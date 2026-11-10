@@ -255,4 +255,16 @@ with tempfile.TemporaryDirectory() as tmp:
     check("fail runs from the command line", out.returncode == 0
           and json.loads(out.stdout)["code"] == "connector_not_connected")
 
+# ---- capable ---------------------------------------------------------------------------
+
+described = {"content": [{"type": "text", "text": json.dumps({
+    "action": "room.commons.feeds.fail", "decision": "allow", "effect": "mutation"})}]}
+check("a backend that describes feeds.fail takes the failure report",
+      fr.capable(described) == {"report_failures": True})
+for reply, name in (({"code": "NOT_FOUND", "message": "no such action"}, "an unknown Action"),
+                    ({"action": "room.commons.feeds.fail", "decision": "deny"}, "a denied one"),
+                    ({"nothing": 1}, "an unreadable reply")):
+    check(f"{name} means a backend from before the report: log, never crash",
+          fr.capable(reply) == {"report_failures": False})
+
 print(f"commons-feed-runner: {len(passed)} passed")

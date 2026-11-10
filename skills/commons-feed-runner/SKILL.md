@@ -42,6 +42,11 @@ carries the same key, and the backend writes a key once.
 
 Work in a fresh temporary directory; `$S` is `skills/commons-feed-runner/scripts`.
 
+0. **What this backend takes.** In the first room, `room.actions.describe`
+   `room.commons.feeds.fail`; save the whole reply to `describe.json` and run
+   `python3 $S/feed_runner.py capable describe.json`. `report_failures: false` (a backend from
+   before the failure report) changes one thing: a run that cannot write is logged and its task
+   closed `failed`, with nothing reported. Runs that can write go on as below.
 1. **Find the grants.** `room.list` (scope self). For each room, `room.action.read` with
    `room.commons.feeds.list` and save the whole reply to `feeds-<n>.json`. A room that answers
    no grants, or refuses the read, is skipped.
@@ -56,7 +61,7 @@ Work in a fresh temporary directory; `$S` is `skills/commons-feed-runner/scripts
    2. `composio_exec` with `run.connector.toolkit`, `run.connector.action` and
       `run.connector.arguments`, exactly. Save the whole reply to `connector.json`.
    3. `python3 $S/feed_runner.py rows run.json connector.json > write.json`. Exit 1 means the
-      run cannot write. Report why, so the app shows an error instead of old rows looking fresh:
+      run cannot write. When step 0 said `report_failures: true`, report why, so the app shows an error instead of old rows looking fresh:
       `python3 $S/feed_runner.py fail run.json connector.json > fail.json`, then
       `room.action.execute` `room.commons.feeds.fail` with the arguments in `fail.json` (a
       closed code, never the connector's text), the task's `task_id` and

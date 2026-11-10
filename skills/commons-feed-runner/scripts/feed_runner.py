@@ -10,6 +10,7 @@ judgment. It never calls anything itself and holds no state.
   rows    <run.json> <composio.json>    the feeds.write arguments for one run
   outcome <write.json>                  done, wait (retry_after_s), stop or fail
   fail    <run.json> <connector.json>   the feeds.fail arguments for a run that could not write
+  capable <describe.json>               whether this backend takes room.commons.feeds.fail
 
 Each JSON file is a tool's whole reply as it came back, wrapper included. The backend holds
 the same rules (room-collab commons_feeds.write_plan): this script keeps a run from even asking
@@ -260,6 +261,19 @@ def failure(run: dict, reply) -> dict:
     return {"grant_id": run["grant_id"], "run_key": run["run_key"], "code": code}
 
 
+def capable(reply) -> dict:
+    """Whether the backend offers this agent room.commons.feeds.fail, from room.actions.describe's
+    reply (an unknown Action answers a refusal). A backend from before it still takes writes:
+    the runner then logs a failed run and closes its task, and reports nothing."""
+    try:
+        described = _unwrap(reply, "action")
+    except Refused:
+        return {"report_failures": False}
+    ok = (described.get("action") == "room.commons.feeds.fail"
+          and described.get("decision", "allow") == "allow" and "code" not in described)
+    return {"report_failures": ok}
+
+
 def outcome(reply) -> dict:
     """What a feeds.write reply means for the run and its task: done, wait (the backend's
     retry_after_s), stop (the grant is no longer active) or fail."""
@@ -307,7 +321,7 @@ def _read(path: str):
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2 or argv[1] not in ("due", "rows", "outcome", "fail"):
+    if len(argv) < 2 or argv[1] not in ("due", "rows", "outcome", "fail", "capable"):
         print(__doc__.strip(), file=sys.stderr)
         return 2
     now_ms = int(datetime.datetime.now(datetime.UTC).timestamp() * 1000)
@@ -323,6 +337,8 @@ def main(argv: list[str]) -> int:
             answer = outcome(_read(argv[2]))
         elif argv[1] == "fail" and len(argv) == 4:
             answer = failure(_read(argv[2]), _read(argv[3]))
+        elif argv[1] == "capable" and len(argv) == 3:
+            answer = capable(_read(argv[2]))
         else:
             print(__doc__.strip(), file=sys.stderr)
             return 2
