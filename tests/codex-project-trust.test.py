@@ -77,6 +77,17 @@ class EnsureTrusted(unittest.TestCase):
         self.assertIn(str(self.repo), self.projects())
         self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
 
+    def test_a_folder_inside_a_repository_is_trusted_alone_never_the_repository(self):
+        sub = self.repo / "projects" / "worker"
+        sub.mkdir(parents=True)
+        self.assertEqual(self.cpt.ensure_folder_trusted(self.home, sub / "."), "trusted")
+        self.assertEqual(self.projects(), {str(sub): {"trust_level": "trusted"}})
+        self.assertEqual(self.cpt.ensure_folder_trusted(self.home, sub), "already-set")
+        self.assertEqual(self.cpt.main(["--folder-only", str(self.home), str(sub)]), 0)
+        self.assertNotIn(str(self.repo), self.projects())
+        with self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()):
+            self.cpt.main([str(self.home), str(sub)])
+
     def test_an_explicit_untrusted_choice_is_left_alone(self):
         self.home.mkdir()
         original = f'[projects."{self.repo}"]\ntrust_level = "untrusted"\n'

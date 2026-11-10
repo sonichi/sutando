@@ -45,6 +45,19 @@ def ensure_trusted(codex_home, working_dir, repo):
         return "not-git"
     if root != Path(repo).resolve():
         return "foreign"
+    return _record(codex_home, root)
+
+
+def ensure_folder_trusted(codex_home, folder):
+    """Returns "already-set" or "trusted": `folder` itself is recorded, never the repository holding it.
+
+    A pool worker's folder sits inside the owner's workspace repository; Codex's prompt would trust that
+    whole root, while a saved entry for the folder's own path answers it for the folder alone.
+    """
+    return _record(codex_home, Path(folder).resolve())
+
+
+def _record(codex_home, root):
     config = Path(codex_home) / "config.toml"
     try:
         text = config.read_text()
@@ -79,10 +92,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("codex_home", type=Path)
     parser.add_argument("working_dir", type=Path)
-    parser.add_argument("repo", type=Path)
+    parser.add_argument("repo", type=Path, nargs="?")
+    parser.add_argument("--folder-only", action="store_true",
+                        help="record working_dir itself, not the repository that holds it")
     args = parser.parse_args(argv)
+    if args.repo is None and not args.folder_only:
+        parser.error("repo is required unless --folder-only")
     try:
-        print(ensure_trusted(args.codex_home, args.working_dir, args.repo))
+        print(ensure_folder_trusted(args.codex_home, args.working_dir) if args.folder_only
+              else ensure_trusted(args.codex_home, args.working_dir, args.repo))
     except (OSError, ValueError) as exc:  # tomllib.TOMLDecodeError is a ValueError
         print(f"codex project trust: {exc}", file=sys.stderr)
         return 1

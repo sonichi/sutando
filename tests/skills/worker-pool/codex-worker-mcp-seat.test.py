@@ -135,7 +135,8 @@ class Launcher(unittest.TestCase):
         for rel in ("skills/worker-pool/scripts/launch-codex-worker-session.sh",
                     "skills/worker-pool/scripts/worker-mcp-credential.sh",
                     "skills/worker-pool/scripts/codex_worker_mcp.py",
-                    "scripts/python-binary.sh", "src/agent/launch-path.sh", "src/toml_fallback.py"):
+                    "scripts/python-binary.sh", "src/agent/launch-path.sh", "src/toml_fallback.py",
+                    "src/codex_project_trust.py"):
             (root / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / rel, root / rel)
         (root / "scripts/sutando-config.sh").write_text(
@@ -169,6 +170,7 @@ class Launcher(unittest.TestCase):
                "SUTANDO_TMUX_SESSION": "worker-session", "SUTANDO_TASKS_DIR": str(ws / "in"),
                "SUTANDO_WORKSPACE_DIR": str(ws), "SUTANDO_RESULTS_DIR": str(ws / "results"),
                "SUTANDO_INBOX_RESOLVER": "/bin/true", "SUTANDO_POOL_DELIVERY_SCRIPT": "/bin/true",
+               "SUTANDO_CODEX_WORKING_DIR": str(ws / "wd"),
                "TMUX_STATE": str(tmp / "up"), "TMUX_ARGV": str(tmp / "argv.json")}
         r = subprocess.run(["bash", str(root / "skills/worker-pool/scripts/launch-codex-worker-session.sh")],
                            cwd=root, env=env, capture_output=True, text=True, timeout=30)
@@ -197,6 +199,16 @@ class Launcher(unittest.TestCase):
             self.assertEqual(t["command"], "/a s/node")
             self.assertEqual(t["env_vars"], ["SUTANDO_WORKER_ID", "AG2_MCP_WORKER_CREDENTIAL"])
             self.assertNotIn("bearer", json.dumps(argv).lower())
+
+    def test_the_worker_folder_alone_is_recorded_as_trusted(self):
+        # Codex's own prompt would trust the whole repository the worker folder sits in.
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q", tmp], check=True)
+            self.launch(tmp, codex_toml=CODEX_TOML)
+            cfg = tomllib.loads(Path(tmp, "home/codex/config.toml").read_text())
+            folder = str(Path(tmp, "ws/wd").resolve())
+            self.assertEqual(cfg["projects"], {folder: {"trust_level": "trusted"}})
+            self.assertEqual(cfg["mcp_servers"]["s-space"]["command"], "/c/node", "the rest of the file is kept")
 
     def test_the_codex_homes_own_entry_wins(self):
         with tempfile.TemporaryDirectory() as tmp:
