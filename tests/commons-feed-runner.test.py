@@ -371,4 +371,16 @@ with tempfile.TemporaryDirectory() as tmp:
             got = fr.main(["feed_runner.py", *args])
         check(f"main {' '.join(args[:1]) or '(no command)'} exits {code}", got == code)
 
+# Review (Susan, nit at 48560f6f): an envelope inside {"result": ...}, plain or MCP-wrapped, is
+# still the envelope: its rate limit is a rate limit, its missing connection a missing one.
+limited = {"data": {}, "successful": False, "error": "429 Too Many Requests"}
+for wrapped, name in (({"result": limited}, "result-wrapped"),
+                      ({"content": [{"type": "text", "text": json.dumps({"result": limited})}]},
+                       "MCP and result-wrapped")):
+    check(f"a {name} rate limit is connector_rate_limited",
+          fr.failure(run, wrapped)["code"] == "connector_rate_limited")
+check("a result-wrapped missing connection is connector_not_connected",
+      fr.failure(run, {"result": {"error": "connect_required"}})["code"]
+      == "connector_not_connected")
+
 print(f"commons-feed-runner: {len(passed)} passed")

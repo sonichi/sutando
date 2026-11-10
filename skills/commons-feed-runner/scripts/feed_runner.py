@@ -290,6 +290,9 @@ def _top(reply) -> dict:
             node = json.loads(node)
         except ValueError:
             return {"error": node}
+    # A {"result": ...} envelope (the MCP tool reply's shape) holds the connector's own envelope.
+    while isinstance(node, dict) and set(node) == {"result"} and isinstance(node["result"], dict):
+        node = node["result"]
     return node if isinstance(node, dict) else {}
 
 
