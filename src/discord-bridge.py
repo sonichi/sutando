@@ -1890,6 +1890,14 @@ async def _action_delete_and_escalate(client_ref, suspect_message, verdict, extr
         deleted_ok = True
     except Exception as e:
         print(f"  [mod-action] delete failed for {getattr(suspect_message,'id','?')}: {e}", flush=True)
+    if deleted_ok:
+        try:
+            handled, esc = await _repeat_offender_escalation(client_ref, suspect_message, verdict, extras_md)
+        except Exception as e:
+            print(f"  [mod-repeat] strike handling failed: {e}", flush=True)
+            handled = False
+        if handled:
+            return deleted_ok, esc
     rule_label = verdict.get("rule_match", "rule_?")
     rationale = verdict.get("rationale", "")
     esc = await _post_mod_escalation(client_ref, suspect_message, rule_label, rationale, extras_md)
@@ -2097,6 +2105,110 @@ class _OffTopicStreakTracker:
 # time by _DupeTracker before the judge runs); the dispatcher handles
 # verdicts on Rule 3-flagged messages by either delete-and-escalate (if
 # the LLM judges them as also violating server rules) or escalate-only.
+# Repeat offenders (#6312), opt-in per guild: `guilds.<id>.repeat_offender` in access.json, e.g.
+# {"strikes": 3, "window_s": 600, "timeout_s": 3600}. Only a deletion by rules 1, 2, 3 or 6 is a strike.
+REPEAT_OFFENDER_DEFAULTS = {"strikes": 3, "window_s": 600, "timeout_s": 3600}
+REPEAT_OFFENDER_BOUNDS = {"strikes": (2, 20), "window_s": (60, 24 * 3600),
+                          "timeout_s": (60, 28 * 24 * 3600)}  # 28 days is Discord's longest timeout
+
+
+def _load_repeat_offender_config(guild_id):
+    """The guild's repeat-offender settings, or None (off) when `repeat_offender` is absent or
+    any value given is not an int in its bounds. A key left out takes its default."""
+    try:
+        g = json.loads(ACCESS_FILE.read_text()).get("guilds", {}).get(str(guild_id))
+    except Exception:
+        return None
+    raw = g.get("repeat_offender") if isinstance(g, dict) else None
+    if not isinstance(raw, dict):
+        return None
+    cfg = {}
+    for key, (lo, hi) in REPEAT_OFFENDER_BOUNDS.items():
+        v = raw.get(key, REPEAT_OFFENDER_DEFAULTS[key])
+        if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+            print(f"  [mod-repeat] guild {guild_id}: repeat_offender.{key}={v!r} is not an int "
+                  f"in [{lo}, {hi}]; repeat-offender handling is off", flush=True)
+            return None
+        cfg[key] = v
+    return cfg
+
+
+class _StrikeTracker:
+    """Auto-deletions per (guild, author) in a rolling window. Caller passes `now_s`."""
+
+    def __init__(self):
+        self._store = {}  # (guild_id_str, user_id_str) -> [strike dict with "ts"]
+
+    def add(self, guild_id, user_id, strike, now_s, window_s, limit):
+        """Record one deletion. When it brings the author to `limit` within `window_s`, return
+        every strike in the window and start the count again; else None."""
+        key = (str(guild_id), str(user_id))
+        bucket = [s for s in self._store.get(key, []) if now_s - s["ts"] <= window_s]
+        bucket.append(dict(strike, ts=now_s))
+        if len(bucket) >= limit:
+            self._store.pop(key, None)
+            return bucket
+        self._store[key] = bucket
+        return None
+
+    def gc(self, now_s, max_window_s=REPEAT_OFFENDER_BOUNDS["window_s"][1]):
+        """Drop authors whose newest strike is older than any window could reach."""
+        for k in list(self._store):
+            if not self._store[k] or now_s - self._store[k][-1]["ts"] > max_window_s:
+                del self._store[k]
+
+
+async def _timeout_member(member, guild_id, timeout_s, reason, now_s):
+    """Time `member` out for `timeout_s`, or say why not. Never raises: moderators and the server
+    owner are never timed out, and a missing permission or a Discord refusal is reported."""
+    _active, mod_roles = _load_mod_config(guild_id)
+    if _is_moderator(member, mod_roles):
+        return "No timeout applied: the author is a moderator or the server owner."
+    perms = getattr(getattr(getattr(member, "guild", None), "me", None), "guild_permissions", None)
+    if not getattr(perms, "moderate_members", False):
+        return "No timeout applied: the bot lacks the Moderate Members permission."
+    if not callable(getattr(member, "timeout", None)):
+        return "No timeout applied: the author is no longer a member of this server."
+    try:
+        import datetime as _dt
+        await member.timeout(_dt.timedelta(seconds=timeout_s), reason=reason)
+    except Exception as e:
+        return f"No timeout applied: Discord refused it ({type(e).__name__}: {e})."
+    end = int(now_s + timeout_s)
+    return f"Timed out until <t:{end}:f> ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(end))})."
+
+
+async def _repeat_offender_escalation(client_ref, suspect_message, verdict, extras_md="", now_s=None):
+    """Count one auto-deletion against its author. At the guild's limit, time the author out and
+    post one combined escalation. Returns (True, escalation) when that replaces this message's own
+    escalation, else (False, None)."""
+    guild_id = _guild_id_of(suspect_message)
+    author = getattr(suspect_message, "author", None)
+    cfg = _load_repeat_offender_config(guild_id) if guild_id is not None else None
+    if cfg is None or getattr(author, "id", None) is None:
+        return False, None
+    now_s = time.time() if now_s is None else now_s
+    rule = verdict.get("rule_match", "rule_?")
+    strike = {"rule": rule, "channel": getattr(suspect_message.channel, "name", "?"),
+              "preview": _sanitize_for_quote((getattr(suspect_message, "content", None) or "")[:100])}
+    struck = _mod_strike_tracker.add(guild_id, author.id, strike, now_s, cfg["window_s"], cfg["strikes"])
+    if struck is None:
+        return False, None
+    window = f"{cfg['window_s'] // 60} min" if cfg["window_s"] >= 60 else f"{cfg['window_s']} s"
+    outcome = await _timeout_member(author, guild_id, cfg["timeout_s"],
+                                    f"auto-mod: {len(struck)} messages deleted within {window}", now_s)
+    lines = [f"**Repeat offender** <@{author.id}>: {len(struck)} messages auto-deleted within {window}. "
+             "They are already deleted, so there is nothing to jump to:"]
+    lines += [f"- {s['rule']} in `#{s['channel']}` at {time.strftime('%H:%M:%S UTC', time.gmtime(s['ts']))}: "
+              f"\u201c{s['preview'] or '(no text content)'}\u201d" for s in struck]
+    lines += ["", outcome]
+    if extras_md:
+        lines += ["", extras_md]
+    esc = await _post_mod_escalation(client_ref, suspect_message, f"{rule} \u00b7 repeat offender",
+                                     verdict.get("rationale", ""), "\n".join(lines))
+    return True, esc
+
+
 RULE_TO_ACTION = {
     "rule_1": "delete_and_escalate",  # crypto-job spam
     "rule_2": "delete_and_escalate",  # CSAM-bait spam
@@ -2224,6 +2336,7 @@ _mod_buffer_lock = None              # asyncio.Lock guarding _mod_buffer mutatio
 _mod_flush_lock = None               # asyncio.Lock serializing whole-flush executions
 _mod_dupe_tracker = _DupeTracker()
 _mod_streak_tracker = _OffTopicStreakTracker()
+_mod_strike_tracker = _StrikeTracker()
 
 
 def _ensure_mod_lock():
@@ -2418,6 +2531,7 @@ async def _flush_mod_buffer_inner():
     try:
         import time as _t
         _mod_dupe_tracker.gc(now_s=_t.time())
+        _mod_strike_tracker.gc(now_s=_t.time())
     except Exception:
         pass
 
