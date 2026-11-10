@@ -324,4 +324,51 @@ check("a grant without a usable max_rows or query is skipped, and the good one s
       [r["grant_id"] for r in mixed["runs"]] == ["gabc123def"]
       and {"gnomax0001", "gzeromax01", "gboolmax01", "gnoquery01"} <= set(why))
 
+# ---- edges, and the command line in-process (so a coverage run sees main) ----------------
+
+edge = fr.due(ME, [(ROOM, listed(
+    grant(grant_id="gwindow001", query={"kind": "calendar.upcoming", "window_days": 90}),
+    grant(grant_id="gfast00001", every_minutes=5)))], NOW)
+why = {s["grant_id"]: s["why"] for s in edge["skipped"]}
+check("a window past 60 days, or a cadence under the floor, is skipped with its reason",
+      why == {"gwindow001": "window_days is 1 to 60",
+              "gfast00001": "every_minutes is missing or under the 15-minute floor"})
+check("a start or end that is not a Google time is left out, never guessed",
+      fr._when("2026-11-10") is None and fr._when({"dateTime": "soon"}) is None
+      and fr._when({"dateTime": "2026-11-10T09:00:00"}) is None and fr._when({}) is None)
+check("a meeting link is https or nothing", fr._https("http://meet.example/x") is None
+      and fr._https(42) is None)
+try:
+    fr.rows({**run, "kind": "gmail.threads_matching"}, composio(EVENTS))
+    ok = False
+except fr.Refused:
+    ok = True
+check("a kind the runner cannot project is refused", ok)
+check("a plain-text reply is read as the envelope's error", fr._top("connect_required") ==
+      {"error": "connect_required"} and fr.failure(run, "connect_required")["code"]
+      == "connector_not_connected")
+check("retry_after_s is found wherever the envelope nests it",
+      fr.outcome({"code": "RATE_LIMITED", "details": [{"retry_after_s": 30}]})["retry_after_s"]
+      == 30)
+
+import contextlib
+import io
+
+with tempfile.TemporaryDirectory() as tmp:
+    files = {"feeds": listed(grant()), "run": run, "connector": composio(EVENTS),
+             "write": {"result": {"run_key": "k", "rows": 1}},
+             "describe": {"action": "room.commons.feeds.fail", "decision": "allow"},
+             "broken": {"error": "connect_required"}}
+    for name, body in files.items():
+        (Path(tmp) / f"{name}.json").write_text(json.dumps(body))
+    f = {name: str(Path(tmp) / f"{name}.json") for name in files}
+    calls = [(["due", ME, f"{ROOM}={f['feeds']}"], 0), (["rows", f["run"], f["connector"]], 0),
+             (["outcome", f["write"]], 0), (["fail", f["run"], f["broken"]], 0),
+             (["capable", f["describe"]], 0), (["rows", f["run"], f["broken"]], 1),
+             (["due", ME, f["feeds"]], 1), (["rows", f["run"]], 2), (["nope"], 2), ([], 2)]
+    for args, code in calls:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            got = fr.main(["feed_runner.py", *args])
+        check(f"main {' '.join(args[:1]) or '(no command)'} exits {code}", got == code)
+
 print(f"commons-feed-runner: {len(passed)} passed")
