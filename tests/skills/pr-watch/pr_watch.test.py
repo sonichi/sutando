@@ -875,7 +875,7 @@ class InProcess(_Tmp):
             stopper.start()
             try:
                 self.assertTrue(at_cleanup.wait(5))
-                self.assertFalse(done.is_set(), "shutdown must wait for the actual writer")
+                self.assertFalse(done.wait(1), "shutdown must wait while the actual writer remains gated")
             finally:
                 release.set()
                 stopper.join(5)
