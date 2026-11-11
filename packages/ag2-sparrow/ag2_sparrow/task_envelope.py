@@ -15,6 +15,7 @@ from pathlib import Path
 
 STAMP_PREFIX = "envelope_hmac: v1:"
 VERIFIED, UNSIGNED, INVALID, UNVERIFIABLE = "verified", "unsigned", "invalid", "unverifiable"
+_MAC_CHARS = frozenset("0123456789abcdef")
 
 
 def parse_key(text: str) -> bytes:
@@ -83,7 +84,14 @@ def verify_text(text: str, key_path) -> str:
         key = load_key(key_path)
     except (OSError, ValueError):
         return UNVERIFIABLE
+    if not is_mac_shape(mac):
+        return INVALID
     return VERIFIED if hmac.compare_digest(mac, _mac(body, key)) else INVALID
+
+
+def is_mac_shape(mac: str) -> bool:
+    """Exactly what the signer emits (64 lowercase hex): compare_digest raises TypeError on non-ASCII str."""
+    return len(mac) == 64 and all(c in _MAC_CHARS for c in mac)
 
 
 def stamper(key_path):

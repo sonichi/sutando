@@ -45,6 +45,7 @@ s=raw.decode("utf-8","replace").strip()
 try: k=bytes.fromhex(s); ok=len(s)==64 and len(k)==32
 except ValueError: ok=False
 if not ok: out("unverifiable")
+if len(mac)!=64 or any(c not in "0123456789abcdef" for c in mac): out("invalid")
 out("verified" if hmac.compare_digest(hmac.new(k,"\\n".join(L).encode(),hashlib.sha256).hexdigest(),mac) else "invalid")
 `
 // The submitted text's hash, bound to the authorization and checked at turn.start (sha256 hex).

@@ -162,6 +162,13 @@ class VerifierMirrorsSparrow(unittest.TestCase):
                                  env=hermetic_env(AG2_HMAC_KEY_FILE=missing), check=True).stdout.split()
             self.assertEqual((got[0], got[3], hmac_policy.key_digest(missing)), ("unverifiable", "absent", "absent"))
 
+    def test_a_malformed_stamp_reads_invalid_not_a_crash(self):
+        signed = self.vectors()[0]
+        mac = signed.split("\n")[1][len(STAMP):]
+        for bad in ("\u00e9", mac[:63], mac.upper()):
+            self.assertEqual(run_verifier(verify_py(), signed.replace(mac, bad), str(self.key_file))[0], "invalid",
+                             repr(bad[:8]))
+
     def test_mutants_are_caught(self):
         always_verified = verify_py().replace('out("verified" if', 'out("verified" if True or')
         self.assertIn('if True or', always_verified)

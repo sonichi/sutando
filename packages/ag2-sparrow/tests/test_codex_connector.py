@@ -761,6 +761,39 @@ class EnvelopeTest(unittest.TestCase):
                 self.assertIn("refused (envelope %s, --hmac-key-file set) -> %s" % (verdict, tid), err.getvalue())
             self.assertNotIn(Path(key).read_text().strip(), err.getvalue(), "the key is never logged")
 
+    def test_a_malformed_stamp_is_refused_and_the_queue_moves_on(self):
+        """A stamp that is not 64 hex characters (here non-ASCII) is refused like any invalid one, never raised,
+        so the signed task queued behind it is still served."""
+        from ag2_sparrow import task_envelope
+        with tempfile.TemporaryDirectory() as d:
+            key = os.path.join(d, "task-hmac.key")
+            task_envelope.create_key(key)
+            k = task_envelope.load_key(key)
+            now = time.time()
+            write_text(d, "task-chat-bad", "id: task-chat-bad\nenvelope_hmac: v1:\u00e9\nchannel_id: c\n"
+                       "access_tier: owner\ntask: hello\n", mtime=now - 30)
+            write_text(d, "task-chat-good", task_envelope.stamp_text(
+                "id: task-chat-good\nsource: chat\nchannel_id: local-chat\naccess_tier: owner\ntask: hello\n", k),
+                mtime=now - 10)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(run_connector(d, once=2, extra=["--hmac-key-file", key]), 0)
+            self.assertEqual(result(d, "task-chat-bad"), task_io.NON_OWNER_REFUSED)
+            self.assertIn("refused (envelope invalid, --hmac-key-file set) -> task-chat-bad", err.getvalue())
+            self.assertTrue(result(d, "task-chat-good").startswith("STUB echo"), result(d, "task-chat-good"))
+
+    def test_verify_text_reads_a_malformed_stamp_as_invalid(self):
+        from ag2_sparrow import task_envelope
+        with tempfile.TemporaryDirectory() as d:
+            key = os.path.join(d, "task-hmac.key")
+            task_envelope.create_key(key)
+            good = task_envelope.stamp_text("id: t\naccess_tier: owner\ntask: hi\n", task_envelope.load_key(key))
+            mac = good.split("\n")[1][len(task_envelope.STAMP_PREFIX):]
+            self.assertEqual(task_envelope.verify_text(good, key), task_envelope.VERIFIED)
+            for bad in ("\u00e9", "\u00e9" * 64, mac[:63], mac + "0", mac.upper(), mac[:63] + "g"):
+                text = good.replace(mac, bad)
+                self.assertEqual(task_envelope.verify_text(text, key), task_envelope.INVALID, repr(bad[:8]))
+
     def test_the_stamp_is_checked_on_the_text_that_is_served(self):
         """A file swapped between reads cannot lend its stamp to another text: an unsigned forged task that is
         replaced by a validly signed one right after it is read is still refused."""
