@@ -78,6 +78,34 @@ class EnsureTrusted(unittest.TestCase):
         self.assertIn(str(self.repo), self.projects())
         self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
 
+    def test_a_folder_inside_a_repository_is_trusted_alone_never_the_repository(self):
+        sub = self.repo / "projects" / "worker"
+        sub.mkdir(parents=True)
+        self.home.mkdir()
+        self.assertEqual(self.cpt.ensure_folder_trusted(self.home, sub / "."), "trusted")
+        self.assertEqual(self.projects(), {str(sub): {"trust_level": "trusted"}})
+        self.assertEqual(self.cpt.ensure_folder_trusted(self.home, sub), "already-set")
+        self.assertEqual(self.cpt.main(["--folder-only", str(self.home), str(sub)]), 0)
+        self.assertNotIn(str(self.repo), self.projects())
+        with self.assertRaises(SystemExit), patch("sys.stderr", io.StringIO()):
+            self.cpt.main([str(self.home), str(sub)])
+
+    def test_two_launches_at_once_both_keep_their_entry(self):
+        # Each process pauses between its read and its write, so an unlocked pair drops one entry.
+        racer = ("import sys, time; sys.path.insert(0, sys.argv[1]); import codex_project_trust as c; "
+                 "real = c.tomllib.loads; c.tomllib = type('T', (), {'loads': staticmethod("
+                 "lambda t: (time.sleep(0.5), real(t))[1])}); "
+                 "print(c.ensure_folder_trusted(sys.argv[2], sys.argv[3]))")
+        folders = [self.repo / name for name in ("one", "two")]
+        self.home.mkdir()
+        procs = []
+        for folder in folders:
+            folder.mkdir()
+            procs.append(subprocess.Popen([sys.executable, "-c", racer, str(REPO / "src"), str(self.home),
+                                           str(folder)], stdout=subprocess.PIPE, text=True))
+        self.assertEqual(sorted(p.communicate()[0].strip() for p in procs), ["trusted", "trusted"])
+        self.assertEqual(set(self.projects()), {str(f) for f in folders})
+
     def test_an_explicit_untrusted_choice_is_left_alone(self):
         self.home.mkdir()
         original = f'[projects."{self.repo}"]\ntrust_level = "untrusted"\n'
@@ -126,6 +154,13 @@ class EnsureTrusted(unittest.TestCase):
         """The launcher resolves and creates the home; trust only writes into it."""
         rc = self.cpt.main([str(self.home), str(self.repo), str(self.repo)])
         self.assertEqual(rc, 1)
+        self.assertFalse(os.path.lexists(self.home))
+
+    def test_a_missing_codex_home_is_never_created_for_a_worker_folder(self):
+        sub = self.repo / "worker"
+        sub.mkdir()
+        with patch("sys.stderr", io.StringIO()):
+            self.assertEqual(self.cpt.main(["--folder-only", str(self.home), str(sub)]), 1)
         self.assertFalse(os.path.lexists(self.home))
 
     def test_an_empty_codex_home_is_refused(self):
@@ -198,6 +233,25 @@ class EnsureTrustedHosted(unittest.TestCase):
             with self.assertRaises(OSError):
                 self.trust()
         self.assertEqual(sorted(p.name for p in self.codex_home.iterdir()), [])
+
+
+    def test_a_worker_folder_is_trusted_alone_through_the_descriptor(self):
+        sub = self.repo / "worker"
+        sub.mkdir()
+        trust = lambda: cpt.ensure_folder_trusted(self.codex_home, sub, repo=self.repo, home=self.home)
+        self.assertEqual(trust(), "trusted")
+        self.assertEqual(trust(), "already-set")
+        self.assertEqual(cpt.tomllib.loads(self.config.read_text())["projects"],
+                         {str(sub): {"trust_level": "trusted"}})
+
+    def test_a_worker_folder_is_never_recorded_in_the_owners_codex_home(self):
+        sub = self.repo / "worker"
+        sub.mkdir()
+        owner = self.home / ".codex"
+        owner.mkdir()
+        with self.assertRaises(ValueError):
+            cpt.ensure_folder_trusted(owner, sub, repo=self.repo, home=self.home)
+        self.assertEqual(list(owner.iterdir()), [])
 
 
 class EnsureTrustedWithoutTomllib(EnsureTrusted):

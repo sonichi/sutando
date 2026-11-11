@@ -150,7 +150,9 @@ session"). A task a core lane routed to the worker is still answered as the core
 `s-space` MCP tools mint as the worker's agent too: the launcher exports `AG2_MCP_WORKER_CREDENTIAL`, the
 argv of `scripts/connections.py worker-mcp-credential`, which hands the desktop's MCP proxy the worker's vault
 token in memory, or tells it `acts_as: core` for a worker with no enabled identity; with no resolver the proxy
-refuses rather than guess (a Codex seat's proxy inherits no environment and does not take this path yet).
+refuses rather than guess. A Codex seat's proxy inherits only the variables its entry names, so the Codex launcher
+starts it with the desktop's `s-space` registration (the Codex home's, else the Claude config dir's) plus `env_vars`
+naming `SUTANDO_WORKER_ID` and `AG2_MCP_WORKER_CREDENTIAL` (`codex_worker_mcp.py`); if that cannot be composed the launcher refuses to start the seat.
 
 ```bash
 python3 skills/worker-pool/scripts/pool_identity.py add <worker> --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"
@@ -168,6 +170,29 @@ the launch and the record disagree, or neither can say, the lane refuses to star
 
 `pool_manage.py retire` also removes the worker's agent identity: its lane, its row and its vault secret. The agent
 itself stays on its server until the owner deletes it there.
+
+### Giving a worker its own agent: the device-connect flow (the standard way)
+
+The core starts s.space's device-connect flow and the owner approves it in a browser; nobody pastes a token.
+Use it when the owner asked for the worker to have its own agent:
+
+```bash
+python3 skills/worker-pool/scripts/pool_identity.py add <worker> --device-flow --label <name> [--display-name TEXT] [--lane INSTANCE]
+python3 skills/worker-pool/scripts/pool_identity.py rotate <worker> --device-flow --label <same name>
+```
+
+- `--label` names the agent (1-32 lowercase letters, digits, inner dashes); suggest the worker's role and let the
+  owner confirm. It is required: without one the server would answer with the owner's own agent.
+- The core sends the owner the approval link in their DM, with the time it stops working (15 minutes), and waits.
+  Run it in the background; it prints one JSON line (`agent_id`, `status`) once the owner approved. An expired link
+  saves nothing, prints `{"status": "expired"}` and tells the owner in their DM; run it again for a new link.
+- The token is saved to the vault only when the gateway confirms it is the agent the poll named, not the core's own
+  agent, on the core's server and owned by the core's owner. `rotate` must answer for the worker's existing agent.
+  The device code and the token are never printed, logged or written to a file.
+- Once the token is saved the owner gets a second DM naming the agent and where to find it, and a running seat
+  restarts (`pool_manage.py reseat <worker>`): its `s-space` tools decide at start whom they act as. A seat that owes
+  work is left running and the JSON line says `"seat": "deferred"`; run the reseat once it is done. A seat whose
+  `s-space` calls fail with "descriptor changed during the call" is this case: its identity changed; reseat it.
 
 ### Creating the agent without a pasted token
 

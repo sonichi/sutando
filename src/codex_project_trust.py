@@ -11,6 +11,8 @@ the file (trusted or untrusted) is left as it is. The Codex home is the one the 
 resolved; it is never created here.
 """
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import subprocess
@@ -38,6 +40,9 @@ def git_root(path):
     return Path(out.stdout.strip()).resolve()
 
 
+_CHECKOUT = Path(__file__).resolve().parent.parent
+
+
 def ensure_trusted(codex_home, working_dir, repo, home=None):
     """Returns "not-git", "foreign", "already-set" or "trusted".
 
@@ -51,13 +56,41 @@ def ensure_trusted(codex_home, working_dir, repo, home=None):
         return "not-git"
     if root != Path(repo).resolve():
         return "foreign"
-    if codex_host_instructions.host_instructions(repo) is None:
-        return _trust(Path(codex_home) / "config.toml", None, root)
-    fd = codex_host_instructions.open_home(codex_home, Path.home() if home is None else home)
+    return _record(codex_home, root, repo, home)
+
+
+def ensure_folder_trusted(codex_home, folder, repo=None, home=None):
+    """Returns "already-set" or "trusted": `folder` itself is recorded, never the repository holding it.
+
+    A pool worker's folder sits inside the owner's workspace repository; Codex's prompt would trust that
+    whole root, while a saved entry for the folder's own path answers it for the folder alone.
+    `repo` (default: this checkout) decides, as for ensure_trusted, whether the home is guarded.
+    """
+    return _record(codex_home, Path(folder).resolve(), _CHECKOUT if repo is None else repo, home)
+
+
+@contextlib.contextmanager
+def _locked_home(codex_home, guarded, home):
+    """An exclusively locked descriptor of the existing Codex home, which is never created.
+    Seats launched together each read, then replace, the one config.toml; the lock serializes them."""
+    if guarded:
+        fd = codex_host_instructions.open_home(codex_home, Path.home() if home is None else home)
+    else:
+        fd = os.open(codex_home, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
-        return _trust("config.toml", fd, root)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield fd
     finally:
         os.close(fd)
+
+
+def _record(codex_home, root, repo, home):
+    """On a desktop host the config is reached only below the owner-guarded descriptor."""
+    guarded = codex_host_instructions.host_instructions(repo) is not None
+    with _locked_home(codex_home, guarded, home) as fd:
+        if guarded:
+            return _trust("config.toml", fd, root)
+        return _trust(Path(codex_home) / "config.toml", None, root)
 
 
 def _trust(config, dir_fd, root):
@@ -105,12 +138,17 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("codex_home", help="the resolved Codex home; never created here")
     parser.add_argument("working_dir", type=Path)
-    parser.add_argument("repo", type=Path)
+    parser.add_argument("repo", type=Path, nargs="?")
+    parser.add_argument("--folder-only", action="store_true",
+                        help="record working_dir itself, not the repository that holds it")
     args = parser.parse_args(argv)
+    if args.repo is None and not args.folder_only:
+        parser.error("repo is required unless --folder-only")
     try:
         if not args.codex_home:
             raise ValueError("no Codex home given")
-        print(ensure_trusted(Path(args.codex_home), args.working_dir, args.repo))
+        print(ensure_folder_trusted(Path(args.codex_home), args.working_dir) if args.folder_only
+              else ensure_trusted(Path(args.codex_home), args.working_dir, args.repo))
     except (OSError, ValueError) as exc:  # tomllib.TOMLDecodeError is a ValueError
         print(f"codex project trust: {exc}", file=sys.stderr)
         return 1

@@ -688,7 +688,7 @@ class Verbs(Base):
     def test_finish_prints_the_agent_id_and_status_and_starts_the_lane(self):
         _, claim = provision_fake.created(self.backend, CORE, "reviewer", self.begun()["claim_key_sha256"])
         rc, out, err = self.run_cmd("provision-finish", "Reviewer", "--claim-id", claim, "--agent-id", WORKER_AGENT)
-        self.assertEqual((rc, json.loads(out)), (0, {"agent_id": WORKER_AGENT, "status": "ok"}), err)
+        self.assertEqual((rc, json.loads(out)), (0, {"agent_id": WORKER_AGENT, "status": "ok", "seat": "skipped"}), err)
         self.assertEqual(self.started[0]["logs_dir"], self.ws / "logs")
         self.assertEqual(self.started[0]["repo"], ROOT)
         self.assertNotIn(CLAIM_KEY, self.vault.store)
@@ -708,7 +708,8 @@ class Verbs(Base):
             raise C.LaunchFailed("no bridge script")
         with unittest.mock.patch.object(C, "start_added", refuses):
             rc, out, err = self.run_cmd("provision-finish", "Reviewer", "--claim-id", claim, "--agent-id", WORKER_AGENT)
-        self.assertEqual((rc, json.loads(out)), (1, {"agent_id": WORKER_AGENT, "status": "stored_lane_not_started"}))
+        self.assertEqual((rc, json.loads(out)), (1, {"agent_id": WORKER_AGENT, "status": "stored_lane_not_started",
+                                                   "seat": "skipped"}))
         self.assertIn("not started: no bridge script", err)
         self.backend.agents[WORKER_AGENT]["deleted"] = True
         self.assertEqual(self.run_cmd("retire-remote", "Reviewer")[0], 0)
@@ -730,7 +731,7 @@ class Verbs(Base):
         self.begun()
         rc, out, err = self.run_cmd("provision-wait", "Reviewer", "--operation-id", "op-9", "--name", "reviewer",
                                     "--display-name", "Reviewer", "--role", "reviews PRs")
-        self.assertEqual((rc, json.loads(out), err), (0, {"agent_id": WORKER_AGENT, "status": "ok"}, ""))
+        self.assertEqual((rc, json.loads(out), err), (0, {"agent_id": WORKER_AGENT, "status": "ok", "seat": "skipped"}, ""))
         self.assertEqual(self.backend.operations["op-9"]["arguments"]["role"], "reviews PRs")
         self.assertEqual(len(self.started), 1)
 
