@@ -3,13 +3,17 @@
 A bridge resolves its workspace from the checkout it was started from, so a
 bridge left running from another install's engine can write tasks this core
 never reads. Read-only: the probe takes each live bridge's script path from its
-argv (cwd only for a relative path) and compares it with this engine directory.
+real argv vector, as the Python interpreter's first script operand (trailing
+arguments allowed; cwd only for a relative path), and compares it with this
+engine directory. A non-Python process naming the script (an editor, a pager) is
+ignored; a process whose argv vector cannot be read is unknown.
 """
 from __future__ import annotations
 
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -37,13 +41,11 @@ def _option(tok: str) -> str:
 
 
 def _is_interpreter(token: str) -> bool:
-    return re.fullmatch(r"[Pp]ython(\d+(\.\d+)*)?[tw]?", os.path.basename(token)) is not None
+    return re.fullmatch(r"[Pp]ython(3(\.\d+)?t?d?)?", os.path.basename(token)) is not None
 
 
 def _first_operand(tokens: "list[str]") -> Optional[str]:
     """The script operand of `<interpreter> [options] <script> ...`, or None."""
-    if not tokens or not _is_interpreter(tokens[0]):
-        return None
     i = _skip_options(tokens, 1)
     if i is None or i >= len(tokens):
         return None
@@ -67,48 +69,14 @@ def _skip_options(tokens: "list[str]", i: int) -> Optional[int]:
     return i
 
 
-def _script_operand(argv, script: str) -> Optional[str]:
-    """The interpreter's script operand when its basename is `script`, else None.
-
-    Prefers the real argv vector. A flattened command line cannot split a path
-    with spaces, so there the interpreter and script are located by name."""
-    if isinstance(argv, (list, tuple)):
-        if not all(isinstance(a, str) for a in argv):
-            return None
-        op = _first_operand(list(argv))
-    else:
-        text = str(argv or "")
-        interp = re.search(r"[Pp]ython(\d+(\.\d+)*)?[tw]?(?=\s)", text)
-        if not interp:
-            return None
-        rest = text[interp.end():]
-        op = None
-        tokens = rest.split()
-        i = _skip_options(tokens, 0)
-        if i is not None and i < len(tokens):
-            # Rejoin from the first operand: it runs to the first ".py" followed by a boundary.
-            tail = " ".join(tokens[i:])
-            m = re.match(r"(.+?\.py)(?=\s|$)", tail)
-            op = m.group(1) if m else None
-    if op is None or os.path.basename(op) != script:
-        return None
-    return op
-
-
 def _argv_vector(pid):
     import watcher_identity  # noqa: PLC0415
     return watcher_identity.proc_argv_vector(pid)
 
 
-def read_argv(pid: str):
-    vec = _argv_vector(pid)
-    if vec:
-        return vec
-    try:
-        return subprocess.run(["/bin/ps", "-o", "command=", "-p", str(pid)],
-                              capture_output=True, text=True, timeout=5).stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
+def read_argv(pid: str) -> Optional["list[str]"]:
+    """The real argv vector, or None: a flattened `ps` line is never parsed."""
+    return _argv_vector(pid) or None
 
 
 def read_cwd(pid: str, proc_root: str = "/proc") -> str:
@@ -126,11 +94,31 @@ def read_cwd(pid: str, proc_root: str = "/proc") -> str:
     return next((ln[1:] for ln in out.splitlines() if ln.startswith("n")), "")
 
 
+def _same_dir(a: str, b: str) -> bool:
+    """Two spellings of one folder: equal, or a case variant on a case-insensitive volume."""
+    if os.path.normcase(a) == os.path.normcase(b):
+        return True
+    if a.casefold() != b.casefold():
+        return False
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def _judge(name: str, script: str, pid, engine: str, argv_of, cwd_of) -> "tuple[str, str]":
-    """("match" | "other" | "unknown", a finished line) for one bridge process."""
-    token = _script_operand(argv_of(pid), script)
-    if token is None:
-        return "unknown", f"{name} pid {pid}: script path unreadable"
+    """("match" | "other" | "unknown" | "ignored", a finished line) for one process."""
+    argv = argv_of(pid)
+    if not isinstance(argv, (list, tuple)) or not argv or \
+            not all(isinstance(a, str) for a in argv):
+        return "unknown", (f"{name} pid {pid}: argv vector unreadable "
+                           "(a flattened ps command line is ambiguous, so it is not parsed)")
+    if not _is_interpreter(argv[0]):
+        return "ignored", ""
+    token = _first_operand(list(argv))
+    if token is None or os.path.basename(token) != script:
+        return "unknown", (f"{name} pid {pid}: the interpreter's first script operand "
+                           f"is not {script}")
     path = Path(token)
     if not path.is_absolute():
         cwd = cwd_of(pid)
@@ -138,7 +126,7 @@ def _judge(name: str, script: str, pid, engine: str, argv_of, cwd_of) -> "tuple[
             return "unknown", f"{name} pid {pid}: relative script path and cwd unreadable"
         path = Path(cwd) / path
     runs_from = Path(os.path.realpath(path)).parent.parent
-    if os.path.realpath(runs_from) == engine:
+    if _same_dir(os.path.realpath(runs_from), engine):
         return "match", f"{name} pid {pid}"
     return "other", (f"{name} pid {pid} runs from {runs_from}, not this app's engine ({engine}); "
                      "its tasks may go to another workspace. Restart it from the desktop app")
@@ -146,12 +134,17 @@ def _judge(name: str, script: str, pid, engine: str, argv_of, cwd_of) -> "tuple[
 
 def check_bridge_engine_match(engine_dir, list_pids: Callable[[str], "tuple[list, bool]"],
                               argv_of: Optional[Callable] = None,
-                              cwd_of: Optional[Callable] = None) -> dict:
+                              cwd_of: Optional[Callable] = None,
+                              platform: Optional[str] = None) -> dict:
     """`list_pids(script)` returns (pids, scanned); a failed scan is unknown, not absence."""
+    if (platform or sys.platform).startswith("win"):
+        return {"name": CHECK_NAME, "status": "unknown",
+                "detail": "not checked on Windows: there is no reader here for a process's "
+                          "argv vector or working directory"}
     argv_of = argv_of or read_argv
     cwd_of = cwd_of or read_cwd
     engine = os.path.realpath(engine_dir)
-    found = {"match": [], "other": [], "unknown": []}
+    found = {"match": [], "other": [], "unknown": [], "ignored": []}
     for name, script in BRIDGE_SCRIPTS.items():
         pids, scanned = list_pids(script)
         if not scanned:
