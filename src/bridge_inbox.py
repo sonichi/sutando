@@ -94,7 +94,7 @@ def report_inbox(bridge: str, tasks_dir, directory: Optional[Path] = None,
         record = validate({
             "version": SCHEMA_VERSION, "pid": pid, "bridge": bridge,
             "tasks_dir": canonical(tasks_dir),
-            "engine_dir": canonical(Path(__file__).resolve().parent.parent),
+            "engine_dir": canonical(Path(__file__).resolve().parent.parent),  # lint-workspace-resolution: allow-repo-root — names the engine CODE checkout
             "start": process_start(pid) or "", "started_at": int(time.time()),
         })
         if record is None:
