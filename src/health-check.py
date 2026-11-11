@@ -87,7 +87,7 @@ import process_pins  # noqa: E402
 import pool_suspension  # noqa: E402
 import tmux_pane_keys  # noqa: E402
 import watcher_identity  # noqa: E402
-import bridge_inbox  # noqa: E402
+import bridge_engine  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
 from gateway_serving import (  # noqa: E402
@@ -9464,35 +9464,16 @@ def _watcher_runtime(sentinel: Path, inbox: "str | None") -> str:
     return "claude" if _claude_runtime_selected() else "other"
 
 
-def _core_inboxes() -> "list[str]":
-    """Inboxes the core drains: the resolved one, $SUTANDO_TASKS_DIR, and each
-    live session watcher's `--inbox`."""
-    found = [str(WORKSPACE_DIR / "tasks")]
-    if os.environ.get("SUTANDO_TASKS_DIR"):
-        found.append(os.environ["SUTANDO_TASKS_DIR"])
-    for sp in watcher_sentinel_paths(WORKSPACE_DIR / "state"):
-        try:
-            pid = int(sp.read_text().strip())
-        except (OSError, ValueError):
-            continue
-        argv = _proc_argv(pid)
-        if argv and _is_watcher_argv(argv, pid):
-            role, inbox = _watcher_role_and_inbox(argv, pid)
-            if role == "session" and inbox:
-                found.append(inbox)
-    return found
-
-
-def check_bridge_inbox_match() -> dict:
-    """A bridge running from another install writes tasks this core never reads."""
+def check_bridge_engine_match() -> dict:
+    """A bridge running from another install's engine may write tasks this core never reads."""
     def _pids(script: str) -> list:
         pids, _ok = probe_pids(re.escape(script) + "$")
         return _drop_launcher_parents(pids)
     try:
-        return bridge_inbox.check_bridge_inbox_match(_core_inboxes(), _pids)
+        return bridge_engine.check_bridge_engine_match(REPO_DIR, _pids)
     except Exception as exc:  # noqa: BLE001 — a probe failure is not a finding
-        return {"name": bridge_inbox.CHECK_NAME, "status": "ok",
-                "detail": f"probe failed ({type(exc).__name__}) — not asserting a match"}
+        return {"name": bridge_engine.CHECK_NAME, "status": "unknown",
+                "detail": f"probe failed ({type(exc).__name__})"}
 
 
 def check_task_watcher() -> dict:
@@ -13935,7 +13916,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_stranded_destined_proactive())
     checks.append(check_stale_proactive_backlog())
     checks.append(check_task_watcher())
-    checks.append(check_bridge_inbox_match())
+    checks.append(check_bridge_engine_match())
     checks.append(check_task_claim_age())
     checks.append(check_a_fallback_hits())
     checks.append(check_outbox_parked())

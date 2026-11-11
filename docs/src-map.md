@@ -37,7 +37,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`body_file.py`** — Bounded read of a CLI `--body-file` argument — the single owner of that policy.
 - **`bounded-wait.sh`** — Shared bounded child run.
 - **`bounded_file_read.py`** — Read a small regular file's text without ever blocking: the one reader for credential files.
-- **`bridge_inbox.py`** — Whether each running channel bridge writes tasks into the inbox the core watches.
+- **`bridge_engine.py`** — Whether each running channel bridge runs from this core's engine checkout.
 - **`browser-tools.ts`** — Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
 - **`browser.mjs`** — Sutando browser automation — lightweight Playwright wrapper.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.

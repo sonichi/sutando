@@ -152,7 +152,6 @@ class BridgeTest(unittest.TestCase):
         out, order = io.StringIO(), []
         with mock.patch.object(sys, "stdout", out), \
              mock.patch.object(bridge, "_single_instance_acquire", lambda *_: order.append("lock")), \
-             mock.patch.object(bridge, "report_inbox", lambda *a, **k: None), \
              mock.patch.object(bridge.client, "run", lambda *a, **k: order.append(
                  ("run", bool(logging.getLogger("discord.gateway").handlers)))):
             bridge._run_bridge()

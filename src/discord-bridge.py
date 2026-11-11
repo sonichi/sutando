@@ -116,7 +116,6 @@ _PKG_ROOT = str(Path(__file__).resolve().parent.parent / "packages" / "ag2-sparr
 if _PKG_ROOT not in sys.path:
     sys.path.insert(0, _PKG_ROOT)
 from workspace_default import resolve_workspace  # noqa: E402
-from bridge_inbox import report_inbox  # noqa: E402
 from single_instance import acquire as _single_instance_acquire  # noqa: E402
 from channel_auth_exit import exit_auth_rejected  # noqa: E402
 import discord_config  # noqa: E402  — Sutando workspace-local discord config (#1147)
@@ -2772,7 +2771,6 @@ def _log_gateway_reasons(stream=None) -> None:
 
 def _run_bridge() -> None:
     _single_instance_acquire("discord-bridge")
-    report_inbox("discord-bridge", TASKS_DIR)
     _log_gateway_reasons()
     _run_gateway()
 

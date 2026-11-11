@@ -104,7 +104,6 @@ import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
-from bridge_inbox import report_inbox  # noqa: E402
 from sutando_config import config_get  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 from task_archive import archive_file as _shared_archive_file  # noqa: E402
@@ -2004,7 +2003,6 @@ def _recover_orphan_sending_files() -> int:
 def main():  # pragma: no cover
     global _TOFU_ENROLLMENT_CODE
     _single_instance_acquire("slack-bridge")
-    report_inbox("slack-bridge", TASKS_DIR)
     print("Slack bridge started. Socket Mode connecting...", flush=True)
     _recover_orphan_sending_files()
     # Prime the in-memory access cache so tofu_onboard() can detect external
