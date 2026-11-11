@@ -357,10 +357,15 @@ def _workspace_from(cfg: Dict[str, Any], root: Optional[Path]) -> Path:
     test_ws = _test_mode_workspace()
     if test_ws is not None:
         return test_ws
-    cfg_path = (cfg.get("workspace") or {}).get("path")
     # An embedder (e.g. a desktop app whose repo root is read-only) names the full
     # workspace path; it fills the default slot only, below explicit config.
-    embedder_default = os.environ.get("SUTANDO_DEFAULT_WORKSPACE", "").strip()
+    return _workspace_order(cfg, root, os.environ.get("SUTANDO_DEFAULT_WORKSPACE", ""))
+
+
+def _workspace_order(cfg: Dict[str, Any], root: Optional[Path], embedder_default: str) -> Path:
+    """Config path, then the embedder default, then `<root>/workspace`."""
+    cfg_path = (cfg.get("workspace") or {}).get("path")
+    embedder_default = (embedder_default or "").strip()
     if cfg_path:
         return Path(cfg_path).expanduser().resolve()
     if embedder_default:
@@ -530,6 +535,19 @@ def resolve_workspace(repo_root: Optional[Path] = None) -> Path:
             )
 
     return resolved
+
+
+def checkout_workspace(repo_root: Path, embedder_default: str = "") -> Path:
+    """The workspace a process running from the checkout at `repo_root` resolves.
+
+    For reasoning about ANOTHER checkout's process: reads that checkout's config
+    without touching this process's cache, env or test-mode override.
+    `embedder_default` stands in for that process's `$SUTANDO_DEFAULT_WORKSPACE`.
+    """
+    root = Path(repo_root)
+    cfg = _expand_vars(_deep_merge(_load_json(root / _CONFIG_FILENAME),
+                                   _load_json(root / _LOCAL_FILENAME)), root)
+    return _workspace_order(cfg, root, embedder_default)
 
 
 def resolve_vault(repo_root: Optional[Path] = None) -> Dict[str, Any]:
