@@ -557,10 +557,9 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
         hold = dict(hold, status="released", released_at=now)
     if switched:
         hold = dict(hold, account=launch_account, account_at=now)
-    # Record the launch account when nothing is on record ("none"): a switch is only seen against
-    # it. Never onto a legacy hold that carries no account: that limit is not this account's to claim.
-    first_sight = bool(launch_account and (hold is None or hold.get("status") == "none")
-                       and not (hold or {}).get("account"))
+    # Record the launch account on any record that carries none: a switch is only seen against it.
+    # Never onto a hold this launch released: that limit is not this account's to claim.
+    first_sight = bool(launch_account and not was_held and not (hold or {}).get("account"))
     if first_sight:
         hold = dict(hold or {"status": "none"}, account=launch_account)
     if was_held or switched or first_sight:

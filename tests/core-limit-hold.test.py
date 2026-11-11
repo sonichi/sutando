@@ -799,6 +799,27 @@ class AccountChange(unittest.TestCase):
         self.assertFalse(clh.decide(self.ws, t, quota=limited_record(t, ago=30), launch_account="B").launch)
         self.assertNotIn("account", clh.read_hold(self.ws))
 
+    def test_a_released_or_cleared_record_without_an_account_still_learns_the_launch_account(self):
+        """A record left by an earlier hold (released by the gate, or cleared by the owner) from
+        before accounts were recorded carries none. The next launch must write its account down,
+        or the report repeats: A hits its limit, the owner signs in to B, and B is held."""
+        for status in ("released", "cleared"):
+            with self.subTest(status=status):
+                t = time.time() + 1000
+                clh._write_hold(self.ws, {"status": status, "kind": "usage-limit", "model": None,
+                                          "evidence_at": t - 900, "set_at": t - 890, "until": t - 600,
+                                          "released_at": t - 600, "strikes": 1,
+                                          "reason": "core paused: usage limit on its model, retrying later"})
+                first = clh.decide(self.ws, t, quota=limited_record(t, ago=900), launch_account="A")
+                self.assertTrue(first.launch, "account A launches: the old evidence is already on record")
+                self.assertEqual(clh.read_hold(self.ws)["account"], "A",
+                                 f"a {status} record with no account did not learn the launch account")
+                # A is refused ten seconds later and the core dies; the owner signs in to B.
+                switched = clh.decide(self.ws, t + 20, quota=limited_record(t + 20, ago=10), launch_account="B")
+                self.assertTrue(switched.launch, f"after a {status} record, account A's limit held account B")
+                self.assertEqual(clh.read_hold(self.ws)["account"], "B")
+                self.assertIsNone(clh.active_hold(self.ws, t + 21))
+
     def test_unreadable_account_keeps_the_hold(self):
         self.sign_in("acct-a", "a@example.com")
         self.assertEqual(self.gate(), clh.HOLD_EXIT)
