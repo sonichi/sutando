@@ -198,7 +198,9 @@ class HealthCheckDelegates(unittest.TestCase):
         self.assertEqual(results["other"]["status"], "warn", results)
         self.assertIn(os.path.realpath(other), results["other"]["detail"])
 
-    def test_one_malformed_record_does_not_hide_another_bridges_mismatch(self):
+    def _two_bridges(self, **bad_fields):
+        """Through the real health-check wrapper: slack holds a VALID mismatched
+        record, discord a record with `bad_fields` applied."""
         spec = importlib.util.spec_from_file_location("health_check", ROOT / "src" / "health-check.py")
         health = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(health)
@@ -206,27 +208,53 @@ class HealthCheckDelegates(unittest.TestCase):
         core, other, records = tmp / "core" / "tasks", tmp / "other" / "tasks", tmp / "bridges"
         good, bad = os.getpid(), os.getppid()
         pids = {"slack": [str(good)], "discord": [str(bad)]}
-        stubs = [
-            mock.patch.object(health, "_core_inboxes", lambda: [str(core)]),
-            mock.patch.object(health, "probe_pids", lambda pat: (
-                next((v for k, v in pids.items() if k in pat), []), True)),
-            mock.patch.object(health, "_drop_launcher_parents", lambda p: p),
-            mock.patch.object(bridge_inbox, "sentinel_dir", lambda: records),
-        ]
-        for st in stubs:
-            st.start()
-            self.addCleanup(st.stop)
-        bridge_inbox.report_inbox("slack-bridge", other, pid=good)
-        rec = {"version": 1, "pid": bad, "bridge": [], "tasks_dir": str(core),
-               "engine_dir": "/e", "start": bridge_inbox.process_start(bad), "started_at": 1}
-        (records / f"discord-bridge-{bad}.json").write_text(json.dumps(rec))
-        got = health.check_bridge_inbox_match()
-        self.assertEqual(got["status"], "warn", got)
-        self.assertIn(f"slack-bridge pid {good}", got["detail"])
-        self.assertIn(os.path.realpath(other), got["detail"])
-        self.assertNotIn("probe failed", got["detail"])
-        self.assertIn(f"discord-bridge pid {bad}", got["detail"])
-        self.assertIn("inbox record malformed", got["detail"])
+        with mock.patch.object(health, "_core_inboxes", lambda: [str(core)]), \
+             mock.patch.object(health, "probe_pids", lambda pat: (
+                 next((v for k, v in pids.items() if k in pat), []), True)), \
+             mock.patch.object(health, "_drop_launcher_parents", lambda p: p), \
+             mock.patch.object(bridge_inbox, "sentinel_dir", lambda: records):
+            bridge_inbox.report_inbox("slack-bridge", other, pid=good)
+            rec = {"version": 1, "pid": bad, "bridge": "discord-bridge", "tasks_dir": str(core),
+                   "engine_dir": "/e", "start": bridge_inbox.process_start(bad), "started_at": 1}
+            rec.update(bad_fields)
+            (records / f"discord-bridge-{bad}.json").write_text(json.dumps(rec))
+            got = health.check_bridge_inbox_match()
+        return got, good, bad, other
+
+    def _assert_mismatch_survives(self, got, good, bad, other, label):
+        self.assertEqual(got["status"], "warn", (label, got))
+        self.assertIn(f"slack-bridge pid {good}", got["detail"], label)
+        self.assertIn(os.path.realpath(other), got["detail"], label)
+        self.assertNotIn("probe failed", got["detail"], label)
+        self.assertIn(f"Also inbox unknown: discord-bridge pid {bad}", got["detail"], label)
+
+    def test_one_malformed_record_does_not_hide_another_bridges_mismatch(self):
+        got, good, bad, other = self._two_bridges(bridge=[])
+        self._assert_mismatch_survives(got, good, bad, other, "bridge=[]")
+        self.assertIn("inbox record malformed (bridge)", got["detail"])
+
+    def test_nul_in_tasks_dir_is_named_and_does_not_hide_a_mismatch(self):
+        got, good, bad, other = self._two_bridges(tasks_dir="/bad\u0000path")
+        self._assert_mismatch_survives(got, good, bad, other, "NUL")
+        self.assertIn("inbox record malformed (tasks_dir)", got["detail"])
+
+    BAD_VALUES = ["/bad\u0000path", "", "relative/path", [], {}, None, "/" + "x" * 5000,
+                  [["nested"]], {"a": [1]}, True, 1.5, -1, 0]
+
+    def test_bad_values_in_every_field_never_hide_the_mismatch(self):
+        fields = ["version", "pid", "bridge", "tasks_dir", "engine_dir", "start", "started_at"]
+        cases = [(f, v) for f in fields for v in self.BAD_VALUES]
+        cases += [("pid", "123"), ("start", 42), ("start", ["lstart:x"])]
+        failed = []
+        for field, value in cases:
+            label = f"{field}={value!r}"[:80]
+            got, good, bad, other = self._two_bridges(**{field: value})
+            try:
+                self._assert_mismatch_survives(got, good, bad, other, label)
+            except AssertionError:
+                failed.append(label)
+        print(f"\n  table: {len(cases)} cases, {len(failed)} failed", file=sys.stderr)
+        self.assertEqual(failed, [])
 
     def test_health_check_runs_the_probe(self):
         src = (ROOT / "src" / "health-check.py").read_text()

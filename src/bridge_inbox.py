@@ -74,22 +74,35 @@ def _is_int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
 
-def validate(data) -> Optional[dict]:
-    """The record if it matches schema v1 and its bounds, else None. Types first,
-    so no value can make a membership or comparison raise."""
+def _text_ok(v, cap: int, path: bool) -> bool:
+    if not (isinstance(v, str) and 0 < len(v) <= cap and "\x00" not in v):
+        return False
+    return os.path.isabs(v) if path else True
+
+
+def schema_error(data) -> Optional[str]:
+    """The first field that breaks schema v1 and its bounds, or None. Types are
+    checked before any membership or comparison, so no value can raise here."""
     if not isinstance(data, dict):
-        return None
-    version, pid, bridge = data.get("version"), data.get("pid"), data.get("bridge")
-    if not (_is_int(version) and _is_int(pid) and isinstance(bridge, str)
-            and _is_int(data.get("started_at"))):
-        return None
-    for key, cap in (("tasks_dir", _MAX_PATH), ("engine_dir", _MAX_PATH), ("start", _MAX_START)):
-        v = data.get(key)
-        if not (isinstance(v, str) and 0 < len(v) <= cap):
-            return None
-    if version != SCHEMA_VERSION or pid <= 0 or bridge not in BRIDGE_SCRIPTS:
-        return None
-    return data if os.path.isabs(data["tasks_dir"]) else None
+        return "not an object"
+    if not (_is_int(data.get("version")) and data["version"] == SCHEMA_VERSION):
+        return "version"
+    if not (_is_int(data.get("pid")) and data["pid"] > 0):
+        return "pid"
+    if not (isinstance(data.get("bridge"), str) and data["bridge"] in BRIDGE_SCRIPTS):
+        return "bridge"
+    if not (_is_int(data.get("started_at")) and data["started_at"] > 0):
+        return "started_at"
+    for key, cap, path in (("tasks_dir", _MAX_PATH, True), ("engine_dir", _MAX_PATH, True),
+                           ("start", _MAX_START, False)):
+        if not _text_ok(data.get(key), cap, path):
+            return key
+    return None
+
+
+def validate(data) -> Optional[dict]:
+    """The record if it matches schema v1, else None."""
+    return None if schema_error(data) else data
 
 
 def report_inbox(bridge: str, tasks_dir, directory: Optional[Path] = None,
@@ -140,11 +153,14 @@ def read_report(bridge: str, pid, directory: Optional[Path] = None,
     except (OSError, ValueError):
         return None, "unreadable"
     try:
-        data = validate(json.loads(raw))
+        data = json.loads(raw)
     except ValueError:
-        data = None
-    if data is None or data["bridge"] != bridge or str(data["pid"]) != str(pid):
-        return None, "malformed"
+        return None, "malformed (not JSON)"
+    bad = schema_error(data)
+    if bad:
+        return None, f"malformed ({bad})"
+    if data["bridge"] != bridge or str(data["pid"]) != str(pid):
+        return None, "malformed (names another bridge or pid)"
     live = start_of(pid)
     if live is None:
         return None, "start unreadable"
@@ -215,6 +231,21 @@ def read_cwd(pid: str) -> str:
     return next((ln[1:] for ln in out.splitlines() if ln.startswith("n")), "")
 
 
+def _judge_record(name, script, pid, core, directory, start_of, argv_of, cwd_of) -> "tuple[str, str]":
+    """All work on one bridge's record, message formatting included:
+    ("match" | "mismatch" | "unknown", a finished line). The probe only joins lines."""
+    report, why = read_report(name, pid, directory, start_of)
+    if report is None:
+        engine = bridge_engine(argv_of(pid), cwd_of(pid), script)
+        return "unknown", (f"{name} pid {pid} from {engine or 'an unreadable engine'}: "
+                           f"inbox record {why} — it may predate inbox reporting, so its "
+                           "destination is unverified; restart it from the desktop engine")
+    inbox = canonical(report["tasks_dir"])
+    if inbox in core:
+        return "match", f"{name} pid {pid}"
+    return "mismatch", f"{name} pid {pid} (from {report['engine_dir']}) writes {inbox}"
+
+
 def check_bridge_inbox_match(core_inboxes: Iterable,
                              list_pids: Callable[[str], list],
                              directory: Optional[Path] = None,
@@ -229,23 +260,15 @@ def check_bridge_inbox_match(core_inboxes: Iterable,
         return {"name": CHECK_NAME, "status": "ok",
                 "detail": "core inbox unknown — not comparing bridge inboxes"}
     seen, mismatched, unknown = [], [], []
+    verdicts = {"match": seen, "mismatch": mismatched, "unknown": unknown}
     for name, script in BRIDGE_SCRIPTS.items():
         for pid in list_pids(script):
             try:
-                report, why = read_report(name, pid, directory, start_of)
+                kind, text = _judge_record(name, script, pid, core, directory,
+                                           start_of, argv_of, cwd_of)
             except Exception as exc:  # noqa: BLE001 — one record never fails the probe
-                report, why = None, f"malformed ({type(exc).__name__})"
-            if report is None:
-                engine = bridge_engine(argv_of(pid), cwd_of(pid), script)
-                unknown.append(f"{name} pid {pid} from {engine or 'an unreadable engine'}: "
-                               f"inbox record {why} — it may predate inbox reporting, so its "
-                               "destination is unverified; restart it from the desktop engine")
-                continue
-            inbox = canonical(report["tasks_dir"])
-            if inbox in core:
-                seen.append(f"{name} pid {pid}")
-            else:
-                mismatched.append(f"{name} pid {pid} (from {report['engine_dir']}) writes {inbox}")
+                kind, text = "unknown", f"{name} pid {pid}: record invalid ({type(exc).__name__})"
+            verdicts[kind].append(text)
     if mismatched:
         return {"name": CHECK_NAME, "status": "warn",
                 "detail": (f"{'; '.join(mismatched)} — but the core watches "
