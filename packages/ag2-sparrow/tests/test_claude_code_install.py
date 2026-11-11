@@ -191,7 +191,7 @@ class ConnectInstall(ConnectBase):
         rc, out, err = self.install_with(silent)
         self.assertEqual(rc, 1)
         self.assertIn(f"the managed launcher did not acquire {self.work} within 2 s (free)", err)
-        self.assertIn(f"run {cli.COMMAND} uninstall, then {cli.COMMAND} install", err)
+        self.assertIn(f"run {cli.COMMAND} uninstall --work {self.work}, then {cli.COMMAND} install", err)
         self.assertTrue(cli.config_path().exists() and cli.service_path().exists(), "as written; nothing rolled back")
         self.assertNotIn(self.ACQUIRED, out)
         rc, out, _ = self.install_with(self.runner())
@@ -241,7 +241,7 @@ class ConnectInstall(ConnectBase):
             rc, _, err = self.install_with(self.runner(table))
             self.assertEqual(rc, 1, table)
             self.assertIn(f"the managed launcher did not acquire {self.work}", err)
-            self.assertIn("uninstall, then", err)
+            self.assertIn(f"uninstall --work {self.work}, then", err)
         rc, _, err = self.install_with(self.runner({("launchctl", "bootstrap"): 1}), True)
         self.assertEqual((rc, "bootstrap failed" in err), (1, True))
 
@@ -254,7 +254,7 @@ class ConnectInstall(ConnectBase):
                       {("systemctl", "stop"): None}):
             rc, _, err = self.install_with(self.runner(table), False, "--permission-mode", "plan")
             self.assertEqual(rc, 1, table)
-            self.assertIn("nothing was applied", err)
+            self.assertRegex(err, r"(nothing|its stop was asked for and nothing else) was applied")
             self.assertEqual(cli.config_path().read_text(), before, "the old config stands")
         for table in ({("systemctl", "show"): (1, "", "Failed to connect to bus\n")}, {("systemctl", "show"): None}):
             rc, _, err = self.install_with(self.runner(table), False, "--permission-mode", "plan")
@@ -405,7 +405,7 @@ class ConnectRoot(ConnectBase):
         runner.calls.clear()
         rc, _, err = self.install_with(runner, False, "--work", str(other))
         self.assertEqual(rc, 1)
-        self.assertIn(f"the work root is {self.work}, not {other}; run {cli.COMMAND} uninstall, then {cli.COMMAND} install", err)
+        self.assertIn(f"the work root is {self.work}, not {other}; run {cli.COMMAND} uninstall --work {self.work}, then {cli.COMMAND} install", err)
         self.assertEqual(cli.config_path().read_text(), before)
         self.assertEqual(runner.calls, [], "refused before the manager is touched")
         self.assertFalse(other.exists(), "the proposed root is untouched: no tasks/ or results/ made")
@@ -478,7 +478,8 @@ class ConnectOrphan(ConnectBase):
         early = Early(root=None)
         rc, out, err = self.install_with(early, True, "--permission-mode", "default")
         self.assertEqual(rc, 1)
-        self.assertIn(f"{self.work} is held by launcher pid {old} after the stop; nothing was applied", err)
+        self.assertIn(f"{self.work} is held by launcher pid {old} after the stop; ", err)
+        self.assertIn(" was stopped and nothing else was applied", err)
         self.assertNotIn(ConnectInstall.ACQUIRED, out)
         self.assertNotIn("bootstrap", early.verbs("launchctl"), "no start over a root that is not free")
         self.assertEqual(cli.config_path().read_text(), before, "nothing written")
@@ -1143,8 +1144,7 @@ class ConnectOwnership(ConnectBase):
         self.assertTrue(cfg.is_dir())
         cfg.rmdir()
         good = self.configure().read_text()
-        for bad in (good + "PERMISSION_MODE='unclosed\n", good.replace("INBOX_DIR=", "INBOX_WAS="),
-                    good.replace(f"ROOT={self.work}", "ROOT=relative/work")):
+        for bad in (good.replace(f"ROOT={self.work}", "ROOT=relative/work"),):
             cfg.write_text(bad)
             scratch = self.home / "cwd"
             scratch.mkdir(exist_ok=True)
@@ -1164,6 +1164,31 @@ class ConnectOwnership(ConnectBase):
             self.assertFalse(cli.service_path().exists())
             rc, _, err = self.main("uninstall")
             self.assertEqual((rc, cfg.read_text()), (1, bad), "uninstall keeps it too: " + err)
+
+    def test_a_marked_config_that_no_longer_loads_on_its_own_root_is_repaired_by_install(self):
+        """A marked config whose root is still the one install resolves (an unparsable line, a key gone) is
+        rewritten whole by install, the repair verify names; run, verify and uninstall still refuse it."""
+        cfg = cli.config_path()
+        good, runner = self.configure().read_text(), self.runner()
+        for bad in (good + "PERMISSION_MODE='unclosed\n", good.replace("INBOX_DIR=", "INBOX_WAS=")):
+            cfg.write_text(bad)
+            self.assertEqual(self.main("run")[0], 2, bad)
+            self.assertEqual(self.main("verify")[0], 1, bad)
+            rc, out, err = self.install_with(runner)
+            self.assertEqual(rc, 0, out + err)
+            self.assertIn(f"repairing: {cfg}, which no longer loads", out)
+            self.assertEqual(cm.load_config(L)[1], "", "the rewritten config loads")
+            self.assertEqual(cm.read_config(cfg)["ROOT"], str(self.work))
+        cfg.write_text(good.replace(f"ROOT={self.work}", "ROOT='unclosed"))     # the unit still records the root
+        rc, out, err = self.install_with(runner)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(cm.read_config(cfg)["ROOT"], str(self.work))
+        elsewhere = good.replace(f"ROOT={self.work}", f"ROOT={self.home / 'elsewhere'}") + "PERMISSION_MODE='unclosed\n"
+        cfg.write_text(elsewhere)       # the config and the unit disagree on the root: no repair
+        rc, out, err = self.install_with(runner)
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("remove it by hand", err)
+        self.assertEqual(cfg.read_text(), elsewhere, "preserved")
 
     def test_a_malformed_owned_config_fails_closed_with_an_old_root_orphan(self):
         """The persisted root is the only anchor; a config that cannot name it stops install and uninstall

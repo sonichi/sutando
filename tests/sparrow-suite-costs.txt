@@ -25,6 +25,7 @@
 22 packages/ag2-sparrow/tests/test_hatch_served_setup.py
 0 packages/ag2-sparrow/tests/test_human_action.py
 0 packages/ag2-sparrow/tests/test_inflight_recovery.py
+25 packages/ag2-sparrow/tests/test_install_token_stdin.py
 1 packages/ag2-sparrow/tests/test_launch_diagnostics.py
 35 packages/ag2-sparrow/tests/test_lock_heartbeat_thread.py
 9 packages/ag2-sparrow/tests/test_on_task_wake.py

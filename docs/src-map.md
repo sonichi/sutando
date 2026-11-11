@@ -24,7 +24,9 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`ag2space_links.py`** — Links a person clicks to open an AG2 Space room, message or room surface inside the app.
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
 - **`agent_availability.py`** — Two room-visible projections of one private runtime: what this agent is doing on THIS task, and whether it can take more work.
+- **`agent_display_name.py`** — The name this agent introduces itself by: its live s.space display name, never a persona name.
 - **`agent_endpoint.py`** — Agent Endpoint resolver — resolve(endpoint, mode) → a transport route.
+- **`agent_triggers.py`** — AgentTrigger vocabulary and playbook dispatch: which platform events a task may name and which skill runs it.
 - **`agent_turn.py`** — Per-invocation turn context and the 3-outcome turn gate for relay tasks.
 - **`archive-stale-results.py`** — Archive stale `results/*.txt` files to `results/archive-YYYY-MM-DD/`.
 - **`archive-transcript.sh`** — Archive the conversation transcript on PreCompact.
@@ -35,6 +37,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`body_file.py`** — Bounded read of a CLI `--body-file` argument — the single owner of that policy.
 - **`bounded-wait.sh`** — Shared bounded child run.
 - **`bounded_file_read.py`** — Read a small regular file's text without ever blocking: the one reader for credential files.
+- **`bridge_engine.py`** — Whether each running channel bridge runs from this core's engine checkout.
 - **`browser-tools.ts`** — Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
 - **`browser.mjs`** — Sutando browser automation — lightweight Playwright wrapper.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
@@ -51,7 +54,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`check-pending-questions.py`** — Thin entry for the pending-questions reminder: hands argv to the `remind` of the adapter an installed skill declares (`--store-adapter <path>` overrides), resolved here across the installed roots (src/skill_roots.py) and injected into src/pending_questions_reader.py.
 - **`check-pending-tasks.sh`** — Stop hook: blocks Claude from finishing when unprocessed tasks exist.
 - **`claude_config_dir.sh`** — Shared CLAUDE_CONFIG_DIR resolution for start-cli.sh and startup.sh.
-- **`claude_hooks_settings.py`** — Sutando-owned hook entries in a project-level Claude Code settings.json: install one idempotently and prune dead copies of the same hook.
+- **`claude_hooks_settings.py`** — Sutando-owned hook entries in a project-level Claude Code settings.json: install one idempotently, prune dead copies of the same hook, and re-point hooks a moved install left on its old path.
 - **`cli_wedge.py`** — CLI progress detector for the core's tmux pane — advisory only.
 - **`cli_wedge_patterns.py`** — The abnormal-banner table of the CLI progress detector: text on a pane that says the CLI is parked (a login prompt, a provider limit, a compaction, an error it sits on), as data.
 - **`client-frame-hub.ts`** — Client-frame hub: optional voice plugins register handlers; the host offers them every client JSON frame it does not own.
@@ -165,6 +168,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`output_sanitizer.ts`** — Pure predicate + state machine, no deps — importable so tests exercise THIS code rather than a copy that can pass while the real sanitizer drifts.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`owner_activity.py`** — Atomic publication of the owner's most recent messaging activity.
+- **`owner_channel.py`** — May the core speak in this channel?
 - **`owner_room_access.py`** — How a room-database adapter reaches the owner's room: capability lookup, owner DM, agent identity and credentials.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
 - **`pending_questions_reader.py`** — The one way core reads owner pending questions: through the store adapter an installed skill declares in its manifest (`pending_questions_store`), loaded by the path an edge injects — core names no skill, scans no root and carries no question schema.
@@ -231,8 +235,9 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`skill_install.py`** — Atomic, fail-closed installs of skill directories into the core's skills dir.
 - **`skill_roots.py`** — Where installed skills live, and what their manifests declare — the one Python scan of the sanctioned roots: the engine's `<repo>/skills` and the owner's `<workspace>/skills`, the pair `skills/install.sh` links (the TS loader `loadSkillManifestTools` scans these and more; consumers and their roots are listed in skills/MANIFEST.md).
 - **`skip_marker_ownership.ts`** — Suppression is universal; retirement authority is scoped to the consumer that dispatched the task.
-- **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to tasks/, sends replies from results/.
+- **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs, @mentions and replies in threads the bot started or was @-mentioned in via Socket Mode, writes to tasks/, sends replies from results/.
 - **`slack_access.py`** — Slack access-record semantics — the three states, owned in one place.
+- **`slack_bot_threads.py`** — Slack channel thread replies addressed to the bot — companion to `slack-bridge.py`.
 - **`slack_owner.py`** — Slack owner-recipient resolution helpers.
 - **`slack_proactive_receipts.py`** — Durable idempotency receipts for Slack proactive-result delivery.
 - **`slack_result_delivery.py`** — Slack reply-leg delivery state, bound to the shared outbox (Slack strangler).
@@ -256,6 +261,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`task-emit.sh`** — TASK_FILE emitters — sourceable so a test can invoke them in isolation.
 - **`task_archive.py`** — Task-file locator for archive calls (#933).
 - **`task_body_guard.py`** — Confine untrusted user message content before embedding it in a task file.
+- **`task_delegation.py`** — A task the core handed to an in-session background agent, for a bounded time.
 - **`task_disposition.py`** — What happened to a task whose file is not where a notification said it was.
 - **`task_envelope.py`** — Task-envelope authentication: an HMAC stamp that makes access_tier a verified claim instead of an honor-system header.
 - **`task_envelope.ts`** — task_envelope.ts — TypeScript mirror of src/task_envelope.py's stamping half, for the TS task writers (voice delegation seam, context-drop, wearable).
@@ -361,6 +367,11 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`start-cli.sh`** — src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core tmux session.
 - **`sutando-shell-setup.sh`** — sutando-shell-setup — configure the `claude-sutando` shell alias.
 - **`task-notifier.sh`** — External task-file-injection notifier for the Claude Code core, matching Codex/agy's tmux-injection shape — a standby path alongside self-arm via Monitor.
+
+## `src/agent/claude/task-watch-mod/hooks/`
+
+- **`register.ts`** — The task-watch Mod: runs the session's task watcher and starts a turn with each task it announces.
+- **`version.ts`** — The oldest Claude Code this Mod is verified on; the launchers read this line too.
 
 ## `src/agent/codex/cli/`
 

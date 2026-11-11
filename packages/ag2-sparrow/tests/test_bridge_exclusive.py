@@ -30,8 +30,9 @@ from claude_code_fixtures import cb, cm, sm  # noqa: E402
 
 claude_cli, codex_cli = fx.cli, importlib.import_module("ag2_sparrow.adapters.codex.connect_cli")
 
-CL, CX = claude_cli.LOCAL, codex_cli.LOCAL
-BRIDGES = {CL.name: claude_cli.BRIDGE, CX.name: codex_cli.BRIDGE}
+# Each adapter's own job for the agent, and its bridge.
+CL, CX = (cm.for_key(m.LOCAL, cm.agent_key(fx.AGENT)) for m in (claude_cli, codex_cli))
+BRIDGES = {CL.name: cb.bridge_shape(CL), CX.name: cb.bridge_shape(CX)}
 COMMANDS = {CL.name: claude_cli.COMMAND, CX.name: codex_cli.COMMAND}
 FAKE_CODEX = '''#!/bin/sh
 case "$1 $2" in
@@ -41,6 +42,7 @@ case "$1 $2" in
 esac
 '''
 START = ("restart", "start", "bootstrap", "kickstart")
+OTHER = "@other.agent:ag2.space"
 
 
 def verb_of(cmd):
@@ -110,13 +112,17 @@ class Jobs:
     def __init__(self, root, runners):
         self.launchers = {s.name: LauncherJob(s, root) for s in (CL, CX)}
         self.bridges = {name: BridgeJob(shape) for name, shape in BRIDGES.items()}
-        runners.extend(self.launchers.values())
+        # Another agent's own jobs on either adapter, on its own root.
+        others = [cm.for_key(m.LOCAL, cm.agent_key(OTHER)) for m in (claude_cli, codex_cli)]
+        self.other_launchers = [LauncherJob(s, Path(root).parent / "other.agent_ag2.space") for s in others]
+        self.other_bridges = [BridgeJob(cb.bridge_shape(s)) for s in others]
+        runners.extend([*self.launchers.values(), *self.other_launchers])
 
     def __call__(self, cmd, timeout=30):
-        for job in self.bridges.values():
+        for job in [*self.bridges.values(), *self.other_bridges]:
             if job.ours(cmd):
                 return job(cmd)
-        for job in self.launchers.values():
+        for job in [*self.launchers.values(), *self.other_launchers]:
             if any(job.shape.service_name in a or job.shape.agent_label in a for a in cmd):
                 return job(cmd, timeout)
         return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -197,7 +203,7 @@ class Exclusive(fx.AgentRootBase):
     def assert_refused_untouched(self, rc, err, first, second, jobs, before):
         self.assertNotEqual(rc, 0, err)
         self.assertIn(f"already has a bridge, run by {first}", err)
-        self.assertIn(f"run {COMMANDS[first]} uninstall first", err)
+        self.assertIn(f"run {COMMANDS[first]} uninstall --agent {fx.AGENT} first", err)
         self.assertFalse(jobs.bridges[second].started(), "no second bridge is started")
         self.assertFalse(any(verb_of(c) in START for c in jobs.launchers[second].calls), "no second launcher")
         self.assertTrue(jobs.bridges[first].active, "the first bridge is left running")
@@ -245,7 +251,8 @@ class Exclusive(fx.AgentRootBase):
 
     def record(self, root, agent):
         """codex-local's config as install wrote it for `root`, its job stopped."""
-        cm._write(cm.config_path(CX), cm.render_config(CX, {
+        shape = cm.job_for(CX, agent)
+        cm._write(cm.config_path(shape), cm.render_config(shape, {
             "CODEX": str(self.codex), "INBOX_DIR": f"{root}/tasks", "RESULTS_DIR": f"{root}/results",
             "AGENT_ID": agent, "BRIDGE": cb.UNIT, "ROOT": str(root)}), 0o600)
 
@@ -270,8 +277,11 @@ class Exclusive(fx.AgentRootBase):
                 self.assertNotIn("already has a bridge", err)
                 self.assertIn(f"connected: {other}", out)
                 self.assertTrue(jobs.bridges[CL.name].active, "the served agent's bridge is left running")
-                for path in (cm.config_path(CX), cm.supervisor_path(BRIDGES[CX.name]), cm.supervisor_path(CX)):
+                shape = cm.job_for(CX, other)
+                for path in (cm.config_path(shape), cm.supervisor_path(cb.bridge_shape(shape)), cm.supervisor_path(shape)):
                     path.unlink(missing_ok=True)
+                for launcher in jobs.other_launchers:   # the other agent's own launcher holds its own root
+                    launcher.stop_session()
 
     def test_a_connect_without_agent_is_refused_before_the_code_is_read(self):
         for name in (CL.name, CX.name):
@@ -416,7 +426,7 @@ class Exclusive(fx.AgentRootBase):
                                                             "ROOT": str(self.root)}), 0o600)
         problem = cb.bridge_owner_problem(CX, str(self.root), fx.AGENT)
         self.assertIn(f"run by {CL.name} (declared for sparrowd)", problem)
-        self.assertIn(f"run {COMMANDS[CL.name]} uninstall first", problem)
+        self.assertIn(f"run {COMMANDS[CL.name]} uninstall --agent {fx.AGENT} first", problem)
         cm.config_path(CL).unlink()
         self.assertEqual(cb.bridge_owner_problem(CX, str(self.root), fx.AGENT), "")
 

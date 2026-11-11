@@ -66,6 +66,8 @@ NOTIFIER_SUPERVISOR="$REPO/src/agent/codex/cli/task-notifier-supervisor.sh"
 NOTIFIER_SCRIPT="$REPO/src/agent/claude/cli/task-notifier.sh"
 SURFACE_ARGS=(--remote-control "Sutando" --chrome)
 add_skill_claude_plugins
+# Off unless SUTANDO_TASK_WATCH_MOD_CORE=1: the core keeps its Monitor watcher by default.
+add_task_watch_mod "${SUTANDO_TASK_WATCH_MOD_CORE:-}"
 # `/startup` is the CANONICAL CORE's ceremony: orphan recovery, session crons,
 # a gate any watcher satisfies. One arg — the skill reads it as $ARGUMENTS.
 BOOT_PROMPT="/startup"
@@ -128,6 +130,9 @@ restore_shutdown_sentinel() {
 }
 export SUTANDO_CORE_RUNTIME=claude
 ENV_ARGS=(-e SUTANDO_CORE_RUNTIME=claude -e SUTANDO_CORE_SESSION=1)
+# Always set, empty included, so a stale tmux server value cannot switch the watcher path.
+export SUTANDO_TASK_WATCH_MOD="$TASK_WATCH_MOD"
+ENV_ARGS+=(-e "SUTANDO_TASK_WATCH_MOD=$TASK_WATCH_MOD")
 [ -n "${SUTANDO_TMUX_SOCKET:-}" ] && ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
 [ -n "${SUTANDO_TMUX_SESSION:-}" ] && ENV_ARGS+=(-e "SUTANDO_TMUX_SESSION=$SUTANDO_TMUX_SESSION")
 # Forward the embedder-provided default workspace into the core session for the
@@ -162,9 +167,14 @@ if [ "${1:-}" = "--print-core-env" ]; then
   exit 0
 fi
 
-# Registers the PERSONAL_CLAUDE.md compaction-reinject hook. Below the probe
-# exit: --print-core-env is a pure read and must not write settings.
+# Below the probe exit: --print-core-env is a pure read and must not write settings.
+repair_claude_hook_paths
+# Registers the PERSONAL_CLAUDE.md compaction-reinject hook.
 install_claude_personal_hook
+
+# Restore owned hooks before spawning; unattended launches omit the transcript archiver.
+SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash "$REPO/src/install-claude-hooks.sh" \
+  || echo "start-cli: claude hooks install failed (rc=$?) — owned hooks may be absent this session" >&2
 
 # Optional working-directory override for the core `claude` process.
 #   - Unset (upstream default): no override — the core launches from $REPO (the
@@ -562,7 +572,12 @@ fi
 # provider limit is held until the reset or a backoff; any other death launches as before.
 if [ -n "$PY" ] && [ -f "$REPO/src/core_limit_hold.py" ]; then
   _hold_rc=0
-  _hold_line="$("$PY" "$REPO/src/core_limit_hold.py" gate --cwd "$(pwd -P)" --switch-entry "$REPO/scripts/switch-model.sh" 2>/dev/null)" || _hold_rc=$?
+  # The desktop host's card presenter, when this checkout runs under one; the gate names no host file.
+  _card_args=()
+  _app_dir="$(sutando_desktop_app_support "$REPO")"
+  [ -n "$_app_dir" ] && [ -f "$_app_dir/engine/local-card.py" ] && _card_args=(--card-entry "$_app_dir/engine/local-card.py")
+  _hold_line="$("$PY" "$REPO/src/core_limit_hold.py" gate --cwd "$(pwd -P)" --switch-entry "$REPO/scripts/switch-model.sh" \
+    ${_card_args[@]+"${_card_args[@]}"} 2>/dev/null)" || _hold_rc=$?
   if [ "$_hold_rc" = 75 ]; then
     echo "  ⏸ $SESSION not launched — ${_hold_line:-core paused: provider limit}" >&2
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "held: ${_hold_line:-provider limit}"
@@ -589,7 +604,7 @@ if claude_named_tmux_session_exists; then
     tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
     exit 127
   fi
-  CORE_CMD=(claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
+  CORE_CMD=("${CLAUDE_BIN:-claude}" --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} -- "$BOOT_PROMPT")
   # -P -F prints the index the window ACTUALLY landed on: when index 0 is
   # occupied (e.g. a sibling drifted there) the fallback creates the core at a
