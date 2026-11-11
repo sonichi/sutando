@@ -618,6 +618,13 @@ enabled identity whose token cannot be read (`no_token`, exit 1), answers every 
 refusal rather than mint as the core. A Codex worker's proxy inherits no environment, so it does
 not yet take this path.
 
+The proxy decides whom it acts as once, when the seat starts. A worker given its own agent while
+its seat runs keeps acting as the core's, and once the worker's credential exists every call
+fails with "descriptor changed during the call": the identity changed under the seat, and the fix
+is to restart the seat. `pool_identity.py` does that after any add that creates the identity
+(`pool_manage.py reseat <worker>`); a seat that owes work is left running and the command prints
+the reseat to run once it is done.
+
 `connections.task_agent_mxid(task_id)` names the agent a task is answered as: the agent of the
 lane that queued it (`task-<instance>~…`). Each row of `state/agent-activity.jsonl` for such a
 task carries it as `agent`.
