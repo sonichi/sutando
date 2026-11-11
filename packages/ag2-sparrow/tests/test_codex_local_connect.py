@@ -487,9 +487,16 @@ class Install(Base):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             cli.main(["install", "--work", str(self.work), "--sandbox", "no-such-sandbox"])
 
+    def signing_key(self):
+        from ag2_sparrow import task_hmac
+        key = self.home / "task-hmac.key"
+        task_hmac.create_key(key)
+        return str(key)
+
     def test_full_access_is_explicit_persisted_shown_and_owner_only(self):
         runner = self.runner()
-        rc, out, _ = self.install_with(runner, False, "--sandbox", "danger-full-access")
+        rc, out, _ = self.install_with(runner, False, "--sandbox", "danger-full-access",
+                                       "--hmac-key-file", self.signing_key())
         self.assertEqual(rc, 0)
         self.assertIn("NOTE sandbox: danger-full-access lets an owner turn run commands, change files anywhere this "
                       "user can and use the network, all without asking", out)
@@ -502,6 +509,46 @@ class Install(Base):
             out = self.main("verify")[1]
         self.assertIn("INFO sandbox: danger-full-access for owner turns; non-owner turns are always read-only", out)
         self.assertEqual(cc.NON_OWNER_SANDBOX, "read-only", "the connector's non-owner floor is unchanged")
+        self.assertEqual(self.checks(out).get("full access signed"), "PASS", out)
+
+    def test_full_access_without_a_signing_key_is_refused_before_anything_is_written(self):
+        for extra in ((), ("--hmac-key-file", str(self.home / "absent.key"))):
+            runner = self.runner()
+            rc, out, err = self.install_with(runner, False, "--sandbox", "danger-full-access", *extra)
+            self.assertEqual(rc, cli.EXIT_UNUSABLE, extra)
+            self.assertEqual(err, "error: " + cli.FULL_ACCESS_UNSIGNED + "\n")
+            self.assertIn("pass --hmac (or --hmac-key-file <key>), or drop full access", err)
+            self.assertEqual(runner.calls, [], "no manager is asked anything")
+            self.assertFalse(cli.config_path().exists(), "no config")
+
+    def test_connect_refuses_full_access_without_a_key_before_the_code_is_spent(self):
+        ns = argparse.Namespace(sandbox="danger-full-access", hmac=False, hmac_key_file=None, codex=str(self.codex),
+                                codex_home=str(self.codex_home))
+        self.assertEqual(cli.connect_preflight(ns, login=False), cli.FULL_ACCESS_UNSIGNED)
+        for over in ({"hmac": True}, {"hmac_key_file": self.signing_key()}, {"sandbox": "read-only"},
+                     {"sandbox": "workspace-write"}):
+            self.assertEqual(cli.full_access_problem(argparse.Namespace(**dict(vars(ns), **over))), "", over)
+
+    def test_a_recorded_full_access_job_with_no_key_is_refused_on_its_next_install(self):
+        runner = self.runner()
+        self.assertEqual(self.install_with(runner, False, "--sandbox", "danger-full-access",
+                                           "--hmac-key-file", self.signing_key())[0], 0)
+        path = cli.config_path()
+        path.write_text("\n".join("HMAC_KEY_FILE=" if line.startswith("HMAC_KEY_FILE=") else line
+                                  for line in path.read_text().split("\n")))
+        self.assertEqual(cm.read_config(path)["HMAC_KEY_FILE"], "")
+        with mock.patch.object(sm, "_run", side_effect=runner):
+            rc, out, err = self.main("install", "--work", str(self.work))
+            vrc, vout, _ = self.main("verify")
+        self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
+        self.assertIn(cli.FULL_ACCESS_UNSIGNED, err)
+        self.assertEqual(self.checks(vout).get("full access signed"), "FAIL", vout)
+        self.assertNotEqual(vrc, 0)
+
+    def test_the_default_sandbox_needs_no_key(self):
+        rc, _, err = self.install_with(self.runner(), False)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(cm.read_config(cli.config_path())["SANDBOX"], "read-only")
 
     def test_install_refuses_an_old_codex_before_writing_anything(self):
         (self.home / "codex-version").write_text("0.157.0")

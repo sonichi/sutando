@@ -153,7 +153,7 @@ def install(args) -> int:
     if getattr(args, "token_stdin", False):
         return cb.install_token_stdin(args, LOCAL, lambda: connect_preflight(args, login=False), install, COMMAND,
                                       work=None)
-    problem = cb.recorded_install_args(args, LOCAL, RECORDED)
+    problem = cb.recorded_install_args(args, LOCAL, RECORDED) or full_access_problem(args)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -214,7 +214,7 @@ def install(args) -> int:
 def connect_preflight(args, login: bool = True) -> str:
     """'' when this host can run the agent, checked before the single-use code is spent (`login`: and the
     codex login is in place); else why not."""
-    problem = cb.host_problem(COMMAND)
+    problem = full_access_problem(args) or cb.host_problem(COMMAND)
     if problem:
         return problem
     codex = os.path.abspath(shutil.which(args.codex) or args.codex)
@@ -328,6 +328,24 @@ def selected(args) -> "tuple[Shape | None, str]":
                          getattr(args, "key", None))
 
 
+FULL_ACCESS_UNSIGNED = ("--sandbox danger-full-access needs a signing key, or anything that can write the inbox gets "
+                        "full-access owner turns: pass --hmac (or --hmac-key-file <key>), or drop full access")
+
+
+def full_access_problem(args) -> str:
+    """'' unless full access is asked for with no signing key: --hmac (made at install) or a usable --hmac-key-file."""
+    if getattr(args, "sandbox", None) != "danger-full-access" or getattr(args, "hmac", False):
+        return ""
+    path = getattr(args, "hmac_key_file", None)
+    try:
+        if path:
+            task_hmac.load_key(Path(path).expanduser())
+            return ""
+    except (OSError, ValueError):
+        pass
+    return FULL_ACCESS_UNSIGNED
+
+
 def hmac_key(args, local, mode) -> "tuple[str, str]":
     """(the key every task must be signed with, or '' for none; '') or ('', why): --hmac makes the agent's own,
     --hmac-key-file names one that must already be a usable key."""
@@ -370,6 +388,9 @@ def verify(args) -> int:
         cm.check(results, not problem, "hmac key", problem or cfg["HMAC_KEY_FILE"])
     print("INFO hmac mode: " + ("strict (only tasks its bridge signed are served)" if cfg.get("HMAC_KEY_FILE")
                                 else "off (tasks are not signed)"))
+    if cfg.get("SANDBOX") == "danger-full-access":
+        cm.check(results, bool(cfg.get("HMAC_KEY_FILE")), "full access signed",
+                 cfg.get("HMAC_KEY_FILE") or FULL_ACCESS_UNSIGNED)
     print(f"INFO sandbox: {cfg.get('SANDBOX') or 'read-only'} for owner turns; non-owner turns are always read-only")
     print(f"INFO non-owner: {'served read-only (--allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '1' else 'refused unless attested collaborator'}")
     if cb.bridge_mode(cfg) != EXTERNAL:
@@ -403,7 +424,8 @@ def session_options(p) -> None:
     p.add_argument("--codex-home", help="CODEX_HOME holding the login the connector uses (default: the CLI's own)")
     p.add_argument("--sandbox", choices=SANDBOXES, default="read-only",
                    help="the owner threads' sandbox (default read-only; danger-full-access lets owner turns change "
-                        "anything this user can and use the network; non-owner turns are always read-only)")
+                        "anything this user can and use the network, and needs --hmac or --hmac-key-file; "
+                        "non-owner turns are always read-only)")
     p.add_argument("--allow-non-owner", action="store_true",
                    help="serve non-owner senders without collaborator access too, on an ephemeral read-only thread")
     p.add_argument("--hmac", action="store_true",
