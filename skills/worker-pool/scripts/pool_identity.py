@@ -80,6 +80,19 @@ def preview_text(p: dict) -> str:
                      + ([f"error:   {p['error']}"] if p.get("error") else []))
 
 
+def reseat_after_add(ws: Path, repo, wid: str) -> dict:
+    """A seat started before the worker had its own agent keeps acting as the core's until it restarts."""
+    import pool_manage
+    try:
+        out = pool_manage.reseat(ws, repo or _REPO, wid)
+    except Exception as e:  # noqa: BLE001 — the identity is saved; the restart is reported, never raised
+        out = {"result": "failed", "why": f"{type(e).__name__}: {e}"}
+    if out.get("result") not in ("reseated", "skipped"):
+        print(f"worker {wid}'s seat still acts as the core's agent: {out.get('why') or out.get('result')}; "
+              f"restart it with: pool_manage.py reseat {wid}", file=sys.stderr)
+    return out
+
+
 def cmd_device_flow(args, ws: Path, *, rotate: bool) -> int:
     wid = live_worker(ws, args.worker)
     if not args.label:
@@ -108,7 +121,10 @@ def cmd_device_flow(args, ws: Path, *, rotate: bool) -> int:
     if not started:
         print(f"lane {out['row']['instance']} not started: {launch.get('reason')}", file=sys.stderr)
     status = out["status"] if started else "stored_lane_not_started"
-    print(json.dumps({"agent_id": out["agent_id"], "status": status}, sort_keys=True))
+    line = {"agent_id": out["agent_id"], "status": status}
+    if not rotate and not args.no_start:
+        line["seat"] = reseat_after_add(ws, args.repo, wid).get("result")
+    print(json.dumps(line, sort_keys=True))
     return 0 if started else 1
 
 
@@ -134,6 +150,8 @@ def cmd_add(args, ws: Path) -> int:
     print(f"{'added' if created else 'already present:'} {row['instance']}: worker {wid} runs as "
           f"{row.get('agent_mxid') or '?'} (token in the vault as {row['token_ref']})")
     launch = connections.start_added(row, repo=args.repo, logs_dir=args.logs_dir, workspace=ws)
+    if created:
+        print(f"seat: {reseat_after_add(ws, args.repo, wid).get('result')}")
     if launch is not None and not launch.get("ok"):
         print(f"lane {row['instance']} not started: {launch.get('reason')}", file=sys.stderr)
         return 1
@@ -184,7 +202,7 @@ def cmd_provision_begin(args, ws: Path) -> int:
     return 0
 
 
-def _provisioned(args, ws: Path, out: dict) -> int:
+def _provisioned(args, ws: Path, out: dict, wid: str) -> int:
     """Start the new identity's lane and print the agent id and a status."""
     try:
         launch = None if args.no_start else connections.start_added(
@@ -194,8 +212,10 @@ def _provisioned(args, ws: Path, out: dict) -> int:
     started = launch is None or bool(launch.get("ok"))
     if not started:
         print(f"lane {out['row']['instance']} not started: {launch.get('reason')}", file=sys.stderr)
-    print(json.dumps({"agent_id": out["agent_id"], "status": "ok" if started else "stored_lane_not_started"},
-                     sort_keys=True))
+    line = {"agent_id": out["agent_id"], "status": "ok" if started else "stored_lane_not_started"}
+    if not args.no_start:
+        line["seat"] = reseat_after_add(ws, args.repo, wid).get("result")
+    print(json.dumps(line, sort_keys=True))
     return 0 if started else 1
 
 
@@ -203,12 +223,12 @@ def cmd_provision_wait(args, ws: Path) -> int:
     wid = live_worker(ws, args.worker)
     return _provisioned(args, ws, pool_provision.provision(
         wid, args.operation_id, args.name, display_name=args.display_name or "", role=args.role or "",
-        timeout=args.timeout, workspace=ws, lane=args.lane, say=lambda text: print(text, file=sys.stderr, flush=True)))
+        timeout=args.timeout, workspace=ws, lane=args.lane, say=lambda text: print(text, file=sys.stderr, flush=True)), wid)
 
 
 def cmd_provision_finish(args, ws: Path) -> int:
     wid = live_worker(ws, args.worker)
-    return _provisioned(args, ws, pool_provision.finish(wid, args.claim_id, args.agent_id, workspace=ws, lane=args.lane))
+    return _provisioned(args, ws, pool_provision.finish(wid, args.claim_id, args.agent_id, workspace=ws, lane=args.lane), wid)
 
 
 def cmd_provision_abort(args, ws: Path) -> int:

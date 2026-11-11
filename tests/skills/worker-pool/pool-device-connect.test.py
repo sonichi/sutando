@@ -28,6 +28,7 @@ _spec.loader.exec_module(S)  # its hermetic environment, connection fakes and pr
 C, H = S.C, S.H
 import pool_device_connect as dc
 import pool_identity
+import pool_manage
 
 W, CORE = S.W, S.CORE
 NEW_AGENT = "@owner-desk-reviewer.agent:alpha-fixture.net"
@@ -111,11 +112,27 @@ class Add(Base):
         row = C.worker_identity(W, self.ws)
         self.assertEqual(row["agent_mxid"], NEW_AGENT)
         self.assertEqual(C.secret_of(self.vault.store[row["token_ref"]]), fake.bearer)
-        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(self.sent), 2)
         self.assertIn("https://alpha-fixture.net/api/connect-page?code=U-", self.sent[0])
         self.assertIn("It works until", self.sent[0])
-        self.assertTrue(self.sent[0].startswith("[dm-only]"))
-        self.assertNoSecret(fake, json.dumps({k: v for k, v in out.items() if k != "row"}), self.sent[0])
+        self.assertTrue(all(t.startswith("[dm-only]") for t in self.sent))
+        self.assertNoSecret(fake, json.dumps({k: v for k, v in out.items() if k != "row"}), *self.sent)
+
+    def test_once_saved_the_owner_is_told_which_agent_it_is_and_where_to_find_it(self):
+        fake = ConnectFake(self.backend)
+        self.connect(fake, worker_label="pool worker 1")
+        done = self.sent[-1]
+        self.assertIn(NEW_AGENT, done)
+        self.assertIn("pool worker 1's own agent", done)
+        self.assertIn("agents list", done)
+        self.assertNoSecret(fake, done)
+
+    def test_a_refused_save_sends_no_done_note(self):
+        fake = ConnectFake(self.backend, agent=CORE)
+        fake.bearer = self.backend.bearer_of(CORE)
+        with self.assertRaises(dc.DeviceConnectError):
+            self.connect(fake)
+        self.assertEqual(len(self.sent), 1)
 
     def test_the_core_s_own_agent_is_refused(self):
         fake = ConnectFake(self.backend, agent=CORE)
@@ -285,12 +302,13 @@ class Edges(Base):
         fake.approve()
         dc.connect(W, label="reviewer", workspace=self.ws, vault=self.vault, request=fake.request,
                    preview=self.preview, sleep=self.backend.sleep, clock=self.backend.clock)
-        queued = list((self.ws / "results").glob("proactive-*worker-connect*.txt"))
-        self.assertEqual(len(queued), 1)
-        text = queued[0].read_text()
-        self.assertTrue(text.startswith("[dm-only]"))
-        self.assertIn("/api/connect-page?code=U-", text)
-        self.assertNoSecret(fake, text)
+        queued = sorted((self.ws / "results").glob("proactive-*worker-connect*.txt"))
+        self.assertEqual(len(queued), 2)
+        texts = [q.read_text() for q in queued]
+        self.assertTrue(all(t.startswith("[dm-only]") for t in texts))
+        self.assertTrue(any("/api/connect-page?code=U-" in t for t in texts))
+        self.assertTrue(any(t.startswith("[dm-only]\nDone:") for t in texts))
+        self.assertNoSecret(fake, *texts)
 
 
 class Rotate(Base):
@@ -334,8 +352,27 @@ class Cli(Base):
             rc = pool_identity.main(["--workspace", str(self.ws), "add", "Reviewer", "--device-flow",
                                      "--label", "reviewer"])
         self.assertEqual(rc, 0, out)
-        self.assertEqual(json.loads(out[-1]), {"agent_id": NEW_AGENT, "status": "ok"})
+        self.assertEqual(json.loads(out[-1]), {"agent_id": NEW_AGENT, "status": "ok", "seat": "skipped"})
         self.assertNoSecret(fake, *out)
+
+    def test_a_new_identity_restarts_the_running_seat_and_a_rotate_does_not(self):
+        calls = []
+        with unittest.mock.patch.object(pool_manage, "reseat",
+                                        lambda ws, repo, wid, **kw: calls.append(wid) or {"result": "reseated"}):
+            rc, out, _ = self.run_cli(ConnectFake(self.backend))
+            self.assertEqual((rc, json.loads(out[-1])["seat"]), (0, "reseated"))
+            self.assertEqual(calls, [W])
+            with unittest.mock.patch.object(C, "update_token", lambda instance, token, **kw: {"instance": instance}):
+                rc, out, _ = self.run_cli(ConnectFake(self.backend), verb="rotate")
+        self.assertNotIn("seat", json.loads(out[-1]))
+        self.assertEqual(calls, [W])
+
+    def test_a_seat_that_owes_work_is_left_and_the_owner_is_told_how_to_restart_it(self):
+        with unittest.mock.patch.object(pool_manage, "reseat", lambda *a, **kw: {
+                "result": "deferred", "why": "it owes 1 task(s)"}):
+            rc, out, _ = self.run_cli(ConnectFake(self.backend))
+        self.assertEqual((rc, json.loads(out[-1])["seat"]), (0, "deferred"))
+        self.assertTrue(any(f"restart it with: pool_manage.py reseat {W}" in line for line in out), out)
 
     def run_cli(self, fake, during_wait=None, *, patch_start=True, extra=(), verb="add", approve=True):
         real, out, starts = dc.connect, [], []

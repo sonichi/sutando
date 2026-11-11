@@ -140,6 +140,15 @@ def expiry_note(worker_label: str, label: str, expires_at: float) -> str:
             "before it was approved, so nothing was set up. Ask me for a new link whenever you are ready.")
 
 
+def done_note(worker_label: str, label: str, agent_id: str, *, rotated: bool = False) -> str:
+    """The owner's DM once the approval is saved: which agent it is and where to find it."""
+    if rotated:
+        return (f"[dm-only]\nDone: agent \"{label}\" ({agent_id}) has a new token, and pool worker {worker_label} "
+                "uses it. The old token no longer works.")
+    return (f"[dm-only]\nDone: agent \"{label}\" ({agent_id}) is set up as pool worker {worker_label}'s own agent. "
+            "Find it in your agents list in s.space (or in your DMs); mention it in a room to give it work there.")
+
+
 def send_to_owner(workspace: Path, text: str) -> str:
     """Queue `text` to the owner's DM through the proactive path; the file name it was queued as."""
     from local_record import new_name, write_text_whole
@@ -194,12 +203,13 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
                         preview=preview, repo=repo, logs_dir=logs_dir)
             if start_lane is not None and not rotate:
                 out["launch"] = start_lane(out["row"])
-            return out
     except DeviceConnectError as e:
         raise DeviceConnectError(pp.scrub(str(e), known), status=e.status) from None
     except (pp.ProvisionError, connections.ConnectionsError) as e:
         raise DeviceConnectError(pp.scrub(f"{pp._said(e)}; the approved agent {got['agent_id']} was not "
                                           "saved", known)) from None
+    send(done_note(worker_label or worker, label, out["agent_id"], rotated=rotate))
+    return out
 
 
 def _save(worker, token, agent_id, core, current, *, workspace, vault, preview, repo, logs_dir) -> dict:

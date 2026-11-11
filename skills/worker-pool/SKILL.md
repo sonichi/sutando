@@ -187,6 +187,10 @@ python3 skills/worker-pool/scripts/pool_identity.py rotate <worker> --device-flo
 - The token is saved to the vault only when the gateway confirms it is the agent the poll named, not the core's own
   agent, on the core's server and owned by the core's owner. `rotate` must answer for the worker's existing agent.
   The device code and the token are never printed, logged or written to a file.
+- Once the token is saved the owner gets a second DM naming the agent and where to find it, and a running seat
+  restarts (`pool_manage.py reseat <worker>`): its `s-space` tools decide at start whom they act as. A seat that owes
+  work is left running and the JSON line says `"seat": "deferred"`; run the reseat once it is done. A seat whose
+  `s-space` calls fail with "descriptor changed during the call" is this case: its identity changed; reseat it.
 
 ### Creating the agent without a pasted token
 
