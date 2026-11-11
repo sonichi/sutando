@@ -137,9 +137,16 @@ class Launcher(unittest.TestCase):
                     "skills/worker-pool/scripts/worker-mcp-credential.sh",
                     "skills/worker-pool/scripts/codex_worker_mcp.py",
                     "scripts/python-binary.sh", "src/agent/launch-path.sh", "src/toml_fallback.py",
-                    "src/codex_project_trust.py"):
+                    "src/codex_project_trust.py", "src/agent/codex/codex-home.sh", "src/codex_home.py",
+                    "src/codex_host_instructions.py", "src/sutando_config.py"):
             (root / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / rel, root / rel)
+        (root / "src/__init__.py").touch()
+        # The worker's Codex home comes from the shared owner (src/codex_home.py), which reads this config.
+        dirs = [{"id": "x", "type": "codex", "env_name": "CODEX_HOME", "synced": False,
+                 "value": str(home / "codex")}] if codex_home else []
+        (root / "sutando.config.json").write_text(json.dumps({"workspace": {"path": str(ws)},
+                                                              "core_config_dirs": dirs}))
         (root / "scripts/sutando-config.sh").write_text(
             '#!/bin/sh\ncase "$1" in\n'
             '  core-config-dir-env-name) printf "CODEX_HOME" ;;\n'
