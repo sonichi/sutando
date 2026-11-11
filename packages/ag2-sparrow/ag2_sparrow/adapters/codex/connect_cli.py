@@ -29,14 +29,16 @@ from ... import _dirs, connect_bridge as cb, connect_common as cm, task_io
 from ...connect_bridge import EXTERNAL, UNIT
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, RUN_TIMEOUT_S, Shape, _v
 from . import codex_connector
+from ... import task_hmac
 
 SHAPE = "codex-local"
 COMMAND = "ag2-sparrow-codex-local"
 MIN_CODEX = (0, 160, 1)
-SANDBOXES = ("read-only", "workspace-write")
+SANDBOXES = ("read-only", "workspace-write", "danger-full-access")
 ENV_KEEP = ("PATH", "HOME", "USER")
 REQUIRED_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR")
-CONFIG_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR", "CODEX_HOME", "SANDBOX", "ALLOW_NON_OWNER", "MODEL") + cb.CONFIG_KEYS
+CONFIG_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR", "CODEX_HOME", "SANDBOX", "ALLOW_NON_OWNER", "MODEL",
+               "HMAC_KEY_FILE") + cb.CONFIG_KEYS
 LOCAL = Shape(name=SHAPE, command=COMMAND, description="the Codex connector as an s.space agent",
               cli="Codex CLI", min_version=MIN_CODEX, version_anchor=r"^codex",
               version_note="the app-server stdio shape was measured there", required_keys=REQUIRED_KEYS,
@@ -87,6 +89,8 @@ def connector_argv(cfg: dict, root: str, root_fd: int) -> list:
         argv.append("--allow-non-owner")
     if cfg.get("MODEL"):
         argv += ["--model", cfg["MODEL"]]
+    if cfg.get("HMAC_KEY_FILE"):
+        argv += ["--hmac-key-file", cfg["HMAC_KEY_FILE"]]     # the key's path; the key is read per task
     return argv
 
 
@@ -141,14 +145,15 @@ def resolve_root(args) -> "tuple[dict, str]":
 
 # What a repair `install <selector>` takes from the job's recorded config: (key, option, value).
 RECORDED = (("CODEX", "codex", str), ("CODEX_HOME", "codex_home", str), ("SANDBOX", "sandbox", str),
-            ("ALLOW_NON_OWNER", "allow_non_owner", lambda v: v == "1"), ("MODEL", "model", str))
+            ("ALLOW_NON_OWNER", "allow_non_owner", lambda v: v == "1"), ("MODEL", "model", str),
+            ("HMAC_KEY_FILE", "hmac_key_file", str))
 
 
 def install(args) -> int:
     if getattr(args, "token_stdin", False):
         return cb.install_token_stdin(args, LOCAL, lambda: connect_preflight(args, login=False), install, COMMAND,
                                       work=None)
-    problem = cb.recorded_install_args(args, LOCAL, RECORDED)
+    problem = cb.recorded_install_args(args, LOCAL, RECORDED) or full_access_problem(args)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -172,7 +177,11 @@ def install(args) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     bridge = cb.bridge_shape(local)
-    values = {"CODEX": os.path.abspath(codex), "INBOX_DIR": str(Path(root) / "tasks"),
+    key_file, problem = hmac_key(args, local, mode)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    values = {"CODEX": os.path.abspath(codex), "HMAC_KEY_FILE": key_file, "INBOX_DIR": str(Path(root) / "tasks"),
               "RESULTS_DIR": str(Path(root) / "results"),
               "CODEX_HOME": str(Path(args.codex_home).expanduser().resolve()) if args.codex_home else "",
               "SANDBOX": args.sandbox, "ALLOW_NON_OWNER": "1" if args.allow_non_owner else "",
@@ -182,6 +191,10 @@ def install(args) -> int:
     if args.sandbox == "workspace-write":
         print("NOTE sandbox: workspace-write lets an owner turn write under the work root; a turn retried after "
               "the app-server dies can repeat side effects the first attempt already made")
+    if args.sandbox == "danger-full-access":
+        print("NOTE sandbox: danger-full-access lets an owner turn run commands, change files anywhere this user can "
+              "and use the network, all without asking; a turn retried after the app-server dies can repeat side "
+              "effects the first attempt already made. Non-owner and collaborator turns stay read-only")
     def installed() -> int:
         rc = cm.install(local, values, root, root_id=getattr(args, "root_identity", None), holder=holder_words)
         if rc != 0 or mode == EXTERNAL:
@@ -201,7 +214,7 @@ def install(args) -> int:
 def connect_preflight(args, login: bool = True) -> str:
     """'' when this host can run the agent, checked before the single-use code is spent (`login`: and the
     codex login is in place); else why not."""
-    problem = cb.host_problem(COMMAND)
+    problem = full_access_problem(args) or cb.host_problem(COMMAND)
     if problem:
         return problem
     codex = os.path.abspath(shutil.which(args.codex) or args.codex)
@@ -315,6 +328,39 @@ def selected(args) -> "tuple[Shape | None, str]":
                          getattr(args, "key", None))
 
 
+FULL_ACCESS_UNSIGNED = ("--sandbox danger-full-access needs a signing key, or anything that can write the inbox gets "
+                        "full-access owner turns: pass --hmac (or --hmac-key-file <key>), or drop full access")
+
+
+def full_access_problem(args) -> str:
+    """'' unless full access is asked for with no signing key: --hmac (made at install) or a usable --hmac-key-file."""
+    if getattr(args, "sandbox", None) != "danger-full-access" or getattr(args, "hmac", False):
+        return ""
+    path = getattr(args, "hmac_key_file", None)
+    try:
+        if path:
+            task_hmac.load_key(Path(path).expanduser())
+            return ""
+    except (OSError, ValueError):
+        pass
+    return FULL_ACCESS_UNSIGNED
+
+
+def hmac_key(args, local, mode) -> "tuple[str, str]":
+    """(the key every task must be signed with, or '' for none; '') or ('', why): --hmac makes the agent's own,
+    --hmac-key-file names one that must already be a usable key."""
+    if getattr(args, "hmac", False):
+        return cb.own_hmac_key(local, mode, getattr(args, "hmac_key_file", None) or "")
+    if not getattr(args, "hmac_key_file", None):
+        return "", ""
+    path = str(Path(args.hmac_key_file).expanduser().resolve())
+    try:
+        task_hmac.load_key(path)
+    except (OSError, ValueError) as e:
+        return "", f"--hmac-key-file {path} is not a usable key ({type(e).__name__})"
+    return path, ""
+
+
 def verify(args) -> int:
     local, problem = selected(args)
     if problem:
@@ -333,6 +379,18 @@ def verify(args) -> int:
         cm.check(results, not problem, "login", problem or "codex login status: logged in")
     for key in ("INBOX_DIR", "RESULTS_DIR"):
         cm.check(results, Path(cfg[key]).is_dir(), key.lower().replace("_dir", ""), cfg[key])
+    if cfg.get("HMAC_KEY_FILE"):
+        try:
+            task_hmac.load_key(cfg["HMAC_KEY_FILE"])
+            problem = ""
+        except (OSError, ValueError) as e:
+            problem = f"{cfg['HMAC_KEY_FILE']} is not a usable key ({type(e).__name__})"
+        cm.check(results, not problem, "hmac key", problem or cfg["HMAC_KEY_FILE"])
+    print("INFO hmac mode: " + ("strict (only tasks its bridge signed are served)" if cfg.get("HMAC_KEY_FILE")
+                                else "off (tasks are not signed)"))
+    if cfg.get("SANDBOX") == "danger-full-access":
+        cm.check(results, bool(cfg.get("HMAC_KEY_FILE")), "full access signed",
+                 cfg.get("HMAC_KEY_FILE") or FULL_ACCESS_UNSIGNED)
     print(f"INFO sandbox: {cfg.get('SANDBOX') or 'read-only'} for owner turns; non-owner turns are always read-only")
     print(f"INFO non-owner: {'served read-only (--allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '1' else 'refused unless attested collaborator'}")
     if cb.bridge_mode(cfg) != EXTERNAL:
@@ -365,9 +423,15 @@ def session_options(p) -> None:
     p.add_argument("--codex", default="codex", help="the codex executable (default: codex on PATH)")
     p.add_argument("--codex-home", help="CODEX_HOME holding the login the connector uses (default: the CLI's own)")
     p.add_argument("--sandbox", choices=SANDBOXES, default="read-only",
-                   help="the owner threads' sandbox (default read-only; non-owner turns are always read-only)")
+                   help="the owner threads' sandbox (default read-only; danger-full-access lets owner turns change "
+                        "anything this user can and use the network, and needs --hmac or --hmac-key-file; "
+                        "non-owner turns are always read-only)")
     p.add_argument("--allow-non-owner", action="store_true",
                    help="serve non-owner senders without collaborator access too, on an ephemeral read-only thread")
+    p.add_argument("--hmac", action="store_true",
+                   help="sign every task with a key of the agent's own, made at install (0600 in its job's config dir): "
+                        "the bridge this install runs stamps each task and the connector serves verified ones only")
+    p.add_argument("--hmac-key-file", help="serve only tasks signed with this key (64 hex characters)")
     p.add_argument("--model", help="the model for every turn (default: the connector's)")
 
 

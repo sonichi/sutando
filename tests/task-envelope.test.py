@@ -205,6 +205,30 @@ class EnvelopeContract(unittest.TestCase):
         Path(path).unlink()
 
 
+class MalformedStamp(unittest.TestCase):
+    """A stamp the signer never emits reads `invalid`, never raises: compare_digest
+    raises TypeError on a non-ASCII str, which stopped verify callers."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="env-ws-")
+        self.ws = Path(self._tmp.name)
+        (self.ws / "state" / "auth").mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_malformed_macs_are_invalid(self):
+        signed = E.stamp_text(TASK, self.ws)
+        mac = signed.split("\n")[1][len(E.STAMP_PREFIX):]
+        self.assertEqual(E.verify_text(signed, self.ws)["verdict"], "verified")
+        for bad in ("\u00e9", "\u00e9" * 64, mac[:63], mac + "0", mac.upper(), mac[:63] + "g", ""):
+            self.assertEqual(E.verify_text(signed.replace(mac, bad), self.ws)["verdict"], "invalid", repr(bad[:8]))
+
+    def test_malformed_mac_without_a_key_is_unverifiable(self):
+        text = "id: t\n" + E.STAMP_PREFIX + "\u00e9\ntask: hi\n"
+        self.assertEqual(E.verify_text(text, self.ws)["verdict"], "unverifiable")
+
+
 class BodyStampCollision(unittest.TestCase):
     """Review P1-2: a stamp-shaped line in USER CONTENT must survive
     byte-identically and never be consumed as the envelope."""

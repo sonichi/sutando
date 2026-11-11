@@ -113,11 +113,41 @@ def _alive(pid: int) -> bool:
 
 
 def claude_argv(cfg: dict, session_id: str) -> list:
-    """`claude --plugin-dir … --permission-mode … --resume|--session-id <id>`: resume when the
-    transcript exists under the session's config dir, else start it under that id."""
+    """`claude --plugin-dir … --permission-mode … [--strict-mcp-config --mcp-config <file>] [--setting-sources
+    <list>] --resume|--session-id <id>`: resume when the transcript exists under the session's config dir, else
+    start it under that id. A recorded MCP file is the session's whole MCP set; the config dir's own is ignored."""
     flag = "--resume" if transcript_exists(cfg.get("CLAUDE_CONFIG_DIR", ""), session_id) else "--session-id"
-    return [cfg["CLAUDE"], "--plugin-dir", str(resolve_plugin_dir(cfg["PLUGIN_DIR"])[0]), "--permission-mode",
-            cfg.get("PERMISSION_MODE") or "bypassPermissions", flag, session_id]
+    argv = [cfg["CLAUDE"], "--plugin-dir", str(resolve_plugin_dir(cfg["PLUGIN_DIR"])[0]), "--permission-mode",
+            cfg.get("PERMISSION_MODE") or "bypassPermissions"]
+    if cfg.get("MCP_CONFIG"):
+        argv += ["--strict-mcp-config", "--mcp-config", cfg["MCP_CONFIG"]]
+    if cfg.get("SETTING_SOURCES"):
+        argv += ["--setting-sources", cfg["SETTING_SOURCES"]]
+    return argv + [flag, session_id]
+
+
+SETTING_SOURCES = ("user", "project", "local")
+
+
+def mcp_servers(path: str) -> "tuple[list, str]":
+    """(the server names an MCP config file declares, '') or ([], why): with --strict-mcp-config these are the
+    session's whole MCP set."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return [], f"{path} is not a readable MCP config ({type(e).__name__})"
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    if not isinstance(servers, dict):
+        return [], f"{path} has no mcpServers object"
+    return sorted(servers), ""
+
+
+def setting_sources_problem(value: str) -> str:
+    """'' when `value` is a comma list of Claude Code's setting sources (user, project, local), else why not."""
+    parts = value.split(",")
+    if not value or any(p not in SETTING_SOURCES for p in parts) or len(set(parts)) != len(parts):
+        return f"--setting-sources takes a comma list of {', '.join(SETTING_SOURCES)}, not {value!r}"
+    return ""
 
 
 TITLE_OFF_VAR = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE"

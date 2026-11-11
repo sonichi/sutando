@@ -64,7 +64,18 @@ def parse_task(path):
     """(headers, message, operator_lines). Headers come from the package parser; a
     `task_layout: mid` body is the writer's one-line message plus bridge-written lines."""
     with open(path, encoding="utf-8", errors="replace") as f:
-        parsed = attested_headers(f.read())
+        return parse_task_text(f.read())
+
+
+def read_task_text(path):
+    """The task file's text, read once: whatever is checked against it (its stamp, its hash) is then the text parsed."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def parse_task_text(text):
+    """parse_task on text already read."""
+    parsed = attested_headers(text)
     headers = dict(parsed.headers)
     tier = local_task_protocol.canonical_access_tier(headers.get("access_tier"))
     headers["access_tier"] = tier if tier in local_task_protocol.BROKER_WIRE_TIERS else "guest"

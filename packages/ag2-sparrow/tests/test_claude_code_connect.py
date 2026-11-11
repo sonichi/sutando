@@ -4,6 +4,7 @@ own root and bridge, the agent lock around it, and the host-supervised refusal. 
 claude_code_fixtures.py."""
 from __future__ import annotations
 
+import argparse
 import contextlib
 import errno
 import functools
@@ -18,6 +19,7 @@ import stat
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import unittest
 import urllib.error
@@ -1903,7 +1905,9 @@ class ConnectAgentRoot(AgentRootBase):
         self.assertEqual(env, sorted([f'Environment="AGENT_CONNECT_TASK_DIR={self.root}/tasks"',
                                       f'Environment="AGENT_CONNECT_RESULT_DIR={self.root}/results"',
                                       f'Environment="AGENT_CONNECT_STATE_DIR={home}/state"',
-                                      f'Environment="AGENT_MXID={AGENT}"', f'Environment="AG2_DEVICE_ENV={self.relay}"']))
+                                      f'Environment="AGENT_MXID={AGENT}"', f'Environment="AG2_DEVICE_ENV={self.relay}"',
+                                      # The install's key path: its own bridge signs every task the strict session checks.
+                                      f'Environment="AG2_HMAC_KEY_FILE={self.home / "task-hmac.key"}"']))
         self.assertNotIn(TOKEN, unit + cli.config_path(LA).read_text(), "the token stays in its file")
         self.assertEqual(fake.verbs(), ["show", "enable", "restart"], "absent: registered and started, no stop")
         self.assertIn(f"started: {BA.service_name}, feeding {self.root}/tasks as {AGENT}", out)
@@ -2190,7 +2194,8 @@ class ConnectHostSupervised(AgentRootBase):
         seg = "probe.agent_ag2.space"
         self.assertEqual(body["env"], {"AGENT_CONNECT_TASK_DIR": f"{self.root}/tasks",
                                        "AGENT_CONNECT_RESULT_DIR": f"{self.root}/results",
-                                       "AGENT_CONNECT_STATE_DIR": f"{self.root}.bridge/state", "AGENT_MXID": AGENT})
+                                       "AGENT_CONNECT_STATE_DIR": f"{self.root}.bridge/state", "AGENT_MXID": AGENT},
+                         "a host supervisor's bridge signs with the host's key: no key path in its declaration")
         self.assertEqual((body["name"], body["token_vault_key"], body["host"], body["module"]),
                          (cli.worker_name(seg), cli.vault_key(seg), "sparrowd", "ag2_sparrow.remote_gateway_bridge"))
         self.assertRegex(body["name"], r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$", "sparrowd's worker-name rule")
@@ -2280,6 +2285,72 @@ class ConnectHostSupervised(AgentRootBase):
         rc, _, err = self.install_with(self.runner(), False, "--work", str(self.work))
         self.assertEqual(rc, 0, err)
         self.assertEqual(self.cfg()["AGENT_ID"], "", "the host's binding is not this root's agent")
+
+SHARED_SESSION_ID = "0b6c4e8e-6d55-4f6e-9a41-8f2a6c1d3e77"
+
+
+class SharedConfigOptions(unittest.TestCase):
+    """--mcp-config and --setting-sources: what a session sharing another config dir loads of it."""
+
+    def test_a_filtered_mcp_set_leaves_the_config_dirs_own_servers_out(self):
+        from ag2_sparrow.adapters.claude_code import hold as hold_mod_  # noqa: F401
+        with tempfile.TemporaryDirectory() as d:
+            ccd = Path(d) / "shared-config"
+            ccd.mkdir()
+            # The shared dir's own MCP: the core's s.space server and the connected-apps one.
+            (ccd / ".claude.json").write_text(json.dumps({"mcpServers": {
+                "s-space": {"type": "stdio", "command": "node"}, "sutando-station": {"type": "http", "url": "https://x"}}}))
+            mcp = Path(d) / "agent-mcp.json"
+            mcp.write_text(json.dumps({"mcpServers": {"sutando-station": {"type": "http", "url": "https://x"}}}))
+            cfg = {"CLAUDE": "/opt/claude", "PLUGIN_DIR": "", "CLAUDE_CONFIG_DIR": str(ccd), "MCP_CONFIG": str(mcp),
+                   "SETTING_SOURCES": "project,local"}
+            argv = hold_mod_.claude_argv(cfg, SHARED_SESSION_ID)
+            at = argv.index("--mcp-config")
+            self.assertEqual(argv[at - 1:at + 2], ["--strict-mcp-config", "--mcp-config", str(mcp)])
+            self.assertEqual(argv[argv.index("--setting-sources") + 1], "project,local")
+            self.assertEqual(argv[-2:], ["--session-id", SHARED_SESSION_ID], "the session id stays last")
+            servers, problem = hold_mod_.mcp_servers(cfg["MCP_CONFIG"])
+            self.assertEqual((servers, problem), (["sutando-station"], ""))
+            self.assertNotIn("s-space", servers, "strict: the config dir's own s.space server is not in the set")
+            plain = hold_mod_.claude_argv(dict(cfg, MCP_CONFIG="", SETTING_SOURCES=""), SHARED_SESSION_ID)
+            self.assertFalse({"--strict-mcp-config", "--mcp-config", "--setting-sources"} & set(plain))
+
+    def test_bad_mcp_files_and_setting_lists_are_refused(self):
+        from ag2_sparrow.adapters.claude_code import cli as cli_, hold as hold_mod_
+        with tempfile.TemporaryDirectory() as d:
+            bad = Path(d) / "bad.json"
+            bad.write_text("[]")
+            self.assertIn("no mcpServers", hold_mod_.mcp_servers(str(bad))[1])
+            self.assertIn("not a readable MCP config", hold_mod_.mcp_servers(str(Path(d) / "absent.json"))[1])
+            for value in ("", "user,admin", "project,project"):
+                self.assertTrue(hold_mod_.setting_sources_problem(value), value)
+            self.assertEqual(hold_mod_.setting_sources_problem("project,local"), "")
+            args = argparse.Namespace(mcp_config=str(bad), setting_sources=None)
+            self.assertIn("--mcp-config", cli_.session_files_problem(args))
+            self.assertIn("--setting-sources", cli_.session_files_problem(argparse.Namespace(mcp_config=None,
+                                                                                           setting_sources="x")))
+        recorded = {r[0] for r in cli_.RECORDED}
+        self.assertTrue({"MCP_CONFIG", "SETTING_SOURCES", "HMAC_KEY_FILE"} <= recorded, "a repair keeps them")
+        self.assertTrue({"MCP_CONFIG", "SETTING_SOURCES"} <= set(cli_.LOCAL.config_keys))
+
+
+class AdmitReadsOnce(unittest.TestCase):
+    """inbox.admit decides on one read of the task file, and only on the text the Mod verified."""
+
+    def test_a_file_changed_since_it_was_verified_is_parked(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, "tasks").mkdir()
+            task = Path(root, "tasks", "task-v1.txt")
+            task.write_bytes(b"id: task-v1\r\naccess_tier: owner\r\ntask: hi\r\n")
+            verified = hashlib.sha256(task.read_bytes()).hexdigest()
+            kind, headers, _ = inbox.admit(root, "task-v1", False, False, verified)
+            self.assertEqual((kind, headers["access_tier"]), ("owner", "owner"), "CRLF parses as a text-mode read")
+            task.write_text("id: task-v1\naccess_tier: owner\ntask: rm -rf ~\n")
+            with self.assertRaises(inbox.Parked) as cm:
+                inbox.admit(root, "task-v1", False, False, verified)
+            self.assertIn("changed after its envelope was verified", str(cm.exception))
+            self.assertEqual(inbox.admit(root, "task-v1", False, False)[0], "owner", "no hash given: decided as before")
 
 
 if __name__ == "__main__":
