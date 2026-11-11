@@ -4,40 +4,62 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 
+/** How long a notice stands: a longer outage is announced again once a day, never forgotten. */
+export const OFFLINE_NOTICE_TTL_S = 24 * 3600;
+
 /**
  * A set of announced failure categories that survives a restart of the voice agent. A restarted
  * process that meets the same refusal (a region Gemini Live does not serve, a revoked key) reads
- * that the owner was already told and stays quiet; only recovery clears it, so the next outage
- * is announced again. Reads and writes fail soft: an unreadable record is an empty one, and a
- * record that cannot be written leaves the set held in memory for this process, as before.
+ * that the owner was already told and stays quiet; recovery clears it, so the next outage is
+ * announced again, and a notice older than OFFLINE_NOTICE_TTL_S lapses. Each category keeps the
+ * time it was first announced.
+ *
+ * The file is the record whenever it was last written successfully: every read takes it whole, so
+ * a clear another process wrote is seen here (the last writer wins). When a write fails, what this
+ * process holds is authoritative until a write succeeds again, so a recovery that could not be
+ * saved is never undone by the stale file. Reads fail soft: an absent, unreadable or wrong-shaped
+ * record leaves the set as this process holds it.
  */
 export class OfflineNoticeStore implements Iterable<string> {
-	private memory = new Set<string>();
+	private notified = new Map<string, number>();
+	private diskCurrent = true;
 
-	constructor(private readonly path: string) {}
+	constructor(
+		private readonly path: string,
+		private readonly now: () => number = () => Date.now() / 1000,
+	) {}
 
-	private load(): Set<string> {
-		try {
-			const raw = JSON.parse(readFileSync(this.path, 'utf8')) as { categories?: unknown };
-			if (raw && typeof raw === 'object' && raw.categories && typeof raw.categories === 'object') {
-				for (const c of Object.keys(raw.categories as Record<string, unknown>)) this.memory.add(c);
+	private load(): Map<string, number> {
+		if (this.diskCurrent) {
+			try {
+				const raw = JSON.parse(readFileSync(this.path, 'utf8')) as { categories?: unknown } | null;
+				const recorded = raw?.categories;
+				if (recorded && typeof recorded === 'object' && !Array.isArray(recorded)) {
+					const next = new Map<string, number>();
+					for (const [category, at] of Object.entries(recorded as Record<string, unknown>)) {
+						if (typeof at === 'number' && Number.isFinite(at)) next.set(category, at);
+					}
+					this.notified = next;
+				}
+			} catch {
+				// Absent or unreadable: what this process holds is all there is.
 			}
-		} catch {
-			// Absent or unreadable: what this process holds is all there is.
 		}
-		return this.memory;
+		const cutoff = this.now() - OFFLINE_NOTICE_TTL_S;
+		for (const [category, at] of this.notified) if (at < cutoff) this.notified.delete(category);
+		return this.notified;
 	}
 
 	private save(): void {
-		const categories: Record<string, number> = {};
-		for (const c of this.memory) categories[c] = Math.floor(Date.now() / 1000);
 		const tmp = `${this.path}.${process.pid}.tmp`;
 		try {
 			mkdirSync(dirname(this.path), { recursive: true });
-			writeFileSync(tmp, JSON.stringify({ categories }));
+			writeFileSync(tmp, JSON.stringify({ categories: Object.fromEntries(this.notified) }));
 			renameSync(tmp, this.path);
+			this.diskCurrent = true;
 		} catch {
-			// The set still holds for this process; only a restart would forget it.
+			// Unsaved: this process's set stands until a write succeeds, and the stale file is not read.
+			this.diskCurrent = false;
 		}
 	}
 
@@ -50,17 +72,18 @@ export class OfflineNoticeStore implements Iterable<string> {
 	}
 
 	add(category: string): this {
-		this.load().add(category);
+		const notified = this.load();
+		if (!notified.has(category)) notified.set(category, this.now());
 		this.save();
 		return this;
 	}
 
 	clear(): void {
-		this.memory = new Set<string>();
+		this.notified = new Map<string, number>();
 		this.save();
 	}
 
 	[Symbol.iterator](): Iterator<string> {
-		return this.load()[Symbol.iterator]();
+		return this.load().keys();
 	}
 }

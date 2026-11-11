@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { OfflineNoticeStore } from '../src/voice-offline-notice.js';
+import { OFFLINE_NOTICE_TTL_S, OfflineNoticeStore } from '../src/voice-offline-notice.js';
 
 const fresh = () => join(mkdtempSync(join(tmpdir(), 'voice-offline-notice-')), 'state', 'voice-offline-notified.json');
 
@@ -42,6 +42,39 @@ describe('the offline notice is owed once per outage', () => {
 	});
 });
 
+describe('the record over time and across processes', () => {
+	it('a notice lapses after a day, so a long outage is announced once a day', () => {
+		const path = fresh();
+		let now = 1_000_000;
+		new OfflineNoticeStore(path, () => now).add('location_unsupported');
+		now += OFFLINE_NOTICE_TTL_S - 1;
+		assert.equal(new OfflineNoticeStore(path, () => now).has('location_unsupported'), true);
+		now += 2;
+		assert.equal(new OfflineNoticeStore(path, () => now).has('location_unsupported'), false,
+			'a notice that never lapses would silence the next outage of that kind forever');
+	});
+
+	it('each category keeps the time it was first announced', () => {
+		const path = fresh();
+		let now = 1_000_000;
+		const store = new OfflineNoticeStore(path, () => now);
+		store.add('location_unsupported');
+		now += 600;
+		store.add('quota_exceeded');
+		store.add('location_unsupported');
+		const recorded = JSON.parse(readFileSync(path, 'utf8')).categories;
+		assert.deepEqual(recorded, { location_unsupported: 1_000_000, quota_exceeded: 1_000_600 });
+	});
+
+	it('a clear another process wrote is seen here', () => {
+		const path = fresh();
+		const a = new OfflineNoticeStore(path);
+		a.add('location_unsupported');
+		new OfflineNoticeStore(path).clear();
+		assert.equal(a.has('location_unsupported'), false);
+	});
+});
+
 describe('it fails soft', () => {
 	it('an unreadable record is an empty one, and a new add works', () => {
 		const path = fresh();
@@ -62,7 +95,28 @@ describe('it fails soft', () => {
 		assert.equal(new OfflineNoticeStore(path).size, 0);
 	});
 
-	it('a record that cannot be written still holds for this process', { skip: process.platform === 'win32' || process.getuid?.() === 0 }, () => {
+	const posixNonRoot = { skip: process.platform === 'win32' || process.getuid?.() === 0 };
+
+	it('a recovery that cannot be saved is not undone by the stale file', posixNonRoot, () => {
+		const path = fresh();
+		const store = new OfflineNoticeStore(path);
+		store.add('location_unsupported');
+		chmodSync(join(path, '..'), 0o555);
+		try {
+			store.clear();
+			assert.equal(store.size, 0, 'the old file put the category back');
+			assert.equal(store.has('location_unsupported'), false);
+			store.add('auth_invalid');
+			assert.deepEqual([...store], ['auth_invalid'], 'this process holds the set until a write succeeds');
+		} finally {
+			chmodSync(join(path, '..'), 0o755);
+		}
+		store.add('quota_exceeded');
+		assert.deepEqual(Object.keys(JSON.parse(readFileSync(path, 'utf8')).categories).sort(),
+			['auth_invalid', 'quota_exceeded'], 'the next successful write records what this process held');
+	});
+
+	it('a record that cannot be written still holds for this process', posixNonRoot, () => {
 		const dir = mkdtempSync(join(tmpdir(), 'voice-offline-notice-ro-'));
 		chmodSync(dir, 0o555);
 		try {
