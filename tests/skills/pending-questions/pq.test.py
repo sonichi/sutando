@@ -5,6 +5,15 @@ reconcile / resolve, the reminder with --notify), and core finds the adapter onl
 manifest declaration — refusing when two skills declare it. No real room or workspace is
 touched: a temp workspace, the fake room-collab capability and the in-process database
 store of the room-db test."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib.util
 import io
@@ -60,10 +69,20 @@ class TestAsk(_Ws):
                               "--urgency", "durable", "--workspace", str(self.ws))
         self.assertEqual(rc, 0, out)
         self.assertIn("recorded: Pending questions database", out)
-        self.assertIn(f"row: https://collab.test.invalid/#/room/{ROOM}?surface=db&page=pendingq", out)
+        self.assertNotIn("row: https://", out, "unknown room servers have no app link")
         [body] = json.loads(self.state.read_text())["bodies"].values()
         self.assertIn("**Approve** -> merge\n**Hold** -> wait", body)
         self.assertIn("**Sent:** queued owner-dm", body)
+        self.assertEqual(self.outbox(), [])
+
+    def test_ask_prints_the_registered_room_app_link(self):
+        rc, out, err = self.cli("ask", "A fixture question?", "--urgency", "durable",
+                                "--workspace", str(self.ws),
+                                env={"PENDING_QUESTIONS_ROOM": "!fixture:s.space"})
+        self.assertEqual(rc, 0, err)
+        self.assertIn("recorded: Pending questions database", out)
+        self.assertIn("row: https://chat.s.space/home/!fixture%3As.space?surface=database&page=pendingq", out)
+        self.assertNotIn("https://collab.test.invalid", out)
         self.assertEqual(self.outbox(), [])
 
     def test_ask_without_the_capability_holds_the_question_in_the_outbox(self):
@@ -286,7 +305,7 @@ class TestSharedRoom(rdb._Ws):
         store, room = self.store_room({})
         self.assertEqual(room, self.SHARED)
         self.assertNotIn("DM", store.label)
-        self.assertIn(self.SHARED, store.link)
+        self.assertIsNone(store.link, "unknown shared-room servers have no app link")
 
     def test_env_wins_over_the_state_file(self):
         (self.ws / "state" / "pending-questions-room").write_text("!fromstate:test.invalid")

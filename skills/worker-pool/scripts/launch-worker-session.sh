@@ -38,6 +38,9 @@ cd "$REPO"
 if [ "${SUTANDO_WORKER_RUNTIME:-claude}" = "codex" ]; then
   exec bash "$REPO/skills/worker-pool/scripts/launch-codex-worker-session.sh" "$@"
 fi
+# shellcheck source=../../../src/agent/launch-path.sh
+. "$REPO/src/agent/launch-path.sh"
+sutando_append_launch_path "$REPO"
 # shellcheck source=../../../src/agent/claude/cli/session-launch.sh
 . "$REPO/src/agent/claude/cli/session-launch.sh"
 
@@ -52,6 +55,9 @@ SESSION="${SUTANDO_TMUX_SESSION:?launch-worker-session.sh needs SUTANDO_TMUX_SES
 # those are the canonical core's alone.
 SURFACE_ARGS=()
 add_skill_claude_plugins
+# Opt-in per spawn: SUTANDO_TASK_WATCH_MOD_WORKER=1 runs this worker's watcher in the
+# task-watch Mod instead of a Monitor (docs/task-watcher-hosting-modes.md).
+add_task_watch_mod "${SUTANDO_TASK_WATCH_MOD_WORKER:-}"
 # `/startup --worker` is the pool worker's own boot ceremony (orphan recovery
 # and session crons are core-only; the worker gate is what it runs instead).
 BOOT_PROMPT="/startup --worker"
@@ -72,6 +78,9 @@ ENV_ARGS=(-e SUTANDO_CORE_RUNTIME=claude -e SUTANDO_CORE_SESSION=)
 [ -n "${SUTANDO_TMUX_SOCKET:-}" ] && ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
 ENV_ARGS+=(-e "SUTANDO_TMUX_SESSION=$SESSION")
 ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID")
+ENV_ARGS+=(-e "SUTANDO_WORKER_ID=${SUTANDO_WORKER_ID:-$SUTANDO_INSTANCE_ID}")
+# Explicit empties: the core's ids are tmux server-global, so only -e clears them here.
+ENV_ARGS+=(-e SUTANDO_CORE_ID= -e SUTANDO_CORE_POOL_SIZE= -e SUTANDO_WORKER_SEAT=)
 [ -n "${SUTANDO_TASKS_DIR:-}" ] && ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
 # A worker's inbox is <ws>/deliveries/<id>, so the watcher cannot infer the
 # workspace from it: unforwarded, its results/ and state/ land under deliveries/.
@@ -80,6 +89,8 @@ ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID")
 # answers go. Derived in-session they become deliveries/results, which no
 # bridge drains.
 [ -n "${SUTANDO_INBOX_KIND:-}" ] && ENV_ARGS+=(-e "SUTANDO_INBOX_KIND=$SUTANDO_INBOX_KIND")
+# Always set, empty included: an omitted one inherits the tmux server's global env.
+ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
 [ -n "${SUTANDO_RESULTS_DIR:-}" ] && ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
 # Third half of that seam: without the resolver a worker reads the sentinel
 # itself, so an unforwarded one is the zero-byte read, not a missing option.
@@ -97,6 +108,8 @@ ENV_ARGS+=(-e "SUTANDO_INSTANCE_ID=$SUTANDO_INSTANCE_ID")
 # the spawner's --cwd, which need not be the repo, so a relative path would
 # resolve against the wrong directory.
 ENV_ARGS+=(-e "SUTANDO_WATCHER_CMD=$REPO/src/watch-tasks-stream.sh")
+# Always set, empty included: /startup --worker and the hooks read it to skip the Monitor.
+ENV_ARGS+=(-e "SUTANDO_TASK_WATCH_MOD=$TASK_WATCH_MOD")
 # The worker's own watcher beats state/watchers/<id>.alive, so the pool can
 # observe it as a file rather than a process scan.
 ENV_ARGS+=(-e "SUTANDO_WATCHER_BEAT=$REPO/skills/worker-pool/scripts/pool_beat.py")
@@ -110,6 +123,10 @@ if [ -n "$PY" ] && [ -x "$PY" ]; then
   [ -n "$WORKER_PY" ] && [ -x "$WORKER_PY" ] || WORKER_PY=""
 fi
 ENV_ARGS+=(-e "SUTANDO_PY=$WORKER_PY")
+# The seat's s-space MCP proxy asks this resolver whose agent to mint as; the token stays in the vault.
+. "$REPO/skills/worker-pool/scripts/worker-mcp-credential.sh"
+MCP_WORKER_CREDENTIAL="$(worker_mcp_credential "$REPO" "$WORKER_PY" "${SUTANDO_WORKER_ID:-$SUTANDO_INSTANCE_ID}" "${SUTANDO_WORKSPACE_DIR:-}")"
+ENV_ARGS+=(-e "AG2_MCP_WORKER_CREDENTIAL=$MCP_WORKER_CREDENTIAL")
 # Forward the embedder-provided default workspace for the same reason as
 # above (tmux takes the server env, not this shell's).
 [ -n "${SUTANDO_DEFAULT_WORKSPACE:-}" ] && ENV_ARGS+=(-e "SUTANDO_DEFAULT_WORKSPACE=$SUTANDO_DEFAULT_WORKSPACE")

@@ -46,6 +46,8 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
 
 1.5. **Start the streaming task watcher NOW, before registering any cron jobs.** This step used to run last (as step 5, after every `CronCreate` round-trip below) — moved here so an incoming task isn't queued unprocessed for the entire registration loop. Measured impact (startup-latency post-mortem, 2026-08-24, RC9 onboarding): with N session crons the old ordering left the watcher unarmed for ~76 seconds on a fresh boot (one `CronCreate` round-trip per entry, 9 entries measured), during which a brand-new user's first onboarding ping sat unprocessed — the single biggest contributor to "Sutando took a while to respond" reports on first boot.
 
+   If `python3 src/watcher_rearm.py mod-ready --repo "$PWD" --workspace "$(bash scripts/sutando-config.sh workspace)"` prints `yes`, the task-watch Mod runs the watcher: skip this step. On `no`, start it here as usual.
+
    Start it via the `Monitor` tool — pass `command: 'bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"'` (an instance whose inbox isn't `<workspace>/tasks/` substitutes `$SUTANDO_TASKS_DIR` for the resolved path instead: that variable, when set, is what the watcher and its supervisor both resolve to, so the tag must carry it, not the workspace default; every reader compares inboxes by their real path, so a trailing slash or a `/private` prefix does not split one inbox into two), `timeout_ms: 1800000`, `description: 'Streaming task watcher'`. **`Monitor` has no `persistent` option** (passing one does not keep the command alive; without `timeout_ms` the command is killed at the 5-minute default and the standby takes over until the next pass re-arms it). It kills the command at `timeout_ms` (30 min is the maximum) and sends one expiry notice; on that notice, run this step again — a start on a watched inbox exits 0. A notice that the command exited early is the same instruction (re-arm first, investigate second: the standby only covers after its 45 s grace); on macOS Claude Code reports a watcher killed by SIGTERM as `exit code 144`, which is not SIGURG and not the watcher's own crash. `--role session --inbox <value>` is what makes this an in-session watcher CODE can tell apart from an external one for the SAME inbox (#4477) — the watcher itself, on seeing `--role session`, proves readiness, stamps its sentinel, then waits up to 15 s for any external standby on this exact inbox to leave before its sweep (it kills nothing: #4585), and `task-notifier-supervisor.sh` (if one is running externally) polls the same inbox-scoped, sentinel-gated signal and stands the standby down; neither needs an instruction here to tear the other down, so there is no teardown step in this skill. The script emits one `TASK_FILE: <basename>` line per new task file (initial sweep + each subsequent event). Read the named file via the Read tool when notifications arrive. **The watcher checks its own inbox at startup** (`watcher_identity.py inbox-holders`): if a session watcher already covers it, the new one exits 0 naming the holder, so the Monitor call is safe to make whenever the per-inbox verdict says no session watcher is ready; never start it untagged, and use `--force-restart` only on the owner's word. The host-wide enumerator below stays for the STOP decision (which pids are ownerless), never for the start:
 
    ```bash
@@ -196,6 +198,14 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    with no digest map at all. Omitting the field is safe (the probe skips the check); a WRONG map
    would report drift that is not there.
 
+   Then publish this host's schedule to the owner's **Crons** room database, so anyone can see what
+   every agent has scheduled: `python3 skills/schedule-crons/scripts/crons_table.py sync`. It is
+   fail-open (one line and a non-zero exit when the room is unreachable) and never blocks
+   registration; an unchanged `crons.json` writes nothing, so rows deleted in the room come back
+   only with `sync --force`. A cron may end its prompt with
+   `python3 skills/schedule-crons/scripts/crons_table.py touch <name> "<one-line result>"` to stamp
+   its row's Last ran (UTC) and Last result.
+
 6. Confirm what was scheduled — note whether the proactive-loop fallback was triggered (informs operator that crons.json may need a persistent entry).
 
 ## Adding New Crons
@@ -216,19 +226,23 @@ Wrap **sub-daily** non-`main-loop` cron `prompt` bodies (e.g. `*/N`, `*/30`, hou
 
 `cron-gate.sh <reason> <command...>` either `exec`s the command (queue empty) or prints `cron-gate: owner tasks queued — deferring <reason>` and exits 0. See `crons.example.json` for canonical wrapped forms.
 
-## Attaching cron output to an AG2 Space room (if connected)
+## Attaching cron output to an s.space room (if connected)
 
-When the agent is connected to AG2 Space, an output-producing cron can post its results into its **own dedicated room** instead of a shared channel — one room per cron, so the owner can monitor each stream separately. This is **opt-in and connectivity-gated**: a cron with no `room` field, or an agent with no gateway token, is unaffected.
+When the agent is connected to s.space, an output-producing cron can post its results into its **own dedicated room** instead of a shared channel — one room per cron, so the owner can monitor each stream separately. This is **opt-in and connectivity-gated**: a cron with no `room` field, or an agent with no gateway token, is unaffected.
 
 **Opt in** by adding `"room": "auto"` to a cron entry in `crons.json`. On `/schedule-crons` activation (after step 3), run the helper once:
 
 ```bash
 WS="$(bash scripts/sutando-config.sh workspace)"; H="$(bash scripts/sutando-config.sh host-label)"
+OWNER="$(python3 scripts/connections.py list --json \
+  | python3 -c 'import json,sys; print(next((r["owner_mxid"] or "" for r in json.load(sys.stdin) if r["primary"]), ""))')"
 python3 skills/schedule-crons/ensure-cron-room.py \
-  --crons-file "$WS/hosts/$H/crons.json" --owner "@<owner>:ag2.space" --repo .
+  --crons-file "$WS/hosts/$H/crons.json" --owner "$OWNER" --repo .
 ```
 
-`ensure-cron-room.py` is **idempotent**: for each `"room": "auto"` entry it creates one room (`Sutando · <cron>`), invites the owner, posts a self-identifying first message, and **rewrites `room` to the concrete `!id:ag2.space`**. Entries that already hold a `!id` are skipped — re-running never makes duplicate rooms (the failure mode of ad-hoc creation). If no gateway token resolves, it exits 0 having done nothing. The cron's own prompt then posts output to its `room` id via the gateway op:message path ([[reference_gateway_op_message_room_post]]).
+`OWNER` is the primary connection row's `owner_mxid`: the owner's account on the homeserver the agent is on, whichever server that is. When the row has not learned it yet the value is empty; pass the owner's mxid yourself.
+
+`ensure-cron-room.py` is **idempotent**: for each `"room": "auto"` entry it creates one room (`Sutando · <cron>`), invites the owner, posts a self-identifying first message, and **rewrites `room` to the concrete `!id:<server>`** (the homeserver it was created on). Entries that already hold a `!id` are skipped — re-running never makes duplicate rooms (the failure mode of ad-hoc creation). If no gateway token resolves, it exits 0 having done nothing. The cron's own prompt then posts output to its `room` id via the gateway op:message path ([[reference_gateway_op_message_room_post]]).
 
 **Which crons opt in:** only *output-producing* crons (pr-shepherd, roadmap-driver, friction-room-sweep, disk-hygiene, ai-frontline-today, morning-briefing). Silent/internal crons (main-loop, sync-memory, briefing-fallback) stay room-less — a room each would be clutter.
 
@@ -263,6 +277,14 @@ This installs `com.sutando.cron-runner` (launchd, every 60s → `src/cron-runner
 
 ### Mechanical shell jobs
 
+A session cron runs its body inside the core's turn, so owner tasks queue
+behind it until it finishes. Choose by what the body needs:
+
+- **Mechanical** (runs scripts, no judgment): make it a `"launchd": true` entry
+  with `"shell_command"`. It runs outside the core session entirely.
+- **Needs LLM judgment**: keep it a prompt, and have the prompt dispatch the
+  work to a background subagent instead of running it inline.
+
 Launchd-owned entries may set `"shell_command"` for work that should not wake a
 model session (for example, a polling or sync script):
 
@@ -275,10 +297,15 @@ model session (for example, a polling or sync script):
 }
 ```
 
-`src/cron-runner.py` executes the command from the repository root, logs its
-command, stdout, stderr, and exit code to `<workspace>/logs/cron-runner.log`,
-and reports non-zero exits on stderr. A shell job runs even when the core
-heartbeat is absent and never creates a `tasks/` file. If an entry contains
+`src/cron-runner.py` starts the command in a detached child from the repository
+root and returns without waiting, so a slow job never delays other launchd
+crons. The child holds a per-job lock: a fire that lands while the previous run
+is still going is skipped and logged. It enforces `shell_timeout_s` (default
+300) by killing the process tree, and appends command, stdout, stderr and exit
+code to `<workspace>/logs/cron/<name>.log`. A shell job runs even when the core
+heartbeat is absent and never creates a `tasks/` file. A job with something for
+the owner writes `results/proactive-*.txt` itself, as `src/morning-briefing.py`
+does (see "Digest cron delivery" below). If an entry contains
 more than one execution form, precedence is `shell_command` > `prompt_skill` >
 `prompt`; use only one form in new configuration.
 

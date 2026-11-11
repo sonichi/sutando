@@ -19,7 +19,7 @@ EquipPanel / assignments API use).
 
 Cloud origin is declared in this skill's manifest.json `config` block (the
 config-only manifest convention in skills/MANIFEST.md) and resolved as
-`$AG2_CLOUD_ORIGIN override > manifest default > CLOUD_FALLBACK`.
+`$AG2_CLOUD_ORIGIN override > manifest default > this install's DotSpace cloud`.
 """
 
 import json
@@ -32,16 +32,27 @@ from pathlib import Path
 
 CLOUD_ENV_NAME = "AG2_CLOUD_ORIGIN"
 MANIFEST_PATH = Path(__file__).resolve().parents[1] / "manifest.json"
-# Last-resort only. The manifest's `config` block is the declared source of
-# truth for this default (skills/MANIFEST.md); this constant exists so an
-# unreadable/corrupt manifest degrades to the historical value instead of
-# crashing a cron-invoked reporter. If the two ever disagree, the manifest wins.
-CLOUD_FALLBACK = "https://sutando.ag2.space"
+
+
+def _cloud_fallback() -> str:
+    """Last resort when the manifest's `config` default is unreadable: this install's DotSpace's
+    cloud (core's dotspace); without core, the manifest value, else "" (the report is skipped)."""
+    src = Path(os.path.realpath(__file__)).parents[3] / "src"
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    try:
+        from dotspace import default_cloud_origin  # type: ignore
+    except ImportError:
+        return _manifest_default() or ""
+    return default_cloud_origin()
+
+
 MAX_EVENTS = 100  # server cap per report
 
 
 def _manifest_default(
     key: str = CLOUD_ENV_NAME, manifest_path: Path = MANIFEST_PATH
+
 ) -> "str | None":
     """Read a declared config default out of this skill's manifest.
 
@@ -66,7 +77,7 @@ def resolve_cloud_origin(
 ) -> str:
     """Resolve the cloud origin per the skill-config precedence.
 
-    env override > manifest `config` default > CLOUD_FALLBACK.
+    env override > manifest `config` default > this install's DotSpace cloud.
 
     An env var set to the empty string is treated as UNSET rather than as an
     override to "" — an empty origin would build a garbage URL, and the shell
@@ -93,6 +104,9 @@ def _normalize_origin(origin: str) -> str:
         return origin
     return normalize_base(origin)
 
+
+# After every helper it may call: a standalone install must import, never NameError.
+CLOUD_FALLBACK = _cloud_fallback()
 
 CLOUD = resolve_cloud_origin()
 
@@ -284,6 +298,9 @@ def _report(ws: Path, log: Path, pending: Path) -> int:
 
 
 def main() -> int:
+    if not CLOUD:
+        print("skill-usage-report: no cloud origin known (manifest unreadable, core absent); skipping")
+        return 0
     root = repo_root()
     sys.path.insert(0, str(root / "src"))
     try:

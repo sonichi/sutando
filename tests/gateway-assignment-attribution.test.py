@@ -32,6 +32,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 _REPO = Path(__file__).resolve().parent.parent
 _SRC = _REPO / "src" / "remote-gateway-bridge.py"
 _POOL_SCRIPTS = _REPO / "skills" / "worker-pool" / "scripts"
@@ -436,7 +441,7 @@ class AssignmentAttribution(unittest.TestCase):
         self._sentinel(W1, tid)
         self._counting_core()
         seen = {}
-        self.mod._quarantine_undelivered = lambda rf, t, why: seen.update(
+        self.mod._quarantine_undelivered = lambda rf, t, why, **kw: seen.update(
             {"file": rf, "tid": t, "why": why})
         rf = Path(self.workspace) / f"{tid}.txt"
         rf.write_text("done!")

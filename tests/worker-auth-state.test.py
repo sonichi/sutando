@@ -15,8 +15,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from cli_wedge import live_banner_lines  # noqa: E402
-from worker_auth_state import (auth_expired, authenticated_turn, login_expired,  # noqa: E402
-                               login_refusal, signed_in_since)
+from worker_auth_state import (auth_expired, authenticated_turn, idle_since_sign_in,  # noqa: E402
+                               login_expired, login_refusal, refusal_answered, signed_in_since)
 
 FOOTER = ("────────\n❯ \n────────\n"
           "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
@@ -183,6 +183,136 @@ class ProofOfASignedInTurn(unittest.TestCase):
         self.assertTrue(authenticated_turn("❯ hi\n● Done.\n✻ Cooked · done 1:00 PM\n" + FOOTER))
         self.assertFalse(authenticated_turn("❯ hi\n  ⎿  x\n✻ Cooked · done 1:00 PM\n" + FOOTER))
 
+
+class TheRefusalIsAnswered(unittest.TestCase):
+    """#5478: the first frame showing the CLI signed in after a refusal ends it, so a card
+    clears on that frame instead of waiting for the next completed turn."""
+
+    def test_output_after_the_refusal_answers_it(self):
+        for tail in ("❯ hi\n● Hello.\n", "❯ hi\n⏺ Bash(ls)\n", "  ⎿  Login successful\n",
+                     "❯ hi\n● Checking.\n✻ Perambulating… (1m 46s · ↓ 5.9k tokens)\n"):
+            self.assertTrue(refusal_answered(REFUSED + tail + FOOTER), tail)
+
+    def test_nothing_after_the_refusal_does_not(self):
+        for tail in ("", "❯ try again\n", "❯ try again\n✻ Perambulating… (1m 46s)\n"):
+            self.assertFalse(refusal_answered(REFUSED + tail + FOOTER), tail)
+
+    def test_no_refusal_on_the_pane_is_not_an_answer(self):
+        for pane in (None, "", FOOTER, "● Earlier answer.\n" + FOOTER):
+            self.assertFalse(refusal_answered(pane), repr(pane))
+
+
+CODEX_FOOTER = "  GPT-6-Sol ultra · ~/agents/x  ⚠ 1 warning · f2 to view"
+CODEX_IDLE = "\n» Ask Codex to do anything\n\n" + CODEX_FOOTER
+CODEX_REFUSED = "› /startup\nAuthentication required\n"
+
+
+class CodexSignsInWithItsOwnGrammar(unittest.TestCase):
+    """Codex verification of #5479: a Codex `•` response is the positive evidence a
+    Claude `●` is, read only for the codex runtime, and never from a spinner, a typed
+    prompt or an indented quote."""
+
+    def test_a_response_after_the_refusal_ends_it(self):
+        pane = CODEX_REFUSED + "› hi\n• Done — PR #5169 updated.\n" + CODEX_IDLE
+        self.assertIsNone(login_expired(pane, "codex"))
+        self.assertTrue(refusal_answered(pane, "codex"))
+        self.assertTrue(authenticated_turn(pane, "codex"))
+        self.assertTrue(signed_in_since("• Ran ls\n" + CODEX_IDLE, "codex"))
+
+    def test_the_claude_reading_is_unchanged(self):
+        pane = CODEX_REFUSED + "› hi\n• Done — PR #5169 updated.\n" + CODEX_IDLE
+        self.assertEqual(login_expired(pane), "Authentication required")
+        self.assertFalse(refusal_answered(pane))
+        self.assertFalse(authenticated_turn(pane))
+
+    def test_what_does_not_end_it(self):
+        for name, tail in (("typed prompt", "› try again\n"),
+                           ("spinner", "› try again\n• Working (0m 12s • esc to interrupt)\n› \n"),
+                           ("indented quote", "› hi\n  └ • Done — PR #5169 updated.\n    • Done.\n"),
+                           ("nothing", "")):
+            pane = CODEX_REFUSED + tail + CODEX_IDLE
+            self.assertEqual(login_expired(pane, "codex"), "Authentication required", name)
+            self.assertFalse(refusal_answered(pane, "codex"), name)
+            self.assertFalse(authenticated_turn(pane, "codex"), name)
+
+    def test_a_refusal_quoted_inside_a_turn_that_ran_is_not_one(self):
+        pane = ("› check auth\n• Ran cat diagnostic.txt\n  └ Authentication required\n"
+                "• The diagnostic was read.\n" + CODEX_IDLE)
+        self.assertIsNone(login_expired(pane, "codex"))
+
+    def test_an_earlier_turns_response_does_not_void_a_later_refusal(self):
+        pane = "› hi\n• Done.\n" + CODEX_REFUSED + CODEX_IDLE
+        self.assertEqual(login_expired(pane, "codex"), "Authentication required")
+
+    def test_proof_of_a_signed_in_codex_turn(self):
+        self.assertTrue(authenticated_turn("› hi\n• Done.\n" + CODEX_IDLE, "codex"))
+        for pane in (CODEX_IDLE, "› hi\n• Working (3m 02s • esc to interrupt)\n\n› \n" + CODEX_FOOTER,
+                     "› hi\n• Done.\n" + CODEX_FOOTER):
+            self.assertFalse(authenticated_turn(pane, "codex"), pane)
+
+
+class IdleSinceSignIn(unittest.TestCase):
+    """A /login that nothing has run after: the one frame the core monitor re-prompts on."""
+    SIGNED_IN = "❯ /login\n  ⎿  Login successful\n"
+
+    def test_a_sign_in_with_nothing_after_it_is_idle(self):
+        self.assertTrue(idle_since_sign_in(REFUSED + self.SIGNED_IN + FOOTER))
+        self.assertTrue(idle_since_sign_in(self.SIGNED_IN + FOOTER))
+
+    def test_anything_after_the_sign_in_ends_it(self):
+        for tail in (REAL, "❯ /startup\n", "❯ /startup\n✻ Perambulating… (3s)\n",
+                     "⏺ Bash(ls)\n", REFUSED, "✻ Worked for 0s\n"):
+            self.assertFalse(idle_since_sign_in(self.SIGNED_IN + tail + FOOTER), tail)
+
+    def test_the_live_effort_footer_row_is_not_agent_output(self):
+        # The idle frame captured from Claude Code v2.1.275, under a fresh sign-in.
+        live = ("                                            ● high · /effort\n"
+                "────────────────────────────────────────────────────────────────\n"
+                '❯ Try "refactor <filepath>"\n'
+                "────────────────────────────────────────────────────────────────\n"
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n")
+        self.assertTrue(idle_since_sign_in("Login successful\n" + live))
+        self.assertEqual(login_expired(REFUSED + live), EXPIRED)
+
+    def test_no_sign_in_or_a_codex_pane_is_not_idle_since_one(self):
+        self.assertFalse(idle_since_sign_in(REFUSED + FOOTER))
+        self.assertFalse(idle_since_sign_in(""))
+        self.assertFalse(idle_since_sign_in(self.SIGNED_IN + FOOTER, "codex"))
+
+
+
+# The words quoted where /login's result row is not: a tool result, the agent's prose, a
+# multi-line prompt the owner typed. Each renders as Claude Code draws it.
+QUOTED_LOGIN = {
+    "tool result": "❯ check the auth log\n⏺ Bash(tail -1 auth.log)\n  ⎿  Login successful\n",
+    "assistant prose": "❯ did it work?\n● The CLI printed this line:\n  Login successful\n",
+    "quoted user message": "❯ the worker said:\n  Login successful\n  is that enough?\n",
+}
+
+
+class QuotedLoginSuccessfulIsNotASignIn(unittest.TestCase):
+    """Only /login's own result row ("  ⎿  Login successful", or that row at column 0 in
+    a scrolled frame) is a sign-in; the same words anywhere else prove nothing."""
+
+    def test_the_words_quoted_elsewhere_are_not_a_sign_in(self):
+        for name, quoted in QUOTED_LOGIN.items():
+            with self.subTest(name):
+                self.assertFalse(idle_since_sign_in(REFUSED + quoted + FOOTER))
+                self.assertFalse(idle_since_sign_in(quoted + FOOTER))
+                self.assertFalse(authenticated_turn(quoted + FOOTER))
+
+    def test_a_quoted_prompt_does_not_answer_a_refusal(self):
+        quoted = QUOTED_LOGIN["quoted user message"]
+        self.assertFalse(signed_in_since(quoted + FOOTER))
+        self.assertFalse(refusal_answered(REFUSED + quoted + FOOTER))
+        self.assertEqual(login_expired(REFUSED + quoted + FOOTER), EXPIRED)
+
+    def test_control_the_result_row_forms_still_count(self):
+        for row in ("❯ /login\n  ⎿  Login successful\n", "  ⎿  Login successful\n", "Login successful\n"):
+            with self.subTest(row):
+                self.assertTrue(idle_since_sign_in(REFUSED + row + FOOTER))
+                self.assertTrue(signed_in_since(row + FOOTER))
+                self.assertTrue(authenticated_turn(row + FOOTER))
 
 if __name__ == "__main__":
     unittest.main()

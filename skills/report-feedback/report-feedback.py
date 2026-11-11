@@ -28,6 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -52,9 +53,9 @@ RETIRED_CLOUD_ORIGINS = cloud_auth.RETIRED_CLOUD_ORIGINS
 SIGNED_OUT_SENTINEL = cloud_auth.SIGNED_OUT_SENTINEL
 
 # Owner prefs written by the desktop Settings UI (host is the single writer).
-# autoReport defaults ON; sendLogs defaults OFF. The log excerpt is the part
-# that carries incidental owner data, so it is opt-in rather than opt-out.
-PREFS_DEFAULTS = {"autoReport": True, "sendLogs": False, "askFirst": False}
+# Both default OFF: an automatic report leaves the machine, so absence of the
+# file or key is not consent. Only an explicit true from the Settings toggle files.
+PREFS_DEFAULTS = {"autoReport": False, "sendLogs": False, "askFirst": False}
 # Ask-first: an automatic report is parked as a draft and the owner gets a card
 # (File / File without logs / Skip) instead of a filing; the reply files or drops it.
 DRAFTS_DIR = "feedback-drafts"
@@ -78,6 +79,7 @@ ASK_ACTIONS = [
 AUTO_STATE_FILE = "feedback-auto-reports.json"
 AUTO_DEDUPE_WINDOW_S = 24 * 3600
 AUTO_DAILY_CAP = 5
+HISTORICAL_HOLD_S = 72 * 3600
 
 
 def _git(repo: Path, *args: str) -> Optional[str]:
@@ -164,6 +166,35 @@ def body_with_versions(body: str, versions: dict) -> str:
     return "\n".join(lines)
 
 
+def recovery_report_content(rec: dict) -> tuple[str, dict]:
+    """Describe the persisted hold interval without changing the draft or recovery state."""
+    recovery = dict(rec["payload"]["recovery"])
+    timestamps = {}
+    for key, value in (("observed_at", rec.get("created")), ("released", recovery.get("released"))):
+        try:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("unknown timestamp")
+            timestamps[key] = datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z")
+        except (ValueError, OverflowError, OSError):
+            value = None
+            timestamps[key] = "unknown"
+        recovery[key] = value
+    observed, released = recovery["observed_at"], recovery["released"]
+    elapsed = (released - observed if observed is not None and released is not None
+               and released >= observed else None)
+    recovery["held_seconds"] = elapsed
+    recovery["historical"] = elapsed >= HISTORICAL_HOLD_S if elapsed is not None else None
+    duration = str(timedelta(seconds=elapsed)) if elapsed is not None else "unknown"
+    lines = [rec["payload"]["body"], "", "### Automatic report timing",
+             f"- Original observation (UTC): {timestamps['observed_at']}",
+             f"- Released (UTC): {timestamps['released']}",
+             f"- Elapsed hold duration: {duration}"]
+    if recovery["historical"]:
+        lines.extend(["", "**Historical report:** Held for at least 72 hours. This describes an earlier "
+                      "observation and may not reflect the current state."])
+    return "\n".join(lines), recovery
+
+
 def _redact(text: str) -> str:
     """Best-effort scrub of secrets/PII before a log excerpt leaves the machine.
 
@@ -217,7 +248,7 @@ def resolve_workspace() -> Path:
 
 
 # Wrappers, not aliases: each hands its sibling down as the injected reader, so
-# patching _keychain_get / read_keychain_auth here still steers the chain.
+# patching _keychain_get here still steers the chain (every Keychain key is a candidate).
 _normalize_base = cloud_auth.normalize_base
 _fnv1a64 = cloud_auth.fnv1a64
 origin_vault_key = cloud_auth.origin_vault_key
@@ -233,7 +264,7 @@ def read_keychain_auth():
 
 
 def read_cloud_auth(ws: Path):
-    return cloud_auth.read_cloud_auth(ws, keychain_auth=read_keychain_auth)
+    return cloud_auth.read_cloud_auth(ws, keychain_get=_keychain_get)
 
 
 def why_no_logs(ws: Path) -> str:
@@ -261,13 +292,12 @@ def read_prefs(ws: Path) -> dict:
 
     Written by the desktop Settings toggles ("File automatic bug reports",
     "Send logs with bug reports"). Missing file, missing key, or a non-bool
-    value all read as PREFS_DEFAULTS: autoReport ON, sendLogs OFF.
+    value all read as PREFS_DEFAULTS: autoReport OFF, sendLogs OFF.
 
-    The two defaults differ on purpose. Absence of the file must never disable
-    REPORTING on installs that predate the toggles. But absence is not consent
-    either, and the log excerpt is the part that carries incidental owner data
-    (paths with usernames, hostnames, workspace content), so it is opt-in: an
-    owner who has never opened Settings ships no logs.
+    Absence is not consent. An automatic report sends the owner's error context
+    to the cloud, and the log excerpt adds incidental owner data (paths with
+    usernames, hostnames, workspace content), so both are opt-in: an owner who
+    has never turned the toggles on files nothing automatically.
     """
     prefs = dict(PREFS_DEFAULTS)
     try:
@@ -275,7 +305,6 @@ def read_prefs(ws: Path) -> dict:
         for k in prefs:
             if isinstance(d.get(k), bool):
                 prefs[k] = d[k]
-        # The room the ask-first card goes to (the owner's DM); a string, unlike the switches.
     except Exception:
         pass
     return prefs
@@ -370,25 +399,23 @@ def decision_for_reply(text: str) -> str | None:
 def hitl_manager(ws: Path):
     """The engine's HITL store: the bridge projects what is created here and applies the clicks."""
     _engine_modules()
-    from hitl.manager import HitlManager, HitlStore, default_store  # type: ignore
+    from hitl.cards import manager_for  # type: ignore
 
-    return HitlManager(HitlStore(default_store(ws)))
+    return manager_for(ws)
 
 
 def register_ask(ws: Path, draft_id: str, title: str, device: str) -> str:
     """One HumanRequirement per draft: the card the owner sees, keyed to the draft by guard."""
     _engine_modules()
-    from hitl.schema import Action, HumanRequirement  # type: ignore
+    from hitl.cards import create_choice  # type: ignore
 
-    req = HumanRequirement(
-        kind="choice", runtime=HITL_RUNTIME, title="File a bug report?",
-        message=f"I hit what looks like a Sutando/AG2 Space defect: {title}. File it to the team?",
-        guard=draft_id, device={"id": f"{HITL_RUNTIME}:{draft_id}", "name": device},
-        actions=[Action(id=a["id"], kind=a["kind"], label=a["label"]) for a in ASK_ACTIONS],
-        subject={"draft_id": draft_id, "title": title},
-        turn_on_action=True,  # the click reaches the core as a task, so the Stop hook runs at once
-    )
-    return hitl_manager(ws).create(req).id
+    # turn_on_action (the helper's default): the click reaches the core as a task, so the Stop hook runs at once
+    return create_choice(
+        f"I hit what looks like a Sutando/AG2 Space defect: {title}. File it to the team?",
+        ASK_ACTIONS, draft_id, {"draft_id": draft_id, "title": title},
+        runtime=HITL_RUNTIME, title="File a bug report?",
+        device={"id": f"{HITL_RUNTIME}:{draft_id}", "name": device}, manager=hitl_manager(ws),
+    ).id
 
 
 def requirement_for_draft(manager, draft_id: str):
@@ -407,18 +434,16 @@ HELD_ACTIONS = [
 def register_held(ws: Path, manager, draft_id: str, title: str, device: str) -> str:
     """The post got no answer: a new card says so and asks again. Same guard grammar with a suffix,
     so the store dedupes a repeat and the click's task path is the same one."""
-    from hitl.schema import Action, HumanRequirement  # type: ignore
+    _engine_modules()
+    from hitl.cards import create_choice  # type: ignore
 
-    req = HumanRequirement(
-        kind="choice", runtime=HITL_RUNTIME, title="Bug report: filed or not?",
-        message=(f"The report \"{title}\" was sent but no answer came back, so it may or may not be filed. "
-                 f"File it again, or skip it?"),
-        guard=f"{draft_id}:held", device={"id": f"{HITL_RUNTIME}:{draft_id}:held", "name": device},
-        actions=[Action(id=a["id"], kind=a["kind"], label=a["label"]) for a in HELD_ACTIONS],
-        subject={"draft_id": draft_id, "title": title, "held": True},
-        turn_on_action=True,
-    )
-    return manager.create(req).id
+    return create_choice(
+        (f"The report \"{title}\" was sent but no answer came back, so it may or may not be filed. "
+         f"File it again, or skip it?"),
+        HELD_ACTIONS, f"{draft_id}:held", {"draft_id": draft_id, "title": title, "held": True},
+        runtime=HITL_RUNTIME, title="Bug report: filed or not?",
+        device={"id": f"{HITL_RUNTIME}:{draft_id}:held", "name": device}, manager=manager,
+    ).id
 
 
 def apply_clicks(ws: Path, prefs: dict, device: str, *, release_automatic: bool = True) -> dict:
@@ -721,7 +746,12 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
     if rec["payload"].get("recovery") and not recovery_ready(rec):
         print(f"HELD: incident {draft_id} is awaiting recovery.")
         return 3
-    base, token = read_cloud_auth(ws)
+    auth = read_cloud_auth(ws)
+    base, token = auth
+    refusal = None if token else cloud_auth.refusal_message(auth)
+    if refusal:
+        print(f"ACCOUNT_REFUSED: {refusal} The draft stays parked.")
+        return 2
     if not token:
         print(f"NOT_SIGNED_IN: not signed in to Sutando Cloud (probed {base or resolve_cloud_origin()}) — the draft stays parked; sign in, then retry.")
         return 2
@@ -731,8 +761,11 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
     ctx["versions"] = d.get("versions") or {
         name: {"version": "unknown", "commit": "unknown"} for name in ("sutando", "ag2space")
     }
+    body = d["body"]
     if d.get("recovery"):
         ctx["recovery"] = d["recovery"]
+        if d.get("auto"):
+            body, ctx["recovery"] = recovery_report_content(rec)
     with_logs = choice == "file" and prefs["sendLogs"] and not d.get("no_logs")
     if with_logs:
         excerpt, names = logs_excerpt(ws)
@@ -743,7 +776,7 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
             ctx["logs_omitted"] = why_no_logs(ws)
     else:
         ctx["logs_opted_out"] = True
-    payload = {"kind": d["kind"], "severity": d["severity"], "title": d["title"], "body": body_with_versions(d["body"], ctx["versions"]), "context": ctx}
+    payload = {"kind": d["kind"], "severity": d["severity"], "title": d["title"], "body": body_with_versions(body, ctx["versions"]), "context": ctx}
     mark_posting(ws, draft_id)
     receipt: dict = {}
     try:
@@ -859,7 +892,12 @@ def _main() -> None:
         print(f"ASKED: draft {draft_id} parked as {req_id}; the bridge delivers the card. After the owner answers, run --apply.")
         return
 
-    base, token = read_cloud_auth(ws)
+    auth = read_cloud_auth(ws)
+    base, token = auth
+    refusal = None if token else cloud_auth.refusal_message(auth)
+    if refusal:
+        print(f"ACCOUNT_REFUSED: {refusal}")
+        sys.exit(2)
     if not token:
         print(f"NOT_SIGNED_IN: not signed in to Sutando Cloud (probed {base or resolve_cloud_origin()}) — ask the user to sign in (Settings → Sutando Cloud), then retry.")
         sys.exit(2)

@@ -53,7 +53,15 @@
 set -u
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-SETTINGS="$REPO_DIR/.claude/settings.json"
+# Claude Code reads project settings from the directory the core LAUNCHES from, which
+# start-cli.sh lets SUTANDO_CLAUDE_WORKING_DIR move; the scripts stay anchored at REPO_DIR.
+# One resolver for every site (scripts/core-working-dir.sh); only needed when the override is set.
+TARGET_DIR="$REPO_DIR"
+if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
+  . "$REPO_DIR/scripts/core-working-dir.sh" || { echo "error: scripts/core-working-dir.sh missing — cannot resolve SUTANDO_CLAUDE_WORKING_DIR" >&2; exit 1; }
+  TARGET_DIR="$(sutando_core_working_dir "$REPO_DIR")" || { echo "error: SUTANDO_CLAUDE_WORKING_DIR rejected — hooks NOT installed" >&2; exit 1; }
+fi
+SETTINGS="$TARGET_DIR/.claude/settings.json"
 
 # Hook specs: each line is "<event>|<command>".  Order = install order.
 # $REPO_DIR is expanded HERE, at install time, so the command written into
@@ -124,13 +132,38 @@ HOOK_PRIOR=()
 for _i in "${!HOOKS[@]}"; do HOOK_PRIOR+=(""); done
 
 # Skill-declared hooks via src/skill_hooks.py (the same discovery the health probe reads).
+# The interpreter is the launcher's (SUTANDO_PY > bundled > a PATH python3 that is not
+# Apple's stub); a bare `python3` here reaches the stub on a Mac without the CLT.
+PY=""
+if [ -r "$REPO_DIR/scripts/python-binary.sh" ]; then
+  . "$REPO_DIR/scripts/python-binary.sh"
+  PY="$(resolve_python "$REPO_DIR")"
+else
+  PY="$(command -v python3 || true)"
+fi
+DISCOVERY_RC=0
+DISCOVERED="$(mktemp "${TMPDIR:-/tmp}/skill-hooks.XXXXXX")"
+if [ ! -f "$REPO_DIR/src/skill_hooks.py" ]; then
+  echo "install-claude-hooks: no src/skill_hooks.py in this tree — static hooks only" >&2
+elif [ -z "$PY" ]; then
+  echo "install-claude-hooks: no runnable python3 — skill-declared hooks NOT registered" >&2
+  DISCOVERY_RC=1
+else
+  # `$?` inside an `if ! cmd` branch is the NEGATED status; capture the real one.
+  "$PY" "$REPO_DIR/src/skill_hooks.py" "$REPO_DIR" > "$DISCOVERED" 2>/dev/null || DISCOVERY_RC=$?
+  if [ "$DISCOVERY_RC" != 0 ]; then
+    echo "install-claude-hooks: skill-hook discovery failed (rc=$DISCOVERY_RC via $PY) — skill-declared hooks NOT registered" >&2
+    : > "$DISCOVERED"
+  fi
+fi
 # NUL-framed (-d '') because two of the four fields embed the repo path.
 while IFS= read -r -d '' _ev && IFS= read -r -d '' _tok \
    && IFS= read -r -d '' _cmd && IFS= read -r -d '' _prior; do
   [ -n "${_ev:-}" ] || continue
   HOOKS+=("$_ev|$_tok|$_cmd")
   HOOK_PRIOR+=("$_prior")
-done < <(python3 "$REPO_DIR/src/skill_hooks.py" "$REPO_DIR" 2>/dev/null)
+done < "$DISCOVERED"
+rm -f "$DISCOVERED"
 
 # Deprecated hooks to uninstall on re-run.  Each line: "<event>|<substring>".
 # Matching uses `.command | contains(substring)` so we don't need to track
@@ -159,7 +192,7 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 
-mkdir -p "$REPO_DIR/.claude"
+mkdir -p "$TARGET_DIR/.claude"
 if [ ! -f "$SETTINGS" ]; then
   echo '{}' > "$SETTINGS"
 fi
@@ -271,14 +304,31 @@ for i in "${!HOOKS[@]}"; do
 
   # SHAPE cannot match the runner-first entry (its first word is `[`), so match the
   # prior command exactly, taken from the emitter — `${CMD#*exec }` splits on a path.
+  # Several legacy shapes per hook, joined by the record separator skill_hooks.py emits.
   LEGACY_SHAPE=""
-  [ -n "${HOOK_PRIOR[$i]:-}" ] && LEGACY_SHAPE="^$(re_escape "${HOOK_PRIOR[$i]}")\$"
+  if [ -n "${HOOK_PRIOR[$i]:-}" ]; then
+    _alts=""
+    while IFS= read -r -d $'\x1e' _p || [ -n "$_p" ]; do
+      [ -n "$_p" ] && _alts="${_alts:+$_alts|}$(re_escape "$_p")"
+    done < <(printf '%s' "${HOOK_PRIOR[$i]}")
+    LEGACY_SHAPE="^($_alts)\$"
+  fi
+  # A skill hook starts with the fail-open guard on ITS OWN path (`[ -f <path> ] || exit 0; `).
+  # Another revision of this installer spells the rest differently (the interpreter resolved at
+  # event time), and no operator writes that guard: an entry that opens with our guard for our
+  # path and carries the marker is ours whatever follows, so the two spellings never coexist.
+  GUARD_SHAPE=""
+  case "$CMD" in
+    "[ -f "*" ] || exit 0; "*)
+      _guard="${CMD%% ] || exit 0; *} ] || exit 0; "
+      GUARD_SHAPE="^$(re_escape "$_guard").*$(re_escape "$MARKER")" ;;
+  esac
 
   if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
-           --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" \
+           --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" --arg guard "$GUARD_SHAPE" \
       '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command // "")
        | map(contains($marker) and (. != $cmd)
-             and (test($shape) or ($legacy != "" and test($legacy))))
+             and (test($shape) or ($legacy != "" and test($legacy)) or ($guard != "" and test($guard))))
        | any' \
       "$SETTINGS" >/dev/null 2>&1; then
     continue
@@ -286,14 +336,14 @@ for i in "${!HOOKS[@]}"; do
 
   TMP="$(mktemp "${SETTINGS}.XXXXXX")"
   jq --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
-     --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" '
+     --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" --arg guard "$GUARD_SHAPE" '
     if (.hooks // {})[$event] then
       .hooks[$event] |= map(
         .hooks |= map(select(
           ((.command // "") | contains($marker))
           and ((.command // "") != $cmd)
           and ((.command // "")
-               | test($shape) or ($legacy != "" and test($legacy)))
+               | test($shape) or ($legacy != "" and test($legacy)) or ($guard != "" and test($guard)))
           | not
         ))
       )
@@ -368,6 +418,9 @@ if jq -e '(.hooks // {}).PreCompact // [] | map(.hooks // []) | flatten
 fi
 
 echo "install-claude-hooks: added=$ADDED skipped=$SKIPPED removed=$REMOVED → $SETTINGS"
+# A failed discovery leaves the static hooks installed and exits non-zero: the
+# launcher prints its warning and the claude-hooks probe names the missing ones.
+[ "$DISCOVERY_RC" = 0 ] || exit 1
 
 # Register hooks in the sutando-hook-manifest so migration-notice can identify
 # them without relying on the hardcoded substring list. (#1502)

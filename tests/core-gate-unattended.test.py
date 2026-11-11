@@ -297,7 +297,7 @@ class TestQueuedTasksHearWhy(unittest.TestCase):
     def test_an_unreadable_queue_is_no_count_and_no_notice(self):
         _task(self.ws, 1)
         with patch.object(core_gate_notice.task_queue, "pending_files", side_effect=PermissionError("denied")):
-            self.assertEqual(core_gate_notice.queued_count(self.ws), 0)
+            self.assertIsNone(core_gate_notice.queued_count(self.ws))
             req = M.escalate(self.mgr, "blocked-human", "d", "selection", PICKER, SESSION)
             self.assertEqual(core_gate_notice.notice_queued(self.mgr, req, self.ws, "blocked-human", "selection"), [])
         self.assertEqual(_rows(self.ws), [])
@@ -342,6 +342,9 @@ class _Clock:
     def time(self):
         return self.t
 
+    def monotonic(self):
+        return self.t
+
     def sleep(self, s):
         self.left -= 1
         if self.left <= 0:
@@ -378,7 +381,7 @@ class TestMonitorLoop(unittest.TestCase):
         argv = ["core-input-watch.py", "--socket", "/x.sock", "--session", SESSION, "--out", str(out)]
         if seat:
             argv += ["--seat", seat]
-        with patch.object(M, "capture", lambda s, sess: screen["pane"]), \
+        with patch.object(M, "capture_styled", lambda s, sess: screen["pane"]), \
                 patch.object(M, "send_keys", send), \
                 patch.object(M, "_load_runtime_health", lambda: _RH()), \
                 patch.object(M, "gateway_alive", lambda *a: True), \

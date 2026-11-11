@@ -1,5 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
 	initialGoodbyeGuard,
 	shouldFireGoodbye,
@@ -46,35 +48,28 @@ describe('P7 D7.3 stale-repeat goodbye guard', () => {
 });
 
 describe('P7 D7.3 centralized conversation clear (G-P7-8)', () => {
-	it('empties items IN PLACE and rebases the cursor together', () => {
-		const items: string[] = ['a', 'b', 'c'];
+	it('resets through bodhi and rebases the cursor together', () => {
+		const reasons: string[] = [];
 		const logs: string[] = [];
-		const h = createConversationClearHelper(() => items, (m) => logs.push(m));
+		const h = createConversationClearHelper((r) => { reasons.push(r); return 3; }, (m) => logs.push(m));
 		h.cursor.index = 3;
-		const cleared = h.clear('test');
-		assert.equal(cleared, 3);
-		assert.equal(items.length, 0, 'mutated in place (getter-backed array)');
+		assert.equal(h.clear('test'), 3);
+		assert.deepEqual(reasons, ['test'], 'bodhi resetConversationContext, so its history writer keeps its checkpoint');
 		assert.equal(h.cursor.index, 0, 'cursor rebased WITH the clear');
 		assert.ok(logs.some((l) => l.includes('cleared 3')));
 	});
 
-	it('rebases the cursor even when items are unreadable — a stale cursor against an emptied array is the bug', () => {
-		const h = createConversationClearHelper(
-			() => {
-				throw new Error('no session yet');
-			},
-			() => {},
-		);
+	it('rebases the cursor even when the reset throws — a stale cursor against an emptied array is the bug', () => {
+		const h = createConversationClearHelper(() => { throw new Error('no session yet'); }, () => {});
 		h.cursor.index = 7;
 		assert.equal(h.clear('early'), 0);
 		assert.equal(h.cursor.index, 0);
 	});
 
-	it('non-array items: clears nothing, still rebases', () => {
-		const h = createConversationClearHelper(() => undefined, () => {});
-		h.cursor.index = 2;
-		assert.equal(h.clear('none'), 0);
-		assert.equal(h.cursor.index, 0);
+	it('voice-agent clears through resetConversationContext, never by truncating items', () => {
+		const src = readFileSync(join(import.meta.dirname, '..', 'src', 'voice-agent.ts'), 'utf-8');
+		assert.match(src, /voiceSessionRef\?\.resetConversationContext\(reason\)\.cleared \?\? 0/);
+		assert.doesNotMatch(src, /items\.length = 0/);
 	});
 });
 

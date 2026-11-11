@@ -48,7 +48,10 @@ text slot only: the managed voice entry is a cloud-minted Gemini Live
 ephemeral token (``auth_tokens/...``), accepted by the Live API alone, so
 spending it on ``generateContent`` is rejected as an invalid API key. It is
 not a voice surface, so a 'managed' preference never blocks its env fallback,
-and quarantine hides every managed entry as always.
+and quarantine hides every managed entry as always. A desktop supervisor also
+injects that token into every child as GEMINI_VOICE_API_KEY, so no capability
+but voice accepts an ``auth_tokens/`` value, or the managed voice key, from ANY
+tier; with nothing else left it resolves ``('', 'none')``.
 
 Managed-file schema (version 1):
   {"version": 1,
@@ -106,6 +109,9 @@ _ENV_SLOTS = {
     "gemini-image": ["gemini-text", "gemini-voice"],
 }
 
+# Cloud-minted Gemini Live ephemeral tokens carry this prefix; only the Live API accepts them.
+_LIVE_TOKEN_PREFIX = "auth_tokens/"
+
 # Env-var names per capability slot, in existing-chain order.
 _ENV_VARS = {
     "gemini-voice": "GEMINI_VOICE_API_KEY",
@@ -159,11 +165,20 @@ def resolve_credential(
     # S1: the preference governs the VOICE capability; quarantine hides
     # managed entries from every capability in every mode.
     preference = managed.voice_preference if capability == "gemini-voice" else None
+    managed_voice = managed.caps.get("gemini-voice")
+    managed_voice_key = managed_voice.get("key") if isinstance(managed_voice, dict) else None
+
+    def spendable(key: str) -> bool:
+        # A Live token (or its injected env copy) is spendable by the voice capability alone.
+        return capability == "gemini-voice" or not (
+            key.startswith(_LIVE_TOKEN_PREFIX) or key == managed_voice_key
+        )
+
     if preference != "byok" and not managed.quarantined:
         for slot in _MANAGED_SLOTS[capability]:
             entry = managed.caps.get(slot)
             key = entry.get("key") if isinstance(entry, dict) else None
-            if isinstance(key, str) and key:
+            if isinstance(key, str) and key and spendable(key):
                 # S3: report the entry's opaque generation verbatim, when present.
                 generation = entry.get("generation")
                 return ResolvedCredential(
@@ -180,7 +195,7 @@ def resolve_credential(
         return ResolvedCredential(key="", source="none")
     for slot in _ENV_SLOTS[capability]:
         key = os.environ.get(_ENV_VARS[slot])
-        if key:
+        if key and spendable(key):
             # S3/U4: for the voice capability the launcher injects
             # SUTANDO_VOICE_CREDENTIAL_GENERATION beside a materialized BYOK
             # key. Manual/legacy .env keys stay generationless (Y4/Z4: a

@@ -126,6 +126,9 @@ class FakeTmuxHarness(unittest.TestCase):
         # Every capture-pane increments this; the paste logs `CAPTURES@<n>`, so a
         # test can aim a state flip at "the read before the paste" without hard-coding order.
         self.capture_count = self.root / "capture-count.txt"
+        # One line per has-session probe: the caller's pid and what the marker and results
+        # dirs held at that moment; after a paste the notifier probes only once has_result missed.
+        self.session_probe_log = self.root / "has-session.log"
         # Holds N: on the Nth capture the footer flips to BUSY (consumed once).
         self.busy_on_capture_flag = self.root / "busy-on-capture.flag"
         # Holds N: on the Nth capture a trust gate replaces the pane (consumed once).
@@ -192,6 +195,7 @@ class FakeTmuxHarness(unittest.TestCase):
         script = self.bin / "tmux"
         glob_limit = self.HISTORY_LIMIT if self.GLOBAL_HISTORY_LIMIT is None else self.GLOBAL_HISTORY_LIMIT
         script.write_text(f'''#!/bin/bash
+. "{REPO}/tests/lib/tmux-fake-unwrap.sh"
 [ "${{1:-}}" = -S ] && shift 2
 cmd="$1"; shift
 PANE="{self.pane_file}"
@@ -284,6 +288,7 @@ history_size() {{
 }}
 case "$cmd" in
   has-session)
+    printf 'PROBE pid=%s markers=%s results=%s\n' "$PPID" "$(ls "{self.inflight_dir}" 2>/dev/null | tr '\n' ',')" "$(ls "{self.results_dir}" 2>/dev/null | tr '\n' ',')" >> "{self.session_probe_log}"
     [ -f "{self.session_flag}" ] && exit 0
     exit 1
     ;;
@@ -507,8 +512,18 @@ esac
 
     def _env(self, extra=None):
         env = dict(os.environ)
+        # A pool worker's shell routes its inbox through these; inherited, they reclassify
+        # the fixture's tasks (a deliveries inbox skips the worker-held check).
+        for k in ("SUTANDO_INBOX_KIND", "SUTANDO_INBOX_RESOLVER", "SUTANDO_INBOX_RESOLVER_TIMEOUT",
+                  "SUTANDO_INSTANCE", "SUTANDO_INSTANCE_ID", "SUTANDO_POOL_DELIVERY_SCRIPT",
+                  "SUTANDO_WATCHER_BEAT", "SUTANDO_WATCHER_TRANSITION_HOOK"):
+            env.pop(k, None)
         env.update({
             "PATH": f"{self.bin}:{env.get('PATH', '/usr/bin:/bin')}",
+            # The notifier derives state/ from the workspace and its queue from TMPDIR;
+            # inherited values would put both outside the fixture (the live core's, in a core shell).
+            "SUTANDO_WORKSPACE_DIR": str(self.tasks_dir.parent),
+            "TMPDIR": str(self.root),
             "SUTANDO_TMUX_SOCKET": str(self.root / "fake.sock"),
             "SUTANDO_TMUX_SESSION": "sutando-core-test",
             "SUTANDO_TASKS_DIR": str(self.tasks_dir),
@@ -547,6 +562,15 @@ esac
                 f"Delivered by the standby: no session-role watcher holds {self.tasks_dir}. "
                 f'Re-arm yours via the Monitor tool: bash "{REPO}/src/watch-tasks-stream.sh" '
                 f'"{self.tasks_dir}" --role session --inbox "{self.tasks_dir}"')
+
+    def no_result_polls(self, pid, name):
+        """has-session probes by pid that found name's marker present and its result absent."""
+        n = 0
+        for line in (self.session_probe_log.read_text() if self.session_probe_log.exists() else "").splitlines():
+            m = re.match(r"PROBE pid=(\d+) markers=(\S*) results=(\S*)$", line)
+            if m and int(m.group(1)) == pid and name in m.group(2).split(",") and name not in m.group(3).split(","):
+                n += 1
+        return n
 
     def sendkeys_log_text(self):
         return self.sendkeys_log.read_text()

@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Regression pin: the seven python legs, as ci.yml's own step computes them, partition discovery.
+"""Regression pin: the python legs (cost-sharded, then the load-sensitive pair), as ci.yml's
+own step computes them, partition discovery.
 
-Runs the `Run Python standalone tests` step body from ci.yml once per leg (SHARD=1..7)
+Runs the `Run Python standalone tests` step body from ci.yml once per matrix leg
 in a fixture that has every discovered path, the real selector, sharder, cost table and
 list, and a stub lane runner that records the file list and worker count it is handed.
 Whatever the workflow does to pick a leg's files — selector, sharder, or anything that
 replaces them — is what gets measured. It must hold that every discovered suite runs in
-exactly one leg, the listed load-sensitive suites in leg 6 (heaviest first, two workers)
-except those tagged `serial`, which run alone in leg 7, and legs 1-5 none of them; and a list with a stale or duplicate entry must stop every
-leg with the selector's exit 3, so a leg that reads the list without the selector fails.
+exactly one leg except the quarantined ones (tests/python-quarantine.txt), which run in none, the listed load-sensitive suites in the second-to-last leg (heaviest first, two
+workers) except those tagged `serial`, which run alone in the last, and the shared legs none of them; and a list with a stale or duplicate entry must stop every
+leg with the selector's exit 3, so a leg that reads the list without the selector fails. A quarantine entry
+that is stale or carries no issue url stops every leg the same way.
 
 Run: python3 tests/python-ci-legs-partition.test.py
 """
@@ -25,8 +27,9 @@ REPO = Path(__file__).resolve().parent.parent
 CI = REPO / ".github" / "workflows" / "ci.yml"
 LIST = "tests/python-load-sensitive-suites.txt"
 COSTS = "tests/python-suite-costs.txt"
+QUARANTINE = "tests/python-quarantine.txt"
 COPIED = ["scripts/discover-python-tests.sh", "scripts/select-load-sensitive-suites.sh",
-          "scripts/shard-by-cost.sh", LIST, COSTS]
+          "scripts/select-quarantined-suites.sh", "scripts/shard-by-cost.sh", LIST, COSTS, QUARANTINE]
 
 LANE_STUB = """#!/usr/bin/env bash
 # Records what the step hands the lane runner, and a passing record per file.
@@ -66,9 +69,25 @@ def build_fixture(td: Path, discovered) -> Path:
     return fx
 
 
-def run_legs(fx: Path, list_text: str, nproc: int = 8, shards=range(1, 8)):
+def matrix_legs() -> int:
+    job = CI.read_text().split("\n  python-standalone-tests:\n", 1)[1]
+    m = re.search(r"^ {8}shard: \[([0-9, ]+)\]$", job, re.M)
+    if not m:
+        raise AssertionError("could not find python-standalone-tests' `shard:` matrix in ci.yml")
+    return len(m.group(1).split(","))
+
+
+# The leg layout ci.yml encodes: cost-sharded legs, then the load-sensitive pair as the last two.
+SERIAL_LEG = matrix_legs()
+LOAD_LEG = SERIAL_LEG - 1
+SHARED_LEGS = range(1, LOAD_LEG)
+ALL_LEGS = range(1, SERIAL_LEG + 1)
+
+
+def run_legs(fx: Path, list_text: str, nproc: int = 8, shards=ALL_LEGS, quarantine_text=None):
     body = step_body()
     (fx / LIST).write_text(list_text)
+    (fx / QUARANTINE).write_text((REPO / QUARANTINE).read_text() if quarantine_text is None else quarantine_text)
     getconf = fx.parent / "bin" / "getconf"
     getconf.write_text(f"#!/usr/bin/env bash\necho {nproc}\n")
     getconf.chmod(0o755)
@@ -91,6 +110,9 @@ def main() -> int:
     listed = [r[0] for r in rows]
     serial = [r[0] for r in rows if r[1:] == ["serial"]]
     paired = [f for f in listed if f not in serial]
+    quarantined = [ln.split()[0] for ln in (REPO / QUARANTINE).read_text().splitlines()
+                   if ln.strip() and not ln.startswith("#")]
+    gated = [f for f in disc if f not in quarantined]
     cost = {}
     for ln in (REPO / COSTS).read_text().splitlines():
         if ln and not ln.startswith("#"):
@@ -114,32 +136,35 @@ def main() -> int:
     dups = sorted({f for f in every if every.count(f) > 1})
     if dups:
         fails.append(f"{len(dups)} suite(s) run in more than one leg, e.g. {dups[:3]}")
-    missing = sorted(set(disc) - set(every))
+    missing = sorted(set(gated) - set(every))
     if missing:
         fails.append(f"{len(missing)} discovered suite(s) run in no leg, e.g. {missing[:3]}")
-    shared = sorted(set(listed) & {f for s in range(1, 6) for f in legs[s][1]})
+    leaked = sorted(set(quarantined) & set(every))
+    if leaked:
+        fails.append(f"quarantined suite(s) still run in a gating leg: {leaked[:3]}")
+    shared = sorted(set(listed) & {f for s in SHARED_LEGS for f in legs[s][1]})
     if shared:
-        fails.append(f"load-sensitive suite(s) in legs 1-5: {shared[:3]}")
-    leg6, leg7 = legs[6][1], legs[7][1]
+        fails.append(f"load-sensitive suite(s) in legs 1-{SHARED_LEGS[-1]}: {shared[:3]}")
+    leg6, leg7 = legs[LOAD_LEG][1], legs[SERIAL_LEG][1]
     if not serial:
-        fails.append("the list tags no suite `serial`, so leg 7 has nothing to run")
+        fails.append(f"the list tags no suite `serial`, so leg {SERIAL_LEG} has nothing to run")
     if sorted(leg6) != sorted(paired):
-        fails.append(f"leg 6 runs {len(leg6)} suites, not exactly the {len(paired)} listed without `serial`")
+        fails.append(f"leg {LOAD_LEG} runs {len(leg6)} suites, not exactly the {len(paired)} listed without `serial`")
     if sorted(leg7) != sorted(serial):
-        fails.append(f"leg 7 runs {leg7}, not exactly the `serial` suites {serial}")
+        fails.append(f"leg {SERIAL_LEG} runs {leg7}, not exactly the `serial` suites {serial}")
     if [cost.get(f, 1) for f in leg6] != sorted((cost.get(f, 1) for f in leg6), reverse=True):
-        fails.append("leg 6 is not ordered heaviest first")
-    # The step's rule: shared legs take the host's core count, leg 6 two, leg 7 one. Checked
+        fails.append(f"leg {LOAD_LEG} is not ordered heaviest first")
+    # The step's rule: shared legs take the host's core count, the load leg two, the serial leg one. Checked
     # on a 2-core and an 8-core host so a valid 2-core value is never read as hardcoding.
     for nproc in (2, 8):
         got = legs if nproc == 8 else run_legs(fx, real, nproc)
-        shared = {s: got[s][2] for s in range(1, 6)}
+        shared = {s: got[s][2] for s in SHARED_LEGS}
         if set(shared.values()) != {str(nproc)}:
-            fails.append(f"on a {nproc}-core host legs 1-5 run with {sorted(set(shared.values()))} workers, not {nproc}")
-        if got[6][2] != "2":
-            fails.append(f"on a {nproc}-core host leg 6 runs with {got[6][2]} workers, not 2")
-        if got[7][2] != "1":
-            fails.append(f"on a {nproc}-core host leg 7 runs with {got[7][2]} workers, not 1")
+            fails.append(f"on a {nproc}-core host legs 1-{SHARED_LEGS[-1]} run with {sorted(set(shared.values()))} workers, not {nproc}")
+        if got[LOAD_LEG][2] != "2":
+            fails.append(f"on a {nproc}-core host leg {LOAD_LEG} runs with {got[LOAD_LEG][2]} workers, not 2")
+        if got[SERIAL_LEG][2] != "1":
+            fails.append(f"on a {nproc}-core host leg {SERIAL_LEG} runs with {got[SERIAL_LEG][2]} workers, not 1")
 
     # A list that only partitions correctly when it is valid proves nothing about who reads
     # it: a stale or duplicate entry must stop every leg with the selector's exit 3.
@@ -154,21 +179,33 @@ def main() -> int:
                 fails.append(f"{what}: leg {shard} exited {rc}, not the selector's 3"
                              f"{' and ran ' + str(len(files)) + ' suites' if files else ''}")
 
-    # No `serial` tag left: leg 7 must stop with a reason, not run nothing.
+    # The quarantine list is read the same way: a stale entry or one with no issue url stops every leg.
+    qreal = (REPO / QUARANTINE).read_text()
+    qdrifted = {
+        "stale quarantine entry": qreal + "tests/no-such-suite.test.py https://github.com/sonichi/sutando/issues/1\n",
+        "quarantine entry without an issue url": qreal + disc[0] + "\n",
+    }
+    for what, text in qdrifted.items():
+        for shard, (rc, files, _w, err, _r) in run_legs(fx, real, quarantine_text=text).items():
+            if rc != 3:
+                fails.append(f"{what}: leg {shard} exited {rc}, not the selector's 3")
+
+    # No `serial` tag left: the serial leg must stop with a reason, not run nothing.
     untagged = real.replace(f"{serial[0]} serial", serial[0]) if serial else real
-    rc, files, _w, err, _r = run_legs(fx, untagged, 8, (7,))[7]
-    if rc != 3 or "leg 7: the selector emitted no serial suites" not in err:
-        fails.append(f"no `serial` suite: leg 7 exited {rc} without the empty-leg reason: {err.strip()!r}")
+    rc, files, _w, err, _r = run_legs(fx, untagged, 8, (SERIAL_LEG,))[SERIAL_LEG]
+    if rc != 3 or "serial leg: the selector emitted no serial suites" not in err:
+        fails.append(f"no `serial` suite: leg {SERIAL_LEG} exited {rc} without the empty-leg reason: {err.strip()!r}")
 
     td_obj.cleanup()
     for f in fails:
         print("  FAIL", f)
     if fails:
         return 1
-    print(f"PASS: ci.yml's seven legs run all {len(disc)} discovered suites exactly once "
-          f"({'/'.join(str(len(legs[s][1])) for s in legs)}); {len(paired)} listed in leg 6 (heaviest first, two "
-          f"workers), {len(serial)} `serial` alone in leg 7, on 2- and 8-core hosts; a stale, duplicate or "
-          "badly tagged list entry stops every leg with exit 3; an untagged list stops leg 7 with its reason")
+    print(f"PASS: ci.yml's {len(legs)} legs run all {len(gated)} gated suites exactly once and none of the "
+          f"{len(quarantined)} quarantined "
+          f"({'/'.join(str(len(legs[s][1])) for s in legs)}); {len(paired)} listed in leg {LOAD_LEG} (heaviest first, two "
+          f"workers), {len(serial)} `serial` alone in leg {SERIAL_LEG}, on 2- and 8-core hosts; a stale, duplicate or "
+          f"badly tagged list entry, or a stale or issue-less quarantine entry, stops every leg with exit 3; an untagged list stops leg {SERIAL_LEG} with its reason")
     return 0
 
 

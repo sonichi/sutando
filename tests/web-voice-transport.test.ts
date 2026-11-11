@@ -1323,6 +1323,25 @@ describe('`agent.state` client handling (Step 18 — design 1a′)', () => {
 		assert.match(describeAgentFailure('r', 'network').detail, /reach/i);
 		assert.match(describeAgentFailure('r', undefined).detail, /upstream failed/i);
 	});
+
+	it('describeAgentFailure: a dead token asks for a new token, not a key fix', () => {
+		const d = describeAgentFailure('credential-expired', 'auth');
+		assert.match(d.detail, /token has expired or been used up \(credential-expired\)/);
+		assert.match(d.remediation, /new voice token/);
+		assert.doesNotMatch(d.remediation, /Fix your Gemini key/);
+		// Other auth failures keep the key-fix remediation.
+		assert.match(describeAgentFailure('auth-invalid', 'auth').remediation, /Fix your Gemini key/);
+	});
+
+	it('describeAgentFailure: a region refusal names the region and the VPN route, never a key or network check', () => {
+		const d = describeAgentFailure('location-unsupported', 'network');
+		assert.match(d.detail, /isn't available from your network's region.*\(location-unsupported\)/);
+		assert.match(d.detail, /Text chat still works/);
+		assert.match(d.remediation, /VPN or proxy, route generativelanguage\.googleapis\.com through a supported region/);
+		assert.doesNotMatch(d.detail + d.remediation, /key|Check your network connection/i);
+		// Any other network failure keeps the generic reachability copy.
+		assert.match(describeAgentFailure('upstream-lost', 'network').remediation, /Check your network connection/);
+	});
 });
 
 describe('close-code decoding (Step 18 — W5 client-busy 4409 + superseded 4410)', () => {

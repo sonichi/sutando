@@ -62,15 +62,38 @@ claude_named_pids() {
   # in-session restart), the live process would otherwise be invisible.
   # `read -r pid _` tolerates procps -a's "pid cmdline" output too.
   pgrep -ax claude 2>/dev/null | while read -r pid _; do
-    args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    args=" $(ps -p "$pid" -o args= 2>/dev/null || true) "
+    # The name is a whole token: `sutando-core` must not match `sutando-core-worker`.
     case "$args" in
-      *"--name $SESSION"*|*"--name=$SESSION"*) echo "$pid" ;;
+      *" --name $SESSION "*|*" --name=$SESSION "*) echo "$pid" ;;
     esac
   done
 }
 
 claude_named_process_running() {
   [ -n "$(claude_named_pids)" ]
+}
+
+# A private socket (SUTANDO_TMUX_SOCKET set, e.g. a desktop install) is shared
+# with no other install, so a same-name claude outside its server is foreign.
+claude_private_socket_in_use() {
+  [ -n "${SUTANDO_TMUX_SOCKET:-}" ]
+}
+
+# claude_named_pids restricted to processes running inside a pane of the tmux
+# server on $TMUX_SOCKET (the pane pid itself or one of its descendants).
+claude_named_pids_on_socket() {
+  local panes pid p depth
+  panes="$(tmux -S "$TMUX_SOCKET" list-panes -a -F '#{pane_pid}' 2>/dev/null)" || return 0
+  [ -n "$panes" ] || return 0
+  for pid in $(claude_named_pids); do
+    p="$pid"; depth=0
+    while [ -n "$p" ] && [ "$p" -gt 1 ] 2>/dev/null && [ "$depth" -lt 16 ]; do
+      if printf '%s\n' "$panes" | grep -qx "$p"; then echo "$pid"; break; fi
+      p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+      depth=$((depth + 1))
+    done
+  done
 }
 
 claude_named_tmux_session_exists() {
@@ -80,7 +103,11 @@ claude_named_tmux_session_exists() {
 
 claude_named_session_running() {
   claude_named_tmux_session_exists || return 1
-  claude_named_process_running
+  if claude_private_socket_in_use; then
+    [ -n "$(claude_named_pids_on_socket)" ]
+  else
+    claude_named_process_running
+  fi
 }
 
 # Optional working-directory override. Unset: no override, launches from cwd.
@@ -93,9 +120,8 @@ claude_named_session_running() {
 resolve_claude_cwd_args() {
   CWD_ARGS=()
   if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
-    _cwd_exp="${SUTANDO_CLAUDE_WORKING_DIR/#\~/$HOME}"
-    mkdir -p "$_cwd_exp" || { echo "  ✗ can't create working dir: $_cwd_exp" >&2; exit 1; }
-    SUTANDO_CLAUDE_WORKING_DIR="$(cd "$_cwd_exp" && pwd -P)"
+    . "$REPO/scripts/core-working-dir.sh"
+    SUTANDO_CLAUDE_WORKING_DIR="$(sutando_core_working_dir "$REPO")" || { echo "  ✗ SUTANDO_CLAUDE_WORKING_DIR rejected — not launching the core there" >&2; exit 1; }
     export SUTANDO_CLAUDE_WORKING_DIR
     CWD_ARGS=(-c "$SUTANDO_CLAUDE_WORKING_DIR")
     echo "  ✓ working dir: $SUTANDO_CLAUDE_WORKING_DIR"
@@ -115,7 +141,9 @@ resolve_claude_config_dir_and_seed() {
     export CLAUDE_CONFIG_DIR="$_ccd"
     echo "  ✓ CLAUDE_CONFIG_DIR=$_ccd"
     if [ -n "$PY" ] && "$PY" -c 'import sys' > /dev/null 2>&1; then
-      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-}" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" "$PY" - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
+      # No override: claude starts in this checkout, which a git repo makes Claude Code ask
+      # about (2026-10-22: a PR checkout's core restarted into that prompt and sat there).
+      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-$(cd "$REPO" && pwd -P)}" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" "$PY" - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
 import json, os
 ccd = os.environ["_ccd"]
 target = os.path.join(ccd, ".claude.json")
@@ -156,10 +184,11 @@ if (cfg.get("fullscreenUpsellSeenCount") or 0) < 3:
     cfg["fullscreenUpsellSeenCount"] = 3
     changed = True
     upsell_seeded = True
-# Trust-seed for the explicitly-configured working dir. Claude Code keys the
+# Trust-seed for the dir claude starts in. Claude Code keys the
 # folder-trust dialog on projects[<abs cwd>].hasTrustDialogAccepted; a fresh
-# scoped config lacks it for a custom cwd, so a detached session would hang on
-# the prompt. Only pre-trust the one dir the caller explicitly chose.
+# scoped config lacks it, so a detached session would hang on the prompt.
+# Only pre-trust the one dir the caller explicitly chose, or else the launcher's
+# own checkout (physical path, as getcwd() reports it).
 cwd = os.environ.get("_cwd") or ""
 trusted_dir = None
 if cwd:
@@ -246,7 +275,7 @@ resolve_claude_settings_args() {
       echo "obs hooks: settings build failed — capture disabled this session" >&2
     fi
   fi
-  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py")"
+  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py" "$REPO/hooks/shell-trap-guard.py" "$REPO/hooks/stale-head-post-guard.py")"
   if [ -n "$CLAUDE_SETTINGS_JSON" ]; then
     SETTINGS_ARGS=(--settings "$CLAUDE_SETTINGS_JSON")
     echo "session hooks: AskUserQuestion guard registered (PreToolUse deny — a headless session can't answer it)"
@@ -284,11 +313,13 @@ resolve_claude_credential_proxy() {
     lsof -nP -iTCP:7846 -sTCP:LISTEN > /dev/null 2>&1
   }
   if [ -z "${ANTHROPIC_BASE_URL:-}" ]; then
-    # A loaded launchd job means the proxy is EXPECTED on this host even when
-    # its listener hasn't bound yet.
+    # The proxy is EXPECTED, though not yet bound, under either supervisor: a loaded
+    # launchd job, or a live proxy process (the desktop app supervises it without launchd).
     PROXY_EXPECTED=""
     if launchctl print "gui/$(id -u)/com.sutando.credential-proxy" > /dev/null 2>&1; then
-      PROXY_EXPECTED=1
+      PROXY_EXPECTED="launchd job loaded"
+    elif pgrep -f 'credential-proxy\.(js|ts)( |$)' > /dev/null 2>&1; then
+      PROXY_EXPECTED="proxy process running"
     fi
     if [ -n "$PROXY_EXPECTED" ]; then
       # Bounded wait (~10s): a supervised proxy can bind seconds after this
@@ -301,7 +332,7 @@ resolve_claude_credential_proxy() {
     if _proxy_listener_up; then
       export ANTHROPIC_BASE_URL=http://localhost:7846
     elif [ -n "$PROXY_EXPECTED" ]; then
-      echo "  ⚠ credential proxy expected (launchd job loaded) but :7846 never bound within ~10s — session runs unrouted this launch (no proxy protection, no quota telemetry)" >&2
+      echo "  ⚠ credential proxy expected ($PROXY_EXPECTED) but :7846 never bound within ~10s — session runs unrouted this launch (no proxy protection, no quota telemetry)" >&2
     fi
   fi
 }
@@ -313,6 +344,39 @@ add_skill_claude_plugins() {
   while IFS= read -r -d '' _plugin_dir; do
     SURFACE_ARGS+=(--plugin-dir "$_plugin_dir")
   done < <(skill_manifest_claude_plugins "$REPO" "$PY")
+}
+
+# 0 when dotted release $1 is at least $2; any suffix after the numbers is ignored.
+claude_version_at_least() {
+  local IFS=. i
+  local -a a b
+  read -r -a a <<< "${1%%[!0-9.]*}"
+  read -r -a b <<< "${2%%[!0-9.]*}"
+  [ "${#a[@]}" -gt 0 ] && [ "${#b[@]}" -gt 0 ] || return 1
+  for i in 0 1 2 3; do
+    [ "${a[$i]:-0}" -gt "${b[$i]:-0}" ] 2>/dev/null && return 0
+    [ "${a[$i]:-0}" -lt "${b[$i]:-0}" ] 2>/dev/null && return 1
+  done
+  return 0
+}
+
+# With $1 = "1": --plugin-dir for the task-watch Mod and TASK_WATCH_MOD=1, gated on CLAUDE_BIN,
+# the claude the session's PATH resolves, which the launch then runs. Reads REPO.
+add_task_watch_mod() {
+  TASK_WATCH_MOD=""
+  CLAUDE_BIN=""
+  [ "${1:-}" = "1" ] || return 0
+  local dir="$REPO/src/agent/claude/task-watch-mod" min have
+  CLAUDE_BIN="$(PATH="$(claude_pane_path)"; hash -r; command -v claude 2>/dev/null)" || CLAUDE_BIN=""
+  case "$CLAUDE_BIN" in /*) ;; *) CLAUDE_BIN="" ;; esac
+  min="$(sed -n "s/^export const MIN_CLAUDE_VERSION = '\([0-9.]*\)'.*/\1/p" "$dir/hooks/version.ts" 2>/dev/null)"
+  have="$([ -n "$CLAUDE_BIN" ] && "$CLAUDE_BIN" --version 2>/dev/null | awk 'NR==1 {print $1}')"
+  if [ -z "$min" ] || [ -z "$have" ] || ! claude_version_at_least "$have" "$min"; then
+    echo "task-watch Mod: Claude Code ${have:-unknown} is not at least ${min:-unknown}; this session keeps the Monitor watcher" >&2
+    return 0
+  fi
+  SURFACE_ARGS+=(--plugin-dir "$dir")
+  TASK_WATCH_MOD=1
 }
 
 # Any installed skill's manifest.json "config" block, forwarded the same way
@@ -353,9 +417,50 @@ forward_skill_manifest_config() {
   unset _mc_seen _mcrec
 }
 
-# Registers the PERSONAL_CLAUDE.md compaction-reinject hook. Idempotent.
+# Re-points hooks a moved install left on its old path at this checkout. Adds no hook,
+# so an opt-in one (the transcript archiver) stays as it was.
+repair_claude_hook_paths() {
+  [ -n "${PY:-}" ] && [ -f "$REPO/src/claude_hooks_settings.py" ] || return 0
+  local _dirs=("$REPO") _wd _d _args=()
+  if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
+    . "$REPO/scripts/core-working-dir.sh"
+    _wd="$(sutando_core_working_dir "$REPO")" && _dirs+=("$_wd")
+  fi
+  for _d in "${_dirs[@]}"; do
+    _args+=(--settings "$_d/.claude/settings.json" --settings "$_d/.claude/settings.local.json")
+  done
+  "$PY" "$REPO/src/claude_hooks_settings.py" repair-paths --repo "$REPO" "${_args[@]}" \
+    || echo "session-launch: hook path repair failed (rc=$?) — a moved install's hooks may still fail" >&2
+}
+
+# Registers the post-compaction SessionStart hooks: PERSONAL_CLAUDE.md re-inject
+# and the task-watcher re-arm hint. Idempotent.
 install_claude_personal_hook() {
   bash "$REPO/scripts/install-personal-claude-hook.sh" || echo "session-launch: personal-claude hook install failed (rc=$?) — hook may be absent" >&2
+  bash "$REPO/scripts/install-watcher-rearm-hook.sh" || echo "session-launch: watcher re-arm hook install failed (rc=$?) — hook may be absent" >&2
+}
+
+# PATH a core pane runs under: tmux gives it the session's, else the server's global
+# environment, never this shell's. Falls back to $PATH when no server answers.
+claude_pane_path() {
+  local line
+  line="$(tmux -S "$TMUX_SOCKET" show-environment -t "=$SESSION" PATH 2>/dev/null)" || line=""
+  case "$line" in PATH=*) printf '%s' "${line#PATH=}"; return 0 ;; esac
+  line="$(tmux -S "$TMUX_SOCKET" show-environment -g PATH 2>/dev/null)" || line=""
+  case "$line" in PATH=*) printf '%s' "${line#PATH=}"; return 0 ;; esac
+  printf '%s' "$PATH"
+}
+
+# Returns 1, with the reason in CLAUDE_LAUNCH_FAILURE and on stderr, when `claude` does
+# not resolve on the pane's PATH: tmux would accept the command and the pane would just die.
+claude_cli_resolves() {
+  local pane_path
+  CLAUDE_LAUNCH_FAILURE=""
+  pane_path="$(claude_pane_path)"
+  (PATH="$pane_path"; hash -r; command -v claude >/dev/null 2>&1) && return 0
+  CLAUDE_LAUNCH_FAILURE="claude not found on PATH=$pane_path"
+  echo "  ⚠ $CLAUDE_LAUNCH_FAILURE" >&2
+  return 1
 }
 
 # Creates a new tmux session running claude with the fully-assembled args, then
@@ -365,8 +470,10 @@ install_claude_personal_hook() {
 # SESSION_ARGS, BOOT_PROMPT. Returns 0 if the session came up live, 1 otherwise
 # (caller decides what that means — abort, retry, or a heal path).
 launch_claude_session() {
+  claude_cli_resolves || return 1
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
-    claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
+    -e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" \
+    "${CLAUDE_BIN:-claude}" --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
     -- "$BOOT_PROMPT" || true
   for _ in $(seq 1 25); do

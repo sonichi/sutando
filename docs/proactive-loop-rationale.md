@@ -1,5 +1,41 @@
 # Proactive loop — rationale and measurements
 
+## Completion and missing-driver health
+
+A completed pass publishes `state/loop-completions/<host>.json` through
+the core `loop_completion` module. This host-scoped record contains `version: 1`, `host`,
+and a finite, nonnegative Unix `completed_at` timestamp. The writer locks and
+atomically replaces the record, preserving the newest completion under concurrent
+writers. Ordinary `core-status.sh idle` only records work status. A proactive
+pass finishes with `core-status.sh idle "" --loop-complete`; the durable Codex
+scheduler also records completion when it finds the scheduled pass's result,
+using its publication mtime (capped at observation time). A delayed result cannot
+renew proof to the later polling time; foreign-host scheduler state is discarded.
+Enqueueing a task, a scheduler heartbeat, and completing an unrelated task are
+not proof that a proactive pass finished.
+
+The `cron-schedule` health probe reads only this host's record. It warns after
+7 hours without completion and fails after 26 hours. Existing
+`SUTANDO_CRON_STALE_WARN_H` and `SUTANDO_CRON_STALE_FAIL_H` overrides remain
+supported. Missing first proof has a bounded grace period after installation of
+the explicit writer; the health detail says it is awaiting proof. Once that
+period expires, absence warns even if ordinary conversations continue. Invalid,
+unreadable, or future-dated proof warns immediately. The legacy shared
+`state/last-loop-ok` marker and peer-host records cannot establish liveness.
+
+For a Codex core, `cron-runner` and the scheduler's `health` command also require
+one canonical core-owned `main-loop` / `prompt_skill: proactive-loop` entry in the
+host's `crons.json`; an hourly-only config or worker-owned loop cannot satisfy
+that requirement. Shared policy lives in the core `cron_loop_policy` module. An explicit
+disabled marker plus a proven impossible cron date is deliberate parking and
+exempts completion health. A disabled marker alone does not stop a schedulable
+entry. Autonomy pause and self-development settings do not exempt the health
+pass. These checks diagnose missing configuration; they do not recreate a driver
+or modify the host's schedules.
+
+The archived rationale below predates this completion contract where it refers
+to ordinary `idle` as the final pass command.
+
 Every paragraph below is the verbatim text that lived in `skills/proactive-loop/SKILL.md` until
 it was reduced to commands (sonichi/sutando PR: commands, not lessons). The skill now names a step
 number; the matching section here carries the measurement, the incident and the reasoning. This
@@ -202,7 +238,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    or a killed process tree, so the pass re-arms it: `connectors.py rearm` starts a waiter only for
    an unclaimed wait whose lock no live waiter holds, so running it every pass never doubles one.
 
-2. **Pending questions are not surfaced on a pass.** A question is sent to the owner once, when it is asked (`scripts/ask-owner.py`), and reminded only on demand (`python3 src/check-pending-questions.py --notify`); a per-pass voice file or macOS notification was a scheduled reminder under another name. The pass runs `python3 src/check-pending-questions.py` (flagless: reconcile and list, nothing sent) so anything the outbox holds is filed, and `python3 src/pending_questions_reader.py list` only when the owner asks what is waiting or the pass is blocked on an answer. These are core's public entries over the store an installed skill declares (`pending_questions_store` in its manifest); the loop names no skill's private CLI.
+2. **Pending questions are not surfaced on a pass.** A question is sent to the owner once, when it is asked (`scripts/ask-owner.py`), and reminded only on demand (`python3 src/check-pending-questions.py --notify`); a per-pass voice file or macOS notification was a scheduled reminder under another name. The pass runs `python3 src/check-pending-questions.py` (flagless: reconcile and list; the only send is the one pointer owed for a decision card the gateway never posted, which completes the ask rather than reminding) so anything the outbox holds is filed, and `python3 src/pending_questions_reader.py list` only when the owner asks what is waiting or the pass is blocked on an answer. These are core's public entries over the store an installed skill declares (`pending_questions_store` in its manifest); the loop names no skill's private CLI.
 
 3. **Check system health.** Run `python3 src/health-check.py`. If issues found, fix what you can (`--fix` flag), note what you can't.
 
@@ -382,6 +418,8 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
        --state "$WORKSPACE/state/idle-streak.json"
    # -> post <hash>   (changed set: surface it)   |   quiet <hash>  (unchanged)
 
+   # Check owner_channel.py --workspace "$WORKSPACE" before posting.
+   # A refusal means no send and no surface-hash commit.
    # 2. Post the message. THEN, and only then, stamp the set as surfaced:
    echo '[["3166","owner"],["3274","owner"]]' |
      python3 skills/proactive-loop/scripts/idle-surface-hash.py \
@@ -576,7 +614,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    a duplicate. Which rows may go is the owner's call (a pending question -> "MEMORY.md byte
    budget"); the guard's job is only to stop the write that would decide it by accident.
 
-8. **If blocked, ask.** `python3 scripts/ask-owner.py "<question>" [--context "<why / options>"] [--task-file <workspace>/tasks/<task>.txt]` — through the store an installed skill declares it records the question as a row of the owner's Pending questions database (held in `<workspace>/state/pending-questions-outbox/` while the room is unreachable), queues it to the owner and fires the macOS notification. Never hand-edit; the per-host `pending-questions.md` is read-only history. Read the output: a `FAILED` line is not an ask. Confirm with `python3 src/pending_questions_reader.py list --json` that the ask id is listed. Don't stop — apply the Pivot-on-block rule and pick another menu item.
+8. **If blocked, ask.** `python3 scripts/ask-owner.py "<question>" [--context "<why / options>"] [--task-file <workspace>/tasks/<task>.txt]` — through the store an installed skill declares it records the question as a row of the owner's Pending questions database (held in `<workspace>/state/pending-questions-outbox/` while the room is unreachable), queues it to the owner and fires the macOS notification. Never hand-edit; the per-host `pending-questions.md` is read-only history. The new question is queued and held before room-database work; after its row is confirmed, older questions are reconciled within the same 90-second subprocess-operation budget. A failed write keeps the outbox entry for a later explicit reconcile. Read the output: a `FAILED` line is not an ask. Confirm with `python3 src/pending_questions_reader.py list --json` that the ask id is listed. Don't stop — apply the Pivot-on-block rule and pick another menu item.
 
 9. **Ensure the streaming watcher is running.** **Read the `task-watcher` probe from the `health-check.py` run you already did in step 3 — do not re-derive liveness here.** That probe is the authoritative signal: it enumerates real watcher process trees (`_watcher_trees()` in `src/health-check.py`) and reports which of four states holds. Act on the state it names:
 
@@ -680,3 +718,14 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    **Note**: contextual-chips refresh used to be step 11 in this loop. As of 2026-05-05 it is owned exclusively by Sutando.app's 120s timer (PR #600). The proactive-loop must NOT write `contextual-chips.json` — Sutando.app is the single writer. If a future case calls for chip-state the menu-bar app can't see (e.g. decision-state from the pending questions), surface it via a different file Sutando.app reads, not by competing as a writer.
 
    **Do NOT fall back to `results/proactive-*.txt` for heartbeats if `bot2bot-post` is not installed.** That legacy path is polled by both Discord and Telegram bridges and produces duplicate deliveries to the owner's DMs (9-per-heartbeat in practice on 2026-04-20). If the skill is missing, skip the heartbeat silently; fold the summary into the next task-reply instead.
+
+## Bound-room speech gate
+
+Recent owner activity identifies a destination, not who owns its voice.
+`src/owner_channel.py` consults the workspace bindings before the core posts:
+unbound rooms are allowed; a bound room is refused while its worker is alive
+or its liveness is unknown. Only a readable sentinel whose PID is positively
+dead releases the room for recovery. Missing or unreadable evidence is not
+proof of death. The supervisor relay uses the same policy after validating
+the destination. A refused proactive FYI must not commit its surface hash,
+because no message was sent.

@@ -7,7 +7,8 @@ user-invocable: true
 # model-switch
 
 `scripts/switch-model.sh <model> [--dry-run] [--confirm] [--accept-timeout S]` — `<model>` is one of the
-CLI's aliases (`default|opus|sonnet|haiku|fable`) or a `claude-*` id with an optional `[1m]` tag;
+CLI's aliases (`default|opus|sonnet|haiku|fable`) or a `claude-*` id, either with an optional `[1m]`
+tag (`default` takes none);
 anything else is refused before any write (exit 2).
 
 Order, under one lock per brain (`<workspace>/state/.model-switch.lock`, held across preflight, send,
@@ -28,6 +29,22 @@ persist every `/model` pick, so the file can lag the live session), else null.
 (measured 2026-09-04: the key changed hours into a session with no repo writer). Measured the same
 day on a live core: the send alone exited 0 while the CLI sat at the confirm dialog and the model had
 not changed — which is why the send is treated as initiation and the record follows acceptance.
+
+**`--offline` (core down).** With no core process for the session there is no CLI to take `/model`,
+so `--offline` writes `model` into the runtime's `settings.json` (other keys kept) and records
+`model-switch.json` with `accepted: false`; the core starts on it at its next launch. It is refused
+(exit 9) while a `claude` process named for the session runs (the launcher's own test, from
+`src/agent/claude/cli/session-launch.sh`; the tmux server, whose argv also names the session, is not
+a core), and never overwrites a settings file it cannot read (exit 1). The launcher's provider-limit
+hold uses it for the owner's "switch to <model>" reply.
+
+**Held for a provider limit (no flag needed).** When no core process runs and
+`src/core_limit_hold.py held` reports a hold in force, a plain switch (the desktop's Model picker)
+takes the `--offline` write, releases the switch lock, and starts the core through
+`src/agent/start-cli.sh` (`--launcher` overrides it), whose limit gate lets a launch on another
+model family through. Exit 0: the core is starting on the new model; exit 10: the model is set but
+the launcher did not start the core (its reason and log path on stderr). Without a hold, a down core
+is never started from here.
 
 **A picker left on screen.** Right before the send the script writes an attribution record through
 `src/self_opened_gate.py` (`<workspace>/state/self-opened-gate.<session>.json`) and clears it once the
