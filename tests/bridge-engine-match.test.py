@@ -176,6 +176,17 @@ class EngineMatch(unittest.TestCase):
                            "18": ["python3", f"{self.core}/src/slack-bridge.py"]})
         self.assertEqual(got["detail"], "1 bridge(s) run from this engine")
 
+    def test_free_threaded_and_debug_interpreters_count(self):
+        for interp in ("/opt/py/bin/python3.13t", "python3.13d", "python3.13td", "python3t"):
+            got = self._probe({"21": [interp, f"{self.old}/src/slack-bridge.py"]})
+            self.assertEqual(got["status"], "warn", (interp, got))
+            got = self._probe({"21": [interp, f"{self.core}/src/slack-bridge.py"]})
+            self.assertEqual(got, {"name": "bridge-engine-match", "status": "ok",
+                                   "detail": "1 bridge(s) run from this engine"}, interp)
+        for tool in ("python3.13x", "python3.13tt", "python2t", "vim"):
+            got = self._probe({"21": [tool, f"{self.old}/src/slack-bridge.py"]})
+            self.assertEqual(got["detail"], "no bridge running", tool)
+
     def test_case_variant_of_the_engine_does_not_warn_on_a_case_insensitive_volume(self):
         variant = Path(str(self.core).replace("/desktop/", "/DESKTOP/"))
         argv = ["python3", f"{variant}/src/slack-bridge.py"]

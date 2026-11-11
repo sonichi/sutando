@@ -41,7 +41,7 @@ def _option(tok: str) -> str:
 
 
 def _is_interpreter(token: str) -> bool:
-    return re.fullmatch(r"[Pp]ython(3(\.\d+)?)?", os.path.basename(token)) is not None
+    return re.fullmatch(r"[Pp]ython(3(\.\d+)?t?d?)?", os.path.basename(token)) is not None
 
 
 def _first_operand(tokens: "list[str]") -> Optional[str]:
