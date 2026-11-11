@@ -70,19 +70,26 @@ def _record_path(directory: Path, bridge: str, pid) -> Path:
     return directory / f"{bridge}-{int(pid)}.json"
 
 
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
 def validate(data) -> Optional[dict]:
-    """The record if it matches schema v1 and its bounds, else None."""
-    if not isinstance(data, dict) or data.get("version") != SCHEMA_VERSION:
+    """The record if it matches schema v1 and its bounds, else None. Types first,
+    so no value can make a membership or comparison raise."""
+    if not isinstance(data, dict):
         return None
-    ok = (isinstance(data.get("pid"), int) and not isinstance(data.get("pid"), bool)
-          and data["pid"] > 0
-          and data.get("bridge") in BRIDGE_SCRIPTS
-          and isinstance(data.get("started_at"), int))
+    version, pid, bridge = data.get("version"), data.get("pid"), data.get("bridge")
+    if not (_is_int(version) and _is_int(pid) and isinstance(bridge, str)
+            and _is_int(data.get("started_at"))):
+        return None
     for key, cap in (("tasks_dir", _MAX_PATH), ("engine_dir", _MAX_PATH), ("start", _MAX_START)):
         v = data.get(key)
-        ok = ok and isinstance(v, str) and 0 < len(v) <= cap
-    ok = ok and os.path.isabs(data.get("tasks_dir") or "")
-    return data if ok else None
+        if not (isinstance(v, str) and 0 < len(v) <= cap):
+            return None
+    if version != SCHEMA_VERSION or pid <= 0 or bridge not in BRIDGE_SCRIPTS:
+        return None
+    return data if os.path.isabs(data["tasks_dir"]) else None
 
 
 def report_inbox(bridge: str, tasks_dir, directory: Optional[Path] = None,
@@ -224,7 +231,10 @@ def check_bridge_inbox_match(core_inboxes: Iterable,
     seen, mismatched, unknown = [], [], []
     for name, script in BRIDGE_SCRIPTS.items():
         for pid in list_pids(script):
-            report, why = read_report(name, pid, directory, start_of)
+            try:
+                report, why = read_report(name, pid, directory, start_of)
+            except Exception as exc:  # noqa: BLE001 — one record never fails the probe
+                report, why = None, f"malformed ({type(exc).__name__})"
             if report is None:
                 engine = bridge_engine(argv_of(pid), cwd_of(pid), script)
                 unknown.append(f"{name} pid {pid} from {engine or 'an unreadable engine'}: "
@@ -241,7 +251,8 @@ def check_bridge_inbox_match(core_inboxes: Iterable,
                 "detail": (f"{'; '.join(mismatched)} — but the core watches "
                            f"{' / '.join(core)}, so those messages are never answered. "
                            "Stop that bridge and relaunch it from this engine "
-                           "(startup.sh or the desktop app)")}
+                           "(startup.sh or the desktop app)"
+                           + (f". Also inbox unknown: {'; '.join(unknown)}" if unknown else ""))}
     if unknown:
         lead = f"{len(seen)} bridge(s) write the core inbox; " if seen else ""
         return {"name": CHECK_NAME, "status": "ok",

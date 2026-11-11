@@ -111,6 +111,27 @@ class Probe(unittest.TestCase):
         self.assertIn("discord-bridge pid 222 from /engines/e222: inbox record malformed", got["detail"])
         self.assertIn("telegram-bridge pid 333 from /engines/e333: inbox record unreadable", got["detail"])
 
+    def test_wrong_typed_fields_are_malformed_never_raise(self):
+        base = {"version": 1, "pid": 111, "bridge": "slack-bridge",
+                "tasks_dir": str(self.core), "engine_dir": "/e", "start": "lstart:A",
+                "started_at": 1}
+        bad_values = [[], {}, None, [[1]], {"a": []}, True, 1.5, "x" * 5000]
+        cases = [{**base, key: v} for key in base for v in bad_values]
+        cases += [[], None, "string", 7, [base]]
+        self.dir.mkdir(parents=True)
+        for case in cases:
+            (self.dir / "slack-bridge-111.json").write_text(json.dumps(case))
+            got = self._probe({"111": "slack-bridge.py"})
+            self.assertEqual(got["status"], "ok", (case, got))
+            self.assertIn("inbox record malformed", got["detail"], case)
+
+    def test_deeply_nested_record_is_malformed(self):
+        self.dir.mkdir(parents=True)
+        (self.dir / "slack-bridge-111.json").write_text("[" * 100000 + "]" * 100000)
+        got = self._probe({"111": "slack-bridge.py"})
+        self.assertIn("slack-bridge pid 111", got["detail"])
+        self.assertIn("inbox record malformed", got["detail"])
+
     def test_writer_fails_open(self):
         blocker = self.tmp / "file-not-dir"
         blocker.write_text("x")
@@ -176,6 +197,36 @@ class HealthCheckDelegates(unittest.TestCase):
         self.assertEqual(results["core"]["status"], "ok", results)
         self.assertEqual(results["other"]["status"], "warn", results)
         self.assertIn(os.path.realpath(other), results["other"]["detail"])
+
+    def test_one_malformed_record_does_not_hide_another_bridges_mismatch(self):
+        spec = importlib.util.spec_from_file_location("health_check", ROOT / "src" / "health-check.py")
+        health = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(health)
+        tmp = Path(tempfile.mkdtemp())
+        core, other, records = tmp / "core" / "tasks", tmp / "other" / "tasks", tmp / "bridges"
+        good, bad = os.getpid(), os.getppid()
+        pids = {"slack": [str(good)], "discord": [str(bad)]}
+        stubs = [
+            mock.patch.object(health, "_core_inboxes", lambda: [str(core)]),
+            mock.patch.object(health, "probe_pids", lambda pat: (
+                next((v for k, v in pids.items() if k in pat), []), True)),
+            mock.patch.object(health, "_drop_launcher_parents", lambda p: p),
+            mock.patch.object(bridge_inbox, "sentinel_dir", lambda: records),
+        ]
+        for st in stubs:
+            st.start()
+            self.addCleanup(st.stop)
+        bridge_inbox.report_inbox("slack-bridge", other, pid=good)
+        rec = {"version": 1, "pid": bad, "bridge": [], "tasks_dir": str(core),
+               "engine_dir": "/e", "start": bridge_inbox.process_start(bad), "started_at": 1}
+        (records / f"discord-bridge-{bad}.json").write_text(json.dumps(rec))
+        got = health.check_bridge_inbox_match()
+        self.assertEqual(got["status"], "warn", got)
+        self.assertIn(f"slack-bridge pid {good}", got["detail"])
+        self.assertIn(os.path.realpath(other), got["detail"])
+        self.assertNotIn("probe failed", got["detail"])
+        self.assertIn(f"discord-bridge pid {bad}", got["detail"])
+        self.assertIn("inbox record malformed", got["detail"])
 
     def test_health_check_runs_the_probe(self):
         src = (ROOT / "src" / "health-check.py").read_text()
