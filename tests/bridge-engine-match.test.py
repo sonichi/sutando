@@ -138,7 +138,11 @@ class EngineMatch(unittest.TestCase):
     def test_execution_modes_are_not_script_launches(self):
         for argv in (["python3", "-c", "import x", f"{self.old}/src/slack-bridge.py"],
                      ["python3", "-m", "pkg", f"{self.old}/src/slack-bridge.py"],
-                     f"python3 -m pkg {self.old}/src/slack-bridge.py"):
+                     f"python3 -m pkg {self.old}/src/slack-bridge.py",
+                     ["python3", "-cpass", f"{self.old}/src/slack-bridge.py"],
+                     ["python3", "-mpkg", f"{self.old}/src/slack-bridge.py"],
+                     ["python3", "-Icpass", f"{self.old}/src/slack-bridge.py"],
+                     f"python3 -cpass {self.old}/src/slack-bridge.py"):
             got = self._probe({"14": ("slack-bridge.py", argv)})
             self.assertEqual(got["status"], "unknown", (argv, got))
 

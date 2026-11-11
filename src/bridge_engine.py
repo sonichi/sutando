@@ -21,8 +21,19 @@ BRIDGE_SCRIPTS = {
 }
 
 
-_ARG_OPTS = {"-X", "-W", "-Q"}  # interpreter options that take the next token
-_NO_SCRIPT = {"-c", "-m"}  # the interpreter runs a string or a module, not a file
+_VALUE_FLAGS = "XWQ"  # a short flag whose value is attached or is the next token
+_MODE_FLAGS = "cm"  # the interpreter runs a string or a module, not a file
+
+
+def _option(tok: str) -> str:
+    """"mode" (-c/-m, attached or combined), "takes-next" or "flag" for a
+    single-dash option token."""
+    for i, ch in enumerate(tok[1:], start=1):
+        if ch in _MODE_FLAGS:
+            return "mode"
+        if ch in _VALUE_FLAGS:
+            return "flag" if i + 1 < len(tok) else "takes-next"
+    return "flag"
 
 
 def _is_interpreter(token: str) -> bool:
@@ -33,21 +44,27 @@ def _first_operand(tokens: "list[str]") -> Optional[str]:
     """The script operand of `<interpreter> [options] <script> ...`, or None."""
     if not tokens or not _is_interpreter(tokens[0]):
         return None
-    i = 1
+    i = _skip_options(tokens, 1)
+    if i is None or i >= len(tokens):
+        return None
+    return tokens[i]
+
+
+def _skip_options(tokens: "list[str]", i: int) -> Optional[int]:
+    """Index of the first operand at or after `i`, or None for an execution mode."""
     while i < len(tokens):
         tok = tokens[i]
-        if tok in _NO_SCRIPT or tok == "-":
+        if tok == "-":
             return None
-        if tok in _ARG_OPTS:
-            i += 2
-            continue
         if tok == "--":
-            return tokens[i + 1] if i + 1 < len(tokens) else None
-        if tok.startswith("-"):
-            i += 1
-            continue
-        return tok
-    return None
+            return i + 1
+        if not tok.startswith("-"):
+            return i
+        kind = _option(tok)
+        if kind == "mode":
+            return None
+        i += 2 if kind == "takes-next" else 1
+    return i
 
 
 def _script_operand(argv, script: str) -> Optional[str]:
@@ -67,12 +84,8 @@ def _script_operand(argv, script: str) -> Optional[str]:
         rest = text[interp.end():]
         op = None
         tokens = rest.split()
-        i = 0
-        while i < len(tokens) and tokens[i].startswith("-"):
-            if tokens[i] in _NO_SCRIPT or tokens[i] == "-":
-                return None
-            i += 2 if tokens[i] in _ARG_OPTS else 1
-        if i < len(tokens):
+        i = _skip_options(tokens, 0)
+        if i is not None and i < len(tokens):
             # Rejoin from the first operand: it runs to the first ".py" followed by a boundary.
             tail = " ".join(tokens[i:])
             m = re.match(r"(.+?\.py)(?=\s|$)", tail)
