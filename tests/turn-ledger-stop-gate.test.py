@@ -710,6 +710,15 @@ def test_overlapping_copies_of_one_stop_are_serialised() -> None:
         check("and no reminder is spent", not turn_ledger.reminder_spent(ws), "")
 
 
+def test_a_gate_that_cannot_make_its_lock_dir_still_answers() -> None:
+    """The lock fails open like the ledger's: a state dir that cannot be created must not
+    turn the gate into an exception on the Stop path."""
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = pathlib.Path(tmp)
+        (ws / "state").write_text("not a directory")
+        check("the gate still answers, and lets the turn end", turn_ledger.stop_gate(ws, stop_id="s") is None, "")
+
+
 def test_the_stop_id_in_process() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         ws = _workspace(tmp)
@@ -739,6 +748,7 @@ def main() -> int:
         test_a_stop_that_names_no_transcript_is_judged_as_before,
         test_the_stop_id_in_process,
         test_overlapping_copies_of_one_stop_are_serialised,
+        test_a_gate_that_cannot_make_its_lock_dir_still_answers,
         test_module_records_both_kinds,
         test_a_no_send_counts_for_this_turn_only,
         test_the_file_is_bounded_and_keeps_the_newest,
