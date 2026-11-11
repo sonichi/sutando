@@ -2571,14 +2571,14 @@ class Signing(Base):
     AGENT = "@helper:s.example"
 
     def test_hmac_makes_the_agents_own_key_and_the_job_records_only_its_path(self):
-        from ag2_sparrow import task_envelope
+        from ag2_sparrow import task_hmac
         local, _ = cm.agent_job(L, self.AGENT)
         path, problem = cli.hmac_key(argparse.Namespace(hmac=True, hmac_key_file=None), local, cb.UNIT)
         self.assertEqual(problem, "")
         self.assertEqual(Path(path), cm.config_dir(local) / cb.OWN_HMAC_KEY)
         self.assertEqual(stat.S_IMODE(Path(path).stat().st_mode), 0o600)
         key = Path(path).read_text().strip()
-        task_envelope.load_key(path)
+        task_hmac.load_key(path)
         self.assertEqual(cli.hmac_key(argparse.Namespace(hmac=True, hmac_key_file=None), local, cb.UNIT), (path, ""))
         self.assertEqual(Path(path).read_text().strip(), key, "a reinstall keeps the key")
         argv = cli.connector_argv({"CODEX": str(self.codex), "HMAC_KEY_FILE": path}, str(self.work), 7)
@@ -2606,14 +2606,14 @@ class Signing(Base):
         self.assertEqual(cli.hmac_key(argparse.Namespace(hmac=False, hmac_key_file=None), local, cb.UNIT), ("", ""))
 
     def test_verify_shows_the_signing_mode(self):
-        from ag2_sparrow import task_envelope
+        from ag2_sparrow import task_hmac
         runner = self.runner()
         self.assertEqual(self.install_with(runner)[0], 0)
         with mock.patch.object(sm, "_run", side_effect=runner):
             out = self.main("verify")[1]
         self.assertIn("INFO hmac mode: off (tasks are not signed)", out)
         key = self.home / "k.key"
-        task_envelope.create_key(key)
+        task_hmac.create_key(key)
         self.configure(HMAC_KEY_FILE=str(key))
         with mock.patch.object(sm, "_run", side_effect=runner):
             out = self.main("verify")[1]
@@ -2632,26 +2632,26 @@ class BridgeSignsForTheSession(unittest.TestCase):
     def test_signed_tasks_are_submitted_and_unsigned_or_tampered_ones_refused(self):
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from claude_code_fixtures import run_verifier, verify_py
-        from ag2_sparrow import local_task_protocol, task_envelope
+        from ag2_sparrow import local_task_protocol, task_hmac
         from ag2_sparrow.adapters.claude_code import hmac_policy
         with tempfile.TemporaryDirectory() as d:
             key = Path(d) / "task-hmac.key"
-            self.assertTrue(task_envelope.create_key(key))
+            self.assertTrue(task_hmac.create_key(key))
             self.assertEqual(stat.S_IMODE(key.stat().st_mode), 0o600)
-            self.assertEqual(task_envelope.install_bridge_stamper({"AG2_HMAC_KEY_FILE": str(key)}), "")
+            self.assertEqual(task_hmac.install_bridge_stamper({"AG2_HMAC_KEY_FILE": str(key)}), "")
             self.addCleanup(local_task_protocol.set_task_stamper, None)
             path = local_task_protocol.write_task_file(Path(d) / "tasks", "task-s1",
                                                        [("source", "ag2space"), ("access_tier", "owner")], "hi")
             signed = Path(path).read_text()
-            self.assertTrue(signed.split("\n")[1].startswith(task_envelope.STAMP_PREFIX), signed)
+            self.assertTrue(signed.split("\n")[1].startswith(task_hmac.STAMP_PREFIX), signed)
             cfg = {"HMAC_KEY_FILE": str(key), "HMAC_STRICT": "1"}
             for text, submitted in ((signed, True), (signed.replace("hi", "rm -rf ~"), False),
                                     ("id: task-u\naccess_tier: owner\ntask: hi\n", False)):
                 verdict, _tier, _collab = run_verifier(verify_py(), text, str(key))
                 ok, why, _retry = hmac_policy.decide(cfg, verdict, hmac_policy.key_digest(str(key)))
                 self.assertEqual(ok, submitted, (verdict, why))
-        self.assertEqual(task_envelope.install_bridge_stamper({}), "", "no key path: nothing changes")
-        self.assertIn("no usable key", task_envelope.install_bridge_stamper({"AG2_HMAC_KEY_FILE": "/nonexistent/k"}))
+        self.assertEqual(task_hmac.install_bridge_stamper({}), "", "no key path: nothing changes")
+        self.assertIn("no usable key", task_hmac.install_bridge_stamper({"AG2_HMAC_KEY_FILE": "/nonexistent/k"}))
 
 
 
@@ -2659,15 +2659,15 @@ class SigningAndMcpPieces(unittest.TestCase):
     """The pieces a strict, shared-folder agent rests on, each refusal included."""
 
     def test_keys_are_made_once_and_a_non_key_is_never_replaced(self):
-        from ag2_sparrow import task_envelope
+        from ag2_sparrow import task_hmac
         with tempfile.TemporaryDirectory() as d:
             key = Path(d) / "k"
-            self.assertTrue(task_envelope.create_key(key))
-            self.assertFalse(task_envelope.create_key(key), "kept")
+            self.assertTrue(task_hmac.create_key(key))
+            self.assertFalse(task_hmac.create_key(key), "kept")
             other = Path(d) / "not-a-key"
             other.write_text("hello")
             with self.assertRaises(ValueError):
-                task_envelope.create_key(other)
+                task_hmac.create_key(other)
             self.assertEqual(other.read_text(), "hello")
             # Another writer wins the race between the check and the link: its key stands.
             raced = Path(d) / "raced"
@@ -2677,19 +2677,19 @@ class SigningAndMcpPieces(unittest.TestCase):
                 Path(dst).write_text("cd" * 32)
                 return real_link(src, dst)
             with mock.patch.object(os, "link", side_effect=link_after_rival):
-                self.assertFalse(task_envelope.create_key(raced))
+                self.assertFalse(task_hmac.create_key(raced))
             self.assertEqual(raced.read_text(), "cd" * 32)
-            signed = task_envelope.stamp_text("id: t\naccess_tier: owner\ntask: hi\n", task_envelope.load_key(key))
-            self.assertEqual(task_envelope.verify_text(signed, key), task_envelope.VERIFIED)
-            self.assertEqual(task_envelope.verify_text(signed, Path(d) / "absent"), task_envelope.UNVERIFIABLE)
-            self.assertEqual(task_envelope.verify_text("id: t\ntask: hi\n", key), task_envelope.UNSIGNED)
-            self.assertEqual(task_envelope.stamp_text(signed, task_envelope.load_key(key)).count(task_envelope.STAMP_PREFIX),
+            signed = task_hmac.stamp_text("id: t\naccess_tier: owner\ntask: hi\n", task_hmac.load_key(key))
+            self.assertEqual(task_hmac.verify_text(signed, key), task_hmac.VERIFIED)
+            self.assertEqual(task_hmac.verify_text(signed, Path(d) / "absent"), task_hmac.UNVERIFIABLE)
+            self.assertEqual(task_hmac.verify_text("id: t\ntask: hi\n", key), task_hmac.UNSIGNED)
+            self.assertEqual(task_hmac.stamp_text(signed, task_hmac.load_key(key)).count(task_hmac.STAMP_PREFIX),
                              1, "re-stamping replaces, never doubles")
 
     def test_an_unwritable_key_dir_is_refused(self):
         local, _ = cm.agent_job(L, "@helper:s.example")
         with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"HOME": d}):
-            with mock.patch("ag2_sparrow.task_envelope.create_key", side_effect=PermissionError("no")):
+            with mock.patch("ag2_sparrow.task_hmac.create_key", side_effect=PermissionError("no")):
                 key, problem = cb.own_hmac_key(local, cb.UNIT)
             self.assertEqual(key, "")
             self.assertIn("could not hold the agent's task key (PermissionError)", problem)

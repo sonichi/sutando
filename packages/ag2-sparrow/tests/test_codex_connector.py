@@ -740,18 +740,18 @@ class EnvelopeTest(unittest.TestCase):
     """--hmac-key-file: only a task whose stamp verifies under the key is served; every other one is refused."""
 
     def test_only_tasks_signed_with_the_key_are_served(self):
-        from ag2_sparrow import task_envelope
+        from ag2_sparrow import task_hmac
         with tempfile.TemporaryDirectory() as d:
             key = os.path.join(d, "task-hmac.key")
-            task_envelope.create_key(key)
-            k = task_envelope.load_key(key)
+            task_hmac.create_key(key)
+            k = task_hmac.load_key(key)
             now = time.time()
             owner = lambda tid: ("id: %s\nsource: chat\nchannel_id: local-chat\naccess_tier: owner\n"  # noqa: E731
                                  "task: hello\n" % tid)
-            write_text(d, "task-chat-signed", task_envelope.stamp_text(owner("task-chat-signed"), k), mtime=now - 30)
+            write_text(d, "task-chat-signed", task_hmac.stamp_text(owner("task-chat-signed"), k), mtime=now - 30)
             write_task(d, "task-chat-unsigned", "hello", mtime=now - 20)
             write_text(d, "task-chat-tampered",
-                       task_envelope.stamp_text(owner("task-chat-tampered"), k).replace("hello", "rm -rf"), mtime=now - 10)
+                       task_hmac.stamp_text(owner("task-chat-tampered"), k).replace("hello", "rm -rf"), mtime=now - 10)
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
                 self.assertEqual(run_connector(d, once=3, extra=["--hmac-key-file", key]), 0)
@@ -764,15 +764,15 @@ class EnvelopeTest(unittest.TestCase):
     def test_a_malformed_stamp_is_refused_and_the_queue_moves_on(self):
         """A stamp that is not 64 hex characters (here non-ASCII) is refused like any invalid one, never raised,
         so the signed task queued behind it is still served."""
-        from ag2_sparrow import task_envelope
+        from ag2_sparrow import task_hmac
         with tempfile.TemporaryDirectory() as d:
             key = os.path.join(d, "task-hmac.key")
-            task_envelope.create_key(key)
-            k = task_envelope.load_key(key)
+            task_hmac.create_key(key)
+            k = task_hmac.load_key(key)
             now = time.time()
             write_text(d, "task-chat-bad", "id: task-chat-bad\nenvelope_hmac: v1:\u00e9\nchannel_id: c\n"
                        "access_tier: owner\ntask: hello\n", mtime=now - 30)
-            write_text(d, "task-chat-good", task_envelope.stamp_text(
+            write_text(d, "task-chat-good", task_hmac.stamp_text(
                 "id: task-chat-good\nsource: chat\nchannel_id: local-chat\naccess_tier: owner\ntask: hello\n", k),
                 mtime=now - 10)
             err = io.StringIO()
@@ -783,26 +783,26 @@ class EnvelopeTest(unittest.TestCase):
             self.assertTrue(result(d, "task-chat-good").startswith("STUB echo"), result(d, "task-chat-good"))
 
     def test_verify_text_reads_a_malformed_stamp_as_invalid(self):
-        from ag2_sparrow import task_envelope
+        from ag2_sparrow import task_hmac
         with tempfile.TemporaryDirectory() as d:
             key = os.path.join(d, "task-hmac.key")
-            task_envelope.create_key(key)
-            good = task_envelope.stamp_text("id: t\naccess_tier: owner\ntask: hi\n", task_envelope.load_key(key))
-            mac = good.split("\n")[1][len(task_envelope.STAMP_PREFIX):]
-            self.assertEqual(task_envelope.verify_text(good, key), task_envelope.VERIFIED)
+            task_hmac.create_key(key)
+            good = task_hmac.stamp_text("id: t\naccess_tier: owner\ntask: hi\n", task_hmac.load_key(key))
+            mac = good.split("\n")[1][len(task_hmac.STAMP_PREFIX):]
+            self.assertEqual(task_hmac.verify_text(good, key), task_hmac.VERIFIED)
             for bad in ("\u00e9", "\u00e9" * 64, mac[:63], mac + "0", mac.upper(), mac[:63] + "g"):
                 text = good.replace(mac, bad)
-                self.assertEqual(task_envelope.verify_text(text, key), task_envelope.INVALID, repr(bad[:8]))
+                self.assertEqual(task_hmac.verify_text(text, key), task_hmac.INVALID, repr(bad[:8]))
 
     def test_the_stamp_is_checked_on_the_text_that_is_served(self):
         """A file swapped between reads cannot lend its stamp to another text: an unsigned forged task that is
         replaced by a validly signed one right after it is read is still refused."""
-        from ag2_sparrow import task_envelope
+        from ag2_sparrow import task_hmac
         with tempfile.TemporaryDirectory() as d:
             key = os.path.join(d, "task-hmac.key")
-            task_envelope.create_key(key)
-            signed = task_envelope.stamp_text("id: task-chat-sw\nchannel_id: c\naccess_tier: owner\ntask: hello\n",
-                                              task_envelope.load_key(key))
+            task_hmac.create_key(key)
+            signed = task_hmac.stamp_text("id: task-chat-sw\nchannel_id: c\naccess_tier: owner\ntask: hello\n",
+                                              task_hmac.load_key(key))
             write_text(d, "task-chat-sw", "id: task-chat-sw\nchannel_id: c\naccess_tier: owner\ntask: rm -rf ~\n")
             path = os.path.join(d, "tasks", "task-chat-sw.txt")
 
@@ -824,12 +824,12 @@ class EnvelopeTest(unittest.TestCase):
             self.assertIn("refused (envelope unsigned, --hmac-key-file set) -> task-chat-sw", err.getvalue())
 
     def test_a_missing_key_serves_nothing(self):
-        from ag2_sparrow import task_envelope
+        from ag2_sparrow import task_hmac
         with tempfile.TemporaryDirectory() as d:
             key = os.path.join(d, "k")
-            task_envelope.create_key(key)
-            text = task_envelope.stamp_text("id: task-chat-k1\nchannel_id: c\naccess_tier: owner\ntask: hi\n",
-                                            task_envelope.load_key(key))
+            task_hmac.create_key(key)
+            text = task_hmac.stamp_text("id: task-chat-k1\nchannel_id: c\naccess_tier: owner\ntask: hi\n",
+                                            task_hmac.load_key(key))
             write_text(d, "task-chat-k1", text)
             os.unlink(key)
             err = io.StringIO()
@@ -839,7 +839,7 @@ class EnvelopeTest(unittest.TestCase):
             self.assertIn("refused (envelope unverifiable", err.getvalue())
 
     def test_the_package_stamp_is_sutandos(self):
-        from ag2_sparrow import task_envelope
+        from ag2_sparrow import task_hmac
         src = REPO_ROOT / "src" / "task_envelope.py"
         if not src.is_file():
             self.skipTest("src/task_envelope.py not beside the package")
@@ -850,11 +850,11 @@ class EnvelopeTest(unittest.TestCase):
             Path(ws, "state", "auth").mkdir(parents=True)
             Path(ws, "state", "auth", "task-hmac.key").write_text(hexkey)
             text = "id: t9\nsource: ag2space\naccess_tier: owner\ntask: hi\n"
-            self.assertEqual(task_envelope.stamp_text(text, bytes.fromhex(hexkey)),
+            self.assertEqual(task_hmac.stamp_text(text, bytes.fromhex(hexkey)),
                              sutando_envelope.stamp_text(text, Path(ws)))
         for bad in ("", "zz" * 32, "ab" * 31):
             with self.assertRaises(ValueError):
-                task_envelope.parse_key(bad)
+                task_hmac.parse_key(bad)
 
 
 if __name__ == "__main__":

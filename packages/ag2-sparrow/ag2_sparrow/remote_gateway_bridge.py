@@ -10907,8 +10907,8 @@ def _abort_if_poll_stalled(anchor: float,
 def main() -> None:
     # This process holds the gateway URL: nothing uncaught, in any thread, prints it raw.
     gateway_instance.install_scrubbing_excepthooks(lambda: URL)
-    from . import task_envelope
-    problem = task_envelope.install_bridge_stamper(os.environ)
+    from . import task_hmac
+    problem = task_hmac.install_bridge_stamper(os.environ)
     if problem:
         # A strict session refuses unsigned tasks; stopping here says why, where a silent start would not.
         sys.exit(f"FATAL: {problem}")

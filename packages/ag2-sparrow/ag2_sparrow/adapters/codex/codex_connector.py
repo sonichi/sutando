@@ -28,7 +28,7 @@ import threading
 import time
 import uuid
 
-from ... import task_envelope
+from ... import task_hmac
 from ...relay_loop import count_arg
 from ...task_io import (DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock,  # noqa: F401
                         admission, attested_headers, exit_on_sigterm, holder_consumer, load_done, make_dirs,
@@ -202,8 +202,8 @@ class Connector:
         """`verified` when no key is configured (nothing to check), else the text's stamp checked against the key
         read now: only `verified` is served, so an unsigned, tampered or unverifiable task is refused."""
         if not self.args.hmac_key_file:
-            return task_envelope.VERIFIED
-        return task_envelope.verify_text(text, self.args.hmac_key_file)
+            return task_hmac.VERIFIED
+        return task_hmac.verify_text(text, self.args.hmac_key_file)
 
     def thread_params(self, owner):
         p = {"cwd": self.turn_cwd(owner), "approvalPolicy": "never",
@@ -427,7 +427,7 @@ class Connector:
             text = read_task_text(path)
             verdict = self.envelope(text)
             headers, message, operator_lines = parse_task_text(text)
-            if verdict != task_envelope.VERIFIED:
+            if verdict != task_hmac.VERIFIED:
                 log("refused (envelope %s, --hmac-key-file set) ->" % verdict, task_id, headers["access_tier"])
                 write_atomic(os.path.join(self.args.results, name), NON_OWNER_REFUSED)
                 record_done(done_path, task_id)

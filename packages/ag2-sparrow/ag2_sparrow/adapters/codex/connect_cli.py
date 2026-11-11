@@ -29,7 +29,7 @@ from ... import _dirs, connect_bridge as cb, connect_common as cm, task_io
 from ...connect_bridge import EXTERNAL, UNIT
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, RUN_TIMEOUT_S, Shape, _v
 from . import codex_connector
-from ... import task_envelope
+from ... import task_hmac
 
 SHAPE = "codex-local"
 COMMAND = "ag2-sparrow-codex-local"
@@ -337,7 +337,7 @@ def hmac_key(args, local, mode) -> "tuple[str, str]":
         return "", ""
     path = str(Path(args.hmac_key_file).expanduser().resolve())
     try:
-        task_envelope.load_key(path)
+        task_hmac.load_key(path)
     except (OSError, ValueError) as e:
         return "", f"--hmac-key-file {path} is not a usable key ({type(e).__name__})"
     return path, ""
@@ -363,7 +363,7 @@ def verify(args) -> int:
         cm.check(results, Path(cfg[key]).is_dir(), key.lower().replace("_dir", ""), cfg[key])
     if cfg.get("HMAC_KEY_FILE"):
         try:
-            task_envelope.load_key(cfg["HMAC_KEY_FILE"])
+            task_hmac.load_key(cfg["HMAC_KEY_FILE"])
             problem = ""
         except (OSError, ValueError) as e:
             problem = f"{cfg['HMAC_KEY_FILE']} is not a usable key ({type(e).__name__})"

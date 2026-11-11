@@ -86,7 +86,7 @@ OWN_HMAC_KEY = "task-hmac.key"
 def own_hmac_key(local: cm.Shape, mode: str, given: str = "") -> "tuple[str, str]":
     """(the agent's own task-signing key, made now if absent, 0600 in its job's config dir; '') or ('', why). Only
     an install that runs the agent's bridge can sign with it, so an explicit root (a bridge you run) is refused."""
-    from . import task_envelope
+    from . import task_hmac
     if given:
         return "", "--hmac makes the agent's own key; --hmac-key-file names one: pass one"
     if mode != UNIT or not local.agent:
@@ -94,7 +94,7 @@ def own_hmac_key(local: cm.Shape, mode: str, given: str = "") -> "tuple[str, str
                     "--hmac-key-file with the key that bridge signs with")
     path = cm.config_dir(local) / OWN_HMAC_KEY
     try:
-        made = task_envelope.create_key(path)
+        made = task_hmac.create_key(path)
     except (OSError, ValueError) as e:
         return "", f"{path} could not hold the agent's task key ({type(e).__name__})"
     print(f"{'made' if made else 'kept'} the agent's task key: {path} (mode 600; its bridge signs every task with it)")
