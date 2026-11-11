@@ -41,7 +41,7 @@ import os
 import sys
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Optional
 
 # --------------------------------------------------------------------------- #
 #  File discovery                                                             #
@@ -340,46 +340,36 @@ def _reset_cache_for_tests() -> None:
     _WS_LAYER_WORKSPACE_KEY_WARN_PRINTED = False
 
 
-def _test_mode_workspace(env: Optional[Mapping[str, str]] = None) -> Optional[Path]:
+def _test_mode_workspace() -> Optional[Path]:
     """`$SUTANDO_WORKSPACE` under `SUTANDO_TEST_MODE=1` only; production ignores it."""
-    env = os.environ if env is None else env
-    env_val = env.get("SUTANDO_WORKSPACE", "").strip()
-    if env_val and env.get("SUTANDO_TEST_MODE") == "1":
+    env_val = os.environ.get("SUTANDO_WORKSPACE", "").strip()
+    if env_val and os.environ.get("SUTANDO_TEST_MODE") == "1":
         return Path(env_val).expanduser().resolve()
     return None
 
 
-def _workspace_from(cfg: Dict[str, Any], root: Optional[Path],
-                    env: Optional[Mapping[str, str]] = None,
-                    cwd: Optional[Path] = None) -> Path:
+def _workspace_from(cfg: Dict[str, Any], root: Optional[Path]) -> Path:
     """The workspace a repo-merged config names. Pure: no warnings, no disk reads.
 
     Shared by `resolve_workspace` and the workspace config layer, so the layer is
-    always read from the workspace every caller resolves. `env` and `cwd` default
-    to this process's; a relative path resolves against `cwd`.
+    always read from the workspace every caller resolves.
     """
-    env = os.environ if env is None else env
-    test_ws = _test_mode_workspace(env)
+    test_ws = _test_mode_workspace()
     if test_ws is not None:
         return test_ws
     cfg_path = (cfg.get("workspace") or {}).get("path")
     # An embedder (e.g. a desktop app whose repo root is read-only) names the full
     # workspace path; it fills the default slot only, below explicit config.
-    embedder_default = env.get("SUTANDO_DEFAULT_WORKSPACE", "").strip()
+    embedder_default = os.environ.get("SUTANDO_DEFAULT_WORKSPACE", "").strip()
     if cfg_path:
-        return _absolute(cfg_path, cwd)
+        return Path(cfg_path).expanduser().resolve()
     if embedder_default:
-        return _absolute(embedder_default, cwd)
+        return Path(embedder_default).expanduser().resolve()
     if root is None:
         # No repo root: last-ditch default outside a checkout, deliberately not the
         # removed `.sutando/workspace/`. workspace_default.py mirrors this.
         return Path.home().joinpath("sutando-workspace").resolve()
     return (root / _HARDCODED_WORKSPACE_DEFAULT_REL).resolve()
-
-
-def _absolute(path: str, cwd: Optional[Path]) -> Path:
-    p = Path(path).expanduser()
-    return (Path(cwd) / p if cwd is not None and not p.is_absolute() else p).resolve()
 
 
 def _workspace_layer_path(repo_cfg: Dict[str, Any], root: Path) -> Path:
@@ -411,13 +401,6 @@ def _load_workspace_layer(repo_cfg: Dict[str, Any], root: Path) -> Dict[str, Any
     return layer
 
 
-def _repo_config(root: Path):
-    """(defaults, overrides, merged+expanded) for the checkout at `root`; uncached."""
-    defaults = _load_json(root / _CONFIG_FILENAME)
-    overrides = _load_json(root / _LOCAL_FILENAME)
-    return defaults, overrides, _expand_vars(_deep_merge(defaults, overrides), root)
-
-
 def load_config(repo_root: Optional[Path] = None) -> Dict[str, Any]:
     """Load + merge sutando config from disk. Memoized per-process.
 
@@ -444,7 +427,9 @@ def load_config(repo_root: Optional[Path] = None) -> Dict[str, Any]:
         _CACHE_REPO_ROOT = None
         return _CACHE
 
-    defaults, overrides, repo_cfg = _repo_config(root)
+    defaults = _load_json(root / _CONFIG_FILENAME)
+    overrides = _load_json(root / _LOCAL_FILENAME)
+    repo_cfg = _expand_vars(_deep_merge(defaults, overrides), root)
     workspace_layer = _expand_vars(_load_workspace_layer(repo_cfg, root), root)
     expanded = _deep_merge(repo_cfg, workspace_layer)
 
@@ -466,16 +451,8 @@ def load_config(repo_root: Optional[Path] = None) -> Dict[str, Any]:
 _HARDCODED_WORKSPACE_DEFAULT_REL = "workspace"  # relative to repo root
 
 
-def resolve_workspace(repo_root: Optional[Path] = None, *,
-                      env: Optional[Mapping[str, str]] = None,
-                      module_dir: Optional[Path] = None,
-                      cwd: Optional[Path] = None) -> Path:
+def resolve_workspace(repo_root: Optional[Path] = None) -> Path:
     """Resolve the workspace directory per the canonical contract.
-
-    `env` + `module_dir` + `cwd` answer for ANOTHER process: the workspace a
-    process with environment `env` and working directory `cwd`, whose
-    `sutando_config.py` sits in `module_dir`, resolves.
-    That path reads no cache, writes no cache and prints nothing.
 
     Order (v0.8 — `$SUTANDO_WORKSPACE` env override removed):
       1. `sutando.config.{json,local.json}` → `workspace.path` (deep-merged).
@@ -492,10 +469,6 @@ def resolve_workspace(repo_root: Optional[Path] = None, *,
     in v0.8 per `docs/workspace-contract-v0.8.md`).
     """
     global _LEGACY_ENV_WARN_PRINTED, _DOTENV_DRIFT_WARN_PRINTED
-
-    if env is not None:
-        root = repo_root or _find_repo_root(Path(module_dir) if module_dir else None)
-        return _workspace_from(_repo_config(root)[2] if root else {}, root, env, cwd)
 
     env_val = os.environ.get("SUTANDO_WORKSPACE", "").strip()
 

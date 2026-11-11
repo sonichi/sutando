@@ -2,21 +2,26 @@
 
 A bridge resolves its workspace from the checkout it was started from, so a
 bridge still running from another install's engine writes tasks the core never
-reads. The probe finds every bridge process on the host, derives its checkout
-from argv (or cwd for a relative launch), resolves that checkout's inbox with
-the process's OWN environment and cwd, and compares it with the core's; an unreadable
-checkout or environment is reported unknown, never guessed. Process readers are injected so tests run offline.
+reads. Each bridge REPORTS the inbox it actually uses (`report_inbox`, called
+at startup) into a per-user directory that does not depend on any workspace;
+health-check reads those reports for the live bridge pids and compares them
+with the core's inbox. A live bridge with no report predates reporting and is
+named as unknown, never guessed.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
-import sys
+import tempfile
+import time
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import workspace_default  # noqa: E402
+try:
+    import pwd
+except ImportError:  # Windows: no passwd database
+    pwd = None
 
 CHECK_NAME = "bridge-inbox-match"
 BRIDGE_SCRIPTS = {
@@ -26,8 +31,119 @@ BRIDGE_SCRIPTS = {
 }
 
 
+SCHEMA_VERSION = 1
+_MAX_PATH = 4096
+_MAX_START = 64
+
+
+def sentinel_dir() -> Path:
+    """Host-local, per-uid, never synced: the same place for every install of this user.
+
+    No workspace path can serve, because the workspace is the thing that differs
+    between installs; see docs/workspace-design.md.
+    """
+    home = Path(pwd.getpwuid(os.geteuid()).pw_dir) if pwd is not None else Path.home()
+    return home / ".local" / "state" / "sutando" / "bridges"
+
+
 def canonical(path) -> str:
     return os.path.realpath(os.path.expanduser(str(path)))
+
+
+def process_start(pid) -> Optional[str]:
+    """The start identity of `pid`, so a record cannot validate a reused pid."""
+    try:
+        stat = Path(f"/proc/{int(pid)}/stat").read_text()
+        return "stat:" + stat.rsplit(")", 1)[1].split()[19]  # field 22: starttime
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        out = subprocess.run(["/bin/ps", "-o", "lstart=", "-p", str(int(pid))],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    text = " ".join(out.stdout.split())
+    return f"lstart:{text}" if out.returncode == 0 and text else None
+
+
+def _record_path(directory: Path, bridge: str, pid) -> Path:
+    return directory / f"{bridge}-{int(pid)}.json"
+
+
+def validate(data) -> Optional[dict]:
+    """The record if it matches schema v1 and its bounds, else None."""
+    if not isinstance(data, dict) or data.get("version") != SCHEMA_VERSION:
+        return None
+    ok = (isinstance(data.get("pid"), int) and not isinstance(data.get("pid"), bool)
+          and data["pid"] > 0
+          and data.get("bridge") in BRIDGE_SCRIPTS
+          and isinstance(data.get("started_at"), int))
+    for key, cap in (("tasks_dir", _MAX_PATH), ("engine_dir", _MAX_PATH), ("start", _MAX_START)):
+        v = data.get(key)
+        ok = ok and isinstance(v, str) and 0 < len(v) <= cap
+    ok = ok and os.path.isabs(data.get("tasks_dir") or "")
+    return data if ok else None
+
+
+def report_inbox(bridge: str, tasks_dir, directory: Optional[Path] = None,
+                 pid: Optional[int] = None) -> Optional[Path]:
+    """Record the inbox this bridge process writes. Fail-open: logs, never raises."""
+    try:
+        d = Path(directory) if directory is not None else sentinel_dir()
+        pid = int(pid) if pid is not None else os.getpid()
+        record = validate({
+            "version": SCHEMA_VERSION, "pid": pid, "bridge": bridge,
+            "tasks_dir": canonical(tasks_dir),
+            "engine_dir": canonical(Path(__file__).resolve().parent.parent),
+            "start": process_start(pid) or "", "started_at": int(time.time()),
+        })
+        if record is None:
+            raise ValueError("record outside schema (unknown bridge, path or start identity)")
+        d.mkdir(parents=True, exist_ok=True)
+        for old in d.glob(f"{bridge}-*.json"):
+            tail = old.stem.rsplit("-", 1)[-1]
+            if tail.isdigit() and int(tail) != pid and process_start(int(tail)) is None:
+                old.unlink(missing_ok=True)
+        target = _record_path(d, bridge, pid)
+        fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(d))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(record, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, target)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        return target
+    except Exception as exc:  # noqa: BLE001 — reporting must never stop a bridge
+        print(f"[bridge-inbox] could not record inbox: {type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
+def read_report(bridge: str, pid, directory: Optional[Path] = None,
+                start_of: Optional[Callable[[object], Optional[str]]] = None) -> "tuple[Optional[dict], str]":
+    """(record, why) for live `pid`; record is None with a reason when it cannot be trusted."""
+    start_of = start_of or process_start
+    d = Path(directory) if directory is not None else sentinel_dir()
+    try:
+        raw = _record_path(d, bridge, pid).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, "missing"
+    except (OSError, ValueError):
+        return None, "unreadable"
+    try:
+        data = validate(json.loads(raw))
+    except ValueError:
+        data = None
+    if data is None or data["bridge"] != bridge or str(data["pid"]) != str(pid):
+        return None, "malformed"
+    live = start_of(pid)
+    if live is None:
+        return None, "start unreadable"
+    if live != data["start"]:
+        return None, "stale (pid reused)"
+    return data, "ok"
 
 
 def _script_operand(argv, script: str) -> Optional[str]:
@@ -42,19 +158,18 @@ def _script_operand(argv, script: str) -> Optional[str]:
     if end > 0 and text[end - 1] not in "/ \t":
         return None
     stop = end + len(script)
-    slash = text.rfind("/", 0, end)
-    if slash < 0:
+    if text.rfind("/", 0, end) < 0:
         return script
     start = text.rfind(" /", 0, end)
     if start >= 0:
         return text[start + 1:stop]
     if text.startswith("/"):
         return text[:stop]
-    return text[text.rfind(" ", 0, end) + 1:stop]  # relative, no spaces
+    return text[text.rfind(" ", 0, end) + 1:stop]
 
 
-def bridge_checkout(argv, cwd: str, script: str) -> Optional[Path]:
-    """The checkout whose `src/<script>` this argv executes, or None."""
+def bridge_engine(argv, cwd: str, script: str) -> Optional[Path]:
+    """The engine checkout whose `src/<script>` this argv executes, or None."""
     token = _script_operand(argv, script)
     if token is None:
         return None
@@ -64,61 +179,6 @@ def bridge_checkout(argv, cwd: str, script: str) -> Optional[Path]:
             return None
         path = Path(cwd) / path
     return Path(canonical(path)).parent.parent
-
-
-def checkout_inbox(checkout: Path, env: dict, cwd: str) -> Path:
-    """The bridges' own `resolve_workspace() / "tasks"`, as that process resolves it."""
-    return workspace_default.resolve_workspace(
-        env=env, module_dir=Path(checkout) / "src", cwd=Path(cwd)) / "tasks"
-
-
-def read_env(pid: str) -> Optional[dict]:
-    """The environment `pid` was started with, or None when it cannot be read."""
-    raw = None
-    try:  # linux
-        raw = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
-    except OSError:
-        raw = None
-    if raw is None:
-        raw = _darwin_env(pid)
-    if raw is None:
-        return None
-    env = {}
-    for item in raw:
-        key, sep, val = item.decode("utf8", "replace").partition("=")
-        if sep and key:
-            env[key] = val
-    return env
-
-
-def _darwin_env(pid: str) -> Optional[list]:
-    """KERN_PROCARGS2 holds argc, the exec path, argv, then the environment."""
-    try:
-        import ctypes
-        import ctypes.util
-        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-        mib = (ctypes.c_int * 3)(1, 49, int(pid))
-        size = ctypes.c_size_t(262144)
-        buf = ctypes.create_string_buffer(size.value)
-        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
-            return None
-        data = buf.raw[:size.value]
-        argc = int.from_bytes(data[:4], sys.byteorder)
-        parts = data[4:].split(b"\0")
-        i = 0
-        while i < len(parts) and parts[i] == b"":
-            i += 1
-        i += 1  # the exec path
-        while i < len(parts) and parts[i] == b"":
-            i += 1
-        i += argc
-        out = []
-        while i < len(parts) and parts[i]:
-            out.append(parts[i])
-            i += 1
-        return out
-    except Exception:  # noqa: BLE001 -- not darwin, gone, or not ours
-        return None
 
 
 def read_argv(pid: str):
@@ -150,15 +210,13 @@ def read_cwd(pid: str) -> str:
 
 def check_bridge_inbox_match(core_inboxes: Iterable,
                              list_pids: Callable[[str], list],
+                             directory: Optional[Path] = None,
                              argv_of: Optional[Callable[[str], object]] = None,
                              cwd_of: Optional[Callable[[str], str]] = None,
-                             env_of: Optional[Callable[[str], Optional[dict]]] = None,
-                             inbox_of: Optional[Callable[[Path, dict, str], Path]] = None) -> dict:
-    """warn naming each bridge, its inbox and the core's when they differ."""
+                             start_of: Optional[Callable[[object], Optional[str]]] = None) -> dict:
+    """warn naming each live bridge whose reported inbox is not the core's."""
     argv_of = argv_of or read_argv
     cwd_of = cwd_of or read_cwd
-    env_of = env_of or read_env
-    inbox_of = inbox_of or checkout_inbox
     core = sorted({canonical(p) for p in core_inboxes if p})
     if not core:
         return {"name": CHECK_NAME, "status": "ok",
@@ -166,34 +224,29 @@ def check_bridge_inbox_match(core_inboxes: Iterable,
     seen, mismatched, unknown = [], [], []
     for name, script in BRIDGE_SCRIPTS.items():
         for pid in list_pids(script):
-            cwd = cwd_of(pid)
-            checkout = bridge_checkout(argv_of(pid), cwd, script)
-            env = env_of(pid)
-            missing = ("checkout" if checkout is None else "environment" if env is None
-                       else "cwd" if not cwd else None)
-            if missing:
-                unknown.append(f"{name} pid {pid} ({missing} unreadable)")
+            report, why = read_report(name, pid, directory, start_of)
+            if report is None:
+                engine = bridge_engine(argv_of(pid), cwd_of(pid), script)
+                unknown.append(f"{name} pid {pid} from {engine or 'an unreadable engine'}: "
+                               f"inbox record {why} — it may predate inbox reporting, so its "
+                               "destination is unverified; restart it from the desktop engine")
                 continue
-            try:
-                inbox = canonical(inbox_of(checkout, env, cwd))
-            except Exception as exc:  # noqa: BLE001 — a foreign config must not break the check
-                unknown.append(f"{name} pid {pid} ({checkout}: {type(exc).__name__})")
-                continue
+            inbox = canonical(report["tasks_dir"])
             if inbox in core:
                 seen.append(f"{name} pid {pid}")
             else:
-                mismatched.append(f"{name} pid {pid} (from {checkout}) writes {inbox}")
+                mismatched.append(f"{name} pid {pid} (from {report['engine_dir']}) writes {inbox}")
     if mismatched:
         return {"name": CHECK_NAME, "status": "warn",
                 "detail": (f"{'; '.join(mismatched)} — but the core watches "
                            f"{' / '.join(core)}, so those messages are never answered. "
                            "Stop that bridge and relaunch it from this engine "
                            "(startup.sh or the desktop app)")}
-    note = f"; inbox unknown for {', '.join(unknown)}" if unknown else ""
-    if not seen and unknown:
+    if unknown:
+        lead = f"{len(seen)} bridge(s) write the core inbox; " if seen else ""
         return {"name": CHECK_NAME, "status": "ok",
-                "detail": f"inbox unknown for {', '.join(unknown)} — not asserting a match"}
+                "detail": f"{lead}inbox unknown: {'; '.join(unknown)}"}
     if not seen:
         return {"name": CHECK_NAME, "status": "ok", "detail": "no bridge running"}
     return {"name": CHECK_NAME, "status": "ok",
-            "detail": f"{len(seen)} bridge(s) write the core inbox{note}"}
+            "detail": f"{len(seen)} bridge(s) write the core inbox"}

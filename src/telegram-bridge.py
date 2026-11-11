@@ -65,6 +65,7 @@ from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
+from bridge_inbox import report_inbox  # noqa: E402
 from presenter_mode import presenter_mode_active  # noqa: E402
 from sutando_config import config_get, config_get_env_first  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
@@ -734,6 +735,7 @@ def log_privacy_setting(get_me):
 def main():  # pragma: no cover
     global _TOFU_ENROLLMENT_CODE
     _single_instance_acquire("telegram-bridge")
+    report_inbox("telegram-bridge", TASKS_DIR)
     print("Telegram bridge started. Polling for messages...", flush=True)
     print(log_privacy_setting(lambda: api("getMe")), flush=True)
     # Restart-safety: sweep orphan `.sending` files before the poll

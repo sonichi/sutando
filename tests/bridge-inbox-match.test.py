@@ -2,17 +2,18 @@
 """A bridge started from another install's engine writes tasks the core never reads.
 
 Field case: the Slack bridge kept running from an older app's engine, so it wrote
-into that install's workspace while the core watched the desktop app's. The
-probe must name the bridge and both inboxes, and stay quiet when a different
-checkout still resolves the core's workspace.
+into that install's workspace while the core watched the desktop app's. Each
+bridge now reports the inbox it uses; the probe compares the reports of live
+bridge pids with the core's inbox and never guesses for a bridge without one.
 """
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
-import re
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -36,181 +37,145 @@ _telegram_cfg.mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(ROOT / "src"))
 
 import bridge_inbox  # noqa: E402
-import sutando_config, workspace_default  # noqa: E401,E402
+
+START = {"111": "lstart:A", "222": "lstart:B", "333": "lstart:C"}
 
 
-def _install(base: Path, name: str, workspace: Path) -> Path:
-    """An engine checkout whose `workspace` link points at `workspace`, as a desktop install lays it out."""
-    checkout = base / name / "engine" / "sutando"
-    (checkout / "src").mkdir(parents=True)
-    (checkout / "sutando.config.json").write_text("{}")
-    workspace.mkdir(parents=True, exist_ok=True)
-    (checkout / "workspace").symlink_to(workspace)
-    return checkout
-
-
-class BridgeInboxMatch(unittest.TestCase):
+class Probe(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        self.core_ws = self.tmp / "Application Support" / "desktop" / "workspace"
-        self.old_ws = self.tmp / "Application Support" / "old-app" / "workspace"
-        self.core = _install(self.tmp / "Application Support", "desktop", self.core_ws)
-        self.old = _install(self.tmp / "Application Support", "old-app", self.old_ws)
+        self.dir = self.tmp / "bridges"
+        self.core = self.tmp / "Application Support" / "desktop" / "workspace" / "tasks"
+        self.other = self.tmp / "Application Support" / "old-app" / "workspace" / "tasks"
+        self.core.mkdir(parents=True)
+        self.other.mkdir(parents=True)
 
-    def _probe(self, procs: dict, cwds: dict | None = None, envs: dict | None = None):
-        cwds = cwds or {}
-        envs = envs or {}
-        def pids(script):
-            return [pid for pid, argv in procs.items() if script in str(argv)]
+    def _write(self, bridge, pid, tasks_dir, start=None):
+        with mock.patch.object(bridge_inbox, "process_start",
+                               lambda p: start or START.get(str(p))):
+            return bridge_inbox.report_inbox(bridge, tasks_dir, directory=self.dir, pid=int(pid))
+
+    def _probe(self, live: dict, starts=None):
+        starts = starts or START
         return bridge_inbox.check_bridge_inbox_match(
-            [self.core_ws / "tasks"], pids,
-            argv_of=lambda pid: procs[pid], cwd_of=lambda pid: cwds.get(pid, str(self.tmp)),
-            env_of=lambda pid: envs.get(pid, {}))
+            [self.core], lambda script: [p for p, s in live.items() if s == script],
+            directory=self.dir,
+            argv_of=lambda pid: ["python3", f"/engines/e{pid}/src/{live[pid]}"],
+            cwd_of=lambda pid: "/", start_of=lambda pid: starts.get(str(pid)))
 
-    def test_bridge_from_other_engine_is_flagged_with_both_paths(self):
-        argv = f"python3 {self.old}/src/slack-bridge.py"  # flattened, path has a space
-        got = self._probe({"111": argv})
+    def test_record_matching_core_is_ok(self):
+        self._write("slack-bridge", 111, self.core)
+        got = self._probe({"111": "slack-bridge.py"})
+        self.assertEqual(got["status"], "ok", got)
+        self.assertEqual(got["detail"], "1 bridge(s) write the core inbox")
+
+    def test_mismatch_warns_naming_both_paths(self):
+        self._write("slack-bridge", 111, self.other)
+        got = self._probe({"111": "slack-bridge.py"})
         self.assertEqual(got["status"], "warn", got)
-        self.assertIn("slack-bridge pid 111", got["detail"])
-        self.assertIn(os.path.realpath(self.old_ws / "tasks"), got["detail"])
-        self.assertIn(os.path.realpath(self.core_ws / "tasks"), got["detail"])
+        self.assertIn(os.path.realpath(self.other), got["detail"])
+        self.assertIn(os.path.realpath(self.core), got["detail"])
 
-    def test_relative_launch_resolves_through_cwd(self):
-        got = self._probe({"7": ["python3", "src/telegram-bridge.py"]}, {"7": str(self.old)})
-        self.assertEqual(got["status"], "warn", got)
-        self.assertIn("telegram-bridge pid 7", got["detail"])
-
-    def test_bridge_from_core_engine_is_ok(self):
-        got = self._probe({"5": ["python3", f"{self.core}/src/discord-bridge.py"]})
+    def test_dead_pid_record_is_ignored(self):
+        self._write("slack-bridge", 222, self.other)  # pid 222 no longer runs
+        self._write("slack-bridge", 111, self.core)
+        got = self._probe({"111": "slack-bridge.py"})
         self.assertEqual(got["status"], "ok", got)
-        self.assertIn("1 bridge(s) write the core inbox", got["detail"])
+        self.assertNotIn("222", got["detail"])
 
-    def test_other_checkout_sharing_the_core_workspace_is_ok(self):
-        shared = _install(self.tmp, "dev-clone", self.core_ws)
-        got = self._probe({"9": ["python3", f"{shared}/src/slack-bridge.py"]})
+    def test_reused_pid_is_stale_not_a_match(self):
+        self._write("slack-bridge", 111, self.core)
+        got = self._probe({"111": "slack-bridge.py"}, starts={"111": "lstart:LATER"})
         self.assertEqual(got["status"], "ok", got)
-
-    def test_probe_env_does_not_stand_in_for_the_bridge(self):
-        # The core's embedder default would make every foreign checkout look like the core.
-        os.environ["SUTANDO_DEFAULT_WORKSPACE"] = str(self.core_ws)
-        try:
-            got = self._probe({"111": ["python3", f"{self.old}/src/slack-bridge.py"]})
-        finally:
-            del os.environ["SUTANDO_DEFAULT_WORKSPACE"]
-        self.assertEqual(got["status"], "warn", got)
-
-    def test_foreign_checkout_whose_env_names_the_core_workspace_is_ok(self):
-        got = self._probe({"4": ["python3", f"{self.old}/src/slack-bridge.py"]},
-                          envs={"4": {"SUTANDO_DEFAULT_WORKSPACE": str(self.core_ws)}})
-        self.assertEqual(got["status"], "ok", got)
-        self.assertIn("1 bridge(s) write the core inbox", got["detail"])
-
-    def test_core_checkout_whose_env_names_another_workspace_warns(self):
-        got = self._probe({"6": ["python3", f"{self.core}/src/slack-bridge.py"]},
-                          envs={"6": {"SUTANDO_DEFAULT_WORKSPACE": str(self.old_ws)}})
-        self.assertEqual(got["status"], "warn", got)
-        self.assertIn(os.path.realpath(self.old_ws / "tasks"), got["detail"])
-
-    def test_unreadable_environment_is_unknown_not_a_guess(self):
-        procs = {"8": ["python3", f"{self.old}/src/slack-bridge.py"]}
-        got = bridge_inbox.check_bridge_inbox_match(
-            [self.core_ws / "tasks"], lambda s: [p for p, a in procs.items() if s in str(a)],
-            argv_of=procs.get, cwd_of=lambda p: "", env_of=lambda p: None)
-        self.assertEqual(got["status"], "ok", got)
-        self.assertIn("inbox unknown for slack-bridge pid 8 (environment unreadable)", got["detail"])
-
-    def test_unreadable_checkout_is_unknown(self):
-        got = self._probe({"2": ["python3", "src/discord-bridge.py"]}, {"2": ""})
-        self.assertEqual(got["status"], "ok", got)
-        self.assertIn("inbox unknown for discord-bridge pid 2 (checkout unreadable)", got["detail"])
-
-    def _relative_config(self):
-        (self.old / "sutando.config.local.json").write_text('{"workspace": {"path": "ws"}}')
-        return {"5": ["python3", f"{self.old}/src/slack-bridge.py"]}
-
-    def test_relative_config_resolves_against_the_bridge_cwd(self):
-        (self.core_ws.parent / "ws").symlink_to(self.core_ws)
-        got = self._probe(self._relative_config(), {"5": str(self.core_ws.parent)})
-        self.assertEqual(got["status"], "ok", got)
-
-    def test_relative_config_from_another_cwd_warns(self):
-        got = self._probe(self._relative_config(), {"5": str(self.old_ws.parent)})
-        self.assertEqual(got["status"], "warn", got)
-        self.assertIn(os.path.realpath(self.old_ws.parent / "ws" / "tasks"), got["detail"])
-
-    def test_unreadable_cwd_is_unknown(self):
-        got = self._probe(self._relative_config(), {"5": ""})
-        self.assertEqual(got["status"], "ok", got)
-        self.assertIn("inbox unknown for slack-bridge pid 5 (cwd unreadable)", got["detail"])
-
-    def test_resolving_another_process_leaves_the_cache_alone(self):
-        sutando_config.load_config(self.core)
-        before = (sutando_config._CACHE, sutando_config._CACHE_REPO_ROOT)
-        got = workspace_default.resolve_workspace(env={}, module_dir=self.old / "src", cwd=self.tmp)
-        self.assertEqual(got, self.old_ws.resolve())
-        self.assertEqual((sutando_config._CACHE, sutando_config._CACHE_REPO_ROOT), before)
-
-    def test_checkout_config_beats_the_bridge_env(self):
-        # resolve_workspace ranks explicit config above the embedder default.
-        (self.old / "sutando.config.local.json").write_text(
-            '{"workspace": {"path": "%s"}}' % self.core_ws)
-        got = self._probe({"4": ["python3", f"{self.old}/src/slack-bridge.py"]},
-                          envs={"4": {"SUTANDO_DEFAULT_WORKSPACE": str(self.old_ws)}})
-        self.assertEqual(got["status"], "ok", got)
-
-    def test_env_keys_the_resolver_ignores_are_ignored(self):
-        env = {"SUTANDO_TASKS_DIR": str(self.core_ws / "tasks"),
-               "SUTANDO_WORKSPACE_DIR": str(self.core_ws),
-               "SUTANDO_WORKSPACE": str(self.core_ws)}
-        got = self._probe({"4": ["python3", f"{self.old}/src/slack-bridge.py"]}, envs={"4": env})
-        self.assertEqual(got["status"], "warn", got)
-
-    def test_unrelated_process_is_not_a_bridge(self):
-        got = self._probe({"3": "vim notes-slack-bridge.py"})
-        self.assertEqual(got["status"], "ok", got)
+        self.assertIn("stale (pid reused)", got["detail"])
         self.assertNotIn("write the core inbox", got["detail"])
 
+    def test_live_bridge_without_record_is_unknown_with_hint(self):
+        got = self._probe({"333": "telegram-bridge.py"})
+        self.assertEqual(got["status"], "ok", got)
+        self.assertIn("telegram-bridge pid 333 from /engines/e333: inbox record missing", got["detail"])
+        self.assertIn("may predate inbox reporting", got["detail"])
+        self.assertIn("destination is unverified; restart it from the desktop engine", got["detail"])
 
-class HealthCheckDelegatesToTheResolver(unittest.TestCase):
-    def test_probe_result_follows_resolve_workspace(self):
+    def test_malformed_and_unreadable_records_are_unknown(self):
+        self.dir.mkdir(parents=True)
+        (self.dir / "slack-bridge-111.json").write_text("{not json")
+        bad = {"version": 1, "pid": 222, "bridge": "slack-bridge", "tasks_dir": "relative",
+               "engine_dir": "/e", "start": "lstart:B", "started_at": 1}
+        (self.dir / "discord-bridge-222.json").write_text(json.dumps(bad))
+        (self.dir / "telegram-bridge-333.json").mkdir()  # a directory cannot be read as a file
+        got = self._probe({"111": "slack-bridge.py", "222": "discord-bridge.py",
+                           "333": "telegram-bridge.py"})
+        self.assertEqual(got["status"], "ok", got)
+        self.assertIn("slack-bridge pid 111 from /engines/e111: inbox record malformed", got["detail"])
+        self.assertIn("discord-bridge pid 222 from /engines/e222: inbox record malformed", got["detail"])
+        self.assertIn("telegram-bridge pid 333 from /engines/e333: inbox record unreadable", got["detail"])
+
+    def test_writer_fails_open(self):
+        blocker = self.tmp / "file-not-dir"
+        blocker.write_text("x")
+        self.assertIsNone(bridge_inbox.report_inbox("slack-bridge", self.core, directory=blocker))
+        self.assertIsNone(bridge_inbox.report_inbox("not-a-bridge", self.core, directory=self.dir))
+
+    def test_concurrent_writers_leave_only_valid_records(self):
+        pids = [os.getpid(), os.getppid()]
+        errors = []
+
+        def write(bridge, pid, n):
+            for _ in range(n):
+                if bridge_inbox.report_inbox(bridge, self.core, directory=self.dir, pid=pid) is None:
+                    errors.append((bridge, pid))
+        threads = [threading.Thread(target=write, args=(b, p, 25))
+                   for b in bridge_inbox.BRIDGE_SCRIPTS for p in pids for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir() if p.name.startswith(".")), [])
+        for b in bridge_inbox.BRIDGE_SCRIPTS:
+            for p in pids:
+                rec, why = bridge_inbox.read_report(b, p, directory=self.dir)
+                self.assertEqual(why, "ok", (b, p))
+                self.assertEqual(rec["tasks_dir"], os.path.realpath(self.core))
+
+    def test_record_schema(self):
+        target = bridge_inbox.report_inbox("slack-bridge", self.core, directory=self.dir)
+        rec = json.loads(target.read_text())
+        self.assertEqual(set(rec), {"version", "pid", "bridge", "tasks_dir", "engine_dir",
+                                    "start", "started_at"})
+        self.assertEqual(rec["version"], 1)
+        self.assertEqual(rec["pid"], os.getpid())
+        self.assertEqual(rec["engine_dir"], os.path.realpath(ROOT))
+        self.assertEqual(rec["start"], bridge_inbox.process_start(os.getpid()))
+
+
+class HealthCheckDelegates(unittest.TestCase):
+    def test_health_check_reads_the_reports(self):
         spec = importlib.util.spec_from_file_location("health_check", ROOT / "src" / "health-check.py")
         health = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(health)
-        core = Path(tempfile.mkdtemp()) / "core-ws"
-        elsewhere = Path(tempfile.mkdtemp()) / "other-ws"
-        argv = ["python3", "/engine/src/slack-bridge.py"]
+        self.assertIs(health.bridge_inbox, bridge_inbox)
+        tmp = Path(tempfile.mkdtemp())
+        core, other = tmp / "core" / "tasks", tmp / "other" / "tasks"
+        pid = os.getpid()
         stubs = [
-            mock.patch.object(health, "_core_inboxes", lambda: [str(core / "tasks")]),
+            mock.patch.object(health, "_core_inboxes", lambda: [str(core)]),
             mock.patch.object(health, "probe_pids",
-                              lambda pat: (["42"], True) if "slack" in pat else ([], True)),
+                              lambda pat: ([str(pid)], True) if "slack" in pat else ([], True)),
             mock.patch.object(health, "_drop_launcher_parents", lambda pids: pids),
-            mock.patch.object(bridge_inbox, "read_argv", lambda pid: argv),
-            mock.patch.object(bridge_inbox, "read_cwd", lambda pid: "/"),
-            mock.patch.object(bridge_inbox, "read_env", lambda pid: {}),
+            mock.patch.object(bridge_inbox, "sentinel_dir", lambda: tmp / "bridges"),
         ]
         for st in stubs:
             st.start()
             self.addCleanup(st.stop)
-        # health-check's bridge_inbox is this one only if the defaults were bound late.
-        self.assertIs(health.bridge_inbox, bridge_inbox)
         results = {}
-        for label, ws in (("core", core), ("elsewhere", elsewhere)):
-            with mock.patch.object(workspace_default, "resolve_workspace",
-                                   lambda migrate=True, *, env=None, module_dir=None, cwd=None, _w=ws: _w):
-                results[label] = health.check_bridge_inbox_match()
+        for label, inbox in (("core", core), ("other", other)):
+            bridge_inbox.report_inbox("slack-bridge", inbox)
+            results[label] = health.check_bridge_inbox_match()
         self.assertEqual(results["core"]["status"], "ok", results)
-        self.assertEqual(results["elsewhere"]["status"], "warn", results)
-        self.assertIn(os.path.realpath(elsewhere / "tasks"), results["elsewhere"]["detail"])
-
-
-class BridgesShareOneResolver(unittest.TestCase):
-    def test_each_bridge_takes_its_inbox_from_resolve_workspace(self):
-        for script in bridge_inbox.BRIDGE_SCRIPTS.values():
-            src = (ROOT / "src" / script).read_text()
-            self.assertIn("from workspace_default import resolve_workspace", src, script)
-            self.assertRegex(src, r"\nREPO = resolve_workspace\(\)\n", script)
-            for line in re.findall(r"^TASKS_DIR = .*$", src, re.M):
-                self.assertEqual(line, 'TASKS_DIR = REPO / "tasks"', script)
+        self.assertEqual(results["other"]["status"], "warn", results)
+        self.assertIn(os.path.realpath(other), results["other"]["detail"])
 
     def test_health_check_runs_the_probe(self):
         src = (ROOT / "src" / "health-check.py").read_text()
