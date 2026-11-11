@@ -35,6 +35,8 @@ GATE_SCRIPT = "scripts/cron-gate.sh"
 _GATE_CALL = re.compile(r"(^|[\s`])bash " + re.escape(GATE_SCRIPT) + r"\s")
 LOOP_NAME = "main-loop"
 LOOP_SKILL = "proactive-loop"
+# The slash command itself, not a path such as skills/proactive-loop/scripts/x.py.
+_LOOP_CALL = re.compile(r"(^|[\s`])/" + re.escape(LOOP_SKILL) + r"(?![\w/-])")
 
 
 def base_prompt(entry: dict) -> Optional[str]:
@@ -56,7 +58,7 @@ def is_main_loop(entry: dict) -> bool:
     if entry.get("name") == LOOP_NAME:
         return True
     prompt = entry.get("prompt")
-    return isinstance(prompt, str) and "/" + LOOP_SKILL in prompt
+    return isinstance(prompt, str) and _LOOP_CALL.search(prompt) is not None
 
 
 def is_gated(entry: dict) -> bool:

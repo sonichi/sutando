@@ -79,6 +79,14 @@ def main() -> int:
     check("a prompt invoking /proactive-loop is the loop", not cpg.is_gated(loop_by_prompt))
     check("a prompt invoking /proactive-loop registers verbatim",
           cpg.registered_prompt(loop_by_prompt) == loop_by_prompt["prompt"])
+    loop_script = {"name": "loop-digest", "cron": "0 * * * *",
+                   "prompt": "Run python3 skills/proactive-loop/scripts/quota-tier.py and report"}
+    check("a prompt naming a proactive-loop script path is not the loop",
+          not cpg.is_main_loop(loop_script) and cpg.is_gated(loop_script))
+    check("a longer slash command sharing the prefix is not the loop",
+          not cpg.is_main_loop({"name": "x", "prompt": "/proactive-loop-report"}))
+    check("the bare slash command with an interval is the loop",
+          cpg.is_main_loop({"name": "x", "prompt": "/proactive-loop 10m"}))
 
     check("gate: false opts out", not cpg.is_gated(opted_out))
     check("gate: false registers the prompt verbatim",
