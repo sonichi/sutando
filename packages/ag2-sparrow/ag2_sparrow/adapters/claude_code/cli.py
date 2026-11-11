@@ -204,9 +204,31 @@ RECORDED = (("CLAUDE", "claude", str), ("PLUGIN_DIR", "plugin_dir", lambda v: v 
             (inbox.ALLOW_COLLABORATOR, "allow_collaborator", lambda v: v == "1"))
 
 
+# Install and connect ran, but a kept session id stayed instead of --resume-session's.
+EXIT_RESUME_NOT_APPLIED = 79
+_UNAPPLIED: list = []      # (requested id, kept id, stop command), reset per top-level command
+
+
+def resume_outcome(rc: int) -> int:
+    """`rc`, or EXIT_RESUME_NOT_APPLIED once everything else succeeded: decided only after the agent
+    lock is released, so the job and its bridge stay as installed."""
+    if rc != 0 or not _UNAPPLIED:
+        return rc
+    resume, kept, stop_cmd = _UNAPPLIED[-1]
+    print(f"error: --resume-session {resume} was not applied: the old session is not proven gone, so the agent runs "
+          f"under its kept session id {kept} (installed and running); stop the job ({stop_cmd}), then install "
+          "again", file=sys.stderr)
+    return EXIT_RESUME_NOT_APPLIED
+
+
 def install(args) -> int:
+    _UNAPPLIED.clear()
+    return resume_outcome(_install(args))
+
+
+def _install(args) -> int:
     if getattr(args, "token_stdin", False):
-        return cb.install_token_stdin(args, LOCAL, lambda: connect_preflight(args, login=False), install, COMMAND,
+        return cb.install_token_stdin(args, LOCAL, lambda: connect_preflight(args, login=False), _install, COMMAND,
                                       work=None, inbox=None, bridge_state_dir=None)
     problem = cb.recorded_install_args(args, LOCAL, RECORDED)
     if problem:
@@ -271,7 +293,6 @@ def install(args) -> int:
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
-    unapplied = []
 
     def live_server() -> "int | None":
         """The recorded tmux server's pid while it is not proven gone, else None."""
@@ -291,7 +312,8 @@ def install(args) -> int:
             server = live_server()
             if server:
                 print(f"kept the session id {kept}: the old session (tmux server pid {server}) is not proven gone")
-                unapplied.append(resume)
+                if resume:
+                    _UNAPPLIED.append((resume, kept, cm.stop_command(local)))
             else:
                 kept = ""
                 if not resume:
@@ -305,9 +327,6 @@ def install(args) -> int:
         rc = cm.install(local, values, root, root_id=getattr(args, "root_identity", None), revise=revise,
                         precheck=lambda r: inbox.root_problem(r) or records.agent_problem(r, agent_id),
                         holder=holder_words)
-        if rc == 0 and any(unapplied):
-            print(f"warning: --resume-session {resume} was not applied: the old session is not proven gone, so it "
-                  f"keeps its own id; stop the job ({cm.stop_command(local)}), then install again", file=sys.stderr)
         if rc != 0 or mode == EXTERNAL:
             return rc
         problem = cb.wire_bridge_bound(dict(values, ROOT=root), COMMAND, bridge, local,
@@ -362,7 +381,8 @@ def connect_preflight(args, login: bool = True) -> str:
 def connect(args) -> int:
     """Preflight, redeem the code into the agent's seat beside its root (connect_bridge's), then install
     exactly as `install` does with the seat's .env as the token env file, all inside the agent's fence."""
-    return cb.fenced(args.agent, lambda: _connect(args))
+    _UNAPPLIED.clear()
+    return resume_outcome(cb.fenced(args.agent, lambda: _connect(args)))
 
 
 def _connect(args) -> int:
@@ -375,7 +395,7 @@ def _connect(args) -> int:
 
     def installed() -> int:
         print(cm.served_setup_line(SETUP_VENDOR))
-        return install(argparse.Namespace(**session, work=None, inbox=None, token_env_file=seat["seat_env"],
+        return _install(argparse.Namespace(**session, work=None, inbox=None, token_env_file=seat["seat_env"],
                                           bridge_state_dir=None, root_identity=seat["root_id"]))
     return cb.finish_connect(seat, installed, COMMAND, cb.session_flags(args))
 

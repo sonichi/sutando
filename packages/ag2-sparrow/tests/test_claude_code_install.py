@@ -225,9 +225,10 @@ class ConnectInstall(ConnectBase):
         self.assertEqual(inbox.prepare_root(str(self.work)), "")
         records.save_supervisor(str(self.work), dict(records.empty_supervisor(), generation=live))
         rc, out, err = self.install_with(runner, False, "--resume-session", self.RESUMED)
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, cli.EXIT_RESUME_NOT_APPLIED, err)
         self.assertIn(f"kept the session id {first}", out)
-        self.assertIn(f"--resume-session {self.RESUMED} was not applied", err)
+        self.assertIn(f"error: --resume-session {self.RESUMED} was not applied", err)
+        self.assertIsNotNone(runner.pid(), "the job is installed and running under the kept id")
         self.assertEqual(cli.read_config(cli.config_path())["SESSION_ID"], first)
         dead = subprocess.Popen(["sleep", "0"]); dead.wait()
         records.save_supervisor(str(self.work), dict(records.empty_supervisor(), generation=dict(live, server_pid=dead.pid,
