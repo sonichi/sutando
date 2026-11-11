@@ -108,7 +108,9 @@ class Add(Base):
         fake = ConnectFake(self.backend)
         out = self.connect(fake, display_name="Reviewer")
         self.assertEqual((out["agent_id"], out["status"]), (NEW_AGENT, "ok"))
-        self.assertEqual(fake.started, [{"label": "reviewer", "display_name": "Reviewer"}])
+        core = dc.pp.core_lane(self.ws, None)["agent_mxid"]
+        self.assertEqual(fake.started, [{"label": "reviewer", "display_name": "Reviewer",
+                                         "welcome": "worker", "welcome_core": core}])
         row = C.worker_identity(W, self.ws)
         self.assertEqual(row["agent_mxid"], NEW_AGENT)
         self.assertEqual(C.secret_of(self.vault.store[row["token_ref"]]), fake.bearer)
@@ -329,6 +331,7 @@ class Rotate(Base):
                 instance=instance, secret=C.secret_of(token)) or {"instance": instance}):
             out = self.connect(again, rotate=True)
         self.assertEqual((out["agent_id"], out["status"]), (NEW_AGENT, "rotated"))
+        self.assertNotIn("welcome", again.started[-1])
         self.assertEqual(updated, {"instance": C.worker_identity(W, self.ws)["instance"], "secret": again.bearer})
 
     def test_rotate_needs_an_agent(self):
