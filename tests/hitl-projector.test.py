@@ -871,6 +871,35 @@ class NoticesOnARefusedPassTests(_RefusalDrive):
         self.assertEqual(raised.code, 400, "the notice failure never masks the card refusal")
         self.assertIs(raised.projection, got)
 
+    def test_a_notice_failure_does_not_skip_the_next_due_notice(self):
+        """Two cards whose reminders are both due in the same pass: the first notice's send
+        raises, but the second is still sent, and the raised exception reaches the caller only
+        after every due notice has been attempted (review of #5472 / main's own notice gap)."""
+        a = self.card("a")
+        b = self.card("b")
+        self.drive(self.sent)  # accepts both cards, no notices due yet
+        self.sent.sent.clear()
+        calls = []
+
+        def flaky(payload):
+            calls.append(payload)
+            if len(calls) == 1:
+                raise RuntimeError("notice transport down")
+            return self.sent(payload)
+
+        self.t += 10 ** 7
+        wall, mono = time.time() + self.t, time.monotonic() + self.t
+        with self.assertRaises(RuntimeError):
+            self.pj.project_pass(self.mgr, flaky, ROOM, clock=lambda: wall, monotonic=lambda: mono)
+        self.assertEqual(len(calls), 2, "the second due notice is still attempted after the first raises")
+        attempted = [p["extra_content"][NOTICE_FIELD]["ids"][0] for p in calls]
+        self.assertEqual(set(attempted), {a.id, b.id}, "each card's own reminder, not a joint one")
+        raised_for, recorded_for = attempted[0], attempted[1]
+        self.assertEqual(self.mgr.store.projection(recorded_for).get("reminders"), 1,
+                         "the notice that DID go out is recorded, so it is not re-sent")
+        self.assertEqual(self.mgr.store.projection(raised_for).get("reminders") or 0, 0,
+                         "the notice that raised is NOT recorded, so it retries next pass")
+
     def test_a_failed_card_is_announced_once_per_revision_across_a_restart(self):
         req = self.mgr.create(make_req(kind="choice", guard="q", message="Pick a deploy target\nmore",
                                        device={"id": "dq", "name": "n"},
