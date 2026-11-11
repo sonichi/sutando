@@ -220,7 +220,7 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    status, run:
 
    ```bash
-   python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE"   # rc=1 => a task got no result
+   python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE"   # rc=1 => unanswered work needs attention
    ```
 
    A task file stays in `tasks/` until a result is written and the bridge archives it, so
@@ -229,7 +229,13 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    in the transcript, the terminal shows it, and only the queue disagrees. Measured five
    times in one session, caught every time by re-listing by hand and never once by recall —
    which is why this is a command and not a reminder. It fires only on tasks older than
-   `--min-age-sec` (default 120), so a task still in flight is never flagged.
+   `--min-age-sec` (default 120). A task held only by non-exclusive service claims
+   is also reported when every claim is more than 600 seconds old and no live
+   background delegation holds it. That warning calls for inspecting the claimant;
+   ownership remains intact and the core must not answer the task merely because
+   the warning appeared. Fresh claims and ordinary worker deliveries remain held.
+   `--json` carries the same verdict and exit code, while preserving the task's
+   claimed status. Exit 2 means the evidence could not be read, never an empty queue.
 
 1.5. **Re-arm connector waits.** When the owner asks for something that needs an app they have not
    connected, the `connect-apps` skill posts a Connect card, records a wait under

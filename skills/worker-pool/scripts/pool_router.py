@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 import pool_attribution as pa  # noqa: E402
+import pool_claim_policy as pcp  # noqa: E402
 import pool_delivery as pd  # noqa: E402
 import pool_record as prec  # noqa: E402
 import pool_roster as pr  # noqa: E402
@@ -123,28 +124,15 @@ def holders(workspace, task_id: str, _between_suffix_checks=None, _arbitration_s
             if not holds:
                 continue    # a marker only matters where this task is held: no roster read otherwise
             marker = pd.regular_file_state(pd.NON_EXCLUSIVE_MARKER, dir_fd=dfd)
-            if marker == "absent":
-                held.append(folder.name)
-                continue
-            if marker != "regular":
-                raise UnreadableEvidence(f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} is {marker}; refusing to decide")
-            # A marker may only mean "outside the roster": on a real recipient it would hide its deliveries.
-            if snapshot is None:
+            if marker == "regular" and snapshot is None:
                 snapshot = (pr.load_roster(workspace),)
-            r = snapshot[0]
-            if r is None:
-                raise UnreadableEvidence(
-                    f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} found but the roster is unreadable; refusing to decide")
             try:
-                if not isinstance(r, dict) or not isinstance(r.get("workers"), dict):
-                    raise pr.RosterError("roster 'workers' must be an object")
-                pr.validate_workers(r["workers"])
-            except pr.RosterError as e:
+                non_exclusive = pcp.is_non_exclusive(folder.name, marker, snapshot[0] if snapshot else None)
+            except pcp.InvalidClaimMarker as e:
                 raise UnreadableEvidence(
-                    f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} found but the roster is malformed ({e}); refusing to decide") from e
-            if not pr.unknown_targets(r, [folder.name]):
-                raise UnreadableEvidence(
-                    f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} marks roster recipient {folder.name!r}; refusing to decide")
+                    f"{task_id}: {folder / pd.NON_EXCLUSIVE_MARKER} {e}") from e
+            if not non_exclusive:
+                held.append(folder.name)
         finally:
             lock.__exit__(None, None, None)
     return held

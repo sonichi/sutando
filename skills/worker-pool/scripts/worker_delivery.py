@@ -26,7 +26,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from pool_delivery import ACCEPTED_SUFFIX, LEGACY_ACCEPTED_SUFFIX, PENDING_SUFFIX
+from pool_delivery import ACCEPTED_SUFFIX, LEGACY_ACCEPTED_SUFFIX, PENDING_SUFFIX, NON_EXCLUSIVE_MARKER, regular_file_state
+import pool_claim_policy
+import pool_roster
 
 #: The router's stages, spelled once in pool_delivery; a new stage is added there.
 SENTINEL_SUFFIXES = (PENDING_SUFFIX, ACCEPTED_SUFFIX, LEGACY_ACCEPTED_SUFFIX)
@@ -70,3 +72,50 @@ def holder_of(workspace: Path, task_id: str) -> str | None:
             if _sentinel_present(recipient / f"{task_id}{suffix}"):
                 return recipient.name
     return None
+
+
+def holder_evidence(workspace: Path, task_id: str, *, now: float) -> list[dict]:
+    """Read every holder and its youngest sentinel's age without creating locks.
+    Unreadable or malformed evidence is undecidable, never an expired assignment."""
+    deliveries = Path(workspace) / "deliveries"
+    try:
+        recipients = sorted(p for p in deliveries.iterdir() if _is_dir(p))
+    except FileNotFoundError:
+        return []
+    out, roster = [], None
+    roster_loaded = False
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    for recipient in recipients:
+        try:
+            dfd = os.open(recipient, flags)
+        except FileNotFoundError:
+            continue
+        try:
+            mtimes = []
+            for suffix in SENTINEL_SUFFIXES:
+                name = f"{task_id}{suffix}"
+                try:
+                    fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), dir_fd=dfd)
+                except FileNotFoundError:
+                    continue
+                try:
+                    st = os.fstat(fd)
+                finally:
+                    os.close(fd)
+                if not _stat.S_ISREG(st.st_mode):
+                    raise OSError(f"{recipient / name} is non-regular; refusing to decide")
+                mtimes.append(st.st_mtime)
+            if not mtimes:
+                continue
+            marker = regular_file_state(NON_EXCLUSIVE_MARKER, dir_fd=dfd)
+            if marker == "regular" and not roster_loaded:
+                roster, roster_loaded = pool_roster.load_roster(workspace), True
+            try:
+                non_exclusive = pool_claim_policy.is_non_exclusive(recipient.name, marker, roster)
+            except pool_claim_policy.InvalidClaimMarker as exc:
+                raise OSError(f"{recipient / NON_EXCLUSIVE_MARKER} {exc}") from exc
+            out.append({"recipient": recipient.name, "non_exclusive": non_exclusive,
+                        "claim_age_s": max(0.0, now - max(mtimes))})
+        finally:
+            os.close(dfd)
+    return out

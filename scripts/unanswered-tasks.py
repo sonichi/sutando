@@ -8,10 +8,8 @@ answers in its own transcript, the terminal shows the reply, and only the queue
 disagrees. Measured five times in one session, caught every time by re-listing
 by hand and never by recall.
 
-Exit 1 when a task older than --min-age-sec has no result AND nobody holds it
-(src/task_delegation.py:holder), 0 otherwise, 2 when the answer cannot be
-decided. A task the router gave a worker, or the core handed to a live background
-agent, is not the core's to answer now, so counting it here reports work it must not redo.
+Exit 1 for an old unanswered task with no holder, or only stale service claims;
+0 otherwise, 2 when undecidable. A reported claim remains held: inspect, never redo.
 
 The third code exists because 1 and "cannot decide" must not share one: an
 unreadable deliveries/ says nothing about who holds a task, and reporting that
@@ -66,19 +64,26 @@ def _unanswered_reason(results: Path, task_id: str, tasks: Path | None = None) -
 
 
 _POOL_SCRIPTS = _SRC.parent / "skills" / "worker-pool" / "scripts"
+STALE_CLAIM_SEC = 600.0
+CLAIM_INSPECTION_NOTICE = "inspect the claimant; task remains held"
 
 
-def _pool_holder(workspace: Path, task_id: str) -> str | None:
-    """Delegated to the worker-pool skill's worker_delivery.py. The skill is
-    optional: without it there is no router, so no worker can hold a task."""
+def _pool_delivery():
+    """The optional skill owns delivery evidence; absence means no pool."""
     try:
         os.stat(_POOL_SCRIPTS / "worker_delivery.py")
     except FileNotFoundError:
         return None
     # Any other stat failure propagates: an unreadable skill is not an absent one.
-    sys.path.insert(0, str(_POOL_SCRIPTS))
-    from worker_delivery import holder_of  # noqa: E402
-    return holder_of(workspace, task_id)
+    if str(_POOL_SCRIPTS) not in sys.path:
+        sys.path.insert(0, str(_POOL_SCRIPTS))
+    import worker_delivery  # noqa: E402
+    return worker_delivery
+
+
+def _pool_holder(workspace: Path, task_id: str) -> str | None:
+    pool = _pool_delivery()
+    return pool.holder_of(workspace, task_id) if pool is not None else None
 
 
 def _holder(workspace: Path, task_id: str, task_file: Path | None = None) -> str | None:
@@ -86,27 +91,49 @@ def _holder(workspace: Path, task_id: str, task_file: Path | None = None) -> str
     return task_delegation.holder(workspace, task_id, task_file=task_file, worker_holder=_pool_holder)
 
 
+def _claim_diagnostic(workspace: Path, task_id: str, task_file: Path, now: float) -> tuple:
+    """Report stale service-only claims without changing who owns the task."""
+    import task_delegation
+    pool = _pool_delivery()
+    evidence = pool.holder_evidence(workspace, task_id, now=now) if pool is not None else []
+    if not evidence or task_delegation.is_delegated(workspace, task_id, task_file=task_file, now=now):
+        return None, evidence
+    if not all(row["non_exclusive"] and row["claim_age_s"] > STALE_CLAIM_SEC for row in evidence):
+        return None, evidence
+    names = ", ".join(row["recipient"] for row in evidence)
+    age = min(row["claim_age_s"] for row in evidence)
+    return (f"held only by non-exclusive claimant {names} for {age / 60:.1f}m; "
+            f"{CLAIM_INSPECTION_NOTICE}"), evidence
+
+
 def unanswered(workspace: Path, min_age_sec: float, now: float | None = None) -> list[tuple[str, float, str]]:
     _markers()  # resolve up front: an empty queue must not silently skip the guard
+    from local_task_protocol import valid_archive_lookup_id
+    from task_archive import task_id_for
     now = time.time() if now is None else now
     tasks, results = workspace / "tasks", workspace / "results"
     out: list[tuple[str, float, str]] = []
     if not tasks.is_dir():
         return out
     for f in sorted(tasks.glob("task-*.txt")):
+        task_id = task_id_for(f, accept=valid_archive_lookup_id)
+        if task_id is None:
+            continue
         age = now - f.stat().st_mtime
         if age < min_age_sec:
             continue  # still plausibly in flight
-        holder = _holder(workspace, f.stem, f)
+        holder = _holder(workspace, task_id, f)
         if holder is not None:
-            # Not the core's to report: the router made it that worker's. Said
-            # on stderr so a genuinely stuck holder stays visible to a human.
-            print(f"unanswered-tasks: {f.stem} held by {holder} ({age/60:.0f}m) — not the core's to answer",
+            reason, _ = _claim_diagnostic(workspace, task_id, f, now)
+            if reason is not None and _unanswered_reason(results, task_id, tasks) is not None:
+                out.append((task_id, age, reason))
+                continue
+            print(f"unanswered-tasks: {task_id} held by {holder} ({age/60:.0f}m) — not the core's to answer",
                   file=sys.stderr)
             continue
-        reason = _unanswered_reason(results, f.stem, tasks)
+        reason = _unanswered_reason(results, task_id, tasks)
         if reason is not None:
-            out.append((f.stem, age, reason))
+            out.append((task_id, age, reason))
     return out
 
 
@@ -156,14 +183,16 @@ def snapshot(workspace: Path, min_age_sec: float, now: float | None = None,
         headers = parse_task_headers_lenient(f.read_text(errors="replace")).headers
         intake = status_ack_policy.intake_at(task_id, headers)
         phase, holder = _phase(workspace, task_id), _holder(workspace, task_id, f)
+        claim_reason, evidence = _claim_diagnostic(workspace, task_id, f, now) if holder is not None else (None, [])
         reason = _unanswered_reason(results, task_id, tasks)
         claimed = holder is not None or phase in _CLAIMED_PHASES
         age = None if intake is None else max(0.0, now - intake)
         pending = not (claimed or reason is None)
-        flagged = reason if holder is None and now - mtime >= min_age_sec else None
+        flagged = (claim_reason if holder is not None else reason) if now - mtime >= min_age_sec and reason else None
         out.append({"task_id": task_id, "file": f.name, "intake_at": intake, "intake_known": intake is not None,
                     "age_s": age, "mtime_age_s": now - mtime, "phase": phase, "holder": holder,
                     "answered": reason is None, "claimed": claimed,
+                    "delivery_holders": evidence,
                     "unclaimed_age_s": age if pending else None, "unanswered": flagged})
     waiting = [t for t in out if t["unclaimed_age_s"] is not None]
     unknown = [t["task_id"] for t in out if not t["intake_known"] and not (t["claimed"] or t["answered"])]
@@ -215,7 +244,8 @@ def main() -> int:
         print("unanswered-tasks: none")
         return 0
     for task_id, age, reason in rows:
-        print(f"UNANSWERED {task_id} ({age / 60:.1f}m old) — {reason}; the room heard nothing")
+        suffix = "" if reason.endswith(CLAIM_INSPECTION_NOTICE) else "; the room heard nothing"
+        print(f"UNANSWERED {task_id} ({age / 60:.1f}m old) — {reason}{suffix}")
     return 1
 
 

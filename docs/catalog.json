@@ -483,7 +483,7 @@
    ],
    "status": "canonical",
    "canonical_for": "why each proactive-loop step exists: the measurement, the incident and the reasoning the skill file no longer carries",
-   "last_verified": "2026-11-06"
+   "last_verified": "2026-11-11"
   },
   "docs/recovery-issue-metrics.md": {
    "title": "Recovery issue metrics",
@@ -503,7 +503,7 @@
    ],
    "status": "draft",
    "canonical_for": "the v1 worker pool: durable worker identities and run history, zero-byte delivery sentinels under deliveries/<recipient>/ with the payload immutable in tasks/, the router as the core watcher's task-event handler over an owner-declared, core-compiled roster (unknown targets go to the core; liveness never routes), residue-based recovery, and the Phase 1 / Phase 2 split",
-   "last_verified": "2026-11-06"
+   "last_verified": "2026-11-11"
   },
   "docs/worker-pool-design-notes.md": {
    "title": "Worker pool — design notes",
