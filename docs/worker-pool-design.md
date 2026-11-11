@@ -559,6 +559,8 @@ keeps it out of this diagnostic. The claim age comes from the sentinel's mtime,
 not the task's age. Text and `--json` modes exit 1 for this condition; unreadable
 claim evidence exits 2 rather than reporting an empty queue. JSON retains the
 task's holder and claimed status, so the warning does not describe it as unclaimed.
+Ownership readers count even dangling sentinel symlinks as held; this diagnostic
+requires regular sentinels without following links, so a symlink exits 2.
 
 Inspect the claimant before deciding how to recover. The diagnostic does not
 expire ownership, remove sentinels, requeue work, or tell the core to answer it.
