@@ -64,7 +64,9 @@ def make_handler(root: Path, capability: str, port: int, expires_at: float):
             except UnicodeDecodeError:
                 return self._deny(404, "not found")
             parts = path.lstrip("/").split("/", 1)
-            if not hmac.compare_digest(parts[0], capability):
+            # Bytes, so a non-ASCII path segment is a mismatch rather than a TypeError.
+            if not hmac.compare_digest(parts[0].encode("utf-8", "surrogatepass"),
+                                       capability.encode("utf-8")):
                 return self._deny(404, "not found")
             rel = parts[1] if len(parts) > 1 and parts[1] else "index.html"
             if "\x00" in rel or ".." in rel.split("/"):

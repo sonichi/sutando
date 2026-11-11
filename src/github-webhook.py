@@ -35,6 +35,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
+from secret_compare import secret_equal  # noqa: E402
 
 WORKSPACE_DIR = resolve_workspace()
 TASKS_DIR = WORKSPACE_DIR / "tasks"
@@ -77,12 +78,12 @@ def verify_github_signature(body: bytes, signature_header: str) -> bool:
         return False
     if not signature_header:
         return False
-    if not signature_header.startswith("sha256="):
+    if not isinstance(signature_header, str) or not signature_header.startswith("sha256="):
         return False
     expected = "sha256=" + hmac.new(
         WEBHOOK_SECRET.encode("utf-8"), body, hashlib.sha256
     ).hexdigest()
-    return hmac.compare_digest(expected, signature_header)
+    return secret_equal(signature_header, expected)
 
 # Events we care about and how to summarize them
 def format_event(event_type: str, payload: dict):
