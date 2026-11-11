@@ -508,8 +508,9 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
         if _ensure_notice(workspace, hold, card_entry, now):
             _write_hold(workspace, hold)
         return Decision(False, hold, status_line(hold))
-    switched = bool(hold and launch_account and hold.get("account")
-                    and hold.get("account") != launch_account)
+    # Who ran last: the record's account, else the launcher a released legacy hold remembered.
+    last = (hold or {}).get("account") or (hold or {}).get("launch_account")
+    switched = bool(launch_account and last and last != launch_account)
     since = now if switched else (hold or {}).get("account_at")
     if quota is None:
         rec = qa.read_quota_record(workspace, now)
@@ -555,6 +556,9 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
     was_held = bool(hold and hold.get("status") == "held")
     if was_held:
         hold = dict(hold, status="released", released_at=now)
+        if launch_account and not hold.get("account"):
+            # Not the old limit's owner, only who launched: the next switch is seen against it.
+            hold["launch_account"] = launch_account
     if switched:
         hold = dict(hold, account=launch_account, account_at=now)
     # Record the launch account on any record that carries none: a switch is only seen against it.

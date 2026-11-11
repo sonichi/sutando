@@ -799,6 +799,25 @@ class AccountChange(unittest.TestCase):
         self.assertFalse(clh.decide(self.ws, t, quota=limited_record(t, ago=30), launch_account="B").launch)
         self.assertNotIn("account", clh.read_hold(self.ws))
 
+    def test_the_launch_that_expires_a_legacy_hold_is_remembered_so_the_next_switch_is_seen(self):
+        """A expires a legacy hold (no account on it) and launches; A is then refused and the
+        owner signs in to B. The record must remember that A launched, or A's refusal holds B."""
+        legacy = {"status": "held", "kind": "usage-limit", "model": None, "strikes": 1,
+                  "reason": "core paused: usage limit on its model, retrying later",
+                  "notice": "legacy.txt", "notice_queued": True}
+        for next_account, launches in (("B", True), ("A", False)):
+            with self.subTest(next_account=next_account):
+                t = time.time() + 5000
+                clh._write_hold(self.ws, dict(legacy, evidence_at=t - 30, set_at=t - 20, until=t - 1))
+                self.assertTrue(clh.decide(self.ws, t, quota=limited_record(t, ago=30), launch_account="A").launch)
+                record = clh.read_hold(self.ws)
+                self.assertNotIn("account", record, "the old limit was pinned on the account that outlived it")
+                self.assertEqual(record["launch_account"], "A")
+                # A is refused ten seconds before the next launch.
+                after = clh.decide(self.ws, t + 20, quota=limited_record(t + 20, ago=10), launch_account=next_account)
+                self.assertEqual(after.launch, launches,
+                                 "account A's refusal held account B" if launches else "account A's own refusal did not hold it")
+
     def test_a_released_or_cleared_record_without_an_account_still_learns_the_launch_account(self):
         """A record left by an earlier hold (released by the gate, or cleared by the owner) from
         before accounts were recorded carries none. The next launch must write its account down,
