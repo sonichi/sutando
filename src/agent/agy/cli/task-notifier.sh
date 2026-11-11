@@ -206,7 +206,7 @@ deliver_prompt() {
   wait_for_core_idle || { log_notifier "core not idle -- refusing to send for $filename"; return 1; }
   while :; do
     baseline="$(pane_capture)"
-    tmux -S "$TMUX_SOCKET" send-keys -t "=$SESSION:" -l -- "$prompt"
+    bash "$REPO/src/tmux-pane-keys.sh" --python "$NOTIFIER_PY" -S "$TMUX_SOCKET" -t "=$SESSION:" -- -l -- "$prompt"
     waited=0
     while [ "$waited" -lt "$TYPE_CONFIRM_TIMEOUT_TICKS" ]; do
       if prompt_is_staged "$filename" "$baseline"; then staged=1; break 2; fi
@@ -217,7 +217,7 @@ deliver_prompt() {
     [ "$type_tries" -ge 2 ] && break
     log_notifier "typed prompt for $filename did not stage; retyping"
   done
-  tmux -S "$TMUX_SOCKET" send-keys -t "=$SESSION:" Enter
+  bash "$REPO/src/tmux-pane-keys.sh" --python "$NOTIFIER_PY" -S "$TMUX_SOCKET" -t "=$SESSION:" -- C-m
   [ "$staged" = 1 ] || { log_notifier "prompt for $filename sent unverified (never observed staged)"; return 0; }
   # Confirmed by the pane going BUSY, not by the marker vanishing — it stays
   # visible as sent history, so that check always read "still staged."
@@ -230,7 +230,7 @@ deliver_prompt() {
     waited=$((waited + 1))
   done
   log_notifier "prompt not yet submitted after Enter for $filename; re-pressing once"
-  tmux -S "$TMUX_SOCKET" send-keys -t "=$SESSION:" Enter
+  bash "$REPO/src/tmux-pane-keys.sh" --python "$NOTIFIER_PY" -S "$TMUX_SOCKET" -t "=$SESSION:" -- C-m
 }
 
 submit_task() {

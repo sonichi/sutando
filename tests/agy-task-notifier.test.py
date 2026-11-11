@@ -39,6 +39,7 @@ REPO = Path(os.environ.get(
 NOTIFIER = REPO / "src/agent/agy/cli/task-notifier.sh"
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 from clean_watcher_env import clean_env  # noqa: E402
+from _helpers.process_group import popen_bound  # noqa: E402
 
 BUSY_MARKER = "esc to cancel"
 IDLE_MARKER = "? for shortcuts"
@@ -78,6 +79,7 @@ class FakeTmuxHarness(unittest.TestCase):
         script = self.bin / "tmux"
         pane_width = self.pane_width if self.pane_width else 0
         script.write_text(f'''#!/bin/bash
+. "{REPO}/tests/lib/tmux-fake-unwrap.sh"
 [ "${{1:-}}" = -S ] && shift 2
 cmd="$1"; shift
 FIXED_ROWS=12
@@ -478,14 +480,13 @@ class MainLoopWiringTest(FakeTmuxHarness):
     def test_dropped_task_file_is_picked_up_by_the_real_watcher(self):
         if shutil.which("fswatch") is None:
             self.skipTest("fswatch not installed on this host")
-        proc = subprocess.Popen(
+        proc = popen_bound(
             ["/bin/bash", str(NOTIFIER)],
             env=self._env(),
             cwd=str(self.root),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
         try:
             self.wait_for_watcher_ready()
@@ -530,14 +531,13 @@ class MainLoopWiringTest(FakeTmuxHarness):
         })
         # No SUTANDO_INSTANCE_ID here: left to the notifier's own resolved_instance_id(),
         # which exports "" for this canonical inbox -- the empty-but-present case.
-        proc = subprocess.Popen(
+        proc = popen_bound(
             ["/bin/bash", str(NOTIFIER)],
             env=env,
             cwd=str(self.root),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
         try:
             self.wait_for_watcher_ready()
@@ -588,14 +588,13 @@ class MainLoopWiringTest(FakeTmuxHarness):
             "SUTANDO_INBOX_RESOLVER_TIMEOUT": "5",
             "SUTANDO_POOL_DELIVERY_SCRIPT": str(REPO / "skills/worker-pool/scripts/pool_delivery.py"),
         })
-        proc = subprocess.Popen(
+        proc = popen_bound(
             ["/bin/bash", str(NOTIFIER)],
             env=env,
             cwd=str(self.root),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
         try:
             state_dir = noncanon_tasks.parent / "state"
@@ -640,14 +639,13 @@ class MainLoopWiringTest(FakeTmuxHarness):
         # must be skipped there, or every wake re-offers it and nothing behind it runs.
         if shutil.which("fswatch") is None:
             self.skipTest("fswatch not installed on this host")
-        proc = subprocess.Popen(
+        proc = popen_bound(
             ["/bin/bash", str(NOTIFIER)],
             env=self._env(),
             cwd=str(self.root),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
         try:
             self.wait_for_watcher_ready()
@@ -685,14 +683,13 @@ class MainLoopWiringTest(FakeTmuxHarness):
         if shutil.which("fswatch") is None:
             self.skipTest("fswatch not installed on this host")
         self.pane_file.write_text(BUSY_MARKER + "\n")
-        proc = subprocess.Popen(
+        proc = popen_bound(
             ["/bin/bash", str(NOTIFIER)],
             env=self._env(),
             cwd=str(self.root),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
         try:
             self.wait_for_watcher_ready()
@@ -737,14 +734,13 @@ class MainLoopWiringTest(FakeTmuxHarness):
         # a busy gap between them must still retry, not silently drop.
         if shutil.which("fswatch") is None:
             self.skipTest("fswatch not installed on this host")
-        proc = subprocess.Popen(
+        proc = popen_bound(
             ["/bin/bash", str(NOTIFIER)],
             env=self._env(),
             cwd=str(self.root),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
         try:
             self.wait_for_watcher_ready()
@@ -811,14 +807,13 @@ class MainLoopWiringTest(FakeTmuxHarness):
             env.pop(var, None)
         state_dir = self.tasks_dir.parent / "state"
         canonical_sentinel = state_dir / "watch-tasks-stream.pid"
-        proc = subprocess.Popen(
+        proc = popen_bound(
             ["/bin/bash", str(NOTIFIER)],
             env=env,
             cwd=str(self.root),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
         try:
             deadline = time.time() + 10
@@ -863,14 +858,13 @@ class MainLoopWiringTest(FakeTmuxHarness):
         state_dir = self.tasks_dir.parent / "state"
         foreign_sentinel = state_dir / "watch-tasks-stream-local-agent+shared-worker.pid"
         expected_sentinel = state_dir / "watch-tasks-stream.pid"
-        proc = subprocess.Popen(
+        proc = popen_bound(
             ["/bin/bash", str(NOTIFIER)],
             env=env,
             cwd=str(self.root),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
         try:
             deadline = time.time() + 10
@@ -909,7 +903,7 @@ class MainLoopWiringTest(FakeTmuxHarness):
         core_env = self._env()
         for var in ("SUTANDO_INSTANCE_ID", "SUTANDO_AGENT_ID", "AGENT_MXID", "AGENT_ID"):
             core_env.pop(var, None)
-        core_proc = subprocess.Popen(
+        core_proc = popen_bound(
             ["/bin/bash", str(REPO / "src/watch-tasks-stream.sh"), str(self.tasks_dir),
              "--role", "session", "--inbox", str(self.tasks_dir)],
             env=core_env,
@@ -917,7 +911,6 @@ class MainLoopWiringTest(FakeTmuxHarness):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
         try:
             deadline = time.time() + 15
@@ -935,14 +928,13 @@ class MainLoopWiringTest(FakeTmuxHarness):
             })
             for var in ("SUTANDO_INSTANCE_ID", "SUTANDO_AGENT_ID", "AGENT_MXID", "AGENT_ID"):
                 agy_env.pop(var, None)
-            agy_proc = subprocess.Popen(
+            agy_proc = popen_bound(
                 ["/bin/bash", str(NOTIFIER)],
                 env=agy_env,
                 cwd=str(self.root),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                start_new_session=True,
             )
             try:
                 deadline = time.time() + 15
@@ -999,14 +991,13 @@ class RestartHandoffTest(FakeTmuxHarness):
     own initial sweep -- and exactly once, never zero times, never twice."""
 
     def _spawn(self):
-        return subprocess.Popen(
+        return popen_bound(
             ["/bin/bash", str(NOTIFIER)],
             env=self._env(),
             cwd=str(self.root),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            start_new_session=True,
         )
 
     def _terminate(self, proc):
