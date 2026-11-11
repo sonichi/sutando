@@ -62,6 +62,11 @@ if [ "${SUTANDO_CODEX_AUTO_RESET_ENABLED+x}" = x ]; then
   ENV_ARGS+=(-e "SUTANDO_CODEX_AUTO_RESET_ENABLED=$SUTANDO_CODEX_AUTO_RESET_ENABLED")
 fi
 
+# The seat's s-space MCP proxy asks this resolver whose agent to mint as; the token stays in the vault.
+. "$REPO/skills/worker-pool/scripts/worker-mcp-credential.sh"
+MCP_WORKER_CREDENTIAL="$(worker_mcp_credential "$REPO" "$WORKER_PY" "${SUTANDO_WORKER_ID:-$SUTANDO_INSTANCE_ID}" "$SUTANDO_WORKSPACE_DIR")"
+ENV_ARGS+=(-e "AG2_MCP_WORKER_CREDENTIAL=$MCP_WORKER_CREDENTIAL")
+
 if [ "${1:-}" = "--print-env" ]; then
   printf '%s\n' "${ENV_ARGS[@]}"
   exit 0
@@ -90,6 +95,26 @@ CODEX_ARGS=(-C "$WORKING_DIR" --add-dir "$HOME" --sandbox danger-full-access
             --ask-for-approval never --search --no-alt-screen
             # Headless like the core: an interactive startup update menu would block it.
             -c check_for_update_on_startup=false)
+# Headless: Codex's trust prompt would hold the seat, and answering it trusts the whole enclosing repo.
+# Record the worker's own folder only; a `-c projects...` override does not answer the prompt.
+# With no Sutando Codex home the file would be the user's own ~/.codex config: leave that to them.
+if [ -z "${CODEX_HOME:-}" ]; then
+  echo "launch-codex-worker-session: no Sutando Codex home; not recording trust in the user's own Codex config, so $SESSION may wait on Codex's trust prompt" >&2
+elif ! trust_out="$("$WORKER_PY" "$REPO/src/codex_project_trust.py" --folder-only "$CODEX_HOME" "$WORKING_DIR" 2>&1)"; then
+  echo "launch-codex-worker-session: could not record trust for $WORKING_DIR ($trust_out); $SESSION may wait on Codex's trust prompt" >&2
+fi
+# Codex passes a stdio MCP server only the variables its entry names: the seat's s-space entry names both.
+claude_dir="$(bash "$REPO/scripts/sutando-config.sh" claude-sutando-config-dir 2>/dev/null || true)"
+if mcp_out="$("$WORKER_PY" "$REPO/skills/worker-pool/scripts/codex_worker_mcp.py" \
+    --codex-home "${CODEX_HOME:-$HOME/.codex}" --claude-config-dir "$claude_dir")"; then
+  [ -n "$mcp_out" ] || echo "launch-codex-worker-session: no s-space MCP server is registered; $SESSION has no s-space tools" >&2
+  case "$mcp_out" in *".enabled=false"*) echo "launch-codex-worker-session: the s-space MCP server registered is not one the worker can be passed to; it is off for $SESSION" >&2 ;; esac
+  while IFS= read -r arg; do if [ -n "$arg" ]; then CODEX_ARGS+=("$arg"); fi; done <<< "$mcp_out"
+else
+  # Fail closed: the home's own entry passes neither name through, so its proxy would act as the core.
+  echo "launch-codex-worker-session: could not compose the seat's s-space MCP server; not starting $SESSION rather than let its tools act as the core's agent" >&2
+  exit 1
+fi
 tmux -S "$SOCKET" new-session -d -s "$SESSION" "${ENV_ARGS[@]}" \
   codex "${CODEX_ARGS[@]}" "$BOOT_PROMPT"
 for i in 1 2 3 4 5 6 7 8 9 10; do

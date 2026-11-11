@@ -11,7 +11,9 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # --- a fake repo: the real launcher, stub helpers -----------------------------
 FAKE="$TMP/repo"
 mkdir -p "$FAKE/skills/worker-pool/scripts" "$FAKE/scripts" "$FAKE/src/agent/codex/cli" "$FAKE/skills/proactive-loop/scripts"
-cp "$REPO/skills/worker-pool/scripts/launch-codex-worker-session.sh" "$FAKE/skills/worker-pool/scripts/"
+for f in launch-codex-worker-session.sh worker-mcp-credential.sh codex_worker_mcp.py; do
+  cp "$REPO/skills/worker-pool/scripts/$f" "$FAKE/skills/worker-pool/scripts/"
+done
 cp "$REPO/src/agent/launch-path.sh" "$FAKE/src/agent/"
 printf '#!/bin/bash\necho ""\n' > "$FAKE/scripts/sutando-config.sh"
 printf 'require_python() { printf "%%s\\n" "$SUTANDO_PY"; }\nresolve_python() { printf "%%s\\n" "$SUTANDO_PY"; }\n' > "$FAKE/scripts/python-binary.sh"

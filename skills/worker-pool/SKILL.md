@@ -150,7 +150,9 @@ session"). A task a core lane routed to the worker is still answered as the core
 `s-space` MCP tools mint as the worker's agent too: the launcher exports `AG2_MCP_WORKER_CREDENTIAL`, the
 argv of `scripts/connections.py worker-mcp-credential`, which hands the desktop's MCP proxy the worker's vault
 token in memory, or tells it `acts_as: core` for a worker with no enabled identity; with no resolver the proxy
-refuses rather than guess (a Codex seat's proxy inherits no environment and does not take this path yet).
+refuses rather than guess. A Codex seat's proxy inherits only the variables its entry names, so the Codex launcher
+starts it with the desktop's `s-space` registration (the Codex home's, else the Claude config dir's) plus `env_vars`
+naming `SUTANDO_WORKER_ID` and `AG2_MCP_WORKER_CREDENTIAL` (`codex_worker_mcp.py`); if that cannot be composed the launcher refuses to start the seat.
 
 ```bash
 python3 skills/worker-pool/scripts/pool_identity.py add <worker> --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"
