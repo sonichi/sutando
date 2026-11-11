@@ -366,12 +366,18 @@ add_task_watch_mod() {
   TASK_WATCH_MOD=""
   CLAUDE_BIN=""
   [ "${1:-}" = "1" ] || return 0
-  local dir="$REPO/src/agent/claude/task-watch-mod" min have
+  local dir="$REPO/src/agent/claude/task-watch-mod" min have out
   CLAUDE_BIN="$(PATH="$(claude_pane_path)"; hash -r; command -v claude 2>/dev/null)" || CLAUDE_BIN=""
   case "$CLAUDE_BIN" in /*) ;; *) CLAUDE_BIN="" ;; esac
   min="$(sed -n "s/^export const MIN_CLAUDE_VERSION = '\([0-9.]*\)'.*/\1/p" "$dir/hooks/version.ts" 2>/dev/null)" || min=""
-  # A missing Mod or a missing/silent claude must not end a `set -e` launcher: both mean "keep the Monitor".
-  have="$([ -n "$CLAUDE_BIN" ] && "$CLAUDE_BIN" --version 2>/dev/null | awk 'NR==1 {print $1}')" || have=""
+  # A missing, silent or hung claude must neither end a `set -e` launcher nor stall it: all mean "keep the Monitor".
+  # Read from a file, not a pipe: a killed claude's own children could hold a pipe open.
+  have=""
+  if [ -n "$CLAUDE_BIN" ] && out="$(mktemp "${TMPDIR:-/tmp}/claude-version.XXXXXX")"; then
+    ( . "$REPO/src/bounded-wait.sh"; run_bounded 5 -- "$CLAUDE_BIN" --version </dev/null >"$out" 2>/dev/null ) || true
+    have="$(awk 'NR==1 {print $1}' "$out" 2>/dev/null)" || have=""
+    rm -f "$out"
+  fi
   if [ -z "$min" ] || [ -z "$have" ] || ! claude_version_at_least "$have" "$min"; then
     echo "task-watch Mod: Claude Code ${have:-unknown} is not at least ${min:-unknown}; this session keeps the Monitor watcher" >&2
     return 0
