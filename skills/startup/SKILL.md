@@ -34,18 +34,10 @@ A pool worker is an instance, not the canonical core. It shares the host's works
    REPO="$(cd "$(dirname "$SUTANDO_WATCHER_CMD")/.." && pwd)"
    H="$(bash "$REPO/scripts/sutando-config.sh" host-label)"
    CF="$SUTANDO_WORKSPACE_DIR/hosts/$H/crons.json"
-   "$SUTANDO_PY" -c "
-   import json, sys
-   sys.path.insert(0, '$REPO/src')
-   from cron_ownership import entries_for_owner
-   try:
-       cfg = json.load(open('$CF'))
-   except FileNotFoundError:
-       cfg = []
-   print(json.dumps(entries_for_owner(cfg, '$SUTANDO_INSTANCE_ID')))"
+   "$SUTANDO_PY" "$REPO/src/cron_prompt_gate.py" "$CF" --owner "$SUTANDO_INSTANCE_ID"
    ```
 
-   The repo root is derived from `$SUTANDO_WATCHER_CMD` rather than assumed from cwd, for the same reason step 2 does. For each entry the filter returns, `CronCreate` it exactly as `/schedule-crons` step 3 would (`prompt_skill` → `/skill-name`; otherwise the `prompt` string) — an entry pinned to a worker is never a `monitor`, `execution: "codex-task"`, or `launchd: true` entry (those ownership models are core-only), so no further filtering is needed. If `crons.json` doesn't exist, or nothing is pinned to `$SUTANDO_INSTANCE_ID`, there is nothing to do here — that is the common case for most workers.
+   The repo root is derived from `$SUTANDO_WATCHER_CMD` rather than assumed from cwd, for the same reason step 2 does. A missing `crons.json` prints `[]`. For each entry the filter returns, `CronCreate` it exactly as `/schedule-crons` step 3 would: `prompt: <registered_prompt>` from the helper's output, which already carries the owner-task gate preamble (`src/cron_prompt_gate.py`; `"gate": false` opts an entry out) — an entry pinned to a worker is never a `monitor`, `execution: "codex-task"`, or `launchd: true` entry (those ownership models are core-only), so no further filtering is needed. If `crons.json` doesn't exist, or nothing is pinned to `$SUTANDO_INSTANCE_ID`, there is nothing to do here — that is the common case for most workers.
 
 3. Report what actually happened, never a fixed line: `start` → `worker <instance> ready: watching <inbox>` (plus `+ N cron(s) registered` when step 2.5 registered any) — unless the watcher's first line is `WATCHER_HELD:`, which means a holder this session did not start (the gate's `why=` names it) still owns the inbox: report that line verbatim, claim no readiness, and leave `--force-restart` to the owner's word; `skip` → `worker <instance> already watching <inbox>` (nothing was started); `unknown` → start NOTHING and report the gate's `why=` verbatim. Reporting readiness after an `unknown` is the failure this step exists to prevent: it claims a watcher that does not exist.
 

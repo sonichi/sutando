@@ -25,6 +25,7 @@ Each entry has:
 - `artifact` (optional string) — the filename STEM of the dated output this job produces, e.g. `"fleet-growth"` for `fleet-growth-2026-08-18.mp4`. Read by `health-check.py`'s `daily-cron-punctuality` probe. Without it the probe infers a stem from the last hyphenated token of the job name, so `talk-events-nightly` looks for `nightly-<date>.*`, never observes the real artifact, and reports the job UNCHECKED forever. Declare it whenever the name does not already equal the stem.
 - `conditional` (optional bool) — set `true` when the job runs on schedule but produces output only if there is new input (a nightly render with no new beats). The punctuality probe then treats "no artifact today" as evidence of nothing rather than a miss; lateness is still measured from the artifacts that do exist.
   On macOS, the Codex core launcher automatically reconciles ordinary fixed-interval entries to this owner because Codex has no session `CronCreate` surface. It preserves `main-loop`, dynamic loops, and entries already owned by `execution: "codex-task"`, and initializes the runner boundary before changing ownership so activation never replays an old action backlog.
+- `gate` (optional bool, default `true`) — whether the registered prompt yields to queued owner work. Step 3 prefixes every `prompt` / `prompt_skill` entry with a `bash scripts/cron-gate.sh --check <name>` preamble (see "Defer crons when owner tasks are queued" below); set `"gate": false` to register the prompt verbatim. The canonical `main-loop` / `prompt_skill: proactive-loop` entry is never gated whatever this says — it is the owner-task handler itself.
 - `owner` (optional string) — which session's `CronCreate` registration this entry belongs to: absent means the core (today's only behavior, unchanged). A worker-pool worker's bare id (the same id `pool_roster.py`/`worker_identity.py` use, e.g. `"d1fc9b10050b490d894947f96627447f"`) pins the entry to that worker instead — that worker's own `/startup` registers it (see `skills/startup/SKILL.md`'s worker section), and step 3 below must skip it here so the two registrations never double-fire the same job. Set this by hand when moving a job that a pinned room's cron output belongs to from the core onto its worker, per `src/cron_ownership.py` (the one shared filter both registration passes call — see `docs/architecture-boundaries.md` "Shared adapter policy").
 
 ### Durable Codex schedules
@@ -107,14 +108,14 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
      target after quota resets. Codex keeps using its own quota telemetry and durable scheduler.
 3. **Filter to entries the core owns before iterating.** This step always runs as the core, never a worker (workers never call `/schedule-crons`; see `skills/startup/SKILL.md`'s worker section). Skip any entry whose `owner` names a worker — it belongs to that worker's own registration, and registering it here too double-fires it (this closed a real incident: a room's `event-mining-hourly` posted from both the core and its pinned worker until the entry was marked `owner`-pinned). Absent `owner` is unaffected — that is still every entry today.
    ```bash
-   python3 -c "
-   import json, sys
-   sys.path.insert(0, 'src')
-   from cron_ownership import entries_for_owner, CORE
-   cfg = json.load(open('$CF'))
-   print(json.dumps(entries_for_owner(cfg, CORE)))"
+   python3 src/cron_prompt_gate.py "$CF"          # --owner core is the default
    ```
-   Iterate the filtered list below, not the raw file.
+   This prints `entries_for_owner(cfg, CORE)` (`src/cron_ownership.py`) with one extra field per
+   entry, `registered_prompt`: the exact text to pass to `CronCreate` (or as the `/loop` body),
+   with the owner-task gate preamble already in front of it unless the entry is the main loop,
+   opts out with `"gate": false`, or already calls `scripts/cron-gate.sh` itself
+   (`src/cron_prompt_gate.py` is the one rule; a worker's startup pass uses the same command with
+   `--owner <its id>`). Iterate the filtered list below, not the raw file.
    - Skip entries carrying a `monitor` object — they are Monitors, not crons (no `cron`, no prompt to register); step 5.4 owns their arming, and a `CronCreate` attempt on one is invalid.
    - Skip entries with `execution: "codex-task"`; the OS-backed runner owns them.
    - **Skip any entry with `"launchd": true`** — it is owned by the OS-level cron-runner (see "Reliable OS-level crons" below), which emits its task independently. Registering it here too would double-fire (duplicate deliveries — the exact noise class the launchd path was built to avoid).
@@ -145,9 +146,13 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
      schedules the next fire time and never runs the prompt on registration.
    - Call `CronCreate` with the cron expression and prompt (using the quota-aware effective cron
      above for the Claude `main-loop` entry):
-     - If `prompt_skill` is set, pass `prompt: "/skill-name"` (the leading slash makes the scheduled cron fire the skill as a slash command at its scheduled time).
-     - Otherwise pass `prompt: <prompt-string-from-config>`.
-     - **If the entry is a dynamic loop** (`loop: "dynamic"` / no interval), do NOT `CronCreate` it. Instead invoke the built-in **`/loop` with no interval** (the adaptive/self-pacing mode), passing the entry's prompt (`/skill-name` or `prompt`) plus any `loop_hint` as the loop body, and append to that body: "on each re-arm, also stamp `state/dynamic-loop-<entry-name>.alive` with `{ts, next_delay_s}`". `/loop`-no-interval then self-paces via ScheduleWakeup by its own judgment — no min/max/signal needed. **Durability comes from schedule-crons re-launching it on every boot.** Double-launch guard: a dynamic loop is NOT visible in `CronList` (ScheduleWakeup schedules a wakeup, not a cron job), and it isn't an OS process either, so neither the cron check nor a PID sentinel can see it. Use the mtime-freshness heartbeat pattern instead (same shape as `state/cores/<hostname>.alive`): the loop stamps its `.alive` sentinel on every re-arm (per the body clause above). On **boot** (first `/schedule-crons` of a new session), always launch — wakeups are session-scoped and died with the old session, so any leftover sentinel is definitionally stale. On a **mid-session re-run**, skip the launch if the sentinel's `ts` is younger than `next_delay_s + 120` seconds (loop still armed); launch only if stale or absent. This guard is also what prevents the inline-fire failure mode below for dynamic loops: launching `/loop` runs the body's first iteration immediately, which is intended at boot but must not repeat on a mid-session `/schedule-crons` re-invocation.
+     - Pass `prompt: <registered_prompt>` from the helper's output — never the raw `prompt` /
+       `prompt_skill` field. For the ungated main loop that is the bare `/proactive-loop` (the
+       leading slash makes the scheduled cron fire the skill as a slash command); for everything
+       else it is the gate preamble followed by the original prompt, or by `invoke the skill
+       /skill-name` for a `prompt_skill` entry — the firing agent runs the check first and, when
+       it prints `clear`, invokes the skill through the Skill tool.
+     - **If the entry is a dynamic loop** (`loop: "dynamic"` / no interval), do NOT `CronCreate` it. Instead invoke the built-in **`/loop` with no interval** (the adaptive/self-pacing mode), passing the entry's `registered_prompt` plus any `loop_hint` as the loop body, and append to that body: "on each re-arm, also stamp `state/dynamic-loop-<entry-name>.alive` with `{ts, next_delay_s}`". `/loop`-no-interval then self-paces via ScheduleWakeup by its own judgment — no min/max/signal needed. **Durability comes from schedule-crons re-launching it on every boot.** Double-launch guard: a dynamic loop is NOT visible in `CronList` (ScheduleWakeup schedules a wakeup, not a cron job), and it isn't an OS process either, so neither the cron check nor a PID sentinel can see it. Use the mtime-freshness heartbeat pattern instead (same shape as `state/cores/<hostname>.alive`): the loop stamps its `.alive` sentinel on every re-arm (per the body clause above). On **boot** (first `/schedule-crons` of a new session), always launch — wakeups are session-scoped and died with the old session, so any leftover sentinel is definitionally stale. On a **mid-session re-run**, skip the launch if the sentinel's `ts` is younger than `next_delay_s + 120` seconds (loop still armed); launch only if stale or absent. This guard is also what prevents the inline-fire failure mode below for dynamic loops: launching `/loop` runs the body's first iteration immediately, which is intended at boot but must not repeat on a mid-session `/schedule-crons` re-invocation.
    - **Do NOT invoke the skill or run the prompt body inline during /schedule-crons.** Crons fire at their scheduled cron expression, never on registration. (Exception: a dynamic-loop entry's first iteration runs at launch by design — at boot only; the freshness-sentinel guard above is what keeps a mid-session re-run from repeating it.) (Past bug 2026-06-03T16:52Z: a mid-session `/schedule-crons` re-invocation inline-fired every entry — `/morning-briefing` plus 5 cron-body prompts — at one instant, dropping 8 spurious prompts atop legit watcher TASK_FILE events. The long-running session drowned and ended at 16:54 without processing queued owner DMs.)
 4. **Fallback — ensure `/proactive-loop` is scheduled.** After step 3, check whether any job in `crons.json` references `/proactive-loop` (either `"prompt_skill": "proactive-loop"` or a `"prompt"` whose body invokes the loop). If none does, call `CronCreate` directly with the Claude quota helper's `effective_cron` (`*/10 * * * *` is its normal missing-config fallback) and `prompt: "/proactive-loop"` as a bootstrap-safety net. Rationale: post-#954 the CLI boots with `-- "/schedule-crons"` and exits once registration finishes, so if `crons.json` is missing/empty/forgot-to-include-the-loop-entry the session goes idle with no recurring work driver. The fallback guarantees the loop runs at least every 10 min when quota telemetry is healthy and below threshold, while preserving the same 30-minute protection near quota exhaustion. Idempotent: if the user has a custom `*/5 * * * *` or `*/15 * * * *` entry, that satisfies the check and the fallback is skipped (no duplicate cron).
 5. **Streaming task watcher — already started in step 1.5, before this step's registration loop ran.** (Moved 2026-08-24: previously ran here, after every `CronCreate` round-trip in steps 2-4, leaving the watcher unarmed for the whole registration window — see step 1.5 for the measured impact and the gate logic, which is unchanged, just earlier.) No action needed here on a normal pass; nothing in steps 2-4 above needs the watcher running to complete.
@@ -212,19 +217,26 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
 
 Edit `<workspace>/hosts/<hostname>/crons.json` (this host's cron set) to add/remove jobs. No need to change this skill file. The proactive-loop fallback (step 4 above) auto-armed if your `crons.json` is missing the loop entry; add an explicit `proactive-loop` entry to suppress the fallback message and pick your own cadence.
 
-### Defer non-loop crons when owner tasks are queued
+### Defer crons when owner tasks are queued
 
-Wrap **sub-daily** non-`main-loop` cron `prompt` bodies (e.g. `*/N`, `*/30`, hourly) with `scripts/cron-gate.sh` so the cron defers when `<workspace>/tasks/` has any `task-*.txt` pending. The next natural tick (≤ a few minutes later for `*/30`, ≤ an hour for hourly) covers a deferred fire. Pattern:
+Every session cron yields to the owner's queued work by mechanism, not by discipline: step 3
+registers each `prompt` / `prompt_skill` entry behind a preamble that runs
+`bash scripts/cron-gate.sh --check <name>` first and stops when it prints `deferred` (owner
+`task-*.txt` files are pending in `<workspace>/tasks/`; peer-tier, cron-runner and classifier
+emissions do not count, nor does a task a pool worker holds — a sentinel under
+`deliveries/<worker>/`, read through `src/pool_holder.py`). A deferred fire is covered by the next natural tick. The rule and its
+exemptions live in `src/cron_prompt_gate.py`, so a host's `crons.json` needs no wrapper of its own:
 
-```json
-{
-  "name": "sync-workspace",
-  "cron": "*/30 * * * *",
-  "prompt": "Run: bash scripts/cron-gate.sh sync-workspace bash scripts/sync-workspace.sh — <human-readable description>."
-}
-```
-
-`cron-gate.sh <reason> <command...>` either `exec`s the command (queue empty) or prints `cron-gate: owner tasks queued — deferring <reason>` and exits 0. See `crons.example.json` for canonical wrapped forms.
+- `main-loop` / `prompt_skill: proactive-loop` (or a prompt that invokes `/proactive-loop`) is
+  **never** gated — it is the owner-task handler, and gating it deadlocks the queue.
+- `"gate": false` on an entry registers its prompt verbatim. Use it for a daily job where a missed
+  day costs more than a delayed owner reply: a daily cron deferred at its one fire is gone until
+  tomorrow, which is what the former "sub-daily only" rule (PR #1437) protected against. Today the
+  default is reversed — owner messages come first everywhere — and that entry-level opt-out is how
+  a host keeps a briefing it would rather have late than lose.
+- A prompt that already calls `scripts/cron-gate.sh` (the shell form,
+  `bash scripts/cron-gate.sh <reason> <command...>`, which `exec`s the command or defers) is
+  registered as is; the helper never wraps twice.
 
 ## Attaching cron output to an s.space room (if connected)
 
@@ -251,15 +263,10 @@ python3 skills/schedule-crons/ensure-cron-room.py \
 - **`op:state` 502s** → a room's display name can't be set or read after creation. Identity rides on the create-time `name` **and** the identifying first message, never a post-hoc state write.
 - **`op:invite` is slow/flaky** — it can take >15s or time out client-side while the invite still lands server-side. So (a) treat invite as best-effort (the helper tolerates a `None` result), and (b) do NOT retry-loop it — repeat calls may queue duplicate invites the owner has to dismiss. These are roadmap track-8 (error-legibility) / broker-reliability items.
 
-**When to gate (decision rule):**
-
-| Cron cadence | Gate? | Why |
-| --- | --- | --- |
-| `main-loop` (`/proactive-loop`) | **NEVER** | `/proactive-loop` IS the owner-task handler; gating would deadlock. |
-| Sub-daily (`*/N`, `*/30`, hourly) | **YES** | A skip is recovered by the next natural tick within minutes-hours. |
-| Daily / less-frequent (`X Y * * *`) | **NO** | A skip = function is gone until next day (briefing missed, etc.). M1's no-inline-fire rule already kills the avalanche on registration — gating dailies is over-broad. |
-
-Lucy caught this on PR #1437 (2026-06-03): gating daily crons (morning-briefing 06:57, daily-insight 06:50, obsidian-dream 03:37, learned-skills-scan 07:30) means one queued task at briefing time loses the briefing for the entire day. Pinning the gate to sub-daily crons preserves the defense-in-depth where it matters without the missed-day risk.
+**When to gate (decision rule):** every entry, by default, through step 3's `registered_prompt`
+— the only exception is `main-loop` / `/proactive-loop`, which is the owner-task handler and must
+never be gated. A daily job that would rather fire late than lose its day opts out with
+`"gate": false` (see "Defer crons when owner tasks are queued").
 
 ## Reliable OS-level crons (`"launchd": true`)
 
