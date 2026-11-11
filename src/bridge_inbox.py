@@ -154,7 +154,7 @@ def read_report(bridge: str, pid, directory: Optional[Path] = None,
         return None, "unreadable"
     try:
         data = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None, "malformed (not JSON)"
     bad = schema_error(data)
     if bad:
