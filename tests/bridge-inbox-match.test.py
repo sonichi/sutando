@@ -12,22 +12,20 @@ from _helpers.hermetic_env import isolate_os_environ
 
 isolate_os_environ()
 
+import importlib.util
 import os
 import re
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-import importlib.util  # noqa: E402
-from unittest import mock  # noqa: E402
-
 import bridge_inbox  # noqa: E402
-import sutando_config  # noqa: E402
-import workspace_default  # noqa: E402
+import sutando_config, workspace_default  # noqa: E401,E402
 
 
 def _install(base: Path, name: str, workspace: Path) -> Path:
