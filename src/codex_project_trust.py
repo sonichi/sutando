@@ -40,7 +40,7 @@ def git_root(path):
     return Path(out.stdout.strip()).resolve()
 
 
-_CHECKOUT = Path(__file__).resolve().parent.parent
+_CHECKOUT = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root — the CODE checkout Codex trusts
 
 
 def ensure_trusted(codex_home, working_dir, repo, home=None):
