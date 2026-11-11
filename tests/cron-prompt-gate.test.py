@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Unit tests for src/cron_prompt_gate.py — the registered-prompt builder that
 puts the owner-task gate in front of every session cron by default."""
+import contextlib
 import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -23,6 +25,14 @@ def check(name, cond, extra=""):
     else:
         print(f"FAIL  {name}  {extra}")
         FAILURES.append(name)
+
+
+def run_main(*args):
+    """main() in-process, so the coverage gate measures the CLI's own lines."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = cpg.main(list(args))
+    return rc, out.getvalue(), err.getvalue()
 
 
 def main() -> int:
@@ -61,6 +71,11 @@ def main() -> int:
           cpg.registered_prompt(loop) == "/proactive-loop", cpg.registered_prompt(loop))
     check("a prompt_skill of proactive-loop is the loop whatever its name",
           not cpg.is_gated({"name": "x", "prompt_skill": "proactive-loop"}))
+    loop_by_name = {"name": "main-loop", "cron": "*/15 * * * *", "prompt": "Run the loop pass"}
+    check("an entry named main-loop is the loop whatever its prompt",
+          cpg.is_main_loop(loop_by_name) and not cpg.is_gated(loop_by_name))
+    check("an entry named main-loop registers verbatim",
+          cpg.registered_prompt(loop_by_name) == "Run the loop pass")
     check("a prompt invoking /proactive-loop is the loop", not cpg.is_gated(loop_by_prompt))
     check("a prompt invoking /proactive-loop registers verbatim",
           cpg.registered_prompt(loop_by_prompt) == loop_by_prompt["prompt"])
@@ -126,6 +141,22 @@ def main() -> int:
                               str(Path(td) / "missing.json")],
                              capture_output=True, text=True, check=True).stdout
         check("CLI on a missing file prints an empty list", json.loads(out) == [])
+
+        rc, out, err = run_main(str(cf))
+        check("main returns 0 and prints the core view",
+              rc == 0 and err == "" and json.loads(out) == got, (rc, out, err))
+        rc, out, _ = run_main(str(cf), "--owner", "d1fc9b10050b490d894947f96627447f")
+        check("main --owner prints a worker's view, gate included",
+              rc == 0 and [e["registered_prompt"] for e in json.loads(out)]
+              == [cpg.registered_prompt(worker_entry)], (rc, out))
+        rc, out, err = run_main(str(Path(td) / "missing.json"))
+        check("main on a missing file returns 0 with an empty list",
+              (rc, json.loads(out), err) == (0, [], ""), (rc, out, err))
+        not_a_list = Path(td) / "object.json"
+        not_a_list.write_text(json.dumps({"crons": entries}))
+        rc, out, err = run_main(str(not_a_list))
+        check("main rejects a crons.json that is not a list with exit 2",
+              rc == 2 and out == "" and "expected a JSON list" in err, (rc, out, err))
 
     # ── the shipped example never double-wraps ───────────────────────────
     example = json.loads((REPO / "skills" / "schedule-crons" / "crons.example.json").read_text())

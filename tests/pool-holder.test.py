@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Unit tests for src/pool_holder.py — the optional-skill lookup that says
 which pool worker holds a queued task (shared by unanswered-tasks and cron-gate)."""
+import contextlib
 import importlib.util
+import io
 import os
 import stat
 import subprocess
@@ -29,6 +31,14 @@ def cli(*args):
     p = subprocess.run([sys.executable, str(REPO / "src" / "pool_holder.py"), *args],
                        capture_output=True, text=True)
     return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+
+def run_main(*args):
+    """main() in-process, so the coverage gate measures the CLI's own lines."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = ph.main(list(args))
+    return rc, out.getvalue().strip(), err.getvalue().strip()
 
 
 def main() -> int:
@@ -65,6 +75,27 @@ def main() -> int:
         check("CLI exits 1 with no output when nobody holds it", (rc, out) == (1, ""), (rc, out))
         rc, out, _ = cli(str(ws), tid, "--pool-scripts", str(empty))
         check("CLI exits 1 when the skill is absent", rc == 1, rc)
+
+        rc, out, err = run_main(str(ws), tid)
+        check("main prints the holder and returns 0", (rc, out, err) == (0, "w1", ""), (rc, out, err))
+        rc, out, _ = run_main(str(ws), str(ws / "tasks" / f"{tid}.txt"))
+        check("main strips the directory and .txt from a task path", (rc, out) == (0, "w1"), (rc, out))
+        rc, out, err = run_main(str(ws), "task-999")
+        check("main returns 1 and prints nothing when nobody holds it",
+              (rc, out, err) == (1, "", ""), (rc, out, err))
+        rc, out, _ = run_main(str(ws), tid, "--pool-scripts", str(empty))
+        check("main returns 1 when the skill is absent", (rc, out) == (1, ""), (rc, out))
+        # A skill dir under a regular file stats as ENOTDIR: unreadable, not absent.
+        blocked = Path(td) / "a-file"
+        blocked.write_text("")
+        try:
+            ph.pool_holder(ws, tid, pool_scripts=blocked / "scripts")
+            check("an unreadable skill dir raises, never reads as absent", False)
+        except NotADirectoryError:
+            check("an unreadable skill dir raises, never reads as absent", True)
+        rc, out, err = run_main(str(ws), tid, "--pool-scripts", str(blocked / "scripts"))
+        check("main returns 3 (undecidable) and prints no holder on an OSError",
+              rc == 3 and out == "" and err.startswith("pool-holder: cannot read"), (rc, out, err))
 
         if os.geteuid() != 0:
             (ws / "deliveries").chmod(0)
