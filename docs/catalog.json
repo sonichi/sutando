@@ -475,6 +475,17 @@
    "canonical_for": "the composition of the lead-follower pool (#3314) with standing sessions (#3263)",
    "last_verified": "2026-08-25"
   },
+  "docs/pr-watch-lifecycle.md": {
+   "title": "PR-watch runner lifecycle",
+   "audience": [
+    "operators",
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "PR-watch runner shutdown admission, thread and process draining, cleanup deadlines, and local validation boundaries",
+   "last_verified": "2026-11-11"
+  },
   "docs/proactive-loop-rationale.md": {
    "title": "Proactive loop — rationale and measurements",
    "audience": [
