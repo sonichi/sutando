@@ -22,7 +22,10 @@ never held, so it is revived as before.
 
 A hold also records a digest of the account it was observed under; a launch under a different
 account is not held by it, so signing in to an account with quota resumes at once. Every launch
-passes this gate, so evidence older than the gate's first sight of an account is not that account's.
+passes this gate and leaves its account on record even when nothing is held (status "none"), so
+the next launch can tell a switch: evidence older than the gate's first sight of an account is
+not that account's. Without that record, a limit hit by one account followed by a sign-in to
+another before the next launch was pinned on the new account.
 
 While a hold is in force the gate also acts on the owner's bare replies to the notice,
 "switch to <model>" and "retry now", since nothing else reads the inbox with the core down.
@@ -554,7 +557,14 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
         hold = dict(hold, status="released", released_at=now)
     if switched:
         hold = dict(hold, account=launch_account, account_at=now)
-    if was_held or switched:
+    # Every launch leaves the account it ran as on record, hold or no hold. A switch is
+    # only seen against that record: with nothing recorded, the first limit an account
+    # ever hit, followed by a sign-in to another account before the next launch, was
+    # read as the NEW account's limit and held it until the old account's reset.
+    first_sight = bool(launch_account and not (hold or {}).get("account"))
+    if first_sight:
+        hold = dict(hold or {"status": "none"}, account=launch_account)
+    if was_held or switched or first_sight:
         _write_hold(workspace, hold)
     if was_held:
         _mirror_core_status(workspace, "starting", "resuming after a provider limit", now)

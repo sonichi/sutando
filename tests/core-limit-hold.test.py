@@ -747,6 +747,36 @@ class AccountChange(unittest.TestCase):
         self.assertIsNone(clh.active_hold(self.ws))
         self.assertEqual(self.gate(), 0, "the old account's evidence re-armed the hold")
 
+    def test_a_limit_hit_before_any_hold_is_not_pinned_on_the_account_signed_in_next(self):
+        """The owner's report: account A ran with no hold on record, hit its limit and the core
+        died; the owner signed in to account B before the next launch. The gate had never
+        written A down, so it saw no switch, read A's refusal as B's, and held B until A's
+        reset, days away. B was at 13% of its limit."""
+        quota = self.ws / "state" / "quota-state.json"
+        quota.unlink()
+        self.sign_in("acct-a", "a@example.com")
+        self.assertEqual(self.gate(), 0, "account A launches with nothing against it")
+        record = clh.read_hold(self.ws)
+        self.assertEqual((record["status"], record["account"]), ("none", clh.account_fingerprint(str(self.cfg))),
+                         "a launch with no hold must still leave its account on record")
+        self.assertIsNone(clh.active_hold(self.ws))
+        self.assertIsNone(clh.binding_hold(self.ws))
+        quota.write_text(json.dumps(limited_record(time.time())))     # A is refused; the core dies
+        self.sign_in("acct-b", "b@example.com")                       # the owner signs in to B
+        self.assertEqual(self.gate(), 0, "account A's limit held account B, which had quota")
+        self.assertIsNone(clh.active_hold(self.ws))
+        self.assertEqual(clh.read_hold(self.ws)["account"], clh.account_fingerprint(str(self.cfg)))
+        self.assertEqual(self.gate(), 0, "account A's old evidence re-armed a hold on account B")
+
+    def test_the_same_account_is_still_held_by_its_own_first_limit(self):
+        quota = self.ws / "state" / "quota-state.json"
+        quota.unlink()
+        self.sign_in("acct-a", "a@example.com")
+        self.assertEqual(self.gate(), 0)
+        quota.write_text(json.dumps(limited_record(time.time())))
+        self.assertEqual(self.gate(), clh.HOLD_EXIT, "the account that hit the limit is the one held")
+        self.assertEqual(clh.read_hold(self.ws)["account"], clh.account_fingerprint(str(self.cfg)))
+
     def test_unreadable_account_keeps_the_hold(self):
         self.sign_in("acct-a", "a@example.com")
         self.assertEqual(self.gate(), clh.HOLD_EXIT)
