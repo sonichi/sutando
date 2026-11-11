@@ -43,13 +43,15 @@ class BridgeInboxMatch(unittest.TestCase):
         self.core = _install(self.tmp / "Application Support", "desktop", self.core_ws)
         self.old = _install(self.tmp / "Application Support", "old-app", self.old_ws)
 
-    def _probe(self, procs: dict, cwds: dict | None = None):
+    def _probe(self, procs: dict, cwds: dict | None = None, envs: dict | None = None):
         cwds = cwds or {}
+        envs = envs or {}
         def pids(script):
             return [pid for pid, argv in procs.items() if script in str(argv)]
         return bridge_inbox.check_bridge_inbox_match(
-            [self.core_ws / "tasks"], self.core, pids,
-            argv_of=lambda pid: procs[pid], cwd_of=lambda pid: cwds.get(pid, ""))
+            [self.core_ws / "tasks"], pids,
+            argv_of=lambda pid: procs[pid], cwd_of=lambda pid: cwds.get(pid, ""),
+            env_of=lambda pid: envs.get(pid, {}))
 
     def test_bridge_from_other_engine_is_flagged_with_both_paths(self):
         argv = f"python3 {self.old}/src/slack-bridge.py"  # flattened, path has a space
@@ -83,21 +85,46 @@ class BridgeInboxMatch(unittest.TestCase):
             del os.environ["SUTANDO_DEFAULT_WORKSPACE"]
         self.assertEqual(got["status"], "warn", got)
 
+    def test_foreign_checkout_whose_env_names_the_core_workspace_is_ok(self):
+        got = self._probe({"4": ["python3", f"{self.old}/src/slack-bridge.py"]},
+                          envs={"4": {"SUTANDO_DEFAULT_WORKSPACE": str(self.core_ws)}})
+        self.assertEqual(got["status"], "ok", got)
+        self.assertIn("1 bridge(s) write the core inbox", got["detail"])
+
+    def test_core_checkout_whose_env_names_another_workspace_warns(self):
+        got = self._probe({"6": ["python3", f"{self.core}/src/slack-bridge.py"]},
+                          envs={"6": {"SUTANDO_DEFAULT_WORKSPACE": str(self.old_ws)}})
+        self.assertEqual(got["status"], "warn", got)
+        self.assertIn(os.path.realpath(self.old_ws / "tasks"), got["detail"])
+
+    def test_unreadable_environment_is_unknown_not_a_guess(self):
+        procs = {"8": ["python3", f"{self.old}/src/slack-bridge.py"]}
+        got = bridge_inbox.check_bridge_inbox_match(
+            [self.core_ws / "tasks"], lambda s: [p for p, a in procs.items() if s in str(a)],
+            argv_of=procs.get, cwd_of=lambda p: "", env_of=lambda p: None)
+        self.assertEqual(got["status"], "ok", got)
+        self.assertIn("inbox unknown for slack-bridge pid 8 (environment unreadable)", got["detail"])
+
+    def test_unreadable_checkout_is_unknown(self):
+        got = self._probe({"2": ["python3", "src/discord-bridge.py"]})  # relative, no cwd
+        self.assertEqual(got["status"], "ok", got)
+        self.assertIn("inbox unknown for discord-bridge pid 2 (checkout unreadable)", got["detail"])
+
     def test_checkout_workspace_leaves_the_process_cache_alone(self):
         sutando_config.load_config(self.core)
         before = (sutando_config._CACHE, sutando_config._CACHE_REPO_ROOT)
-        self.assertEqual(sutando_config.checkout_workspace(self.old), self.old_ws.resolve())
+        self.assertEqual(sutando_config.checkout_workspace(self.old, {}), self.old_ws.resolve())
         self.assertEqual((sutando_config._CACHE, sutando_config._CACHE_REPO_ROOT), before)
 
     def test_checkout_config_path_wins(self):
         (self.old / "sutando.config.local.json").write_text(
             '{"workspace": {"path": "%s"}}' % self.core_ws)
-        self.assertEqual(sutando_config.checkout_workspace(self.old), self.core_ws.resolve())
+        self.assertEqual(sutando_config.checkout_workspace(self.old, {}), self.core_ws.resolve())
 
     def test_unrelated_process_is_not_a_bridge(self):
         got = self._probe({"3": "vim notes-slack-bridge.py"})
         self.assertEqual(got["status"], "ok", got)
-        self.assertIn("no bridge running", got["detail"])
+        self.assertNotIn("write the core inbox", got["detail"])
 
 
 class BridgesShareOneResolver(unittest.TestCase):

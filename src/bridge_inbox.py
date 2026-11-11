@@ -3,8 +3,9 @@
 A bridge resolves its workspace from the checkout it was started from, so a
 bridge still running from another install's engine writes tasks the core never
 reads. The probe finds every bridge process on the host, derives its checkout
-from argv (or cwd for a relative launch), resolves that checkout's inbox, and
-compares it with the core's. Process readers are injected so tests run offline.
+from argv (or cwd for a relative launch), resolves that checkout's inbox with
+the process's OWN environment, and compares it with the core's; an unreadable
+checkout or environment is reported unknown, never guessed. Process readers are injected so tests run offline.
 """
 from __future__ import annotations
 
@@ -65,9 +66,57 @@ def bridge_checkout(argv, cwd: str, script: str) -> Optional[Path]:
     return Path(canonical(path)).parent.parent
 
 
-def checkout_inbox(checkout: Path) -> Path:
-    # The probe's own embedder env belongs to the core's launcher, not to the bridge.
-    return sutando_config.checkout_workspace(checkout) / "tasks"
+def checkout_inbox(checkout: Path, env: dict) -> Path:
+    return sutando_config.checkout_workspace(checkout, env) / "tasks"
+
+
+def read_env(pid: str) -> Optional[dict]:
+    """The environment `pid` was started with, or None when it cannot be read."""
+    raw = None
+    try:  # linux
+        raw = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        raw = None
+    if raw is None:
+        raw = _darwin_env(pid)
+    if raw is None:
+        return None
+    env = {}
+    for item in raw:
+        key, sep, val = item.decode("utf8", "replace").partition("=")
+        if sep and key:
+            env[key] = val
+    return env
+
+
+def _darwin_env(pid: str) -> Optional[list]:
+    """KERN_PROCARGS2 holds argc, the exec path, argv, then the environment."""
+    try:
+        import ctypes
+        import ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        mib = (ctypes.c_int * 3)(1, 49, int(pid))
+        size = ctypes.c_size_t(262144)
+        buf = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+            return None
+        data = buf.raw[:size.value]
+        argc = int.from_bytes(data[:4], sys.byteorder)
+        parts = data[4:].split(b"\0")
+        i = 0
+        while i < len(parts) and parts[i] == b"":
+            i += 1
+        i += 1  # the exec path
+        while i < len(parts) and parts[i] == b"":
+            i += 1
+        i += argc
+        out = []
+        while i < len(parts) and parts[i]:
+            out.append(parts[i])
+            i += 1
+        return out
+    except Exception:  # noqa: BLE001 -- not darwin, gone, or not ours
+        return None
 
 
 def read_argv(pid: str):
@@ -97,29 +146,27 @@ def read_cwd(pid: str) -> str:
     return next((ln[1:] for ln in out.splitlines() if ln.startswith("n")), "")
 
 
-def check_bridge_inbox_match(core_inboxes: Iterable, core_checkout: Path,
+def check_bridge_inbox_match(core_inboxes: Iterable,
                              list_pids: Callable[[str], list],
                              argv_of: Callable[[str], object] = read_argv,
                              cwd_of: Callable[[str], str] = read_cwd,
-                             inbox_of: Callable[[Path], Path] = checkout_inbox) -> dict:
+                             env_of: Callable[[str], Optional[dict]] = read_env,
+                             inbox_of: Callable[[Path, dict], Path] = checkout_inbox) -> dict:
     """warn naming each bridge, its inbox and the core's when they differ."""
     core = sorted({canonical(p) for p in core_inboxes if p})
     if not core:
         return {"name": CHECK_NAME, "status": "ok",
                 "detail": "core inbox unknown — not comparing bridge inboxes"}
-    core_root = canonical(core_checkout)
     seen, mismatched, unknown = [], [], []
     for name, script in BRIDGE_SCRIPTS.items():
         for pid in list_pids(script):
             checkout = bridge_checkout(argv_of(pid), cwd_of(pid), script)
-            if checkout is None:
-                unknown.append(f"{name} pid {pid}")
-                continue
-            if canonical(checkout) == core_root:
-                seen.append(f"{name} pid {pid}")
+            env = env_of(pid)
+            if checkout is None or env is None:
+                unknown.append(f"{name} pid {pid} ({'checkout' if checkout is None else 'environment'} unreadable)")
                 continue
             try:
-                inbox = canonical(inbox_of(checkout))
+                inbox = canonical(inbox_of(checkout, env))
             except Exception as exc:  # noqa: BLE001 — a foreign config must not break the check
                 unknown.append(f"{name} pid {pid} ({checkout}: {type(exc).__name__})")
                 continue
@@ -133,8 +180,11 @@ def check_bridge_inbox_match(core_inboxes: Iterable, core_checkout: Path,
                            f"{' / '.join(core)}, so those messages are never answered. "
                            "Stop that bridge and relaunch it from this engine "
                            "(startup.sh or the desktop app)")}
-    note = f"; checkout unreadable for {', '.join(unknown)}" if unknown else ""
+    note = f"; inbox unknown for {', '.join(unknown)}" if unknown else ""
+    if not seen and unknown:
+        return {"name": CHECK_NAME, "status": "ok",
+                "detail": f"inbox unknown for {', '.join(unknown)} — not asserting a match"}
     if not seen:
-        return {"name": CHECK_NAME, "status": "ok", "detail": f"no bridge running{note}"}
+        return {"name": CHECK_NAME, "status": "ok", "detail": "no bridge running"}
     return {"name": CHECK_NAME, "status": "ok",
             "detail": f"{len(seen)} bridge(s) write the core inbox{note}"}

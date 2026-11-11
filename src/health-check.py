@@ -9489,7 +9489,7 @@ def check_bridge_inbox_match() -> dict:
         pids, _ok = probe_pids(re.escape(script) + "$")
         return _drop_launcher_parents(pids)
     try:
-        return bridge_inbox.check_bridge_inbox_match(_core_inboxes(), REPO_DIR, _pids)
+        return bridge_inbox.check_bridge_inbox_match(_core_inboxes(), _pids)
     except Exception as exc:  # noqa: BLE001 — a probe failure is not a finding
         return {"name": bridge_inbox.CHECK_NAME, "status": "ok",
                 "detail": f"probe failed ({type(exc).__name__}) — not asserting a match"}

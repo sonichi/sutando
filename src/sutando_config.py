@@ -41,7 +41,7 @@ import os
 import sys
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 # --------------------------------------------------------------------------- #
 #  File discovery                                                             #
@@ -340,10 +340,11 @@ def _reset_cache_for_tests() -> None:
     _WS_LAYER_WORKSPACE_KEY_WARN_PRINTED = False
 
 
-def _test_mode_workspace() -> Optional[Path]:
+def _test_mode_workspace(env: Optional[Mapping[str, str]] = None) -> Optional[Path]:
     """`$SUTANDO_WORKSPACE` under `SUTANDO_TEST_MODE=1` only; production ignores it."""
-    env_val = os.environ.get("SUTANDO_WORKSPACE", "").strip()
-    if env_val and os.environ.get("SUTANDO_TEST_MODE") == "1":
+    env = os.environ if env is None else env
+    env_val = env.get("SUTANDO_WORKSPACE", "").strip()
+    if env_val and env.get("SUTANDO_TEST_MODE") == "1":
         return Path(env_val).expanduser().resolve()
     return None
 
@@ -537,17 +538,20 @@ def resolve_workspace(repo_root: Optional[Path] = None) -> Path:
     return resolved
 
 
-def checkout_workspace(repo_root: Path, embedder_default: str = "") -> Path:
-    """The workspace a process running from the checkout at `repo_root` resolves.
+def checkout_workspace(repo_root: Path, env: Mapping[str, str]) -> Path:
+    """The workspace a process running from the checkout at `repo_root` with
+    environment `env` resolves.
 
-    For reasoning about ANOTHER checkout's process: reads that checkout's config
-    without touching this process's cache, env or test-mode override.
-    `embedder_default` stands in for that process's `$SUTANDO_DEFAULT_WORKSPACE`.
+    For reasoning about ANOTHER process: reads that checkout's config without
+    touching this process's cache, and takes every env input from `env`.
     """
     root = Path(repo_root)
+    test_ws = _test_mode_workspace(env)
+    if test_ws is not None:
+        return test_ws
     cfg = _expand_vars(_deep_merge(_load_json(root / _CONFIG_FILENAME),
                                    _load_json(root / _LOCAL_FILENAME)), root)
-    return _workspace_order(cfg, root, embedder_default)
+    return _workspace_order(cfg, root, env.get("SUTANDO_DEFAULT_WORKSPACE", ""))
 
 
 def resolve_vault(repo_root: Optional[Path] = None) -> Dict[str, Any]:
