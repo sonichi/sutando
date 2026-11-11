@@ -13,8 +13,8 @@
 #   - <command...>: the actual command to run if the queue is empty
 #   - --check: run no command; print one line and exit 0 either way —
 #     `deferred: owner tasks queued — <reason> (will retry next fire)` or `clear`.
-#     This is the form /schedule-crons prefixes to every registered prompt
-#     (src/cron_prompt_gate.py), so a prompt-shaped cron can yield too.
+#     This is the form /schedule-crons prefixes to a sub-daily (or `gate: true`)
+#     registered prompt (src/cron_prompt_gate.py), so a prompt-shaped cron can yield too.
 #
 # Example crons.example.json entry (shell form):
 #   "prompt": "Run: bash scripts/cron-gate.sh sync-workspace bash scripts/sync-workspace.sh"

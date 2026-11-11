@@ -12,7 +12,7 @@
   {
     "name": "sync-workspace",
     "cron": "*/30 * * * *",
-    "prompt": "Run: bash scripts/sync-workspace.sh — syncs workspace (memory + notes + state/cores) to the private vault via per-host branch (requires vault.remote_url in sutando.config.local.json, or --vault-url flag). /schedule-crons gates every entry on queued owner tasks by itself, so no cron-gate.sh wrapper is needed here; a deferred fire is covered by the next */30 tick. Replaces the legacy sync-memory entry (an rsync to a separate memory-sync clone); sync-memory.sh still works during the transition but emits a deprecation banner."
+    "prompt": "Run: bash scripts/sync-workspace.sh — syncs workspace (memory + notes + state/cores) to the private vault via per-host branch (requires vault.remote_url in sutando.config.local.json, or --vault-url flag). /schedule-crons gates every entry that fires more than once a day on queued owner tasks by itself, so no cron-gate.sh wrapper is needed here; a deferred fire is covered by the next */30 tick. Replaces the legacy sync-memory entry (an rsync to a separate memory-sync clone); sync-memory.sh still works during the transition but emits a deprecation banner."
   },
   {
     "name": "learned-skills-scan",

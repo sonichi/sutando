@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """The prompt a crons.json entry is registered with, owner-task gate included.
 
-Every session cron (CronCreate'd by the core's /schedule-crons or a worker's
-startup pass) yields to queued owner work by construction: its registered
-prompt opens with a `bash scripts/cron-gate.sh --check <name>` preamble that
-tells the firing agent to stop when owner tasks are queued. Two registration
-passes build prompts from the same file, so the rule lives here once — see
+A session cron (CronCreate'd by the core's /schedule-crons or a worker's
+startup pass) that fires more than once a day yields to queued owner work by
+construction: its registered prompt opens with a
+`bash scripts/cron-gate.sh --check <name>` preamble that tells the firing agent
+to stop when owner tasks are queued. Two registration passes build prompts from
+the same file, so the rule lives here once — see
 docs/architecture-boundaries.md "Shared adapter policy".
 
-Exempt, and registered verbatim:
+The default follows the entry's `cron` cadence; `"gate": true` / `"gate": false`
+on the entry overrides it either way:
+  - sub-daily (minute values x hour values > 1): gated — the next tick covers
+    a deferred fire;
+  - daily or rarer (one minute, one hour): not gated — a deferred fire would
+    lose the job until its next day;
+  - no `cron` (a dynamic loop) or one that does not parse: gated.
+
+Never gated, and registered verbatim:
   - the canonical main loop (`main-loop` / `prompt_skill: proactive-loop` / a
     prompt that invokes /proactive-loop): it IS the owner-task handler, and
     gating it deadlocks the queue;
-  - an entry that opts out with `"gate": false`;
   - a prompt that already runs `bash scripts/cron-gate.sh ...` (never double-wrap).
 
 CLI (prints the owner-filtered entries, each with `registered_prompt`):
@@ -61,16 +69,63 @@ def is_main_loop(entry: dict) -> bool:
     return isinstance(prompt, str) and _LOOP_CALL.search(prompt) is not None
 
 
+def _field_values(field: str, lo: int, hi: int) -> Optional[set]:
+    """The values a cron field selects within lo..hi; None when it does not parse."""
+    values: set = set()
+    for part in field.split(","):
+        base, sep, step_text = part.partition("/")
+        if sep and not step_text.isdecimal():
+            return None
+        step = int(step_text) if sep else 1
+        if step < 1:
+            return None
+        if base == "*":
+            start, end = lo, hi
+        else:
+            first, dash, last = base.partition("-")
+            if not first.isdecimal() or (dash and not last.isdecimal()):
+                return None
+            start = int(first)
+            # `5/15` runs from 5 to the field's maximum, as cron reads it.
+            end = int(last) if dash else (hi if sep else start)
+        if start < lo or end > hi or start > end:
+            return None
+        values.update(range(start, end + 1, step))
+    return values
+
+
+def fires_per_day(entry: dict) -> Optional[int]:
+    """Fires on a day the entry runs at all (minute values x hour values);
+    None when `cron` is absent or is not a parseable 5-field expression."""
+    cron = entry.get("cron")
+    if not isinstance(cron, str):
+        return None
+    fields = cron.split()
+    if len(fields) != 5:
+        return None
+    minutes = _field_values(fields[0], 0, 59)
+    hours = _field_values(fields[1], 0, 23)
+    if not minutes or not hours:
+        return None
+    return len(minutes) * len(hours)
+
+
+def gated_by_default(entry: dict) -> bool:
+    """Sub-daily entries yield to owner work; a daily-or-rarer one would lose its day."""
+    # No cadence to read (dynamic loop, malformed cron): gate, since gating only delays.
+    fires = fires_per_day(entry)
+    return fires is None or fires > 1
+
+
 def is_gated(entry: dict) -> bool:
     """Whether the registered prompt gets the owner-task preamble."""
-    if entry.get("gate") is False:
-        return False
     if is_main_loop(entry):
         return False
     prompt = base_prompt(entry)
-    if prompt is None:
+    if prompt is None or _GATE_CALL.search(prompt) is not None:
         return False
-    return _GATE_CALL.search(prompt) is None
+    gate = entry.get("gate")
+    return gate if isinstance(gate, bool) else gated_by_default(entry)
 
 
 def gate_reason(entry: dict) -> str:
