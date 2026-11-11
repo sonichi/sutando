@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The task-watch Mod is installed only on an explicit per-launcher opt-in and a Claude Code at
-# or above the Mod's own floor; the session marker says which watcher path the session is on.
+# The task-watch Mod is installed on a worker only on opt-in and on the core unless opted out, both
+# only at or above the Mod's own floor; the session marker says which watcher path the session is on.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pass=0; fail=0
@@ -84,13 +84,18 @@ echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD="; check $? "the core's flag does
 core_env() { env -i HOME="$HOME" PATH="$STUB_PATH" STUB_VERSION=9.9.9 "$@" \
   bash "$REPO/src/agent/claude/cli/start-cli.sh" --print-core-env 2>/dev/null; }
 out="$(core_env)"
-echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD="; check $? "the core is off by default, marker explicitly empty"
-out="$(core_env SUTANDO_TASK_WATCH_MOD_WORKER=1)"
-echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD="; check $? "the worker flag does not switch the core"
-out="$(core_env SUTANDO_TASK_WATCH_MOD_CORE=1)"
-echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD=1"; check $? "only SUTANDO_TASK_WATCH_MOD_CORE=1 switches the core"
-out="$(core_env SUTANDO_TASK_WATCH_MOD_CORE=1 STUB_VERSION=2.1.0)"
+echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD=1"; check $? "the core is on by default, marker 1"
+[ "$(echo "$out" | grep -c '^SUTANDO_TASK_WATCH_MOD=')" = 1 ]; check $? "the core marker appears once"
+out="$(core_env SUTANDO_TASK_WATCH_MOD_CORE=)"
+echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD=1"; check $? "an empty core flag is the default, on"
+out="$(core_env SUTANDO_TASK_WATCH_MOD_CORE=0)"
+echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD="; check $? "SUTANDO_TASK_WATCH_MOD_CORE=0 keeps the core on the Monitor, marker empty"
+out="$(core_env SUTANDO_TASK_WATCH_MOD_WORKER=0)"
+echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD=1"; check $? "the worker flag does not switch the core"
+out="$(core_env STUB_VERSION=2.1.0)"
 echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD="; check $? "the core keeps the Monitor below the floor"
+out="$(core_env STUB_VERSION=)"
+echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD="; check $? "the core keeps the Monitor when claude's version cannot be read"
 
 echo "$pass passed, $fail failed"
 [ "$fail" = "0" ]

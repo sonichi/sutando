@@ -44,6 +44,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Changed
 
 <!-- refactor(), perf(), docs() changes visible to operators go here -->
+- Claude core: the task-watch Mod now hosts the core session's task watcher by default, so it no longer dies when a `Monitor` reaches its 30-minute cap. `SUTANDO_TASK_WATCH_MOD_CORE=0` keeps the `Monitor` watcher. A Claude Code below the Mod's floor, or a Mod that never reports a ready watcher, still falls back to the `Monitor`. Workers and Codex cores are unchanged.
 - macOS notifications are off by default. Sutando posts no macOS desktop notification (pending questions, bridge restarts, health checks, the agent shepherd, voice offline/online, context drop, screen recording) unless `sutando.config.local.json` sets `"notifications": {"macos": true}`. The same alerts still reach the owner's DM or the core's task queue. There is no exception: the gateway bridge's no-workspace alert, which has no DM to fall back on, is silent too unless you opt in. Windows and Linux notifications are unchanged.
 
 ## Security

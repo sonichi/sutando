@@ -65,8 +65,8 @@ NOTIFIER_SUPERVISOR="$REPO/src/agent/codex/cli/task-notifier-supervisor.sh"
 NOTIFIER_SCRIPT="$REPO/src/agent/claude/cli/task-notifier.sh"
 SURFACE_ARGS=(--remote-control "Sutando" --chrome)
 add_skill_claude_plugins
-# Off unless SUTANDO_TASK_WATCH_MOD_CORE=1: the core keeps its Monitor watcher by default.
-add_task_watch_mod "${SUTANDO_TASK_WATCH_MOD_CORE:-}"
+# On unless SUTANDO_TASK_WATCH_MOD_CORE=0; the version floor and mod-ready keep the Monitor fallback.
+add_task_watch_mod "${SUTANDO_TASK_WATCH_MOD_CORE:-1}"
 # `/startup` is the CANONICAL CORE's ceremony: orphan recovery, session crons,
 # a gate any watcher satisfies. One arg — the skill reads it as $ARGUMENTS.
 BOOT_PROMPT="/startup"
