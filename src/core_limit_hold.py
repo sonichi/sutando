@@ -557,10 +557,8 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
         hold = dict(hold, status="released", released_at=now)
     if switched:
         hold = dict(hold, account=launch_account, account_at=now)
-    # Every launch leaves the account it ran as on record, hold or no hold. A switch is
-    # only seen against that record: with nothing recorded, the first limit an account
-    # ever hit, followed by a sign-in to another account before the next launch, was
-    # read as the NEW account's limit and held it until the old account's reset.
+    # Record the launch account even with no hold: a switch is only seen against this record,
+    # and without it the old account's limit is pinned on the account signed in next.
     first_sight = bool(launch_account and not (hold or {}).get("account"))
     if first_sight:
         hold = dict(hold or {"status": "none"}, account=launch_account)
