@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import sutando_config  # noqa: E402
+import workspace_default  # noqa: E402
 
 CHECK_NAME = "bridge-inbox-match"
 BRIDGE_SCRIPTS = {
@@ -67,7 +67,8 @@ def bridge_checkout(argv, cwd: str, script: str) -> Optional[Path]:
 
 
 def checkout_inbox(checkout: Path, env: dict) -> Path:
-    return sutando_config.checkout_workspace(checkout, env) / "tasks"
+    """The bridges' own `resolve_workspace() / "tasks"`, as that process resolves it."""
+    return workspace_default.resolve_workspace(env=env, module_dir=Path(checkout) / "src") / "tasks"
 
 
 def read_env(pid: str) -> Optional[dict]:
@@ -148,11 +149,15 @@ def read_cwd(pid: str) -> str:
 
 def check_bridge_inbox_match(core_inboxes: Iterable,
                              list_pids: Callable[[str], list],
-                             argv_of: Callable[[str], object] = read_argv,
-                             cwd_of: Callable[[str], str] = read_cwd,
-                             env_of: Callable[[str], Optional[dict]] = read_env,
-                             inbox_of: Callable[[Path, dict], Path] = checkout_inbox) -> dict:
+                             argv_of: Optional[Callable[[str], object]] = None,
+                             cwd_of: Optional[Callable[[str], str]] = None,
+                             env_of: Optional[Callable[[str], Optional[dict]]] = None,
+                             inbox_of: Optional[Callable[[Path, dict], Path]] = None) -> dict:
     """warn naming each bridge, its inbox and the core's when they differ."""
+    argv_of = argv_of or read_argv
+    cwd_of = cwd_of or read_cwd
+    env_of = env_of or read_env
+    inbox_of = inbox_of or checkout_inbox
     core = sorted({canonical(p) for p in core_inboxes if p})
     if not core:
         return {"name": CHECK_NAME, "status": "ok",

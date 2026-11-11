@@ -22,14 +22,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
+import importlib.util  # noqa: E402
+from unittest import mock  # noqa: E402
+
 import bridge_inbox  # noqa: E402
 import sutando_config  # noqa: E402
+import workspace_default  # noqa: E402
 
 
 def _install(base: Path, name: str, workspace: Path) -> Path:
     """An engine checkout whose `workspace` link points at `workspace`, as a desktop install lays it out."""
     checkout = base / name / "engine" / "sutando"
     (checkout / "src").mkdir(parents=True)
+    (checkout / "sutando.config.json").write_text("{}")
     workspace.mkdir(parents=True, exist_ok=True)
     (checkout / "workspace").symlink_to(workspace)
     return checkout
@@ -110,21 +115,64 @@ class BridgeInboxMatch(unittest.TestCase):
         self.assertEqual(got["status"], "ok", got)
         self.assertIn("inbox unknown for discord-bridge pid 2 (checkout unreadable)", got["detail"])
 
-    def test_checkout_workspace_leaves_the_process_cache_alone(self):
+    def test_resolving_another_process_leaves_the_cache_alone(self):
         sutando_config.load_config(self.core)
         before = (sutando_config._CACHE, sutando_config._CACHE_REPO_ROOT)
-        self.assertEqual(sutando_config.checkout_workspace(self.old, {}), self.old_ws.resolve())
+        got = workspace_default.resolve_workspace(env={}, module_dir=self.old / "src")
+        self.assertEqual(got, self.old_ws.resolve())
         self.assertEqual((sutando_config._CACHE, sutando_config._CACHE_REPO_ROOT), before)
 
-    def test_checkout_config_path_wins(self):
+    def test_checkout_config_beats_the_bridge_env(self):
+        # resolve_workspace ranks explicit config above the embedder default.
         (self.old / "sutando.config.local.json").write_text(
             '{"workspace": {"path": "%s"}}' % self.core_ws)
-        self.assertEqual(sutando_config.checkout_workspace(self.old, {}), self.core_ws.resolve())
+        got = self._probe({"4": ["python3", f"{self.old}/src/slack-bridge.py"]},
+                          envs={"4": {"SUTANDO_DEFAULT_WORKSPACE": str(self.old_ws)}})
+        self.assertEqual(got["status"], "ok", got)
+
+    def test_env_keys_the_resolver_ignores_are_ignored(self):
+        env = {"SUTANDO_TASKS_DIR": str(self.core_ws / "tasks"),
+               "SUTANDO_WORKSPACE_DIR": str(self.core_ws),
+               "SUTANDO_WORKSPACE": str(self.core_ws)}
+        got = self._probe({"4": ["python3", f"{self.old}/src/slack-bridge.py"]}, envs={"4": env})
+        self.assertEqual(got["status"], "warn", got)
 
     def test_unrelated_process_is_not_a_bridge(self):
         got = self._probe({"3": "vim notes-slack-bridge.py"})
         self.assertEqual(got["status"], "ok", got)
         self.assertNotIn("write the core inbox", got["detail"])
+
+
+class HealthCheckDelegatesToTheResolver(unittest.TestCase):
+    def test_probe_result_follows_resolve_workspace(self):
+        spec = importlib.util.spec_from_file_location("health_check", ROOT / "src" / "health-check.py")
+        health = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(health)
+        core = Path(tempfile.mkdtemp()) / "core-ws"
+        elsewhere = Path(tempfile.mkdtemp()) / "other-ws"
+        argv = ["python3", "/engine/src/slack-bridge.py"]
+        stubs = [
+            mock.patch.object(health, "_core_inboxes", lambda: [str(core / "tasks")]),
+            mock.patch.object(health, "probe_pids",
+                              lambda pat: (["42"], True) if "slack" in pat else ([], True)),
+            mock.patch.object(health, "_drop_launcher_parents", lambda pids: pids),
+            mock.patch.object(bridge_inbox, "read_argv", lambda pid: argv),
+            mock.patch.object(bridge_inbox, "read_cwd", lambda pid: ""),
+            mock.patch.object(bridge_inbox, "read_env", lambda pid: {}),
+        ]
+        for st in stubs:
+            st.start()
+            self.addCleanup(st.stop)
+        # health-check's bridge_inbox is this one only if the defaults were bound late.
+        self.assertIs(health.bridge_inbox, bridge_inbox)
+        results = {}
+        for label, ws in (("core", core), ("elsewhere", elsewhere)):
+            with mock.patch.object(workspace_default, "resolve_workspace",
+                                   lambda migrate=True, *, env=None, module_dir=None, _w=ws: _w):
+                results[label] = health.check_bridge_inbox_match()
+        self.assertEqual(results["core"]["status"], "ok", results)
+        self.assertEqual(results["elsewhere"]["status"], "warn", results)
+        self.assertIn(os.path.realpath(elsewhere / "tasks"), results["elsewhere"]["detail"])
 
 
 class BridgesShareOneResolver(unittest.TestCase):
