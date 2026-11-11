@@ -4,7 +4,7 @@ A bridge resolves its workspace from the checkout it was started from, so a
 bridge still running from another install's engine writes tasks the core never
 reads. The probe finds every bridge process on the host, derives its checkout
 from argv (or cwd for a relative launch), resolves that checkout's inbox with
-the process's OWN environment, and compares it with the core's; an unreadable
+the process's OWN environment and cwd, and compares it with the core's; an unreadable
 checkout or environment is reported unknown, never guessed. Process readers are injected so tests run offline.
 """
 from __future__ import annotations
@@ -66,9 +66,10 @@ def bridge_checkout(argv, cwd: str, script: str) -> Optional[Path]:
     return Path(canonical(path)).parent.parent
 
 
-def checkout_inbox(checkout: Path, env: dict) -> Path:
+def checkout_inbox(checkout: Path, env: dict, cwd: str) -> Path:
     """The bridges' own `resolve_workspace() / "tasks"`, as that process resolves it."""
-    return workspace_default.resolve_workspace(env=env, module_dir=Path(checkout) / "src") / "tasks"
+    return workspace_default.resolve_workspace(
+        env=env, module_dir=Path(checkout) / "src", cwd=Path(cwd)) / "tasks"
 
 
 def read_env(pid: str) -> Optional[dict]:
@@ -152,7 +153,7 @@ def check_bridge_inbox_match(core_inboxes: Iterable,
                              argv_of: Optional[Callable[[str], object]] = None,
                              cwd_of: Optional[Callable[[str], str]] = None,
                              env_of: Optional[Callable[[str], Optional[dict]]] = None,
-                             inbox_of: Optional[Callable[[Path, dict], Path]] = None) -> dict:
+                             inbox_of: Optional[Callable[[Path, dict, str], Path]] = None) -> dict:
     """warn naming each bridge, its inbox and the core's when they differ."""
     argv_of = argv_of or read_argv
     cwd_of = cwd_of or read_cwd
@@ -165,13 +166,16 @@ def check_bridge_inbox_match(core_inboxes: Iterable,
     seen, mismatched, unknown = [], [], []
     for name, script in BRIDGE_SCRIPTS.items():
         for pid in list_pids(script):
-            checkout = bridge_checkout(argv_of(pid), cwd_of(pid), script)
+            cwd = cwd_of(pid)
+            checkout = bridge_checkout(argv_of(pid), cwd, script)
             env = env_of(pid)
-            if checkout is None or env is None:
-                unknown.append(f"{name} pid {pid} ({'checkout' if checkout is None else 'environment'} unreadable)")
+            missing = ("checkout" if checkout is None else "environment" if env is None
+                       else "cwd" if not cwd else None)
+            if missing:
+                unknown.append(f"{name} pid {pid} ({missing} unreadable)")
                 continue
             try:
-                inbox = canonical(inbox_of(checkout, env))
+                inbox = canonical(inbox_of(checkout, env, cwd))
             except Exception as exc:  # noqa: BLE001 — a foreign config must not break the check
                 unknown.append(f"{name} pid {pid} ({checkout}: {type(exc).__name__})")
                 continue

@@ -454,7 +454,7 @@ def _grep_env_for_workspace() -> str | None:
     return None
 
 
-def resolve_workspace(migrate: bool = True, *, env=None, module_dir=None) -> Path:
+def resolve_workspace(migrate: bool = True, *, env=None, module_dir=None, cwd=None) -> Path:
     """Resolve the workspace directory per the canonical contract.
 
     **Delegates to `src/sutando_config.py::resolve_workspace`** as of the
@@ -507,7 +507,7 @@ def resolve_workspace(migrate: bool = True, *, env=None, module_dir=None) -> Pat
     import sutando_config  # type: ignore[import-untyped]
     if env is not None:
         # Another process's resolution (see sutando_config): no notices, no side effects.
-        return sutando_config.resolve_workspace(env=env, module_dir=module_dir)
+        return sutando_config.resolve_workspace(env=env, module_dir=module_dir, cwd=cwd)
     target = sutando_config.resolve_workspace()
 
     # One-time notice if legacy-state evidence exists, pointing at the

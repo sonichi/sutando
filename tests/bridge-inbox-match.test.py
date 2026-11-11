@@ -8,10 +8,6 @@ checkout still resolves the core's workspace.
 """
 from __future__ import annotations
 
-from _helpers.hermetic_env import isolate_os_environ
-
-isolate_os_environ()
-
 import importlib.util
 import os
 import re
@@ -22,6 +18,21 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "tests"))  # `python3 -I` does not add the script dir
+
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+isolate_os_environ()
+os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-bridge-inbox-")
+_slack_cfg = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"
+_slack_cfg.mkdir(parents=True, exist_ok=True)
+(_slack_cfg / "access.json").write_text("{}")
+_discord_cfg = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "discord"
+_discord_cfg.mkdir(parents=True, exist_ok=True)
+(_discord_cfg / "access.json").write_text("{}")
+_telegram_cfg = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "telegram"
+_telegram_cfg.mkdir(parents=True, exist_ok=True)
+(_telegram_cfg / "access.json").write_text("{}")
 sys.path.insert(0, str(ROOT / "src"))
 
 import bridge_inbox  # noqa: E402
@@ -53,7 +64,7 @@ class BridgeInboxMatch(unittest.TestCase):
             return [pid for pid, argv in procs.items() if script in str(argv)]
         return bridge_inbox.check_bridge_inbox_match(
             [self.core_ws / "tasks"], pids,
-            argv_of=lambda pid: procs[pid], cwd_of=lambda pid: cwds.get(pid, ""),
+            argv_of=lambda pid: procs[pid], cwd_of=lambda pid: cwds.get(pid, str(self.tmp)),
             env_of=lambda pid: envs.get(pid, {}))
 
     def test_bridge_from_other_engine_is_flagged_with_both_paths(self):
@@ -109,14 +120,33 @@ class BridgeInboxMatch(unittest.TestCase):
         self.assertIn("inbox unknown for slack-bridge pid 8 (environment unreadable)", got["detail"])
 
     def test_unreadable_checkout_is_unknown(self):
-        got = self._probe({"2": ["python3", "src/discord-bridge.py"]})  # relative, no cwd
+        got = self._probe({"2": ["python3", "src/discord-bridge.py"]}, {"2": ""})
         self.assertEqual(got["status"], "ok", got)
         self.assertIn("inbox unknown for discord-bridge pid 2 (checkout unreadable)", got["detail"])
+
+    def _relative_config(self):
+        (self.old / "sutando.config.local.json").write_text('{"workspace": {"path": "ws"}}')
+        return {"5": ["python3", f"{self.old}/src/slack-bridge.py"]}
+
+    def test_relative_config_resolves_against_the_bridge_cwd(self):
+        (self.core_ws.parent / "ws").symlink_to(self.core_ws)
+        got = self._probe(self._relative_config(), {"5": str(self.core_ws.parent)})
+        self.assertEqual(got["status"], "ok", got)
+
+    def test_relative_config_from_another_cwd_warns(self):
+        got = self._probe(self._relative_config(), {"5": str(self.old_ws.parent)})
+        self.assertEqual(got["status"], "warn", got)
+        self.assertIn(os.path.realpath(self.old_ws.parent / "ws" / "tasks"), got["detail"])
+
+    def test_unreadable_cwd_is_unknown(self):
+        got = self._probe(self._relative_config(), {"5": ""})
+        self.assertEqual(got["status"], "ok", got)
+        self.assertIn("inbox unknown for slack-bridge pid 5 (cwd unreadable)", got["detail"])
 
     def test_resolving_another_process_leaves_the_cache_alone(self):
         sutando_config.load_config(self.core)
         before = (sutando_config._CACHE, sutando_config._CACHE_REPO_ROOT)
-        got = workspace_default.resolve_workspace(env={}, module_dir=self.old / "src")
+        got = workspace_default.resolve_workspace(env={}, module_dir=self.old / "src", cwd=self.tmp)
         self.assertEqual(got, self.old_ws.resolve())
         self.assertEqual((sutando_config._CACHE, sutando_config._CACHE_REPO_ROOT), before)
 
@@ -155,7 +185,7 @@ class HealthCheckDelegatesToTheResolver(unittest.TestCase):
                               lambda pat: (["42"], True) if "slack" in pat else ([], True)),
             mock.patch.object(health, "_drop_launcher_parents", lambda pids: pids),
             mock.patch.object(bridge_inbox, "read_argv", lambda pid: argv),
-            mock.patch.object(bridge_inbox, "read_cwd", lambda pid: ""),
+            mock.patch.object(bridge_inbox, "read_cwd", lambda pid: "/"),
             mock.patch.object(bridge_inbox, "read_env", lambda pid: {}),
         ]
         for st in stubs:
@@ -166,7 +196,7 @@ class HealthCheckDelegatesToTheResolver(unittest.TestCase):
         results = {}
         for label, ws in (("core", core), ("elsewhere", elsewhere)):
             with mock.patch.object(workspace_default, "resolve_workspace",
-                                   lambda migrate=True, *, env=None, module_dir=None, _w=ws: _w):
+                                   lambda migrate=True, *, env=None, module_dir=None, cwd=None, _w=ws: _w):
                 results[label] = health.check_bridge_inbox_match()
         self.assertEqual(results["core"]["status"], "ok", results)
         self.assertEqual(results["elsewhere"]["status"], "warn", results)

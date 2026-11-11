@@ -350,12 +350,13 @@ def _test_mode_workspace(env: Optional[Mapping[str, str]] = None) -> Optional[Pa
 
 
 def _workspace_from(cfg: Dict[str, Any], root: Optional[Path],
-                    env: Optional[Mapping[str, str]] = None) -> Path:
+                    env: Optional[Mapping[str, str]] = None,
+                    cwd: Optional[Path] = None) -> Path:
     """The workspace a repo-merged config names. Pure: no warnings, no disk reads.
 
     Shared by `resolve_workspace` and the workspace config layer, so the layer is
-    always read from the workspace every caller resolves. `env` defaults to this
-    process's environment.
+    always read from the workspace every caller resolves. `env` and `cwd` default
+    to this process's; a relative path resolves against `cwd`.
     """
     env = os.environ if env is None else env
     test_ws = _test_mode_workspace(env)
@@ -366,14 +367,19 @@ def _workspace_from(cfg: Dict[str, Any], root: Optional[Path],
     # workspace path; it fills the default slot only, below explicit config.
     embedder_default = env.get("SUTANDO_DEFAULT_WORKSPACE", "").strip()
     if cfg_path:
-        return Path(cfg_path).expanduser().resolve()
+        return _absolute(cfg_path, cwd)
     if embedder_default:
-        return Path(embedder_default).expanduser().resolve()
+        return _absolute(embedder_default, cwd)
     if root is None:
         # No repo root: last-ditch default outside a checkout, deliberately not the
         # removed `.sutando/workspace/`. workspace_default.py mirrors this.
         return Path.home().joinpath("sutando-workspace").resolve()
     return (root / _HARDCODED_WORKSPACE_DEFAULT_REL).resolve()
+
+
+def _absolute(path: str, cwd: Optional[Path]) -> Path:
+    p = Path(path).expanduser()
+    return (Path(cwd) / p if cwd is not None and not p.is_absolute() else p).resolve()
 
 
 def _workspace_layer_path(repo_cfg: Dict[str, Any], root: Path) -> Path:
@@ -462,11 +468,13 @@ _HARDCODED_WORKSPACE_DEFAULT_REL = "workspace"  # relative to repo root
 
 def resolve_workspace(repo_root: Optional[Path] = None, *,
                       env: Optional[Mapping[str, str]] = None,
-                      module_dir: Optional[Path] = None) -> Path:
+                      module_dir: Optional[Path] = None,
+                      cwd: Optional[Path] = None) -> Path:
     """Resolve the workspace directory per the canonical contract.
 
-    `env` + `module_dir` answer for ANOTHER process: the workspace a process with
-    environment `env`, whose `sutando_config.py` sits in `module_dir`, resolves.
+    `env` + `module_dir` + `cwd` answer for ANOTHER process: the workspace a
+    process with environment `env` and working directory `cwd`, whose
+    `sutando_config.py` sits in `module_dir`, resolves.
     That path reads no cache, writes no cache and prints nothing.
 
     Order (v0.8 — `$SUTANDO_WORKSPACE` env override removed):
@@ -487,7 +495,7 @@ def resolve_workspace(repo_root: Optional[Path] = None, *,
 
     if env is not None:
         root = repo_root or _find_repo_root(Path(module_dir) if module_dir else None)
-        return _workspace_from(_repo_config(root)[2] if root else {}, root, env)
+        return _workspace_from(_repo_config(root)[2] if root else {}, root, env, cwd)
 
     env_val = os.environ.get("SUTANDO_WORKSPACE", "").strip()
 
