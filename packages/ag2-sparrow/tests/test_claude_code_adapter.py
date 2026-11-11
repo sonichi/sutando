@@ -85,7 +85,7 @@ class PluginShape(unittest.TestCase):
 
 
 class VerifierMirrorsSparrow(unittest.TestCase):
-    """VERIFY_PY must answer exactly what src/task_envelope.verify_text and
+    """VERIFY_PY must answer exactly what src/task_envelope.verify_text, ag2_sparrow.task_hmac.verify_text and
     team_result_guard.resolve_access_tier answer, vector by vector."""
 
     def setUp(self):
@@ -93,7 +93,9 @@ class VerifierMirrorsSparrow(unittest.TestCase):
             self.skipTest("src/task_envelope.py not beside the package (standalone checkout)")
         sys.path.insert(0, str(SRC))
         import task_envelope
+        from ag2_sparrow import task_hmac
         self.te = task_envelope
+        self.th = task_hmac
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.ws = Path(self.tmp.name)
         self.key = secrets.token_hex(32)
@@ -118,7 +120,15 @@ class VerifierMirrorsSparrow(unittest.TestCase):
             "id: t\ntask: hi\n",
             "id: t\ncollaborator: true\naccess_tier: team\ntask: hi\n",
         ]
-        return [signed, flipped, base, crlf, no_id] + [stamp(t, self.key) for t in tiers]
+        return [signed, flipped, base, crlf, no_id] + [stamp(t, self.key) for t in tiers] + self.malformed(signed)
+
+    @staticmethod
+    def malformed(signed: str) -> list[str]:
+        """The signed vector with its MAC replaced by shapes the signer never emits: non-ASCII, short, long,
+        uppercase, non-hex."""
+        mac = signed.split("\n")[1][len(STAMP):]
+        bad = ["\u00e9", "\u00e9" * 64, mac[:63], mac + "0", mac.upper(), mac[:63] + "g"]
+        return [signed.replace(mac, b) for b in bad]
 
     def check(self, script: str, key_file: str, workspace: Path) -> list[str]:
         """Every vector where the mod's verifier and Sparrow's own readers disagree."""
@@ -126,6 +136,9 @@ class VerifierMirrorsSparrow(unittest.TestCase):
         for i, text in enumerate(self.vectors()):
             verdict, tier, collab = run_verifier(script, text, key_file)
             want_verdict = self.te.verify_text(text, workspace)["verdict"]
+            package_verdict = self.th.verify_text(text, key_file)
+            if package_verdict != want_verdict:
+                diffs.append(f"vector {i}: package {package_verdict} != sparrow {want_verdict}")
             task_file = workspace / f"vec{i}.txt"; task_file.write_text(text)
             want_tier = resolve_access_tier(task_file)
             head = text.split("\ntask:", 1)[0].split("\n")
@@ -162,12 +175,11 @@ class VerifierMirrorsSparrow(unittest.TestCase):
                                  env=hermetic_env(AG2_HMAC_KEY_FILE=missing), check=True).stdout.split()
             self.assertEqual((got[0], got[3], hmac_policy.key_digest(missing)), ("unverifiable", "absent", "absent"))
 
-    def test_a_malformed_stamp_reads_invalid_not_a_crash(self):
-        signed = self.vectors()[0]
-        mac = signed.split("\n")[1][len(STAMP):]
-        for bad in ("\u00e9", mac[:63], mac.upper()):
-            self.assertEqual(run_verifier(verify_py(), signed.replace(mac, bad), str(self.key_file))[0], "invalid",
-                             repr(bad[:8]))
+    def test_a_malformed_stamp_reads_invalid_in_all_three_verifiers(self):
+        for text in self.malformed(self.vectors()[0]):
+            got = (run_verifier(verify_py(), text, str(self.key_file))[0],
+                   self.te.verify_text(text, self.ws)["verdict"], self.th.verify_text(text, str(self.key_file)))
+            self.assertEqual(got, ("invalid",) * 3, repr(text.split("\n")[1][:30]))
 
     def test_mutants_are_caught(self):
         always_verified = verify_py().replace('out("verified" if', 'out("verified" if True or')

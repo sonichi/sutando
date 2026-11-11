@@ -117,6 +117,14 @@ def _mac(text_without_stamp: str, key: bytes) -> str:
                     hashlib.sha256).hexdigest()
 
 
+_MAC_CHARS = frozenset("0123456789abcdef")
+
+
+def is_mac_shape(mac: str) -> bool:
+    """Exactly what _mac emits (64 lowercase hex): compare_digest raises TypeError on non-ASCII str."""
+    return len(mac) == 64 and all(c in _MAC_CHARS for c in mac)
+
+
 def stamp_text(text: str, workspace: Path | None = None) -> str:
     """Return the task text with a fresh stamp line inserted after the
     first line (the `id:` header in every live writer shape — before the
@@ -148,6 +156,9 @@ def verify_text(text: str, workspace: Path | None = None) -> dict:
     if key is None:
         return {"verdict": "unverifiable",
                 "reason": "no local key — cannot judge; treat as warn"}
+    if not is_mac_shape(mac):
+        return {"verdict": "invalid",
+                "reason": "stamp is not 64 lowercase hex characters"}
     want = _mac(stripped, key)
     if hmac.compare_digest(mac, want):
         return {"verdict": "verified", "reason": ""}
