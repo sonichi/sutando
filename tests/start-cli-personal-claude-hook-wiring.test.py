@@ -79,6 +79,10 @@ class StartCliPersonalClaudeHookWiringTest(unittest.TestCase):
         for name in ("src/agent/core-runtime-record.sh", "src/agent/core-window.sh", "src/agent/launch-path.sh", "src/core_runtime_record.py", "src/result_publish.py"):
             shutil.copy2(REPO / name, self.root / name)
         shutil.copy2(
+            REPO / "src/agent/runtime-compat-gate.sh",
+            self.root / "src/agent/runtime-compat-gate.sh",
+        )
+        shutil.copy2(
             REPO / "src/agent/task-event-handler-lookup.sh",
             self.root / "src/agent/task-event-handler-lookup.sh",
         )

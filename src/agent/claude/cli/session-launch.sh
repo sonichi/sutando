@@ -361,13 +361,13 @@ claude_version_at_least() {
 }
 
 # With $1 = "1": --plugin-dir for the task-watch Mod and TASK_WATCH_MOD=1, gated on CLAUDE_BIN,
-# the claude the session's PATH resolves, which the launch then runs. Reads REPO.
+# the compatibility-selected CLI, or the session's PATH when no gate ran. Reads REPO.
 add_task_watch_mod() {
   TASK_WATCH_MOD=""
   CLAUDE_BIN=""
   [ "${1:-}" = "1" ] || return 0
   local dir="$REPO/src/agent/claude/task-watch-mod" min have
-  CLAUDE_BIN="$(PATH="$(claude_pane_path)"; hash -r; command -v claude 2>/dev/null)" || CLAUDE_BIN=""
+  CLAUDE_BIN="$(PATH="$(claude_pane_path)"; hash -r; command -v "${SUTANDO_CORE_CLI_BIN:-claude}" 2>/dev/null)" || CLAUDE_BIN=""
   case "$CLAUDE_BIN" in /*) ;; *) CLAUDE_BIN="" ;; esac
   min="$(sed -n "s/^export const MIN_CLAUDE_VERSION = '\([0-9.]*\)'.*/\1/p" "$dir/hooks/version.ts" 2>/dev/null)"
   have="$([ -n "$CLAUDE_BIN" ] && "$CLAUDE_BIN" --version 2>/dev/null | awk 'NR==1 {print $1}')"
@@ -457,7 +457,7 @@ claude_cli_resolves() {
   local pane_path
   CLAUDE_LAUNCH_FAILURE=""
   pane_path="$(claude_pane_path)"
-  (PATH="$pane_path"; hash -r; command -v claude >/dev/null 2>&1) && return 0
+  (PATH="$pane_path"; hash -r; command -v "${CLAUDE_BIN:-${SUTANDO_CORE_CLI_BIN:-claude}}" >/dev/null 2>&1) && return 0
   CLAUDE_LAUNCH_FAILURE="claude not found on PATH=$pane_path"
   echo "  ⚠ $CLAUDE_LAUNCH_FAILURE" >&2
   return 1
@@ -473,7 +473,7 @@ launch_claude_session() {
   claude_cli_resolves || return 1
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     -e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" \
-    "${CLAUDE_BIN:-claude}" --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
+    "${CLAUDE_BIN:-${SUTANDO_CORE_CLI_BIN:-claude}}" --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
     -- "$BOOT_PROMPT" || true
   for _ in $(seq 1 25); do

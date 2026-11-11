@@ -58,7 +58,7 @@ class Harness:
             (bind / stub).write_text("#!/bin/bash\n" + body)
             (bind / stub).chmod(0o755)
         self.sock = self.td / "t.sock"
-        self.env = {"PATH": f"{bind}:{Path(TMUX).parent}:/usr/bin:/bin:/usr/sbin",
+        self.env = {"SUTANDO_SKIP_RUNTIME_COMPAT": "1", "PATH": f"{bind}:{Path(TMUX).parent}:/usr/bin:/bin:/usr/sbin",
                     "HOME": str(self.td / "home"), "SUTANDO_TMUX_SOCKET": str(self.sock),
                     "SUTANDO_TEST_MODE": "1"}
 

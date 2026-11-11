@@ -310,6 +310,7 @@ class Launcher(unittest.TestCase):
             "SUTANDO_PY": str(self.bin / "py"), "REAL_PY": sys.executable,
             "ANTHROPIC_BASE_URL": "http://127.0.0.1:9", "SUTANDO_TEST_MODE": "1",
             "SUTANDO_WORKSPACE": str(self.ws), "SUTANDO_RESTART_GRACE_S": "1",
+            "SUTANDO_SKIP_RUNTIME_COMPAT": "1",
             "SUTANDO_TMUX_SOCKET": str(td / "run" / "tmux.sock"),
         }
 

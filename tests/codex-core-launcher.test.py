@@ -101,6 +101,16 @@ exit 0
 '''
 
 
+# Answers the compat gate's probes the way a real codex-cli does.
+CODEX_STUB = """#!/bin/bash
+case "${1:-}" in
+  --version) echo "codex-cli 0.160.1" ;;
+  --help) echo "--cd --add-dir --sandbox --ask-for-approval --search --no-alt-screen --config --model" ;;
+esac
+exit 0
+"""
+
+
 class CodexCoreLauncherTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -119,6 +129,14 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/codex-observer.mjs",
             "src/agent/start-cli.sh",
             "src/agent/restart-guard.sh",
+            "src/agent/runtime-compat-gate.sh",
+            "src/runtime_compat.py",
+            "src/auth_preflight.py",
+            "src/owner_reply.py",
+            "src/local_record.py",
+            "src/policy/__init__.py",
+            "src/policy/egress/__init__.py",
+            "src/policy/egress/result.py",
             "src/agent/tmux-socket-guard.sh",
             "src/agent/core-runtime-record.sh",
             "src/agent/core-window.sh",
@@ -215,7 +233,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
         subprocess.run([sys.executable, str(self.root / "src/runtime_observation.py"), "write",
                         "--workspace", str(workspace)], input=json.dumps(record), text=True, check=True)
         self.bin.mkdir()
-        self._write_exe("codex", '#!/bin/bash\n[ "${1:-}" = login ] && exit 0\nexit 0\n')
+        self._write_exe("codex", CODEX_STUB)
         self._write_exe("fswatch", '#!/bin/bash\nexit 0\n')
         # Nothing listens on the agent API port; the fake API only records its start.
         self._write_exe("lsof", '#!/bin/bash\nexit 1\n')
@@ -414,6 +432,9 @@ exit 0
             env["FAKE_CORE_PANE_PID"] = str(self.pane_pid)
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
+            "SUTANDO_RUNTIME_SYSTEM_DIRS": "",
+            "SUTANDO_RUNTIME_WAIT_S": "0",
+            "SUTANDO_RUNTIMES_DIR": str(Path(self.tmp.name) / "runtimes"),
             "TMUX_LOG": str(self.log),
             "TMUX_STATE": str(Path(self.tmp.name) / "tmux-killed"),
             "HOME": str(Path(self.tmp.name) / "home"),
@@ -452,6 +473,9 @@ exit 0
         env.pop("SUTANDO_APP_SUPPORT", None)
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
+            "SUTANDO_RUNTIME_SYSTEM_DIRS": "",
+            "SUTANDO_RUNTIME_WAIT_S": "0",
+            "SUTANDO_RUNTIMES_DIR": str(Path(self.tmp.name) / "runtimes"),
             "TMUX_LOG": str(self.log),
             "TMUX_STATE": str(Path(self.tmp.name) / "tmux-killed"),
             "HOME": str(Path(self.tmp.name) / "home"),
@@ -526,7 +550,8 @@ exit 0
         marker = tmp / "codex-ran"
         for key in ("install", "local"):
             exe = dirs[key] / "codex"
-            exe.write_text(f'#!/bin/bash\nprintf "%s\\n%s\\n" {key} "$PATH" > "{marker}"\nexit 1\n')
+            auth_probe = f'  login) printf "%s\\n%s\\n" {key} "$PATH" > "{marker}"; exit 1 ;;\n'
+            exe.write_text(CODEX_STUB.replace("esac\nexit 0", auth_probe + "esac\nexit 0"))
             exe.chmod(0o755)
         (self.bin / "codex").unlink()
         env = {"CODEX_INSTALL_BIN": str(dirs["install"])}
@@ -1111,12 +1136,160 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertIn("sutando-core already running (codex)", result.stdout)
 
     def test_auth_failure_stops_before_tmux_launch(self):
-        self._write_exe("codex", '#!/bin/bash\nexit 1\n')
+        self._write_exe("codex", CODEX_STUB.replace("esac\nexit 0", "  login) exit 1 ;;\nesac\nexit 0"))
         result = self.run_launcher()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not authenticated", result.stderr)
         calls = self._tmux_calls()
         self.assertNotIn("new-session", calls)
+
+    def test_off_tty_broken_cli_asks_the_owner_then_their_reply_repairs_and_launches(self):
+        self._write_exe("codex", "#!/bin/bash\nexit 1\n")
+        ws = self.root / "workspace"
+        self._write_exe("npm", """#!/bin/bash
+PREFIX=""
+while [ $# -gt 0 ]; do [ "$1" = --prefix ] && PREFIX="$2"; shift; done
+mkdir -p "$PREFIX/bin"
+cp "$CODEX_GOOD" "$PREFIX/bin/codex"
+""")
+        first = self.run_launcher()
+        self.assertEqual(first.returncode, 3, first.stderr)
+        self.assertNotIn("new-session -d -s sutando-core ", self._tmux_calls())
+        self.assertEqual(self.run_launcher().returncode, 3)
+        notices = sorted((ws / "results").glob("proactive-runtime-compat-codex-*.txt"))
+        self.assertEqual(len(notices), 1, "one DM per incident, however often the launch is retried")
+        self.assertIn('Reply "install compatible codex"', notices[0].read_text())
+        good = Path(self.tmp.name) / "codex-good"
+        good.write_text(CODEX_STUB)
+        good.chmod(0o755)
+        reply = ws / "tasks" / "task-900.txt"
+        reply.parent.mkdir(parents=True, exist_ok=True)
+        reply.write_text("source: ag2space\naccess_tier: owner\ntask: install compatible codex\n")
+        done = self.run_launcher(env_extra={"CODEX_GOOD": str(good)})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        managed = Path(self.tmp.name) / "runtimes" / "bin" / "codex"
+        self.assertIn(f"{managed} -C", self._tmux_calls())
+        self.assertIn("Installed codex 0.160.1", (ws / "results" / "task-900.txt").read_text())
+        self.assertFalse(reply.exists())
+        self.assertEqual(len(list((ws / "tasks" / "archive").rglob("task-900.txt"))), 1)
+        again = self.run_launcher(env_extra={"CODEX_GOOD": str(good)})
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(len(sorted((ws / "results").glob("proactive-runtime-compat-codex-*.txt"))), 1)
+
+    def test_app_surface_broken_codex_stops_at_once_without_a_dm(self):
+        self._write_exe("codex", "#!/bin/bash\nexit 1\n")
+        ran = Path(self.tmp.name) / "npm-ran"
+        self._write_exe("npm", f'#!/bin/bash\ntouch "{ran}"\nexit 1\n')
+        start = time.monotonic()
+        r = self.run_launcher(env_extra={"SUTANDO_RUNTIME_CONSENT_SURFACE": "app",
+                                         "SUTANDO_RUNTIME_WAIT_S": "600"})
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertLess(time.monotonic() - start, 60)
+        self.assertNotIn("waiting up to", r.stderr)
+        self.assertNotIn("new-session -d -s sutando-core ", self._tmux_calls())
+        ws = self.root / "workspace"
+        self.assertEqual(sorted((ws / "results").glob("proactive-runtime-compat-codex-*.txt")), [])
+        self.assertFalse(ran.exists())
+
+    def test_app_surface_login_timeout_does_not_request_a_session(self):
+        hanging = CODEX_STUB.replace("esac\nexit 0", "  login) exec /bin/sleep 30 ;;\nesac\nexit 0")
+        self._write_exe("codex", hanging)
+        result = self.run_launcher(env_extra={"SUTANDO_RUNTIME_CONSENT_SURFACE": "app",
+                                              "SUTANDO_RUNTIME_WAIT_S": "600"})
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertIn("login status failed", result.stderr)
+        self.assertNotIn("new-session", self._tmux_calls())
+        self.assertNotIn("new-window", self._tmux_calls())
+
+    def _owner_reply_installs(self, installed_stub):
+        """Broken codex, one launch to open the incident, then the owner's install reply."""
+        self._write_exe("codex", "#!/bin/bash\nexit 1\n")
+        ws = self.root / "workspace"
+        self._write_exe("npm", """#!/bin/bash
+PREFIX=""
+while [ $# -gt 0 ]; do [ "$1" = --prefix ] && PREFIX="$2"; shift; done
+mkdir -p "$PREFIX/bin"
+cp "$CODEX_GOOD" "$PREFIX/bin/codex"
+""")
+        self.assertEqual(self.run_launcher().returncode, 3)
+        good = Path(self.tmp.name) / "codex-good"
+        good.write_text(installed_stub)
+        good.chmod(0o755)
+        reply = ws / "tasks" / "task-901.txt"
+        reply.parent.mkdir(parents=True, exist_ok=True)
+        reply.write_text("source: ag2space\naccess_tier: owner\ntask: install compatible codex\n")
+        result = self.run_launcher(env_extra={"CODEX_GOOD": str(good)})
+        return result, (ws / "results" / "task-901.txt").read_text()
+
+    def test_owner_install_reply_on_a_logged_out_codex_answers_with_the_login_step(self):
+        logged_out = CODEX_STUB.replace("esac\nexit 0", "  login) exit 1 ;;\nesac\nexit 0")
+        result, answer = self._owner_reply_installs(logged_out)
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertNotIn("new-session -d -s sutando-core ", self._tmux_calls())
+        self.assertIn("Installed codex 0.160.1", answer)
+        self.assertIn("codex login", answer)
+        self.assertIn('"retry now"', answer)
+        self.assertNotIn("starting", answer)
+
+    def test_owner_install_reply_on_a_logged_in_codex_answers_that_it_starts(self):
+        result, answer = self._owner_reply_installs(CODEX_STUB)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        managed = Path(self.tmp.name) / "runtimes" / "bin" / "codex"
+        self.assertIn(f"{managed} -C", self._tmux_calls())
+        self.assertIn("Installed codex 0.160.1", answer)
+        self.assertIn("The core is starting.", answer)
+
+    def test_no_codex_anywhere_with_consent_installs_and_launches(self):
+        (self.bin / "codex").unlink()
+        good = Path(self.tmp.name) / "codex-good"
+        good.write_text(CODEX_STUB)
+        good.chmod(0o755)
+        self._write_exe("npm", """#!/bin/bash
+PREFIX=""
+while [ $# -gt 0 ]; do [ "$1" = --prefix ] && PREFIX="$2"; shift; done
+mkdir -p "$PREFIX/bin"
+cp "$CODEX_GOOD" "$PREFIX/bin/codex"
+""")
+        result = self.run_launcher(env_extra={"CODEX_GOOD": str(good),
+                                              "SUTANDO_RUNTIME_REPAIR_CONSENT": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("repair succeeded", result.stderr)
+        managed = Path(self.tmp.name) / "runtimes" / "bin" / "codex"
+        self.assertIn(f"{managed} -C", self._tmux_calls())
+
+    def test_working_managed_codex_off_path_is_found_and_launched(self):
+        (self.bin / "codex").unlink()
+        managed = Path(self.tmp.name) / "runtimes" / "bin" / "codex"
+        managed.parent.mkdir(parents=True)
+        managed.write_text(CODEX_STUB)
+        managed.chmod(0o755)
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("not installed", result.stderr)
+        self.assertIn(f"{managed} -C", self._tmux_calls())
+
+    def test_heals_the_core_window_with_the_managed_codex_off_path(self):
+        (self.bin / "codex").unlink()
+        managed = Path(self.tmp.name) / "runtimes" / "bin" / "codex"
+        managed.parent.mkdir(parents=True)
+        managed.write_text(CODEX_STUB)
+        managed.chmod(0o755)
+        result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "codex", "FAKE_NO_CORE_WINDOW": "1"})
+        self.assertIn("healing core window", result.stderr)
+        calls = self._tmux_calls()
+        self.assertIn(f"-c {self.root} {managed} -C", calls)
+        self.assertNotIn("new-session -d -s sutando-core ", calls + " ")
+
+    def test_two_codex_on_path_the_too_old_first_is_skipped_for_the_second(self):
+        self._write_exe("codex", CODEX_STUB.replace("0.160.1", "0.30.0"))
+        second = Path(self.tmp.name) / "bin2" / "codex"
+        second.parent.mkdir()
+        second.write_text(CODEX_STUB)
+        second.chmod(0o755)
+        result = self.run_launcher(env_extra={"PATH": f"{self.bin}:{second.parent}:/usr/bin:/bin"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"using {second} (0.160.1)", result.stderr)
+        self.assertIn(f"{second} -C", self._tmux_calls())
 
     def test_notifier_supervisor_restarts_after_child_exit(self):
         count = Path(self.tmp.name) / "notifier-count"
@@ -2916,7 +3089,8 @@ class CoreWindowRestartTests(unittest.TestCase):
         (self.case.bin / "tmux").symlink_to(REAL_TMUX)
         # A core that stays up like the real CLI; `login status` still succeeds.
         codex = self.case.bin / "codex"
-        codex.write_text('#!/bin/bash\n[ "${1:-}" = login ] && exit 0\nexec sleep 300\n')
+        codex.write_text(CODEX_STUB.replace(' ;;', '; exit 0 ;;').replace(
+            "esac\nexit 0", "  login) exit 0 ;;\nesac\nexec sleep 300"))
         codex.chmod(0o755)
 
     def tmux(self, *args):
