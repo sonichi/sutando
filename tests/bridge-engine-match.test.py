@@ -14,12 +14,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "tests"))  # `python3 -I` does not add the script dir
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # `python3 -I` does not add the script dir
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
 
 isolate_os_environ()
+ROOT = Path(__file__).resolve().parent.parent
 os.environ["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(prefix="ccd-bridge-engine-")
 _slack_cfg = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "channels" / "slack"
 _slack_cfg.mkdir(parents=True, exist_ok=True)
