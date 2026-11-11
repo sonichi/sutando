@@ -777,6 +777,28 @@ class AccountChange(unittest.TestCase):
         self.assertEqual(self.gate(), clh.HOLD_EXIT, "the account that hit the limit is the one held")
         self.assertEqual(clh.read_hold(self.ws)["account"], clh.account_fingerprint(str(self.cfg)))
 
+    def test_a_legacy_hold_without_an_account_is_not_claimed_by_the_account_launching_now(self):
+        """A record written before accounts were recorded carries none. The account launching
+        now may already be the new one, so it must not be stamped onto that record: the old
+        limit would become this account's."""
+        t = self.now
+        clh._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "model": None,
+                                  "evidence_at": t - 30, "set_at": t - 20, "until": t - 1, "strikes": 1,
+                                  "reason": "core paused: usage limit on its model, retrying later",
+                                  "notice": "legacy.txt", "notice_queued": True})
+        launched = clh.decide(self.ws, t, quota=limited_record(t, ago=30), launch_account="B")
+        self.assertTrue(launched.launch, "an expired legacy hold with unchanged evidence lets the core out")
+        record = clh.read_hold(self.ws)
+        self.assertEqual(record["status"], "released")
+        self.assertNotIn("account", record, "the launch account was stamped onto a legacy hold")
+        # In force, it still binds whoever launches (an unknown side keeps it binding) and stays unclaimed.
+        clh._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "model": None,
+                                  "evidence_at": t - 30, "set_at": t - 20, "until": t + 600, "strikes": 1,
+                                  "reason": "core paused: usage limit on its model, retrying later",
+                                  "notice": "legacy.txt", "notice_queued": True})
+        self.assertFalse(clh.decide(self.ws, t, quota=limited_record(t, ago=30), launch_account="B").launch)
+        self.assertNotIn("account", clh.read_hold(self.ws))
+
     def test_unreadable_account_keeps_the_hold(self):
         self.sign_in("acct-a", "a@example.com")
         self.assertEqual(self.gate(), clh.HOLD_EXIT)
