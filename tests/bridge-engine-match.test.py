@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -16,7 +18,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # `python3 -I` does not add the script dir
 
-from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
 
 isolate_os_environ()
 ROOT = Path(__file__).resolve().parent.parent
@@ -75,8 +77,7 @@ class EngineMatch(unittest.TestCase):
         self.assertEqual(got["status"], "ok", got)
 
     def test_other_engine_warns_naming_both_dirs(self):
-        # Flattened argv with a space in the path, as `ps` prints it.
-        got = self._probe({"3": f"python3 {self.old}/src/slack-bridge.py"})
+        got = self._probe({"3": ["python3", f"{self.old}/src/slack-bridge.py"]})
         self.assertEqual(got["status"], "warn", got)
         self.assertIn(f"slack-bridge pid 3 runs from {os.path.realpath(self.old)}", got["detail"])
         self.assertIn(f"not this app's engine ({os.path.realpath(self.core)})", got["detail"])
@@ -95,7 +96,7 @@ class EngineMatch(unittest.TestCase):
             self.core, lambda s: (["5"] if s == "slack-bridge.py" else [], True),
             argv_of=lambda pid: "", cwd_of=lambda pid: "")
         self.assertEqual(got["status"], "unknown", got)
-        self.assertIn("slack-bridge pid 5: script path unreadable", got["detail"])
+        self.assertIn("slack-bridge pid 5: argv vector unreadable", got["detail"])
         got = self._probe({"6": ["python3", "src/slack-bridge.py"]})  # relative, no cwd
         self.assertEqual(got["status"], "unknown", got)
         self.assertIn("relative script path and cwd unreadable", got["detail"])
@@ -113,7 +114,8 @@ class EngineMatch(unittest.TestCase):
         argv = ["python3", f"{self.core}/src/read-file.py", f"{self.old}/src/slack-bridge.py"]
         got = self._probe({"9": ("slack-bridge.py", argv)})
         self.assertNotEqual(got["status"], "warn", got)
-        self.assertIn("slack-bridge pid 9: script path unreadable", got["detail"])
+        self.assertIn("slack-bridge pid 9: the interpreter's first script operand "
+                      "is not slack-bridge.py", got["detail"])
         flat = f"python3 {self.core}/src/read-file.py {self.old}/src/slack-bridge.py"
         got = self._probe({"9": ("slack-bridge.py", flat)})
         self.assertNotEqual(got["status"], "warn", got)
@@ -127,11 +129,9 @@ class EngineMatch(unittest.TestCase):
 
     def test_unbuffered_launch_with_spaces_in_both_paths_is_recognised(self):
         interp = f"{self.tmp}/runtime/python/bin/python3"  # self.tmp contains "Application Support"
-        for argv in ([interp, "-u", f"{self.old}/src/slack-bridge.py"],
-                     f"{interp} -u {self.old}/src/slack-bridge.py"):
-            got = self._probe({"13": ("slack-bridge.py", argv)})
-            self.assertEqual(got["status"], "warn", (argv, got))
-            self.assertIn(f"runs from {os.path.realpath(self.old)}", got["detail"])
+        got = self._probe({"13": ("slack-bridge.py", [interp, "-u", f"{self.old}/src/slack-bridge.py"])})
+        self.assertEqual(got["status"], "warn", got)
+        self.assertIn(f"runs from {os.path.realpath(self.old)}", got["detail"])
         got = self._probe({"13": ("slack-bridge.py", [interp, "-u", f"{self.core}/src/slack-bridge.py"])})
         self.assertEqual(got["status"], "ok", got)
 
@@ -146,6 +146,64 @@ class EngineMatch(unittest.TestCase):
             got = self._probe({"14": ("slack-bridge.py", argv)})
             self.assertEqual(got["status"], "unknown", (argv, got))
 
+    def test_flattened_ps_line_is_unknown_not_parsed(self):
+        for flat in (f"python3 {self.old}/src/slack-bridge.py",
+                     f"python3 {self.core}/src/slack-bridge.py", f"python3 {self.old}/x.py python3 y"):
+            got = self._probe({"15": ("slack-bridge.py", flat)})
+            self.assertEqual(got["status"], "unknown", (flat, got))
+            self.assertIn("slack-bridge pid 15: argv vector unreadable (a flattened ps command "
+                          "line is ambiguous, so it is not parsed)", got["detail"])
+        got = self._probe({"15": ("slack-bridge.py", [])})
+        self.assertEqual(got["status"], "unknown", got)
+
+    def test_bridge_with_trailing_arguments_is_recognised(self):
+        got = self._probe({"16": ["python3", "-u", f"{self.old}/src/slack-bridge.py", "--foo", "x"]})
+        self.assertEqual(got["status"], "warn", got)
+        self.assertIn("slack-bridge pid 16 runs from", got["detail"])
+        got = self._probe({"16": ["python3", f"{self.core}/src/slack-bridge.py", "--foo"]})
+        self.assertEqual(got, {"name": "bridge-engine-match", "status": "ok",
+                               "detail": "1 bridge(s) run from this engine"})
+
+    def test_only_python_interpreters_count(self):
+        for tool in ("vim", "/usr/bin/tail", "less", "pythonista", "python2", "ipython3"):
+            got = self._probe({"17": [tool, f"{self.old}/src/slack-bridge.py"]})
+            self.assertEqual(got, {"name": "bridge-engine-match", "status": "ok",
+                                   "detail": "no bridge running"}, tool)
+        for interp in ("python", "python3", "/opt/py/bin/python3.12", "Python"):
+            got = self._probe({"17": [interp, f"{self.old}/src/slack-bridge.py"]})
+            self.assertEqual(got["status"], "warn", (interp, got))
+        got = self._probe({"17": ["vim", f"{self.core}/src/slack-bridge.py"],
+                           "18": ["python3", f"{self.core}/src/slack-bridge.py"]})
+        self.assertEqual(got["detail"], "1 bridge(s) run from this engine")
+
+    def test_case_variant_of_the_engine_does_not_warn_on_a_case_insensitive_volume(self):
+        variant = Path(str(self.core).replace("/desktop/", "/DESKTOP/"))
+        argv = ["python3", f"{variant}/src/slack-bridge.py"]
+        for insensitive, status in ((True, "ok"), (False, "warn")):
+            with mock.patch.object(bridge_engine.os.path, "samefile",
+                                   lambda a, b, _r=insensitive: _r):
+                got = self._probe({"19": argv})
+            self.assertEqual(got["status"], status, (insensitive, got))
+        with mock.patch.object(bridge_engine.os.path, "samefile", side_effect=OSError("gone")):
+            self.assertEqual(self._probe({"19": argv})["status"], "warn")
+        with mock.patch.object(bridge_engine.os.path, "samefile", side_effect=AssertionError):
+            got = self._probe({"19": ["python3", f"{self.old}/src/slack-bridge.py"]})
+        self.assertEqual(got["status"], "warn", got)  # spellings that differ beyond case
+
+    def test_case_variant_against_the_real_volume(self):
+        variant = Path(str(self.core).replace("/desktop/", "/DESKTOP/"))
+        insensitive = variant.exists()
+        got = self._probe({"20": ["python3", f"{variant}/src/slack-bridge.py"]})
+        self.assertEqual(got["status"], "ok" if insensitive else "warn", (insensitive, got))
+
+    def test_windows_is_unknown_and_says_why(self):
+        def never(script):
+            raise AssertionError("no scan on Windows")
+        got = bridge_engine.check_bridge_engine_match(self.core, never, platform="win32")
+        self.assertEqual(got, {"name": "bridge-engine-match", "status": "unknown",
+                               "detail": "not checked on Windows: there is no reader here for a "
+                                         "process's argv vector or working directory"})
+
     def test_no_bridge(self):
         got = self._probe({})
         self.assertEqual(got, {"name": "bridge-engine-match", "status": "ok",
@@ -154,31 +212,25 @@ class EngineMatch(unittest.TestCase):
 
 class Readers(unittest.TestCase):
     def test_operand_edge_cases(self):
-        op = bridge_engine._script_operand
-        self.assertIsNone(op(["vim", "/e/src/slack-bridge.py"], "slack-bridge.py"))
-        self.assertIsNone(op(["python3", "-", "/e/src/slack-bridge.py"], "slack-bridge.py"))
-        self.assertIsNone(op(["python3", "-u"], "slack-bridge.py"))
-        self.assertIsNone(op(["python3", "-u", "-X"], "slack-bridge.py"))
-        self.assertEqual(op(["python3", "--", "/e/src/slack-bridge.py"], "slack-bridge.py"),
-                         "/e/src/slack-bridge.py")
-        self.assertIsNone(op(["python3", "--"], "slack-bridge.py"))
-        self.assertIsNone(op(["python3", 3, "/e/src/slack-bridge.py"], "slack-bridge.py"))
-        self.assertIsNone(op("vim /e/src/slack-bridge.py", "slack-bridge.py"))
-        self.assertIsNone(op("python3 -u", "slack-bridge.py"))
+        op = bridge_engine._first_operand
+        self.assertIsNone(op(["python3", "-", "/e/src/slack-bridge.py"]))
+        self.assertIsNone(op(["python3", "-u"]))
+        self.assertIsNone(op(["python3", "-u", "-X"]))
+        self.assertEqual(op(["python3", "--", "/e/src/slack-bridge.py"]), "/e/src/slack-bridge.py")
+        self.assertIsNone(op(["python3", "--"]))
+        self.assertEqual(op(["python3", "/e/src/slack-bridge.py", "--foo"]), "/e/src/slack-bridge.py")
 
-    def test_read_argv_prefers_the_vector_then_ps(self):
+    def test_read_argv_is_the_vector_and_never_ps(self):
         me = str(os.getpid())
-        with mock.patch.object(bridge_engine, "_argv_vector", lambda pid: ["python3", "x.py"]):
-            self.assertEqual(bridge_engine.read_argv(me), ["python3", "x.py"])
-        ps = mock.Mock(stdout="python3 /e/src/slack-bridge.py\n")
-        with mock.patch.object(bridge_engine, "_argv_vector", lambda pid: None), \
-             mock.patch.object(bridge_engine.subprocess, "run", return_value=ps) as run:
-            self.assertEqual(bridge_engine.read_argv(me), "python3 /e/src/slack-bridge.py")
-        self.assertEqual(run.call_args.args[0][:3], ["/bin/ps", "-o", "command="])
-        for exc in (OSError("no ps"), bridge_engine.subprocess.TimeoutExpired("ps", 5)):
-            with mock.patch.object(bridge_engine, "_argv_vector", lambda pid: None), \
-                 mock.patch.object(bridge_engine.subprocess, "run", side_effect=exc):
-                self.assertEqual(bridge_engine.read_argv(me), "")
+        with mock.patch.object(bridge_engine.subprocess, "run", side_effect=AssertionError("ps")):
+            with mock.patch.object(bridge_engine, "_argv_vector", lambda pid: ["python3", "x.py"]):
+                self.assertEqual(bridge_engine.read_argv(me), ["python3", "x.py"])
+            for none in (None, []):
+                with mock.patch.object(bridge_engine, "_argv_vector", lambda pid, _n=none: _n):
+                    self.assertIsNone(bridge_engine.read_argv(me))
+        vec = bridge_engine.read_argv(me)
+        self.assertIsInstance(vec, list)
+        self.assertIn(Path(__file__).name, " ".join(vec))
 
     def test_read_cwd_from_proc(self):
         root = Path(tempfile.mkdtemp())
@@ -238,6 +290,33 @@ class HealthCheckWiring(unittest.TestCase):
         self.assertEqual(got["status"], "warn", got)
         self.assertIn("telegram-bridge pid 12 runs from", got["detail"])
         self.assertIn("Also engine unknown: slack-bridge: process scan failed", got["detail"])
+
+    def test_scan_pattern_finds_a_bridge_with_trailing_arguments(self):
+        health = self._health()
+        seen = []
+        with mock.patch.object(health, "probe_pids", lambda pat: (seen.append(pat), ([], True))[1]):
+            health.check_bridge_engine_match()
+        pattern = next(p for p in seen if "slack" in p)
+        pgrep = shutil.which("pgrep")
+        if pgrep is None:
+            self.assertTrue(sys.platform.startswith("win"), "pgrep missing on a POSIX host")
+            return
+        src = Path(tempfile.mkdtemp()) / "src"
+        src.mkdir()
+        sleeper = "import time; time.sleep(30)"
+        procs = [subprocess.Popen([sys.executable, "-c", sleeper, *tail], env=isolated_child_env())
+                 for tail in ([f"{src}/slack-bridge.py", "--foo"], [f"{src}/slack-bridge.py"],
+                              [f"{src}/slack-bridge.py.log"])]
+        try:
+            out = subprocess.run([pgrep, "-f", pattern], capture_output=True, text=True,
+                                 env=isolated_child_env(), timeout=10).stdout.split()
+        finally:
+            for p in procs:
+                p.kill()
+                p.wait()
+        self.assertIn(str(procs[0].pid), out)
+        self.assertIn(str(procs[1].pid), out)
+        self.assertNotIn(str(procs[2].pid), out)
 
     def test_health_check_compares_with_its_own_engine(self):
         spec = importlib.util.spec_from_file_location("health_check", ROOT / "src" / "health-check.py")

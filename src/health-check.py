@@ -9467,7 +9467,8 @@ def _watcher_runtime(sentinel: Path, inbox: "str | None") -> str:
 def check_bridge_engine_match() -> dict:
     """A bridge running from another install's engine may write tasks this core never reads."""
     def _pids(script: str) -> tuple:
-        pids, scanned = probe_pids(re.escape(script) + "$")
+        # Not end-anchored: a bridge launched with trailing arguments must still be found.
+        pids, scanned = probe_pids(re.escape(script) + "([[:space:]]|$)")
         return _drop_launcher_parents(pids), scanned
     try:
         return bridge_engine.check_bridge_engine_match(REPO_DIR, _pids)
