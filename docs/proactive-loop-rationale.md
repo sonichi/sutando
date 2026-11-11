@@ -34,9 +34,9 @@ pass. These checks diagnose missing configuration; they do not recreate a driver
 or modify the host's schedules.
 
 The loop is also the one session cron that never yields to queued owner work:
-`/schedule-crons` registers every other `crons.json` entry behind a
-`scripts/cron-gate.sh --check` preamble (`src/cron_prompt_gate.py`) so a
-scheduled job stops when owner tasks are waiting, and the loop is exempt because
+`/schedule-crons` registers every other `crons.json` entry behind the cron
+gate's check preamble (see that skill's "Defer crons" section) so a scheduled
+job stops when owner tasks are waiting, and the loop is exempt because
 it is what drains that queue — gating it would deadlock the owner's own messages.
 
 The archived rationale below predates this completion contract where it refers
