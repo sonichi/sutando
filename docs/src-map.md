@@ -311,6 +311,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`voice-key.ts`** — Shared Gemini API-key resolution for voice surfaces (voice-agent, phone-conversation, and any plugin voice surface).
 - **`voice-lock.ts`** — voice-lock.ts — TS caller of the guarded PID-lock helper (`scripts/voice-lock.py`), used by voice-agent's `acquirePidLock` (impl plan WS1 Step 4, amendments R1/R3/R4).
 - **`voice-mode-resolver.ts`** — Unified base-mode resolver for the voice agent (issue #1410, supersedes partial fixes #1412 + #1413).
+- **`voice-offline-notice.ts`** — Which voice-offline categories the owner has already been told about, kept in the workspace so the notice is owed once per outage, not once per voice-agent process (#6368).
 - **`voice-recovery-config.ts`** — Env settings for bodhi's upstream recovery: whether active-silence recovery is armed and after how many health ticks, and when a stuck dial is replaced.
 - **`voice-session-end.ts`** — When the user hangs up, the core gets a task about that call: when it ran, how it ended, and what was said.
 - **`voice-task-status-writer.ts`** — Writes the relay agent's task table out for the status page, the way bodhi's history stores write the conversation: the table lives in memory and calls back after each change; this writes asynchronously, one write at a time, coalescing changes that arrive while a write is in flight (the last state wins).
