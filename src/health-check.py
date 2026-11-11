@@ -7010,9 +7010,11 @@ def check_sspace_migration(workspace_dir: Optional[Path] = None) -> "dict | None
     return {"name": "sspace-migration", "status": "warn",
             "detail": (f"only connected to {legacy}, no {target} connection — from the repo first try the "
                        "agent's existing secret: python3 scripts/connections.py move --repo . --logs-dir "
-                       '"$(bash scripts/sutando-config.sh workspace)/logs"; if it is refused, '
-                       "in the Sutando desktop app, open Homeserver connections and choose Update code… "
-                       "(Reconnect with a code… if it is paused)")}
+                       '"$(bash scripts/sutando-config.sh workspace)/logs"; if it is refused, add the '
+                       f"{target} relay token as a new connection and promote it: python3 scripts/connections.py "
+                       "add - --yes --expected-server " + target + " (token on stdin) && "
+                       "python3 scripts/connections.py promote s-space --repo . --logs-dir "
+                       '"$(bash scripts/sutando-config.sh workspace)/logs"')}
 
 
 def check_gateway_bridge() -> "dict | None":

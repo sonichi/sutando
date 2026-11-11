@@ -88,7 +88,8 @@ class CliTests(unittest.TestCase):
         proc = self.run_cli("move", "--dry-run")
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("move refused: no_successor", proc.stderr)
-        self.assertIn("open Homeserver connections and choose Update code\u2026", proc.stdout)
+        self.assertIn("connections.py add - --yes --expected-server s.space", proc.stdout)
+        self.assertIn("connections.py promote s-space --repo . --logs-dir", proc.stdout)
         self.assertFalse((self.ws / "state" / "connections.json").exists(), "a refusal writes nothing")
 
     def test_add_previews_then_asks(self):
@@ -506,8 +507,12 @@ class InProcess(unittest.TestCase):
         rc, out, err = self.run_main(["move", "--dry-run"], try_reuse_move=refused)
         self.assertEqual(rc, 1)
         self.assertIn("move refused: auth_rejected (s.space does not accept it)", err)
-        self.assertEqual(out, "next: in the Sutando desktop app, open Homeserver connections and choose "
-                              "Update code\u2026 (Reconnect with a code\u2026 if it is paused)\n")
+        self.assertEqual(out, "next: add the s.space relay token as a new connection and promote it: "
+                              "python3 scripts/connections.py add - --yes --expected-server s.space "
+                              "(token on stdin) && python3 scripts/connections.py promote s-space --repo . "
+                              '--logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"; '
+                              "Update code\u2026 in the Sutando desktop app's Homeserver connections only "
+                              "replaces a same-server rotated token, not this cross-server move\n")
         half = lambda inst, **kw: {"ok": False, "reason": "new_primary_not_connected", "detail": "", "server": "s.space",
                                    "added": True, "instance": "s-space"}
         rc, out, _ = self.run_main(["move", "--repo", "/r", "--logs-dir", "/l"], try_reuse_move=half)

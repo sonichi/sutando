@@ -325,8 +325,15 @@ to check; `{"instance": "legacy"}` names the legacy row), answering `{ok, instan
 A refusal writes nothing and names its reason: `auth_rejected` (either server issued a new token
 since the copy), `agent_mismatch` (another agent or owner), `unverified` (a server did not confirm
 the agent), `no_token`, `no_successor` or `successor_exists` (another agent's row is already on
-s.space). Then, in the Sutando desktop app, open Homeserver connections and choose Update code…
-(Reconnect with a code… if it is paused).
+s.space). Then add the s.space relay token as a new connection and promote it:
+
+```
+python3 scripts/connections.py add - --yes --expected-server s.space   # token on stdin
+python3 scripts/connections.py promote s-space --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"
+```
+
+(The desktop app's Homeserver connections → Update code… only replaces a same-server rotated token;
+it does not perform this cross-server move.)
 
 To go back: `unpark ''`, let its launcher resume the legacy bridge, then `promote ''`.
 

@@ -55,11 +55,15 @@ class SspaceMigrationProbe(unittest.TestCase):
         out = hc.check_sspace_migration(self.ws)
         self.assertEqual(out["name"], "sspace-migration")
         self.assertEqual(out["status"], "warn")
-        self.assertTrue(out["detail"].endswith("; if it is refused, in the Sutando desktop app, open Homeserver connections and choose Update code… (Reconnect with a code… if it is paused)"), out["detail"])
+        self.assertTrue(out["detail"].endswith(
+            'promote s-space --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"'),
+            out["detail"])
         self.assertLess(out["detail"].index("connections.py move --repo . --logs-dir"),
-                        out["detail"].index("Homeserver connections"), "the existing secret is tried first")
-        for gone in ("agent portal", "connections.py add", "connections.py promote"):
-            self.assertNotIn(gone, out["detail"])
+                        out["detail"].index("connections.py add"), "the existing secret is tried first")
+        self.assertIn("connections.py add", out["detail"])
+        self.assertIn("connections.py promote", out["detail"])
+        self.assertNotIn("agent portal", out["detail"])
+        self.assertNotIn("Homeserver connections", out["detail"])
         self.assertEqual(connections.record_path(self.ws).read_bytes(), before, "the probe never writes")
 
     def test_commands_parse_with_the_real_cli(self):
@@ -73,10 +77,14 @@ class SspaceMigrationProbe(unittest.TestCase):
             verbs.append(args.verb)
             if args.verb == "move":
                 self.assertEqual((args.instance, args.logs_dir), (None, Path("/w/logs")))
+            if args.verb == "add":
+                self.assertEqual(args.token, "-")
+                self.assertEqual(args.expected_server, "s.space")
+                self.assertTrue(args.yes)
             if args.verb == "promote":
                 self.assertEqual(args.instance, connections.instance_for("s.space"))
                 self.assertIsInstance(args.logs_dir, Path)
-        self.assertEqual(verbs, ["move"])
+        self.assertEqual(verbs, ["move", "add", "promote"])
 
     def test_warns_for_provisional_gateway_host_row(self):
         self.write([_row("chat.ag2.space", "ag2-space", primary=True)])
@@ -99,8 +107,9 @@ class SspaceMigrationProbe(unittest.TestCase):
     def test_doc_section_names_the_same_commands(self):
         doc = (REPO / "docs" / "connections.md").read_text()
         section = doc.split("### Moving a terminal-run core to s.space", 1)[1].split("\n## ", 1)[0]
-        self.assertIn("Then, in the Sutando desktop app, open Homeserver connections and choose Update code\u2026\n"
-                      "(Reconnect with a code\u2026 if it is paused).", section)
+        self.assertIn("python3 scripts/connections.py add - --yes --expected-server s.space", section)
+        self.assertIn("python3 scripts/connections.py promote s-space --repo . --logs-dir", section)
+        self.assertIn("only replaces a same-server rotated token", section)
         self.assertNotIn("agent portal", section)
         self.assertNotIn("connections.py add '<code>'", section)
 
