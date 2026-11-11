@@ -53,8 +53,8 @@ class ClaudeLauncherEnsuresHeartbeat(unittest.TestCase):
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
         shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
         (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True)
-        shutil.copy2(REPO / "skills/worker-pool/scripts/launch-worker-session.sh",
-                     root / "skills/worker-pool/scripts/launch-worker-session.sh")
+        for name in ("launch-worker-session.sh", "worker-mcp-credential.sh"):
+            shutil.copy2(REPO / "skills/worker-pool/scripts" / name, root / "skills/worker-pool/scripts" / name)
         self.calls = self.td / "heartbeat-calls"
         (root / "src" / "core_heartbeat.py").write_text(
             "import sys\n"

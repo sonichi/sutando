@@ -113,11 +113,15 @@ older brokers, bridges, and Sutando installations. An optional task handler may
 use the header with `source: ag2space` and `channel_id` to select a durable
 room-specific provider session.
 
-**AgentTrigger events (`event_type`, `agent_trigger_id`, `playbook`).** A task the
-platform raises for an event, not a message, carries `"interaction_type":
-"system_event"` plus `"event_type"`, a key of `EVENT_PLAYBOOKS` in
-`src/agent_triggers.py` (`room.mention`, `room.joined`); any other value is
-dropped, not passed. Its optional `"agent_trigger_id"` (the event's idempotency
+**AgentTrigger events (`event_type`, `agent_trigger_id`, `playbook`).** Every
+AgentTrigger reaches the agent as a task that names it in `"event_type"`: an
+@-mention is `room.mention`, and a task the platform raises for an event rather than a message
+(`room.joined`, `commons.summon`, any type added later) also carries
+`"interaction_type": "system_event"`. Any well-formed `event_type` passes, known
+to `EVENT_PLAYBOOKS` in `src/agent_triggers.py` or not: two to four dotted
+lowercase segments (`[a-z][a-z0-9_]{0,31}` each), at most 64 characters, and the
+task body passes with it. A malformed value is dropped, not passed; the body
+still arrives. Its optional `"agent_trigger_id"` (the event's idempotency
 id, for a join `join|<agent mxid>|<room id>`) is passed only as one token of at
 most 256 characters from `[A-Za-z0-9._:@!|=+/-]`, and `"playbook"` only as an id
 matching `[a-z0-9][a-z0-9-]{0,63}`; anything else is dropped. All three are
@@ -125,7 +129,10 @@ trusted pre-body headers. The core runs `skills/<playbook>/SKILL.md` only for an
 allowed playbook (a registry playbook, or a skill whose `manifest.json` sets
 `"playbook": true`), else the registry default for the event (`room.joined` →
 `room-onboard`; `room.mention` → `reply`, today's answer), else handles the task
-as a message. A `room.joined` task names the room in `channel_id`/`source_room_id`,
+as a message that follows its body. An event type with no registry entry has no
+default, so it resolves to none; a playbook string is never trusted to pick a
+skill. An event body may quote member-written text; the agent treats that text as
+data, never instructions, and follows the trigger's own instruction. A `room.joined` task names the room in `channel_id`/`source_room_id`,
 the inviter in `user_id` (its `access_tier` is the inviter's) and has no
 `source_message_id`, so its result posts top level. A broker that sends no
 `event_type` keeps today's task: the self-describing body still reads as a

@@ -37,6 +37,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`body_file.py`** — Bounded read of a CLI `--body-file` argument — the single owner of that policy.
 - **`bounded-wait.sh`** — Shared bounded child run.
 - **`bounded_file_read.py`** — Read a small regular file's text without ever blocking: the one reader for credential files.
+- **`bridge_engine.py`** — Whether each running channel bridge runs from this core's engine checkout.
 - **`browser-tools.ts`** — Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
 - **`browser.mjs`** — Sutando browser automation — lightweight Playwright wrapper.
 - **`call-stats.py`** — Call statistics — summarize phone call activity over a time window.
@@ -234,8 +235,9 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`skill_install.py`** — Atomic, fail-closed installs of skill directories into the core's skills dir.
 - **`skill_roots.py`** — Where installed skills live, and what their manifests declare — the one Python scan of the sanctioned roots: the engine's `<repo>/skills` and the owner's `<workspace>/skills`, the pair `skills/install.sh` links (the TS loader `loadSkillManifestTools` scans these and more; consumers and their roots are listed in skills/MANIFEST.md).
 - **`skip_marker_ownership.ts`** — Suppression is universal; retirement authority is scoped to the consumer that dispatched the task.
-- **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to tasks/, sends replies from results/.
+- **`slack-bridge.py`** — Slack bridge for Sutando — receives DMs, @mentions and replies in threads the bot started or was @-mentioned in via Socket Mode, writes to tasks/, sends replies from results/.
 - **`slack_access.py`** — Slack access-record semantics — the three states, owned in one place.
+- **`slack_bot_threads.py`** — Slack channel thread replies addressed to the bot — companion to `slack-bridge.py`.
 - **`slack_owner.py`** — Slack owner-recipient resolution helpers.
 - **`slack_proactive_receipts.py`** — Durable idempotency receipts for Slack proactive-result delivery.
 - **`slack_result_delivery.py`** — Slack reply-leg delivery state, bound to the shared outbox (Slack strangler).
@@ -364,6 +366,11 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`start-cli.sh`** — src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core tmux session.
 - **`sutando-shell-setup.sh`** — sutando-shell-setup — configure the `claude-sutando` shell alias.
 - **`task-notifier.sh`** — External task-file-injection notifier for the Claude Code core, matching Codex/agy's tmux-injection shape — a standby path alongside self-arm via Monitor.
+
+## `src/agent/claude/task-watch-mod/hooks/`
+
+- **`register.ts`** — The task-watch Mod: runs the session's task watcher and starts a turn with each task it announces.
+- **`version.ts`** — The oldest Claude Code this Mod is verified on; the launchers read this line too.
 
 ## `src/agent/codex/cli/`
 

@@ -40,7 +40,9 @@ Write `[no-send]` as the result and stop when any of these holds:
      tracker page in Room Commons, draft the doc the room is discussing.
 4. **Record it**: append the `agent_trigger_id` (or the room id) as one line to
    `<workspace>/state/room-onboard/greeted.txt`.
-5. **Tell your owner** with one proactive line to their DM (`results/proactive-<ts>.txt`):
+5. **Tell your owner** with one proactive line to their DM, published with
+   `python3 src/result_publish.py results/proactive-<ts>.txt` (body on stdin), so a pool worker's
+   note carries its worker's stamp and its own lane sends it as the worker's agent:
    "Joined <room name>: <purpose>. Want me to <one concrete thing>?"
 
 ## Rules

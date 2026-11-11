@@ -27,6 +27,7 @@ try:  # pragma: no cover - exercised by whichever context imports it
         dedup_cross_sender_target,
         dedup_decision,
         dedup_requeue_count,
+        dedup_same_relay_asker,
         task_channel_id,
         task_source,
         task_user_id,
@@ -41,6 +42,7 @@ except ImportError:  # pragma: no cover - flat src/ import path
         dedup_cross_sender_target,
         dedup_decision,
         dedup_requeue_count,
+        dedup_same_relay_asker,
         task_channel_id,
         task_source,
         task_user_id,
@@ -166,11 +168,13 @@ def plan_dedup_recovery(
     if holder_delivery_state is not None and holder and not (cross_channel or cross_sender):
         state = holder_delivery_state(holder)
         if state != "missing":
-            compatible = (orig_text and holder_task and destination
+            same_route = ((task_channel_id(holder_task) == destination
+                           and task_user_id(orig_text)
+                           and task_user_id(orig_text) == task_user_id(holder_task))
+                          if destination else dedup_same_relay_asker(orig_text, holder_task))
+            compatible = (orig_text and holder_task
                           and task_source(orig_text) == task_source(holder_task)
-                          and task_channel_id(holder_task) == destination
-                          and task_user_id(orig_text)
-                          and task_user_id(orig_text) == task_user_id(holder_task))
+                          and same_route)
             if not compatible:
                 return "report", (
                     "⚠️ The holder's delivery destination or sender could not be verified. "
