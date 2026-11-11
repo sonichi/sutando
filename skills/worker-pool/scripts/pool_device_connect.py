@@ -146,7 +146,7 @@ def done_note(worker_label: str, label: str, agent_id: str, *, rotated: bool = F
         return (f"[dm-only]\nDone: agent \"{label}\" ({agent_id}) has a new token, and pool worker {worker_label} "
                 "uses it. The old token no longer works.")
     return (f"[dm-only]\nDone: agent \"{label}\" ({agent_id}) is set up as pool worker {worker_label}'s own agent. "
-            "Find it in your agents list in s.space (or in your DMs); mention it in a room to give it work there.")
+            "Find it in your agents list (or in your DMs); mention it in a room to give it work there.")
 
 
 def send_to_owner(workspace: Path, text: str) -> str:
