@@ -76,7 +76,7 @@ def _reap(tmp: str) -> None:
         time.sleep(0.02)
 
 
-def launch(logs_blocked: bool = False):
+def launch(logs_blocked: bool = False, logs_unwritable: str = ""):
     """One real launcher run; returns (workspace, stderr)."""
     tmp = tempfile.mkdtemp(prefix="claude-monitor-logs-")
     root, binp = Path(tmp) / "repo", Path(tmp) / "bin"
@@ -95,6 +95,14 @@ def launch(logs_blocked: bool = False):
     (ws / "state").mkdir(parents=True, exist_ok=True)
     if logs_blocked:
         (ws / "logs").write_text("a file where logs/ would go, so mkdir -p fails\n")
+    if logs_unwritable == "dir":
+        (ws / "logs").mkdir()
+        (ws / "logs").chmod(0o555)
+    elif logs_unwritable == "files":
+        (ws / "logs").mkdir()
+        for name in ("core-input-watch.log", "core-supervisor-relay.log"):
+            (ws / "logs" / name).write_text("kept\n")
+            (ws / "logs" / name).chmod(0o444)
     ran, relayed = Path(tmp) / "monitor-ran", Path(tmp) / "relay-ran"
     _exe(root / "src" / "core-input-watch.py",
          f"import pathlib\npathlib.Path({str(ran)!r}).touch()\nprint('monitor-stdout', flush=True)\n")
@@ -141,6 +149,19 @@ check("b) with logs/ uncreatable the monitor still starts", ran, err.strip()[-30
 check("b) and the relay loop still runs, so its escalation is not lost", relayed, err.strip()[-300:])
 check("b) and nothing is written in place of logs/", (ws / "logs").is_file()
       and (ws / "logs").read_text().startswith("a file where"), "logs/ was replaced")
+
+# The reviewer's two shapes: an existing logs/ that takes no files, and existing logs that
+# cannot be written. Either one used to stop the monitor and relay before they ran.
+for shape, what in (("dir", "a logs/ that takes no files"), ("files", "existing logs that cannot be written")):
+    ws, ran, relayed, err = launch(logs_unwritable=shape)
+    check(f"c) with {what} the monitor still starts", ran, err.strip()[-300:])
+    check(f"c) with {what} the relay loop still runs", relayed, err.strip()[-300:])
+    check(f"c) with {what} the launcher reports no refused redirect", "Permission denied" not in err,
+          err.strip()[-300:])
+    if shape == "files":
+        check("c) and the unwritable logs keep their lines",
+              all((ws / "logs" / n).read_text() == "kept\n"
+                  for n in ("core-input-watch.log", "core-supervisor-relay.log")))
 
 print()
 if failures:

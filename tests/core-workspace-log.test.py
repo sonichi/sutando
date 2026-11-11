@@ -7,6 +7,8 @@ so a log never stops a start. Both launchers source it and keep only their launc
 (docs/architecture-boundaries.md, "Shared adapter policy").
   a) it prints <workspace>/logs/<name> and makes logs/
   b) with logs/ uncreatable it prints /dev/null and still succeeds
+  b2) so it does when logs/ exists but takes no files, or the log exists but is not writable,
+      and an existing log is never truncated by the check
   c) both launchers source it and spell no log path or fallback of their own
      (structural; the behaviour is driven in start-cli-claude-monitor-logs and codex-core-launcher)
 
@@ -56,6 +58,38 @@ with tempfile.TemporaryDirectory() as td:
     check("b) with logs/ uncreatable the log is /dev/null", out.stdout == "/dev/null", repr(out.stdout))
     check("b) and the helper still succeeds, so the caller still starts", out.returncode == 0,
           f"rc {out.returncode}")
+
+    stale = Path(td) / "stale"
+    (stale / "logs").mkdir(parents=True)
+    (stale / "logs" / "core-input-watch.log").write_text("yesterday's lines\n")
+    out = log_path(stale, "core-input-watch.log")
+    check("b2) an existing writable log is still the log", out.stdout == f"{stale}/logs/core-input-watch.log",
+          repr(out.stdout))
+    check("b2) and the check leaves its lines alone",
+          (stale / "logs" / "core-input-watch.log").read_text() == "yesterday's lines\n")
+
+    shut = Path(td) / "shut"
+    (shut / "logs").mkdir(parents=True)
+    (shut / "logs").chmod(0o555)
+    try:
+        out = log_path(shut, "core-input-watch.log")
+        check("b2) a logs/ that takes no files gives /dev/null", (out.stdout, out.returncode) == ("/dev/null", 0),
+              repr((out.stdout, out.returncode, out.stderr)))
+        check("b2) and says nothing on stderr", out.stderr == "", repr(out.stderr))
+    finally:
+        (shut / "logs").chmod(0o755)
+
+    ro = Path(td) / "ro"
+    (ro / "logs").mkdir(parents=True)
+    (ro / "logs" / "core-supervisor-relay.log").write_text("kept\n")
+    (ro / "logs" / "core-supervisor-relay.log").chmod(0o444)
+    try:
+        out = log_path(ro, "core-supervisor-relay.log")
+        check("b2) a log that cannot be written gives /dev/null", (out.stdout, out.returncode) == ("/dev/null", 0),
+              repr((out.stdout, out.returncode)))
+        check("b2) and that log is not touched", (ro / "logs" / "core-supervisor-relay.log").read_text() == "kept\n")
+    finally:
+        (ro / "logs" / "core-supervisor-relay.log").chmod(0o644)
 
 for rel in LAUNCHERS:
     text = (REPO / rel).read_text(encoding="utf-8")
