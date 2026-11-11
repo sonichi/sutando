@@ -149,6 +149,112 @@ class ConnectInstall(ConnectBase):
         self.assertNotEqual(second, first)
         self.assertTrue(cli.SESSION_ID_RE.match(second))
 
+    RESUMED = "0f1e2d3c-4b5a-4968-8778-695a4b3c2d1e"
+
+    def transcript(self, session_id=None, folder="-Users-owner-long-project"):
+        """A conversation the owner made elsewhere: its transcript in another project folder of the config dir."""
+        projects = self.home / ".claude-sutando" / "projects" / folder
+        projects.mkdir(parents=True, exist_ok=True)
+        path = projects / ((session_id or self.RESUMED) + ".jsonl")
+        path.write_text('{"type":"user","sessionId":"%s"}\n' % (session_id or self.RESUMED))
+        return path
+
+    def live_registry(self, session_id, pid):
+        """The CLI's own record of a running process holding a conversation open."""
+        sessions = self.home / ".claude-sutando" / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        (sessions / f"{pid}.json").write_text(json.dumps({"pid": pid, "sessionId": session_id, "kind": "interactive"}))
+
+    def test_resume_session_records_an_existing_conversation_as_the_session_id(self):
+        transcript = self.transcript()
+        runner = self.runner()
+        rc, out, err = self.install_with(runner, False, "--resume-session", self.RESUMED.upper())
+        self.assertEqual(rc, 0, err)
+        self.assertIn(f"resuming the existing conversation {self.RESUMED}", out)
+        cfg = cli.read_config(cli.config_path())
+        self.assertEqual(cfg["SESSION_ID"], self.RESUMED, "recorded lower-cased, as the CLI names it")
+        self.assertEqual(hold_mod.claude_argv(cfg, cfg["SESSION_ID"])[-2:], ["--resume", self.RESUMED],
+                         "the pane resumes it although its transcript sits in another project folder")
+        self.assertEqual(transcript.read_text(), '{"type":"user","sessionId":"%s"}\n' % self.RESUMED, "never copied or touched")
+        self.assertEqual(self.install_with(runner)[0], 0)
+        self.assertEqual(cli.read_config(cli.config_path())["SESSION_ID"], self.RESUMED, "a reinstall keeps it")
+
+    def test_resume_session_refuses_a_malformed_id_a_missing_transcript_and_a_conversation_open_elsewhere(self):
+        runner = self.runner()
+        rc, _, err = self.install_with(runner, False, "--resume-session", "not-a-uuid")
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertIn("is not a Claude Code session id", err)
+        rc, _, err = self.install_with(runner, False, "--resume-session", self.RESUMED)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertIn(f"no conversation {self.RESUMED} under {self.home / '.claude-sutando' / 'projects'}", err)
+        self.transcript()
+        self.live_registry(self.RESUMED, os.getpid())
+        rc, _, err = self.install_with(runner, False, "--resume-session", self.RESUMED)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertIn(f"is open in a running Claude Code process (pid {os.getpid()})", err)
+        self.assertFalse(cli.config_path().exists(), "refused before anything is written")
+        self.assertEqual(runner.verbs("systemctl"), [], "nor anything stopped or started")
+        dead = subprocess.Popen(["sleep", "0"]); dead.wait()
+        self.live_registry(self.RESUMED, dead.pid)
+        (self.home / ".claude-sutando" / "sessions" / f"{os.getpid()}.json").unlink()
+        rc, _, err = self.install_with(runner, False, "--resume-session", self.RESUMED)
+        self.assertEqual(rc, 0, "a registry entry whose process is gone does not hold it: " + err)
+
+    def test_resume_session_looks_only_in_the_configured_claude_config_dir(self):
+        """A host installs with a config dir of the agent's own: the CLI's default ~/.claude is never searched."""
+        default = self.home / ".claude" / "projects" / "-Users-owner-long-project"
+        default.mkdir(parents=True)
+        (default / (self.RESUMED + ".jsonl")).write_text("{}\n")
+        rc, _, err = self.install_with(self.runner(), False, "--resume-session", self.RESUMED)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE)
+        self.assertIn(f"no conversation {self.RESUMED} under {self.home / '.claude-sutando' / 'projects'}", err)
+        self.assertEqual(cli.resume_problem("", self.RESUMED), "", "with no config dir recorded, the CLI's default is it")
+
+    def test_resume_session_and_new_session_are_exclusive(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()) as err:
+            cli.main(["install", "--new-session", "--resume-session", self.RESUMED])
+        self.assertIn("not allowed with argument", err.getvalue())
+
+    def test_resume_session_replaces_a_kept_id_only_over_a_dead_generation(self):
+        runner = self.runner()
+        self.assertEqual(self.install_with(runner)[0], 0)
+        first = cli.read_config(cli.config_path())["SESSION_ID"]
+        self.transcript()
+        live = {"server_pid": os.getpid(), "server_start": holder_lock.start_time(os.getpid()), "session_id": "$1",
+                "session_created": 1, "pane_id": "%0", "pane_pid": 1, "start_command": "x", "nonce": "0" * 32}
+        self.assertEqual(inbox.prepare_root(str(self.work)), "")
+        records.save_supervisor(str(self.work), dict(records.empty_supervisor(), generation=live))
+        rc, out, err = self.install_with(runner, False, "--resume-session", self.RESUMED)
+        self.assertEqual(rc, 0)
+        self.assertIn(f"kept the session id {first}", out)
+        self.assertIn(f"--resume-session {self.RESUMED} was not applied", err)
+        self.assertEqual(cli.read_config(cli.config_path())["SESSION_ID"], first)
+        dead = subprocess.Popen(["sleep", "0"]); dead.wait()
+        records.save_supervisor(str(self.work), dict(records.empty_supervisor(), generation=dict(live, server_pid=dead.pid,
+                                                                                                 server_start="never")))
+        rc, out, err = self.install_with(runner, False, "--resume-session", self.RESUMED)
+        self.assertEqual(rc, 0, err)
+        self.assertIn(f"resuming the existing conversation {self.RESUMED}", out)
+        self.assertNotIn("rotating", out)
+        self.assertEqual(cli.read_config(cli.config_path())["SESSION_ID"], self.RESUMED)
+
+    def test_the_connectors_own_running_session_does_not_block_resuming_its_own_id(self):
+        self.transcript()
+        runner = self.runner()
+        self.assertEqual(self.install_with(runner, False, "--resume-session", self.RESUMED)[0], 0)
+        self.live_registry(self.RESUMED, os.getpid())
+        rc, _, err = self.install_with(runner, False, "--resume-session", self.RESUMED)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(cli.resume_problem(str(self.home / ".claude-sutando"), self.RESUMED, kept="")[:18],
+                         "conversation 0f1e2", "another job's id open elsewhere is still refused")
+
+    def test_the_default_install_still_mints_and_starts_with_session_id(self):
+        self.transcript()
+        self.assertEqual(self.install_with(self.runner())[0], 0)
+        cfg = cli.read_config(cli.config_path())
+        self.assertNotEqual(cfg["SESSION_ID"], self.RESUMED)
+        self.assertEqual(hold_mod.claude_argv(cfg, cfg["SESSION_ID"])[-2:], ["--session-id", cfg["SESSION_ID"]])
+
     def test_an_identical_retry_performs_the_whole_apply_again(self):
         runner = self.runner()
         self.assertEqual(self.install_with(runner)[0], 0)

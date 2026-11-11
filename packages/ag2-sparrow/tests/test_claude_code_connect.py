@@ -805,6 +805,28 @@ class ConnectCode(UndoSeams, AgentRootBase):
                         unhold(holder)
                     shutil.rmtree(cli.bridge_home(self.root), ignore_errors=True)
 
+    def test_connect_with_resume_session_hosts_that_existing_conversation(self):
+        resumed = "0f1e2d3c-4b5a-4968-8778-695a4b3c2d1e"
+        projects = self.home / ".claude-sutando" / "projects" / "-Users-owner-long-project"
+        projects.mkdir(parents=True)
+        (projects / (resumed + ".jsonl")).write_text("{}\n")
+        rc, out, err = self.connect(Backend(), None, "--resume-session", resumed)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn(f"resuming the existing conversation {resumed}", out)
+        self.assertEqual(self.cfg()["SESSION_ID"], resumed)
+
+    def test_a_resume_session_without_its_transcript_is_refused_before_the_code_is_spent_or_the_job_stopped(self):
+        fake = self.running_job()
+        pid = fake.runner.pid()
+        backend = Backend()
+        resumed = "0f1e2d3c-4b5a-4968-8778-695a4b3c2d1e"
+        rc, out, err = self.connect(backend, fake, "--resume-session", resumed)
+        self.assertEqual(rc, cli.EXIT_UNUSABLE, out + err)
+        self.assertIn(f"no conversation {resumed}", err)
+        self.assertIn("the code was not used", err)
+        self.assertEqual(backend.calls, [], "the code is not spent")
+        self.assert_job_runs(fake, pid)
+
     def test_an_unusable_hmac_key_is_refused_before_the_code_is_spent_or_the_job_stopped(self):
         fake = self.running_job()
         pid = fake.runner.pid()
