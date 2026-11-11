@@ -95,9 +95,13 @@ def _script_operand(argv, script: str) -> Optional[str]:
     return op
 
 
-def read_argv(pid: str):
+def _argv_vector(pid):
     import watcher_identity  # noqa: PLC0415
-    vec = watcher_identity.proc_argv_vector(pid)
+    return watcher_identity.proc_argv_vector(pid)
+
+
+def read_argv(pid: str):
+    vec = _argv_vector(pid)
     if vec:
         return vec
     try:
@@ -107,9 +111,9 @@ def read_argv(pid: str):
         return ""
 
 
-def read_cwd(pid: str) -> str:
-    proc = Path(f"/proc/{pid}/cwd")
-    if proc.exists():
+def read_cwd(pid: str, proc_root: str = "/proc") -> str:
+    proc = Path(proc_root) / str(pid) / "cwd"
+    if os.path.lexists(proc):
         try:
             return os.readlink(proc)
         except OSError:

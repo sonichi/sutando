@@ -152,7 +152,65 @@ class EngineMatch(unittest.TestCase):
                                "detail": "no bridge running"})
 
 
+class Readers(unittest.TestCase):
+    def test_operand_edge_cases(self):
+        op = bridge_engine._script_operand
+        self.assertIsNone(op(["vim", "/e/src/slack-bridge.py"], "slack-bridge.py"))
+        self.assertIsNone(op(["python3", "-", "/e/src/slack-bridge.py"], "slack-bridge.py"))
+        self.assertIsNone(op(["python3", "-u"], "slack-bridge.py"))
+        self.assertIsNone(op(["python3", "-u", "-X"], "slack-bridge.py"))
+        self.assertEqual(op(["python3", "--", "/e/src/slack-bridge.py"], "slack-bridge.py"),
+                         "/e/src/slack-bridge.py")
+        self.assertIsNone(op(["python3", "--"], "slack-bridge.py"))
+        self.assertIsNone(op(["python3", 3, "/e/src/slack-bridge.py"], "slack-bridge.py"))
+        self.assertIsNone(op("vim /e/src/slack-bridge.py", "slack-bridge.py"))
+        self.assertIsNone(op("python3 -u", "slack-bridge.py"))
+
+    def test_read_argv_prefers_the_vector_then_ps(self):
+        me = str(os.getpid())
+        with mock.patch.object(bridge_engine, "_argv_vector", lambda pid: ["python3", "x.py"]):
+            self.assertEqual(bridge_engine.read_argv(me), ["python3", "x.py"])
+        ps = mock.Mock(stdout="python3 /e/src/slack-bridge.py\n")
+        with mock.patch.object(bridge_engine, "_argv_vector", lambda pid: None), \
+             mock.patch.object(bridge_engine.subprocess, "run", return_value=ps) as run:
+            self.assertEqual(bridge_engine.read_argv(me), "python3 /e/src/slack-bridge.py")
+        self.assertEqual(run.call_args.args[0][:3], ["/bin/ps", "-o", "command="])
+        for exc in (OSError("no ps"), bridge_engine.subprocess.TimeoutExpired("ps", 5)):
+            with mock.patch.object(bridge_engine, "_argv_vector", lambda pid: None), \
+                 mock.patch.object(bridge_engine.subprocess, "run", side_effect=exc):
+                self.assertEqual(bridge_engine.read_argv(me), "")
+
+    def test_read_cwd_from_proc(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "41").mkdir()
+        (root / "41" / "cwd").symlink_to("/some/engine")
+        self.assertEqual(bridge_engine.read_cwd("41", proc_root=str(root)), "/some/engine")
+        (root / "42").mkdir()
+        (root / "42" / "cwd").write_text("not a link")
+        self.assertEqual(bridge_engine.read_cwd("42", proc_root=str(root)), "")
+
+    def test_read_cwd_from_lsof(self):
+        absent = str(Path(tempfile.mkdtemp()) / "no-proc")
+        out = mock.Mock(stdout="p41\nfcwd\nn/some/engine\n")
+        with mock.patch.object(bridge_engine.subprocess, "run", return_value=out) as run:
+            self.assertEqual(bridge_engine.read_cwd("41", proc_root=absent), "/some/engine")
+        self.assertEqual(run.call_args.args[0][0], "/usr/sbin/lsof")
+        with mock.patch.object(bridge_engine.subprocess, "run", return_value=mock.Mock(stdout="")):
+            self.assertEqual(bridge_engine.read_cwd("41", proc_root=absent), "")
+        for exc in (OSError("no lsof"), bridge_engine.subprocess.TimeoutExpired("lsof", 5)):
+            with mock.patch.object(bridge_engine.subprocess, "run", side_effect=exc):
+                self.assertEqual(bridge_engine.read_cwd("41", proc_root=absent), "")
+
+
 class HealthCheckWiring(unittest.TestCase):
+    def test_a_crashing_probe_is_unknown_not_ok(self):
+        health = self._health()
+        with mock.patch.object(bridge_engine, "check_bridge_engine_match",
+                               side_effect=RuntimeError("boom")):
+            got = health.check_bridge_engine_match()
+        self.assertEqual(got, {"name": "bridge-engine-match", "status": "unknown",
+                               "detail": "probe failed (RuntimeError)"})
+
     def _health(self):
         spec = importlib.util.spec_from_file_location("health_check", ROOT / "src" / "health-check.py")
         health = importlib.util.module_from_spec(spec)
