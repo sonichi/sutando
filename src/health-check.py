@@ -9466,9 +9466,9 @@ def _watcher_runtime(sentinel: Path, inbox: "str | None") -> str:
 
 def check_bridge_engine_match() -> dict:
     """A bridge running from another install's engine may write tasks this core never reads."""
-    def _pids(script: str) -> list:
-        pids, _ok = probe_pids(re.escape(script) + "$")
-        return _drop_launcher_parents(pids)
+    def _pids(script: str) -> tuple:
+        pids, scanned = probe_pids(re.escape(script) + "$")
+        return _drop_launcher_parents(pids), scanned
     try:
         return bridge_engine.check_bridge_engine_match(REPO_DIR, _pids)
     except Exception as exc:  # noqa: BLE001 — a probe failure is not a finding

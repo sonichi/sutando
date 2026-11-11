@@ -61,7 +61,8 @@ class EngineMatch(unittest.TestCase):
                 raise value
             return value
         return bridge_engine.check_bridge_engine_match(
-            engine or self.core, lambda script: [p for p, (s, _) in table.items() if s == script],
+            engine or self.core,
+            lambda script: ([p for p, (s, _) in table.items() if s == script], True),
             argv_of=argv_of, cwd_of=lambda pid: cwds.get(pid, ""))
 
     def test_same_engine_is_ok(self):
@@ -91,7 +92,7 @@ class EngineMatch(unittest.TestCase):
 
     def test_unreadable_path_is_unknown(self):
         got = bridge_engine.check_bridge_engine_match(
-            self.core, lambda s: ["5"] if s == "slack-bridge.py" else [],
+            self.core, lambda s: (["5"] if s == "slack-bridge.py" else [], True),
             argv_of=lambda pid: "", cwd_of=lambda pid: "")
         self.assertEqual(got["status"], "unknown", got)
         self.assertIn("slack-bridge pid 5: script path unreadable", got["detail"])
@@ -108,6 +109,39 @@ class EngineMatch(unittest.TestCase):
             self.assertIn("slack-bridge pid 7 runs from", got["detail"])
             self.assertIn("Also engine unknown: discord-bridge pid 8", got["detail"])
 
+    def test_bridge_script_as_a_later_argument_is_not_a_bridge(self):
+        argv = ["python3", f"{self.core}/src/read-file.py", f"{self.old}/src/slack-bridge.py"]
+        got = self._probe({"9": ("slack-bridge.py", argv)})
+        self.assertNotEqual(got["status"], "warn", got)
+        self.assertIn("slack-bridge pid 9: script path unreadable", got["detail"])
+        flat = f"python3 {self.core}/src/read-file.py {self.old}/src/slack-bridge.py"
+        got = self._probe({"9": ("slack-bridge.py", flat)})
+        self.assertNotEqual(got["status"], "warn", got)
+
+    def test_interpreter_options_are_skipped(self):
+        argv = ["/usr/bin/python3", "-I", "-u", "-X", "utf8", "-W", "ignore",
+                f"{self.old}/src/discord-bridge.py"]
+        got = self._probe({"10": argv})
+        self.assertEqual(got["status"], "warn", got)
+        self.assertIn("discord-bridge pid 10 runs from", got["detail"])
+
+    def test_unbuffered_launch_with_spaces_in_both_paths_is_recognised(self):
+        interp = f"{self.tmp}/runtime/python/bin/python3"  # self.tmp contains "Application Support"
+        for argv in ([interp, "-u", f"{self.old}/src/slack-bridge.py"],
+                     f"{interp} -u {self.old}/src/slack-bridge.py"):
+            got = self._probe({"13": ("slack-bridge.py", argv)})
+            self.assertEqual(got["status"], "warn", (argv, got))
+            self.assertIn(f"runs from {os.path.realpath(self.old)}", got["detail"])
+        got = self._probe({"13": ("slack-bridge.py", [interp, "-u", f"{self.core}/src/slack-bridge.py"])})
+        self.assertEqual(got["status"], "ok", got)
+
+    def test_execution_modes_are_not_script_launches(self):
+        for argv in (["python3", "-c", "import x", f"{self.old}/src/slack-bridge.py"],
+                     ["python3", "-m", "pkg", f"{self.old}/src/slack-bridge.py"],
+                     f"python3 -m pkg {self.old}/src/slack-bridge.py"):
+            got = self._probe({"14": ("slack-bridge.py", argv)})
+            self.assertEqual(got["status"], "unknown", (argv, got))
+
     def test_no_bridge(self):
         got = self._probe({})
         self.assertEqual(got, {"name": "bridge-engine-match", "status": "ok",
@@ -115,6 +149,34 @@ class EngineMatch(unittest.TestCase):
 
 
 class HealthCheckWiring(unittest.TestCase):
+    def _health(self):
+        spec = importlib.util.spec_from_file_location("health_check", ROOT / "src" / "health-check.py")
+        health = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(health)
+        return health
+
+    def test_failed_scan_is_unknown_not_absence(self):
+        health = self._health()
+        for scanned, status in ((True, "ok"), (False, "unknown")):
+            with mock.patch.object(health, "probe_pids", lambda pat, _s=scanned: ([], _s)):
+                got = health.check_bridge_engine_match()
+            self.assertEqual(got["status"], status, (scanned, got))
+        self.assertIn("slack-bridge: process scan failed", got["detail"])
+
+    def test_failed_scan_does_not_hide_a_mismatch_from_a_good_scan(self):
+        health = self._health()
+        other = Path(tempfile.mkdtemp()) / "other-engine"
+        argv = ["python3", f"{other}/src/telegram-bridge.py"]
+        with mock.patch.object(health, "probe_pids", lambda pat: (
+                (["12"], True) if "telegram" in pat else ([], "slack" not in pat))), \
+             mock.patch.object(health, "_drop_launcher_parents", lambda p: p), \
+             mock.patch.object(bridge_engine, "read_argv", lambda pid: argv), \
+             mock.patch.object(bridge_engine, "read_cwd", lambda pid: ""):
+            got = health.check_bridge_engine_match()
+        self.assertEqual(got["status"], "warn", got)
+        self.assertIn("telegram-bridge pid 12 runs from", got["detail"])
+        self.assertIn("Also engine unknown: slack-bridge: process scan failed", got["detail"])
+
     def test_health_check_compares_with_its_own_engine(self):
         spec = importlib.util.spec_from_file_location("health_check", ROOT / "src" / "health-check.py")
         health = importlib.util.module_from_spec(spec)

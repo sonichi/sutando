@@ -8,6 +8,7 @@ argv (cwd only for a relative path) and compares it with this engine directory.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Callable, Optional
@@ -20,27 +21,65 @@ BRIDGE_SCRIPTS = {
 }
 
 
+_ARG_OPTS = {"-X", "-W", "-Q"}  # interpreter options that take the next token
+_NO_SCRIPT = {"-c", "-m"}  # the interpreter runs a string or a module, not a file
+
+
+def _is_interpreter(token: str) -> bool:
+    return re.fullmatch(r"[Pp]ython(\d+(\.\d+)*)?[tw]?", os.path.basename(token)) is not None
+
+
+def _first_operand(tokens: "list[str]") -> Optional[str]:
+    """The script operand of `<interpreter> [options] <script> ...`, or None."""
+    if not tokens or not _is_interpreter(tokens[0]):
+        return None
+    i = 1
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in _NO_SCRIPT or tok == "-":
+            return None
+        if tok in _ARG_OPTS:
+            i += 2
+            continue
+        if tok == "--":
+            return tokens[i + 1] if i + 1 < len(tokens) else None
+        if tok.startswith("-"):
+            i += 1
+            continue
+        return tok
+    return None
+
+
 def _script_operand(argv, script: str) -> Optional[str]:
-    """The operand naming `script`: from a real argv list, or else recovered from a
-    flattened command line whose path may contain spaces."""
+    """The interpreter's script operand when its basename is `script`, else None.
+
+    Prefers the real argv vector. A flattened command line cannot split a path
+    with spaces, so there the interpreter and script are located by name."""
     if isinstance(argv, (list, tuple)):
-        return next((a for a in argv
-                     if isinstance(a, str) and (a == script or a.endswith("/" + script))), None)
-    text = str(argv or "")
-    end = text.rfind(script)
-    if end < 0 or (end + len(script) < len(text) and not text[end + len(script)].isspace()):
+        if not all(isinstance(a, str) for a in argv):
+            return None
+        op = _first_operand(list(argv))
+    else:
+        text = str(argv or "")
+        interp = re.search(r"[Pp]ython(\d+(\.\d+)*)?[tw]?(?=\s)", text)
+        if not interp:
+            return None
+        rest = text[interp.end():]
+        op = None
+        tokens = rest.split()
+        i = 0
+        while i < len(tokens) and tokens[i].startswith("-"):
+            if tokens[i] in _NO_SCRIPT or tokens[i] == "-":
+                return None
+            i += 2 if tokens[i] in _ARG_OPTS else 1
+        if i < len(tokens):
+            # Rejoin from the first operand: it runs to the first ".py" followed by a boundary.
+            tail = " ".join(tokens[i:])
+            m = re.match(r"(.+?\.py)(?=\s|$)", tail)
+            op = m.group(1) if m else None
+    if op is None or os.path.basename(op) != script:
         return None
-    if end > 0 and text[end - 1] not in "/ \t":
-        return None
-    stop = end + len(script)
-    if text.rfind("/", 0, end) < 0:
-        return script
-    start = text.rfind(" /", 0, end)
-    if start >= 0:
-        return text[start + 1:stop]
-    if text.startswith("/"):
-        return text[:stop]
-    return text[text.rfind(" ", 0, end) + 1:stop]
+    return op
 
 
 def read_argv(pid: str):
@@ -88,15 +127,19 @@ def _judge(name: str, script: str, pid, engine: str, argv_of, cwd_of) -> "tuple[
                      "its tasks may go to another workspace. Restart it from the desktop app")
 
 
-def check_bridge_engine_match(engine_dir, list_pids: Callable[[str], list],
+def check_bridge_engine_match(engine_dir, list_pids: Callable[[str], "tuple[list, bool]"],
                               argv_of: Optional[Callable] = None,
                               cwd_of: Optional[Callable] = None) -> dict:
+    """`list_pids(script)` returns (pids, scanned); a failed scan is unknown, not absence."""
     argv_of = argv_of or read_argv
     cwd_of = cwd_of or read_cwd
     engine = os.path.realpath(engine_dir)
     found = {"match": [], "other": [], "unknown": []}
     for name, script in BRIDGE_SCRIPTS.items():
-        for pid in list_pids(script):
+        pids, scanned = list_pids(script)
+        if not scanned:
+            found["unknown"].append(f"{name}: process scan failed")
+        for pid in pids:
             try:
                 kind, line = _judge(name, script, pid, engine, argv_of, cwd_of)
             except Exception as exc:  # noqa: BLE001 — one process never fails the probe
