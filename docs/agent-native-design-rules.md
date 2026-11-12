@@ -196,7 +196,7 @@ Links:
 - An agent recommends another agent only on an explicit capability: where it runs and what it can
   reach, always on, voice, connected apps, or already in the room. It names the capability. When
   nothing explicit differs, it does not recommend.
-- Discovery is a small maintained deck of feature cards (size and contents are set in the spec).
+- Discovery is a small maintained deck of feature cards (ask a maintainer for its current size and contents).
   The deck is shown once after an update. An agent can pull a card when asked or when it would
   help, at most once per situation.
 - Each card's main action takes the person into the feature in place, landing in the DM with their
