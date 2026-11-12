@@ -126,14 +126,16 @@ def _take_down(workspace, wid, runner) -> dict:
         return take_down_held(workspace, wid, runner)
 
 
-def take_down_held(workspace, wid, runner) -> dict:
+def take_down_held(workspace, wid, runner, end_reason: str = "killed") -> dict:
     """`_take_down` for a caller that already holds the remedy's lock (a sweep acting on a decision).
-    Nothing owed is touched: the deliveries stay the worker's, for the seat that resumes."""
+    Nothing owed is touched: the deliveries stay the worker's, for the seat that resumes. A sweep
+    that means to bring the seat straight back closes its runs "crashed", not "killed" (the owner's
+    stop), so a seat whose restart then fails still reads as dead to supervision."""
     sup.set_paused(workspace, wid, True)
     sessions = stop_sessions(workspace, wid, runner=runner)
     down = all(v != "unknown" for v in sessions.values())
     # A seat tmux could not confirm gone keeps its run open, so supervision still sees it.
-    closed = rem.close_dead_runs(workspace, wid, end_reason="killed") if down else []
+    closed = rem.close_dead_runs(workspace, wid, end_reason=end_reason) if down else []
     return {"sessions": sessions, "closed_runs": closed, "down": down}
 
 

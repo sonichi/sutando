@@ -40,6 +40,17 @@ import tmux_probe  # noqa: E402
 import worker_identity as wi  # noqa: E402
 
 
+def launch_account() -> str | None:
+    """The account a Claude seat launches under: the digest of the shared config dir's signed-in
+    account (core_limit_hold.current_account), recorded on its run so a limit it parks on is bound
+    to the account its process started with. None when it cannot be read."""
+    try:
+        import core_limit_hold
+        return core_limit_hold.current_account()
+    except Exception:  # noqa: BLE001 - an unread account records nothing, as before
+        return None
+
+
 # The core's own identity: inherited, these stamp a worker's direct posts as
 # "worker-<core id>" while pool delivery stamps the worker's real id.
 _CORE_ONLY_ENV = ("SUTANDO_CORE_ID", "SUTANDO_CORE_POOL_SIZE", "SUTANDO_WORKER_SEAT")
@@ -429,12 +440,13 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
         rec = {"worker_id": worker_id}
     elif resumed_id:
         run = wi.start_incarnation(workspace, worker_id, session_id, tmux_socket=socket,
-                                   tmux_session=name)
+                                   tmux_session=name, account=launch_account())
         rec = {"worker_id": worker_id}
     else:
         rec = wi.create_worker(workspace, runtime=runtime, cwd=str(cwd or repo),
                                host=os.uname().nodename, session_id=session_id,
-                               tmux_socket=socket, worker_id=worker_id)
+                               tmux_socket=socket, worker_id=worker_id,
+                               account=None if runtime == "codex" else launch_account())
     Path(p["delivery_dir"]).mkdir(parents=True, exist_ok=True)
 
     # start-cli prefers RESUME, so an INHERITED one would beat the SESSION_ID a

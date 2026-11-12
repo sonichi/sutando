@@ -128,6 +128,9 @@ class Pool(unittest.TestCase):
     def spawn(self, workspace, repo, **kw):
         wid = kw.get("existing_worker_id") or next(w for w in self.WORKERS if self.seat(w) not in self.alive)
         self.spawned.append((wid, kw.get("resume")))
+        # As spawn_worker does: a new run, carrying the account it launched under.
+        wi.start_incarnation(self.ws, wid, kw.get("resume"), tmux_socket=self.socket,
+                             tmux_session=self.seat(wid), account=self.account)
         self.alive.add(self.seat(wid))
         self.panes[wid] = [IDLE]
         return {"runtime_session_id": f"{kw.get('resume')}-again"}
@@ -342,22 +345,123 @@ class NewLogin(Pool):
         self.assertIs(sup.work_outstanding(self.ws, mars), True)
 
 
-class CodexIsNotRestarted(Pool):
-    WORKERS = {"c" * 32: "Reviewer"}
-
-    def setUp(self):
-        super().setUp()
-        (self.ws / "state" / "roster.json").write_text(json.dumps(
-            {"workers": {w: {"state": "live", "runtime": "codex", "label": n} for w, n in self.WORKERS.items()}}))
-
-    def test_a_codex_seat_under_a_limit_banner_is_left_to_its_own_reset(self):
-        w = next(iter(self.WORKERS))
-        self.show(w, PARKED)
+    def test_a_spawn_that_fails_after_the_kill_is_started_again_until_it_starts(self):
+        mars = next(iter(self.WORKERS))
+        self.owe(mars, "task-owed-3")
+        self.show(mars, PARKED)
         self.sweep()
         self.account = B
-        _, out = self.sweep()
-        self.assertNotEqual(out["decisions"].get(w), ps.RESTART_NEW_LOGIN)
-        self.assertEqual(self.spawned, [])
+        real_spawn, tries = self.spawn, []
+
+        def fail_twice(workspace, repo, **kw):
+            tries.append(kw.get("resume"))
+            if len(tries) <= 2:
+                raise rem.sw.SpawnRefused("the seat could not start")
+            return real_spawn(workspace, repo, **kw)
+        self.spawn = fail_twice
+        rc, out = self.sweep()
+        self.assertEqual((rc, out["recoveries"][mars]["outcome"]), (1, rem.FAILED))
+        self.assertNotIn(self.seat(mars), self.alive, "the kill landed: the seat is down")
+        self.assertIn("it is down, and a later sweep starts it again", "".join(self.notes()))
+        self.assertIs(sup.probe_session(self.ws, mars, runner=self.runner), False, "supervision still sees it")
+        self.assertEqual(self.sweep_until(mars)[1]["outcome"], rem.FAILED, "tried again while down")
+        self.assertEqual(self.sweep_until(mars)[1]["outcome"], rem.RECOVERED, "and it comes back")
+        self.assertEqual(tries, ["s0", "s0", "s0"], "each try resumes its own session")
+        self.assertIn(self.seat(mars), self.alive)
+        self.assertIs(sup.work_outstanding(self.ws, mars), True, "its owed work is still its own")
+        state = sup.load_state(self.ws).workers[mars]
+        self.assertEqual((state.limit_account, state.relogin_down), (B, False))
+        openers = [n for n in self.notes() if "I'm back on a new login" in n]
+        self.assertEqual(len(openers), 1, "one opening note for the sign-in, whatever the tries")
+
+    def test_a_take_down_that_breaks_after_the_kill_still_comes_back(self):
+        mars = next(iter(self.WORKERS))
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+        with patch.object(rem, "close_dead_runs", side_effect=OSError("runs unreadable")):
+            _, out = self.sweep()
+        self.assertEqual(out["recoveries"][mars]["outcome"], rem.FAILED)
+        self.assertNotIn(self.seat(mars), self.alive)
+        self.assertFalse(sup.is_paused(self.ws, mars))
+        self.assertEqual(self.sweep_until(mars)[1]["outcome"], rem.RECOVERED)
+
+    def test_a_suspension_between_the_kill_and_the_start_is_started_after_it_lifts(self):
+        mars = next(iter(self.WORKERS))
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+        manage = rem._sibling("pool_manage")
+        real = manage.take_down_held
+
+        def kill_then_quit(*a, **kw):
+            out = real(*a, **kw)
+            rem.suspend(self.ws, "the app is quitting")  # after the kill, before the start
+            return out
+        with patch.object(manage, "take_down_held", side_effect=kill_then_quit):
+            _, out = self.sweep()
+        self.assertEqual(out["recoveries"][mars]["outcome"], rem.SUSPENDED)
+        self.assertNotIn(self.seat(mars), self.alive)
+        lifted = rem.resume(self.ws, REPO, runner=self.runner, spawn=self.spawn)
+        self.assertNotIn(mars, lifted["restarted"], "the quit did not stop it: resume leaves it to its rule")
+        self.assertFalse(rem.suspension(self.ws))
+        self.assertEqual(self.sweep_until(mars)[1]["outcome"], rem.RECOVERED, "a seat this rule killed comes back")
+
+    def test_the_tries_are_spaced_by_a_doubling_backoff(self):
+        mars = next(iter(self.WORKERS))
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+        real_runner = self.runner
+
+        def kill_unconfirmed(argv, **kw):
+            if "kill-session" in argv and self.seat(mars) in argv[-1]:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return real_runner(argv, **kw)
+        self.runner = kill_unconfirmed
+        tried_at = []
+        for _ in range(8):
+            _, out = self.sweep()
+            if mars in out["recoveries"]:
+                tried_at.append(self.now)
+        gaps = [b - a for a, b in zip(tried_at, tried_at[1:])]
+        self.assertEqual(len(tried_at), ps.RELOGIN_MAX_ATTEMPTS)
+        self.assertEqual(gaps, [ps.RELOGIN_RETRY_S, 2 * ps.RELOGIN_RETRY_S], "300 s, then 600 s")
+
+    def test_a_switch_to_a_third_account_starts_the_count_again(self):
+        mars = next(iter(self.WORKERS))
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+        real_runner = self.runner
+
+        def kill_unconfirmed(argv, **kw):
+            if "kill-session" in argv and self.seat(mars) in argv[-1]:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return real_runner(argv, **kw)
+        self.runner = kill_unconfirmed
+        for _ in range(ps.RELOGIN_MAX_ATTEMPTS):
+            self.sweep_until(mars)
+        self.assertEqual(self.sweep_until(mars), (None, None), "capped on B")
+        self.runner = real_runner
+        self.account = "acct-cccc"
+        self.assertEqual(self.sweep_until(mars)[1]["outcome"], rem.RECOVERED, "a new sign-in is a new count")
+
+    def test_a_seat_bound_to_its_launch_account_however_late_it_parks(self):
+        mars = next(iter(self.WORKERS))
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+        self.sweep()  # restarted on B: its new run is launched under B
+        self.assertEqual(sup.launch_account(self.ws, mars), B)
+        self.account = "acct-cccc"  # the owner signs in again; the seat keeps working a while
+        self.show(mars, MID_TURN)
+        for _ in range(3):
+            self.sweep()
+        self.show(mars, PARKED)  # it parks only now, on B's limit
+        before = len(self.spawned)
+        self.sweep()
+        self.assertEqual(len(self.spawned), before + 1, "bound to B, the account its process launched under")
 
     def test_an_unreadable_account_binds_nothing_and_ends_nothing(self):
         mars = next(iter(self.WORKERS))
@@ -380,6 +484,69 @@ class CodexIsNotRestarted(Pool):
         self.sweep()
         self.assertEqual(self.spawned, [])
 
+
+class CodexIsNotRestarted(Pool):
+    WORKERS = {"c" * 32: "Reviewer"}
+
+    def setUp(self):
+        super().setUp()
+        (self.ws / "state" / "roster.json").write_text(json.dumps(
+            {"workers": {w: {"state": "live", "runtime": "codex", "label": n} for w, n in self.WORKERS.items()}}))
+
+    def test_a_codex_seat_under_a_limit_banner_is_left_to_its_own_reset(self):
+        w = next(iter(self.WORKERS))
+        self.show(w, PARKED)
+        self.sweep()
+        self.account = B
+        _, out = self.sweep()
+        self.assertNotEqual(out["decisions"].get(w), ps.RESTART_NEW_LOGIN)
+        self.assertEqual(self.spawned, [])
+
+
+class ErrorBranches(Pool):
+    """Every way the new paths fail answers a value, and none of them raises out of a sweep."""
+
+    def test_a_seat_with_no_open_run_or_an_unreadable_pane_is_not_restarted(self):
+        mars = next(iter(self.WORKERS))
+        rem.close_dead_runs(self.ws, mars, end_reason="killed")
+        self.assertEqual(rem.restart_on_new_login(self.ws, REPO, mars, runner=self.runner)["outcome"], rem.NO_SESSION)
+        baxter = list(self.WORKERS)[1]
+
+        def unreadable(argv, **kw):
+            raise OSError("tmux is gone")
+        got = rem.restart_on_new_login(self.ws, REPO, baxter, runner=unreadable)
+        self.assertEqual((got["outcome"], got["why"]), (rem.INDETERMINATE, "its pane could not be read"))
+        self.assertEqual(self.spawned, [])
+
+    def test_an_unreadable_account_is_none(self):
+        with patch.object(clh, "current_account", side_effect=RuntimeError("config gone")):
+            self.assertIsNone(sup.current_account())
+        import spawn_worker
+        with patch.object(clh, "current_account", side_effect=RuntimeError("config gone")):
+            self.assertIsNone(spawn_worker.launch_account())
+        with patch.object(clh, "current_account", return_value=A):
+            self.assertEqual(spawn_worker.launch_account(), A)
+
+    def test_the_account_is_a_digest_of_the_signed_in_identity(self):
+        cfg = self.ws / "cfg"
+        cfg.mkdir()
+        (cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "u-1", "emailAddress": "x@y"}}))
+        with patch.object(clh, "_launch_config_dir", return_value=str(cfg)):
+            got = clh.current_account()
+        self.assertEqual(len(got), 16)
+        self.assertNotIn("x@y", got)
+
+    def test_a_failed_sweep_nudge_never_reaches_the_core(self):
+        watch = _load("core_input_watch", SRC / "core-input-watch.py")
+        with patch.object(trig, "request_sweep", side_effect=RuntimeError("no pool")):
+            self.assertFalse(watch.pool_sweep_after_sign_in(self.ws, 1.0))
+            clh._pool_sweep(self.ws, "core-limit-cleared", "k")  # swallowed: the timer still sweeps
+
+    def test_a_spawn_that_cannot_start_is_no_sweep(self):
+        def broken(argv, **kw):
+            raise OSError("no python")
+        self.assertFalse(trig.request_sweep(self.ws, "core-signed-in", "k-1", spawn=broken))
+        self.assertFalse(trig.request_sweep(self.ws, "core-signed-in", "", spawn=broken), "no key, no sweep")
 
 class RetryLimitReadsTheFooterForm(Pool):
     def test_the_footer_banner_is_a_limit_wait_not_a_changed_pane(self):
@@ -410,6 +577,7 @@ class CoreRecoveredTrigger(unittest.TestCase):
         self.addCleanup(self.td.cleanup)
         self.ws = Path(self.td.name)
         (self.ws / "state").mkdir()
+        (self.ws / "state" / "roster.json").write_text(json.dumps({"workers": {}}))
         self.spawns = []
 
     def spawn(self, argv, **kw):
@@ -425,8 +593,10 @@ class CoreRecoveredTrigger(unittest.TestCase):
         trig.request_sweep(self.ws, "core-limit-released", "core-launch:200", spawn=self.spawn)
         self.assertEqual(len(self.spawns), 2, "a new event is a new sweep")
 
-    def test_no_pool_installed_is_no_sweep(self):
+    def test_no_pool_installed_or_no_roster_is_no_sweep(self):
         self.assertFalse(trig.request_sweep(self.ws, "x", "k", repo=self.ws, spawn=self.spawn))
+        (self.ws / "state" / "roster.json").unlink()
+        self.assertFalse(trig.request_sweep(self.ws, "x", "k2", spawn=self.spawn))
         self.assertEqual(self.spawns, [])
 
     def test_the_hold_asks_once_when_it_releases_and_when_cleared(self):

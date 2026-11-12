@@ -52,11 +52,12 @@ def _record(workspace, entry: dict) -> None:
 def request_sweep(workspace, cause: str, key: str, *, repo: Optional[Path] = None,
                   spawn: Optional[Callable] = None, now: Optional[float] = None) -> bool:
     """Start one detached `pool_remedy.py --sweep` for the event `key`; False when that key was
-    already requested, the pool is not installed, or the spawn failed."""
+    already requested, the pool is not installed or has no roster here, or the spawn failed."""
     repo = Path(repo) if repo is not None else REPO
     spawn = spawn or subprocess.Popen
     script = repo / SWEEP_SCRIPT
-    if not key or not script.is_file():
+    # No roster, no pool to sweep: a workspace that never spawned a worker asks for nothing.
+    if not key or not script.is_file() or not (Path(workspace) / "state" / "roster.json").is_file():
         return False
     if (last_request(workspace) or {}).get("key") == key:
         return False

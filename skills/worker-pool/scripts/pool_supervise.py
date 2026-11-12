@@ -333,6 +333,7 @@ def observe(workspace, now: float, *, worker_ids=None,
             limit_banner=reset.banner if reset else None,
             delivery_block=blocks.get(socket) if socket else None,
             limit_parked=parked,
+            launch_account=launch_account(workspace, wid) if parked else None,
         )
     return obs
 
@@ -441,11 +442,14 @@ def load_state(workspace) -> ps.SupervisionState:
                 limit_account=ev.get("limit_account"),
                 relogin_attempts=int(ev.get("relogin_attempts") or 0),
                 relogin_next_at=ev.get("relogin_next_at"),
+                relogin_target=ev.get("relogin_target"),
+                relogin_down=bool(ev.get("relogin_down")),
             )
     last = raw.get("last_sample_at")
     return ps.SupervisionState(
         last_sample_at=float(last) if isinstance(last, (int, float)) else None,
-        workers=workers, last_account=raw.get("last_account"))
+        workers=workers, last_account=raw.get("last_account"),
+        relogin_announced=raw.get("relogin_announced"))
 
 
 def save_state(workspace, state: ps.SupervisionState) -> None:
@@ -454,6 +458,7 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
     payload = {
         "last_sample_at": state.last_sample_at,
         "last_account": state.last_account,
+        "relogin_announced": state.relogin_announced,
         "workers": {w: {"first_detected_at": e.first_detected_at,
                         "consecutive": e.consecutive,
                         "recover_issued_at": e.recover_issued_at,
@@ -474,7 +479,9 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
                         "limit_reset_at": e.limit_reset_at,
                         "limit_account": e.limit_account,
                         "relogin_attempts": e.relogin_attempts,
-                        "relogin_next_at": e.relogin_next_at}
+                        "relogin_next_at": e.relogin_next_at,
+                        "relogin_target": e.relogin_target,
+                        "relogin_down": e.relogin_down}
                     for w, e in state.workers.items()},
     }
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".pool-supervision.")
@@ -485,6 +492,28 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+def launch_account(workspace, worker_id) -> str | None:
+    """The account the worker's open run was launched under (its run's `account`), else None."""
+    open_runs = [r for r in wi.incarnations(workspace, worker_id)
+                 if isinstance(r, dict) and r.get("ended_at") is None]
+    return (open_runs[-1].get("account") or None) if open_runs else None
+
+
+def mark_relogin_down(workspace, worker_id) -> None:
+    """Persist that a restart took `worker_id` down without a confirmed start (pool_supervision)."""
+    save_state(workspace, ps.mark_relogin_down(load_state(workspace), worker_id))
+
+
+def relogin_announced(workspace) -> str | None:
+    return load_state(workspace).relogin_announced
+
+
+def announce_relogin(workspace, account) -> None:
+    """Persist that the owner was told the pool restarts on `account`: one opening note per sign-in."""
+    from dataclasses import replace as _replace
+    save_state(workspace, _replace(load_state(workspace), relogin_announced=account))
 
 
 def confirm_new_login(workspace, worker_id, account) -> None:
