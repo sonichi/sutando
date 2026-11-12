@@ -63,8 +63,10 @@ code.
 ## 4. Fewest steps, in place
 
 - One tap on the first card. No second card, no detour to Settings.
-- One approval for related items, not one per item.
+- One approval for closely related items, not one per item. The card lists each thing it covers.
 - The current value is pre-filled.
+- A value that becomes permanent on approval (for example an agent's ID) is editable on the card
+  before approving, because it cannot be changed afterwards.
 
 ## 5. No dead ends
 
@@ -121,6 +123,8 @@ Two cases that are easy to get wrong:
   updated in place. No second chat message repeats it.
 - Never show internals (ids, hostnames, session names, raw provider errors, key fragments) outside
   Details.
+- State an install-wide or hard-to-undo effect plainly, before the tap. Keep it undoable where
+  possible.
 - Carry a plain-text fallback for clients that do not know the card.
 
 | Action class | How the person does it |
@@ -153,18 +157,24 @@ Links:
 
 ## 9. Where things appear
 
-- **Chat cards** are the record in the timeline.
+- **Chat cards** are the record in the timeline. A card carrying data from the person's own
+  accounts or device goes to their DM only, never a shared room.
 - **The bar above the message box** shows every card waiting on the person, from any room, whether
   or not that agent is in the current room. It also carries live reminders (sign in, open the
   terminal, out of budget), which clear when the cause clears.
   - It acts in place when the action is safe. Otherwise one tap goes to the card.
   - More than one item becomes a drawer: "N things need you".
+  - Order: a stuck agent first (signed out, out of budget, blocked), then approvals, then
+    questions, then informational items. Within a class, the current room's items come first.
+  - The bar and the agent's working-status line share one slot above the message box. An action
+    item takes priority over working status.
   - Each item can be dismissed. Dismissing does not answer it. Dismissing hides an item from the
     bar. It comes back by itself only if the card changes. The person can bring it back any time
     from "N hidden · Show" in the bar or the drawer, and the card itself stays in its room.
   - It stays discreet in a shared room. For an item that comes from another room, the closed bar
     shows only that something needs the person and from which agent, or just a count, with no card
     text. The content appears only when the person opens the drawer.
+  - When a stuck-agent item is hidden from the bar, the agent keeps a small warning mark.
 - **Settings** is the reference.
 
 ## 10. Agents and discovery
@@ -218,37 +228,49 @@ not. A line about something the change does not touch is "not applicable".
 8. Is end-user-facing text free of instructions to do a known action that has a control?
    (Runbooks, developer docs and operator instructions may say "run this command".)
 9. Does the person finish in one step on the first card?
-10. Are related items under one approval?
-11. Is the current value pre-filled?
-12. Does every refusal name the way through?
-13. Is each action handled as its class requires (section 7)?
+10. Are closely related items under one approval?
+11. Does the card list each thing that approval covers?
+12. Is the current value pre-filled?
+13. Is a value that becomes permanent on approval editable on the card first?
+14. Does every refusal name the way through?
+15. Is each action handled as its class requires (section 7)?
 
 **Cards**
 
-14. Does the card say what is asked in plain words?
-15. Is everything the card mentions a link to it?
-16. Does the card show its own outcome in place, with no second message repeating it?
-17. Is user-facing text free of internals and secrets outside Details?
-18. Does the card carry a plain-text fallback?
-19. Do in-app links open in place, on the person's click?
-20. Does a card waiting on the person show in the bar, from any room?
+16. Does the card say what is asked in plain words?
+17. Is everything the card mentions a link to it?
+18. Is an install-wide or hard-to-undo effect stated on the card before the tap?
+19. Does the card show its own outcome in place, with no second message repeating it?
+20. Is user-facing text free of internals and secrets outside Details?
+21. Does a card with data from the person's own accounts or device go to their DM only?
+22. Does the card carry a plain-text fallback?
+23. Do in-app links open in place, on the person's click?
+24. Does a card waiting on the person show in the bar, from any room?
 
 **Questions and discovery**
 
-21. Does a question to a person use the one question model and renderer?
-22. Is the question free of instructions to edit a row or a database?
-23. Is another agent recommended only on a named, explicit capability?
+25. Does a question to a person use the one question model and renderer?
+26. Is the question free of instructions to edit a row or a database?
+27. Is another agent recommended only on a named, explicit capability?
 
 **Trust**
 
-24. Is the click check the shared one?
-25. Is a click that fails the check refused, never treated as chat?
+28. Is the click check the shared one?
+29. Is a click that fails the check refused, never treated as chat?
+
+## Open questions
+
+These are not rules yet.
+
+- Where the warning mark sits when a stuck-agent item is hidden from the bar.
+- Whether a card from another person's agent that asks the viewer for something shows in the
+  viewer's bar. Proposed: yes, labelled with whose agent it is, with "Go" only.
 
 ## What this means here (agent engine)
 
 The engine writes the card content and the text the owner reads, so rules 2, 3, 5, 7, 8, 10
-and 11 land here. Checklist lines 19 and 20 are for the web client and do not apply to an engine
-change.
+and 11 land here. Checklist lines 23 and 24 are for the web client and do not apply to
+an engine change.
 
 - High-impact (rule 2) is at least what `CLAUDE.md` "Identity" has the agent confirm with the
   owner before executing: irreversible actions such as sending email, deleting files and
@@ -274,6 +296,10 @@ change.
   capability this one lacks, and name that capability.
 - No raw ids, hostnames, session names or provider errors in owner-facing text. Say what happened
   and what unblocks it in plain words; keep the raw detail in the card's Details or the log.
+- A card carrying data from the owner's connected accounts or device is sent to the owner's DM,
+  never to a shared room. This is the same rule as `CLAUDE.md` "Where replies go".
+- An approval card lists each thing it covers, and offers a value that becomes permanent (for
+  example a worker agent's ID) as an editable field.
 - Known gaps, where one plain instruction is still allowed: `vault set KEY VALUE` (the secret
   must go through the bridge's interception, not a card field, so it stays a typed command
   until a secure-entry control exists) and the typed re-link code.
@@ -290,3 +316,12 @@ change.
   message. The click's task is still answered through its result file, starting with
   `[no-send]` or `[REPLIED]` when the card already shows the outcome.
 - Open-ended questions stay chat. This rule is about actions the agent already knows.
+
+## Mechanical checks worth adding later
+
+Not part of the rules.
+
+- A lint for "reply yes to…", "go to Settings" and "set its Status" in end-user-facing strings.
+- A test that only one module verifies card clicks.
+- A test that owner-facing text contains no hostnames, hex ids or key-like tokens.
+- A test that every question with options renders as buttons.
