@@ -22,7 +22,8 @@ resume their request once the apps are connected.
         (--request TEXT | --request-file PATH|-) (--error TEXT | --error-file PATH|-) [--account A] [--stopped TEXT]
                                     an app call failed because the app's sign-in lapsed (not connect_required):
                                     arms the same wait as `card` and prints "message", a Signed out agent panel
-                                    card for the owner's DM whose Reconnect reply brings up the Connect card
+                                    card whose Reconnect signs the owner in on the card; refused (not_owner_dm)
+                                    unless --room is the owner's checked DM with this agent
   card-check <wait-id> --event-id E --content-file PATH|-
                                     after posting a DM card, check the read-back event carries a
                                     card the client draws; exit 1 prints "fallback", the plain text
@@ -1504,20 +1505,29 @@ def auth_problem(error: str) -> str | None:
 def reauth_message(wait: dict, owner: str, task: str, *, name: str, slug: str, account: str = "",
                    stopped: str = "") -> dict:
     """The room.message.send payload for a signed-out app: an agent panel in state error, whose Reconnect
-    button signs the owner in to the app in place; this wait resumes the request once it shows connected."""
+    button signs the owner in to the app in place. The client sends nothing when that succeeds: the wait
+    armed before this card is built is what resumes the request once the app shows connected."""
     import agent_card as ac
 
     did = stopped or f"I couldn't finish your request because {name} signed me out."
     body, card = ac.build(
-        f"app-reauth:{slug}", "error", title=name, subtitle="Signed out" + (f" · {account}" if account else ""),
+        f"app-reauth:{slug}", "error", title=name, subtitle=account, status="Signed out",
         avatar_=ac.avatar(app=slug, shape="square"),
         text=f"{did} Reconnect it and I'll carry on.",
-        buttons=[ac.button(f"Reconnect {name}", "connect", style="primary", toolkit=slug)],
+        buttons=[ac.button(f"Reconnect {name}", "connect", style="primary", toolkit=slug, for_=owner)],
         note=f"Or {INTEGRATIONS_HINT}.", note_tone="dim",
         body=f"{name} signed me out{f' ({account})' if account else ''}, so I stopped. Reconnect {name}: "
              f"tap Reconnect on the card, or {INTEGRATIONS_HINT}.")
     return {"body": body, "extra_content": {ac.CARD_KEY: card}, "reply_to": wait["reply_to"],
             "operation_id": f"{task}:reauth-card"}
+
+
+def owner_dms(ws: Path, owner: str) -> set[str]:
+    """The checked DMs `owner` has with this machine's own agents (never a worker's)."""
+    import connections  # noqa: PLC0415
+
+    return {dm for dm in (connections.owner_dm(r, ws) for r in connections.read_rows(ws)
+                          if not r.get("worker") and r.get("owner_mxid") == owner) if dm}
 
 
 def cmd_reauth(
@@ -1530,7 +1540,7 @@ def cmd_reauth(
     **_: Any,
 ) -> int:
     """An app call failed because its sign-in lapsed: arm the same wait `card` arms (the request resumes
-    once the app is connected again) and print the Signed out card to post in the owner's DM."""
+    once the app is connected again) and print the Signed out card, for the owner's checked DM only."""
     args.private, args.switch, args.line = False, False, []
     a = wait_args(args)
     slug = a["slugs"][0]
@@ -1539,6 +1549,9 @@ def cmd_reauth(
         a["owner"] = task_owner
     elif a["owner"] != task_owner:
         raise Setup("not_owner_task", f"--owner is not the user of {a['task']}.")
+    if a["room"] not in owner_dms(ws, a["owner"]):
+        raise Setup("not_owner_dm", "The Signed out card names the owner's account, so it goes only to their DM "
+                                    "with this agent; from any other room use `card --private`.")
     error = args.error if args.error is not None else (sys.stdin.read(MAX_REQUEST_READ) if args.error_file == "-"
                                                        else Path(args.error_file).read_text(encoding="utf-8"))
     kind = auth_problem(error)

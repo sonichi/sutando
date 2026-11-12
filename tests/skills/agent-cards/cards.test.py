@@ -3,9 +3,13 @@
 
 - Each builder's card passes the client's checks (agent_card.problem): connections (core rows only,
   workers' own agents as a footer, chat-app bridges), workers, apps, and circle with an honest empty state.
-- `show` posts only for the owner, only in their checked DM, through the injected Action call.
-- `reply` acts only for the owner in their DM; Disconnect and Retire act only on their confirmed variant;
-  app replies never disconnect an app.
+- Cards follow the client's contract: a status pill, no shape on a member's avatar, apps split into
+  Connected and Not connected with a `connect` action per unconnected app, "+ Connect an app" as a picker.
+- `show` posts only for the owner, only in their checked DM, through the injected Action call, records the
+  room, connection and handler, and `show apps` starts every connect waiter that is not running.
+- `reply` acts only on the owner's click on a card this agent posted (agent_card.click_verdict); any other
+  click prints the fixed refusal and nothing acts. Disconnect and Retire never act on the first click: it
+  posts a confirm card, whose "Yes" acts once.
 
 Every source and every action is a fake; nothing touches the network, tmux or the real workspace.
 
@@ -32,7 +36,7 @@ ac = cards.ac
 DM, ROOM, OWNER = "!dm:s.space", "!team:s.space", "@owner:s.space"
 CORE = {"instance": "s_dspace", "owner_mxid": OWNER, "agent_mxid": "@owner-mini.agent:s.space"}
 ROWS = [
-    {"instance": "s_dspace", "server": "s.space", "primary": True, "state": "connected",
+    {"instance": "s_dspace", "server": "s.space", "primary": True, "state": "connected", "owner_mxid": OWNER,
      "agent_mxid": "@owner-mini.agent:s.space", "agent_display_name": "Mini"},
     {"instance": "dev-s-space", "server": "dev.s.space", "primary": False, "state": "connected",
      "agent_mxid": "@owner-mini.agent:dev.s.space"},
@@ -80,8 +84,11 @@ class Builders(unittest.TestCase):
         replies = {i["command"]: i for i in menu_items(card)}
         self.assertEqual(replies["card:connections:dev-s-space:make-main"]["reply"], "Make dev.s.space my main connection")
         self.assertIn("card:connections:dev-s-space:make-main", replies)
-        disconnect = replies["card:connections:dev-s-space:disconnect:confirmed"]
-        self.assertIn("confirm", disconnect)
+        self.assertNotIn("confirm", replies["card:connections:dev-s-space:disconnect"])
+        self.assertFalse(any(c.endswith(":confirmed") for c in replies), "only a confirm card offers a confirmed command")
+        self.assertEqual(card["header"]["status"], {"label": "2 of 3 connected"})
+        self.assertEqual([r["avatar"] for r in servers["rows"]],
+                         [{"mxid": "@owner-mini.agent:s.space"}, {"mxid": "@owner-mini.agent:dev.s.space"}, {"seed": "ag2.space"}])
         self.assertFalse(any("s_dspace" in r for r in replies), "the main connection offers no Disconnect")
         self.assertEqual([b["label"] for b in card["header"]["badges"]], ["s.space", "dev.s.space", "ag2.space"])
 
@@ -99,17 +106,42 @@ class Builders(unittest.TestCase):
         self.assertEqual(items["card:workers:w1:pause"]["reply"], "Pause Pylon")
         self.assertIn("card:workers:w1:pause", items)
         self.assertNotIn("card:workers:w2:pause", items)
-        self.assertIn("confirm", items["card:workers:w1:retire:confirmed"])
+        self.assertEqual(items["card:workers:w1:retire"]["reply"], "Retire Pylon")
+        self.assertNotIn("card:workers:w1:retire:confirmed", items)
+        self.assertEqual(rows[0]["avatar"], {"mxid": "@owner-pylon.agent:s.space"})
         self.assertEqual(card["buttons"][0]["reply"], "create a worker")
 
     def test_apps(self):
-        _, card = cards.apps_card(APPS)
+        pending = [{"slug": "notion", "name": "Notion"}, {"slug": "gmail", "name": "Gmail"},
+                   {"slug": "linear", "name": "Linear"}, {"slug": "Bad Slug"}]
+        body, card = cards.apps_card(APPS, pending)
         self.assertIsNone(ac.problem(card))
-        rows = card["groups"][0]["rows"]
-        self.assertEqual([(r["title"], r["subtitle"], r["avatar"]["app"]) for r in rows],
-                         [("Gmail", "me@work.io · default", "gmail"), ("Linear", "Signed out", "linear")])
-        self.assertEqual(rows[1]["actions"][0], {"label": "Reconnect", "kind": "connect", "toolkit": "linear"})
-        self.assertEqual(card["buttons"][0]["reply"], "connect an app")
+        on, off = card["groups"]
+        self.assertEqual((on["label"], off["label"]), ("Connected", "Not connected"))
+        self.assertEqual([(r["title"], r["subtitle"], r["avatar"]) for r in on["rows"]],
+                         [("Gmail", "me@work.io · default", {"app": "gmail", "shape": "square"})])
+        self.assertEqual(on["rows"][0]["actions"], [{"label": "Switch account", "kind": "reply",
+                                                     "reply": "Switch my Gmail account", "command": "card:apps:gmail:switch"}])
+        self.assertEqual([(r["title"], r["subtitle"], r["state"], r["actions"]) for r in off["rows"]], [
+            ("Linear", "Signed out", "warn", [{"label": "Reconnect", "kind": "connect", "toolkit": "linear"}]),
+            ("Notion", "Needed for a request you made", "warn", [{"label": "Connect", "kind": "connect", "toolkit": "notion"}])])
+        self.assertEqual(card["buttons"], [{"label": "+ Connect an app", "kind": "connect_picker", "style": "secondary"}])
+        self.assertEqual(card["header"]["status"], {"label": "1 connected"})
+        self.assertEqual(body, "Your apps: 1 connected, 2 not connected. Manage them in Settings → Integrations.")
+        self.assertEqual(cards.issued_cards.offered(card), {"Switch my Gmail account": "card:apps:gmail:switch"})
+        self.assertTrue(cards.issued_cards.has_picker(card))
+        _, only_off = cards.apps_card([APPS[1]])
+        self.assertEqual([g["label"] for g in only_off["groups"]], ["Not connected"])
+        self.assertNotIn("status", only_off["header"])
+
+    def test_no_card_types_a_glyph_or_asks_for_a_reply_where_the_client_can_act(self):
+        built = [cards.connections_card(ROWS, BRIDGES), cards.workers_card(WORKERS, {}, {}), cards.apps_card(APPS),
+                 cards.circle_card([{"entity_id": "@ana:s.space", "kind": "human"}]),
+                 cards.confirm_card(ac.Reply("workers", "w1", "retire", False), "Retire Pylon", now=1000.0)]
+        for body, card in built:
+            self.assertNotRegex(body + json.dumps(card, ensure_ascii=False), "[\u2713\u2714\u2705\u274c\u26a0]")
+        plain = sorted(t for _, card in built for t, c in cards.issued_cards.offered(card).items() if not c)
+        self.assertEqual(plain, ["create a worker", "show my workers"])
 
     def test_circle_and_its_empty_state(self):
         _, empty = cards.circle_card([])
@@ -120,8 +152,8 @@ class Builders(unittest.TestCase):
                                      {"entity_id": "svc", "kind": "service"}])
         self.assertIsNone(ac.problem(card))
         people, agents = card["groups"]
-        self.assertEqual(people["rows"][0]["avatar"], {"mxid": "@ana:s.space", "shape": "round"})
-        self.assertEqual(agents["rows"][0]["avatar"]["shape"], "square")
+        self.assertEqual(people["rows"][0]["avatar"], {"mxid": "@ana:s.space"})
+        self.assertEqual(agents["rows"][0]["avatar"], {"mxid": "@ana-bot.agent:s.space"})
 
     def test_nothing_set_up(self):
         for body, card in (cards.connections_card([], []), cards.workers_card([], {}, {}), cards.apps_card([])):
@@ -143,9 +175,10 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.ws = Path(self.tmp.name)
-        p = mock.patch.object(cards.connections, "owner_dm", lambda row, ws=None: DM)
-        p.start()
-        self.addCleanup(p.stop)
+        for name, fake in (("owner_dm", lambda row, ws=None: DM), ("read_rows", lambda ws=None: ROWS)):
+            p = mock.patch.object(cards.connections, name, fake)
+            p.start()
+            self.addCleanup(p.stop)
 
     def run_(self, argv, text, **kw):
         path = self.ws / "task.txt"
@@ -165,6 +198,37 @@ class Show(Base):
         action, args, op, room = fake.calls[0]
         self.assertEqual((action, op, room, args["reply_to"]), ("room.message.send", "task-1:connections-card", DM, "$ask"))
         self.assertEqual(args["extra_content"]["space.ag2.card"]["id"], "connections")
+        entry = cards.issued_cards.live(self.ws, "$card")
+        self.assertEqual((entry["room"], entry["lane"], entry["handler"]), (DM, "s_dspace", cards.HANDLER))
+
+    def test_show_apps_starts_the_waiter_of_every_request_that_waits_for_an_app(self):
+        import connectors
+        markers = [{"wait_id": "w-alive", "toolkits": [{"slug": "notion", "name": "Notion"}]},
+                   {"wait_id": "w-dead", "toolkits": [{"slug": "linear", "name": "Linear"}, "odd"]},
+                   {"wait_id": "w-stuck", "toolkits": [{"slug": "asana", "name": "Asana"}]}]
+        spawned, fake = [], Fake()
+
+        def spawn(ws, wait_id):
+            spawned.append(wait_id)
+            if wait_id == "w-stuck":
+                raise OSError("no exec")
+            return 4242
+        with mock.patch.object(connectors, "list_markers", lambda ws: markers), \
+                mock.patch.object(connectors, "waiter_alive", lambda ws, wid: wid == "w-alive"), \
+                mock.patch.object(connectors.Cloud, "connection_rows", lambda self, cached=False: APPS), \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc, out = self.run_(["show", "apps"], task("show my apps"), execute=fake.execute, spawn=spawn)
+            self.assertEqual((rc, out), (0, {"status": "posted", "event_id": "$card", "waits": ["w-alive", "w-dead"]}))
+            self.assertEqual(spawned, ["w-dead", "w-stuck"])
+            off = fake.calls[0][1]["extra_content"]["space.ag2.card"]["groups"][1]["rows"]
+            self.assertEqual([(r["title"], r["actions"][0]["kind"]) for r in off],
+                             [("Linear", "connect"), ("Notion", "connect"), ("Asana", "connect")])
+            rc, out = self.run_(["show", "apps", "--print"], task("show my apps"), spawn=spawn)
+        self.assertEqual((rc, len(spawned)), (0, 2), "a preview starts nothing")
+        with mock.patch.object(connectors, "list_markers", lambda ws: []), \
+                mock.patch.object(connectors.Cloud, "connection_rows", lambda self, cached=False: APPS):
+            rc, out = self.run_(["show", "apps"], task("show my apps"), execute=fake.execute)
+        self.assertEqual(out, {"status": "posted", "event_id": "$card"})
 
     def test_anyone_else_or_any_other_room_is_refused_before_anything_is_read(self):
         fake = Fake()
@@ -227,11 +291,14 @@ class Sources(Base):
             workers, identities, runtimes = cards.read_workers(self.ws)
             self.assertEqual((len(workers), identities["w1"], runtimes), (3, {}, {"w1": "codex"}))
             self.assertEqual(cards.build_kind("workers", self.ws)[1]["id"], "workers")
-        with mock.patch.object(connectors.Cloud, "connection_rows", lambda self, cached=False: APPS):
+        with mock.patch.object(connectors.Cloud, "connection_rows", lambda self, cached=False: APPS), \
+                mock.patch.object(connectors, "list_markers", lambda ws: [
+                    {"wait_id": "w1", "toolkits": [{"slug": "notion", "name": "Notion"}]}]):
+            self.assertEqual(cards.read_apps(self.ws), (APPS, [{"slug": "notion", "name": "Notion"}]))
             self.assertEqual(cards.build_kind("apps", self.ws)[1]["id"], "apps")
 
     def test_print_shows_the_card_without_posting_it(self):
-        with mock.patch.object(cards, "read_apps", lambda ws: APPS):
+        with mock.patch.object(cards, "read_apps", lambda ws: (APPS, [])):
             rc, out = self.run_(["show", "apps", "--print"], task("show my apps"))
         self.assertEqual((rc, out["card"]["id"]), (0, "apps"))
         self.assertFalse(cards.issued_cards.ledger_path(self.ws).exists())
@@ -242,13 +309,13 @@ class Sources(Base):
         self.assertEqual((rc, out["status"]), (1, "failed"))
         self.assertIn("cloud down", out["why"])
         refusing = lambda *a, **k: {"is_error": True, "code": "FORBIDDEN"}
-        with mock.patch.object(cards, "read_apps", lambda ws: APPS):
+        with mock.patch.object(cards, "read_apps", lambda ws: (APPS, [])):
             rc, out = self.run_(["show", "apps"], task("show my apps"), execute=refusing)
         self.assertEqual((rc, out["status"]), (1, "failed"))
         self.assertIn("FORBIDDEN", out["why"])
 
     def test_a_card_that_cannot_be_recorded_is_posted_and_says_its_buttons_will_not_act(self):
-        with mock.patch.object(cards, "read_apps", lambda ws: APPS), \
+        with mock.patch.object(cards, "read_apps", lambda ws: (APPS, [])), \
                 mock.patch.object(cards.issued_cards, "record", side_effect=OSError("disk full")):
             rc, out = self.run_(["show", "apps"], task("show my apps"), execute=Fake().execute)
         self.assertEqual((rc, out["status"], out["event_id"]), (0, "posted", "$card"))
@@ -262,7 +329,7 @@ class Sources(Base):
         out = io.StringIO()
         with mock.patch.object(cards, "_core", lambda ws: CORE), \
                 mock.patch.object(pool_provision, "core_actions", lambda ws, lane: (fake, CORE)), \
-                mock.patch.object(cards, "read_apps", lambda ws: APPS), \
+                mock.patch.object(cards, "read_apps", lambda ws: (APPS, [])), \
                 mock.patch("workspace_default.resolve_workspace", lambda: str(self.ws)), \
                 contextlib.redirect_stdout(out):
             rc = cards.main(["show", "apps", "--task-file", str(path)])
@@ -278,39 +345,106 @@ class Sources(Base):
 
 
 class Reply(Base):
-    """A click acts only as the owner's reply, in their DM, to a card this agent posted that offered it."""
+    """A click acts only as the owner's click, in the room of a card this agent posted, on a text it offered."""
 
     @staticmethod
     def text(command):
         return f"Do {command}"
 
-    def issue(self, *commands, event="$card"):
+    def issue(self, *commands, event="$card", lane=""):
         _, card = ac.build("test", "info", title="t", body="b",
                            buttons=[ac.button(c, "reply", reply=self.text(c), command=c) for c in commands])
-        self.assertTrue(cards.issued_cards.record(self.ws, event, card))
+        self.assertTrue(cards.issued_cards.record(self.ws, event, card, room=DM, lane=lane, handler=cards.HANDLER))
 
-    def reply(self, command, *, said=None, card_id="test", **kw):
+    def reply(self, command, *, said=None, card_id="test", execute=None, **kw):
         said = self.text(command) if said is None else said
         kw.setdefault("reply_to_event", "$card")
         kw.setdefault("card_click", json.dumps({"card_id": card_id, "action": said}))
-        return self.run_(["reply"], task(said, **kw))
+        return self.run_(["reply"], task(said, **kw), **({"execute": execute} if execute else {}))
 
-    def test_disconnect_acts_on_the_confirmed_variant_the_card_offered(self):
+    def forged(self, *a, **kw):
+        rc, out = self.reply(*a, **kw)
+        self.assertEqual((rc, out["status"], out["say"]), (1, "forged_or_stale_click", ac.UNMATCHED_CLICK), (a, kw))
+
+    def first_click(self, kind, target, verb, words):
+        """Show a card that offers the destructive action, click it, and return the confirm card posted."""
+        _, card = ac.build(kind, "info", title="t", body="b", buttons=[
+            ac.button(words, "reply", reply=words, command=ac.reply(kind, target, verb))])
+        cards.issued_cards.record(self.ws, "$list", card, room=DM, handler=cards.HANDLER)
+        fake = Fake()
+        fake.execute = lambda action, arguments, **kw: fake.calls.append((action, arguments, kw)) or {
+            "result": {"event_id": "$confirm"}}
+        rc, out = self.reply("", said=words, card_id=kind, reply_to_event="$list", execute=fake.execute)
+        self.assertEqual((rc, out), (0, {"status": "asked", "event_id": "$confirm"}))
+        return fake.calls[0][1]["extra_content"]["space.ag2.card"], fake.calls[0]
+
+    def test_the_first_click_on_disconnect_only_asks_and_the_confirm_card_s_yes_acts_once(self):
         done = []
-        self.issue("card:connections:dev-s-space:disconnect:confirmed")
-        with mock.patch.object(cards.connections, "read_rows", lambda ws=None: ROWS), \
-                mock.patch.object(cards.connections, "disconnect", lambda inst, **kw: done.append(inst) or {}):
-            rc, out = self.reply("card:connections:dev-s-space:disconnect")
-            self.assertEqual((rc, out["status"], done), (1, "not_a_card_reply", []))
-            rc, out = self.reply("card:connections:dev-s-space:disconnect:confirmed")
-        self.assertEqual((rc, out["status"], done), (0, "done", ["dev-s-space"]))
+        with mock.patch.object(cards.connections, "disconnect", lambda inst, **kw: done.append(inst) or {}):
+            confirm, call = self.first_click("connections", "dev-s-space", "disconnect", "Disconnect dev.s.space")
+            self.assertEqual(done, [], "the first click never disconnects")
+            self.assertIsNone(ac.problem(confirm))
+            self.assertEqual((confirm["id"], confirm["state"], confirm["header"]["title"]),
+                             ("confirm:connections:dev-s-space:disconnect", "pending", "Disconnect dev.s.space?"))
+            self.assertEqual([(b["label"], b["reply"], b["command"]) for b in confirm["buttons"]], [
+                ("Yes, disconnect dev.s.space", "Yes, disconnect dev.s.space", "card:connections:dev-s-space:disconnect:confirmed"),
+                ("Keep dev.s.space", "Keep dev.s.space", "card:connections:dev-s-space:keep")])
+            self.assertEqual((call[1]["reply_to"], call[2]["room_id"], call[2]["operation_id"]), ("$ask", DM, "task-1:confirm-card"))
+            entry = cards.issued_cards.live(self.ws, "$confirm")
+            self.assertLessEqual(entry["expires_at"] - cards.time.time(), cards.CONFIRM_TTL_S)
+            yes = dict(said="Yes, disconnect dev.s.space", card_id=confirm["id"], reply_to_event="$confirm")
+            self.forged("", said="Yes, disconnect dev.s.space", card_id="connections", reply_to_event="$list")
+            rc, out = self.reply("", **yes)
+            self.assertEqual((rc, out["status"], done), (0, "done", ["dev-s-space"]))
+            self.forged("", **yes)
+        self.assertEqual(done, ["dev-s-space"], "a confirm card answers once")
+
+    def test_retire_asks_first_and_keep_drops_the_question(self):
+        import pool_manage
+        retired = []
+        with mock.patch.object(pool_manage, "retire", lambda ws, t, **k: retired.append(t) or {"result": "retired"}):
+            confirm, _ = self.first_click("workers", "w1", "retire", "Retire Pylon")
+            self.assertIn("loses its own agent", confirm["text"])
+            keep = dict(said="Keep Pylon", card_id=confirm["id"], reply_to_event="$confirm")
+            self.assertEqual(self.reply("", **keep), (0, {"status": "say", "say": "Okay, I left it as it is."}))
+            self.forged("", said="Yes, retire Pylon", card_id=confirm["id"], reply_to_event="$confirm")
+            self.assertEqual(retired, [])
+            confirm, _ = self.first_click("workers", "w1", "retire", "Retire Pylon")
+            rc, out = self.reply("", said="Yes, retire Pylon", card_id=confirm["id"], reply_to_event="$confirm")
+        self.assertEqual((rc, out["status"], retired), (0, "done", ["w1"]))
+
+    def test_a_confirm_card_that_cannot_be_posted_or_recorded_does_nothing(self):
+        import pool_manage
+        import pool_provision
+        _, card = ac.build("workers", "info", title="t", body="b", buttons=[
+            ac.button("Retire Pylon", "reply", reply="Retire Pylon", command="card:workers:w1:retire")])
+        cards.issued_cards.record(self.ws, "$list", card, room=DM, lane="s_dspace", handler=cards.HANDLER)
+        click = dict(said="Retire Pylon", card_id="workers", reply_to_event="$list")
+        refusing = mock.Mock(execute=lambda *a, **k: {"is_error": True, "code": "FORBIDDEN"})
+        lanes = []
+        with mock.patch.object(pool_manage, "retire", mock.Mock(side_effect=AssertionError("acted"))), \
+                mock.patch.object(pool_provision, "core_actions", lambda ws, lane: lanes.append(lane) or (refusing, CORE)):
+            rc, out = self.reply("", **click)
+            self.assertEqual((rc, out["status"], lanes), (1, "failed", ["s_dspace"]))
+            self.assertIn("FORBIDDEN", out["why"])
+            real = cards.issued_cards.record
+            with mock.patch.object(cards.issued_cards, "record", side_effect=OSError("disk full")):
+                rc, out = self.reply("", execute=Fake().execute, **click)
+            self.assertEqual((rc, out["status"]), (1, "failed"))
+            self.assertIn("will not act", out["why"])
+            self.assertIs(cards.issued_cards.record, real)
+            long = "Retire " + "x" * 120
+            _, card = ac.build("workers", "info", title="t", body="b", buttons=[
+                ac.button("Retire", "reply", reply=long, command="card:workers:w1:retire")])
+            cards.issued_cards.record(self.ws, "$long", card, room=DM, handler=cards.HANDLER)
+            rc, out = self.reply("", said=long, card_id="workers", reply_to_event="$long", execute=Fake().execute)
+            self.assertEqual((rc, out["status"]), (0, "asked"), "a long name is cut, never refused")
 
     def test_reconnect_and_make_main_run_the_connections_units(self):
         calls = []
         self.issue("card:connections:dev-s-space:reconnect", "card:connections:dev-s-space:make-main",
                    "card:connections:s-space-w1:reconnect")
-        with mock.patch.object(cards.connections, "read_rows", lambda ws=None: ROWS), \
-                mock.patch.object(cards.connections, "reconnect", lambda inst, **kw: calls.append(("re", inst)) or {"pid": 7}), \
+        with mock.patch.object(cards.connections, "reconnect", lambda inst, **kw: calls.append(("re", inst)) or {"pid": 7}), \
                 mock.patch.object(cards.connections, "set_primary", lambda inst, **kw: calls.append(("main", inst)) or {"server": "dev.s.space", "relaunch_needed": True}):
             self.assertEqual(self.reply("card:connections:dev-s-space:reconnect"), (0, {"status": "done", "say": "Reconnected dev-s-space.", "pid": 7}))
             rc, out = self.reply("card:connections:dev-s-space:make-main")
@@ -320,19 +454,17 @@ class Reply(Base):
         self.assertEqual(calls, [("re", "dev-s-space"), ("main", "dev-s-space")])
         self.assertEqual((rc, out["status"]), (2, "refused"))
 
-    def test_workers_pause_restart_and_a_confirmed_retire(self):
+    def test_workers_pause_and_restart(self):
         import pool_manage
         calls = []
-        said = ("card:workers:w1:pause", "card:workers:w1:restart", "card:workers:w1:retire:confirmed")
+        said = ("card:workers:w1:pause", "card:workers:w1:restart")
         self.issue(*said)
         with mock.patch.object(pool_manage, "stop", lambda ws, t, **k: calls.append(("stop", t)) or {"result": "stopped"}), \
                 mock.patch.object(pool_manage, "reseat", lambda ws, repo, t, **k: {"result": "skipped"}), \
-                mock.patch.object(pool_manage, "enable", lambda ws, repo, t, **k: calls.append(("enable", t)) or {"result": "failed"}), \
-                mock.patch.object(pool_manage, "retire", lambda ws, t, **k: calls.append(("retire", t)) or {"result": "retired"}):
-            got = [self.reply(x) for x in said + ("card:workers:w1:retire",)]
-        self.assertEqual(calls, [("stop", "w1"), ("enable", "w1"), ("retire", "w1")])
-        self.assertEqual([(rc, out["status"]) for rc, out in got],
-                         [(0, "done"), (1, "failed"), (0, "done"), (1, "not_a_card_reply")])
+                mock.patch.object(pool_manage, "enable", lambda ws, repo, t, **k: calls.append(("enable", t)) or {"result": "failed"}):
+            got = [self.reply(x) for x in said]
+        self.assertEqual(calls, [("stop", "w1"), ("enable", "w1")])
+        self.assertEqual([(rc, out["status"]) for rc, out in got], [(0, "done"), (1, "failed")])
 
     def test_restart_reseats_a_running_worker_and_enables_a_stopped_one(self):
         import pool_manage
@@ -358,7 +490,7 @@ class Reply(Base):
         offers = cards.issued_cards.offered(card)
         self.assertEqual(offers["Pause Pylon (w9)"], "card:workers:w9:pause")
         self.assertEqual(offers["Pause Pylon (w1)"], "card:workers:w1:pause")
-        self.assertTrue(cards.issued_cards.record(self.ws, "$twins", card))
+        self.assertTrue(cards.issued_cards.record(self.ws, "$twins", card, room=DM))
         stopped = []
         with mock.patch.object(pool_manage, "stop", lambda ws, t, **k: stopped.append(t) or {"result": "stopped"}):
             rc, out = self.reply("", said="Pause Pylon (w9)", card_id="workers", reply_to_event="$twins")
@@ -368,66 +500,61 @@ class Reply(Base):
         offers = cards.issued_cards.offered(cards.connections_card(rows, [])[1])
         self.assertEqual(offers["Reconnect s.space (b)"], "card:connections:b:reconnect")
 
-    def test_app_replies_never_disconnect(self):
-        self.issue("card:apps:gmail:disconnect", "card:apps:gmail:switch", "card:apps:gmail:reconnect")
-        rc, out = self.reply("card:apps:gmail:disconnect")
-        self.assertEqual((rc, out["status"]), (0, "say"))
-        self.assertIn("Settings → Integrations", out["say"])
-        self.assertEqual(self.reply("card:apps:gmail:switch")[1],
-                         {"status": "handoff", "skill": "connect-apps", "step": "switch", "slug": "gmail"})
-        import connectors
-        with mock.patch.object(connectors, "list_markers", lambda ws: []):
-            self.assertEqual(self.reply("card:apps:gmail:reconnect")[1],
-                             {"status": "handoff", "skill": "connect-apps", "step": "connect", "slug": "gmail"})
+    def test_switch_account_hands_over_to_connect_apps(self):
+        self.issue("card:apps:gmail:switch")
+        self.assertEqual(self.reply("card:apps:gmail:switch"),
+                         (0, {"status": "handoff", "skill": "connect-apps", "step": "switch", "slug": "gmail"}))
 
-    def test_a_click_on_a_real_posted_card_round_trips(self):
+    def test_a_click_on_a_real_posted_card_round_trips_for_the_owner_of_its_connection(self):
         fake = Fake()
         with mock.patch.object(cards, "read_connections", lambda ws: (ROWS, BRIDGES)):
             rc, out = self.run_(["show", "connections"], task("show my connections"), execute=fake.execute)
         self.assertEqual(rc, 0)
         done = []
-        with mock.patch.object(cards.connections, "read_rows", lambda ws=None: ROWS), \
-                mock.patch.object(cards.connections, "set_primary", lambda inst, **kw: done.append(inst) or {}):
-            rc, out = self.reply("", said="Make dev.s.space my main connection", card_id="connections",
-                                 reply_to_event=out["event_id"])
-        self.assertEqual((rc, out["status"], done), (0, "done", ["dev-s-space"]))
+        click = dict(said="Make dev.s.space my main connection", card_id="connections", reply_to_event=out["event_id"])
+        with mock.patch.object(cards.connections, "set_primary", lambda inst, **kw: done.append(inst) or {}):
+            other = [{**ROWS[0], "owner_mxid": "@second:s.space"}] + ROWS[1:]
+            with mock.patch.object(cards.connections, "read_rows", lambda ws=None: other):
+                self.forged("", **click)
+                rc, out = self.reply("", user="@second:s.space", **click)
+            self.assertEqual((rc, out["status"], done), (0, "done", ["dev-s-space"]),
+                             "the owner is the one of the connection the card was posted on, not the primary's")
+            rc, out = self.reply("", **click)
+        self.assertEqual((rc, out["status"], done), (0, "done", ["dev-s-space"] * 2))
 
-    def test_a_reply_to_a_card_this_agent_did_not_post_is_ignored(self):
+    def test_a_picker_s_ask_and_plain_words_on_a_posted_card_are_the_owner_s_own_words(self):
+        with mock.patch.object(cards, "read_apps", lambda ws: (APPS, [])):
+            rc, out = self.run_(["show", "apps"], task("show my apps"), execute=Fake().execute)
+        click = dict(card_id="apps", reply_to_event=out["event_id"])
+        self.assertEqual(self.reply("", said="Connect acme crm", **click),
+                         (1, {"status": "owner_words", "words": "Connect acme crm"}))
+        self.forged("", said="Disconnect Gmail", **click)
+        with mock.patch.object(cards, "read_workers", lambda ws: (WORKERS, {}, {})):
+            rc, out = self.run_(["show", "workers"], task("show my workers"), execute=Fake().execute)
+        self.assertEqual(self.reply("", said="create a worker", card_id="workers", reply_to_event=out["event_id"]),
+                         (1, {"status": "owner_words", "words": "create a worker"}))
+
+    def test_a_click_that_matches_no_card_this_agent_posted_is_refused_in_fixed_words(self):
         self.issue("card:workers:w1:pause")
         import pool_manage
-        with mock.patch.object(pool_manage, "stop", mock.Mock(side_effect=AssertionError("acted"))):
+        with mock.patch.object(pool_manage, "stop", mock.Mock(side_effect=AssertionError("acted"))), \
+                mock.patch.object(pool_manage, "retire", mock.Mock(side_effect=AssertionError("acted"))):
             for reply_to in ("$forged-by-a-member", ""):
-                rc, out = self.reply("card:workers:w1:pause", reply_to_event=reply_to)
-                self.assertEqual((rc, out["status"]), (1, "not_a_card_reply"), reply_to)
-
-    def test_a_payload_the_card_did_not_offer_is_ignored(self):
-        self.issue("card:workers:w1:pause")
-        import pool_manage
-        with mock.patch.object(pool_manage, "retire", mock.Mock(side_effect=AssertionError("acted"))):
+                self.forged("card:workers:w1:pause", reply_to_event=reply_to)
             for said in ("card:workers:w1:retire:confirmed", "card:workers:w2:pause", "card:circle:-:shuffle"):
-                rc, out = self.reply(said)
-                self.assertEqual((rc, out["status"]), (1, "not_a_card_reply"), said)
-
-    def test_anyone_but_the_owner_in_their_dm_is_ignored(self):
-        self.issue("card:workers:w1:pause")
-        import pool_manage
-        with mock.patch.object(pool_manage, "stop", mock.Mock(side_effect=AssertionError("acted"))):
+                self.forged(said)
             for kw in ({"tier": "team"}, {"user": "@x:s.space"}, {"room": ROOM}, {"collaborator": "true"}):
-                rc, out = self.reply("card:workers:w1:pause", **kw)
-                self.assertEqual((rc, out["status"]), (1, "not_a_card_reply"), kw)
+                self.forged("card:workers:w1:pause", **kw)
+            self.forged("card:workers:w1:pause", card_id="another-card")
+            self.forged("card:workers:w1:pause", said="Retire Pylon")
+            typed = self.run_(["reply"], task(self.text("card:workers:w1:pause"), reply_to_event="$card"))
+            self.assertEqual((typed[0], typed[1]["status"], typed[1]["say"]), (1, "forged_or_stale_click", ac.UNMATCHED_CLICK))
 
     def test_other_words_and_other_cards_are_not_its_replies(self):
-        self.assertEqual(self.run_(["reply"], task("show my workers")), (1, {"status": "not_a_card_reply"}))
-        self.assertEqual(self.reply("card:worker-approval:w1:resend")[1]["status"], "not_a_card_reply")
-        self.issue("card:workers:w1:pause")
-        import pool_manage
-        with mock.patch.object(pool_manage, "stop", mock.Mock(side_effect=AssertionError("acted"))):
-            typed = self.run_(["reply"], task(self.text("card:workers:w1:pause"), reply_to_event="$card"))
-            self.assertEqual(typed, (1, {"status": "not_a_card_reply"}))
-            rc, out = self.reply("card:workers:w1:pause", card_id="another-card")
-            self.assertEqual((rc, out["status"]), (1, "not_a_card_reply"))
-            rc, out = self.reply("card:workers:w1:pause", said="Pause everything")
-            self.assertEqual((rc, out["status"]), (1, "not_a_card_reply"))
+        self.assertEqual(self.run_(["reply"], task("show my workers")), (1, {"status": "not_a_card"}))
+        self.issue("card:worker-approval:w1:resend")
+        rc, out = self.reply("card:worker-approval:w1:resend")
+        self.assertEqual((rc, out), (1, {"status": "other_card", "card": "worker-approval", "run": cards.HANDLER}))
 
     def test_a_core_that_cannot_be_read_or_a_handler_that_raises_is_named(self):
         self.issue("card:workers:w1:pause")
@@ -438,11 +565,14 @@ class Reply(Base):
         with mock.patch.object(cards, "_core", side_effect=RuntimeError("no core lane")), \
                 contextlib.redirect_stdout(out):
             rc = cards.main(["--workspace", str(self.ws), "reply", "--task-file", str(path)])
-        self.assertEqual((rc, json.loads(out.getvalue())["status"]), (2, "refused"))
+        got = json.loads(out.getvalue())
+        self.assertEqual((rc, got["status"], got["why"]), (1, "forged_or_stale_click", "the owner is not known"))
         import pool_manage
         with mock.patch.object(pool_manage, "stop", side_effect=RuntimeError("tmux gone")):
             rc, got = self.reply("card:workers:w1:pause")
         self.assertEqual((rc, got), (1, {"status": "failed", "why": "RuntimeError: tmux gone"}))
+        self.issue("card:circle:-:wave")
+        self.assertEqual(self.reply("card:circle:-:wave"), (2, {"status": "refused", "why": "a circle card has no actions"}))
 
 
 class Units(Base):
@@ -450,13 +580,12 @@ class Units(Base):
 
     def test_unknown_verbs_and_targets_are_refused(self):
         R = ac.Reply
-        with mock.patch.object(cards.connections, "read_rows", lambda ws=None: ROWS):
-            self.assertEqual(cards._connections_reply(self.ws, R("connections", "dev-s-space", "explode", False))["status"],
-                             "refused")
-            self.assertIn("(legacy)", cards._connections_reply(self.ws, R("connections", "", "reconnect", False))["why"])
+        self.assertEqual(cards._connections_reply(self.ws, R("connections", "dev-s-space", "explode", False))["status"],
+                         "refused")
+        self.assertIn("(legacy)", cards._connections_reply(self.ws, R("connections", "", "reconnect", False))["why"])
         self.assertEqual(cards._workers_reply(self.ws, R("workers", "w1", "explode", False))["status"], "refused")
-        self.assertEqual(cards._apps_reply(self.ws, R("apps", "Bad!", "switch", False), {})["status"], "refused")
-        self.assertEqual(cards._apps_reply(self.ws, R("apps", "gmail", "explode", False), {})["status"], "refused")
+        self.assertEqual(cards._apps_reply(self.ws, R("apps", "Bad!", "switch", False))["status"], "refused")
+        self.assertEqual(cards._apps_reply(self.ws, R("apps", "gmail", "explode", False))["status"], "refused")
 
 
 if __name__ == "__main__":

@@ -13,13 +13,17 @@ but the owner and in any room but their DM.
   prints): core rows, workers' own agents only as a footer count; the chat-app bridges from
   src/chat_bridges.py (health-check's reading).
 - workers: `pool_manage.listing` and each worker's own identity (`connections.worker_identity`).
-- apps: the Station connections connect-apps reads (`connectors.Cloud.connection_rows`, its 30 s cache).
+- apps: the Station connections connect-apps reads (`connectors.Cloud.connection_rows`, its 30 s cache),
+  split into Connected and Not connected (signed out, or needed by a request that is waiting for it); a
+  Not connected row and "+ Connect an app" sign the owner in on the card, and `show` starts any waiter
+  that is not running, so a waiting request resumes once its app is connected.
 - circle: the collaboration map's quick-lookup index (collaboration-intelligence), else an empty state.
 
-`reply` handles a card:<connections|workers|apps>:<target>:<verb>[:confirmed] task from the owner, in their
-DM: Reconnect, Make main and Disconnect run connections' own units; Pause, Restart and Retire run
-pool_manage's; Disconnect and Retire act only on their `confirmed` variant, the one the card's confirm
-dialog sends. App replies never disconnect an app: they print what to say or which connect-apps step runs.
+`reply` handles the owner's click on one of these cards (agent_card.click_verdict decides; a click that
+matches no card this agent posted prints the fixed refusal and nothing acts): Reconnect and Make main run
+connections' own units; Pause and Restart run pool_manage's. Disconnect and Retire never act on the
+first click: it posts a confirm card, and only that card's own "Yes" (the `confirmed` command, offered
+nowhere else, used once, live for ten minutes) runs the unit. Switch account hands over to connect-apps.
 Every command prints one JSON object. Exit 0 done, 1 a negative answer, 2 refused.
 """
 from __future__ import annotations
@@ -28,6 +32,7 @@ import argparse
 import json
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -44,6 +49,11 @@ import dotspace
 import issued_cards
 
 KINDS = ("connections", "workers", "apps", "circle")
+HANDLER = "skills/agent-cards/scripts/cards.py reply"
+# The first click on one of these only asks; what the confirm card says under the question.
+DESTRUCTIVE = {("connections", "disconnect"): "Its token is kept, so you can reconnect later.",
+               ("workers", "retire"): "It stops for good and loses its own agent."}
+CONFIRM_TTL_S = 10 * 60
 RUNTIMES = {"claude": "Claude", "codex": "Codex"}
 STATE_DOT = {"connected": "on", "failed": "warn", "starting": "warn", "stale": "warn"}
 _MXID = re.compile(r"@[^\s:]+:\S+")
@@ -80,9 +90,7 @@ def connections_card(rows: list, bridges: list) -> tuple:
         if inst and not r.get("primary") and state == "connected":
             items.append(_act("Make main", f"Make {name} my main connection", ac.reply("connections", inst, "make-main")))
         if inst and not r.get("primary") and not r.get("disabled"):
-            items.append(_act("Disconnect", f"Disconnect {name}", ac.reply("connections", inst, "disconnect", confirmed=True),
-                                   confirm=f"Disconnect {r.get('server') or inst}? Its token is kept, so you can "
-                                           "reconnect later."))
+            items.append(_act("Disconnect", f"Disconnect {name}", ac.reply("connections", inst, "disconnect")))
         if items:
             actions.append(ac.button("⋯", "menu", items=items))
         who = r.get("agent_mxid")
@@ -90,7 +98,7 @@ def connections_card(rows: list, bridges: list) -> tuple:
             str(r.get("agent_display_name") or r.get("server") or inst or dotspace.SUCCESSOR_SERVER),
             subtitle=" · ".join(x for x in (str(r.get("server") or ""), state.replace("_", " ")) if x),
             tag="Main" if r.get("primary") else "", state=dot,
-            avatar_=ac.avatar(mxid=str(who), shape="square") if who else ac.avatar(seed=str(r.get("server") or "s"), shape="square"),
+            avatar_=ac.avatar(mxid=str(who)) if who else ac.avatar(seed=str(r.get("server") or "s")),
             actions=actions))
     bridge_rows = [ac.row(b["name"], state={True: "on", False: "off"}.get(b["running"], "warn"),
                           subtitle={True: "Running", False: "Set up, not running"}.get(b["running"], "State unknown"),
@@ -106,6 +114,7 @@ def connections_card(rows: list, bridges: list) -> tuple:
                            f"agent{'s' if n != 1 else ''} · see Workers →", "reply", reply="show my workers")
     up = sum(1 for r in core if r.get("state") == "connected")
     return ac.build("connections", "info", title="Your connections", avatar_=ac.avatar(initial="C"),
+                    status=f"{up} of {len(core)} connected" if core else "",
                     badges=badges, groups=groups, footer_link=footer,
                     text="" if groups else "No connections are set up on this Mac yet.",
                     body=f"Your connections: {up} of {len(core)} servers connected"
@@ -130,14 +139,13 @@ def workers_card(workers: list, identities: dict, runtimes: dict) -> tuple:
             items = [_act("Restart", f"Restart {who}", ac.reply("workers", wid, "restart"))]
             if not w.get("paused"):
                 items.insert(0, _act("Pause", f"Pause {who}", ac.reply("workers", wid, "pause")))
-            items.append(_act("Retire", f"Retire {who}", ac.reply("workers", wid, "retire", confirmed=True),
-                                   confirm=f"Retire {w['name']}? It stops for good and loses its own agent."))
+            items.append(_act("Retire", f"Retire {who}", ac.reply("workers", wid, "retire")))
             actions.append(ac.button("⋯", "menu", items=items))
         runtime = str(runtimes.get(wid) or "claude").lower()
         rows.append(ac.row(str(w["name"]), tag=RUNTIMES.get(runtime, runtime.title()), subtitle=f"{status} · {own}",
                            state="off" if retired or w.get("paused") else "on" if w.get("session_alive") else "warn",
-                           avatar_=(ac.avatar(mxid=str(ident["agent_mxid"]), shape="square") if ident.get("agent_mxid")
-                                    else ac.avatar(seed=str(w["name"]), shape="square")),
+                           avatar_=(ac.avatar(mxid=str(ident["agent_mxid"])) if ident.get("agent_mxid")
+                                    else ac.avatar(seed=str(w["name"]))),
                            actions=actions))
     live = [w for w in workers if w.get("state") != "retired"]
     return ac.build("workers", "info", title="Your workers", avatar_=ac.avatar(initial="W"),
@@ -147,37 +155,59 @@ def workers_card(workers: list, identities: dict, runtimes: dict) -> tuple:
                     body=f"Your workers: {len(live)} in the pool.")
 
 
-def apps_card(rows: list) -> tuple:
-    """(body, card) for the owner's connected apps, one row per account."""
-    out, live = [], set()
+def apps_card(rows: list, pending: Optional[list] = None) -> tuple:
+    """(body, card) for the owner's apps: one row per connected account, then the apps that are not
+    connected (signed out, or `pending`: [{slug, name}] a waiting request needs), each with a Connect
+    that signs the owner in on the card."""
+    on, off, live, seen = [], [], set(), set()
     for r in rows:
         slug = str(r.get("toolkit") or "").lower()
-        if not _SLUG.fullmatch(slug):
-            continue
-        active = str(r.get("status") or "").upper() == "ACTIVE"
-        name = str(r.get("name") or slug)
-        label = str(r.get("accountLabel") or "")
-        sub = (label + (" · default" if r.get("isDefault") else "")) if active else \
-            ("Signed out" + (f" · {label}" if label else ""))
-        if active:
+        if _SLUG.fullmatch(slug) and str(r.get("status") or "").upper() == "ACTIVE":
             live.add(slug)
-            actions = [ac.button("⋯", "menu", items=[
-                _act("Switch account", f"Switch my {name} account", ac.reply("apps", slug, "switch")),
-                _act("Disconnect", f"Disconnect {name}", ac.reply("apps", slug, "disconnect"))])]
-        else:
-            actions = [ac.button("Reconnect", "connect", toolkit=slug)]
-        out.append(ac.row(name, subtitle=sub.strip(" ·"), state="on" if active else "warn",
-                          avatar_=ac.avatar(app=slug, shape="square"), actions=actions))
+            name = str(r.get("name") or slug)
+            sub = str(r.get("accountLabel") or "") + (" · default" if r.get("isDefault") else "")
+            on.append(ac.row(name, subtitle=sub.strip(" ·"), state="on", avatar_=ac.avatar(app=slug, shape="square"),
+                             actions=[_act("Switch account", f"Switch my {name} account", ac.reply("apps", slug, "switch"))]))
+    known = [(str(r.get("toolkit") or "").lower(), str(r.get("name") or ""), "Signed out", str(r.get("accountLabel") or ""))
+             for r in rows] + [(str(p.get("slug") or ""), str(p.get("name") or ""), "Needed for a request you made", "")
+                               for p in pending or []]
+    for slug, name, why, label in known:
+        if not _SLUG.fullmatch(slug) or slug in live or slug in seen:
+            continue
+        seen.add(slug)
+        off.append(ac.row(name or slug, subtitle=why + (f" · {label}" if label else ""), state="warn",
+                          avatar_=ac.avatar(app=slug, shape="square"),
+                          actions=[ac.button("Reconnect" if why == "Signed out" else "Connect", "connect", toolkit=slug)]))
+    groups = [g for g in (ac.group("Connected", on[:80]) if on else None,
+                          ac.group("Not connected", off[:20]) if off else None) if g]
     return ac.build("apps", "info", title="Your apps", avatar_=ac.avatar(initial="A"),
-                    groups=[ac.group("Connected apps", out[:100])] if out else None,
-                    text="" if out else "No apps are connected yet.",
-                    buttons=[ac.button("+ Connect an app", "reply", style="secondary", reply="connect an app")],
+                    status=f"{len(live)} connected" if live else "", groups=groups,
+                    text="" if groups else "No apps are connected yet.",
+                    buttons=[ac.button("+ Connect an app", "connect_picker", style="secondary")],
                     note="Disconnecting happens in Settings → Integrations.", note_tone="dim",
-                    body=f"Your apps: {len(live)} connected. Manage them in Settings → Integrations.")
+                    body=f"Your apps: {len(live)} connected"
+                         + (f", {len(off)} not connected" if off else "") + ". Manage them in Settings → Integrations.")
+
+
+def confirm_card(said: ac.Reply, words: str, *, now: float) -> tuple:
+    """(body, card) asking the owner whether to do `words` ("Retire Pylon"): the only card that offers the
+    confirmed command, beside a Keep that drops it."""
+    what, _, name = words.partition(" ")
+    yes, keep = f"Yes, {what.lower()} {name}"[:80], f"Keep {name}"[:80]
+    return ac.build(f"confirm:{said.kind}:{said.target or '-'}:{said.verb}", "pending", title=f"{words}?"[:120],
+                    avatar_=ac.avatar(initial="?"), text=DESTRUCTIVE[(said.kind, said.verb)],
+                    buttons=[ac.button(yes, "reply", style="primary", reply=yes,
+                                       command=ac.reply(said.kind, said.target, said.verb, confirmed=True)),
+                             ac.button(keep, "reply", style="secondary", reply=keep,
+                                       command=ac.reply(said.kind, said.target, "keep"))],
+                    note="Nothing changes until you confirm.", note_tone="dim",
+                    expires_at_ms=int((now + CONFIRM_TTL_S) * 1000),
+                    body=f"{words}? {DESTRUCTIVE[(said.kind, said.verb)]} Confirm on the card.")
 
 
 def circle_card(entities: list) -> tuple:
-    """(body, card) for who the owner works with, from the collaboration map; people round, agents square."""
+    """(body, card) for who the owner works with, from the collaboration map; the app shapes a member's
+    own avatar, and an initial is round for a person and square for an agent."""
     people, agents = [], []
     for e in entities:
         if not isinstance(e, dict):
@@ -187,7 +217,7 @@ def circle_card(entities: list) -> tuple:
         if not name or kind not in ("human", "agent"):
             continue
         shape = "square" if kind == "agent" else "round"
-        av = ac.avatar(mxid=eid, shape=shape) if _MXID.fullmatch(eid) else ac.avatar(initial=name[:1].upper(), shape=shape)
+        av = ac.avatar(mxid=eid) if _MXID.fullmatch(eid) else ac.avatar(initial=name[:1].upper(), shape=shape)
         item = ac.row(name[:120], subtitle=str(e.get("one_line") or "")[:300], avatar_=av,
                       actions=[ac.button("Message", "open_dm", user_id=eid)] if _MXID.fullmatch(eid) else None)
         (agents if kind == "agent" else people).append(item)
@@ -218,11 +248,26 @@ def read_workers(ws: Path) -> tuple:
     return workers, identities, {wid: (row or {}).get("runtime") for wid, row in roster.items()}
 
 
-def read_apps(ws: Path) -> list:
+def read_apps(ws: Path) -> tuple:
+    """(connection rows, [{slug, name}] the apps a waiting request needs)."""
     import connectors
     cloud = connectors.Cloud(ws)
     cloud.cache = connectors.ConnectCache(ws)
-    return cloud.connection_rows(cached=True)
+    pending = [{"slug": k.get("slug"), "name": k.get("name")} for m in connectors.list_markers(ws)
+               for k in m.get("toolkits") or [] if isinstance(k, dict)]
+    return cloud.connection_rows(cached=True), pending
+
+
+def arm_waits(ws: Path, spawn: Optional[Callable] = None) -> list:
+    """Every connect wait on disk with its waiter running, started here when it was not: the ids. The
+    client says nothing when a card's Connect succeeds; the waiter is what resumes the request."""
+    import connectors
+    out = []
+    for marker in connectors.list_markers(ws):
+        wait_id = marker["wait_id"]
+        if connectors.waiter_alive(ws, wait_id) or connectors._try_spawn(spawn or connectors.spawn_waiter, ws, wait_id):
+            out.append(wait_id)
+    return out
 
 
 def _yaml_load(text: str):
@@ -249,7 +294,7 @@ def build_kind(kind: str, ws: Path) -> tuple:
     if kind == "workers":
         return workers_card(*read_workers(ws))
     if kind == "apps":
-        return apps_card(read_apps(ws))
+        return apps_card(*read_apps(ws))
     return circle_card(read_circle(ws))
 
 
@@ -273,9 +318,10 @@ def gate(ws: Path, task_text: str, core: Optional[dict] = None) -> tuple:
 
 # ── commands ──────────────────────────────────────────────────────────────────
 
-def cmd_show(ws: Path, args, *, core=None, execute=None) -> int:
+def cmd_show(ws: Path, args, *, core=None, execute=None, spawn=None) -> int:
     text = Path(args.task_file).read_text(encoding="utf-8")
     try:
+        core = core if core is not None else _core(ws)
         headers, _, dm, why = gate(ws, text, core)
     except Exception as e:  # noqa: BLE001 — no core lane: nothing can be shown as the core
         return _emit({"status": "refused", "why": f"{type(e).__name__}: {e}"}, 2)
@@ -290,17 +336,25 @@ def cmd_show(ws: Path, args, *, core=None, execute=None) -> int:
     if execute is None:
         import pool_provision
         execute = pool_provision.core_actions(ws, None)[0].execute
+    waits = arm_waits(ws, spawn) if args.kind == "apps" else []
     task_id = str(headers.get("task_id") or headers.get("id") or "task")
+    out = _post(ws, execute, headers, body, card, f"{task_id}:{args.kind}-card", dm, str(core.get("instance") or ""))
+    return _emit({**out, **({"waits": waits} if waits else {})}, 0 if out["status"] == "posted" else 1)
+
+
+def _post(ws: Path, execute, headers: dict, body: str, card: dict, operation_id: str, dm: str, lane: str,
+          ttl_s: float = issued_cards.TTL_S) -> dict:
+    """Post `card` in the owner's DM as a reply to the task's message and record it for its clicks."""
     try:
-        eid = ac.send_card(execute, str(headers["channel_id"]), body, card, operation_id=f"{task_id}:{args.kind}-card",
+        eid = ac.send_card(execute, str(headers.get("channel_id") or ""), body, card, operation_id=operation_id,
                            reply_to=str(headers.get("source_message_id") or ""), owner_dm=dm)
     except ac.CardError as e:
-        return _emit({"status": "failed", "why": str(e), "body": body}, 1)
+        return {"status": "failed", "why": str(e), "body": body}
     try:
-        issued_cards.record(ws, eid, card)
+        issued_cards.record(ws, eid, card, room=dm, lane=lane, handler=HANDLER, ttl_s=ttl_s)
     except OSError as e:
-        return _emit({"status": "posted", "event_id": eid, "why": f"its buttons will not act ({type(e).__name__})"})
-    return _emit({"status": "posted", "event_id": eid})
+        return {"status": "posted", "event_id": eid, "why": f"its buttons will not act ({type(e).__name__})"}
+    return {"status": "posted", "event_id": eid}
 
 
 def _connections_reply(ws: Path, said: ac.Reply) -> dict:
@@ -314,7 +368,7 @@ def _connections_reply(ws: Path, said: ac.Reply) -> dict:
         row = connections.set_primary(inst, workspace=ws)
         return {"status": "done", "say": f"{row.get('server') or inst} is now your main connection"
                 + ("; it takes over after a reconnect." if row.get("relaunch_needed") else ".")}
-    if said.verb == "disconnect" and said.confirmed:
+    if said.verb == "disconnect":
         connections.disconnect(inst, workspace=ws)
         return {"status": "done", "say": f"Disconnected {inst}. Its token is kept; Reconnect brings it back."}
     return {"status": "refused", "why": f"a connections card has no {said.verb!r} action"}
@@ -328,7 +382,7 @@ def _workers_reply(ws: Path, said: ac.Reply) -> dict:
         out = pool_manage.reseat(ws, str(_REPO), said.target)
         if out.get("result") == "skipped":
             out = pool_manage.enable(ws, str(_REPO), said.target)
-    elif said.verb == "retire" and said.confirmed:
+    elif said.verb == "retire":
         out = pool_manage.retire(ws, said.target)
     else:
         return {"status": "refused", "why": f"a workers card has no {said.verb!r} action"}
@@ -336,54 +390,57 @@ def _workers_reply(ws: Path, said: ac.Reply) -> dict:
     return {"status": "done" if ok else "failed", "result": out}
 
 
-def _apps_reply(ws: Path, said: ac.Reply, headers: dict) -> dict:
-    slug = said.target
-    if not _SLUG.fullmatch(slug):
+def _apps_reply(ws: Path, said: ac.Reply) -> dict:
+    if not _SLUG.fullmatch(said.target):
         return {"status": "refused", "why": "not an app slug"}
-    if said.verb == "disconnect":
-        return {"status": "say", "say": f"You can disconnect {slug} in Settings → Integrations."}
     if said.verb == "switch":
-        return {"status": "handoff", "skill": "connect-apps", "step": "switch", "slug": slug}
-    if said.verb == "reconnect":
-        import connectors
-        room = str(headers.get("channel_id") or "")
-        for marker in connectors.list_markers(ws):
-            if marker.get("room") == room and slug in {str(k.get("slug")) for k in marker.get("toolkits") or []
-                                                       if isinstance(k, dict)}:
-                names = [str(k.get("name") or k.get("slug")) for k in marker["toolkits"] if isinstance(k, dict)]
-                message = connectors.card_message(marker, str(marker.get("owner") or ""), str(marker.get("task") or ""),
-                                                  connectors.card_intro(names, False), False)
-                return {"status": "post", "message": {**message, "operation_id": f"{marker['wait_id']}:reconnect-card"},
-                        "wait_id": marker["wait_id"]}
-        return {"status": "handoff", "skill": "connect-apps", "step": "connect", "slug": slug}
+        return {"status": "handoff", "skill": "connect-apps", "step": "switch", "slug": said.target}
     return {"status": "refused", "why": f"an apps card has no {said.verb!r} action"}
 
 
-def cmd_reply(ws: Path, args, *, core=None) -> int:
-    text = Path(args.task_file).read_text(encoding="utf-8")
-    headers, _ = ac.reply_words(text)
-    if ac.card_click(headers) is None:
-        return _emit({"status": "not_a_card_reply"}, 1)
+def cmd_reply(ws: Path, args, *, core=None, execute=None, now=time.time) -> int:
+    headers, words = ac.reply_words(Path(args.task_file).read_text(encoding="utf-8"))
     try:
-        headers, words, _, why = gate(ws, text, core)
         core = core if core is not None else _core(ws)
-    except Exception as e:  # noqa: BLE001
-        return _emit({"status": "refused", "why": f"{type(e).__name__}: {e}"}, 2)
-    said, ignored = (None, why) if why else ac.card_command(headers, words, str(core.get("owner_mxid") or ""), ws)
-    if said is None or said.kind not in KINDS:
-        return _emit({"status": "not_a_card_reply", "why": ignored or "not one of these cards"}, 1)
-    handlers: dict = {"connections": lambda: _connections_reply(ws, said),
-                      "workers": lambda: _workers_reply(ws, said),
-                      "apps": lambda: _apps_reply(ws, said, headers)}
+    except Exception:  # noqa: BLE001 — a card records its own lane; only one without it needs the core's owner
+        core = {}
+    verdict = ac.click_verdict(headers, words, ws, ac.lane_owner(ws, str(core.get("owner_mxid") or "")))
+    other = ac.click_answer(verdict, words, KINDS)
+    if other is not None:
+        return _emit(other, 1)
+    said, clicked = verdict.command, str(headers.get("reply_to_event") or "")
+    destructive = (said.kind, said.verb) in DESTRUCTIVE
     try:
-        out = handlers.get(said.kind, lambda: {"status": "refused", "why": f"a {said.kind} card has no actions"})()
+        if said.verb == "keep":
+            out = {"status": "say", "say": "Okay, I left it as it is."}
+        elif destructive and not said.confirmed:
+            out = _ask(ws, said, words, headers, verdict.lane or str(core.get("instance") or ""), execute, now())
+        else:
+            handlers: dict = {"connections": lambda: _connections_reply(ws, said),
+                              "workers": lambda: _workers_reply(ws, said),
+                              "apps": lambda: _apps_reply(ws, said)}
+            out = handlers.get(said.kind, lambda: {"status": "refused", "why": f"a {said.kind} card has no actions"})()
+        if said.confirmed or said.verb == "keep":
+            issued_cards.settle(ws, clicked)  # a confirm card answers once
     except Exception as e:  # noqa: BLE001 — each unit's refusal is reported in its own words
         out = {"status": "failed", "why": f"{type(e).__name__}: {e}"}
     code = {"refused": 2, "failed": 1}.get(out["status"], 0)
     return _emit(out, code)
 
 
-def main(argv=None, *, core=None, execute=None) -> int:
+def _ask(ws: Path, said: ac.Reply, words: str, headers: dict, lane: str, execute, now: float) -> dict:
+    """Post the confirm card for a destructive click in the room it came from; nothing is done yet."""
+    if execute is None:
+        import pool_provision
+        execute = pool_provision.core_actions(ws, lane or None)[0].execute
+    body, card = confirm_card(said, words, now=now)
+    task_id = str(headers.get("task_id") or headers.get("id") or "task")
+    out = _post(ws, execute, headers, body, card, f"{task_id}:confirm-card", str(headers.get("channel_id") or ""), lane,
+                CONFIRM_TTL_S)
+    return {**out, "status": "asked"} if out.get("event_id") and "why" not in out else {**out, "status": "failed"}
+
+
+def main(argv=None, *, core=None, execute=None, spawn=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--workspace", default=None)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -400,8 +457,8 @@ def main(argv=None, *, core=None, execute=None) -> int:
         from workspace_default import resolve_workspace
         ws = Path(resolve_workspace())
     if args.cmd == "show":
-        return cmd_show(ws, args, core=core, execute=execute)
-    return cmd_reply(ws, args, core=core)
+        return cmd_show(ws, args, core=core, execute=execute, spawn=spawn)
+    return cmd_reply(ws, args, core=core, execute=execute)
 
 
 if __name__ == "__main__":

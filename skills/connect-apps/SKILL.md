@@ -342,7 +342,8 @@ card with `note`, never in the room.
 
 `composio_exec` failing with `connect_required` is Step 3a (never connected). Failing because the app's
 sign-in lapsed (the error says expired, revoked, invalid grant or token, unauthorized, 401, re-authenticate)
-is this step, in the owner's DM only (from a room with other people: Step 3b, `card --private`):
+is this step, in the owner's DM only: the script refuses any other room (`not_owner_dm`; from a room with
+other people use Step 3b, `card --private`):
 
 ```bash
 python3 "$C" reauth gmail --room '<room id>' --reply-to '<source_message_id>' --task '<task id>' \
@@ -353,17 +354,17 @@ SUTANDO_REQUEST
 ```
 
 It arms the same wait as `card`, so the request resumes by itself once the app is connected again, and
-prints `message`: a Signed out card (agent panel, state error: the app's logo, "Signed out · <account>",
-what it stopped, a "Reconnect <App>" button that signs the owner in to the app right on the card). Post it
-with ONE `room.message.send` exactly as in Step 3a, then write the result "Once it's reconnected I'll carry
-on." (adapted). The wait resumes the request once the app shows connected, whichever way they signed in. Exit 1 with `reason`: `use_card` (it
+prints `message`: a Signed out card (agent panel, state error: the app's logo, a "Signed out" status, the
+account, what it stopped, a "Reconnect <App>" button that signs the owner in to the app right on the card).
+Post it with ONE `room.message.send` exactly as in Step 3a, then write the result "Once it's reconnected
+I'll carry on." (adapted). The app sends nothing when the sign-in succeeds: the wait armed here is what
+resumes the request once the app shows connected, whichever way they signed in. Exit 1 with `reason`: `use_card` (it
 was `connect_required`: Step 3a), `not_an_auth_error` (answer with the error as usual), `still_active` (the
 app still lists the sign-in as active, so a wait would resume into the same error: tell the owner
 "<App> refused my sign-in; reconnect it in Settings → Integrations." and stop).
 
-A `card:apps:<slug>:reconnect` click on an older card this agent posted (a `card_click` task) still works:
-run `python3 skills/agent-cards/scripts/cards.py reply --task-file <task file>`; it prints `message`, the
-Connect card for the same wait, to post with `room.message.send`; then write `[no-send]`.
+"Connect <app name>" arriving as the owner's words from a card's "+ Connect an app" search (it found no
+match) is an ordinary connect request: Step 1 with that name.
 
 ## Two accounts of one app
 
