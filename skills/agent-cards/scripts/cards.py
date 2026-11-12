@@ -40,6 +40,7 @@ for _p in (str(_REPO / "src"), str(_SKILLS / "worker-pool" / "scripts"), str(_SK
 
 import agent_card as ac  # noqa: E402
 import connections  # noqa: E402
+import dotspace  # noqa: E402
 
 KINDS = ("connections", "workers", "apps", "circle")
 RUNTIMES = {"claude": "Claude", "codex": "Codex"}
@@ -81,7 +82,7 @@ def connections_card(rows: list, bridges: list) -> tuple:
             actions.append(ac.button("⋯", "menu", items=items))
         who = r.get("agent_mxid")
         server_rows.append(ac.row(
-            str(r.get("agent_display_name") or r.get("server") or inst or "s.space"),
+            str(r.get("agent_display_name") or r.get("server") or inst or dotspace.SUCCESSOR_SERVER),
             subtitle=" · ".join(x for x in (str(r.get("server") or ""), state.replace("_", " ")) if x),
             tag="Main" if r.get("primary") else "", state=dot,
             avatar_=ac.avatar(mxid=str(who), shape="square") if who else ac.avatar(seed=str(r.get("server") or "s"), shape="square"),
@@ -91,7 +92,7 @@ def connections_card(rows: list, bridges: list) -> tuple:
                           avatar_=ac.avatar(app=b["channel"], shape="square")) for b in bridges]
     groups = [g for g in (ac.group("Servers", server_rows) if server_rows else None,
                           ac.group("Chat apps", bridge_rows) if bridge_rows else None) if g]
-    badges = [{"label": str(r.get("server") or "s.space"), "state": "on" if r.get("state") == "connected" else "off"}
+    badges = [{"label": str(r.get("server") or dotspace.SUCCESSOR_SERVER), "state": "on" if r.get("state") == "connected" else "off"}
               for r in core][:8]
     footer = None
     if workers:
