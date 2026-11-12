@@ -194,16 +194,19 @@ def approval_card(worker: str, worker_label: str, label: str, verify_url: str, e
     """(body, card) asking the owner to approve agent `label` for the worker; the link is labelled, never bare."""
     until = _until(expires_at)
     what = (f"a new token for the agent {label}" if rotate else f"the agent {label}")
+    host = urllib.parse.urlsplit(verify_url).hostname or ""
+    approve = f"Approve on {host}" if host else "Approve"
     return ac.build(
         card_id(worker, server), "pending", title=worker_label, subtitle=subtitle, avatar_=ac.avatar(seed=label),
         text=(f"Approve {what} so {worker_label} works as its own agent. Nothing is saved until you approve, "
               "and I check that the agent is yours before the worker uses it."),
-        fields=[{"label": "Agent", "value": label}, {"label": "Server", "value": server or "s.space"}],
-        buttons=[ac.button("Approve on s.space →", "url", style="primary", url=verify_url)],
+        fields=[{"label": "Agent", "value": label}] + ([{"label": "Server", "value": server or host}]
+                                                        if server or host else []),
+        buttons=[ac.button(f"{approve} →", "url", style="primary", url=verify_url)],
         note=f"Works for {max(1, round((expires_at - (time.time() if now is None else now)) / 60))} minutes, until {until}.", note_tone="dim",
         expires_at_ms=int(expires_at * 1000),
         body=ac.body_line(f"Approve agent \"{label}\" for pool worker {worker_label} (works until {until}):",
-                          link_label="Approve on s.space", url=verify_url))
+                          link_label=approve, url=verify_url))
 
 
 def done_card(worker: str, worker_label: str, label: str, agent_id: str, *, server: str, subtitle: str,
