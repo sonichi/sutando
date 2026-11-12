@@ -304,34 +304,100 @@ def write_record(workspace: Optional[Path], worker: str, record: dict) -> None:
     write_whole(path, record)
 
 
-def resend(worker: str, *, workspace: Optional[Path] = None, spawn=None) -> dict:
-    """Start a fresh device flow for `worker` from its expired card, in the background: {status, why?}.
-    The caller has already checked that the owner asked (agent_card.owner_may_act)."""
-    rec = read_record(workspace, worker)
-    if not rec.get("label"):
-        return {"status": "refused", "why": f"no approval card was sent for worker {worker}"}
-    if rec.get("state") != "expired":
-        return {"status": "refused", "why": f"the approval for worker {worker} is {rec.get('state') or 'unknown'}, "
-                                            "not expired; its link still works or it is done"}
-    argv = [sys.executable, str(_HERE / "pool_identity.py"), "--workspace", str(connections._workspace(workspace)),
-            "rotate" if rec.get("rotate") else "add", worker, "--device-flow", "--label", str(rec["label"])]
-    if rec.get("display_name"):
-        argv += ["--display-name", str(rec["display_name"])]
-    if rec.get("lane") is not None:
-        argv += ["--lane", str(rec["lane"])]
-    write_record(workspace, worker, {**rec, "state": "resending"})
-    logs = Path(connections._workspace(workspace)) / "logs"
-    logs.mkdir(parents=True, exist_ok=True)
+RESEND_STALE_S = 15 * 60
+
+
+def _alive(pid: int) -> bool:
     try:
-        if spawn is not None:
-            spawn(argv)
-        else:
-            with open(logs / "worker-approval-resend.log", "ab") as log:
-                subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
-    except OSError as e:
-        write_record(workspace, worker, rec)
-        return {"status": "failed", "why": f"the new approval flow did not start ({type(e).__name__})"}
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _resend_live(rec: dict, now: float) -> bool:
+    """Whether a "resending" record still has its flow on the way: younger than RESEND_STALE_S and, when its
+    process is known, that process still running. A dead or silent attempt leaves the button usable again."""
+    if rec.get("state") != "resending" or now - float(rec.get("resend_at") or 0) > RESEND_STALE_S:
+        return False
+    pid = rec.get("resend_pid")
+    return not isinstance(pid, int) or _alive(pid)
+
+
+def _why_not(worker: str, rec: dict, now: float) -> Optional[str]:
+    who = rec.get("worker_label") or worker
+    if not rec.get("label"):
+        return f"no approval card was sent for worker {worker}"
+    if _resend_live(rec, now):
+        return f"a new approval link for {who} is already on its way to your DM"
+    if rec.get("state") == "pending" and float(rec.get("expires_at") or 0) > now:
+        return f"the approval link for {who} still works; use Approve on the newest card"
+    if rec.get("state") == "done":
+        return f"{who} already has its own agent"
+    return None
+
+
+def resend(worker: str, *, workspace: Optional[Path] = None, spawn=None, clock=time.time) -> dict:
+    """Start a fresh device flow for `worker` from its expired or failed card, in the background: {status, why?}.
+    The claim is one locked read-check-write, so two clicks start one flow. The caller has already checked
+    that the owner clicked (agent_card.card_command)."""
+    from file_lock import locked_file
+    path = record_path(workspace, worker)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with locked_file(path.with_name(path.name + ".lock")):
+        rec, now = read_record(workspace, worker), clock()
+        why = _why_not(worker, rec, now)
+        if why:
+            return {"status": "refused", "why": why}
+        resend_id = secrets.token_hex(8)
+        argv = [sys.executable, str(_HERE / "pool_identity.py"), "--workspace", str(connections._workspace(workspace)),
+                "rotate" if rec.get("rotate") else "add", worker, "--device-flow", "--label", str(rec["label"]),
+                "--resend-id", resend_id]
+        if rec.get("display_name"):
+            argv += ["--display-name", str(rec["display_name"])]
+        if rec.get("lane") is not None:
+            argv += ["--lane", str(rec["lane"])]
+        claimed = {**rec, "state": "resending", "resend_id": resend_id, "resend_at": now}
+        claimed.pop("resend_pid", None)
+        write_record(workspace, worker, claimed)
+        logs = Path(connections._workspace(workspace)) / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        try:
+            if spawn is not None:
+                pid = spawn(argv)
+            else:
+                with open(logs / "worker-approval-resend.log", "ab") as log:
+                    pid = getattr(subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                                   start_new_session=True), "pid", None)
+        except OSError as e:
+            write_record(workspace, worker, rec)
+            return {"status": "failed", "why": f"the new approval flow did not start ({type(e).__name__})"}
+        if isinstance(pid, int):
+            write_record(workspace, worker, {**claimed, "resend_pid": pid})
     return {"status": "started"}
+
+
+def resend_failed(workspace: Optional[Path], worker: str, resend_id: str, why: str,
+                  deliver: Optional[Callable[[str], object]] = None) -> bool:
+    """A resend attempt that ended before its new card was posted: its record becomes "failed" (the card's
+    button works again) and the owner hears why. Only the same attempt is touched; False when it is not."""
+    if not resend_id:
+        return False
+    from file_lock import locked_file
+    path = record_path(workspace, worker)
+    with locked_file(path.with_name(path.name + ".lock")):
+        rec = read_record(workspace, worker)
+        if rec.get("state") != "resending" or rec.get("resend_id") != resend_id:
+            return False
+        write_record(workspace, worker, {**{k: v for k, v in rec.items() if not k.startswith("resend_")},
+                                         "state": "failed", "why": why})
+    who = rec.get("worker_label") or worker
+    send = deliver or (lambda text: send_to_owner(workspace or connections._workspace(None), text))
+    send(f"[dm-only]\nI couldn't make a new approval link for {who}: {why}. Tap \"{resend_text(who)}\" on the "
+         "card to try again.")
+    return True
 
 
 def connect(worker: str, *, label: str, display_name: str = "", worker_label: str = "", rotate: bool = False,

@@ -99,10 +99,23 @@ def reseat_after_add(ws: Path, repo, wid: str) -> dict:
 
 
 def cmd_device_flow(args, ws: Path, *, rotate: bool) -> int:
+    """The device flow; a resend attempt (--resend-id) that ends without a new card says why and frees its button."""
+    resend_id = getattr(args, "resend_id", None) or ""
+    try:
+        rc, why = _device_flow(args, ws, rotate=rotate)
+    except Exception as e:
+        pool_device_connect.resend_failed(ws, args.worker, resend_id, f"it stopped ({type(e).__name__})")
+        raise
+    if rc != 0:
+        pool_device_connect.resend_failed(ws, args.worker, resend_id, why or "the approval flow did not start")
+    return rc
+
+
+def _device_flow(args, ws: Path, *, rotate: bool) -> tuple:
     wid = live_worker(ws, args.worker)
     if not args.label:
         print("pool_identity: --device-flow needs --label <the agent's name>", file=sys.stderr)
-        return 2
+        return 2, "it was started without the agent's name"
     label = str(((pr.load_roster(ws) or {}).get("workers") or {}).get(wid, {}).get("label") or args.worker)
     def start_lane(row):
         if args.no_start:
@@ -120,7 +133,7 @@ def cmd_device_flow(args, ws: Path, *, rotate: bool) -> int:
     except pool_device_connect.DeviceConnectError as e:
         print(f"pool_identity: {e}", file=sys.stderr)
         print(json.dumps({"status": e.status}, sort_keys=True))
-        return 1
+        return 1, str(e)
     launch = out.get("launch")
     started = launch is None or bool(launch.get("ok"))
     if not started:
@@ -130,7 +143,7 @@ def cmd_device_flow(args, ws: Path, *, rotate: bool) -> int:
     if not rotate and not args.no_start:
         line["seat"] = reseat_after_add(ws, args.repo, wid).get("result")
     print(json.dumps(line, sort_keys=True))
-    return 0 if started else 1
+    return (0, "") if started else (1, "")
 
 
 def cmd_add(args, ws: Path) -> int:
@@ -301,6 +314,7 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("--device-flow", action="store_true"); s.add_argument("--label", default=None)
         s.add_argument("--display-name", default=None); s.add_argument("--lane", default=None)
         s.add_argument("--base", default=None, help=argparse.SUPPRESS); s.add_argument("--no-start", action="store_true")
+        s.add_argument("--resend-id", default=None, help=argparse.SUPPRESS)
     s = sub.add_parser("remove"); s.add_argument("worker"); s.set_defaults(fn=cmd_remove)
     s = sub.add_parser("provision-begin"); s.add_argument("worker"); s.add_argument("--role", default=None)
     s.add_argument("--lane", default=None); s.set_defaults(fn=cmd_provision_begin)
