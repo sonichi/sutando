@@ -32,6 +32,7 @@ _REPO = _HERE.parents[2]
 sys.path[:0] = [p for p in (str(_HERE), str(_REPO / "src")) if p not in sys.path]
 
 import agent_card as ac
+import issued_cards
 import connections
 import pool_provision as pp
 import pool_roster as pr
@@ -242,19 +243,28 @@ def expired_card(worker: str, worker_label: str, label: str, expires_at: float, 
 
 @dataclass
 class CardSink:
-    """Approval cards in the owner's checked DM, posted as the core's own agent."""
+    """Approval cards in the owner's checked DM, posted as the core's own agent; with `workspace`, each
+    posted card is recorded (issued_cards) so only a reply to it can act."""
     execute: ac.Execute
     room: str
+    workspace: Optional[Path] = None
 
     def show(self, body: str, card: dict, operation_id: str, previous: str = "") -> str:
         """The event now showing `card`; "" when it could not be posted (the caller sends the text)."""
         try:
             if previous:
-                return ac.update_card(self.execute, self.room, previous, body, card, operation_id=operation_id,
-                                      owner_dm=self.room)
-            return ac.send_card(self.execute, self.room, body, card, operation_id=operation_id, owner_dm=self.room)
+                eid = ac.update_card(self.execute, self.room, previous, body, card, operation_id=operation_id,
+                                     owner_dm=self.room)
+            else:
+                eid = ac.send_card(self.execute, self.room, body, card, operation_id=operation_id, owner_dm=self.room)
         except (ac.CardError, pp.ProvisionError, pp.TransportError):
             return ""
+        if self.workspace is not None:
+            try:
+                issued_cards.record(self.workspace, eid, card)
+            except OSError:
+                pass  # unrecorded, the card's own buttons do nothing; the flow itself still completes
+        return eid
 
 
 def default_cards(workspace: Optional[Path], core: dict, vault=None, request=None) -> Optional[CardSink]:
@@ -266,7 +276,7 @@ def default_cards(workspace: Optional[Path], core: dict, vault=None, request=Non
         actions, _ = pp.core_actions(workspace, str(core.get("instance") or ""), vault=vault, request=request)
     except (pp.ProvisionError, connections.ConnectionsError):
         return None
-    return CardSink(actions.execute, room)
+    return CardSink(actions.execute, room, connections._workspace(workspace))
 
 
 def record_path(workspace: Optional[Path], worker: str) -> Path:

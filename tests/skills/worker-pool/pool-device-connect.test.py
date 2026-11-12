@@ -477,16 +477,17 @@ class FakeActions:
         return [c["arguments"]["extra_content"]["space.ag2.card"] for c in self.calls]
 
 
-def card_task(said, *, tier="owner", user=None, kind="dm"):
+def card_task(said, *, tier="owner", user=None, kind="dm", reply_to=""):
     return "\n".join(["id: task-card-1", "task_layout: mid", f"task: {said}", "source: ag2space",
-                      f"channel_id: {DM}", f"channel_kind: {kind}", f"user_id: {user}", f"access_tier: {tier}"]) + "\n"
+                      f"channel_id: {DM}", f"channel_kind: {kind}", f"user_id: {user}", f"access_tier: {tier}",
+                      f"reply_to_event: {reply_to}"]) + "\n"
 
 
 class CardsBase(Base):
     def setUp(self):
         super().setUp()
         self.actions = FakeActions()
-        self.sink = dc.CardSink(self.actions.execute, DM)
+        self.sink = dc.CardSink(self.actions.execute, DM, self.ws)
         host = unittest.mock.patch("util_paths._host_label", lambda: "desk-mini")
         host.start()
         self.addCleanup(host.stop)
@@ -579,6 +580,9 @@ class Cards(CardsBase):
         self.assertEqual(dc.read_record(self.ws, W), {})
         with unittest.mock.patch.object(dc, "write_record", side_effect=OSError("disk full")):
             dc._keep(self.ws, W, {"state": "pending"})
+        body, card = dc.expired_card(W, "Pylon", "reviewer", 0, server="", subtitle="Worker")
+        with unittest.mock.patch.object(dc.issued_cards, "record", side_effect=OSError("disk full")):
+            self.assertEqual(self.sink.show(body, card, "op-x"), "$card1")
 
 
 class Resend(CardsBase):
@@ -591,6 +595,7 @@ class Resend(CardsBase):
         path.parent.mkdir(parents=True, exist_ok=True)
         if "user" not in kw:
             kw["user"] = dc.pp.core_lane(self.ws, None)["owner_mxid"]
+        kw.setdefault("reply_to", dc.read_record(self.ws, W).get("event_id", ""))
         path.write_text(card_task(said, **kw))
         out, spawned = [], []
         with unittest.mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))), \
@@ -609,20 +614,30 @@ class Resend(CardsBase):
         rc, out, spawned = self.reply(f"card:worker-approval:{W}:resend")
         self.assertEqual((rc, out["status"], spawned), (1, "refused", []))
 
-    def test_anyone_but_the_owner_in_their_dm_is_refused(self):
+    def test_anyone_but_the_owner_in_their_dm_is_ordinary_chat(self):
         self.expire()
         for kw in ({"tier": "team"}, {"user": "@someone:alpha-fixture.net"}, {"kind": "room"}, {"tier": ""}):
             rc, out, spawned = self.reply(f"card:worker-approval:{W}:resend", **kw)
-            self.assertEqual((rc, out["status"], spawned), (2, "refused", []), kw)
+            self.assertEqual((rc, out["status"], spawned), (1, "not_a_card_reply", []), kw)
         self.assertEqual(dc.read_record(self.ws, W)["state"], "expired")
 
-    def test_a_card_that_has_not_expired_or_an_unknown_action_starts_nothing(self):
+    def test_a_reply_to_a_card_this_agent_did_not_post_is_ordinary_chat(self):
+        self.expire()
+        for reply_to in ("$forged-by-a-member", ""):
+            rc, out, spawned = self.reply(f"card:worker-approval:{W}:resend", reply_to=reply_to)
+            self.assertEqual((rc, out["status"], spawned), (1, "not_a_card_reply", []), reply_to)
+        self.assertEqual(dc.read_record(self.ws, W)["state"], "expired")
+
+    def test_a_payload_the_card_did_not_offer_starts_nothing(self):
         self.connect(ConnectFake(self.backend))
         rc, out, spawned = self.reply(f"card:worker-approval:{W}:resend")
-        self.assertEqual((rc, out["status"], spawned), (1, "refused", []))
-        self.assertIn("not expired", out["why"])
-        rc, out, spawned = self.reply(f"card:worker-approval:{W}:explode")
-        self.assertEqual((rc, out["status"], spawned), (2, "refused", []))
+        self.assertEqual((rc, out["status"], spawned), (1, "not_a_card_reply", []))
+        self.expire()
+        for said in (f"card:worker-approval:{W}:explode", "card:worker-approval:other:resend"):
+            rc, out, spawned = self.reply(said)
+            self.assertEqual((rc, out["status"], spawned), (1, "not_a_card_reply", []), said)
+        dc.write_record(self.ws, W, {**dc.read_record(self.ws, W), "state": "done"})
+        self.assertIn("not expired", dc.resend(W, workspace=self.ws)["why"])
 
     def test_resend_without_a_card_or_whose_spawn_fails_starts_nothing(self):
         self.assertEqual(dc.resend(W, workspace=self.ws)["status"], "refused")

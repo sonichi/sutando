@@ -3,25 +3,32 @@
 
 - `build` returns a one-line body and a card the checks accept; a card a client would not draw raises.
 - `problem` matches the web client: unknown fields allowed, required keys, http(s) links without
-  credentials (avatars https or mxc), menus only in row actions, and the client's size limits.
+  credentials (avatar links mxc:// only), menus only in row actions, and the client's size limits.
 - `send_card` posts through the injected Action call (`room.message.send` with `extra_content`) and returns
   the event id; a private card goes only to the owner's checked DM. `update_card` posts a new card as a
   reply to the old one, since no Action carries a card in an edit.
-- A card reply is `card:<kind>:<target>:<verb>[:confirmed]`, read from a gateway task's own words, and only
-  the owner, in their DM, may act on one.
+- A card reply is `card:<kind>:<target>:<verb>[:confirmed]`, read from a gateway task's own words, and is
+  acted on only when the owner, in their DM, replied to a card this agent posted (issued_cards) with a
+  payload that card offered; anything else is ordinary chat.
 
 Run: python3 tests/agent-card.test.py
 """
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 import agent_card as ac  # noqa: E402
+import issued_cards  # noqa: E402
 
 DM, ROOM, OWNER = "!dm:s.space", "!shared:s.space", "@owner:s.space"
 
@@ -97,8 +104,9 @@ class Check(unittest.TestCase):
             self.assertIsNotNone(ac.problem({**self.card, "header": {"title": "t", "avatar": {"url": url}}}))
         self.assertIsNone(ac.problem({**self.card, "buttons": [{"label": "x", "kind": "url", "url": "http://a.b"}]}))
 
-    def test_an_avatar_link_is_https_or_mxc_and_an_app_is_a_slug(self):
-        for url, ok in (("https://a.b/x.png", True), ("mxc://s.space/abc", True), ("http://a.b/x.png", False)):
+    def test_an_avatar_link_is_mxc_only_and_an_app_is_a_slug(self):
+        for url, ok in (("mxc://s.space/abc", True), ("https://a.b/x.png", False), ("http://a.b/x.png", False),
+                        ("mxc:///abc", False)):
             self.assertEqual(ac.problem({**self.card, "header": {"title": "t", "avatar": {"url": url}}}) is None, ok)
         for app, ok in (("gmail", True), ("google_calendar", True), ("Gmail", False), ("g-mail", False)):
             self.assertEqual(ac.problem({**self.card, "header": {"title": "t", "avatar": {"app": app}}}) is None, ok)
@@ -165,7 +173,7 @@ class Check(unittest.TestCase):
         cases = [
             ("not an object", "the card is not an object"),
             ({**c, "header": {**h, "avatar": {"seed": "s", "shape": "oval"}}}, "shape must be round or square"),
-            ({**c, "header": {**h, "avatar": {"url": "https://[::1"}}}, "must be an https or mxc"),
+            ({**c, "header": {**h, "avatar": {"url": "mxc://[::1"}}}, "must be an mxc:// link"),
             ({**c, "buttons": [{**reply, "style": "loud"}]}, "style must be primary or secondary"),
             ({**c, "buttons": "x"}, "buttons must be a list"),
             ({**c, "header": {**h, "badges": [{"label": "b", "state": "maybe"}]}}, "badges[0] needs a label"),
@@ -265,6 +273,83 @@ class Replies(unittest.TestCase):
         self.assertIsNotNone(ac.owner_may_act({**ok, "user_id": "@other:s.space"}, OWNER))
         self.assertIsNotNone(ac.owner_may_act({**ok, "channel_kind": "room"}, OWNER))
         self.assertIsNone(ac.owner_may_act({**ok, "channel_kind": "room"}, OWNER, dm_only=False))
+
+
+class Issued(unittest.TestCase):
+    """Only the owner's reply to a card this agent posted, with a payload that card offered, can act."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = Path(tmp.name)
+        self.resend = "card:worker-approval:w1:resend"
+        self.card = a_card(state="expired", buttons=[ac.button("Get a new link", "reply", reply=self.resend)])[1]
+        self.assertTrue(issued_cards.record(self.ws, "$mine", self.card, now=1000.0))
+
+    def said(self, payload):
+        return ac.parse_reply(payload)
+
+    def ask(self, payload, *, now=1001.0, **headers):
+        h = {"access_tier": "owner", "user_id": OWNER, "channel_kind": "dm", "reply_to_event": "$mine", **headers}
+        return ac.answered_card(h, self.said(payload), OWNER, self.ws, now=now)
+
+    def test_the_owner_s_reply_to_this_agent_s_card_with_an_offered_payload_acts(self):
+        self.assertIsNone(self.ask(self.resend))
+        self.assertEqual(issued_cards.offered_by(self.ws, "$mine", self.resend, now=1001.0), self.card["id"])
+
+    def test_a_reply_to_a_card_someone_else_posted_is_ordinary_chat(self):
+        self.assertIsNotNone(self.ask(self.resend, reply_to_event="$forged"))
+        self.assertIsNotNone(self.ask(self.resend, reply_to_event=""))
+
+    def test_a_payload_the_card_did_not_offer_is_ordinary_chat(self):
+        self.assertIsNotNone(self.ask("card:worker-approval:w2:resend"))
+        self.assertIsNotNone(self.ask("card:connections:s_dspace:disconnect:confirmed"))
+
+    def test_anyone_but_the_owner_or_an_unknown_owner_is_ordinary_chat(self):
+        self.assertIsNotNone(self.ask(self.resend, user_id="@member:s.space"))
+        self.assertIsNotNone(self.ask(self.resend, access_tier="team"))
+        h = {"access_tier": "owner", "user_id": OWNER, "channel_kind": "dm", "reply_to_event": "$mine"}
+        self.assertEqual(ac.answered_card(h, self.said(self.resend), "", self.ws, now=1001.0), "the owner is not known")
+
+    def test_a_record_expires_and_the_ledger_keeps_only_live_cards(self):
+        self.assertIsNotNone(self.ask(self.resend, now=1000.0 + issued_cards.TTL_S + 1))
+        issued_cards.record(self.ws, "$later", self.card, now=1000.0 + issued_cards.TTL_S + 1)
+        kept = json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"]
+        self.assertEqual(list(kept), ["$later"])
+        issued_cards.ledger_path(self.ws).unlink()
+        with mock.patch.object(issued_cards, "MAX_CARDS", 2):
+            for i in range(3):
+                issued_cards.record(self.ws, f"$n{i}", self.card, now=2000.0 + i)
+        self.assertEqual(sorted(json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"]), ["$n1", "$n2"])
+
+    def test_every_reply_a_card_offers_is_recorded_and_nothing_else(self):
+        reply = lambda r: ac.button("x", "reply", reply=r)
+        card = a_card(shuffle_reply="card:circle:-:shuffle", buttons=[reply("card:a:b:c"),
+                      ac.button("Open", "url", url="https://s.space/x")], footer_link=reply("show my workers"),
+                      groups=[ac.group("g", [ac.row("t", actions=[ac.button("⋯", "menu", items=[
+                          reply("card:a:b:d:confirmed")])])])])[1]
+        self.assertEqual(issued_cards.offered(card),
+                         ["card:a:b:c", "card:a:b:d:confirmed", "card:circle:-:shuffle", "show my workers"])
+        self.assertFalse(issued_cards.record(self.ws, "$plain", a_card()[1]))
+        self.assertFalse(issued_cards.record(self.ws, "not-an-event", card))
+
+    def test_an_unreadable_ledger_holds_no_card(self):
+        issued_cards.ledger_path(self.ws).write_text("{broken")
+        self.assertIsNotNone(self.ask(self.resend))
+        issued_cards.ledger_path(self.ws).write_text(json.dumps({"cards": []}))
+        self.assertIsNone(issued_cards.offered_by(self.ws, "$mine", self.resend))
+
+    def test_the_cli_records_a_posted_message_payload(self):
+        def run(stdin, *argv):
+            out = io.StringIO()
+            with mock.patch.object(sys, "stdin", io.StringIO(stdin)), contextlib.redirect_stdout(out):
+                rc = issued_cards.main(["record", "--workspace", str(self.ws), *argv])
+            return rc, json.loads(out.getvalue())
+        message = json.dumps({"body": "b", "extra_content": {"space.ag2.card": self.card}})
+        self.assertEqual(run(message, "--event-id", "$cli"), (0, {"recorded": True}))
+        self.assertEqual(issued_cards.offered_by(self.ws, "$cli", self.resend), self.card["id"])
+        self.assertEqual(run("{}", "--event-id", "$x"), (1, {"recorded": False}))
+        self.assertEqual(run("nope", "--event-id", "$x")[0], 2)
 
 
 if __name__ == "__main__":

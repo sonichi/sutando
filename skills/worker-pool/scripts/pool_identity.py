@@ -271,16 +271,13 @@ def cmd_card_reply(args, ws: Path) -> int:
     except pool_provision.ProvisionError as e:
         print(json.dumps({"status": "refused", "why": str(e)}))
         return 2
-    why = agent_card.owner_may_act(headers, owner)
-    if why is None and said.verb != pool_device_connect.RESEND:
-        why = f"a worker approval card has no {said.verb!r} action"
-    if why is None:
-        roster = pr.load_roster(ws) or {}
-        row = (roster.get("workers") or {}).get(said.target)
-        if not isinstance(row, dict) or row.get("state") == "retired":
-            why = f"no live pool worker {said.target!r}"
-    if why:
-        print(json.dumps({"status": "refused", "why": why}, sort_keys=True))
+    ignored = agent_card.answered_card(headers, said, owner, ws)
+    if ignored:
+        print(json.dumps({"status": "not_a_card_reply", "why": ignored}, sort_keys=True))
+        return 1
+    row = ((pr.load_roster(ws) or {}).get("workers") or {}).get(said.target)
+    if not isinstance(row, dict) or row.get("state") == "retired":
+        print(json.dumps({"status": "refused", "why": f"no live pool worker {said.target!r}"}, sort_keys=True))
         return 2
     out = pool_device_connect.resend(said.target, workspace=ws)
     print(json.dumps(out, sort_keys=True))

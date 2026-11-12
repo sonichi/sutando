@@ -164,6 +164,9 @@ ALLOWLIST = {
     # agent_card: flagged tokens are card/row "state" schema fields; the module
     # does no file I/O and names no workspace path.
     "src/agent_card.py",
+    # issued_cards never resolves the workspace: its ledger path is composed FROM the
+    # caller's workspace, task_archive.py's caller-supplies-the-path rationale.
+    "src/issued_cards.py",
     # runtime-cli talks to the daemon over the socket only — it renders the
     # daemon's "state" fields and owns no workspace paths.
     "src/runtime-cli/sutando-runtime.py",
