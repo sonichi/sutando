@@ -18,11 +18,14 @@ Run: python3 tests/skills/worker-pool/pool-codex-banners-and-pool-down.test.py
 from __future__ import annotations
 # ruff: noqa: E402 (the imports follow the sys.path set-up)
 
+import contextlib
 import importlib.util
+import io
 import json
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -54,6 +57,7 @@ pl = _load("pool_limit")
 import core_limit_hold as clh
 from delivery import codex_banners as cb
 from hitl.manager import HitlManager, HitlStore
+from hitl.projector import project_pass
 
 # The Codex 0.157 idle composer and footer, as captured (tests/pane-gate-contract.test.py).
 FOOT = "  GPT-6-Sol ultra · ~/Library/Application Support/sp…  ⚠ 1 warning · f2 to view"
@@ -379,13 +383,32 @@ class PoolDown(unittest.TestCase):
         card = m.get(first["raised"][0])
         self.assertIn("All 3 Claude workers", card.message)
         self.assertGreater(card.revision, revision, "re-projected to the owner")
-        settled = card.revision
-        later = self.obs(**{a: {"pane": ps.PANE_LIMIT, "limit_reset_at": 9999.0}, b: {"pane": ps.PANE_LIMIT},
-                            e: {"pane": ps.PANE_LIMIT}})
-        quiet = wc.raise_pool_down(self.ws, wc.pool_down(self.ws, later, host="mac"), manager=m)
-        self.assertEqual((quiet["updated"], m.get(first["raised"][0]).revision), ([], settled),
-                         "the same seats with a new reset: kept current, never re-notified")
-        self.assertIn("It resets at", m.get(first["raised"][0]).message)
+        # What the owner sees: the real projector, its sends captured. The card is shown once.
+        sent = []
+
+        def send(payload):
+            sent.append(payload)
+            return {"ok": True, "event_id": "$card1"}
+        project_pass(m, send, "!dm:s.space")
+        cid = first["raised"][0]
+        self.assertFalse(m.needs_projection(cid), "shown")
+        shown = len(sent)
+
+        def reset(at):
+            return self.obs(**{w: {"pane": ps.PANE_LIMIT, "limit_reset_at": at} for w in (a, b, e)})
+        moved_reset = wc.raise_pool_down(self.ws, wc.pool_down(self.ws, reset(5000.0), host="mac"), manager=m)
+        self.assertEqual(moved_reset["updated"], [cid], "the same seats with a new reset: the card is updated")
+        self.assertTrue(m.needs_projection(cid), "and its new revision is owed to the shown card")
+        project_pass(m, send, "!dm:s.space")
+        edits = [x for x in sent[shown:] if x.get("op") == "edit"]
+        self.assertEqual([x.get("event_id") for x in edits], ["$card1"], "edited in place")
+        self.assertEqual(len(sent[shown:]), 1, "one edit, and no new message or notice")
+        self.assertIn("It resets at", json.dumps(edits[0]), "the edit carries the new reset")
+        self.assertFalse(m.needs_projection(cid))
+        settled = m.get(cid).revision
+        same_minute = wc.raise_pool_down(self.ws, wc.pool_down(self.ws, reset(5030.0), host="mac"), manager=m)
+        self.assertEqual((same_minute["updated"], m.get(cid).revision, m.needs_projection(cid)),
+                         ([], settled, False), "a reset moving within the minute it shows edits nothing")
         one = self.obs(**{a: {"pane": ps.PANE_LIMIT}, b: {"paused": True}, e: {"paused": True}})
         alone = wc.raise_pool_down(self.ws, wc.pool_down(self.ws, one, host="mac"), manager=m)
         self.assertEqual(alone["closed"], [], "one sweep up closes nothing yet")
@@ -395,6 +418,48 @@ class PoolDown(unittest.TestCase):
         self.assertEqual(back, {"raised": [], "updated": [], "closed": []})
         self.assertEqual([r for r in m.active() if (r.subject or {}).get("wedge") == wc.POOL_DOWN], [])
 
+
+    def test_a_one_seat_sweep_never_moves_the_pool_card(self):
+        """`--recipient` observes one seat; a pool reads down or up only from all of them."""
+        a, b, _ = list(self.SEATS)
+        down = self.obs(**{a: {"pane": ps.PANE_LIMIT}, b: {"pane": ps.PANE_LIMIT}})
+        seen = {"obs": down}
+
+        def tick(ws, now, worker_ids=None, persist=True):
+            obs = seen["obs"] if worker_ids is None else {w: seen["obs"][w] for w in worker_ids}
+            return {"observations": obs, "decisions": {}, "auth_expired": []}
+        idle = {"recoveries": {}, "rearms": {}, "cards": {}, "escalations": []}
+        quiet = [patch.object(sup, "tick", side_effect=tick),
+                 patch.object(sup, "load_state", return_value=ps.SupervisionState()),
+                 patch.object(rem, "apply", side_effect=lambda *x: json.loads(json.dumps(idle))), patch.object(rem, "_repair_human_cards"),
+                 patch.object(rem, "ensure_supervisors", return_value={}),
+                 patch.object(rem, "ensure_input_watches", return_value={}),
+                 patch.object(wc, "drive_escapes", return_value={}),
+                 patch.object(wc, "resolve_cleared", return_value=[])]
+        for q in quiet:
+            q.start()
+            self.addCleanup(q.stop)
+
+        def sweep(recipient=None):
+            a_ = types.SimpleNamespace(workspace=self.ws, repo=REPO, resume=False, recipient=recipient,
+                                       dry_run=False)
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rem._sweep(a_, runner=lambda *x, **k: subprocess.CompletedProcess(x, 0, "", ""))
+            return json.loads(out.getvalue()).get("pool_down")
+
+        def cards():
+            m = HitlManager(HitlStore(self.ws / "state" / "hitl" / "requirements"))
+            return [r.id for r in m.active() if (r.subject or {}).get("wedge") == wc.POOL_DOWN]
+        sweep()
+        raised = sweep()["raised"]
+        self.assertEqual(len(raised), 1, "two full sweeps down raise the card")
+        for _ in range(3):
+            self.assertIsNone(sweep(recipient=a), "a one-seat sweep does not read the pool")
+        self.assertEqual(cards(), raised, "the outage card survives one-seat sweeps of a seat still down")
+        self.assertEqual(sweep(), {"raised": [], "updated": [], "closed": []}, "nor re-raised after them")
+        seen["obs"] = self.obs()
+        sweep()
+        self.assertEqual(sweep()["closed"], raised, "two full sweeps working close it")
 
 class CodexLoginCard(unittest.TestCase):
     def test_a_signed_out_codex_seat_gets_a_login_card_quoting_its_cell(self):

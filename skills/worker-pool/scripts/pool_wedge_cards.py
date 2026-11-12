@@ -387,8 +387,10 @@ def _pool_body(g: dict) -> str:
 def raise_pool_down(workspace, groups: list, *, manager=None) -> dict:
     """One card per down pool, keyed on its host, runtime and cause, through the same hitl store as
     the seat cards. A pool is carded only once it has read down for POOL_DOWN_HOLD sweeps, and its
-    card resolved only once it has read working that long, so one seat flapping moves nothing; a
-    change in its seats or reset updates the card in place. Types nothing."""
+    card resolved only once it has read working that long, so one seat flapping moves nothing. A
+    change to what the card says (its seats, reset or account) bumps its revision, so the shown
+    card is edited in place (the projector's op=edit, which notifies no one); a reset that moves
+    within the minute it shows changes nothing. Types nothing."""
     from hitl.cards import choice_request
     manager = manager or manager_for(workspace)
     path = _pool_down_path(workspace)
@@ -414,10 +416,11 @@ def raise_pool_down(workspace, groups: list, *, manager=None) -> dict:
                 with manager.store.locked():
                     cur = manager.get(card.id)
                     if cur is not None and not cur.terminal:
-                        cur.message, cur.subject = _pool_body(g), subject
-                        if before.get("worker_ids") != g["worker_ids"]:
-                            cur.revision += 1  # re-projected only when its seats change, never each sweep
+                        body = _pool_body(g)
+                        if body != cur.message:  # what the owner reads moved: edited in place, quietly
+                            cur.revision += 1
                             updated.append(cur.id)
+                        cur.message, cur.subject = body, subject
                         cur.updated_at = time.time()
                         manager.store.save(cur)
         elif seen[gid]["down"] >= POOL_DOWN_HOLD:

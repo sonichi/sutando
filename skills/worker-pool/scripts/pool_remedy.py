@@ -758,11 +758,12 @@ def _sweep(a, runner=None) -> int:
         acted["cards_closed"] = wc.resolve_cleared(
             a.workspace, clear, wedges=now_asks, observations=tick["observations"], recovered=recovered,
             runner=runner)
-        try:  # one card per runtime whose whole pool is stopped (a usage limit, or signed out)
-            acted["pool_down"] = wc.raise_pool_down(
-                a.workspace, wc.pool_down(a.workspace, tick["observations"], runner=runner or subprocess.run))
-        except Exception as e:  # noqa: BLE001 - the seat cards and the sweep do not depend on it
-            acted["pool_down"] = {"error": f"{type(e).__name__}: {e}"}
+        if not a.recipient:  # a pool reads down or up only from every seat; one seat proves neither
+            try:  # one card per runtime whose whole pool is stopped (a usage limit, or signed out)
+                acted["pool_down"] = wc.raise_pool_down(
+                    a.workspace, wc.pool_down(a.workspace, tick["observations"], runner=runner or subprocess.run))
+            except Exception as e:  # noqa: BLE001 - the seat cards and the sweep do not depend on it
+                acted["pool_down"] = {"error": f"{type(e).__name__}: {e}"}
     if tick.get("sentinels_deferred"):
         acted["sentinels_deferred"] = tick["sentinels_deferred"]
     print(json.dumps({"decisions": tick["decisions"], "auth_expired": tick["auth_expired"],
