@@ -77,7 +77,8 @@ class Builders(unittest.TestCase):
         self.assertEqual([(r["title"], r["state"]) for r in chat["rows"]], [("Discord", "off"), ("Slack", "on")])
         self.assertEqual(card["footer_link"]["reply"], "show my workers")
         self.assertIn("1 worker has its own agent", card["footer_link"]["label"])
-        replies = {i["reply"]: i for i in menu_items(card)}
+        replies = {i["command"]: i for i in menu_items(card)}
+        self.assertEqual(replies["card:connections:dev-s-space:make-main"]["reply"], "Make dev.s.space my main connection")
         self.assertIn("card:connections:dev-s-space:make-main", replies)
         disconnect = replies["card:connections:dev-s-space:disconnect:confirmed"]
         self.assertIn("confirm", disconnect)
@@ -94,7 +95,8 @@ class Builders(unittest.TestCase):
         self.assertEqual(rows[0]["actions"][0], {"label": "Message", "kind": "open_dm",
                                                  "user_id": "@owner-pylon.agent:s.space"})
         self.assertNotIn("actions", rows[2])
-        items = {i["reply"]: i for i in menu_items(card)}
+        items = {i["command"]: i for i in menu_items(card)}
+        self.assertEqual(items["card:workers:w1:pause"]["reply"], "Pause Pylon")
         self.assertIn("card:workers:w1:pause", items)
         self.assertNotIn("card:workers:w2:pause", items)
         self.assertIn("confirm", items["card:workers:w1:retire:confirmed"])
@@ -106,7 +108,8 @@ class Builders(unittest.TestCase):
         rows = card["groups"][0]["rows"]
         self.assertEqual([(r["title"], r["subtitle"], r["avatar"]["app"]) for r in rows],
                          [("Gmail", "me@work.io · default", "gmail"), ("Linear", "Signed out", "linear")])
-        self.assertEqual(rows[1]["actions"][0]["reply"], "card:apps:linear:reconnect")
+        self.assertEqual((rows[1]["actions"][0]["reply"], rows[1]["actions"][0]["command"]),
+                         ("Reconnect Linear", "card:apps:linear:reconnect"))
         self.assertEqual(card["buttons"][0]["reply"], "connect an app")
 
     def test_circle_and_its_empty_state(self):
@@ -266,13 +269,19 @@ class Sources(Base):
 class Reply(Base):
     """A click acts only as the owner's reply, in their DM, to a card this agent posted that offered it."""
 
-    def issue(self, *payloads, event="$card"):
+    @staticmethod
+    def text(command):
+        return f"Do {command}"
+
+    def issue(self, *commands, event="$card"):
         _, card = ac.build("test", "info", title="t", body="b",
-                           buttons=[ac.button(p, "reply", reply=p) for p in payloads])
+                           buttons=[ac.button(c, "reply", reply=self.text(c), command=c) for c in commands])
         self.assertTrue(cards.issued_cards.record(self.ws, event, card))
 
-    def reply(self, said, **kw):
+    def reply(self, command, *, said=None, card_id="test", **kw):
+        said = self.text(command) if said is None else said
         kw.setdefault("reply_to_event", "$card")
+        kw.setdefault("card_click", json.dumps({"card_id": card_id, "action": said}))
         return self.run_(["reply"], task(said, **kw))
 
     def test_disconnect_acts_on_the_confirmed_variant_the_card_offered(self):
@@ -333,7 +342,8 @@ class Reply(Base):
         done = []
         with mock.patch.object(cards.connections, "read_rows", lambda ws=None: ROWS), \
                 mock.patch.object(cards.connections, "set_primary", lambda inst, **kw: done.append(inst) or {}):
-            rc, out = self.reply("card:connections:dev-s-space:make-main", reply_to_event=out["event_id"])
+            rc, out = self.reply("", said="Make dev.s.space my main connection", card_id="connections",
+                                 reply_to_event=out["event_id"])
         self.assertEqual((rc, out["status"], done), (0, "done", ["dev-s-space"]))
 
     def test_a_reply_to_a_card_this_agent_did_not_post_is_ignored(self):
@@ -363,11 +373,21 @@ class Reply(Base):
     def test_other_words_and_other_cards_are_not_its_replies(self):
         self.assertEqual(self.run_(["reply"], task("show my workers")), (1, {"status": "not_a_card_reply"}))
         self.assertEqual(self.reply("card:worker-approval:w1:resend")[1]["status"], "not_a_card_reply")
+        self.issue("card:workers:w1:pause")
+        import pool_manage
+        with mock.patch.object(pool_manage, "stop", mock.Mock(side_effect=AssertionError("acted"))):
+            typed = self.run_(["reply"], task(self.text("card:workers:w1:pause"), reply_to_event="$card"))
+            self.assertEqual(typed, (1, {"status": "not_a_card_reply"}))
+            rc, out = self.reply("card:workers:w1:pause", card_id="another-card")
+            self.assertEqual((rc, out["status"]), (1, "not_a_card_reply"))
+            rc, out = self.reply("card:workers:w1:pause", said="Pause everything")
+            self.assertEqual((rc, out["status"]), (1, "not_a_card_reply"))
 
     def test_a_core_that_cannot_be_read_or_a_handler_that_raises_is_named(self):
         self.issue("card:workers:w1:pause")
         path = self.ws / "task.txt"
-        path.write_text(task("card:workers:w1:pause", reply_to_event="$card"))
+        path.write_text(task(self.text("card:workers:w1:pause"), reply_to_event="$card", card_click=json.dumps(
+            {"card_id": "test", "action": self.text("card:workers:w1:pause")})))
         out = io.StringIO()
         with mock.patch.object(cards, "_core", side_effect=RuntimeError("no core lane")), \
                 contextlib.redirect_stdout(out):

@@ -362,10 +362,10 @@ was `connect_required`: Step 3a), `not_an_auth_error` (answer with the error as 
 app still lists the sign-in as active, so a wait would resume into the same error: tell the owner
 "<App> refused my sign-in; reconnect it in Settings → Integrations." and stop).
 
-The card's Reconnect button replies `card:apps:<slug>:reconnect`. On that task run
+The card's Reconnect button replies "Reconnect <App>" with a `card_click` header. On that task run
 `python3 skills/agent-cards/scripts/cards.py reply --task-file <task file>`: it prints `message`, the
 Connect card for the same wait, to post with `room.message.send`; then write `[no-send]`. It prints
-`not_a_card_reply` unless the owner replied to the recorded card: then it is ordinary chat.
+`not_a_card_reply` unless it is the owner's click on the recorded card: then it is ordinary chat.
 
 ## Two accounts of one app
 

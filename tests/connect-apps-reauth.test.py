@@ -6,7 +6,8 @@
   carrying an agent panel in state error (app logo, "Signed out · <account>", what it stopped, Reconnect).
 - connect_required, a non-auth error and an app still listed active arm nothing; only the owner's own
   task may arm one.
-- The card's Reconnect reply (skills/agent-cards cards.py reply) prints the Connect card of that wait.
+- The card's Reconnect click (skills/agent-cards cards.py reply), once the posted card is recorded
+  (issued_cards), prints the Connect card of that wait.
 
 Run: python3 tests/connect-apps-reauth.test.py
 """
@@ -72,7 +73,8 @@ class Reauth(S.Base):
         self.assertEqual(card["header"]["subtitle"], "Signed out · me@work.io")
         self.assertEqual(card["header"]["avatar"], {"app": "gmail", "shape": "square"})
         self.assertIn("I couldn't check your inbox.", card["text"])
-        self.assertEqual(card["buttons"][0]["reply"], "card:apps:gmail:reconnect")
+        self.assertEqual((card["buttons"][0]["label"], card["buttons"][0]["reply"], card["buttons"][0]["command"]),
+                         ("Reconnect Gmail", "Reconnect Gmail", "card:apps:gmail:reconnect"))
         self.assertNotIn("\n", msg["body"])
         marker = connectors.read_marker(self.ws, out["wait_id"])
         self.assertEqual((marker["request"], marker["owner"]), ("any email from Sam", OWNER))
@@ -104,7 +106,10 @@ class Reauth(S.Base):
         cards = importlib.util.module_from_spec(_spec2)
         _spec2.loader.exec_module(cards)
         task = self.ws / "tasks" / "task-click.txt"
-        task.write_text("\n".join(["id: task-click", "task_layout: mid", "task: card:apps:gmail:reconnect",
+        click = json.dumps({"card_id": out["message"]["extra_content"]["space.ag2.card"]["id"],
+                            "action": "Reconnect Gmail"})
+        task.write_text("\n".join(["id: task-click", "task_layout: mid", f"card_click: {click}",
+                                   "task: Reconnect Gmail",
                                    "source: ag2space", f"channel_id: {ROOM}", "channel_kind: dm",
                                    f"user_id: {OWNER}", "access_tier: owner", "reply_to_event: $signed-out"]) + "\n")
         printed = io.StringIO()

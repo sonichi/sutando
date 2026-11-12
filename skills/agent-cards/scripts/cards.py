@@ -57,6 +57,11 @@ def _emit(payload: dict, code: int = 0) -> int:
 
 # ── builders (pure) ───────────────────────────────────────────────────────────
 
+def _act(label: str, text: str, command: str, **kw) -> dict:
+    """A reply button that sends `text`, a sentence the owner reads, and acts as `command` (issued_cards)."""
+    return ac.button(label, "reply", reply=" ".join(text.split())[:300], command=command, **kw)
+
+
 def connections_card(rows: list, bridges: list) -> tuple:
     """(body, card) for the owner's own connections: the core's servers, then the chat-app bridges."""
     core = [r for r in rows if not r.get("worker")]
@@ -64,15 +69,16 @@ def connections_card(rows: list, bridges: list) -> tuple:
     server_rows = []
     for r in core:
         inst, state = str(r.get("instance") or ""), str(r.get("state") or "")
+        name = str(r.get("server") or inst)
         dot = "off" if r.get("disabled") or r.get("parked") else STATE_DOT.get(state, "off")
         actions = []
         if inst and state != "connected" and not r.get("parked"):
-            actions.append(ac.button("Reconnect", "reply", reply=ac.reply("connections", inst, "reconnect")))
+            actions.append(_act("Reconnect", f"Reconnect {name}", ac.reply("connections", inst, "reconnect")))
         items = []
         if inst and not r.get("primary") and state == "connected":
-            items.append(ac.button("Make main", "reply", reply=ac.reply("connections", inst, "make-main")))
+            items.append(_act("Make main", f"Make {name} my main connection", ac.reply("connections", inst, "make-main")))
         if inst and not r.get("primary") and not r.get("disabled"):
-            items.append(ac.button("Disconnect", "reply", reply=ac.reply("connections", inst, "disconnect", confirmed=True),
+            items.append(_act("Disconnect", f"Disconnect {name}", ac.reply("connections", inst, "disconnect", confirmed=True),
                                    confirm=f"Disconnect {r.get('server') or inst}? Its token is kept, so you can "
                                            "reconnect later."))
         if items:
@@ -117,10 +123,10 @@ def workers_card(workers: list, identities: dict, runtimes: dict) -> tuple:
         if ident.get("agent_mxid") and not retired:
             actions.append(ac.button("Message", "open_dm", user_id=str(ident["agent_mxid"])))
         if not retired:
-            items = [ac.button("Restart", "reply", reply=ac.reply("workers", wid, "restart"))]
+            items = [_act("Restart", f"Restart {w['name']}", ac.reply("workers", wid, "restart"))]
             if not w.get("paused"):
-                items.insert(0, ac.button("Pause", "reply", reply=ac.reply("workers", wid, "pause")))
-            items.append(ac.button("Retire", "reply", reply=ac.reply("workers", wid, "retire", confirmed=True),
+                items.insert(0, _act("Pause", f"Pause {w['name']}", ac.reply("workers", wid, "pause")))
+            items.append(_act("Retire", f"Retire {w['name']}", ac.reply("workers", wid, "retire", confirmed=True),
                                    confirm=f"Retire {w['name']}? It stops for good and loses its own agent."))
             actions.append(ac.button("⋯", "menu", items=items))
         runtime = str(runtimes.get(wid) or "claude").lower()
@@ -152,10 +158,10 @@ def apps_card(rows: list) -> tuple:
         if active:
             live.add(slug)
             actions = [ac.button("⋯", "menu", items=[
-                ac.button("Switch account", "reply", reply=ac.reply("apps", slug, "switch")),
-                ac.button("Disconnect", "reply", reply=ac.reply("apps", slug, "disconnect"))])]
+                _act("Switch account", f"Switch my {name} account", ac.reply("apps", slug, "switch")),
+                _act("Disconnect", f"Disconnect {name}", ac.reply("apps", slug, "disconnect"))])]
         else:
-            actions = [ac.button("Reconnect", "reply", reply=ac.reply("apps", slug, "reconnect"))]
+            actions = [_act("Reconnect", f"Reconnect {name}", ac.reply("apps", slug, "reconnect"))]
         out.append(ac.row(name, subtitle=sub.strip(" ·"), state="on" if active else "warn",
                           avatar_=ac.avatar(app=slug, shape="square"), actions=actions))
     return ac.build("apps", "info", title="Your apps", avatar_=ac.avatar(initial="A"),
@@ -247,7 +253,7 @@ def _core(ws: Path) -> dict:
 
 def gate(ws: Path, task_text: str, core: Optional[dict] = None) -> tuple:
     """(headers, card reply, owner DM, refusal or None) for a task asking for or clicking a card."""
-    headers, said = ac.reply_payload(task_text)
+    headers, said = ac.reply_words(task_text)
     core = core if core is not None else _core(ws)
     why = ac.owner_may_act(headers, str(core.get("owner_mxid") or ""))
     dm = connections.owner_dm(core, ws)
@@ -344,17 +350,17 @@ def _apps_reply(ws: Path, said: ac.Reply, headers: dict) -> dict:
 
 def cmd_reply(ws: Path, args, *, core=None) -> int:
     text = Path(args.task_file).read_text(encoding="utf-8")
-    headers, said = ac.reply_payload(text)
-    if said is None or said.kind not in KINDS:
+    headers, _ = ac.reply_words(text)
+    if ac.card_click(headers) is None:
         return _emit({"status": "not_a_card_reply"}, 1)
     try:
-        headers, said, _, why = gate(ws, text, core)
+        headers, words, _, why = gate(ws, text, core)
         core = core if core is not None else _core(ws)
     except Exception as e:  # noqa: BLE001
         return _emit({"status": "refused", "why": f"{type(e).__name__}: {e}"}, 2)
-    ignored = why or ac.answered_card(headers, said, str(core.get("owner_mxid") or ""), ws)
-    if ignored:
-        return _emit({"status": "not_a_card_reply", "why": ignored}, 1)
+    said, ignored = (None, why) if why else ac.card_command(headers, words, str(core.get("owner_mxid") or ""), ws)
+    if said is None or said.kind not in KINDS:
+        return _emit({"status": "not_a_card_reply", "why": ignored or "not one of these cards"}, 1)
     handlers: dict = {"connections": lambda: _connections_reply(ws, said),
                       "workers": lambda: _workers_reply(ws, said),
                       "apps": lambda: _apps_reply(ws, said, headers)}

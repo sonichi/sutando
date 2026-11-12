@@ -1512,7 +1512,8 @@ def reauth_message(wait: dict, owner: str, task: str, *, name: str, slug: str, a
         f"app-reauth:{slug}", "error", title=name, subtitle="Signed out" + (f" · {account}" if account else ""),
         avatar_=ac.avatar(app=slug, shape="square"),
         text=f"{did} Reconnect it and I'll carry on.",
-        buttons=[ac.button("Reconnect", "reply", style="primary", reply=ac.reply("apps", slug, "reconnect"))],
+        buttons=[ac.button(f"Reconnect {name}", "reply", style="primary", reply=f"Reconnect {name}",
+                           command=ac.reply("apps", slug, "reconnect"))],
         note=f"Or {INTEGRATIONS_HINT}.", note_tone="dim",
         body=f"{name} signed me out{f' ({account})' if account else ''}, so I stopped. Reconnect {name}: "
              f"tap Reconnect on the card, or {INTEGRATIONS_HINT}.")
