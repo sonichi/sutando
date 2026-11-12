@@ -1206,7 +1206,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("cli-replacement-has-its-own-operation-id", argv[-2] == "--operation-id"
           and re.fullmatch(re.escape(steps[choice_idx]["operation_id"]) + r"-update-[0-9a-f]{8}", argv[-1]))
     # Its id names its own arguments, which follow the database's live options (N1).
-    (tmp / "dbs2.json").write_text(json.dumps(envelope_of({"databases": [{"database": "db:d1", "rows": 0, "properties": [
+    (tmp / "dbs2.json").write_text(json.dumps(envelope_of({"databases": [{"database": "db:d1", "properties_truncated": False, "rows": 0, "properties": [
         {"name": "Choice", "type": "select", "options": ["Option B"]}]}]})))
     code2, out2 = cli("check", str(tmp / "plan.json"), str(db_idx), str(tmp / "dbs2.json"))
     other = json.loads(out2)["columns"][str(choice_idx)]["operation_id"] if code2 == 0 else ""
