@@ -127,28 +127,58 @@ def collect(base: str, pending: dict, *, request=pp.http_json, sleep=time.sleep,
                                               f"{', ' + pp.error_code(out) if pp.error_code(out) else ''})", known))
 
 
-def approval_note(worker_label: str, label: str, verify_url: str, expires_at: float) -> str:
-    """The owner's DM: what they approve, the link, and when it stops working."""
-    until = time.strftime("%H:%M %Z", time.localtime(expires_at))
-    return (f"[dm-only]\nApprove the agent \"{label}\" for pool worker {worker_label}: open this link "
-            f"and approve it. It works until {until}.\n\n{verify_url}\n\nNothing is saved until you approve, "
-            "and I check that the agent is yours before the worker uses it.")
+def _at(ts: float, now: float) -> str:
+    """`ts` as the owner reads a clock: "3:52 PM", with "tomorrow" (or the date) when it is not today."""
+    t, today = time.localtime(ts), time.localtime(now)
+    hm = time.strftime("%I:%M %p", t).lstrip("0")
+    if t[:3] == today[:3]:
+        return f"{hm} today"
+    if t[:3] == time.localtime(now + 86400)[:3]:
+        return f"{hm} tomorrow"
+    return f"{hm} on {time.strftime('%b', t)} {t.tm_mday}"
 
 
-def expiry_note(worker_label: str, label: str, expires_at: float) -> str:
+def _minutes(seconds: float) -> str:
+    n = max(1, int(round(seconds / 60)))
+    return f"{n} minute{'' if n == 1 else 's'}"
+
+
+def _md_url(url: str) -> str:
+    # A markdown link target ends at a space or an unbalanced paren.
+    return url.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
+
+
+def approval_note(worker_label: str, label: str, verify_url: str, expires_at: float, *, now: float,
+                  display_name: str = "", rotated: bool = False) -> str:
+    """The owner's DM: what they approve, on which server, a labelled link (the code-bearing URL is never
+    the visible text), and how long it works."""
+    host = urllib.parse.urlsplit(verify_url).hostname or "s.space"
+    name = display_name or label
+    if rotated:
+        head = f"**Approve a new token for {worker_label}'s agent**"
+        what = f"Its agent \"{name}\" on {host} gets a new token; the old one stops working once you approve."
+    else:
+        head = f"**Approve an agent for your worker {worker_label}**"
+        what = f"It will work on {host} as its own agent, \"{name}\"."
+    return (f"[dm-only]\n{head}\n\n{what}\n\n**[Approve {name} on {host} \u2192]({_md_url(verify_url)})**\n\n"
+            f"Works for {_minutes(expires_at - now)}, until {_at(expires_at, now)}. Nothing is saved until you "
+            "approve, and I check that the agent is yours before the worker uses it.")
+
+
+def expiry_note(worker_label: str, label: str, expires_at: float, *, now: float) -> str:
     """The owner's DM once an unapproved link has lapsed: nothing changed, and how to get a new one."""
-    until = time.strftime("%H:%M %Z", time.localtime(expires_at))
-    return (f"[dm-only]\nThe approval link for agent \"{label}\" (pool worker {worker_label}) expired at {until} "
-            "before it was approved, so nothing was set up. Ask me for a new link whenever you are ready.")
+    return (f"[dm-only]\n**The approval link for {worker_label} expired**\n\nIt expired at {_at(expires_at, now)} "
+            f"before agent \"{label}\" was approved, so nothing was set up. Ask me for a new link whenever "
+            "you are ready.")
 
 
 def done_note(worker_label: str, label: str, agent_id: str, *, rotated: bool = False) -> str:
     """The owner's DM once the approval is saved: which agent it is and where to find it."""
     if rotated:
-        return (f"[dm-only]\nDone: agent \"{label}\" ({agent_id}) has a new token, and pool worker {worker_label} "
-                "uses it. The old token no longer works.")
-    return (f"[dm-only]\nDone: agent \"{label}\" ({agent_id}) is set up as pool worker {worker_label}'s own agent. "
-            "Find it in your agents list (or in your DMs); mention it in a room to give it work there.")
+        return (f"[dm-only]\n**Done: {worker_label}'s agent has a new token**\n\nAgent \"{label}\" "
+                f"(`{agent_id}`) now uses it, and the old token no longer works.")
+    return (f"[dm-only]\n**Done: {worker_label} has its own agent**\n\nAgent \"{label}\" (`{agent_id}`) "
+            "is ready. Find it in your agents list or your DMs, and mention it in a room to give it work there.")
 
 
 def send_to_owner(workspace: Path, text: str) -> str:
@@ -183,7 +213,8 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     pending = start(base, label, display_name, server=str(core.get("server") or ""),
                     welcome_core="" if rotate else str(core.get("agent_mxid") or ""), request=request, clock=clock)
     known = [pending["device_code"]]
-    note = approval_note(worker_label or worker, label, pending["verify_url"], pending["expires_at"])
+    note = approval_note(worker_label or worker, label, pending["verify_url"], pending["expires_at"], now=clock(),
+                         display_name=display_name, rotated=rotate)
     send = deliver or (lambda text: send_to_owner(workspace or connections._workspace(None), text))
     send(note)
     say(f"approval link sent to the owner; it works until "
@@ -192,7 +223,7 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
         got = collect(base, pending, request=request, sleep=sleep, clock=clock)
     except DeviceConnectError as e:
         if e.status == "expired":
-            send(expiry_note(worker_label or worker, label, pending["expires_at"]))
+            send(expiry_note(worker_label or worker, label, pending["expires_at"], now=clock()))
         raise
     known.append(got["bearer"])
     token = f"{got['relay_url']}|{got['bearer']}"
