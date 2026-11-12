@@ -831,6 +831,39 @@ class Resend(CardsBase):
         later = lambda: time.time() + dc.RESEND_STALE_S + 1
         self.assertEqual(dc.resend(W, workspace=self.ws, spawn=lambda a: None, clock=later)["status"], "started")
 
+    def test_a_child_that_finishes_before_the_parent_records_its_pid_keeps_what_it_wrote(self):
+        self.expire()
+        ran = []
+
+        def child_runs_first(argv):
+            ran.append(self.connect(ConnectFake(self.backend), display_name="Reviewer"))
+            return os.getpid()
+        self.assertEqual(dc.resend(W, workspace=self.ws, spawn=child_runs_first), {"status": "started"})
+        rec = dc.read_record(self.ws, W)
+        self.assertEqual((rec["state"], "resend_pid" in rec, "resend_id" in rec), ("done", False, False))
+        self.assertEqual(C.worker_identity(W, self.ws)["agent_mxid"], ran[0]["agent_id"])
+        self.assertIn("already has its own agent", dc.resend(W, workspace=self.ws, spawn=lambda a: None)["why"])
+
+    def test_a_child_still_pending_when_the_pid_arrives_is_not_put_back_to_resending(self):
+        self.expire()
+        pending = {"label": "reviewer", "worker_label": W, "state": "pending", "expires_at": time.time() + 600,
+                   "event_id": "$new"}
+        dc.resend(W, workspace=self.ws, spawn=lambda argv: dc._keep(self.ws, W, pending) or os.getpid())
+        self.assertEqual(dc.read_record(self.ws, W), pending)
+
+        def fails_after_the_child_wrote(argv):
+            dc._keep(self.ws, W, pending)
+            raise OSError("no exec")
+        dc.write_record(self.ws, W, {**pending, "state": "expired"})
+        self.assertEqual(dc.resend(W, workspace=self.ws, spawn=fails_after_the_child_wrote)["status"], "failed")
+        self.assertEqual(dc.read_record(self.ws, W), pending)
+
+    def test_the_pid_is_recorded_while_the_claim_is_still_this_attempt_s(self):
+        self.expire()
+        dc.resend(W, workspace=self.ws, spawn=lambda argv: os.getpid())
+        rec = dc.read_record(self.ws, W)
+        self.assertEqual((rec["state"], rec["resend_pid"]), ("resending", os.getpid()))
+
     def test_two_clicks_at_once_start_one_flow(self):
         self.expire()
         barrier, spawned, results = threading.Barrier(2), [], []
@@ -907,7 +940,12 @@ class Resend(CardsBase):
         rc, out, _ = self.reply("send me a new link please", click={})
         self.assertEqual((rc, out), (1, {"status": "not_a_card"}))
         self.expire()
+        rc, out, _ = self.reply("send me a new link please", click={})
+        self.assertEqual((rc, out), (1, {"status": "owner_words", "words": "send me a new link please"}))
         rc, out, spawned = self.reply(dc.resend_text(W), click={})
+        self.assertEqual((rc, out["status"], out["say"], spawned),
+                         (1, "forged_or_stale_click", dc.ac.UNTAPPED_ACTION, []))
+        rc, out, spawned = self.reply(dc.resend_text(W), click={"card_id": "  ", "action": dc.resend_text(W)})
         self.assertEqual((rc, out["status"], out["say"], spawned),
                          (1, "forged_or_stale_click", dc.ac.UNMATCHED_CLICK, []))
         issued = dc.issued_cards.live(self.ws, dc.read_record(self.ws, W)["event_id"])

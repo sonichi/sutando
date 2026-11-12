@@ -489,7 +489,8 @@ def reply_words(task_text: str) -> Tuple[dict, str]:
 
 
 def card_click(headers: Mapping[str, str]) -> Optional[dict]:
-    """The message's `space.ag2.card_click` as the bridge passed it on ({card_id, action}), or None."""
+    """The message's `space.ag2.card_click` as the bridge passed it on ({card_id, action}), or None when
+    the task carries none or one that cannot be used (`click_tagged` tells those apart)."""
     import json
     try:
         click = json.loads(str(headers.get("card_click") or ""))
@@ -498,6 +499,11 @@ def card_click(headers: Mapping[str, str]) -> Optional[dict]:
     if not isinstance(click, dict) or not _text(click.get("card_id"), "id") or not _text(click.get("action"), "reply"):
         return None
     return {"card_id": click["card_id"], "action": click["action"]}
+
+
+def click_tagged(headers: Mapping[str, str]) -> bool:
+    """Whether the task carries a `card_click` header at all, usable or not: a tap, never typed words."""
+    return bool(str(headers.get("card_click") or "").strip())
 
 
 def owner_may_act(headers: Mapping[str, str], owner_mxid: str = "", *, dm_only: bool = True) -> Optional[str]:
@@ -519,6 +525,9 @@ NOT_A_CARD, FORGED, WORDS, COMMAND = "not_a_card", "forged_or_stale_click", "own
 # What the agent says, once, to a click it cannot match; it then does nothing else with the message.
 UNMATCHED_CLICK = ("I couldn't match that button to a card I sent, so I haven't done anything. "
                    "Tell me what you'd like in your own words.")
+# The same, for a button's own text sent as a reply to the card without a tap.
+UNTAPPED_ACTION = ("That reads like a button on my card, but it didn't arrive as a tap, so I haven't done "
+                   "anything. Tap the button, or tell me what you'd like in your own words.")
 _PICKER_ASK = re.compile(r"Connect \S.{0,200}")
 _HANDLER_RE = re.compile(r"skills/[A-Za-z0-9_-]+/scripts/[A-Za-z0-9_-]+\.py( [a-z-]+)?")
 
@@ -526,12 +535,14 @@ _HANDLER_RE = re.compile(r"skills/[A-Za-z0-9_-]+/scripts/[A-Za-z0-9_-]+\.py( [a-
 @dataclass(frozen=True)
 class Click:
     """What a task is to this agent's cards: `verdict`, the `command` of a COMMAND, why a FORGED click
-    was refused, and the card's handler script and connection as its poster recorded them."""
+    was refused and the fixed line to `say` for it, and the card's handler script and connection as its
+    poster recorded them."""
     verdict: str
     command: Optional[Reply] = None
     why: str = ""
     handler: str = ""
     lane: str = ""
+    say: str = UNMATCHED_CLICK
 
 
 def lane_owner(workspace, default: str = "") -> Callable[[str], str]:
@@ -548,23 +559,33 @@ def lane_owner(workspace, default: str = "") -> Callable[[str], str]:
 def click_verdict(headers: Mapping[str, str], said: str, workspace, owner_of: Callable[[str], str],
                   *, now: Optional[float] = None) -> Click:
     """COMMAND or WORDS for the owner's click on a card this agent posted (the owner of the connection it
-    was posted on, in the room it was posted in, in reply to its event, with a text it offered); FORGED
-    for any other click and for a card command's text without one; NOT_A_CARD for everything else."""
+    was posted on, in the room it was posted in, in reply to its event, with a text it offered). FORGED
+    for any other click, for a click header that cannot be read, and for a card command's text sent
+    without a click. Without a click, the owner's other words in reply to their card are WORDS, and
+    everything else is NOT_A_CARD."""
     import issued_cards
     entry = issued_cards.live(workspace, str(headers.get("reply_to_event") or ""), now=now)
     click = card_click(headers)
-    if click is None:
-        if parse_reply(said) is not None or (entry is not None and entry["offers"].get(said)):
-            return Click(FORGED, why="it is a card's action text without a click")
-        return Click(NOT_A_CARD)
-    if click["action"] != said:
+    if click is None and click_tagged(headers):
+        return Click(FORGED, why="its click header cannot be read")
+    if click is not None and click["action"] != said:
         return Click(FORGED, why="the click names another action than the words")
-    if entry is None or str(entry.get("card_id") or "") != click["card_id"]:
+    if click is None and parse_reply(said) is not None:
+        return Click(FORGED, why="it is a card's command without a click", say=UNTAPPED_ACTION)
+    if click is None and entry is None:
+        return Click(NOT_A_CARD)
+    if entry is None or (click is not None and str(entry.get("card_id") or "") != click["card_id"]):
         return Click(FORGED, why="it does not answer a card I posted")
-    if str(entry.get("room") or "") != str(headers.get("channel_id") or ""):
-        return Click(FORGED, why="it is not in the room the card was posted in")
     owner = owner_of(str(entry.get("lane") or ""))
-    why = owner_may_act(headers, owner) if owner else "the owner is not known"
+    why = ("it is not in the room the card was posted in"
+           if str(entry.get("room") or "") != str(headers.get("channel_id") or "")
+           else owner_may_act(headers, owner) if owner else "the owner is not known")
+    if click is None:
+        if why:
+            return Click(NOT_A_CARD)
+        if entry["offers"].get(said):
+            return Click(FORGED, why="it is a button's text without a click", say=UNTAPPED_ACTION)
+        return Click(WORDS)
     if why:
         return Click(FORGED, why=why)
     command = entry["offers"].get(said)
@@ -583,7 +604,7 @@ def click_answer(verdict: Click, said: str, mine: Tuple[str, ...] = ()) -> Optio
     refusal for a forged click, the owner's words, ordinary chat, or another handler's card. None for
     its own command."""
     if verdict.verdict == FORGED:
-        return {"status": FORGED, "say": UNMATCHED_CLICK, "why": verdict.why}
+        return {"status": FORGED, "say": verdict.say, "why": verdict.why}
     if verdict.verdict == WORDS:
         return {"status": WORDS, "words": said}
     if verdict.verdict == NOT_A_CARD:
