@@ -841,6 +841,55 @@ class TestResolveActiveTarget(unittest.TestCase):
 
 
 
+class TestBlockerAlertGoesToOwnerDm(unittest.TestCase):
+    """A blocked-on-you alert goes to the owner's own DM, never the last-active shared room."""
+
+    ROOM, DM = "!shared:ag2.space", "!dm:ag2.space"
+
+    def _ws(self, td, dm=True):
+        st = os.path.join(td, "state")
+        os.makedirs(st)
+        act = os.path.join(st, "last-owner-activity.json")
+        with open(act, "w") as f:
+            json.dump({"channel": "ag2space", "channel_id": self.ROOM}, f)
+        if dm:
+            with open(os.path.join(st, "owner-routing.json"), "w") as f:
+                json.dump({"owner_dm": self.DM, "private": True}, f)
+        sig = os.path.join(st, "core-supervisor.json")
+        return act, sig
+
+    def _run(self, td, state, dm=True):
+        act, sig = self._ws(td, dm)
+        with open(sig, "w") as f:
+            json.dump({"state": state, "prompt": "p", "kind": "x"}, f)
+        sent = []
+        with patch.object(_mod, "_channel_notify",
+                          lambda m, s, c, extra=None: sent.append((s, c)) or True):
+            _mod.main(["--signal", sig, "--active-from", act, "--no-macos", "--no-seats",
+                       "--state-file", os.path.join(td, "st")])
+        return sent
+
+    def test_blocker_goes_to_owner_dm(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(self._run(td, "blocked-human"), [("ag2space", self.DM)])
+
+    def test_no_owner_dm_keeps_last_active_room(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(self._run(td, "blocked-human", dm=False), [("ag2space", self.ROOM)])
+
+    def test_soft_notice_keeps_last_active_room(self):
+        with tempfile.TemporaryDirectory() as td:
+            act, sig = self._ws(td)
+            with open(sig, "w") as f:
+                json.dump({"state": "healthy", "auto_answered": {"kind": "fable-limit", "at": 1}}, f)
+            sent = []
+            with patch.object(_mod, "_channel_notify",
+                              lambda m, s, c, extra=None: sent.append((s, c)) or True):
+                _mod.main(["--signal", sig, "--active-from", act, "--no-macos", "--no-seats",
+                           "--state-file", os.path.join(td, "st")])
+            self.assertEqual(sent, [("ag2space", self.ROOM)])
+
+
 class TestChannelEnvContainmentDelegation(unittest.TestCase):
     """The probe (_is_deliverable) must call the shared
     src/channel_env_containment.py function, not carry its own copy of the
