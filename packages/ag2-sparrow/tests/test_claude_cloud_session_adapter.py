@@ -261,7 +261,13 @@ class PayloadTest(unittest.TestCase):
         self.assertIsNotNone(ui, prompt)
         self.assertEqual(re.findall(r"`(mcp__ag2_space__\w+)`", ui.group(1)),
                          ["mcp__ag2_space__ui_describe", "mcp__ag2_space__ui_request", "mcp__ag2_space__ui_result"])
-        forbidden = prompt[allowed.end() + ui.end():prompt.index("Post with the AG2 Space connector")]
+        account = re.search(r"Only when the\nrouting line has `tier=owner`, you may also call (.*?) for that item",
+                            prompt[allowed.end() + ui.end():], re.S)
+        self.assertIsNotNone(account, prompt)
+        self.assertEqual(re.findall(r"`(mcp__ag2_space__\w+)`", account.group(1)),
+                         ["mcp__ag2_space__space_action_read"])
+        self.assertIn("pass `action`, `arguments` and that item's `task_id`, and nothing else", prompt)
+        forbidden = prompt[allowed.end() + ui.end() + account.end():prompt.index("Post with the AG2 Space connector")]
         self.assertIn("Never call", forbidden)
         for tool in ("room_list", "room_inspect", "room_action_read", "relay_token_issue", "agent_link",
                      "agent_unlink"):
