@@ -938,12 +938,13 @@ def result_line(request: Dict[str, Any], reply: str) -> Optional[Dict[str, Any]]
 
 
 def _post_result(request, reply, call) -> None:
-    post = result_line(request, reply)
-    if post is not None:
-        try:
+    """The thread's last line, best effort from end to end: the reply is already recorded."""
+    try:
+        post = result_line(request, reply)
+        if post is not None:
             call(dict(post, operation_id=f"cab-{request['request_id']}-result"))
-        except Exception:  # noqa: BLE001 - the thread is best effort; the DM reply is recorded
-            pass
+    except Exception:  # noqa: BLE001 - the thread is best effort; the DM reply is recorded
+        pass
 
 
 # --------------------------------------------------------------------------- CLI

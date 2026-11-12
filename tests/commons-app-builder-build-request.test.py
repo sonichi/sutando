@@ -11,7 +11,6 @@ import importlib.util
 import json
 import os
 import re
-import subprocess
 import tempfile
 import threading
 import time
@@ -1185,28 +1184,23 @@ room_off, room_plain = FakeRoom(), FakeRoom()
 with_root = reply_of(run(room_off, task(template="poll", thread_root=ROOT), {"app_name": "Weekend"}))
 plain = reply_of(run(room_plain, task(template="poll"), {"app_name": "Weekend"}))
 check("switch-off-is-todays-answer", with_root == plain and "room.message.send" not in actions_of(room_off))
-# Off, thread_root is ignored as any unknown key is: byte for byte the base's parse and plan (M1).
-_base_path = _SKILL / "scripts" / "_base_build_request_for_test.py"
-_base_path.write_text(subprocess.run(["git", "-C", str(_ROOT), "show",
-                                      "origin/fix/commons-app-builder-followups:skills/commons-app-builder/scripts/build_request.py"],
-                                     capture_output=True, text=True, check=True).stdout)
-try:
-    base = _load("base_build_request", _base_path)
-    base.WORKSPACE = WS
-    for label, root in (("a-good-root", ROOT), ("a-malformed-root", "not-an-event"), ("no-root", None)):
-        text = task(template="poll", thread_root=root, request_id="18181818-3434-4565-8787-909090909090")
-        same_parse = json.dumps(br.parse(text), sort_keys=True) == json.dumps(base.parse(text), sort_keys=True)
-        with tempfile.TemporaryDirectory() as led:
-            (Path(led) / "t.txt").write_text(text)
-            outs = []
-            for mod in (br, base):
-                o, e = io.StringIO(), io.StringIO()
-                with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
-                    rc = mod.main(["plan", str(Path(led) / "t.txt"), "--ledger", str(Path(led) / mod.__name__)])
-                outs.append((rc, o.getvalue()))
-        check(f"switch-off-is-the-base-byte-for-byte-{label}", same_parse and outs[0] == outs[1])
-finally:
-    _base_path.unlink(missing_ok=True)
+# Off, thread_root is ignored as any unknown key is: the base's own parse, plan and reply, byte for
+# byte (M1). The base's outputs are a checked-in fixture, made once from #6397's head.
+OFF = json.loads((_ROOT / "tests" / "fixtures" / "commons-app-builder" / "thread-root-switch-off.json").read_text())
+for label, case in OFF["cases"].items():
+    text = task(template="poll", thread_root=case["thread_root"], request_id="18181818-3434-4565-8787-909090909090")
+    parsed = br.parse(text)
+    parsed.pop("owner", None)
+    with tempfile.TemporaryDirectory() as led:
+        (Path(led) / "t.txt").write_text(text)
+        plan_exit, plan_out = cli("plan", str(Path(led) / "t.txt"), "--ledger", led)
+        reply_exit, reply_out = cli("reply", str(Path(led) / "t.txt"), "--status", "done", "--page", "html-k3m9x2qa",
+                                    "--database", "d7k2m9x1", "--app-id", "a1b2c3d4", "--line", "Built it.",
+                                    "--ledger", led)
+    check(f"switch-off-parse-is-the-base-{label}", parsed == case["parse"])
+    check(f"switch-off-plan-is-the-base-{label}", plan_exit == case["plan_exit"]
+          and (json.loads(plan_out) if plan_exit == 0 else plan_out) == case["plan"])
+    check(f"switch-off-reply-is-the-base-{label}", (reply_exit, reply_out) == (case["reply_exit"], case["reply"]))
 
 br.thread_conversation = lambda: True
 try:
@@ -1257,6 +1251,21 @@ try:
             return super().call(step)
     _, rep = reply_of(run(Exploding2(), task(template="poll", thread_root=ROOT)))
     check("any-error-from-a-thread-post-is-best-effort", rep["status"] == "done")
+
+    # On the failure path too: the reply is recorded, and a post that raises never escapes the build.
+    class FailingAndExploding(PathError):
+        def call(self, step):
+            if step["action"] == "room.message.send":
+                raise RuntimeError("socket closed")
+            return super().call(step)
+    led_f = br.Ledger(Path(tempfile.mkdtemp()))
+    text_f = task(template="poll", thread_root=ROOT, request_id="a1a1a1a1-3434-4565-8787-909090909090")
+    try:
+        out_f = run(FailingAndExploding(), text_f, {}, led_f)
+        check("a-raising-post-on-failure-is-best-effort", reply_of(out_f)[1]["status"] == "failed"
+              and led_f.claim(ROOM, "a1a1a1a1-3434-4565-8787-909090909090")[0] == "done")
+    except Exception as error:  # noqa: BLE001
+        check(f"a-raising-post-on-failure-is-best-effort ({type(error).__name__})", False)
 
     # On, but no thread named: DM only.
     room = FakeRoom()
