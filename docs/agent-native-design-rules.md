@@ -27,8 +27,9 @@ complete reference.
 High-impact means, at least, irreversible actions and outward-facing ones: sending to people or
 places outside the conversation the request came from (email, a post, another room), publishing,
 purchasing, deleting, and changing permissions or credentials. A reply in the conversation the
-request came from is not high-impact. A standing approval the owner gave for a named kind of
-action satisfies the hold, and only a person can give it.
+request came from, or a message to the agent's own owner in their DM, is not high-impact. A
+standing approval the owner gave for a named kind of action satisfies the hold, and only a person
+can give it.
 
 An Action's risk and its approval requirement come from the Action's own metadata, set by the
 platform. They never come from the caller or the card, so an agent cannot downgrade them.
@@ -64,8 +65,8 @@ gaps today:
 
 - Sending a secret is a typed `vault set` command.
 - Re-linking an agent is a typed approval code.
-- Clicks on room cards, and the owner's click on an owner card in a shared room, are not accepted
-  yet (section 11).
+- A click on a room card that reaches an agent as a task, and the owner's click on an owner card
+  in a shared room, are not accepted yet (section 11).
 - A card's outcome is not yet edited in place: the updated card is posted as a reply to the old
   one, which stays as it was (section 7).
 
@@ -216,10 +217,14 @@ For both kinds:
 - There is one shared implementation of this check, not one per feature. Nobody writes a second.
 
 Today the shared check covers owner cards in the owner's DM only. The owner's own click in a
-shared room is refused. Room cards, a click by a room member with the room's permission, have no
-check yet, and the acting side does not act on a room-card click until one is added to the same
-function. Both are tracked gaps (section 3). Until then, a room card's buttons must not be relied
-on: use a link or open button, or a question.
+shared room is refused. A room card whose clicks reach an agent as a task has no check yet, and
+the acting side does not act on such a click until one is added to the same function. Both are
+tracked gaps (section 3). Until then, the buttons of that kind of room card must not be relied on:
+use a link or open button, or a question.
+
+Other room interactions work today and are checked elsewhere: a room question asked through
+`room.question.ask` is checked by the backend, an invite is a Matrix join, and a room-app button
+runs the app's own Action.
 
 ## 12. Checklist for contributors and reviewers
 
@@ -293,7 +298,7 @@ These are not rules yet.
 ## What this means here (agent engine)
 
 The engine writes the card content and the text the owner reads, so rules 2, 3, 5, 7, 8, 10
-and 11 land here. Lines that usually apply in this repo: 2, 3, 8, 12
+and 11 land here. Lines that usually apply in this repo: 2 to 4, 8
 to 22 and 25 to 29. Lines 23 and 24 are for the web client.
 
 - High-impact is defined by rule 2 of this note. `CLAUDE.md` "Identity" (confirm irreversible
@@ -335,8 +340,10 @@ to 22 and 25 to 29. Lines 23 and 24 are for the web client.
   check. Today it covers owner cards in the owner's DM only (`owner_may_act` defaults to
   `dm_only=True`): the owner's own click in a shared room is refused, and room cards have no
   check yet. The engine does not act on a room-card click until one is added to the same
-  function. Both are tracked gaps. Until then, do not rely on a room card's buttons: use a link
-  or open button, or a question.
+  function. Both are tracked gaps. Until then, do not rely on the buttons of a room card whose
+  clicks come to the engine as a task: use a link or open button, or a question. A room
+  question asked with `room.question.ask`, an invite and a room-app button do not come through
+  this path and work today.
 - The engine never does anything on the person-only list. It asks, with a card.
 - "Known action → control" is about text an end user reads. Runbooks, developer docs and
   operator instructions may say "run this command".
