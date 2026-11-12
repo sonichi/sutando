@@ -354,15 +354,18 @@ SUTANDO_REQUEST
 
 It arms the same wait as `card`, so the request resumes by itself once the app is connected again, and
 prints `message`: a Signed out card (agent panel, state error: the app's logo, "Signed out · <account>",
-what it stopped, a Reconnect button). Post it with ONE `room.message.send` exactly as in Step 3a, then
-write the result "Once it's reconnected I'll carry on." (adapted). Exit 1 with `reason`: `use_card` (it
+what it stopped, a Reconnect button). Post it with ONE `room.message.send` exactly as in Step 3a, record it
+so its button can act (`python3 src/issued_cards.py record --workspace "$(bash scripts/sutando-config.sh
+workspace)" --event-id '<the event id the send returned>'`, the same `message` JSON on stdin), then write the
+result "Once it's reconnected I'll carry on." (adapted). Exit 1 with `reason`: `use_card` (it
 was `connect_required`: Step 3a), `not_an_auth_error` (answer with the error as usual), `still_active` (the
 app still lists the sign-in as active, so a wait would resume into the same error: tell the owner
 "<App> refused my sign-in; reconnect it in Settings → Integrations." and stop).
 
 The card's Reconnect button replies `card:apps:<slug>:reconnect`. On that task run
 `python3 skills/agent-cards/scripts/cards.py reply --task-file <task file>`: it prints `message`, the
-Connect card for the same wait, to post with `room.message.send`; then write `[no-send]`.
+Connect card for the same wait, to post with `room.message.send`; then write `[no-send]`. It prints
+`not_a_card_reply` unless the owner replied to the recorded card: then it is ordinary chat.
 
 ## Two accounts of one app
 

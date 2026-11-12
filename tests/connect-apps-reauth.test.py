@@ -26,6 +26,7 @@ _spec.loader.exec_module(S)
 connectors, ROOM, OWNER = S.connectors, S.ROOM, S.OWNER
 sys.path.insert(0, str(ROOT / "src"))
 import agent_card as ac  # noqa: E402
+import issued_cards  # noqa: E402
 
 GMAIL = {"kind": "connector", "slug": "gmail", "name": "Gmail", "authMode": "oauth"}
 EXPIRED = "composio_exec failed: 401 Unauthorized: the connected account's token expired, re-authenticate"
@@ -95,13 +96,17 @@ class Reauth(S.Base):
     def test_the_reconnect_reply_brings_up_the_connect_card_of_that_wait(self):
         code, out = self.run_(reauth_argv())
         wait_id = out["wait_id"]
+        recorded = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(out["message"]))), \
+                contextlib.redirect_stdout(recorded):
+            self.assertEqual(issued_cards.main(["record", "--workspace", str(self.ws), "--event-id", "$signed-out"]), 0)
         _spec2 = importlib.util.spec_from_file_location("cards", ROOT / "skills" / "agent-cards" / "scripts" / "cards.py")
         cards = importlib.util.module_from_spec(_spec2)
         _spec2.loader.exec_module(cards)
         task = self.ws / "tasks" / "task-click.txt"
         task.write_text("\n".join(["id: task-click", "task_layout: mid", "task: card:apps:gmail:reconnect",
                                    "source: ag2space", f"channel_id: {ROOM}", "channel_kind: dm",
-                                   f"user_id: {OWNER}", "access_tier: owner"]) + "\n")
+                                   f"user_id: {OWNER}", "access_tier: owner", "reply_to_event: $signed-out"]) + "\n")
         printed = io.StringIO()
         with mock.patch.object(cards.connections, "owner_dm", lambda row, ws=None: ROOM), \
                 mock.patch.object(cards, "connectors", connectors, create=True), \
@@ -112,6 +117,24 @@ class Reauth(S.Base):
         self.assertEqual((rc, got["status"], got["wait_id"]), (0, "post", wait_id))
         self.assertEqual(got["message"]["extra_content"]["space.ag2.connector"]["toolkits"], [{"slug": "gmail"}])
         self.assertEqual(got["message"]["operation_id"], f"{wait_id}:reconnect-card")
+
+    def test_an_explicit_owner_must_be_the_task_s_own(self):
+        argv = [a for a in reauth_argv() if a != "--owner-from-task"] + ["--owner", "@someone:s.space"]
+        code, out = self.run_(argv)
+        self.assertEqual((code, out["error"]), (2, "not_owner_task"))
+        argv = [a for a in reauth_argv() if a != "--owner-from-task"] + ["--owner", OWNER]
+        code, out = self.run_(argv)
+        self.assertEqual(code, 0, out)
+
+    def test_signed_out_of_sutando_or_another_station_account_arms_nothing(self):
+        code, out = self.run_(reauth_argv(), S.FakeCloud(self.ws, items=[GMAIL], token=None))
+        self.assertEqual((code, out["error"]), (2, "not_signed_in"))
+        stamp = {"version": 1, "has_station_entry": True, "cloud_user_id": "u-other", "spawned_at": "2026-09-15T00:00:00Z"}
+        (self.ws / "state").mkdir(exist_ok=True)
+        (self.ws / "state" / "station-core-stamp.json").write_text(json.dumps(stamp))
+        code, out = self.run_(reauth_argv())
+        self.assertEqual((code, out["reason"], out["message"]), (1, "account_changed", None))
+        self.assertEqual(connectors.list_markers(self.ws), [])
 
 
 if __name__ == "__main__":

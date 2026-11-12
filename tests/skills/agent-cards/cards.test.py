@@ -175,56 +175,222 @@ class Show(Base):
         self.assertEqual(fake.calls, [])
 
 
+class Sources(Base):
+    """Each card reads its own source on this machine, and `show` names what could not be read or sent."""
+
+    def test_the_circle_is_read_from_the_collaboration_map_and_skips_what_it_cannot_show(self):
+        self.assertEqual(cards.read_circle(self.ws), [])
+        path = self.ws / "data" / "collaboration-intelligence" / "quick-lookup.yaml"
+        path.parent.mkdir(parents=True)
+        path.write_text("quick_lookup:\n  recent_entities:\n    - {entity_id: '@ana:s.space', kind: human}\n"
+                        "    - just a name\n    - {entity_id: svc, kind: service}\n    - {name: Bo, kind: agent}\n")
+        try:
+            import yaml  # noqa: F401
+        except ImportError:
+            self.assertEqual(cards.read_circle(self.ws), [])
+            return
+        entities = cards.read_circle(self.ws)
+        self.assertEqual(len(entities), 4)
+        _, card = cards.build_kind("circle", self.ws)
+        people, agents = card["groups"]
+        self.assertEqual([r["title"] for r in people["rows"] + agents["rows"]], ["@ana:s.space", "Bo"])
+        self.assertEqual(agents["rows"][0]["avatar"], {"initial": "B", "shape": "square"})
+        path.write_text(": : not yaml : [")
+        self.assertEqual(cards.read_circle(self.ws), [])
+
+    def test_each_kind_reads_its_own_source(self):
+        import chat_bridges
+        import connectors
+        import pool_manage
+        import pool_roster
+        with mock.patch.object(cards.connections, "list_connections", lambda ws: ROWS), \
+                mock.patch.object(cards.connections, "status_for", lambda r, ws: r), \
+                mock.patch.object(chat_bridges, "states", lambda d, env: BRIDGES):
+            self.assertEqual(cards.build_kind("connections", self.ws)[1]["id"], "connections")
+        with mock.patch.object(pool_manage, "listing", lambda ws: WORKERS), \
+                mock.patch.object(pool_roster, "load_roster", lambda ws: {"workers": {"w1": {"runtime": "codex"}}}), \
+                mock.patch.object(cards.connections, "worker_identity", lambda wid, ws: None):
+            workers, identities, runtimes = cards.read_workers(self.ws)
+            self.assertEqual((len(workers), identities["w1"], runtimes), (3, {}, {"w1": "codex"}))
+            self.assertEqual(cards.build_kind("workers", self.ws)[1]["id"], "workers")
+        with mock.patch.object(connectors.Cloud, "connection_rows", lambda self, cached=False: APPS):
+            self.assertEqual(cards.build_kind("apps", self.ws)[1]["id"], "apps")
+
+    def test_print_shows_the_card_without_posting_it(self):
+        with mock.patch.object(cards, "read_apps", lambda ws: APPS):
+            rc, out = self.run_(["show", "apps", "--print"], task("show my apps"))
+        self.assertEqual((rc, out["card"]["id"]), (0, "apps"))
+        self.assertFalse(cards.issued_cards.ledger_path(self.ws).exists())
+
+    def test_a_source_or_a_send_that_fails_is_named(self):
+        with mock.patch.object(cards, "read_apps", side_effect=RuntimeError("cloud down")):
+            rc, out = self.run_(["show", "apps"], task("show my apps"), execute=Fake().execute)
+        self.assertEqual((rc, out["status"]), (1, "failed"))
+        self.assertIn("cloud down", out["why"])
+        refusing = lambda *a, **k: {"is_error": True, "code": "FORBIDDEN"}
+        with mock.patch.object(cards, "read_apps", lambda ws: APPS):
+            rc, out = self.run_(["show", "apps"], task("show my apps"), execute=refusing)
+        self.assertEqual((rc, out["status"]), (1, "failed"))
+        self.assertIn("FORBIDDEN", out["why"])
+
+    def test_a_card_that_cannot_be_recorded_is_posted_and_says_its_buttons_will_not_act(self):
+        with mock.patch.object(cards, "read_apps", lambda ws: APPS), \
+                mock.patch.object(cards.issued_cards, "record", side_effect=OSError("disk full")):
+            rc, out = self.run_(["show", "apps"], task("show my apps"), execute=Fake().execute)
+        self.assertEqual((rc, out["status"], out["event_id"]), (0, "posted", "$card"))
+        self.assertIn("OSError", out["why"])
+
+    def test_without_an_injected_core_or_sender_it_posts_as_the_core_s_own_agent(self):
+        import pool_provision
+        fake = Fake()
+        path = self.ws / "task.txt"
+        path.write_text(task("show my apps"))
+        out = io.StringIO()
+        with mock.patch.object(cards, "_core", lambda ws: CORE), \
+                mock.patch.object(pool_provision, "core_actions", lambda ws, lane: (fake, CORE)), \
+                mock.patch.object(cards, "read_apps", lambda ws: APPS), \
+                mock.patch("workspace_default.resolve_workspace", lambda: str(self.ws)), \
+                contextlib.redirect_stdout(out):
+            rc = cards.main(["show", "apps", "--task-file", str(path)])
+        self.assertEqual((rc, json.loads(out.getvalue())["status"]), (0, "posted"))
+        self.assertEqual(fake.calls[0][3], DM)
+        with mock.patch.object(cards, "_core", side_effect=RuntimeError("no core lane")):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = cards.main(["--workspace", str(self.ws), "show", "apps", "--task-file", str(path)])
+        self.assertEqual((rc, json.loads(out.getvalue())["status"]), (2, "refused"))
+        with mock.patch.object(pool_provision, "core_lane", lambda ws, lane: CORE):
+            self.assertEqual(cards._core(self.ws), CORE)
+
+
 class Reply(Base):
-    def test_disconnect_acts_only_on_the_confirmed_variant(self):
+    """A click acts only as the owner's reply, in their DM, to a card this agent posted that offered it."""
+
+    def issue(self, *payloads, event="$card"):
+        _, card = ac.build("test", "info", title="t", body="b",
+                           buttons=[ac.button(p, "reply", reply=p) for p in payloads])
+        self.assertTrue(cards.issued_cards.record(self.ws, event, card))
+
+    def reply(self, said, **kw):
+        kw.setdefault("reply_to_event", "$card")
+        return self.run_(["reply"], task(said, **kw))
+
+    def test_disconnect_acts_on_the_confirmed_variant_the_card_offered(self):
         done = []
+        self.issue("card:connections:dev-s-space:disconnect:confirmed")
         with mock.patch.object(cards.connections, "read_rows", lambda ws=None: ROWS), \
                 mock.patch.object(cards.connections, "disconnect", lambda inst, **kw: done.append(inst) or {}):
-            rc, out = self.run_(["reply"], task("card:connections:dev-s-space:disconnect"))
-            self.assertEqual((rc, out["status"], done), (1, "needs_confirm", []))
-            rc, out = self.run_(["reply"], task("card:connections:dev-s-space:disconnect:confirmed"))
+            rc, out = self.reply("card:connections:dev-s-space:disconnect")
+            self.assertEqual((rc, out["status"], done), (1, "not_a_card_reply", []))
+            rc, out = self.reply("card:connections:dev-s-space:disconnect:confirmed")
         self.assertEqual((rc, out["status"], done), (0, "done", ["dev-s-space"]))
 
     def test_reconnect_and_make_main_run_the_connections_units(self):
         calls = []
+        self.issue("card:connections:dev-s-space:reconnect", "card:connections:dev-s-space:make-main",
+                   "card:connections:s-space-w1:reconnect")
         with mock.patch.object(cards.connections, "read_rows", lambda ws=None: ROWS), \
                 mock.patch.object(cards.connections, "reconnect", lambda inst, **kw: calls.append(("re", inst)) or {"pid": 7}), \
-                mock.patch.object(cards.connections, "set_primary", lambda inst, **kw: calls.append(("main", inst)) or {"server": "dev.s.space"}):
-            self.assertEqual(self.run_(["reply"], task("card:connections:dev-s-space:reconnect"))[0], 0)
-            self.assertEqual(self.run_(["reply"], task("card:connections:dev-s-space:make-main"))[0], 0)
-            rc, out = self.run_(["reply"], task("card:connections:s-space-w1:reconnect"))
+                mock.patch.object(cards.connections, "set_primary", lambda inst, **kw: calls.append(("main", inst)) or {"server": "dev.s.space", "relaunch_needed": True}):
+            self.assertEqual(self.reply("card:connections:dev-s-space:reconnect"), (0, {"status": "done", "say": "Reconnected dev-s-space.", "pid": 7}))
+            rc, out = self.reply("card:connections:dev-s-space:make-main")
+            self.assertEqual(rc, 0)
+            self.assertIn("takes over after a reconnect", out["say"])
+            rc, out = self.reply("card:connections:s-space-w1:reconnect")
         self.assertEqual(calls, [("re", "dev-s-space"), ("main", "dev-s-space")])
         self.assertEqual((rc, out["status"]), (2, "refused"))
 
     def test_workers_pause_restart_and_a_confirmed_retire(self):
         import pool_manage
         calls = []
+        said = ("card:workers:w1:pause", "card:workers:w1:restart", "card:workers:w1:retire:confirmed")
+        self.issue(*said)
         with mock.patch.object(pool_manage, "stop", lambda ws, t, **k: calls.append(("stop", t)) or {"result": "stopped"}), \
-                mock.patch.object(pool_manage, "enable", lambda ws, repo, t, **k: calls.append(("enable", t)) or {"result": "enabled"}), \
+                mock.patch.object(pool_manage, "enable", lambda ws, repo, t, **k: calls.append(("enable", t)) or {"result": "failed"}), \
                 mock.patch.object(pool_manage, "retire", lambda ws, t, **k: calls.append(("retire", t)) or {"result": "retired"}):
-            for said in ("card:workers:w1:pause", "card:workers:w1:restart", "card:workers:w1:retire",
-                         "card:workers:w1:retire:confirmed"):
-                self.run_(["reply"], task(said))
+            got = [self.reply(x) for x in said + ("card:workers:w1:retire",)]
         self.assertEqual(calls, [("stop", "w1"), ("enable", "w1"), ("retire", "w1")])
+        self.assertEqual([(rc, out["status"]) for rc, out in got],
+                         [(0, "done"), (1, "failed"), (0, "done"), (1, "not_a_card_reply")])
 
     def test_app_replies_never_disconnect(self):
-        rc, out = self.run_(["reply"], task("card:apps:gmail:disconnect"))
+        self.issue("card:apps:gmail:disconnect", "card:apps:gmail:switch", "card:apps:gmail:reconnect")
+        rc, out = self.reply("card:apps:gmail:disconnect")
         self.assertEqual((rc, out["status"]), (0, "say"))
         self.assertIn("Settings → Integrations", out["say"])
-        rc, out = self.run_(["reply"], task("card:apps:gmail:switch"))
-        self.assertEqual(out, {"status": "handoff", "skill": "connect-apps", "step": "switch", "slug": "gmail"})
+        self.assertEqual(self.reply("card:apps:gmail:switch")[1],
+                         {"status": "handoff", "skill": "connect-apps", "step": "switch", "slug": "gmail"})
+        import connectors
+        with mock.patch.object(connectors, "list_markers", lambda ws: []):
+            self.assertEqual(self.reply("card:apps:gmail:reconnect")[1],
+                             {"status": "handoff", "skill": "connect-apps", "step": "connect", "slug": "gmail"})
 
-    def test_only_the_owner_in_their_dm(self):
+    def test_a_click_on_a_real_posted_card_round_trips(self):
+        fake = Fake()
+        with mock.patch.object(cards, "read_connections", lambda ws: (ROWS, BRIDGES)):
+            rc, out = self.run_(["show", "connections"], task("show my connections"), execute=fake.execute)
+        self.assertEqual(rc, 0)
+        done = []
+        with mock.patch.object(cards.connections, "read_rows", lambda ws=None: ROWS), \
+                mock.patch.object(cards.connections, "set_primary", lambda inst, **kw: done.append(inst) or {}):
+            rc, out = self.reply("card:connections:dev-s-space:make-main", reply_to_event=out["event_id"])
+        self.assertEqual((rc, out["status"], done), (0, "done", ["dev-s-space"]))
+
+    def test_a_reply_to_a_card_this_agent_did_not_post_is_ignored(self):
+        self.issue("card:workers:w1:pause")
         import pool_manage
         with mock.patch.object(pool_manage, "stop", mock.Mock(side_effect=AssertionError("acted"))):
-            for text in (task("card:workers:w1:pause", tier="team"), task("card:workers:w1:pause", user="@x:s.space"),
-                         task("card:workers:w1:pause", room=ROOM)):
-                rc, out = self.run_(["reply"], text)
-                self.assertEqual((rc, out["status"]), (2, "refused"))
+            for reply_to in ("$forged-by-a-member", ""):
+                rc, out = self.reply("card:workers:w1:pause", reply_to_event=reply_to)
+                self.assertEqual((rc, out["status"]), (1, "not_a_card_reply"), reply_to)
+
+    def test_a_payload_the_card_did_not_offer_is_ignored(self):
+        self.issue("card:workers:w1:pause")
+        import pool_manage
+        with mock.patch.object(pool_manage, "retire", mock.Mock(side_effect=AssertionError("acted"))):
+            for said in ("card:workers:w1:retire:confirmed", "card:workers:w2:pause", "card:circle:-:shuffle"):
+                rc, out = self.reply(said)
+                self.assertEqual((rc, out["status"]), (1, "not_a_card_reply"), said)
+
+    def test_anyone_but_the_owner_in_their_dm_is_ignored(self):
+        self.issue("card:workers:w1:pause")
+        import pool_manage
+        with mock.patch.object(pool_manage, "stop", mock.Mock(side_effect=AssertionError("acted"))):
+            for kw in ({"tier": "team"}, {"user": "@x:s.space"}, {"room": ROOM}, {"collaborator": "true"}):
+                rc, out = self.reply("card:workers:w1:pause", **kw)
+                self.assertEqual((rc, out["status"]), (1, "not_a_card_reply"), kw)
 
     def test_other_words_and_other_cards_are_not_its_replies(self):
         self.assertEqual(self.run_(["reply"], task("show my workers")), (1, {"status": "not_a_card_reply"}))
-        self.assertEqual(self.run_(["reply"], task("card:worker-approval:w1:resend"))[1]["status"], "not_a_card_reply")
+        self.assertEqual(self.reply("card:worker-approval:w1:resend")[1]["status"], "not_a_card_reply")
+
+    def test_a_core_that_cannot_be_read_or_a_handler_that_raises_is_named(self):
+        self.issue("card:workers:w1:pause")
+        path = self.ws / "task.txt"
+        path.write_text(task("card:workers:w1:pause", reply_to_event="$card"))
+        out = io.StringIO()
+        with mock.patch.object(cards, "_core", side_effect=RuntimeError("no core lane")), \
+                contextlib.redirect_stdout(out):
+            rc = cards.main(["--workspace", str(self.ws), "reply", "--task-file", str(path)])
+        self.assertEqual((rc, json.loads(out.getvalue())["status"]), (2, "refused"))
+        import pool_manage
+        with mock.patch.object(pool_manage, "stop", side_effect=RuntimeError("tmux gone")):
+            rc, got = self.reply("card:workers:w1:pause")
+        self.assertEqual((rc, got), (1, {"status": "failed", "why": "RuntimeError: tmux gone"}))
+
+
+class Units(Base):
+    """Each reply unit refuses what no card offers, so a future card cannot reach an unnamed action."""
+
+    def test_unknown_verbs_and_targets_are_refused(self):
+        R = ac.Reply
+        with mock.patch.object(cards.connections, "read_rows", lambda ws=None: ROWS):
+            self.assertEqual(cards._connections_reply(self.ws, R("connections", "dev-s-space", "explode", False))["status"],
+                             "refused")
+            self.assertIn("(legacy)", cards._connections_reply(self.ws, R("connections", "", "reconnect", False))["why"])
+        self.assertEqual(cards._workers_reply(self.ws, R("workers", "w1", "explode", False))["status"], "refused")
+        self.assertEqual(cards._apps_reply(self.ws, R("apps", "Bad!", "switch", False), {})["status"], "refused")
+        self.assertEqual(cards._apps_reply(self.ws, R("apps", "gmail", "explode", False), {})["status"], "refused")
 
 
 if __name__ == "__main__":

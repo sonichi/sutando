@@ -41,6 +41,7 @@ for _p in (str(_REPO / "src"), str(_SKILLS / "worker-pool" / "scripts"), str(_SK
 import agent_card as ac  # noqa: E402
 import connections  # noqa: E402
 import dotspace
+import issued_cards
 
 KINDS = ("connections", "workers", "apps", "circle")
 RUNTIMES = {"claude": "Claude", "codex": "Codex"}
@@ -55,10 +56,6 @@ def _emit(payload: dict, code: int = 0) -> int:
 
 
 # ── builders (pure) ───────────────────────────────────────────────────────────
-
-def _target(instance: str) -> str:
-    return instance or "-"
-
 
 def connections_card(rows: list, bridges: list) -> tuple:
     """(body, card) for the owner's own connections: the core's servers, then the chat-app bridges."""
@@ -284,6 +281,10 @@ def cmd_show(ws: Path, args, *, core=None, execute=None) -> int:
                            reply_to=str(headers.get("source_message_id") or ""), owner_dm=dm)
     except ac.CardError as e:
         return _emit({"status": "failed", "why": str(e), "body": body}, 1)
+    try:
+        issued_cards.record(ws, eid, card)
+    except OSError as e:
+        return _emit({"status": "posted", "event_id": eid, "why": f"its buttons will not act ({type(e).__name__})"})
     return _emit({"status": "posted", "event_id": eid})
 
 
@@ -298,9 +299,7 @@ def _connections_reply(ws: Path, said: ac.Reply) -> dict:
         row = connections.set_primary(inst, workspace=ws)
         return {"status": "done", "say": f"{row.get('server') or inst} is now your main connection"
                 + ("; it takes over after a reconnect." if row.get("relaunch_needed") else ".")}
-    if said.verb == "disconnect":
-        if not said.confirmed:
-            return {"status": "needs_confirm", "say": f"Tap Disconnect on the card and confirm to disconnect {inst}."}
+    if said.verb == "disconnect" and said.confirmed:
         connections.disconnect(inst, workspace=ws)
         return {"status": "done", "say": f"Disconnected {inst}. Its token is kept; Reconnect brings it back."}
     return {"status": "refused", "why": f"a connections card has no {said.verb!r} action"}
@@ -312,9 +311,7 @@ def _workers_reply(ws: Path, said: ac.Reply) -> dict:
         out = pool_manage.stop(ws, said.target)
     elif said.verb == "restart":
         out = pool_manage.enable(ws, str(_REPO), said.target)
-    elif said.verb == "retire":
-        if not said.confirmed:
-            return {"status": "needs_confirm", "say": "Tap Retire on the card and confirm to retire that worker."}
+    elif said.verb == "retire" and said.confirmed:
         out = pool_manage.retire(ws, said.target)
     else:
         return {"status": "refused", "why": f"a workers card has no {said.verb!r} action"}
@@ -352,20 +349,20 @@ def cmd_reply(ws: Path, args, *, core=None) -> int:
         return _emit({"status": "not_a_card_reply"}, 1)
     try:
         headers, said, _, why = gate(ws, text, core)
+        core = core if core is not None else _core(ws)
     except Exception as e:  # noqa: BLE001
         return _emit({"status": "refused", "why": f"{type(e).__name__}: {e}"}, 2)
-    if why:
-        return _emit({"status": "refused", "why": why}, 2)
+    ignored = why or ac.answered_card(headers, said, str(core.get("owner_mxid") or ""), ws)
+    if ignored:
+        return _emit({"status": "not_a_card_reply", "why": ignored}, 1)
     handlers: dict = {"connections": lambda: _connections_reply(ws, said),
                       "workers": lambda: _workers_reply(ws, said),
                       "apps": lambda: _apps_reply(ws, said, headers)}
-    if said.kind not in handlers:
-        return _emit({"status": "refused", "why": f"a {said.kind} card has no actions"}, 2)
     try:
-        out = handlers[said.kind]()
+        out = handlers.get(said.kind, lambda: {"status": "refused", "why": f"a {said.kind} card has no actions"})()
     except Exception as e:  # noqa: BLE001 — each unit's refusal is reported in its own words
         out = {"status": "failed", "why": f"{type(e).__name__}: {e}"}
-    code = {"refused": 2, "failed": 1, "needs_confirm": 1}.get(out["status"], 0)
+    code = {"refused": 2, "failed": 1}.get(out["status"], 0)
     return _emit(out, code)
 
 

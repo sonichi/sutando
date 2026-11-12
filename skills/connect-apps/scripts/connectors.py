@@ -1533,8 +1533,6 @@ def cmd_reauth(
     once the app is connected again) and print the Signed out card to post in the owner's DM."""
     args.private, args.switch, args.line = False, False, []
     a = wait_args(args)
-    if len(a["slugs"]) != 1:
-        raise Setup("invalid_arguments", "reauth takes exactly one app")
     slug = a["slugs"][0]
     task_owner = origin_owner(ws, a["task"])
     if a["owner"] is None:
