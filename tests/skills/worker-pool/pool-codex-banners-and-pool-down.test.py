@@ -118,6 +118,22 @@ class CodexBanners(unittest.TestCase):
         self.assertIsNone(cb.live_banner(None))
         self.assertIsNone(cb.live_banner(""))
 
+    def test_only_the_cells_own_frame_counts(self):
+        self.assertIsNone(cb.live_banner(f"› do it\n\n  ■ {LIMITS['pro']}\n\n{IDLE}"), "an indented marker")
+        assistant = f"› do it\n\n• Here is what the log says:\n\n■ {LIMITS['pro']}\n\n{IDLE}"
+        self.assertIsNone(cb.live_banner(assistant), "an assistant's line starting with the marker")
+        pasted = f"› do it\n\n• Ran cat codex.log\n  └ 3 lines\n■ {LIMITS['pro']}\n\n{IDLE}"
+        self.assertIsNone(cb.live_banner(pasted), "a log a tool printed")
+        self.assertIsNone(cb.live_banner(f"› do it\n\n■ {LIMITS['pro']}\n{IDLE}"), "no blank line above the composer")
+        spinner = f"› do it\n\n■ {LIMITS['pro']}\n  ◦ Working (3s • esc to interrupt) try again at 9:00 PM\n\n{IDLE}"
+        self.assertIsNone(cb.live_banner(spinner), "a spinner under the cell is never read into it")
+        self.assertEqual(cb.live_banner(f"■ {LIMITS['pro']}\n\n{IDLE}").cause, cb.USAGE_LIMIT,
+                         "the top of the capture may be the cell")
+        self.assertIsNone(cb.live_banner(f"› do it\n\n    ■ {LIMITS['pro']}\n\n{IDLE}"), "a marker indented further")
+        self.assertIsNone(cb.live_banner(f"› do it\n\n■ {LIMITS['pro']}\n  and more\n{IDLE}"),
+                          "the cell's own lines run into the composer")
+        self.assertIsNone(cb.live_banner(f"› do it\n■ {LIMITS['pro']}\n\n{IDLE}"), "no blank line above the cell")
+
     def test_a_draft_in_the_composer_does_not_hide_the_limit(self):
         draft = f"\x1b[1m»\x1b[0m half typed\n\n{FOOT}\n"
         self.assertEqual(cb.live_banner(pane(LIMITS["pro"], composer=draft)).cause, cb.USAGE_LIMIT)
@@ -138,26 +154,61 @@ class SupervisionReading(unittest.TestCase):
         self.assertEqual(pl.reset_at(LIMITS["pro"], now), datetime(2026, 11, 12, 15, 5).timestamp())
         self.assertEqual(pl.reset_at(LIMITS["plus"], now), datetime(2026, 11, 13, 9, 12).timestamp())
         self.assertEqual(pl.reset("resets 9pm", now).banner, "9pm", "Claude's form is unchanged")
+        self.assertEqual(pl.reset_at("Rate limit reached; try again in 20s.", now), now + 20)
+        self.assertEqual(pl.reset_at("try again in 1.5 seconds", now), now + 1.5)
+        self.assertEqual(pl.reset_at("try again in 250ms", now), now + 0.25)
+
+    def test_a_codex_limit_keeps_the_watcher_and_delivery_checks(self):
+        def run(limit_waits):
+            st, t, seen = ps.SupervisionState(), 1000.0, []
+            for _ in range(8):
+                o = ps.Observation(beat=ps.LIVE, session_alive=True, watcher_beat=ps.ABSENT, watcher_held=False, work_outstanding=True,
+                                   pane=ps.PANE_LIMIT, pane_id="same", limit_waits=limit_waits)
+                st, d = ps.evaluate(st, {"w": o}, t)
+                seen.append(d["w"])
+                t += 300.0
+            return seen, st.workers["w"]
+        claude, claude_ev = run(True)
+        codex, codex_ev = run(False)
+        self.assertIsNone(claude_ev.watcher_first_detected_at, "a Claude seat waits on its limit, checks held")
+        self.assertNotIn(ps.CARD_HUMAN, claude)
+        self.assertIsNotNone(codex_ev.watcher_first_detected_at, "a Codex seat's dead watcher is still seen")
+        self.assertIn(ps.CARD_HUMAN, codex, "and the seat that owes work is carded")
 
 
 class AccountLabels(unittest.TestCase):
-    def test_claude_label_is_name_and_plan_never_the_email(self):
+    def test_claude_label_is_fixed_wording_never_a_name_or_an_email(self):
         with tempfile.TemporaryDirectory() as d:
-            (Path(d) / ".claude.json").write_text(json.dumps({"oauthAccount": {
-                "displayName": "Ana a@b.co", "planDisplayName": "Claude Max", "emailAddress": "a@b.co",
-                "accountUuid": "u"}}))
-            self.assertEqual(clh.account_label(d), "Ana · Claude Max")
-            (Path(d) / ".claude.json").write_text(json.dumps({"oauthAccount": {"emailAddress": "a@b.co"}}))
-            self.assertIsNone(clh.account_label(d), "an email alone is no label")
+            def label(**acct):
+                (Path(d) / ".claude.json").write_text(json.dumps({"oauthAccount": acct}))
+                return clh.account_label(d)
+            self.assertEqual(label(displayName="Ana a@b.co", planDisplayName="Claude Max", emailAddress="a@b.co",
+                                   accountUuid="u"), "Claude Max")
+            self.assertEqual(label(planDisplayName="Claude Max for a@b.co", accountUuid="u"), "Claude account")
+            self.assertEqual(label(planDisplayName="sk-ant-***", accountUuid="u"), "Claude account")
+            self.assertEqual(label(accountUuid="u"), "Claude account")
+            self.assertIsNone(label(emailAddress="a@b.co"), "signed in to nothing")
         self.assertIsNone(clh.account_label("/no/such/dir"))
         self.assertIsNone(clh.account_label(None))
 
-    def test_codex_label_from_login_status(self):
+    def test_codex_label_is_fixed_wording_never_the_tools_text(self):
         def status(out):
             return lambda argv, **kw: subprocess.CompletedProcess(argv, 0, out, "")
-        self.assertEqual(wc.codex_account_label(status("Logged in using ChatGPT\n")), "ChatGPT login")
-        self.assertEqual(wc.codex_account_label(status("Logged in using ChatGPT (a@b.co)\n")), "ChatGPT (a@b.co) login"
-                         .replace(" (a@b.co)", ""), "an email word is dropped")
+        # `codex login status`'s own lines (codex-cli 0.160.1 binary strings), and a masked key after one.
+        for line, want in (("Logged in using ChatGPT", "ChatGPT account"),
+                           ("Logged in using an API key - sk-proj-***ABCDE", "API key"),
+                           ("Logged in using Amazon Bedrock API key", "Amazon Bedrock"),
+                           ("Logged in using Amazon Bedrock AWS access keys", "Amazon Bedrock"),
+                           ("Logged in using personal access token", "access token"),
+                           ("Logged in using access token", "access token"),
+                           ("Logged in using workload identity", "workload identity"),
+                           ("Logged in using something new ***SECRET", "unknown")):
+            with self.subTest(line):
+                got = wc.codex_account_label(status(line + "\n"))
+                self.assertEqual(got, want)
+                self.assertNotIn("***", got)
+        for fuzz in ("Logged in using an API key - ***ABCDE", "Logged in using ***ABCDE", "Logged in using an API key ABCDE"):
+            self.assertIn(wc.codex_account_label(status(fuzz)), ("API key", "unknown"))
         self.assertIsNone(wc.codex_account_label(status("Not logged in\n")))
 
         def gone(argv, **kw):
@@ -176,7 +227,7 @@ class PoolDown(unittest.TestCase):
         (self.ws / "state" / "roster.json").write_text(json.dumps({"workers": {
             w: {"state": "live", "label": n, "runtime": r} for w, (n, r) in self.SEATS.items()}}))
         self.label = patch.object(wc, "_account_label", side_effect=lambda runtime, runner:
-                                  "Ana · Claude Max" if runtime == "claude" else "ChatGPT login")
+                                  "Claude Max" if runtime == "claude" else "ChatGPT account")
         self.label.start()
         self.addCleanup(self.label.stop)
 
@@ -197,7 +248,7 @@ class PoolDown(unittest.TestCase):
         self.assertEqual((g["id"], g["cause"], g["runtime"]), ("pool-down:mac:claude-usage-limit", "usage-limit", "claude"))
         self.assertEqual(g["workers"], ["Baxter", "Mars"])
         self.assertEqual(g["reset_at"], 1500.0, "the earliest reset")
-        self.assertEqual(g["account_label"], "Ana · Claude Max")
+        self.assertEqual(g["account_label"], "Claude Max")
         self.assertIn("/login", g["remedy"])
         self.assertNotIn("@", json.dumps(g))
 
@@ -232,33 +283,52 @@ class PoolDown(unittest.TestCase):
         got = wc.pool_down(self.ws, self.obs(**{c: {"pane": ps.PANE_LOGGED_OUT}, f: {"pane": ps.PANE_LOGGED_OUT}}),
                            host="mac")
         self.assertEqual([(g["id"], g["account_label"]) for g in got],
-                         [("pool-down:mac:codex-signed-out", "ChatGPT login")])
+                         [("pool-down:mac:codex-signed-out", "ChatGPT account")])
         self.assertIn("codex login", got[0]["remedy"])
         self.assertIsNone(got[0]["reset_at"])
+
+    def test_the_card_waits_two_sweeps_and_a_flapping_seat_moves_nothing(self):
+        a, b, _ = list(self.SEATS)
+        m = HitlManager(HitlStore(self.ws / "state" / "hitl" / "requirements"))
+        down = self.obs(**{a: {"pane": ps.PANE_LIMIT}, b: {"pane": ps.PANE_LIMIT}})
+        once = wc.raise_pool_down(self.ws, wc.pool_down(self.ws, down, host="mac"), manager=m)
+        self.assertEqual(once["raised"], [], "one sweep down is not yet a down pool")
+        for state in (down, self.obs(), down, self.obs(), down, self.obs(), down, self.obs(), down, self.obs(), down):
+            wc.raise_pool_down(self.ws, wc.pool_down(self.ws, state, host="mac"), manager=m)
+        pool_cards = [r for r in m.store.all() if (r.subject or {}).get("wedge") == wc.POOL_DOWN]
+        self.assertLessEqual(len(pool_cards), 1, "eleven flapping sweeps give at most one card")
 
     def test_one_card_per_down_pool_resolved_when_it_works_again(self):
         a, b, _ = list(self.SEATS)
         m = HitlManager(HitlStore(self.ws / "state" / "hitl" / "requirements"))
         down = self.obs(**{a: {"pane": ps.PANE_LIMIT}, b: {"pane": ps.PANE_LIMIT}})
+        wc.raise_pool_down(self.ws, wc.pool_down(self.ws, down, host="mac"), manager=m)
         first = wc.raise_pool_down(self.ws, wc.pool_down(self.ws, down, host="mac"), manager=m)
-        self.assertEqual(len(first["raised"]), 1)
+        self.assertEqual(len(first["raised"]), 1, "raised on the second sweep down")
         card = m.get(first["raised"][0])
         self.assertIn("All 2 Claude workers on mac are stopped", card.message)
         self.assertEqual(card.subject["pool_down"]["id"], "pool-down:mac:claude-usage-limit")
         again = wc.raise_pool_down(self.ws, wc.pool_down(self.ws, down, host="mac"), manager=m)
-        self.assertEqual(again, {"raised": [], "closed": []}, "the same pool down raises nothing new")
+        self.assertEqual(again, {"raised": [], "updated": [], "closed": []}, "the same pool down changes nothing")
         e = "e" * 32
         self.SEATS = dict(self.SEATS, **{e: ("Rams", "claude")})
         (self.ws / "state" / "roster.json").write_text(json.dumps({"workers": {
             w: {"state": "live", "label": n, "runtime": r} for w, (n, r) in self.SEATS.items()}}))
         grown = self.obs(**{a: {"pane": ps.PANE_LIMIT}, b: {"pane": ps.PANE_LIMIT}, e: {"pane": ps.PANE_LIMIT}})
+        revision = m.get(first["raised"][0]).revision
         moved = wc.raise_pool_down(self.ws, wc.pool_down(self.ws, grown, host="mac"), manager=m)
-        self.assertEqual((len(moved["raised"]), moved["closed"]), (1, first["raised"]), "a new set of seats is a new card")
+        self.assertEqual((moved["raised"], moved["updated"], moved["closed"]), ([], first["raised"], []),
+                         "a new set of seats updates the same card")
+        card = m.get(first["raised"][0])
+        self.assertIn("All 3 Claude workers", card.message)
+        self.assertGreater(card.revision, revision, "re-projected to the owner")
         one = self.obs(**{a: {"pane": ps.PANE_LIMIT}, b: {"paused": True}, e: {"paused": True}})
         alone = wc.raise_pool_down(self.ws, wc.pool_down(self.ws, one, host="mac"), manager=m)
-        self.assertEqual((alone["raised"], alone["closed"]), ([], moved["raised"]), "one seat left: its own card")
+        self.assertEqual(alone["closed"], [], "one sweep up closes nothing yet")
+        alone = wc.raise_pool_down(self.ws, wc.pool_down(self.ws, one, host="mac"), manager=m)
+        self.assertEqual(alone["closed"], first["raised"], "two sweeps without a down pool close it")
         back = wc.raise_pool_down(self.ws, wc.pool_down(self.ws, self.obs(), host="mac"), manager=m)
-        self.assertEqual(back, {"raised": [], "closed": []})
+        self.assertEqual(back, {"raised": [], "updated": [], "closed": []})
         self.assertEqual([r for r in m.active() if (r.subject or {}).get("wedge") == wc.POOL_DOWN], [])
 
 

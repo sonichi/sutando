@@ -15,8 +15,16 @@ class Reset(NamedTuple):
     banner: str
 
 
+# A server's "try again in 20s" / "in 1.5 seconds" (the Codex binary parses the same words).
+_RETRY_IN = re.compile(r"try again in\s*(\d+(?:\.\d+)?)\s*(ms|s|seconds?)\b", re.I)
+
+
 def reset(text, now):
     """The banner's reset words and their time (None when unparsed); None without a banner."""
+    found_in = list(_RETRY_IN.finditer(text))
+    if found_in:
+        n, unit = float(found_in[-1].group(1)), found_in[-1].group(2).lower()
+        return Reset(now + (n / 1000 if unit == "ms" else n), found_in[-1].group(0))
     # Claude: "resets 9pm", "Continuing automatically at …"; Codex: "… or try again at 3:05 PM."
     matches = list(re.finditer(r"(?:resets?|continuing automatically|try again)\s+(?:at\s+)?([^\n]+)", text, re.I))
     if not matches:

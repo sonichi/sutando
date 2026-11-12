@@ -346,6 +346,7 @@ def observe(workspace, now: float, *, worker_ids=None,
             limit_banner=reset.banner if reset else None,
             delivery_block=blocks.get(socket) if socket else None,
             limit_parked=parked,
+            limit_waits=(row.get("runtime") or "claude") == "claude",
             launch_account=launch_account(workspace, wid) if parked else None,
         )
     return obs

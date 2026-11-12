@@ -40,32 +40,42 @@ class Banner:
     reset_words: Optional[str] = None   # "3:05 PM" from "try again at 3:05 PM", else None
 
 
+_PROMPT = re.compile(r"^[›»](?:\s|$)")  # a prompt row the user sent: where a refused turn's cell hangs
+_ROW_GLYPH = re.compile(r"^\s*[◦•✔✗└├│⠀-⣿✻✶✳✢·]")  # a spinner, bullet or tool row, never a cell's own line
+
+
 def live_banner(capture: Optional[str]) -> Optional[Banner]:
-    """The Codex error cell the seat is stopped on, or None: the cell must be the last content
-    above the composer (its continuation lines, indented, belong to it), and match one of the
-    CLI's own messages."""
+    """The Codex error cell the seat is stopped on, or None. Only the frame the CLI draws counts:
+    the composer last; one blank line above it; the cell, its "■ " row at column 0 and any lines
+    of its own indented two spaces (never a spinner, bullet or tool row); one blank line above
+    the cell; and above that the user's prompt it answered (or the top of the capture). A "■"
+    quoted in a log, a message or an assistant's text is not in that frame."""
     if not capture:
         return None
     lines = [_SGR.sub("", ln).rstrip() for ln in capture.splitlines()]
-    end = len(lines)
-    for i in range(len(lines) - 1, -1, -1):  # the composer: the last row it is drawn on
-        if _COMPOSER.match(lines[i]):
-            end = i
-            break
-    else:
+    composer = next((i for i in range(len(lines) - 1, -1, -1) if _COMPOSER.match(lines[i])), None)
+    if composer is None or composer < 2 or lines[composer - 1].strip():
         return None
-    body = [ln for ln in lines[:end] if ln.strip()]
-    # Walk up from the composer over the cell's indented continuation lines to its "■" row.
-    for j in range(len(body) - 1, -1, -1):
-        cell = _CELL.match(body[j])
-        if cell:
-            tail = [ln.strip() for ln in body[j + 1:]]  # only its own indented lines (below)
-            text = " ".join([cell["text"].strip(), *tail]).strip()
-            for cause, pattern in _PATTERNS:
-                if pattern.search(text):
-                    found = _RETRY_AT.search(text) if cause == USAGE_LIMIT else None
-                    return Banner(cause, text, found["when"].strip() if found else None)
+    i = composer - 2
+    own = []
+    while i >= 0 and lines[i].startswith("  ") and not lines[i].startswith("   ") \
+            and lines[i].strip() and not _ROW_GLYPH.match(lines[i]):
+        own.insert(0, lines[i].strip())
+        i -= 1
+    cell = _CELL.match(lines[i]) if i >= 0 else None
+    if cell is None:
+        return None
+    if i > 0:
+        if lines[i - 1].strip():
             return None
-        if not body[j].startswith(" ") or _FOOTER.match(body[j]):
-            return None  # the last content above the composer is not an error cell
+        j = i - 2
+        while j >= 0 and lines[j].startswith("  ") and lines[j].strip() and not _ROW_GLYPH.match(lines[j]):
+            j -= 1
+        if j >= 0 and not _PROMPT.match(lines[j]):
+            return None  # it answers an assistant's or a tool's line, not the prompt: quoted text
+    text = " ".join([cell["text"].strip(), *own]).strip()
+    for cause, pattern in _PATTERNS:
+        if pattern.search(text):
+            found = _RETRY_AT.search(text) if cause == USAGE_LIMIT else None
+            return Banner(cause, text, found["when"].strip() if found else None)
     return None

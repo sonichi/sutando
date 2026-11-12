@@ -16,6 +16,8 @@ a card instead, through the engine's hitl store:
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import re
 import subprocess
 import time
@@ -292,16 +294,31 @@ def _seat_cause(o: dict) -> str | None:
     return None
 
 
+# `codex login status`'s own lines (codex-cli 0.160.1), each to fixed wording. None of the tool's
+# text is passed on: "Logged in using an API key - " is followed by the masked key itself.
+_CODEX_LOGINS = (
+    ("Logged in using ChatGPT", "ChatGPT account"),
+    ("Logged in using an API key", "API key"),
+    ("Logged in using Amazon Bedrock API key", "Amazon Bedrock"),
+    ("Logged in using Amazon Bedrock AWS access keys", "Amazon Bedrock"),
+    ("Logged in using personal access token", "access token"),
+    ("Logged in using access token", "access token"),
+    ("Logged in using workload identity", "workload identity"),
+)
+
+
 def codex_account_label(runner=subprocess.run) -> str | None:
-    """How Codex is signed in ("Logged in using ChatGPT" -> "ChatGPT login"), from `codex login
-    status`, which prints no secret; never auth.json. None when it cannot be read."""
+    """How Codex is signed in, in fixed wording only ("ChatGPT account", "API key", …, else
+    "unknown"), from `codex login status`; never auth.json. None when it cannot be read."""
     try:
         done = runner(["codex", "login", "status"], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    m = re.search(r"Logged in using (.+)", (done.stdout or "") + (done.stderr or ""))
-    words = [w for w in (m.group(1).split() if m else []) if "@" not in w]
-    return f"{' '.join(words)[:40]} login" if words else None
+    text = (done.stdout or "") + (done.stderr or "")
+    if "Logged in using" not in text:
+        return None
+    return next((label for line, label in _CODEX_LOGINS
+                 if any(ln.strip().startswith(line) for ln in text.splitlines())), "unknown")
 
 
 def _account_label(runtime: str, runner) -> str | None:
@@ -350,38 +367,76 @@ def pool_down(workspace, observations: dict, *, host: str | None = None, runner=
     return out
 
 
+POOL_DOWN_HOLD = 2  # sweeps a pool must read down (or working again) before its card changes
+
+
+def _pool_down_path(workspace) -> Path:
+    return Path(workspace) / "state" / "pool-down.json"
+
+
+def _pool_body(g: dict) -> str:
+    n = len(g["workers"])
+    what = "hit its usage limit" if g["cause"] == codex_banners.USAGE_LIMIT else "is signed out"
+    when = (f" It resets at {time.strftime('%-I:%M %p on %b %-d', time.localtime(g['reset_at']))}."
+            if g.get("reset_at") else "")
+    acct = f" ({g['account_label']})" if g.get("account_label") else ""
+    return (f"All {n} {g['runtime'].capitalize()} worker{'s' if n != 1 else ''} on {g['host']} are stopped: "
+            f"the account{acct} {what}.{when}\nWorkers: {', '.join(g['workers'])}.\n{g['remedy']}")
+
+
 def raise_pool_down(workspace, groups: list, *, manager=None) -> dict:
-    """One card per down pool, through the same hitl store as the seat cards; a pool that is
-    working again, or whose set of seats changed, has its old card resolved. Types nothing."""
+    """One card per down pool, keyed on its host, runtime and cause, through the same hitl store as
+    the seat cards. A pool is carded only once it has read down for POOL_DOWN_HOLD sweeps, and its
+    card resolved only once it has read working that long, so one seat flapping moves nothing; a
+    change in its seats or reset updates the card in place. Types nothing."""
     from hitl.cards import choice_request
     manager = manager or manager_for(workspace)
-    want = {}
-    for g in groups:
-        n = len(g["workers"])
-        what = "hit its usage limit" if g["cause"] == codex_banners.USAGE_LIMIT else "is signed out"
-        when = (f" It resets at {time.strftime('%-I:%M %p on %b %-d', time.localtime(g['reset_at']))}."
-                if g.get("reset_at") else "")
-        acct = f" ({g['account_label']})" if g.get("account_label") else ""
-        body = (f"All {n} {g['runtime'].capitalize()} worker{'s' if n != 1 else ''} on {g['host']} are stopped: "
-                f"the account{acct} {what}.{when}\nWorkers: {', '.join(g['workers'])}.\n{g['remedy']}")
-        guard = f"{g['id']}:{'+'.join(g['worker_ids'])}"
-        # The remedy is the owner's, at the Mac: the one action opens the core's terminal for it.
-        want[guard] = choice_request(
-            body, [_jump(cw.DEFAULT_SESSION)], guard, {"source": SOURCE, "wedge": POOL_DOWN, "pool_down": g},
-            runtime=g["runtime"], title=f"{g['runtime'].capitalize()} workers stopped · {g['cause']}",
-            device={"id": cw.DEFAULT_SESSION, "name": "Sutando"}, kind="core-blocked", turn_on_action=False)
-    raised, closed = [], []
-    for r in manager.active():
-        subj = r.subject or {}
-        if subj.get("source") == SOURCE and subj.get("wedge") == POOL_DOWN:
-            if r.guard in want:
-                want.pop(r.guard)  # already raised for this same set of seats
-            else:
-                manager.resolve(r.id)
-                closed.append(r.id)
-    for req in want.values():
-        raised.append(manager.create(req).id)
-    return {"raised": raised, "closed": closed}
+    path = _pool_down_path(workspace)
+    try:
+        seen = json.loads(path.read_text(encoding="utf-8"))
+        seen = seen if isinstance(seen, dict) else {}
+    except (OSError, ValueError):
+        seen = {}
+    now_down = {g["id"]: g for g in groups}
+    for gid in set(seen) | set(now_down):
+        count = seen.get(gid, {"down": 0, "up": 0})
+        seen[gid] = ({"down": count.get("down", 0) + 1, "up": 0} if gid in now_down
+                     else {"down": 0, "up": count.get("up", 0) + 1})
+    active = {(r.subject or {}).get("pool_down", {}).get("id"): r for r in manager.active()
+              if (r.subject or {}).get("source") == SOURCE and (r.subject or {}).get("wedge") == POOL_DOWN}
+    raised, updated, closed = [], [], []
+    for gid, g in now_down.items():
+        card = active.get(gid)
+        subject = {"source": SOURCE, "wedge": POOL_DOWN, "pool_down": g}
+        if card is not None:
+            if (card.subject or {}).get("pool_down") != g:
+                with manager.store.locked():
+                    cur = manager.get(card.id)
+                    if cur is not None and not cur.terminal:
+                        cur.message, cur.subject = _pool_body(g), subject
+                        cur.revision += 1  # re-projected: the owner's card shows the seats now
+                        cur.updated_at = time.time()
+                        manager.store.save(cur)
+                        updated.append(cur.id)
+        elif seen[gid]["down"] >= POOL_DOWN_HOLD:
+            # The remedy is the owner's, at the Mac: the one action opens the core's terminal for it.
+            raised.append(manager.create(choice_request(
+                _pool_body(g), [_jump(cw.DEFAULT_SESSION)], gid, subject, runtime=g["runtime"],
+                title=f"{g['runtime'].capitalize()} workers stopped · {g['cause']}",
+                device={"id": cw.DEFAULT_SESSION, "name": "Sutando"}, kind="core-blocked",
+                turn_on_action=False)).id)
+    for gid, card in active.items():
+        if gid not in now_down and seen.get(gid, {}).get("up", 0) >= POOL_DOWN_HOLD:
+            manager.resolve(card.id)
+            closed.append(card.id)
+    # Remembered while the pool is down or its card is still up; forgotten once it is closed.
+    keep = {gid: c for gid, c in seen.items()
+            if gid in now_down or (gid in active and active[gid].id not in closed)}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(keep), encoding="utf-8")
+    os.replace(tmp, path)
+    return {"raised": raised, "updated": updated, "closed": closed}
 
 
 def _note(manager, req_id, **fields):

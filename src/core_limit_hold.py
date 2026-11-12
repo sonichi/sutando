@@ -380,22 +380,19 @@ def _launch_config_dir() -> Optional[str]:
 
 
 def account_label(config_dir: Optional[str]) -> Optional[str]:
-    """A label the owner recognises their account by ("Qingyun · Claude Max"), else None: the
-    display name and the plan, never the email address; any word with an "@" in it is dropped."""
+    """How the owner tells this account apart, in fixed wording only: its plan as Anthropic names it
+    ("Claude Max"), else "Claude account"; None when the CLI is signed in to nothing. Nothing the
+    owner typed (the display name) or that identifies them (the email) is ever part of it."""
     if not config_dir:
         return None
     try:
         acct = json.loads((Path(config_dir) / ".claude.json").read_text(encoding="utf-8")).get("oauthAccount")
     except (OSError, ValueError, AttributeError):
         return None
-    if not isinstance(acct, dict):
+    if not isinstance(acct, dict) or not acct.get("accountUuid"):
         return None
-    parts = []
-    for key in ("displayName", "planDisplayName"):
-        words = [w for w in str(acct.get(key) or "").split() if "@" not in w]
-        if words:
-            parts.append(" ".join(words)[:60])
-    return " · ".join(parts) or None
+    plan = str(acct.get("planDisplayName") or "")
+    return plan if re.fullmatch(r"Claude(?: [A-Z][A-Za-z0-9]{1,15}){1,3}", plan) else "Claude account"
 
 
 def current_account_label() -> Optional[str]:
