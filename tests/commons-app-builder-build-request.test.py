@@ -394,6 +394,71 @@ for desc, want in [("vote on the next book", "poll"), ("a tic-tac-toe game", "tu
     check(f"pick-{want}-for-{desc[:12]}", br.pick_template(desc) == want)
 check("explicit-template-wins", br.pick_template("vote on it", "planner") == "planner")
 
+# A sign-up sheet is poll's model: one counted choice per person among fixed slots.
+for desc in ("An app for a sign-up sheet for a weekend event, morning or afternoon",
+             "signup for the potluck", "sign up for a shift", "RSVP for Friday", "the volunteer roster",
+             "pick a slot"):
+    check(f"sign-up-words-pick-poll-{desc[:14]}", br.pick_template(desc) == "poll")
+check("adaptation-names-the-template", br.pick_template("something unusual", None, "planner") == "planner")
+check("request-template-beats-the-words", br.pick_template("a sign-up sheet", "tracker") == "tracker")
+check("request-and-adaptation-agreeing-is-fine", br.pick_template("x", "poll", "poll") == "poll")
+for args, words in ((("x", None, "kanban"), "the adaptation names template 'kanban'"),
+                    (("x", "kanban", None), "the request names template 'kanban'"),
+                    (("x", "poll", "planner"), "the request asks for template poll, the adaptation for planner")):
+    try:
+        br.pick_template(*args)
+        check(f"refused-{words[:24]}", False)
+    except br.ActionFailed as error:
+        check(f"refused-{words[:24]}", words in str(error))
+
+
+def added_columns(room):
+    return [a["property"]["name"] for act, a in room.calls
+            if act == "room.commons.databases.mutate" and a.get("op") == "prop_add"]
+
+
+# The agent's adaptation picks the template a keyword-less request would miss.
+room = FakeRoom()
+_, rep = reply_of(run(room, task(description="something for the weekend", template=None),
+                      {"app_name": "Weekend", "template": "poll"}))
+check("adapted-template-is-built", rep["status"] == "done"
+      and added_columns(room) == [p["name"] for p in br.load_template("poll")[1]["databases"][0]["props"]])
+
+# A page written against other columns carries its own schema: those columns are added, not the template's.
+OWN = {"app": "Weekend sign-ups", "databases": [{"name": "Weekend — Signups", "role": "primary", "props": [
+    {"name": "Slot", "type": "select", "options": [{"name": "Morning"}, {"name": "Afternoon"}]},
+    {"name": "State", "type": "status", "options": [{"name": "Going", "group": "doing"},
+                                                     {"name": "Cancelled", "group": "done"}]},
+    {"name": "Created by", "type": "created_by"}], "views": [{"layout": "board", "name": "By slot", "groupBy": "Slot"}]}]}
+room = FakeRoom()
+_, rep = reply_of(run(room, task(template=None), {"app_name": "Weekend sign-ups", "template": "poll",
+                                                  "html": "<p>own page</p>", "schema": OWN}))
+check("own-schema-columns-are-added", rep["status"] == "done"
+      and added_columns(room) == ["Slot", "State", "Created by"])
+check("own-schema-page-is-written", room.pages[PAGE] == "<p>own page</p>")
+slot = next(a["property"] for act, a in room.calls if act == "room.commons.databases.mutate"
+            and a.get("op") == "prop_add" and a["property"]["name"] == "Slot")
+check("own-schema-options-are-sent", [o["name"] for o in slot["options"]] == ["Morning", "Afternoon"])
+
+# The panel's own database keeps what it has: only the missing columns are added to it.
+room = FakeRoom(databases={"d7k2m9x1": {"name": "Untitled", "properties": ["Name", "Slot"], "views": []}})
+_, rep = reply_of(run(room, task(database="d7k2m9x1", template=None),
+                      {"template": "poll", "html": "<p>own</p>", "schema": OWN}))
+check("panel-database-gets-only-the-missing-columns", rep["status"] == "done"
+      and added_columns(room) == ["State", "Created by"] and rep.get("database") == "d7k2m9x1")
+check("panel-database-only-no-second-database",
+      not any(act == "room.commons.pages.create" for act, _ in room.calls))
+
+for bad, words in (({"schema": OWN}, "needs its own page"),
+                   ({"html": "<p>x</p>", "schema": {"databases": []}}, "exactly one primary database"),
+                   ({"html": "<p>x</p>", "schema": {"databases": [{"name": "D", "role": "primary",
+                                                                    "props": [{"name": "A"}]}]}},
+                    "needs a name and a type")):
+    room = FakeRoom()
+    _, rep = reply_of(run(room, task(template="poll"), bad))
+    check(f"bad-schema-{words[:16]}", rep["status"] == "failed" and words in rep["reason"]
+          and not any(act.endswith(("replace", "create", "mutate")) for act, _ in room.calls))
+
 # --------------------------------------------------------------------------- every template builds
 for name in br.TEMPLATES:
     room = FakeRoom()
@@ -460,6 +525,22 @@ with tempfile.TemporaryDirectory() as tmp:
           and not any(s["action"] == "room.commons.databases.mutate" for s in steps))
     code, out = cli("plan", str(tmp / "refine.txt"), "--ledger", led)
     check("cli-plan-refine-needs-the-page", code == 1 and "refine needs the edited page" in out)
+    # A homeserver the MCP host does not reach: each step as room-commons' `action` command.
+    (tmp / "build2.txt").write_text(task(template="poll", request_id="12121212-3434-4565-8787-909090909090"),
+                                    encoding="utf-8")
+    code, out = cli("plan", str(tmp / "build2.txt"), "--route", "cli", "--ledger", led)
+    steps = json.loads(out)
+    check("cli-route-every-step-is-an-action-command", code == 0 and all(
+        st["cli"][:3] == ["action", "account" if st.get("target_kind") == "account" else st["room_id"], st["action"]]
+        and json.loads(st["cli"][4]) == st["arguments"] for st in steps))
+    check("cli-route-reads-are-reads", all(("--read" in st["cli"]) == bool(st.get("read")) for st in steps))
+    check("cli-route-guide-is-an-account-read", steps[0]["cli"][:2] == ["action", "account"])
+    check("cli-route-bad-value", cli("plan", str(tmp / "build2.txt"), "--route", "carrier", "--ledger", led)[0] == 2)
+    (tmp / "own.json").write_text(json.dumps({"template": "kanban"}), encoding="utf-8")
+    (tmp / "build3.txt").write_text(task(template=None, request_id="13131313-3434-4565-8787-909090909090"),
+                                    encoding="utf-8")
+    code, out = cli("plan", str(tmp / "build3.txt"), "--adapt", str(tmp / "own.json"), "--ledger", led)
+    check("cli-plan-unknown-adapted-template-fails", code == 1 and "template 'kanban'" in out)
     code, out = cli("chunks", str(tmp / "page.html"))
     sizes = [int(n) for n in out.split()]
     check("cli-chunks", code == 0 and len(sizes) == 3 and max(sizes) <= ROOM_LIMIT)

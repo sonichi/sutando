@@ -56,7 +56,10 @@ connected accounts or private context, only what the description asks for.
   `room.action.read`, `room.action.execute`). The `ag2-space-mcp` skill maps them and
   registers the connector when none is present. The `room-commons` skill's CLI offers the same
   operations where it is installed (`--kind db create`, `page-add`, `--kind html-<id> append`,
-  `app create`, `app scaffold`). Use one route per build, not both.
+  `app create`, `app scaffold`, `prop-add` for a column on an existing database), and its
+  `action` command runs any Action on the deployment its lane reaches: the route on a homeserver
+  the MCP host does not reach (BUILD_REQUEST.md, "Where to run them"). Use one route per build,
+  not both.
 - **Static pre-flight.** Before you publish, run:
 
   ```bash

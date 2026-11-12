@@ -263,18 +263,32 @@ class _FileLock:
 
 # --------------------------------------------------------------------------- the template
 
+class ActionFailed(RuntimeError):
+    """An Action refused, or the build cannot be planned; its message becomes the reason."""
+
+
 _PICK = (
     ("turn-game", r"\b(game|tic[- ]?tac|turn|board game|gomoku|checkers|chess|connect four)\b"),
-    ("poll", r"\b(poll|vote|voting|survey|choose|pick (one|a)|preference|which (day|option))\b"),
+    # A sign-up sheet is one choice per person among fixed slots: poll's model (templates/README.md).
+    ("poll", r"\b(poll|vote|voting|survey|choose|pick (one|a)|preference|which (day|option)"
+             r"|sign[- ]?ups?|rsvps?|roster|slots?)\b"),
     ("planner", r"\b(plan|planner|week|weekly|schedule|rota|calendar|itinerary|meal)\b"),
     ("tracker", r"\b(track|tracker|task|todo|to-do|issue|bug|request|queue|chore|status)\b"),
 )
 
 
-def pick_template(description: str, requested: Optional[str] = None) -> str:
-    """The requested template, else the first whose words the description uses, else tracker."""
-    if requested:
-        return requested
+def pick_template(description: str, requested: Optional[str] = None,
+                  adapted: Optional[str] = None) -> str:
+    """The request's template, else the one the agent's adaptation names, else the first whose
+    words the description uses, else tracker. A request and an adaptation naming two different
+    templates is refused: the panel's choice is the owner's."""
+    for value, where in ((requested, "the request"), (adapted, "the adaptation")):
+        if value is not None and value not in TEMPLATES:
+            raise ActionFailed(f"{where} names template {value!r}; it is one of " + ", ".join(TEMPLATES))
+    if requested and adapted and requested != adapted:
+        raise ActionFailed(f"the request asks for template {requested}, the adaptation for {adapted}")
+    if requested or adapted:
+        return requested or adapted
     lower = description.lower()
     for name, pattern in _PICK:
         if re.search(pattern, lower):
@@ -318,6 +332,7 @@ def adapt(page: str, schema: Dict[str, Any], adaptation: Dict[str, Any]) -> Tupl
             ]
     if adaptation.get("html"):
         return adaptation["html"], schema
+
     safe = _html_escape(app_name)
     page = re.sub(r"<title>[^<]*</title>", f"<title>{safe}</title>", page, count=1)
     page = re.sub(r"<h1>[^<]*</h1>", f"<h1>{safe}</h1>", page, count=1)
@@ -325,6 +340,40 @@ def adapt(page: str, schema: Dict[str, Any], adaptation: Dict[str, Any]) -> Tupl
     js = new_db_name.replace("\\", "\\\\").replace("'", "\\'")
     page = page.replace(f"'{old_db_name}'", f"'{js}'")
     return page, schema
+
+
+def _checked_schema(schema: Any) -> Dict[str, Any]:
+    """An adaptation's own schema: the template schema's shape, one primary database whose props
+    each have a name and a type (BUILD_REQUEST.md, adapt.json)."""
+    dbs = schema.get("databases") if isinstance(schema, dict) else None
+    primary = [d for d in dbs or [] if isinstance(d, dict) and d.get("role") == "primary"]
+    if len(primary) != 1 or not isinstance(primary[0].get("name"), str) or not primary[0]["name"].strip():
+        raise ActionFailed("the adaptation's schema needs exactly one primary database with a name")
+    for prop in primary[0].get("props") or []:
+        if not (isinstance(prop, dict) and isinstance(prop.get("name"), str) and prop["name"].strip()
+                and isinstance(prop.get("type"), str) and prop["type"]):
+            raise ActionFailed("every column in the adaptation's schema needs a name and a type")
+    return json.loads(json.dumps(schema))
+
+
+def build_inputs(request: Dict[str, Any], adaptation: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, Any]], str]:
+    """(page html, schema, app name) for this request. A refine edits the page and no database.
+    A build takes the template the request or the adaptation names (else one matching the
+    description); a page the agent wrote itself (`html`) is laid over the schema the adaptation
+    gives (`schema`), else the named template's, renamed and with its options as adapted."""
+    if request["mode"] == "refine":
+        if not adaptation.get("html"):
+            raise ActionFailed("refine needs the edited page")
+        return adaptation["html"], None, adaptation.get("app_name", "")
+    template = pick_template(request["description"], request.get("template"), adaptation.get("template"))
+    raw_page, raw_schema = load_template(template)
+    if adaptation.get("schema") is not None:
+        if not adaptation.get("html"):
+            raise ActionFailed("an adaptation's own schema needs its own page (html) written against it")
+        raw_schema = _checked_schema(adaptation["schema"])
+    page_html, schema = adapt(raw_page, raw_schema, adaptation)
+    name = (adaptation.get("app_name") or raw_schema.get("app") or "App").strip()
+    return page_html, schema, name
 
 
 # --------------------------------------------------------------------------- the writes
@@ -428,10 +477,6 @@ def plan(request: Dict[str, Any], page_html: str, schema: Optional[Dict[str, Any
 
 
 # --------------------------------------------------------------------------- run and reply
-
-class ActionFailed(RuntimeError):
-    """An Action refused; its message becomes the completion's reason."""
-
 
 def execute(steps: List[Dict[str, Any]], call: Callable[[Dict[str, Any]], Dict[str, Any]]) -> Dict[str, Any]:
     """Runs the plan through `call(step) -> result`, substituting $db and $app as they are answered.
@@ -580,15 +625,7 @@ def build(task_text: str, call: Callable[[Dict[str, Any]], Dict[str, Any]],
             return completion(request["request_id"], "failed",
                               "this request is already being built")
     try:
-        if request["mode"] == "refine":
-            if not adaptation.get("html"):
-                raise ActionFailed("refine needs the edited page")
-            page_html, schema, name = adaptation["html"], None, adaptation.get("app_name", "")
-        else:
-            template = pick_template(request["description"], request.get("template"))
-            raw_page, raw_schema = load_template(template)
-            page_html, schema = adapt(raw_page, raw_schema, adaptation)
-            name = (adaptation.get("app_name") or raw_schema.get("app") or "App").strip()
+        page_html, schema, name = build_inputs(request, adaptation)
         answers = execute(plan(request, page_html, schema, name), call)
         database = request.get("database") or answers.get("$db") or answers.get("$app_db")
         app_id = answers.get("$app") or request.get("app_id")
@@ -680,6 +717,9 @@ def main(argv: List[str]) -> int:
             print(reply)
             return 0
         adapt_path = _flag(argv, "--adapt")
+        route = _flag(argv, "--route") or "mcp"
+        if route not in ("mcp", "cli"):
+            raise SystemExit("build_request: --route is mcp or cli")
     except SystemExit as error:
         print(str(error), file=sys.stderr)
         return 2
@@ -694,16 +734,11 @@ def main(argv: List[str]) -> int:
     adaptation: Dict[str, Any] = {}
     if adapt_path:
         adaptation = json.loads(Path(adapt_path).read_text(encoding="utf-8"))
-    if request["mode"] == "refine":
-        page_html, schema, name = adaptation.get("html", ""), None, adaptation.get("app_name", "")
-        if not page_html:
-            print(completion(request["request_id"], "failed", "refine needs the edited page"))
-            return 1
-    else:
-        template = pick_template(request["description"], request.get("template"))
-        raw_page, raw_schema = load_template(template)
-        page_html, schema = adapt(raw_page, raw_schema, adaptation)
-        name = (adaptation.get("app_name") or raw_schema.get("app") or "App").strip()
+    try:
+        page_html, schema, name = build_inputs(request, adaptation)
+    except ActionFailed as error:
+        print(completion(request["request_id"], "failed", str(error)))
+        return 1
     state, recorded = ledger().claim(request["room_id"], request["request_id"])
     if state == "done":
         print(recorded)
@@ -711,8 +746,21 @@ def main(argv: List[str]) -> int:
     if state == "busy":
         print("build_request: another run is building this request", file=sys.stderr)
         return 4
-    print(json.dumps(plan(request, page_html, schema, name), indent=2, ensure_ascii=False))
+    steps = plan(request, page_html, schema, name)
+    if route == "cli":
+        steps = [dict(step, cli=cli_argv(step)) for step in steps]
+    print(json.dumps(steps, indent=2, ensure_ascii=False))
     return 0
+
+
+def cli_argv(step: Dict[str, Any]) -> List[str]:
+    """The step as room-commons' `action` command (room_commons.py action …): the same Action on
+    the deployment the CLI's lane reaches, its result printed in the shape `check` reads. `$db`
+    and `$app` stay placeholders, filled from the answers `check` prints, as for an MCP host."""
+    target = "account" if step.get("target_kind") == "account" else step["room_id"]
+    argv = ["action", target, step["action"], "--args",
+            json.dumps(step["arguments"], ensure_ascii=False, separators=(",", ":"))]
+    return argv + (["--read"] if step.get("read") else [])
 
 
 if __name__ == "__main__":

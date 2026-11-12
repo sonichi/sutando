@@ -114,9 +114,22 @@ blocking after 30 minutes, so a crashed run does not wedge the request. Claims a
 lock per room, so two runs of one request cannot both proceed.
 
 `adapt.json` holds `app_name`, `database_name`, `options` (`{"<column>": ["<option>", …]}`) and,
-for a refine or a heavier edit, the whole page as `html`. `plan` prints the Actions in order;
-`$db` and `$app` stand for the ids earlier steps answer. Run them through the s.space MCP in that
+for a refine or a heavier edit, the whole page as `html`. For a build it may also name the
+`template` (one of the four; when the request names one too they must agree, and an unknown name
+is refused), and, with an `html` page written against other columns, that page's own `schema` in
+the templates' `schema.json` shape (one primary database whose columns each have a name and a
+type). Without `schema`, an `html` page is laid over the named template's columns. `plan` prints
+the Actions in order; `$db` and `$app` stand for the ids earlier steps answer. Run them in that
 order, and run `scripts/check_page.py` on the page before writing it.
+
+**Where to run them.** Through the s.space MCP when it reaches the room's homeserver. On one it
+does not reach (it answers `unknown ag2_lane …`, e.g. dev.s.space), `plan --route cli` adds to
+each step a `cli` argv for the `room-commons` skill's `action` command
+(`python3 <room-commons>/scripts/room_commons.py <cli…>`), which runs the same Action as this agent
+on the deployment the CLI's lane reaches and prints its result in the shape `check` reads. Replace
+`$db` / `$app` in the argv with the answers `check` prints, exactly as for an MCP host. Columns
+then go into the database the panel sent (`prop_add` through `databases.mutate`), never a second
+one. Use one route per build.
 
 ## The reply
 
