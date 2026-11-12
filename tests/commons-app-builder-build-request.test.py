@@ -1662,8 +1662,31 @@ with tempfile.TemporaryDirectory() as tmp:
     check("intake-verdict-without-a-ledger-flag-value-is-refused",
           cli("intake-verdict", str(tmp / "q.json"), "--ledger")[0] == 2)
 
-    # A room's ledger lock has a timeout: a holder never stalls another process past it.
+    # Its own lock wait is 1 s (inside the bridge's 2 s budget): a held lock exits 3, never waits on.
     import fcntl  # noqa: PLC0415
+    room_dir = br.Ledger(tmp / "ledger")._path(ROOM, rid_t).parent
+    held = os.open(str(room_dir / ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(held, fcntl.LOCK_EX)
+    began = time.monotonic()
+    try:
+        code, _ = cli("intake-verdict", str(tmp / "q.json"), "--ledger", str(tmp / "ledger"), "--tasks", str(tasks))
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+    check("intake-verdict-gives-up-on-a-held-lock-within-its-own-second",
+          code == 3 and 0.8 <= time.monotonic() - began < 1.6)
+
+    # The window is on both sides of the fence: the same words long before it are not its copy.
+    rid_u, root_u = "b6b6b6b6-3434-4565-8787-909090909090", "$rootU:s.space"
+    led.claim(ROOM, rid_u, fence={"room_id": ROOM, "thread_root": root_u, "owner": OWNER, "at": T0, "mode": "build",
+                                  "request_id": rid_u, "said": DESC})
+    early = T0 - br.settle_seconds() - 1
+    check("the-words-long-before-the-fence-are-not-the-slot",
+          tt(msg(tmp, "early-u", DESC, at=early, mid="$u9", root=root_u), now=T0 + 99999) == ("none", None))
+    check("the-words-just-before-it-still-are", tt(msg(tmp, "near-u", DESC, at=T0 - br.settle_seconds(), mid="$u8",
+                                                     root=root_u), now=T0 + 1) == ("duplicate", rid_u))
+
+    # A room's ledger lock has a timeout: a holder never stalls another process past it.
     busy = br.Ledger(tmp / "ledger-busy", lock_timeout=0.2)
     folder = busy._path(ROOM, rid_t).parent
     folder.mkdir(parents=True, exist_ok=True)

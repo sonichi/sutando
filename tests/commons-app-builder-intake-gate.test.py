@@ -207,6 +207,41 @@ def main():
     check("and says so in one log line", any("build thread gate: TimeoutExpired; delivering" in m for m in logs)
           and any("build thread gate: the verdict exited 3; delivering" in m for m in logs))
 
+    # The child sees only the workspace's and the skill's own variables, never the gateway token,
+    # and runs isolated (-I). Each probe answers "duplicate" (settled) only if that holds.
+    os.environ["REMOTE_TASK_TOKEN"] = "test-token-never-for-the-child"
+    os.environ["SOME_OTHER_SECRET"] = "x"
+    # Every parent variable outside the list must be absent (the OS adds its own locale ones).
+    leaked = sorted(set(os.environ) - set(rgb._INTAKE_ENV) - {"LC_CTYPE", "__CF_USER_TEXT_ENCODING"})
+    probes = {"env": f"import json, os; ok = not set({leaked!r}) & set(os.environ)\n",
+              "isolated": "import json, sys; ok = bool(sys.flags.isolated)\n"}
+    try:
+        for name, body in probes.items():
+            (fakes / f"{name}.py").write_text(body + "print(json.dumps({'verdict': 'duplicate' if ok else 'none', "
+                                                    "'request_id': 'probe'}))\n")
+            rgb._BUILD_REQUEST = fakes / f"{name}.py"
+            try:
+                write(f"task-probe-{name}", thread_message(f"$p{name}"))
+            finally:
+                rgb._BUILD_REQUEST = real
+            check(f"the verdict's child passes the {name} probe", settled(f"task-probe-{name}")
+                  and not queued(f"task-probe-{name}"))
+    finally:
+        os.environ.pop("REMOTE_TASK_TOKEN", None)
+        os.environ.pop("SOME_OTHER_SECRET", None)
+
+    # A late pass already past the round's wait runs no check: the message is delivered at once.
+    calls = []
+    real_verdict = rgb._build_thread_verdict
+    rgb._build_thread_verdict = lambda *x, **k: calls.append(x) or real_verdict(*x, **k)
+    rgb._INTAKE_MODE["deadline"] = time.monotonic() - 1.0
+    try:
+        write("task-overdue", thread_message("$od1"))
+    finally:
+        rgb._INTAKE_MODE["deadline"] = None
+        rgb._build_thread_verdict = real_verdict
+    check("past the round's wait a deferred message is delivered with no check", queued("task-overdue") and calls == [])
+
     # A room's ledger lock held by another process: delivered within the verdict's budget.
     rid6 = "eeeeeeee-7a4d-4e8b-9f61-2c5d8a0b7e14"
     write("task-fence6", fence(rid6))

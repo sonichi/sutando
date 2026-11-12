@@ -1319,7 +1319,11 @@ def _intake_command(argv: List[str]) -> int:
         print(f"build_request: bad intake question: {error}", file=sys.stderr)
         return 2
     ledger_ = Ledger(Path(folder) if folder else default_ledger(), lock_timeout=INTAKE_LOCK_TIMEOUT_S)
-    verdict, request_id = intake_verdict(fields, tier, ledger_, Path(tasks) if tasks else default_tasks_dir())
+    try:
+        verdict, request_id = intake_verdict(fields, tier, ledger_, Path(tasks) if tasks else default_tasks_dir())
+    except LedgerBusy as error:
+        print(f"build_request: {error}", file=sys.stderr)
+        return 3
     print(json.dumps({"verdict": verdict, "request_id": request_id}))
     return 0
 

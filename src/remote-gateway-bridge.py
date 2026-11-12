@@ -398,6 +398,10 @@ _BUILD_REQUEST = _REPO / "skills" / "commons-app-builder" / "scripts" / "build_r
 BUILD_THREAD_POLL_S = 0.25
 BUILD_THREAD_VERDICT_S = 2.0  # one verdict's whole budget, well inside the round's 6 s wait
 _INTAKE_FIELDS = ("user_id", "thread_root", "source_room_id", "channel_id", "source_message_id", "timestamp", "task")
+# All the verdict's child sees: where the workspace (and its envelope key) is, and the skill's two
+# settings. Never the gateway's token or any other secret the bridge holds.
+_INTAKE_ENV = ("HOME", "SUTANDO_WORKSPACE", "SUTANDO_TEST_MODE", "SUTANDO_DEFAULT_WORKSPACE",
+               "BUILD_THREAD_CONVERSATION", "BUILD_THREAD_SETTLE_SECONDS")
 
 
 def _build_thread_verdict(task: dict, tier: str, budget: float):
@@ -410,7 +414,8 @@ def _build_thread_verdict(task: dict, tier: str, budget: float):
         done = subprocess.run(
             [sys.executable, "-I", str(_BUILD_REQUEST), "intake-verdict", "-",
              "--ledger", str(WS / "state" / "commons-app-builds"), "--tasks", str(TASKS_DIR)],  # noqa: F821
-            input=question, capture_output=True, text=True, timeout=max(0.1, budget))
+            input=question, capture_output=True, text=True, timeout=max(0.1, budget),
+            env={k: os.environ[k] for k in _INTAKE_ENV if k in os.environ})
         answer = json.loads(done.stdout) if done.returncode == 0 else None
         verdict = (answer["verdict"], answer.get("request_id")) if isinstance(answer, dict) else None
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as e:
@@ -434,7 +439,12 @@ def _build_thread_gate(task: dict):
     if tier != "owner":
         return None
     mode = _INTAKE_MODE  # noqa: F821
-    verdict = _build_thread_verdict(task, tier, BUILD_THREAD_VERDICT_S)
+    budget = BUILD_THREAD_VERDICT_S
+    if mode["deadline"] is not None:  # a late pass: no task's check runs past the round's wait
+        budget = min(budget, mode["deadline"] - time.monotonic())
+        if budget <= 0:
+            return None
+    verdict = _build_thread_verdict(task, tier, budget)
     if verdict and verdict[0] == "wait":
         if mode["defer"]:
             return INTAKE_DEFER  # noqa: F821

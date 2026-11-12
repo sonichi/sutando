@@ -277,9 +277,12 @@ The two are tied exactly, never by time:
 **Where it runs first: the gateway bridge.** Before a room task with a `thread_root` is queued,
 the bridge's intake gate (`src/remote-gateway-bridge.py`, `_build_thread_gate`) asks this same
 verdict about the owner's message: `build_request.py intake-verdict -`, a subprocess given the
-gateway's own fields and the tier the bridge resolved, never code loaded into the bridge. It has
-2 s (its ledger lock waits at most 1 s); a non-zero exit, a timeout or unparseable output
-delivers the message. `duplicate`: the message is settled unqueued and the agent never sees it.
+gateway's own fields and the tier the bridge resolved, never code loaded into the bridge. It runs
+isolated (`python -I`) with only `HOME`, the workspace's `SUTANDO_WORKSPACE`, `SUTANDO_TEST_MODE`
+and `SUTANDO_DEFAULT_WORKSPACE`, and this skill's `BUILD_THREAD_CONVERSATION` and
+`BUILD_THREAD_SETTLE_SECONDS`: never the gateway's token. It has 2 s, and never past the round's
+wait (its ledger lock waits at most 1 s, then it exits 3); a non-zero exit, a timeout or
+unparseable output delivers the message. `duplicate`: the message is settled unqueued and the agent never sees it.
 `wait`: it is taken after the round's other tasks, held in memory and unacked, and rechecked
 every 0.25 s until the round's wait ends (6 s), then delivered; a restart re-serves it. Anything
 else is delivered as usual. So a threaded task
