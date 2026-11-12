@@ -18,6 +18,11 @@ resume their request once the apps are connected.
                                     connected: catalog check, one connections read, one account
                                     read, then the wait; prints "mode" (dm | private) and, for dm,
                                     the exact room.message.send payload ("message") to post
+  reauth <slug> --room R --reply-to E --task T (--owner O | --owner-from-task)
+        (--request TEXT | --request-file PATH|-) (--error TEXT | --error-file PATH|-) [--account A] [--stopped TEXT]
+                                    an app call failed because the app's sign-in lapsed (not connect_required):
+                                    arms the same wait as `card` and prints "message", a Signed out agent panel
+                                    card for the owner's DM whose Reconnect reply brings up the Connect card
   card-check <wait-id> --event-id E --content-file PATH|-
                                     after posting a DM card, check the read-back event carries a
                                     card the client draws; exit 1 prints "fallback", the plain text
@@ -1481,6 +1486,92 @@ def cmd_card(
     return EXIT_OK
 
 
+# An app call refused because the app's sign-in lapsed (expired, revoked, re-auth needed), as
+# opposed to connect_required, which means the app was never connected.
+AUTH_LAPSED_RE = re.compile(
+    r"\b(expired|revoked|invalid[_ ]grant|invalid[_ ]token|token[_ ]expired|re-?auth\w*|unauthori[sz]ed|"
+    r"auth(?:entication)?[_ ]failed|signed[_ ]out|sign in again|401)\b", re.I)
+
+
+def auth_problem(error: str) -> str | None:
+    """`not_connected` (connect_required), `signed_out` (the sign-in lapsed) or None for any other error."""
+    text = str(error or "")
+    if "connect_required" in text:
+        return "not_connected"
+    return "signed_out" if AUTH_LAPSED_RE.search(text) else None
+
+
+def reauth_message(wait: dict, owner: str, task: str, *, name: str, slug: str, account: str = "",
+                   stopped: str = "") -> dict:
+    """The room.message.send payload for a signed-out app: an agent panel in state error, whose Reconnect
+    reply brings up the Connect card for this same wait."""
+    import agent_card as ac
+
+    did = stopped or f"I couldn't finish your request because {name} signed me out."
+    body, card = ac.build(
+        f"app-reauth:{slug}", "error", title=name, subtitle="Signed out" + (f" · {account}" if account else ""),
+        avatar_=ac.avatar(app=slug, shape="square"),
+        text=f"{did} Reconnect it and I'll carry on.",
+        buttons=[ac.button("Reconnect", "reply", style="primary", reply=ac.reply("apps", slug, "reconnect"))],
+        note=f"Or {INTEGRATIONS_HINT}.", note_tone="dim",
+        body=f"{name} signed me out{f' ({account})' if account else ''}, so I stopped. Reconnect {name}: "
+             f"tap Reconnect on the card, or {INTEGRATIONS_HINT}.")
+    return {"body": body, "extra_content": {ac.CARD_KEY: card}, "reply_to": wait["reply_to"],
+            "operation_id": f"{task}:reauth-card"}
+
+
+def cmd_reauth(
+    ws: Path,
+    cloud: Cloud,
+    args: argparse.Namespace,
+    spawn: Callable[[Path, str], int] = spawn_waiter,
+    now: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+    **_: Any,
+) -> int:
+    """An app call failed because its sign-in lapsed: arm the same wait `card` arms (the request resumes
+    once the app is connected again) and print the Signed out card to post in the owner's DM."""
+    args.private, args.switch, args.line = False, False, []
+    a = wait_args(args)
+    if len(a["slugs"]) != 1:
+        raise Setup("invalid_arguments", "reauth takes exactly one app")
+    slug = a["slugs"][0]
+    task_owner = origin_owner(ws, a["task"])
+    if a["owner"] is None:
+        a["owner"] = task_owner
+    elif a["owner"] != task_owner:
+        raise Setup("not_owner_task", f"--owner is not the user of {a['task']}.")
+    error = args.error if args.error is not None else (sys.stdin.read(MAX_REQUEST_READ) if args.error_file == "-"
+                                                       else Path(args.error_file).read_text(encoding="utf-8"))
+    kind = auth_problem(error)
+    if kind != "signed_out":
+        emit({"wait_id": None, "reason": "use_card" if kind == "not_connected" else "not_an_auth_error",
+              "message": None})
+        return EXIT_NO
+    toolkits = resolve_toolkits(cloud, [slug])
+    if slug in active_by_toolkit(cloud.connection_rows()):
+        # Still listed as active: a wait would resume at once into the same refusal.
+        emit({"wait_id": None, "reason": "still_active", "message": None})
+        return EXIT_NO
+    if not cloud.signed_in():
+        raise cloud.not_signed_in()
+    cloud_user_id = account_for_wait(cloud, sleep)
+    changed = station_account_changed(ws, cloud, cloud_user_id)
+    if changed:
+        emit({**changed, "message": None})
+        return EXIT_NO
+    payload = arm_wait(ws, a, cloud_user_id, toolkits=lambda _slugs: toolkits, baseline=lambda: {}, spawn=spawn,
+                       now=now)
+    message = None
+    if payload.get("wait_id"):
+        message = reauth_message(payload, a["owner"], a["task"], name=toolkits[0]["name"], slug=slug,
+                                 account=" ".join((args.account or "").split())[:80],
+                                 stopped=" ".join((args.stopped or "").split())[:300])
+    emit({**payload, "message": message, "fallback": fallback_message(payload, a["task"], False)
+          if payload.get("wait_id") else None})
+    return EXIT_OK
+
+
 def _readback_entry(data: Any, event_id: str) -> dict | None:
     """The posted event out of the read-back: the whole tool output, its `result`, or a list."""
     if isinstance(data, dict) and isinstance(data.get("result"), (dict, list)):
@@ -1694,6 +1785,22 @@ def parser() -> argparse.ArgumentParser:
     k.add_argument("--line", action="append",
                    help="the intro (first line) and, for --private, the further card lines (repeatable)")
     k.add_argument("--switch", action="store_true", help="a Switch account card instead of a Connect card")
+    ra = sub.add_parser("reauth", help="an app call failed because its sign-in lapsed: the Signed out card")
+    ra.add_argument("slugs", nargs=1)
+    ra.add_argument("--room", required=True)
+    ra.add_argument("--reply-to", required=True)
+    ra.add_argument("--task", required=True)
+    rwho = ra.add_mutually_exclusive_group(required=True)
+    rwho.add_argument("--owner")
+    rwho.add_argument("--owner-from-task", action="store_true", help="the owner is the task file's user_id")
+    rreq = ra.add_mutually_exclusive_group(required=True)
+    rreq.add_argument("--request")
+    rreq.add_argument("--request-file", help="read the request from this file; - reads stdin")
+    rerr = ra.add_mutually_exclusive_group(required=True)
+    rerr.add_argument("--error", help="the app call's error text")
+    rerr.add_argument("--error-file", help="read the error text from this file; - reads stdin")
+    ra.add_argument("--account", help="the account that was signed out, when the error or status names it")
+    ra.add_argument("--stopped", help="one sentence on what the failure stopped")
     cc = sub.add_parser("card-check", help="after posting a DM card: verify the posted event carries it")
     cc.add_argument("wait_id")
     cc.add_argument("--event-id", required=True, help="the event id room.message.send returned")
@@ -1714,7 +1821,8 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
-COMMANDS = {"find": cmd_find, "status": cmd_status, "await": cmd_await, "card": cmd_card, "claim": cmd_claim,
+COMMANDS = {"find": cmd_find, "status": cmd_status, "await": cmd_await, "card": cmd_card, "reauth": cmd_reauth,
+            "claim": cmd_claim,
             "verify-account": cmd_verify_account, "note": cmd_note, "set-default": cmd_set_default}
 
 
