@@ -40,7 +40,7 @@ for _p in (str(_REPO / "src"), str(_SKILLS / "worker-pool" / "scripts"), str(_SK
 
 import agent_card as ac  # noqa: E402
 import connections  # noqa: E402
-import dotspace  # noqa: E402
+import dotspace
 
 KINDS = ("connections", "workers", "apps", "circle")
 RUNTIMES = {"claude": "Claude", "codex": "Codex"}
