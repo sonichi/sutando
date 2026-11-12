@@ -57,8 +57,13 @@ The test: if you are about to write "reply yes to…", "open this link", "go to 
 "run this command", stop and add the control.
 
 Where no control exists yet, one plain instruction is allowed, and it is tracked as a gap. Known
-gaps today: sending a secret with a typed `vault set` command, typing the re-link approval code,
-and clicks on room cards (section 11).
+gaps today:
+
+- Sending a secret is a typed `vault set` command.
+- Re-linking an agent is a typed approval code.
+- Clicks on room cards are not accepted yet (section 11).
+- A card's outcome is not yet edited in place: the updated card is posted as a reply to the old
+  one, which stays as it was (section 7).
 
 ## 4. Fewest steps, in place
 
@@ -284,9 +289,9 @@ The engine writes the card content and the text the owner reads, so rules 2, 3, 
 and 11 land here. Checklist lines 23 and 24 are for the web client and do not apply to
 an engine change.
 
-- High-impact (rule 2) is at least what `CLAUDE.md` "Identity" has the agent confirm with the
-  owner before executing: irreversible actions such as sending email, deleting files and
-  financial transactions. The two lists are kept the same.
+- High-impact is defined by rule 2 of this note. `CLAUDE.md` "Identity" (confirm irreversible
+  actions with the owner: sending email, deleting files, financial transactions) is a shorter
+  summary of it, not a second list.
 - A request from someone other than the owner never borrows the owner's authority. Tiers and
   collaborators are in [`docs/access-control.md`](access-control.md).
 - When a control exists for a known action, owner-facing text sends the control, not the
@@ -326,9 +331,11 @@ an engine change.
 - The engine never does anything on the person-only list. It asks, with a card.
 - "Known action → control" is about text an end user reads. Runbooks, developer docs and
   operator instructions may say "run this command".
-- When the outcome is known, update the card that asked; do not repeat it in a second chat
-  message. The click's task is still answered through its result file, starting with
-  `[no-send]` or `[REPLIED]` when the card already shows the outcome.
+- When the outcome is known, show it on the card that asked with `update_card`; do not repeat
+  it in a second chat message. Known gap: no Action carries a card in an edit, so `update_card`
+  posts the updated card as a reply to the old one, which stays as it was. The click's task is
+  still answered through its result file, starting with `[no-send]` or `[REPLIED]` when the
+  updated card already shows the outcome.
 - Open-ended questions stay chat. This rule is about actions the agent already knows.
 
 ## Mechanical checks worth adding later
