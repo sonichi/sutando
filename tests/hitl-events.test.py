@@ -51,7 +51,7 @@ class IngestTests(unittest.TestCase):
         [req] = self.mgr.active()
         self.assertEqual((req.kind, req.runtime, req.guard), ("permission", "claude", "g1"))
         self.assertNotIn("core-2", req.title + req.message.splitlines()[0])
-        self.assertEqual(req.message.partition("\n\n")[2], "Session: core-2")
+        self.assertEqual(req.message, "Do you want to proceed?")
         self.assertEqual(req.title, "Claude needs you")
         self.assertEqual(req.actions[-1].label, "Open terminal")
         kinds = [(a.id, a.kind) for a in req.actions]
@@ -96,7 +96,7 @@ class IngestTests(unittest.TestCase):
                                                   {"id": "deny", "label": "Deny", "kind": "reject_once"}]))
         ingest(self.mgr, self.ws)
         [req] = self.mgr.active()
-        self.assertEqual(req.subject, {"tool": "Read", "input": "/x", "details_folded": True})
+        self.assertEqual(req.subject, {"tool": "Read", "input": "/x"})
         self.assertEqual((req.title, req.device["name"]), ("Your agent needs you", "Your agent"))
         self.assertEqual([(a.id, a.kind) for a in req.actions[:2]], [("allow", "allow_once"), ("deny", "reject_once")])
         self.assertEqual(req.actions[-1].kind, "open_terminal")  # the jump floor stays
@@ -106,7 +106,21 @@ class IngestTests(unittest.TestCase):
         ingest(self.mgr, self.ws)
         [req] = self.mgr.active()
         self.assertEqual({a.kind for a in req.actions[:-1]}, {"tui_select"})
-        self.assertEqual(req.subject, {"details_folded": True})
+        self.assertEqual(req.subject, {})
+
+    def test_a_text_only_reader_gets_the_whole_ask_and_a_summary_folds_the_session(self):
+        from hitl.projector import fallback_body
+        for n, ask in enumerate(("Choose a destination:\n1. Staging\n2. Production",
+                                 "Allow Read /tmp/project/config.json?", "请确认是否继续部署？")):
+            self.drop(f"core-{n}-g{n}", event(session=f"core-{n}", guard=f"g{n}", kind="choice", prompt=ask))
+        self.drop("core-9-g9", event(session="core-9", guard="g9", kind="auth", prompt=""))
+        ingest(self.mgr, self.ws)
+        bodies = {r.device["id"]: fallback_body(r) for r in self.mgr.active()}
+        self.assertIn("Choose a destination:\n1. Staging\n2. Production", bodies["core-0"])
+        self.assertIn("Allow Read /tmp/project/config.json?", bodies["core-1"])
+        self.assertIn("请确认是否继续部署？", bodies["core-2"])
+        self.assertIn("Claude needs to sign in again", bodies["core-9"])
+        self.assertNotIn("Session:", bodies["core-9"])
 
     def test_repaint_expires_the_old_dialog_and_mints_a_new_card_with_new_options(self):
         # TustinOC's second repro: the guard moved to screen BBB; the old card's

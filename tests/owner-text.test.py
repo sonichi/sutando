@@ -79,6 +79,8 @@ class Redaction(unittest.TestCase):
             self.assertEqual(owner_text.owner_line(given), want, given)
             self.assertEqual(owner_text.internals(owner_text.owner_line(given)), [], given)
         self.assertEqual(owner_text.owner_line("card g2"), "card g2", "a short plain line is kept")
+        for clean in ("Continue?", "请确认是否继续部署？", "続行しますか？"):
+            self.assertEqual(owner_text.owner_line(clean), clean, "a line in any script is kept")
         for nothing_left in ("sutando-core · blocked-human", HEX, "7 · 12", ""):
             self.assertEqual(owner_text.owner_line(nothing_left), owner_text.GENERIC_LINE, nothing_left)
 
@@ -115,6 +117,14 @@ class Shapes(unittest.TestCase):
         self.assertEqual(text.split("\n\n")[1].splitlines(), ["  raw: [redacted]", f"Session: {SESSION}"])
         self.assertEqual(owner_text.card_text("Only a sentence."), "Only a sentence.")
 
+    def test_a_secret_split_across_detail_lines_is_redacted_whole(self):
+        payload = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC" + "x" * 32
+        pem = ["-----BEGIN PRIVATE KEY-----", payload, "-----END PRIVATE KEY-----"]
+        text = owner_text.card_text("Its terminal shows a key.", pem)
+        self.assertNotIn(payload, text)
+        self.assertNotIn("END PRIVATE KEY", text)
+        self.assertEqual(owner_text.headline(text), "Its terminal shows a key.")
+
     def test_the_text_only_form_is_the_first_line_of_a_folded_card_and_all_of_any_other(self):
         folded = owner_text.card_text("Reviewer is signed out.", [f"Session: {SESSION}"])
         self.assertEqual(owner_text.fallback_text(folded, True), "Reviewer is signed out.")
@@ -135,29 +145,34 @@ class Shapes(unittest.TestCase):
 
 
 class AgentName(unittest.TestCase):
-    """The name on a card comes from local records: the primary connection row, then the environment."""
+    """The name on a card is the self-introduction name without the homeserver lookup."""
 
-    def test_the_connection_row_wins_then_the_environment_then_the_default(self):
+    MXID = "@blue-fox.agent:example.com"
+
+    def name(self, rows=(), *args, **kw):
+        import agent_display_name
         import agent_local_name
         import connections
-        row = {"agent_display_name": "Blue Fox", "primary": True}
-        with patch.object(connections, "primary_row", return_value=row):
-            self.assertEqual(agent_local_name.local_name(environ={"AGENT_DISPLAY_NAME": "Env Name"}), "Blue Fox")
-        with patch.object(connections, "primary_row", return_value=None):
-            self.assertEqual(agent_local_name.local_name(environ={"AGENT_DISPLAY_NAME": "Env Name"}), "Env Name")
-            self.assertEqual(agent_local_name.local_name(environ={"SUTANDO_DISPLAY_NAME": "First",
-                                                                  "AGENT_DISPLAY_NAME": "Second"}), "First")
-            self.assertEqual(agent_local_name.local_name(environ={}), "Your agent")
+        with patch.object(connections, "read_rows", return_value=list(rows)), \
+                patch.object(agent_display_name, "profile_name", side_effect=AssertionError("no network")):
+            return agent_local_name.local_name(*args, **kw)
+
+    def test_the_connection_row_for_this_agent_wins_then_the_environment_then_the_localpart(self):
+        rows = [{"agent_mxid": "@other:example.com", "agent_display_name": "Other"},
+                {"agent_mxid": self.MXID, "agent_display_name": "Sky Owl"}]
+        self.assertEqual(self.name(rows, mxid=self.MXID, environ={"AGENT_DISPLAY_NAME": "Env Name"}), "Sky Owl")
+        self.assertEqual(self.name(mxid=self.MXID, environ={"AGENT_DISPLAY_NAME": "Env Name"}), "Env Name")
+        self.assertEqual(self.name(mxid="", environ={"SUTANDO_DISPLAY_NAME": "First",
+                                                     "AGENT_DISPLAY_NAME": "Second"}), "First")
+        self.assertEqual(self.name(mxid=self.MXID, environ={}), "Blue Fox")
+        self.assertEqual(self.name(mxid="", environ={}), "Your agent")
 
     def test_an_identifier_or_an_unreadable_record_is_no_name(self):
         import agent_local_name
-        import connections
-        with patch.object(connections, "primary_row", return_value={"agent_display_name": SESSION}):
-            self.assertEqual(agent_local_name.local_name("An agent", environ={}), "An agent")
-        with patch.object(connections, "primary_row", side_effect=RuntimeError("unreadable")):
-            self.assertEqual(agent_local_name.local_name(environ={"AGENT_DISPLAY_NAME": "Env Name"}), "Env Name")
-        with tempfile.TemporaryDirectory() as empty:
-            self.assertEqual(agent_local_name.local_name(workspace=Path(empty), environ={}), "Your agent")
+        rows = [{"agent_mxid": self.MXID, "agent_display_name": SESSION}]
+        self.assertEqual(self.name(rows, "An agent", mxid=self.MXID, environ={}), "An agent")
+        with patch.object(agent_local_name.agent_display_name, "resolve", side_effect=RuntimeError("unreadable")):
+            self.assertEqual(agent_local_name.local_name(environ={}), "Your agent")
 
 
 class BlockedCard(unittest.TestCase):
@@ -287,7 +302,8 @@ class Projection(unittest.TestCase):
         req = self.mgr.create(blocked(
             owner_text.card_text("Reviewer is signed out, so every task sent to it waits.",
                                  ["Its terminal shows:", f"  API Error: 401 {KEY}", f"Session: {SESSION}"]),
-            "Reviewer is signed out", subject={owner_text.FOLDED: True}))
+            "Reviewer is signed out", device={"id": SESSION, "name": "Reviewer", "host": "studio"},
+            subject={owner_text.FOLDED: True}))
         project(self.mgr, self.send, "!room:example.com", clock=lambda: T0)
         [payload] = self.sent
         plain(self, payload["body"])

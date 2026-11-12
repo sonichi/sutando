@@ -132,15 +132,16 @@ def agent_mxid(environ: Optional[Mapping[str, str]] = None) -> str:
 
 def resolve(mxid: Optional[str] = None, *, fetch: Optional[Fetch] = None,
             environ: Optional[Mapping[str, str]] = None,
-            workspace: Optional[Path] = None) -> Tuple[str, str]:
-    """(name, source) for this agent's self-introduction, in the order the module docstring gives."""
+            workspace: Optional[Path] = None, offline: bool = False) -> Tuple[str, str]:
+    """(name, source) for this agent's self-introduction, in the order the module docstring gives;
+    `offline` skips the homeserver (tier 1), for a monitor that may not make a network call."""
     if mxid is None:
         try:
             mxid = agent_mxid(environ)
         except Exception:  # noqa: BLE001 - no identity still yields a name
             mxid = ""
     mxid = (mxid or "").strip()
-    for source, name in (("profile", lambda: profile_name(mxid, fetch)),
+    for source, name in (("profile", lambda: "" if offline else profile_name(mxid, fetch)),
                          ("connection", lambda: connection_name(mxid, workspace)),
                          ("configured", lambda: configured_name(environ)),
                          ("localpart", lambda: localpart_name(mxid))):
