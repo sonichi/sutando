@@ -27,9 +27,10 @@ complete reference.
 High-impact means, at least, irreversible actions and outward-facing ones: sending to people or
 places outside the conversation the request came from (email, a post, another room), publishing,
 purchasing, deleting, and changing permissions or credentials. A reply in the conversation the
-request came from, or a message to the agent's own owner in their DM, is not high-impact. A
-standing approval the owner gave for a named kind of action satisfies the hold, and only a person
-can give it.
+request came from, or a message to the agent's own owner in their DM, is not high-impact. That is
+about the approval hold only: data from the owner's accounts or device still goes to the DM only
+(section 9). A standing approval the owner gave for a named kind of action satisfies the hold, and
+only a person can give it.
 
 An Action's risk and its approval requirement come from the Action's own metadata, set by the
 platform. They never come from the caller or the card, so an agent cannot downgrade them.
