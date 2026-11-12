@@ -278,6 +278,35 @@ class StaleClaims(unittest.TestCase):
         self.roster.write_text("not json")
         self.assert_verdict(0)
 
+    def test_nonrecipient_directory_symlink_is_ignored_without_writes(self):
+        self.claim()
+        with tempfile.TemporaryDirectory() as cache:
+            alias = self.ws / "deliveries" / "_cache"
+            alias.symlink_to(cache, target_is_directory=True)
+            before = self.tree_state()
+            with patch.object(pool_router.prec, "iter_recipients", wraps=pool_router.prec.iter_recipients) as recipients:
+                text, snap = self.assert_verdict(1)
+                self.assertEqual(recipients.call_count, 2)
+            self.assertIn("inspect the claimant; task remains held", text)
+            self.assertTrue(snap["tasks"][0]["claimed"])
+            self.assertEqual([row["recipient"] for row in snap["tasks"][0]["delivery_holders"]], ["side-claims"])
+            self.assertEqual(self.tree_state(), before)
+            self.assertEqual(list(Path(cache).iterdir()), [])
+            self.assertEqual(pool_router.holders(self.ws, TASK), [])
+
+    def test_recipient_directory_symlink_remains_undecidable_without_writes(self):
+        self.claim()
+        with tempfile.TemporaryDirectory() as cache:
+            alias = self.ws / "deliveries" / "cache"
+            alias.symlink_to(cache, target_is_directory=True)
+            before = self.tree_state()
+            self.assert_verdict(2)
+            self.assertEqual(self.tree_state(), before)
+            self.assertEqual(list(Path(cache).iterdir()), [])
+            with self.assertRaises(pool_router.UnreadableEvidence):
+                pool_router.holders(self.ws, TASK)
+            self.assertEqual(self.tree_state(), before)
+
     def test_recipient_removed_during_probe_does_not_create_a_stale_claim(self):
         sentinel = self.claim()
         original_open = os.open

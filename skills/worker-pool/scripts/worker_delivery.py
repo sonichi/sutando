@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from pool_delivery import ACCEPTED_SUFFIX, LEGACY_ACCEPTED_SUFFIX, PENDING_SUFFIX, NON_EXCLUSIVE_MARKER, regular_file_state
 import pool_claim_policy
+import pool_record
 import pool_roster
 
 #: The router's stages, spelled once in pool_delivery; a new stage is added there.
@@ -79,13 +80,14 @@ def holder_evidence(workspace: Path, task_id: str, *, now: float) -> list[dict]:
     Unreadable or malformed evidence is undecidable, never an expired assignment."""
     deliveries = Path(workspace) / "deliveries"
     try:
-        recipients = sorted(p for p in deliveries.iterdir() if _is_dir(p))
+        recipients = pool_record.iter_recipients(deliveries)
     except FileNotFoundError:
         return []
     out, roster = [], None
     roster_loaded = False
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    for recipient in recipients:
+    for recipient_name in recipients:
+        recipient = deliveries / recipient_name
         try:
             dfd = os.open(recipient, flags)
         except FileNotFoundError:

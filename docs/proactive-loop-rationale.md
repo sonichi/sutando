@@ -220,7 +220,8 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    status, run:
 
    ```bash
-   python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE"   # rc=1 => unanswered work needs attention
+   python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE" &&
+     bash scripts/core-status.sh idle "" --loop-complete
    ```
 
    A task file stays in `tasks/` until a result is written and the bridge archives it, so
@@ -235,7 +236,13 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    ownership remains intact and the core must not answer the task merely because
    the warning appeared. Fresh claims and ordinary worker deliveries remain held.
    `--json` carries the same verdict and exit code, while preserving the task's
-   claimed status. Exit 2 means the evidence could not be read, never an empty queue.
+   claimed status. Exit 1 and exit 2 both stop the `&&` chain, so neither idle
+   status nor loop completion is recorded until the queue check succeeds. A held
+   claim warning means inspect the claimant; never answer or reassign its task.
+   Exit 2 means the evidence could not be read, never an empty queue. The status-ack
+   runner calls the same snapshot directly: unreadable or unimportable evidence
+   makes it skip new acknowledgements and watcher-outage alerts for that pass,
+   after reconciling prior state. It does not cancel already-published outbound work.
 
 1.5. **Re-arm connector waits.** When the owner asks for something that needs an app they have not
    connected, the `connect-apps` skill posts a Connect card, records a wait under

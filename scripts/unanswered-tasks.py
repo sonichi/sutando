@@ -188,7 +188,9 @@ def snapshot(workspace: Path, min_age_sec: float, now: float | None = None,
         claimed = holder is not None or phase in _CLAIMED_PHASES
         age = None if intake is None else max(0.0, now - intake)
         pending = not (claimed or reason is None)
-        flagged = (claim_reason if holder is not None else reason) if now - mtime >= min_age_sec and reason else None
+        flagged = None
+        if now - mtime >= min_age_sec and reason:
+            flagged = claim_reason if holder is not None else reason
         out.append({"task_id": task_id, "file": f.name, "intake_at": intake, "intake_known": intake is not None,
                     "age_s": age, "mtime_age_s": now - mtime, "phase": phase, "holder": holder,
                     "answered": reason is None, "claimed": claimed,
