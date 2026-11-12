@@ -321,7 +321,7 @@ def cmd_worker_mcp_credential(args) -> int:
     command here that prints a secret, to stdout alone, for the proxy's memory. Exit 1 refused."""
     worker = args.worker or connections.session_worker()
     try:
-        cred = connections.worker_mcp_credential(worker, workspace=args.workspace)
+        cred = connections.worker_mcp_credential(worker, workspace=args.workspace, server=args.server or None)
     except connections.NoWorkerCredential as e:
         print(f"worker-mcp-credential: refused, {e.reason}: {e.detail}", file=sys.stderr)
         return 1
@@ -331,7 +331,8 @@ def cmd_worker_mcp_credential(args) -> int:
 
 def cmd_worker_mcp_credential_argv(args) -> int:
     """The JSON argv a worker seat exports as AG2_MCP_WORKER_CREDENTIAL (no secret, no vault read)."""
-    print(json.dumps(connections.mcp_worker_credential_argv(args.worker, args.repo, args.python, args.workspace)))
+    print(json.dumps(connections.mcp_worker_credential_argv(args.worker, args.repo, args.python, args.workspace,
+                                                        args.server)))
     return 0
 
 
@@ -390,9 +391,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("import-env").set_defaults(fn=cmd_import_env)
     sub.add_parser("launch-plan").set_defaults(fn=cmd_launch_plan)
     s = sub.add_parser("worker-mcp-credential"); s.add_argument("--worker", default="")
+    s.add_argument("--server", default="", help="the identity on this server, for a worker with several")
     s.set_defaults(fn=cmd_worker_mcp_credential)
     s = sub.add_parser("worker-mcp-credential-argv"); s.add_argument("--worker", required=True)
     s.add_argument("--repo", type=Path, required=True); s.add_argument("--python", default="")
+    s.add_argument("--server", default="", help="pin the identity the seat's proxy mints with to this server")
     s.set_defaults(fn=cmd_worker_mcp_credential_argv)
     sub.add_parser("primary").set_defaults(fn=cmd_primary)
     sub.add_parser("enabled").set_defaults(fn=cmd_enabled)

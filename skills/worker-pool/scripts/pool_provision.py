@@ -225,6 +225,14 @@ def core_lane(workspace: Optional[Path] = None, lane: Optional[str] = None, orig
     return row
 
 
+def _no_identity_yet(worker: str, core: dict, workspace: Optional[Path], done: str = "retire it first") -> None:
+    """Refuse a second agent for `worker` on the server of the core lane it is provisioned through."""
+    try:
+        connections.require_no_worker_identity(worker, str(core.get("server") or ""), workspace)
+    except connections.ConnectionsError as e:
+        raise ProvisionError(f"{e}; {done}") from None
+
+
 def suggested_name(role: str) -> str:
     """A name the server accepts for `role`: lowercase letters, digits and inner dashes, at most 32.
     The server puts the owner and the core's own label in front of it, so it names the role alone."""
@@ -236,9 +244,7 @@ def begin(worker: str, *, role: str, workspace: Optional[Path] = None, vault=Non
           lane: Optional[str] = None) -> dict:
     """Start provisioning `worker`'s agent: a fresh one-time secret goes into the vault, replacing any
     earlier pending one, and only its SHA-256 and a suggested name come back."""
-    if connections.worker_identity(worker, workspace) is not None:
-        raise ProvisionError(f"worker {worker} already has an agent of its own; retire it first")
-    core_lane(workspace, lane)
+    _no_identity_yet(worker, core_lane(workspace, lane), workspace)
     secret = secrets.token_hex(32)
     try:
         _vault(vault).set(claim_key(worker), secret)
@@ -295,9 +301,8 @@ def _redeem_and_save(worker: str, claim_id: str, expected: str, known: list, *, 
     known.append(secret)
     if not _MXID_RE.fullmatch(expected or ""):
         raise ProvisionError("the agent id must be the one agent.create returned (an @name:server id)")
-    if connections.worker_identity(worker, workspace) is not None:
-        raise ProvisionError(f"worker {worker} already has an agent of its own; nothing was redeemed")
     row = core_lane(workspace, lane)
+    _no_identity_yet(worker, row, workspace, "nothing was redeemed")
     gateway, token = connections.connection_credential(row, vault=vault)
     known.append(bearer_of(token))
     body = redeem(gateway, bearer_of(token), claim_id, secret, request=request, sleep=sleep)
@@ -323,9 +328,12 @@ def _save(worker: str, token: str, expected: str, gateway: str, *, workspace, va
     if mxid != expected:
         raise ProvisionError(f"the gateway does not confirm the redeemed token is agent {expected}'s "
                              f"({seen.get('error') or 'it names ' + (mxid or 'no agent')}); nothing stored")
-    saved, created = connections.add_worker_identity(worker, token, expected_server=str(seen.get("server") or ""),
-                                                     source="agent_link", preview=seen, workspace=workspace,
-                                                     vault=vault)
+    try:
+        saved, created = connections.add_worker_identity(worker, token, expected_server=str(seen.get("server") or ""),
+                                                         source="agent_link", preview=seen, workspace=workspace,
+                                                         vault=vault)
+    except connections.WorkerIdentityExists:
+        saved, created = connections.worker_identity(worker, workspace, server=str(seen.get("server") or "")), False
     if not created:
         raise ProvisionError(f"worker {worker} already had a connection ({saved['instance']}); the redeemed "
                              "token was not stored")
@@ -553,31 +561,38 @@ def provision(worker: str, operation_id: str, name: str, *, display_name: str = 
 
 def retire(worker: str, *, workspace: Optional[Path] = None, vault=None,
            preview: Optional[Callable[[str], dict]] = None, kill=None, local_anyway: bool = False) -> dict:
-    """Drop `worker`'s own agent here once its server has retired it: the gateway must reject the
-    stored token. A token still accepted, or a gateway that gives no verdict, is `NotRetired` and
-    leaves everything in place, unless `local_anyway` removes the lane, row and secret regardless."""
-    row = connections.worker_identity(worker, workspace)
-    if row is None:
+    """Drop every agent `worker` holds here (one per server) once each server has retired it: each
+    gateway must reject its stored token. One token still accepted, or a gateway that gives no verdict,
+    is `NotRetired` and leaves everything in place, unless `local_anyway` removes the lanes, rows and
+    secrets regardless. `agent_id` names the agent when there is one; with several, `agent_ids`."""
+    rows = connections.worker_identities(worker, workspace)
+    if not rows:
         return {"agent_id": None, "status": "no_identity"}
     mine = _vault(vault)
-    ref, agent = str(row["token_ref"]), row.get("agent_mxid")
-    try:
-        token = held(mine, ref)
-    except Exception as e:  # noqa: BLE001
-        raise ProvisionError(f"the vault could not be read ({type(e).__name__}); nothing removed") from None
-    seen: dict = {}
-    if token:
+    revoked_all = True
+    for row in rows:
+        ref, agent = str(row["token_ref"]), row.get("agent_mxid")
         try:
-            seen = (preview or connections.preview_connection)(token)
-        except connections.ConnectionsError as e:
-            seen = {"error": type(e).__name__}
-    revoked = seen.get("authenticated") is False
-    if not revoked and not local_anyway:
-        verdict = "still accepts its token" if seen.get("authenticated") else \
-            f"gave no verdict ({seen.get('error') or 'no token in the vault'})"
-        raise NotRetired(f"the server {verdict} for {agent or 'this agent'}: retire it there first "
-                         "(agent.retire); nothing removed")
+            token = held(mine, ref)
+        except Exception as e:  # noqa: BLE001
+            raise ProvisionError(f"the vault could not be read ({type(e).__name__}); nothing removed") from None
+        seen: dict = {}
+        if token:
+            try:
+                seen = (preview or connections.preview_connection)(token)
+            except connections.ConnectionsError as e:
+                seen = {"error": type(e).__name__}
+        revoked = seen.get("authenticated") is False
+        revoked_all = revoked_all and revoked
+        if not revoked and not local_anyway:
+            verdict = "still accepts its token" if seen.get("authenticated") else \
+                f"gave no verdict ({seen.get('error') or 'no token in the vault'})"
+            raise NotRetired(f"the server {verdict} for {agent or 'this agent'}: retire it there first "
+                             "(agent.retire); nothing removed")
     connections.retire_worker_identity(worker, workspace=workspace, vault=vault, kill=kill)
-    if held(mine, ref):
-        raise ProvisionError(f"the vault still holds {ref} after the removal")
-    return {"agent_id": agent, "status": "retired" if revoked else "removed_locally"}
+    left = [str(r["token_ref"]) for r in rows if held(mine, str(r["token_ref"]))]
+    if left:
+        raise ProvisionError(f"the vault still holds {', '.join(left)} after the removal")
+    agents = [r.get("agent_mxid") for r in rows]
+    out = {"agent_id": agents[0] if len(agents) == 1 else None, "status": "retired" if revoked_all else "removed_locally"}
+    return out if len(agents) == 1 else {**out, "agent_ids": agents}

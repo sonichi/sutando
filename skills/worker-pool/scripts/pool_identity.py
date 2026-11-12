@@ -6,12 +6,16 @@ connection row naming the worker (src/connections.py, "a pool worker's own ident
 of its own that answers only what is addressed to that agent, hands every task it queues to the
 worker, and posts nothing proactively. Retiring the worker (pool_manage retire) takes it away.
 
+A worker holds at most one agent per server, so it can have one on each homeserver the core is
+connected to: `--device-flow --lane INSTANCE` adds it on that core lane's server. `show` lists them
+all; `rotate` and `remove` act on the one on `--server`, which may be left out while there is one.
+
     python3 pool_identity.py [--workspace WS] add <worker> --repo REPO --logs-dir DIR [TOKEN|-] [--yes --expected-server NAME]
     python3 pool_identity.py [--workspace WS] add <worker> --device-flow --label LABEL [--display-name TEXT] [--lane INSTANCE]
-    python3 pool_identity.py [--workspace WS] show <worker>
-    python3 pool_identity.py [--workspace WS] rotate <worker> --repo REPO --logs-dir DIR [TOKEN|-]
+    python3 pool_identity.py [--workspace WS] show <worker> [--server SERVER]
+    python3 pool_identity.py [--workspace WS] rotate <worker> --repo REPO --logs-dir DIR [TOKEN|-] [--server SERVER]
     python3 pool_identity.py [--workspace WS] rotate <worker> --device-flow --label LABEL [--lane INSTANCE]
-    python3 pool_identity.py [--workspace WS] remove <worker>
+    python3 pool_identity.py [--workspace WS] remove <worker> [--server SERVER]
     python3 pool_identity.py [--workspace WS] provision-begin <worker> [--role ROLE] [--lane INSTANCE]
     python3 pool_identity.py [--workspace WS] provision-wait <worker> --operation-id ID --name NAME
                                               [--display-name TEXT] [--role TEXT] [--timeout SECONDS] [--lane INSTANCE]
@@ -160,21 +164,27 @@ def cmd_add(args, ws: Path) -> int:
 
 
 def cmd_show(args, ws: Path) -> int:
-    row = connections.worker_identity(live_worker(ws, args.worker), ws)
-    if row is None:
-        print(f"{args.worker} has no agent of its own; it answers through the core's")
+    wid = live_worker(ws, args.worker)
+    rows = [connections.worker_identity(wid, ws, server=args.server)] if args.server \
+        else connections.worker_identities(wid, ws)
+    rows = [r for r in rows if r is not None]
+    if not rows:
+        print(f"{args.worker} has no agent of its own{' on ' + args.server if args.server else ''}; "
+              "it answers through the core's")
         return 1
     keep = ("instance", "server", "agent_mxid", "agent_display_name", "token_ref", "added_by", "added_at", "disabled")
-    print(json.dumps({k: row.get(k) for k in keep}, indent=2, sort_keys=True))
+    shown = [{k: r.get(k) for k in keep} for r in rows]
+    print(json.dumps(shown[0] if len(shown) == 1 else shown, indent=2, sort_keys=True))
     return 0
 
 
 def cmd_rotate(args, ws: Path) -> int:
     if args.device_flow:
         return cmd_device_flow(args, ws, rotate=True)
-    row = connections.worker_identity(live_worker(ws, args.worker), ws)
+    row = connections.worker_identity(live_worker(ws, args.worker), ws, server=args.server)
     if row is None:
-        print(f"pool_identity: {args.worker} has no agent of its own to rotate", file=sys.stderr)
+        print(f"pool_identity: {args.worker} has no agent of its own to rotate"
+              f"{' on ' + args.server if args.server else ''}", file=sys.stderr)
         return 1
     token = read_token(args.token, f"New access token for {args.worker}'s own agent (hidden): ")
     out = connections.update_token(str(row["instance"]), token, repo=args.repo, logs_dir=args.logs_dir, workspace=ws)
@@ -185,9 +195,9 @@ def cmd_rotate(args, ws: Path) -> int:
 def cmd_remove(args, ws: Path) -> int:
     roster = pr.load_roster(ws) or {}
     wid = pr.resolve_label(roster, args.worker)
-    row = connections.retire_worker_identity(wid, workspace=ws)
+    row = connections.remove_worker_identity(wid, server=args.server, workspace=ws)
     if row is None:
-        print(f"{args.worker} has no agent of its own")
+        print(f"{args.worker} has no agent of its own{' on ' + args.server if args.server else ''}")
         return 0
     print(f"removed {row['instance']} ({row.get('agent_mxid') or '?'}): lane stopped, row and vault secret gone; "
           "the agent stays on its server until the owner deletes it there")
@@ -258,8 +268,11 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--yes", action="store_true"); a.add_argument("--expected-server", default=None)
     a.set_defaults(fn=cmd_add)
     s = sub.add_parser("show"); s.add_argument("worker"); s.set_defaults(fn=cmd_show)
+    s.add_argument("--server", default=None, help="only the agent on this server (default: every one)")
     r = sub.add_parser("rotate"); r.add_argument("worker"); r.add_argument("token", nargs="?", default=None)
     r.set_defaults(fn=cmd_rotate)
+    r.add_argument("--server", default=None, help="the agent on this server, for a worker with several "
+                   "(--device-flow takes the server of --lane)")
     for s in (a, r):
         # A pasted token needs --repo and --logs-dir; --device-flow defaults them.
         s.add_argument("--repo", type=Path, default=None); s.add_argument("--logs-dir", type=Path, default=None)
@@ -267,6 +280,7 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("--display-name", default=None); s.add_argument("--lane", default=None)
         s.add_argument("--base", default=None, help=argparse.SUPPRESS); s.add_argument("--no-start", action="store_true")
     s = sub.add_parser("remove"); s.add_argument("worker"); s.set_defaults(fn=cmd_remove)
+    s.add_argument("--server", default=None, help="the agent on this server, for a worker with several")
     s = sub.add_parser("provision-begin"); s.add_argument("worker"); s.add_argument("--role", default=None)
     s.add_argument("--lane", default=None); s.set_defaults(fn=cmd_provision_begin)
     s = sub.add_parser("provision-wait"); s.add_argument("worker"); s.add_argument("--operation-id", required=True)
