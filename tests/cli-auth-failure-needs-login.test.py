@@ -120,6 +120,7 @@ class AuthFailureIsNeedsLogin(unittest.TestCase):
                         self.assertTrue(fire)
                         msg = relay.compose_message(signal)
                         self.assertIn("has to be signed in again", msg)
+                        self.assertIn("/login", msg, "a channel with no card still has a way through")
                         # Debounced: the same standing state does not re-fire.
                         self.assertFalse(relay.should_escalate(signal, _h)[0])
 

@@ -435,12 +435,11 @@ def _when_line(hold: dict, now: Optional[float] = None) -> str:
 
 def _notice_body(hold: dict, card: bool = False) -> str:
     from result_markers import neutralize_markers
-    # With the card left beside this notice, the card is the way out; without one, a reply is.
-    way = ('To keep working now, pick another model on the "Your agent\'s model" card I left you, '
-           'or send "retry now" to try this one again at once.\n'
-           if card else
-           'To keep working now, reply to this or just send "switch to sonnet" (or another model: '
-           "haiku, opus, fable), or pick a model under Agent Settings, Runtime, Model. "
+    # The card's start is never confirmed, so the typed and Settings routes stay beside it.
+    lead = ('To keep working now, pick another model on the "Your agent\'s model" card I left you. Or reply'
+            if card else "To keep working now, reply")
+    way = (f'{lead} to this or just send "switch to sonnet" (or another model: haiku, opus, fable), '
+           "or pick a model under Agent Settings, Runtime, Model. "
            'Send "retry now" to try the current model again at once.\n')
     return "[dm-only]\n" + neutralize_markers(
         f"Your Sutando core is paused: {_limit_words(hold)} (pause {_incident_ref(hold)}).\n\n"

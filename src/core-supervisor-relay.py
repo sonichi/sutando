@@ -322,8 +322,8 @@ def _compose(signal: dict, surface: str = "") -> str:
                 " If the core looks fine, no action is needed.")
     elif _is_login_class(signal):
         host = _core_host_label() or "the host"
-        msg += (f" — it is signed out and has to be signed in again on {host}, from its card"
-                " or its terminal. A chat reply can't sign it in.")
+        msg += (f" — it is signed out and has to be signed in again on {host}, from its card,"
+                " or by typing /login in its terminal there. A chat reply can't sign it in.")
     else:
         host = _core_host_label() or "the host"
         where = f"in its terminal on {host}"

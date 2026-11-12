@@ -422,9 +422,8 @@ class Launcher(unittest.TestCase):
         self.assertIn("usage limit on claude-opus-5-5", lines[0])
         notice = next((self.ws / "results").glob("proactive-*.txt")).read_text()
         self.assertIn("card I left you", notice)
-        for typed in ("switch to sonnet", "reply to this"):
-            self.assertNotIn(typed, notice, "the card picks the model; no typed switch beside it")
-        self.assertIn('"retry now"', notice, "the card has no retry, so the notice keeps that way open")
+        for way in ('"switch to sonnet"', "Agent Settings, Runtime, Model", '"retry now"'):
+            self.assertIn(way, notice, "the card's start is unconfirmed, so every other way stays")
 
 
 class StatusSurfaces(unittest.TestCase):
@@ -1215,6 +1214,9 @@ class ModelSwitchWayOut(unittest.TestCase):
                                             card_entry=str(entry)).launch)
             self.assertFalse(clh.read_hold(ws)["card_presented"], "a failed card never stops the hold")
             self.assertTrue(clh.read_hold(ws)["notice_queued"])
+            notice = next((ws / "results").glob("proactive-*.txt")).read_text()
+            for way in ('"switch to sonnet"', "Agent Settings, Runtime, Model", '"retry now"'):
+                self.assertIn(way, notice, "a card that never started leaves the other ways out")
 
     def test_card_outlives_no_part_of_a_hold_6_to_24h_long(self):
         """A reset 6-24h away holds until reset + grace; notice_queued stops a re-present, so
