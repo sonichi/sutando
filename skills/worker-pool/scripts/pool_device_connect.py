@@ -67,8 +67,8 @@ def _bounded(value, default: int, low: int, high: int) -> int:
         return default
 
 
-def start(base: str, label: str, display_name: str, *, server: str = "", request=pp.http_json,
-          clock=time.time) -> dict:
+def start(base: str, label: str, display_name: str, *, server: str = "", welcome_core: str = "",
+          request=pp.http_json, clock=time.time) -> dict:
     """A new device code for agent `label`: {device_code, verify_url, interval, expires_at}. The approval
     link must be on `base`'s origin or on `server`'s own https host, and must not carry the device code,
     which alone collects the bearer."""
@@ -78,6 +78,8 @@ def start(base: str, label: str, display_name: str, *, server: str = "", request
     body = {"label": label}
     if display_name:
         body["display_name"] = display_name[:64]
+    if welcome_core:
+        body.update(welcome="worker", welcome_core=welcome_core)
     status, _, out = request("POST", base + START_PATH, payload=body)
     code, url = out.get("device_code"), out.get("verify_url")
     if status != 200 or not isinstance(code, str) or not code or not isinstance(url, str):
@@ -178,7 +180,8 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     if base != gateway:
         raise DeviceConnectError("the connect base must be the core's own gateway origin, so the approval link "
                                  "cannot come from another host")
-    pending = start(base, label, display_name, server=str(core.get("server") or ""), request=request, clock=clock)
+    pending = start(base, label, display_name, server=str(core.get("server") or ""),
+                    welcome_core="" if rotate else str(core.get("agent_mxid") or ""), request=request, clock=clock)
     known = [pending["device_code"]]
     note = approval_note(worker_label or worker, label, pending["verify_url"], pending["expires_at"])
     send = deliver or (lambda text: send_to_owner(workspace or connections._workspace(None), text))

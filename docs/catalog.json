@@ -106,7 +106,7 @@
    ],
    "status": "active",
    "canonical_for": "Codex core setup, earned-reset policy, and rollback",
-   "last_verified": "2026-10-30"
+   "last_verified": "2026-11-10"
   },
   "docs/community-use-cases/README.md": {
    "title": "Community use cases",
@@ -474,6 +474,17 @@
    "status": "draft",
    "canonical_for": "the composition of the lead-follower pool (#3314) with standing sessions (#3263)",
    "last_verified": "2026-08-25"
+  },
+  "docs/pr-watch-lifecycle.md": {
+   "title": "PR-watch runner lifecycle",
+   "audience": [
+    "operators",
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "PR-watch runner shutdown admission, thread and process draining, cleanup deadlines, and local validation boundaries",
+   "last_verified": "2026-11-11"
   },
   "docs/proactive-loop-rationale.md": {
    "title": "Proactive loop — rationale and measurements",

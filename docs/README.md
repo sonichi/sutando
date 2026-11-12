@@ -41,6 +41,7 @@ Machine-readable ownership and lifecycle metadata lives in
 
 ## Operations
 
+- [PR-watch runner lifecycle](pr-watch-lifecycle.md) — thread and process draining, shutdown limits, and isolated verification.
 - [Recovery issue metrics](recovery-issue-metrics.md) — persistent issue IDs and recovery-rate definitions.
 
 - [Release process and migrations](release-process.md)
