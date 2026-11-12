@@ -152,6 +152,7 @@ def main():
     rid4 = "cccccccc-7a4d-4e8b-9f61-2c5d8a0b7e14"
     late_fence = fence(rid4, mode="refine", app_id="a1b2c3d4", thread_message="$c2", description="add a date")
     timer = threading.Timer(0.3, write, ("task-change2", late_fence))
+    os.environ["BUILD_THREAD_CONVERSATION"] = "true"  # only with the switch on does a message wait
     rgb._INTAKE_MODE["deadline"] = time.monotonic() + 3.0
     began = time.monotonic()
     timer.start()
@@ -160,16 +161,19 @@ def main():
     finally:
         timer.join()
         rgb._INTAKE_MODE["deadline"] = None
+        os.environ.pop("BUILD_THREAD_CONVERSATION", None)
     check("a fence that lands during the wait still drops its message", not queued("task-change2-msg")
           and settled("task-change2-msg") and queued("task-change2") and time.monotonic() - began < 2.5)
 
     # 4. A message nothing names waits out the round, then is delivered.
+    os.environ["BUILD_THREAD_CONVERSATION"] = "true"
     rgb._INTAKE_MODE["deadline"] = time.monotonic() + 0.6
     began = time.monotonic()
     try:
         write("task-late", thread_message("$l1", text="also add a date column"))
     finally:
         rgb._INTAKE_MODE["deadline"] = None
+        os.environ.pop("BUILD_THREAD_CONVERSATION", None)
     check("an unnamed message is delivered after the round's wait",
           queued("task-late") and 0.4 <= time.monotonic() - began < 2.0)
     write("task-free", thread_message("$l2", text="thanks"))
@@ -204,8 +208,9 @@ def main():
             rgb._BUILD_REQUEST = real
         check(f"a verdict that {name} delivers the message, and the bridge stays up",
               queued(f"task-{name}") and isinstance(got, tuple) and time.monotonic() - began < 3.0, repr(got))
-    check("and says so in one log line", any("build thread gate: TimeoutExpired; delivering" in m for m in logs)
-          and any("build thread gate: the verdict exited 3; delivering" in m for m in logs))
+    check("and a timeout or garbage says so in one log line",
+          any("build thread gate: TimeoutExpired; delivering" in m for m in logs)
+          and any("build thread gate: an unreadable verdict; delivering" in m for m in logs))
 
     # The child sees only the workspace's and the skill's own variables, never the gateway token,
     # and runs isolated (-I). Each probe answers "duplicate" (settled) only if that holds.
@@ -307,6 +312,85 @@ def main():
         rgb._build_thread_verdict = real_verdict
     check("a team-tier sender never starts the verdict; the owner's message does",
           queued("task-team2") and len(calls) == 1 and calls[0][1] == "owner")
+
+    # 9. The review on 5807e0eb. Switch off, an old app thread: the owner's "thanks" never waits.
+    rid9 = "33333333-7a4d-4e8b-9f61-2c5d8a0b7e14"
+    write("task-fence9", dict(fence(rid9, description="A quiz for the team"), timestamp=now_iso(-7 * 86400)))
+    rgb._INTAKE_MODE["deadline"] = time.monotonic() + 6.0
+    began = time.monotonic()
+    try:
+        write("task-thanks9", thread_message("$th9", text="thanks, looks great"))
+    finally:
+        rgb._INTAKE_MODE["deadline"] = None
+    check("switch off, an owner's thanks in a week-old app thread is delivered at once",
+          queued("task-thanks9") and time.monotonic() - began < 1.5)
+
+    # The first pass runs no check at all: every threaded owner task is taken after the acks.
+    calls = []
+    real_verdict = rgb._build_thread_verdict
+    rgb._build_thread_verdict = lambda *x, **k: calls.append(x) or real_verdict(*x, **k)
+    rgb._INTAKE_MODE["defer"] = True
+    try:
+        write("task-first-pass", thread_message("$fp1"))
+        first_pass = "queued"
+    except rgb._IntakeDeferred:
+        first_pass = "deferred"
+    finally:
+        rgb._INTAKE_MODE["defer"] = False
+        rgb._build_thread_verdict = real_verdict
+    check("the first pass defers a threaded owner task without running its check",
+          first_pass == "deferred" and calls == [] and not queued("task-first-pass"))
+
+    # A build-thread wait never spends the lane dedupe's: its own runs first, later tasks keep theirs.
+    import lane_dedupe  # noqa: PLC0415
+    seen_waits = []
+    real_reason = lane_dedupe.duplicate_reason
+
+    def reason(*a, wait_s=None, **k):
+        seen_waits.append(wait_s)
+        return None
+    lane_dedupe.duplicate_reason = reason
+    rgb.BUILD_THREAD_ROUND_S, real_round = 1.0, rgb.BUILD_THREAD_ROUND_S
+    os.environ["BUILD_THREAD_CONVERSATION"] = "true"
+    rid10 = "44444444-7a4d-4e8b-9f61-2c5d8a0b7e14"
+    root10 = "$threadRoot10:s.space"  # its own thread: no question is open there
+    write("task-fence10", fence(rid10, mode="refine", app_id="a1b2c3d4", thread_message="$elsewhere",
+                                description="a later change", thread_root=root10))
+    seen_waits.clear()
+    rgb._INTAKE_MODE["deadline"] = time.monotonic() + 3.0
+    try:
+        write("task-waits10", thread_message("$w10", text="make the title bigger", root=root10))
+        write("task-next10", thread_message("$n10", text="and darker", root=root10))
+    finally:
+        rgb._INTAKE_MODE["deadline"] = None
+        os.environ.pop("BUILD_THREAD_CONVERSATION", None)
+        rgb.BUILD_THREAD_ROUND_S = real_round
+        lane_dedupe.duplicate_reason = real_reason
+    check("the waiting task's own lane dedupe ran first, with the round's whole wait",
+          len(seen_waits) == 2 and seen_waits[0] is not None and seen_waits[0] > 2.5, repr(seen_waits))
+    check("and the next task's lane dedupe still gets the rest of the round",
+          len(seen_waits) == 2 and seen_waits[1] is not None and seen_waits[1] > 1.5, repr(seen_waits))
+    check("both are delivered", queued("task-waits10") and queued("task-next10"))
+
+    # Wiring: the verdict goes through the shared runner, isolated, the question on stdin.
+    import optional_script  # noqa: PLC0415
+    got = {}
+    real_runner = optional_script.run_optional_script
+
+    def runner(script, args, **kw):
+        got.update(script=script, args=list(args), **kw)
+        return '{"verdict": "none", "request_id": null}'
+    optional_script.run_optional_script = runner
+    try:
+        write("task-wired", thread_message("$wire1", text="wired"))
+    finally:
+        optional_script.run_optional_script = real_runner
+    question = json.loads(got.get("input") or "{}")
+    check("the adapter delegates to run_optional_script", got.get("script") == rgb._BUILD_REQUEST
+          and got.get("args", [])[:2] == ["intake-verdict", "-"] and got.get("isolated") is True
+          and set(got.get("env") or {}) <= set(rgb._INTAKE_ENV) and got.get("timeout") == rgb.BUILD_THREAD_VERDICT_S
+          and question.get("tier") == "owner" and question.get("fields", {}).get("task") == "wired"
+          and queued("task-wired"), repr({k: v for k, v in got.items() if k != "on_error"}))
 
     print(f"commons-app-builder intake gate: {'FAIL' if failures else 'OK'} ({len(failures)} failed)")
     return 1 if failures else 0

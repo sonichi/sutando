@@ -1608,6 +1608,14 @@ with tempfile.TemporaryDirectory() as tmp:
     tt = lambda text, now: br.thread_task(text, led, tasks, now=now)
     check("switch-is-off-for-thread-task", br.thread_conversation() is False)
 
+    def ttw(text, now):
+        """thread_task with the switch on: only then does a message wait for its fence."""
+        br.thread_conversation = lambda: True
+        try:
+            return br.thread_task(text, led, tasks, now=now)
+        finally:
+            br.thread_conversation = real_switch
+
     # A thread no fence has ever named: an ordinary message at once, however young.
     check("an-unknown-thread-is-none-at-once", tt(msg(tmp, "cold", at=T0, mid="$c0"), now=T0 + 1) == ("none", None))
 
@@ -1623,8 +1631,13 @@ with tempfile.TemporaryDirectory() as tmp:
     thanks = msg(tmp, "thanks", "thanks!", at=T0 + 60, mid="$b2")
     again = msg(tmp, "again", DESC, at=T0 + 3 * 86400, mid="$b3")
     check("the-same-words-again-later-are-not-the-used-slot", tt(again, now=T0 + 3 * 86400 + 99) == ("none", None))
-    check("a-second-message-waits-while-young", tt(thanks, now=T0 + 65) == ("wait", None))
-    check("then-it-is-an-ordinary-message", tt(thanks, now=T0 + 60 + br.settle_seconds()) == ("none", None))
+    check("switch-off-a-second-message-never-waits", tt(thanks, now=T0 + 65) == ("none", None))
+    check("a-second-message-waits-while-young", ttw(thanks, now=T0 + 65) == ("wait", None))
+    check("then-it-is-an-ordinary-message", ttw(thanks, now=T0 + 60 + br.settle_seconds()) == ("none", None))
+    # A thread whose fences are all older than a request's lifetime is no longer waited on.
+    stale = msg(tmp, "stale", "thanks, looks great", at=T0 + br.ASK_TTL_S + 5, mid="$b7")
+    check("switch-on-a-thread-with-only-a-day-old-fence-never-waits",
+          ttw(stale, now=T0 + br.ASK_TTL_S + 6) == ("none", None))
     before = msg(tmp, "before", "hello", at=T0 - 5, mid="$b0")
     check("a-message-before-the-build-fence-is-not-its", tt(before, now=T0 + 600) == ("none", None))
     # Once the request is answered, its slot is closed: the words alone take nothing.
@@ -1713,7 +1726,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # A change: its thread message comes BEFORE its fence, which then names it.
     change_msg = msg(tmp, "change", "make the buttons bigger", at=T0 + 7200, mid="$x1")
-    check("a-changes-message-waits-for-its-fence", tt(change_msg, now=T0 + 7201) == ("wait", None))
+    check("a-changes-message-waits-for-its-fence", ttw(change_msg, now=T0 + 7201) == ("wait", None))
     (tasks / "task-change.txt").write_text(task(mode="refine", app_id="a1b2c3d4", thread_root=ROOT, thread_message="$x1",
                                                 request_id=CHANGE_ID, description="bigger buttons", when=iso(T0 + 7202)))
     check("named-by-its-fence-it-is-a-duplicate", tt(change_msg, now=T0 + 7203) == ("duplicate", CHANGE_ID))
@@ -1814,8 +1827,8 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # A stamp in the future never keeps a message waiting past the settle time from when it was first seen.
     future = msg(tmp, "future", "and also", at=T0 + 10**6, mid="$f1")
-    check("a-future-stamp-waits-once", tt(future, now=T0 + 7300) == ("wait", None))
-    check("then-no-longer-than-the-settle-time", tt(future, now=T0 + 7300 + br.settle_seconds()) == ("none", None))
+    check("a-future-stamp-waits-once", ttw(future, now=T0 + 7300) == ("wait", None))
+    check("then-no-longer-than-the-settle-time", ttw(future, now=T0 + 7300 + br.settle_seconds()) == ("none", None))
 
     # Unreadable bits are skipped, never matched, never fatal; the default inbox is the watcher's.
     (led._path(ROOM, BUILD_ID).parent / "00000000-0000-4000-8000-0000000000aa.json").write_text("{nope")

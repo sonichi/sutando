@@ -1063,8 +1063,9 @@ def thread_task(task_text: str, ledger: "Ledger", tasks_dir: Optional[Path] = No
        whose text is the fence's description (the client's own first message), once; closed once
        the request is answered or a question is asked;
     3. ("answer", id): the owner's answer to a request's open question (switch on);
-    4. ("wait", None): a known app thread, the asking owner, no fence names it yet, and younger
-       than settle_seconds(): a change's message arrives before its fence. Run it again after;
+    4. ("wait", None): switch on, a thread one of the owner's fences named within ASK_TTL_S (a
+       request's own lifetime), no fence names it yet, and younger than settle_seconds(): a
+       change's message arrives before its fence. Run it again after;
     5. ("none", None): an ordinary message.
     Every verdict but none needs the attested owner tier, the fence's own owner, the same room and
     the same thread root. Times are the gateway's `timestamp` headers; `now` is this host's clock."""
@@ -1112,9 +1113,10 @@ def _verdict(meta: Dict[str, str], line: str, ledger: "Ledger", tasks_dir: Optio
             if (asked.get("thread_root") == root and asked.get("owner") == owner
                     and not e.get("answer") and not e.get("reply")):
                 return "answer", e.get("request_id")
-    # 4. A change's message comes before its fence: wait for it, in a thread known as an app's,
-    #    never longer than the settle time from when it was first seen, whatever its stamp says.
-    if mine and message and at is not None and now - at < settle_seconds():
+    # 4. Switch on, a change's message comes before its fence: wait for it in a thread an app's
+    #    fence named within ASK_TTL_S, never past the settle time from when it was first seen.
+    live = [e for e in mine if now - (e["fence"].get("at") or 0) < ASK_TTL_S]
+    if thread_conversation() and live and message and at is not None and now - at < settle_seconds():
         if now - ledger.first_seen(room, message, now) < settle_seconds():
             return "wait", None
     return "none", None

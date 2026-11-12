@@ -276,17 +276,21 @@ The two are tied exactly, never by time:
 
 **Where it runs first: the gateway bridge.** Before a room task with a `thread_root` is queued,
 the bridge's intake gate (`src/remote-gateway-bridge.py`, `_build_thread_gate`) asks this same
-verdict about the owner's message: `build_request.py intake-verdict -`, a subprocess given the
-gateway's own fields and the tier the bridge resolved, never code loaded into the bridge. It runs
-isolated (`python -I`) with only `HOME`, the workspace's `SUTANDO_WORKSPACE`, `SUTANDO_TEST_MODE`
-and `SUTANDO_DEFAULT_WORKSPACE`, and this skill's `BUILD_THREAD_CONVERSATION` and
-`BUILD_THREAD_SETTLE_SECONDS`: never the gateway's token. It has 2 s, and never past the round's
-wait (its ledger lock waits at most 1 s, then it exits 3); a non-zero exit, a timeout or
-unparseable output delivers the message. `duplicate`: the message is settled unqueued and the agent never sees it.
-`wait`: it is taken after the round's other tasks, held in memory and unacked, and rechecked
-every 0.25 s until the round's wait ends (6 s), then delivered; a restart re-serves it. Anything
-else is delivered as usual. So a threaded task
-that reaches the agent is one the bridge could not decide.
+verdict about the owner's message: `build_request.py intake-verdict -`, run through the shared
+optional-script runner (`src/optional_script.py`), never loaded into the bridge. It gets the
+gateway's own fields and the tier the bridge resolved on stdin, runs isolated (`python -I`) with
+only `HOME`, the workspace's `SUTANDO_WORKSPACE`, `SUTANDO_TEST_MODE` and
+`SUTANDO_DEFAULT_WORKSPACE`, and this skill's `BUILD_THREAD_CONVERSATION` and
+`BUILD_THREAD_SETTLE_SECONDS` (never the gateway's token), and has 2 s (its ledger lock waits at
+most 1 s, then it exits 3). A non-zero exit, a timeout or unparseable output delivers the message.
+
+In a served round the check costs the first pass nothing: the task is taken after the round's
+acks, after its lane dedupe (which keeps its own wait), and every build-thread check and wait in
+the round shares one budget of 3 s, half the round's 6 s wait. `duplicate`: settled unqueued, the
+agent never sees it. `wait`: held in memory, unacked, and rechecked every 0.25 s within that
+budget, then delivered; a restart re-serves it. Past the budget a task is delivered unchecked.
+Anything else is delivered as usual. So a threaded task that reaches the agent is one the bridge
+could not decide.
 
 On **any room task with a `thread_root` header** that reaches you, run first:
 
@@ -304,9 +308,11 @@ posts nothing anywhere. The checks run in this order:
    the slot was free, the request neither answered nor asking). Write `[no-send]` and do nothing.
 3. `answer <request_id>`: a question is open for a request in this thread (switch on). Go on as
    `answer` does.
-4. `wait`: this thread is a known app thread (some fence named it), the sender is its owner, no
-   fence names this message yet, and it is younger than `BUILD_THREAD_SETTLE_SECONDS` (env, then the
-   manifest; default 30). A change's message arrives **before** its fence, so wait that long, run
+4. `wait`: **switch on only**. This thread is an app thread one of the owner's fences named within
+   the last 24 hours (`ASK_TTL_S`, a request's own lifetime; older fences still tie messages
+   exactly, but no longer make a thread one to wait in), the sender is its owner, no fence names
+   this message yet, and it is younger than `BUILD_THREAD_SETTLE_SECONDS` (env, then the manifest;
+   default 30). With the switch off a message never waits. A change's message arrives **before** its fence, so wait that long, run
    `thread-task` again, and only then treat it as `none`. A message is never `wait` for longer than
    the settle time from when `thread-task` first saw it (recorded in the ledger), whatever its
    timestamp says.
