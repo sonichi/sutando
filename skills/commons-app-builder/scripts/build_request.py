@@ -15,8 +15,8 @@ Usage (task.txt is the whole task file, headers included: they say who sent it a
   build_request.py check  <plan.json> <n> <result.json>    -> exit 1 with the reason if step n's
                                                               result fails its check; 0 if it passes
   build_request.py chunks <page.html>                      -> chunk byte sizes, one per line
-plan exits 3 printing the recorded reply when the request_id was already answered, and 4 when
-another run holds it. Add --ledger DIR to keep the record somewhere other than the workspace.
+plan exits 5 printing the recorded reply when the request_id was already answered (never 3:
+room-commons' `action` exits 3 for an outcome it cannot know), and 4 when another run holds it. Add --ledger DIR to keep the record somewhere other than the workspace.
 """
 from __future__ import annotations
 
@@ -36,6 +36,8 @@ VERSION = 1
 WRITE_LIMIT = 20_000            # bytes per page write: the bridge's per-write cap, kept on every write
 DESCRIPTION_MAX = 2_000
 TEMPLATES = ("tracker", "poll", "planner", "turn-game")
+# plan's exit for a request already answered: not 3, room-commons' `action` code for "pending".
+ANSWERED = 5
 MODES = ("build", "refine")
 CLAIM_TTL_S = 30 * 60            # a claim nobody finished stops blocking a retry after this
 
@@ -434,6 +436,32 @@ def _checked_schema(schema: Any) -> Dict[str, Any]:
     return checked
 
 
+def _checked_adaptation(adaptation: Dict[str, Any], template_schema: Dict[str, Any]) -> None:
+    """The adaptation's own names, under the rules an own schema's are: app_name and
+    database_name, and `options` only for the template's option columns, a list of names each."""
+    for key in ("app_name", "database_name"):
+        if adaptation.get(key) is not None:
+            _name(adaptation[key], f"the adaptation's {key}")
+    options = adaptation.get("options")
+    if options is None:
+        return
+    if not isinstance(options, dict):
+        raise ActionFailed("the adaptation's options must map a column to its list of options")
+    primary = next(d for d in template_schema["databases"] if d.get("role") == "primary")
+    with_options = {p["name"] for p in primary.get("props", []) if p.get("options")}
+    for column, names in options.items():
+        if column not in with_options:
+            raise ActionFailed(f"the adaptation gives options for {column!r}, which has none in this template")
+        if not isinstance(names, list) or not names or len(names) > MAX_OPTIONS:
+            raise ActionFailed(f"the options for {column} must be a list of 1 to {MAX_OPTIONS} names")
+        seen: set = set()
+        for n in names:
+            folded = _name(n, f"an option of {column}").strip().casefold()
+            if folded in seen:
+                raise ActionFailed(f"the options for {column} list {n} twice")
+            seen.add(folded)
+
+
 def build_inputs(request: Dict[str, Any], adaptation: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, Any]], str]:
     """(page html, schema, app name) for this request. A refine edits the page and no database.
     A build takes the template the request or the adaptation names (else one matching the
@@ -449,6 +477,7 @@ def build_inputs(request: Dict[str, Any], adaptation: Dict[str, Any]) -> Tuple[s
         if not adaptation.get("html"):
             raise ActionFailed("an adaptation's own schema needs its own page (html) written against it")
         raw_schema = _checked_schema(adaptation["schema"])
+    _checked_adaptation(adaptation, raw_schema)  # against the columns this build actually uses
     page_html, schema = adapt(raw_page, raw_schema, adaptation)
     name = (adaptation.get("app_name") or raw_schema.get("app") or "App").strip()
     return page_html, schema, name
@@ -576,7 +605,7 @@ def execute(steps: List[Dict[str, Any]], call: Callable[[Dict[str, Any]], Dict[s
     decided: Dict[int, Any] = {}
     written = False
     for n, step in enumerate(steps):
-        if step.get("skip_if_present") and step["skip_if_present"] in present:
+        if step.get("skip_if_present") and step["skip_if_present"].strip().casefold() in present:
             step = decided.get(id(step), "skip")
             if step == "skip":
                 continue
@@ -592,15 +621,6 @@ def execute(steps: List[Dict[str, Any]], call: Callable[[Dict[str, Any]], Dict[s
             # Every column the database already has is decided now, before any column is written.
             decided = column_decisions(steps, n, answers, present)
     return answers
-
-
-def column_decisions(steps: List[Dict[str, Any]], n: int, answers: Dict[str, Any],
-                     present: set) -> Dict[int, Any]:
-    """For each column step after step n whose column the database already has: "skip", or the
-    prop_update to run in its place. Raises ActionFailed for the first that cannot be used, so a
-    build that must fail fails before it writes anything to the owner's database."""
-    return {id(later): existing_column(later, answers) or "skip" for later in steps[n + 1:]
-            if later.get("skip_if_present") and later["skip_if_present"] in present}
 
 
 def verify(step: Dict[str, Any], result: Dict[str, Any], answers: Optional[Dict[str, Any]] = None,
@@ -646,7 +666,8 @@ def verify(step: Dict[str, Any], result: Dict[str, Any], answers: Optional[Dict[
         if found.get("properties_truncated") is True:  # no read shows every column and option
             raise ActionFailed(f"the room lists database {step['expect_database']} without all of its "
                                "columns or options, so they cannot be checked before anything is written")
-        present.update(p.get("name") for p in found.get("properties", []) if p.get("name"))
+        present.update(p["name"].strip().casefold() for p in found.get("properties", [])
+                       if isinstance(p.get("name"), str))
         if answers is not None:
             answers["$columns"] = {p["name"].casefold(): {"name": p["name"], "type": p.get("type"),
                                                            "options": list(p.get("options") or [])}
@@ -671,9 +692,13 @@ def existing_column(step: Dict[str, Any], answers: Dict[str, Any]) -> Optional[D
     (only on a database with no rows, so no value can be cleared), or ActionFailed: another type,
     or options missing from a database that already has rows."""
     want = step["arguments"]["property"]
-    have = (answers.get("$columns") or {}).get(want["name"].casefold())
+    have = (answers.get("$columns") or {}).get(want["name"].strip().casefold())
     if have is None:
         return None
+    if have["name"] != want["name"]:
+        # The page reads and writes its columns by exact name.
+        raise ActionFailed(f"the database has a column {have['name']}; this app reads it as {want['name']}: "
+                           f"rename it to {want['name']} in its table")
     if have.get("type") != want["type"]:
         raise ActionFailed(f"the database already has a {have.get('type')} column {have['name']}; "
                            f"this app needs it to be {want['type']}")
@@ -681,14 +706,33 @@ def existing_column(step: Dict[str, Any], answers: Dict[str, Any]) -> Optional[D
                if o["name"].casefold() not in {n.casefold() for n in have.get("options") or []}]
     if not missing:
         return None
+    lacking = f"column {have['name']} lacks the options " + ", ".join(o["name"] for o in missing)
+    if want["type"] == "status":
+        # The listing gives names only: resent, a status option would lose its group.
+        raise ActionFailed(f"{lacking}; a status column's options are not changed from here: add them in its table")
+    if answers.get("$rows") is None:
+        raise ActionFailed(f"{lacking}; the database's row count is not known, so they were not changed: "
+                           "add them in its table")
     if answers.get("$rows") != 0:
-        raise ActionFailed(f"column {have['name']} lacks the options "
-                           + ", ".join(o["name"] for o in missing)
-                           + "; the database already has rows, so they were not changed: add them in its table")
+        raise ActionFailed(f"{lacking}; the database already has rows, so they were not changed: add them in its table")
     options = [{"name": n} for n in have.get("options") or []] + missing
-    return dict(step, skip_if_present=None, arguments={
+    replaced = dict(step, skip_if_present=None, arguments={
         "database": step["arguments"]["database"], "op": "prop_update", "prop": have["name"],
         "property": {"options": options}})
+    if step.get("operation_id"):
+        replaced["operation_id"] = f"{step['operation_id']}-update"
+    if "cli" in step:
+        replaced["cli"] = cli_argv(replaced)
+    return replaced
+
+
+def column_decisions(steps: List[Dict[str, Any]], n: int, answers: Dict[str, Any],
+                     present: set) -> Dict[int, Any]:
+    """For each column step after step n whose column the database already has: "skip", or the
+    prop_update to run in its place. Raises ActionFailed for the first that cannot be used, so a
+    build that must fail fails before it writes anything to the owner's database."""
+    return {id(later): existing_column(later, answers) or "skip" for later in steps[n + 1:]
+            if later.get("skip_if_present") and later["skip_if_present"].strip().casefold() in present}
 
 
 def unwrap(result: Any) -> Dict[str, Any]:
@@ -753,7 +797,7 @@ def build(task_text: str, call: Callable[[Dict[str, Any]], Dict[str, Any]],
                               "this request is already being built")
     try:
         page_html, schema, name = build_inputs(request, adaptation)
-        answers = execute(plan(request, page_html, schema, name), call)
+        answers = execute(with_operation_ids(request["request_id"], plan(request, page_html, schema, name)), call)
         database = request.get("database") or answers.get("$db") or answers.get("$app_db")
         app_id = answers.get("$app") or request.get("app_id")
         verb = "Updated" if request["mode"] == "refine" else "Built"
@@ -813,7 +857,8 @@ def _check(args: List[str]) -> int:
             return 1
         columns = {str(i): by_step[id(later)] for i, later in enumerate(steps) if id(later) in by_step}
     shown = {k: v for k, v in answers.items() if not k.startswith("$columns") and k != "$rows"}
-    print(json.dumps({"present": sorted(present), "answers": shown, "columns": columns}, ensure_ascii=False))
+    listed = sorted(c["name"] for c in (answers.get("$columns") or {}).values()) or sorted(present)
+    print(json.dumps({"present": listed, "answers": shown, "columns": columns}, ensure_ascii=False))
     return 0
 
 
@@ -875,14 +920,15 @@ def main(argv: List[str]) -> int:
         adaptation = json.loads(Path(adapt_path).read_text(encoding="utf-8"))
     try:
         page_html, schema, name = build_inputs(request, adaptation)
-        steps = plan(request, page_html, schema, name)  # before the claim: a plan that fails holds nothing
+        # Before the claim: a plan that fails holds nothing.
+        steps = with_operation_ids(request["request_id"], plan(request, page_html, schema, name))
     except (ActionFailed, KeyError, ValueError, TypeError, AttributeError) as error:
         print(completion(request["request_id"], "failed", str(error) or type(error).__name__))
         return 1
     state, recorded = ledger().claim(request["room_id"], request["request_id"])
     if state == "done":
         print(recorded)
-        return 3
+        return ANSWERED
     if state == "busy":
         print("build_request: another run is building this request", file=sys.stderr)
         return 4
@@ -892,6 +938,17 @@ def main(argv: List[str]) -> int:
     return 0
 
 
+def with_operation_ids(request_id: str, steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Each write step with a fixed operation id from the request and the step's place, so a step
+    retried after an unknown outcome sends the same id (the server dedupes it where it can)."""
+    def digest(step):
+        raw = json.dumps(step["arguments"], sort_keys=True, ensure_ascii=False).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()[:8]
+    # The arguments are in the id: a re-plan with another adaptation is another operation.
+    return [step if step.get("read") else dict(step, operation_id=f"cab-{request_id}-{i}-{digest(step)}")
+            for i, step in enumerate(steps)]
+
+
 def cli_argv(step: Dict[str, Any]) -> List[str]:
     """The step as room-commons' `action` command (room_commons.py action …): the same Action on
     the deployment the CLI's lane reaches, its result printed in the shape `check` reads. `$db`
@@ -899,7 +956,9 @@ def cli_argv(step: Dict[str, Any]) -> List[str]:
     target = "account" if step.get("target_kind") == "account" else step["room_id"]
     argv = ["action", target, step["action"], "--args",
             json.dumps(step["arguments"], ensure_ascii=False, separators=(",", ":"))]
-    return argv + (["--read"] if step.get("read") else [])
+    if step.get("read"):
+        return argv + ["--read"]
+    return argv + (["--operation-id", step["operation_id"]] if step.get("operation_id") else [])
 
 
 if __name__ == "__main__":
