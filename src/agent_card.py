@@ -60,13 +60,14 @@ def avatar(*, mxid: str = "", url: str = "", seed: str = "", initial: str = "", 
 
 
 def button(label: str, kind: str, *, style: str = "", url: str = "", reply: str = "", room_id: str = "",
-           user_id: str = "", items: Optional[list] = None, confirm: str = "", disabled: bool = False,
+           user_id: str = "", items: Optional[list] = None, confirm: str = "", disabled: Optional[bool] = None,
            uses_input: bool = False) -> dict:
-    """A button, row action or menu item; `confirm` makes the client ask before it acts."""
+    """A button, row action or menu item; `confirm` makes the client ask first. On a done or expired
+    card the client disables a button unless it says `disabled: False`."""
     out = _drop_empty({"label": label, "kind": kind, "style": style, "url": url, "reply": reply,
                        "room_id": room_id, "user_id": user_id, "items": items, "confirm": confirm})
-    if disabled:
-        out["disabled"] = True
+    if disabled is not None:
+        out["disabled"] = bool(disabled)
     if uses_input:
         out["uses_input"] = True
     return out
@@ -114,80 +115,151 @@ def build(card_id: str, state: str, *, title: str, body: str, subtitle: str = ""
 
 # ── checking ──────────────────────────────────────────────────────────────────
 
-def _is_http(url: object) -> bool:
-    return isinstance(url, str) and re.fullmatch(r"https?://\S+", url, re.I) is not None
+# The web client's limits: past any of them it shows the plain body instead of the card.
+LIMITS = {"id": 200, "title": 120, "subtitle": 300, "text": 4000, "badges": 8, "fields": 12, "buttons": 6,
+          "groups": 10, "rows": 100, "row_actions": 4, "menu_items": 8, "reply": 1000, "input_value": 200,
+          "pattern": 300}
+_APP_RE = re.compile(r"[a-z0-9_]{1,64}")
+_INPUT_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+
+
+def _link_ok(url: object, schemes: Tuple[str, ...] = ("http", "https")) -> bool:
+    """An absolute link in one of `schemes`, with a host and no embedded credentials."""
+    if not isinstance(url, str) or any(c.isspace() for c in url):
+        return False
+    import urllib.parse
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    return parts.scheme.lower() in schemes and bool(parts.netloc) and "@" not in parts.netloc
 
 
 def _text(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _long(value: object, limit: str) -> bool:
+    return isinstance(value, str) and len(value) > LIMITS[limit]
+
+
 def _avatar_problem(av: object, where: str) -> Optional[str]:
     if not isinstance(av, dict) or not any(_text(av.get(k)) for k in AVATAR_KEYS):
         return f"{where} needs one of {', '.join(AVATAR_KEYS)}"
-    if "url" in av and not _is_http(av["url"]):
-        return f"{where}.url is not an http(s) link"
+    if "url" in av and not _link_ok(av["url"], ("https", "mxc")):
+        return f"{where}.url must be an https or mxc:// link"
+    if "app" in av and not (isinstance(av["app"], str) and _APP_RE.fullmatch(av["app"])):
+        return f"{where}.app is not an app slug"
     if "shape" in av and av["shape"] not in ("round", "square"):
         return f"{where}.shape must be round or square"
     return None
 
 
-def _action_problem(b: object, where: str, *, in_menu: bool = False) -> Optional[str]:
+def _action_problem(b: object, where: str, *, menu_ok: bool = False) -> Optional[str]:
     if not isinstance(b, dict) or not _text(b.get("label")):
         return f"{where} needs a label"
     kind = b.get("kind")
-    if kind not in BUTTON_KINDS or (in_menu and kind == "menu"):
+    if kind not in BUTTON_KINDS:
         return f"{where}.kind {kind!r} is not one of {', '.join(BUTTON_KINDS)}"
+    if kind == "menu" and not menu_ok:
+        return f"{where}: a menu belongs only in a row's actions, and menu items do not nest"
     need = {"url": "url", "reply": "reply", "open_room": "room_id", "open_dm": "user_id"}.get(kind)
     if need and not _text(b.get(need)):
         return f"{where} of kind {kind} needs {need}"
-    if kind == "url" and not _is_http(b.get("url")):
-        return f"{where}.url is not an http(s) link"
+    if "url" in b and not _link_ok(b["url"]):
+        return f"{where}.url is not an http(s) link without credentials"
+    if _long(b.get("reply"), "reply"):
+        return f"{where}.reply is longer than {LIMITS['reply']} characters"
     if "style" in b and b["style"] not in STYLES:
         return f"{where}.style must be primary or secondary"
+    if "disabled" in b and not isinstance(b["disabled"], bool):
+        return f"{where}.disabled must be true or false"
     if kind == "menu":
         items = b.get("items")
-        if not isinstance(items, list) or not items:
-            return f"{where} of kind menu needs items"
+        if not isinstance(items, list) or not items or len(items) > LIMITS["menu_items"]:
+            return f"{where} of kind menu needs 1-{LIMITS['menu_items']} items"
         for i, item in enumerate(items):
-            found = _action_problem(item, f"{where}.items[{i}]", in_menu=True)
+            found = _action_problem(item, f"{where}.items[{i}]")
             if found:
                 return found
     return None
 
 
+def _input_problem(inp: object) -> Optional[str]:
+    if not isinstance(inp, dict) or not (isinstance(inp.get("name"), str) and _INPUT_NAME_RE.fullmatch(inp["name"])):
+        return "input.name must be a letter or _ then up to 63 letters, digits or _"
+    if _long(inp.get("value"), "input_value"):
+        return f"input.value is longer than {LIMITS['input_value']} characters"
+    if "pattern" in inp:
+        if not isinstance(inp["pattern"], str) or len(inp["pattern"]) > LIMITS["pattern"]:
+            return f"input.pattern must be a regex of at most {LIMITS['pattern']} characters"
+        try:
+            re.compile(inp["pattern"])
+        except re.error:
+            return "input.pattern does not compile"
+    return None
+
+
+def _many(card: Mapping[str, object], key: str, limit: str = "") -> Optional[str]:
+    value = card.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return f"{key} must be a list"
+    return f"{key} has more than {LIMITS[limit or key]}" if len(value) > LIMITS[limit or key] else None
+
+
 def problem(card: object) -> Optional[str]:
-    """Why a client would fall back to the plain body for `card`, or None when it draws it."""
+    """Why the client would fall back to the plain body for `card`, or None when it draws it. Unknown
+    fields are allowed; a missing state reads as info and a missing note_tone as dim."""
     if not isinstance(card, dict):
         return "the card is not an object"
     if card.get("kind") != KIND or card.get("v") != VERSION:
         return f"kind must be {KIND} and v {VERSION}"
-    if not _text(card.get("id")):
-        return "id is missing"
-    if card.get("state") not in STATES:
+    if not _text(card.get("id")) or _long(card["id"], "id"):
+        return f"id must be 1-{LIMITS['id']} characters"
+    if "state" in card and card["state"] not in STATES:
         return f"state must be one of {', '.join(STATES)}"
     header = card.get("header")
     if not isinstance(header, dict) or not _text(header.get("title")):
         return "header.title is missing"
+    for key in ("title", "subtitle"):
+        if key in header and (not isinstance(header[key], str) or _long(header[key], key)):
+            return f"header.{key} is longer than {LIMITS[key]} characters"
+    if _long(card.get("text"), "text") or ("text" in card and not isinstance(card["text"], str)):
+        return f"text must be at most {LIMITS['text']} characters"
     if "avatar" in header:
         found = _avatar_problem(header["avatar"], "header.avatar")
         if found:
             return found
+    found = _many(header, "badges")
+    if found:
+        return "header." + found
     for i, badge in enumerate(header.get("badges") or []):
         if not isinstance(badge, dict) or not _text(badge.get("label")) or badge.get("state", "on") not in BADGE_STATES:
             return f"header.badges[{i}] needs a label and a state of on, off or warn"
     shuffle = header.get("shuffle")
-    if shuffle is not None and not (isinstance(shuffle, dict) and _text(shuffle.get("reply"))):
+    if shuffle is not None and not (isinstance(shuffle, dict) and _text(shuffle.get("reply"))
+                                    and not _long(shuffle["reply"], "reply")):
         return "header.shuffle needs a reply"
+    for key in ("fields", "buttons", "groups"):
+        found = _many(card, key)
+        if found:
+            return found
     for i, field in enumerate(card.get("fields") or []):
         if not isinstance(field, dict) or not _text(field.get("label")) or not isinstance(field.get("value"), str):
             return f"fields[{i}] needs a label and a value"
-    inp = card.get("input")
-    if inp is not None and not (isinstance(inp, dict) and _text(inp.get("name"))):
-        return "input needs a name"
+    if "input" in card:
+        found = _input_problem(card["input"])
+        if found:
+            return found
+    rows = 0
     for g, grp in enumerate(card.get("groups") or []):
         if not isinstance(grp, dict) or not isinstance(grp.get("rows"), list):
             return f"groups[{g}] needs rows"
+        rows += len(grp["rows"])
+        if rows > LIMITS["rows"]:
+            return f"the groups hold more than {LIMITS['rows']} rows"
         for r, item in enumerate(grp["rows"]):
             where = f"groups[{g}].rows[{r}]"
             if not isinstance(item, dict) or not _text(item.get("title")):
@@ -198,8 +270,11 @@ def problem(card: object) -> Optional[str]:
                 found = _avatar_problem(item["avatar"], f"{where}.avatar")
                 if found:
                     return found
+            found = _many(item, "actions", "row_actions")
+            if found:
+                return f"{where}.{found}"
             for a, act in enumerate(item.get("actions") or []):
-                found = _action_problem(act, f"{where}.actions[{a}]")
+                found = _action_problem(act, f"{where}.actions[{a}]", menu_ok=True)
                 if found:
                     return found
     for i, b in enumerate(card.get("buttons") or []):
@@ -210,9 +285,8 @@ def problem(card: object) -> Optional[str]:
         return "note_tone must be dim, warn or ok"
     if "expires_at" in card and (isinstance(card["expires_at"], bool) or not isinstance(card["expires_at"], int)):
         return "expires_at must be milliseconds since the epoch"
-    footer = card.get("footer_link")
-    if footer is not None:
-        found = _action_problem(footer, "footer_link")
+    if card.get("footer_link") is not None:
+        found = _action_problem(card["footer_link"], "footer_link")
         if found:
             return found
     return None

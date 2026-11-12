@@ -517,8 +517,9 @@ class Cards(CardsBase):
         self.assertNotIn("\n", body)
         self.assertIn("[Approve on s.space](https://", body)
         self.assertEqual(self.actions.calls[1]["arguments"]["reply_to"], "$card1")
-        kinds = [(b["kind"], b.get("user_id") or b.get("reply")) for b in done["buttons"]]
-        self.assertEqual(kinds, [("open_dm", NEW_AGENT), ("reply", "Add reviewer to a room")])
+        kinds = [(b["kind"], b.get("user_id") or b.get("reply"), b.get("disabled")) for b in done["buttons"]]
+        self.assertEqual(kinds, [("open_dm", NEW_AGENT, False), ("reply", "Add reviewer to a room", False)])
+        self.assertNotIn("**", json.dumps(self.actions.cards()))
         self.assertTrue(all(c["room"] == DM and c["action"] == "room.message.send" for c in self.actions.calls))
         self.assertEqual(len({c["operation_id"] for c in self.actions.calls}), 2)
         self.assertNoSecret(fake, json.dumps(self.actions.calls))
@@ -532,8 +533,8 @@ class Cards(CardsBase):
             self.connect(fake, approve_after=None)
         expired = self.actions.cards()[-1]
         self.assertEqual(expired["state"], "expired")
-        self.assertEqual(expired["buttons"][0], {"label": "Send a new link", "kind": "reply", "style": "primary",
-                                                 "reply": f"card:worker-approval:{W}:resend"})
+        self.assertEqual(expired["buttons"][0], {"label": "Get a new link", "kind": "reply", "style": "primary",
+                                                 "reply": f"card:worker-approval:{W}:resend", "disabled": False})
         self.assertEqual(self.sent, [])
         self.assertEqual(dc.read_record(self.ws, W)["state"], "expired")
 

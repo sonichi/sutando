@@ -2,7 +2,8 @@
 """Agent panel cards (src/agent_card.py): the builders, the client's checks, the sender and card replies.
 
 - `build` returns a one-line body and a card the checks accept; a card a client would not draw raises.
-- `problem` allows unknown fields, needs the required keys, and takes only http(s) links.
+- `problem` matches the web client: unknown fields allowed, required keys, http(s) links without
+  credentials (avatars https or mxc), menus only in row actions, and the client's size limits.
 - `send_card` posts through the injected Action call (`room.message.send` with `extra_content`) and returns
   the event id; a private card goes only to the owner's checked DM. `update_card` posts a new card as a
   reply to the old one, since no Action carries a card in an edit.
@@ -83,24 +84,70 @@ class Check(unittest.TestCase):
         self.assertIsNone(ac.problem({**self.card, "sparkle": True, "header": {**self.card["header"], "x": 1}}))
 
     def test_required_keys(self):
-        for key in ("kind", "v", "id", "state", "header"):
+        for key in ("kind", "v", "id", "header"):
             broken = {k: v for k, v in self.card.items() if k != key}
             self.assertIsNotNone(ac.problem(broken), key)
         self.assertIsNotNone(ac.problem({**self.card, "header": {"subtitle": "no title"}}))
         self.assertIsNotNone(ac.problem({**self.card, "v": 2}))
 
-    def test_only_http_links(self):
-        for url in ("ftp://x", "file:///etc/passwd", "javascript:x", "//s.space"):
+    def test_only_http_links_without_credentials(self):
+        for url in ("ftp://x", "file:///etc/passwd", "javascript:x", "//s.space", "https://u:p@s.space/x",
+                    "https://u@s.space", "https://s.space/a b"):
             self.assertIsNotNone(ac.problem({**self.card, "buttons": [{"label": "x", "kind": "url", "url": url}]}))
             self.assertIsNotNone(ac.problem({**self.card, "header": {"title": "t", "avatar": {"url": url}}}))
         self.assertIsNone(ac.problem({**self.card, "buttons": [{"label": "x", "kind": "url", "url": "http://a.b"}]}))
 
+    def test_an_avatar_link_is_https_or_mxc_and_an_app_is_a_slug(self):
+        for url, ok in (("https://a.b/x.png", True), ("mxc://s.space/abc", True), ("http://a.b/x.png", False)):
+            self.assertEqual(ac.problem({**self.card, "header": {"title": "t", "avatar": {"url": url}}}) is None, ok)
+        for app, ok in (("gmail", True), ("google_calendar", True), ("Gmail", False), ("g-mail", False)):
+            self.assertEqual(ac.problem({**self.card, "header": {"title": "t", "avatar": {"app": app}}}) is None, ok)
+
+    def test_state_and_note_tone_may_be_left_out(self):
+        self.assertIsNone(ac.problem({k: v for k, v in self.card.items() if k != "state"}))
+
     def test_actions_need_their_target(self):
         for b in ({"label": "x", "kind": "reply"}, {"label": "x", "kind": "open_dm"},
-                  {"label": "x", "kind": "open_room"}, {"label": "x", "kind": "menu", "items": []},
-                  {"label": "x", "kind": "menu", "items": [{"label": "y", "kind": "menu", "items": []}]},
-                  {"kind": "reply", "reply": "r"}, {"label": "x", "kind": "teleport"}):
+                  {"label": "x", "kind": "open_room"}, {"kind": "reply", "reply": "r"},
+                  {"label": "x", "kind": "teleport"}, {"label": "x", "kind": "reply", "reply": "r", "disabled": "no"}):
             self.assertIsNotNone(ac.problem({**self.card, "buttons": [b]}), b)
+
+    def test_a_menu_is_for_row_actions_only_and_never_nests(self):
+        menu = {"label": "⋯", "kind": "menu", "items": [{"label": "y", "kind": "reply", "reply": "r"}]}
+        self.assertIsNotNone(ac.problem({**self.card, "buttons": [menu]}))
+        self.assertIsNotNone(ac.problem({**self.card, "footer_link": menu}))
+        rows = lambda m: [{"label": "g", "rows": [{"title": "t", "actions": [m]}]}]
+        self.assertIsNone(ac.problem({**self.card, "groups": rows(menu)}))
+        self.assertIsNotNone(ac.problem({**self.card, "groups": rows({**menu, "items": [menu]})}))
+        self.assertIsNotNone(ac.problem({**self.card, "groups": rows({**menu, "items": []})}))
+        self.assertIsNotNone(ac.problem({**self.card, "groups": rows({**menu, "items": menu["items"] * 9})}))
+
+    def test_the_input_name_and_pattern(self):
+        good = {"name": "agent_id", "value": "pylon", "pattern": "^[a-z]+$"}
+        self.assertIsNone(ac.problem({**self.card, "input": good}))
+        for bad in ({**good, "name": "agent-id"}, {**good, "name": "1x"}, {**good, "pattern": "(["},
+                    {**good, "value": "x" * 201}, {**good, "pattern": "a" * 301}):
+            self.assertIsNotNone(ac.problem({**self.card, "input": bad}), bad)
+
+    def test_the_client_limits(self):
+        c = self.card
+        reply = {"label": "x", "kind": "reply", "reply": "r"}
+        row = {"title": "t"}
+        over = [{**c, "id": "x" * 201}, {**c, "header": {"title": "x" * 121}},
+                {**c, "header": {"title": "t", "subtitle": "x" * 301}}, {**c, "text": "x" * 4001},
+                {**c, "header": {"title": "t", "badges": [{"label": "b"}] * 9}},
+                {**c, "fields": [{"label": "f", "value": "v"}] * 13}, {**c, "buttons": [reply] * 7},
+                {**c, "groups": [{"label": "g", "rows": [row]}] * 11},
+                {**c, "groups": [{"label": "g", "rows": [row] * 51}] * 2},
+                {**c, "groups": [{"label": "g", "rows": [{"title": "t", "actions": [reply] * 5}]}]},
+                {**c, "buttons": [{**reply, "reply": "x" * 1001}]}]
+        for card in over:
+            self.assertIsNotNone(ac.problem(card))
+        at = [{**c, "id": "x" * 200}, {**c, "header": {"title": "x" * 120}}, {**c, "text": "x" * 4000},
+              {**c, "buttons": [reply] * 6}, {**c, "groups": [{"label": "g", "rows": [row] * 50}] * 2},
+              {**c, "buttons": [{**reply, "reply": "x" * 1000}]}]
+        for card in at:
+            self.assertIsNone(ac.problem(card))
 
     def test_groups_rows_and_avatars(self):
         good = ac.group("Chat apps", [ac.row("Discord", state="off", avatar_=ac.avatar(app="discord", shape="square"),

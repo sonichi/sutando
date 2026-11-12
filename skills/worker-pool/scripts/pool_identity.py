@@ -28,7 +28,7 @@ a file, and never printed. `add` shows what the token's gateway says before anyt
 device-connect flow for agent LABEL, sends the owner the approval link in their DM, waits until they
 approve it in a browser (or the link expires, which it reports), checks the agent and its owner, and
 saves the token in the vault. It prints one JSON line with the agent id and a status. The owner sees an
-approval card (the text note when no card can be posted); once the link expires, the card's "Send a new
+approval card (the text note when no card can be posted); once the link expires, the card's "Get a new
 link" button replies `card:worker-approval:<worker>:resend`, and `card-reply` on that task starts the same
 flow again in the background, for the owner only.
 

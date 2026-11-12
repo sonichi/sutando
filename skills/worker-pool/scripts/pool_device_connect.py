@@ -193,7 +193,7 @@ def approval_card(worker: str, worker_label: str, label: str, verify_url: str, e
                   server: str, subtitle: str, rotate: bool = False, now: Optional[float] = None) -> tuple:
     """(body, card) asking the owner to approve agent `label` for the worker; the link is labelled, never bare."""
     until = _until(expires_at)
-    what = (f"a new token for the agent **{label}**" if rotate else f"the agent **{label}**")
+    what = (f"a new token for the agent {label}" if rotate else f"the agent {label}")
     return ac.build(
         card_id(worker, server), "pending", title=worker_label, subtitle=subtitle, avatar_=ac.avatar(seed=label),
         text=(f"Approve {what} so {worker_label} works as its own agent. Nothing is saved until you approve, "
@@ -209,12 +209,12 @@ def approval_card(worker: str, worker_label: str, label: str, verify_url: str, e
 def done_card(worker: str, worker_label: str, label: str, agent_id: str, *, server: str, subtitle: str,
               rotated: bool = False) -> tuple:
     """(body, card) once the approval is saved: the agent, a DM with it, and a way to give it a room."""
-    text = (f"**{label}** has a new token, and {worker_label} uses it. The old token no longer works." if rotated
-            else f"**{label}** is {worker_label}'s own agent now. Mention it in a room to give it work there.")
-    buttons = [ac.button(f"Message {label}", "open_dm", style="primary", user_id=agent_id)]
+    text = (f"{label} has a new token, and {worker_label} uses it. The old token no longer works." if rotated
+            else f"{label} is {worker_label}'s own agent now. Mention it in a room to give it work there.")
+    buttons = [ac.button(f"Message {label}", "open_dm", style="primary", user_id=agent_id, disabled=False)]
     if not rotated:
         buttons.append(ac.button(f"Add {label} to a room", "reply", style="secondary",
-                                 reply=f"Add {label} to a room"))
+                                 reply=f"Add {label} to a room", disabled=False))
     return ac.build(card_id(worker, server), "done", title=worker_label, subtitle=subtitle,
                     avatar_=ac.avatar(mxid=agent_id), text=text,
                     fields=[{"label": "Agent", "value": agent_id}], buttons=buttons,
@@ -228,10 +228,10 @@ def expired_card(worker: str, worker_label: str, label: str, expires_at: float, 
     until = _until(expires_at)
     return ac.build(card_id(worker, server), "expired", title=worker_label, subtitle=subtitle,
                     avatar_=ac.avatar(seed=label),
-                    text=f"The approval link for **{label}** expired at {until} before it was approved, so nothing "
+                    text=f"The approval link for {label} expired at {until} before it was approved, so nothing "
                          "was set up.",
-                    buttons=[ac.button("Send a new link", "reply", style="primary",
-                                       reply=ac.reply(CARD_KIND, worker, RESEND))],
+                    buttons=[ac.button("Get a new link", "reply", style="primary",
+                                       reply=ac.reply(CARD_KIND, worker, RESEND), disabled=False)],
                     note="A new link works for 15 minutes.", note_tone="dim",
                     body=ac.body_line(f"The approval link for agent \"{label}\" (pool worker {worker_label}) expired "
                                       f"at {until}; nothing was set up. Ask me for a new link."))
