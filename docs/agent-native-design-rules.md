@@ -2,7 +2,7 @@
 
 Every contribution that adds or changes something a person or an agent can do in s.space follows
 these rules. The same text lives in the web client, the backend and the agent engine; only the
-last section, "What this means here", differs.
+section "What this means here" differs.
 
 ## 1. Why
 
@@ -24,8 +24,11 @@ complete reference.
   stay behind an approval hold.
 - **Anything an agent needs from a person arrives as a control, not a sentence.**
 
-High-impact means, at least, irreversible actions and outward-facing ones: sending, publishing,
-purchasing, deleting, and changing permissions or credentials.
+High-impact means, at least, irreversible actions and outward-facing ones: sending to people or
+places outside the conversation the request came from (email, a post, another room), publishing,
+purchasing, deleting, and changing permissions or credentials. A reply in the conversation the
+request came from is not high-impact. A standing approval the owner gave for a named kind of
+action satisfies the hold, and only a person can give it.
 
 An Action's risk and its approval requirement come from the Action's own metadata, set by the
 platform. They never come from the caller or the card, so an agent cannot downgrade them.
@@ -38,7 +41,7 @@ Some things are person-only, by design. An agent never:
 
 - approves its own approval hold;
 - widens its own authority;
-- changes sign-in factors (password, 2FA, recovery);
+- changes sign-in factors (password, 2FA, recovery, sessions, devices);
 - mints or reveals credentials;
 - deletes the person's account.
 
@@ -61,7 +64,8 @@ gaps today:
 
 - Sending a secret is a typed `vault set` command.
 - Re-linking an agent is a typed approval code.
-- Clicks on room cards are not accepted yet (section 11).
+- Clicks on room cards, and the owner's click on an owner card in a shared room, are not accepted
+  yet (section 11).
 - A card's outcome is not yet edited in place: the updated card is posted as a reply to the old
   one, which stays as it was (section 7).
 
@@ -125,9 +129,10 @@ Two cases that are easy to get wrong:
   credential, and a private title is never shown to someone without access.
 - Let the person answer in one step, by action class (table below).
 - Show the card's own outcome on the same card: the status changes to Approved, Expired or Done,
-  updated in place. No second chat message repeats it.
-- Never show internals (ids, hostnames, session names, raw provider errors, key fragments) outside
-  Details.
+  updated in place. No second chat message repeats it. In-place update is a tracked gap today
+  (section 3).
+- Show internals (ids, hostnames, session names, raw provider errors) only in Details. Secrets and
+  key fragments appear nowhere a person can read them.
 - State an install-wide or hard-to-undo effect plainly, before the tap. Keep it undoable where
   possible.
 - Carry a plain-text fallback for clients that do not know the card.
@@ -201,7 +206,7 @@ There are two kinds of card:
 
 | Kind | Examples | Who may act | What the acting side checks |
 | --- | --- | --- | --- |
-| Owner card | An agent asking its own owner: approvals, sign-ins, the agent's own state | Only the owner | It issued the card, the card offered the payload, the sender is the owner, and the click is in the same room |
+| Owner card | An agent asking its own owner: approvals, sign-ins, the agent's own state | Only the owner | It issued the card, the card offered the payload, the sender is the owner, and the click is in the room the card was posted in (today, the owner's DM only) |
 | Room card | Room questions, room-app buttons, invites, polls | Any member the room's permission allows for that action | It issued the card, the card offered the payload, and the room's permission for that action allows the sender, in place of ownership |
 
 For both kinds:
@@ -210,9 +215,11 @@ For both kinds:
 - A click that fails the check is refused. It is never treated as chat.
 - There is one shared implementation of this check, not one per feature. Nobody writes a second.
 
-Today the shared check handles owner cards only. Room cards, a click by a room member with the
-room's permission, are a known gap (section 3). Until that path lands, a room card's buttons must
-not be relied on: use a link or open button, or a question.
+Today the shared check covers owner cards in the owner's DM only. The owner's own click in a
+shared room is refused. Room cards, a click by a room member with the room's permission, have no
+check yet, and the acting side does not act on a room-card click until one is added to the same
+function. Both are tracked gaps (section 3). Until then, a room card's buttons must not be relied
+on: use a link or open button, or a question.
 
 ## 12. Checklist for contributors and reviewers
 
@@ -221,7 +228,7 @@ not. A line about something the change does not touch is "not applicable".
 
 **Most often missed**
 
-- No internals or secrets in user-facing text (line 20).
+- Internals only in Details; secrets nowhere a person can read them (line 20).
 - The click check is the shared one (line 28).
 - The card shows its own outcome in place (line 19).
 - Every refusal names the way through (line 14).
@@ -258,7 +265,7 @@ not. A line about something the change does not touch is "not applicable".
 17. Is everything the card mentions a link to it?
 18. Is an install-wide or hard-to-undo effect stated on the card before the tap?
 19. Does the card show its own outcome in place, with no second message repeating it?
-20. Is user-facing text free of internals and secrets outside Details?
+20. Are internals only in Details, and secrets and key fragments nowhere a person can read them?
 21. Does a card with data from the person's own accounts or device go to their DM only?
 22. Does the card carry a plain-text fallback?
 23. Do in-app links open in place, on the person's click?
@@ -286,8 +293,8 @@ These are not rules yet.
 ## What this means here (agent engine)
 
 The engine writes the card content and the text the owner reads, so rules 2, 3, 5, 7, 8, 10
-and 11 land here. Checklist lines 23 and 24 are for the web client and do not apply to
-an engine change.
+and 11 land here. Lines that usually apply in this repo: 2, 3, 8, 12
+to 22 and 25 to 29. Lines 23 and 24 are for the web client.
 
 - High-impact is defined by rule 2 of this note. `CLAUDE.md` "Identity" (confirm irreversible
   actions with the owner: sending email, deleting files, financial transactions) is a shorter
@@ -313,6 +320,7 @@ an engine change.
   capability this one lacks, and name that capability.
 - No raw ids, hostnames, session names or provider errors in owner-facing text. Say what happened
   and what unblocks it in plain words; keep the raw detail in the card's Details or the log.
+  Secrets and key fragments go nowhere the owner or anyone else can read them.
 - A card carrying data from the owner's connected accounts or device is sent to the owner's DM,
   never to a shared room. This is the same rule as `CLAUDE.md` "Where replies go".
 - An approval card lists each thing it covers, and offers a value that becomes permanent (for
@@ -324,16 +332,18 @@ an engine change.
   check, `click_verdict` in [`src/agent_card.py`](../src/agent_card.py), which accepts only a
   card recorded in [`src/issued_cards.py`](../src/issued_cards.py). Act only on a click that
   passes, and never answer a failed click as if the owner had typed it. Do not write a second
-  check. Today it handles owner cards only: a click that is not the owner's, on a card this
-  agent issued, is refused as forged or stale. Room cards are a known gap. Until that path
-  lands, do not rely on a room card's buttons: use a link or open button, or a question. When
-  it lands, it goes into `click_verdict`, not beside it.
+  check. Today it covers owner cards in the owner's DM only (`owner_may_act` defaults to
+  `dm_only=True`): the owner's own click in a shared room is refused, and room cards have no
+  check yet. The engine does not act on a room-card click until one is added to the same
+  function. Both are tracked gaps. Until then, do not rely on a room card's buttons: use a link
+  or open button, or a question.
 - The engine never does anything on the person-only list. It asks, with a card.
 - "Known action → control" is about text an end user reads. Runbooks, developer docs and
   operator instructions may say "run this command".
 - When the outcome is known, show it on the card that asked with `update_card`; do not repeat
   it in a second chat message. Known gap: no Action carries a card in an edit, so `update_card`
-  posts the updated card as a reply to the old one, which stays as it was. The click's task is
+  posts the updated card as a reply to the old one, which stays as it was (`EDIT_CARRIES_CARD` is
+  false), so checklist line 19 cannot be met through the helper yet. The click's task is
   still answered through its result file, starting with `[no-send]` or `[REPLIED]` when the
   updated card already shows the outcome.
 - Open-ended questions stay chat. This rule is about actions the agent already knows.
