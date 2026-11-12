@@ -29,7 +29,6 @@ import argparse
 import contextlib
 import json
 import os
-import re
 import sys
 import urllib.parse
 import urllib.request
@@ -38,27 +37,13 @@ from typing import Callable, Mapping, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from agent_local_name import CONFIGURED_VARS, MXID, NAME_MAX, clean, connection_name, localpart_name  # noqa: E402,F401
+
 FALLBACK_NAME = "Sutando"
-NAME_MAX = 64
-CONFIGURED_VARS = ("SUTANDO_DISPLAY_NAME", "AGENT_DISPLAY_NAME")
 PROFILE_TIMEOUT = 5
 USER_AGENT = "sutando-agent-name/1"
-MXID = re.compile(r"^@([^:\s]+):([A-Za-z0-9.\-]+(?::\d+)?)$")
 
 Fetch = Callable[[str], bytes]
-
-
-def clean(name: object) -> str:
-    """`name` single-spaced and cut to NAME_MAX; '' for anything that is not a non-blank string."""
-    return " ".join(name.split())[:NAME_MAX] if isinstance(name, str) else ""
-
-
-def localpart_name(mxid: str) -> str:
-    """A readable name from an mxid's localpart: `@blue-fox.agent:x` -> `Blue Fox`."""
-    m = MXID.match(mxid or "")
-    local = re.sub(r"\.agent$", "", m.group(1)) if m else ""
-    words = [w for w in re.split(r"[-._=/]+", local) if w]
-    return " ".join(w[:1].upper() + w[1:] for w in words)[:NAME_MAX]
 
 
 def https_get(url: str) -> bytes:
@@ -87,19 +72,6 @@ def profile_name(mxid: str, fetch: Optional[Fetch] = None) -> str:
     except Exception:  # noqa: BLE001
         return ""
     return clean(got.get("displayname")) if isinstance(got, dict) else ""
-
-
-def connection_name(mxid: str, workspace: Optional[Path] = None) -> str:
-    """The display name the gateway listed for `mxid` on its connection row; '' when none."""
-    if not mxid:
-        return ""
-    try:
-        import connections
-        rows = connections.read_rows(workspace)
-    except Exception:  # noqa: BLE001 - an unreadable record leaves the next tier
-        return ""
-    return next((clean(r.get("agent_display_name")) for r in rows
-                 if isinstance(r, dict) and r.get("agent_mxid") == mxid and clean(r.get("agent_display_name"))), "")
 
 
 def configured_name(environ: Optional[Mapping[str, str]] = None) -> str:
@@ -132,16 +104,15 @@ def agent_mxid(environ: Optional[Mapping[str, str]] = None) -> str:
 
 def resolve(mxid: Optional[str] = None, *, fetch: Optional[Fetch] = None,
             environ: Optional[Mapping[str, str]] = None,
-            workspace: Optional[Path] = None, offline: bool = False) -> Tuple[str, str]:
-    """(name, source) for this agent's self-introduction, in the order the module docstring gives;
-    `offline` skips the homeserver (tier 1), for a monitor that may not make a network call."""
+            workspace: Optional[Path] = None) -> Tuple[str, str]:
+    """(name, source) for this agent's self-introduction, in the order the module docstring gives."""
     if mxid is None:
         try:
             mxid = agent_mxid(environ)
         except Exception:  # noqa: BLE001 - no identity still yields a name
             mxid = ""
     mxid = (mxid or "").strip()
-    for source, name in (("profile", lambda: "" if offline else profile_name(mxid, fetch)),
+    for source, name in (("profile", lambda: profile_name(mxid, fetch)),
                          ("connection", lambda: connection_name(mxid, workspace)),
                          ("configured", lambda: configured_name(environ)),
                          ("localpart", lambda: localpart_name(mxid))):

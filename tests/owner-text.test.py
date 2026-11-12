@@ -145,16 +145,16 @@ class Shapes(unittest.TestCase):
 
 
 class AgentName(unittest.TestCase):
-    """The name on a card is the self-introduction name without the homeserver lookup."""
+    """The name on a card comes from local records only: no homeserver, no credential files."""
 
     MXID = "@blue-fox.agent:example.com"
 
     def name(self, rows=(), *args, **kw):
-        import agent_display_name
         import agent_local_name
         import connections
+        primary = next((r for r in rows if r.get("primary")), None)
         with patch.object(connections, "read_rows", return_value=list(rows)), \
-                patch.object(agent_display_name, "profile_name", side_effect=AssertionError("no network")):
+                patch.object(connections, "primary_row", return_value=primary):
             return agent_local_name.local_name(*args, **kw)
 
     def test_the_connection_row_for_this_agent_wins_then_the_environment_then_the_localpart(self):
@@ -171,8 +171,18 @@ class AgentName(unittest.TestCase):
         import agent_local_name
         rows = [{"agent_mxid": self.MXID, "agent_display_name": SESSION}]
         self.assertEqual(self.name(rows, "An agent", mxid=self.MXID, environ={}), "An agent")
-        with patch.object(agent_local_name.agent_display_name, "resolve", side_effect=RuntimeError("unreadable")):
+        with patch.object(agent_local_name, "connection_name", side_effect=RuntimeError("unreadable")):
             self.assertEqual(agent_local_name.local_name(environ={}), "Your agent")
+
+    def test_without_an_mxid_the_primary_row_names_the_agent(self):
+        rows = [{"agent_mxid": self.MXID, "agent_display_name": "Sky Owl", "primary": True}]
+        self.assertEqual(self.name(rows, environ={}), "Sky Owl")
+        self.assertEqual(self.name(rows, environ={"AGENT_MXID": "@other:example.com"}), "Other")
+
+    def test_it_never_reaches_the_credential_path(self):
+        import agent_local_name
+        self.assertNotIn("agent_display_name", vars(agent_local_name))
+        self.assertNotIn("channel_credentials", open(agent_local_name.__file__).read())
 
 
 class BlockedCard(unittest.TestCase):

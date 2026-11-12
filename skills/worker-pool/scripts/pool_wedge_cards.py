@@ -77,8 +77,8 @@ def manager_for(workspace):
 
 
 def seat_label(workspace, worker_id) -> str:
-    row = sup.supervised_workers(workspace).get(worker_id) or {}
     workers = sup.supervised_workers(workspace)
+    row = workers.get(worker_id) or {}
     label = sup.pr.display_label(row, worker_id)
     if label != worker_id:
         return owner_text.named(label, UNNAMED_SEAT)
