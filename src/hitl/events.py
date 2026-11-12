@@ -58,7 +58,8 @@ def _requirement_for(ev: Dict) -> HumanRequirement:
     session = str(ev.get("session") or "?")
     runtime = str(ev.get("runtime") or "unknown")
     who = RUNTIME_NAMES.get(runtime, "Your agent")
-    prompt = ev.get("prompt") or {
+    own = str(ev.get("prompt") or "")
+    prompt = own or {
         "auth": f"{who} needs to sign in again",
         "permission": f"{who} is asking permission to run a tool",
         "confirmation": f"{who} is waiting for your confirmation",
@@ -70,9 +71,10 @@ def _requirement_for(ev: Dict) -> HumanRequirement:
     return HumanRequirement(
         kind=str(ev.get("kind") or "unknown"),
         runtime=runtime,
-        message=card_text(str(prompt), [f"Session: {session}"]),
+        # The event's own prompt is the ask itself: kept whole, unfolded; the session is on `device`.
+        message=card_text(own) if own else card_text(prompt, [f"Session: {session}"]),
         guard=str(ev.get("guard") or ""),
-        subject={**(ev.get("subject") if isinstance(ev.get("subject"), dict) else {}), FOLDED: True},
+        subject={**(ev.get("subject") if isinstance(ev.get("subject"), dict) else {}), **({} if own else {FOLDED: True})},
         device=device,
         title=f"{who} needs you",
         actions=_actions_for(ev),

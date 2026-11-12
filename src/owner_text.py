@@ -83,9 +83,10 @@ def internals(text: object) -> List[str]:
 
 def card_text(sentence: str, details: Iterable[object] = ()) -> str:
     """One plain sentence, then (below a blank line) the detail lines, redacted."""
-    lines = [redact(d).rstrip() for d in details if str(d or "").strip()]
-    head = redact(sentence).strip()
-    return head if not lines else head + "\n\n" + "\n".join(lines)
+    lines = [str(d).rstrip() for d in details if str(d or "").strip()]
+    head = str(sentence or "").strip()
+    # Redacted whole, so a secret split across detail lines (a PEM block) still matches.
+    return redact(head if not lines else head + "\n\n" + "\n".join(lines))
 
 
 def fallback_text(message: object, folded: bool) -> str:
@@ -99,7 +100,7 @@ _STAND_INS = {"record-id": "a task", "hex-id": "", "session": "", "path": "", "s
               "command": "a command", "key": REDACTED}
 _COMMAND_RUN = re.compile(r"\b(?:python3|launchctl|bash)\s+\S.*$")
 _LEFTOVERS = re.compile(r"\(\s*\)|`\s*`|\s+(?=[.,;:!?])|(?<=\s)[·—–-]\s*(?=[·—–-]|$)|^\s*[·—–:-]+\s*")
-_MEANING = re.compile(r"[A-Za-z]{3,}")
+_MEANING = re.compile(r"[^\W\d_]{2,}")  # letters in any script
 
 
 def without_internals(text: object) -> str:
