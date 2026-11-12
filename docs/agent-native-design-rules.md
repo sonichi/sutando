@@ -1,7 +1,7 @@
 # Agent-native design rules
 
 Every contribution that adds or changes something a person or an agent can do in s.space follows
-these rules. The same text lives in the web client, the backend and the agent engine; only the
+these rules. The same rules live in the web client, the backend and the agent engine; only the
 section "What this means here" differs.
 
 ## 1. Why
@@ -29,7 +29,7 @@ places outside the conversation the request came from (email, a post, another ro
 purchasing, deleting, and changing permissions or credentials. A reply in the conversation the
 request came from, or a message to the agent's own owner in their DM, is not high-impact. That is
 about the approval hold only: data from the owner's accounts or device still goes to the DM only
-(section 9). A standing approval the owner gave for a named kind of action satisfies the hold, and
+(§9). A standing approval the owner gave for a named kind of action satisfies the hold, and
 only a person can give it.
 
 An Action's risk and its approval requirement come from the Action's own metadata, set by the
@@ -67,9 +67,9 @@ gaps today:
 - Sending a secret is a typed `vault set` command.
 - Re-linking an agent is a typed approval code.
 - A click on a room card that reaches an agent as a task, and the owner's click on an owner card
-  in a shared room, are not accepted yet (section 11).
+  in a shared room, are not accepted yet (§11).
 - A card's outcome is not yet edited in place: the updated card is posted as a reply to the old
-  one, which stays as it was (section 7).
+  one, which stays as it was (§7).
 
 ## 4. Fewest steps, in place
 
@@ -86,7 +86,7 @@ The person can always finish what they intend, even a delete.
 - Safety may add a step. It never removes the path. The step is: see the consequence, press a
   button named after the action, and the acting side re-checks.
 - Every refusal names the way through. It never sends the person back to the thing that just
-  failed. An authorization refusal still does not reveal the target (section 2).
+  failed. An authorization refusal still does not reveal the target (§2).
 - Every "Go" lands on something the person can act on.
 - Dismissing hides an item from the bar. It comes back by itself only if the card changes. The
   person can bring it back any time from "N hidden · Show" in the bar or the drawer, and the card
@@ -101,8 +101,8 @@ definition. It states:
 - **What it belongs to**: the user, the app, a room or an agent (table below).
 - **What it does**, in one plain sentence.
 - **Who may change it**. The rule is the same for a person and for an agent acting for them.
-- **Its risk**: its action class (section 7) and its approval requirement. Both come from the
-  Action's own metadata (section 2).
+- **Its risk**: its action class (§7) and its approval requirement. Both come from the
+  Action's own metadata (§2).
 
 A new setting without these four is not ready to merge.
 
@@ -132,7 +132,7 @@ Two cases that are easy to get wrong:
 - Let the person answer in one step, by action class (table below).
 - Show the card's own outcome on the same card: the status changes to Approved, Expired or Done,
   updated in place. No second chat message repeats it. In-place update is a tracked gap today
-  (section 3).
+  (§3).
 - Show internals (ids, hostnames, session names, raw provider errors) only in Details. Secrets and
   key fragments appear nowhere a person can read them.
 - State an install-wide or hard-to-undo effect plainly, before the tap. Keep it undoable where
@@ -220,7 +220,7 @@ For both kinds:
 Today the shared check covers owner cards in the owner's DM only. The owner's own click in a
 shared room is refused. A room card whose clicks reach an agent as a task has no check yet, and
 the acting side does not act on such a click until one is added to the same function. Both are
-tracked gaps (section 3). Until then, the buttons of that kind of room card must not be relied on:
+tracked gaps (§3). Until then, the buttons of that kind of room card must not be relied on:
 use a link or open button, or a question.
 
 Other room interactions work today and are checked elsewhere: a room question asked through
@@ -230,7 +230,8 @@ runs the app's own Action.
 ## 12. Checklist for contributors and reviewers
 
 Answer each line yes or no. A "no" is fixed in the same pull request, or the pull request says why
-not. A line about something the change does not touch is "not applicable".
+not. A line about something the change does not touch is "not applicable". "Line N" is checklist
+item N; "§N" is a section of this note.
 
 **Most often missed**
 
@@ -263,7 +264,7 @@ not. A line about something the change does not touch is "not applicable".
 12. Is the current value pre-filled?
 13. Is a value that becomes permanent on approval editable on the card first?
 14. Does every refusal name the way through?
-15. Is each action handled as its class requires (section 7)?
+15. Is each action handled as its class requires (§7)?
 
 **Cards**
 
@@ -298,11 +299,11 @@ These are not rules yet.
 
 ## What this means here (agent engine)
 
-The engine writes the card content and the text the owner reads, so rules 2, 3, 5, 7, 8, 10
-and 11 land here. Lines that usually apply in this repo: 2 to 4, 8
-to 22 and 25 to 29. Lines 23 and 24 are for the web client.
+The engine writes the card content and the text the owner reads, so §2, §3, §5, §7, §8, §10
+and §11 land here. Lines that usually apply in this repo: 2 to 4, 8 to 22 and 25 to 29.
+Lines 23 and 24 are for the web client.
 
-- High-impact is defined by rule 2 of this note. `CLAUDE.md` "Identity" (confirm irreversible
+- High-impact is defined by §2 of this note. `CLAUDE.md` "Identity" (confirm irreversible
   actions with the owner: sending email, deleting files, financial transactions) is a shorter
   summary of it, not a second list.
 - A request from someone other than the owner never borrows the owner's authority. Tiers and
@@ -364,4 +365,5 @@ Not part of the rules.
 - A test that only one module verifies card clicks.
 - A test that owner-facing text contains no hostnames, hex ids or key-like tokens.
 - A test that every question with options renders as buttons.
-- A sync check that keeps the three repos' copies of this note identical.
+- A sync check that keeps the shared sections of the three repos' copies identical, compared
+  after normalising table padding.
