@@ -425,7 +425,11 @@ def _checked_schema(schema: Any) -> Dict[str, Any]:
             if view.get(key) is not None and (not isinstance(view[key], str)
                                               or view[key].strip().casefold() not in seen):
                 raise ActionFailed(f"a view's {key} names {view[key]!r}, which is not one of its columns")
-    return json.loads(json.dumps(schema))
+    checked = json.loads(json.dumps(schema))
+    for d in checked["databases"]:
+        if d.get("role") == "primary":
+            d["props"], d["views"] = d.get("props") or [], d.get("views") or []  # null is none
+    return checked
 
 
 def build_inputs(request: Dict[str, Any], adaptation: Dict[str, Any]) -> Tuple[str, Optional[Dict[str, Any]], str]:
@@ -567,11 +571,12 @@ def execute(steps: List[Dict[str, Any]], call: Callable[[Dict[str, Any]], Dict[s
         return value
 
     present: set = set()
+    decided: Dict[int, Any] = {}
     written = False
-    for step in steps:
+    for n, step in enumerate(steps):
         if step.get("skip_if_present") and step["skip_if_present"] in present:
-            step = existing_column(step, answers)
-            if step is None:
+            step = decided.get(id(step), "skip")
+            if step == "skip":
                 continue
         concrete = dict(step, arguments=fill(step["arguments"]))
         try:
@@ -581,7 +586,19 @@ def execute(steps: List[Dict[str, Any]], call: Callable[[Dict[str, Any]], Dict[s
         if step["action"] in ("room.commons.pages.replace", "room.commons.pages.append"):
             written = True
         verify(step, result, answers, present)
+        if step.get("expect_database"):
+            # Every column the database already has is decided now, before any column is written.
+            decided = column_decisions(steps, n, answers, present)
     return answers
+
+
+def column_decisions(steps: List[Dict[str, Any]], n: int, answers: Dict[str, Any],
+                     present: set) -> Dict[int, Any]:
+    """For each column step after step n whose column the database already has: "skip", or the
+    prop_update to run in its place. Raises ActionFailed for the first that cannot be used, so a
+    build that must fail fails before it writes anything to the owner's database."""
+    return {id(later): existing_column(later, answers) or "skip" for later in steps[n + 1:]
+            if later.get("skip_if_present") and later["skip_if_present"] in present}
 
 
 def verify(step: Dict[str, Any], result: Dict[str, Any], answers: Optional[Dict[str, Any]] = None,
@@ -784,13 +801,12 @@ def _check(args: List[str]) -> int:
     # prop_update in `columns`; a column that cannot be used fails here, before anything is written.
     columns: Dict[str, Any] = {}
     if step.get("expect_database"):
-        for i, later in enumerate(steps):
-            if i > int(args[1]) and later.get("skip_if_present") in present:
-                try:
-                    columns[str(i)] = existing_column(later, answers) or "skip"
-                except ActionFailed as error:
-                    print(str(error))
-                    return 1
+        try:
+            by_step = column_decisions(steps, int(args[1]), answers, present)
+        except ActionFailed as error:
+            print(str(error))
+            return 1
+        columns = {str(i): by_step[id(later)] for i, later in enumerate(steps) if id(later) in by_step}
     shown = {k: v for k, v in answers.items() if not k.startswith("$columns") and k != "$rows"}
     print(json.dumps({"present": sorted(present), "answers": shown, "columns": columns}, ensure_ascii=False))
     return 0
