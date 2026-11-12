@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -72,6 +73,16 @@ class Build(unittest.TestCase):
         line = ac.body_line("Approve it at https://s.space/api/connect-page?code=U-1 now", link_label="Approve",
                             url="https://s.space/api/connect-page?code=U-1")
         self.assertEqual(line, "Approve it at now [Approve](https://s.space/api/connect-page?code=U-1)")
+
+    def test_a_hostile_name_in_the_fallback_body_stays_literal(self):
+        evil = "x](http://evil) [y*_`\\"
+        line = ac.body_line(f"Approve agent {evil} for {evil}:", link_label=f"Approve {evil}",
+                            url="https://s.space/api/connect-page?code=U-1")
+        self.assertTrue(line.endswith("](https://s.space/api/connect-page?code=U-1)"))
+        links = re.findall(r"\[((?:\\.|[^\]\\])*)\]\(([^)\s]*)\)", line)
+        self.assertEqual([t for _, t in links], ["https://s.space/api/connect-page?code=U-1"])
+        self.assertNotIn("code=", line[:line.rindex("](")])
+        self.assertEqual(ac.md_escape("a]b\nc"), "a\\]b c")
 
     def test_a_reply_payload_round_trips(self):
         text = ac.reply("connections", "s_dspace", "disconnect", confirmed=True)
