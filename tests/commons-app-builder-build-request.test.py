@@ -729,6 +729,28 @@ for label, listed in (("a-hidden-column", {"Name": None, "Choice": ["Keep1", "Ke
     check(f"and-on-the-cli-route-check-stops-before-the-first-write-{label}",
           idx < first_write and code == 1 and "without all of its columns or options" in out)
 
+# Complete only when the listing says so: a missing, null or non-bool flag is refused like true.
+for label, flag in (("missing", None), ("null", "null"), ("a-string", "false"), ("zero", 0)):
+    room = truncated_room(None)
+    real = room.call
+
+    def listing(step, real=real, label=label, flag=flag):
+        out = real(step)
+        if step["action"] == "room.commons.databases.list":
+            for d in out["databases"]:
+                if label == "missing":
+                    d.pop("properties_truncated", None)
+                else:
+                    d["properties_truncated"] = None if flag == "null" else flag
+        return out
+    room.call = listing
+    _, rep = reply_of(run(room, task(database="d7k2m9x1", template="poll"),
+                          {"options": {"Choice": ["Morning", "Afternoon"]}}))
+    check(f"a-listing-whose-flag-is-{label}-is-refused", rep["status"] == "failed"
+          and "without all of its columns or options" in rep["reason"]
+          and not any(act == "room.commons.databases.mutate" for act, _ in room.calls))
+
+
 
 with tempfile.TemporaryDirectory() as tmp:
     tmp = Path(tmp)
@@ -994,23 +1016,23 @@ with tempfile.TemporaryDirectory() as tmp:
     db_idx = next(i for i, st in enumerate(given_db) if st.get("expect_database"))
     (tmp / "db.json").write_text(json.dumps(given_db), encoding="utf-8")
     code, out = cli("check", str(tmp / "db.json"), str(db_idx), result("dbs.json", envelope_of(
-        {"databases": [{"database": "db:d1", "rows": 0, "properties": [
+        {"databases": [{"database": "db:d1", "properties_truncated": False, "rows": 0, "properties": [
             {"name": "Choice", "type": "select", "options": ["Option A", "Option B", "Option C"]}]}]})))
     check("check-prints-the-columns-already-there", code == 0 and json.loads(out)["present"] == ["Choice"])
     choice_step = next(i for i, st in enumerate(given_db) if st.get("skip_if_present") == "Choice")
     check("check-says-to-skip-a-column-that-is-already-right",
           code == 0 and json.loads(out)["columns"] == {str(choice_step): "skip"})
     code, out = cli("check", str(tmp / "db.json"), str(db_idx), result("dbs1.json", envelope_of(
-        {"databases": [{"database": "db:d1", "rows": 0, "properties": [
+        {"databases": [{"database": "db:d1", "properties_truncated": False, "rows": 0, "properties": [
             {"name": "Choice", "type": "select", "options": ["Option A"]}]}]})))
     replaced = json.loads(out)["columns"][str(choice_step)] if code == 0 else {}
     check("check-gives-the-update-for-missing-options", replaced.get("arguments", {}).get("op") == "prop_update"
           and [o["name"] for o in replaced["arguments"]["property"]["options"]] == ["Option A", "Option B", "Option C"])
     code, out = cli("check", str(tmp / "db.json"), str(db_idx), result("dbs2.json", envelope_of(
-        {"databases": [{"database": "db:d1", "rows": 0, "properties": [{"name": "Choice", "type": "text"}]}]})))
+        {"databases": [{"database": "db:d1", "properties_truncated": False, "rows": 0, "properties": [{"name": "Choice", "type": "text"}]}]})))
     check("check-fails-a-column-of-another-type", code == 1 and "already has a text column Choice" in out)
     code, out = cli("check", str(tmp / "db.json"), str(db_idx), result("dbs3.json", envelope_of(
-        {"databases": [{"database": "db:d1", "properties": [{"name": "Choice"}]}]})))
+        {"databases": [{"database": "db:d1", "properties_truncated": False, "properties": [{"name": "Choice"}]}]})))
     check("check-fails-closed-on-a-column-without-a-type", code == 1)
     code, out = cli("check", str(tmp / "plan.json"), str(member_step), absent)
     check("check-owner-absent-fails", code == 1 and "the owner is not in room" in out)
@@ -1042,7 +1064,7 @@ good = {"expect_member": {"members": [{"user_id": OWNER}]},
         "expect_page": {"pages": [{"kind": PAGE}]},
         "expect_empty": {"total_bytes": 0, "text": ""},
         "expect_app": {"apps": [{"id": "a1", "page": PAGE, "database": "db:d1"}]},
-        "expect_database": {"databases": [{"database": "db:d1", "properties": []}]}}
+        "expect_database": {"databases": [{"database": "db:d1", "properties_truncated": False, "properties": []}]}}
 for key, step in by_key.items():
     br.verify(step, good[key])
     br.verify(step, envelope_of(good[key]))           # the MCP tool's own reply, saved whole
@@ -1174,7 +1196,7 @@ with tempfile.TemporaryDirectory() as tmp:
     steps = json.loads(out)
     db_idx = next(i for i, st in enumerate(steps) if st.get("expect_database"))
     choice_idx = next(i for i, st in enumerate(steps) if st.get("skip_if_present") == "Choice")
-    (tmp / "dbs.json").write_text(json.dumps(envelope_of({"databases": [{"database": "db:d1", "rows": 0, "properties": [
+    (tmp / "dbs.json").write_text(json.dumps(envelope_of({"databases": [{"database": "db:d1", "properties_truncated": False, "rows": 0, "properties": [
         {"name": "Choice", "type": "select", "options": ["Option A"]}]}]})))
     code, out = cli("check", str(tmp / "plan.json"), str(db_idx), str(tmp / "dbs.json"))
     replaced = json.loads(out)["columns"][str(choice_idx)] if code == 0 else {}
@@ -1184,7 +1206,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("cli-replacement-has-its-own-operation-id", argv[-2] == "--operation-id"
           and re.fullmatch(re.escape(steps[choice_idx]["operation_id"]) + r"-update-[0-9a-f]{8}", argv[-1]))
     # Its id names its own arguments, which follow the database's live options (N1).
-    (tmp / "dbs2.json").write_text(json.dumps(envelope_of({"databases": [{"database": "db:d1", "rows": 0, "properties": [
+    (tmp / "dbs2.json").write_text(json.dumps(envelope_of({"databases": [{"database": "db:d1", "properties_truncated": False, "rows": 0, "properties": [
         {"name": "Choice", "type": "select", "options": ["Option B"]}]}]})))
     code2, out2 = cli("check", str(tmp / "plan.json"), str(db_idx), str(tmp / "dbs2.json"))
     other = json.loads(out2)["columns"][str(choice_idx)]["operation_id"] if code2 == 0 else ""

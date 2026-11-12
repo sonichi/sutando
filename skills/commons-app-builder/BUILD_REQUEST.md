@@ -144,8 +144,8 @@ the `databases.list` step prints `columns`: for each later column step, `skip` o
 `prop_update` to run in its place, with its own `operation_id` (and, on the cli route, its own
 `cli` argv).
 
-A listing marked `properties_truncated` (the room left a column or an option out of it) fails
-the build there too: what it hides could be a column of another type, or options an update
+A listing not marked `properties_truncated: false` (the room left a column or an option out of
+it, or did not say) fails the build there too: what it hides could be a column of another type, or options an update
 would drop, and no read shows every column and option (`databases.query` bounds them the same
 way).
 
