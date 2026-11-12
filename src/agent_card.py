@@ -384,7 +384,7 @@ def reply_payload(task_text: str) -> Tuple[dict, Optional[Reply]]:
 def owner_may_act(headers: Mapping[str, str], owner_mxid: str = "", *, dm_only: bool = True) -> Optional[str]:
     """Why a card reply in this task must not act, or None when its sender is the owner."""
     import local_task_protocol as ltp
-    if ltp.canonical_access_tier(headers.get("access_tier")) != "owner":
+    if ltp.canonical_access_tier(headers.get("access_tier")) != "owner" or str(headers.get("collaborator") or "").strip():
         return "only the owner can use this card"
     sender = str(headers.get("user_id") or "").strip()
     if owner_mxid and sender != owner_mxid:

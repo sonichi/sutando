@@ -231,6 +231,7 @@ class Replies(unittest.TestCase):
         self.assertIsNone(ac.owner_may_act(ok, OWNER))
         self.assertIsNotNone(ac.owner_may_act({**ok, "access_tier": "team"}, OWNER))
         self.assertIsNotNone(ac.owner_may_act({**ok, "access_tier": ""}, OWNER))
+        self.assertIsNotNone(ac.owner_may_act({**ok, "collaborator": "true"}, OWNER))
         self.assertIsNotNone(ac.owner_may_act({**ok, "user_id": "@other:s.space"}, OWNER))
         self.assertIsNotNone(ac.owner_may_act({**ok, "channel_kind": "room"}, OWNER))
         self.assertIsNone(ac.owner_may_act({**ok, "channel_kind": "room"}, OWNER, dm_only=False))
