@@ -152,15 +152,16 @@ def approval_note(worker_label: str, label: str, verify_url: str, expires_at: fl
                   display_name: str = "", rotated: bool = False) -> str:
     """The owner's DM: what they approve, on which server, a labelled link (the code-bearing URL is never
     the visible text), and how long it works."""
-    host = urllib.parse.urlsplit(verify_url).hostname or "s.space"
+    host = urllib.parse.urlsplit(verify_url).hostname or ""
+    on = f" on {host}" if host else ""
     name = display_name or label
     if rotated:
         head = f"**Approve a new token for {worker_label}'s agent**"
-        what = f"Its agent \"{name}\" on {host} gets a new token; the old one stops working once you approve."
+        what = f"Its agent \"{name}\"{on} gets a new token; the old one stops working once you approve."
     else:
         head = f"**Approve an agent for your worker {worker_label}**"
-        what = f"It will work on {host} as its own agent, \"{name}\"."
-    return (f"[dm-only]\n{head}\n\n{what}\n\n**[Approve {name} on {host} \u2192]({_md_url(verify_url)})**\n\n"
+        what = f"It will work{on} as its own agent, \"{name}\"."
+    return (f"[dm-only]\n{head}\n\n{what}\n\n**[Approve {name}{on} \u2192]({_md_url(verify_url)})**\n\n"
             f"Works for {_minutes(expires_at - now)}, until {_at(expires_at, now)}. Nothing is saved until you "
             "approve, and I check that the agent is yours before the worker uses it.")
 
