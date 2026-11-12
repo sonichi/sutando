@@ -591,6 +591,31 @@ check("options-are-never-replaced-on-a-database-with-rows", rep["status"] == "fa
       and "already has rows" in rep["reason"]
       and not any(a.get("op") == "prop_update" for _, a in room.calls))
 
+# Every existing column is decided before anything is written, in the in-process path too: a later
+# wrong-type column fails the build with the owner's database untouched (review on bc9a376).
+room = FakeRoom(databases={"d7k2m9x1": {"name": "Untitled", "views": [], "rows": 0,
+                                        "properties": ["Name", {"name": "Comment", "type": "number"}]}})
+_, rep = reply_of(run(room, task(database="d7k2m9x1", template="poll"), {"options": {"Choice": ["A", "B"]}}))
+check("a-later-wrong-column-fails-before-an-earlier-add", rep["status"] == "failed"
+      and "already has a number column Comment" in rep["reason"]
+      and not any(act == "room.commons.databases.mutate" for act, _ in room.calls))
+room = FakeRoom(databases={"d7k2m9x1": {"name": "Untitled", "views": [], "rows": 0, "properties": [
+    "Name", {"name": "Choice", "type": "select", "options": ["Morning"]}, {"name": "Comment", "type": "number"}]}})
+_, rep = reply_of(run(room, task(database="d7k2m9x1", template="poll"), {"options": {"Choice": ["Morning", "Afternoon"]}}))
+check("a-later-wrong-column-fails-before-an-earlier-option-update", rep["status"] == "failed"
+      and "already has a number column Comment" in rep["reason"]
+      and not any(act == "room.commons.databases.mutate" for act, _ in room.calls)
+      and next(p_ for p_ in room.databases["d7k2m9x1"]["properties"] if p_["name"] == "Choice")["options"] == ["Morning"])
+check("and-nothing-else-is-written", not any(act in ("room.commons.pages.replace", "room.commons.pages.append",
+                                                     "room.commons.apps.create") for act, _ in room.calls))
+
+# An own schema's props or views given as null are none, not a crash.
+room = FakeRoom()
+_, rep = reply_of(run(room, task(template="poll"), {"html": "<p>own</p>", "schema": {"databases": [
+    {"name": "Signups", "role": "primary", "props": None, "views": None}]}}))
+check("null-props-and-views-are-none", rep["status"] == "done"
+      and not any(a.get("op") in ("prop_add", "view_add") for act, a in room.calls if act == "room.commons.databases.mutate"))
+
 
 # The template path's own names and options follow the own schema's rules (N1).
 for label, adaptation, words in (
