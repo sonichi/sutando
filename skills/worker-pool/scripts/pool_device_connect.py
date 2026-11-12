@@ -200,6 +200,7 @@ def send_to_owner(workspace: Path, text: str) -> str:
 
 RUNTIME_NAMES = {"claude": "Claude", "codex": "Codex"}
 CARD_KIND = "worker-approval"
+CARD_HANDLER = "skills/worker-pool/scripts/pool_identity.py card-reply"
 RESEND = "resend"
 
 
@@ -251,7 +252,7 @@ def done_card(worker: str, worker_label: str, label: str, agent_id: str, *, serv
         buttons.append(ac.button(f"Add {label} to a room", "reply", style="secondary",
                                  reply=f"Add {label} to a room", disabled=False))
     return ac.build(card_id(worker, server), "done", title=worker_label, subtitle=subtitle,
-                    avatar_=ac.avatar(mxid=agent_id), text=text,
+                    avatar_=ac.avatar(mxid=agent_id), status="Approved", text=text,
                     fields=[{"label": "Agent", "value": agent_id}], buttons=buttons,
                     body=ac.body_line(f"Done: agent \"{label}\" ({agent_id}) "
                                       + ("has a new token." if rotated else f"is {worker_label}'s own agent.")))
@@ -262,16 +263,31 @@ def resend_text(worker_label: str) -> str:
     return f"Get a new link for {worker_label}"
 
 
+def _resend_button(worker: str, worker_label: str) -> dict:
+    return ac.button(resend_text(worker_label), "reply", style="primary", reply=resend_text(worker_label),
+                     command=ac.reply(CARD_KIND, worker, RESEND), disabled=False)
+
+
+def failed_card(worker: str, worker_label: str, label: str, why: str, *, server: str, subtitle: str) -> tuple:
+    """(body, card) once a resend ended without a new link: why, and the same one tap to try again."""
+    why = " ".join(str(why).split())[:300]
+    return ac.build(card_id(worker, server), "error", title=worker_label, subtitle=subtitle,
+                    avatar_=ac.avatar(seed=label), status="Couldn't make a link",
+                    text=f"I couldn't make a new approval link for {label}: {why}.",
+                    buttons=[_resend_button(worker, worker_label)],
+                    body=ac.body_line(f"I couldn't make a new approval link for agent \"{label}\" (pool worker "
+                                      f"{worker_label}): {why}. Ask me for a new link."))
+
+
 def expired_card(worker: str, worker_label: str, label: str, expires_at: float, *, server: str,
                  subtitle: str) -> tuple:
     """(body, card) once the link lapsed unapproved: nothing changed, and one tap for a new link."""
     until = _until(expires_at)
     return ac.build(card_id(worker, server), "expired", title=worker_label, subtitle=subtitle,
-                    avatar_=ac.avatar(seed=label),
+                    avatar_=ac.avatar(seed=label), status="Link expired",
                     text=f"The approval link for {label} expired at {until} before it was approved, so nothing "
                          "was set up.",
-                    buttons=[ac.button(resend_text(worker_label), "reply", style="primary", reply=resend_text(worker_label),
-                                       command=ac.reply(CARD_KIND, worker, RESEND), disabled=False)],
+                    buttons=[_resend_button(worker, worker_label)],
                     note="A new link works for 15 minutes.", note_tone="dim",
                     body=ac.body_line(f"The approval link for agent \"{label}\" (pool worker {worker_label}) expired "
                                       f"at {until}; nothing was set up. Ask me for a new link."))
@@ -279,11 +295,13 @@ def expired_card(worker: str, worker_label: str, label: str, expires_at: float, 
 
 @dataclass
 class CardSink:
-    """Approval cards in the owner's checked DM, posted as the core's own agent; with `workspace`, each
-    posted card is recorded (issued_cards) so only a reply to it can act."""
+    """Approval cards in the owner's checked DM, posted as the core's own agent on connection `lane`;
+    with `workspace`, each posted card is recorded (issued_cards) so only a click on it can act, and the
+    card it replaces stops acting."""
     execute: ac.Execute
     room: str
     workspace: Optional[Path] = None
+    lane: str = ""
 
     def show(self, body: str, card: dict, operation_id: str, previous: str = "") -> str:
         """The event now showing `card`; "" when it could not be posted (the caller sends the text)."""
@@ -297,7 +315,7 @@ class CardSink:
             return ""
         if self.workspace is not None:
             try:
-                issued_cards.record(self.workspace, eid, card)
+                issued_cards.record(self.workspace, eid, card, room=self.room, lane=self.lane, handler=CARD_HANDLER)
             except OSError:
                 pass  # unrecorded, the card's own buttons do nothing; the flow itself still completes
         return eid
@@ -312,7 +330,7 @@ def default_cards(workspace: Optional[Path], core: dict, vault=None, request=Non
         actions, _ = pp.core_actions(workspace, str(core.get("instance") or ""), vault=vault, request=request)
     except (pp.ProvisionError, connections.ConnectionsError):
         return None
-    return CardSink(actions.execute, room, connections._workspace(workspace))
+    return CardSink(actions.execute, room, connections._workspace(workspace), str(core.get("instance") or ""))
 
 
 def record_path(workspace: Optional[Path], worker: str) -> Path:
@@ -373,7 +391,7 @@ def _why_not(worker: str, rec: dict, now: float) -> Optional[str]:
 def resend(worker: str, *, workspace: Optional[Path] = None, spawn=None, clock=time.time) -> dict:
     """Start a fresh device flow for `worker` from its expired or failed card, in the background: {status, why?}.
     The claim is one locked read-check-write, so two clicks start one flow. The caller has already checked
-    that the owner clicked (agent_card.card_command)."""
+    that the owner clicked (agent_card.click_verdict)."""
     from file_lock import locked_file
     path = record_path(workspace, worker)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -411,9 +429,10 @@ def resend(worker: str, *, workspace: Optional[Path] = None, spawn=None, clock=t
 
 
 def resend_failed(workspace: Optional[Path], worker: str, resend_id: str, why: str,
-                  deliver: Optional[Callable[[str], object]] = None) -> bool:
-    """A resend attempt that ended before its new card was posted: its record becomes "failed" (the card's
-    button works again) and the owner hears why. Only the same attempt is touched; False when it is not."""
+                  deliver: Optional[Callable[[str], object]] = None, cards: Optional[CardSink] = None) -> bool:
+    """A resend attempt that ended before its new card was posted: its record becomes "failed" (the
+    button works again) and the owner sees why, on a card (`cards`; by default the core's own, unless
+    `deliver` is given) or as text. Only the same attempt is touched; False when it is not."""
     if not resend_id:
         return False
     from file_lock import locked_file
@@ -425,6 +444,26 @@ def resend_failed(workspace: Optional[Path], worker: str, resend_id: str, why: s
         write_record(workspace, worker, {**{k: v for k, v in rec.items() if not k.startswith("resend_")},
                                          "state": "failed", "why": why})
     who = rec.get("worker_label") or worker
+    if cards is None and deliver is None:
+        try:
+            cards = default_cards(workspace, pp.core_lane(workspace, rec.get("lane")))
+        except (pp.ProvisionError, connections.ConnectionsError, OSError):
+            cards = None
+    shown = ""
+    if cards is not None:
+        try:
+            card = failed_card(worker, who, str(rec.get("label") or who), why, server=str(rec.get("server") or ""),
+                               subtitle=worker_subtitle(workspace, worker))
+            shown = cards.show(*card, f"{CARD_KIND}:{worker}:{resend_id}:failed",
+                               previous=str(rec.get("event_id") or ""))
+        except (ac.CardError, OSError):
+            shown = ""
+    if shown:
+        with locked_file(path.with_name(path.name + ".lock")):
+            now = read_record(workspace, worker)
+            if now.get("state") == "failed":
+                _keep(workspace, worker, {**now, "room": cards.room, "event_id": shown})
+        return True
     send = deliver or (lambda text: send_to_owner(workspace or connections._workspace(None), text))
     send(f"[dm-only]\nI couldn't make a new approval link for {who}: {why}. Tap \"{resend_text(who)}\" on the "
          "card to try again.")
@@ -464,7 +503,8 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     subtitle = worker_subtitle(workspace, worker)
     op = f"{CARD_KIND}:{worker}:{secrets.token_hex(6)}"
     record = {"label": label, "display_name": display_name, "worker_label": who, "rotate": rotate,
-              "lane": core.get("instance"), "expires_at": pending["expires_at"], "state": "pending"}
+              "lane": core.get("instance"), "server": server, "expires_at": pending["expires_at"],
+              "state": "pending"}
     shown = ""
     if cards is not None:
         shown = cards.show(*approval_card(worker, who, label, pending["verify_url"], pending["expires_at"],

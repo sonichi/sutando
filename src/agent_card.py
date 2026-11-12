@@ -4,22 +4,29 @@ A card rides on an ordinary room message as `content["space.ag2.card"]` beside a
 that older clients show. `build` returns that pair, `problem` checks a card the way the web client does
 (unknown fields allowed, required keys present, only http(s) links), and `send_card` posts one through
 the s.space Action `room.message.send` with an injected Action client, so this module holds no HTTP
-client of its own. A card button of kind `reply` sends its `reply` text (a sentence the owner can read)
+client of its own. `connect` and `connect_picker` actions sign the owner in to an app in the client and
+send nothing back: whoever posts one arms the connect-apps wait first. A card button of kind `reply` sends its `reply` text (a sentence the owner can read)
 as the clicker's reply to the card, with `space.ag2.card_click` beside it; its `command` (a
 `card:<kind>:<target>:<verb>[:confirmed]` code) stays with this agent's record of the card
-(issued_cards). `card_command` hands back that command only for the owner's click on a card this agent
-posted that offered that text. Standard library only, plus local_task_protocol and issued_cards.
+(issued_cards). `click_verdict` is the one decision on such a task: the owner's click on a card this
+agent posted, in the room it was posted in, is its command or the owner's own words; any other click,
+and card action text sent without one, is forged or stale and nothing acts on it; the rest is ordinary
+chat. `python3 src/agent_card.py click --task-file PATH` prints that verdict and the script that runs
+the command. Standard library only, plus local_task_protocol, issued_cards and connections.
 """
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass
 from typing import Callable, Mapping, Optional, Tuple
 
 CARD_KEY = "space.ag2.card"
 KIND, VERSION = "agent_panel", 1
 STATES = ("pending", "done", "expired", "error", "info")
-BUTTON_KINDS = ("url", "reply", "open_room", "open_dm", "menu")
+BUTTON_KINDS = ("url", "reply", "open_room", "open_dm", "connect", "connect_picker", "menu")
+# Where each placed kind may sit; every other kind may sit anywhere.
+PLACES = {"menu": ("row",), "connect": ("button", "row"), "connect_picker": ("button", "footer")}
 ROW_STATES = ("on", "off", "warn", "none")
 BADGE_STATES = ("on", "off", "warn")
 STYLES = ("primary", "secondary")
@@ -54,24 +61,29 @@ def _drop_empty(d: Mapping[str, object]) -> dict:
 
 def avatar(*, mxid: str = "", url: str = "", seed: str = "", initial: str = "", app: str = "",
            shape: str = "") -> dict:
-    """One avatar shape; the first given of mxid, url, seed, initial, app wins."""
+    """One avatar; the first given of mxid, url, seed, initial, app wins. The app picks the shape of a
+    user's (mxid) and of generated (seed) artwork, so `shape` is sent only for the other three."""
     for key, value in (("mxid", mxid), ("url", url), ("seed", seed), ("initial", initial), ("app", app)):
         if value:
-            return _drop_empty({key: value, "shape": shape})
+            return _drop_empty({key: value, "shape": "" if key in ("mxid", "seed") else shape})
     raise CardError("an avatar needs one of mxid, url, seed, initial or app")
 
 
 def button(label: str, kind: str, *, style: str = "", url: str = "", reply: str = "", room_id: str = "",
            user_id: str = "", items: Optional[list] = None, confirm: str = "", disabled: Optional[bool] = None,
-           uses_input: bool = False, command: str = "") -> dict:
+           uses_input: bool = False, command: str = "", toolkit: str = "", for_: str = "",
+           suggest: Optional[list] = None) -> dict:
     """A button, row action or menu item; `confirm` makes the client ask first. On a done or expired
     card the client disables a button unless it says `disabled: False`. A `reply` button with a
-    `command` acts as that command when the owner clicks it; without one its text is plain words."""
+    `command` acts as that command when the owner clicks it; without one its text is plain words. A
+    `connect` action signs `for_` (default: the owner) in to `toolkit`, an app slug, on the card; a
+    `connect_picker` searches every app there, listing the `suggest` slugs first."""
     if command and parse_reply(command) is None:
         raise CardError(f"{command!r} is not a card command")
     out = _drop_empty({"label": label, "kind": kind, "style": style, "url": url, "reply": reply,
                        "room_id": room_id, "user_id": user_id, "items": items, "confirm": confirm,
-                       "command": command})
+                       "command": command, "toolkit": toolkit, "for": for_,
+                       "suggest": list(dict.fromkeys(suggest or []))})
     if disabled is not None:
         out["disabled"] = bool(disabled)
     if uses_input:
@@ -113,12 +125,15 @@ def body_line(text: str, *, link_label: str = "", url: str = "") -> str:
 
 def build(card_id: str, state: str, *, title: str, body: str, subtitle: str = "",
           avatar_: Optional[dict] = None, badges: Optional[list] = None, shuffle_reply: str = "",
-          text: str = "", fields: Optional[list] = None, input_: Optional[dict] = None,
+          status: str = "", text: str = "", fields: Optional[list] = None, input_: Optional[dict] = None,
           groups: Optional[list] = None, buttons: Optional[list] = None, note: str = "", note_tone: str = "",
           expires_at_ms: Optional[int] = None, footer_link: Optional[dict] = None) -> Tuple[str, dict]:
-    """(body, card) for one agent panel, checked: a card the client would not draw raises CardError."""
+    """(body, card) for one agent panel, checked: a card the client would not draw raises CardError.
+    `status` is the pill beside the title ("Approved"): a short word with no glyph, since the client
+    takes its tone and icon from `state`. A done card shows a check where the shuffle would be."""
     header = _drop_empty({"title": title, "subtitle": subtitle, "avatar": avatar_, "badges": badges,
-                          "shuffle": {"reply": shuffle_reply} if shuffle_reply else None})
+                          "shuffle": {"reply": shuffle_reply} if shuffle_reply and state != "done" else None,
+                          "status": {"label": status} if status else None})
     card = {"kind": KIND, "v": VERSION, "id": card_id, "state": state, "header": header}
     card.update(_drop_empty({"text": text, "fields": fields, "input": input_, "groups": groups,
                              "buttons": buttons, "note": note, "note_tone": note_tone,
@@ -138,14 +153,20 @@ def build(card_id: str, state: str, *, title: str, body: str, subtitle: str = ""
 # The web client's limits: past any of them it shows the plain body instead of the card.
 LIMITS = {"id": 200, "title": 120, "subtitle": 300, "text": 4000, "badges": 8, "fields": 12, "buttons": 6,
           "groups": 10, "rows": 100, "row_actions": 4, "menu_items": 8, "reply": 1000, "input_value": 200,
-          "pattern": 300}
+          "pattern": 300, "label": 80, "confirm": 300, "status": 40, "badge": 40, "tag": 40, "field_label": 60,
+          "field_value": 300, "group_label": 80, "note": 600, "suggest": 8, "mxid": 255, "seed": 128,
+          "initial": 8, "avatar_url": 512, "url": 4096, "input_label": 200, "affix": 60, "hint": 300}
 _APP_RE = re.compile(r"[a-z0-9_]{1,64}")
 _INPUT_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+_USER_RE = re.compile(r"@[^\s:]+:\S+")
+_ROOM_RE = re.compile(r"![^\s:]+:\S+")
+_MXC_RE = re.compile(r"mxc://[^/\s?#]+/[^/\s?#]+")
+_MAX_SAFE_INT = 2 ** 53 - 1
 
 
 def _link_ok(url: object, schemes: Tuple[str, ...] = ("http", "https")) -> bool:
     """An absolute link in one of `schemes`, with a host and no embedded credentials."""
-    if not isinstance(url, str) or any(c.isspace() for c in url):
+    if not isinstance(url, str) or len(url) > LIMITS["url"] or any(c.isspace() for c in url):
         return False
     import urllib.parse
     try:
@@ -155,64 +176,99 @@ def _link_ok(url: object, schemes: Tuple[str, ...] = ("http", "https")) -> bool:
     return parts.scheme.lower() in schemes and bool(parts.netloc) and "@" not in parts.netloc
 
 
-def _text(value: object) -> bool:
-    return isinstance(value, str) and bool(value.strip())
+def _text(value: object, limit: str = "") -> bool:
+    """Non-blank text, within LIMITS[limit] when one is named."""
+    return isinstance(value, str) and bool(value.strip()) and (not limit or len(value) <= LIMITS[limit])
 
 
-def _long(value: object, limit: str) -> bool:
-    return isinstance(value, str) and len(value) > LIMITS[limit]
+def _opt(value: object, limit: str) -> bool:
+    """Absent, or bounded text: a present value of another shape is a bad card."""
+    return value is None or _text(value, limit)
+
+
+def _is(value: object, pattern: "re.Pattern", limit: str = "") -> bool:
+    return isinstance(value, str) and bool(pattern.fullmatch(value)) and (not limit or len(value) <= LIMITS[limit])
 
 
 def _avatar_problem(av: object, where: str) -> Optional[str]:
-    if not isinstance(av, dict) or not any(_text(av.get(k)) for k in AVATAR_KEYS):
+    """The client reads the first of mxid, url, seed, initial, app. It would draw the title's initial for
+    an avatar with none of them or with an http(s) picture; a sender never means that, so both are refused."""
+    if not isinstance(av, dict):
         return f"{where} needs one of {', '.join(AVATAR_KEYS)}"
-    if "url" in av and not _link_ok(av["url"], ("mxc",)):
-        return f"{where}.url must be an mxc:// link"
-    if "app" in av and not (isinstance(av["app"], str) and _APP_RE.fullmatch(av["app"])):
-        return f"{where}.app is not an app slug"
-    if "shape" in av and av["shape"] not in ("round", "square"):
+    if av.get("shape") is not None and av["shape"] not in ("round", "square"):
         return f"{where}.shape must be round or square"
+    key = next((k for k in AVATAR_KEYS if av.get(k) is not None), None)
+    if key is None:
+        return f"{where} needs one of {', '.join(AVATAR_KEYS)}"
+    value = av[key]
+    if key == "mxid" and not _is(value, _USER_RE, "mxid"):
+        return f"{where}.mxid is not a user id"
+    if key == "url" and not _is(value, _MXC_RE, "avatar_url"):
+        return f"{where}.url must be an mxc:// link"
+    if key in ("seed", "initial") and not _text(value, key):
+        return f"{where}.{key} must be 1-{LIMITS[key]} characters"
+    if key == "app" and not _is(value, _APP_RE):
+        return f"{where}.app is not an app slug"
     return None
 
 
-def _action_problem(b: object, where: str, *, menu_ok: bool = False) -> Optional[str]:
-    if not isinstance(b, dict) or not _text(b.get("label")):
-        return f"{where} needs a label"
+def _action_problem(b: object, where: str, place: str = "button") -> Optional[str]:
+    """`place` is where the action sits: button, row (a row's actions), item (a menu's) or footer."""
+    if not isinstance(b, dict) or not _text(b.get("label"), "label"):
+        return f"{where} needs a label of at most {LIMITS['label']} characters"
     kind = b.get("kind")
     if kind not in BUTTON_KINDS:
         return f"{where}.kind {kind!r} is not one of {', '.join(BUTTON_KINDS)}"
-    if kind == "menu" and not menu_ok:
-        return f"{where}: a menu belongs only in a row's actions, and menu items do not nest"
-    need = {"url": "url", "reply": "reply", "open_room": "room_id", "open_dm": "user_id"}.get(kind)
-    if need and not _text(b.get(need)):
-        return f"{where} of kind {kind} needs {need}"
-    if "url" in b and not _link_ok(b["url"]):
-        return f"{where}.url is not an http(s) link without credentials"
-    if _long(b.get("reply"), "reply"):
-        return f"{where}.reply is longer than {LIMITS['reply']} characters"
-    if "style" in b and b["style"] not in STYLES:
+    if place not in PLACES.get(kind, (place,)):
+        return {"menu": f"{where}: a menu belongs only in a row's actions, and menu items do not nest",
+                "connect": f"{where}: connect belongs only in buttons and row actions",
+                "connect_picker": f"{where}: connect_picker belongs only in buttons and the footer link"}[kind]
+    if not _opt(b.get("confirm"), "confirm"):
+        return f"{where}.confirm must be 1-{LIMITS['confirm']} characters"
+    if b.get("style") is not None and b["style"] not in STYLES:
         return f"{where}.style must be primary or secondary"
-    if "disabled" in b and not isinstance(b["disabled"], bool):
-        return f"{where}.disabled must be true or false"
+    for flag in ("disabled", "uses_input"):
+        if b.get(flag) is not None and not isinstance(b[flag], bool):
+            return f"{where}.{flag} must be true or false"
     if "command" in b and (kind != "reply" or parse_reply(b["command"]) is None):
         return f"{where}.command must be a card command on a reply button"
+    if kind == "url" and not _link_ok(b.get("url")):
+        return f"{where}.url is not an http(s) link without credentials"
+    if kind == "reply" and not _text(b.get("reply"), "reply"):
+        return f"{where} of kind reply needs a reply of at most {LIMITS['reply']} characters"
+    if kind == "open_room" and not _is(b.get("room_id"), _ROOM_RE):
+        return f"{where} of kind open_room needs a room_id"
+    if kind == "open_dm" and not _is(b.get("user_id"), _USER_RE):
+        return f"{where} of kind open_dm needs a user_id"
+    if kind in ("connect", "connect_picker") and b.get("for") is not None and not _is(b["for"], _USER_RE, "mxid"):
+        return f"{where}.for is not a user id"
+    if kind == "connect" and not _is(b.get("toolkit"), _APP_RE):
+        return f"{where}.toolkit is not an app slug"
+    if kind == "connect_picker" and b.get("suggest") is not None:
+        slugs = b["suggest"]
+        if not isinstance(slugs, list) or len(slugs) > LIMITS["suggest"] or not all(_is(s, _APP_RE) for s in slugs):
+            return f"{where}.suggest must be at most {LIMITS['suggest']} app slugs"
     if kind == "menu":
         items = b.get("items")
         if not isinstance(items, list) or not items or len(items) > LIMITS["menu_items"]:
             return f"{where} of kind menu needs 1-{LIMITS['menu_items']} items"
         for i, item in enumerate(items):
-            found = _action_problem(item, f"{where}.items[{i}]")
+            found = _action_problem(item, f"{where}.items[{i}]", "item")
             if found:
                 return found
     return None
 
 
 def _input_problem(inp: object) -> Optional[str]:
-    if not isinstance(inp, dict) or not (isinstance(inp.get("name"), str) and _INPUT_NAME_RE.fullmatch(inp["name"])):
+    if not isinstance(inp, dict) or not _is(inp.get("name"), _INPUT_NAME_RE):
         return "input.name must be a letter or _ then up to 63 letters, digits or _"
-    if _long(inp.get("value"), "input_value"):
+    for key, limit in (("label", "input_label"), ("prefix", "affix"), ("suffix", "affix"), ("hint", "hint")):
+        if not _opt(inp.get(key), limit):
+            return f"input.{key} must be 1-{LIMITS[limit]} characters"
+    value = inp.get("value")
+    if value is not None and (not isinstance(value, str) or len(value) > LIMITS["input_value"]):
         return f"input.value is longer than {LIMITS['input_value']} characters"
-    if "pattern" in inp:
+    if inp.get("pattern") is not None:
         if not isinstance(inp["pattern"], str) or len(inp["pattern"]) > LIMITS["pattern"]:
             return f"input.pattern must be a regex of at most {LIMITS['pattern']} characters"
         try:
@@ -231,26 +287,35 @@ def _many(card: Mapping[str, object], key: str, limit: str = "") -> Optional[str
     return f"{key} has more than {LIMITS[limit or key]}" if len(value) > LIMITS[limit or key] else None
 
 
-def problem(card: object) -> Optional[str]:
-    """Why the client would fall back to the plain body for `card`, or None when it draws it. Unknown
-    fields are allowed; a missing state reads as info and a missing note_tone as dim."""
-    if not isinstance(card, dict):
-        return "the card is not an object"
-    if card.get("kind") != KIND or card.get("v") != VERSION:
-        return f"kind must be {KIND} and v {VERSION}"
-    if not _text(card.get("id")) or _long(card["id"], "id"):
-        return f"id must be 1-{LIMITS['id']} characters"
-    if "state" in card and card["state"] not in STATES:
-        return f"state must be one of {', '.join(STATES)}"
-    header = card.get("header")
+def _row_problem(item: object, where: str) -> Optional[str]:
+    if not isinstance(item, dict) or not _text(item.get("title"), "title"):
+        return f"{where} needs a title of at most {LIMITS['title']} characters"
+    for key in ("tag", "subtitle"):
+        if not _opt(item.get(key), key):
+            return f"{where}.{key} must be 1-{LIMITS[key]} characters"
+    if item.get("state") is not None and item["state"] not in ROW_STATES:
+        return f"{where}.state must be one of {', '.join(ROW_STATES)}"
+    if item.get("avatar") is not None:
+        found = _avatar_problem(item["avatar"], f"{where}.avatar")
+        if found:
+            return found
+    found = _many(item, "actions", "row_actions")
+    if found:
+        return f"{where}.{found}"
+    for a, act in enumerate(item.get("actions") or []):
+        found = _action_problem(act, f"{where}.actions[{a}]", "row")
+        if found:
+            return found
+    return None
+
+
+def _header_problem(header: object) -> Optional[str]:
     if not isinstance(header, dict) or not _text(header.get("title")):
         return "header.title is missing"
     for key in ("title", "subtitle"):
-        if key in header and (not isinstance(header[key], str) or _long(header[key], key)):
-            return f"header.{key} is longer than {LIMITS[key]} characters"
-    if _long(card.get("text"), "text") or ("text" in card and not isinstance(card["text"], str)):
-        return f"text must be at most {LIMITS['text']} characters"
-    if "avatar" in header:
+        if not _opt(header.get(key), key):
+            return f"header.{key} must be 1-{LIMITS[key]} characters"
+    if header.get("avatar") is not None:
         found = _avatar_problem(header["avatar"], "header.avatar")
         if found:
             return found
@@ -258,57 +323,73 @@ def problem(card: object) -> Optional[str]:
     if found:
         return "header." + found
     for i, badge in enumerate(header.get("badges") or []):
-        if not isinstance(badge, dict) or not _text(badge.get("label")) or badge.get("state", "on") not in BADGE_STATES:
+        if (not isinstance(badge, dict) or not _text(badge.get("label"), "badge")
+                or (badge.get("state") is not None and badge["state"] not in BADGE_STATES)):
             return f"header.badges[{i}] needs a label and a state of on, off or warn"
     shuffle = header.get("shuffle")
-    if shuffle is not None and not (isinstance(shuffle, dict) and _text(shuffle.get("reply"))
-                                    and not _long(shuffle["reply"], "reply")):
+    if shuffle is not None and not (isinstance(shuffle, dict) and _text(shuffle.get("reply"), "reply")):
         return "header.shuffle needs a reply"
+    status = header.get("status")
+    if status is not None and not (isinstance(status, dict) and _text(status.get("label"), "status")):
+        return f"header.status needs a label of at most {LIMITS['status']} characters"
+    return None
+
+
+def problem(card: object) -> Optional[str]:
+    """Why the client would fall back to the plain body for `card`, or None when it draws it. Unknown
+    fields are allowed; a missing state reads as info and a missing note_tone as dim."""
+    if not isinstance(card, dict):
+        return "the card is not an object"
+    if card.get("kind") != KIND or card.get("v") != VERSION or isinstance(card.get("v"), bool):
+        return f"kind must be {KIND} and v {VERSION}"
+    if not _text(card.get("id"), "id"):
+        return f"id must be 1-{LIMITS['id']} characters"
+    if card.get("state") is not None and card["state"] not in STATES:
+        return f"state must be one of {', '.join(STATES)}"
+    found = _header_problem(card.get("header"))
+    if found:
+        return found
+    if not _opt(card.get("text"), "text"):
+        return f"text must be 1-{LIMITS['text']} characters"
     for key in ("fields", "buttons", "groups"):
         found = _many(card, key)
         if found:
             return found
     for i, field in enumerate(card.get("fields") or []):
-        if not isinstance(field, dict) or not _text(field.get("label")) or not isinstance(field.get("value"), str):
+        if (not isinstance(field, dict) or not _text(field.get("label"), "field_label")
+                or not _text(field.get("value"), "field_value")):
             return f"fields[{i}] needs a label and a value"
-    if "input" in card:
+    if card.get("input") is not None:
         found = _input_problem(card["input"])
         if found:
             return found
     rows = 0
     for g, grp in enumerate(card.get("groups") or []):
-        if not isinstance(grp, dict) or not isinstance(grp.get("rows"), list):
+        if not isinstance(grp, dict) or not isinstance(grp.get("rows"), list) or not grp["rows"]:
             return f"groups[{g}] needs rows"
+        if not _opt(grp.get("label"), "group_label"):
+            return f"groups[{g}].label must be 1-{LIMITS['group_label']} characters"
         rows += len(grp["rows"])
         if rows > LIMITS["rows"]:
             return f"the groups hold more than {LIMITS['rows']} rows"
         for r, item in enumerate(grp["rows"]):
-            where = f"groups[{g}].rows[{r}]"
-            if not isinstance(item, dict) or not _text(item.get("title")):
-                return f"{where} needs a title"
-            if "state" in item and item["state"] not in ROW_STATES:
-                return f"{where}.state must be one of {', '.join(ROW_STATES)}"
-            if "avatar" in item:
-                found = _avatar_problem(item["avatar"], f"{where}.avatar")
-                if found:
-                    return found
-            found = _many(item, "actions", "row_actions")
+            found = _row_problem(item, f"groups[{g}].rows[{r}]")
             if found:
-                return f"{where}.{found}"
-            for a, act in enumerate(item.get("actions") or []):
-                found = _action_problem(act, f"{where}.actions[{a}]", menu_ok=True)
-                if found:
-                    return found
+                return found
     for i, b in enumerate(card.get("buttons") or []):
-        found = _action_problem(b, f"buttons[{i}]")
+        found = _action_problem(b, f"buttons[{i}]", "button")
         if found:
             return found
-    if "note_tone" in card and card["note_tone"] not in NOTE_TONES:
+    if not _opt(card.get("note"), "note"):
+        return f"note must be 1-{LIMITS['note']} characters"
+    if card.get("note_tone") is not None and card["note_tone"] not in NOTE_TONES:
         return "note_tone must be dim, warn or ok"
-    if "expires_at" in card and (isinstance(card["expires_at"], bool) or not isinstance(card["expires_at"], int)):
+    expires = card.get("expires_at")
+    if expires is not None and (isinstance(expires, bool) or not isinstance(expires, int)
+                                or not 0 < expires <= _MAX_SAFE_INT):
         return "expires_at must be milliseconds since the epoch"
     if card.get("footer_link") is not None:
-        found = _action_problem(card["footer_link"], "footer_link")
+        found = _action_problem(card["footer_link"], "footer_link", "footer")
         if found:
             return found
     return None
@@ -414,7 +495,7 @@ def card_click(headers: Mapping[str, str]) -> Optional[dict]:
         click = json.loads(str(headers.get("card_click") or ""))
     except ValueError:
         return None
-    if not isinstance(click, dict) or not all(_text(click.get(k)) for k in ("card_id", "action")):
+    if not isinstance(click, dict) or not _text(click.get("card_id"), "id") or not _text(click.get("action"), "reply"):
         return None
     return {"card_id": click["card_id"], "action": click["action"]}
 
@@ -434,23 +515,112 @@ def owner_may_act(headers: Mapping[str, str], owner_mxid: str = "", *, dm_only: 
     return None
 
 
-def card_command(headers: Mapping[str, str], said: str, owner_mxid: str, workspace,
-                 *, now: Optional[float] = None) -> Tuple[Optional[Reply], str]:
-    """(the command, "") for the owner's click on a card this agent posted, else (None, why it is ordinary
-    chat). A click is `space.ag2.card_click` naming the card, in reply to that card's own event, whose
-    text is one the card offered. Typed words, a forged card and anyone else's click never pass."""
+NOT_A_CARD, FORGED, WORDS, COMMAND = "not_a_card", "forged_or_stale_click", "owner_words", "command"
+# What the agent says, once, to a click it cannot match; it then does nothing else with the message.
+UNMATCHED_CLICK = ("I couldn't match that button to a card I sent, so I haven't done anything. "
+                   "Tell me what you'd like in your own words.")
+_PICKER_ASK = re.compile(r"Connect \S.{0,200}")
+_HANDLER_RE = re.compile(r"skills/[A-Za-z0-9_-]+/scripts/[A-Za-z0-9_-]+\.py( [a-z-]+)?")
+
+
+@dataclass(frozen=True)
+class Click:
+    """What a task is to this agent's cards: `verdict`, the `command` of a COMMAND, why a FORGED click
+    was refused, and the card's handler script and connection as its poster recorded them."""
+    verdict: str
+    command: Optional[Reply] = None
+    why: str = ""
+    handler: str = ""
+    lane: str = ""
+
+
+def lane_owner(workspace, default: str = "") -> Callable[[str], str]:
+    """lane -> its owner's mxid, from this machine's core connections; `default` for a card with no lane."""
+    def owner(lane: str) -> str:
+        if not lane:
+            return default
+        import connections
+        return next((str(r.get("owner_mxid") or "") for r in connections.read_rows(workspace)
+                     if r.get("instance") == lane and not r.get("worker")), "")
+    return owner
+
+
+def click_verdict(headers: Mapping[str, str], said: str, workspace, owner_of: Callable[[str], str],
+                  *, now: Optional[float] = None) -> Click:
+    """COMMAND or WORDS for the owner's click on a card this agent posted (the owner of the connection it
+    was posted on, in the room it was posted in, in reply to its event, with a text it offered); FORGED
+    for any other click and for a card command's text without one; NOT_A_CARD for everything else."""
     import issued_cards
-    if not owner_mxid:
-        return None, "the owner is not known"
-    why = owner_may_act(headers, owner_mxid)
-    if why:
-        return None, why
+    entry = issued_cards.live(workspace, str(headers.get("reply_to_event") or ""), now=now)
     click = card_click(headers)
-    if click is None or click["action"] != said:
-        return None, "it is not a card click"
-    command = issued_cards.command_for(workspace, str(headers.get("reply_to_event") or ""), click["card_id"],
-                                       said, now=now)
-    parsed = parse_reply(command or "")
-    if parsed is None:
-        return None, "it does not answer a card I posted with that action"
-    return parsed, ""
+    if click is None:
+        if parse_reply(said) is not None or (entry is not None and entry["offers"].get(said)):
+            return Click(FORGED, why="it is a card's action text without a click")
+        return Click(NOT_A_CARD)
+    if click["action"] != said:
+        return Click(FORGED, why="the click names another action than the words")
+    if entry is None or str(entry.get("card_id") or "") != click["card_id"]:
+        return Click(FORGED, why="it does not answer a card I posted")
+    if str(entry.get("room") or "") != str(headers.get("channel_id") or ""):
+        return Click(FORGED, why="it is not in the room the card was posted in")
+    owner = owner_of(str(entry.get("lane") or ""))
+    why = owner_may_act(headers, owner) if owner else "the owner is not known"
+    if why:
+        return Click(FORGED, why=why)
+    command = entry["offers"].get(said)
+    if command:
+        parsed = parse_reply(command)
+        if parsed is None:
+            return Click(FORGED, why="its command is unreadable")
+        return Click(COMMAND, parsed, handler=str(entry.get("handler") or ""), lane=str(entry.get("lane") or ""))
+    if command == "" or (entry.get("picker") and _PICKER_ASK.fullmatch(said)):
+        return Click(WORDS)
+    return Click(FORGED, why="that card did not offer it")
+
+
+def click_answer(verdict: Click, said: str, mine: Tuple[str, ...] = ()) -> Optional[dict]:
+    """What a card handler prints for a task that is not a command of its own kinds (`mine`): the fixed
+    refusal for a forged click, the owner's words, ordinary chat, or another handler's card. None for
+    its own command."""
+    if verdict.verdict == FORGED:
+        return {"status": FORGED, "say": UNMATCHED_CLICK, "why": verdict.why}
+    if verdict.verdict == WORDS:
+        return {"status": WORDS, "words": said}
+    if verdict.verdict == NOT_A_CARD:
+        return {"status": NOT_A_CARD}
+    if verdict.command.kind not in mine:
+        return {"status": "other_card", "card": verdict.command.kind,
+                "run": verdict.handler if _HANDLER_RE.fullmatch(verdict.handler) else None}
+    return None
+
+
+def main(argv=None) -> int:
+    """`click --task-file PATH [--workspace WS]`: one JSON line, the verdict on that task. Exit 0 for a
+    command, the owner's words or ordinary chat; 1 for a forged or stale click; 2 unreadable."""
+    import argparse
+    import json
+    from pathlib import Path
+    p = argparse.ArgumentParser(description="What a task is to the cards this agent posted.")
+    p.add_argument("verb", choices=("click",))
+    p.add_argument("--task-file", required=True)
+    p.add_argument("--workspace", default=None)
+    args = p.parse_args(argv)
+    if args.workspace:
+        ws = Path(args.workspace)
+    else:
+        from workspace_default import resolve_workspace
+        ws = Path(resolve_workspace())
+    try:
+        headers, said = reply_words(Path(args.task_file).read_text(encoding="utf-8"))
+    except OSError as e:
+        print(json.dumps({"status": "refused", "why": f"the task file is unreadable ({type(e).__name__})"}))
+        return 2
+    out = click_answer(click_verdict(headers, said, ws, lane_owner(ws)), said)
+    if out["status"] == "other_card":
+        out["status"] = COMMAND
+    print(json.dumps(out, sort_keys=True))
+    return 1 if out["status"] == FORGED else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

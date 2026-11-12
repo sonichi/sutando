@@ -2781,8 +2781,8 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # A room question this agent is asked: one line of quoted room data (branch below).
                 "room_question")
 
-# A card click's card_id and action, each at most this long (the client caps a reply at 1000).
-_CARD_CLICK_MAX = 1000
+# A card click's bounds: the card id as the backend forwards it, the action as the client caps a reply.
+_CARD_CLICK_MAX = {"card_id": 200, "action": 1000}
 
 # platform_card passes through with exactly these subkeys — a signed pointer
 # {card_url, card_sha256, sig, key_id, alg} to the platform's canonical agent
@@ -6360,8 +6360,8 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
                 lines.append(f"ui_origin: {uo}")
         elif f == "card_click":
             click = task.get(f)
-            if isinstance(click, dict) and all(isinstance(click.get(k), str) and 0 < len(click[k]) <= _CARD_CLICK_MAX
-                                               for k in ("card_id", "action")):
+            if isinstance(click, dict) and all(isinstance(click.get(k), str) and 0 < len(click[k]) <= limit
+                                               for k, limit in _CARD_CLICK_MAX.items()):
                 lines.append("card_click: " + json.dumps({"card_id": click["card_id"], "action": click["action"]},
                                                          separators=(",", ":")))
         elif f == "owner_mentioned":

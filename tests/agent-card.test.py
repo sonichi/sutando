@@ -3,14 +3,20 @@
 
 - `build` returns a one-line body and a card the checks accept; a card a client would not draw raises.
 - `problem` matches the web client: unknown fields allowed, required keys, http(s) links without
-  credentials (avatar links mxc:// only), menus only in row actions, and the client's size limits.
+  credentials (avatar links mxc:// only), the client's size limits, and where each kind may sit: a menu
+  only in row actions, `connect` in buttons and row actions, `connect_picker` in buttons and the footer.
+- The status pill is `header.status.label` (40 characters at most); a done card carries no shuffle, and
+  `shape` is never sent for an mxid or seed avatar.
 - `send_card` posts through the injected Action call (`room.message.send` with `extra_content`) and returns
   the event id; a private card goes only to the owner's checked DM. `update_card` posts a new card as a
   reply to the old one, since no Action carries a card in an edit.
 - A reply button sends a readable sentence and keeps its `card:<kind>:<target>:<verb>[:confirmed]` command in
-  this agent's record of the card (issued_cards). `card_command` returns it only for the owner's click
-  (`card_click` header) in their DM, in reply to that card's event, with a text the card offered; typed
-  words, a forged card and anyone else's click are ordinary chat.
+  this agent's record of the card (issued_cards), with the room, the connection and the handler script.
+- `click_verdict` is the one decision on a task: `command` or `owner_words` for the click of the owner of
+  that connection, in that room and their DM, in reply to that card's event, with a text it offered;
+  `forged_or_stale_click` for every other click and for card action text sent without one, which nothing
+  acts on (the handlers print one fixed refusal); `not_a_card` for the rest, which is ordinary chat.
+- A newer card with the same id in the same room replaces the older record; `settle` forgets one.
 
 Run: python3 tests/agent-card.test.py
 """
@@ -60,6 +66,32 @@ class Build(unittest.TestCase):
         self.assertEqual(card["header"], {"title": "Pylon", "subtitle": "Worker", "avatar": {"seed": "pylon"}})
         self.assertEqual(card["buttons"][0]["kind"], "url")
         self.assertIsNone(ac.problem(card))
+
+    def test_the_status_pill_is_a_short_label_and_a_done_card_has_no_shuffle(self):
+        _, card = a_card(state="done", status="Approved", shuffle_reply="Try another avatar")
+        self.assertEqual(card["header"], {"title": "Pylon", "status": {"label": "Approved"}})
+        _, card = a_card(shuffle_reply="Try another avatar")
+        self.assertEqual(card["header"]["shuffle"], {"reply": "Try another avatar"})
+        self.assertNotIn("status", card["header"])
+        with self.assertRaises(ac.CardError):
+            a_card(status="x" * 41)
+
+    def test_shape_is_sent_only_for_avatars_the_card_may_shape(self):
+        self.assertEqual(ac.avatar(mxid="@a:s.space", shape="square"), {"mxid": "@a:s.space"})
+        self.assertEqual(ac.avatar(seed="pylon", shape="square"), {"seed": "pylon"})
+        for key in ("url", "initial", "app"):
+            value = {"url": "mxc://s.space/abc", "initial": "P", "app": "gmail"}[key]
+            self.assertEqual(ac.avatar(**{key: value}, shape="round"), {key: value, "shape": "round"})
+        with self.assertRaises(ac.CardError):
+            ac.avatar(shape="round")
+
+    def test_connect_and_picker_buttons_carry_their_contract_keys(self):
+        self.assertEqual(ac.button("Reconnect Gmail", "connect", toolkit="gmail", for_=OWNER),
+                         {"label": "Reconnect Gmail", "kind": "connect", "toolkit": "gmail", "for": OWNER})
+        self.assertEqual(ac.button("+ Connect an app", "connect_picker", suggest=["notion", "linear", "notion"]),
+                         {"label": "+ Connect an app", "kind": "connect_picker", "suggest": ["notion", "linear"]})
+        self.assertEqual(ac.button("+ Connect an app", "connect_picker"),
+                         {"label": "+ Connect an app", "kind": "connect_picker"})
 
     def test_a_card_a_client_would_not_draw_is_refused_at_build(self):
         with self.assertRaises(ac.CardError):
@@ -132,6 +164,44 @@ class Check(unittest.TestCase):
                   {"label": "x", "kind": "teleport"}, {"label": "x", "kind": "reply", "reply": "r", "disabled": "no"}):
             self.assertIsNotNone(ac.problem({**self.card, "buttons": [b]}), b)
 
+    def test_connect_sits_in_buttons_and_row_actions_only(self):
+        good = ac.button("Reconnect Gmail", "connect", toolkit="gmail")
+        rows = lambda a: [{"label": "g", "rows": [{"title": "Gmail", "actions": [a]}]}]
+        menu = lambda a: {"label": "⋯", "kind": "menu", "items": [a]}
+        for ok in ({**self.card, "buttons": [good]}, {**self.card, "groups": rows(good)},
+                   {**self.card, "buttons": [{**good, "for": OWNER, "confirm": "ignored"}]}):
+            self.assertIsNone(ac.problem(ok))
+        self.assertIn("connect belongs only in buttons and row actions",
+                      ac.problem({**self.card, "groups": rows(menu(good))}))
+        self.assertIn("connect belongs only", ac.problem({**self.card, "footer_link": good}))
+        for toolkit in (None, "", "Gmail", "g-mail", "x" * 65, 7):
+            b = {"label": "Reconnect", "kind": "connect", **({"toolkit": toolkit} if toolkit is not None else {})}
+            self.assertIn("toolkit is not an app slug", ac.problem({**self.card, "buttons": [b]}), toolkit)
+        for who in ("owner", "@owner", 7, "@" + "o" * 255 + ":s.space"):
+            self.assertIn("for is not a user id", ac.problem({**self.card, "buttons": [{**good, "for": who}]}))
+
+    def test_a_picker_sits_in_buttons_and_the_footer_only(self):
+        good = ac.button("+ Connect an app", "connect_picker", suggest=["notion", "linear"])
+        bare = {"label": "+ Connect an app", "kind": "connect_picker"}
+        rows = lambda a: [{"label": "g", "rows": [{"title": "t", "actions": [a]}]}]
+        for ok in ({**self.card, "buttons": [good]}, {**self.card, "footer_link": good},
+                   {**self.card, "buttons": [bare]}, {**self.card, "buttons": [{**good, "for": OWNER}]},
+                   {**self.card, "buttons": [{**bare, "suggest": ["a"] * 8}]}):
+            self.assertIsNone(ac.problem(ok))
+        self.assertIn("connect_picker belongs only in buttons and the footer link",
+                      ac.problem({**self.card, "groups": rows(good)}))
+        self.assertIn("connect_picker belongs only", ac.problem(
+            {**self.card, "groups": rows({"label": "⋯", "kind": "menu", "items": [good]})}))
+        for suggest in ("notion", ["Notion"], [7], ["a"] * 9):
+            self.assertIn("suggest must be at most 8 app slugs",
+                          ac.problem({**self.card, "buttons": [{**bare, "suggest": suggest}]}), suggest)
+        self.assertIn("for is not a user id", ac.problem({**self.card, "footer_link": {**bare, "for": "me"}}))
+
+    def test_neither_connect_kind_is_a_reply_this_agent_must_remember(self):
+        card = {**self.card, "buttons": [ac.button("Reconnect Gmail", "connect", toolkit="gmail"),
+                                         ac.button("+ Connect an app", "connect_picker")]}
+        self.assertEqual(issued_cards.offered(card), {})
+
     def test_a_menu_is_for_row_actions_only_and_never_nests(self):
         menu = {"label": "⋯", "kind": "menu", "items": [{"label": "y", "kind": "reply", "reply": "r"}]}
         self.assertIsNotNone(ac.problem({**self.card, "buttons": [menu]}))
@@ -168,6 +238,55 @@ class Check(unittest.TestCase):
               {**c, "buttons": [{**reply, "reply": "x" * 1000}]}]
         for card in at:
             self.assertIsNone(ac.problem(card))
+
+    def test_the_client_s_text_bounds(self):
+        c, h = self.card, self.card["header"]
+        reply = {"label": "x", "kind": "reply", "reply": "r"}
+        row = lambda **kw: {**c, "groups": [{"label": "g", "rows": [{"title": "t", **kw}]}]}
+        cases = [
+            ({**c, "header": {**h, "status": {"label": "x" * 41}}}, "status needs a label"),
+            ({**c, "header": {**h, "status": {"label": " "}}}, "status needs a label"),
+            ({**c, "header": {**h, "status": "Approved"}}, "status needs a label"),
+            ({**c, "header": {**h, "subtitle": ""}}, "header.subtitle must be"),
+            ({**c, "header": {**h, "badges": [{"label": "x" * 41}]}}, "badges[0] needs a label"),
+            ({**c, "header": {**h, "avatar": {"mxid": "pylon"}}}, "mxid is not a user id"),
+            ({**c, "header": {**h, "avatar": "pylon"}}, "avatar needs one of"),
+            ({**c, "header": {**h, "avatar": {"seed": "x" * 129}}}, "seed must be"),
+            ({**c, "header": {**h, "avatar": {"initial": "x" * 9}}}, "initial must be"),
+            ({**c, "header": {**h, "avatar": {"url": "mxc://s.space/" + "x" * 512}}}, "must be an mxc:// link"),
+            ({**c, "text": " "}, "text must be"),
+            ({**c, "fields": [{"label": "f", "value": ""}]}, "fields[0] needs"),
+            ({**c, "fields": [{"label": "x" * 61, "value": "v"}]}, "fields[0] needs"),
+            ({**c, "fields": [{"label": "f", "value": "x" * 301}]}, "fields[0] needs"),
+            ({**c, "groups": [{"label": "g", "rows": []}]}, "groups[0] needs rows"),
+            ({**c, "groups": [{"label": "x" * 81, "rows": [{"title": "t"}]}]}, "groups[0].label must be"),
+            (row(tag="x" * 41), "tag must be"), (row(subtitle="x" * 301), "subtitle must be"),
+            (row(title="x" * 121), "needs a title"),
+            ({**c, "buttons": [{**reply, "label": "x" * 81}]}, "needs a label"),
+            ({**c, "buttons": [{**reply, "confirm": "x" * 301}]}, "confirm must be"),
+            ({**c, "buttons": [{"label": "x", "kind": "url", "url": "https://s.space/x", "uses_input": "yes"}]},
+             "uses_input must be true or false"),
+            ({**c, "buttons": [{"label": "x", "kind": "url", "url": "https://s.space/" + "x" * 4096}]}, "not an http(s) link"),
+            ({**c, "buttons": [{"label": "x", "kind": "open_dm", "user_id": "pylon"}]}, "needs a user_id"),
+            ({**c, "buttons": [{"label": "x", "kind": "open_room", "room_id": "#room:s.space"}]}, "needs a room_id"),
+            ({**c, "input": {"name": "a", "label": "x" * 201}}, "input.label must be"),
+            ({**c, "input": {"name": "a", "prefix": "x" * 61}}, "input.prefix must be"),
+            ({**c, "input": {"name": "a", "hint": ""}}, "input.hint must be"),
+            ({**c, "input": {"name": "a", "value": 3}}, "input.value"),
+            ({**c, "note": "x" * 601}, "note must be"),
+            ({**c, "expires_at": 0}, "expires_at must be milliseconds"),
+            ({**c, "expires_at": 2 ** 53}, "expires_at must be milliseconds"),
+            ({**c, "v": True}, "kind must be"),
+        ]
+        for card, why in cases:
+            self.assertIn(why, ac.problem(card) or "", card)
+        fine = [{**c, "header": {**h, "status": {"label": "x" * 40}, "subtitle": None}}, {**c, "state": None},
+                {**c, "note": "x" * 600, "note_tone": None, "text": None, "input": {"name": "a"}},
+                {**c, "groups": [{"rows": [{"title": "t", "tag": "x" * 40, "state": None, "avatar": None}]}]},
+                {**c, "buttons": [{**reply, "label": "x" * 80, "confirm": "x" * 300, "style": None}]},
+                {**c, "header": {**h, "avatar": {"mxid": "@a:s.space", "shape": "square"}}}]
+        for card in fine:
+            self.assertIsNone(ac.problem(card), card)
 
     def test_groups_rows_and_avatars(self):
         good = ac.group("Chat apps", [ac.row("Discord", state="off", avatar_=ac.avatar(app="discord", shape="square"),
@@ -289,7 +408,8 @@ class Replies(unittest.TestCase):
     def test_the_click_header_is_read_only_whole(self):
         good = '{"card_id":"c1","action":"Go"}'
         self.assertEqual(ac.card_click({"card_click": good}), {"card_id": "c1", "action": "Go"})
-        for bad in ("", "{broken", "[]", '{"card_id":"c1"}', '{"card_id":"","action":"Go"}'):
+        for bad in ("", "{broken", "[]", '{"card_id":"c1"}', '{"card_id":"","action":"Go"}',
+                    json.dumps({"card_id": "c" * 201, "action": "Go"}), json.dumps({"card_id": "c", "action": "G" * 1001})):
             self.assertIsNone(ac.card_click({"card_click": bad}), bad)
 
     def test_only_the_owner_in_their_dm_may_act(self):
@@ -304,58 +424,113 @@ class Replies(unittest.TestCase):
 
 
 class Issued(unittest.TestCase):
-    """Only the owner's click on a card this agent posted, with a text that card offered, is a command."""
+    """Only the owner's click on a card this agent posted, with a text that card offered, acts."""
     TEXT, COMMAND = "Get a new link for Pylon", "card:worker-approval:w1:resend"
+    HANDLER = "skills/worker-pool/scripts/pool_identity.py card-reply"
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.ws = Path(tmp.name)
         self.card = a_card(state="expired", buttons=[
-            ac.button(self.TEXT, "reply", reply=self.TEXT, command=self.COMMAND)])[1]
-        self.assertTrue(issued_cards.record(self.ws, "$mine", self.card, now=1000.0))
+            ac.button(self.TEXT, "reply", reply=self.TEXT, command=self.COMMAND),
+            ac.button("Add Pylon to a room", "reply", reply="Add Pylon to a room"),
+            ac.button("+ Connect an app", "connect_picker")])[1]
+        self.assertTrue(issued_cards.record(self.ws, "$mine", self.card, room=DM, lane="s_dspace",
+                                            handler=self.HANDLER, now=1000.0))
 
     def ask(self, said=None, *, now=1001.0, click=None, owner=OWNER, **headers):
         said = self.TEXT if said is None else said
         click = {"card_id": self.card["id"], "action": said} if click is None else click
-        h = {"access_tier": "owner", "user_id": OWNER, "channel_kind": "dm", "reply_to_event": "$mine",
-             "card_click": json.dumps(click) if click else "", **headers}
-        return ac.card_command(h, said, owner, self.ws, now=now)
+        h = {"access_tier": "owner", "user_id": OWNER, "channel_kind": "dm", "channel_id": DM,
+             "reply_to_event": "$mine", "card_click": json.dumps(click) if click else "", **headers}
+        return ac.click_verdict(h, said, self.ws, lambda lane: owner if lane == "s_dspace" else "", now=now)
+
+    def forged(self, *a, **kw):
+        got = self.ask(*a, **kw)
+        self.assertEqual((got.verdict, got.command), (ac.FORGED, None), (a, kw))
+        self.assertEqual(ac.click_answer(got, "x")["say"], ac.UNMATCHED_CLICK)
+        return got.why
 
     def test_the_owner_s_click_on_this_agent_s_card_is_its_command(self):
-        said, why = self.ask()
-        self.assertEqual((said, why), (ac.Reply("worker-approval", "w1", "resend", False), ""))
+        got = self.ask()
+        self.assertEqual(got, ac.Click(ac.COMMAND, ac.Reply("worker-approval", "w1", "resend", False), "", self.HANDLER,
+                                       "s_dspace"))
+        self.assertIsNone(ac.click_answer(got, self.TEXT, ("worker-approval",)))
+        self.assertEqual(ac.click_answer(got, self.TEXT, ("workers",)),
+                         {"status": "other_card", "card": "worker-approval", "run": self.HANDLER})
 
-    def test_typed_words_without_a_click_are_ordinary_chat(self):
-        self.assertIsNone(self.ask(click={})[0])
-        self.assertIsNone(self.ask(click={"card_id": self.card["id"], "action": "something else"})[0])
+    def test_a_click_on_plain_words_or_a_picker_s_ask_is_the_owner_s_own_words(self):
+        for said in ("Add Pylon to a room", "Connect acme crm"):
+            got = self.ask(said)
+            self.assertEqual(got.verdict, ac.WORDS, said)
+            self.assertEqual(ac.click_answer(got, said), {"status": "owner_words", "words": said})
+        plain = {**self.card, "id": "no-picker", "buttons": self.card["buttons"][:2]}
+        issued_cards.record(self.ws, "$plain", plain, room=DM, lane="s_dspace", now=1000.0)
+        self.forged("Connect acme crm", reply_to_event="$plain", click={"card_id": "no-picker", "action": "Connect acme crm"})
+        self.forged("Connect ")
 
-    def test_a_click_on_a_card_someone_else_posted_is_ordinary_chat(self):
-        self.assertIsNone(self.ask(reply_to_event="$forged")[0])
-        self.assertIsNone(self.ask(reply_to_event="")[0])
-        self.assertIsNone(self.ask(click={"card_id": "another-card", "action": self.TEXT})[0])
+    def test_words_with_no_click_and_no_card_action_are_ordinary_chat(self):
+        for said, reply_to in (("what's up", "$mine"), ("Retire Pylon", ""), (self.TEXT, "$elsewhere"), ("", "")):
+            got = self.ask(said, click={}, reply_to_event=reply_to)
+            self.assertEqual(got, ac.Click(ac.NOT_A_CARD), (said, reply_to))
+            self.assertEqual(ac.click_answer(got, said), {"status": "not_a_card"})
 
-    def test_a_text_the_card_did_not_offer_is_ordinary_chat(self):
-        self.assertIsNone(self.ask("Retire Pylon")[0])
-        self.assertIsNone(self.ask(self.COMMAND)[0])
+    def test_card_action_text_without_a_click_is_never_ordinary_chat(self):
+        self.assertIn("without a click", self.forged(click={}))
+        self.assertEqual(self.ask("Add Pylon to a room", click={}).verdict, ac.NOT_A_CARD, "plain words carry no command")
+        self.forged(self.COMMAND, click={}, reply_to_event="")
 
-    def test_anyone_but_the_owner_or_an_unknown_owner_is_ordinary_chat(self):
-        self.assertIsNone(self.ask(user_id="@member:s.space")[0])
-        self.assertIsNone(self.ask(access_tier="team")[0])
-        self.assertEqual(self.ask(owner=""), (None, "the owner is not known"))
+    def test_a_click_that_does_not_match_an_issued_card_is_forged_or_stale(self):
+        self.assertIn("another action", self.forged(click={"card_id": self.card["id"], "action": "something else"}))
+        for kw in ({"reply_to_event": "$forged"}, {"reply_to_event": ""},
+                   {"click": {"card_id": "another-card", "action": self.TEXT}}):
+            self.assertIn("does not answer a card I posted", self.forged(**kw))
+        self.assertIn("did not offer", self.forged("Retire Pylon"))
+        self.forged(self.COMMAND)
+        self.assertIn("not in the room", self.forged(channel_id=ROOM))
+        self.forged(now=1000.0 + issued_cards.TTL_S + 1)
+
+    def test_anyone_but_the_owner_of_the_card_s_connection_is_refused(self):
+        self.forged(user_id="@member:s.space")
+        self.forged(access_tier="team")
+        self.forged(channel_kind="room")
+        self.assertEqual(self.forged(owner=""), "the owner is not known")
+        issued_cards.record(self.ws, "$other", {**self.card, "id": "c2"}, room=DM, lane="other", now=1000.0)
+        self.forged(reply_to_event="$other", click={"card_id": "c2", "action": self.TEXT})
+
+    def test_the_owner_is_the_one_of_the_connection_the_card_was_posted_on(self):
+        rows = [{"instance": "s_dspace", "owner_mxid": "@second:s.space"},
+                {"instance": "s_dspace", "owner_mxid": "@worker-owner:s.space", "worker": "w1"},
+                {"instance": "primary", "owner_mxid": OWNER}]
+        with mock.patch("connections.read_rows", lambda ws=None: rows):
+            owner_of = ac.lane_owner(self.ws, "@fallback:s.space")
+            self.assertEqual([owner_of(x) for x in ("s_dspace", "primary", "gone", "")],
+                             ["@second:s.space", OWNER, "", "@fallback:s.space"])
+
+    def test_a_newer_card_with_the_same_id_replaces_the_older_record(self):
+        done = a_card(state="done")[1]
+        self.assertFalse(issued_cards.record(self.ws, "$done", done, room=DM, now=1002.0))
+        self.forged(now=1003.0)
+        self.assertTrue(issued_cards.record(self.ws, "$a", self.card, room=DM, lane="s_dspace", now=1004.0))
+        self.assertTrue(issued_cards.record(self.ws, "$b", self.card, room=ROOM, lane="s_dspace", now=1004.0))
+        self.assertEqual(sorted(json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"]), ["$a", "$b"])
+        self.assertTrue(issued_cards.settle(self.ws, "$a"))
+        self.assertFalse(issued_cards.settle(self.ws, "$a"))
+        self.forged(reply_to_event="$a", now=1005.0)
 
     def test_a_record_expires_and_the_ledger_keeps_only_live_cards(self):
-        self.assertIsNone(self.ask(now=1000.0 + issued_cards.TTL_S + 1)[0])
-        issued_cards.record(self.ws, "$later", self.card, now=1000.0 + issued_cards.TTL_S + 1)
+        self.assertLessEqual(issued_cards.TTL_S, 3 * 86400)
+        issued_cards.record(self.ws, "$later", {**self.card, "id": "later"}, now=1000.0 + issued_cards.TTL_S + 1)
         kept = json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"]
         self.assertEqual(list(kept), ["$later"])
         issued_cards.ledger_path(self.ws).unlink()
         with mock.patch.object(issued_cards, "MAX_CARDS", 2):
             for i in range(3):
-                issued_cards.record(self.ws, f"$n{i}", self.card, now=2000.0 + i)
+                issued_cards.record(self.ws, f"$n{i}", {**self.card, "id": f"c{i}"}, now=2000.0 + i)
         self.assertEqual(sorted(json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"]), ["$n1", "$n2"])
 
-    def test_only_commanded_unambiguous_replies_are_recorded(self):
+    def test_every_unambiguous_reply_is_recorded_with_its_command_or_as_plain_words(self):
         cmd = lambda text, c: ac.button(text, "reply", reply=text, command=c)
         card = a_card(shuffle_reply="Shuffle", buttons=[cmd("Pause Pylon", "card:workers:w1:pause"),
                       cmd("Pause Quill", "card:workers:w2:pause"), cmd("Pause Quill", "card:workers:w3:pause"),
@@ -363,21 +538,27 @@ class Issued(unittest.TestCase):
                       ac.button("Open", "url", url="https://s.space/x")],
                       footer_link=cmd("Restart Pylon", "card:workers:w1:restart"),
                       groups=[ac.group("g", [ac.row("t", actions=[ac.button("⋯", "menu", items=[
-                          cmd("Retire Pylon", "card:workers:w1:retire:confirmed")])])])])[1]
+                          cmd("Retire Pylon", "card:workers:w1:retire")])])])])[1]
         self.assertEqual(issued_cards.offered(card), {"Pause Pylon": "card:workers:w1:pause",
                                                       "Restart Pylon": "card:workers:w1:restart",
-                                                      "Retire Pylon": "card:workers:w1:retire:confirmed"})
+                                                      "Retire Pylon": "card:workers:w1:retire",
+                                                      "create a worker": "", "Shuffle": ""})
         self.assertFalse(issued_cards.record(self.ws, "$plain", a_card()[1]))
         self.assertFalse(issued_cards.record(self.ws, "not-an-event", card))
+        self.assertFalse(issued_cards.has_picker(card))
 
     def test_an_unreadable_ledger_holds_no_card(self):
         issued_cards.ledger_path(self.ws).write_text("{broken")
-        self.assertIsNone(self.ask()[0])
+        self.forged()
         issued_cards.ledger_path(self.ws).write_text(json.dumps({"cards": []}))
-        self.assertIsNone(issued_cards.command_for(self.ws, "$mine", self.card["id"], self.TEXT))
+        self.assertIsNone(issued_cards.live(self.ws, "$mine"))
         issued_cards.ledger_path(self.ws).write_text(json.dumps({"cards": {"$mine": {
             "card_id": self.card["id"], "offers": [self.TEXT], "expires_at": 1e18}}}))
-        self.assertIsNone(issued_cards.command_for(self.ws, "$mine", self.card["id"], self.TEXT))
+        self.assertIsNone(issued_cards.live(self.ws, "$mine"))
+        issued_cards.ledger_path(self.ws).write_text(json.dumps({"cards": {"$mine": {
+            "card_id": self.card["id"], "offers": {self.TEXT: "not a command"}, "room": DM, "lane": "s_dspace",
+            "expires_at": 1e18}}}))
+        self.assertEqual(self.forged(), "its command is unreadable")
 
     def test_the_cli_records_a_posted_message_payload(self):
         def run(stdin, *argv):
@@ -385,11 +566,56 @@ class Issued(unittest.TestCase):
             with mock.patch.object(sys, "stdin", io.StringIO(stdin)), contextlib.redirect_stdout(out):
                 rc = issued_cards.main(["record", "--workspace", str(self.ws), *argv])
             return rc, json.loads(out.getvalue())
-        message = json.dumps({"body": "b", "extra_content": {"space.ag2.card": self.card}})
-        self.assertEqual(run(message, "--event-id", "$cli"), (0, {"recorded": True}))
-        self.assertEqual(issued_cards.command_for(self.ws, "$cli", self.card["id"], self.TEXT), self.COMMAND)
+        message = json.dumps({"body": "b", "extra_content": {"space.ag2.card": {**self.card, "id": "cli"}}})
+        self.assertEqual(run(message, "--event-id", "$cli", "--room", DM, "--lane", "s_dspace", "--handler", "h"),
+                         (0, {"recorded": True}))
+        entry = issued_cards.live(self.ws, "$cli")
+        self.assertEqual((entry["room"], entry["lane"], entry["handler"], entry["offers"][self.TEXT]),
+                         (DM, "s_dspace", "h", self.COMMAND))
         self.assertEqual(run("{}", "--event-id", "$x"), (1, {"recorded": False}))
         self.assertEqual(run("nope", "--event-id", "$x")[0], 2)
+
+
+class Dispatch(Issued):
+    """`agent_card.py click`: the one place a task is matched to a card, for every card."""
+
+    def run_click(self, said, *, click=None, **headers):
+        click = {"card_id": self.card["id"], "action": said} if click is None else click
+        h = {"access_tier": "owner", "user_id": OWNER, "channel_kind": "dm", "channel_id": DM,
+             "reply_to_event": "$mine", **headers}
+        path = self.ws / "task.txt"
+        path.write_text("\n".join(["id: task-1", "task_layout: mid"] + [f"{k}: {v}" for k, v in h.items()]
+                                  + ([f"card_click: {json.dumps(click)}"] if click else [])
+                                  + [f"task: {said}", "source: ag2space"]) + "\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                mock.patch("connections.read_rows", lambda ws=None: [{"instance": "s_dspace", "owner_mxid": OWNER}]), \
+                mock.patch.object(issued_cards.time, "time", lambda: 1001.0):
+            rc = ac.main(["click", "--task-file", str(path), "--workspace", str(self.ws)])
+        return rc, json.loads(out.getvalue())
+
+    def test_each_verdict_is_one_json_line(self):
+        self.assertEqual(self.run_click(self.TEXT),
+                         (0, {"status": "command", "card": "worker-approval", "run": self.HANDLER}))
+        self.assertEqual(self.run_click("Add Pylon to a room"),
+                         (0, {"status": "owner_words", "words": "Add Pylon to a room"}))
+        self.assertEqual(self.run_click("good morning", click={}), (0, {"status": "not_a_card"}))
+        rc, out = self.run_click("Retire Pylon")
+        self.assertEqual((rc, out["status"], out["say"]), (1, "forged_or_stale_click", ac.UNMATCHED_CLICK))
+        rc, out = self.run_click(self.TEXT, user_id="@member:s.space")
+        self.assertEqual((rc, out["status"]), (1, "forged_or_stale_click"))
+
+    def test_a_handler_that_is_not_a_skill_script_is_not_printed(self):
+        issued_cards.record(self.ws, "$odd", {**self.card, "id": "odd"}, room=DM, lane="s_dspace",
+                            handler="rm -rf / ; skills/x/scripts/y.py", now=1000.0)
+        rc, out = self.run_click(self.TEXT, reply_to_event="$odd", click={"card_id": "odd", "action": self.TEXT})
+        self.assertEqual((rc, out), (0, {"status": "command", "card": "worker-approval", "run": None}))
+
+    def test_an_unreadable_task_and_the_default_workspace(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch("workspace_default.resolve_workspace", lambda: str(self.ws)):
+            rc = ac.main(["click", "--task-file", str(self.ws / "absent.txt")])
+        self.assertEqual((rc, json.loads(out.getvalue())["status"]), (2, "refused"))
 
 
 if __name__ == "__main__":
