@@ -458,5 +458,154 @@ class Cli(Base):
                 pool_identity.main(["--workspace", str(self.ws), "add", "Reviewer", "-"])
 
 
+DM = "!owner-dm:alpha-fixture.net"
+
+
+class FakeActions:
+    """room.message.send as the server answers it; `refuse` makes every send an error."""
+
+    def __init__(self, refuse=False):
+        self.calls, self.refuse = [], refuse
+
+    def execute(self, action, arguments, *, operation_id="", room_id=""):
+        self.calls.append({"action": action, "arguments": arguments, "operation_id": operation_id, "room": room_id})
+        if self.refuse:
+            return {"is_error": True, "code": "FORBIDDEN"}
+        return {"result": {"event_id": f"$card{len(self.calls)}"}}
+
+    def cards(self):
+        return [c["arguments"]["extra_content"]["space.ag2.card"] for c in self.calls]
+
+
+def card_task(said, *, tier="owner", user=None, kind="dm"):
+    return "\n".join(["id: task-card-1", "task_layout: mid", f"task: {said}", "source: ag2space",
+                      f"channel_id: {DM}", f"channel_kind: {kind}", f"user_id: {user}", f"access_tier: {tier}"]) + "\n"
+
+
+class CardsBase(Base):
+    def setUp(self):
+        super().setUp()
+        self.actions = FakeActions()
+        self.sink = dc.CardSink(self.actions.execute, DM)
+        host = unittest.mock.patch("util_paths._host_label", lambda: "desk-mini")
+        host.start()
+        self.addCleanup(host.stop)
+
+    def connect(self, fake, **kw):
+        kw.setdefault("cards", self.sink)
+        return super().connect(fake, **kw)
+
+
+class Cards(CardsBase):
+
+    def test_the_owner_gets_an_approval_card_then_a_done_card_and_no_text(self):
+        fake = ConnectFake(self.backend)
+        self.connect(fake, worker_label="Pylon", display_name="Reviewer")
+        self.assertEqual(self.sent, [])
+        pending, done = self.actions.cards()
+        self.assertEqual((pending["state"], done["state"]), ("pending", "done"))
+        self.assertEqual(pending["id"], f"worker-approval:{W}:{C.read_rows(self.ws)[0]['server']}")
+        self.assertEqual(pending["header"]["title"], "Pylon")
+        self.assertEqual(pending["header"]["avatar"], {"seed": "reviewer"})
+        self.assertIn("desk-mini", pending["header"]["subtitle"])
+        button = pending["buttons"][0]
+        self.assertEqual((button["kind"], button["style"]), ("url", "primary"))
+        self.assertIn("/api/connect-page?code=U-", button["url"])
+        self.assertNotIn("input", pending)
+        self.assertEqual(pending["expires_at"], int(dc.read_record(self.ws, W)["expires_at"] * 1000))
+        body = self.actions.calls[0]["arguments"]["body"]
+        self.assertNotIn("\n", body)
+        self.assertIn("[Approve on s.space](https://", body)
+        self.assertEqual(self.actions.calls[1]["arguments"]["reply_to"], "$card1")
+        kinds = [(b["kind"], b.get("user_id") or b.get("reply")) for b in done["buttons"]]
+        self.assertEqual(kinds, [("open_dm", NEW_AGENT), ("reply", "Add reviewer to a room")])
+        self.assertTrue(all(c["room"] == DM and c["action"] == "room.message.send" for c in self.actions.calls))
+        self.assertEqual(len({c["operation_id"] for c in self.actions.calls}), 2)
+        self.assertNoSecret(fake, json.dumps(self.actions.calls))
+        rec = dc.read_record(self.ws, W)
+        self.assertEqual((rec["state"], rec["event_id"], rec["label"]), ("done", "$card2", "reviewer"))
+        self.assertNoSecret(fake, json.dumps(rec))
+
+    def test_an_expired_link_turns_the_card_to_expired_with_a_resend_reply(self):
+        fake = ConnectFake(self.backend, expires_in=60)
+        with self.assertRaises(dc.DeviceConnectError):
+            self.connect(fake, approve_after=None)
+        expired = self.actions.cards()[-1]
+        self.assertEqual(expired["state"], "expired")
+        self.assertEqual(expired["buttons"][0], {"label": "Send a new link", "kind": "reply", "style": "primary",
+                                                 "reply": f"card:worker-approval:{W}:resend"})
+        self.assertEqual(self.sent, [])
+        self.assertEqual(dc.read_record(self.ws, W)["state"], "expired")
+
+    def test_a_card_the_server_refuses_falls_back_to_the_text_note(self):
+        refusing = FakeActions(refuse=True)
+        self.connect(ConnectFake(self.backend), cards=dc.CardSink(refusing.execute, DM))
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn("/api/connect-page?code=U-", self.sent[0])
+        self.assertTrue(self.sent[1].startswith("[dm-only]\nDone:"))
+
+    def test_a_rotate_done_card_offers_only_the_dm(self):
+        self.connect(ConnectFake(self.backend))
+        with unittest.mock.patch.object(C, "update_token", lambda instance, token, **kw: {"instance": instance}):
+            self.connect(ConnectFake(self.backend), rotate=True)
+        done = self.actions.cards()[-1]
+        self.assertEqual([b["kind"] for b in done["buttons"]], ["open_dm"])
+
+    def test_default_cards_need_the_owner_dm(self):
+        core = dc.pp.core_lane(self.ws, None)
+        self.assertIsNone(dc.default_cards(self.ws, core))
+        with unittest.mock.patch.object(C, "owner_dm", lambda row, ws=None: DM), \
+                unittest.mock.patch.object(dc.pp, "core_actions", lambda ws, lane, **kw: (self.actions, core)):
+            sink = dc.default_cards(self.ws, core)
+        self.assertEqual((sink.room, sink.execute), (DM, self.actions.execute))
+
+
+class Resend(CardsBase):
+    def expire(self):
+        with self.assertRaises(dc.DeviceConnectError):
+            self.connect(ConnectFake(self.backend, expires_in=60), approve_after=None, display_name="Reviewer")
+
+    def reply(self, said, **kw):
+        path = self.ws / "tasks" / "task-card-1.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        kw.setdefault("user", dc.pp.core_lane(self.ws, None)["owner_mxid"])
+        path.write_text(card_task(said, **kw))
+        out, spawned = [], []
+        with unittest.mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))), \
+                unittest.mock.patch.object(dc.subprocess, "Popen", lambda argv, **k: spawned.append(argv)):
+            rc = pool_identity.main(["--workspace", str(self.ws), "card-reply", "--task-file", str(path)])
+        return rc, json.loads(out[-1]), spawned
+
+    def test_the_owner_s_resend_starts_a_fresh_flow_in_the_background(self):
+        self.expire()
+        rc, out, spawned = self.reply(f"card:worker-approval:{W}:resend")
+        self.assertEqual((rc, out), (0, {"status": "started"}))
+        argv = spawned[0]
+        self.assertEqual(argv[argv.index("add") + 1:argv.index("add") + 5], [W, "--device-flow", "--label", "reviewer"])
+        self.assertIn("Reviewer", argv)
+        self.assertEqual(dc.read_record(self.ws, W)["state"], "resending")
+        rc, out, spawned = self.reply(f"card:worker-approval:{W}:resend")
+        self.assertEqual((rc, out["status"], spawned), (1, "refused", []))
+
+    def test_anyone_but_the_owner_in_their_dm_is_refused(self):
+        self.expire()
+        for kw in ({"tier": "team"}, {"user": "@someone:alpha-fixture.net"}, {"kind": "room"}, {"tier": ""}):
+            rc, out, spawned = self.reply(f"card:worker-approval:{W}:resend", **kw)
+            self.assertEqual((rc, out["status"], spawned), (2, "refused", []), kw)
+        self.assertEqual(dc.read_record(self.ws, W)["state"], "expired")
+
+    def test_a_card_that_has_not_expired_or_an_unknown_action_starts_nothing(self):
+        self.connect(ConnectFake(self.backend))
+        rc, out, spawned = self.reply(f"card:worker-approval:{W}:resend")
+        self.assertEqual((rc, out["status"], spawned), (1, "refused", []))
+        self.assertIn("not expired", out["why"])
+        rc, out, spawned = self.reply(f"card:worker-approval:{W}:explode")
+        self.assertEqual((rc, out["status"], spawned), (2, "refused", []))
+
+    def test_other_words_are_not_a_card_reply(self):
+        rc, out, _ = self.reply("send me a new link please")
+        self.assertEqual((rc, out), (1, {"status": "not_a_card_reply"}))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -18,6 +18,7 @@ worker, and posts nothing proactively. Retiring the worker (pool_manage retire) 
     python3 pool_identity.py [--workspace WS] provision-finish <worker> --claim-id ID --agent-id MXID [--lane INSTANCE]
     python3 pool_identity.py [--workspace WS] provision-abort <worker>
     python3 pool_identity.py [--workspace WS] retire-remote <worker> [--local-anyway]
+    python3 pool_identity.py [--workspace WS] card-reply --task-file PATH
 
 TOKEN is the agent's access token from its settings page in AG2 Space. Leave it out to type it
 at a hidden prompt, or pass '-' to read it from stdin; it is stored in the secret vault, never in
@@ -26,7 +27,10 @@ a file, and never printed. `add` shows what the token's gateway says before anyt
 `--device-flow` needs no pasted token either (pool_device_connect.py): the core starts s.space's
 device-connect flow for agent LABEL, sends the owner the approval link in their DM, waits until they
 approve it in a browser (or the link expires, which it reports), checks the agent and its owner, and
-saves the token in the vault. It prints one JSON line with the agent id and a status.
+saves the token in the vault. It prints one JSON line with the agent id and a status. The owner sees an
+approval card (the text note when no card can be posted); once the link expires, the card's "Send a new
+link" button replies `card:worker-approval:<worker>:resend`, and `card-reply` on that task starts the same
+flow again in the background, for the owner only.
 
 The `provision-*` verbs need no pasted token (pool_provision.py). `provision-begin` prints the
 SHA-256 the `agent.create` Action takes and a suggested name. `provision-wait` makes that call as
@@ -46,6 +50,7 @@ _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parents[2]
 sys.path[:0] = [p for p in (str(_HERE), str(_REPO / "src")) if p not in sys.path]
 
+import agent_card
 import connections
 import pool_device_connect
 import pool_provision
@@ -249,6 +254,39 @@ def cmd_retire_remote(args, ws: Path) -> int:
     return 0 if out["status"] in ("retired", "no_identity") else 1
 
 
+def cmd_card_reply(args, ws: Path) -> int:
+    """A click on a worker approval card, read from the task it arrived as; the owner's only."""
+    try:
+        text = Path(args.task_file).read_text(encoding="utf-8")
+    except OSError as e:
+        print(json.dumps({"status": "refused", "why": f"the task file is unreadable ({type(e).__name__})"}))
+        return 2
+    headers, said = agent_card.reply_payload(text)
+    if said is None or said.kind != pool_device_connect.CARD_KIND:
+        print(json.dumps({"status": "not_a_card_reply"}))
+        return 1
+    rec = pool_device_connect.read_record(ws, said.target)
+    try:
+        owner = str(pool_provision.core_lane(ws, rec.get("lane")).get("owner_mxid") or "")
+    except pool_provision.ProvisionError as e:
+        print(json.dumps({"status": "refused", "why": str(e)}))
+        return 2
+    why = agent_card.owner_may_act(headers, owner)
+    if why is None and said.verb != pool_device_connect.RESEND:
+        why = f"a worker approval card has no {said.verb!r} action"
+    if why is None:
+        roster = pr.load_roster(ws) or {}
+        row = (roster.get("workers") or {}).get(said.target)
+        if not isinstance(row, dict) or row.get("state") == "retired":
+            why = f"no live pool worker {said.target!r}"
+    if why:
+        print(json.dumps({"status": "refused", "why": why}, sort_keys=True))
+        return 2
+    out = pool_device_connect.resend(said.target, workspace=ws)
+    print(json.dumps(out, sort_keys=True))
+    return 0 if out["status"] == "started" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="pool_identity", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -282,6 +320,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("provision-abort"); s.add_argument("worker"); s.set_defaults(fn=cmd_provision_abort)
     s = sub.add_parser("retire-remote"); s.add_argument("worker"); s.add_argument("--local-anyway", action="store_true")
     s.set_defaults(fn=cmd_retire_remote)
+    s = sub.add_parser("card-reply"); s.add_argument("--task-file", required=True); s.set_defaults(fn=cmd_card_reply)
     return p
 
 

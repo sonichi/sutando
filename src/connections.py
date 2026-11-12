@@ -1513,6 +1513,15 @@ def _owner_dm_as(row: Mapping[str, object], inst: str, workspace: Optional[Path]
     return str(rec["owner_dm"]) if not agent or rec.get("identity") == agent else ""
 
 
+def owner_dm(row: Mapping[str, object], workspace: Optional[Path] = None) -> str:
+    """The row's checked owner DM: under its own instance, else the one launch-key alias that has one; "" when none."""
+    own = _owner_dm_as(row, str(row.get("instance") or ""), workspace)
+    if own:
+        return own
+    found = {dm for dm in (_owner_dm_as(row, inst, workspace) for inst in alias_instances(row)) if dm}
+    return found.pop() if len(found) == 1 else ""
+
+
 def _has_owner_dm(row: Mapping[str, object], workspace: Optional[Path]) -> bool:
     """Whether the row's bridge has a checked owner DM on disk under its own instance. Every lane reads it alike."""
     return bool(_owner_dm_as(row, str(row.get("instance") or ""), workspace))
