@@ -500,7 +500,11 @@ def _checked_schema(schema: Any) -> Dict[str, Any]:
             if view.get(key) is not None and (not isinstance(view[key], str)
                                               or view[key].strip().casefold() not in seen):
                 raise ActionFailed(f"a view's {key} names {view[key]!r}, which is not one of its columns")
-    return json.loads(json.dumps(schema))
+    checked = json.loads(json.dumps(schema))
+    for d in checked["databases"]:
+        if d.get("role") == "primary":
+            d["props"], d["views"] = d.get("props") or [], d.get("views") or []  # null is none
+    return checked
 
 
 def _checked_adaptation(adaptation: Dict[str, Any], template_schema: Dict[str, Any]) -> None:
@@ -799,7 +803,8 @@ def existing_column(step: Dict[str, Any], answers: Dict[str, Any]) -> Optional[D
 def column_decisions(steps: List[Dict[str, Any]], n: int, answers: Dict[str, Any],
                      present: set) -> Dict[int, Any]:
     """For each column step after step n whose column the database already has: "skip", or the
-    prop_update to run in its place. Raises ActionFailed for the first that cannot be used."""
+    prop_update to run in its place. Raises ActionFailed for the first that cannot be used, so a
+    build that must fail fails before it writes anything to the owner's database."""
     return {id(later): existing_column(later, answers) or "skip" for later in steps[n + 1:]
             if later.get("skip_if_present") and later["skip_if_present"].strip().casefold() in present}
 
