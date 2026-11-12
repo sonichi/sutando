@@ -404,6 +404,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 - **`__init__.py`** — _(no header comment)_
 - **`channel_key.py`** — Per-channel pull path for task-result files in `results/`.
+- **`codex_banners.py`** — The Codex CLI's own error cells that leave a seat unable to work, read off a captured pane.
 - **`codex_pickup.py`** — Codex idle pickup: correlate a completed parent turn and keep bounded local timing evidence.
 - **`codex_recovery.py`** — Bounded Codex liveness probes; terminal errors never acknowledge or replay an owner task.
 - **`disposal.py`** — Terminal disposal of a result file: claim the generation read, verify it, quarantine it once; recover the claims a crashed owner left behind.

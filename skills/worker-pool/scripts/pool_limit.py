@@ -17,10 +17,11 @@ class Reset(NamedTuple):
 
 def reset(text, now):
     """The banner's reset words and their time (None when unparsed); None without a banner."""
-    matches = list(re.finditer(r"(?:resets?|continuing automatically)\s+(?:at\s+)?([^\n]+)", text, re.I))
+    # Claude: "resets 9pm", "Continuing automatically at …"; Codex: "… or try again at 3:05 PM."
+    matches = list(re.finditer(r"(?:resets?|continuing automatically|try again)\s+(?:at\s+)?([^\n]+)", text, re.I))
     if not matches:
         return None
-    banner = matches[-1].group(1).split("·")[0].strip()
+    banner = matches[-1].group(1).split("·")[0].strip().rstrip(".").strip()
     return Reset(_parse(banner, now), banner)
 
 
@@ -42,8 +43,9 @@ def _parse(value, now):
     value = re.sub(r"^(?:today|tomorrow)\s+", "", value, flags=re.I)
     value = re.sub(r"\s+at\s+", " ", value, flags=re.I)
     value = re.sub(r"\s+(am|pm)$", r"\1", value, flags=re.I)
+    value = re.sub(r"\b(\d{1,2})(?:st|nd|rd|th)\b", r"\1", value)  # Codex: "Nov 13th, 2026 9:12 AM"
     for pattern in ("%b %d %I:%M%p", "%b %d %I%p", "%b %d, %I:%M%p", "%b %d, %I%p", "%I:%M%p", "%I%p", "%H:%M",
-                    "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S%z"):
+                    "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S%z", "%b %d, %Y %I:%M%p"):
         try:
             parsed = datetime.strptime(f"{today.year} {value}", f"%Y {pattern}") if "%Y" not in pattern else datetime.strptime(value, pattern)
         except ValueError:

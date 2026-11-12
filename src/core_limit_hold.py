@@ -379,6 +379,30 @@ def _launch_config_dir() -> Optional[str]:
         return None
 
 
+def account_label(config_dir: Optional[str]) -> Optional[str]:
+    """A label the owner recognises their account by ("Qingyun · Claude Max"), else None: the
+    display name and the plan, never the email address; any word with an "@" in it is dropped."""
+    if not config_dir:
+        return None
+    try:
+        acct = json.loads((Path(config_dir) / ".claude.json").read_text(encoding="utf-8")).get("oauthAccount")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(acct, dict):
+        return None
+    parts = []
+    for key in ("displayName", "planDisplayName"):
+        words = [w for w in str(acct.get(key) or "").split() if "@" not in w]
+        if words:
+            parts.append(" ".join(words)[:60])
+    return " · ".join(parts) or None
+
+
+def current_account_label() -> Optional[str]:
+    """account_label() of the config dir the core and its pool's seats launch with."""
+    return account_label(_launch_config_dir())
+
+
 def current_account() -> Optional[str]:
     """The account on disk now in the config dir the core (and its pool's seats) launch with."""
     return account_fingerprint(_launch_config_dir())

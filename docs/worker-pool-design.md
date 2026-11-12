@@ -399,6 +399,25 @@ policy stays in the sweep. One gap stays: a seat launched before runs recorded a
 account, already parked when this first ran after the owner had signed in, has no
 reading to bind to and waits for its own reset, as before.
 
+**A Codex seat stopped by its own error cell.** Codex prints a refused turn as an error cell
+(`■ <message>`) above an idle composer, so `pane_gate` reads the seat idle-ready while it cannot
+work. `src/delivery/codex_banners.py` reads the cell the seat is stopped on, by the CLI's own
+wording only (codex-cli 0.160.1's binary strings), and only as the last content above the
+composer, since a cell under later turns is history. Supervision maps a usage limit to
+`PANE_LIMIT` (its "try again at …" is the reset) and a signed-out cell to `PANE_LOGGED_OUT`,
+which raises the login card quoting the cell with "run codex login". A refused request leaves
+the seat usable, so it stays `PANE_IDLE`. The core's own delivery verdict is unchanged: a banner
+left on screen after its reset holds no dispatch.
+
+**A pool that is down.** When every live, unpaused seat of one runtime is stopped by the same
+cause (a usage limit, or signed out), the sweep raises one card for the whole pool, through the
+same hitl store as the seat cards: `pool_wedge_cards.pool_down` gives its data (id
+`pool-down:<host>:<runtime>-<cause>`, the seats by label, the account by its label, never the
+email, the earliest known reset, the banner and the owner's remedy at the Mac), and
+`raise_pool_down` keeps one card per down pool, resolving it once the pool works again or its
+set of seats changes. A pool partly down, or of a single live seat (its own seat card is the
+card), is left to the per-seat ladders.
+
 An expired login is the exception to the work-owed and sustain requirements: its
 banner asks for a `/login` card immediately, even with an empty inbox. On upgrade,
 an acknowledgment saved before wedge kinds existed is rechecked for login only.
