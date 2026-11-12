@@ -269,16 +269,20 @@ The two are tied exactly, never by time:
 - **A build fence cannot name its message,** because the fence comes first. Its message is the one
   whose text **is** the fence's description, from the asking owner, in that thread. That is the
   client's own first message; texts are compared trimmed, with whitespace collapsed. That is the
-  build's one slot, used once, and closed for good once the request is answered or a question is
-  asked for it. Any other message (an @-mention, a "thanks", the same words three days later) is
+  build's one slot, used once, only within `BUILD_THREAD_SETTLE_SECONDS` of the fence (the client
+  sends it at once; the same words later are the owner's own), and closed for good once the
+  request is answered or a question is asked for it. Any other message (an @-mention, a "thanks", the same words three days later) is
   not the slot.
 
 **Where it runs first: the gateway bridge.** Before a room task with a `thread_root` is queued,
-the bridge's intake gate (`src/remote-gateway-bridge.py`, `_build_thread_gate`) runs this same
-verdict on the owner's message (`intake_verdict`, the gateway's own fields and the tier it
-resolved). `duplicate`: the message is settled unqueued and the agent never sees it. `wait`: it
-is taken after the round's other tasks, rechecked until the round's wait ends (a few seconds),
-then delivered. Anything else, or a check that fails, is delivered as usual. So a threaded task
+the bridge's intake gate (`src/remote-gateway-bridge.py`, `_build_thread_gate`) asks this same
+verdict about the owner's message: `build_request.py intake-verdict -`, a subprocess given the
+gateway's own fields and the tier the bridge resolved, never code loaded into the bridge. It has
+2 s (its ledger lock waits at most 1 s); a non-zero exit, a timeout or unparseable output
+delivers the message. `duplicate`: the message is settled unqueued and the agent never sees it.
+`wait`: it is taken after the round's other tasks, held in memory and unacked, and rechecked
+every 0.25 s until the round's wait ends (6 s), then delivered; a restart re-serves it. Anything
+else is delivered as usual. So a threaded task
 that reaches the agent is one the bridge could not decide.
 
 On **any room task with a `thread_root` header** that reaches you, run first:

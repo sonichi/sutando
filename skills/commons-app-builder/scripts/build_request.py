@@ -54,6 +54,9 @@ ASK_TTL_S = 24 * 3600  # an unanswered question fails its request after this
 WAITING = 6  # plan's exit while the owner's answer is awaited
 _MANIFEST = Path(__file__).resolve().parents[1] / "manifest.json"
 
+# A room's ledger lock is held for one read-modify-write; past this another process gets LedgerBusy.
+LOCK_TIMEOUT_S = 10.0
+
 
 def thread_conversation() -> bool:
     """The skill's switch BUILD_THREAD_CONVERSATION, read env > the manifest's config (default
@@ -220,8 +223,8 @@ class Ledger:
     runs of one request cannot both proceed.
     """
 
-    def __init__(self, folder: Path):
-        self.folder = Path(folder)
+    def __init__(self, folder: Path, lock_timeout: float = LOCK_TIMEOUT_S):
+        self.folder, self.lock_timeout = Path(folder), lock_timeout
 
     def _path(self, room_id: str, request_id: str) -> Path:
         room = hashlib.sha256(room_id.encode("utf-8")).hexdigest()[:16]
@@ -366,11 +369,10 @@ class Ledger:
                 continue
         return out
 
-    @staticmethod
-    def _locked(folder: Path):
-        """One room's claims and records, serialized across processes."""
+    def _locked(self, folder: Path):
+        """One room's claims and records, serialized across processes (LedgerBusy past the timeout)."""
         folder.mkdir(parents=True, exist_ok=True)
-        return _FileLock(folder / ".lock")
+        return _FileLock(folder / ".lock", self.lock_timeout)
 
     @staticmethod
     def _write(path: Path, entry: Dict[str, Any]) -> None:
@@ -380,14 +382,26 @@ class Ledger:
         os.replace(tmp, path)
 
 
+class LedgerBusy(OSError):
+    """Another process held a room's ledger lock past the timeout."""
+
+
 class _FileLock:
-    def __init__(self, path: Path):
-        self.path = path
+    def __init__(self, path: Path, timeout: float = LOCK_TIMEOUT_S):
+        self.path, self.timeout = path, timeout
 
     def __enter__(self):
         self.fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)
-        fcntl.flock(self.fd, fcntl.LOCK_EX)
-        return self
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    os.close(self.fd)
+                    raise LedgerBusy(f"the build ledger {self.path.parent} is busy") from None
+                time.sleep(0.02)
 
     def __exit__(self, *exc):
         fcntl.flock(self.fd, fcntl.LOCK_UN)
@@ -1054,8 +1068,13 @@ def thread_task(task_text: str, ledger: "Ledger", tasks_dir: Optional[Path] = No
     5. ("none", None): an ordinary message.
     Every verdict but none needs the attested owner tier, the fence's own owner, the same room and
     the same thread root. Times are the gateway's `timestamp` headers; `now` is this host's clock."""
+    return _verdict(headers(task_text), _task_line(task_text), ledger, tasks_dir, now, itself=task_text)
+
+
+def _verdict(meta: Dict[str, str], line: str, ledger: "Ledger", tasks_dir: Optional[Path],
+             now: Optional[float], itself: Optional[str] = None) -> Tuple[str, Optional[str]]:
+    """thread_task's checks on a message's attested headers and its task line (see thread_task)."""
     now = time.time() if now is None else now
-    meta = headers(task_text)
     owner, root, room = meta.get("user_id", ""), meta.get("thread_root", ""), meta.get("source_room_id", "")
     message, at = meta.get("source_message_id", ""), _when(meta)
     if meta.get("access_tier") != "owner" or not owner.startswith("@") or not _EVENT_RE.match(root) or not room:
@@ -1065,7 +1084,7 @@ def thread_task(task_text: str, ledger: "Ledger", tasks_dir: Optional[Path] = No
             other = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        facts = fence_facts(other) if other != task_text else None
+        facts = fence_facts(other) if other != itself else None
         if facts and facts.get("room_id") == room:
             ledger.note_fence(facts)  # a fence not yet taken up is known all the same
     entries = ledger.entries(room)
@@ -1076,12 +1095,13 @@ def thread_task(task_text: str, ledger: "Ledger", tasks_dir: Optional[Path] = No
         if message and e["fence"].get("thread_message") == message:
             return "duplicate", e.get("request_id")
     # 2. A build fence's one slot: its first message after it.
-    said = _said(_message_text(task_text, strip_mention=False))
+    said = _said(_words(line, strip_mention=False))
     for e in mine:
         f = e["fence"]
         # Only the client's own first message: the build's description, word for word.
         if (f.get("mode") == "build" and not f.get("thread_message") and said and f.get("said") == said
                 and e.get("slot_used_by") in (None, message) and message
+                and at is not None and abs(at - f.get("at", float("inf"))) <= settle_seconds()
                 and (e.get("slot_used_by") == message or not (e.get("asked") or e.get("reply")))):
             if ledger.use_slot(room, e["request_id"], message):
                 return "duplicate", e.get("request_id")
@@ -1108,15 +1128,22 @@ def intake_verdict(fields: Dict[str, Any], tier: str, ledger: "Ledger", tasks_di
         return " ".join(str(value).splitlines())
     keys = {"user_id": fields.get("user_id"), "thread_root": fields.get("thread_root"),
             "source_room_id": fields.get("source_room_id") or fields.get("channel_id"),
-            "source_message_id": fields.get("source_message_id"), "timestamp": fields.get("timestamp")}
-    lines = [f"{k}: {flat(v)}" for k, v in keys.items() if v not in (None, "")]
-    lines += [f"access_tier: {flat(tier)}", f"task: {flat(fields.get('task') or '')}"]
-    return thread_task("\n".join(lines) + "\n", ledger, tasks_dir, now)
+            "source_message_id": fields.get("source_message_id"), "timestamp": fields.get("timestamp"),
+            "access_tier": tier}
+    meta = {k: flat(v).strip() for k, v in keys.items() if v not in (None, "")}
+    return _verdict(meta, flat(fields.get("task") or "").strip(), ledger, tasks_dir, now)
+
+
+def _task_line(task_text: str) -> str:
+    return next((ln[len("task:"):].strip() for ln in task_text.splitlines() if ln.startswith("task:")), "")
 
 
 def _message_text(task_text: str, strip_mention: bool = True) -> str:
     """The message's own words: the task line, less the gateway's reply context (and a mention)."""
-    line = next((ln[len("task:"):].strip() for ln in task_text.splitlines() if ln.startswith("task:")), "")
+    return _words(_task_line(task_text), strip_mention)
+
+
+def _words(line: str, strip_mention: bool = True) -> str:
     line = re.sub(r"\[AG2 Space reply context.*?\[End AG2 Space reply context\]", "", line).strip()
     return (re.sub(r"^@\S+\s*", "", line) if strip_mention else line).strip()[:2000]
 
@@ -1270,15 +1297,44 @@ def _check(args: List[str]) -> int:
     return 0
 
 
+INTAKE_LOCK_TIMEOUT_S = 1.0  # the gateway bridge gives the whole verdict 2 s, then delivers
+
+
+def _intake_command(argv: List[str]) -> int:
+    """intake-verdict -|FILE --ledger DIR --tasks DIR: the gateway bridge's question, as JSON
+    {"fields": <the gateway's task fields>, "tier": <the tier it resolved>}; prints
+    {"verdict", "request_id"}. Run out of the bridge's process: anything but exit 0 delivers."""
+    try:
+        folder, tasks = _flag(argv, "--ledger"), _flag(argv, "--tasks")
+    except SystemExit as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    try:
+        raw = sys.stdin.read() if argv[1] == "-" else Path(argv[1]).read_text(encoding="utf-8")
+        data = json.loads(raw)
+        fields, tier = data["fields"], data["tier"]
+        if not isinstance(fields, dict) or not isinstance(tier, str):
+            raise ValueError("fields must be an object and tier a string")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"build_request: bad intake question: {error}", file=sys.stderr)
+        return 2
+    ledger_ = Ledger(Path(folder) if folder else default_ledger(), lock_timeout=INTAKE_LOCK_TIMEOUT_S)
+    verdict, request_id = intake_verdict(fields, tier, ledger_, Path(tasks) if tasks else default_tasks_dir())
+    print(json.dumps({"verdict": verdict, "request_id": request_id}))
+    return 0
+
+
 def main(argv: List[str]) -> int:
     if len(argv) < 2 or argv[0] not in ("parse", "plan", "reply", "check", "chunks", "ask", "answer",
-                                        "thread-line", "thread-task"):
-        print("usage: build_request.py parse|plan|reply|check|chunks|ask|answer|thread-line|thread-task <file> "
-              "[options]", file=sys.stderr)
+                                        "thread-line", "thread-task", "intake-verdict"):
+        print("usage: build_request.py parse|plan|reply|check|chunks|ask|answer|thread-line|thread-task"
+              "|intake-verdict <file> [options]", file=sys.stderr)
         return 2
     command, path = argv[0], argv[1]
     if command == "check":
         return _check(argv[1:])
+    if command == "intake-verdict":
+        return _intake_command(argv)
     try:
         text = Path(path).read_text(encoding="utf-8")
     except OSError as error:

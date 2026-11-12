@@ -1634,6 +1634,52 @@ with tempfile.TemporaryDirectory() as tmp:
     led.record(ROOM, rid_r, br.completion(rid_r, "done", "", "Built."))
     check("an-answered-builds-slot-is-closed", tt(msg(tmp, "late-r", DESC, at=T0 + 9, mid="$r1", root=root_r),
                                                   now=T0 + 99999) == ("none", None))
+    # The slot holds only within the settle time of its fence: the same words typed by the owner
+    # later, the client's copy never having come, are the owner's own message (review on ebb47d1f).
+    rid_t, root_t = "b5b5b5b5-3434-4565-8787-909090909090", "$rootT:s.space"
+    led.claim(ROOM, rid_t, fence={"room_id": ROOM, "thread_root": root_t, "owner": OWNER, "at": T0, "mode": "build",
+                                  "request_id": rid_t, "said": DESC})
+    late = T0 + br.settle_seconds() + 1
+    check("the-words-past-the-settle-time-are-not-the-slot",
+          tt(msg(tmp, "late-t", DESC, at=late, mid="$t9", root=root_t), now=late + br.settle_seconds()) == ("none", None))
+    check("at-the-settle-time-they-still-are", tt(msg(tmp, "edge-t", DESC, at=T0 + br.settle_seconds(), mid="$t8",
+                                                     root=root_t), now=T0 + 31) == ("duplicate", rid_t))
+
+    # The gateway bridge's question, out of its process: the same verdict from its own fields.
+    q = {"fields": {"user_id": OWNER, "thread_root": root_t, "source_room_id": ROOM, "source_message_id": "$t8",
+                    "timestamp": iso(T0 + br.settle_seconds()), "task": DESC}, "tier": "owner"}
+    (tmp / "q.json").write_text(json.dumps(q))
+    code, out = cli("intake-verdict", str(tmp / "q.json"), "--ledger", str(tmp / "ledger"), "--tasks", str(tasks))
+    check("intake-verdict-answers-from-the-gateways-fields", code == 0
+          and json.loads(out) == {"verdict": "duplicate", "request_id": rid_t})
+    (tmp / "q2.json").write_text(json.dumps(dict(q, tier="team")))
+    code, out = cli("intake-verdict", str(tmp / "q2.json"), "--ledger", str(tmp / "ledger"), "--tasks", str(tasks))
+    check("intake-verdict-takes-the-bridges-tier", code == 0 and json.loads(out)["verdict"] == "none")
+    for bad in ("not json", json.dumps({"fields": []}), json.dumps({"fields": {}, "tier": 3})):
+        (tmp / "bad.json").write_text(bad)
+        check("intake-verdict-refuses-a-bad-question",
+              cli("intake-verdict", str(tmp / "bad.json"), "--ledger", str(tmp / "ledger"))[0] == 2)
+    check("intake-verdict-without-a-ledger-flag-value-is-refused",
+          cli("intake-verdict", str(tmp / "q.json"), "--ledger")[0] == 2)
+
+    # A room's ledger lock has a timeout: a holder never stalls another process past it.
+    import fcntl  # noqa: PLC0415
+    busy = br.Ledger(tmp / "ledger-busy", lock_timeout=0.2)
+    folder = busy._path(ROOM, rid_t).parent
+    folder.mkdir(parents=True, exist_ok=True)
+    held = os.open(str(folder / ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(held, fcntl.LOCK_EX)
+    began = time.monotonic()
+    try:
+        busy.claim(ROOM, rid_t)
+        refused = False
+    except br.LedgerBusy:
+        refused = True
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+    check("a-held-ledger-lock-times-out", refused and time.monotonic() - began < 1.5)
+    check("and-once-free-the-ledger-works", busy.claim(ROOM, rid_t)[0] == "claimed")
 
     # The fence's task is taken up: the ledger keeps its facts (the switch is off).
     (tmp / "build.txt").write_text((tasks / "task-build.txt").read_text())

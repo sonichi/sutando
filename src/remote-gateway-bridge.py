@@ -395,8 +395,30 @@ def _lane_dedupe_gate(task: dict):
 
 
 _BUILD_REQUEST = _REPO / "skills" / "commons-app-builder" / "scripts" / "build_request.py"
-_BUILD_REQUEST_MOD = []  # loaded once, on the first threaded owner message
 BUILD_THREAD_POLL_S = 0.25
+BUILD_THREAD_VERDICT_S = 2.0  # one verdict's whole budget, well inside the round's 6 s wait
+_INTAKE_FIELDS = ("user_id", "thread_root", "source_room_id", "channel_id", "source_message_id", "timestamp", "task")
+
+
+def _build_thread_verdict(task: dict, tier: str, budget: float):
+    """(verdict, request_id) from the skill's `intake-verdict`, run out of this process; None when
+    it cannot say in time (missing, exits non-zero, times out, prints anything unparseable)."""
+    import json
+    import subprocess
+    question = json.dumps({"fields": {k: task.get(k) for k in _INTAKE_FIELDS}, "tier": tier})
+    try:
+        done = subprocess.run(
+            [sys.executable, "-I", str(_BUILD_REQUEST), "intake-verdict", "-",
+             "--ledger", str(WS / "state" / "commons-app-builds"), "--tasks", str(TASKS_DIR)],  # noqa: F821
+            input=question, capture_output=True, text=True, timeout=max(0.1, budget))
+        answer = json.loads(done.stdout) if done.returncode == 0 else None
+        verdict = (answer["verdict"], answer.get("request_id")) if isinstance(answer, dict) else None
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as e:
+        _log(f"build thread gate: {type(e).__name__}; delivering")  # noqa: F821
+        return None
+    if verdict is None:
+        _log(f"build thread gate: the verdict exited {done.returncode}; delivering")  # noqa: F821
+    return verdict
 
 
 def _build_thread_gate(task: dict):
@@ -406,34 +428,24 @@ def _build_thread_gate(task: dict):
     round's wait ends; still undecided, it is delivered and the skill decides. Fails open."""
     if not task.get("thread_root") or not _BUILD_REQUEST.is_file():
         return None
-    try:
-        attested, _ = local_task_protocol.broker_attested_tier(  # noqa: F821
-            task.get("access_tier"), task.get("requested_access_tier"), task.get("collaborator"))
-        tier = _tier_for(task.get("user_id"), attested)  # noqa: F821
-        if tier != "owner":
-            return None
-        if not _BUILD_REQUEST_MOD:
-            import importlib.util
-            spec = importlib.util.spec_from_file_location("commons_build_request", _BUILD_REQUEST)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            _BUILD_REQUEST_MOD.append(mod)
-        br, inbox, mode = _BUILD_REQUEST_MOD[0], TASKS_DIR, _INTAKE_MODE  # noqa: F821
-        ledger = br.Ledger(WS / "state" / "commons-app-builds")
-        kind, rid = br.intake_verdict(task, tier, ledger, inbox)
-        if kind == "wait":
-            if mode["defer"]:
-                return INTAKE_DEFER  # noqa: F821
-
-            deadline = mode["deadline"]
-            while kind == "wait" and deadline is not None and time.monotonic() < deadline:
-                time.sleep(min(BUILD_THREAD_POLL_S, max(0.0, deadline - time.monotonic())))
-                kind, rid = br.intake_verdict(task, tier, ledger, inbox)
-    except Exception as e:  # noqa: BLE001 - a broken check delivers the message; the skill decides
-        _log(f"build thread gate: {type(e).__name__}; delivering")  # noqa: F821
+    attested, _ = local_task_protocol.broker_attested_tier(  # noqa: F821
+        task.get("access_tier"), task.get("requested_access_tier"), task.get("collaborator"))
+    tier = _tier_for(task.get("user_id"), attested)  # noqa: F821
+    if tier != "owner":
         return None
-    if kind == "duplicate":
-        return f"commons-app-builder: the app build's own message in its thread (request {rid})"
+    mode = _INTAKE_MODE  # noqa: F821
+    verdict = _build_thread_verdict(task, tier, BUILD_THREAD_VERDICT_S)
+    if verdict and verdict[0] == "wait":
+        if mode["defer"]:
+            return INTAKE_DEFER  # noqa: F821
+
+        deadline = mode["deadline"]
+        while verdict and verdict[0] == "wait" and deadline is not None and time.monotonic() < deadline:
+            time.sleep(min(BUILD_THREAD_POLL_S, max(0.0, deadline - time.monotonic())))
+            left = deadline - time.monotonic()
+            verdict = _build_thread_verdict(task, tier, min(BUILD_THREAD_VERDICT_S, left)) if left > 0 else verdict
+    if verdict and verdict[0] == "duplicate":
+        return f"commons-app-builder: the app build's own message in its thread (request {verdict[1]})"
     return None
 
 

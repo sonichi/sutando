@@ -19,6 +19,7 @@ Run: python3 tests/commons-app-builder-intake-gate.test.py   (exit 0 pass / 1 fa
 """
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -28,6 +29,8 @@ from pathlib import Path
 from _helpers.hermetic_env import isolate_os_environ
 
 isolate_os_environ()
+
+import fcntl  # noqa: E402  (an extension module: below the isolation)
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
@@ -76,6 +79,7 @@ def thread_message(mid, text=SAID, user=OWNER, tier="owner", root=ROOT):
 
 def main():
     rgb = _load("remote_gateway_bridge", REPO / "src" / "remote-gateway-bridge.py")
+    br = _load("commons_build_request", REPO / "skills" / "commons-app-builder" / "scripts" / "build_request.py")
     tmp = Path(tempfile.mkdtemp(prefix="rgb-build-thread-test-"))
     rgb.WS = tmp
     rgb.TASKS_DIR = tmp / "tasks"
@@ -181,27 +185,93 @@ def main():
         rgb._BUILD_REQUEST = real
     check("without the skill a thread message is delivered", queued("task-noskill"))
 
-    # 5. A raising check fails open, and the lane dedupe still runs.
-    class Broken:
-        WORKSPACE = None
+    # 5. Contained: the verdict runs out of the bridge's process within 2 s, and anything but a
+    #    clean answer delivers. The bridge stays up in every case.
+    real = rgb._BUILD_REQUEST
+    fakes = tmp / "fake-skill"
+    fakes.mkdir()
+    for name, body in (("exits", "raise SystemExit(0)\n"), ("crashes", "import sys; sys.exit(3)\n"),
+                       ("slow", "import time; time.sleep(30)\n"), ("garbled", "print('not json')\n")):
+        write("task-fence-" + name, fence(f"{name[:1] * 8}-7a4d-4e8b-9f61-2c5d8a0b7e14"))
+        (fakes / f"{name}.py").write_text(body)
+        rgb._BUILD_REQUEST = fakes / f"{name}.py"
+        began = time.monotonic()
+        try:
+            got = write(f"task-{name}", thread_message(f"${name}1"))
+        except BaseException as e:  # noqa: BLE001 - what the test is for
+            got = e
+        finally:
+            rgb._BUILD_REQUEST = real
+        check(f"a verdict that {name} delivers the message, and the bridge stays up",
+              queued(f"task-{name}") and isinstance(got, tuple) and time.monotonic() - began < 3.0, repr(got))
+    check("and says so in one log line", any("build thread gate: TimeoutExpired; delivering" in m for m in logs)
+          and any("build thread gate: the verdict exited 3; delivering" in m for m in logs))
 
-        def Ledger(self, *_a):
-            raise RuntimeError("boom")
-    saved = list(rgb._BUILD_REQUEST_MOD)
-    rgb._BUILD_REQUEST_MOD[:] = [Broken()]
+    # A room's ledger lock held by another process: delivered within the verdict's budget.
+    rid6 = "eeeeeeee-7a4d-4e8b-9f61-2c5d8a0b7e14"
+    write("task-fence6", fence(rid6))
+    lock_dir = br.Ledger(tmp / "state" / "commons-app-builds")._path(ROOM, rid6).parent
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    held = os.open(str(lock_dir / ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(held, fcntl.LOCK_EX)
+    began = time.monotonic()
     try:
-        write("task-broken", thread_message("$b1"))
+        write("task-locked", thread_message("$k1"))
     finally:
-        rgb._BUILD_REQUEST_MOD[:] = saved
-    check("a raising check delivers the message", queued("task-broken"))
-    check("and says so in one log line", any("build thread gate: RuntimeError; delivering" in m for m in logs))
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+    check("a held ledger lock delivers the message within the verdict's budget",
+          queued("task-locked") and time.monotonic() - began < 2.5)
+
+    # The lane dedupe still runs after an undecided verdict.
+    rgb._BUILD_REQUEST = fakes / "crashes.py"
     rgb.GATEWAY_INSTANCE = "sspace"
     try:
-        write("task-broken-copy", thread_message("$b1"))
+        write("task-crashes-copy", thread_message("$crashes1"))
     finally:
         rgb.GATEWAY_INSTANCE = ""
+        rgb._BUILD_REQUEST = real
     check("the lane dedupe still settles another lane's copy",
-          not (rgb.TASKS_DIR / "task-sspace~task-broken-copy.txt").exists())
+          not (rgb.TASKS_DIR / "task-sspace~task-crashes-copy.txt").exists())
+
+    # 6. The owner retypes the description long after the fence, the client's copy never having
+    #    come: the owner's own message, delivered (the slot holds only within the settle time).
+    rid7 = "ffffffff-7a4d-4e8b-9f61-2c5d8a0b7e14"
+    write("task-fence7", dict(fence(rid7, description="A rota for the kitchen"), timestamp=now_iso(-120)))
+    write("task-retyped", thread_message("$y1", text="A rota for the kitchen"))
+    rid7b = "22222222-7a4d-4e8b-9f61-2c5d8a0b7e14"
+    write("task-fence7b", dict(fence(rid7b, description="A rota for the garden"), timestamp=now_iso(-10)))
+    write("task-prompt", thread_message("$y2", text="A rota for the garden"))
+    check("while the same words ten seconds after their fence are still its copy", not queued("task-prompt")
+          and settled("task-prompt"))
+    check("a retyped description two minutes after its fence is delivered", queued("task-retyped"))
+
+    # 7. Switch on: the owner's answer to the request's question is delivered, never settled.
+    rid8 = "11111111-7a4d-4e8b-9f61-2c5d8a0b7e14"
+    write("task-fence8", fence(rid8))
+    fence8 = (rgb.TASKS_DIR / "task-fence8.txt").read_text()
+    led = br.Ledger(tmp / "state" / "commons-app-builds")
+    claimed = led.claim(ROOM, rid8, fence=br.fence_facts(fence8))
+    asked = led.ask(ROOM, rid8, thread_root=ROOT, owner=OWNER, question="Morning or afternoon?", task_text=fence8)
+    os.environ["BUILD_THREAD_CONVERSATION"] = "true"
+    try:
+        write("task-answer", thread_message("$ans1", text="Morning"))
+    finally:
+        os.environ.pop("BUILD_THREAD_CONVERSATION", None)
+    check("with the switch on, the owner's answer is delivered", claimed[0] == "claimed" and asked
+          and queued("task-answer"), repr((claimed, asked)))
+
+    # 8. The bridge's own tier check: a team-tier sender never starts the verdict.
+    calls = []
+    real_verdict = rgb._build_thread_verdict
+    rgb._build_thread_verdict = lambda *x, **k: calls.append(x) or real_verdict(*x, **k)
+    try:
+        write("task-team2", thread_message("$t2", tier="team"))
+        write("task-owner2", thread_message("$o2", text="and a notes column"))
+    finally:
+        rgb._build_thread_verdict = real_verdict
+    check("a team-tier sender never starts the verdict; the owner's message does",
+          queued("task-team2") and len(calls) == 1 and calls[0][1] == "owner")
 
     print(f"commons-app-builder intake gate: {'FAIL' if failures else 'OK'} ({len(failures)} failed)")
     return 1 if failures else 0
