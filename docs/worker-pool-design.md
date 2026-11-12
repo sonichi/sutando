@@ -561,7 +561,8 @@ claim evidence exits 2 rather than reporting an empty queue. JSON retains the
 task's holder and claimed status, so the warning does not describe it as unclaimed.
 Ownership readers count even dangling sentinel symlinks as held; this diagnostic
 requires regular sentinels without following links, so a symlink exits 2.
-It enumerates folders through `pool_record.iter_recipients`, like the router:
+Claim folders must use recipient-valid names. The diagnostic enumerates folders
+through `pool_record.iter_recipients`, like the router:
 non-recipient names are ignored, while a recipient-named directory symlink is
 undecidable even when its target has no sentinel for this task. The scan creates
 no directories or lock files.

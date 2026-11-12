@@ -59,8 +59,7 @@ caps this file and refuses date stamps in it).
    `$WORKSPACE/tasks/archive/<id>.txt` after writing its result; bridges and the Windows dispatcher
    archive their own claims.
    Before idle: `python3 scripts/unanswered-tasks.py --workspace "$WORKSPACE" && bash scripts/core-status.sh idle "" --loop-complete`
-   (1 = unanswered work or a held-claim warning; 2 = undecidable; both stop idle/completion).
-   A held-claim warning means inspect its claimant; never answer or reassign that held task.
+   (1/2 stop idle/completion; held claims: inspect claimant, never answer/reassign.)
 1.5. **Connect waits.** `python3 skills/connect-apps/scripts/connectors.py rearm` restarts the waiter of
    any pending connector wait that lost it; idempotent, and a failure never blocks the pass.
 2. **Questions.** A question reaches the owner once, when asked (`scripts/ask-owner.py`). Flagless,
