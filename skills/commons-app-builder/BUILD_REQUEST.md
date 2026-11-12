@@ -107,8 +107,10 @@ python3 skills/commons-app-builder/scripts/build_request.py reply task.txt --sta
 ```
 
 `plan` **claims** the request in a durable record, `<workspace>/state/commons-app-builds/`, one
-file per room and `request_id`. If that request was already answered it exits 3 and prints the
-recorded reply, which is what the agent sends again; if another run holds it, it exits 4 and the
+file per room and `request_id`. If that request was already answered it exits 5 and prints the
+recorded reply, which is what the agent sends again (5, not 3: on the `--route cli` path an
+`action` that exits 3 is an outcome it cannot know, never an answered request); if another run
+holds it, it exits 4 and the
 agent sends nothing. `reply` prints the reply and records it. A claim nobody finished stops
 blocking after 30 minutes, so a crashed run does not wedge the request. Claims are taken under a
 lock per room, so two runs of one request cannot both proceed.
@@ -126,12 +128,22 @@ database is created with one, named `Name` (the page reads it as the `title`-typ
 GUIDE.md's test harness shows). Without `schema`, an `html` page is laid over the named
 template's columns.
 
-A column the database the panel sent already has is compared, not just skipped: another type
-fails the build before anything is written; the same select, multi-select or status lacking some
-of the app's options gets them added (`prop_update`), only when the database has no rows, since
-the options are resent by name; with rows, the build fails and says which options to add.
-`check` on the `databases.list` step prints `columns`: for each later column step, `skip` or the
-`prop_update` to run in its place. `plan` prints
+`app_name`, `database_name` and `options` follow the same name rules on a template's path
+(`options` only for the template's own option columns, at most 100 a column).
+
+A column the database the panel sent already has (matched in any case) is compared, not just
+skipped, and every such column is decided right after `databases.list`, before any column is
+written: another type fails the build; a select or multi-select lacking some of the app's
+options gets them added (`prop_update`), only when the listing shows the database has no rows,
+since the options are resent by name; a status column, whose groups the listing does not give,
+is never changed this way. Otherwise the build fails and says which options to add. `check` on
+the `databases.list` step prints `columns`: for each later column step, `skip` or the
+`prop_update` to run in its place.
+
+Every write step carries a fixed `operation_id` (`cab-<request_id>-<step>`), and `--route cli`
+passes it as `--operation-id`: a step retried after an unknown outcome sends the same id, which
+the server dedupes for an Action that requires one. After `action` exits 3, never run that step
+again before `operation.inspect` says it did not happen. `plan` prints
 the Actions in order; `$db` and `$app` stand for the ids earlier steps answer. Run them in that
 order, and run `scripts/check_page.py` on the page before writing it.
 

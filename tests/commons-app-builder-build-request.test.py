@@ -592,6 +592,60 @@ check("options-are-never-replaced-on-a-database-with-rows", rep["status"] == "fa
       and not any(a.get("op") == "prop_update" for _, a in room.calls))
 
 
+# The template path's own names and options follow the own schema's rules (N1).
+for label, adaptation, words in (
+        ("long-app-name", {"app_name": "a" * 101}, "longer than 100"),
+        ("$-app-name", {"app_name": "$app"}, "may not start with $"),
+        ("$-db-name", {"database_name": "$db"}, "may not start with $"),
+        ("options-not-a-map", {"options": ["Morning"]}, "must map a column"),
+        ("options-for-a-plain-column", {"options": {"Comment": ["a"]}}, "which has none in this template"),
+        ("too-many-options", {"options": {"Choice": [f"o{i}" for i in range(101)]}}, "1 to 100 names"),
+        ("a-$-option", {"options": {"Choice": ["$db"]}}, "may not start with $"),
+        ("duplicate-options", {"options": {"Choice": ["Am", "am"]}}, "twice")):
+    room = FakeRoom()
+    _, rep = reply_of(run(room, task(template="poll"), adaptation))
+    check(f"template-path-{label}", rep["status"] == "failed" and words in rep["reason"]
+          and not any(act.endswith(("replace", "create", "mutate")) for act, _ in room.calls))
+
+# Every existing column is decided before any is written (N2).
+room = FakeRoom(databases={"d7k2m9x1": {"name": "Untitled", "views": [], "rows": 0, "properties": [
+    "Name", {"name": "Comment", "type": "number"}]}})
+_, rep = reply_of(run(room, task(database="d7k2m9x1", template="poll"), {"options": {"Choice": ["A", "B"]}}))
+check("a-later-wrong-column-fails-before-an-earlier-is-added", rep["status"] == "failed"
+      and "already has a number column Comment" in rep["reason"]
+      and not any(act == "room.commons.databases.mutate" for act, _ in room.calls))
+
+# Names match whatever their case; a status column is never re-optioned by name; no row count is no guess (N3).
+room = panel_db({"name": "choice", "type": "select", "options": ["Option A", "Option B", "Option C"]})
+_, rep = reply_of(run(room, task(database="d7k2m9x1", template="poll")))
+check("a-column-matches-in-any-case", rep["status"] == "done"
+      and "Choice" not in [a["property"]["name"] for act, a in room.calls
+                           if act == "room.commons.databases.mutate" and a.get("op") == "prop_add"])
+STATUS = {"app": "S", "databases": [{"name": "S", "role": "primary", "props": [
+    {"name": "State", "type": "status", "options": [{"name": "Going", "group": "doing"}]}]}]}
+room = panel_db({"name": "State", "type": "status", "options": ["Maybe"]})
+_, rep = reply_of(run(room, task(database="d7k2m9x1", template="poll"),
+                      {"html": "<p>x</p>", "schema": STATUS}))
+check("a-status-column-is-never-re-optioned-by-name", rep["status"] == "failed"
+      and "status column's options are not changed from here" in rep["reason"]
+      and not any(a.get("op") == "prop_update" for _, a in room.calls))
+
+
+class NoRowCount(FakeRoom):
+    def call(self, step):
+        out = super().call(step)
+        if step["action"] == "room.commons.databases.list":
+            for d in out["databases"]:
+                d.pop("rows", None)
+        return out
+
+
+room = NoRowCount(databases={"d7k2m9x1": {"name": "Untitled", "views": [], "properties": [
+    "Name", {"name": "Choice", "type": "select", "options": ["Morning"]}]}})
+_, rep = reply_of(run(room, task(database="d7k2m9x1", template="poll"), {"options": {"Choice": ["Morning", "Noon"]}}))
+check("no-row-count-says-so", rep["status"] == "failed" and "row count is not known" in rep["reason"])
+
+
 # --------------------------------------------------------------------------- the command line
 import contextlib
 import io
@@ -645,6 +699,14 @@ with tempfile.TemporaryDirectory() as tmp:
                                     encoding="utf-8")
     _, mcp_out = cli("plan", str(tmp / "build4.txt"), "--ledger", str(tmp / "ledger-mcp"))
     _, cli_out = cli("plan", str(tmp / "build4.txt"), "--route", "cli", "--ledger", str(tmp / "ledger-cli"))
+    # A fixed operation id per write step, the same on both routes and on a re-plan.
+    writes = [st for st in json.loads(mcp_out) if not st.get("read")]
+    check("every-write-step-has-a-fixed-operation-id", writes and all(
+        st.get("operation_id") == f"cab-14141414-3434-4565-8787-909090909090-{i}"
+        for i, st in enumerate(json.loads(mcp_out)) if not st.get("read")))
+    check("reads-carry-no-operation-id", all("operation_id" not in st for st in json.loads(mcp_out) if st.get("read")))
+    check("cli-writes-pass-their-operation-id", all(
+        st["cli"][-2:] == ["--operation-id", st["operation_id"]] for st in json.loads(cli_out) if not st.get("read")))
     check("cli-route-is-the-mcp-plan", [{k: v for k, v in st.items() if k != "cli"} for st in json.loads(cli_out)]
           == json.loads(mcp_out))
     check("cli-route-bad-value", cli("plan", str(tmp / "build2.txt"), "--route", "carrier", "--ledger", led)[0] == 2)
@@ -996,7 +1058,8 @@ with tempfile.TemporaryDirectory() as tmp:
     check("cli-reply-records-and-prints", code3 == 0 and rec["status"] == "done"
           and rec["database"] == "d7k2m9x1" and out3.startswith("Built it."))
     code4, out4 = cli("plan", str(tmp / "t.txt"), "--ledger", led_dir)
-    check("cli-plan-after-a-reply-returns-the-recorded-reply", code4 == 3 and out4.strip() == out3.strip())
+    check("cli-plan-after-a-reply-returns-the-recorded-reply", code4 == 5 and out4.strip() == out3.strip())
+    check("answered-is-never-the-cli-pending-code", br.ANSWERED == 5 and br.ANSWERED != 3)
     check("cli-reply-needs-a-status", cli("reply", str(tmp / "t.txt"), "--ledger", led_dir)[0] == 2)
     (tmp / "nofence.txt").write_text("hello", encoding="utf-8")
     check("cli-reply-needs-a-request-id", cli("reply", str(tmp / "nofence.txt"), "--ledger", led_dir,
