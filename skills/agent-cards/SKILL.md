@@ -50,7 +50,8 @@ offered. Run `reply --task-file` on a task carrying `card_click` and answer from
 
 What each button does: connections Reconnect / Make main / Disconnect run `connections.reconnect`,
 `set_primary`, `disconnect` (the same units as `scripts/connections.py`); workers Pause / Restart / Retire
-run `pool_manage.py stop` / `enable` / `retire`; apps Switch account is connect-apps Step 3c, Disconnect
+run `pool_manage.py stop` / `reseat` (a running seat; `enable` when it is stopped or paused; a seat that owes
+work is left running, `deferred`) / `retire`; apps Switch account is connect-apps Step 3c, Disconnect
 is never done by an agent ("You can disconnect <App> in Settings → Integrations."), Reconnect brings up
 the Connect card of the app's pending wait. "+ New worker", "+ Connect an app", "show my workers" and
 "Add <name> to a room" are plain words: handle them as the owner's message.

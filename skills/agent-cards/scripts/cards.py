@@ -67,9 +67,11 @@ def connections_card(rows: list, bridges: list) -> tuple:
     core = [r for r in rows if not r.get("worker")]
     workers = [r for r in rows if r.get("worker") and not r.get("disabled")]
     server_rows = []
+    servers = [str(r.get("server") or r.get("instance") or "") for r in core]
     for r in core:
         inst, state = str(r.get("instance") or ""), str(r.get("state") or "")
         name = str(r.get("server") or inst)
+        name += f" ({inst})" if servers.count(name) > 1 and inst else ""
         dot = "off" if r.get("disabled") or r.get("parked") else STATE_DOT.get(state, "off")
         actions = []
         if inst and state != "connected" and not r.get("parked"):
@@ -113,8 +115,10 @@ def connections_card(rows: list, bridges: list) -> tuple:
 def workers_card(workers: list, identities: dict, runtimes: dict) -> tuple:
     """(body, card) for the pool's workers: runtime, own agent, status, and what the owner can do."""
     rows = []
+    names = [str(w["name"]) for w in workers]
     for w in workers:
         wid, ident = w["worker_id"], identities.get(w["worker_id"]) or {}
+        who = str(w["name"]) + (f" ({wid})" if names.count(str(w["name"])) > 1 else "")
         retired = w.get("state") == "retired"
         status = ("Retired" if retired else "Paused" if w.get("paused")
                   else "Running" if w.get("session_alive") else "Stopped")
@@ -123,10 +127,10 @@ def workers_card(workers: list, identities: dict, runtimes: dict) -> tuple:
         if ident.get("agent_mxid") and not retired:
             actions.append(ac.button("Message", "open_dm", user_id=str(ident["agent_mxid"])))
         if not retired:
-            items = [_act("Restart", f"Restart {w['name']}", ac.reply("workers", wid, "restart"))]
+            items = [_act("Restart", f"Restart {who}", ac.reply("workers", wid, "restart"))]
             if not w.get("paused"):
-                items.insert(0, _act("Pause", f"Pause {w['name']}", ac.reply("workers", wid, "pause")))
-            items.append(_act("Retire", f"Retire {w['name']}", ac.reply("workers", wid, "retire", confirmed=True),
+                items.insert(0, _act("Pause", f"Pause {who}", ac.reply("workers", wid, "pause")))
+            items.append(_act("Retire", f"Retire {who}", ac.reply("workers", wid, "retire", confirmed=True),
                                    confirm=f"Retire {w['name']}? It stops for good and loses its own agent."))
             actions.append(ac.button("⋯", "menu", items=items))
         runtime = str(runtimes.get(wid) or "claude").lower()
@@ -221,13 +225,18 @@ def read_apps(ws: Path) -> list:
     return cloud.connection_rows(cached=True)
 
 
-def read_circle(ws: Path) -> list:
+def _yaml_load(text: str):
+    import yaml
+    return yaml.safe_load(text)
+
+
+def read_circle(ws: Path, load: Callable[[str], object] = _yaml_load) -> list:
+    """The collaboration map's recent entities: under `quick_lookup`, or at the top of a bare map."""
     path = ws / "data" / "collaboration-intelligence" / "quick-lookup.yaml"
     if not path.is_file():
         return []
     try:
-        import yaml
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        raw = load(path.read_text(encoding="utf-8")) or {}
     except Exception:  # noqa: BLE001 — no PyYAML or an unreadable index is an empty map here
         return []
     q = raw.get("quick_lookup") or raw if isinstance(raw, dict) else {}
@@ -316,7 +325,9 @@ def _workers_reply(ws: Path, said: ac.Reply) -> dict:
     if said.verb == "pause":
         out = pool_manage.stop(ws, said.target)
     elif said.verb == "restart":
-        out = pool_manage.enable(ws, str(_REPO), said.target)
+        out = pool_manage.reseat(ws, str(_REPO), said.target)
+        if out.get("result") == "skipped":
+            out = pool_manage.enable(ws, str(_REPO), said.target)
     elif said.verb == "retire" and said.confirmed:
         out = pool_manage.retire(ws, said.target)
     else:

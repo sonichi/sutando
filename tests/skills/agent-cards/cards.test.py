@@ -201,6 +201,18 @@ class Sources(Base):
         path.write_text(": : not yaml : [")
         self.assertEqual(cards.read_circle(self.ws), [])
 
+    def test_the_circle_reads_a_wrapped_or_bare_map_and_skips_a_missing_or_broken_one(self):
+        path = self.ws / "data" / "collaboration-intelligence" / "quick-lookup.yaml"
+        self.assertEqual(cards.read_circle(self.ws, load=json.loads), [])
+        path.parent.mkdir(parents=True)
+        ana = {"entity_id": "@ana:s.space", "kind": "human"}
+        for doc in ({"quick_lookup": {"recent_entities": [ana]}}, {"recent_entities": [ana]}):
+            path.write_text(json.dumps(doc))
+            self.assertEqual(cards.read_circle(self.ws, load=json.loads), [ana], doc)
+        for text in ("{broken", "[1, 2]", '{"quick_lookup": [1]}', "null"):
+            path.write_text(text)
+            self.assertEqual(cards.read_circle(self.ws, load=json.loads), [], text)
+
     def test_each_kind_reads_its_own_source(self):
         import chat_bridges
         import connectors
@@ -315,12 +327,47 @@ class Reply(Base):
         said = ("card:workers:w1:pause", "card:workers:w1:restart", "card:workers:w1:retire:confirmed")
         self.issue(*said)
         with mock.patch.object(pool_manage, "stop", lambda ws, t, **k: calls.append(("stop", t)) or {"result": "stopped"}), \
+                mock.patch.object(pool_manage, "reseat", lambda ws, repo, t, **k: {"result": "skipped"}), \
                 mock.patch.object(pool_manage, "enable", lambda ws, repo, t, **k: calls.append(("enable", t)) or {"result": "failed"}), \
                 mock.patch.object(pool_manage, "retire", lambda ws, t, **k: calls.append(("retire", t)) or {"result": "retired"}):
             got = [self.reply(x) for x in said + ("card:workers:w1:retire",)]
         self.assertEqual(calls, [("stop", "w1"), ("enable", "w1"), ("retire", "w1")])
         self.assertEqual([(rc, out["status"]) for rc, out in got],
                          [(0, "done"), (1, "failed"), (0, "done"), (1, "not_a_card_reply")])
+
+    def test_restart_reseats_a_running_worker_and_enables_a_stopped_one(self):
+        import pool_manage
+        self.issue("card:workers:w1:restart")
+        calls = []
+        answers = iter([{"result": "reseated"}, {"result": "skipped", "why": "no seat running"},
+                        {"result": "deferred", "owed": ["task-9"], "why": "it owes 1 task(s)"}])
+
+        def reseat(ws, repo, t, **k):
+            calls.append(("reseat", t))
+            return next(answers)
+        with mock.patch.object(pool_manage, "reseat", reseat), \
+                mock.patch.object(pool_manage, "enable", lambda ws, repo, t, **k: calls.append(("enable", t)) or {"result": "enabled"}):
+            got = [self.reply("card:workers:w1:restart")[1] for _ in range(3)]
+        self.assertEqual(calls, [("reseat", "w1"), ("reseat", "w1"), ("enable", "w1"), ("reseat", "w1")])
+        self.assertEqual([g["result"]["result"] for g in got], ["reseated", "enabled", "deferred"])
+
+    def test_workers_or_servers_sharing_a_name_keep_working_controls(self):
+        import pool_manage
+        twins = [{"worker_id": "w1", "name": "Pylon", "state": "live", "paused": False, "session_alive": True},
+                 {"worker_id": "w9", "name": "Pylon", "state": "live", "paused": False, "session_alive": True}]
+        _, card = cards.workers_card(twins, {}, {})
+        offers = cards.issued_cards.offered(card)
+        self.assertEqual(offers["Pause Pylon (w9)"], "card:workers:w9:pause")
+        self.assertEqual(offers["Pause Pylon (w1)"], "card:workers:w1:pause")
+        self.assertTrue(cards.issued_cards.record(self.ws, "$twins", card))
+        stopped = []
+        with mock.patch.object(pool_manage, "stop", lambda ws, t, **k: stopped.append(t) or {"result": "stopped"}):
+            rc, out = self.reply("", said="Pause Pylon (w9)", card_id="workers", reply_to_event="$twins")
+        self.assertEqual((rc, out["status"], stopped), (0, "done", ["w9"]))
+        rows = [{"instance": "a", "server": "s.space", "state": "connected", "primary": True},
+                {"instance": "b", "server": "s.space", "state": "failed"}]
+        offers = cards.issued_cards.offered(cards.connections_card(rows, [])[1])
+        self.assertEqual(offers["Reconnect s.space (b)"], "card:connections:b:reconnect")
 
     def test_app_replies_never_disconnect(self):
         self.issue("card:apps:gmail:disconnect", "card:apps:gmail:switch", "card:apps:gmail:reconnect")
