@@ -2,6 +2,10 @@
 """Text the owner reads names the agent and the cause in one plain line; ids, session names,
 paths, state codes and key fragments never reach a title, a first line, a reminder or a
 text-only fallback. Pinned as properties of the text, not as wording."""
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
 import importlib.util
 import sys
 import tempfile
@@ -106,23 +110,29 @@ class Shapes(unittest.TestCase):
 
 
 class AgentName(unittest.TestCase):
-    def test_it_is_the_recorded_display_name_and_never_reads_the_network(self):
-        import agent_display_name
+    """The name on a card comes from local records: the primary connection row, then the environment."""
 
-        def resolve(mxid=None, *, fetch=None, environ=None, workspace=None):
-            with self.assertRaises(OSError):
-                fetch("https://example.com/profile")
-            return "Blue Fox", "connection"
-        with patch.object(agent_display_name, "resolve", resolve):
-            self.assertEqual(owner_text.agent_name(), "Blue Fox")
+    def test_the_connection_row_wins_then_the_environment_then_the_default(self):
+        import agent_local_name
+        import connections
+        row = {"agent_display_name": "Blue Fox", "primary": True}
+        with patch.object(connections, "primary_row", return_value=row):
+            self.assertEqual(agent_local_name.local_name(environ={"AGENT_DISPLAY_NAME": "Env Name"}), "Blue Fox")
+        with patch.object(connections, "primary_row", return_value=None):
+            self.assertEqual(agent_local_name.local_name(environ={"AGENT_DISPLAY_NAME": "Env Name"}), "Env Name")
+            self.assertEqual(agent_local_name.local_name(environ={"SUTANDO_DISPLAY_NAME": "First",
+                                                                  "AGENT_DISPLAY_NAME": "Second"}), "First")
+            self.assertEqual(agent_local_name.local_name(environ={}), "Your agent")
 
-    def test_no_recorded_name_an_identifier_or_a_failure_is_your_agent(self):
-        import agent_display_name
-        for answer in (("Sutando", "fallback"), (SESSION, "configured")):
-            with patch.object(agent_display_name, "resolve", lambda *a, **k: answer):
-                self.assertEqual(owner_text.agent_name(), "Your agent")
-        with patch.object(agent_display_name, "resolve", side_effect=RuntimeError("no records")):
-            self.assertEqual(owner_text.agent_name(default="An agent"), "An agent")
+    def test_an_identifier_or_an_unreadable_record_is_no_name(self):
+        import agent_local_name
+        import connections
+        with patch.object(connections, "primary_row", return_value={"agent_display_name": SESSION}):
+            self.assertEqual(agent_local_name.local_name("An agent", environ={}), "An agent")
+        with patch.object(connections, "primary_row", side_effect=RuntimeError("unreadable")):
+            self.assertEqual(agent_local_name.local_name(environ={"AGENT_DISPLAY_NAME": "Env Name"}), "Env Name")
+        with tempfile.TemporaryDirectory() as empty:
+            self.assertEqual(agent_local_name.local_name(workspace=Path(empty), environ={}), "Your agent")
 
 
 class BlockedCard(unittest.TestCase):
@@ -132,7 +142,7 @@ class BlockedCard(unittest.TestCase):
         return HitlManager(HitlStore(Path(tempfile.mkdtemp(prefix="owner-text-"))))
 
     def raised(self, state="blocked-human", kind="unknown", prompt="Proceed with the plan?", seat=None, **kw):
-        with patch.object(ciw.owner_text, "agent_name", return_value="Blue Fox"):
+        with patch.object(ciw.agent_local_name, "local_name", return_value="Blue Fox"):
             return ciw.escalate(self.manager(), state, "awaiting user", kind, prompt, "sutando-core",
                                 seat=seat, **kw)
 

@@ -155,7 +155,7 @@ class SeatOnTheCard(unittest.TestCase):
         self.assertEqual(req.subject["seat"], f"worker comm ({NAME[-32:]})")
 
     def test_without_a_seat_the_core_card_is_unchanged(self):
-        with patch.object(ciw.owner_text, "agent_name", return_value="Blue Fox"):
+        with patch.object(ciw.agent_local_name, "local_name", return_value="Blue Fox"):
             req = ciw.escalate(self.manager(), "blocked-human", "d", "selection", "Pick one:", "sutando-core")
         self.assertEqual(req.device, {"id": "sutando-core", "name": "Blue Fox"})
         self.assertEqual(req.title, "Blue Fox is waiting for you")

@@ -752,7 +752,8 @@ class TheSweepOnALoggedOutWorker(Base):
         self.assertEqual(len(self.t.launches()), self.launched_before)
         req = rem.wc.manager_for(self.ws).get(out["cards"][self.wid]["hitl_id"])
         self.assertIn("Login expired · Please run /login", req.message)
-        self.assertIn("Run /login", req.message)
+        self.assertIn("/login signs it in", req.message.partition("\n\n")[2])
+        self.assertIn("is signed out", req.message.splitlines()[0])
         self.assertEqual(req.subject["wedge"], ps.CARD_LOGIN)
         self.assertNotIn(req.id, out["cards_closed"])
         # Raised once: the next sweep still reports the finding, without a second card.

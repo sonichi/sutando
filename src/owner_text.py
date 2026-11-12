@@ -12,7 +12,8 @@ health notices, usage-limit notices) builds its text here, so one rule holds for
 - `internals(text)`: which internal shapes a text still carries (a hex id, a session name, a
   path, a state code, a key). A sender's first line must carry none; `owner_line` falls back to
   a generic sentence when one does, so a record written before this rule cannot leak either.
-- `agent_name()`: this agent's display name, read without the network.
+- `named()`: a display name with any bracketed id dropped; `agent_local_name.local_name()`
+  gives this agent's own, from local records.
 - `clock()` / `resets()`: a reset time as a person reads it.
 """
 from __future__ import annotations
@@ -103,20 +104,6 @@ def resets(reset_at: Optional[float], now: Optional[float] = None) -> str:
     if not isinstance(reset_at, (int, float)) or isinstance(reset_at, bool) or reset_at <= now:
         return ""
     return f"It resets at {clock(reset_at, now)}."
-
-
-def _no_fetch(_url: str) -> bytes:
-    raise OSError("the display name is read from local records only")
-
-
-def agent_name(workspace=None, environ=None, default: str = DEFAULT_AGENT_NAME) -> str:
-    """This agent's display name from its local records; `default` when none is recorded."""
-    try:
-        import agent_display_name
-        name, source = agent_display_name.resolve(fetch=_no_fetch, environ=environ, workspace=workspace)
-    except Exception:  # noqa: BLE001 - a name is never worth failing the notice it titles
-        return default
-    return default if source == "fallback" or internals(name) else name
 
 
 def named(name: Optional[str], default: str = DEFAULT_AGENT_NAME) -> str:

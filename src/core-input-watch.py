@@ -730,6 +730,7 @@ DRIVE_SETTLE_S = 15.0
 
 
 from prompt_excerpt import prompt_excerpt  # noqa: E402  (shared with core-supervisor-relay)
+import agent_local_name  # noqa: E402
 import owner_text  # noqa: E402
 
 
@@ -806,7 +807,7 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
     try:
         from hitl import tui_gate
         limit = is_usage_limit(kind, prompt)
-        name = owner_text.named(seat, "A worker") if seat else owner_text.agent_name()
+        name = owner_text.named(seat, "A worker") if seat else agent_local_name.local_name()
         req = tui_gate.requirement_for(state, kind, prompt, session, detail,
                                        escalation_message(state, detail, kind, prompt, session, runtime, name),
                                        runtime=runtime,

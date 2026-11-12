@@ -357,7 +357,7 @@ turn in flight. With the same sustain and stale line, once per episode:
 
 Every wedge card reads the same way. Its title and first line name the worker by its
 display name ("A worker" when it has none) and say the cause in one plain sentence, with
-the reset time when the pane states one. The worker id, the session, the socket, the
+the reset time when the pane states one. The worker id, the session, the tmux path, the
 terminal's own lines and any command are detail lines below the first (`src/owner_text.py`
 `card_text`): a card folds them behind "Details", a text-only client and a reminder show
 the first line alone, and key-like fragments are redacted in both. The ids stay in the
