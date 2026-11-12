@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 import re
+import subprocess
 import tempfile
 import threading
 import time
@@ -1117,7 +1118,13 @@ with tempfile.TemporaryDirectory() as tmp:
     check("cli-replacement-is-a-prop-update", argv[:3] == ["action", ROOM, "room.commons.databases.mutate"]
           and json.loads(argv[4])["op"] == "prop_update" and json.loads(argv[4])["prop"] == "Choice")
     check("cli-replacement-has-its-own-operation-id", argv[-2] == "--operation-id"
-          and argv[-1] == steps[choice_idx]["operation_id"] + "-update")
+          and re.fullmatch(re.escape(steps[choice_idx]["operation_id"]) + r"-update-[0-9a-f]{8}", argv[-1]))
+    # Its id names its own arguments, which follow the database's live options (N1).
+    (tmp / "dbs2.json").write_text(json.dumps(envelope_of({"databases": [{"database": "db:d1", "rows": 0, "properties": [
+        {"name": "Choice", "type": "select", "options": ["Option B"]}]}]})))
+    code2, out2 = cli("check", str(tmp / "plan.json"), str(db_idx), str(tmp / "dbs2.json"))
+    other = json.loads(out2)["columns"][str(choice_idx)]["operation_id"] if code2 == 0 else ""
+    check("the-replacement-id-follows-the-live-options", other and other != replaced.get("operation_id"))
 
 # R5: an own schema's option columns are its own, not the template's.
 OWN_OPTS = {"databases": [{"name": "Signups", "role": "primary", "props": [
@@ -1178,8 +1185,28 @@ room_off, room_plain = FakeRoom(), FakeRoom()
 with_root = reply_of(run(room_off, task(template="poll", thread_root=ROOT), {"app_name": "Weekend"}))
 plain = reply_of(run(room_plain, task(template="poll"), {"app_name": "Weekend"}))
 check("switch-off-is-todays-answer", with_root == plain and "room.message.send" not in actions_of(room_off))
-_, rep = reply_of(run(FakeRoom(), task(template="poll", thread_root="not-an-event")))
-check("a-bad-thread-root-is-malformed", rep["status"] == "failed" and "thread_root" in rep["reason"])
+# Off, thread_root is ignored as any unknown key is: byte for byte the base's parse and plan (M1).
+_base_path = _SKILL / "scripts" / "_base_build_request_for_test.py"
+_base_path.write_text(subprocess.run(["git", "-C", str(_ROOT), "show",
+                                      "origin/fix/commons-app-builder-followups:skills/commons-app-builder/scripts/build_request.py"],
+                                     capture_output=True, text=True, check=True).stdout)
+try:
+    base = _load("base_build_request", _base_path)
+    base.WORKSPACE = WS
+    for label, root in (("a-good-root", ROOT), ("a-malformed-root", "not-an-event"), ("no-root", None)):
+        text = task(template="poll", thread_root=root, request_id="18181818-3434-4565-8787-909090909090")
+        same_parse = json.dumps(br.parse(text), sort_keys=True) == json.dumps(base.parse(text), sort_keys=True)
+        with tempfile.TemporaryDirectory() as led:
+            (Path(led) / "t.txt").write_text(text)
+            outs = []
+            for mod in (br, base):
+                o, e = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
+                    rc = mod.main(["plan", str(Path(led) / "t.txt"), "--ledger", str(Path(led) / mod.__name__)])
+                outs.append((rc, o.getvalue()))
+        check(f"switch-off-is-the-base-byte-for-byte-{label}", same_parse and outs[0] == outs[1])
+finally:
+    _base_path.unlink(missing_ok=True)
 
 br.thread_conversation = lambda: True
 try:
@@ -1192,14 +1219,11 @@ try:
                        if act not in ("commons.app_guide", "room.members.list", "room.commons.pages.list",
                                       "room.commons.pages.read", "room.commons.databases.list",
                                       "room.message.send"))
-    check("thread-start-and-result-are-posted", rep["status"] == "done" and len(posts) == 2)
+    check("thread-start-is-posted-and-done-adds-no-line", rep["status"] == "done" and len(posts) == 1)
     check("thread-start-comes-before-the-first-write", acts.index("room.message.send") < first_write)
     check("thread-start-says-building", posts[0]["body"] == "Building Weekend…" and posts[0]["thread_root"] == ROOT)
-    check("thread-result-is-the-dm-line", posts[1]["body"] == line)
     check("thread-posts-carry-the-marker",
-          posts[0]["extra_content"]["space.ag2.commons.app_thread"] == {"request_id": rep["request_id"], "page": PAGE}
-          and posts[1]["extra_content"]["space.ag2.commons.app_thread"] == {"request_id": rep["request_id"],
-                                                                            "app": rep["app_id"]})
+          posts[0]["extra_content"]["space.ag2.commons.app_thread"] == {"request_id": rep["request_id"], "page": PAGE})
     check("thread-posts-carry-operation-ids", all(p_["operation_id"] for p_ in posts))
     check("the-dm-reply-is-unchanged-by-the-thread", rep == {**plain[1], "app_id": rep["app_id"],
                                                              "database": rep["database"]})
@@ -1209,6 +1233,30 @@ try:
     room.refuse_posts = True
     _, rep = reply_of(run(room, task(template="poll", thread_root=ROOT)))
     check("a-refused-thread-post-is-best-effort", rep["status"] == "done")
+
+    _, rep = reply_of(run(FakeRoom(), task(template="poll", thread_root="not-an-event")))
+    check("on-a-bad-thread-root-is-malformed", rep["status"] == "failed" and "thread_root" in rep["reason"])
+
+    # A failure's line in the shared thread is fixed wording: an error's own text stays private.
+    class PathError(FakeRoom):
+        def call(self, step):
+            if step["action"] == "room.commons.pages.replace":
+                raise OSError("[Errno 28] No space left on device: '/Users/someone/private/cache'")
+            return super().call(step)
+    room = PathError()
+    _, rep = reply_of(run(room, task(template="poll", thread_root=ROOT)))
+    last = getattr(room, "posts", [])[-1]["body"]
+    check("a-failure-in-the-thread-is-fixed-wording", rep["status"] == "failed" and last == br.THREAD_FAILED
+          and "/Users" not in last and "/Users" in rep["reason"])
+
+    # A start line whose post raises anything at all never fails the build.
+    class Exploding2(FakeRoom):
+        def call(self, step):
+            if step["action"] == "room.message.send":
+                raise RuntimeError("socket closed")
+            return super().call(step)
+    _, rep = reply_of(run(Exploding2(), task(template="poll", thread_root=ROOT)))
+    check("any-error-from-a-thread-post-is-best-effort", rep["status"] == "done")
 
     # On, but no thread named: DM only.
     room = FakeRoom()
@@ -1224,14 +1272,28 @@ try:
         code, out = cli("plan", str(tmp / "t.txt"), "--ledger", led)
         steps = json.loads(out)
         check("plan-puts-the-start-line-in", code == 0 and any(st["action"] == "room.message.send" for st in steps))
-        code, out = cli("ask", str(tmp / "t.txt"), "--question", "Use the existing Signups database?", "--ledger", led)
+        plan_file = str(tmp / "plan.json")
+        Path(plan_file).write_text(out)
+        code, _ = cli("ask", str(tmp / "t.txt"), "--question", "too soon?", "--plan", plan_file, "--ledger", led)
+        check("ask-before-the-checks-is-refused", code == 2)
+
+        def pass_check(key, result):
+            n = next(i for i, st in enumerate(steps) if key in st)
+            (tmp / f"{key}.json").write_text(json.dumps(envelope_of(result)))
+            return cli("check", plan_file, str(n), str(tmp / f"{key}.json"))[0]
+        check("membership-check-passes", pass_check("expect_member", {"members": [{"user_id": OWNER}]}) == 0)
+        code, _ = cli("ask", str(tmp / "t.txt"), "--question", "still too soon?", "--plan", plan_file, "--ledger", led)
+        check("ask-after-only-the-membership-check-is-refused", code == 2)
+        check("page-check-passes", pass_check("expect_page", {"pages": [{"kind": PAGE}]}) == 0)
+        code, out = cli("ask", str(tmp / "t.txt"), "--question", "Use the existing Signups database?",
+                        "--plan", plan_file, "--ledger", led)
         asked = json.loads(out)
         check("ask-posts-one-question-in-the-thread", code == 0 and len(asked) == 1
               and asked[0]["arguments"]["thread_root"] == ROOT
               and asked[0]["arguments"]["extra_content"]["space.ag2.commons.app_thread"]
               == {"request_id": rid, "page": PAGE, "asks": True}
               and asked[0]["operation_id"] == f"cab-{rid}-ask")
-        code, out = cli("ask", str(tmp / "t.txt"), "--question", "again?", "--ledger", led)
+        code, out = cli("ask", str(tmp / "t.txt"), "--question", "again?", "--plan", plan_file, "--ledger", led)
         check("a-second-question-is-never-asked", code == br.WAITING and json.loads(out) == [])
         code, out = cli("plan", str(tmp / "t.txt"), "--ledger", led)
         check("a-restart-while-waiting-builds-nothing", code == br.WAITING and out == "")
@@ -1255,12 +1317,26 @@ try:
         code, out = cli("plan", got["task_file"], "--ledger", led)
         check("the-answered-request-is-built", code == 0 and json.loads(out)[-1]["action"] == "room.commons.apps.create")
         check("resumed-once", cli("plan", got["task_file"], "--ledger", led)[0] == 4)
+        # The resumed run dies: the claim is taken over after 30 minutes, and the question stays asked (M2).
+        path = br.Ledger(Path(led))._path(ROOM, rid)
+        entry = json.loads(path.read_text())
+        entry["claimed_at"] -= br.CLAIM_TTL_S + 1
+        path.write_text(json.dumps(entry))
+        code, out = cli("plan", got["task_file"], "--ledger", led)
+        kept = json.loads(path.read_text())
+        check("a-retaken-claim-keeps-the-question-and-answer", code == 0 and kept.get("asked", {}).get("question")
+              == "Use the existing Signups database?" and kept.get("answer") == "yes, use it")
+        Path(plan_file).write_text(out)
+        code, out = cli("ask", got["task_file"], "--question", "a new question?", "--plan", plan_file, "--ledger", led)
+        check("a-retaken-claim-never-asks-again", code == br.WAITING and json.loads(out) == [])
 
         # A question nobody answers lapses: the request fails, and the thread hears it once.
         rid2 = "31313131-3434-4565-8787-909090909090"
         (tmp / "t2.txt").write_text(task(template="poll", thread_root=ROOT, request_id=rid2), encoding="utf-8")
-        cli("plan", str(tmp / "t2.txt"), "--ledger", led)
-        cli("ask", str(tmp / "t2.txt"), "--question", "Morning or afternoon first?", "--ledger", led)
+        _, out2 = cli("plan", str(tmp / "t2.txt"), "--ledger", led)
+        led_ = br.Ledger(Path(led))
+        led_.ask(ROOM, rid2, thread_root=ROOT, owner=OWNER, question="Morning or afternoon first?",
+                 task_text=(tmp / "t2.txt").read_text())
         path = br.Ledger(Path(led))._path(ROOM, rid2)
         entry = json.loads(path.read_text())
         entry["asked"]["at"] -= br.ASK_TTL_S + 1
@@ -1272,7 +1348,58 @@ try:
         code, out = cli("thread-line", str(tmp / "t2.txt"), "--result", "--ledger", led)
         line_steps = json.loads(out)
         check("the-lapse-is-said-in-the-thread", code == 0 and len(line_steps) == 1
-              and "went unanswered" in line_steps[0]["arguments"]["body"])
+              and line_steps[0]["arguments"]["body"] == br.THREAD_LAPSED)
+
+        # The owner answers a lapsed question before any plan ran again: told once that it lapsed.
+        rid4 = "51515151-3434-4565-8787-909090909090"
+        root4 = "$root4:s.space"
+        text4 = task(template="poll", thread_root=root4, request_id=rid4)
+        led_.claim(ROOM, rid4)
+        led_.ask(ROOM, rid4, thread_root=root4, owner=OWNER, question="q?", task_text=text4, now=time.time() - br.ASK_TTL_S - 5)
+        (tmp / "late.txt").write_text(thread_message("morning", root=root4))
+        code, out = cli("answer", str(tmp / "late.txt"), "--ledger", led)
+        check("a-late-answer-is-told-it-lapsed", code == 0 and json.loads(out).get("lapsed") is True
+              and json.loads(out)["request_id"] == rid4)
+        check("lapsed-is-told-once", cli("answer", str(tmp / "late.txt"), "--ledger", led)[0] == 1)
+        (tmp / "t4.txt").write_text(text4)
+        code, out = cli("thread-line", str(tmp / "t4.txt"), "--result", "--ledger", led)
+        check("the-late-lapse-reaches-the-thread", json.loads(out)[0]["arguments"]["body"] == br.THREAD_LAPSED)
+
+        # The answer is the message's own words: reply context stripped, at most 2000 characters.
+        rid5 = "61616161-3434-4565-8787-909090909090"
+        root5 = "$root5:s.space"
+        led_.claim(ROOM, rid5)
+        led_.ask(ROOM, rid5, thread_root=root5, owner=OWNER, question="q?",
+                 task_text=task(template="poll", thread_root=root5, request_id=rid5))
+        ctx = "[AG2 Space reply context: earlier words here] [End AG2 Space reply context] "
+        (tmp / "ctx.txt").write_text(thread_message(f"{AGENT} {ctx}" + "y" * 2500, root=root5))
+        got5 = json.loads(cli("answer", str(tmp / "ctx.txt"), "--ledger", led)[1])
+        check("the-answer-drops-the-reply-context", "earlier words" not in got5["answer"])
+        check("the-answer-is-capped", got5["answer"] == "y" * 2000)
+
+        # Only the owner who asked, only in that room, only with the switch on.
+        rid6 = "71717171-3434-4565-8787-909090909090"
+        root6 = "$root6:s.space"
+        led_.claim(ROOM, rid6)
+        led_.ask(ROOM, rid6, thread_root=root6, owner=OWNER, question="q?",
+                 task_text=task(template="poll", thread_root=root6, request_id=rid6))
+        (tmp / "another-owner.txt").write_text(thread_message("yes", root=root6, user="@someone-else:s.space"))
+        check("another-owner-tier-sender-is-not-the-asker", cli("answer", str(tmp / "another-owner.txt"), "--ledger", led)[0] == 1)
+        (tmp / "other-room.txt").write_text(thread_message("yes", root=root6, room="!otherRoom:s.space"))
+        check("the-same-root-in-another-room-is-not-it", cli("answer", str(tmp / "other-room.txt"), "--ledger", led)[0] == 1)
+        br.thread_conversation = lambda: False
+        (tmp / "owner6.txt").write_text(thread_message("yes", root=root6))
+        check("off-an-open-question-is-not-answered", cli("answer", str(tmp / "owner6.txt"), "--ledger", led)[0] == 1)
+        br.thread_conversation = lambda: True
+        check("on-the-same-message-answers-it", cli("answer", str(tmp / "owner6.txt"), "--ledger", led)[0] == 0)
+
+        # A posted line's id is the request's and the line's, the same in every process.
+        (tmp / "t7.txt").write_text(task(template="poll", thread_root=ROOT, request_id="81818181-3434-4565-8787-909090909090"))
+        a = json.loads(cli("thread-line", str(tmp / "t7.txt"), "--line", "Halfway there", "--ledger", led)[1])[0]["operation_id"]
+        b = json.loads(cli("thread-line", str(tmp / "t7.txt"), "--line", "Halfway there", "--ledger", led)[1])[0]["operation_id"]
+        c = json.loads(cli("thread-line", str(tmp / "t7.txt"), "--line", "Done soon", "--ledger", led)[1])[0]["operation_id"]
+        expected = "cab-81818181-3434-4565-8787-909090909090-line-" + hashlib.sha256(b"Halfway there").hexdigest()[:8]
+        check("a-line-id-is-stable", a == b == expected and a != c)
         check("a-late-answer-finds-nothing", cli("answer", str(tmp / "owner.txt"), "--ledger", led)[0] == 1)
 
         # In-process: a request waiting on its question says nothing and builds nothing.
@@ -1293,5 +1420,27 @@ with tempfile.TemporaryDirectory() as tmp:
     (Path(tmp) / "o.txt").write_text(thread_message("yes"))
     check("answer-is-nothing-with-the-switch-off", cli("answer", str(Path(tmp) / "o.txt"), "--ledger", str(Path(tmp) / "l"))[0] == 1)
 
+
+# The switch reads like every skill's config: env, then the manifest (M3).
+old_env = os.environ.get("BUILD_THREAD_CONVERSATION")
+try:
+    os.environ["BUILD_THREAD_CONVERSATION"] = "true"
+    check("the-env-turns-the-switch-on", br.thread_conversation() is True)
+    os.environ["BUILD_THREAD_CONVERSATION"] = "false"
+    check("the-env-turns-it-off", br.thread_conversation() is False)
+    os.environ.pop("BUILD_THREAD_CONVERSATION")
+    check("the-manifest-default-is-off", br.thread_conversation() is False)
+finally:
+    if old_env is None:
+        os.environ.pop("BUILD_THREAD_CONVERSATION", None)
+    else:
+        os.environ["BUILD_THREAD_CONVERSATION"] = old_env
+
+# An operation id's digest does not depend on the order of the arguments' keys (N2).
+one = br.with_operation_ids("91919191-3434-4565-8787-909090909090",
+                            [{"action": "x", "arguments": {"a": 1, "b": {"c": 2, "d": 3}}}])[0]["operation_id"]
+two = br.with_operation_ids("91919191-3434-4565-8787-909090909090",
+                            [{"action": "x", "arguments": {"b": {"d": 3, "c": 2}, "a": 1}}])[0]["operation_id"]
+check("the-id-digest-ignores-key-order", one == two)
 
 print(f"commons-app-builder build request: {len(passed)} passed")

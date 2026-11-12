@@ -56,13 +56,13 @@ _MANIFEST = Path(__file__).resolve().parents[1] / "manifest.json"
 
 
 def thread_conversation() -> bool:
-    """The skill's switch (manifest config BUILD_THREAD_CONVERSATION, default off): when on, a
-    request naming its app thread is also spoken about there. Off, nothing reads the thread."""
+    """The skill's switch BUILD_THREAD_CONVERSATION, read env > the manifest's config (default
+    off), as every skill's config is (skills/MANIFEST.md). Off, nothing reads the thread."""
     try:
-        config = json.loads(_MANIFEST.read_text(encoding="utf-8")).get("config") or {}
-    except (OSError, ValueError, AttributeError):
+        from skill_config import enabled  # noqa: PLC0415  (src/ is on the path)
+    except ImportError:
         return False
-    return config.get("BUILD_THREAD_CONVERSATION") is True
+    return enabled("BUILD_THREAD_CONVERSATION", _MANIFEST)
 
 # The skill's own folder, for its templates/; not the workspace.
 SKILL_DIR = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
@@ -169,7 +169,8 @@ def validate(data: Dict[str, Any]) -> Dict[str, Any]:
     template = text("template", required=False)
     if template is not None and template not in TEMPLATES:
         raise RequestError("`template` must be one of " + ", ".join(TEMPLATES))
-    thread_root = text("thread_root", required=False)
+    # Off, the field is ignored as an unknown key is: never validated, never in the request.
+    thread_root = text("thread_root", required=False) if thread_conversation() else None
     if thread_root is not None and not _EVENT_RE.match(thread_root):
         raise RequestError("`thread_root` is not an event id")
     app_id = text("app_id", required=False)
@@ -179,7 +180,7 @@ def validate(data: Dict[str, Any]) -> Dict[str, Any]:
         raise RequestError("`app_id` is not an app id")
     return {"v": VERSION, "request_id": request_id, "mode": mode, "description": description,
             "room_id": room_id, "page": page, "database": database, "template": template,
-            "app_id": app_id, "thread_root": thread_root}
+            "app_id": app_id, **({"thread_root": thread_root} if thread_root else {})}
 
 
 def parse(text: str) -> Dict[str, Any]:
@@ -235,6 +236,7 @@ class Ledger:
         now = time.time() if now is None else now
         path = self._path(room_id, request_id)
         with self._locked(path.parent):
+            entry = None
             if path.exists():
                 entry = self.recorded(room_id, request_id)
                 if entry and entry.get("reply"):
@@ -251,7 +253,9 @@ class Ledger:
                     started = path.stat().st_mtime
                 if now - started < CLAIM_TTL_S:
                     return "busy", None
-            self._write(path, {"room_id": room_id, "request_id": request_id, "claimed_at": now})
+            # A dead claim taken over keeps what it held: an asked question stays asked for good.
+            kept = {k: v for k, v in (entry or {}).items() if k in ("asked", "answer", "answered_at", "resumed")}
+            self._write(path, dict(kept, room_id=room_id, request_id=request_id, claimed_at=now))
             return "claimed", None
 
     def ask(self, room_id: str, request_id: str, *, thread_root: str, owner: str, question: str,
@@ -284,12 +288,18 @@ class Ledger:
                 except (OSError, ValueError):
                     continue
                 asked = entry.get("asked") or {}
-                if (asked.get("thread_root") == thread_root and asked.get("owner") == owner
-                        and not entry.get("answer") and not entry.get("reply")
-                        and now - asked.get("at", 0) < ASK_TTL_S):
-                    self._write(path, dict(entry, answer=text, answered_at=now))
-                    return {"request_id": entry["request_id"], "answer": text,
-                            "question": asked.get("question"), "task_file": str(path.with_suffix(".task.txt"))}
+                if (asked.get("thread_root") != thread_root or asked.get("owner") != owner
+                        or entry.get("answer") or entry.get("reply")):
+                    continue
+                if now - asked.get("at", 0) >= ASK_TTL_S:
+                    # Too late: the request lapsed. Recorded once, so the thread hears it once.
+                    reply = completion(entry["request_id"], "failed", LAPSED)
+                    self._write(path, dict(entry, reply=reply, answered_at=now))
+                    return {"request_id": entry["request_id"], "lapsed": True,
+                            "task_file": str(path.with_suffix(".task.txt"))}
+                self._write(path, dict(entry, answer=text, answered_at=now))
+                return {"request_id": entry["request_id"], "answer": text,
+                        "question": asked.get("question"), "task_file": str(path.with_suffix(".task.txt"))}
         return None
 
     def record(self, room_id: str, request_id: str, reply: str) -> None:
@@ -669,9 +679,11 @@ def execute(steps: List[Dict[str, Any]], call: Callable[[Dict[str, Any]], Dict[s
         concrete = dict(step, arguments=fill(step["arguments"]))
         try:
             result = call(concrete) or {}
-        except ActionFailed as error:
+        except Exception as error:  # noqa: BLE001 - a best-effort line never fails the build
             if step.get("best_effort"):
                 continue  # a line in the thread; the DM answer stays the source of truth
+            if not isinstance(error, ActionFailed):
+                raise
             raise ActionFailed(_partial(str(error), written)) from None
         if step["action"] in ("room.commons.pages.replace", "room.commons.pages.append"):
             written = True
@@ -776,7 +788,9 @@ def existing_column(step: Dict[str, Any], answers: Dict[str, Any]) -> Optional[D
         "database": step["arguments"]["database"], "op": "prop_update", "prop": have["name"],
         "property": {"options": options}})
     if step.get("operation_id"):
-        replaced["operation_id"] = f"{step['operation_id']}-update"
+        raw = json.dumps(replaced["arguments"], sort_keys=True, ensure_ascii=False).encode("utf-8")
+        # Its arguments depend on the database's live options: they are in its id.
+        replaced["operation_id"] = f"{step['operation_id']}-update-{hashlib.sha256(raw).hexdigest()[:8]}"
     if "cli" in step:
         replaced["cli"] = cli_argv(replaced)
     return replaced
@@ -909,10 +923,18 @@ def _message_text(task_text: str) -> str:
     return re.sub(r"^@\S+\s*", "", line).strip()[:2000]
 
 
+THREAD_FAILED = "Could not build the app. The reason is in the reply to the request."
+THREAD_LAPSED = "Could not build the app: the question above went unanswered for 24 hours."
+
+
 def result_line(request: Dict[str, Any], reply: str) -> Optional[Dict[str, Any]]:
-    """The DM reply's own human line, again in the app's thread (best effort)."""
+    """The thread's last line for a request that failed (best effort), in fixed wording: an error's
+    own text (a path, a server message) stays in the private reply. None on done: the client posts
+    its own built card there."""
     body = json.loads(reply.split(f"```{FENCE}\n", 1)[1].split("\n```", 1)[0])
-    return thread_post(request, reply.split("\n\n", 1)[0], app_id=body.get("app_id"))
+    if body.get("status") != "failed":
+        return None
+    return thread_post(request, THREAD_LAPSED if body.get("reason") == LAPSED else THREAD_FAILED)
 
 
 def _post_result(request, reply, call) -> None:
@@ -935,7 +957,7 @@ def _thread_command(command: str, text: str, argv: List[str], ledger: "Ledger") 
             # Not the owner's answer to an open question here: the agent posts nothing.
             print("build_request: no open question this message answers", file=sys.stderr)
             return 1
-        print(json.dumps(found, ensure_ascii=False))
+        print(json.dumps(found, ensure_ascii=False))  # with "lapsed": run thread-line --result on its task_file
         return 0
     try:
         request = parse(text)
@@ -948,6 +970,12 @@ def _thread_command(command: str, text: str, argv: List[str], ledger: "Ledger") 
             raise SystemExit("build_request: ask needs --question")
         if not thread_root_of(request):
             print("build_request: this request has no app thread to ask in", file=sys.stderr)
+            return 2
+        # Only once the plan's membership and page checks have passed (`check` records them).
+        passed = _passed_checks(_flag(argv, "--plan"), request["request_id"])
+        if not {"member", "page"} <= passed:
+            print("build_request: ask runs after the room membership and page checks pass "
+                  "(--plan plan.json, checked with `check`)", file=sys.stderr)
             return 2
         if not ledger.ask(request["room_id"], request["request_id"], thread_root=request["thread_root"],
                           owner=request["owner"], question=question, task_text=text):
@@ -962,9 +990,34 @@ def _thread_command(command: str, text: str, argv: List[str], ledger: "Ledger") 
         op = f"cab-{request['request_id']}-result"
     else:
         post = thread_post(request, _flag(argv, "--line") or "")
-        op = f"cab-{request['request_id']}-line-{abs(hash(_flag(argv, '--line') or '')) % 10**8}"
+        line = _flag(argv, "--line") or ""
+        op = f"cab-{request['request_id']}-line-{hashlib.sha256(line.encode('utf-8')).hexdigest()[:8]}"
     print(json.dumps([dict(post, operation_id=op)] if post else [], ensure_ascii=False))
     return 0
+
+
+def _plan_request_id(steps: List[Dict[str, Any]]) -> Optional[str]:
+    """The request a plan is for, read off its write steps' operation ids (cab-<request id>-…)."""
+    for step in steps:
+        op = step.get("operation_id") or ""
+        if op.startswith("cab-") and len(op) > 40:
+            return op[4:40]
+    return None
+
+
+def _checks_path(plan_path: str) -> Path:
+    return Path(plan_path + ".checks")
+
+
+def _passed_checks(plan_path: Optional[str], request_id: str) -> set:
+    """The checks `check` recorded as passed for this plan: "member", "page"; empty when none."""
+    if not plan_path:
+        return set()
+    try:
+        record = json.loads(_checks_path(plan_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return set()
+    return set(record.get("passed") or []) if record.get("request_id") == request_id else set()
 
 
 def _flag(argv: List[str], name: str) -> Optional[str]:
@@ -997,6 +1050,11 @@ def _check(args: List[str]) -> int:
     except ActionFailed as error:
         print(str(error))
         return 1
+    kinds = [k for k, key in (("member", "expect_member"), ("page", "expect_page")) if key in step]
+    if kinds:
+        rid = _plan_request_id(steps)
+        done = _passed_checks(args[0], rid) | set(kinds)
+        _checks_path(args[0]).write_text(json.dumps({"request_id": rid, "passed": sorted(done)}), encoding="utf-8")
     # What later steps use: a prop_add whose column is listed here is skipped, or replaced by the
     # prop_update in `columns`; a column that cannot be used fails here, before anything is written.
     columns: Dict[str, Any] = {}
