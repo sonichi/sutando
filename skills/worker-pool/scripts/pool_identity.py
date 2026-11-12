@@ -261,19 +261,19 @@ def cmd_card_reply(args, ws: Path) -> int:
     except OSError as e:
         print(json.dumps({"status": "refused", "why": f"the task file is unreadable ({type(e).__name__})"}))
         return 2
-    headers, said = agent_card.reply_payload(text)
-    if said is None or said.kind != pool_device_connect.CARD_KIND:
+    headers, words = agent_card.reply_words(text)
+    if agent_card.card_click(headers) is None:
         print(json.dumps({"status": "not_a_card_reply"}))
         return 1
-    rec = pool_device_connect.read_record(ws, said.target)
     try:
-        owner = str(pool_provision.core_lane(ws, rec.get("lane")).get("owner_mxid") or "")
+        owner = str(pool_provision.core_lane(ws, None).get("owner_mxid") or "")
     except pool_provision.ProvisionError as e:
         print(json.dumps({"status": "refused", "why": str(e)}))
         return 2
-    ignored = agent_card.answered_card(headers, said, owner, ws)
-    if ignored:
-        print(json.dumps({"status": "not_a_card_reply", "why": ignored}, sort_keys=True))
+    said, ignored = agent_card.card_command(headers, words, owner, ws)
+    if said is None or said.kind != pool_device_connect.CARD_KIND:
+        print(json.dumps({"status": "not_a_card_reply", "why": ignored or "not a worker approval card"},
+                         sort_keys=True))
         return 1
     row = ((pr.load_roster(ws) or {}).get("workers") or {}).get(said.target)
     if not isinstance(row, dict) or row.get("state") == "retired":

@@ -477,10 +477,10 @@ class FakeActions:
         return [c["arguments"]["extra_content"]["space.ag2.card"] for c in self.calls]
 
 
-def card_task(said, *, tier="owner", user=None, kind="dm", reply_to=""):
-    return "\n".join(["id: task-card-1", "task_layout: mid", f"task: {said}", "source: ag2space",
-                      f"channel_id: {DM}", f"channel_kind: {kind}", f"user_id: {user}", f"access_tier: {tier}",
-                      f"reply_to_event: {reply_to}"]) + "\n"
+def card_task(said, *, tier="owner", user=None, kind="dm", reply_to="", click=None):
+    return "\n".join(["id: task-card-1", "task_layout: mid", f"card_click: {json.dumps(click) if click else ''}",
+                      f"task: {said}", "source: ag2space", f"channel_id: {DM}", f"channel_kind: {kind}",
+                      f"user_id: {user}", f"access_tier: {tier}", f"reply_to_event: {reply_to}"]) + "\n"
 
 
 class CardsBase(Base):
@@ -534,8 +534,9 @@ class Cards(CardsBase):
             self.connect(fake, approve_after=None)
         expired = self.actions.cards()[-1]
         self.assertEqual(expired["state"], "expired")
-        self.assertEqual(expired["buttons"][0], {"label": "Get a new link", "kind": "reply", "style": "primary",
-                                                 "reply": f"card:worker-approval:{W}:resend", "disabled": False})
+        self.assertEqual(expired["buttons"][0], {"label": f"Get a new link for {W}", "kind": "reply", "style": "primary",
+                                                 "reply": f"Get a new link for {W}",
+                                                 "command": f"card:worker-approval:{W}:resend", "disabled": False})
         self.assertEqual(self.sent, [])
         self.assertEqual(dc.read_record(self.ws, W)["state"], "expired")
 
@@ -590,12 +591,17 @@ class Resend(CardsBase):
         with self.assertRaises(dc.DeviceConnectError):
             self.connect(ConnectFake(self.backend, expires_in=60), approve_after=None, display_name="Reviewer")
 
+    def click(self, said):
+        return {"card_id": dc.card_id(W, str(dc.pp.core_lane(self.ws, None).get("server") or "")), "action": said}
+
     def reply(self, said, **kw):
         path = self.ws / "tasks" / "task-card-1.txt"
         path.parent.mkdir(parents=True, exist_ok=True)
         if "user" not in kw:
             kw["user"] = dc.pp.core_lane(self.ws, None)["owner_mxid"]
         kw.setdefault("reply_to", dc.read_record(self.ws, W).get("event_id", ""))
+        if "click" not in kw:
+            kw["click"] = self.click(said)
         path.write_text(card_task(said, **kw))
         out, spawned = [], []
         with unittest.mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))), \
@@ -605,35 +611,35 @@ class Resend(CardsBase):
 
     def test_the_owner_s_resend_starts_a_fresh_flow_in_the_background(self):
         self.expire()
-        rc, out, spawned = self.reply(f"card:worker-approval:{W}:resend")
+        rc, out, spawned = self.reply(dc.resend_text(W))
         self.assertEqual((rc, out), (0, {"status": "started"}))
         argv = spawned[0]
         self.assertEqual(argv[argv.index("add") + 1:argv.index("add") + 5], [W, "--device-flow", "--label", "reviewer"])
         self.assertIn("Reviewer", argv)
         self.assertEqual(dc.read_record(self.ws, W)["state"], "resending")
-        rc, out, spawned = self.reply(f"card:worker-approval:{W}:resend")
+        rc, out, spawned = self.reply(dc.resend_text(W))
         self.assertEqual((rc, out["status"], spawned), (1, "refused", []))
 
     def test_anyone_but_the_owner_in_their_dm_is_ordinary_chat(self):
         self.expire()
         for kw in ({"tier": "team"}, {"user": "@someone:alpha-fixture.net"}, {"kind": "room"}, {"tier": ""}):
-            rc, out, spawned = self.reply(f"card:worker-approval:{W}:resend", **kw)
+            rc, out, spawned = self.reply(dc.resend_text(W), **kw)
             self.assertEqual((rc, out["status"], spawned), (1, "not_a_card_reply", []), kw)
         self.assertEqual(dc.read_record(self.ws, W)["state"], "expired")
 
     def test_a_reply_to_a_card_this_agent_did_not_post_is_ordinary_chat(self):
         self.expire()
         for reply_to in ("$forged-by-a-member", ""):
-            rc, out, spawned = self.reply(f"card:worker-approval:{W}:resend", reply_to=reply_to)
+            rc, out, spawned = self.reply(dc.resend_text(W), reply_to=reply_to)
             self.assertEqual((rc, out["status"], spawned), (1, "not_a_card_reply", []), reply_to)
         self.assertEqual(dc.read_record(self.ws, W)["state"], "expired")
 
     def test_a_payload_the_card_did_not_offer_starts_nothing(self):
         self.connect(ConnectFake(self.backend))
-        rc, out, spawned = self.reply(f"card:worker-approval:{W}:resend")
+        rc, out, spawned = self.reply(dc.resend_text(W))
         self.assertEqual((rc, out["status"], spawned), (1, "not_a_card_reply", []))
         self.expire()
-        for said in (f"card:worker-approval:{W}:explode", "card:worker-approval:other:resend"):
+        for said in ("Blow it up", "Get a new link for other"):
             rc, out, spawned = self.reply(said)
             self.assertEqual((rc, out["status"], spawned), (1, "not_a_card_reply", []), said)
         dc.write_record(self.ws, W, {**dc.read_record(self.ws, W), "state": "done"})
@@ -661,20 +667,23 @@ class Resend(CardsBase):
                                      str(self.ws / "tasks" / "absent.txt")])
         self.assertEqual((rc, json.loads(out[-1])["status"]), (2, "refused"))
         self.expire()
-        owner = dc.pp.core_lane(self.ws, None)["owner_mxid"]
+        owner, click = dc.pp.core_lane(self.ws, None)["owner_mxid"], self.click(dc.resend_text(W))
         with unittest.mock.patch.object(pool_identity.pool_provision, "core_lane",
                                         side_effect=dc.pp.ProvisionError("no core lane")):
-            rc, got, spawned = self.reply(f"card:worker-approval:{W}:resend", user=owner)
+            rc, got, spawned = self.reply(dc.resend_text(W), user=owner, click=click)
         self.assertEqual((rc, got, spawned), (2, {"status": "refused", "why": "no core lane"}, []))
         with unittest.mock.patch.object(pool_identity.pr, "load_roster",
                                         lambda ws: {"workers": {W: {"state": "retired"}}}):
-            rc, got, spawned = self.reply(f"card:worker-approval:{W}:resend")
+            rc, got, spawned = self.reply(dc.resend_text(W))
         self.assertEqual((rc, got["status"], spawned), (2, "refused", []))
         self.assertIn("no live pool worker", got["why"])
 
     def test_other_words_are_not_a_card_reply(self):
-        rc, out, _ = self.reply("send me a new link please")
+        rc, out, _ = self.reply("send me a new link please", click={})
         self.assertEqual((rc, out), (1, {"status": "not_a_card_reply"}))
+        self.expire()
+        rc, out, spawned = self.reply(dc.resend_text(W), click={})
+        self.assertEqual((rc, out, spawned), (1, {"status": "not_a_card_reply"}, []))
 
 
 if __name__ == "__main__":

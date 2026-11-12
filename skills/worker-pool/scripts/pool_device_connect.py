@@ -226,6 +226,11 @@ def done_card(worker: str, worker_label: str, label: str, agent_id: str, *, serv
                                       + ("has a new token." if rotated else f"is {worker_label}'s own agent.")))
 
 
+def resend_text(worker_label: str) -> str:
+    """What the owner's click on the expired card says: the button's own words, so it needs no second tap."""
+    return f"Get a new link for {worker_label}"
+
+
 def expired_card(worker: str, worker_label: str, label: str, expires_at: float, *, server: str,
                  subtitle: str) -> tuple:
     """(body, card) once the link lapsed unapproved: nothing changed, and one tap for a new link."""
@@ -234,8 +239,8 @@ def expired_card(worker: str, worker_label: str, label: str, expires_at: float, 
                     avatar_=ac.avatar(seed=label),
                     text=f"The approval link for {label} expired at {until} before it was approved, so nothing "
                          "was set up.",
-                    buttons=[ac.button("Get a new link", "reply", style="primary",
-                                       reply=ac.reply(CARD_KIND, worker, RESEND), disabled=False)],
+                    buttons=[ac.button(resend_text(worker_label), "reply", style="primary", reply=resend_text(worker_label),
+                                       command=ac.reply(CARD_KIND, worker, RESEND), disabled=False)],
                     note="A new link works for 15 minutes.", note_tone="dim",
                     body=ac.body_line(f"The approval link for agent \"{label}\" (pool worker {worker_label}) expired "
                                       f"at {until}; nothing was set up. Ask me for a new link."))
