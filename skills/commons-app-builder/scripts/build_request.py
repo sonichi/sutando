@@ -740,7 +740,7 @@ def verify(step: Dict[str, Any], result: Dict[str, Any], answers: Optional[Dict[
         found = dbs.get(bare(step["expect_database"]))
         if not found:
             raise ActionFailed(f"database {step['expect_database']} is not in this room")
-        if found.get("properties_truncated") is True:  # no read shows every column and option
+        if found.get("properties_truncated") is not False:  # complete only when it says so; no read shows more
             raise ActionFailed(f"the room lists database {step['expect_database']} without all of its "
                                "columns or options, so they cannot be checked before anything is written")
         present.update(p["name"].strip().casefold() for p in found.get("properties", [])
