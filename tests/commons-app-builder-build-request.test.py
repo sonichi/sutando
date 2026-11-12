@@ -171,7 +171,7 @@ class FakeRoom:
 
 
 def task(*, tier="owner", kind="dm", user=OWNER, headers=True, stamp=True, layout=True,
-         raw=None, before="", **fields):
+         raw=None, before="", when="2026-11-08T12:00:00Z", **fields):
     """A task file in the gateway's own layout (remote_gateway_bridge._write_task): headers above
     `task:`, the body flattened to one line, room context and the decided access_tier below it,
     and the envelope stamp a live gateway adds. `before` is anything the sender typed first."""
@@ -183,7 +183,7 @@ def task(*, tier="owner", kind="dm", user=OWNER, headers=True, stamp=True, layou
         f"{before}Build a Commons app\n\n```commons-app-build\n{json.dumps(body)}\n```")
     if not headers:
         return text
-    head = ["id: task-1", "timestamp: 2026-11-08T12:00:00Z", "local_time: 2026-11-08T04:00:00-08:00",
+    head = ["id: task-1", f"timestamp: {when}", "local_time: 2026-11-08T04:00:00-08:00",
             "source: ag2space", f"channel_id: {DM}", "task_id: t-1", "execution_generation: 1"]
     if layout:
         head.append("task_layout: mid")
@@ -1161,9 +1161,9 @@ check("in-process-sends-the-planned-ids", [i for i in sent if i] == [st["operati
 ROOT = "$threadRoot1:s.space"
 
 
-def thread_message(text, *, user=OWNER, tier="owner", root=ROOT, room=ROOM, stamp=True):
+def thread_message(text, *, user=OWNER, tier="owner", root=ROOT, room=ROOM, stamp=True, when="2026-11-12T12:00:00Z"):
     """A message in the app's thread, as the gateway writes it: a room task with the thread headers."""
-    head = ["id: task-t1", "timestamp: 2026-11-12T12:00:00Z", "source: ag2space", f"channel_id: {room}",
+    head = ["id: task-t1", f"timestamp: {when}", "source: ag2space", f"channel_id: {room}",
             "task_id: t-2", "execution_generation: 1", "task_layout: mid"]
     tail = ["room_name: Event", "sender_name: x", f"thread_root: {root}", f"source_room_id: {room}",
             "room_member_count: 5", "channel_kind: room", "source_message_id: $m9", f"user_id: {user}",
@@ -1495,5 +1495,101 @@ finally:
         sys.modules.pop("skill_config", None)
     else:
         sys.modules["skill_config"] = _real_mod
+
+# --------------------------------------------------------------------------- thread-task: the message beside a fence
+T0 = "2026-11-12T15:00:00Z"
+T_PLUS = lambda s_: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(1794495600 + s_))  # T0 + s_ seconds
+assert T_PLUS(0) == T0
+
+
+def verdict(message, *, ledger, tasks):
+    code, out = cli("thread-task", str(message), "--ledger", str(ledger), "--tasks", str(tasks))
+    return code, out.strip()
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    tmp = Path(tmp)
+    tasks, led = tmp / "tasks", tmp / "ledger"
+    tasks.mkdir()
+    rid = "e1e1e1e1-3434-4565-8787-909090909090"
+    fence = task(template="poll", thread_root=ROOT, request_id=rid, when=T0)
+    (tasks / "task-fence.txt").write_text(fence)
+    msg = tmp / "msg.txt"
+    msg.write_text(thread_message("a sign-up sheet for the weekend", when=T_PLUS(20)))
+    check("the-message-beside-a-pending-fence-is-a-duplicate", verdict(msg, ledger=led, tasks=tasks) == (0, f"duplicate {rid}"))
+    # Claimed (the fence's task left tasks/): the ledger knows it, with the switch off.
+    (tasks / "task-fence.txt").unlink()
+    (tmp / "fence.txt").write_text(fence)
+    check("plan-claims", cli("plan", str(tmp / "fence.txt"), "--ledger", str(led))[0] == 0)
+    check("switch-is-off-here", br.thread_conversation() is False)
+    check("the-message-beside-a-claimed-fence-is-a-duplicate-switch-off",
+          verdict(msg, ledger=led, tasks=tasks) == (0, f"duplicate {rid}"))
+    check("the-fence-is-in-no-output", "fence" not in cli("parse", str(tmp / "fence.txt"))[1])
+    # Answered, a moment ago: still the same message.
+    cli("reply", str(tmp / "fence.txt"), "--status", "done", "--page", PAGE, "--line", "Built.", "--ledger", str(led))
+    check("still-a-duplicate-after-the-reply", verdict(msg, ledger=led, tasks=tasks) == (0, f"duplicate {rid}"))
+    # The guards: each one alone makes it an ordinary message.
+    for label, other in (("another-owner", thread_message("x", user="@someone:s.space", when=T_PLUS(20))),
+                         ("not-the-owner-tier", thread_message("x", tier="team", when=T_PLUS(20))),
+                         ("another-room", thread_message("x", room="!otherRoom:s.space", when=T_PLUS(20))),
+                         ("another-thread", thread_message("x", root="$elsewhere:s.space", when=T_PLUS(20))),
+                         ("unstamped", thread_message("x", stamp=False, when=T_PLUS(20))),
+                         ("long-after-the-fence", thread_message("thanks!", when=T_PLUS(600))),
+                         ("long-before-the-fence", thread_message("hello", when=T_PLUS(-600)))):
+        (tmp / f"{label}.txt").write_text(other)
+        check(f"thread-task-none-{label}", verdict(tmp / f"{label}.txt", ledger=led, tasks=tasks) == (0, "none"))
+    check("at-the-window-edge-is-a-duplicate", (lambda f: (f.write_text(thread_message("x", when=T_PLUS(br.DUPLICATE_WINDOW_S))),
+                                                          verdict(f, ledger=led, tasks=tasks))[1])(tmp / "edge.txt")
+          == (0, f"duplicate {rid}"))
+    # A change long after the build arrives WITH its own fence: that new request's duplicate.
+    rid2 = "f1f1f1f1-3434-4565-8787-909090909090"
+    (tasks / "task-change.txt").write_text(task(mode="refine", app_id="a1b2c3d4", thread_root=ROOT, request_id=rid2,
+                                                description="bigger buttons", when=T_PLUS(7200)))
+    (tmp / "change.txt").write_text(thread_message("make the buttons bigger", when=T_PLUS(7205)))
+    check("a-later-change-with-its-fence-is-its-duplicate", verdict(tmp / "change.txt", ledger=led, tasks=tasks)
+          == (0, f"duplicate {rid2}"))
+    (tasks / "task-change.txt").unlink()
+    check("a-later-message-with-no-fence-is-none", verdict(tmp / "change.txt", ledger=led, tasks=tasks) == (0, "none"))
+    # A fence that names no valid thread, or another owner's fence, is never matched.
+    (tasks / "task-bad.txt").write_text(task(template="poll", thread_root="not-an-event", when=T_PLUS(7200),
+                                             request_id="a2a2a2a2-3434-4565-8787-909090909090"))
+    (tasks / "task-stranger.txt").write_text(task(template="poll", thread_root=ROOT, user="@someone:s.space", when=T_PLUS(7200),
+                                                  request_id="a3a3a3a3-3434-4565-8787-909090909090"))
+    check("a-bad-or-foreign-fence-matches-nothing", verdict(tmp / "change.txt", ledger=led, tasks=tasks) == (0, "none"))
+    (tasks / "task-untiered.txt").write_text(task(template="poll", thread_root=ROOT, tier="team", when=T_PLUS(7200),
+                                                  request_id="a5a5a5a5-3434-4565-8787-909090909090"))
+    check("a-fence-below-the-owner-tier-matches-nothing", verdict(tmp / "change.txt", ledger=led, tasks=tasks) == (0, "none"))
+    (tasks / "task-untiered.txt").unlink()
+    (tasks / "task-room.txt").write_text(task(template="poll", thread_root=ROOT, when=T_PLUS(7200),
+                                              request_id="a6a6a6a6-3434-4565-8787-909090909090"))
+    (tmp / "room-msg.txt").write_text(thread_message("x", room="!otherRoom:s.space", when=T_PLUS(7205)))
+    check("a-pending-fence-in-another-room-matches-nothing", verdict(tmp / "room-msg.txt", ledger=led, tasks=tasks) == (0, "none"))
+    (tasks / "task-room.txt").unlink()
+    # An open question: the owner's message (far from any fence) is its answer, only with the switch on.
+    rid3 = "a4a4a4a4-3434-4565-8787-909090909090"
+    root3 = "$root3:s.space"
+    ledger3 = br.Ledger(led)
+    ledger3.claim(ROOM, rid3)
+    ledger3.ask(ROOM, rid3, thread_root=root3, owner=OWNER, question="q?", task_text=task(thread_root=root3, request_id=rid3))
+    (tmp / "ans.txt").write_text(thread_message("yes", root=root3, when=T_PLUS(9000)))
+    check("off-an-open-question-is-none", verdict(tmp / "ans.txt", ledger=led, tasks=tasks) == (0, "none"))
+    br.thread_conversation = lambda: True
+    try:
+        check("on-the-owners-message-is-the-answer", verdict(tmp / "ans.txt", ledger=led, tasks=tasks) == (0, f"answer {rid3}"))
+        (tmp / "ans-other.txt").write_text(thread_message("yes", root=root3, user="@someone:s.space", when=T_PLUS(9000)))
+        check("another-owners-message-answers-nothing", verdict(tmp / "ans-other.txt", ledger=led, tasks=tasks) == (0, "none"))
+        ledger3.answer(ROOM, root3, OWNER, "yes")
+        check("an-answered-question-takes-no-second-answer", verdict(tmp / "ans.txt", ledger=led, tasks=tasks) == (0, "none"))
+    finally:
+        br.thread_conversation = real_switch
+    check("thread-task-writes-nothing-to-the-thread", "room.message.send" not in verdict(msg, ledger=led, tasks=tasks)[1])
+    # Unreadable bits are skipped, never matched, never fatal.
+    room_dir = br.Ledger(led)._path(ROOM, rid).parent
+    (room_dir / "00000000-0000-4000-8000-0000000000aa.json").write_text("{nope")
+    (tasks / "a-folder.txt").mkdir()
+    check("unreadable-entries-and-files-are-skipped", verdict(msg, ledger=led, tasks=tasks) == (0, f"duplicate {rid}"))
+    (tmp / "no-time.txt").write_text(thread_message("x", when="not a time"))
+    check("a-message-without-a-time-is-none", verdict(tmp / "no-time.txt", ledger=led, tasks=tasks) == (0, "none"))
+    check("thread-task-flag-without-a-value", cli("thread-task", str(msg), "--ledger")[0] == 2)
 
 print(f"commons-app-builder build request: {len(passed)} passed")

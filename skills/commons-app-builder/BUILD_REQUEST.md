@@ -247,3 +247,34 @@ python3 build_request.py ask task.txt --plan plan.json --question 'Use the exist
   thread went unanswered for 24 hours"); an owner's `answer` after that prints `"lapsed": true`
   once. Either way `thread-line --result` then says so in the thread, once.
 
+## The message beside a fence
+
+The client sends each build, change or Try again as the DM fence **and** a message in the app's
+thread. On the appservice delivery path the owner's thread messages reach the owner's agent
+whether or not they name it, and the gateway passes no marker, so that message arrives as a
+room task beside the fence. This holds with `BUILD_THREAD_CONVERSATION` off too, so it is handled
+either way. On **any room task with a `thread_root` header**, run first:
+
+```bash
+python3 build_request.py thread-task thread-task.txt   # [--tasks <workspace>/tasks] [--ledger DIR]
+```
+
+It prints one verdict, exit 0, and posts nothing anywhere:
+
+- `duplicate <request_id>`: the message that goes with that request's fence. Write `[no-send]`
+  and do nothing: the fence is the request, answered in the DM.
+- `answer <request_id>`: the owner's answer to that request's open question (switch on only).
+  Go on as `answer` does.
+- `none`: an ordinary message. Handle it as usual.
+
+Every verdict but `none` needs the attested owner tier, the owner who sent the fence, the same
+room (`source_room_id`) and the same `thread_root`. A duplicate also needs that fence to have
+arrived within **120 seconds** of the message (`timestamp` headers), either still pending in
+`<workspace>/tasks/` (the message can be read first) or already claimed. The claim keeps the fence's
+thread, owner and time in the ledger, never in any output.
+
+So a message is never dropped without a fence of its own beside it. An owner's "thanks" a minute
+after the build is `none`. A change long after the build comes with its own new fence, so its
+thread message is that new request's duplicate. An owner message long after the build, with no
+fence, is `none`.
+

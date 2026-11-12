@@ -230,7 +230,7 @@ class Ledger:
             return None
 
     def claim(self, room_id: str, request_id: str,
-              now: Optional[float] = None) -> Tuple[str, Optional[str]]:
+              now: Optional[float] = None, fence: Optional[Dict[str, Any]] = None) -> Tuple[str, Optional[str]]:
         """("claimed", None), ("done", reply), ("busy", None), ("asked", None) while the owner's
         answer to its question is awaited, or ("expired", None) once that wait is over."""
         now = time.time() if now is None else now
@@ -254,7 +254,10 @@ class Ledger:
                 if now - started < CLAIM_TTL_S:
                     return "busy", None
             # A dead claim taken over keeps what it held: an asked question stays asked for good.
-            kept = {k: v for k, v in (entry or {}).items() if k in ("asked", "answer", "answered_at", "resumed")}
+            kept = {k: v for k, v in (entry or {}).items()
+                    if k in ("asked", "answer", "answered_at", "resumed", "fence")}
+            if fence and "fence" not in kept:
+                kept["fence"] = fence  # its thread, owner and time, for thread-task; never in any output
             self._write(path, dict(kept, room_id=room_id, request_id=request_id, claimed_at=now))
             return "claimed", None
 
@@ -305,8 +308,20 @@ class Ledger:
     def record(self, room_id: str, request_id: str, reply: str) -> None:
         path = self._path(room_id, request_id)
         with self._locked(path.parent):
+            fence = (self.recorded(room_id, request_id) or {}).get("fence")
             self._write(path, {"room_id": room_id, "request_id": request_id, "reply": reply,
-                               "answered_at": time.time()})
+                               "answered_at": time.time(), **({"fence": fence} if fence else {})})
+
+    def entries(self, room_id: str) -> List[Dict[str, Any]]:
+        """Every readable entry of one room."""
+        room = self.folder / hashlib.sha256(room_id.encode("utf-8")).hexdigest()[:16]
+        out = []
+        for path in sorted(room.glob("*.json")) if room.is_dir() else []:
+            try:
+                out.append(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                continue
+        return out
 
     @staticmethod
     def _locked(folder: Path):
@@ -858,7 +873,7 @@ def build(task_text: str, call: Callable[[Dict[str, Any]], Dict[str, Any]],
     except RequestError as error:
         return completion(request_id, "failed", str(error))
     if ledger is not None:
-        state, recorded = ledger.claim(request["room_id"], request["request_id"])
+        state, recorded = ledger.claim(request["room_id"], request["request_id"], fence=fence_facts(task_text))
         if state == "done":
             return recorded
         if state == "busy":
@@ -914,6 +929,73 @@ def answer_of(thread_task: str, ledger: "Ledger") -> Optional[Dict[str, Any]]:
         return None
     text = _message_text(thread_task)
     return ledger.answer(room, root, owner, text) if text else None
+
+
+DUPLICATE_WINDOW_S = 120  # a thread message this close to its own request's fence is that request
+
+
+def _when(meta: Dict[str, str]) -> Optional[float]:
+    """The task's own timestamp header, as epoch seconds; None when absent or unreadable."""
+    from datetime import datetime  # noqa: PLC0415
+    try:
+        return datetime.fromisoformat(meta.get("timestamp", "").replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def fence_facts(task_text: str) -> Optional[Dict[str, Any]]:
+    """A DM fence's room, thread root, owner and arrival time, read whatever the switch says (the
+    thread message that goes with it arrives either way); None when any is missing."""
+    try:
+        meta = headers(task_text)
+        owner = authorize(meta)
+        data = extract(task_text)
+    except RequestError:
+        return None
+    root, room, at = data.get("thread_root"), data.get("room_id"), _when(meta)
+    # The root is compared with the message's validated one, so it needs no shape check of its own.
+    if not (isinstance(root, str) and isinstance(room, str) and at is not None):
+        return None
+    return {"room_id": room, "thread_root": root, "owner": owner, "at": at,
+            "request_id": data.get("request_id")}
+
+
+def thread_task(task_text: str, ledger: "Ledger", tasks_dir: Optional[Path] = None) -> Tuple[str, Optional[str]]:
+    """What a room task in an app thread is: ("duplicate", id), the thread message that goes with
+    that request's DM fence (the caller answers nothing: the fence is the request); ("answer", id),
+    the owner's answer to that request's open question; or ("none", None), an ordinary message.
+
+    Each needs the attested owner tier, the owner who sent the fence, the same room and the same
+    thread root. A duplicate also needs that fence to have arrived within DUPLICATE_WINDOW_S of the
+    message, pending in `tasks_dir` or already claimed: a message with no fence of its own nearby
+    (a "thanks" after the build, a question long after) is never dropped."""
+    meta = headers(task_text)
+    owner, root, room = meta.get("user_id", ""), meta.get("thread_root", ""), meta.get("source_room_id", "")
+    at = _when(meta)
+    if meta.get("access_tier") != "owner" or not owner.startswith("@") or not _EVENT_RE.match(root) or not room:
+        return "none", None
+    near = lambda f: (f and f.get("room_id") == room and f.get("thread_root") == root and f.get("owner") == owner
+                      and at is not None and abs(f.get("at", 0) - at) <= DUPLICATE_WINDOW_S)
+    for path in sorted(Path(tasks_dir).glob("*.txt")) if tasks_dir and Path(tasks_dir).is_dir() else []:
+        try:
+            other = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if other != task_text:
+            facts = fence_facts(other)
+            if near(facts):
+                return "duplicate", facts.get("request_id")
+    entries = ledger.entries(room)
+    for entry in entries:
+        if near(entry.get("fence")):
+            return "duplicate", entry.get("request_id")
+    if thread_conversation():
+        for entry in entries:
+            asked = entry.get("asked") or {}
+            if (asked.get("thread_root") == root and asked.get("owner") == owner
+                    and not entry.get("answer") and not entry.get("reply")):
+                return "answer", entry.get("request_id")
+    return "none", None
 
 
 def _message_text(task_text: str) -> str:
@@ -1074,9 +1156,9 @@ def _check(args: List[str]) -> int:
 
 def main(argv: List[str]) -> int:
     if len(argv) < 2 or argv[0] not in ("parse", "plan", "reply", "check", "chunks", "ask", "answer",
-                                        "thread-line"):
-        print("usage: build_request.py parse|plan|reply|check|chunks|ask|answer|thread-line <file> [options]",
-              file=sys.stderr)
+                                        "thread-line", "thread-task"):
+        print("usage: build_request.py parse|plan|reply|check|chunks|ask|answer|thread-line|thread-task <file> "
+              "[options]", file=sys.stderr)
         return 2
     command, path = argv[0], argv[1]
     if command == "check":
@@ -1089,6 +1171,17 @@ def main(argv: List[str]) -> int:
     if command == "chunks":
         for piece in chunks(text):
             print(len(piece.encode("utf-8")))
+        return 0
+    if command == "thread-task":
+        try:
+            folder, tasks = _flag(argv, "--ledger"), _flag(argv, "--tasks")
+            ledger_ = Ledger(Path(folder) if folder else default_ledger())
+            tasks_dir = Path(tasks) if tasks else Path(default_ledger()).parents[1] / "tasks"
+        except SystemExit as error:
+            print(str(error), file=sys.stderr)
+            return 2
+        verdict, request_id = thread_task(text, ledger_, tasks_dir)
+        print(verdict if request_id is None else f"{verdict} {request_id}")
         return 0
     if command in ("ask", "answer", "thread-line"):
         try:
@@ -1145,7 +1238,7 @@ def main(argv: List[str]) -> int:
     except (ActionFailed, KeyError, ValueError, TypeError, AttributeError) as error:
         print(completion(request["request_id"], "failed", str(error) or type(error).__name__))
         return 1
-    state, recorded = ledger().claim(request["room_id"], request["request_id"])
+    state, recorded = ledger().claim(request["room_id"], request["request_id"], fence=fence_facts(text))
     if state == "done":
         print(recorded)
         return ANSWERED
