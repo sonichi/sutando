@@ -422,6 +422,8 @@ class Launcher(unittest.TestCase):
         self.assertIn("usage limit on claude-opus-5-5", lines[0])
         notice = next((self.ws / "results").glob("proactive-*.txt")).read_text()
         self.assertIn("card I left you", notice)
+        for typed in ("switch to sonnet", "retry now", "reply to this"):
+            self.assertNotIn(typed, notice, "the card is the way out; no typed command beside it")
 
 
 class StatusSurfaces(unittest.TestCase):
@@ -630,6 +632,17 @@ class OwnerRecovery(unittest.TestCase):
 
     def notices(self):
         return sorted((self.ws / "results").glob("proactive-*.txt"))
+
+    def test_notice_says_the_reset_time_once_as_a_clock_time(self):
+        hold = clh.read_hold(self.ws)
+        for card in (False, True):
+            body = clh._notice_body(hold, card)
+            self.assertEqual(body.count("It resets at ") + body.count("It tries again at "), 1, body)
+            self.assertRegex(body, r"It (resets|tries again) at (\w{3} \d{1,2}, )?\d{1,2}:\d{2} [AP]M, and")
+            self.assertNotRegex(body, r"\d{4}-\d{2}-\d{2}", "no machine timestamp")
+            self.assertNotIn("core-model", body)
+        self.assertEqual(clh._limit_words({"kind": "rate-limit"}), "rate limit on its model")
+        self.assertIn("It tries again at ", clh._when_line({"until": self.now + 600}, self.now))
 
     def test_notice_offers_product_actions(self):
         body = self.notices()[0].read_text()

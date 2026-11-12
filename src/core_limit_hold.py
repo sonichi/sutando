@@ -422,22 +422,31 @@ def _task_predates(path: Path, started: object) -> bool:
     return True
 
 
-def _when_line(hold: dict) -> str:
-    return (f"It resets {_when(hold['reset_at'])}" if isinstance(hold.get("reset_at"), (int, float))
-            else f"It tries again {_when(hold['until'])}")
+def _limit_words(hold: dict) -> str:
+    """Which limit paused the core, without the time: the next line says that once."""
+    what = "usage limit" if hold.get("kind") == "usage-limit" else "rate limit"
+    return f"{what} on {hold.get('model') or 'its model'}"
+
+
+def _when_line(hold: dict, now: Optional[float] = None) -> str:
+    """When the pause ends, as a clock time a person reads."""
+    from owner_text import clock
+    return (f"It resets at {clock(hold['reset_at'], now)}" if isinstance(hold.get("reset_at"), (int, float))
+            else f"It tries again at {clock(hold['until'], now)}")
 
 
 def _notice_body(hold: dict, card: bool = False) -> str:
     from result_markers import neutralize_markers
-    where = ('pick a model on the "Your agent\'s model" card I left you, or under Agent Settings, Runtime, Model'
-             if card else "pick a model in the core-model card under Agent Settings, Runtime, Model")
+    # With the card left beside this notice, the card is the way out; without one, a reply is.
+    way = ('To keep working now, pick another model on the "Your agent\'s model" card I left you.\n'
+           if card else
+           'To keep working now, reply to this or just send "switch to sonnet" (or another model: '
+           "haiku, opus, fable), or pick a model under Agent Settings, Runtime, Model. "
+           'Send "retry now" to try the current model again at once.\n')
     return "[dm-only]\n" + neutralize_markers(
-        f"Your Sutando core is paused: {hold['reason'].split(': ', 1)[-1]} (pause {_incident_ref(hold)}).\n\n"
+        f"Your Sutando core is paused: {_limit_words(hold)} (pause {_incident_ref(hold)}).\n\n"
         f"{_when_line(hold)}, and the core starts again by itself after that. Messages you send meanwhile "
-        "wait and are answered then.\n\n"
-        'To keep working now, reply to this or just send "switch to sonnet" (or another model: '
-        f"haiku, opus, fable), or {where}. "
-        'Send "retry now" to try the current model again at once.\n')
+        f"wait and are answered then.\n\n{way}")
 
 
 def _present_card(hold: dict, card_entry: str, now: float) -> bool:

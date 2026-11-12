@@ -203,9 +203,74 @@ def _card_projected(signal: dict, surface: str) -> bool:
         return False
 
 
+def _src_on_path() -> None:
+    """Run as a script, the relay's own directory is not on sys.path; its helpers live there."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+
+
+def _who(signal: dict) -> str:
+    """The stuck agent by the name its owner knows: the worker's label, else this agent's."""
+    try:
+        _src_on_path()
+        import agent_local_name
+        import owner_text
+        seat = signal.get("seat")
+        return owner_text.named(seat, "A worker") if seat else agent_local_name.local_name()
+    except Exception:  # noqa: BLE001 - the owner's only channel: a name never stops the notice
+        return "Your agent"
+
+
+def _attach_command() -> str:
+    """How to open the core's terminal by hand, for the details; '' when it is not recorded."""
+    try:
+        be = _derive_backend()
+    except Exception:  # noqa: BLE001 - nothing in derivation may crash the escalation
+        be = None
+    return (f"tmux -S {be['socket']} attach -t {be.get('session') or _DEFAULT_TMUX_SESSION}"
+            if be else "")
+
+
+def compose_details(signal: dict) -> list:
+    """What a person debugging this needs and the notice does not say: the state and gate
+    codes, the terminal's first readable line, and the command that opens the terminal.
+    Logged, and sent as the alert's structured details; never part of the notice text."""
+    prompt = (signal.get("prompt") or "").strip()
+    try:
+        _src_on_path()
+        from prompt_excerpt import first_readable_line
+        excerpt = first_readable_line(prompt)
+    except Exception:  # noqa: BLE001 - details are best-effort
+        excerpt = next((ln.strip() for ln in prompt.splitlines() if ln.strip()), "")
+    out = [f"state: {signal.get('state') or ''}" + (f" · gate: {signal['kind']}" if signal.get("kind") else "")]
+    if excerpt:
+        out.append(f"terminal: {excerpt[:200]}")
+    attach = _attach_command()
+    if attach:
+        out.append(f"open its terminal: {attach}")
+    if _is_login_class(signal):
+        out.append("if the credential proxy still refuses after signing in: sonichi#4326")
+    try:
+        import owner_text
+        return [owner_text.redact(line) for line in out]
+    except Exception:  # noqa: BLE001
+        return out
+
+
 def compose_message(signal: dict, surface: str = "") -> str:
-    """The owner-facing 'action needed' line: what's stuck + a prompt excerpt. `surface` is
-    the channel it goes to, which decides whether a choice card can be named."""
+    """The owner-facing 'action needed' line: who is stuck and why, in plain words, and what
+    the owner can do. `surface` is the channel it goes to, which decides whether a choice card
+    can be named. Codes, terminal lines and commands are `compose_details`."""
+    try:
+        _src_on_path()
+        import owner_text
+        return owner_text.redact(_compose(signal, surface))
+    except ImportError:
+        return _compose(signal, surface)
+
+
+def _compose(signal: dict, surface: str = "") -> str:
     aa = _soft_notice(signal)
     if aa and signal.get("state") not in HARD_ESCALATE and aa.get("kind") == "fable-limit-refused":
         who = f"worker {signal['seat']}" if signal.get("seat") else "the core"
@@ -221,25 +286,7 @@ def compose_message(signal: dict, surface: str = "") -> str:
                 " otherwise; /model there changes it, /usage-credits keeps Fable on credits.")
     detail = signal.get("detail") or signal.get("state") or "core needs attention"
     kind = signal.get("kind")
-    prompt = (signal.get("prompt") or "").strip()
-    # The first READABLE line: on a login pane the first non-empty line is a box rule or an OAuth
-    # URL fragment. Same filter as the escalation card; a failure here must not drop the notice.
-    try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        if here not in sys.path:
-            sys.path.insert(0, here)
-        from prompt_excerpt import first_readable_line
-        excerpt = first_readable_line(prompt)
-    except Exception:  # noqa: BLE001 - the owner's only channel: never crash the escalation
-        excerpt = next((ln.strip() for ln in prompt.splitlines() if ln.strip()), "")
-    parts = [f"⚠️ Agent needs you — {detail}"]
-    if kind and kind not in detail:
-        parts.append(f"({kind})")
-    msg = " ".join(parts)
-    if excerpt:
-        # The remedy is the actionable half, so it keeps its length; the prompt
-        # echo is what gives way to stay inside the message-length bound.
-        msg += f": {excerpt[:110]}"
+    msg = f"⚠️ {_who(signal)} needs you — {detail}"
     if kind == "turn-rejected":
         msg += (" — the core sits at its idle prompt but refuses every turn it is sent; each"
                 " ends in that line, so nothing queued for it runs")
@@ -256,28 +303,11 @@ def compose_message(signal: dict, surface: str = "") -> str:
                 " If the core looks fine, no action is needed.")
     elif _is_login_class(signal):
         host = _core_host_label() or "the host"
-        try:
-            be = _derive_backend()
-        except Exception:
-            be = None
-        where = (f"`tmux -S {be['socket']} attach -t {be.get('session') or _DEFAULT_TMUX_SESSION}`"
-                 if be else "the Runtime panel")
-        msg += (f" — needs GUI /login on {host}: run /login in the core terminal ({where})."
-                " If the credential proxy still refuses, see sonichi#4326."
-                " A chat reply can't resolve this.")
+        msg += (f" — it is signed out and has to be signed in again on {host}, from its card"
+                " or its terminal. A chat reply can't sign it in.")
     else:
         host = _core_host_label() or "the host"
-        # Guard at the CALL SITE too: this message is the owner's only channel
-        # here, so nothing in derivation may crash the escalation.
-        try:
-            be = _derive_backend()
-        except Exception:
-            be = None
-        # A bare socket path is not actionable; the attach command is — and it must
-        # name the session, or a shared socket attaches to the wrong one.
-        where = (f"at the core's terminal on {host} — `tmux -S {be['socket']} "
-                 f"attach -t {be.get('session') or _DEFAULT_TMUX_SESSION}`"
-                 if be else f"where the core is running on {host}")
+        where = f"in its terminal on {host}"
         if kind in ("selection", "permission") and _card_projected(signal, surface):
             # The card's buttons type the answer into the dialog, so it is the first option
             # and the terminal the second; a card is named only when one is really there.
@@ -320,7 +350,8 @@ def alert_content(signal: dict) -> dict:
     a clear, so the tag names only the agent and what it is stuck on."""
     return {ALERT_FIELD: {"agent": f"core@{_core_host_label()}",
                           "state": str(signal.get("state") or ""),
-                          "kind": str(signal.get("kind") or "")}}
+                          "kind": str(signal.get("kind") or ""),
+                          "details": compose_details(signal)}}
 
 
 def _channel_notify(message: str, source: str, channel: str,
@@ -603,6 +634,7 @@ def main(argv=None):
         return 0
     if msg:
         print(("DRY-RUN " if a.dry_run else "escalated: ") + msg)
+        print("details: " + " | ".join(compose_details(signal)))
         return 0
     print(f"no escalation (state={signal.get('state')})")
     return 0

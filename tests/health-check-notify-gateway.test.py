@@ -121,6 +121,21 @@ class TestGatewayNotify(unittest.TestCase):
 
     # --- delivery ---------------------------------------------------------
 
+    def test_a_detail_naming_an_internal_stays_out_of_the_dm_and_a_key_is_redacted(self):
+        sent = []
+        checks = [self._fail("task-notifier", "managed tmux session 'sutando-core-watcher' is missing"),
+                  self._fail("voice", "failed: 401 for sk-ant-api03-" + "a1B2" * 8),
+                  self._fail("core-quota")]
+        with tempfile.TemporaryDirectory() as td:
+            self.assertTrue(self.hc.notify_gateway_for_failures(
+                checks, state_file=Path(td) / "s.json", sender=lambda t: sent.append(t) or True))
+        text = sent[0]
+        self.assertIn("• task-notifier: fail\n", text)
+        self.assertIn("• core-quota: fail (CORE IS OVER QUOTA)", text)
+        for leak in ("tmux", "sutando-core-watcher", "sk-ant"):
+            self.assertNotIn(leak, text)
+        self.assertEqual(self.hc._owner_reason(""), "")
+
     def _fail(self, name="core-quota", detail="CORE IS OVER QUOTA"):
         return {"name": name, "status": "fail", "detail": detail}
 

@@ -4261,12 +4261,12 @@ def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
         if action == "restart":
             ok, why = guard(REPO_DIR)
             if not ok:
-                _alert(f"⚠️ health-check: {name} is DOWN — NOT auto-restarted "
-                       f"({why}). Start it via startup.sh once the checkout is clean/on main.")
+                _alert(f"⚠️ health-check: {name} is DOWN — NOT auto-restarted{_owner_reason(why)}. "
+                       "It needs an engine restart once the checkout is clean and on main.")
                 continue
         else:  # action == "alert"
-            _alert(f"⚠️ health-check: {name} is DOWN — alert-only "
-                   f"(down_bridge_action=alert). Start it via startup.sh.")
+            _alert(f"⚠️ health-check: {name} is DOWN and automatic restart is turned off. "
+                   "It needs an engine restart.")
             continue
 
 
@@ -4275,12 +4275,24 @@ def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
         ok, how = _restart_bridge(name)
         if ok:
             restarted.append(name)
-            _alert(f"♻️ health-check auto-restarted **{name}** (was down; {how}). "
-                   f"If this repeats, it's crash-looping — check logs/{name}.log.")
+            _alert(f"♻️ health-check auto-restarted **{name}** (it was down). "
+                   "If this repeats, it is crash-looping and its log has the reason.")
+            print(f"  {name}: restarted ({how})")
         else:
-            _alert(f"⚠️ health-check: {name} is DOWN and could NOT be auto-restarted "
-                   f"({how}). Start it via startup.sh.")
+            _alert(f"⚠️ health-check: {name} is DOWN and could NOT be auto-restarted{_owner_reason(how)}. "
+                   "It needs an engine restart.")
     return restarted
+
+
+def _owner_reason(reason: object) -> str:
+    """` (reason)` for an alert the owner reads: redacted, and left to the log (printed here)
+    when it names a path, a session, an id or a command."""
+    import owner_text
+    text = owner_text.redact(" ".join(str(reason or "").split()))
+    if text and owner_text.internals(text):
+        print(f"  reason kept out of the alert: {text}")
+        return ""
+    return f" ({text})" if text else ""
 
 
 def _bridge_launch_plan(name: str) -> "tuple[str, dict] | None":
@@ -14526,7 +14538,7 @@ def notify_gateway_for_failures(
     if history.get(_LAST_HASH_KEY) == hash_key:
         return True
 
-    lines = [f"• {c['name']}: {c['status']} ({c['detail']})" for c in failures[:5]]
+    lines = [f"• {c['name']}: {c['status']}{_owner_reason(c.get('detail'))}" for c in failures[:5]]
     extra = f"\n…(+{len(failures) - 5} more)" if len(failures) > 5 else ""
     text = "⚠️ Sutando health check — " + f"{len(failures)} issue(s):\n" + "\n".join(lines) + extra
 
