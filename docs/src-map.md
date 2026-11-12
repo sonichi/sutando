@@ -174,6 +174,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`overlay-manager-ui.ts`** — Overlay Manager view for the Sutando web UI.
 - **`owner_activity.py`** — Atomic publication of the owner's most recent messaging activity.
 - **`owner_channel.py`** — May the core speak in this channel?
+- **`owner_question.py`** — A question to the owner: one model, and the only place that turns it into words.
 - **`owner_room_access.py`** — How a room-database adapter reaches the owner's room: capability lookup, owner DM, agent identity and credentials.
 - **`owner_text.py`** — Text the owner reads, in one place: say the cause in one plain sentence, keep the rest behind it.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.

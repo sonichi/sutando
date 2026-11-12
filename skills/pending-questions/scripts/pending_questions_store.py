@@ -84,9 +84,20 @@ def neutralize(text: str) -> str:
     return LEDGER_FIELD_RE.sub("** ", neutralize_markers(text or "")).replace("<!--", "<! --")
 
 
+def default_option(default_action: Optional[str], options) -> Optional[int]:
+    """Index, among the labelled options, of the one the default names (case and outer
+    whitespace ignored); None when the default is an action of its own."""
+    want = (default_action or "").strip().lower()
+    labels = [str(a).strip().lower() for a, _ in options or () if str(a).strip()]
+    return labels.index(want) if want and want in labels else None
+
+
 def ordered_options(default_action: Optional[str], options) -> list:
-    """(label, consequence) pairs with Approve first; Approve carries the default."""
+    """(label, consequence) pairs with Approve first; Approve carries the default. A default
+    that names one of the options adds nothing: the options are the list, as given."""
     opts = [(str(a).strip(), str(b).strip()) for a, b in options or () if str(a).strip()]
+    if default_option(default_action, options) is not None:
+        return opts
     approve = [o for o in opts if o[0].lower() == APPROVE.lower()]
     rest = [o for o in opts if o[0].lower() != APPROVE.lower()]
     if approve:

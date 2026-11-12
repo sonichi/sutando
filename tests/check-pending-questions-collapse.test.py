@@ -93,7 +93,7 @@ with tempfile.TemporaryDirectory() as td:
        f"proactive-pending-q-{_mod.questions_key(Q_AB)}.txt" not in names)
     survivor = Path(td) / f"proactive-pending-q-{_mod.questions_key(Q_B)}.txt"
     body = survivor.read_text() if survivor.exists() else ""
-    ok("the surviving body states the new count", body.startswith("⚠️ 1 pending question "))
+    ok("the surviving body states the new count", body.startswith("1 question is still waiting for your answer"))
 
 # T6: superseding is scoped to OUR reminders. results/ is a shared namespace —
 # other proactive producers' bodies must survive, as must a claimed .sending.

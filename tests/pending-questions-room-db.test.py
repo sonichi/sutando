@@ -417,7 +417,7 @@ class TestAskOwner(_Ws):
         self.assertEqual(e["ask_id"], out["ask_id"])
         self.assertIn(f"via {out['proactive_file']} at", e["body"])
         body = (self.ws / "results" / out["proactive_file"]).read_text()
-        self.assertIn("set its Status on the row: https://db/page", body)
+        self.assertNotIn("https://db/page", body, "the owner is never sent to the row to answer")
         self.assertIn("Pending questions database", body)
         self.assertEqual("\n".join(pqa.report_lines(out)).count("recorded:"), 1)
         self.assertIn("row: https://link/row", pqa.report_lines(out))

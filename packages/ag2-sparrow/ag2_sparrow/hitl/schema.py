@@ -19,7 +19,7 @@ WIRE_FIELD = "space.ag2.hitl"
 NOTICE_FIELD = "space.ag2.hitl_notice"
 # The subject fields a card may show. The rest of `subject` is the producer's own bookkeeping
 # (claims, tokens, leases, session keys) and never leaves the host.
-WIRE_SUBJECT_FIELDS = ("tool", "input", "options", "choices")
+WIRE_SUBJECT_FIELDS = ("tool", "input", "options", "choices", "refs", "effects")
 
 
 # Canonical JSON's integer range; a number outside it is refused like a float.
@@ -189,7 +189,10 @@ class HumanRequirement:
         if device:
             wire["device"] = device
         if self.actions:
-            wire["actions"] = [a.to_wire() for a in self.actions]
+            # `subject.styles` is {action id: style}: a stored action keeps the three keys every reader loads.
+            styles = (self.subject or {}).get("styles") or {}
+            wire["actions"] = [{**a.to_wire(), "style": styles[a.id]} if styles.get(a.id) else a.to_wire()
+                               for a in self.actions]
         subject = {k: self.subject[k] for k in WIRE_SUBJECT_FIELDS if k in (self.subject or {})}
         if subject:
             wire["subject"] = subject

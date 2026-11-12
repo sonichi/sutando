@@ -361,13 +361,16 @@ def ack_click(workspace: Path, ask_id: str, token: str, manager=None) -> tuple:
     return cards.ack_click(Path(workspace), ask_id, token, manager)
 
 
+action_id = core_ask.action_id
+
+
 # ---- the ask ----------------------------------------------------------------------
 
 def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live",
               task_file: Optional[str] = None, workspace: Optional[Path] = None,
               host: Optional[str] = None, now: Optional[float] = None, store=None,
               default_action: Optional[str] = None, reason: Optional[str] = None,
-              options=(), priority: str = "Medium") -> dict:
+              options=(), priority: str = "Medium", extra: Optional[dict] = None) -> dict:
     """Hold (core), row, card or text, bounded reconcile, notify — each step reported, none raising.
     `store` is this adapter's store; None leaves the question in the outbox. No outbox record,
     no row: the question is still queued to the owner, and the report says it was not held. A
@@ -385,7 +388,7 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
                  "open it any time from that room. Questions are sent to you as they come up, not on a schedule.")
     link = getattr(store, "link", None) if store is not None else None
     out = core_ask.queue_question(question, context, task_file, ws, host, now, link, intro,
-                                  default_action, reason, options, priority)
+                                  default_action, reason, options, priority, extra=extra)
     out.update({"reconcile": rec, "record": None, "db_error": out["outbox_error"], "link": link,
                 "macos": None, "macos_fix": None, "history_error": None})
     if (out["proactive_file"] or out["card"]) and intro:

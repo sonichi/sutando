@@ -26,6 +26,7 @@ for _p in (REPO / "src", HERE):
         sys.path.insert(0, str(_p))
 from workspace_default import resolve_workspace
 from sutando_config import resolve_macos_notifications
+import owner_question
 from result_publish import publish_text
 from presenter_mode import presenter_mode_active
 from pending_questions_ask import SENT_QUIET_SEC, asked_recently, card_live, send_card_pointers
@@ -210,24 +211,14 @@ def notify_voice(questions):
 def notify_discord_dm(questions):
     """Write a proactive-*.txt file so discord-bridge DMs the owner."""
     path = RESULTS_DIR / f"{PROACTIVE_PREFIX}{questions_key(questions)}.txt"
-    lines = [
-        f"⚠️ {len(questions)} pending question{'s' if len(questions) > 1 else ''} waiting:",
-        "",
-    ]
-    for q in questions[:5]:
-        lines.append(f"• {q['title']}")
-        if q.get("snippet"):
-            lines.append(f"  ↳ {q['snippet']}")
-    if len(questions) > 5:
-        lines.append(f"…and {len(questions) - 5} more")
-    lines.append("")
-    lines.append("Reply here, or set the row's Status in the Pending questions database.")
+    body = owner_question.waiting_digest([q["title"] for q in questions],
+                                         [q.get("snippet") or "" for q in questions])
     # Each body is a whole snapshot, so a stale one is wrong, not redundant. Look
     # BEFORE writing: a file appearing after can be an overlapping run's, not ours.
     superseded = [p for p in RESULTS_DIR.glob(f"{PROACTIVE_PREFIX}*.txt") if p != path]
     # Appear at the deliverable name in one step: a poll claims proactive-*.txt on sight.
     # Owner-only (0600): the body holds the owner's question titles and snippets.
-    publish_text(path, "\n".join(lines), mode=0o600)
+    publish_text(path, body, mode=0o600)
     for old in superseded:
         old.unlink(missing_ok=True)
 

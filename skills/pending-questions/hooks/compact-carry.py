@@ -27,7 +27,7 @@ SUMMARY_RULE = (
 AFTER_COMPACT = (
     "Owner questions after this compaction: if the summary has the heading "
     f"'{TO_FILE}', file each item now with `python3 scripts/ask-owner.py \"<question>\" "
-    "--unless-open [--context \"<why / options>\"]` (it files nothing already open), then drop the "
+    "--unless-open [--context \"<why>\"] [--option \"<Label>=<what it does>\" per known answer]` (it files nothing already open), then drop the "
     "heading. Never list owner questions in terminal or summary text; file them. Open questions: "
     "`python3 src/pending_questions_reader.py summary`.")
 

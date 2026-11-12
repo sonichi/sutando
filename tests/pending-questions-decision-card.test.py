@@ -134,6 +134,7 @@ class Delegation(unittest.TestCase):
         cc.assert_called_once()
         self.assertEqual(cc.call_args.args[2], out["ask_id"])
         self.assertEqual(cc.call_args.args[3], {"ask_id": out["ask_id"],
+                                                "details_folded": True, "default": "approve",
                                                 "choices": {"approve": "merge it", "option-1": "wait for the CLA"}})
         self.assertEqual(cc.call_args.kwargs["runtime"], ask.CARD_RUNTIME)
 
@@ -150,7 +151,8 @@ class QueueQuestion(unittest.TestCase):
         self.assertEqual((req.runtime, req.guard, req.subject["ask_id"]), (ask.CARD_RUNTIME, out["ask_id"], out["ask_id"]))
         self.assertEqual([(a.id, a.label) for a in req.actions], [("approve", "Approve"), ("option-1", "Hold")])
         self.assertTrue(req.turn_on_action)
-        self.assertIn("Approve: merge it", req.message)
+        self.assertEqual(req.subject["choices"]["approve"], "merge it")
+        self.assertNotIn("Approve: merge it", req.message, "the button carries the choice")
         self.assertIn(f"**Sent:** card {out['card']}", out["sent_line"])
         self.assertTrue(out["outbox"], "the question is still held for its row")
         self.assertTrue(any("decision card" in ln for ln in ask.report_lines(out)))
@@ -305,7 +307,7 @@ class CardOutcomes(unittest.TestCase):
         self.assertFalse(any("asked as text" in ln for ln in lines), lines)
         self.assertTrue(any("could not be checked" in ln and "no text was sent" in ln for ln in lines), lines)
 
-    def test_a_definite_failure_texts_the_same_destination_with_the_link_and_rewrites_the_record(self):
+    def test_a_definite_failure_texts_the_same_destination_and_rewrites_the_record(self):
         ws = _ws("ag2space")
         m = _manager(ws)
         out = self._queued(ws, m)
@@ -315,7 +317,7 @@ class CardOutcomes(unittest.TestCase):
         self.assertTrue(out["proactive_file"].endswith(".to-ag2space.txt"), out["proactive_file"])
         body = (ws / "results" / out["proactive_file"]).read_text()
         self.assertIn("[channel: !dm:test.invalid]", body)
-        self.assertIn("https://row.test.invalid/7", body)
+        self.assertNotIn("https://row.test.invalid/7", body, "a row link in the text is previewed under it")
         held = json.loads(Path(out["outbox"]).read_text())
         self.assertEqual(held["sent"], out["sent_line"])
         self.assertIn(f"via {out['proactive_file']}", held["sent"])
@@ -386,10 +388,11 @@ class CardPointer(unittest.TestCase):
                                              manager=m, host="h")
         body = (ws / "results" / name).read_text()
         self.assertIn("Merge #7 into main?", body)
-        self.assertIn("decision card", body)
+        self.assertIn("as a card", body)
         self.assertIn("may not have arrived", body)
-        for word in ("Approve", "Hold", "merge it", "wait for the CLA", "Decline", "Reply here", "->"):
-            self.assertNotIn(word, body, f"pointer must carry no option or answer wording: {word}")
+        for word in ("Approve", "Hold", "merge it", "wait for the CLA", "Decline", "->"):
+            self.assertNotIn(word, body, f"pointer must carry no option wording: {word}")
+        self.assertIn("reply here in your own words", body, "never a dead end: the owner's words answer it")
         self.assertTrue(body.startswith("[dm-only]"))
 
     def test_a_pointer_that_cannot_be_written_is_reported(self):
@@ -746,7 +749,7 @@ class CrashBoundaries(unittest.TestCase):
         self.assertNotIn("**Sent:** card", row["body"])
         self.assertNotIn(out["ask_id"], self.held())
 
-    def test_the_fallback_carries_the_rows_own_link_not_the_one_guessed_before(self):
+    def test_the_fallback_text_links_no_row_and_the_report_names_the_rows_own_link(self):
         store, _ = room_db.room_store(self.ws)
         real = room_db.write_question
 
@@ -758,7 +761,8 @@ class CrashBoundaries(unittest.TestCase):
                 mock.patch.object(room_db, "write_question", write_with_new_link):
             out = self.ask(store)
         body = (self.ws / "results" / out["proactive_file"]).read_text()
-        self.assertIn("https://row.test.invalid/after-write", body)
+        self.assertNotIn("https://row.test.invalid", body)
+        self.assertEqual(out["link"], "https://row.test.invalid/after-write")
 
     def test_death_after_the_hold_before_the_row_rewrite_is_reconciled(self):
         self.child("with mock.patch('hitl.manager.HitlManager.create', side_effect=OSError('disk full')), \\\n"
@@ -962,8 +966,11 @@ class CardRoom(unittest.TestCase):
 
 class EdgePaths(unittest.TestCase):
     def test_the_card_carries_the_row_link(self):
-        msg = ask.card_message("Q?", None, "go", None, (), link="https://row.test.invalid/1")
-        self.assertIn("https://row.test.invalid/1", msg)
+        msg = ask.question_model("Q?", None, "go", None, (), link="https://row.test.invalid/1").card_message()
+        head, _, details = msg.partition("\n\n")
+        self.assertEqual(head, "Q?")
+        self.assertIn("Record: https://row.test.invalid/1", details.splitlines())
+        self.assertNotIn("Status", msg)
 
 if __name__ == "__main__":
     unittest.main()

@@ -112,6 +112,45 @@ def cmd_resolve(args: list) -> int:
     return 0 if ok else 1
 
 
+def task_headers(text: str) -> dict:
+    """The task file's `key: value` headers, up to its `task:` line."""
+    out = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if not sep or key.strip() == "task":
+            break
+        out[key.strip()] = value.strip()
+    return out
+
+
+def cmd_answered(args: list) -> int:
+    """The owner answered a question card by replying to it in their own words: close its row,
+    so they never have to. Only an owner-tier task that replies to an open card of ours closes one."""
+    ap = argparse.ArgumentParser(prog="pq.py answered")
+    ap.add_argument("--task-file", required=True)
+    ap.add_argument("--workspace", default=None, help=argparse.SUPPRESS)
+    opts = ap.parse_args(args)
+    import pending_questions_ask as ask  # noqa: PLC0415
+    import pending_questions_room_db as adapter  # noqa: PLC0415
+    try:
+        headers = task_headers(Path(opts.task_file).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as e:
+        print(f"not closed: the task file is unreadable ({e}); close it with `pq.py resolve <id> --answered`")
+        return 1
+    if (headers.get("access_tier") or "").lower() != "owner":
+        print("not closed: only the owner's own reply answers a question")
+        return 1
+    ws = _workspace(opts.workspace)
+    ask_id = ask.ask_for_reply(ws, headers.get("reply_to_event") or "")
+    if ask_id is None:
+        print("not closed: this message does not reply to an open question card; if it answers one, "
+              "close that one with `pq.py resolve <id> --answered` (`pq.py list` shows the ids)")
+        return 1
+    ok, msg = adapter.resolve(ws, ask_id, "Answered")
+    print(msg)
+    return 0 if ok else 1
+
+
 def cmd_clicks(args: list) -> int:
     import pending_questions_reader as reader  # noqa: PLC0415 — the core contract prints the choices
     return reader.main(["clicks", *_with_adapter(args)])
@@ -128,7 +167,7 @@ def cmd_remind(args: list) -> int:
 
 
 VERBS = {"ask": cmd_ask, "list": cmd_list, "reconcile": cmd_reconcile, "resolve": cmd_resolve,
-         "remind": cmd_remind, "clicks": cmd_clicks, "ack": cmd_ack}
+         "remind": cmd_remind, "clicks": cmd_clicks, "ack": cmd_ack, "answered": cmd_answered}
 
 
 def main(argv=None) -> int:
