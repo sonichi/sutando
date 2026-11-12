@@ -89,11 +89,25 @@ def group(label: str, rows: list) -> dict:
     return {"label": label, "rows": list(rows)}
 
 
+_MD_SPECIAL = re.compile(r"([\\`*_\[\]<>])")
+
+
+def md_escape(text: str) -> str:
+    """`text` as literal markdown on one line: emphasis, code and link characters escaped, so a name
+    cannot end a link label early or turn a URL into visible text."""
+    return _MD_SPECIAL.sub(r"\\\1", " ".join(str(text or "").split()))
+
+
+def md_url(url: str) -> str:
+    """`url` as a markdown link target, which ends at a space or an unbalanced paren."""
+    return url.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
+
+
 def body_line(text: str, *, link_label: str = "", url: str = "") -> str:
-    """The plain fallback: one line, any link labelled, never a bare URL."""
-    line = " ".join(_URL_RE.sub("", str(text or "")).split())
+    """The plain fallback: one line of literal text, any link labelled, never a bare URL."""
+    line = md_escape(_URL_RE.sub("", str(text or "")))
     if url:
-        line = f"{line} [{link_label or 'Open'}]({url})".strip()
+        line = f"{line} [{md_escape(link_label or 'Open')}]({md_url(url)})".strip()
     return line
 
 

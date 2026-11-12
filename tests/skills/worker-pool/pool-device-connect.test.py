@@ -18,6 +18,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -85,6 +86,19 @@ class ConnectFake:
         return self.backend.request(method, url, bearer=bearer, payload=payload, headers=headers, timeout=timeout)
 
 
+_LINK = re.compile(r"\[((?:\\.|[^\]\\])*)\]\(([^)\s]*)\)")
+
+
+def links(markdown: str) -> list:
+    """The (label, target) of every markdown link, a backslash-escaped bracket staying inside its label."""
+    return _LINK.findall(markdown)
+
+
+def visible(markdown: str) -> str:
+    """What a reader sees of `markdown`: each link shows its label, never its target; escapes unescaped."""
+    return re.sub(r"\\(.)", r"\1", _LINK.sub(lambda m: m.group(1), markdown))
+
+
 class Base(S.Base):
     def setUp(self):
         super().setUp()
@@ -121,8 +135,10 @@ class Add(Base):
         self.assertEqual(row["agent_mxid"], NEW_AGENT)
         self.assertEqual(C.secret_of(self.vault.store[row["token_ref"]]), fake.bearer)
         self.assertEqual(len(self.sent), 2)
-        self.assertIn("https://alpha-fixture.net/api/connect-page?code=U-", self.sent[0])
-        self.assertIn("It works until", self.sent[0])
+        self.assertIn("](https://alpha-fixture.net/api/connect-page?code=U-", self.sent[0])
+        self.assertIn("**[Approve Reviewer on alpha-fixture.net \u2192](", self.sent[0])
+        self.assertIn("Works for 15 minutes, until ", self.sent[0])
+        self.assertNotIn("code=", visible(self.sent[0]), "the code-bearing URL is only ever a link target")
         self.assertTrue(all(t.startswith("[dm-only]") for t in self.sent))
         self.assertNoSecret(fake, json.dumps({k: v for k, v in out.items() if k != "row"}), *self.sent)
 
@@ -131,7 +147,7 @@ class Add(Base):
         self.connect(fake, worker_label="pool worker 1")
         done = self.sent[-1]
         self.assertIn(NEW_AGENT, done)
-        self.assertIn("pool worker 1's own agent", done)
+        self.assertIn("**Done: pool worker 1 has its own agent**", done)
         self.assertIn("agents list", done)
         self.assertNoSecret(fake, done)
 
@@ -315,8 +331,66 @@ class Edges(Base):
         texts = [q.read_text() for q in queued]
         self.assertTrue(all(t.startswith("[dm-only]") for t in texts))
         self.assertTrue(any("/api/connect-page?code=U-" in t for t in texts))
-        self.assertTrue(any(t.startswith("[dm-only]\nDone:") for t in texts))
+        self.assertTrue(any(t.startswith("[dm-only]\n**Done:") for t in texts))
         self.assertNoSecret(fake, *texts)
+
+
+class Notes(unittest.TestCase):
+    """The owner's DM text, pinned: a labelled link, the server it is on, and a local, relative expiry."""
+    LINK = "https://dev.s.space/api/connect-page?code=vfy.Hxegupwi8-9qeuUqm44chU_Zq"
+
+    def at(self, hour, minute, day=12):
+        return time.mktime((2026, 11, day, hour, minute, 0, 0, 0, -1))
+
+    def test_the_link_is_a_labelled_markdown_link_naming_the_worker_agent_and_server(self):
+        note = dc.approval_note("Pylon-the-ops", "pylon", self.LINK, self.at(15, 52), now=self.at(15, 37))
+        self.assertEqual(note, "[dm-only]\n**Approve an agent for your worker Pylon-the-ops**\n\n"
+                               "It will work on dev.s.space as its own agent, \"pylon\".\n\n"
+                               f"**[Approve pylon on dev.s.space \u2192]({self.LINK})**\n\n"
+                               "Works for 15 minutes, until 3:52 PM today. Nothing is saved until you approve, "
+                               "and I check that the agent is yours before the worker uses it.")
+        self.assertNotIn("https://", visible(note))
+        self.assertNotIn("vfy.", visible(note))
+
+    def test_an_expiry_past_midnight_says_tomorrow_and_a_display_name_labels_the_link(self):
+        note = dc.approval_note("Pylon-the-ops", "pylon", self.LINK, self.at(0, 10, 13), now=self.at(23, 55),
+                                display_name="Pylon")
+        self.assertIn("Works for 15 minutes, until 12:10 AM tomorrow.", note)
+        self.assertIn("[Approve Pylon on dev.s.space \u2192](", note)
+
+    def test_a_rotate_asks_for_a_new_token_and_says_the_old_one_stops(self):
+        note = dc.approval_note("Pylon-the-ops", "pylon", self.LINK, self.at(16, 0), now=self.at(15, 59),
+                                rotated=True)
+        self.assertIn("**Approve a new token for Pylon-the-ops's agent**", note)
+        self.assertIn("the old one stops working once you approve", note)
+        self.assertIn("Works for 1 minute, until 4:00 PM today.", note)
+
+    def test_a_hostile_name_cannot_break_the_link_or_show_its_target(self):
+        evil = "x](http://evil) [y*_`\\"
+        for note in (dc.approval_note(evil, evil, self.LINK, self.at(15, 52), now=self.at(15, 37)),
+                     dc.approval_note(evil, "a", self.LINK, self.at(15, 52), now=self.at(15, 37), display_name=evil,
+                                      rotated=True)):
+            self.assertEqual([t for _, t in links(note)], [self.LINK])
+            for secret in ("code=", "https://", "vfy."):
+                self.assertNotIn(secret, visible(note))
+            self.assertIn(f"Approve {evil}", visible(note))
+        for note in (dc.expiry_note(evil, evil, self.at(15, 52), now=self.at(15, 53)),
+                     dc.done_note(evil, evil, "@a:s.space"), dc.done_note(evil, evil, "@a:s.space", rotated=True)):
+            self.assertEqual(links(note), [])
+            self.assertIn(evil, visible(note))
+
+    def test_a_link_target_cannot_end_early_on_a_space_or_paren(self):
+        note = dc.approval_note("w", "a", "https://s.space/p?x=(1) 2", self.at(16, 0), now=self.at(15, 45))
+        self.assertIn("](https://s.space/p?x=%281%29%202)**", note)
+
+    def test_the_expiry_and_done_notes_share_the_format(self):
+        lapsed = dc.expiry_note("Pylon-the-ops", "pylon", self.at(15, 52), now=self.at(15, 53))
+        self.assertTrue(lapsed.startswith("[dm-only]\n**The approval link for Pylon-the-ops expired**\n\n"))
+        self.assertIn("It expired at 3:52 PM today", lapsed)
+        done = dc.done_note("Pylon-the-ops", "pylon", NEW_AGENT)
+        self.assertTrue(done.startswith("[dm-only]\n**Done: Pylon-the-ops has its own agent**\n\n"))
+        rotated = dc.done_note("Pylon-the-ops", "pylon", NEW_AGENT, rotated=True)
+        self.assertTrue(rotated.startswith("[dm-only]\n**Done: Pylon-the-ops's agent has a new token**\n\n"))
 
 
 class Rotate(Base):
@@ -551,7 +625,7 @@ class Cards(CardsBase):
         self.connect(ConnectFake(self.backend), cards=dc.CardSink(refusing.execute, DM))
         self.assertEqual(len(self.sent), 2)
         self.assertIn("/api/connect-page?code=U-", self.sent[0])
-        self.assertTrue(self.sent[1].startswith("[dm-only]\nDone:"))
+        self.assertTrue(self.sent[1].startswith("[dm-only]\n**Done:"))
 
     def test_a_rotate_done_card_offers_only_the_dm(self):
         self.connect(ConnectFake(self.backend))
