@@ -286,10 +286,15 @@ only `HOME`, the workspace's `SUTANDO_WORKSPACE`, `SUTANDO_TEST_MODE` and
 most 1 s, then it exits 3). A non-zero exit, a timeout or unparseable output delivers the message.
 
 **Only an app's thread is checked.** The bridge first reads, in its own process, this skill's
-thread index `state/commons-app-builds/app-threads.json` (`{room_id: {thread_root: until}}`,
-written whenever the ledger notes or claims a fence: a thread stays an app's for 24 hours after
-the newest fence that named it). Any other thread, and anything unreadable, takes the ordinary
-path in its place in the round, with no check.
+thread index `state/commons-app-builds/app-threads.json` (`{room_id: {thread_root: newest fence
+time}}`). The ledger adds a thread whenever it notes or claims a fence, and it stays an app's
+thread at any age, as long as the app exists. An entry is removed when the thread is no app's:
+- a request in it fails because its app is gone (`app … is not in this room`);
+- or every request in it has failed (a build that never made an app, a question that lapsed).
+
+A done or still-open request keeps it. So the file holds one entry per thread with an app or an
+open request, never one per message, and does not grow with age. Any other thread, and anything
+unreadable, takes the ordinary path in its place in the round, with no check.
 
 **A new build's thread is indexed at its fence.** An owner-tier DM task whose text contains the
 fence's opening line (```` ```commons-app-build ````, one substring test, no parsing in the bridge)
@@ -323,10 +328,11 @@ outage holds both paths together):
 12 s covers the DM p99, the one-second timestamps and the client's gap. A fence later than that
 leaves its message `none`, delivered as conversation and never a build (only a fence builds).
 
-The cost: with the switch on, an owner message in an app's thread within 24 hours of a fence
-waits up to 3 s at the bridge. If it reaches the agent as `wait`, it is rechecked 12 s after it
-was first seen. That includes a plain "thanks", because nothing at intake marks which thread
-messages belong to a build.
+The cost: with the switch on, an owner message in **any** app's thread, at any age, waits up to
+the round's 3 s build-thread budget at the bridge. If it reaches the agent as `wait`, it is
+rechecked up to the settle time (12 s) after it was first seen. That includes a plain "thanks",
+because nothing at intake marks which thread messages belong to a build. With the switch off,
+nothing waits.
 
 The client does mark them (`space.ag2.commons.app_thread`: `request_id`, `page` or `app`, `asks`,
 `answers`), but the marker is dropped before the task. The backend's `event_to_task`
@@ -353,10 +359,8 @@ posts nothing anywhere. The checks run in this order:
    the slot was free, no question asked for it, within the settle time of the fence, answered or not). Write `[no-send]` and do nothing.
 3. `answer <request_id>`: a question is open for a request in this thread (switch on). Go on as
    `answer` does.
-4. `wait`: **switch on only**. This thread is an app thread one of the owner's fences named within
-   the last 24 hours (`ASK_TTL_S`, a request's own lifetime; older fences still tie messages
-   exactly, but no longer make a thread one to wait in), the sender is its owner, no fence names
-   this message yet, and it is younger than `BUILD_THREAD_SETTLE_SECONDS` (env, then the manifest;
+4. `wait`: **switch on only**. This thread is an app's thread (one of the owner's fences named
+   it, at any age), the sender is its owner, no fence names this message yet, and it is younger than `BUILD_THREAD_SETTLE_SECONDS` (env, then the manifest;
    default 12). With the switch off a message never waits. A change's message arrives **before** its fence, so wait that long, run
    `thread-task` again, and only then treat it as `none`. A message is never `wait` for longer than
    the settle time from when `thread-task` first saw it (recorded in the ledger), whatever its

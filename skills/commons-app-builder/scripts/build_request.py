@@ -324,6 +324,23 @@ class Ledger:
             kept = {k: old[k] for k in ("fence", "slot_used_by", "asked") if k in old}
             self._write(path, {"room_id": room_id, "request_id": request_id, "reply": reply,
                                "answered_at": time.time(), **kept})
+        self._settle_thread(room_id, (kept.get("fence") or {}).get("thread_root"), reply)
+
+    def _settle_thread(self, room_id: str, root: Optional[str], reply: str) -> None:
+        """Drop a thread from THREADS once it is no app's: its app is gone (a request failed on
+        that), or every request in it has failed. A done or still-open request keeps it."""
+        if not isinstance(root, str):
+            return
+        body = _reply_body(reply)
+        if body.get("status") != "failed":
+            return
+        if not _app_gone_reason(str(body.get("reason") or "")):
+            for e in self.entries(room_id):
+                if (e.get("fence") or {}).get("thread_root") != root:
+                    continue
+                if not e.get("reply") or _reply_body(e["reply"]).get("status") == "done":
+                    return
+        self.unindex_thread(room_id, root)
 
     def note_fence(self, fence: Dict[str, Any]) -> None:
         """Keep a fence's thread facts even when its plan failed before any claim, so the thread
@@ -341,12 +358,20 @@ class Ledger:
     THREADS = "app-threads.json"
 
     def index_thread(self, fence: Dict[str, Any]) -> None:
-        """Record a fence's thread in THREADS, {room_id: {thread_root: until}}, the one file the
-        gateway bridge reads in its own process to tell an app's thread from any other: a thread
-        stays an app's until ASK_TTL_S after the newest fence that named it. Best effort."""
+        """Record a fence's thread in THREADS, {room_id: {thread_root: newest fence time}}, the one
+        file the gateway bridge reads in its own process to tell an app's thread from any other.
+        A thread stays an app's at any age; _settle_thread removes it once it is no app's, so the
+        file holds one entry per app thread (or thread with an open request). Best effort."""
         room, root, at = fence.get("room_id"), fence.get("thread_root"), fence.get("at")
         if not (isinstance(room, str) and isinstance(root, str) and isinstance(at, (int, float))):
             return
+        self._edit_threads(lambda known: known.setdefault(room, {}).__setitem__(
+            root, max(known.get(room, {}).get(root, 0), at)))
+
+    def unindex_thread(self, room_id: str, root: str) -> None:
+        self._edit_threads(lambda known: (known.get(room_id) or {}).pop(root, None))
+
+    def _edit_threads(self, change) -> None:
         path = self.folder / self.THREADS
         try:
             self.folder.mkdir(parents=True, exist_ok=True)
@@ -356,12 +381,10 @@ class Ledger:
                     known = known if isinstance(known, dict) else {}
                 except (OSError, ValueError):
                     known = {}
-                now = time.time()
                 known = {r: {t: u for t, u in (ts or {}).items()
-                             if isinstance(u, (int, float)) and math.isfinite(u) and u > now}
+                             if isinstance(u, (int, float)) and not isinstance(u, bool) and math.isfinite(u)}
                          for r, ts in known.items() if isinstance(ts, dict)}
-                threads = known.setdefault(room, {})
-                threads[root] = max(threads.get(root, 0), at + ASK_TTL_S)
+                change(known)
                 self._write(path, {r: ts for r, ts in known.items() if ts})
         except LedgerBusy as error:
             print(f"build_request: {error}; the thread index was not updated", file=sys.stderr)
@@ -443,6 +466,15 @@ class _FileLock:
 
 
 # --------------------------------------------------------------------------- the template
+
+def app_gone(app_id: str) -> str:
+    """The failure reason when a request's app no longer exists: it ends the thread's index entry."""
+    return f"app {app_id} is not in this room"
+
+
+def _app_gone_reason(reason: str) -> bool:
+    return reason.startswith("app ") and reason.endswith(" is not in this room") and " " not in reason[4:-20]
+
 
 class ActionFailed(RuntimeError):
     """An Action refused, or the build cannot be planned; its message becomes the reason."""
@@ -828,7 +860,7 @@ def verify(step: Dict[str, Any], result: Dict[str, Any], answers: Optional[Dict[
         app_id, page = step["expect_app"]
         apps = {a.get("id"): a for a in _listed(result, "apps")}
         if app_id not in apps:
-            raise ActionFailed(f"app {app_id} is not in this room")
+            raise ActionFailed(app_gone(app_id))
         if apps[app_id].get("page") != page:
             raise ActionFailed(f"app {app_id} is not on page {page}")
         answers["$app_db"] = bare(apps[app_id].get("database"))
@@ -946,6 +978,15 @@ def bare(database: Optional[str]) -> Optional[str]:
     if isinstance(database, str) and database.startswith("db:"):
         return database[3:]
     return database
+
+
+def _reply_body(reply: str) -> Dict[str, Any]:
+    """A recorded reply's fence as a dict ({} when it has none)."""
+    try:
+        body = json.loads(str(reply).split(f"```{FENCE}\n", 1)[1].split("\n```", 1)[0])
+    except (IndexError, ValueError):
+        return {}
+    return body if isinstance(body, dict) else {}
 
 
 def completion(request_id: Optional[str], status: str, reason: str = "",
@@ -1101,9 +1142,9 @@ def thread_task(task_text: str, ledger: "Ledger", tasks_dir: Optional[Path] = No
        whose text is the fence's description (the client's own first message), once; closed once
        the request is answered or a question is asked;
     3. ("answer", id): the owner's answer to a request's open question (switch on);
-    4. ("wait", None): switch on, a thread one of the owner's fences named within ASK_TTL_S (a
-       request's own lifetime), no fence names it yet, and younger than settle_seconds(): a
-       change's message arrives before its fence. Run it again after;
+    4. ("wait", None): switch on, a thread one of the owner's fences named (an app's thread, at any
+       age), no fence names it yet, and younger than settle_seconds(): a change's message arrives
+       before its fence. Run it again after;
     5. ("none", None): an ordinary message.
     Every verdict but none needs the attested owner tier, the fence's own owner, the same room and
     the same thread root. Times are the gateway's `timestamp` headers; `now` is this host's clock."""
@@ -1151,10 +1192,9 @@ def _verdict(meta: Dict[str, str], line: str, ledger: "Ledger", tasks_dir: Optio
             if (asked.get("thread_root") == root and asked.get("owner") == owner
                     and not e.get("answer") and not e.get("reply")):
                 return "answer", e.get("request_id")
-    # 4. Switch on, a change's message comes before its fence: wait for it in a thread an app's
-    #    fence named within ASK_TTL_S, never past the settle time from when it was first seen.
-    live = [e for e in mine if now - (e["fence"].get("at") or 0) < ASK_TTL_S]
-    if thread_conversation() and live and message and at is not None and now - at < settle_seconds():
+    # 4. Switch on, a change's message comes before its fence: wait for it in an app's thread, at
+    #    any age, never past the settle time from when it was first seen.
+    if thread_conversation() and mine and message and at is not None and now - at < settle_seconds():
         if now - ledger.first_seen(room, message, now) < settle_seconds():
             return "wait", None
     return "none", None

@@ -353,8 +353,8 @@ def main():
     finally:
         rgb._INTAKE_MODE["deadline"] = None
         rgb._build_thread_verdict = real_verdict
-    check("an owner's thanks in a thread whose only fence is a week old is delivered at once, unchecked",
-          queued("task-thanks9") and time.monotonic() - began < 1.5 and calls9 == [])
+    check("switch off, an owner's thanks in a week-old app thread is checked once and delivered at once",
+          queued("task-thanks9") and time.monotonic() - began < 1.5 and len(calls9) == 1)
 
     # The first pass runs no check at all: every threaded owner task is taken after the acks.
     calls = []
@@ -529,6 +529,46 @@ def main():
     check("six fence DMs with a hung script: the first ack comes within the round's budget",
           acks and acks[0] < rgb.BUILD_THREAD_ROUND_S + 1.5, repr(acks[:1]))
     check("and every fence DM is delivered", all(queued(f"task-hf{i}") for i in range(1, 7)))
+
+    # 15. Switch on, an app's thread at any age: a change for an app last built 2 or 30 days ago
+    #     is deferred, waits, and is settled once its fence lands (sonichi's probe on 06144a36).
+    os.environ["BUILD_THREAD_CONVERSATION"] = "true"
+    try:
+        for days in (2, 30):
+            root_o = f"$rootOld{days}:s.space"
+            fenced(f"task-fence-old{days}", dict(fence(f"{days:02d}{days:02d}{days:02d}{days:02d}-7a4d-4e8b-9f61-2c5d8a0b7e14",
+                                                       description="A tracker", thread_root=root_o),
+                                                 timestamp=now_iso(-days * 86400)))
+            change_o = fence(f"{days:02d}{days:02d}aaaa-7a4d-4e8b-9f61-2c5d8a0b7e14", mode="refine", app_id="a1b2c3d4",
+                             thread_message=f"$chg{days}", description="make the button blue", thread_root=root_o)
+            timer = threading.Timer(0.3, write, (f"task-change-old{days}", change_o))
+            rgb._INTAKE_MODE["round"] += 1
+            rgb._INTAKE_MODE["deadline"] = time.monotonic() + 3.0
+            timer.start()
+            try:
+                write(f"task-msg-old{days}", thread_message(f"$chg{days}", text="make the button blue", root=root_o))
+            finally:
+                timer.join()
+                rgb._INTAKE_MODE["deadline"] = None
+            check(f"switch on, a change in a {days}-day-old app thread waits and is settled at intake",
+                  not queued(f"task-msg-old{days}") and settled(f"task-msg-old{days}"))
+    finally:
+        os.environ.pop("BUILD_THREAD_CONVERSATION", None)
+
+    # A removed app's thread stops being an app's: its next message takes the ordinary path, unchecked.
+    led_r = br.Ledger(tmp / "state" / "commons-app-builds")
+    rid_r = "16161616-7a4d-4e8b-9f61-2c5d8a0b7e14"
+    fenced("task-fence16", fence(rid_r, mode="refine", app_id="a1b2c3d4", thread_message="$none16",
+                                 description="a change", thread_root="$root16:s.space"))
+    led_r.record(ROOM, rid_r, br.completion(rid_r, "failed", br.app_gone("a1b2c3d4")))
+    calls16 = []
+    real_verdict = rgb._build_thread_verdict
+    rgb._build_thread_verdict = lambda *x, **k: calls16.append(x) or real_verdict(*x, **k)
+    try:
+        write("task-after16", thread_message("$a16", text="make the button blue", root="$root16:s.space"))
+    finally:
+        rgb._build_thread_verdict = real_verdict
+    check("a removed app's thread is ordinary again", queued("task-after16") and calls16 == [])
 
     print(f"commons-app-builder intake gate: {'FAIL' if failures else 'OK'} ({len(failures)} failed)")
     return 1 if failures else 0

@@ -434,18 +434,18 @@ def _build_thread_verdict(task: dict, tier: str, budget: float):
 
 
 def _known_app_thread(task: dict) -> bool:
-    """Whether the skill's own index (`app-threads.json`, {room: {thread_root: until}}) names this
-    message's thread as an app's: read in this process, no subprocess; anything unreadable is no."""
+    """Whether the skill's own index (`app-threads.json`, {room: {thread_root: newest fence time}})
+    names this message's thread as an app's, at any age: the skill removes a thread once it is no
+    app's. Read in this process, no subprocess; anything unreadable is no."""
     import json
     import math
     room = task.get("source_room_id") or task.get("channel_id")
     try:
         known = json.loads((WS / "state" / "commons-app-builds" / "app-threads.json").read_text(encoding="utf-8"))  # noqa: F821
-        until = known.get(room, {}).get(task.get("thread_root"))
+        at = known.get(room, {}).get(task.get("thread_root"))
     except (OSError, ValueError, AttributeError, TypeError):
         return False
-    return (isinstance(until, (int, float)) and not isinstance(until, bool) and math.isfinite(until)
-            and until > time.time())
+    return isinstance(at, (int, float)) and not isinstance(at, bool) and math.isfinite(at)
 
 
 def _build_thread_until(deadline: "float | None") -> float:

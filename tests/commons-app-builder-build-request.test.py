@@ -1634,10 +1634,21 @@ with tempfile.TemporaryDirectory() as tmp:
     check("switch-off-a-second-message-never-waits", tt(thanks, now=T0 + 65) == ("none", None))
     check("a-second-message-waits-while-young", ttw(thanks, now=T0 + 65) == ("wait", None))
     check("then-it-is-an-ordinary-message", ttw(thanks, now=T0 + 60 + br.settle_seconds()) == ("none", None))
-    # A thread whose fences are all older than a request's lifetime is no longer waited on.
-    stale = msg(tmp, "stale", "thanks, looks great", at=T0 + br.ASK_TTL_S + 5, mid="$b7")
-    check("switch-on-a-thread-with-only-a-day-old-fence-never-waits",
-          ttw(stale, now=T0 + br.ASK_TTL_S + 6) == ("none", None))
+    # Switch on, an app's thread is waited in at any age: a change for an app last built 2 or 30
+    # days ago still arrives before its fence (sonichi's probe on 06144a36). Switch off, never.
+    for days in (2, 30):
+        old = T0 + days * 86400
+        late_change = msg(tmp, f"old{days}", "make the button blue", at=old, mid=f"$old{days}")
+        check(f"switch-on-a-change-in-a-{days}-day-old-app-thread-waits", ttw(late_change, now=old + 1) == ("wait", None))
+        check(f"switch-off-it-never-waits-at-{days}-days", tt(late_change, now=old + 1) == ("none", None))
+        rid_old = f"{days:02d}{days:02d}e1e1-3434-4565-8787-909090909090"
+        (tasks / f"task-old{days}.txt").write_text(task(mode="refine", app_id="a1b2c3d4", thread_root=ROOT,
+                                                        thread_message=f"$old{days}", request_id=rid_old,
+                                                        description="blue", when=iso(old + 2)))
+        check(f"and-once-its-fence-lands-at-{days}-days-it-is-a-duplicate",
+              ttw(late_change, now=old + 3) == ("duplicate", rid_old))
+    ordinary = msg(tmp, "ordinary", "make the button blue", at=T0 + 2 * 86400, mid="$ord1", root="$chat:s.space")
+    check("an-ordinary-thread-stays-ordinary-at-any-age", ttw(ordinary, now=T0 + 2 * 86400 + 1) == ("none", None))
     before = msg(tmp, "before", "hello", at=T0 - 5, mid="$b0")
     check("a-message-before-the-build-fence-is-not-its", tt(before, now=T0 + 600) == ("none", None))
     # The build's copy is its copy even after the reply: the queue runs the fence first, so the
@@ -1743,8 +1754,7 @@ with tempfile.TemporaryDirectory() as tmp:
     idx_led.note_fence({"room_id": ROOM, "thread_root": "$rootI:s.space", "owner": OWNER, "at": now_i,
                         "mode": "build", "request_id": "c1c1c1c1-3434-4565-8787-909090909090"})
     threads = json.loads((idx_led.folder / br.Ledger.THREADS).read_text())
-    check("a-noted-fence-indexes-its-thread-for-a-requests-lifetime",
-          threads == {ROOM: {"$rootI:s.space": now_i + br.ASK_TTL_S}})
+    check("a-noted-fence-indexes-its-thread-with-its-time", threads == {ROOM: {"$rootI:s.space": now_i}})
     idx_led.claim(ROOM, "c2c2c2c2-3434-4565-8787-909090909090",
                   fence={"room_id": ROOM, "thread_root": "$rootJ:s.space", "owner": OWNER, "at": now_i,
                          "mode": "build", "request_id": "c2c2c2c2-3434-4565-8787-909090909090"})
@@ -1755,12 +1765,35 @@ with tempfile.TemporaryDirectory() as tmp:
     idx_led.note_fence({"room_id": ROOM, "thread_root": "$rootK:s.space", "owner": OWNER, "at": now_i,
                         "mode": "build", "request_id": "c3c3c3c3-3434-4565-8787-909090909090"})
     threads = json.loads((idx_led.folder / br.Ledger.THREADS).read_text())
-    check("an-expired-thread-is-pruned-on-the-next-write",
-          set(threads[ROOM]) == {"$rootI:s.space", "$rootJ:s.space", "$rootK:s.space"})
+    check("an-old-thread-is-never-pruned-by-age",
+          set(threads[ROOM]) == {"$rootI:s.space", "$rootJ:s.space", "$rootK:s.space", "$rootX:s.space"})
     idx_led.note_fence({"room_id": ROOM, "thread_root": "$rootI:s.space", "owner": OWNER, "at": now_i - 100,
                         "mode": "build", "request_id": "c4c4c4c4-3434-4565-8787-909090909090"})
-    check("an-older-fence-never-shortens-a-thread", json.loads((idx_led.folder / br.Ledger.THREADS).read_text())
-          [ROOM]["$rootI:s.space"] == now_i + br.ASK_TTL_S)
+    check("an-older-fence-never-moves-a-thread-back", json.loads((idx_led.folder / br.Ledger.THREADS).read_text())
+          [ROOM]["$rootI:s.space"] == now_i)
+
+    # An entry ends when the thread is no app's: a request failed because its app is gone, or every
+    # request in the thread failed. A done request keeps it.
+    rid_d, rid_e = "c7c7c7c7-3434-4565-8787-909090909090", "c8c8c8c8-3434-4565-8787-909090909090"
+    for rid_, root_ in ((rid_d, "$rootD:s.space"), (rid_e, "$rootE:s.space")):
+        idx_led.claim(ROOM, rid_, fence={"room_id": ROOM, "thread_root": root_, "owner": OWNER, "at": now_i,
+                                         "mode": "build", "request_id": rid_})
+    idx_led.record(ROOM, rid_d, br.completion(rid_d, "done", "", "Built.", app="a1b2c3d4"))
+    rid_d2 = "c9c9c9c9-3434-4565-8787-909090909090"
+    idx_led.claim(ROOM, rid_d2, fence={"room_id": ROOM, "thread_root": "$rootD:s.space", "owner": OWNER,
+                                       "at": now_i + 5, "mode": "refine", "request_id": rid_d2})
+    idx_led.record(ROOM, rid_d2, br.completion(rid_d2, "failed", "the page is too big"))
+    check("a-failed-change-keeps-a-built-apps-thread", "$rootD:s.space" in
+          json.loads((idx_led.folder / br.Ledger.THREADS).read_text())[ROOM])
+    rid_d3 = "cacacaca-3434-4565-8787-909090909090"
+    idx_led.claim(ROOM, rid_d3, fence={"room_id": ROOM, "thread_root": "$rootD:s.space", "owner": OWNER,
+                                       "at": now_i + 9, "mode": "refine", "request_id": rid_d3})
+    idx_led.record(ROOM, rid_d3, br.completion(rid_d3, "failed", br.app_gone("a1b2c3d4")))
+    check("a-removed-apps-thread-stops-being-an-apps", "$rootD:s.space" not in
+          json.loads((idx_led.folder / br.Ledger.THREADS).read_text())[ROOM])
+    idx_led.record(ROOM, rid_e, br.completion(rid_e, "failed", br.LAPSED))
+    check("a-thread-whose-only-request-lapsed-is-dropped", "$rootE:s.space" not in
+          json.loads((idx_led.folder / br.Ledger.THREADS).read_text())[ROOM])
 
     # A non-finite `until` is pruned on the next write; a held index lock skips the update, and says so.
     (idx_led.folder / br.Ledger.THREADS).write_text('{"%s": {"$rootInf:s.space": Infinity}}' % ROOM)
