@@ -78,7 +78,8 @@ class Redaction(unittest.TestCase):
         for given, want in table.items():
             self.assertEqual(owner_text.owner_line(given), want, given)
             self.assertEqual(owner_text.internals(owner_text.owner_line(given)), [], given)
-        for nothing_left in ("sutando-core · blocked-human", "hitl_ab12cd34ef56", HEX, ""):
+        self.assertEqual(owner_text.owner_line("card g2"), "card g2", "a short plain line is kept")
+        for nothing_left in ("sutando-core · blocked-human", HEX, "7 · 12", ""):
             self.assertEqual(owner_text.owner_line(nothing_left), owner_text.GENERIC_LINE, nothing_left)
 
     def test_ordinary_text_and_none_are_untouched(self):

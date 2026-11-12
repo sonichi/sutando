@@ -126,7 +126,7 @@ def owner_line(text: object, fallback: str = GENERIC_LINE) -> str:
     """The one line of `text` a notification or a text-only client shows: its first line with
     each internal token taken out; `fallback` only when too little is left to mean anything."""
     line = without_internals(headline(text))
-    return line if len(_MEANING.findall(line)) >= 2 and not internals(line) else fallback
+    return line if _MEANING.search(line) and not internals(line) else fallback
 
 
 def clock(epoch: float, now: Optional[float] = None) -> str:
