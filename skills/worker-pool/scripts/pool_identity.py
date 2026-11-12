@@ -18,6 +18,7 @@ worker, and posts nothing proactively. Retiring the worker (pool_manage retire) 
     python3 pool_identity.py [--workspace WS] provision-finish <worker> --claim-id ID --agent-id MXID [--lane INSTANCE]
     python3 pool_identity.py [--workspace WS] provision-abort <worker>
     python3 pool_identity.py [--workspace WS] retire-remote <worker> [--local-anyway]
+    python3 pool_identity.py [--workspace WS] card-reply --task-file PATH
 
 TOKEN is the agent's access token from its settings page in AG2 Space. Leave it out to type it
 at a hidden prompt, or pass '-' to read it from stdin; it is stored in the secret vault, never in
@@ -26,7 +27,11 @@ a file, and never printed. `add` shows what the token's gateway says before anyt
 `--device-flow` needs no pasted token either (pool_device_connect.py): the core starts s.space's
 device-connect flow for agent LABEL, sends the owner the approval link in their DM, waits until they
 approve it in a browser (or the link expires, which it reports), checks the agent and its owner, and
-saves the token in the vault. It prints one JSON line with the agent id and a status.
+saves the token in the vault. It prints one JSON line with the agent id and a status. The owner sees an
+approval card (the text note when no card can be posted); once the link expires, the card's "Get a new
+link" button replies "Get a new link for <worker>", and `card-reply` on that task starts the same flow again
+in the background, for the owner only; a click that matches no card this agent posted prints
+`forged_or_stale_click` with the one line to say, and nothing acts on it.
 
 The `provision-*` verbs need no pasted token (pool_provision.py). `provision-begin` prints the
 SHA-256 the `agent.create` Action takes and a suggested name. `provision-wait` makes that call as
@@ -46,6 +51,7 @@ _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parents[2]
 sys.path[:0] = [p for p in (str(_HERE), str(_REPO / "src")) if p not in sys.path]
 
+import agent_card
 import connections
 import pool_device_connect
 import pool_provision
@@ -94,10 +100,23 @@ def reseat_after_add(ws: Path, repo, wid: str) -> dict:
 
 
 def cmd_device_flow(args, ws: Path, *, rotate: bool) -> int:
+    """The device flow; a resend attempt (--resend-id) that ends without a new card says why and frees its button."""
+    resend_id = getattr(args, "resend_id", None) or ""
+    try:
+        rc, why = _device_flow(args, ws, rotate=rotate)
+    except Exception as e:
+        pool_device_connect.resend_failed(ws, args.worker, resend_id, f"it stopped ({type(e).__name__})")
+        raise
+    if rc != 0:
+        pool_device_connect.resend_failed(ws, args.worker, resend_id, why or "the approval flow did not start")
+    return rc
+
+
+def _device_flow(args, ws: Path, *, rotate: bool) -> tuple:
     wid = live_worker(ws, args.worker)
     if not args.label:
         print("pool_identity: --device-flow needs --label <the agent's name>", file=sys.stderr)
-        return 2
+        return 2, "it was started without the agent's name"
     label = str(((pr.load_roster(ws) or {}).get("workers") or {}).get(wid, {}).get("label") or args.worker)
     def start_lane(row):
         if args.no_start:
@@ -115,7 +134,7 @@ def cmd_device_flow(args, ws: Path, *, rotate: bool) -> int:
     except pool_device_connect.DeviceConnectError as e:
         print(f"pool_identity: {e}", file=sys.stderr)
         print(json.dumps({"status": e.status}, sort_keys=True))
-        return 1
+        return 1, str(e)
     launch = out.get("launch")
     started = launch is None or bool(launch.get("ok"))
     if not started:
@@ -125,7 +144,7 @@ def cmd_device_flow(args, ws: Path, *, rotate: bool) -> int:
     if not rotate and not args.no_start:
         line["seat"] = reseat_after_add(ws, args.repo, wid).get("result")
     print(json.dumps(line, sort_keys=True))
-    return 0 if started else 1
+    return (0, "") if started else (1, "")
 
 
 def cmd_add(args, ws: Path) -> int:
@@ -249,6 +268,34 @@ def cmd_retire_remote(args, ws: Path) -> int:
     return 0 if out["status"] in ("retired", "no_identity") else 1
 
 
+def cmd_card_reply(args, ws: Path) -> int:
+    """A click on a worker approval card, read from the task it arrived as; the owner's only. Any other
+    task prints agent_card's answer for it: a forged or stale click is refused in fixed words."""
+    try:
+        text = Path(args.task_file).read_text(encoding="utf-8")
+    except OSError as e:
+        print(json.dumps({"status": "refused", "why": f"the task file is unreadable ({type(e).__name__})"}))
+        return 2
+    headers, words = agent_card.reply_words(text)
+    try:
+        owner = str(pool_provision.core_lane(ws, None).get("owner_mxid") or "")
+    except pool_provision.ProvisionError:
+        owner = ""  # a card records its own lane; only one without it needs the core's owner
+    verdict = agent_card.click_verdict(headers, words, ws, agent_card.lane_owner(ws, owner))
+    other = agent_card.click_answer(verdict, words, (pool_device_connect.CARD_KIND,))
+    if other is not None:
+        print(json.dumps(other, sort_keys=True))
+        return 1
+    said = verdict.command
+    row = ((pr.load_roster(ws) or {}).get("workers") or {}).get(said.target)
+    if not isinstance(row, dict) or row.get("state") == "retired":
+        print(json.dumps({"status": "refused", "why": f"no live pool worker {said.target!r}"}, sort_keys=True))
+        return 2
+    out = pool_device_connect.resend(said.target, workspace=ws)
+    print(json.dumps(out, sort_keys=True))
+    return 0 if out["status"] == "started" else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="pool_identity", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -266,6 +313,7 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("--device-flow", action="store_true"); s.add_argument("--label", default=None)
         s.add_argument("--display-name", default=None); s.add_argument("--lane", default=None)
         s.add_argument("--base", default=None, help=argparse.SUPPRESS); s.add_argument("--no-start", action="store_true")
+        s.add_argument("--resend-id", default=None, help=argparse.SUPPRESS)
     s = sub.add_parser("remove"); s.add_argument("worker"); s.set_defaults(fn=cmd_remove)
     s = sub.add_parser("provision-begin"); s.add_argument("worker"); s.add_argument("--role", default=None)
     s.add_argument("--lane", default=None); s.set_defaults(fn=cmd_provision_begin)
@@ -282,6 +330,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("provision-abort"); s.add_argument("worker"); s.set_defaults(fn=cmd_provision_abort)
     s = sub.add_parser("retire-remote"); s.add_argument("worker"); s.add_argument("--local-anyway", action="store_true")
     s.set_defaults(fn=cmd_retire_remote)
+    s = sub.add_parser("card-reply"); s.add_argument("--task-file", required=True); s.set_defaults(fn=cmd_card_reply)
     return p
 
 
