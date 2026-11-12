@@ -119,7 +119,7 @@ class AuthFailureIsNeedsLogin(unittest.TestCase):
                         fire, _h = relay.should_escalate(signal, None)
                         self.assertTrue(fire)
                         msg = relay.compose_message(signal)
-                        self.assertIn("run /login", msg)
+                        self.assertIn("has to be signed in again", msg)
                         # Debounced: the same standing state does not re-fire.
                         self.assertFalse(relay.should_escalate(signal, _h)[0])
 
@@ -132,8 +132,8 @@ class AuthFailureIsNeedsLogin(unittest.TestCase):
 
         cases = (
             ("attach", lambda: {"socket": "/tmp/s.sock", "session": "core"},
-             "`tmux -S /tmp/s.sock attach -t core`"),
-            ("unreadable", boom, "the Runtime panel"),
+             "tmux -S /tmp/s.sock attach -t core"),
+            ("unreadable", boom, ""),
         )
         orig = relay._derive_backend
         try:
@@ -141,7 +141,10 @@ class AuthFailureIsNeedsLogin(unittest.TestCase):
                 with self.subTest(backend=name):
                     relay._derive_backend = fn
                     msg = relay.compose_message(signal)
-                    self.assertIn(f"run /login in the core terminal ({where})", msg)
+                    self.assertIn("signed in again", msg)
+                    self.assertNotIn("tmux", msg, "the command is a detail, not the notice")
+                    details = " | ".join(relay.compose_details(signal))
+                    self.assertEqual(f"open its terminal: {where}" in details, bool(where))
                     self.assertNotIn("restart.sh", msg)
         finally:
             relay._derive_backend = orig
