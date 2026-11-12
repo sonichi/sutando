@@ -487,7 +487,11 @@ def restart_on_new_login(workspace, repo, worker_id, *, runner=None, spawn=None)
     if capture.returncode != 0 or not sup.pane_gate.limit_holds(capture.stdout, sup.pane_gate.CLAUDE):
         return {"worker_id": worker_id, "outcome": "pane-changed",
                 "why": "it was busy again, so it was left as it is"}
-    sup.mark_relogin_down(workspace, worker_id)
+    try:
+        sup.mark_relogin_down(workspace, worker_id)
+    except Exception as e:  # noqa: BLE001 - unmarked, a killed seat could be stranded: never kill it
+        return {"worker_id": worker_id, "outcome": FAILED,
+                "why": f"its down mark could not be saved ({type(e).__name__}), so it was left running"}
     try:
         down = _sibling("pool_manage").take_down_held(workspace, worker_id, run, end_reason="crashed")
     except Exception as e:  # noqa: BLE001 - the seat is unpaused below, whatever the take-down raised
@@ -504,7 +508,11 @@ def restart_on_new_login(workspace, repo, worker_id, *, runner=None, spawn=None)
 def _confirmed(workspace, worker_id, out: dict) -> dict:
     """Bind a seat that came back to the account on disk now; leave any other outcome to be tried again."""
     if out["outcome"] == RECOVERED:
-        sup.confirm_new_login(workspace, worker_id, sup.current_account())
+        try:
+            sup.confirm_new_login(workspace, worker_id, sup.current_account())
+        except Exception as e:  # noqa: BLE001 - it is back; unbound, it is rebound when it next parks
+            print(f"pool_remedy: {worker_id} is back but its new login could not be saved "
+                  f"({type(e).__name__}: {e})", file=sys.stderr)
     return out
 
 
@@ -516,12 +524,21 @@ def _try_owner(workspace, prefix: str, text: str):
         return None
 
 
-def _left_for(workspace, worker_id, runner=None) -> str:
+def _left_for(workspace, worker_id, runner=None) -> str | None:
+    """What happens next to a seat that did not come back, for the owner's note; None when the owner
+    was already told it is down (each later failed try stays silent)."""
     ev = sup.load_state(workspace).workers.get(worker_id, ps.WorkerEvidence())
+    label = _label(workspace, worker_id)
     if ev.relogin_down and sup.probe_session(workspace, worker_id, runner=runner or subprocess.run) is False:
-        return "it is down, and a later sweep starts it again"
+        if ev.relogin_down_told:
+            return None
+        sup.tell_relogin_down(workspace, worker_id)
+        return ("it is down and not coming back on its own. I'll keep trying to start it about once an "
+                f"hour without writing again; to stop that, stop it (pool_manage.py stop {label}) or retire "
+                f"it (pool_manage.py retire {label}), or fix what stops it starting (its folder, its CLI) "
+                "and the next try starts it")
     if ev.relogin_attempts >= ps.RELOGIN_MAX_ATTEMPTS:
-        return f"no more automatic tries; restart it with: pool_manage.py reseat {_label(workspace, worker_id)}"
+        return f"no more automatic tries; restart it with: pool_manage.py reseat {label}"
     return "I'll try again on a later sweep"
 
 
@@ -541,10 +558,23 @@ def restart_new_logins(workspace, repo, worker_ids, *, runner=None, spawn=None) 
             return {w: {"worker_id": w, "outcome": "note-failed",
                         "why": "the owner's note could not be queued; nothing was restarted"} for w in worker_ids}
         sup.announce_relogin(workspace, account)
-    done = {w: restart_on_new_login(workspace, repo, w, runner=runner, spawn=spawn) for w in worker_ids}
+    done = {}
+    for w in worker_ids:
+        try:
+            done[w] = restart_on_new_login(workspace, repo, w, runner=runner, spawn=spawn)
+        except Exception as e:  # noqa: BLE001 - one seat's error never stops the others or the note
+            done[w] = {"worker_id": w, "outcome": FAILED, "why": f"an unexpected error ({type(e).__name__}: {e})"}
     back = [w for w, r in done.items() if r["outcome"] == RECOVERED]
-    left = [f"{_label(workspace, w)} ({r.get('why') or r['outcome']}; {_left_for(workspace, w, runner)})"
-            for w, r in done.items() if r["outcome"] != RECOVERED]
+    left = []
+    for w, r in done.items():
+        if r["outcome"] == RECOVERED:
+            continue
+        try:
+            next_step = _left_for(workspace, w, runner)
+        except Exception:  # noqa: BLE001 - the note still goes out
+            next_step = "I'll try again on a later sweep"
+        if next_step is not None:
+            left.append(f"{_label(workspace, w)} ({r.get('why') or r['outcome']}; {next_step})")
     if left:
         rest = " The rest are back." if back else ""
         _try_owner(workspace, "pool-new-login-failed", f"Not restarted on the new login: {'; '.join(left)}.{rest}")

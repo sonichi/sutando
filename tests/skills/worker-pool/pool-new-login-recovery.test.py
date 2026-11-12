@@ -126,7 +126,9 @@ class Pool(unittest.TestCase):
         raise AssertionError(f"unexpected process operation: {argv}")
 
     def spawn(self, workspace, repo, **kw):
-        wid = kw.get("existing_worker_id") or next(w for w in self.WORKERS if self.seat(w) not in self.alive)
+        # As spawn_worker does: the worker is the one whose session it resumes.
+        wid = (kw.get("existing_worker_id") or wi.worker_for_session(self.ws, kw.get("resume") or "")
+               or next(w for w in self.WORKERS if self.seat(w) not in self.alive))
         self.spawned.append((wid, kw.get("resume")))
         # As spawn_worker does: a new run, carrying the account it launched under.
         wi.start_incarnation(self.ws, wid, kw.get("resume"), tmux_socket=self.socket,
@@ -362,7 +364,8 @@ class NewLogin(Pool):
         rc, out = self.sweep()
         self.assertEqual((rc, out["recoveries"][mars]["outcome"]), (1, rem.FAILED))
         self.assertNotIn(self.seat(mars), self.alive, "the kill landed: the seat is down")
-        self.assertIn("it is down, and a later sweep starts it again", "".join(self.notes()))
+        self.assertIn("it is down and not coming back on its own", "".join(self.notes()))
+        self.assertIn("pool_manage.py retire Mars", "".join(self.notes()), "it names the way out")
         self.assertIs(sup.probe_session(self.ws, mars, runner=self.runner), False, "supervision still sees it")
         self.assertEqual(self.sweep_until(mars)[1]["outcome"], rem.FAILED, "tried again while down")
         self.assertEqual(self.sweep_until(mars)[1]["outcome"], rem.RECOVERED, "and it comes back")
@@ -373,6 +376,120 @@ class NewLogin(Pool):
         self.assertEqual((state.limit_account, state.relogin_down), (B, False))
         openers = [n for n in self.notes() if "I'm back on a new login" in n]
         self.assertEqual(len(openers), 1, "one opening note for the sign-in, whatever the tries")
+
+    def test_a_seat_that_never_starts_is_told_once_and_tried_hourly_for_good(self):
+        mars = next(iter(self.WORKERS))
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+
+        def never(workspace, repo, **kw):
+            raise rem.sw.SpawnRefused("its folder is gone")
+        self.spawn = never
+        tried_at = []
+        for _ in range(288):  # a day at the timer's cadence
+            _, out = self.sweep()
+            if out["decisions"].get(mars) == ps.RESTART_NEW_LOGIN:
+                tried_at.append(self.now)
+        gaps = [b - a for a, b in zip(tried_at, tried_at[1:])]
+        cap = ps.RELOGIN_DOWN_MAX_RETRY_S
+        self.assertTrue(all(b >= a for a, b in zip(gaps, gaps[1:])), f"the wait only grows: {gaps}")
+        self.assertEqual(max(gaps), cap, "and stops growing at the ceiling")
+        self.assertGreater(gaps.count(cap), 15, "an hour apart, for good")
+        self.assertNotIn(self.seat(mars), self.alive)
+        notes = self.notes()
+        self.assertEqual(len(notes), 2, f"one opener and one note that it is not coming back: {notes}")
+        self.assertEqual(sum("not coming back" in n for n in notes), 1)
+
+    def test_the_down_wait_doubles_from_the_first_failed_start(self):
+        mars = next(iter(self.WORKERS))
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+
+        def never(workspace, repo, **kw):
+            raise rem.sw.SpawnRefused("broken CLI")
+        self.spawn = never
+        tried_at = []
+        for _ in range(60):
+            _, out = self.sweep()
+            if out["decisions"].get(mars) == ps.RESTART_NEW_LOGIN:  # not the dead-seat ladder's own tries
+                tried_at.append(self.now)
+        gaps = [b - a for a, b in zip(tried_at, tried_at[1:])]
+        self.assertEqual(gaps[:6], [300.0, 600.0, 1200.0, 2400.0, 3600.0, 3600.0],
+                         "doubled per try from 300 s, then an hour apart")
+
+    def test_a_down_seat_seen_alive_drops_its_down_mark(self):
+        mars = next(iter(self.WORKERS))
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+
+        def never(workspace, repo, **kw):
+            raise rem.sw.SpawnRefused("broken CLI")
+        real = self.spawn
+        self.spawn = never
+        self.sweep()
+        ev = sup.load_state(self.ws).workers[mars]
+        self.assertEqual((ev.relogin_down, ev.relogin_down_told), (True, True))
+        self.spawn = real
+        real(self.ws, REPO, resume="s0")  # the owner starts it by hand
+        self.show(mars, MID_TURN)
+        self.sweep()
+        ev = sup.load_state(self.ws).workers[mars]
+        self.assertEqual((ev.relogin_down, ev.relogin_down_told), (False, False))
+        before = len(self.spawned)
+        for _ in range(4):
+            self.sweep()
+        self.assertEqual(len(self.spawned), before, "an alive seat is never restarted by the down rule")
+
+    def test_one_seats_unexpected_error_never_stops_the_others_or_the_note(self):
+        mars, baxter = list(self.WORKERS)
+        for w in (mars, baxter):
+            self.show(w, PARKED)
+        self.sweep()
+        self.account = B
+        real_recover = rem.recover
+
+        def mars_breaks(ws, repo, w, **kw):
+            if w == mars:
+                raise RuntimeError("boom")  # not SpawnRefused/OSError: an error nobody expected
+            return real_recover(ws, repo, w, **kw)
+        with patch.object(rem, "recover", side_effect=mars_breaks):
+            rc, out = self.sweep()
+        self.assertEqual(out["recoveries"][mars]["outcome"], rem.FAILED)
+        self.assertIn("RuntimeError", out["recoveries"][mars]["why"])
+        self.assertEqual(out["recoveries"][baxter]["outcome"], rem.RECOVERED, "the other seat still restarts")
+        self.assertTrue(any("Not restarted on the new login: Mars" in n for n in self.notes()))
+        self.assertNotIn(self.seat(mars), self.alive)
+        self.assertTrue(sup.load_state(self.ws).workers[mars].relogin_down, "and it is started again later")
+        self.assertEqual(self.sweep_until(mars)[1]["outcome"], rem.RECOVERED)
+
+    def test_a_down_mark_that_cannot_be_saved_kills_nothing(self):
+        mars = next(iter(self.WORKERS))
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+        with patch.object(sup, "mark_relogin_down", side_effect=OSError("read-only")):
+            _, out = self.sweep()
+        self.assertEqual(out["recoveries"][mars]["outcome"], rem.FAILED)
+        self.assertIn("left running", out["recoveries"][mars]["why"])
+        self.assertIn(self.seat(mars), self.alive, "unmarked, it is never taken down")
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.sweep_until(mars)[1]["outcome"], rem.RECOVERED, "a later sweep restarts it")
+
+    def test_a_confirmation_that_cannot_be_saved_still_restarts_the_rest(self):
+        mars, baxter = list(self.WORKERS)
+        for w in (mars, baxter):
+            self.show(w, PARKED)
+        self.sweep()
+        self.account = B
+        with patch.object(sup, "confirm_new_login", side_effect=OSError("read-only")):
+            _, out = self.sweep()
+        self.assertEqual({w: r["outcome"] for w, r in out["recoveries"].items()},
+                         {mars: rem.RECOVERED, baxter: rem.RECOVERED})
+        self.assertIn(self.seat(mars), self.alive)
+        self.assertIn(self.seat(baxter), self.alive)
 
     def test_a_take_down_that_breaks_after_the_kill_still_comes_back(self):
         mars = next(iter(self.WORKERS))

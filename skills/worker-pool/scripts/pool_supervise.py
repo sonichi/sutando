@@ -444,6 +444,7 @@ def load_state(workspace) -> ps.SupervisionState:
                 relogin_next_at=ev.get("relogin_next_at"),
                 relogin_target=ev.get("relogin_target"),
                 relogin_down=bool(ev.get("relogin_down")),
+                relogin_down_told=bool(ev.get("relogin_down_told")),
             )
     last = raw.get("last_sample_at")
     return ps.SupervisionState(
@@ -481,7 +482,8 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
                         "relogin_attempts": e.relogin_attempts,
                         "relogin_next_at": e.relogin_next_at,
                         "relogin_target": e.relogin_target,
-                        "relogin_down": e.relogin_down}
+                        "relogin_down": e.relogin_down,
+                        "relogin_down_told": e.relogin_down_told}
                     for w, e in state.workers.items()},
     }
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".pool-supervision.")
@@ -504,6 +506,11 @@ def launch_account(workspace, worker_id) -> str | None:
 def mark_relogin_down(workspace, worker_id) -> None:
     """Persist that a restart took `worker_id` down without a confirmed start (pool_supervision)."""
     save_state(workspace, ps.mark_relogin_down(load_state(workspace), worker_id))
+
+
+def tell_relogin_down(workspace, worker_id) -> None:
+    """Persist that the owner was told `worker_id` is down and not coming back (pool_supervision)."""
+    save_state(workspace, ps.tell_relogin_down(load_state(workspace), worker_id))
 
 
 def relogin_announced(workspace) -> str | None:

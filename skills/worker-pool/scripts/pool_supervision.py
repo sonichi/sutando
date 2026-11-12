@@ -134,6 +134,8 @@ class WorkerEvidence:
     # and whether a restart took the seat down without a confirmed start.
     relogin_target: str | None = None
     relogin_down: bool = False
+    # The owner was told this down seat is not coming back: later failed tries stay silent.
+    relogin_down_told: bool = False
 
 
 @dataclass(frozen=True)
@@ -207,8 +209,8 @@ def _new_login(ev: WorkerEvidence, obs: Observation, now: float, account: str | 
         return replace(ev, relogin_attempts=ev.relogin_attempts + 1, relogin_next_at=now + wait), True
     if obs.session_alive is not True:
         return ev, False
-    if ev.relogin_down:
-        ev = replace(ev, relogin_down=False)
+    if ev.relogin_down or ev.relogin_down_told:
+        ev = replace(ev, relogin_down=False, relogin_down_told=False)
     if not obs.limit_parked:
         if (ev.limit_account or ev.relogin_attempts) and obs.pane in (PANE_IDLE, PANE_WORKING):
             ev = replace(ev, limit_account=None, relogin_attempts=0, relogin_next_at=None, relogin_target=None)
@@ -235,12 +237,20 @@ def mark_relogin_down(state: SupervisionState, worker_id: str) -> SupervisionSta
     return replace(state, workers=workers)
 
 
+def tell_relogin_down(state: SupervisionState, worker_id: str) -> SupervisionState:
+    """The owner was told this down seat is not coming back; its later failed tries stay silent."""
+    ev = state.workers.get(worker_id, WorkerEvidence())
+    workers = dict(state.workers)
+    workers[worker_id] = replace(ev, relogin_down_told=True)
+    return replace(state, workers=workers)
+
+
 def confirm_new_login(state: SupervisionState, worker_id: str, account: str | None) -> SupervisionState:
     """The seat restarted on `account`: bind it there and end the episode, so it is not restarted again."""
     ev = state.workers.get(worker_id, WorkerEvidence())
     workers = dict(state.workers)
     workers[worker_id] = replace(ev, limit_account=account, relogin_attempts=0, relogin_next_at=None,
-                                 relogin_target=None, relogin_down=False,
+                                 relogin_target=None, relogin_down=False, relogin_down_told=False,
                                  limit_next_at=None, limit_attempts=0, limit_exhausted=False,
                                  limit_banner=None, limit_reset_at=None)
     return replace(state, workers=workers)

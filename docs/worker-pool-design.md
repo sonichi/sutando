@@ -356,28 +356,44 @@ turn in flight. With the same sustain and stale line, once per episode:
 
 **A new login is the one exception to "never restarted"** (owner ask, 2026-11-11): a
 seat parked on a provider limit and nothing else (`pane_gate.limit_holds`: no turn
-running, an empty composer) has its limit bound to the account it was first seen
-under (`limit_account` in `state/pool-supervision.json`; `core_limit_hold`'s digest of
-`.claude.json`'s non-secret identity fields). A seat first seen parked just after the
-owner signed in is bound to the account the pool read on the tick before
-(`last_account`), the one its limit was hit under. While it stays parked and another
-known account is on disk, the wait is over: the sweep decides `restart_new_login`,
-sends one line to the owner's DM naming the seats, then restarts each, leaving alone a
-seat under a pool suspension or whose pane no longer waits on the limit alone (a turn
-started); the take-down keeps its owed deliveries, the pause it takes is always lifted,
-and `recover` resumes its session and re-offers what was mid-work. Only a seat that
-comes back is bound to the new account (`confirm_new_login`); every other outcome keeps
-the old binding, so a later sweep tries again, at most `RELOGIN_MAX_ATTEMPTS` times
-with a doubling `RELOGIN_RETRY_S` backoff. A second line goes to the owner only for
-seats that did not come back, saying whether another try follows. A note that cannot
-be queued restarts nothing that sweep and never aborts it. The same account keeps
-waiting for the reset, an unreadable account on either side decides nothing, a paused
-seat is left paused, and a Codex seat is out of scope. The core coming back (its limit
-hold released or cleared, its account switched at launch, or its own `/login`
-recovery) asks for one immediate sweep per event (`src/pool_sweep_trigger.py`); the
-policy stays in the sweep. One gap stays: a seat that was already parked when this
-first ran, after the owner had already signed in, has no earlier reading to bind to
-and waits for its own reset, as before.
+running, an empty composer) has its limit bound to an account (`limit_account` in
+`state/pool-supervision.json`; `core_limit_hold`'s digest of `.claude.json`'s
+non-secret identity fields). The binding is the account its run launched under (each
+run records it: `account` on the incarnation, written by `spawn_worker`), so however
+late the seat parks after a sign-in it is bound to the account its process started
+with; a run from before that field existed falls back to the account the pool read on
+the tick before (`last_account`). While it stays parked and another known account is
+on disk, the wait is over: the sweep decides `restart_new_login`, sends one line to the
+owner's DM naming the seats (once per sign-in: `relogin_announced`), then restarts
+each, leaving alone a seat under a pool suspension or whose pane no longer waits on
+the limit alone (a turn started).
+
+A seat this rule kills always comes back. It is marked `relogin_down` before its
+take-down, and the take-down closes its runs `crashed`, not `killed` (the owner's
+stop), so supervision still reads a dead seat as dead. A seat that is down and
+`relogin_down` is started again by every later sweep, with no cap and a backoff that
+doubles up to `RELOGIN_DOWN_MAX_RETRY_S`, resuming its own session and keeping its
+owed deliveries, until a start is confirmed; seen alive, the mark clears. That covers
+a spawn failing after the kill, a take-down raising after it, and a suspension landing
+between the kill and the start. Only a seat that comes back is bound to the new
+account (`confirm_new_login`). A seat that is still up after a failed try (the kill
+not confirmed, the take-down raising before it) keeps its old binding and is tried
+again at most `RELOGIN_MAX_ATTEMPTS` times with a doubling `RELOGIN_RETRY_S` backoff;
+a sign-in to a third account starts that count again. The pause the take-down takes is
+always lifted. A second line goes to the owner only for seats that did not come back,
+saying whether another try follows; a seat that is down is named there once, with the
+way out (stop or retire it, or fix its folder or CLI), and its later failed tries stay
+silent (`relogin_down_told`). One seat's unexpected error never stops the others or
+the note, and a down mark that cannot be saved leaves the seat running: it is never
+taken down unmarked. A note that cannot be queued restarts nothing that
+sweep and never aborts it. The same account keeps waiting for the reset, an unreadable
+account on either side decides nothing, a seat the owner paused is left paused, and a
+Codex seat is out of scope. The core coming back (its limit hold released or cleared,
+its account switched at launch, or its own `/login` recovery) asks for one immediate
+sweep per event (`src/pool_sweep_trigger.py`, only where a pool roster exists); the
+policy stays in the sweep. One gap stays: a seat launched before runs recorded an
+account, already parked when this first ran after the owner had signed in, has no
+reading to bind to and waits for its own reset, as before.
 
 An expired login is the exception to the work-owed and sustain requirements: its
 banner asks for a `/login` card immediately, even with an empty inbox. On upgrade,
