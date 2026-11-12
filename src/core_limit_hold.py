@@ -379,6 +379,9 @@ def _launch_config_dir() -> Optional[str]:
         return None
 
 
+CLAUDE_PLANS = ("Claude Free", "Claude Pro", "Claude Max", "Claude Team", "Claude Enterprise")
+
+
 def account_label(config_dir: Optional[str]) -> Optional[str]:
     """How the owner tells this account apart, in fixed wording only: its plan as Anthropic names it
     ("Claude Max"), else "Claude account"; None when the CLI is signed in to nothing. Nothing the
@@ -392,7 +395,7 @@ def account_label(config_dir: Optional[str]) -> Optional[str]:
     if not isinstance(acct, dict) or not acct.get("accountUuid"):
         return None
     plan = str(acct.get("planDisplayName") or "")
-    return plan if re.fullmatch(r"Claude(?: [A-Z][A-Za-z0-9]{1,15}){1,3}", plan) else "Claude account"
+    return plan if plan in CLAUDE_PLANS else "Claude account"
 
 
 def current_account_label() -> Optional[str]:

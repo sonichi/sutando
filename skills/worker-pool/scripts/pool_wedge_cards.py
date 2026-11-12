@@ -409,15 +409,17 @@ def raise_pool_down(workspace, groups: list, *, manager=None) -> dict:
         card = active.get(gid)
         subject = {"source": SOURCE, "wedge": POOL_DOWN, "pool_down": g}
         if card is not None:
-            if (card.subject or {}).get("pool_down") != g:
+            before = (card.subject or {}).get("pool_down") or {}
+            if before != g:
                 with manager.store.locked():
                     cur = manager.get(card.id)
                     if cur is not None and not cur.terminal:
                         cur.message, cur.subject = _pool_body(g), subject
-                        cur.revision += 1  # re-projected: the owner's card shows the seats now
+                        if before.get("worker_ids") != g["worker_ids"]:
+                            cur.revision += 1  # re-projected only when its seats change, never each sweep
+                            updated.append(cur.id)
                         cur.updated_at = time.time()
                         manager.store.save(cur)
-                        updated.append(cur.id)
         elif seen[gid]["down"] >= POOL_DOWN_HOLD:
             # The remedy is the owner's, at the Mac: the one action opens the core's terminal for it.
             raised.append(manager.create(choice_request(

@@ -40,39 +40,46 @@ class Banner:
     reset_words: Optional[str] = None   # "3:05 PM" from "try again at 3:05 PM", else None
 
 
-_PROMPT = re.compile(r"^[›»](?:\s|$)")  # a prompt row the user sent: where a refused turn's cell hangs
 _ROW_GLYPH = re.compile(r"^\s*[◦•✔✗└├│⠀-⣿✻✶✳✢·]")  # a spinner, bullet or tool row, never a cell's own line
+MAX_BLANKS = 2  # blank lines between the cell and the composer
 
 
 def live_banner(capture: Optional[str]) -> Optional[Banner]:
-    """The Codex error cell the seat is stopped on, or None. Only the frame the CLI draws counts:
-    the composer last; one blank line above it; the cell, its "■ " row at column 0 and any lines
-    of its own indented two spaces (never a spinner, bullet or tool row); one blank line above
-    the cell; and above that the user's prompt it answered (or the top of the capture). A "■"
-    quoted in a log, a message or an assistant's text is not in that frame."""
+    """The Codex error cell the seat is stopped on, or None. It must be the last block before the
+    composer: up to MAX_BLANKS blank lines and one hint row may sit between them, never a spinner,
+    bullet or tool row (a turn still running). The cell is its "■ " row at column 0 and the lines
+    of its own below it, indented (a wrap may indent deeper). Above it is a blank line or the top
+    of the capture; what is above that (the prompt, tool rows, an assistant line, an older cell)
+    is any turn's own output. Codex draws history indented or under a glyph, so a "■" at column 0
+    that a log or a message printed sits right under its own row with no blank line between."""
     if not capture:
         return None
     lines = [_SGR.sub("", ln).rstrip() for ln in capture.splitlines()]
     composer = next((i for i in range(len(lines) - 1, -1, -1) if _COMPOSER.match(lines[i])), None)
-    if composer is None or composer < 2 or lines[composer - 1].strip():
+    if composer is None:
         return None
-    i = composer - 2
+    i, blanks, hint = composer - 1, 0, False
+    while i >= 0 and (not lines[i].strip() or (lines[i].startswith(" ") and not hint)):
+        if _ROW_GLYPH.match(lines[i]):
+            return None  # a turn is running under the cell
+        if not lines[i].strip():
+            blanks += 1
+        elif i - 1 >= 0 and not lines[i - 1].strip():
+            hint = True  # one hint row, set off by a blank line; one right under the cell is its own
+        else:
+            break
+        i -= 1
+    if blanks > MAX_BLANKS:
+        return None
     own = []
-    while i >= 0 and lines[i].startswith("  ") and not lines[i].startswith("   ") \
-            and lines[i].strip() and not _ROW_GLYPH.match(lines[i]):
+    while i >= 0 and lines[i].startswith("  ") and lines[i].strip() and not _ROW_GLYPH.match(lines[i]):
         own.insert(0, lines[i].strip())
         i -= 1
     cell = _CELL.match(lines[i]) if i >= 0 else None
     if cell is None:
         return None
-    if i > 0:
-        if lines[i - 1].strip():
-            return None
-        j = i - 2
-        while j >= 0 and lines[j].startswith("  ") and lines[j].strip() and not _ROW_GLYPH.match(lines[j]):
-            j -= 1
-        if j >= 0 and not _PROMPT.match(lines[j]):
-            return None  # it answers an assistant's or a tool's line, not the prompt: quoted text
+    if i > 0 and lines[i - 1].strip():
+        return None  # printed under its own row: a log or a message, not a cell
     text = " ".join([cell["text"].strip(), *own]).strip()
     for cause, pattern in _PATTERNS:
         if pattern.search(text):

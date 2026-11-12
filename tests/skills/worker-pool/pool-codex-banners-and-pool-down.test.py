@@ -120,19 +120,50 @@ class CodexBanners(unittest.TestCase):
 
     def test_only_the_cells_own_frame_counts(self):
         self.assertIsNone(cb.live_banner(f"› do it\n\n  ■ {LIMITS['pro']}\n\n{IDLE}"), "an indented marker")
-        assistant = f"› do it\n\n• Here is what the log says:\n\n■ {LIMITS['pro']}\n\n{IDLE}"
-        self.assertIsNone(cb.live_banner(assistant), "an assistant's line starting with the marker")
-        pasted = f"› do it\n\n• Ran cat codex.log\n  └ 3 lines\n■ {LIMITS['pro']}\n\n{IDLE}"
-        self.assertIsNone(cb.live_banner(pasted), "a log a tool printed")
-        self.assertIsNone(cb.live_banner(f"› do it\n\n■ {LIMITS['pro']}\n{IDLE}"), "no blank line above the composer")
-        spinner = f"› do it\n\n■ {LIMITS['pro']}\n  ◦ Working (3s • esc to interrupt) try again at 9:00 PM\n\n{IDLE}"
-        self.assertIsNone(cb.live_banner(spinner), "a spinner under the cell is never read into it")
-        self.assertEqual(cb.live_banner(f"■ {LIMITS['pro']}\n\n{IDLE}").cause, cb.USAGE_LIMIT,
-                         "the top of the capture may be the cell")
         self.assertIsNone(cb.live_banner(f"› do it\n\n    ■ {LIMITS['pro']}\n\n{IDLE}"), "a marker indented further")
-        self.assertIsNone(cb.live_banner(f"› do it\n\n■ {LIMITS['pro']}\n  and more\n{IDLE}"),
-                          "the cell's own lines run into the composer")
-        self.assertIsNone(cb.live_banner(f"› do it\n■ {LIMITS['pro']}\n\n{IDLE}"), "no blank line above the cell")
+        # Codex draws an assistant's message under its "• " row, its later lines indented: a line of it
+        # that starts with the marker is never at column 0.
+        for assistant in (f"› do it\n\n• Here is what the log says:\n  ■ {LIMITS['pro']}\n\n{IDLE}",
+                          f"› do it\n\n• ■ {LIMITS['pro']}\n\n{IDLE}"):
+            self.assertIsNone(cb.live_banner(assistant), "an assistant's line starting with the marker")
+        pasted = f"› do it\n\n• Ran cat codex.log\n  └ 3 lines\n■ {LIMITS['pro']}\n\n{IDLE}"
+        self.assertIsNone(cb.live_banner(pasted), "a log printed right under its tool row")
+        self.assertIsNone(cb.live_banner(f"› do it\n■ {LIMITS['pro']}\n\n{IDLE}"), "printed right under a row")
+        spinner = f"› do it\n\n■ {LIMITS['pro']}\n  ◦ Working (3s • esc to interrupt) try again at 9:00 PM\n\n{IDLE}"
+        self.assertIsNone(cb.live_banner(spinner), "a turn running under the cell")
+        apart = f"› do it\n\n■ {LIMITS['pro']}\n\n  ◦ Working (3s • esc to interrupt)\n\n{IDLE}"
+        self.assertIsNone(cb.live_banner(apart), "a spinner set off by a blank line is a running turn, not a hint")
+        self.assertIsNone(cb.live_banner(f"› do it\n\n ■ {LIMITS['pro']}\n  and more\n\n{IDLE}"),
+                          "one space in: not column 0")
+        tool = f"› do it\n\n■ {LIMITS['pro']}\n\n• Ran ls\n  └ a b\n\n{IDLE}"
+        self.assertIsNone(cb.live_banner(tool), "a tool row after the cell: the turn went on")
+        self.assertIsNone(cb.live_banner(f"■ {LIMITS['pro']}\n\n\n\n{IDLE}"), "three blank lines: not the frame")
+        self.assertIsNone(cb.live_banner(f"■ stream error: {LIMITS['pro']}\n\n{IDLE}"),
+                          "the message is the cell's own opening words, never quoted inside it")
+
+    def test_the_shapes_a_real_worker_cell_takes(self):
+        """Each shape a limited or signed-out worker shows (the review's seven), read as stopped."""
+        shapes = {
+            "mid-turn after tool output": f"› do it\n\n• Ran ls\n  └ a b\n\n■ {LIMITS['pro']}\n\n{IDLE}",
+            "mid-turn after an assistant line": f"› do it\n\n• I'll check the logs.\n\n■ {LIMITS['pro']}\n\n{IDLE}",
+            "resumed, no prompt visible": f"• Resumed the earlier session.\n\n■ {LIMITS['pro']}\n\n{IDLE}",
+            "a retry cell above it": f"› do it\n\n■ stream error: retrying 1/5 in 2s\n\n■ {LIMITS['pro']}\n\n{IDLE}",
+            "a hint row before the composer": f"› do it\n\n■ {LIMITS['pro']}\n\n  Tip: /status shows your usage\n{IDLE}",
+            "no blank line": f"› do it\n\n■ {LIMITS['pro']}\n{IDLE}",
+            "two blank lines": f"› do it\n\n■ {LIMITS['pro']}\n\n\n{IDLE}",
+        }
+        for name, capture in shapes.items():
+            with self.subTest(name):
+                self.assertEqual(cb.live_banner(capture).cause, cb.USAGE_LIMIT)
+        wrapped = ("› do it\n\n■ You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit\n"
+                   "    https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 3:05 PM.\n\n"
+                   f"{IDLE}")
+        got = cb.live_banner(wrapped)
+        self.assertEqual((got.cause, got.reset_words), (cb.USAGE_LIMIT, "3:05 PM"), "a wrap indented deeper is its own")
+        after_tool = f"› do it\n\n• Ran git push\n  └ done\n\n■ {SIGNED_OUT[0]}\n\n{IDLE}"
+        self.assertEqual(cb.live_banner(after_tool).cause, cb.SIGNED_OUT, "a sign-out after tool output")
+        retry_last = f"› do it\n\n■ {LIMITS['pro']}\n\n■ stream error: retrying 1/5 in 2s\n\n{IDLE}"
+        self.assertIsNone(cb.live_banner(retry_last), "the last cell is the retry: not stopped on the limit")
 
     def test_a_draft_in_the_composer_does_not_hide_the_limit(self):
         draft = f"\x1b[1m»\x1b[0m half typed\n\n{FOOT}\n"
@@ -157,6 +188,30 @@ class SupervisionReading(unittest.TestCase):
         self.assertEqual(pl.reset_at("Rate limit reached; try again in 20s.", now), now + 20)
         self.assertEqual(pl.reset_at("try again in 1.5 seconds", now), now + 1.5)
         self.assertEqual(pl.reset_at("try again in 250ms", now), now + 0.25)
+
+    def test_the_real_observation_turns_the_limit_wait_off_for_codex(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            (ws / "state").mkdir()
+            rows = {"a" * 32: {"state": "live", "label": "Mars", "runtime": "claude"},
+                    "c" * 32: {"state": "live", "label": "Reviewer", "runtime": "codex"}}
+            (ws / "state" / "roster.json").write_text(json.dumps({"workers": rows}))
+            wi.record_session(ws, "a" * 32, "s1", runtime="claude", relation=wi.RELATION_NEW)
+            wi.start_incarnation(ws, "a" * 32, "s1", tmux_socket="/tmp/x.sock", tmux_session=wi.tmux_session_name("a" * 32))
+            wi.create_worker(ws, runtime="codex", worker_id="c" * 32, tmux_socket="/tmp/x.sock")
+            screens = {wi.tmux_session_name("a" * 32): "  ⎿  You've hit your session limit · resets 9pm\n❯ \n",
+                       wi.tmux_session_name("c" * 32): pane(LIMITS["pro"])}
+
+            def tmux(argv, **kw):
+                name = argv[argv.index("-t") + 1].lstrip("=").split(":")[0] if "-t" in argv else ""
+                if "capture-pane" in argv:
+                    return subprocess.CompletedProcess(argv, 0, screens.get(name, ""), "")
+                if "inbox-holders" in argv:
+                    return subprocess.CompletedProcess(argv, 0, "4242 session\n", "")
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            obs = sup.observe(ws, 1_000_000.0, runner=tmux)
+        self.assertEqual((obs["c" * 32].pane, obs["c" * 32].limit_waits), (ps.PANE_LIMIT, False))
+        self.assertTrue(obs["a" * 32].limit_waits, "a Claude seat's limit wait is unchanged")
 
     def test_a_codex_limit_keeps_the_watcher_and_delivery_checks(self):
         def run(limit_waits):
@@ -187,6 +242,8 @@ class AccountLabels(unittest.TestCase):
             self.assertEqual(label(planDisplayName="Claude Max for a@b.co", accountUuid="u"), "Claude account")
             self.assertEqual(label(planDisplayName="sk-ant-***", accountUuid="u"), "Claude account")
             self.assertEqual(label(accountUuid="u"), "Claude account")
+            self.assertEqual(label(planDisplayName="Claude Ana Smith Jones", accountUuid="u"), "Claude account",
+                             "only a known plan name")
             self.assertIsNone(label(emailAddress="a@b.co"), "signed in to nothing")
         self.assertIsNone(clh.account_label("/no/such/dir"))
         self.assertIsNone(clh.account_label(None))
@@ -322,6 +379,13 @@ class PoolDown(unittest.TestCase):
         card = m.get(first["raised"][0])
         self.assertIn("All 3 Claude workers", card.message)
         self.assertGreater(card.revision, revision, "re-projected to the owner")
+        settled = card.revision
+        later = self.obs(**{a: {"pane": ps.PANE_LIMIT, "limit_reset_at": 9999.0}, b: {"pane": ps.PANE_LIMIT},
+                            e: {"pane": ps.PANE_LIMIT}})
+        quiet = wc.raise_pool_down(self.ws, wc.pool_down(self.ws, later, host="mac"), manager=m)
+        self.assertEqual((quiet["updated"], m.get(first["raised"][0]).revision), ([], settled),
+                         "the same seats with a new reset: kept current, never re-notified")
+        self.assertIn("It resets at", m.get(first["raised"][0]).message)
         one = self.obs(**{a: {"pane": ps.PANE_LIMIT}, b: {"paused": True}, e: {"paused": True}})
         alone = wc.raise_pool_down(self.ws, wc.pool_down(self.ws, one, host="mac"), manager=m)
         self.assertEqual(alone["closed"], [], "one sweep up closes nothing yet")
