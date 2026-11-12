@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -36,7 +37,9 @@ MIN_CODEX = (0, 160, 1)
 SANDBOXES = ("read-only", "workspace-write")
 ENV_KEEP = ("PATH", "HOME", "USER")
 REQUIRED_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR")
-CONFIG_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR", "CODEX_HOME", "SANDBOX", "ALLOW_NON_OWNER", "MODEL") + cb.CONFIG_KEYS
+CONFIG_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR", "CODEX_HOME", "SANDBOX", "ALLOW_NON_OWNER", "MODEL",
+               "RESUME_THREAD") + cb.CONFIG_KEYS
+THREAD_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 LOCAL = Shape(name=SHAPE, command=COMMAND, description="the Codex connector as an s.space agent",
               cli="Codex CLI", min_version=MIN_CODEX, version_anchor=r"^codex",
               version_note="the app-server stdio shape was measured there", required_keys=REQUIRED_KEYS,
@@ -87,7 +90,20 @@ def connector_argv(cfg: dict, root: str, root_fd: int) -> list:
         argv.append("--allow-non-owner")
     if cfg.get("MODEL"):
         argv += ["--model", cfg["MODEL"]]
+    if cfg.get("RESUME_THREAD"):
+        argv += ["--resume-thread", cfg["RESUME_THREAD"]]
     return argv
+
+
+def resume_thread_problem(thread: str, codex_home: str) -> str:
+    """'' when `thread` names a Codex conversation saved under the agent's CODEX_HOME (its sessions/
+    rollouts, where the host puts the owner's conversation it continues), else why not."""
+    if not THREAD_ID_RE.match(thread or ""):
+        return f"--resume-thread {thread!r} is not a Codex conversation id"
+    home = Path(codex_home or os.path.join(os.path.expanduser("~"), ".codex"))
+    if not any((home / "sessions").glob(f"**/rollout-*-{thread}.jsonl")):
+        return f"no Codex conversation {thread} under {home / 'sessions'}: put it there before install"
+    return ""
 
 
 def login_problem(cfg: dict, run_=subprocess.run) -> str:
@@ -172,11 +188,17 @@ def install(args) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     bridge = cb.bridge_shape(local)
+    codex_home = str(Path(args.codex_home).expanduser().resolve()) if args.codex_home else ""
+    resume = getattr(args, "resume_thread", None) or ""
+    problem = resume_thread_problem(resume, codex_home) if resume else ""
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
     values = {"CODEX": os.path.abspath(codex), "INBOX_DIR": str(Path(root) / "tasks"),
               "RESULTS_DIR": str(Path(root) / "results"),
               "CODEX_HOME": str(Path(args.codex_home).expanduser().resolve()) if args.codex_home else "",
               "SANDBOX": args.sandbox, "ALLOW_NON_OWNER": "1" if args.allow_non_owner else "",
-              "MODEL": args.model or "", "AGENT_ID": where["agent_id"], "BRIDGE": mode if mode != EXTERNAL else "",
+              "MODEL": args.model or "", "RESUME_THREAD": resume, "AGENT_ID": where["agent_id"], "BRIDGE": mode if mode != EXTERNAL else "",
               "TOKEN_ENV_FILE": where["token_file"], "TOKEN_VAULT_KEY": "",
               "BRIDGE_STATE_DIR": str(cb.bridge_home(root) / "state") if mode != EXTERNAL else ""}
     if args.sandbox == "workspace-write":
@@ -369,6 +391,9 @@ def session_options(p) -> None:
     p.add_argument("--allow-non-owner", action="store_true",
                    help="serve non-owner senders without collaborator access too, on an ephemeral read-only thread")
     p.add_argument("--model", help="the model for every turn (default: the connector's)")
+    p.add_argument("--resume-thread", metavar="UUID",
+                   help="continue this Codex conversation (saved under --codex-home's sessions/) in the owner's "
+                        "DM with the agent, as `codex resume <id>` does; every other room starts a new one")
 
 
 def agent_option(p):

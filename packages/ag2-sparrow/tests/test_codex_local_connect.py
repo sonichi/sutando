@@ -487,6 +487,30 @@ class Install(Base):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             cli.main(["install", "--work", str(self.work), "--sandbox", "danger-full-access"])
 
+    def test_resume_thread_is_checked_recorded_and_handed_to_the_connector(self):
+        thread = "019a1b70-4175-7721-8b53-5c79b079372d"
+        home = self.home / "agent-codex"
+        rc, _, err = self.install_with(self.runner(), False, "--codex-home", str(home), "--resume-thread", thread)
+        self.assertEqual(rc, 2, "not saved there yet")
+        self.assertIn(f"no Codex conversation {thread}", err)
+        self.assertFalse(cli.config_path().exists(), "refused before anything is written")
+        rc, _, err = self.install_with(self.runner(), False, "--resume-thread", "../etc")
+        self.assertEqual(rc, 2)
+        self.assertIn("is not a Codex conversation id", err)
+        day = home / "sessions" / "2026" / "11" / "12"
+        day.mkdir(parents=True)
+        (day / f"rollout-2026-11-12T03-00-00-{thread}.jsonl").write_text("{}\n")
+        runner = self.runner()
+        rc, out, err = self.install_with(runner, False, "--codex-home", str(home), "--resume-thread", thread)
+        self.assertEqual(rc, 0, out + err)
+        cfg = cm.read_config(cli.config_path())
+        self.assertEqual(cfg["RESUME_THREAD"], thread)
+        self.assertEqual(cli.connector_argv(cfg, str(self.work), 7)[-2:], ["--resume-thread", thread])
+        rc, out, err = self.install_with(runner, False, "--codex-home", str(home))
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn("--resume-thread", cli.connector_argv(cm.read_config(cli.config_path()), str(self.work), 7),
+                         "a reinstall without it starts fresh")
+
     def test_install_refuses_an_old_codex_before_writing_anything(self):
         (self.home / "codex-version").write_text("0.157.0")
         rc, _, err = self.install()
