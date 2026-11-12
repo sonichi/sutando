@@ -48,6 +48,21 @@ _ROOM_RE = re.compile(r"^![^:\s]+:\S+$")
 # A bare database id: the backend's DATABASE pattern (actions/commons/reads.py) without "db:".
 _DB_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,119}$")
 _APP_RE = re.compile(r"^[A-Za-z0-9_.:@-]{1,80}$")
+_EVENT_RE = re.compile(r"^\$[A-Za-z0-9_\-+/=.:]{1,254}$")  # a Matrix event id
+
+ASK_TTL_S = 24 * 3600  # an unanswered question fails its request after this
+WAITING = 6  # plan's exit while the owner's answer is awaited
+_MANIFEST = Path(__file__).resolve().parents[1] / "manifest.json"
+
+
+def thread_conversation() -> bool:
+    """The skill's switch (manifest config BUILD_THREAD_CONVERSATION, default off): when on, a
+    request naming its app thread is also spoken about there. Off, nothing reads the thread."""
+    try:
+        config = json.loads(_MANIFEST.read_text(encoding="utf-8")).get("config") or {}
+    except (OSError, ValueError, AttributeError):
+        return False
+    return config.get("BUILD_THREAD_CONVERSATION") is True
 
 # The skill's own folder, for its templates/; not the workspace.
 SKILL_DIR = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
@@ -154,6 +169,9 @@ def validate(data: Dict[str, Any]) -> Dict[str, Any]:
     template = text("template", required=False)
     if template is not None and template not in TEMPLATES:
         raise RequestError("`template` must be one of " + ", ".join(TEMPLATES))
+    thread_root = text("thread_root", required=False)
+    if thread_root is not None and not _EVENT_RE.match(thread_root):
+        raise RequestError("`thread_root` is not an event id")
     app_id = text("app_id", required=False)
     if mode == "refine" and app_id is None:
         raise RequestError("`app_id` is required to refine")
@@ -161,7 +179,7 @@ def validate(data: Dict[str, Any]) -> Dict[str, Any]:
         raise RequestError("`app_id` is not an app id")
     return {"v": VERSION, "request_id": request_id, "mode": mode, "description": description,
             "room_id": room_id, "page": page, "database": database, "template": template,
-            "app_id": app_id}
+            "app_id": app_id, "thread_root": thread_root}
 
 
 def parse(text: str) -> Dict[str, Any]:
@@ -212,7 +230,8 @@ class Ledger:
 
     def claim(self, room_id: str, request_id: str,
               now: Optional[float] = None) -> Tuple[str, Optional[str]]:
-        """("claimed", None), ("done", reply) or ("busy", None)."""
+        """("claimed", None), ("done", reply), ("busy", None), ("asked", None) while the owner's
+        answer to its question is awaited, or ("expired", None) once that wait is over."""
         now = time.time() if now is None else now
         path = self._path(room_id, request_id)
         with self._locked(path.parent):
@@ -220,6 +239,12 @@ class Ledger:
                 entry = self.recorded(room_id, request_id)
                 if entry and entry.get("reply"):
                     return "done", entry["reply"]
+                if entry and entry.get("asked") and not entry.get("answer"):
+                    return ("asked" if now - entry["asked"]["at"] < ASK_TTL_S else "expired"), None
+                if entry and entry.get("answer") and not entry.get("resumed"):
+                    # The owner answered: this run takes the request up again, once.
+                    self._write(path, dict(entry, claimed_at=now, resumed=True))
+                    return "claimed", None
                 # Unreadable counts as busy until it ages out: only a dead claim is taken over.
                 started = entry.get("claimed_at") if entry else None
                 if not isinstance(started, (int, float)):
@@ -228,6 +253,44 @@ class Ledger:
                     return "busy", None
             self._write(path, {"room_id": room_id, "request_id": request_id, "claimed_at": now})
             return "claimed", None
+
+    def ask(self, room_id: str, request_id: str, *, thread_root: str, owner: str, question: str,
+            task_text: str, now: Optional[float] = None) -> bool:
+        """Turn this run's claim into one question awaiting the owner in the thread; False when the
+        request already asked one (a restart never asks twice) or is not this run's to ask."""
+        now = time.time() if now is None else now
+        path = self._path(room_id, request_id)
+        with self._locked(path.parent):
+            entry = self.recorded(room_id, request_id) or {}
+            if entry.get("reply") or entry.get("asked") or "claimed_at" not in entry:
+                return False
+            self._write(path, dict(entry, asked={"thread_root": thread_root, "owner": owner,
+                                                 "question": question, "at": now}))
+            path.with_suffix(".task.txt").write_text(task_text, encoding="utf-8")
+            return True
+
+    def answer(self, room_id: str, thread_root: str, owner: str, text: str,
+               now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """The open question this room's thread holds, answered by its owner: the request it
+        belongs to, now ready to be taken up again; None when there is none to answer."""
+        now = time.time() if now is None else now
+        room = self.folder / hashlib.sha256(room_id.encode("utf-8")).hexdigest()[:16]
+        if not room.is_dir():
+            return None
+        with self._locked(room):
+            for path in sorted(room.glob("*.json")):
+                try:
+                    entry = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                asked = entry.get("asked") or {}
+                if (asked.get("thread_root") == thread_root and asked.get("owner") == owner
+                        and not entry.get("answer") and not entry.get("reply")
+                        and now - asked.get("at", 0) < ASK_TTL_S):
+                    self._write(path, dict(entry, answer=text, answered_at=now))
+                    return {"request_id": entry["request_id"], "answer": text,
+                            "question": asked.get("question"), "task_file": str(path.with_suffix(".task.txt"))}
+        return None
 
     def record(self, room_id: str, request_id: str, reply: str) -> None:
         path = self._path(room_id, request_id)
@@ -607,6 +670,8 @@ def execute(steps: List[Dict[str, Any]], call: Callable[[Dict[str, Any]], Dict[s
         try:
             result = call(concrete) or {}
         except ActionFailed as error:
+            if step.get("best_effort"):
+                continue  # a line in the thread; the DM answer stays the source of truth
             raise ActionFailed(_partial(str(error), written)) from None
         if step["action"] in ("room.commons.pages.replace", "room.commons.pages.append"):
             written = True
@@ -785,9 +850,17 @@ def build(task_text: str, call: Callable[[Dict[str, Any]], Dict[str, Any]],
         if state == "busy":
             return completion(request["request_id"], "failed",
                               "this request is already being built")
+        if state == "asked":
+            return ""  # waiting on the owner's answer in the thread: nothing to say yet
+        if state == "expired":
+            reply = lapsed(request, ledger)
+            _post_result(request, reply, call)
+            return reply
     try:
         page_html, schema, name = build_inputs(request, adaptation)
-        answers = execute(with_operation_ids(request["request_id"], plan(request, page_html, schema, name)), call)
+        start = adaptation.get("thread_start") or f"Building {name or 'the app'}…"
+        steps = with_operation_ids(request["request_id"], with_thread_start(request, plan(request, page_html, schema, name), start))
+        answers = execute(steps, call)
         database = request.get("database") or answers.get("$db") or answers.get("$app_db")
         app_id = answers.get("$app") or request.get("app_id")
         verb = "Updated" if request["mode"] == "refine" else "Built"
@@ -801,10 +874,98 @@ def build(task_text: str, call: Callable[[Dict[str, Any]], Dict[str, Any]],
         reply = completion(request["request_id"], "failed", f"the build failed unexpectedly ({type(error).__name__})")
     if ledger is not None:
         ledger.record(request["room_id"], request["request_id"], reply)
+    _post_result(request, reply, call)
     return reply
 
 
+LAPSED = "the question in the app's thread went unanswered for 24 hours"
+
+
+def lapsed(request: Dict[str, Any], ledger: "Ledger") -> str:
+    """A question nobody answered in time: the request fails, recorded like any answer."""
+    reply = completion(request["request_id"], "failed", LAPSED)
+    ledger.record(request["room_id"], request["request_id"], reply)
+    return reply
+
+
+def answer_of(thread_task: str, ledger: "Ledger") -> Optional[Dict[str, Any]]:
+    """The owner's answer to an open question, read off a message in that app's thread; None for
+    anyone else's message, another thread, or no open question. Only the agent's own owner counts:
+    the attested owner tier, the same room and the same thread root as the question."""
+    if not thread_conversation():
+        return None
+    meta = headers(thread_task)
+    owner, root, room = meta.get("user_id", ""), meta.get("thread_root", ""), meta.get("source_room_id", "")
+    if meta.get("access_tier") != "owner" or not owner.startswith("@") or not _EVENT_RE.match(root) or not room:
+        return None
+    text = _message_text(thread_task)
+    return ledger.answer(room, root, owner, text) if text else None
+
+
+def _message_text(task_text: str) -> str:
+    """The message's own words: the task line, less the gateway's reply context and a mention."""
+    line = next((ln[len("task:"):].strip() for ln in task_text.splitlines() if ln.startswith("task:")), "")
+    line = re.sub(r"\[AG2 Space reply context.*?\[End AG2 Space reply context\]", "", line).strip()
+    return re.sub(r"^@\S+\s*", "", line).strip()[:2000]
+
+
+def result_line(request: Dict[str, Any], reply: str) -> Optional[Dict[str, Any]]:
+    """The DM reply's own human line, again in the app's thread (best effort)."""
+    body = json.loads(reply.split(f"```{FENCE}\n", 1)[1].split("\n```", 1)[0])
+    return thread_post(request, reply.split("\n\n", 1)[0], app_id=body.get("app_id"))
+
+
+def _post_result(request, reply, call) -> None:
+    post = result_line(request, reply)
+    if post is not None:
+        try:
+            call(dict(post, operation_id=f"cab-{request['request_id']}-result"))
+        except Exception:  # noqa: BLE001 - the thread is best effort; the DM reply is recorded
+            pass
+
+
 # --------------------------------------------------------------------------- CLI
+
+def _thread_command(command: str, text: str, argv: List[str], ledger: "Ledger") -> int:
+    """ask / answer / thread-line. Steps print as a JSON list (empty when the switch is off or the
+    request names no thread), each to run like a plan step."""
+    if command == "answer":
+        found = answer_of(text, ledger)
+        if found is None:
+            # Not the owner's answer to an open question here: the agent posts nothing.
+            print("build_request: no open question this message answers", file=sys.stderr)
+            return 1
+        print(json.dumps(found, ensure_ascii=False))
+        return 0
+    try:
+        request = parse(text)
+    except RequestError as error:
+        print(f"build_request: {error}", file=sys.stderr)
+        return 2
+    if command == "ask":
+        question = _flag(argv, "--question") or ""
+        if not question.strip():
+            raise SystemExit("build_request: ask needs --question")
+        if not thread_root_of(request):
+            print("build_request: this request has no app thread to ask in", file=sys.stderr)
+            return 2
+        if not ledger.ask(request["room_id"], request["request_id"], thread_root=request["thread_root"],
+                          owner=request["owner"], question=question, task_text=text):
+            print("[]")
+            return WAITING  # already asked, or not this run's claim: never a second question
+        post = thread_post(request, question, asks=True)
+        print(json.dumps([dict(post, operation_id=f"cab-{request['request_id']}-ask")], ensure_ascii=False))
+        return 0
+    if "--result" in argv:
+        entry = ledger.recorded(request["room_id"], request["request_id"]) or {}
+        post = result_line(request, entry["reply"]) if entry.get("reply") else None
+        op = f"cab-{request['request_id']}-result"
+    else:
+        post = thread_post(request, _flag(argv, "--line") or "")
+        op = f"cab-{request['request_id']}-line-{abs(hash(_flag(argv, '--line') or '')) % 10**8}"
+    print(json.dumps([dict(post, operation_id=op)] if post else [], ensure_ascii=False))
+    return 0
+
 
 def _flag(argv: List[str], name: str) -> Optional[str]:
     """The value after --name, or None; a flag given last with no value is a usage error."""
@@ -853,8 +1014,9 @@ def _check(args: List[str]) -> int:
 
 
 def main(argv: List[str]) -> int:
-    if len(argv) < 2 or argv[0] not in ("parse", "plan", "reply", "check", "chunks"):
-        print("usage: build_request.py parse|plan|reply|check|chunks <file> [options]",
+    if len(argv) < 2 or argv[0] not in ("parse", "plan", "reply", "check", "chunks", "ask", "answer",
+                                        "thread-line"):
+        print("usage: build_request.py parse|plan|reply|check|chunks|ask|answer|thread-line <file> [options]",
               file=sys.stderr)
         return 2
     command, path = argv[0], argv[1]
@@ -869,6 +1031,13 @@ def main(argv: List[str]) -> int:
         for piece in chunks(text):
             print(len(piece.encode("utf-8")))
         return 0
+    if command in ("ask", "answer", "thread-line"):
+        try:
+            folder = _flag(argv, "--ledger")
+            return _thread_command(command, text, argv, Ledger(Path(folder) if folder else default_ledger()))
+        except SystemExit as error:
+            print(str(error), file=sys.stderr)
+            return 2
     try:
         folder = _flag(argv, "--ledger")
         ledger = (lambda: Ledger(Path(folder) if folder else default_ledger()))
@@ -911,13 +1080,22 @@ def main(argv: List[str]) -> int:
     try:
         page_html, schema, name = build_inputs(request, adaptation)
         # Before the claim: a plan that fails holds nothing.
-        steps = with_operation_ids(request["request_id"], plan(request, page_html, schema, name))
+        start = adaptation.get("thread_start") or f"Building {name or 'the app'}…"
+        steps = with_operation_ids(request["request_id"],
+                                   with_thread_start(request, plan(request, page_html, schema, name), start))
     except (ActionFailed, KeyError, ValueError, TypeError, AttributeError) as error:
         print(completion(request["request_id"], "failed", str(error) or type(error).__name__))
         return 1
     state, recorded = ledger().claim(request["room_id"], request["request_id"])
     if state == "done":
         print(recorded)
+        return ANSWERED
+    if state == "asked":
+        print("build_request: waiting for the owner's answer in the app's thread; ask nothing again",
+              file=sys.stderr)
+        return WAITING
+    if state == "expired":
+        print(lapsed(request, ledger()))  # then `thread-line --result` says so in the thread
         return ANSWERED
     if state == "busy":
         print("build_request: another run is building this request", file=sys.stderr)
@@ -926,6 +1104,42 @@ def main(argv: List[str]) -> int:
         steps = [dict(step, cli=cli_argv(step)) for step in steps]
     print(json.dumps(steps, indent=2, ensure_ascii=False))
     return 0
+
+
+THREAD_MARKER = "space.ag2.commons.app_thread"
+THREAD_LINE_MAX = 500
+
+
+def thread_root_of(request: Dict[str, Any]) -> Optional[str]:
+    """The app thread this request is also spoken about in: its fence's thread_root, only with the
+    skill's switch on; None means today's DM-only answer."""
+    return request.get("thread_root") if thread_conversation() else None
+
+
+def thread_post(request: Dict[str, Any], text: str, *, app_id: Optional[str] = None,
+                asks: bool = False) -> Optional[Dict[str, Any]]:
+    """One ordinary reply in the app's thread, best effort: it never fails the build. It carries the
+    thread's marker (the client's own key) with the request id, the app once there is one, else the
+    page, and `asks` on the one question, so the client can show the agent is waiting on the owner."""
+    root = thread_root_of(request)
+    if not root or not text.strip():
+        return None
+    marker: Dict[str, Any] = {"request_id": request["request_id"]}
+    marker.update({"app": app_id} if app_id else {"page": request["page"]})
+    if asks:
+        marker["asks"] = True
+    return {"action": "room.message.send", "room_id": request["room_id"], "best_effort": True,
+            "arguments": {"body": " ".join(text.split())[:THREAD_LINE_MAX], "thread_root": root,
+                          "extra_content": {THREAD_MARKER: marker}}}
+
+
+def with_thread_start(request: Dict[str, Any], steps: List[Dict[str, Any]], line: str) -> List[Dict[str, Any]]:
+    """The plan with the thread's start line right before its first write: the checks have passed."""
+    post = thread_post(request, line)
+    if post is None:
+        return steps
+    first = next((i for i, st in enumerate(steps) if not st.get("read")), len(steps))
+    return steps[:first] + [post] + steps[first:]
 
 
 def with_operation_ids(request_id: str, steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

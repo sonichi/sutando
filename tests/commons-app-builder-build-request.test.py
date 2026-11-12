@@ -160,6 +160,12 @@ class FakeRoom:
                 raise Refused(f"404: no app {args['app']}")
             self.apps[args["app"]].update({"page": args["page"]})
             return {"app": self.apps[args["app"]], "link": None}
+        if action == "room.message.send":
+            if getattr(self, "refuse_posts", False):
+                raise Refused("403: posting is not allowed here")
+            self.posts = getattr(self, "posts", [])
+            self.posts.append(dict(args, operation_id=step.get("operation_id")))
+            return {"event_id": f"$post{len(self.posts)}"}
         raise Refused(f"unexpected action {action}")
 
 
@@ -1143,5 +1149,149 @@ planned = br.with_operation_ids("17171717-3434-4565-8787-909090909090", br.plan(
                      {"app_name": "X"})))
 check("in-process-sends-the-planned-ids", [i for i in sent if i] == [st["operation_id"] for st in planned
                                                                       if st.get("operation_id")])
+
+# --------------------------------------------------------------------------- in the app's thread (MVP B)
+ROOT = "$threadRoot1:s.space"
+
+
+def thread_message(text, *, user=OWNER, tier="owner", root=ROOT, room=ROOM, stamp=True):
+    """A message in the app's thread, as the gateway writes it: a room task with the thread headers."""
+    head = ["id: task-t1", "timestamp: 2026-11-12T12:00:00Z", "source: ag2space", f"channel_id: {room}",
+            "task_id: t-2", "execution_generation: 1", "task_layout: mid"]
+    tail = ["room_name: Event", "sender_name: x", f"thread_root: {root}", f"source_room_id: {room}",
+            "room_member_count: 5", "channel_kind: room", "source_message_id: $m9", f"user_id: {user}",
+            "interaction_type: message", f"access_tier: {tier}"]
+    out = "\n".join(head + ["task: " + one_line(text)] + tail) + "\n"
+    return envelope.stamp_text(out, WS) if stamp else out
+
+
+def actions_of(room):
+    return [act for act, _ in room.calls]
+
+
+real_switch = br.thread_conversation
+check("the-switch-is-off-by-default", real_switch() is False
+      and json.loads((_SKILL / "manifest.json").read_text())["config"]["BUILD_THREAD_CONVERSATION"] is False)
+
+# Off: a fence naming its thread is answered exactly as today, and nothing is posted anywhere.
+room_off, room_plain = FakeRoom(), FakeRoom()
+with_root = reply_of(run(room_off, task(template="poll", thread_root=ROOT), {"app_name": "Weekend"}))
+plain = reply_of(run(room_plain, task(template="poll"), {"app_name": "Weekend"}))
+check("switch-off-is-todays-answer", with_root == plain and "room.message.send" not in actions_of(room_off))
+_, rep = reply_of(run(FakeRoom(), task(template="poll", thread_root="not-an-event")))
+check("a-bad-thread-root-is-malformed", rep["status"] == "failed" and "thread_root" in rep["reason"])
+
+br.thread_conversation = lambda: True
+try:
+    # On: a start line before the first write, the result line at the end, both in the thread.
+    room = FakeRoom()
+    line, rep = reply_of(run(room, task(template="poll", thread_root=ROOT), {"app_name": "Weekend"}))
+    posts = getattr(room, "posts", [])
+    acts = actions_of(room)
+    first_write = next(i for i, (act, _) in enumerate(room.calls)
+                       if act not in ("commons.app_guide", "room.members.list", "room.commons.pages.list",
+                                      "room.commons.pages.read", "room.commons.databases.list",
+                                      "room.message.send"))
+    check("thread-start-and-result-are-posted", rep["status"] == "done" and len(posts) == 2)
+    check("thread-start-comes-before-the-first-write", acts.index("room.message.send") < first_write)
+    check("thread-start-says-building", posts[0]["body"] == "Building Weekend…" and posts[0]["thread_root"] == ROOT)
+    check("thread-result-is-the-dm-line", posts[1]["body"] == line)
+    check("thread-posts-carry-the-marker",
+          posts[0]["extra_content"]["space.ag2.commons.app_thread"] == {"request_id": rep["request_id"], "page": PAGE}
+          and posts[1]["extra_content"]["space.ag2.commons.app_thread"] == {"request_id": rep["request_id"],
+                                                                            "app": rep["app_id"]})
+    check("thread-posts-carry-operation-ids", all(p_["operation_id"] for p_ in posts))
+    check("the-dm-reply-is-unchanged-by-the-thread", rep == {**plain[1], "app_id": rep["app_id"],
+                                                             "database": rep["database"]})
+
+    # A post the room refuses never fails the build.
+    room = FakeRoom()
+    room.refuse_posts = True
+    _, rep = reply_of(run(room, task(template="poll", thread_root=ROOT)))
+    check("a-refused-thread-post-is-best-effort", rep["status"] == "done")
+
+    # On, but no thread named: DM only.
+    room = FakeRoom()
+    run(room, task(template="poll"))
+    check("no-thread-root-posts-nothing", "room.message.send" not in actions_of(room))
+
+    # The one question, end to end through the command line.
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        led = str(tmp / "ledger")
+        rid = "21212121-3434-4565-8787-909090909090"
+        (tmp / "t.txt").write_text(task(template="poll", thread_root=ROOT, request_id=rid), encoding="utf-8")
+        code, out = cli("plan", str(tmp / "t.txt"), "--ledger", led)
+        steps = json.loads(out)
+        check("plan-puts-the-start-line-in", code == 0 and any(st["action"] == "room.message.send" for st in steps))
+        code, out = cli("ask", str(tmp / "t.txt"), "--question", "Use the existing Signups database?", "--ledger", led)
+        asked = json.loads(out)
+        check("ask-posts-one-question-in-the-thread", code == 0 and len(asked) == 1
+              and asked[0]["arguments"]["thread_root"] == ROOT
+              and asked[0]["arguments"]["extra_content"]["space.ag2.commons.app_thread"]
+              == {"request_id": rid, "page": PAGE, "asks": True}
+              and asked[0]["operation_id"] == f"cab-{rid}-ask")
+        code, out = cli("ask", str(tmp / "t.txt"), "--question", "again?", "--ledger", led)
+        check("a-second-question-is-never-asked", code == br.WAITING and json.loads(out) == [])
+        code, out = cli("plan", str(tmp / "t.txt"), "--ledger", led)
+        check("a-restart-while-waiting-builds-nothing", code == br.WAITING and out == "")
+        (tmp / "stranger.txt").write_text(thread_message("yes", user="@stranger:s.space", tier="team"))
+        check("a-non-owner-answer-gets-nothing", cli("answer", str(tmp / "stranger.txt"), "--ledger", led) == (1, ""))
+        (tmp / "untiered.txt").write_text(thread_message("yes", tier="team"))
+        check("the-owner-id-below-the-owner-tier-gets-nothing",
+              cli("answer", str(tmp / "untiered.txt"), "--ledger", led)[0] == 1)
+        (tmp / "other.txt").write_text(thread_message("yes", root="$otherRoot:s.space"))
+        check("another-thread-answers-nothing", cli("answer", str(tmp / "other.txt"), "--ledger", led)[0] == 1)
+        (tmp / "forged.txt").write_text(thread_message("yes", stamp=False))
+        check("an-unstamped-answer-gets-nothing", cli("answer", str(tmp / "forged.txt"), "--ledger", led)[0] == 1)
+        (tmp / "owner.txt").write_text(thread_message(f"{AGENT} yes, use it"))
+        code, out = cli("answer", str(tmp / "owner.txt"), "--ledger", led)
+        got = json.loads(out) if code == 0 else {}
+        check("the-owners-answer-is-taken", code == 0 and got.get("request_id") == rid
+              and got.get("answer") == "yes, use it" and got.get("question") == "Use the existing Signups database?")
+        check("the-answer-gives-back-the-request", Path(got.get("task_file", "/nonexistent")).read_text()
+              == (tmp / "t.txt").read_text())
+        check("an-answer-is-taken-once", cli("answer", str(tmp / "owner.txt"), "--ledger", led)[0] == 1)
+        code, out = cli("plan", got["task_file"], "--ledger", led)
+        check("the-answered-request-is-built", code == 0 and json.loads(out)[-1]["action"] == "room.commons.apps.create")
+        check("resumed-once", cli("plan", got["task_file"], "--ledger", led)[0] == 4)
+
+        # A question nobody answers lapses: the request fails, and the thread hears it once.
+        rid2 = "31313131-3434-4565-8787-909090909090"
+        (tmp / "t2.txt").write_text(task(template="poll", thread_root=ROOT, request_id=rid2), encoding="utf-8")
+        cli("plan", str(tmp / "t2.txt"), "--ledger", led)
+        cli("ask", str(tmp / "t2.txt"), "--question", "Morning or afternoon first?", "--ledger", led)
+        path = br.Ledger(Path(led))._path(ROOM, rid2)
+        entry = json.loads(path.read_text())
+        entry["asked"]["at"] -= br.ASK_TTL_S + 1
+        path.write_text(json.dumps(entry))
+        code, out = cli("plan", str(tmp / "t2.txt"), "--ledger", led)
+        _, rep = reply_of(out)
+        check("an-unanswered-question-lapses", code == br.ANSWERED and rep["status"] == "failed"
+              and "went unanswered for 24 hours" in rep["reason"])
+        code, out = cli("thread-line", str(tmp / "t2.txt"), "--result", "--ledger", led)
+        line_steps = json.loads(out)
+        check("the-lapse-is-said-in-the-thread", code == 0 and len(line_steps) == 1
+              and "went unanswered" in line_steps[0]["arguments"]["body"])
+        check("a-late-answer-finds-nothing", cli("answer", str(tmp / "owner.txt"), "--ledger", led)[0] == 1)
+
+        # In-process: a request waiting on its question says nothing and builds nothing.
+        rid3 = "41414141-3434-4565-8787-909090909090"
+        led3 = br.Ledger(tmp / "ledger3")
+        text3 = task(template="poll", thread_root=ROOT, request_id=rid3)
+        led3.claim(ROOM, rid3)
+        led3.ask(ROOM, rid3, thread_root=ROOT, owner=OWNER, question="q?", task_text=text3)
+        room = FakeRoom()
+        check("in-process-waiting-says-nothing", run(room, text3, {}, led3) == "" and room.calls == [])
+finally:
+    br.thread_conversation = real_switch
+
+with tempfile.TemporaryDirectory() as tmp:
+    (Path(tmp) / "t.txt").write_text(task(template="poll", thread_root=ROOT), encoding="utf-8")
+    check("thread-line-is-empty-with-the-switch-off",
+          cli("thread-line", str(Path(tmp) / "t.txt"), "--line", "hi", "--ledger", str(Path(tmp) / "l")) == (0, "[]\n"))
+    (Path(tmp) / "o.txt").write_text(thread_message("yes"))
+    check("answer-is-nothing-with-the-switch-off", cli("answer", str(Path(tmp) / "o.txt"), "--ledger", str(Path(tmp) / "l"))[0] == 1)
+
 
 print(f"commons-app-builder build request: {len(passed)} passed")

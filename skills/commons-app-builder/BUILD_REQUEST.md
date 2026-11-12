@@ -193,3 +193,48 @@ Could not build the app: page html-k3m9x2qa is not in this room
 
 Not settled here: whether the private task path posts the reply as a thread under the request or
 as the next message. Match on `request_id` inside the fence, which works either way.
+
+## In the app's thread
+
+Off unless the skill's manifest config `BUILD_THREAD_CONVERSATION` is `true` (default `false`).
+Off, everything above is unchanged and a `thread_root` in the fence is ignored. The DM fence stays
+the request, its authorization and its answer; the thread only hears about it.
+
+**The request** may name its app's build thread: `"thread_root": "$<event id>"`, beside
+`request_id`, in the same fence. Without it the request is answered in the DM only.
+
+**What the agent says there**, each an ordinary reply in the thread (`room.message.send` with
+`thread_root`), short and in the owner's language, best effort (a post that fails never fails the
+build):
+
+- a start line once the checks have passed, right before the first write: `plan` puts it in the
+  steps ("Building <app>…"; the adaptation's `thread_start` replaces it);
+- the result: after `reply`, `build_request.py thread-line task.txt --result` prints the step that
+  posts the DM reply's human line in the thread (done, failed or lapsed).
+
+Every such post carries the client's own marker, `space.ag2.commons.app_thread`, with the request:
+`{"request_id": "<id>", "page": "html-…"}`, or `{"request_id", "app": "<id>"}` once the app exists
+(the result line of a build), so the client can tie it to the request and record `app_threads`.
+
+**One question**, only for what the agent cannot decide from the description (for example, whether
+to use an existing database that could fit). Never when nothing needs one.
+
+```bash
+python3 build_request.py ask task.txt --question 'Use the existing Signups database, or a new one?'
+```
+
+- `ask` turns the claim into one open question and prints its post: the marker carries
+  `"asks": true`, which is how the client shows the agent is waiting on the owner. The DM fence gets
+  no reply while it waits.
+- A request already asking exits 6 and prints `[]`: there is never a second question. `plan` on it
+  exits 6 too (waiting), so a restart neither asks again nor builds.
+- The answer is the owner's next message in that thread. On each message there, run
+  `build_request.py answer thread-task.txt`: it counts only with the attested owner tier, the
+  owner who asked (`user_id`), the same room (`source_room_id`) and the same `thread_root`, all
+  headers the gateway stamps. It prints `{request_id, question, answer, task_file}`; take the
+  request up again with `plan task_file`, applying the answer in the adaptation. Anything else
+  exits 1: a non-owner's message in the thread gets nothing from the agent, no reply at all.
+- A question unanswered for 24 hours lapses: `plan` records the request failed ("the question in
+  the app's thread went unanswered for 24 hours"), and `thread-line --result` says so in the thread,
+  once.
+

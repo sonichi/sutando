@@ -20,7 +20,9 @@ Sutando follow the same file. Keep it portable: Sutando-only material goes here,
 
 A private task holding a ```` ```commons-app-build ```` fence is the s.space panel asking you to
 build or refine an app in a page it already created. [`BUILD_REQUEST.md`](BUILD_REQUEST.md) is the
-contract; follow it exactly, because the panel parses your reply.
+contract; follow it exactly, because the panel parses your reply. With the skill's
+`BUILD_THREAD_CONVERSATION` switch on, a request naming its app thread is also spoken about there,
+and may ask the owner one question (BUILD_REQUEST.md, "In the app's thread").
 
 1. `python3 skills/commons-app-builder/scripts/build_request.py parse task.txt`, on the **whole
    task file** as delivered (its stamp is checked): it checks the task came from the owner's DM
