@@ -22,6 +22,11 @@ from __future__ import annotations
 
 from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple
 
+try:
+    from ..owner_text import GENERIC_LINE, named, owner_line   # the vendored package layout
+except ImportError:
+    from owner_text import GENERIC_LINE, named, owner_line     # the repo's src/ on sys.path
+
 from .schema import STATUS_RESOLVED, TERMINAL_STATUSES, HumanRequirement
 
 # Kinds that stop the runtime outright; a decision card waits without re-alerting.
@@ -176,8 +181,10 @@ def _queued(req: HumanRequirement) -> int:
 
 
 def _headline(req: HumanRequirement) -> str:
-    first = next((ln.strip() for ln in (req.message or "").splitlines() if ln.strip()), "")
-    return (req.title or first or req.kind).rstrip(".")
+    """The card in one plain line: its first sentence, else its title; never an id, a session
+    name or a state code, so a card written before that rule reads as a generic line."""
+    line = owner_line(req.message, "") or owner_line(req.title, "") or GENERIC_LINE
+    return line.rstrip(".")
 
 
 def body(notice: str, req: HumanRequirement, now: float,
@@ -186,14 +193,17 @@ def body(notice: str, req: HumanRequirement, now: float,
     if notice == FAILED:
         head = _headline(req)
         head = head if len(head) <= _FAILED_HEADLINE_MAX else head[:_FAILED_HEADLINE_MAX - 1] + "…"
-        return f"⚠ Sutando could not show you a card — {head}. The relay refused it."
+        return f"⚠ Sutando could not show you a card — {head}."
     if notice == RECOVERY:
         tail = (f"resuming {n} queued task{'s' if n != 1 else ''}" if n
                 else "Sutando has continued its work")
         if req.kind in SIGN_IN_KINDS:
-            seat = str((req.device or {}).get("name") or "")
+            seat = named((req.device or {}).get("name"), "")
             return f"✓ Signed in{f' ({seat})' if seat else ''} — {tail}."
-        return f"✓ Cleared — {_headline(req)}; {tail}."
+        cleared = str((req.subject or {}).get("cleared") or "").strip()
+        if cleared:
+            return f"✓ {_headline(req)}. {cleared}"
+        return f"✓ No longer blocked — {named((req.device or {}).get('name'))} can continue; {tail}."
     waiting = f" {n} task{'s are' if n != 1 else ' is'} waiting." if n else ""
     started = req.created_at if since is None else since
     return (f"⚠ Still blocked after {_duration(now - started)} — "

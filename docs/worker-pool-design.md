@@ -345,7 +345,8 @@ turn in flight. With the same sustain and stale line, once per episode:
   running above it reads as working, and a frame that moves clears the episode. The
   seat's own input watcher does not page that banner, since it cannot read the
   worker's queue; a refused limit turn, the limit menu or any dialog still pages there;
-- abnormal text raises a card that quotes the banner line and names the cause. On a
+- abnormal text raises a card that names the cause in words and quotes the banner line
+  in its details. On a
   seat routed through the credential proxy, a retry, API or network cause offers the
   proxy restart (`launchctl kickstart -k gui/$(id -u)/com.sutando.credential-proxy`,
   what `src/restart.sh` runs); the click reaches the core as a task. The worker's
@@ -353,6 +354,14 @@ turn in flight. With the same sustain and stale line, once per episode:
 - a frozen turn raises a card offering "Send Escape". Nothing is typed unless the
   owner presses it; the next tick then re-reads the pane and types one Escape only
   if it still shows the frame the card was raised for, and refuses otherwise.
+
+Every wedge card reads the same way. Its title and first line name the worker by its
+display name ("A worker" when it has none) and say the cause in one plain sentence, with
+the reset time when the pane states one. The worker id, the session, the socket, the
+terminal's own lines and any command are detail lines below the first (`src/owner_text.py`
+`card_text`): a card folds them behind "Details", a text-only client and a reminder show
+the first line alone, and key-like fragments are redacted in both. The ids stay in the
+card's `subject` and `device`, where tools read them.
 
 An expired login is the exception to the work-owed and sustain requirements: its
 banner asks for a `/login` card immediately, even with an empty inbox. On upgrade,

@@ -92,6 +92,11 @@ def _replace_patterns(text: str) -> tuple[str, set[str]]:
     return redacted, found
 
 
+def redact_known_patterns(text: str) -> str:
+    """`text` with every provider-signature secret replaced; no scanner, no entropy guess."""
+    return _replace_patterns(text)[0]
+
+
 def _redact_unhandled_hit_lines(text: str, redacted: str, hits: Iterable[object]) -> str:
     """Redact a whole line when detection found a secret but no full-span
     pattern changed it. Losing the line is safer than persisting a partial hit."""

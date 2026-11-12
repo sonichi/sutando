@@ -17,6 +17,11 @@ from __future__ import annotations
 import time
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
+try:
+    from ..owner_text import FOLDED, fallback_text, named, redact   # the vendored package layout
+except ImportError:
+    from owner_text import FOLDED, fallback_text, named, redact     # the repo's src/ on sys.path
+
 from . import renotify
 from .manager import HitlManager
 from .schema import (
@@ -76,15 +81,27 @@ _KIND_STATUS_LINES = {("auth", STATUS_RESOLVED): "✓ Signed in — Sutando has 
 def fallback_body(req: HumanRequirement) -> str:
     """Plain-text rendering for clients that ignore the hitl content field."""
     device = req.wire_device() or {}
-    name, host = device.get("name", ""), device.get("host", "")
+    text = fallback_text(req.message, bool((req.subject or {}).get(FOLDED)))
+    # A session name or an id is not a name; a name the text already says is not repeated.
+    name, host = named(device.get("name"), ""), device.get("host", "")
+    name = "" if name and name in text else name
     where = f" (on {host} · {name})" if host and name else f" (on {host or name})" if (host or name) else ""
     lead = _CATEGORY_HEADS.get(category_of(req.kind),
                                _CATEGORY_HEADS[CATEGORY_BLOCKED])
-    head = f"{lead} — {req.message}{where}"
+    head = f"{lead} — {text}{where}"
     closer = _KIND_STATUS_LINES.get((req.kind, req.status)) or _STATUS_LINES.get(req.status)
     if closer:
         return f"{head}\n\n{closer}"
     return head
+
+
+def card_wire(req: HumanRequirement) -> Dict:
+    """The card as sent: `to_wire()` with key-like fragments redacted from the text a person reads."""
+    wire = req.to_wire()
+    for key in ("message", "title"):
+        if isinstance(wire.get(key), str):
+            wire[key] = redact(wire[key])
+    return wire
 
 
 def _notices(manager: HitlManager, now: float) -> List[renotify.Notice]:
@@ -205,7 +222,7 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
             "room_id": req.room or room_id,
             "body": fallback_body(req),
             "dedupe_key": f"hitl:{req.id}:{req.revision}",
-            "extra_content": {WIRE_FIELD: req.to_wire()},
+            "extra_content": {WIRE_FIELD: card_wire(req)},
         }
         if target:
             payload.update({"op": "edit", "event_id": target})
@@ -280,7 +297,8 @@ def _send_notices(manager: HitlManager, send: Sender, room_id: str, now: float,
                   "runtime": n.req.runtime, "device": device.get("id") or "",
                   "host": device.get("host") or ""}
         answer = send(wire_safe({"room_id": n.req.room or room_id, "op": "message",
-                                 "body": renotify.body(n.notice, n.req, now, since=n.since, queued=n.queued),
+                                 "body": redact(renotify.body(n.notice, n.req, now, since=n.since,
+                                                              queued=n.queued)),
                                  "dedupe_key": renotify.dedupe_key(n.notice, n.req, ledger, n.reminders),
                                  "extra_content": {NOTICE_FIELD: notice}}))
         if not isinstance(answer, dict) or not (answer.get("ok") or answer.get("event_id")):

@@ -113,14 +113,14 @@ def _requirement(data: dict) -> HumanRequirement:
         kind="permission",
         runtime="claude",
         message=f"Claude wants to run {tool}: {_summary(tool, tool_input)}",
-        title=f"claude · {session}",
+        title="Claude asks to use a tool",
         guard=_guard(tool, tool_input),
         subject={"tool": tool, "input": _summary(tool, tool_input)},
-        device={"id": session, "name": session},
+        device={"id": session, "name": "Claude"},
         actions=[
             Action(id="allow", kind="allow_once", label="Allow"),
             Action(id="deny", kind="reject_once", label="Deny"),
-            Action(id="open_terminal", kind="open_terminal", label=f"Open terminal ({session})"),
+            Action(id="open_terminal", kind="open_terminal", label="Open terminal"),
         ],
     )
 

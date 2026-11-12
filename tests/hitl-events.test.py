@@ -50,7 +50,10 @@ class IngestTests(unittest.TestCase):
         self.assertEqual(c["created"], 1)
         [req] = self.mgr.active()
         self.assertEqual((req.kind, req.runtime, req.guard), ("permission", "claude", "g1"))
-        self.assertIn("core-2", req.message)
+        self.assertNotIn("core-2", req.title + req.message.splitlines()[0])
+        self.assertEqual(req.message.partition("\n\n")[2], "Session: core-2")
+        self.assertEqual(req.title, "Claude needs you")
+        self.assertEqual(req.actions[-1].label, "Open terminal")
         kinds = [(a.id, a.kind) for a in req.actions]
         self.assertIn(("1", "tui_select"), kinds)
         self.assertEqual(req.actions[-1].id, JUMP_ACTION_ID)
@@ -59,7 +62,7 @@ class IngestTests(unittest.TestCase):
         self.drop("core-2-g1", event())
         ingest(self.mgr, self.ws)
         [req] = self.mgr.active()
-        self.assertEqual(req.device, {"id": "core-2", "name": "core-2", "socket": "/tmp/s.sock"})
+        self.assertEqual(req.device, {"id": "core-2", "name": "Claude", "socket": "/tmp/s.sock"})
         import hitl.schema as SCHEMA
         with mock.patch.object(SCHEMA, "device_host", return_value="Chis-MacBook-Pro"):
             self.assertEqual(req.to_wire()["device"]["host"], "Chis-MacBook-Pro")
@@ -93,7 +96,8 @@ class IngestTests(unittest.TestCase):
                                                   {"id": "deny", "label": "Deny", "kind": "reject_once"}]))
         ingest(self.mgr, self.ws)
         [req] = self.mgr.active()
-        self.assertEqual(req.subject, {"tool": "Read", "input": "/x"})
+        self.assertEqual(req.subject, {"tool": "Read", "input": "/x", "details_folded": True})
+        self.assertEqual((req.title, req.device["name"]), ("Your agent needs you", "Your agent"))
         self.assertEqual([(a.id, a.kind) for a in req.actions[:2]], [("allow", "allow_once"), ("deny", "reject_once")])
         self.assertEqual(req.actions[-1].kind, "open_terminal")  # the jump floor stays
 
@@ -102,7 +106,7 @@ class IngestTests(unittest.TestCase):
         ingest(self.mgr, self.ws)
         [req] = self.mgr.active()
         self.assertEqual({a.kind for a in req.actions[:-1]}, {"tui_select"})
-        self.assertEqual(req.subject, {})
+        self.assertEqual(req.subject, {"details_folded": True})
 
     def test_repaint_expires_the_old_dialog_and_mints_a_new_card_with_new_options(self):
         # TustinOC's second repro: the guard moved to screen BBB; the old card's

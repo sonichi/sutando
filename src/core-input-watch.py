@@ -730,29 +730,40 @@ DRIVE_SETTLE_S = 15.0
 
 
 from prompt_excerpt import prompt_excerpt  # noqa: E402  (shared with core-supervisor-relay)
+import owner_text  # noqa: E402
 
 
-def escalation_message(state, detail, kind, prompt, session=None, runtime=None):
-    """The card body. The core is blocked, so this is the only thing that will
-    reach the owner until they act."""
-    head = ("I am blocked and cannot continue without you."
-            if state == "blocked-human" else
-            "I am signed out and cannot continue without you.")
-    lines = [head, "", f"State: {state} — {detail}"]
-    if kind and kind != "unknown":
-        lines.append(f"Gate: {kind}")
+def _limit_reset(prompt, now=None):
+    """When the limit on this pane lifts, as the pane states it; None when it does not say."""
+    try:
+        from core_limit_hold import parse_reset
+        return parse_reset(prompt or "", time.time() if now is None else now)
+    except Exception:  # noqa: BLE001 - an unread reset time is an unknown one
+        return None
+
+
+def escalation_message(state, detail, kind, prompt, session=None, runtime=None, name=None, now=None):
+    """The card body: one plain sentence naming who is stopped and why, then the details
+    (the terminal's own lines, the state and gate codes, the session) a card folds away."""
+    who = owner_text.named(name)
+    limit = is_usage_limit(kind, prompt)
+    if limit:
+        from hitl.tui_gate import limit_sentence, limit_unblock
+        head = limit_sentence(name, _limit_reset(prompt, now), now)
+    elif state == "blocked-human":
+        head = f"{who} is waiting on a question in its terminal and cannot continue until you answer."
+    else:
+        head = f"{who} is signed out and cannot continue until you sign in."
+    details = []
     excerpt = prompt_excerpt(prompt) if prompt else []
     if excerpt:
-        # Plain lines, not a code fence: the card renders text, and the prompt is what the owner
-        # needs to read, not the pane's chrome around it.
-        lines += ["", "What the terminal is showing:"] + [f"  {ln}" for ln in excerpt]
-    if is_usage_limit(kind, prompt):
-        from hitl.tui_gate import limit_unblock
-        lines += ["", limit_unblock(session, runtime)]
-    else:
-        lines += ["", "Open the Runtime panel (or the core's terminal) and answer it. "
-                      "Nothing else I do can clear this one."]
-    return "\n".join(lines)
+        details += ["What its terminal shows:"] + [f"  {ln}" for ln in excerpt]
+    if limit:
+        details.append(limit_unblock(session, runtime))
+    details.append(f"State: {state} — {detail}" + (f" · gate: {kind}" if kind and kind != "unknown" else ""))
+    if session:
+        details.append(f"Session: {session}")
+    return owner_text.card_text(head, details)
 
 
 def _hitl_manager(out_path):
@@ -772,16 +783,13 @@ def _hitl_manager(out_path):
         return None
 
 
-def _name_seat(req, session, seat):
-    """Say which seat is asking: a card from one of several watched panes must
-    name its own, and its terminal jump must name that pane's session."""
-    from hitl.schema import Action
-    req.title = f"{seat} · {req.title}"
-    req.message = f"{seat} (tmux session {session})\n\n{req.message}"
-    req.device = {"id": session, "name": seat}
+def _name_seat(req, session, seat, name):
+    """Say which seat is asking, by its name: a card from one of several watched panes names
+    its own in the title. The session stays in `device.id`, where the terminal jump reads it."""
+    if name not in req.title:
+        req.title = f"{name} · {req.title}"
+    req.device = {"id": session, "name": name}
     req.subject = {**(req.subject or {}), "seat": seat}
-    req.actions = [Action(id=a.id, kind=a.kind, label=f"Open terminal ({session})")
-                   if a.kind == "open_terminal" else a for a in req.actions]
     return req
 
 
@@ -798,14 +806,15 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
     try:
         from hitl import tui_gate
         limit = is_usage_limit(kind, prompt)
+        name = owner_text.named(seat, "A worker") if seat else owner_text.agent_name()
         req = tui_gate.requirement_for(state, kind, prompt, session, detail,
-                                       escalation_message(state, detail, kind, prompt, session, runtime),
+                                       escalation_message(state, detail, kind, prompt, session, runtime, name),
                                        runtime=runtime,
-                                       episode=tui_gate.LIMIT_EPISODE if limit else None)
+                                       episode=tui_gate.LIMIT_EPISODE if limit else None, name=name)
         if queued:
             req.message = f"{req.message}\n\n{core_gate_notice.card_line(queued)}"
         if seat:
-            req = _name_seat(req, session, seat)
+            req = _name_seat(req, session, seat, name)
         return manager.create(req)
     except Exception as exc:  # noqa: BLE001 — never let the card take down the monitor
         print(f"hitl escalation failed: {exc}", file=_sys.stderr)

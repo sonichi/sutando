@@ -57,6 +57,7 @@ MAP = {
     "src/dotspace.py": "dotspace.py",
     "src/workspace_lock.py": "workspace_lock.py",
     "src/chat_secret_filter.py": "chat_secret_filter.py",
+    "src/owner_text.py": "owner_text.py",
     "src/policy/egress/result.py": "team_result_guard.py",
     "src/policy/guardrail.py": "team_guardrail.py",
     "src/vault_set_grammar.py": "vault_set_grammar.py",
