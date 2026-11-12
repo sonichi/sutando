@@ -269,11 +269,12 @@ class ActionFailed(RuntimeError):
 
 _PICK = (
     ("turn-game", r"\b(game|tic[- ]?tac|turn|board game|gomoku|checkers|chess|connect four)\b"),
-    # A sign-up sheet is one choice per person among fixed slots: poll's model (templates/README.md).
-    ("poll", r"\b(poll|vote|voting|survey|choose|pick (one|a)|preference|which (day|option)"
-             r"|sign[- ]?ups?|rsvps?|roster|slots?)\b"),
+    ("poll", r"\b(poll|vote|voting|survey|choose|pick (one|a)|preference|which (day|option))\b"),
     ("planner", r"\b(plan|planner|week|weekly|schedule|rota|calendar|itinerary|meal)\b"),
     ("tracker", r"\b(track|tracker|task|todo|to-do|issue|bug|request|queue|chore|status)\b"),
+    # Last, so a planner or tracker word wins: a sign-up is one choice per person among fixed
+    # slots, poll's model (templates/README.md).
+    ("poll", r"\b(sign[- ]?ups?|sign-up sheet|rsvps?)\b"),
 )
 
 
@@ -342,17 +343,88 @@ def adapt(page: str, schema: Dict[str, Any], adaptation: Dict[str, Any]) -> Tupl
     return page, schema
 
 
+# The column types the backend's prop_add takes, less the title (a blank database mints it) and
+# a relation (it needs a target database); and bounds well inside the backend's own.
+SCHEMA_TYPES = ("text", "number", "checkbox", "url", "email", "select", "multi_select", "status",
+                "date", "person", "files", "created_time", "created_by", "edited_time", "edited_by")
+OPTION_TYPES = ("select", "multi_select", "status")
+LAYOUTS = ("table", "board", "calendar", "list", "gallery")
+MAX_COLUMNS, MAX_OPTIONS, MAX_VIEWS, MAX_NAME = 50, 100, 10, 100
+TITLE_NAME = "Name"  # the title column a blank database is created with
+
+
+def _name(value: Any, what: str) -> str:
+    """A name the planner may send: a non-empty string of at most MAX_NAME characters that is not
+    one of the plan's own placeholders ($db, $app)."""
+    if not isinstance(value, str) or not value.strip():
+        raise ActionFailed(f"{what} needs a name")
+    if len(value) > MAX_NAME:
+        raise ActionFailed(f"{what} is longer than {MAX_NAME} characters")
+    if value.strip().startswith("$"):
+        raise ActionFailed(f"{what} may not start with $ ({value[:20]!r})")
+    return value
+
+
 def _checked_schema(schema: Any) -> Dict[str, Any]:
-    """An adaptation's own schema: the template schema's shape, one primary database whose props
-    each have a name and a type (BUILD_REQUEST.md, adapt.json)."""
+    """An adaptation's own schema, checked in full before anything is claimed or created: the
+    templates' schema.json shape, one primary database, at most MAX_COLUMNS columns of a known type
+    with unique names, none of them the title, options only where a type has them, and at most
+    MAX_VIEWS views over declared columns."""
     dbs = schema.get("databases") if isinstance(schema, dict) else None
-    primary = [d for d in dbs or [] if isinstance(d, dict) and d.get("role") == "primary"]
-    if len(primary) != 1 or not isinstance(primary[0].get("name"), str) or not primary[0]["name"].strip():
+    if not isinstance(dbs, list):
+        raise ActionFailed("the adaptation's schema needs a databases list")
+    primary = [d for d in dbs if isinstance(d, dict) and d.get("role") == "primary"]
+    if len(primary) != 1:
         raise ActionFailed("the adaptation's schema needs exactly one primary database with a name")
-    for prop in primary[0].get("props") or []:
-        if not (isinstance(prop, dict) and isinstance(prop.get("name"), str) and prop["name"].strip()
-                and isinstance(prop.get("type"), str) and prop["type"]):
+    db = primary[0]
+    _name(db.get("name"), "the adaptation's database")
+    props = db.get("props") if db.get("props") is not None else []
+    if not isinstance(props, list) or len(props) > MAX_COLUMNS:
+        raise ActionFailed(f"the adaptation's schema has more than {MAX_COLUMNS} columns, or no list of them")
+    seen: set = set()
+    for prop in props:
+        if not isinstance(prop, dict):
             raise ActionFailed("every column in the adaptation's schema needs a name and a type")
+        name = _name(prop.get("name"), "a column in the adaptation's schema")
+        if not isinstance(prop.get("type"), str) or not prop["type"]:
+            raise ActionFailed("every column in the adaptation's schema needs a name and a type")
+        if prop["type"] not in SCHEMA_TYPES:
+            raise ActionFailed(f"column {name} has type {prop['type']!r}; a column is one of " + ", ".join(SCHEMA_TYPES))
+        folded = name.strip().casefold()
+        if folded == TITLE_NAME.casefold():
+            raise ActionFailed(f"column {name} is the title column every database already has; leave it out")
+        if folded in seen:
+            raise ActionFailed(f"the adaptation's schema names column {name} twice")
+        seen.add(folded)
+        options = prop.get("options")
+        if options is None:
+            continue
+        if prop["type"] not in OPTION_TYPES:
+            raise ActionFailed(f"column {name} is {prop['type']}; only " + ", ".join(OPTION_TYPES) + " have options")
+        if not isinstance(options, list) or len(options) > MAX_OPTIONS:
+            raise ActionFailed(f"column {name} needs a list of at most {MAX_OPTIONS} options")
+        names: set = set()
+        for option in options:
+            if not isinstance(option, dict):
+                raise ActionFailed(f"each option of {name} needs a name")
+            oname = _name(option.get("name"), f"an option of {name}").strip().casefold()
+            if oname in names:
+                raise ActionFailed(f"column {name} lists the option {option['name']} twice")
+            names.add(oname)
+            if option.get("group") is not None and not isinstance(option["group"], str):
+                raise ActionFailed(f"the group of option {option['name']} of {name} must be text")
+    views = db.get("views") if db.get("views") is not None else []
+    if not isinstance(views, list) or len(views) > MAX_VIEWS:
+        raise ActionFailed(f"the adaptation's schema needs a list of at most {MAX_VIEWS} views")
+    for view in views:
+        if not isinstance(view, dict) or view.get("layout") not in LAYOUTS:
+            raise ActionFailed("each view needs a layout: one of " + ", ".join(LAYOUTS))
+        if view.get("name") is not None:
+            _name(view["name"], "a view")
+        for key in ("groupBy", "dateBy"):
+            if view.get(key) is not None and (not isinstance(view[key], str)
+                                              or view[key].strip().casefold() not in seen):
+                raise ActionFailed(f"a view's {key} names {view[key]!r}, which is not one of its columns")
     return json.loads(json.dumps(schema))
 
 
@@ -498,7 +570,9 @@ def execute(steps: List[Dict[str, Any]], call: Callable[[Dict[str, Any]], Dict[s
     written = False
     for step in steps:
         if step.get("skip_if_present") and step["skip_if_present"] in present:
-            continue
+            step = existing_column(step, answers)
+            if step is None:
+                continue
         concrete = dict(step, arguments=fill(step["arguments"]))
         try:
             result = call(concrete) or {}
@@ -551,6 +625,11 @@ def verify(step: Dict[str, Any], result: Dict[str, Any], answers: Optional[Dict[
         if not found:
             raise ActionFailed(f"database {step['expect_database']} is not in this room")
         present.update(p.get("name") for p in found.get("properties", []) if p.get("name"))
+        if answers is not None:
+            answers["$columns"] = {p["name"].casefold(): {"name": p["name"], "type": p.get("type"),
+                                                           "options": list(p.get("options") or [])}
+                                   for p in found.get("properties", []) if isinstance(p.get("name"), str)}
+            answers["$rows"] = found.get("rows") if type(found.get("rows")) is int else None
     if (step.get("expect_bytes") is not None
             and (type(result.get("total_bytes")) is not int
                  or result["total_bytes"] != step["expect_bytes"])):
@@ -562,6 +641,32 @@ def verify(step: Dict[str, Any], result: Dict[str, Any], answers: Optional[Dict[
         answers["$app"] = result.get("id") or app.get("id")
         if app.get("database"):
             answers["$app_db"] = bare(app["database"])
+
+
+def existing_column(step: Dict[str, Any], answers: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """What a prop_add becomes when its column is already in the database the panel sent: None
+    (nothing to do: the same type, every option there), a prop_update adding the options it lacks
+    (only on a database with no rows, so no value can be cleared), or ActionFailed: another type,
+    or options missing from a database that already has rows."""
+    want = step["arguments"]["property"]
+    have = (answers.get("$columns") or {}).get(want["name"].casefold())
+    if have is None:
+        return None
+    if have.get("type") != want["type"]:
+        raise ActionFailed(f"the database already has a {have.get('type')} column {have['name']}; "
+                           f"this app needs it to be {want['type']}")
+    missing = [o for o in want.get("options") or []
+               if o["name"].casefold() not in {n.casefold() for n in have.get("options") or []}]
+    if not missing:
+        return None
+    if answers.get("$rows") != 0:
+        raise ActionFailed(f"column {have['name']} lacks the options "
+                           + ", ".join(o["name"] for o in missing)
+                           + "; the database already has rows, so they were not changed: add them in its table")
+    options = [{"name": n} for n in have.get("options") or []] + missing
+    return dict(step, skip_if_present=None, arguments={
+        "database": step["arguments"]["database"], "op": "prop_update", "prop": have["name"],
+        "property": {"options": options}})
 
 
 def unwrap(result: Any) -> Dict[str, Any]:
@@ -636,6 +741,8 @@ def build(task_text: str, call: Callable[[Dict[str, Any]], Dict[str, Any]],
                            page=request["page"], database=database, app_id=app_id)
     except (ActionFailed, OSError, KeyError, ValueError) as error:
         reply = completion(request["request_id"], "failed", str(error) or type(error).__name__)
+    except Exception as error:  # noqa: BLE001 - after the claim every outcome is a recorded reply
+        reply = completion(request["request_id"], "failed", f"the build failed unexpectedly ({type(error).__name__})")
     if ledger is not None:
         ledger.record(request["room_id"], request["request_id"], reply)
     return reply
@@ -673,8 +780,19 @@ def _check(args: List[str]) -> int:
     except ActionFailed as error:
         print(str(error))
         return 1
-    # What later steps use: skip a prop_add whose skip_if_present name is listed here.
-    print(json.dumps({"present": sorted(present), "answers": answers}, ensure_ascii=False))
+    # What later steps use: a prop_add whose column is listed here is skipped, or replaced by the
+    # prop_update in `columns`; a column that cannot be used fails here, before anything is written.
+    columns: Dict[str, Any] = {}
+    if step.get("expect_database"):
+        for i, later in enumerate(steps):
+            if i > int(args[1]) and later.get("skip_if_present") in present:
+                try:
+                    columns[str(i)] = existing_column(later, answers) or "skip"
+                except ActionFailed as error:
+                    print(str(error))
+                    return 1
+    shown = {k: v for k, v in answers.items() if not k.startswith("$columns") and k != "$rows"}
+    print(json.dumps({"present": sorted(present), "answers": shown, "columns": columns}, ensure_ascii=False))
     return 0
 
 
@@ -736,8 +854,9 @@ def main(argv: List[str]) -> int:
         adaptation = json.loads(Path(adapt_path).read_text(encoding="utf-8"))
     try:
         page_html, schema, name = build_inputs(request, adaptation)
-    except ActionFailed as error:
-        print(completion(request["request_id"], "failed", str(error)))
+        steps = plan(request, page_html, schema, name)  # before the claim: a plan that fails holds nothing
+    except (ActionFailed, KeyError, ValueError, TypeError, AttributeError) as error:
+        print(completion(request["request_id"], "failed", str(error) or type(error).__name__))
         return 1
     state, recorded = ledger().claim(request["room_id"], request["request_id"])
     if state == "done":
@@ -746,7 +865,6 @@ def main(argv: List[str]) -> int:
     if state == "busy":
         print("build_request: another run is building this request", file=sys.stderr)
         return 4
-    steps = plan(request, page_html, schema, name)
     if route == "cli":
         steps = [dict(step, cli=cli_argv(step)) for step in steps]
     print(json.dumps(steps, indent=2, ensure_ascii=False))

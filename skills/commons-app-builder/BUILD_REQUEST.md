@@ -117,8 +117,21 @@ lock per room, so two runs of one request cannot both proceed.
 for a refine or a heavier edit, the whole page as `html`. For a build it may also name the
 `template` (one of the four; when the request names one too they must agree, and an unknown name
 is refused), and, with an `html` page written against other columns, that page's own `schema` in
-the templates' `schema.json` shape (one primary database whose columns each have a name and a
-type). Without `schema`, an `html` page is laid over the named template's columns. `plan` prints
+the templates' `schema.json` shape. It is checked in full before the request is claimed or
+anything is created: one primary database; at most 50 columns, each of a type `prop_add` takes
+(not `title` or `relation`), names unique, at most 100 characters and never starting with `$`;
+options, at most 100 a column, only on a select, multi-select or status; at most 10 views, each
+with a layout and grouping only by its own columns. Never list the title column: a blank
+database is created with one, named `Name` (the page reads it as the `title`-type column, as
+GUIDE.md's test harness shows). Without `schema`, an `html` page is laid over the named
+template's columns.
+
+A column the database the panel sent already has is compared, not just skipped: another type
+fails the build before anything is written; the same select, multi-select or status lacking some
+of the app's options gets them added (`prop_update`), only when the database has no rows, since
+the options are resent by name; with rows, the build fails and says which options to add.
+`check` on the `databases.list` step prints `columns`: for each later column step, `skip` or the
+`prop_update` to run in its place. `plan` prints
 the Actions in order; `$db` and `$app` stand for the ids earlier steps answer. Run them in that
 order, and run `scripts/check_page.py` on the page before writing it.
 

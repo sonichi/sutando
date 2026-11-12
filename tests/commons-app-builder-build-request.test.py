@@ -63,7 +63,11 @@ class FakeRoom:
     def __init__(self, pages=(PAGE,), databases=None, members=(OWNER, AGENT)):
         self.members = list(members)
         self.pages = {k: "" for k in pages}
-        self.databases = dict(databases or {})     # bare id -> {"name", "properties": [names], "views"}
+        # bare id -> {"name", "properties": [name, or {name, type, options}], "views", "rows"?}
+        self.databases = {i: dict(d, properties=[p if isinstance(p, dict) else
+                                                 {"name": p, "type": "title" if p == "Name" else "text"}
+                                                 for p in d["properties"]])
+                          for i, d in (databases or {}).items()}
         self.apps = {}
         self.calls = []
         self.write_sizes = []
@@ -100,24 +104,32 @@ class FakeRoom:
                     "max_pages": 100}
         if action == "room.commons.databases.list":
             return {"databases": [
-                {"database": "db:" + i, "name": d["name"], "rows": 0, "properties_truncated": False,
-                 "properties": [{"id": n.lower(), "name": n, "type": "text", "options": None}
-                                for n in d["properties"]]}
+                {"database": "db:" + i, "name": d["name"], "rows": d.get("rows", 0), "properties_truncated": False,
+                 "properties": [{"id": p["name"].lower(), "name": p["name"], "type": p["type"],
+                                 "options": p.get("options")} for p in d["properties"]]}
                 for i, d in self.databases.items()]}
         if action == "room.commons.pages.create":
             assert args["kind"] == "db", "the panel creates the page; the agent never does"
             db = self._id("d")
-            self.databases[db] = {"name": args["title"], "properties": ["Name"], "views": []}
+            self.databases[db] = {"name": args["title"], "properties": [{"name": "Name", "type": "title"}],
+                                  "views": []}
             return {"kind": "db:" + db}
         if action == "room.commons.databases.mutate":
             db = br.bare(args["database"])
             if db not in self.databases:
                 raise Refused(f"404: no database {db}")
+            props = self.databases[db]["properties"]
             if args["op"] == "prop_add":
                 name = args["property"]["name"]
-                if name in self.databases[db]["properties"]:
+                if any(p["name"] == name for p in props):
                     raise Refused(f"409: {name} exists")
-                self.databases[db]["properties"].append(name)
+                props.append({"name": name, "type": args["property"]["type"],
+                              "options": [o["name"] for o in args["property"].get("options") or []] or None})
+            elif args["op"] == "prop_update":
+                target = next((p for p in props if p["name"] == args["prop"]), None)
+                if target is None:
+                    raise Refused(f"404: no column {args['prop']}")
+                target["options"] = [o["name"] for o in args["property"]["options"]]
             elif args["op"] == "view_add":
                 self.databases[db]["views"].append(args["view_settings"])
             return {"ok": True}
@@ -250,7 +262,7 @@ check("build-page-is-the-app", "<title>Cleanup sign-ups</title>" in page and "<h
 check("build-page-finds-its-database-by-the-new-name", "Cleanup sign-ups — Votes" in page)
 db = room.databases[rep["database"]]
 check("build-db-named-app-dash-entity", db["name"] == "Cleanup sign-ups — Votes")
-check("build-db-has-the-schema-columns", {"Choice", "Comment", "Created by"} <= set(db["properties"]))
+check("build-db-has-the-schema-columns", {"Choice", "Comment", "Created by"} <= {c["name"] for c in db["properties"]})
 choice = next(a for a in room.calls if a[0] == "room.commons.databases.mutate"
               and a[1]["op"] == "prop_add" and a[1]["property"]["name"] == "Choice")
 check("build-options-adapted", [o["name"] for o in choice[1]["property"]["options"]] == ["Morning", "Afternoon"])
@@ -261,7 +273,8 @@ check("build-never-created-a-page", all(not (a == "room.commons.pages.create" an
                                         for a, b in room.calls))
 
 # --------------------------------------------------------------------------- the panel's database
-room = FakeRoom(databases={"d7k2m9x1": {"name": "Votes", "properties": ["Name", "Choice"], "views": []}})
+room = FakeRoom(databases={"d7k2m9x1": {"name": "Votes", "views": [], "properties": [
+    "Name", {"name": "Choice", "type": "select", "options": ["Option A", "Option B", "Option C"]}]}})
 out = run(room, task(template="poll", database="d7k2m9x1"))
 _, rep = reply_of(out)
 check("given-db-done", rep["status"] == "done" and rep["database"] == "d7k2m9x1")
@@ -396,9 +409,14 @@ check("explicit-template-wins", br.pick_template("vote on it", "planner") == "pl
 
 # A sign-up sheet is poll's model: one counted choice per person among fixed slots.
 for desc in ("An app for a sign-up sheet for a weekend event, morning or afternoon",
-             "signup for the potluck", "sign up for a shift", "RSVP for Friday", "the volunteer roster",
-             "pick a slot"):
+             "signup for the potluck", "sign up for a shift", "RSVP for Friday"):
     check(f"sign-up-words-pick-poll-{desc[:14]}", br.pick_template(desc) == "poll")
+# A planner or tracker word is the stronger one (Argus F3).
+for desc, want in (("weekly rota of shift slots", "planner"), ("plan the volunteer roster for the week", "planner"),
+                   ("schedule time slots for interviews", "planner"), ("a bug tracker for sign-up errors", "tracker"),
+                   ("track newsletter signups", "tracker"), ("a signups status tracker", "tracker"),
+                   ("task queue with slots", "tracker"), ("sign-up sheet for a board game night", "turn-game")):
+    check(f"stronger-word-wins-{desc[:18]}", br.pick_template(desc) == want)
 check("adaptation-names-the-template", br.pick_template("something unusual", None, "planner") == "planner")
 check("request-template-beats-the-words", br.pick_template("a sign-up sheet", "tracker") == "tracker")
 check("request-and-adaptation-agreeing-is-fine", br.pick_template("x", "poll", "poll") == "poll")
@@ -441,7 +459,8 @@ slot = next(a["property"] for act, a in room.calls if act == "room.commons.datab
 check("own-schema-options-are-sent", [o["name"] for o in slot["options"]] == ["Morning", "Afternoon"])
 
 # The panel's own database keeps what it has: only the missing columns are added to it.
-room = FakeRoom(databases={"d7k2m9x1": {"name": "Untitled", "properties": ["Name", "Slot"], "views": []}})
+room = FakeRoom(databases={"d7k2m9x1": {"name": "Untitled", "views": [], "properties": [
+    "Name", {"name": "Slot", "type": "select", "options": ["Morning", "Afternoon"]}]}})
 _, rep = reply_of(run(room, task(database="d7k2m9x1", template=None),
                       {"template": "poll", "html": "<p>own</p>", "schema": OWN}))
 check("panel-database-gets-only-the-missing-columns", rep["status"] == "done"
@@ -486,6 +505,92 @@ class LossyRoom(FakeRoom):
 
 _, rep = reply_of(run(LossyRoom(), task(template="poll")))
 check("read-back-mismatch-fails", rep["status"] == "failed" and "read back" in rep["reason"])
+
+# --------------------------------------------------------------------------- an own schema, checked in full (Argus F1, F2, F7)
+def schema_with(**over):
+    db = {"name": "Signups", "role": "primary", "props": [{"name": "Slot", "type": "select",
+                                                           "options": [{"name": "Morning"}]}], "views": []}
+    db.update(over)
+    return {"databases": [db]}
+
+
+BAD_SCHEMAS = {
+    "options-a-string": (schema_with(props=[{"name": "a", "type": "select", "options": "abc"}]), "list of at most"),
+    "options-not-objects": (schema_with(props=[{"name": "a", "type": "select", "options": ["x"]}]), "needs a name"),
+    "option-name-an-object": (schema_with(props=[{"name": "a", "type": "select", "options": [{"name": {}}]}]),
+                              "needs a name"),
+    "views-a-string": (schema_with(views="table"), "list of at most"),
+    "view-no-layout": (schema_with(views=[{"name": "x"}]), "needs a layout"),
+    "view-groups-by-nothing": (schema_with(views=[{"layout": "board", "groupBy": "Nope"}]), "not one of its columns"),
+    "too-many-columns": (schema_with(props=[{"name": f"c{i}", "type": "text"} for i in range(51)]), "more than 50"),
+    "a-long-name": (schema_with(props=[{"name": "x" * 101, "type": "text"}]), "longer than 100"),
+    "a-long-db-name": (schema_with(name="d" * 101), "longer than 100"),
+    "too-many-options": (schema_with(props=[{"name": "a", "type": "select",
+                                             "options": [{"name": f"o{i}"} for i in range(101)]}]), "at most 100"),
+    "too-many-views": (schema_with(views=[{"layout": "table"}] * 11), "at most 10"),
+    "unknown-type": (schema_with(props=[{"name": "a", "type": "evil"}]), "has type 'evil'"),
+    "a-relation": (schema_with(props=[{"name": "a", "type": "relation"}]), "has type 'relation'"),
+    "duplicate-names": (schema_with(props=[{"name": "A", "type": "text"}, {"name": "a", "type": "text"}]), "twice"),
+    "the-title-column": (schema_with(props=[{"name": "Name", "type": "text"}]), "title column"),
+    "options-off-a-select": (schema_with(props=[{"name": "a", "type": "text", "options": []}]), "only select"),
+    "a-$db-column": (schema_with(props=[{"name": "$db", "type": "text"}]), "may not start with $"),
+    "a-$app-option": (schema_with(props=[{"name": "a", "type": "select", "options": [{"name": "$app"}]}]),
+                      "may not start with $"),
+}
+for label, (bad, words) in BAD_SCHEMAS.items():
+    room, led = FakeRoom(), br.Ledger(Path(tempfile.mkdtemp()))
+    text = task(template="poll", request_id=f"{abs(hash(label)) % 10**8:08d}-0000-4000-8000-000000000000")
+    _, rep = reply_of(run(room, text, {"html": "<p>x</p>", "schema": bad}, led))
+    check(f"bad-own-schema-{label}", rep["status"] == "failed" and words in rep["reason"])
+    check(f"bad-own-schema-creates-nothing-{label}",
+          not any(act.endswith(("replace", "create", "mutate")) for act, _ in room.calls))
+    check(f"bad-own-schema-is-a-recorded-reply-{label}", led.claim(ROOM, br.parse(text)["request_id"])[0] == "done")
+
+
+# Anything after the claim ends in a recorded failed reply, never an exception (F1).
+class Exploding(FakeRoom):
+    def call(self, step):
+        if step["action"] == "room.commons.pages.list":
+            raise AttributeError("'str' object has no attribute 'get'")
+        return super().call(step)
+
+
+led = br.Ledger(Path(tempfile.mkdtemp()))
+text = task(template="poll", request_id="99999999-1111-4222-8333-444444444444")
+try:
+    out = run(Exploding(), text, {"app_name": "X"}, led)
+    _, rep = reply_of(out)
+    check("an-unexpected-error-is-a-failed-reply", rep["status"] == "failed" and "unexpectedly" in rep["reason"])
+except Exception as error:  # noqa: BLE001
+    check(f"an-unexpected-error-is-a-failed-reply ({type(error).__name__})", False)
+check("an-unexpected-error-releases-the-request", led.claim(ROOM, br.parse(text)["request_id"])[0] == "done")
+
+
+# An existing column in the panel's database: its type is compared and its options completed (F5).
+def panel_db(choice, rows=0):
+    return FakeRoom(databases={"d7k2m9x1": {"name": "Untitled", "views": [], "rows": rows,
+                                            "properties": ["Name", choice]}})
+
+
+slots = {"app_name": "Weekend", "options": {"Choice": ["Morning", "Afternoon"]}}
+room = panel_db({"name": "Choice", "type": "select", "options": ["Morning"]})
+_, rep = reply_of(run(room, task(database="d7k2m9x1", template="poll"), slots))
+updates = [a for act, a in room.calls if act == "room.commons.databases.mutate" and a.get("op") == "prop_update"]
+check("missing-options-are-added", rep["status"] == "done" and len(updates) == 1
+      and [o["name"] for o in updates[0]["property"]["options"]] == ["Morning", "Afternoon"])
+check("missing-options-reach-the-database",
+      next(p for p in room.databases["d7k2m9x1"]["properties"] if p["name"] == "Choice")["options"]
+      == ["Morning", "Afternoon"])
+room = panel_db({"name": "Choice", "type": "text"})
+_, rep = reply_of(run(room, task(database="d7k2m9x1", template="poll"), slots))
+check("a-column-of-another-type-fails-plainly", rep["status"] == "failed"
+      and "already has a text column Choice" in rep["reason"] and room.pages[PAGE] == "")
+room = panel_db({"name": "Choice", "type": "select", "options": ["Morning"]}, rows=3)
+_, rep = reply_of(run(room, task(database="d7k2m9x1", template="poll"), slots))
+check("options-are-never-replaced-on-a-database-with-rows", rep["status"] == "failed"
+      and "already has rows" in rep["reason"]
+      and not any(a.get("op") == "prop_update" for _, a in room.calls))
+
 
 # --------------------------------------------------------------------------- the command line
 import contextlib
@@ -535,6 +640,13 @@ with tempfile.TemporaryDirectory() as tmp:
         and json.loads(st["cli"][4]) == st["arguments"] for st in steps))
     check("cli-route-reads-are-reads", all(("--read" in st["cli"]) == bool(st.get("read")) for st in steps))
     check("cli-route-guide-is-an-account-read", steps[0]["cli"][:2] == ["action", "account"])
+    # Route parity: the same request planned on both routes is the same plan once `cli` is dropped (F4).
+    (tmp / "build4.txt").write_text(task(template="poll", request_id="14141414-3434-4565-8787-909090909090"),
+                                    encoding="utf-8")
+    _, mcp_out = cli("plan", str(tmp / "build4.txt"), "--ledger", str(tmp / "ledger-mcp"))
+    _, cli_out = cli("plan", str(tmp / "build4.txt"), "--route", "cli", "--ledger", str(tmp / "ledger-cli"))
+    check("cli-route-is-the-mcp-plan", [{k: v for k, v in st.items() if k != "cli"} for st in json.loads(cli_out)]
+          == json.loads(mcp_out))
     check("cli-route-bad-value", cli("plan", str(tmp / "build2.txt"), "--route", "carrier", "--ledger", led)[0] == 2)
     (tmp / "own.json").write_text(json.dumps({"template": "kanban"}), encoding="utf-8")
     (tmp / "build3.txt").write_text(task(template=None, request_id="13131313-3434-4565-8787-909090909090"),
@@ -738,8 +850,24 @@ with tempfile.TemporaryDirectory() as tmp:
     db_idx = next(i for i, st in enumerate(given_db) if st.get("expect_database"))
     (tmp / "db.json").write_text(json.dumps(given_db), encoding="utf-8")
     code, out = cli("check", str(tmp / "db.json"), str(db_idx), result("dbs.json", envelope_of(
-        {"databases": [{"database": "db:d1", "properties": [{"name": "Choice"}]}]})))
+        {"databases": [{"database": "db:d1", "rows": 0, "properties": [
+            {"name": "Choice", "type": "select", "options": ["Option A", "Option B", "Option C"]}]}]})))
     check("check-prints-the-columns-already-there", code == 0 and json.loads(out)["present"] == ["Choice"])
+    choice_step = next(i for i, st in enumerate(given_db) if st.get("skip_if_present") == "Choice")
+    check("check-says-to-skip-a-column-that-is-already-right",
+          code == 0 and json.loads(out)["columns"] == {str(choice_step): "skip"})
+    code, out = cli("check", str(tmp / "db.json"), str(db_idx), result("dbs1.json", envelope_of(
+        {"databases": [{"database": "db:d1", "rows": 0, "properties": [
+            {"name": "Choice", "type": "select", "options": ["Option A"]}]}]})))
+    replaced = json.loads(out)["columns"][str(choice_step)] if code == 0 else {}
+    check("check-gives-the-update-for-missing-options", replaced.get("arguments", {}).get("op") == "prop_update"
+          and [o["name"] for o in replaced["arguments"]["property"]["options"]] == ["Option A", "Option B", "Option C"])
+    code, out = cli("check", str(tmp / "db.json"), str(db_idx), result("dbs2.json", envelope_of(
+        {"databases": [{"database": "db:d1", "rows": 0, "properties": [{"name": "Choice", "type": "text"}]}]})))
+    check("check-fails-a-column-of-another-type", code == 1 and "already has a text column Choice" in out)
+    code, out = cli("check", str(tmp / "db.json"), str(db_idx), result("dbs3.json", envelope_of(
+        {"databases": [{"database": "db:d1", "properties": [{"name": "Choice"}]}]})))
+    check("check-fails-closed-on-a-column-without-a-type", code == 1)
     code, out = cli("check", str(tmp / "plan.json"), str(member_step), absent)
     check("check-owner-absent-fails", code == 1 and "the owner is not in room" in out)
     full = result("full.json", {"total_bytes": 9, "text": "<p>x</p>"})
