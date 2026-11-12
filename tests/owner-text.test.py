@@ -285,6 +285,18 @@ class Projection(unittest.TestCase):
         self.assertEqual(wire["title"], "Token [redacted] refused")
         self.assertNotIn("title", card_wire(blocked("m")))
 
+    def test_the_tool_input_summary_is_redacted_and_ids_are_kept(self):
+        command = f"curl -H 'Authorization: Bearer {KEY}' https://example.com/{HEX}"
+        req = blocked(f"Claude wants to run Bash: {command}", kind="permission",
+                      subject={"tool": "Bash", "input": command, "session": SESSION})
+        wire = card_wire(req)
+        self.assertNotIn(KEY, wire["subject"]["input"])
+        self.assertNotIn(KEY, wire["message"])
+        self.assertIn(HEX, wire["subject"]["input"], "an id is not a secret")
+        self.assertEqual(wire["subject"]["tool"], "Bash")
+        self.assertEqual(req.subject["input"], command, "the stored requirement is untouched")
+        self.assertEqual(card_wire(blocked("m", subject={"options": ["a"]}))["subject"], {"options": ["a"]})
+
     def test_a_reminder_goes_out_redacted_and_tagged_with_its_cards(self):
         req = self.mgr.create(blocked(f"Reviewer cannot use the key {KEY}", "Reviewer is stuck"))
         clock = [T0]

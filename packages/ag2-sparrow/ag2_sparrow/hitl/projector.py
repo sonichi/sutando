@@ -96,11 +96,15 @@ def fallback_body(req: HumanRequirement) -> str:
 
 
 def card_wire(req: HumanRequirement) -> Dict:
-    """The card as sent: `to_wire()` with key-like fragments redacted from the text a person reads."""
+    """The card as sent: `to_wire()` with key-like fragments redacted from the text a person
+    reads (the message, the title, the tool-input summary). Ids a tool needs are left as they are."""
     wire = req.to_wire()
     for key in ("message", "title"):
         if isinstance(wire.get(key), str):
             wire[key] = redact(wire[key])
+    subject = wire.get("subject")
+    if isinstance(subject, dict) and isinstance(subject.get("input"), str):
+        wire["subject"] = {**subject, "input": redact(subject["input"])}
     return wire
 
 
