@@ -41,6 +41,9 @@ LIMIT_MAX_ATTEMPTS = 4
 # A seat parked on a limit seen under one account, while another account is on disk now: the owner
 # signed in again, so its limit is over and the seat restarts on the new login (its owed work kept).
 RESTART_NEW_LOGIN = "restart_new_login"
+# The old binding stands until a restart is confirmed, so a failed try is tried again, this often:
+RELOGIN_RETRY_S = 300.0
+RELOGIN_MAX_ATTEMPTS = 3
 
 NOTHING, RECOVER, ESCALATE, REARM_WATCHER = "nothing", "recover", "escalate", "rearm_watcher"
 # A wedged live session's card: the cause named (abnormal text), a frozen turn
@@ -90,9 +93,8 @@ class Observation:
     # The banner's own reset words: an unchanged banner keeps the deadline it first parsed to.
     limit_banner: str | None = None
     # The pane waits on a provider limit and nothing else (pane_gate.limit_holds): no turn runs,
-    # the composer is empty. `account` is the account on disk at this tick (None: unread).
+    # the composer is empty.
     limit_parked: bool = False
-    account: str | None = None
 
 
 @dataclass(frozen=True)
@@ -119,13 +121,19 @@ class WorkerEvidence:
     limit_banner: str | None = None
     limit_reset_at: float | None = None
     # The account a parked seat's limit was first seen under; another one on disk ends the wait.
+    # It stays until a restart is confirmed; the tries so far and when the next one is due.
     limit_account: str | None = None
+    relogin_attempts: int = 0
+    relogin_next_at: float | None = None
 
 
 @dataclass(frozen=True)
 class SupervisionState:
     last_sample_at: float | None = None
     workers: dict[str, WorkerEvidence] = field(default_factory=dict)
+    # The account on disk at the last tick that read one: a seat first seen parked after the
+    # owner signed in is bound to it, the account its limit was hit under.
+    last_account: str | None = None
 
 
 def is_resume(now: float, last_sample_at: float | None,
@@ -172,22 +180,39 @@ def _wait_moved(obs: Observation, ev: WorkerEvidence) -> bool:
     return bool(ev.wedge_kind == "human" and now and before and now != before)
 
 
-def _new_login(ev: WorkerEvidence, obs: Observation) -> tuple[WorkerEvidence, bool]:
+def _new_login(ev: WorkerEvidence, obs: Observation, now: float, account: str | None,
+               before: str | None) -> tuple[WorkerEvidence, bool]:
     """(evidence, restart): a parked seat's limit is bound to the account it was first seen
-    under; while it stays parked and another known account is on disk, the wait is over. A seat
-    that runs or idles again ends the episode. An unknown account on either side binds nothing
-    and ends nothing, so an unreadable config keeps the reset-time wait."""
+    under, or, first seen just after a switch, to the account on disk the tick before (`before`).
+    While it stays parked and another known account is on disk, the wait is over: a restart is
+    due, at most RELOGIN_MAX_ATTEMPTS times RELOGIN_RETRY_S apart. The binding stands until the
+    restart is confirmed (`confirm_new_login`) or the seat runs or idles again, so a failed try is
+    tried again. An unknown account on either side binds nothing and ends nothing."""
     if obs.session_alive is not True:
         return ev, False
     if not obs.limit_parked:
-        if ev.limit_account and obs.pane in (PANE_IDLE, PANE_WORKING):
-            ev = replace(ev, limit_account=None)
+        if (ev.limit_account or ev.relogin_attempts) and obs.pane in (PANE_IDLE, PANE_WORKING):
+            ev = replace(ev, limit_account=None, relogin_attempts=0, relogin_next_at=None)
         return ev, False
-    bound = ev.limit_account or obs.account
-    if bound and obs.account and obs.account != bound:
-        return replace(_cleared_wedge(ev), limit_account=obs.account, limit_next_at=None, limit_attempts=0,
-                       limit_exhausted=False, limit_banner=None, limit_reset_at=None), True
-    return (replace(ev, limit_account=bound) if bound != ev.limit_account else ev), False
+    bound = ev.limit_account or (before if before and account and before != account else account)
+    if bound != ev.limit_account:
+        ev = replace(ev, limit_account=bound)
+    if not (bound and account and account != bound):
+        return ev, False
+    if ev.relogin_attempts >= RELOGIN_MAX_ATTEMPTS or (ev.relogin_next_at is not None and now < ev.relogin_next_at):
+        return ev, False
+    return replace(_cleared_wedge(ev), relogin_attempts=ev.relogin_attempts + 1,
+                   relogin_next_at=now + RELOGIN_RETRY_S * 2 ** ev.relogin_attempts), True
+
+
+def confirm_new_login(state: SupervisionState, worker_id: str, account: str | None) -> SupervisionState:
+    """The seat restarted on `account`: bind it there and end the episode, so it is not restarted again."""
+    ev = state.workers.get(worker_id, WorkerEvidence())
+    workers = dict(state.workers)
+    workers[worker_id] = replace(ev, limit_account=account, relogin_attempts=0, relogin_next_at=None,
+                                 limit_next_at=None, limit_attempts=0, limit_exhausted=False,
+                                 limit_banner=None, limit_reset_at=None)
+    return replace(state, workers=workers)
 
 
 def _wedge_kind(obs: Observation, ev: WorkerEvidence) -> str | None:
@@ -330,8 +355,11 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
              detect_after_s: float = DETECT_AFTER_S,
              escalate_after_s: float = ESCALATE_AFTER_S,
              fast_sustained_ticks: int = FAST_SUSTAINED_TICKS,
+             account: str | None = None,
              ) -> tuple[SupervisionState, dict[str, str]]:
-    """Advance one tick. Returns the new state and one decision per worker."""
+    """Advance one tick. Returns the new state and one decision per worker. `account` is the
+    account on disk now (None: unread), which the new-login rule compares a parked seat with."""
+    known = account if account is not None else state.last_account
     if is_resume(now, state.last_sample_at,
                  expected_period_s=expected_period_s, slack_s=slack_s):
         # Discarded as evidence: the clock moved, the pool did not necessarily die.
@@ -346,7 +374,7 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
                     ev, consecutive=ev.consecutive + 1,
                     first_detected_at=(ev.first_detected_at
                                        if ev.first_detected_at is not None else now))
-        return (SupervisionState(last_sample_at=now, workers=workers),
+        return (SupervisionState(last_sample_at=now, workers=workers, last_account=known),
                 {w: NOTHING for w in observations})
 
     workers = dict(state.workers)
@@ -365,7 +393,7 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
 
         ev = workers.get(worker_id, WorkerEvidence())
 
-        ev, restart = _new_login(ev, obs)
+        ev, restart = _new_login(ev, obs, now, account, state.last_account)
         if restart:
             workers[worker_id] = ev
             decisions[worker_id] = RESTART_NEW_LOGIN
@@ -451,4 +479,4 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
         workers[worker_id] = ev
         decisions[worker_id] = decision
 
-    return SupervisionState(last_sample_at=now, workers=workers), decisions
+    return SupervisionState(last_sample_at=now, workers=workers, last_account=known), decisions

@@ -252,18 +252,6 @@ def observe_pane(workspace, worker_id, runtime: str = "claude", *,
                                               if kind == ps.PANE_LIMIT else None), parked)
 
 
-class _Once:
-    """A reading taken at most once per tick, on first use."""
-
-    def __init__(self, read):
-        self._read, self._done, self._value = read, False, None
-
-    def __call__(self):
-        if not self._done:
-            self._value, self._done = self._read(), True
-        return self._value
-
-
 def current_account() -> str | None:
     """The account on disk now in the config dir the seats launch with (core_limit_hold's reader:
     a digest of non-secret identity fields, never a token); None when it cannot be read."""
@@ -317,7 +305,6 @@ def observe(workspace, now: float, *, worker_ids=None,
         rows = {w: rows[w] for w in worker_ids if w in rows}
     obs = {}
     blocks = {}
-    account = _Once(current_account)
     for wid, row in rows.items():
         session_alive = probe_session(workspace, wid, runner=runner)
         watcher_beat = pb.classify(pb.beat_path(workspace, "watcher", wid), now)
@@ -346,8 +333,6 @@ def observe(workspace, now: float, *, worker_ids=None,
             limit_banner=reset.banner if reset else None,
             delivery_block=blocks.get(socket) if socket else None,
             limit_parked=parked,
-            # Read only for a parked seat: it is the one the new-login rule asks about.
-            account=account() if parked else None,
         )
     return obs
 
@@ -454,11 +439,13 @@ def load_state(workspace) -> ps.SupervisionState:
                 limit_banner=ev.get("limit_banner"),
                 limit_reset_at=ev.get("limit_reset_at"),
                 limit_account=ev.get("limit_account"),
+                relogin_attempts=int(ev.get("relogin_attempts") or 0),
+                relogin_next_at=ev.get("relogin_next_at"),
             )
     last = raw.get("last_sample_at")
     return ps.SupervisionState(
         last_sample_at=float(last) if isinstance(last, (int, float)) else None,
-        workers=workers)
+        workers=workers, last_account=raw.get("last_account"))
 
 
 def save_state(workspace, state: ps.SupervisionState) -> None:
@@ -466,6 +453,7 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "last_sample_at": state.last_sample_at,
+        "last_account": state.last_account,
         "workers": {w: {"first_detected_at": e.first_detected_at,
                         "consecutive": e.consecutive,
                         "recover_issued_at": e.recover_issued_at,
@@ -484,7 +472,9 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
                         "limit_exhausted": e.limit_exhausted,
                         "limit_banner": e.limit_banner,
                         "limit_reset_at": e.limit_reset_at,
-                        "limit_account": e.limit_account}
+                        "limit_account": e.limit_account,
+                        "relogin_attempts": e.relogin_attempts,
+                        "relogin_next_at": e.relogin_next_at}
                     for w, e in state.workers.items()},
     }
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".pool-supervision.")
@@ -495,6 +485,11 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+def confirm_new_login(workspace, worker_id, account) -> None:
+    """Persist that `worker_id` restarted on `account` (pool_supervision.confirm_new_login)."""
+    save_state(workspace, ps.confirm_new_login(load_state(workspace), worker_id, account))
 
 
 def acknowledge_cards(workspace, worker_ids) -> None:
@@ -515,7 +510,9 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
     state = load_state(workspace)
     obs = observe(workspace, now, worker_ids=worker_ids, runner=runner)
     period = ps.SAMPLE_PERIOD_S
-    new_state, decisions = ps.evaluate(state, obs, now, expected_period_s=period)
+    # Read every tick a seat runs, so a seat first seen parked just after a switch has the account before it.
+    account = current_account() if any(o.session_alive is True for o in obs.values()) else None
+    new_state, decisions = ps.evaluate(state, obs, now, expected_period_s=period, account=account)
     retired, retire_errors, deferred = {}, {}, {}
     if persist:
         save_state(workspace, new_state)

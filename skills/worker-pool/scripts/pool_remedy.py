@@ -461,10 +461,14 @@ def tell_owner(workspace, prefix: str, text: str) -> str:
 
 
 def restart_on_new_login(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
-    """Restart a seat parked on the old account's limit, under the sweep's lock: re-read its pane
-    first and leave it alone unless it still waits on that limit and nothing else (a turn that
-    started since the tick is never interrupted), then take it down and resume its session.
-    Its owed deliveries stay its own: `recover` re-offers what a killed turn left mid-work."""
+    """Restart a seat parked on the old account's limit, under the sweep's lock: leave it alone
+    under a pool suspension, or unless its pane still waits on that limit and nothing else (a turn
+    started since the tick is never interrupted); then take it down and resume its session. Its
+    owed deliveries stay its own: `recover` re-offers what a killed turn left mid-work. Only a
+    RECOVERED seat is bound to the new account; any other outcome keeps the old binding, so the
+    sweep tries again (pool_supervision.RELOGIN_MAX_ATTEMPTS)."""
+    if suspension(workspace):
+        return {"worker_id": worker_id, "outcome": SUSPENDED}
     run = runner or subprocess.run
     socket, session = sup._open_tmux(workspace, worker_id)
     if not socket:
@@ -476,32 +480,57 @@ def restart_on_new_login(workspace, repo, worker_id, *, runner=None, spawn=None)
         return {"worker_id": worker_id, "outcome": INDETERMINATE, "why": "capture failed"}
     if capture.returncode != 0 or not sup.pane_gate.limit_holds(capture.stdout, sup.pane_gate.CLAUDE):
         return {"worker_id": worker_id, "outcome": "pane-changed",
-                "why": "the seat no longer waits on the limit alone; left as it is"}
-    down = _sibling("pool_manage").take_down_held(workspace, worker_id, run)
-    sup.set_paused(workspace, worker_id, False)
+                "why": "it was busy again, so it was left as it is"}
+    try:
+        down = _sibling("pool_manage").take_down_held(workspace, worker_id, run)
+    except Exception as e:  # noqa: BLE001 - the seat is unpaused below, whatever the take-down raised
+        down = {"down": False, "sessions": {}, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        sup.set_paused(workspace, worker_id, False)
     if not down["down"]:
         return {"worker_id": worker_id, "outcome": FAILED, "sessions": down["sessions"],
-                "why": "tmux could not confirm the parked seat gone"}
-    return {**recover(workspace, repo, worker_id, runner=runner, spawn=spawn),
-            "taken_down": down["sessions"]}
+                "why": down.get("error") or "tmux could not confirm the parked seat gone"}
+    out = {**recover(workspace, repo, worker_id, runner=runner, spawn=spawn), "taken_down": down["sessions"]}
+    if out["outcome"] == RECOVERED:
+        sup.confirm_new_login(workspace, worker_id, sup.current_account())
+    return out
+
+
+def _try_owner(workspace, prefix: str, text: str):
+    try:
+        return tell_owner(workspace, prefix, text)
+    except OSError as e:
+        print(f"pool_remedy: the owner's note could not be queued ({type(e).__name__}: {e})", file=sys.stderr)
+        return None
+
+
+def _left_for(workspace, worker_id) -> str:
+    ev = sup.load_state(workspace).workers.get(worker_id, ps.WorkerEvidence())
+    if ev.relogin_attempts >= ps.RELOGIN_MAX_ATTEMPTS:
+        return f"no more automatic tries; restart it with: pool_manage.py reseat {_label(workspace, worker_id)}"
+    return "I'll try again on a later sweep"
 
 
 def restart_new_logins(workspace, repo, worker_ids, *, runner=None, spawn=None) -> dict:
     """The owner signed in again: say which seats restart, restart them without waiting for an
-    answer, and say so again only for the ones that failed."""
+    answer, and write again only when one did not come back. A note that cannot be queued
+    restarts nothing this sweep (the next one tries again), and never aborts the sweep."""
     if not worker_ids:
         return {}
     names = [_label(workspace, w) for w in worker_ids]
     n = len(names)
-    tell_owner(workspace, "pool-new-login",
-               f"I'm back on a new login; restarting {n} worker{'s' if n != 1 else ''} parked on the old "
-               f"limit: {', '.join(names)}.")
+    if _try_owner(workspace, "pool-new-login",
+                  f"I'm back on a new login; restarting {n} worker{'s' if n != 1 else ''} parked on the old "
+                  f"limit: {', '.join(names)}.") is None:
+        return {w: {"worker_id": w, "outcome": "note-failed",
+                    "why": "the owner's note could not be queued; nothing was restarted"} for w in worker_ids}
     done = {w: restart_on_new_login(workspace, repo, w, runner=runner, spawn=spawn) for w in worker_ids}
-    failed = [f"{_label(workspace, w)} ({r.get('why') or r['outcome']})" for w, r in done.items()
-              if r["outcome"] not in (RECOVERED, "pane-changed")]
-    if failed:
-        tell_owner(workspace, "pool-new-login-failed",
-                   f"Could not restart on the new login: {'; '.join(failed)}. The rest are back.")
+    back = [w for w, r in done.items() if r["outcome"] == RECOVERED]
+    left = [f"{_label(workspace, w)} ({r.get('why') or r['outcome']}; {_left_for(workspace, w)})"
+            for w, r in done.items() if r["outcome"] != RECOVERED]
+    if left:
+        rest = " The rest are back." if back else ""
+        _try_owner(workspace, "pool-new-login-failed", f"Not restarted on the new login: {'; '.join(left)}.{rest}")
     return done
 
 

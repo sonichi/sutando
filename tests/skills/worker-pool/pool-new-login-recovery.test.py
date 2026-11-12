@@ -158,6 +158,14 @@ class Pool(unittest.TestCase):
             rc = rem.main(["--workspace", str(self.ws), "--repo", str(REPO), "--sweep"], runner=self.runner)
         return rc, json.loads(out.getvalue())
 
+    def sweep_until(self, wid, *, most=8):
+        """Sweep at the normal cadence until `wid` is acted on (its backoff allows a try); its outcome."""
+        for _ in range(most):
+            rc, out = self.sweep()
+            if wid in out["recoveries"]:
+                return rc, out["recoveries"][wid]
+        return None, None
+
     def notes(self):
         return sorted(p.read_text() for p in (self.ws / "results").glob("proactive-*.txt"))
 
@@ -202,7 +210,7 @@ class NewLogin(Pool):
         self.assertIn(self.seat(mars), self.alive)
         self.assertIn("1 worker parked on the old limit: Baxter.", self.notes()[0])
 
-    def test_a_turn_that_starts_after_the_tick_is_left_alone(self):
+    def test_a_turn_that_starts_after_the_tick_is_left_alone_and_said_so(self):
         mars = next(iter(self.WORKERS))
         self.show(mars, PARKED)
         self.sweep()
@@ -212,6 +220,11 @@ class NewLogin(Pool):
         self.assertEqual(out["recoveries"][mars]["outcome"], "pane-changed")
         self.assertEqual(self.spawned, [])
         self.assertIn(self.seat(mars), self.alive)
+        self.assertIn("Not restarted on the new login: Mars (it was busy again", self.notes()[0] + self.notes()[1])
+        self.assertNotIn("The rest are back", "".join(self.notes()), "none came back")
+        self.show(mars, PARKED)  # it parked again on the old account's limit: a later sweep tries again
+        self.sweep_until(mars)
+        self.assertEqual(self.spawned, [(mars, "s0")], "the binding stood, so the try came again")
 
     def test_owed_work_stays_the_seats_across_the_restart(self):
         mars = next(iter(self.WORKERS))
@@ -226,21 +239,125 @@ class NewLogin(Pool):
         self.assertIs(sup.work_outstanding(self.ws, mars), True)
         self.assertFalse(sup.is_paused(self.ws, mars), "the take-down's pause is lifted for the new seat")
 
-    def test_a_failed_restart_is_told_after_the_note(self):
+    def test_a_failed_restart_is_told_and_tried_again_up_to_the_cap(self):
         mars = next(iter(self.WORKERS))
         self.show(mars, PARKED)
         self.sweep()
         self.account = B
+        real_runner = self.runner
 
-        def refuse(*a, **kw):
-            raise rem.sw.SpawnRefused("the seat could not start")
-        self.spawn = refuse
-        rc, out = self.sweep()
-        self.assertEqual(rc, 1)
+        def kill_unconfirmed(argv, **kw):  # tmux cannot confirm the parked seat gone, so it stays up
+            if "kill-session" in argv and self.seat(mars) in argv[-1]:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            return real_runner(argv, **kw)
+        self.runner = kill_unconfirmed
+        for attempt in range(1, ps.RELOGIN_MAX_ATTEMPTS + 1):
+            rc, got = self.sweep_until(mars)
+            self.assertEqual((rc, got["outcome"]), (1, rem.FAILED), attempt)
+        self.assertEqual(self.sweep_until(mars), (None, None), "past the cap it is not tried again")
+        joined = "".join(self.notes())
+        self.assertIn("Not restarted on the new login: Mars (tmux could not confirm the parked seat gone; "
+                      "I'll try again", joined)
+        self.assertIn("no more automatic tries; restart it with: pool_manage.py reseat Mars", joined)
+        self.assertEqual(sup.load_state(self.ws).workers[mars].limit_account, A, "never bound to B: not restarted")
+        self.assertFalse(sup.is_paused(self.ws, mars))
+        self.runner = real_runner
+        self.show(mars, IDLE)  # the owner restarted it by hand: the episode ends
+        self.sweep()
+        self.assertEqual(sup.load_state(self.ws).workers[mars].relogin_attempts, 0)
+
+    def test_the_note_comes_before_any_restart(self):
+        mars, baxter = list(self.WORKERS)
+        self.show(mars, PARKED)
+        self.show(baxter, PARKED)
+        self.sweep()
+        self.account = B
+        events, real_tell, real_spawn = [], rem.tell_owner, self.spawn
+        self.spawn = lambda ws, repo, **kw: (events.append("restart"), real_spawn(ws, repo, **kw))[1]
+        with patch.object(rem, "tell_owner", side_effect=lambda *a: (events.append("note"), real_tell(*a))[1]):
+            self.sweep()
+        self.assertEqual(events, ["note", "restart", "restart"])
+
+    def test_a_note_that_cannot_be_queued_restarts_nothing_and_the_sweep_goes_on(self):
+        mars = next(iter(self.WORKERS))
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+        with patch.object(rem, "tell_owner", side_effect=OSError("disk full")):
+            rc, out = self.sweep()
+        self.assertEqual((rc, out["recoveries"][mars]["outcome"]), (0, "note-failed"))
+        self.assertEqual(self.spawned, [])
+        self.assertIn("cards_closed", out, "the rest of the sweep still ran")
+        self.assertEqual(self.sweep_until(mars)[1]["outcome"], rem.RECOVERED, "a later sweep tries again")
+        self.assertEqual(self.spawned, [(mars, "s0")])
+
+    def test_a_failing_take_down_never_leaves_the_seat_paused(self):
+        mars = next(iter(self.WORKERS))
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+        with patch.object(rem, "close_dead_runs", side_effect=OSError("runs unreadable")):
+            _, out = self.sweep()
         self.assertEqual(out["recoveries"][mars]["outcome"], rem.FAILED)
-        notes = self.notes()
-        self.assertEqual(len(notes), 2)
-        self.assertIn("Could not restart on the new login: Mars (the seat could not start)", "".join(notes))
+        self.assertIn("OSError: runs unreadable", out["recoveries"][mars]["why"])
+        self.assertFalse(sup.is_paused(self.ws, mars), "supervision still sees it")
+
+    def test_a_suspension_written_during_the_sweep_stops_the_kill(self):
+        mars = next(iter(self.WORKERS))
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+        real_tell = rem.tell_owner
+
+        def quit_then_tell(*a):
+            rem.suspend(self.ws, "the app is quitting")  # lands after the decision, before the take-down
+            return real_tell(*a)
+        with patch.object(rem, "tell_owner", side_effect=quit_then_tell):
+            _, out = self.sweep()
+        self.assertEqual(out["recoveries"][mars]["outcome"], rem.SUSPENDED)
+        self.assertIn(self.seat(mars), self.alive, "nothing was killed")
+        self.assertEqual(self.spawned, [])
+
+    def test_a_seat_first_seen_parked_after_the_sign_in_is_still_restarted(self):
+        mars = next(iter(self.WORKERS))
+        self.sweep()  # running on A: the pool reads A
+        self.account = B  # the owner signs in, and the seat had parked on A's limit in between
+        self.show(mars, PARKED)
+        _, out = self.sweep()
+        self.assertEqual(out["decisions"][mars], ps.RESTART_NEW_LOGIN)
+        self.assertEqual(self.spawned, [(mars, "s0")])
+
+    def test_an_accepted_task_in_flight_is_still_the_seats_after_the_restart(self):
+        mars = next(iter(self.WORKERS))
+        self.owe(mars, "task-in-flight")
+        inbox = rem.pd.deliveries_dir(self.ws, mars)
+        rem.pd.accept(inbox / "task-in-flight.txt")
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+        _, out = self.sweep()
+        self.assertEqual(out["recoveries"][mars]["outcome"], rem.RECOVERED)
+        kept = sorted(p.name for p in inbox.glob("task-in-flight.*"))
+        self.assertTrue(kept, "the accepted task is neither dropped nor handed away")
+        self.assertIs(sup.work_outstanding(self.ws, mars), True)
+
+
+class CodexIsNotRestarted(Pool):
+    WORKERS = {"c" * 32: "Reviewer"}
+
+    def setUp(self):
+        super().setUp()
+        (self.ws / "state" / "roster.json").write_text(json.dumps(
+            {"workers": {w: {"state": "live", "runtime": "codex", "label": n} for w, n in self.WORKERS.items()}}))
+
+    def test_a_codex_seat_under_a_limit_banner_is_left_to_its_own_reset(self):
+        w = next(iter(self.WORKERS))
+        self.show(w, PARKED)
+        self.sweep()
+        self.account = B
+        _, out = self.sweep()
+        self.assertNotEqual(out["decisions"].get(w), ps.RESTART_NEW_LOGIN)
+        self.assertEqual(self.spawned, [])
 
     def test_an_unreadable_account_binds_nothing_and_ends_nothing(self):
         mars = next(iter(self.WORKERS))
