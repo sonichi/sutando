@@ -2759,6 +2759,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # The UI-control handle, present only when the owner's message was stamped.
                 # Above "task" so the strict parser reads it and a body cannot claim it.
                 "ui_origin",
+                # A card click's `space.ag2.card_click`, one JSON line (branch below). Above "task" so a
+                # body cannot claim it; the agent acts on a card command only with it.
+                "card_click",
                 "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -2777,6 +2780,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 "platform_card",
                 # A room question this agent is asked: one line of quoted room data (branch below).
                 "room_question")
+
+# A card click's bounds: the card id as the backend forwards it, the action as the client caps a reply.
+_CARD_CLICK_MAX = {"card_id": 200, "action": 1000}
 
 # platform_card passes through with exactly these subkeys — a signed pointer
 # {card_url, card_sha256, sig, key_id, alg} to the platform's canonical agent
@@ -6352,6 +6358,15 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             uo = task.get(f)
             if isinstance(uo, str) and _UI_ORIGIN_RE.fullmatch(uo):
                 lines.append(f"ui_origin: {uo}")
+        elif f == "card_click":
+            click = task.get(f)
+            if isinstance(click, dict) and all(isinstance(click.get(k), str) and click[k].strip()
+                                               and len(click[k]) <= limit for k, limit in _CARD_CLICK_MAX.items()):
+                lines.append("card_click: " + json.dumps({"card_id": click["card_id"], "action": click["action"]},
+                                                         separators=(",", ":")))
+            elif click not in (None, ""):
+                # A click that cannot be used stays a click: the agent refuses it, never reads it as chat.
+                lines.append("card_click: invalid")
         elif f == "owner_mentioned":
             if task.get(f) == "true":  # the broker's exact string only; nothing else is a claim
                 lines.append("owner_mentioned: true")
