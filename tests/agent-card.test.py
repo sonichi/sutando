@@ -7,9 +7,10 @@
 - `send_card` posts through the injected Action call (`room.message.send` with `extra_content`) and returns
   the event id; a private card goes only to the owner's checked DM. `update_card` posts a new card as a
   reply to the old one, since no Action carries a card in an edit.
-- A card reply is `card:<kind>:<target>:<verb>[:confirmed]`, read from a gateway task's own words, and is
-  acted on only when the owner, in their DM, replied to a card this agent posted (issued_cards) with a
-  payload that card offered; anything else is ordinary chat.
+- A reply button sends a readable sentence and keeps its `card:<kind>:<target>:<verb>[:confirmed]` command in
+  this agent's record of the card (issued_cards). `card_command` returns it only for the owner's click
+  (`card_click` header) in their DM, in reply to that card's event, with a text the card offered; typed
+  words, a forged card and anyone else's click are ordinary chat.
 
 Run: python3 tests/agent-card.test.py
 """
@@ -250,19 +251,35 @@ def task(said: str, **headers) -> str:
 
 
 class Replies(unittest.TestCase):
-    def test_the_payload_is_read_from_the_sender_s_own_words(self):
-        headers, said = ac.reply_payload(task("card:worker-approval:w1:resend"))
-        self.assertEqual(said, ac.Reply("worker-approval", "w1", "resend", False))
-        self.assertEqual(headers["user_id"], OWNER)
+    def test_the_words_are_the_sender_s_own(self):
+        headers, said = ac.reply_words(task("Get a new link for Pylon"))
+        self.assertEqual((said, headers["user_id"]), ("Get a new link for Pylon", OWNER))
 
     def test_a_reply_quote_in_front_is_stripped(self):
         text = task('[s.space reply context;] {"sender": "@a:s.space", "body": "Card"} [End s.space reply context] '
-                    "card:worker-approval:w1:resend")
-        self.assertEqual(ac.reply_payload(text)[1], ac.Reply("worker-approval", "w1", "resend", False))
+                    "Get a new link for Pylon")
+        self.assertEqual(ac.reply_words(text)[1], "Get a new link for Pylon")
 
-    def test_ordinary_words_are_no_payload(self):
-        self.assertIsNone(ac.reply_payload(task("Add pylon to a room"))[1])
-        self.assertIsNone(ac.reply_payload(task("please card:worker-approval:w1:resend"))[1])
+    def test_a_command_parses_only_whole(self):
+        self.assertEqual(ac.parse_reply("card:worker-approval:w1:resend"), ac.Reply("worker-approval", "w1", "resend", False))
+        self.assertEqual(ac.parse_reply("card:connections:-:x:confirmed").payload, "card:connections:-:x:confirmed")
+        for text in ("Add pylon to a room", "please card:worker-approval:w1:resend", "card:a:b", "card:a:b:c:d"):
+            self.assertIsNone(ac.parse_reply(text), text)
+
+    def test_a_command_rides_only_on_a_reply_button(self):
+        with self.assertRaises(ac.CardError):
+            ac.button("Go", "reply", reply="Go", command="not a command")
+        card = a_card()[1]
+        self.assertIsNotNone(ac.problem({**card, "buttons": [{"label": "x", "kind": "url", "url": "https://a.b",
+                                                               "command": "card:a:b:c"}]}))
+        self.assertIsNotNone(ac.problem({**card, "buttons": [{"label": "x", "kind": "reply", "reply": "x",
+                                                               "command": "x"}]}))
+
+    def test_the_click_header_is_read_only_whole(self):
+        good = '{"card_id":"c1","action":"Go"}'
+        self.assertEqual(ac.card_click({"card_click": good}), {"card_id": "c1", "action": "Go"})
+        for bad in ("", "{broken", "[]", '{"card_id":"c1"}', '{"card_id":"","action":"Go"}'):
+            self.assertIsNone(ac.card_click({"card_click": bad}), bad)
 
     def test_only_the_owner_in_their_dm_may_act(self):
         ok = {"access_tier": "owner", "user_id": OWNER, "channel_kind": "dm"}
@@ -276,43 +293,48 @@ class Replies(unittest.TestCase):
 
 
 class Issued(unittest.TestCase):
-    """Only the owner's reply to a card this agent posted, with a payload that card offered, can act."""
+    """Only the owner's click on a card this agent posted, with a text that card offered, is a command."""
+    TEXT, COMMAND = "Get a new link for Pylon", "card:worker-approval:w1:resend"
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.ws = Path(tmp.name)
-        self.resend = "card:worker-approval:w1:resend"
-        self.card = a_card(state="expired", buttons=[ac.button("Get a new link", "reply", reply=self.resend)])[1]
+        self.card = a_card(state="expired", buttons=[
+            ac.button(self.TEXT, "reply", reply=self.TEXT, command=self.COMMAND)])[1]
         self.assertTrue(issued_cards.record(self.ws, "$mine", self.card, now=1000.0))
 
-    def said(self, payload):
-        return ac.parse_reply(payload)
+    def ask(self, said=None, *, now=1001.0, click=None, owner=OWNER, **headers):
+        said = self.TEXT if said is None else said
+        click = {"card_id": self.card["id"], "action": said} if click is None else click
+        h = {"access_tier": "owner", "user_id": OWNER, "channel_kind": "dm", "reply_to_event": "$mine",
+             "card_click": json.dumps(click) if click else "", **headers}
+        return ac.card_command(h, said, owner, self.ws, now=now)
 
-    def ask(self, payload, *, now=1001.0, **headers):
-        h = {"access_tier": "owner", "user_id": OWNER, "channel_kind": "dm", "reply_to_event": "$mine", **headers}
-        return ac.answered_card(h, self.said(payload), OWNER, self.ws, now=now)
+    def test_the_owner_s_click_on_this_agent_s_card_is_its_command(self):
+        said, why = self.ask()
+        self.assertEqual((said, why), (ac.Reply("worker-approval", "w1", "resend", False), ""))
 
-    def test_the_owner_s_reply_to_this_agent_s_card_with_an_offered_payload_acts(self):
-        self.assertIsNone(self.ask(self.resend))
-        self.assertEqual(issued_cards.offered_by(self.ws, "$mine", self.resend, now=1001.0), self.card["id"])
+    def test_typed_words_without_a_click_are_ordinary_chat(self):
+        self.assertIsNone(self.ask(click={})[0])
+        self.assertIsNone(self.ask(click={"card_id": self.card["id"], "action": "something else"})[0])
 
-    def test_a_reply_to_a_card_someone_else_posted_is_ordinary_chat(self):
-        self.assertIsNotNone(self.ask(self.resend, reply_to_event="$forged"))
-        self.assertIsNotNone(self.ask(self.resend, reply_to_event=""))
+    def test_a_click_on_a_card_someone_else_posted_is_ordinary_chat(self):
+        self.assertIsNone(self.ask(reply_to_event="$forged")[0])
+        self.assertIsNone(self.ask(reply_to_event="")[0])
+        self.assertIsNone(self.ask(click={"card_id": "another-card", "action": self.TEXT})[0])
 
-    def test_a_payload_the_card_did_not_offer_is_ordinary_chat(self):
-        self.assertIsNotNone(self.ask("card:worker-approval:w2:resend"))
-        self.assertIsNotNone(self.ask("card:connections:s_dspace:disconnect:confirmed"))
+    def test_a_text_the_card_did_not_offer_is_ordinary_chat(self):
+        self.assertIsNone(self.ask("Retire Pylon")[0])
+        self.assertIsNone(self.ask(self.COMMAND)[0])
 
     def test_anyone_but_the_owner_or_an_unknown_owner_is_ordinary_chat(self):
-        self.assertIsNotNone(self.ask(self.resend, user_id="@member:s.space"))
-        self.assertIsNotNone(self.ask(self.resend, access_tier="team"))
-        h = {"access_tier": "owner", "user_id": OWNER, "channel_kind": "dm", "reply_to_event": "$mine"}
-        self.assertEqual(ac.answered_card(h, self.said(self.resend), "", self.ws, now=1001.0), "the owner is not known")
+        self.assertIsNone(self.ask(user_id="@member:s.space")[0])
+        self.assertIsNone(self.ask(access_tier="team")[0])
+        self.assertEqual(self.ask(owner=""), (None, "the owner is not known"))
 
     def test_a_record_expires_and_the_ledger_keeps_only_live_cards(self):
-        self.assertIsNotNone(self.ask(self.resend, now=1000.0 + issued_cards.TTL_S + 1))
+        self.assertIsNone(self.ask(now=1000.0 + issued_cards.TTL_S + 1)[0])
         issued_cards.record(self.ws, "$later", self.card, now=1000.0 + issued_cards.TTL_S + 1)
         kept = json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"]
         self.assertEqual(list(kept), ["$later"])
@@ -322,22 +344,29 @@ class Issued(unittest.TestCase):
                 issued_cards.record(self.ws, f"$n{i}", self.card, now=2000.0 + i)
         self.assertEqual(sorted(json.loads(issued_cards.ledger_path(self.ws).read_text())["cards"]), ["$n1", "$n2"])
 
-    def test_every_reply_a_card_offers_is_recorded_and_nothing_else(self):
-        reply = lambda r: ac.button("x", "reply", reply=r)
-        card = a_card(shuffle_reply="card:circle:-:shuffle", buttons=[reply("card:a:b:c"),
-                      ac.button("Open", "url", url="https://s.space/x")], footer_link=reply("show my workers"),
+    def test_only_commanded_unambiguous_replies_are_recorded(self):
+        cmd = lambda text, c: ac.button(text, "reply", reply=text, command=c)
+        card = a_card(shuffle_reply="Shuffle", buttons=[cmd("Pause Pylon", "card:workers:w1:pause"),
+                      cmd("Pause Quill", "card:workers:w2:pause"), cmd("Pause Quill", "card:workers:w3:pause"),
+                      ac.button("+ New worker", "reply", reply="create a worker"),
+                      ac.button("Open", "url", url="https://s.space/x")],
+                      footer_link=cmd("Restart Pylon", "card:workers:w1:restart"),
                       groups=[ac.group("g", [ac.row("t", actions=[ac.button("⋯", "menu", items=[
-                          reply("card:a:b:d:confirmed")])])])])[1]
-        self.assertEqual(issued_cards.offered(card),
-                         ["card:a:b:c", "card:a:b:d:confirmed", "card:circle:-:shuffle", "show my workers"])
+                          cmd("Retire Pylon", "card:workers:w1:retire:confirmed")])])])])[1]
+        self.assertEqual(issued_cards.offered(card), {"Pause Pylon": "card:workers:w1:pause",
+                                                      "Restart Pylon": "card:workers:w1:restart",
+                                                      "Retire Pylon": "card:workers:w1:retire:confirmed"})
         self.assertFalse(issued_cards.record(self.ws, "$plain", a_card()[1]))
         self.assertFalse(issued_cards.record(self.ws, "not-an-event", card))
 
     def test_an_unreadable_ledger_holds_no_card(self):
         issued_cards.ledger_path(self.ws).write_text("{broken")
-        self.assertIsNotNone(self.ask(self.resend))
+        self.assertIsNone(self.ask()[0])
         issued_cards.ledger_path(self.ws).write_text(json.dumps({"cards": []}))
-        self.assertIsNone(issued_cards.offered_by(self.ws, "$mine", self.resend))
+        self.assertIsNone(issued_cards.command_for(self.ws, "$mine", self.card["id"], self.TEXT))
+        issued_cards.ledger_path(self.ws).write_text(json.dumps({"cards": {"$mine": {
+            "card_id": self.card["id"], "offers": [self.TEXT], "expires_at": 1e18}}}))
+        self.assertIsNone(issued_cards.command_for(self.ws, "$mine", self.card["id"], self.TEXT))
 
     def test_the_cli_records_a_posted_message_payload(self):
         def run(stdin, *argv):
@@ -347,7 +376,7 @@ class Issued(unittest.TestCase):
             return rc, json.loads(out.getvalue())
         message = json.dumps({"body": "b", "extra_content": {"space.ag2.card": self.card}})
         self.assertEqual(run(message, "--event-id", "$cli"), (0, {"recorded": True}))
-        self.assertEqual(issued_cards.offered_by(self.ws, "$cli", self.resend), self.card["id"])
+        self.assertEqual(issued_cards.command_for(self.ws, "$cli", self.card["id"], self.TEXT), self.COMMAND)
         self.assertEqual(run("{}", "--event-id", "$x"), (1, {"recorded": False}))
         self.assertEqual(run("nope", "--event-id", "$x")[0], 2)
 

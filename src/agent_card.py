@@ -4,11 +4,11 @@ A card rides on an ordinary room message as `content["space.ag2.card"]` beside a
 that older clients show. `build` returns that pair, `problem` checks a card the way the web client does
 (unknown fields allowed, required keys present, only http(s) links), and `send_card` posts one through
 the s.space Action `room.message.send` with an injected Action client, so this module holds no HTTP
-client of its own. A card button of kind `reply` comes back as the clicker's reply to the card: an
-ordinary task whose message is a `card:<kind>:<target>:<verb>[:confirmed]` payload, read by
-`reply_payload` and acted on only through `answered_card`: the owner's reply to a card this agent
-posted (issued_cards), carrying a payload that card offered. Standard library only, plus
-local_task_protocol and issued_cards.
+client of its own. A card button of kind `reply` sends its `reply` text (a sentence the owner can read)
+as the clicker's reply to the card, with `space.ag2.card_click` beside it; its `command` (a
+`card:<kind>:<target>:<verb>[:confirmed]` code) stays with this agent's record of the card
+(issued_cards). `card_command` hands back that command only for the owner's click on a card this agent
+posted that offered that text. Standard library only, plus local_task_protocol and issued_cards.
 """
 from __future__ import annotations
 
@@ -63,11 +63,15 @@ def avatar(*, mxid: str = "", url: str = "", seed: str = "", initial: str = "", 
 
 def button(label: str, kind: str, *, style: str = "", url: str = "", reply: str = "", room_id: str = "",
            user_id: str = "", items: Optional[list] = None, confirm: str = "", disabled: Optional[bool] = None,
-           uses_input: bool = False) -> dict:
+           uses_input: bool = False, command: str = "") -> dict:
     """A button, row action or menu item; `confirm` makes the client ask first. On a done or expired
-    card the client disables a button unless it says `disabled: False`."""
+    card the client disables a button unless it says `disabled: False`. A `reply` button with a
+    `command` acts as that command when the owner clicks it; without one its text is plain words."""
+    if command and parse_reply(command) is None:
+        raise CardError(f"{command!r} is not a card command")
     out = _drop_empty({"label": label, "kind": kind, "style": style, "url": url, "reply": reply,
-                       "room_id": room_id, "user_id": user_id, "items": items, "confirm": confirm})
+                       "room_id": room_id, "user_id": user_id, "items": items, "confirm": confirm,
+                       "command": command})
     if disabled is not None:
         out["disabled"] = bool(disabled)
     if uses_input:
@@ -176,6 +180,8 @@ def _action_problem(b: object, where: str, *, menu_ok: bool = False) -> Optional
         return f"{where}.style must be primary or secondary"
     if "disabled" in b and not isinstance(b["disabled"], bool):
         return f"{where}.disabled must be true or false"
+    if "command" in b and (kind != "reply" or parse_reply(b["command"]) is None):
+        return f"{where}.command must be a card command on a reply button"
     if kind == "menu":
         items = b.get("items")
         if not isinstance(items, list) or not items or len(items) > LIMITS["menu_items"]:
@@ -378,13 +384,25 @@ def parse_reply(text: str) -> Optional[Reply]:
     return Reply(parts[0], "" if parts[1] == "-" else parts[1], parts[2], confirmed)
 
 
-def reply_payload(task_text: str) -> Tuple[dict, Optional[Reply]]:
-    """(headers, card reply) of a gateway task file: the sender's own words, the reply quote stripped."""
+def reply_words(task_text: str) -> Tuple[dict, str]:
+    """(headers, the sender's own words) of a gateway task file, the reply quote stripped."""
     import local_task_protocol as ltp
     parsed = ltp.parse_task_headers_trusted(task_text)
     words = ltp.sender_words(parsed)
     said = ltp.reply_action_text(words) or ltp.split_reply_context(words)[1]
-    return dict(parsed.headers), parse_reply(said.strip())
+    return dict(parsed.headers), said.strip()
+
+
+def card_click(headers: Mapping[str, str]) -> Optional[dict]:
+    """The message's `space.ag2.card_click` as the bridge passed it on ({card_id, action}), or None."""
+    import json
+    try:
+        click = json.loads(str(headers.get("card_click") or ""))
+    except ValueError:
+        return None
+    if not isinstance(click, dict) or not all(_text(click.get(k)) for k in ("card_id", "action")):
+        return None
+    return {"card_id": click["card_id"], "action": click["action"]}
 
 
 def owner_may_act(headers: Mapping[str, str], owner_mxid: str = "", *, dm_only: bool = True) -> Optional[str]:
@@ -402,16 +420,23 @@ def owner_may_act(headers: Mapping[str, str], owner_mxid: str = "", *, dm_only: 
     return None
 
 
-def answered_card(headers: Mapping[str, str], said: Reply, owner_mxid: str, workspace,
-                  *, now: Optional[float] = None) -> Optional[str]:
-    """Why a card reply is ordinary chat, or None when the owner replied to a card this agent posted
-    and the payload is one that card offered. A forged card in a room never passes the second test."""
+def card_command(headers: Mapping[str, str], said: str, owner_mxid: str, workspace,
+                 *, now: Optional[float] = None) -> Tuple[Optional[Reply], str]:
+    """(the command, "") for the owner's click on a card this agent posted, else (None, why it is ordinary
+    chat). A click is `space.ag2.card_click` naming the card, in reply to that card's own event, whose
+    text is one the card offered. Typed words, a forged card and anyone else's click never pass."""
     import issued_cards
     if not owner_mxid:
-        return "the owner is not known"
+        return None, "the owner is not known"
     why = owner_may_act(headers, owner_mxid)
     if why:
-        return why
-    if not issued_cards.offered_by(workspace, str(headers.get("reply_to_event") or ""), said.payload, now=now):
-        return "it does not answer a card I posted with that action"
-    return None
+        return None, why
+    click = card_click(headers)
+    if click is None or click["action"] != said:
+        return None, "it is not a card click"
+    command = issued_cards.command_for(workspace, str(headers.get("reply_to_event") or ""), click["card_id"],
+                                       said, now=now)
+    parsed = parse_reply(command or "")
+    if parsed is None:
+        return None, "it does not answer a card I posted with that action"
+    return parsed, ""
