@@ -129,19 +129,23 @@ GUIDE.md's test harness shows). Without `schema`, an `html` page is laid over th
 template's columns.
 
 `app_name`, `database_name` and `options` follow the same name rules on a template's path
-(`options` only for the template's own option columns, at most 100 a column).
+(`options` only for the option columns of the schema the build uses, the own schema's when one
+is given, at most 100 a column).
 
-A column the database the panel sent already has (matched in any case) is compared, not just
-skipped, and every such column is decided right after `databases.list`, before any column is
+A column the database the panel sent already has is compared, not just skipped (a column there
+under another case fails the build with the name to rename it to, since the page reads its
+columns by exact name), and every such column is decided right after `databases.list`, before any column is
 written: another type fails the build; a select or multi-select lacking some of the app's
 options gets them added (`prop_update`), only when the listing shows the database has no rows,
 since the options are resent by name; a status column, whose groups the listing does not give,
 is never changed this way. Otherwise the build fails and says which options to add. `check` on
 the `databases.list` step prints `columns`: for each later column step, `skip` or the
-`prop_update` to run in its place.
+`prop_update` to run in its place, with its own `operation_id` (and, on the cli route, its own
+`cli` argv).
 
-Every write step carries a fixed `operation_id` (`cab-<request_id>-<step>`), and `--route cli`
-passes it as `--operation-id`: a step retried after an unknown outcome sends the same id, which
+Every write step carries a fixed `operation_id` (`cab-<request_id>-<step>-<8 hex of its
+arguments>`, so a re-plan with another adaptation is another operation), and `--route cli` passes
+it as `--operation-id`: a step retried after an unknown outcome sends the same id, which
 the server dedupes for an Action that requires one. After `action` exits 3, never run that step
 again before `operation.inspect` says it did not happen. `plan` prints
 the Actions in order; `$db` and `$app` stand for the ids earlier steps answer. Run them in that

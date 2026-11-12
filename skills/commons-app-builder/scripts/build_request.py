@@ -467,11 +467,11 @@ def build_inputs(request: Dict[str, Any], adaptation: Dict[str, Any]) -> Tuple[s
         return adaptation["html"], None, adaptation.get("app_name", "")
     template = pick_template(request["description"], request.get("template"), adaptation.get("template"))
     raw_page, raw_schema = load_template(template)
-    _checked_adaptation(adaptation, raw_schema)
     if adaptation.get("schema") is not None:
         if not adaptation.get("html"):
             raise ActionFailed("an adaptation's own schema needs its own page (html) written against it")
         raw_schema = _checked_schema(adaptation["schema"])
+    _checked_adaptation(adaptation, raw_schema)  # against the columns this build actually uses
     page_html, schema = adapt(raw_page, raw_schema, adaptation)
     name = (adaptation.get("app_name") or raw_schema.get("app") or "App").strip()
     return page_html, schema, name
@@ -686,6 +686,10 @@ def existing_column(step: Dict[str, Any], answers: Dict[str, Any]) -> Optional[D
     have = (answers.get("$columns") or {}).get(want["name"].strip().casefold())
     if have is None:
         return None
+    if have["name"] != want["name"]:
+        # The page reads and writes its columns by exact name.
+        raise ActionFailed(f"the database has a column {have['name']}; this app reads it as {want['name']}: "
+                           f"rename it to {want['name']} in its table")
     if have.get("type") != want["type"]:
         raise ActionFailed(f"the database already has a {have.get('type')} column {have['name']}; "
                            f"this app needs it to be {want['type']}")
@@ -703,9 +707,14 @@ def existing_column(step: Dict[str, Any], answers: Dict[str, Any]) -> Optional[D
     if answers.get("$rows") != 0:
         raise ActionFailed(f"{lacking}; the database already has rows, so they were not changed: add them in its table")
     options = [{"name": n} for n in have.get("options") or []] + missing
-    return dict(step, skip_if_present=None, arguments={
+    replaced = dict(step, skip_if_present=None, arguments={
         "database": step["arguments"]["database"], "op": "prop_update", "prop": have["name"],
         "property": {"options": options}})
+    if step.get("operation_id"):
+        replaced["operation_id"] = f"{step['operation_id']}-update"
+    if "cli" in step:
+        replaced["cli"] = cli_argv(replaced)
+    return replaced
 
 
 def column_decisions(steps: List[Dict[str, Any]], n: int, answers: Dict[str, Any],
@@ -778,7 +787,7 @@ def build(task_text: str, call: Callable[[Dict[str, Any]], Dict[str, Any]],
                               "this request is already being built")
     try:
         page_html, schema, name = build_inputs(request, adaptation)
-        answers = execute(plan(request, page_html, schema, name), call)
+        answers = execute(with_operation_ids(request["request_id"], plan(request, page_html, schema, name)), call)
         database = request.get("database") or answers.get("$db") or answers.get("$app_db")
         app_id = answers.get("$app") or request.get("app_id")
         verb = "Updated" if request["mode"] == "refine" else "Built"
@@ -922,7 +931,11 @@ def main(argv: List[str]) -> int:
 def with_operation_ids(request_id: str, steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Each write step with a fixed operation id from the request and the step's place, so a step
     retried after an unknown outcome sends the same id (the server dedupes it where it can)."""
-    return [step if step.get("read") else dict(step, operation_id=f"cab-{request_id}-{i}")
+    def digest(step):
+        raw = json.dumps(step["arguments"], sort_keys=True, ensure_ascii=False).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()[:8]
+    # The arguments are in the id: a re-plan with another adaptation is another operation.
+    return [step if step.get("read") else dict(step, operation_id=f"cab-{request_id}-{i}-{digest(step)}")
             for i, step in enumerate(steps)]
 
 

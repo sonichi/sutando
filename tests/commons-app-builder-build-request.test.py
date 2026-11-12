@@ -618,9 +618,9 @@ check("a-later-wrong-column-fails-before-an-earlier-is-added", rep["status"] == 
 # Names match whatever their case; a status column is never re-optioned by name; no row count is no guess (N3).
 room = panel_db({"name": "choice", "type": "select", "options": ["Option A", "Option B", "Option C"]})
 _, rep = reply_of(run(room, task(database="d7k2m9x1", template="poll")))
-check("a-column-matches-in-any-case", rep["status"] == "done"
-      and "Choice" not in [a["property"]["name"] for act, a in room.calls
-                           if act == "room.commons.databases.mutate" and a.get("op") == "prop_add"])
+check("a-column-under-another-case-fails-with-the-rename", rep["status"] == "failed"
+      and "has a column choice; this app reads it as Choice: rename it to Choice" in rep["reason"]
+      and not any(act == "room.commons.databases.mutate" for act, _ in room.calls))
 STATUS = {"app": "S", "databases": [{"name": "S", "role": "primary", "props": [
     {"name": "State", "type": "status", "options": [{"name": "Going", "group": "doing"}]}]}]}
 room = panel_db({"name": "State", "type": "status", "options": ["Maybe"]})
@@ -702,8 +702,19 @@ with tempfile.TemporaryDirectory() as tmp:
     # A fixed operation id per write step, the same on both routes and on a re-plan.
     writes = [st for st in json.loads(mcp_out) if not st.get("read")]
     check("every-write-step-has-a-fixed-operation-id", writes and all(
-        st.get("operation_id") == f"cab-14141414-3434-4565-8787-909090909090-{i}"
+        re.fullmatch(rf"cab-14141414-3434-4565-8787-909090909090-{i}-[0-9a-f]{{8}}", st.get("operation_id", ""))
         for i, st in enumerate(json.loads(mcp_out)) if not st.get("read")))
+    # The id names the step's arguments: the same plan again is the same ids, another adaptation is not.
+    (tmp / "build5.txt").write_text(task(template="poll", request_id="15151515-3434-4565-8787-909090909090"),
+                                    encoding="utf-8")
+    (tmp / "a1.json").write_text(json.dumps({"app_name": "One"}))
+    (tmp / "a2.json").write_text(json.dumps({"app_name": "Two"}))
+    ids = lambda out: [st.get("operation_id") for st in json.loads(out) if not st.get("read")]
+    _, one = cli("plan", str(tmp / "build5.txt"), "--adapt", str(tmp / "a1.json"), "--ledger", str(tmp / "l5a"))
+    _, one_again = cli("plan", str(tmp / "build5.txt"), "--adapt", str(tmp / "a1.json"), "--ledger", str(tmp / "l5b"))
+    _, two = cli("plan", str(tmp / "build5.txt"), "--adapt", str(tmp / "a2.json"), "--ledger", str(tmp / "l5c"))
+    check("the-same-plan-has-the-same-ids", ids(one) == ids(one_again))
+    check("a-changed-plan-has-new-ids", ids(one) != ids(two))
     check("reads-carry-no-operation-id", all("operation_id" not in st for st in json.loads(mcp_out) if st.get("read")))
     check("cli-writes-pass-their-operation-id", all(
         st["cli"][-2:] == ["--operation-id", st["operation_id"]] for st in json.loads(cli_out) if not st.get("read")))
@@ -1081,5 +1092,56 @@ with tempfile.TemporaryDirectory() as d:
     check("refine-resend-gets-the-same-reply", again == first and reply_of(first)[1]["status"] == "done")
     check("refine-resend-writes-nothing", len(room.calls) == n and len(room.write_sizes) == writes
           and room.pages[PAGE] == edited)
+
+# R2: on the cli route, check's replacement for an existing column is the prop_update's own argv.
+with tempfile.TemporaryDirectory() as tmp:
+    tmp = Path(tmp)
+    (tmp / "t.txt").write_text(task(template="poll", database="d1", request_id="16161616-3434-4565-8787-909090909090"),
+                               encoding="utf-8")
+    code, out = cli("plan", str(tmp / "t.txt"), "--route", "cli", "--ledger", str(tmp / "l"))
+    (tmp / "plan.json").write_text(out)
+    steps = json.loads(out)
+    db_idx = next(i for i, st in enumerate(steps) if st.get("expect_database"))
+    choice_idx = next(i for i, st in enumerate(steps) if st.get("skip_if_present") == "Choice")
+    (tmp / "dbs.json").write_text(json.dumps(envelope_of({"databases": [{"database": "db:d1", "rows": 0, "properties": [
+        {"name": "Choice", "type": "select", "options": ["Option A"]}]}]})))
+    code, out = cli("check", str(tmp / "plan.json"), str(db_idx), str(tmp / "dbs.json"))
+    replaced = json.loads(out)["columns"][str(choice_idx)] if code == 0 else {}
+    argv = replaced.get("cli", [])
+    check("cli-replacement-is-a-prop-update", argv[:3] == ["action", ROOM, "room.commons.databases.mutate"]
+          and json.loads(argv[4])["op"] == "prop_update" and json.loads(argv[4])["prop"] == "Choice")
+    check("cli-replacement-has-its-own-operation-id", argv[-2] == "--operation-id"
+          and argv[-1] == steps[choice_idx]["operation_id"] + "-update")
+
+# R5: an own schema's option columns are its own, not the template's.
+OWN_OPTS = {"databases": [{"name": "Signups", "role": "primary", "props": [
+    {"name": "Slot", "type": "select", "options": [{"name": "Morning"}]}]}]}
+_, rep = reply_of(run(FakeRoom(), task(template="poll"),
+                      {"html": "<p>x</p>", "schema": OWN_OPTS, "options": {"Slot": ["Morning", "Afternoon"]}}))
+check("own-schema-options-are-checked-against-its-own-columns", rep["status"] == "done")
+_, rep = reply_of(run(FakeRoom(), task(template="poll"),
+                      {"html": "<p>x</p>", "schema": OWN_OPTS, "options": {"Choice": ["A"]}}))
+check("a-template-column-is-not-an-own-schemas", rep["status"] == "failed" and "which has none" in rep["reason"])
+
+# R6: the in-process build sends the same operation ids the plan prints.
+sent = []
+room = FakeRoom()
+
+
+def recording(step):
+    sent.append(step.get("operation_id"))
+    try:
+        return room.call(step)
+    except Refused as error:
+        raise br.ActionFailed(str(error)) from None
+
+
+br.build(task(template="poll", request_id="17171717-3434-4565-8787-909090909090"), recording, {"app_name": "X"})
+planned = br.with_operation_ids("17171717-3434-4565-8787-909090909090", br.plan(
+    dict(br.parse(task(template="poll", request_id="17171717-3434-4565-8787-909090909090")), owner=OWNER),
+    *br.build_inputs(br.parse(task(template="poll", request_id="17171717-3434-4565-8787-909090909090")),
+                     {"app_name": "X"})))
+check("in-process-sends-the-planned-ids", [i for i in sent if i] == [st["operation_id"] for st in planned
+                                                                      if st.get("operation_id")])
 
 print(f"commons-app-builder build request: {len(passed)} passed")
