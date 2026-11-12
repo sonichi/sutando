@@ -585,6 +585,10 @@ class Cards(CardsBase):
         self.assertEqual(self.sent, [])
         pending, done = self.actions.cards()
         self.assertEqual((pending["state"], done["state"]), ("pending", "done"))
+        self.assertEqual((pending["header"].get("status"), done["header"]["status"]), (None, {"label": "Approved"}))
+        self.assertEqual(done["header"]["avatar"], {"mxid": NEW_AGENT})
+        self.assertNotRegex(json.dumps(self.actions.cards(), ensure_ascii=False) + "".join(
+            c["arguments"]["body"] for c in self.actions.calls), "[\u2713\u2714\u2705\u274c\u26a0]")
         self.assertEqual(pending["id"], f"worker-approval:{W}:{C.read_rows(self.ws)[0]['server']}")
         self.assertEqual(pending["header"]["title"], "Pylon")
         self.assertEqual(pending["header"]["avatar"], {"seed": "reviewer"})
@@ -613,7 +617,7 @@ class Cards(CardsBase):
         with self.assertRaises(dc.DeviceConnectError):
             self.connect(fake, approve_after=None)
         expired = self.actions.cards()[-1]
-        self.assertEqual(expired["state"], "expired")
+        self.assertEqual((expired["state"], expired["header"]["status"]), ("expired", {"label": "Link expired"}))
         self.assertEqual(expired["buttons"][0], {"label": f"Get a new link for {W}", "kind": "reply", "style": "primary",
                                                  "reply": f"Get a new link for {W}",
                                                  "command": f"card:worker-approval:{W}:resend", "disabled": False})
@@ -704,24 +708,27 @@ class Resend(CardsBase):
         self.expire()
         for kw in ({"tier": "team"}, {"user": "@someone:alpha-fixture.net"}, {"kind": "room"}, {"tier": ""}):
             rc, out, spawned = self.reply(dc.resend_text(W), **kw)
-            self.assertEqual((rc, out["status"], spawned), (1, "not_a_card_reply", []), kw)
+            self.assertEqual((rc, out["status"], out["say"], spawned),
+                             (1, "forged_or_stale_click", dc.ac.UNMATCHED_CLICK, []), kw)
         self.assertEqual(dc.read_record(self.ws, W)["state"], "expired")
 
     def test_a_reply_to_a_card_this_agent_did_not_post_is_ordinary_chat(self):
         self.expire()
         for reply_to in ("$forged-by-a-member", ""):
             rc, out, spawned = self.reply(dc.resend_text(W), reply_to=reply_to)
-            self.assertEqual((rc, out["status"], spawned), (1, "not_a_card_reply", []), reply_to)
+            self.assertEqual((rc, out["status"], spawned), (1, "forged_or_stale_click", []), reply_to)
         self.assertEqual(dc.read_record(self.ws, W)["state"], "expired")
 
     def test_a_payload_the_card_did_not_offer_starts_nothing(self):
         self.connect(ConnectFake(self.backend))
         rc, out, spawned = self.reply(dc.resend_text(W))
-        self.assertEqual((rc, out["status"], spawned), (1, "not_a_card_reply", []))
+        self.assertEqual((rc, out["status"], spawned), (1, "forged_or_stale_click", []))
+        rc, out, spawned = self.reply("Add reviewer to a room")
+        self.assertEqual((rc, out, spawned), (1, {"status": "owner_words", "words": "Add reviewer to a room"}, []))
         self.expire()
         for said in ("Blow it up", "Get a new link for other"):
             rc, out, spawned = self.reply(said)
-            self.assertEqual((rc, out["status"], spawned), (1, "not_a_card_reply", []), said)
+            self.assertEqual((rc, out["status"], spawned), (1, "forged_or_stale_click", []), said)
         dc.write_record(self.ws, W, {**dc.read_record(self.ws, W), "state": "done"})
         self.assertIn("already has its own agent", dc.resend(W, workspace=self.ws)["why"])
 
@@ -751,7 +758,8 @@ class Resend(CardsBase):
         with unittest.mock.patch.object(pool_identity.pool_provision, "core_lane",
                                         side_effect=dc.pp.ProvisionError("no core lane")):
             rc, got, spawned = self.reply(dc.resend_text(W), user=owner, click=click)
-        self.assertEqual((rc, got, spawned), (2, {"status": "refused", "why": "no core lane"}, []))
+        self.assertEqual((rc, got["status"], got["why"], spawned),
+                         (1, "forged_or_stale_click", "the owner is not known", []))
         with unittest.mock.patch.object(pool_identity.pr, "load_roster",
                                         lambda ws: {"workers": {W: {"state": "retired"}}}):
             rc, got, spawned = self.reply(dc.resend_text(W))
@@ -841,6 +849,48 @@ class Resend(CardsBase):
             t.join()
         self.assertEqual((sorted(results), len(spawned)), (["refused", "started"], 1))
 
+    def failing_resend(self, **kw):
+        self.expire()
+        ids = []
+        dc.resend(W, workspace=self.ws, spawn=lambda argv: ids.append(argv[argv.index("--resend-id") + 1]))
+        return dc.resend_failed(self.ws, W, ids[0], "the server answered 503 (busy)", **kw)
+
+    def test_a_failed_resend_shows_an_error_card_whose_button_tries_again(self):
+        self.assertTrue(self.failing_resend(cards=self.sink))
+        failed = self.actions.cards()[-1]
+        self.assertEqual((failed["state"], failed["header"]["status"]), ("error", {"label": "Couldn't make a link"}))
+        self.assertEqual(failed["id"], self.actions.cards()[0]["id"])
+        self.assertIn("503", failed["text"])
+        self.assertEqual(failed["buttons"][0]["command"], f"card:worker-approval:{W}:resend")
+        self.assertEqual(self.actions.calls[-1]["arguments"]["reply_to"], "$card2")
+        self.assertEqual((self.sent, self.owner_notes()), ([], []))
+        rec = dc.read_record(self.ws, W)
+        self.assertEqual((rec["state"], rec["event_id"]), ("failed", "$card3"))
+        rc, out, spawned = self.reply(dc.resend_text(W))
+        self.assertEqual((rc, out["status"], len(spawned)), (0, "started", 1))
+
+    def test_a_failed_resend_card_that_cannot_be_posted_is_said_in_text(self):
+        refusing = FakeActions(refuse=True)
+        self.assertTrue(self.failing_resend(cards=dc.CardSink(refusing.execute, DM)))
+        self.assertTrue(any("couldn't make a new approval link" in n for n in self.owner_notes()))
+        self.assertEqual(dc.read_record(self.ws, W)["event_id"], "$card2")
+
+    def test_a_failed_resend_finds_the_core_s_own_cards_and_survives_a_missing_lane(self):
+        core = dc.pp.core_lane(self.ws, None)
+        with unittest.mock.patch.object(C, "owner_dm", lambda row, ws=None: DM), \
+                unittest.mock.patch.object(dc.pp, "core_actions", lambda ws, lane, **kw: (self.actions, core)):
+            self.assertTrue(self.failing_resend())
+        self.assertEqual(self.actions.cards()[-1]["state"], "error")
+        with unittest.mock.patch.object(dc.pp, "core_lane", side_effect=dc.pp.ProvisionError("no lane")):
+            ids = []
+            dc.resend(W, workspace=self.ws, spawn=lambda argv: ids.append(argv[argv.index("--resend-id") + 1]))
+            self.assertTrue(dc.resend_failed(self.ws, W, ids[0], "x"))
+        self.assertEqual(len(self.owner_notes()), 1)
+        with unittest.mock.patch.object(dc, "failed_card", side_effect=dc.ac.CardError("too long")):
+            dc.resend(W, workspace=self.ws, spawn=lambda argv: ids.append(argv[argv.index("--resend-id") + 1]))
+            self.assertTrue(dc.resend_failed(self.ws, W, ids[-1], "x", cards=self.sink))
+        self.assertEqual(len(self.owner_notes()), 2)
+
     def test_a_resend_failure_for_another_attempt_changes_nothing(self):
         self.expire()
         dc.resend(W, workspace=self.ws, spawn=lambda a: None)
@@ -855,10 +905,18 @@ class Resend(CardsBase):
 
     def test_other_words_are_not_a_card_reply(self):
         rc, out, _ = self.reply("send me a new link please", click={})
-        self.assertEqual((rc, out), (1, {"status": "not_a_card_reply"}))
+        self.assertEqual((rc, out), (1, {"status": "not_a_card"}))
         self.expire()
         rc, out, spawned = self.reply(dc.resend_text(W), click={})
-        self.assertEqual((rc, out, spawned), (1, {"status": "not_a_card_reply"}, []))
+        self.assertEqual((rc, out["status"], out["say"], spawned),
+                         (1, "forged_or_stale_click", dc.ac.UNMATCHED_CLICK, []))
+        issued = dc.issued_cards.live(self.ws, dc.read_record(self.ws, W)["event_id"])
+        self.assertEqual((issued["room"], issued["handler"]), (DM, dc.CARD_HANDLER))
+        with unittest.mock.patch.object(dc.ac, "click_verdict", lambda *a, **k: dc.ac.Click(
+                dc.ac.COMMAND, dc.ac.Reply("workers", "w1", "pause", False), "", "skills/agent-cards/scripts/cards.py reply")):
+            rc, out, spawned = self.reply("Pause Pylon")
+        self.assertEqual((rc, out["status"], out["run"], spawned),
+                         (1, "other_card", "skills/agent-cards/scripts/cards.py reply", []))
 
 
 if __name__ == "__main__":

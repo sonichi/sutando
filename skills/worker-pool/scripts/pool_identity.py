@@ -29,8 +29,9 @@ device-connect flow for agent LABEL, sends the owner the approval link in their 
 approve it in a browser (or the link expires, which it reports), checks the agent and its owner, and
 saves the token in the vault. It prints one JSON line with the agent id and a status. The owner sees an
 approval card (the text note when no card can be posted); once the link expires, the card's "Get a new
-link" button replies `card:worker-approval:<worker>:resend`, and `card-reply` on that task starts the same
-flow again in the background, for the owner only.
+link" button replies "Get a new link for <worker>", and `card-reply` on that task starts the same flow again
+in the background, for the owner only; a click that matches no card this agent posted prints
+`forged_or_stale_click` with the one line to say, and nothing acts on it.
 
 The `provision-*` verbs need no pasted token (pool_provision.py). `provision-begin` prints the
 SHA-256 the `agent.create` Action takes and a suggested name. `provision-wait` makes that call as
@@ -268,26 +269,24 @@ def cmd_retire_remote(args, ws: Path) -> int:
 
 
 def cmd_card_reply(args, ws: Path) -> int:
-    """A click on a worker approval card, read from the task it arrived as; the owner's only."""
+    """A click on a worker approval card, read from the task it arrived as; the owner's only. Any other
+    task prints agent_card's answer for it: a forged or stale click is refused in fixed words."""
     try:
         text = Path(args.task_file).read_text(encoding="utf-8")
     except OSError as e:
         print(json.dumps({"status": "refused", "why": f"the task file is unreadable ({type(e).__name__})"}))
         return 2
     headers, words = agent_card.reply_words(text)
-    if agent_card.card_click(headers) is None:
-        print(json.dumps({"status": "not_a_card_reply"}))
-        return 1
     try:
         owner = str(pool_provision.core_lane(ws, None).get("owner_mxid") or "")
-    except pool_provision.ProvisionError as e:
-        print(json.dumps({"status": "refused", "why": str(e)}))
-        return 2
-    said, ignored = agent_card.card_command(headers, words, owner, ws)
-    if said is None or said.kind != pool_device_connect.CARD_KIND:
-        print(json.dumps({"status": "not_a_card_reply", "why": ignored or "not a worker approval card"},
-                         sort_keys=True))
+    except pool_provision.ProvisionError:
+        owner = ""  # a card records its own lane; only one without it needs the core's owner
+    verdict = agent_card.click_verdict(headers, words, ws, agent_card.lane_owner(ws, owner))
+    other = agent_card.click_answer(verdict, words, (pool_device_connect.CARD_KIND,))
+    if other is not None:
+        print(json.dumps(other, sort_keys=True))
         return 1
+    said = verdict.command
     row = ((pr.load_roster(ws) or {}).get("workers") or {}).get(said.target)
     if not isinstance(row, dict) or row.get("state") == "retired":
         print(json.dumps({"status": "refused", "why": f"no live pool worker {said.target!r}"}, sort_keys=True))
