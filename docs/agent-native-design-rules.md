@@ -57,8 +57,8 @@ The test: if you are about to write "reply yes to…", "open this link", "go to 
 "run this command", stop and add the control.
 
 Where no control exists yet, one plain instruction is allowed, and it is tracked as a gap. Known
-gaps today: sending a secret with a typed `vault set` command, and typing the re-link approval
-code.
+gaps today: sending a secret with a typed `vault set` command, typing the re-link approval code,
+and clicks on room cards (section 11).
 
 ## 4. Fewest steps, in place
 
@@ -203,12 +203,24 @@ For both kinds:
 
 - A click is data, not authority.
 - A click that fails the check is refused. It is never treated as chat.
-- There is one shared implementation of this check, not one per feature.
+- There is one shared implementation of this check, not one per feature. Nobody writes a second.
+
+Today the shared check handles owner cards only. Room cards, a click by a room member with the
+room's permission, are a known gap (section 3). Until that path lands, a room card's buttons must
+not be relied on: use a link or open button, or a question.
 
 ## 12. Checklist for contributors and reviewers
 
 Answer each line yes or no. A "no" is fixed in the same pull request, or the pull request says why
 not. A line about something the change does not touch is "not applicable".
+
+**Most often missed**
+
+- No internals or secrets in user-facing text (line 20).
+- The click check is the shared one (line 28).
+- The card shows its own outcome in place (line 19).
+- Every refusal names the way through (line 14).
+- Data from the owner's accounts or device goes to the DM only (line 21).
 
 **Actions and authority**
 
@@ -307,8 +319,10 @@ an engine change.
   check, `click_verdict` in [`src/agent_card.py`](../src/agent_card.py), which accepts only a
   card recorded in [`src/issued_cards.py`](../src/issued_cards.py). Act only on a click that
   passes, and never answer a failed click as if the owner had typed it. Do not write a second
-  check. For an owner card the check is that the sender is the owner. For a room card it is the
-  room's permission for that action.
+  check. Today it handles owner cards only: a click that is not the owner's, on a card this
+  agent issued, is refused as forged or stale. Room cards are a known gap. Until that path
+  lands, do not rely on a room card's buttons: use a link or open button, or a question. When
+  it lands, it goes into `click_verdict`, not beside it.
 - The engine never does anything on the person-only list. It asks, with a card.
 - "Known action → control" is about text an end user reads. Runbooks, developer docs and
   operator instructions may say "run this command".
@@ -325,3 +339,4 @@ Not part of the rules.
 - A test that only one module verifies card clicks.
 - A test that owner-facing text contains no hostnames, hex ids or key-like tokens.
 - A test that every question with options renders as buttons.
+- A sync check that keeps the three repos' copies of this note identical.
