@@ -173,6 +173,9 @@ def validate(data: Dict[str, Any]) -> Dict[str, Any]:
     thread_root = text("thread_root", required=False) if thread_conversation() else None
     if thread_root is not None and not _EVENT_RE.match(thread_root):
         raise RequestError("`thread_root` is not an event id")
+    thread_message = text("thread_message", required=False) if thread_conversation() else None
+    if thread_message is not None and not _EVENT_RE.match(thread_message):
+        raise RequestError("`thread_message` is not an event id")
     app_id = text("app_id", required=False)
     if mode == "refine" and app_id is None:
         raise RequestError("`app_id` is required to refine")
@@ -180,7 +183,8 @@ def validate(data: Dict[str, Any]) -> Dict[str, Any]:
         raise RequestError("`app_id` is not an app id")
     return {"v": VERSION, "request_id": request_id, "mode": mode, "description": description,
             "room_id": room_id, "page": page, "database": database, "template": template,
-            "app_id": app_id, **({"thread_root": thread_root} if thread_root else {})}
+            "app_id": app_id, **({"thread_root": thread_root} if thread_root else {}),
+            **({"thread_message": thread_message} if thread_message else {})}
 
 
 def parse(text: str) -> Dict[str, Any]:
@@ -248,15 +252,17 @@ class Ledger:
                     self._write(path, dict(entry, claimed_at=now, resumed=True))
                     return "claimed", None
                 # Unreadable counts as busy until it ages out: only a dead claim is taken over.
+                # An entry holding only a fence's facts (noted when a plan failed early) is no claim.
                 started = entry.get("claimed_at") if entry else None
-                if not isinstance(started, (int, float)):
+                noted_only = bool(entry) and set(entry) <= {"room_id", "request_id", "fence", "slot_used_by"}
+                if not isinstance(started, (int, float)) and not noted_only:
                     started = path.stat().st_mtime
-                if now - started < CLAIM_TTL_S:
+                if not noted_only and now - started < CLAIM_TTL_S:
                     return "busy", None
             # A dead claim taken over keeps what it held: an asked question stays asked for good.
             kept = {k: v for k, v in (entry or {}).items()
-                    if k in ("asked", "answer", "answered_at", "resumed", "fence")}
-            if fence and "fence" not in kept:
+                    if k in ("asked", "answer", "answered_at", "resumed", "fence", "slot_used_by")}
+            if fence and "fence" not in kept and fence.get("request_id") == request_id:
                 kept["fence"] = fence  # its thread, owner and time, for thread-task; never in any output
             self._write(path, dict(kept, room_id=room_id, request_id=request_id, claimed_at=now))
             return "claimed", None
@@ -308,9 +314,35 @@ class Ledger:
     def record(self, room_id: str, request_id: str, reply: str) -> None:
         path = self._path(room_id, request_id)
         with self._locked(path.parent):
-            fence = (self.recorded(room_id, request_id) or {}).get("fence")
+            old = self.recorded(room_id, request_id) or {}
+            kept = {k: old[k] for k in ("fence", "slot_used_by", "asked") if k in old}
             self._write(path, {"room_id": room_id, "request_id": request_id, "reply": reply,
-                               "answered_at": time.time(), **({"fence": fence} if fence else {})})
+                               "answered_at": time.time(), **kept})
+
+    def note_fence(self, fence: Dict[str, Any]) -> None:
+        """Keep a fence's thread facts even when its plan failed before any claim, so the thread
+        message that goes with it is still known for what it is."""
+        try:
+            path = self._path(fence["room_id"], fence["request_id"])
+        except (KeyError, TypeError, ValueError):
+            return
+        with self._locked(path.parent):
+            entry = self.recorded(fence["room_id"], fence["request_id"]) or {}
+            if "fence" not in entry:
+                self._write(path, dict(entry, room_id=fence["room_id"], request_id=fence["request_id"], fence=fence))
+
+    def use_slot(self, room_id: str, request_id: str, message_id: str) -> bool:
+        """Give a build fence's one slot to this message; True when it is (or already was) this
+        message's, False when another message holds it."""
+        path = self._path(room_id, request_id)
+        with self._locked(path.parent):
+            entry = self.recorded(room_id, request_id) or {}
+            used = entry.get("slot_used_by")
+            if used and used != message_id:
+                return False
+            if not used:
+                self._write(path, dict(entry, slot_used_by=message_id))
+            return True
 
     def entries(self, room_id: str) -> List[Dict[str, Any]]:
         """Every readable entry of one room."""
@@ -931,7 +963,7 @@ def answer_of(thread_task: str, ledger: "Ledger") -> Optional[Dict[str, Any]]:
     return ledger.answer(room, root, owner, text) if text else None
 
 
-DUPLICATE_WINDOW_S = 120  # a thread message this close to its own request's fence is that request
+DEFAULT_SETTLE_S = 30  # see settle_seconds()
 
 
 def _when(meta: Dict[str, str]) -> Optional[float]:
@@ -956,45 +988,82 @@ def fence_facts(task_text: str) -> Optional[Dict[str, Any]]:
     # The root is compared with the message's validated one, so it needs no shape check of its own.
     if not (isinstance(root, str) and isinstance(room, str) and at is not None):
         return None
-    return {"room_id": room, "thread_root": root, "owner": owner, "at": at,
-            "request_id": data.get("request_id")}
+    message = data.get("thread_message")
+    return {"room_id": room, "thread_root": root, "owner": owner, "at": at, "mode": data.get("mode"),
+            "request_id": data.get("request_id"),
+            **({"thread_message": message} if isinstance(message, str) and _EVENT_RE.match(message) else {})}
 
 
-def thread_task(task_text: str, ledger: "Ledger", tasks_dir: Optional[Path] = None) -> Tuple[str, Optional[str]]:
-    """What a room task in an app thread is: ("duplicate", id), the thread message that goes with
-    that request's DM fence (the caller answers nothing: the fence is the request); ("answer", id),
-    the owner's answer to that request's open question; or ("none", None), an ordinary message.
+def settle_seconds() -> int:
+    """How long a message in a known app thread waits for the fence that may name it
+    (BUILD_THREAD_SETTLE_SECONDS, env > the manifest's config; DEFAULT_SETTLE_S when unset)."""
+    try:
+        from skill_config import config_value  # noqa: PLC0415  (src/ is on the path)
+        value = int(config_value("BUILD_THREAD_SETTLE_SECONDS", _MANIFEST) or DEFAULT_SETTLE_S)
+    except (ImportError, ValueError, TypeError):
+        return DEFAULT_SETTLE_S
+    return value if value > 0 else DEFAULT_SETTLE_S
 
-    Each needs the attested owner tier, the owner who sent the fence, the same room and the same
-    thread root. A duplicate also needs that fence to have arrived within DUPLICATE_WINDOW_S of the
-    message, pending in `tasks_dir` or already claimed: a message with no fence of its own nearby
-    (a "thanks" after the build, a question long after) is never dropped."""
+
+def default_tasks_dir() -> Path:
+    """The inbox the watcher reads: $SUTANDO_TASKS_DIR when set, else <workspace>/tasks."""
+    if os.environ.get("SUTANDO_TASKS_DIR"):
+        return Path(os.environ["SUTANDO_TASKS_DIR"])
+    return Path(default_ledger()).parents[1] / "tasks"
+
+
+def thread_task(task_text: str, ledger: "Ledger", tasks_dir: Optional[Path] = None,
+                now: Optional[float] = None) -> Tuple[str, Optional[str]]:
+    """What a room task in an app thread is, in this order (the gateway passes no marker, so the
+    tie is exact, never by time):
+    1. ("duplicate", id): a change or Try-again fence names this message (its `thread_message`);
+    2. ("duplicate", id): the first message from the asking owner after a build fence in that
+       thread, which cannot name it; that fence's one slot, closed once a question is asked;
+    3. ("answer", id): the owner's answer to a request's open question (switch on);
+    4. ("wait", None): a known app thread, the asking owner, no fence names it yet, and younger
+       than settle_seconds(): a change's message arrives before its fence. Run it again after;
+    5. ("none", None): an ordinary message.
+    Every verdict but none needs the attested owner tier, the fence's own owner, the same room and
+    the same thread root. Times are the gateway's `timestamp` headers; `now` is this host's clock."""
+    now = time.time() if now is None else now
     meta = headers(task_text)
     owner, root, room = meta.get("user_id", ""), meta.get("thread_root", ""), meta.get("source_room_id", "")
-    at = _when(meta)
+    message, at = meta.get("source_message_id", ""), _when(meta)
     if meta.get("access_tier") != "owner" or not owner.startswith("@") or not _EVENT_RE.match(root) or not room:
         return "none", None
-    near = lambda f: (f and f.get("room_id") == room and f.get("thread_root") == root and f.get("owner") == owner
-                      and at is not None and abs(f.get("at", 0) - at) <= DUPLICATE_WINDOW_S)
     for path in sorted(Path(tasks_dir).glob("*.txt")) if tasks_dir and Path(tasks_dir).is_dir() else []:
         try:
             other = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        if other != task_text:
-            facts = fence_facts(other)
-            if near(facts):
-                return "duplicate", facts.get("request_id")
+        facts = fence_facts(other) if other != task_text else None
+        if facts and facts.get("room_id") == room:
+            ledger.note_fence(facts)  # a fence not yet taken up is known all the same
     entries = ledger.entries(room)
-    for entry in entries:
-        if near(entry.get("fence")):
-            return "duplicate", entry.get("request_id")
+    mine = [e for e in entries if (e.get("fence") or {}).get("thread_root") == root
+            and (e.get("fence") or {}).get("owner") == owner]
+    # 1. Named exactly.
+    for e in mine:
+        if message and e["fence"].get("thread_message") == message:
+            return "duplicate", e.get("request_id")
+    # 2. A build fence's one slot: its first message after it.
+    builds = sorted((e for e in mine if e["fence"].get("mode") == "build" and not e["fence"].get("thread_message")
+                     and not e.get("asked") and at is not None and e["fence"].get("at", 0) <= at),
+                    key=lambda e: e["fence"].get("at", 0), reverse=True)
+    for e in builds:
+        if e.get("slot_used_by") in (None, message) and message:
+            if ledger.use_slot(room, e["request_id"], message):
+                return "duplicate", e.get("request_id")
+    # 3. An answer.
     if thread_conversation():
-        for entry in entries:
-            asked = entry.get("asked") or {}
+        for e in entries:
+            asked = e.get("asked") or {}
             if (asked.get("thread_root") == root and asked.get("owner") == owner
-                    and not entry.get("answer") and not entry.get("reply")):
-                return "answer", entry.get("request_id")
+                    and not e.get("answer") and not e.get("reply")):
+                return "answer", e.get("request_id")
+    # 4. A change's message comes before its fence: wait for it, in a thread known as an app's.
+    if mine and at is not None and now - at < settle_seconds():
+        return "wait", None
     return "none", None
 
 
@@ -1176,7 +1245,7 @@ def main(argv: List[str]) -> int:
         try:
             folder, tasks = _flag(argv, "--ledger"), _flag(argv, "--tasks")
             ledger_ = Ledger(Path(folder) if folder else default_ledger())
-            tasks_dir = Path(tasks) if tasks else Path(default_ledger()).parents[1] / "tasks"
+            tasks_dir = Path(tasks) if tasks else default_tasks_dir()
         except SystemExit as error:
             print(str(error), file=sys.stderr)
             return 2
@@ -1236,6 +1305,9 @@ def main(argv: List[str]) -> int:
         steps = with_operation_ids(request["request_id"],
                                    with_thread_start(request, plan(request, page_html, schema, name), start))
     except (ActionFailed, KeyError, ValueError, TypeError, AttributeError) as error:
+        facts = fence_facts(text)
+        if facts:
+            ledger().note_fence(facts)  # its thread message must still be known as this request's
         print(completion(request["request_id"], "failed", str(error) or type(error).__name__))
         return 1
     state, recorded = ledger().claim(request["room_id"], request["request_id"], fence=fence_facts(text))

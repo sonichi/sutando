@@ -251,30 +251,50 @@ python3 build_request.py ask task.txt --plan plan.json --question 'Use the exist
 
 The client sends each build, change or Try again as the DM fence **and** a message in the app's
 thread. On the appservice delivery path the owner's thread messages reach the owner's agent
-whether or not they name it, and the gateway passes no marker, so that message arrives as a
-room task beside the fence. This holds with `BUILD_THREAD_CONVERSATION` off too, so it is handled
-either way. On **any room task with a `thread_root` header**, run first:
+whether or not they name it, and the gateway passes no marker, so that message arrives as a room
+task beside the fence. This holds with `BUILD_THREAD_CONVERSATION` off too, so it is handled
+either way.
+
+The two are tied exactly, never by time:
+
+- **A change or Try-again fence names its message.** It carries `"thread_message": "$<event id>"`,
+  the id of the thread message the client sent just before it. With the switch off, the key is
+  ignored like `thread_root` is: never checked, never in the request.
+- **A build fence cannot name its message,** because the fence comes first. Its message is the first
+  one from the asking owner in that thread after the fence. That is the build's one slot, used
+  once, and closed for good once a question has been asked for it.
+
+On **any room task with a `thread_root` header**, run first:
 
 ```bash
-python3 build_request.py thread-task thread-task.txt   # [--tasks <workspace>/tasks] [--ledger DIR]
+python3 build_request.py thread-task thread-task.txt   # [--tasks DIR] [--ledger DIR]
 ```
 
-It prints one verdict, exit 0, and posts nothing anywhere:
+`--tasks` defaults to the inbox the watcher reads (`$SUTANDO_TASKS_DIR`, else
+`<workspace>/tasks`): fences not yet taken up are read there. It prints one verdict, exits 0, and
+posts nothing anywhere. The checks run in this order:
 
-- `duplicate <request_id>`: the message that goes with that request's fence. Write `[no-send]`
-  and do nothing: the fence is the request, answered in the DM.
-- `answer <request_id>`: the owner's answer to that request's open question (switch on only).
-  Go on as `answer` does.
-- `none`: an ordinary message. Handle it as usual.
+1. `duplicate <request_id>`: a fence names this message (`source_message_id`), at any distance in
+   time. Write `[no-send]` and do nothing.
+2. `duplicate <request_id>`: this message holds a build fence's slot (it came after that fence,
+   the slot was free, no question was asked). Write `[no-send]` and do nothing.
+3. `answer <request_id>`: a question is open for a request in this thread (switch on). Go on as
+   `answer` does.
+4. `wait`: this thread is a known app thread (some fence named it), the sender is its owner, no
+   fence names this message yet, and it is younger than `BUILD_THREAD_SETTLE_SECONDS` (env, then the
+   manifest; default 30). A change's message arrives **before** its fence, so wait that long, run
+   `thread-task` again, and only then treat it as `none`.
+5. `none`: an ordinary message. Handle it as usual. A message in a thread no fence ever named is
+   `none` at once.
 
-Every verdict but `none` needs the attested owner tier, the owner who sent the fence, the same
-room (`source_room_id`) and the same `thread_root`. A duplicate also needs that fence to have
-arrived within **120 seconds** of the message (`timestamp` headers), either still pending in
-`<workspace>/tasks/` (the message can be read first) or already claimed. The claim keeps the fence's
-thread, owner and time in the ledger, never in any output.
+Every verdict but `none` needs the attested owner tier, the fence's own owner, the same room
+(`source_room_id`) and the same `thread_root`. The claim keeps a fence's facts in the ledger and
+never in any output. That covers its thread, owner, arrival time, mode and `thread_message`. A
+fence whose plan fails before any claim still leaves them, so its message is never `none`.
 
-So a message is never dropped without a fence of its own beside it. An owner's "thanks" a minute
-after the build is `none`. A change long after the build comes with its own new fence, so its
-thread message is that new request's duplicate. An owner message long after the build, with no
-fence, is `none`.
+**The settle time** is a config value, not a measured latency. The client sends the message and the
+fence back to back, but they reach the agent on two paths (a room task through the appservice,
+a private task through the DM), and neither delay has been measured. Raise it if a change's
+message is ever judged before its fence lands.
 
+**Times** are the gateway's `timestamp` headers; only `wait` compares one with this host's clock.
