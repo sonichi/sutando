@@ -24,7 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from workspace_default import resolve_workspace  # noqa: E402
 
 REQUEST_FILE = "pool-sweep-request.json"
-REPO = Path(__file__).resolve().parent.parent
+# Unresolved, as agent-api.py does: a bundle that symlinks src/ keeps its own skills/ beside it.
+REPO = Path(__file__).parent.parent
 SWEEP_SCRIPT = Path("skills") / "worker-pool" / "scripts" / "pool_remedy.py"
 
 
