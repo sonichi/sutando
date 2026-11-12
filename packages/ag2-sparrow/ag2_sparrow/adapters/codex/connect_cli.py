@@ -39,7 +39,7 @@ ENV_KEEP = ("PATH", "HOME", "USER")
 REQUIRED_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR")
 CONFIG_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR", "CODEX_HOME", "SANDBOX", "ALLOW_NON_OWNER", "MODEL",
                "RESUME_THREAD") + cb.CONFIG_KEYS
-THREAD_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+THREAD_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 LOCAL = Shape(name=SHAPE, command=COMMAND, description="the Codex connector as an s.space agent",
               cli="Codex CLI", min_version=MIN_CODEX, version_anchor=r"^codex",
               version_note="the app-server stdio shape was measured there", required_keys=REQUIRED_KEYS,
@@ -98,7 +98,7 @@ def connector_argv(cfg: dict, root: str, root_fd: int) -> list:
 def resume_thread_problem(thread: str, codex_home: str) -> str:
     """'' when `thread` names a Codex conversation saved under the agent's CODEX_HOME (its sessions/
     rollouts, where the host puts the owner's conversation it continues), else why not."""
-    if not THREAD_ID_RE.match(thread or ""):
+    if not THREAD_ID_RE.fullmatch(thread or ""):
         return f"--resume-thread {thread!r} is not a Codex conversation id"
     home = Path(codex_home or os.path.join(os.path.expanduser("~"), ".codex"))
     if not any((home / "sessions").glob(f"**/rollout-*-{thread}.jsonl")):
@@ -157,7 +157,8 @@ def resolve_root(args) -> "tuple[dict, str]":
 
 # What a repair `install <selector>` takes from the job's recorded config: (key, option, value).
 RECORDED = (("CODEX", "codex", str), ("CODEX_HOME", "codex_home", str), ("SANDBOX", "sandbox", str),
-            ("ALLOW_NON_OWNER", "allow_non_owner", lambda v: v == "1"), ("MODEL", "model", str))
+            ("ALLOW_NON_OWNER", "allow_non_owner", lambda v: v == "1"), ("MODEL", "model", str),
+            ("RESUME_THREAD", "resume_thread", str))
 
 
 def install(args) -> int:
@@ -228,7 +229,9 @@ def connect_preflight(args, login: bool = True) -> str:
         return problem
     codex = os.path.abspath(shutil.which(args.codex) or args.codex)
     login_cfg = {"CODEX": codex, "CODEX_HOME": str(Path(args.codex_home).expanduser().resolve()) if args.codex_home else ""}
-    return version_problem(codex) or (login_problem(login_cfg) if login else "")
+    resume = getattr(args, "resume_thread", None)
+    return (version_problem(codex) or (resume_thread_problem(resume, login_cfg["CODEX_HOME"]) if resume else "")
+            or (login_problem(login_cfg) if login else ""))
 
 
 CONNECT_OFF = "Codex connect is not enabled in this release; use install --work / verify"
@@ -391,7 +394,8 @@ def session_options(p) -> None:
     p.add_argument("--allow-non-owner", action="store_true",
                    help="serve non-owner senders without collaborator access too, on an ephemeral read-only thread")
     p.add_argument("--model", help="the model for every turn (default: the connector's)")
-    p.add_argument("--resume-thread", metavar="UUID",
+    # Codex names its rollouts in lowercase: the id is matched and resumed as such.
+    p.add_argument("--resume-thread", metavar="UUID", type=str.lower,
                    help="continue this Codex conversation (saved under --codex-home's sessions/) in the owner's "
                         "DM with the agent, as `codex resume <id>` does; every other room starts a new one")
 

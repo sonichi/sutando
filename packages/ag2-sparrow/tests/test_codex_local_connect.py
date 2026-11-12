@@ -506,10 +506,14 @@ class Install(Base):
         cfg = cm.read_config(cli.config_path())
         self.assertEqual(cfg["RESUME_THREAD"], thread)
         self.assertEqual(cli.connector_argv(cfg, str(self.work), 7)[-2:], ["--resume-thread", thread])
+        # A repair reinstall from the record keeps it: the connector's marker keeps it from being taken twice.
         rc, out, err = self.install_with(runner, False, "--codex-home", str(home))
         self.assertEqual(rc, 0, out + err)
-        self.assertNotIn("--resume-thread", cli.connector_argv(cm.read_config(cli.config_path()), str(self.work), 7),
-                         "a reinstall without it starts fresh")
+        self.assertEqual(cm.read_config(cli.config_path())["RESUME_THREAD"], thread)
+        self.assertIn(("RESUME_THREAD", "resume_thread", str), cli.RECORDED)
+        rc, _, err = self.install_with(runner, False, "--codex-home", str(home), "--resume-thread", thread.upper())
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(cm.read_config(cli.config_path())["RESUME_THREAD"], thread, "matched and kept lowercase")
 
     def test_install_refuses_an_old_codex_before_writing_anything(self):
         (self.home / "codex-version").write_text("0.157.0")
