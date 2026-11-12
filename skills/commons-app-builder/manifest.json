@@ -10,6 +10,6 @@
   },
   "config": {
     "BUILD_THREAD_CONVERSATION": false,
-    "BUILD_THREAD_SETTLE_SECONDS": 30
+    "BUILD_THREAD_SETTLE_SECONDS": 12
   }
 }

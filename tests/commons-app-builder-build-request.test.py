@@ -1699,6 +1699,31 @@ with tempfile.TemporaryDirectory() as tmp:
     check("the-words-just-before-it-still-are", tt(msg(tmp, "near-u", DESC, at=T0 - br.settle_seconds(), mid="$u8",
                                                      root=root_u), now=T0 + 1) == ("duplicate", rid_u))
 
+    # The thread index the gateway bridge reads in its own process: {room: {root: until}}.
+    idx_led = br.Ledger(tmp / "ledger-index")
+    now_i = time.time()
+    idx_led.note_fence({"room_id": ROOM, "thread_root": "$rootI:s.space", "owner": OWNER, "at": now_i,
+                        "mode": "build", "request_id": "c1c1c1c1-3434-4565-8787-909090909090"})
+    threads = json.loads((idx_led.folder / br.Ledger.THREADS).read_text())
+    check("a-noted-fence-indexes-its-thread-for-a-requests-lifetime",
+          threads == {ROOM: {"$rootI:s.space": now_i + br.ASK_TTL_S}})
+    idx_led.claim(ROOM, "c2c2c2c2-3434-4565-8787-909090909090",
+                  fence={"room_id": ROOM, "thread_root": "$rootJ:s.space", "owner": OWNER, "at": now_i,
+                         "mode": "build", "request_id": "c2c2c2c2-3434-4565-8787-909090909090"})
+    check("a-claim-indexes-its-fences-thread-too", "$rootJ:s.space" in
+          json.loads((idx_led.folder / br.Ledger.THREADS).read_text())[ROOM])
+    idx_led.note_fence({"room_id": ROOM, "thread_root": "$rootX:s.space", "owner": OWNER, "at": now_i - br.ASK_TTL_S - 5,
+                        "mode": "build", "request_id": "c5c5c5c5-3434-4565-8787-909090909090"})
+    idx_led.note_fence({"room_id": ROOM, "thread_root": "$rootK:s.space", "owner": OWNER, "at": now_i,
+                        "mode": "build", "request_id": "c3c3c3c3-3434-4565-8787-909090909090"})
+    threads = json.loads((idx_led.folder / br.Ledger.THREADS).read_text())
+    check("an-expired-thread-is-pruned-on-the-next-write",
+          set(threads[ROOM]) == {"$rootI:s.space", "$rootJ:s.space", "$rootK:s.space"})
+    idx_led.note_fence({"room_id": ROOM, "thread_root": "$rootI:s.space", "owner": OWNER, "at": now_i - 100,
+                        "mode": "build", "request_id": "c4c4c4c4-3434-4565-8787-909090909090"})
+    check("an-older-fence-never-shortens-a-thread", json.loads((idx_led.folder / br.Ledger.THREADS).read_text())
+          [ROOM]["$rootI:s.space"] == now_i + br.ASK_TTL_S)
+
     # A room's ledger lock has a timeout: a holder never stalls another process past it.
     busy = br.Ledger(tmp / "ledger-busy", lock_timeout=0.2)
     folder = busy._path(ROOM, rid_t).parent
@@ -1809,16 +1834,16 @@ with tempfile.TemporaryDirectory() as tmp:
           == ("none", None))
 
     # The settle time is config (env > manifest), with a default.
-    check("the-settle-default", br.settle_seconds() == 30
-          and json.loads((_SKILL / "manifest.json").read_text())["config"]["BUILD_THREAD_SETTLE_SECONDS"] == 30)
+    check("the-settle-default", br.settle_seconds() == 12
+          and json.loads((_SKILL / "manifest.json").read_text())["config"]["BUILD_THREAD_SETTLE_SECONDS"] == 12)
     old = os.environ.get("BUILD_THREAD_SETTLE_SECONDS")
     try:
         os.environ["BUILD_THREAD_SETTLE_SECONDS"] = "5"
         check("the-settle-time-from-the-env", br.settle_seconds() == 5 and tt(thanks, now=T0 + 66) == ("none", None))
         os.environ["BUILD_THREAD_SETTLE_SECONDS"] = "soon"
-        check("a-bad-settle-value-is-the-default", br.settle_seconds() == 30)
+        check("a-bad-settle-value-is-the-default", br.settle_seconds() == 12)
         os.environ["BUILD_THREAD_SETTLE_SECONDS"] = "0"
-        check("a-non-positive-settle-value-is-the-default", br.settle_seconds() == 30)
+        check("a-non-positive-settle-value-is-the-default", br.settle_seconds() == 12)
     finally:
         if old is None:
             os.environ.pop("BUILD_THREAD_SETTLE_SECONDS", None)

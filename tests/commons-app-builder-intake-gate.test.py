@@ -91,6 +91,13 @@ def main():
     def write(tid, fields):
         return rgb._write_task({"id": tid, **fields})
 
+    def fenced(tid, fields):
+        """A fence the agent has taken up: queued by the bridge, then noted in the skill's ledger,
+        which indexes its thread as an app's (what `plan` and `thread-task` do)."""
+        got = write(tid, fields)
+        br.Ledger(tmp / "state" / "commons-app-builds").note_fence(br.fence_facts((rgb.TASKS_DIR / f"{tid}.txt").read_text()))
+        return got
+
     def queued(tid):
         return (rgb.TASKS_DIR / f"{tid}.txt").exists()
 
@@ -100,9 +107,16 @@ def main():
 
     check("the loader installs the intake gate", rgb.TASK_INTAKE_GATE is rgb._intake_gate)
 
+    # 0. A thread no one has indexed yet (a build's fence not taken up): its messages keep their
+    #    place, unchecked; the skill's own thread-task drops the build's copy.
+    write("task-fence0", fence("00000000-7a4d-4e8b-9f61-2c5d8a0b7e14", description="A new board",
+                               thread_root="$freshRoot:s.space"))
+    write("task-fresh0", thread_message("$fr0", text="A new board", root="$freshRoot:s.space"))
+    check("in a thread no one has indexed, even the build's copy is queued unchecked", queued("task-fresh0"))
+
     # 1. A build fence, then its description in the app's thread.
     rid = "3f2b9c1e-7a4d-4e8b-9f61-2c5d8a0b7e14"
-    write("task-fence1", fence(rid))
+    fenced("task-fence1", fence(rid))
     check("the fence is queued", queued("task-fence1"))
     got = write("task-desc1", thread_message("$d1"))
     check("its description in the thread is not queued", got is not None and not queued("task-desc1"), repr(got))
@@ -115,7 +129,7 @@ def main():
     write("task-other", thread_message("$o1", text="make the header blue"))
     check("other text in the thread is queued", queued("task-other"))
     rid2 = "aaaaaaaa-7a4d-4e8b-9f61-2c5d8a0b7e14"
-    write("task-fence2", fence(rid2))
+    fenced("task-fence2", fence(rid2))
     write("task-guest", thread_message("$g1", user=OTHER, tier="guest"))
     check("another sender's copy is queued", queued("task-guest"))
     write("task-team", thread_message("$t1", tier="team"))
@@ -180,7 +194,7 @@ def main():
     check("outside a round it is delivered at once", queued("task-free"))
 
     # 4b. No commons-app-builder skill: nothing is read, the message is delivered.
-    write("task-fence5", fence("dddddddd-7a4d-4e8b-9f61-2c5d8a0b7e14"))  # its copy would be dropped
+    fenced("task-fence5", fence("dddddddd-7a4d-4e8b-9f61-2c5d8a0b7e14"))  # its copy would be dropped
     real = rgb._BUILD_REQUEST
     rgb._BUILD_REQUEST = tmp / "no-such-skill" / "build_request.py"
     try:
@@ -196,7 +210,7 @@ def main():
     fakes.mkdir()
     for name, body in (("exits", "raise SystemExit(0)\n"), ("crashes", "import sys; sys.exit(3)\n"),
                        ("slow", "import time; time.sleep(30)\n"), ("garbled", "print('not json')\n")):
-        write("task-fence-" + name, fence(f"{name[:1] * 8}-7a4d-4e8b-9f61-2c5d8a0b7e14"))
+        fenced("task-fence-" + name, fence(f"{name[:1] * 8}-7a4d-4e8b-9f61-2c5d8a0b7e14"))
         (fakes / f"{name}.py").write_text(body)
         rgb._BUILD_REQUEST = fakes / f"{name}.py"
         began = time.monotonic()
@@ -249,7 +263,7 @@ def main():
 
     # A room's ledger lock held by another process: delivered within the verdict's budget.
     rid6 = "eeeeeeee-7a4d-4e8b-9f61-2c5d8a0b7e14"
-    write("task-fence6", fence(rid6))
+    fenced("task-fence6", fence(rid6))
     lock_dir = br.Ledger(tmp / "state" / "commons-app-builds")._path(ROOM, rid6).parent
     lock_dir.mkdir(parents=True, exist_ok=True)
     held = os.open(str(lock_dir / ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
@@ -277,10 +291,10 @@ def main():
     # 6. The owner retypes the description long after the fence, the client's copy never having
     #    come: the owner's own message, delivered (the slot holds only within the settle time).
     rid7 = "ffffffff-7a4d-4e8b-9f61-2c5d8a0b7e14"
-    write("task-fence7", dict(fence(rid7, description="A rota for the kitchen"), timestamp=now_iso(-120)))
+    fenced("task-fence7", dict(fence(rid7, description="A rota for the kitchen"), timestamp=now_iso(-120)))
     write("task-retyped", thread_message("$y1", text="A rota for the kitchen"))
     rid7b = "22222222-7a4d-4e8b-9f61-2c5d8a0b7e14"
-    write("task-fence7b", dict(fence(rid7b, description="A rota for the garden"), timestamp=now_iso(-10)))
+    fenced("task-fence7b", dict(fence(rid7b, description="A rota for the garden"), timestamp=now_iso(-10)))
     write("task-prompt", thread_message("$y2", text="A rota for the garden"))
     check("while the same words ten seconds after their fence are still its copy", not queued("task-prompt")
           and settled("task-prompt"))
@@ -288,7 +302,7 @@ def main():
 
     # 7. Switch on: the owner's answer to the request's question is delivered, never settled.
     rid8 = "11111111-7a4d-4e8b-9f61-2c5d8a0b7e14"
-    write("task-fence8", fence(rid8))
+    fenced("task-fence8", fence(rid8))
     fence8 = (rgb.TASKS_DIR / "task-fence8.txt").read_text()
     led = br.Ledger(tmp / "state" / "commons-app-builds")
     claimed = led.claim(ROOM, rid8, fence=br.fence_facts(fence8))
@@ -315,15 +329,22 @@ def main():
 
     # 9. The review on 5807e0eb. Switch off, an old app thread: the owner's "thanks" never waits.
     rid9 = "33333333-7a4d-4e8b-9f61-2c5d8a0b7e14"
-    write("task-fence9", dict(fence(rid9, description="A quiz for the team"), timestamp=now_iso(-7 * 86400)))
+    fenced("task-fence9", dict(fence(rid9, description="A quiz for the team"), timestamp=now_iso(-7 * 86400)))
+    root9 = "$threadRoot9:s.space"  # its own thread, so only this week-old fence names it
+    fenced("task-fence9b", dict(fence("55555555-7a4d-4e8b-9f61-2c5d8a0b7e14", description="A quiz",
+                                      thread_root=root9), timestamp=now_iso(-7 * 86400)))
+    calls9 = []
+    real_verdict = rgb._build_thread_verdict
+    rgb._build_thread_verdict = lambda *x, **k: calls9.append(x) or real_verdict(*x, **k)
     rgb._INTAKE_MODE["deadline"] = time.monotonic() + 6.0
     began = time.monotonic()
     try:
-        write("task-thanks9", thread_message("$th9", text="thanks, looks great"))
+        write("task-thanks9", thread_message("$th9", text="thanks, looks great", root=root9))
     finally:
         rgb._INTAKE_MODE["deadline"] = None
-    check("switch off, an owner's thanks in a week-old app thread is delivered at once",
-          queued("task-thanks9") and time.monotonic() - began < 1.5)
+        rgb._build_thread_verdict = real_verdict
+    check("an owner's thanks in a thread whose only fence is a week old is delivered at once, unchecked",
+          queued("task-thanks9") and time.monotonic() - began < 1.5 and calls9 == [])
 
     # The first pass runs no check at all: every threaded owner task is taken after the acks.
     calls = []
@@ -354,7 +375,7 @@ def main():
     os.environ["BUILD_THREAD_CONVERSATION"] = "true"
     rid10 = "44444444-7a4d-4e8b-9f61-2c5d8a0b7e14"
     root10 = "$threadRoot10:s.space"  # its own thread: no question is open there
-    write("task-fence10", fence(rid10, mode="refine", app_id="a1b2c3d4", thread_message="$elsewhere",
+    fenced("task-fence10", fence(rid10, mode="refine", app_id="a1b2c3d4", thread_message="$elsewhere",
                                 description="a later change", thread_root=root10))
     seen_waits.clear()
     rgb._INTAKE_MODE["deadline"] = time.monotonic() + 3.0
@@ -391,6 +412,32 @@ def main():
           and set(got.get("env") or {}) <= set(rgb._INTAKE_ENV) and got.get("timeout") == rgb.BUILD_THREAD_VERDICT_S
           and question.get("tier") == "owner" and question.get("fields", {}).get("task") == "wired"
           and queued("task-wired"), repr({k: v for k, v in got.items() if k != "on_error"}))
+
+    # 11. A served round of [plain, ordinary thread, app thread, plain]: only the app thread's task
+    #     is taken after the acks; the ordinary thread keeps its place, and runs no check.
+    order, checks = [], []
+    real_write, real_ack, real_verdict = rgb._write_task, rgb._post_task_ack, rgb._build_thread_verdict
+
+    def recording(task, *a, **k):
+        got = real_write(task, *a, **k)
+        if got:
+            order.append(task["id"])
+        return got
+    rgb._write_task = recording
+    rgb._post_task_ack = lambda *a, **k: True
+    rgb._build_thread_verdict = lambda *x, **k: checks.append(x[0]["id"]) or real_verdict(*x, **k)
+    plain = dict(thread_message("$pl1", text="hello"), thread_root=None)
+    ordinary = thread_message("$or1", text="a reply in a chat thread", root="$chatRoot:s.space")
+    app = thread_message("$ap1", text="and a footer")
+    plain2 = dict(thread_message("$pl2", text="hello again"), thread_root=None)
+    try:
+        rgb._take_served_round([{"id": "task-r1", **plain}, {"id": "task-r2", **ordinary},
+                                {"id": "task-r3", **app}, {"id": "task-r4", **plain2}], set(), [], {}, [])
+    finally:
+        rgb._write_task, rgb._post_task_ack, rgb._build_thread_verdict = real_write, real_ack, real_verdict
+    check("an ordinary thread keeps its place; only the app thread is taken after the acks",
+          order == ["task-r1", "task-r2", "task-r4", "task-r3"], repr(order))
+    check("and only the app thread's task runs a check", checks == ["task-r3"], repr(checks))
 
     print(f"commons-app-builder intake gate: {'FAIL' if failures else 'OK'} ({len(failures)} failed)")
     return 1 if failures else 0

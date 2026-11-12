@@ -430,6 +430,19 @@ def _build_thread_verdict(task: dict, tier: str, budget: float):
         return None
 
 
+def _known_app_thread(task: dict) -> bool:
+    """Whether the skill's own index (`app-threads.json`, {room: {thread_root: until}}) names this
+    message's thread as an app's: read in this process, no subprocess; anything unreadable is no."""
+    import json
+    room = task.get("source_room_id") or task.get("channel_id")
+    try:
+        known = json.loads((WS / "state" / "commons-app-builds" / "app-threads.json").read_text(encoding="utf-8"))  # noqa: F821
+        until = known.get(room, {}).get(task.get("thread_root"))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return False
+    return isinstance(until, (int, float)) and not isinstance(until, bool) and until > time.time()
+
+
 def _build_thread_until(deadline: float) -> float:
     """This round's end for build-thread work: BUILD_THREAD_ROUND_S from its first check, never past
     the round's own deadline (a round is known by that deadline)."""
@@ -440,15 +453,16 @@ def _build_thread_until(deadline: float) -> float:
 
 def _build_thread_gate(task: dict):
     """A room message in an app's thread that is the app build's own copy (commons-app-builder's
-    thread-task verdict `duplicate`): settled unqueued, so the agent never acts on it. In a served
-    round every check runs after the round's acks, within this round's build-thread budget; a `wait`
-    is rechecked within it, then delivered. Outside a round: one check, no wait. Fails open."""
+    thread-task verdict `duplicate`): settled unqueued, so the agent never acts on it. Only a thread
+    the skill's index names is checked; in a served round its check runs after the round's acks,
+    within this round's build-thread budget, and a `wait` is rechecked within it, then delivered.
+    Outside a round: one check, no wait. Fails open."""
     if not task.get("thread_root") or not _BUILD_REQUEST.is_file():
         return None
     attested, _ = local_task_protocol.broker_attested_tier(  # noqa: F821
         task.get("access_tier"), task.get("requested_access_tier"), task.get("collaborator"))
     tier = _tier_for(task.get("user_id"), attested)  # noqa: F821
-    if tier != "owner":
+    if tier != "owner" or not _known_app_thread(task):  # any other thread keeps its place in the round
         return None
     mode = _INTAKE_MODE  # noqa: F821
 

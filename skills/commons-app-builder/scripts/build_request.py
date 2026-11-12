@@ -268,7 +268,9 @@ class Ledger:
             if fence and "fence" not in kept and fence.get("request_id") == request_id:
                 kept["fence"] = fence  # its thread, owner and time, for thread-task; never in any output
             self._write(path, dict(kept, room_id=room_id, request_id=request_id, claimed_at=now))
-            return "claimed", None
+        if kept.get("fence"):
+            self.index_thread(kept["fence"])
+        return "claimed", None
 
     def ask(self, room_id: str, request_id: str, *, thread_root: str, owner: str, question: str,
             task_text: str, now: Optional[float] = None) -> bool:
@@ -333,6 +335,34 @@ class Ledger:
             entry = self.recorded(fence["room_id"], fence["request_id"]) or {}
             if "fence" not in entry:
                 self._write(path, dict(entry, room_id=fence["room_id"], request_id=fence["request_id"], fence=fence))
+        self.index_thread(fence)
+
+    THREADS = "app-threads.json"
+
+    def index_thread(self, fence: Dict[str, Any]) -> None:
+        """Record a fence's thread in THREADS, {room_id: {thread_root: until}}, the one file the
+        gateway bridge reads in its own process to tell an app's thread from any other: a thread
+        stays an app's until ASK_TTL_S after the newest fence that named it. Best effort."""
+        room, root, at = fence.get("room_id"), fence.get("thread_root"), fence.get("at")
+        if not (isinstance(room, str) and isinstance(root, str) and isinstance(at, (int, float))):
+            return
+        path = self.folder / self.THREADS
+        try:
+            self.folder.mkdir(parents=True, exist_ok=True)
+            with _FileLock(self.folder / ".threads.lock", self.lock_timeout):
+                try:
+                    known = json.loads(path.read_text(encoding="utf-8"))
+                    known = known if isinstance(known, dict) else {}
+                except (OSError, ValueError):
+                    known = {}
+                now = time.time()
+                known = {r: {t: u for t, u in (ts or {}).items() if isinstance(u, (int, float)) and u > now}
+                         for r, ts in known.items() if isinstance(ts, dict)}
+                threads = known.setdefault(room, {})
+                threads[root] = max(threads.get(root, 0), at + ASK_TTL_S)
+                self._write(path, {r: ts for r, ts in known.items() if ts})
+        except OSError:
+            return
 
     def use_slot(self, room_id: str, request_id: str, message_id: str) -> bool:
         """Give a build fence's one slot to this message; True when it is (or already was) this
@@ -998,7 +1028,7 @@ def answer_of(thread_task: str, ledger: "Ledger") -> Optional[Dict[str, Any]]:
     return ledger.answer(room, root, owner, text) if text else None
 
 
-DEFAULT_SETTLE_S = 30  # see settle_seconds()
+DEFAULT_SETTLE_S = 12  # see settle_seconds()
 
 
 def _when(meta: Dict[str, str]) -> Optional[float]:

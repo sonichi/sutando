@@ -284,6 +284,13 @@ only `HOME`, the workspace's `SUTANDO_WORKSPACE`, `SUTANDO_TEST_MODE` and
 `BUILD_THREAD_SETTLE_SECONDS` (never the gateway's token), and has 2 s (its ledger lock waits at
 most 1 s, then it exits 3). A non-zero exit, a timeout or unparseable output delivers the message.
 
+**Only an app's thread is checked.** The bridge first reads, in its own process, this skill's
+thread index `state/commons-app-builds/app-threads.json` (`{room_id: {thread_root: until}}`,
+written whenever the ledger notes or claims a fence: a thread stays an app's for 24 hours after
+the newest fence that named it). Any other thread, and anything unreadable, takes the ordinary
+path in its place in the round, with no check. So a build's copy in a thread whose fence no run
+has taken up yet reaches the agent, and `thread-task` drops it there.
+
 In a served round the check costs the first pass nothing: the task is taken after the round's
 acks, after its lane dedupe (which keeps its own wait), and every build-thread check and wait in
 the round shares one budget of 3 s, half the round's 6 s wait. `duplicate`: settled unqueued, the
@@ -291,6 +298,31 @@ agent never sees it. `wait`: held in memory, unacked, and rechecked every 0.25 s
 budget, then delivered; a restart re-serves it. Past the budget a task is delivered unchecked.
 Anything else is delivered as usual. So a threaded task that reaches the agent is one the bridge
 could not decide.
+
+**Why 12 seconds, and what it costs.** The client sends a change's thread message, then its fence,
+from the same click, but they travel two paths: a room task and the owner's DM task. A message
+leads its fence by at most the DM path's lag, plus the client's own gap between the two sends.
+Measured over this workspace's archived AG2 Space tasks since 2026-10-15, outside outages (an
+outage holds both paths together):
+- DM path: p50 2 s, p90 4 s, p99 10 s, over 2,039 tasks;
+- room path: p50 2 s, p99 18 s, over 4,953 tasks.
+
+12 s covers the DM p99, the one-second timestamps and the client's gap. A fence later than that
+leaves its message `none`, delivered as conversation and never a build (only a fence builds).
+
+The cost: with the switch on, an owner message in an app's thread within 24 hours of a fence
+waits up to 3 s at the bridge. If it reaches the agent as `wait`, it is rechecked 12 s after it
+was first seen. That includes a plain "thanks", because nothing at intake marks which thread
+messages belong to a build.
+
+The client does mark them (`space.ag2.commons.app_thread`: `request_id`, `page` or `app`, `asks`,
+`answers`), but the marker is dropped before the task. The backend's `event_to_task`
+(`services/shared/bridge_core.py`) copies only `room_question`, `hitl_action` and `card_click`
+from a message's content. Carrying it takes two changes (ag2-space/ag2space-backend#4045):
+- `event_to_task` copies the marker's fields, typed;
+- this bridge serializes them as stamped headers.
+
+Then only a marked message waits, and an unmarked one is delivered at once.
 
 On **any room task with a `thread_root` header** that reaches you, run first:
 
@@ -312,7 +344,7 @@ posts nothing anywhere. The checks run in this order:
    the last 24 hours (`ASK_TTL_S`, a request's own lifetime; older fences still tie messages
    exactly, but no longer make a thread one to wait in), the sender is its owner, no fence names
    this message yet, and it is younger than `BUILD_THREAD_SETTLE_SECONDS` (env, then the manifest;
-   default 30). With the switch off a message never waits. A change's message arrives **before** its fence, so wait that long, run
+   default 12). With the switch off a message never waits. A change's message arrives **before** its fence, so wait that long, run
    `thread-task` again, and only then treat it as `none`. A message is never `wait` for longer than
    the settle time from when `thread-task` first saw it (recorded in the ledger), whatever its
    timestamp says.
