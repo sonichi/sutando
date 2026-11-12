@@ -287,13 +287,11 @@ def _when(epoch: float) -> str:
 
 def status_line(hold: dict) -> str:
     """The reason in the words a user reads instead of "Connecting"."""
-    what = "usage limit" if hold.get("kind") == "usage-limit" else "rate limit"
-    model = hold.get("model") or "its model"
     if isinstance(hold.get("reset_at"), (int, float)):
         tail = f"resets {_when(hold['reset_at'])}"
     else:
         tail = f"retrying {_when(hold['until'])}" if isinstance(hold.get("until"), (int, float)) else "retrying later"
-    return f"core paused: {what} on {model}, {tail}"
+    return f"core paused: {_limit_words(hold)}, {tail}"
 
 
 def _write_hold(workspace: Path, hold: dict) -> None:
@@ -438,7 +436,8 @@ def _when_line(hold: dict, now: Optional[float] = None) -> str:
 def _notice_body(hold: dict, card: bool = False) -> str:
     from result_markers import neutralize_markers
     # With the card left beside this notice, the card is the way out; without one, a reply is.
-    way = ('To keep working now, pick another model on the "Your agent\'s model" card I left you.\n'
+    way = ('To keep working now, pick another model on the "Your agent\'s model" card I left you, '
+           'or send "retry now" to try this one again at once.\n'
            if card else
            'To keep working now, reply to this or just send "switch to sonnet" (or another model: '
            "haiku, opus, fable), or pick a model under Agent Settings, Runtime, Model. "

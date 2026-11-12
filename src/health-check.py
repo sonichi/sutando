@@ -4277,7 +4277,7 @@ def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
             restarted.append(name)
             _alert(f"♻️ health-check auto-restarted **{name}** (it was down). "
                    "If this repeats, it is crash-looping and its log has the reason.")
-            print(f"  {name}: restarted ({how})")
+            print(f"  {name}: restarted ({how})", file=sys.stderr)
         else:
             _alert(f"⚠️ health-check: {name} is DOWN and could NOT be auto-restarted{_owner_reason(how)}. "
                    "It needs an engine restart.")
@@ -4285,14 +4285,21 @@ def fix_down_bridges(checks: list, *, action=None, sender=None, guard=None,
 
 
 def _owner_reason(reason: object) -> str:
-    """` (reason)` for an alert the owner reads: redacted, and left to the log (printed here)
-    when it names a path, a session, an id or a command."""
+    """` (reason)` for an alert the owner reads: redacted, and left to the log (stderr, so a
+    --json payload on stdout stays whole) when it names a path, a session, an id or a command."""
     import owner_text
     text = owner_text.redact(" ".join(str(reason or "").split()))
     if text and owner_text.internals(text):
-        print(f"  reason kept out of the alert: {text}")
+        print(f"  reason kept out of the alert: {text}", file=sys.stderr)
         return ""
     return f" ({text})" if text else ""
+
+
+def _owner_bullets(failures: list, shown: int = 5) -> str:
+    """The failing checks as the owner reads them, for every DM that lists them."""
+    lines = [f"• {c['name']}: {c['status']}{_owner_reason(c.get('detail'))}" for c in failures[:shown]]
+    extra = f"\n…(+{len(failures) - shown} more)" if len(failures) > shown else ""
+    return "\n".join(lines) + extra
 
 
 def _bridge_launch_plan(name: str) -> "tuple[str, dict] | None":
@@ -14479,12 +14486,9 @@ def notify_slack_for_failures(
         # Unchanged failure set since the last successful send — no re-fire.
         return
 
-    lines = [f"• {c['name']}: {c['status']} ({c['detail']})" for c in failures[:5]]
-    extra = f"\n…(+{len(failures) - 5} more)" if len(failures) > 5 else ""
     text = (
         f":rotating_light: *Sutando health check* — {len(failures)} issue(s):\n"
-        + "\n".join(lines)
-        + extra
+        + _owner_bullets(failures)
     )
 
     send = sender or _default_slack_sender
@@ -14538,9 +14542,7 @@ def notify_gateway_for_failures(
     if history.get(_LAST_HASH_KEY) == hash_key:
         return True
 
-    lines = [f"• {c['name']}: {c['status']}{_owner_reason(c.get('detail'))}" for c in failures[:5]]
-    extra = f"\n…(+{len(failures) - 5} more)" if len(failures) > 5 else ""
-    text = "⚠️ Sutando health check — " + f"{len(failures)} issue(s):\n" + "\n".join(lines) + extra
+    text = "⚠️ Sutando health check — " + f"{len(failures)} issue(s):\n" + _owner_bullets(failures)
 
     send = sender or _default_gateway_sender
     if not send(text):

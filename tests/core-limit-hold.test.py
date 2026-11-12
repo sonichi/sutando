@@ -422,8 +422,9 @@ class Launcher(unittest.TestCase):
         self.assertIn("usage limit on claude-opus-5-5", lines[0])
         notice = next((self.ws / "results").glob("proactive-*.txt")).read_text()
         self.assertIn("card I left you", notice)
-        for typed in ("switch to sonnet", "retry now", "reply to this"):
-            self.assertNotIn(typed, notice, "the card is the way out; no typed command beside it")
+        for typed in ("switch to sonnet", "reply to this"):
+            self.assertNotIn(typed, notice, "the card picks the model; no typed switch beside it")
+        self.assertIn('"retry now"', notice, "the card has no retry, so the notice keeps that way open")
 
 
 class StatusSurfaces(unittest.TestCase):
