@@ -161,6 +161,9 @@ ALLOWLIST = {
     # tasks_view: flagged tokens are RPC status fields ("state": "pending"),
     # not filesystem paths; tasks/results dirs are injected by server.py.
     "src/runtime-api/tasks_view.py",
+    # agent_card: flagged tokens are card/row "state" schema fields; the module
+    # does no file I/O and names no workspace path.
+    "src/agent_card.py",
     # runtime-cli talks to the daemon over the socket only — it renders the
     # daemon's "state" fields and owns no workspace paths.
     "src/runtime-cli/sutando-runtime.py",

@@ -515,7 +515,7 @@ class Cards(CardsBase):
         self.assertEqual(pending["expires_at"], int(dc.read_record(self.ws, W)["expires_at"] * 1000))
         body = self.actions.calls[0]["arguments"]["body"]
         self.assertNotIn("\n", body)
-        self.assertIn("[Approve on s.space](https://", body)
+        self.assertIn("[Approve on alpha-fixture.net](https://", body)
         self.assertEqual(self.actions.calls[1]["arguments"]["reply_to"], "$card1")
         kinds = [(b["kind"], b.get("user_id") or b.get("reply"), b.get("disabled")) for b in done["buttons"]]
         self.assertEqual(kinds, [("open_dm", NEW_AGENT, False), ("reply", "Add reviewer to a room", False)])
