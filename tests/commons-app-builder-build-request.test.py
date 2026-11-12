@@ -1654,6 +1654,36 @@ with tempfile.TemporaryDirectory() as tmp:
     check("the-same-words-past-the-settle-time-after-the-reply-are-none",
           tt(msg(tmp, "later-r", DESC, at=T0 + br.settle_seconds() + 60, mid="$r3", root=root_r),
              now=T0 + 99999) == ("none", None))
+    # A question closes the slot: asked before any copy, the owner's answer in the description's
+    # exact words within the settle time is the answer, never the build's copy.
+    rid_w, root_w = "b7b7b7b7-3434-4565-8787-909090909090", "$rootW:s.space"
+    fence_w = task(template="poll", thread_root=root_w, request_id=rid_w, when=iso(T0))
+    led.claim(ROOM, rid_w, fence={"room_id": ROOM, "thread_root": root_w, "owner": OWNER, "at": T0, "mode": "build",
+                                  "request_id": rid_w, "said": br._said(DESC)})
+    check("the-question-is-asked", led.ask(ROOM, rid_w, thread_root=root_w, owner=OWNER, question="Which day?",
+                                           task_text=fence_w, now=T0 + 2))
+    check("an-answer-in-the-descriptions-words-within-the-window-is-the-answer",
+          ttw(msg(tmp, "ans-w", DESC, at=T0 + 5, mid="$w1", root=root_w), now=T0 + 6) == ("answer", rid_w))
+
+    # The bridge's DM question: a whole, valid owner fence notes its thread; anything else nothing.
+    dm_led = br.Ledger(tmp / "ledger-dm")
+    good = {"user_id": OWNER, "channel_kind": "dm", "timestamp": iso(T0), "task": "Build a Commons app\n\n```"
+            "commons-app-build\n" + json.dumps({"v": 1, "request_id": "d1d1d1d1-3434-4565-8787-909090909090",
+                                                 "mode": "build", "description": DESC, "room_id": ROOM, "page": PAGE,
+                                                 "thread_root": "$rootDM:s.space"}) + "\n```"}
+    check("an-owner-dm-fence-is-noted", br.intake_fence(good, "owner", dm_led) == "d1d1d1d1-3434-4565-8787-909090909090"
+          and "$rootDM:s.space" in json.loads((dm_led.folder / br.Ledger.THREADS).read_text())[ROOM])
+    for label, fields, tier in (("a-quote", dict(good, task="see ```commons-app-build {oops"), "owner"),
+                                ("a-guest", good, "guest"), ("not-a-dm", dict(good, channel_kind="room"), "owner"),
+                                ("no-thread", dict(good, task=good["task"].replace('"thread_root": "$rootDM:s.space"',
+                                                                                   '"thread_root": 7')), "owner"),
+                                ("a-bad-id", dict(good, task=good["task"].replace("d1d1d1d1-3434", "nope")), "owner")):
+        check(f"a-dm-that-is-{label}-notes-nothing", br.intake_fence(fields, tier, br.Ledger(tmp / f"ledger-{label}")) is None
+              and not (tmp / f"ledger-{label}" / br.Ledger.THREADS).exists())
+    (tmp / "qdm.json").write_text(json.dumps({"fields": good, "tier": "owner"}))
+    code, out = cli("intake-verdict", str(tmp / "qdm.json"), "--ledger", str(tmp / "ledger-dm2"), "--tasks", str(tasks))
+    check("intake-verdict-notes-a-dm-fence", code == 0 and json.loads(out) == {
+        "verdict": "noted", "request_id": "d1d1d1d1-3434-4565-8787-909090909090"})
     # The slot holds only within the settle time of its fence: the same words typed by the owner
     # later, the client's copy never having come, are the owner's own message (review on ebb47d1f).
     rid_t, root_t = "b5b5b5b5-3434-4565-8787-909090909090", "$rootT:s.space"

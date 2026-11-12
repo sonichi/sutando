@@ -1053,6 +1053,10 @@ def fence_facts(task_text: str) -> Optional[Dict[str, Any]]:
         data = extract(task_text)
     except RequestError:
         return None
+    return _facts(meta, owner, data)
+
+
+def _facts(meta: Dict[str, str], owner: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     root, room, at = data.get("thread_root"), data.get("room_id"), _when(meta)
     # The root is compared with the message's validated one, so it needs no shape check of its own.
     if not (isinstance(root, str) and isinstance(room, str) and at is not None):
@@ -1168,6 +1172,27 @@ def intake_verdict(fields: Dict[str, Any], tier: str, ledger: "Ledger", tasks_di
             "access_tier": tier}
     meta = {k: flat(v).strip() for k, v in keys.items() if v not in (None, "")}
     return _verdict(meta, flat(fields.get("task") or "").strip(), ledger, tasks_dir, now)
+
+
+def intake_fence(fields: Dict[str, Any], tier: str, ledger: "Ledger") -> Optional[str]:
+    """An owner's DM task the gateway bridge saw carrying the fence's opening line: when it is a
+    whole, valid fence naming an app thread, note it (which indexes that thread, so the copy that
+    follows is checked at intake) and return its request id. Anything else notes nothing."""
+    meta = {k: " ".join(str(fields.get(k)).splitlines()).strip() for k in ("user_id", "channel_kind", "timestamp")
+            if fields.get(k) not in (None, "")}
+    meta["access_tier"] = tier
+    try:
+        owner = authorize(meta)
+        data = extract(str(fields.get("task") or ""))
+        uuid.UUID(str(data.get("request_id")))
+    except (RequestError, ValueError):
+        return None
+    facts = _facts(meta, owner, data)
+    if (not facts or data.get("mode") not in MODES or not _EVENT_RE.match(facts["thread_root"])
+            or not str(facts["room_id"]).startswith("!")):
+        return None
+    ledger.note_fence(facts)
+    return facts["request_id"]
 
 
 def _task_line(task_text: str) -> str:
@@ -1355,6 +1380,10 @@ def _intake_command(argv: List[str]) -> int:
         print(f"build_request: bad intake question: {error}", file=sys.stderr)
         return 2
     ledger_ = Ledger(Path(folder) if folder else default_ledger(), lock_timeout=INTAKE_LOCK_TIMEOUT_S)
+    if not fields.get("thread_root"):  # the owner's DM that may be a fence: note its thread
+        noted = intake_fence(fields, tier, ledger_)
+        print(json.dumps({"verdict": "noted" if noted else "none", "request_id": noted}))
+        return 0
     try:
         verdict, request_id = intake_verdict(fields, tier, ledger_, Path(tasks) if tasks else default_tasks_dir())
     except LedgerBusy as error:

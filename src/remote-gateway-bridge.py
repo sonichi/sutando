@@ -400,7 +400,10 @@ BUILD_THREAD_VERDICT_S = 2.0
 
 # Every build-thread check and wait in one round, together: half the round's 6 s wait.
 BUILD_THREAD_ROUND_S = 3.0
-_INTAKE_FIELDS = ("user_id", "thread_root", "source_room_id", "channel_id", "source_message_id", "timestamp", "task")
+_INTAKE_FIELDS = ("user_id", "thread_root", "source_room_id", "channel_id", "source_message_id", "timestamp",
+                  "channel_kind", "task")
+# The fence's opening line, matched as text only: the skill decides whether it is a fence.
+_FENCE_OPENER = "```commons-app-build"
 # All the verdict's child sees: where the workspace (and its envelope key) is, and the skill's two
 # settings. Never the gateway's token or any other secret the bridge holds.
 _INTAKE_ENV = ("HOME", "SUTANDO_WORKSPACE", "SUTANDO_TEST_MODE", "SUTANDO_DEFAULT_WORKSPACE",
@@ -459,12 +462,18 @@ def _build_thread_gate(task: dict):
     the skill's index names is checked; in a served round its check runs after the round's acks,
     within this round's build-thread budget, and a `wait` is rechecked within it, then delivered.
     Outside a round: one check, no wait. Fails open."""
-    if not task.get("thread_root") or not _BUILD_REQUEST.is_file():
+    fence_like = not task.get("thread_root") and _FENCE_OPENER in str(task.get("task") or "")
+    if not (task.get("thread_root") or fence_like) or not _BUILD_REQUEST.is_file():
         return None
     attested, _ = local_task_protocol.broker_attested_tier(  # noqa: F821
         task.get("access_tier"), task.get("requested_access_tier"), task.get("collaborator"))
     tier = _tier_for(task.get("user_id"), attested)  # noqa: F821
-    if tier != "owner" or not _known_app_thread(task):  # any other thread keeps its place in the round
+    if tier != "owner":
+        return None
+    if fence_like:  # the skill notes a real fence's thread, so its copy is checked; always delivered
+        _build_thread_verdict(task, tier, BUILD_THREAD_VERDICT_S)
+        return None
+    if not _known_app_thread(task):  # any other thread keeps its place in the round
         return None
     mode = _INTAKE_MODE  # noqa: F821
 

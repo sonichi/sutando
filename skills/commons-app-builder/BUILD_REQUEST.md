@@ -289,11 +289,19 @@ most 1 s, then it exits 3). A non-zero exit, a timeout or unparseable output del
 thread index `state/commons-app-builds/app-threads.json` (`{room_id: {thread_root: until}}`,
 written whenever the ledger notes or claims a fence: a thread stays an app's for 24 hours after
 the newest fence that named it). Any other thread, and anything unreadable, takes the ordinary
-path in its place in the round, with no check. So a build's copy in a thread whose fence no run
-has taken up yet reaches the agent, and `thread-task` drops it there, as a duplicate even when the
-build has already answered. The bridge does not index a new build's thread at the fence: the
-fence is a DM task, and seeing it would mean asking the skill about every owner DM (one process,
-about 140 ms each) or parsing the fence in the bridge.
+path in its place in the round, with no check.
+
+**A new build's thread is indexed at its fence.** An owner-tier DM task whose text contains the
+fence's opening line (```` ```commons-app-build ````, one substring test, no parsing in the bridge)
+is handed to the same `intake-verdict` call, within the same 2 s and failing open. The skill notes
+it when it is a whole, valid owner fence naming an app thread, which indexes that thread, and
+notes nothing otherwise (a quote of the marker, a guest, a group room, a bad id). The DM is
+delivered either way. So the copy that follows, in that round or a later one, is checked and
+settled at intake. A DM without the marker starts no process.
+
+What remains: if that call fails or times out, the thread is indexed only once a run notes or
+claims the fence. The copy then reaches the agent, and `thread-task` drops it, as a duplicate even
+after the build has answered.
 
 In a served round the check costs the first pass nothing: the task is taken after the round's
 acks, after its lane dedupe (which keeps its own wait), and every build-thread check and wait in

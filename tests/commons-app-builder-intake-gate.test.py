@@ -107,12 +107,16 @@ def main():
 
     check("the loader installs the intake gate", rgb.TASK_INTAKE_GATE is rgb._intake_gate)
 
-    # 0. A thread no one has indexed yet (a build's fence not taken up): its messages keep their
-    #    place, unchecked; the skill's own thread-task drops the build's copy.
+    # 0. A new build: the bridge hands its fence DM to the skill, which indexes its thread, so the
+    #    copy that follows (here in the next round) is settled at intake. No run took the fence up.
     write("task-fence0", fence("00000000-7a4d-4e8b-9f61-2c5d8a0b7e14", description="A new board",
                                thread_root="$freshRoot:s.space"))
+    check("the fence DM itself is delivered", queued("task-fence0"))
     write("task-fresh0", thread_message("$fr0", text="A new board", root="$freshRoot:s.space"))
-    check("in a thread no one has indexed, even the build's copy is queued unchecked", queued("task-fresh0"))
+    check("a new build's copy in the next round is settled at intake", not queued("task-fresh0")
+          and settled("task-fresh0"))
+    write("task-fresh0b", thread_message("$fr0b", text="is it ready?", root="$freshRoot:s.space"))
+    check("while another message in that thread is delivered", queued("task-fresh0b"))
 
     # 1. A build fence, then its description in the app's thread.
     rid = "3f2b9c1e-7a4d-4e8b-9f61-2c5d8a0b7e14"
@@ -459,6 +463,42 @@ def main():
         index.write_text(kept_index)
         rgb._build_thread_verdict = real_verdict
     check("and none of them ran a check", calls12 == [])
+
+    # 13. The fence and its copy in ONE served round: the fence is taken in the first pass and
+    #     indexes its thread, so the copy (an app thread now) is checked after the acks and settled.
+    real_ack = rgb._post_task_ack
+    rgb._post_task_ack = lambda *a, **k: True
+    try:
+        rgb._take_served_round([{"id": "task-rf13", **fence("13131313-7a4d-4e8b-9f61-2c5d8a0b7e14", description="A poll",
+                                                         thread_root="$root13:s.space")},
+                                {"id": "task-rc13", **thread_message("$c13", text="A poll", root="$root13:s.space")}],
+                               set(), [], {}, [])
+    finally:
+        rgb._post_task_ack = real_ack
+    check("a fence and its copy in one round: the copy is settled", queued("task-rf13") and not queued("task-rc13")
+          and settled("task-rc13"))
+
+    # The pre-check costs one substring test: only an owner DM with the fence's opening line starts the
+    # skill, and the skill indexes only a whole, valid fence.
+    spawned = []
+    real_verdict = rgb._build_thread_verdict
+    rgb._build_thread_verdict = lambda *x, **k: spawned.append(x[0]["id"]) or real_verdict(*x, **k)
+    index = tmp / "state" / "commons-app-builds" / "app-threads.json"
+    before = index.read_text()
+    dm = {k: v for k, v in fence("14141414-7a4d-4e8b-9f61-2c5d8a0b7e14").items() if k != "task"}
+    try:
+        write("task-dm-plain", dict(dm, task="Can you build me a poll for Saturday?"))
+        write("task-dm-quote", dict(dm, task="The docs say to start with ```commons-app-build and then {oops"))
+        write("task-dm-guest", dict(fence("15151515-7a4d-4e8b-9f61-2c5d8a0b7e14", thread_root="$root15:s.space"),
+                                    user_id=OTHER, access_tier="guest"))
+    finally:
+        rgb._build_thread_verdict = real_verdict
+    check("an owner DM without the fence's opening line starts no process", "task-dm-plain" not in spawned)
+    check("a DM that only quotes the marker is handed over, but indexes nothing", spawned == ["task-dm-quote"]
+          and index.read_text() == before)
+    check("a non-owner's fence-like DM never reaches the skill", "task-dm-guest" not in spawned
+          and "$root15:s.space" not in index.read_text())
+    check("and all three are delivered", queued("task-dm-plain") and queued("task-dm-quote") and queued("task-dm-guest"))
 
     print(f"commons-app-builder intake gate: {'FAIL' if failures else 'OK'} ({len(failures)} failed)")
     return 1 if failures else 0
