@@ -2267,6 +2267,17 @@ def worker_home_identity(worker: str, workspace: Optional[Path] = None) -> Optio
     return next((r for r in own if _row_servers(r) & servers), None)
 
 
+def is_worker_note_lane(instance: str, worker: str, room_id: str = "", workspace: Optional[Path] = None) -> bool:
+    """Whether the lane `instance` delivers a note `worker`'s session stamped: one naming a room goes from
+    the worker's serving identity on that room's server when it has one; any other from its home lane
+    (`is_worker_home_lane`)."""
+    server = server_of_room(room_id or "")
+    row = worker_identity(worker, workspace, server=server) if server else None
+    if row is not None and _serving(row):
+        return instance in [str(row["instance"])] + alias_instances(row)
+    return is_worker_home_lane(instance, worker, workspace)
+
+
 def is_worker_home_lane(instance: str, worker: str, workspace: Optional[Path] = None) -> bool:
     """Whether the lane `instance` may deliver the notes `worker`'s session stamps: always while no other
     lane of that worker serves; with several, only its home identity's (`worker_home_identity`), and
@@ -2282,11 +2293,12 @@ def session_proactive_name(name, environ: Optional[Mapping[str, str]] = None,
     """The name this session publishes a proactive file under (`proactive_routing.stamp_worker`): stamped
     with its worker when the session is a pool worker's that acts as its own agent
     (`worker_home_identity`), so that worker's home lane claims it; unchanged for the core's session and
-    for a worker acting through the core's agent, whose notes a core lane sends as before.
-    AmbiguousWorkerIdentity when the worker serves on several servers and none is the primary's."""
+    for a worker acting through the core's agent, whose notes a core lane sends as before, and for every
+    name the stamp leaves alone (a task result). AmbiguousWorkerIdentity for a proactive note when the
+    worker serves on several servers and none is the primary's."""
     from proactive_routing import stamp_worker
     worker = session_worker(environ)
-    if not worker:
+    if not worker or stamp_worker(name, worker) == Path(name).name:
         return Path(name).name
     if worker_home_identity(worker, workspace) is not None:
         return stamp_worker(name, worker)
@@ -2296,11 +2308,18 @@ def session_proactive_name(name, environ: Optional[Mapping[str, str]] = None,
     return Path(name).name
 
 
-def mcp_seat_server(workspace: Optional[Path] = None) -> str:
-    """The server the workspace's agent MCP descriptor mints on: its lane's row's server, else its agent's
-    server; "" when the descriptor is missing, unreadable or names neither."""
+MCP_DESCRIPTOR_ENV = "AG2_MCP_DESCRIPTOR"
+
+
+def mcp_seat_server(workspace: Optional[Path] = None, environ: Optional[Mapping[str, str]] = None) -> str:
+    """The server the seat's agent MCP descriptor mints on: the one its proxy reads (`MCP_DESCRIPTOR_ENV`,
+    which the proxy keeps for this resolver, wherever it lives), else the workspace's. Its lane's row's
+    server, else its agent's; "" when no descriptor is readable or it names neither."""
+    environ = os.environ if environ is None else environ
+    named = str(environ.get(MCP_DESCRIPTOR_ENV) or "")
     try:
-        desc = json.loads(mcp_descriptor_path(workspace).read_text(encoding="utf-8"))
+        path = Path(named) if named and Path(named).is_file() else mcp_descriptor_path(workspace)
+        desc = json.loads(path.read_text(encoding="utf-8"))
         rows = _read(record_path(workspace))
     except (OSError, ValueError, SchemaError):
         return ""
@@ -2321,14 +2340,15 @@ def worker_mcp_credential(worker: str, *, workspace: Optional[Path] = None,
     `{worker, acts_as, lane, server, agent_id, relay, bearer}`, `bearer` the secret half. A worker with no
     identity, or a disabled or parked one, answers `{worker, acts_as: "core", reason}`: it acts through the
     core's agent, as its notes do. The identity is the one on `server`, else on the server the seat's MCP
-    descriptor mints on (`mcp_seat_server`) when known, so a token is never minted on another server's.
+    descriptor mints on (`mcp_seat_server`: the proxy's own) when known, so a token is never minted on
+    another server's.
     Refused with NoWorkerCredential for no worker, for an enabled identity with no token, and
     (`ambiguous_server`) for several identities and no server to pick by; the core's is never answered."""
     if not worker or not WORKER_RE.match(worker):
         raise NoWorkerCredential("no_worker", "this session names no pool worker")
     mine = worker_identities(worker, workspace)
     own = [r for r in mine if _serving(r)]
-    server = (server or (mcp_seat_server(workspace) if own else "")).strip().lower()
+    server = (server or (mcp_seat_server(workspace, environ) if own else "")).strip().lower()
     if not server and len(own) > 1:
         raise NoWorkerCredential("ambiguous_server", f"worker {worker} has an agent on several servers and the "
                                  "seat's MCP descriptor names no server to pick one by")
@@ -2459,11 +2479,28 @@ def remove_worker_identity(worker: str, *, server: Optional[str] = None, workspa
     return remove_connection(str(row["instance"]), workspace=workspace, vault=vault, kill=kill)
 
 
+class PartialWorkerRetire(ConnectionsError):
+    """`retire_worker_identity` removed some of a worker's identities and failed on another: `removed`
+    lists the rows taken down, `cause` the failure; the rest stand and a retry takes them."""
+
+    def __init__(self, removed: list, cause: Exception):
+        names = ", ".join(str(r["instance"]) for r in removed) or "none"
+        super().__init__(f"removed {names} before failing: {type(cause).__name__}: {cause}")
+        self.removed, self.cause = removed, cause
+
+
 def retire_worker_identity(worker: str, *, workspace: Optional[Path] = None, vault=None, kill=None) -> list:
     """Take every identity `worker` holds down (`remove_connection` each, one per server): what a retired
-    worker leaves. [] when it has none."""
-    return [remove_connection(str(r["instance"]), workspace=workspace, vault=vault, kill=kill)
-            for r in worker_identities(worker, workspace)]
+    worker leaves. [] when it has none; PartialWorkerRetire, naming what went, when one fails after another."""
+    removed: list = []
+    for r in worker_identities(worker, workspace):
+        try:
+            removed.append(remove_connection(str(r["instance"]), workspace=workspace, vault=vault, kill=kill))
+        except ConnectionsError as e:
+            if not removed:
+                raise
+            raise PartialWorkerRetire(removed, e) from e
+    return removed
 
 
 def disconnect(instance: str, *, workspace: Optional[Path] = None, kill=None) -> dict:

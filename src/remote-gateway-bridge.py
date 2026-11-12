@@ -507,11 +507,19 @@ def _lane_worker() -> str:
 def _worker_lane_claim_gate(worker: str):
     """A worker's own lane shares results/ with the core's lanes: it claims only the proactive files
     its worker's session stamped (`lane_claims_proactive`), which it posts as the worker's agent, and
-    only while it is that worker's home lane (`is_worker_home_lane`), so a worker with an agent on
-    several servers sends each note from one of them."""
-    from connections import is_worker_home_lane
-    return lambda path: lane_claims_proactive(path.name, worker) and \
-        is_worker_home_lane(GATEWAY_INSTANCE, worker, WS)  # noqa: F821
+    only the ones that are this lane's (`is_worker_note_lane`): a note naming a room goes from the
+    worker's lane on that room's server, any other from its home lane, so each has one claimant."""
+    from connections import is_worker_note_lane
+
+    def gate(path: Path) -> bool:
+        if not lane_claims_proactive(path.name, worker):
+            return False
+        try:
+            route, room, _ = _proactive_route(path.read_text(encoding="utf-8"))  # noqa: F821
+        except (OSError, ValueError):
+            route, room = "", ""
+        return is_worker_note_lane(GATEWAY_INSTANCE, worker, room if route == "send" else "", WS)  # noqa: F821
+    return gate
 
 
 def _install_worker_lane(worker: str) -> None:

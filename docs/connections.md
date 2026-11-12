@@ -585,10 +585,18 @@ answers before the rule above:
 A worker's row has no channel env file: its token is in the vault alone, so
 `channel-env.sh <its lane>` exits 1 saying so, and room clients resolve it by room.
 
-Whether a worker acts as its own agent at all is one test, `connections.worker_enabled_identity`:
-its row exists and is neither disabled nor parked, so a lane serves it. A worker with no row, or a
-disabled or parked one, acts through the core's agent in everything below, as every worker did
-before it had an identity.
+Whether a worker acts as its own agent on a server is one test, `connections.worker_enabled_identity`
+(`server=`): its row on that server exists and is neither disabled nor parked, so a lane serves it. A
+worker with no row there, or a disabled or parked one, acts through the core's agent in everything
+below, as every worker did before it had an identity.
+
+A worker holds at most one identity per server, so it can have one on each homeserver the core is
+connected to (`require_no_worker_identity` is the one check, on the server of the `--lane` it is
+added through). Every reader picks the one for the server it acts on: a room's server for room
+operations; for the seat's MCP tools, `--server`, else the server of the descriptor the seat's proxy
+reads (`mcp_seat_server`). Where nothing names a server (a room operation with no room, an MCP seat
+whose descriptor matches neither) it refuses by name (`WorkerRoomAmbiguous`, `ambiguous_server`)
+instead of guessing. `retire_worker_identity` removes them all.
 
 A proactive file such a worker's session writes is the worker's lane's to deliver. The session
 publishes it through `result_publish.py`, which stamps the name
@@ -596,7 +604,9 @@ publishes it through `result_publish.py`, which stamps the name
 `proactive_routing.stamp_worker`); a session that writes the file by hand uses the same name. A
 worker acting through the core publishes the name unchanged, and a core lane sends it as before.
 The one claim rule is `proactive_routing.lane_claims_proactive(name, lane_worker)`: a stamped file
-is claimed only by the lane running as that worker, which posts it as the worker's agent into that
+is claimed only by the lane running as that worker (with an identity on several servers, by one of
+them, `connections.is_worker_note_lane`: the lane on the server of the room the note names, else
+its home lane, the identity on the primary's server; a note with no home is refused at publish), which posts it as the worker's agent into that
 agent's own owner DM; a core lane and every other bridge (Discord, Slack, Telegram, their
 fallbacks) refuse it, and a worker's lane claims nothing unstamped. The gateway's drain asks its
 host (`PROACTIVE_OWN_FILE`) whether an owner-directed file is the lane's own, so a worker's lane

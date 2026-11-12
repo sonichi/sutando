@@ -716,6 +716,78 @@ class TwoServers(Base):
             rc, out, _ = run("show", "Reviewer")
             self.assertEqual(json.loads(out)["agent_mxid"], WORKER_AGENT, "one left: no server needed")
 
+    def test_the_mcp_credential_reads_the_descriptor_the_seats_proxy_reads(self):
+        """The proxy keeps AG2_MCP_DESCRIPTOR for the resolver: a desktop descriptor outside the workspace,
+        with none inside it, still picks the seat's server."""
+        import tempfile
+        outside = Path(tempfile.mkdtemp(prefix="desktop-descriptor-")) / "ag2-mcp.json"
+        outside.write_text(json.dumps({"version": 1, "lane": "desktop-own-name", "agent_id": BETA_CORE}))
+        self.assertFalse((self.ws / "state" / C.MCP_DESCRIPTOR_NAME).exists())
+        env = {C.MCP_DESCRIPTOR_ENV: str(outside)}
+        cred = C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault, environ=env)
+        self.assertEqual((cred["server"], cred["bearer"]), ("beta-fixture.net", "secret-reviewer-b"))
+        with self.assertRaises(C.NoWorkerCredential):
+            C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault,
+                                    environ={C.MCP_DESCRIPTOR_ENV: str(outside) + ".gone"})
+
+    def test_a_task_result_publishes_whatever_the_proactive_home(self):
+        import result_publish
+        with unittest.mock.patch.object(C, "primary_row", lambda ws=None: None):
+            self.assertEqual(C.session_proactive_name("task-s-space~task-abc.txt", self.env, self.ws),
+                             "task-s-space~task-abc.txt", "a task result has its own route back")
+            with unittest.mock.patch.dict(os.environ, {**self.env, "SUTANDO_WORKSPACE_DIR": str(self.ws)}):
+                got = result_publish.worker_published_path(self.ws / "results" / "task-abc.txt", self.env)
+            self.assertEqual(got.name, "task-abc.txt")
+            with self.assertRaises(C.AmbiguousWorkerIdentity):
+                C.session_proactive_name("proactive-9.txt", self.env, self.ws)
+
+    def test_a_note_naming_a_room_goes_from_that_rooms_server(self):
+        a, b = self.alpha["instance"], self.beta["instance"]
+        self.assertEqual((C.is_worker_note_lane(a, W, BETA_ROOM, self.ws), C.is_worker_note_lane(b, W, BETA_ROOM, self.ws)),
+                         (False, True))
+        self.assertEqual((C.is_worker_note_lane(a, W, ALPHA_ROOM, self.ws), C.is_worker_note_lane(b, W, ALPHA_ROOM, self.ws)),
+                         (True, False))
+        for room in ("", "!r:gamma-fixture.net"):
+            self.assertEqual((C.is_worker_note_lane(a, W, room, self.ws), C.is_worker_note_lane(b, W, room, self.ws)),
+                             (True, False), f"{room!r}: no identity there, so the home lane")
+
+    def test_the_bridges_worker_gate_picks_one_lane_per_note(self):
+        """Through the gateway bridge's own claim gate: each note has exactly one claiming lane."""
+        rgb = _load_shim()
+        saved = {k: getattr(rgb, k) for k in ("WS", "GATEWAY_INSTANCE")}
+        self.addCleanup(lambda: [setattr(rgb, k, v) for k, v in saved.items()])
+        rgb.WS = self.ws
+        results = self.ws / "results"
+        results.mkdir(exist_ok=True)
+        notes = {"room-beta": (f"[channel: {BETA_ROOM}]\nfor beta\n", self.beta["instance"]),
+                 "room-alpha": (f"[channel: {ALPHA_ROOM}]\nfor alpha\n", self.alpha["instance"]),
+                 "unaddressed": ("hello owner\n", self.alpha["instance"])}
+        for i, (key, (body, owner)) in enumerate(notes.items()):
+            path = results / f"proactive-{i}.by-{W}.txt"
+            path.write_text(body)
+            claimants = []
+            for lane in (self.alpha["instance"], self.beta["instance"]):
+                rgb.GATEWAY_INSTANCE = lane
+                if rgb._worker_lane_claim_gate(W)(path):
+                    claimants.append(lane)
+            self.assertEqual(claimants, [owner], key)
+
+    def test_a_partial_retire_names_what_it_removed(self):
+        real = C.remove_connection
+        calls = []
+
+        def remove(instance, **kw):
+            calls.append(instance)
+            if len(calls) == 2:
+                raise C.BridgeStillRunning(instance, 4242)
+            return real(instance, **kw)
+        with unittest.mock.patch.object(C, "remove_connection", remove):
+            with self.assertRaises(C.PartialWorkerRetire) as e:
+                C.retire_worker_identity(W, workspace=self.ws, vault=self.vault, kill=lambda *a: None)
+        self.assertEqual([r["instance"] for r in e.exception.removed], calls[:1])
+        self.assertIn(f"removed {calls[0]} before failing", str(e.exception))
+        self.assertEqual(len(C.worker_identities(W, self.ws)), 1, "the rest stands for a retry")
+
     def test_pool_manage_retire_takes_both(self):
         import pool_manage
         with unittest.mock.patch.object(C, "_vault", lambda v=None: self.vault), \

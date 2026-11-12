@@ -246,7 +246,8 @@ def _save(worker, token, agent_id, core, current, *, workspace, vault, preview, 
                                                        source="agent_link", preview=seen, workspace=workspace,
                                                        vault=vault)
     except connections.WorkerIdentityExists:
-        row, created = connections.worker_identity(worker, workspace, server=str(seen.get("server") or "")), False
+        row, created = connections.worker_identity(worker, workspace, server=str(seen.get("server") or "")) or \
+            {"instance": "another agent's, since removed"}, False
     if not created:
         raise DeviceConnectError(f"worker {worker} already had a connection ({row['instance']}) by the time the "
                                  "approved token was saved; it was left as it is", status="identity_changed")

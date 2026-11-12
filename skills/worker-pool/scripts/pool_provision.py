@@ -333,7 +333,8 @@ def _save(worker: str, token: str, expected: str, gateway: str, *, workspace, va
                                                          source="agent_link", preview=seen, workspace=workspace,
                                                          vault=vault)
     except connections.WorkerIdentityExists:
-        saved, created = connections.worker_identity(worker, workspace, server=str(seen.get("server") or "")), False
+        saved, created = connections.worker_identity(worker, workspace, server=str(seen.get("server") or "")) or \
+            {"instance": "another agent's, since removed"}, False
     if not created:
         raise ProvisionError(f"worker {worker} already had a connection ({saved['instance']}); the redeemed "
                              "token was not stored")
