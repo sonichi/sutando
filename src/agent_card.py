@@ -6,7 +6,9 @@ that older clients show. `build` returns that pair, `problem` checks a card the 
 the s.space Action `room.message.send` with an injected Action client, so this module holds no HTTP
 client of its own. A card button of kind `reply` comes back as the clicker's reply to the card: an
 ordinary task whose message is a `card:<kind>:<target>:<verb>[:confirmed]` payload, read by
-`reply_payload` and gated by `owner_may_act`. Standard library only, plus local_task_protocol.
+`reply_payload` and acted on only through `answered_card`: the owner's reply to a card this agent
+posted (issued_cards), carrying a payload that card offered. Standard library only, plus
+local_task_protocol and issued_cards.
 """
 from __future__ import annotations
 
@@ -146,8 +148,8 @@ def _long(value: object, limit: str) -> bool:
 def _avatar_problem(av: object, where: str) -> Optional[str]:
     if not isinstance(av, dict) or not any(_text(av.get(k)) for k in AVATAR_KEYS):
         return f"{where} needs one of {', '.join(AVATAR_KEYS)}"
-    if "url" in av and not _link_ok(av["url"], ("https", "mxc")):
-        return f"{where}.url must be an https or mxc:// link"
+    if "url" in av and not _link_ok(av["url"], ("mxc",)):
+        return f"{where}.url must be an mxc:// link"
     if "app" in av and not (isinstance(av["app"], str) and _APP_RE.fullmatch(av["app"])):
         return f"{where}.app is not an app slug"
     if "shape" in av and av["shape"] not in ("round", "square"):
@@ -357,6 +359,10 @@ class Reply:
     verb: str
     confirmed: bool
 
+    @property
+    def payload(self) -> str:
+        return REPLY_PREFIX + ":".join([self.kind, self.target or "-", self.verb] + ([CONFIRMED] if self.confirmed else []))
+
 
 def parse_reply(text: str) -> Optional[Reply]:
     """The card reply `text` is, or None when it is not exactly one."""
@@ -393,4 +399,19 @@ def owner_may_act(headers: Mapping[str, str], owner_mxid: str = "", *, dm_only: 
         return "the reply names no sender"
     if dm_only and str(headers.get("channel_kind") or "").strip() != "dm":
         return "this card acts only from the owner's DM"
+    return None
+
+
+def answered_card(headers: Mapping[str, str], said: Reply, owner_mxid: str, workspace,
+                  *, now: Optional[float] = None) -> Optional[str]:
+    """Why a card reply is ordinary chat, or None when the owner replied to a card this agent posted
+    and the payload is one that card offered. A forged card in a room never passes the second test."""
+    import issued_cards
+    if not owner_mxid:
+        return "the owner is not known"
+    why = owner_may_act(headers, owner_mxid)
+    if why:
+        return why
+    if not issued_cards.offered_by(workspace, str(headers.get("reply_to_event") or ""), said.payload, now=now):
+        return "it does not answer a card I posted with that action"
     return None
