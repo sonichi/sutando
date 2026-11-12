@@ -232,17 +232,32 @@ def _attach_command() -> str:
             if be else "")
 
 
-def compose_details(signal: dict) -> list:
-    """What a person debugging this needs and the notice does not say: the state and gate
-    codes, the terminal's first readable line, and the command that opens the terminal.
-    Logged, and sent as the alert's structured details; never part of the notice text."""
+def _plain(text: str) -> str:
+    """`text` with internal tokens taken out, for the notice; unchanged if the helper is missing."""
+    try:
+        _src_on_path()
+        import owner_text
+        return owner_text.without_internals(text) or text
+    except Exception:  # noqa: BLE001 - the owner's only channel: never crash the escalation
+        return text
+
+
+def _excerpt(signal: dict) -> str:
+    """The terminal's first readable line: what the owner is being asked."""
     prompt = (signal.get("prompt") or "").strip()
     try:
         _src_on_path()
         from prompt_excerpt import first_readable_line
-        excerpt = first_readable_line(prompt)
-    except Exception:  # noqa: BLE001 - details are best-effort
-        excerpt = next((ln.strip() for ln in prompt.splitlines() if ln.strip()), "")
+        return first_readable_line(prompt)
+    except Exception:  # noqa: BLE001 - a missing filter degrades to the raw first line
+        return next((ln.strip() for ln in prompt.splitlines() if ln.strip()), "")
+
+
+def compose_details(signal: dict) -> list:
+    """What a person debugging this needs and the notice does not say: the state and gate
+    codes, the terminal's first readable line in full, and the command that opens the terminal.
+    Logged, and sent as the alert's structured details; never part of the notice text."""
+    excerpt = _excerpt(signal)
     out = [f"state: {signal.get('state') or ''}" + (f" · gate: {signal['kind']}" if signal.get("kind") else "")]
     if excerpt:
         out.append(f"terminal: {excerpt[:200]}")
@@ -273,7 +288,7 @@ def compose_message(signal: dict, surface: str = "") -> str:
 def _compose(signal: dict, surface: str = "") -> str:
     aa = _soft_notice(signal)
     if aa and signal.get("state") not in HARD_ESCALATE and aa.get("kind") == "fable-limit-refused":
-        who = f"worker {signal['seat']}" if signal.get("seat") else "the core"
+        who = _who(signal) if signal.get("seat") else "the core"
         return (f"ℹ️ Fable weekly limit reached — {who} had a turn refused, so its monitor typed"
                 " `/model opus`, and types `continue` once the pane is idle with an empty composer."
                 " Whether the switch took is not checked: if its terminal still shows the Fable"
@@ -286,7 +301,11 @@ def _compose(signal: dict, surface: str = "") -> str:
                 " otherwise; /model there changes it, /usage-credits keeps Fable on credits.")
     detail = signal.get("detail") or signal.get("state") or "core needs attention"
     kind = signal.get("kind")
-    msg = f"⚠️ {_who(signal)} needs you — {detail}"
+    msg = f"⚠️ {_who(signal)} needs you — {_plain(detail)}"
+    excerpt = _excerpt(signal)
+    if excerpt:
+        # What the terminal is asking, on every channel: the remedy keeps its length, this gives way.
+        msg += f": {excerpt[:110]}"
     if kind == "turn-rejected":
         msg += (" — the core sits at its idle prompt but refuses every turn it is sent; each"
                 " ends in that line, so nothing queued for it runs")

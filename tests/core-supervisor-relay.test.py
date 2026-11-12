@@ -182,7 +182,9 @@ class TestComposeMessage(unittest.TestCase):
     def test_a_refused_turn_switch_names_the_worker_and_the_switch(self):
         self.assertTrue(should_escalate(_FABLE_REFUSED_AUTO, None)[0])
         msg = compose_message(dict(_FABLE_REFUSED_AUTO, seat="sutando-worker-d2571c90"))
-        self.assertIn("worker sutando-worker-d2571c90", msg)
+        self.assertIn("A worker had a turn refused", msg, "a session name is not a name")
+        self.assertNotIn("sutando-worker-d2571c90", msg)
+        self.assertIn("Pro-fast had a turn refused", compose_message(dict(_FABLE_REFUSED_AUTO, seat="Pro-fast")))
         self.assertIn("/model opus", msg)
         self.assertNotIn("Agent needs you", msg)
         self.assertIn("the core", compose_message({k: v for k, v in _FABLE_REFUSED_AUTO.items() if k != "seat"}))
@@ -215,7 +217,7 @@ class TestComposeMessage(unittest.TestCase):
     def test_includes_detail_and_prompt_excerpt(self):
         m = compose_message(_LOGIN)
         self.assertIn("awaiting user: login", m)
-        self.assertNotIn(_LOGIN["prompt"].splitlines()[0], m, "the terminal's line is a detail")
+        self.assertIn(": " + _LOGIN["prompt"].strip().splitlines()[0][:110], m, "what is asked stays visible")
         self.assertIn("terminal: " + _LOGIN["prompt"].strip().splitlines()[0], _details(_LOGIN))
         self.assertIn("can't sign it in", m)
 
@@ -313,7 +315,7 @@ class TestComposeMessage(unittest.TestCase):
         m = compose_message(sig)
         self.assertIn("refuses every turn", m)
         self.assertIn("OAuth access token has expired", _details(sig))
-        self.assertNotIn("OAuth access token", m)
+        self.assertIn("OAuth access token has expired", m, "what is asked stays visible")
         self.assertIn("has to be signed in again", m)
         self.assertNotIn("usage limit", m)
 
@@ -464,6 +466,17 @@ class TestNoticeReadsPlainly(unittest.TestCase):
                 self.assertNotIn(leak, m, sig.get("state"))
             self.assertNotIn(self.KEY, d)
             self.assertIn("open its terminal: tmux -S /tmp/sutando-tmux.sock attach -t", d)
+
+    def test_the_detail_loses_its_internal_tokens_and_the_question_stays_visible(self):
+        sig = {"state": "blocked-human", "detail": "awaiting user in sutando-core (7c700e11a8d9)",
+               "kind": "selection", "prompt": "╭────╮\nWhich branch should I merge?\n❯ 1. main\n"}
+        with _no_backend():
+            m = compose_message(sig)
+        self.assertIn("needs you — Awaiting user in: Which branch should I merge?", m)
+        for leak in ("sutando-core", "7c700e11a8d9", "╭"):
+            self.assertNotIn(leak, m)
+        with patch.dict(sys.modules, {"owner_text": None}):
+            self.assertEqual(_mod._plain("x y"), "x y")
 
     def test_a_worker_is_named_by_its_label_and_the_core_by_its_display_name(self):
         self.assertTrue(compose_message(self.SIGNALS[-1]).startswith("⚠️ Reviewer needs you — "))
@@ -1162,8 +1175,8 @@ class TestSeatNotices(unittest.TestCase):
             second = self._run()
         finally:
             _mod._macos_notify = orig
-        self.assertIn("worker Pro-fast", first)
-        self.assertNotIn("worker Pro-fast", second)
+        self.assertIn("Pro-fast had a turn refused", first)
+        self.assertNotIn("Pro-fast", second)
         self.assertTrue(os.path.exists(self.state + ".sutando-worker-ab"))
 
     def test_a_failed_switch_retyped_each_cooldown_is_one_notice_per_episode(self):
