@@ -439,6 +439,27 @@ def main():
           order == ["task-r1", "task-r2", "task-r4", "task-r3"], repr(order))
     check("and only the app thread's task runs a check", checks == ["task-r3"], repr(checks))
 
+    # 12. An unreadable or hostile index is no app thread: delivered in place, no check, no crash.
+    index = tmp / "state" / "commons-app-builds" / "app-threads.json"
+    kept_index = index.read_text()
+    calls12 = []
+    real_verdict = rgb._build_thread_verdict
+    rgb._build_thread_verdict = lambda *x, **k: calls12.append(x) or real_verdict(*x, **k)
+    try:
+        for n, bad in enumerate(("{not json", "[]", json.dumps({ROOM: []}), json.dumps({ROOM: {ROOT: "soon"}}),
+                                 '{"%s": {"%s": Infinity}}' % (ROOM, ROOT), '{"%s": {"%s": NaN}}' % (ROOM, ROOT),
+                                 json.dumps({ROOM: {ROOT: True}}))):
+            index.write_text(bad)
+            write(f"task-badindex{n}", thread_message(f"$bi{n}"))
+            check(f"an index that is {bad[:28]!r} is no app thread", queued(f"task-badindex{n}"))
+        index.unlink()
+        write("task-noindex", thread_message("$bi9"))
+        check("no index at all is no app thread", queued("task-noindex"))
+    finally:
+        index.write_text(kept_index)
+        rgb._build_thread_verdict = real_verdict
+    check("and none of them ran a check", calls12 == [])
+
     print(f"commons-app-builder intake gate: {'FAIL' if failures else 'OK'} ({len(failures)} failed)")
     return 1 if failures else 0
 

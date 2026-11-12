@@ -270,8 +270,9 @@ The two are tied exactly, never by time:
   whose text **is** the fence's description, from the asking owner, in that thread. That is the
   client's own first message; texts are compared trimmed, with whitespace collapsed. That is the
   build's one slot, used once, only within `BUILD_THREAD_SETTLE_SECONDS` of the fence (the client
-  sends it at once; the same words later are the owner's own), and closed for good once the
-  request is answered or a question is asked for it. Any other message (an @-mention, a "thanks", the same words three days later) is
+  sends it at once; the same words later are the owner's own), and closed for good once a
+  question is asked for it. The request's reply does not close it: the agent's queue runs the
+  fence first, so the copy is often checked only after the build has answered. Any other message (an @-mention, a "thanks", the same words three days later) is
   not the slot.
 
 **Where it runs first: the gateway bridge.** Before a room task with a `thread_root` is queued,
@@ -289,7 +290,10 @@ thread index `state/commons-app-builds/app-threads.json` (`{room_id: {thread_roo
 written whenever the ledger notes or claims a fence: a thread stays an app's for 24 hours after
 the newest fence that named it). Any other thread, and anything unreadable, takes the ordinary
 path in its place in the round, with no check. So a build's copy in a thread whose fence no run
-has taken up yet reaches the agent, and `thread-task` drops it there.
+has taken up yet reaches the agent, and `thread-task` drops it there, as a duplicate even when the
+build has already answered. The bridge does not index a new build's thread at the fence: the
+fence is a DM task, and seeing it would mean asking the skill about every owner DM (one process,
+about 140 ms each) or parsing the fence in the bridge.
 
 In a served round the check costs the first pass nothing: the task is taken after the round's
 acks, after its lane dedupe (which keeps its own wait), and every build-thread check and wait in
@@ -337,7 +341,7 @@ posts nothing anywhere. The checks run in this order:
 1. `duplicate <request_id>`: a fence names this message (`source_message_id`), at any distance in
    time. Write `[no-send]` and do nothing.
 2. `duplicate <request_id>`: this message holds a build fence's slot (its text is the description,
-   the slot was free, the request neither answered nor asking). Write `[no-send]` and do nothing.
+   the slot was free, no question asked for it, within the settle time of the fence, answered or not). Write `[no-send]` and do nothing.
 3. `answer <request_id>`: a question is open for a request in this thread (switch on). Go on as
    `answer` does.
 4. `wait`: **switch on only**. This thread is an app thread one of the owner's fences named within

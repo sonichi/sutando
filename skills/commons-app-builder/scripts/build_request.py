@@ -23,6 +23,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -356,11 +357,14 @@ class Ledger:
                 except (OSError, ValueError):
                     known = {}
                 now = time.time()
-                known = {r: {t: u for t, u in (ts or {}).items() if isinstance(u, (int, float)) and u > now}
+                known = {r: {t: u for t, u in (ts or {}).items()
+                             if isinstance(u, (int, float)) and math.isfinite(u) and u > now}
                          for r, ts in known.items() if isinstance(ts, dict)}
                 threads = known.setdefault(room, {})
                 threads[root] = max(threads.get(root, 0), at + ASK_TTL_S)
                 self._write(path, {r: ts for r, ts in known.items() if ts})
+        except LedgerBusy as error:
+            print(f"build_request: {error}; the thread index was not updated", file=sys.stderr)
         except OSError:
             return
 
@@ -1133,7 +1137,7 @@ def _verdict(meta: Dict[str, str], line: str, ledger: "Ledger", tasks_dir: Optio
         if (f.get("mode") == "build" and not f.get("thread_message") and said and f.get("said") == said
                 and e.get("slot_used_by") in (None, message) and message
                 and at is not None and abs(at - f.get("at", float("inf"))) <= settle_seconds()
-                and (e.get("slot_used_by") == message or not (e.get("asked") or e.get("reply")))):
+                and (e.get("slot_used_by") == message or not e.get("asked"))):  # a reply closes nothing
             if ledger.use_slot(room, e["request_id"], message):
                 return "duplicate", e.get("request_id")
     # 3. An answer.

@@ -434,13 +434,15 @@ def _known_app_thread(task: dict) -> bool:
     """Whether the skill's own index (`app-threads.json`, {room: {thread_root: until}}) names this
     message's thread as an app's: read in this process, no subprocess; anything unreadable is no."""
     import json
+    import math
     room = task.get("source_room_id") or task.get("channel_id")
     try:
         known = json.loads((WS / "state" / "commons-app-builds" / "app-threads.json").read_text(encoding="utf-8"))  # noqa: F821
         until = known.get(room, {}).get(task.get("thread_root"))
     except (OSError, ValueError, AttributeError, TypeError):
         return False
-    return isinstance(until, (int, float)) and not isinstance(until, bool) and until > time.time()
+    return (isinstance(until, (int, float)) and not isinstance(until, bool) and math.isfinite(until)
+            and until > time.time())
 
 
 def _build_thread_until(deadline: float) -> float:

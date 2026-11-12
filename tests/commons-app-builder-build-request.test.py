@@ -1640,13 +1640,20 @@ with tempfile.TemporaryDirectory() as tmp:
           ttw(stale, now=T0 + br.ASK_TTL_S + 6) == ("none", None))
     before = msg(tmp, "before", "hello", at=T0 - 5, mid="$b0")
     check("a-message-before-the-build-fence-is-not-its", tt(before, now=T0 + 600) == ("none", None))
-    # Once the request is answered, its slot is closed: the words alone take nothing.
+    # The build's copy is its copy even after the reply: the queue runs the fence first, so the
+    # copy is often checked after the build answered. Within the settle time it is still a duplicate.
     rid_r, root_r = "b4b4b4b4-3434-4565-8787-909090909090", "$rootR:s.space"
     led.claim(ROOM, rid_r, fence={"room_id": ROOM, "thread_root": root_r, "owner": OWNER, "at": T0, "mode": "build",
                                   "request_id": rid_r, "said": DESC})
     led.record(ROOM, rid_r, br.completion(rid_r, "done", "", "Built."))
-    check("an-answered-builds-slot-is-closed", tt(msg(tmp, "late-r", DESC, at=T0 + 9, mid="$r1", root=root_r),
-                                                  now=T0 + 99999) == ("none", None))
+    check("claim-reply-then-the-copy-is-still-a-duplicate",
+          tt(msg(tmp, "late-r", DESC, at=T0 + 9, mid="$r1", root=root_r), now=T0 + 99999) == ("duplicate", rid_r))
+    check("a-new-message-in-other-words-after-the-reply-is-none",
+          tt(msg(tmp, "new-r", "can you add a date column?", at=T0 + 10, mid="$r2", root=root_r),
+             now=T0 + 99999) == ("none", None))
+    check("the-same-words-past-the-settle-time-after-the-reply-are-none",
+          tt(msg(tmp, "later-r", DESC, at=T0 + br.settle_seconds() + 60, mid="$r3", root=root_r),
+             now=T0 + 99999) == ("none", None))
     # The slot holds only within the settle time of its fence: the same words typed by the owner
     # later, the client's copy never having come, are the owner's own message (review on ebb47d1f).
     rid_t, root_t = "b5b5b5b5-3434-4565-8787-909090909090", "$rootT:s.space"
@@ -1723,6 +1730,26 @@ with tempfile.TemporaryDirectory() as tmp:
                         "mode": "build", "request_id": "c4c4c4c4-3434-4565-8787-909090909090"})
     check("an-older-fence-never-shortens-a-thread", json.loads((idx_led.folder / br.Ledger.THREADS).read_text())
           [ROOM]["$rootI:s.space"] == now_i + br.ASK_TTL_S)
+
+    # A non-finite `until` is pruned on the next write; a held index lock skips the update, and says so.
+    (idx_led.folder / br.Ledger.THREADS).write_text('{"%s": {"$rootInf:s.space": Infinity}}' % ROOM)
+    idx_led.note_fence({"room_id": ROOM, "thread_root": "$rootL:s.space", "owner": OWNER, "at": now_i,
+                        "mode": "build", "request_id": "c6c6c6c6-3434-4565-8787-909090909090"})
+    check("a-non-finite-until-is-pruned", set(json.loads((idx_led.folder / br.Ledger.THREADS).read_text())[ROOM])
+          == {"$rootL:s.space"})
+    import fcntl  # noqa: PLC0415
+    held = os.open(str(idx_led.folder / ".threads.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(held, fcntl.LOCK_EX)
+    quick = br.Ledger(idx_led.folder, lock_timeout=0.2)
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            quick.index_thread({"room_id": ROOM, "thread_root": "$rootM:s.space", "at": now_i})
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+    check("a-held-index-lock-skips-the-update-and-logs-it", "the thread index was not updated" in err.getvalue()
+          and "$rootM:s.space" not in (idx_led.folder / br.Ledger.THREADS).read_text())
 
     # A room's ledger lock has a timeout: a holder never stalls another process past it.
     busy = br.Ledger(tmp / "ledger-busy", lock_timeout=0.2)
