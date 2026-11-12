@@ -344,6 +344,17 @@ class Ledger:
                 self._write(path, dict(entry, slot_used_by=message_id))
             return True
 
+    def first_seen(self, room_id: str, message_id: str, now: float) -> float:
+        """When thread-task first saw this message (recorded the first time it is asked)."""
+        room = self.folder / hashlib.sha256(room_id.encode("utf-8")).hexdigest()[:16]
+        path = room / f"seen-{hashlib.sha256(message_id.encode('utf-8')).hexdigest()[:24]}.txt"
+        with self._locked(room):
+            try:
+                return float(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                path.write_text(repr(now), encoding="utf-8")
+                return now
+
     def entries(self, room_id: str) -> List[Dict[str, Any]]:
         """Every readable entry of one room."""
         room = self.folder / hashlib.sha256(room_id.encode("utf-8")).hexdigest()[:16]
@@ -989,9 +1000,16 @@ def fence_facts(task_text: str) -> Optional[Dict[str, Any]]:
     if not (isinstance(root, str) and isinstance(room, str) and at is not None):
         return None
     message = data.get("thread_message")
+    said = data.get("description")
     return {"room_id": room, "thread_root": root, "owner": owner, "at": at, "mode": data.get("mode"),
             "request_id": data.get("request_id"),
+            **({"said": _said(said)} if isinstance(said, str) else {}),
             **({"thread_message": message} if isinstance(message, str) and _EVENT_RE.match(message) else {})}
+
+
+def _said(text: str) -> str:
+    """Text as compared for the build slot: trimmed, its whitespace collapsed."""
+    return " ".join((text or "").split())
 
 
 def settle_seconds() -> int:
@@ -1017,8 +1035,9 @@ def thread_task(task_text: str, ledger: "Ledger", tasks_dir: Optional[Path] = No
     """What a room task in an app thread is, in this order (the gateway passes no marker, so the
     tie is exact, never by time):
     1. ("duplicate", id): a change or Try-again fence names this message (its `thread_message`);
-    2. ("duplicate", id): the first message from the asking owner after a build fence in that
-       thread, which cannot name it; that fence's one slot, closed once a question is asked;
+    2. ("duplicate", id): a build fence's one slot: a message from the asking owner in that thread
+       whose text is the fence's description (the client's own first message), once; closed once
+       the request is answered or a question is asked;
     3. ("answer", id): the owner's answer to a request's open question (switch on);
     4. ("wait", None): a known app thread, the asking owner, no fence names it yet, and younger
        than settle_seconds(): a change's message arrives before its fence. Run it again after;
@@ -1047,11 +1066,13 @@ def thread_task(task_text: str, ledger: "Ledger", tasks_dir: Optional[Path] = No
         if message and e["fence"].get("thread_message") == message:
             return "duplicate", e.get("request_id")
     # 2. A build fence's one slot: its first message after it.
-    builds = sorted((e for e in mine if e["fence"].get("mode") == "build" and not e["fence"].get("thread_message")
-                     and not e.get("asked") and at is not None and e["fence"].get("at", 0) <= at),
-                    key=lambda e: e["fence"].get("at", 0), reverse=True)
-    for e in builds:
-        if e.get("slot_used_by") in (None, message) and message:
+    said = _said(_message_text(task_text, strip_mention=False))
+    for e in mine:
+        f = e["fence"]
+        # Only the client's own first message: the build's description, word for word.
+        if (f.get("mode") == "build" and not f.get("thread_message") and said and f.get("said") == said
+                and e.get("slot_used_by") in (None, message) and message
+                and (e.get("slot_used_by") == message or not (e.get("asked") or e.get("reply")))):
             if ledger.use_slot(room, e["request_id"], message):
                 return "duplicate", e.get("request_id")
     # 3. An answer.
@@ -1061,17 +1082,19 @@ def thread_task(task_text: str, ledger: "Ledger", tasks_dir: Optional[Path] = No
             if (asked.get("thread_root") == root and asked.get("owner") == owner
                     and not e.get("answer") and not e.get("reply")):
                 return "answer", e.get("request_id")
-    # 4. A change's message comes before its fence: wait for it, in a thread known as an app's.
-    if mine and at is not None and now - at < settle_seconds():
-        return "wait", None
+    # 4. A change's message comes before its fence: wait for it, in a thread known as an app's,
+    #    never longer than the settle time from when it was first seen, whatever its stamp says.
+    if mine and message and at is not None and now - at < settle_seconds():
+        if now - ledger.first_seen(room, message, now) < settle_seconds():
+            return "wait", None
     return "none", None
 
 
-def _message_text(task_text: str) -> str:
-    """The message's own words: the task line, less the gateway's reply context and a mention."""
+def _message_text(task_text: str, strip_mention: bool = True) -> str:
+    """The message's own words: the task line, less the gateway's reply context (and a mention)."""
     line = next((ln[len("task:"):].strip() for ln in task_text.splitlines() if ln.startswith("task:")), "")
     line = re.sub(r"\[AG2 Space reply context.*?\[End AG2 Space reply context\]", "", line).strip()
-    return re.sub(r"^@\S+\s*", "", line).strip()[:2000]
+    return (re.sub(r"^@\S+\s*", "", line) if strip_mention else line).strip()[:2000]
 
 
 THREAD_FAILED = "Could not build the app. The reason is in the reply to the request."

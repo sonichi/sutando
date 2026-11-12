@@ -1506,6 +1506,7 @@ finally:
 T0 = 1794495600.0  # 2026-11-12T15:00:00Z
 iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
 BUILD_ID, CHANGE_ID = "e1e1e1e1-3434-4565-8787-909090909090", "f1f1f1f1-3434-4565-8787-909090909090"
+DESC = "a sign-up sheet for Saturday's cleanup"  # task()'s description: the client's first thread message
 
 
 def msg(tmp, name, text="a sign-up sheet", *, at, mid, **kw):
@@ -1526,15 +1527,27 @@ with tempfile.TemporaryDirectory() as tmp:
 
     # A build: the fence first, then the first message from the owner, which it cannot name.
     (tasks / "task-build.txt").write_text(task(template="poll", thread_root=ROOT, request_id=BUILD_ID, when=iso(T0)))
-    first = msg(tmp, "first", at=T0 + 3, mid="$b1")
+    # The slot is only the client's own first message: the description, word for word.
+    mention = msg(tmp, "mention", f"{AGENT} can you make it blue?", at=T0 + 2, mid="$b9")
+    check("an-owner-message-that-is-not-the-description-is-not-the-slot", tt(mention, now=T0 + 99999) == ("none", None))
+    first = msg(tmp, "first", "  a sign-up   sheet for Saturday's  cleanup ", at=T0 + 3, mid="$b1")
     check("a-builds-first-message-is-its-duplicate", tt(first, now=T0 + 4) == ("duplicate", BUILD_ID))
     check("the-same-message-again-is-the-same-duplicate", tt(first, now=T0 + 600) == ("duplicate", BUILD_ID))
     # A second owner message in that thread is not swallowed: the slot is used.
     thanks = msg(tmp, "thanks", "thanks!", at=T0 + 60, mid="$b2")
+    again = msg(tmp, "again", DESC, at=T0 + 3 * 86400, mid="$b3")
+    check("the-same-words-again-later-are-not-the-used-slot", tt(again, now=T0 + 3 * 86400 + 99) == ("none", None))
     check("a-second-message-waits-while-young", tt(thanks, now=T0 + 65) == ("wait", None))
     check("then-it-is-an-ordinary-message", tt(thanks, now=T0 + 60 + br.settle_seconds()) == ("none", None))
     before = msg(tmp, "before", "hello", at=T0 - 5, mid="$b0")
     check("a-message-before-the-build-fence-is-not-its", tt(before, now=T0 + 600) == ("none", None))
+    # Once the request is answered, its slot is closed: the words alone take nothing.
+    rid_r, root_r = "b4b4b4b4-3434-4565-8787-909090909090", "$rootR:s.space"
+    led.claim(ROOM, rid_r, fence={"room_id": ROOM, "thread_root": root_r, "owner": OWNER, "at": T0, "mode": "build",
+                                  "request_id": rid_r, "said": DESC})
+    led.record(ROOM, rid_r, br.completion(rid_r, "done", "", "Built."))
+    check("an-answered-builds-slot-is-closed", tt(msg(tmp, "late-r", DESC, at=T0 + 9, mid="$r1", root=root_r),
+                                                  now=T0 + 99999) == ("none", None))
 
     # The fence's task is taken up: the ledger keeps its facts (the switch is off).
     (tmp / "build.txt").write_text((tasks / "task-build.txt").read_text())
@@ -1552,14 +1565,22 @@ with tempfile.TemporaryDirectory() as tmp:
     check("named-it-stays-a-duplicate-at-any-distance", tt(change_msg, now=T0 + 99999) == ("duplicate", CHANGE_ID))
     (tasks / "task-change.txt").unlink()
     check("named-even-once-its-task-is-gone", tt(change_msg, now=T0 + 99999) == ("duplicate", CHANGE_ID))
+    led.record(ROOM, CHANGE_ID, br.completion(CHANGE_ID, "done", "", "Updated."))
+    check("named-it-stays-a-duplicate-once-answered", tt(change_msg, now=T0 + 99999) == ("duplicate", CHANGE_ID))
+    # A pending fence in another room is never noted under this one.
+    (tasks / "task-elsewhere.txt").write_text(task(template="poll", thread_root=ROOT, room_id="!otherRoom:s.space",
+                                                   request_id="b5b5b5b5-3434-4565-8787-909090909090", when=iso(T0)))
+    tt(change_msg, now=T0 + 99999)
+    check("the-inbox-is-read-for-this-room-only", led.entries("!otherRoom:s.space") == [])
+    (tasks / "task-elsewhere.txt").unlink()
 
     # A message sent before a build's fence is never that build's, even with its slot still open.
     rid_e, root_e = "b3b3b3b3-3434-4565-8787-909090909090", "$rootE:s.space"
     (tasks / "task-early.txt").write_text(task(template="poll", thread_root=root_e, request_id=rid_e, when=iso(T0 + 100)))
     early = msg(tmp, "early", "hi", at=T0 + 95, mid="$e1", root=root_e)
-    check("an-earlier-message-never-takes-the-slot", tt(early, now=T0 + 99999) == ("none", None))
-    late_first = msg(tmp, "late-first", "the build", at=T0 + 102, mid="$e2", root=root_e)
-    check("the-slot-is-still-there-for-its-own-message", tt(late_first, now=T0 + 103) == ("duplicate", rid_e))
+    check("another-message-never-takes-the-slot", tt(early, now=T0 + 99999) == ("none", None))
+    late_first = msg(tmp, "late-first", DESC, at=T0 + 99, mid="$e2", root=root_e)
+    check("the-description-takes-it-even-a-moment-ahead", tt(late_first, now=T0 + 103) == ("duplicate", rid_e))
     (tasks / "task-early.txt").unlink()
 
     # A change fence that names no message (an older client) opens no slot: its later message is its own.
@@ -1583,7 +1604,7 @@ with tempfile.TemporaryDirectory() as tmp:
     (tmp / "adapt.json").write_text(json.dumps({"template": "kanban"}))
     code, _ = cli("plan", str(tmp / "bad.txt"), "--adapt", str(tmp / "adapt.json"), "--ledger", str(led.folder))
     check("a-plan-that-fails-before-its-claim", code == 1)
-    bad_msg = msg(tmp, "bad-msg", at=T0 + 2, mid="$bad1", root="$rootBad:s.space")
+    bad_msg = msg(tmp, "bad-msg", DESC, at=T0 + 2, mid="$bad1", root="$rootBad:s.space")
     check("its-message-is-still-its-duplicate", tt(bad_msg, now=T0 + 3) == ("duplicate", rid_bad))
     check("and-a-noted-fence-is-still-claimable", cli("plan", str(tmp / "bad.txt"), "--ledger", str(led.folder))[0] == 0)
 
@@ -1604,6 +1625,8 @@ with tempfile.TemporaryDirectory() as tmp:
         cli("plan", str(tmp / "q.txt"), "--ledger", str(led.folder))
         led.ask(ROOM, rid_q, thread_root=root_q, owner=OWNER, question="Reuse Signups?",
                 task_text=(tmp / "q.txt").read_text())
+        quick = msg(tmp, "quick", DESC, at=T0 + 45, mid="$q1", root=root_q)
+        check("a-question-closes-the-slot-even-for-its-words", tt(quick, now=T0 + 46) == ("answer", rid_q))
         quick = msg(tmp, "quick", "yes", at=T0 + 45, mid="$q1", root=root_q)
         check("a-quick-answer-is-the-answer", tt(quick, now=T0 + 46) == ("answer", rid_q))
         led.answer(ROOM, root_q, OWNER, "yes")
@@ -1626,11 +1649,18 @@ with tempfile.TemporaryDirectory() as tmp:
         check("the-settle-time-from-the-env", br.settle_seconds() == 5 and tt(thanks, now=T0 + 66) == ("none", None))
         os.environ["BUILD_THREAD_SETTLE_SECONDS"] = "soon"
         check("a-bad-settle-value-is-the-default", br.settle_seconds() == 30)
+        os.environ["BUILD_THREAD_SETTLE_SECONDS"] = "0"
+        check("a-non-positive-settle-value-is-the-default", br.settle_seconds() == 30)
     finally:
         if old is None:
             os.environ.pop("BUILD_THREAD_SETTLE_SECONDS", None)
         else:
             os.environ["BUILD_THREAD_SETTLE_SECONDS"] = old
+
+    # A stamp in the future never keeps a message waiting past the settle time from when it was first seen.
+    future = msg(tmp, "future", "and also", at=T0 + 10**6, mid="$f1")
+    check("a-future-stamp-waits-once", tt(future, now=T0 + 7300) == ("wait", None))
+    check("then-no-longer-than-the-settle-time", tt(future, now=T0 + 7300 + br.settle_seconds()) == ("none", None))
 
     # Unreadable bits are skipped, never matched, never fatal; the default inbox is the watcher's.
     (led._path(ROOM, BUILD_ID).parent / "00000000-0000-4000-8000-0000000000aa.json").write_text("{nope")

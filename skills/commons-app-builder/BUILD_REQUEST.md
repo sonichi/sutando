@@ -260,9 +260,12 @@ The two are tied exactly, never by time:
 - **A change or Try-again fence names its message.** It carries `"thread_message": "$<event id>"`,
   the id of the thread message the client sent just before it. With the switch off, the key is
   ignored like `thread_root` is: never checked, never in the request.
-- **A build fence cannot name its message,** because the fence comes first. Its message is the first
-  one from the asking owner in that thread after the fence. That is the build's one slot, used
-  once, and closed for good once a question has been asked for it.
+- **A build fence cannot name its message,** because the fence comes first. Its message is the one
+  whose text **is** the fence's description, from the asking owner, in that thread. That is the
+  client's own first message; texts are compared trimmed, with whitespace collapsed. That is the
+  build's one slot, used once, and closed for good once the request is answered or a question is
+  asked for it. Any other message (an @-mention, a "thanks", the same words three days later) is
+  not the slot.
 
 On **any room task with a `thread_root` header**, run first:
 
@@ -276,14 +279,16 @@ posts nothing anywhere. The checks run in this order:
 
 1. `duplicate <request_id>`: a fence names this message (`source_message_id`), at any distance in
    time. Write `[no-send]` and do nothing.
-2. `duplicate <request_id>`: this message holds a build fence's slot (it came after that fence,
-   the slot was free, no question was asked). Write `[no-send]` and do nothing.
+2. `duplicate <request_id>`: this message holds a build fence's slot (its text is the description,
+   the slot was free, the request neither answered nor asking). Write `[no-send]` and do nothing.
 3. `answer <request_id>`: a question is open for a request in this thread (switch on). Go on as
    `answer` does.
 4. `wait`: this thread is a known app thread (some fence named it), the sender is its owner, no
    fence names this message yet, and it is younger than `BUILD_THREAD_SETTLE_SECONDS` (env, then the
    manifest; default 30). A change's message arrives **before** its fence, so wait that long, run
-   `thread-task` again, and only then treat it as `none`.
+   `thread-task` again, and only then treat it as `none`. A message is never `wait` for longer than
+   the settle time from when `thread-task` first saw it (recorded in the ledger), whatever its
+   timestamp says.
 5. `none`: an ordinary message. Handle it as usual. A message in a thread no fence ever named is
    `none` at once.
 
@@ -297,4 +302,14 @@ fence back to back, but they reach the agent on two paths (a room task through t
 a private task through the DM), and neither delay has been measured. Raise it if a change's
 message is ever judged before its fence lands.
 
-**Times** are the gateway's `timestamp` headers; only `wait` compares one with this host's clock.
+**Times** are the gateway's `timestamp` headers; only `wait` compares one with this host's clock,
+and the first-seen record bounds that.
+
+**A residual race.** A build's message that reaches the agent a few milliseconds before its fence
+does (they travel different paths) finds an unknown thread, so it is `none` at once. Nothing the
+task carries dates the thread root, so this can't be told apart. The rule below is the safety net.
+
+**A build or a change is started only by a fence.** A room message in an app's thread whose
+verdict is `none` is conversation. If it asks something, answer it as conversation. Never build,
+refine or change the app from it. So a wrong `none`, or an older client's Try again without
+`thread_message`, can never start a second build.
