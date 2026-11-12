@@ -353,6 +353,14 @@ def write_record(workspace: Optional[Path], worker: str, record: dict) -> None:
     write_whole(path, record)
 
 
+def _record_lock(workspace: Optional[Path], worker: str):
+    """The one lock every writer of the worker's approval record takes."""
+    from file_lock import locked_file
+    path = record_path(workspace, worker)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return locked_file(path.with_name(path.name + ".lock"))
+
+
 RESEND_STALE_S = 15 * 60
 
 
@@ -390,12 +398,11 @@ def _why_not(worker: str, rec: dict, now: float) -> Optional[str]:
 
 def resend(worker: str, *, workspace: Optional[Path] = None, spawn=None, clock=time.time) -> dict:
     """Start a fresh device flow for `worker` from its expired or failed card, in the background: {status, why?}.
-    The claim is one locked read-check-write, so two clicks start one flow. The caller has already checked
-    that the owner clicked (agent_card.click_verdict)."""
-    from file_lock import locked_file
-    path = record_path(workspace, worker)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with locked_file(path.with_name(path.name + ".lock")):
+    The claim is one locked read-check-write, so two clicks start one flow, and the flow's own writes
+    take the same lock: the pid is added only while the record is still this attempt's claim, so it never
+    replaces what the child has written since. The caller has already checked that the owner clicked
+    (agent_card.click_verdict)."""
+    with _record_lock(workspace, worker):
         rec, now = read_record(workspace, worker), clock()
         why = _why_not(worker, rec, now)
         if why:
@@ -411,20 +418,27 @@ def resend(worker: str, *, workspace: Optional[Path] = None, spawn=None, clock=t
         claimed = {**rec, "state": "resending", "resend_id": resend_id, "resend_at": now}
         claimed.pop("resend_pid", None)
         write_record(workspace, worker, claimed)
-        logs = Path(connections._workspace(workspace)) / "logs"
-        logs.mkdir(parents=True, exist_ok=True)
-        try:
-            if spawn is not None:
-                pid = spawn(argv)
-            else:
-                with open(logs / "worker-approval-resend.log", "ab") as log:
-                    pid = getattr(subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                                   start_new_session=True), "pid", None)
-        except OSError as e:
-            write_record(workspace, worker, rec)
-            return {"status": "failed", "why": f"the new approval flow did not start ({type(e).__name__})"}
-        if isinstance(pid, int):
-            write_record(workspace, worker, {**claimed, "resend_pid": pid})
+
+    def still_claimed(then: Callable[[dict], dict]) -> None:
+        with _record_lock(workspace, worker):
+            current = read_record(workspace, worker)
+            if current.get("state") == "resending" and current.get("resend_id") == resend_id:
+                write_record(workspace, worker, then(current))
+
+    logs = Path(connections._workspace(workspace)) / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    try:
+        if spawn is not None:
+            pid = spawn(argv)
+        else:
+            with open(logs / "worker-approval-resend.log", "ab") as log:
+                pid = getattr(subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                               start_new_session=True), "pid", None)
+    except OSError as e:
+        still_claimed(lambda current: rec)
+        return {"status": "failed", "why": f"the new approval flow did not start ({type(e).__name__})"}
+    if isinstance(pid, int):
+        still_claimed(lambda current: {**current, "resend_pid": pid})
     return {"status": "started"}
 
 
@@ -435,9 +449,7 @@ def resend_failed(workspace: Optional[Path], worker: str, resend_id: str, why: s
     `deliver` is given) or as text. Only the same attempt is touched; False when it is not."""
     if not resend_id:
         return False
-    from file_lock import locked_file
-    path = record_path(workspace, worker)
-    with locked_file(path.with_name(path.name + ".lock")):
+    with _record_lock(workspace, worker):
         rec = read_record(workspace, worker)
         if rec.get("state") != "resending" or rec.get("resend_id") != resend_id:
             return False
@@ -459,10 +471,10 @@ def resend_failed(workspace: Optional[Path], worker: str, resend_id: str, why: s
         except (ac.CardError, OSError):
             shown = ""
     if shown:
-        with locked_file(path.with_name(path.name + ".lock")):
+        with _record_lock(workspace, worker):
             now = read_record(workspace, worker)
             if now.get("state") == "failed":
-                _keep(workspace, worker, {**now, "room": cards.room, "event_id": shown})
+                write_record(workspace, worker, {**now, "room": cards.room, "event_id": shown})
         return True
     send = deliver or (lambda text: send_to_owner(workspace or connections._workspace(None), text))
     send(f"[dm-only]\nI couldn't make a new approval link for {who}: {why}. Tap \"{resend_text(who)}\" on the "
@@ -560,7 +572,8 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
 
 def _keep(workspace: Optional[Path], worker: str, record: dict) -> None:
     try:
-        write_record(workspace, worker, record)
+        with _record_lock(workspace, worker):
+            write_record(workspace, worker, record)
     except OSError:
         pass  # only a later resend reads it; the flow itself never depends on it
 

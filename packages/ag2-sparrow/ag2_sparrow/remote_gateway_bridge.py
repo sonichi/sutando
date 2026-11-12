@@ -6360,10 +6360,13 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
                 lines.append(f"ui_origin: {uo}")
         elif f == "card_click":
             click = task.get(f)
-            if isinstance(click, dict) and all(isinstance(click.get(k), str) and 0 < len(click[k]) <= limit
-                                               for k, limit in _CARD_CLICK_MAX.items()):
+            if isinstance(click, dict) and all(isinstance(click.get(k), str) and click[k].strip()
+                                               and len(click[k]) <= limit for k, limit in _CARD_CLICK_MAX.items()):
                 lines.append("card_click: " + json.dumps({"card_id": click["card_id"], "action": click["action"]},
                                                          separators=(",", ":")))
+            elif click not in (None, ""):
+                # A click that cannot be used stays a click: the agent refuses it, never reads it as chat.
+                lines.append("card_click: invalid")
         elif f == "owner_mentioned":
             if task.get(f) == "true":  # the broker's exact string only; nothing else is a claim
                 lines.append("owner_mentioned: true")

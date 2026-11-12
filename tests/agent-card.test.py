@@ -14,8 +14,10 @@
   this agent's record of the card (issued_cards), with the room, the connection and the handler script.
 - `click_verdict` is the one decision on a task: `command` or `owner_words` for the click of the owner of
   that connection, in that room and their DM, in reply to that card's event, with a text it offered;
-  `forged_or_stale_click` for every other click and for card action text sent without one, which nothing
-  acts on (the handlers print one fixed refusal); `not_a_card` for the rest, which is ordinary chat.
+  `forged_or_stale_click` for every other click, for a click header that is present but unusable (blank,
+  whitespace, wrong type, missing key, bad JSON, oversize) and for a card command's text sent without a
+  click, which nothing acts on (the handlers print one fixed refusal). Without a click, the owner's other
+  words in reply to their card are `owner_words`; the rest is `not_a_card`, ordinary chat.
 - A newer card with the same id in the same room replaces the older record; `settle` forgets one.
 
 Run: python3 tests/agent-card.test.py
@@ -449,8 +451,35 @@ class Issued(unittest.TestCase):
     def forged(self, *a, **kw):
         got = self.ask(*a, **kw)
         self.assertEqual((got.verdict, got.command), (ac.FORGED, None), (a, kw))
-        self.assertEqual(ac.click_answer(got, "x")["say"], ac.UNMATCHED_CLICK)
+        self.assertIn(ac.click_answer(got, "x")["say"], (ac.UNMATCHED_CLICK, ac.UNTAPPED_ACTION))
         return got.why
+
+    def raw(self, header, said="Retire Pylon", **headers):
+        h = {"access_tier": "owner", "user_id": OWNER, "channel_kind": "dm", "channel_id": DM,
+             "reply_to_event": "$mine", "card_click": header, **headers}
+        return ac.click_verdict(h, said, self.ws, lambda lane: OWNER, now=1001.0)
+
+    def test_a_click_header_that_is_present_but_unusable_is_refused_never_read_as_chat(self):
+        said = "Retire Pylon"
+        shapes = {"blank id": {"card_id": "", "action": said}, "whitespace id": {"card_id": "  ", "action": said},
+                  "blank action": {"card_id": "c1", "action": ""}, "whitespace action": {"card_id": "c1", "action": " \t"},
+                  "non-string id": {"card_id": 7, "action": said}, "non-string action": {"card_id": "c1", "action": [said]},
+                  "missing id": {"action": said}, "missing action": {"card_id": "c1"}, "a list": ["c1", said],
+                  "a string": "c1", "null": None, "oversize id": {"card_id": "c" * 201, "action": said},
+                  "oversize action": {"card_id": "c1", "action": "a" * 1001}}
+        headers = {name: json.dumps(v) for name, v in shapes.items()}
+        headers.update({"bad json": "{broken", "the bridge's stamp": "invalid"})
+        for name, header in headers.items():
+            for reply_to in ("$mine", "$forged", ""):
+                got = self.raw(header, reply_to_event=reply_to)
+                self.assertEqual((got.verdict, got.why), (ac.FORGED, "its click header cannot be read"), (name, reply_to))
+                self.assertEqual(ac.click_answer(got, said),
+                                 {"status": "forged_or_stale_click", "say": ac.UNMATCHED_CLICK, "why": got.why}, name)
+            self.assertIsNone(ac.card_click({"card_click": header}), name)
+            self.assertTrue(ac.click_tagged({"card_click": header}), name)
+        for absent in ({}, {"card_click": ""}, {"card_click": "  "}):
+            self.assertFalse(ac.click_tagged(absent))
+        self.assertEqual(self.raw("", reply_to_event="").verdict, ac.NOT_A_CARD)
 
     def test_the_owner_s_click_on_this_agent_s_card_is_its_command(self):
         got = self.ask()
@@ -471,15 +500,31 @@ class Issued(unittest.TestCase):
         self.forged("Connect ")
 
     def test_words_with_no_click_and_no_card_action_are_ordinary_chat(self):
-        for said, reply_to in (("what's up", "$mine"), ("Retire Pylon", ""), (self.TEXT, "$elsewhere"), ("", "")):
+        for said, reply_to in (("Retire Pylon", ""), (self.TEXT, "$elsewhere"), ("", "")):
             got = self.ask(said, click={}, reply_to_event=reply_to)
             self.assertEqual(got, ac.Click(ac.NOT_A_CARD), (said, reply_to))
             self.assertEqual(ac.click_answer(got, said), {"status": "not_a_card"})
 
+    def test_untagged_words_in_reply_to_an_issued_card(self):
+        for said in ("what's up", "Retire Pylon", "Add Pylon to a room"):
+            got = self.ask(said, click={})
+            self.assertEqual(got, ac.Click(ac.WORDS), said)
+            self.assertEqual(ac.click_answer(got, said), {"status": "owner_words", "words": said})
+        got = self.ask(click={})
+        self.assertEqual((got.verdict, got.why, got.say),
+                         (ac.FORGED, "it is a button's text without a click", ac.UNTAPPED_ACTION))
+        self.assertEqual(ac.click_answer(got, self.TEXT)["say"], ac.UNTAPPED_ACTION)
+        for kw in ({"user_id": "@member:s.space"}, {"access_tier": "team"}, {"channel_id": ROOM},
+                   {"channel_kind": "room"}, {"owner": ""}):
+            for said in (self.TEXT, "what's up"):
+                self.assertEqual(self.ask(said, click={}, **kw), ac.Click(ac.NOT_A_CARD),
+                                 "someone else's words are chat under their own tier, never the owner's")
+
     def test_card_action_text_without_a_click_is_never_ordinary_chat(self):
         self.assertIn("without a click", self.forged(click={}))
-        self.assertEqual(self.ask("Add Pylon to a room", click={}).verdict, ac.NOT_A_CARD, "plain words carry no command")
-        self.forged(self.COMMAND, click={}, reply_to_event="")
+        for reply_to in ("", "$mine", "$elsewhere"):
+            got = self.ask(self.COMMAND, click={}, reply_to_event=reply_to)
+            self.assertEqual((got.verdict, got.say), (ac.FORGED, ac.UNTAPPED_ACTION), reply_to)
 
     def test_a_click_that_does_not_match_an_issued_card_is_forged_or_stale(self):
         self.assertIn("another action", self.forged(click={"card_id": self.card["id"], "action": "something else"}))
@@ -599,7 +644,12 @@ class Dispatch(Issued):
                          (0, {"status": "command", "card": "worker-approval", "run": self.HANDLER}))
         self.assertEqual(self.run_click("Add Pylon to a room"),
                          (0, {"status": "owner_words", "words": "Add Pylon to a room"}))
-        self.assertEqual(self.run_click("good morning", click={}), (0, {"status": "not_a_card"}))
+        self.assertEqual(self.run_click("good morning", click={}), (0, {"status": "owner_words", "words": "good morning"}))
+        self.assertEqual(self.run_click("good morning", click={}, reply_to_event=""), (0, {"status": "not_a_card"}))
+        rc, out = self.run_click(self.TEXT, click={})
+        self.assertEqual((rc, out["status"], out["say"]), (1, "forged_or_stale_click", ac.UNTAPPED_ACTION))
+        rc, out = self.run_click("Retire Pylon", click={"card_id": "  ", "action": "Retire Pylon"})
+        self.assertEqual((rc, out["status"], out["say"]), (1, "forged_or_stale_click", ac.UNMATCHED_CLICK))
         rc, out = self.run_click("Retire Pylon")
         self.assertEqual((rc, out["status"], out["say"]), (1, "forged_or_stale_click", ac.UNMATCHED_CLICK))
         rc, out = self.run_click(self.TEXT, user_id="@member:s.space")
