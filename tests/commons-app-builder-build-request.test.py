@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -1419,6 +1420,38 @@ try:
         led3.ask(ROOM, rid3, thread_root=ROOT, owner=OWNER, question="q?", task_text=text3)
         room = FakeRoom()
         check("in-process-waiting-says-nothing", run(room, text3, {}, led3) == "" and room.calls == [])
+
+        # The error branches: each refuses plainly and posts nothing.
+        (tmp / "bad.txt").write_text(task(page=""))
+        check("ask-on-a-malformed-request-is-refused", cli("ask", str(tmp / "bad.txt"), "--question", "q?",
+                                                            "--ledger", led) == (2, ""))
+        check("ask-without-a-question-is-refused", cli("ask", str(tmp / "t.txt"), "--ledger", led)[0] == 2)
+        (tmp / "nothread.txt").write_text(task(template="poll", request_id="b1b1b1b1-3434-4565-8787-909090909090"))
+        check("ask-without-a-thread-is-refused", cli("ask", str(tmp / "nothread.txt"), "--question", "q?",
+                                                     "--ledger", led)[0] == 2)
+        check("ask-without-a-plan-is-refused", cli("ask", str(tmp / "t.txt"), "--question", "q?", "--ledger", led)[0] == 2)
+        # An unreadable entry beside the open question never stops the answer.
+        room_dir = br.Ledger(Path(led))._path(ROOM, rid).parent
+        (room_dir / "00000000-0000-4000-8000-000000000000.json").write_text("{not json")
+        rid8 = "c1c1c1c1-3434-4565-8787-909090909090"
+        root8 = "$root8:s.space"
+        led_.claim(ROOM, rid8)
+        led_.ask(ROOM, rid8, thread_root=root8, owner=OWNER, question="q?",
+                 task_text=task(template="poll", thread_root=root8, request_id=rid8))
+        (tmp / "owner8.txt").write_text(thread_message("yes", root=root8))
+        check("an-unreadable-entry-is-skipped", cli("answer", str(tmp / "owner8.txt"), "--ledger", led)[0] == 0)
+
+        # In-process, a question that lapsed: the request fails, recorded, and the thread hears it.
+        rid9 = "d1d1d1d1-3434-4565-8787-909090909090"
+        led9 = br.Ledger(tmp / "ledger9")
+        text9 = task(template="poll", thread_root=ROOT, request_id=rid9)
+        led9.claim(ROOM, rid9)
+        led9.ask(ROOM, rid9, thread_root=ROOT, owner=OWNER, question="q?", task_text=text9,
+                 now=time.time() - br.ASK_TTL_S - 5)
+        room9 = FakeRoom()
+        _, rep9 = reply_of(run(room9, text9, {}, led9))
+        check("in-process-a-lapsed-question-fails-the-request", rep9["status"] == "failed"
+              and rep9["reason"] == br.LAPSED and getattr(room9, "posts", [{}])[-1].get("body") == br.THREAD_LAPSED)
 finally:
     br.thread_conversation = real_switch
 
@@ -1451,5 +1484,16 @@ one = br.with_operation_ids("91919191-3434-4565-8787-909090909090",
 two = br.with_operation_ids("91919191-3434-4565-8787-909090909090",
                             [{"action": "x", "arguments": {"b": {"d": 3, "c": 2}, "a": 1}}])[0]["operation_id"]
 check("the-id-digest-ignores-key-order", one == two)
+
+# A switch that cannot be read (no src/skill_config) is off.
+_real_mod = sys.modules.get("skill_config")
+sys.modules["skill_config"] = None
+try:
+    check("an-unreadable-switch-is-off", br.thread_conversation() is False)
+finally:
+    if _real_mod is None:
+        sys.modules.pop("skill_config", None)
+    else:
+        sys.modules["skill_config"] = _real_mod
 
 print(f"commons-app-builder build request: {len(passed)} passed")
