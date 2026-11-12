@@ -267,7 +267,15 @@ The two are tied exactly, never by time:
   asked for it. Any other message (an @-mention, a "thanks", the same words three days later) is
   not the slot.
 
-On **any room task with a `thread_root` header**, run first:
+**Where it runs first: the gateway bridge.** Before a room task with a `thread_root` is queued,
+the bridge's intake gate (`src/remote-gateway-bridge.py`, `_build_thread_gate`) runs this same
+verdict on the owner's message (`intake_verdict`, the gateway's own fields and the tier it
+resolved). `duplicate`: the message is settled unqueued and the agent never sees it. `wait`: it
+is taken after the round's other tasks, rechecked until the round's wait ends (a few seconds),
+then delivered. Anything else, or a check that fails, is delivered as usual. So a threaded task
+that reaches the agent is one the bridge could not decide.
+
+On **any room task with a `thread_root` header** that reaches you, run first:
 
 ```bash
 python3 build_request.py thread-task thread-task.txt   # [--tasks DIR] [--ledger DIR]

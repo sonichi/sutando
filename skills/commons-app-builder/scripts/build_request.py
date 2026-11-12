@@ -1095,6 +1095,20 @@ def thread_task(task_text: str, ledger: "Ledger", tasks_dir: Optional[Path] = No
     return "none", None
 
 
+def intake_verdict(fields: Dict[str, Any], tier: str, ledger: "Ledger", tasks_dir: Path,
+                   now: Optional[float] = None) -> Tuple[str, Optional[str]]:
+    """thread_task for a room message the gateway has not queued yet (its intake gate): the same
+    headers, from the gateway's task fields and the tier the bridge resolved for the sender."""
+    def flat(value: Any) -> str:
+        return " ".join(str(value).splitlines())
+    keys = {"user_id": fields.get("user_id"), "thread_root": fields.get("thread_root"),
+            "source_room_id": fields.get("source_room_id") or fields.get("channel_id"),
+            "source_message_id": fields.get("source_message_id"), "timestamp": fields.get("timestamp")}
+    lines = [f"{k}: {flat(v)}" for k, v in keys.items() if v not in (None, "")]
+    lines += [f"access_tier: {flat(tier)}", f"task: {flat(fields.get('task') or '')}"]
+    return thread_task("\n".join(lines) + "\n", ledger, tasks_dir, now)
+
+
 def _message_text(task_text: str, strip_mention: bool = True) -> str:
     """The message's own words: the task line, less the gateway's reply context (and a mention)."""
     line = next((ln[len("task:"):].strip() for ln in task_text.splitlines() if ln.startswith("task:")), "")

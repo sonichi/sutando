@@ -1698,7 +1698,9 @@ with tempfile.TemporaryDirectory() as tmp:
     try:
         check("the-default-inbox-is-the-watchers", br.default_tasks_dir() == tasks)
         os.environ.pop("SUTANDO_TASKS_DIR", None)
-        check("without-the-override-it-is-the-workspaces", br.default_tasks_dir().name == "tasks")
+        from workspace_default import resolve_workspace  # noqa: PLC0415
+        check("without-the-override-it-is-the-workspaces",
+              br.default_tasks_dir() == Path(resolve_workspace()) / "tasks")
     finally:
         if old_inbox is None:
             os.environ.pop("SUTANDO_TASKS_DIR", None)

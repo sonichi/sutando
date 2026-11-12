@@ -394,10 +394,55 @@ def _lane_dedupe_gate(task: dict):
         return INTAKE_DEFER  # noqa: F821
 
 
+_BUILD_REQUEST = _REPO / "skills" / "commons-app-builder" / "scripts" / "build_request.py"
+_BUILD_REQUEST_MOD = []  # loaded once, on the first threaded owner message
+BUILD_THREAD_POLL_S = 0.25
+
+
+def _build_thread_gate(task: dict):
+    """A room message in an app's thread that is the app build's own copy (commons-app-builder's
+    thread-task verdict `duplicate`): settled unqueued, so the agent never acts on it. A `wait` (a
+    change's message before its fence) is taken after the round's acks and rechecked until the
+    round's wait ends; still undecided, it is delivered and the skill decides. Fails open."""
+    if not task.get("thread_root") or not _BUILD_REQUEST.is_file():
+        return None
+    try:
+        attested, _ = local_task_protocol.broker_attested_tier(  # noqa: F821
+            task.get("access_tier"), task.get("requested_access_tier"), task.get("collaborator"))
+        tier = _tier_for(task.get("user_id"), attested)  # noqa: F821
+        if tier != "owner":
+            return None
+        if not _BUILD_REQUEST_MOD:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("commons_build_request", _BUILD_REQUEST)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _BUILD_REQUEST_MOD.append(mod)
+        br, inbox, mode = _BUILD_REQUEST_MOD[0], TASKS_DIR, _INTAKE_MODE  # noqa: F821
+        ledger = br.Ledger(WS / "state" / "commons-app-builds")
+        kind, rid = br.intake_verdict(task, tier, ledger, inbox)
+        if kind == "wait":
+            if mode["defer"]:
+                return INTAKE_DEFER  # noqa: F821
+
+            deadline = mode["deadline"]
+            while kind == "wait" and deadline is not None and time.monotonic() < deadline:
+                time.sleep(min(BUILD_THREAD_POLL_S, max(0.0, deadline - time.monotonic())))
+                kind, rid = br.intake_verdict(task, tier, ledger, inbox)
+    except Exception as e:  # noqa: BLE001 - a broken check delivers the message; the skill decides
+        _log(f"build thread gate: {type(e).__name__}; delivering")  # noqa: F821
+        return None
+    if kind == "duplicate":
+        return f"commons-app-builder: the app build's own message in its thread (request {rid})"
+    return None
+
+
 def _intake_gate(task: dict):
-    """A task from before this connection was added (its row's `not_before`), else the lane dedupe."""
+    """A task from before this connection was added (its row's `not_before`), else an app build's
+    own thread message, else the lane dedupe."""
     from connections import NOT_BEFORE_ENV, backlog_reason
-    return backlog_reason(task, os.environ.get(NOT_BEFORE_ENV, "")) or _lane_dedupe_gate(task)
+    return (backlog_reason(task, os.environ.get(NOT_BEFORE_ENV, "")) or _build_thread_gate(task)
+            or _lane_dedupe_gate(task))
 
 
 _STATUS_ACK_MANIFEST = _REPO / "skills" / "status-ack" / "manifest.json"
