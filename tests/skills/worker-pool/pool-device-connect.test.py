@@ -560,6 +560,26 @@ class Cards(CardsBase):
             sink = dc.default_cards(self.ws, core)
         self.assertEqual((sink.room, sink.execute), (DM, self.actions.execute))
 
+    def test_the_owner_dm_comes_from_the_core_s_routing_record_and_a_lane_without_actions_gets_none(self):
+        core = dc.pp.core_lane(self.ws, None)
+        state = self.ws / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / f"owner-routing.{core['instance']}.json").write_text(json.dumps(
+            {"owner_dm": DM, "private": True, "identity": core.get("agent_mxid")}))
+        self.assertEqual(C.owner_dm(core, self.ws), DM)
+        actions, row = dc.pp.core_actions(self.ws, None, vault=self.vault)
+        self.assertEqual(row["instance"], core["instance"])
+        with unittest.mock.patch.object(dc.pp, "core_actions", side_effect=dc.pp.ProvisionError("no lane")):
+            self.assertIsNone(dc.default_cards(self.ws, core))
+
+    def test_an_unreadable_record_reads_as_none_and_a_failed_keep_is_ignored(self):
+        path = dc.record_path(self.ws, W)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json")
+        self.assertEqual(dc.read_record(self.ws, W), {})
+        with unittest.mock.patch.object(dc, "write_record", side_effect=OSError("disk full")):
+            dc._keep(self.ws, W, {"state": "pending"})
+
 
 class Resend(CardsBase):
     def expire(self):
@@ -569,7 +589,8 @@ class Resend(CardsBase):
     def reply(self, said, **kw):
         path = self.ws / "tasks" / "task-card-1.txt"
         path.parent.mkdir(parents=True, exist_ok=True)
-        kw.setdefault("user", dc.pp.core_lane(self.ws, None)["owner_mxid"])
+        if "user" not in kw:
+            kw["user"] = dc.pp.core_lane(self.ws, None)["owner_mxid"]
         path.write_text(card_task(said, **kw))
         out, spawned = [], []
         with unittest.mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))), \
@@ -602,6 +623,39 @@ class Resend(CardsBase):
         self.assertIn("not expired", out["why"])
         rc, out, spawned = self.reply(f"card:worker-approval:{W}:explode")
         self.assertEqual((rc, out["status"], spawned), (2, "refused", []))
+
+    def test_resend_without_a_card_or_whose_spawn_fails_starts_nothing(self):
+        self.assertEqual(dc.resend(W, workspace=self.ws)["status"], "refused")
+        self.expire()
+        started = []
+        self.assertEqual(dc.resend(W, workspace=self.ws, spawn=started.append), {"status": "started"})
+        self.assertEqual(len(started), 1)
+        dc.write_record(self.ws, W, {**dc.read_record(self.ws, W), "state": "expired"})
+
+        def boom(argv):
+            raise OSError("no exec")
+        out = dc.resend(W, workspace=self.ws, spawn=boom)
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("OSError", out["why"])
+        self.assertEqual(dc.read_record(self.ws, W)["state"], "expired")
+
+    def test_an_unreadable_task_a_lane_that_cannot_be_read_or_a_retired_worker_is_refused(self):
+        out = []
+        with unittest.mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
+            rc = pool_identity.main(["--workspace", str(self.ws), "card-reply", "--task-file",
+                                     str(self.ws / "tasks" / "absent.txt")])
+        self.assertEqual((rc, json.loads(out[-1])["status"]), (2, "refused"))
+        self.expire()
+        owner = dc.pp.core_lane(self.ws, None)["owner_mxid"]
+        with unittest.mock.patch.object(pool_identity.pool_provision, "core_lane",
+                                        side_effect=dc.pp.ProvisionError("no core lane")):
+            rc, got, spawned = self.reply(f"card:worker-approval:{W}:resend", user=owner)
+        self.assertEqual((rc, got, spawned), (2, {"status": "refused", "why": "no core lane"}, []))
+        with unittest.mock.patch.object(pool_identity.pr, "load_roster",
+                                        lambda ws: {"workers": {W: {"state": "retired"}}}):
+            rc, got, spawned = self.reply(f"card:worker-approval:{W}:resend")
+        self.assertEqual((rc, got["status"], spawned), (2, "refused", []))
+        self.assertIn("no live pool worker", got["why"])
 
     def test_other_words_are_not_a_card_reply(self):
         rc, out, _ = self.reply("send me a new link please")

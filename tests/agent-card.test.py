@@ -159,6 +159,34 @@ class Check(unittest.TestCase):
         self.assertIsNotNone(ac.problem({**self.card, "groups": [{"label": "x", "rows": [
             {"title": "t", "avatar": {"shape": "round"}}]}]}))
 
+    def test_each_other_shape_the_client_refuses_is_named(self):
+        c, h = self.card, self.card["header"]
+        reply = {"label": "x", "kind": "reply", "reply": "r"}
+        cases = [
+            ("not an object", "the card is not an object"),
+            ({**c, "header": {**h, "avatar": {"seed": "s", "shape": "oval"}}}, "shape must be round or square"),
+            ({**c, "header": {**h, "avatar": {"url": "https://[::1"}}}, "must be an https or mxc"),
+            ({**c, "buttons": [{**reply, "style": "loud"}]}, "style must be primary or secondary"),
+            ({**c, "buttons": "x"}, "buttons must be a list"),
+            ({**c, "header": {**h, "badges": [{"label": "b", "state": "maybe"}]}}, "badges[0] needs a label"),
+            ({**c, "header": {**h, "shuffle": {"reply": ""}}}, "shuffle needs a reply"),
+            ({**c, "fields": [{"label": "f", "value": 3}]}, "fields[0] needs a label and a value"),
+            ({**c, "groups": [{"label": "g"}]}, "groups[0] needs rows"),
+            ({**c, "groups": [{"label": "g", "rows": [{"title": "t", "state": "lit"}]}]}, "state must be one of"),
+            ({**c, "note_tone": "loud"}, "note_tone must be dim, warn or ok"),
+            ({**c, "expires_at": True}, "expires_at must be milliseconds"),
+        ]
+        for card, why in cases:
+            self.assertIn(why, ac.problem(card) or "", card)
+
+    def test_the_builders_refuse_an_empty_avatar_and_mark_an_input_button(self):
+        with self.assertRaises(ac.CardError):
+            ac.avatar()
+        self.assertTrue(ac.button("Save", "reply", reply="card:a:b:c", uses_input=True)["uses_input"])
+        self.assertIsNone(ac.parse_reply("card:a#b:c:d"))
+        ok = {"access_tier": "owner", "user_id": "not-an-mxid", "channel_kind": "dm"}
+        self.assertEqual(ac.owner_may_act(ok), "the reply names no sender")
+
 
 class Send(unittest.TestCase):
     def test_send_posts_the_card_as_extra_content_and_returns_the_event(self):
@@ -169,6 +197,8 @@ class Send(unittest.TestCase):
         action, args, op, room = fake.calls[0]
         self.assertEqual((action, op, room), ("room.message.send", "op-1", DM))
         self.assertEqual(args, {"body": body, "extra_content": {"space.ag2.card": card}, "reply_to": "$ask"})
+        ac.send_card(fake.execute, DM, body, card, operation_id="op-2", thread_root="$root")
+        self.assertEqual(fake.calls[1][1]["thread_root"], "$root")
 
     def test_a_private_card_goes_only_to_the_owner_dm(self):
         body, card = a_card()
