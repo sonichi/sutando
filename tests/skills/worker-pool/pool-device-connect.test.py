@@ -13,10 +13,16 @@ Run: python3 tests/skills/worker-pool/pool-device-connect.test.py
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
+import os
 import secrets
+import subprocess
 import sys
+import threading
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -643,7 +649,7 @@ class Resend(CardsBase):
             rc, out, spawned = self.reply(said)
             self.assertEqual((rc, out["status"], spawned), (1, "not_a_card_reply", []), said)
         dc.write_record(self.ws, W, {**dc.read_record(self.ws, W), "state": "done"})
-        self.assertIn("not expired", dc.resend(W, workspace=self.ws)["why"])
+        self.assertIn("already has its own agent", dc.resend(W, workspace=self.ws)["why"])
 
     def test_resend_without_a_card_or_whose_spawn_fails_starts_nothing(self):
         self.assertEqual(dc.resend(W, workspace=self.ws)["status"], "refused")
@@ -677,6 +683,101 @@ class Resend(CardsBase):
             rc, got, spawned = self.reply(dc.resend_text(W))
         self.assertEqual((rc, got["status"], spawned), (2, "refused", []))
         self.assertIn("no live pool worker", got["why"])
+
+    def child(self, argv, **patches):
+        """Run the detached child's own CLI line in this process, as the spawned process would."""
+        out = []
+        with contextlib.ExitStack() as stack:
+            for target, value in patches.items():
+                stack.enter_context(unittest.mock.patch(target, value))
+            stack.enter_context(unittest.mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))))
+            rc = pool_identity.main(argv[2:])
+        return rc, out
+
+    def owner_notes(self):
+        return [p.read_text() for p in sorted((self.ws / "results").glob("proactive-*"))]
+
+    def test_a_child_whose_start_fails_frees_the_button_and_tells_the_owner(self):
+        self.expire()
+        rc, out, spawned = self.reply(dc.resend_text(W))
+        self.assertEqual((rc, out["status"]), (0, "started"))
+        self.assertEqual(dc.read_record(self.ws, W)["state"], "resending")
+        boom = unittest.mock.Mock(side_effect=dc.DeviceConnectError("the server answered 503 (busy)"))
+        rc, _ = self.child(spawned[0], **{"pool_device_connect.start": boom})
+        self.assertEqual(rc, 1)
+        rec = dc.read_record(self.ws, W)
+        self.assertEqual((rec["state"], rec["why"]), ("failed", "the server answered 503 (busy)"))
+        self.assertFalse(any(k.startswith("resend_") for k in rec))
+        notes = self.owner_notes()
+        self.assertTrue(any("couldn't make a new approval link" in n and "503" in n for n in notes), notes)
+        rc, out, spawned = self.reply(dc.resend_text(W))
+        self.assertEqual((rc, out["status"], len(spawned)), (0, "started", 1))
+
+    def test_a_child_refused_by_the_identity_check_frees_the_button(self):
+        self.expire()
+        _, _, spawned = self.reply(dc.resend_text(W))
+        rc, _ = self.child(spawned[0], **{"connections.worker_identity": lambda w, ws=None: {"instance": "x"}})
+        self.assertEqual(rc, 1)
+        self.assertIn("already has an agent", dc.read_record(self.ws, W)["why"])
+        self.assertEqual(self.reply(dc.resend_text(W))[1]["status"], "started")
+
+    def test_a_child_that_crashes_frees_the_button_and_says_so(self):
+        self.expire()
+        _, _, spawned = self.reply(dc.resend_text(W))
+        with self.assertRaises(RuntimeError):
+            self.child(spawned[0], **{"pool_device_connect.connect": unittest.mock.Mock(side_effect=RuntimeError("x"))})
+        self.assertEqual(dc.read_record(self.ws, W)["why"], "it stopped (RuntimeError)")
+
+    def test_a_child_that_dies_on_its_arguments_is_stale_at_once(self):
+        self.expire()
+        dead = subprocess.Popen([sys.executable, "-c", ""])
+        dead.wait()
+        argv = []
+        self.assertEqual(dc.resend(W, workspace=self.ws, spawn=lambda a: argv.append(a) or dead.pid)["status"], "started")
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.child(argv[0] + ["--no-such-flag"])
+        self.assertEqual((dc.read_record(self.ws, W)["state"], dc.read_record(self.ws, W)["resend_pid"]),
+                         ("resending", dead.pid))
+        self.assertEqual(dc.resend(W, workspace=self.ws, spawn=lambda a: None)["status"], "started")
+
+    def test_a_live_resend_refuses_a_second_tap_until_it_goes_stale(self):
+        self.expire()
+        self.assertEqual(dc.resend(W, workspace=self.ws, spawn=lambda a: os.getpid())["status"], "started")
+        out = dc.resend(W, workspace=self.ws, spawn=lambda a: None)
+        self.assertEqual(out["status"], "refused")
+        self.assertIn("already on its way", out["why"])
+        later = lambda: time.time() + dc.RESEND_STALE_S + 1
+        self.assertEqual(dc.resend(W, workspace=self.ws, spawn=lambda a: None, clock=later)["status"], "started")
+
+    def test_two_clicks_at_once_start_one_flow(self):
+        self.expire()
+        barrier, spawned, results = threading.Barrier(2), [], []
+
+        def spawn(argv):
+            spawned.append(argv)
+            time.sleep(0.2)
+
+        def click():
+            barrier.wait()
+            results.append(dc.resend(W, workspace=self.ws, spawn=spawn)["status"])
+        threads = [threading.Thread(target=click) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual((sorted(results), len(spawned)), (["refused", "started"], 1))
+
+    def test_a_resend_failure_for_another_attempt_changes_nothing(self):
+        self.expire()
+        dc.resend(W, workspace=self.ws, spawn=lambda a: None)
+        self.assertFalse(dc.resend_failed(self.ws, W, "not-this-attempt", "x", deliver=self.sent.append))
+        self.assertFalse(dc.resend_failed(self.ws, W, "", "x", deliver=self.sent.append))
+        self.assertEqual((dc.read_record(self.ws, W)["state"], self.sent), ("resending", []))
+
+    def test_a_pending_link_that_still_works_is_named(self):
+        dc.write_record(self.ws, W, {"label": "reviewer", "worker_label": "Pylon", "state": "pending",
+                                     "expires_at": time.time() + 60})
+        self.assertIn("still works", dc.resend(W, workspace=self.ws, spawn=lambda a: None)["why"])
 
     def test_other_words_are_not_a_card_reply(self):
         rc, out, _ = self.reply("send me a new link please", click={})

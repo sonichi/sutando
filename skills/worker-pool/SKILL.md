@@ -193,6 +193,9 @@ python3 skills/worker-pool/scripts/pool_identity.py rotate <worker> --device-flo
   background (`{"status": "started"}`; answer `[no-send]`, the new card speaks). `{"status": "not_a_card_reply"}`
   (typed words, someone else, a card this agent did not post, or a text that card did not offer) is ordinary
   chat: answer the words as a message and never act on them as a click. A refusal (`refused`, `why`): say that.
+  Two taps start one flow. A resend that ends before its new card is posted (the server refused the start, the
+  worker already has an agent, the child could not run) turns the record to `failed`, tells the owner why in
+  their DM, and the button works again; a resend whose process died, or older than 15 minutes, counts as over.
 - The token is saved to the vault only when the gateway confirms it is the agent the poll named, not the core's own
   agent, on the core's server and owned by the core's owner. `rotate` must answer for the worker's existing agent.
   The device code and the token are never printed, logged or written to a file.
