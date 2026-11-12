@@ -73,6 +73,8 @@ adapter checks nothing about it beyond the single-process lock. The binary enfor
    `mcp__ag2_space__*` (`ag2_whoami`, `room_actions_describe`, `room_action_execute`, `room_inspect`,
    `room_list`, `space_action_read`). The prompt allows `space_action_read` only for owner tasks, with the
    task's `task_id`; re-paste the prompt into an existing session to pick that up.
+   The prompt is not the control: the server answers an account read only when the `task_id` is a message the owner
+   addressed to this agent, so a task that falsely claims `tier=owner` is refused.
 3. Paste [`session-prompt.md`](session-prompt.md) (the part between its two rules) as the session's
    first message. It should answer `ready`.
 4. Run the adapter with `--session-id session_…` and, so owner-only answers asked in a shared room can
