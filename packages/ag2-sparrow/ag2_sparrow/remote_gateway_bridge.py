@@ -2235,7 +2235,7 @@ STOP_INTERRUPT = False
 # A gate returns INTAKE_DEFER while it would wait on another lane; `defer` makes it answer that at
 # once, and `deadline` (monotonic) bounds the whole round's waiting.
 INTAKE_DEFER = "\0intake-defer"
-_INTAKE_MODE: dict = {"defer": False, "deadline": None}
+_INTAKE_MODE: dict = {"defer": False, "deadline": None, "round": 0}  # `round` numbers served rounds
 _INTAKE_ROUND_WAIT_S = 6.0
 
 
@@ -7625,6 +7625,7 @@ def _take_served_round(tasks: list, inflight: "set[str]", pending_ack: list, fat
     lane is taken after every sibling's ack, so the wait delays no one else's lease."""
     added = False
     deferred: list = []
+    _INTAKE_MODE["round"] = _INTAKE_MODE.get("round", 0) + 1
     _INTAKE_MODE["defer"] = True
     try:
         for task in tasks:

@@ -1677,7 +1677,8 @@ with tempfile.TemporaryDirectory() as tmp:
                                 ("a-guest", good, "guest"), ("not-a-dm", dict(good, channel_kind="room"), "owner"),
                                 ("no-thread", dict(good, task=good["task"].replace('"thread_root": "$rootDM:s.space"',
                                                                                    '"thread_root": 7')), "owner"),
-                                ("a-bad-id", dict(good, task=good["task"].replace("d1d1d1d1-3434", "nope")), "owner")):
+                                ("a-bad-id", dict(good, task=good["task"].replace("d1d1d1d1-3434", "nope")), "owner"),
+                                ("a-bad-root", dict(good, task=good["task"].replace("$rootDM:s.space", "rootDM")), "owner")):
         check(f"a-dm-that-is-{label}-notes-nothing", br.intake_fence(fields, tier, br.Ledger(tmp / f"ledger-{label}")) is None
               and not (tmp / f"ledger-{label}" / br.Ledger.THREADS).exists())
     (tmp / "qdm.json").write_text(json.dumps({"fields": good, "tier": "owner"}))

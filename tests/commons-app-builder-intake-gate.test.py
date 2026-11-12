@@ -147,6 +147,7 @@ def main():
     rid3 = "bbbbbbbb-7a4d-4e8b-9f61-2c5d8a0b7e14"
     change = fence(rid3, mode="refine", app_id="a1b2c3d4", thread_message="$c1", description="make it blue")
     msg = thread_message("$c1", text="make it blue")
+    rgb._INTAKE_MODE["round"] += 1
     rgb._INTAKE_MODE["defer"] = True
     try:
         write("task-change-msg", msg)
@@ -158,6 +159,7 @@ def main():
     check("a change's message before its fence is held for the round's late pass", deferred
           and not queued("task-change-msg"))
     write("task-change", change)
+    rgb._INTAKE_MODE["round"] += 1  # a new served round, as _take_served_round starts one
     rgb._INTAKE_MODE["deadline"] = time.monotonic() + 2.0
     try:
         write("task-change-msg", msg)
@@ -171,6 +173,7 @@ def main():
     late_fence = fence(rid4, mode="refine", app_id="a1b2c3d4", thread_message="$c2", description="add a date")
     timer = threading.Timer(0.3, write, ("task-change2", late_fence))
     os.environ["BUILD_THREAD_CONVERSATION"] = "true"  # only with the switch on does a message wait
+    rgb._INTAKE_MODE["round"] += 1  # a new served round, as _take_served_round starts one
     rgb._INTAKE_MODE["deadline"] = time.monotonic() + 3.0
     began = time.monotonic()
     timer.start()
@@ -185,6 +188,7 @@ def main():
 
     # 4. A message nothing names waits out the round, then is delivered.
     os.environ["BUILD_THREAD_CONVERSATION"] = "true"
+    rgb._INTAKE_MODE["round"] += 1  # a new served round, as _take_served_round starts one
     rgb._INTAKE_MODE["deadline"] = time.monotonic() + 0.6
     began = time.monotonic()
     try:
@@ -257,6 +261,7 @@ def main():
     calls = []
     real_verdict = rgb._build_thread_verdict
     rgb._build_thread_verdict = lambda *x, **k: calls.append(x) or real_verdict(*x, **k)
+    rgb._INTAKE_MODE["round"] += 1  # a new served round, as _take_served_round starts one
     rgb._INTAKE_MODE["deadline"] = time.monotonic() - 1.0
     try:
         write("task-overdue", thread_message("$od1"))
@@ -340,6 +345,7 @@ def main():
     calls9 = []
     real_verdict = rgb._build_thread_verdict
     rgb._build_thread_verdict = lambda *x, **k: calls9.append(x) or real_verdict(*x, **k)
+    rgb._INTAKE_MODE["round"] += 1  # a new served round, as _take_served_round starts one
     rgb._INTAKE_MODE["deadline"] = time.monotonic() + 6.0
     began = time.monotonic()
     try:
@@ -354,6 +360,7 @@ def main():
     calls = []
     real_verdict = rgb._build_thread_verdict
     rgb._build_thread_verdict = lambda *x, **k: calls.append(x) or real_verdict(*x, **k)
+    rgb._INTAKE_MODE["round"] += 1
     rgb._INTAKE_MODE["defer"] = True
     try:
         write("task-first-pass", thread_message("$fp1"))
@@ -382,6 +389,7 @@ def main():
     fenced("task-fence10", fence(rid10, mode="refine", app_id="a1b2c3d4", thread_message="$elsewhere",
                                 description="a later change", thread_root=root10))
     seen_waits.clear()
+    rgb._INTAKE_MODE["round"] += 1  # a new served round, as _take_served_round starts one
     rgb._INTAKE_MODE["deadline"] = time.monotonic() + 3.0
     try:
         write("task-waits10", thread_message("$w10", text="make the title bigger", root=root10))
@@ -499,6 +507,28 @@ def main():
     check("a non-owner's fence-like DM never reaches the skill", "task-dm-guest" not in spawned
           and "$root15:s.space" not in index.read_text())
     check("and all three are delivered", queued("task-dm-plain") and queued("task-dm-quote") and queued("task-dm-guest"))
+
+    # 14. Fence DMs in the first pass count against the round's 3 s budget: with a hung script and
+    #     six fence DMs, the round's first ack still comes within the budget, and every DM is delivered.
+    hung = fakes / "hung.py"
+    hung.write_text("import time; time.sleep(60)\n")
+    acks = []
+    began = time.monotonic()
+    real_ack, real_script, real_verdict = rgb._post_task_ack, rgb._BUILD_REQUEST, rgb._build_thread_verdict
+    started14 = []
+    rgb._post_task_ack = lambda *a, **k: acks.append(time.monotonic() - began) or True
+    rgb._BUILD_REQUEST = hung
+    rgb._build_thread_verdict = lambda *x, **k: started14.append(x[2]) or real_verdict(*x, **k)
+    batch = [{"id": f"task-hf{i}", **fence(f"{i}{i}{i}{i}{i}{i}{i}{i}-7a4d-4e8b-9f61-2c5d8a0b7e14",
+                                           thread_root=f"$rootH{i}:s.space")} for i in range(1, 7)]
+    try:
+        rgb._take_served_round(batch, set(), [], {}, [])
+    finally:
+        rgb._post_task_ack, rgb._BUILD_REQUEST, rgb._build_thread_verdict = real_ack, real_script, real_verdict
+    check("once the round's budget is spent, no further check starts", len(started14) == 2, repr(started14))
+    check("six fence DMs with a hung script: the first ack comes within the round's budget",
+          acks and acks[0] < rgb.BUILD_THREAD_ROUND_S + 1.5, repr(acks[:1]))
+    check("and every fence DM is delivered", all(queued(f"task-hf{i}") for i in range(1, 7)))
 
     print(f"commons-app-builder intake gate: {'FAIL' if failures else 'OK'} ({len(failures)} failed)")
     return 1 if failures else 0

@@ -408,7 +408,7 @@ _FENCE_OPENER = "```commons-app-build"
 # settings. Never the gateway's token or any other secret the bridge holds.
 _INTAKE_ENV = ("HOME", "SUTANDO_WORKSPACE", "SUTANDO_TEST_MODE", "SUTANDO_DEFAULT_WORKSPACE",
                "BUILD_THREAD_CONVERSATION", "BUILD_THREAD_SETTLE_SECONDS")
-_BUILD_THREAD_ROUND: dict = {"round": None, "until": None}
+_BUILD_THREAD_ROUND: dict = {"round": None, "until": None}  # one budget per served round, both passes
 
 
 def _build_thread_verdict(task: dict, tier: str, budget: float):
@@ -448,12 +448,14 @@ def _known_app_thread(task: dict) -> bool:
             and until > time.time())
 
 
-def _build_thread_until(deadline: float) -> float:
-    """This round's end for build-thread work: BUILD_THREAD_ROUND_S from its first check, never past
-    the round's own deadline (a round is known by that deadline)."""
-    if _BUILD_THREAD_ROUND["round"] != deadline:
-        _BUILD_THREAD_ROUND.update(round=deadline, until=min(deadline, time.monotonic() + BUILD_THREAD_ROUND_S))
-    return _BUILD_THREAD_ROUND["until"]
+def _build_thread_until(deadline: "float | None") -> float:
+    """This round's end for build-thread work, first pass and late pass together:
+    BUILD_THREAD_ROUND_S from its first check, and never past the round's deadline once there is one."""
+    rnd = _INTAKE_MODE.get("round")  # noqa: F821
+    if _BUILD_THREAD_ROUND["round"] != rnd:
+        _BUILD_THREAD_ROUND.update(round=rnd, until=time.monotonic() + BUILD_THREAD_ROUND_S)
+    until = _BUILD_THREAD_ROUND["until"]
+    return until if deadline is None else min(deadline, until)
 
 
 def _build_thread_gate(task: dict):
@@ -471,7 +473,12 @@ def _build_thread_gate(task: dict):
     if tier != "owner":
         return None
     if fence_like:  # the skill notes a real fence's thread, so its copy is checked; always delivered
-        _build_thread_verdict(task, tier, BUILD_THREAD_VERDICT_S)
+        budget, mode = BUILD_THREAD_VERDICT_S, _INTAKE_MODE  # noqa: F821
+        if mode["defer"] or mode["deadline"] is not None:
+            budget = min(budget, _build_thread_until(mode["deadline"]) - time.monotonic())
+
+        if budget > 0:  # the round's budget spent: delivered unchecked, as on any failure
+            _build_thread_verdict(task, tier, budget)
         return None
     if not _known_app_thread(task):  # any other thread keeps its place in the round
         return None

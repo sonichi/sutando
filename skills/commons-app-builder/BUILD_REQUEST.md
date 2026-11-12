@@ -293,7 +293,8 @@ path in its place in the round, with no check.
 
 **A new build's thread is indexed at its fence.** An owner-tier DM task whose text contains the
 fence's opening line (```` ```commons-app-build ````, one substring test, no parsing in the bridge)
-is handed to the same `intake-verdict` call, within the same 2 s and failing open. The skill notes
+is handed to the same `intake-verdict` call, within the same 2 s and failing open, and counted
+against the round's same 3 s build-thread budget (past it, such a DM is delivered unchecked). The skill notes
 it when it is a whole, valid owner fence naming an app thread, which indexes that thread, and
 notes nothing otherwise (a quote of the marker, a guest, a group room, a bad id). The DM is
 delivered either way. So the copy that follows, in that round or a later one, is checked and
