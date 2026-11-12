@@ -19,9 +19,31 @@ complete reference.
 ## 2. Two halves
 
 - **Anything a person can do, their agent can do through an Action, under the same authority.**
-  The authority is the agent's own, delegated by its owner, or approved per use. High-impact
-  Actions stay behind an approval hold.
+  That authority is the owner's, as delegated: the agent's own, delegated by its owner, or
+  approved per use. It is never the authority of whoever is asking in a room. High-impact Actions
+  stay behind an approval hold.
 - **Anything an agent needs from a person arrives as a control, not a sentence.**
+
+High-impact means, at least, irreversible actions and outward-facing ones: sending, publishing,
+purchasing, deleting, and changing permissions or credentials.
+
+An Action's risk and its approval requirement come from the Action's own metadata, set by the
+platform. They never come from the caller or the card, so an agent cannot downgrade them.
+
+An authorization refusal does not reveal whether the target exists. A caller without access gets
+the same answer for "not found" and "not allowed". The refusal names what the caller can do (ask
+the owner, request access), not the target.
+
+Some things are person-only, by design. An agent never:
+
+- approves its own approval hold;
+- widens its own authority;
+- changes sign-in factors (password, 2FA, recovery);
+- mints or reveals credentials;
+- deletes the person's account.
+
+These are not coverage gaps. They stay with the person, and the agent's part is to ask, with a
+card.
 
 ## 3. The rule of thumb
 
@@ -33,6 +55,10 @@ sign in to that, pick one of these, open this page. Open-ended input stays chat.
 
 The test: if you are about to write "reply yes to…", "open this link", "go to Settings → …" or
 "run this command", stop and add the control.
+
+Where no control exists yet, one plain instruction is allowed, and it is tracked as a gap. Known
+gaps today: sending a secret with a typed `vault set` command, and typing the re-link approval
+code.
 
 ## 4. Fewest steps, in place
 
@@ -47,9 +73,11 @@ The person can always finish what they intend, even a delete.
 - Safety may add a step. It never removes the path. The step is: see the consequence, press a
   button named after the action, and the acting side re-checks.
 - Every refusal names the way through. It never sends the person back to the thing that just
-  failed.
+  failed. An authorization refusal still does not reveal the target (section 2).
 - Every "Go" lands on something the person can act on.
-- A dismissed item can be brought back.
+- Dismissing hides an item from the bar. It comes back by itself only if the card changes. The
+  person can bring it back any time from "N hidden · Show" in the bar or the drawer, and the card
+  itself stays in its room.
 - The person's own words always work as a fallback.
 
 ## 6. Every setting and action has a clean definition
@@ -60,8 +88,8 @@ definition. It states:
 - **What it belongs to**: the user, the app, a room or an agent (table below).
 - **What it does**, in one plain sentence.
 - **Who may change it**. The rule is the same for a person and for an agent acting for them.
-- **Its risk**: its action class (section 7), and whether an agent needs an approval hold to do
-  it.
+- **Its risk**: its action class (section 7) and its approval requirement. Both come from the
+  Action's own metadata (section 2).
 
 A new setting without these four is not ready to merge.
 
@@ -85,10 +113,12 @@ Two cases that are easy to get wrong:
 - Say what is being asked, in plain words.
 - Put the evidence one tap away. Anything the card mentions that lives elsewhere (a pull request,
   a page, a room, a file, a person) is a link to it. A pull request link shows live status (state,
-  review, checks), fetched as the viewer.
+  review, checks), fetched as the viewer, when the viewer has a connected account that can read
+  it. Otherwise it is a plain link with no status. Status is never fetched with someone else's
+  credential, and a private title is never shown to someone without access.
 - Let the person answer in one step, by action class (table below).
-- Show the outcome on the same card: the status changes to Approved, Expired or Done, updated in
-  place, with no follow-up message.
+- Show the card's own outcome on the same card: the status changes to Approved, Expired or Done,
+  updated in place. No second chat message repeats it.
 - Never show internals (ids, hostnames, session names, raw provider errors, key fragments) outside
   Details.
 - Carry a plain-text fallback for clients that do not know the card.
@@ -102,8 +132,11 @@ Two cases that are easy to get wrong:
 
 Links:
 
-- A link opens in place, in the app's side panel, like a Commons page. A new tab is the fallback,
-  never the default. Nothing opens until the person clicks.
+- In-app targets (rooms, messages, Commons pages, settings) open in place, in the side panel.
+- An external site opens in place only where the client can host it (the desktop app's side
+  panel). Where a site refuses to be embedded (most external sites in the browser client), a
+  preview is shown for known kinds, otherwise a new tab.
+- A new tab is the fallback, not the default. Nothing opens until the person clicks.
 - A link to a Commons page shows the page itself in the message, editable in place, opened on the
   part the agent changed.
 - When an agent shares a page, it says which section changed and one line on what changed.
@@ -126,69 +159,106 @@ Links:
   terminal, out of budget), which clear when the cause clears.
   - It acts in place when the action is safe. Otherwise one tap goes to the card.
   - More than one item becomes a drawer: "N things need you".
-  - Each item can be dismissed. Dismiss hides it and does not answer it. It returns only if the
-    card changes.
-  - It stays discreet in a shared room.
+  - Each item can be dismissed. Dismissing does not answer it. Dismissing hides an item from the
+    bar. It comes back by itself only if the card changes. The person can bring it back any time
+    from "N hidden · Show" in the bar or the drawer, and the card itself stays in its room.
+  - It stays discreet in a shared room. For an item that comes from another room, the closed bar
+    shows only that something needs the person and from which agent, or just a count, with no card
+    text. The content appears only when the person opens the drawer.
 - **Settings** is the reference.
 
 ## 10. Agents and discovery
 
-- Agents are named by product name (Dot, Muse, Sutando), never by invented task categories.
+- Other agents and agent types are named by product name (Dot, Muse, Sutando), never by invented
+  task categories. An agent still introduces itself by its own display name.
 - An agent recommends another agent only on an explicit capability: where it runs and what it can
   reach, always on, voice, connected apps, or already in the room. It names the capability. When
   nothing explicit differs, it does not recommend.
-- Discovery is a maintained deck of five feature cards. The deck is shown once after an update. An
-  agent can pull a card when asked or when it would help, at most once per situation.
+- Discovery is a small maintained deck of feature cards (size and contents are set in the spec).
+  The deck is shown once after an update. An agent can pull a card when asked or when it would
+  help, at most once per situation.
 - Each card's main action takes the person into the feature in place, landing in the DM with their
   own agent.
 
 ## 11. Trust rules for controls
 
-- A control acts only on a card from the viewer's own agent.
-- A click is data, not authority. The acting side verifies that the click replies to a card it
-  issued, carries a payload that card offered, comes from the owner, and is in the same room.
+There are two kinds of card:
+
+| Kind | Examples | Who may act | What the acting side checks |
+| --- | --- | --- | --- |
+| Owner card | An agent asking its own owner: approvals, sign-ins, the agent's own state | Only the owner | It issued the card, the card offered the payload, the sender is the owner, and the click is in the same room |
+| Room card | Room questions, room-app buttons, invites, polls | Any member the room's permission allows for that action | It issued the card, the card offered the payload, and the room's permission for that action allows the sender, in place of ownership |
+
+For both kinds:
+
+- A click is data, not authority.
 - A click that fails the check is refused. It is never treated as chat.
 - There is one shared implementation of this check, not one per feature.
 
 ## 12. Checklist for contributors and reviewers
 
 Answer each line yes or no. A "no" is fixed in the same pull request, or the pull request says why
-not.
+not. A line about something the change does not touch is "not applicable".
 
-1. If this adds something a person can do, can an agent do it through an Action under the same
-   authority? If not, is the reason written down?
-2. Is every high-impact Action behind an approval hold?
-3. Is user-facing text free of instructions to do a known action ("reply yes", "open this link",
-   "go to Settings", "run this command")? Each one is a control.
-4. Does the person finish in one step on the first card, with related items under one approval and
-   the current value pre-filled?
-5. Can the person always finish what they intend: every refusal names the way through, every "Go"
-   lands on something actionable, and a dismissed item can be brought back?
-6. Is each new setting or action defined in the one place: what it belongs to (user, app, room or
-   agent), what it does, who may change it, and its risk?
-7. Does the card say what is asked in plain words, link everything it mentions, and show its
-   outcome in place with no follow-up message?
-8. Does each action follow its class: one tap for safe and reversible, confirmed in place with the
-   consequence and a named button for irreversible, and re-checked by the acting side?
-9. Is user-facing text free of internals and secrets (ids, hostnames, session names, raw provider
-   errors, key fragments) outside Details?
-10. Do links open in place on the person's click, and does a Commons page link show the page on
-    the part that changed, with one line on what changed?
-11. Does a question to a person use the one model and renderer, with choices as buttons, and no
-    instruction to edit a row or a database?
-12. Does a card waiting on the person show in the bar from any room, with a dismiss that hides it
-    without answering it?
-13. Are agents named by product name, and recommended only on a named, explicit capability?
-14. Is the click check the shared one, and does the card carry a plain-text fallback?
+**Actions and authority**
+
+1. Can an agent do each new thing a person can do, through an Action, or is the reason written
+   down?
+2. Does the Action act with the owner's delegated authority, never the authority of whoever is
+   asking?
+3. Is everything on the person-only list still out of an agent's reach?
+4. Is every high-impact Action behind an approval hold?
+5. Do risk and approval come from the Action's own metadata, not from the caller or the card?
+6. Does an authorization refusal give the same answer for "not found" and "not allowed"?
+7. Is each new setting or action defined once, with what it belongs to, what it does, who may
+   change it and its risk?
+
+**Controls**
+
+8. Is end-user-facing text free of instructions to do a known action that has a control?
+   (Runbooks, developer docs and operator instructions may say "run this command".)
+9. Does the person finish in one step on the first card?
+10. Are related items under one approval?
+11. Is the current value pre-filled?
+12. Does every refusal name the way through?
+13. Is each action handled as its class requires (section 7)?
+
+**Cards**
+
+14. Does the card say what is asked in plain words?
+15. Is everything the card mentions a link to it?
+16. Does the card show its own outcome in place, with no second message repeating it?
+17. Is user-facing text free of internals and secrets outside Details?
+18. Does the card carry a plain-text fallback?
+19. Do in-app links open in place, on the person's click?
+20. Does a card waiting on the person show in the bar, from any room?
+
+**Questions and discovery**
+
+21. Does a question to a person use the one question model and renderer?
+22. Is the question free of instructions to edit a row or a database?
+23. Is another agent recommended only on a named, explicit capability?
+
+**Trust**
+
+24. Is the click check the shared one?
+25. Is a click that fails the check refused, never treated as chat?
 
 ## What this means here (agent engine)
 
-The engine writes the card content and the text the owner reads, so rules 3, 5, 7, 8, 10 and 11
-land here.
+The engine writes the card content and the text the owner reads, so rules 2, 3, 5, 7, 8, 10
+and 11 land here. Checklist lines 19 and 20 are for the web client and do not apply to an engine
+change.
 
-- Owner-facing text never tells the owner to do a known action in prose. Send a card with the
-  agent card helper (sutando#6385) or a local card. For a missing app connection, use the
-  [`connect-apps`](../skills/connect-apps/SKILL.md) skill's Connect card.
+- High-impact (rule 2) is at least what `CLAUDE.md` "Identity" has the agent confirm with the
+  owner before executing: irreversible actions such as sending email, deleting files and
+  financial transactions. The two lists are kept the same.
+- A request from someone other than the owner never borrows the owner's authority. Tiers and
+  collaborators are in [`docs/access-control.md`](access-control.md).
+- When a control exists for a known action, owner-facing text sends the control, not the
+  instruction. Send a card with the agent card helper
+  ([`src/agent_card.py`](../src/agent_card.py)) or a local card. For a missing app connection,
+  use the [`connect-apps`](../skills/connect-apps/SKILL.md) skill's Connect card.
 - A question to the owner carries structured references (for example the pull request rows it is
   about, with their state) and says what each option does. Ask it with
   [`scripts/ask-owner.py`](../scripts/ask-owner.py) and its `--option` / `--default` flags so it
@@ -204,8 +274,19 @@ land here.
   capability this one lacks, and name that capability.
 - No raw ids, hostnames, session names or provider errors in owner-facing text. Say what happened
   and what unblocks it in plain words; keep the raw detail in the card's Details or the log.
-- A click on a card reaches the engine as a task. It is data: check it with the one shared check
-  before acting, act only on a click that passes, and never answer a failed click as if the owner
-  had typed it.
-- When the outcome is known, update the card that asked. Do not post a follow-up message.
+- Known gaps, where one plain instruction is still allowed: `vault set KEY VALUE` (the secret
+  must go through the bridge's interception, not a card field, so it stays a typed command
+  until a secure-entry control exists) and the typed re-link code.
+- A click on a card reaches the engine as a task. It is data: check it with the one shared
+  check, `click_verdict` in [`src/agent_card.py`](../src/agent_card.py), which accepts only a
+  card recorded in [`src/issued_cards.py`](../src/issued_cards.py). Act only on a click that
+  passes, and never answer a failed click as if the owner had typed it. Do not write a second
+  check. For an owner card the check is that the sender is the owner. For a room card it is the
+  room's permission for that action.
+- The engine never does anything on the person-only list. It asks, with a card.
+- "Known action → control" is about text an end user reads. Runbooks, developer docs and
+  operator instructions may say "run this command".
+- When the outcome is known, update the card that asked; do not repeat it in a second chat
+  message. The click's task is still answered through its result file, starting with
+  `[no-send]` or `[REPLIED]` when the card already shows the outcome.
 - Open-ended questions stay chat. This rule is about actions the agent already knows.

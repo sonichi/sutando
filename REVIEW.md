@@ -467,15 +467,15 @@ and loads whichever repo it reviews.
     depends on and check the continuation re-reads it rather than closing over it.
 
 22. **Apply the agent-native design rules to anything a person or an agent can do or read.**
-    The rules and the full checklist are in
-    [`docs/agent-native-design-rules.md`](docs/agent-native-design-rules.md); they are not
-    repeated here. Block on any of these: owner-facing text that tells the owner to do a
-    known action in prose ("reply yes", "open this link", "go to Settings", "run this
-    command") instead of sending a card; a card that reports its outcome in a follow-up
-    message instead of updating in place, or has no plain-text fallback; raw ids, session
-    names, provider errors or key fragments in owner-facing text; a click acted on without
-    the shared check, or a second copy of that check; a capability a person has that an
-    agent cannot reach through an Action, with no reason given.
+    If this adds or changes something a person or an agent can do or read, follow
+    [`docs/agent-native-design-rules.md`](docs/agent-native-design-rules.md) and answer
+    its checklist.
+    *Grounded by:* four cases found while the rules were being written, 2026-11. A question
+    to the owner went out as prose: the options sat in a sentence, and answering meant
+    editing a database row. A review found a hole where a forged card click would have been
+    handled as ordinary chat. Owner-facing cards showed raw worker ids and session names. A
+    status bar showed a fragment of a key. In each, the action or the fact was already known
+    to the agent, so a control or a plain wording was available and was not used.
 
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 

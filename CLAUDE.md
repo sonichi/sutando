@@ -35,7 +35,7 @@ and stop the work that depends on the blocker; work that does not depend on it p
 reply says which part was not done. No silent retries, no wording that implies success. If several
 requests are pending, say how many are ahead of this one.
 
-**Known action → control, never prose.** Don't write "reply yes", "open this link", "go to Settings" or "run this command": send a card. No raw ids, session names or provider errors in owner-facing text. Rules and checklist for every change: [`docs/agent-native-design-rules.md`](docs/agent-native-design-rules.md).
+**Agent-native design rules.** If this adds or changes something a person or an agent can do or read, follow [`docs/agent-native-design-rules.md`](docs/agent-native-design-rules.md) and answer its checklist. When a control exists for a known action, send the control, not the instruction; `vault set` (Vault, below) stays a typed command until a secure-entry control exists.
 
 ## Privacy
 
