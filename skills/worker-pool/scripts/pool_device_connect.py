@@ -148,13 +148,21 @@ def _md_url(url: str) -> str:
     return url.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
 
 
+_MD_SPECIAL = re.compile(r"([\\`*_\[\]<>])")
+
+
+def _md(text: str) -> str:
+    """`text` as literal markdown: one line, its emphasis, code and link characters escaped."""
+    return _MD_SPECIAL.sub(r"\\\1", " ".join(str(text).split()))
+
+
 def approval_note(worker_label: str, label: str, verify_url: str, expires_at: float, *, now: float,
                   display_name: str = "", rotated: bool = False) -> str:
     """The owner's DM: what they approve, on which server, a labelled link (the code-bearing URL is never
     the visible text), and how long it works."""
-    host = urllib.parse.urlsplit(verify_url).hostname or ""
+    host = _md(urllib.parse.urlsplit(verify_url).hostname or "")
     on = f" on {host}" if host else ""
-    name = display_name or label
+    name, worker_label = _md(display_name or label), _md(worker_label)
     if rotated:
         head = f"**Approve a new token for {worker_label}'s agent**"
         what = f"Its agent \"{name}\"{on} gets a new token; the old one stops working once you approve."
@@ -168,6 +176,7 @@ def approval_note(worker_label: str, label: str, verify_url: str, expires_at: fl
 
 def expiry_note(worker_label: str, label: str, expires_at: float, *, now: float) -> str:
     """The owner's DM once an unapproved link has lapsed: nothing changed, and how to get a new one."""
+    worker_label, label = _md(worker_label), _md(label)
     return (f"[dm-only]\n**The approval link for {worker_label} expired**\n\nIt expired at {_at(expires_at, now)} "
             f"before agent \"{label}\" was approved, so nothing was set up. Ask me for a new link whenever "
             "you are ready.")
@@ -175,6 +184,7 @@ def expiry_note(worker_label: str, label: str, expires_at: float, *, now: float)
 
 def done_note(worker_label: str, label: str, agent_id: str, *, rotated: bool = False) -> str:
     """The owner's DM once the approval is saved: which agent it is and where to find it."""
+    worker_label, label = _md(worker_label), _md(label)
     if rotated:
         return (f"[dm-only]\n**Done: {worker_label}'s agent has a new token**\n\nAgent \"{label}\" "
                 f"(`{agent_id}`) now uses it, and the old token no longer works.")

@@ -81,9 +81,17 @@ class ConnectFake:
         return self.backend.request(method, url, bearer=bearer, payload=payload, headers=headers, timeout=timeout)
 
 
+_LINK = re.compile(r"\[((?:\\.|[^\]\\])*)\]\(([^)\s]*)\)")
+
+
+def links(markdown: str) -> list:
+    """The (label, target) of every markdown link, a backslash-escaped bracket staying inside its label."""
+    return _LINK.findall(markdown)
+
+
 def visible(markdown: str) -> str:
-    """What a reader sees of `markdown`: each link shows its label, never its target."""
-    return re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", markdown)
+    """What a reader sees of `markdown`: each link shows its label, never its target; escapes unescaped."""
+    return re.sub(r"\\(.)", r"\1", _LINK.sub(lambda m: m.group(1), markdown))
 
 
 class Base(S.Base):
@@ -351,6 +359,20 @@ class Notes(unittest.TestCase):
         self.assertIn("**Approve a new token for Pylon-the-ops's agent**", note)
         self.assertIn("the old one stops working once you approve", note)
         self.assertIn("Works for 1 minute, until 4:00 PM today.", note)
+
+    def test_a_hostile_name_cannot_break_the_link_or_show_its_target(self):
+        evil = "x](http://evil) [y*_`\\"
+        for note in (dc.approval_note(evil, evil, self.LINK, self.at(15, 52), now=self.at(15, 37)),
+                     dc.approval_note(evil, "a", self.LINK, self.at(15, 52), now=self.at(15, 37), display_name=evil,
+                                      rotated=True)):
+            self.assertEqual([t for _, t in links(note)], [self.LINK])
+            for secret in ("code=", "https://", "vfy."):
+                self.assertNotIn(secret, visible(note))
+            self.assertIn(f"Approve {evil}", visible(note))
+        for note in (dc.expiry_note(evil, evil, self.at(15, 52), now=self.at(15, 53)),
+                     dc.done_note(evil, evil, "@a:s.space"), dc.done_note(evil, evil, "@a:s.space", rotated=True)):
+            self.assertEqual(links(note), [])
+            self.assertIn(evil, visible(note))
 
     def test_a_link_target_cannot_end_early_on_a_space_or_paren(self):
         note = dc.approval_note("w", "a", "https://s.space/p?x=(1) 2", self.at(16, 0), now=self.at(15, 45))
