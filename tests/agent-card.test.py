@@ -132,6 +132,16 @@ class Check(unittest.TestCase):
                   {"label": "x", "kind": "teleport"}, {"label": "x", "kind": "reply", "reply": "r", "disabled": "no"}):
             self.assertIsNotNone(ac.problem({**self.card, "buttons": [b]}), b)
 
+    def test_a_connect_action_names_an_app_slug(self):
+        good = ac.button("Reconnect Gmail", "connect", toolkit="gmail")
+        self.assertEqual(good, {"label": "Reconnect Gmail", "kind": "connect", "toolkit": "gmail"})
+        self.assertIsNone(ac.problem({**self.card, "buttons": [good]}))
+        rows = [{"label": "g", "rows": [{"title": "Gmail", "actions": [good]}]}]
+        self.assertIsNone(ac.problem({**self.card, "groups": rows}))
+        for toolkit in (None, "", "Gmail", "g-mail", "x" * 65, 7):
+            b = {"label": "Reconnect", "kind": "connect", **({"toolkit": toolkit} if toolkit is not None else {})}
+            self.assertIsNotNone(ac.problem({**self.card, "buttons": [b]}), toolkit)
+
     def test_a_menu_is_for_row_actions_only_and_never_nests(self):
         menu = {"label": "⋯", "kind": "menu", "items": [{"label": "y", "kind": "reply", "reply": "r"}]}
         self.assertIsNotNone(ac.problem({**self.card, "buttons": [menu]}))

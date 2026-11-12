@@ -165,7 +165,7 @@ def apps_card(rows: list) -> tuple:
                 _act("Switch account", f"Switch my {name} account", ac.reply("apps", slug, "switch")),
                 _act("Disconnect", f"Disconnect {name}", ac.reply("apps", slug, "disconnect"))])]
         else:
-            actions = [_act("Reconnect", f"Reconnect {name}", ac.reply("apps", slug, "reconnect"))]
+            actions = [ac.button("Reconnect", "connect", toolkit=slug)]
         out.append(ac.row(name, subtitle=sub.strip(" ·"), state="on" if active else "warn",
                           avatar_=ac.avatar(app=slug, shape="square"), actions=actions))
     return ac.build("apps", "info", title="Your apps", avatar_=ac.avatar(initial="A"),

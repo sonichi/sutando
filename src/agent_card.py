@@ -19,7 +19,7 @@ from typing import Callable, Mapping, Optional, Tuple
 CARD_KEY = "space.ag2.card"
 KIND, VERSION = "agent_panel", 1
 STATES = ("pending", "done", "expired", "error", "info")
-BUTTON_KINDS = ("url", "reply", "open_room", "open_dm", "menu")
+BUTTON_KINDS = ("url", "reply", "open_room", "open_dm", "menu", "connect")
 ROW_STATES = ("on", "off", "warn", "none")
 BADGE_STATES = ("on", "off", "warn")
 STYLES = ("primary", "secondary")
@@ -63,15 +63,16 @@ def avatar(*, mxid: str = "", url: str = "", seed: str = "", initial: str = "", 
 
 def button(label: str, kind: str, *, style: str = "", url: str = "", reply: str = "", room_id: str = "",
            user_id: str = "", items: Optional[list] = None, confirm: str = "", disabled: Optional[bool] = None,
-           uses_input: bool = False, command: str = "") -> dict:
+           uses_input: bool = False, command: str = "", toolkit: str = "") -> dict:
     """A button, row action or menu item; `confirm` makes the client ask first. On a done or expired
     card the client disables a button unless it says `disabled: False`. A `reply` button with a
-    `command` acts as that command when the owner clicks it; without one its text is plain words."""
+    `command` acts as that command when the owner clicks it; without one its text is plain words. A
+    `connect` button signs the owner in to `toolkit` (an app slug) in place, in the client."""
     if command and parse_reply(command) is None:
         raise CardError(f"{command!r} is not a card command")
     out = _drop_empty({"label": label, "kind": kind, "style": style, "url": url, "reply": reply,
                        "room_id": room_id, "user_id": user_id, "items": items, "confirm": confirm,
-                       "command": command})
+                       "command": command, "toolkit": toolkit})
     if disabled is not None:
         out["disabled"] = bool(disabled)
     if uses_input:
@@ -183,9 +184,11 @@ def _action_problem(b: object, where: str, *, menu_ok: bool = False) -> Optional
         return f"{where}.kind {kind!r} is not one of {', '.join(BUTTON_KINDS)}"
     if kind == "menu" and not menu_ok:
         return f"{where}: a menu belongs only in a row's actions, and menu items do not nest"
-    need = {"url": "url", "reply": "reply", "open_room": "room_id", "open_dm": "user_id"}.get(kind)
+    need = {"url": "url", "reply": "reply", "open_room": "room_id", "open_dm": "user_id", "connect": "toolkit"}.get(kind)
     if need and not _text(b.get(need)):
         return f"{where} of kind {kind} needs {need}"
+    if kind == "connect" and not (isinstance(b["toolkit"], str) and _APP_RE.fullmatch(b["toolkit"])):
+        return f"{where}.toolkit is not an app slug"
     if "url" in b and not _link_ok(b["url"]):
         return f"{where}.url is not an http(s) link without credentials"
     if _long(b.get("reply"), "reply"):

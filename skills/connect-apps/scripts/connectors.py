@@ -1504,7 +1504,7 @@ def auth_problem(error: str) -> str | None:
 def reauth_message(wait: dict, owner: str, task: str, *, name: str, slug: str, account: str = "",
                    stopped: str = "") -> dict:
     """The room.message.send payload for a signed-out app: an agent panel in state error, whose Reconnect
-    reply brings up the Connect card for this same wait."""
+    button signs the owner in to the app in place; this wait resumes the request once it shows connected."""
     import agent_card as ac
 
     did = stopped or f"I couldn't finish your request because {name} signed me out."
@@ -1512,8 +1512,7 @@ def reauth_message(wait: dict, owner: str, task: str, *, name: str, slug: str, a
         f"app-reauth:{slug}", "error", title=name, subtitle="Signed out" + (f" · {account}" if account else ""),
         avatar_=ac.avatar(app=slug, shape="square"),
         text=f"{did} Reconnect it and I'll carry on.",
-        buttons=[ac.button(f"Reconnect {name}", "reply", style="primary", reply=f"Reconnect {name}",
-                           command=ac.reply("apps", slug, "reconnect"))],
+        buttons=[ac.button(f"Reconnect {name}", "connect", style="primary", toolkit=slug)],
         note=f"Or {INTEGRATIONS_HINT}.", note_tone="dim",
         body=f"{name} signed me out{f' ({account})' if account else ''}, so I stopped. Reconnect {name}: "
              f"tap Reconnect on the card, or {INTEGRATIONS_HINT}.")

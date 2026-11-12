@@ -108,8 +108,7 @@ class Builders(unittest.TestCase):
         rows = card["groups"][0]["rows"]
         self.assertEqual([(r["title"], r["subtitle"], r["avatar"]["app"]) for r in rows],
                          [("Gmail", "me@work.io · default", "gmail"), ("Linear", "Signed out", "linear")])
-        self.assertEqual((rows[1]["actions"][0]["reply"], rows[1]["actions"][0]["command"]),
-                         ("Reconnect Linear", "card:apps:linear:reconnect"))
+        self.assertEqual(rows[1]["actions"][0], {"label": "Reconnect", "kind": "connect", "toolkit": "linear"})
         self.assertEqual(card["buttons"][0]["reply"], "connect an app")
 
     def test_circle_and_its_empty_state(self):

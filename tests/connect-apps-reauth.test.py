@@ -6,8 +6,9 @@
   carrying an agent panel in state error (app logo, "Signed out · <account>", what it stopped, Reconnect).
 - connect_required, a non-auth error and an app still listed active arm nothing; only the owner's own
   task may arm one.
-- The card's Reconnect click (skills/agent-cards cards.py reply), once the posted card is recorded
-  (issued_cards), prints the Connect card of that wait.
+- The card's Reconnect button is a `connect` action: the client signs the owner in to the app in place,
+  and the armed wait resumes the request once the app shows connected. A Reconnect reply on a recorded
+  card (skills/agent-cards cards.py reply) still prints the Connect card of that wait.
 
 Run: python3 tests/connect-apps-reauth.test.py
 """
@@ -73,8 +74,9 @@ class Reauth(S.Base):
         self.assertEqual(card["header"]["subtitle"], "Signed out · me@work.io")
         self.assertEqual(card["header"]["avatar"], {"app": "gmail", "shape": "square"})
         self.assertIn("I couldn't check your inbox.", card["text"])
-        self.assertEqual((card["buttons"][0]["label"], card["buttons"][0]["reply"], card["buttons"][0]["command"]),
-                         ("Reconnect Gmail", "Reconnect Gmail", "card:apps:gmail:reconnect"))
+        self.assertEqual(card["buttons"][0], {"label": "Reconnect Gmail", "kind": "connect", "style": "primary",
+                                              "toolkit": "gmail"})
+        self.assertEqual(issued_cards.offered(card), {}, "signing in happens in the client, not as a reply")
         self.assertNotIn("\n", msg["body"])
         marker = connectors.read_marker(self.ws, out["wait_id"])
         self.assertEqual((marker["request"], marker["owner"]), ("any email from Sam", OWNER))
@@ -95,19 +97,17 @@ class Reauth(S.Base):
         code, out = self.run_(reauth_argv(task="task-team"))
         self.assertEqual((code, out["error"]), (2, "not_owner_task"))
 
-    def test_the_reconnect_reply_brings_up_the_connect_card_of_that_wait(self):
+    def test_a_reconnect_reply_on_an_issued_card_brings_up_the_connect_card_of_that_wait(self):
         code, out = self.run_(reauth_argv())
         wait_id = out["wait_id"]
-        recorded = io.StringIO()
-        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(out["message"]))), \
-                contextlib.redirect_stdout(recorded):
-            self.assertEqual(issued_cards.main(["record", "--workspace", str(self.ws), "--event-id", "$signed-out"]), 0)
+        _, older = ac.build("apps", "info", title="Your apps", body="b", buttons=[
+            ac.button("Reconnect", "reply", reply="Reconnect Gmail", command="card:apps:gmail:reconnect")])
+        self.assertTrue(issued_cards.record(self.ws, "$signed-out", older))
         _spec2 = importlib.util.spec_from_file_location("cards", ROOT / "skills" / "agent-cards" / "scripts" / "cards.py")
         cards = importlib.util.module_from_spec(_spec2)
         _spec2.loader.exec_module(cards)
         task = self.ws / "tasks" / "task-click.txt"
-        click = json.dumps({"card_id": out["message"]["extra_content"]["space.ag2.card"]["id"],
-                            "action": "Reconnect Gmail"})
+        click = json.dumps({"card_id": "apps", "action": "Reconnect Gmail"})
         task.write_text("\n".join(["id: task-click", "task_layout: mid", f"card_click: {click}",
                                    "task: Reconnect Gmail",
                                    "source: ag2space", f"channel_id: {ROOM}", "channel_kind: dm",
