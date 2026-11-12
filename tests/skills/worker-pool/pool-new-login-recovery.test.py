@@ -491,6 +491,130 @@ class NewLogin(Pool):
         self.assertIn(self.seat(mars), self.alive)
         self.assertIn(self.seat(baxter), self.alive)
 
+    def test_a_suspension_written_during_the_capture_stops_the_kill(self):
+        mars = next(iter(self.WORKERS))
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+        real_runner, real_restart, restarting = self.runner, rem.restart_on_new_login, []
+
+        def quit_while_capturing(argv, **kw):
+            # The restart's own capture is where the app quits: the marker lands mid-capture.
+            if restarting and "capture-pane" in argv:
+                rem.suspend(self.ws, "the app is quitting")
+            return real_runner(argv, **kw)
+
+        def restart(*a, **kw):
+            restarting.append(1)
+            return real_restart(*a, **kw)
+        self.runner = quit_while_capturing
+        with patch.object(rem, "restart_on_new_login", side_effect=restart):
+            _, out = self.sweep()
+        got = out["recoveries"][mars]
+        self.assertEqual(got["outcome"], rem.SUSPENDED)
+        self.assertNotIn("taken_down", got, "nothing was taken down")
+        self.assertIn(self.seat(mars), self.alive, "the seat is still running")
+        self.assertEqual(self.spawned, [])
+        self.runner = real_runner
+        rem.resume(self.ws, REPO, runner=self.runner, spawn=self.spawn)
+        self.assertEqual(sup.load_state(self.ws).workers[mars].relogin_attempts, 0, "the skipped try is not spent")
+        self.assertEqual(self.sweep_until(mars)[1]["outcome"], rem.RECOVERED, "restarted once the quit is over")
+
+    def test_a_suspension_written_as_the_seat_is_marked_down_still_stops_the_kill(self):
+        mars = next(iter(self.WORKERS))
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+        real_mark = sup.mark_relogin_down
+
+        def quit_while_marking(ws, w):
+            real_mark(ws, w)
+            rem.suspend(self.ws, "the app is quitting")  # after the capture's check, before the kill
+        with patch.object(sup, "mark_relogin_down", side_effect=quit_while_marking):
+            _, out = self.sweep()
+        self.assertEqual(out["recoveries"][mars]["outcome"], rem.SUSPENDED)
+        self.assertIn(self.seat(mars), self.alive, "the last check before the kill held")
+        rem.resume(self.ws, REPO, runner=self.runner, spawn=self.spawn)
+        self.sweep()
+        self.assertFalse(sup.load_state(self.ws).workers[mars].relogin_down, "seen alive, the mark is gone")
+
+    def test_a_restart_whose_capture_fails_is_done_by_a_healthy_later_sweep(self):
+        mars = next(iter(self.WORKERS))
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+        real_runner, real_restart, restarting = self.runner, rem.restart_on_new_login, []
+
+        def capture_times_out(argv, **kw):
+            if restarting and "capture-pane" in argv:
+                raise subprocess.TimeoutExpired(argv, 10)
+            return real_runner(argv, **kw)
+
+        def restart(*a, **kw):
+            restarting.append(1)
+            return real_restart(*a, **kw)
+        self.runner = capture_times_out
+        with patch.object(rem, "restart_on_new_login", side_effect=restart):
+            _, out = self.sweep()
+        self.assertEqual(out["recoveries"][mars]["outcome"], rem.INDETERMINATE)
+        self.assertEqual(sup.load_state(self.ws).workers[mars].limit_account, A, "the old binding stands")
+        self.runner = real_runner
+        self.assertEqual(self.sweep_until(mars)[1]["outcome"], rem.RECOVERED, "the next healthy sweep restarts it")
+
+    def test_a_down_note_that_could_not_be_queued_is_written_on_the_next_try(self):
+        mars = next(iter(self.WORKERS))
+        self.owe(mars, "task-owed-9")
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+
+        def never(workspace, repo, **kw):
+            raise rem.sw.SpawnRefused("its folder is gone")
+        self.spawn = never
+        real_tell, failed = rem.tell_owner, []
+
+        def first_failure_note_fails(workspace, prefix, text):
+            if prefix == "pool-new-login-failed" and not failed:
+                failed.append(text)
+                raise OSError("results is full")
+            return real_tell(workspace, prefix, text)
+        with patch.object(rem, "tell_owner", side_effect=first_failure_note_fails):
+            for _ in range(30):
+                self.sweep()
+        self.assertEqual(len(failed), 1)
+        down = [n for n in self.notes() if "not coming back" in n]
+        self.assertEqual(len(down), 1, f"told once, after the failed write: {self.notes()}")
+        self.assertIn("pool_manage.py stop Mars --force", down[0], "the flag a seat that owes work needs")
+        self.assertIn("pool_manage.py retire Mars --hand-off", down[0])
+        self.assertTrue(sup.load_state(self.ws).workers[mars].relogin_down_told)
+
+    def test_a_down_seat_retried_with_the_account_unreadable_gets_no_new_opener(self):
+        mars = next(iter(self.WORKERS))
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+
+        def never(workspace, repo, **kw):
+            raise rem.sw.SpawnRefused("broken CLI")
+        self.spawn = never
+        self.sweep()
+        self.account = None  # the config cannot be read for the rest of the run
+        for _ in range(48):
+            self.sweep()
+        openers = [n for n in self.notes() if "I'm back on a new login" in n]
+        self.assertEqual(len(openers), 1, "retrying a seat already down says nothing again")
+
+    def test_a_sign_in_that_cannot_be_recorded_never_aborts_the_sweep(self):
+        mars, baxter = list(self.WORKERS)
+        for w in (mars, baxter):
+            self.show(w, PARKED)
+        self.sweep()
+        self.account = B
+        with patch.object(sup, "announce_relogin", side_effect=OSError("read-only")):
+            rc, out = self.sweep()
+        self.assertEqual({w: r["outcome"] for w, r in out["recoveries"].items()},
+                         {mars: rem.RECOVERED, baxter: rem.RECOVERED})
+
     def test_a_take_down_that_breaks_after_the_kill_still_comes_back(self):
         mars = next(iter(self.WORKERS))
         self.show(mars, PARKED)

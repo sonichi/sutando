@@ -487,11 +487,16 @@ def restart_on_new_login(workspace, repo, worker_id, *, runner=None, spawn=None)
     if capture.returncode != 0 or not sup.pane_gate.limit_holds(capture.stdout, sup.pane_gate.CLAUDE):
         return {"worker_id": worker_id, "outcome": "pane-changed",
                 "why": "it was busy again, so it was left as it is"}
+    # The capture can take seconds: a pool suspension written meanwhile still protects the seat.
+    if suspension(workspace):
+        return {"worker_id": worker_id, "outcome": SUSPENDED}
     try:
         sup.mark_relogin_down(workspace, worker_id)
     except Exception as e:  # noqa: BLE001 - unmarked, a killed seat could be stranded: never kill it
         return {"worker_id": worker_id, "outcome": FAILED,
                 "why": f"its down mark could not be saved ({type(e).__name__}), so it was left running"}
+    if suspension(workspace):  # the last moment before the kill; the mark clears when it is seen alive
+        return {"worker_id": worker_id, "outcome": SUSPENDED}
     try:
         down = _sibling("pool_manage").take_down_held(workspace, worker_id, run, end_reason="crashed")
     except Exception as e:  # noqa: BLE001 - the seat is unpaused below, whatever the take-down raised
@@ -524,22 +529,26 @@ def _try_owner(workspace, prefix: str, text: str):
         return None
 
 
-def _left_for(workspace, worker_id, runner=None) -> str | None:
-    """What happens next to a seat that did not come back, for the owner's note; None when the owner
-    was already told it is down (each later failed try stays silent)."""
+def _left_for(workspace, worker_id, runner=None) -> tuple[str | None, bool]:
+    """(what happens next to a seat that did not come back, for the owner's note; whether this is
+    the one note that the seat is down). None when the owner was already told it is down: each
+    later failed try stays silent. The caller marks it told only once the note is queued."""
     ev = sup.load_state(workspace).workers.get(worker_id, ps.WorkerEvidence())
-    label = _label(workspace, worker_id)
+    label = shlex.quote(_label(workspace, worker_id))
     if ev.relogin_down and sup.probe_session(workspace, worker_id, runner=runner or subprocess.run) is False:
         if ev.relogin_down_told:
-            return None
-        sup.tell_relogin_down(workspace, worker_id)
+            return None, False
+        # A seat parked on a limit usually owes work, and then stop and retire each need their flag.
+        owes = sup.work_outstanding(workspace, worker_id) is not False
+        stop, retire = (f"stop {label} --force", f"retire {label} --hand-off") if owes else (
+            f"stop {label}", f"retire {label}")
         return ("it is down and not coming back on its own. I'll keep trying to start it about once an "
-                f"hour without writing again; to stop that, stop it (pool_manage.py stop {label}) or retire "
-                f"it (pool_manage.py retire {label}), or fix what stops it starting (its folder, its CLI) "
-                "and the next try starts it")
+                f"hour without writing again; to stop that, stop it (pool_manage.py {stop}) or retire "
+                f"it (pool_manage.py {retire}), or fix what stops it starting (its folder, its CLI) "
+                "and the next try starts it"), True
     if ev.relogin_attempts >= ps.RELOGIN_MAX_ATTEMPTS:
-        return f"no more automatic tries; restart it with: pool_manage.py reseat {label}"
-    return "I'll try again on a later sweep"
+        return f"no more automatic tries; restart it with: pool_manage.py reseat {label}", False
+    return "I'll try again on a later sweep", False
 
 
 def restart_new_logins(workspace, repo, worker_ids, *, runner=None, spawn=None) -> dict:
@@ -551,33 +560,56 @@ def restart_new_logins(workspace, repo, worker_ids, *, runner=None, spawn=None) 
     names = [_label(workspace, w) for w in worker_ids]
     n = len(names)
     account = sup.current_account()
-    if sup.relogin_announced(workspace) != account or account is None:
+    state = sup.load_state(workspace)
+    # A seat already down from an earlier try was announced then: retrying only those says nothing
+    # again, also when the account cannot be read (the opener would otherwise repeat each retry).
+    parked = [w for w in worker_ids if not state.workers.get(w, ps.WorkerEvidence()).relogin_down]
+    if parked and (state.relogin_announced != account or account is None):
         if _try_owner(workspace, "pool-new-login",
                       f"I'm back on a new login; restarting {n} worker{'s' if n != 1 else ''} parked on the old "
                       f"limit: {', '.join(names)}.") is None:
             return {w: {"worker_id": w, "outcome": "note-failed",
                         "why": "the owner's note could not be queued; nothing was restarted"} for w in worker_ids}
-        sup.announce_relogin(workspace, account)
+        try:
+            sup.announce_relogin(workspace, account)
+        except Exception as e:  # noqa: BLE001 - the opener went out; at worst a later sign-in repeats it
+            print(f"pool_remedy: the new login could not be recorded ({type(e).__name__}: {e})", file=sys.stderr)
     done = {}
     for w in worker_ids:
         try:
             done[w] = restart_on_new_login(workspace, repo, w, runner=runner, spawn=spawn)
         except Exception as e:  # noqa: BLE001 - one seat's error never stops the others or the note
             done[w] = {"worker_id": w, "outcome": FAILED, "why": f"an unexpected error ({type(e).__name__}: {e})"}
+        if done[w]["outcome"] == SUSPENDED and "taken_down" not in done[w]:
+            try:  # skipped before any kill: the try is not spent, so the cap still allows it later
+                sup.release_relogin_try(workspace, w)
+            except Exception as e:  # noqa: BLE001 - at worst the skipped try counts
+                print(f"pool_remedy: {w}'s skipped try could not be released ({type(e).__name__}: {e})",
+                      file=sys.stderr)
     back = [w for w, r in done.items() if r["outcome"] == RECOVERED]
-    left = []
+    left, telling = [], []
     for w, r in done.items():
         if r["outcome"] == RECOVERED:
             continue
         try:
-            next_step = _left_for(workspace, w, runner)
+            next_step, down_note = _left_for(workspace, w, runner)
         except Exception:  # noqa: BLE001 - the note still goes out
-            next_step = "I'll try again on a later sweep"
+            next_step, down_note = "I'll try again on a later sweep", False
         if next_step is not None:
             left.append(f"{_label(workspace, w)} ({r.get('why') or r['outcome']}; {next_step})")
+        if down_note:
+            telling.append(w)
     if left:
         rest = " The rest are back." if back else ""
-        _try_owner(workspace, "pool-new-login-failed", f"Not restarted on the new login: {'; '.join(left)}.{rest}")
+        queued = _try_owner(workspace, "pool-new-login-failed",
+                            f"Not restarted on the new login: {'; '.join(left)}.{rest}")
+        # Told only once the note is queued: a note that failed is written again on the next try.
+        for w in telling if queued is not None else []:
+            try:
+                sup.tell_relogin_down(workspace, w)
+            except Exception as e:  # noqa: BLE001 - unrecorded, the owner is told again next try
+                print(f"pool_remedy: {w}'s down note could not be recorded ({type(e).__name__}: {e})",
+                      file=sys.stderr)
     return done
 
 

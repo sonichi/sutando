@@ -237,6 +237,14 @@ def mark_relogin_down(state: SupervisionState, worker_id: str) -> SupervisionSta
     return replace(state, workers=workers)
 
 
+def release_relogin_try(state: SupervisionState, worker_id: str) -> SupervisionState:
+    """A restart the pool's suspension skipped before any kill: it does not count as a try."""
+    ev = state.workers.get(worker_id, WorkerEvidence())
+    workers = dict(state.workers)
+    workers[worker_id] = replace(ev, relogin_attempts=max(0, ev.relogin_attempts - 1), relogin_next_at=None)
+    return replace(state, workers=workers)
+
+
 def tell_relogin_down(state: SupervisionState, worker_id: str) -> SupervisionState:
     """The owner was told this down seat is not coming back; its later failed tries stay silent."""
     ev = state.workers.get(worker_id, WorkerEvidence())

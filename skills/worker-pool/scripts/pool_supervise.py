@@ -508,6 +508,11 @@ def mark_relogin_down(workspace, worker_id) -> None:
     save_state(workspace, ps.mark_relogin_down(load_state(workspace), worker_id))
 
 
+def release_relogin_try(workspace, worker_id) -> None:
+    """Persist that a suspension skipped this seat's restart before any kill (pool_supervision)."""
+    save_state(workspace, ps.release_relogin_try(load_state(workspace), worker_id))
+
+
 def tell_relogin_down(workspace, worker_id) -> None:
     """Persist that the owner was told `worker_id` is down and not coming back (pool_supervision)."""
     save_state(workspace, ps.tell_relogin_down(load_state(workspace), worker_id))

@@ -371,7 +371,7 @@ the limit alone (a turn started).
 A seat this rule kills always comes back. It is marked `relogin_down` before its
 take-down, and the take-down closes its runs `crashed`, not `killed` (the owner's
 stop), so supervision still reads a dead seat as dead. A seat that is down and
-`relogin_down` is started again by every later sweep, with no cap and a backoff that
+`relogin_down` is started again by every later sweep its backoff allows, with no cap and a backoff that
 doubles up to `RELOGIN_DOWN_MAX_RETRY_S`, resuming its own session and keeping its
 owed deliveries, until a start is confirmed; seen alive, the mark clears. That covers
 a spawn failing after the kill, a take-down raising after it, and a suspension landing
@@ -382,8 +382,12 @@ again at most `RELOGIN_MAX_ATTEMPTS` times with a doubling `RELOGIN_RETRY_S` bac
 a sign-in to a third account starts that count again. The pause the take-down takes is
 always lifted. A second line goes to the owner only for seats that did not come back,
 saying whether another try follows; a seat that is down is named there once, with the
-way out (stop or retire it, or fix its folder or CLI), and its later failed tries stay
-silent (`relogin_down_told`). One seat's unexpected error never stops the others or
+way out (stop or retire it, adding `--force` / `--hand-off` when it owes work, as a
+parked seat usually does, or fix its folder or CLI), and its later failed tries stay
+silent (`relogin_down_told`, set only once that note is queued, so a note that could not
+be written goes out on the next try). The dead-seat ladder also sees such a seat and
+escalates it once, a separate signal. A pool suspension is read again after the pane
+capture and once more right before the kill; a restart it skips spends no try. One seat's unexpected error never stops the others or
 the note, and a down mark that cannot be saved leaves the seat running: it is never
 taken down unmarked. A note that cannot be queued restarts nothing that
 sweep and never aborts it. The same account keeps waiting for the reset, an unreadable
