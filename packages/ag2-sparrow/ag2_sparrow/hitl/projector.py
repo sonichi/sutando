@@ -18,9 +18,9 @@ import time
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 try:
-    from ..owner_text import FOLDED, fallback_text, named, redact   # the vendored package layout
+    from ..owner_text import FOLDED, fallback_text, named, redact, redact_deep   # the vendored layout
 except ImportError:
-    from owner_text import FOLDED, fallback_text, named, redact     # the repo's src/ on sys.path
+    from owner_text import FOLDED, fallback_text, named, redact, redact_deep     # src/ on sys.path
 
 from . import renotify
 from .manager import HitlManager
@@ -97,14 +97,14 @@ def fallback_body(req: HumanRequirement) -> str:
 
 def card_wire(req: HumanRequirement) -> Dict:
     """The card as sent: `to_wire()` with key-like fragments redacted from the text a person
-    reads (the message, the title, the tool-input summary). Ids a tool needs are left as they are."""
+    reads: the message, the title, and every string of the subject it shows (the tool-input
+    summary, the options). Ids a tool needs are left as they are."""
     wire = req.to_wire()
     for key in ("message", "title"):
         if isinstance(wire.get(key), str):
             wire[key] = redact(wire[key])
-    subject = wire.get("subject")
-    if isinstance(subject, dict) and isinstance(subject.get("input"), str):
-        wire["subject"] = {**subject, "input": redact(subject["input"])}
+    if "subject" in wire:
+        wire["subject"] = redact_deep(wire["subject"])
     return wire
 
 

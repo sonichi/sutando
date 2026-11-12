@@ -57,6 +57,30 @@ class Redaction(unittest.TestCase):
         self.assertEqual(owner_text.redact("api_key=sk-proj-" + "a" * 40), "api_key=[redacted]")
         self.assertEqual(owner_text.redact("AKIA" + "A" * 16), "[REDACTED-AWS Access Key]")
 
+    def test_a_secret_assigned_with_spaces_a_colon_or_quotes_is_redacted(self):
+        for text in ("API_KEY = hunter2secret", "api_key: hunter2secret", 'password="hunter2secret"',
+                     "AUTH_TOKEN='hunter2secret'", "client_secret : hunter2secret"):
+            self.assertNotIn("hunter2secret", owner_text.redact(text), text)
+        for text in ("the key: is missing", "monkey business", "a secret plan"):
+            self.assertEqual(owner_text.redact(text), text)
+        self.assertEqual(owner_text.redact_deep({"a": [f"x {KEY}", 3], "b": None}), {"a": ["x [redacted]", 3], "b": None})
+
+    def test_a_line_loses_its_internal_tokens_and_keeps_its_meaning(self):
+        table = {
+            f"Commit {HEX[:9]} failed CI": "Commit failed CI",
+            f"worker Reviewer ({HEX[:8]}…) (tmux session {SESSION}) owes work": "Worker Reviewer owes work",
+            "task-fcc45a4ac1 is waiting on you": "A task is waiting on you",
+            f"The file {SOCKET} is stale": "The file is stale",
+            "Run python3 src/x.py recover now": "Run a command",
+            f"Auth failed for {KEY} on retry": "Auth failed for [redacted] on retry",
+            "Reviewer is signed out.": "Reviewer is signed out.",
+        }
+        for given, want in table.items():
+            self.assertEqual(owner_text.owner_line(given), want, given)
+            self.assertEqual(owner_text.internals(owner_text.owner_line(given)), [], given)
+        for nothing_left in ("sutando-core · blocked-human", "hitl_ab12cd34ef56", HEX, ""):
+            self.assertEqual(owner_text.owner_line(nothing_left), owner_text.GENERIC_LINE, nothing_left)
+
     def test_ordinary_text_and_none_are_untouched(self):
         for text in ("Reviewer has a task that wasn't delivered for 15 minutes.", "risk-free task", "key=ab"):
             self.assertEqual(owner_text.redact(text), text)
@@ -188,10 +212,10 @@ class BlockedCard(unittest.TestCase):
             self.assertIsNone(ciw._limit_reset("resets 3pm", now))
         self.assertEqual(tui_gate.blocked_title(SESSION, limit=True), "Your agent has reached its usage limit")
 
-    def test_a_queued_count_stays_below_the_first_line(self):
+    def test_a_queued_count_is_on_the_first_line_where_a_card_never_folds_it(self):
         req = self.raised(queued=2)
-        self.assertNotIn("queued", req.message.splitlines()[0])
-        self.assertIn("2 queued task(s)", req.message)
+        self.assertIn("2 queued task(s) are waiting behind this", req.message.splitlines()[0])
+        self.assertIn("State: blocked-human", req.message.partition("\n\n")[2])
 
     def test_a_card_with_buttons_keeps_its_question_whole_for_a_text_reader(self):
         req = self.raised(kind="selection", prompt="Pick one:\n❯ 1. Stop and wait\n  2. Switch\n")
@@ -223,7 +247,10 @@ class Notices(unittest.TestCase):
             self.assertIn("2 tasks are waiting", body)
         self.assertIn("Reviewer has a task that wasn't delivered for 15 minutes",
                       renotify.body(renotify.REMINDER, self.NEW, T0 + 31 * 60))
-        self.assertIn(owner_text.GENERIC_LINE, renotify.body(renotify.REMINDER, self.OLD, T0 + 31 * 60))
+        self.assertIn("Worker Reviewer owes work", renotify.body(renotify.REMINDER, self.OLD, T0 + 31 * 60),
+                      "the ids go, the meaning stays")
+        bare = blocked("", title="sutando-core · blocked-human")
+        self.assertIn(owner_text.GENERIC_LINE, renotify.body(renotify.REMINDER, bare, T0 + 31 * 60))
 
     def test_a_recovery_says_what_cleared_in_the_cards_own_words(self):
         self.assertEqual(renotify.body(renotify.RECOVERY, self.NEW, T0),
@@ -296,6 +323,9 @@ class Projection(unittest.TestCase):
         self.assertEqual(wire["subject"]["tool"], "Bash")
         self.assertEqual(req.subject["input"], command, "the stored requirement is untouched")
         self.assertEqual(card_wire(blocked("m", subject={"options": ["a"]}))["subject"], {"options": ["a"]})
+        shown = card_wire(blocked("m", subject={"options": [f"Use {KEY}", "Skip"], "choices": {"a": f"token={KEY}"}}))
+        self.assertEqual(shown["subject"]["options"], ["Use [redacted]", "Skip"])
+        self.assertNotIn(KEY, str(shown["subject"]["choices"]))
 
     def test_a_reminder_goes_out_redacted_and_tagged_with_its_cards(self):
         req = self.mgr.create(blocked(f"Reviewer cannot use the key {KEY}", "Reviewer is stuck"))

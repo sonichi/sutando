@@ -36,7 +36,8 @@ GENERIC_LINE = "An agent needs your attention"
 
 _SK = re.compile(r"\bsk-[A-Za-z0-9_-]{6,}")
 _BEARER = re.compile(r"\b(Bearer)\s+[A-Za-z0-9._~+/=-]{8,}", re.I)
-_KEY_VALUE = re.compile(r"\b([A-Za-z0-9_-]*(?:key|token|secret|password))=(?!\[)[^\s,;&'\"]{6,}", re.I)
+_KEY_VALUE = re.compile(r"\b([A-Za-z0-9_-]*(?:key|token|secret|password|passwd))(\s*[=:]\s*)([\"']?)(?!\[)"
+                        r"[^\s,;&'\"]{4,}\3", re.I)
 
 _BRACKETED = re.compile(r"\s*\([^()]*\)")
 
@@ -51,11 +52,22 @@ _INTERNAL_SHAPES = (
 )
 
 
+def redact_deep(value: object) -> object:
+    """`value` with every string in it redacted, through lists and mappings; keys are kept."""
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, dict):
+        return {k: redact_deep(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_deep(v) for v in value]
+    return value
+
+
 def redact(text: object) -> str:
     """`text` with every key-like fragment replaced."""
     out = redact_known_patterns(_SK.sub(REDACTED, "" if text is None else str(text)))
     out = _BEARER.sub(lambda m: f"{m.group(1)} {REDACTED}", out)
-    return _KEY_VALUE.sub(lambda m: f"{m.group(1)}={REDACTED}", out)
+    return _KEY_VALUE.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", out)
 
 
 def headline(text: object) -> str:
@@ -82,11 +94,39 @@ def fallback_text(message: object, folded: bool) -> str:
     return owner_line(message) if folded else redact(message)
 
 
+# What stands in for each internal shape in a line a person reads; "" drops the token.
+_STAND_INS = {"record-id": "a task", "hex-id": "", "session": "", "path": "", "state-code": "",
+              "command": "a command", "key": REDACTED}
+_COMMAND_RUN = re.compile(r"\b(?:python3|launchctl|bash)\s+\S.*$")
+_LEFTOVERS = re.compile(r"\(\s*\)|`\s*`|\s+(?=[.,;:!?])|(?<=\s)[·—–-]\s*(?=[·—–-]|$)|^\s*[·—–:-]+\s*")
+_MEANING = re.compile(r"[A-Za-z]{3,}")
+
+
+def without_internals(text: object) -> str:
+    """`text` with each internal token replaced by a neutral word or dropped, the rest kept:
+    "Commit d698b19d7 failed CI" is "Commit failed CI"."""
+    given = redact(text)
+    if not internals(given):
+        return " ".join(given.split())
+    out = _BRACKETED.sub(lambda m: "" if internals(m.group(0)) else m.group(0), given)
+    out = _COMMAND_RUN.sub(_STAND_INS["command"], out)
+    shapes = dict(_INTERNAL_SHAPES)
+    for name in _STAND_INS:
+        if name != "command":
+            shape = shapes[name]
+            out = shape.sub(lambda m, word=_STAND_INS[name]: (m.group(0)[:1] if m.group(0)[:1].isspace() else "")
+                            + word, out)
+    out = " ".join(out.split())
+    for _ in range(3):
+        out = " ".join(_LEFTOVERS.sub("", out).split())
+    return out[:1].upper() + out[1:]
+
+
 def owner_line(text: object, fallback: str = GENERIC_LINE) -> str:
-    """The one line of `text` a notification or a text-only client shows: its first line,
-    redacted, or `fallback` when that line still names an internal."""
-    line = redact(headline(text))
-    return line if line and not internals(line) else fallback
+    """The one line of `text` a notification or a text-only client shows: its first line with
+    each internal token taken out; `fallback` only when too little is left to mean anything."""
+    line = without_internals(headline(text))
+    return line if len(_MEANING.findall(line)) >= 2 and not internals(line) else fallback
 
 
 def clock(epoch: float, now: Optional[float] = None) -> str:

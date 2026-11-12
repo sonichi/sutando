@@ -813,7 +813,9 @@ def escalate(manager, state, detail, kind, prompt, session, seat=None, queued=0,
                                        runtime=runtime,
                                        episode=tui_gate.LIMIT_EPISODE if limit else None, name=name)
         if queued:
-            req.message = f"{req.message}\n\n{core_gate_notice.card_line(queued)}"
+            # On the first line, which a card never folds: the owner sees what is held up.
+            head, sep, rest = req.message.partition("\n")
+            req.message = f"{head} {core_gate_notice.card_line(queued)}{sep}{rest}"
         if seat:
             req = _name_seat(req, session, seat, name)
         return manager.create(req)

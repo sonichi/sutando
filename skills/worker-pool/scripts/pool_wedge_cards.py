@@ -78,8 +78,13 @@ def manager_for(workspace):
 
 def seat_label(workspace, worker_id) -> str:
     row = sup.supervised_workers(workspace).get(worker_id) or {}
+    workers = sup.supervised_workers(workspace)
     label = sup.pr.display_label(row, worker_id)
-    return owner_text.named(None if label == worker_id else label, UNNAMED_SEAT)
+    if label != worker_id:
+        return owner_text.named(label, UNNAMED_SEAT)
+    # Several workers with no name are told apart by their order, never by an id.
+    unnamed = sorted(w for w, r in workers.items() if sup.pr.display_label(r, w) == w)
+    return UNNAMED_SEAT if len(unnamed) < 2 or worker_id not in unnamed else f"Worker {unnamed.index(worker_id) + 1}"
 
 
 def cause_words(names, lines=()) -> str:

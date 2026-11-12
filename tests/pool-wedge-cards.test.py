@@ -583,6 +583,12 @@ class CardsReadPlainly(unittest.TestCase):
         del data["workers"][WID]["label"]
         roster.write_text(json.dumps(data))
         self.assertEqual(wc.seat_label(ws, WID), "A worker")
+        data["workers"]["0aaa" + WID[4:]] = {"state": "live"}
+        roster.write_text(json.dumps(data))
+        with patch.object(sup, "supervised_workers", return_value=data["workers"]):
+            names = [wc.seat_label(ws, w) for w in sorted(data["workers"])]
+        self.assertEqual(names, ["Worker 1", "Worker 2"], "two unnamed workers are told apart, never by id")
+        roster.write_text(json.dumps({"workers": {WID: {"state": "live"}}}))
         out = wc.raise_card(ws, WID, FROZEN, runner=Tmux(PANES["frozen"]), manager=manager(ws))
         self.assertTrue(first_line(manager(ws).get(out["hitl_id"])).startswith("A worker has work waiting"))
 
