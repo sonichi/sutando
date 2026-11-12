@@ -466,6 +466,17 @@ and loads whichever repo it reviews.
     Cheap form: for each side effect in a newly-async continuation, name the state it
     depends on and check the continuation re-reads it rather than closing over it.
 
+22. **Apply the agent-native design rules to anything a person or an agent can do or read.**
+    The rules and the full checklist are in
+    [`docs/agent-native-design-rules.md`](docs/agent-native-design-rules.md); they are not
+    repeated here. Block on any of these: owner-facing text that tells the owner to do a
+    known action in prose ("reply yes", "open this link", "go to Settings", "run this
+    command") instead of sending a card; a card that reports its outcome in a follow-up
+    message instead of updating in place, or has no plain-text fallback; raw ids, session
+    names, provider errors or key fragments in owner-facing text; a click acted on without
+    the shared check, or a second copy of that check; a capability a person has that an
+    agent cannot reach through an Action, with no reason given.
+
 ## Checks (machine-readable — consumed by scripts/review-checks.sh)
 
 ```yaml

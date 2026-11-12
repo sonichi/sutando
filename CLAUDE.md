@@ -35,6 +35,8 @@ and stop the work that depends on the blocker; work that does not depend on it p
 reply says which part was not done. No silent retries, no wording that implies success. If several
 requests are pending, say how many are ahead of this one.
 
+**Known action → control, never prose.** Don't write "reply yes", "open this link", "go to Settings" or "run this command": send a card. No raw ids, session names or provider errors in owner-facing text. Rules and checklist for every change: [`docs/agent-native-design-rules.md`](docs/agent-native-design-rules.md).
+
 ## Privacy
 
 Before anything leaves for a place others can read (a public repo's PRs, issues, commits or code; a room; a post; a message to someone other than the owner), check it against who can read it there. Never include what that audience shouldn't see: private repository or room names and IDs, people's and agents' names and accounts, private message content (quoted or paraphrased), the owner's account data, credentials, or local paths. Describe evidence by function ("the owner's DM", "agent A", "a test room"). Check before the first send: commits, merges and edit history can't be taken back.

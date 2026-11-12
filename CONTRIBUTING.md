@@ -93,6 +93,14 @@ In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so th
 - What changed, and why?
 - What files / sections should reviewers look at first?
 - What user behavior or bug does this prove?
+- **Agent-native design rules.** If the PR adds or changes something a person or an agent
+  can do, a card, a setting, or any text the owner reads, answer the checklist in
+  [`docs/agent-native-design-rules.md`](docs/agent-native-design-rules.md). In short: a
+  capability a person has is reachable by an agent through an Action, or the PR says why not;
+  no text tells the owner to do a known action ("reply yes", "open this link", "go to
+  Settings", "run this command") — it is a card; the card shows its outcome in place and
+  carries a plain-text fallback; no raw ids, session names, provider errors or secrets in
+  owner-facing text; the click check is the shared one.
 - **Feature/documentation consistency.** If the PR adds, changes, or removes a
   user-visible feature, capability, or behavior, update the corresponding
   canonical document under `docs/` in the same PR. Use `docs/catalog.json` to
