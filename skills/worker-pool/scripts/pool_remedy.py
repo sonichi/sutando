@@ -417,8 +417,11 @@ def retry_limit(workspace, repo, worker_id, *, runner=None):
                       capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return {"worker_id": worker_id, "outcome": "capture-failed"}
+    # The footer form ("Usage limit reached · Continuing automatically at …") reads as a gate, not
+    # PANE_LIMIT; a pane that waits on the limit and nothing else (limit_holds) is the same wait.
     if (capture.returncode != 0
-            or sup.classify_pane_text(capture.stdout, runtime) != ps.PANE_LIMIT
+            or (sup.classify_pane_text(capture.stdout, runtime) != ps.PANE_LIMIT
+                and not sup.pane_gate.limit_holds(capture.stdout, sup.pane_gate.CLAUDE))
             or sup.pane_gate.pending_text(capture.stdout, sup.pane_gate.CLAUDE) != ""):
         return {"worker_id": worker_id, "outcome": "pane-changed-or-pending"}
     ask = _sibling("pool_ask")
@@ -444,6 +447,64 @@ def retry_limit(workspace, repo, worker_id, *, runner=None):
             "task_id": task_id, "send_code": sent.code}
 
 
+def _label(workspace, worker_id) -> str:
+    row = (sw.pr.load_roster(workspace) or {}).get("workers", {}).get(worker_id, {})
+    return str(row.get("label") or worker_id[:8])
+
+
+def tell_owner(workspace, prefix: str, text: str) -> str:
+    """Queue one line to the owner's DM (the proactive path; no card). The file name it was queued as."""
+    from local_record import new_name, write_text_whole
+    from proactive_routing import proactive_filename
+    return write_text_whole(Path(workspace) / "results" / proactive_filename(new_name(prefix), None),
+                            f"[dm-only]\n{text}\n").name
+
+
+def restart_on_new_login(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
+    """Restart a seat parked on the old account's limit, under the sweep's lock: re-read its pane
+    first and leave it alone unless it still waits on that limit and nothing else (a turn that
+    started since the tick is never interrupted), then take it down and resume its session.
+    Its owed deliveries stay its own: `recover` re-offers what a killed turn left mid-work."""
+    run = runner or subprocess.run
+    socket, session = sup._open_tmux(workspace, worker_id)
+    if not socket:
+        return {"worker_id": worker_id, "outcome": NO_SESSION}
+    try:
+        capture = run(["tmux", "-S", str(socket), "capture-pane", "-e", "-p", "-J", "-t", session],
+                      capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return {"worker_id": worker_id, "outcome": INDETERMINATE, "why": "capture failed"}
+    if capture.returncode != 0 or not sup.pane_gate.limit_holds(capture.stdout, sup.pane_gate.CLAUDE):
+        return {"worker_id": worker_id, "outcome": "pane-changed",
+                "why": "the seat no longer waits on the limit alone; left as it is"}
+    down = _sibling("pool_manage").take_down_held(workspace, worker_id, run)
+    sup.set_paused(workspace, worker_id, False)
+    if not down["down"]:
+        return {"worker_id": worker_id, "outcome": FAILED, "sessions": down["sessions"],
+                "why": "tmux could not confirm the parked seat gone"}
+    return {**recover(workspace, repo, worker_id, runner=runner, spawn=spawn),
+            "taken_down": down["sessions"]}
+
+
+def restart_new_logins(workspace, repo, worker_ids, *, runner=None, spawn=None) -> dict:
+    """The owner signed in again: say which seats restart, restart them without waiting for an
+    answer, and say so again only for the ones that failed."""
+    if not worker_ids:
+        return {}
+    names = [_label(workspace, w) for w in worker_ids]
+    n = len(names)
+    tell_owner(workspace, "pool-new-login",
+               f"I'm back on a new login; restarting {n} worker{'s' if n != 1 else ''} parked on the old "
+               f"limit: {', '.join(names)}.")
+    done = {w: restart_on_new_login(workspace, repo, w, runner=runner, spawn=spawn) for w in worker_ids}
+    failed = [f"{_label(workspace, w)} ({r.get('why') or r['outcome']})" for w, r in done.items()
+              if r["outcome"] not in (RECOVERED, "pane-changed")]
+    if failed:
+        tell_owner(workspace, "pool-new-login-failed",
+                   f"Could not restart on the new login: {'; '.join(failed)}. The rest are back.")
+    return done
+
+
 def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
     """Act on a tick's decisions. `recover` resumes the session; `rearm_watcher`
     ensures the inbox's supervisor, whose standby arms once no session watcher
@@ -454,6 +515,8 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
     done = {}
     rearms = {}
     cards = {}
+    new_logins = [] if suspension(workspace) else \
+        [w for w, d in decisions.items() if d == ps.RESTART_NEW_LOGIN and not sup.is_paused(workspace, w)]
     for worker_id, decision in decisions.items():
         # Re-read per action: an app quit can land mid-sweep, just before its tmux kill-server.
         if decision != ps.ESCALATE and suspension(workspace):
@@ -475,6 +538,7 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
             rearms[worker_id] = ensure_supervisor(workspace, repo, worker_id,
                                                   runner=runner)
     sup.acknowledge_cards(workspace, [w for w, r in cards.items() if r.get("outcome") == "carded"])
+    done.update(restart_new_logins(workspace, repo, new_logins, runner=runner, spawn=spawn))
     return {"recoveries": done,
             "rearms": rearms,
             "cards": cards,

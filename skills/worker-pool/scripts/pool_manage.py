@@ -123,11 +123,17 @@ def _take_down(workspace, wid, runner) -> dict:
     """Pause, kill, close the run. The pause lands under the remedy's lock first, so a
     sweep in flight cannot restart what is being stopped."""
     with rem.pool_lock(workspace, STOP_LOCK_WAIT_S):
-        sup.set_paused(workspace, wid, True)
-        sessions = stop_sessions(workspace, wid, runner=runner)
-        down = all(v != "unknown" for v in sessions.values())
-        # A seat tmux could not confirm gone keeps its run open, so supervision still sees it.
-        closed = rem.close_dead_runs(workspace, wid, end_reason="killed") if down else []
+        return take_down_held(workspace, wid, runner)
+
+
+def take_down_held(workspace, wid, runner) -> dict:
+    """`_take_down` for a caller that already holds the remedy's lock (a sweep acting on a decision).
+    Nothing owed is touched: the deliveries stay the worker's, for the seat that resumes."""
+    sup.set_paused(workspace, wid, True)
+    sessions = stop_sessions(workspace, wid, runner=runner)
+    down = all(v != "unknown" for v in sessions.values())
+    # A seat tmux could not confirm gone keeps its run open, so supervision still sees it.
+    closed = rem.close_dead_runs(workspace, wid, end_reason="killed") if down else []
     return {"sessions": sessions, "closed_runs": closed, "down": down}
 
 

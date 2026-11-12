@@ -354,6 +354,21 @@ turn in flight. With the same sustain and stale line, once per episode:
   owner presses it; the next tick then re-reads the pane and types one Escape only
   if it still shows the frame the card was raised for, and refuses otherwise.
 
+**A new login is the one exception to "never restarted"** (owner ask, 2026-11-11): a
+seat parked on a provider limit and nothing else (`pane_gate.limit_holds`: no turn
+running, an empty composer) has its limit bound to the account it was first seen
+under (`limit_account` in `state/pool-supervision.json`; `core_limit_hold`'s digest of
+`.claude.json`'s non-secret identity fields). While it stays parked and another known
+account is on disk, the wait is over: the sweep decides `restart_new_login`, sends one
+line to the owner's DM naming the seats, restarts each (re-reading its pane first and
+leaving it alone if a turn started; the take-down keeps its owed deliveries, and
+`recover` resumes its session and re-offers what was mid-work), and sends a second
+line only for a seat that failed. The same account keeps waiting for the reset, an
+unreadable account on either side decides nothing, a paused seat is left paused, and
+a Codex seat is out of scope. The core coming back (its limit hold released or
+cleared, its account switched at launch, or its own `/login` recovery) asks for one
+immediate sweep per event (`src/pool_sweep_trigger.py`); the policy stays in the sweep.
+
 An expired login is the exception to the work-owed and sustain requirements: its
 banner asks for a `/login` card immediately, even with an empty inbox. On upgrade,
 an acknowledgment saved before wedge kinds existed is rechecked for login only.

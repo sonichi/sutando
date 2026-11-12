@@ -38,6 +38,9 @@ LIVE, STALE, ABSENT, UNKNOWN = "live", "stale", "absent", "unknown"
 RETRY_LIMIT = "retry_limit"
 LIMIT_PROBE_S = 900.0
 LIMIT_MAX_ATTEMPTS = 4
+# A seat parked on a limit seen under one account, while another account is on disk now: the owner
+# signed in again, so its limit is over and the seat restarts on the new login (its owed work kept).
+RESTART_NEW_LOGIN = "restart_new_login"
 
 NOTHING, RECOVER, ESCALATE, REARM_WATCHER = "nothing", "recover", "escalate", "rearm_watcher"
 # A wedged live session's card: the cause named (abnormal text), a frozen turn
@@ -86,6 +89,10 @@ class Observation:
     limit_reset_at: float | None = None
     # The banner's own reset words: an unchanged banner keeps the deadline it first parsed to.
     limit_banner: str | None = None
+    # The pane waits on a provider limit and nothing else (pane_gate.limit_holds): no turn runs,
+    # the composer is empty. `account` is the account on disk at this tick (None: unread).
+    limit_parked: bool = False
+    account: str | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +118,8 @@ class WorkerEvidence:
     limit_exhausted: bool = False
     limit_banner: str | None = None
     limit_reset_at: float | None = None
+    # The account a parked seat's limit was first seen under; another one on disk ends the wait.
+    limit_account: str | None = None
 
 
 @dataclass(frozen=True)
@@ -161,6 +170,24 @@ def _wait_moved(obs: Observation, ev: WorkerEvidence) -> bool:
     (pane_gate.progress_id): the session progresses under a stale banner."""
     now, before = _wait_part(obs.pane_id), _wait_part(ev.last_pane_id)
     return bool(ev.wedge_kind == "human" and now and before and now != before)
+
+
+def _new_login(ev: WorkerEvidence, obs: Observation) -> tuple[WorkerEvidence, bool]:
+    """(evidence, restart): a parked seat's limit is bound to the account it was first seen
+    under; while it stays parked and another known account is on disk, the wait is over. A seat
+    that runs or idles again ends the episode. An unknown account on either side binds nothing
+    and ends nothing, so an unreadable config keeps the reset-time wait."""
+    if obs.session_alive is not True:
+        return ev, False
+    if not obs.limit_parked:
+        if ev.limit_account and obs.pane in (PANE_IDLE, PANE_WORKING):
+            ev = replace(ev, limit_account=None)
+        return ev, False
+    bound = ev.limit_account or obs.account
+    if bound and obs.account and obs.account != bound:
+        return replace(_cleared_wedge(ev), limit_account=obs.account, limit_next_at=None, limit_attempts=0,
+                       limit_exhausted=False, limit_banner=None, limit_reset_at=None), True
+    return (replace(ev, limit_account=bound) if bound != ev.limit_account else ev), False
 
 
 def _wedge_kind(obs: Observation, ev: WorkerEvidence) -> str | None:
@@ -337,6 +364,12 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
             continue
 
         ev = workers.get(worker_id, WorkerEvidence())
+
+        ev, restart = _new_login(ev, obs)
+        if restart:
+            workers[worker_id] = ev
+            decisions[worker_id] = RESTART_NEW_LOGIN
+            continue
 
         if obs.session_alive is True and obs.pane == PANE_LIMIT:
             ev = _cleared_wedge(ev)

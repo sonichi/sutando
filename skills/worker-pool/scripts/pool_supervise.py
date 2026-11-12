@@ -219,26 +219,59 @@ def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=N
     return ps.PANE_UNKNOWN
 
 
+class PaneReading(tuple):
+    """(pane kind, frame id, limit reset), and `parked`: the pane waits on a provider limit and
+    nothing else (pane_gate.limit_holds; the Claude seat's only, Codex is not restarted for it)."""
+
+    def __new__(cls, kind=None, frame=None, reset=None, parked=False):
+        reading = super().__new__(cls, (kind, frame, reset))
+        reading.parked = parked
+        return reading
+
+
 def observe_pane(workspace, worker_id, runtime: str = "claude", *,
-                 runner=subprocess.run, now=None) -> tuple[str | None, str | None, "pl.Reset | None"]:
+                 runner=subprocess.run, now=None) -> PaneReading:
     """(pane kind, frame id, limit reset); all None when unread."""
     socket, name = _open_tmux(workspace, worker_id)
     if not socket:
-        return None, None, None
+        return PaneReading()
     try:
         # -e as the notifier captures: both read the same bytes, so a dim placeholder is one verdict.
         done = runner(["tmux", "-S", str(socket), "capture-pane", "-e", "-p", "-t", f"={name}:0"],
                       capture_output=True, text=True, timeout=8)
     except (OSError, ValueError, subprocess.TimeoutExpired):
-        return None, None, None
+        return PaneReading()
     text = done.stdout if done.returncode == 0 else None
     if not text or not text.strip():
-        return None, None, None
+        return PaneReading()
     kind = classify_pane_text(text, runtime, workspace=workspace, socket=socket, session=name)
     if kind in (ps.PANE_ABNORMAL, ps.PANE_UNKNOWN):
         pane_gate.save_frame(workspace, name, kind, text)
-    return kind, frame_id(text), (pl.reset(plain_text(text), time.time() if now is None else now)
-                                  if kind == ps.PANE_LIMIT else None)
+    parked = runtime == "claude" and pane_gate.limit_holds(text, pane_gate.CLAUDE)
+    return PaneReading(kind, frame_id(text), (pl.reset(plain_text(text), time.time() if now is None else now)
+                                              if kind == ps.PANE_LIMIT else None), parked)
+
+
+class _Once:
+    """A reading taken at most once per tick, on first use."""
+
+    def __init__(self, read):
+        self._read, self._done, self._value = read, False, None
+
+    def __call__(self):
+        if not self._done:
+            self._value, self._done = self._read(), True
+        return self._value
+
+
+def current_account() -> str | None:
+    """The account on disk now in the config dir the seats launch with (core_limit_hold's reader:
+    a digest of non-secret identity fields, never a token); None when it cannot be read."""
+    try:
+        import core_limit_hold
+        return core_limit_hold.current_account()
+    except Exception:  # noqa: BLE001 - an unreadable account binds nothing and ends no wait
+        return None
 
 
 def plain_text(text: str) -> str:
@@ -284,6 +317,7 @@ def observe(workspace, now: float, *, worker_ids=None,
         rows = {w: rows[w] for w in worker_ids if w in rows}
     obs = {}
     blocks = {}
+    account = _Once(current_account)
     for wid, row in rows.items():
         session_alive = probe_session(workspace, wid, runner=runner)
         watcher_beat = pb.classify(pb.beat_path(workspace, "watcher", wid), now)
@@ -292,9 +326,10 @@ def observe(workspace, now: float, *, worker_ids=None,
         held = None
         if session_alive is True and watcher_beat != pb.LIVE:
             held = session_watcher_holds(workspace, wid, runner=runner)
-        pane, pane_id, reset = (observe_pane(workspace, wid, row.get("runtime") or "claude",
-                                      runner=runner, now=now)
-                         if session_alive is True else (None, None, None))
+        reading = (observe_pane(workspace, wid, row.get("runtime") or "claude", runner=runner, now=now)
+                   if session_alive is True else PaneReading())
+        pane, pane_id, reset = reading
+        parked = getattr(reading, "parked", False)
         socket = _open_tmux(workspace, wid)[0] if session_alive is True else None
         if socket and socket not in blocks:
             blocks[socket] = delivery_block(socket)
@@ -310,6 +345,9 @@ def observe(workspace, now: float, *, worker_ids=None,
             limit_reset_at=reset.at if reset else None,
             limit_banner=reset.banner if reset else None,
             delivery_block=blocks.get(socket) if socket else None,
+            limit_parked=parked,
+            # Read only for a parked seat: it is the one the new-login rule asks about.
+            account=account() if parked else None,
         )
     return obs
 
@@ -415,6 +453,7 @@ def load_state(workspace) -> ps.SupervisionState:
                 limit_exhausted=bool(ev.get("limit_exhausted")),
                 limit_banner=ev.get("limit_banner"),
                 limit_reset_at=ev.get("limit_reset_at"),
+                limit_account=ev.get("limit_account"),
             )
     last = raw.get("last_sample_at")
     return ps.SupervisionState(
@@ -444,7 +483,8 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
                         "limit_attempts": e.limit_attempts,
                         "limit_exhausted": e.limit_exhausted,
                         "limit_banner": e.limit_banner,
-                        "limit_reset_at": e.limit_reset_at}
+                        "limit_reset_at": e.limit_reset_at,
+                        "limit_account": e.limit_account}
                     for w, e in state.workers.items()},
     }
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".pool-supervision.")
