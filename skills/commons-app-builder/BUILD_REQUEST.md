@@ -118,7 +118,8 @@ for a refine or a heavier edit, the whole page as `html`. For a build it may als
 `template` (one of the four; when the request names one too they must agree, and an unknown name
 is refused), and, with an `html` page written against other columns, that page's own `schema` in
 the templates' `schema.json` shape. It is checked in full before the request is claimed or
-anything is created: one primary database; at most 50 columns, each of a type `prop_add` takes
+anything is created: exactly one database, the primary (a second one is refused, never
+dropped); at most 50 columns, each of a type `prop_add` takes
 (not `title` or `relation`), names unique, at most 100 characters and never starting with `$`;
 options, at most 100 a column, only on a select, multi-select or status; at most 10 views, each
 with a layout and grouping only by its own columns. Never list the title column: a blank
@@ -130,6 +131,10 @@ A column the database the panel sent already has is compared, not just skipped: 
 fails the build before anything is written; the same select, multi-select or status lacking some
 of the app's options gets them added (`prop_update`), only when the database has no rows, since
 the options are resent by name; with rows, the build fails and says which options to add.
+Every column is decided right after `databases.list`, before the first write, in both routes. A
+listing marked `properties_truncated` (the room left a column or an option out of it) fails the
+build there too: what it hides could be a column of another type, or options an update would
+drop, and no read shows every column and option (`databases.query` bounds them the same way).
 `check` on the `databases.list` step prints `columns`: for each later column step, `skip` or the
 `prop_update` to run in its place. `plan` prints
 the Actions in order; `$db` and `$app` stand for the ids earlier steps answer. Run them in that

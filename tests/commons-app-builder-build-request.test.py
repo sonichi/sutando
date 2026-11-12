@@ -104,9 +104,11 @@ class FakeRoom:
                     "max_pages": 100}
         if action == "room.commons.databases.list":
             return {"databases": [
-                {"database": "db:" + i, "name": d["name"], "rows": d.get("rows", 0), "properties_truncated": False,
+                {"database": "db:" + i, "name": d["name"], "rows": d.get("rows", 0),
+                 "properties_truncated": bool(d.get("listed")),
                  "properties": [{"id": p["name"].lower(), "name": p["name"], "type": p["type"],
-                                 "options": p.get("options")} for p in d["properties"]]}
+                                 "options": (d.get("listed") or {}).get(p["name"], p.get("options"))}
+                                for p in d["properties"] if p["name"] in (d.get("listed") or {p["name"]: 0})]}
                 for i, d in self.databases.items()]}
         if action == "room.commons.pages.create":
             assert args["kind"] == "db", "the panel creates the page; the agent never does"
@@ -609,6 +611,13 @@ check("a-later-wrong-column-fails-before-an-earlier-option-update", rep["status"
 check("and-nothing-else-is-written", not any(act in ("room.commons.pages.replace", "room.commons.pages.append",
                                                      "room.commons.apps.create") for act, _ in room.calls))
 
+# An own schema with a second database is refused: the plan builds one, and would drop the other.
+room = FakeRoom()
+_, rep = reply_of(run(room, task(template="poll"), {"html": "<p>own</p>", "schema": {"databases": [
+    {"name": "Signups", "role": "primary", "props": []}, {"name": "Extra", "role": "lookup", "props": []}]}}))
+check("an-own-schema-with-two-databases-is-refused", rep["status"] == "failed"
+      and "more than one database" in rep["reason"] and room.calls == [])
+
 # An own schema's props or views given as null are none, not a crash.
 room = FakeRoom()
 _, rep = reply_of(run(room, task(template="poll"), {"html": "<p>own</p>", "schema": {"databases": [
@@ -628,6 +637,36 @@ def cli(*args):
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
         code = br.main(list(args))
     return code, out.getvalue()
+
+
+# A listing marked truncated is refused before any write, on both routes: what it leaves out can
+# be a column of another type, or options a prop_update would drop (review on 1de8592c).
+def truncated_room(listed):
+    return FakeRoom(databases={"d7k2m9x1": {"name": "Untitled", "views": [], "rows": 0, "listed": listed, "properties": [
+        "Name", {"name": "Choice", "type": "select", "options": ["Keep1", "Keep2", "Morning"]},
+        {"name": "Comment", "type": "number"}]}})
+
+
+for label, listed in (("a-hidden-column", {"Name": None, "Choice": ["Keep1", "Keep2", "Morning"]}),
+                      ("hidden-options", {"Name": None, "Choice": ["Morning"], "Comment": None})):
+    room = truncated_room(listed)
+    _, rep = reply_of(run(room, task(database="d7k2m9x1", template="poll"),
+                          {"options": {"Choice": ["Morning", "Afternoon"]}}))
+    check(f"a-listing-with-{label}-is-refused-before-any-write", rep["status"] == "failed"
+          and "without all of its columns or options" in rep["reason"]
+          and not any(act == "room.commons.databases.mutate" for act, _ in room.calls)
+          and room.databases["d7k2m9x1"]["properties"][1]["options"] == ["Keep1", "Keep2", "Morning"])
+    given = br.plan(dict(br.parse(task(database="d7k2m9x1", template="poll")), owner=OWNER), "<p>x</p>",
+                    br.load_template("poll")[1], "X")
+    idx = next(i for i, st in enumerate(given) if st.get("expect_database"))
+    first_write = next(i for i, st in enumerate(given) if st["action"] == "room.commons.databases.mutate")
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "plan.json").write_text(json.dumps(given), encoding="utf-8")
+        (Path(d) / "r.json").write_text(json.dumps(envelope_of(room.call({"action": "room.commons.databases.list", "arguments": {}}))),
+                                        encoding="utf-8")
+        code, out = cli("check", str(Path(d) / "plan.json"), str(idx), str(Path(d) / "r.json"))
+    check(f"and-on-the-cli-route-check-stops-before-the-first-write-{label}",
+          idx < first_write and code == 1 and "without all of its columns or options" in out)
 
 
 with tempfile.TemporaryDirectory() as tmp:

@@ -376,6 +376,8 @@ def _checked_schema(schema: Any) -> Dict[str, Any]:
     primary = [d for d in dbs if isinstance(d, dict) and d.get("role") == "primary"]
     if len(primary) != 1:
         raise ActionFailed("the adaptation's schema needs exactly one primary database with a name")
+    if len(dbs) != 1:  # the plan builds the primary database only; a second one would be dropped
+        raise ActionFailed("the adaptation's schema has more than one database; an app here has one")
     db = primary[0]
     _name(db.get("name"), "the adaptation's database")
     props = db.get("props") if db.get("props") is not None else []
@@ -641,6 +643,9 @@ def verify(step: Dict[str, Any], result: Dict[str, Any], answers: Optional[Dict[
         found = dbs.get(bare(step["expect_database"]))
         if not found:
             raise ActionFailed(f"database {step['expect_database']} is not in this room")
+        if found.get("properties_truncated") is True:  # no read shows every column and option
+            raise ActionFailed(f"the room lists database {step['expect_database']} without all of its "
+                               "columns or options, so they cannot be checked before anything is written")
         present.update(p.get("name") for p in found.get("properties", []) if p.get("name"))
         if answers is not None:
             answers["$columns"] = {p["name"].casefold(): {"name": p["name"], "type": p.get("type"),
