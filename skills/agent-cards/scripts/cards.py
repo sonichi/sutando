@@ -23,7 +23,8 @@ but the owner and in any room but their DM.
 matches no card this agent posted prints the fixed refusal and nothing acts): Reconnect and Make main run
 connections' own units; Pause and Restart run pool_manage's. Disconnect and Retire never act on the
 first click: it posts a confirm card, and only that card's own "Yes" (the `confirmed` command, offered
-nowhere else, used once, live for ten minutes) runs the unit. Switch account hands over to connect-apps.
+nowhere else, live for ten minutes) runs the unit. Yes and Keep each claim the card under its record
+lock before anything runs, so of any clicks on it, at once or in turn, exactly one is answered. Switch account hands over to connect-apps.
 Every command prints one JSON object. Exit 0 done, 1 a negative answer, 2 refused.
 """
 from __future__ import annotations
@@ -410,6 +411,14 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, now=time.time) -> int:
         return _emit(other, 1)
     said, clicked = verdict.command, str(headers.get("reply_to_event") or "")
     destructive = (said.kind, said.verb) in DESTRUCTIVE
+    if said.confirmed or said.verb == "keep":
+        # Claim the confirm card under its record lock before anything runs: one answer, the first.
+        try:
+            claimed = issued_cards.settle(ws, clicked)
+        except OSError as e:
+            return _emit({"status": "failed", "why": f"the confirm card could not be claimed ({type(e).__name__})"}, 1)
+        if not claimed:
+            return _emit({"status": ac.FORGED, "say": ac.UNMATCHED_CLICK, "why": "that card was already answered"}, 1)
     try:
         if said.verb == "keep":
             out = {"status": "say", "say": "Okay, I left it as it is."}
@@ -420,8 +429,6 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, now=time.time) -> int:
                               "workers": lambda: _workers_reply(ws, said),
                               "apps": lambda: _apps_reply(ws, said)}
             out = handlers.get(said.kind, lambda: {"status": "refused", "why": f"a {said.kind} card has no actions"})()
-        if said.confirmed or said.verb == "keep":
-            issued_cards.settle(ws, clicked)  # a confirm card answers once
     except Exception as e:  # noqa: BLE001 — each unit's refusal is reported in its own words
         out = {"status": "failed", "why": f"{type(e).__name__}: {e}"}
     code = {"refused": 2, "failed": 1}.get(out["status"], 0)

@@ -23,6 +23,7 @@ import io
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -365,6 +366,7 @@ class Reply(Base):
     def forged(self, *a, **kw):
         rc, out = self.reply(*a, **kw)
         self.assertEqual((rc, out["status"], out["say"]), (1, "forged_or_stale_click", ac.UNMATCHED_CLICK), (a, kw))
+        return out
 
     def first_click(self, kind, target, verb, words):
         """Show a card that offers the destructive action, click it, and return the confirm card posted."""
@@ -412,6 +414,79 @@ class Reply(Base):
             confirm, _ = self.first_click("workers", "w1", "retire", "Retire Pylon")
             rc, out = self.reply("", said="Yes, retire Pylon", card_id=confirm["id"], reply_to_event="$confirm")
         self.assertEqual((rc, out["status"], retired), (0, "done", ["w1"]))
+
+    def click_task(self, name, said, card_id):
+        path = self.ws / name
+        path.write_text(task(said, reply_to_event="$confirm", card_click=json.dumps({"card_id": card_id, "action": said})))
+        return path
+
+    def handle(self, path, results):
+        """The production handler on one task, its one JSON line collected (stdout is shared by threads)."""
+        results.append(cards.cmd_reply(self.ws, mock.Mock(task_file=str(path)), core=CORE))
+
+    def test_two_yes_clicks_at_once_act_exactly_once(self):
+        import pool_manage
+        retired, printed, codes = [], [], []
+        both_checked, real = threading.Barrier(2, timeout=10), ac.click_verdict
+
+        def verdict_then_wait(*a, **kw):
+            got = real(*a, **kw)
+            both_checked.wait()  # both clicks have passed the check before either may act
+            return got
+        with mock.patch.object(pool_manage, "retire", lambda ws, t, **k: retired.append(t) or {"result": "retired"}):
+            confirm, _ = self.first_click("workers", "w1", "retire", "Retire Pylon")
+            paths = [self.click_task(f"yes{i}.txt", "Yes, retire Pylon", confirm["id"]) for i in range(2)]
+            with mock.patch.object(ac, "click_verdict", verdict_then_wait), \
+                    mock.patch.object(cards, "_emit", lambda payload, code=0: printed.append(payload) or code):
+                threads = [threading.Thread(target=self.handle, args=(p, codes)) for p in paths]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(15)
+        self.assertEqual(retired, ["w1"], "two Yes clicks that both passed the check retire once")
+        self.assertEqual(sorted(p["status"] for p in printed), ["done", "forged_or_stale_click"])
+        self.assertEqual(sorted(codes), [0, 1])
+        refused = next(p for p in printed if p["status"] != "done")
+        self.assertEqual((refused["say"], refused["why"]), (ac.UNMATCHED_CLICK, "that card was already answered"))
+
+    def test_a_keep_that_lands_after_a_yes_passed_its_check_stops_that_yes(self):
+        import pool_manage
+        retired, real = [], ac.click_verdict
+        with mock.patch.object(pool_manage, "retire", lambda ws, t, **k: retired.append(t) or {"result": "retired"}):
+            confirm, _ = self.first_click("workers", "w1", "retire", "Retire Pylon")
+            keep = dict(said="Keep Pylon", card_id=confirm["id"], reply_to_event="$confirm")
+            state = {}
+
+            def yes_checked_then_keep_runs(*a, **kw):
+                got = real(*a, **kw)
+                if not state:
+                    state["keep"] = True
+                    with mock.patch.object(ac, "click_verdict", real):
+                        state["keep"] = self.reply("", **keep)
+                return got
+            with mock.patch.object(ac, "click_verdict", yes_checked_then_keep_runs):
+                rc, out = self.reply("", said="Yes, retire Pylon", card_id=confirm["id"], reply_to_event="$confirm")
+        self.assertEqual(state["keep"], (0, {"status": "say", "say": "Okay, I left it as it is."}))
+        self.assertEqual((rc, out["status"], out["say"], retired), (1, "forged_or_stale_click", ac.UNMATCHED_CLICK, []))
+
+    def test_keep_then_yes_and_yes_then_keep_answer_once_and_a_claim_that_fails_does_nothing(self):
+        import pool_manage
+        retired = []
+        with mock.patch.object(pool_manage, "retire", lambda ws, t, **k: retired.append(t) or {"result": "retired"}):
+            confirm, _ = self.first_click("workers", "w1", "retire", "Retire Pylon")
+            yes = dict(said="Yes, retire Pylon", card_id=confirm["id"], reply_to_event="$confirm")
+            keep = dict(said="Keep Pylon", card_id=confirm["id"], reply_to_event="$confirm")
+            self.assertEqual(self.reply("", **keep)[1]["status"], "say")
+            self.forged("", **yes)
+            self.forged("", **keep)
+            self.assertEqual(retired, [])
+            confirm, _ = self.first_click("workers", "w1", "retire", "Retire Pylon")
+            with mock.patch.object(cards.issued_cards, "settle", side_effect=OSError("disk full")):
+                rc, out = self.reply("", **yes)
+            self.assertEqual((rc, out["status"], retired), (1, "failed", []))
+            self.assertEqual(self.reply("", **yes)[1]["status"], "done")
+            self.forged("", **keep)
+        self.assertEqual(retired, ["w1"])
 
     def test_a_confirm_card_that_cannot_be_posted_or_recorded_does_nothing(self):
         import pool_manage
@@ -548,7 +623,10 @@ class Reply(Base):
             self.forged("card:workers:w1:pause", card_id="another-card")
             self.forged("card:workers:w1:pause", said="Retire Pylon")
             typed = self.run_(["reply"], task(self.text("card:workers:w1:pause"), reply_to_event="$card"))
-            self.assertEqual((typed[0], typed[1]["status"], typed[1]["say"]), (1, "forged_or_stale_click", ac.UNMATCHED_CLICK))
+            self.assertEqual((typed[0], typed[1]["status"], typed[1]["say"]), (1, "forged_or_stale_click", ac.UNTAPPED_ACTION))
+            self.forged("card:workers:w1:pause", card_click=json.dumps({"card_id": "  ", "action": self.text("card:workers:w1:pause")}))
+            words = self.run_(["reply"], task("what does pause do?", reply_to_event="$card"))
+            self.assertEqual(words, (1, {"status": "owner_words", "words": "what does pause do?"}))
 
     def test_other_words_and_other_cards_are_not_its_replies(self):
         self.assertEqual(self.run_(["reply"], task("show my workers")), (1, {"status": "not_a_card"}))
