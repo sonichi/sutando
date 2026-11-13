@@ -16,6 +16,8 @@
 #
 # Beside the bridge it keeps `src/sparrowd.py --agent-bridges` alive, the only supervisor of the
 # agent bridges declared under <workspace>/agents on this install; that child does its own scanning.
+#
+# Killing the wrapper by hand brings it back in about 10 s; use launchctl bootout to stop it for good.
 
 set -euo pipefail
 
