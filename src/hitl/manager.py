@@ -416,7 +416,8 @@ class HitlManager:
                           extra: Optional[Dict] = None, replaces: Optional[str] = None) -> None:
         """Idempotent: recording an older revision than already projected is a
         no-op; the event id (first CREATE event, the EDIT target) is kept. A card re-created
-        because the relay lost `replaces` still lands its id while the ledger names that target."""
+        because the relay lost `replaces` still lands its id, at the revision it carries, while
+        the ledger names that target, so a newer revision stays pending for it."""
         with self.store.locked():
             req = self.store.load(req_id)
             if req is None:
@@ -424,7 +425,8 @@ class HitlManager:
             current = self.store.projection(req_id)
             if revision <= current.get("revision", 0):
                 if replaces and event_id and current.get("event_id") == replaces:
-                    self.store.save(req, projection={**current, "event_id": event_id})
+                    self.store.save(req, projection={**current, **(extra or {}),
+                                                     "revision": revision, "event_id": event_id})
                 return
             event_id = event_id or current.get("event_id")
             kept = {k: v for k, v in current.items() if k not in REFUSAL_KEYS}

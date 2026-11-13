@@ -655,19 +655,27 @@ class EditTargetMissingTests(unittest.TestCase):
         self.assertNotIn("failed_revision", ledger)
         self.assertTrue(self.mgr.needs_projection(self.stale.id))
 
-    def test_the_new_id_lands_when_a_later_revision_was_recorded_during_the_resend(self):
-        self.mgr.resolve(self.stale.id)
+    def test_the_new_card_catches_up_when_a_later_revision_was_recorded_during_the_resend(self):
+        self.mgr.apply_action(ActionReply(hitl_id=self.stale.id, expected_revision=1,
+                                          action_id="reauth", guard="stale"))
         dead = self.mgr.projection_target(self.stale.id)
 
-        def relay(payload):  # an overlapping pass records a later revision on the dead target
+        def relay(payload):  # an overlapping pass resolves it and records that on the dead target
             if payload["op"] == "message":
-                req = self.mgr.store.load(self.stale.id)
-                self.mgr.record_projection(req.id, req.revision + 1, None)
+                self.mgr.resolve(self.stale.id)
+                self.mgr.record_projection(self.stale.id, self.mgr.store.load(self.stale.id).revision, None)
             return self.relay(payload)
         project(self.mgr, relay, "!dm:s.space")
         target = self.mgr.projection_target(self.stale.id)
         self.assertNotEqual(target, dead)
         self.assertIn(target, self.relay.events)
+        self.assertTrue(self.mgr.needs_projection(self.stale.id), "the new card holds the older content")
+        project(self.mgr, self.relay, "!dm:s.space")
+        last = self.relay.sent[-1]
+        self.assertEqual((last["op"], last["event_id"]), ("edit", target))
+        self.assertEqual(last["extra_content"][WIRE_FIELD]["status"], STATUS_RESOLVED)
+        self.assertFalse(self.mgr.needs_projection(self.stale.id))
+        self.assertEqual(project(self.mgr, self.relay, "!dm:s.space"), [])
 
     def test_a_target_already_replaced_by_another_pass_is_kept(self):
         self.mgr.resolve(self.stale.id)
