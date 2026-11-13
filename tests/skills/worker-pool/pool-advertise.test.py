@@ -37,7 +37,8 @@ AGENT_MXID = "@a3f91c2d4e5b6a7c8d9e0f1a2b3c4d5e.agent:fixture.net"
 SENSITIVE_TOKEN_REF = "AG2_REMOTE_TOKEN_FIXTURE_SHOULD_NOT_LEAK"
 
 
-def _write_identity(ws: Path, wid: str, *, agent_mxid=None, token_ref=None, disabled=False) -> None:
+def _write_identity(ws: Path, wid: str, *, agent_mxid=None, token_ref=None, disabled=False,
+                    parked=False) -> None:
     """A minimal worker identity row written straight to connections.json —
     the same field `pool_identity.py show` and `report()` both read."""
     row = {"server": "fixture.net", "instance": f"{wid[:8]}-agent", "gateway_url": "https://fixture.net",
@@ -46,6 +47,8 @@ def _write_identity(ws: Path, wid: str, *, agent_mxid=None, token_ref=None, disa
            "server_source": "identity", "worker": wid, "disabled": disabled}
     if agent_mxid is not None:
         row["agent_mxid"] = agent_mxid
+    if parked:
+        row["parked"] = True
     path = connections.record_path(ws)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"schema_version": connections.SCHEMA_VERSION, "connections": [row],
@@ -140,6 +143,14 @@ class TestWorkerAgentMxidRidesTheReport(Base):
         # worker_enabled_identity so a disabled row never rides the report.
         r = self.roster({W1: {"state": "live", "label": "one"}})
         _write_identity(self.ws, W1, agent_mxid=AGENT_MXID, disabled=True)
+        rep = pa.report(r, workspace=self.ws)
+        self.assertNotIn("agent_mxid", self._worker(rep, W1))
+
+    def test_a_parked_identity_row_is_never_advertised(self):
+        # A parked row stays in the record but no lane serves it, so the worker acts as the core.
+        r = self.roster({W1: {"state": "live", "label": "one"}})
+        _write_identity(self.ws, W1, agent_mxid=AGENT_MXID, parked=True)
+        self.assertTrue(connections.worker_identity(W1, self.ws).get("parked"))
         rep = pa.report(r, workspace=self.ws)
         self.assertNotIn("agent_mxid", self._worker(rep, W1))
 
