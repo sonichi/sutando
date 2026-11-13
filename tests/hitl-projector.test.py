@@ -985,5 +985,83 @@ class NoFloatOnTheWireTests(unittest.TestCase):
             self.assertEqual(_floats_at(payload), [], payload)
 
 
+
+_NOT_IN_ROOM = '{"errcode": "M_FORBIDDEN", "error": "sender is not in this room"}'
+
+
+def _room_refusing(room, body=_NOT_IN_ROOM, ok=None):
+    """Refuses every send to `room` with a 403 carrying `body`; others go to `ok`."""
+    ok = ok or RecordingSender()
+    refused = []
+
+    def send(payload):
+        if payload["room_id"] == room:
+            refused.append(payload)
+            err = OSError("HTTP 403")
+            err.code, err.body = 403, body
+            raise err
+        return ok(payload)
+    send.refused, send.ok = refused, ok
+    return send
+
+
+class RoomMembershipRefusalTests(_RefusalDrive):
+    """A 403 that is the room's verdict on the sender ends that card after one send, is
+    recorded once, and never holds back the cards behind it (#5054)."""
+
+    def drive(self, send, step=10 ** 7, describe=lambda e: getattr(e, "body", "")):
+        self.t += step
+        wall, mono = time.time() + self.t, time.monotonic() + self.t
+        try:
+            return self.pj.project_pass(self.mgr, send, ROOM, clock=lambda: wall, monotonic=lambda: mono,
+                                        describe=describe), None
+        except OSError as e:
+            return getattr(e, "projection", None), e
+
+    def test_a_card_whose_room_refuses_the_sender_is_sent_once_and_the_rest_go_out(self):
+        left = self.mgr.create(make_req(guard="a", device={"id": "da", "name": "n"}, room="!left:x"))
+        others = [self.card(g) for g in ("b", "c")]
+        send = _room_refusing("!left:x")
+        raised = [self.drive(send, step=120)[1] for _ in range(10)]
+        cards = [p for p in send.refused if WIRE_FIELD in p["extra_content"]]
+        self.assertEqual(len(cards), 1, "the refused card was sent once, not every pass")
+        self.assertEqual(raised, [None] * 10, "a room's refusal of one card is not the relay's failure")
+        self.assertTrue(self.mgr.projection_failed(left.id))
+        self.assertIn("not in this room", self.mgr.store.projection(left.id)["refused_error"])
+        sent = {p["extra_content"][WIRE_FIELD]["id"] for p in send.ok.sent if WIRE_FIELD in p["extra_content"]}
+        self.assertEqual(sent, {r.id for r in others}, "the cards behind it were delivered")
+
+    def test_the_failure_notice_a_refusing_room_also_refuses_is_recorded_once(self):
+        left = self.mgr.create(make_req(guard="a", device={"id": "da", "name": "n"}, room="!left:x"))
+        send = _room_refusing("!left:x")
+        raised = [self.drive(send, step=120)[1] for _ in range(10)]
+        self.assertEqual(len(send.refused), 2, "one card, one failure notice, then nothing")
+        self.assertEqual(raised, [None] * 10)
+        self.assertEqual(self.mgr.store.projection(left.id).get("failed_notice"), left.revision)
+        self.assertNotIn(left.id, pending_ids(self.mgr, clock=lambda: time.time() + self.t))
+
+    def test_any_other_403_still_reaches_the_caller_and_charges_nothing(self):
+        req = self.card("a")
+        for body in ("", "<html>edge</html>", '{"error": "token expired"}',
+                     '{"errcode": "M_FORBIDDEN", "error": "Invalid access token"}',
+                     '{"errcode": "M_FORBIDDEN", "error": "sender is not a member of this workspace"}'):
+            _, raised = self.drive(_room_refusing(ROOM, body=body))
+            self.assertIsNotNone(raised, f"403 {body!r} keeps the caller's auth handling")
+        self.assertFalse(self.mgr.projection_failed(req.id))
+        self.assertNotIn("refusals", self.mgr.store.projection(req.id))
+
+    def test_a_403_notice_that_is_not_the_rooms_refusal_still_reaches_the_caller(self):
+        req = self.mgr.create(make_req(guard="a", device={"id": "da", "name": "n"}, room="!left:x"))
+        card, token = _room_refusing("!left:x"), _room_refusing(
+            "!left:x", body='{"errcode": "M_FORBIDDEN", "error": "Invalid access token"}')
+
+        def send(payload):  # the card meets the room's refusal, its failure notice a bad token
+            return (token if NOTICE_FIELD in payload["extra_content"] else card)(payload)
+        _, raised = self.drive(send, step=120)
+        self.assertTrue(self.mgr.projection_failed(req.id))
+        self.assertIsNotNone(raised, "a bad token on the notice is the caller's to recover")
+        self.assertNotIn("failed_notice", self.mgr.store.projection(req.id), "the notice stays owed")
+
+
 if __name__ == "__main__":
     unittest.main()

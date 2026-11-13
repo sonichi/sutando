@@ -1915,7 +1915,7 @@ def _project_hitl(log=print) -> int:
             f"{projector.PROJECTION_MAX_REFUSALS}; retrying it in {delay:g}s")
     for req_id, revision, error in gave_up:
         log(f"hitl: card {req_id} could not be projected at revision {revision}: refused "
-            f"{projector.PROJECTION_MAX_REFUSALS} times ({error}); no further retries for this "
+            f"({error}); no further retries for this "
             f"revision, health-check reports it")
     if failed:
         _hitl_backoff_bump(log)  # a refusing or raising sender
