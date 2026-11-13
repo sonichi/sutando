@@ -231,7 +231,9 @@ HTML-escaped and only `http(s)` links become links. Run `track` from a checkout:
 5. **Lifetime.** The runner lives as long as the mod's module: a reload or session end kills it,
    and the next `session.start` respawns it. One runner per state dir (a lock); a second exits.
    If the runner exits on its own it is restarted after 30 s, except for a missing extension or
-   a held lock.
+   a held lock. A normal stop drains its repository and helper threads before releasing the
+   lock; runner-owned GitHub calls are cancellable and time bounded. See
+   [the shutdown contract](../../docs/pr-watch-lifecycle.md).
 6. **Events while no session runs are lost.** `gh webhook forward` does not replay; after a gap,
    check the watched PRs once by hand.
 

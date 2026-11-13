@@ -46,6 +46,7 @@ sys.path.insert(0, str(REPO / "src"))
 from proactive_routing import redirect_target_is_foreign as _real_redirect_target_is_foreign  # noqa: E402
 from proactive_routing import body_target_channel as _real_body_target_channel  # noqa: E402
 from proactive_routing import body_claimable_by as _real_body_claimable_by  # noqa: E402
+from proactive_routing import lane_claims_proactive as _real_lane_claims  # noqa: E402
 from proactive_routing import should_claim_proactive_peeked as _real_peeked  # noqa: E402
 
 FAILURES: list[str] = []
@@ -115,6 +116,7 @@ def _run_one_pass(results: Path, send, claims_by_routing: bool = True):
     routing.redirect_target_is_foreign = _real_redirect_target_is_foreign
     routing.body_target_channel = _real_body_target_channel
     routing.body_claimable_by = _real_body_claimable_by
+    routing.lane_claims_proactive = _real_lane_claims  # a worker-stamped name is its own lane's
     # The real pre-claim helper, resolving its legs through this stub.
     routing.should_claim_proactive_peeked = types.FunctionType(
         _real_peeked.__code__, routing.__dict__)

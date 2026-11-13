@@ -44,7 +44,7 @@ install. A Codex core without the app follows `docs/codex-core.md`
 ## Use
 
 Tools: `ag2.whoami`, `room.list`, `room.inspect`, `room.actions.search`,
-`room.actions.describe`, `room.action.read` (zero-effect Actions),
+`room.actions.describe`, `room.action.read` (zero-effect Actions), `space.action.read` (owner account reads),
 `room.action.execute` (mutations), `operation.inspect`, `approval.inspect`.
 Availability is per room and per actor: describe an Action before relying on its
 parameters. General room work (read, members, mentions, reactions, the room vault,
@@ -67,7 +67,11 @@ What Commons work runs over MCP today:
 | Query or change a Commons database | `room.commons.databases.query` (read); `room.commons.databases.mutate` (execute) |
 | List a page's comments | `room.commons.comments.list` (read) |
 | Summon someone to Commons work | `room.commons.summon` (execute) |
+| Your owner's own agents (`account.agents.list`) | `space.action.read` with `action`, `arguments` and the `task_id` of the owner's message (read) |
 | Organize pages into folders | `room.commons.folders.*`; describe each before use |
+
+`space.action.read` always targets the owner's account and answers only when the owner asked this agent
+directly in s.space; without the owner message's `task_id` (a local session with no task) it is refused.
 
 Edit Commons pages and databases only through these Actions, never through room
 messages or state events.

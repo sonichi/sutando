@@ -43,6 +43,7 @@ NO_REPLY = "[no reply] Codex completed the turn without a message."
 # --held: the launcher that spawned this process holds the work root and attaches it as the consumer
 # whose liveness fences the root; the connector waits this long for that record, then refuses.
 HELD_WAIT_S = held_start.WAIT_S
+RESUME_MARKER = "resume-thread-taken"   # under state/: the --resume-thread id already carried over
 
 
 def log(*a):
@@ -213,10 +214,24 @@ class Connector:
         self.thread_id = res["thread"]["id"]
         log("started thread", self.thread_id, "owner" if owner else "non-owner", "ephemeral" if ephemeral else "durable")
 
-    def open_owner_thread(self, channel_id):
-        """The channel's durable thread: resume the saved id when it is still known, else start one."""
+    def carried_thread(self, kind):
+        """The owner's conversation `--resume-thread` names, for the owner's DM, until it has been taken
+        once (the marker holds the id taken, so a new id given at a reinstall is taken again)."""
+        if not self.args.resume_thread or kind != "dm" or self.args.ephemeral:
+            return None
+        try:
+            with open(os.path.join(self.args.state, RESUME_MARKER), encoding="utf-8") as f:
+                taken = f.readline().strip()
+        except FileNotFoundError:
+            taken = ""
+        return None if taken == self.args.resume_thread else self.args.resume_thread
+
+    def open_owner_thread(self, channel_id, kind=""):
+        """The channel's durable thread: in the owner's DM, the conversation carried over the first time;
+        else resume the saved id when it is still known, else start one."""
         key = channel_key(channel_id)
-        if key in self.live:
+        carried = self.carried_thread(kind)
+        if key in self.live and not carried:
             self.thread_id = self.live[key]
             return
         path = os.path.join(self.args.state, "threads", key)
@@ -224,7 +239,10 @@ class Connector:
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 wanted = f.readline().strip() or None
-        wanted = wanted or bound_thread_id(self.args.thread_id, channel_id)
+        wanted = carried or wanted or bound_thread_id(self.args.thread_id, channel_id)
+        if carried:
+            # Taken once whatever the resume answers: a failed one is not retried on every task.
+            write_atomic(os.path.join(self.args.state, RESUME_MARKER), carried + "\n")
         if wanted and not self.args.ephemeral:
             try:
                 res = self.rpc.request("thread/resume", dict(self.thread_params(True), threadId=wanted),
@@ -243,7 +261,7 @@ class Connector:
         """Owner: the channel's durable thread. Anyone else: a fresh ephemeral, read-only
         thread in an empty temp dir, so no room's tasks or results are in its cwd."""
         if is_owner(headers):
-            self.open_owner_thread(headers.get("channel_id"))
+            self.open_owner_thread(headers.get("channel_id"), (headers.get("channel_kind") or "").strip().lower())
         else:
             self.drop_scratch()
             self.scratch_cwd = tempfile.mkdtemp(prefix="codex-nonowner-")
@@ -496,6 +514,8 @@ def build_parser():
                          "never needs it: it always gets that ephemeral read-only thread.")
     ap.add_argument("--thread-id", default=None, metavar="CHANNEL_ID=THREAD",
                     help="resume THREAD for exactly this owner channel when it has no saved thread yet")
+    ap.add_argument("--resume-thread", default=None, metavar="THREAD",
+                    help="the owner's own Codex conversation to continue in the owner's DM (taken once)")
     ap.add_argument("--ephemeral", action="store_true", help="owner threads too: do not persist to the Codex home")
     ap.add_argument("--developer-instructions", default=None)
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
