@@ -64,7 +64,8 @@ def failure_status(exc: BaseException) -> int | None:
 
 
 # How a gateway words a 403 that is the room's verdict on the sender, not the bearer's.
-_ROOM_REFUSAL_MARKERS = ("not in this room", "not a room member", "not a member", "m_forbidden")
+# Room-specific wording only: M_FORBIDDEN and "not a member" also mean a bad token or workspace.
+_ROOM_REFUSAL_MARKERS = ("not in this room", "not a room member", " not in room !")
 
 
 def is_room_membership_refusal(status: int, body: object) -> bool:

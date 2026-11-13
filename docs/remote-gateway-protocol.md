@@ -897,7 +897,7 @@ so:
   429, and a connection that was refused or a host that did not resolve. Another 4xx parks
   at once. A 400 naming an upgraded owner DM holds the file until the DM is repointed.
 - **A room that refuses the sender ends the send.** A 403 whose JSON error says the sender
-  is not in the room (`sender is not in this room`, `not a room member`, `M_FORBIDDEN`) is
+  is not in the room (`sender is not in this room`, `not a room member`, or Matrix's `User … not in room !…`; a bare `M_FORBIDDEN` or "not a member" is not enough, since a bad token or a workspace refusal uses them too) is
   the room's answer, not the bearer's: the gateway authenticated the request first. It is
   sent once, the item parks (`permanent-refusal`), the file moves to `results/undelivered/`
   with a log line, and nothing is raised to the poll loop's credential recovery. Any other

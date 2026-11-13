@@ -93,6 +93,9 @@ def classify(is_room_membership_refusal, where: str) -> None:
         check(is_room_membership_refusal(403, body), f"{where}: a room refusal is recognised: {str(body)[:50]}")
     for status, body in ((403, b""), (403, "<html>error 1010</html>"), (403, {"error": "unauthorized"}),
                          (403, {"error": "forbidden"}), (403, None), (403, ["not in this room"]),
+                         (403, {"errcode": "M_FORBIDDEN", "error": "Invalid access token"}),
+                         (403, {"error": "not a member of this workspace"}),
+                         (403, {"error": "user is not a member of the organization"}),
                          (401, NOT_IN_ROOM), (429, NOT_IN_ROOM), (500, NOT_IN_ROOM)):
         check(not is_room_membership_refusal(status, body),
               f"{where}: not a room refusal: HTTP {status} {str(body)[:40]!r}")
@@ -102,7 +105,7 @@ def an_unreadable_body_is_no_room_refusal() -> None:
     class Unreadable(urllib.error.HTTPError):
         def read(self, *a):
             raise OSError("connection reset")
-    e = Unreadable("https://gw.example/relay/v1/room", 403, "err", {}, None)
+    e = Unreadable("https://gw.example/relay/v1/room", 403, "err", {}, io.BytesIO(b""))
     check(room_refused_sender(e) is False, "a 403 whose body cannot be read is not a room refusal")
     check(e.sparrow_body.getvalue() == b"", "and later readers see the same empty body, not a second read")
 
