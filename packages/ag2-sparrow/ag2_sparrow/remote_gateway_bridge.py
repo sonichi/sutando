@@ -5296,10 +5296,29 @@ def _vault_handled(text: str, sender_tier: str) -> str:
     return result.text
 
 
-def _sender_tier(task: dict) -> str:
-    attested, _ = local_task_protocol.broker_attested_tier(
+def _sender_tier_and_collaborator(task: dict) -> "tuple[str, bool]":
+    """(effective sender tier, whether the collaborator engage rulebook applies): the ONE
+    broker-attestation decision for a task, so task-write routing, vault handling and
+    owner-activity recording can never read it differently from each other. A sender asking
+    for team (`requested_access_tier: team`) whose broker attestation did not promote it is
+    logged once here — distinct from a plain guest message — since that gap (wire access_tier
+    still `guest`, collaborator not `True`) is exactly what a not-yet-landed cross-homeserver
+    collaborator attestation looks like, and this is the only place that otherwise swallows it."""
+    attested, broker_collaborator = local_task_protocol.broker_attested_tier(
         task.get("access_tier"), task.get("requested_access_tier"), task.get("collaborator"))
-    return _tier_for(task.get("user_id"), attested)
+    sender_tier = _tier_for(task.get("user_id"), attested)
+    collaborator_enabled = broker_collaborator and sender_tier == "team"
+    if (not collaborator_enabled and local_task_protocol.canonical_access_tier(
+            task.get("requested_access_tier")) == "team" and task.get("collaborator") is not True):
+        _log(f"task {task.get('id')}: requested team but the broker's collaborator attestation "
+             f"was not True on this delivery (sender {task.get('user_id')!r}, room "
+             f"{task.get('channel_id')!r}) — serving as {sender_tier}; a later redelivery with "
+             "collaborator: true would be the attestation catching up")
+    return sender_tier, collaborator_enabled
+
+
+def _sender_tier(task: dict) -> str:
+    return _sender_tier_and_collaborator(task)[0]
 
 
 def _redact_quoted(value, found: set):
@@ -6276,11 +6295,9 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     # Promote only the exact broker boolean plus Team request; the legacy Guest
     # wire tier keeps old nodes restricted and body text cannot opt itself in.
-    attested_tier, broker_collaborator = local_task_protocol.broker_attested_tier(
-        task.get("access_tier"), task.get("requested_access_tier"), task.get("collaborator"))
-    # Resolved once and reused below so routing and owner-activity cannot diverge.
-    sender_tier = _tier_for(task.get("user_id"), attested_tier)
-    collaborator_enabled = broker_collaborator and sender_tier == "team"
+    # One shared helper decides this — see _sender_tier_and_collaborator — so this
+    # write and every other tier read (vault, owner-activity) can never disagree.
+    sender_tier, collaborator_enabled = _sender_tier_and_collaborator(task)
     lines = []
     # Which instance took delivery (shared-room fan-out: each Sutando writes its own
     # task file). Emitted just after id: below; KNOWN_HEADER_KEYS defangs a forged body copy.
