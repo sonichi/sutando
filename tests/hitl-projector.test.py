@@ -21,7 +21,7 @@ from hitl.projector import (  # noqa: E402
     project,
 )
 from hitl.schema import (  # noqa: E402
-    Action, CATEGORY_BLOCKED, CATEGORY_DECISION, HumanRequirement, KINDS,
+    Action, ActionReply, CATEGORY_BLOCKED, CATEGORY_DECISION, HumanRequirement, KINDS,
     NOTICE_FIELD, STATUS_RESOLVED, WIRE_FIELD, category_of,
 )
 
@@ -557,6 +557,84 @@ class RefusalClassTests(unittest.TestCase):
         self.assertEqual([i for i, _ in project(self.mgr, sent, ROOM)], [req.id])
         self.assertNotIn("failed_revision", self.mgr.store.projection(req.id))
 
+
+
+class _Relay:
+    """A relay that holds only the events it accepted: an edit of any other is its 404."""
+
+    def __init__(self, edit_miss=404, reachable=True):
+        self.sent, self.events, self.edit_miss, self.reachable = [], set(), edit_miss, reachable
+
+    def _refuse(self, code):
+        err = OSError(f"HTTP {code}")
+        err.code = code
+        raise err
+
+    def __call__(self, payload):
+        self.sent.append(payload)
+        if not self.reachable:
+            self._refuse(404)
+        if payload["op"] == "edit":
+            if payload["event_id"] not in self.events:
+                self._refuse(self.edit_miss)
+            return {"ok": True, "event_id": f"$edit{len(self.sent)}"}
+        self.events.add(f"$new{len(self.sent)}")
+        return {"ok": True, "event_id": f"$new{len(self.sent)}"}
+
+
+class EditTargetMissingTests(unittest.TestCase):
+    """A card posted through one homeserver and revised after the lane moved to another: the
+    new relay has no such event, so the edit is its 404 and the revision goes out as a new card."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.mgr = HitlManager(HitlStore(Path(self.tmp.name)))
+        self.stale = self.mgr.create(make_req(kind="choice", guard="stale"))
+        project(self.mgr, RecordingSender(), ROOM)  # projected by the relay of the old homeserver
+        self.relay = _Relay()
+
+    def _ops(self, relay, req):
+        return [p["op"] for p in relay.sent if p["dedupe_key"].startswith(f"hitl:{req.id}:")]
+
+    def test_a_missing_edit_target_is_recreated_and_holds_back_no_other_card(self):
+        self.mgr.resolve(self.stale.id)
+        fresh = self.mgr.create(make_req(kind="choice", guard="fresh"))
+        done = dict(project(self.mgr, self.relay, "!dm:s.space"))
+        self.assertEqual(set(done), {self.stale.id, fresh.id}, "the prompt beside the stale card is delivered")
+        self.assertEqual(self._ops(self.relay, self.stale), ["edit", "message"])
+        again = self.relay.sent[[p["op"] for p in self.relay.sent].index("edit") + 1]
+        self.assertNotIn("event_id", again)
+        self.assertEqual(again["extra_content"][WIRE_FIELD]["status"], STATUS_RESOLVED)
+        self.assertFalse(self.mgr.needs_projection(self.stale.id))
+        self.assertEqual(project(self.mgr, self.relay, "!dm:s.space"), [], "nothing is sent twice")
+
+    def test_the_recreated_card_takes_the_later_edits(self):
+        self.mgr.apply_action(ActionReply(hitl_id=self.stale.id, expected_revision=1,
+                                          action_id="reauth", guard="stale"))
+        project(self.mgr, self.relay, "!dm:s.space")
+        target = self.mgr.projection_target(self.stale.id)
+        self.assertIn(target, self.relay.events)
+        self.mgr.resolve(self.stale.id)
+        project(self.mgr, self.relay, "!dm:s.space")
+        self.assertEqual(self._ops(self.relay, self.stale), ["edit", "message", "edit"])
+        self.assertEqual(self.relay.sent[-1]["event_id"], target)
+
+    def test_any_other_edit_refusal_still_propagates_with_nothing_sent_anew(self):
+        self.mgr.resolve(self.stale.id)
+        relay = _Relay(edit_miss=403)
+        with self.assertRaises(OSError):
+            project(self.mgr, relay, "!dm:s.space")
+        self.assertEqual([p["op"] for p in relay.sent], ["edit"])
+        self.assertTrue(self.mgr.needs_projection(self.stale.id))
+
+    def test_an_endpoint_wide_404_still_propagates_and_records_nothing(self):
+        self.mgr.resolve(self.stale.id)
+        before = self.mgr.store.projection(self.stale.id)
+        with self.assertRaises(OSError):
+            project(self.mgr, _Relay(reachable=False), "!dm:s.space")
+        self.assertEqual(self.mgr.store.projection(self.stale.id), before)
+        self.assertTrue(self.mgr.needs_projection(self.stale.id))
 
 
 def _refusing(code):

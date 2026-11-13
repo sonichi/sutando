@@ -95,9 +95,27 @@ def _notices(manager: HitlManager, now: float) -> List[renotify.Notice]:
 
 def _refusal_code(exc: BaseException) -> Optional[int]:
     """The status with which the relay refused this one payload, or None for anything else."""
+    code = _status(exc)
+    return code if code in _CARD_4XX else None
+
+
+def _status(exc: BaseException) -> Optional[int]:
     code = getattr(exc, "code", None)
     code = code if isinstance(code, int) else getattr(exc, "status", None)
-    return code if code in _CARD_4XX else None
+    return code if isinstance(code, int) else None
+
+
+def _send_card(send: Sender, payload: Dict, target: Optional[str]) -> Tuple[Dict, bool]:
+    """Send one card revision -> (answer, created). An EDIT the relay answers 404 for has a
+    target this homeserver does not hold, so the revision is sent again as a new card; a 404
+    for that send is the endpoint's and propagates."""
+    if target:
+        try:
+            return send(wire_safe({**payload, "op": "edit", "event_id": target})), False
+        except Exception as e:  # noqa: BLE001 — only a missing target is handled here
+            if _status(e) != 404:
+                raise
+    return send(wire_safe({**payload, "op": "message"})), True
 
 
 def _detail(describe: Optional[Callable[[BaseException], str]], exc: BaseException) -> str:
@@ -191,6 +209,7 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
     still sent, then the first refusal is re-raised, carrying this pass as `.projection`.
     Any other exception from the sender propagates at once — the caller owns transport retry
     cadence, this module owns idempotency. `describe` renders a refusal's response body for the log.
+    An EDIT whose target the relay answers 404 for is sent as a new card (`_send_card`).
     """
     clock = clock or time.time
     now, mono = clock(), (monotonic or time.monotonic)()
@@ -207,12 +226,8 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
             "dedupe_key": f"hitl:{req.id}:{req.revision}",
             "extra_content": {WIRE_FIELD: req.to_wire()},
         }
-        if target:
-            payload.update({"op": "edit", "event_id": target})
-        else:
-            payload["op"] = "message"
         try:
-            answer = send(wire_safe(payload))
+            answer, created = _send_card(send, payload, target)
         except Exception as e:  # noqa: BLE001 — classified; anything not this card's re-raises
             code = _refusal_code(e)
             if code is None:
@@ -222,8 +237,8 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
         if not isinstance(answer, dict) or not (answer.get("ok") or answer.get("event_id")):
             continue
         event_id = str(answer.get("event_id") or "") or None
-        extra = None if target else renotify.on_create(req, clock())
-        manager.record_projection(req.id, req.revision, event_id if not target else None, extra)
+        extra = renotify.on_create(req, clock()) if created else None
+        manager.record_projection(req.id, req.revision, event_id if created else None, extra)
         _RETRY_DEADLINES.pop((str(manager.store.root), req.id, req.revision), None)
         out.done.append((req.id, event_id))
     if out.done:
