@@ -30,9 +30,16 @@ def capability_scripts(roots: Iterable[Path], names: Iterable[str], modules: Ite
 
 
 def owner_routing_path(workspace: Path) -> Path:
-    """`state/owner-routing.<instance>.json`, the file the primary connection's bridge writes; the
-    unsuffixed file when the primary is the legacy row, none is recorded, or its file is absent."""
+    """`state/owner-routing.<lane>.json` of the desktop's active lane when it exists, else the file the
+    primary connection's bridge writes; the unsuffixed file when the primary is the legacy row, none
+    is recorded, or its file is absent."""
     legacy = status_path("owner-routing.json", Path(workspace))
+    from gateway_serving import active_lane
+    lane = active_lane()
+    if lane:
+        active = status_path(f"owner-routing.{lane}.json", Path(workspace))
+        if active.is_file():
+            return active
     import connections
     row = connections.primary_row(Path(workspace))
     if not row or not row.get("instance"):
