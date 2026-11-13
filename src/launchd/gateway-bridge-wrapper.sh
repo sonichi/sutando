@@ -174,12 +174,16 @@ stop_agents_supervisor() {
   wait "$AGENTS_PID" 2>/dev/null || true
   AGENTS_PID=''
 }
+STOP_SIGNAL=''
 stop_wrapper() {
   STOPPING=1
+  STOP_SIGNAL="$1"
   [ -z "$CHILD_PID" ] || kill "$CHILD_PID" 2>/dev/null || true
   [ -z "$AGENTS_PID" ] || kill "$AGENTS_PID" 2>/dev/null || true
 }
-trap stop_wrapper TERM INT HUP
+trap 'stop_wrapper TERM' TERM
+trap 'stop_wrapper INT' INT
+trap 'stop_wrapper HUP' HUP
 while [ "$STOPPING" = 0 ]; do
   # A rotated or removed .env token must reach the next child: reset to the
   # environment-provided values, re-read the .env, redo the legacy mapping.
@@ -250,3 +254,9 @@ while [ "$STOPPING" = 0 ]; do
   CHILD_PID=''
 done
 stop_agents_supervisor
+# KeepAlive is crash-only: exit 0 here would leave the job down for good after a stray signal.
+# A launchctl bootout still stops it; kickstart -k restarts it either way.
+if [ -n "$STOP_SIGNAL" ]; then
+  echo "[gateway-bridge-wrapper] received SIG$STOP_SIGNAL — stopping the bridge; exiting non-zero so launchd restarts the job" >&2
+  exit $(( 128 + $(kill -l "$STOP_SIGNAL") ))
+fi
