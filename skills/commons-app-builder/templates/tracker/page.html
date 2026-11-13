@@ -9,13 +9,13 @@
     color-scheme: light dark;
     --bg: #fbfbfd; --card: #fff; --ink: #16161a; --dim: #5d5d6b;
     --line: #e3e3ea; --accent: #2f5bea; --warn: #8a5a00; --bad: #b3261e;
-    --todo: #6b7280; --doing: #2f5bea; --done: #157f4b;
+    --todo: #B7B2AD; --doing: #8A5911; --done: #06813D;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #111115; --card: #1a1a20; --ink: #f2f2f5; --dim: #a6a6b4;
       --line: #2c2c36; --accent: #7d9bff; --warn: #ffcf70; --bad: #ff8a80;
-      --todo: #9aa0ab; --doing: #7d9bff; --done: #5bd39b;
+      --todo: #B7B2AD; --doing: #F0E345; --done: #9EE2BF;
     }
   }
   * { box-sizing: border-box; }
@@ -41,8 +41,10 @@
   .item { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; min-width: 0; }
   .top { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; min-width: 0; }
   .name { font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
-  .chip { font-size: 12px; padding: 3px 9px; border-radius: 999px; border: 1px solid currentColor; white-space: nowrap; }
-  .chip.todo { color: var(--todo); } .chip.doing { color: var(--doing); } .chip.done { color: var(--done); }
+  .chip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--card); color: var(--ink); white-space: nowrap; }
+  .chip::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--dot, var(--todo)); }
+  .chip.todo { --dot: var(--todo); } .chip.doing { --dot: var(--doing); } .chip.done { --dot: var(--done); }
   /* Outcome is agent-written text: a long URL, hash or token must wrap, not widen the page. */
   .meta { color: var(--dim); font-size: 13px; margin-top: 6px; overflow-wrap: anywhere; min-width: 0; }
   .meta.over { color: var(--bad); }

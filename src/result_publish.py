@@ -126,6 +126,19 @@ def _helpers():
     return local_task_protocol, result_markers, task_archive, workspace_default
 
 
+def worker_published_path(path: str | Path, environ=None) -> Path:
+    """Where this session publishes `path`: a proactive file from a pool worker's session that acts as
+    its own agent carries the worker's stamp (`connections.session_proactive_name`), so only that
+    worker's lane delivers it. The core's session, a worker acting through the core, a copy of this
+    module without the engine's `connections`, and every task result publish under the name given."""
+    path = Path(path)
+    try:
+        import connections
+    except ImportError:
+        return path
+    return path.with_name(connections.session_proactive_name(path.name, environ))
+
+
 def _unrouted_cron_task(path: str | Path) -> str | None:
     """The task id when `path` is the live result of a `source: cron` task naming no destination.
 
@@ -259,6 +272,11 @@ def main(argv: list[str]) -> int:
         print(_USAGE, file=sys.stderr)
         return 2
     path, allow, title, outcome, parent = parsed
+    stamped = worker_published_path(path)
+    if stamped.name != Path(path).name:
+        print(f"result_publish: publishing {Path(path).name} as {stamped.name}: a pool worker's "
+              "proactive file carries its worker's stamp, so its own lane delivers it", file=sys.stderr)
+        path = str(stamped)
     text = sys.stdin.read()
     reason = None if allow else undeliverable_reason(path, text)
     if reason:

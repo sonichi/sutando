@@ -603,6 +603,30 @@ stays the pane's. The session runs `claude --plugin-dir â€¦ --permission-mode â€
 `install --new-session` rotates it only once the old generation is proven
 gone (quiescent; otherwise the old id stays and the command says so).
 
+**Resuming a conversation you already have.** `install` or `connect` with
+`--resume-session <uuid>` hosts an existing Claude Code conversation instead
+of a new one: the id is recorded as the session id and the pane starts
+`claude --resume <uuid>`. Its transcript must exist as `<uuid>.jsonl` in some
+project folder of the config dir's `projects/` (pass the `--claude-config-dir`
+it was made in), and no running Claude Code process may have it open (the CLI's
+own `sessions/` registry); otherwise nothing is changed and, for `connect`, the
+code is not spent. Claude Code finds a transcript by id from any working
+directory, so nothing is copied or linked: the conversation keeps growing in
+its own file, and new turns record the pane's `<work>/tasks` as their cwd. A
+kept id is replaced under the same rule as `--new-session`; when it cannot be
+(the old session is not proven gone), the agent is installed and running under
+the kept id, its bridge included, and the command exits **79** with a line
+naming the stop to run before installing again. Find the id with
+`/status` in that conversation, or as the file name under `projects/`.
+A host that gives the agent a config dir of its own places a copy (a clone,
+never a link to the owner's file) at
+`<claude-config-dir>/projects/<any folder>/<uuid>.jsonl` before install, and
+passes `--claude-config-dir <claude-config-dir> --resume-session <uuid>`; only
+that config dir is searched. Exit 0: the conversation is the session; 79: the
+agent runs under its earlier session id instead (nothing torn down); 2: refused
+before anything changed (bad id, no transcript, or the conversation open in a
+running Claude Code process).
+
 **Folder trust and startup dialogs.** Before it creates a session the launcher
 records Claude Code's own trust for exactly `<work>/tasks` (never a parent):
 `projects[<resolved path>].hasTrustDialogAccepted: true` in the CLI's global
