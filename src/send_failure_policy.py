@@ -5,6 +5,7 @@ Parking is the safe default: only a KNOWN transient retries.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 # 4xx timing cases only. 5xx is handled as a RANGE below, because enumerating it
@@ -60,6 +61,32 @@ def failure_status(exc: BaseException) -> int | None:
     """
     status = getattr(exc, "status", None)
     return status if isinstance(status, int) and not isinstance(status, bool) else None
+
+
+# How a gateway words a 403 that is the room's verdict on the sender, not the bearer's.
+_ROOM_REFUSAL_MARKERS = ("not in this room", "not a room member", "not a member", "m_forbidden")
+
+
+def is_room_membership_refusal(status: int, body: object) -> bool:
+    """True for a 403 whose JSON error says the room refused the sender.
+
+    The gateway authenticated the bearer first, so neither a retry nor a credential
+    refresh changes the answer: the send is over. Any other 403 (an edge page, a
+    bare status) stays with the caller's auth handling.
+    """
+    if status != 403:
+        return False
+    if isinstance(body, (bytes, bytearray)):
+        body = bytes(body).decode("utf-8", "replace")
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except ValueError:
+            return False
+    if not isinstance(body, dict):
+        return False
+    said = " ".join(str(body.get(k) or "") for k in ("error", "errcode")).lower()
+    return any(marker in said for marker in _ROOM_REFUSAL_MARKERS)
 
 
 def is_retryable_http_status(status: int, *, auth_recoverable: bool = False) -> bool:

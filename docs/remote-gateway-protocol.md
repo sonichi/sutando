@@ -896,6 +896,12 @@ so:
   as task results, counted on the item, so a restart keeps the count): 401/403, 408, 425,
   429, and a connection that was refused or a host that did not resolve. Another 4xx parks
   at once. A 400 naming an upgraded owner DM holds the file until the DM is repointed.
+- **A room that refuses the sender ends the send.** A 403 whose JSON error says the sender
+  is not in the room (`sender is not in this room`, `not a room member`, `M_FORBIDDEN`) is
+  the room's answer, not the bearer's: the gateway authenticated the request first. It is
+  sent once, the item parks (`permanent-refusal`), the file moves to `results/undelivered/`
+  with a log line, and nothing is raised to the poll loop's credential recovery. Any other
+  403 keeps the retry above (`send_failure_policy.is_room_membership_refusal` decides).
 - **A message about a task** is named `proactive-about-<task id>--<ts>.txt`
   (`proactive_routing.about_task_filename`). In the task's own room it posts in the task's
   thread: an ask already in a thread keeps that thread's root, a top-level ask is rooted at

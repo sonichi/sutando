@@ -31,6 +31,7 @@ reconciliation (and runs the same delivery read).
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import socket
 from collections import OrderedDict
@@ -41,7 +42,7 @@ from typing import Callable, Optional
 
 from ..outbox import DeliveryOutcome as OutboxOutcome
 from ..outbox_adapter import classify_response
-from ..send_failure_policy import is_retryable_http_status
+from ..send_failure_policy import is_retryable_http_status, is_room_membership_refusal
 
 from .contract import (DeliveryAttempt, DeliveryOutcome, DeliveryReceipt,
                        ProviderCapabilities, ProviderIndeterminate,
@@ -197,6 +198,19 @@ def room_response_refused(resp) -> bool:
                                            or resp.get("errcode"))
 
 
+def room_refused_sender(e: urllib.error.HTTPError) -> bool:
+    """The room, not the bearer, refused this send: the 403's own body says so. The body is
+    read once and kept on the error, so every later reader of it sees the same bytes."""
+    buffered = getattr(e, "sparrow_body", None)
+    if buffered is None:
+        try:
+            buffered = io.BytesIO(e.read() or b"")
+        except Exception:  # noqa: BLE001 - an unreadable body names no room refusal
+            buffered = io.BytesIO()
+        e.sparrow_body = buffered
+    return is_room_membership_refusal(e.code, buffered.getvalue())
+
+
 def _never_connected(exc: BaseException) -> bool:
     """A failure urllib can only raise before the request was written: no connection was made."""
     reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
@@ -232,6 +246,10 @@ class AG2SpaceRoomMessageProvider:
         except urllib.error.HTTPError as e:
             if 500 <= e.code <= 599:
                 raise ProviderIndeterminate(f"gateway error for {item_id}: HTTP {e.code}") from e
+            if room_refused_sender(e):
+                # Membership is not a credential: retrying repeats the 403 until the window ends.
+                raise ProviderPermanentRefused(
+                    f"room {room} refused {item_id}: the sender is not in it (HTTP 403)") from e
             if is_retryable_http_status(e.code, auth_recoverable=True):
                 raise ProviderRefused(f"gateway refused {item_id} for now: HTTP {e.code}") from e
             raise ProviderPermanentRefused(f"gateway refused {item_id}: HTTP {e.code}") from e
