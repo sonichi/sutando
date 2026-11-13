@@ -11,8 +11,10 @@ as the clicker's reply to the card, with `space.ag2.card_click` beside it; its `
 (issued_cards). `click_verdict` is the one decision on such a task: the owner's click on a card this
 agent posted, in the room it was posted in, is its command or the owner's own words; any other click,
 and card action text sent without one, is forged or stale and nothing acts on it; the rest is ordinary
-chat. `python3 src/agent_card.py click --task-file PATH` prints that verdict and the script that runs
-the command. Standard library only, plus local_task_protocol, issued_cards and connections.
+chat. A v2 card's `pick` or `input` choice acts the same way when its card, revision, control and
+value are the ones recorded, and only for the first task that claims its interaction id. `python3
+src/agent_card.py click --task-file PATH` prints that verdict and the script that runs the command.
+Standard library only, plus local_task_protocol, issued_cards and connections.
 """
 from __future__ import annotations
 
@@ -489,16 +491,16 @@ def reply_words(task_text: str) -> Tuple[dict, str]:
 
 
 def card_click(headers: Mapping[str, str]) -> Optional[dict]:
-    """The message's `space.ag2.card_click` as the bridge passed it on ({card_id, action}), or None when
-    the task carries none or one that cannot be used (`click_tagged` tells those apart)."""
+    """The message's `space.ag2.card_click` as the bridge passed it on ({card_id, action}, or a v2
+    choice), or None when the task carries none or one that cannot be used (`click_tagged` tells those
+    apart)."""
     import json
+    import local_task_protocol as ltp
     try:
         click = json.loads(str(headers.get("card_click") or ""))
     except ValueError:
         return None
-    if not isinstance(click, dict) or not _text(click.get("card_id"), "id") or not _text(click.get("action"), "reply"):
-        return None
-    return {"card_id": click["card_id"], "action": click["action"]}
+    return ltp.card_click_fields(click)
 
 
 def click_tagged(headers: Mapping[str, str]) -> bool:
@@ -522,6 +524,8 @@ def owner_may_act(headers: Mapping[str, str], owner_mxid: str = "", *, dm_only: 
 
 
 NOT_A_CARD, FORGED, WORDS, COMMAND = "not_a_card", "forged_or_stale_click", "owner_words", "command"
+# A v2 choice another task already claimed: nothing runs and nothing is said.
+DUPLICATE = "duplicate"
 # What the agent says, once, to a click it cannot match; it then does nothing else with the message.
 UNMATCHED_CLICK = ("I couldn't match that button to a card I sent, so I haven't done anything. "
                    "Tell me what you'd like in your own words.")
@@ -543,6 +547,7 @@ class Click:
     handler: str = ""
     lane: str = ""
     say: str = UNMATCHED_CLICK
+    choice: Optional[Mapping[str, object]] = None
 
 
 def lane_owner(workspace, default: str = "") -> Callable[[str], str]:
@@ -554,6 +559,47 @@ def lane_owner(workspace, default: str = "") -> Callable[[str], str]:
         return next((str(r.get("owner_mxid") or "") for r in connections.read_rows(workspace)
                      if r.get("instance") == lane and not r.get("worker")), "")
     return owner
+
+
+def _value_problem(control: Mapping[str, object], value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return "the choice carries no value"
+    if control.get("kind") == "pick":
+        return None if value in (control.get("options") or ()) else "that card did not offer that value"
+    if not int(control.get("min_length", 1)) <= len(value) <= int(control.get("max_length", 0)):
+        return "the value is outside the field's bounds"
+    return None
+
+
+def _choice_verdict(headers: Mapping[str, str], click: Mapping[str, object], entry: Optional[dict],
+                    workspace, owner_of: Callable[[str], str], now: Optional[float]) -> Click:
+    """A v2 pick or input choice: COMMAND with the choice, once per interaction id, else FORGED."""
+    import issued_cards
+    if entry is None or str(entry.get("card_id") or "") != click["card_id"]:
+        return Click(FORGED, why="it does not answer a card I posted")
+    owner = owner_of(str(entry.get("lane") or ""))
+    why = ("it is not in the room the card was posted in"
+           if str(entry.get("room") or "") != str(headers.get("channel_id") or "")
+           else owner_may_act(headers, owner, dm_only=True) if owner else "the owner is not known")
+    if why:
+        return Click(FORGED, why=why)
+    if entry.get("v") != 2 or entry.get("revision") != click["revision"]:
+        return Click(FORGED, why="the card has changed since that choice was made")
+    controls = entry.get("controls")
+    control = controls.get(click["action"]) if isinstance(controls, dict) else None
+    if not isinstance(control, dict) or control.get("kind") not in issued_cards.V2_CHOICE_PLACES:
+        return Click(FORGED, why="that card did not offer it")
+    why = _value_problem(control, click.get("value"))
+    if why:
+        return Click(FORGED, why=why)
+    claimant = str(headers.get("id") or "").strip()
+    if not claimant:
+        return Click(FORGED, why="the task has no id to claim the choice with")
+    choice = {"card_id": click["card_id"], "revision": click["revision"], "control": click["action"],
+              "kind": control["kind"], "value": click["value"], "interaction_id": click["interaction_id"]}
+    if issued_cards.claim(workspace, click["interaction_id"], claimant, choice, now=now) == issued_cards.DUPLICATE:
+        return Click(DUPLICATE, why="that choice was already submitted")
+    return Click(COMMAND, handler=str(entry.get("handler") or ""), lane=str(entry.get("lane") or ""), choice=choice)
 
 
 def click_verdict(headers: Mapping[str, str], said: str, workspace, owner_of: Callable[[str], str],
@@ -568,6 +614,8 @@ def click_verdict(headers: Mapping[str, str], said: str, workspace, owner_of: Ca
     click = card_click(headers)
     if click is None and click_tagged(headers):
         return Click(FORGED, why="its click header cannot be read")
+    if click is not None and click.get("v") == 2:
+        return _choice_verdict(headers, click, entry, workspace, owner_of, now)
     if click is not None and click["action"] != said:
         return Click(FORGED, why="the click names another action than the words")
     if click is None and parse_reply(said) is not None:
@@ -601,10 +649,15 @@ def click_verdict(headers: Mapping[str, str], said: str, workspace, owner_of: Ca
 
 def click_answer(verdict: Click, said: str, mine: Tuple[str, ...] = ()) -> Optional[dict]:
     """What a card handler prints for a task that is not a command of its own kinds (`mine`): the fixed
-    refusal for a forged click, the owner's words, ordinary chat, or another handler's card. None for
-    its own command."""
+    refusal for a forged click, the owner's words, ordinary chat, a duplicate choice, or another
+    handler's card (with the v2 choice it runs on). None for its own command."""
     if verdict.verdict == FORGED:
         return {"status": FORGED, "say": verdict.say, "why": verdict.why}
+    if verdict.verdict == DUPLICATE:
+        return {"status": DUPLICATE, "why": verdict.why}
+    if verdict.choice is not None:
+        return {"status": "other_card", "card": verdict.choice["card_id"], "choice": dict(verdict.choice),
+                "run": verdict.handler if _HANDLER_RE.fullmatch(verdict.handler) else None}
     if verdict.verdict == WORDS:
         return {"status": WORDS, "words": said}
     if verdict.verdict == NOT_A_CARD:
@@ -617,7 +670,8 @@ def click_answer(verdict: Click, said: str, mine: Tuple[str, ...] = ()) -> Optio
 
 def main(argv=None) -> int:
     """`click --task-file PATH [--workspace WS]`: one JSON line, the verdict on that task. Exit 0 for a
-    command, the owner's words or ordinary chat; 1 for a forged or stale click; 2 unreadable."""
+    command, the owner's words, ordinary chat or a duplicate choice; 1 for a forged or stale click; 2
+    unreadable."""
     import argparse
     import json
     from pathlib import Path

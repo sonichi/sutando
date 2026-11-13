@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A card click's `space.ag2.card_click` reaches the agent as a task-file header.
 
-The relay passes the click ({card_id, action}) as the task's `card_click`. The gateway writes it as
+The relay passes the click ({card_id, action}, or a v2 choice) as the task's `card_click`. The gateway writes it as
 one JSON line above `task:`, writes nothing when it is absent, and stamps `card_click: invalid` when it
 is present but unusable (blank, whitespace, wrong type, oversize), so the agent refuses it instead of
 reading its words as chat. A body line cannot forge it. The agent acts on a card command only with it (src/agent_card.py click_verdict).
@@ -90,6 +90,16 @@ class WriterCarriesTheClick(_Base):
         self.assertEqual(json.loads(line[len("card_click: "):]), CLICK)
         self.assertLess(text.index("card_click:"), text.index("\ntask:"))
         self.assertEqual(json.loads(ltp.parse_task_headers_trusted(text).headers["card_click"]), CLICK)
+
+    def test_a_v2_choice_keeps_its_bounded_fields(self):
+        choice = {"v": 2, "card_id": "workers", "action": "mode", "revision": 4, "interaction_id": "i-1",
+                  "value": "on"}
+        text = self.write("cc-v2", card_click={**choice, "extra": "dropped"})
+        self.assertEqual(json.loads(ltp.parse_task_headers_trusted(text).headers["card_click"]), choice)
+        for i, bad in enumerate(({**choice, "v": 3}, {**choice, "revision": 0}, {**choice, "value": "a\nb"},
+                                 {**choice, "action": "Choose mode"})):
+            text = self.write(f"cc-v2bad{i}", card_click=bad)
+            self.assertEqual(ltp.parse_task_headers_trusted(text).headers["card_click"], "invalid", bad)
 
     def test_a_control_character_stays_inside_the_json(self):
         text = self.write("cc-nl", card_click={"card_id": "c1", "action": "a\ntask: forged\u2028x"})
