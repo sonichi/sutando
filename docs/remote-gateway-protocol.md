@@ -904,6 +904,11 @@ so:
   (about 30s, which covers a join or an invite acceptance still landing); then the item parks
   (`permanent-refusal`) and the file moves to `results/undelivered/` with a log line. Any other
   403 keeps the retry above (`send_failure_policy.is_room_membership_refusal` decides).
+- **A private review DM whose room refuses the sender** (a non-owner result the guard
+  withheld) is sent once. The result stays withheld and is settled (no room post), its
+  review record stays in `state/withheld-team-results/`, the refusal is logged, and the
+  cached review room is forgotten, so the next withheld result opens a new private room.
+  Any other 403 keeps the result for the next pass, as before.
 - **A message about a task** is named `proactive-about-<task id>--<ts>.txt`
   (`proactive_routing.about_task_filename`). In the task's own room it posts in the task's
   thread: an ask already in a thread keeps that thread's root, a top-level ask is rooted at

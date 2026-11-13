@@ -892,7 +892,12 @@ def _route_withheld_review(path: Path) -> bool:
             # Non-AG2 clients ignore it and retain the typed Yes/No fallback.
             payload["extra_content"] = {
                 "space.ag2.a2ui": _review_buttons(str(record["review_id"]))}
-        answer = _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S)
+        try:
+            answer = _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S)
+        except urllib.error.HTTPError as e:
+            if room_refused_sender(e) and (_read_private_json(_WITHHELD_DM_CACHE) or {}).get("room_id") == room:
+                _WITHHELD_DM_CACHE.unlink(missing_ok=True)  # not a room the agent is in: the next review makes one
+            raise
         if not isinstance(answer, dict) or not answer.get("ok"):
             raise RuntimeError(f"private review DM part {index}/{len(messages)} was not accepted")
     record.update({"status": "awaiting_owner", "owner": owner, "dm_room_id": room,
@@ -1775,6 +1780,15 @@ def _guarded_result_body(tid: str, body: str):
         try:
             if not _route_withheld_review(artifact):
                 return None, f"{verdict.reason}; private owner review unavailable"
+        except urllib.error.HTTPError as exc:
+            if not room_refused_sender(exc):
+                return None, f"{verdict.reason}; private owner review failed: {diagnostics.describe(exc)}"
+            # Retrying repeats the 403: the result stays withheld, its review record kept on disk.
+            verdict = verdict._replace(reason=(
+                f"{verdict.reason}; the private review room refused the agent (HTTP 403, not in the "
+                f"room), review {artifact.stem} kept unsent"))
+            _log(f"withheld review {artifact.stem}: the private review room refused the agent "
+                 "(HTTP 403, not in the room); not retried, the review record is kept")
         except Exception as exc:  # noqa: BLE001 — retain result file for retry
             return None, f"{verdict.reason}; private owner review failed: {diagnostics.describe(exc)}"
     result = (verdict.body, verdict.reason)
