@@ -22,6 +22,11 @@ Exit: 0 on pass, 1 on fail.
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# The launcher this spawns reaches gateway credentials: no outer value survives.
+isolate_os_environ()
+
 import subprocess
 import sys
 import tempfile

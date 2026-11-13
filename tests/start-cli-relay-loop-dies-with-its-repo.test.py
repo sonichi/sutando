@@ -27,6 +27,11 @@ Run: python3 tests/start-cli-relay-loop-dies-with-its-repo.test.py  (exit 0/1)
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# The relay loop this spawns reaches gateway credentials: no outer value survives.
+isolate_os_environ()
+
 import os
 import re
 import subprocess
