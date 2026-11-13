@@ -1006,8 +1006,10 @@ def _room_refusing(room, body=_NOT_IN_ROOM, ok=None):
 
 
 class RoomMembershipRefusalTests(_RefusalDrive):
-    """A 403 that is the room's verdict on the sender ends that card after one send, is
-    recorded once, and never holds back the cards behind it (#5054)."""
+    """A 403 that is the room's verdict on the sender is charged to that card alone, fails it
+    after ROOM_REFUSAL_ATTEMPTS sends, and never holds back the cards behind it (#5054)."""
+
+    CAP = 5  # send_failure_policy.ROOM_REFUSAL_ATTEMPTS; a literal so the parent can run this
 
     def drive(self, send, step=10 ** 7, describe=lambda e: getattr(e, "body", "")):
         self.t += step
@@ -1018,14 +1020,20 @@ class RoomMembershipRefusalTests(_RefusalDrive):
         except OSError as e:
             return getattr(e, "projection", None), e
 
-    def test_a_card_whose_room_refuses_the_sender_is_sent_once_and_the_rest_go_out(self):
+    def test_the_policy_bound_is_the_one_used(self):
+        self.assertEqual(self.pj.ROOM_REFUSAL_ATTEMPTS, self.CAP)
+
+    def test_a_card_whose_room_refuses_the_sender_is_bounded_and_the_rest_go_out(self):
         left = self.mgr.create(make_req(guard="a", device={"id": "da", "name": "n"}, room="!left:x"))
         others = [self.card(g) for g in ("b", "c")]
         send = _room_refusing("!left:x")
-        raised = [self.drive(send, step=120)[1] for _ in range(10)]
+        raised = [self.drive(send, step=60)[1]]
+        first = {p["extra_content"][WIRE_FIELD]["id"] for p in send.ok.sent if WIRE_FIELD in p["extra_content"]}
+        self.assertEqual(first, {r.id for r in others}, "the cards behind it went out in the same pass")
+        raised += [self.drive(send, step=60)[1] for _ in range(29)]  # a pass a minute for 30 minutes
         cards = [p for p in send.refused if WIRE_FIELD in p["extra_content"]]
-        self.assertEqual(len(cards), 1, "the refused card was sent once, not every pass")
-        self.assertEqual(raised, [None] * 10, "a room's refusal of one card is not the relay's failure")
+        self.assertEqual(len(cards), self.CAP, "the refused card is sent a bounded number of times")
+        self.assertEqual(raised, [None] * 30, "a room's refusal of one card is not the relay's failure")
         self.assertTrue(self.mgr.projection_failed(left.id))
         self.assertIn("not in this room", self.mgr.store.projection(left.id)["refused_error"])
         sent = {p["extra_content"][WIRE_FIELD]["id"] for p in send.ok.sent if WIRE_FIELD in p["extra_content"]}
@@ -1034,9 +1042,9 @@ class RoomMembershipRefusalTests(_RefusalDrive):
     def test_the_failure_notice_a_refusing_room_also_refuses_is_recorded_once(self):
         left = self.mgr.create(make_req(guard="a", device={"id": "da", "name": "n"}, room="!left:x"))
         send = _room_refusing("!left:x")
-        raised = [self.drive(send, step=120)[1] for _ in range(10)]
-        self.assertEqual(len(send.refused), 2, "one card, one failure notice, then nothing")
-        self.assertEqual(raised, [None] * 10)
+        raised = [self.drive(send, step=60)[1] for _ in range(30)]
+        self.assertEqual(len(send.refused), self.CAP + 1, "the bounded card sends, one notice, then nothing")
+        self.assertEqual(raised, [None] * 30)
         self.assertEqual(self.mgr.store.projection(left.id).get("failed_notice"), left.revision)
         self.assertNotIn(left.id, pending_ids(self.mgr, clock=lambda: time.time() + self.t))
 
@@ -1057,9 +1065,9 @@ class RoomMembershipRefusalTests(_RefusalDrive):
 
         def send(payload):  # the card meets the room's refusal, its failure notice a bad token
             return (token if NOTICE_FIELD in payload["extra_content"] else card)(payload)
-        _, raised = self.drive(send, step=120)
+        raised = [self.drive(send, step=600)[1] for _ in range(self.CAP)]
         self.assertTrue(self.mgr.projection_failed(req.id))
-        self.assertIsNotNone(raised, "a bad token on the notice is the caller's to recover")
+        self.assertIsNotNone(raised[-1], "a bad token on the notice is the caller's to recover")
         self.assertNotIn("failed_notice", self.mgr.store.projection(req.id), "the notice stays owed")
 
 

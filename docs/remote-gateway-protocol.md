@@ -904,9 +904,10 @@ so:
   (about 30s, which covers a join or an invite acceptance still landing); then the item parks
   (`permanent-refusal`) and the file moves to `results/undelivered/` with a log line. Any other
   403 keeps the retry above (`send_failure_policy.is_room_membership_refusal` decides).
-- **A runtime prompt card whose room refuses the sender** is sent once: that revision is
-  marked failed (logged, and kept live where health-check sees it) and the pass goes on to
-  the cards behind it, with no backoff. Its failure notice, refused by the same room, is
+- **A runtime prompt card whose room refuses the sender** is charged to that card alone: the
+  pass goes on to the cards behind it with no bridge backoff, the card waits out its own
+  backoff, and after `ROOM_REFUSAL_ATTEMPTS` sends that revision is marked failed (logged,
+  and kept live where health-check sees it). Its failure notice, refused by the same room, is
   recorded as sent and not repeated. Any other 403 still raises to the caller's backoff.
 - **A message about a task** is named `proactive-about-<task id>--<ts>.txt`
   (`proactive_routing.about_task_filename`). In the task's own room it posts in the task's

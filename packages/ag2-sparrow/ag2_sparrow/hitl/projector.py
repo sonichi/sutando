@@ -18,9 +18,9 @@ import time
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 try:
-    from ..send_failure_policy import is_room_membership_refusal   # the vendored package layout
+    from ..send_failure_policy import ROOM_REFUSAL_ATTEMPTS, is_room_membership_refusal  # vendored
 except ImportError:
-    from send_failure_policy import is_room_membership_refusal     # the repo's src/ on sys.path
+    from send_failure_policy import ROOM_REFUSAL_ATTEMPTS, is_room_membership_refusal    # src/
 
 from . import renotify
 from .manager import HitlManager
@@ -200,7 +200,7 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
     requirement's `room` when set, else to `room_id`.
 
     A rejected send is skipped (nothing recorded) so the next drive retries it.
-    A 403 whose room refused the sender fails its card's revision at once, like a card's own defect.
+    A 403 whose room refused the sender is charged to its card alone, failing it after ROOM_REFUSAL_ATTEMPTS.
     A 400, 413 or 422 never stops the other cards in the pass. It is charged to its card
     (backed off on its own and, after PROJECTION_MAX_REFUSALS, marked failed for that
     revision) as `_settle_refusals` decides; when no card was accepted the due notices are
@@ -235,7 +235,7 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
                 refused = _room_refusal(describe, e)
                 if refused is None:
                     raise
-                _refuse(manager, req, 403, refused, now, mono, out, max_refusals=1)
+                _refuse(manager, req, 403, refused, now, mono, out, max_refusals=ROOM_REFUSAL_ATTEMPTS)
                 continue
             held.append((req, code, _detail(describe, e), e))
             continue
