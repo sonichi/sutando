@@ -521,7 +521,8 @@ def resolve_active_target(activity_path):
 
 def resolve_owner_dm_target(activity_path, source=""):
     """(source, owner DM room) for a blocked-on-you alert, or None when no owner DM is known.
-    A blocker is for the owner alone, so it never follows the last-active shared room."""
+    A blocker is for the owner alone, so it never follows the last-active shared room.
+    ("", "") when the DM is known but not the core's to post in: macOS-only."""
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
@@ -535,6 +536,9 @@ def resolve_owner_dm_target(activity_path, source=""):
     src = "ag2space" if source in ("", "discord", "slack", "telegram") else source
     if not _is_deliverable(src, dm):
         return None
+    # A refused DM is still the only place for a blocker: silence, not the shared room.
+    if not _core_may_speak(activity_path, dm):
+        return "", ""
     return src, dm
 
 

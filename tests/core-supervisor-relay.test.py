@@ -848,7 +848,7 @@ class TestBlockerAlertGoesToOwnerDm(unittest.TestCase):
 
     def _ws(self, td, dm=True, owner_dm=None):
         st = os.path.join(td, "state")
-        os.makedirs(st)
+        os.makedirs(st, exist_ok=True)
         act = os.path.join(st, "last-owner-activity.json")
         with open(act, "w") as f:
             json.dump({"channel": "ag2space", "channel_id": self.ROOM}, f)
@@ -900,6 +900,56 @@ class TestBlockerAlertGoesToOwnerDm(unittest.TestCase):
             self.assertEqual(sent, [("ag2space", self.ROOM)])
             self.assertIn("owner DM unreadable", err.getvalue())
             self.assertIn("routing store unavailable", err.getvalue())
+
+    WID = "39041ce6a4444e28bf94859ec2426270"
+
+    def _bind(self, td, room, liveness):
+        """Bind `room` to a worker: "alive", "dead", "unknown" (no sentinel) or "malformed"."""
+        st = os.path.join(td, "state")
+        os.makedirs(st, exist_ok=True)
+        with open(os.path.join(st, "bindings.json"), "w") as f:
+            f.write("{not json" if liveness == "malformed"
+                    else json.dumps({"bindings": {room: self.WID}}))
+        pid = {"alive": os.getpid(), "dead": 2**22 - 7}.get(liveness)
+        if pid is not None:
+            with open(os.path.join(st, f"watch-tasks-stream-{self.WID}.pid"), "w") as f:
+                f.write(f"{pid}\n")
+
+    def _refused(self, liveness, owner_dm=None):
+        with tempfile.TemporaryDirectory() as td:
+            self._bind(td, owner_dm or self.DM, liveness)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                sent = self._run(td, "blocked-human", owner_dm=owner_dm)
+            return sent, err.getvalue()
+
+    def test_owner_dm_bound_to_an_alive_worker_gets_nothing(self):
+        sent, err = self._refused("alive")
+        self.assertEqual(sent, [])
+        self.assertIn(f"not posting to {self.DM}", err)
+
+    def test_owner_dm_bound_to_a_worker_of_unknown_liveness_gets_nothing(self):
+        sent, err = self._refused("unknown")
+        self.assertEqual(sent, [])
+        self.assertIn("UNKNOWN", err)
+
+    def test_malformed_bindings_send_nothing(self):
+        sent, err = self._refused("malformed")
+        self.assertEqual(sent, [])
+        self.assertIn("bindings unreadable", err)
+
+    def test_refused_room_that_is_both_last_active_and_owner_dm_gets_nothing(self):
+        for liveness in ("alive", "unknown", "malformed"):
+            with self.subTest(liveness=liveness):
+                self.assertEqual(self._refused(liveness, owner_dm=self.ROOM)[0], [])
+
+    def test_bindings_that_leave_the_owner_dm_free_still_deliver(self):
+        # Positive controls: another room bound, and the DM bound to a dead worker.
+        for room, liveness in ((self.ROOM, "alive"), (self.DM, "dead")):
+            with self.subTest(room=room, liveness=liveness), \
+                    tempfile.TemporaryDirectory() as td:
+                self._bind(td, room, liveness)
+                self.assertEqual(self._run(td, "blocked-human"), [("ag2space", self.DM)])
 
     def test_soft_notice_keeps_last_active_room(self):
         with tempfile.TemporaryDirectory() as td:
