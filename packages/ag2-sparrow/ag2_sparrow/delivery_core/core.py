@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from .contract import (ClaimBackend, Defer, DeliveryAttempt, DeliveryOutcome, DeliveryProvider,
-                       DrainResult, DrainStatus, ProviderIndeterminate,
+                       DrainResult, DrainStatus, ProviderBoundedRefused, ProviderIndeterminate,
                        ProviderRefused, ProviderPermanentRefused, RecoverReport)
 
 
@@ -106,8 +106,10 @@ class DeliveryCore:
         except ProviderIndeterminate as exc:
             return DeliveryOutcome.OUTCOME_UNKNOWN, None, None, False, str(exc)
         except ProviderRefused as exc:
+            spent = (isinstance(exc, ProviderBoundedRefused)
+                     and self.backend.attempts(item_id) + 1 >= exc.attempts)
             return (DeliveryOutcome.NOT_DELIVERED, None, None,
-                    isinstance(exc, ProviderPermanentRefused), str(exc))
+                    spent or isinstance(exc, ProviderPermanentRefused), str(exc))
 
     def _reconcile(self, item_id: str, payload: bytes, key: str):
         """Resolve a prior ambiguity, or None when reconciliation resolved

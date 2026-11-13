@@ -42,9 +42,10 @@ from typing import Callable, Optional
 
 from ..outbox import DeliveryOutcome as OutboxOutcome
 from ..outbox_adapter import classify_response
-from ..send_failure_policy import is_retryable_http_status, is_room_membership_refusal
+from ..send_failure_policy import (ROOM_REFUSAL_ATTEMPTS, is_retryable_http_status,
+                                   is_room_membership_refusal)
 
-from .contract import (DeliveryAttempt, DeliveryOutcome, DeliveryReceipt,
+from .contract import (DeliveryAttempt, DeliveryOutcome, DeliveryReceipt, ProviderBoundedRefused,
                        ProviderCapabilities, ProviderIndeterminate,
                        ProviderRefused, ProviderPermanentRefused)
 
@@ -247,9 +248,10 @@ class AG2SpaceRoomMessageProvider:
             if 500 <= e.code <= 599:
                 raise ProviderIndeterminate(f"gateway error for {item_id}: HTTP {e.code}") from e
             if room_refused_sender(e):
-                # Membership is not a credential: retrying repeats the 403 until the window ends.
-                raise ProviderPermanentRefused(
-                    f"room {room} refused {item_id}: the sender is not in it (HTTP 403)") from e
+                # Membership is not a credential; a few sends cover a join still landing.
+                raise ProviderBoundedRefused(
+                    f"room {room} refused {item_id}: the sender is not in it (HTTP 403)",
+                    ROOM_REFUSAL_ATTEMPTS) from e
             if is_retryable_http_status(e.code, auth_recoverable=True):
                 raise ProviderRefused(f"gateway refused {item_id} for now: HTTP {e.code}") from e
             raise ProviderPermanentRefused(f"gateway refused {item_id}: HTTP {e.code}") from e

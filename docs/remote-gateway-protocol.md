@@ -898,9 +898,11 @@ so:
   at once. A 400 naming an upgraded owner DM holds the file until the DM is repointed.
 - **A room that refuses the sender ends the send.** A 403 whose JSON error says the sender
   is not in the room (`sender is not in this room`, `not a room member`, or Matrix's `User … not in room !…`; a bare `M_FORBIDDEN` or "not a member" is not enough, since a bad token or a workspace refusal uses them too) is
-  the room's answer, not the bearer's: the gateway authenticated the request first. It is
-  sent once, the item parks (`permanent-refusal`), the file moves to `results/undelivered/`
-  with a log line, and nothing is raised to the poll loop's credential recovery. Any other
+  the room's answer, not the bearer's: the gateway authenticated the request first, so
+  nothing is raised to the poll loop's credential recovery. Only a join can change it, so the
+  send gets `send_failure_policy.ROOM_REFUSAL_ATTEMPTS` (5) tries on the outbox's own backoff
+  (about 30s, which covers a join or an invite acceptance still landing); then the item parks
+  (`permanent-refusal`) and the file moves to `results/undelivered/` with a log line. Any other
   403 keeps the retry above (`send_failure_policy.is_room_membership_refusal` decides).
 - **A message about a task** is named `proactive-about-<task id>--<ts>.txt`
   (`proactive_routing.about_task_filename`). In the task's own room it posts in the task's

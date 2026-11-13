@@ -63,6 +63,10 @@ def failure_status(exc: BaseException) -> int | None:
     return status if isinstance(status, int) and not isinstance(status, bool) else None
 
 
+# Sends a room-membership refusal gets before it parks: on the outbox's 2s-doubling backoff
+# that spans about 30s, enough for a join or an invite acceptance still landing.
+ROOM_REFUSAL_ATTEMPTS = 5
+
 # How a gateway words a 403 that is the room's verdict on the sender, not the bearer's.
 # Room-specific wording only: M_FORBIDDEN and "not a member" also mean a bad token or workspace.
 _ROOM_REFUSAL_MARKERS = ("not in this room", "not a room member", " not in room !")
@@ -71,9 +75,9 @@ _ROOM_REFUSAL_MARKERS = ("not in this room", "not a room member", " not in room 
 def is_room_membership_refusal(status: int, body: object) -> bool:
     """True for a 403 whose JSON error says the room refused the sender.
 
-    The gateway authenticated the bearer first, so neither a retry nor a credential
-    refresh changes the answer: the send is over. Any other 403 (an edge page, a
-    bare status) stays with the caller's auth handling.
+    The gateway authenticated the bearer first, so a credential refresh never changes the
+    answer; only a join can, so the send gets ROOM_REFUSAL_ATTEMPTS tries, then is over.
+    Any other 403 (an edge page, a bare status) stays with the caller's auth handling.
     """
     if status != 403:
         return False
