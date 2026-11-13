@@ -204,31 +204,50 @@ def live(workspace: Path, event_id: str, *, now: Optional[float] = None) -> Opti
     return entry if isinstance(entry.get("offers"), dict) else None
 
 
-CLAIMED, SAME, DUPLICATE = "claimed", "same", "duplicate"
+CLAIMED, SAME, DUPLICATE, REFUSED = "claimed", "same", "duplicate", "refused"
+
+
+def _held_claims(path: Path) -> Optional[dict]:
+    """The claims file's entries; {} when it does not exist, None when it cannot be trusted."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return None
+    held = data.get("claims") if isinstance(data, dict) else None
+    if not isinstance(held, dict):
+        return None
+    for v in held.values():
+        expiry = v.get("expires_at") if isinstance(v, dict) else None
+        if not isinstance(v, dict) or not isinstance(v.get("claimant"), str) \
+                or isinstance(expiry, bool) or not isinstance(expiry, (int, float)):
+            return None
+    return held
 
 
 def claim(workspace: Path, interaction_id: str, claimant: str, choice: Mapping[str, object], *,
-          now: Optional[float] = None, ttl_s: float = TTL_S) -> str:
-    """Claim the v2 submission `interaction_id` for the task `claimant`: CLAIMED the first time, SAME
-    when that task claimed it already (its handler reading it again), DUPLICATE for any other task."""
+          expires_at: float, now: Optional[float] = None) -> str:
+    """Claim the v2 submission `interaction_id` for the task id `claimant` until `expires_at` (its card's
+    expiry). Once per submission id across tasks: CLAIMED the first time, SAME for the task id that
+    claimed it (its handler reading it again, or that task re-delivered under its own id), DUPLICATE for
+    any other task. REFUSED, with nothing written, when the file cannot be trusted or is full of live claims."""
     from file_lock import locked_file
     from local_record import write_whole
     now = time.time() if now is None else now
     path = Path(workspace).joinpath(*CLAIMS)
     with locked_file(path.with_name(path.name + ".lock")):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            data = {}
-        held = data.get("claims") if isinstance(data, dict) else None
-        held = {k: v for k, v in (held if isinstance(held, dict) else {}).items()
-                if isinstance(v, dict) and float(v.get("expires_at") or 0) > now}
+        held = _held_claims(path)
+        if held is None:
+            return REFUSED
+        held = {k: v for k, v in held.items() if v["expires_at"] > now}
         earlier = held.get(interaction_id)
         if earlier is not None:
-            return SAME if earlier.get("claimant") == claimant else DUPLICATE
-        held[interaction_id] = {"claimant": claimant, "choice": dict(choice), "at": now, "expires_at": now + ttl_s}
-        newest = sorted(held.items(), key=lambda kv: kv[1]["expires_at"])[-MAX_CLAIMS:]
-        write_whole(path, {"claims": dict(newest)})
+            return SAME if earlier["claimant"] == claimant else DUPLICATE
+        if len(held) >= MAX_CLAIMS or expires_at <= now:
+            return REFUSED
+        held[interaction_id] = {"claimant": claimant, "choice": dict(choice), "at": now, "expires_at": expires_at}
+        write_whole(path, {"claims": held})
     return CLAIMED
 
 

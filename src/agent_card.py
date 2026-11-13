@@ -561,12 +561,21 @@ def lane_owner(workspace, default: str = "") -> Callable[[str], str]:
     return owner
 
 
+_NOT_TEXT = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
 def _value_problem(control: Mapping[str, object], value: Optional[str]) -> Optional[str]:
     if value is None:
         return "the choice carries no value"
     if control.get("kind") == "pick":
-        return None if value in (control.get("options") or ()) else "that card did not offer that value"
-    if not int(control.get("min_length", 1)) <= len(value) <= int(control.get("max_length", 0)):
+        options = control.get("options")
+        return None if isinstance(options, list) and value in options else "that card did not offer that value"
+    low, high = control.get("min_length"), control.get("max_length")
+    if not all(isinstance(n, int) and not isinstance(n, bool) for n in (low, high)):
+        return "the field's bounds are unreadable"
+    if not value.strip() or _NOT_TEXT.search(value):
+        return "the value is not one line of text"
+    if not low <= len(value) <= high:
         return "the value is outside the field's bounds"
     return None
 
@@ -597,8 +606,12 @@ def _choice_verdict(headers: Mapping[str, str], click: Mapping[str, object], ent
         return Click(FORGED, why="the task has no id to claim the choice with")
     choice = {"card_id": click["card_id"], "revision": click["revision"], "control": click["action"],
               "kind": control["kind"], "value": click["value"], "interaction_id": click["interaction_id"]}
-    if issued_cards.claim(workspace, click["interaction_id"], claimant, choice, now=now) == issued_cards.DUPLICATE:
+    claimed = issued_cards.claim(workspace, click["interaction_id"], claimant, choice,
+                                 expires_at=float(entry.get("expires_at") or 0), now=now)
+    if claimed == issued_cards.DUPLICATE:
         return Click(DUPLICATE, why="that choice was already submitted")
+    if claimed not in (issued_cards.CLAIMED, issued_cards.SAME):
+        return Click(FORGED, why="the choice could not be claimed")
     return Click(COMMAND, handler=str(entry.get("handler") or ""), lane=str(entry.get("lane") or ""), choice=choice)
 
 
@@ -650,7 +663,8 @@ def click_verdict(headers: Mapping[str, str], said: str, workspace, owner_of: Ca
 def click_answer(verdict: Click, said: str, mine: Tuple[str, ...] = ()) -> Optional[dict]:
     """What a card handler prints for a task that is not a command of its own kinds (`mine`): the fixed
     refusal for a forged click, the owner's words, ordinary chat, a duplicate choice, or another
-    handler's card (with the v2 choice it runs on). None for its own command."""
+    handler's card (with the v2 choice it runs on). None for its own command. A v2 choice is never None
+    here: a handler that takes choices reads `verdict.choice` before calling this."""
     if verdict.verdict == FORGED:
         return {"status": FORGED, "say": verdict.say, "why": verdict.why}
     if verdict.verdict == DUPLICATE:

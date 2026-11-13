@@ -27,6 +27,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import re
 import sys
 import tempfile
@@ -767,6 +768,54 @@ class V2Choices(unittest.TestCase):
         self.assertEqual(self.ask(task_id="task-3", value="off").verdict, ac.DUPLICATE)
         self.assertEqual(self.ask(task_id="task-4", interaction_id="i-5", value="off").verdict, ac.COMMAND)
         self.forged("no id", task_id="", interaction_id="i-6")
+
+    def test_an_untrusted_claims_file_refuses_every_claim_and_is_never_rewritten(self):
+        path = self.ws.joinpath(*issued_cards.CLAIMS)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shapes = {"garbage": b"{broken", "a list": b"[]", "claims a list": b'{"claims": []}',
+                  "entry without claimant": b'{"claims": {"i-0": {"expires_at": 1e18}}}',
+                  "entry with text expiry": b'{"claims": {"i-0": {"claimant": "task-0", "expires_at": "soon"}}}'}
+        for name, raw in shapes.items():
+            path.write_bytes(raw)
+            for task_id in ("task-1", "task-2"):
+                got = self.ask(task_id=task_id)
+                self.assertEqual((got.verdict, got.why), (ac.FORGED, "the choice could not be claimed"), name)
+            self.assertEqual(path.read_bytes(), raw, name)
+        path.write_bytes(b'{"claims": {}}')
+        path.chmod(0)
+        self.addCleanup(path.chmod, 0o600)
+        if not os.access(path, os.R_OK):
+            self.assertEqual(self.ask().verdict, ac.FORGED)
+            path.chmod(0o600)
+            self.assertEqual(path.read_bytes(), b'{"claims": {}}')
+        path.unlink()
+        self.assertEqual(self.ask().verdict, ac.COMMAND, "only a missing file is an empty one")
+
+    def test_a_claim_lives_as_long_as_its_card_and_a_full_file_refuses_instead_of_evicting(self):
+        expiry = issued_cards.live(self.ws, "$v2", now=1001.0)["expires_at"]
+        with mock.patch.object(issued_cards, "MAX_CLAIMS", 2):
+            self.assertEqual(self.ask(interaction_id="i-1", task_id="t1").verdict, ac.COMMAND)
+            self.assertEqual(self.ask(interaction_id="i-2", task_id="t2", now=1002.0).verdict, ac.COMMAND)
+            got = self.ask(interaction_id="i-3", task_id="t3", now=1003.0)
+            self.assertEqual((got.verdict, got.why), (ac.FORGED, "the choice could not be claimed"))
+            held = json.loads(self.ws.joinpath(*issued_cards.CLAIMS).read_text())["claims"]
+            self.assertEqual(sorted(held), ["i-1", "i-2"])
+            self.assertEqual({v["expires_at"] for v in held.values()}, {expiry})
+            self.assertEqual(self.ask(interaction_id="i-1", task_id="t9", now=expiry - 1).verdict, ac.DUPLICATE)
+            self.assertEqual(issued_cards.claim(self.ws, "i-4", "t4", {}, expires_at=expiry + 10, now=expiry + 1),
+                             issued_cards.CLAIMED, "expired claims make room")
+
+    def test_an_input_must_be_text_on_one_line_and_the_record_must_be_well_formed(self):
+        for i, value in enumerate(("   ", "Py\x1blon", "Py\u2028lon", "Py\u2029lon", "Py\x7flon")):
+            self.forged("not one line of text", action="rename", value=value, interaction_id=f"w-{i}")
+        path = issued_cards.ledger_path(self.ws)
+        data = json.loads(path.read_text())
+        data["cards"]["$v2"]["controls"] = {"mode": {"kind": "pick", "options": "on off"},
+                                            "rename": {"kind": "input", "min_length": "1", "max_length": 12}}
+        path.write_text(json.dumps(data))
+        self.forged("did not offer that value", value="on")
+        self.forged("did not offer that value", value="o")
+        self.forged("bounds are unreadable", action="rename", value="Pylon")
 
     def test_choices_act_only_for_the_owner_in_their_dm_in_the_card_s_room(self):
         def as_(**h):
