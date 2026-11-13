@@ -8,8 +8,10 @@ The rows are held to the backend's own cell rules (room-collab commons_db_writes
 commons_feeds._desired): a passing run is one the backend accepts. Hermetic."""
 from __future__ import annotations
 
+import contextlib
 import datetime
 import importlib.util
+import io
 import json
 import re
 import subprocess
@@ -297,8 +299,47 @@ for wrap, name in ((failed_envelope, "plain"),
     check(f"a failed {name} envelope is refused, never written as an empty feed", ok)
     check(f"a failed {name} envelope is reported as a connector error",
           fr.failure(run, wrap)["code"] == "connector_error")
-check("no 3.11-only datetime.UTC in the runner (Python 3.9 floor)",
-      "datetime.UTC" not in _SCRIPT.read_text())
+
+# The Python 3.9 floor, run: datetime has no UTC constant there, so the runner is loaded again
+# with it taken away and each entry point that reads the clock or formats a time is driven.
+_utc_const = getattr(datetime, "UTC", None)
+if _utc_const is not None:
+    delattr(datetime, "UTC")
+floor_stage = "loading the runner"
+floor_checks = []
+try:
+    floor_spec = importlib.util.spec_from_file_location("feed_runner_floor", _SCRIPT)
+    floor = importlib.util.module_from_spec(floor_spec)
+    floor_spec.loader.exec_module(floor)
+    floor_stage = "due"
+    (floor_run,) = floor.due(ME, [(ROOM, listed(grant()))], NOW)["runs"]
+    floor_checks.append(("due plans the same window there",
+                         floor_run["connector"]["arguments"]["timeMin"] == "2026-11-09T18:07:00Z"
+                         and floor_run["connector"]["arguments"]["timeMax"]
+                         == "2026-11-23T18:07:00Z"))
+    floor_stage = "rows"
+    floor_checks.append(("rows formats the same times there",
+                         floor.rows(floor_run, composio(EVENTS))
+                         == fr.rows(run, composio(EVENTS))))
+    floor_stage = "the command line"
+    with tempfile.TemporaryDirectory() as floor_tmp:
+        floor_feeds = Path(floor_tmp) / "feeds.json"
+        floor_feeds.write_text(json.dumps(listed(grant())))
+        floor_out = io.StringIO()
+        with contextlib.redirect_stdout(floor_out):
+            floor_code = floor.main(["feed_runner.py", "due", ME, f"{ROOM}={floor_feeds}"])
+    floor_checks.append(("the command line reads the clock there", floor_code == 0
+                         and json.loads(floor_out.getvalue())["runs"][0]["room_id"] == ROOM))
+    floor_stage = None
+except AttributeError:
+    pass  # the constant was reached for: the stage that did is named below
+finally:
+    if _utc_const is not None:
+        datetime.UTC = _utc_const
+check(f"the runner works where datetime has no UTC constant, the Python 3.9 floor "
+      f"(stopped at: {floor_stage})", floor_stage is None)
+for floor_name, floor_ok in floor_checks:
+    check(floor_name, floor_ok)
 
 # Review (Susan, should-fix 3): the code comes from the envelope's status and error only. Event
 # content that happens to say "429", "Room 429" or "not connected" changes nothing.
@@ -351,8 +392,6 @@ check("retry_after_s is found wherever the envelope nests it",
       fr.outcome({"code": "RATE_LIMITED", "details": [{"retry_after_s": 30}]})["retry_after_s"]
       == 30)
 
-import contextlib
-import io
 
 with tempfile.TemporaryDirectory() as tmp:
     files = {"feeds": listed(grant()), "run": run, "connector": composio(EVENTS),
