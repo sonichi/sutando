@@ -902,7 +902,9 @@ so:
   nothing is raised to the poll loop's credential recovery. Only a join can change it, so the
   send gets `send_failure_policy.ROOM_REFUSAL_ATTEMPTS` (5) tries on the outbox's own backoff
   (about 30s, which covers a join or an invite acceptance still landing); then the item parks
-  (`permanent-refusal`) and the file moves to `results/undelivered/` with a log line. Any other
+  (`permanent-refusal`) and the file moves to `results/undelivered/` with a log line that
+  prints the requeue command (with `--reset-attempts`, so the resend gets the whole budget). The
+  wording is read from the body's `error`, `errcode`, `message` and `detail`. Any other
   403 keeps the retry above (`send_failure_policy.is_room_membership_refusal` decides).
 - **A message about a task** is named `proactive-about-<task id>--<ts>.txt`
   (`proactive_routing.about_task_filename`). In the task's own room it posts in the task's

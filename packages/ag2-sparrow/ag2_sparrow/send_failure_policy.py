@@ -90,7 +90,7 @@ def is_room_membership_refusal(status: int, body: object) -> bool:
             return False
     if not isinstance(body, dict):
         return False
-    said = " ".join(str(body.get(k) or "") for k in ("error", "errcode")).lower()
+    said = " ".join(str(body.get(k) or "") for k in ("error", "errcode", "message", "detail")).lower()
     return any(marker in said for marker in _ROOM_REFUSAL_MARKERS)
 
 
