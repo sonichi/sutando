@@ -7,7 +7,7 @@
 #
 # Usage:
 #   bash scripts/cron-gate.sh <reason> <command...>
-#   bash scripts/cron-gate.sh --check <reason>
+#   bash scripts/cron-gate.sh --check <reason> [--workspace <dir>]
 #
 #   - <reason>: short label printed in the deferral message (e.g. "sync-workspace")
 #   - <command...>: the actual command to run if the queue is empty
@@ -15,6 +15,7 @@
 #     `deferred: owner tasks queued — <reason> (will retry next fire)` or `clear`.
 #     This is the form /schedule-crons prefixes to a sub-daily (or `gate: true`)
 #     registered prompt (src/cron_prompt_gate.py), so a prompt-shaped cron can yield too.
+#     `--workspace <dir>` checks that workspace's queue (a worker's assigned one).
 #
 # Example crons.example.json entry (shell form):
 #   "prompt": "Run: bash scripts/cron-gate.sh sync-workspace bash scripts/sync-workspace.sh"
@@ -28,11 +29,16 @@
 set -eu
 
 check_only=0
+workspace_arg=""
 if [ "${1:-}" = "--check" ]; then
   check_only=1
   shift
+  if [ $# -eq 3 ] && [ "$2" = "--workspace" ] && [ -n "$3" ]; then
+    workspace_arg="$3"
+    set -- "$1"
+  fi
   if [ $# -ne 1 ]; then
-    echo "usage: $0 --check <reason>" >&2
+    echo "usage: $0 --check <reason> [--workspace <dir>]" >&2
     exit 2
   fi
 elif [ $# -lt 2 ]; then
@@ -42,7 +48,11 @@ fi
 
 # Workspace resolution via the canonical M0 helper (PR #1395).
 SCRIPT_PARENT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-WORKSPACE="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" workspace)"
+if [ -n "$workspace_arg" ]; then
+  WORKSPACE="$workspace_arg"
+else
+  WORKSPACE="$(bash "$SCRIPT_PARENT/scripts/sutando-config.sh" workspace)"
+fi
 
 reason="$1"
 shift

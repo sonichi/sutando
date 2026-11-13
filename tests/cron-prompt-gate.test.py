@@ -5,6 +5,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -53,8 +54,11 @@ def main() -> int:
     # ── the wrap ─────────────────────────────────────────────────────────
     rp = cpg.registered_prompt(sweep)
     check("a sub-daily prompt entry is gated", cpg.is_gated(sweep))
+    gate_cmd = f"bash {shlex.quote(str(REPO / 'scripts' / 'cron-gate.sh'))}"
     check("gated prompt opens with the --check preamble",
-          rp.startswith("First run `bash scripts/cron-gate.sh --check inbox-sweep`"), rp)
+          rp.startswith(f"First run `{gate_cmd} --check inbox-sweep`"), rp)
+    check("gated prompt tells the agent to stop on any other output",
+          "anything other than `deferred` or `clear`" in rp, rp)
     check("gated prompt names deferred and clear",
           "`deferred`" in rp and "`clear`" in rp, rp)
     check("gated prompt keeps the original text verbatim at the end",
@@ -114,7 +118,7 @@ def main() -> int:
     check("gate: true forces a daily to be gated", cpg.is_gated(forced))
     check("a forced daily carries the preamble and its prompt",
           cpg.registered_prompt(forced).startswith(
-              "First run `bash scripts/cron-gate.sh --check morning-briefing`")
+              f"First run `{gate_cmd} --check morning-briefing`")
           and cpg.registered_prompt(forced).endswith(briefing["prompt"]))
     check("gate: false forces a sub-daily to be ungated",
           not cpg.is_gated(dict(sweep, gate=False))
@@ -125,7 +129,7 @@ def main() -> int:
     check("gate: true never gates the main loop", not cpg.is_gated(dict(loop, gate=True)))
     check("gate: true never double-wraps", not cpg.is_gated(dict(hand_wrapped, gate=True)))
     watchdog = {"name": "core-watchdog", "cron": "*/10 * * * *", "gate": False,
-                "prompt": "Run python3 src/health-check.py and report anything red"}
+                "prompt": "Run the health pass and report anything red"}
     check("a watchdog with gate: false registers verbatim",
           cpg.registered_prompt(watchdog) == watchdog["prompt"])
 
@@ -162,7 +166,11 @@ def main() -> int:
           cpg.registered_prompt(hand_wrapped) == hand_wrapped["prompt"])
     twice = cpg.registered_prompt({"name": "inbox-sweep", "cron": sweep["cron"], "prompt": rp})
     check("re-applying to an already gated prompt is a no-op", twice == rp, twice)
-    check("the preamble appears once", rp.count("bash scripts/cron-gate.sh") == 1)
+    check("the preamble appears once", rp.count("scripts/cron-gate.sh") == 1)
+    quoted = {"name": "q", "cron": sweep["cron"],
+              "prompt": "First run `bash '/a b/scripts/cron-gate.sh' --check q`. Then sweep"}
+    check("a prompt calling the gate by a quoted absolute path is not wrapped again",
+          cpg.registered_prompt(quoted) == quoted["prompt"])
     prose = {"name": "sync-workspace", "prompt": "Run x — no cron-gate.sh wrapper is needed here."}
     check("a prose mention of cron-gate.sh is not a wrap", cpg.is_gated(prose))
 
@@ -223,6 +231,27 @@ def main() -> int:
         check("main --owner prints a worker's view, gate included",
               rc == 0 and [e["registered_prompt"] for e in json.loads(out)]
               == [cpg.registered_prompt(worker_entry)], (rc, out))
+
+        # A worker's registered gate runs from a non-repo cwd against its assigned queue.
+        assigned = Path(td) / "assigned ws"
+        (assigned / "tasks").mkdir(parents=True)
+        rc, out, _ = run_main(str(cf), "--owner", "d1fc9b10050b490d894947f96627447f",
+                              "--workspace", str(assigned))
+        wrp = json.loads(out)[0]["registered_prompt"]
+        gate_line = wrp.split("`")[1]
+        check("a worker's gate names its assigned workspace",
+              gate_line.endswith(f"--workspace {shlex.quote(str(assigned))}"), wrp)
+
+        def fire():
+            return subprocess.run(["bash", "-c", gate_line], cwd=td, capture_output=True,
+                                  text=True, env={"PATH": "/usr/bin:/bin", "HOME": td})
+        r = fire()
+        check("a worker's gate runs outside the repo and prints clear on its empty queue",
+              (r.returncode, r.stdout.strip()) == (0, "clear"), (r.returncode, r.stdout, r.stderr))
+        (assigned / "tasks" / "task-worker-1.txt").write_text("task: queued\n")
+        r = fire()
+        check("a worker's gate defers on a task queued in its assigned workspace",
+              r.returncode == 0 and r.stdout.startswith("deferred:"), (r.returncode, r.stdout, r.stderr))
         rc, out, err = run_main(str(Path(td) / "missing.json"))
         check("main on a missing file returns 0 with an empty list",
               (rc, json.loads(out), err) == (0, [], ""), (rc, out, err))
@@ -238,11 +267,11 @@ def main() -> int:
     for name, e in view.items():
         rp_e = e["registered_prompt"] or ""
         check(f"example entry {name} carries at most one gate",
-              rp_e.count("bash scripts/cron-gate.sh") <= 1, rp_e)
+              rp_e.count("scripts/cron-gate.sh") <= 1, rp_e)
     check("example main-loop stays ungated", view["main-loop"]["registered_prompt"] == "/proactive-loop")
     check("example sync-workspace (*/30) is gated at registration",
           view["sync-workspace"]["registered_prompt"].startswith(
-              "First run `bash scripts/cron-gate.sh --check sync-workspace`"))
+              f"First run `{gate_cmd} --check sync-workspace`"))
     for daily in ("morning-briefing", "learned-skills-scan", "example-digest"):
         check(f"example daily {daily} registers verbatim",
               view[daily]["registered_prompt"] == view[daily]["prompt"])

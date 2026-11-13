@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 import sys
 from pathlib import Path
 from typing import Optional
@@ -39,8 +40,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cron_ownership import CORE, entries_for_owner  # noqa: E402
 
 GATE_SCRIPT = "scripts/cron-gate.sh"
-# An invocation of the gate, not a mention of it in prose.
-_GATE_CALL = re.compile(r"(^|[\s`])bash " + re.escape(GATE_SCRIPT) + r"\s")
+# Absolute, so the preamble runs from any cwd (a worker's need not be the repo).
+GATE_PATH = Path(__file__).resolve().parents[1] / GATE_SCRIPT
+# An invocation of the gate (relative, absolute or quoted), not a mention of it in prose.
+_GATE_CALL = re.compile(r"(^|[\s`])bash (?:'[^']*/|\"[^\"]*/|\S*/)?"
+                        + re.escape(GATE_SCRIPT) + r"['\"]?\s")
 LOOP_NAME = "main-loop"
 LOOP_SKILL = "proactive-loop"
 # The slash command itself, not a path such as skills/proactive-loop/scripts/x.py.
@@ -136,29 +140,39 @@ def gate_reason(entry: dict) -> str:
     return "cron"
 
 
-def preamble(reason: str) -> str:
-    return (f"First run `bash {GATE_SCRIPT} --check {reason}`. If it prints `deferred`, "
+def gate_command(reason: str, workspace: Optional[str] = None) -> str:
+    cmd = f"bash {shlex.quote(str(GATE_PATH))} --check {reason}"
+    if workspace:
+        cmd += f" --workspace {shlex.quote(workspace)}"
+    return cmd
+
+
+def preamble(reason: str, workspace: Optional[str] = None) -> str:
+    return (f"First run `{gate_command(reason, workspace)}`. If it prints `deferred`, "
             "stop here: owner tasks are queued and this job retries on its next fire. "
+            "If it prints anything other than `deferred` or `clear`, or fails, stop too. "
             "If it prints `clear`, carry on: ")
 
 
-def registered_prompt(entry: dict) -> Optional[str]:
+def registered_prompt(entry: dict, workspace: Optional[str] = None) -> Optional[str]:
     """The text to pass as CronCreate's prompt (or the /loop body). None when
-    the entry has neither prompt nor prompt_skill (a monitor entry)."""
+    the entry has neither prompt nor prompt_skill (a monitor entry). `workspace`
+    names the queue the gate checks (a worker's assigned one); None = the configured one."""
     prompt = base_prompt(entry)
     if prompt is None or not is_gated(entry):
         return prompt
     if entry.get("prompt_skill"):
-        return preamble(gate_reason(entry)) + f"invoke the skill {prompt}"
-    return preamble(gate_reason(entry)) + prompt
+        return preamble(gate_reason(entry), workspace) + f"invoke the skill {prompt}"
+    return preamble(gate_reason(entry), workspace) + prompt
 
 
-def registration_view(entries: list, owner_id: str = CORE) -> list:
+def registration_view(entries: list, owner_id: str = CORE,
+                      workspace: Optional[str] = None) -> list:
     """entries_for_owner(...) with `registered_prompt` filled in on each entry."""
     out = []
     for entry in entries_for_owner(entries, owner_id):
         e = dict(entry)
-        e["registered_prompt"] = registered_prompt(entry)
+        e["registered_prompt"] = registered_prompt(entry, workspace)
         out.append(e)
     return out
 
@@ -168,6 +182,8 @@ def main(argv=None) -> int:
     ap.add_argument("crons_json", help="path to the host's crons.json")
     ap.add_argument("--owner", default=CORE,
                     help="session registering: 'core' (default) or a worker's bare id")
+    ap.add_argument("--workspace", default=None,
+                    help="workspace whose queue the gate checks (a worker's assigned one)")
     args = ap.parse_args(argv)
     try:
         cfg = json.loads(Path(args.crons_json).read_text())
@@ -176,7 +192,7 @@ def main(argv=None) -> int:
     if not isinstance(cfg, list):
         print(f"{args.crons_json}: expected a JSON list", file=sys.stderr)
         return 2
-    print(json.dumps(registration_view(cfg, args.owner)))
+    print(json.dumps(registration_view(cfg, args.owner, args.workspace)))
     return 0
 
 

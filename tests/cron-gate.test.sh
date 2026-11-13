@@ -262,4 +262,22 @@ set -e
 [ "$rc" -eq 2 ] || fail "--check with a trailing command: expected exit 2, got $rc"
 ok "--check takes exactly one reason and never a command"
 
+# --- --check --workspace reads that workspace's queue, from any cwd -----------
+ASSIGNED="$TMPDIR/assigned ws"
+mkdir -p "$ASSIGNED/tasks"
+touch "$ASSIGNED/tasks/task-worker-1.txt"
+out="$(cd / && SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" --check test-ws --workspace "$ASSIGNED" 2>&1)"
+case "$out" in
+  "deferred: owner tasks queued — test-ws"*) : ;;
+  *) fail "--check --workspace: expected deferred on the assigned queue, got '$out'" ;;
+esac
+out="$(cd / && SUTANDO_WORKSPACE="$ASSIGNED" SUTANDO_TEST_MODE=1 bash "$GATE" --check test-ws --workspace "$TMPDIR" 2>&1)"
+[ "$out" = "clear" ] || fail "--check --workspace: expected clear on the empty named queue, got '$out'"
+set +e
+SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" --check test-ws --workspace >/dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "--check --workspace without a dir: expected exit 2, got $rc"
+ok "--check --workspace checks the named workspace, not the configured one"
+
 echo "OK — $PASSED/$PASSED cron-gate tests passed"
