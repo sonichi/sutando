@@ -164,6 +164,82 @@ def test_write_task_drops_unsafe_and_idless():
         print("PASS test_write_task_drops_unsafe_and_idless")
 
 
+def _collaborator_task(tid):
+    return {
+        "id": tid,
+        "task": "[AG2Space collaborator] hello",
+        "source": "ag2space",
+        "channel_id": "!room:dev.ag2.space",
+        "user_id": "@collaborator:dev.ag2.space",
+        "access_tier": "guest",
+        "requested_access_tier": "team",
+        "collaborator": True,
+        "timestamp": "2026-11-13T08:42:00Z",
+    }
+
+
+def test_write_task_collaborator_routing_matches_the_shared_helper():
+    """sonichi/sutando#5878: _write_task must decide team+collaborator through the SAME
+    helper every other tier read uses (_sender_tier_and_collaborator) — no private copy
+    of the policy that could drift and silently stop promoting an attested collaborator."""
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        m = _load(base)
+        t = _collaborator_task("task-1784500000020")
+        want_tier, want_collab = m._sender_tier_and_collaborator(t)
+        assert (want_tier, want_collab) == ("team", True)
+        tid, _ = m._write_task(t)
+        body = (m.TASKS_DIR / f"{tid}.txt").read_text()
+        assert "access_tier: team" in body
+        assert "\ncollaborator: true\n" in body
+        # The engage rulebook, not the plain team guardrail or the guest sandbox lines.
+        assert "designated COLLABORATOR" in body
+        print("PASS test_write_task_collaborator_routing_matches_the_shared_helper")
+
+
+def test_write_task_logs_a_pending_collaborator_attestation():
+    """sonichi/sutando#5878 repro: a sender asking for team (`requested_access_tier: team`)
+    whose broker attestation has not (yet) promoted them — `collaborator` missing/not True,
+    exactly what a not-yet-landed cross-homeserver attestation looks like on the wire — is
+    served as guest today (fail-closed, unchanged) but must say so in the log, so this
+    failure mode is diagnosable at the time it happens instead of only by diffing a task's
+    `timestamp:` header against its file mtime hours later."""
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        m = _load(base)
+        logs = []
+        m._log = lambda msg, *a, **k: logs.append(str(msg))
+        t = dict(_collaborator_task("task-1784500000021"), collaborator=None)
+        tier, collab = m._sender_tier_and_collaborator(t)
+        assert (tier, collab) == ("guest", False)
+        assert any("collaborator attestation was not True" in line for line in logs), logs
+        assert any("task-1784500000021" in line for line in logs), logs
+        assert any("dev.ag2.space" in line for line in logs), logs
+        print("PASS test_write_task_logs_a_pending_collaborator_attestation")
+
+
+def test_write_task_silent_for_plain_guest_and_for_a_landed_collaborator():
+    """The diagnostic line is specific to a team REQUEST that did not land as collaborator;
+    it must not fire for an ordinary guest message (no team request at all) nor for a
+    collaborator correctly attested on the first delivery — both are unremarkable."""
+    with tempfile.TemporaryDirectory() as d:
+        base = pathlib.Path(d)
+        m = _load(base)
+        logs = []
+        m._log = lambda msg, *a, **k: logs.append(str(msg))
+
+        plain_guest = {"id": "task-1784500000022", "task": "hi", "source": "ag2space",
+                       "channel_id": "!room:ag2.space", "user_id": "@someone:ag2.space",
+                       "access_tier": "guest"}
+        m._sender_tier_and_collaborator(plain_guest)
+        assert not any("collaborator attestation" in line for line in logs), logs
+
+        landed = _collaborator_task("task-1784500000023")
+        m._sender_tier_and_collaborator(landed)
+        assert not any("collaborator attestation" in line for line in logs), logs
+        print("PASS test_write_task_silent_for_plain_guest_and_for_a_landed_collaborator")
+
+
 def test_write_task_shell_quotes_channel_id_in_skill_instructions():
     """A malicious channel_id must not break the shell commands embedded in
     the SKILL INSTRUCTIONS block; shlex must round-trip it as one argument."""
@@ -284,4 +360,7 @@ if __name__ == "__main__":
     test_write_task_shell_quotes_channel_id_in_skill_instructions()
     test_a_present_but_unusable_picker_stamp_is_written_as_refused()
     test_picker_args_present_but_invalid_is_preserved_as_a_refusing_stamp()
+    test_write_task_collaborator_routing_matches_the_shared_helper()
+    test_write_task_logs_a_pending_collaborator_attestation()
+    test_write_task_silent_for_plain_guest_and_for_a_landed_collaborator()
     print("ALL PASS test_write_task_atomic")
