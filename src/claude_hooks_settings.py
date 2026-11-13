@@ -27,8 +27,10 @@ checkout, so it never adds a hook (the opt-in transcript archiver included).
 
 ``install`` also re-points its own hook when an older checkout that still exists on
 disk left it registered: an entry that is the installed command exactly, except for
-the checkout root before ``src/``/``scripts/``/``skills/``, is rewritten in place
-rather than kept beside the new one. Any other difference marks it as not ours.
+the checkout root before ``src/``/``scripts/``/``skills/``, under the same matcher,
+is rewritten in place rather than kept beside the new one. Any other difference,
+the matcher included, marks it as not ours. Two live checkouts sharing one settings
+file therefore hand the hook to whichever launched last.
 
     python3 src/claude_hooks_settings.py install --settings <path> \\
         --event SessionStart --command 'bash "<repo>/src/x.sh"' \\
@@ -156,17 +158,18 @@ def is_other_checkout_copy(existing: str, command: str) -> bool:
                for o, t in zip(_spellings(our_root), _spellings(their_root)))
 
 
-def repoint_other_checkouts(settings: dict, event: str, command: str) -> list[str]:
-    """Rewrite, in place, ``event`` hooks that are ``command`` on another checkout's path.
+def repoint_other_checkouts(settings: dict, event: str, command: str, matcher: str = "") -> list[str]:
+    """Rewrite, in place, ``event`` hooks under ``matcher`` that are ``command`` on another checkout's path.
 
-    A copy is rewritten to ``command`` where it stands; one beside an existing ``command`` is
-    dropped instead. Returns the old commands.
+    A copy is rewritten to ``command`` where it stands; one beside an existing ``command`` under
+    the same matcher is dropped instead. Entries under any other matcher are not ours and stay.
+    Returns the old commands.
     """
     changed: list[str] = []
     present = False
     kept_entries = []
     for entry in settings.get("hooks", {}).get(event, []) or []:
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or entry.get("matcher", "") != matcher:
             kept_entries.append(entry)
             continue
         kept_hooks = []
@@ -205,7 +208,7 @@ def install(
     # <project>/.claude/settings.json → the project is two levels up.
     project_dir = settings_path.resolve().parent.parent
     removed = prune_dead(settings, event, family_of(command), project_dir=project_dir)
-    repointed = repoint_other_checkouts(settings, event, command)
+    repointed = repoint_other_checkouts(settings, event, command, matcher)
     entries = settings.setdefault("hooks", {}).setdefault(event, [])
     present = any(
         isinstance(h, dict) and h.get("command", "") == command

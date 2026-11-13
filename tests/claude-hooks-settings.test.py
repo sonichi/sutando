@@ -266,9 +266,28 @@ with tempfile.TemporaryDirectory() as tmp:
     cmds = [h["command"] for e in json.loads(both.read_text())["hooks"]["SessionStart"] for h in e["hooks"]]
     check(status == "re-pointed" and cmds == [new_cmd], "a copy beside the correct entry is dropped", str(cmds))
     odd = {"hooks": {"SessionStart": ["not-a-dict", entry(old_cmd), entry(new_cmd)]}}
-    changed = chs.repoint_other_checkouts(odd, "SessionStart", new_cmd)
+    changed = chs.repoint_other_checkouts(odd, "SessionStart", new_cmd, "compact")
     check(changed == [old_cmd] and odd["hooks"]["SessionStart"] == ["not-a-dict", entry(new_cmd)],
           "a copy BEFORE the correct entry is rewritten once, a non-dict entry kept", json.dumps(odd))
+
+    # A copy under another matcher is not ours: re-pointing it would drop or change a trigger.
+    def run_rows(rows, requested):
+        path = tmp / f"matcher-{len(list(tmp.glob('matcher-*')))}" / ".claude" / "settings.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"hooks": {"SessionStart": [entry(c, matcher=m) for c, m in rows]}}))
+        status, _ = chs.install(path, event="SessionStart", command=new_cmd, matcher=requested)
+        got = json.loads(path.read_text())["hooks"]["SessionStart"]
+        return status, sorted((h["command"], e["matcher"]) for e in got for h in e["hooks"])
+
+    status, got = run_rows([(old_cmd, "compact"), (new_cmd, "resume")], "resume")
+    check(got == sorted([(old_cmd, "compact"), (new_cmd, "resume")]),
+          "old@compact + new@resume, requesting resume: the resume trigger is kept", f"{status} {got}")
+    status, got = run_rows([(new_cmd, "resume"), (old_cmd, "compact")], "resume")
+    check(got == sorted([(new_cmd, "resume"), (old_cmd, "compact")]),
+          "new@resume + old@compact, requesting resume: the compact trigger is kept", f"{status} {got}")
+    status, got = run_rows([(old_cmd, "compact")], "compact|resume")
+    check(status == "installed" and (new_cmd, "compact|resume") in got,
+          "old@compact, requesting compact|resume: the requested matcher is applied", f"{status} {got}")
 
     check(not chs.is_other_checkout_copy(f'bash "{tmp}/elsewhere/watcher-rearm-session-hint.sh"', new_cmd),
           "a same-named script outside a src/, scripts/ or skills/ tail is not a checkout copy")
