@@ -5,8 +5,9 @@ set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$REPO/src/startup.sh"
 fails=0
-ok()  { printf '  ok   %s\n' "$1"; }
-bad() { printf '  FAIL %s %s\n' "$1" "${2:-}"; fails=$((fails+1)); }
+total=0
+ok()  { total=$((total+1)); printf '  ok   %s\n' "$1"; }
+bad() { total=$((total+1)); printf '  FAIL %s %s\n' "$1" "${2:-}"; fails=$((fails+1)); }
 
 echo "startup funnel drift:"
 
@@ -17,7 +18,7 @@ BLOCK="$(awk '/^ *FUNNEL_CFG_URL=/,/^ *elif ! pgrep -f "ngrok"/' "$SRC" | sed '$
 fi"
 if [ -z "$BLOCK" ]; then
   bad "block extracted from src/startup.sh" "no FUNNEL_CFG_URL region found"
-  echo "  Total: 1 — pass: 0, fail: 1"; exit 1
+  echo "  Total: $total — pass: $((total-fails)), fail: $fails"; exit 1
 fi
 ok "block extracted from src/startup.sh"
 
@@ -31,11 +32,11 @@ mk_ts() {  # $1... = each https://... line to emit, in order; none = "nothing se
   chmod +x "$TMP/ts"; echo "$TMP/ts"
 }
 run_case() {  # $1=.env body  $2=TAILSCALE_BIN
-  ( cd "$TMP" && printf '%s\n' "$1" > .env && TAILSCALE_BIN="$2" bash -c "$BLOCK" 2>&1 )
+  ( cd "$TMP" && printf '%s\n' "$1" > .env && _cs_up=1 TAILSCALE_BIN="$2" bash -c "$BLOCK" 2>&1 )
 }
 
-PRO="https://chis-macbook-pro.taild96b9b.ts.net"
-AIR="https://chis-macbook-air.taild96b9b.ts.net"
+PRO="https://host-a.example-tailnet.ts.net"
+AIR="https://host-b.example-tailnet.ts.net"
 
 out="$(run_case "TWILIO_WEBHOOK_URL=$PRO" "$(mk_ts "$PRO")")"
 case "$out" in
@@ -80,8 +81,8 @@ case "$out" in
   *) bad "trailing slash + comment normalise" "got: $out" ;;
 esac
 
-# --- port is part of the endpoint (qingyun-wu on #4187): 443/8443/10000 are all
-# --- valid Funnel ports, so a hostname-only compare calls :443 and :8443 equal.
+# Funnel ports (443/8443/10000) are part of the endpoint; a hostname-only
+# compare would call :443 and :8443 the same reachable host.
 out="$(run_case "TWILIO_WEBHOOK_URL=$PRO" "$(mk_ts "$PRO:8443")")"
 case "$out" in
   *"DIFFERENT host"*) ok "configured :443 vs live :8443 -> warns, no false agreement" ;;
@@ -100,10 +101,8 @@ case "$out" in
   *) bad "explicit :443 normalises" "got: $out" ;;
 esac
 
-# --- multiple served origins (john-the-dev/qingyun-wu on #4187): `head -1`
-# --- kept only the first, so output ORDER decided the verdict. Check the
-# --- COMPLETE set instead; pin both orders, an absent origin, and confirm the
-# --- single-port cases above are untouched by the set-based rewrite.
+# Multiple served origins: check the complete set, not just the first line,
+# so listing order never decides the verdict. Pins both orders plus an absent origin.
 out="$(run_case "TWILIO_WEBHOOK_URL=$PRO:8443" "$(mk_ts "$PRO:443" "$PRO:8443")")"
 case "$out" in
   *"matches TWILIO_WEBHOOK_URL"*) ok "configured origin present, listed SECOND -> matches" ;;
@@ -123,6 +122,5 @@ case "$out" in
 esac
 case "$out" in *"$PRO"*) ok "warning lists a serving origin" ;; *) bad "warning lists a serving origin" "got: $out" ;; esac
 
-total=$((16))
 echo "  Total: $total — pass: $((total-fails)), fail: $fails"
 [ "$fails" -eq 0 ]

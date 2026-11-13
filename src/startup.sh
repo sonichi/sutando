@@ -1323,15 +1323,12 @@ elif twilio_creds_present; then
   else
     echo "  ✗ conversation server process found ($(echo $_cs_running | tr ' ' ,)) but nothing listens on port 3100 — check /tmp/conversation-server.log; ngrok not started"
   fi
-  # A Funnel URL is this host's own tunnel: conversation-server binds it directly
-  # and never starts ngrok, so attempting one prints a failure for something that
-  # is not needed. Nothing else compares the configured URL to the live funnel,
-  # so a webhook naming another machine boots silently.
+  # Funnel is this host's own tunnel; conversation-server binds it directly and
+  # never starts ngrok, so nothing else catches a webhook naming another host.
   FUNNEL_CFG_URL=$(grep -E '^TWILIO_WEBHOOK_URL=' .env 2>/dev/null | head -1 \
     | cut -d'=' -f2- | cut -d'#' -f1 | tr -d '"' | tr -d "'" | xargs | sed 's:/*$::')
-  # Funnel listens on 443, 8443 or 10000, so the port is part of the endpoint:
-  # comparing hostnames alone calls :443 and :8443 the same reachable URL.
-  # Normalise an explicit :443 away, keep every other port.
+  # Funnel's port is part of the endpoint (443/8443/10000); hostname-only
+  # compare would call :443 and :8443 the same host. Normalise :443 away.
   funnel_origin() {  # scheme://host[:port] -> canonical origin, or empty if not .ts.net
     printf '%s' "$1" | sed -E 's#^(https?://[^/]+).*#\1#; s#:443$##' \
       | grep -E '^https?://[A-Za-z0-9.-]+\.ts\.net(:[0-9]+)?$' || true
@@ -1339,11 +1336,7 @@ elif twilio_creds_present; then
   FUNNEL_CFG_ORIGIN="$(funnel_origin "$FUNNEL_CFG_URL")"
   FUNNEL_MODE=0
   [ -n "$FUNNEL_CFG_ORIGIN" ] && FUNNEL_MODE=1
-  # origin/main's _cs_up guard (nothing behind the port -> no tunnel at all,
-  # Funnel included) runs first; it is the only line this merge adds here.
-  # Default unset to "up" -- real callers always set it above; the funnel-drift
-  # test extracts this block standalone and never defines it.
-  if [ "${_cs_up:-1}" -ne 1 ]; then
+  if [ "$_cs_up" -ne 1 ]; then
     : # nothing behind the port, so no tunnel to it (reported above)
   elif [ "$FUNNEL_MODE" = 1 ]; then
     TS_BIN="${TAILSCALE_BIN:-}"
@@ -1353,9 +1346,8 @@ elif twilio_creds_present; then
       # An absent CLI must not read as agreement: say UNCHECKED, never a tick.
       echo "  ⊘ Funnel configured ($FUNNEL_CFG_URL) — tailscale CLI not found, drift UNCHECKED"
     else
-      # `funnel status` can list several served origins (qingyun-wu, #4187):
-      # `head -1` kept only the first, so output ORDER decided the verdict.
-      # Normalise the whole set and check membership instead.
+      # `funnel status` can list several served origins; check membership in
+      # the whole set rather than only the first line.
       FUNNEL_LIVE_SET="$("$TS_BIN" funnel status 2>/dev/null \
         | grep -oE 'https://[A-Za-z0-9.-]+\.ts\.net(:[0-9]+)?' \
         | while IFS= read -r line; do funnel_origin "$line"; done)"
