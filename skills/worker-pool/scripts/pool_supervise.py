@@ -43,7 +43,7 @@ pd = _sibling("pool_delivery")
 
 _SRC = _HERE.parents[2] / "src"
 import cli_wedge as cw  # noqa: E402  (src/ is on the path via pool_delivery)
-from delivery import pane_gate, task_dispatch as td  # noqa: E402
+from delivery import codex_banners, pane_gate, task_dispatch as td  # noqa: E402
 from task_disposition import SPENT, task_disposition  # noqa: E402
 import tmux_pane_keys  # noqa: E402
 
@@ -215,8 +215,21 @@ def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=N
             return ps.PANE_WORKING
         return ps.PANE_GATE
     if verdict.state in ("idle-ready", "pending"):
+        if runtime == "codex":
+            # Codex prints a refused turn as an error cell above an idle composer: idle to
+            # pane_gate, but a limited or signed-out seat cannot work. A refused request can.
+            banner = codex_banners.live_banner(text)
+            if banner and banner.cause == codex_banners.USAGE_LIMIT:
+                return ps.PANE_LIMIT
+            if banner and banner.cause == codex_banners.SIGNED_OUT:
+                return ps.PANE_LOGGED_OUT
         return ps.PANE_IDLE
     return ps.PANE_UNKNOWN
+
+
+def codex_banner(text: str | None, runtime: str):
+    """The Codex error cell the seat is stopped on (codex_banners.Banner), else None."""
+    return codex_banners.live_banner(text) if runtime == "codex" and text else None
 
 
 class PaneReading(tuple):
@@ -333,6 +346,7 @@ def observe(workspace, now: float, *, worker_ids=None,
             limit_banner=reset.banner if reset else None,
             delivery_block=blocks.get(socket) if socket else None,
             limit_parked=parked,
+            limit_waits=(row.get("runtime") or "claude") == "claude",
             launch_account=launch_account(workspace, wid) if parked else None,
         )
     return obs
@@ -595,7 +609,9 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
                                  "paused": o.paused, "watcher_beat": o.watcher_beat,
                                  "watcher_held": o.watcher_held,
                                  "work_outstanding": o.work_outstanding,
-                                 "pane": o.pane} for w, o in obs.items()},
+                                 "pane": o.pane, "limit_parked": o.limit_parked,
+                                 "limit_reset_at": o.limit_reset_at,
+                                 "limit_banner": o.limit_banner} for w, o in obs.items()},
             "resumed": ps.is_resume(now, state.last_sample_at, expected_period_s=period)}
 
 

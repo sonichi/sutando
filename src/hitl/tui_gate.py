@@ -87,8 +87,9 @@ def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None) 
     """How the owner lifts a usage limit, for the card body; the steps are the runtime's own."""
     where = f"open its terminal (tmux session {session})" if session else "open its terminal"
     if runtime == "codex":
-        return (f"It continues when the limit resets. To unblock it sooner, {where} and run "
-                "`codex login` to switch to another account.")
+        # Nothing types into a Codex seat after the reset: it does not resume by itself.
+        return (f"Codex does not resume by itself: send its work again once the limit resets. To "
+                f"unblock it sooner, {where} and run `codex login` to switch to another account.")
     return (f"It continues when the limit resets. To unblock it sooner, {where} and run "
             "/usage-credits to use extra credits, /login to switch to another account, "
             "or /model to switch to a model with usage left.")

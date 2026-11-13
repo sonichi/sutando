@@ -379,6 +379,30 @@ def _launch_config_dir() -> Optional[str]:
         return None
 
 
+CLAUDE_PLANS = ("Claude Free", "Claude Pro", "Claude Max", "Claude Team", "Claude Enterprise")
+
+
+def account_label(config_dir: Optional[str]) -> Optional[str]:
+    """How the owner tells this account apart, in fixed wording only: its plan as Anthropic names it
+    ("Claude Max"), else "Claude account"; None when the CLI is signed in to nothing. Nothing the
+    owner typed (the display name) or that identifies them (the email) is ever part of it."""
+    if not config_dir:
+        return None
+    try:
+        acct = json.loads((Path(config_dir) / ".claude.json").read_text(encoding="utf-8")).get("oauthAccount")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(acct, dict) or not acct.get("accountUuid"):
+        return None
+    plan = str(acct.get("planDisplayName") or "")
+    return plan if plan in CLAUDE_PLANS else "Claude account"
+
+
+def current_account_label() -> Optional[str]:
+    """account_label() of the config dir the core and its pool's seats launch with."""
+    return account_label(_launch_config_dir())
+
+
 def current_account() -> Optional[str]:
     """The account on disk now in the config dir the core (and its pool's seats) launch with."""
     return account_fingerprint(_launch_config_dir())

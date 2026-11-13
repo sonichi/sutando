@@ -98,6 +98,9 @@ class Observation:
     # The pane waits on a provider limit and nothing else (pane_gate.limit_holds): no turn runs,
     # the composer is empty.
     limit_parked: bool = False
+    # The seat's limit wait can be probed and retried (a Claude seat). A Codex seat's limit is only
+    # shown: its watcher and undelivered-work checks run on while the cell is on screen.
+    limit_waits: bool = True
     # The account the seat's open run was launched under (worker_identity's run `account`).
     launch_account: str | None = None
 
@@ -449,7 +452,7 @@ def evaluate(state: SupervisionState, observations: dict[str, Observation], now:
             decisions[worker_id] = RESTART_NEW_LOGIN
             continue
 
-        if obs.session_alive is True and obs.pane == PANE_LIMIT:
+        if obs.session_alive is True and obs.pane == PANE_LIMIT and obs.limit_waits:
             ev = _cleared_wedge(ev)
             if obs.work_outstanding is not True:
                 workers[worker_id] = ev

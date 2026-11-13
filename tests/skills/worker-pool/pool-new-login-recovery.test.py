@@ -153,6 +153,7 @@ class Pool(unittest.TestCase):
                 patch.object(rem.wc, "raise_card", return_value={"outcome": "carded"}), \
                 patch.object(rem.wc, "resolve_cleared", return_value=[]), \
                 patch.object(rem.wc, "drive_escapes", return_value={}), \
+                patch.object(rem.wc, "_account_label", return_value=None), \
                 patch.object(rem, "_repair_human_cards", return_value=None), \
                 patch.object(rem, "retry_limit", return_value={"outcome": "rearm-sent"}), \
                 patch.object(rem, "ensure_supervisors", return_value={}), \
