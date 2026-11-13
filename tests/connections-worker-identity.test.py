@@ -730,6 +730,24 @@ class TwoServers(Base):
             C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault,
                                     environ={C.MCP_DESCRIPTOR_ENV: str(outside) + ".gone"})
 
+    def test_a_primary_switch_does_not_move_the_seats_server(self):
+        """The seat's proxy mints as its descriptor's own agent; set_primary rewrites no descriptor, so after
+        the owner makes beta primary a seat written for alpha still mints on alpha, and so does the worker's
+        credential (review at e85d3d12: it followed whichever row was primary now)."""
+        state = self.ws / "state"
+        state.mkdir(exist_ok=True)
+        (state / C.MCP_DESCRIPTOR_NAME).write_text(
+            json.dumps({"version": 1, "lane": "primary", "agent_id": CORE_AGENT}))
+        before = C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault, environ={})
+        self.assertEqual((before["server"], before["bearer"]), ("alpha-fixture.net", "secret-reviewer"))
+        beta_core = next(r for r in C._core_rows(C._read(C.record_path(self.ws)))
+                         if r["server"] == "beta-fixture.net")
+        C.set_primary(beta_core["instance"], workspace=self.ws)
+        self.assertEqual(C.mcp_seat_server(self.ws, {}), "alpha-fixture.net", "the seat still mints on alpha")
+        after = C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault, environ={})
+        self.assertEqual((after["server"], after["bearer"]), ("alpha-fixture.net", "secret-reviewer"),
+                         "never a token for beta while the seat's proxy mints on alpha")
+
     def test_a_task_result_publishes_whatever_the_proactive_home(self):
         import result_publish
         with unittest.mock.patch.object(C, "primary_row", lambda ws=None: None):

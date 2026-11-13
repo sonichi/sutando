@@ -2313,8 +2313,10 @@ MCP_DESCRIPTOR_ENV = "AG2_MCP_DESCRIPTOR"
 
 def mcp_seat_server(workspace: Optional[Path] = None, environ: Optional[Mapping[str, str]] = None) -> str:
     """The server the seat's agent MCP descriptor mints on: the one its proxy reads (`MCP_DESCRIPTOR_ENV`,
-    which the proxy keeps for this resolver, wherever it lives), else the workspace's. Its lane's row's
-    server, else its agent's; "" when no descriptor is readable or it names neither."""
+    which the proxy keeps for this resolver, wherever it lives), else the workspace's. The descriptor's own
+    agent's server first: that is who the proxy mints as, and it does not move when the owner switches
+    which server is primary (set_primary rewrites no descriptor). Only a descriptor naming no agent falls
+    back to its lane's row's server. "" when no descriptor is readable or it names neither."""
     environ = os.environ if environ is None else environ
     named = str(environ.get(MCP_DESCRIPTOR_ENV) or "")
     try:
@@ -2325,10 +2327,13 @@ def mcp_seat_server(workspace: Optional[Path] = None, environ: Optional[Mapping[
         return ""
     if not isinstance(desc, dict):
         return ""
+    own = server_of_mxid(str(desc.get("agent_id") or ""))
+    if own:
+        return own.lower()
     lane = str(desc.get("lane") or "")
     lane = "" if lane == "primary" else lane
     row = next((r for r in _core_rows(rows) if (r["instance"] == lane if lane else r["primary"])), None)
-    return str(row["server"]).lower() if row else server_of_mxid(str(desc.get("agent_id") or ""))
+    return str(row["server"]).lower() if row else ""
 
 
 def worker_mcp_credential(worker: str, *, workspace: Optional[Path] = None,
