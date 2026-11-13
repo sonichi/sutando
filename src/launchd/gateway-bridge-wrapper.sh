@@ -168,6 +168,22 @@ tend_agents_supervisor() {
   AGENTS_PID=$!
   echo "[gateway-bridge-wrapper] agent-bridge supervisor started (pid $AGENTS_PID)" >&2
 }
+# Named lanes (connections.py launch-plan) have no supervisor of their own: one keep-lanes pass every
+# LANES_EVERY_S, never two at once. Each pass starts lanes under the connections lock and backs off.
+LANES_EVERY_S="${SUTANDO_GATEWAY_LANES_EVERY_S:-30}"
+LANES_PID=''
+LANES_NEXT=0
+tend_lanes() {
+  if [ -n "$LANES_PID" ]; then
+    kill -0 "$LANES_PID" 2>/dev/null && return 0
+    wait "$LANES_PID" 2>/dev/null || true
+    LANES_PID=''
+  fi
+  [ "$(date +%s)" -ge "$LANES_NEXT" ] || return 0
+  LANES_NEXT=$(( $(date +%s) + LANES_EVERY_S ))
+  python3 "$REPO/scripts/connections.py" keep-lanes --repo "$REPO" --logs-dir "$WORKSPACE/logs" &
+  LANES_PID=$!
+}
 stop_agents_supervisor() {
   [ -n "$AGENTS_PID" ] || return 0
   kill "$AGENTS_PID" 2>/dev/null || true
@@ -196,6 +212,7 @@ while [ "$STOPPING" = 0 ]; do
     exit 0
   fi
   tend_agents_supervisor
+  tend_lanes
   # A primary move parked the legacy row: launch nothing, keep tending the agent bridges, and
   # resume on its own once the row is unparked.
   if python3 "$REPO/scripts/connections.py" legacy-parked >/dev/null 2>&1; then
@@ -225,6 +242,7 @@ while [ "$STOPPING" = 0 ]; do
   # supervisor must be tended while the bridge runs.
   while kill -0 "$CHILD_PID" 2>/dev/null && [ "$STOPPING" = 0 ]; do
     tend_agents_supervisor
+    tend_lanes
     sleep "$POLL_S"
   done
   set +e
