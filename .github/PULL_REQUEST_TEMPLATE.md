@@ -36,6 +36,7 @@ please do — it saves a lot of round-trips.
 - [ ] Scanned added lines for host-specific hardcoded paths and inline home/workspace fallbacks; fixtures are narrowly scoped
 - [ ] If this PR adds or edits a CI workflow, I confirmed it actually runs on this PR (see the Checks tab — a `branches:` filter can silently exclude a stacked PR)
 - [ ] Doesn't reinvent workspace / home-path resolution — uses the `resolve_workspace` / `resolveWorkspace` / `claude_home_path` helpers (see `CLAUDE.md` "Workspace contract"; enforced by the `lint-workspace-resolution`, `lint-claude-home-path`, and `workspace-leak-check` CI checks)
+- [ ] **Agent-native design rules.** If this adds or changes something a person or an agent can do or read, follow `docs/agent-native-design-rules.md` and answer its checklist. (or N/A)
 
 ## Before / after evidence
 

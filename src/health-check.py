@@ -87,6 +87,7 @@ import process_pins  # noqa: E402
 import pool_suspension  # noqa: E402
 import tmux_pane_keys  # noqa: E402
 import watcher_identity  # noqa: E402
+import bridge_engine  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
 from gateway_serving import (  # noqa: E402
@@ -9463,6 +9464,19 @@ def _watcher_runtime(sentinel: Path, inbox: "str | None") -> str:
     return "claude" if _claude_runtime_selected() else "other"
 
 
+def check_bridge_engine_match() -> dict:
+    """A bridge running from another install's engine may write tasks this core never reads."""
+    def _pids(script: str) -> tuple:
+        # Not end-anchored: a bridge launched with trailing arguments must still be found.
+        pids, scanned = probe_pids(re.escape(script) + "([[:space:]]|$)")
+        return _drop_launcher_parents(pids), scanned
+    try:
+        return bridge_engine.check_bridge_engine_match(REPO_DIR, _pids)
+    except Exception as exc:  # noqa: BLE001 — a probe failure is not a finding
+        return {"name": bridge_engine.CHECK_NAME, "status": "unknown",
+                "detail": f"probe failed ({type(exc).__name__})"}
+
+
 def check_task_watcher() -> dict:
     """Direct liveness of the streaming task watcher (src/watch-tasks-stream.sh).
 
@@ -13903,6 +13917,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_stranded_destined_proactive())
     checks.append(check_stale_proactive_backlog())
     checks.append(check_task_watcher())
+    checks.append(check_bridge_engine_match())
     checks.append(check_task_claim_age())
     checks.append(check_a_fallback_hits())
     checks.append(check_outbox_parked())

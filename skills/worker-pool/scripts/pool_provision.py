@@ -475,6 +475,14 @@ class Actions:
         return self.tool("room.action.read", {"action": action, "room_id": room_id, "arguments": arguments})
 
 
+def core_actions(workspace: Optional[Path] = None, lane: Optional[str] = None, *, vault=None,
+                 request: Optional[Callable[..., Reply]] = None) -> Tuple["Actions", dict]:
+    """(Actions as the core's own agent, the core's connection row), for a caller that posts as the core."""
+    row = core_lane(workspace, lane)
+    gateway, token = connections.connection_credential(row, vault=vault)
+    return Actions(gateway, bearer_of(token), request or http_json, []), row
+
+
 def settle(call: Callable[[], dict], *, timeout: float, sleep, clock, first: Optional[dict] = None,
            waiting: Optional[Callable[[], None]] = None, poll: float = POLL_S) -> Tuple[str, dict]:
     """(state, answer) of an Action call once it stops waiting. Nothing tells an agent that its held

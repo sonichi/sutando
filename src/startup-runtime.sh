@@ -44,7 +44,7 @@ claude_auth_carry_enabled() {
 # configured CODEX_HOME as its launcher, then asks the CLI itself for status.
 preflight_selected_core_auth() {
   local _runtime="${1:-claude}" _claude_config_dir="${2:-}"
-  local _repo _config_env _config_value
+  local _repo
   _repo="$(sutando_repo_root)"
 
   case "$_runtime" in
@@ -54,18 +54,13 @@ preflight_selected_core_auth() {
       fi
       ;;
     codex)
-      _config_env="$(bash "$_repo/scripts/sutando-config.sh" core-config-dir-env-name codex)" || {
-        echo "startup: could not resolve the Codex config-dir environment" >&2
-        return 1
-      }
-      _config_value="$(bash "$_repo/scripts/sutando-config.sh" core-config-dir-value codex)" || {
+      # src/codex_home.py alone resolves, checks and creates the home; a refused one is not made.
+      # shellcheck source=agent/codex/codex-home.sh
+      . "$_repo/src/agent/codex/codex-home.sh"
+      sutando_codex_home_prepare "$_repo" || {
         echo "startup: could not resolve the Codex config directory" >&2
         return 1
       }
-      if [ -n "$_config_env" ] && [ -n "$_config_value" ]; then
-        mkdir -p "$_config_value"
-        export "$_config_env=$_config_value"
-      fi
       if [ "${SUTANDO_SKIP_AUTH_PREFLIGHT:-0}" = "1" ]; then
         echo "codex-auth-preflight: skipped (SUTANDO_SKIP_AUTH_PREFLIGHT=1)"
         return 0

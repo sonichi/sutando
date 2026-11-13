@@ -22,7 +22,10 @@ never held, so it is revived as before.
 
 A hold also records a digest of the account it was observed under; a launch under a different
 account is not held by it, so signing in to an account with quota resumes at once. Every launch
-passes this gate, so evidence older than the gate's first sight of an account is not that account's.
+passes this gate and leaves its account on record even when nothing is held (status "none"), so
+the next launch can tell a switch: evidence older than the gate's first sight of an account is
+not that account's. Without that record, a limit hit by one account followed by a sign-in to
+another before the next launch was pinned on the new account.
 
 While a hold is in force the gate also acts on the owner's bare replies to the notice,
 "switch to <model>" and "retry now", since nothing else reads the inbox with the core down.
@@ -505,8 +508,9 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
         if _ensure_notice(workspace, hold, card_entry, now):
             _write_hold(workspace, hold)
         return Decision(False, hold, status_line(hold))
-    switched = bool(hold and launch_account and hold.get("account")
-                    and hold.get("account") != launch_account)
+    # Who ran last: the record's account, else the launcher a released legacy hold remembered.
+    last = (hold or {}).get("account") or (hold or {}).get("launch_account")
+    switched = bool(launch_account and last and last != launch_account)
     since = now if switched else (hold or {}).get("account_at")
     if quota is None:
         rec = qa.read_quota_record(workspace, now)
@@ -552,9 +556,17 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
     was_held = bool(hold and hold.get("status") == "held")
     if was_held:
         hold = dict(hold, status="released", released_at=now)
+        if launch_account and not hold.get("account"):
+            # Not the old limit's owner, only who launched: the next switch is seen against it.
+            hold["launch_account"] = launch_account
     if switched:
         hold = dict(hold, account=launch_account, account_at=now)
-    if was_held or switched:
+    # Record the launch account on any record that carries none: a switch is only seen against it.
+    # Never onto a hold this launch released: that limit is not this account's to claim.
+    first_sight = bool(launch_account and not was_held and not (hold or {}).get("account"))
+    if first_sight:
+        hold = dict(hold or {"status": "none"}, account=launch_account)
+    if was_held or switched or first_sight:
         _write_hold(workspace, hold)
     if was_held:
         _mirror_core_status(workspace, "starting", "resuming after a provider limit", now)
