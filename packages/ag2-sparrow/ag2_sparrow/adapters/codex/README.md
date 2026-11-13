@@ -23,7 +23,7 @@ occupancy and the holder record attribution, never readiness.
 ```bash
 ag2-sparrow-codex-local install --agent <@agent:server> --token-stdin   # paste the relay token when asked
 ag2-sparrow-codex-local install --work <dir> [--codex-home <dir>] [--sandbox read-only|workspace-write] \
-    [--allow-non-owner] [--model <m>] [--codex <path>]
+    [--allow-non-owner] [--model <m>] [--codex <path>] [--resume-thread <uuid>]
 ag2-sparrow-codex-local install --token-env-file <the agent's .env> [the same options]   # the alternative to --token-stdin
 ag2-sparrow-codex-local verify [--agent <@agent:server>]
 ag2-sparrow-codex-local uninstall [--agent <@agent:server>]
@@ -160,7 +160,7 @@ owner path is unchanged.
 
 | | owner | attested collaborator, or any non-owner under `--allow-non-owner` |
 |---|---|---|
-| thread | durable, one per `channel_id` (`state/threads/<sha256 of the id>`, the readable id inside the file), resumed across restarts; owner tasks with no `channel_id` share the one `default` thread; `--thread-id CHANNEL_ID=THREAD` seeds exactly that channel | a fresh **ephemeral** thread per task, never reused, never saved |
+| thread | durable, one per `channel_id` (`state/threads/<sha256 of the id>`, the readable id inside the file), resumed across restarts; owner tasks with no `channel_id` share the one `default` thread; `--thread-id CHANNEL_ID=THREAD` seeds exactly that channel; `install --resume-thread <uuid>` (a conversation saved under `--codex-home`'s `sessions/`, as `codex resume <id>` takes it) is resumed in the owner's DM (`channel_kind: dm`) the first time, recorded in `state/resume-thread-taken`, and every other room starts a new thread; everything in that conversation becomes the agent's context there, and if the agent has more than one DM-kind room with the owner, the first to send takes it | a fresh **ephemeral** thread per task, never reused, never saved |
 | cwd | `--cwd` (default `--work`) | an empty temp dir, removed after the turn, so no room's `tasks/` or `results/` is in reach |
 | sandbox | `--sandbox` (default `read-only`) | `read-only`, whatever the flag says |
 | approvals | `never`; a request that still arrives is declined | same |

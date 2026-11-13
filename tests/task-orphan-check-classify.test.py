@@ -756,6 +756,21 @@ class TestWorkerHeld(ClassifyBase):
         self.assertFalse((self.ws.root / "deliveries").exists())
         self.assertEqual(self.one()["verdict"], "orphan")
 
+    def test_a_live_background_marker_does_not_hold_at_recovery(self):
+        sys.path.insert(0, str(REPO / "src"))
+        import task_delegation
+        self.held_task()
+        task_delegation.mark(self.ws.root, self.HELD, 1800)
+        self.assertEqual(self.one()["verdict"], "orphan")
+
+    def test_holder_lookup_delegates_to_the_shared_predicate(self):
+        sys.path.insert(0, str(REPO / "src"))
+        import task_delegation
+        with unittest.mock.patch.object(task_delegation, "holder", return_value="w9") as h:
+            self.assertEqual(self.mod._holder_of(self.ws.root, self.HELD), "w9")
+        h.assert_called_once_with(self.ws.root, self.HELD, worker_holder=self.mod._pool_holder,
+                                  include_background=False)
+
 
 class TestLimitHeld(ClassifyBase):
     """A task that arrived while the core was paused for a provider limit waits for the core:

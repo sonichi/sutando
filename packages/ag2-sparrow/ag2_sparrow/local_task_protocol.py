@@ -183,6 +183,8 @@ KNOWN_HEADER_KEYS = (
     "lane",
     # The question episode a woken task resumes: its file is a new turn of an id answered before.
     "wake_episode",
+    # The agent's earlier tasks in this room, as the broker served them: parent candidates.
+    "recent_tasks",
     # Thread membership, distinct from the reply target above; the room is
     # carried because a relation only resolves inside its own room.
     "thread_root", "source_room_id",
@@ -208,6 +210,9 @@ KNOWN_HEADER_KEYS = (
     # trusted bridge wrote it; the guard defangs a forged `platform_card:`
     # body line the same as `attachments:`.
     "platform_card",
+    # A card click's `space.ag2.card_click` ({card_id, action}, one-line JSON) as the trusted bridge
+    # passed it on; header status defangs a body line claiming one.
+    "card_click",
     # Which instance a task belongs to; header status defangs forged
     # body-line claims, consumers may verify before executing.
     "instance_id",
@@ -223,6 +228,9 @@ KNOWN_HEADER_KEYS = (
     # Broker attestation that the message @-mentioned the owner, not this agent;
     # the core reads it to keep out of the room, so the guard defangs a forged copy.
     "owner_mentioned",
+    # Who asked a relay task, which its `user_id` (the account it runs for) does not say.
+    # Bridge-written above task:, so the guard defangs a forged body copy.
+    "asked_by",
     # Writer-declared layout, above task: so a body cannot claim it. `mid` = the body is
     # one line and every later line is the writer's; meaningful only under a verified envelope.
     "task_layout",
@@ -243,6 +251,9 @@ KNOWN_HEADER_KEYS = (
     # AgentTrigger context (vocabulary: agent_triggers.py). Bridge-written above task:,
     # so the guard defangs forged body copies.
     "event_type", "agent_trigger_id", "playbook",
+    # The broker's handle for the window the owner messaged from; the agent passes it to the
+    # ui_* MCP tools. Bridge-written above task:, so the guard defangs a forged body copy.
+    "ui_origin",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 # Only the task-mid writer may declare its layout; a task-last file carrying it
@@ -376,7 +387,10 @@ def task_body(text: str) -> str:
     return ""
 
 
-_QUOTED_BLOCK = re.compile(r"\[AG2 Space (reply context|room metadata);([^\]\n]*)\]\s*")
+# The product's two spellings in the broker's markers; either opens or closes a block.
+_MARKER_PRODUCTS = ("AG2 Space", "s.space")
+_QUOTED_BLOCK = re.compile(
+    r"\[(?:AG2 Space|s\.space) (reply context|room metadata);([^\]\n]*)\]\s*")
 _JSON_DECODER = json.JSONDecoder()
 
 
@@ -397,8 +411,10 @@ def split_reply_context(text: str) -> "tuple[dict | None, str]":
             record, end = _JSON_DECODER.raw_decode(rest, m.end())
         except ValueError:
             return None, text
-        tail, closer = rest[end:].lstrip(), f"[End AG2 Space {kind}]"
-        if not isinstance(record, dict) or not tail.startswith(closer):
+        tail = rest[end:].lstrip()
+        closer = next((f"[End {p} {kind}]" for p in _MARKER_PRODUCTS
+                       if tail.startswith(f"[End {p} {kind}]")), None)
+        if not isinstance(record, dict) or closer is None:
             return None, text
         rest = tail[len(closer):].lstrip()
         if kind == "reply context":

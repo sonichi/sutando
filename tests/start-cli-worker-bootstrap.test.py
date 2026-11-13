@@ -69,10 +69,9 @@ def _boot(extra_env: dict, server_env: "dict | None" = None, pgrep_stub: str = P
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
         shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
         (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True)
-        shutil.copy2(
-            REPO / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
-            root / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
-        )
+        for name in ("launch-worker-session.sh", "worker-mcp-credential.sh"):
+            shutil.copy2(REPO / "skills" / "worker-pool" / "scripts" / name,
+                         root / "skills" / "worker-pool" / "scripts" / name)
         delivery_script = root / "skills" / "worker-pool" / "scripts" / "pool_delivery.py"
         delivery_script.write_text("# Readable pool writer fixture for launcher preflight.\n")
         ws = td / "ws"

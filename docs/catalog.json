@@ -76,7 +76,7 @@
    ],
    "status": "canonical",
    "canonical_for": "built-in capability catalog",
-   "last_verified": "2026-11-05"
+   "last_verified": "2026-11-08"
   },
   "docs/census/d1-identity-census.md": {
    "title": "D1 identity/state census — Discord / AG2 Space / Slack",
@@ -106,7 +106,7 @@
    ],
    "status": "active",
    "canonical_for": "Codex core setup, earned-reset policy, and rollback",
-   "last_verified": "2026-10-30"
+   "last_verified": "2026-11-10"
   },
   "docs/community-use-cases/README.md": {
    "title": "Community use cases",
@@ -135,7 +135,7 @@
    ],
    "status": "active",
    "canonical_for": "the state/connections.json record, preview-then-confirm add, primary and state semantics, and the startup launch plan for multi-gateway bridges",
-   "last_verified": "2026-10-28"
+   "last_verified": "2026-11-09"
   },
   "docs/delivery-protocol.md": {
    "title": "The file delivery protocol as a formal state machine",
@@ -267,7 +267,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-11-06"
+   "last_verified": "2026-11-08"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
@@ -350,7 +350,7 @@
    ],
    "status": "active",
    "canonical_for": "subagent delegation triggers beyond the explicit at-background rule, the do-not-delegate list, and per-spawn model selection",
-   "last_verified": "2026-08-21"
+   "last_verified": "2026-11-06"
   },
   "docs/testing-coverage.md": {
    "title": "Unit-test coverage gate",
@@ -475,6 +475,17 @@
    "canonical_for": "the composition of the lead-follower pool (#3314) with standing sessions (#3263)",
    "last_verified": "2026-08-25"
   },
+  "docs/pr-watch-lifecycle.md": {
+   "title": "PR-watch runner lifecycle",
+   "audience": [
+    "operators",
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "PR-watch runner shutdown admission, thread and process draining, cleanup deadlines, and local validation boundaries",
+   "last_verified": "2026-11-11"
+  },
   "docs/proactive-loop-rationale.md": {
    "title": "Proactive loop — rationale and measurements",
    "audience": [
@@ -483,7 +494,7 @@
    ],
    "status": "canonical",
    "canonical_for": "why each proactive-loop step exists: the measurement, the incident and the reasoning the skill file no longer carries",
-   "last_verified": "2026-10-15"
+   "last_verified": "2026-11-06"
   },
   "docs/recovery-issue-metrics.md": {
    "title": "Recovery issue metrics",
@@ -503,7 +514,7 @@
    ],
    "status": "draft",
    "canonical_for": "the v1 worker pool: durable worker identities and run history, zero-byte delivery sentinels under deliveries/<recipient>/ with the payload immutable in tasks/, the router as the core watcher's task-event handler over an owner-declared, core-compiled roster (unknown targets go to the core; liveness never routes), residue-based recovery, and the Phase 1 / Phase 2 split",
-   "last_verified": "2026-11-03"
+   "last_verified": "2026-11-06"
   },
   "docs/worker-pool-design-notes.md": {
    "title": "Worker pool — design notes",
@@ -522,8 +533,8 @@
     "maintainers"
    ],
    "status": "canonical",
-   "canonical_for": "how one inbox keeps exactly one announcer: the session watcher and the supervisor's standby, the tag and verdicts, readiness, the handoff contract",
-   "last_verified": "2026-10-22"
+   "canonical_for": "how one inbox keeps exactly one announcer: the session watcher and the supervisor's standby, the tag and verdicts, readiness, the handoff contract, the opt-in task-watch Mod",
+   "last_verified": "2026-11-06"
   },
   "docs/learning-window.md": {
    "title": "Retained learning windows",
@@ -586,6 +597,17 @@
    "status": "active",
    "canonical_for": "task wedge classes, detection policy, origin status and measurement limits",
    "last_verified": "2026-11-02"
+  },
+  "docs/agent-native-design-rules.md": {
+   "title": "Agent-native design rules",
+   "audience": [
+    "agents",
+    "contributors",
+    "maintainers"
+   ],
+   "status": "canonical",
+   "canonical_for": "agent-native design rules: Action parity under the same authority, controls instead of prose for known actions, card and click trust rules, and the contributor and reviewer checklist",
+   "last_verified": "2026-11-11"
   }
  }
 }

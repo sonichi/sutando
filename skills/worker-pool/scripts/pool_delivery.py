@@ -530,17 +530,20 @@ def prune_spent(workspace: Path, recipient: str) -> dict:
 
 
 def archive_finished(workspace, recipient: str, *, dry_run: bool = False,
-                     task_ids=None, moved: Optional[list] = None) -> dict:
+                     task_ids=None, moved: Optional[list] = None,
+                     deadline: Optional[float] = None) -> dict:
     """Move every sentinel `sentinel_retirable` allows into `archive/`; open tasks keep theirs.
     `task_ids` narrows the pass to those tasks (prune_spent, the boot sweep, the supervisor's
     retire). Without it a missing task's sentinel stays: the inbox resolver still judges those.
 
-    The payload is re-checked under the folder lock the router delivers under, so a task
-    re-queued meanwhile keeps its hold. Moved, never deleted: a move that cannot happen
+    The folder is scanned without its lock; each move then takes the lock the router delivers
+    under, re-checks that one task and moves it, so a task re-queued meanwhile keeps its hold and
+    a route waits on one entry, never the scan. Moved, never deleted: a move that cannot happen
     leaves the sentinel where it is; `prune_spent` later deletes aged archived files through
-    `prune_archive`. Returns {"archived": [task ids], "kept": {disposition: count},
-    "sentinels": n}. A caller's `moved` list gets each id as it moves, so a raise mid-loop
-    keeps them.
+    `prune_archive`. `deadline` (time.monotonic) stops the pass between entries; the ids it did not
+    decide are counted in "deferred" and the next pass picks them up. Returns {"archived": [task
+    ids], "kept": {disposition: count}, "sentinels": n, "deferred": n}. A caller's `moved` list
+    gets each id as it moves, so a raise mid-loop keeps them.
     """
     import task_disposition as tdisp
 
@@ -558,35 +561,52 @@ def archive_finished(workspace, recipient: str, *, dry_run: bool = False,
     if task_ids is not None:
         wanted = set(task_ids)
         by_id = {t: v for t, v in by_id.items() if t in wanted}
-    disp = tdisp.task_dispositions(ws, by_id)
-    finished = sorted(t for t in by_id if t in disp and _retirable_given(ws, recipient, t, disp[t])
-                      and (task_ids is not None or disp[t] != tdisp.MISSING))
+    ids = sorted(by_id)
+    disp: dict = {}
+    scanned = 0
+    while scanned < len(ids) and not _past(deadline):
+        chunk = ids[scanned:scanned + _DISPOSITION_CHUNK]
+        disp.update(tdisp.task_dispositions(ws, chunk))
+        scanned += len(chunk)
+    decided = ids[:scanned]
+    finished = [t for t in decided if t in disp and _retirable_given(ws, recipient, t, disp[t])
+                and (task_ids is not None or disp[t] != tdisp.MISSING)]
     kept: dict[str, int] = {}
-    for t in set(by_id) - set(finished):
+    for t in set(decided) - set(finished):
         state = disp.get(t, "unreadable-id")
         if state in tdisp.SETTLED:
             state += "-payload-live"
         kept[state] = kept.get(state, 0) + 1
-    out = {"archived": [] if moved is None else moved, "kept": kept, "sentinels": sum(len(v) for v in by_id.values())}
+    out = {"archived": [] if moved is None else moved, "kept": kept,
+           "sentinels": sum(len(v) for v in by_id.values()), "deferred": len(ids) - scanned}
     if dry_run:
         out["archived"] = finished
         return out
-    if not finished:
-        return out
-    with arbitration(ws, recipient) as dfd:
-        afd = _open_archive(dfd)
-        try:
-            for t in finished:
-                if not sentinel_retirable(ws, recipient, t):  # the same rule, under the lock
-                    kept["re-queued"] = kept.get("re-queued", 0) + 1
-                    continue
+    for i, t in enumerate(finished):
+        if _past(deadline):
+            out["deferred"] += len(finished) - i
+            break
+        with arbitration(ws, recipient) as dfd:
+            if not sentinel_retirable(ws, recipient, t):  # the same rule, under the lock
+                kept["re-queued"] = kept.get("re-queued", 0) + 1
+                continue
+            afd = _open_archive(dfd)
+            try:
                 for name in sentinel_names(t):
                     if regular_file_state(name, dir_fd=dfd) == "regular":
                         _move_into_archive(dfd, afd, name)
-                out["archived"].append(t)
-        finally:
-            os.close(afd)
+            finally:
+                os.close(afd)
+        out["archived"].append(t)
     return out
+
+
+# Ids per bulk disposition lookup when a pass has a deadline: small enough to stop near it.
+_DISPOSITION_CHUNK = 64
+
+
+def _past(deadline: Optional[float]) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
 
 
 def _open_archive(dfd: int) -> int:
