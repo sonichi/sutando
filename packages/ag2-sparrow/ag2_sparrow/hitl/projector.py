@@ -238,7 +238,8 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
             continue
         event_id = str(answer.get("event_id") or "") or None
         extra = renotify.on_create(req, clock()) if created else None
-        manager.record_projection(req.id, req.revision, event_id if created else None, extra)
+        manager.record_projection(req.id, req.revision, event_id if created else None, extra,
+                                  replaces=target if created else None)
         _RETRY_DEADLINES.pop((str(manager.store.root), req.id, req.revision), None)
         out.done.append((req.id, event_id))
     if out.done:

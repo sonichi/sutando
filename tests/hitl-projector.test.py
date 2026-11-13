@@ -636,6 +636,51 @@ class EditTargetMissingTests(unittest.TestCase):
         self.assertEqual(self.mgr.store.projection(self.stale.id), before)
         self.assertTrue(self.mgr.needs_projection(self.stale.id))
 
+    def test_a_404_on_the_resend_is_the_endpoints_and_is_not_resent_again(self):
+        self.mgr.resolve(self.stale.id)
+        self.mgr.create(make_req(kind="choice", guard="fresh"))  # accepted would charge a card 404
+        stale_key = f"hitl:{self.stale.id}:"
+
+        def relay(payload):  # holds no event of the stale card, and 404s its new card too
+            if payload["dedupe_key"].startswith(stale_key):
+                self.relay.sent.append(payload)
+                self.relay._refuse(404)
+            return self.relay(payload)
+        with self.assertRaises(OSError) as raised:
+            project(self.mgr, relay, "!dm:s.space")
+        self.assertEqual(raised.exception.code, 404, "the endpoint's 404, not a charged card refusal")
+        self.assertEqual(self._ops(self.relay, self.stale), ["edit", "message"])
+        ledger = self.mgr.store.projection(self.stale.id)
+        self.assertNotIn("refusals", ledger)
+        self.assertNotIn("failed_revision", ledger)
+        self.assertTrue(self.mgr.needs_projection(self.stale.id))
+
+    def test_the_new_id_lands_when_a_later_revision_was_recorded_during_the_resend(self):
+        self.mgr.resolve(self.stale.id)
+        dead = self.mgr.projection_target(self.stale.id)
+
+        def relay(payload):  # an overlapping pass records a later revision on the dead target
+            if payload["op"] == "message":
+                req = self.mgr.store.load(self.stale.id)
+                self.mgr.record_projection(req.id, req.revision + 1, None)
+            return self.relay(payload)
+        project(self.mgr, relay, "!dm:s.space")
+        target = self.mgr.projection_target(self.stale.id)
+        self.assertNotEqual(target, dead)
+        self.assertIn(target, self.relay.events)
+
+    def test_a_target_already_replaced_by_another_pass_is_kept(self):
+        self.mgr.resolve(self.stale.id)
+
+        def relay(payload):  # an overlapping pass already re-created the card and recorded it
+            if payload["op"] == "message":
+                req = self.mgr.store.load(self.stale.id)
+                self.mgr.record_projection(req.id, req.revision + 1, "$other",
+                                           replaces=self.mgr.projection_target(req.id))
+            return self.relay(payload)
+        project(self.mgr, relay, "!dm:s.space")
+        self.assertEqual(self.mgr.projection_target(self.stale.id), "$other")
+
 
 def _refusing(code):
     def send(payload):
