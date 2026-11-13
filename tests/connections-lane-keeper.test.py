@@ -2,8 +2,8 @@
 """The primary gateway wrapper's lane keeper (`connections.keep_lanes_up`).
 
 Pins: a launch-plan lane no bridge holds is started once, with one log line; a lane that is up,
-disconnected or parked is left alone; a lane that does not start backs off (30 s, then doubling)
-and is not retried every pass; a token update's stop and relaunch share one hold of the record
+disconnected or parked is left alone; a lane that does not start backs off (30 s, then doubling,
+capped at 15 min however many failures) and is not retried every pass, nor stops the pass for others; a token update's stop and relaunch share one hold of the record
 lock, so a keeper pass run in between neither starts the lane on the old code nor starts it twice;
 the keeper's environment never carries an inherited lane token.
 
@@ -133,6 +133,41 @@ class KeepsLanesUp(KeeperBase):
         self.assertEqual(len(ok), 1)
         self.assertIn("started it", ok[0])
         self.assertEqual(C._read_json(C.lane_keeper_state_path(self.ws)), {}, "a started lane clears its wait")
+
+
+class SustainedFailure(KeeperBase):
+    def spawn_failing_alpha(self, argv, env, log_path):
+        if env["GATEWAY_INSTANCE"] == "alpha-fixture-net":
+            raise OSError("no python")
+        return self.spawn(argv, env, log_path)
+
+    def test_thousands_of_failures_stay_capped_and_the_next_lane_still_starts(self):
+        now, waits = 1000.0, set()
+        for n in range(3000):
+            lines = self.keep(spawn=self.spawn_failing_alpha, now=now)
+            alpha = [line for line in lines if "alpha-fixture-net" in line]
+            self.assertEqual(len(alpha), 1, (n, lines))
+            waits.add(alpha[0].rsplit("next try in ", 1)[1])
+            if n == 0:
+                self.assertIn(f"lane {BETA} was down; started it", " ".join(lines), "same pass as the failure")
+            now += C.LANE_RETRY_MAX_S + 1
+        self.assertEqual(C._read_json(C.lane_keeper_state_path(self.ws))["alpha-fixture-net"]["failures"], 3000)
+        self.assertTrue(waits <= {"30s", "60s", "120s", "240s", "480s", "900s"}, waits)
+        self.assertEqual(C.lane_retry_wait(1025), C.LANE_RETRY_MAX_S)
+        self.assertEqual(C.lane_retry_wait(10 ** 9), C.LANE_RETRY_MAX_S)
+
+    def test_a_lane_whose_check_raises_does_not_stop_the_pass(self):
+        real = C._row_named
+
+        def row_named(inst, workspace):
+            if inst == "alpha-fixture-net":
+                raise RuntimeError("bad row")
+            return real(inst, workspace)
+        with unittest.mock.patch.object(C, "_row_named", row_named):
+            lines = self.keep(now=1000.0)
+        self.assertEqual([i for i, _ in self.spawned], [BETA])
+        self.assertTrue(any("alpha-fixture-net: keeper check failed (RuntimeError); next try in 30s" in line
+                            for line in lines), lines)
 
 
 class TokenUpdateRace(KeeperBase):

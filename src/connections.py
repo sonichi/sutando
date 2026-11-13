@@ -3300,6 +3300,51 @@ def keeper_environ(environ: Optional[Mapping[str, str]] = None) -> dict:
     return {**base, **channel_launch_keys(base)}
 
 
+def lane_retry_wait(failures: int) -> float:
+    """Seconds before try `failures + 1`: LANE_RETRY_FIRST_S doubling per failure, capped at
+    LANE_RETRY_MAX_S; the exponent is bounded so no failure count can overflow it."""
+    return min(LANE_RETRY_FIRST_S * 2 ** min(max(failures - 1, 0), 16), LANE_RETRY_MAX_S)
+
+
+def _lane_retry(due: object, now: float) -> dict:
+    try:
+        failures = int((due or {}).get("failures") or 0) + 1  # type: ignore[union-attr]
+    except (AttributeError, TypeError, ValueError):
+        failures = 1
+    return {"failures": failures, "next_try": now + lane_retry_wait(failures)}
+
+
+def _keep_lane(inst: str, state: dict, now: float, say: Callable[[str], None], *, repo: Path, logs_dir: Path,
+               environ: Mapping[str, str], workspace: Optional[Path], vault, spawn, python: Optional[str]) -> None:
+    """`keep_lanes_up` for one lane, under the record lock."""
+    with _records_lock(workspace):
+        if inst not in {e["instance"] for e in launch_plan(environ, workspace=workspace)}:
+            state.pop(inst, None)  # disconnected, parked or removed since the plan was read
+            return
+        row = _row_named(inst, workspace) or {}
+        if any(_proven_holder(n, workspace) for n in [inst] + alias_instances(row)):
+            state.pop(inst, None)
+            return
+        due = state.get(inst) or {}
+        try:
+            if float(due.get("next_try") or 0) > now:
+                return
+        except (AttributeError, TypeError, ValueError):
+            pass  # an unreadable wait is no wait
+        try:
+            rec = launch(inst, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
+                         vault=vault, spawn=spawn, python=python)
+        except ConnectionsError as e:
+            reason = _launch_record(inst, workspace).get("reason") if isinstance(e, LaunchFailed) else None
+            state[inst] = _lane_retry(due, now)
+            say(f"lane {inst} is down and did not start ({reason or _error_reason(e)}); "
+                f"next try in {state[inst]['next_try'] - now:.0f}s")
+            return
+        state.pop(inst, None)
+        if rec.get("lease") == "held":
+            say(f"lane {inst} was down; started it (pid {rec.get('pid')})")
+
+
 def keep_lanes_up(*, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
                   workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None,
                   now: Optional[float] = None, log: Optional[Callable[[str], None]] = None) -> list:
@@ -3321,31 +3366,13 @@ def keep_lanes_up(*, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, 
         log(line)
     plan = [e["instance"] for e in launch_plan(environ, workspace=workspace)]
     for inst in plan:
-        with _records_lock(workspace):
-            if inst not in {e["instance"] for e in launch_plan(environ, workspace=workspace)}:
-                state.pop(inst, None)  # disconnected, parked or removed since the plan was read
-                continue
-            row = _row_named(inst, workspace) or {}
-            if any(_proven_holder(n, workspace) for n in [inst] + alias_instances(row)):
-                state.pop(inst, None)
-                continue
-            due = state.get(inst) or {}
-            if float(due.get("next_try") or 0) > now:
-                continue
-            try:
-                rec = launch(inst, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
-                             vault=vault, spawn=spawn, python=python)
-            except ConnectionsError as e:
-                reason = _launch_record(inst, workspace).get("reason") if isinstance(e, LaunchFailed) else None
-                failures = int(due.get("failures") or 0) + 1
-                wait = min(LANE_RETRY_FIRST_S * 2 ** (failures - 1), LANE_RETRY_MAX_S)
-                state[inst] = {"failures": failures, "next_try": now + wait}
-                say(f"lane {inst} is down and did not start ({reason or _error_reason(e)}); "
-                    f"next try in {wait:.0f}s")
-                continue
-            state.pop(inst, None)
-            if rec.get("lease") == "held":
-                say(f"lane {inst} was down; started it (pid {rec.get('pid')})")
+        try:
+            _keep_lane(inst, state, now, say, repo=repo, logs_dir=logs_dir, environ=environ,
+                       workspace=workspace, vault=vault, spawn=spawn, python=python)
+        except Exception as e:  # noqa: BLE001 - one lane's fault never costs the others their pass
+            state[inst] = _lane_retry(state.get(inst), now)
+            say(f"lane {inst}: keeper check failed ({type(e).__name__}); "
+                f"next try in {state[inst]['next_try'] - now:.0f}s")
     for inst in [k for k in state if k not in plan]:
         state.pop(inst, None)
     _atomic_json(state_path, state)
