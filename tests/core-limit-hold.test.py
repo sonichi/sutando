@@ -65,6 +65,13 @@ def limited_record(now: float, *, reset_in: float = 3600, rejected: bool = True,
     }
 
 
+def unattributed_429(now: float, ago: float = 1) -> dict:
+    """A 429 the record's headers do not speak for: no provider status came with it."""
+    rec = limited_record(now, rejected=False, ago=ago)
+    del rec["headers"]["anthropic-ratelimit-unified-status"]
+    return rec
+
+
 def owner_task(tasks: Path, name: str, body: str, tier: str = "owner",
                stamp: str = "2099-01-01T00:00:00Z") -> Path:
     path = tasks / f"{name}.txt"
@@ -131,8 +138,7 @@ class Decide(unittest.TestCase):
 
     def test_no_reset_backs_off_and_grows_only_on_new_evidence(self):
         now = 1_800_000_000.0
-        rec = limited_record(now, rejected=False, ago=1)  # a 429 with no rejected window
-        rec["last_checked"] = iso(now - 1)
+        rec = unattributed_429(now)  # a 429 the provider's headers say nothing of
         d = clh.decide(self.ws, now, quota=rec)
         self.assertFalse(d.launch)
         self.assertEqual(d.hold["until"], now + clh.BACKOFF_BASE_S)
@@ -140,7 +146,7 @@ class Decide(unittest.TestCase):
         t = now + clh.BACKOFF_BASE_S + 1
         self.assertTrue(clh.decide(self.ws, t, quota=rec).launch)
         # The relaunched core is refused again: a fresh 429, a longer hold.
-        rec2 = limited_record(t + 30, rejected=False, ago=1)
+        rec2 = unattributed_429(t + 30)
         d = clh.decide(self.ws, t + 30, quota=rec2)
         self.assertFalse(d.launch)
         self.assertEqual(d.hold["strikes"], 2)
@@ -149,7 +155,7 @@ class Decide(unittest.TestCase):
         t2 = d.hold["until"] + 1
         self.assertTrue(clh.decide(self.ws, t2, quota=rec2).launch)
         later = t2 + clh.BACKOFF_BASE_S + 60
-        d = clh.decide(self.ws, later, quota=limited_record(later, rejected=False, ago=1))
+        d = clh.decide(self.ws, later, quota=unattributed_429(later))
         self.assertEqual(d.hold["strikes"], 1)
         self.assertEqual(d.hold["until"], later + clh.BACKOFF_BASE_S)
 
@@ -1496,6 +1502,82 @@ class WitnessFindings(unittest.TestCase):
         clh.decide(self.ws, after + 90, quota=limited_record(after + 30, ago=1))
         self.assertEqual(len(self.notices()), 2)
 
+
+
+class QuotaAllowed(unittest.TestCase):
+    """A 429 on an account the provider says has quota is not a limit (rmwflgs2c28gt0)."""
+
+    # The proxy's ledger holds the 429's body as it arrived: compressed, so unreadable here.
+    ENCODED = "\ufffd8\x00\x00\ufffd\ufffd\ufffd\ufffd\ufffd\ufffdt\ufffd\x1eL\ufffd&7"
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.ws = Path(self.td.name)
+        (self.ws / "state").mkdir()
+        self.now = 1_800_000_000.0
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def fable_429(self, snippet: str) -> dict:
+        rec = limited_record(self.now, rejected=False, model="claude-fable-5-2", ago=20)
+        rec["headers"]["anthropic-ratelimit-unified-7d-utilization"] = "0.41"
+        rec["recent_rejections"][0]["snippet"] = snippet
+        return rec
+
+    def test_a_throttle_with_quota_left_does_not_pause_the_core(self):
+        for snippet in (self.ENCODED, '{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}'):
+            d = clh.decide(self.ws, self.now, quota=self.fable_429(snippet), launch_model="claude-fable-5-2")
+            self.assertTrue(d.launch, d.line)
+            self.assertIsNone(clh.active_hold(self.ws, self.now))
+            self.assertFalse((self.ws / "results").exists(), "no pause notice for a throttle")
+
+    def test_a_named_usage_limit_or_retry_time_still_holds(self):
+        d = clh.decide(self.ws, self.now, quota=self.fable_429("You've reached your Fable limit."),
+                       launch_model="claude-fable-5-2")
+        self.assertFalse(d.launch)
+        self.assertEqual((d.hold["kind"], d.hold["model"]), ("usage-limit", "claude-fable-5-2"))
+        lim = clh.record_evidence(self.fable_429("rate limited, retry-after: 90"), self.now)
+        self.assertEqual((lim.kind, lim.reset_at), ("rate-limit", self.now - 20 + 90))
+
+    def test_an_exhausted_account_still_holds(self):
+        rec = limited_record(self.now, model="claude-fable-5-2")
+        rec["recent_rejections"][0]["snippet"] = self.ENCODED
+        d = clh.decide(self.ws, self.now, quota=rec, launch_model="claude-fable-5-2")
+        self.assertFalse(d.launch)
+        self.assertEqual(d.hold["kind"], "usage-limit")
+
+    def test_headers_from_an_earlier_response_do_not_clear_the_429(self):
+        rec = self.fable_429(self.ENCODED)
+        rec["last_checked"] = iso(self.now - 600)
+        self.assertFalse(clh.decide(self.ws, self.now, quota=rec, launch_model="claude-fable-5-2").launch)
+
+    def transcript(self, text: str) -> Path:
+        proj = self.ws / "projects"
+        proj.mkdir(exist_ok=True)
+        now = time.time()
+        served = {"type": "assistant", "timestamp": iso(now - 60),
+                  "message": {"model": "claude-fable-5-2", "content": [{"type": "text", "text": "ok"}]}}
+        err = {"isApiErrorMessage": True, "timestamp": iso(now - 20), "type": "assistant",
+               "message": {"model": "<synthetic>", "content": [{"type": "text", "text": text}]}}
+        (proj / "s.jsonl").write_text(json.dumps({"type": "user"}) + "\n" + json.dumps(served) + "\n"
+                                      + json.dumps({"type": "user"}) + "\n" + json.dumps(err) + "\n")
+        return proj
+
+    def test_the_clis_not_your_usage_limit_error_does_not_pause_the_core(self):
+        text = "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited"
+        self.assertIsNone(clh.classify_text(text, self.now))
+        d = clh.decide(self.ws, time.time(), quota=None, projects_dir=self.transcript(text),
+                       launch_model="claude-fable-5-2")
+        self.assertTrue(d.launch, d.line)
+
+    def test_the_clis_fable_limit_holds_fable_only(self):
+        proj = self.transcript("You've reached your Fable limit.")
+        now = time.time()
+        self.assertTrue(clh.decide(self.ws, now, quota=None, projects_dir=proj, launch_model="sonnet").launch)
+        d = clh.decide(self.ws, now, quota=None, projects_dir=proj, launch_model="claude-fable-5-2")
+        self.assertFalse(d.launch)
+        self.assertEqual((d.hold["kind"], d.hold["model"]), ("usage-limit", "claude-fable-5-2"))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

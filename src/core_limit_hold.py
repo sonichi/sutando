@@ -33,6 +33,10 @@ Tasks that arrive during a hold are listed in its record (`held_tasks`), so the 
 on the next boot leaves them for the core; each hold incident sends its own notice. Given the
 desktop's card presenter (`gate --card-entry`), that notice also presents the core-model card.
 A hold binds only launches on the model family and account it was seen under (`binding_hold`).
+
+A 429 whose own response reports the account's limits all allowed is a throttle, not a limit:
+it holds nothing unless its text names a usage limit or a time to retry. The CLI's
+"(not your usage limit)" error is the same case, read from the transcript.
 """
 from __future__ import annotations
 
@@ -73,9 +77,12 @@ SERVED_SLACK_S = 5
 
 _CLI_LIMIT = tuple(rx for name, rx in cli_wedge.ABNORMAL_PATTERNS
                    if name in cli_wedge.PROVIDER_LIMIT_PATTERNS)
-# The window-named banner ("5-hour limit reached") and the API's own words for a refusal.
+# The window-named banner ("5-hour limit reached"), a per-model cap ("You've reached your Fable
+# limit."), and the API's own words for a refusal.
 _USAGE_EXTRA = re.compile(r"\b\d+-hour limit (?:reached|exceeded|hit)\b|\bquota\b.{0,20}\b(?:exceeded|exhausted)\b"
-                          r"|\binsufficient_quota\b", re.I)
+                          r"|\breached your [A-Za-z][\w.-]{0,24} limit\b|\binsufficient_quota\b", re.I)
+# The CLI's words for a 429 the account's quota did not cause: the server is throttling.
+_NOT_A_LIMIT = re.compile(r"\bnot your usage limit\b", re.I)
 # A 429 counts only as a status (API Error, HTTP, a status field), never as a number in a URL or id.
 _RATE = re.compile(r"\brate_limit_error\b|\brate[ -]?limit(?:ed)?\b|\btoo many requests\b"
                    r"|\b(?:API ?Error|HTTP(?:/[\d.]+)?|status(?:_?code)?)\"?\s*[:=]?\s*429\b", re.I)
@@ -143,7 +150,7 @@ def parse_reset(text: str, at: float) -> Optional[float]:
 def classify_text(text: str, at: float, model: Optional[str] = None,
                   source: str = "cli-transcript") -> Optional[Limit]:
     """A provider limit named by refusal text, or None for any other error."""
-    if not text:
+    if not text or _NOT_A_LIMIT.search(text):
         return None
     if any(rx.search(text) for rx in _CLI_LIMIT) or _USAGE_EXTRA.search(text):
         kind = "usage-limit"
@@ -197,11 +204,22 @@ def record_evidence(payload, now: float) -> Optional[Limit]:
     headers = payload.get("headers") if isinstance(payload.get("headers"), dict) else {}
     model = qa._norm_model(rej.get("model")) or qa.record_model(payload)
     found = classify_text(str(rej.get("snippet") or ""), at, model, "provider-record")
+    if state == "allowed" and _answered_allowed(payload, headers, at) and not (
+            found and (found.kind == "usage-limit" or (found.reset_at or 0) > now)):
+        return None  # a throttle on an account with quota; the CLI retries it itself
     kind = "usage-limit" if state == "rejected" else (found.kind if found else "rate-limit")
     reset = _record_reset(headers, now) if state == "rejected" else None
     if reset is None and found is not None and found.reset_at and found.reset_at > now:
         reset = found.reset_at
     return Limit(kind, at, reset, model, "provider-record")
+
+
+def _answered_allowed(payload: dict, headers: dict, at: float) -> bool:
+    """Whether the record's headers are the 429's own and carry the provider's status for it.
+    Headers written well before the 429 are an earlier response's, so they say nothing of it."""
+    checked = qa._parse_when(payload.get("last_checked"))
+    return bool(headers.get("anthropic-ratelimit-unified-status")) and checked is not None \
+        and abs(checked - at) <= SERVED_SLACK_S
 
 
 def _entry_text(entry: dict) -> str:
