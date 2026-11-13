@@ -746,8 +746,10 @@ def case_p_action_alert_alerts_not_restarts() -> list[str]:
     restarted, spawned = run_with_popen_stub(checks, action="alert", sender=sent.append)
     if restarted or spawned:
         fails.append(f"p) action=alert must not restart: {restarted}/{spawned}")
-    if len(sent) != 2 or not all("alert-only" in m for m in sent):
+    if len(sent) != 2 or not all("automatic restart is turned off" in m for m in sent):
         fails.append(f"p) expected 2 alert-only messages, got {sent}")
+    if any(leak in m for m in sent for leak in ("startup.sh", "down_bridge_action", "logs/")):
+        fails.append(f"p) an alert names a script, a setting key or a log path: {sent}")
     return fails
 
 

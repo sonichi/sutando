@@ -422,6 +422,8 @@ class Launcher(unittest.TestCase):
         self.assertIn("usage limit on claude-opus-5-5", lines[0])
         notice = next((self.ws / "results").glob("proactive-*.txt")).read_text()
         self.assertIn("card I left you", notice)
+        for way in ('"switch to sonnet"', "Agent Settings, Runtime, Model", '"retry now"'):
+            self.assertIn(way, notice, "the card's start is unconfirmed, so every other way stays")
 
 
 class StatusSurfaces(unittest.TestCase):
@@ -630,6 +632,17 @@ class OwnerRecovery(unittest.TestCase):
 
     def notices(self):
         return sorted((self.ws / "results").glob("proactive-*.txt"))
+
+    def test_notice_says_the_reset_time_once_as_a_clock_time(self):
+        hold = clh.read_hold(self.ws)
+        for card in (False, True):
+            body = clh._notice_body(hold, card)
+            self.assertEqual(body.count("It resets at ") + body.count("It tries again at "), 1, body)
+            self.assertRegex(body, r"It (resets|tries again) at (\w{3} \d{1,2}, )?\d{1,2}:\d{2} [AP]M, and")
+            self.assertNotRegex(body, r"\d{4}-\d{2}-\d{2}", "no machine timestamp")
+            self.assertNotIn("core-model", body)
+        self.assertEqual(clh._limit_words({"kind": "rate-limit"}), "rate limit on its model")
+        self.assertIn("It tries again at ", clh._when_line({"until": self.now + 600}, self.now))
 
     def test_notice_offers_product_actions(self):
         body = self.notices()[0].read_text()
@@ -1201,6 +1214,9 @@ class ModelSwitchWayOut(unittest.TestCase):
                                             card_entry=str(entry)).launch)
             self.assertFalse(clh.read_hold(ws)["card_presented"], "a failed card never stops the hold")
             self.assertTrue(clh.read_hold(ws)["notice_queued"])
+            notice = next((ws / "results").glob("proactive-*.txt")).read_text()
+            for way in ('"switch to sonnet"', "Agent Settings, Runtime, Model", '"retry now"'):
+                self.assertIn(way, notice, "a card that never started leaves the other ways out")
 
     def test_card_outlives_no_part_of_a_hold_6_to_24h_long(self):
         """A reset 6-24h away holds until reset + grace; notice_queued stops a re-present, so
