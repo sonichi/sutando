@@ -231,5 +231,57 @@ with tempfile.TemporaryDirectory() as tmp:
                              project_dir=proj) == [],
               "nor when a project_dir is supplied and the expansion would resolve")
 
+    # ── a copy left by an OLDER install tree that still exists is re-pointed, not kept ──
+    # Its script exists, so prune_dead keeps it; without re-pointing it fires from the old tree.
+    old_tree = tmp / "old app" / "engine" / "sutando"
+    new_tree = tmp / "new app" / "engine" / "sutando"
+    for tree in (old_tree, new_tree):
+        (tree / "src").mkdir(parents=True)
+        (tree / "src" / "watcher-rearm-session-hint.sh").write_text("#!/bin/bash\n")
+    old_cmd = f'bash "{old_tree}/src/watcher-rearm-session-hint.sh"'
+    new_cmd = f'bash "{new_tree}/src/watcher-rearm-session-hint.sh"'
+    custom = f'bash -x "{old_tree}/src/watcher-rearm-session-hint.sh"'
+    moved = tmp / "moved" / ".claude" / "settings.json"
+    moved.parent.mkdir(parents=True)
+    moved.write_text(json.dumps({"hooks": {"SessionStart": [
+        entry(old_cmd, matcher="compact|resume"), entry(custom, matcher=""),
+        entry("echo not-sutando", matcher="")]}}))
+    status, removed = chs.install(moved, event="SessionStart", command=new_cmd, matcher="compact|resume")
+    got = json.loads(moved.read_text())["hooks"]["SessionStart"]
+    cmds = [h["command"] for e in got for h in e["hooks"]]
+    check(status == "re-pointed" and removed == [], "an older tree's copy reports re-pointed", status)
+    check(got[0] == entry(new_cmd, matcher="compact|resume"),
+          "the copy is rewritten in place to this checkout, matcher kept", json.dumps(got))
+    check(old_cmd not in cmds and cmds.count(new_cmd) == 1, "no entry still runs the older tree's script")
+    check(custom in cmds, "an operator variant of the same script (extra flag) is not ours and stays")
+    check("echo not-sutando" in cmds, "a foreign non-Sutando hook stays")
+    status, _ = chs.install(moved, event="SessionStart", command=new_cmd, matcher="compact|resume")
+    check(status == "already installed", "a hook already on this checkout is skipped", status)
+
+    # A copy beside an already-correct entry is dropped rather than doubled.
+    both = tmp / "both" / ".claude" / "settings.json"
+    both.parent.mkdir(parents=True)
+    both.write_text(json.dumps({"hooks": {"SessionStart": [entry(new_cmd), entry(old_cmd)]}}))
+    status, _ = chs.install(both, event="SessionStart", command=new_cmd, matcher="compact")
+    cmds = [h["command"] for e in json.loads(both.read_text())["hooks"]["SessionStart"] for h in e["hooks"]]
+    check(status == "re-pointed" and cmds == [new_cmd], "a copy beside the correct entry is dropped", str(cmds))
+
+    check(not chs.is_other_checkout_copy(f'bash "{tmp}/elsewhere/watcher-rearm-session-hint.sh"', new_cmd),
+          "a same-named script outside a src/, scripts/ or skills/ tail is not a checkout copy")
+
+    # The real installer, end to end, on the reported hook.
+    work2 = tmp / "work2"
+    (work2 / ".claude").mkdir(parents=True)
+    stale = f'bash "{old_tree}/src/watcher-rearm-session-hint.sh"'
+    (work2 / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
+        "SessionStart": [entry(stale, matcher="compact|resume")]}}))
+    r = subprocess.run(["bash", str(REPO / "scripts" / "install-watcher-rearm-hook.sh")], capture_output=True,
+                       text=True, env=dict(os.environ, SUTANDO_CLAUDE_WORKING_DIR=str(work2)), timeout=30)
+    cmds = [h["command"] for e in json.loads((work2 / ".claude" / "settings.json").read_text())["hooks"]["SessionStart"]
+            for h in e["hooks"]]
+    check(r.returncode == 0 and cmds == [f'bash "{REPO}/src/watcher-rearm-session-hint.sh"']
+          and "(re-pointed)" in r.stdout, "install-watcher-rearm-hook.sh re-points an older tree's entry",
+          r.stdout + r.stderr + str(cmds))
+
 print(f"\n{_pass} passed, {_fail} failed")
 sys.exit(1 if _fail else 0)

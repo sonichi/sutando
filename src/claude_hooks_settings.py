@@ -25,6 +25,11 @@ Re-pointing is a separate step from any installer: it rewrites only the old root
 of a hook whose script is gone and whose repo-relative remainder exists in this
 checkout, so it never adds a hook (the opt-in transcript archiver included).
 
+``install`` also re-points its own hook when an older checkout that still exists on
+disk left it registered: an entry that is the installed command exactly, except for
+the checkout root before ``src/``/``scripts/``/``skills/``, is rewritten in place
+rather than kept beside the new one. Any other difference marks it as not ours.
+
     python3 src/claude_hooks_settings.py install --settings <path> \\
         --event SessionStart --command 'bash "<repo>/src/x.sh"' \\
         [--matcher compact] [--prepend] [--label "x hook"]
@@ -129,6 +134,61 @@ def prune_dead(settings: dict, event: str, family: str,
     return removed
 
 
+def is_other_checkout_copy(existing: str, command: str) -> bool:
+    """True when ``existing`` is ``command`` exactly, except that its script sits in another checkout.
+
+    The script paths must share a repo-relative tail (``src/…``, ``scripts/…``, ``skills/…``) and
+    differ only in the root before it; any other difference (a flag, a wrapper) is not ours.
+    """
+    ours, theirs = script_path_of(command), script_path_of(existing)
+    if not ours or not theirs or ours == theirs or existing == command:
+        return False
+    if not (ours.startswith("/") and theirs.startswith("/")) or not _judgeable(theirs):
+        return False
+    a, b = ours.split("/"), theirs.split("/")
+    n = 0
+    while n < min(len(a), len(b)) - 1 and a[-1 - n] == b[-1 - n]:
+        n += 1
+    if not any(part in _REPO_TOP_DIRS for part in a[len(a) - n:-1]):
+        return False
+    our_root, their_root = "/".join(a[:len(a) - n]), "/".join(b[:len(b) - n])
+    return any(command.replace(o + "/", t + "/") == existing
+               for o, t in zip(_spellings(our_root), _spellings(their_root)))
+
+
+def repoint_other_checkouts(settings: dict, event: str, command: str) -> list[str]:
+    """Rewrite, in place, ``event`` hooks that are ``command`` on another checkout's path.
+
+    A copy is rewritten to ``command`` where it stands; one beside an existing ``command`` is
+    dropped instead. Returns the old commands.
+    """
+    changed: list[str] = []
+    present = False
+    kept_entries = []
+    for entry in settings.get("hooks", {}).get(event, []) or []:
+        if not isinstance(entry, dict):
+            kept_entries.append(entry)
+            continue
+        kept_hooks = []
+        for hook in entry.get("hooks", []) or []:
+            current = hook.get("command", "") if isinstance(hook, dict) else ""
+            if isinstance(current, str) and is_other_checkout_copy(current, command):
+                changed.append(current)
+                if present:
+                    continue
+                hook = dict(hook, command=command)
+            if isinstance(hook, dict) and hook.get("command") == command:
+                if present:
+                    continue
+                present = True
+            kept_hooks.append(hook)
+        if kept_hooks:
+            kept_entries.append(dict(entry, hooks=kept_hooks))
+    if changed:
+        settings.setdefault("hooks", {})[event] = kept_entries
+    return changed
+
+
 def install(
     settings_path: Path,
     *,
@@ -137,18 +197,24 @@ def install(
     matcher: str = "",
     prepend: bool = False,
 ) -> tuple[str, list[str]]:
-    """Prune dead same-family entries, then add ``command`` once. Returns (status, removed)."""
+    """Prune dead same-family entries, re-point copies from another checkout, then add ``command`` once.
+
+    Returns (status, removed); status is "re-pointed" when an existing copy was rewritten.
+    """
     settings = load(settings_path)
     # <project>/.claude/settings.json → the project is two levels up.
     project_dir = settings_path.resolve().parent.parent
     removed = prune_dead(settings, event, family_of(command), project_dir=project_dir)
+    repointed = repoint_other_checkouts(settings, event, command)
     entries = settings.setdefault("hooks", {}).setdefault(event, [])
     present = any(
         isinstance(h, dict) and h.get("command", "") == command
         for entry in entries if isinstance(entry, dict)
         for h in entry.get("hooks", []) or []
     )
-    if present:
+    if repointed:
+        status = "re-pointed"
+    elif present:
         status = "already installed"
     else:
         new_entry = {"matcher": matcher, "hooks": [{"type": "command", "command": command}]}
@@ -157,7 +223,7 @@ def install(
         else:
             entries.append(new_entry)
         status = "installed"
-    if status == "installed" or removed or not settings_path.is_file():
+    if status == "installed" or removed or repointed or not settings_path.is_file():
         save(settings_path, settings)
     return status, removed
 
