@@ -19,6 +19,14 @@ lk = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(lk)
 
 
+def _load_notify_reviewers():
+    spec = importlib.util.spec_from_file_location(
+        "_nr_shapes", Path(lk.__file__).parent / "notify_reviewers.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def store(tmp, yaml_text=None, roster=None):
     d = Path(tmp) / "data" / "collaboration-intelligence"
     d.mkdir(parents=True)
@@ -266,21 +274,41 @@ class AMigratedDocumentExposesNoMetadataAsAPerson(unittest.TestCase):
             self.assertEqual(ids, ["x"])
 
     def test_the_metadata_rule_has_ONE_owner(self):
-        # roster_identity.is_person_key is the owner; a byte-equivalent private
-        # copy passes every behaviour test and drifts the moment the rule moves.
-        import pathlib as _p
-        # EVERY reader of the promoted roster, not just the one that prompted
-        # this test: a scan naming one file lets the next copy in unseen.
-        scripts = _p.Path(lk.__file__).parent
-        for name in ("lookup.py", "notify_reviewers.py"):
-            src = (scripts / name).read_text()
-            self.assertNotIn('startswith("_")', src,
-                             f"{name} carries its own copy of the metadata rule")
-            self.assertIn("is_person_key", src, f"{name} must call the owner")
+        """Pin by BEHAVIOR, not source text (liususan091219 on #3537): a
+        byte-equivalent private copy would pass a text scan but diverge the
+        moment the rule moves. Patch the owner's predicate with a sentinel
+        that rejects an ordinary-looking key ("x", which does not start with
+        "_"); every reader must obey it, which only holds if each one calls
+        the owner instead of carrying its own `startswith("_")` copy."""
+        class _Sentinel:
+            @staticmethod
+            def is_person_key(key):
+                return key != "x"
+
+        roster = {"x": {"github": "gh-x"}, "y": {"github": "gh-y"}}
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, roster=roster)
+            orig_ri, lk._ri = lk._ri, (lambda: _Sentinel)
+            try:
+                ids = [r["entity_id"] for r in lk.load_roster(d)]
+            finally:
+                lk._ri = orig_ri
+        self.assertNotIn("x", ids, "lookup.py did not call the owner's predicate")
+        self.assertIn("y", ids, "the sentinel must not reject every key")
+
+        nr = _load_notify_reviewers()
+        orig_ri, nr._ri = nr._ri, (lambda: _Sentinel)
+        try:
+            actors = nr._actor_map(roster)
+        finally:
+            nr._ri = orig_ri
+        self.assertNotIn("x", actors,
+                         "notify_reviewers.py did not call the owner's predicate")
+        self.assertIn("y", actors, "the sentinel must not reject every key")
 
     def test_the_owner_itself_is_the_only_definition(self):
-        # The negative control: the scan above must not be satisfiable by
-        # deleting the rule everywhere, so pin that the owner still defines it.
+        # The negative control: the sentinel swap above must not pass because
+        # there is no real rule to delegate to -- pin that the owner defines one.
         import pathlib as _p
         owner = (_p.Path(lk.__file__).parent / "roster_identity.py").read_text()
         self.assertIn("def is_person_key", owner)
