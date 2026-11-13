@@ -61,6 +61,7 @@ sys.path.insert(0, str(SRC_DIR))
 from task_body_guard import confine_user_content  # noqa: E402
 from file_lock import lock_fd, unlock_fd  # noqa: E402
 import cron_task_id  # noqa: E402
+from cron_loop_policy import _entry_marked_parked  # noqa: E402
 
 try:
     from workspace_default import resolve_workspace  # type: ignore
@@ -750,6 +751,11 @@ def run(now_epoch: Optional[int] = None) -> list:
             name = entry.get("name")
             expr = entry.get("cron")
             if not name or not expr:
+                continue
+            if _entry_marked_parked(entry):
+                # Advance the boundary like the malformed-shell_command skip: a
+                # re-enabled entry resumes at its next slot, never a stale one.
+                state[name] = now_epoch
                 continue
             has_shell_command = "shell_command" in entry
             shell_command = entry.get("shell_command")

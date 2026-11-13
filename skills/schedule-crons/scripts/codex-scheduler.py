@@ -25,7 +25,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from task_archive import find_task_file  # noqa: E402
 from result_publish import publish_text  # noqa: E402
-from cron_loop_policy import is_core_main_loop, main_loop_problem  # noqa: E402
+from cron_loop_policy import (  # noqa: E402
+    _entry_marked_parked, is_core_main_loop, main_loop_problem,
+)
 from loop_completion import write_completion  # noqa: E402
 from local_task_protocol import serialize_task_last  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
@@ -183,6 +185,8 @@ def load_jobs(config_path: Path, *, include_main_loop: bool = False) -> list[dic
         )
         if raw_entry.get("execution") != "codex-task" and not implicit_main_loop:
             continue
+        if _entry_marked_parked(raw_entry):
+            continue  # deliberately parked in crons.json — no durable owner either
         entry = dict(raw_entry)
         entry["_core_main_loop"] = canonical_main_loop
         if canonical_main_loop:
