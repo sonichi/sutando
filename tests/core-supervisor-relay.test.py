@@ -472,7 +472,7 @@ class TestNoticeReadsPlainly(unittest.TestCase):
                "kind": "selection", "prompt": "╭────╮\nWhich branch should I merge?\n❯ 1. main\n"}
         with _no_backend():
             m = compose_message(sig)
-        self.assertIn("needs you — Awaiting user in: Which branch should I merge?", m)
+        self.assertIn("needs you — Awaiting user: Which branch should I merge?", m)
         for leak in ("sutando-core", "7c700e11a8d9", "╭"):
             self.assertNotIn(leak, m)
         with patch.dict(sys.modules, {"owner_text": None}):
