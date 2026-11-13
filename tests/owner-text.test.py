@@ -84,6 +84,32 @@ class Redaction(unittest.TestCase):
         for nothing_left in ("sutando-core · blocked-human", HEX, "7 · 12", ""):
             self.assertEqual(owner_text.owner_line(nothing_left), owner_text.GENERIC_LINE, nothing_left)
 
+    def test_exit_codes_signals_and_panes_alone_leave_the_generic_line(self):
+        self.assertEqual(owner_text.owner_line("exit 144 SIGTERM tmux sutando-core pane 0"), owner_text.GENERIC_LINE)
+
+    def test_a_return_code_a_log_path_and_a_script_go_with_the_words_pointing_at_them(self):
+        got = owner_text.without_internals("Restart failed: rc=1 see /Users/x/.log; run src/restart.sh")
+        self.assertEqual(got, "Restart failed.")
+        self.assertEqual(owner_text.internals(got), [])
+
+    def test_a_headline_is_owner_text_and_the_raw_line_stays_available(self):
+        given = "worker infra-eng (de612d49) stuck: pane wedged at dialog 'Do you want to proceed?' pid=4512 /tmp/x.log"
+        got = owner_text.headline(given)
+        self.assertEqual(got, "Worker infra-eng stuck: pane wedged at dialog 'Do you want to proceed?'")
+        for leak in ("de612d49", "pid", "4512", "/tmp/x.log"):
+            self.assertNotIn(leak, got)
+        self.assertEqual(owner_text.owner_line(given), got)
+        self.assertEqual(owner_text.first_line("\n " + given + "\nmore"), given)
+
+    def test_cjk_and_a_split_pem_survive_the_new_shapes(self):
+        for clean in ("请确认是否继续部署？", "続行しますか？", "Enter code 1234", "Please sign in."):
+            self.assertEqual(owner_text.headline(clean), clean)
+        payload = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC" + "x" * 32
+        text = owner_text.card_text("Restart failed: rc=1", ["-----BEGIN PRIVATE KEY-----", payload,
+                                                              "-----END PRIVATE KEY-----"])
+        self.assertNotIn(payload, text)
+        self.assertEqual(owner_text.owner_line(text), "Restart failed.")
+
     def test_ordinary_text_and_none_are_untouched(self):
         for text in ("Reviewer has a task that wasn't delivered for 15 minutes.", "risk-free task", "key=ab"):
             self.assertEqual(owner_text.redact(text), text)
@@ -94,8 +120,9 @@ class Shapes(unittest.TestCase):
     def test_each_internal_shape_is_named(self):
         cases = {f"worker Reviewer ({HEX[:8]}…)": ["hex-id"], f"session {SESSION}": ["hex-id", "session"],
                  "tmux attach": ["session"], f"socket {SOCKET}": ["path"], "state blocked-human": ["state-code"],
-                 "see task-fcc45a4ac1": ["hex-id", "record-id"], "card hitl_ab12": ["record-id"], "run python3 src/x.py": ["command"],
-                 f"auth {KEY}": ["key"]}
+                 "see task-fcc45a4ac1": ["hex-id", "record-id"], "card hitl_ab12": ["record-id"], "run python3 src/x.py": ["command", "script"],
+                 f"auth {KEY}": ["key"], "run src/restart.sh": ["script"], "exit 144 SIGTERM": ["process"],
+                 "pid=4512": ["process"], "pane 0": ["process"]}
         for text, want in cases.items():
             self.assertEqual(owner_text.internals(text), want, text)
 
