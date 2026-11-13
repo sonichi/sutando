@@ -3379,6 +3379,32 @@ def keep_lanes_up(*, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, 
     return lines
 
 
+# The longest one keeper pass may run, and what the process exits with when it is given up.
+LANE_PASS_MAX_S = 300.0
+LANE_PASS_TIMEOUT_RC = 3
+
+
+def keep_lanes_bounded(*, max_s: float = LANE_PASS_MAX_S, log: Optional[Callable[[str], None]] = None,
+                       give_up: Callable[[int], None] = os._exit, **keep_kw) -> list:
+    """`keep_lanes_up`, given up once it has run `max_s`: a pass waiting on a record lock whose holder
+    hangs, or in a lane start that never returns, would otherwise keep its supervisor from ever
+    starting the next pass. A timer thread logs one line and ends the process wherever the pass is
+    blocked, which frees the record lock if this pass held it."""
+    log = log or (lambda line: print(line, flush=True))
+
+    def expired() -> None:
+        log(f"lane keeper pass still running after {max_s:.0f}s (waiting on the connections lock, or in a "
+            "lane start that does not return); gave it up, and no lane is tended until a pass completes")
+        give_up(LANE_PASS_TIMEOUT_RC)
+    timer = threading.Timer(max_s, expired)
+    timer.daemon = True
+    timer.start()
+    try:
+        return keep_lanes_up(log=log, **keep_kw)
+    finally:
+        timer.cancel()
+
+
 def bridge_pid(instance: str, workspace: Optional[Path] = None) -> int:
     """The pid of the process proven to hold `instance`'s bridge lease (workspace_lock's own record
     and identity check), 0 when none runs; `BridgeLeaseIndeterminate` when the lease proves neither."""
