@@ -846,7 +846,7 @@ class TestBlockerAlertGoesToOwnerDm(unittest.TestCase):
 
     ROOM, DM = "!shared:ag2.space", "!dm:ag2.space"
 
-    def _ws(self, td, dm=True):
+    def _ws(self, td, dm=True, owner_dm=None):
         st = os.path.join(td, "state")
         os.makedirs(st)
         act = os.path.join(st, "last-owner-activity.json")
@@ -854,12 +854,12 @@ class TestBlockerAlertGoesToOwnerDm(unittest.TestCase):
             json.dump({"channel": "ag2space", "channel_id": self.ROOM}, f)
         if dm:
             with open(os.path.join(st, "owner-routing.json"), "w") as f:
-                json.dump({"owner_dm": self.DM, "private": True}, f)
+                json.dump({"owner_dm": owner_dm or self.DM, "private": True}, f)
         sig = os.path.join(st, "core-supervisor.json")
         return act, sig
 
-    def _run(self, td, state, dm=True):
-        act, sig = self._ws(td, dm)
+    def _run(self, td, state, dm=True, owner_dm=None):
+        act, sig = self._ws(td, dm, owner_dm)
         with open(sig, "w") as f:
             json.dump({"state": state, "prompt": "p", "kind": "x"}, f)
         sent = []
@@ -876,6 +876,30 @@ class TestBlockerAlertGoesToOwnerDm(unittest.TestCase):
     def test_no_owner_dm_keeps_last_active_room(self):
         with tempfile.TemporaryDirectory() as td:
             self.assertEqual(self._run(td, "blocked-human", dm=False), [("ag2space", self.ROOM)])
+
+    def test_an_owner_dm_with_no_route_keeps_last_active_room(self):
+        # A room id naming no server has no gateway route: the blocker must not be
+        # addressed to it, and the alert still goes out.
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(self._run(td, "blocked-human", owner_dm="!nodomain"),
+                             [("ag2space", self.ROOM)])
+
+    def test_unreadable_owner_routing_still_delivers_the_blocker(self):
+        # Routing is best-effort: a lookup that raises must not swallow the alert,
+        # and the operator is told why the owner DM was not used.
+        import owner_room_access
+
+        def unreadable(_workspace):
+            raise RuntimeError("routing store unavailable")
+
+        with tempfile.TemporaryDirectory() as td:
+            err = io.StringIO()
+            with patch.object(owner_room_access, "owner_routing", unreadable), \
+                    contextlib.redirect_stderr(err):
+                sent = self._run(td, "blocked-human")
+            self.assertEqual(sent, [("ag2space", self.ROOM)])
+            self.assertIn("owner DM unreadable", err.getvalue())
+            self.assertIn("routing store unavailable", err.getvalue())
 
     def test_soft_notice_keeps_last_active_room(self):
         with tempfile.TemporaryDirectory() as td:
