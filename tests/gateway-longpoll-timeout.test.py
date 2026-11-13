@@ -1033,6 +1033,40 @@ class DroppedConnectionTest(unittest.TestCase):
         self.assertEqual(recovered, ["poll recovered after 1 failures, 4s"],
                          "only the poll that answered ends the outage")
 
+    def _slept_through_first_poll(self, asleep_s: float):
+        """The first poll is cut by a dropped connection after `asleep_s` of host sleep: wall
+        time moves by it, monotonic time does not, as on a sleeping Mac."""
+        import http.client
+        outcomes = [http.client.RemoteDisconnected("gone"), None]
+        with _Loop(self.gw, poll_raises=outcomes, advance=35.0) as loop:
+            loop._alive = [True, True, False]
+            clock, poll, asleep = loop.clock, self.gw._req, [asleep_s]
+            clock.monotonic = lambda: clock.now - (asleep_s - asleep[0])
+
+            def sleeps_once(method, path, *a, **k):
+                if path.startswith("/v1/tasks?") and asleep[0]:
+                    clock.now += asleep[0]
+                    asleep[0] = 0.0
+                return poll(method, path, *a, **k)
+            self.gw._req = sleeps_once
+            loop.run()
+        return loop.logs
+
+    def test_a_gap_the_host_slept_through_names_its_awake_seconds(self):
+        logs = self._slept_through_first_poll(833.0)
+        errors = [m for m in logs if m.startswith("poll network error")]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("868s since last successful poll, 35s of it awake —", errors[0],
+                      "the 14-min gap of #5510 is 35s of polling and 833s of sleep")
+        recovered = [m for m in logs if m.startswith("poll recovered")]
+        self.assertEqual(recovered, ["poll recovered after 1 failures, 904s, 71s of it awake"])
+
+    def test_control_an_awake_gap_reads_as_before(self):
+        logs = self._slept_through_first_poll(0.0)
+        errors = [m for m in logs if m.startswith("poll network error")]
+        self.assertIn("1 consecutive, 35s since last successful poll — backing off", errors[0])
+        self.assertIn("poll recovered after 1 failures, 71s", logs)
+
     def test_a_reset_while_reading_the_body_is_a_network_error(self):
         import urllib.request
 

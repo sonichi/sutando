@@ -349,7 +349,8 @@ from .delivery_core import (WITHDRAWN, DeliveryCore, DesignAClaimBackend, DrainS
                             ProviderRefused, RetryPolicy)
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
 from .delivery_core import is_refused_for_good
-from .delivery_core.provider_ag2space import AG2SpaceRoomMessageProvider, room_response_refused
+from .delivery_core.provider_ag2space import (AG2SpaceRoomMessageProvider, room_refused_sender,
+                                              room_response_refused)
 from .delivery_core.provider_ag2space import (AG2SpaceResultProvider, RESULT_THREAD_ASK,
                                               RESULT_THREAD_FIELD)
 from .result_ready import (identity_of, read_ready_result, read_ready_result_with_identity,
@@ -8695,7 +8696,8 @@ def _post_proactive_message(room: str, body: str, dedupe_key: str, thread_root: 
     except urllib.error.HTTPError as e:
         seen = _PROACTIVE_SEND.__dict__.setdefault("seen", {})
         if e.code in (401, 403):
-            seen["auth"] = e
+            if not room_refused_sender(e):  # a room's refusal is the message's, never the bearer's
+                seen["auth"] = e
         elif e.code == 400:
             replacement = _room_upgraded_to(_http_error_body(e))
             if replacement is not None:
@@ -10844,6 +10846,16 @@ def _poll_timeout_is_empty(last_ok: float, now: float,
     return (now - last_ok) <= grace
 
 
+def _awake_note(wall_s: float, awake_s: float) -> str:
+    """`, Ns of it awake` when the host slept through a poll gap, else "": time.time() counts a
+    sleeping Mac's hours, time.monotonic() does not, and the gap alone cannot tell the two apart."""
+    return f", {int(awake_s)}s of it awake" if wall_s - awake_s >= _ASLEEP_NOTE_MIN_S else ""
+
+
+# Below this, wall and monotonic readings differ only by clock noise, not by a sleep.
+_ASLEEP_NOTE_MIN_S = 30
+
+
 def _poll_stalled(last_ok: float, now: float,
                   limit: float = POLL_STALL_EXIT_S) -> bool:
     """Whether the poll loop has gone `limit` seconds without a success."""
@@ -10987,6 +10999,7 @@ def main() -> None:
              f"prefer launching through startup.sh for full diagnostics")
     backoff = 1
     poll_grace_since = time.time()
+    poll_ok_awake = time.monotonic()  # poll_grace_since on the clock a host sleep does not advance
     last_poll_ok: float | None = None
     poll_failures = 0  # consecutive network failures; the next good poll resets it
     stall_anchor = time.monotonic()  # excludes system sleep on macOS, unlike time.time()
@@ -11021,13 +11034,13 @@ def main() -> None:
             _push_pool_advertisement()
             if _advance_held_tasks(inflight):   # a retried ack, or a publish after a restart
                 wake_outbound()
-            prev_ok = poll_grace_since
+            prev_ok, prev_ok_awake = poll_grace_since, poll_ok_awake
             _RESP_META.last = None
             try:
                 resp = _req("GET", f"/v1/tasks?wait={_poll_wait(inflight)}{_POLL_PROOF}",
                             timeout=POLL_WAIT + 10)
                 last_poll_ok = poll_grace_since = time.time()
-                stall_anchor = time.monotonic()
+                stall_anchor = poll_ok_awake = time.monotonic()
                 # A completed poll remains evidence even if accepting its tasks fails.
                 _emit_gateway_status(True, poll_ok_ts=last_poll_ok)
             except (TimeoutError, socket.timeout):
@@ -11040,7 +11053,8 @@ def main() -> None:
                 resp = {"tasks": []}
             received_at = time.monotonic()           # the dropped-ack retry budget runs from here
             if poll_failures and poll_grace_since != prev_ok:  # a real answer, not the grace path
-                _log(f"poll recovered after {poll_failures} failures, {int(poll_grace_since - prev_ok)}s")
+                _log(f"poll recovered after {poll_failures} failures, {int(poll_grace_since - prev_ok)}s"
+                     f"{_awake_note(poll_grace_since - prev_ok, poll_ok_awake - prev_ok_awake)}")
                 poll_failures = 0
             added = False
             pending_ack = []
@@ -11091,7 +11105,8 @@ def main() -> None:
         except _NETWORK_ERRORS as e:
             poll_failures += 1
             _log(f"poll network error: {diagnostics.describe(e)} — {poll_failures} consecutive, "
-                 f"{int(time.time() - poll_grace_since)}s since last successful poll — "
+                 f"{int(time.time() - poll_grace_since)}s since last successful poll"
+                 f"{_awake_note(time.time() - poll_grace_since, time.monotonic() - poll_ok_awake)} — "
                  f"backing off {backoff}s")
             _emit_gateway_status(False, error=f"network: {diagnostics.describe(e)}", backoff_s=backoff,
                                  poll_ok_ts=last_poll_ok)

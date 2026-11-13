@@ -93,6 +93,15 @@ class ProviderPermanentRefused(ProviderRefused):
     """A definitive refusal which another automatic send cannot repair."""
 
 
+class ProviderBoundedRefused(ProviderRefused):
+    """A refusal that may clear on its own (a room join still landing): retried on the
+    backend's schedule, and permanent once the item has been sent `attempts` times."""
+
+    def __init__(self, message: str, attempts: int):
+        super().__init__(message)
+        self.attempts = attempts
+
+
 @dataclass(frozen=True)
 class DeliveryReceipt:
     """Outcome of one deliver/reconcile call. `provider_ref` is the
