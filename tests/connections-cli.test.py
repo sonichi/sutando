@@ -507,12 +507,17 @@ class InProcess(unittest.TestCase):
         rc, out, err = self.run_main(["move", "--dry-run"], try_reuse_move=refused)
         self.assertEqual(rc, 1)
         self.assertIn("move refused: auth_rejected (s.space does not accept it)", err)
-        self.assertEqual(out, "next: add the s.space relay token as a new connection and promote it: "
+        self.assertEqual(out, "next: add the s.space relay token (on stdin) as a new connection and promote it: "
                               "python3 scripts/connections.py add - --yes --expected-server s.space "
-                              "(token on stdin) && python3 scripts/connections.py promote s-space --repo . "
+                              "&& python3 scripts/connections.py promote s-space --repo . "
                               '--logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"; '
                               "Update code\u2026 in the Sutando desktop app's Homeserver connections only "
                               "replaces a same-server rotated token, not this cross-server move\n")
+        # The printed chain must be VALID SHELL, not just argparse-splittable:
+        # an unquoted annotation mid-command fails bash -n before either runs.
+        printed_cmd = "python3" + out.split("python3", 1)[1].split(";")[0]
+        rc = subprocess.run(["bash", "-n"], input=printed_cmd, text=True).returncode
+        self.assertEqual(rc, 0, f"printed recovery command is not valid shell: {printed_cmd!r}")
         half = lambda inst, **kw: {"ok": False, "reason": "new_primary_not_connected", "detail": "", "server": "s.space",
                                    "added": True, "instance": "s-space"}
         rc, out, _ = self.run_main(["move", "--repo", "/r", "--logs-dir", "/l"], try_reuse_move=half)

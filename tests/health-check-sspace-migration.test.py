@@ -9,6 +9,7 @@ isolate_os_environ()
 import importlib.util
 import re
 import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -85,6 +86,15 @@ class SspaceMigrationProbe(unittest.TestCase):
                 self.assertEqual(args.instance, connections.instance_for("s.space"))
                 self.assertIsInstance(args.logs_dir, Path)
         self.assertEqual(verbs, ["move", "add", "promote"])
+
+    def test_printed_recovery_commands_are_valid_shell(self):
+        # The regex above splits at "(" before argparse ever sees it, so it
+        # cannot catch unquoted shell syntax in the printed detail.
+        self.write([_row("ag2.space", "", primary=True)])
+        detail = hc.check_sspace_migration(self.ws)["detail"]
+        for chain in re.findall(r"python3 scripts/connections\.py [^;]+", detail):
+            rc = subprocess.run(["bash", "-n"], input=chain, text=True).returncode
+            self.assertEqual(rc, 0, f"not valid shell: {chain!r}")
 
     def test_warns_for_provisional_gateway_host_row(self):
         self.write([_row("chat.ag2.space", "ag2-space", primary=True)])

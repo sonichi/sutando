@@ -174,8 +174,8 @@ def cmd_move(args) -> int:
         if out.get("added"):
             print(f"next: the {out.get('instance')} row is saved; run move again to finish (it resumes)")
         elif out["reason"] != "successor_exists":
-            print("next: add the s.space relay token as a new connection and promote it: "
-                  "python3 scripts/connections.py add - --yes --expected-server s.space (token on stdin) && "
+            print("next: add the s.space relay token (on stdin) as a new connection and promote it: "
+                  "python3 scripts/connections.py add - --yes --expected-server s.space && "
                   "python3 scripts/connections.py promote s-space --repo . --logs-dir "
                   '"$(bash scripts/sutando-config.sh workspace)/logs"; Update code… in the Sutando desktop app\'s '
                   "Homeserver connections only replaces a same-server rotated token, not this cross-server move")
