@@ -180,8 +180,11 @@ def cmd_move(args) -> int:
         if out.get("added"):
             print(f"next: the {out.get('instance')} row is saved; run move again to finish (it resumes)")
         elif out["reason"] != "successor_exists":
-            print(f"next: get a connect code at {out.get('server') or 'the successor server'}'s agent portal, "
-                  "then run python3 scripts/connections.py add '<code>'")
+            print("next: add the s.space relay token (on stdin) as a new connection and promote it: "
+                  "python3 scripts/connections.py add - --yes --expected-server s.space && "
+                  "python3 scripts/connections.py promote s-space --repo . --logs-dir "
+                  '"$(bash scripts/sutando-config.sh workspace)/logs"; Update code… in the Sutando desktop app\'s '
+                  "Homeserver connections only replaces a same-server rotated token, not this cross-server move")
         return 1
     rooms = out.get("rooms") or []
     failed = [r for r in rooms if r.get("error")]

@@ -35,7 +35,7 @@ bash src/agent/start-cli.sh --restart
 ```
 
 That command starts the core and the local agent API (`127.0.0.1:7843`) when
-nothing serves it yet; the s.space desktop hands its connect code to that API,
+nothing serves it yet; the s.space desktop hands its relay token to that API,
 so a core moved to s.space from the desktop needs it running. It does not start
 the other local services (voice, web client, dashboard, bridges): for those, start
 everything with `bash src/startup.sh`, which then launches the same core.

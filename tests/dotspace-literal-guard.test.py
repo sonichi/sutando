@@ -40,6 +40,10 @@ ALLOW: dict[str, "tuple[str, ...] | None"] = {
         'r"\\[(?:AG2 Space|s\\.space) (reply context|room metadata);',
     ),
     "src/health-check.py": ("ag2.space mobile", "ag2.space gateway not configured"),
+    "scripts/connections.py": (
+        "add the s.space relay token",
+        "--expected-server s.space",
+    ),
     "skills/task-progress/scripts/notify.py": ("(e.g. dev.ag2.space)",),
     "packages/ag2-sparrow/ag2_sparrow/adapters/hatch/cli.py": (
         "@my-agent:ag2.space",
