@@ -573,7 +573,7 @@ def _value_problem(control: Mapping[str, object], value: Optional[str]) -> Optio
     low, high = control.get("min_length"), control.get("max_length")
     if not all(isinstance(n, int) and not isinstance(n, bool) for n in (low, high)):
         return "the field's bounds are unreadable"
-    if not value.strip() or _NOT_TEXT.search(value):
+    if (low > 0 and not value.strip()) or _NOT_TEXT.search(value):
         return "the value is not one line of text"
     if not low <= len(value) <= high:
         return "the value is outside the field's bounds"

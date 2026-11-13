@@ -702,12 +702,12 @@ class V2Choices(unittest.TestCase):
         self.assertTrue(issued_cards.record(self.ws, "$v2", v2_card(), room=DM, lane="s_dspace",
                                             handler=self.HANDLER, now=1000.0))
 
-    def ask(self, *, task_id="task-1", now=1001.0, **click):
+    def ask(self, *, task_id="task-1", now=1001.0, reply_to_event="$v2", **click):
         c = {"v": 2, "card_id": "workers", "action": "mode", "revision": 3, "interaction_id": "i-1", "value": "on",
              **click}
         c = {k: v for k, v in c.items() if v is not None}
         h = {"id": task_id, "access_tier": "owner", "user_id": OWNER, "channel_kind": "dm", "channel_id": DM,
-             "reply_to_event": "$v2", "card_click": json.dumps(c)}
+             "reply_to_event": reply_to_event, "card_click": json.dumps(c)}
         return ac.click_verdict(h, "Choose mode: On", self.ws, lambda lane: OWNER if lane == "s_dspace" else "",
                                 now=now)
 
@@ -804,6 +804,15 @@ class V2Choices(unittest.TestCase):
             self.assertEqual(self.ask(interaction_id="i-1", task_id="t9", now=expiry - 1).verdict, ac.DUPLICATE)
             self.assertEqual(issued_cards.claim(self.ws, "i-4", "t4", {}, expires_at=expiry + 10, now=expiry + 1),
                              issued_cards.CLAIMED, "expired claims make room")
+
+    def test_an_empty_input_clears_an_optional_field_only(self):
+        self.forged("not one line of text", action="rename", value="", interaction_id="e-1")
+        issued_cards.record(self.ws, "$opt", v2_card(id="optional", buttons=[{**v2_card()["buttons"][1], "field": {
+            "name": "name", "min_length": 0, "max_length": 12}}]), room=DM, lane="s_dspace", now=1000.0)
+        got = self.ask(card_id="optional", action="rename", value="", interaction_id="e-2", reply_to_event="$opt")
+        self.assertEqual((got.verdict, got.choice and got.choice["value"]), (ac.COMMAND, ""))
+        self.assertEqual(self.ask(card_id="optional", action="rename", value="a\x1b", interaction_id="e-3",
+                                  reply_to_event="$opt").why, "the value is not one line of text")
 
     def test_an_input_must_be_text_on_one_line_and_the_record_must_be_well_formed(self):
         for i, value in enumerate(("   ", "Py\x1blon", "Py\u2028lon", "Py\u2029lon", "Py\x7flon")):
