@@ -265,6 +265,10 @@ with tempfile.TemporaryDirectory() as tmp:
     status, _ = chs.install(both, event="SessionStart", command=new_cmd, matcher="compact")
     cmds = [h["command"] for e in json.loads(both.read_text())["hooks"]["SessionStart"] for h in e["hooks"]]
     check(status == "re-pointed" and cmds == [new_cmd], "a copy beside the correct entry is dropped", str(cmds))
+    odd = {"hooks": {"SessionStart": ["not-a-dict", entry(old_cmd), entry(new_cmd)]}}
+    changed = chs.repoint_other_checkouts(odd, "SessionStart", new_cmd)
+    check(changed == [old_cmd] and odd["hooks"]["SessionStart"] == ["not-a-dict", entry(new_cmd)],
+          "a copy BEFORE the correct entry is rewritten once, a non-dict entry kept", json.dumps(odd))
 
     check(not chs.is_other_checkout_copy(f'bash "{tmp}/elsewhere/watcher-rearm-session-hint.sh"', new_cmd),
           "a same-named script outside a src/, scripts/ or skills/ tail is not a checkout copy")
