@@ -289,6 +289,26 @@ with tempfile.TemporaryDirectory() as tmp:
     check(status == "installed" and (new_cmd, "compact|resume") in got,
           "old@compact, requesting compact|resume: the requested matcher is applied", f"{status} {got}")
 
+    # The exact command under another matcher does not count as installed for the requested one.
+    status, got = run_rows([(new_cmd, "compact")], "compact|resume")
+    check(status == "installed" and got == sorted([(new_cmd, "compact"), (new_cmd, "compact|resume")]),
+          "new@compact, requesting compact|resume: added alongside, compact entry kept", f"{status} {got}")
+    path = tmp / "matcher-rerun" / ".claude" / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"hooks": {"SessionStart": [entry(new_cmd, matcher="compact")]}}))
+    for _ in range(2):
+        status, _ = chs.install(path, event="SessionStart", command=new_cmd, matcher="compact|resume")
+    rows = sorted((h["command"], e["matcher"]) for e in json.loads(path.read_text())["hooks"]["SessionStart"]
+                  for h in e["hooks"])
+    check(status == "already installed" and rows == sorted([(new_cmd, "compact"), (new_cmd, "compact|resume")]),
+          "rerun with compact|resume is idempotent", f"{status} {rows}")
+    no_matcher = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": new_cmd}]}]}}
+    path = tmp / "matcher-absent" / ".claude" / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(no_matcher))
+    status, _ = chs.install(path, event="SessionStart", command=new_cmd, matcher="")
+    check(status == "already installed", "an entry with no matcher key counts as the empty matcher", status)
+
     check(not chs.is_other_checkout_copy(f'bash "{tmp}/elsewhere/watcher-rearm-session-hint.sh"', new_cmd),
           "a same-named script outside a src/, scripts/ or skills/ tail is not a checkout copy")
 

@@ -200,7 +200,7 @@ def install(
     matcher: str = "",
     prepend: bool = False,
 ) -> tuple[str, list[str]]:
-    """Prune dead same-family entries, re-point copies from another checkout, then add ``command`` once.
+    """Prune dead same-family entries, re-point copies from another checkout, then add ``command`` under ``matcher`` once.
 
     Returns (status, removed); status is "re-pointed" when an existing copy was rewritten.
     """
@@ -212,7 +212,7 @@ def install(
     entries = settings.setdefault("hooks", {}).setdefault(event, [])
     present = any(
         isinstance(h, dict) and h.get("command", "") == command
-        for entry in entries if isinstance(entry, dict)
+        for entry in entries if isinstance(entry, dict) and entry.get("matcher", "") == matcher
         for h in entry.get("hooks", []) or []
     )
     if repointed:
