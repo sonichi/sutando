@@ -10,8 +10,9 @@ health notices, usage-limit notices) builds its text here, so one rule holds for
 - `redact(text)`: key-like fragments (`sk-...`, `Bearer ...`, `Key=...`, every provider signature
   `chat_secret_filter` knows) are replaced wherever they appear, details included.
 - `internals(text)`: which internal shapes a text still carries (a hex id, a session name, a
-  path, a state code, a key). A sender's first line must carry none; `owner_line` falls back to
-  a generic sentence when one does, so a record written before this rule cannot leak either.
+  path, a script, an exit code, signal, pid or pane, a state code, a key). A sender's first line
+  must carry none; `headline` and `owner_line` take them out (`first_line` is the raw line), and
+  `owner_line` falls back to a generic sentence when nothing readable is left.
 - `named()`: a display name with any bracketed id dropped; `agent_local_name.local_name()`
   gives this agent's own, from local records.
 - `clock()` / `resets()`: a reset time as a person reads it.
@@ -49,6 +50,10 @@ _INTERNAL_SHAPES = (
     ("path", re.compile(r"(?:^|[\s(`'\"])(?:~|\.)?/[\w.-]+/[\w./-]+")),
     ("state-code", re.compile(r"\b(?:blocked-human|logged-out|needs-login|api-error|network-error)\b")),
     ("command", re.compile(r"\b(?:python3|launchctl|bash)\s+\S")),
+    ("script", re.compile(r"(?<![\w/])(?:src|scripts|skills)/[\w./-]+|(?<![\w/.-])[\w-]+\.(?:sh|py)\b")),
+    ("process", re.compile(r"\bexit(?:\s+(?:code|status))?\s*[=:]?\s*-?\d+\b|\b(?:rc|returncode|exit_?code)\s*[=:]\s*-?\d+"
+                           r"|\bpid\s*[=:]?\s*\d+\b|\bSIG(?:TERM|KILL|INT|HUP|QUIT|ABRT|SEGV|PIPE|USR[12]|STOP|ALRM|BUS)\b"
+                           r"|\bpane\s+%?\d+(?:\.\d+)*\b", re.I)),
 )
 
 
@@ -70,9 +75,14 @@ def redact(text: object) -> str:
     return _KEY_VALUE.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", out)
 
 
-def headline(text: object) -> str:
-    """The first non-empty line: what a card shows before "Details"."""
+def first_line(text: object) -> str:
+    """The first non-empty line, raw: for matching and parsing, never for showing."""
     return next((ln.strip() for ln in str(text or "").splitlines() if ln.strip()), "")
+
+
+def headline(text: object) -> str:
+    """What a card shows before "Details": its first line with internal tokens taken out."""
+    return without_internals(first_line(text))
 
 
 def internals(text: object) -> List[str]:
@@ -97,7 +107,10 @@ def fallback_text(message: object, folded: bool) -> str:
 
 # What stands in for each internal shape in a line a person reads; "" drops the token.
 _STAND_INS = {"record-id": "a task", "hex-id": "", "session": "", "path": "", "state-code": "",
-              "command": "a command", "key": REDACTED}
+              "command": "a command", "key": REDACTED, "script": "", "process": ""}
+_GONE = "\x00"  # marks a dropped token until the words that only pointed at it are dropped too
+_POINTER = re.compile(r"\b(?:run|see|check|via|using|at|in|from|with|by)\s*" + _GONE, re.I)
+_ORPHAN_MARK = re.compile(r"\s*[:;,](?=\s*(?:[:;,.!?]|$))")
 _COMMAND_RUN = re.compile(r"\b(?:python3|launchctl|bash)\s+\S.*$")
 _LEFTOVERS = re.compile(r"\(\s*\)|`\s*`|\s+(?=[.,;:!?])|(?<=\s)[·—–-]\s*(?=[·—–-]|$)|^\s*[·—–:-]+\s*")
 _MEANING = re.compile(r"[^\W\d_]{2,}")  # letters in any script
@@ -115,18 +128,25 @@ def without_internals(text: object) -> str:
     for name in _STAND_INS:
         if name != "command":
             shape = shapes[name]
-            out = shape.sub(lambda m, word=_STAND_INS[name]: (m.group(0)[:1] if m.group(0)[:1].isspace() else "")
-                            + word, out)
-    out = " ".join(out.split())
+            out = shape.sub(lambda m, word=_STAND_INS[name] or _GONE: (m.group(0)[:1] if m.group(0)[:1].isspace()
+                                                                       else "") + word, out)
+    for _ in range(3):
+        out = _POINTER.sub(_GONE, " ".join(out.split()))
+    out = " ".join(out.replace(_GONE, " ").split())
     for _ in range(3):
         out = " ".join(_LEFTOVERS.sub("", out).split())
+    cut = re.search(r"[:;,]\s*$", out)
+    for _ in range(3):
+        out = " ".join(_ORPHAN_MARK.sub("", out).split())
+    if cut and out and not out.endswith((".", "!", "?")):
+        out += "."  # a clause that held only internals ended the sentence
     return out[:1].upper() + out[1:]
 
 
 def owner_line(text: object, fallback: str = GENERIC_LINE) -> str:
     """The one line of `text` a notification or a text-only client shows: its first line with
     each internal token taken out; `fallback` only when too little is left to mean anything."""
-    line = without_internals(headline(text))
+    line = headline(text)
     return line if _MEANING.search(line) and not internals(line) else fallback
 
 
