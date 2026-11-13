@@ -271,6 +271,9 @@ def _settle_refusals(manager: HitlManager, held: List[Tuple[HumanRequirement, in
 
 def _send_notices(manager: HitlManager, send: Sender, room_id: str, now: float,
                   out: List[Tuple[str, Optional[str]]]) -> None:
+    # One notice's raise must not skip the ones after it (review of #5472): held and re-raised
+    # only once every due notice has had its turn, same as the card loop's own refusal handling.
+    pending: Optional[BaseException] = None
     for n in _notices(manager, now):
         ledger = dict(next(pj for r, pj in n.members if r.id == n.req.id))
         # No card field (a second card would never get the status edits); the notice field lets
@@ -279,10 +282,15 @@ def _send_notices(manager: HitlManager, send: Sender, room_id: str, now: float,
         notice = {"notice": n.notice, "ids": [r.id for r, _ in n.members],
                   "runtime": n.req.runtime, "device": device.get("id") or "",
                   "host": device.get("host") or ""}
-        answer = send(wire_safe({"room_id": n.req.room or room_id, "op": "message",
-                                 "body": renotify.body(n.notice, n.req, now, since=n.since, queued=n.queued),
-                                 "dedupe_key": renotify.dedupe_key(n.notice, n.req, ledger, n.reminders),
-                                 "extra_content": {NOTICE_FIELD: notice}}))
+        try:
+            answer = send(wire_safe({"room_id": n.req.room or room_id, "op": "message",
+                                     "body": renotify.body(n.notice, n.req, now, since=n.since, queued=n.queued),
+                                     "dedupe_key": renotify.dedupe_key(n.notice, n.req, ledger, n.reminders),
+                                     "extra_content": {NOTICE_FIELD: notice}}))
+        except Exception as e:  # noqa: BLE001 — one notice's failure must not skip the rest
+            if pending is None:
+                pending = e
+            continue
         if not isinstance(answer, dict) or not (answer.get("ok") or answer.get("event_id")):
             continue
         _accepted(manager)
@@ -290,3 +298,5 @@ def _send_notices(manager: HitlManager, send: Sender, room_id: str, now: float,
         for r, pj in n.members:
             manager.record_notice(r.id, renotify.after(n.notice, pj, now, n.reminders))
         out.append((n.req.id, str(answer.get("event_id") or "") or None))
+    if pending is not None:
+        raise pending
