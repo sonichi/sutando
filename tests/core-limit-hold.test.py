@@ -747,6 +747,98 @@ class AccountChange(unittest.TestCase):
         self.assertIsNone(clh.active_hold(self.ws))
         self.assertEqual(self.gate(), 0, "the old account's evidence re-armed the hold")
 
+    def test_a_limit_hit_before_any_hold_is_not_pinned_on_the_account_signed_in_next(self):
+        """The owner's report: account A ran with no hold on record, hit its limit and the core
+        died; the owner signed in to account B before the next launch. The gate had never
+        written A down, so it saw no switch, read A's refusal as B's, and held B until A's
+        reset, days away. B was at 13% of its limit."""
+        quota = self.ws / "state" / "quota-state.json"
+        quota.unlink()
+        self.sign_in("acct-a", "a@example.com")
+        self.assertEqual(self.gate(), 0, "account A launches with nothing against it")
+        record = clh.read_hold(self.ws)
+        self.assertEqual((record["status"], record["account"]), ("none", clh.account_fingerprint(str(self.cfg))),
+                         "a launch with no hold must still leave its account on record")
+        self.assertIsNone(clh.active_hold(self.ws))
+        self.assertIsNone(clh.binding_hold(self.ws))
+        quota.write_text(json.dumps(limited_record(time.time())))     # A is refused; the core dies
+        self.sign_in("acct-b", "b@example.com")                       # the owner signs in to B
+        self.assertEqual(self.gate(), 0, "account A's limit held account B, which had quota")
+        self.assertIsNone(clh.active_hold(self.ws))
+        self.assertEqual(clh.read_hold(self.ws)["account"], clh.account_fingerprint(str(self.cfg)))
+        self.assertEqual(self.gate(), 0, "account A's old evidence re-armed a hold on account B")
+
+    def test_the_same_account_is_still_held_by_its_own_first_limit(self):
+        quota = self.ws / "state" / "quota-state.json"
+        quota.unlink()
+        self.sign_in("acct-a", "a@example.com")
+        self.assertEqual(self.gate(), 0)
+        quota.write_text(json.dumps(limited_record(time.time())))
+        self.assertEqual(self.gate(), clh.HOLD_EXIT, "the account that hit the limit is the one held")
+        self.assertEqual(clh.read_hold(self.ws)["account"], clh.account_fingerprint(str(self.cfg)))
+
+    def test_a_legacy_hold_without_an_account_is_not_claimed_by_the_account_launching_now(self):
+        """A record written before accounts were recorded carries none. The account launching
+        now may already be the new one, so it must not be stamped onto that record: the old
+        limit would become this account's."""
+        t = self.now
+        clh._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "model": None,
+                                  "evidence_at": t - 30, "set_at": t - 20, "until": t - 1, "strikes": 1,
+                                  "reason": "core paused: usage limit on its model, retrying later",
+                                  "notice": "legacy.txt", "notice_queued": True})
+        launched = clh.decide(self.ws, t, quota=limited_record(t, ago=30), launch_account="B")
+        self.assertTrue(launched.launch, "an expired legacy hold with unchanged evidence lets the core out")
+        record = clh.read_hold(self.ws)
+        self.assertEqual(record["status"], "released")
+        self.assertNotIn("account", record, "the launch account was stamped onto a legacy hold")
+        # In force, it still binds whoever launches (an unknown side keeps it binding) and stays unclaimed.
+        clh._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "model": None,
+                                  "evidence_at": t - 30, "set_at": t - 20, "until": t + 600, "strikes": 1,
+                                  "reason": "core paused: usage limit on its model, retrying later",
+                                  "notice": "legacy.txt", "notice_queued": True})
+        self.assertFalse(clh.decide(self.ws, t, quota=limited_record(t, ago=30), launch_account="B").launch)
+        self.assertNotIn("account", clh.read_hold(self.ws))
+
+    def test_the_launch_that_expires_a_legacy_hold_is_remembered_so_the_next_switch_is_seen(self):
+        """A expires a legacy hold (no account on it) and launches; A is then refused and the
+        owner signs in to B. The record must remember that A launched, or A's refusal holds B."""
+        legacy = {"status": "held", "kind": "usage-limit", "model": None, "strikes": 1,
+                  "reason": "core paused: usage limit on its model, retrying later",
+                  "notice": "legacy.txt", "notice_queued": True}
+        for next_account, launches in (("B", True), ("A", False)):
+            with self.subTest(next_account=next_account):
+                t = time.time() + 5000
+                clh._write_hold(self.ws, dict(legacy, evidence_at=t - 30, set_at=t - 20, until=t - 1))
+                self.assertTrue(clh.decide(self.ws, t, quota=limited_record(t, ago=30), launch_account="A").launch)
+                record = clh.read_hold(self.ws)
+                self.assertNotIn("account", record, "the old limit was pinned on the account that outlived it")
+                self.assertEqual(record["launch_account"], "A")
+                # A is refused ten seconds before the next launch.
+                after = clh.decide(self.ws, t + 20, quota=limited_record(t + 20, ago=10), launch_account=next_account)
+                self.assertEqual(after.launch, launches,
+                                 "account A's refusal held account B" if launches else "account A's own refusal did not hold it")
+
+    def test_a_released_or_cleared_record_without_an_account_still_learns_the_launch_account(self):
+        """A record left by an earlier hold (released by the gate, or cleared by the owner) from
+        before accounts were recorded carries none. The next launch must write its account down,
+        or the report repeats: A hits its limit, the owner signs in to B, and B is held."""
+        for status in ("released", "cleared"):
+            with self.subTest(status=status):
+                t = time.time() + 1000
+                clh._write_hold(self.ws, {"status": status, "kind": "usage-limit", "model": None,
+                                          "evidence_at": t - 900, "set_at": t - 890, "until": t - 600,
+                                          "released_at": t - 600, "strikes": 1,
+                                          "reason": "core paused: usage limit on its model, retrying later"})
+                first = clh.decide(self.ws, t, quota=limited_record(t, ago=900), launch_account="A")
+                self.assertTrue(first.launch, "account A launches: the old evidence is already on record")
+                self.assertEqual(clh.read_hold(self.ws)["account"], "A",
+                                 f"a {status} record with no account did not learn the launch account")
+                # A is refused ten seconds later and the core dies; the owner signs in to B.
+                switched = clh.decide(self.ws, t + 20, quota=limited_record(t + 20, ago=10), launch_account="B")
+                self.assertTrue(switched.launch, f"after a {status} record, account A's limit held account B")
+                self.assertEqual(clh.read_hold(self.ws)["account"], "B")
+                self.assertIsNone(clh.active_hold(self.ws, t + 21))
+
     def test_unreadable_account_keeps_the_hold(self):
         self.sign_in("acct-a", "a@example.com")
         self.assertEqual(self.gate(), clh.HOLD_EXIT)

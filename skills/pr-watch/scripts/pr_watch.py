@@ -80,6 +80,9 @@ RECORD_WINDOW_S = 30
 RESTART_DELAY_S = 15
 CONFLICT_DELAY_S = 300
 LOCK_WAIT_S = 20
+RUNNER_GH_TIMEOUT_S = 10
+SHUTDOWN_CLEANUP_S = 10
+TERMINATE_WAIT_S = 2
 MAX_TAIL = 16 * 1024 * 1024
 # Generated per install, or by Claude Code when it loads the mod.
 SKIP_IN_MOD = ("node_modules", "tsconfig.json", ".claude-plugin/types", "hooks/paths.ts")
@@ -465,8 +468,9 @@ class ReviewedLookup:
     A yes is kept for the runner's lifetime; a no is re-asked after `ttl` seconds."""
 
     def __init__(self, ttl: float = REVIEWED_TTL_S, timeout: float = REVIEWED_TIMEOUT_S,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, run=None):
         self.ttl, self.timeout, self.clock = ttl, timeout, clock
+        self.run = run
         self.cache: Dict[Tuple[str, int, FrozenSet[str]], Tuple[bool, float]] = {}
         self.lock = threading.Lock()
 
@@ -489,7 +493,7 @@ class ReviewedLookup:
 
     def fetch(self, repo: str, number: int, me: List[str]) -> Optional[bool]:
         try:
-            r = gh(["api", f"repos/{repo}/pulls/{number}/reviews", "--paginate",
+            r = (self.run or gh)(["api", f"repos/{repo}/pulls/{number}/reviews", "--paginate",
                     "--jq", ".[].user.login"], timeout=self.timeout)
         except (OSError, subprocess.TimeoutExpired):
             return None
@@ -516,11 +520,11 @@ class ReviewedLookup:
                     self.cache[key] = (True, self.clock())
 
 
-def forwarder_hook_ids(repo: str) -> Optional[List[int]]:
+def forwarder_hook_ids(repo: str, run=None) -> Optional[List[int]]:
     """Ids of the repo's gh-webhook forwarder hooks, or None when they cannot be listed."""
     jq = (f'.[] | select(.name == "{FORWARDER_HOOK_NAME}" and '
           f'((.config.url // "") | contains("{FORWARDER_URL_MARK}"))) | .id')
-    r = gh(["api", f"repos/{repo}/hooks", "--paginate", "--jq", jq])
+    r = (run or gh)(["api", f"repos/{repo}/hooks", "--paginate", "--jq", jq])
     if r.returncode != 0:
         return None
     try:
@@ -529,8 +533,8 @@ def forwarder_hook_ids(repo: str) -> Optional[List[int]]:
         return None
 
 
-def delete_hook(repo: str, hook_id: int) -> bool:
-    r = gh(["api", "-X", "DELETE", f"repos/{repo}/hooks/{hook_id}"])
+def delete_hook(repo: str, hook_id: int, run=None) -> bool:
+    r = (run or gh)(["api", "-X", "DELETE", f"repos/{repo}/hooks/{hook_id}"])
     return r.returncode == 0 or "HTTP 404" in (r.stderr or "")
 
 
@@ -545,7 +549,7 @@ def record_hooks(st: State, repo: str, ids: Iterable[int]) -> None:
         write_json(st.hooks, data)
 
 
-def drop_recorded(st: State, repo: Optional[str] = None) -> Dict[str, List[int]]:
+def drop_recorded(st: State, repo: Optional[str] = None, run=None) -> Dict[str, List[int]]:
     """Delete exactly the hook ids this skill recorded; keep the ones a delete failed on."""
     with _hooks_lock:
         data = read_json(st.hooks, {})
@@ -554,7 +558,7 @@ def drop_recorded(st: State, repo: Optional[str] = None) -> Dict[str, List[int]]
             if repo is not None and r != repo:
                 left[r] = ids
                 continue
-            kept = [i for i in ids if not delete_hook(r, i)]
+            kept = [i for i in ids if not delete_hook(r, i, run=run)]
             if kept:
                 left[r] = kept
         write_json(st.hooks, left)
@@ -619,10 +623,91 @@ class Runner:
         self.threads: Dict[str, Tuple[threading.Thread, threading.Event]] = {}
         self.procs: Dict[str, subprocess.Popen] = {}
         self.procs_lock = threading.Lock()
-        self.reviewed = ReviewedLookup()
+        self.api_procs = set()
+        self.process_groups = set()
+        self.background = set()
+        self.thread_lock = threading.Lock()
+        self.reviewed = ReviewedLookup(run=self._gh)
         self.wake_cond = threading.Condition()
         self.wake_gen = 0
         self.backoff_lock = threading.Lock()
+
+    def _start_thread(self, target, *args) -> Optional[threading.Thread]:
+        with self.procs_lock, self.thread_lock:
+            if self.stop.is_set():
+                return None
+            self.background = {t for t in self.background if t.is_alive()}
+            thread = threading.Thread(target=target, args=args, daemon=True)
+            self.background.add(thread)
+            thread.start()
+            return thread
+
+    def _spawn(self, args: List[str], *, repo=None, cleanup=False):
+        with self.procs_lock:
+            if self.stop.is_set() and not cleanup:
+                return None
+            proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, bufsize=1, start_new_session=True)
+            self.process_groups.add(proc)
+            if repo is None:
+                self.api_procs.add(proc)
+            else:
+                self.procs[repo] = proc
+            return proc
+
+    def _signal(self, proc, sig, *, grouped=None) -> None:
+        owned_group = proc in self.process_groups if grouped is None else grouped
+        try:
+            if owned_group:
+                os.killpg(proc.pid, sig)
+            elif proc.poll() is None:
+                proc.send_signal(sig)
+        except ProcessLookupError:
+            pass
+
+    def _terminate(self, procs) -> None:
+        with self.procs_lock:
+            groups = self.process_groups.intersection(procs)
+            for proc in procs:
+                self._signal(proc, signal.SIGTERM, grouped=proc in groups)
+            deadline = time.monotonic() + TERMINATE_WAIT_S
+            for proc in procs:
+                try:
+                    proc.wait(timeout=max(0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    pass
+                if proc in groups:
+                    self._retire_group_locked(proc)
+                elif proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+
+    def _retire_group_locked(self, proc) -> None:
+        if proc in self.process_groups:
+            self._signal(proc, signal.SIGKILL, grouped=True)
+            proc.wait()
+            self.process_groups.discard(proc)
+
+    def _gh(self, args: List[str], check=False, timeout=None, *, cleanup=False):
+        proc = self._spawn(["gh"] + args, cleanup=cleanup)
+        if proc is None:
+            return subprocess.CompletedProcess(args, 130, "", "pr-watch stopped")
+        try:
+            try:
+                out, err = proc.communicate(timeout=RUNNER_GH_TIMEOUT_S if timeout is None else timeout)
+                rc = proc.returncode
+            except subprocess.TimeoutExpired:
+                self._terminate([proc])
+                out, err = proc.communicate()
+                rc = 124
+            result = subprocess.CompletedProcess(args, rc, out, err)
+            if check and rc:
+                raise subprocess.CalledProcessError(rc, args, out, err)
+            return result
+        finally:
+            with self.procs_lock:
+                self._retire_group_locked(proc)
+                self.api_procs.discard(proc)
 
     def emit(self, line: str) -> None:
         with self.out_lock:
@@ -681,9 +766,9 @@ class Runner:
                 del self.threads[repo]
         for repo in sorted(wanted - set(self.threads)):
             ev = threading.Event()
-            t = threading.Thread(target=self.loop, args=(repo, ev), daemon=True)
-            self.threads[repo] = (t, ev)
-            t.start()
+            t = self._start_thread(self.loop, repo, ev)
+            if t is not None:
+                self.threads[repo] = (t, ev)
 
     def loop(self, repo: str, gone: threading.Event) -> None:
         while not self.stop.is_set() and not gone.is_set():
@@ -692,11 +777,13 @@ class Runner:
             if self.pause(delay, gone, seen):
                 break
         self.set_backoff(repo, None)
-        drop_recorded(self.st, repo)
+        drop_recorded(self.st, repo, run=self._gh)
 
     def forward_once(self, repo: str) -> int:
-        drop_recorded(self.st, repo)
-        before = forwarder_hook_ids(repo)
+        drop_recorded(self.st, repo, run=self._gh)
+        before = forwarder_hook_ids(repo, run=self._gh)
+        if self.stop.is_set():
+            return 0
         if before is None:
             return self.back_off(repo, "cannot list hooks (need admin on the repo)",
                                  f"{repo}: cannot list hooks (need admin on the repo); retrying")
@@ -706,15 +793,13 @@ class Runner:
                                  f"(hook {before[0]}); GitHub allows one, retrying later")
         self.set_backoff(repo, None)
         err_path = self.st.logs / (repo.replace("/", "_") + ".err")
-        proc = subprocess.Popen(
-            ["gh", "webhook", "forward", f"--repo={repo}", f"--events={EVENTS}"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
-        with self.procs_lock:
-            self.procs[repo] = proc
+        proc = self._spawn(["gh", "webhook", "forward", f"--repo={repo}", f"--events={EVENTS}"], repo=repo)
+        if proc is None:
+            return 0
         self._save_forwarders()
         conflict = threading.Event()
-        threading.Thread(target=self._stderr, args=(proc, err_path, conflict), daemon=True).start()
-        threading.Thread(target=self._record, args=(repo, before, proc), daemon=True).start()
+        helpers = [self._start_thread(self._stderr, proc, err_path, conflict),
+                   self._start_thread(self._record, repo, before, proc)]
         buf = ""
         assert proc.stdout is not None
         for chunk in iter(proc.stdout.readline, ""):
@@ -728,9 +813,18 @@ class Runner:
                     self.emit(line)
         proc.wait()
         with self.procs_lock:
-            self.procs.pop(repo, None)
+            self._retire_group_locked(proc)
+        for helper in helpers:
+            if helper is not None:
+                helper.join()
+        proc.stdout.close()
+        if proc.stderr is not None:
+            proc.stderr.close()
+        with self.procs_lock:
+            if self.procs.get(repo) is proc:
+                self.procs.pop(repo)
         self._save_forwarders()
-        drop_recorded(self.st, repo)
+        drop_recorded(self.st, repo, run=self._gh)
         if conflict.is_set():
             return self.back_off(repo, f"GitHub refused a second forwarder ({HOOK_EXISTS})",
                                  f"{repo}: GitHub refused a second forwarder ({HOOK_EXISTS}); retrying later")
@@ -754,27 +848,33 @@ class Runner:
     def _record(self, repo: str, before: List[int], proc: subprocess.Popen) -> None:
         deadline = time.time() + RECORD_WINDOW_S
         while time.time() < deadline and proc.poll() is None and not self.stop.is_set():
-            time.sleep(2)
-            now = forwarder_hook_ids(repo)
+            if self.stop.wait(2) or proc.poll() is not None:
+                return
+            now = forwarder_hook_ids(repo, run=self._gh)
             new = [i for i in (now or []) if i not in before]
             if new:
                 record_hooks(self.st, repo, new)
                 return
 
     def shutdown(self) -> None:
-        self.stop.set()
-        self.wake()
         with self.procs_lock:
-            procs = list(self.procs.values())
-        for p in procs:
-            if p.poll() is None:
-                p.terminate()
-        for p in procs:
-            try:
-                p.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                p.kill()
-        drop_recorded(self.st)
+            self.stop.set()
+            procs = set(self.procs.values()) | self.api_procs | self.process_groups
+        self.wake()
+        self._terminate(procs)
+        with self.thread_lock:
+            threads = list(self.background)
+        for thread in threads:
+            thread.join()
+        deadline = time.monotonic() + SHUTDOWN_CLEANUP_S
+
+        def cleanup_gh(args, **kwargs):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return subprocess.CompletedProcess(args, 124, "", "pr-watch cleanup deadline reached")
+            return self._gh(args, timeout=remaining, cleanup=True, **kwargs)
+
+        drop_recorded(self.st, run=cleanup_gh)
         write_json(self.st.forwarders, {})
         write_json(self.st.backoff, {})
 
@@ -794,6 +894,7 @@ def cmd_run(st: State) -> int:
         except BlockingIOError:
             if time.time() > deadline:
                 print("PR_WATCH_NOTE another pr-watch runner is active; this one exits", flush=True)
+                lock_fh.close()
                 return 4
             time.sleep(1)
     st.runner_pid.write_text(f"{os.getpid()}\n")
@@ -819,6 +920,7 @@ def cmd_run(st: State) -> int:
             st.runner_pid.unlink()
         except OSError:
             pass
+        lock_fh.close()
     return 0
 
 

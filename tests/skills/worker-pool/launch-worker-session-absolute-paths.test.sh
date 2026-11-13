@@ -72,6 +72,7 @@ mkdir -p "$NOPY_REPO/src/agent/claude/cli" "$NOPY_REPO/src/agent" "$NOPY_REPO/sc
         "$NOPY_REPO/skills/worker-pool/scripts"
 cp "$REPO/src/agent/claude/cli/session-launch.sh" "$NOPY_REPO/src/agent/claude/cli/"
 cp "$WORKERCLI" "$NOPY_REPO/skills/worker-pool/scripts/launch-worker-session.sh"
+cp "$REPO/skills/worker-pool/scripts/worker-mcp-credential.sh" "$NOPY_REPO/skills/worker-pool/scripts/"
 cp "$REPO/scripts/python-binary.sh" "$NOPY_REPO/scripts/" 2>/dev/null
 for _dep in "$REPO/src/agent"/*.sh; do [ -f "$_dep" ] && cp "$_dep" "$NOPY_REPO/src/agent/"; done
 [ -d "$TMP/norepo/runtime/python" ] && { echo "  fixture invalid: a runtime/ sibling exists"; exit 1; }
