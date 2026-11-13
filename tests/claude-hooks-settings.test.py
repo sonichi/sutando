@@ -326,5 +326,68 @@ with tempfile.TemporaryDirectory() as tmp:
           and "(re-pointed)" in r.stdout, "install-watcher-rearm-hook.sh re-points an older tree's entry",
           r.stdout + r.stderr + str(cmds))
 
+    # ── the current entry's own settings survive, whichever order it sits in ──────
+    # An older live checkout's copy before the current entry must not replace it: the
+    # current hook owns its timeout and async metadata.
+    older = tmp / "older" / "src" / "personal-claude-compact-hint.sh"
+    older.parent.mkdir(parents=True, exist_ok=True)
+    older.write_text("#!/bin/bash\n")
+    older_cmd = f'bash "{older}"'
+    check(chs.is_other_checkout_copy(older_cmd, live_cmd), "fixture: the older tree's entry is a copy")
+
+    def rich(cmd, timeout, matcher="compact", **extra):
+        return {"matcher": matcher,
+                "hooks": [dict({"type": "command", "command": cmd, "timeout": timeout}, **extra)]}
+
+    CURRENT = dict(timeout=600, **{"async": True, "statusMessage": "keep me"})
+    for label, order in (
+            ("older first", lambda: [rich(older_cmd, 1), rich(live_cmd, **CURRENT)]),
+            ("current first", lambda: [rich(live_cmd, **CURRENT), rich(older_cmd, 1)])):
+        s = {"hooks": {"SessionStart": order()}}
+        chs.repoint_other_checkouts(s, "SessionStart", live_cmd, matcher="compact")
+        hooks = [h for e in s["hooks"]["SessionStart"] for h in (e.get("hooks") or [])]
+        check(len(hooks) == 1 and hooks[0].get("command") == live_cmd,
+              f"{label}: one current entry survives", str(hooks))
+        check(len(hooks) == 1 and hooks[0].get("timeout") == 600,
+              f"{label}: the current entry's timeout survives", str(hooks))
+        check(len(hooks) == 1 and hooks[0].get("async") is True
+              and hooks[0].get("statusMessage") == "keep me",
+              f"{label}: the current entry's async metadata survives", str(hooks))
+
+    # Two older copies and no current entry: the first in file order is the one re-pointed,
+    # so the entry keeps its position; the rest are dropped as duplicates.
+    older2 = tmp / "older2" / "src" / "personal-claude-compact-hint.sh"
+    older2.parent.mkdir(parents=True, exist_ok=True)
+    older2.write_text("#!/bin/bash\n")
+    s = {"hooks": {"SessionStart": [rich(older_cmd, 1), rich(f'bash "{older2}"', 2)]}}
+    chs.repoint_other_checkouts(s, "SessionStart", live_cmd, matcher="compact")
+    hooks = [h for e in s["hooks"]["SessionStart"] for h in (e.get("hooks") or [])]
+    check(len(hooks) == 1 and hooks[0].get("command") == live_cmd and hooks[0].get("timeout") == 1,
+          "two older copies, no current: the first in file order is re-pointed", str(hooks))
+
+    # A current entry under another matcher is not ours to touch.
+    s = {"hooks": {"SessionStart": [rich(older_cmd, 1), rich(live_cmd, 600, matcher="resume")]}}
+    chs.repoint_other_checkouts(s, "SessionStart", live_cmd, matcher="compact")
+    kept = s["hooks"]["SessionStart"]
+    check(any(e.get("matcher") == "resume" and e["hooks"][0].get("timeout") == 600 for e in kept),
+          "a current entry under another matcher is left untouched", str(kept))
+
+    # A non-dict entry and a non-dict hook are carried through untouched.
+    s = {"hooks": {"SessionStart": ["not-an-entry", {"matcher": "compact", "hooks": ["not-a-hook"]},
+                                    rich(older_cmd, 1)]}}
+    chs.repoint_other_checkouts(s, "SessionStart", live_cmd, matcher="compact")
+    kept = s["hooks"]["SessionStart"]
+    check("not-an-entry" in kept and any(e.get("hooks") == ["not-a-hook"] for e in kept if isinstance(e, dict)),
+          "a non-dict entry and a non-dict hook survive the migration", str(kept))
+
+    # Idempotence: a second pass over the settled settings changes nothing.
+    s = {"hooks": {"SessionStart": [rich(older_cmd, 1), rich(live_cmd, **CURRENT)]}}
+    chs.repoint_other_checkouts(s, "SessionStart", live_cmd, matcher="compact")
+    once = json.dumps(s, sort_keys=True)
+    again = chs.repoint_other_checkouts(s, "SessionStart", live_cmd, matcher="compact")
+    check(again == [] and json.dumps(s, sort_keys=True) == once,
+          "running the migration twice changes nothing", once)
+
+
 print(f"\n{_pass} passed, {_fail} failed")
 sys.exit(1 if _fail else 0)

@@ -162,11 +162,21 @@ def repoint_other_checkouts(settings: dict, event: str, command: str, matcher: s
     """Rewrite, in place, ``event`` hooks under ``matcher`` that are ``command`` on another checkout's path.
 
     A copy is rewritten to ``command`` where it stands; one beside an existing ``command`` under
-    the same matcher is dropped instead. Entries under any other matcher are not ours and stay.
-    Returns the old commands.
+    the same matcher is dropped instead. An entry that already IS ``command`` is preferred over
+    every copy, in whichever order they sit, so its own timeout and async settings survive.
+    Entries under any other matcher are not ours and stay. Returns the old commands.
     """
+    def _hooks_under(matcher: str):
+        for entry in settings.get("hooks", {}).get(event, []) or []:
+            if isinstance(entry, dict) and entry.get("matcher", "") == matcher:
+                for hook in entry.get("hooks", []) or []:
+                    yield hook
+
     changed: list[str] = []
-    present = False
+    # The current entry owns its settings, so a copy before it is dropped, never re-pointed
+    # over it; without this the copy's own timeout would replace the current one's.
+    exact = any(isinstance(h, dict) and h.get("command") == command for h in _hooks_under(matcher))
+    kept = False
     kept_entries = []
     for entry in settings.get("hooks", {}).get(event, []) or []:
         if not isinstance(entry, dict) or entry.get("matcher", "") != matcher:
@@ -177,13 +187,13 @@ def repoint_other_checkouts(settings: dict, event: str, command: str, matcher: s
             current = hook.get("command", "") if isinstance(hook, dict) else ""
             if isinstance(current, str) and is_other_checkout_copy(current, command):
                 changed.append(current)
-                if present:
+                if exact or kept:
                     continue
                 hook = dict(hook, command=command)
             if isinstance(hook, dict) and hook.get("command") == command:
-                if present:
+                if kept:
                     continue
-                present = True
+                kept = True
             kept_hooks.append(hook)
         if kept_hooks:
             kept_entries.append(dict(entry, hooks=kept_hooks))
