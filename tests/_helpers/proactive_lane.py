@@ -7,12 +7,49 @@ process would.
 """
 from __future__ import annotations
 
+import contextlib
+import os
 import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 OWNER_DM = "!OwnerDmRoomXyZ:ag2.space"
 ROOM = "!TaskRoomAbCdEf:ag2.space"
+AGENT = "@lane-agent:ag2.space"
+
+
+def owner_of(agent: str) -> str:
+    """The agent's owner, on the agent's own homeserver (a registry owner elsewhere is no owner)."""
+    return "@lane-owner:" + agent.partition(":")[2]
+
+
+def registry_reply(gb, method, path, payload, owner_dm: str):
+    """What the gateway answers to the owner DM's member read (the agent and its owner) and to
+    this agent's registry row; None for any other request."""
+    agent, payload = gb._reenroll_identity(), payload or {}
+    op = payload.get("op") if method == "POST" and path == "/v1/room" else None
+    if op == "members" and payload.get("room_id") == owner_dm:
+        return {"members": [{"user_id": u} for u in (agent, owner_of(agent))]}
+    if method == "GET" and path == "/v1/agents":
+        return {"agents": [{"id": agent, "owner": owner_of(agent), "owner_dm_room": owner_dm}]}
+    return None
+
+
+@contextlib.contextmanager
+def known_owner(gb, agent: str = AGENT):
+    """An agent identity (`agent` unless the test set one) and an owner read fresh from the registry."""
+    saved = (os.environ.get("AGENT_MXID"), dict(gb._HITL_OWNER))
+    if not gb._reenroll_identity():
+        os.environ["AGENT_MXID"] = agent
+    gb._HITL_OWNER.update(mxid="", at=0.0, bad_at=None)
+    try:
+        yield
+    finally:
+        if saved[0] is None:
+            os.environ.pop("AGENT_MXID", None)
+        else:
+            os.environ["AGENT_MXID"] = saved[0]
+        gb._HITL_OWNER.update(saved[1])
 
 
 def scratch(prefix: str) -> Path:
@@ -37,7 +74,7 @@ class Lane:
         if method == "POST" and path == "/v1/room" and (payload or {}).get("op") == "message":
             self.posts.append(dict(payload))
             return self.respond(payload)
-        return {"ok": True}
+        return registry_reply(self.gb, method, path, payload, self.owner_dm) or {"ok": True}
 
     def write(self, name: str, body: str) -> Path:
         p = self.results / name
@@ -57,7 +94,8 @@ class Lane:
         gb.PROACTIVE_ROUTE_GATE, gb.PROACTIVE_ACK_GATE = route_gate, ack_gate
         gb._ROUTING.update(owner_dm=self.owner_dm, loaded=True, next=gb.time.time() + 3600)
         try:
-            gb._post_proactive()
+            with known_owner(gb):
+                gb._post_proactive()
         finally:
             (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR, gb.UNDELIVERABLE_RESULTS_DIR, gb.TASKS_DIR,
              gb.PROACTIVE_ROOM, gb._req, gb.PROACTIVE_CLAIM_GATE, gb._log,

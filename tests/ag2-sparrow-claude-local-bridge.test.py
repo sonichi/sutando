@@ -42,6 +42,7 @@ from ag2_sparrow.hitl.schema import Action, HumanRequirement  # noqa: E402
 
 OWNER = "@owner:ag2.space"
 DM = "!owner-dm:ag2.space"
+AGENT = "@me:ag2.space"
 STALL = {"reason": "static", "since": 1.0, "frame_hash": "a" * 16, "task": "task-a", "checks": "pane static", "lines": []}
 
 
@@ -51,9 +52,21 @@ def tree(root):
         if root.exists() else {}
 
 
+def gateway(fake):
+    """`fake` behind the owner DM's member read, which the gateway answers: the agent and its owner."""
+    def req(method, path, payload=None, timeout=20):
+        if (payload or {}).get("op") == "members" and payload.get("room_id") == DM:
+            return {"members": [{"user_id": AGENT}, {"user_id": OWNER}]}
+        return fake(method, path, payload, timeout=timeout)
+    return req
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         os.environ["SPARROW_HA_OWNER"] = OWNER
+        identity = mock.patch.object(rgb, "_reenroll_identity", lambda: AGENT)
+        identity.start()
+        self.addCleanup(identity.stop)
         self.work = TMP / ("work-%s" % os.urandom(3).hex())
         for d in ("tasks", "results"):
             (self.work / d).mkdir(parents=True)
@@ -79,8 +92,8 @@ class Base(unittest.TestCase):
 
     def project(self):
         sent = []
-        with mock.patch.object(rgb, "_req", lambda method, path, payload, timeout=20: sent.append(payload)
-                               or {"event_id": "$card-%d" % len(sent)}):
+        with mock.patch.object(rgb, "_req", gateway(lambda method, path, payload, timeout=20: sent.append(payload)
+                                                    or {"event_id": "$card-%d" % len(sent)})):
             rgb._project_hitl(log=lambda *a: None)
         return sent
 
@@ -130,13 +143,13 @@ class Projection(Base):
         def refuse_default(method, path, payload, timeout=20):
             sent.append(payload)
             return {"ok": False} if self.default_req.id in json.dumps(payload) else {"event_id": "$cl"}
-        with mock.patch.object(rgb, "_req", refuse_default):
+        with mock.patch.object(rgb, "_req", gateway(refuse_default)):
             self.assertEqual(rgb._project_hitl(log=lambda *a: None), 1)
         self.assertTrue(any(self.req.id in json.dumps(p) for p in sent), "projected despite the stuck default card")
         self.assertEqual(self.store().load(self.req.id).room, DM)
         rgb._hitl_backoff_reset()
         sent.clear()
-        with mock.patch.object(rgb, "_req", lambda m, p, payload, timeout=20: sent.append(payload) or {"event_id": "$d"}), \
+        with mock.patch.object(rgb, "_req", gateway(lambda m, p, payload, timeout=20: sent.append(payload) or {"event_id": "$d"})), \
                 mock.patch.object(rgb, "_project_claude_local", side_effect=RuntimeError("claude-local store broke")):
             with self.assertRaises(RuntimeError):
                 rgb._project_hitl(log=lambda *a: None)
@@ -151,7 +164,7 @@ class Projection(Base):
                 raise OSError("relay down for that card")
             sent.append(payload)
             return {"event_id": "$cl"}
-        with mock.patch.object(rgb, "_req", raise_default), self.assertRaises(OSError):
+        with mock.patch.object(rgb, "_req", gateway(raise_default)), self.assertRaises(OSError):
             rgb._project_hitl(log=lambda *a: None)
         self.assertTrue(any(self.req.id in json.dumps(p) for p in sent), "projected before the error is re-raised")
         rgb._hitl_backoff_reset()
@@ -347,9 +360,9 @@ class Clicks(Base):
         self.addCleanup(rgb._HITL_OWNER.update, mxid="", at=0.0, bad_at=None)
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
-        stack.enter_context(mock.patch.object(rgb, "_reenroll_identity", lambda: "@me:ag2.space"))
+        stack.enter_context(mock.patch.object(rgb, "_reenroll_identity", lambda: AGENT))
         stack.enter_context(mock.patch.object(
-            rgb, "_req", lambda *a, **k: {"agents": [{"id": "@me:ag2.space", "owner": owner}]}))
+            rgb, "_req", lambda *a, **k: {"agents": [{"id": AGENT, "owner": owner}]}))
 
     def test_unset_variable_owner_click_is_applied_by_the_registry_owner(self):
         self._registry_owner(OWNER)

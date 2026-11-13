@@ -345,7 +345,7 @@ from .outbox import RetrySchedule, delivered_body_differs, effective_item_id, re
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome, withdraw_unsent
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS
-from .delivery_core import (WITHDRAWN, DeliveryCore, DesignAClaimBackend, DrainStatus,
+from .delivery_core import (WITHDRAWN, Defer, DeliveryCore, DesignAClaimBackend, DrainStatus,
                             ProviderRefused, RetryPolicy)
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
 from .delivery_core import is_refused_for_good
@@ -779,13 +779,13 @@ def _hitl_owner() -> str:
 _HITL_OWNER_UNKNOWN = "hitl: card click ignored, owner unknown"
 
 
-def _owner_dm_is_private(room: str, owner: str) -> "bool | None":
+def _owner_dm_is_private(room: str, owner: str, timeout: float = 10) -> "bool | None":
     """Whether only the agent and its owner are in `room`; None when the gateway cannot say."""
     agent = _reenroll_identity()
     if not (room and owner and agent):
         return None
     try:
-        answer = _req("POST", "/v1/room", {"op": "members", "room_id": room}, timeout=10)
+        answer = _req("POST", "/v1/room", {"op": "members", "room_id": room}, timeout=timeout)
     except Exception:  # noqa: BLE001 - unreadable is undecided, never private
         return None
     if not isinstance(answer, dict) or answer.get("error") or not isinstance(answer.get("members"), list):
@@ -1853,8 +1853,24 @@ def _project_claude_local(mods, room: str, log=print):
                 store.save(req, store.projection(req.id))
     if not projector.pending_ids(manager):
         return projector.ProjectionPass([], [], [])
-    return projector.project_pass(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S), room,
-                                  describe=_http_error_body)
+    return projector.project_pass(manager, _hitl_sender(), room, describe=_http_error_body)
+
+
+def _hitl_sender():
+    """One projection pass's sender. A card, edit or notice for the owner DM is held while
+    _owner_dm_send_hold says so: it gets no answer, so the projector records nothing, charges
+    nothing and retries it. The members are read once per pass, right before its first send there."""
+    holds: dict = {}
+
+    def send(payload: dict):
+        room = payload.get("room_id")
+        if room not in holds:
+            holds[room] = _owner_dm_send_hold(room)
+        if holds[room] is not None:
+            _log_backoff(("hitl-owner-dm-held", holds[room]), f"hitl: {holds[room]}")
+            return {}
+        return _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S)
+    return send
 
 
 def _project_hitl(log=print) -> int:
@@ -1893,8 +1909,7 @@ def _project_hitl(log=print) -> int:
             if drive == "claude-local":
                 got = _project_claude_local(mods, room, log)
             elif pending_ids(manager):
-                got = project_pass(manager, lambda payload: _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S), room,
-                                   describe=_http_error_body)
+                got = project_pass(manager, _hitl_sender(), room, describe=_http_error_body)
             else:
                 continue
         except Exception as e:  # noqa: BLE001 — re-raised below, after both passes
@@ -8234,14 +8249,41 @@ def _task_thread_root(headers: dict, room: str) -> "str | None":
     return source if _EVENT_ID_RE.fullmatch(source) else None
 
 
+#: The send-time membership read runs under the send lock, so it is bounded tighter than a refresh's.
+OWNER_DM_SEND_CHECK_TIMEOUT_S = 5.0
+
+
+def _owner_dm_send_hold(room) -> "str | None":
+    """Why a send to the owner DM must wait, or None. The DM reading the drain resolved is as old
+    as the last refresh (ROUTING_REFRESH_S): someone who joined since must not get owner-private
+    posts, so the members are read again right before each send to that room. Fails closed: an
+    unknown owner or an unreadable member list holds too. A room that is not the DM reading is
+    not this check's (a refresh already moved it, and the drain holds a moved item itself)."""
+    if not room or room != _ROUTING["owner_dm"]:
+        return None
+    private = _owner_dm_is_private(room, _hitl_owner(), timeout=OWNER_DM_SEND_CHECK_TIMEOUT_S)
+    if private is True:
+        return None
+    if private is False:
+        # The refresh is due now, not run here under the send lock: it clears the reading, and
+        # the next pass then holds the message unclaimed until a private owner DM is read again.
+        _ROUTING["next"] = 0.0
+        return f"owner DM {room} has members besides the agent and its owner; held, not posted"
+    return f"owner DM {room}: its members could not be read; held, not posted"
+
+
 def _proactive_dispatch_veto(item_id: str, payload: bytes) -> "str | None":
     """Asked by the outbox right before the send: a message about a task that has been
-    answered, has ended, waits on the owner or is being cancelled is withdrawn."""
+    answered, has ended, waits on the owner or is being cancelled is withdrawn; a message to
+    an owner DM that is not private right now is deferred (held, never withdrawn)."""
     try:
         env = json.loads(payload.decode("utf-8"))
         tid = env.get("task_id")
     except (UnicodeDecodeError, ValueError, AttributeError):
         return None
+    hold = _owner_dm_send_hold(env.get("room_id") if isinstance(env, dict) else None)
+    if hold is not None:
+        return Defer(hold)
     if not tid:
         return None
     if (RESULTS_DIR / f"{tid}.txt").exists() or _delivered_copy_exists(tid):
