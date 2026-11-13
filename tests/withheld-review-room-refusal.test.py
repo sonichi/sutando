@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """A private review DM whose room refuses the agent (HTTP 403 "sender is not in this room")
-ends that review after one send: the withheld result is settled, not re-scanned every second,
-and the next withheld result reaches the owner through a fresh private room (#5054)."""
+gets send_failure_policy.ROOM_REFUSAL_ATTEMPTS spaced sends, then the withheld result is settled
+instead of re-sent on every 1 s scan, and the next withheld result reaches the owner through a
+fresh private room (#5054)."""
 import io
 import json
 import pathlib
 import sys
 import tempfile
 import urllib.error
+from unittest import mock
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
 
@@ -92,24 +94,31 @@ with tempfile.TemporaryDirectory() as td:
             check(json.loads(m._WITHHELD_DM_CACHE.read_text()).get("room_id") == LEFT,
                   "and the private review room stays cached")
 
-        # --- the room refuses the sender: one send, then the result is settled
+        # --- the room refuses the sender: a bounded, spaced set of sends, then settled
         sent.clear()
         refusal[0] = NOT_IN_ROOM
         write_task(tasks, "task-refused")
-        got = [m._guarded_result_body("task-refused", BODY) for _ in range(10)]
-        check(sent.count(LEFT) == 1, f"the refused review DM is sent once in 10 scans "
-                                     f"(sent {sent.count(LEFT)})")
-        body, reason = got[0]
+        cap = m.ROOM_REFUSAL_ATTEMPTS if hasattr(m, "ROOM_REFUSAL_ATTEMPTS") else 5
+        clock = [1000.0]
+        got = []
+        with mock.patch.object(m.time, "monotonic", lambda: clock[0]):
+            for _ in range(60):  # one scan a second for a minute, as the result drain does
+                got.append(m._guarded_result_body("task-refused", BODY))
+                clock[0] += 1.0
+        check(sent.count(LEFT) == cap, f"the refused review DM is sent {cap} times in 60 scans "
+                                       f"(sent {sent.count(LEFT)})")
+        settled = [g for g in got if g[0] is not None]
+        check(bool(settled) and all(g == settled[0] for g in settled) and got[-1] == settled[0],
+              "once settled, every later scan gets the same verdict")
+        body, reason = settled[0] if settled else (None, None)
         check(body == "[no-send]", "the withheld result is still suppressed from the shared room")
         check("refused" in (reason or "") and "not in" in (reason or ""),
               "the reason names the room's refusal")
-        check(all(g == got[0] for g in got), "every later scan gets the same settled verdict")
         record = json.loads(m.team_result_guard.withheld_review_artifact(
             m._STATE, "task-refused", BODY).read_text())
         check(record.get("status") == "pending_dm", "the review record is kept for the owner")
-        check(not m._WITHHELD_DM_CACHE.exists() or
-              json.loads(m._WITHHELD_DM_CACHE.read_text()).get("room_id") != LEFT,
-              "the refusing room is no longer cached as the private review room")
+        check(json.loads(m._WITHHELD_DM_CACHE.read_text()).get("private") is not True,
+              "the refusing room is no longer trusted as the private review room")
 
         # --- the next withheld result is not blocked: it reaches the owner in a new room
         sent.clear()
@@ -122,6 +131,7 @@ with tempfile.TemporaryDirectory() as td:
             setattr(m, n, v)
         m._WITHHELD_TASK_OUTPUT.clear()
         m._WITHHELD_TASK_OUTPUT.update(saved_output)
+        getattr(m, "_REVIEW_ROOM_REFUSALS", {}).clear()
 
 print("PASS: 0 failure(s)" if not fail else "FAIL: withheld review room refusal")
 sys.exit(fail)
