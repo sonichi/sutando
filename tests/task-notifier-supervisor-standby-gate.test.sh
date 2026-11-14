@@ -31,6 +31,7 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/sut-sup-gate.XXXXXX")"
 # sentinels in the host's live state dir and take the running core's readiness away.
 unset SUTANDO_WORKSPACE_DIR
 SOCK="$WORK/tmux.sock"
+LEASE="$WORK/supervisor.lock"
 
 STUB="$WORK/stub-notifier.sh"
 cat > "$STUB" <<'EOS'
@@ -68,10 +69,24 @@ start_supervisor() {
   tmux -S "$SOCK" new-session -d -s supervisor -c "$REPO" \
     "env -u SUTANDO_INSTANCE_ID -u SUTANDO_WORKSPACE_DIR PATH=${extra_path:+$extra_path:}\$PATH \
        SUTANDO_TMUX_SOCKET=$SOCK SUTANDO_TMUX_SESSION=target \
+       SUTANDO_NOTIFIER_LOCK_DIR=$LEASE \
        SUTANDO_TASKS_DIR=$tasks_dir SUTANDO_NOTIFIER_SCRIPT=$STUB \
        SUTANDO_STUB_MARKER=$marker SUTANDO_NOTIFIER_GRACE_PERIOD=$grace \
        SUTANDO_NOTIFIER_ROLE_POLL=$role_poll \
        bash $SUPERVISOR > $WORK/sup.log 2>&1"
+}
+
+# Killing the tmux pane may return before its supervisor's signal trap releases the lease.
+stop_supervisor() {
+  tmux -S "$SOCK" kill-session -t supervisor >/dev/null 2>&1 || true
+  local i
+  for i in $(seq 1 100); do
+    [ ! -d "$LEASE" ] && return 0
+    sleep 0.1
+  done
+  echo "  FAIL: prior supervisor did not release its lease"
+  cat "$WORK/sup.log"
+  return 1
 }
 
 start_internal_watcher() {  # start_internal_watcher <tasks_dir> <name> [<PATH prefix>]
@@ -129,7 +144,7 @@ else
   echo "  FAIL: scenario 3 -- re-armed even though the session-role watcher is still present"
   fail=1
 fi
-tmux -S "$SOCK" kill-session -t supervisor >/dev/null 2>&1 || true
+stop_supervisor || exit 1
 tmux -S "$SOCK" kill-session -t internal-core >/dev/null 2>&1 || true
 sleep 0.3
 
@@ -150,7 +165,7 @@ else
     fail=1
   fi
 fi
-tmux -S "$SOCK" kill-session -t supervisor >/dev/null 2>&1 || true
+stop_supervisor || exit 1
 tmux -S "$SOCK" kill-session -t internal-core2 >/dev/null 2>&1 || true
 sleep 0.3
 
@@ -179,7 +194,7 @@ else
   echo "  FAIL: scenario 5b -- notifier never armed while ps stayed unobservable (an inbox with no watcher, forever)"
   fail=1
 fi
-tmux -S "$SOCK" kill-session -t supervisor >/dev/null 2>&1 || true
+stop_supervisor || exit 1
 sleep 0.3
 
 # --- scenario 6: a session-role watcher that exists but has not proven
@@ -200,7 +215,7 @@ else
     fail=1
   fi
 fi
-tmux -S "$SOCK" kill-session -t supervisor >/dev/null 2>&1 || true
+stop_supervisor || exit 1
 tmux -S "$SOCK" kill-session -t internal-unready >/dev/null 2>&1 || true
 
 if [ "$fail" -eq 0 ]; then

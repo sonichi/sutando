@@ -113,6 +113,8 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/start-cli.sh",
             "src/agent/codex/cli/task-notifier.sh",
             "src/agent/codex/cli/task-notifier-supervisor.sh",
+            "src/agent/codex/cli/notifier_lease.py",
+            "src/portable_mtime.sh",
             "src/tmux-pane-keys.sh",
             "src/tmux_pane_keys.py",
             "src/bounded-wait.sh",
@@ -1254,6 +1256,7 @@ exit 23
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core",
+                   SUTANDO_NOTIFIER_LOCK_DIR=str(Path(self.tmp.name) / "supervisor.lock"),
                    SUTANDO_NOTIFIER_SCRIPT=str(notifier),
                    SUTANDO_NOTIFIER_RESTART_DELAY="0.01",
                    SUTANDO_NOTIFIER_GRACE_PERIOD="0",
@@ -1306,6 +1309,7 @@ sleep 60
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core",
+                   SUTANDO_NOTIFIER_LOCK_DIR=str(Path(self.tmp.name) / "supervisor.lock"),
                    SUTANDO_NOTIFIER_SCRIPT=str(notifier),
                    SUTANDO_NOTIFIER_RESTART_DELAY="0.01",
                    SUTANDO_NOTIFIER_GRACE_PERIOD="0",
@@ -1342,6 +1346,7 @@ sleep 60
         env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core",
+                   SUTANDO_NOTIFIER_LOCK_DIR=str(Path(self.tmp.name) / "supervisor.lock"),
                    SUTANDO_NOTIFIER_SCRIPT=str(notifier))
         supervisor = self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"
         result = subprocess.run(["/bin/bash", str(supervisor)], env=env,
