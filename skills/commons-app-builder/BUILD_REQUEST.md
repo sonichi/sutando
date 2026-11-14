@@ -253,3 +253,139 @@ python3 build_request.py ask task.txt --plan plan.json --question 'Use the exist
   thread went unanswered for 24 hours"); an owner's `answer` after that prints `"lapsed": true`
   once. Either way `thread-line --result` then says so in the thread, once.
 
+## The message beside a fence
+
+The client sends each build, change or Try again as the DM fence **and** a message in the app's
+thread. On the appservice delivery path the owner's thread messages reach the owner's agent
+whether or not they name it, and the gateway passes no marker, so that message arrives as a room
+task beside the fence. This holds with `BUILD_THREAD_CONVERSATION` off too, so it is handled
+either way.
+
+The two are tied exactly, never by time:
+
+- **A change or Try-again fence names its message.** It carries `"thread_message": "$<event id>"`,
+  the id of the thread message the client sent just before it. With the switch off, the key is
+  ignored like `thread_root` is: never checked, never in the request.
+- **A build fence cannot name its message,** because the fence comes first. Its message is the one
+  whose text **is** the fence's description, from the asking owner, in that thread. That is the
+  client's own first message; texts are compared trimmed, with whitespace collapsed. That is the
+  build's one slot, used once, only within `BUILD_THREAD_SETTLE_SECONDS` of the fence (the client
+  sends it at once; the same words later are the owner's own), and closed for good once a
+  question is asked for it. The request's reply does not close it: the agent's queue runs the
+  fence first, so the copy is often checked only after the build has answered. Any other message (an @-mention, a "thanks", the same words three days later) is
+  not the slot.
+
+**Where it runs first: the gateway bridge.** Before a room task with a `thread_root` is queued,
+the bridge's intake gate (`src/remote-gateway-bridge.py`, `_build_thread_gate`) asks this same
+verdict about the owner's message: `build_request.py intake-verdict -`, run through the shared
+optional-script runner (`src/optional_script.py`), never loaded into the bridge. It gets the
+gateway's own fields and the tier the bridge resolved on stdin, runs isolated (`python -I`) with
+only `HOME`, the workspace's `SUTANDO_WORKSPACE`, `SUTANDO_TEST_MODE` and
+`SUTANDO_DEFAULT_WORKSPACE`, and this skill's `BUILD_THREAD_CONVERSATION` and
+`BUILD_THREAD_SETTLE_SECONDS` (never the gateway's token), and has 2 s (its ledger lock waits at
+most 1 s, then it exits 3). A non-zero exit, a timeout or unparseable output delivers the message.
+
+**Only an app's thread is checked.** The bridge first reads, in its own process, this skill's
+thread index `state/commons-app-builds/app-threads.json` (`{room_id: {thread_root: newest fence
+time}}`). The ledger adds a thread whenever it notes or claims a fence, and it stays an app's
+thread at any age, as long as the app exists. An entry is removed when the thread is no app's:
+- a request in it fails because its app is gone (`app … is not in this room`);
+- or every request in it has failed (a build that never made an app, a question that lapsed).
+
+A done or still-open request keeps it. So the file holds one entry per thread with an app or an
+open request, never one per message, and does not grow with age. Any other thread, and anything
+unreadable, takes the ordinary path in its place in the round, with no check.
+
+**A new build's thread is indexed at its fence.** An owner-tier DM task whose text contains the
+fence's opening line (```` ```commons-app-build ````, one substring test, no parsing in the bridge)
+is handed to the same `intake-verdict` call, within the same 2 s and failing open, and counted
+against the round's same 3 s build-thread budget (past it, such a DM is delivered unchecked). The skill notes
+it when it is a whole, valid owner fence naming an app thread, which indexes that thread, and
+notes nothing otherwise (a quote of the marker, a guest, a group room, a bad id). The DM is
+delivered either way. So the copy that follows, in that round or a later one, is checked and
+settled at intake. A DM without the marker starts no process.
+
+What remains: if that call fails or times out, the thread is indexed only once a run notes or
+claims the fence. The copy then reaches the agent, and `thread-task` drops it, as a duplicate even
+after the build has answered.
+
+In a served round the check costs the first pass nothing: the task is taken after the round's
+acks, after its lane dedupe (which keeps its own wait), and every build-thread check and wait in
+the round shares one budget of 3 s, half the round's 6 s wait. `duplicate`: settled unqueued, the
+agent never sees it. `wait`: held in memory, unacked, and rechecked every 0.25 s within that
+budget, then delivered; a restart re-serves it. Past the budget a task is delivered unchecked.
+Anything else is delivered as usual. So a threaded task that reaches the agent is one the bridge
+could not decide.
+
+**Why 12 seconds, and what it costs.** The client sends a change's thread message, then its fence,
+from the same click, but they travel two paths: a room task and the owner's DM task. A message
+leads its fence by at most the DM path's lag, plus the client's own gap between the two sends.
+Measured over this workspace's archived AG2 Space tasks since 2026-10-15, outside outages (an
+outage holds both paths together):
+- DM path: p50 2 s, p90 4 s, p99 10 s, over 2,039 tasks;
+- room path: p50 2 s, p99 18 s, over 4,953 tasks.
+
+12 s covers the DM p99, the one-second timestamps and the client's gap. A fence later than that
+leaves its message `none`, delivered as conversation and never a build (only a fence builds).
+
+The cost: with the switch on, an owner message in **any** app's thread, at any age, waits up to
+the round's 3 s build-thread budget at the bridge. If it reaches the agent as `wait`, it is
+rechecked up to the settle time (12 s) after it was first seen. That includes a plain "thanks",
+because nothing at intake marks which thread messages belong to a build. With the switch off,
+nothing waits.
+
+The client does mark them (`space.ag2.commons.app_thread`: `request_id`, `page` or `app`, `asks`,
+`answers`), but the marker is dropped before the task. The backend's `event_to_task`
+(`services/shared/bridge_core.py`) copies only `room_question`, `hitl_action` and `card_click`
+from a message's content. Carrying it takes two changes (ag2-space/ag2space-backend#4045):
+- `event_to_task` copies the marker's fields, typed;
+- this bridge serializes them as stamped headers.
+
+Then only a marked message waits, and an unmarked one is delivered at once.
+
+On **any room task with a `thread_root` header** that reaches you, run first:
+
+```bash
+python3 build_request.py thread-task thread-task.txt   # [--tasks DIR] [--ledger DIR]
+```
+
+`--tasks` defaults to the inbox the watcher reads (`$SUTANDO_TASKS_DIR`, else
+`<workspace>/tasks`): fences not yet taken up are read there. It prints one verdict, exits 0, and
+posts nothing anywhere. The checks run in this order:
+
+1. `duplicate <request_id>`: a fence names this message (`source_message_id`), at any distance in
+   time. Write `[no-send]` and do nothing.
+2. `duplicate <request_id>`: this message holds a build fence's slot (its text is the description,
+   the slot was free, no question asked for it, within the settle time of the fence, answered or not). Write `[no-send]` and do nothing.
+3. `answer <request_id>`: a question is open for a request in this thread (switch on). Go on as
+   `answer` does.
+4. `wait`: **switch on only**. This thread is an app's thread (one of the owner's fences named
+   it, at any age), the sender is its owner, no fence names this message yet, and it is younger than `BUILD_THREAD_SETTLE_SECONDS` (env, then the manifest;
+   default 12). With the switch off a message never waits. A change's message arrives **before** its fence, so wait that long, run
+   `thread-task` again, and only then treat it as `none`. A message is never `wait` for longer than
+   the settle time from when `thread-task` first saw it (recorded in the ledger), whatever its
+   timestamp says.
+5. `none`: an ordinary message. Handle it as usual. A message in a thread no fence ever named is
+   `none` at once.
+
+Every verdict but `none` needs the attested owner tier, the fence's own owner, the same room
+(`source_room_id`) and the same `thread_root`. The claim keeps a fence's facts in the ledger and
+never in any output. That covers its thread, owner, arrival time, mode and `thread_message`. A
+fence whose plan fails before any claim still leaves them, so its message is never `none`.
+
+**The settle time** is a config value, not a measured latency. The client sends the message and the
+fence back to back, but they reach the agent on two paths (a room task through the appservice,
+a private task through the DM), and neither delay has been measured. Raise it if a change's
+message is ever judged before its fence lands.
+
+**Times** are the gateway's `timestamp` headers; only `wait` compares one with this host's clock,
+and the first-seen record bounds that.
+
+**A residual race.** A build's message that reaches the agent a few milliseconds before its fence
+does (they travel different paths) finds an unknown thread, so it is `none` at once. Nothing the
+task carries dates the thread root, so this can't be told apart. The rule below is the safety net.
+
+**A build or a change is started only by a fence.** A room message in an app's thread whose
+verdict is `none` is conversation. If it asks something, answer it as conversation. Never build,
+refine or change the app from it. So a wrong `none`, or an older client's Try again without
+`thread_message`, can never start a second build.

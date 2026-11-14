@@ -397,10 +397,121 @@ def _lane_dedupe_gate(task: dict):
         return INTAKE_DEFER  # noqa: F821
 
 
+_BUILD_REQUEST = _REPO / "skills" / "commons-app-builder" / "scripts" / "build_request.py"
+BUILD_THREAD_POLL_S = 0.25
+BUILD_THREAD_VERDICT_S = 2.0
+
+# Every build-thread check and wait in one round, together: half the round's 6 s wait.
+BUILD_THREAD_ROUND_S = 3.0
+_INTAKE_FIELDS = ("user_id", "thread_root", "source_room_id", "channel_id", "source_message_id", "timestamp",
+                  "channel_kind", "task")
+# The fence's opening line, matched as text only: the skill decides whether it is a fence.
+_FENCE_OPENER = "```commons-app-build"
+# All the verdict's child sees: where the workspace (and its envelope key) is, and the skill's two
+# settings. Never the gateway's token or any other secret the bridge holds.
+_INTAKE_ENV = ("HOME", "SUTANDO_WORKSPACE", "SUTANDO_TEST_MODE", "SUTANDO_DEFAULT_WORKSPACE",
+               "BUILD_THREAD_CONVERSATION", "BUILD_THREAD_SETTLE_SECONDS")
+_BUILD_THREAD_ROUND: dict = {"round": None, "until": None}  # one budget per served round, both passes
+
+
+def _build_thread_verdict(task: dict, tier: str, budget: float):
+    """(verdict, request_id) from the skill's `intake-verdict`, through the shared optional-script
+    runner (python -I, the env allowlist, the question on stdin); None when it cannot say in time."""
+    import json
+    from optional_script import run_optional_script
+    question = json.dumps({"fields": {k: task.get(k) for k in _INTAKE_FIELDS}, "tier": tier})
+    out = run_optional_script(
+        _BUILD_REQUEST, ["intake-verdict", "-", "--ledger", str(WS / "state" / "commons-app-builds"),
+                         "--tasks", str(TASKS_DIR)],  # noqa: F821
+        timeout=max(0.1, budget), input=question, isolated=True,
+        env={k: os.environ[k] for k in _INTAKE_ENV if k in os.environ},
+        on_error=lambda e: _log(f"build thread gate: {type(e).__name__}; delivering"))  # noqa: F821
+    if out is None:
+        return None
+    try:
+        answer = json.loads(out)
+        return (answer["verdict"], answer.get("request_id")) if isinstance(answer, dict) else None
+    except (ValueError, KeyError, TypeError):
+        _log("build thread gate: an unreadable verdict; delivering")  # noqa: F821
+        return None
+
+
+def _known_app_thread(task: dict) -> bool:
+    """Whether the skill's own index (`app-threads.json`, {room: {thread_root: newest fence time}})
+    names this message's thread as an app's, at any age: the skill removes a thread once it is no
+    app's. Read in this process, no subprocess; anything unreadable is no."""
+    import json
+    import math
+    room = task.get("source_room_id") or task.get("channel_id")
+    try:
+        known = json.loads((WS / "state" / "commons-app-builds" / "app-threads.json").read_text(encoding="utf-8"))  # noqa: F821
+        at = known.get(room, {}).get(task.get("thread_root"))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return False
+    return isinstance(at, (int, float)) and not isinstance(at, bool) and math.isfinite(at)
+
+
+def _build_thread_until(deadline: "float | None") -> float:
+    """This round's end for build-thread work, first pass and late pass together:
+    BUILD_THREAD_ROUND_S from its first check, and never past the round's deadline once there is one."""
+    rnd = _INTAKE_MODE.get("round")  # noqa: F821
+    if _BUILD_THREAD_ROUND["round"] != rnd:
+        _BUILD_THREAD_ROUND.update(round=rnd, until=time.monotonic() + BUILD_THREAD_ROUND_S)
+    until = _BUILD_THREAD_ROUND["until"]
+    return until if deadline is None else min(deadline, until)
+
+
+def _build_thread_gate(task: dict):
+    """A room message in an app's thread that is the app build's own copy (commons-app-builder's
+    thread-task verdict `duplicate`): settled unqueued, so the agent never acts on it. Only a thread
+    the skill's index names is checked; in a served round its check runs after the round's acks,
+    within this round's build-thread budget, and a `wait` is rechecked within it, then delivered.
+    Outside a round: one check, no wait. Fails open."""
+    fence_like = not task.get("thread_root") and _FENCE_OPENER in str(task.get("task") or "")
+    if not (task.get("thread_root") or fence_like) or not _BUILD_REQUEST.is_file():
+        return None
+    attested, _ = local_task_protocol.broker_attested_tier(  # noqa: F821
+        task.get("access_tier"), task.get("requested_access_tier"), task.get("collaborator"))
+    tier = _tier_for(task.get("user_id"), attested)  # noqa: F821
+    if tier != "owner":
+        return None
+    if fence_like:  # the skill notes a real fence's thread, so its copy is checked; always delivered
+        budget, mode = BUILD_THREAD_VERDICT_S, _INTAKE_MODE  # noqa: F821
+        if mode["defer"] or mode["deadline"] is not None:
+            budget = min(budget, _build_thread_until(mode["deadline"]) - time.monotonic())
+
+        if budget > 0:  # the round's budget spent: delivered unchecked, as on any failure
+            _build_thread_verdict(task, tier, budget)
+        return None
+    if not _known_app_thread(task):  # any other thread keeps its place in the round
+        return None
+    mode = _INTAKE_MODE  # noqa: F821
+
+    if mode["defer"]:  # the first pass costs nothing: the check waits for the round's acks
+        return INTAKE_DEFER  # noqa: F821
+
+    if mode["deadline"] is None:
+        verdict = _build_thread_verdict(task, tier, BUILD_THREAD_VERDICT_S)
+    else:
+        until = _build_thread_until(mode["deadline"])
+        verdict = None
+        while time.monotonic() < until:
+            verdict = _build_thread_verdict(task, tier, min(BUILD_THREAD_VERDICT_S, until - time.monotonic()))
+            if not verdict or verdict[0] != "wait":
+                break
+            time.sleep(min(BUILD_THREAD_POLL_S, max(0.0, until - time.monotonic())))
+    if verdict and verdict[0] == "duplicate":
+        return f"commons-app-builder: the app build's own message in its thread (request {verdict[1]})"
+    return None
+
+
 def _intake_gate(task: dict):
-    """A task from before this connection was added (its row's `not_before`), else the lane dedupe."""
+    """A task from before this connection was added (its row's `not_before`), else the lane dedupe,
+    else an app build's own thread message. The lane dedupe goes first, so its wait is never spent
+    on a build-thread check."""
     from connections import NOT_BEFORE_ENV, backlog_reason
-    return backlog_reason(task, os.environ.get(NOT_BEFORE_ENV, "")) or _lane_dedupe_gate(task)
+    return (backlog_reason(task, os.environ.get(NOT_BEFORE_ENV, "")) or _lane_dedupe_gate(task)
+            or _build_thread_gate(task))
 
 
 _STATUS_ACK_MANIFEST = _REPO / "skills" / "status-ack" / "manifest.json"
