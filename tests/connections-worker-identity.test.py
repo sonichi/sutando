@@ -796,7 +796,8 @@ class TwoServers(Base):
                         "https://relay.beta-fixture.net", "https://relay.beta-fixture.net:443",
                         "https://evil-relay.beta-fixture.net:8443", "https://relay.beta-fixture.net:8443.evil.example",
                         "https://chat.alpha-fixture.net:0", "http://chat.alpha-fixture.net:443",
-                        "ftp://chat.alpha-fixture.net:443", "http://relay.beta-fixture.net:8443"):
+                        "ftp://chat.alpha-fixture.net:443", "http://relay.beta-fixture.net:8443",
+                        "https://chat.alpha-fixture.net:4433", "https://relay.beta-fixture.net:84430"):
                 with self.assertRaises(C.NoWorkerCredential, msg=(key, url)) as e:
                     self._seat({"lane": "primary", key: url + "/v1/mcp/token"})
                 self.assertEqual(e.exception.reason, "descriptor_unresolved", (key, url))
