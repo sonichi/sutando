@@ -10,6 +10,7 @@ Run: python3 tests/schedule-crons-seed-policy.test.py
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -21,7 +22,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 SKILL = REPO / "skills" / "schedule-crons"
 OPT_IN = {"morning-briefing", "example-digest"}
-PRE_OPT_IN = REPO / "tests" / "fixtures" / "schedule-crons" / "crons.example.pre-opt-in.json"
+FIXTURES = REPO / "tests" / "fixtures" / "schedule-crons"
+PRE_OPT_IN = FIXTURES / "crons.example.pre-opt-in.json"
+OLDEST = FIXTURES / "crons.example.2b45993b.json"
 
 
 def step1_command() -> str:
@@ -96,6 +99,30 @@ class SeedPolicy(unittest.TestCase):
         self.assertNotIn("not-enabled", out)
         self.assertFalse((self.ws / "hosts" / "h1" / "crons.legacy.json").exists())
         self.assertFalse(self.names() & OPT_IN, self.names())
+
+    def test_oldest_shipped_template_is_not_called_owner_jobs(self):
+        self.legacy.write_text(OLDEST.read_text())
+        out = self.run_step1()
+        self.assertNotIn("not-enabled", out)
+        self.assertFalse(self.names() & OPT_IN, self.names())
+
+    def test_history_holds_every_current_template_entry(self):
+        history = {h["sha256"] for h in json.loads((SKILL / "crons.example.history.json").read_text())}
+        for e in self.example:
+            job = {k: v for k, v in e.items() if k != "opt_in"}
+            blob = json.dumps(job, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            self.assertIn(hashlib.sha256(blob.encode()).hexdigest(), history,
+                          f"append {e['name']}'s digest to crons.example.history.json")
+
+    def test_a_second_keep_never_names_a_file_holding_other_content(self):
+        kept_dir = self.ws / "hosts" / "h1"
+        kept_dir.mkdir(parents=True)
+        (kept_dir / "crons.legacy.json").write_text('[{"name":"older"}]')
+        own = {"name": "my-report", "cron": "0 9 * * *", "prompt": "x"}
+        self.legacy.write_text(json.dumps([own]))
+        out = self.run_step1()
+        path = Path(out.split("kept at ", 1)[1].strip())
+        self.assertIn(own, json.loads(path.read_text()))
 
     def test_first_install_only_seeds_just_the_named_starter_jobs(self):
         out = subprocess.run(

@@ -18,11 +18,12 @@ Codex launcher seeds only ``main-loop``. It never narrows a migrated interim fil
 
 The in-checkout ``skills/schedule-crons/crons.json`` is never published. It is git-ignored and
 older releases' installer filled it from the example, so its jobs prove no opt-in. Its entries
-that are neither a published entry nor a shipped example entry (compared without the
-template-only ``opt_in`` key, so a pre-``opt_in`` template still matches) may be an owner's
-own schedule, including a customised entry under a starter name: the file is
-copied once to ``hosts/<host>/crons.legacy.json`` and their names are printed on a
-``not-enabled`` line, so the agent can ask the owner. Nothing from it is registered.
+that match neither a published entry nor any template entry ever shipped
+(``crons.example.history.json`` holds their digests; compared without the template-only ``opt_in`` key) may include
+jobs of the owner's own, such as a customised entry under a starter name. The file is kept as
+``hosts/<host>/crons.legacy.json`` (a new dated name if that holds other content) and their names
+are printed on a ``not-enabled`` line, so the agent can ask the owner. Nothing from it is
+registered without the owner's word.
 
 The per-host file is published with temp file + ``os.link``, which refuses an existing name,
 so a concurrent seeder or the owner is never clobbered.
@@ -31,16 +32,19 @@ so a concurrent seeder or the owner is never clobbered.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 REPO = SKILL_DIR.parents[1]
 MARKER = ".crons-seeded"
 LEGACY_KEPT = "crons.legacy.json"
+HISTORY = "crons.example.history.json"
 
 
 def _config(key: str) -> str:
@@ -83,12 +87,18 @@ def starter_entries(example: list, only: tuple[str, ...] | None = None) -> list:
             and (not only or e.get("name") in only)]
 
 
-def legacy_not_enabled(legacy: list, published: list, example: list) -> list[str]:
-    """Names of legacy entries whose job is neither published nor a shipped example entry."""
-    known = [_job(e) for e in published + example if isinstance(e, dict)]
+def job_digest(entry: dict) -> str:
+    blob = json.dumps(_job(entry), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def legacy_not_enabled(legacy: list, published: list, example: list,
+                       shipped: frozenset = frozenset()) -> list[str]:
+    """Names of legacy entries whose job is neither published nor any shipped template entry."""
+    known = {job_digest(e) for e in published + example if isinstance(e, dict)} | shipped
     return [
         e["name"] for e in legacy
-        if isinstance(e, dict) and isinstance(e.get("name"), str) and _job(e) not in known
+        if isinstance(e, dict) and isinstance(e.get("name"), str) and job_digest(e) not in known
     ]
 
 
@@ -107,6 +117,10 @@ def seed(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR,
 
     example_path = skill_dir / "crons.example.json"
     example = _entries(example_path.read_bytes(), example_path)
+    history_path = skill_dir / HISTORY
+    shipped = frozenset(
+        h.get("sha256") for h in (_entries(history_path.read_bytes(), history_path)
+                                  if history_path.is_file() else []) if isinstance(h, dict))
     interim = workspace / "crons" / f"{host_label}.json"
     if not marker.exists() and interim.is_file():
         source, content = interim, interim.read_bytes()
@@ -125,12 +139,14 @@ def seed(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR,
     if legacy_path.is_file():
         raw = legacy_path.read_bytes()
         try:
-            not_enabled = legacy_not_enabled(_entries(raw, legacy_path), published, example)
+            not_enabled = legacy_not_enabled(_entries(raw, legacy_path), published, example, shipped)
         except ValueError:
             not_enabled = []
         if not_enabled:
             kept = host_dir / LEGACY_KEPT
-            _publish(kept, raw)
+            if not _publish(kept, raw) and kept.read_bytes() != raw:
+                kept = host_dir / f"crons.legacy.{int(time.time())}.json"
+                _publish(kept, raw)
     return "seeded", target, source, not_enabled, kept
 
 
