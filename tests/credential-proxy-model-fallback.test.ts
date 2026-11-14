@@ -1,0 +1,331 @@
+/**
+ * The proxy rewrites a request body's `model` to the active fallback tier's
+ * model, keeps updating quota state from the response headers, records the
+ * tier in quota-state.json and tells the owner once per change. Upstream,
+ * keychain, clock, config and the state/notify sinks are injected.
+ */
+import { test, afterEach } from 'node:test';
+import assert from 'node:assert';
+import { createServer as createHttpServer, request as httpRequest, type Server, type IncomingMessage } from 'node:http';
+import type { request as httpsRequest } from 'node:https';
+import { createProxyServer, type ProxyDeps } from '../skills/quota-tracker/scripts/credential-proxy.ts';
+import { DEFAULT_FALLBACK_CONFIG, type FallbackConfig, type FallbackState } from '../skills/quota-tracker/scripts/quota-fallback-policy.ts';
+
+let NOW = 1_700_000_000_000;
+const servers: Server[] = [];
+afterEach(async () => {
+	await Promise.all(servers.splice(0).map((s) => new Promise((r) => s.close(r))));
+});
+
+function listen(s: Server): Promise<number> {
+	servers.push(s);
+	return new Promise((resolve) => s.listen(0, '127.0.0.1', () => resolve((s.address() as { port: number }).port)));
+}
+
+interface Seen { body: string; headers: IncomingMessage['headers'] }
+
+interface Harness {
+	port: number;
+	seen: Seen[];
+	quotaWrites: Array<[Record<string, string>, string | undefined, string | undefined]>;
+	recorded: FallbackState[];
+	notified: string[];
+	setUpstreamHeaders: (h: Record<string, string>) => void;
+	setUpstreamStatus: (code: number) => void;
+}
+
+// Projection off: these cases are about the rewrite plumbing, not the 5h fit.
+const CFG: FallbackConfig = { ...DEFAULT_FALLBACK_CONFIG, projection5h: { ...DEFAULT_FALLBACK_CONFIG.projection5h, enabled: false } };
+
+async function start(cfg: FallbackConfig = CFG, initial: FallbackState | null = null): Promise<Harness> {
+	let upstreamHeaders: Record<string, string> = {};
+	let upstreamStatus = 200;
+	const seen: Seen[] = [];
+	const upstreamPort = await listen(createHttpServer((req, res) => {
+		const chunks: Buffer[] = [];
+		req.on('data', (c) => chunks.push(c));
+		req.on('end', () => {
+			seen.push({ body: Buffer.concat(chunks).toString(), headers: req.headers });
+			res.writeHead(upstreamStatus, { 'content-type': 'application/json', ...upstreamHeaders });
+			res.end('{"ok":true}');
+		});
+	}));
+	const h: Harness = {
+		port: 0, seen, quotaWrites: [], recorded: [], notified: [],
+		setUpstreamHeaders: (x) => { upstreamHeaders = x; },
+		setUpstreamStatus: (code) => { upstreamStatus = code; },
+	};
+	const deps: Partial<ProxyDeps> = {
+		readCredCandidates: () => [{ service: 'svc', oauth: { accessToken: 'tok', expiresAt: NOW + 3600_000 } }],
+		writeCred: () => true,
+		refreshAccessToken: async () => null,
+		request: httpRequest as unknown as typeof httpsRequest,
+		upstreamUrl: new URL(`http://127.0.0.1:${upstreamPort}`),
+		updateQuotaState: (headers, model, effective) => { h.quotaWrites.push([headers, model, effective]); },
+		recordRejection: () => {},
+		recordCredentialState: () => {},
+		now: () => NOW,
+		idleTimeoutMs: 5000,
+		fallbackConfig: () => cfg,
+		readFallbackState: () => initial,
+		recordFallback: (s) => { h.recorded.push(s); },
+		notifyOwner: (line) => { h.notified.push(line); },
+		readHistorySamples: () => [],
+	};
+	h.port = await listen(createProxyServer(deps));
+	return h;
+}
+
+function call(port: number, body: string, headers: Record<string, string> = {}): Promise<number> {
+	return new Promise((resolve, reject) => {
+		const req = httpRequest({ hostname: '127.0.0.1', port, path: '/v1/messages', method: 'POST', headers: { authorization: 'Bearer client', ...headers } }, (res) => {
+			res.resume();
+			res.on('end', () => resolve(res.statusCode ?? 0));
+		});
+		req.on('error', reject);
+		req.end(body);
+	});
+}
+
+const H7 = (u: string) => ({
+	'anthropic-ratelimit-unified-status': 'allowed',
+	'anthropic-ratelimit-unified-7d-utilization': u,
+	'anthropic-ratelimit-unified-7d-reset': '1700600000',
+	'anthropic-ratelimit-unified-5h-utilization': '0.20',
+	'anthropic-ratelimit-unified-5h-reset': '1700018000',
+});
+
+test('at 0.50 the request goes upstream unchanged; at 0.86 the next Fable request is rewritten to the level-2 model and content-length follows', async () => {
+	const h = await start();
+	const fable = '{"model":"claude-fable-5-1[1m]","messages":[{"role":"user","content":"hi"}]}';
+	h.setUpstreamHeaders(H7('0.50'));
+	assert.strictEqual(await call(h.port, fable), 200);
+	assert.strictEqual(JSON.parse(h.seen[0].body).model, 'claude-fable-5-1[1m]', 'below every line: untouched');
+	assert.strictEqual(h.recorded.length, 1, 'the first observation records the (primary) tier once');
+	assert.strictEqual(h.recorded[0].tier, 1);
+	assert.deepStrictEqual(h.notified, [], 'primary from the start: nothing to tell the owner');
+
+	h.setUpstreamHeaders(H7('0.86'));
+	assert.strictEqual(await call(h.port, fable), 200);
+	assert.strictEqual(JSON.parse(h.seen[1].body).model, 'claude-fable-5-1[1m]', 'the response that crossed the line was already sent');
+	assert.strictEqual(h.recorded.at(-1)?.tier, 2);
+	assert.strictEqual(h.notified.length, 1);
+	assert.match(h.notified[0], /^Quota 7d window 86% is over the 85% line — Fable requests now run on claude-opus-5-5/);
+
+	assert.strictEqual(await call(h.port, fable), 200);
+	const sent = h.seen[2];
+	assert.strictEqual(JSON.parse(sent.body).model, 'claude-opus-5-5[1m]', 'rewritten to the tier-2 model, variant kept');
+	assert.deepStrictEqual(JSON.parse(sent.body).messages, [{ role: 'user', content: 'hi' }]);
+	assert.strictEqual(Number(sent.headers['content-length']), Buffer.byteLength(sent.body), 'content-length matches the rewritten body');
+	// The stamp is the seat's identity, so it names what the seat ASKED for; the
+	// model that actually ran travels beside it (#5275 review: stamping the rewritten
+	// model moved an Opus seat's quota and rejections onto Sonnet).
+	assert.strictEqual(h.quotaWrites.at(-1)?.[1], 'claude-fable-5-1[1m]', 'the quota stamp names the requested model');
+	assert.strictEqual(h.quotaWrites.at(-1)?.[2], 'claude-opus-5-5[1m]', 'and carries the model that ran, variant kept');
+	assert.strictEqual(h.quotaWrites[0]?.[2], undefined, 'an unrewritten request carries no effective model');
+	assert.strictEqual(h.quotaWrites.at(-1)?.[0]['anthropic-ratelimit-unified-7d-utilization'], '0.86', 'response headers still update state');
+	assert.strictEqual(h.notified.length, 1, 'one DM per tier change, not per request');
+
+	// Opus is already at the tier: never touched. Sonnet is below it: never raised.
+	await call(h.port, '{"model":"claude-opus-5-5","messages":[]}');
+	assert.strictEqual(JSON.parse(h.seen[3].body).model, 'claude-opus-5-5');
+	await call(h.port, '{"model":"claude-sonnet-5","messages":[]}');
+	assert.strictEqual(JSON.parse(h.seen[4].body).model, 'claude-sonnet-5');
+});
+
+test('above the 7d level2 line every Claude request above Sonnet runs on the level-3 model', async () => {
+	const h = await start();
+	h.setUpstreamHeaders(H7('0.96'));
+	await call(h.port, '{"model":"claude-opus-5-5","messages":[]}');
+	await call(h.port, '{"model":"claude-opus-5-5","messages":[]}');
+	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}');
+	assert.strictEqual(JSON.parse(h.seen[1].body).model, 'claude-sonnet-5');
+	assert.strictEqual(JSON.parse(h.seen[2].body).model, 'claude-sonnet-5');
+	assert.match(h.notified[0], /Fable and Opus requests now run on claude-sonnet-5/);
+});
+
+test('DM gate: recovery and escalation inside the interval are sent; a de-escalation is held and flushed by the timer', async () => {
+	NOW = 1_700_000_000_000;
+	const h = await start({ ...CFG, dmMinIntervalSec: 1 }); // 1 s so the flush timer fires inside the test
+	const opus = '{"model":"claude-opus-5-5","messages":[]}';
+	h.setUpstreamHeaders(H7('0.86')); await call(h.port, opus);                 // 1 → 2
+	NOW += 100; h.setUpstreamHeaders(H7('0.96')); await call(h.port, opus);     // 2 → 3, inside the interval
+	assert.strictEqual(h.notified.length, 2, 'an escalation is never held');
+	assert.match(h.notified[1], /^Quota 7d window 96% is over the 95% line/);
+	NOW += 100; h.setUpstreamHeaders(H7('0.90')); await call(h.port, opus);     // 3 → 2 (under the 0.92 clear line): held
+	assert.strictEqual(h.notified.length, 2, 'a de-escalation inside the interval is held');
+	assert.strictEqual(h.recorded.at(-1)?.tier, 2, '...but the state still moved');
+	NOW += 100; h.setUpstreamHeaders(H7('0.50')); await call(h.port, opus);     // 2 → 1: recovery
+	assert.strictEqual(h.notified.length, 3, 'recovery to the primary models is never held');
+	assert.match(h.notified[2], /^Quota eased \(5h 20%, 7d 50%\) — back on the primary models\. \[1 earlier change\(s\) held since the last message: Quota 7d window 90%/);
+
+	// A held line with no later event is flushed when the interval elapses.
+	NOW += 100; h.setUpstreamHeaders(H7('0.96')); await call(h.port, opus);     // 1 → 3
+	NOW += 100; h.setUpstreamHeaders(H7('0.90')); await call(h.port, opus);     // 3 → 2 (under the 0.92 clear line): held
+	assert.strictEqual(h.notified.length, 4);
+	NOW += 1100;                                                                 // the interval (1 s) elapses in proxy time
+	await new Promise((r) => setTimeout(r, 1300));                               // ...and the real timer fires
+	assert.strictEqual(h.notified.length, 5, 'the held de-escalation was flushed without a new event');
+	assert.match(h.notified[4], /^Quota 7d window 90% is over the 85% line — Fable requests now run on claude-opus-5-5/);
+	NOW = 1_700_000_000_000;
+});
+
+test('rejected: no model is swapped, the Codex runtime-switch request is recorded, and the owner is told once', async () => {
+	const h = await start();
+	h.setUpstreamHeaders({ ...H7('0.99'), 'anthropic-ratelimit-unified-status': 'rejected' });
+	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}');
+	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}');
+	assert.strictEqual(JSON.parse(h.seen[1].body).model, 'claude-fable-5-1', 'all Claude models share the rejected quota');
+	assert.strictEqual(h.recorded.at(-1)?.runtime_switch?.to, 'codex');
+	assert.strictEqual(h.recorded.at(-1)?.tier, 1);
+	assert.strictEqual(h.notified.length, 1);
+	assert.match(h.notified[0], /Codex/);
+});
+
+// #5275 review point 2: a raw `rejected` is not an unavailable account. With HTTP 200
+// and overage allowed the request was SERVED on extra usage — the quota writer records
+// limit_state overage, available true — so asking for a runtime switch was wrong.
+const OVERAGE_SERVED = {
+	...H7('0.99'),
+	'anthropic-ratelimit-unified-status': 'rejected',
+	'anthropic-ratelimit-unified-7d-status': 'rejected',
+	'anthropic-ratelimit-unified-overage-status': 'allowed',
+};
+
+test('served on overage (HTTP 200, status rejected, overage allowed): no runtime switch, no Codex DM', async () => {
+	const h = await start();
+	h.setUpstreamHeaders(OVERAGE_SERVED);
+	assert.strictEqual(await call(h.port, '{"model":"claude-fable-5-1","messages":[]}'), 200);
+	assert.strictEqual(await call(h.port, '{"model":"claude-fable-5-1","messages":[]}'), 200);
+	assert.strictEqual(h.recorded.at(-1)?.runtime_switch ?? null, null, 'overage is served, not paused');
+	assert.ok(!h.notified.some((l) => /Codex/.test(l)), `no runtime-switch DM, got ${JSON.stringify(h.notified)}`);
+});
+
+test('control: the same headers on a real 429 do request the runtime switch', async () => {
+	const h = await start();
+	h.setUpstreamHeaders(OVERAGE_SERVED);
+	h.setUpstreamStatus(429);
+	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}');
+	assert.strictEqual(h.recorded.at(-1)?.runtime_switch?.to, 'codex', 'an actual 429 is rejection evidence');
+	assert.ok(h.notified.some((l) => /Codex/.test(l)));
+});
+
+// #5275 review point 3: a same-tier handoff between windows must reach disk. The
+// health check reads the PERSISTED windows to decide "cleared", so a record that
+// still says the expired 7d window holds the tier reports cleared while the proxy
+// keeps rewriting on the 5h window's account.
+test('same-tier handoff: 7d resets while 5h takes tier 3 over — the persisted state follows the 5h window', async () => {
+	const h = await start();
+	h.setUpstreamHeaders({
+		'anthropic-ratelimit-unified-status': 'allowed',
+		'anthropic-ratelimit-unified-7d-utilization': '0.96', 'anthropic-ratelimit-unified-7d-reset': '1700600000',
+		'anthropic-ratelimit-unified-5h-utilization': '0.20', 'anthropic-ratelimit-unified-5h-reset': '1700018000',
+	});
+	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}');
+	const first = h.recorded.at(-1)!;
+	assert.strictEqual(first.tier, 3, '7d over its level2 line');
+	assert.strictEqual(first.windows['7d'].tier, 3);
+	assert.strictEqual(first.fired?.window, '7d');
+
+	// The 7d window resets (new reset epoch, usage drops) as 5h crosses its level2 line.
+	h.setUpstreamHeaders({
+		'anthropic-ratelimit-unified-status': 'allowed',
+		'anthropic-ratelimit-unified-7d-utilization': '0.10', 'anthropic-ratelimit-unified-7d-reset': '1701200000',
+		'anthropic-ratelimit-unified-5h-utilization': '0.98', 'anthropic-ratelimit-unified-5h-reset': '1700036000',
+	});
+	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}');
+	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}');
+	assert.notStrictEqual(JSON.parse(h.seen[2].body).model, 'claude-fable-5-1', 'still rewriting: the tier held');
+
+	const saved = h.recorded.at(-1)!;
+	assert.strictEqual(saved.tier, 3, 'the effective tier is unchanged');
+	assert.strictEqual(saved.windows['7d'].tier, 1, 'the reset 7d window is saved as primary');
+	assert.strictEqual(saved.windows['7d'].reset, '1701200000', 'with its NEW reset epoch');
+	assert.strictEqual(saved.windows['5h'].tier, 3, 'the 5h window that now holds the tier is saved');
+	assert.strictEqual(saved.windows['5h'].reset, '1700036000');
+	assert.strictEqual(saved.fired?.window, '5h', 'the saved reason names the window that holds the tier now');
+	assert.ok(!h.notified.some((l, i) => i > 0 && /now run on|over the/.test(l) && /7d/.test(l)),
+		'no second DM for a handoff that changed nothing the owner acts on');
+});
+
+test('a response that changes nothing persisted is not written again', async () => {
+	const h = await start();
+	h.setUpstreamHeaders(H7('0.50'));
+	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}');
+	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}');
+	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}');
+	assert.strictEqual(h.recorded.length, 1, 'identical observations do not rewrite the record');
+});
+
+test('a persisted tier survives a proxy restart, the priority header is consumed by the proxy, and the low ladder is off by default', async () => {
+	const seeded = await start();
+	seeded.setUpstreamHeaders(H7('0.86'));
+	await call(seeded.port, '{"model":"claude-opus-5-5","messages":[]}');
+	const persisted = seeded.recorded.at(-1)!;
+	assert.strictEqual(persisted.tier, 2);
+
+	const h = await start(CFG, persisted);
+	h.setUpstreamHeaders(H7('0.84'));
+	await call(h.port, '{"model":"claude-fable-5-1","messages":[]}', { 'x-sutando-priority': 'low' });
+	assert.strictEqual(JSON.parse(h.seen[0].body).model, 'claude-opus-5-5', 'tier 2 held across the restart (0.84 is inside the hysteresis band)');
+	assert.strictEqual(h.seen[0].headers['x-sutando-priority'], undefined, 'our marker never travels upstream');
+	assert.deepStrictEqual(h.notified, [], 'no transition: no DM');
+
+	const low = await start({ ...CFG, lowPriorityEnabled: true });
+	low.setUpstreamHeaders(H7('0.61'));
+	await call(low.port, '{"model":"claude-fable-5-1","messages":[]}');
+	await call(low.port, '{"model":"claude-fable-5-1","messages":[]}', { 'x-sutando-priority': 'low' });
+	await call(low.port, '{"model":"claude-fable-5-1","messages":[]}');
+	assert.strictEqual(JSON.parse(low.seen[1].body).model, 'claude-opus-5-5', 'low priority demotes from 0.60 when the ladder is on');
+	assert.strictEqual(JSON.parse(low.seen[2].body).model, 'claude-fable-5-1', 'normal traffic is untouched at 0.61');
+});
+
+// Both windows share one gate: a held de-escalation is cleared by the next escalation or recovery,
+// whichever window drives it, so the timer can never flush a line that contradicts the current tier.
+const H2 = (u5: string, u7: string) => ({
+	'anthropic-ratelimit-unified-status': 'allowed',
+	'anthropic-ratelimit-unified-5h-utilization': u5, 'anthropic-ratelimit-unified-5h-reset': '1700018000',
+	'anthropic-ratelimit-unified-7d-utilization': u7, 'anthropic-ratelimit-unified-7d-reset': '1700600000',
+});
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+test('two windows: a 5h escalation after a held 7d-filed de-escalation clears it — no stale "now on Opus" flush while requests run on Sonnet', async () => {
+	NOW = 1_700_000_000_000;
+	const h = await start({ ...CFG, dmMinIntervalSec: 1 });
+	const opus = '{"model":"claude-opus-5-5","messages":[]}';
+	h.setUpstreamHeaders(H2('0.20', '0.94')); await call(h.port, opus);              // 7d → tier 2 (sent)
+	NOW += 100; h.setUpstreamHeaders(H2('0.98', '0.94')); await call(h.port, opus);  // 5h hard line → tier 3 (sent)
+	NOW += 100; h.setUpstreamHeaders(H2('0.93', '0.94')); await call(h.port, opus);  // 3 → 2, filed by the 7d window: held
+	assert.strictEqual(h.notified.length, 2);
+	assert.strictEqual(h.recorded.at(-1)?.tier, 2);
+	assert.strictEqual(h.recorded.at(-1)?.fired?.window, '7d', 'the held de-escalation is the 7d window\'s');
+	NOW += 100; h.setUpstreamHeaders(H2('0.98', '0.94')); await call(h.port, opus);  // 5h back to tier 3: escalation (sent)
+	assert.strictEqual(h.notified.length, 3);
+	assert.strictEqual(h.recorded.at(-1)?.fired?.window, '5h');
+	assert.match(h.notified[2], /Fable and Opus requests now run on claude-sonnet-5.*\[1 earlier change\(s\) held since the last message: Quota 7d window 94%/);
+	await call(h.port, opus);
+	assert.strictEqual(JSON.parse(h.seen.at(-1)!.body).model, 'claude-sonnet-5', 'requests run on the tier-3 model');
+	NOW += 1100; await sleep(1300);                                                   // the interval elapses: nothing may flush
+	assert.strictEqual(h.notified.length, 3, 'no stale held line was flushed');
+	NOW = 1_700_000_000_000;
+});
+
+test('two windows: a recovery after the firing window switched clears every held de-escalation', async () => {
+	NOW = 1_700_000_000_000;
+	const h = await start({ ...CFG, dmMinIntervalSec: 1 });
+	const opus = '{"model":"claude-opus-5-5","messages":[]}';
+	h.setUpstreamHeaders(H2('0.20', '0.94')); await call(h.port, opus);              // 7d → tier 2
+	NOW += 100; h.setUpstreamHeaders(H2('0.98', '0.94')); await call(h.port, opus);  // 5h → tier 3
+	NOW += 100; h.setUpstreamHeaders(H2('0.93', '0.94')); await call(h.port, opus);  // → tier 2 filed by 7d: held
+	NOW += 100; h.setUpstreamHeaders(H2('0.98', '0.94')); await call(h.port, opus);  // 5h → tier 3: sent
+	NOW += 100; h.setUpstreamHeaders(H2('0.93', '0.80')); await call(h.port, opus);  // → tier 2 filed by 5h: held
+	assert.strictEqual(h.recorded.at(-1)?.fired?.window, '5h');
+	assert.strictEqual(h.notified.length, 3);
+	NOW += 100; h.setUpstreamHeaders(H2('0.50', '0.50')); await call(h.port, opus);  // both ease → recovery
+	assert.strictEqual(h.recorded.at(-1)?.tier, 1);
+	assert.strictEqual(h.notified.length, 4, 'recovery is sent at once');
+	assert.match(h.notified[3], /^Quota eased \(5h 50%, 7d 50%\) — back on the primary models\. \[1 earlier change\(s\) held/);
+	NOW += 1100; await sleep(1300);
+	assert.strictEqual(h.notified.length, 4, 'no stale held line (from either window) was flushed after recovery');
+	NOW = 1_700_000_000_000;
+});
