@@ -311,6 +311,8 @@ async function askMyAgent(row, attempt) {
   lines and no long run of spaces; the host refuses the request otherwise (`invalid request`).
   Row text is other people's, so strip those characters before you build `text` (the
   `review-list` template's `clean()` shows how).
+- `agent.list()` is empty both when the viewer has no agent and when they have not yet
+  allowed the page. The page cannot tell the two apart, so one message has to cover both.
 - Check that `art.agent` exists before you draw the button. An older room has no such call:
   leave the button out and say so once, rather than draw one that does nothing.
 
@@ -330,9 +332,11 @@ arrives there too**. It never appears in the room, and the page never receives i
 
 **What the page learns back.** Only whether the request went out.
 
-- `{ok: true, eventId}`: accepted. `eventId` is an opaque receipt, not a task id: you cannot
-  look anything up with it. Say where the answer will arrive: "Sent to *name*. The answer comes
-  to your chat with it, not to this page."
+- `{ok: true, eventId}`: accepted. Accepted means the request reached the agent's queue, not
+  that it was answered: the answer arrives later, in the viewer's own chat with the agent.
+  `eventId` is an opaque receipt, not a task id: you cannot look anything up with it. Say
+  where the answer will arrive: "Sent to *name*. The answer comes to your chat with it, not to
+  this page."
 - `{ok: false, reason}`: nothing was sent, or it is not known. Show a sentence for the reason.
 - The same `key` again returns the recorded result without asking again. That is the point of
   the key, and it is why it must be stable.
