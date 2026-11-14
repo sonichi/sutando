@@ -338,6 +338,34 @@ The resume task of a switch wait says "signed in with the new account" and is ha
 now signed in with the new account."). The label is personal: in a shared room it goes on the private
 card with `note`, never in the room.
 
+## Step 3d: an app that signed you out
+
+`composio_exec` failing with `connect_required` is Step 3a (never connected). Failing because the app's
+sign-in lapsed (the error says expired, revoked, invalid grant or token, unauthorized, 401, re-authenticate)
+is this step, in the owner's DM only: the script refuses any other room (`not_owner_dm`; from a room with
+other people use Step 3b, `card --private`):
+
+```bash
+python3 "$C" reauth gmail --room '<room id>' --reply-to '<source_message_id>' --task '<task id>' \
+  --owner-from-task --error '<the error text>' [--account '<accountLabel from status>'] \
+  --stopped "I couldn't check your inbox." --request-file - <<'SUTANDO_REQUEST'
+<the owner request, verbatim>
+SUTANDO_REQUEST
+```
+
+It arms the same wait as `card`, so the request resumes by itself once the app is connected again, and
+prints `message`: a Signed out card (agent panel, state error: the app's logo, a "Signed out" status, the
+account, what it stopped, a "Reconnect <App>" button that signs the owner in to the app right on the card).
+Post it with ONE `room.message.send` exactly as in Step 3a, then write the result "Once it's reconnected
+I'll carry on." (adapted). The app sends nothing when the sign-in succeeds: the wait armed here is what
+resumes the request once the app shows connected, whichever way they signed in. Exit 1 with `reason`: `use_card` (it
+was `connect_required`: Step 3a), `not_an_auth_error` (answer with the error as usual), `still_active` (the
+app still lists the sign-in as active, so a wait would resume into the same error: tell the owner
+"<App> refused my sign-in; reconnect it in Settings → Integrations." and stop).
+
+"Connect <app name>" arriving as the owner's words from a card's "+ Connect an app" search (it found no
+match) is an ordinary connect request: Step 1 with that name.
+
 ## Two accounts of one app
 
 The owner may keep two accounts of one app connected (a personal and a work Gmail). `composio_find`
