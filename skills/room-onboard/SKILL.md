@@ -33,12 +33,16 @@ Write `[no-send]` as the result and stop when any of these holds:
    and inviter, and say in the greeting that it is a guess.
 3. **Greet once**, as the task result (top level, short, in the room's language):
    - "I'm <your name>, <owner's display name>'s agent; <inviter> just invited me."
+     `<your name>` is what `python3 src/agent_display_name.py --room <channel_id>` prints: your
+     s.space display name, never a persona or Stand name.
    - What you understand the room is for (or your guess, flagged as one).
    - 2-3 concrete offers that fit that purpose, e.g. summarize the thread so far, keep a task
      tracker page in Room Commons, draft the doc the room is discussing.
 4. **Record it**: append the `agent_trigger_id` (or the room id) as one line to
    `<workspace>/state/room-onboard/greeted.txt`.
-5. **Tell your owner** with one proactive line to their DM (`results/proactive-<ts>.txt`):
+5. **Tell your owner** with one proactive line to their DM, published with
+   `python3 src/result_publish.py results/proactive-<ts>.txt` (body on stdin), so a pool worker's
+   note carries its worker's stamp and its own lane sends it as the worker's agent:
    "Joined <room name>: <purpose>. Want me to <one concrete thing>?"
 
 ## Rules

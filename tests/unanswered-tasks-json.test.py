@@ -101,7 +101,7 @@ with tempfile.TemporaryDirectory() as d:
     root = Path(d)
     task(root, "task-chat-w", intake_ago=600)
     real = uat._holder
-    uat._holder = lambda ws, tid: "worker-2"
+    uat._holder = lambda ws, tid, *_: "worker-2"
     try:
         snap = uat.snapshot(root, 120, now=NOW, holders=SESSION)
     finally:
@@ -145,7 +145,7 @@ for name in (f"{CANON}.claimed-core-2.txt", f"{CANON}.assigned-inst-a.txt"):
             root = Path(d)
             renamed(root, name, declare=declare)
             seen, real = [], uat._holder
-            uat._holder = lambda ws, tid: (seen.append(tid), "worker-2" if tid == CANON else None)[1]
+            uat._holder = lambda ws, tid, *_: (seen.append(tid), "worker-2" if tid == CANON else None)[1]
             try:
                 snap = uat.snapshot(root, 120, now=NOW, holders=SESSION)
             finally:
@@ -234,7 +234,7 @@ with tempfile.TemporaryDirectory() as d:
     task(root, "task-chat-a", intake_ago=600)
     real = uat._holder
 
-    def unreadable(ws, tid):
+    def unreadable(ws, tid, *_):
         raise PermissionError("deliveries/")
     uat._holder = unreadable
     try:

@@ -33,6 +33,14 @@ entry. Autonomy pause and self-development settings do not exempt the health
 pass. These checks diagnose missing configuration; they do not recreate a driver
 or modify the host's schedules.
 
+The loop is also the one session cron that can never be made to yield to queued
+owner work: `/schedule-crons` registers every other `crons.json` entry that
+fires more than once a day behind the cron gate's check preamble (see that
+skill's "Defer crons" section; a daily-or-rarer entry is not gated unless it
+sets `"gate": true`) so a scheduled job stops when owner tasks are waiting, and
+the loop is exempt because it is what drains that queue — gating it would
+deadlock the owner's own messages.
+
 The archived rationale below predates this completion contract where it refers
 to ordinary `idle` as the final pass command.
 
@@ -418,6 +426,8 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
        --state "$WORKSPACE/state/idle-streak.json"
    # -> post <hash>   (changed set: surface it)   |   quiet <hash>  (unchanged)
 
+   # Check owner_channel.py --workspace "$WORKSPACE" before posting.
+   # A refusal means no send and no surface-hash commit.
    # 2. Post the message. THEN, and only then, stamp the set as surfaced:
    echo '[["3166","owner"],["3274","owner"]]' |
      python3 skills/proactive-loop/scripts/idle-surface-hash.py \
@@ -716,3 +726,14 @@ Skip step 6 (end the pass early after step 3) if and only if one of these applie
    **Note**: contextual-chips refresh used to be step 11 in this loop. As of 2026-05-05 it is owned exclusively by Sutando.app's 120s timer (PR #600). The proactive-loop must NOT write `contextual-chips.json` — Sutando.app is the single writer. If a future case calls for chip-state the menu-bar app can't see (e.g. decision-state from the pending questions), surface it via a different file Sutando.app reads, not by competing as a writer.
 
    **Do NOT fall back to `results/proactive-*.txt` for heartbeats if `bot2bot-post` is not installed.** That legacy path is polled by both Discord and Telegram bridges and produces duplicate deliveries to the owner's DMs (9-per-heartbeat in practice on 2026-04-20). If the skill is missing, skip the heartbeat silently; fold the summary into the next task-reply instead.
+
+## Bound-room speech gate
+
+Recent owner activity identifies a destination, not who owns its voice.
+`src/owner_channel.py` consults the workspace bindings before the core posts:
+unbound rooms are allowed; a bound room is refused while its worker is alive
+or its liveness is unknown. Only a readable sentinel whose PID is positively
+dead releases the room for recovery. Missing or unreadable evidence is not
+proof of death. The supervisor relay uses the same policy after validating
+the destination. A refused proactive FYI must not commit its surface hash,
+because no message was sent.

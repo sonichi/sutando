@@ -98,25 +98,62 @@ PROACTIVE_DESTINATIONS = frozenset(BRIDGE_CHANNELS)
 _DESTINATION_RE = re.compile(r"\.to-([a-z0-9_-]+)\.txt\Z")
 
 
-def proactive_filename(ts, channel: "str | None" = None) -> str:
+# The .by-<worker> tag, before any .to- tag, names the pool worker whose session wrote the file:
+# only that worker's own lane delivers it, into its own agent's owner DM, as that agent.
+_WORKER_TAG_RE = re.compile(r"\.by-([a-z0-9][a-z0-9-]{0,31})(?:\.to-[a-z0-9_-]+)?\.txt\Z")
+_WORKER_ID_RE = re.compile(r"\A[a-z0-9][a-z0-9-]{0,31}\Z")
+
+
+def proactive_filename(ts, channel: "str | None" = None, worker: "str | None" = None) -> str:
     """Typed constructor — the only way to spell a destined proactive name.
     Writer and every claiming reader share this grammar (phone-key precedent:
     a private spelling on either side re-creates the cross-bridge race)."""
+    if worker is not None and not _WORKER_ID_RE.match(worker):
+        raise ValueError(f"not a worker id: {worker!r}")
+    by = f".by-{worker}" if worker else ""
     if channel is None:
-        return f"proactive-{ts}.txt"
+        return f"proactive-{ts}{by}.txt"
     if channel not in PROACTIVE_DESTINATIONS:
         raise ValueError(f"unknown proactive destination {channel!r}")
-    return f"proactive-{ts}.to-{channel}.txt"
+    return f"proactive-{ts}{by}.to-{channel}.txt"
+
+
+def proactive_worker(name) -> "str | None":
+    """The pool worker whose session wrote the proactive file `name` (its `.by-<worker>` tag), or
+    None for a file the core's session wrote."""
+    m = _WORKER_TAG_RE.search(Path(name).name)
+    return m.group(1) if m else None
+
+
+def stamp_worker(name, worker: str) -> str:
+    """`name` as `worker`'s session publishes it: a proactive name gains the `.by-<worker>` tag
+    unless it carries one; a task result, or a name published by the core ("" worker), is unchanged."""
+    base = Path(name).name
+    if not worker or not base.startswith("proactive-") or not base.endswith(".txt") \
+            or proactive_worker(base) is not None:
+        return base
+    if not _WORKER_ID_RE.match(worker):
+        raise ValueError(f"not a worker id: {worker!r}")
+    dest = proactive_destination(base)
+    head = base[: -len(f".to-{dest}.txt")] if dest else base[: -len(".txt")]
+    return f"{head}.by-{worker}" + (f".to-{dest}.txt" if dest else ".txt")
+
+
+def lane_claims_proactive(name, lane_worker: str = "") -> bool:
+    """The one rule for which lane may claim a proactive file by who wrote it: a file a worker's
+    session stamped is that worker's own lane's alone; an unstamped file is never a worker lane's.
+    `lane_worker` is the worker the claiming lane runs as, "" for a core lane or any other bridge."""
+    return (proactive_worker(name) or "") == (lane_worker or "")
 
 
 # A message about one task (a named instance's id included) names it: proactive-about-<task id>--<ts>
-# [.to-<channel>].txt. The gateway threads it in that task's conversation and re-checks the task first.
-_ABOUT_TASK_RE = re.compile(r"\Aproactive-about-(task-[A-Za-z0-9._~-]+)--(\d+)(?:\.to-[a-z0-9_-]+)?\.txt\Z")
+# [.by-<worker>][.to-<channel>].txt. The gateway threads it in that task's conversation and re-checks the task first.
+_ABOUT_TASK_RE = re.compile(r"\Aproactive-about-(task-[A-Za-z0-9._~-]+)--(\d+)(?:\.by-[a-z0-9-]+)?(?:\.to-[a-z0-9_-]+)?\.txt\Z")
 
 
-def about_task_filename(task_id: str, ts, channel: "str | None" = None) -> str:
+def about_task_filename(task_id: str, ts, channel: "str | None" = None, worker: "str | None" = None) -> str:
     """Typed constructor for a proactive message about `task_id`; the reader is about_task()."""
-    name = proactive_filename(ts, channel).replace("proactive-", f"proactive-about-{task_id}--", 1)
+    name = proactive_filename(ts, channel, worker).replace("proactive-", f"proactive-about-{task_id}--", 1)
     if about_task(name) != task_id:
         raise ValueError(f"not a task id and timestamp: {task_id!r}, {ts!r}")
     return name
@@ -155,7 +192,10 @@ def proactive_destination(name) -> "str | None":
 
 def should_claim_proactive_file(name, state_file_path: Path,
                                 this_channel: str) -> bool:
-    """Per-FILE claim decision: destination outranks activity routing."""
+    """Per-FILE claim decision: destination outranks activity routing. A file a pool worker's
+    session stamped is its own lane's (`lane_claims_proactive`), never an activity-routed bridge's."""
+    if not lane_claims_proactive(name):
+        return False
     dest = proactive_destination(name)
     if dest is not None:
         return dest == this_channel
@@ -169,7 +209,9 @@ def claims_unless_routed_elsewhere(name, state_file_path: Path, this_channel: st
     routing (Discord has the same override); a RECORDED owner activity on a
     bridge channel routes there; with no record (or a non-bridge one) a lone
     bridge claims, while on a multi-bridge install the deterministic default
-    (should_claim_proactive: discord) keeps the file."""
+    (should_claim_proactive: discord) keeps the file. A worker-stamped file is never a bridge's."""
+    if not lane_claims_proactive(name):
+        return False
     dest = proactive_destination(name)
     if dest is not None:
         return dest == this_channel
@@ -201,8 +243,8 @@ def fallback_claims_name(name, this_channel: str) -> bool:
     """Per-file gate for a channel's catch-all fallback (no activity routing):
     a foreign or unknown .to-<channel> tag is never claimed — an explicit
     destination strands visibly rather than falling into another channel's
-    fallback sweep."""
-    return proactive_destination(name) in (None, this_channel)
+    fallback sweep. A worker-stamped file belongs to that worker's lane, never to a sweep."""
+    return lane_claims_proactive(name) and proactive_destination(name) in (None, this_channel)
 
 
 # The [channel:] BODY marker names a channel but IMPLIES a bridge, and that
@@ -270,7 +312,7 @@ def should_claim_proactive_peeked(name, body, state_file_path: Path,
     so claim-then-release every pass starves it (#5368). Otherwise the filename
     tag / activity routing decides, and a body addressed to this bridge claims.
     """
-    if not body_claimable_by(body, this_channel):
+    if not body_claimable_by(body, this_channel) or not lane_claims_proactive(name):
         return False
     if should_claim_proactive_file(name, state_file_path, this_channel):
         return True

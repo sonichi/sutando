@@ -187,15 +187,30 @@ if ! command -v codex >/dev/null 2>&1; then
   fi
 fi
 
-# Use the configured CODEX_HOME (or another env name chosen by the operator).
-# The default points at ~/.codex to reuse the existing authenticated install.
-config_env="$(bash "$REPO/scripts/sutando-config.sh" core-config-dir-env-name codex)"
-config_value="$(bash "$REPO/scripts/sutando-config.sh" core-config-dir-value codex)"
-if [ -n "$config_env" ] && [ -n "$config_value" ]; then
-  mkdir -p "$config_value"
-  export "$config_env=$config_value"
-  echo "  ✓ $config_env=$config_value"
-fi
+# One interpreter for the heartbeat, start and stop alike: the repository resolver, never a bare
+# `python3` (on a clean macOS host PATH can hand that name to Apple's developer-tools stub).
+# Resolved ONCE, in this shell, never inside $(...): a subshell's assignment cannot reach the
+# parent, so stop and start would each resolve on their own and could disagree.
+_HB_PY=""
+resolve_heartbeat_python() {
+  [ -r "$REPO/scripts/python-binary.sh" ] || return 0
+  # shellcheck source=scripts/python-binary.sh
+  . "$REPO/scripts/python-binary.sh"
+  _HB_PY="$(resolve_python "$REPO" 2>/dev/null || true)"
+}
+heartbeat_python() {
+  [ -n "$_HB_PY" ] && printf '%s' "$_HB_PY"
+}
+resolve_heartbeat_python
+
+# The configured CODEX_HOME is resolved, checked and created only by src/codex_home.py;
+# CODEX_HOME_DIR is the one home every later step uses, empty when nothing may be written.
+# shellcheck source=../codex-home.sh
+. "$REPO/src/agent/codex/codex-home.sh"
+sutando_codex_home_prepare "$REPO" "$(heartbeat_python)" || true
+CODEX_HOME_DIR="$SUTANDO_CODEX_HOME"
+CODEX_HOME_REFUSED="$SUTANDO_CODEX_HOME_REFUSED"
+[ -n "${CODEX_HOME:-}" ] && echo "  ✓ CODEX_HOME=$CODEX_HOME"
 
 # `|| _codex_auth_rc=$?` keeps set -e from killing the script on a non-zero
 # probe — the exit code IS the signal here, not a failure.
@@ -265,6 +280,8 @@ CODEX_ARGS=(
   # The core runs headless: an interactive "Update available" menu at startup
   # blocks it until someone answers, so the startup update check stays off.
   -c check_for_update_on_startup=false
+  # The checkout's AGENTS.md is larger than Codex's 32 KiB default, which drops its tail.
+  -c project_doc_max_bytes=131072
 )
 if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   CODEX_ARGS+=(-m "$SUTANDO_CORE_MODEL")
@@ -275,12 +292,43 @@ ensure_codex_project_trust() {
   local py out
   py="$(heartbeat_python)"
   [ -n "$py" ] || return 0
-  if out="$("$py" "$REPO/src/codex_project_trust.py" "${CODEX_HOME:-$HOME/.codex}" "$WORKING_DIR" "$REPO")"; then
+  if out="$("$py" "$REPO/src/codex_project_trust.py" "$CODEX_HOME_DIR" "$WORKING_DIR" "$REPO")"; then
     [ "$out" = trusted ] && echo "  ✓ Codex project trust recorded for $WORKING_DIR"
   else
     echo "  ⚠ could not record Codex project trust; the core may wait on a trust prompt" >&2
   fi
   return 0
+}
+
+# A desktop host's own AGENTS.md sits above the checkout, where Codex never looks; see
+# src/codex_host_instructions.py. Best effort: a failure leaves the core without it.
+ensure_codex_host_instructions() {
+  local py out
+  py="$(heartbeat_python)"
+  [ -n "$py" ] || return 0
+  if out="$("$py" "$REPO/src/codex_host_instructions.py" "$CODEX_HOME_DIR" "$REPO")"; then
+    case "$out" in
+      linked) echo "  ✓ Codex core given the host's AGENTS.md" ;;
+      overridden) echo "  ⚠ $CODEX_HOME_DIR/AGENTS.override.md replaces the host's AGENTS.md for the core" >&2 ;;
+      invalid-home) echo "  ⚠ $CODEX_HOME_DIR is relative, contains '..', or has a symlink or non-directory component; the host's AGENTS.md was not linked" >&2 ;;
+      dangling) echo "  ⚠ $CODEX_HOME_DIR/AGENTS.md is a broken link; remove it so the core gets the host's AGENTS.md" >&2 ;;
+      foreign) echo "  ⚠ an existing AGENTS.md entry in $CODEX_HOME_DIR is not the host's and was kept; the host's AGENTS.md was not linked" >&2 ;;
+      owner-home) echo "  ⚠ $CODEX_HOME_DIR is the owner's own Codex home; the host's AGENTS.md was not linked" >&2 ;;
+    esac
+  else
+    echo "  ⚠ could not link the host's AGENTS.md; the core may miss its first-contact instructions" >&2
+  fi
+  return 0
+}
+
+# A refused home gets no write from the launcher: not the trust entry, not the link.
+prepare_codex_home() {
+  if [ -n "$CODEX_HOME_REFUSED" ] || [ -z "$CODEX_HOME_DIR" ]; then
+    echo "  ⚠ not recording Codex project trust or linking the host's AGENTS.md: the Codex home was refused" >&2
+    return 0
+  fi
+  ensure_codex_project_trust
+  ensure_codex_host_instructions
 }
 
 apply_tmux_defaults() {
@@ -395,20 +443,6 @@ ensure_core_monitor() {
 # migrate schedules and then silently suppress every fire. Start it here (once).
 # Guard on the $REPO-anchored path so the check is per-checkout (won't cross-match
 # a heartbeat from a different checkout/bundle, and stays hermetic under test).
-# One interpreter for the heartbeat, start and stop alike: the repository resolver, never a bare
-# `python3` (on a clean macOS host PATH can hand that name to Apple's developer-tools stub).
-# Resolved ONCE, in this shell, never inside $(...): a subshell's assignment cannot reach the
-# parent, so stop and start would each resolve on their own and could disagree.
-_HB_PY=""
-resolve_heartbeat_python() {
-  [ -r "$REPO/scripts/python-binary.sh" ] || return 0
-  # shellcheck source=scripts/python-binary.sh
-  . "$REPO/scripts/python-binary.sh"
-  _HB_PY="$(resolve_python "$REPO" 2>/dev/null || true)"
-}
-heartbeat_python() {
-  [ -n "$_HB_PY" ] && printf '%s' "$_HB_PY"
-}
 ensure_core_heartbeat() {
   if [ -n "$EXTERNAL_HELPERS" ]; then check_external_helpers; return; fi
   local _py
@@ -480,11 +514,18 @@ ensure_codex_auto_reset_timer() {
     return 0
   fi
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
-  if ! "$py" "$timer" ensure --workspace "$ws" --codex-home "${CODEX_HOME:-$HOME/.codex}" >/dev/null; then
+  [ -n "$CODEX_HOME_DIR" ] || return 0
+  if ! "$py" "$timer" ensure --workspace "$ws" --codex-home "$CODEX_HOME_DIR" >/dev/null; then
     echo "  ⚠ Could not reconcile the Codex earned-reset timer" >&2
   fi
 }
 
+prepare_codex_bootstrap() {
+  local prompt
+  [ -n "$_HB_PY" ] || { echo "start-cli: no runnable Python for managed Codex bootstrap" >&2; return 1; }
+  prompt="$("$_HB_PY" "$REPO/src/delivery/codex_recovery.py" prompt)" || return 1
+  CODEX_ARGS+=("$prompt")
+}
 # Codex has no session CronCreate surface. Two complementary reconcilers run on
 # each default invocation, partitioned by reconcile_launchd.py's eligibility
 # rules so no entry is double-owned: ensure_durable_schedules moves ordinary
@@ -492,13 +533,6 @@ ensure_codex_auto_reset_timer() {
 # codex-task entries, and anything already launchd-owned), and
 # ensure_codex_scheduler owns execution:codex-task entries plus the canonical
 # five-minute main loop while this runtime is selected.
-resolve_heartbeat_python
-prepare_codex_bootstrap() {
-  local prompt
-  [ -n "$_HB_PY" ] || { echo "start-cli: no runnable Python for managed Codex bootstrap" >&2; return 1; }
-  prompt="$("$_HB_PY" "$REPO/src/delivery/codex_recovery.py" prompt)" || return 1
-  CODEX_ARGS+=("$prompt")
-}
 if [ "$RECONCILE_SCHEDULES" = 1 ]; then
   ensure_durable_schedules
   ensure_codex_scheduler
@@ -634,7 +668,7 @@ if ! tmux_available; then
     exit 127
   fi
   prepare_codex_bootstrap || exit 1
-  ensure_codex_project_trust
+  prepare_codex_home
   stash_shutdown_sentinel
   clear_shutdown_sentinel
   # errexit would exit on the failed exec before the restore below is reached;
@@ -691,7 +725,7 @@ heal_core_window() {
   for _win in $(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" all codex); do
     tmux -S "$TMUX_SOCKET" kill-window -t "$_win" 2>/dev/null || true
   done
-  ensure_codex_project_trust
+  prepare_codex_home
   if ! idx="$(sutando_new_core_window "$TMUX_SOCKET" "$SESSION" "${CORE_ENV_ARGS[@]}" -c "$REPO" codex "${CODEX_ARGS[@]}")" \
      || [ -z "$idx" ]; then
     echo "  ⚠ could not create a core window in $SESSION — sentinel NOT cleared, no core is serving." >&2
@@ -726,7 +760,7 @@ fi
 # (new-session rc=0 only means tmux accepted it), then starts the helpers.
 start_core_session_and_helpers() {
   prepare_codex_bootstrap || return 1
-  ensure_codex_project_trust
+  prepare_codex_home
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
   wait_core_up "$SESSION" session_exists "$SESSION" || return 1
   log_session_start

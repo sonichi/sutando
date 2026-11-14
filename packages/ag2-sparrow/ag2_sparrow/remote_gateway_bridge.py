@@ -329,6 +329,7 @@ from . import (agent_identity, agent_triggers, diagnostics, gateway_credential_i
                setup_fetch)
 from .bounded_file_read import read_private, read_regular, read_regular_text
 from .result_markers import parse_markers, render_skill_prelude
+from .result_markers import has_skip_action
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
 from . import result_labels
@@ -343,12 +344,13 @@ from .outbox import dispatch_unsettled, record_provider_ref, released_by_operato
 from .outbox import RetrySchedule, delivered_body_differs, effective_item_id, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome, withdraw_unsent
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
-from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS
+from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, ROOM_REFUSAL_ATTEMPTS
 from .delivery_core import (WITHDRAWN, DeliveryCore, DesignAClaimBackend, DrainStatus,
                             ProviderRefused, RetryPolicy)
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
 from .delivery_core import is_refused_for_good
-from .delivery_core.provider_ag2space import AG2SpaceRoomMessageProvider, room_response_refused
+from .delivery_core.provider_ag2space import (AG2SpaceRoomMessageProvider, room_refused_sender,
+                                              room_response_refused)
 from .delivery_core.provider_ag2space import (AG2SpaceResultProvider, RESULT_THREAD_ASK,
                                               RESULT_THREAD_FIELD)
 from .result_ready import (identity_of, read_ready_result, read_ready_result_with_identity,
@@ -379,11 +381,18 @@ NOT_A_STOP_NOTE = (
     "This task's text quotes a stop instruction, but it is a message from its sender, not a control: "
     "nothing was stopped or cancelled. Do not stop any task for it, and do not say that anything was "
     "cancelled or stopped; you may reply in words.")
+# Only on an owner task stamped with ui_origin: the ui_* tools take that handle.
+UI_ORIGIN_NOTE = (
+    "Your owner is looking at S.space in a window. To open, show or go to something there (Settings, "
+    "Add agent, Add room, a room or message), use s-space ui_request with the ui_origin above; never "
+    "the local computer's settings.")
 
 
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 _WITHHELD_TASK_OUTPUT: "dict[tuple, tuple]" = {}
+# review id -> (sends the review room refused, monotonic time the next send is due).
+_REVIEW_ROOM_REFUSALS: "dict[str, tuple[int, float]]" = {}
 _WITHHELD_DM_CACHE = _STATE / "withheld-review-dm.json"
 _WITHHELD_CONTROL_DIR = _STATE / "withheld-review-control-results"
 _GATEWAY_OWNER_DM_HINT = ""
@@ -809,6 +818,35 @@ def _owner_review_dm(owner: str) -> str:
     return room
 
 
+def _forget_review_room() -> None:
+    """Unmark the cached review room as private, so the next review opens a new one."""
+    cached = _read_private_json(_WITHHELD_DM_CACHE)
+    if cached and cached.get("private") is True:
+        _atomic_private_json(_WITHHELD_DM_CACHE, {**cached, "private": False})
+
+
+def _reroute_refused_review(artifact: Path, verdict, refused: int):
+    """After the review room refused the agent ROOM_REFUSAL_ATTEMPTS times, send the same review once
+    to a new private room. -> the verdict to settle on, or None to leave the result for the next pass."""
+    try:
+        _forget_review_room()
+        if _route_withheld_review(artifact):
+            _log(f"withheld review {artifact.stem}: the review room refused the agent {refused} times "
+                 "(HTTP 403, not in the room); sent to a new private review room")
+            return verdict
+        return None
+    except Exception as exc:  # noqa: BLE001 - runs inside the caller's except clause, past its catch-all
+        if not (isinstance(exc, urllib.error.HTTPError) and room_refused_sender(exc)):
+            _log(f"withheld review {artifact.stem}: the re-route to a new private review room failed: "
+                 f"{diagnostics.describe(exc)}; retried on the next pass")
+            return None
+    _log(f"withheld review {artifact.stem}: DROPPED, not delivered to the owner: the review room and a new "
+         f"one both refused the agent (HTTP 403, not in the room); the record stays at {artifact}")
+    return verdict._replace(reason=(
+        f"{verdict.reason}; owner review {artifact.stem} dropped: every private review room refused "
+        f"the agent; the record stays at {artifact}"))
+
+
 def _review_messages(record: dict) -> list[str]:
     rid = str(record.get("review_id") or "")
     context = record.get("context") or {}
@@ -1199,8 +1237,33 @@ def _settlement_record(directory: Path, review_id: str) -> "dict | None":
     return {}
 
 
+# Set before the exec by an adapter whose RESULTS_DIR sits in the workspace this command prints.
+_WORKSPACE_RESOLVER: str = globals().get("_SUTANDO_WORKSPACE_RESOLVER") or ""
+
+
+def _shell_root(root) -> str:
+    """`root` as a logged command names it: behind the workspace resolver, else `$HOME`, so the log
+    carries no home path. Run from the engine checkout, as `src/outbox_cli.py` already requires."""
+    root = Path(root)
+    bases = ([(RESULTS_DIR.parent, f'"$({_WORKSPACE_RESOLVER})"')] if _WORKSPACE_RESOLVER else []) + [
+        (Path.home(), '"$HOME"')]
+    for base, prefix in bases:
+        try:
+            rel = root.relative_to(base)
+        except ValueError:
+            continue
+        return prefix if rel == Path(".") else f"{prefix}/{shlex.quote(rel.as_posix())}"
+    return shlex.quote(str(root))
+
+
+def _outbox_cli_command(root, *args: str, program: str = "python3 src/outbox_cli.py",
+                        results_dir=None) -> str:
+    tail = f" --results-dir {_shell_root(results_dir)}" if results_dir is not None else ""
+    return f"{program} --root {_shell_root(root)} {shlex.join(args)}{tail}"
+
+
 def _requeue_command(root, item_id: str) -> str:
-    return shlex.join(["python3", "src/outbox_cli.py", "--root", str(root), "requeue", item_id])
+    return _outbox_cli_command(root, "requeue", item_id)
 
 
 def _reread_record(path: Path) -> dict:
@@ -1588,6 +1651,7 @@ def _guarded_result_labels(tid: str, generation=None) -> dict:
     `generation`; each kept only when the result guard passes it unchanged for the task's tier."""
     labels = result_labels.read(RESULTS_DIR / f"{tid}{result_labels.SUFFIX}",
                                 getattr(generation, "digest", None))
+    labels.pop(result_labels.PARENT_KEY, None)
     if not labels:
         return {}
     try:
@@ -1609,6 +1673,76 @@ def _guarded_result_labels(tid: str, generation=None) -> dict:
             _log(f"result {tid}: its {key} is left out: the result guard withheld it "
                  f"({verdict.reason or 'rewritten'})")
     return kept
+
+
+def _result_parent(tid: str, generation=None) -> str:
+    """The parent task id the side file names for the bytes of `generation`; "" when none."""
+    return result_labels.read(RESULTS_DIR / f"{tid}{result_labels.SUFFIX}",
+                              getattr(generation, "digest", None)).get(result_labels.PARENT_KEY, "")
+
+
+# The broker labels a task only once it is closed, which the result POST may finish just after.
+PARENT_RETRY_S = (0, 2, 5, 10, 20, 30)
+
+
+def _send_parent(broker_tid: str, parent: str, sleep=time.sleep) -> str:
+    """Ask the broker to group `broker_tid` under `parent`: "applied", else why not. Only a task
+    not yet closed is tried again; any other refusal or failure drops the parent alone."""
+    path = f"/v1/tasks/{urllib.parse.quote(broker_tid, safe='')}/summary"
+    for delay in PARENT_RETRY_S:
+        sleep(delay)
+        try:
+            _req("POST", path, {result_labels.PARENT_KEY: parent}, timeout=10)
+        except urllib.error.HTTPError as e:
+            code, _ = task_attempts.http_error_code(e)
+            if code == "task_not_terminal":
+                continue
+            why = code or f"HTTP {e.code}"
+        except (OSError, ValueError, http.client.HTTPException) as e:
+            why = diagnostics.describe(e)
+        else:
+            _log(f"result {broker_tid}: grouped under {parent}")
+            return "applied"
+        _log(f"result {broker_tid}: its parent {parent} is left out ({why})")
+        return why
+    _log(f"result {broker_tid}: its parent {parent} is left out (the task did not close in time)")
+    return "task_not_terminal"
+
+
+def _group_under_parent(broker_tid: str, parent: str) -> None:
+    """Send the parent of a delivered result off the drain's thread; it never holds a result."""
+    if not parent:
+        return
+    try:
+        threading.Thread(target=_send_parent, args=(broker_tid, parent), daemon=True,
+                         name=f"result-parent-{broker_tid}").start()
+    except Exception as exc:  # noqa: BLE001 — the result is already committed; only the parent is lost
+        _log(f"result {broker_tid}: its parent {parent} is left out ({diagnostics.describe(exc)})")
+
+
+RECENT_TASKS_MAX = 5
+RECENT_TITLE_MAX = 80
+
+
+def _recent_tasks_value(value) -> str:
+    """The broker's `recent_tasks` as one JSON line for the task file: at most RECENT_TASKS_MAX,
+    each with a task id the broker could accept as a parent, its fields cleaned to one line and any
+    secret in a title redacted."""
+    if not isinstance(value, list):
+        return ""
+    kept = []
+    for t in value[:RECENT_TASKS_MAX]:
+        tid = result_labels.parent(t.get("task_id")) if isinstance(t, dict) else ""
+        if not tid:
+            continue
+        created = t.get("created_at")
+        title = result_labels.clean(t.get("title"))
+        kept.append({"task_id": tid,
+                     "title": result_labels.fit(filter_chat_secrets(title).text, RECENT_TITLE_MAX),
+                     "status": result_labels.fit(t.get("status"), 32),
+                     "created_at": created if isinstance(created, int)
+                     and not isinstance(created, bool) else None})
+    return json.dumps(kept, ensure_ascii=False, separators=(",", ":")) if kept else ""
 
 
 def _archive_result_labels(stem: str) -> None:
@@ -1694,9 +1828,25 @@ def _guarded_result_body(tid: str, body: str):
         artifact = review_artifact(_STATE, tid, body)
         if not artifact.is_file():
             return None, verdict.reason
+        refused, due = _REVIEW_ROOM_REFUSALS.get(artifact.stem, (0, 0.0))
+        if time.monotonic() < due:
+            return None, f"{verdict.reason}; private review room refused the agent, next send not due yet"
         try:
             if not _route_withheld_review(artifact):
                 return None, f"{verdict.reason}; private owner review unavailable"
+            _REVIEW_ROOM_REFUSALS.pop(artifact.stem, None)
+        except urllib.error.HTTPError as exc:
+            if not room_refused_sender(exc):
+                return None, f"{verdict.reason}; private owner review failed: {diagnostics.describe(exc)}"
+            refused += 1
+            if refused < ROOM_REFUSAL_ATTEMPTS:  # a join may still be landing: 2 s doubling, as the outbox
+                _REVIEW_ROOM_REFUSALS[artifact.stem] = (refused, time.monotonic() + 2.0 * 2 ** (refused - 1))
+                return None, (f"{verdict.reason}; private review room refused the agent "
+                              f"(send {refused}/{ROOM_REFUSAL_ATTEMPTS})")
+            _REVIEW_ROOM_REFUSALS.pop(artifact.stem, None)
+            verdict = _reroute_refused_review(artifact, verdict, refused)
+            if verdict is None:
+                return None, "private owner review failed in its new room; retried on the next pass"
         except Exception as exc:  # noqa: BLE001 — retain result file for retry
             return None, f"{verdict.reason}; private owner review failed: {diagnostics.describe(exc)}"
     result = (verdict.body, verdict.reason)
@@ -1837,7 +1987,7 @@ def _project_hitl(log=print) -> int:
             f"{projector.PROJECTION_MAX_REFUSALS}; retrying it in {delay:g}s")
     for req_id, revision, error in gave_up:
         log(f"hitl: card {req_id} could not be projected at revision {revision}: refused "
-            f"{projector.PROJECTION_MAX_REFUSALS} times ({error}); no further retries for this "
+            f"({error}); no further retries for this "
             f"revision, health-check reports it")
     if failed:
         _hitl_backoff_bump(log)  # a refusing or raising sender
@@ -2136,6 +2286,9 @@ PROACTIVE_ROOM_KEEP: Callable[[], bool] | None = None
 # Host-injected () -> bool: whether this bridge owns unaddressed nudges and the owner's cards.
 # None (standalone default): only the bridge launched without GATEWAY_INSTANCE does.
 OWNS_UNADDRESSED: Callable[[], bool] | None = None
+# Host-injected (path) -> bool: an owner-directed file this lane delivers although it owns no
+# unaddressed ones (a worker's lane, its worker's files). None: only `owns_unaddressed` decides.
+PROACTIVE_OWN_FILE: Callable[[Path], bool] | None = None
 # Host-injected () -> the worker every task this lane queues is addressed to (`requested_worker`),
 # or "". None (standalone default) leaves each task's field as the gateway sent it.
 TASK_ADDRESSEE: Callable[[], str] | None = None
@@ -2308,6 +2461,20 @@ def owns_unaddressed() -> bool:
     except Exception as e:  # noqa: BLE001 - an unanswerable host keeps the launch-time rule
         _log_backoff(("owns-unaddressed", type(e).__name__), f"primary check failed ({diagnostics.describe(e)})")
         return not GATEWAY_INSTANCE
+
+
+def owner_directed_is_mine(path: Path) -> bool:
+    """Whether this lane delivers the owner-directed file `path`: the primary delivers every one
+    (`owns_unaddressed`); any other lane only one the host names as its own (PROACTIVE_OWN_FILE)."""
+    if owns_unaddressed():
+        return True
+    if PROACTIVE_OWN_FILE is None:
+        return False
+    try:
+        return bool(PROACTIVE_OWN_FILE(path))
+    except Exception as e:  # noqa: BLE001 - an unanswerable host keeps the primary-only rule
+        _log_backoff(("own-file", type(e).__name__), f"own-file check failed ({diagnostics.describe(e)})")
+        return False
 
 
 def proactive_room() -> str:
@@ -2630,6 +2797,9 @@ _heartbeat_backoff = 0.0
 _last_heartbeat_at = 0.0
 _last_core_health: "dict | None" = None
 
+# Opaque, 1-256 chars as the ui_* tools accept it; no whitespace or control characters,
+# so it stays one header line. Anything else is dropped.
+_UI_ORIGIN_RE = re.compile(r"[^\s\x00-\x1f\x7f]{1,256}")
 _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # Both ahead of "task": the safe parser stops at the body, so a
                 # field written below it is invisible to every task-last reader.
@@ -2649,6 +2819,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # The broker's word that the message mentioned the owner, not this agent.
                 # Above "task" so the strict parser reads it and a body cannot claim it.
                 "owner_mentioned",
+                # Who asked a relay task; its user_id is the account it runs for. Above "task"
+                # so the strict parser reads it, and the dedup fold checks it.
+                "asked_by",
                 # Commons hook-fire / Summon contexts, each one JSON line. Above "task":
                 # the agent's safe parser must see which hook or row change it serves.
                 "hook",
@@ -2656,6 +2829,12 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # AgentTrigger context, above "task" so the strict parser reads it: the event
                 # behind this task, its idempotency id and the playbook it names.
                 "event_type", "agent_trigger_id", "playbook",
+                # The UI-control handle, present only when the owner's message was stamped.
+                # Above "task" so the strict parser reads it and a body cannot claim it.
+                "ui_origin",
+                # A card click's `space.ag2.card_click`, one JSON line (branch below). Above "task" so a
+                # body cannot claim it; the agent acts on a card command only with it.
+                "card_click",
                 "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -2674,6 +2853,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 "platform_card",
                 # A room question this agent is asked: one line of quoted room data (branch below).
                 "room_question")
+
+# A card click's bounds: the card id as the backend forwards it, the action as the client caps a reply.
+_CARD_CLICK_MAX = {"card_id": 200, "action": 1000}
 
 # platform_card passes through with exactly these subkeys — a signed pointer
 # {card_url, card_sha256, sig, key_id, alg} to the platform's canonical agent
@@ -3103,6 +3285,12 @@ def _read_by(resp, deadline: float) -> bytes:
         # read1 returns what one socket read gave; read(n) would wait for all n bytes.
         chunk = (resp.read1 if hasattr(resp, "read1") else resp.read)(4096)
         if not chunk:
+            # read1 ends with b"" when the deadline's shutdown cuts the socket, and when the peer
+            # hangs up early: neither is a whole body, which a short read would otherwise pass for.
+            if time.monotonic() >= deadline:
+                raise TimeoutError("response body still arriving at its deadline")
+            if getattr(resp, "length", None):
+                raise http.client.IncompleteRead(b"".join(chunks), resp.length)
             return b"".join(chunks)
         chunks.append(chunk)
 
@@ -6203,6 +6391,9 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             # trusted execution-policy header before all untrusted body text.
             if woken:
                 lines.append(f"wake_episode: {_one_line(woken)}")
+            recent = _recent_tasks_value(task.get("recent_tasks")) if sender_tier == "owner" else ""
+            if recent:
+                lines.append(f"recent_tasks: {recent}")
             if collaborator_enabled:
                 lines.append("collaborator: true")
                 if task.get("sensitive_data_filter") is False:
@@ -6242,6 +6433,19 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
                     lines.extend(_mh.rstrip("\n").split("\n"))
         elif f == "task_layout":
             lines.append("task_layout: mid")
+        elif f == "ui_origin":
+            uo = task.get(f)
+            if isinstance(uo, str) and _UI_ORIGIN_RE.fullmatch(uo):
+                lines.append(f"ui_origin: {uo}")
+        elif f == "card_click":
+            click = task.get(f)
+            if isinstance(click, dict) and all(isinstance(click.get(k), str) and click[k].strip()
+                                               and len(click[k]) <= limit for k, limit in _CARD_CLICK_MAX.items()):
+                lines.append("card_click: " + json.dumps({"card_id": click["card_id"], "action": click["action"]},
+                                                         separators=(",", ":")))
+            elif click not in (None, ""):
+                # A click that cannot be used stays a click: the agent refuses it, never reads it as chat.
+                lines.append("card_click: invalid")
         elif f == "owner_mentioned":
             if task.get(f) == "true":  # the broker's exact string only; nothing else is a claim
                 lines.append("owner_mentioned: true")
@@ -6322,6 +6526,8 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         lines.extend(render_skill_prelude(
             _one_line(task.get("channel_id") or ""), CHANNEL_DIR, tid,
             _one_line(task.get("addressed_to") or "")))
+    if sender_tier == "owner" and any(line.startswith("ui_origin: ") for line in lines):
+        lines.append(UI_ORIGIN_NOTE)
     # Last, after every tier block: it keeps their limits and replaces their reply step.
     if task.get("owner_mentioned") == "true":
         lines.extend(owner_mention_lines(f"results/{tid}.txt"))
@@ -6738,26 +6944,33 @@ def _save_task_rooms(rooms: dict[str, str]) -> None:
         # Per-PID staging (sonichi/sutando#2222 follow-up): collision-proof if a
         # second sparrow instance ever runs. os.replace is atomic overwrite.
         tmp = TASK_ROOMS_FILE.with_suffix(f".json.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(rooms, sort_keys=True))
+        # Insertion order is the intake order that ready results are delivered in.
+        tmp.write_text(json.dumps(rooms))
         os.replace(tmp, TASK_ROOMS_FILE)
     except Exception as e:  # noqa: BLE001
         _log(f"task-rooms persist failed ({diagnostics.describe(e)}) — continuing")
 
 
+# The poll loop and the delivery workers both rewrite the task-room map, whose order the drain sends in.
+_TASK_ROOMS_MUTEX = threading.RLock()
+
+
 def _record_task_room(tid: str, room: str) -> None:
     if not room:
         return
-    rooms = _load_task_rooms()
-    if rooms.get(tid) != room:
-        rooms[tid] = room
-        _save_task_rooms(rooms)
+    with _TASK_ROOMS_MUTEX:
+        rooms = _load_task_rooms()
+        if rooms.get(tid) != room:
+            rooms[tid] = room
+            _save_task_rooms(rooms)
 
 
 def _forget_task_room(tid: str) -> None:
-    rooms = _load_task_rooms()
-    if tid in rooms:
-        rooms.pop(tid)
-        _save_task_rooms(rooms)
+    with _TASK_ROOMS_MUTEX:
+        rooms = _load_task_rooms()
+        if tid in rooms:
+            rooms.pop(tid)
+            _save_task_rooms(rooms)
 
 
 def _load_task_media() -> "dict | None":
@@ -8056,10 +8269,10 @@ def _proactive_item_id(stem: str, body: str) -> str:
     return proactive_item_id(stem, body)
 
 
-def _proactive_requeue_command(root, item_id: str, body_sha256: str) -> str:
+def _proactive_requeue_command(root, item_id: str, body_sha256: str, reset_attempts: bool = False) -> str:
     """The operator's resend: requeue the item and restore exactly its own quarantined body."""
-    return shlex.join(["python3", "src/outbox_cli.py", "--root", str(root), "requeue", item_id,
-                       "--body-id", item_id.rsplit("~", 1)[0], "--body-sha256", body_sha256])
+    return _outbox_cli_command(root, "requeue", item_id, "--body-id", item_id.rsplit("~", 1)[0],
+                               "--body-sha256", body_sha256, *(["--reset-attempts"] if reset_attempts else []))
 
 
 def _proactive_outbox_root() -> Path:
@@ -8339,8 +8552,8 @@ def _post_proactive() -> None:
             continue  # another homeserver's lane owns it; a claim here can only park it
         # No target of its own AND no default: skip BEFORE claiming. Claiming it
         # would spin (claim -> no destination -> hand back) on every pass.
-        if route == "send" and peek_room is None and not owns_unaddressed():
-            continue  # a secondary never owns unaddressed nudges
+        if route == "send" and peek_room is None and not owner_directed_is_mine(f):
+            continue  # a secondary owns no unaddressed nudge, only a file the host names as its own
         if route == "send" and peek_room is None and not proactive_room():
             _held(f"owner-directed {f.name}")
             continue
@@ -8378,7 +8591,7 @@ def _post_proactive() -> None:
         if route == "foreign" or (
                 route == "send" and room_override is not None
                 and not _room_is_deliverable_here(room_override)) or (
-                route == "send" and room_override is None and (not owns_unaddressed() or not proactive_room())):
+                route == "send" and room_override is None and (not owner_directed_is_mine(f) or not proactive_room())):
             # Hand back rather than eat: a foreign target seen only post-claim, or one that vanished
             # and left an unaddressed body this instance may not own or cannot place.
             _hand_back(claim, f)
@@ -8525,7 +8738,9 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
             body_sha256 = ""
         retired = _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
         # No digest, no command: an unfiltered restore can install another generation's body.
-        how = (f"{_proactive_requeue_command(core.backend.root, item_id, body_sha256)}" if body_sha256
+        # A refusal spent its whole budget: a requeue that keeps the count gets one try.
+        how = (f"{_proactive_requeue_command(core.backend.root, item_id, body_sha256, reason == 'permanent-refusal')}"
+               if body_sha256
                else f"NO recovery command: its body could not be read to pin which parked copy "
                     f"is its own; requeue {item_id} by hand with --body-sha256 of that copy")
         where = (f"PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/" if retired
@@ -8539,7 +8754,8 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
                  f"To send it to {room}: {how}")
         else:
             _log(f"proactive {f.name} PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ ({reason}"
-                 f"{': ' + result.detail if result.detail else ''}) — it will NOT be re-sent")
+                 f"{': ' + result.detail if result.detail else ''}) — it will NOT be re-sent. "
+                 f"To send it again: {how}")
         return
     _hand_back(claim, f)  # still owed: the outbox's retry schedule decides when it is tried again
     if result.status is DrainStatus.ATTEMPTED:
@@ -8565,7 +8781,8 @@ def _post_proactive_message(room: str, body: str, dedupe_key: str, thread_root: 
     except urllib.error.HTTPError as e:
         seen = _PROACTIVE_SEND.__dict__.setdefault("seen", {})
         if e.code in (401, 403):
-            seen["auth"] = e
+            if not room_refused_sender(e):  # a room's refusal is the message's, never the bearer's
+                seen["auth"] = e
         elif e.code == 400:
             replacement = _room_upgraded_to(_http_error_body(e))
             if replacement is not None:
@@ -8661,9 +8878,10 @@ def _dedup_plan(tid: str, holder_id: str | None, inflight: "set[str] | None" = N
         aliases[new_id] = delivery
         if not _save_dedup_aliases(aliases):
             return False
-        rooms = _load_task_rooms()
-        rooms[new_id] = room
-        _save_task_rooms(rooms)
+        with _TASK_ROOMS_MUTEX:
+            rooms = _load_task_rooms()
+            rooms[new_id] = room
+            _save_task_rooms(rooms)
         if inflight is not None and new_id not in inflight:
             inflight.add(new_id)
             if not _save_inflight(inflight):
@@ -8889,11 +9107,10 @@ def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
             _log(f"result {tid}: {why} — quarantined to {UNDELIVERABLE_RESULTS_DIR.name}/; "
                  f"{not_requeueable_because}")
             return
-        _log(f"result {tid}: {why} — quarantined to "
-             f"{UNDELIVERABLE_RESULTS_DIR.name}/ — `ag2-sparrow-outbox "
-             f"--root {gateway_instance.outbox_root(RESULTS_DIR, GATEWAY_INSTANCE)} "
-             f"requeue {outbox_item_id or _broker_tid(_delivery_tid(tid) or tid)} --reset-attempts "
-             f"--results-dir {RESULTS_DIR} --body-id {tid}` restores it")
+        how = _outbox_cli_command(gateway_instance.outbox_root(RESULTS_DIR, GATEWAY_INSTANCE), "requeue",
+                                  outbox_item_id or _broker_tid(_delivery_tid(tid) or tid), "--reset-attempts",
+                                  "--body-id", tid, program="ag2-sparrow-outbox", results_dir=RESULTS_DIR)
+        _log(f"result {tid}: {why} — quarantined to {UNDELIVERABLE_RESULTS_DIR.name}/ — `{how}` restores it")
     except disposal.KeptQuarantined:
         return                                          # the lifecycle owner named where it waits
     except disposal.GenerationReplaced:
@@ -9374,6 +9591,8 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     doc.update(_result_contract(dm_only))
     # Activity labels ride the doc that carries dm_only; a broker without them ignores the keys.
     doc.update(_guarded_result_labels(tid, generation))
+    # Only a reply closes the task with this body; a no_send or a fold is grouped by nobody.
+    parent = "" if no_send or consolidated_into else _result_parent(tid, generation)
     if thread_ask:
         # The broker roots it on this task's own ask; a broker without it ignores the key.
         doc[RESULT_THREAD_FIELD] = RESULT_THREAD_ASK
@@ -9400,6 +9619,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     item_id = _effective_item_id(core, woken_item or broker_tid, no_send or bool(consolidated_into))
     # The task's own result item only: a close of an id already accepted keeps today's policy.
     relay = relay and item_id == broker_tid
+    parent = parent if item_id == broker_tid else ""
     if relay:
         core = _delivery_core("relay")
     live = _live_source(disposal.pin_path(RESULTS_DIR, tid) if pinned else result_file, generation)
@@ -9428,7 +9648,7 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
             if delivered_body_differs(core.backend.root, item_id, ruled):
                 _quarantine_unsent(result_file, tid, item_id, generation)
                 return False
-            return _committed(tid, broker_tid, claim, record)
+            return _grouped(_committed(tid, broker_tid, claim, record), broker_tid, parent, record)
         if relay:
             _reopen_relay_result(core, item_id, tid, record, result_file, generation)
             return False
@@ -9465,7 +9685,8 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
         _log(f"result {tid} {what} via DeliveryCore "
              f"(provider={type(core.provider).__name__}, "
              f"backend={type(core.backend).__name__}, worker={core.worker})")
-        return _committed(tid, broker_tid, claim, read_item(root, item_id) if root is not None else None)
+        record = read_item(root, item_id) if root is not None else None
+        return _grouped(_committed(tid, broker_tid, claim, record), broker_tid, parent, record)
     record = read_item(core.backend.root, item_id) or {}
     if record.get("status") == "PARKED":
         if relay:
@@ -9485,6 +9706,14 @@ def _deliver_result_payload(tid: str, broker_tid: str, body: str,
     else:
         _log(line)
     return False
+
+
+def _grouped(committed, broker_tid: str, parent: str, record=None):
+    """`committed`, after sending the parent of a result this attempt delivered as the answer; a
+    delivery with no outbox record to show that sends none."""
+    if parent and committed is True and _really_delivered(record):
+        _group_under_parent(broker_tid, parent)
+    return committed
 
 
 def _lifecycle_of(broker_tid: str, claim) -> dict:
@@ -9716,9 +9945,11 @@ def _owner_mention_disposition(tid: str, raw: str) -> "bool | None":
     return True
 
 
-# A result's delivery runs on a worker of its own, so one task's stalled send never holds another's.
+# A room's results go out one at a time in intake order on that room's worker; rooms run in parallel.
 DELIVERY_PASS_WAIT_S = 5.0
 _DELIVERING: "set[str]" = set()
+_DELIVERING_ROOMS: "set[str]" = set()
+ROOM_ORDER_MAX_WAIT_S = 120.0
 _DELIVERING_MUTEX = threading.Lock()
 
 
@@ -9727,13 +9958,98 @@ def _delivering(tid: str) -> bool:
         return tid in _DELIVERING
 
 
-def _start_delivery(tid: str, rfile: Path, raw: str, generation, inflight: "set[str]") -> threading.Thread:
+def _start_delivery(items: list, inflight: "set[str]", room: "str | None" = None) -> threading.Thread:
+    """One worker delivering `items` ((tid, rfile, raw, generation), in order) one after another;
+    with `room`, that room is busy until the last of them is done."""
     with _DELIVERING_MUTEX:
-        _DELIVERING.add(tid)
-    th = threading.Thread(target=_delivery_worker, args=(tid, rfile, raw, generation, inflight),
-                          name=f"result-{tid}", daemon=True)
+        _DELIVERING.update(item[0] for item in items)
+        if room:
+            _DELIVERING_ROOMS.add(room)
+
+    def run():
+        try:
+            for n, (tid, rfile, raw, generation) in enumerate(items):
+                _delivery_worker(tid, rfile, raw, generation, inflight)
+                if room and _holds_room(tid, rfile, inflight):
+                    _release_unsent(items[n + 1:])
+                    _log(f"room order: {tid} is still in flight — its room's later replies wait")
+                    break
+        finally:
+            if room:
+                with _DELIVERING_MUTEX:
+                    _DELIVERING_ROOMS.discard(room)
+    th = threading.Thread(target=run, name=f"result-{items[0][0]}", daemon=True)
     th.start()
     return th
+
+
+def _result_settled(tid: str, inflight: "set[str]") -> bool:
+    """Whether tid's result is done for ordering: its task left the in-flight set, or its outbox
+    item is terminal (delivered or parked). Anything else may still post later."""
+    if tid not in inflight:
+        return True
+    try:
+        core = _delivery_core()
+        return (read_item(core.backend.root, _broker_tid(tid)) or {}).get("status") in core.backend.TERMINAL
+    except Exception as e:  # noqa: BLE001 — an unreadable record is not proof it went out
+        _log(f"room order: {tid}'s outbox record unreadable ({diagnostics.describe(e)})")
+        return False
+
+
+def _release_unsent(items: list) -> None:
+    """Hand back a room's later replies unsent, so the next pass offers them again in order."""
+    for tid, _rfile, _raw, _generation in items:
+        try:
+            _end_unpublished_claims(_broker_tid(tid))
+        except Exception as e:  # noqa: BLE001 — a claim left open is ended by the next reconcile
+            _log(f"result {tid}: its claim could not be ended yet ({diagnostics.describe(e)})")
+        with _DELIVERING_MUTEX:
+            _DELIVERING.discard(tid)
+
+
+def _room_busy(room: str) -> bool:
+    with _DELIVERING_MUTEX:
+        return room in _DELIVERING_ROOMS
+
+
+def _reply_room(tid: str, rfile: Path, rooms: "dict[str, str]") -> "str | None":
+    """The room tid's written reply takes a place in; None with no reply yet or one that posts nothing."""
+    if not rooms.get(tid):
+        return None
+    try:
+        raw = rfile.read_text(errors="replace")
+    except OSError:
+        return None
+    return _ordered_room(tid, raw, rooms)
+
+
+def _holds_room(tid: str, rfile: Path, inflight: "set[str]") -> bool:
+    """Whether tid's reply, not yet settled, still holds its room's later replies back; past
+    ROOM_ORDER_MAX_WAIT_S it stops holding them, so one stuck reply never silences a room."""
+    if _result_settled(tid, inflight):
+        return False
+    try:
+        waited = time.time() - rfile.stat().st_mtime
+    except OSError:
+        return True
+    if waited <= ROOM_ORDER_MAX_WAIT_S:
+        return True
+    _log_backoff((tid, "room-order"), f"room order: {tid} unsent after {int(waited)}s — "
+                 "its room's later replies go on without it")
+    return False
+
+
+def _intake_ordered(tids, rooms: "dict[str, str]") -> list:
+    """`tids` in intake order (the task-room map's insertion order); unrecorded ones last, by id."""
+    pos = {t: n for n, t in enumerate(rooms)}
+    return sorted(tids, key=lambda t: (pos.get(t, len(pos)), t))
+
+
+def _ordered_room(tid: str, raw: str, rooms: "dict[str, str]") -> "str | None":
+    """The room whose reply order this result takes a place in; None for one that posts nothing."""
+    if has_skip_action(parse_markers(raw).actions):
+        return None
+    return rooms.get(tid) or None
 
 
 def _delivery_worker(tid: str, rfile: Path, raw: str, generation, inflight: "set[str]") -> None:
@@ -9763,37 +10079,61 @@ def _post_ready_results(inflight: set[str]) -> None:
     _recover_disposing_claims()
     _load_settle_pending()
     changed, started = False, []
-    for tid in list(inflight):
+    rooms = _load_task_rooms()
+    queued: "dict[str, list]" = {}
+    held: "set[str]" = set()                    # rooms with an earlier reply still unsent
+    for tid in _intake_ordered(list(inflight), rooms):
         if not _valid_local_tid(tid):  # defense-in-depth: never read an unsafe path (local ids may carry the instance encoding)
             inflight.discard(tid); changed = True
             continue
         rfile = RESULTS_DIR / f"{tid}.txt"
-        if _ATTEMPTS is not None:
-            run = _run_holds_result(tid, rfile)
-            if run is None:
-                continue
-            if run is False:
-                inflight.discard(tid)
-                changed = True
-                continue
-        if _ATTEMPTS is not None and _delivering(tid):
-            continue                            # its delivery is still under way on its own worker
-        raw, generation = _pin_and_claim(tid) if _ATTEMPTS is not None else _read_ready_generation(rfile)
-        if raw is None:
-            # A disposed-of id whose task could not be archived earlier is retried here.
-            if not os.path.lexists(rfile):
-                with _retiring(tid):  # the judgement and the settle are one step to a wake
-                    if tid in _SETTLE_PENDING or (tid not in _SETTLE_SCANNED and _result_disposed(tid)):
-                        changed |= _settle_task(tid, inflight)
-                _SETTLE_SCANNED.add(tid)
-            continue
-        if _ATTEMPTS is None:
-            changed |= _deliver_ready(tid, rfile, raw, generation, inflight)
-        else:
-            started.append(_start_delivery(tid, rfile, raw, generation, inflight))
+        reply_room = _reply_room(tid, rfile, rooms)
+        if reply_room and (reply_room in held or _room_busy(reply_room)):
+            held.add(reply_room)
+            continue                            # an earlier reply in its room is not out yet
+        try:
+            changed |= _offer_result(tid, rfile, inflight, rooms, queued, started)
+        finally:
+            if (reply_room and not any(i[0] == tid for i in queued.get(reply_room, ()))
+                    and _holds_room(tid, rfile, inflight)):
+                held.add(reply_room)
+    started += [_start_delivery(items, inflight, room) for room, items in queued.items()]
     _await_deliveries(started)
     if changed:
         _save_inflight(inflight)
+
+
+def _offer_result(tid: str, rfile: Path, inflight: "set[str]", rooms: "dict[str, str]",
+                  queued: "dict[str, list]", started: list) -> bool:
+    """One in-flight task's turn in the drain: delivered now (ledger off), queued on its room's
+    worker, started on its own, or left; whether the in-flight set changed."""
+    changed = False
+    if _ATTEMPTS is not None:
+        run = _run_holds_result(tid, rfile)
+        if run is None:
+            return changed
+        if run is False:
+            inflight.discard(tid)
+            return True
+    if _ATTEMPTS is not None and _delivering(tid):
+        return changed                          # its delivery is still under way on its own worker
+    raw, generation = _pin_and_claim(tid) if _ATTEMPTS is not None else _read_ready_generation(rfile)
+    if raw is None:
+        # A disposed-of id whose task could not be archived earlier is retried here.
+        if not os.path.lexists(rfile):
+            with _retiring(tid):  # the judgement and the settle are one step to a wake
+                if tid in _SETTLE_PENDING or (tid not in _SETTLE_SCANNED and _result_disposed(tid)):
+                    changed |= _settle_task(tid, inflight)
+            _SETTLE_SCANNED.add(tid)
+        return changed
+    if _ATTEMPTS is None:
+        return _deliver_ready(tid, rfile, raw, generation, inflight)
+    room = _ordered_room(tid, raw, rooms)
+    if room is None:
+        started.append(_start_delivery([(tid, rfile, raw, generation)], inflight))
+    else:
+        queued.setdefault(room, []).append((tid, rfile, raw, generation))
+    return changed
 
 
 def _deliver_ready(tid: str, rfile: Path, raw: str, generation, inflight: "set[str]") -> bool:
@@ -10590,6 +10930,16 @@ def _poll_timeout_is_empty(last_ok: float, now: float,
     return (now - last_ok) <= grace
 
 
+def _awake_note(wall_s: float, awake_s: float) -> str:
+    """`, Ns of it awake` when the host slept through a poll gap, else "": time.time() counts a
+    sleeping Mac's hours, time.monotonic() does not, and the gap alone cannot tell the two apart."""
+    return f", {int(awake_s)}s of it awake" if wall_s - awake_s >= _ASLEEP_NOTE_MIN_S else ""
+
+
+# Below this, wall and monotonic readings differ only by clock noise, not by a sleep.
+_ASLEEP_NOTE_MIN_S = 30
+
+
 def _poll_stalled(last_ok: float, now: float,
                   limit: float = POLL_STALL_EXIT_S) -> bool:
     """Whether the poll loop has gone `limit` seconds without a success."""
@@ -10733,6 +11083,7 @@ def main() -> None:
              f"prefer launching through startup.sh for full diagnostics")
     backoff = 1
     poll_grace_since = time.time()
+    poll_ok_awake = time.monotonic()  # poll_grace_since on the clock a host sleep does not advance
     last_poll_ok: float | None = None
     poll_failures = 0  # consecutive network failures; the next good poll resets it
     stall_anchor = time.monotonic()  # excludes system sleep on macOS, unlike time.time()
@@ -10767,13 +11118,14 @@ def main() -> None:
             _push_pool_advertisement()
             if _advance_held_tasks(inflight):   # a retried ack, or a publish after a restart
                 wake_outbound()
-            prev_ok = poll_grace_since
+            prev_ok, prev_ok_awake = poll_grace_since, poll_ok_awake
             _RESP_META.last = None
             try:
+                # The whole poll is bounded, not each socket read: a body that drips held it open.
                 resp = _req("GET", f"/v1/tasks?wait={_poll_wait(inflight)}{_POLL_PROOF}",
-                            timeout=POLL_WAIT + 10)
+                            timeout=POLL_WAIT + 10, deadline=time.monotonic() + POLL_WAIT + 10)
                 last_poll_ok = poll_grace_since = time.time()
-                stall_anchor = time.monotonic()
+                stall_anchor = poll_ok_awake = time.monotonic()
                 # A completed poll remains evidence even if accepting its tasks fails.
                 _emit_gateway_status(True, poll_ok_ts=last_poll_ok)
             except (TimeoutError, socket.timeout):
@@ -10786,7 +11138,8 @@ def main() -> None:
                 resp = {"tasks": []}
             received_at = time.monotonic()           # the dropped-ack retry budget runs from here
             if poll_failures and poll_grace_since != prev_ok:  # a real answer, not the grace path
-                _log(f"poll recovered after {poll_failures} failures, {int(poll_grace_since - prev_ok)}s")
+                _log(f"poll recovered after {poll_failures} failures, {int(poll_grace_since - prev_ok)}s"
+                     f"{_awake_note(poll_grace_since - prev_ok, poll_ok_awake - prev_ok_awake)}")
                 poll_failures = 0
             added = False
             pending_ack = []
@@ -10837,7 +11190,8 @@ def main() -> None:
         except _NETWORK_ERRORS as e:
             poll_failures += 1
             _log(f"poll network error: {diagnostics.describe(e)} — {poll_failures} consecutive, "
-                 f"{int(time.time() - poll_grace_since)}s since last successful poll — "
+                 f"{int(time.time() - poll_grace_since)}s since last successful poll"
+                 f"{_awake_note(time.time() - poll_grace_since, time.monotonic() - poll_ok_awake)} — "
                  f"backing off {backoff}s")
             _emit_gateway_status(False, error=f"network: {diagnostics.describe(e)}", backoff_s=backoff,
                                  poll_ok_ts=last_poll_ok)
