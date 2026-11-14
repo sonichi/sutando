@@ -24,10 +24,10 @@ Usage:
   ensure-cron-room.py --crons-file <path> [--name <cron> | --all]
                       [--owner <mxid>] [--repo <repo-root>] [--dry-run]
 
-Token: on an install with several connections, the primary's (the core's
-connections.room_credential); otherwise resolved from $GATEWAY_TOKEN / $REMOTE_TASK_TOKEN / $AG2_REMOTE_TOKEN
-(env first) else the `AG2_REMOTE_TOKEN=` line in <repo>/.env. Combined
-`https://<gateway>|<secret>` form is split; a bare secret needs $GATEWAY_URL.
+Token: on an install with several connections, connections.room_credential
+selects the room's server (or the primary). Otherwise src/relay_credentials.py
+resolves env, channel env, vault, then <repo>/.env. Combined
+`https://<gateway>|<secret>` form is split; a bare secret needs a URL alias.
 Owner mxid: --owner, else $AG2_OWNER_MXID, else the token's own account is not
 discoverable here so we require one of those when creating.
 """
@@ -63,42 +63,25 @@ def _routed(repo, room):
     return url.rstrip("/"), connections.secret_of(token) or token.strip()
 
 
-def resolve_token(repo, room=None):
-    routed = _routed(repo, room)
+def resolve_token(repo=None, room=None):
+    """Resolve room routing first, then the shared relay credential tiers."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2]
+    routed = _routed(str(repo) if repo is not None else str(root), room)
     if routed is not None:
         return routed
-    # Resolve gateway creds from the SAME alias set the existing clients use
-    # (src/remote-gateway-bridge.py, skills/agent-room-ops/_gateway.py) — read
-    # from BOTH process env and <repo>/.env (the persistent bridge/startup
-    # setup), process env winning. Parsing only AG2_REMOTE_TOKEN from .env
-    # mis-detected a split-token install (e.g. REMOTE_TASK_URL + REMOTE_TASK_TOKEN)
-    # as "not connected" (review #2079).
-    TOKEN_KEYS = ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
-    URL_KEYS = ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL", "AG2_REMOTE_URL")
-    vals = {k: os.environ.get(k) for k in TOKEN_KEYS + URL_KEYS}
-    envp = os.path.join(repo, ".env")
-    if os.path.isfile(envp):
-        for line in open(envp):
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            k = k.strip()
-            if k in vals and not vals.get(k):  # process env wins over .env
-                vals[k] = v.strip().strip('"').strip("'")
-    raw = next((vals[k] for k in TOKEN_KEYS if vals.get(k)), "")
-    if not raw:
-        return None, None
-    # Combined onboarding form "https://<gateway>|<secret>" carries the URL in
-    # the token; otherwise it's a bare secret and the URL comes from env.
-    if "|" in raw and raw.split("|", 1)[0].startswith(("http://", "https://")):
-        url_from_token, secret = raw.split("|", 1)
+    src = str(root / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    from relay_credentials import resolve_relay_credentials
+    if repo is None:
+        creds = resolve_relay_credentials()
     else:
-        url_from_token, secret = "", raw
-    # URL precedence (same as the existing clients): explicit
-    # GATEWAY_URL > RELAY_URL > REMOTE_TASK_URL > AG2_REMOTE_URL > url-from-token.
-    url = next((vals[k] for k in URL_KEYS if vals.get(k)), url_from_token or "").rstrip("/")
-    return (url or None), (secret or None)
+        envp = Path(repo) / ".env"
+        creds = resolve_relay_credentials(repo=envp if envp.is_file() else None)
+    if not creds.token:
+        return None, None
+    return (creds.base_url or None), creds.token
 
 
 def call(url, secret, payload, timeout=10):

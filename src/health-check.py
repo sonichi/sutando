@@ -27,6 +27,7 @@ Checks:
 """
 
 import ast
+import collections
 import functools
 import hashlib
 import fnmatch
@@ -64,6 +65,7 @@ from git_binary import git_argv  # noqa: E402
 from git_binary import GitUnavailable  # noqa: E402
 from git_binary import developer_tools_installed  # noqa: E402
 from channel_token import token_from_vault  # noqa: E402
+import relay_credentials  # noqa: E402
 from channel_env_resolve import channel_configured  # noqa: E402
 from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
@@ -4295,8 +4297,9 @@ def _bridge_launch_plan(name: str) -> "tuple[str, dict] | None":
         # The bridge exits without a token, and startup.sh sources the same
         # channels/ag2space/.env before launching it.
         gw_env = _load_channel_env("ag2space")
-        merged = {**os.environ, **gw_env}
-        token = merged.get("REMOTE_TASK_TOKEN") or merged.get("AG2_REMOTE_TOKEN")
+        # startup.sh sources the channel env over the inherited one, so it wins here too.
+        token = _relay_creds(channel=gw_env,
+                             environ=collections.ChainMap(gw_env, os.environ)).raw
         if not token:
             return None
         child_env.update(gw_env)
@@ -14369,6 +14372,17 @@ def _gateway_owner_room(source: str = "ag2space") -> "str | None":
     return None
 
 
+def _relay_creds(source: str = "ag2space", channel=None,
+                 environ=None) -> "relay_credentials.RelayCredentials":
+    """The shared relay resolver, fed this module's channel locator and vault seam."""
+    if channel is None:
+        channel = relay_credentials.channel_env_file(
+            source, channels_dir=claude_home_path("channels"))
+    return relay_credentials.resolve_relay_credentials(
+        source, environ=environ, channel=channel,
+        vault=lambda: relay_credentials.vault_token(token_from_vault))
+
+
 def _primary_channel_source(source: str = "ag2space") -> str:
     """The channel dir of the primary connection's bridge; `source` for the legacy row or none."""
     import connections
@@ -14379,7 +14393,7 @@ def _primary_channel_source(source: str = "ag2space") -> str:
 def _gateway_creds(source: str = "ag2space", room: "str | None" = None) -> "tuple[str, str] | None":
     """(url, token) for the gateway op:message endpoint, or None. With several connections,
     the one serving `room`'s server (no room: the primary), and None when it has none. Else
-    the one-token form (REMOTE_TASK_TOKEN='https://gw|secret') or the legacy AG2_REMOTE_* aliases."""
+    the shared relay resolver supplies the legacy-install credential."""
     import connections
     try:
         routed = connections.room_credential(room, workspace=WORKSPACE_DIR)
@@ -14388,17 +14402,8 @@ def _gateway_creds(source: str = "ag2space", room: "str | None" = None) -> "tupl
     if routed is not None:
         url, token = routed
         return url.rstrip("/"), connections.secret_of(token) or token.strip()
-    env = _env_file_dict(claude_home_path("channels", source, ".env"))
-
-    def get(key: str) -> str:
-        return os.environ.get(key) or env.get(key) or ""
-
-    url = (get("REMOTE_TASK_URL") or get("AG2_REMOTE_URL")).strip().rstrip("/")
-    token = (get("REMOTE_TASK_TOKEN") or get("AG2_REMOTE_TOKEN")).strip()
-    if "|" in token:
-        _u, token = token.split("|", 1)
-        url = url or _u.strip().rstrip("/")
-    return (url, token) if url and token else None
+    creds = _relay_creds(source)
+    return (creds.base_url, creds.token) if creds.base_url and creds.token else None
 
 
 def _default_gateway_sender(text: str) -> bool:

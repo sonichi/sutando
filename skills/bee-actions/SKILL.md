@@ -57,9 +57,10 @@ Declared in this skill's `manifest.json` `config` block (see
 - `BEE_ROOM_OWNER` — owner mxid; enables one-touch auto-registration when no
   room is registered yet
 
-Gateway credentials for the room verbs resolve via the shared contract
-(`GATEWAY_TOKEN` > `RELAY_TOKEN` > `REMOTE_TASK_TOKEN` > `AG2_REMOTE_TOKEN`;
-combined `url|secret` onboarding tokens honored).
+Gateway credentials for the room verbs resolve via `src/relay_credentials.py`:
+the process env (`GATEWAY_TOKEN` > `RELAY_TOKEN` > `REMOTE_TASK_TOKEN` >
+`AG2_REMOTE_TOKEN`), then the ag2space channel env, the vault, the repo `.env`;
+combined `url|secret` onboarding tokens honored.
 
 ## Tests
 
