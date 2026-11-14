@@ -84,11 +84,41 @@ def lock_path(path: Path) -> Path:
     return path.with_name(path.name + ".lock")
 
 
+class NotAHostAnchor(ValueError):
+    """The target does not resolve under hosts/<label>/ — see require_host_anchor()."""
+
+
+def require_host_anchor(path: Path) -> Path:
+    """Raise unless the EFFECTIVE destination sits in hosts/<label>/.
+
+    Resolved, never spelled: `hosts/../x.md` names the workspace root however it
+    reads, and `hosts/hosts/x.md` is the legitimate host whose label is `hosts`.
+    """
+    resolved = Path(path).expanduser().resolve()
+    if resolved.parent.parent.name != "hosts":
+        raise NotAHostAnchor(
+            f"{path} resolves to {resolved}, which does not sit under hosts/<label>/. "
+            "An unset host label collapses hosts/$H/ to hosts/, whose content the vault "
+            "does not carry (`!hosts/*/**` needs the directory level), so the write would "
+            "succeed onto a path that is ignored and never backed up."
+        )
+    return resolved
+
+
 @contextmanager
 def locked(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with locked_file(lock_path(path), create_mode=0o600):
-        yield
+    """Yield the RESOLVED destination; every side effect must use it.
+
+    An alias (a symlink, `hosts/../`) validates as the anchor it resolves to, so
+    the lock, the temp file and the archive must land beside that file too, or
+    two spellings of one anchor take two locks and rotation can drop an append.
+    """
+    # Validate BEFORE mkdir and before the lock file: a refused write leaves no
+    # directory, no lock and no anchor behind.
+    dest = require_host_anchor(path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with locked_file(lock_path(dest), create_mode=0o600):
+        yield dest
 
 
 def append(path: Path, text: str, keep_bytes: int = DEFAULT_KEEP,
@@ -100,20 +130,20 @@ def append(path: Path, text: str, keep_bytes: int = DEFAULT_KEEP,
     every pass in between pays the oversized read. Returns the RotateResult when it
     rotated, else None. Nothing is deleted: head + archive is still the original.
     """
-    with locked(path):
-        with open(path, "a", encoding="utf-8") as f:
+    with locked(path) as dest:
+        with open(dest, "a", encoding="utf-8") as f:
             f.write(text if text.endswith("\n") else text + "\n")
-        if not auto_rotate or path.stat().st_size <= keep_bytes:
+        if not auto_rotate or dest.stat().st_size <= keep_bytes:
             return None
-        return _rotate_locked(path, keep_bytes, False, pin, None)
+        return _rotate_locked(dest, keep_bytes, False, pin, None)
 
 
 def replace(path: Path, text: str) -> None:
     """Create or rewrite the whole head under the writer lock, atomically (temp + os.replace)."""
-    with locked(path):
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with locked(path) as dest:
+        tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
         tmp.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
-        os.replace(tmp, path)
+        os.replace(tmp, dest)
 
 
 def split(text: str) -> tuple[str, list[str]]:
@@ -240,8 +270,8 @@ def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
 def rotate(path: Path, keep_bytes: int = DEFAULT_KEEP, dry_run: bool = False,
            pin=PIN_DEFAULT, _between_read_and_replace=None) -> RotateResult:
     """Rotate under the writer lock. `_between_read_and_replace` is a test seam."""
-    with locked(path):
-        return _rotate_locked(path, keep_bytes, dry_run, pin, _between_read_and_replace)
+    with locked(path) as dest:
+        return _rotate_locked(dest, keep_bytes, dry_run, pin, _between_read_and_replace)
 
 
 def _rotate_locked(path: Path, keep_bytes: int, dry_run: bool, pin,
