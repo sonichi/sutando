@@ -303,6 +303,33 @@ def task_can_post(workspace: Path, task_id: Optional[str]) -> bool:
     return ltp.find_result(Path(workspace) / "results", task_id) is None
 
 
+def _task_stems(workspace: Path) -> "frozenset | None":
+    """One listing of tasks/, as the name before each entry's first `.`; None when it cannot be
+    listed, so no caller treats an unreadable inbox as an empty one."""
+    try:
+        return frozenset(name.split(".", 1)[0] for name in os.listdir(Path(workspace) / "tasks"))
+    except FileNotFoundError:
+        return frozenset()
+    except OSError:
+        return None
+
+
+def _poster(workspace: Path) -> Callable[[Optional[str]], bool]:
+    """task_can_post for one read-only pass: each task is asked once, and a dot-free id with no
+    entry in a single listing of tasks/ is answered there without a glob per call."""
+    stems, seen = _task_stems(workspace), {}
+
+    def can_post(task_id: Optional[str]) -> bool:
+        if task_id not in seen:
+            # find_task_file only matches `<id>.txt` and `<id>.*`: with no `.` in the id, an
+            # id absent from the listing has no task file. An id with a `.` takes the full lookup.
+            absent = stems is not None and isinstance(task_id, str) and "." not in task_id \
+                and task_id not in stems
+            seen[task_id] = not absent and task_can_post(workspace, task_id)
+        return seen[task_id]
+    return can_post
+
+
 FUTURE_TOLERANCE_S = 300
 
 
@@ -325,12 +352,13 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
     open_recs = [r for r in records(workspace, "pending")
                  if not _record_path(workspace, "answered", r["cid"]).exists()]
     held = _answer_bindings(workspace, {r["cid"] for r in open_recs})
+    can_post = _poster(workspace)
     out, listed = [], set()
     for r in sorted(open_recs, key=lambda r: r.get("asked_at") or 0):
         age = _age(r, now)
         nudged = _record_path(workspace, "nudged", r["cid"]).exists()
         if nudged and age > expire_after_s and r["cid"] not in held \
-                and not task_can_post(workspace, r.get("task_id")):
+                and not can_post(r.get("task_id")):
             continue
         listed.add(r.get("task_id"))
         overdue = age >= nudge_after_s
@@ -352,10 +380,14 @@ def pending(workspace: Path, nudge_after_s: float, now: Optional[float] = None,
                         "reason": "closed, but its relay is not acknowledged: tell the owner that the answer "
                                   "may not have been delivered, then run `relayed <cid>`"})
     roots = Path(workspace) / _STATE / "roots"
+    answered_tasks = None  # read once, and only if a root needs it: never once per root
     for f in sorted(roots.glob("*.json")) if roots.is_dir() else []:
         task = f.name[:-len(".json")]
-        if task not in listed and task_can_post(workspace, task) \
-                and not any(r.get("task_id") == task for r in records(workspace, "answered")):
+        if task in listed or not can_post(task):
+            continue
+        if answered_tasks is None:
+            answered_tasks = {r.get("task_id") for r in records(workspace, "answered")}
+        if task not in answered_tasks:
             out.append({"task_id": task, "cid": (_read_record(f) or {}).get("cid"), "claim_only": True,
                         "unconfirmed": True,
                         "reason": "a root claim with no ask record: this task cannot ask again; "
@@ -709,6 +741,13 @@ def match_reply(transport, *, room: str, self_mxid: str, workspace: Optional[Pat
     return _close(workspace, data, event, task_id, no)
 
 
+def _closable_binding(binding) -> bool:
+    """Whether a binding holds what _close needs: its payload and its consult record. A malformed
+    one can never close a consult, so nothing may treat it as holding one open either."""
+    return (isinstance(binding, dict) and isinstance(binding.get("payload"), dict)
+            and isinstance(binding.get("record"), dict))
+
+
 def _judged(workspace: Path, bound: dict, event: str, task_id, final: bool, not_final: bool, no) -> dict:
     """A message already bound: its recorded judgement wins; an answer binding finishes
     closing its own consult from what the binding holds, without the room or the expiry."""
@@ -718,7 +757,7 @@ def _judged(workspace: Path, bound: dict, event: str, task_id, final: bool, not_
             return no("this message was bound as not final; --final conflicts with that judgement",
                       conflict=True, cid=cid)
         return no("this message was already judged not final", progress=True, cid=cid)
-    if not isinstance(bound.get("payload"), dict) or not isinstance(bound.get("record"), dict):
+    if not _closable_binding(bound):
         return no(f"the binding of {event} is malformed; nothing is closed")
     if not_final:
         return no("this message was bound as the answer; --not-final conflicts with that judgement "
@@ -767,7 +806,7 @@ def _answer_bindings(workspace: Path, cids) -> dict:
     d, out = Path(workspace) / _STATE / "bound", {}
     for p in sorted(d.glob("*.json")) if cids and d.is_dir() else []:
         b = _read_record(p)
-        if b and b.get("cid") in cids and b.get("disposition") == "answer":
+        if b and b.get("cid") in cids and b.get("disposition") == "answer" and _closable_binding(b):
             out.setdefault(b["cid"], b)
     return out
 
