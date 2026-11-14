@@ -5,7 +5,7 @@ Status comes from the snapshot, the name from the profile patch. A worker in
 one and not the other renders wrong rather than absent, which is why both are
 built from a single roster read.
 
-Run: python3 tests/pool-advertise.test.py
+Run: python3 tests/skills/worker-pool/pool-advertise.test.py
 """
 from __future__ import annotations
 
