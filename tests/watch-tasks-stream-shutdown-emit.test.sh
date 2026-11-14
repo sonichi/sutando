@@ -19,6 +19,8 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=fixtures/clean-watcher-env.sh
+. "$REPO/tests/fixtures/clean-watcher-env.sh"
 WATCHER="$REPO/src/watch-tasks-stream.sh"
 EMITTERS="$REPO/src/task-emit.sh"
 
@@ -156,6 +158,7 @@ fi
 # Real shutdown recovery: the structural checks above accept any plain `"$var"`,
 # so only an end-to-end TERM proves recovery names the payload, not the sentinel.
 RTMP="$(mktemp -d)"
+RTMP="$(cd "$RTMP" && pwd -P)"
 # Not under deliveries/: that inbox is a worker's, and a worker never runs the core's handler.
 RWS="$RTMP/ws"; RINBOX="$RWS/inbox/w-test"
 mkdir -p "$RWS/tasks" "$RINBOX" "$RWS/results"

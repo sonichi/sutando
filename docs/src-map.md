@@ -127,6 +127,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`holder_lock.py`** — One-process exclusion per work root: a flock held for the owner's life, and a record of who holds it.
 - **`hook_transcript_path.sh`** — Shared resolver for a Claude Code hook's transcript path.
 - **`http-body-limit.ts`** — Shared request-body cap for the two HTTP surfaces that accept a vision frame: the web-client's /vision/frame proxy and the voice-agent's vision control server.
+- **`inbox-events.sh`** — Sourceable: start_inbox_events <python> <fifo> <path>...
 - **`inbox-resolve.sh`** — Inbox-entry resolver — sourceable so a test can invoke it in isolation.
 - **`ingress_identity.py`** — Provider-event ingress admission — the shared policy behind Slice 3.
 - **`init.sh`** — Sutando init — idempotent first-run + every-start bootstrap.
@@ -143,6 +144,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`issued_cards.py`** — The agent panel cards this agent itself posted, so a card click counts only as an answer to one of them.
 - **`lane_dedupe.py`** — Cross-lane duplicate guard: one room message becomes one task, answered by its owner lane when known.
 - **`launch_hooks.py`** — Launch hooks: the scripts installed skills declare with the manifest field `on_launch`, each started once per core launch, detached, so no launch waits on or fails because of one.
+- **`line_relay.py`** — Copy stdin to stdout line by line, never letting a slow stdout stall stdin.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.
 - **`local_api_gate.py`** — The one gate for the loopback HTTP services' privileged routes.
 - **`local_record.py`** — Local JSON records: one object per file under a directory, each written whole in one rename and read back only when its file name is a safe single path segment that the record itself names.
