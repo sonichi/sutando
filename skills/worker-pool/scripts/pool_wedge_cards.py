@@ -16,6 +16,7 @@ a card instead, through the engine's hitl store:
 from __future__ import annotations
 
 import importlib.util
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -121,6 +122,21 @@ def limit_holds(workspace, req, worker_id, runner=None, owes_work=None) -> bool:
     return tui_gate.limit_card_holds(req, text, worker_runtime(workspace, worker_id), outrun)
 
 
+# Claude Code's footer row for a background agent still running ("◯ general-purpose  … 37m 31s · ↓ 159.5k tokens").
+BACKGROUND_AGENT_ROW = re.compile(r"^\s*◯ \S.*\d+[ms](?: \d+s)? · [↓↑]", re.MULTILINE)
+
+
+def live_owed_tasks(workspace, worker_id) -> list[str]:
+    """Owed task ids (no ready result) whose task file is still live in tasks/: the ones a
+    delivery could still type in. A sentinel left over for an archived or vanished task is not."""
+    from delivery import task_dispatch as td
+    from task_archive import find_task_file
+    owned = td.owned_task_ids(sup.pd.deliveries_dir(workspace, worker_id).parent, worker_id)
+    ready = td.ready_result_filenames(sup.pd.results_dir(workspace), [f"{t}.txt" for t in owned])
+    tasks = Path(workspace) / "tasks"
+    return [t for t in owned if f"{t}.txt" not in ready and find_task_file(tasks, t) is not None]
+
+
 def _jump(session):
     from hitl.schema import Action
     return Action(id="open_terminal", kind="open_terminal", label=f"Open terminal ({session})")
@@ -168,6 +184,32 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
             [_jump(session)], f"{SOURCE}:{session}:human", subject, runtime=runtime,
             title=f"{seat} · needs your decision", device=device, kind="core-blocked",
             turn_on_action=False)
+    elif which == ps.CARD_UNDELIVERED:
+        if pane != ps.PANE_IDLE:
+            return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
+        if BACKGROUND_AGENT_ROW.search(text):
+            # The turn ended but a background agent it started is still running.
+            return {"worker_id": worker_id, "outcome": "cleared", "pane": "background-agent"}
+        if not live_owed_tasks(workspace, worker_id):
+            # Owed only by sentinels whose task is archived or gone: nothing to deliver.
+            return {"worker_id": worker_id, "outcome": "cleared", "pane": "no-live-task"}
+        cause = sup.delivery_block(socket)
+        body = [f"{seat} (tmux session {session}) owes work, its watcher is running, and its pane "
+                f"has read idle at the prompt for over {int(ps.UNDELIVERED_AFTER_S // 60)} minutes: "
+                "its task appears not to have been delivered."]
+        if cause == "pane-key-fence":
+            body += ["", f"Cause: automated sends on {socket} are blocked by the pane-keys fence "
+                     "(docs/codex-core.md). Once no send can still be in flight, clear it with:",
+                     f"  python3 src/tmux_pane_keys.py recover {socket}",
+                     "The retained tasks are typed in on the notifier's next wake."]
+        else:
+            body += ["", f"Cause: not identified. The {session}-watcher session logs each delivery "
+                     "attempt and why it was refused."]
+        subject.update(cause=[cause] if cause else [])
+        req = choice_request(
+            "\n".join(body), [_jump(session)], f"{SOURCE}:{session}:undelivered:{cause or 'unknown'}",
+            subject, runtime=runtime, title=f"{seat} · tasks not delivered", device=device,
+            kind="core-blocked", turn_on_action=False)
     elif which == ps.CARD_FROZEN:
         if pane != ps.PANE_WORKING:
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}

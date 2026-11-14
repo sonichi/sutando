@@ -237,13 +237,21 @@ class TestFlagAfterDrain(Base):
     def test_a_done_flag_with_no_result_is_finished_not_died(self):
         """The bridge drains results/<id>.txt on delivery. A crash between the
         flag and the archive, then a drain, leaves .accepted + flag + payload and
-        NO result. Reading that as died-mid-work re-runs finished work."""
+        NO result. Reading that as died-mid-work re-runs finished work; dropping
+        the sentinel hands the live payload back to the core, which re-runs it too."""
         self.ws.payload("task-1")
         pd.accept(self.ws.deliver("core", "task-1"))
         self.ws.flag("core", "task-1")                  # result already drained
         self.assertEqual(pd.residue(self.root, "core", "task-1"), "finished")
         out = pd.sweep(self.root, "core")
-        self.assertEqual(out["released"], [])
+        self.assertEqual((out["released"], out["ready"]), ([], []))
+        self.assertEqual(out["kept"], ["task-1"])
+        self.assertIsNotNone(pd.find(self.root, "core", "task-1"))
+
+    def test_a_done_flag_whose_payload_is_gone_is_retired(self):
+        pd.accept(self.ws.deliver("core", "task-1"))
+        self.ws.flag("core", "task-1")
+        self.assertEqual(pd.sweep(self.root, "core")["retired"], ["task-1"])
         self.assertIsNone(pd.find(self.root, "core", "task-1"))
 
 
@@ -443,7 +451,7 @@ class TestCliDispatch(Base):
         rc, out = self._main("sweep")
         got = json.loads(out)
         self.assertEqual(rc, 0)
-        self.assertEqual(set(got), {"ready", "released", "completed", "retired", "stale"})
+        self.assertEqual(set(got), {"ready", "released", "completed", "retired", "stale", "kept"})
         self.assertEqual(got["ready"], ["task-1"])
 
 
@@ -486,6 +494,156 @@ class TestWatch(Base):
             with self.assertRaises(KeyboardInterrupt):
                 pd.main(["--workspace", str(self.root), "--recipient", "core", "watch"])
         self.assertIn("task-live", seen)
+
+
+class TestSweepNeverDropsAHoldOnLiveWork(Base):
+    """`sweep` deletes on residue's verdict, but residue reads only the bare payload
+    path and the done flag. Removing the sentinel of a task still live in tasks/ with
+    no ready result hands it back to the core's queue: a duplicate run."""
+
+    def test_a_flag_with_a_live_unanswered_payload_is_kept(self):
+        self.ws.payload("task-1")
+        pd.accept(self.ws.deliver("worker-3", "task-1"))
+        self.ws.flag("worker-3", "task-1")
+        self.assertEqual(pd.residue(self.root, "worker-3", "task-1"), "finished")
+        out = pd.sweep(self.root, "worker-3")
+        self.assertEqual(out["kept"], ["task-1"])
+        self.assertEqual((out["ready"], out["released"], out["retired"]), ([], [], []))
+        self.assertIsNotNone(pd.find(self.root, "worker-3", "task-1"))
+
+    def test_a_task_a_core_lane_claimed_is_kept_not_stale(self):
+        (self.root / "tasks" / "task-1.claimed-core-1.txt").write_text(
+            "id: task-1\nsource: test\ntask: x\n", encoding="utf-8")
+        self.ws.deliver("worker-3", "task-1")
+        self.assertEqual(pd.residue(self.root, "worker-3", "task-1"), "stale-sentinel")
+        out = pd.sweep(self.root, "worker-3")
+        self.assertEqual(out["kept"], ["task-1"])
+        self.assertEqual(out["stale"], [])
+        self.assertIsNotNone(pd.find(self.root, "worker-3", "task-1"))
+
+    def test_a_sentinel_whose_id_is_no_task_id_is_kept(self):
+        long_id = "task-" + "a" * 130  # sentinel-shaped, but past the lookup id's 128 characters
+        self.ws.deliver("worker-3", long_id)
+        out = pd.sweep(self.root, "worker-3")
+        self.assertEqual(out["kept"], [long_id])
+        self.assertIsNotNone(pd.find(self.root, "worker-3", long_id))
+
+    def test_sweep_removes_only_what_prune_spent_also_removes(self):
+        """The one rule (task_disposition.SPENT): on every shape, what the boot sweep
+        deletes is a subset of what prune_spent deletes, and neither re-offers spent work."""
+
+        def shaped(d):
+            ws = Workspace(d)
+            for tid in ("task-pending", "task-died", "task-claimed", "task-flag-live",
+                        "task-flag-gone", "task-answered", "task-answered-flag",
+                        "task-archived", "task-missing"):
+                ws.deliver("worker-3", tid)
+            for tid in ("task-pending", "task-died", "task-flag-live", "task-answered", "task-answered-flag"):
+                ws.payload(tid)
+            pd.accept(ws.root / "deliveries/worker-3/task-died.txt")
+            (ws.root / "tasks/task-claimed.claimed-core-1.txt").write_text("id: task-claimed\ntask: x\n")
+            for tid in ("task-flag-live", "task-flag-gone", "task-answered-flag"):
+                ws.flag("worker-3", tid)
+            for tid in ("task-answered", "task-answered-flag"):
+                ws.result(tid)
+            (ws.root / "tasks/archive/task-archived.txt").write_text("id: task-archived\ntask: x\n")
+            return ws.root
+
+        def present(root):
+            return {pd.parse_sentinel(q.name)[0] for q in (root / "deliveries/worker-3").iterdir()
+                    if pd.parse_sentinel(q.name)}
+
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            ra, rb = shaped(a), shaped(b)
+            before = present(ra)
+            swept = pd.sweep(ra, "worker-3")
+            pruned = pd.prune_spent(rb, "worker-3")
+            swept_gone, pruned_gone = before - present(ra), before - present(rb)
+            self.assertLessEqual(swept_gone, pruned_gone, swept)
+            spent = {t for t in before if pd.sentinel_retirable(rb, "worker-3", t)}
+            self.assertEqual(pruned_gone, spent)
+            self.assertEqual(set(swept["ready"] + swept["released"]) & spent, set(), swept)
+            for tid in ("task-pending", "task-died", "task-claimed", "task-flag-live"):
+                self.assertIn(tid, present(ra), f"sweep dropped the hold on live work: {tid}")
+
+
+class TestSpentSentinelsAreArchived(Base):
+    """A spent sentinel moves to deliveries/<worker>/archive/, never over an earlier one, and a
+    file or link where archive/ should be keeps it in the inbox: never deleted, the walk goes on."""
+
+    def spent(self, tid="task-1"):
+        return self.ws.deliver("worker-3", tid)   # no payload anywhere: missing, so spent
+
+    def test_prune_moves_a_spent_sentinel_into_archive(self):
+        self.spent()
+        self.assertEqual(pd.prune_spent(self.root, "worker-3")["archived"], ["task-1"])
+        box = pd.deliveries_dir(self.root, "worker-3")
+        self.assertTrue((box / pd.ARCHIVE_DIR / "task-1.txt").is_file())
+        self.assertIsNone(pd.find(self.root, "worker-3", "task-1"))
+
+    def test_sweep_moves_rather_than_deletes(self):
+        self.spent()
+        self.assertEqual(pd.sweep(self.root, "worker-3")["stale"], ["task-1"])
+        self.assertTrue((pd.deliveries_dir(self.root, "worker-3") / pd.ARCHIVE_DIR / "task-1.txt").is_file())
+
+    def test_an_earlier_archived_name_is_never_overwritten(self):
+        box = pd.deliveries_dir(self.root, "worker-3")
+        self.spent()
+        pd.prune_spent(self.root, "worker-3")
+        (box / pd.ARCHIVE_DIR / "task-1.txt").write_text("first")
+        self.spent()
+        pd.prune_spent(self.root, "worker-3")
+        self.assertEqual(sorted(q.name for q in (box / pd.ARCHIVE_DIR).iterdir()),
+                         ["task-1.txt", "task-1.txt.1"])
+        self.assertEqual((box / pd.ARCHIVE_DIR / "task-1.txt").read_text(), "first")
+
+    def test_a_file_at_archive_keeps_the_sentinel_and_the_walk_goes_on(self):
+        box = pd.deliveries_dir(self.root, "worker-3")
+        self.spent("task-1")
+        self.spent("task-2")
+        (box / pd.ARCHIVE_DIR).write_text("not a folder")
+        out = pd.prune_spent(self.root, "worker-3")
+        self.assertEqual(out["kept"], ["task-1", "task-2"])
+        self.assertIn("archive_error", out)
+        self.assertTrue((box / "task-1.txt").exists() and (box / "task-2.txt").exists())
+        self.assertEqual((box / pd.ARCHIVE_DIR).read_text(), "not a folder")
+        self.assertEqual(sorted(pd.sweep(self.root, "worker-3")["kept"]), ["task-1", "task-2"])
+        self.assertTrue((box / "task-1.txt").exists() and (box / "task-2.txt").exists())
+
+    def test_a_subset_archive_that_cannot_happen_is_empty_never_an_error(self):
+        self.assertEqual(pd.archive_finished(self.root, "nobody", task_ids=["task-1"])["archived"], [])
+        self.assertEqual(pd.archive_finished(self.root, "worker-3", task_ids=["task-bad id"])["archived"], [])
+        self.spent("task-2")
+        self.assertEqual(pd.archive_finished(self.root, "worker-3", task_ids=["task-9"])["archived"], [])
+
+    def test_a_task_re_queued_before_the_lock_keeps_its_sentinel_through_sweep(self):
+        """Blue's probe: the task comes back to tasks/ between the check and the lock."""
+        import contextlib
+        box = pd.deliveries_dir(self.root, "worker-3")
+        self.spent("task-1")
+        real = pd.arbitration
+
+        @contextlib.contextmanager
+        def requeue_then_lock(ws, recipient, **kw):
+            self.ws.payload("task-1")
+            with real(ws, recipient, **kw) as dfd:
+                yield dfd
+
+        pd.arbitration = requeue_then_lock
+        self.addCleanup(setattr, pd, "arbitration", real)
+        self.assertEqual(pd.sweep(self.root, "worker-3")["kept"], ["task-1"])
+        self.assertTrue((box / "task-1.txt").exists(), "a re-queued task lost its sentinel")
+
+    def test_a_link_at_archive_is_never_followed(self):
+        box = pd.deliveries_dir(self.root, "worker-3")
+        outside = self.root / "outside"
+        outside.mkdir()
+        (box).mkdir(parents=True, exist_ok=True)
+        (box / pd.ARCHIVE_DIR).symlink_to(outside)
+        self.spent()
+        self.assertEqual(pd.prune_spent(self.root, "worker-3")["kept"], ["task-1"])
+        self.assertEqual(list(outside.iterdir()), [], "a sentinel was moved through the link")
+        self.assertTrue((box / "task-1.txt").exists())
 
 
 class TestSweepTotality(Base):
@@ -618,7 +776,7 @@ class TestInterruptedReconciliation(Base):
         self.assertEqual(pd.sweep(self.root, "worker-1")["completed"], [tid])
         self.assertTrue(entry.exists())
         pd.mark_done(self.root, "worker-1", tid, published=True)
-        self.assertEqual(pd.prune_spent(self.root, "worker-1")["retired"], [tid])
+        self.assertEqual(pd.prune_spent(self.root, "worker-1")["archived"], [tid])
 
     def test_releases_exactly_died_mid_work_with_coexisting_sentinel_names(self):
         suffixes = (".txt", ".accepted", ".claimed")
@@ -1021,8 +1179,8 @@ class TestMarkDoneCli(Base):
         rc, out = self._main("prune-spent")
 
         self.assertEqual(rc, 0)
-        self.assertEqual(json.loads(out), {"retired": ["task-finished"],
-                                           "stale": [], "kept": ["task-inflight"]})
+        self.assertEqual(json.loads(out), {"archived": ["task-finished"], "pruned": [],
+                                           "kept": ["task-inflight"]})
         self.assertFalse(finished.exists())
         self.assertTrue(inflight.exists())
 

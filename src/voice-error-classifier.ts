@@ -19,6 +19,7 @@ export type FailureCategory =
 	| 'auth_invalid'        // Key revoked, expired, or malformed
 	| 'token_expired'       // Ephemeral token (auth_tokens/…) expired, used up, or past its session-start window
 	| 'model_not_found'     // Configured model name no longer valid
+	| 'location_unsupported' // Google refused the caller's network region (IP geolocation)
 	| 'rate_limit'          // Transient 429 — bodhi will retry, no user action
 	| 'transient'           // Normal close (1000) or other expected closures
 	| 'unknown';            // Did not match any pattern — assume transient
@@ -39,6 +40,14 @@ const PATTERNS: Array<{
 	userMessage: string;
 	userActionUrl: string;
 }> = [
+	{
+		// Checked first so no broader pattern below can claim Google's region refusal.
+		rx: /user location is not supported/i,
+		category: 'location_unsupported',
+		retryable: false,
+		userMessage: 'Voice is offline — Gemini Live isn\'t available from your network\'s region (Google refused the connection: user location not supported). Text chat still works. If you use a VPN or proxy, route generativelanguage.googleapis.com through a supported region (e.g. US, Japan, Singapore, Taiwan) and try again.',
+		userActionUrl: 'https://aistudio.google.com/docs/available-regions',
+	},
 	{
 		rx: /prepayment.{0,20}credits.{0,20}depleted|prepayment.{0,20}depleted/i,
 		category: 'credits_depleted',
@@ -73,8 +82,9 @@ const PATTERNS: Array<{
 		// Real Gemini API errors put the full model path between "model" and
 		// "not found" (e.g. "models/gemini-3.1-flash-live-preview is not
 		// found for API version v1beta") — match on the API's verbatim
-		// phrasing rather than requiring tight proximity.
-		rx: /is not found for API version|not supported for|\bmodels?\/\S+\s+(is\s+)?not\s+found|\b404\b|\bdeprecated\b/i,
+		// phrasing rather than requiring tight proximity. "Not supported for" counts only when a model
+		// method follows: close reasons are cut at 123 bytes, so "…for bidi" must still match.
+		rx: /is not found for API version|\bnot supported for (?:bidi|(?:stream)?generatecontent)|\bmodels?\/\S+\s+(is\s+)?not\s+found|\b404\b|\bdeprecated\b/i,
 		category: 'model_not_found',
 		retryable: false,
 		userMessage: 'Voice is offline — configured Gemini voice model is unavailable. Change the model in config/voice-agent.json in the Sutando workspace, then restart Sutando.',
@@ -115,16 +125,20 @@ export function classifyTransportClose(
 	};
 }
 
+// Refusals Google decides from the network route each dial takes: shown as terminal, but every
+// dial asks again, so fixing the route (a VPN exit) brings voice back without a restart.
+const ROUTE_REFUSALS: ReadonlySet<FailureCategory> = new Set<FailureCategory>(['location_unsupported']);
+
 /**
- * The classifier bodhi's upstream recovery gets (`upstreamRecovery.classifyClose`): a non-retryable
- * close blocks dialing for the fatal backoff; anything else is left to the redial ladder.
+ * The classifier bodhi's upstream recovery gets (`upstreamRecovery.classifyClose`): a non-retryable close
+ * other than a route refusal blocks dialing for the fatal backoff; the rest is left to the redial ladder.
  */
 export function fatalCloseForRecovery(
 	code: number | undefined,
 	reason: string | undefined,
 ): { category: string; code?: number; reason: string } | null {
 	const c = classifyTransportClose(code, reason);
-	return c.retryable ? null : { category: c.category, code, reason: c.rawReason };
+	return c.retryable || ROUTE_REFUSALS.has(c.category) ? null : { category: c.category, code, reason: c.rawReason };
 }
 
 /**
@@ -177,6 +191,8 @@ const PROTOCOL_MAP: Partial<Record<FailureCategory, { reason: string; category: 
 	quota_exceeded: { reason: 'quota-exceeded', category: 'quota' },
 	credits_depleted: { reason: 'credits-depleted', category: 'quota' },
 	model_not_found: { reason: 'model-not-found', category: 'other' },
+	// Additive: a client that predates the reason code reads 'network' and names no key fix.
+	location_unsupported: { reason: 'location-unsupported', category: 'network' },
 };
 
 /**
@@ -196,6 +212,7 @@ export function protocolFailureFor(c: ClassifiedClose): ProtocolFailure | null {
 // arrives while the session sits in fatal backoff still sees
 // `upstream:'failed'` with the classified reason/category.
 let _lastTerminal: ProtocolFailure | null = null;
+let _lastTerminalCategory: FailureCategory | null = null;
 
 /**
  * Classify + persist in one step. Records only terminal classifications;
@@ -205,8 +222,21 @@ let _lastTerminal: ProtocolFailure | null = null;
  */
 export function recordTerminalClassification(c: ClassifiedClose): ProtocolFailure | null {
 	const failure = protocolFailureFor(c);
-	if (failure) _lastTerminal = failure;
+	if (failure) {
+		_lastTerminal = failure;
+		_lastTerminalCategory = c.category;
+	}
 	return failure;
+}
+
+/**
+ * Drop a persisted route refusal before a client attempt dials, so the client gets that dial's answer,
+ * not the stale one. Other terminal failures stay until ACTIVE. Returns whether one was dropped.
+ */
+export function clearRouteRefusalForAttempt(): boolean {
+	if (_lastTerminalCategory === null || !ROUTE_REFUSALS.has(_lastTerminalCategory)) return false;
+	clearTerminalClassification();
+	return true;
 }
 
 /** Last persisted terminal classification (null when none / cleared). */
@@ -220,6 +250,7 @@ export function lastTerminalClassification(): ProtocolFailure | null {
  */
 export function clearTerminalClassification(): void {
 	_lastTerminal = null;
+	_lastTerminalCategory = null;
 }
 
 // AppleScript `display notification` cannot be withdrawn or updated, so a banner

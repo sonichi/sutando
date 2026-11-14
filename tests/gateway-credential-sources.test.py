@@ -1608,7 +1608,7 @@ READS = {"open", "read_text", "read_bytes", "readlines"}
 # The bridge declaration's file: a path built from these is opaque outside the owner. It may be
 # formatted into a message or handed to one of DECLARATION_OWNER_CALLS, and nothing else.
 DECLARATION_MARKERS = {"DECLARATION", "worker.json"}
-DECLARATION_OWNER_CALLS = {"write_bridge_declaration", "remove_bridge_declaration"}
+DECLARATION_OWNER_CALLS = {"write_bridge_declaration", "remove_bridge_declaration", "declared_bridge"}
 OWNER_MODULE = "gateway_credential_sources"
 # The owner's entry points: reachable only as `<alias>.<name>(...)` on the module's one import of it.
 OWNER_CALLS = frozenset(DECLARATION_OWNER_CALLS | READER_ONLY)
@@ -2390,7 +2390,8 @@ class Guard(unittest.TestCase):
         tree = ast.parse(text)
         parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
         uses = [n for n in ast.walk(tree) if isinstance(n, ast.Attribute) and ast.unparse(n.value) == "_sources"]
-        self.assertEqual(sorted(n.attr for n in uses), ["remove_bridge_declaration", "seat_bridge_environ",
+        self.assertEqual(sorted(n.attr for n in uses), ["remove_bridge_declaration", "remove_bridge_declaration",
+                                                        "seat_bridge_environ",
                                                         "write_bridge_declaration"],
                          "the owner checks, writes and removes the declaration and reads a seat; the adapter only "
                          "names its path")

@@ -254,6 +254,14 @@ def resolve_room_channel_env(channels_dir, source: str, room_id: str) -> Path | 
     return picked
 
 
+def _worker_lane(source: str) -> bool:
+    try:
+        import connections
+        return connections.worker_lane_named(source)
+    except Exception:  # noqa: BLE001 - no record to ask is simply not a worker's lane
+        return False
+
+
 def main(argv: list[str]) -> int:
     args = argv[1:]
     room = ""
@@ -272,6 +280,10 @@ def main(argv: list[str]) -> int:
             return 1
     else:
         resolved = resolve_channel_env(channels_dir, source)
+    if resolved is None and _worker_lane(source):
+        print(f"channel-env: {source} is a pool worker's own lane: its token is in the vault, not a "
+              "file to source; room_ops.py resolves it by room in that worker's session", file=sys.stderr)
+        return 1
     if resolved is None and not os.path.isdir(os.path.join(channels_dir, source)):
         print(f"channel-env: no channel dir {os.path.join(channels_dir, source)}", file=sys.stderr)
         return 1

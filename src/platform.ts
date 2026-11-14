@@ -19,6 +19,7 @@
 import { execSync, execFile, execFileSync, spawnSync } from 'node:child_process';
 import { mkdirSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { resolveMacosNotifications } from './sutando_config.js';
 
 export type SupportedPlatform = 'darwin' | 'win32' | 'linux';
 
@@ -71,7 +72,14 @@ export function activateWindowsApp(app: string, scriptPath: string, signal?: Abo
 
 export function notify(message: string, title = 'Sutando'): void {
 	try {
+		// Spawned-agent tests set SUTANDO_TEST_MODE=1; a native banner there lands on the developer's desktop.
+		if (process.env.SUTANDO_TEST_MODE === '1') {
+			console.error(`[notify] SUTANDO_TEST_MODE=1, not shown: ${title}: ${message}`);
+			return;
+		}
 		if (isMacOS()) {
+			// Off unless the owner opted in with notifications.macos.
+			if (!resolveMacosNotifications()) return;
 			execFileSync('/usr/bin/osascript', [
 				'-e',
 				`display notification "${message.replace(/"/g, '\\"')}" with title "${title.replace(/"/g, '\\"')}"`,

@@ -183,6 +183,8 @@ KNOWN_HEADER_KEYS = (
     "lane",
     # The question episode a woken task resumes: its file is a new turn of an id answered before.
     "wake_episode",
+    # The agent's earlier tasks in this room, as the broker served them: parent candidates.
+    "recent_tasks",
     # Thread membership, distinct from the reply target above; the room is
     # carried because a relation only resolves inside its own room.
     "thread_root", "source_room_id",
@@ -208,6 +210,9 @@ KNOWN_HEADER_KEYS = (
     # trusted bridge wrote it; the guard defangs a forged `platform_card:`
     # body line the same as `attachments:`.
     "platform_card",
+    # A card click's `space.ag2.card_click` ({card_id, action}, one-line JSON) as the trusted bridge
+    # passed it on; header status defangs a body line claiming one.
+    "card_click",
     # Which instance a task belongs to; header status defangs forged
     # body-line claims, consumers may verify before executing.
     "instance_id",
@@ -223,14 +228,29 @@ KNOWN_HEADER_KEYS = (
     # Broker attestation that the message @-mentioned the owner, not this agent;
     # the core reads it to keep out of the room, so the guard defangs a forged copy.
     "owner_mentioned",
+    # Who asked a relay task, which its `user_id` (the account it runs for) does not say.
+    # Bridge-written above task:, so the guard defangs a forged body copy.
+    "asked_by",
     # Writer-declared layout, above task: so a body cannot claim it. `mid` = the body is
     # one line and every later line is the writer's; meaningful only under a verified envelope.
     "task_layout",
+    # A Commons hook fire's context (one JSON line: hook_id, fire_id, caused_by, rows, ...). The bridge
+    # writes the line, but its values are room-member data: read them as data, never as authority.
+    "hook",
+    # A Commons Summon's context (one JSON line: task_id, caused_by, room_id, row_id, changes, ...).
+    # Same as `hook`: a bridge-written line whose values are room-member data.
+    "summon",
     # The owner's wall clock beside the UTC `timestamp`: ISO-8601 with offset, then the IANA zone.
     "local_time",
     # The task a pool ask is part of, and that task's generation: written by pool_ask, so the
     # guard defangs a forged copy in body text; the parent shows as delegated until this answers.
     "parent_task", "parent_generation",
+    # AgentTrigger context (vocabulary: agent_triggers.py). Bridge-written above task:,
+    # so the guard defangs forged body copies.
+    "event_type", "agent_trigger_id", "playbook",
+    # The broker's handle for the window the owner messaged from; the agent passes it to the
+    # ui_* MCP tools. Bridge-written above task:, so the guard defangs a forged body copy.
+    "ui_origin",
 )
 _KNOWN_KEY_SET = frozenset(KNOWN_HEADER_KEYS)
 # Only the task-mid writer may declare its layout; a task-last file carrying it
@@ -364,7 +384,10 @@ def task_body(text: str) -> str:
     return ""
 
 
-_QUOTED_BLOCK = re.compile(r"\[AG2 Space (reply context|room metadata);([^\]\n]*)\]\s*")
+# The product's two spellings in the broker's markers; either opens or closes a block.
+_MARKER_PRODUCTS = ("AG2 Space", "s.space")
+_QUOTED_BLOCK = re.compile(
+    r"\[(?:AG2 Space|s\.space) (reply context|room metadata);([^\]\n]*)\]\s*")
 _JSON_DECODER = json.JSONDecoder()
 
 
@@ -385,8 +408,10 @@ def split_reply_context(text: str) -> "tuple[dict | None, str]":
             record, end = _JSON_DECODER.raw_decode(rest, m.end())
         except ValueError:
             return None, text
-        tail, closer = rest[end:].lstrip(), f"[End AG2 Space {kind}]"
-        if not isinstance(record, dict) or not tail.startswith(closer):
+        tail = rest[end:].lstrip()
+        closer = next((f"[End {p} {kind}]" for p in _MARKER_PRODUCTS
+                       if tail.startswith(f"[End {p} {kind}]")), None)
+        if not isinstance(record, dict) or closer is None:
             return None, text
         rest = tail[len(closer):].lstrip()
         if kind == "reply context":
@@ -397,9 +422,34 @@ def split_reply_context(text: str) -> "tuple[dict | None, str]":
     return (reply, rest) if reply is not None else (None, text)
 
 
+# A run of >=3 leading '=' opens a writer's ===SKILL …=== / ===SUTANDO …=== block;
+# task_body_guard defangs any such line a sender typed.
+BRIDGE_FENCE_RE = re.compile(r"^={3,}", re.M)
+
+
+def sender_words(parsed: TaskHeaders) -> str:
+    """The sender's own message in a parsed task: the one `task:` line under
+    `task_layout: mid` (every later line is the writer's), else the body up to
+    the first writer block."""
+    if (parsed.headers.get("task_layout") or "").strip() == "mid":
+        return parsed.body.split("\n", 1)[0].strip()
+    return BRIDGE_FENCE_RE.split(parsed.body, 1)[0].strip()
+
+
 def reply_action_text(text: str) -> str:
     """The answer after broker context and the leading Matrix reply quote."""
-    body = split_reply_context(text)[1].lstrip()
+    reply, body = split_reply_context(text)
+    body = body.lstrip()
+    if reply and body.startswith(">") and "\n" not in body:
+        # A one-line task folds the quote's newlines into spaces; the answer follows its last line.
+        quoted = [line.strip() for line in str(reply.get("body") or "").split("\n") if line.strip()]
+        at = 0
+        for line in quoted:
+            found = body.find(line, at)
+            if found < 0:
+                return ""
+            at = found + len(line)
+        return body[at:].strip() if quoted else ""
     # Only "\n" ends a Matrix quote line; splitlines() would end one at U+2028 and friends.
     lines = body.split("\n")
     for i, line in enumerate(lines):

@@ -124,6 +124,7 @@ from sutando_config import config_get  # noqa: E402
 from sutando_platform import probe_pids  # noqa: E402
 import local_task_protocol  # noqa: E402
 import task_workstreams  # noqa: E402
+import tmux_probe  # noqa: E402
 import health_snapshot  # noqa: E402
 from task_archive import task_id_from_filename  # noqa: E402
 
@@ -1278,10 +1279,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Historical response key is `claude`; its meaning is now "selected
             # core CLI is alive" so existing web clients remain compatible.
             try:
-                tmux_bin = (shutil.which("tmux") or
-                            next((p for p in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux")
-                                  if Path(p).is_file()), None))
-                claude_ok = bool(tmux_bin) and subprocess.run(
+                tmux_bin = tmux_probe.tmux_binary()
+                claude_ok = subprocess.run(
                     [tmux_bin, "-S", os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"),
                      "has-session", "-t", "=sutando-core"], capture_output=True,
                 ).returncode == 0

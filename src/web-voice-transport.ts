@@ -285,6 +285,17 @@ export function describeAgentFailure(
       remediation: 'Get a new voice token in voice setup, then retry.',
     };
   }
+  // Google judges the region from the address the connection leaves from, so no key change helps.
+  if (reason === 'location-unsupported') {
+    return {
+      detail:
+        "Gemini Live isn't available from your network's region: Google refused the connection" +
+        code +
+        '. Text chat still works.',
+      remediation:
+        'If you use a VPN or proxy, route generativelanguage.googleapis.com through a supported region (e.g. US, Japan, Singapore, Taiwan), then retry.',
+    };
+  }
   switch (category) {
     case 'auth':
       return {

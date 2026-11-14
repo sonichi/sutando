@@ -262,11 +262,11 @@ class InboxCli(ConnectBase):
         (self.inbox / (task_id + ".txt")).write_text("id: %s\n%s%stask: hi\n" % (task_id, extra, lines))
         return task_id
 
-    def test_claim_admits_the_owner_and_answers_every_non_owner_and_a_tierless_task_with_the_refusal(self):
+    def test_claim_admits_the_owner_and_answers_every_other_non_owner_and_a_tierless_task_with_the_refusal(self):
         rc, out = self.verb("claim", self.task("task-o"))
         self.assertEqual((rc, out["admission"], out["access_tier"], out["collaborator"]), (0, "owner", "owner", False))
         refused = {"task-t": ("team", ""), "task-g": ("guest", ""), "task-c": ("team", "collaborator: true\n"),
-                   "task-n": (None, "")}
+                   "task-gc": ("guest", "collaborator: true\n"), "task-n": (None, "")}
         for t, (tier, extra) in refused.items():
             rc, out = self.verb("claim", self.task(t, tier, extra))
             self.assertEqual((rc, "not admitted" in out["refused"]), (1, True), (t, out))
@@ -316,13 +316,14 @@ class InboxCli(ConnectBase):
             ran.append(sc["name"])
             # The harness answers envelope from its options; the same choice is recorded in the config here.
             self.configure(**{"off": {"HMAC_KEY_FILE": "", "HMAC_STRICT": ""}, "lenient": {"HMAC_STRICT": "0"},
-                              "strict": {"HMAC_STRICT": "1"}}.get(sc.get("hmac"), {}))
+                              "strict": {"HMAC_STRICT": "1"}}.get(sc.get("hmac"), {}),
+                           ALLOW_COLLABORATOR="1" if sc.get("allow_collaborator") else "")
             key = self.home / "task-hmac.key"
             if sc.get("key") == "present":
                 key.write_text("ab" * 32)
             elif sc.get("key") == "missing" and key.exists():
                 key.unlink()
-            self.task(sc["task"], sc["tier"])
+            self.task(sc["task"], sc["tier"], sc.get("extra", ""))
             if "result" in sc:
                 (self.results / (sc["task"] + ".txt")).write_text(sc["result"])
             if "archived" in sc:
@@ -342,7 +343,7 @@ class InboxCli(ConnectBase):
 
     def test_the_contract_set_pin_fails_on_a_dropped_or_an_extra_scenario(self):
         names = [sc["name"] for sc in contract_scenarios()]
-        self.assertEqual(len(names), 31)
+        self.assertEqual(len(names), 33)
         self.assertEqual(contract_set_problem(names), "")
         for i in (0, 17, len(names) - 1):
             self.assertIn("missing [%r]" % names[i], contract_set_problem(names[:i] + names[i + 1:]), i)
@@ -895,8 +896,8 @@ class InboxCli(ConnectBase):
         self.assertEqual(detector.stuck_answers({"stuck": {"a": {"since": "x"}, "b": 3}}), {})
         self.assertEqual(detector.stuck_answers({"stuck": ["a"]}), {})
 
-    def test_with_allow_non_owner_every_non_owner_is_claimed_with_its_admission_and_a_tierless_task_still_refused(self):
-        self.configure(ALLOW_NON_OWNER="1")
+    def test_with_both_flags_every_non_owner_is_claimed_with_its_admission_and_a_tierless_task_still_refused(self):
+        self.configure(ALLOW_NON_OWNER="1", ALLOW_COLLABORATOR="1")
         for t, tier, extra, kind in (("task-t", "team", "", "non_owner"), ("task-g", "guest", "", "non_owner"),
                                      ("task-c", "team", "collaborator: true\n", "collaborator")):
             rc, out = self.verb("claim", self.task(t, tier, extra))
@@ -2055,7 +2056,7 @@ class LauncherTmux(ConnectBase):
         order = []
         real_free, real_stray = cm._await_free, cli.stop_stray
         with mock.patch.object(cm, "_await_free", lambda root, *a, **k: order.append("free") or real_free(root, *a, **k)), \
-                mock.patch.object(cli, "stop_stray", lambda cfg: order.append("stray") or real_stray(cfg)), \
+                mock.patch.object(cli, "stop_stray", lambda cfg, *a: order.append("stray") or real_stray(cfg, *a)), \
                 mock.patch.object(sm, "_run", side_effect=self.runner(root=False)):
             rc, out, err = self.main("uninstall")
         self.assertEqual(rc, 0, out + err)
@@ -2590,8 +2591,8 @@ class LocalCommands(ConnectBase):
         routing = state / "owner-routing.json"
         routing.unlink(missing_ok=True)
         line = cli.projection_lines(cli.load_config()[0])
-        self.assertEqual(line, ["INFO pending projection: %s (no primary gateway); on this machine: %s stop --confirm"
-                                % (req.id, cli.COMMAND)])
+        self.assertEqual(line, ["INFO pending projection: %s (no primary gateway); on this machine: %s stop --confirm "
+                                "--work %s" % (req.id, cli.COMMAND, self.work)])
         routing.write_text("{}")
         self.addCleanup(routing.unlink, missing_ok=True)
         self.assertIn("(gateway predates claude-local)", cli.projection_lines(cli.load_config()[0])[0])
@@ -2738,6 +2739,18 @@ class LauncherUnit(ConnectBase):
             lc.state["sig"] = signal.SIGTERM
             with mock.patch.object(lc, "stop_session", return_value=outcome), mock.patch.object(lc, "apply_effects", lambda r: r):
                 self.assertEqual(lc._serve(), rc, outcome)
+
+    def test_a_retire_whose_session_stop_fails_asks_to_be_retried_not_retired(self):
+        lc, real = launcher.Launcher(self.cfg, cli.config_dir(), sleep=lambda s: None), launcher.Launcher._serve
+
+        def asked_to_retire(self):
+            self.state.update(sig=cm.RETIRE_SIGNAL, retire=True)
+            return real(self)
+        for outcome, rc in (("stopped", cm.EXIT_HELD), ("uncertain: x", launcher.EXIT_RETRY)):
+            with self.subTest(outcome), mock.patch.object(launcher, "tmux_problem", return_value=""), \
+                    mock.patch.object(launcher.Launcher, "_serve", asked_to_retire), \
+                    mock.patch.object(lc, "stop_session", return_value=outcome), mock.patch.object(lc, "apply_effects", lambda r: r):
+                self.assertEqual(lc.serve(), rc, "a session left running keeps its launcher's restart")
 
 
 class LauncherBranches(ConnectBase):
@@ -3249,7 +3262,8 @@ class StartupDialogAndRefusals(ConnectBase):
             self.assertEqual(rc, cm.EXIT_HELD, "the manager stops: launchd's 0, systemd's RestartPreventExitStatus")
             self.assertEqual(launcher.launchd_exit(rc), 0)
             self.assertIn("is not a fresh work dir for this adapter (it holds stray)", self.lines[0])
-            self.assertEqual(self.lines[1], f"stopping: the work root needs attention, then run {cli.COMMAND} install again")
+            self.assertEqual(self.lines[1], f"stopping: the work root needs attention, then run {cli.COMMAND} install "
+                                            f"--work {self.work} again")
             lc = self.launcher()
             with mock.patch.object(inbox, "prepare_root", return_value="refusing to start: cannot check /w: EIO"):
                 self.assertEqual(lc.tick(lc.record())[0], launcher.EXIT_RETRY)
@@ -3280,7 +3294,7 @@ class StartupDialogAndRefusals(ConnectBase):
         for _ in range(3):
             rec = lc.observe(rec)
         self.assertEqual(self.lines, [f"the session waits at Claude Code's folder-trust dialog; answer it in the pane "
-                                      f"({cli.COMMAND} attach)", "the session is past its startup dialog"])
+                                      f"({cli.COMMAND} attach --single)", "the session is past its startup dialog"])
 
     def test_verify_fails_on_a_pane_waiting_at_a_dialog_and_reports_the_trust_record(self):
         runner = self.runner()
@@ -3297,7 +3311,7 @@ class StartupDialogAndRefusals(ConnectBase):
         self.assertEqual(rc, 1)
         self.assertIn(f"INFO folder trust: {self.inbox} recorded", out)
         self.assertIn(f"FAIL session: the pane waits at Claude Code's folder-trust dialog, so no task is answered; run "
-                      f"{cli.COMMAND} attach and answer it", out)
+                      f"{cli.COMMAND} attach --work {self.work} and answer it", out)
         for present, pane in ((True, READY_PANE), (False, TRUST_PANE), (None, TRUST_PANE)):
             with mock.patch.object(launcher.Tmux, "has_session", return_value=present), \
                     mock.patch.object(launcher.Tmux, "capture", return_value=pane):

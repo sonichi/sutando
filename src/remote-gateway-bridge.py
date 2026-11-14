@@ -44,7 +44,8 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
         sys.path.insert(0, _p)
 
 from proactive_routing import (BRIDGE_CHANNELS, body_target_channel,  # noqa: E402
-                               proactive_destination, should_claim_proactive)
+                               lane_claims_proactive, proactive_destination,
+                               should_claim_proactive)
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 from voice_room_membership import (CHECK_DIR_NAME, VERDICT_TTL_S,  # noqa: E402
@@ -110,6 +111,9 @@ def _sutando_apply_worker_label_overrides(labels: dict, config_version: int,
 # An install without worker-pool has no callback and makes no profile read.
 _SUTANDO_WORKER_LABEL_APPLIER = (_sutando_apply_worker_label_overrides
                                  if _WORKER_LABEL_SCRIPT.is_file() else None)
+
+# Logged recovery commands name the workspace through its resolver, never its absolute path.
+_SUTANDO_WORKSPACE_RESOLVER = "bash scripts/sutando-config.sh workspace"
 
 # Runtime self-report, injected BEFORE the exec (anything after it is
 # unreachable when the exec'd source's own __main__ guard fires; see #3285).
@@ -299,7 +303,10 @@ def _ag2space_proactive_room_gate(path: Path, room: str) -> bool:
 
 def _ag2space_proactive_claim_gate(path: Path) -> bool:
     """Claim when routing says the owner lives here; otherwise claim only what
-    no other bridge will ever take (see _routed_bridge_still_owns)."""
+    no other bridge will ever take (see _routed_bridge_still_owns). A file a pool
+    worker's session stamped is that worker's own lane's, never a core lane's."""
+    if not lane_claims_proactive(path.name):
+        return False
     if _tagged_voice_result(path.name) and not _voice_result_room_verified(path):
         return False
     dest = proactive_destination(path.name)
@@ -484,6 +491,42 @@ def _ag2space_lane_server() -> str:
 
 
 LANE_SERVER = _ag2space_lane_server
+
+
+def _lane_worker() -> str:
+    """The pool worker whose own agent this lane runs as, or "": exits rather than start a lane
+    that cannot tell, since a worker's lane run as the core's would post the core's messages."""
+    from connections import LaneIdentityUnknown, lane_worker_at_start
+    try:
+        worker, problem = lane_worker_at_start(GATEWAY_INSTANCE, os.environ, WS)  # noqa: F821
+    except LaneIdentityUnknown as e:
+        _log(f"FATAL: lane {GATEWAY_INSTANCE} refuses to start: {e}")  # noqa: F821
+        sys.exit(f"FATAL: lane {GATEWAY_INSTANCE} refuses to start: {e}")  # noqa: F821
+    if problem:
+        _log(f"ERROR: lane {GATEWAY_INSTANCE}: {problem} (worker {worker})")  # noqa: F821
+    return worker
+
+
+def _worker_lane_claim_gate(worker: str):
+    """A worker's own lane shares results/ with the core's lanes: it claims only the proactive files
+    its worker's session stamped (`lane_claims_proactive`), which it posts as the worker's agent."""
+    return lambda path: lane_claims_proactive(path.name, worker)
+
+
+def _install_worker_lane(worker: str) -> None:
+    """This lane runs as `worker`'s own agent: every task it queues is addressed to that worker,
+    and the only proactive files it claims and owns are the ones that worker's session wrote."""
+    global TASK_ADDRESSEE, PROACTIVE_CLAIM_GATE, PROACTIVE_OWN_FILE
+    TASK_ADDRESSEE = lambda: worker  # noqa: E731
+    PROACTIVE_CLAIM_GATE = PROACTIVE_OWN_FILE = _worker_lane_claim_gate(worker)
+
+
+# Read once: a lane's row names its worker for the life of the process (a change relaunches it).
+_LANE_WORKER = _lane_worker() if GATEWAY_INSTANCE else ""  # noqa: F821
+if _LANE_WORKER:
+    _log(f"lane {GATEWAY_INSTANCE} runs as worker {_LANE_WORKER}'s own agent: its tasks go to that worker, "  # noqa: F821
+         "and it posts only the proactive files that worker's session writes")
+    _install_worker_lane(_LANE_WORKER)
 STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
                    and not gateway_credential_sources.is_seat(os.environ) else None)  # noqa: F821
 

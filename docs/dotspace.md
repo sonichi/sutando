@@ -44,11 +44,19 @@ instance is a config entry.
    {"core": {"dotspace": {"instances": [
      {"server": "ag2.space", "gateway_host": "chat.ag2.space",
       "cloud_origin": "https://sutando.s.space"},
-     {"server": "s.space", "gateway_host": "chat.s.space"}
+     {"server": "s.space", "gateway_host": "chat.s.space", "app_origin": "https://chat.s.space"}
    ]}}}
    ```
 
-   Optional per entry: `cloud_origin`, `mcp_url`, `link_via` (default: server), `prefer_ipv4`
+   `app_origin` is the browser app origin, independent of the relay gateway. The built-in
+   entries use `https://chat.ag2.space`, `https://dev-chat.ag2.space`, `https://chat.s.space`,
+   and `https://dev-chat.s.space`, respectively. Custom entries must name their own app origin;
+   an absent origin or unknown server gives no app link. This field is config-only, never
+   filled from well-known or a relay token. `ag2space_links.surface_link(room, surface)` and
+   `database_link(room, db)` resolve it from the room server; an optional `origin=` keyword
+   is an explicit override, not a transport fallback.
+
+   Optional per entry: `app_origin`, `cloud_origin`, `mcp_url`, `link_via` (default: server), `prefer_ipv4`
    (default: true). When the section is absent the built-in list applies — ag2.space,
    dev.ag2.space, s.space, dev.s.space with their `chat.` / `dev-chat.` gateways and their MCP
    endpoints (`mcp.` / `dev-mcp.` under ag2.space and s.space, path `/mcp`); `cloud_origin` only

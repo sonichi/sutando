@@ -16,6 +16,8 @@
 #
 # Beside the bridge it keeps `src/sparrowd.py --agent-bridges` alive, the only supervisor of the
 # agent bridges declared under <workspace>/agents on this install; that child does its own scanning.
+#
+# Killing the wrapper by hand brings it back in about 10 s; use launchctl bootout to stop it for good.
 
 set -euo pipefail
 
@@ -50,6 +52,9 @@ _load_channel_env() {
         tok="$(bash "$REPO/scripts/channel-env.sh" ag2space 2>/dev/null)" || tok=""
         [ -n "$tok" ] && [ -f "$tok" ] && [ "$tok" != "$dot" ] && { set -a; . "$tok"; set +a; }
     fi
+    # The bridge re-reads the file holding the token on an auth rejection, to pick up a rotated one.
+    local held="$dot"; [ -n "$tok" ] && [ -f "$tok" ] && held="$tok"
+    [ -n "$held" ] && [ -f "$held" ] && export REMOTE_TASK_TOKEN_FILE="$held"
     # Only the shared rule's "blank" verdict (rc 3) drops it; an unrunnable check keeps it.
     local v rc
     for v in REMOTE_TASK_TOKEN AG2_REMOTE_TOKEN; do
@@ -111,7 +116,7 @@ fi
 # the bridge's own stand-down and ends the wrapper for good.
 if ! WORKSPACE="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || [ -z "$WORKSPACE" ]; then
     echo "[gateway-bridge-wrapper] FATAL: workspace unresolvable via scripts/sutando-config.sh (check sutando.config.local.json) — not starting the bridge" >&2
-    osascript -e 'display notification "Gateway bridge cannot resolve the workspace; it is not running." with title "Sutando"' >/dev/null 2>&1 || true
+    bash "$REPO/src/macos-notify.sh" "Gateway bridge cannot resolve the workspace; it is not running." || true
     exit 0
 fi
 STATE_DIR="$WORKSPACE/state/channel-bridge-supervisor"
@@ -137,7 +142,7 @@ emit_restart_alert() {
   echo "$NOW" > "$ALERT_STAMP"
   printf '%s\n' "⚠️ The gateway bridge exited and was automatically restarted." \
     | python3 "$REPO/src/result_publish.py" "$WORKSPACE/results/proactive-gateway-bridge-restarted-$NOW.txt"
-  osascript -e "display notification \"The gateway bridge exited and was automatically restarted.\" with title \"Sutando\"" >/dev/null 2>&1 || true
+  bash "$REPO/src/macos-notify.sh" "The gateway bridge exited and was automatically restarted." || true
 }
 if [ -f "$MARKER" ]; then emit_restart_alert; fi
 date +%s > "$MARKER"
@@ -165,18 +170,38 @@ tend_agents_supervisor() {
   AGENTS_PID=$!
   echo "[gateway-bridge-wrapper] agent-bridge supervisor started (pid $AGENTS_PID)" >&2
 }
+# Named lanes (connections.py launch-plan) have no supervisor of their own: one keep-lanes pass every
+# LANES_EVERY_S, never two at once. Each pass starts lanes under the connections lock and backs off.
+LANES_EVERY_S="${SUTANDO_GATEWAY_LANES_EVERY_S:-30}"
+LANES_PID=''
+LANES_NEXT=0
+tend_lanes() {
+  if [ -n "$LANES_PID" ]; then
+    kill -0 "$LANES_PID" 2>/dev/null && return 0
+    wait "$LANES_PID" 2>/dev/null || true
+    LANES_PID=''
+  fi
+  [ "$(date +%s)" -ge "$LANES_NEXT" ] || return 0
+  LANES_NEXT=$(( $(date +%s) + LANES_EVERY_S ))
+  python3 "$REPO/scripts/connections.py" keep-lanes --repo "$REPO" --logs-dir "$WORKSPACE/logs" &
+  LANES_PID=$!
+}
 stop_agents_supervisor() {
   [ -n "$AGENTS_PID" ] || return 0
   kill "$AGENTS_PID" 2>/dev/null || true
   wait "$AGENTS_PID" 2>/dev/null || true
   AGENTS_PID=''
 }
+STOP_SIGNAL=''
 stop_wrapper() {
   STOPPING=1
+  STOP_SIGNAL="$1"
   [ -z "$CHILD_PID" ] || kill "$CHILD_PID" 2>/dev/null || true
   [ -z "$AGENTS_PID" ] || kill "$AGENTS_PID" 2>/dev/null || true
 }
-trap stop_wrapper TERM INT HUP
+trap 'stop_wrapper TERM' TERM
+trap 'stop_wrapper INT' INT
+trap 'stop_wrapper HUP' HUP
 while [ "$STOPPING" = 0 ]; do
   # A rotated or removed .env token must reach the next child: reset to the
   # environment-provided values, re-read the .env, redo the legacy mapping.
@@ -193,6 +218,7 @@ while [ "$STOPPING" = 0 ]; do
     exit 0
   fi
   tend_agents_supervisor
+  tend_lanes
   # A primary move parked the legacy row: launch nothing, keep tending the agent bridges, and
   # resume on its own once the row is unparked.
   if python3 "$REPO/scripts/connections.py" legacy-parked >/dev/null 2>&1; then
@@ -222,6 +248,7 @@ while [ "$STOPPING" = 0 ]; do
   # supervisor must be tended while the bridge runs.
   while kill -0 "$CHILD_PID" 2>/dev/null && [ "$STOPPING" = 0 ]; do
     tend_agents_supervisor
+    tend_lanes
     sleep "$POLL_S"
   done
   set +e
@@ -247,3 +274,9 @@ while [ "$STOPPING" = 0 ]; do
   CHILD_PID=''
 done
 stop_agents_supervisor
+# KeepAlive is crash-only: exit 0 here would leave the job down for good after a stray signal.
+# A launchctl bootout still stops it; kickstart -k restarts it either way.
+if [ -n "$STOP_SIGNAL" ]; then
+  echo "[gateway-bridge-wrapper] received SIG$STOP_SIGNAL — stopping the bridge; exiting non-zero so launchd restarts the job" >&2
+  exit $(( 128 + $(kill -l "$STOP_SIGNAL") ))
+fi

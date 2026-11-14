@@ -27,6 +27,13 @@ _ROOM = re.compile(r"^[!#][^\s:]+:\S+$")
 _DB_PAGE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 
 
+def app_origin_for(room_id: str) -> str:
+    """The room server's registered app origin, or empty for an unknown server; no network I/O."""
+    server = dotspace.server_of_matrix_id(room_id)
+    instance = dotspace.dotspace_for(server, fetch=dotspace.NO_FETCH)
+    return instance.app_origin if instance.is_dotspace else ""
+
+
 def default_via(room_id: str = "") -> str:
     """`?via=` for `room_id`: its own server's DotSpace (rooms are `!x:server`), else the install's."""
     if dotspace.server_of_matrix_id(room_id):
@@ -60,10 +67,12 @@ def room_link(room_id: str, event_id: str = "", via: Optional[str] = None) -> st
     return f"{MATRIX_TO}{frag}?via={via}" if via else f"{MATRIX_TO}{frag}"
 
 
-def surface_link(origin: str, room_id: str, surface: str, page: str | None = None) -> str:
+def surface_link(room_id: str, surface: str, page: Optional[str] = None, *, origin: Optional[str] = None) -> str:
     """`<origin>/<ROOM_ROUTE>/<room, encodeURIComponent>?surface=<surface>[&page=<page>]`.
 
-    Raises ValueError for an origin that is not an http(s) URL or a room that is no room id/alias."""
+    Origin defaults to the room registry; a keyword override is explicit. Raises ValueError
+    for an unknown app origin, invalid http(s) override, or invalid room id/alias."""
+    origin = app_origin_for(room_id) if origin is None else origin
     m = _ORIGIN.match((origin or "").strip())
     if not m:
         raise ValueError(f"not an app origin: {origin!r}")
@@ -74,7 +83,7 @@ def surface_link(origin: str, room_id: str, surface: str, page: str | None = Non
     return "/".join((m.group(1), ROOM_ROUTE, room_path)) + "?" + urllib.parse.urlencode(query)
 
 
-def database_link(origin: str, room_id: str, db_id: str | None = None) -> str:
+def database_link(room_id: str, db_id: Optional[str] = None, *, origin: Optional[str] = None) -> str:
     """The room's Database surface, on database `db_id` when that id is one a link may name."""
     page = (db_id or "").strip().lower()
-    return surface_link(origin, room_id, "database", page if _DB_PAGE.fullmatch(page) else None)
+    return surface_link(room_id, "database", page if _DB_PAGE.fullmatch(page) else None, origin=origin)

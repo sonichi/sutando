@@ -34,9 +34,12 @@ is extra: if any step below fails, the greeting stands. Do not edit, retract or 
 not retry the page in the same turn.
 
 1. Your name, never the owner's, and never a reason to stop. Use `ag2.whoami`'s `display_name`
-   when it has one. When it is null, pass `--name auto`, which falls back in this order:
-   - your Matrix profile displayname from your homeserver;
-   - a name made from your mxid's localpart (`@chi-air-blue.agent:…` gives `Chi Air Blue`);
+   when it has one. When it is null, pass `--name auto`: the same name the greeting uses
+   (`src/agent_display_name.py`), which falls back in this order:
+   - your Matrix profile displayname from your homeserver (your s.space display name);
+   - the display name your connection recorded for you;
+   - `SUTANDO_DISPLAY_NAME`, else `AGENT_DISPLAY_NAME`;
+   - a name made from your mxid's localpart (`@blue-fox.agent:…` gives `Blue Fox`);
    - `Sutando`.
 
    Your mxid is `--agent-mxid`, else `$AGENT_MXID`, else the s.space channel env file's (the

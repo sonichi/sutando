@@ -124,7 +124,7 @@ class TestOrphanCheckExemption(unittest.TestCase):
         self.assertIn("import-unbound): U", self.text)
         # Every verdict the summary defines must appear in the formula, or a
         # pass silently drops one. Pinned as a property, not one spelling.
-        formula = re.search(r"If `([MKWXISUJ+ ]+) ≠ N`", self.text)
+        formula = re.search(r"If `([A-Z+ ]+) ≠ N`", self.text)
         self.assertIsNotNone(formula, "the summary still reconciles its counts against N")
         terms = {t.strip() for t in formula.group(1).split("+") if t.strip()}
         for letter in ("M", "K", "I", "S", "U", "J"):
