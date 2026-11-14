@@ -23,6 +23,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`activity_rows.py`** — The agent-activity row writer: one JSON row per line at <workspace>/state/agent-activity.jsonl, the live window the desktop renders, its per-day archive, the per-task index that keeps a summary exact after rotation, and the summary left at done.
 - **`ag2space_links.py`** — Links a person clicks to open an AG2 Space room, message or room surface inside the app.
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
+- **`agent-display-name.ts`** — The name the voice and phone prompts introduce the agent by.
 - **`agent_availability.py`** — Two room-visible projections of one private runtime: what this agent is doing on THIS task, and whether it can take more work.
 - **`agent_card.py`** — Agent panel cards (`space.ag2.card`, kind `agent_panel`, v 1): build, check, send, and read the replies.
 - **`agent_display_name.py`** — The name this agent introduces itself by: its live s.space display name, never a persona name.
@@ -222,6 +223,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
 - **`screen-capture-server.py`** — Screen capture HTTP server — runs in a terminal (has Screen Recording permission on macOS; needs no special setup on Windows).
 - **`scroll-wheel.swift`** — scroll-wheel.swift — Send OS-level scroll wheel events to Chrome
+- **`secret_compare.py`** — Constant-time equality for a presented credential string against an expected one.
 - **`secret_scanner.py`** — Library-based secret detection for inbound bridge messages.
 - **`self_opened_gate.py`** — Attribution for a terminal dialog Sutando opened itself, and the one rule that may dismiss it.
 - **`send_allowlist.py`** — Alias of `policy.egress.attachment` (phase-1a restructure); one transition window.
