@@ -142,7 +142,7 @@ case "$cmd" in
         # exists to prevent. cron-runner.py persists its state file on every
         # tick whenever crons.json has entries, so a forced tick + fresh state
         # write is an end-to-end proof.
-        H="$(hostname | sed 's/\..*//')"
+        H="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null || true)"
         CRONS_FILE="$WORKSPACE/hosts/$H/crons.json"
         STATE_FILE="$WORKSPACE/state/cron-runner-state.json"
         if ! "$PYTHON_BIN" -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])) else 1)' "$CRONS_FILE" 2>/dev/null; then
