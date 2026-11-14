@@ -417,8 +417,11 @@ def retry_limit(workspace, repo, worker_id, *, runner=None):
                       capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return {"worker_id": worker_id, "outcome": "capture-failed"}
+    # The footer form ("Usage limit reached · Continuing automatically at …") reads as a gate, not
+    # PANE_LIMIT; a pane that waits on the limit and nothing else (limit_holds) is the same wait.
     if (capture.returncode != 0
-            or sup.classify_pane_text(capture.stdout, runtime) != ps.PANE_LIMIT
+            or (sup.classify_pane_text(capture.stdout, runtime) != ps.PANE_LIMIT
+                and not sup.pane_gate.limit_holds(capture.stdout, sup.pane_gate.CLAUDE))
             or sup.pane_gate.pending_text(capture.stdout, sup.pane_gate.CLAUDE) != ""):
         return {"worker_id": worker_id, "outcome": "pane-changed-or-pending"}
     ask = _sibling("pool_ask")
@@ -444,6 +447,179 @@ def retry_limit(workspace, repo, worker_id, *, runner=None):
             "task_id": task_id, "send_code": sent.code}
 
 
+def _label(workspace, worker_id) -> str:
+    row = (sw.pr.load_roster(workspace) or {}).get("workers", {}).get(worker_id, {})
+    return str(row.get("label") or worker_id[:8])
+
+
+def tell_owner(workspace, prefix: str, text: str) -> str:
+    """Queue one line to the owner's DM (the proactive path; no card). The file name it was queued as."""
+    from local_record import new_name, write_text_whole
+    from proactive_routing import proactive_filename
+    return write_text_whole(Path(workspace) / "results" / proactive_filename(new_name(prefix), None),
+                            f"[dm-only]\n{text}\n").name
+
+
+def restart_on_new_login(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
+    """Restart a seat parked on the old account's limit, under the sweep's lock: leave it alone
+    under a pool suspension, or unless its pane still waits on that limit and nothing else (a turn
+    started since the tick is never interrupted); then take it down and resume its session. Its
+    owed deliveries stay its own: `recover` re-offers what a killed turn left mid-work.
+
+    The seat is marked down before the take-down, and its runs close "crashed", so whatever stops
+    a start (the kill, the run record, the spawn) leaves a seat the next sweeps start again
+    (pool_supervision: relogin_down); one already down is only started. Only a RECOVERED seat
+    is bound to the new account; any other outcome keeps the old binding."""
+    if suspension(workspace):
+        return {"worker_id": worker_id, "outcome": SUSPENDED}
+    run = runner or subprocess.run
+    ev = sup.load_state(workspace).workers.get(worker_id, ps.WorkerEvidence())
+    if ev.relogin_down and sup.probe_session(workspace, worker_id, runner=run) is False:
+        return _confirmed(workspace, worker_id, recover(workspace, repo, worker_id, runner=runner, spawn=spawn))
+    socket, session = sup._open_tmux(workspace, worker_id)
+    if not socket:
+        return {"worker_id": worker_id, "outcome": NO_SESSION, "why": "no open run to restart"}
+    try:
+        capture = run(["tmux", "-S", str(socket), "capture-pane", "-e", "-p", "-J", "-t", session],
+                      capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return {"worker_id": worker_id, "outcome": INDETERMINATE, "why": "its pane could not be read"}
+    if capture.returncode != 0 or not sup.pane_gate.limit_holds(capture.stdout, sup.pane_gate.CLAUDE):
+        return {"worker_id": worker_id, "outcome": "pane-changed",
+                "why": "it was busy again, so it was left as it is"}
+    # The capture can take seconds: a pool suspension written meanwhile still protects the seat.
+    if suspension(workspace):
+        return {"worker_id": worker_id, "outcome": SUSPENDED}
+    try:
+        sup.mark_relogin_down(workspace, worker_id)
+    except Exception as e:  # noqa: BLE001 - unmarked, a killed seat could be stranded: never kill it
+        return {"worker_id": worker_id, "outcome": FAILED,
+                "why": f"its down mark could not be saved ({type(e).__name__}), so it was left running"}
+    if suspension(workspace):  # the last moment before the kill; the mark clears when it is seen alive
+        return {"worker_id": worker_id, "outcome": SUSPENDED}
+    try:
+        down = _sibling("pool_manage").take_down_held(workspace, worker_id, run, end_reason="crashed")
+    except Exception as e:  # noqa: BLE001 - the seat is unpaused below, whatever the take-down raised
+        down = {"down": False, "sessions": {}, "error": f"{type(e).__name__}: {e}"}
+    finally:
+        sup.set_paused(workspace, worker_id, False)
+    if not down["down"]:
+        return {"worker_id": worker_id, "outcome": FAILED, "sessions": down["sessions"],
+                "why": down.get("error") or "tmux could not confirm the parked seat gone"}
+    return {**_confirmed(workspace, worker_id, recover(workspace, repo, worker_id, runner=runner, spawn=spawn)),
+            "taken_down": down["sessions"]}
+
+
+def _confirmed(workspace, worker_id, out: dict) -> dict:
+    """Bind a seat that came back to the account on disk now; leave any other outcome to be tried again."""
+    if out["outcome"] == RECOVERED:
+        try:
+            sup.confirm_new_login(workspace, worker_id, sup.current_account())
+        except Exception as e:  # noqa: BLE001 - it is back; unbound, it is rebound when it next parks
+            print(f"pool_remedy: {worker_id} is back but its new login could not be saved "
+                  f"({type(e).__name__}: {e})", file=sys.stderr)
+    return out
+
+
+def _try_owner(workspace, prefix: str, text: str):
+    try:
+        return tell_owner(workspace, prefix, text)
+    except OSError as e:
+        print(f"pool_remedy: the owner's note could not be queued ({type(e).__name__}: {e})", file=sys.stderr)
+        return None
+
+
+def _left_for(workspace, worker_id, runner=None) -> tuple[str | None, bool]:
+    """(what happens next to a seat that did not come back, for the owner's note; whether this is
+    the one note that the seat is down). None when the owner was already told it is down: each
+    later failed try stays silent. The caller marks it told only once the note is queued."""
+    ev = sup.load_state(workspace).workers.get(worker_id, ps.WorkerEvidence())
+    label = shlex.quote(_label(workspace, worker_id))
+    if ev.relogin_down and sup.probe_session(workspace, worker_id, runner=runner or subprocess.run) is False:
+        if ev.relogin_down_told:
+            return None, False
+        # A seat parked on a limit usually owes work, and then stop and retire each need their flag.
+        owes = sup.work_outstanding(workspace, worker_id) is not False
+        stop, retire = (f"stop {label} --force", f"retire {label} --hand-off") if owes else (
+            f"stop {label}", f"retire {label}")
+        return ("it is down and not coming back on its own. I'll keep trying to start it about once an "
+                f"hour without writing again; to stop that, stop it (pool_manage.py {stop}) or retire "
+                f"it (pool_manage.py {retire}), or fix what stops it starting (its folder, its CLI) "
+                "and the next try starts it"), True
+    if ev.relogin_attempts >= ps.RELOGIN_MAX_ATTEMPTS:
+        return f"no more automatic tries; restart it with: pool_manage.py reseat {label}", False
+    return "I'll try again on a later sweep", False
+
+
+def _release_try(workspace, worker_id) -> None:
+    """A try skipped before any kill is not spent, so the attempt cap still allows it later."""
+    try:
+        sup.release_relogin_try(workspace, worker_id)
+    except Exception as e:  # noqa: BLE001 - at worst the skipped try counts
+        print(f"pool_remedy: {worker_id}'s skipped try could not be released ({type(e).__name__}: {e})",
+              file=sys.stderr)
+
+
+def restart_new_logins(workspace, repo, worker_ids, *, runner=None, spawn=None) -> dict:
+    """The owner signed in again: say which seats restart, restart them without waiting for an
+    answer, and write again only when one did not come back. A note that cannot be queued
+    restarts nothing this sweep (the next one tries again), and never aborts the sweep."""
+    if not worker_ids:
+        return {}
+    names = [_label(workspace, w) for w in worker_ids]
+    n = len(names)
+    account = sup.current_account()
+    state = sup.load_state(workspace)
+    # A seat already down from an earlier try was announced then: retrying only those says nothing
+    # again, also when the account cannot be read (the opener would otherwise repeat each retry).
+    parked = [w for w in worker_ids if not state.workers.get(w, ps.WorkerEvidence()).relogin_down]
+    if parked and (state.relogin_announced != account or account is None):
+        if _try_owner(workspace, "pool-new-login",
+                      f"I'm back on a new login; restarting {n} worker{'s' if n != 1 else ''} parked on the old "
+                      f"limit: {', '.join(names)}.") is None:
+            for w in worker_ids:  # nothing was killed: the try is not spent, as for a suspended skip
+                _release_try(workspace, w)
+            return {w: {"worker_id": w, "outcome": "note-failed",
+                        "why": "the owner's note could not be queued; nothing was restarted"} for w in worker_ids}
+        try:
+            sup.announce_relogin(workspace, account)
+        except Exception as e:  # noqa: BLE001 - the opener went out; at worst a later sign-in repeats it
+            print(f"pool_remedy: the new login could not be recorded ({type(e).__name__}: {e})", file=sys.stderr)
+    done = {}
+    for w in worker_ids:
+        try:
+            done[w] = restart_on_new_login(workspace, repo, w, runner=runner, spawn=spawn)
+        except Exception as e:  # noqa: BLE001 - one seat's error never stops the others or the note
+            done[w] = {"worker_id": w, "outcome": FAILED, "why": f"an unexpected error ({type(e).__name__}: {e})"}
+        if done[w]["outcome"] == SUSPENDED and "taken_down" not in done[w]:
+            _release_try(workspace, w)
+    back = [w for w, r in done.items() if r["outcome"] == RECOVERED]
+    left, telling = [], []
+    for w, r in done.items():
+        if r["outcome"] == RECOVERED:
+            continue
+        try:
+            next_step, down_note = _left_for(workspace, w, runner)
+        except Exception:  # noqa: BLE001 - the note still goes out
+            next_step, down_note = "I'll try again on a later sweep", False
+        if next_step is not None:
+            left.append(f"{_label(workspace, w)} ({r.get('why') or r['outcome']}; {next_step})")
+        if down_note:
+            telling.append(w)
+    if left:
+        rest = " The rest are back." if back else ""
+        queued = _try_owner(workspace, "pool-new-login-failed",
+                            f"Not restarted on the new login: {'; '.join(left)}.{rest}")
+        # Told only once the note is queued: a note that failed is written again on the next try.
+        for w in telling if queued is not None else []:
+            try:
+                sup.tell_relogin_down(workspace, w)
+            except Exception as e:  # noqa: BLE001 - unrecorded, the owner is told again next try
+                print(f"pool_remedy: {w}'s down note could not be recorded ({type(e).__name__}: {e})",
+                      file=sys.stderr)
+    return done
+
+
 def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
     """Act on a tick's decisions. `recover` resumes the session; `rearm_watcher`
     ensures the inbox's supervisor, whose standby arms once no session watcher
@@ -454,6 +630,8 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
     done = {}
     rearms = {}
     cards = {}
+    new_logins = [] if suspension(workspace) else \
+        [w for w, d in decisions.items() if d == ps.RESTART_NEW_LOGIN and not sup.is_paused(workspace, w)]
     for worker_id, decision in decisions.items():
         # Re-read per action: an app quit can land mid-sweep, just before its tmux kill-server.
         if decision != ps.ESCALATE and suspension(workspace):
@@ -475,6 +653,7 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
             rearms[worker_id] = ensure_supervisor(workspace, repo, worker_id,
                                                   runner=runner)
     sup.acknowledge_cards(workspace, [w for w, r in cards.items() if r.get("outcome") == "carded"])
+    done.update(restart_new_logins(workspace, repo, new_logins, runner=runner, spawn=spawn))
     return {"recoveries": done,
             "rearms": rearms,
             "cards": cards,
@@ -586,6 +765,12 @@ def _sweep(a, runner=None) -> int:
         acted["cards_closed"] = wc.resolve_cleared(
             a.workspace, clear, wedges=now_asks, observations=tick["observations"], recovered=recovered,
             runner=runner)
+        if not a.recipient:  # a pool reads down or up only from every seat; one seat proves neither
+            try:  # one card per runtime whose whole pool is stopped (a usage limit, or signed out)
+                acted["pool_down"] = wc.raise_pool_down(
+                    a.workspace, wc.pool_down(a.workspace, tick["observations"], runner=runner or subprocess.run))
+            except Exception as e:  # noqa: BLE001 - the seat cards and the sweep do not depend on it
+                acted["pool_down"] = {"error": f"{type(e).__name__}: {e}"}
     if tick.get("sentinels_deferred"):
         acted["sentinels_deferred"] = tick["sentinels_deferred"]
     print(json.dumps({"decisions": tick["decisions"], "auth_expired": tick["auth_expired"],

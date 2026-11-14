@@ -354,6 +354,70 @@ turn in flight. With the same sustain and stale line, once per episode:
   owner presses it; the next tick then re-reads the pane and types one Escape only
   if it still shows the frame the card was raised for, and refuses otherwise.
 
+**A new login is the one exception to "never restarted"** (owner ask, 2026-11-11): a
+seat parked on a provider limit and nothing else (`pane_gate.limit_holds`: no turn
+running, an empty composer) has its limit bound to an account (`limit_account` in
+`state/pool-supervision.json`; `core_limit_hold`'s digest of `.claude.json`'s
+non-secret identity fields). The binding is the account its run launched under (each
+run records it: `account` on the incarnation, written by `spawn_worker`), so however
+late the seat parks after a sign-in it is bound to the account its process started
+with; a run from before that field existed falls back to the account the pool read on
+the tick before (`last_account`). While it stays parked and another known account is
+on disk, the wait is over: the sweep decides `restart_new_login`, sends one line to the
+owner's DM naming the seats (once per sign-in: `relogin_announced`), then restarts
+each, leaving alone a seat under a pool suspension or whose pane no longer waits on
+the limit alone (a turn started).
+
+A seat this rule kills always comes back. It is marked `relogin_down` before its
+take-down, and the take-down closes its runs `crashed`, not `killed` (the owner's
+stop), so supervision still reads a dead seat as dead. A seat that is down and
+`relogin_down` is started again by every later sweep its backoff allows, with no cap and a backoff that
+doubles up to `RELOGIN_DOWN_MAX_RETRY_S`, resuming its own session and keeping its
+owed deliveries, until a start is confirmed; seen alive, the mark clears. That covers
+a spawn failing after the kill, a take-down raising after it, and a suspension landing
+between the kill and the start. Only a seat that comes back is bound to the new
+account (`confirm_new_login`). A seat that is still up after a failed try (the kill
+not confirmed, the take-down raising before it) keeps its old binding and is tried
+again at most `RELOGIN_MAX_ATTEMPTS` times with a doubling `RELOGIN_RETRY_S` backoff;
+a sign-in to a third account starts that count again. The pause the take-down takes is
+always lifted. A second line goes to the owner only for seats that did not come back,
+saying whether another try follows; a seat that is down is named there once, with the
+way out (stop or retire it, adding `--force` / `--hand-off` when it owes work, as a
+parked seat usually does, or fix its folder or CLI), and its later failed tries stay
+silent (`relogin_down_told`, set only once that note is queued, so a note that could not
+be written goes out on the next try). The dead-seat ladder also sees such a seat and
+escalates it once, a separate signal. A pool suspension is read again after the pane
+capture and once more right before the kill; a restart it skips spends no try. One seat's unexpected error never stops the others or
+the note, and a down mark that cannot be saved leaves the seat running: it is never
+taken down unmarked. A note that cannot be queued restarts nothing that
+sweep and never aborts it. The same account keeps waiting for the reset, an unreadable
+account on either side decides nothing, a seat the owner paused is left paused, and a
+Codex seat is out of scope. The core coming back (its limit hold released or cleared,
+its account switched at launch, or its own `/login` recovery) asks for one immediate
+sweep per event (`src/pool_sweep_trigger.py`, only where a pool roster exists); the
+policy stays in the sweep. One gap stays: a seat launched before runs recorded an
+account, already parked when this first ran after the owner had signed in, has no
+reading to bind to and waits for its own reset, as before.
+
+**A Codex seat stopped by its own error cell.** Codex prints a refused turn as an error cell
+(`■ <message>`) above an idle composer, so `pane_gate` reads the seat idle-ready while it cannot
+work. `src/delivery/codex_banners.py` reads the cell the seat is stopped on, by the CLI's own
+wording only (codex-cli 0.160.1's binary strings), and only as the last content above the
+composer, since a cell under later turns is history. Supervision maps a usage limit to
+`PANE_LIMIT` (its "try again at …" is the reset) and a signed-out cell to `PANE_LOGGED_OUT`,
+which raises the login card quoting the cell with "run codex login". A refused request leaves
+the seat usable, so it stays `PANE_IDLE`. The core's own delivery verdict is unchanged: a banner
+left on screen after its reset holds no dispatch.
+
+**A pool that is down.** When every live, unpaused seat of one runtime is stopped by the same
+cause (a usage limit, or signed out), the sweep raises one card for the whole pool, through the
+same hitl store as the seat cards: `pool_wedge_cards.pool_down` gives its data (id
+`pool-down:<host>:<runtime>-<cause>`, the seats by label, the account by its label, never the
+email, the earliest known reset, the banner and the owner's remedy at the Mac), and
+`raise_pool_down` keeps one card per down pool, resolving it once the pool works again or its
+set of seats changes. A pool partly down, or of a single live seat (its own seat card is the
+card), is left to the per-seat ladders.
+
 An expired login is the exception to the work-owed and sustain requirements: its
 banner asks for a `/login` card immediately, even with an empty inbox. On upgrade,
 an acknowledgment saved before wedge kinds existed is rechecked for login only.

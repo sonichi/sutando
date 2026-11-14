@@ -195,7 +195,8 @@ def worker_for_session(workspace, session_id: str) -> "str | None":
 
 def start_incarnation(workspace, worker_id: str, session_id,
                       incarnation_id=None, tmux_socket: str = "",
-                      tmux_session: str = "", runtime: str = "", cwd: str = "") -> dict:
+                      tmux_session: str = "", runtime: str = "", cwd: str = "",
+                      account: str | None = None) -> dict:
     """Begin one run. A watcher restart, a terminal reattach, or a delivered
     message is NOT a new run and must not call this.
 
@@ -218,6 +219,9 @@ def start_incarnation(workspace, worker_id: str, session_id,
     if runtime == "codex":
         row["runtime"] = runtime
         row["cwd"] = cwd
+    if account:
+        # A digest of the CLI's signed-in account (core_limit_hold.account_fingerprint), never a token.
+        row["account"] = account
     path = incarnations_path(workspace, worker_id)
     with _appending(path):
         rows = incarnations(workspace, worker_id)
@@ -258,7 +262,7 @@ def tmux_session_name(worker_id: str) -> str:
 def create_worker(workspace, *, runtime: str, host: str = "", cwd: str = "",
                   session_id=None, resume=False, fork_from=None,
                   transcript_path: str = "", tmux_socket: str = "",
-                  worker_id=None) -> dict:
+                  worker_id=None, account: str | None = None) -> dict:
     """Mint a worker and open its first run.
 
     `resume` keeps the given session id and its lineage is the caller's to have
@@ -288,7 +292,7 @@ def create_worker(workspace, *, runtime: str, host: str = "", cwd: str = "",
                        transcript_path=transcript_path)
     inc = start_incarnation(workspace, worker_id, sid, tmux_socket=tmux_socket,
                             tmux_session=tmux_session_name(worker_id), runtime=runtime,
-                            cwd=cwd)
+                            cwd=cwd, account=account)
     return {"worker_id": worker_id, "runtime_session_id": sid,
             "incarnation_id": inc["incarnation_id"], "relation": relation,
             "tmux_session": inc["tmux"]["session_name"]}

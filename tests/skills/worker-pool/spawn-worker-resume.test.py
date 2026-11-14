@@ -133,6 +133,18 @@ class ResumeRuntimeSelection(HermeticSpawnTest):
         self.assertEqual(len(wi.incarnations(self.ws, wid)), 2)
         self.assertEqual([p.name for p in (self.ws / "state/workers").iterdir()], [wid])
 
+    def test_each_run_records_the_account_it_launched_under(self):
+        """A seat parked on a limit is bound to its run's account (pool_supervision's new-login rule)."""
+        t = FakeTmux(runtime="claude")
+        with mock.patch.object(sw, "launch_account", return_value="acct-aaaa"):
+            first = self.seed_claude(t)
+        t.existing.clear()
+        with mock.patch.object(sw, "launch_account", return_value="acct-bbbb"):
+            sw.spawn(self.ws, self.repo, runtime="claude", resume=first["runtime_session_id"], runner=t,
+                     require_sentinel=False)
+        runs = wi.incarnations(self.ws, first["worker_id"])
+        self.assertEqual([r.get("account") for r in runs], ["acct-aaaa", "acct-bbbb"])
+
     def test_explicit_runtime_still_uses_the_recorded_folder(self):
         t = FakeTmux(runtime="codex")
         project = self.ws / "project"

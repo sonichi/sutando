@@ -43,7 +43,7 @@ pd = _sibling("pool_delivery")
 
 _SRC = _HERE.parents[2] / "src"
 import cli_wedge as cw  # noqa: E402  (src/ is on the path via pool_delivery)
-from delivery import pane_gate, task_dispatch as td  # noqa: E402
+from delivery import codex_banners, pane_gate, task_dispatch as td  # noqa: E402
 from task_disposition import SPENT, task_disposition  # noqa: E402
 import tmux_pane_keys  # noqa: E402
 
@@ -215,30 +215,64 @@ def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=N
             return ps.PANE_WORKING
         return ps.PANE_GATE
     if verdict.state in ("idle-ready", "pending"):
+        if runtime == "codex":
+            # Codex prints a refused turn as an error cell above an idle composer: idle to
+            # pane_gate, but a limited or signed-out seat cannot work. A refused request can.
+            banner = codex_banners.live_banner(text)
+            if banner and banner.cause == codex_banners.USAGE_LIMIT:
+                return ps.PANE_LIMIT
+            if banner and banner.cause == codex_banners.SIGNED_OUT:
+                return ps.PANE_LOGGED_OUT
         return ps.PANE_IDLE
     return ps.PANE_UNKNOWN
 
 
+def codex_banner(text: str | None, runtime: str):
+    """The Codex error cell the seat is stopped on (codex_banners.Banner), else None."""
+    return codex_banners.live_banner(text) if runtime == "codex" and text else None
+
+
+class PaneReading(tuple):
+    """(pane kind, frame id, limit reset), and `parked`: the pane waits on a provider limit and
+    nothing else (pane_gate.limit_holds; the Claude seat's only, Codex is not restarted for it)."""
+
+    def __new__(cls, kind=None, frame=None, reset=None, parked=False):
+        reading = super().__new__(cls, (kind, frame, reset))
+        reading.parked = parked
+        return reading
+
+
 def observe_pane(workspace, worker_id, runtime: str = "claude", *,
-                 runner=subprocess.run, now=None) -> tuple[str | None, str | None, "pl.Reset | None"]:
+                 runner=subprocess.run, now=None) -> PaneReading:
     """(pane kind, frame id, limit reset); all None when unread."""
     socket, name = _open_tmux(workspace, worker_id)
     if not socket:
-        return None, None, None
+        return PaneReading()
     try:
         # -e as the notifier captures: both read the same bytes, so a dim placeholder is one verdict.
         done = runner(["tmux", "-S", str(socket), "capture-pane", "-e", "-p", "-t", f"={name}:0"],
                       capture_output=True, text=True, timeout=8)
     except (OSError, ValueError, subprocess.TimeoutExpired):
-        return None, None, None
+        return PaneReading()
     text = done.stdout if done.returncode == 0 else None
     if not text or not text.strip():
-        return None, None, None
+        return PaneReading()
     kind = classify_pane_text(text, runtime, workspace=workspace, socket=socket, session=name)
     if kind in (ps.PANE_ABNORMAL, ps.PANE_UNKNOWN):
         pane_gate.save_frame(workspace, name, kind, text)
-    return kind, frame_id(text), (pl.reset(plain_text(text), time.time() if now is None else now)
-                                  if kind == ps.PANE_LIMIT else None)
+    parked = runtime == "claude" and pane_gate.limit_holds(text, pane_gate.CLAUDE)
+    return PaneReading(kind, frame_id(text), (pl.reset(plain_text(text), time.time() if now is None else now)
+                                              if kind == ps.PANE_LIMIT else None), parked)
+
+
+def current_account() -> str | None:
+    """The account on disk now in the config dir the seats launch with (core_limit_hold's reader:
+    a digest of non-secret identity fields, never a token); None when it cannot be read."""
+    try:
+        import core_limit_hold
+        return core_limit_hold.current_account()
+    except Exception:  # noqa: BLE001 - an unreadable account binds nothing and ends no wait
+        return None
 
 
 def plain_text(text: str) -> str:
@@ -292,9 +326,10 @@ def observe(workspace, now: float, *, worker_ids=None,
         held = None
         if session_alive is True and watcher_beat != pb.LIVE:
             held = session_watcher_holds(workspace, wid, runner=runner)
-        pane, pane_id, reset = (observe_pane(workspace, wid, row.get("runtime") or "claude",
-                                      runner=runner, now=now)
-                         if session_alive is True else (None, None, None))
+        reading = (observe_pane(workspace, wid, row.get("runtime") or "claude", runner=runner, now=now)
+                   if session_alive is True else PaneReading())
+        pane, pane_id, reset = reading
+        parked = getattr(reading, "parked", False)
         socket = _open_tmux(workspace, wid)[0] if session_alive is True else None
         if socket and socket not in blocks:
             blocks[socket] = delivery_block(socket)
@@ -310,6 +345,9 @@ def observe(workspace, now: float, *, worker_ids=None,
             limit_reset_at=reset.at if reset else None,
             limit_banner=reset.banner if reset else None,
             delivery_block=blocks.get(socket) if socket else None,
+            limit_parked=parked,
+            limit_waits=(row.get("runtime") or "claude") == "claude",
+            launch_account=launch_account(workspace, wid) if parked else None,
         )
     return obs
 
@@ -415,11 +453,18 @@ def load_state(workspace) -> ps.SupervisionState:
                 limit_exhausted=bool(ev.get("limit_exhausted")),
                 limit_banner=ev.get("limit_banner"),
                 limit_reset_at=ev.get("limit_reset_at"),
+                limit_account=ev.get("limit_account"),
+                relogin_attempts=int(ev.get("relogin_attempts") or 0),
+                relogin_next_at=ev.get("relogin_next_at"),
+                relogin_target=ev.get("relogin_target"),
+                relogin_down=bool(ev.get("relogin_down")),
+                relogin_down_told=bool(ev.get("relogin_down_told")),
             )
     last = raw.get("last_sample_at")
     return ps.SupervisionState(
         last_sample_at=float(last) if isinstance(last, (int, float)) else None,
-        workers=workers)
+        workers=workers, last_account=raw.get("last_account"),
+        relogin_announced=raw.get("relogin_announced"))
 
 
 def save_state(workspace, state: ps.SupervisionState) -> None:
@@ -427,6 +472,8 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "last_sample_at": state.last_sample_at,
+        "last_account": state.last_account,
+        "relogin_announced": state.relogin_announced,
         "workers": {w: {"first_detected_at": e.first_detected_at,
                         "consecutive": e.consecutive,
                         "recover_issued_at": e.recover_issued_at,
@@ -444,7 +491,13 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
                         "limit_attempts": e.limit_attempts,
                         "limit_exhausted": e.limit_exhausted,
                         "limit_banner": e.limit_banner,
-                        "limit_reset_at": e.limit_reset_at}
+                        "limit_reset_at": e.limit_reset_at,
+                        "limit_account": e.limit_account,
+                        "relogin_attempts": e.relogin_attempts,
+                        "relogin_next_at": e.relogin_next_at,
+                        "relogin_target": e.relogin_target,
+                        "relogin_down": e.relogin_down,
+                        "relogin_down_told": e.relogin_down_told}
                     for w, e in state.workers.items()},
     }
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".pool-supervision.")
@@ -455,6 +508,43 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+def launch_account(workspace, worker_id) -> str | None:
+    """The account the worker's open run was launched under (its run's `account`), else None."""
+    open_runs = [r for r in wi.incarnations(workspace, worker_id)
+                 if isinstance(r, dict) and r.get("ended_at") is None]
+    return (open_runs[-1].get("account") or None) if open_runs else None
+
+
+def mark_relogin_down(workspace, worker_id) -> None:
+    """Persist that a restart took `worker_id` down without a confirmed start (pool_supervision)."""
+    save_state(workspace, ps.mark_relogin_down(load_state(workspace), worker_id))
+
+
+def release_relogin_try(workspace, worker_id) -> None:
+    """Persist that a suspension skipped this seat's restart before any kill (pool_supervision)."""
+    save_state(workspace, ps.release_relogin_try(load_state(workspace), worker_id))
+
+
+def tell_relogin_down(workspace, worker_id) -> None:
+    """Persist that the owner was told `worker_id` is down and not coming back (pool_supervision)."""
+    save_state(workspace, ps.tell_relogin_down(load_state(workspace), worker_id))
+
+
+def relogin_announced(workspace) -> str | None:
+    return load_state(workspace).relogin_announced
+
+
+def announce_relogin(workspace, account) -> None:
+    """Persist that the owner was told the pool restarts on `account`: one opening note per sign-in."""
+    from dataclasses import replace as _replace
+    save_state(workspace, _replace(load_state(workspace), relogin_announced=account))
+
+
+def confirm_new_login(workspace, worker_id, account) -> None:
+    """Persist that `worker_id` restarted on `account` (pool_supervision.confirm_new_login)."""
+    save_state(workspace, ps.confirm_new_login(load_state(workspace), worker_id, account))
 
 
 def acknowledge_cards(workspace, worker_ids) -> None:
@@ -475,7 +565,9 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
     state = load_state(workspace)
     obs = observe(workspace, now, worker_ids=worker_ids, runner=runner)
     period = ps.SAMPLE_PERIOD_S
-    new_state, decisions = ps.evaluate(state, obs, now, expected_period_s=period)
+    # Read every tick a seat runs, so a seat first seen parked just after a switch has the account before it.
+    account = current_account() if any(o.session_alive is True for o in obs.values()) else None
+    new_state, decisions = ps.evaluate(state, obs, now, expected_period_s=period, account=account)
     retired, retire_errors, deferred = {}, {}, {}
     if persist:
         save_state(workspace, new_state)
@@ -517,7 +609,9 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
                                  "paused": o.paused, "watcher_beat": o.watcher_beat,
                                  "watcher_held": o.watcher_held,
                                  "work_outstanding": o.work_outstanding,
-                                 "pane": o.pane} for w, o in obs.items()},
+                                 "pane": o.pane, "limit_parked": o.limit_parked,
+                                 "limit_reset_at": o.limit_reset_at,
+                                 "limit_banner": o.limit_banner} for w, o in obs.items()},
             "resumed": ps.is_resume(now, state.last_sample_at, expected_period_s=period)}
 
 

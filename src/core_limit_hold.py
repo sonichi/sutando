@@ -406,6 +406,44 @@ def _launch_config_dir() -> Optional[str]:
         return None
 
 
+CLAUDE_PLANS = ("Claude Free", "Claude Pro", "Claude Max", "Claude Team", "Claude Enterprise")
+
+
+def account_label(config_dir: Optional[str]) -> Optional[str]:
+    """How the owner tells this account apart, in fixed wording only: its plan as Anthropic names it
+    ("Claude Max"), else "Claude account"; None when the CLI is signed in to nothing. Nothing the
+    owner typed (the display name) or that identifies them (the email) is ever part of it."""
+    if not config_dir:
+        return None
+    try:
+        acct = json.loads((Path(config_dir) / ".claude.json").read_text(encoding="utf-8")).get("oauthAccount")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(acct, dict) or not acct.get("accountUuid"):
+        return None
+    plan = str(acct.get("planDisplayName") or "")
+    return plan if plan in CLAUDE_PLANS else "Claude account"
+
+
+def current_account_label() -> Optional[str]:
+    """account_label() of the config dir the core and its pool's seats launch with."""
+    return account_label(_launch_config_dir())
+
+
+def current_account() -> Optional[str]:
+    """The account on disk now in the config dir the core (and its pool's seats) launch with."""
+    return account_fingerprint(_launch_config_dir())
+
+
+def _pool_sweep(workspace: Path, cause: str, key: str) -> None:
+    """The core is back: the pool sweeps now, so its seats parked on the old limit recover."""
+    try:
+        import pool_sweep_trigger
+        pool_sweep_trigger.request_sweep(workspace, cause, key)
+    except Exception:  # noqa: BLE001 - a failed nudge leaves the pool's own timer to sweep
+        pass
+
+
 def launch_identity(workspace: Path, config_dir: Optional[str] = None) -> tuple:
     """(model, account) the next launch would run as, read the way the gate reads them."""
     config_dir = _launch_config_dir() if config_dir is None else config_dir
@@ -597,6 +635,9 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
         _write_hold(workspace, hold)
     if was_held:
         _mirror_core_status(workspace, "starting", "resuming after a provider limit", now)
+    if was_held or switched:
+        _pool_sweep(workspace, "core-limit-released" if was_held else "core-account-switched",
+                    f"core-launch:{int(now)}")
     return Decision(True, hold, "")
 
 
@@ -610,6 +651,7 @@ def clear(workspace: Path, now: Optional[float] = None, by: Optional[str] = None
         hold["cleared_by"] = by
     _write_hold(workspace, hold)
     _mirror_core_status(workspace, "starting", "resuming after a provider limit", hold["released_at"])
+    _pool_sweep(workspace, "core-limit-cleared", f"core-clear:{int(hold['released_at'])}")
     return hold
 
 

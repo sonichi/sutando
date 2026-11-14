@@ -182,6 +182,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`platform.ts`** — Cross-platform OS abstraction layer.
 - **`pool_holder.py`** — Which worker-pool worker holds a queued task, with the pool skill optional.
 - **`pool_suspension.py`** — Shared reader for the worker pool's suspension marker, `state/pool-suspended`.
+- **`pool_sweep_trigger.py`** — Ask the worker pool for one sweep now, once per core-recovery event.
 - **`presenter-mode.ts`** — Provider-neutral presenter-mode sentinel policy — TS twin of src/presenter_mode.py (#2501).
 - **`presenter_mode.py`** — Provider-neutral presenter-mode sentinel policy.
 - **`proactive_claim_fence.py`** — Proactive claim lifecycle on the outbox ClaimBackend seam.
@@ -407,6 +408,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 - **`__init__.py`** — _(no header comment)_
 - **`channel_key.py`** — Per-channel pull path for task-result files in `results/`.
+- **`codex_banners.py`** — The Codex CLI's own error cells that leave a seat unable to work, read off a captured pane.
 - **`codex_pickup.py`** — Codex idle pickup: correlate a completed parent turn and keep bounded local timing evidence.
 - **`codex_recovery.py`** — Bounded Codex liveness probes; terminal errors never acknowledge or replay an owner task.
 - **`disposal.py`** — Terminal disposal of a result file: claim the generation read, verify it, quarantine it once; recover the claims a crashed owner left behind.

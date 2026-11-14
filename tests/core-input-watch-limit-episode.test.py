@@ -47,8 +47,9 @@ SEAT = "worker comm"
 UNBLOCK = ("It continues when the limit resets. To unblock it sooner, open its terminal (tmux session "
            "sutando-worker-1) and run /usage-credits to use extra credits, /login to switch to another "
            "account, or /model to switch to a model with usage left.")
-CODEX_UNBLOCK = ("It continues when the limit resets. To unblock it sooner, open its terminal (tmux session "
-                 "sutando-worker-1) and run `codex login` to switch to another account.")
+CODEX_UNBLOCK = ("Codex does not resume by itself: send its work again once the limit resets. To unblock it "
+                 "sooner, open its terminal (tmux session sutando-worker-1) and run `codex login` to switch "
+                 "to another account.")
 _FOOTER = ("────────\n❯ \n────────\n"
            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
 
