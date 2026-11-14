@@ -114,7 +114,7 @@ import local_task_protocol as ltp  # noqa: E402
 _POOL_SCRIPTS = REPO / "skills" / "worker-pool" / "scripts"
 
 
-def _holder_of(workspace: Path, task_id: str) -> str | None:
+def _pool_holder(workspace: Path, task_id: str) -> str | None:
     try:
         os.stat(_POOL_SCRIPTS / "worker_delivery.py")
     except FileNotFoundError:
@@ -123,6 +123,13 @@ def _holder_of(workspace: Path, task_id: str) -> str | None:
         sys.path.insert(0, str(_POOL_SCRIPTS))
     import worker_delivery  # noqa: E402
     return worker_delivery.holder_of(workspace, task_id)
+
+
+def _holder_of(workspace: Path, task_id: str) -> str | None:
+    # A background-agent marker is not honored: that agent died with the session
+    # this pass recovers from.
+    import task_delegation
+    return task_delegation.holder(workspace, task_id, worker_holder=_pool_holder, include_background=False)
 
 FRESH_AGE_S = 300
 IMPORT_FRESH_AGE_S = 1800

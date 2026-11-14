@@ -87,6 +87,7 @@ import process_pins  # noqa: E402
 import pool_suspension  # noqa: E402
 import tmux_pane_keys  # noqa: E402
 import watcher_identity  # noqa: E402
+import bridge_engine  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
 from gateway_serving import (  # noqa: E402
@@ -8876,7 +8877,7 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
     except OSError as e:  # noqa: BLE001 — a probe failure must not fail the check
         return {"name": name, "status": "warn", "detail": f"could not scan results/: {e}"}
     orphans: list[tuple[str, int]] = []
-    unreadable = 0
+    unreadable = unretired = 0
     for path in entries:
         # Per-file isolation on purpose. One unreadable entry must not decide
         # the answer for the whole directory: with the guard around the loop
@@ -8934,11 +8935,15 @@ def check_orphaned_results(threshold_age_sec: int = 900) -> dict:
         except (OSError, ValueError, ImportError):
             skips = set()          # unreadable -> judge it as before, never silently clear
         if skips & {"no-send", "REPLIED"}:
+            unretired += 1
             continue
         orphans.append((path.name, int(age)))
     # Coverage is part of the verdict: say what could not be measured rather
     # than let it round down into a clean result.
     partial = f" ({unreadable} entr{'y' if unreadable == 1 else 'ies'} unreadable)" if unreadable else ""
+    # A skip was never a lost reply, but a consumer should still have retired it from results/.
+    if unretired:
+        partial += f"; {unretired} skip-marked result(s) still live past the threshold, unretired"
     if not orphans:
         status = "warn" if unreadable else "ok"
         return {"name": name, "status": status,
@@ -9457,6 +9462,19 @@ def _watcher_runtime(sentinel: Path, inbox: "str | None") -> str:
                 return row["runtime"]
             break
     return "claude" if _claude_runtime_selected() else "other"
+
+
+def check_bridge_engine_match() -> dict:
+    """A bridge running from another install's engine may write tasks this core never reads."""
+    def _pids(script: str) -> tuple:
+        # Not end-anchored: a bridge launched with trailing arguments must still be found.
+        pids, scanned = probe_pids(re.escape(script) + "([[:space:]]|$)")
+        return _drop_launcher_parents(pids), scanned
+    try:
+        return bridge_engine.check_bridge_engine_match(REPO_DIR, _pids)
+    except Exception as exc:  # noqa: BLE001 — a probe failure is not a finding
+        return {"name": bridge_engine.CHECK_NAME, "status": "unknown",
+                "detail": f"probe failed ({type(exc).__name__})"}
 
 
 def check_task_watcher() -> dict:
@@ -10854,7 +10872,12 @@ def check_codex_task_notifier() -> dict:
                 "session could not be verified"
             ),
         }
-    return _probe_codex_task_notifier(target)
+    probe = _probe_codex_task_notifier(target)
+    from delivery.codex_pickup import warning
+    stalled = warning(WORKSPACE_DIR)
+    if stalled and probe["status"] == "ok":
+        return {"name": "codex-task-notifier", "status": "warn", "detail": stalled}
+    return probe
 
 
 def _claude_runtime_selected() -> bool:
@@ -12361,6 +12384,33 @@ def check_vault_manifest_integrity(
     }
 
 
+def _hook_settings_target(repo: Path) -> Optional[Path]:
+    """Where install-claude-hooks.sh writes: the core's launch dir when overridden, else the repo.
+
+    Mirrors scripts/core-working-dir.sh (the launcher and every installer source it) shape for
+    shape — unset → repo; absolute or `~/…` → that path; anything else is REFUSED there, and
+    here it is None: the installer wrote nothing for that launch, so no file can stand for it.
+    tests/core-working-dir.test.sh runs both implementations over one input table.
+    """
+    # No .strip(): the bash resolver this mirrors does not strip, so stripping here
+    # made "  " refused there and the repo default here — the one shape the contract forbids.
+    override = os.environ.get("SUTANDO_CLAUDE_WORKING_DIR", "")
+    if not override:
+        return repo
+    if override.startswith("~/"):
+        override = os.path.join(os.path.expanduser("~"), override[2:])
+    elif not override.startswith("/"):
+        return None
+    # Strict resolution detects symlink loops on every Python version; a missing
+    # target is valid because the installer creates it.
+    try:
+        try:
+            return Path(override).resolve(strict=True)
+        except FileNotFoundError:
+            return Path(override).resolve()
+    except (OSError, RuntimeError):
+        return None
+
 def _hook_script_path(command: str) -> Optional[str]:
     """The script a hook command runs; the installer module owns the parse, this is a fallback."""
     try:
@@ -12470,7 +12520,18 @@ def check_claude_hook_registration(
                           f"cannot verify skill-declared hooks"}
 
     sm = re.search(r'^SETTINGS="([^"]+)"', src, re.M)
-    settings = Path(sm.group(1).replace("$REPO_DIR", str(repo))) if sm else repo / ".claude" / "settings.json"
+    # The installer targets the directory the core launches from (SUTANDO_CLAUDE_WORKING_DIR,
+    # else the repo); the probe must read the same file or it reports the wrong tree.
+    target = _hook_settings_target(repo)
+    if target is None:
+        # A refused override is not "no override": the launcher installs nothing for it, and a
+        # settings.json left at the repo from an earlier launch must not read as this one's.
+        return {"name": name, "status": "warn",
+                "detail": f"SUTANDO_CLAUDE_WORKING_DIR={os.environ.get('SUTANDO_CLAUDE_WORKING_DIR', '')!r} "
+                          f"is neither absolute nor ~/… (or cannot be resolved) — the installer refuses it, "
+                          f"so no hooks were installed for this launch; target unknown, {len(owned)} hook(s) unverified"}
+    settings = (Path(sm.group(1).replace("$TARGET_DIR", str(target)).replace("$REPO_DIR", str(repo)))
+                if sm else target / ".claude" / "settings.json")
     if not settings.is_file():
         return {"name": name, "status": "warn",
                 "detail": f"{settings} missing — install-claude-hooks.sh has never run here; "
@@ -13856,6 +13917,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_stranded_destined_proactive())
     checks.append(check_stale_proactive_backlog())
     checks.append(check_task_watcher())
+    checks.append(check_bridge_engine_match())
     checks.append(check_task_claim_age())
     checks.append(check_a_fallback_hits())
     checks.append(check_outbox_parked())
@@ -14659,11 +14721,12 @@ def _resolve_launch_env() -> dict:
 
 
 def _core_limit_hold(now: float) -> "dict | None":
-    """The launcher's provider-limit hold in force now, else None; unreadable is None."""
+    """The launcher's provider-limit hold that would stop a relaunch now, else None; unreadable
+    is None. A hold the owner switched away from does not bind, so the core is revived."""
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         import core_limit_hold
-        return core_limit_hold.active_hold(WORKSPACE_DIR, now)
+        return core_limit_hold.binding_hold(WORKSPACE_DIR, now)
     except Exception:
         return None
 

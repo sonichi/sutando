@@ -39,7 +39,8 @@ def _field(value):
 
 
 def build_payload(task_id, headers, message, operator_lines=(), note=None, text_max=TEXT_MAX, extra=()):
-    """First line: the attested routing fields, then any `extra` (key, value) pairs. Then, for a
+    """First line: the attested routing fields, then any `extra` (key, value) pairs, then ui_origin
+    when the task carries one. Then, for a
     non-owner tier, the note; then the untrusted body between nonce markers; then the bridge-written
     lines, outside them. Only the body is cut to fit `text_max`, so the markers and lines survive."""
     tier = headers.get("access_tier") or "guest"
@@ -48,6 +49,9 @@ def build_payload(task_id, headers, message, operator_lines=(), note=None, text_
     thread = _field(headers.get("thread_root")) or "none"
     fields = "room=%s thread=%s tier=%s collaborator=%s task_id=%s" % (
         room, thread, tier, "true" if collaborator else "false", _field(task_id))
+    ui_origin = _field(headers.get("ui_origin"))
+    if ui_origin:
+        extra = [*extra, ("ui_origin", ui_origin)]
     head = fields + "".join(" %s=%s" % (k, _field(v)) for k, v in extra) + "\n"
     if tier != "owner":
         head += "note: %s\n" % (note if note is not None else non_owner_note())

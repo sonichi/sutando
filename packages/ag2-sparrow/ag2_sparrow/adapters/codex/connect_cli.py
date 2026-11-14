@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -36,7 +37,9 @@ MIN_CODEX = (0, 160, 1)
 SANDBOXES = ("read-only", "workspace-write")
 ENV_KEEP = ("PATH", "HOME", "USER")
 REQUIRED_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR")
-CONFIG_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR", "CODEX_HOME", "SANDBOX", "ALLOW_NON_OWNER", "MODEL") + cb.CONFIG_KEYS
+CONFIG_KEYS = ("CODEX", "INBOX_DIR", "RESULTS_DIR", "CODEX_HOME", "SANDBOX", "ALLOW_NON_OWNER", "MODEL",
+               "RESUME_THREAD") + cb.CONFIG_KEYS
+THREAD_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 LOCAL = Shape(name=SHAPE, command=COMMAND, description="the Codex connector as an s.space agent",
               cli="Codex CLI", min_version=MIN_CODEX, version_anchor=r"^codex",
               version_note="the app-server stdio shape was measured there", required_keys=REQUIRED_KEYS,
@@ -50,16 +53,16 @@ WORK_DIRS = ("tasks", "results", "state", os.path.join("state", "threads"))
 LABELS = ("launcher", "connector")     # the holder and its consumer, in verify's and install's words
 
 
-def config_path() -> Path:
-    return cm.config_path(LOCAL)
+def config_path(shape: Shape = LOCAL) -> Path:
+    return cm.config_path(shape)
 
 
 def version_problem(codex: str, run=subprocess.run) -> str:
     return cm.version_problem(codex, LOCAL, run)
 
 
-def load_config() -> "tuple[dict, str]":
-    return cm.load_config(LOCAL)
+def load_config(shape: Shape = LOCAL) -> "tuple[dict, str]":
+    return cm.load_config(shape)
 
 
 def child_env(cfg: dict, environ=None) -> dict:
@@ -87,7 +90,20 @@ def connector_argv(cfg: dict, root: str, root_fd: int) -> list:
         argv.append("--allow-non-owner")
     if cfg.get("MODEL"):
         argv += ["--model", cfg["MODEL"]]
+    if cfg.get("RESUME_THREAD"):
+        argv += ["--resume-thread", cfg["RESUME_THREAD"]]
     return argv
+
+
+def resume_thread_problem(thread: str, codex_home: str) -> str:
+    """'' when `thread` names a Codex conversation saved under the agent's CODEX_HOME (its sessions/
+    rollouts, where the host puts the owner's conversation it continues), else why not."""
+    if not THREAD_ID_RE.fullmatch(thread or ""):
+        return f"--resume-thread {thread!r} is not a Codex conversation id"
+    home = Path(codex_home or os.path.join(os.path.expanduser("~"), ".codex"))
+    if not any((home / "sessions").glob(f"**/rollout-*-{thread}.jsonl")):
+        return f"no Codex conversation {thread} under {home / 'sessions'}: put it there before install"
+    return ""
 
 
 def login_problem(cfg: dict, run_=subprocess.run) -> str:
@@ -107,9 +123,9 @@ def holder_words(root: str, _rec=None) -> str:
     return cm.holder_words(root, LABELS)
 
 
-def occupancy_line(root: str) -> str:
+def occupancy_line(root: str, local: Shape = LOCAL) -> str:
     """The shared tri-state beside the manager's state, in this shape's nouns."""
-    return cm.occupancy_line(LOCAL, root, LABELS)
+    return cm.occupancy_line(local, root, LABELS)
 
 
 # ── commands ─────────────────────────────────────────────────────────────────
@@ -139,7 +155,20 @@ def resolve_root(args) -> "tuple[dict, str]":
     return {"root": root, "mode": mode, "agent_id": agent_id, "token_file": token_file}, problem
 
 
+# What a repair `install <selector>` takes from the job's recorded config: (key, option, value).
+RECORDED = (("CODEX", "codex", str), ("CODEX_HOME", "codex_home", str), ("SANDBOX", "sandbox", str),
+            ("ALLOW_NON_OWNER", "allow_non_owner", lambda v: v == "1"), ("MODEL", "model", str),
+            ("RESUME_THREAD", "resume_thread", str))
+
+
 def install(args) -> int:
+    if getattr(args, "token_stdin", False):
+        return cb.install_token_stdin(args, LOCAL, lambda: connect_preflight(args, login=False), install, COMMAND,
+                                      work=None)
+    problem = cb.recorded_install_args(args, LOCAL, RECORDED)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
     codex = shutil.which(args.codex) or args.codex
     problem = version_problem(codex)
     if problem:
@@ -150,38 +179,59 @@ def install(args) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     root, mode = where["root"], where["mode"]
+    problem = cb.agent_arg_problem(getattr(args, "agent", None), where["agent_id"])
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    local, problem = cm.agent_job(LOCAL, where["agent_id"]) if mode != EXTERNAL else (LOCAL, "")
+    problem = problem or cm.install_selector_problem(local, getattr(args, "key", None), getattr(args, "single", False))
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    bridge = cb.bridge_shape(local)
+    codex_home = str(Path(args.codex_home).expanduser().resolve()) if args.codex_home else ""
+    resume = getattr(args, "resume_thread", None) or ""
+    problem = resume_thread_problem(resume, codex_home) if resume else ""
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
     values = {"CODEX": os.path.abspath(codex), "INBOX_DIR": str(Path(root) / "tasks"),
               "RESULTS_DIR": str(Path(root) / "results"),
               "CODEX_HOME": str(Path(args.codex_home).expanduser().resolve()) if args.codex_home else "",
               "SANDBOX": args.sandbox, "ALLOW_NON_OWNER": "1" if args.allow_non_owner else "",
-              "MODEL": args.model or "", "AGENT_ID": where["agent_id"], "BRIDGE": mode if mode != EXTERNAL else "",
+              "MODEL": args.model or "", "RESUME_THREAD": resume, "AGENT_ID": where["agent_id"], "BRIDGE": mode if mode != EXTERNAL else "",
               "TOKEN_ENV_FILE": where["token_file"], "TOKEN_VAULT_KEY": "",
               "BRIDGE_STATE_DIR": str(cb.bridge_home(root) / "state") if mode != EXTERNAL else ""}
     if args.sandbox == "workspace-write":
         print("NOTE sandbox: workspace-write lets an owner turn write under the work root; a turn retried after "
               "the app-server dies can repeat side effects the first attempt already made")
     def installed() -> int:
-        rc = cm.install(LOCAL, values, root, root_id=getattr(args, "root_identity", None), holder=holder_words)
+        rc = cm.install(local, values, root, root_id=getattr(args, "root_identity", None), holder=holder_words)
         if rc != 0 or mode == EXTERNAL:
             return rc
-        problem = cb.wire_bridge_bound(dict(values, ROOT=root), COMMAND, BRIDGE, LOCAL,
+        problem = cb.wire_bridge_bound(dict(values, ROOT=root), COMMAND, bridge, local,
                                        getattr(args, "root_identity", None))
         if problem:
             print(f"error: the connector is installed but its bridge is not: {problem}; run "
-                  f"{cb.rerun_install(COMMAND, where['token_file'], cb.session_flags(args))}", file=sys.stderr)
+                  f"{cb.rerun_install(local, where['token_file'], cb.session_flags(args))}", file=sys.stderr)
             return EXIT_UNUSABLE
         return 0
-    return cb.under_agent_lock(root, installed, LOCAL if mode != EXTERNAL else None, where["agent_id"])
+    return cb.under_agent_lock(root, installed, local if mode != EXTERNAL else None, where["agent_id"],
+                               cm.fence_name(local, where["agent_id"]),
+                               orphan=lambda: cb.orphan_bridge(dict(values, ROOT=root), COMMAND, bridge, local))
 
 
-def connect_preflight(args) -> str:
-    """'' when this host can run the agent, checked before the single-use code is spent; else why not."""
+def connect_preflight(args, login: bool = True) -> str:
+    """'' when this host can run the agent, checked before the single-use code is spent (`login`: and the
+    codex login is in place); else why not."""
     problem = cb.host_problem(COMMAND)
     if problem:
         return problem
     codex = os.path.abspath(shutil.which(args.codex) or args.codex)
-    login = {"CODEX": codex, "CODEX_HOME": str(Path(args.codex_home).expanduser().resolve()) if args.codex_home else ""}
-    return version_problem(codex) or login_problem(login)
+    login_cfg = {"CODEX": codex, "CODEX_HOME": str(Path(args.codex_home).expanduser().resolve()) if args.codex_home else ""}
+    resume = getattr(args, "resume_thread", None)
+    return (version_problem(codex) or (resume_thread_problem(resume, login_cfg["CODEX_HOME"]) if resume else "")
+            or (login_problem(login_cfg) if login else ""))
 
 
 CONNECT_OFF = "Codex connect is not enabled in this release; use install --work / verify"
@@ -196,6 +246,10 @@ def connect(args) -> int:
         return EXIT_UNUSABLE
     if not args.base:
         args.parser.error("the following arguments are required: --base")
+    return cb.fenced(args.agent, lambda: _connect(args))
+
+
+def _connect(args) -> int:
     seat, problem = cb.redeem_into_seat(args.base, args.code, args.trust_relay_host, lambda: connect_preflight(args),
                                          LOCAL, args.agent)
     if problem:
@@ -216,13 +270,14 @@ def run(args, popen=subprocess.Popen) -> int:
     launchd stops instead of relaunching over the holder). `debug-run` is the hand start: its
     check-then-acquire runs under the shape's operation lock (install and uninstall take the same one)
     and its holder record carries the debug label, which install never accepts as its launcher."""
-    problem = "" if args.debug else cm.managed_problem(LOCAL)
+    local, why = selected(args) if args.debug else cm.job_from_env(LOCAL)
+    problem = why or ("" if args.debug else cm.managed_problem(LOCAL))
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     if getattr(args, "launchd", False):
-        return cm.run_launchd(cm.run_child_argv(LOCAL, __name__), popen)
-    op = cm.operation_lock(LOCAL) if args.debug else None
+        return cm.run_launchd(cm.run_child_argv(local, __name__), popen)
+    op = cm.operation_lock(local) if args.debug else None
     if op is not None:
         try:
             op.__enter__()
@@ -230,14 +285,14 @@ def run(args, popen=subprocess.Popen) -> int:
             print(f"error: {e}", file=sys.stderr)
             return EXIT_UNUSABLE
     try:
-        return _checked(popen, op)
+        return _checked(popen, op, local)
     finally:
         if op is not None:
             op.release()
 
 
-def _checked(popen, op) -> int:
-    cfg, problem = load_config()
+def _checked(popen, op, local: Shape = LOCAL) -> int:
+    cfg, problem = load_config(local)
     if problem:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
@@ -279,10 +334,21 @@ def _supervise(child, state: dict) -> int:
     return rc
 
 
-def verify(_args) -> int:
+def selected(args) -> "tuple[Shape | None, str]":
+    """The job --agent, --work or --single names, else the only one installed."""
+    return cm.select_job(LOCAL, getattr(args, "agent", None), getattr(args, "work", None), getattr(args, "single", False),
+                         getattr(args, "key", None))
+
+
+def verify(args) -> int:
+    local, problem = selected(args)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    bridge = cb.bridge_shape(local)
     results: list = []
-    cfg, problem = load_config()
-    cm.check(results, not problem, "config", problem or str(config_path()))
+    cfg, problem = load_config(local)
+    cm.check(results, not problem, "config", cm.config_problem(local, problem) or str(config_path(local)))
     if problem:
         return 1
     problem = version_problem(cfg["CODEX"])
@@ -296,18 +362,27 @@ def verify(_args) -> int:
     print(f"INFO non-owner: {'served read-only (--allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '1' else 'refused unless attested collaborator'}")
     if cb.bridge_mode(cfg) != EXTERNAL:
         print(f"INFO agent: {cfg.get('AGENT_ID')}")
-        problem = cb.bridge_problem(cfg, COMMAND, BRIDGE)
+        problem = cb.bridge_problem(cfg, COMMAND, bridge)
         root = cm.work_root(cfg)
         cm.check(results, not problem, "bridge", problem or f"a connected bridge feeds {root}/tasks and {root}/results")
-        relay = lambda results_: cb.relay_rows(results_, cfg, COMMAND, BRIDGE)  # noqa: E731
+        relay = lambda results_: cb.relay_rows(results_, cfg, COMMAND, bridge)  # noqa: E731
     else:
         relay = lambda results_: cm.relay_check(results_, _dirs.device_env_path())  # noqa: E731
-    cm.verify_tail(LOCAL, cfg, results, occupancy=occupancy_line, relay=relay)
+    cm.verify_tail(local, cfg, results, occupancy=lambda root: occupancy_line(root, local), relay=relay)
     return 0 if all(results) else 1
 
 
-def uninstall(_args) -> int:
-    return cm.uninstall(LOCAL, before_free=lambda cfg: cb.unwire_bridge(cfg, COMMAND, BRIDGE), token_file=cb.kept_token)
+def uninstall(args) -> int:
+    local, problem = selected(args)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    bridge = cb.bridge_shape(local)
+    return cm.uninstall(local, before_free=lambda cfg: cb.unwire_bridge(cfg, COMMAND, bridge), token_file=cb.kept_token)
+
+
+def list_cmd(_args) -> int:
+    return cm.list_jobs(LOCAL)
 
 
 def session_options(p) -> None:
@@ -319,6 +394,14 @@ def session_options(p) -> None:
     p.add_argument("--allow-non-owner", action="store_true",
                    help="serve non-owner senders without collaborator access too, on an ephemeral read-only thread")
     p.add_argument("--model", help="the model for every turn (default: the connector's)")
+    # Codex names its rollouts in lowercase: the id is matched and resumed as such.
+    p.add_argument("--resume-thread", metavar="UUID", type=str.lower,
+                   help="continue this Codex conversation (saved under --codex-home's sessions/) in the owner's "
+                        "DM with the agent, as `codex resume <id>` does; every other room starts a new one")
+
+
+def agent_option(p):
+    return cm.job_options(p)
 
 
 def main(argv=None) -> int:
@@ -329,8 +412,16 @@ def main(argv=None) -> int:
                        "(a reinstall stops the old one first)")
     p.add_argument("--work", help="an explicit work root, fed by a bridge you run: Sparrow's tasks/ and results/ must "
                    "be <work>/tasks and <work>/results")
-    p.add_argument("--token-env-file", help="instead of --work: the agent's 0600 env file (a seat .env, or one with "
-                   "REMOTE_TASK_TOKEN and AGENT_MXID); the root is the agent's own and install runs its bridge")
+    tok = p.add_mutually_exclusive_group()
+    tok.add_argument("--token-env-file", help="instead of --work: the agent's 0600 env file (a seat .env, or one with "
+                     "REMOTE_TASK_TOKEN and AGENT_MXID); the root is the agent's own and install runs its bridge")
+    tok.add_argument("--token-stdin", action="store_true", help="instead of --work, with --agent: read the agent's "
+                     "relay token (<relay_url>|<secret>, or its REMOTE_TASK_TOKEN= line) from stdin, asked for without "
+                     "echo on a terminal, and write it to the agent's seat (mode 600) as connect does; the agent's "
+                     "job must be stopped")
+    p.add_argument("--agent", help="the agent's Matrix ID, checked against the one the token env file names")
+    p.add_argument("--key", help="the agent key of the job this install must be (checked, never chosen by it)")
+    p.add_argument("--single", action="store_true", help="checked: this install must be the fixed job")
     session_options(p)
     p.set_defaults(func=install, parser=p)
     c = sub.add_parser("connect", help="experimental, off in this release: refused unless enabled")
@@ -351,12 +442,17 @@ def main(argv=None) -> int:
     r.add_argument("--launchd", action="store_true", help="launchd's entry shim: runs the launcher as a child and "
                    "maps logical 75 to exit 0, everything else (and a signal death) to non-zero")
     r.set_defaults(func=run, debug=False)
-    sub.add_parser("debug-run", help="the same launcher by hand, for a look at the connector (stop the job first: a "
-                   "held root is refused with 75; its holder is never taken for the managed one)"
-                   ).set_defaults(func=run, debug=True, launchd=False)
-    sub.add_parser("verify", help="check every part").set_defaults(func=verify)
-    sub.add_parser("uninstall", help="stop the job, then remove what install wrote (config last)").set_defaults(func=uninstall)
+    d = sub.add_parser("debug-run", help="the same launcher by hand, for a look at the connector (stop the job first: "
+                       "a held root is refused with 75; its holder is never taken for the managed one)")
+    agent_option(d)
+    d.set_defaults(func=run, debug=True, launchd=False)
+    agent_option(sub.add_parser("verify", help="check every part")).set_defaults(func=verify)
+    agent_option(sub.add_parser("uninstall", help="stop the job, then remove what install wrote (config last)")
+                 ).set_defaults(func=uninstall)
+    sub.add_parser("list", help="each job installed here: its agent, the manager's state, its work root and the "
+                   "selector that names it").set_defaults(func=list_cmd)
     args = ap.parse_args(argv)
+    args.argv = list(sys.argv[1:] if argv is None else argv)
     return args.func(args)
 
 

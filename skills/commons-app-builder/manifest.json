@@ -1,0 +1,14 @@
+{
+  "name": "commons-app-builder",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Build Room Commons apps (an HTML page on room databases) from a one-line request: data model first, the window.artifact bridge, a phone-width-first UX bar, and verification before replying. GUIDE.md is the portable method; SKILL.md is the Sutando wrapper. Config: BUILD_THREAD_CONVERSATION (default false) lets a build also speak in the app's own thread (BUILD_REQUEST.md, \"In the app's thread\").",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  },
+  "config": {
+    "BUILD_THREAD_CONVERSATION": false
+  }
+}

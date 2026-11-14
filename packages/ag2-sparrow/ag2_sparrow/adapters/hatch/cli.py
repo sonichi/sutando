@@ -1539,21 +1539,14 @@ def _commit_answer_locked(result_dir: Path, task_dir: Path, tid: str, root: Path
         return False, "none"
     if result_file.exists():
         return False, _line_report(result_dir, tid)
-    side = None
     try:
         # Before the result: the drain that reads the result finds its labels with it.
-        side = result_labels.write(result_file, labels or {})
+        result_labels.write(result_file, labels or {}, body)
         committed = _publish_once(result_file, body)
     except BaseException:
         with contextlib.suppress(OSError):
             (_claims_dir(result_dir) / tid).unlink(missing_ok=True)
-        if side is not None:
-            with contextlib.suppress(OSError):
-                side.unlink(missing_ok=True)
         raise
-    if not committed and side is not None:
-        with contextlib.suppress(OSError):
-            side.unlink(missing_ok=True)
     # False: another result holds the name, so the task is answered either way.
     return committed, _line_report(result_dir, tid)
 
@@ -1589,12 +1582,13 @@ def no_reply(args) -> int:
 
 
 def _answer_labels(args, silent: bool) -> dict:
-    """The Activity title and outcome, each cut to fit with a warning; a no-reply's outcome
-    defaults to its reason."""
+    """The Activity title, outcome and parent, each cut to fit or dropped with a warning; a
+    no-reply's outcome defaults to its reason."""
     outcome = getattr(args, "outcome", None)
     if silent and not result_labels.clean(outcome):
         outcome = result_labels.fit(getattr(args, "reason", None), result_labels.OUTCOME_MAX)
-    labels, notes = result_labels.check(getattr(args, "title", None), outcome)
+    labels, notes = result_labels.check(getattr(args, "title", None), outcome,
+                                        getattr(args, "parent", None))
     for note in notes:
         print(f"warning: {note}", file=sys.stderr)
     return labels
@@ -1763,6 +1757,8 @@ def main(argv=None) -> int:
                    f"{result_labels.TITLE_MAX} characters (longer is cut to fit, with a warning)")
     r.add_argument("--outcome", help=f"the Activity outcome: what came of it, past tense, one "
                    f"line, at most {result_labels.OUTCOME_ASK} characters, visible to the owner only")
+    r.add_argument("--parent", help="the task_id of one of your recent_tasks this request continues "
+                   "(same piece of work, outside a thread), so Activity groups them; leave it out if unsure")
     r.add_argument("--wait", type=float, default=REPLY_WAIT_S,
                    help=f"seconds to wait for Sparrow to confirm (default {REPLY_WAIT_S:g})")
     r.set_defaults(func=reply)
@@ -1776,6 +1772,8 @@ def main(argv=None) -> int:
                    f"{result_labels.TITLE_MAX} characters (longer is cut to fit, with a warning)")
     n.add_argument("--outcome", help=f"the Activity outcome, past tense, one line, at most "
                    f"{result_labels.OUTCOME_ASK} characters, visible to the owner only (default: --reason)")
+    n.add_argument("--parent", help="the task_id of one of your recent_tasks this request continues "
+                   "(same piece of work, outside a thread), so Activity groups them; leave it out if unsure")
     n.add_argument("--wait", type=float, default=REPLY_WAIT_S,
                    help=f"seconds to wait for Sparrow to confirm (default {REPLY_WAIT_S:g})")
     n.set_defaults(func=no_reply)

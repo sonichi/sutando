@@ -132,9 +132,9 @@ class ReadersSayUnknown(unittest.TestCase):
         self.assertEqual(sup.classify_pane_text("no prompt here\n"), ps.PANE_UNKNOWN)
 
     def test_no_run_or_a_failed_capture_reads_nothing(self):
-        self.assertEqual(sup.observe_pane(pool(with_run=False), WID, runner=Runner()), (None, None))
+        self.assertEqual(sup.observe_pane(pool(with_run=False), WID, runner=Runner()), (None, None, None))
         self.assertEqual(sup.observe_pane(pool(), WID, runner=Runner(capture_pane=OSError("x"))),
-                         (None, None))
+                         (None, None, None))
 
 
 if __name__ == "__main__":
