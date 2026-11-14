@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import {
 	DEFAULT_FALLBACK_CONFIG as D, EMPTY_DM_GATE, clearLine, decideModel, fiveHourTier, flushHeld, gateLine, initialState, modelLevel, nextFlushAt, nextState,
-	observationFromHeaders, projectFiveHour, pushSample, requestPriority, rewriteModel, samplesFromHistoryRows,
+	observationFromHeaders, persistedStateChanged, projectFiveHour, pushSample, requestPriority, rewriteModel, samplesFromHistoryRows,
 	splitModel, stateChanged, transitionLine, validModelForLevel, windowTier,
 	type DmGate, type FallbackConfig, type FallbackState, type QuotaObservation, type Sample,
 } from '../skills/quota-tracker/scripts/quota-fallback-policy.ts';
@@ -334,6 +334,51 @@ test('projection hysteresis: tier 2 escalates to 3 after the dwell if it still r
 	ws = { ...ws, ...fiveHourTier(ws, 0.70, t, 0.03, false, clear, pc, now) };
 	assert.strictEqual(ws.tier, 2, 'N samples and the quiet period: one level back');
 	assert.strictEqual(ws.clear_count, 0, 'the count restarts for the next level');
+});
+
+test('restart continuity: the projection cooldown survives a save and restore, measured from the latest failure', () => {
+	const pc = D.projection5h;
+	const t = D.thresholds['5h'];
+	const fail = { projected: 1.2, ratePerHour: 0.5, etaFullMs: T0 + H, source: 'slope' as const };
+	const clear = { projected: 0.8, ratePerHour: 0.05, etaFullMs: null, source: 'slope' as const };
+	const withWin = (ws: FallbackState['windows']['5h']): FallbackState => {
+		const base = initialState(T0);
+		return { ...base, tier: ws.tier, windows: { ...base.windows, '5h': ws } };
+	};
+	// The proxy writes only when persistedStateChanged says so; disk is a JSON round trip.
+	const save = (disk: FallbackState | null, next: FallbackState): FallbackState | null =>
+		persistedStateChanged(disk, next) ? JSON.parse(JSON.stringify(next)) : disk;
+	const w0 = initialState(T0).windows['5h'];
+	let ws = { ...w0, ...fiveHourTier(w0, 0.60, t, 0.03, false, fail, pc, T0) };
+	const E = T0 + pc.escalateAfterSec * 1000;
+	ws = { ...ws, ...fiveHourTier(ws, 0.70, t, 0.03, false, fail, pc, E) };
+	assert.strictEqual(ws.tier, 3);
+	let disk = save(null, withWin(ws));
+	const lastFail = E + 240_000;
+	ws = { ...ws, ...fiveHourTier(ws, 0.70, t, 0.03, false, fail, pc, lastFail) };
+	assert.strictEqual(ws.tier, 3, 'a same-tier failure moves only last_fail_at');
+	disk = save(disk, withWin(ws));
+	assert.strictEqual(disk!.windows['5h'].last_fail_at, lastFail, 'the newer failure reached disk');
+	let live = ws;
+	let restored = { ...(JSON.parse(JSON.stringify(disk)) as FallbackState).windows['5h'] };
+	let now = lastFail;
+	for (let i = 0; i < pc.clearSamples; i++) {
+		now += 1000;
+		live = { ...live, ...fiveHourTier(live, 0.70, t, 0.03, false, clear, pc, now) };
+		restored = { ...restored, ...fiveHourTier(restored, 0.70, t, 0.03, false, clear, pc, now) };
+		disk = save(disk, withWin(restored));
+		assert.strictEqual(restored.tier, 3, `clearing sample ${i + 1} after restore: the cooldown still holds`);
+		assert.strictEqual(restored.tier, live.tier);
+	}
+	assert.strictEqual(disk!.windows['5h'].clear_count, pc.clearSamples, 'clearing samples are saved too');
+	now = lastFail + pc.clearAfterSec * 1000 - 1000;
+	restored = { ...restored, ...fiveHourTier(restored, 0.70, t, 0.03, false, clear, pc, now) };
+	assert.strictEqual(restored.tier, 3, 'one second before the cooldown ends');
+	now = lastFail + pc.clearAfterSec * 1000;
+	restored = { ...restored, ...fiveHourTier(restored, 0.70, t, 0.03, false, clear, pc, now) };
+	live = { ...live, ...fiveHourTier(live, 0.70, t, 0.03, false, clear, pc, now) };
+	assert.strictEqual(restored.tier, 2, 'cooldown elapsed: one level back');
+	assert.strictEqual(restored.tier, live.tier, 'same as the uninterrupted control');
 });
 
 test('history rows seed the samples: seconds → ms, foreign/old rows skipped, oldest first', () => {

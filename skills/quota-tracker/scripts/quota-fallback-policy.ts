@@ -427,13 +427,16 @@ export function stateChanged(a: FallbackState | null, b: FallbackState): boolean
 }
 
 /** What the persisted record must keep current: everything a reader of
- *  quota-state.json `fallback` decides from. The health check finds the window at
- *  the effective tier and calls it cleared once that window's reset has passed, so
- *  per-window tiers and reset epochs belong here, with the reason and model map.
- *  Per-sample numbers (utilization, projection, eta) are left out: they move on
- *  every response and no reader decides from them. */
+ *  quota-state.json `fallback` decides from, including the proxy itself after a
+ *  restart. The health check finds the window at the effective tier and calls it
+ *  cleared once that window's reset has passed, so per-window tiers and reset
+ *  epochs belong here, with the reason and model map. `fiveHourTier` decides from
+ *  `last_fail_at`, `clear_count` and `tier_since`, so a restart that lost them
+ *  would end the cooldown early. Per-sample numbers (utilization, projection,
+ *  eta) are left out: no reader decides from them. */
 function persistedView(s: FallbackState): string {
-	const w = (x: WindowState | undefined) => [x?.tier ?? null, x?.low_tier ?? null, x?.reset ?? null];
+	const w = (x: WindowState | undefined) => [x?.tier ?? null, x?.low_tier ?? null, x?.reset ?? null,
+		x?.last_fail_at ?? null, x?.clear_count ?? null, x?.tier_since ?? null];
 	const f = s.fired ? [s.fired.window, s.fired.key, s.fired.threshold] : null;
 	const map = Object.entries(s.active_model_map ?? {}).sort(([x], [y]) => x.localeCompare(y));
 	return JSON.stringify([s.tier, s.low_priority_tier, s.runtime_switch?.to ?? null, s.reason, f, map,
