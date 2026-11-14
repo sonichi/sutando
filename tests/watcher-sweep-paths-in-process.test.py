@@ -371,7 +371,7 @@ class ArchiveErrors(Base):
         ptr = self.ptr("task-a")
         self.fifo_lock()
         logs = []
-        self.assertEqual(ta.retire_delivery_pointers(self.ws / "deliveries", "task-a", log=logs.append), [])
+        self.assertEqual(ta.retire_delivery_pointers(self.ws / "deliveries", "task-a", tasks_dir=self.tasks, log=logs.append), [])
         self.assertTrue(ptr.exists())
         self.assertEqual(len(logs), 1)
         self.assertIn("retire pointer for task-a in", logs[0])
@@ -381,13 +381,13 @@ class ArchiveErrors(Base):
         root = self.ws / "deliveries-as-a-file"
         root.write_text("")
         logs = []
-        self.assertEqual(ta.retire_delivery_pointers(root, "task-a", log=logs.append), [])
+        self.assertEqual(ta.retire_delivery_pointers(root, "task-a", tasks_dir=self.tasks, log=logs.append), [])
         self.assertEqual(len(logs), 1)
         self.assertIn(f"retire pointers for task-a: cannot list {root}", logs[0])
 
     def test_a_missing_root_is_silent(self):
         logs = []
-        self.assertEqual(ta.retire_delivery_pointers(self.ws / "nope", "task-a", log=logs.append), [])
+        self.assertEqual(ta.retire_delivery_pointers(self.ws / "nope", "task-a", tasks_dir=self.tasks, log=logs.append), [])
         self.assertEqual(logs, [])
 
     def test_migration_without_an_archive_dir_still_retires_a_processed_task(self):

@@ -7941,7 +7941,7 @@ def _archive_task_file(tid: str) -> bool:
             pass
     gone = find_task_file(TASKS_DIR, tid) is None
     if gone:
-        retire_delivery_pointers(deliveries_root_for(TASKS_DIR), tid, log=_log)
+        retire_delivery_pointers(deliveries_root_for(TASKS_DIR), tid, tasks_dir=TASKS_DIR, log=_log)
     return gone
 
 

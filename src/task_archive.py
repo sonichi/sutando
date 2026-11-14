@@ -185,7 +185,8 @@ def archive_file(src: Path, kind: str, task_id: str, *,
             dest_dir.mkdir(parents=True, exist_ok=True)
             _move_without_clobbering(src, dest_dir / f"{task_id}.txt")
             if kind == "tasks":
-                retire_delivery_pointers(deliveries_root_for(src.parent), task_id, log=log)
+                retire_delivery_pointers(deliveries_root_for(src.parent), task_id,
+                                         tasks_dir=src.parent, log=log)
         return True
     except Exception as e:
         log(f"  archive_file({kind}, {task_id}) failed: {e}")
@@ -269,8 +270,11 @@ def _retire_in_folder(folder: str, task_id: str, tasks_dir: Path) -> list[str] |
         os.close(dfd)
 
 
-def retire_delivery_pointers(deliveries_root: Path, task_id: str, *, log=print) -> list[str]:
+def retire_delivery_pointers(deliveries_root: Path, task_id: str, *, tasks_dir: Path,
+                             log=print) -> list[str]:
     """Move every inbox's pointer for an archived task into that inbox's archive/.
+
+    `tasks_dir` is the live inbox the task came from; a body still there keeps its pointer.
 
     Called from the step that archives the task body, so "this task is done" has one
     writer. Best-effort: a failure is logged and the next migration pass retries it.
@@ -289,7 +293,7 @@ def retire_delivery_pointers(deliveries_root: Path, task_id: str, *, log=print) 
     moved: list[str] = []
     for folder in folders:
         try:
-            moved += _retire_in_folder(folder, task_id, Path(deliveries_root).parent / "tasks") or []
+            moved += _retire_in_folder(folder, task_id, Path(tasks_dir)) or []
         except OSError as e:
             log(f"  retire pointer for {task_id} in {folder} failed: {e}")
     return moved

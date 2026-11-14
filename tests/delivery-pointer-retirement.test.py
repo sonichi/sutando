@@ -76,26 +76,26 @@ class RetireOnArchive(Base):
 
     def test_an_accepted_pointer_is_retired_too(self):
         ptr = self.pointer("task-a3", ".accepted")
-        moved = ta.retire_delivery_pointers(self.ws / "deliveries", "task-a3", log=lambda m: None)
+        moved = ta.retire_delivery_pointers(self.ws / "deliveries", "task-a3", tasks_dir=self.tasks, log=lambda m: None)
         self.assertEqual([Path(m).name for m in moved], ["task-a3.accepted"])
         self.assertFalse(ptr.exists())
 
     def test_no_pointer_is_a_no_op_that_creates_nothing(self):
-        self.assertEqual(ta.retire_delivery_pointers(self.ws / "deliveries", "task-none"), [])
+        self.assertEqual(ta.retire_delivery_pointers(self.ws / "deliveries", "task-none", tasks_dir=self.tasks), [])
         self.assertFalse((self.inbox / "archive").exists())
         self.assertFalse((self.inbox / ta.POINTER_LOCK_NAME).exists())
-        self.assertEqual(ta.retire_delivery_pointers(self.ws / "absent", "task-none"), [])
+        self.assertEqual(ta.retire_delivery_pointers(self.ws / "absent", "task-none", tasks_dir=self.tasks), [])
 
     def test_a_symlinked_inbox_is_never_followed(self):
         real = Path(self._td.name) / "elsewhere"
         real.mkdir()
         (real / "task-a4.txt").write_text("")
         os.symlink(real, self.ws / "deliveries" / "fedcba9876543210fedcba9876543210")
-        ta.retire_delivery_pointers(self.ws / "deliveries", "task-a4", log=lambda m: None)
+        ta.retire_delivery_pointers(self.ws / "deliveries", "task-a4", tasks_dir=self.tasks, log=lambda m: None)
         self.assertTrue((real / "task-a4.txt").exists())
 
     def test_a_traversal_id_is_refused(self):
-        self.assertEqual(ta.retire_delivery_pointers(self.ws / "deliveries", "../x"), [])
+        self.assertEqual(ta.retire_delivery_pointers(self.ws / "deliveries", "../x", tasks_dir=self.tasks), [])
 
     def test_a_held_lock_fails_soft_and_is_logged(self):
         import fcntl
@@ -103,18 +103,41 @@ class RetireOnArchive(Base):
         logs = []
         with open(self.inbox / ta.POINTER_LOCK_NAME, "a+") as fh:
             fcntl.flock(fh, fcntl.LOCK_EX)
-            moved = ta.retire_delivery_pointers(self.ws / "deliveries", "task-a5", log=logs.append)
+            moved = ta.retire_delivery_pointers(self.ws / "deliveries", "task-a5", tasks_dir=self.tasks, log=logs.append)
         self.assertEqual(moved, [])
         self.assertTrue((self.inbox / "task-a5.txt").exists())
         self.assertTrue(any("task-a5" in m for m in logs))
 
     def test_a_retired_pointer_is_no_longer_a_hold_or_a_delivery(self):
         self.pointer("task-a6")
-        ta.retire_delivery_pointers(self.ws / "deliveries", "task-a6", log=lambda m: None)
+        ta.retire_delivery_pointers(self.ws / "deliveries", "task-a6", tasks_dir=self.tasks, log=lambda m: None)
         self.assertFalse(td.worker_holds(self.ws / "deliveries", "task-a6.txt"))
         self.assertEqual(td.owned_task_ids(self.ws / "deliveries", W), [])
         self.assertEqual(pd.pending(self.ws, W), [])
         self.assertEqual(sorted(p.name for p in self.inbox.glob("*.txt")), [])
+
+
+class CustomInbox(Base):
+    def test_a_custom_inbox_keeps_the_pointer_of_a_body_still_live_there(self):
+        inbox = self.ws / "inbox-custom"
+        inbox.mkdir()
+        (inbox / "task-ci.txt").write_text("id: task-ci\ntask: x\n")
+        ptr = self.pointer("task-ci")
+        self.assertEqual(ta.retire_delivery_pointers(ta.deliveries_root_for(inbox), "task-ci",
+                                                     tasks_dir=inbox, log=lambda m: None), [])
+        self.assertTrue(ptr.exists())
+
+    def test_archive_file_from_a_custom_inbox_retires_the_pointer(self):
+        inbox = self.ws / "inbox-custom"
+        inbox.mkdir()
+        src = inbox / "task-ci2.txt"
+        src.write_text("id: task-ci2\ntask: x\n")
+        (self.tasks / "task-ci2.txt").write_text("a same-named body in the default inbox\n")
+        ptr = self.pointer("task-ci2")
+        self.assertTrue(ta.archive_file(src, "tasks", "task-ci2", tasks_dir=inbox / "archive",
+                                        results_dir=self.ws / "results" / "archive", log=lambda m: None))
+        self.assertFalse(ptr.exists())
+        self.assertTrue((self.inbox / "archive" / "task-ci2.txt").is_file())
 
 
 class GatewayArchive(Base):
@@ -180,7 +203,7 @@ class Migration(Base):
     def test_the_archive_step_keeps_the_pointer_of_a_task_live_again(self):
         self.task("task-rq2")
         ptr = self.pointer("task-rq2")
-        self.assertEqual(ta.retire_delivery_pointers(self.ws / "deliveries", "task-rq2", log=lambda m: None), [])
+        self.assertEqual(ta.retire_delivery_pointers(self.ws / "deliveries", "task-rq2", tasks_dir=self.tasks, log=lambda m: None), [])
         self.assertTrue(ptr.exists())
 
     def test_an_inbox_it_cannot_lock_fails_the_run_and_a_later_run_retires_it(self):
