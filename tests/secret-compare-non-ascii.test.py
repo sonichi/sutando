@@ -23,8 +23,26 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 _TMP = tempfile.TemporaryDirectory()
-os.environ["SUTANDO_WORKSPACE"] = _TMP.name
-os.environ["SUTANDO_TELEMETRY"] = "0"
+_HOME = Path(_TMP.name) / "home"
+_HOME.mkdir()
+# The capture server writes its token under the home directory at import time.
+_ISOLATED_ENV = {"SUTANDO_WORKSPACE": str(Path(_TMP.name) / "workspace"), "SUTANDO_TEST_MODE": "1",
+                 "SUTANDO_TELEMETRY": "0", "HOME": str(_HOME), "USERPROFILE": str(_HOME),
+                 "XDG_CONFIG_HOME": str(_HOME / ".config")}
+_REAL_TOKEN = Path(os.path.expanduser("~/.config/sutando/screen-capture-token"))
+
+
+def _lstat_or_none(p: Path):
+    try:
+        st = p.lstat()
+    except FileNotFoundError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns, st.st_mode)
+
+
+_REAL_TOKEN_BEFORE = _lstat_or_none(_REAL_TOKEN)
+_SAVED_ENV = {k: os.environ.get(k) for k in _ISOLATED_ENV}
+os.environ.update(_ISOLATED_ENV)
 sys.path.insert(0, str(REPO / "src"))
 
 import local_api_gate  # noqa: E402
@@ -113,6 +131,13 @@ class CaptureTokenTests(unittest.TestCase):
         self.assertEqual(self._check(NON_ASCII), (False, [403]))
         self.assertEqual(self._check("cap-token"), (True, []))
 
+    def test_token_written_only_inside_fixture(self):
+        token = Path(self.mod._CAPTURE_TOKEN_PATH)
+        self.assertTrue(token.is_relative_to(_HOME), token)
+        self.assertTrue(token.is_file())
+        self.assertNotEqual(token, _REAL_TOKEN)
+        self.assertEqual(_lstat_or_none(_REAL_TOKEN), _REAL_TOKEN_BEFORE)
+
 
 class WorkspaceServerTests(unittest.TestCase):
     @classmethod
@@ -147,4 +172,9 @@ if __name__ == "__main__":
     try:
         unittest.main()
     finally:
+        for _k, _v in _SAVED_ENV.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
         _TMP.cleanup()
