@@ -276,6 +276,23 @@ describe('build-core-settings.mjs', () => {
 		assert.deepEqual(shellParsedWords(last.hooks[0].command), [hook]);
 	});
 
+	it('registers the github-evidence merge gate on Bash with --merge-gate and its checkout, after the stale-head guard', () => {
+		const trap = '/x/hooks/shell-trap-guard.py';
+		const stale = '/x/hooks/stale-head-post-guard.py';
+		const hook = '/x y/hooks/github-evidence-guard.py';
+		const o = JSON.parse(
+			execFileSync(
+				'node',
+				[CORE_BUILDER, GUARD, '', SKILL_TELEMETRY, GMAIL_WRITE_GUARD, GDOCS_WRITE_GUARD, NATIVE_PIM_GUARD, trap, stale, hook],
+				{ encoding: 'utf8' },
+			),
+		);
+		const last = o.hooks.PreToolUse[o.hooks.PreToolUse.length - 1];
+		assert.equal(last.matcher, 'Bash');
+		assert.deepEqual(shellParsedWords(last.hooks[0].command), [hook, '--merge-gate', '--repo', '/x y']);
+		assert.ok(!JSON.stringify(o.hooks.PostToolUse || []).includes('github-evidence-guard'));
+	});
+
 	it('omitting the stale-head post guard path registers no hook for it', () => {
 		const o = JSON.parse(
 			execFileSync('node', [CORE_BUILDER, GUARD, '', '', '', '', '', '/x/hooks/shell-trap-guard.py', ''], {

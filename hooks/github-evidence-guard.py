@@ -2,8 +2,10 @@
 """Guard the observed CI log-scraping error, and surface evidence rules in context.
 
 This is a narrow command guard, not proof of general model accuracy. PostToolUse may read GitHub; no user-data writes occur here. Wrapper/variable bypasses remain possible.
+Registered with `--merge-gate --repo <checkout>`, it only gates PR merges before they run (`_merge_hold.py`).
 """
 import json
+import os
 import re
 from shlex import quote
 import sys
@@ -56,12 +58,27 @@ def decision_context(command):
             json.dumps(receipts, ensure_ascii=False)) if receipts else ""
 
 
-def decide(data: dict) -> dict:
+def merge_gate(data: dict, command: str, argv) -> dict:
+    """PreToolUse deny for a merge during an announced re-read (`--merge-gate` registration only)."""
+    if data.get("hook_event_name", "PreToolUse") != "PreToolUse":
+        return {}
+    import _merge_hold
+    root = next((argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--repo"), None)
+    verdict, text = _merge_hold.gate(command, data.get("cwd"), root or os.environ.get("SUTANDO_REPO_ROOT"))
+    if verdict == "deny":
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": text}}
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}} if text else {}
+
+
+def decide(data: dict, argv=()) -> dict:
     if data.get("tool_name") != "Bash":
         return {}
     command = (data.get("tool_input") or {}).get("command", "")
     if not isinstance(command, str) or not re.search(r"\bgh\s+(?:(?:pr|run)\s+(?:view|checks|merge)|api)\b", command):
         return {}
+    if "--merge-gate" in argv:
+        return merge_gate(data, command, list(argv))
     event = data.get("hook_event_name", "PreToolUse")
     script = Path(__file__).resolve().parent.parent / "skills/review-preflight/scripts"  # lint-workspace-resolution: allow-repo-root
     helper = quote(str(script / "github-evidence.py"))
@@ -91,7 +108,15 @@ def decide(data: dict) -> dict:
 
 
 def main() -> None:
-    result = decide(json.loads(sys.stdin.read()))
+    raw = sys.stdin.read()
+    try:
+        result = decide(json.loads(raw), sys.argv[1:])
+    except Exception as exc:
+        if "--merge-gate" not in sys.argv[1:] or not re.search(r"merge|enqueuePullRequest", raw):
+            raise
+        # A merge gate that cannot decide must not let the merge through.
+        result = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                  "permissionDecisionReason": f"merge-hold: guard error {exc!r}; cannot verify merge holds. Re-run."}}
     if result:
         print(json.dumps(result))
 

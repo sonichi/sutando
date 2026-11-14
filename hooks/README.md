@@ -674,3 +674,63 @@ string at a time, the same scope limit the other two hooks accept. Deploy is the
 per-node registration as `context-source-guard.py`'s "Deploy (per node)" section above
 (`PreToolUse` → `Bash` matcher, `$CLAUDE_CONFIG_DIR` awareness) — not done as part of
 landing this hook's source.
+
+## `github-evidence-guard.py --merge-gate` (merge holds)
+
+Gates a **PR merge while a reviewer's announced re-read has not landed**. The same
+`github-evidence-guard.py` file, registered a second time under `PreToolUse[Bash]` with
+`--merge-gate --repo <checkout>`, runs only this gate; its other registrations are unchanged.
+The policy lives beside it in `_merge_hold.py`.
+
+Merge commands it reads: `gh pr merge <n|url> [--repo|-R o/r]` (`--disable-auto` passes),
+`gh api -X PUT repos/o/r/pulls/<n>/merge`, and `gh api graphql` carrying `mergePullRequest`
+or `enqueuePullRequest` (inline `-f query=`, `-F query=@file`, or `--input file`; the
+`pullRequestId` is a literal or a `-f/-F` variable). `bash -c` / `sh -c` / `eval` wrappers
+are read; heredoc bodies are not commands. A merge whose PR it cannot name (no `--repo`, a
+`$VAR` id, an unreadable body) is UNKNOWN. Every other Bash command returns on a string
+match with no `gh` call and no file read.
+
+For each merge it makes **one** `gh api graphql` read (head commit date, author, review
+requests, the last 100 reviews and comments), 5 s budget:
+
+- **HOLD**: an issue comment or review body since the head commit says re-read / re-reading /
+  reading again / will re-review / taking another look / hold merge / do not merge / please
+  wait, from a login with **standing** (a requested reviewer, a login that has reviewed the
+  PR, or an OWNER / MEMBER / COLLABORATOR author association). The PR author, bots, quoted
+  (`>`) lines and a re-read named as done ("after re-reading it") never hold.
+- It **resolves** when that login posts any newer review, or a newer comment that approves or
+  says lgtm / done / no further / clear to merge without announcing again.
+- It **expires** `env.MERGE_HOLD_TTL_HOURS` (default 4) hours after the announcement; an
+  expired hold passes with `EXPIRED hold by <login> announced <t> (<age>); re-ask them`.
+- **Room holds** (said in a chat room, not on GitHub) live in
+  `<workspace>/state/merge-holds.json`, expire the same way or at their own `expires_at`:
+  `python3 hooks/_merge_hold.py OWNER/REPO PR --add-hold --who LOGIN --note "..." [--url U] [--expires-at T]`,
+  `... --clear-hold --who LOGIN`.
+- **UNKNOWN**: a failed, timed-out, malformed or truncated read, an unreadable hold file, or
+  a bad TTL. Never CLEAR.
+
+**Mode** (`env.MERGE_HOLD_MODE` in `sutando.config.local.json`): `shadow` (default) never
+denies; `enforce` denies on HOLD and UNKNOWN, naming the reviewer, time, URL and expiry. Any
+other value enforces. Both modes append one line per merge target to
+`<workspace>/logs/merge-hold-shadow.jsonl` (`ts`, `repo`, `pr`, `verdict` HOLD / CLEAR /
+EXPIRED / UNKNOWN, `holder`, `elapsed_ms`, `kind`, `mode`, `override`);
+`python3 hooks/_merge_hold.py --summary` prints counts by verdict and p50/p95 `elapsed_ms`.
+
+**Override** (enforce mode): `SUTANDO_MERGE_HOLD_OVERRIDE='<reason>' gh pr merge ...`, the
+reason at least 8 characters, passes a HOLD or UNKNOWN. It is appended to
+`<workspace>/state/guards/merge_hold_overrides.jsonl` first; if that write fails the merge is
+denied.
+
+**Known limits.** One command at a time: a merge run from a script, alias, `xargs` or
+another tool is not seen. Phrase matching is English and literal. More than 100 comments or
+reviews since the head commit reads as UNKNOWN. Codex-core sessions do not load Claude hooks.
+
+### Registration
+
+**Auto-registered** for every core session: `session-launch.sh` passes the hook to
+`build-core-settings.mjs` (arg 9, after the stale-head guard), which registers it under
+`PreToolUse` with matcher `Bash` and command `python3 <hook> --merge-gate --repo <checkout>`.
+For a non-core session, add the same entry by hand.
+
+Tests: `python3 tests/merge-hold.test.py` (policy) and
+`python3 tests/github-evidence-guard-merge-gate.test.py` (gate, cost, registration).

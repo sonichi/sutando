@@ -13,7 +13,7 @@
 // builder treats the obs settings as an opaque JSON blob and array-concats it
 // with the guard, so the two concerns never drift.
 //
-// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>] [<abs-path-to-gdocs-write-guard.py>] [<abs-path-to-native-pim-guard.py>] [<abs-path-to-shell-trap-guard.py>] [<abs-path-to-stale-head-post-guard.py>]
+// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>] [<abs-path-to-gdocs-write-guard.py>] [<abs-path-to-native-pim-guard.py>] [<abs-path-to-shell-trap-guard.py>] [<abs-path-to-stale-head-post-guard.py>] [<abs-path-to-github-evidence-guard.py>]
 //   arg1 (required): path to the guard hook script (skip-ask-user-question.py).
 //   arg2 (optional): the obs `--settings` JSON string from build-hook-settings.mjs;
 //                    empty / omitted → obs hooks are not included.
@@ -38,6 +38,9 @@
 //   arg8 (optional): path to hooks/stale-head-post-guard.py — registered under
 //                    PreToolUse[Bash]: blocks a PR review or comment whose
 //                    commit_id or sha claim names a head the PR has moved past.
+//   arg9 (optional): path to hooks/github-evidence-guard.py — registered under
+//                    PreToolUse[Bash] with --merge-gate --repo <checkout>: denies a PR
+//                    merge while a reviewer's announced re-read has not landed.
 // Prints the merged settings JSON to stdout (exit 2 on a missing guard path,
 // exit 3 on an unparseable obs-settings blob).
 
@@ -162,6 +165,15 @@ if (staleHeadPostGuardHook.trim()) {
 	staleHeadPostGuardSettings = { hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command }] }] } };
 }
 
+// Always-on, merge gate only: one GitHub read per merge command, nothing for any other.
+const mergeGateHook = process.argv[10] || '';
+let mergeGateSettings = null;
+if (mergeGateHook.trim()) {
+	const repoRoot = path.resolve(mergeGateHook, '..', '..');
+	const command = `python3 ${shq(mergeGateHook)} --merge-gate --repo ${shq(repoRoot)}`;
+	mergeGateSettings = { hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command }] }] } };
+}
+
 process.stdout.write(
 	JSON.stringify(
 		mergeHookSettings(
@@ -173,6 +185,7 @@ process.stdout.write(
 			nativePimGuardSettings,
 			shellTrapGuardSettings,
 			staleHeadPostGuardSettings,
+			mergeGateSettings,
 		),
 	),
 );
