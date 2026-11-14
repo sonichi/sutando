@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import Dict, Iterable, List, NamedTuple, Optional, Tuple
 
-from .schema import STATUS_RESOLVED, TERMINAL_STATUSES, HumanRequirement
+from .schema import STATUS_RESOLVED, TERMINAL_STATUSES, HumanRequirement, device_id
 
 # Kinds that stop the runtime outright; a decision card waits without re-alerting.
 REMIND_KINDS = frozenset({"auth", "core-blocked"})
@@ -96,7 +96,7 @@ def after(notice: str, projection: Dict, now: float, reminders: Optional[int] = 
 
 
 def seat_key(req: HumanRequirement) -> Tuple[str, str]:
-    return (req.runtime, str((req.device or {}).get("id") or ""))
+    return (req.runtime, device_id(req))
 
 
 def _current(req: HumanRequirement, projection: Dict) -> bool:

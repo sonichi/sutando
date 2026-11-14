@@ -37,6 +37,7 @@ from .schema import (
     STATUS_IN_PROGRESS,
     STATUS_RESOLVED,
     TERMINAL_STATUSES,
+    device_id,
     validate_action,
 )
 
@@ -296,7 +297,7 @@ class HitlManager:
                 if existing.decided_by == POLICY_DECIDER:
                     continue  # auto-answered, in flight: never a dedup target
                 if not (existing.runtime == req.runtime and existing.kind == req.kind
-                        and _device_id(existing) == _device_id(req)):
+                        and device_id(existing) == device_id(req)):
                     continue
                 if existing.guard == req.guard:
                     return existing
@@ -456,10 +457,6 @@ class HitlManager:
     def projection_target(self, req_id: str) -> Optional[str]:
         """Event id of the CREATE projection — the target for status EDITs."""
         return self.store.projection(req_id).get("event_id")
-
-
-def _device_id(req: HumanRequirement) -> str:
-    return str((req.device or {}).get("id") or "")
 
 
 def _req_to_dict(req: HumanRequirement) -> Dict:
