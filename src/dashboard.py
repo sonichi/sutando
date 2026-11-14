@@ -502,7 +502,7 @@ def get_schedules() -> list[dict]:
     out = []
     for s in dashboard_schedules.list_schedules(_crons_path()):
         kind = (f'skill:{s["prompt_or_skill"]}' if s["kind"] == "skill"
-                else "prompt")
+                else s["kind"])
         desc = (s["description"].replace("&", "&amp;")
                 .replace("<", "&lt;").replace(">", "&gt;"))
         out.append({"name": s["name"], "cron": s["cron"], "kind": kind,

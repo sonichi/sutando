@@ -159,7 +159,6 @@ class ResolvePython(unittest.TestCase):
             ["swiftc", str(SWIFT_CONFIG), str(probe_dir / "main.swift"), "-o", str(cls.probe)],
             env=env,
             check=True,
-            capture_output=True,
         )
         # An "engine" dir whose sibling is the vendored runtime, matching the
         # bundle layout scripts/sutando-config.sh documents.

@@ -98,6 +98,20 @@ check("non-list JSON reads as []", ds.read_crons(p) == [])
 p.write_text('[{"name": "x"}]')
 check("a list reads back", ds.read_crons(p) == [{"name": "x"}])
 
+# ── shell schedule presentation ─────────────────────────────────────────────
+with tempfile.TemporaryDirectory() as td:
+    shell_path = Path(td) / "crons.json"
+    shell_path.write_text(json.dumps([
+        {"name": "poll", "cron": "* * * * *", "shell_command": "echo <ready>"},
+        {"name": "named", "shell_command": "echo ready", "description": "Custom"},
+    ]))
+    shell, named = ds.list_schedules(shell_path, now=_now)
+    check("shell kind survives listing", shell["kind"] == "shell")
+    check("shell description stays unescaped in the domain",
+          shell["description"] == "Runs shell command: echo <ready>")
+    check("explicit shell description wins", named["description"] == "Custom")
+
+
 # ── write_crons atomicity + cleanup ──────────────────────────────────────────
 print("── write_crons ──")
 p2 = tmp_path()

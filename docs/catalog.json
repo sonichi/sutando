@@ -236,6 +236,16 @@
    "canonical_for": "Claude Code hook event mapping and privacy contract",
    "last_verified": "2026-07-27"
   },
+  "docs/scp-v0.md": {
+   "title": "SCP — Sutando Client Protocol, v0",
+   "audience": [
+    "contributors",
+    "maintainers"
+   ],
+   "status": "active",
+   "canonical_for": "the runtime-api JSON-RPC task protocol, Unix-socket and opt-in LAN WebSocket transports, and task.update streaming contract",
+   "last_verified": "2026-11-06"
+  },
   "docs/slack-bridge.md": {
    "title": "Slack bridge",
    "audience": [
