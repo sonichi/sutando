@@ -2,7 +2,9 @@
 """Inbound chat secrets are redacted before task/state/log persistence."""
 
 import os
+import re
 import sys
+import time
 import types
 import unittest
 from pathlib import Path
@@ -11,7 +13,14 @@ from unittest import mock
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
+import chat_secret_filter
 from chat_secret_filter import filter_chat_secrets, secret_handling_instruction
+
+try:
+    import secret_scanner as _secret_scanner
+    HAS_DETECT_SECRETS = _secret_scanner.DETECT_SECRETS_ACTIVE
+except Exception:
+    HAS_DETECT_SECRETS = False
 
 
 class TestChatSecretFilter(unittest.TestCase):
@@ -21,6 +30,52 @@ class TestChatSecretFilter(unittest.TestCase):
         self.assertTrue(result.detected)
         self.assertNotIn(token, result.text)
         self.assertIn("[REDACTED-GitHub Token]", result.text)
+
+    def test_multiple_detected_secrets_on_one_line_are_redacted(self):
+        github = "ghp_" + "c" * 36
+        sendgrid = "SG." + "a" * 22 + "." + "b" * 43
+        result = filter_chat_secrets(f"keys {github} and {sendgrid}")
+        self.assertNotIn("c" * 36, result.text)
+        self.assertIn("GitHub Token", result.secret_types)
+        # SendGrid comes only from detect-secrets; absent it, the token stays.
+        if HAS_DETECT_SECRETS:
+            self.assertNotIn("b" * 43, result.text)
+            self.assertIn("SendGrid API Key", result.secret_types)
+
+    def test_multiple_fallback_secrets_on_one_line_are_redacted(self):
+        github = "ghp_" + "c" * 36
+        slack = "xoxb-12345678901-abcdefghij"
+        result = filter_chat_secrets(f"keys {github} and {slack}")
+        self.assertNotIn("c" * 36, result.text)
+        self.assertNotIn(slack, result.text)
+        self.assertIn("GitHub Token", result.secret_types)
+        self.assertIn("Slack Token", result.secret_types)
+
+    def test_detector_secret_not_covered_by_fallback_redacts_its_line(self):
+        sendgrid = "SG." + "a" * 22 + "." + "b" * 43
+        github = "ghp_" + "c" * 36
+
+        class Hit:
+            secret_type = "SendGrid API Key"
+            line_number = 1
+            secret_value = sendgrid
+
+        scanner = types.SimpleNamespace(scan_and_redact=mock.Mock(return_value=([Hit()], "")))
+        with mock.patch.dict(sys.modules, {"secret_scanner": scanner}):
+            result = filter_chat_secrets(f"prefix {github} and {sendgrid}")
+        self.assertEqual(result.text, "[REDACTED-SendGrid API Key]")
+
+    def test_detector_hit_without_value_redacts_line_already_changed_by_fallback(self):
+        github = "ghp_" + "c" * 36
+
+        class Hit:
+            secret_type = "Opaque Detector Secret"
+            line_number = 1
+
+        scanner = types.SimpleNamespace(scan_and_redact=mock.Mock(return_value=([Hit()], "")))
+        with mock.patch.dict(sys.modules, {"secret_scanner": scanner}):
+            result = filter_chat_secrets(f"prefix {github} suffix")
+        self.assertEqual(result.text, "[REDACTED-Opaque Detector Secret]")
 
     def test_openai_variant_is_redacted_by_runtime_fallback(self):
         token = "sk-" + "proj-" + "x" * 48
@@ -132,6 +187,55 @@ class TestChatSecretFilter(unittest.TestCase):
         self.assertNotIn("fixture payload", result.text)
         self.assertIn("public prefix", result.text)
         self.assertIn("public suffix", result.text)
+
+    def test_detector_after_multiline_private_key_preserves_intervening_prose(self):
+        sendgrid = "SG." + "a" * 22 + "." + "b" * 43
+        text = (
+            "-----BEGIN PRIVATE KEY-----\n"
+            "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n"
+            "BKcwggSjAgEAAoIBAQC7\n"
+            "-----END PRIVATE KEY-----\n"
+            f"hello\n{sendgrid}"
+        )
+        result = filter_chat_secrets(text)
+        self.assertIn("hello", result.text)
+        self.assertNotIn("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC", result.text)
+        self.assertNotIn("BKcwggSjAgEAAoIBAQC7", result.text)
+        if HAS_DETECT_SECRETS:
+            self.assertNotIn("b" * 43, result.text)
+
+    def test_fallback_matchers_are_bounded_on_long_unmatched_runs(self):
+        for unit in ("http://", "eyJ", "M"):
+            text = unit * (140_000 // len(unit))
+            started = time.perf_counter()
+            chat_secret_filter._detector_spans(text)
+            elapsed = time.perf_counter() - started
+            self.assertLess(elapsed, 1.0, unit)
+
+    def test_fallback_match_ranges_match_original_patterns(self):
+        patterns = {
+            "Remote Task Token": r"https?://(?:(?!%7[Cc])[^\s|])+(?:\||%7[Cc])[A-Za-z0-9_+/=-]{20,}",
+            "JSON Web Token": r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+            "Discord Bot Token": r"[MNO][A-Za-z\d_-]{23,}\.[A-Za-z\d_-]{6,}\.[A-Za-z\d_-]{27,}",
+        }
+        samples = {
+            "Remote Task Token": (
+                "http://a.example/relay%7C" + "x" * 24 + " "
+                "http://http://a.example|" + "y" * 24
+            ),
+            "JSON Web Token": "eyJa.b.c",
+            "Discord Bot Token": "M" + "a" * 23 + "." + "b" * 6 + "." + "c" * 27,
+        }
+        finders = dict(chat_secret_filter._FALLBACK_PATTERNS)
+        for secret_type, pattern in patterns.items():
+            with self.subTest(secret_type=secret_type):
+                text = samples[secret_type]
+                expected = [(m.start(), m.end()) for m in re.finditer(pattern, text)]
+                finder = finders[secret_type]
+                actual = list(finder(text)) if callable(finder) else [
+                    (m.start(), m.end()) for m in finder.finditer(text)
+                ]
+                self.assertEqual(actual, expected)
 
     def test_discord_and_slack_notice_requires_source_message_cleanup(self):
         for surface in ("Discord", "Slack"):
