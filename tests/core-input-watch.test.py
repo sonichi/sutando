@@ -1624,19 +1624,30 @@ class TestStyledPermissionCaretRow(unittest.TestCase):
         return tui_gate, prompt, state, tui_gate.requirement_for(
             state, kind, prompt, "s", detail, "fallback")
 
-    def test_the_card_offers_yes_and_no(self):
+    def test_the_card_offers_every_styled_option(self):
+        """V42 (owner, 2026-11-06): this dialog offers three, so the card offers three.
+        It used to collapse to No/Yes, which left "don't ask again" unreachable."""
         _, _, _, req = self._card()
-        self.assertEqual(req.kind, "permission")
-        self.assertEqual([a.label for a in req.actions], ["No", "Yes", "Open terminal"])
+        self.assertEqual(req.kind, "choice")
+        self.assertEqual([a.label for a in req.actions], [
+            "Yes",
+            "Yes, and don\u2019t ask again for: sh -c 'for f in ./x; do rm \"$f\"; done'",
+            "No",
+            "Open terminal",
+        ])
         self.assertNotIn("╌", req.message)
         self.assertIn("This command requires approval Do you want to proceed?", req.message)
 
-    def test_yes_is_typed_into_the_dialog_on_screen(self):
+    def test_a_click_is_typed_into_the_dialog_on_screen(self):
+        """The caret row is still dialog evidence through the SGR styling: without it
+        parse_options finds no caret and every click would go stale."""
         tui_gate, prompt, state, req = self._card()
-        req.chosen_action = "allow"
+        req.chosen_action = "opt1"
         self.assertEqual(tui_gate.keys_for(req, prompt, state), ["Enter"])
-        req.chosen_action = "deny"
+        req.chosen_action = "opt3"
         self.assertEqual(tui_gate.keys_for(req, prompt, state), ["Down", "Down", "Enter"])
+        req.chosen_action = "opt2"
+        self.assertEqual(tui_gate.keys_for(req, prompt, state), ["Down", "Enter"])
 
 
 class TestStyledWriteFileDialog(unittest.TestCase):
