@@ -29,7 +29,10 @@ forged** (`created_by` is stamped by the server) and that the pages never presen
 field as identity. Say this plainly when you hand an app over, rather than implying the page
 controls who may do what.
 
-A sign-up sheet is the worked example in [GUIDE.md](../GUIDE.md), not a template here.
+A sign-up sheet starts from `poll/`: one choice per person among fixed slots is poll's model
+(each person's latest row is the one counted, so changing slot replaces the sign-up). Rename the
+`Choice` options to the slots; a page that lists who signed up for each slot, as the worked
+example in [GUIDE.md](../GUIDE.md) does, is the agent's own `html` with its own `schema`.
 For something with no obvious shape, read the "Patterns from apps that shipped" section.
 
 ## Using one
