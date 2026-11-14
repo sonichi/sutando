@@ -383,6 +383,24 @@ class SeedPolicy(unittest.TestCase):
         self.assertIn("my-report", bodies)
         self.assertIn("app update", bodies)
 
+    def test_a_retried_backup_reports_a_deleted_legacy_file_as_lost(self):
+        self._owner_job()
+        mod = self._seeder()
+
+        def fails(*_a):
+            raise OSError("disk full")
+        mod.keep_legacy = fails
+        self._seed_in_process(mod)
+        self.legacy.unlink()
+        self._age_notice(2 * 86400)
+        out = self.run_step1()
+        line = next(x for x in out.splitlines() if x.startswith("not-enabled"))
+        self.assertIn("lost", line)
+        self.assertIn("my-report", line)
+        self.assertNotIn("only at", line)
+        bodies = " ".join(p.read_text() for p in self._queued_dms())
+        self.assertIn("app update", bodies)
+
     def test_overflow_backups_never_replace_one_a_notice_still_names(self):
         host = self.ws / "hosts" / "h1"
         host.mkdir(parents=True)

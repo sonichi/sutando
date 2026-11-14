@@ -28,7 +28,7 @@ file is published, the legacy file is kept as ``hosts/<host>/crons.legacy.json``
 ``not-enabled`` line, so the agent can ask the owner. If no copy can be written, the line says the
 only copy is in the checkout, which an app update replaces, and later runs retry the copy while the
 notice is pending, only if the legacy file still holds the bytes the notice was raised for;
-otherwise the notice says those jobs were lost. Nothing from it is
+if it changed or is gone, the notice says those jobs were lost. Nothing from it is
 registered without the owner's word.
 
 Owner notices (``restored`` and ``not-enabled``) are recorded in ``hosts/<host>/crons-notice.json``
@@ -383,6 +383,9 @@ def due_notices(workspace: Path, host_dir: Path, now: float) -> list[str]:
                     _describe_not_enabled(notice, keep_legacy(host_dir, raw))
                 else:
                     _describe_lost(notice)
+                notice["queued"] = False
+            except FileNotFoundError:
+                _describe_lost(notice)
                 notice["queued"] = False
             except (OSError, KeyError):
                 pass
