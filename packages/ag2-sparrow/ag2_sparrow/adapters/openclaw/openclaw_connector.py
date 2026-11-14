@@ -33,7 +33,7 @@ from pathlib import Path
 
 from ... import agent_triggers, held_start, result_labels, result_publish
 from ...file_lock import locked_file
-from ...result_markers import neutralize_markers
+from ...result_markers import neutralize_markers, parse_markers
 from ...relay_loop import count_arg
 from ...task_io import (NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock, admission, exit_code,
                         exit_on_sigterm, holder_consumer, load_done, make_dirs, parse_task, record_done,
@@ -115,6 +115,19 @@ def answer_once(state_dir, task_id, result_file, body, title=None, outcome=None)
     with contextlib.suppress(OSError), open(answered_dir(state_dir) / task_id, "wb") as f:
         f.write(PUBLISHED)
     return True, notes
+
+
+def delivery_markers(text):
+    """The one delivery-marker guard: the actions `text` would trigger if published. `reply` refuses a
+    body with any; the connector's own fallback is quoted until it has none."""
+    return parse_markers(text or "").actions
+
+
+def quoted(text):
+    """`text` with every delivery marker neutralised, as the fallback publishes it; checked again by
+    the guard, and withheld if anything still reads as a marker."""
+    out = neutralize_markers(text or "")
+    return out if not delivery_markers(out) else "(withheld: the text carried a delivery marker)"
 
 
 def release_unpublished(state_dir, task_id, result_file):
@@ -267,6 +280,13 @@ def resolved(root, raw):
         return None
 
 
+def at_or_above_home(root):
+    """`root` is the home directory or one of its ancestors (real paths): a working directory there
+    would put every dotfile under the owner's file grants. Unresolvable is treated as above."""
+    home, here = resolved(root, "~"), resolved(root, ".")
+    return not home or not here or os.path.commonpath([home, here]) == here
+
+
 def is_draft(root, raw, result_file):
     """`raw` names this task's reply draft itself: compared as written (.. and ~ normalised, links not
     followed), and the draft is not a link, so a link placed at its path cannot hand out its target."""
@@ -313,8 +333,9 @@ def decide_permission(params, owner, cwd, reply_command, result_file):
             verdict = (True, "this task's reply draft")
         elif not owner:
             verdict = (False, "only the owner's turns may read or change files")
-        elif resolved(cwd, "~") == resolved(cwd, "."):
-            verdict = (False, "the working directory is the home directory; set --cwd to a project directory")
+        elif at_or_above_home(cwd):
+            verdict = (False, "the working directory is the home directory or above it; set --cwd to a "
+                              "project directory")
         elif all(under(cwd, p) for p in paths):
             verdict = (True, "under the working directory")
         else:
@@ -497,15 +518,16 @@ class Connector:
         """What the connector posts when the agent did not answer through `reply`. The turn's own text is
         posted with its delivery markers neutralised: `reply` refuses a marker, and this path must not be
         the way round that refusal (an attachment, a redirect or a skip written into the final text)."""
-        if not is_message(headers):
-            return EVENT_NO_ANSWER + ("" if status == "completed" else " (%s: %s)" % (status, detail[:120])) + "\n"
-        said = neutralize_markers((text or "").strip())
+        if not is_message(headers):  # the leading [no-send] stays live; what follows it is quoted
+            return EVENT_NO_ANSWER + quoted("" if status == "completed" else " (%s: %s)" % (status, detail[:120])) + "\n"
+        said = (text or "").strip()
         if status == "completed":
-            return (said or NO_ANSWER) + "\n"
+            return quoted(said or NO_ANSWER) + "\n"
+        # `detail` is OpenClaw's own text too (an error's message, a stopReason): the whole body is quoted.
         head = {"timeout": "OpenClaw did not finish this in time (%s)." % detail,
                 "gone": "OpenClaw stopped before answering (%s)." % detail}.get(
                     status, "OpenClaw could not answer this (%s: %s)." % (status, detail))
-        return head + ("\n\nPartial reply:\n" + said if said else "") + "\n"
+        return quoted(head + ("\n\nPartial reply:\n" + said if said else "")) + "\n"
 
     def handle(self, name):
         task_id = name[:-4]

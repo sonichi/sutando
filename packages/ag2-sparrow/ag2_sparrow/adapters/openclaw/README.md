@@ -68,12 +68,14 @@ The owner and an attested collaborator are served; any other non-owner is refuse
   (named as written, never through a link placed at its path);
 - the owner only: a `read` or `edit` whose every path, nested ones (`edits[].path`) included, resolves (after
   `..`, `~` and symlinks) under the working directory, with no key the policy does not know; never when the
-  working directory is the home directory (install with `--cwd` set to a project directory);
+  working directory is the home directory or above it, such as `/` (install with `--cwd` set to a project
+  directory);
 - nothing else: no other command, and no `execute`, `fetch`, `delete`, `move` or unclassified call, is ever
   granted, as the codex adapter declines every approval it is asked for.
 
-When the agent ends a turn without `reply`, the connector posts its final text for a message, with any
-delivery marker (attachment, redirect, skip, thread) neutralised, as `reply` refuses one; a message that got
+When the agent ends a turn without `reply`, the connector posts its final text for a message, or says why
+it did not answer. That whole body, OpenClaw's own error text and stop reason included, is quoted so no
+delivery marker (attachment, redirect, skip, thread) in it acts, as `reply` refuses one; a message that got
 no answer says so. An event posts nothing.
 
 This binds only what OpenClaw asks about. A read or command OpenClaw runs without asking is limited by its

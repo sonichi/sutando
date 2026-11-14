@@ -28,7 +28,6 @@ from pathlib import Path
 
 from ... import _dirs, connect_bridge as cb, connect_common as cm, result_labels, task_io
 from ...connect_bridge import EXTERNAL, UNIT
-from ...result_markers import parse_markers
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, Shape
 from . import openclaw_connector as oc
 from .acp_client import AcpClient, AcpError
@@ -385,6 +384,9 @@ def _read_draft(result_file: str) -> "tuple[str, str]":
         return f.read(REPLY_MAX_BYTES + 1).decode("utf-8", "replace"), ""
 
 
+delivery_markers = oc.delivery_markers  # the one guard, shared with the connector's fallback
+
+
 def reply(args, stdin=None) -> int:
     if getattr(args, "draft", False):
         raw, why = _read_draft(args.result_file)
@@ -396,7 +398,7 @@ def reply(args, stdin=None) -> int:
         return _answer(args, None, f"the reply is over {REPLY_MAX_BYTES} bytes")
     if not raw.strip():
         return _answer(args, None, "the reply is empty; to post nothing run no-reply")
-    if parse_markers(raw).actions:
+    if delivery_markers(raw):
         return _answer(args, None, "a reply may not carry a delivery marker (redirect, attachment, skip or thread)")
     return _answer(args, raw.rstrip("\n") + "\n", "")
 
