@@ -26,7 +26,6 @@ import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
@@ -1574,7 +1573,7 @@ class QuotaAllowed(unittest.TestCase):
         rec["last_checked"] = iso(self.now - 19)
         self.assertFalse(self.launches(rec))
 
-    def transcript(self, text: str, served: Optional[str] = None) -> Path:
+    def transcript(self, text: str, served: str = "") -> Path:
         proj = self.ws / "projects"
         proj.mkdir(exist_ok=True)
         now = time.time()
@@ -1595,7 +1594,7 @@ class QuotaAllowed(unittest.TestCase):
                        launch_model="claude-fable-5-2")
         self.assertTrue(d.launch, d.line)
 
-    def _fable_cap_holds_fable_only(self, served: Optional[str]):
+    def _fable_cap_holds_fable_only(self, served: str):
         proj = self.transcript("You've reached your Fable limit.", served)
         now = time.time()
         for other in ("sonnet", "claude-sonnet-5"):
@@ -1606,7 +1605,7 @@ class QuotaAllowed(unittest.TestCase):
         self.assertEqual((d.hold["kind"], d.hold["model"]), ("usage-limit", "fable"))
 
     def test_a_fable_cap_on_the_first_turn_holds_fable_only(self):
-        self._fable_cap_holds_fable_only(None)
+        self._fable_cap_holds_fable_only("")
 
     def test_a_fable_cap_after_a_sonnet_turn_holds_fable_not_sonnet(self):
         self._fable_cap_holds_fable_only("claude-sonnet-5")
