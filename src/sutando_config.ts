@@ -106,6 +106,14 @@ export function findRepoRoot(start?: string): string | undefined {
 	return undefined;
 }
 
+/** `<repo>/src/<name>` when it exists, else `<moduleDir>/<name>`. The bundle ships src/*.py beside
+ * dist/, never inside it, so a module-sibling path misses in packaged installs. */
+export function repoSrcScriptPath(name: string, moduleDir: string): string {
+	const root = findRepoRoot(moduleDir);
+	const canonical = root ? join(root, 'src', name) : null;
+	return canonical && existsSync(canonical) ? canonical : join(moduleDir, name);
+}
+
 // --------------------------------------------------------------------------- //
 //  JSON loading + comment stripping                                           //
 // --------------------------------------------------------------------------- //
