@@ -8,6 +8,7 @@ working dir was ever seeded. Run: python3 tests/start-cli-claude-trust-seed.test
 """
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -23,6 +24,8 @@ class ClaudeTrustSeed(unittest.TestCase):
         root = Path(self.tmp.name).resolve()
         self.real = root / "real" / "checkout"
         (self.real / "src").mkdir(parents=True)
+        (self.real / "scripts").mkdir()
+        shutil.copy2(REPO / "scripts/core-working-dir.sh", self.real / "scripts/core-working-dir.sh")
         (root / "link").symlink_to(root / "real")
         self.logical = root / "link" / "checkout"
         self.ccd = root / "ccd"

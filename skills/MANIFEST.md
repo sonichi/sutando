@@ -46,6 +46,7 @@ Tools that need an instant response (sub-second round-trip) live in `src/inline-
 | `tools` | optional | Relative path to a TS file exporting `tools: ToolDefinition[]`. Only present if the skill contributes runtime tools. |
 | `server` | optional | Relative path to a long-running server script. Not auto-started — referenced for ops |
 | `startup` | optional | Relative path to a script that boots the server (manual or via an orchestrator) |
+| `playbook` | optional | `true` lets an AgentTrigger task's `playbook` header name this skill (`src/agent_triggers.py`); without it the header is refused and the event's default playbook runs |
 | `config` | optional | Each entry is exported into `process.env` at agent startup, but only if the env var is not already set (so a user override wins over a manifest default) |
 
 ## Loader behavior
