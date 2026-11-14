@@ -1206,8 +1206,31 @@ def _settlement_record(directory: Path, review_id: str) -> "dict | None":
     return {}
 
 
+# Set before the exec by an adapter whose RESULTS_DIR sits in the workspace this command prints.
+_WORKSPACE_RESOLVER: str = globals().get("_SUTANDO_WORKSPACE_RESOLVER") or ""
+
+
+def _shell_root(root) -> str:
+    """`root` as a logged command names it: behind the workspace resolver, else `$HOME`, so the log
+    carries no home path. Run from the engine checkout, as `src/outbox_cli.py` already requires."""
+    root = Path(root)
+    bases = ([(RESULTS_DIR.parent, f'"$({_WORKSPACE_RESOLVER})"')] if _WORKSPACE_RESOLVER else []) + [
+        (Path.home(), '"$HOME"')]
+    for base, prefix in bases:
+        try:
+            rel = root.relative_to(base)
+        except ValueError:
+            continue
+        return prefix if rel == Path(".") else f"{prefix}/{shlex.quote(rel.as_posix())}"
+    return shlex.quote(str(root))
+
+
+def _outbox_cli_command(root, *args: str) -> str:
+    return f"python3 src/outbox_cli.py --root {_shell_root(root)} {shlex.join(args)}"
+
+
 def _requeue_command(root, item_id: str) -> str:
-    return shlex.join(["python3", "src/outbox_cli.py", "--root", str(root), "requeue", item_id])
+    return _outbox_cli_command(root, "requeue", item_id)
 
 
 def _reread_record(path: Path) -> dict:
@@ -8195,9 +8218,8 @@ def _proactive_item_id(stem: str, body: str) -> str:
 
 def _proactive_requeue_command(root, item_id: str, body_sha256: str, reset_attempts: bool = False) -> str:
     """The operator's resend: requeue the item and restore exactly its own quarantined body."""
-    return shlex.join(["python3", "src/outbox_cli.py", "--root", str(root), "requeue", item_id,
-                       "--body-id", item_id.rsplit("~", 1)[0], "--body-sha256", body_sha256]
-                      + (["--reset-attempts"] if reset_attempts else []))
+    return _outbox_cli_command(root, "requeue", item_id, "--body-id", item_id.rsplit("~", 1)[0],
+                               "--body-sha256", body_sha256, *(["--reset-attempts"] if reset_attempts else []))
 
 
 def _proactive_outbox_root() -> Path:
