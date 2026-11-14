@@ -25,6 +25,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Fixed
 
 <!-- fix() PRs go here -->
+- Task watcher: every dispatch decision after the task-handler probe now logs one line naming the probe's exit code and the outcome (announced, handled, or held with the live watcher that holds the claim), so a task that is neither announced nor run is never silent. Each catch-up pass also re-dispatches a task still in the inbox a pass later that this watcher never admitted and that is neither held nor answered, so a drop with no known cause heals within two passes.
 - ag2-sparrow: the `ag2-sparrow-outbox` recovery command logged for a quarantined result names its `--root` and `--results-dir` through the workspace resolver (`$HOME` without one) and quotes its ids, so the log carries no home path and a workspace path with a space no longer splits the command. ([#6447])
 - schedule-crons: the seeder's owner notices (a restored `crons.json`, legacy jobs not enabled) are recorded before the schedule is written, queued once to the owner's DM through the proactive outbox, and kept, printed at most once a day, until `seed_crons.py --notice-sent`; a failed legacy backup or notice write no longer loses them. ([#6448])
 - ag2-sparrow: the requeue command the bridge logs for a parked message names its outbox root through `bash scripts/sutando-config.sh workspace` (or `$HOME` when no workspace resolver is set), so the log no longer carries a home path; run it from the engine checkout as before. ([#6445])
