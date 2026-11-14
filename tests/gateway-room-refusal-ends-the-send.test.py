@@ -26,6 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from _helpers.hermetic_gateway import isolate_then_import
+from _helpers.hermetic_env import isolated_child_env
 
 gb, _IMPORT_READS = isolate_then_import(env={"REMOTE_PROACTIVE_ROOM": ""})
 
@@ -33,7 +34,6 @@ from _helpers import proactive_lane as pl
 from ag2_sparrow.delivery_core import ProviderBoundedRefused, ProviderPermanentRefused, ProviderRefused
 from ag2_sparrow.delivery_core.provider_ag2space import AG2SpaceRoomMessageProvider
 import importlib.util
-import os
 import shlex
 import subprocess
 
@@ -189,7 +189,7 @@ def a_room_refusal_parks_after_its_budget() -> None:
     if cmd:
         # As an operator pastes it: a shell in the checkout, the resolver printing this workspace.
         ran = subprocess.run(["bash", "-c", line], cwd=REPO, capture_output=True, text=True, timeout=60,
-                             env={**os.environ, "SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(lane.ws)})
+                             env=isolated_child_env(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(lane.ws)))
         check(ran.returncode == 0, f"the logged command requeues it ({ran.returncode}: {ran.stderr[-300:]})")
         lane.respond = refuse_until_joined(ROOM_REFUSAL_ATTEMPTS - 1)
         before = len(lane.posts)
@@ -211,7 +211,7 @@ def a_logged_command_names_no_home_path() -> None:
     check(str(home) not in bare and bare.startswith('python3 src/outbox_cli.py --root "$HOME"/'),
           f"without a resolver, a root under the home dir is named from $HOME ({bare})")
     ran = subprocess.run(["bash", "-c", f"printf '%s\\n' {bare.split(' --root ', 1)[1]}"],
-                         capture_output=True, text=True, env={**os.environ, "HOME": str(home)})
+                         capture_output=True, text=True, env=isolated_child_env(HOME=str(home)))
     check(ran.stdout.splitlines() == [str(under_home), "requeue", "wr_1.c"],
           f"and the shell expands it back to the root, spaces intact ({ran.stdout!r})")
     elsewhere = Path("/srv/agent ws/results/.outbox-proactive")
