@@ -13,9 +13,14 @@ The rule, in order:
 4. otherwise seed the starter set: ``crons.example.json`` without its ``"opt_in": true``
    entries (the morning briefing, the sample digest), which start only on the owner's word.
 
+``--first-install-only NAME`` (repeatable) narrows a starter-set seed to those entries; the
+Codex launcher seeds only ``main-loop``. It never narrows a migrated interim file.
+
 The in-checkout ``skills/schedule-crons/crons.json`` is never published. It is git-ignored and
 older releases' installer filled it from the example, so its jobs prove no opt-in. Its entries
-that are not a verbatim shipped example entry may be an owner's own schedule: the file is
+that are neither a published entry nor a shipped example entry (compared without the
+template-only ``opt_in`` key, so a pre-``opt_in`` template still matches) may be an owner's
+own schedule, including a customised entry under a starter name: the file is
 copied once to ``hosts/<host>/crons.legacy.json`` and their names are printed on a
 ``not-enabled`` line, so the agent can ask the owner. Nothing from it is registered.
 
@@ -66,21 +71,29 @@ def _publish(target: Path, content: bytes) -> bool:
         tmp.unlink(missing_ok=True)
 
 
-def starter_entries(example: list) -> list:
-    return [e for e in example if isinstance(e, dict) and e.get("opt_in") is not True]
+TEMPLATE_ONLY_KEYS = ("opt_in",)
+
+
+def _job(entry: dict) -> dict:
+    return {k: v for k, v in entry.items() if k not in TEMPLATE_ONLY_KEYS}
+
+
+def starter_entries(example: list, only: tuple[str, ...] | None = None) -> list:
+    return [e for e in example if isinstance(e, dict) and e.get("opt_in") is not True
+            and (not only or e.get("name") in only)]
 
 
 def legacy_not_enabled(legacy: list, published: list, example: list) -> list[str]:
-    """Names in the legacy file that are neither published nor a verbatim shipped example entry."""
-    live = {e.get("name") for e in published if isinstance(e, dict)}
+    """Names of legacy entries whose job is neither published nor a shipped example entry."""
+    known = [_job(e) for e in published + example if isinstance(e, dict)]
     return [
         e["name"] for e in legacy
-        if isinstance(e, dict) and isinstance(e.get("name"), str)
-        and e["name"] not in live and e not in example
+        if isinstance(e, dict) and isinstance(e.get("name"), str) and _job(e) not in known
     ]
 
 
-def seed(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR):
+def seed(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR,
+         first_install_only: tuple[str, ...] | None = None):
     """Return (status, target, source, not_enabled, kept). Never overwrites ``target``."""
     if not host_label.strip():
         raise ValueError("host label did not resolve")
@@ -99,7 +112,7 @@ def seed(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR):
         source, content = interim, interim.read_bytes()
         published = _entries(content, interim)
     else:
-        published = starter_entries(example)
+        published = starter_entries(example, first_install_only)
         source, content = example_path, (json.dumps(published, indent=2) + "\n").encode()
 
     if not _publish(target, content):
@@ -126,6 +139,8 @@ def main() -> int:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--workspace")
     parser.add_argument("--host-label")
+    parser.add_argument("--first-install-only", action="append", metavar="NAME",
+                        help="seed only this starter entry when seeding the starter set (repeatable)")
     parser.add_argument("--skill-dir", help=argparse.SUPPRESS)
     args = parser.parse_args()
     skill_dir = Path(args.skill_dir) if args.skill_dir else SKILL_DIR
@@ -134,7 +149,8 @@ def main() -> int:
         if not raw_ws:
             raise ValueError("workspace did not resolve")
         host_label = (args.host_label or "").strip() or _config("host-label")
-        status, target, source, not_enabled, kept = seed(Path(raw_ws), host_label, skill_dir)
+        only = tuple(args.first_install_only) if args.first_install_only else None
+        status, target, source, not_enabled, kept = seed(Path(raw_ws), host_label, skill_dir, only)
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"seed-crons: {exc}", file=sys.stderr)
         return 1

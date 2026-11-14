@@ -4,6 +4,7 @@
 Runs `/schedule-crons` step 1 as the agent would: the step's last inline code span, executed by
 bash in a scratch checkout whose `scripts/sutando-config.sh` points at a scratch workspace. The
 installer-managed in-checkout `skills/schedule-crons/crons.json` holds the shipped sample jobs.
+`crons.example.pre-opt-in.json` is the template as shipped before `opt_in` existed.
 
 Run: python3 tests/schedule-crons-seed-policy.test.py
 """
@@ -20,6 +21,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 SKILL = REPO / "skills" / "schedule-crons"
 OPT_IN = {"morning-briefing", "example-digest"}
+PRE_OPT_IN = REPO / "tests" / "fixtures" / "schedule-crons" / "crons.example.pre-opt-in.json"
 
 
 def step1_command() -> str:
@@ -79,6 +81,40 @@ class SeedPolicy(unittest.TestCase):
         self.assertIn("not-enabled my-report kept at", out)
         kept = json.loads((self.ws / "hosts" / "h1" / "crons.legacy.json").read_text())
         self.assertIn(own, kept)
+
+    def test_customized_starter_name_job_is_kept_and_named(self):
+        own = {"name": "main-loop", "cron": "0 9 * * *", "prompt": "my owner-customized task"}
+        self.legacy.write_text(json.dumps([own]))
+        out = self.run_step1()
+        self.assertIn("not-enabled main-loop kept at", out)
+        kept = json.loads((self.ws / "hosts" / "h1" / "crons.legacy.json").read_text())
+        self.assertIn(own, kept)
+
+    def test_pre_upgrade_shipped_template_is_not_called_owner_jobs(self):
+        self.legacy.write_text(PRE_OPT_IN.read_text())
+        out = self.run_step1()
+        self.assertNotIn("not-enabled", out)
+        self.assertFalse((self.ws / "hosts" / "h1" / "crons.legacy.json").exists())
+        self.assertFalse(self.names() & OPT_IN, self.names())
+
+    def test_first_install_only_seeds_just_the_named_starter_jobs(self):
+        out = subprocess.run(
+            ["python3", "skills/schedule-crons/scripts/seed_crons.py",
+             "--first-install-only", "main-loop"],
+            cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.names(), {"main-loop"})
+
+    def test_first_install_only_leaves_an_interim_file_whole(self):
+        (self.ws / "crons").mkdir()
+        own = [{"name": "mine", "cron": "0 9 * * *", "prompt": "x"}]
+        (self.ws / "crons" / "h1.json").write_text(json.dumps(own))
+        out = subprocess.run(
+            ["python3", "skills/schedule-crons/scripts/seed_crons.py",
+             "--first-install-only", "main-loop"],
+            cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(self.target.read_text()), own)
 
     def test_interim_workspace_file_is_migrated_whole(self):
         (self.ws / "crons").mkdir()
