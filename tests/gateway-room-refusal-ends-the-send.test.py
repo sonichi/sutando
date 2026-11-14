@@ -219,6 +219,37 @@ def a_logged_command_names_no_home_path() -> None:
     check(got[3] == str(elsewhere), f"a root outside both is quoted whole ({got})")
 
 
+def a_quarantined_result_names_no_workspace_path() -> None:
+    ws = Path(pl.scratch("gw-quarantine-")) / "agent ws"
+    results = ws / "results"
+    results.mkdir(parents=True)
+    rfile = results / "task-q1.txt"
+    rfile.write_text("reply\n", encoding="utf-8")
+    logs: list = []
+    saved = (gb.RESULTS_DIR, gb.UNDELIVERABLE_RESULTS_DIR, gb._log, getattr(gb, "_WORKSPACE_RESOLVER", None))
+    gb.RESULTS_DIR, gb.UNDELIVERABLE_RESULTS_DIR = results, results / "undelivered"
+    gb._log, gb._WORKSPACE_RESOLVER = logs.append, RESOLVER
+    try:
+        gb._quarantine_undelivered(rfile, "task-q1", "refused")
+    finally:
+        gb.RESULTS_DIR, gb.UNDELIVERABLE_RESULTS_DIR, gb._log, gb._WORKSPACE_RESOLVER = saved
+    line = next((m.split("`")[1] for m in logs if "restores it" in m and m.count("`") >= 2), None)
+    check(line is not None and str(ws) not in line and str(ws.resolve()) not in line
+          and f'--root "$({RESOLVER})"/results/' in line and f'--results-dir "$({RESOLVER})"/results' in line,
+          f"a quarantined result's recovery command names the workspace through its resolver ({line})")
+    if line:
+        # Its arguments as the operator's shell hands them over, from the checkout.
+        ran = subprocess.run(["bash", "-c", "printf '%s\\n' " + line.split(" ", 1)[1]], cwd=REPO,
+                             capture_output=True, text=True, timeout=60,
+                             env=isolated_child_env(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws)))
+        argv = ran.stdout.splitlines()
+        root = Path(argv[argv.index("--root") + 1]) if "--root" in argv else None
+        rdir = Path(argv[argv.index("--results-dir") + 1]) if "--results-dir" in argv else None
+        check(root is not None and root.parent == results.resolve() and rdir == results.resolve()
+              and argv[argv.index("requeue") + 1:argv.index("requeue") + 2] == ["task-q1"],
+              f"and the shell expands it to this workspace's outbox and results ({argv})")
+
+
 def a_join_landing_on_the_third_send_delivers() -> None:
     lane = pl.Lane(gb, ISO, refuse_until_joined(2))
     lane.write("proactive-joinrace.txt", "[channel: !joining:example.org]\ngreeting\n")
@@ -248,6 +279,7 @@ def main() -> int:
     provider()
     a_room_refusal_parks_after_its_budget()
     a_logged_command_names_no_home_path()
+    a_quarantined_result_names_no_workspace_path()
     a_join_landing_on_the_third_send_delivers()
     another_403_keeps_its_handling_and_stays_bounded()
     return check.exit_code()
