@@ -231,7 +231,8 @@ def fresh_reask_id() -> str:
 def _published_as(tasks_dir: Path, results_dir: Path, task_id: str, body: str) -> "bool | None":
     """None when nothing holds the id; True when its task is this very re-ask;
     False when anything else holds it, including an answer with no readable task."""
-    task = find_task_file(tasks_dir, task_id) or find_archived_task(tasks_dir, task_id)
+    task = find_task_file(tasks_dir, task_id) or find_archived_task(
+        tasks_dir, task_id, require_identity=False)
     if task is None:
         return False if find_result(results_dir, task_id) else None
     try:

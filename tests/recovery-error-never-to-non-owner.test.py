@@ -97,7 +97,7 @@ class ArchivedTaskIsNotFatal(unittest.TestCase):
     def test_month_archived_task_is_archived(self):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
-            (ws / "tasks/archive/2026-10" / f"{TID}.txt").write_text("id: x\ntask: hi\n")
+            (ws / "tasks/archive/2026-10" / f"{TID}.txt").write_text(f"id: {TID}\ntask: hi\n")
             self.assertEqual(td_mod.task_disposition(ws, TID), "archived")
 
     def test_epoch_suffixed_month_archived_result_is_answered(self):
@@ -112,7 +112,7 @@ class ArchivedTaskIsNotFatal(unittest.TestCase):
             ws = self._ws(td)
             (ws / "results" / f"{TID}.txt").write_text("  \n")
             self.assertEqual(td_mod.task_disposition(ws, TID), "missing")
-            (ws / "tasks" / f"{TID}.txt").write_text("id: x\ntask: hi\n")
+            (ws / "tasks" / f"{TID}.txt").write_text(f"id: {TID}\ntask: hi\n")
             self.assertEqual(td_mod.task_disposition(ws, TID), "pending")
 
     def test_empty_archived_result_is_not_answered(self):
@@ -120,13 +120,13 @@ class ArchivedTaskIsNotFatal(unittest.TestCase):
             ws = self._ws(td)
             (ws / "results/archive/2026-10" / f"{TID}-1792626046.txt").write_text("")
             self.assertEqual(td_mod.task_disposition(ws, TID), "missing")
-            (ws / "tasks" / f"{TID}.txt").write_text("id: x\ntask: hi\n")
+            (ws / "tasks" / f"{TID}.txt").write_text(f"id: {TID}\ntask: hi\n")
             self.assertEqual(td_mod.task_disposition(ws, TID), "pending")
 
     def test_ready_archived_result_behind_empty_live_one_is_answered(self):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
-            (ws / "tasks" / f"{TID}.txt").write_text("id: x\ntask: hi\n")
+            (ws / "tasks" / f"{TID}.txt").write_text(f"id: {TID}\ntask: hi\n")
             (ws / "results" / f"{TID}.txt").write_text("")
             (ws / "results/archive/2026-10" / f"{TID}-1792626046.txt").write_text("done")
             self.assertEqual(td_mod.task_disposition(ws, TID), "answered")
@@ -139,13 +139,57 @@ class ArchivedTaskIsNotFatal(unittest.TestCase):
             claimed.write_text(f"id: {TID}\ntask: hi\n")
             self.assertEqual(td_mod.task_disposition(ws, TID), "claimed")
             claimed.unlink()
-            (ws / "tasks" / f"{TID}.txt").write_text("id: x\ntask: hi\n")
+            (ws / "tasks" / f"{TID}.txt").write_text(f"id: {TID}\ntask: hi\n")
             self.assertEqual(td_mod.task_disposition(ws, TID), "pending")
+
+    def test_foreign_live_or_archived_identity_does_not_settle_recovery(self):
+        for directory in ("tasks", "tasks/processed", "tasks/archive", "tasks/archive/2026-10"):
+            with self.subTest(directory=directory), tempfile.TemporaryDirectory() as td:
+                ws = self._ws(td)
+                target = ws / directory / "task-a.claimed-core-1.txt"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("id: task-a\ntask: hello\n")
+                state = td_mod.task_disposition(ws, "task-a.claimed-core-1")
+                self.assertEqual(state, "missing")
+                self.assertNotIn(state, td_mod.SETTLED)
+                if directory == "tasks":
+                    self.assertEqual(td_mod.task_disposition(ws, "task-a"), "claimed")
+
+    def test_matching_and_headerless_records_keep_their_disposition(self):
+        for declared in (True, False):
+            for directory, suffix, expected in (
+                ("tasks", ".txt", "pending"),
+                ("tasks", ".claimed-core-1.txt", "claimed"),
+                ("tasks/processed", ".txt", "archived"),
+                ("tasks/archive", ".txt", "archived"),
+                ("tasks/archive/2026-10", ".txt", "archived"),
+            ):
+                with self.subTest(declared=declared, directory=directory, suffix=suffix):
+                    with tempfile.TemporaryDirectory() as td:
+                        ws = self._ws(td)
+                        target = ws / directory / f"{TID}{suffix}"
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_text((f"id: {TID}\n" if declared else "") + "task: hello\n")
+                        self.assertEqual(td_mod.task_disposition(ws, TID), expected)
+
+    def test_package_loaded_archive_lookup_uses_the_same_identity_owner(self):
+        sys.path.insert(0, str(REPO))
+        try:
+            from src.local_task_protocol import find_archived_task
+        finally:
+            sys.path.remove(str(REPO))
+        with tempfile.TemporaryDirectory() as td:
+            ws = self._ws(td)
+            target = ws / "tasks/archive" / f"{TID}.txt"
+            target.write_text("id: task-foreign\ntask: hello\n")
+            self.assertIsNone(find_archived_task(ws / "tasks", TID))
+            target.write_text(f"id: {TID}\ntask: hello\n")
+            self.assertEqual(find_archived_task(ws / "tasks", TID), target)
 
     def test_cli_accepts_the_notification_file_name(self):
         with tempfile.TemporaryDirectory() as td:
             ws = self._ws(td)
-            (ws / "tasks/archive" / f"{TID}.txt").write_text("id: x\ntask: hi\n")
+            (ws / "tasks/archive" / f"{TID}.txt").write_text(f"id: {TID}\ntask: hi\n")
             self.assertEqual(td_mod.main([f"{TID}.txt", "--workspace", str(ws)]), 0)
             self.assertEqual(td_mod.main(["..", "--workspace", str(ws)]), 2)
             fake = types.ModuleType("workspace_default")

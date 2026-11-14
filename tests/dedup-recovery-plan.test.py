@@ -315,7 +315,7 @@ class PublishOnceTest(unittest.TestCase):
                                  "a re-ask already published was written again")
 
     def test_an_id_held_by_anything_else_is_never_claimed(self):
-        for where in ("another re-ask", "archived other", "answer only", "unreadable"):
+        for where in ("another re-ask", "archived other", "archived foreign", "answer only", "unreadable"):
             with self.subTest(where=where), tempfile.TemporaryDirectory() as td:
                 sp = _Space(td); sp.holder(""); sp.orig()
                 if where == "another re-ask":
@@ -323,6 +323,9 @@ class PublishOnceTest(unittest.TestCase):
                 elif where == "archived other":
                     (sp.tasks / "archive").mkdir()
                     (sp.tasks / "archive" / f"{NEW}.txt").write_text("another question")
+                elif where == "archived foreign":
+                    (sp.tasks / "archive").mkdir()
+                    (sp.tasks / "archive" / f"{NEW}.txt").write_text("id: task-foreign\ntask: other\n")
                 elif where == "answer only":
                     (sp.results / f"{NEW}.txt").write_text("an answer whose task is unknown")
                 else:
