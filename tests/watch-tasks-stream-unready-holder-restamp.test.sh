@@ -31,7 +31,7 @@ start_inst() {  # start_inst <ws> <inbox> <instance> <name>; prints the pid
 start() {  # start <ws-env> <inbox> <name> [args]; prints the pid
   local ws="$1" inbox="$2" name="$3"; shift 3
   env -u SUTANDO_INSTANCE_ID -u SUTANDO_AGENT_ID -u AGENT_ID -u AGENT_MXID -u SUTANDO_TASKS_DIR -u SUTANDO_WORKSPACE -u SUTANDO_CORE_SESSION \
-      ${ws:+SUTANDO_WORKSPACE_DIR="$ws"} PATH="$WORK/stubbin:$PATH" \
+      ${ws:+SUTANDO_WORKSPACE_DIR="$ws"} ${TASKS_ENV:+SUTANDO_TASKS_DIR="$TASKS_ENV"} PATH="$WORK/stubbin:$PATH" \
       python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
       bash "$WATCHER" "$inbox" --role session --inbox "$inbox" "$@" > "$WORK/$name.out" 2> "$WORK/$name.err" &
   echo $!
@@ -130,15 +130,15 @@ for i in $(seq 1 100); do alive "$n" || break; sleep 0.1; done
 [ "$(cat "$SENT3" 2>/dev/null)" = "$h3" ]; check "(e) ...and re-stamps the sentinel with the holder's pid (realpath match, not basename)" $? "sentinel: $(cat "$SENT3" 2>/dev/null)"
 grep -q 're-stamped' "$WORK/eighth.err"; check "(e) ...and said so on stderr" $? "$(tail -2 "$WORK/eighth.err" | tr '\n' '|')"
 
-# (f) a custom inbox + separate workspace with no instance id is a SUPPORTED
-# core config; the re-stamp arm must accept empty id alone, no inbox match.
+# (f) a custom inbox + separate workspace with no instance id is a SUPPORTED core
+# config when the launcher names both; the re-stamp arm must accept empty id alone.
 WS4="$WORK/ws4"; CUSTOM4="$WORK/custom-inbox-root/tasks"
 mkdir -p "$WS4/state" "$CUSTOM4"
-h4="$(start "$WS4" "$CUSTOM4" holder4)"; PIDS+=("$h4")
+h4="$(TASKS_ENV="$CUSTOM4" start "$WS4" "$CUSTOM4" holder4)"; PIDS+=("$h4")
 ready "$WS4" "$h4"; check "(f setup) a session holder on a custom inbox (separate workspace) is ready" $? "$(tail -2 "$WORK/holder4.err" | tr '\n' '|')"
 SENT4="$(ls "$WS4"/state/*.pid | head -1)"
 rm -f "$SENT4"
-n="$(start "$WS4" "$CUSTOM4" ninth)"; PIDS+=("$n")
+n="$(TASKS_ENV="$CUSTOM4" start "$WS4" "$CUSTOM4" ninth)"; PIDS+=("$n")
 for i in $(seq 1 100); do alive "$n" || break; sleep 0.1; done
 ! alive "$n"; check "(f) a new start on the custom inbox yields to the live holder (exits)" $?
 [ "$(cat "$SENT4" 2>/dev/null)" = "$h4" ]; check "(f) ...and re-stamps the sentinel with the holder's pid" $? "sentinel: $(cat "$SENT4" 2>/dev/null)"
