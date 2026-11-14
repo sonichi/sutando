@@ -368,8 +368,7 @@ def trigger_of(headers):
     """(event_type, playbook): the event type when well-formed (None reads as a message), the playbook
     only when it is a registry playbook."""
     event = agent_triggers.event_type_value(headers.get("event_type"))
-    playbook = agent_triggers.playbook_value(headers.get("playbook"))
-    return event, (playbook if playbook in agent_triggers.REGISTRY_PLAYBOOKS else None)
+    return event, agent_triggers.allowed_playbook_value(headers.get("playbook"))
 
 
 def is_message(headers):

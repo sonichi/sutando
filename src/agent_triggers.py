@@ -32,10 +32,13 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# event_type -> default playbook id. "reply" has no skill: a mention is answered as today.
+# event_type -> default playbook id, as the backend's trigger registry names it.
+# "reply" has no skill: a mention is answered as today.
 EVENT_PLAYBOOKS = {
     "room.mention": "reply",
     "room.joined": "room-onboard",
+    "commons.summon": "summon",
+    "email.received": "email",
 }
 EVENT_TYPES = frozenset(EVENT_PLAYBOOKS)
 # A well-formed event type: two to four dotted lowercase segments, e.g. "commons.summon".

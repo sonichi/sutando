@@ -49,6 +49,9 @@ class Registry(unittest.TestCase):
     def test_defaults(self):
         self.assertEqual(at.EVENT_PLAYBOOKS["room.joined"], "room-onboard")
         self.assertEqual(at.EVENT_PLAYBOOKS["room.mention"], "reply")
+        # The backend's trigger registry names these playbooks (intake/triggers.py REGISTRY).
+        self.assertEqual(at.EVENT_PLAYBOOKS["commons.summon"], "summon")
+        self.assertEqual(at.EVENT_PLAYBOOKS["email.received"], "email")
         self.assertEqual(at.EVENT_TYPES, frozenset(at.EVENT_PLAYBOOKS))
         for pb in at.EVENT_PLAYBOOKS.values():
             self.assertEqual(at.playbook_value(pb), pb, "a default must be a valid id")
@@ -142,13 +145,30 @@ class Dispatch(unittest.TestCase):
 
     def test_unknown_playbook_resolves_to_none(self):
         # The trigger survives the wire; only its playbook is refused, so the body is followed.
-        for event in ("commons.summon", "zz.made_up.thing"):
+        for event in ("commons.page_moved", "zz.made_up.thing"):
             self.assertEqual(at.event_type_value(event), event)
             for pb in ("no-such-skill", "plain-skill", "../evil", "", None):
                 self.assertIsNone(self.resolve(at.event_type_value(event), at.playbook_value(pb)),
                                   (event, pb))
-        self.assertEqual(self.resolve("commons.summon", "other-playbook"),
+        self.assertEqual(self.resolve("commons.page_moved", "other-playbook"),
                          self.skills / "other-playbook" / "SKILL.md", "an allowed playbook still runs")
+
+    def test_summon_and_email_run_their_default_playbook(self):
+        for event, pb in (("commons.summon", "summon"), ("email.received", "email")):
+            self.assertIsNone(self.resolve(event, pb), f"{event}: no {pb} skill yet, a message")
+            self.assertIsNone(self.resolve(event, None), event)
+            (self.skills / pb).mkdir()
+            (self.skills / pb / "SKILL.md").write_text(f"# {pb}\n")
+            want = self.skills / pb / "SKILL.md"
+            for header in (pb, None, "", "plain-skill", "no-such-skill", "../evil"):
+                self.assertEqual(self.resolve(event, header), want, (event, header))
+            self.assertEqual(self.resolve(event, "other-playbook"),
+                             self.skills / "other-playbook" / "SKILL.md", "the task's own playbook wins")
+
+    def test_registry_playbooks_cross_a_bridge_with_no_skills_tree(self):
+        # The hatch and openclaw adapters have no skills tree: a playbook missing here is dropped there.
+        for pb in ("summon", "email"):
+            self.assertEqual(at.allowed_playbook_value(pb), pb)
 
     def test_allowed_playbook_value_uses_the_same_allowlist(self):
         for pb in ("room-onboard", "reply"):
@@ -175,7 +195,9 @@ class Dispatch(unittest.TestCase):
         self.assertEqual(Path(run("--event-type", "room.joined")),
                          REPO / "skills" / "room-onboard" / "SKILL.md")
         self.assertEqual(run("--event-type", "room.mention"), "none")
-        self.assertEqual(run("--event-type", "commons.summon", "--playbook", "no-such-skill"), "none")
+        self.assertEqual(run("--event-type", "commons.page_moved", "--playbook", "no-such-skill"), "none")
+        self.assertEqual(Path(run("--event-type", "commons.summon", "--playbook", "no-such-skill")),
+                         REPO / "skills" / "summon" / "SKILL.md")
         self.assertEqual(run("--event-type", "room.joined", "--playbook", "../../etc"),
                          str(REPO / "skills" / "room-onboard" / "SKILL.md"))
         # An installed skill that is not a playbook cannot be steered into by the header.
@@ -204,6 +226,15 @@ class Dispatch(unittest.TestCase):
                  "playbook": value}))
             errors, _warnings = lint._lint_manifest(d)
             self.assertEqual(not any("playbook must be a boolean" in e for e in errors), ok, (value, errors))
+
+    def test_shipped_summon_playbook_resolves(self):
+        manifest = json.loads((REPO / "skills" / "summon" / "manifest.json").read_text())
+        self.assertIs(manifest.get("playbook"), True)
+        want = REPO / "skills" / "summon" / "SKILL.md"
+        for header in ("summon", None):
+            self.assertEqual(at.resolve_playbook("commons.summon", header, REPO / "skills"), want)
+        errors, _warnings = lint._lint_manifest(REPO / "skills" / "summon")
+        self.assertEqual(errors, [])
 
     def test_shipped_room_onboard_opts_in(self):
         manifest = json.loads((REPO / "skills" / "room-onboard" / "manifest.json").read_text())
