@@ -24,7 +24,6 @@ holders, for a caller that must tell "busy" from "not reading its inbox". Exit c
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 from pathlib import Path
@@ -69,16 +68,10 @@ _POOL_SCRIPTS = _SRC.parent / "skills" / "worker-pool" / "scripts"
 
 
 def _pool_holder(workspace: Path, task_id: str) -> str | None:
-    """Delegated to the worker-pool skill's worker_delivery.py. The skill is
-    optional: without it there is no router, so no worker can hold a task."""
-    try:
-        os.stat(_POOL_SCRIPTS / "worker_delivery.py")
-    except FileNotFoundError:
-        return None
-    # Any other stat failure propagates: an unreadable skill is not an absent one.
-    sys.path.insert(0, str(_POOL_SCRIPTS))
-    from worker_delivery import holder_of  # noqa: E402
-    return holder_of(workspace, task_id)
+    """Delegated to src/pool_holder.py: the worker-pool skill's worker_delivery.py
+    when installed, else no router and so no holder."""
+    from pool_holder import pool_holder
+    return pool_holder(workspace, task_id, _POOL_SCRIPTS)
 
 
 def _holder(workspace: Path, task_id: str, task_file: Path | None = None) -> str | None:

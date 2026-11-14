@@ -12,5 +12,6 @@
     "isolatedModules": true,
     "types": ["node"]
   },
-  "include": ["src"]
+  "include": ["src"],
+  "exclude": ["src/agent/claude/task-watch-mod/**"]
 }

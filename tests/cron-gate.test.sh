@@ -174,4 +174,110 @@ esac
 ok "a task with no access_tier still defers — unknown tier fails closed"
 rm -f "$TMPDIR/tasks/"task-*.txt
 
+# --- a task a pool worker holds is that worker's, not the core's ----------------
+# Regression (live, 2026-11-10): four owner tasks routed to a pool worker (a
+# sentinel each under deliveries/<worker>/) kept the core's sync-workspace cron
+# deferred although the core had nothing to answer. The holder lookup is
+# src/pool_holder.py, the same predicate unanswered-tasks uses.
+rm -f "$TMPDIR/tasks/"task-*.txt
+mkdir -p "$TMPDIR/tasks" "$TMPDIR/deliveries/w1"
+printf 'id: t\naccess_tier: owner\ntask: routed to a worker\n' > "$TMPDIR/tasks/task-1786301397901.txt"
+: > "$TMPDIR/deliveries/w1/task-1786301397901.txt"
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-worker-held echo 'ran-despite-worker-task' 2>&1)"
+[ "$out" = "ran-despite-worker-task" ] || fail "worker-held task must NOT defer, got '$out'"
+ok "an owner task a pool worker holds does not trigger deferral"
+
+rm -f "$TMPDIR/deliveries/w1/task-1786301397901.txt"
+: > "$TMPDIR/deliveries/w1/task-1786301397901.accepted"
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-worker-accepted echo 'ran-despite-accepted' 2>&1)"
+[ "$out" = "ran-despite-accepted" ] || fail "worker-accepted task must NOT defer, got '$out'"
+ok "an accepted worker sentinel counts as held too"
+
+# ... but the same queue seen from THAT worker's own session still yields
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 SUTANDO_INSTANCE_ID=w1 bash "$GATE" test-own-worker echo 'should-not-run' 2>&1)"
+case "$out" in
+  *"deferring test-own-worker"*) : ;;
+  *) fail "the holding worker's own cron must defer on its own task, got '$out'" ;;
+esac
+ok "a worker's own cron still yields to the tasks that worker holds"
+
+# ... and an unheld owner task beside a worker-held one still defers the core
+printf 'id: t\naccess_tier: owner\ntask: for the core\n' > "$TMPDIR/tasks/task-1786301397902.txt"
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-worker-plus-core echo 'should-not-run' 2>&1)"
+case "$out" in
+  *"deferring test-worker-plus-core"*) : ;;
+  *) fail "an unheld owner task beside a worker-held one must defer, got '$out'" ;;
+esac
+ok "an unheld owner task still defers beside a worker-held one"
+
+# ... and an unreadable deliveries/ is undecidable, which yields
+rm -f "$TMPDIR/tasks/task-1786301397902.txt"
+if [ "$(id -u)" -ne 0 ]; then
+  chmod 000 "$TMPDIR/deliveries"
+  out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" test-undecidable echo 'should-not-run' 2>&1)"
+  chmod 700 "$TMPDIR/deliveries"
+  case "$out" in
+    *"deferring test-undecidable"*) : ;;
+    *) fail "unreadable deliveries/ must yield (undecidable), got '$out'" ;;
+  esac
+  ok "an unreadable deliveries/ is undecidable and yields"
+fi
+rm -rf "$TMPDIR/deliveries" "$TMPDIR/tasks/"task-*.txt
+
+# --- --check mode: no command, one line, exit 0 either way --------------------
+# This is the form /schedule-crons prefixes to every registered prompt, so a
+# prompt-shaped cron (one with no shell command to wrap) can yield too.
+rm -f "$TMPDIR/tasks/"task-*.txt
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" --check test-check-clear 2>&1)"
+[ "$out" = "clear" ] || fail "--check on empty queue: expected 'clear', got '$out'"
+ok "--check prints clear on an empty queue"
+
+printf 'id: t\naccess_tier: owner\ntask: owner work\n' > "$TMPDIR/tasks/task-owner-2.txt"
+set +e
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" --check test-check-queued 2>&1)"
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "--check queued: expected exit 0, got $rc"
+case "$out" in
+  "deferred: owner tasks queued — test-check-queued"*) : ;;
+  *) fail "--check queued: expected a 'deferred: ... test-check-queued' line, got '$out'" ;;
+esac
+ok "--check prints deferred (exit 0) when an owner task is queued"
+
+printf 'id: t\naccess_tier: team\ntask: peer\n' > "$TMPDIR/tasks/task-owner-2.txt"
+out="$(SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" --check test-check-team 2>&1)"
+[ "$out" = "clear" ] || fail "--check with only a team task: expected 'clear', got '$out'"
+ok "--check applies the same tier filter as the wrapping form"
+rm -f "$TMPDIR/tasks/"task-*.txt
+
+set +e
+SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" --check >/dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "--check without a reason: expected exit 2, got $rc"
+set +e
+SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" --check a-reason echo 'should-not-run' >/dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "--check with a trailing command: expected exit 2, got $rc"
+ok "--check takes exactly one reason and never a command"
+
+# --- --check --workspace reads that workspace's queue, from any cwd -----------
+ASSIGNED="$TMPDIR/assigned ws"
+mkdir -p "$ASSIGNED/tasks"
+touch "$ASSIGNED/tasks/task-worker-1.txt"
+out="$(cd / && SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" --check test-ws --workspace "$ASSIGNED" 2>&1)"
+case "$out" in
+  "deferred: owner tasks queued — test-ws"*) : ;;
+  *) fail "--check --workspace: expected deferred on the assigned queue, got '$out'" ;;
+esac
+out="$(cd / && SUTANDO_WORKSPACE="$ASSIGNED" SUTANDO_TEST_MODE=1 bash "$GATE" --check test-ws --workspace "$TMPDIR" 2>&1)"
+[ "$out" = "clear" ] || fail "--check --workspace: expected clear on the empty named queue, got '$out'"
+set +e
+SUTANDO_WORKSPACE="$TMPDIR" SUTANDO_TEST_MODE=1 bash "$GATE" --check test-ws --workspace >/dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "--check --workspace without a dir: expected exit 2, got $rc"
+ok "--check --workspace checks the named workspace, not the configured one"
+
 echo "OK — $PASSED/$PASSED cron-gate tests passed"

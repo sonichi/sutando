@@ -962,6 +962,32 @@ def _lock_path(workspace: Optional[Path]) -> Path:
     return _workspace(workspace) / "state" / LOCK_NAME
 
 
+_LOCK_DEPTH = threading.local()
+
+
+@contextmanager
+def _records_lock(workspace: Optional[Path]) -> Iterator[None]:
+    """The record lock, re-entered without blocking by the thread that already holds it, so a stop and
+    the `launch` after it can share one hold. Other threads and processes still wait for it."""
+    key = os.path.abspath(str(_lock_path(workspace)))
+    depth = getattr(_LOCK_DEPTH, "held", None)
+    if depth is None:
+        depth = _LOCK_DEPTH.held = {}
+    if depth.get(key):
+        depth[key] += 1
+        try:
+            yield
+        finally:
+            depth[key] -= 1
+        return
+    with locked_file(_lock_path(workspace), create_mode=0o600):
+        depth[key] = 1
+        try:
+            yield
+        finally:
+            depth.pop(key, None)
+
+
 def launch_record_path(instance: str, workspace: Optional[Path] = None) -> Path:
     return _workspace(workspace) / "state" / LAUNCH_DIR / f"{instance or 'primary'}.json"
 
@@ -1110,7 +1136,7 @@ def _write(path: Path, record: dict) -> None:
 def _transaction(workspace: Optional[Path]) -> Iterator[dict]:
     """Read-mutate-publish under the record's lock; the yielded record is what gets written."""
     path = record_path(workspace)
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         record = _read_record(path)
         yield record
         _write(path, record)
@@ -1468,7 +1494,7 @@ def legacy_keeps_proactive_room(workspace: Optional[Path] = None) -> bool:
     room. Under the record lock, so a `set_primary` either committed first (False here) or runs
     after and sees this bridge's lease (refused); an unreadable record keeps it (env-only fail-open)."""
     try:
-        with locked_file(_lock_path(workspace), create_mode=0o600):
+        with _records_lock(workspace):
             rows = _read(record_path(workspace))
     except (SchemaError, OSError):
         return True
@@ -1481,7 +1507,7 @@ def legacy_parked(workspace: Optional[Path] = None) -> bool:
     record lock, so a `promote` that is stopping it commits first; an unreadable record parks nothing
     (the env-only fail-open)."""
     try:
-        with locked_file(_lock_path(workspace), create_mode=0o600):
+        with _records_lock(workspace):
             rec = _read_record(record_path(workspace))
     except (SchemaError, OSError):
         return False
@@ -1499,19 +1525,38 @@ def owns_unaddressed(instance: str, workspace: Optional[Path] = None) -> bool:
     return bool(instance) and instance in [owner["instance"]] + alias_instances(owner)
 
 
-def _has_owner_dm(row: Mapping[str, object], workspace: Optional[Path]) -> bool:
-    """Whether the row's bridge has a checked owner DM on disk (state/owner-routing<suffix>.json: a
-    private room, bound to the row's agent when the row names one). Every lane reads it alike."""
-    inst = str(row.get("instance") or "")
+def _owner_dm_as(row: Mapping[str, object], inst: str, workspace: Optional[Path]) -> str:
+    """The checked owner DM the row's bridge wrote while running as `inst` (state/owner-routing<suffix>.json:
+    a private room, bound to the row's agent when the row names one); "" when none."""
     path = _workspace(workspace) / "state" / f"owner-routing{'.' + inst if inst else ''}.json"
     try:
         rec = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return False
+        return ""
     if not isinstance(rec, dict) or not rec.get("owner_dm") or rec.get("private") is not True:
-        return False
+        return ""
     agent = str(row.get("agent_mxid") or "")
-    return not agent or rec.get("identity") == agent
+    return str(rec["owner_dm"]) if not agent or rec.get("identity") == agent else ""
+
+
+def owner_dm(row: Mapping[str, object], workspace: Optional[Path] = None) -> str:
+    """The row's checked owner DM: under its own instance, else the one launch-key alias that has one; "" when none."""
+    own = _owner_dm_as(row, str(row.get("instance") or ""), workspace)
+    if own:
+        return own
+    found = {dm for dm in (_owner_dm_as(row, inst, workspace) for inst in alias_instances(row)) if dm}
+    return found.pop() if len(found) == 1 else ""
+
+
+def _has_owner_dm(row: Mapping[str, object], workspace: Optional[Path]) -> bool:
+    """Whether the row's bridge has a checked owner DM on disk under its own instance. Every lane reads it alike."""
+    return bool(_owner_dm_as(row, str(row.get("instance") or ""), workspace))
+
+
+def _lane_owner_dms(row: Mapping[str, object], workspace: Optional[Path]) -> set:
+    """Every checked owner DM of the row's bridge, under its instance or a launch-key alias it runs as."""
+    names = [str(row.get("instance") or "")] + alias_instances(row)
+    return {dm for dm in (_owner_dm_as(row, inst, workspace) for inst in names) if dm}
 
 
 def unaddressed_owner(workspace: Optional[Path] = None) -> "tuple[Optional[dict], Optional[dict]]":
@@ -1631,17 +1676,23 @@ def primary_row(workspace: Optional[Path] = None) -> Optional[dict]:
     return next((dict(r) for r in rows if r["primary"]), None)
 
 
-def connection_for_room(room_id: Optional[str], workspace: Optional[Path] = None) -> Optional[dict]:
+def connection_for_room(room_id: Optional[str], workspace: Optional[Path] = None,
+                        environ: Optional[Mapping[str, str]] = None) -> Optional[dict]:
     """The row a room operation acts through: the row whose server equals the room ID's domain
     exactly; for an ID naming no domain, the one row whose bridge has a task open in it, else the
     primary; with no room, the primary. None keeps the caller's own single-connection
     resolution: fewer than two rows, no primary, or an unreadable record.
-    NoConnectionForRoom when the domain has no row, or its row is disconnected."""
+    NoConnectionForRoom when the domain has no row, or its row is disconnected.
+    In a pool worker's session (`session_worker`) that worker's own identity comes first
+    (`acting_identity`); every other caller acts through the install's own rows."""
     try:
-        # A room operation acts as the install's own agent, never as a worker's identity.
-        rows = _core_rows(_read(record_path(workspace)))
+        every = _read(record_path(workspace))
     except (SchemaError, OSError):
         return None
+    own = acting_identity(every, room_id, session_worker(environ), workspace)
+    if own is not None:
+        return dict(own)
+    rows = _core_rows(every)
     if len(rows) < 2:
         return None
     server = server_of_room(room_id or "")
@@ -1665,7 +1716,7 @@ def room_agent_mxid(room_id: Optional[str], *, workspace: Optional[Path] = None,
     """The agent identity a room operation acts as, from the row `connection_for_room` routes it to:
     the row's recorded `agent_mxid`, else AGENT_MXID in the row's channel env file, kept only when it
     names that row's server. None keeps the caller's own resolution; '' when the row names none."""
-    row = connection_for_room(room_id, workspace)
+    row = connection_for_room(room_id, workspace, environ)
     if row is None:
         return None
     environ = os.environ if environ is None else environ
@@ -1755,7 +1806,7 @@ def room_credential(room_id: Optional[str], *, workspace: Optional[Path] = None,
                     environ: Optional[Mapping[str, str]] = None, vault=None) -> "Optional[tuple[str, str]]":
     """(gateway_url, token) a room operation must use, or None to keep the caller's own resolution
     (see `connection_for_room`). NoConnectionForRoom names what is missing."""
-    row = connection_for_room(room_id, workspace)
+    row = connection_for_room(room_id, workspace, environ)
     return None if row is None else connection_credential(row, environ, vault=vault)
 
 
@@ -1845,24 +1896,25 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
     start_kw = dict(repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace, vault=vault,
                     spawn=spawn, python=python)
     try:
-        if not was_primary and not _connected_bridge(snapshot, workspace):
-            # A stop that signals and then is refused has still taken it down: rollback restarts it.
-            undo["relaunched"] = any(bridge_pid(i, workspace) for i in [instance] + alias_instances(snapshot))
-            _stop_row(snapshot, workspace, kill)
-        launch = start(instance, **start_kw)
+        with _records_lock(workspace):  # stop and start in one hold: the lane keeper starts lanes under it
+            if not was_primary and not _connected_bridge(snapshot, workspace):
+                # A stop that signals and then is refused has still taken it down: rollback restarts it.
+                undo["relaunched"] = any(bridge_pid(i, workspace) for i in [instance] + alias_instances(snapshot))
+                _stop_row(snapshot, workspace, kill)
+            launch = start(instance, **start_kw)
         if not launch.get("ok"):
             raise NewPrimaryNotStarted(instance, str(launch.get("reason") or "launch_failed"))
         undo["started"] = int(launch.get("pid") or 0) if launch.get("lease") == "held" else 0
         _await_connected(instance, int(launch.get("holder_pid") or launch.get("pid") or 0), workspace,
                          CONNECT_TIMEOUT_S if connect_timeout_s is None else connect_timeout_s)
     except ConnectionsError:
-        with locked_file(_lock_path(workspace), create_mode=0o600):
+        with _records_lock(workspace):
             _undo_promote(_read_record(record_path(workspace)), **undo)
-        _restart_secondary(undo, start_kw)
+            _restart_secondary(undo, start_kw)
         raise
     path = record_path(workspace)
     failure = None
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):  # a rollback's stop and restart share one hold
         rec = _read_record(path)
         row = next((r for r in rec["rows"] if r["instance"] == instance), None)
         old = next((r for r in rec["rows"] if old_inst is not None and r["instance"] == old_inst), None)
@@ -1887,9 +1939,9 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
             for r in rec["rows"]:
                 r["primary"] = r is row
             _write(path, rec)
-    if failure is not None:
-        _restart_secondary(undo, start_kw)
-        raise failure
+        if failure is not None:
+            _restart_secondary(undo, start_kw)
+            raise failure
     out = dict(row)
     parked = old if park else None
     out.update(previous=None if parked is None else parked["instance"],
@@ -1918,7 +1970,7 @@ def _promote_legacy(workspace: Optional[Path], kill, park: bool = False) -> dict
     primary then it runs without the room and the row carries `relaunch_needed`: its launchers
     restart it (`bash src/restart.sh`)."""
     path = record_path(workspace)
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         rec = _read_record(path)
         row = _find(rec["rows"], "")
         if row.get("disabled"):
@@ -1984,8 +2036,8 @@ def _undo_promote(rec: dict, *, instance: str, before: Optional[str], was_parked
 
 
 def _restart_secondary(undo: dict, start_kw: dict) -> None:
-    """After a rollback, outside the record lock (`launch` takes it): start again, as a secondary,
-    the bridge `promote` stopped to relaunch it."""
+    """After a rollback, in the same hold of the record lock as its stop: start again, as a
+    secondary, the bridge `promote` stopped to relaunch it."""
     if undo["relaunched"]:
         start(undo["instance"], **start_kw)
 
@@ -2017,7 +2069,7 @@ def park(instance: str, *, workspace: Optional[Path] = None, kill=None) -> dict:
     row as it was. `''` with no legacy row parks the rowless legacy bridge (`legacy_parked`). The row
     carries `stopped_pid` (0 when none ran)."""
     path = record_path(workspace)
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         rec = _read_record(path)
         row = next((r for r in rec["rows"] if r["instance"] == instance), None)
         if row is None and instance:
@@ -2044,7 +2096,7 @@ def park_legacy(*, workspace: Optional[Path] = None, kill=None) -> dict:
     {primary, parked: [instance], stopped: {instance: pid}}."""
     path = record_path(workspace)
     parked, stopped = [], {}
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         rec = _read_record(path)
         primary = next((r for r in rec["rows"] if r["primary"]), None)
         if primary is None:
@@ -2076,7 +2128,7 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
     vault = _vault(vault)
     path = record_path(workspace)
     # Cleanup stays under the record lock: a same-name re-add must not have its new files deleted.
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         rec = _read_record(path)
         rows = rec["rows"]
         row = _find(rows, instance)
@@ -2118,6 +2170,140 @@ def worker_identity(worker: str, workspace: Optional[Path] = None) -> Optional[d
     except (SchemaError, OSError):
         return None
     return next((dict(r) for r in rows if r.get("worker") == worker), None)
+
+
+# A worker's seat names its worker here (the pool launchers export it); the core's names none.
+SESSION_WORKER_ENV = "SUTANDO_WORKER_ID"
+
+
+def session_worker(environ: Optional[Mapping[str, str]] = None) -> str:
+    """The pool worker this process is a session of (`SESSION_WORKER_ENV`); "" for the core's."""
+    environ = os.environ if environ is None else environ
+    worker = str(environ.get(SESSION_WORKER_ENV) or "")
+    return worker if WORKER_RE.match(worker) else ""
+
+
+def acting_identity(rows: list, room_id: Optional[str], worker: str,
+                    workspace: Optional[Path] = None) -> Optional[dict]:
+    """`worker`'s own identity row when its session acts through it in `room_id`, else None (the
+    core's rows): its enabled row on the room's server; with no room, its only enabled row. A room
+    local state says is the core's stays the core's: one where a core lane, and not the worker's,
+    has a task open (that task is answered as the core's agent), or a core lane's own owner DM."""
+    own = [r for r in rows if worker and r.get("worker") == worker and not r.get("disabled")]
+    if not room_id:
+        return own[0] if len(own) == 1 else None
+    server = server_of_room(room_id)
+    mine = next((r for r in own if server in _row_servers(r)), None) if server else next(
+        (r for r in own if _lane_holds_room(r, room_id, workspace)), None)
+    if mine is None or _lane_holds_room(mine, room_id, workspace):
+        return mine
+    core = [r for r in _core_rows(rows) if not server or server in _row_servers(r)]
+    if any(_lane_holds_room(r, room_id, workspace) or room_id in _lane_owner_dms(r, workspace) for r in core):
+        return None
+    return mine
+
+
+class NoWorkerCredential(ConnectionsError):
+    """A pool worker's session has no credential of its own to act with; `reason` is one of
+    WORKER_CREDENTIAL_REASONS. The core's credential is never the answer."""
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason, self.detail = reason, detail
+
+
+WORKER_CREDENTIAL_REASONS = ("no_worker", "no_token")
+# Why a worker acts through the core's agent instead of one of its own (`worker_mcp_credential`'s `reason`).
+WORKER_ACTS_AS_CORE_REASONS = ("no_identity", "disabled")
+# The worker seat's s-space MCP proxy runs this argv to learn whose credential to mint with (see
+# `mcp_worker_credential_argv`): a token comes from the vault to the proxy's memory, never a file.
+MCP_WORKER_CREDENTIAL_ENV = "AG2_MCP_WORKER_CREDENTIAL"
+
+
+def worker_enabled_identity(worker: str, workspace: Optional[Path] = None) -> Optional[dict]:
+    """`worker`'s own identity row while a lane serves it (neither disabled nor parked), else None. The one
+    test of whether a worker acts as its own agent: its proactive notes are stamped for its lane and its
+    seat's MCP proxy mints with its token exactly when this answers a row; otherwise it acts as the core."""
+    row = worker_identity(worker, workspace)
+    return row if row is not None and not row.get("disabled") and not row.get("parked") else None
+
+
+def session_proactive_name(name, environ: Optional[Mapping[str, str]] = None,
+                           workspace: Optional[Path] = None) -> str:
+    """The name this session publishes a proactive file under (`proactive_routing.stamp_worker`): stamped
+    with its worker when the session is a pool worker's that acts as its own agent
+    (`worker_enabled_identity`), so that worker's lane claims it; unchanged for the core's session and
+    for a worker acting through the core's agent, whose notes a core lane sends as before."""
+    from proactive_routing import stamp_worker
+    worker = session_worker(environ)
+    return stamp_worker(name, worker) if worker and worker_enabled_identity(worker, workspace) else Path(name).name
+
+
+def worker_mcp_credential(worker: str, *, workspace: Optional[Path] = None,
+                          environ: Optional[Mapping[str, str]] = None, vault=None) -> dict:
+    """Whose credential a worker session's MCP proxy mints with. A worker that acts as its own agent
+    (`worker_enabled_identity`) answers `acts_as: "worker"` with its row and token, resolved as every room
+    client resolves one (`connection_credential`: the vault's, by its `token_ref`):
+    `{worker, acts_as, lane, server, agent_id, relay, bearer}`, `bearer` the secret half. A worker with no
+    identity, or a disabled or parked one, answers `{worker, acts_as: "core", reason}`: it acts through the
+    core's agent, as its notes do. Refused with NoWorkerCredential for no worker or for an enabled identity
+    with no token; the core's rows are never read here, so the core's credential is never answered."""
+    if not worker or not WORKER_RE.match(worker):
+        raise NoWorkerCredential("no_worker", "this session names no pool worker")
+    row = worker_enabled_identity(worker, workspace)
+    if row is None:
+        reason = "disabled" if worker_identity(worker, workspace) is not None else "no_identity"
+        return {"worker": worker, "acts_as": "core", "reason": reason}
+    try:
+        gateway_url, token = connection_credential(row, environ, vault=vault)
+    except NoConnectionForRoom as e:
+        raise NoWorkerCredential("no_token", str(e)) from None
+    mxid = str(row.get("agent_mxid") or "").strip()
+    return {"worker": worker, "acts_as": "worker", "lane": str(row["instance"]), "server": str(row["server"]),
+            "agent_id": mxid if _STRICT_MXID_RE.fullmatch(mxid) else None,
+            "relay": (gateway_url_of(token) or gateway_url).rstrip("/"),
+            "bearer": secret_of(token) if gateway_url_of(token) else token.strip()}
+
+
+def mcp_worker_credential_argv(worker: str, repo: Path, python: str = "",
+                               workspace: Optional[Path] = None) -> list:
+    """The argv a worker seat's MCP proxy runs for `worker_mcp_credential` (`MCP_WORKER_CREDENTIAL_ENV`
+    carries it JSON-encoded): the seat's own interpreter when the launcher resolved one, else python3, and
+    the workspace named outright, since the proxy runs it with a scrubbed environment."""
+    return [python or "python3", str(Path(repo) / "scripts" / "connections.py"), "--workspace",
+            str(_workspace(workspace)), "worker-mcp-credential", "--worker", worker]
+
+
+def worker_lane_named(name: str, workspace: Optional[Path] = None) -> bool:
+    """Whether `name` is a pool worker's own lane, by its instance or its channel dir. Such a lane
+    has no channel env file: its token lives in the vault alone (`connection_credential` reads it)."""
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return False
+    return any(r.get("worker") and name in (r["instance"], lane_channel_dir(str(r["instance"]))) for r in rows)
+
+
+def task_lane(task_id: str) -> str:
+    """The named lane that queued `task_id` (`task-<instance>~<broker id>`); "" for any other id."""
+    first = str(task_id or "").partition("~~")[0]  # a later run is `<local id>~~<n>`
+    inst, sep, _ = first[len("task-"):].partition("~")
+    return inst if first.startswith("task-") and sep and INSTANCE_RE.match(inst) else ""
+
+
+def task_agent_mxid(task_id: str, workspace: Optional[Path] = None) -> str:
+    """The agent a task is answered as: the one the lane that queued it runs as (`task_lane`, by
+    slug or launch-key alias). "" for a task no named lane queued, or when the record names none."""
+    instance = task_lane(task_id)
+    if not instance:
+        return ""
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return ""
+    row = next((r for r in rows if instance in [r["instance"]] + alias_instances(r)), None)
+    mxid = str((row or {}).get("agent_mxid") or "").strip()
+    return mxid if _STRICT_MXID_RE.fullmatch(mxid) else ""
 
 
 class LaneIdentityUnknown(ConnectionsError):
@@ -2849,7 +3035,7 @@ def _exited(pid: int) -> bool:
     """Whether `pid` has ended: our own child by its exit status, any other by the kernel."""
     child = _CHILDREN.get(pid)
     if child is not None:
-        if child.poll() is None:
+        if child.poll() is None and not _exited_while_waited(pid):
             return False
         _CHILDREN.pop(pid, None)
         return True
@@ -2875,6 +3061,38 @@ def _exited(pid: int) -> bool:
     except OSError:
         return False
     return False
+
+
+def _exited_while_waited(pid: int) -> bool:
+    """Whether our own child has exited though poll() said None, asked of the kernel without reaping it."""
+    # poll() returns None unchecked while the reaper's wait() holds the Popen's waitpid lock.
+    waitid = getattr(os, "waitid", None)
+    if waitid is None:
+        return os.name != "nt" and (_ps_zombie(pid) or _no_longer_our_child(pid))
+    try:
+        return waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except ChildProcessError:  # the reaper has already collected it
+        return True
+    except OSError:
+        return False
+
+
+def _no_longer_our_child(pid: int) -> bool:
+    """Whether our child's pid is gone from the kernel or now names another parent's process (reaped,
+    then reused); False when either probe cannot answer."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    ps = "/bin/ps" if os.path.exists("/bin/ps") else "ps"
+    try:
+        out = subprocess.run([ps, "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    ppid = out.strip()
+    return ppid.isdigit() and int(ppid) != os.getpid()
 
 
 def _zombie(pid: int) -> bool:
@@ -2945,6 +3163,12 @@ def _await_lease(instance: str, pid: int, workspace: Optional[Path], timeout_s: 
 
 
 def _exit_code(child) -> Optional[int]:
+    wait = getattr(child, "wait", None)
+    if wait is not None:
+        try:  # the child has exited; wait for the reaper's lock so its rc is read, not None
+            return wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
     poll = getattr(child, "poll", None)
     return poll() if poll is not None else None
 
@@ -2966,7 +3190,7 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
     if not env_only:
         _learn_missing_identity(instance, environ, workspace, vault, fetch, getaddrinfo)
     # Holding the lock to the lease is safe: the bridge's startup never reads this record.
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         entry = plan_entry(instance, environ, workspace=workspace, env_only=env_only)
         if env_only and not entry["agent_mxid"]:
             entry["agent_mxid"] = _verified_agent((environ.get(entry["token_ref"]) or "").strip(), fetch, getaddrinfo)
@@ -3058,6 +3282,129 @@ def start_added(row: Mapping[str, object], **launch_kw) -> Optional[dict]:
     return start(str(row["instance"]), **launch_kw)
 
 
+# How soon the lane keeper retries a lane that did not start: doubling from the first, capped.
+LANE_RETRY_FIRST_S = 30.0
+LANE_RETRY_MAX_S = 900.0
+LANE_KEEPER_STATE = "gateway-lane-keeper.json"
+
+
+def lane_keeper_state_path(workspace: Optional[Path] = None) -> Path:
+    return _workspace(workspace) / "state" / LANE_KEEPER_STATE
+
+
+def keeper_environ(environ: Optional[Mapping[str, str]] = None) -> dict:
+    """`environ` with its AG2_REMOTE_TOKEN_<INST> values replaced by what the channel env file holds
+    now: a long-lived supervisor's inherited copy would launch a lane on a rotated-away token."""
+    environ = os.environ if environ is None else environ
+    base = {k: v for k, v in environ.items() if not _ENV_VAR_RE.match(k)}
+    return {**base, **channel_launch_keys(base)}
+
+
+def lane_retry_wait(failures: int) -> float:
+    """Seconds before try `failures + 1`: LANE_RETRY_FIRST_S doubling per failure, capped at
+    LANE_RETRY_MAX_S; the exponent is bounded so no failure count can overflow it."""
+    return min(LANE_RETRY_FIRST_S * 2 ** min(max(failures - 1, 0), 16), LANE_RETRY_MAX_S)
+
+
+def _lane_retry(due: object, now: float) -> dict:
+    try:
+        failures = int((due or {}).get("failures") or 0) + 1  # type: ignore[union-attr]
+    except (AttributeError, TypeError, ValueError):
+        failures = 1
+    return {"failures": failures, "next_try": now + lane_retry_wait(failures)}
+
+
+def _keep_lane(inst: str, state: dict, now: float, say: Callable[[str], None], *, repo: Path, logs_dir: Path,
+               environ: Mapping[str, str], workspace: Optional[Path], vault, spawn, python: Optional[str]) -> None:
+    """`keep_lanes_up` for one lane, under the record lock."""
+    with _records_lock(workspace):
+        if inst not in {e["instance"] for e in launch_plan(environ, workspace=workspace)}:
+            state.pop(inst, None)  # disconnected, parked or removed since the plan was read
+            return
+        row = _row_named(inst, workspace) or {}
+        if any(_proven_holder(n, workspace) for n in [inst] + alias_instances(row)):
+            state.pop(inst, None)
+            return
+        due = state.get(inst) or {}
+        try:
+            if float(due.get("next_try") or 0) > now:
+                return
+        except (AttributeError, TypeError, ValueError):
+            pass  # an unreadable wait is no wait
+        try:
+            rec = launch(inst, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
+                         vault=vault, spawn=spawn, python=python)
+        except ConnectionsError as e:
+            reason = _launch_record(inst, workspace).get("reason") if isinstance(e, LaunchFailed) else None
+            state[inst] = _lane_retry(due, now)
+            say(f"lane {inst} is down and did not start ({reason or _error_reason(e)}); "
+                f"next try in {state[inst]['next_try'] - now:.0f}s")
+            return
+        state.pop(inst, None)
+        if rec.get("lease") == "held":
+            say(f"lane {inst} was down; started it (pid {rec.get('pid')})")
+
+
+def keep_lanes_up(*, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
+                  workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None,
+                  now: Optional[float] = None, log: Optional[Callable[[str], None]] = None) -> list:
+    """One pass of the primary gateway wrapper over the launch plan: `launch` each named lane that no
+    process holds, under the record lock, which every stop-then-start here holds across both steps,
+    so a lane is never started between another caller's stop and its own start. The token is read
+    by `launch` at that moment. A lane that does not start waits LANE_RETRY_FIRST_S, then twice as
+    long each time, up to LANE_RETRY_MAX_S (state in `lane_keeper_state_path`). Exactly one line is
+    logged per start attempt, none for a lane that is up or still waiting. Returns those lines."""
+    environ = keeper_environ(environ)
+    log = log or (lambda line: print(line, flush=True))
+    now = time.time() if now is None else now
+    state_path = lane_keeper_state_path(workspace)
+    state = _read_json(state_path)
+    lines: list = []
+
+    def say(line: str) -> None:
+        lines.append(line)
+        log(line)
+    plan = [e["instance"] for e in launch_plan(environ, workspace=workspace)]
+    for inst in plan:
+        try:
+            _keep_lane(inst, state, now, say, repo=repo, logs_dir=logs_dir, environ=environ,
+                       workspace=workspace, vault=vault, spawn=spawn, python=python)
+        except Exception as e:  # noqa: BLE001 - one lane's fault never costs the others their pass
+            state[inst] = _lane_retry(state.get(inst), now)
+            say(f"lane {inst}: keeper check failed ({type(e).__name__}); "
+                f"next try in {state[inst]['next_try'] - now:.0f}s")
+    for inst in [k for k in state if k not in plan]:
+        state.pop(inst, None)
+    _atomic_json(state_path, state)
+    return lines
+
+
+# The longest one keeper pass may run, and what the process exits with when it is given up.
+LANE_PASS_MAX_S = 300.0
+LANE_PASS_TIMEOUT_RC = 3
+
+
+def keep_lanes_bounded(*, max_s: float = LANE_PASS_MAX_S, log: Optional[Callable[[str], None]] = None,
+                       give_up: Callable[[int], None] = os._exit, **keep_kw) -> list:
+    """`keep_lanes_up`, given up once it has run `max_s`: a pass waiting on a record lock whose holder
+    hangs, or in a lane start that never returns, would otherwise keep its supervisor from ever
+    starting the next pass. A timer thread logs one line and ends the process wherever the pass is
+    blocked, which frees the record lock if this pass held it."""
+    log = log or (lambda line: print(line, flush=True))
+
+    def expired() -> None:
+        log(f"lane keeper pass still running after {max_s:.0f}s (waiting on the connections lock, or in a "
+            "lane start that does not return); gave it up, and no lane is tended until a pass completes")
+        give_up(LANE_PASS_TIMEOUT_RC)
+    timer = threading.Timer(max_s, expired)
+    timer.daemon = True
+    timer.start()
+    try:
+        return keep_lanes_up(log=log, **keep_kw)
+    finally:
+        timer.cancel()
+
+
 def bridge_pid(instance: str, workspace: Optional[Path] = None) -> int:
     """The pid of the process proven to hold `instance`'s bridge lease (workspace_lock's own record
     and identity check), 0 when none runs; `BridgeLeaseIndeterminate` when the lease proves neither."""
@@ -3108,44 +3455,58 @@ def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Ma
     _launch_preflight(instance, repo, environ, workspace, vault, python)
     previous = _launch_record(instance, workspace)
     previous_repo = previous.get("repo") or previous.get("last_repo") or ""
-    known = _row_named(instance, workspace)
-    stopped = _stop_row(known, workspace, kill) if known else stop_bridge(instance, workspace=workspace, kill=kill)
-    rows = {r["instance"]: r for r in list_connections(workspace, vault=vault)}
-    if instance in rows:
-        if rows[instance].get("disabled"):
-            _enable(instance, workspace)
-        ref = rows[instance]["token_ref"]
-        token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
-        if token:
-            try:
-                learn_identity(instance, preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo),
-                               workspace=workspace)
-            except ConnectionsError:
-                pass
-    try:
-        record = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
-                        vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
-    except LaunchFailed as e:
-        if not stopped or not previous_repo:
-            raise LaunchFailed(f"{e}; no previous bridge to bring back") from None
-        if Path(previous_repo).resolve() == Path(repo).resolve():
-            raise LaunchFailed(f"{e}; the previous bridge ran from this same checkout, so it was not "
-                               "retried: the lane is down until it is relaunched") from None
-        if not (Path(previous_repo) / "src" / "remote-gateway-bridge.py").is_file():
-            raise LaunchFailed(f"{e}; the previous bridge's checkout {previous_repo} has no bridge any more: "
-                               "the lane is down until it is relaunched") from None
+    # One hold from the stop through the relaunch: the primary wrapper's lane keeper waits on it.
+    with _records_lock(workspace):
+        known = _row_named(instance, workspace)
+        stopped = _stop_row(known, workspace, kill) if known else stop_bridge(instance, workspace=workspace, kill=kill)
+        rows = {r["instance"]: r for r in list_connections(workspace, vault=vault)}
+        if instance in rows:
+            if rows[instance].get("disabled"):
+                _enable(instance, workspace)
+            ref = rows[instance]["token_ref"]
+            token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
+            if token:
+                try:
+                    learn_identity(instance, preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo),
+                                   workspace=workspace)
+                except ConnectionsError:
+                    pass
         try:
-            back = launch(instance, repo=Path(previous_repo), logs_dir=logs_dir, environ=environ, workspace=workspace,
-                          vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
-        except LaunchFailed as e2:
-            raise LaunchFailed(f"{e}; bringing the previous bridge back from {previous_repo} failed too: {e2}") from None
-        raise LaunchFailed(f"{e}; the previous bridge was brought back from {previous_repo} "
-                           f"(pid {back.get('pid')})") from None
+            record = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
+                            vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
+        except LaunchFailed as e:
+            if not stopped or not previous_repo:
+                raise LaunchFailed(f"{e}; no previous bridge to bring back") from None
+            if Path(previous_repo).resolve() == Path(repo).resolve():
+                raise LaunchFailed(f"{e}; the previous bridge ran from this same checkout, so it was not "
+                                   "retried: the lane is down until it is relaunched") from None
+            if not (Path(previous_repo) / "src" / "remote-gateway-bridge.py").is_file():
+                raise LaunchFailed(f"{e}; the previous bridge's checkout {previous_repo} has no bridge any more: "
+                                   "the lane is down until it is relaunched") from None
+            try:
+                back = launch(instance, repo=Path(previous_repo), logs_dir=logs_dir, environ=environ, workspace=workspace,
+                              vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
+            except LaunchFailed as e2:
+                raise LaunchFailed(f"{e}; bringing the previous bridge back from {previous_repo} failed too: {e2}") from None
+            raise LaunchFailed(f"{e}; the previous bridge was brought back from {previous_repo} "
+                               f"(pid {back.get('pid')})") from None
     record["stopped_pid"] = stopped
     return record
 
 
 def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
+                 environ: Optional[Mapping[str, str]] = None, workspace: Optional[Path] = None,
+                 vault=None, spawn=None, kill=None, python: Optional[str] = None, fetch=None,
+                 resolver=None, getaddrinfo=None) -> dict:
+    """`_update_token_held` under one hold of the record lock from its stop through its relaunch, so
+    the primary wrapper's lane keeper cannot start the lane in between, on either code."""
+    with _records_lock(workspace):
+        return _update_token_held(instance, token, repo=repo, logs_dir=logs_dir, environ=environ,
+                                  workspace=workspace, vault=vault, spawn=spawn, kill=kill, python=python,
+                                  fetch=fetch, resolver=resolver, getaddrinfo=getaddrinfo)
+
+
+def _update_token_held(instance: str, token: str, *, repo: Path, logs_dir: Path,
                  environ: Optional[Mapping[str, str]] = None, workspace: Optional[Path] = None,
                  vault=None, spawn=None, kill=None, python: Optional[str] = None, fetch=None,
                  resolver=None, getaddrinfo=None) -> dict:
@@ -3187,7 +3548,7 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
     ref, previous, mutating, stopped, failure, found, restore = "", None, False, 0, None, "", ""
     path = record_path(workspace)
     # Snapshot, effects, publication and any reconcile share one hold of the record lock.
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         rec = _read_record(path)
         try:
             row = _find(rec["rows"], instance)

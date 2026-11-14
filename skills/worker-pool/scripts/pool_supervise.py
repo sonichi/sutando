@@ -37,6 +37,7 @@ ps = _sibling("pool_supervision")
 pb = _sibling("pool_beat")
 pr = _sibling("pool_roster")
 wi = _sibling("worker_identity")
+pl = _sibling("pool_limit")
 prr = _sibling("pool_routing_receipt")
 pd = _sibling("pool_delivery")
 
@@ -54,6 +55,10 @@ PAUSED_MARKER = "paused"
 NOT_SUPERVISED = ("retired",)
 # A sentinel younger than this is left alone: its payload may still be landing.
 SENTINEL_RETIRE_AFTER_S = 3600
+# Time a sweep spends archiving spent sentinels, per worker and in all; what is left waits for
+# the next sweep (SAMPLE_PERIOD_S later), so a backlog drains over sweeps and never stalls one.
+SENTINEL_RETIRE_BUDGET_S = 10.0
+SENTINEL_RETIRE_TOTAL_BUDGET_S = 60.0
 
 
 def state_path(workspace) -> Path:
@@ -163,10 +168,12 @@ def work_outstanding(workspace, worker_id) -> bool | None:
 
 
 def retire_spent_sentinels(workspace, worker_id, now: float,
-                           min_age_s: float = SENTINEL_RETIRE_AFTER_S) -> list[str]:
+                           min_age_s: float = SENTINEL_RETIRE_AFTER_S, *,
+                           deadline: float | None = None, progress: dict | None = None) -> list[str]:
     """Move spent sentinels older than `min_age_s` into the inbox's archive/ through
     pool_delivery.archive_finished, so the inbox holds what is owed. Returns the names moved.
-    An archive/ that cannot be used raises, and the sweep reports it."""
+    `deadline` (time.monotonic) bounds the pass; `progress["deferred"]` gets the task ids it left
+    for the next sweep. An archive/ that cannot be used raises, and the sweep reports it."""
     inbox = pd.deliveries_dir(workspace, worker_id)
     spent = sentinel_ids(workspace, worker_id)[1]
     old: dict[str, list[str]] = {}
@@ -179,8 +186,10 @@ def retire_spent_sentinels(workspace, worker_id, now: float,
         old.setdefault(tid, []).append(f.name)
     if not old:
         return []
-    moved = pd.archive_finished(workspace, worker_id, task_ids=sorted(old))["archived"]
-    return sorted(n for t in moved for n in old[t])
+    got = pd.archive_finished(workspace, worker_id, task_ids=sorted(old), deadline=deadline)
+    if progress is not None:
+        progress["deferred"] = got.get("deferred", 0)
+    return sorted(n for t in got["archived"] for n in old[t])
 
 
 def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=None,
@@ -211,24 +220,29 @@ def classify_pane_text(text: str | None, runtime: str = "claude", *, workspace=N
 
 
 def observe_pane(workspace, worker_id, runtime: str = "claude", *,
-                 runner=subprocess.run) -> tuple[str | None, str | None]:
-    """(pane kind, frame id) of this worker's pane; (None, None) when unread."""
+                 runner=subprocess.run, now=None) -> tuple[str | None, str | None, "pl.Reset | None"]:
+    """(pane kind, frame id, limit reset); all None when unread."""
     socket, name = _open_tmux(workspace, worker_id)
     if not socket:
-        return None, None
+        return None, None, None
     try:
         # -e as the notifier captures: both read the same bytes, so a dim placeholder is one verdict.
         done = runner(["tmux", "-S", str(socket), "capture-pane", "-e", "-p", "-t", f"={name}:0"],
                       capture_output=True, text=True, timeout=8)
     except (OSError, ValueError, subprocess.TimeoutExpired):
-        return None, None
+        return None, None, None
     text = done.stdout if done.returncode == 0 else None
     if not text or not text.strip():
-        return None, None
+        return None, None, None
     kind = classify_pane_text(text, runtime, workspace=workspace, socket=socket, session=name)
     if kind in (ps.PANE_ABNORMAL, ps.PANE_UNKNOWN):
         pane_gate.save_frame(workspace, name, kind, text)
-    return kind, frame_id(text)
+    return kind, frame_id(text), (pl.reset(plain_text(text), time.time() if now is None else now)
+                                  if kind == ps.PANE_LIMIT else None)
+
+
+def plain_text(text: str) -> str:
+    return pane_gate.SGR_STRIP.sub("", text)
 
 
 def frame_id(text: str) -> str:
@@ -278,9 +292,9 @@ def observe(workspace, now: float, *, worker_ids=None,
         held = None
         if session_alive is True and watcher_beat != pb.LIVE:
             held = session_watcher_holds(workspace, wid, runner=runner)
-        pane, pane_id = (observe_pane(workspace, wid, row.get("runtime") or "claude",
-                                      runner=runner)
-                         if session_alive is True else (None, None))
+        pane, pane_id, reset = (observe_pane(workspace, wid, row.get("runtime") or "claude",
+                                      runner=runner, now=now)
+                         if session_alive is True else (None, None, None))
         socket = _open_tmux(workspace, wid)[0] if session_alive is True else None
         if socket and socket not in blocks:
             blocks[socket] = delivery_block(socket)
@@ -293,6 +307,8 @@ def observe(workspace, now: float, *, worker_ids=None,
             work_outstanding=work_outstanding(workspace, wid),
             pane=pane,
             pane_id=pane_id,
+            limit_reset_at=reset.at if reset else None,
+            limit_banner=reset.banner if reset else None,
             delivery_block=blocks.get(socket) if socket else None,
         )
     return obs
@@ -394,6 +410,11 @@ def load_state(workspace) -> ps.SupervisionState:
                 wedge_escalated=bool(ev.get("wedge_escalated")),
                 wedge_kind=ev.get("wedge_kind"),
                 last_pane_id=ev.get("last_pane_id"),
+                limit_next_at=ev.get("limit_next_at"),
+                limit_attempts=int(ev.get("limit_attempts") or 0),
+                limit_exhausted=bool(ev.get("limit_exhausted")),
+                limit_banner=ev.get("limit_banner"),
+                limit_reset_at=ev.get("limit_reset_at"),
             )
     last = raw.get("last_sample_at")
     return ps.SupervisionState(
@@ -418,7 +439,12 @@ def save_state(workspace, state: ps.SupervisionState) -> None:
                         "wedge_consecutive": e.wedge_consecutive,
                         "wedge_escalated": e.wedge_escalated,
                         "wedge_kind": e.wedge_kind,
-                        "last_pane_id": e.last_pane_id}
+                        "last_pane_id": e.last_pane_id,
+                        "limit_next_at": e.limit_next_at,
+                        "limit_attempts": e.limit_attempts,
+                        "limit_exhausted": e.limit_exhausted,
+                        "limit_banner": e.limit_banner,
+                        "limit_reset_at": e.limit_reset_at}
                     for w, e in state.workers.items()},
     }
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".pool-supervision.")
@@ -450,16 +476,25 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
     obs = observe(workspace, now, worker_ids=worker_ids, runner=runner)
     period = ps.SAMPLE_PERIOD_S
     new_state, decisions = ps.evaluate(state, obs, now, expected_period_s=period)
-    retired, retire_errors = {}, {}
+    retired, retire_errors, deferred = {}, {}, {}
     if persist:
         save_state(workspace, new_state)
         if worker_ids is None:  # the sweep only: a delivery-time check stays read-only
+            total = time.monotonic() + SENTINEL_RETIRE_TOTAL_BUDGET_S
             for wid in obs:
+                progress = {}
                 try:
-                    if n := len(retire_spent_sentinels(workspace, wid, now)):
+                    if time.monotonic() >= total:
+                        deferred[wid] = "not-started"
+                        continue
+                    if n := len(retire_spent_sentinels(
+                            workspace, wid, now, deadline=min(total, time.monotonic() + SENTINEL_RETIRE_BUDGET_S),
+                            progress=progress)):
                         retired[wid] = n
                 except (OSError, ValueError) as e:
                     retire_errors[wid] = f"{type(e).__name__}: {e}"
+                if progress.get("deferred"):
+                    deferred[wid] = progress["deferred"]
     asked = list(worker_ids or [])
     # Reported on every tick, not only when a card decision is due: a dry run must
     # show the finding after the real sweep already raised (and acknowledged) the card.
@@ -468,9 +503,13 @@ def tick(workspace, now: float, *, worker_ids=None, runner=subprocess.run,
             "wedged": sorted(w for w, e in new_state.workers.items() if e.wedge_consecutive),
             "wedge_kinds": {w: e.wedge_kind for w, e in new_state.workers.items()
                             if e.wedge_consecutive and e.wedge_kind},
+            "limit_waits": {w: {"next_at": e.limit_next_at, "attempts": e.limit_attempts,
+                                  "exhausted": e.limit_exhausted}
+                            for w, e in new_state.workers.items() if e.limit_next_at is not None},
             "routing": routing_status(workspace),
             "sentinels_retired": retired,
             "sentinel_retire_errors": retire_errors,
+            "sentinels_deferred": deferred,
             "delivery_blocks": {w: o.delivery_block for w, o in obs.items() if o.delivery_block},
             "notifier_stalls": notifier_stalls(workspace, obs),
             "not_supervised": [w for w in asked if w not in obs],
@@ -526,6 +565,8 @@ def main(argv=None) -> int:
             print("resumed: this sample was discarded as evidence (host slept)")
         for wid, err in sorted(out.get("sentinel_retire_errors", {}).items()):
             print(f"{wid[:8]}  could not archive spent sentinels: {err}")
+        for wid, left in sorted(out.get("sentinels_deferred", {}).items()):
+            print(f"{wid[:8]}  spent-sentinel archiving ran out of time; left for the next sweep: {left}")
         for wid, cause in sorted(out.get("delivery_blocks", {}).items()):
             print(f"{wid[:8]}  typed delivery is blocked ({cause}); see the card for the remedy")
         for wid, rec in sorted(out.get("notifier_stalls", {}).items()):
