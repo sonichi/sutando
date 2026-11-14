@@ -10,6 +10,11 @@ Run: python3 tests/owner-channel-refuses-bound-rooms.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# The resolver this spawns reaches gateway credentials: no outer value survives.
+isolate_os_environ()
+
 import json
 import os
 import subprocess
