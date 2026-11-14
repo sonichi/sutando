@@ -76,6 +76,12 @@ check(m.RUNTIME_IDENTITY.get("module_sha256") == _hl.sha256(
 check(str(m.RUNTIME_IDENTITY.get("entrypoint", "")).endswith(
     "src/remote-gateway-bridge.py"), "entrypoint names the canonical loader")
 
+# A recovery command the bridge logs names the workspace through its resolver, not its path.
+_cmd = m._requeue_command(m.RESULTS_DIR / ".outbox-x", "item~1")
+check(m.RESULTS_DIR.parent == m.WS
+      and _cmd.startswith('python3 src/outbox_cli.py --root "$(bash scripts/sutando-config.sh workspace)"/results/')
+      and str(m.WS) not in _cmd, f"loader names the workspace resolver in logged commands: {_cmd}")
+
 # ── the status payload carries the runtime block ───────────────────────────
 with tempfile.TemporaryDirectory() as td:
     m.GATEWAY_STATUS_FILE = Path(td) / "gateway-status.json"

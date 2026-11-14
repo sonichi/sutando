@@ -962,6 +962,32 @@ def _lock_path(workspace: Optional[Path]) -> Path:
     return _workspace(workspace) / "state" / LOCK_NAME
 
 
+_LOCK_DEPTH = threading.local()
+
+
+@contextmanager
+def _records_lock(workspace: Optional[Path]) -> Iterator[None]:
+    """The record lock, re-entered without blocking by the thread that already holds it, so a stop and
+    the `launch` after it can share one hold. Other threads and processes still wait for it."""
+    key = os.path.abspath(str(_lock_path(workspace)))
+    depth = getattr(_LOCK_DEPTH, "held", None)
+    if depth is None:
+        depth = _LOCK_DEPTH.held = {}
+    if depth.get(key):
+        depth[key] += 1
+        try:
+            yield
+        finally:
+            depth[key] -= 1
+        return
+    with locked_file(_lock_path(workspace), create_mode=0o600):
+        depth[key] = 1
+        try:
+            yield
+        finally:
+            depth.pop(key, None)
+
+
 def launch_record_path(instance: str, workspace: Optional[Path] = None) -> Path:
     return _workspace(workspace) / "state" / LAUNCH_DIR / f"{instance or 'primary'}.json"
 
@@ -1110,7 +1136,7 @@ def _write(path: Path, record: dict) -> None:
 def _transaction(workspace: Optional[Path]) -> Iterator[dict]:
     """Read-mutate-publish under the record's lock; the yielded record is what gets written."""
     path = record_path(workspace)
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         record = _read_record(path)
         yield record
         _write(path, record)
@@ -1468,7 +1494,7 @@ def legacy_keeps_proactive_room(workspace: Optional[Path] = None) -> bool:
     room. Under the record lock, so a `set_primary` either committed first (False here) or runs
     after and sees this bridge's lease (refused); an unreadable record keeps it (env-only fail-open)."""
     try:
-        with locked_file(_lock_path(workspace), create_mode=0o600):
+        with _records_lock(workspace):
             rows = _read(record_path(workspace))
     except (SchemaError, OSError):
         return True
@@ -1481,7 +1507,7 @@ def legacy_parked(workspace: Optional[Path] = None) -> bool:
     record lock, so a `promote` that is stopping it commits first; an unreadable record parks nothing
     (the env-only fail-open)."""
     try:
-        with locked_file(_lock_path(workspace), create_mode=0o600):
+        with _records_lock(workspace):
             rec = _read_record(record_path(workspace))
     except (SchemaError, OSError):
         return False
@@ -1870,28 +1896,29 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
     start_kw = dict(repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace, vault=vault,
                     spawn=spawn, python=python)
     try:
-        if not was_primary and not _connected_bridge(snapshot, workspace):
-            # A stop that signals and then is refused has still taken it down: rollback restarts it.
-            undo["relaunched"] = any(bridge_pid(i, workspace) for i in [instance] + alias_instances(snapshot))
-            _stop_row(snapshot, workspace, kill)
-        launch = start(instance, **start_kw)
+        with _records_lock(workspace):  # stop and start in one hold: the lane keeper starts lanes under it
+            if not was_primary and not _connected_bridge(snapshot, workspace):
+                # A stop that signals and then is refused has still taken it down: rollback restarts it.
+                undo["relaunched"] = any(bridge_pid(i, workspace) for i in [instance] + alias_instances(snapshot))
+                _stop_row(snapshot, workspace, kill)
+            launch = start(instance, **start_kw)
         if not launch.get("ok"):
             raise NewPrimaryNotStarted(instance, str(launch.get("reason") or "launch_failed"))
         undo["started"] = int(launch.get("pid") or 0) if launch.get("lease") == "held" else 0
         _await_connected(instance, int(launch.get("holder_pid") or launch.get("pid") or 0), workspace,
                          CONNECT_TIMEOUT_S if connect_timeout_s is None else connect_timeout_s)
     except ConnectionsError:
-        with locked_file(_lock_path(workspace), create_mode=0o600):
-            _undo_promote(_read_record(record_path(workspace)), **undo)
-        # The record is already rolled back: its lanes follow it even if the restart itself fails.
+        # The record is rolled back under the lock: its lanes follow it even if the restart itself fails.
         try:
-            _restart_secondary(undo, start_kw)
+            with _records_lock(workspace):
+                _undo_promote(_read_record(record_path(workspace)), **undo)
+                _restart_secondary(undo, start_kw)
         finally:
             _refresh_mcp_lanes(workspace, environ, vault)
         raise
     path = record_path(workspace)
-    failure = None
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    failure = restart_failure = None
+    with _records_lock(workspace):  # a rollback's stop and restart share one hold
         rec = _read_record(path)
         row = next((r for r in rec["rows"] if r["instance"] == instance), None)
         old = next((r for r in rec["rows"] if old_inst is not None and r["instance"] == old_inst), None)
@@ -1916,17 +1943,18 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
             for r in rec["rows"]:
                 r["primary"] = r is row
             _write(path, rec)
-    if failure is not None:
-        try:
-            _restart_secondary(undo, start_kw)
-        except Exception as e:
-            raise e from failure
-        finally:
-            _refresh_mcp_lanes(workspace, environ, vault)
-        raise failure
+        if failure is not None:
+            try:
+                _restart_secondary(undo, start_kw)
+            except Exception as e:  # noqa: BLE001 - re-raised below, once the lanes follow the record
+                restart_failure = e
     # The lanes follow the committed record, not the launch: `start` synced them while the old
     # owner was still unparked, and parking it above is a change no launch follows.
     _refresh_mcp_lanes(workspace, environ, vault)
+    if restart_failure is not None:
+        raise restart_failure from failure
+    if failure is not None:
+        raise failure
     out = dict(row)
     parked = old if park else None
     out.update(previous=None if parked is None else parked["instance"],
@@ -1956,7 +1984,7 @@ def _promote_legacy(workspace: Optional[Path], kill, park: bool = False, *,
     primary then it runs without the room and the row carries `relaunch_needed`: its launchers
     restart it (`bash src/restart.sh`). The lanes are synced to the committed record after."""
     path = record_path(workspace)
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         rec = _read_record(path)
         row = _find(rec["rows"], "")
         if row.get("disabled"):
@@ -2024,8 +2052,8 @@ def _undo_promote(rec: dict, *, instance: str, before: Optional[str], was_parked
 
 
 def _restart_secondary(undo: dict, start_kw: dict) -> None:
-    """After a rollback, outside the record lock (`launch` takes it): start again, as a secondary,
-    the bridge `promote` stopped to relaunch it."""
+    """After a rollback, in the same hold of the record lock as its stop: start again, as a
+    secondary, the bridge `promote` stopped to relaunch it."""
     if undo["relaunched"]:
         start(undo["instance"], **start_kw)
 
@@ -2059,7 +2087,7 @@ def park(instance: str, *, workspace: Optional[Path] = None, kill=None) -> dict:
     row as it was. `''` with no legacy row parks the rowless legacy bridge (`legacy_parked`). The row
     carries `stopped_pid` (0 when none ran)."""
     path = record_path(workspace)
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         rec = _read_record(path)
         row = next((r for r in rec["rows"] if r["instance"] == instance), None)
         if row is None and instance:
@@ -2087,7 +2115,7 @@ def park_legacy(*, workspace: Optional[Path] = None, kill=None) -> dict:
     {primary, parked: [instance], stopped: {instance: pid}}."""
     path = record_path(workspace)
     parked, stopped = [], {}
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         rec = _read_record(path)
         primary = next((r for r in rec["rows"] if r["primary"]), None)
         if primary is None:
@@ -2121,7 +2149,7 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
     vault = _vault(vault)
     path = record_path(workspace)
     # Cleanup stays under the record lock: a same-name re-add must not have its new files deleted.
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         rec = _read_record(path)
         rows = rec["rows"]
         row = _find(rows, instance)
@@ -3196,7 +3224,7 @@ def _launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
     if not env_only:
         _learn_missing_identity(instance, environ, workspace, vault, fetch, getaddrinfo)
     # Holding the lock to the lease is safe: the bridge's startup never reads this record.
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         entry = plan_entry(instance, environ, workspace=workspace, env_only=env_only)
         if env_only and not entry["agent_mxid"]:
             entry["agent_mxid"] = _verified_agent((environ.get(entry["token_ref"]) or "").strip(), fetch, getaddrinfo)
@@ -3288,6 +3316,129 @@ def start_added(row: Mapping[str, object], **launch_kw) -> Optional[dict]:
     return start(str(row["instance"]), **launch_kw)
 
 
+# How soon the lane keeper retries a lane that did not start: doubling from the first, capped.
+LANE_RETRY_FIRST_S = 30.0
+LANE_RETRY_MAX_S = 900.0
+LANE_KEEPER_STATE = "gateway-lane-keeper.json"
+
+
+def lane_keeper_state_path(workspace: Optional[Path] = None) -> Path:
+    return _workspace(workspace) / "state" / LANE_KEEPER_STATE
+
+
+def keeper_environ(environ: Optional[Mapping[str, str]] = None) -> dict:
+    """`environ` with its AG2_REMOTE_TOKEN_<INST> values replaced by what the channel env file holds
+    now: a long-lived supervisor's inherited copy would launch a lane on a rotated-away token."""
+    environ = os.environ if environ is None else environ
+    base = {k: v for k, v in environ.items() if not _ENV_VAR_RE.match(k)}
+    return {**base, **channel_launch_keys(base)}
+
+
+def lane_retry_wait(failures: int) -> float:
+    """Seconds before try `failures + 1`: LANE_RETRY_FIRST_S doubling per failure, capped at
+    LANE_RETRY_MAX_S; the exponent is bounded so no failure count can overflow it."""
+    return min(LANE_RETRY_FIRST_S * 2 ** min(max(failures - 1, 0), 16), LANE_RETRY_MAX_S)
+
+
+def _lane_retry(due: object, now: float) -> dict:
+    try:
+        failures = int((due or {}).get("failures") or 0) + 1  # type: ignore[union-attr]
+    except (AttributeError, TypeError, ValueError):
+        failures = 1
+    return {"failures": failures, "next_try": now + lane_retry_wait(failures)}
+
+
+def _keep_lane(inst: str, state: dict, now: float, say: Callable[[str], None], *, repo: Path, logs_dir: Path,
+               environ: Mapping[str, str], workspace: Optional[Path], vault, spawn, python: Optional[str]) -> None:
+    """`keep_lanes_up` for one lane, under the record lock."""
+    with _records_lock(workspace):
+        if inst not in {e["instance"] for e in launch_plan(environ, workspace=workspace)}:
+            state.pop(inst, None)  # disconnected, parked or removed since the plan was read
+            return
+        row = _row_named(inst, workspace) or {}
+        if any(_proven_holder(n, workspace) for n in [inst] + alias_instances(row)):
+            state.pop(inst, None)
+            return
+        due = state.get(inst) or {}
+        try:
+            if float(due.get("next_try") or 0) > now:
+                return
+        except (AttributeError, TypeError, ValueError):
+            pass  # an unreadable wait is no wait
+        try:
+            rec = launch(inst, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
+                         vault=vault, spawn=spawn, python=python)
+        except ConnectionsError as e:
+            reason = _launch_record(inst, workspace).get("reason") if isinstance(e, LaunchFailed) else None
+            state[inst] = _lane_retry(due, now)
+            say(f"lane {inst} is down and did not start ({reason or _error_reason(e)}); "
+                f"next try in {state[inst]['next_try'] - now:.0f}s")
+            return
+        state.pop(inst, None)
+        if rec.get("lease") == "held":
+            say(f"lane {inst} was down; started it (pid {rec.get('pid')})")
+
+
+def keep_lanes_up(*, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
+                  workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None,
+                  now: Optional[float] = None, log: Optional[Callable[[str], None]] = None) -> list:
+    """One pass of the primary gateway wrapper over the launch plan: `launch` each named lane that no
+    process holds, under the record lock, which every stop-then-start here holds across both steps,
+    so a lane is never started between another caller's stop and its own start. The token is read
+    by `launch` at that moment. A lane that does not start waits LANE_RETRY_FIRST_S, then twice as
+    long each time, up to LANE_RETRY_MAX_S (state in `lane_keeper_state_path`). Exactly one line is
+    logged per start attempt, none for a lane that is up or still waiting. Returns those lines."""
+    environ = keeper_environ(environ)
+    log = log or (lambda line: print(line, flush=True))
+    now = time.time() if now is None else now
+    state_path = lane_keeper_state_path(workspace)
+    state = _read_json(state_path)
+    lines: list = []
+
+    def say(line: str) -> None:
+        lines.append(line)
+        log(line)
+    plan = [e["instance"] for e in launch_plan(environ, workspace=workspace)]
+    for inst in plan:
+        try:
+            _keep_lane(inst, state, now, say, repo=repo, logs_dir=logs_dir, environ=environ,
+                       workspace=workspace, vault=vault, spawn=spawn, python=python)
+        except Exception as e:  # noqa: BLE001 - one lane's fault never costs the others their pass
+            state[inst] = _lane_retry(state.get(inst), now)
+            say(f"lane {inst}: keeper check failed ({type(e).__name__}); "
+                f"next try in {state[inst]['next_try'] - now:.0f}s")
+    for inst in [k for k in state if k not in plan]:
+        state.pop(inst, None)
+    _atomic_json(state_path, state)
+    return lines
+
+
+# The longest one keeper pass may run, and what the process exits with when it is given up.
+LANE_PASS_MAX_S = 300.0
+LANE_PASS_TIMEOUT_RC = 3
+
+
+def keep_lanes_bounded(*, max_s: float = LANE_PASS_MAX_S, log: Optional[Callable[[str], None]] = None,
+                       give_up: Callable[[int], None] = os._exit, **keep_kw) -> list:
+    """`keep_lanes_up`, given up once it has run `max_s`: a pass waiting on a record lock whose holder
+    hangs, or in a lane start that never returns, would otherwise keep its supervisor from ever
+    starting the next pass. A timer thread logs one line and ends the process wherever the pass is
+    blocked, which frees the record lock if this pass held it."""
+    log = log or (lambda line: print(line, flush=True))
+
+    def expired() -> None:
+        log(f"lane keeper pass still running after {max_s:.0f}s (waiting on the connections lock, or in a "
+            "lane start that does not return); gave it up, and no lane is tended until a pass completes")
+        give_up(LANE_PASS_TIMEOUT_RC)
+    timer = threading.Timer(max_s, expired)
+    timer.daemon = True
+    timer.start()
+    try:
+        return keep_lanes_up(log=log, **keep_kw)
+    finally:
+        timer.cancel()
+
+
 def bridge_pid(instance: str, workspace: Optional[Path] = None) -> int:
     """The pid of the process proven to hold `instance`'s bridge lease (workspace_lock's own record
     and identity check), 0 when none runs; `BridgeLeaseIndeterminate` when the lease proves neither."""
@@ -3338,44 +3489,58 @@ def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Ma
     _launch_preflight(instance, repo, environ, workspace, vault, python)
     previous = _launch_record(instance, workspace)
     previous_repo = previous.get("repo") or previous.get("last_repo") or ""
-    known = _row_named(instance, workspace)
-    stopped = _stop_row(known, workspace, kill) if known else stop_bridge(instance, workspace=workspace, kill=kill)
-    rows = {r["instance"]: r for r in list_connections(workspace, vault=vault)}
-    if instance in rows:
-        if rows[instance].get("disabled"):
-            _enable(instance, workspace)
-        ref = rows[instance]["token_ref"]
-        token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
-        if token:
-            try:
-                learn_identity(instance, preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo),
-                               workspace=workspace)
-            except ConnectionsError:
-                pass
-    try:
-        record = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
-                        vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
-    except LaunchFailed as e:
-        if not stopped or not previous_repo:
-            raise LaunchFailed(f"{e}; no previous bridge to bring back") from None
-        if Path(previous_repo).resolve() == Path(repo).resolve():
-            raise LaunchFailed(f"{e}; the previous bridge ran from this same checkout, so it was not "
-                               "retried: the lane is down until it is relaunched") from None
-        if not (Path(previous_repo) / "src" / "remote-gateway-bridge.py").is_file():
-            raise LaunchFailed(f"{e}; the previous bridge's checkout {previous_repo} has no bridge any more: "
-                               "the lane is down until it is relaunched") from None
+    # One hold from the stop through the relaunch: the primary wrapper's lane keeper waits on it.
+    with _records_lock(workspace):
+        known = _row_named(instance, workspace)
+        stopped = _stop_row(known, workspace, kill) if known else stop_bridge(instance, workspace=workspace, kill=kill)
+        rows = {r["instance"]: r for r in list_connections(workspace, vault=vault)}
+        if instance in rows:
+            if rows[instance].get("disabled"):
+                _enable(instance, workspace)
+            ref = rows[instance]["token_ref"]
+            token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
+            if token:
+                try:
+                    learn_identity(instance, preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo),
+                                   workspace=workspace)
+                except ConnectionsError:
+                    pass
         try:
-            back = launch(instance, repo=Path(previous_repo), logs_dir=logs_dir, environ=environ, workspace=workspace,
-                          vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
-        except LaunchFailed as e2:
-            raise LaunchFailed(f"{e}; bringing the previous bridge back from {previous_repo} failed too: {e2}") from None
-        raise LaunchFailed(f"{e}; the previous bridge was brought back from {previous_repo} "
-                           f"(pid {back.get('pid')})") from None
+            record = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
+                            vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
+        except LaunchFailed as e:
+            if not stopped or not previous_repo:
+                raise LaunchFailed(f"{e}; no previous bridge to bring back") from None
+            if Path(previous_repo).resolve() == Path(repo).resolve():
+                raise LaunchFailed(f"{e}; the previous bridge ran from this same checkout, so it was not "
+                                   "retried: the lane is down until it is relaunched") from None
+            if not (Path(previous_repo) / "src" / "remote-gateway-bridge.py").is_file():
+                raise LaunchFailed(f"{e}; the previous bridge's checkout {previous_repo} has no bridge any more: "
+                                   "the lane is down until it is relaunched") from None
+            try:
+                back = launch(instance, repo=Path(previous_repo), logs_dir=logs_dir, environ=environ, workspace=workspace,
+                              vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
+            except LaunchFailed as e2:
+                raise LaunchFailed(f"{e}; bringing the previous bridge back from {previous_repo} failed too: {e2}") from None
+            raise LaunchFailed(f"{e}; the previous bridge was brought back from {previous_repo} "
+                               f"(pid {back.get('pid')})") from None
     record["stopped_pid"] = stopped
     return record
 
 
 def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
+                 environ: Optional[Mapping[str, str]] = None, workspace: Optional[Path] = None,
+                 vault=None, spawn=None, kill=None, python: Optional[str] = None, fetch=None,
+                 resolver=None, getaddrinfo=None) -> dict:
+    """`_update_token_held` under one hold of the record lock from its stop through its relaunch, so
+    the primary wrapper's lane keeper cannot start the lane in between, on either code."""
+    with _records_lock(workspace):
+        return _update_token_held(instance, token, repo=repo, logs_dir=logs_dir, environ=environ,
+                                  workspace=workspace, vault=vault, spawn=spawn, kill=kill, python=python,
+                                  fetch=fetch, resolver=resolver, getaddrinfo=getaddrinfo)
+
+
+def _update_token_held(instance: str, token: str, *, repo: Path, logs_dir: Path,
                  environ: Optional[Mapping[str, str]] = None, workspace: Optional[Path] = None,
                  vault=None, spawn=None, kill=None, python: Optional[str] = None, fetch=None,
                  resolver=None, getaddrinfo=None) -> dict:
@@ -3417,7 +3582,7 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
     ref, previous, mutating, stopped, failure, found, restore = "", None, False, 0, None, "", ""
     path = record_path(workspace)
     # Snapshot, effects, publication and any reconcile share one hold of the record lock.
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         rec = _read_record(path)
         try:
             row = _find(rec["rows"], instance)

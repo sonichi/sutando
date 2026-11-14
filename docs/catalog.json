@@ -267,7 +267,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-11-08"
+   "last_verified": "2026-11-13"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
@@ -494,7 +494,7 @@
    ],
    "status": "canonical",
    "canonical_for": "why each proactive-loop step exists: the measurement, the incident and the reasoning the skill file no longer carries",
-   "last_verified": "2026-11-06"
+   "last_verified": "2026-11-11"
   },
   "docs/recovery-issue-metrics.md": {
    "title": "Recovery issue metrics",
