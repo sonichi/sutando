@@ -509,15 +509,23 @@ def host_of_url(url: str) -> str:
 
 
 def origin_of_url(url: str) -> str:
-    """`host:port` of an http(s) URL, the port made explicit (443, 80) so a default and a stated one
-    agree; '' for anything else. Two URLs name the same endpoint only when these are equal."""
+    """The endpoint an http(s) URL names, as `scheme://host:port`: the scheme and host lowercased, a
+    trailing dot dropped, an IPv6 literal in its canonical bracketed form, and the port made explicit
+    (443 for https, 80 for http) so a default and a stated one agree. '' for another scheme, a URL
+    with userinfo, no host, or a bad port. Two URLs name the same endpoint only when these are equal."""
     try:
         u = urllib.parse.urlsplit(url or "")
-        host, port = (u.hostname or "").lower(), u.port
+        scheme, host, port = u.scheme.lower(), (u.hostname or "").rstrip("."), u.port
     except ValueError:
         return ""
-    port = port or {"https": 443, "http": 80}.get(u.scheme.lower())
-    return f"{host}:{port}" if host and port else ""
+    if scheme not in ("http", "https") or not host or "@" in u.netloc:
+        return ""
+    try:
+        host = f"[{ipaddress.IPv6Address(host).compressed}]"
+    except ValueError:
+        host = host.lower()
+    port = (443 if scheme == "https" else 80) if port is None else port
+    return f"{scheme}://{host}:{port}" if 1 <= port <= 65535 else ""
 
 
 def worker_instance_for(server: str, worker: str) -> str:
@@ -1414,16 +1422,16 @@ def _core_rows(rows: list) -> list:
 def _same_connection(rows: list, seen: Mapping[str, object], worker: Optional[str] = None) -> Optional[dict]:
     """The row this preview belongs to, among the core rows, or among `worker`'s own rows. A row
     whose server the registry or an identity vouches for matches on server; a provisional
-    (gateway-sourced) row matches only on its own gateway host, so it can never stand in for a
-    real connection elsewhere."""
+    (gateway-sourced) row matches only on its own gateway endpoint (`origin_of_url`: scheme, host and
+    port), so it can never stand in for a real connection elsewhere, another port of its host included."""
     server = str(seen.get("server") or "")
-    host = str(seen.get("gateway_host") or "")
+    endpoint = origin_of_url(str(seen.get("gateway_url") or ""))
     rows = [r for r in rows if r.get("worker") == (worker or None)]
     for r in rows:
         if r["server_source"] != "gateway" and r["server"] == server:
             return r
     for r in rows:
-        if host and host_of_url(r["gateway_url"]) == host:
+        if endpoint and origin_of_url(str(r["gateway_url"])) == endpoint:
             return r
     return None
 
@@ -1785,7 +1793,8 @@ def _channel_dir_tokens(channel_dir: Optional[str]) -> list:
 def connection_credential(row: Mapping[str, object], environ: Optional[Mapping[str, str]] = None, *,
                           vault=None) -> "tuple[str, str]":
     """(gateway_url, token) for one row: the first token among its env var, its launch keys, its
-    channel env file and its vault key whose embedded gateway (if any) is the row's own host."""
+    channel env file and its vault key whose embedded gateway (if any) is the row's own endpoint
+    (`origin_of_url`: scheme, host and port)."""
     environ = os.environ if environ is None else environ
     ref, instance = str(row["token_ref"]), str(row["instance"])
     refs = [ref] + [str(k) for k in row.get("launch_keys") or []]
@@ -1794,11 +1803,11 @@ def connection_credential(row: Mapping[str, object], environ: Optional[Mapping[s
         keys = channel_launch_keys(environ)
         candidates += [keys.get(r, "") for r in refs]
     candidates += _channel_dir_tokens(channel_dir_for(instance, environ) if instance else None)
-    host = host_of_url(str(row["gateway_url"]))
+    endpoint = origin_of_url(str(row["gateway_url"]))
 
     def own(tok) -> str:
         tok = (tok or "").strip()
-        return tok if tok and (not gateway_url_of(tok) or host_of_url(gateway_url_of(tok)) == host) else ""
+        return tok if tok and (not gateway_url_of(tok) or origin_of_url(gateway_url_of(tok)) == endpoint) else ""
     tok = next((own(t) for t in candidates if own(t)), "")
     if not tok:
         try:
@@ -2637,7 +2646,7 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
                 continue
             host = server_of_token(token)
             resolved = resolve_server(host, resolver)
-            seen = {"server": resolved or host, "gateway_host": host}
+            seen = {"server": resolved or host, "gateway_host": host, "gateway_url": gateway_url_of(token)}
             if any(r["instance"] == inst or r["token_ref"] == ref for r in rows):
                 continue
             same = _same_connection(rows, seen)

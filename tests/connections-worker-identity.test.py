@@ -804,10 +804,17 @@ class TwoServers(Base):
                     ("https://relay.beta-fixture.net:8443", "beta-fixture.net", "secret-reviewer-b")):
                 cred = self._seat({"lane": "primary", key: url + "/v1/mcp/token"})
                 self.assertEqual((cred["server"], cred["bearer"]), (server, secret), (key, url))
-        self.assertEqual(C.origin_of_url("https://h.example"), "h.example:443")
-        self.assertEqual(C.origin_of_url("http://H.example:80/p"), "h.example:80")
+        self.assertEqual(C.origin_of_url("https://h.example"), "https://h.example:443")
+        self.assertEqual(C.origin_of_url("http://H.example:80/p"), "http://h.example:80")
         for bad in ("", "h.example", "ftp://h.example", "https://h.example:notaport", "https://:8443"):
             self.assertEqual(C.origin_of_url(bad), "", bad)
+        for url in ("https://x@chat.alpha-fixture.net", "https://chat.alpha-fixture.net.",
+                    "HTTPS://Chat.Alpha-Fixture.NET.:443/v1"):
+            if "@" in url:
+                with self.assertRaises(C.NoWorkerCredential, msg=url):
+                    self._seat({"lane": "primary", "relay": url})
+            else:
+                self.assertEqual(self._seat({"lane": "primary", "relay": url})["server"], "alpha-fixture.net", url)
 
     def test_a_named_descriptor_that_cannot_be_read_is_refused_not_replaced(self):
         """A seat told to use one descriptor is never resolved by another, even when the workspace has one."""
@@ -921,6 +928,64 @@ class TwoServers(Base):
         self.assertEqual(out["result"], "removed")
         self.assertEqual(out["agent"], f"{WORKER_AGENT}, {BETA_WORKER}")
         self.assertEqual(C.worker_identities(W, self.ws), [])
+
+
+class Endpoints(Base):
+    """One rule for "is this the row's endpoint": scheme, host and port, exactly (`origin_of_url`)."""
+
+    def test_the_endpoint_key(self):
+        same = [("https://h.example", "https://h.example:443/any/path"),
+                ("https://h.example", "HTTPS://H.Example."),
+                ("https://h.example:8443", "https://h.example.:8443"),
+                ("https://[::1]:8443", "https://[0:0:0:0:0:0:0:1]:8443/"),
+                ("http://h.example", "http://h.example:80")]
+        for a, b in same:
+            self.assertEqual(C.origin_of_url(a), C.origin_of_url(b), (a, b))
+            self.assertTrue(C.origin_of_url(a), a)
+        differ = [("https://h.example", "http://h.example:443"), ("https://h.example", "http://h.example"),
+                  ("https://h.example", "https://h.example:8443"), ("https://[::1]", "https://[::1]:8443"),
+                  ("https://h.example", "https://evil-h.example"), ("https://h.example", "https://h.example.evil.example"),
+                  ("https://[::1]:8443", "https://[::2]:8443")]
+        for a, b in differ:
+            self.assertNotEqual(C.origin_of_url(a), C.origin_of_url(b), (a, b))
+        self.assertEqual(C.origin_of_url("https://[::1]:8443"), "https://[::1]:8443")
+        for bad in ("https://user@h.example", "https://user:pw@h.example", "https://h.example@evil.example",
+                    "https://h.example:0", "https://h.example:65536", "https://[::1"):
+            self.assertEqual(C.origin_of_url(bad), "", bad)
+
+    def _row(self, gateway, source="gateway"):
+        return {"server": "h.example", "server_source": source, "gateway_url": gateway, "worker": None,
+                "instance": "h-example", "token_ref": "SECRET_FOR_H", "launch_keys": []}
+
+    def test_a_provisional_row_matches_a_new_code_only_on_its_own_endpoint(self):
+        for stored in ("https://h.example", "https://h.example:443"):
+            row = self._row(stored)
+            for url in ("https://h.example", "https://h.example:443/", "https://H.example.", "https://h.example/relay"):
+                self.assertIs(C._same_connection([row], {"server": "other.example", "gateway_url": url}), row,
+                              (stored, url))
+            for url in ("https://h.example:8443", "http://h.example", "https://evil-h.example",
+                        "https://h.example.evil.example", "https://u@h.example", ""):
+                self.assertIsNone(C._same_connection([row], {"server": "other.example", "gateway_url": url}),
+                                  (stored, url))
+        verified = self._row("https://h.example:8443", source="resolver")
+        self.assertIs(C._same_connection([verified], {"server": "h.example", "gateway_url": "https://elsewhere.example"}),
+                      verified, "a row a resolver vouches for still matches on its server")
+
+    def test_a_rows_token_must_name_the_rows_own_endpoint(self):
+        row = self._row("https://h.example")
+        for token in ("https://h.example|secret-h", "https://h.example:443|secret-h", "https://H.Example.|secret-h",
+                      "secret-h"):
+            got = C.connection_credential(row, {"SECRET_FOR_H": token}, vault=H.FakeVault())
+            self.assertEqual(got, ("https://h.example", token), token)
+        for token in ("https://h.example:8443|secret-h", "http://h.example|secret-h", "https://evil-h.example|secret-h",
+                      "https://h.example.evil.example|secret-h", "https://u@h.example|secret-h"):
+            with self.assertRaises(C.NoConnectionForRoom, msg=token):
+                C.connection_credential(row, {"SECRET_FOR_H": token}, vault=H.FakeVault())
+        ported = self._row("https://h.example:8443")
+        self.assertEqual(C.connection_credential(ported, {"SECRET_FOR_H": "https://h.example:8443|s"},
+                                                 vault=H.FakeVault())[1], "https://h.example:8443|s")
+        with self.assertRaises(C.NoConnectionForRoom):
+            C.connection_credential(ported, {"SECRET_FOR_H": "https://h.example|s"}, vault=H.FakeVault())
 
 
 if __name__ == "__main__":
