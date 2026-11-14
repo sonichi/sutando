@@ -3363,5 +3363,21 @@ class StartupDialogAndRefusals(ConnectBase):
             self.assertEqual(cli.occupancy_line(str(self.work)), "held by hold pid 7, its claude pid 9 (manager active/running)")
 
 
+
+class TierMatrixTest(unittest.TestCase):
+    """The Mod's claim decision (inbox.admit) over tier_shapes.REFUSED, as the desktop installs it
+    (--allow-collaborator, never --allow-non-owner): the owner and the broker-stamped collaborator only."""
+
+    def test_only_the_owner_and_a_stamped_collaborator_reach_the_session(self):
+        import tier_shapes
+        tier_shapes.check_matrix(self, lambda root, name: inbox.admit(root, name, False, True)[0],
+                                 collaborator_admitted=True)
+
+    def test_without_the_flag_no_collaborator_reaches_it(self):
+        import tier_shapes
+        tier_shapes.check_matrix(self, lambda root, name: inbox.admit(root, name, False, False)[0],
+                                 collaborator_admitted=False)
+
+
 if __name__ == "__main__":
     unittest.main()
