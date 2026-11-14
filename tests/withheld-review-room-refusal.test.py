@@ -247,6 +247,38 @@ with tempfile.TemporaryDirectory() as td:
                   "where it settles, and nothing logs it as dropped")
             check(record_of(f"task-timeout-{n}").get("dm_room_id") == new_room,
                   "with the owner's review open in the new room")
+
+        # --- the cached room cannot be unmarked (the cache write fails at the fifth refusal):
+        # the scan still returns, nothing is dropped, and a later pass reaches the new room
+        unwritable, failed_write = "!fresh7:ag2.space", []
+        real_write = m._atomic_private_json
+
+        def write_fails_once(path, data, *args, **kwargs):
+            if path == m._WITHHELD_DM_CACHE and data.get("private") is False and not failed_write:
+                failed_write.append(1)
+                raise PermissionError(13, "Permission denied", str(path))
+            return real_write(path, data, *args, **kwargs)
+
+        m._req = refuse_then("task-cache-write", unwritable, lambda _: None)
+        logged, got, escaped = [], [], []
+        clock = [1000.0]
+        with mock.patch.object(m, "_log", logged.append), \
+                mock.patch.object(m, "_atomic_private_json", write_fails_once), \
+                mock.patch.object(m.time, "monotonic", lambda: clock[0]):
+            for _ in range(120):  # the failed pass starts a second bounded round on the cached room
+                try:
+                    got.append(m._guarded_result_body("task-cache-write", BODY))
+                except Exception as exc:  # noqa: BLE001 - what escaped is what the poll round sees
+                    escaped.append(exc)
+                clock[0] += 1.0
+        check(not escaped and failed_write == [1],
+              f"a failed cache write at the fifth refusal stays inside the scan (escaped: {escaped})")
+        check(any(b is None and "failed in its new room" in (r or "") for b, r in got),
+              "and keeps the result for the next pass")
+        check(bool(got) and got[-1][0] == "[no-send]" and not any("DROPPED" in line for line in logged),
+              "where it later settles, and nothing logs it as dropped")
+        check(record_of("task-cache-write").get("dm_room_id") == unwritable,
+              f"with the owner's review open in the new room ({sent[-3:]})")
     finally:
         for n, v in saved.items():
             setattr(m, n, v)

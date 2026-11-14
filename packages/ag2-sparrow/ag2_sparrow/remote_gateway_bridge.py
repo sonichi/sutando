@@ -828,8 +828,8 @@ def _forget_review_room() -> None:
 def _reroute_refused_review(artifact: Path, verdict, refused: int):
     """After the review room refused the agent ROOM_REFUSAL_ATTEMPTS times, send the same review once
     to a new private room. -> the verdict to settle on, or None to leave the result for the next pass."""
-    _forget_review_room()
     try:
+        _forget_review_room()
         if _route_withheld_review(artifact):
             _log(f"withheld review {artifact.stem}: the review room refused the agent {refused} times "
                  "(HTTP 403, not in the room); sent to a new private review room")
@@ -837,7 +837,7 @@ def _reroute_refused_review(artifact: Path, verdict, refused: int):
         return None
     except Exception as exc:  # noqa: BLE001 - runs inside the caller's except clause, past its catch-all
         if not (isinstance(exc, urllib.error.HTTPError) and room_refused_sender(exc)):
-            _log(f"withheld review {artifact.stem}: the new private review room failed: "
+            _log(f"withheld review {artifact.stem}: the re-route to a new private review room failed: "
                  f"{diagnostics.describe(exc)}; retried on the next pass")
             return None
     _log(f"withheld review {artifact.stem}: DROPPED, not delivered to the owner: the review room and a new "
