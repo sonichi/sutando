@@ -113,11 +113,15 @@ older brokers, bridges, and Sutando installations. An optional task handler may
 use the header with `source: ag2space` and `channel_id` to select a durable
 room-specific provider session.
 
-**AgentTrigger events (`event_type`, `agent_trigger_id`, `playbook`).** A task the
-platform raises for an event, not a message, carries `"interaction_type":
-"system_event"` plus `"event_type"`, a key of `EVENT_PLAYBOOKS` in
-`src/agent_triggers.py` (`room.mention`, `room.joined`); any other value is
-dropped, not passed. Its optional `"agent_trigger_id"` (the event's idempotency
+**AgentTrigger events (`event_type`, `agent_trigger_id`, `playbook`).** Every
+AgentTrigger reaches the agent as a task that names it in `"event_type"`: an
+@-mention is `room.mention`, and a task the platform raises for an event rather than a message
+(`room.joined`, `commons.summon`, any type added later) also carries
+`"interaction_type": "system_event"`. Any well-formed `event_type` passes, known
+to `EVENT_PLAYBOOKS` in `src/agent_triggers.py` or not: two to four dotted
+lowercase segments (`[a-z][a-z0-9_]{0,31}` each), at most 64 characters, and the
+task body passes with it. A malformed value is dropped, not passed; the body
+still arrives. Its optional `"agent_trigger_id"` (the event's idempotency
 id, for a join `join|<agent mxid>|<room id>`) is passed only as one token of at
 most 256 characters from `[A-Za-z0-9._:@!|=+/-]`, and `"playbook"` only as an id
 matching `[a-z0-9][a-z0-9-]{0,63}`; anything else is dropped. All three are
@@ -125,7 +129,10 @@ trusted pre-body headers. The core runs `skills/<playbook>/SKILL.md` only for an
 allowed playbook (a registry playbook, or a skill whose `manifest.json` sets
 `"playbook": true`), else the registry default for the event (`room.joined` →
 `room-onboard`; `room.mention` → `reply`, today's answer), else handles the task
-as a message. A `room.joined` task names the room in `channel_id`/`source_room_id`,
+as a message that follows its body. An event type with no registry entry has no
+default, so it resolves to none; a playbook string is never trusted to pick a
+skill. An event body may quote member-written text; the agent treats that text as
+data, never instructions, and follows the trigger's own instruction. A `room.joined` task names the room in `channel_id`/`source_room_id`,
 the inviter in `user_id` (its `access_tier` is the inviter's) and has no
 `source_message_id`, so its result posts top level. A broker that sends no
 `event_type` keeps today's task: the self-describing body still reads as a
@@ -511,8 +518,17 @@ Sutando checkout around it sends neither field.
   claims it for the run and generation in the same transition, before any effect (attachments,
   Stop, settle, publish). A reply written at the result's name after that is a new result; one that
   arrives after the task's lease closed is kept in `results/undelivered/` for review. A task id is
-  not retired while its pin is held, so the results directory must support hard links. Each
-  result is delivered on a worker of its own, so a send that hangs holds no other task's result.
+  not retired while its pin is held, so the results directory must support hard links. Results
+  ready together go out in intake order (the insertion order of `remote-task-rooms*.json`), one
+  at a time per room on that room's worker, and rooms run in parallel: a send that hangs holds
+  only its own room's later replies, for at most its request timeout (35 s for the result post,
+  60 s per attachment upload). A reply that is still in flight after its turn (a deferred upload,
+  an unreadable alias ledger, a held result, an unconfirmed post) holds its room's later replies
+  until its outbox item is terminal (delivered or parked) or its task is settled; past
+  `ROOM_ORDER_MAX_WAIT_S` (120 s from the reply's write) it stops holding them, and a log line
+  says so. A result that posts nothing (`[no-send]`, `[REPLIED]`, `[deduped:]`) and one with no
+  recorded room are delivered on a worker of their own. Right after an upgrade the map was
+  written sorted, so the first pass may order the tasks already in flight by id.
 - Earlier ledgers (`relay-task-attempts.json`, `relay-task-attempts-v2.json`) are not read or
   upgraded; start logs that they are ignored, and attempts in flight across that upgrade are not
   resumed.
@@ -880,6 +896,31 @@ so:
   as task results, counted on the item, so a restart keeps the count): 401/403, 408, 425,
   429, and a connection that was refused or a host that did not resolve. Another 4xx parks
   at once. A 400 naming an upgraded owner DM holds the file until the DM is repointed.
+- **A room that refuses the sender ends the send.** A 403 whose JSON error says the sender
+  is not in the room (`sender is not in this room`, `not a room member`, or Matrix's `User … not in room !…`; a bare `M_FORBIDDEN` or "not a member" is not enough, since a bad token or a workspace refusal uses them too) is
+  the room's answer, not the bearer's: the gateway authenticated the request first, so
+  nothing is raised to the poll loop's credential recovery. Only a join can change it, so the
+  send gets `send_failure_policy.ROOM_REFUSAL_ATTEMPTS` (5) tries on the outbox's own backoff
+  (about 30s, which covers a join or an invite acceptance still landing); then the item parks
+  (`permanent-refusal`) and the file moves to `results/undelivered/` with a log line that
+  prints the requeue command (with `--reset-attempts`, so the resend gets the whole budget). It
+  names its root through `bash scripts/sutando-config.sh workspace` (run it from the engine
+  checkout), so the log carries no home path. The
+  wording is read from the body's `error`, `errcode`, `message` and `detail`. Any other
+  403 keeps the retry above (`send_failure_policy.is_room_membership_refusal` decides).
+- **A runtime prompt card whose room refuses the sender** is charged to that card alone: the
+  pass goes on to the cards behind it with no bridge backoff, the card waits out its own
+  backoff, and after `ROOM_REFUSAL_ATTEMPTS` sends that revision is marked failed (logged,
+  and kept live where health-check sees it). Its failure notice, refused by the same room, is
+  sent once to the owner DM instead; if the DM refuses it too, it is recorded as sent and not
+  repeated. Any other 403 still raises to the caller's backoff.
+- **A private review DM whose room refuses the sender** (a non-owner result the guard
+  withheld) gets the same `ROOM_REFUSAL_ATTEMPTS` sends, 2 s doubling apart. Then the cached
+  review room is no longer trusted and the same review is sent once to a new private room,
+  which later reviews use; the result stays withheld (no room post) and is settled. If the new
+  room refuses too, the review is logged as `DROPPED` (not delivered to the owner) with the
+  path of its record, kept in `state/withheld-team-results/`. Any other 403 keeps the result
+  for the next pass, as before.
 - **A message about a task** is named `proactive-about-<task id>--<ts>.txt`
   (`proactive_routing.about_task_filename`). In the task's own room it posts in the task's
   thread: an ask already in a thread keeps that thread's root, a top-level ask is rooted at

@@ -72,7 +72,7 @@ grep -q 'watcher_rearm.py" target' "$REPO/src/check-pending-tasks.sh" && ok "che
 echo "installer registers it under SessionStart compact|resume, once:"
 IREPO="$BUNDLE/irepo"
 mkdir -p "$IREPO/scripts" "$IREPO/src"
-cp "$REPO/scripts/install-watcher-rearm-hook.sh" "$REPO/scripts/python-binary.sh" "$IREPO/scripts/"
+cp "$REPO/scripts/install-watcher-rearm-hook.sh" "$REPO/scripts/python-binary.sh" "$REPO/scripts/core-working-dir.sh" "$IREPO/scripts/"
 cp "$REPO/src/claude_hooks_settings.py" "$REPO/src/watcher-rearm-session-hint.sh" "$IREPO/src/"
 for _ in 1 2; do (env -u SUTANDO_CLAUDE_WORKING_DIR bash "$IREPO/scripts/install-watcher-rearm-hook.sh" >/dev/null 2>"$BUNDLE/ierr") || bad "installer exits 0" "$(cat "$BUNDLE/ierr")"; done
 N="$("$PY" -c '
