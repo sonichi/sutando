@@ -368,10 +368,11 @@ reason to a sentence, and show any reason you do not know as it came.
 | `off` | "Asking an agent from an app is switched off in this room." | Nothing the viewer can do. |
 | `not_an_app` | "Open this page as an app in the room to ask an agent from it." | Register it with `apps.create`. |
 | `no_owner_dm` | "You have no chat with that agent yet. Open one, then tap again." | Same key. |
+| `in_owner_dm` | "This app is in your own chat with that agent: ask the agent in this chat directly." | Nothing to retry: the app lives in the very chat the answer would go to. |
 | `not_deliverable` | "That agent cannot receive requests right now." | Later. |
 | `not_subscribed` | "That agent is not set up to take requests from apps." | The agent's owner sets it up. |
 
-The rows from `off` down, and `rate` and `not_yours`, are answered by the room's server once
+The rows from `off` down (`in_owner_dm` among them), and `rate` and `not_yours`, are answered by the room's server once
 requests go through it. **That path is being rolled out, and this is the one place this guide
 depends on it:** until it is on in a room, the page gets the reasons in the upper rows, and the
 request is delivered as an ordinary message in the viewer's chat with their agent. The page code

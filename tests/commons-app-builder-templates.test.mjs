@@ -1738,6 +1738,7 @@ for (const [reason, shown] of [
   ['off', /switched off in this room/],
   ['not_an_app', /Open this page as an app/],
   ['no_owner_dm', /no chat with that agent yet/],
+  ['in_owner_dm', /ask the agent in this chat directly/],
   ['not_deliverable', /cannot receive requests right now/],
   ['too many agent requests', /Too many requests just now/],
   ['agent not owned or unavailable', /not yours to ask from here/],
