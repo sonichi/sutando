@@ -43,6 +43,7 @@ Machine-readable ownership and lifecycle metadata lives in
 
 - [PR-watch runner lifecycle](pr-watch-lifecycle.md) — thread and process draining, shutdown limits, and isolated verification.
 - [Recovery issue metrics](recovery-issue-metrics.md) — persistent issue IDs and recovery-rate definitions.
+- [Incident 2026-11-14: orphaned busy-loops stall the core](incidents/2026-11-14-orphaned-busy-loops.md) — cause, impact, resolution, prevention, and a high-load runbook.
 
 - [Release process and migrations](release-process.md)
 - [Workspace sync across machines](workspace-sync.md)
