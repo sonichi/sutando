@@ -902,8 +902,15 @@ so:
   nothing is raised to the poll loop's credential recovery. Only a join can change it, so the
   send gets `send_failure_policy.ROOM_REFUSAL_ATTEMPTS` (5) tries on the outbox's own backoff
   (about 30s, which covers a join or an invite acceptance still landing); then the item parks
-  (`permanent-refusal`) and the file moves to `results/undelivered/` with a log line. Any other
+  (`permanent-refusal`) and the file moves to `results/undelivered/` with a log line that
+  prints the requeue command (with `--reset-attempts`, so the resend gets the whole budget). The
+  wording is read from the body's `error`, `errcode`, `message` and `detail`. Any other
   403 keeps the retry above (`send_failure_policy.is_room_membership_refusal` decides).
+- **A runtime prompt card whose room refuses the sender** is charged to that card alone: the
+  pass goes on to the cards behind it with no bridge backoff, the card waits out its own
+  backoff, and after `ROOM_REFUSAL_ATTEMPTS` sends that revision is marked failed (logged,
+  and kept live where health-check sees it). Its failure notice, refused by the same room, is
+  recorded as sent and not repeated. Any other 403 still raises to the caller's backoff.
 - **A private review DM whose room refuses the sender** (a non-owner result the guard
   withheld) gets the same `ROOM_REFUSAL_ATTEMPTS` sends, 2 s doubling apart. Then the cached
   review room is no longer trusted and the same review is sent once to a new private room,
