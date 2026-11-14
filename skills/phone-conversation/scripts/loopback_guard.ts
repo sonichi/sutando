@@ -1,17 +1,7 @@
 // Loopback-only access guard for the phone-conversation HTTP server.
 //
-// The server binds to `0.0.0.0` to accommodate ngrok's local-tunnel
-// client + the Twilio webhook path. That makes every endpoint LAN-
-// reachable. /twilio/* paths validate Twilio's signature; the rest are
-// internal control endpoints (originate calls, hang up, play audio,
-// etc.) that should never be exposed to the LAN.
-//
-// `isLoopback(req)` is the one-line predicate used by the request
-// handler to gate non-/twilio control endpoints. Extracted to its own
-// module so we can unit-test the predicate without loading
-// conversation-server.ts (which has heavy module-load side effects:
-// Gemini SDK init, Twilio client, env validation that `exit(1)`s when
-// credentials are missing).
+// Loopback control requests must not arrive through a forwarding tunnel.
+// Kept separate from the phone server to avoid its module-load side effects.
 
 import type { IncomingMessage } from 'node:http';
 
@@ -28,4 +18,24 @@ import type { IncomingMessage } from 'node:http';
 export function isLoopback(req: IncomingMessage): boolean {
 	const addr = req.socket.remoteAddress ?? '';
 	return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+}
+
+export function isForwarded(req: IncomingMessage): boolean {
+	return [
+		'x-forwarded-for',
+		'x-forwarded-host',
+		'x-forwarded-proto',
+		'forwarded',
+		'x-real-ip',
+		'tailscale-funnel-request',
+		'cf-connecting-ip',
+		'true-client-ip',
+		'x-forwarded-server',
+		'x-original-forwarded-for',
+		'via',
+	].some(header => req.headers[header] !== undefined);
+}
+
+export function isDirectLoopback(req: IncomingMessage): boolean {
+	return isLoopback(req) && !isForwarded(req);
 }
