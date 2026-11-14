@@ -379,6 +379,9 @@ test('restart continuity: the projection cooldown survives a save and restore, m
 	live = { ...live, ...fiveHourTier(live, 0.70, t, 0.03, false, clear, pc, now) };
 	assert.strictEqual(restored.tier, 2, 'cooldown elapsed: one level back');
 	assert.strictEqual(restored.tier, live.tier, 'same as the uninterrupted control');
+	const quiet = withWin({ ...w0, ...fiveHourTier(w0, 0.10, t, 0.03, false, clear, pc, T0) });
+	const quieter = withWin({ ...quiet.windows['5h'], ...fiveHourTier(quiet.windows['5h'], 0.11, t, 0.03, false, clear, pc, T0 + 1000) });
+	assert.strictEqual(persistedStateChanged(quiet, quieter), false, 'at tier 1 a clearing sample writes nothing');
 });
 
 test('history rows seed the samples: seconds → ms, foreign/old rows skipped, oldest first', () => {

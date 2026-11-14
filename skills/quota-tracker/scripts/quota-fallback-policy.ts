@@ -426,11 +426,11 @@ export function stateChanged(a: FallbackState | null, b: FallbackState): boolean
 		|| (a.runtime_switch?.to ?? null) !== (b.runtime_switch?.to ?? null);
 }
 
-/** Everything a reader of `fallback` decides from, the restarted proxy included
- *  (fiveHourTier's cooldown inputs); utilization, projection and eta are left out. */
+/** Everything a reader of `fallback` decides from, the restarted proxy included.
+ *  clear_count counts only above tier 1, or every primary-tier response would write. */
 function persistedView(s: FallbackState): string {
 	const w = (x: WindowState | undefined) => [x?.tier ?? null, x?.low_tier ?? null, x?.reset ?? null,
-		x?.last_fail_at ?? null, x?.clear_count ?? null, x?.tier_since ?? null];
+		x?.last_fail_at ?? null, (x?.tier ?? 1) > 1 ? x?.clear_count ?? null : null, x?.tier_since ?? null];
 	const f = s.fired ? [s.fired.window, s.fired.key, s.fired.threshold] : null;
 	const map = Object.entries(s.active_model_map ?? {}).sort(([x], [y]) => x.localeCompare(y));
 	return JSON.stringify([s.tier, s.low_priority_tier, s.runtime_switch?.to ?? null, s.reason, f, map,
