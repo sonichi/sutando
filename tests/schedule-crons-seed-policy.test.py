@@ -11,6 +11,7 @@ Run: python3 tests/schedule-crons-seed-policy.test.py
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import re
 import shutil
@@ -135,7 +136,7 @@ class SeedPolicy(unittest.TestCase):
         self.assertIn(f"kept at {kept_dir / 'crons.legacy.json'}", out)
         self.assertEqual(sorted(p.name for p in kept_dir.glob("crons.legacy*")), ["crons.legacy.json"])
 
-    def test_a_failed_backup_still_tells_the_owner(self):
+    def test_an_unusable_backup_name_is_skipped_not_reported(self):
         kept_dir = self.ws / "hosts" / "h1"
         (kept_dir / "crons.legacy.json").mkdir(parents=True)
         self.target.write_text('[{"name":"mine"}]')
@@ -143,7 +144,8 @@ class SeedPolicy(unittest.TestCase):
         self.target.unlink()
         out = self._seed_with_an_owner_legacy_job()
         self.assertIn(f"restored {self.target}", out)
-        self.assertIn(f"not-enabled my-report kept at {self.legacy.resolve()}", out)
+        self.assertIn(f"not-enabled my-report kept at {kept_dir / 'crons.legacy.1.json'}", out)
+        self.assertIn("my-report", (kept_dir / "crons.legacy.1.json").read_text())
         self.run_step1()
         self._age_notice(2 * 86400)
         self.assertIn("not-enabled my-report", self.run_step1())
@@ -233,8 +235,164 @@ class SeedPolicy(unittest.TestCase):
         for n in range(1, 40):
             (kept_dir / f"crons.legacy.{n}.json").write_text("[]")
         out = self._seed_with_an_owner_legacy_job()
-        self.assertIn(f"not-enabled my-report kept at {self.legacy.resolve()}", out)
+        latest = kept_dir / "crons.legacy.latest.json"
+        self.assertIn(f"not-enabled my-report kept at {latest}", out)
+        self.assertIn("my-report", latest.read_text())
         self.assertFalse((kept_dir / "crons.legacy.40.json").exists())
+
+    def _seeder(self):
+        spec = importlib.util.spec_from_file_location(
+            f"seed_crons_{id(self)}", self.repo / "skills" / "schedule-crons" / "scripts" / "seed_crons.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _seed_in_process(self, mod):
+        return mod.seed(self.ws, "h1", self.repo / "skills" / "schedule-crons")
+
+    def _owner_job(self) -> dict:
+        own = {"name": "my-report", "cron": "0 9 * * *", "prompt": "x"}
+        self.legacy.write_text(json.dumps([own]))
+        return own
+
+    def test_the_backup_is_saved_before_the_schedule_is_published(self):
+        own = self._owner_job()
+        mod = self._seeder()
+        real = mod._publish
+
+        def crash_after_target(path, content):
+            published = real(path, content)
+            if path == self.target:
+                raise KeyboardInterrupt("crash after the schedule is published")
+            return published
+        mod._publish = crash_after_target
+        with self.assertRaises(KeyboardInterrupt):
+            self._seed_in_process(mod)
+        backups = list((self.ws / "hosts" / "h1").glob("crons.legacy*.json"))
+        self.assertTrue(backups and any(own in json.loads(b.read_text()) for b in backups), backups)
+        self.assertIn("not-enabled my-report kept at", self.run_step1())
+
+    def test_an_unsaved_backup_is_retried_while_its_notice_is_pending(self):
+        own = self._owner_job()
+        mod = self._seeder()
+        real = mod.keep_legacy
+
+        def fails(*_a):
+            raise OSError("disk full")
+        mod.keep_legacy = fails
+        self._seed_in_process(mod)
+        mod.keep_legacy = real
+        out = self.run_step1()
+        kept = self.ws / "hosts" / "h1" / "crons.legacy.json"
+        self.assertIn(own, json.loads(kept.read_text()))
+        rec = json.loads(self._notice_record().read_text())
+        self.assertEqual([n["line"] for n in rec["notices"]], [f"not-enabled my-report kept at {kept}"])
+        self.assertIn("not-enabled my-report kept at", out)
+
+    def test_an_unsaved_backup_says_where_the_only_copy_is(self):
+        self._owner_job()
+        mod = self._seeder()
+
+        def fails(*_a):
+            raise OSError("disk full")
+        mod.keep_legacy = fails
+        self._seed_in_process(mod)
+        line = json.loads(self._notice_record().read_text())["notices"][0]["line"]
+        self.assertIn("only at", line)
+        self.assertIn("an app update replaces it", line)
+
+    def test_a_losing_seeder_never_removes_the_winners_notices(self):
+        self._owner_job()
+        winner, loser = self._seeder(), self._seeder()
+        real = loser._publish
+
+        def lose(path, content):
+            if path == self.target:
+                self._seed_in_process(winner)
+                return real(path, content)
+            return real(path, content)
+        loser._publish = lose
+        self.assertEqual(self._seed_in_process(loser)[0], "exists")
+        lines = [n["line"] for n in json.loads(self._notice_record().read_text())["notices"]]
+        self.assertTrue(any(x.startswith("not-enabled my-report") for x in lines), lines)
+        self.assertEqual(len(self._queued_dms()), 0)
+        self.run_step1()
+        self.assertEqual(len(self._queued_dms()), 1)
+
+    def test_a_seed_that_loses_to_the_owner_withdraws_its_notices(self):
+        self._owner_job()
+        mod = self._seeder()
+        real = mod._publish
+
+        def owner_first(path, content):
+            if path == self.target:
+                self.target.write_text('[{"name":"mine"}]')
+            return real(path, content)
+        mod._publish = owner_first
+        self.assertEqual(self._seed_in_process(mod)[0], "exists")
+        self.assertFalse(self._notice_record().exists())
+
+    def test_seeder_runs_on_one_host_are_serialized(self):
+        import fcntl
+        host = self.ws / "hosts" / "h1"
+        host.mkdir(parents=True)
+        with open(host / ".crons-seed.lock", "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                subprocess.run(["bash", "-c", step1_command()], cwd=self.repo, capture_output=True,
+                               text=True, timeout=2)
+        self.assertFalse(self.target.exists())
+        self.run_step1()
+        self.assertTrue(self.target.exists())
+
+    def test_notice_sent_keeps_notices_never_shown(self):
+        self._owner_job()
+        self._seed_in_process(self._seeder())
+        ack = subprocess.run(["python3", "skills/schedule-crons/scripts/seed_crons.py", "--notice-sent"],
+                             cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(ack.returncode, 0, ack.stderr)
+        self.assertIn("not-enabled my-report", self.run_step1())
+
+    def test_a_failed_owner_dm_enqueue_is_reported(self):
+        (self.ws / "results").write_text("not a directory")
+        self._owner_job()
+        out = subprocess.run(["bash", "-c", step1_command()], cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("could not queue the owner DM", out.stderr)
+
+    def test_the_same_notice_is_merged_not_repeated(self):
+        self.assertIn("not-enabled my-report", self._seed_with_an_owner_legacy_job())
+        (self.ws / "hosts" / "h1" / "crons.legacy.json").write_text("[]")
+        self.target.unlink()
+        self.run_step1()
+        lines = [n["line"] for n in json.loads(self._notice_record().read_text())["notices"]]
+        self.assertEqual(sum(x.startswith("not-enabled my-report") for x in lines), 1, lines)
+
+    def test_unreadable_records_past_the_cap_do_not_block_the_seed(self):
+        host = self.ws / "hosts" / "h1"
+        host.mkdir(parents=True)
+        (host / "crons-notice.bad.json").write_text("x")
+        for n in range(1, 21):
+            (host / f"crons-notice.bad.{n}.json").write_text("x")
+        self._notice_record().write_text("{broken")
+        out = subprocess.run(["bash", "-c", step1_command()], cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(self.target.exists())
+        self.assertIn(f"notice-record-unreadable kept at {host / 'crons-notice.bad.latest.json'}", out.stdout)
+
+    def test_a_record_of_the_wrong_shape_is_reported(self):
+        self.target.parent.mkdir(parents=True)
+        self.target.write_text('[{"name":"mine"}]')
+        self._notice_record().write_text('{"notices": {"oops": 1}}')
+        self.assertIn("notice-record-unreadable kept at", self.run_step1())
+
+    def test_a_record_in_the_earlier_format_is_migrated(self):
+        self.target.parent.mkdir(parents=True)
+        self.target.write_text('[{"name":"mine"}]')
+        kept = self.ws / "hosts" / "h1" / "crons.legacy.json"
+        self._notice_record().write_text(json.dumps({"lines": [f"not-enabled my-report kept at {kept}"]}))
+        self.assertIn(f"not-enabled my-report kept at {kept}", self.run_step1())
+        self.assertEqual(len(self._queued_dms()), 1)
 
     def test_a_failed_notice_write_commits_nothing_and_a_retry_regenerates_it(self):
         self._notice_record().mkdir(parents=True)
