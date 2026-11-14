@@ -24,9 +24,10 @@ def _result(ok, *, rooms=None, rooms_detailed=None, reason=None):
             "reason": reason}
 
 
-def joined_rooms(agent_mxid=None):
-    """→ {ok, rooms, rooms_detailed, reason} via op `joined_rooms` (#184)."""
-    base, headers = gateway()
+def joined_rooms(agent_mxid=None, via_room=None):
+    """→ {ok, rooms, rooms_detailed, reason} via op `joined_rooms` (#184), on the connection
+    serving `via_room`'s server (the primary when None)."""
+    base, headers = gateway(via_room)
     if not base:
         return _result(False, reason="no gateway configured")
     try:

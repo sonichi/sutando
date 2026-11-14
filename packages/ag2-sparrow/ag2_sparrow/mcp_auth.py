@@ -23,14 +23,13 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Tuple
 
-from . import gateway_instance
+from . import gateway_instance, mcp_discovery
 
-DISCOVERY_PATH = "/v1/mcp/discovery"
+DISCOVERY_PATH = mcp_discovery.DISCOVERY_PATH
 # Claude Code gives a headersHelper 10 s in all: the bridge import (~1.5 s) plus two calls fit.
 HTTP_TIMEOUT_S = 3
 USER_AGENT = "sutando-gateway-client/1.0"
 SERVER_NAME = "ag2-space"
-_LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 
 Gateway = Tuple[str, str, str]  # (relay URL, bearer, the .env file that supplied it or "")
 
@@ -47,14 +46,10 @@ def resolve_gateway() -> Gateway:
 
 def _safe_url(field: str, value: object) -> str:
     # The bearer is sent to mint_url: only TLS, or plain http to this machine.
-    if not isinstance(value, str) or not value:
-        raise McpAuthError(f"discovery answered without {field}")
-    parsed = urllib.parse.urlsplit(value)
-    if parsed.scheme == "https" and parsed.hostname:
-        return value
-    if parsed.scheme == "http" and (parsed.hostname or "") in _LOOPBACK:
-        return value
-    raise McpAuthError(f"{field} must be https (or http to loopback): {parsed.scheme}://{parsed.hostname}")
+    try:
+        return mcp_discovery.safe_url(field, value)
+    except mcp_discovery.DiscoveryRefused as exc:
+        raise McpAuthError(str(exc)) from None
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -89,19 +84,16 @@ def _call(method: str, url: str, bearer: str, gateway_url: str = "") -> Tuple[in
 
 
 def discover(relay_url: str, bearer: str) -> Tuple[str, str]:
-    from .remote_gateway_bridge import AGENT_ACCESS_MINT_PATH, _same_origin
     _safe_url("the relay URL", relay_url)  # the bearer goes to discovery first: same rule as mint_url
     status, body = _call("GET", relay_url.rstrip("/") + DISCOVERY_PATH, bearer, relay_url)
     if status != 200:
         detail = body.get("error") or "no detail"
         raise McpAuthError(f"MCP discovery answered {status} ({detail})")
-    mint_url = _safe_url("mint_url", body.get("mint_url"))
-    # The relay secret goes only to the relay's own origin, as the bridge's own mint does.
-    if not _same_origin(mint_url, relay_url):
-        raise McpAuthError("mint_url is not on the relay's origin; the relay token is not sent there")
-    if urllib.parse.urlsplit(mint_url).path != AGENT_ACCESS_MINT_PATH:
-        raise McpAuthError(f"mint_url is not the relay's {AGENT_ACCESS_MINT_PATH}; the relay token is not sent there")
-    return mint_url, _safe_url("mcp_url", body.get("mcp_url"))
+    try:
+        return (mcp_discovery.mint_url(relay_url, body.get("mint_url")),
+                mcp_discovery.mcp_url(relay_url, body.get("mcp_url")))
+    except mcp_discovery.DiscoveryRefused as exc:
+        raise McpAuthError(str(exc)) from None
 
 
 def mint(mint_url: str, bearer: str) -> str:
