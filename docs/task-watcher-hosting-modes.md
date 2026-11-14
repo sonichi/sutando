@@ -198,6 +198,16 @@ the `Monitor`. The Mod checks the same floor itself.
   so an inbox full of answered pointers costs the startup sweep once and the catch-up passes nothing.
   Already-dispatched and already-answered entries are refused by the same dedupe the event path uses.
   A dead fswatch is the relaunch budget's case, above, not this one.
+  A session watcher that is starting proves events flow before it stamps the sentinel. When no
+  readiness probe comes back through a live fswatch on its default monitor, the watcher relaunches
+  fswatch once with `poll_monitor`, which stats the inbox itself and needs no kernel event service,
+  and then runs the probe again, counting only that round's probe. Its later relaunches keep that
+  monitor. A fswatch that does not stop within 2 s of TERM is killed, so a wedged monitor cannot hold
+  the start lock. `poll_monitor` stats the whole inbox every 0.5 s, so a large inbox costs more CPU
+  under it than under an event monitor. `SUTANDO_FSWATCH_MONITOR`
+  (any name `fswatch -M` lists) picks the monitor for every launch, by both the session and standby
+  watchers. A watcher given a monitor this way never swaps it for another; if that monitor fails its
+  probe, the watcher exits 1 and its message names the monitor.
 - **Watchers started before the tag was required** (`SUTANDO_WATCHER_CMD <inbox>` on hosts whose
   worker boot skill predated the tagged form) keep running and read as `untagged` holders until
   their session restarts; a new untagged start is refused. The rule (owner, 2026-09-22): every start
