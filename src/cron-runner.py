@@ -369,6 +369,29 @@ def due_since(expr: str, last_epoch: int, now_epoch: int) -> bool:
 
 def local_core_alive(now_epoch: Optional[int] = None) -> bool:
     """Whether this host's core heartbeat is fresh enough to accept work."""
+    if os.name == 'nt':
+        import ntpath
+        import shlex
+        from sutando_platform import process_snapshot
+        try:
+            pid = int((WORKSPACE / 'state' / 'task-dispatcher.pid').read_text().strip())
+        except (OSError, ValueError):
+            return False
+        snapshot = process_snapshot()
+        expected = os.path.normcase(str(REPO_ROOT / 'src' / 'task-dispatcher.ps1'))
+        for row in (snapshot or '').splitlines():
+            fields = row.split(None, 2)
+            if len(fields) != 3 or fields[0] != str(pid):
+                continue
+            try:
+                argv = [arg.strip('"') for arg in shlex.split(fields[2], posix=False)]
+                index = [arg.lower() for arg in argv].index('-file')
+                executable = ntpath.basename(argv[0]).lower()
+                return (executable in ('pwsh.exe', 'powershell.exe') and
+                        os.path.normcase(argv[index + 1]) == expected)
+            except (ValueError, IndexError):
+                return False
+        return False
     now_epoch = float(time.time() if now_epoch is None else now_epoch)
     try:
         age = now_epoch - CORE_ALIVE_FILE.stat().st_mtime
@@ -379,6 +402,8 @@ def local_core_alive(now_epoch: Optional[int] = None) -> bool:
 
 def _core_alive_reason(now_epoch: float) -> str:
     """Why local_core_alive() said no, for the hold record and the log line."""
+    if os.name == 'nt':
+        return 'this installation has no verified Windows task dispatcher'
     try:
         age = now_epoch - CORE_ALIVE_FILE.stat().st_mtime
     except OSError:
