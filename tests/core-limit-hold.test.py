@@ -65,6 +65,13 @@ def limited_record(now: float, *, reset_in: float = 3600, rejected: bool = True,
     }
 
 
+def unattributed_429(now: float, ago: float = 1) -> dict:
+    """A 429 the record's headers do not speak for: no provider status came with it."""
+    rec = limited_record(now, rejected=False, ago=ago)
+    del rec["headers"]["anthropic-ratelimit-unified-status"]
+    return rec
+
+
 def owner_task(tasks: Path, name: str, body: str, tier: str = "owner",
                stamp: str = "2099-01-01T00:00:00Z") -> Path:
     path = tasks / f"{name}.txt"
@@ -131,8 +138,7 @@ class Decide(unittest.TestCase):
 
     def test_no_reset_backs_off_and_grows_only_on_new_evidence(self):
         now = 1_800_000_000.0
-        rec = limited_record(now, rejected=False, ago=1)  # a 429 with no rejected window
-        rec["last_checked"] = iso(now - 1)
+        rec = unattributed_429(now)  # a 429 the provider's headers say nothing of
         d = clh.decide(self.ws, now, quota=rec)
         self.assertFalse(d.launch)
         self.assertEqual(d.hold["until"], now + clh.BACKOFF_BASE_S)
@@ -140,7 +146,7 @@ class Decide(unittest.TestCase):
         t = now + clh.BACKOFF_BASE_S + 1
         self.assertTrue(clh.decide(self.ws, t, quota=rec).launch)
         # The relaunched core is refused again: a fresh 429, a longer hold.
-        rec2 = limited_record(t + 30, rejected=False, ago=1)
+        rec2 = unattributed_429(t + 30)
         d = clh.decide(self.ws, t + 30, quota=rec2)
         self.assertFalse(d.launch)
         self.assertEqual(d.hold["strikes"], 2)
@@ -149,7 +155,7 @@ class Decide(unittest.TestCase):
         t2 = d.hold["until"] + 1
         self.assertTrue(clh.decide(self.ws, t2, quota=rec2).launch)
         later = t2 + clh.BACKOFF_BASE_S + 60
-        d = clh.decide(self.ws, later, quota=limited_record(later, rejected=False, ago=1))
+        d = clh.decide(self.ws, later, quota=unattributed_429(later))
         self.assertEqual(d.hold["strikes"], 1)
         self.assertEqual(d.hold["until"], later + clh.BACKOFF_BASE_S)
 
@@ -747,6 +753,98 @@ class AccountChange(unittest.TestCase):
         self.assertIsNone(clh.active_hold(self.ws))
         self.assertEqual(self.gate(), 0, "the old account's evidence re-armed the hold")
 
+    def test_a_limit_hit_before_any_hold_is_not_pinned_on_the_account_signed_in_next(self):
+        """The owner's report: account A ran with no hold on record, hit its limit and the core
+        died; the owner signed in to account B before the next launch. The gate had never
+        written A down, so it saw no switch, read A's refusal as B's, and held B until A's
+        reset, days away. B was at 13% of its limit."""
+        quota = self.ws / "state" / "quota-state.json"
+        quota.unlink()
+        self.sign_in("acct-a", "a@example.com")
+        self.assertEqual(self.gate(), 0, "account A launches with nothing against it")
+        record = clh.read_hold(self.ws)
+        self.assertEqual((record["status"], record["account"]), ("none", clh.account_fingerprint(str(self.cfg))),
+                         "a launch with no hold must still leave its account on record")
+        self.assertIsNone(clh.active_hold(self.ws))
+        self.assertIsNone(clh.binding_hold(self.ws))
+        quota.write_text(json.dumps(limited_record(time.time())))     # A is refused; the core dies
+        self.sign_in("acct-b", "b@example.com")                       # the owner signs in to B
+        self.assertEqual(self.gate(), 0, "account A's limit held account B, which had quota")
+        self.assertIsNone(clh.active_hold(self.ws))
+        self.assertEqual(clh.read_hold(self.ws)["account"], clh.account_fingerprint(str(self.cfg)))
+        self.assertEqual(self.gate(), 0, "account A's old evidence re-armed a hold on account B")
+
+    def test_the_same_account_is_still_held_by_its_own_first_limit(self):
+        quota = self.ws / "state" / "quota-state.json"
+        quota.unlink()
+        self.sign_in("acct-a", "a@example.com")
+        self.assertEqual(self.gate(), 0)
+        quota.write_text(json.dumps(limited_record(time.time())))
+        self.assertEqual(self.gate(), clh.HOLD_EXIT, "the account that hit the limit is the one held")
+        self.assertEqual(clh.read_hold(self.ws)["account"], clh.account_fingerprint(str(self.cfg)))
+
+    def test_a_legacy_hold_without_an_account_is_not_claimed_by_the_account_launching_now(self):
+        """A record written before accounts were recorded carries none. The account launching
+        now may already be the new one, so it must not be stamped onto that record: the old
+        limit would become this account's."""
+        t = self.now
+        clh._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "model": None,
+                                  "evidence_at": t - 30, "set_at": t - 20, "until": t - 1, "strikes": 1,
+                                  "reason": "core paused: usage limit on its model, retrying later",
+                                  "notice": "legacy.txt", "notice_queued": True})
+        launched = clh.decide(self.ws, t, quota=limited_record(t, ago=30), launch_account="B")
+        self.assertTrue(launched.launch, "an expired legacy hold with unchanged evidence lets the core out")
+        record = clh.read_hold(self.ws)
+        self.assertEqual(record["status"], "released")
+        self.assertNotIn("account", record, "the launch account was stamped onto a legacy hold")
+        # In force, it still binds whoever launches (an unknown side keeps it binding) and stays unclaimed.
+        clh._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "model": None,
+                                  "evidence_at": t - 30, "set_at": t - 20, "until": t + 600, "strikes": 1,
+                                  "reason": "core paused: usage limit on its model, retrying later",
+                                  "notice": "legacy.txt", "notice_queued": True})
+        self.assertFalse(clh.decide(self.ws, t, quota=limited_record(t, ago=30), launch_account="B").launch)
+        self.assertNotIn("account", clh.read_hold(self.ws))
+
+    def test_the_launch_that_expires_a_legacy_hold_is_remembered_so_the_next_switch_is_seen(self):
+        """A expires a legacy hold (no account on it) and launches; A is then refused and the
+        owner signs in to B. The record must remember that A launched, or A's refusal holds B."""
+        legacy = {"status": "held", "kind": "usage-limit", "model": None, "strikes": 1,
+                  "reason": "core paused: usage limit on its model, retrying later",
+                  "notice": "legacy.txt", "notice_queued": True}
+        for next_account, launches in (("B", True), ("A", False)):
+            with self.subTest(next_account=next_account):
+                t = time.time() + 5000
+                clh._write_hold(self.ws, dict(legacy, evidence_at=t - 30, set_at=t - 20, until=t - 1))
+                self.assertTrue(clh.decide(self.ws, t, quota=limited_record(t, ago=30), launch_account="A").launch)
+                record = clh.read_hold(self.ws)
+                self.assertNotIn("account", record, "the old limit was pinned on the account that outlived it")
+                self.assertEqual(record["launch_account"], "A")
+                # A is refused ten seconds before the next launch.
+                after = clh.decide(self.ws, t + 20, quota=limited_record(t + 20, ago=10), launch_account=next_account)
+                self.assertEqual(after.launch, launches,
+                                 "account A's refusal held account B" if launches else "account A's own refusal did not hold it")
+
+    def test_a_released_or_cleared_record_without_an_account_still_learns_the_launch_account(self):
+        """A record left by an earlier hold (released by the gate, or cleared by the owner) from
+        before accounts were recorded carries none. The next launch must write its account down,
+        or the report repeats: A hits its limit, the owner signs in to B, and B is held."""
+        for status in ("released", "cleared"):
+            with self.subTest(status=status):
+                t = time.time() + 1000
+                clh._write_hold(self.ws, {"status": status, "kind": "usage-limit", "model": None,
+                                          "evidence_at": t - 900, "set_at": t - 890, "until": t - 600,
+                                          "released_at": t - 600, "strikes": 1,
+                                          "reason": "core paused: usage limit on its model, retrying later"})
+                first = clh.decide(self.ws, t, quota=limited_record(t, ago=900), launch_account="A")
+                self.assertTrue(first.launch, "account A launches: the old evidence is already on record")
+                self.assertEqual(clh.read_hold(self.ws)["account"], "A",
+                                 f"a {status} record with no account did not learn the launch account")
+                # A is refused ten seconds later and the core dies; the owner signs in to B.
+                switched = clh.decide(self.ws, t + 20, quota=limited_record(t + 20, ago=10), launch_account="B")
+                self.assertTrue(switched.launch, f"after a {status} record, account A's limit held account B")
+                self.assertEqual(clh.read_hold(self.ws)["account"], "B")
+                self.assertIsNone(clh.active_hold(self.ws, t + 21))
+
     def test_unreadable_account_keeps_the_hold(self):
         self.sign_in("acct-a", "a@example.com")
         self.assertEqual(self.gate(), clh.HOLD_EXIT)
@@ -1018,6 +1116,39 @@ class ModelSwitchWayOut(unittest.TestCase):
         self.assertIsNone(clh.binding_hold(self.ws, self.now + 1))
         self.assertIsNotNone(clh.active_hold(self.ws, self.now + 1), "the record itself stays")
 
+    def test_watchdog_reads_the_seat_the_launcher_resolves_without_its_env(self):
+        """Sutando.app runs health-check without CLAUDE_CONFIG_DIR; the gate reads the resolved
+        seat's settings.json, so the watchdog must too, or it revives a core the gate holds."""
+        import os
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("hc_6293_seat", str(REPO / "src" / "health-check.py"))
+        hc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hc)
+        seat = self.ws / ".claude-sutando"
+        seat.mkdir()
+        self.pick("sonnet")  # a stale record: the model was changed outside switch-model
+        (seat / "settings.json").write_text(json.dumps({"model": "opus"}))
+        env = {"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(self.ws)}
+        with mock.patch.dict(os.environ, env), mock.patch.object(hc, "WORKSPACE_DIR", self.ws):
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            self.assertIsNotNone(hc._core_limit_hold(self.now + 1),
+                                 "the watchdog would revive a core the launcher gate holds (exit 75)")
+            self.assertEqual(clh.launch_identity(self.ws)[0], "opus")
+            (seat / "settings.json").write_text(json.dumps({"model": "sonnet"}))
+            self.pick("opus")
+            self.assertIsNone(hc._core_limit_hold(self.now + 1), "a seat switched away is revived")
+
+    def test_an_unresolvable_seat_falls_back_to_the_model_switch_record(self):
+        import os
+        from unittest import mock
+        import sutando_config
+        self.pick("sonnet")
+        with mock.patch.object(sutando_config, "resolve_claude_sutando_config_dir",
+                               side_effect=ValueError("both config fields set")), \
+                mock.patch.dict(os.environ, {}):
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            self.assertEqual(clh.launch_identity(self.ws), ("sonnet", None))
+
     def test_health_check_revives_a_core_switched_away_from_the_hold(self):
         from unittest import mock
         spec = importlib.util.spec_from_file_location("hc_6291", str(REPO / "src" / "health-check.py"))
@@ -1076,6 +1207,24 @@ class ModelSwitchWayOut(unittest.TestCase):
                                             card_entry=str(entry)).launch)
             self.assertFalse(clh.read_hold(ws)["card_presented"], "a failed card never stops the hold")
             self.assertTrue(clh.read_hold(ws)["notice_queued"])
+
+    def test_card_outlives_no_part_of_a_hold_6_to_24h_long(self):
+        """A reset 6-24h away holds until reset + grace; notice_queued stops a re-present, so
+        a card capped at 6h left the owner without one for the rest of the pause."""
+        from unittest import mock
+        entry = self.ws / "local-card.py"
+        entry.write_text("")
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "state").mkdir()
+            with mock.patch("subprocess.Popen") as popen:
+                d = clh.decide(ws, self.now, quota=limited_record(self.now, reset_in=20 * 3600),
+                               card_entry=str(entry))
+            self.assertFalse(d.launch)
+            argv = popen.call_args[0][0]
+            ttl = int(argv[argv.index("--ttl") + 1])
+            self.assertGreaterEqual(self.now + ttl, d.hold["until"] - 1,
+                                    "the card expires before the hold it offers a way out of")
 
     def test_no_card_presenter_keeps_the_plain_notice(self):
         body = next((self.ws / "results").glob("proactive-*.txt")).read_text()
@@ -1353,6 +1502,132 @@ class WitnessFindings(unittest.TestCase):
         clh.decide(self.ws, after + 90, quota=limited_record(after + 30, ago=1))
         self.assertEqual(len(self.notices()), 2)
 
+
+
+class QuotaAllowed(unittest.TestCase):
+    """A 429 on an account the provider says has quota is not a limit."""
+
+    # The proxy's ledger holds the 429's body as it arrived: compressed, so unreadable here.
+    ENCODED = "\ufffd8\x00\x00\ufffd\ufffd\ufffd\ufffd\ufffd\ufffdt\ufffd\x1eL\ufffd&7"
+    ALLOWED = {"anthropic-ratelimit-unified-status": "allowed",
+               "anthropic-ratelimit-unified-7d-status": "allowed",
+               "anthropic-ratelimit-unified-7d-utilization": "0.41"}
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.ws = Path(self.td.name)
+        (self.ws / "state").mkdir()
+        self.now = 1_800_000_000.0
+
+    def tearDown(self):
+        self.td.cleanup()
+
+    def fable_429(self, snippet: str, own=ALLOWED) -> dict:
+        rec = limited_record(self.now, rejected=False, model="claude-fable-5-2", ago=20)
+        rec["headers"] = dict(self.ALLOWED)
+        rej = rec["recent_rejections"][0]
+        rej["snippet"] = snippet
+        if own is not None:
+            rej["limit_headers"] = dict(own)
+        return rec
+
+    def launches(self, rec: dict, model: str = "claude-fable-5-2") -> bool:
+        return clh.decide(self.ws, self.now, quota=rec, launch_model=model).launch
+
+    def test_a_throttle_with_quota_left_does_not_pause_the_core(self):
+        for snippet in (self.ENCODED, '{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}'):
+            d = clh.decide(self.ws, self.now, quota=self.fable_429(snippet), launch_model="claude-fable-5-2")
+            self.assertTrue(d.launch, d.line)
+            self.assertIsNone(clh.active_hold(self.ws, self.now))
+            self.assertFalse((self.ws / "results").exists(), "no pause notice for a throttle")
+
+    def test_a_named_usage_limit_or_retry_time_still_holds(self):
+        d = clh.decide(self.ws, self.now, quota=self.fable_429("You've reached your Fable limit."),
+                       launch_model="claude-fable-5-2")
+        self.assertFalse(d.launch)
+        self.assertEqual((d.hold["kind"], d.hold["model"]), ("usage-limit", "claude-fable-5-2"))
+        lim = clh.record_evidence(self.fable_429("rate limited, retry-after: 90"), self.now)
+        self.assertEqual((lim.kind, lim.reset_at), ("rate-limit", self.now - 20 + 90))
+
+    def test_an_exhausted_account_still_holds(self):
+        rec = limited_record(self.now, model="claude-fable-5-2")
+        rec["recent_rejections"][0]["snippet"] = self.ENCODED
+        rec["recent_rejections"][0]["limit_headers"] = dict(rec["headers"])
+        d = clh.decide(self.ws, self.now, quota=rec, launch_model="claude-fable-5-2")
+        self.assertFalse(d.launch)
+        self.assertEqual(d.hold["kind"], "usage-limit")
+
+    def test_a_headerless_429_keeps_the_backoff_whatever_answered_just_before(self):
+        # An allowed response 1 s before writes the record's headers; the 429 carried none.
+        for own in (None, {}):
+            rec = self.fable_429(self.ENCODED, own=own)
+            rec["last_checked"] = iso(self.now - 21)
+            self.assertFalse(self.launches(rec), own)
+            clh.clear(self.ws, self.now)
+            (self.ws / "state" / clh.HOLD_FILE).unlink()
+
+    def test_an_allowed_throttle_finishing_last_does_not_hide_a_rejected_account(self):
+        # Two seats on one proxy: B's rejected 429 wrote the record's headers, A's throttle body ended last.
+        rec = limited_record(self.now, model="claude-fable-5-2", ago=3)
+        rej_b = rec["recent_rejections"][0]
+        rej_b["limit_headers"] = dict(rec["headers"])
+        rec["recent_rejections"].append(dict(rej_b, ts=iso(self.now - 1), snippet=self.ENCODED,
+                                             limit_headers=dict(self.ALLOWED)))
+        lim = clh.record_evidence(rec, self.now)
+        self.assertIsNotNone(lim)
+        self.assertEqual(lim.kind, "usage-limit")
+        self.assertFalse(self.launches(rec))
+
+    def test_an_unrecognised_or_differently_cased_status_is_not_allowed(self):
+        for status in ("foo", "", "Rejected"):
+            own = dict(self.ALLOWED, **{"anthropic-ratelimit-unified-status": status})
+            self.assertIsNotNone(clh.record_evidence(self.fable_429(self.ENCODED, own=own), self.now), status)
+        own = dict(self.ALLOWED, **{"anthropic-ratelimit-unified-status": "Allowed"})
+        self.assertIsNone(clh.record_evidence(self.fable_429(self.ENCODED, own=own), self.now))
+
+    def test_another_requests_allowed_headers_do_not_clear_this_429(self):
+        # Interleaved: this 429 was rejected on its own response, another request answered allowed after.
+        rec = self.fable_429(self.ENCODED, own={"anthropic-ratelimit-unified-status": "rejected",
+                                                "anthropic-ratelimit-unified-7d-status": "rejected"})
+        rec["last_checked"] = iso(self.now - 19)
+        self.assertFalse(self.launches(rec))
+
+    def transcript(self, text: str, served: str = "") -> Path:
+        proj = self.ws / "projects"
+        proj.mkdir(exist_ok=True)
+        now = time.time()
+        lines = [{"type": "user"}]
+        if served:
+            lines += [{"type": "assistant", "timestamp": iso(now - 60),
+                       "message": {"model": served, "content": [{"type": "text", "text": "ok"}]}},
+                      {"type": "user"}]
+        lines.append({"isApiErrorMessage": True, "timestamp": iso(now - 20), "type": "assistant",
+                      "message": {"model": "<synthetic>", "content": [{"type": "text", "text": text}]}})
+        (proj / "s.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+        return proj
+
+    def test_the_clis_not_your_usage_limit_error_does_not_pause_the_core(self):
+        text = "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited"
+        self.assertIsNone(clh.classify_text(text, self.now))
+        d = clh.decide(self.ws, time.time(), quota=None, projects_dir=self.transcript(text),
+                       launch_model="claude-fable-5-2")
+        self.assertTrue(d.launch, d.line)
+
+    def _fable_cap_holds_fable_only(self, served: str):
+        proj = self.transcript("You've reached your Fable limit.", served)
+        now = time.time()
+        for other in ("sonnet", "claude-sonnet-5"):
+            self.assertTrue(clh.decide(self.ws, now, quota=None, projects_dir=proj, launch_model=other).launch,
+                            (served, other))
+        d = clh.decide(self.ws, now, quota=None, projects_dir=proj, launch_model="claude-fable-5-2")
+        self.assertFalse(d.launch)
+        self.assertEqual((d.hold["kind"], d.hold["model"]), ("usage-limit", "fable"))
+
+    def test_a_fable_cap_on_the_first_turn_holds_fable_only(self):
+        self._fable_cap_holds_fable_only("")
+
+    def test_a_fable_cap_after_a_sonnet_turn_holds_fable_not_sonnet(self):
+        self._fable_cap_holds_fable_only("claude-sonnet-5")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

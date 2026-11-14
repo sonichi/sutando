@@ -20,6 +20,7 @@ loopback media route as `/media/state/agent-activity.jsonl`:
 | `done` | `true` closes the task: all of its rows leave the drawer (the dock keeps them) |
 | `task.event` | event id of the user message (`source_message_id`); the client mounts the per-message card under it |
 | `task.into` | on a consolidated `done`: event id of the message whose reply answered this one too |
+| `agent` | mxid of the agent the task is answered as, on a task a named lane queued (a pool worker's own agent, a secondary homeserver's); absent on every other row, which is the engine's own agent's |
 | `queue` | on the `queued` row only: `{depth, position}` — how many tasks are pending and this one's 1-based place in the order the core takes them (`src/task_queue.py`) |
 
 A `notice` row reading `queued` is written by the task watcher when the file lands, before any turn

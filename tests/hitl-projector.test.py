@@ -21,7 +21,7 @@ from hitl.projector import (  # noqa: E402
     project,
 )
 from hitl.schema import (  # noqa: E402
-    Action, CATEGORY_BLOCKED, CATEGORY_DECISION, HumanRequirement, KINDS,
+    Action, ActionReply, CATEGORY_BLOCKED, CATEGORY_DECISION, HumanRequirement, KINDS,
     NOTICE_FIELD, STATUS_RESOLVED, WIRE_FIELD, category_of,
 )
 
@@ -559,6 +559,137 @@ class RefusalClassTests(unittest.TestCase):
 
 
 
+class _Relay:
+    """A relay that holds only the events it accepted: an edit of any other is its 404."""
+
+    def __init__(self, edit_miss=404, reachable=True):
+        self.sent, self.events, self.edit_miss, self.reachable = [], set(), edit_miss, reachable
+
+    def _refuse(self, code):
+        err = OSError(f"HTTP {code}")
+        err.code = code
+        raise err
+
+    def __call__(self, payload):
+        self.sent.append(payload)
+        if not self.reachable:
+            self._refuse(404)
+        if payload["op"] == "edit":
+            if payload["event_id"] not in self.events:
+                self._refuse(self.edit_miss)
+            return {"ok": True, "event_id": f"$edit{len(self.sent)}"}
+        self.events.add(f"$new{len(self.sent)}")
+        return {"ok": True, "event_id": f"$new{len(self.sent)}"}
+
+
+class EditTargetMissingTests(unittest.TestCase):
+    """A card posted through one homeserver and revised after the lane moved to another: the
+    new relay has no such event, so the edit is its 404 and the revision goes out as a new card."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.mgr = HitlManager(HitlStore(Path(self.tmp.name)))
+        self.stale = self.mgr.create(make_req(kind="choice", guard="stale"))
+        project(self.mgr, RecordingSender(), ROOM)  # projected by the relay of the old homeserver
+        self.relay = _Relay()
+
+    def _ops(self, relay, req):
+        return [p["op"] for p in relay.sent if p["dedupe_key"].startswith(f"hitl:{req.id}:")]
+
+    def test_a_missing_edit_target_is_recreated_and_holds_back_no_other_card(self):
+        self.mgr.resolve(self.stale.id)
+        fresh = self.mgr.create(make_req(kind="choice", guard="fresh"))
+        done = dict(project(self.mgr, self.relay, "!dm:s.space"))
+        self.assertEqual(set(done), {self.stale.id, fresh.id}, "the prompt beside the stale card is delivered")
+        self.assertEqual(self._ops(self.relay, self.stale), ["edit", "message"])
+        again = self.relay.sent[[p["op"] for p in self.relay.sent].index("edit") + 1]
+        self.assertNotIn("event_id", again)
+        self.assertEqual(again["extra_content"][WIRE_FIELD]["status"], STATUS_RESOLVED)
+        self.assertFalse(self.mgr.needs_projection(self.stale.id))
+        self.assertEqual(project(self.mgr, self.relay, "!dm:s.space"), [], "nothing is sent twice")
+
+    def test_the_recreated_card_takes_the_later_edits(self):
+        self.mgr.apply_action(ActionReply(hitl_id=self.stale.id, expected_revision=1,
+                                          action_id="reauth", guard="stale"))
+        project(self.mgr, self.relay, "!dm:s.space")
+        target = self.mgr.projection_target(self.stale.id)
+        self.assertIn(target, self.relay.events)
+        self.mgr.resolve(self.stale.id)
+        project(self.mgr, self.relay, "!dm:s.space")
+        self.assertEqual(self._ops(self.relay, self.stale), ["edit", "message", "edit"])
+        self.assertEqual(self.relay.sent[-1]["event_id"], target)
+
+    def test_any_other_edit_refusal_still_propagates_with_nothing_sent_anew(self):
+        self.mgr.resolve(self.stale.id)
+        relay = _Relay(edit_miss=403)
+        with self.assertRaises(OSError):
+            project(self.mgr, relay, "!dm:s.space")
+        self.assertEqual([p["op"] for p in relay.sent], ["edit"])
+        self.assertTrue(self.mgr.needs_projection(self.stale.id))
+
+    def test_an_endpoint_wide_404_still_propagates_and_records_nothing(self):
+        self.mgr.resolve(self.stale.id)
+        before = self.mgr.store.projection(self.stale.id)
+        with self.assertRaises(OSError):
+            project(self.mgr, _Relay(reachable=False), "!dm:s.space")
+        self.assertEqual(self.mgr.store.projection(self.stale.id), before)
+        self.assertTrue(self.mgr.needs_projection(self.stale.id))
+
+    def test_a_404_on_the_resend_is_the_endpoints_and_is_not_resent_again(self):
+        self.mgr.resolve(self.stale.id)
+        self.mgr.create(make_req(kind="choice", guard="fresh"))  # accepted would charge a card 404
+        stale_key = f"hitl:{self.stale.id}:"
+
+        def relay(payload):  # holds no event of the stale card, and 404s its new card too
+            if payload["dedupe_key"].startswith(stale_key):
+                self.relay.sent.append(payload)
+                self.relay._refuse(404)
+            return self.relay(payload)
+        with self.assertRaises(OSError) as raised:
+            project(self.mgr, relay, "!dm:s.space")
+        self.assertEqual(raised.exception.code, 404, "the endpoint's 404, not a charged card refusal")
+        self.assertEqual(self._ops(self.relay, self.stale), ["edit", "message"])
+        ledger = self.mgr.store.projection(self.stale.id)
+        self.assertNotIn("refusals", ledger)
+        self.assertNotIn("failed_revision", ledger)
+        self.assertTrue(self.mgr.needs_projection(self.stale.id))
+
+    def test_the_new_card_catches_up_when_a_later_revision_was_recorded_during_the_resend(self):
+        self.mgr.apply_action(ActionReply(hitl_id=self.stale.id, expected_revision=1,
+                                          action_id="reauth", guard="stale"))
+        dead = self.mgr.projection_target(self.stale.id)
+
+        def relay(payload):  # an overlapping pass resolves it and records that on the dead target
+            if payload["op"] == "message":
+                self.mgr.resolve(self.stale.id)
+                self.mgr.record_projection(self.stale.id, self.mgr.store.load(self.stale.id).revision, None)
+            return self.relay(payload)
+        project(self.mgr, relay, "!dm:s.space")
+        target = self.mgr.projection_target(self.stale.id)
+        self.assertNotEqual(target, dead)
+        self.assertIn(target, self.relay.events)
+        self.assertTrue(self.mgr.needs_projection(self.stale.id), "the new card holds the older content")
+        project(self.mgr, self.relay, "!dm:s.space")
+        last = self.relay.sent[-1]
+        self.assertEqual((last["op"], last["event_id"]), ("edit", target))
+        self.assertEqual(last["extra_content"][WIRE_FIELD]["status"], STATUS_RESOLVED)
+        self.assertFalse(self.mgr.needs_projection(self.stale.id))
+        self.assertEqual(project(self.mgr, self.relay, "!dm:s.space"), [])
+
+    def test_a_target_already_replaced_by_another_pass_is_kept(self):
+        self.mgr.resolve(self.stale.id)
+
+        def relay(payload):  # an overlapping pass already re-created the card and recorded it
+            if payload["op"] == "message":
+                req = self.mgr.store.load(self.stale.id)
+                self.mgr.record_projection(req.id, req.revision + 1, "$other",
+                                           replaces=self.mgr.projection_target(req.id))
+            return self.relay(payload)
+        project(self.mgr, relay, "!dm:s.space")
+        self.assertEqual(self.mgr.projection_target(self.stale.id), "$other")
+
+
 def _refusing(code):
     def send(payload):
         err = OSError(f"HTTP {code}")
@@ -983,6 +1114,151 @@ class NoFloatOnTheWireTests(unittest.TestCase):
         self.assertEqual(len(notices), 1, "a reminder notice went out")
         for payload in sent.sent:
             self.assertEqual(_floats_at(payload), [], payload)
+
+
+
+_NOT_IN_ROOM = '{"errcode": "M_FORBIDDEN", "error": "sender is not in this room"}'
+
+
+def _room_refusing(room, body=_NOT_IN_ROOM, ok=None):
+    """Refuses every send to `room` with a 403 carrying `body`; others go to `ok`."""
+    ok = ok or RecordingSender()
+    refused = []
+
+    def send(payload):
+        if payload["room_id"] == room:
+            refused.append(payload)
+            err = OSError("HTTP 403")
+            err.code, err.body = 403, body
+            raise err
+        return ok(payload)
+    send.refused, send.ok = refused, ok
+    return send
+
+
+class RoomMembershipRefusalTests(_RefusalDrive):
+    """A 403 that is the room's verdict on the sender is charged to that card alone, fails it
+    after ROOM_REFUSAL_ATTEMPTS sends, and never holds back the cards behind it (#5054)."""
+
+    CAP = 5  # send_failure_policy.ROOM_REFUSAL_ATTEMPTS; a literal so the parent can run this
+
+    def drive(self, send, step=10 ** 7, describe=lambda e: getattr(e, "body", "")):
+        self.t += step
+        wall, mono = time.time() + self.t, time.monotonic() + self.t
+        try:
+            return self.pj.project_pass(self.mgr, send, ROOM, clock=lambda: wall, monotonic=lambda: mono,
+                                        describe=describe), None
+        except OSError as e:
+            return getattr(e, "projection", None), e
+
+    def test_the_policy_bound_is_the_one_used(self):
+        self.assertEqual(self.pj.ROOM_REFUSAL_ATTEMPTS, self.CAP)
+
+    def test_a_card_whose_room_refuses_the_sender_is_bounded_and_the_rest_go_out(self):
+        left = self.mgr.create(make_req(guard="a", device={"id": "da", "name": "n"}, room="!left:x"))
+        others = [self.card(g) for g in ("b", "c")]
+        send = _room_refusing("!left:x")
+        raised = [self.drive(send, step=60)[1]]
+        first = {p["extra_content"][WIRE_FIELD]["id"] for p in send.ok.sent if WIRE_FIELD in p["extra_content"]}
+        self.assertEqual(first, {r.id for r in others}, "the cards behind it went out in the same pass")
+        raised += [self.drive(send, step=60)[1] for _ in range(29)]  # a pass a minute for 30 minutes
+        cards = [p for p in send.refused if WIRE_FIELD in p["extra_content"]]
+        self.assertEqual(len(cards), self.CAP, "the refused card is sent a bounded number of times")
+        self.assertEqual(raised, [None] * 30, "a room's refusal of one card is not the relay's failure")
+        self.assertTrue(self.mgr.projection_failed(left.id))
+        self.assertIn("not in this room", self.mgr.store.projection(left.id)["refused_error"])
+        sent = {p["extra_content"][WIRE_FIELD]["id"] for p in send.ok.sent if WIRE_FIELD in p["extra_content"]}
+        self.assertEqual(sent, {r.id for r in others}, "the cards behind it were delivered")
+
+    def test_the_failure_notice_a_refusing_room_also_refuses_is_recorded_once(self):
+        left = self.mgr.create(make_req(guard="a", device={"id": "da", "name": "n"}, room="!left:x"))
+        send = _room_refusing("!left:x")
+        raised = [self.drive(send, step=60)[1] for _ in range(30)]
+        self.assertEqual(len(send.refused), self.CAP + 1, "the bounded card sends, one notice, then nothing")
+        self.assertEqual(raised, [None] * 30)
+        self.assertEqual(self.mgr.store.projection(left.id).get("failed_notice"), left.revision)
+        self.assertNotIn(left.id, pending_ids(self.mgr, clock=lambda: time.time() + self.t))
+
+    def _notices(self, payloads):
+        return [p for p in payloads if NOTICE_FIELD in p["extra_content"]]
+
+    def test_a_notice_its_room_refuses_reaches_the_owner_dm(self):
+        left = self.mgr.create(make_req(guard="a", device={"id": "da", "name": "n"}, room="!left:x"))
+        send = _room_refusing("!left:x")
+        raised = [self.drive(send, step=60)[1] for _ in range(30)]
+        self.assertEqual(raised, [None] * 30)
+        self.assertEqual([p["room_id"] for p in self._notices(send.refused)], ["!left:x"])
+        delivered = self._notices(send.ok.sent)
+        self.assertEqual([p["room_id"] for p in delivered], [ROOM], "the owner DM got the notice, once")
+        self.assertEqual(delivered[0]["extra_content"][NOTICE_FIELD]["ids"], [left.id])
+        self.assertEqual(self.mgr.store.projection(left.id).get("failed_notice"), left.revision)
+
+    def test_a_notice_the_owner_dm_also_refuses_is_bounded(self):
+        left = self.mgr.create(make_req(guard="a", device={"id": "da", "name": "n"}, room="!left:x"))
+        dm = _room_refusing(ROOM)
+        send = _room_refusing("!left:x", ok=dm)
+        raised = [self.drive(send, step=60)[1] for _ in range(30)]
+        self.assertEqual(raised, [None] * 30, "two refusing rooms are not the relay's failure")
+        self.assertEqual([p["room_id"] for p in self._notices(send.refused + dm.refused)], ["!left:x", ROOM],
+                         "one try in the card's room, one in the DM, then nothing")
+        self.assertEqual(self._notices(dm.ok.sent), [])
+        self.assertEqual(self.mgr.store.projection(left.id).get("failed_notice"), left.revision)
+        self.assertNotIn(left.id, pending_ids(self.mgr, clock=lambda: time.time() + self.t))
+
+    def test_a_card_in_the_owner_dm_is_not_sent_its_notice_twice(self):
+        for room in (ROOM, None):
+            with self.subTest(room=room):
+                # An auth card folds into any live one on the same device, so each needs its own.
+                req = self.mgr.create(make_req(guard="dm", device={"id": f"dd-{room}", "name": "n"}, room=room))
+                self.assertEqual(req.room, room)
+                send = _room_refusing(ROOM)
+                raised = [self.drive(send, step=60)[1] for _ in range(30)]
+                self.assertEqual(raised, [None] * 30)
+                self.assertEqual(len(self._notices(send.refused)), 1, "the DM is the card's room: one try")
+                self.assertEqual(self._notices(send.ok.sent), [])
+                self.assertEqual(self.mgr.store.projection(req.id).get("failed_notice"), req.revision)
+
+    def test_a_dm_send_that_fails_otherwise_leaves_the_notice_owed(self):
+        def dm_error(payload):
+            err = OSError("HTTP 500")
+            err.code, err.body = 500, '{"error": "internal"}'
+            raise err
+
+        for name, dm in (("error", dm_error), ("not ok", lambda payload: {"ok": False})):
+            with self.subTest(dm=name):
+                left = self.mgr.create(make_req(guard="a", device={"id": f"dl-{name}", "name": "n"}, room="!left:x"))
+                send = _room_refusing("!left:x", ok=dm)
+                raised = [self.drive(send, step=600)[1] for _ in range(self.CAP + 2)]
+                self.assertTrue(self.mgr.projection_failed(left.id))
+                if dm is dm_error:
+                    self.assertIsNotNone(raised[-1], "a DM error that is not a refusal is the caller's")
+                self.assertNotIn("failed_notice", self.mgr.store.projection(left.id), "the notice stays owed")
+                send = _room_refusing("!left:x")
+                self.drive(send, step=600)
+                self.assertEqual([p["room_id"] for p in self._notices(send.ok.sent)], [ROOM])
+                self.assertEqual(self.mgr.store.projection(left.id).get("failed_notice"), left.revision)
+
+    def test_any_other_403_still_reaches_the_caller_and_charges_nothing(self):
+        req = self.card("a")
+        for body in ("", "<html>edge</html>", '{"error": "token expired"}',
+                     '{"errcode": "M_FORBIDDEN", "error": "Invalid access token"}',
+                     '{"errcode": "M_FORBIDDEN", "error": "sender is not a member of this workspace"}'):
+            _, raised = self.drive(_room_refusing(ROOM, body=body))
+            self.assertIsNotNone(raised, f"403 {body!r} keeps the caller's auth handling")
+        self.assertFalse(self.mgr.projection_failed(req.id))
+        self.assertNotIn("refusals", self.mgr.store.projection(req.id))
+
+    def test_a_403_notice_that_is_not_the_rooms_refusal_still_reaches_the_caller(self):
+        req = self.mgr.create(make_req(guard="a", device={"id": "da", "name": "n"}, room="!left:x"))
+        card, token = _room_refusing("!left:x"), _room_refusing(
+            "!left:x", body='{"errcode": "M_FORBIDDEN", "error": "Invalid access token"}')
+
+        def send(payload):  # the card meets the room's refusal, its failure notice a bad token
+            return (token if NOTICE_FIELD in payload["extra_content"] else card)(payload)
+        raised = [self.drive(send, step=600)[1] for _ in range(self.CAP)]
+        self.assertTrue(self.mgr.projection_failed(req.id))
+        self.assertIsNotNone(raised[-1], "a bad token on the notice is the caller's to recover")
+        self.assertNotIn("failed_notice", self.mgr.store.projection(req.id), "the notice stays owed")
 
 
 if __name__ == "__main__":

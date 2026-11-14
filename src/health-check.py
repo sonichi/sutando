@@ -87,6 +87,7 @@ import process_pins  # noqa: E402
 import pool_suspension  # noqa: E402
 import tmux_pane_keys  # noqa: E402
 import watcher_identity  # noqa: E402
+import bridge_engine  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
 from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
 from gateway_serving import (  # noqa: E402
@@ -1937,6 +1938,21 @@ def _carrier_representatives(workspace: Path, entry: str) -> "list[Path]":
     return [m for m in matches if not _reaches_through_symlink(workspace, m)]
 
 
+def _stale_with_culprits(stale, culprits, workspace) -> str:
+    """`entry (-> the match git ignores)` so the reader sees which path is dropped."""
+    out = []
+    for entry in stale[:4]:
+        rep = culprits.get(entry)
+        if rep is None or str(rep).rstrip("/").endswith(entry.rstrip("/")):
+            out.append(entry)
+        else:
+            try:
+                shown = rep.relative_to(workspace).as_posix()
+            except ValueError:
+                shown = str(rep)
+            out.append(f"{entry} -> {shown}")
+    return ", ".join(out) + ("…" if len(stale) > 4 else "")
+
 def _reaches_through_symlink(workspace: Path, p: Path) -> bool:
     """True when every file the probe would derive from `p` is "beyond a
     symbolic link" to git: `p` itself is a symlinked DIRECTORY, or any
@@ -2217,6 +2233,7 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
         return None
 
     stale: "list[str]" = []
+    stale_culprit: "dict[str, Path]" = {}
     unmeasured: "list[str]" = []
     for entry in resolved:
         # EVERY materialized match, not one. `_carrier_representative()` (singular)
@@ -2246,13 +2263,19 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
         # probe still say OK. Both that and the directory/contents distinction now
         # live in `_carrier_target_verdict` so the two branches cannot drift.
         verdict = "carried"
+        culprit = None
         for rep in reps:
             got = _carrier_target_verdict(workspace, rep)
             if got != "carried":
                 verdict = got
+                culprit = rep
                 break
         if verdict == "dropped":
             stale.append(entry)
+            # Name the MATCH, not just the entry: a glob entry resolves to several
+            # paths and the reader cannot tell which one git is ignoring.
+            if culprit is not None:
+                stale_culprit[entry] = culprit
         elif verdict == "unmeasured":
             # Could not run the measurement at all. NOT the same as "carried".
             unmeasured.append(entry)
@@ -2402,9 +2425,11 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     if stale:
         parts.append(
             f"{len(stale)} configured carrier path(s) are STILL GIT-IGNORED so the vault is not "
-            f"backing them up ({', '.join(stale[:4])}{'…' if len(stale) > 4 else ''}) — the exclude "
-            f"file is stale and sync refused to regenerate it; fix with "
-            f"`bash scripts/sync-workspace.sh --force-gitignore` (diff it first)"
+            f"backing them up ({_stale_with_culprits(stale, stale_culprit, workspace)}) — usually a "
+            f"stale exclude file, fixed with `bash scripts/sync-workspace.sh --force-gitignore` "
+            f"(diff it first). For a glob-directory entry `<dir>/*/`, a FILE directly in "
+            f"`<dir>/` is outside the `!<dir>/*/**` carve-out; regenerating cannot reach "
+            f"that file — deal with it instead"
         )
     if safe:
         parts.append(
@@ -9559,6 +9584,19 @@ def _watcher_runtime(sentinel: Path, inbox: "str | None") -> str:
     return "claude" if _claude_runtime_selected() else "other"
 
 
+def check_bridge_engine_match() -> dict:
+    """A bridge running from another install's engine may write tasks this core never reads."""
+    def _pids(script: str) -> tuple:
+        # Not end-anchored: a bridge launched with trailing arguments must still be found.
+        pids, scanned = probe_pids(re.escape(script) + "([[:space:]]|$)")
+        return _drop_launcher_parents(pids), scanned
+    try:
+        return bridge_engine.check_bridge_engine_match(REPO_DIR, _pids)
+    except Exception as exc:  # noqa: BLE001 — a probe failure is not a finding
+        return {"name": bridge_engine.CHECK_NAME, "status": "unknown",
+                "detail": f"probe failed ({type(exc).__name__})"}
+
+
 def check_task_watcher() -> dict:
     """Direct liveness of the streaming task watcher (src/watch-tasks-stream.sh).
 
@@ -12466,6 +12504,33 @@ def check_vault_manifest_integrity(
     }
 
 
+def _hook_settings_target(repo: Path) -> Optional[Path]:
+    """Where install-claude-hooks.sh writes: the core's launch dir when overridden, else the repo.
+
+    Mirrors scripts/core-working-dir.sh (the launcher and every installer source it) shape for
+    shape — unset → repo; absolute or `~/…` → that path; anything else is REFUSED there, and
+    here it is None: the installer wrote nothing for that launch, so no file can stand for it.
+    tests/core-working-dir.test.sh runs both implementations over one input table.
+    """
+    # No .strip(): the bash resolver this mirrors does not strip, so stripping here
+    # made "  " refused there and the repo default here — the one shape the contract forbids.
+    override = os.environ.get("SUTANDO_CLAUDE_WORKING_DIR", "")
+    if not override:
+        return repo
+    if override.startswith("~/"):
+        override = os.path.join(os.path.expanduser("~"), override[2:])
+    elif not override.startswith("/"):
+        return None
+    # Strict resolution detects symlink loops on every Python version; a missing
+    # target is valid because the installer creates it.
+    try:
+        try:
+            return Path(override).resolve(strict=True)
+        except FileNotFoundError:
+            return Path(override).resolve()
+    except (OSError, RuntimeError):
+        return None
+
 def _hook_script_path(command: str) -> Optional[str]:
     """The script a hook command runs; the installer module owns the parse, this is a fallback."""
     try:
@@ -12575,7 +12640,18 @@ def check_claude_hook_registration(
                           f"cannot verify skill-declared hooks"}
 
     sm = re.search(r'^SETTINGS="([^"]+)"', src, re.M)
-    settings = Path(sm.group(1).replace("$REPO_DIR", str(repo))) if sm else repo / ".claude" / "settings.json"
+    # The installer targets the directory the core launches from (SUTANDO_CLAUDE_WORKING_DIR,
+    # else the repo); the probe must read the same file or it reports the wrong tree.
+    target = _hook_settings_target(repo)
+    if target is None:
+        # A refused override is not "no override": the launcher installs nothing for it, and a
+        # settings.json left at the repo from an earlier launch must not read as this one's.
+        return {"name": name, "status": "warn",
+                "detail": f"SUTANDO_CLAUDE_WORKING_DIR={os.environ.get('SUTANDO_CLAUDE_WORKING_DIR', '')!r} "
+                          f"is neither absolute nor ~/… (or cannot be resolved) — the installer refuses it, "
+                          f"so no hooks were installed for this launch; target unknown, {len(owned)} hook(s) unverified"}
+    settings = (Path(sm.group(1).replace("$TARGET_DIR", str(target)).replace("$REPO_DIR", str(repo)))
+                if sm else target / ".claude" / "settings.json")
     if not settings.is_file():
         return {"name": name, "status": "warn",
                 "detail": f"{settings} missing — install-claude-hooks.sh has never run here; "
@@ -13964,6 +14040,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_stranded_destined_proactive())
     checks.append(check_stale_proactive_backlog())
     checks.append(check_task_watcher())
+    checks.append(check_bridge_engine_match())
     checks.append(check_task_claim_age())
     checks.append(check_a_fallback_hits())
     checks.append(check_outbox_parked())

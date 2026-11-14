@@ -378,6 +378,9 @@ export interface RejectionRecord {
 	effective_model?: string;
 	user_agent?: string;
 	peer_port?: number;
+	// This response's own rate-limit headers ({} when it carried none): the record's
+	// top-level headers may belong to another request.
+	limit_headers?: Record<string, string>;
 }
 
 /** The `model` field of a JSON request body, or "" when absent or unparsable. */
@@ -761,6 +764,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 										ts: new Date(deps.now()).toISOString(), status: code, path: req.url ?? '', snippet,
 										model, ...(effective ? { effective_model: effective } : {}),
 										user_agent: String(req.headers['user-agent'] ?? ''), peer_port: req.socket.remotePort,
+										limit_headers: quotaHeaders,
 									});
 								} catch { /* best effort */ }
 							});

@@ -22,7 +22,10 @@ never held, so it is revived as before.
 
 A hold also records a digest of the account it was observed under; a launch under a different
 account is not held by it, so signing in to an account with quota resumes at once. Every launch
-passes this gate, so evidence older than the gate's first sight of an account is not that account's.
+passes this gate and leaves its account on record even when nothing is held (status "none"), so
+the next launch can tell a switch: evidence older than the gate's first sight of an account is
+not that account's. Without that record, a limit hit by one account followed by a sign-in to
+another before the next launch was pinned on the new account.
 
 While a hold is in force the gate also acts on the owner's bare replies to the notice,
 "switch to <model>" and "retry now", since nothing else reads the inbox with the core down.
@@ -30,6 +33,10 @@ Tasks that arrive during a hold are listed in its record (`held_tasks`), so the 
 on the next boot leaves them for the core; each hold incident sends its own notice. Given the
 desktop's card presenter (`gate --card-entry`), that notice also presents the core-model card.
 A hold binds only launches on the model family and account it was seen under (`binding_hold`).
+
+A 429 whose own response reports the account's limits all allowed is a throttle, not a limit:
+it holds nothing unless its text names a usage limit or a time to retry. The CLI's
+"(not your usage limit)" error is the same case, read from the transcript.
 """
 from __future__ import annotations
 
@@ -70,9 +77,13 @@ SERVED_SLACK_S = 5
 
 _CLI_LIMIT = tuple(rx for name, rx in cli_wedge.ABNORMAL_PATTERNS
                    if name in cli_wedge.PROVIDER_LIMIT_PATTERNS)
-# The window-named banner ("5-hour limit reached") and the API's own words for a refusal.
+# The window-named banner ("5-hour limit reached"), a per-model cap ("You've reached your Fable
+# limit."), and the API's own words for a refusal.
 _USAGE_EXTRA = re.compile(r"\b\d+-hour limit (?:reached|exceeded|hit)\b|\bquota\b.{0,20}\b(?:exceeded|exhausted)\b"
                           r"|\binsufficient_quota\b", re.I)
+_NAMED_CAP = re.compile(r"\breached your ([A-Za-z][\w.-]{0,24}) limit\b", re.I)
+# The CLI's words for a 429 the account's quota did not cause: the server is throttling.
+_NOT_A_LIMIT = re.compile(r"\bnot your usage limit\b", re.I)
 # A 429 counts only as a status (API Error, HTTP, a status field), never as a number in a URL or id.
 _RATE = re.compile(r"\brate_limit_error\b|\brate[ -]?limit(?:ed)?\b|\btoo many requests\b"
                    r"|\b(?:API ?Error|HTTP(?:/[\d.]+)?|status(?:_?code)?)\"?\s*[:=]?\s*429\b", re.I)
@@ -140,9 +151,13 @@ def parse_reset(text: str, at: float) -> Optional[float]:
 def classify_text(text: str, at: float, model: Optional[str] = None,
                   source: str = "cli-transcript") -> Optional[Limit]:
     """A provider limit named by refusal text, or None for any other error."""
-    if not text:
+    if not text or _NOT_A_LIMIT.search(text):
         return None
-    if any(rx.search(text) for rx in _CLI_LIMIT) or _USAGE_EXTRA.search(text):
+    named = _NAMED_CAP.search(text)
+    if named:
+        # The banner names the capped model; an earlier turn may have run another one.
+        model = qa._model_family(named.group(1).lower()) or model
+    if named or any(rx.search(text) for rx in _CLI_LIMIT) or _USAGE_EXTRA.search(text):
         kind = "usage-limit"
     elif _RATE.search(text):
         kind = "rate-limit"
@@ -194,11 +209,26 @@ def record_evidence(payload, now: float) -> Optional[Limit]:
     headers = payload.get("headers") if isinstance(payload.get("headers"), dict) else {}
     model = qa._norm_model(rej.get("model")) or qa.record_model(payload)
     found = classify_text(str(rej.get("snippet") or ""), at, model, "provider-record")
+    if state != "rejected" and _own_headers_allowed(rej) and not (
+            found and (found.kind == "usage-limit" or (found.reset_at or 0) > now)):
+        return None  # a throttle on an account with quota; the CLI retries it itself
     kind = "usage-limit" if state == "rejected" else (found.kind if found else "rate-limit")
     reset = _record_reset(headers, now) if state == "rejected" else None
     if reset is None and found is not None and found.reset_at and found.reset_at > now:
         reset = found.reset_at
     return Limit(kind, at, reset, model, "provider-record")
+
+
+def _own_headers_allowed(rej: dict) -> bool:
+    """Whether the 429's own response, as the proxy recorded it with the rejection, reported
+    every limit allowed. Absent or status-less headers say nothing, so the old backoff applies."""
+    own = rej.get("limit_headers")
+    if not isinstance(own, dict):
+        return False
+    own = {k: str(v).strip().lower() for k, v in own.items()}
+    if own.get("anthropic-ratelimit-unified-status") not in qa.OVERAGE_OK:
+        return False  # absent or unrecognised: fail closed
+    return qa.classify_limit_state({"headers": own}) == "allowed"
 
 
 def _entry_text(entry: dict) -> str:
@@ -364,9 +394,21 @@ def _binds(hold: dict, launch_model: Optional[str], launch_account: Optional[str
     return _same_family(hold.get("model"), launch_model) and _same_account(hold.get("account"), launch_account)
 
 
+def _launch_config_dir() -> Optional[str]:
+    """The config dir the launcher runs the core in: its export when set, else the resolver it
+    exports from, so a caller the launcher did not start (the watchdog) reads the same seat."""
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        return os.environ["CLAUDE_CONFIG_DIR"]
+    try:
+        from sutando_config import resolve_claude_sutando_config_dir
+        return str(resolve_claude_sutando_config_dir())
+    except Exception:
+        return None
+
+
 def launch_identity(workspace: Path, config_dir: Optional[str] = None) -> tuple:
     """(model, account) the next launch would run as, read the way the gate reads them."""
-    config_dir = os.environ.get("CLAUDE_CONFIG_DIR") if config_dir is None else config_dir
+    config_dir = _launch_config_dir() if config_dir is None else config_dir
     model = qa.seat_model(qa.SeatEnv(True, None, config_dir), Path(workspace))
     return model, account_fingerprint(config_dir)
 
@@ -430,7 +472,8 @@ def _present_card(hold: dict, card_entry: str, now: float) -> bool:
     Detached: the card's DM mirror may take its own deadline, and the launch must not wait on it."""
     import subprocess
     body = f"Paused: {hold['reason'].split(': ', 1)[-1]}. Pick another model to keep working now."
-    ttl = int(max(600, min(float(hold.get("until") or now) - now, LONG_RESET_RECHECK_S)))
+    # The card lasts as long as the hold: notice_queued stops a second present for this pause.
+    ttl = int(max(600, float(hold.get("until") or now) - now))
     try:
         subprocess.Popen([sys.executable, card_entry, "present", "core-model", "--set", f"body={body}",
                           "--ttl", str(ttl)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -492,8 +535,9 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
         if _ensure_notice(workspace, hold, card_entry, now):
             _write_hold(workspace, hold)
         return Decision(False, hold, status_line(hold))
-    switched = bool(hold and launch_account and hold.get("account")
-                    and hold.get("account") != launch_account)
+    # Who ran last: the record's account, else the launcher a released legacy hold remembered.
+    last = (hold or {}).get("account") or (hold or {}).get("launch_account")
+    switched = bool(launch_account and last and last != launch_account)
     since = now if switched else (hold or {}).get("account_at")
     if quota is None:
         rec = qa.read_quota_record(workspace, now)
@@ -539,9 +583,17 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
     was_held = bool(hold and hold.get("status") == "held")
     if was_held:
         hold = dict(hold, status="released", released_at=now)
+        if launch_account and not hold.get("account"):
+            # Not the old limit's owner, only who launched: the next switch is seen against it.
+            hold["launch_account"] = launch_account
     if switched:
         hold = dict(hold, account=launch_account, account_at=now)
-    if was_held or switched:
+    # Record the launch account on any record that carries none: a switch is only seen against it.
+    # Never onto a hold this launch released: that limit is not this account's to claim.
+    first_sight = bool(launch_account and not was_held and not (hold or {}).get("account"))
+    if first_sight:
+        hold = dict(hold or {"status": "none"}, account=launch_account)
+    if was_held or switched or first_sight:
         _write_hold(workspace, hold)
     if was_held:
         _mirror_core_status(workspace, "starting", "resuming after a provider limit", now)

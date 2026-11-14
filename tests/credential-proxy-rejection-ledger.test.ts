@@ -140,3 +140,18 @@ test('appendRejection bounds the ledger, drops foreign entries, keeps the newest
 	assert.deepEqual(appendRejection(undefined, mk(0)), [mk(0)], 'a missing ledger starts fresh');
 	assert.deepEqual(appendRejection('not-a-list', mk(0)), [mk(0)]);
 });
+
+test('a rejection carries its own response\'s rate-limit headers, and {} when that response had none', async () => {
+	let headers: Record<string, string> = { 'anthropic-ratelimit-unified-status': 'allowed', 'anthropic-ratelimit-unified-7d-status': 'allowed', 'x-other': '1' };
+	upstreamHandler = (_req, res) => { res.writeHead(429, headers); res.end('{"error":"throttled"}'); };
+	const port = await startProxy();
+	await call(port);
+	headers = {};
+	await call(port);
+	await settle();
+	assert.equal(recorded.length, 2);
+	assert.deepEqual(recorded[0].limit_headers, {
+		'anthropic-ratelimit-unified-status': 'allowed', 'anthropic-ratelimit-unified-7d-status': 'allowed',
+	}, 'only the rate-limit headers of this response');
+	assert.deepEqual(recorded[1].limit_headers, {}, 'a header-less 429 is not given an earlier response\'s headers');
+});

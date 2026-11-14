@@ -566,6 +566,69 @@ and the tutorial page (`channel_credentials.room_env`), `ensure-cron-room.py` an
 from the primary's `state/owner-routing.<instance>.json`. `room_ops.py` verbs that name no room
 (`rooms`, `history`, `agents`, `resolve`, `events list|pull|stream`) act through the primary.
 
+### In a pool worker's session
+
+A pool worker that has its own agent (`pool_identity.py add`) acts as that agent from its own
+session. The seat names its worker in `SUTANDO_WORKER_ID`, and `connections.acting_identity`
+answers before the rule above:
+
+- a room on the server of the worker's own row resolves to that row, with the token its vault
+  key holds and its `agent_mxid`; with no room, the worker's only enabled row;
+- a room local state says is the core's stays with the core's rows: one where a core lane has a
+  task open and the worker's lane has none (that task is answered as the core's agent), and a
+  core lane's own owner DM (`state/owner-routing[.<instance>].json`, under the row's instance or a
+  launch-key alias its bridge runs as);
+- a disconnected row, a room on a server the worker has no row for, another worker's session
+  and the core's session all fall through to the rule above. The core never acts as a worker's
+  agent.
+
+A worker's row has no channel env file: its token is in the vault alone, so
+`channel-env.sh <its lane>` exits 1 saying so, and room clients resolve it by room.
+
+Whether a worker acts as its own agent at all is one test, `connections.worker_enabled_identity`:
+its row exists and is neither disabled nor parked, so a lane serves it. A worker with no row, or a
+disabled or parked one, acts through the core's agent in everything below, as every worker did
+before it had an identity.
+
+A proactive file such a worker's session writes is the worker's lane's to deliver. The session
+publishes it through `result_publish.py`, which stamps the name
+(`proactive-<ts>.by-<worker>[.to-<channel>].txt`; `connections.session_proactive_name`, over
+`proactive_routing.stamp_worker`); a session that writes the file by hand uses the same name. A
+worker acting through the core publishes the name unchanged, and a core lane sends it as before.
+The one claim rule is `proactive_routing.lane_claims_proactive(name, lane_worker)`: a stamped file
+is claimed only by the lane running as that worker, which posts it as the worker's agent into that
+agent's own owner DM; a core lane and every other bridge (Discord, Slack, Telegram, their
+fallbacks) refuse it, and a worker's lane claims nothing unstamped. The gateway's drain asks its
+host (`PROACTIVE_OWN_FILE`) whether an owner-directed file is the lane's own, so a worker's lane
+delivers its worker's files although it owns no unaddressed ones and projects no cards. Writers
+that do not go through `result_publish.py` (`scripts/ask-owner.py`, a skill writing the file
+itself) still publish unstamped names, which a core lane sends.
+
+The seat's `s-space` MCP proxy (the desktop app's `ag2-mcp-proxy.mjs`) mints its access token
+from the worker's own credential when the worker acts as its own agent. The launcher exports
+`AG2_MCP_WORKER_CREDENTIAL`, the JSON argv of `scripts/connections.py worker-mcp-credential
+--worker <id>` (`connections.worker_mcp_credential`): one JSON line, either `acts_as: "worker"`
+with the worker's `lane`, `server`, `agent_id`, `relay` and `bearer` (resolved as every room
+client resolves a token, `connection_credential`, the vault's, and handed to the proxy's memory,
+never a file), or `acts_as: "core"` with a `reason` (`no_identity`, `disabled`) for a worker that
+acts through the core, whose proxy then reads the core's lane env as before. The proxy runs it
+when `SUTANDO_WORKER_ID` is set, uses a worker's bearer only when its relay is the descriptor's,
+loads none of the core's extra lanes for a worker acting as itself, and with no resolver, or an
+enabled identity whose token cannot be read (`no_token`, exit 1), answers every Action with a
+refusal rather than mint as the core. A Codex worker's proxy inherits no environment, so it does
+not yet take this path.
+
+The proxy decides whom it acts as once, when the seat starts. A worker given its own agent while
+its seat runs keeps acting as the core's, and once the worker's credential exists every call
+fails with "descriptor changed during the call": the identity changed under the seat, and the fix
+is to restart the seat. `pool_identity.py` does that after any add that creates the identity
+(`pool_manage.py reseat <worker>`); a seat that owes work is left running and the command prints
+the reseat to run once it is done.
+
+`connections.task_agent_mxid(task_id)` names the agent a task is answered as: the agent of the
+lane that queued it (`task-<instance>~…`). Each row of `state/agent-activity.jsonl` for such a
+task carries it as `agent`.
+
 ## Known servers
 
 `known_servers()` is the Add picker's offer: every DotSpace the resolver registers
