@@ -27,9 +27,11 @@ are printed on a ``not-enabled`` line, so the agent can ask the owner; if that c
 names the legacy file itself. Nothing from it is
 registered without the owner's word.
 
-Owner notices (``restored`` and ``not-enabled`` lines) are also recorded in
-``hosts/<host>/crons-notice.json``. The next run prints them once more unless
-``--notice-sent`` cleared the record after the owner was told; then the record is dropped.
+Owner notices (``restored`` and ``not-enabled``) are recorded in ``hosts/<host>/crons-notice.json``
+before the per-host file is published, written whole. Each is queued once to the owner's DM
+through the proactive outbox (``results/proactive-crons-notice-*.txt``), retried on a later run
+if queueing failed, and its line is printed at most once a day until ``--notice-sent`` clears the
+record. Printing or queueing never clears it.
 
 The per-host file is published with temp file + ``os.link``, which refuses an existing name,
 so a concurrent seeder or the owner is never clobbered.
@@ -43,6 +45,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -50,6 +53,7 @@ REPO = SKILL_DIR.parents[1]
 MARKER = ".crons-seeded"
 LEGACY_KEPT = "crons.legacy.json"
 NOTICE = "crons-notice.json"
+REPLAY_S = 86400
 HISTORY = "crons.example.history.json"
 
 
@@ -110,7 +114,10 @@ def legacy_not_enabled(legacy: list, published: list, example: list,
 
 def seed(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR,
          first_install_only: tuple[str, ...] | None = None):
-    """Return (status, target, source, not_enabled, kept). Never overwrites ``target``."""
+    """Return (status, target, source, not_enabled, kept). Never overwrites ``target``.
+
+    The owner notices this seed owes are recorded before ``target`` is published, so a failed
+    notice write commits nothing and the next run regenerates both."""
     if not host_label.strip():
         raise ValueError("host label did not resolve")
     host_dir = workspace / "hosts" / host_label
@@ -136,12 +143,8 @@ def seed(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR,
         published = starter_entries(example, first_install_only)
         source, content = example_path, (json.dumps(published, indent=2) + "\n").encode()
 
-    if not _publish(target, content):
-        return "exists", target, None, [], None
-    marker.touch()
-
     not_enabled: list[str] = []
-    kept = None
+    raw = b""
     legacy_path = skill_dir / "crons.json"
     if legacy_path.is_file():
         raw = legacy_path.read_bytes()
@@ -149,11 +152,30 @@ def seed(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR,
             not_enabled = legacy_not_enabled(_entries(raw, legacy_path), published, example, shipped)
         except ValueError:
             not_enabled = []
-        if not_enabled:
-            try:
-                kept = keep_legacy(host_dir, raw)
-            except OSError:
-                kept = legacy_path  # the notice must survive: the next run reports "exists"
+    planned = []
+    if restoring:
+        planned.append(_restored_notice(target))
+    if not_enabled:
+        planned.append(_not_enabled_notice(not_enabled, legacy_path))
+    prior = _read_record(host_dir) if planned else None
+    if planned:
+        _add_notices(host_dir, prior, planned)
+
+    if not _publish(target, content):
+        if planned:
+            _write_record(host_dir, prior)
+        return "exists", target, None, [], None
+    marker.touch()
+
+    kept = None
+    if not_enabled:
+        try:
+            kept = keep_legacy(host_dir, raw)
+        except OSError:
+            kept = legacy_path
+        if kept != legacy_path:
+            _replace_notice(host_dir, _not_enabled_notice(not_enabled, legacy_path),
+                            _not_enabled_notice(not_enabled, kept))
     return ("restored" if restoring else "seeded"), target, source, not_enabled, kept
 
 
@@ -167,19 +189,94 @@ def keep_legacy(host_dir: Path, raw: bytes) -> Path:
         n += 1
 
 
-def owner_notices(host_dir: Path, new: list[str]) -> list[str]:
-    """Record new notices, or replay an unacknowledged one a single more time."""
-    record = host_dir / NOTICE
-    if new:
-        record.write_text(json.dumps({"lines": new}) + "\n")
-        return new
+def _restored_notice(target: Path) -> dict:
+    return {"line": f"restored {target}",
+            "message": "This Mac's scheduled-jobs file had been set up before and was missing, so "
+                       "I restored the starter jobs. Any jobs of your own that were in it need adding "
+                       "back: tell me which ones you want."}
+
+
+def _not_enabled_notice(names: list[str], kept: Path) -> dict:
+    return {"line": f"not-enabled {','.join(names)} kept at {kept}",
+            "message": f"I found an old schedule file with jobs I did not turn on: {', '.join(names)}. "
+                       f"It may include jobs of your own. A copy is kept at {kept}; tell me if you "
+                       "want any of them back."}
+
+
+def _read_record(host_dir: Path) -> dict:
     try:
-        data = json.loads(record.read_text())
-    except (OSError, ValueError):
+        data = json.loads((host_dir / NOTICE).read_text())
+    except (FileNotFoundError, ValueError):
+        return {"notices": [], "last_shown": 0}
+    notices = data.get("notices") if isinstance(data, dict) else None
+    notices = [n for n in notices if isinstance(n, dict) and isinstance(n.get("line"), str)] \
+        if isinstance(notices, list) else []
+    shown = data.get("last_shown") if isinstance(data, dict) else 0
+    return {"notices": notices, "last_shown": shown if isinstance(shown, (int, float)) else 0}
+
+
+def _write_record(host_dir: Path, record: dict) -> None:
+    """Replace the record whole: a reader sees the old or the new one, never a prefix."""
+    path = host_dir / NOTICE
+    if not record["notices"]:
+        path.unlink(missing_ok=True)
+        return
+    host_dir.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _add_notices(host_dir: Path, prior: dict, new: list[dict]) -> None:
+    known = {n["line"] for n in prior["notices"]}
+    added = [dict(n, queued=False) for n in new if n["line"] not in known]
+    _write_record(host_dir, {"notices": prior["notices"] + added, "last_shown": 0})
+
+
+def _replace_notice(host_dir: Path, old: dict, new: dict) -> None:
+    record = _read_record(host_dir)
+    record["notices"] = [dict(new, queued=n.get("queued", False)) if n["line"] == old["line"] else n
+                         for n in record["notices"]]
+    _write_record(host_dir, record)
+
+
+def _queue_owner_dm(workspace: Path, notice: dict) -> None:
+    """Hand the notice to the durable proactive outbox, which delivers it to the owner's DM."""
+    if str(REPO / "src") not in sys.path:
+        sys.path.insert(0, str(REPO / "src"))
+    from proactive_routing import proactive_filename
+    from result_publish import publish_text
+    digest = hashlib.sha256(notice["line"].encode()).hexdigest()[:24]
+    path = workspace / "results" / proactive_filename(f"crons-notice-{digest}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    publish_text(path, f"[dm-only]\n{notice['message']}\n")
+
+
+def due_notices(workspace: Path, host_dir: Path, now: float) -> list[str]:
+    """Queue each pending notice to the owner's DM once; print them at most once a day.
+    The record is kept until ``--notice-sent``."""
+    record = _read_record(host_dir)
+    if not record["notices"]:
         return []
-    record.unlink(missing_ok=True)
-    lines = data.get("lines") if isinstance(data, dict) else None
-    return [x for x in lines if isinstance(x, str)] if isinstance(lines, list) else []
+    for notice in record["notices"]:
+        if not notice.get("queued") and "message" in notice:
+            try:
+                _queue_owner_dm(workspace, notice)
+                notice["queued"] = True
+            except (ImportError, OSError):
+                pass
+    lines = []
+    if now - record["last_shown"] >= REPLAY_S:
+        lines = [n["line"] for n in record["notices"]]
+        record["last_shown"] = now
+    _write_record(host_dir, record)
+    return lines
 
 
 def main() -> int:
@@ -190,7 +287,7 @@ def main() -> int:
     parser.add_argument("--first-install-only", action="append", metavar="NAME",
                         help="seed only this starter entry when seeding the starter set (repeatable)")
     parser.add_argument("--notice-sent", action="store_true",
-                        help="the owner has been told: clear the recorded notice and exit")
+                        help="the owner has answered the notices: clear them and exit")
     parser.add_argument("--skill-dir", help=argparse.SUPPRESS)
     args = parser.parse_args()
     skill_dir = Path(args.skill_dir) if args.skill_dir else SKILL_DIR
@@ -201,18 +298,14 @@ def main() -> int:
         host_label = (args.host_label or "").strip() or _config("host-label")
         if not host_label.strip():
             raise ValueError("host label did not resolve")
-        host_dir = Path(raw_ws) / "hosts" / host_label
+        workspace = Path(raw_ws)
+        host_dir = workspace / "hosts" / host_label
         if args.notice_sent:
             (host_dir / NOTICE).unlink(missing_ok=True)
             return 0
         only = tuple(args.first_install_only) if args.first_install_only else None
-        status, target, source, not_enabled, kept = seed(Path(raw_ws), host_label, skill_dir, only)
-        new = []
-        if status == "restored":
-            new.append(f"restored {target}")
-        if not_enabled:
-            new.append(f"not-enabled {','.join(not_enabled)} kept at {kept}")
-        notices = owner_notices(host_dir, new)
+        status, target, source, _, _ = seed(workspace, host_label, skill_dir, only)
+        notices = due_notices(workspace, host_dir, time.time())
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"seed-crons: {exc}", file=sys.stderr)
         return 1

@@ -44,6 +44,7 @@ class SeedPolicy(unittest.TestCase):
         shutil.copytree(SKILL, self.repo / "skills" / "schedule-crons",
                         ignore=shutil.ignore_patterns("crons.json", "__pycache__"))
         (self.repo / "scripts").mkdir()
+        (self.repo / "src").symlink_to(REPO / "src")
         (self.repo / "scripts" / "sutando-config.sh").write_text(
             f'case "$1" in workspace) echo "{self.ws}";; host-label) echo h1;; esac\n')
         self.example = json.loads((SKILL / "crons.example.json").read_text())
@@ -143,6 +144,8 @@ class SeedPolicy(unittest.TestCase):
         out = self._seed_with_an_owner_legacy_job()
         self.assertIn(f"restored {self.target}", out)
         self.assertIn(f"not-enabled my-report kept at {self.legacy.resolve()}", out)
+        self.run_step1()
+        self._age_notice(2 * 86400)
         self.assertIn("not-enabled my-report", self.run_step1())
 
     def test_a_restored_file_tells_the_owner_their_jobs_need_adding_back(self):
@@ -161,10 +164,57 @@ class SeedPolicy(unittest.TestCase):
         self.legacy.write_text(json.dumps([{"name": "my-report", "cron": "0 9 * * *", "prompt": "x"}]))
         return self.run_step1()
 
-    def test_an_unacknowledged_notice_is_shown_once_more_then_dropped(self):
+    def _notice_record(self) -> Path:
+        return self.ws / "hosts" / "h1" / "crons-notice.json"
+
+    def _age_notice(self, seconds: int):
+        rec = json.loads(self._notice_record().read_text())
+        rec["last_shown"] -= seconds
+        self._notice_record().write_text(json.dumps(rec))
+
+    def _queued_dms(self) -> list:
+        return sorted((self.ws / "results").glob("proactive-crons-notice-*.txt"))
+
+    def test_an_unacknowledged_notice_is_kept_until_acknowledged(self):
         self.assertIn("not-enabled my-report", self._seed_with_an_owner_legacy_job())
+        for _ in range(3):
+            self.run_step1()
+        self.assertTrue(self._notice_record().exists())
+        self._age_notice(2 * 86400)
         self.assertIn("not-enabled my-report", self.run_step1())
+        self.assertTrue(self._notice_record().exists(), "a replay is not an acknowledgement")
+        ack = subprocess.run(["python3", "skills/schedule-crons/scripts/seed_crons.py", "--notice-sent"],
+                             cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(ack.returncode, 0, ack.stderr)
+        self.assertFalse(self._notice_record().exists())
+
+    def test_a_pending_notice_is_replayed_at_most_once_a_day(self):
+        self.assertIn("not-enabled my-report", self._seed_with_an_owner_legacy_job())
         self.assertNotIn("not-enabled", self.run_step1())
+        self._age_notice(86400 + 60)
+        self.assertIn("not-enabled my-report", self.run_step1())
+
+    def test_each_notice_is_queued_once_to_the_owner_dm(self):
+        self._seed_with_an_owner_legacy_job()
+        dms = self._queued_dms()
+        self.assertEqual(len(dms), 1, "queued on the seeding run")
+        body = dms[0].read_text()
+        self.assertTrue(body.startswith("[dm-only]\n"), body)
+        self.assertIn("my-report", body)
+        dms[0].unlink()  # the bridge delivered and archived it
+        self.run_step1()
+        self._age_notice(2 * 86400)
+        self.run_step1()
+        self.assertEqual(self._queued_dms(), [], "a delivered notice is not queued again")
+
+    def test_a_failed_notice_write_commits_nothing_and_a_retry_regenerates_it(self):
+        self._notice_record().mkdir(parents=True)
+        self.legacy.write_text(json.dumps([{"name": "my-report", "cron": "0 9 * * *", "prompt": "x"}]))
+        out = subprocess.run(["bash", "-c", step1_command()], cwd=self.repo, capture_output=True, text=True)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertFalse(self.target.exists(), "the config is committed only after its notice")
+        self._notice_record().rmdir()
+        self.assertIn("not-enabled my-report", self.run_step1())
 
     def test_an_acknowledged_notice_is_not_repeated(self):
         self.assertIn("not-enabled my-report", self._seed_with_an_owner_legacy_job())
