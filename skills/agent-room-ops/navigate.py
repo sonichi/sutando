@@ -516,7 +516,7 @@ def on_mention(m, workspace, now=None, owner_dm=None, window=None,
             handled = m.event_id in led.data["seen"] and not led.data.get("pending")
         if handled:
             return {"ok": True, "navigated": False, "skipped": "already navigated for this message"}
-        owner_dm = owner_dm_room(workspace, _connection(m.room_id)[0], rooms=Rooms(m.room_id))
+        owner_dm = _owner_dm_for(workspace, m.room_id)
     with Ledger(workspace) as led:
         stale = _take_due(led, now, window)
         d = decide(m, led.data, now, owner_dm, window)
@@ -538,9 +538,15 @@ def on_mention(m, workspace, now=None, owner_dm=None, window=None,
             led.data["last_nav_at"] = now
             led.data["pending"] = None
             led.save()
-    if d.kind == "skip":
-        out = {"ok": True, "navigated": False, "skipped": d.why}
-        return _with_held(out, stale, workspace, owner_dm, door_factory)
+    # A hold from another connection is shown through its own owner DM, never folded here.
+    elsewhere = stale if stale and not _same_connection(stale.get("room_id"), m.room_id) else None
+    if d.kind == "skip" or elsewhere:
+        held_dm = _owner_dm_for(workspace, stale.get("room_id")) if elsewhere else owner_dm
+        if d.kind == "skip":
+            return _with_held({"ok": True, "navigated": False, "skipped": d.why}, stale,
+                              workspace, held_dm, door_factory)
+        held = _deliver_held(stale, workspace, held_dm, door_factory)
+        stale = None
     extra = int(stale.get("folded", 0)) + 1 if stale else 0
     res = navigate(owner_dm, _arguments(m, extra), door_factory)
     if not res["ok"]:
@@ -548,7 +554,17 @@ def on_mention(m, workspace, now=None, owner_dm=None, window=None,
         if is_dm_refusal(res):
             forget_owner_dm(workspace, owner_dm)
         res["dm_line"] = _fallback_line(m, res["reason"])
-    return {**res, "navigated": res["ok"]}
+    out = {**res, "navigated": res["ok"]}
+    return {**out, "held_delivered": held} if elsewhere else out
+
+
+def _owner_dm_for(workspace, room):
+    room = str(room or "") or None
+    return owner_dm_room(workspace, _connection(room)[0], rooms=Rooms(room))
+
+
+def _same_connection(room_a, room_b):
+    return (room_a or "") == (room_b or "") or _connection(room_a or None)[0] == _connection(room_b or None)[0]
 
 
 def _take_due(led, now, window):
@@ -590,15 +606,15 @@ def flush(workspace, now=None, owner_dm=None, window=None, door_factory=open_doo
         pending = led.data.get("pending")
         if not isinstance(pending, dict):
             return {"ok": True, "navigated": False, "skipped": "nothing held"}
-        due = float(led.data.get("last_nav_at") or 0.0) + window
+        # The deadline the hold was taken with: a child's own window may differ from the caller's.
+        due = float(pending.get("flush_at") or 0.0) or float(led.data.get("last_nav_at") or 0.0) + window
         if now < due:
             return {"ok": True, "navigated": False, "skipped": "window still open", "due": due}
         led.data["pending"] = None
         led.data["last_nav_at"] = now
         led.save()
     if owner_dm is None:
-        room = str(pending.get("room_id") or "") or None
-        owner_dm = owner_dm_room(workspace, _connection(room)[0], rooms=Rooms(room))
+        owner_dm = _owner_dm_for(workspace, pending.get("room_id"))
     return _deliver_held(pending, workspace, owner_dm, door_factory, dm_writer)
 
 
@@ -672,4 +688,3 @@ def run(a):
     if delay > 0:
         time.sleep(delay)
     return flush(ws, window=window_seconds(a.window))
-

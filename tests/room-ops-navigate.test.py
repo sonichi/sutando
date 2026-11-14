@@ -266,6 +266,37 @@ class AppliesTheRule(unittest.TestCase):
                          "Dana mentioned you in G (+2 more mentions since the last pointer)")
         self.assertEqual(self.flush(1600.0)["skipped"], "nothing held")
 
+    def test_a_stranded_hold_from_another_connection_goes_to_its_own_owner_dm(self):
+        dm_b, room_b = "!ownerdm:s.space", "!group:s.space"
+        bases = {ROOM: "https://a.example", OWNER_DM: "https://a.example",
+                 room_b: "https://b.example", dm_b: "https://b.example"}
+        dms = {"https://a.example": OWNER_DM, "https://b.example": dm_b}
+        with patch.object(nav, "_connection", side_effect=lambda r: (bases.get(r, ""), {})), \
+                patch.object(nav, "owner_dm_room", side_effect=lambda ws, base, rooms=None: dms[base]):
+            self.mention("$a", 1000.0)
+            self.mention("$b", 1010.0)      # held on A; its flush never runs
+            out = nav.on_mention(nav.Mention(dm_b, "$s", "", "Bo", "DM"), self.ws, now=1500.0,
+                                 owner_dm=dm_b, window=120, door_factory=self.door)
+            self.assertEqual(out["skipped"], "the mention is in the owner DM itself")
+            self.assertEqual(self.door.calls[-1][0], OWNER_DM, "A's hold is shown in A's DM")
+            self.mention("$c", 2000.0)
+            self.mention("$d", 2010.0)      # held on A again, stranded
+            out = nav.on_mention(nav.Mention(room_b, "$e", "", "Bo", "H"), self.ws, now=2500.0,
+                                 owner_dm=dm_b, window=120, door_factory=self.door)
+        self.assertTrue(out["navigated"])
+        self.assertTrue(out["held_delivered"]["navigated"])
+        self.assertEqual([(c[0], c[2]["location"]["event_id"]) for c in self.door.calls[-2:]],
+                         [(OWNER_DM, "$d"), (dm_b, "$e")])
+        self.assertNotIn("more mention", self.door.calls[-1][2]["reason"], "never folded across")
+
+    def test_the_trailing_flush_keeps_the_window_its_hold_was_taken_with(self):
+        nav.on_mention(nav.Mention(ROOM, "$a", "", "Alice", "G"), self.ws, now=1000.0,
+                       owner_dm=OWNER_DM, window=30, door_factory=self.door, spawn_flush=self.spawned.append)
+        nav.on_mention(nav.Mention(ROOM, "$b", "", "Alice", "G"), self.ws, now=1010.0,
+                       owner_dm=OWNER_DM, window=30, door_factory=self.door, spawn_flush=self.spawned.append)
+        self.assertEqual(self.spawned, [1030.0])
+        self.assertTrue(self.flush(1030.0)["navigated"], "the child's default window is not used")
+
     def test_skipped_mention_delivers_stale_hold_without_locking_other_writers(self):
         self.mention("$a", 1000.0)
         self.mention("$b", 1010.0)
