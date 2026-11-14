@@ -49,7 +49,7 @@ class _StubRelay:
         self.release = threading.Event()
         self.hits: list[str] = []
         stub = self
-        pending = [list(first_tasks)] if first_tasks else []
+        pending = [list(first_tasks)] if first_tasks is not None else []
 
         class H(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -254,6 +254,22 @@ class StuckRelayPollTest(unittest.TestCase):
             self.assertIs(w["connected"], False, "a timeout reported connected:true")
         self.assertIn("timed out", after_poll[-1]["error"])
         self.assertEqual(b.clock.offset, 2 * _poll_budget(self.gw), "no back-off inside the grace")
+
+    def test_a_timed_out_poll_after_an_answered_one_still_reports_not_connected(self):
+        self.relay.close()
+        self.relay = _StubRelay(first_tasks=[])   # one answered empty poll, then held polls
+        with _Bridge(self.gw, self.relay, self.root) as b:
+            rc = b.run(passes=3)
+        self.assertIsNone(rc)
+        self.assertEqual(b.poll_outcomes, ["answered", "timeout", "timeout"])
+        first_ok = next((i for i, w in enumerate(b.writes) if w["connected"]), None)
+        self.assertIsNotNone(first_ok, "the answered poll reported connected")
+        ok_ts = b.writes[first_ok]["last_ok_ts"]
+        after = [w for w in b.writes[first_ok + 1:] if "timed out" in (w.get("error") or "")]
+        self.assertEqual(len(after), 2, b.writes)
+        for w in after:
+            self.assertIs(w["connected"], False, "a timeout after a success reported connected")
+            self.assertEqual(w["last_ok_ts"], ok_ts, "a timeout stamped last_ok_ts")
 
     # (b) the stuck session is named after N timeouts, with heartbeats answering
     def test_n_timeouts_with_heartbeats_answering_is_a_stuck_poll(self):

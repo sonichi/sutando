@@ -11274,8 +11274,8 @@ def main() -> None:
             # raising, so a broker without the endpoints costs one deferred log.
             _push_pool_advertisement()
             backoff = 1  # healthy round-trip → reset backoff
-            # A timed-out poll stamps nothing: last_ok_ts stays at the last answered poll.
-            _emit_gateway_status(last_poll_ok is not None, poll_ok_ts=last_poll_ok,
+            # A timed-out poll claims nothing: not connected, last_ok_ts stays at the last answer.
+            _emit_gateway_status(answered and last_poll_ok is not None, poll_ok_ts=last_poll_ok,
                                  error=None if answered else _POLL_TIMED_OUT)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):

@@ -230,11 +230,12 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
             self.assertEqual(loop.clock.slept, [1])
 
     def test_confirmed_poll_retains_evidence_through_the_inclusive_grace_boundary(self):
+        # last_ok_ts survives the grace; a timed-out poll itself never reads as serving.
         with _StatusLoop(_GW) as loop:
             ok = int(loop.clock.time()) + 1
             loop.run([(1, self.EMPTY), self.timeout(), self.timeout(_GW.POLL_TIMEOUT_GRACE_S - 1)])
             self.assertEqual([r["last_ok_ts"] for r in loop.records], [None, ok, ok, ok])
-            self.assertEqual(loop.serving, [False, True, True, True])
+            self.assertEqual(loop.serving, [False, True, False, False])
             self.assertEqual(loop.clock.slept, [])
             self.assertFalse(any("poll network error" in m for m in loop.logs))
 
@@ -257,7 +258,7 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
             task_ok = empty_ok + _GW.POLL_TIMEOUT_GRACE_S + 4
             self.assertEqual([r["last_ok_ts"] for r in loop.records],
                              [None, None, empty_ok, empty_ok, empty_ok, task_ok, task_ok])
-            self.assertEqual(loop.serving, [False, False, True, True, False, True, True])
+            self.assertEqual(loop.serving, [False, False, True, False, False, True, False])
             self.assertEqual(loop.clock.slept, [1])
             self.assertEqual(len(loop.acks), 1)
             ack = loop.acks[0]
@@ -282,7 +283,7 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
                          + [self.timeout()] * 7)
                 records = loop.records[1 + len(prefix):]
                 self.assertEqual([r["last_ok_ts"] for r in records], [ok] * 10)
-                self.assertEqual(loop.serving[1 + len(prefix):], [False, True] + [False] * 8)
+                self.assertEqual(loop.serving[1 + len(prefix):], [False] * 10)
                 self.assertIn("unexpected:", records[0]["error"])
                 self.assertTrue(any("FileExistsError" in m for m in loop.logs))
                 self.assertEqual(loop.clock.slept, [1, 1, 2, 4, 8, 16, 32, 60, 60])
@@ -308,7 +309,7 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
             self.assertEqual(failed, [True])
             self.assertEqual([r["last_ok_ts"] for r in loop.records],
                              [None, 1_000_001, 1_000_001, 1_000_001])
-            self.assertEqual(loop.serving, [False, False, True, False])
+            self.assertEqual(loop.serving, [False, False, False, False])
             self.assertEqual(loop.acks, [])
 
     def test_http_and_auth_failures_preserve_evidence_and_existing_handling(self):
