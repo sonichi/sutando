@@ -17,6 +17,7 @@ import { demoStateRef, narrationSpeakingRef, lastSpokenRef, nextDescRef, scrollP
 import { isMacOS, isWindows, macOSOnlyError, resizeImage } from './platform.js';
 import { readCaptureToken } from './util_paths.js';
 import { meetingHoldsModel } from './meeting-input-hold.js';
+import { verifyCaptureArtifact } from './capture-artifact.js';
 
 const ts = () => new Date().toLocaleTimeString('en-US', { hour12: false });
 
@@ -428,8 +429,13 @@ async function captureScreen(): Promise<string | null> {
 		const _capTok = readCaptureToken();
 		const res = await fetch('http://localhost:7845/capture', _capTok ? { headers: { 'X-Sutando-Capture-Token': _capTok } } : {});
 		const data = await res.json() as { status: string; path?: string };
-		return data.status === 'ok' && data.path ? data.path : null;
-	} catch { return null; }
+		return data.status === 'ok' && data.path ? verifyCaptureArtifact(data.path) : null;
+	} catch (error) {
+		if (error instanceof Error && error.message === 'screen-capture-server returned an untrusted path') {
+			console.warn(`${ts()} [Recording] ${error.message}`);
+		}
+		return null;
+	}
 }
 
 export function scrollDown(pixels: number = 600) {
@@ -493,7 +499,8 @@ export const scrollAndDescribeTool: ToolDefinition = {
 			const _capTok2 = readCaptureToken();
 			const captureRes = await fetch('http://localhost:7845/capture', _capTok2 ? { headers: { 'X-Sutando-Capture-Token': _capTok2 } } : {});
 			const captureData = await captureRes.json() as { status: string; path?: string };
-			const firstDesc = captureData.path ? await describeScreenshot(captureData.path) : '';
+			const capturePath = captureData.path ? verifyCaptureArtifact(captureData.path) : null;
+			const firstDesc = capturePath ? await describeScreenshot(capturePath) : '';
 			try { unlinkSync(LIVE_TRANSCRIPT_SRT_PATH); } catch {}
 			const startRaw = execFileSync('python3', ['skills/screen-record/scripts/record.py', 'start'], { timeout: 10_000 }).toString().trim();
 			let recordingPath = '';

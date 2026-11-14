@@ -14,9 +14,12 @@ from _helpers.hermetic_env import isolate_os_environ
 isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
 
 import importlib.util
+import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -49,6 +52,87 @@ class Token(unittest.TestCase):
         path.parent.mkdir(parents=True)
         path.write_text("\n")
         self.assertTrue(G.local_api_token(self.ws))
+
+    def test_concurrent_first_use_returns_the_published_token(self):
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            tokens = list(pool.map(lambda _: G.local_api_token(self.ws), range(16)))
+        self.assertTrue(tokens[0])
+        self.assertEqual(set(tokens), {tokens[0]})
+        self.assertEqual((self.ws / "state" / G.LOCAL_API_TOKEN_NAME).read_text(), tokens[0] + "\n")
+
+    def test_empty_token_file_vanishing_before_restat_still_mints(self):
+        # The empty file is judged by identity precisely so this racer can win.
+        path = self.ws / "state" / G.LOCAL_API_TOKEN_NAME
+        path.parent.mkdir(parents=True)
+        path.write_text("")
+        real_stat = Path.stat
+        probes = {"n": 0}
+
+        def vanishing_stat(self, *a, **k):
+            # The resolver's existence probe stats first; vanish at the
+            # identity re-check instead.
+            if self == path:
+                probes["n"] += 1
+                if probes["n"] >= 2:
+                    if os.path.lexists(self):
+                        os.remove(self)
+                    raise FileNotFoundError(str(self))
+            return real_stat(self, *a, **k)
+
+        with mock.patch.object(Path, "stat", vanishing_stat):
+            token = G.local_api_token(self.ws)
+        self.assertTrue(token)
+        self.assertEqual(path.read_text(), token + "\n")
+
+    def test_empty_token_file_vanishing_before_unlink_still_mints(self):
+        path = self.ws / "state" / G.LOCAL_API_TOKEN_NAME
+        path.parent.mkdir(parents=True)
+        path.write_text("")
+        real_unlink = Path.unlink
+
+        def vanishing_unlink(self, *a, **k):
+            if self == path:
+                os.remove(self)
+                raise FileNotFoundError(str(self))
+            return real_unlink(self, *a, **k)
+
+        with mock.patch.object(Path, "unlink", vanishing_unlink):
+            token = G.local_api_token(self.ws)
+        self.assertTrue(token)
+        self.assertEqual(path.read_text(), token + "\n")
+
+    def test_link_race_returns_the_other_publishers_token(self):
+        # os.link lost to a concurrent mint that left a readable token.
+        path = self.ws / "state" / G.LOCAL_API_TOKEN_NAME
+        other = "published-by-the-other-process"
+        real_link = os.link
+
+        def losing_link(src, dst, *a, **k):
+            if Path(dst) == path:
+                Path(dst).write_text(other + "\n")
+                raise FileExistsError(str(dst))
+            return real_link(src, dst, *a, **k)
+
+        with mock.patch.object(G.os, "link", losing_link):
+            self.assertEqual(G.local_api_token(self.ws), other)
+
+    def test_link_failure_with_no_published_file_raises(self):
+        def losing_link(src, dst, *a, **k):
+            raise FileExistsError(str(dst))
+
+        with mock.patch.object(G.os, "link", losing_link):
+            with self.assertRaises(FileExistsError):
+                G.local_api_token(self.ws)
+
+    def test_publish_read_retries_then_raises(self):
+        # A directory at the token path is occupied, stat-able, and never
+        # readable — the publisher is tolerated but the read retries exhaust.
+        path = self.ws / "state" / G.LOCAL_API_TOKEN_NAME
+        path.parent.mkdir(parents=True)
+        path.mkdir()
+        with self.assertRaises(RuntimeError) as ctx:
+            G.local_api_token(self.ws)
+        self.assertIsInstance(ctx.exception.__cause__, IsADirectoryError)
 
     def test_bearer_compare(self):
         self.assertTrue(G.bearer_matches("Bearer abc", "abc"))
