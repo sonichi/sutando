@@ -501,6 +501,17 @@ def _certified_nodes(tree, bindings: set) -> set:
                 walk(n)
             return names
 
+        def _breaks(nodes):
+            # A `break` of THIS loop: nested loops and scopes own theirs.
+            def walk(n):
+                if isinstance(n, ast.Break):
+                    return True
+                if isinstance(n, (ast.For, ast.AsyncFor, ast.While, ast.FunctionDef,
+                                  ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    return False
+                return any(walk(ch) for ch in ast.iter_child_nodes(n))
+            return any(walk(n) for n in nodes)
+
         def _arms_of(node):
             # Every construct whose branches are ALTERNATIVES, not a sequence, as
             # (statements, names to invalidate first). `finally` runs on every path.
@@ -525,9 +536,13 @@ def _certified_nodes(tree, bindings: set) -> set:
                 rest = node.orelse or []
                 # Any later iteration can enter with a body-assigned name invalidated.
                 carried = tuple(_assigned_in(node.body))
-                return [(node.body + rest, tgt + carried), (rest, ())]
+                arms = [(node.body + rest, tgt + carried), (rest, ())]
+                # A break leaves after any prefix of an iteration and skips orelse.
+                return arms + ([([], tgt + carried)] if _breaks(node.body) else [])
             visit_expr(node.subject)
-            cases = [(c.body, ()) for c in node.cases]
+            cases = [(c.body, tuple(n for p in ast.walk(c.pattern)
+                                    for n in (getattr(p, "name", None), getattr(p, "rest", None)) if n))
+                     for c in node.cases]
             return cases if _match_is_exhaustive(node) else cases + [([], ())]
 
         def branch_merge(node):
@@ -1022,6 +1037,28 @@ class HandlerAndLoopTargetInvalidation(unittest.TestCase):
                 with self.subTest(loop=loop, canonical=canonical):
                     self.assertEqual(self._run_real(source), 'd:task-x@gw' if canonical else 'raw')
                     self.assertEqual(self._d(source), {} if canonical else {('probe.py', 'mint'): 1})
+
+    @unittest.skipUnless(_MATCH_NODES, "match statements need Python 3.10+")
+    def test_a_match_capture_invalidates_only_its_own_binding(self):
+        for binding in ('d', 'e'):
+            source = ("from ag2_sparrow.identity import delivery_id, TaskId\n"
+                      "def mint():\n    d = delivery_id(TaskId('task-x'), 'gw')\n"
+                      f"    match 'raw':\n        case {binding}:\n            pass\n"
+                      "    return {'delivery_id': d}\n")
+            with self.subTest(binding=binding):
+                self.assertEqual(self._run_real(source), 'raw' if binding == 'd' else 'd:task-x@gw')
+                self.assertEqual(self._d(source), {('probe.py', 'mint'): 1} if binding == 'd' else {})
+
+    def test_a_break_that_skips_the_loop_else_keeps_the_raw_value_counted(self):
+        for exit_ in ('break', 'pass'):
+            source = ("from ag2_sparrow.identity import delivery_id, TaskId\n"
+                      "def mint():\n    d = 'raw'\n"
+                      f"    for _ in [1]:\n        {exit_}\n"
+                      "    else:\n        d = delivery_id(TaskId('task-x'), 'gw')\n"
+                      "    return {'delivery_id': d}\n")
+            with self.subTest(exit=exit_):
+                self.assertEqual(self._run_real(source), 'raw' if exit_ == 'break' else 'd:task-x@gw')
+                self.assertEqual(self._d(source), {('probe.py', 'mint'): 1} if exit_ == 'break' else {})
 
     def test_exception_target_invalidates_only_its_own_binding(self):
         for binding in ('d', 'e'):
