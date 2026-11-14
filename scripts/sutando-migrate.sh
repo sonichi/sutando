@@ -2084,6 +2084,13 @@ rollback_main() {
     # state/migration-backup-*.tar.* files (they're outside the tar).
     # Empty backup (0-byte) means dest was empty at backup time; skip extract +
     # rely solely on the cleanup walk below to restore to empty state.
+    # Resolve the interpreter BEFORE extracting: a half-restored tree with no
+    # cleanup pass is worse than a rollback that never started.
+    local rb_py; rb_py="$(resolve_python "$REPO_DIR")"
+    if [ -z "$rb_py" ]; then
+        echo "rollback: no usable python interpreter" >&2
+        exit 1
+    fi
     # Auto-detect gz vs not — tar -xf works on both gzipped and plain tarballs
     # on both BSD and GNU implementations (uses magic-byte detection).
     if [ -s "$backup_path" ]; then
@@ -2094,47 +2101,78 @@ rollback_main() {
     else
         echo "rollback: empty backup (dest was bootstrap-only at backup time); skipping extract"
     fi
-    # Clean files added since backup that are NOT in the backup tarball.
-    # Read tarball entries → reference set → find dest's surface files not in set → delete.
-    local tar_listing
-    tar_listing="$(mktemp -t sutando-rollback.XXXXXX)"
-    if [ -s "$backup_path" ]; then
-        # -tf (not -tzf): media-heavy backups above the gzip threshold are plain
-        # .tar; GNU tar errors on -z for those (bsdtar auto-detects, GNU doesn't
-        # in list mode) and the old `|| true` turned that error into an empty
-        # listing — which the walk below read as "nothing to preserve" and
-        # deleted every file just restored. -tf magic-byte-detects on both.
-        tar -tf "$backup_path" 2>/dev/null > "$tar_listing" || true
-        # Guard: a non-empty backup must yield a non-empty listing. An empty
-        # listing here means tar failed (corrupt archive, unsupported format) —
-        # abort rather than let the cleanup walk mass-delete the restored tree.
-        if [ ! -s "$tar_listing" ]; then
-            echo "rollback: backup is non-empty but listing came back empty (tar list failed?) — refusing post-restore cleanup" >&2
-            rm -f "$tar_listing" || true
-            exit 1
-        fi
-    else
-        : > "$tar_listing"  # empty backup: nothing to preserve, everything is "added since"
-    fi
-    [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] tar_listing size=$(wc -l < "$tar_listing") backup_path size=$(stat -f %z "$backup_path")" >&2
-    local sd
-    [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] rollback walk: DEST_REAL=$DEST_REAL" >&2
-    for sd in "${WORKSPACE_SURFACE_DIRS[@]}" "${WORKSPACE_SURFACE_FILES[@]}"; do
-        [ ! -e "$DEST_REAL/$sd" ] && continue
-        [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] rollback walking $DEST_REAL/$sd" >&2
-        while IFS= read -r f; do
-            local rel="${f#"$DEST_REAL"/}"
-            # If this rel is NOT in the tar listing, it was added after backup → remove.
-            # -xF: match the whole line as a fixed string — rel interpolated as a
-            # regex made bracket/metachar filenames fail to self-match and get
-            # deleted on every rollback. `--` guards a leading-dash rel.
-            if ! grep -qxF -- "$rel" "$tar_listing" 2>/dev/null; then
-                [ "${SUTANDO_MIGRATE_DEBUG:-0}" = "1" ] && echo "[debug] rollback rm $rel" >&2
-                rm -f "$f"
-            fi
-        done < <(find "$DEST_REAL/$sd" -type f 2>/dev/null)
-    done
-    rm -f "$tar_listing" || true
+    # Remove surface files the backup does not hold. Names stay whole (a newline
+    # is part of one name) and nothing resolving outside the dest is unlinked.
+    "$rb_py" - "$DEST_REAL" "$backup_path" "${WORKSPACE_SURFACE_DIRS[@]}" "${WORKSPACE_SURFACE_FILES[@]}" <<'PY' || exit 1
+import os, stat, sys, tarfile
+
+dest, backup, *surface = sys.argv[1:]
+debug = os.environ.get("SUTANDO_MIGRATE_DEBUG", "0") == "1"
+root = os.path.realpath(dest)
+keep = set()
+if os.path.getsize(backup) > 0:
+    # tarfile auto-detects plain vs gzip, so a media-heavy plain .tar lists too.
+    try:
+        with tarfile.open(backup, "r:*") as tf:
+            for m in tf:
+                name = m.name
+                while name.startswith("./"):
+                    name = name[2:]
+                keep.add(name.rstrip("/"))
+    except (tarfile.TarError, OSError):
+        keep = set()
+    # A non-empty backup that lists nothing means the archive is unreadable;
+    # cleaning against an empty set would delete every file just restored.
+    if not keep:
+        print("rollback: backup is non-empty but listing came back empty (tar list failed?) "
+              "— refusing post-restore cleanup", file=sys.stderr)
+        sys.exit(1)
+if debug:
+    print(f"[debug] tar_listing size={len(keep)} backup_path size={os.path.getsize(backup)}", file=sys.stderr)
+    print(f"[debug] rollback walk: DEST_REAL={root}", file=sys.stderr)
+
+
+def inside_dest(path):
+    parent = os.path.realpath(os.path.dirname(path))
+    return parent == root or parent.startswith(root + os.sep)
+
+
+def regular_files(top):
+    try:
+        st = os.lstat(top)
+    except OSError:
+        return
+    if stat.S_ISREG(st.st_mode):
+        yield top
+    elif stat.S_ISDIR(st.st_mode):
+        for d, _subdirs, names in os.walk(top, followlinks=False):
+            for n in names:
+                p = os.path.join(d, n)
+                try:
+                    if stat.S_ISREG(os.lstat(p).st_mode):
+                        yield p
+                except OSError:
+                    pass
+
+
+for sd in surface:
+    top = os.path.join(root, sd)
+    if debug and os.path.lexists(top):
+        print(f"[debug] rollback walking {top}", file=sys.stderr)
+    for f in regular_files(top):
+        rel = os.path.relpath(f, root)
+        if rel in keep:
+            continue
+        if not inside_dest(f):
+            print(f"rollback: refusing to remove {f!r}: outside {root}", file=sys.stderr)
+            continue
+        if debug:
+            print(f"[debug] rollback rm {rel!r}", file=sys.stderr)
+        try:
+            os.unlink(f)
+        except OSError as e:
+            print(f"rollback: could not remove {f!r}: {e}", file=sys.stderr)
+PY
     # Drop sentinels matching this backup id
     rm -f "$DEST_REAL/state/.migrated-from-"*"-$ROLLBACK_ID" 2>/dev/null || true
     # Drop legacy/<src-tag>/ sidecars (only the script ever writes there)
@@ -2147,7 +2185,9 @@ emit_json() {
     # machine-readable JSON dump for downstream tooling (dashboards, skill
     # wrappers, the eventual --commit dry-run UI). Python3 is the bash-friendly
     # path — sutando already requires it.
-    python3 - "$DEST_REAL" "$A_REAL_OK" "$B_REAL_OK" "$C_REAL_OK" "$XSRC_INDEX" <<'PY'
+    local ej_py; ej_py="$(resolve_python "$REPO_DIR")"
+    [ -n "$ej_py" ] || { echo "emit-json: no usable python interpreter" >&2; return 1; }
+    "$ej_py" - "$DEST_REAL" "$A_REAL_OK" "$B_REAL_OK" "$C_REAL_OK" "$XSRC_INDEX" <<'PY'
 import json, sys, os
 from collections import defaultdict
 dest, a, b, c, idx_path = sys.argv[1:6]
