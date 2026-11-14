@@ -6,8 +6,9 @@ The rule, in order:
 
 1. the per-host file exists: do nothing, except record that it existed
    (``hosts/<host>/.crons-seeded``);
-2. it existed once (that marker is present): seed the starter set only. A copy kept anywhere
-   else is older than what the owner had, so it is never reused;
+2. it existed once (that marker is present): seed the starter set only, and print
+   ``restored <path>`` so the owner learns their own jobs need adding back. A copy kept
+   anywhere else is older than what the owner had, so it is never reused;
 3. the interim ``<workspace>/crons/<host>.json`` exists: it is this host's own workspace state
    from the pre-``hosts/`` layout, so it is published whole;
 4. otherwise seed the starter set: ``crons.example.json`` without its ``"opt_in": true``
@@ -24,6 +25,10 @@ jobs of the owner's own, such as a customised entry under a starter name. The fi
 ``hosts/<host>/crons.legacy.json`` (a new dated name if that holds other content) and their names
 are printed on a ``not-enabled`` line, so the agent can ask the owner. Nothing from it is
 registered without the owner's word.
+
+Owner notices (``restored`` and ``not-enabled`` lines) are also recorded in
+``hosts/<host>/crons-notice.json``. The next run prints them once more unless
+``--notice-sent`` cleared the record after the owner was told; then the record is dropped.
 
 The per-host file is published with temp file + ``os.link``, which refuses an existing name,
 so a concurrent seeder or the owner is never clobbered.
@@ -44,6 +49,7 @@ SKILL_DIR = Path(__file__).resolve().parents[1]
 REPO = SKILL_DIR.parents[1]
 MARKER = ".crons-seeded"
 LEGACY_KEPT = "crons.legacy.json"
+NOTICE = "crons-notice.json"
 HISTORY = "crons.example.history.json"
 
 
@@ -110,6 +116,7 @@ def seed(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR,
     host_dir = workspace / "hosts" / host_label
     target = host_dir / "crons.json"
     marker = host_dir / MARKER
+    restoring = marker.exists()
     if target.exists():
         if not marker.exists():
             marker.touch()
@@ -147,7 +154,22 @@ def seed(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR,
             if not _publish(kept, raw) and kept.read_bytes() != raw:
                 kept = host_dir / f"crons.legacy.{int(time.time())}.json"
                 _publish(kept, raw)
-    return "seeded", target, source, not_enabled, kept
+    return ("restored" if restoring else "seeded"), target, source, not_enabled, kept
+
+
+def owner_notices(host_dir: Path, new: list[str]) -> list[str]:
+    """Record new notices, or replay an unacknowledged one a single more time."""
+    record = host_dir / NOTICE
+    if new:
+        record.write_text(json.dumps({"lines": new}) + "\n")
+        return new
+    try:
+        data = json.loads(record.read_text())
+    except (OSError, ValueError):
+        return []
+    record.unlink(missing_ok=True)
+    lines = data.get("lines") if isinstance(data, dict) else None
+    return [x for x in lines if isinstance(x, str)] if isinstance(lines, list) else []
 
 
 def main() -> int:
@@ -157,6 +179,8 @@ def main() -> int:
     parser.add_argument("--host-label")
     parser.add_argument("--first-install-only", action="append", metavar="NAME",
                         help="seed only this starter entry when seeding the starter set (repeatable)")
+    parser.add_argument("--notice-sent", action="store_true",
+                        help="the owner has been told: clear the recorded notice and exit")
     parser.add_argument("--skill-dir", help=argparse.SUPPRESS)
     args = parser.parse_args()
     skill_dir = Path(args.skill_dir) if args.skill_dir else SKILL_DIR
@@ -165,14 +189,26 @@ def main() -> int:
         if not raw_ws:
             raise ValueError("workspace did not resolve")
         host_label = (args.host_label or "").strip() or _config("host-label")
+        if not host_label.strip():
+            raise ValueError("host label did not resolve")
+        host_dir = Path(raw_ws) / "hosts" / host_label
+        if args.notice_sent:
+            (host_dir / NOTICE).unlink(missing_ok=True)
+            return 0
         only = tuple(args.first_install_only) if args.first_install_only else None
         status, target, source, not_enabled, kept = seed(Path(raw_ws), host_label, skill_dir, only)
+        new = []
+        if status == "restored":
+            new.append(f"restored {target}")
+        if not_enabled:
+            new.append(f"not-enabled {','.join(not_enabled)} kept at {kept}")
+        notices = owner_notices(host_dir, new)
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"seed-crons: {exc}", file=sys.stderr)
         return 1
-    print(f"{status} {target}" + (f" from {source}" if source else ""))
-    if not_enabled:
-        print(f"not-enabled {','.join(not_enabled)} kept at {kept}")
+    print(f"{'seeded' if status == 'restored' else status} {target}" + (f" from {source}" if source else ""))
+    for line in notices:
+        print(line)
     return 0
 
 

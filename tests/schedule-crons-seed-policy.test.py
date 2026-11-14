@@ -124,6 +124,34 @@ class SeedPolicy(unittest.TestCase):
         path = Path(out.split("kept at ", 1)[1].strip())
         self.assertIn(own, json.loads(path.read_text()))
 
+    def test_a_restored_file_tells_the_owner_their_jobs_need_adding_back(self):
+        self.target.parent.mkdir(parents=True)
+        self.target.write_text('[{"name":"mine"}]')
+        self.run_step1()
+        self.target.unlink()
+        out = self.run_step1()
+        self.assertIn(f"restored {self.target}", out)
+        self.assertIn("main-loop", self.names())
+
+    def test_a_first_seed_is_not_reported_as_restored(self):
+        self.assertNotIn("restored", self.run_step1())
+
+    def _seed_with_an_owner_legacy_job(self) -> str:
+        self.legacy.write_text(json.dumps([{"name": "my-report", "cron": "0 9 * * *", "prompt": "x"}]))
+        return self.run_step1()
+
+    def test_an_unacknowledged_notice_is_shown_once_more_then_dropped(self):
+        self.assertIn("not-enabled my-report", self._seed_with_an_owner_legacy_job())
+        self.assertIn("not-enabled my-report", self.run_step1())
+        self.assertNotIn("not-enabled", self.run_step1())
+
+    def test_an_acknowledged_notice_is_not_repeated(self):
+        self.assertIn("not-enabled my-report", self._seed_with_an_owner_legacy_job())
+        ack = subprocess.run(["python3", "skills/schedule-crons/scripts/seed_crons.py", "--notice-sent"],
+                             cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(ack.returncode, 0, ack.stderr)
+        self.assertNotIn("not-enabled", self.run_step1())
+
     def test_first_install_only_seeds_just_the_named_starter_jobs(self):
         out = subprocess.run(
             ["python3", "skills/schedule-crons/scripts/seed_crons.py",
