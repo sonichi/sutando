@@ -508,6 +508,18 @@ def host_of_url(url: str) -> str:
         return ""
 
 
+def origin_of_url(url: str) -> str:
+    """`host:port` of an http(s) URL, the port made explicit (443, 80) so a default and a stated one
+    agree; '' for anything else. Two URLs name the same endpoint only when these are equal."""
+    try:
+        u = urllib.parse.urlsplit(url or "")
+        host, port = (u.hostname or "").lower(), u.port
+    except ValueError:
+        return ""
+    port = port or {"https": 443, "http": 80}.get(u.scheme.lower())
+    return f"{host}:{port}" if host and port else ""
+
+
 def worker_instance_for(server: str, worker: str) -> str:
     """The slug of `worker`'s own identity on `server`: the server's slug and the worker id's head,
     within the 32-character bound and distinct from the server's own slug."""
@@ -2325,8 +2337,9 @@ def mcp_seat_server(workspace: Optional[Path] = None, environ: Optional[Mapping[
     """The server the seat's agent MCP descriptor mints on: the one its proxy reads (`MCP_DESCRIPTOR_ENV`,
     which the proxy keeps for this resolver, wherever it lives), else the workspace's. Taken from the
     descriptor alone, never from which row is primary now (set_primary rewrites no descriptor): its own
-    agent's server; for a descriptor naming no agent, the server whose row's gateway is the descriptor's
-    own relay or mint host, or the row its lane names outright. "" when there is no descriptor at all.
+    agent's server; for a descriptor naming no agent, the server whose row's gateway is exactly the
+    descriptor's own relay or mint endpoint (host and port, a default port as stated), or the row its
+    lane names outright. "" when there is no descriptor at all.
     NoWorkerCredential `descriptor_missing` when the variable names a descriptor that cannot be read (a
     seat told to use one is never resolved by another), and `descriptor_unresolved` when a descriptor is
     present but names no server by these, or names two."""
@@ -2351,8 +2364,9 @@ def mcp_seat_server(workspace: Optional[Path] = None, environ: Optional[Mapping[
         rows = _read(record_path(workspace))
     except (OSError, SchemaError):
         rows = []
-    hosts = {host_of_url(str(desc.get(k) or "")) for k in ("relay", "mint_url")} - {""}
-    by_host = {str(r["server"]).lower() for r in rows if host_of_url(str(r.get("gateway_url") or "")) in hosts}
+    # The exact endpoint, port included: a look-alike host or another port on the same host is not the row's.
+    origins = {origin_of_url(str(desc.get(k) or "")) for k in ("relay", "mint_url")} - {""}
+    by_host = {str(r["server"]).lower() for r in rows if origin_of_url(str(r.get("gateway_url") or "")) in origins}
     lane = str(desc.get("lane") or "")
     by_lane = {str(r["server"]).lower() for r in _core_rows(rows) if lane and lane != "primary"
                and r["instance"] == lane}
