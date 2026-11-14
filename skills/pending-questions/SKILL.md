@@ -18,10 +18,11 @@ capability's own, unless `PENDING_QUESTIONS_COLLAB_URL` names one (env, then thi
 tier above both.
 
 ```bash
-python3 skills/pending-questions/scripts/pq.py ask "<question>" [--context "<why / options>"] \
+python3 skills/pending-questions/scripts/pq.py ask "<question>" [--context "<why>"] \
     [--task-file <workspace>/tasks/<task>.txt] [--urgency live|durable] \
     [--default-action "<what Approve does>" --reason "<why>"] [--option "Hold=wait"] \
-    [--priority High|Medium|Low]
+    [--ref 'label=#123;url=https://…;title=…;state=ready'] [--effect "Hold=nothing merges"] \
+    [--primary "Hold"] [--open-question] [--priority High|Medium|Low]
 python3 skills/pending-questions/scripts/pq.py list [--json]
 python3 skills/pending-questions/scripts/pq.py reconcile
 python3 skills/pending-questions/scripts/pq.py resolve <ask-id> [--answered]
@@ -29,6 +30,13 @@ python3 skills/pending-questions/scripts/pq.py remind [--force]
 python3 skills/pending-questions/scripts/pq.py clicks [--json]
 python3 skills/pending-questions/scripts/pq.py ack <ask-id> --token <token>
 ```
+
+**A question with a known set of answers passes `--option "Label=what it does"` once per answer**
+(and may mark one `--primary`); `--context` is the why, never the choices. Its first sentence is
+the card's headline, so keep it short and put the background in `--context`. Text only is for a
+question whose answer really is free text. A question or context that spells its answers out as
+prose ("(1) … (2) …", "Options:", "A) … B)", "yes/no", "X or Y?") with no `--option` is refused
+with exit 2 and nothing is asked; `--open-question` says the answer is free text.
 
 **Trigger: any time you would write a question for the owner into terminal or summary text, file
 it instead** with `ask` (or `scripts/ask-owner.py`; add `--unless-open` to file nothing when an
@@ -86,8 +94,35 @@ count (`python3 src/pending_questions_reader.py summary`).
 A question asked with `--default-action` and/or `--option` whose destination is s.space (its
 task's bridge, else the bridge the owner was last active on) is asked as a decision card, built by
 `src/hitl/cards.py` (the one builder every card producer uses): one button per choice — with a
-default, one per `ordered_options()` entry, Approve first and carrying it; with options alone,
-exactly the options as given, with no Approve — and `subject.choices` holding each consequence.
+default of its own, one per `ordered_options()` entry, Approve first and carrying it; with options
+alone, exactly the options as given, with no Approve — and `subject.choices` holding each
+consequence. A default that names one of the options (case and outer whitespace ignored) marks
+that option as the proposed one (`subject.default`, and the reason reads "Why <label>") and adds
+no button: the buttons are the option labels, in the order given.
+
+Optional, and on the wire only when given:
+
+- `--ref` (repeatable, at most 20): `key=value` pairs joined by `;`. `label` and `url` (https) are
+  required; `title`, `state` (`ready|waiting|open|merged|closed`), `state_label` and `group` are
+  optional; a value holds no `;`. They become `subject.refs`, and are listed as links, one per
+  line (`label — title: url`), wherever the question is asked as text.
+- `--effect "<button label>=what clicking it does"` (repeatable): `subject.effects`, keyed by that
+  button's action id.
+- `--primary "<button label>"`: `style: "primary"` on that button.
+
+A label that names no button is refused before anything is asked.
+
+Every word the owner reads comes from one place, `src/owner_question.py`: this skill builds its
+`Question` (the buttons in the row's order, the row and the machine as details) and that module
+renders the card, the plain text, the reminder and the pointer. The card's title and the text's
+first line name the agent ("<display name> asks you to decide", "Your agent" when no name is
+recorded; `src/agent_local_name.py`), never the machine. The card message's first line is the
+question's first sentence; the why follows, then the details (the row, "From your Mac named …"),
+which the client folds. The buttons carry the choices, so the card does not type them out; a
+question asked as text lists them as a short lettered list. No rendering links the row or asks
+the owner to set its Status: you keep the row (a click closes it; when the owner answers in
+their own words, close it: `pq.py answered --task-file <the task>` for a reply to the question's
+card, `pq.py resolve <id> --answered` otherwise).
 
 - **Order.** The card is built and its id allocated; the question is held in the outbox and its
   row is written, both naming that id (`**Sent:** card hitl_<id> for ag2space owner-dm (decision

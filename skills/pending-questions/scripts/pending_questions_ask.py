@@ -47,6 +47,8 @@ from proactive_routing import BRIDGE_CHANNELS, proactive_filename, should_claim_
 from result_markers import neutralize_markers
 from undelivered_quarantine import quarantine_dir
 from util_paths import host_label
+import owner_question
+from agent_local_name import local_name as asker_name
 from pending_questions_clicks import CARD_RUNTIME
 import pending_questions_lease as lease_mod
 
@@ -147,12 +149,24 @@ def sent_at(body: str, workspace: Optional[Path] = None) -> Optional[float]:
     return c[1]
 
 
-def card_pointer_body(title: str, host: str) -> str:
-    """A pointer to the card, never a decision surface: no options, nothing a reply answers."""
-    return (f"[dm-only]\nA question from the {host} core is waiting for you as a decision card in your "
-            "AG2 Space DM, and it may not have arrived there.\n\n"
-            f"\u201c{' '.join(neutralize_markers(title or '').split())}\u201d\n\n"
-            "Open that card to choose; a reply to this message does not answer it.\n")
+def ask_for_reply(workspace: Path, event_id: str, manager=None) -> Optional[str]:
+    """The open question whose card is the message `event_id` replies to; None when that message
+    is not a question card of this agent's or the card is already settled."""
+    if not (event_id or "").strip():
+        return None
+    from hitl.cards import manager_for  # noqa: PLC0415
+    manager = manager or manager_for(Path(workspace))
+    for req in manager.active():
+        if (req.runtime == CARD_RUNTIME and (req.subject or {}).get("ask_id")
+                and manager.store.projection(req.id).get("event_id") == event_id.strip()):
+            return str(req.subject["ask_id"])
+    return None
+
+
+def card_pointer_body(title: str, asker: str) -> str:
+    """A pointer to a card that may not have arrived; the owner's own words still answer it."""
+    asked = owner_question.Question(headline=title or "", asker=asker)
+    return "[dm-only]\n" + neutralize_markers(asked.pointer())
 
 
 def claim_pointer(manager, card_id: str, now: float) -> Optional[str]:
@@ -234,7 +248,7 @@ def send_card_pointers(questions, workspace: Path, now: Optional[float] = None, 
                 if _pointer_owed(manager, c[0], token) is None:
                     continue  # posted, settled or re-claimed since the claim: no pointer
                 write_proactive(Path(workspace) / "results", name, card_pointer_body(q.get("title", ""),
-                                                                                   host or host_label()))
+                                                                                   asker_name(workspace=Path(workspace))))
             mark_pointer_sent(manager, c[0], token, now)
             out.append((q.get("ask_id"), name))
         except Exception as e:  # noqa: BLE001
@@ -331,25 +345,40 @@ def destination_from_task(text: str, workspace: Optional[Path] = None) -> Destin
     return Destination(bridge=source)
 
 
-def proactive_body(question: str, context: Optional[str], host: str,
-                   dest: Destination, link: Optional[str] = None, intro: Optional[str] = None):
-    """(body, routed): routed is True when a `[channel:]` redirect leads the body.
-    `link` is where the owner can also answer, when the store knows it; `intro` is one
-    extra paragraph the store adds the first time."""
-    routed = dest.bridge in _ROOM_MARKER_BRIDGES and bool(dest.channel)
-    lines = [f"[channel: {dest.channel}]" if routed else "[dm-only]",
-             f"Question for you from the {host} core — it needs your word:", "",
-             neutralize_markers(question).strip()]
-    if context and context.strip():
-        lines += ["", neutralize_markers(context).strip()]
-    if link:
-        lines += ["", f"Reply here, or set its Status on the row: {neutralize_markers(link)}"]
+def question_model(question: str, context: Optional[str] = None, default_action: Optional[str] = None,
+                   reason: Optional[str] = None, options=(), extra: Optional[dict] = None,
+                   asker: str = "", host: str = "", link: Optional[str] = None,
+                   intro: Optional[str] = None, ask_id: str = "") -> "owner_question.Question":
+    """The question as `owner_question` renders it. This store adds only what is its own: the
+    buttons in its row's order with their ids, and the row and the machine as details."""
+    extra = extra or {}
+    notes = {action_id(default_action, options, label): text for label, text in extra.get("effects") or ()}
+    primary = action_id(default_action, options, extra["primary"]) if extra.get("primary") else ""
+    choices = card_choices(default_action, options) if wants_card(default_action, options) else []
+    buttons = [owner_question.Option(id=aid, label=label, effect=what, note=notes.get(aid, ""),
+                                     primary=aid == primary)
+               for (aid, label), (_, what) in zip(card_actions(default_action, options), choices)]
+    proposed = proposed_label(default_action, options) if choices else None
+    if choices and (default_action or "").strip():
+        proposed_id = action_id(default_action, options, proposed) if proposed is not None else buttons[0].id
     else:
-        lines += ["", "Reply here."]
-    body = "\n".join(lines) + "\n"
-    if intro and intro.strip():
-        body += "\n" + neutralize_markers(intro).strip() + "\n"
-    return body, routed
+        proposed_id = ""
+    details = [d for d in (owner_question.row_detail(link), owner_question.host_detail(host)) if d]
+    return owner_question.Question.from_text(
+        question, context, options=buttons, refs=owner_question.refs_from(extra.get("refs")),
+        details=details, asker=asker, reason=reason or "", proposed=proposed_id, intro=intro or "",
+        extra_subject={"ask_id": ask_id} if ask_id else {})
+
+
+def proactive_body(question: str, context: Optional[str], asker: str,
+                   dest: Destination, intro: Optional[str] = None, refs=(),
+                   default_action: Optional[str] = None, reason: Optional[str] = None, options=()):
+    """(body, routed): routed is True when a `[channel:]` redirect leads the body. The words
+    are `owner_question`'s; this adds only the routing marker."""
+    routed = dest.bridge in _ROOM_MARKER_BRIDGES and bool(dest.channel)
+    asked = question_model(question, context, default_action, reason, options, {"refs": refs},
+                           asker=asker, intro=intro)
+    return (f"[channel: {dest.channel}]" if routed else "[dm-only]") + "\n" + neutralize_markers(asked.text()), routed
 
 
 def wants_card(default_action: Optional[str], options) -> bool:
@@ -373,11 +402,27 @@ def card_choices(default_action: Optional[str], options) -> list:
     return [(str(a).strip(), str(b).strip()) for a, b in options or () if str(a).strip()]
 
 
+def proposed_label(default_action: Optional[str], options) -> Optional[str]:
+    """The option's own label when the default names one of the options; None otherwise."""
+    from pending_questions_store import default_option  # noqa: PLC0415
+    at = default_option(default_action, options)
+    return None if at is None else card_choices(default_action, options)[at][0]
+
+
 def card_actions(default_action: Optional[str], options) -> list:
-    """(id, label) per button; `approve` only for the Approve that carries a proposed default."""
-    has_default = bool((default_action or "").strip())
-    return [("approve" if has_default and i == 0 else f"option-{i}", label)
+    """(id, label) per button; `approve` only for the Approve that carries a default of its own."""
+    own_default = bool((default_action or "").strip()) and proposed_label(default_action, options) is None
+    return [("approve" if own_default and i == 0 else f"option-{i}", label)
             for i, (label, _) in enumerate(card_choices(default_action, options))]
+
+
+def action_id(default_action: Optional[str], options, label: str) -> str:
+    """The id of the button with this label (case and outer whitespace ignored); ValueError without one."""
+    want = (label or "").strip().lower()
+    for aid, shown in card_actions(default_action, options):
+        if shown.lower() == want:
+            return aid
+    raise ValueError(f"no button is labelled {label!r}")
 
 
 def card_consequences(default_action: Optional[str], options) -> dict:
@@ -392,34 +437,20 @@ def card_room(dest: Destination) -> str:
     return (dest.channel or "") if dest.bridge == CARD_BRIDGE else ""
 
 
-def card_message(question: str, context: Optional[str], default_action: Optional[str],
-                 reason: Optional[str], options, link: Optional[str] = None,
-                 intro: Optional[str] = None) -> str:
-    parts = [question.strip()]
-    if context and context.strip():
-        parts.append(context.strip())
-    if reason and reason.strip() and (default_action or "").strip():
-        parts.append(f"Why Approve: {reason.strip()}")
-    parts.append("\n".join(f"{label}: {what}" if what else label
-                           for label, what in card_choices(default_action, options)))
-    if link:
-        parts.append(f"Or set its Status on the row: {link}")
-    if intro and intro.strip():
-        parts.append(intro.strip())
-    return "\n\n".join(parts)
-
-
 def build_card(ask_id: str, question: str, context: Optional[str], host: str,
                default_action: Optional[str], reason: Optional[str], options,
-               link: Optional[str] = None, intro: Optional[str] = None, room: str = ""):
-    """The question's card, built but not stored, with its id already allocated."""
+               link: Optional[str] = None, intro: Optional[str] = None, room: str = "",
+               extra: Optional[dict] = None, asker: Optional[str] = None):
+    """The question's card, built but not stored, with its id already allocated. `extra` is the
+    optional {refs: [...], effects: [(button label, text)], primary: button label}. Its words
+    and its subject are `owner_question`'s; the machine is named only in the details."""
     from hitl.cards import choice_request, new_id  # noqa: PLC0415
+    asked = question_model(question, context, default_action, reason, options, extra,
+                           asker=asker or "", host=host, link=link, intro=intro, ask_id=ask_id)
     return choice_request(
-        card_message(question, context, default_action, reason, options, link, intro),
-        card_actions(default_action, options), ask_id,
-        {"ask_id": ask_id, "choices": card_consequences(default_action, options)},
-        runtime=CARD_RUNTIME, title=f"Question from the {host} core",
-        device={"id": f"{CARD_RUNTIME}:{ask_id}", "name": host}, req_id=new_id(), room=room)
+        asked.card_message(), asked.card_actions(), ask_id, asked.card_subject(),
+        runtime=CARD_RUNTIME, title=asked.card_title(),
+        device={"id": f"{CARD_RUNTIME}:{ask_id}", "name": asked.who}, req_id=new_id(), room=room)
 
 
 def write_proactive(results: Path, name: str, body: str) -> Path:
@@ -451,13 +482,15 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
                    workspace: Optional[Path] = None, host: Optional[str] = None, now: Optional[float] = None,
                    link: Optional[str] = None, intro: Optional[str] = None,
                    default_action: Optional[str] = None, reason: Optional[str] = None,
-                   options=(), priority: str = "Medium", manager=None) -> dict:
+                   options=(), priority: str = "Medium", manager=None,
+                   extra: Optional[dict] = None) -> dict:
     """Hold the question in the outbox, naming how it is asked: by a card built here (a default or
     options, bound for AG2 Space) but NOT yet stored — the caller writes its row, then calls
     `create_card` — or by the proactive file, queued here. Nothing raises past here: `card_error`
     says why a card was not used, `send_error` why no file was queued, `outbox_error` why no
     record was saved — and a caller with a store must not write its row without `outbox`.
-    `manager` is the HITL store handle (tests); None uses the workspace's."""
+    `manager` is the HITL store handle (tests); None uses the workspace's. `extra` is
+    `build_card`'s; its refs are also listed in the text when the question is asked as text."""
     from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
     ws = Path(workspace) if workspace else resolve_workspace(migrate=False)
     host = host or host_label()
@@ -465,7 +498,7 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
     ask_id = new_ask_id(now)
     out = {"ask_id": ask_id, "heading": entry_heading(question, now), "workspace": str(ws), "host": host,
            "bridge": None, "channel": None, "where": None, "proactive_file": None, "send_error": None,
-           "card": None, "card_error": None,
+           "card": None, "card_error": None, "refs": list((extra or {}).get("refs") or ()),
            "sent_line": None, "outbox": None, "outbox_error": None,
            "question": question_dict(ask_id, question, context, now, default_action, reason, options, priority)}
     dest = Destination()
@@ -478,7 +511,7 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
     if wants_card(default_action, options) and card_reaches_owner(dest, ws):
         try:
             card = build_card(ask_id, question, context, host, default_action, reason, options, link, intro,
-                              card_room(dest))
+                              card_room(dest), extra, asker_name(workspace=ws))
         except Exception as e:  # noqa: BLE001 — asked as text below
             out["card_error"] = f"{type(e).__name__}: {e}"
     if card is not None:
@@ -504,7 +537,10 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
 
 
 def _ask_by_text(out: dict, question, context, host, dest, link, intro) -> None:
-    body, routed = proactive_body(question, context, host, dest, link, intro)
+    asked = out["question"]
+    body, routed = proactive_body(question, context, asker_name(workspace=Path(out["workspace"])), dest, intro,
+                                  out.get("refs") or (), asked.get("default_action"), asked.get("reason"),
+                                  asked.get("options") or ())
     out["bridge"], out["channel"] = dest.bridge, dest.channel if routed else None
     out["where"] = (f"{dest.bridge} {dest.channel}" if routed else
                     f"{dest.bridge} owner-dm" if dest.bridge else "owner-dm (last-active bridge)")
@@ -576,10 +612,10 @@ def ask_owner(question: str, context: Optional[str] = None, urgency: str = "live
               task_file: Optional[str] = None, workspace: Optional[Path] = None,
               host: Optional[str] = None, now: Optional[float] = None,
               default_action: Optional[str] = None, reason: Optional[str] = None,
-              options=(), priority: str = "Medium") -> dict:
+              options=(), priority: str = "Medium", extra: Optional[dict] = None) -> dict:
     """The whole ask with no room store: queue, hold in the outbox, notify."""
     out = queue_question(question, context, task_file, workspace, host, now, None, None,
-                         default_action, reason, options, priority)
+                         default_action, reason, options, priority, extra=extra)
     create_card(out)
     out.update({"record": f"outbox {out['outbox']}" if out["outbox"] else None,
                 "db_error": out["outbox_error"] or "no room database store", "link": None,

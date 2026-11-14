@@ -109,9 +109,9 @@ caps this file and refuses date stamps in it).
    `python3 skills/proactive-loop/scripts/memory-index-budget.py --adding "<row>" && <append the row>`
    (0 safe · 1 refuse, casualty named · 2 cannot answer). On refusal free room FIRST and check the row is still reachable
    from its hub before removing it; which rows go is the owner's call.
-8. **Ask.** `python3 scripts/ask-owner.py "<question>" [--context "<why / options>"] [--task-file <workspace>/tasks/<task>.txt]`
-   — never hand-edit. It records the row in the owner's Pending questions database (the outbox holds it
-   while the room is unreachable), queues the question to the owner (an owner-DM task's conversation,
+8. **Ask.** `python3 scripts/ask-owner.py "<question>" [--context "<why>"] [--option "<Label>=<effect>"…] [--task-file <workspace>/tasks/<task>.txt]`
+   — one `--option` per known answer, never prose choices; never hand-edit. It files his Pending questions row (the outbox holds it
+   while the room is unreachable), queues it to the owner (an owner-DM task's conversation,
    else his DM) and fires the macOS notification. Read its output: a `FAILED` line is not an ask;
    confirm the id with `pending_questions_reader.py list --json`. Then pivot; never block.
 9. **Watcher.** Ask for this inbox, never host-wide (on a pool host a worker's watcher satisfies any

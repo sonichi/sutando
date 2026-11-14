@@ -76,7 +76,7 @@ def ask_owner(title: str, body: str, workspace: Optional[Path]) -> dict:
     if repo is None:
         raise OSError("cannot locate the repo (scripts/ask-owner.py)")
     argv = [sys.executable, str(repo / "scripts" / "ask-owner.py"), title,
-            "--context", body.rstrip(), "--urgency", "live"]
+            "--context", body.rstrip(), "--urgency", "live", "--open-question"]
     if workspace:
         argv += ["--workspace", str(workspace)]
     try:
