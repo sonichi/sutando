@@ -235,7 +235,7 @@ class SeedPolicy(unittest.TestCase):
         for n in range(1, 40):
             (kept_dir / f"crons.legacy.{n}.json").write_text("[]")
         out = self._seed_with_an_owner_legacy_job()
-        latest = kept_dir / "crons.legacy.latest.json"
+        latest = kept_dir / f"crons.legacy.{hashlib.sha256(self.legacy.read_bytes()).hexdigest()[:16]}.json"
         self.assertIn(f"not-enabled my-report kept at {latest}", out)
         self.assertIn("my-report", latest.read_text())
         self.assertFalse((kept_dir / "crons.legacy.40.json").exists())
@@ -362,6 +362,78 @@ class SeedPolicy(unittest.TestCase):
         self.assertEqual(len(second), 2, "a new episode is queued under a new outbox name")
         self.run_step1()
         self.assertEqual(self._queued_dms(), second, "retries of one episode reuse its name")
+
+    def test_a_retried_backup_never_claims_jobs_the_legacy_file_no_longer_holds(self):
+        self._owner_job()
+        mod = self._seeder()
+
+        def fails(*_a):
+            raise OSError("disk full")
+        mod.keep_legacy = fails
+        self._seed_in_process(mod)
+        self.legacy.write_text(json.dumps([{"name": "other", "cron": "0 1 * * *", "prompt": "y"}]))
+        self._age_notice(2 * 86400)
+        out = self.run_step1()
+        line = next(x for x in out.splitlines() if x.startswith("not-enabled"))
+        self.assertNotIn("kept at", line)
+        self.assertIn("lost", line)
+        self.assertIn("my-report", line)
+        self.assertFalse((self.ws / "hosts" / "h1" / "crons.legacy.json").exists())
+        bodies = " ".join(p.read_text() for p in self._queued_dms())
+        self.assertIn("my-report", bodies)
+        self.assertIn("app update", bodies)
+
+    def test_overflow_backups_never_replace_one_a_notice_still_names(self):
+        host = self.ws / "hosts" / "h1"
+        host.mkdir(parents=True)
+        (host / "crons.legacy.json").write_text("[]")
+        for n in range(1, 21):
+            (host / f"crons.legacy.{n}.json").write_text("[]")
+        first = {"name": "first-job", "cron": "0 9 * * *", "prompt": "a"}
+        self.legacy.write_text(json.dumps([first]))
+        self.run_step1()
+        self.target.unlink()
+        second = {"name": "second-job", "cron": "0 9 * * *", "prompt": "b"}
+        self.legacy.write_text(json.dumps([second]))
+        self.run_step1()
+        rec = json.loads(self._notice_record().read_text())
+        kept = {n["names"][0]: n["kept"] for n in rec["notices"] if n.get("names")}
+        self.assertNotEqual(kept["first-job"], kept["second-job"])
+        self.assertIn(first, json.loads(Path(kept["first-job"]).read_text()))
+        self.assertIn(second, json.loads(Path(kept["second-job"]).read_text()))
+
+    def test_a_losing_run_never_drops_a_notice_an_earlier_run_recorded(self):
+        self.assertIn("not-enabled my-report", self._seed_with_an_owner_legacy_job())
+        self.target.unlink()
+        mod = self._seeder()
+        real = mod._publish
+
+        def owner_first(path, content):
+            if path == self.target:
+                self.target.write_text('[{"name":"mine"}]')
+            return real(path, content)
+        mod._publish = owner_first
+        self.assertEqual(self._seed_in_process(mod)[0], "exists")
+        lines = [n["line"] for n in json.loads(self._notice_record().read_text())["notices"]]
+        self.assertTrue(any(x.startswith("not-enabled my-report") for x in lines), lines)
+
+    def test_a_migrated_notice_is_queued_once_even_if_saving_fails_after_the_enqueue(self):
+        self.target.parent.mkdir(parents=True)
+        self.target.write_text('[{"name":"mine"}]')
+        kept = self.ws / "hosts" / "h1" / "crons.legacy.json"
+        self._notice_record().write_text(json.dumps({"lines": [f"not-enabled my-report kept at {kept}"]}))
+        mod = self._seeder()
+        real = mod._write_record
+
+        def save_fails_after_enqueue(host_dir, record):
+            if self._queued_dms():
+                raise OSError("no space left on device")
+            return real(host_dir, record)
+        mod._write_record = save_fails_after_enqueue
+        with self.assertRaises(OSError):
+            mod.due_notices(self.ws, self.ws / "hosts" / "h1", 10**10)
+        self.run_step1()
+        self.assertEqual(len(self._queued_dms()), 1, self._queued_dms())
 
     def test_notice_sent_keeps_notices_never_shown(self):
         self._owner_job()

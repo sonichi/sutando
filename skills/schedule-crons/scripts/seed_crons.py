@@ -24,15 +24,18 @@ that match neither a published entry nor any template entry ever shipped
 jobs of the owner's own, such as a customised entry under a starter name. Before the per-host
 file is published, the legacy file is kept as ``hosts/<host>/crons.legacy.json``
 (``crons.legacy.<n>.json`` when that name holds other content, up to 20, then
-``crons.legacy.latest.json``) and their names are printed on a ``not-enabled`` line, so the agent can
-ask the owner. If no copy can be written, the line says the only copy is in the checkout, which an
-app update replaces, and later runs retry the copy while the notice is pending. Nothing from it is
+``crons.legacy.<digest>.json``; no backup is ever replaced) and their names are printed on a
+``not-enabled`` line, so the agent can ask the owner. If no copy can be written, the line says the
+only copy is in the checkout, which an app update replaces, and later runs retry the copy while the
+notice is pending, only if the legacy file still holds the bytes the notice was raised for;
+otherwise the notice says those jobs were lost. Nothing from it is
 registered without the owner's word.
 
 Owner notices (``restored`` and ``not-enabled``) are recorded in ``hosts/<host>/crons-notice.json``
 before the per-host file is published, written whole, under a per-host lock that serializes
 seeder runs. A notice already pending under the same id is merged, not repeated; a run that loses
-the race to publish withdraws only the notices it still owns. Each notice is queued once to the
+the race to publish withdraws only the notices it created and still owns. A migrated notice is
+saved with its episode before it is queued. Each notice is queued once to the
 owner's DM through the proactive outbox (``results/proactive-crons-notice-*.txt``, named by the
 notice's id and an episode id drawn when it is first recorded, so a recurrence after
 ``--notice-sent`` is a new outbox item and a retry is the same one); a failed
@@ -191,7 +194,7 @@ def seed(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR,
 
 def keep_legacy(host_dir: Path, raw: bytes) -> Path:
     """Write ``raw`` beside the host file under the first name free or already holding it;
-    past ``MAX_BACKUPS`` names, into ``crons.legacy.latest.json``, replaced whole."""
+    past ``MAX_BACKUPS`` names, under a name of its own digest. No backup is ever replaced."""
     for n in range(MAX_BACKUPS + 1):
         kept = host_dir / (LEGACY_KEPT if n == 0 else f"crons.legacy.{n}.json")
         if _publish(kept, raw):
@@ -201,9 +204,10 @@ def keep_legacy(host_dir: Path, raw: bytes) -> Path:
                 return kept
         except OSError:
             continue
-    latest = host_dir / "crons.legacy.latest.json"
-    _replace_whole(latest, raw)
-    return latest
+    kept = host_dir / f"crons.legacy.{hashlib.sha256(raw).hexdigest()[:16]}.json"
+    if _publish(kept, raw) or kept.read_bytes() == raw:
+        return kept
+    raise OSError(f"{kept} holds other content")
 
 
 def _restored_notice(target: Path) -> dict:
@@ -236,7 +240,16 @@ def _describe_not_enabled(notice: dict, kept: Path | None) -> dict:
     return notice
 
 
-_EMPTY = {"notices": [], "last_shown": 0}
+def _describe_lost(notice: dict) -> dict:
+    names = notice["names"]
+    notice.update(kept=None, lost=True,
+                  line=f"not-enabled {','.join(names)} lost: {notice['legacy']} was replaced by an "
+                       "app update before it could be backed up",
+                  message=f"I found an old schedule file with jobs I did not turn on: {', '.join(names)}. "
+                          "It may have held jobs of your own, but an app update replaced it before I "
+                          "could save a copy, so those jobs are lost. Tell me if you want any of them "
+                          "set up again.")
+    return notice
 
 
 def _migrate_line(line: str) -> dict | None:
@@ -330,14 +343,17 @@ def _merge(record: dict, new: list[dict], token: str) -> dict:
     for n in new:
         same = next((i for i, old in enumerate(notices) if old["id"] == n["id"]), None)
         if same is None:
-            notices.append(dict(n, queued=False, shown=False, by=token, episode=os.urandom(8).hex()))
+            notices.append(dict(n, queued=False, shown=False, by=token, created=token,
+                                episode=os.urandom(8).hex()))
         else:
             notices[same] = dict(notices[same], by=token)
     return {"notices": notices, "last_shown": 0}
 
 
 def _drop_owned(record: dict, token: str) -> dict:
-    return dict(record, notices=[n for n in record["notices"] if n.get("by") != token])
+    """Withdraw what this run created and still owns; a notice it only took over stays."""
+    return dict(record, notices=[n for n in record["notices"]
+                                 if not (n.get("by") == token and n.get("created") == token)])
 
 
 def _queue_owner_dm(workspace: Path, notice: dict) -> None:
@@ -357,11 +373,16 @@ def due_notices(workspace: Path, host_dir: Path, now: float) -> list[str]:
     record = _read_record(host_dir)
     if not record["notices"]:
         return []
+    _write_record(host_dir, record)  # a migrated episode is saved before anything is queued
     for notice in record["notices"]:
-        if notice["id"].startswith("not-enabled:") and notice.get("kept") is None:
+        if notice["id"].startswith("not-enabled:") and notice.get("kept") is None \
+                and not notice.get("lost"):
             try:
-                legacy = Path(notice["legacy"])
-                _describe_not_enabled(notice, keep_legacy(host_dir, legacy.read_bytes()))
+                raw = Path(notice["legacy"]).read_bytes()
+                if notice["id"] == "not-enabled:" + hashlib.sha256(raw).hexdigest()[:24]:
+                    _describe_not_enabled(notice, keep_legacy(host_dir, raw))
+                else:
+                    _describe_lost(notice)
                 notice["queued"] = False
             except (OSError, KeyError):
                 pass
