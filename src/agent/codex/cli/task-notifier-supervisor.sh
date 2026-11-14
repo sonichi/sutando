@@ -203,11 +203,11 @@ stop_child() {
 
 # Our token: pid plus this process's start identity, so a recycled pid cannot
 # impersonate us. Read once — /proc is absent on macOS, so ps is the portable source.
-# Prints the start identity of pid $1; fails when it cannot be measured. An
-# empty `ps` piped through `tr` is not an identity, it is a blind probe.
+# Prints the start identity of pid $1, the same under any locale or timezone; fails
+# when it cannot be measured (an empty `ps` is a blind probe, not an identity).
 _start_of() {
   local out
-  out="$(ps -o lstart= -p "$1" 2>/dev/null)" || return 1
+  out="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null)" || return 1
   [ -n "$out" ] || return 1
   printf '%s' "$out" | tr -s ' ' '_'
 }

@@ -304,6 +304,20 @@ class LeaseOwnershipTest(unittest.TestCase):
         self._await_run("B")
         self.assertIsNone(other.poll(), "a second socket was suppressed by the first")
 
+    def test_a_holder_started_under_another_locale_or_timezone_is_still_live(self):
+        self._bg("A", LC_ALL="C", LANG="C", TZ="UTC")
+        self._await_run("A")
+        token = (self.d / next(p.name for p in self.d.iterdir() if p.name.startswith("sutando-notifier-")
+                               and p.is_dir()) / "token").read_text()
+        for tag, env in (("tz", {"LC_ALL": "C", "TZ": "America/Los_Angeles"}),
+                         ("locale", {"LC_ALL": "de_DE.UTF-8", "LANG": "de_DE.UTF-8", "TZ": "Asia/Shanghai"})):
+            r = self._run(tag, **env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertNotIn(tag, self._ran(), f"a {tag} difference judged the live holder stale")
+        self.assertEqual(self._ran(), ["A"])
+        self.assertEqual(next(p for p in self.d.iterdir() if p.name.startswith("sutando-notifier-")
+                              and p.is_dir()).joinpath("token").read_text(), token)
+
     # --- P1: reclamation is serialized and re-judged under its own lock ---
 
     def _plant_stale(self):
@@ -605,7 +619,7 @@ with open(sys.argv[1], 'w') as guard:
         alive AND matches its start identity is contended, never broken."""
         # Spelled exactly as the script spells its own identity (`tr -s ' ' '_'`
         # over the raw ps line), or a leading blank alone makes it "recycled".
-        ident = subprocess.run(["bash", "-c", "ps -o lstart= -p $1 | tr -s ' ' '_'", "_",
+        ident = subprocess.run(["bash", "-c", "LC_ALL=C TZ=UTC ps -o lstart= -p $1 | tr -s ' ' '_'", "_",
                                 str(os.getpid())], capture_output=True, text=True).stdout
         if not ident.strip("_\n"):
             self.skipTest("ps cannot report this process's start time here")
