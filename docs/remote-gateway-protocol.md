@@ -896,6 +896,31 @@ so:
   as task results, counted on the item, so a restart keeps the count): 401/403, 408, 425,
   429, and a connection that was refused or a host that did not resolve. Another 4xx parks
   at once. A 400 naming an upgraded owner DM holds the file until the DM is repointed.
+- **A room that refuses the sender ends the send.** A 403 whose JSON error says the sender
+  is not in the room (`sender is not in this room`, `not a room member`, or Matrix's `User … not in room !…`; a bare `M_FORBIDDEN` or "not a member" is not enough, since a bad token or a workspace refusal uses them too) is
+  the room's answer, not the bearer's: the gateway authenticated the request first, so
+  nothing is raised to the poll loop's credential recovery. Only a join can change it, so the
+  send gets `send_failure_policy.ROOM_REFUSAL_ATTEMPTS` (5) tries on the outbox's own backoff
+  (about 30s, which covers a join or an invite acceptance still landing); then the item parks
+  (`permanent-refusal`) and the file moves to `results/undelivered/` with a log line that
+  prints the requeue command (with `--reset-attempts`, so the resend gets the whole budget). It
+  names its root through `bash scripts/sutando-config.sh workspace` (run it from the engine
+  checkout), so the log carries no home path. The
+  wording is read from the body's `error`, `errcode`, `message` and `detail`. Any other
+  403 keeps the retry above (`send_failure_policy.is_room_membership_refusal` decides).
+- **A runtime prompt card whose room refuses the sender** is charged to that card alone: the
+  pass goes on to the cards behind it with no bridge backoff, the card waits out its own
+  backoff, and after `ROOM_REFUSAL_ATTEMPTS` sends that revision is marked failed (logged,
+  and kept live where health-check sees it). Its failure notice, refused by the same room, is
+  sent once to the owner DM instead; if the DM refuses it too, it is recorded as sent and not
+  repeated. Any other 403 still raises to the caller's backoff.
+- **A private review DM whose room refuses the sender** (a non-owner result the guard
+  withheld) gets the same `ROOM_REFUSAL_ATTEMPTS` sends, 2 s doubling apart. Then the cached
+  review room is no longer trusted and the same review is sent once to a new private room,
+  which later reviews use; the result stays withheld (no room post) and is settled. If the new
+  room refuses too, the review is logged as `DROPPED` (not delivered to the owner) with the
+  path of its record, kept in `state/withheld-team-results/`. Any other 403 keeps the result
+  for the next pass, as before.
 - **A message about a task** is named `proactive-about-<task id>--<ts>.txt`
   (`proactive_routing.about_task_filename`). In the task's own room it posts in the task's
   thread: an ask already in a thread keeps that thread's root, a top-level ask is rooted at

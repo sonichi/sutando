@@ -210,6 +210,9 @@ KNOWN_HEADER_KEYS = (
     # trusted bridge wrote it; the guard defangs a forged `platform_card:`
     # body line the same as `attachments:`.
     "platform_card",
+    # A card click's `space.ag2.card_click` ({card_id, action}, one-line JSON) as the trusted bridge
+    # passed it on; header status defangs a body line claiming one.
+    "card_click",
     # Which instance a task belongs to; header status defangs forged
     # body-line claims, consumers may verify before executing.
     "instance_id",

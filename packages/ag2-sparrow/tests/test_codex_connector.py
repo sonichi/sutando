@@ -59,9 +59,10 @@ def write_text(work, task_id, text, mtime=None):
     return p
 
 
-def write_task(work, task_id, body, mtime=None, tier="owner", channel="local-chat"):
+def write_task(work, task_id, body, mtime=None, tier="owner", channel="local-chat", kind=None):
     text = ("id: %s\ntimestamp: 2026-10-16T00:00:00Z\nsource: chat\nchannel_id: %s\naccess_tier: %s\n"
-            "priority: normal\ntask: %s\n" % (task_id, channel, tier, body))
+            "%spriority: normal\ntask: %s\n" % (task_id, channel, tier, "channel_kind: %s\n" % kind if kind else "",
+                                                body))
     return write_text(work, task_id, text, mtime)
 
 
@@ -284,6 +285,38 @@ class TierPolicyTest(unittest.TestCase):
             ids = [m["thread"] for m in metrics(d)]
             self.assertEqual(ids[0], "bound-0001", "room A resumed the bound thread")
             self.assertNotEqual(ids[1], "bound-0001", "room B did not inherit it")
+
+    def test_resume_thread_carries_the_owners_conversation_into_the_dm_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            write_task(d, "task-chat-r", "in a room", channel="!r:x", kind="room", mtime=now - 40)
+            write_task(d, "task-chat-d1", "in the DM", channel="!dm:x", kind="dm", mtime=now - 30)
+            write_task(d, "task-chat-d2", "DM again", channel="!dm:x", kind="dm", mtime=now - 20)
+            write_task(d, "task-chat-g", "guest in a DM", channel="!g:x", kind="dm", tier="guest", mtime=now - 10)
+            extra = ["--resume-thread", "owner-thread-0001", "--allow-non-owner"]
+            self.assertEqual(run_connector(d, once=4, extra=extra), 0)
+            ids = {m["task"]: m["thread"] for m in metrics(d)}
+            self.assertNotEqual(ids["task-chat-r"], "owner-thread-0001", "a room starts its own thread")
+            self.assertEqual(ids["task-chat-d1"], "owner-thread-0001", "the owner's DM continues it")
+            self.assertEqual(ids["task-chat-d2"], "owner-thread-0001", "and keeps it")
+            self.assertNotEqual(ids["task-chat-g"], "owner-thread-0001", "a guest never gets it")
+            marker = Path(d) / "state" / cc.RESUME_MARKER
+            self.assertEqual(marker.read_text().strip(), "owner-thread-0001")
+            # A restart with the same id resumes the DM's saved thread; it is not taken again.
+            (Path(d) / "state" / "threads" / cc.channel_key("!dm:x")).write_text("later-0002\n!dm:x\n")
+            write_task(d, "task-chat-d3", "after a restart", channel="!dm:x", kind="dm")
+            self.assertEqual(run_connector(d, once=1, extra=extra), 0)
+            self.assertEqual(metrics(d)[-1]["thread"], "later-0002")
+
+    def test_a_resume_thread_that_cannot_resume_falls_back_and_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as d:
+            now = time.time()
+            write_task(d, "task-chat-1", "one", channel="!dm:x", kind="dm", mtime=now - 20)
+            write_task(d, "task-chat-2", "two", channel="!dm:x", kind="dm", mtime=now - 10)
+            self.assertEqual(run_connector(d, once=2, extra=["--resume-thread", "stale-0003"]), 0)
+            ids = [m["thread"] for m in metrics(d)]
+            self.assertNotEqual(ids[0], "stale-0003")
+            self.assertEqual(ids[0], ids[1], "the new thread is kept, not a second failing resume")
 
     def test_non_owner_turn_runs_in_an_empty_temp_dir_removed_afterwards(self):
         with tempfile.TemporaryDirectory() as d:

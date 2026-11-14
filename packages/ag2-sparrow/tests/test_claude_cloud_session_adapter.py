@@ -261,13 +261,26 @@ class PayloadTest(unittest.TestCase):
         self.assertIsNotNone(ui, prompt)
         self.assertEqual(re.findall(r"`(mcp__ag2_space__\w+)`", ui.group(1)),
                          ["mcp__ag2_space__ui_describe", "mcp__ag2_space__ui_request", "mcp__ag2_space__ui_result"])
-        forbidden = prompt[allowed.end() + ui.end():prompt.index("Post with the AG2 Space connector")]
+        account = re.search(r"Only when the\nrouting line has `tier=owner`, you may also call (.*?) for that item",
+                            prompt[allowed.end() + ui.end():], re.S)
+        self.assertIsNotNone(account, prompt)
+        self.assertEqual(re.findall(r"`(mcp__ag2_space__\w+)`", account.group(1)),
+                         ["mcp__ag2_space__space_action_read"])
+        self.assertIn("pass `action`, `arguments` and that item's `task_id`, and nothing else", prompt)
+        forbidden = prompt[allowed.end() + ui.end() + account.end():prompt.index("Post with the AG2 Space connector")]
         self.assertIn("Never call", forbidden)
         for tool in ("room_list", "room_inspect", "room_action_read", "relay_token_issue", "agent_link",
                      "agent_unlink"):
             self.assertIn("`%s`" % tool, forbidden)
         self.assertIn("or any other AG2 Space connector tool", forbidden)
         self.assertIn("Claude Code's own tools (shell, files, web, subagents, skills)", prompt)
+
+    def test_session_prompt_keeps_the_agent_list_to_the_owners_dm(self):
+        prompt = PROMPT_MD.read_text(encoding="utf-8")
+        start = prompt.index("you may also call `mcp__ag2_space__space_action_read`")
+        rule = " ".join(prompt[start:prompt.index("Never call", start)].split())
+        self.assertIn("read `account.agents.list` only when `channel_kind=dm`", rule)
+        self.assertIn("don't post the list there: say it's private and ask them to ask you in your DM", rule)
 
     def test_session_prompt_pins_the_message_count(self):
         prompt = PROMPT_MD.read_text(encoding="utf-8")

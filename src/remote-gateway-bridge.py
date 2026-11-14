@@ -112,6 +112,9 @@ def _sutando_apply_worker_label_overrides(labels: dict, config_version: int,
 _SUTANDO_WORKER_LABEL_APPLIER = (_sutando_apply_worker_label_overrides
                                  if _WORKER_LABEL_SCRIPT.is_file() else None)
 
+# Logged recovery commands name the workspace through its resolver, never its absolute path.
+_SUTANDO_WORKSPACE_RESOLVER = "bash scripts/sutando-config.sh workspace"
+
 # Runtime self-report, injected BEFORE the exec (anything after it is
 # unreachable when the exec'd source's own __main__ guard fires; see #3285).
 def _build_sha(repo):

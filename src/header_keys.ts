@@ -53,6 +53,7 @@ export const HEADER_KEYS: readonly string[] = [
 	'media_form',
 	'attachments',
 	'platform_card',
+	'card_click',
 	'instance_id',
 	'collaborator',
 	'requested_worker',
