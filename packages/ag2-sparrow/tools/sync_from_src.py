@@ -49,6 +49,7 @@ MAP = {
     "src/gateway_credential_sources.py": "gateway_credential_sources.py",
     # the non-blocking, bounded reader every adapter uses for a credential file
     "src/bounded_file_read.py": "bounded_file_read.py",
+    "src/media_mime.py": "media_mime.py",
     # which homeservers are DotSpaces; the bridge's IPv4 preference asks it per gateway host
     "src/dotspace.py": "dotspace.py",
     "src/workspace_lock.py": "workspace_lock.py",

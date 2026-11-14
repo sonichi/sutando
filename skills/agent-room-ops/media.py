@@ -14,10 +14,26 @@ import base64
 import os
 import tempfile
 
-from _gateway import (gate_allows, load_gate, gateway, http_request, degrade_reason,
+from _gateway import (_core_src_on_path, gate_allows, load_gate, gateway, http_request, degrade_reason,
                     quote, HTTPError, URLError)
 
 MAX_BYTES = 25 * 1024 * 1024
+
+
+def _mime_of(name):
+    """The media type to declare, or None when the core `src/` is not reachable.
+
+    None means the payload carries no `mime` and the server falls back to its own default, as it
+    did before V148 — the skill keeps working standalone rather than growing a second guess that
+    could drift from `src/media_mime.py`.
+    """
+    if not _core_src_on_path():
+        return None
+    try:
+        from media_mime import guess_mime
+    except ImportError:
+        return None
+    return guess_mime(name)
 
 
 def _result(ok, *, path=None, ref=None, room_id=None, reason=None, bytes_=None):
@@ -127,9 +143,16 @@ def send_media(room_id, path, agent_mxid=None, *, gate=None, caption=None):
         return _result(False, room_id=room_id, reason=f"read failed: {e}")
     import json
     headers = {**headers, "Content-Type": "application/json"}
-    payload = json.dumps({"filename": _safe_name(os.path.basename(path)),
-                          "content_b64": base64.b64encode(content).decode("ascii"),
-                          "caption": caption}).encode()
+    name = _safe_name(os.path.basename(path))
+    body = {"filename": name,
+            "content_b64": base64.b64encode(content).decode("ascii"),
+            "caption": caption}
+    # Declared, not left to the server's octet-stream default: that default is what drew an
+    # agent's video as a file card instead of a player (V148).
+    mime = _mime_of(name)
+    if mime:
+        body["mime"] = mime
+    payload = json.dumps(body).encode()
     url = f"{base}/v1/rooms/{quote(room_id)}/media"
     try:
         http_request("POST", url, headers, data=payload)

@@ -321,6 +321,7 @@ from . import (agent_identity, diagnostics, gateway_credential_io, gateway_crede
                gateway_credentials, gateway_instance, local_task_protocol, routing_migrations,
                setup_fetch)
 from .bounded_file_read import read_private, read_regular, read_regular_text
+from .media_mime import guess_mime
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
@@ -5669,7 +5670,8 @@ def _upload_attachment(room: str, path_str: str) -> tuple[bool, str]:
     safe_room = urllib.parse.quote(room, safe="")
     try:
         _req("POST", f"/v1/rooms/{safe_room}/media",
-             {"filename": name, "content_b64": content_b64}, timeout=_UPLOAD_TIMEOUT_S)
+             {"filename": name, "content_b64": content_b64, "mime": guess_mime(name)},
+             timeout=_UPLOAD_TIMEOUT_S)
     except urllib.error.HTTPError as e:
         return False, f"HTTP {e.code}"
     except (urllib.error.URLError, TimeoutError) as e:
@@ -5692,7 +5694,8 @@ def _upload_task_attachment(wire_id: str, ordinal: int, path_str: str,
     safe_tid = urllib.parse.quote(wire_id, safe="")
     try:
         _req("POST", f"/v1/tasks/{safe_tid}/media",
-             {"ordinal": ordinal, "filename": name, "content_b64": content_b64},
+             {"ordinal": ordinal, "filename": name, "content_b64": content_b64,
+              "mime": guess_mime(name)},
              timeout=_UPLOAD_TIMEOUT_S)
     except urllib.error.HTTPError as e:
         if e.code == 409:
