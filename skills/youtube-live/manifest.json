@@ -1,0 +1,20 @@
+{
+  "name": "youtube-live",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Stream a source (test pattern, media file, image slate, or screen) to YouTube Live over RTMP via ffmpeg.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  },
+  "config": {
+    "ingest_base": "rtmp://a.rtmp.youtube.com/live2",
+    "resolution": "1280x720",
+    "fps": 30,
+    "video_bitrate": "4500k",
+    "audio_bitrate": "128k",
+    "buffer_size": "9000k",
+    "avf_screen_spec": "1:0"
+  }
+}
