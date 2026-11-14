@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -151,6 +152,21 @@ class SeedPolicy(unittest.TestCase):
                              cwd=self.repo, capture_output=True, text=True)
         self.assertEqual(ack.returncode, 0, ack.stderr)
         self.assertNotIn("not-enabled", self.run_step1())
+
+    def test_an_occupied_backup_name_is_never_reported_as_the_new_capture(self):
+        kept_dir = self.ws / "hosts" / "h1"
+        kept_dir.mkdir(parents=True)
+        (kept_dir / "crons.legacy.json").write_text('[{"name":"older"}]')
+        (kept_dir / "crons.legacy.1.json").write_text('[{"name":"older-still"}]')
+        now = int(time.time())
+        for t in range(now - 5, now + 60):
+            (kept_dir / f"crons.legacy.{t}.json").write_text('[{"name":"older-dated"}]')
+        own = {"name": "my-report", "cron": "0 9 * * *", "prompt": "x"}
+        self.legacy.write_text(json.dumps([own]))
+        out = self.run_step1()
+        path = Path(out.split("kept at ", 1)[1].split("\n", 1)[0].strip())
+        self.assertIn(own, json.loads(path.read_text()))
+        self.assertEqual(json.loads((kept_dir / "crons.legacy.1.json").read_text()), [{"name": "older-still"}])
 
     def test_first_install_only_seeds_just_the_named_starter_jobs(self):
         out = subprocess.run(

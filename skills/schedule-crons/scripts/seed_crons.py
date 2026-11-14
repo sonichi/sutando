@@ -22,7 +22,7 @@ older releases' installer filled it from the example, so its jobs prove no opt-i
 that match neither a published entry nor any template entry ever shipped
 (``crons.example.history.json`` holds their digests; compared without the template-only ``opt_in`` key) may include
 jobs of the owner's own, such as a customised entry under a starter name. The file is kept as
-``hosts/<host>/crons.legacy.json`` (a new dated name if that holds other content) and their names
+``hosts/<host>/crons.legacy.json`` (``crons.legacy.<n>.json`` when that name holds other content) and their names
 are printed on a ``not-enabled`` line, so the agent can ask the owner. Nothing from it is
 registered without the owner's word.
 
@@ -42,7 +42,6 @@ import json
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -150,11 +149,18 @@ def seed(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR,
         except ValueError:
             not_enabled = []
         if not_enabled:
-            kept = host_dir / LEGACY_KEPT
-            if not _publish(kept, raw) and kept.read_bytes() != raw:
-                kept = host_dir / f"crons.legacy.{int(time.time())}.json"
-                _publish(kept, raw)
+            kept = keep_legacy(host_dir, raw)
     return ("restored" if restoring else "seeded"), target, source, not_enabled, kept
+
+
+def keep_legacy(host_dir: Path, raw: bytes) -> Path:
+    """Write ``raw`` beside the host file under the first name free or already holding it."""
+    n = 0
+    while True:
+        kept = host_dir / (LEGACY_KEPT if n == 0 else f"crons.legacy.{n}.json")
+        if _publish(kept, raw) or kept.read_bytes() == raw:
+            return kept
+        n += 1
 
 
 def owner_notices(host_dir: Path, new: list[str]) -> list[str]:
