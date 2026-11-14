@@ -41,10 +41,14 @@ Write `[no-send]` as the result and stop when either of these holds:
      `room.actions.search`, `room.actions.describe` it, then read that row.
    If you cannot read either, say so in your answer and do what the request allows without it.
 2. **Do what the confirmed request asks**, as your owner would want it. When it asks for a
-   result written into the page or row it names, that write is part of the confirmed ask: make
-   it with your own rights and do not ask again. Ask first, in the DM, before anything
-   irreversible or anything beyond the ask (another page or row, a room message, an email, an
-   invite).
+   result written into the page or row it names, that write is part of the confirmed ask and
+   needs no second confirm, but only when the result holds no data read from your owner's
+   connected accounts or device (mail, calendar, contacts, message history, files from
+   Drive/Dropbox/Notion, credentials, health or financial records). When it would, write
+   nothing to the room: put the result in the DM answer and ask there whether to write a
+   redacted or summary version to the row. Every Commons write passes `asked_by` = your owner
+   (`room.action.execute`). Ask first, in the DM, before anything irreversible or anything
+   beyond the ask (another page or row, a room message, an email, an invite).
 3. **Answer once, as the task result.** It lands top level in your owner's DM. Keep it short
    and end with a link back to the page: the briefing's `page_link` when it has one, else the
    `link` an Action returned for it, else `surface_link(<room id>, <surface>, <page id>)` from
