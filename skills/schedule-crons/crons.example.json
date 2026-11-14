@@ -21,6 +21,11 @@
     "prompt": "Run python3 skills/learned-skills/scripts/detect-learned-skills.py to scan recent task archives for repeated workflow patterns and propose candidate learned skills. Gated on state/learned-skills-enabled.sentinel (toggled from Settings → Skills → Behavior); the script exits early when the gate is off."
   },
   {
+    "name": "own-pr-shepherd",
+    "cron": "23 * * * *",
+    "prompt_skill": "own-pr-shepherd"
+  },
+  {
     "name": "example-digest",
     "opt_in": true,
     "cron": "2 6 * * *",
