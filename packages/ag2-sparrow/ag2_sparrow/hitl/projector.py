@@ -17,6 +17,11 @@ from __future__ import annotations
 import time
 from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
+try:
+    from ..send_failure_policy import ROOM_REFUSAL_ATTEMPTS, is_room_membership_refusal  # vendored
+except ImportError:
+    from send_failure_policy import ROOM_REFUSAL_ATTEMPTS, is_room_membership_refusal    # src/
+
 from . import renotify
 from .manager import HitlManager
 from .schema import (
@@ -125,6 +130,16 @@ def _detail(describe: Optional[Callable[[BaseException], str]], exc: BaseExcepti
         return ""
 
 
+def _room_refusal(describe: Optional[Callable[[BaseException], str]], exc: BaseException) -> Optional[str]:
+    """The relay's detail when the card's room refused the sender (a 403 no retry changes), else None."""
+    code = getattr(exc, "code", None)
+    code = code if isinstance(code, int) else getattr(exc, "status", None)
+    if code != 403:
+        return None
+    detail = _detail(describe, exc)
+    return detail if is_room_membership_refusal(403, detail) else None
+
+
 def _backing_off(manager: HitlManager, req: HumanRequirement, now: float, mono: float) -> bool:
     key = (str(manager.store.root), req.id, req.revision)
     ledger = manager.store.projection(req.id)
@@ -139,7 +154,7 @@ def _backing_off(manager: HitlManager, req: HumanRequirement, now: float, mono: 
 
 
 def _refuse(manager: HitlManager, req: HumanRequirement, code: int, detail: str, now: float,
-            mono: float, out: "ProjectionPass") -> None:
+            mono: float, out: "ProjectionPass", max_refusals: int = PROJECTION_MAX_REFUSALS) -> None:
     error = f"HTTP {code}: {detail[:200]}" if detail else f"HTTP {code}"
     delays: Dict[int, float] = {}
 
@@ -147,7 +162,7 @@ def _refuse(manager: HitlManager, req: HumanRequirement, code: int, detail: str,
         delays[n] = min(PROJECTION_RETRY_BASE_S * 2 ** (n - 1), PROJECTION_RETRY_MAX_S)
         return {"retry_at": now + delays[n]}
 
-    got = manager.refuse_projection(req.id, req.revision, error, PROJECTION_MAX_REFUSALS, retry_fields)
+    got = manager.refuse_projection(req.id, req.revision, error, max_refusals, retry_fields)
     key = (str(manager.store.root), req.id, req.revision)
     if got is None:
         return  # the revision moved on or another writer's send was accepted
@@ -203,6 +218,7 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
     requirement's `room` when set, else to `room_id`.
 
     A rejected send is skipped (nothing recorded) so the next drive retries it.
+    A 403 whose room refused the sender is charged to its card alone, failing it after ROOM_REFUSAL_ATTEMPTS.
     A 400, 413 or 422 never stops the other cards in the pass. It is charged to its card
     (backed off on its own and, after PROJECTION_MAX_REFUSALS, marked failed for that
     revision) as `_settle_refusals` decides; when no card was accepted the due notices are
@@ -231,7 +247,11 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
         except Exception as e:  # noqa: BLE001 — classified; anything not this card's re-raises
             code = _refusal_code(e)
             if code is None:
-                raise
+                refused = _room_refusal(describe, e)
+                if refused is None:
+                    raise
+                _refuse(manager, req, 403, refused, now, mono, out, max_refusals=ROOM_REFUSAL_ATTEMPTS)
+                continue
             held.append((req, code, _detail(describe, e), e))
             continue
         if not isinstance(answer, dict) or not (answer.get("ok") or answer.get("event_id")):
@@ -246,10 +266,10 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
         _accepted(manager)
     first = _settle_refusals(manager, held, now, mono, out) if held else None
     if first is None:
-        _send_notices(manager, send, room_id, clock(), out.done)
+        _send_notices(manager, send, room_id, clock(), out.done, describe)
         return out
     try:
-        _send_notices(manager, send, room_id, clock(), out.done)
+        _send_notices(manager, send, room_id, clock(), out.done, describe)
     except Exception:  # noqa: BLE001 — the card refusal is what the caller must back off on
         pass
     raise first
@@ -286,7 +306,8 @@ def _settle_refusals(manager: HitlManager, held: List[Tuple[HumanRequirement, in
 
 
 def _send_notices(manager: HitlManager, send: Sender, room_id: str, now: float,
-                  out: List[Tuple[str, Optional[str]]]) -> None:
+                  out: List[Tuple[str, Optional[str]]],
+                  describe: Optional[Callable[[BaseException], str]] = None) -> None:
     for n in _notices(manager, now):
         ledger = dict(next(pj for r, pj in n.members if r.id == n.req.id))
         # No card field (a second card would never get the status edits); the notice field lets
@@ -295,14 +316,21 @@ def _send_notices(manager: HitlManager, send: Sender, room_id: str, now: float,
         notice = {"notice": n.notice, "ids": [r.id for r, _ in n.members],
                   "runtime": n.req.runtime, "device": device.get("id") or "",
                   "host": device.get("host") or ""}
-        answer = send(wire_safe({"room_id": n.req.room or room_id, "op": "message",
-                                 "body": renotify.body(n.notice, n.req, now, since=n.since, queued=n.queued),
-                                 "dedupe_key": renotify.dedupe_key(n.notice, n.req, ledger, n.reminders),
-                                 "extra_content": {NOTICE_FIELD: notice}}))
-        if not isinstance(answer, dict) or not (answer.get("ok") or answer.get("event_id")):
-            continue
-        _accepted(manager)
+        try:
+            answer = send(wire_safe({"room_id": n.req.room or room_id, "op": "message",
+                                     "body": renotify.body(n.notice, n.req, now, since=n.since, queued=n.queued),
+                                     "dedupe_key": renotify.dedupe_key(n.notice, n.req, ledger, n.reminders),
+                                     "extra_content": {NOTICE_FIELD: notice}}))
+        except Exception as e:  # noqa: BLE001 — only a room's refusal of the sender is settled here
+            if _room_refusal(describe, e) is None:
+                raise
+            answer = None  # the room will refuse it every time: stamped below, never re-sent
+        else:
+            if not isinstance(answer, dict) or not (answer.get("ok") or answer.get("event_id")):
+                continue
+            _accepted(manager)
         # Every card the notice covered is stamped, so none of them is ever sent again.
         for r, pj in n.members:
             manager.record_notice(r.id, renotify.after(n.notice, pj, now, n.reminders))
-        out.append((n.req.id, str(answer.get("event_id") or "") or None))
+        if answer is not None:
+            out.append((n.req.id, str(answer.get("event_id") or "") or None))
