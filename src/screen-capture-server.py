@@ -27,6 +27,7 @@ from pathlib import Path
 # Cross-platform OS helpers. `sutando_platform.notify` + `sutando_platform.capture_screen`
 # branch on sys.platform so the legacy macOS code paths stay verbatim.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from secret_compare import secret_equal  # noqa: E402
 from sutando_platform import capture_screen as _platform_capture_screen, notify as _platform_notify, resize_image as _platform_resize_image, is_macos, is_windows  # noqa: E402
 
 PORT = 7845
@@ -359,7 +360,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _require_capture_token(self) -> bool:
         """Fail closed unless the request carries the startup capture token."""
         supplied = self.headers.get("X-Sutando-Capture-Token", "")
-        if CAPTURE_TOKEN and supplied and secrets.compare_digest(supplied, CAPTURE_TOKEN):
+        if secret_equal(supplied, CAPTURE_TOKEN):
             return True
         self._send_json(403, {"status": "error", "error": "forbidden"})
         return False
