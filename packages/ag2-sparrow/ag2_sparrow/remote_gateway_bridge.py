@@ -9073,6 +9073,35 @@ def _recover_disposing_claims() -> None:
                              f"result disposal: recovery failed ({diagnostics.describe(e)}); delivery continues")
 
 
+_OUTBOX_LANES = ("result", "relay", "withheld", "proactive")
+
+
+def _recover_outbox_claims() -> None:
+    """Every sweep: retire the claims a crash left on terminal outbox items.
+
+    complete() writes an item's terminal status before it releases the claim, and a death
+    between the two strands the claim: the result is then archived, so no later claim() ever
+    reaches that item, and only recover() does. recover() releases a claim only on a terminal
+    item whose owner is dead past the reclaim TTL, so it never displaces live work; the sweep
+    runs at start and then every ORPHAN_SWEEP_EVERY_S, which outlasts that TTL. One pass per
+    distinct root (result and relay share one), outside any item lock, failing open."""
+    seen: set = set()
+    for lane in _OUTBOX_LANES:
+        try:
+            core = _delivery_core(lane)
+            if core.backend.root in seen:
+                continue
+            seen.add(core.backend.root)
+            retired = core.recover().retired
+        except Exception as e:  # noqa: BLE001 - recovery serves the operator, never delivery
+            disposal.report_once(f"outbox-recovery:{lane}", _log,
+                                 f"outbox {lane}: could not recover claims ({diagnostics.describe(e)}); delivery continues")
+            continue
+        if retired:
+            _log(f"outbox {core.backend.root.name}: retired {len(retired)} claim(s) a crash left on "
+                 f"terminal items: {', '.join(sorted(retired)[:5])}{' …' if len(retired) > 5 else ''}")
+
+
 def _disposed_copy_exists(tid: str, generation) -> bool:
     """The lifecycle owner's verdict; a lock it cannot take is no verdict, and
     the loser then reports rather than staying quiet."""
@@ -10507,6 +10536,7 @@ def _reconcile_orphan_results(inflight: "set[str]") -> None:
         return
     _last_orphan_sweep = now
     _recover_disposing_claims()
+    _recover_outbox_claims()
     _sweep_orphan_result_labels(now)
     try:
         candidates = sorted(RESULTS_DIR.glob("task-*.txt"))
