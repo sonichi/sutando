@@ -835,8 +835,10 @@ def _reroute_refused_review(artifact: Path, verdict, refused: int):
                  "(HTTP 403, not in the room); sent to a new private review room")
             return verdict
         return None
-    except urllib.error.HTTPError as exc:
-        if not room_refused_sender(exc):
+    except Exception as exc:  # noqa: BLE001 - runs inside the caller's except clause, past its catch-all
+        if not (isinstance(exc, urllib.error.HTTPError) and room_refused_sender(exc)):
+            _log(f"withheld review {artifact.stem}: the new private review room failed: "
+                 f"{diagnostics.describe(exc)}; retried on the next pass")
             return None
     _log(f"withheld review {artifact.stem}: DROPPED, not delivered to the owner: the review room and a new "
          f"one both refused the agent (HTTP 403, not in the room); the record stays at {artifact}")

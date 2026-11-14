@@ -212,6 +212,41 @@ with tempfile.TemporaryDirectory() as td:
               f"and the next pass sends the review to the new room ({sent})")
         check(got[-1][0] == "[no-send]" and not any("DROPPED" in line for line in logged),
               "where it settles, and nothing logs it as dropped")
+
+        # --- the new room fails without an HTTP answer (a timeout on create or on the send):
+        # the scan still returns, keeps the result for the next pass, and never reports it dropped
+        for n, (op, error) in enumerate((
+                ("create", urllib.error.URLError("timed out")),
+                ("message", TimeoutError("The read operation timed out")))):
+            new_room, raised = f"!fresh{5 + n}:ag2.space", []
+
+            def times_out_once(method, path, payload=None, timeout=35, new_room=new_room, op=op, error=error):
+                if payload.get("op") == op and not raised and (op == "create" or payload["room_id"] == new_room):
+                    raised.append(op)
+                    raise error
+                return refusing_left(method, path, payload, timeout)
+
+            refusing_left = refuse_then(f"task-timeout-{n}", new_room, lambda _: None)
+            m._req = times_out_once
+            logged, got, escaped = [], [], []
+            clock = [1000.0]
+            with mock.patch.object(m, "_log", logged.append), \
+                    mock.patch.object(m.time, "monotonic", lambda: clock[0]):
+                for _ in range(60):
+                    try:
+                        got.append(m._guarded_result_body(f"task-timeout-{n}", BODY))
+                    except Exception as exc:  # noqa: BLE001 - what escaped is what the poll round sees
+                        escaped.append(exc)
+                    clock[0] += 1.0
+            label = type(error).__name__
+            check(not escaped and raised == [op],
+                  f"a {label} on the new room's {op} stays inside the scan (escaped: {escaped})")
+            check(any(b is None and "failed in its new room" in (r or "") for b, r in got),
+                  "and keeps the result for the next pass")
+            check(bool(got) and got[-1][0] == "[no-send]" and not any("DROPPED" in line for line in logged),
+                  "where it settles, and nothing logs it as dropped")
+            check(record_of(f"task-timeout-{n}").get("dm_room_id") == new_room,
+                  "with the owner's review open in the new room")
     finally:
         for n, v in saved.items():
             setattr(m, n, v)
