@@ -16,8 +16,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 COPIED = ("skills/install.sh", "scripts/sutando-config.sh", "scripts/python-binary.sh",
-          "src/sutando_config.py", "src/skill_audience.py", "src/agent/codex/codex-home.sh",
-          "src/codex_home.py", "src/codex_host_instructions.py")
+          "src/sutando_config.py", "src/skill_audience.py", "src/installed_skill_roots.py",
+          "src/agent/codex/codex-home.sh", "src/codex_home.py", "src/codex_host_instructions.py")
 
 
 class CodexSkillsAreLinked(unittest.TestCase):
