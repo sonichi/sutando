@@ -34,12 +34,13 @@ def _mgr():
 
 
 class TestMessage(unittest.TestCase):
-    def test_it_names_the_gate_and_quotes_the_terminal(self):
+    def test_it_quotes_the_terminal_without_internal_state_names(self):
         b = M.escalation_message("blocked-human", "awaiting user: selection",
                                  "selection", "Pick one:\n> a\n  b")
         self.assertIn("cannot continue without you", b)
-        self.assertIn("selection", b)
         self.assertIn("Pick one:", b)
+        for internal in ("State:", "Gate:", "blocked-human", "selection"):
+            self.assertNotIn(internal, b)
 
     def test_an_unknown_gate_is_not_rendered_as_a_gate_name(self):
         """`unknown` is the classifier saying it could not tell, so `Gate:
@@ -393,7 +394,7 @@ class TestDrive(unittest.TestCase):
         self.assertEqual((state, kind), ("blocked-human", "selection"))
         r = M.escalate(_mgr(), state, detail, kind, prompt, "s")
         self.assertEqual(r.kind, "permission")
-        self.assertEqual([a.label for a in r.actions], ["No", "Yes", "Open terminal"])
+        self.assertEqual([a.kind for a in r.actions], ["allow_once", "allow_always", "reject_once", "open_terminal"])
 
     def test_a_numbered_trust_dialog_through_classify_gets_no_button(self):
         """End to end through the monitor's own classifier: this pane is labelled
@@ -409,7 +410,7 @@ class TestDrive(unittest.TestCase):
     def test_a_permission_gate_carries_no_yes_buttons_not_ack(self):
         r = self._blocked(_mgr())
         self.assertEqual(r.kind, "permission")
-        self.assertEqual([a.label for a in r.actions], ["No", "Yes", "Open terminal"])
+        self.assertEqual([a.kind for a in r.actions], ["allow_once", "allow_always", "reject_once", "open_terminal"])
 
     def test_a_clicked_no_walks_the_caret_to_no_and_confirms(self):
         m, sent = _mgr(), []

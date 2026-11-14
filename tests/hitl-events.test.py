@@ -50,7 +50,8 @@ class IngestTests(unittest.TestCase):
         self.assertEqual(c["created"], 1)
         [req] = self.mgr.active()
         self.assertEqual((req.kind, req.runtime, req.guard), ("permission", "claude", "g1"))
-        self.assertIn("core-2", req.message)
+        for text in (req.message, req.title, req.actions[-1].label):
+            self.assertNotIn("core-2", text, "the session is for routing (device.id), not reading")
         kinds = [(a.id, a.kind) for a in req.actions]
         self.assertIn(("1", "tui_select"), kinds)
         self.assertEqual(req.actions[-1].id, JUMP_ACTION_ID)

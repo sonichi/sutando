@@ -31,6 +31,8 @@ from . import renotify
 from .schema import (
     Action,
     ActionReply,
+    CONFIRM_ACTION_ID,
+    CONFIRM_KINDS,
     HumanRequirement,
     STATUS_CANCELLED,
     STATUS_EXPIRED,
@@ -323,6 +325,8 @@ class HitlManager:
     def apply_action(self, reply: ActionReply, patch=None) -> Action:
         """Validate the three-layer stale gate; on pass, mark in_progress.
 
+        A `spend` / `allow_always` click is held instead: the card stays pending at a new revision
+        and asks Confirm/Back, so no client can grant it with one tap. Confirm applies the held one.
         Returns the matched Action for the caller (driver) to execute.
         Raises StaleRequirementError / MalformedActionError otherwise —
         a stale click must never reach the runtime. `patch(req)`, when given,
@@ -337,6 +341,18 @@ class HitlManager:
 
                 raise MalformedActionError(f"no requirement {reply.hitl_id}")
             action = validate_action(req, reply)
+            if (req.subject or {}).get("confirming"):
+                held = req.end_confirm()
+                if action.id != CONFIRM_ACTION_ID:  # Back: the card as it was, nothing chosen
+                    req.revision += 1
+                    req.updated_at = time.time()
+                    self.store.save(req)
+                    return action
+                action = next(a for a in req.actions if a.id == held)
+            elif action.kind in CONFIRM_KINDS:
+                req.ask_to_confirm(action)
+                self.store.save(req)
+                return action
             req.chosen_action = action.id
             if reply.answer is not None:
                 req.answer = reply.answer
