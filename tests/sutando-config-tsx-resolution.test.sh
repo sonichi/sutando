@@ -11,8 +11,8 @@ say() { echo "  $1"; }
 # --- app-node-dir: config-resolved, not hardcoded (ask: config-resolve path) ---
 out="$(SUTANDO_APP_NODE_DIR=/custom/node/bin bash "$CFG" app-node-dir)"
 [ "$out" = "/custom/node/bin" ] && say "PASS app-node-dir honors override" || { say "FAIL override: $out"; fail=1; }
-out="$(unset SUTANDO_APP_NODE_DIR; bash "$CFG" app-node-dir)"
-case "$out" in *space.ag2.app*node*bin) say "PASS app-node-dir default = app-support engine";; *) say "FAIL default: $out"; fail=1;; esac
+out="$(unset SUTANDO_APP_NODE_DIR SUTANDO_APP_SUPPORT; bash "$CFG" app-node-dir)"
+case "$out" in *space.ag2.*/engine/runtime/node/bin) say "PASS app-node-dir default = app-support engine";; *) say "FAIL default: $out"; fail=1;; esac
 
 # --- tsx-bin: centralized resolver; repo-pinned tsx preferred (the no-homebrew case) ---
 out="$(bash "$CFG" tsx-bin)"

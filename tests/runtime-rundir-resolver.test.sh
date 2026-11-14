@@ -15,11 +15,14 @@ ok "run-dir honors SUTANDO_RUN_DIR override" \
 
 # ── run-dir: OS default branch (rundir.py order) ─────────────────────────────
 case "$(uname -s)" in
-  Darwin) exp="$HOME/Library/Application Support/space.ag2.app/run" ;;
+  Darwin) exp="$(env -u SUTANDO_APP_SUPPORT bash "$CFG" desktop-data-root)/run" ;;
   *) if [ -n "${XDG_RUNTIME_DIR:-}" ]; then exp="$XDG_RUNTIME_DIR/sutando"; else exp="$HOME/.sutando/run"; fi ;;
 esac
 ok "run-dir OS default matches rundir.py chain" \
-   "$(env -u SUTANDO_RUN_DIR bash "$CFG" run-dir)" "$exp"
+   "$(env -u SUTANDO_RUN_DIR -u SUTANDO_APP_SUPPORT bash "$CFG" run-dir)" "$exp"
+ok "run-dir shell == rundir.py run_dir" \
+   "$(env -u SUTANDO_RUN_DIR -u SUTANDO_APP_SUPPORT bash "$CFG" run-dir)" \
+   "$(env -u SUTANDO_RUN_DIR -u SUTANDO_APP_SUPPORT python3 "$REPO/src/runtime-api/rundir.py" --run-dir)"
 
 # ── runtime-socket: env override wins ────────────────────────────────────────
 ok "runtime-socket honors SUTANDO_RUNTIME_SOCKET override" \
