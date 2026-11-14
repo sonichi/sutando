@@ -422,14 +422,26 @@ _OLD_TS_CANCEL = "writeFileSync(join(resultsDir, `${targetId}.txt`), 'Cancelled.
 
 class DelegationTest(unittest.TestCase):
     def test_chat_prompts_delegate_all_result_publication(self):
+        # Lint: each chat bridge renders its instruction through the shared helper.
+        import ast
         for name in ("discord", "slack", "telegram"):
-            source = (REPO / "src" / f"{name}-bridge.py").read_text()
-            self.assertIn("publication_instruction(RESULTS_DIR", source)
-        discord = (REPO / "src" / "discord-bridge.py").read_text()
-        self.assertNotRegex(discord, r"Stage 2:.*: mv ")
-        self.assertIn("{result_command} < {staging_path}", discord)
-        self.assertIn("{proactive_command}", discord)
-        self.assertIn("only the shared publisher may update its own pairing receipts", discord)
+            tree = ast.parse((REPO / "src" / f"{name}-bridge.py").read_text())
+            names = {getattr(n.func, "id", None) for n in ast.walk(tree) if isinstance(n, ast.Call)}
+            self.assertIn("publication_instruction", names, name)
+
+    def test_a_rendered_instruction_runs_the_publisher(self):
+        from delivery.readiness import read_ready_result
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "results" / "task-rendered.txt"
+            path.parent.mkdir()
+            command = re.search(r"pipe only the final body to `([^`]+)`",
+                                result_publish.publication_instruction(path)).group(1)
+            done = subprocess.run(command, shell=True, input="the agent's answer\n", text=True,
+                                  capture_output=True, env=isolated_child_env(), cwd=td, timeout=60)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(read_ready_result(path), "the agent's answer")
+            path.write_text("a body written around the publisher\n")
+            self.assertIsNone(read_ready_result(path), "control: a raw write carries no receipt")
 
     def test_every_writer_reaches_the_publisher(self):
         for rel, needle in {**WRITERS, **VIA_LOCAL_RECORD}.items():

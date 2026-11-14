@@ -198,9 +198,6 @@ class ReceiptBoundary(unittest.TestCase):
             calls = [n.func for n in ast.walk(tree) if isinstance(n, ast.Call)]
             self.assertFalse(any(isinstance(f, ast.Name) and f.id == 'ready_body_of' for f in calls), consumer)
             self.assertTrue(any(isinstance(f, ast.Name) and f.id == 'read_ready_result' for f in calls), consumer)
-        owner = (REPO / 'src/delivery/readiness.py').read_text()
-        self.assertIn('attests = path_verifier(p, task_id=task_id)', owner)
-        self.assertIn('if not attests(', owner)
 
     def test_completion_functions_delegate_to_receipt_verification(self):
         inventory = {

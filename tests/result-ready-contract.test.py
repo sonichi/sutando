@@ -73,12 +73,26 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(calls, [])
 
     def test_every_delivery_consumer_uses_default_verified_readiness(self):
+        # Lint: each consumer calls read_ready_result without its own `attests`.
         for name, path in CONSUMERS.items():
             with self.subTest(name):
-                source = path.read_text()
-                self.assertIn("read_ready_result(", source)
-                self.assertNotIn("attests=lambda", source)
-        self.assertIn("attests = path_verifier(p, task_id=task_id)", (REPO / "src/delivery/readiness.py").read_text())
+                calls = [n for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.Call)
+                         and getattr(n.func, "id", getattr(n.func, "attr", None)) == "read_ready_result"]
+                self.assertTrue(calls)
+                self.assertFalse([c for c in calls if any(k.arg == "attests" for k in c.keywords)])
+
+    def test_default_readiness_refuses_an_unreceipted_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, None)
+            p.write_text("written without a receipt\n")
+            self.assertIsNone(read_ready_result(p))
+
+    def test_default_readiness_refuses_a_body_its_receipt_does_not_cover(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = self._write(td, "the paired answer\n")
+            self.assertEqual(read_ready_result(p), "the paired answer", "positive control")
+            p.write_text("a different body after the receipt\n")
+            self.assertIsNone(read_ready_result(p))
 
     def test_missing_file_is_not_ready(self):
         with tempfile.TemporaryDirectory() as td:

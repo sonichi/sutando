@@ -14,17 +14,25 @@ PWSH = shutil.which("pwsh")
 
 
 class ResultPublisherDelegationTest(unittest.TestCase):
-    def test_windows_producers_delegate_to_the_shared_writer(self):
+    """Runs the publisher call each Windows producer hands its interpreter, on any host."""
+
+    def test_windows_producers_publish_a_paired_result(self):
+        import re
+        sys.path.insert(0, str(REPO / "src"))
+        from delivery.readiness import read_ready_result
         for name in ("task-dispatcher.ps1", "notify.ps1"):
-            source = (REPO / "src" / name).read_text()
-            self.assertIn("Resolve-SutandoPython", source)
-            self.assertIn("from result_publish import publish_text", source)
-            self.assertIn('publish_text(sys.argv[3], Path(sys.argv[2]).read_bytes().decode("utf-8"), pair_result=True)', source)
-            self.assertIn("$LASTEXITCODE -ne 0", source)
-        dispatcher = (REPO / "src/task-dispatcher.ps1").read_text()
-        self.assertNotIn("[IO.File]::Move($temporary, $destination", dispatcher)
-        notify = (REPO / "src/notify.ps1").read_text()
-        self.assertNotIn('Set-Content -Path (Join-Path $resultsDir', notify)
+            with self.subTest(name), tempfile.TemporaryDirectory() as temp:
+                found = re.search(r"\$publisherArgs = @\('-c', '([^']+)', \$PSScriptRoot, \$temporary, \$destination\)",
+                                  (REPO / "src" / name).read_text())
+                self.assertIsNotNone(found, f"{name} hands no publisher call to its interpreter")
+                staged = pathlib.Path(temp) / ".staged"
+                staged.write_text("answer from " + name, encoding="utf-8")
+                destination = pathlib.Path(temp) / "results" / "task-win.txt"
+                destination.parent.mkdir()
+                done = subprocess.run([sys.executable, "-c", found.group(1), str(REPO / "src"), str(staged),
+                                       str(destination)], capture_output=True, text=True, cwd=temp, timeout=60)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(read_ready_result(destination), "answer from " + name)
 
 
 @unittest.skipUnless(
