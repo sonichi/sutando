@@ -533,7 +533,7 @@
     "maintainers"
    ],
    "status": "canonical",
-   "canonical_for": "how one inbox keeps exactly one announcer: the session watcher and the supervisor's standby, the tag and verdicts, readiness, the handoff contract, the opt-in task-watch Mod",
+   "canonical_for": "how one inbox keeps exactly one announcer: the session watcher and the supervisor's standby, the tag and verdicts, readiness, the handoff contract, the task-watch Mod (default for pool workers, opt-in for the core)",
    "last_verified": "2026-11-06"
   },
   "docs/learning-window.md": {
