@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The owner's "Getting started" page in AG2 Space: render it, and create or refresh it in one room.
+"""The owner's "Getting started" page in s.space: render it, and create or refresh it in one room.
 
   getting_started.py render --name NAME|auto [--core claude|codex|unknown|auto] [--list PATH|URL]
       -> the page's HTML
@@ -1218,7 +1218,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not agent:
         # A page without the ownership tag can never be found again: refuse rather than write one.
         print(json.dumps({"ok": False, "reason": "no agent identity: pass --agent-mxid, or set AGENT_MXID in the "
-                                                 "environment or the AG2 Space channel env file"}))
+                                                 "environment or the `ag2space` channel env file"}))
         return 4
     if not MXID.fullmatch(agent):
         print(json.dumps({"ok": False, "reason": f"the agent identity {agent[:80]!r} is not an mxid "

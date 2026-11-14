@@ -238,7 +238,7 @@ def context_line(hits: list[dict], connected: set[str] | None, fields: dict, tid
             f"'{fields.get('source_message_id')}' --task {tid} --owner-from-task{private} --request-file - "
             "(heredoc: the owner request, verbatim); then for mode dm post its message with room.message.send")
     elif missing:
-        parts.append("run: no card (not the owner's own AG2 Space message): say the app isn't connected, text only")
+        parts.append("run: no card (not the owner's own s.space message): say the app isn't connected, text only")
     return "connect-apps precheck: " + "; ".join(parts)
 
 

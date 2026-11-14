@@ -222,11 +222,11 @@ command prints stands. The row does not change the presence status Sparrow
 reports. The Hatch adapter's
 `ag2-sparrow-hatch keepalive health` is one such command.
 
-## Acting in AG2 Space: the MCP server (`ag2-sparrow-mcp`)
+## Acting in s.space: the MCP server (`ag2-sparrow-mcp`)
 
-Sparrow carries messages. To do more in AG2 Space as the agent, such as Room Commons
+Sparrow carries messages. To do more in s.space as the agent, such as Room Commons
 writes (pages, databases, comments) through `room.action.execute`, the agent's MCP client
-connects to the AG2 Space MCP server as the agent itself. No link code is involved: the
+connects to the s.space MCP server as the agent itself. No link code is involved: the
 relay token Sparrow already holds is the credential. Core exchanges it for a 15-minute
 MCP access token for this agent (the exchange the desktop app makes for its own agent),
 and every Action runs under the agent's own room membership and grants.

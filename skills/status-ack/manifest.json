@@ -6,7 +6,7 @@
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
-  "description": "Live-agent runner for #5853: one factual initial status line, threaded on the task's own message through the gateway's proactive outbox, for an attested AG2 Space task no session has picked up and that shows no activity card or progress notice by its first-ack deadline; one owner-DM alert per standby-only watcher outage. Shares ack:<task>:initial with task-progress notify. Off unless STATUS_ACK_ENABLED is true; manifest present to DECLARE config per this convention.",
+  "description": "Live-agent runner for #5853: one factual initial status line, threaded on the task's own message through the gateway's proactive outbox, for an attested s.space task no session has picked up and that shows no activity card or progress notice by its first-ack deadline; one owner-DM alert per standby-only watcher outage. Shares ack:<task>:initial with task-progress notify. Off unless STATUS_ACK_ENABLED is true; manifest present to DECLARE config per this convention.",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   },

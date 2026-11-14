@@ -20,7 +20,7 @@ worker, and posts nothing proactively. Retiring the worker (pool_manage retire) 
     python3 pool_identity.py [--workspace WS] retire-remote <worker> [--local-anyway]
     python3 pool_identity.py [--workspace WS] card-reply --task-file PATH
 
-TOKEN is the agent's access token from its settings page in AG2 Space. Leave it out to type it
+TOKEN is the agent's access token from its settings page in s.space. Leave it out to type it
 at a hidden prompt, or pass '-' to read it from stdin; it is stored in the secret vault, never in
 a file, and never printed. `add` shows what the token's gateway says before anything is saved.
 

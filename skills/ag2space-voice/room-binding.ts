@@ -222,7 +222,7 @@ export function createCurrentRoomTool(current: () => VoiceSessionRoom | null): T
 	return {
 		name: 'current_room',
 		description:
-			'The AG2 Space room this voice session is docked in right now: the room the user has open, when you are in it. ' +
+			'The s.space room this voice session is docked in right now: the room the user has open, when you are in it. ' +
 			'Call it whenever the user asks which room you are in or whether you are in this room. ' +
 			'Returns {docked:true, room} or {docked:false}: not docked means you are in the owner\'s DM, not in any room.',
 		parameters: z.object({}),

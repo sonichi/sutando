@@ -133,7 +133,7 @@ local label drift.
 ## A worker's own agent
 
 By default a worker answers through the core's agent. A worker can instead run as an agent of its own: the owner
-creates that agent in AG2 Space, and its access token becomes a connection row naming the worker
+creates that agent in s.space, and its access token becomes a connection row naming the worker
 (`src/connections.py`, "a pool worker's own identity"). That row runs a lane of its own:
 - It answers only what is addressed to that agent.
 - It hands every task it queues to the worker (`requested_worker`).

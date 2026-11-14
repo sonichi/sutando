@@ -209,7 +209,7 @@ describe('the room index: the rooms the agent can read, with their real names', 
 		const index = { rooms: () => [{ room_id: '!a:x', name: 'Sutando Triage' }, { room_id: '!b:x', name: 'open.space launch video' }], refresh: async () => [], fetchedAt: () => 1 };
 		const [line, ...rest] = roomIndexContextLines(index);
 		assert.deepEqual(rest, []);
-		assert.match(line, /^ROOMS: AG2 Space rooms you can read with read_room: Sutando Triage \| open\.space launch video\./);
+		assert.match(line, /^ROOMS: s.space rooms you can read with read_room: Sutando Triage \| open\.space launch video\./);
 		assert.match(line, /often misheard/);
 		assert.match(line, /spelled exactly like this/);
 	});
@@ -245,7 +245,7 @@ describe('the room index: the rooms the agent can read, with their real names', 
 	});
 
 	it('the prompt rule tells the model a credential error means reconnect, not "unavailable"', () => {
-		assert.match(ROOM_READ_PROMPT_RULE, /"no_credential" or "credential_refused" from any room tool means your AG2 Space connection needs the owner to reconnect it/);
+		assert.match(ROOM_READ_PROMPT_RULE, /"no_credential" or "credential_refused" from any room tool means your s.space connection needs the owner to reconnect it/);
 		for (const create of [createReadRoomTool, createSearchRoomTool, createSearchCommonsTool, createReadPageTool, createWritePageTool, createAddCommentTool, createSendMessageTool, createNavigateSpaceTool]) {
 			const tool = create({ client: () => null, currentRoom: () => null, index: createRoomIndex({ client: () => null }) });
 			assert.match(tool.description, /"no_credential" or "credential_refused".*reconnect/, tool.name);
@@ -456,7 +456,7 @@ describe('searchRoom: what was said about something, however far back', () => {
 		assert.match(ROOM_READ_PROMPT_RULE, /never from memory or an earlier answer/);
 		assert.match(ROOM_READ_PROMPT_RULE, /What a message in a room means, or why someone said it, is answered from that message: read_room with `around`/);
 		assert.match(ROOM_READ_PROMPT_RULE, /submit work only when the room's messages do not hold the answer/);
-		assert.match(ROOM_TURN_CHECK_RULE, /^- none: a question about an AG2 Space room's messages/);
+		assert.match(ROOM_TURN_CHECK_RULE, /^- none: a question about an s.space room's messages/);
 		assert.match(ROOM_TURN_CHECK_RULE, /never work, even when it names a PR/);
 		const src = readFileSync(join(PLUGIN_DIR, 'tools.ts'), 'utf-8');
 		assert.match(src, /tools: \[read, search, commons, page, write, comment, message, navigate, list, \.\.\.open\]/, 'search_room, search_commons, read_page, write_page, add_comment, send_message and navigate_space are declared with read_room, all answering tools through the same map');

@@ -129,6 +129,24 @@ ALLOW: dict[str, "tuple[str, ...] | None"] = {
     "skills/tutorial/scripts/getting_started.py": ("A short tour of s.space",),
     "skills/tutorial/scripts/tour_page.py": ("A short tour of s.space",),
     "skills/tutorial/feature-list.json": ("search &ldquo;s.space&rdquo; in the App Store",),
+    # The product name in text an owner or agent reads: tool descriptions, prompt rules, skill
+    # descriptions, messages. Never a host a caller acts on.
+    "skills/ag2-space-mcp/manifest.json": ("the hosted s.space MCP",),
+    "skills/ag2-space-mcp/scripts/register.py": ("s.space, then save its token",),
+    "skills/ag2space-voice/manifest.json": ("s.space voice surface",),
+    "skills/ag2space-voice/room-actions.ts": ("in s.space", "one s.space action", "other s.space action"),
+    "skills/ag2space-voice/room-binding.ts": ("The s.space room this voice session",),
+    "skills/ag2space-voice/room-read.ts": ("s.space room", "the s.space app"),
+    "skills/agent-room-ops/manifest.json": ("use the s.space MCP room Actions",),
+    "skills/connect-apps/hooks/connect-precheck.py": ("owner's own s.space message",),
+    "skills/connect-apps/scripts/connectors.py": ("owner's own s.space requests", "is not from s.space"),
+    "skills/pending-questions/scripts/pending_questions_ask.py": ("s.space DM, and it may not have arrived",),
+    "skills/report-feedback/report-feedback.py": ("a Sutando/s.space defect",),
+    "skills/schedule-crons/ensure-cron-room.py": ("not connected to s.space",),
+    "skills/status-ack/manifest.json": ("an attested s.space task",),
+    "skills/tutorial/manifest.json": ("in s.space one Getting started",),
+    "packages/ag2-sparrow/ag2_sparrow/mcp_auth.py": ("acts in s.space as this agent",),
+    "scripts/census-d1.py": ("Discord / s.space / Slack",),
 }
 
 TEST_FILE = re.compile(r"(^test_.*\.py$)|(_test\.py$)|(\.test\.(py|ts)$)")
