@@ -2245,7 +2245,8 @@ class NoWorkerCredential(ConnectionsError):
         self.reason, self.detail = reason, detail
 
 
-WORKER_CREDENTIAL_REASONS = ("no_worker", "no_token", "ambiguous_server")
+WORKER_CREDENTIAL_REASONS = ("no_worker", "no_token", "ambiguous_server", "descriptor_missing",
+                             "descriptor_unresolved")
 # Why a worker acts through the core's agent instead of one of its own (`worker_mcp_credential`'s `reason`).
 WORKER_ACTS_AS_CORE_REASONS = ("no_identity", "disabled")
 # The worker seat's s-space MCP proxy runs this argv to learn whose credential to mint with (see
@@ -2322,27 +2323,45 @@ MCP_DESCRIPTOR_ENV = "AG2_MCP_DESCRIPTOR"
 
 def mcp_seat_server(workspace: Optional[Path] = None, environ: Optional[Mapping[str, str]] = None) -> str:
     """The server the seat's agent MCP descriptor mints on: the one its proxy reads (`MCP_DESCRIPTOR_ENV`,
-    which the proxy keeps for this resolver, wherever it lives), else the workspace's. The descriptor's own
-    agent's server first: that is who the proxy mints as, and it does not move when the owner switches
-    which server is primary (set_primary rewrites no descriptor). Only a descriptor naming no agent falls
-    back to its lane's row's server. "" when no descriptor is readable or it names neither."""
+    which the proxy keeps for this resolver, wherever it lives), else the workspace's. Taken from the
+    descriptor alone, never from which row is primary now (set_primary rewrites no descriptor): its own
+    agent's server; for a descriptor naming no agent, the server whose row's gateway is the descriptor's
+    own relay or mint host, or the row its lane names outright. "" when there is no descriptor at all.
+    NoWorkerCredential `descriptor_missing` when the variable names a descriptor that cannot be read (a
+    seat told to use one is never resolved by another), and `descriptor_unresolved` when a descriptor is
+    present but names no server by these, or names two."""
     environ = os.environ if environ is None else environ
     named = str(environ.get(MCP_DESCRIPTOR_ENV) or "")
+    path = Path(named) if named else mcp_descriptor_path(workspace)
+    if not named and not path.is_file():
+        return ""
     try:
-        path = Path(named) if named and Path(named).is_file() else mcp_descriptor_path(workspace)
         desc = json.loads(path.read_text(encoding="utf-8"))
-        rows = _read(record_path(workspace))
-    except (OSError, ValueError, SchemaError):
-        return ""
+    except (OSError, ValueError):
+        if named:
+            raise NoWorkerCredential("descriptor_missing", f"{MCP_DESCRIPTOR_ENV} names a descriptor that "
+                                     "cannot be read") from None
+        raise NoWorkerCredential("descriptor_unresolved", "the seat's MCP descriptor cannot be read") from None
     if not isinstance(desc, dict):
-        return ""
+        raise NoWorkerCredential("descriptor_unresolved", "the seat's MCP descriptor is not an object")
     own = server_of_mxid(str(desc.get("agent_id") or ""))
     if own:
         return own.lower()
+    try:
+        rows = _read(record_path(workspace))
+    except (OSError, SchemaError):
+        rows = []
+    hosts = {host_of_url(str(desc.get(k) or "")) for k in ("relay", "mint_url")} - {""}
+    by_host = {str(r["server"]).lower() for r in rows if host_of_url(str(r.get("gateway_url") or "")) in hosts}
     lane = str(desc.get("lane") or "")
-    lane = "" if lane == "primary" else lane
-    row = next((r for r in _core_rows(rows) if (r["instance"] == lane if lane else r["primary"])), None)
-    return str(row["server"]).lower() if row else ""
+    by_lane = {str(r["server"]).lower() for r in _core_rows(rows) if lane and lane != "primary"
+               and r["instance"] == lane}
+    found = by_host | by_lane
+    if len(found) != 1:
+        raise NoWorkerCredential("descriptor_unresolved", "the seat's MCP descriptor names no agent and "
+                                 + ("its relay, mint host and lane name several servers" if found else
+                                    "neither its relay nor its mint host nor its lane names a server"))
+    return found.pop()
 
 
 def worker_mcp_credential(worker: str, *, workspace: Optional[Path] = None,

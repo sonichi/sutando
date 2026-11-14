@@ -612,7 +612,8 @@ class TwoServers(Base):
     def test_a_single_identity_on_another_server_never_mints_on_the_seats(self):
         C.remove_worker_identity(W, server="alpha-fixture.net", workspace=self.ws, vault=self.vault,
                                  kill=lambda *a: None)
-        (self.ws / "state" / C.MCP_DESCRIPTOR_NAME).write_text(json.dumps({"lane": "primary"}))
+        (self.ws / "state" / C.MCP_DESCRIPTOR_NAME).write_text(
+            json.dumps({"lane": "primary", "relay": "https://chat.alpha-fixture.net"}))
         with unittest.mock.patch.object(C, "mcp_descriptor_path", lambda ws, *a: ws / "state" / C.MCP_DESCRIPTOR_NAME):
             cred = C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault, environ={})
         self.assertEqual(cred, {"worker": W, "acts_as": "core", "reason": "no_identity"},
@@ -733,7 +734,7 @@ class TwoServers(Base):
     def test_a_primary_switch_does_not_move_the_seats_server(self):
         """The seat's proxy mints as its descriptor's own agent; set_primary rewrites no descriptor, so after
         the owner makes beta primary a seat written for alpha still mints on alpha, and so does the worker's
-        credential (review at e85d3d12: it followed whichever row was primary now)."""
+        credential."""
         state = self.ws / "state"
         state.mkdir(exist_ok=True)
         (state / C.MCP_DESCRIPTOR_NAME).write_text(
@@ -747,6 +748,89 @@ class TwoServers(Base):
         after = C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault, environ={})
         self.assertEqual((after["server"], after["bearer"]), ("alpha-fixture.net", "secret-reviewer"),
                          "never a token for beta while the seat's proxy mints on alpha")
+
+    def _seat(self, desc):
+        """Write the workspace's seat descriptor (`desc`, or none when None) and read the worker's credential."""
+        path = self.ws / "state" / C.MCP_DESCRIPTOR_NAME
+        path.parent.mkdir(exist_ok=True)
+        if desc is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(json.dumps(desc))
+        return C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault, environ={})
+
+    def _make_primary(self, server):
+        row = next(r for r in C._core_rows(C._read(C.record_path(self.ws))) if r["server"] == server)
+        C.set_primary(row["instance"], workspace=self.ws)
+
+    def test_a_descriptor_with_no_agent_mints_on_its_own_relays_server_whatever_is_primary(self):
+        """With no usable agent_id the descriptor's own relay or mint host names the server, never the row that
+        is primary now: set_primary does not move it."""
+        seats = [({"lane": "primary", "relay": "https://chat.alpha-fixture.net"}, "alpha-fixture.net"),
+                 ({"lane": "primary", "agent_id": None, "relay": "https://relay.beta-fixture.net:8443/"},
+                  "beta-fixture.net"),
+                 ({"lane": "primary", "agent_id": "not-a-user-id",
+                   "mint_url": "https://relay.beta-fixture.net:8443/v1/mcp/token"}, "beta-fixture.net")]
+        for primary in ("alpha-fixture.net", "beta-fixture.net", "alpha-fixture.net"):
+            self._make_primary(primary)
+            for desc, server in seats:
+                cred = self._seat(desc)
+                self.assertEqual(cred["server"], server, (primary, desc))
+        for desc in ({"lane": "primary"}, {"agent_id": None},
+                     {"relay": "https://chat.alpha-fixture.net", "mint_url": "https://relay.beta-fixture.net:8443/t"},
+                     {"relay": "https://chat.alpha-fixture.net", "lane": "beta-fixture-net"},
+                     {"relay": "https://unknown.example.org"}):
+            for primary in ("alpha-fixture.net", "beta-fixture.net"):
+                self._make_primary(primary)
+                with self.assertRaises(C.NoWorkerCredential, msg=(primary, desc)) as e:
+                    self._seat(desc)
+                self.assertEqual(e.exception.reason, "descriptor_unresolved", desc)
+
+    def test_a_named_descriptor_that_cannot_be_read_is_refused_not_replaced(self):
+        """A seat told to use one descriptor is never resolved by another, even when the workspace has one."""
+        self._seat({"version": 1, "lane": "primary", "agent_id": BETA_CORE})
+        import tempfile
+        gone = Path(tempfile.mkdtemp(prefix="seat-descriptor-")) / "ag2-mcp.json"
+        for env in ({C.MCP_DESCRIPTOR_ENV: str(gone)}, {C.MCP_DESCRIPTOR_ENV: str(gone.parent)}):
+            with self.assertRaises(C.NoWorkerCredential) as e:
+                C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault, environ=env)
+            self.assertEqual(e.exception.reason, "descriptor_missing", env)
+        gone.write_text("{not json")
+        with self.assertRaises(C.NoWorkerCredential) as e:
+            C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault, environ={C.MCP_DESCRIPTOR_ENV: str(gone)})
+        self.assertEqual(e.exception.reason, "descriptor_missing")
+
+    def test_the_token_and_the_endpoint_it_is_sent_to_are_one_servers(self):
+        """Whatever names the seat's server and whichever row is primary, the bearer, the relay it is sent to
+        and the server reported all belong to one server's row."""
+        rows = {r["server"]: r for r in C.worker_identities(W, self.ws)}
+        secret = {"alpha-fixture.net": "secret-reviewer", "beta-fixture.net": "secret-reviewer-b"}
+        seats = [{"agent_id": CORE_AGENT}, {"agent_id": BETA_CORE}, {"agent_id": BETA_CORE, "lane": "primary"},
+                 {"relay": "https://chat.alpha-fixture.net"}, {"mint_url": "https://relay.beta-fixture.net:8443/m"},
+                 {"lane": "beta-fixture-net"}]
+        for primary in ("alpha-fixture.net", "beta-fixture.net"):
+            self._make_primary(primary)
+            for desc in seats:
+                cred = self._seat(desc)
+                server = cred["server"]
+                self.assertEqual(cred["bearer"], secret[server], (primary, desc))
+                self.assertEqual(C.host_of_url(cred["relay"]), C.host_of_url(rows[server]["gateway_url"]),
+                                 (primary, desc))
+                self.assertEqual(cred["lane"], rows[server]["instance"], (primary, desc))
+
+    def test_a_seat_whose_server_has_no_credential_fails_closed(self):
+        """No token for the seat's server's identity refuses; it never falls back to another server's, and a
+        seat on a server the worker has no identity on carries no bearer at all."""
+        self.vault.store.pop(self.beta["token_ref"])
+        for primary in ("alpha-fixture.net", "beta-fixture.net"):
+            self._make_primary(primary)
+            for desc in ({"agent_id": BETA_CORE}, {"relay": "https://relay.beta-fixture.net:8443"},
+                         {"lane": "beta-fixture-net"}):
+                with self.assertRaises(C.NoWorkerCredential, msg=(primary, desc)) as e:
+                    self._seat(desc)
+                self.assertEqual(e.exception.reason, "no_token", desc)
+            cred = self._seat({"agent_id": "@sutando:gamma-fixture.net"})
+            self.assertEqual(cred, {"worker": W, "acts_as": "core", "reason": "no_identity"})
 
     def test_a_task_result_publishes_whatever_the_proactive_home(self):
         import result_publish

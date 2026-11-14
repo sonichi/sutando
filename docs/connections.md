@@ -594,9 +594,14 @@ A worker holds at most one identity per server, so it can have one on each homes
 connected to (`require_no_worker_identity` is the one check, on the server of the `--lane` it is
 added through). Every reader picks the one for the server it acts on: a room's server for room
 operations; for the seat's MCP tools, `--server`, else the server of the descriptor the seat's proxy
-reads (`mcp_seat_server`). Where nothing names a server (a room operation with no room, an MCP seat
-whose descriptor matches neither) it refuses by name (`WorkerRoomAmbiguous`, `ambiguous_server`)
-instead of guessing. `retire_worker_identity` removes them all.
+reads (`mcp_seat_server`). That server comes from the descriptor alone, never from which row is
+primary now: its agent's server, or, for a descriptor naming no agent, the server whose row's gateway
+is the descriptor's own relay or mint host, or the row its lane names outright. A descriptor that names
+no one server by these is refused (`descriptor_unresolved`), and so is one that `AG2_MCP_DESCRIPTOR`
+names but that cannot be read (`descriptor_missing`): the workspace's descriptor never stands in for
+it. Where nothing names a server (a room operation with no room, an MCP seat with no descriptor) it
+refuses by name (`WorkerRoomAmbiguous`, `ambiguous_server`) instead of guessing.
+`retire_worker_identity` removes them all.
 
 A proactive file such a worker's session writes is the worker's lane's to deliver. The session
 publishes it through `result_publish.py`, which stamps the name

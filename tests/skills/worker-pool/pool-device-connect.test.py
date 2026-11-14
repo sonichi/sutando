@@ -799,7 +799,7 @@ class Resend(CardsBase):
     def test_a_child_refused_by_the_identity_check_frees_the_button(self):
         self.expire()
         _, _, spawned = self.reply(dc.resend_text(W))
-        rc, _ = self.child(spawned[0], **{"connections.worker_identity": lambda w, ws=None: {"instance": "x"}})
+        rc, _ = self.child(spawned[0], **{"connections.worker_identity": lambda w, ws=None, server=None: {"instance": "x"}})
         self.assertEqual(rc, 1)
         self.assertIn("already has an agent", dc.read_record(self.ws, W)["why"])
         self.assertEqual(self.reply(dc.resend_text(W))[1]["status"], "started")
