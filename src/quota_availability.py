@@ -193,6 +193,7 @@ FRESH_SEC = 10 * 60
 class QuotaRecord:
     payload: dict
     age_s: Optional[float]    # None: no usable timestamp on the record
+    checked_at: Optional[float] = None    # the epoch age_s was taken from (last_checked, else mtime)
 
     def fresh(self, fresh_sec: float = FRESH_SEC) -> bool:
         return self.age_s is not None and 0 <= self.age_s <= fresh_sec
@@ -236,7 +237,7 @@ def read_quota_record(workspace, now: Optional[float] = None) -> Optional[QuotaR
         except OSError:
             when = None
     at = time.time() if now is None else now
-    return QuotaRecord(data, None if when is None else at - when)
+    return QuotaRecord(data, None if when is None else at - when, when)
 
 
 # ---- the running seat's routing -------------------------------------------
@@ -439,6 +440,9 @@ PROBE_TIMEOUT_S = 60
 PROBE_MARK = "quota-probe.last"
 #: Under logs/: one line per probe decision and one per re-read, the only record that a request was spent.
 PROBE_LOG = "quota-probe.log"
+# The dedup reads at most this much of the log's end; past PROBE_LOG_MAX_BYTES it is rotated to `.1`.
+PROBE_LOG_TAIL_BYTES = 32 * 1024
+PROBE_LOG_MAX_BYTES = 1024 * 1024
 #: Under the system temp dir, OUTSIDE any repo: a cwd under a checkout loads that
 #: project's CLAUDE.md and hooks (the default workspace is in-repo), measured at 60 s vs 7 s.
 PROBE_CWD = "sutando-quota-probe"
@@ -469,24 +473,39 @@ def _launch_detached(argv, env, timeout, cwd=None):
 
 def _log_probe(workspace, at: float, once: Optional[str] = None, **fields) -> None:
     """Append one `k=v` line to `<workspace>/logs/quota-probe.log`. With `once`, a
-    line already carrying that token for the same seat (in the last 200 lines) is
-    not repeated: a held banner is polled every few seconds for as long as it
-    lasts. Never raises: the gate is on a fail-closed path and a log that cannot
-    be written changes nothing."""
+    line already carrying that token for the same seat (for a line with no seat, that
+    token alone), in the log's last PROBE_LOG_TAIL_BYTES, is not repeated: a held
+    banner is polled every few seconds for as long as it lasts. Never raises: the
+    gate is on a fail-closed path and a log that cannot be written changes nothing."""
     stamp = datetime.fromtimestamp(at, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     line = stamp + "".join(f" {k}={v}" for k, v in fields.items() if v is not None) + "\n"
     try:
+        from file_lock import locked_file
         log = Path(workspace) / "logs" / PROBE_LOG
         log.parent.mkdir(parents=True, exist_ok=True)
-        if once is not None and log.exists():
-            seat_tok = f" seat={fields.get('seat')} "
-            tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-200:]
-            if any(seat_tok in ln + " " and f" {once} " in ln + " " for ln in tail):
-                return
-        with log.open("a", encoding="utf-8") as fh:
-            fh.write(line)
-    except OSError:
+        # Every notifier writes this file: the dedup, the rotation and the append are one step.
+        with locked_file(log.with_name(PROBE_LOG + ".lock")):
+            if once is not None and log.exists():
+                seat = fields.get("seat")
+                seat_tok = None if seat is None else f" seat={seat} "
+                if any(f" {once} " in ln + " " and (seat_tok is None or seat_tok in ln + " ")
+                       for ln in _log_tail(log)):
+                    return
+            if log.exists() and log.stat().st_size >= PROBE_LOG_MAX_BYTES:
+                os.replace(log, log.with_name(PROBE_LOG + ".1"))
+            with log.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+    except (OSError, ImportError):
         pass
+
+
+def _log_tail(log: Path) -> list:
+    """The log's last lines, from at most its last PROBE_LOG_TAIL_BYTES: a constant cost per poll."""
+    with log.open("rb") as fh:
+        size = fh.seek(0, os.SEEK_END)
+        fh.seek(max(0, size - PROBE_LOG_TAIL_BYTES))
+        lines = fh.read().decode("utf-8", errors="replace").splitlines()
+    return lines[1:] if size > PROBE_LOG_TAIL_BYTES else lines    # the first line may be cut
 
 
 def _claim_probe_marker(mark: Path, at: float, fresh_sec: float) -> Optional[float]:
@@ -557,18 +576,20 @@ def probe_refreshes_record(workspace, base_url: Optional[str], model: Optional[s
 def _log_reread(workspace, seat: str, rec: QuotaRecord, env: SeatEnv, fresh_sec: float, at: float) -> None:
     """The record as read AFTER a probe landed: written by whichever poll first
     sees a record newer than the marker (the probe is detached, so the poll that
-    sent it reads the old record), once per record stamp."""
+    sent it reads the old record), once per probe window per seat."""
     if rec.age_s is None:
         return
     try:
         marked = (Path(workspace) / "state" / PROBE_MARK).stat().st_mtime
     except OSError:
         return
-    stamp = int(at - rec.age_s)
+    # The record's own time: `at` is a later clock read than the one age_s was taken at.
+    stamp = int(rec.checked_at) if rec.checked_at is not None else int(at - rec.age_s)
     if stamp <= int(marked):
         return
-    _log_probe(workspace, at, once=f"stamp={stamp}", seat=seat, reread=_vouch_reason(rec, env, workspace, fresh_sec) or "vouches",
-               record=record_model(rec.payload), stamp=stamp,
+    # One line per probe window: other seats' traffic rewrites the record at their request rate.
+    _log_probe(workspace, at, once=f"probe={int(marked)}", seat=seat, reread=_vouch_reason(rec, env, workspace, fresh_sec) or "vouches",
+               record=record_model(rec.payload), stamp=stamp, probe=int(marked),
                windows="allowed" if gate_windows_allowed(rec.payload) else "rejected")
 
 

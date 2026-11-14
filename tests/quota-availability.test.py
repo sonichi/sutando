@@ -531,6 +531,11 @@ class TestProbeRefreshesRecord(RecordFixture):
         qa._launch_detached(quick, env=dict(os.environ), timeout=10, cwd=str(self.ws)).wait(10)
         self.assertTrue(done.exists())
 
+    def test_a_lock_module_that_cannot_load_does_not_break_the_probe_log_promise(self):
+        with mock.patch.dict(sys.modules, {"file_lock": None}):
+            qa._log_probe(self.ws, NOW, result="sent")
+        self.assertFalse((Path(self.ws) / "logs" / qa.PROBE_LOG).exists())
+
     def test_the_marker_is_claimed_under_a_sibling_lock_not_the_marker_itself(self):
         # Locking creates its file; if the marker were the lock, its fresh mtime
         # would read as "probed a moment ago" and no probe could ever go out.
@@ -544,7 +549,9 @@ class TestProbeRefreshesRecord(RecordFixture):
 
         with mock.patch.object(file_lock, "locked_file", spy):
             self.assertTrue(qa.probe_refreshes_record(self.ws, PROXY, MODEL, now=NOW, runner=self._runner([])))
-        self.assertEqual(seen, [qa.PROBE_MARK + ".lock"])
+        self.assertEqual(seen[0], qa.PROBE_MARK + ".lock")
+        self.assertNotIn(qa.PROBE_MARK, seen, "the marker itself is never the lock")
+        self.assertEqual(set(seen[1:]) - {qa.PROBE_LOG + ".lock"}, set(), "only the probe log's own lock follows")
 
     def test_at_most_one_probe_per_window_host_wide(self):
         calls = []
@@ -727,6 +734,79 @@ class TestProviderAllowsNowWithProbe(RecordFixture):
         self.assertFalse(self._allows(self._proxy_that_writes(calls, _record(age_s=0))))
         self.assertEqual(calls, [])
         self.assertIn("sent=0 why=marker-unwritable", self._log_lines()[0])
+
+    def test_a_line_with_no_seat_still_dedups_on_its_token(self):
+        for dt in (0, 5, 10):
+            qa._log_probe(self.ws, NOW + dt, once="mark=7", sent=0, why="marker-fresh", mark=7)
+        self.assertEqual(len(self._log_lines()), 1, self._log_lines())
+
+    def test_the_dedup_reads_only_the_logs_tail(self):
+        log = self.ws / "logs" / qa.PROBE_LOG
+        log.parent.mkdir(parents=True, exist_ok=True)
+        filler = "".join(f"2026-01-01T00:00:00Z seat=other n={i}\n" for i in range(qa.PROBE_LOG_TAIL_BYTES // 30))
+        log.write_text(f"2026-01-01T00:00:00Z seat={SEAT} mark=7\n" + filler)
+        qa._log_probe(self.ws, NOW, once="mark=7", seat=SEAT, mark=7)
+        self.assertEqual(sum(f"seat={SEAT} " in ln for ln in self._log_lines()), 2,
+                         "a token older than the tail is not looked for")
+        qa._log_probe(self.ws, NOW + 5, once="mark=7", seat=SEAT, mark=7)
+        self.assertEqual(sum(f"seat={SEAT} " in ln for ln in self._log_lines()), 2, "one inside the tail still dedups")
+
+    def test_a_full_log_is_rotated_before_the_next_line(self):
+        log = self.ws / "logs" / qa.PROBE_LOG
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("x" * qa.PROBE_LOG_MAX_BYTES)
+        qa._log_probe(self.ws, NOW, seat=SEAT, sent=1)
+        self.assertEqual(len(self._log_lines()), 1)
+        self.assertEqual((log.parent / (qa.PROBE_LOG + ".1")).stat().st_size, qa.PROBE_LOG_MAX_BYTES)
+
+    def test_a_second_writer_inside_a_rotation_loses_no_line_and_keeps_the_archive(self):
+        # The first rotation lets another writer run inside it; unlocked, that writer rotates too and
+        # the first writer's rename finds no file, so its line is lost (#6310 review).
+        import threading
+        log = self.ws / "logs" / qa.PROBE_LOG
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text("x" * (qa.PROBE_LOG_MAX_BYTES - 1) + "\n")
+        real, second = os.replace, []
+
+        def replace_with_a_writer_inside(src, dst):
+            if not second:
+                second.append(threading.Thread(target=qa._log_probe, args=(self.ws, NOW + 1),
+                                               kwargs={"seat": "b", "sent": 1}))
+                second[0].start()
+                second[0].join(0.5)          # unlocked it finishes here; locked it waits for this writer
+            return real(src, dst)
+
+        with mock.patch.object(qa.os, "replace", replace_with_a_writer_inside):
+            qa._log_probe(self.ws, NOW, seat="a", sent=1)
+            second[0].join(10)
+        archive = log.with_name(qa.PROBE_LOG + ".1")
+        lines = log.read_text().splitlines()
+        self.assertEqual(sorted(ln.split(" ", 1)[1] for ln in lines), ["seat=a sent=1", "seat=b sent=1"])
+        self.assertEqual(archive.stat().st_size, qa.PROBE_LOG_MAX_BYTES, "the archive is the full old log")
+
+    def test_the_re_read_stamp_is_the_records_own_time_not_the_logging_clock(self):
+        # Production reads the record at one clock and logs at a later one; age-derived stamps drifted.
+        (self.ws / "state" / qa.PROBE_MARK).write_text(str(NOW))
+        os.utime(self.ws / "state" / qa.PROBE_MARK, (NOW, NOW))
+        self.write(_record(age_s=-3.5))                       # last_checked NOW+3.5
+        rec = qa.read_quota_record(self.ws, NOW + 5)
+        self.assertEqual(rec.checked_at, NOW + 3.5)
+        for later in (5.2, 5.7):
+            qa._log_reread(self.ws, SEAT, rec, qa.SeatEnv(True, PROXY), qa.FRESH_SEC, NOW + later)
+        rereads = [ln for ln in self._log_lines() if "reread=" in ln]
+        self.assertEqual(len(rereads), 1, rereads)
+        self.assertIn(f"stamp={int(NOW + 3)}", rereads[0])
+
+    def test_other_seats_traffic_writes_one_re_read_per_probe_window(self):
+        (self.ws / "state" / qa.PROBE_MARK).write_text(str(NOW))
+        os.utime(self.ws / "state" / qa.PROBE_MARK, (NOW, NOW))
+        for n, dt in enumerate((3, 6, 9, 12)):            # the record rewritten by another seat's requests
+            self.write(_record(age_s=-dt))
+            rec = qa.read_quota_record(self.ws, NOW + dt + 1)
+            qa._log_reread(self.ws, SEAT, rec, qa.SeatEnv(True, PROXY), qa.FRESH_SEC, NOW + dt + 1)
+        rereads = [ln for ln in self._log_lines() if "reread=" in ln]
+        self.assertEqual(len(rereads), 1, rereads)
+        self.assertIn(f"probe={int(NOW)}", rereads[0])
 
     def test_a_record_with_no_usable_time_writes_no_re_read(self):
         qa._log_reread(self.ws, SEAT, qa.QuotaRecord(_record(), None), qa.SeatEnv(True, PROXY), qa.FRESH_SEC, NOW)
