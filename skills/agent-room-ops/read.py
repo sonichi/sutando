@@ -10,6 +10,7 @@ gateway-side. See _gateway.py for the shared boundary + gate.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -106,6 +107,65 @@ def _redactor():
     return _REDACTOR
 
 
+_KIND_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,39}")
+_MXC_RE = re.compile(r"mxc://[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9_-]+")
+
+
+def _bp(v):
+    ok = isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 10000
+    return v if ok else None
+
+
+_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+_MIME_RE = re.compile(r"[a-z0-9.+-]{1,40}/[a-z0-9.+-]{1,80}")
+
+
+def _safe_str(v, pattern, redact):
+    if not (isinstance(v, str) and pattern.fullmatch(v)):
+        return None
+    return redact(v)
+
+
+def _commons_comment_view(cc, redact):
+    """Only the known keys, each shape-checked; string values go through the body's redactor."""
+    out = {}
+    for key, pattern in (("surface", _KIND_RE), ("kind", _KIND_RE), ("page", _ID_RE),
+                         ("image", _MXC_RE), ("area_media", _MXC_RE)):
+        if (v := _safe_str(cc.get(key), pattern, redact)) is not None:
+            out[key] = v
+    area = cc.get("area")
+    if isinstance(area, dict):
+        box = {k: _bp(area.get(k)) for k in ("x", "y", "w", "h")}
+        if None not in box.values():
+            out["area"] = box
+    info = cc.get("image_info")
+    if isinstance(info, dict):
+        clean = {k: info[k] for k in ("w", "h", "size")
+                 if isinstance(info.get(k), int) and not isinstance(info.get(k), bool)
+                 and info[k] >= 0}
+        if (mime := _safe_str(info.get("mimetype"), _MIME_RE, redact)) is not None:
+            clean["mimetype"] = mime
+        if clean:
+            out["image_info"] = clean
+    return out
+
+
+def _commons_comment_line(cc):
+    """One line from allow-listed shapes only; agents read it verbatim, the view is member-written."""
+    parts = []
+    area = cc.get("area")
+    if isinstance(area, dict):
+        x, y, w, h = (_bp(area.get(k)) for k in ("x", "y", "w", "h"))
+        if None not in (x, y, w, h):
+            kind = cc.get("kind")
+            on = " on %s" % kind if isinstance(kind, str) and _KIND_RE.fullmatch(kind) else ""
+            parts.append("area %d,%d %dx%d bp%s" % (x, y, w, h, on))
+    image = cc.get("image")
+    if isinstance(image, str) and _MXC_RE.fullmatch(image):
+        parts.append("picture: %s" % image)
+    return "[%s]" % "; ".join(parts) if parts else None
+
+
 def _relation(m):
     """(in_reply_to, thread_root) event ids the gateway item carries, flat or Matrix-nested."""
     rel = m.get("relates_to") or m.get("m.relates_to")
@@ -154,6 +214,13 @@ def _normalize(items):
             norm["in_reply_to"] = reply
         if thread:
             norm["thread_root"] = thread
+        # Member-written: only allow-listed, redacted fields pass, plus one display
+        # line so a reader sees the area and the picture it can `fetch`.
+        cc = m.get("commons_comment")
+        if isinstance(cc, dict) and (cc := _commons_comment_view(cc, redact)):
+            norm["commons_comment"] = cc
+            if (line := _commons_comment_line(cc)):
+                norm["commons_comment_line"] = line
         out.append(norm)
     return out
 
