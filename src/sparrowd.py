@@ -100,7 +100,7 @@ def _skill_worker_specs() -> "tuple[list, list[str]]":
         try:
             script = (skill_dir / rel).resolve()
             valid_script = script.is_relative_to(skill_dir.resolve()) and script.is_file()
-        except (OSError, RuntimeError) as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             skipped.append(f"{name}: script inaccessible ({exc})")
             continue
         if not valid_script:
@@ -179,7 +179,12 @@ def _static_specs() -> "tuple[list, list[str]]":
         ),
     ]
     skill_specs, skipped = _skill_worker_specs()
-    specs.extend(skill_specs)
+    # The supervisor keys workers by name, last wins: the core's and earlier roots' names hold.
+    for spec in skill_specs:
+        if any(spec.name == s.name for s in specs):
+            skipped.append(f"{spec.name}: worker name already taken; {spec.argv[-1]} is not supervised")
+            continue
+        specs.append(spec)
     return specs, skipped
 
 

@@ -268,11 +268,16 @@ def malformed_worker_manifests(mod):
         original_is_file = Path.is_file
         cases = [("non-object " + raw, raw, None) for raw in ("[]", "null", "42", '"text"')]
         cases += [("script permission", valid, root / "bad" / "loop.py"),
-                  ("interpreter permission", valid, root / "bad-python")]
+                  ("interpreter permission", valid, root / "bad-python"),
+                  ("script null character", valid, None)]
         for label, body, denied in cases:
             if label == "interpreter permission":
                 data = json.loads(body)
                 data["config"]["FIXTURE_WORKER_PYTHON"] = str(denied)
+                body = json.dumps(data)
+            if label == "script null character":
+                data = json.loads(body)
+                data["supervised_worker"]["script"] = "bad\u0000.py"
                 body = json.dumps(data)
             manifests[0].write_text(body, encoding="utf-8")
 
@@ -291,6 +296,35 @@ def malformed_worker_manifests(mod):
                     continue
             check(label + " skips only the bad worker", [s.name for s in specs] == ["good"])
             check(label + " records a reason", len(skipped) == 1 and "bad" in skipped[0], str(skipped))
+
+
+def worker_names_are_never_replaced(mod):
+    """A skill declaring a taken worker name is skipped: the core's and the first root's hold."""
+    import tempfile
+    from unittest.mock import patch
+    from ag2_sparrow.sparrowd import Supervisor
+
+    print("── worker names are never replaced ──")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp).resolve()
+        manifests = []
+        for folder, name in (("a-skill", "remote-gateway-bridge"), ("b-skill", "loop"), ("c-skill", "loop")):
+            skill = root / folder
+            skill.mkdir()
+            (skill / "w.py").write_text("# worker\n", encoding="utf-8")
+            (skill / "manifest.json").write_text(json.dumps({"supervised_worker": {
+                "name": name, "script": "w.py", "interpreter": {"config": "FIXTURE_WORKER_PYTHON"}},
+                "config": {"FIXTURE_WORKER_PYTHON": sys.executable}}), encoding="utf-8")
+            manifests.append(skill / "manifest.json")
+        with patch.object(mod, "_skill_manifests", return_value=manifests), \
+                patch.dict(os.environ, {"FIXTURE_WORKER_PYTHON": ""}):
+            specs, skipped = mod._static_specs()
+        workers = {n: w.spec.argv[-1] for n, w in Supervisor(specs)._workers.items()}
+        check("the core gateway bridge is still the core's",
+              workers.get("remote-gateway-bridge") == str(REPO / "src" / "remote-gateway-bridge.py"), str(workers))
+        check("the first skill declaring a name keeps it", workers.get("loop") == str(root / "b-skill" / "w.py"),
+              str(workers))
+        check("each collision is reported", len([w for w in skipped if "already taken" in w]) == 2, str(skipped))
 
 
 def main() -> int:
@@ -394,6 +428,7 @@ def main() -> int:
     guarded_scan(mod)
     locked_skill_folder(mod)
     malformed_worker_manifests(mod)
+    worker_names_are_never_replaced(mod)
 
     print(f"\n{'FAILED: ' + ', '.join(FAILS) if FAILS else 'all sparrowd skill-worker checks ok'}")
     return 1 if FAILS else 0
