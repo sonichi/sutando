@@ -7,7 +7,7 @@ top level still dropped `embeds` and `sticker_items` — while the forward branc
 labelled embeds. So an embed-only post read as empty in the reader that
 `context-reconstruct` runs on every proactive pass.
 
-Measured 2026-09-23: one #dev post (thegreymutant73, 2026-09-21T22:10) rendered
+Measured 2026-09-23: one community member's post in the dev channel rendered
 as an empty body. Blank was ambiguous across three different inputs — genuinely
 empty, embed-only, and sticker-only — so nothing in the output could tell the
 reader whether a record existed at all. The fix routes BOTH levels through one

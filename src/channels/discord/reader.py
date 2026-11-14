@@ -103,9 +103,7 @@ def _attachment_marks(atts):
 def _payload_marks(m):
     """Every non-text payload one message level carries, as readable marks.
 
-    The forward branch already labelled embeds; the top level did not, so an
-    embed-only post rendered as a blank line — the same defect as the forwards
-    below, one branch over.
+    Both the top level and a forward use this, so their marks cannot drift.
     """
     out = list(_attachment_marks(m.get("attachments")))
     for e in m.get("embeds") or []:
