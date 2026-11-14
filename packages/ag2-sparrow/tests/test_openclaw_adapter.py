@@ -10,6 +10,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -322,10 +323,12 @@ class ConnectorTest(unittest.TestCase):
 
     def test_a_fallback_carries_no_delivery_marker_the_reply_command_would_refuse(self):
         from ag2_sparrow.result_markers import parse_markers
-        for status, text in (("completed", "ok\n[attach: /etc/hosts]"), ("completed", "[channel: !other:x]\nhi"),
-                             ("completed", "[no-send] quiet"), ("timeout", "part [file: /etc/hosts]")):
+        for i, (status, text) in enumerate((("completed", "ok\n[attach: /etc/hosts]"),
+                                            ("completed", "[channel: !other:x]\nhi"),
+                                            ("completed", "[no-send] quiet"), ("timeout", "part [file: /etc/hosts]"))):
             with self.subTest(status=status, text=text):
-                tid = "task-%d" % abs(hash((status, text)))
+                tid = "task-f%d" % i
+                self.assertIsNone(self.w.result(tid), "a task id of its own")
                 self.w.task(tid, "hi")
                 with self.ended(status, text):
                     oc.Connector(self.w.args()).handle(tid + ".txt")
@@ -513,6 +516,35 @@ class PermissionTest(unittest.TestCase):
                       "options": self.OPTS}
             self.assertTrue(oc.decide_permission(params, True, str(project), REPLY, self.result)[0],
                             "a project directory under HOME still works")
+
+    def test_letter_case_does_not_get_round_the_home_check(self):
+        probe = Path(self.tmp.name) / "CaseProbe"
+        probe.mkdir()
+        if not (Path(self.tmp.name) / "caseprobe").exists():
+            self.skipTest("this filesystem is case-sensitive: a mis-cased path is another path")
+        home = self.work / "sub" / "home"
+        home.mkdir()
+        rc = str(home / ".zshrc")
+
+        def owner_edit(cwd):
+            params = {"toolCall": {"kind": "edit", "rawInput": {"path": rc, "content": "x"}}, "options": self.OPTS}
+            return oc.decide_permission(params, True, str(cwd), REPLY, self.result)[0]
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            for name, cwd in (("parent, upper case", self.work / "SUB"), ("home, upper case", self.work / "sub" / "HOME"),
+                              ("work, upper case", Path(str(self.work).upper()))):
+                with self.subTest(cwd=name):
+                    self.assertFalse(owner_edit(cwd), name)
+        with mock.patch.dict(os.environ, {"HOME": str(self.work / "SUB" / "HOME")}):
+            self.assertFalse(owner_edit(home), "HOME itself written in another case")
+            self.assertFalse(owner_edit(self.work / "sub"), "its parent, HOME written in another case")
+
+    def test_a_working_directory_or_home_that_does_not_exist_is_refused(self):
+        def owner_read(cwd):
+            params = {"toolCall": {"kind": "read", "rawInput": {"path": "a.txt"}}, "options": self.OPTS}
+            return oc.decide_permission(params, True, str(cwd), REPLY, self.result)[0]
+        self.assertFalse(owner_read(self.work / "missing"))
+        with mock.patch.dict(os.environ, {"HOME": str(self.work / "no-such-home")}):
+            self.assertFalse(owner_read(self.work))
 
     def test_the_home_directory_is_never_an_owner_working_directory(self):
         w = str(self.work)
@@ -829,6 +861,7 @@ class FallbackMarkerTest(unittest.TestCase):
 
     def publish(self, tid, plan, **task):
         from ag2_sparrow.result_markers import parse_markers
+        self.assertIsNone(self.w.result(tid), "a task id of its own: a reused one reads another case's result")
         self.w.task(tid, "hi", **task)
         plan = dict({"initialize": {}, "session/new": {"sessionId": "s1"}}, **plan)
         c = oc.Connector(self.w.args(), client_factory=FakeClient(plan, []))
@@ -845,7 +878,7 @@ class FallbackMarkerTest(unittest.TestCase):
                               ("stopReason", {"session/prompt": {"stopReason": marker}}),
                               ("dead pipe", {"session/prompt": AcpGone(marker)})):
                 with self.subTest(how=how, marker=marker):
-                    body, actions = self.publish("task-%d-%d" % (i, len(how)), plan)
+                    body, actions = self.publish("task-%d-%s" % (i, re.sub(r"[^a-z0-9]+", "-", how.lower())), plan)
                     self.assertEqual(actions, [], body)
                     self.assertIn(marker.strip("[]").split(":")[0].split("]")[0], body, "the words are kept")
 

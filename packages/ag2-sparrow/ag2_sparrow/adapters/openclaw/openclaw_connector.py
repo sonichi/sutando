@@ -281,10 +281,27 @@ def resolved(root, raw):
 
 
 def at_or_above_home(root):
-    """`root` is the home directory or one of its ancestors (real paths): a working directory there
-    would put every dotfile under the owner's file grants. Unresolvable is treated as above."""
-    home, here = resolved(root, "~"), resolved(root, ".")
-    return not home or not here or os.path.commonpath([home, here]) == here
+    """`root` is the home directory or one of its ancestors: a working directory there would put every
+    dotfile under the owner's file grants. Compared as files (device and inode), not as strings, so
+    letter case on a case-insensitive filesystem or a link cannot get round it. A root or a home that
+    cannot be read is treated as above."""
+    try:
+        here = os.stat(root)
+        p = os.path.realpath(os.path.expanduser("~"))
+        os.stat(p)
+    except (OSError, ValueError):
+        return True
+    while True:
+        try:
+            st = os.stat(p)
+            if (st.st_dev, st.st_ino) == (here.st_dev, here.st_ino):
+                return True
+        except OSError:
+            pass
+        parent = os.path.dirname(p)
+        if parent == p:
+            return False
+        p = parent
 
 
 def is_draft(root, raw, result_file):
