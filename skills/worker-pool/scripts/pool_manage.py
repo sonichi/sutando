@@ -193,18 +193,19 @@ def retire(workspace, target, *, unbind=False, hand_off=False, runner=subprocess
 
 
 def _retire_identity(workspace, wid: str) -> dict:
-    """The worker's own agent, if it has one, goes with it: its lane, row and vault secret
+    """The worker's own agents, one per server, go with it: their lanes, rows and vault secrets
     (connections.retire_worker_identity). Retired, the router hands its tasks to the core, and
     a lane still running as the worker would post the core's answers in the worker's name."""
     import connections
     try:
-        row = connections.retire_worker_identity(wid, workspace=Path(workspace))
+        rows = connections.retire_worker_identity(wid, workspace=Path(workspace))
     except connections.ConnectionsError as e:
         return {"result": "failed", "why": f"{type(e).__name__}: {e}"}
-    if row is None:
+    if not rows:
         return {"result": "none"}
-    return {"result": "removed", "instance": row["instance"], "agent": row.get("agent_mxid") or "",
-            "note": "the agent stays on its server until the owner deletes it there"}
+    return {"result": "removed", "instance": ", ".join(str(r["instance"]) for r in rows),
+            "agent": ", ".join(str(r.get("agent_mxid") or "") for r in rows),
+            "note": "the agents stay on their servers until the owner deletes them there"}
 
 
 def enable(workspace, repo, target, *, start=True, runner=None, spawn=None) -> dict:

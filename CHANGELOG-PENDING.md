@@ -25,6 +25,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 ## Fixed
 
 <!-- fix() PRs go here -->
+- connections: a pool worker seat's MCP descriptor with no agent names a server only by its relay or mint endpoint's exact scheme, host and port, so a look-alike host, another port on the same host, plain HTTP against an HTTPS row, port 0 or a non-HTTP(S) scheme is refused, not resolved. ([#6449])
 - ag2-sparrow: the `ag2-sparrow-outbox` recovery command logged for a quarantined result names its `--root` and `--results-dir` through the workspace resolver (`$HOME` without one) and quotes its ids, so the log carries no home path and a workspace path with a space no longer splits the command. ([#6447])
 - schedule-crons: the seeder's owner notices (a restored `crons.json`, legacy jobs not enabled) are recorded before the schedule is written, queued once to the owner's DM through the proactive outbox, and kept, printed at most once a day, until `seed_crons.py --notice-sent`; a failed legacy backup or notice write no longer loses them. ([#6448])
 - ag2-sparrow: the requeue command the bridge logs for a parked message names its outbox root through `bash scripts/sutando-config.sh workspace` (or `$HOME` when no workspace resolver is set), so the log no longer carries a home path; run it from the engine checkout as before. ([#6445])

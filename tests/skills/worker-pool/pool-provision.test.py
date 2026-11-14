@@ -301,7 +301,9 @@ class Finish(Base):
         kept = self.vault.store[WORKER_REF]
         self.vault.set(CLAIM_KEY, "1" * 64)
         before = len(self.backend.paths)
-        self.assertIn("already has an agent of its own; nothing was redeemed", self.failure(claim))
+        text = self.failure(claim)
+        self.assertIn("already has an agent of its own on alpha-fixture.net", text)
+        self.assertIn("nothing was redeemed", text)
         self.assertEqual((len(self.backend.paths), self.vault.store[WORKER_REF]), (before, kept))
 
     def test_a_connection_that_appeared_during_the_redeem_keeps_its_own_token(self):

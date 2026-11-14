@@ -143,6 +143,10 @@ creates that agent in AG2 Space, and its access token becomes a connection row n
   unstamped notes that a core lane sends.
 - It never becomes primary, and owns no unaddressed message or owner card.
 
+A worker holds at most one such agent per server: one on each homeserver the core is connected to, each its own
+row and lane. Rooms use the agent on their server; a note naming no room goes from the one on the primary's server.
+`show` lists them all; `rotate` and `remove` take `--server` (or infer it while there is one); `retire` removes all.
+
 The core owns that identity's lifecycle and its lane; the worker's session uses it. From the worker's seat, room
 clients (`room_ops.py`, `notify.py`, the room-database adapters) act as the worker's own agent in rooms on its
 server, through the one resolver (`connections.acting_identity`, see `docs/connections.md`, "In a pool worker's
@@ -156,9 +160,9 @@ naming `SUTANDO_WORKER_ID` and `AG2_MCP_WORKER_CREDENTIAL` (`codex_worker_mcp.py
 
 ```bash
 python3 skills/worker-pool/scripts/pool_identity.py add <worker> --repo . --logs-dir "$(bash scripts/sutando-config.sh workspace)/logs"
-python3 skills/worker-pool/scripts/pool_identity.py show <worker>
-python3 skills/worker-pool/scripts/pool_identity.py rotate <worker> --repo . --logs-dir <logs dir>
-python3 skills/worker-pool/scripts/pool_identity.py remove <worker>
+python3 skills/worker-pool/scripts/pool_identity.py show <worker> [--server <server>]
+python3 skills/worker-pool/scripts/pool_identity.py rotate <worker> --repo . --logs-dir <logs dir> [--server <server>]
+python3 skills/worker-pool/scripts/pool_identity.py remove <worker> [--server <server>]
 ```
 
 `add` asks for the token at a hidden prompt (`-` reads it from stdin), then shows what the token's gateway says and
@@ -168,7 +172,7 @@ connection already serves (`worker_owner_mismatch`), so a worker never runs as a
 never printed. `rotate` accepts a new token only for the same agent. A worker's lane is launched naming its worker. If
 the launch and the record disagree, or neither can say, the lane refuses to start rather than run as the core's.
 
-`pool_manage.py retire` also removes the worker's agent identity: its lane, its row and its vault secret. The agent
+`pool_manage.py retire` also removes the worker's agent identities, one per server: their lanes, rows and vault secrets. The agent
 itself stays on its server until the owner deletes it there.
 
 ### Giving a worker its own agent: the device-connect flow (the standard way)

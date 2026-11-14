@@ -493,18 +493,22 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     given), and `deliver(text)` the text note when no card was posted. The token is saved only when
     the gateway confirms the agent the poll named, on the core's server and owned by the core's owner, and
     the save and `start_lane(row)` run under `fenced`, so a worker retired during the wait gets neither."""
-    current = connections.worker_identity(worker, workspace)
-    if rotate and current is None:
-        raise DeviceConnectError(f"worker {worker} has no agent of its own to rotate")
-    if not rotate and current is not None:
-        raise DeviceConnectError(f"worker {worker} already has an agent of its own; rotate it instead")
     core = pp.core_lane(workspace, lane)
+    server = str(core.get("server") or "")
+    current = connections.worker_identity(worker, workspace, server=server)
+    if rotate and current is None:
+        raise DeviceConnectError(f"worker {worker} has no agent of its own on {server} to rotate")
+    if not rotate:
+        try:
+            connections.require_no_worker_identity(worker, server, workspace)
+        except connections.ConnectionsError as e:
+            raise DeviceConnectError(str(e)) from None
     gateway = pp.origin_of(str(core["gateway_url"]))
     base = (base or gateway).rstrip("/")
     if base != gateway:
         raise DeviceConnectError("the connect base must be the core's own gateway origin, so the approval link "
                                  "cannot come from another host")
-    pending = start(base, label, display_name, server=str(core.get("server") or ""),
+    pending = start(base, label, display_name, server=server,
                     welcome_core="" if rotate else str(core.get("agent_mxid") or ""), request=request, clock=clock)
     known = [pending["device_code"]]
     who = worker_label or worker
@@ -550,7 +554,7 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     token = f"{got['relay_url']}|{got['bearer']}"
     try:
         with fenced(worker, workspace):
-            now = connections.worker_identity(worker, workspace)
+            now = connections.worker_identity(worker, workspace, server=server)
             if (now or {}).get("instance") != (current or {}).get("instance"):
                 raise DeviceConnectError(f"worker {worker}'s own identity changed while the approval was "
                                          "pending; nothing was saved", status="identity_changed")
@@ -600,9 +604,13 @@ def _save(worker, token, agent_id, core, current, *, workspace, vault, preview, 
                                        workspace=workspace, vault=vault)
         return {"agent_id": agent_id, "status": "rotated", "row": row}
     # A pasted-token add takes no roster lock, so one can still land after `fenced` looked.
-    row, created = connections.add_worker_identity(worker, token, expected_server=str(seen.get("server") or ""),
-                                                   source="agent_link", preview=seen, workspace=workspace,
-                                                   vault=vault)
+    try:
+        row, created = connections.add_worker_identity(worker, token, expected_server=str(seen.get("server") or ""),
+                                                       source="agent_link", preview=seen, workspace=workspace,
+                                                       vault=vault)
+    except connections.WorkerIdentityExists:
+        row, created = connections.worker_identity(worker, workspace, server=str(seen.get("server") or "")) or \
+            {"instance": "another agent's, since removed"}, False
     if not created:
         raise DeviceConnectError(f"worker {worker} already had a connection ({row['instance']}) by the time the "
                                  "approved token was saved; it was left as it is", status="identity_changed")

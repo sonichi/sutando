@@ -243,12 +243,12 @@ class Lifecycle(Base):
 
     def test_retirement_removes_the_row_and_the_secret_only(self):
         out = C.retire_worker_identity(W, workspace=self.ws, vault=self.vault, kill=lambda *a: None)
-        self.assertEqual(out["instance"], WORKER_INST)
+        self.assertEqual([r["instance"] for r in out], [WORKER_INST])
         self.assertIsNone(C.worker_identity(W, self.ws))
         self.assertNotIn(self.row["token_ref"], self.vault.store)
         self.assertIn("AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET", self.vault.store)
         self.assertEqual([r["instance"] for r in self.rows()], ["alpha-fixture-net"])
-        self.assertIsNone(C.retire_worker_identity(W, workspace=self.ws, vault=self.vault))
+        self.assertEqual(C.retire_worker_identity(W, workspace=self.ws, vault=self.vault), [])
 
     def test_pool_manage_retire_takes_the_identity(self):
         import pool_manage
@@ -543,6 +543,389 @@ class OwnerCommand(Base):
                                   stdin=TOKEN_W)
         self.assertEqual(rc, 1)
         self.assertTrue(err.startswith("pool_identity: "), err)
+
+
+# ── one agent per server: a worker with an identity on two homeservers ──────────────────────────
+
+BETA_CORE, BETA_WORKER = "@sutando:beta-fixture.net", "@reviewer:beta-fixture.net"
+TOKEN_WB = "https://relay.beta-fixture.net:8443|secret-reviewer-b"
+ALPHA_ROOM, BETA_ROOM = "!work:alpha-fixture.net", "!work:beta-fixture.net"
+
+
+class TwoServers(Base):
+    """The core is connected to alpha (primary) and beta; worker W holds an agent of its own on each."""
+
+    def setUp(self):
+        super().setUp()
+        self.add_core()
+        self.add(H.TOKEN_B, fetch=H.agents(BETA_CORE))
+        self.alpha, created_a = self.add_worker()
+        self.beta, created_b = self.add_worker(TOKEN_WB, BETA_WORKER)
+        self.assertTrue(created_a and created_b)
+        self.env = {C.SESSION_WORKER_ENV: W}
+
+    def test_two_identities_are_two_rows_with_their_own_secrets(self):
+        mine = C.worker_identities(W, self.ws)
+        self.assertEqual(sorted((r["server"], r["agent_mxid"]) for r in mine),
+                         [("alpha-fixture.net", WORKER_AGENT), ("beta-fixture.net", BETA_WORKER)])
+        self.assertNotEqual(self.alpha["instance"], self.beta["instance"])
+        self.assertEqual(self.vault.store[self.alpha["token_ref"]], TOKEN_W)
+        self.assertEqual(self.vault.store[self.beta["token_ref"]], TOKEN_WB)
+
+    def test_a_lookup_picks_by_server_and_refuses_to_guess(self):
+        self.assertEqual(C.worker_identity(W, self.ws, server="alpha-fixture.net")["agent_mxid"], WORKER_AGENT)
+        self.assertEqual(C.worker_identity(W, self.ws, server="Beta-Fixture.NET")["agent_mxid"], BETA_WORKER)
+        self.assertIsNone(C.worker_identity(W, self.ws, server="gamma-fixture.net"))
+        for lookup in (C.worker_identity, C.worker_enabled_identity):
+            with self.assertRaises(C.AmbiguousWorkerIdentity) as e:
+                lookup(W, self.ws)
+            self.assertEqual(e.exception.CODE, "worker_identity_ambiguous")
+
+    def test_a_room_acts_with_its_own_servers_token(self):
+        for room, token, agent in ((ALPHA_ROOM, TOKEN_W, WORKER_AGENT), (BETA_ROOM, TOKEN_WB, BETA_WORKER)):
+            row = C.connection_for_room(room, self.ws, self.env)
+            self.assertEqual(row["agent_mxid"], agent, room)
+            _, got = C.room_credential(room, workspace=self.ws, environ=self.env, vault=self.vault)
+            self.assertEqual(got, token, room)
+            self.assertEqual(C.room_agent_mxid(room, workspace=self.ws, environ=self.env), agent, room)
+
+    def test_a_room_operation_with_no_room_is_refused_by_name(self):
+        with self.assertRaises(C.WorkerRoomAmbiguous) as e:
+            C.connection_for_room(None, self.ws, self.env)
+        self.assertIsInstance(e.exception, C.NoConnectionForRoom, "every NoConnectionForRoom handler refuses it")
+        self.assertIsNotNone(C.connection_for_room(None, self.ws, {}), "the core's session is unchanged")
+
+    def test_the_mcp_credential_is_the_seats_servers(self):
+        for server, secret in (("alpha-fixture.net", "secret-reviewer"), ("beta-fixture.net", "secret-reviewer-b")):
+            cred = C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault, environ={}, server=server)
+            self.assertEqual((cred["acts_as"], cred["server"], cred["bearer"]), ("worker", server, secret))
+        with self.assertRaises(C.NoWorkerCredential) as e:
+            C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault, environ={})
+        self.assertEqual(e.exception.reason, "ambiguous_server")
+        (self.ws / "state" / C.MCP_DESCRIPTOR_NAME).write_text(json.dumps({"lane": "beta-fixture-net"}))
+        with unittest.mock.patch.object(C, "mcp_descriptor_path", lambda ws, *a: ws / "state" / C.MCP_DESCRIPTOR_NAME):
+            cred = C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault, environ={})
+        self.assertEqual((cred["server"], cred["bearer"]), ("beta-fixture.net", "secret-reviewer-b"))
+        argv = C.mcp_worker_credential_argv(W, Path("/repo"), workspace=self.ws, server="beta-fixture.net")
+        self.assertEqual(argv[-2:], ["--server", "beta-fixture.net"])
+
+    def test_a_single_identity_on_another_server_never_mints_on_the_seats(self):
+        C.remove_worker_identity(W, server="alpha-fixture.net", workspace=self.ws, vault=self.vault,
+                                 kill=lambda *a: None)
+        (self.ws / "state" / C.MCP_DESCRIPTOR_NAME).write_text(
+            json.dumps({"lane": "primary", "relay": "https://chat.alpha-fixture.net"}))
+        with unittest.mock.patch.object(C, "mcp_descriptor_path", lambda ws, *a: ws / "state" / C.MCP_DESCRIPTOR_NAME):
+            cred = C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault, environ={})
+        self.assertEqual(cred, {"worker": W, "acts_as": "core", "reason": "no_identity"},
+                         "the beta token is never handed to a proxy minting on alpha")
+
+    def test_proactive_notes_go_from_the_primarys_server_only(self):
+        self.assertEqual(C.worker_home_identity(W, self.ws)["instance"], self.alpha["instance"])
+        self.assertTrue(C.is_worker_home_lane(self.alpha["instance"], W, self.ws))
+        self.assertFalse(C.is_worker_home_lane(self.beta["instance"], W, self.ws))
+        name = C.session_proactive_name("proactive-1.txt", self.env, self.ws)
+        self.assertEqual(name, f"proactive-1.by-{W}.txt")
+
+    def test_a_note_with_no_server_to_send_from_is_refused_by_name(self):
+        with unittest.mock.patch.object(C, "primary_row", lambda ws=None: None):
+            self.assertIsNone(C.worker_home_identity(W, self.ws))
+            self.assertFalse(C.is_worker_home_lane(self.alpha["instance"], W, self.ws))
+            with self.assertRaises(C.AmbiguousWorkerIdentity):
+                C.session_proactive_name("proactive-1.txt", self.env, self.ws)
+        C.disconnect(self.alpha["instance"], workspace=self.ws, kill=lambda *a: None)
+        self.assertEqual(C.worker_home_identity(W, self.ws)["instance"], self.beta["instance"],
+                         "one serving identity left: it speaks")
+
+    def test_a_second_agent_on_the_same_server_is_still_refused(self):
+        with self.assertRaises(C.WorkerIdentityExists) as e:
+            C.require_no_worker_identity(W, "alpha-fixture.net", self.ws)
+        self.assertEqual(e.exception.CODE, "worker_identity_exists")
+        with self.assertRaises(C.WorkerIdentityExists):
+            self.add_worker("https://chat.alpha-fixture.net|secret-other", "@other:alpha-fixture.net")
+        self.assertEqual(len(C.worker_identities(W, self.ws)), 2)
+        self.assertNotIn("AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET_OTHER", self.vault.store)
+
+    def test_remove_takes_one_server_and_retire_takes_both(self):
+        kill = lambda *a: None  # noqa: E731
+        with self.assertRaises(C.AmbiguousWorkerIdentity):
+            C.remove_worker_identity(W, workspace=self.ws, vault=self.vault, kill=kill)
+        gone = C.remove_worker_identity(W, server="beta-fixture.net", workspace=self.ws, vault=self.vault, kill=kill)
+        self.assertEqual(gone["instance"], self.beta["instance"])
+        self.assertEqual([r["agent_mxid"] for r in C.worker_identities(W, self.ws)], [WORKER_AGENT])
+        self.add_worker(TOKEN_WB, BETA_WORKER)
+        out = C.retire_worker_identity(W, workspace=self.ws, vault=self.vault, kill=kill)
+        self.assertEqual(sorted(r["agent_mxid"] for r in out), [WORKER_AGENT, BETA_WORKER])
+        self.assertEqual(C.worker_identities(W, self.ws), [])
+        self.assertEqual(sorted(self.vault.store), ["AG2_REMOTE_TOKEN_ALPHA_FIXTURE_NET",
+                                                    "AG2_REMOTE_TOKEN_BETA_FIXTURE_NET"])
+
+    def test_the_scripts_refuse_only_on_the_chosen_lanes_server(self):
+        """provision-begin and --device-flow check the server of --lane: beta is refused while W has an
+        agent there, and allowed once that one is gone, the alpha agent standing throughout."""
+        import pool_device_connect
+        import pool_provision
+        kill = lambda *a: None  # noqa: E731
+        for lane, server in (("alpha-fixture-net", "alpha-fixture.net"), ("beta-fixture-net", "beta-fixture.net")):
+            with self.assertRaises(pool_provision.ProvisionError) as e:
+                pool_provision.begin(W, role="reviewer", workspace=self.ws, vault=self.vault, lane=lane)
+            self.assertIn(f"already has an agent of its own on {server}", str(e.exception))
+            with self.assertRaises(pool_device_connect.DeviceConnectError) as e:
+                pool_device_connect.connect(W, label="reviewer", workspace=self.ws, vault=self.vault, lane=lane,
+                                            deliver=lambda text: None)
+            self.assertIn(f"already has an agent of its own on {server}", str(e.exception))
+        C.remove_worker_identity(W, server="beta-fixture.net", workspace=self.ws, vault=self.vault, kill=kill)
+        out = pool_provision.begin(W, role="reviewer", workspace=self.ws, vault=self.vault, lane="beta-fixture-net")
+        self.assertEqual(len(out["claim_key_sha256"]), 64, "a second server's agent may be provisioned")
+
+        class Reached(Exception):
+            pass
+
+        def request(*a, **kw):
+            raise Reached()
+        with self.assertRaises(Reached):
+            pool_device_connect.connect(W, label="reviewer", workspace=self.ws, vault=self.vault,
+                                        lane="beta-fixture-net", request=request, deliver=lambda text: None)
+        with self.assertRaises(pool_device_connect.DeviceConnectError):
+            pool_device_connect.connect(W, label="reviewer", workspace=self.ws, vault=self.vault,
+                                        lane="alpha-fixture-net", request=request, deliver=lambda text: None)
+
+    def test_the_owner_command_takes_or_infers_the_server(self):
+        import pool_identity
+        (self.ws / "state" / "roster.json").write_text(json.dumps(
+            {"version": 1, "workers": {W: {"state": "live", "label": "Reviewer"}}, "bindings": {}}))
+
+        def run(*argv):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = pool_identity.main(["--workspace", str(self.ws), *argv])
+            return rc, out.getvalue(), err.getvalue()
+        with unittest.mock.patch.object(C, "_vault", lambda v=None: self.vault), \
+                unittest.mock.patch.object(C, "_stop_row", lambda row, ws, kill: 0):
+            rc, out, _ = run("show", "Reviewer")
+            self.assertEqual((rc, sorted(r["agent_mxid"] for r in json.loads(out))), (0, [WORKER_AGENT, BETA_WORKER]))
+            rc, out, _ = run("show", "Reviewer", "--server", "beta-fixture.net")
+            self.assertEqual((rc, json.loads(out)["agent_mxid"]), (0, BETA_WORKER))
+            for verb in (("remove", "Reviewer"), ("rotate", "Reviewer", "-", "--repo", str(self.ws),
+                                                  "--logs-dir", str(self.ws))):
+                rc, _, err = run(*verb)
+                self.assertEqual(rc, 1, verb)
+                self.assertIn("refused (worker_identity_ambiguous)", err, verb)
+            self.assertEqual(len(C.worker_identities(W, self.ws)), 2, "nothing was removed or rotated")
+            rc, out, _ = run("remove", "Reviewer", "--server", "beta-fixture.net")
+            self.assertEqual(rc, 0)
+            self.assertIn(self.beta["instance"], out)
+            rc, out, _ = run("show", "Reviewer")
+            self.assertEqual(json.loads(out)["agent_mxid"], WORKER_AGENT, "one left: no server needed")
+
+    def test_the_mcp_credential_reads_the_descriptor_the_seats_proxy_reads(self):
+        """The proxy keeps AG2_MCP_DESCRIPTOR for the resolver: a desktop descriptor outside the workspace,
+        with none inside it, still picks the seat's server."""
+        import tempfile
+        outside = Path(tempfile.mkdtemp(prefix="desktop-descriptor-")) / "ag2-mcp.json"
+        outside.write_text(json.dumps({"version": 1, "lane": "desktop-own-name", "agent_id": BETA_CORE}))
+        self.assertFalse((self.ws / "state" / C.MCP_DESCRIPTOR_NAME).exists())
+        env = {C.MCP_DESCRIPTOR_ENV: str(outside)}
+        cred = C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault, environ=env)
+        self.assertEqual((cred["server"], cred["bearer"]), ("beta-fixture.net", "secret-reviewer-b"))
+        with self.assertRaises(C.NoWorkerCredential):
+            C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault,
+                                    environ={C.MCP_DESCRIPTOR_ENV: str(outside) + ".gone"})
+
+    def test_a_primary_switch_does_not_move_the_seats_server(self):
+        """The seat's proxy mints as its descriptor's own agent; set_primary rewrites no descriptor, so after
+        the owner makes beta primary a seat written for alpha still mints on alpha, and so does the worker's
+        credential."""
+        state = self.ws / "state"
+        state.mkdir(exist_ok=True)
+        (state / C.MCP_DESCRIPTOR_NAME).write_text(
+            json.dumps({"version": 1, "lane": "primary", "agent_id": CORE_AGENT}))
+        before = C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault, environ={})
+        self.assertEqual((before["server"], before["bearer"]), ("alpha-fixture.net", "secret-reviewer"))
+        beta_core = next(r for r in C._core_rows(C._read(C.record_path(self.ws)))
+                         if r["server"] == "beta-fixture.net")
+        C.set_primary(beta_core["instance"], workspace=self.ws)
+        self.assertEqual(C.mcp_seat_server(self.ws, {}), "alpha-fixture.net", "the seat still mints on alpha")
+        after = C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault, environ={})
+        self.assertEqual((after["server"], after["bearer"]), ("alpha-fixture.net", "secret-reviewer"),
+                         "never a token for beta while the seat's proxy mints on alpha")
+
+    def _seat(self, desc):
+        """Write the workspace's seat descriptor (`desc`, or none when None) and read the worker's credential."""
+        path = self.ws / "state" / C.MCP_DESCRIPTOR_NAME
+        path.parent.mkdir(exist_ok=True)
+        if desc is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(json.dumps(desc))
+        return C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault, environ={})
+
+    def _make_primary(self, server):
+        row = next(r for r in C._core_rows(C._read(C.record_path(self.ws))) if r["server"] == server)
+        C.set_primary(row["instance"], workspace=self.ws)
+
+    def test_a_descriptor_with_no_agent_mints_on_its_own_relays_server_whatever_is_primary(self):
+        """With no usable agent_id the descriptor's own relay or mint host names the server, never the row that
+        is primary now: set_primary does not move it."""
+        seats = [({"lane": "primary", "relay": "https://chat.alpha-fixture.net"}, "alpha-fixture.net"),
+                 ({"lane": "primary", "agent_id": None, "relay": "https://relay.beta-fixture.net:8443/"},
+                  "beta-fixture.net"),
+                 ({"lane": "primary", "agent_id": "not-a-user-id",
+                   "mint_url": "https://relay.beta-fixture.net:8443/v1/mcp/token"}, "beta-fixture.net")]
+        for primary in ("alpha-fixture.net", "beta-fixture.net", "alpha-fixture.net"):
+            self._make_primary(primary)
+            for desc, server in seats:
+                cred = self._seat(desc)
+                self.assertEqual(cred["server"], server, (primary, desc))
+        for desc in ({"lane": "primary"}, {"agent_id": None},
+                     {"relay": "https://chat.alpha-fixture.net", "mint_url": "https://relay.beta-fixture.net:8443/t"},
+                     {"relay": "https://chat.alpha-fixture.net", "lane": "beta-fixture-net"},
+                     {"relay": "https://unknown.example.org"}):
+            for primary in ("alpha-fixture.net", "beta-fixture.net"):
+                self._make_primary(primary)
+                with self.assertRaises(C.NoWorkerCredential, msg=(primary, desc)) as e:
+                    self._seat(desc)
+                self.assertEqual(e.exception.reason, "descriptor_unresolved", desc)
+
+    def test_a_relay_or_mint_endpoint_matches_a_row_exactly_host_and_port(self):
+        """Only the row's own endpoint names its server: a look-alike host, a longer host ending in another
+        domain, or the same host on another port names none. A port stated as the scheme's default is the
+        same endpoint as one left out, and a host's case does not matter."""
+        for key in ("relay", "mint_url"):
+            for url in ("https://evil-chat.alpha-fixture.net", "https://chat.alpha-fixture.net.evil.example",
+                        "https://chat.alpha-fixture.net:8444", "http://chat.alpha-fixture.net",
+                        "https://relay.beta-fixture.net", "https://relay.beta-fixture.net:443",
+                        "https://evil-relay.beta-fixture.net:8443", "https://relay.beta-fixture.net:8443.evil.example",
+                        "https://chat.alpha-fixture.net:0", "http://chat.alpha-fixture.net:443",
+                        "ftp://chat.alpha-fixture.net:443", "http://relay.beta-fixture.net:8443",
+                        "https://chat.alpha-fixture.net:4433", "https://relay.beta-fixture.net:84430"):
+                with self.assertRaises(C.NoWorkerCredential, msg=(key, url)) as e:
+                    self._seat({"lane": "primary", key: url + "/v1/mcp/token"})
+                self.assertEqual(e.exception.reason, "descriptor_unresolved", (key, url))
+            for url, server, secret in (
+                    ("https://chat.alpha-fixture.net:443", "alpha-fixture.net", "secret-reviewer"),
+                    ("https://CHAT.Alpha-Fixture.NET", "alpha-fixture.net", "secret-reviewer"),
+                    ("https://relay.beta-fixture.net:8443", "beta-fixture.net", "secret-reviewer-b")):
+                cred = self._seat({"lane": "primary", key: url + "/v1/mcp/token"})
+                self.assertEqual((cred["server"], cred["bearer"]), (server, secret), (key, url))
+        self.assertEqual(C.origin_of_url("https://h.example"), "https://h.example:443")
+        self.assertEqual(C.origin_of_url("http://H.example:80/p"), "http://h.example:80")
+        self.assertNotEqual(C.origin_of_url("http://h.example:443"), C.origin_of_url("https://h.example"))
+        for bad in ("", "h.example", "ftp://h.example", "ftp://h.example:443", "https://h.example:0",
+                    "https://h.example:notaport", "https://:8443"):
+            self.assertEqual(C.origin_of_url(bad), "", bad)
+
+    def test_a_named_descriptor_that_cannot_be_read_is_refused_not_replaced(self):
+        """A seat told to use one descriptor is never resolved by another, even when the workspace has one."""
+        self._seat({"version": 1, "lane": "primary", "agent_id": BETA_CORE})
+        import tempfile
+        gone = Path(tempfile.mkdtemp(prefix="seat-descriptor-")) / "ag2-mcp.json"
+        for env in ({C.MCP_DESCRIPTOR_ENV: str(gone)}, {C.MCP_DESCRIPTOR_ENV: str(gone.parent)}):
+            with self.assertRaises(C.NoWorkerCredential) as e:
+                C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault, environ=env)
+            self.assertEqual(e.exception.reason, "descriptor_missing", env)
+        gone.write_text("{not json")
+        with self.assertRaises(C.NoWorkerCredential) as e:
+            C.worker_mcp_credential(W, workspace=self.ws, vault=self.vault, environ={C.MCP_DESCRIPTOR_ENV: str(gone)})
+        self.assertEqual(e.exception.reason, "descriptor_missing")
+
+    def test_the_token_and_the_endpoint_it_is_sent_to_are_one_servers(self):
+        """Whatever names the seat's server and whichever row is primary, the bearer, the relay it is sent to
+        and the server reported all belong to one server's row."""
+        rows = {r["server"]: r for r in C.worker_identities(W, self.ws)}
+        secret = {"alpha-fixture.net": "secret-reviewer", "beta-fixture.net": "secret-reviewer-b"}
+        seats = [{"agent_id": CORE_AGENT}, {"agent_id": BETA_CORE}, {"agent_id": BETA_CORE, "lane": "primary"},
+                 {"relay": "https://chat.alpha-fixture.net"}, {"mint_url": "https://relay.beta-fixture.net:8443/m"},
+                 {"lane": "beta-fixture-net"}]
+        for primary in ("alpha-fixture.net", "beta-fixture.net"):
+            self._make_primary(primary)
+            for desc in seats:
+                cred = self._seat(desc)
+                server = cred["server"]
+                self.assertEqual(cred["bearer"], secret[server], (primary, desc))
+                self.assertEqual(C.host_of_url(cred["relay"]), C.host_of_url(rows[server]["gateway_url"]),
+                                 (primary, desc))
+                self.assertEqual(cred["lane"], rows[server]["instance"], (primary, desc))
+
+    def test_a_seat_whose_server_has_no_credential_fails_closed(self):
+        """No token for the seat's server's identity refuses; it never falls back to another server's, and a
+        seat on a server the worker has no identity on carries no bearer at all."""
+        self.vault.store.pop(self.beta["token_ref"])
+        for primary in ("alpha-fixture.net", "beta-fixture.net"):
+            self._make_primary(primary)
+            for desc in ({"agent_id": BETA_CORE}, {"relay": "https://relay.beta-fixture.net:8443"},
+                         {"lane": "beta-fixture-net"}):
+                with self.assertRaises(C.NoWorkerCredential, msg=(primary, desc)) as e:
+                    self._seat(desc)
+                self.assertEqual(e.exception.reason, "no_token", desc)
+            cred = self._seat({"agent_id": "@sutando:gamma-fixture.net"})
+            self.assertEqual(cred, {"worker": W, "acts_as": "core", "reason": "no_identity"})
+
+    def test_a_task_result_publishes_whatever_the_proactive_home(self):
+        import result_publish
+        with unittest.mock.patch.object(C, "primary_row", lambda ws=None: None):
+            self.assertEqual(C.session_proactive_name("task-s-space~task-abc.txt", self.env, self.ws),
+                             "task-s-space~task-abc.txt", "a task result has its own route back")
+            with unittest.mock.patch.dict(os.environ, {**self.env, "SUTANDO_WORKSPACE_DIR": str(self.ws)}):
+                got = result_publish.worker_published_path(self.ws / "results" / "task-abc.txt", self.env)
+            self.assertEqual(got.name, "task-abc.txt")
+            with self.assertRaises(C.AmbiguousWorkerIdentity):
+                C.session_proactive_name("proactive-9.txt", self.env, self.ws)
+
+    def test_a_note_naming_a_room_goes_from_that_rooms_server(self):
+        a, b = self.alpha["instance"], self.beta["instance"]
+        self.assertEqual((C.is_worker_note_lane(a, W, BETA_ROOM, self.ws), C.is_worker_note_lane(b, W, BETA_ROOM, self.ws)),
+                         (False, True))
+        self.assertEqual((C.is_worker_note_lane(a, W, ALPHA_ROOM, self.ws), C.is_worker_note_lane(b, W, ALPHA_ROOM, self.ws)),
+                         (True, False))
+        for room in ("", "!r:gamma-fixture.net"):
+            self.assertEqual((C.is_worker_note_lane(a, W, room, self.ws), C.is_worker_note_lane(b, W, room, self.ws)),
+                             (True, False), f"{room!r}: no identity there, so the home lane")
+
+    def test_the_bridges_worker_gate_picks_one_lane_per_note(self):
+        """Through the gateway bridge's own claim gate: each note has exactly one claiming lane."""
+        rgb = _load_shim()
+        saved = {k: getattr(rgb, k) for k in ("WS", "GATEWAY_INSTANCE")}
+        self.addCleanup(lambda: [setattr(rgb, k, v) for k, v in saved.items()])
+        rgb.WS = self.ws
+        results = self.ws / "results"
+        results.mkdir(exist_ok=True)
+        notes = {"room-beta": (f"[channel: {BETA_ROOM}]\nfor beta\n", self.beta["instance"]),
+                 "room-alpha": (f"[channel: {ALPHA_ROOM}]\nfor alpha\n", self.alpha["instance"]),
+                 "unaddressed": ("hello owner\n", self.alpha["instance"])}
+        for i, (key, (body, owner)) in enumerate(notes.items()):
+            path = results / f"proactive-{i}.by-{W}.txt"
+            path.write_text(body)
+            claimants = []
+            for lane in (self.alpha["instance"], self.beta["instance"]):
+                rgb.GATEWAY_INSTANCE = lane
+                if rgb._worker_lane_claim_gate(W)(path):
+                    claimants.append(lane)
+            self.assertEqual(claimants, [owner], key)
+
+    def test_a_partial_retire_names_what_it_removed(self):
+        real = C.remove_connection
+        calls = []
+
+        def remove(instance, **kw):
+            calls.append(instance)
+            if len(calls) == 2:
+                raise C.BridgeStillRunning(instance, 4242)
+            return real(instance, **kw)
+        with unittest.mock.patch.object(C, "remove_connection", remove):
+            with self.assertRaises(C.PartialWorkerRetire) as e:
+                C.retire_worker_identity(W, workspace=self.ws, vault=self.vault, kill=lambda *a: None)
+        self.assertEqual([r["instance"] for r in e.exception.removed], calls[:1])
+        self.assertIn(f"removed {calls[0]} before failing", str(e.exception))
+        self.assertEqual(len(C.worker_identities(W, self.ws)), 1, "the rest stands for a retry")
+
+    def test_pool_manage_retire_takes_both(self):
+        import pool_manage
+        with unittest.mock.patch.object(C, "_vault", lambda v=None: self.vault), \
+                unittest.mock.patch.object(C, "_stop_row", lambda row, ws, kill: 0):
+            out = pool_manage._retire_identity(self.ws, W)
+        self.assertEqual(out["result"], "removed")
+        self.assertEqual(out["agent"], f"{WORKER_AGENT}, {BETA_WORKER}")
+        self.assertEqual(C.worker_identities(W, self.ws), [])
 
 
 if __name__ == "__main__":
