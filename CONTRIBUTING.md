@@ -93,6 +93,10 @@ In the order a reviewer reads them. Say "N/A" if a question doesn't apply, so th
 - What changed, and why?
 - What files / sections should reviewers look at first?
 - What user behavior or bug does this prove?
+- **Agent-native design rules.** If this adds or changes something a person or an agent can do
+  or read, follow
+  [`docs/agent-native-design-rules.md`](docs/agent-native-design-rules.md) and
+  answer its checklist.
 - **Feature/documentation consistency.** If the PR adds, changes, or removes a
   user-visible feature, capability, or behavior, update the corresponding
   canonical document under `docs/` in the same PR. Use `docs/catalog.json` to
