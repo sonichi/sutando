@@ -139,6 +139,22 @@ rem_clean = _with_script_present(_mod.check_overdue_reminders,
 ok("CONTROL: reminders probe that RAN and found nothing returns []",
    rem_clean == [], f"got {rem_clean!r}")
 
+# reminders.py exits 2 without the owner's opt-in (unattended runs never pass
+# --owner-asked): the probe is OFF by the owner's choice, not a failed check.
+_seen_cmd = {}
+
+
+def _rc2(cmd, *a, **k):
+    _seen_cmd["cmd"] = cmd
+    return _Result(2, "")
+
+
+rem_optin = _with_script_present(_mod.check_overdue_reminders, _rc2)
+ok("reminders probe: no-consent exit (2) means the probe is off, not COULD NOT CHECK",
+   rem_optin == [], f"got {rem_optin!r}")
+ok("reminders probe never self-attests consent (--owner-asked is not passed)",
+   "--owner-asked" not in _seen_cmd["cmd"], f"got {_seen_cmd['cmd']!r}")
+
 rem_hit = _with_script_present(_mod.check_overdue_reminders,
                                lambda *a, **k: _Result(0, "Overdue: call the dentist\n"))
 ok("CONTROL: a genuinely overdue reminder is still reported unmarked",

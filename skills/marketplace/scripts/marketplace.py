@@ -137,7 +137,11 @@ class Context:
 
 
 def build_context(args: argparse.Namespace) -> Context:
-    base, token = cloud_auth.read_cloud_auth(_workspace())
+    auth = cloud_auth.read_cloud_auth(_workspace())
+    base, token = auth
+    refusal = None if token else cloud_auth.refusal_message(auth)
+    if refusal:
+        raise Usage(refusal)
     if not token:
         raise Usage(
             "Not signed in to Sutando Cloud (probed "

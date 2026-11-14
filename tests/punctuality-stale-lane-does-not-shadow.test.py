@@ -13,6 +13,12 @@ Measured on a live host: lane2 newest 2026-08-29, lane3 newest 2026-09-01, warn.
 The control is the load-bearing half: with lane 3 also empty the probe must
 still warn, or the fix is a deletion of the detector wearing a green result.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import datetime
 import importlib.util
 import json

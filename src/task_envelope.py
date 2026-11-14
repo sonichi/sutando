@@ -155,6 +155,19 @@ def verify_text(text: str, workspace: Path | None = None) -> dict:
             "reason": "stamp does not match file content"}
 
 
+def attested_task_headers(text: str, workspace: Path | None = None):
+    """Headers a tier or routing decision may read. The strict task-last parse always;
+    the full last-wins scan only when the writer declared `task_layout: mid` above
+    `task:` AND the envelope verifies. The HMAC alone proves bytes, not shape: a signed
+    task-last body could otherwise promote header-looking lines."""
+    import local_task_protocol as ltp  # noqa: PLC0415
+    strict = ltp.parse_task_headers(text)
+    if (strict.headers.get("task_layout") or "").strip() == "mid" and \
+            verify_text(text, workspace).get("verdict") == "verified":
+        return ltp.parse_task_headers_trusted(text)
+    return strict
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 3 or argv[1] not in ("stamp", "verify"):
         print("usage: task_envelope.py stamp|verify <file>", file=sys.stderr)

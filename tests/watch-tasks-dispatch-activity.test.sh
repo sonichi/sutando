@@ -119,7 +119,8 @@ case " $* " in *" --probe "*) exit 4 ;; esac
 exit 1
 H
 chmod +x "$tmp3/handler.sh"
-ws3="$tmp3/ws"; inbox3="$ws3/deliveries/w-test"
+# Not under deliveries/: that inbox is a worker's, and a worker never runs the core's handler.
+ws3="$tmp3/ws"; inbox3="$ws3/inbox/w-test"
 mkdir -p "$ws3/tasks" "$inbox3" "$ws3/results"
 payload3="$ws3/tasks/task-probe3.txt"
 printf 'id: task-probe3\naccess_tier: team\ntask: fail me\n' > "$payload3"

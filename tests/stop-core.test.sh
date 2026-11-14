@@ -57,15 +57,17 @@ else
   say FAIL "custom session: rc=$rc out=$out"
 fi
 
-# --- 4. watcher sibling cleanup: sutando-core + sutando-core-watcher →
-#        both killed; unrelated debug session still survives.
+# --- 4. watcher and observer sibling cleanup: sutando-core + sutando-core-watcher +
+#        sutando-core-observer → all killed; unrelated debug session still survives.
 tmux -S "$SOCK" new-session -d -s sutando-core sleep 60
 tmux -S "$SOCK" new-session -d -s sutando-core-watcher sleep 60
+tmux -S "$SOCK" new-session -d -s sutando-core-observer sleep 60
 out="$(SUTANDO_TMUX_SOCKET="$SOCK" bash "$SCRIPT" 2>&1)"; rc=$?
 if [ $rc -eq 0 ] && ! tmux -S "$SOCK" has-session -t "=sutando-core" 2>/dev/null \
    && ! tmux -S "$SOCK" has-session -t "=sutando-core-watcher" 2>/dev/null \
+   && ! tmux -S "$SOCK" has-session -t "=sutando-core-observer" 2>/dev/null \
    && tmux -S "$SOCK" has-session -t "=sutando-core-debug" 2>/dev/null; then
-  say ok "watcher sibling killed with core; debug survives"
+  say ok "watcher and observer siblings killed with core; debug survives"
 else
   say FAIL "watcher cleanup: rc=$rc out=$out"
 fi

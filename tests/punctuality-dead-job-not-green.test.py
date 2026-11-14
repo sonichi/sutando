@@ -24,6 +24,12 @@ without touching either behaviour.
 The control is load-bearing: with the script PRESENT the same fixture must go
 green, or this is a detector that fires on everything.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import datetime
 import importlib.util
 import json

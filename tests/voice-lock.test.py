@@ -29,6 +29,8 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 HELPER = REPO / "scripts" / "voice-lock.py"
@@ -83,7 +85,7 @@ def spawn_sleeper(trap_term=False):
         + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if trap_term else "")
         + "time.sleep(120)\n"
     )
-    return subprocess.Popen([PY, "-c", code], start_new_session=True)
+    return popen_bound([PY, "-c", code])
 
 
 def spawn_listener_group(port, entry_path):
@@ -98,8 +100,8 @@ def spawn_listener_group(port, entry_path):
         "s.listen(1)\n"
         "time.sleep(120)\n"
     )
-    p = subprocess.Popen(
-        [PY, "-c", code, str(entry_path), str(port)], start_new_session=True
+    p = popen_bound(
+        [PY, "-c", code, str(entry_path), str(port)]
     )
     deadline = time.time() + 10
     while time.time() < deadline:
@@ -341,8 +343,8 @@ def main():
             "s.listen(1)\n"
             "time.sleep(120)\n"
         )
-        stubborn = subprocess.Popen(
-            [PY, "-c", code_ignore, str(entry), str(port)], start_new_session=True
+        stubborn = popen_bound(
+            [PY, "-c", code_ignore, str(entry), str(port)]
         )
         deadline = time.time() + 10
         while time.time() < deadline:
@@ -443,9 +445,8 @@ def main():
             "print(child.pid, flush=True)\n"
             "time.sleep(120)\n"
         )
-        parent = subprocess.Popen(
-            [PY, "-c", parent_code, str(entry)],
-            start_new_session=True, stdout=subprocess.PIPE, text=True,
+        parent = popen_bound(
+            [PY, "-c", parent_code, str(entry)], stdout=subprocess.PIPE, text=True,
         )
         child_pid = int(parent.stdout.readline())
         structured_lock(pidfile, child_pid, my_start_time_ms(child_pid), entry, ws)
@@ -470,9 +471,8 @@ def main():
         check("owned takeover unlinked the lock", not pidfile.exists())
 
         # A caller-provided zero PGID must never target the helper's own group.
-        pgid_zero_target = subprocess.Popen(
+        pgid_zero_target = popen_bound(
             [PY, "-c", "import time; time.sleep(120)", str(entry)],
-            start_new_session=True,
         )
         p = run_helper(
             base("takeover")

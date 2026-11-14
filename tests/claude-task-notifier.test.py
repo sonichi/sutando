@@ -23,6 +23,9 @@ reaches the notifier and gets dispatched) — skipped if fswatch is absent.
 Does NOT drive a real Claude Code session — that was verified by hand
 against the real binary (see the PR body for the pane-text transcript this
 suite's IDLE/BUSY markers are drawn from).
+
+EventDispatchTests lives in claude-task-notifier-gate.test.py and
+claude-task-notifier-submit.test.py; they load the harness from this file.
 """
 from __future__ import annotations
 
@@ -94,6 +97,9 @@ class FakeTmuxHarness(unittest.TestCase):
         self.logs_dir = self.root / "workspace" / "logs"
         for d in (self.tasks_dir, self.results_dir, self.state_dir, self.logs_dir):
             d.mkdir(parents=True)
+        # Standby watchers call setsid(); killpg of the notifier cannot reach them,
+        # and SIGKILL skips its EXIT trap. Reap before the tmp tree is removed.
+        self.addCleanup(self._stop_fixture_watchers)
         self.pane_file = self.root / "pane.txt"
         self.pane_file.write_text(IDLE_FOOTER + "\n")
         # Non-empty = the CLI is showing this ghost text in an empty composer.
@@ -120,6 +126,9 @@ class FakeTmuxHarness(unittest.TestCase):
         # Every capture-pane increments this; the paste logs `CAPTURES@<n>`, so a
         # test can aim a state flip at "the read before the paste" without hard-coding order.
         self.capture_count = self.root / "capture-count.txt"
+        # One line per has-session probe: the caller's pid and what the marker and results
+        # dirs held at that moment; after a paste the notifier probes only once has_result missed.
+        self.session_probe_log = self.root / "has-session.log"
         # Holds N: on the Nth capture the footer flips to BUSY (consumed once).
         self.busy_on_capture_flag = self.root / "busy-on-capture.flag"
         # Holds N: on the Nth capture a trust gate replaces the pane (consumed once).
@@ -139,6 +148,39 @@ class FakeTmuxHarness(unittest.TestCase):
 
         # The core pane is gone (its window may live on with a replacement).
         self.pane_gone_flag = self.root / "pane-gone.flag"
+        # Holds N: a `-l` paste longer than N bytes lands as only its bytes after N,
+        # as one tmux write past the CLI's input limit does on a real pane.
+        self.cut_paste_over_flag = self.root / "cut-paste-over.flag"
+        # Holds N: the Nth and every later `-l` paste is dropped (a chunk the CLI never
+        # took), never consumed; paste_count numbers them from 1.
+        self.drop_paste_from_flag = self.root / "drop-paste-from.flag"
+        self.paste_count = self.root / "paste-count.txt"
+        # Window rows (29, a pool worker's): above 29 the box fits and the view flag lapses;
+        # resize-window logs `RESIZE -y N enters=<ENTERs so far>`; the flags: exit 1, pane unchanged.
+        self.window_rows = self.root / "window-rows.txt"
+        self.resize_log = self.root / "resize.log"
+        # The window-local window-size option (empty = inherited); resize-window sets it
+        # to manual as real tmux does, set-window-option rewrites it and logs `WINOPT`.
+        self.window_size_opt = self.root / "window-size-opt.txt"
+        self.grow_fails_flag = self.root / "grow-fails.flag"
+        self.split_pane_flag = self.root / "split-pane.flag"
+        # Holds K: the box shows only its last K rows (needs WRAP_COLS); "K@N" shows K
+        # rows from row N (0-based): the box cut by the screen bottom on a short pane.
+        self.composer_view_rows_flag = self.root / "composer-view-rows.flag"
+        self.view_py = self.root / "view.py"
+        self.view_py.write_text(
+            "import sys, re\n"
+            "k, _, n = sys.argv[1].partition('@'); k = int(k); n = int(n or -1); rows = sys.stdin.read().split('\\n')\n"
+            "last = max((i for i, r in enumerate(rows) if r.startswith('\u276f')), default=-1)\n"
+            "if last >= 0:\n"
+            "    j = last + 1\n"
+            "    while j < len(rows) and rows[j].startswith('  ') and '\u23f5\u23f5' not in rows[j] and not re.match(r'^[\\s\u2500-\u257f-]+$', rows[j]): j += 1\n"
+            "    box = rows[last:j]\n"
+            "    if len(box) > k:\n"
+            "        keep = box[-k:] if n < 0 else box[n:n + k]; keep[0] = '\u276f ' + keep[0].strip()\n"
+            "        rows[last:j] = keep\n"
+            "        if n >= 0: rows[last + k:] = []  # cut by the screen: the frame is off screen too\n"
+            "print('\\n'.join(rows))\n")
         self._write_fake_tmux()
 
     def write_status(self, status, ts=None):
@@ -153,6 +195,7 @@ class FakeTmuxHarness(unittest.TestCase):
         script = self.bin / "tmux"
         glob_limit = self.HISTORY_LIMIT if self.GLOBAL_HISTORY_LIMIT is None else self.GLOBAL_HISTORY_LIMIT
         script.write_text(f'''#!/bin/bash
+. "{REPO}/tests/lib/tmux-fake-unwrap.sh"
 [ "${{1:-}}" = -S ] && shift 2
 cmd="$1"; shift
 PANE="{self.pane_file}"
@@ -172,6 +215,12 @@ if idx is None:
     lines.append("❯ "); idx = len(lines) - 1
 row = lines[idx]
 row = "❯ " if re.match(r'^❯ *$|^❯ Try "|^❯ Press up to edit queued messages', row) else row
+# The box's own continuation rows (everything down to the frame) belong to the
+# text: a later chunk re-wraps all of it.
+end = idx + 1
+while wrap > 0 and end < len(lines) and lines[end].strip() and "⏵⏵" not in lines[end] \\
+        and not lines[end].startswith("❯") and not re.match(r"^[\\s─-╿]+$", lines[end]):
+    row += lines[end].strip() if style == "word" else lines[end]; end += 1
 new = row + text
 if wrap <= 0:
     rows = [new]
@@ -181,7 +230,7 @@ elif style == "word":
                          break_on_hyphens=False)
 else:
     rows = [new[i:i + wrap] for i in range(0, len(new), wrap)]
-lines[idx:idx + 1] = rows
+lines[idx:end] = rows
 open(path, "w").write("\\n".join(lines) + "\\n")
 PYEOF
 }}
@@ -201,6 +250,36 @@ lines.append(text)
 open(path, "w").write("\\n".join(lines + tail) + "\\n")
 PYEOF
 }}
+# -N <n> BSpace: removes the last n chars of the composer's own typed text
+# (never the glyph), re-wrapping exactly as append_typed does.
+backspace_composer() {{
+  python3 - "$PANE" "$1" {self.WRAP_COLS} "{self.WRAP_STYLE}" <<'PYEOF'
+import re, sys, textwrap
+path, n, wrap, style = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
+lines = open(path).read().split("\\n")
+if lines and lines[-1] == "": lines.pop()
+idx = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].startswith("❯")), None)
+if idx is None:
+    sys.exit(0)
+row = lines[idx]
+end = idx + 1
+while wrap > 0 and end < len(lines) and lines[end].strip() and "⏵⏵" not in lines[end] \\
+        and not lines[end].startswith("❯") and not re.match(r"^[\\s─-╿]+$", lines[end]):
+    row += lines[end].strip() if style == "word" else lines[end]; end += 1
+content = row[2:] if row.startswith("❯ ") else row
+new_content = content[:-n] if 0 < n < len(content) else ""
+new = "❯ " + new_content
+if wrap <= 0:
+    rows = [new]
+elif style == "word":
+    rows = textwrap.wrap(new, width=wrap, subsequent_indent="  ", break_long_words=True,
+                         break_on_hyphens=False) or ["❯ "]
+else:
+    rows = [new[i:i + wrap] for i in range(0, len(new), wrap)] or ["❯ "]
+lines[idx:end] = rows
+open(path, "w").write("\\n".join(lines) + "\\n")
+PYEOF
+}}
 total_rows() {{ grep -c '' "$PANE" 2>/dev/null || echo 0; }}
 history_size() {{
   local t; t="$(total_rows)"; local h=$(( t - {self.PANE_HEIGHT} ))
@@ -209,6 +288,7 @@ history_size() {{
 }}
 case "$cmd" in
   has-session)
+    printf 'PROBE pid=%s markers=%s results=%s\n' "$PPID" "$(ls "{self.inflight_dir}" 2>/dev/null | tr '\n' ',')" "$(ls "{self.results_dir}" 2>/dev/null | tr '\n' ',')" >> "{self.session_probe_log}"
     [ -f "{self.session_flag}" ] && exit 0
     exit 1
     ;;
@@ -247,6 +327,11 @@ case "$cmd" in
         out="$(printf '%s\\n' "$out" | LC_ALL=C sed "s/^❯ $/❯ ${{g}}/")"
       fi
     fi
+    grown=0; [ "$(cat "{self.window_rows}" 2>/dev/null || echo 29)" -gt 29 ] && grown=1
+    [ -f "{self.split_pane_flag}" ] && grown=0
+    if [ -f "{self.composer_view_rows_flag}" ] && [ "$grown" = 0 ]; then
+      out="$(printf '%s\\n' "$out" | python3 "{self.view_py}" "$(cat "{self.composer_view_rows_flag}")")"
+    fi
     if [ {self.CAPTURE_COLS} -gt 0 ] && [ "$join" = 0 ]; then
       out="$(printf '%s\\n' "$out" | fold -w {self.CAPTURE_COLS})"
     fi
@@ -263,6 +348,7 @@ case "$cmd" in
       *history_limit*) echo {self.HISTORY_LIMIT} ;;
       *history_size*) history_size ;;
       *pane_pid*) cat "{self.pane_pid_file}" 2>/dev/null || echo 4242 ;;
+      *window_height*) cat "{self.window_rows}" 2>/dev/null || echo 29 ;;
 
       *pane_id*)
         if [ -f "{self.pane_gone_flag}" ]; then echo ""; exit 0; fi
@@ -279,7 +365,15 @@ case "$cmd" in
       shift 2  # -l --
       text="$1"
       printf 'CAPTURES@%s\\nTYPE %s\\n' "$(cat "{self.capture_count}" 2>/dev/null || echo 0)" "$text" >> "{self.sendkeys_log}"
+      # Real tmux: a trailing ';' is its command separator and is lost; a trailing '\\;' lands as ';'.
+      case "$text" in *'\\;') text="${{text%\\\\;}};" ;; *';') text="${{text%;}}" ;; esac
+      if [ -f "{self.cut_paste_over_flag}" ] && [ "${{#text}}" -gt "$(cat "{self.cut_paste_over_flag}")" ]; then
+        text="${{text:$(cat "{self.cut_paste_over_flag}")}}"
+      fi
+      pn=$(( $(cat "{self.paste_count}" 2>/dev/null || echo 0) + 1 )); echo "$pn" > "{self.paste_count}"
       if [ -f "{self.swallow_always_flag}" ]; then
+        :
+      elif [ -f "{self.drop_paste_from_flag}" ] && [ "$pn" -ge "$(cat "{self.drop_paste_from_flag}")" ]; then
         :
       elif [ -f "{self.swallow_flag}" ]; then
         rm -f "{self.swallow_flag}"
@@ -297,6 +391,9 @@ case "$cmd" in
           append_owner_row "$(cat "{self.extra_owner_row_flag}")"; rm -f "{self.extra_owner_row_flag}"
         fi
       fi
+    elif [ "${{1:-}}" = -N ] && [ "${{3:-}}" = BSpace ]; then
+      printf 'BSPACE %s\\n' "$2" >> "{self.sendkeys_log}"
+      backspace_composer "$2"
     else
       printf 'ENTER markers=%s\\n' "$(ls "{self.inflight_dir}" 2>/dev/null | grep -vc '^\\.')" >> "{self.sendkeys_log}"
       if [ -f "{self.pid_after_enter_flag}" ]; then
@@ -329,6 +426,23 @@ PYEOF
     fi
     exit 0
     ;;
+  resize-window)
+    [ -f "{self.grow_fails_flag}" ] && exit 1
+    rows=""; while [ $# -gt 0 ]; do [ "$1" = -y ] && rows="$2"; shift; done
+    printf 'RESIZE -y %s enters=%s\\n' "$rows" "$({{ grep -c '^ENTER' "{self.sendkeys_log}" || true; }} 2>/dev/null)" >> "{self.resize_log}"
+    echo "$rows" > "{self.window_rows}"
+    echo manual > "{self.window_size_opt}"
+    exit 0
+    ;;
+  show-window-options)
+    cat "{self.window_size_opt}" 2>/dev/null
+    exit 0
+    ;;
+  set-window-option)
+    unset_opt=0; val=""; while [ $# -gt 0 ]; do case "$1" in -u) unset_opt=1 ;; -t) shift ;; window-size) val="${{2:-}}" ;; esac; shift; done
+    if [ "$unset_opt" = 1 ]; then : > "{self.window_size_opt}"; echo "WINOPT unset" >> "{self.resize_log}"; else echo "$val" > "{self.window_size_opt}"; echo "WINOPT $val" >> "{self.resize_log}"; fi
+    exit 0
+    ;;
   new-session|kill-session|setenv)
     exit 0
     ;;
@@ -339,10 +453,77 @@ esac
 ''')
         script.chmod(0o755)
 
+
+    def _strays(self):
+        """Pids of watch-tasks-stream / fswatch still naming this fixture."""
+        needle = str(self.root)
+        me = os.getpid()
+        found = []
+        for pattern in ("watch-tasks-stream", "fswatch"):
+            out = subprocess.run(
+                ["pgrep", "-f", pattern], capture_output=True, text=True,
+            ).stdout
+            for token in out.split():
+                if not token.isdigit():
+                    continue
+                pid = int(token)
+                if pid == me or pid in found:
+                    continue
+                # -ww: macOS `ps -o command=` truncates and would hide the inbox path.
+                cmd = subprocess.run(
+                    ["ps", "-p", str(pid), "-ww", "-o", "command="],
+                    capture_output=True, text=True,
+                ).stdout
+                if needle in cmd:
+                    found.append(pid)
+        return found
+
+    def _kill_strays(self, grace=5.0):
+        """Stop every watcher this fixture started; returns any that survive."""
+        deadline = time.time() + grace
+        while time.time() < deadline:
+            pids = self._strays()
+            if not pids:
+                return []
+            for pid in pids:
+                for killer in (os.killpg, os.kill):
+                    try:
+                        killer(pid, signal.SIGTERM)
+                        break
+                    except (ProcessLookupError, PermissionError):
+                        continue
+            time.sleep(0.3)
+        for pid in self._strays():
+            for killer in (os.killpg, os.kill):
+                try:
+                    killer(pid, signal.SIGKILL)
+                    break
+                except (ProcessLookupError, PermissionError):
+                    continue
+        time.sleep(0.3)
+        return self._strays()
+
+    def _stop_fixture_watchers(self):
+        left = self._kill_strays()
+        if left:
+            raise AssertionError(
+                "fixture watcher(s) survived cleanup: %s" % (left,)
+            )
+
     def _env(self, extra=None):
         env = dict(os.environ)
+        # A pool worker's shell routes its inbox through these; inherited, they reclassify
+        # the fixture's tasks (a deliveries inbox skips the worker-held check).
+        for k in ("SUTANDO_INBOX_KIND", "SUTANDO_INBOX_RESOLVER", "SUTANDO_INBOX_RESOLVER_TIMEOUT",
+                  "SUTANDO_INSTANCE", "SUTANDO_INSTANCE_ID", "SUTANDO_POOL_DELIVERY_SCRIPT",
+                  "SUTANDO_WATCHER_BEAT", "SUTANDO_WATCHER_TRANSITION_HOOK"):
+            env.pop(k, None)
         env.update({
             "PATH": f"{self.bin}:{env.get('PATH', '/usr/bin:/bin')}",
+            # The notifier derives state/ from the workspace and its queue from TMPDIR;
+            # inherited values would put both outside the fixture (the live core's, in a core shell).
+            "SUTANDO_WORKSPACE_DIR": str(self.tasks_dir.parent),
+            "TMPDIR": str(self.root),
             "SUTANDO_TMUX_SOCKET": str(self.root / "fake.sock"),
             "SUTANDO_TMUX_SESSION": "sutando-core-test",
             "SUTANDO_TASKS_DIR": str(self.tasks_dir),
@@ -373,499 +554,50 @@ esac
             timeout=timeout,
         )
 
+    def expected_prompt(self, name):
+        """The line the notifier types for `name`. ONE definition, pinned to the
+        producer by test_the_prompt_names_the_standby_and_the_rearm_command."""
+        return (f"Sutando task ready: {name}. Read {self.tasks_dir}/{name}, follow CLAUDE.md, "
+                f"complete the task, and write the result to {self.results_dir}/{name}. "
+                f"Delivered by the standby: no session-role watcher holds {self.tasks_dir}. "
+                f'Re-arm yours via the Monitor tool: bash "{REPO}/src/watch-tasks-stream.sh" '
+                f'"{self.tasks_dir}" --role session --inbox "{self.tasks_dir}"')
+
+    def no_result_polls(self, pid, name):
+        """has-session probes by pid that found name's marker present and its result absent."""
+        n = 0
+        for line in (self.session_probe_log.read_text() if self.session_probe_log.exists() else "").splitlines():
+            m = re.match(r"PROBE pid=(\d+) markers=(\S*) results=(\S*)$", line)
+            if m and int(m.group(1)) == pid and name in m.group(2).split(",") and name not in m.group(3).split(","):
+                n += 1
+        return n
+
     def sendkeys_log_text(self):
         return self.sendkeys_log.read_text()
 
 
-class EventDispatchTests(FakeTmuxHarness):
-    """--event <filename>: exercises submit_task/deliver_prompt directly."""
+class StandbyReminderTests(FakeTmuxHarness):
+    """Every notifier delivery is a standby delivery, so the pane text says so,
+    names the re-arm command, and the log records the delivery as the standby's."""
 
-    def test_existing_result_is_never_dispatched(self):
-        self.write_task("task-a.txt")
-        self.write_result("task-a.txt")
-        result = self.run_event("task-a.txt")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.sendkeys_log_text(), "",
-                          "a task with an existing result must never be typed into the pane")
-
-    def test_empty_live_placeholder_with_no_ready_result_anywhere_is_still_dispatched(self):
-        # `[ -f results/<f> ]` treated an empty file as delivered regardless
-        # of content; the shared module's READY walk rejects whitespace-only.
-        self.write_task("task-c.txt")
-        (self.results_dir / "task-c.txt").write_text("")
-        import threading
-        def _finish():
-            for _ in range(50):
-                if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-c.txt")
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-c.txt")
-        t.join(timeout=5)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("TYPE Sutando task ready: task-c.txt", self.sendkeys_log_text(),
-                       "an empty placeholder with nothing ready behind it must not block dispatch")
-
-    def test_pending_task_is_typed_and_submitted(self):
-        self.write_task("task-b.txt")
-        import threading
-        def _finish():
-            for _ in range(50):
-                if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-b.txt")
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-b.txt")
-        t.join(timeout=5)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        log = self.sendkeys_log_text()
-        self.assertIn("TYPE Sutando task ready: task-b.txt", log)
-        self.assertIn("ENTER", log)
-        pane = self.pane_file.read_text()
-        self.assertIn("Sutando task ready: task-b.txt", pane)
-        self.assertIn("follow CLAUDE.md", log)
-
-    def test_a_stale_running_self_report_does_not_block_an_idle_pane(self):
-        # The status file is never read; a stale "running" is as irrelevant as a fresh one.
-        self.write_task("task-stale.txt")
-        self.write_status("running", ts=time.time() - 200)
+    def test_the_prompt_names_the_standby_and_the_rearm_command(self):
         self.pane_file.write_text(IDLE_FOOTER + "\n")
-        import threading
-        def _finish():
-            for _ in range(50):
-                if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-stale.txt")
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-stale.txt")
-        t.join(timeout=5)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("TYPE Sutando task ready: task-stale.txt", self.sendkeys_log_text())
+        self.write_task("task-sb.txt")
+        self.run_event("task-sb.txt", timeout=15)
+        # The paste goes out in chunks; what they reassemble to is the line typed.
+        typed = "".join(l[5:] for l in self.sendkeys_log_text().splitlines() if l.startswith("TYPE "))
+        # Equality, not containment: this is what pins expected_prompt() — which the
+        # inflight suite stages into its composer — to what the notifier really types.
+        self.assertEqual(self.expected_prompt('task-sb.txt'), typed)
+        self.assertIn(f"Delivered by the standby: no session-role watcher holds {self.tasks_dir}", typed)
+        # The script path is quoted: a desktop install lives under "Application Support".
+        self.assertIn(f'Re-arm yours via the Monitor tool: bash "{REPO}/src/watch-tasks-stream.sh" "{self.tasks_dir}" --role session --inbox "{self.tasks_dir}"', typed)
+        import shlex
+        rearm = typed.split("Re-arm yours via the Monitor tool: ", 1)[1]
+        self.assertEqual(shlex.split(rearm)[1], f"{REPO}/src/watch-tasks-stream.sh", "the script path survives shell parsing as ONE word")
+        log = (self.logs_dir / "claude-task-notifier.log").read_text()
+        self.assertIn(f"delivering task-sb.txt as the standby: no session-role watcher holds {self.tasks_dir}", log)
 
-    def test_a_fresh_running_self_report_does_not_block_an_idle_pane(self):
-        # The status file is the core's own report; a killed turn leaves it
-        # "running" while the pane shows the idle prompt. The pane decides.
-        self.write_task("task-fresh.txt")
-        self.write_status("running", ts=time.time())
-        self.pane_file.write_text(IDLE_FOOTER + "\n")
-        import threading
-        def _finish():
-            for _ in range(50):
-                if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-fresh.txt")
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-fresh.txt")
-        t.join(timeout=5)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("TYPE Sutando task ready: task-fresh.txt", self.sendkeys_log_text(),
-                      "a self-reported 'running' must not outrank an idle pane")
-
-    def test_a_running_turn_still_receives_the_task(self):
-        # The pane shows an in-flight turn. The Monitor tool's notification
-        # never waited for it, and neither does this: the line queues behind it.
-        self.write_task("task-c.txt")
-        self.pane_file.write_text(BUSY_FOOTER + "\n")
-
-        import threading
-        def _finish():
-            for _ in range(50):
-                if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-c.txt")
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-c.txt")
-        t.join(timeout=5)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        log = self.sendkeys_log_text()
-        self.assertIn("TYPE Sutando task ready: task-c.txt", log,
-                      "a running turn is not a gate; the line must be typed")
-        self.assertIn("ENTER", log, "and submitted, so the CLI queues it")
-
-    def test_trust_gate_on_stale_status_blocks_dispatch(self):
-        # Pins the delegation to the REAL core-input-watch.py: a stale status
-        # plus a pane stuck on the folder-trust gate must not read as idle.
-        self.write_task("task-gate.txt")
-        self.write_status("running", ts=time.time() - 200)
-        self.pane_file.write_text(TRUST_GATE_PANE + "\n")
-        result = self.run_event("task-gate.txt", timeout=8)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.sendkeys_log_text(), "",
-                          "a folder-trust gate must never be typed over")
-
-    def test_trust_gate_on_fresh_idle_status_blocks_dispatch(self):
-        # A fresh (non-stale) idle status alone must not satisfy dispatch --
-        # a trust-gate pane is "not busy" too (no in-flight turn to interrupt).
-        self.write_task("task-gate2.txt")
-        self.write_status("idle")
-        self.pane_file.write_text(TRUST_GATE_PANE + "\n")
-        result = self.run_event("task-gate2.txt", timeout=8)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.sendkeys_log_text(), "",
-                          "a folder-trust gate must never be typed over, even under a fresh idle status")
-
-    def test_stale_same_task_marker_plus_swallowed_paste_is_not_mistaken_for_staged(self):
-        # A prior episode's prompt in OLDER scrollback (above the current
-        # composer) plus this episode's paste swallowed must not read staged.
-        self.pane_file.write_text("Sutando task ready: task-i.txt\n" + IDLE_FOOTER + "\n")
-        self.write_task("task-i.txt")
-        self.swallow_flag.write_text("1")
-
-        import threading
-        def _finish():
-            for _ in range(50):
-                if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-i.txt")
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-i.txt")
-        t.join(timeout=5)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        type_calls = self.sendkeys_log_text().count("TYPE Sutando task ready: task-i.txt")
-        self.assertEqual(type_calls, 2,
-                          "a stale marker from a prior episode must not be read as this "
-                          "episode's own staged paste -- the swallowed retype must still fire")
-
-    def test_stale_marker_plus_concurrent_owner_draft_is_not_mistaken_for_staged(self):
-        # Same stale marker, but the swallowed paste is masked by an
-        # UNRELATED pane change instead of leaving the tail byte-identical.
-        self.pane_file.write_text("Sutando task ready: task-k.txt\n" + IDLE_FOOTER + "\n")
-        self.write_task("task-k.txt")
-        self.swallow_flag.write_text("1")
-        self.concurrent_draft_flag.write_text("1")
-
-        import threading
-        def _finish():
-            for _ in range(50):
-                if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-k.txt")
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-k.txt")
-        t.join(timeout=5)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        log = self.sendkeys_log_text()
-        self.assertEqual(log.count("TYPE Sutando task ready: task-k.txt"), 1)
-        self.assertNotIn("ENTER", log,
-                         "a stale marker plus an unrelated concurrent pane change must not "
-                         "satisfy staging")
-        # The owner's draft now occupies the composer: the retype must refuse
-        # rather than type over it (failing closed beats a second paste).
-        self.assertIn("composer not empty",
-                      (self.logs_dir / "claude-task-notifier.log").read_text())
-
-    def test_composer_draft_blocks_typing(self):
-        # An unsent owner draft in the composer must never be typed over,
-        # even though the pane is otherwise idle-ready (no gate signature).
-        self.pane_file.write_text(DRAFT_FOOTER + "\n")
-        self.write_task("task-m.txt")
-        result = self.run_event("task-m.txt", timeout=8)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("TYPE", self.sendkeys_log_text(),
-                          "an unsent owner draft in the composer must never be typed over")
-        self.assertFalse((self.results_dir / "task-m.txt").exists(),
-                          "a task blocked on a draft composer must stay queued, not consumed")
-
-    def test_ghost_text_suggestion_is_not_a_draft(self):
-        # The CLI's suggested reply is dim ghost text in the EMPTY composer; a plain
-        # capture shows it as typed, and every re-pick would stall on it.
-        self.ghost_file.write_text("yes")
-        self.write_task("task-g.txt")
-        import threading
-        def _finish():
-            for _ in range(50):
-                if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-g.txt")
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-g.txt")
-        t.join()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("composer not empty", result.stderr,
-                         "ghost text must not read as an unsent draft")
-        self.assertIn("TYPE", self.sendkeys_log_text(),
-                      "the paste must proceed over ghost text")
-        self.assertIn("ENTER", self.sendkeys_log_text(),
-                      "the prompt must stage and submit once the ghost text is gone")
-
-    def test_pane_change_after_enter_blocks_a_second_press(self):
-        # After the first C-m, the pane changing to something other than
-        # busy (e.g. the owner typing) must never get a second C-m.
-        self.write_task("task-j.txt")
-        self.owner_types_after_enter_flag.write_text("1")
-        result = self.run_event("task-j.txt", timeout=15)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.sendkeys_log_text().count("ENTER"), 1,
-                          "a pane that changed to something other than our own prompt "
-                          "must not receive a second C-m")
-
-    def test_dropped_paste_is_retyped(self):
-        self.write_task("task-d.txt")
-        self.swallow_flag.write_text("1")
-
-        import threading
-        def _finish():
-            for _ in range(50):
-                if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-d.txt")
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-d.txt")
-        t.join(timeout=5)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        type_calls = self.sendkeys_log_text().count("TYPE Sutando task ready: task-d.txt")
-        self.assertEqual(type_calls, 2,
-                          "a paste that never staged must be retyped exactly once more")
-
-    def test_owner_text_interleaved_with_our_paste_is_not_mistaken_for_staged(self):
-        # Owner text alongside our marker used to satisfy a substring check.
-        # Retyping never clears the composer, so a real mix can't self-heal.
-        self.write_task("task-o.txt")
-        self.interleaved_owner_flag.write_text("1")
-        result = self.run_event("task-o.txt", timeout=15)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        log = self.sendkeys_log_text()
-        self.assertEqual(log.count("TYPE Sutando task ready: task-o.txt"), 1,
-                          "the mix now occupies the composer; a retype would paste over owner text")
-        self.assertNotIn("ENTER", log,
-                          "Enter must never fire on a composer mixing our prompt with owner text")
-        self.assertIn("composer not empty",
-                      (self.logs_dir / "claude-task-notifier.log").read_text())
-
-    def test_never_staged_returns_fast_instead_of_waiting_the_full_timeout(self):
-        # Enter never sent -> give up immediately, never wait out
-        # COMPLETION_TIMEOUT (8s here) for a result that can't ever appear.
-        self.write_task("task-n.txt")
-        self.swallow_always_flag.write_text("1")
-        started = time.time()
-        result = self.run_event("task-n.txt", timeout=15)
-        elapsed = time.time() - started
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("ENTER", self.sendkeys_log_text(),
-                          "Enter must never fire when staging never succeeded")
-        self.assertLess(elapsed, 4,
-                         f"took {elapsed:.1f}s -- a never-submitted prompt must not wait out "
-                         "the completion timeout")
-
-    def test_unconfirmed_submit_is_re_pressed(self):
-        # A swallowed C-m leaves the prompt staged in the composer, so
-        # deliver_prompt must re-press at least once after the confirm timeout.
-        self.swallow_enter_flag.write_text("1")
-        self.write_task("task-e.txt")
-
-        import threading
-        def _finish():
-            for _ in range(80):
-                if self.sendkeys_log_text().count("ENTER") >= 2:
-                    self.write_result("task-e.txt")
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-e.txt")
-        t.join(timeout=5)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertGreaterEqual(self.sendkeys_log_text().count("ENTER"), 2,
-                                 "an unconfirmed submit must be re-pressed")
-
-    def test_no_session_drops_without_hanging(self):
-        self.session_flag.unlink()
-        self.write_task("task-f.txt")
-        result = self.run_event("task-f.txt", timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.sendkeys_log_text(), "")
-
-    def test_submit_confirms_when_the_prompt_leaves_the_composer(self):
-        # The submitted text stays in scrollback; what confirms is the fresh
-        # empty composer under it, not the pane going busy.
-        self.write_task("task-h.txt")
-        self.busy_after_enter_flag.write_text("1")
-        import threading
-        def _finish():
-            for _ in range(50):
-                if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-h.txt")
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-h.txt", timeout=15)
-        t.join(timeout=5)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        log = self.sendkeys_log_text()
-        self.assertEqual(log.count("ENTER"), 1,
-                          "a prompt that left the composer is confirmed on the first attempt")
-        self.assertIn("Sutando task ready: task-h.txt", self.pane_file.read_text(),
-                       "the submitted text staying in scrollback is the exact case this pins")
-
-    def test_a_novel_prompt_under_an_old_idle_footer_is_not_typed_into(self):
-        # An unforeseen confirmation shares the window with a stale idle footer and
-        # a blank bottom composer; the pane read alone must refuse.
-        self.status_file.unlink()
-        self.write_task("task-novel.txt")
-        self.pane_file.write_text("\n".join([
-            "❯", "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
-            "Overwrite the existing config file?", "Enter to confirm · Esc to cancel", "❯", ""]))
-        result = self.run_event("task-novel.txt", timeout=8)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.sendkeys_log_text(), "",
-                         "a live prompt must never receive the task as its answer")
-
-    def test_an_abnormal_banner_holds_the_task(self):
-        # Parked on an API error: the one state a running turn is not. Hold.
-        self.write_task("task-abn.txt")
-        self.pane_file.write_text("API Error: 529 Overloaded\n" + IDLE_FOOTER + "\n")
-        result = self.run_event("task-abn.txt", timeout=8)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.sendkeys_log_text(), "",
-                         "an abnormal pane must not be typed into")
-        self.assertIn("did not become healthy", result.stderr)
-
-    def test_the_clis_connection_error_retry_banner_holds_the_task(self):
-        # The retry family, under the CLI's own result prefix: nothing is being served.
-        self.write_task("task-retry.txt")
-        self.pane_file.write_text("  ⎿  Connection error. Retrying in 2 seconds…\n" + IDLE_FOOTER + "\n")
-        result = self.run_event("task-retry.txt", timeout=8)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.sendkeys_log_text(), "",
-                         "a retrying pane must not be typed into")
-
-    def test_prose_about_a_connection_error_on_screen_does_not_hold(self):
-        # The banner families are line-anchored; a transcript discussing errors is not one.
-        self.write_task("task-prose.txt")
-        self.pane_file.write_text("⏺ I once saw a Connection error. Retrying was the fix.\n" + IDLE_FOOTER + "\n")
-        import threading
-        def _finish():
-            for _ in range(50):
-                if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-prose.txt")
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-prose.txt")
-        t.join(timeout=5)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("TYPE Sutando task ready: task-prose.txt", self.sendkeys_log_text())
-
-    def test_prose_under_the_tool_result_prefix_does_not_hold(self):
-        # `⎿` is also the ordinary tool-result prefix; a whole-line grammar tells the banner from it.
-        self.write_task("task-prose2.txt")
-        self.pane_file.write_text("  ⎿  Connection error. Retrying was the fix.\n" + IDLE_FOOTER + "\n")
-        t = self._finish_on("task-prose2.txt", lambda log: "ENTER" in log)
-        result = self.run_event("task-prose2.txt")
-        t.join(timeout=5)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("TYPE Sutando task ready: task-prose2.txt", self.sendkeys_log_text())
-
-    def test_prose_naming_an_api_error_or_a_retry_does_not_hold(self):
-        for name, line in (("task-p4.txt", "⏺ API Error handling is covered by tests."),
-                           ("task-p5.txt", "  ⎿  Connection error. The fix was retrying")):
-            self.write_task(name)
-            self.pane_file.write_text(line + "\n" + IDLE_FOOTER + "\n")
-            t = self._finish_on(name, lambda log, n=name: f"TYPE Sutando task ready: {n}" in log and "ENTER" in log)
-            result = self.run_event(name)
-            t.join(timeout=5)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn(f"TYPE Sutando task ready: {name}", self.sendkeys_log_text(), line)
-
-    def test_a_wrapped_sentence_starting_with_a_retry_word_does_not_hold(self):
-        self.write_task("task-prose3.txt")
-        self.pane_file.write_text("⏺ I verified the docs that say\n  Connection error handling is covered by tests.\n" + IDLE_FOOTER + "\n")
-        t = self._finish_on("task-prose3.txt", lambda log: "ENTER" in log)
-        result = self.run_event("task-prose3.txt")
-        t.join(timeout=5)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("TYPE Sutando task ready: task-prose3.txt", self.sendkeys_log_text())
-
-    def _finish_on(self, name, predicate):
-        import threading
-        def _run():
-            for _ in range(100):
-                if predicate(self.sendkeys_log_text()):
-                    self.write_result(name)
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_run); t.start()
-        return t
-
-    def test_the_queued_messages_composer_is_not_a_draft(self):
-        # A line already queued behind the turn leaves this hint in the composer;
-        # the next task must still go in, on top of the queue.
-        self.write_task("task-q.txt")
-        self.pane_file.write_text("❯ Press up to edit queued messages\n" + BUSY_STATUS + "\n")
-        import threading
-        def _finish():
-            for _ in range(50):
-                if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-q.txt")
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-q.txt")
-        t.join(timeout=5)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("TYPE Sutando task ready: task-q.txt", self.sendkeys_log_text())
-
-    def test_a_busy_footer_alone_does_not_confirm_a_submit(self):
-        # Busy is trivially true once a turn runs, so it proves nothing about our
-        # line: a swallowed C-m on a busy pane must still be re-pressed.
-        self.write_task("task-h2.txt")
-        self.swallow_enter_flag.write_text("1")
-        self.busy_after_enter_flag.write_text("1")
-        import threading
-        def _finish():
-            for _ in range(80):
-                if self.sendkeys_log_text().count("ENTER") >= 2:
-                    self.write_result("task-h2.txt")
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-h2.txt", timeout=15)
-        t.join(timeout=5)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertGreaterEqual(self.sendkeys_log_text().count("ENTER"), 2,
-                                "a busy footer must not stand in for the prompt leaving the composer")
-
-    def test_no_status_file_does_not_block_an_idle_pane(self):
-        # A fresh install or a core that never wrote its status has no file;
-        # the pane alone shows whether a task can be typed.
-        self.status_file.unlink()
-        self.write_task("task-g.txt")
-        import threading
-        def _finish():
-            for _ in range(50):
-                if "ENTER" in self.sendkeys_log_text():
-                    self.write_result("task-g.txt")
-                    return
-                time.sleep(0.1)
-        t = threading.Thread(target=_finish)
-        t.start()
-        result = self.run_event("task-g.txt")
-        t.join(timeout=5)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("TYPE Sutando task ready: task-g.txt", self.sendkeys_log_text(),
-                      "a missing status file must not hold a task on an idle pane")
 
 
 class SmallViewportTests(FakeTmuxHarness):
@@ -1185,6 +917,32 @@ class LiveWordWrapTests(FakeTmuxHarness):
         result = self.run_event("task-wrapmix.txt", timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("ENTER", self.sendkeys_log_text())
+
+
+class ComposerBlockPathTests(unittest.TestCase):
+    """In-process, so the path owner is measured by coverage, not only via argv."""
+
+    def setUp(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("util_paths", REPO / "src/util_paths.py")
+        self.up = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.up)
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+
+    def test_the_default_instance_keeps_the_bare_name(self):
+        for k in ("SUTANDO_INSTANCE_ID", "SUTANDO_AGENT_ID", "AGENT_MXID",
+                  "AGENT_ID", "SUTANDO_INSTANCE"):
+            if k in os.environ:
+                self.addCleanup(os.environ.__setitem__, k, os.environ.pop(k))
+        p = self.up.composer_block_path(self.d)
+        self.assertEqual(p, self.d / "task-notifier-composer-block")
+
+    def test_two_instances_get_two_files(self):
+        a = self.up.composer_block_path(self.d, instance="w1", agent="@a:x")
+        b = self.up.composer_block_path(self.d, instance="w2", agent="@a:x")
+        self.assertNotEqual(a, b)
+        self.assertEqual({a.parent, b.parent}, {self.d})
 
 
 if __name__ == "__main__":

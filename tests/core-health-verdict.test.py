@@ -11,6 +11,12 @@ is not freshly booted. Everything softer is `report`/`escalate`/`none`. This is
 the fixture wall against the false-positive-restart class that produced ~15
 separate historical fixes (#2114 idle->hung, #2072 bad-PATH->crashed, etc.).
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
@@ -291,8 +297,10 @@ try:
           rh._gateway_configured() is None)
     with tempfile.TemporaryDirectory() as cfg:
         os.environ["CLAUDE_CONFIG_DIR"] = cfg
-        check("_gateway_configured: config dir, no .env -> None",
-              rh._gateway_configured() is None)
+        # No ag2space channel is a definitive "not provisioned" — the answer
+        # health-check gives; None is reserved for "cannot tell".
+        check("_gateway_configured: config dir, no channel -> False",
+              rh._gateway_configured() is False)
         ch = os.path.join(cfg, "channels", "ag2space")
         os.makedirs(ch)
         open(os.path.join(ch, ".env"), "w").write("OTHER=1\n")
@@ -301,6 +309,18 @@ try:
         open(os.path.join(ch, ".env"), "w").write("REMOTE_TASK_TOKEN=abc\n")
         check("_gateway_configured: .env with token -> True",
               rh._gateway_configured() is True)
+        # The resolver pulls in shared/; a helper loading this module from a bare src copy
+        # has none, and the answer is "can't tell", never a crash.
+        _saved_resolver = sys.modules.get("channel_env_resolve")
+        sys.modules["channel_env_resolve"] = None
+        try:
+            check("_gateway_configured: resolver not importable -> None",
+                  rh._gateway_configured() is None)
+        finally:
+            if _saved_resolver is None:
+                sys.modules.pop("channel_env_resolve", None)
+            else:
+                sys.modules["channel_env_resolve"] = _saved_resolver
 finally:
     for k, val in _saved_env.items():
         if val is None:

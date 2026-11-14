@@ -24,7 +24,8 @@ Usage:
   ensure-cron-room.py --crons-file <path> [--name <cron> | --all]
                       [--owner <mxid>] [--repo <repo-root>] [--dry-run]
 
-Token: resolved from $GATEWAY_TOKEN / $REMOTE_TASK_TOKEN / $AG2_REMOTE_TOKEN
+Token: on an install with several connections, the primary's (the core's
+connections.room_credential); otherwise resolved from $GATEWAY_TOKEN / $REMOTE_TASK_TOKEN / $AG2_REMOTE_TOKEN
 (env first) else the `AG2_REMOTE_TOKEN=` line in <repo>/.env. Combined
 `https://<gateway>|<secret>` form is split; a bare secret needs $GATEWAY_URL.
 Owner mxid: --owner, else $AG2_OWNER_MXID, else the token's own account is not
@@ -39,7 +40,33 @@ import urllib.request
 import urllib.error
 
 
-def resolve_token(repo):
+class NoConnection(RuntimeError):
+    """The room's server has no usable connection; never answered with another server's token."""
+
+
+def _routed(repo, room):
+    """(url, secret) the core's connections.room_credential names for `room` (None: the
+    primary), or None to keep the env/.env chain. NoConnection on its refusal."""
+    src = os.path.join(repo, "src")
+    if not os.path.isfile(os.path.join(src, "connections.py")):
+        return None
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    import connections
+    try:
+        got = connections.room_credential(room)
+    except connections.ConnectionsError as e:
+        raise NoConnection(str(e)) from None
+    if got is None:
+        return None
+    url, token = got
+    return url.rstrip("/"), connections.secret_of(token) or token.strip()
+
+
+def resolve_token(repo, room=None):
+    routed = _routed(repo, room)
+    if routed is not None:
+        return routed
     # Resolve gateway creds from the SAME alias set the existing clients use
     # (src/remote-gateway-bridge.py, skills/agent-room-ops/_gateway.py) — read
     # from BOTH process env and <repo>/.env (the persistent bridge/startup
@@ -130,7 +157,11 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
-    url, secret = resolve_token(a.repo)
+    try:
+        url, secret = resolve_token(a.repo)
+    except NoConnection as e:
+        print(f"ensure-cron-room: {e} — skipping, no rooms created.")
+        return 0
     if not (url and secret):
         print("ensure-cron-room: not connected to AG2 Space (no gateway token) — skipping, no rooms created.")
         return 0

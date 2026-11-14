@@ -6,8 +6,15 @@ ENOSPC, and health-check reported "All systems operational" because no check
 looked at free space. A health check that stays green through the failure it
 should catch is worse than no check — it actively certifies a broken system.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import shutil
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +39,11 @@ class _FakeUsage:
 class TestDiskSpace(unittest.TestCase):
     def setUp(self):
         self.hc = _load()
+        # The check stats the workspace before measuring it; a test must not depend on
+        # <repo>/workspace happening to exist (CI's per-lane repo copies may not have it).
+        self._ws = tempfile.TemporaryDirectory()
+        self.addCleanup(self._ws.cleanup)
+        self.hc.WORKSPACE_DIR = Path(self._ws.name)
 
     def _status(self, free_gib):
         with patch.object(shutil, "disk_usage", return_value=_FakeUsage(free_gib)):

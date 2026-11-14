@@ -157,12 +157,14 @@ test('instructions: googleSearch=false omits the search line (capability honesty
 	assert.ok(!off.includes('- Google Search for current-info queries'));
 });
 
-test('instructions: meeting-active swaps BOTH conditional rules', () => {
+test('instructions: meeting mode is dictation, with no prompt-only meeting rules', () => {
 	const meeting = cfg.buildInstructions(ctx({ meeting: true }), OVERRIDES);
-	assert.ok(meeting.includes('⚠️ MEETING MODE IS CURRENTLY ACTIVE.'));
-	assert.ok(meeting.includes('- IN MEETING MODE: When addressed by name, answer DIRECTLY'));
-	assert.ok(!meeting.includes('- When in doubt, call work.'));
-	assert.ok(instructions.includes('- When in doubt, call work.'), 'non-meeting keeps the default rule');
+	assert.strictEqual(meeting, instructions.replace(MODE.marker, MEETING_MODE.marker), 'only the mode marker differs');
+	for (const text of [meeting, instructions]) {
+		assert.ok(text.includes('- MEETING MODE: Call switch_mode("meeting")'));
+		assert.ok(!text.includes('save_meeting_note'));
+		assert.ok(text.includes('- When in doubt, call work.'));
+	}
 });
 
 test('greeting: meeting-mode string is exact', () => {

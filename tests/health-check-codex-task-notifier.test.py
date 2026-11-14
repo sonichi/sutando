@@ -6,6 +6,11 @@ Run: python3 tests/health-check-codex-task-notifier.test.py
 
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
@@ -108,6 +113,16 @@ class CodexTaskNotifierHealthTests(unittest.TestCase):
         # Quote like tmux does. An unquoted path splits on its spaces, so this
         # suite failed on any checkout under e.g. ~/Library/Application Support.
         return f"bash {shlex.quote(str(hc._expected_codex_notifier_entrypoint()))}"
+
+    def test_unconfirmed_delivery_is_visible_without_triggering_recovery(self):
+        self.write_local_core()
+        (self.state / "codex-pickup.json").write_text(json.dumps({
+            "blocked": {"reason": "unconfirmed-parent-turn"}}))
+        with mock.patch.object(hc, "_local_codex_core_target", return_value={}), mock.patch.object(
+                hc, "_probe_codex_task_notifier", return_value={"name": "codex-task-notifier", "status": "ok", "detail": "running"}):
+            result = hc.check_codex_task_notifier()
+        self.assertEqual(result["status"], "warn")
+        self.assertIn("without replay", result["detail"])
 
     def test_bare_watcher_can_be_green_while_managed_notifier_is_missing(self):
         self.write_local_core()

@@ -1,0 +1,12 @@
+# Python suites that fail and then pass on a rerun of the same commit. They leave the gating
+# `python standalone tests` legs and run in the non-blocking `python quarantined tests` job.
+# Admission: a tracked issue showing at least two such runs. Each line is `<path> <issue url>`;
+# fix the timing at its cause, then delete the line. A stale entry stops every leg (exit 3).
+tests/ag2-sparrow-claude-code-adapter.test.py https://github.com/sonichi/sutando/issues/6154
+tests/ag2-sparrow-cloud-session-interlock.test.py https://github.com/sonichi/sutando/issues/6159
+tests/ag2-sparrow-hatch-adapter.test.py https://github.com/sonichi/sutando/issues/6153
+tests/browser-persistent.test.py https://github.com/sonichi/sutando/issues/6158
+tests/hermetic-env-sentinels-hatch-adapter.test.py https://github.com/sonichi/sutando/issues/6155
+tests/runtime-api-e2e.test.py https://github.com/sonichi/sutando/issues/6156
+tests/runtime-api-task-engagement.test.py https://github.com/sonichi/sutando/issues/6157
+tests/start-cli-private-socket-foreign-core.test.py https://github.com/sonichi/sutando/issues/6160

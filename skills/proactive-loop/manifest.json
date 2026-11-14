@@ -6,7 +6,8 @@
   "stability": "stable",
   "description": "Start Sutando's autonomous proactive loop. Monitors tasks, runs health checks, and builds missing capabilities on a recurring schedule.",
   "config": {
-    "SUTANDO_SELF_DEVELOPMENT_ENABLED": "1"
+    "SUTANDO_SELF_DEVELOPMENT_ENABLED": "1",
+    "SUTANDO_CODEX_AUTO_RESET_ENABLED": "1"
   },
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"

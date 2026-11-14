@@ -15,7 +15,7 @@
  * missing. Schema:
  *
  *   {
- *     "model": "gemini-2.5-flash-native-audio-preview-12-2025",
+ *     "model": "gemini-3.8-live",
  *     "googleSearch": true,
  *     "owner_mode": false,
  *     "channels": { "<voice_channel_id>": { "owner_mode": true } }
@@ -23,17 +23,14 @@
  *
  * Missing file → defaults. Partial file → fill in missing keys from defaults.
  *
- * Defaults: 2.5 + search:true. Rationale: 2.5+search is the only combo that
- * works on BOTH the MAIN and VOICE Gemini keys (3.1+search needs paid-tier
- * entitlement that only MAIN currently has on most setups; 3.1 without search
- * works on either key but loses Web grounding by default — that's degrading
- * capability rather than picking a safe baseline). Surfaces that explicitly
- * want a different combo (e.g. voice-agent prefers 3.1 + search:false for the
- * web client's code-heavy workload) ship a `.example` template carrying that
- * override. Phone inherits the default, so a fresh install behaves identically.
+ * Defaults: 3.8 Live + search:true. The model is MIGRATED_MODEL, the one every
+ * seeded install moves to; search stays true because that migration keeps each
+ * install's search setting, so a config-less install runs what a migrated
+ * install seeded with the old 2.5 + search:true default runs. The browser
+ * voice-agent template turns search off; phone's template carries this default.
  */
 
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, writeFileSync, renameSync, copyFileSync } from 'fs';
 
 /** Per-channel override entry. Object-shaped so it stays extensible. */
 export interface VoiceChannelConfig {
@@ -53,6 +50,10 @@ export interface VoiceConfig {
 	divergenceCorrection: boolean;
 	/** Per-channel overrides, keyed by voice channel id. */
 	channels: Record<string, VoiceChannelConfig>;
+	/** The relay agent's text-model checks (is a request complete, is it a request for the core, was it
+	 *  already sent). ABSENT = on with the default model. `false` = off: requests go as the voice model
+	 *  writes them. `{ "model": "…" }` picks the model; `{ "enabled": false }` is also off. */
+	relayCheck?: { enabled?: boolean; model?: string } | false;
 	/** Phase 0.5 seam (design §2.1): context-window compression. ABSENT = take
 	 *  whatever the built-in default says. `{}` = on with the SERVER's defaults
 	 *  (trigger at 80% of the model limit, target half the trigger). Explicit
@@ -77,7 +78,7 @@ export interface VoiceConfig {
 }
 
 export const VOICE_CONFIG_DEFAULTS: VoiceConfig = {
-	model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+	model: 'gemini-3.8-live',
 	googleSearch: true,
 	owner_mode: false,
 	shadowStt: false,
@@ -278,4 +279,123 @@ export function loadVoiceConfig(configPath: string): VoiceConfig {
 		console.warn(`[voice-config] failed to parse ${configPath}, using defaults: ${(e as Error).message}`);
 		return { ...VOICE_CONFIG_DEFAULTS, channels: {} };
 	}
+}
+
+/** The model the template seeded before 3.8, and what every seeded model moves to. */
+export const LEGACY_SEEDED_MODEL = 'gemini-3.1-flash-live-preview';
+export const MIGRATED_MODEL = 'gemini-3.8-live';
+/**
+ * Every model an install may have been seeded with before 3.8: the 3.1 template, and the 2.5
+ * native-audio default that the code seeded when no template was copied (2026-10-11: a desktop
+ * install still on it, a second slower than 3.8, because the migration knew only 3.1).
+ */
+export const LEGACY_SEEDED_MODELS: readonly string[] = [
+	LEGACY_SEEDED_MODEL,
+	'gemini-2.5-flash-native-audio-preview-12-2025',
+	'gemini-2.5-flash-native-audio',
+];
+/** The backup copy a migration leaves beside the config: `.bak-3.1` for 3.1 (as before), `.bak-2.5` for the 2.5 models. */
+export function legacyBackupPath(configPath: string, model: string): string {
+	return `${configPath}.bak-${model === LEGACY_SEEDED_MODEL ? '3.1' : model.startsWith('gemini-2.5') ? '2.5' : model.replace(/[^a-z0-9.]+/gi, '-')}`;
+}
+/** The model a migration stamp says the install came from, or null when the stamp is not ours. */
+export function migratedFromModel(stamp: unknown): string | null {
+	const m = typeof stamp === 'string' ? /^(\S+) -> /.exec(stamp) : null;
+	return m ? m[1] : null;
+}
+/** Written once the move is made, so it is made once: a user who switches back to 3.1 keeps it. */
+export const MODEL_MIGRATION_KEY = 'modelMigration';
+
+export interface ModelMigration {
+	migrated: boolean;
+	backup?: string;
+	reason: string;
+}
+
+/**
+ * Move a config still on a model an install was seeded with (3.1, or the 2.5 native-audio default) to 3.8, once.
+ *
+ * The config is per-user data that an app update never rewrites, and the template is copied only
+ * when the file is missing, so a new default reaches new installs only. This is the one place an
+ * existing install moves. Only `model` changes; every other key (search, tuning, comments) is kept,
+ * the original is copied beside it first, and a stamp records the move so it never repeats. The
+ * file cannot say whether 3.1 was seeded or chosen, so a user who chose it is moved once and can
+ * switch back; the stamp keeps that choice. No voice preset yields 3.1 + search, so that config
+ * comes back only from the `.bak-3.1` copy or a hand edit.
+ */
+export function migrateLegacyModel(configPath: string, now: Date = new Date()): ModelMigration {
+	if (!existsSync(configPath)) return { migrated: false, reason: 'no config file' };
+	let raw: Record<string, unknown>;
+	try {
+		raw = JSON.parse(readFileSync(configPath, 'utf-8'));
+	} catch {
+		return { migrated: false, reason: 'config unreadable; left for loadVoiceConfig to report' };
+	}
+	if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { migrated: false, reason: 'config is not an object' };
+	if (raw[MODEL_MIGRATION_KEY] !== undefined) return { migrated: false, reason: 'already migrated once' };
+	const from = typeof raw.model === 'string' && LEGACY_SEEDED_MODELS.includes(raw.model) ? raw.model : null;
+	if (!from) return { migrated: false, reason: `model is ${String(raw.model)}, not an old default` };
+	const backup = legacyBackupPath(configPath, from);
+	if (!existsSync(backup)) copyFileSync(configPath, backup);
+	const next = { ...raw, model: MIGRATED_MODEL, [MODEL_MIGRATION_KEY]: `${from} -> ${MIGRATED_MODEL} on ${now.toISOString().slice(0, 10)}` };
+	const tmp = `${configPath}.tmp`;
+	writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n');
+	renameSync(tmp, configPath);
+	return { migrated: true, backup, reason: 'moved from the old seeded default' };
+}
+
+/** Written by the voice switch tool: a model the user picked is never reverted. */
+export const MODEL_CHOSEN_KEY = 'modelChosenBySwitch';
+/** Written when a migrated install is put back on 3.1, so the revert also happens at most once. */
+export const MODEL_REVERT_KEY = 'modelMigrationReverted';
+
+export interface ModelRevert {
+	reverted: boolean;
+	model?: string;
+	reason: string;
+}
+
+/**
+ * Put a config the migration moved to 3.8 back on its old model, once, when 3.8 is unavailable.
+ *
+ * Only a config carrying the migration stamp and still on the migrated model is touched, and not
+ * one whose model the voice switch tool wrote, so a user who chose 3.8 themselves is not moved. The model comes from the `.bak-3.1` copy when it
+ * names one; every other current key is kept. The migration stamp stays, so it never re-runs.
+ */
+export function revertModelMigration(configPath: string, now: Date = new Date()): ModelRevert {
+	if (!existsSync(configPath)) return { reverted: false, reason: 'no config file' };
+	let raw: Record<string, unknown>;
+	try {
+		raw = JSON.parse(readFileSync(configPath, 'utf-8'));
+	} catch {
+		return { reverted: false, reason: 'config unreadable' };
+	}
+	if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { reverted: false, reason: 'config is not an object' };
+	if (raw[MODEL_MIGRATION_KEY] === undefined) return { reverted: false, reason: 'not moved by the migration' };
+	if (raw[MODEL_REVERT_KEY] !== undefined) return { reverted: false, reason: 'already reverted once' };
+	if (raw.model !== MIGRATED_MODEL) return { reverted: false, reason: `model is ${String(raw.model)}, not the migrated one` };
+	if (raw[MODEL_CHOSEN_KEY] === raw.model) return { reverted: false, reason: 'model was chosen with the voice switch' };
+	// Back to the model it came from: the stamp names it; else the backup copy; else the 3.1 template.
+	let model = migratedFromModel(raw[MODEL_MIGRATION_KEY]) ?? LEGACY_SEEDED_MODEL;
+	try {
+		const backupModel = JSON.parse(readFileSync(legacyBackupPath(configPath, model), 'utf-8'))?.model;
+		if (typeof backupModel === 'string' && backupModel && backupModel !== MIGRATED_MODEL) model = backupModel;
+	} catch { /* no usable backup: the stamp (or the template model) stands */ }
+	const next = { ...raw, model, [MODEL_REVERT_KEY]: `${MIGRATED_MODEL} -> ${model} on ${now.toISOString().slice(0, 10)} (model unavailable)` };
+	const tmp = `${configPath}.tmp`;
+	writeFileSync(tmp, JSON.stringify(next, null, 2) + '\n');
+	renameSync(tmp, configPath);
+	return { reverted: true, model, reason: 'migrated model unavailable' };
+}
+
+/** The relay check's model, or null when the owner turned the check off. Anything malformed means the default. */
+export function resolveRelayCheck(cfg: Pick<VoiceConfig, 'relayCheck'>, defaultModel: string): { model: string } | null {
+	const rc = cfg.relayCheck as unknown;
+	if (rc === false) return null;
+	if (rc && typeof rc === 'object') {
+		const o = rc as { enabled?: unknown; model?: unknown };
+		if (o.enabled === false) return null;
+		if (typeof o.model === 'string' && o.model.trim()) return { model: o.model.trim() };
+	}
+	return { model: defaultModel };
 }

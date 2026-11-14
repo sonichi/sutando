@@ -107,9 +107,8 @@ if grep -v '^\s*#' "$REPO/src/check-pending-tasks.sh" | grep -qE '\$\(git[[:spac
 else
   ok "check-pending-tasks.sh has no bare git invocation"
 fi
-grep -q 'scripts/git-binary.sh' "$REPO/src/check-pending-tasks.sh" && \
-  ok "check-pending-tasks.sh sources git-binary.sh" || \
-  bad "check-pending-tasks.sh sources git-binary.sh" "source line missing"
+# (The hook reads identity from the launcher's marker now, not from a git probe,
+# so it no longer sources the resolver; the bare-git check above still stands.)
 
 # --- 10. the discovered stub candidate is NEVER executed to decide dev-tools -
 # activated classifier/dev-tools witnesses: ran.log absence alone can't tell a refusal from a bypassed seam.

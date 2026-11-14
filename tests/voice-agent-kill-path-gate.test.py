@@ -24,6 +24,11 @@ Exit: 0 = clean, 1 = an unguarded kill path appeared
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import re
 import subprocess
 import sys

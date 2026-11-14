@@ -316,9 +316,11 @@ class TestMainInProcess(Base):
         self.assertEqual(rc, 0)
         self.assertEqual(Path(out.strip()).resolve(), want.resolve())
 
-    def test_an_absent_payload_returns_one(self):
+    def test_an_absent_payload_returns_the_typed_no_payload_code(self):
+        """Exit 3 is a verdict about the ENTRY (nothing behind the sentinel), so
+        the caller can stop retrying an old one; every other failure stays 1."""
         rc, out, err = self._main(self.deliver("task-missing.txt"))
-        self.assertEqual((rc, out.strip()), (1, ""))
+        self.assertEqual((rc, out.strip()), (3, ""))
         self.assertIn("no payload", err)
 
     def test_an_absent_delivery_returns_one(self):

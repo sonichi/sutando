@@ -30,6 +30,7 @@ import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
 import { resolveWorkspace, statusPath } from './workspace_default.js';
+import { meetingHoldsModel } from './meeting-input-hold.js';
 
 const execFileAsync = promisify(execFile);
 // UTC, matching voice-agent's ts() — these logs interleave in the same file,
@@ -709,7 +710,7 @@ function sendFrameGated(
 	if (frameCount === 1 || frameCount % 10 === 0) {
 		console.log(`${ts()} [Vision] sent frame #${frameCount} (${Math.round(data.byteLength / 1024)}KB ${mimeType})`);
 	}
-	if (fireHooks && visionFrameHooks.length > 0) {
+	if (fireHooks && visionFrameHooks.length > 0 && !meetingHoldsModel(sessionRef)) {
 		const transport = sessionRef?.transport;
 		if (transport && typeof transport.sendContent === 'function') {
 			const sendUserCtx = (text: string): void => {
@@ -812,7 +813,7 @@ export function startStreaming(
 			// gets just the base note and operates in default screen-aware
 			// mode. Symmetric to the stop-side cache-clear in stopStream().
 			const transport = sessionRef?.transport;
-			if (transport && typeof transport.sendContent === 'function') {
+			if (transport && typeof transport.sendContent === 'function' && !meetingHoldsModel(sessionRef)) {
 				try {
 					const baseNote =
 						`[system note] User just started sharing their screen via the Watch button (source='${lower}'). Frames are now flowing live. On your next turn, briefly acknowledge that you can see their shared screen and ask what they're trying to do. Keep it to one sentence. Do not describe the screen in detail unless the user asks.`;
@@ -881,7 +882,7 @@ function stopStream(): { wasRunning: boolean; frames: number; durationMs: number
 		// Call as a method (not via an extracted reference) so `this` binds
 		// to the transport — GeminiLiveTransport.sendContent uses `this.session`
 		// internally and throws otherwise.
-		if (transport && typeof transport.sendContent === 'function') {
+		if (transport && typeof transport.sendContent === 'function' && !meetingHoldsModel(sessionRef)) {
 			try {
 				transport.sendContent([{
 					role: 'user',

@@ -15,6 +15,11 @@ Run: python3 tests/runtime-api-issue-failure.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import sys
 import tempfile

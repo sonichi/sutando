@@ -95,6 +95,9 @@ wait_ready() {
   return 0
 }
 
+WITNESS_REAP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/witness-reap.sh"
+trap 'bash "$WITNESS_REAP"' EXIT
+
 utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 line() { printf '%.0s─' $(seq 1 60); echo; }
 

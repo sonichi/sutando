@@ -22,6 +22,12 @@ are you waiting for".
 Labelled rather than inlined, matching how forwards are handled two functions up:
 attributing a quoted message to the replier is its own misreading.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib.util
 import io

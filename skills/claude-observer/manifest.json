@@ -1,0 +1,19 @@
+{
+  "name": "claude-observer",
+  "version": "0.3.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "access_tier": "owner",
+  "enabled": true,
+  "description": "Observes the Claude main loop of the core and of Claude pool workers from inside the CLI: feeds HealthStatus with structured evidence (motion, condition, reason, last completed request) and draws a compact status band above the prompt. Optional: Codex seats, older engines and a disabled skill simply have no observation and report as before.",
+  "permissions": {
+    "network": false,
+    "filesystem": "read-write",
+    "secrets": "none"
+  },
+  "claude_plugin": "./plugin",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

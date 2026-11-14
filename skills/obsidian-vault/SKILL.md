@@ -38,7 +38,7 @@ Open Obsidian → **File → Open vault → Open folder as vault** → pick `<wo
 
 Two automatic features are **opt-in via env var** and OFF by default:
 
-- `src/obsidian-mirror.py` — one-shot CLI that sweeps `tasks/` + `results/` + `notes/` + `pending-questions.md` into `Sutando/Agent/`. No background process; runs once and exits. Schedule it yourself via `crons.json` at whatever cadence you want.
+- `src/obsidian-mirror.py` — one-shot CLI that sweeps `tasks/` + `results/` + `notes/` + the pending questions (via the declared store adapter) into `Sutando/Agent/`. No background process; runs once and exits. Schedule it yourself via `crons.json` at whatever cadence you want.
 - Nightly `dream.py` cron — Opus-4.7-judged cross-linking (inline `(cf. [[X]])` citations + tiered `## Strongly Related` / `## Related` / `## See also` footer block). Sweeps the mirror first, then judges.
 
 Both are gated by `SUTANDO_OBSIDIAN_MIRROR`. To enable, add to `.env`:

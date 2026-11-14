@@ -569,6 +569,22 @@ def main(argv=None) -> int:
             print("why=lsof could not be consulted", file=sys.stderr)
             return 2
         return 0
+    if args and args[0] == "sentinel-names-pid":
+        rest = args[1:]
+        pid = as_pid(rest[0]) if rest else None
+        state_dir = None
+        i = 1
+        while i < len(rest):
+            if rest[i] == "--ready" and i + 1 < len(rest):
+                state_dir = rest[i + 1]
+                i += 2
+            else:
+                i = len(rest) + 1
+        if pid is None or not state_dir:
+            print("usage: watcher_identity.py sentinel-names-pid <pid> --ready STATE_DIR", file=sys.stderr)
+            return 64
+        print("yes" if sentinel_names_pid(pid, state_dir) else "no")
+        return 0
     if args and args[0] == "inbox-holders":
         rest = args[1:]
         inbox = None

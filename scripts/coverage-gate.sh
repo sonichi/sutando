@@ -36,8 +36,8 @@
 
 set -euo pipefail
 
-# Tests must never emit product telemetry. The suite runs real code paths and
-# an unstubbed one would hit PostHog from CI/dev; opt out for every test here.
+# IMPORTANT: tests must never emit product telemetry; removing or weakening this makes CI test runs
+# count as real users on the admin DAU. Enforced by tests/telemetry-test-optout-guard.test.py.
 export SUTANDO_TELEMETRY=0
 
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"

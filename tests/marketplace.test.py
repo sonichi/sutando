@@ -615,6 +615,15 @@ class TestCoverageEdges(unittest.TestCase):
         with mock.patch.object(cloud_auth, "read_cloud_auth", return_value=(None, None)):
             with self.assertRaises(marketplace.Usage):
                 marketplace.build_context(args)
+        refused = type("Refused", (tuple,), {"refused": "account_changed", "stamp_user_id": "u-A",
+                                              "credential_user_ids": ("u-B",)})((None, None))
+        with mock.patch.object(cloud_auth, "read_cloud_auth", return_value=refused):
+            with self.assertRaisesRegex(marketplace.Usage, "u-B, not the account the desktop app started it for .u-A."):
+                marketplace.build_context(args)
+        refused.refused = "account_unverified"
+        with mock.patch.object(cloud_auth, "read_cloud_auth", return_value=refused):
+            with self.assertRaisesRegex(marketplace.Usage, "temporarily unavailable"):
+                marketplace.build_context(args)
         with mock.patch.object(cloud_auth, "read_cloud_auth", return_value=(None, "sutk_x")), \
                 mock.patch.object(marketplace, "_agent_id", return_value="@a:b"), \
                 mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root)}):

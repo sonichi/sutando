@@ -742,8 +742,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Refresh `contextual-chips.json` from cheap mechanical sources. No LLM
-    /// round-trip — just shell-out to `gh pr list`, read top `## Title` line
-    /// of `pending-questions.md`, scan `results/` for unread items. Atomic
+    /// round-trip — just shell-out to `gh pr list` and scan `results/` for
+    /// unread items. Atomic
     /// write via tmp + replaceItem. Fires every 120s + once at startup. The
     /// web UI polls the file and pins matching chips at the top of the
     /// starter tab.
@@ -783,23 +783,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // 2. Top pending question (read first `## Title` line of pending-questions.md).
-        // pending-questions.md is per-host (hosts/<host>/, #1717 F1) — probe there
-        // first so the chip reflects THIS host's questions, not a stale flat-root copy.
-        let pqPath = perHostPath("pending-questions.md")
-        if let pq = try? String(contentsOfFile: pqPath, encoding: .utf8) {
-            // Skip h1 and [RESOLVED] h2s; latch onto the first open h2.
-            for line in pq.split(separator: "\n") {
-                if line.hasPrefix("## ") && !line.hasPrefix("## [RESOLVED]") {
-                    let title = String(line.dropFirst(3))
-                    let preview = title.count > 60 ? String(title.prefix(57)) + "..." : title
-                    chips.append(["label": "Pending: \(preview)", "desc": "Resolve in pending-questions.md"])
-                    break
-                }
-            }
-        }
-
-        // 3. Most recent unread result (results/task-*.txt newest mtime).
+        // 2. Most recent unread result (results/task-*.txt newest mtime).
         let resultsDir = workspace + "/results"
         if let entries = try? FileManager.default.contentsOfDirectory(atPath: resultsDir) {
             let taskResults = entries

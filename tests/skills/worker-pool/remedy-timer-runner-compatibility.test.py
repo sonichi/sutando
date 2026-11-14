@@ -60,7 +60,7 @@ class LaunchctlAcceptsSpawnWorkersRealRunner(unittest.TestCase):
     def test_is_loaded_with_the_real_runner(self):
         with patch("subprocess.run", side_effect=_fake_run):
             try:
-                prt.is_loaded(sw._run)
+                prt.is_loaded("/test/workspace", sw._run)
             except TypeError as e:
                 self.fail(f"is_loaded(runner=spawn_worker._run) raised: {e}")
 

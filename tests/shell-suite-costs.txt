@@ -1,0 +1,25 @@
+# seconds  path — measured on ubuntu-latest: per-file median of the per-suite seconds CI
+# printed in 3 leg log(s) of run(s) 36815474624 36837579759 36872037091 (2026-10-01).
+# Regenerate: scripts/gen-suite-costs.sh -r '<run-ids>' <leg-logs>... > tests/<python|shell>-suite-costs.txt
+# A missing file counts as 1s; the table only steers balance, never which files run.
+1 tests/app-watcher-notifier-liveness.test.sh
+8 tests/channel-bridge-evict-isolation.test.sh
+12 tests/claude-task-notifier-standby-log.test.sh
+27 tests/codex-bounded.test.sh
+32 tests/gateway-bridge-wrapper-self-heal.test.sh
+1 tests/gateway-job-liveness-predicate.test.sh
+68 tests/graceful-restart.test.sh
+0 tests/install-menu-bar-app.test.sh
+1 tests/review-checks-clt-shims.test.sh
+4 tests/self-upgrade.test.sh
+1 tests/start-cli-claude-config-dir.test.sh
+17 tests/start-cli-restart-inside-core-guard.test.sh
+0 tests/start-sh-entry.test.sh
+7 tests/startup-watcher-reaper-ownership.test.sh
+10 tests/supervisor-nudge-alert-arms.test.sh
+33 tests/task-notifier-supervisor-standby-gate.test.sh
+30 tests/watch-tasks-stream-role-session-kills-standby.test.sh
+23 tests/watch-tasks-stream-self-check.test.sh
+9 tests/watch-tasks-stream-survives-sigurg-and-fswatch-death.test.sh
+1 tests/watcher-sentinel-ownership.test.sh
+36 tests/watcher-writes-its-beat.test.sh

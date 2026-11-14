@@ -5,6 +5,7 @@ Parking is the safe default: only a KNOWN transient retries.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 # 4xx timing cases only. 5xx is handled as a RANGE below, because enumerating it
@@ -62,6 +63,43 @@ def failure_status(exc: BaseException) -> int | None:
     return status if isinstance(status, int) and not isinstance(status, bool) else None
 
 
+# Sends a room-membership refusal gets before it parks: on the outbox's 2s-doubling backoff
+# that spans about 30s, enough for a join or an invite acceptance still landing.
+ROOM_REFUSAL_ATTEMPTS = 5
+
+# How a gateway words a 403 that is the room's verdict on the sender, not the bearer's.
+# Room-specific wording only: M_FORBIDDEN and "not a member" also mean a bad token or workspace.
+_ROOM_REFUSAL_MARKERS = ("not in this room", "not a room member", " not in room !")
+
+
+def is_room_membership_refusal(status: int, body: object) -> bool:
+    """True for a 403 whose JSON error says the room refused the sender.
+
+    The gateway authenticated the bearer first, so a credential refresh never changes the
+    answer; only a join can, so the send gets ROOM_REFUSAL_ATTEMPTS tries, then is over.
+    Any other 403 (an edge page, a bare status) stays with the caller's auth handling.
+    """
+    if status != 403:
+        return False
+    if isinstance(body, (bytes, bytearray)):
+        body = bytes(body).decode("utf-8", "replace")
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except ValueError:
+            return False
+    if not isinstance(body, dict):
+        return False
+    said = " ".join(str(body.get(k) or "") for k in ("error", "errcode", "message", "detail")).lower()
+    return any(marker in said for marker in _ROOM_REFUSAL_MARKERS)
+
+
+def is_retryable_http_status(status: int, *, auth_recoverable: bool = False) -> bool:
+    """Adapters opt into auth retries when their transport can refresh credentials."""
+    return (status in TRANSIENT_STATUSES or 500 <= status <= 599
+            or (auth_recoverable and status in (401, 403)))
+
+
 def is_transient(exc: BaseException) -> bool:
     """True when retrying the same send could plausibly succeed.
 
@@ -84,7 +122,7 @@ def is_transient(exc: BaseException) -> bool:
         status = failure_status(exc)
         if status is not None:
             # Whole 5xx range: the server failed, not the payload.
-            return status in TRANSIENT_STATUSES or 500 <= status <= 599
+            return is_retryable_http_status(status)
         if isinstance(exc, (TimeoutError, ConnectionError)):
             return True
         reason = getattr(exc, "reason", None)

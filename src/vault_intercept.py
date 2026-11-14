@@ -34,11 +34,13 @@ messages where we want to prevent accidental secret exposure in task files but
 must not write to the owner's Keychain.
 """
 
+import contextlib
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 from datetime import datetime, timezone
 from typing import NamedTuple
 
@@ -151,10 +153,108 @@ class InterceptResult(NamedTuple):
     failed: list[str]  # keys that could NOT be stored (secret still redacted)
 
 
+_WRITER = threading.local()
+
+_KEYCHAIN_READ_TIMEOUT_S = 5
+# `security` can block on a Keychain unlock prompt; a write gives up after this, lock released.
+_KEYCHAIN_WRITE_TIMEOUT_S = 15
+# Above update_token's worst legitimate hold: two writes each with a read-back, three reads.
+_WRITER_LOCK_WAIT_S = 2 * (_KEYCHAIN_WRITE_TIMEOUT_S + _KEYCHAIN_READ_TIMEOUT_S) + 3 * _KEYCHAIN_READ_TIMEOUT_S + 10
+KEYCHAIN_TIMEOUT_CODE = "vault_keychain_timeout"
+KEYCHAIN_STATE_UNKNOWN_CODE = "vault_keychain_state_unknown"
+
+
+class VaultBusy(RuntimeError):
+    """Another vault writer held the writer lock past _WRITER_LOCK_WAIT_S; nothing was written."""
+
+    CODE = "vault_busy"
+
+
+def writer_lock_path() -> str:
+    """The vault's writer lock, beside the manifest it guards."""
+    return os.path.join(os.path.dirname(_manifest_path()), "writer.lock")
+
+
+def _take_writer_lock(path: str, wait_s) -> int:
+    import time
+    from file_lock import try_lock_fd
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    wait_s = _WRITER_LOCK_WAIT_S if wait_s is None else wait_s
+    deadline = time.monotonic() + wait_s
+    try:
+        while not try_lock_fd(fd):
+            if time.monotonic() >= deadline:
+                raise VaultBusy(f"{VaultBusy.CODE}: another vault writer held the writer lock for "
+                                f"{wait_s:g}s; nothing was written")
+            time.sleep(0.05)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+@contextlib.contextmanager
+def writer_lock(wait_s=None):
+    """The one writer transaction every vault write runs under (set, delete, chat interception, the
+    CLI): a cross-process lock, re-entrant within a thread, so a caller can hold it across a read,
+    a write and a compare. Lock order: a caller holding connections.lock may take this; code holding
+    this never takes connections.lock. A lock that cannot be taken is a RuntimeError, so the write
+    fails; one still held by another writer after `wait_s` (default _WRITER_LOCK_WAIT_S) is VaultBusy."""
+    if getattr(_WRITER, "depth", 0):
+        _WRITER.depth += 1
+        try:
+            yield
+        finally:
+            _WRITER.depth -= 1
+        return
+    from file_lock import unlock_fd
+    try:
+        fd = _take_writer_lock(writer_lock_path(), wait_s)
+    except OSError as e:
+        raise RuntimeError(f"vault: writer lock unavailable ({type(e).__name__})") from None
+    _WRITER.depth = 1
+    try:
+        yield
+    finally:
+        _WRITER.depth = 0
+        try:
+            unlock_fd(fd)
+        finally:
+            os.close(fd)
+
+
+def _keychain_write(argv: list, key: str, verb: str, landed):
+    """Run a `security` write; on a timeout, read the key back: `landed(read)` True means the write
+    took effect (the result is None), False means it did not (vault_keychain_timeout)."""
+    try:
+        return subprocess.run(argv, capture_output=True, timeout=_KEYCHAIN_WRITE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        took = landed(lookup_vault_key(key))
+    except RuntimeError:
+        took = None
+    if took:
+        return None
+    if took is None:
+        raise RuntimeError(f"{KEYCHAIN_STATE_UNKNOWN_CODE}: could not {verb} '{key}' — security gave no answer "
+                           f"within {_KEYCHAIN_WRITE_TIMEOUT_S}s and reading it back failed; the manifest is "
+                           "unchanged and the Keychain item may or may not hold the write") from None
+    raise RuntimeError(f"{KEYCHAIN_TIMEOUT_CODE}: could not {verb} '{key}' — security gave no answer "
+                       f"within {_KEYCHAIN_WRITE_TIMEOUT_S}s and reading it back shows it did not take "
+                       "effect; nothing was changed") from None
+
+
 def _store_in_keychain(key: str, value: str) -> None:
+    with writer_lock():
+        _store_in_keychain_locked(key, value)
+
+
+def _store_in_keychain_locked(key: str, value: str) -> None:
     # Note: value is passed as an argv element — briefly visible in `ps` to
     # the same user. Acceptable on a single-user Mac; not a multi-user safe API.
-    result = subprocess.run(
+    result = _keychain_write(
         [
             "security", "add-generic-password",
             "-a", _ACCOUNT,
@@ -162,9 +262,9 @@ def _store_in_keychain(key: str, value: str) -> None:
             "-w", value,
             "-U",   # update if already exists
         ],
-        capture_output=True,
+        key, "store", lambda read: read == value,
     )
-    if result.returncode != 0:
+    if result is not None and result.returncode != 0:
         raise RuntimeError(
             f"vault: failed to store '{key}': "
             f"{result.stderr.decode(errors='replace').strip()}"
@@ -191,14 +291,44 @@ def list_vault_keys() -> list[str]:
     return sorted(_read_manifest().keys())
 
 
+
 def get_vault_key(key: str) -> str:
-    """Retrieve a secret value from Keychain. Raises KeyError if not found."""
-    result = subprocess.run(
-        ["security", "find-generic-password", "-a", _ACCOUNT, "-s", key, "-w"],
-        capture_output=True,
-    )
+    """Retrieve a secret value from Keychain. Raises KeyError if not found —
+    or when `security` gives no answer within _KEYCHAIN_READ_TIMEOUT_S.
+
+    `security` can block on a locked keychain's unlock dialog; a reader on the
+    startup or health-check path (channel_token.token_from_vault) must not
+    hang behind it, so no answer in time reads as "not present".
+    """
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-a", _ACCOUNT, "-s", key, "-w"],
+            capture_output=True, timeout=_KEYCHAIN_READ_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        raise KeyError(f"vault: key '{key}' not read — security gave no answer "
+                       f"within {_KEYCHAIN_READ_TIMEOUT_S}s") from None
     if result.returncode != 0:
         raise KeyError(f"vault: key '{key}' not found in Keychain")
+    return result.stdout.decode().strip()
+
+
+def lookup_vault_key(key: str) -> str | None:
+    """The secret under `key`, or None only when Keychain reports the item absent. A read that
+    times out or fails any other way raises RuntimeError: a caller replacing a secret must not
+    take an unreadable one for an absent one."""
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-a", _ACCOUNT, "-s", key, "-w"],
+            capture_output=True, timeout=_KEYCHAIN_READ_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"vault: key '{key}' not read — security gave no answer "
+                           f"within {_KEYCHAIN_READ_TIMEOUT_S}s") from None
+    if result.returncode == _ERRSEC_ITEM_NOT_FOUND:
+        return None
+    if result.returncode != 0:
+        raise RuntimeError(f"vault: key '{key}' not read (rc={result.returncode})")
     return result.stdout.decode().strip()
 
 
@@ -243,13 +373,16 @@ _ERRSEC_ITEM_NOT_FOUND = 44  # errSecItemNotFound
 
 
 def _delete_from_keychain(key: str) -> None:
+    with writer_lock():
+        _delete_from_keychain_locked(key)
+
+
+def _delete_from_keychain_locked(key: str) -> None:
     # rc 44 is errSecItemNotFound — already gone, so the manifest drop proceeds.
     # Any other non-zero may leave the item LIVE; dropping it then strands a secret.
-    result = subprocess.run(
-        ["security", "delete-generic-password", "-a", _ACCOUNT, "-s", key],
-        capture_output=True,
-    )
-    if result.returncode not in (0, _ERRSEC_ITEM_NOT_FOUND):
+    result = _keychain_write(["security", "delete-generic-password", "-a", _ACCOUNT, "-s", key],
+                             key, "delete", lambda read: read is None)
+    if result is not None and result.returncode not in (0, _ERRSEC_ITEM_NOT_FOUND):
         raise RuntimeError(
             f"vault: failed to delete '{key}' from Keychain "
             f"(rc={result.returncode}); manifest entry kept so the secret is not stranded"
@@ -305,9 +438,12 @@ def intercept_vault_commands(text: str) -> InterceptResult:
         is_quoted = m.group(2) is not None or m.group(3) is not None or m.group(4) is not None
         if not is_quoted:
             try:
-                from secret_scanner import DETECT_SECRETS_ACTIVE, scan_secrets
+                from secret_scanner import DETECT_SECRETS_ACTIVE, install_hint, scan_secrets
             except ImportError:
                 DETECT_SECRETS_ACTIVE = False
+                # No secret_scanner at all: the refusal must still name a repair for THIS interpreter.
+                install_hint = lambda py: (f"run '{py} -m pip install detect-secrets' (add "  # noqa: E731
+                                           f"--break-system-packages if PEP 668 blocks it)")
             # Capability gate: the guarded import loads even when degraded,
             # so an ImportError gate would skip this refusal (yixuan, #3103).
             if not DETECT_SECRETS_ACTIVE:
@@ -345,12 +481,9 @@ def intercept_vault_commands(text: str) -> InterceptResult:
                 # on the most common Sutando host. Verified 2026-07-20.
                 return (
                     f"vault set {key} [vault: REFUSED — detect-secrets not installed, "
-                    f"can't validate an unquoted value. AGENT: run "
-                    f"'{sys.executable} -m pip install detect-secrets' — if that fails "
-                    f"with 'externally-managed-environment' (PEP 668), retry the same "
-                    f"command with --break-system-packages. Then tell the owner to "
-                    f"re-send this vault set (or quote the value next time). Never echo "
-                    f"or ask for the value.]"
+                    f"can't validate an unquoted value. AGENT: {install_hint(sys.executable)}. "
+                    f"Then tell the owner to re-send this vault set (or quote the value next "
+                    f"time). Never echo or ask for the value.]"
                 )
             if not scan_secrets(value):
                 if _LOOKS_LIKE_PLAIN_LOWERCASE_WORD.fullmatch(key):

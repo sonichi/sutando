@@ -35,11 +35,20 @@ out="$(run_case "TWILIO_WEBHOOK_URL=$LIVE  # run: ngrok http 3100" "$LIVE")"
 out="$(run_case "TWILIO_WEBHOOK_URL=$LIVE" "$LIVE")"
 [ -z "$out" ] && ok "equal (bare) is silent" || bad "equal (bare) is silent" "got: $out"
 
-# 3. absent -> warns, and asks for the console to be pointed at the live URL
+# 3. absent -> warns, names the live URL, and repairs through the script or the
+#    opt-in — never by recording the moving URL as the fixed key.
 out="$(run_case "OTHER=1" "$LIVE")"
 case "$out" in
   *"$LIVE"*) ok "absent warns and names the live URL" ;;
   *) bad "absent warns and names the live URL" "got: $out" ;;
+esac
+case "$out" in
+  *set-webhook*) ok "absent names set-webhook, not the console" ;;
+  *) bad "absent names set-webhook, not the console" "got: $out" ;;
+esac
+case "$out" in
+  *"TWILIO_WEBHOOK_URL=$LIVE"*) bad "absent never says to record the moving URL" "got: $out" ;;
+  *) ok "absent never says to record the moving URL" ;;
 esac
 
 # 4. mismatched -> names BOTH old and new
@@ -58,6 +67,18 @@ esac
 case "$out" in
   *restart*) ok "mismatch names the required restart" ;;
   *) bad "mismatch names the required restart" "no restart named" ;;
+esac
+
+# 5b. the repair must not record the moving ngrok URL as the fixed key: the
+#     server binds that key and skips its own tunnel, so the next restart would
+#     bind a dead URL again. The repair is the script or the opt-in.
+case "$out" in
+  *"TWILIO_WEBHOOK_URL=$LIVE"*) bad "mismatch never says to record the moving URL" "got: $out" ;;
+  *) ok "mismatch never says to record the moving URL" ;;
+esac
+case "$out" in
+  *set-webhook*TWILIO_AUTO_WEBHOOK*|*TWILIO_AUTO_WEBHOOK*set-webhook*) ok "mismatch names set-webhook and TWILIO_AUTO_WEBHOOK" ;;
+  *) bad "mismatch names set-webhook and TWILIO_AUTO_WEBHOOK" "got: $out" ;;
 esac
 
 # 6. equivalent URLs are NOT drift: conversation-server strips the trailing slash
@@ -85,6 +106,6 @@ else
   ok "conversation-server absent (optional skill) — binding check skipped"
 fi
 
-total=$((10))
+total=$((14))
 echo "  Total: $total — pass: $((total-fails)), fail: $fails"
 [ "$fails" -eq 0 ] || exit 1

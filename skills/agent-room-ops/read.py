@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# DEPRECATION NOTICE: room ops is being replaced by the AG2 Space MCP; use its room Actions.
+# Kept only as the fallback when the MCP is unreachable (see SKILL.md).
 """room-ops · read — pull recent room/channel history for an agent.
 
 A synchronous pull-on-demand read, orthogonal to the task file bridge. Gateway-only
@@ -104,6 +106,21 @@ def _redactor():
     return _REDACTOR
 
 
+def _relation(m):
+    """(in_reply_to, thread_root) event ids the gateway item carries, flat or Matrix-nested."""
+    rel = m.get("relates_to") or m.get("m.relates_to")
+    if not isinstance(rel, dict):
+        content = m.get("content")
+        rel = content.get("m.relates_to") if isinstance(content, dict) else None
+    rel = rel if isinstance(rel, dict) else {}
+    nested = rel.get("m.in_reply_to")
+    reply = (m.get("in_reply_to") or m.get("reply_to")
+             or (nested.get("event_id") if isinstance(nested, dict) else None))
+    thread = m.get("thread_root") or (rel.get("event_id") if rel.get("rel_type") == "m.thread" else None)
+    return (reply if isinstance(reply, str) and reply else None,
+            thread if isinstance(thread, str) and thread else None)
+
+
 def _normalize(items):
     out = []
     redact = _redactor()
@@ -121,14 +138,22 @@ def _normalize(items):
             "reactions": m.get("reactions") or [],
         }
         # `fetch` needs media_ref as its handle, so dropping it leaves an attachment
-        # visible but unfetchable. Set only when present, keeping the shape additive.
-        ref = m.get("media_ref")
+        # visible but unfetchable. The broker names it `mxc`; both are accepted.
+        ref = m.get("media_ref") or m.get("mxc")
         if ref:
             norm["media_ref"] = ref
             # Also conditional: the gateway is an external producer, so a media event
-            # arriving without msgtype must not grow an explicit null either.
+            # arriving without msgtype or mimetype must not grow an explicit null either.
             if (mt := m.get("msgtype")):
                 norm["msgtype"] = mt
+            if (mime := m.get("mimetype")):
+                norm["mimetype"] = mime
+        # Conditional like media_ref: a reader binding a reply to its question needs these.
+        reply, thread = _relation(m)
+        if reply:
+            norm["in_reply_to"] = reply
+        if thread:
+            norm["thread_root"] = thread
         out.append(norm)
     return out
 
@@ -146,7 +171,7 @@ def read_room(room_id, agent_mxid=None, limit=DEFAULT_LIMIT, *, gate=None, befor
     gate = load_gate() if gate is None else gate
     if not gate_allows(agent_mxid, room_id, gate):
         return _result(False, reason=f"client gate denied for {agent_mxid}", room_id=room_id)
-    base, headers = gateway()
+    base, headers = gateway(room_id)
     if not base:
         return _result(False, reason="no gateway configured", room_id=room_id)
     # `limit` here means MESSAGES, but the gateway applies its limit to RAW TIMELINE

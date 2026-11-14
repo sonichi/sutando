@@ -18,7 +18,7 @@ mkdirSync(RESULT_DIR, { recursive: true });
 const {
 	setVoiceSessionOrigin, getVoiceSessionOrigin, voiceTaskOrigin, resolveVoiceResultOrigin, forwardVoiceResultToOrigin, forwardVoiceResultToOwnerDm,
 	keepVoiceResultToDm, forwardOfflineVoiceResult, startResultWatcher, workTool, DM_ONLY_DELIVERY_NOTE, LEADING_REDIRECT_RE, DM_ONLY_RE,
-	_isDeliveredResult, _shouldFallthrough, _shouldRegisterTaskRow, _resultFileOps, _deliverOriginBoundResult,
+	_isDeliveredResult, _shouldFallthrough, _shouldRegisterTaskRow, _resultFileOps, _deliverOriginBoundResult, setVoiceTurnsProvider, logConversation,
 } = await import('../src/task-bridge.js');
 
 after(() => {
@@ -65,6 +65,56 @@ describe('setVoiceSessionOrigin — one origin per live client, opaque to the br
 		assert.match(readFileSync(join(TASK_DIR, `${t3.taskId}.txt`), 'utf-8'), /^channel_id: local-voice$/m);
 		for (const t of [t1, t2, t3]) rmSync(join(TASK_DIR, `${t.taskId}.txt`), { force: true });
 	});
+
+	it('a session that moves during the spoken-turn wait leaves the task with its own origin and words', async () => {
+		// The owner spoke just now and no utterance has landed, so the call waits. The first read
+		// of the session after the call began moves it: place-b's words appear in both the
+		// live turns and the conversation log.
+		mkdirSync(join(TMP, 'logs'), { recursive: true });
+		logConversation('user', 'words said in place a');
+		setVoiceSessionOrigin(origin('place-a'));
+		let moved = false;
+		let armed = false;
+		setVoiceTurnsProvider(() => {
+			if (armed && !moved) {
+				moved = true;
+				setVoiceSessionOrigin(origin('place-b'));
+				logConversation('user', 'words said in place b');
+			}
+			return moved
+				? { items: [{ role: 'user', content: 'words said in place b' }], pendingInput: '', lastUserSpeechAt: Date.now() }
+				: { items: [{ role: 'assistant', content: 'On it.' }], pendingInput: '', lastUserSpeechAt: Date.now() };
+		});
+		try {
+			const pending = delegate('origin probe across a move');
+			armed = true;
+			const t = await pending;
+			assert.equal(moved, true, 'the session moved while the call was in flight');
+			const body = readFileSync(join(TASK_DIR, `${t.taskId}.txt`), 'utf-8');
+			assert.equal(voiceTaskOrigin(t.taskId)?.target, 'place-a');
+			assert.match(body, /^channel_id: place-a$/m);
+			assert.doesNotMatch(body, /words said in place b/, 'none of the new session\'s words reach the task');
+			assert.match(body, /assistant: On it\./, 'the context is the live conversation the task was asked in');
+			rmSync(join(TASK_DIR, `${t.taskId}.txt`), { force: true });
+		} finally {
+			setVoiceTurnsProvider(null);
+			setVoiceSessionOrigin(null);
+		}
+	});
+
+	it('a session that moves right after the call is made leaves the task with the origin it was asked from', async () => {
+		setVoiceSessionOrigin(origin('place-a'));
+		try {
+			const pending = delegate('origin probe immediate move');
+			setVoiceSessionOrigin(origin('place-b'));
+			const t = await pending;
+			assert.equal(voiceTaskOrigin(t.taskId)?.target, 'place-a');
+			assert.match(readFileSync(join(TASK_DIR, `${t.taskId}.txt`), 'utf-8'), /^channel_id: place-a$/m);
+			rmSync(join(TASK_DIR, `${t.taskId}.txt`), { force: true });
+		} finally {
+			setVoiceSessionOrigin(null);
+		}
+	});
 });
 
 describe('forwardVoiceResultToOrigin — the result reaches its origin, and voice never speaks it twice', () => {
@@ -72,7 +122,7 @@ describe('forwardVoiceResultToOrigin — the result reaches its origin, and voic
 		const file = forwardVoiceResultToOrigin('task-1700000000000', 'Three listings.\nSecond line.', origin('place-1'), 1_800_000_000);
 		assert.equal(file, 'proactive-result-task-1700000000000-1800000000.to-fakechan.txt');
 		assert.equal(readFileSync(join(RESULT_DIR, file), 'utf-8'), '[channel: place-1]\nThree listings.\nSecond line.');
-		assert.equal(_shouldFallthrough(file), true, 'the drain would otherwise speak this file on its next tick');
+		assert.equal(_shouldFallthrough(file), false, 'a .to-<bridge> file is that bridge\'s to claim; voice never speaks or archives it');
 		assert.equal(_shouldRegisterTaskRow(file), false);
 		assert.equal(_isDeliveredResult(file), true);
 		const py = spawnSync('python3', ['-c', `import sys; sys.path.insert(0, "src")\nfrom proactive_routing import proactive_destination\nprint(proactive_destination(${JSON.stringify(file)}))`], { cwd: process.cwd(), encoding: 'utf-8' });
@@ -90,6 +140,25 @@ describe('forwardVoiceResultToOrigin — the result reaches its origin, and voic
 			assert.equal(readFileSync(join(RESULT_DIR, f), 'utf-8'), `[channel: place-1]\n${body}`);
 		}
 		assert.match('  [channel: 123]', LEADING_REDIRECT_RE);
+	});
+
+	it('a [thread:] root rides only to the room it belongs to: the origin keeps its own, another room\'s is dropped', () => {
+		const parse = (file: string) => {
+			const py = spawnSync('python3', ['-c', [
+				'import sys; sys.path.insert(0, "src")',
+				'from result_markers import parse_markers',
+				`p = parse_markers(open(${JSON.stringify(join(RESULT_DIR, file))}, encoding="utf-8").read())`,
+				'print([(a.kind, a.value) for a in p.actions if a.kind in ("redirect", "thread")])',
+			].join('\n')], { cwd: process.cwd(), encoding: 'utf-8' });
+			assert.equal(py.status, 0, py.stderr);
+			return py.stdout.trim();
+		};
+		const foreign = forwardVoiceResultToOrigin('task-1700000000020', '[thread: $root]\n[channel: !x:ag2.space]\nupdate', origin('!origin:ag2.space'), 1_800_000_020);
+		assert.equal(parse(foreign), "[('redirect', '!origin:ag2.space'), ('redirect', '!x:ag2.space')]", "X's root is never posted in the origin");
+		const own = forwardVoiceResultToOrigin('task-1700000000021', '[thread: $root]\nupdate', origin('!origin:ag2.space'), 1_800_000_021);
+		assert.equal(parse(own), "[('redirect', '!origin:ag2.space'), ('thread', '$root')]", 'a root with no [channel:] is the origin\'s');
+		const dm = forwardVoiceResultToOwnerDm('task-1700000000022', '[thread: $root]\nprivate', 'fakechan', 1_800_000_022);
+		assert.equal(parse(dm), '[]', 'kept to the DM: the origin room\'s root is dropped');
 	});
 
 	it('the owner-DM shape: same bridge tag, no [channel:] line, [dm-only] on top, claimed at once', () => {

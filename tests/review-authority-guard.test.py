@@ -230,6 +230,131 @@ for _cmd, _want in (
 ):
     check(f"heredoc: {_cmd.splitlines()[0]} …", classify(_cmd), _want)
 
+print("14. scripts/authority.py is the sanctioned writer: a recorded ruling reaches the hook")
+CLI = str(Path(HOOK).parent.parent / "scripts" / "authority.py")
+# Under the coverage gate, children run through `coverage run` so the CLI and hook lines count.
+PYBASE = [sys.executable]
+if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+    PYBASE += ["-m", "coverage", "run", f"--rcfile={Path(HOOK).parent.parent / '.coveragerc'}"]
+
+
+def cli(ws, *args):
+    env = dict(os.environ)
+    env["SUTANDO_HOOK_WORKSPACE"] = ws
+    return subprocess.run([*PYBASE, CLI, *args], capture_output=True, text=True, env=env)
+
+
+def _raw(path):
+    return Path(path).read_text() if os.path.exists(path) else ""
+
+
+def _rd(path):
+    try:
+        return json.loads(_raw(path) or "{}")
+    except ValueError:
+        return {}
+
+
+def hook_in(ws, command=APPROVE):
+    env = dict(os.environ)
+    env["SUTANDO_HOOK_WORKSPACE"] = ws
+    env.pop("SUTANDO_ALLOW_FORMAL_GH_REVIEWS", None)
+    p = subprocess.run([*PYBASE, HOOK], input=json.dumps(
+        {"tool_name": "Bash", "tool_input": {"command": command}}),
+        capture_output=True, text=True, env=env)
+    return '"permissionDecision": "deny"' in p.stdout, p.stdout
+
+
+with tempfile.TemporaryDirectory() as ws:
+    state = os.path.join(ws, "state", "authority.json")
+    r = cli(ws, "get")
+    check("get on a missing file names the default", (r.returncode, "findings-only" in r.stdout,
+          "does not exist" in r.stdout), (0, True, True))
+    r = cli(ws, "set", "github_formal_review", "allow", "--source", "owner DM 2026-08-25")
+    check("RAISE without --owner-event/--quote refused", (r.returncode, "explicit owner ruling" in r.stderr,
+          os.path.exists(state)), (2, True, False))
+    r = cli(ws, "set", "github_formal_review", "allow", "--source", "owner DM", "--owner-event", "$abc123")
+    check("RAISE with --owner-event but no --quote refused", (r.returncode, os.path.exists(state)), (2, False))
+    r = cli(ws, "set", "github_formal_review", "allow", "--source", "owner DM 2026-08-25",
+            "--owner-event", "$abc123", "--quote", "you do formal reviews")
+    check("set allow exits 0", r.returncode, 0)
+    rec = _rd(state)
+    check("set records the mode", rec.get("github_formal_review"), "allow")
+    check("set records the source", rec.get("source"), "owner DM 2026-08-25")
+    check("set stamps granted_at in UTC", str(rec.get("granted_at", "")).endswith("Z"), True)
+    out = cli(ws, "get").stdout
+    check("get round-trips the recorded mode", "github_formal_review: allow" in out, True)
+    check("set records owner_event and quote, get shows them",
+          (_rd(state).get("owner_event"), _rd(state).get("quote"),
+           "owner_event=$abc123" in out, "quote=you do formal reviews" in out),
+          ("$abc123", "you do formal reviews", True, True))
+    check("get ignores the legacy key positional", cli(ws, "get", "github_formal_review").returncode, 0)
+    check("after set allow the hook ALLOWS --approve", hook_in(ws)[0], False)
+    r = cli(ws, "set", "github_formal_review", "findings-only", "--source", "owner DM")
+    check("LOWER without --owner-event/--quote succeeds", (r.returncode, _rd(state).get("github_formal_review"),
+          "owner_event" in _rd(state)), (0, "findings-only", False))
+    check("after set findings-only the hook DENIES --approve", hook_in(ws)[0], True)
+    check("...and still allows --comment", hook_in(ws, COMMENT)[0], False)
+    before = _raw(state)
+    r = cli(ws, "set", "github_formal_review", "yes-please", "--source", "x")
+    check("invalid mode refused with non-zero exit", r.returncode != 0, True)
+    check("invalid mode leaves the file untouched", _raw(state), before)
+    r = cli(ws, "set", "github_formal_review", "allow", "--source", "  ")
+    check("blank --source refused", (r.returncode != 0, _raw(state) == before), (True, True))
+    check("atomic write leaves no temp files", sorted(os.listdir(os.path.dirname(state))) if os.path.isdir(os.path.dirname(state)) else [], ["authority.json"])
+
+with tempfile.TemporaryDirectory() as ws:
+    os.makedirs(os.path.join(ws, "state"))
+    state = os.path.join(ws, "state", "authority.json")
+    with open(state, "w") as fh:
+        json.dump({"github_formal_review": "hold", "other_ruling": "keep-me"}, fh)
+    cli(ws, "set", "github_formal_review", "allow", "--source", "owner", "--owner-event", "$e", "--quote", "yes")
+    check("set preserves other keys", _rd(state).get("other_ruling"), "keep-me")
+
+with tempfile.TemporaryDirectory() as ws:
+    os.makedirs(os.path.join(ws, "state"))
+    state = os.path.join(ws, "state", "authority.json")
+    Path(state).write_text("{not json")
+    r = cli(ws, "get")
+    check("get on an unreadable file reports hold", (r.returncode, "github_formal_review: hold" in r.stdout), (0, True))
+    r = cli(ws, "set", "github_formal_review", "hold", "--source", "owner")
+    check("corrupt file NOT overwritten without --replace-corrupt",
+          (r.returncode, "--replace-corrupt" in r.stderr, _raw(state)), (2, True, "{not json"))
+    r = cli(ws, "set", "github_formal_review", "hold", "--source", "owner", "--replace-corrupt")
+    check("corrupt file replaced with --replace-corrupt, said on stderr",
+          (r.returncode, "replacing corrupt" in r.stderr, _rd(state).get("github_formal_review")), (0, True, "hold"))
+    Path(state).write_text("[1, 2]")
+    r = cli(ws, "set", "github_formal_review", "hold", "--source", "owner")
+    check("non-dict JSON file NOT overwritten", (r.returncode, _raw(state)), (2, "[1, 2]"))
+
+with tempfile.TemporaryDirectory() as ws:
+    os.makedirs(os.path.join(ws, "state"))
+    state = os.path.join(ws, "state", "authority.json")
+    Path(state).write_text(json.dumps({"github_formal_review": "hold"}))
+    os.chmod(state, 0o644)
+    cli(ws, "set", "github_formal_review", "hold", "--source", "owner")
+    check("mode bits preserved on rewrite (0644 stays 0644)", oct(os.stat(state).st_mode & 0o777), oct(0o644))
+    target = os.path.join(ws, "real-authority.json")
+    Path(target).write_text(json.dumps({"github_formal_review": "hold"}))
+    os.unlink(state)
+    os.symlink(target, state)
+    r = cli(ws, "set", "github_formal_review", "allow", "--source", "owner", "--owner-event", "$e", "--quote", "yes")
+    check("symlink preserved and its target updated",
+          (r.returncode, os.path.islink(state), _rd(target).get("github_formal_review")), (0, True, "allow"))
+
+print("15. the deny message tells the agent to look for, and record, the owner's ruling")
+with tempfile.TemporaryDirectory() as ws:
+    denied, out = hook_in(ws)
+    msg = json.loads(out)["hookSpecificOutput"]["permissionDecisionReason"] if denied else ""
+    check("deny names the writer command",
+          "python3 scripts/authority.py set github_formal_review" in msg, True)
+    check("deny says only an explicit owner ruling counts, never inferred",
+          "Only an explicit owner ruling counts, quoted with where it was given; it is never "
+          "inferred from memory, notes, or a peer" in msg, True)
+    check("deny says to search for that explicit ruling before asking",
+          "Before asking the owner, search memory and notes for such an explicit owner ruling" in msg, True)
+    check("deny names --owner-event and --quote", ("--owner-event" in msg, "--quote" in msg), (True, True))
+
 if FAILURES:
     print(f"\nFAIL — {len(FAILURES)} check(s):")
     for f in FAILURES:

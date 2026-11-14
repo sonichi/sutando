@@ -66,6 +66,17 @@ def _portable_run(command, *args, **kwargs):
     return _REAL_RUN(command, *args, **kwargs)
 
 
+def _reap(proc):
+    """Stop a child this test started, on every path: TERM, then KILL past the timeout."""
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
 def _wait_file(path, deadline_s=5.0):
     end = time.monotonic() + deadline_s
     while time.monotonic() < end:
@@ -602,6 +613,129 @@ class TestHeartbeatWrite(unittest.TestCase):
         # last_beat_at should advance.
         self.assertGreater(second_data["last_beat_at"], first_data["last_beat_at"])
 
+    def _main_quietly(self, argv):
+        import contextlib
+        import io
+        import core_heartbeat
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+             patch.object(core_heartbeat, "run_forever", side_effect=AssertionError("must not beat")):
+            rc = core_heartbeat.main(argv)
+        return rc, err.getvalue()
+
+    def test_a_contended_writer_lock_exits_0_and_leaves_alive_untouched(self):
+        import core_heartbeat
+        import file_lock
+        cores = self.tmp / "state" / "cores"; cores.mkdir(parents=True)
+        alive = cores / f"{_short_host()}.alive"
+        alive.write_text('{"heartbeat_pid": 4242}')
+        with patch.object(file_lock, "lock_fd", side_effect=BlockingIOError(11, "busy")):
+            rc, err = self._main_quietly(["--interval", "0.5"])
+        self.assertEqual(rc, 0)
+        self.assertIn("another writer already beats", err)
+        self.assertEqual(alive.read_text(), '{"heartbeat_pid": 4242}')
+        self.assertFalse(alive.with_suffix(".stopped").exists())
+        self.assertIsNone(core_heartbeat._WRITER_LOCK)
+
+    def test_a_lock_error_that_is_not_contention_fails_loudly(self):
+        import errno as _errno
+        import core_heartbeat
+        import file_lock
+        with patch.object(file_lock, "lock_fd", side_effect=OSError(_errno.ENOLCK, "No locks available")):
+            rc, err = self._main_quietly(["--interval", "0.5"])
+        self.assertEqual(rc, 1)
+        self.assertIn("cannot take the writer lock", err)
+        self.assertNotIn("another writer", err)
+        self.assertFalse((self.tmp / "state" / "cores").exists())
+        self.assertIsNone(core_heartbeat._WRITER_LOCK)
+
+    @unittest.skipIf(os.name == "nt", "POSIX advisory lock")
+    def test_the_writer_lock_records_its_holder_and_refuses_a_second_taker(self):
+        import core_heartbeat
+        self.assertIsNone(core_heartbeat._writer_lock_holder())
+        self.assertTrue(core_heartbeat._take_writer_lock())
+        self.addCleanup(core_heartbeat._WRITER_LOCK.close)
+        self.assertEqual(core_heartbeat._writer_lock_holder(), os.getpid())
+        held = core_heartbeat._WRITER_LOCK
+        self.assertFalse(core_heartbeat._take_writer_lock())   # flock is per open file: a second fd contends
+        self.assertIs(core_heartbeat._WRITER_LOCK, held)
+
+    @unittest.skipIf(os.name == "nt", "POSIX advisory lock")
+    def test_ensure_takes_over_only_from_a_verified_writer_holding_the_lock(self):
+        import errno as _errno
+        import core_heartbeat as ch
+        import file_lock
+        writer = subprocess.CompletedProcess([], 0, "python3 src/core_heartbeat.py\n", "")
+        stranger = subprocess.CompletedProcess([], 0, "bash -c sleep 60\n", "")
+        with patch.object(ch, "_terminate") as term:
+            self.assertIsNone(ch._take_over_from_another_checkout())              # nobody holds it
+            with patch.object(file_lock, "lock_fd", side_effect=OSError(_errno.ENOLCK, "No locks")):
+                self.assertIsNone(ch._take_over_from_another_checkout())          # cannot tell: leave it
+            self.assertTrue(ch._take_writer_lock())
+            self.addCleanup(ch._WRITER_LOCK.close)
+            self.assertIsNone(ch._take_over_from_another_checkout())              # the holder is this process
+            ch._writer_lock_path().write_text("777001\n")
+            with patch.object(ch.subprocess, "run", side_effect=OSError("no ps")):
+                self.assertIsNone(ch._take_over_from_another_checkout())
+            with patch.object(ch.subprocess, "run", return_value=stranger):
+                self.assertIsNone(ch._take_over_from_another_checkout())
+            term.assert_not_called()
+            with patch.object(ch.subprocess, "run", return_value=writer):
+                self.assertEqual(ch._take_over_from_another_checkout(timeout_s=0.1), 777001)
+            term.assert_called_once_with([777001], 0.1)
+
+    def _ensure_with_child(self, child, holder=None):
+        import core_heartbeat
+        lock = core_heartbeat._writer_lock_path()
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        if holder is not None:
+            lock.write_text(f"{holder}\n")
+        calls = []
+
+        def writers():  # none before the spawn, the child's own argv after it
+            calls.append(1)
+            return [] if len(calls) == 1 else [child.pid]
+        with patch.object(core_heartbeat, "running_writer_pids", side_effect=writers), \
+             patch.object(core_heartbeat.subprocess, "Popen", return_value=child):
+            return core_heartbeat.ensure_running(self.tmp / "hb.log")
+
+    def test_ensure_reports_started_only_once_the_child_holds_the_lock(self):
+        from unittest.mock import MagicMock
+        child = MagicMock(pid=777001, returncode=None)
+        child.poll.return_value = None
+        self.assertEqual(self._ensure_with_child(child, holder=777001), (True, 777001))
+
+    def test_ensure_reports_the_holder_when_its_child_lost_the_lock(self):
+        from unittest.mock import MagicMock
+        child = MagicMock(pid=777002, returncode=0)
+        child.poll.return_value = 0
+        self.assertEqual(self._ensure_with_child(child, holder=4242), (False, 4242))
+
+    def test_ensure_fails_when_its_child_dies_with_an_error(self):
+        import contextlib
+        import io
+        from unittest.mock import MagicMock
+        import core_heartbeat
+        child = MagicMock(pid=777003, returncode=1)
+        child.poll.return_value = 1
+        with self.assertRaisesRegex(RuntimeError, "writer exited 1 at start"):
+            self._ensure_with_child(child)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+             patch.object(core_heartbeat, "ensure_running", side_effect=RuntimeError("writer exited 1 at start")):
+            self.assertEqual(core_heartbeat.main(["--ensure"]), 1)
+        self.assertIn("writer exited 1 at start", err.getvalue())
+
+    def test_ensure_waits_out_a_slow_child_and_reports_it_started(self):
+        from unittest.mock import MagicMock
+        import core_heartbeat
+        child = MagicMock(pid=777004, returncode=None)
+        child.poll.return_value = None
+        clock = iter(range(0, 1000, 2))
+        with patch.object(core_heartbeat.time, "monotonic", side_effect=lambda: next(clock)), \
+             patch.object(core_heartbeat.time, "sleep"):
+            self.assertEqual(self._ensure_with_child(child), (True, 777004))
+
     def test_write_beat_creates_cores_dir(self):
         """The cores/ dir must be created if it doesn't yet exist — fresh
         install case."""
@@ -628,13 +762,33 @@ class TestHeartbeatCli(unittest.TestCase):
         # — the #1745 drift, and both CLI cases fail locally. CI/Linux (no
         # scutil) matched already; this makes the subprocess path deterministic
         # on drifting hosts too.
-        self.env = {**os.environ, "SUTANDO_WORKSPACE": str(self.tmp),
+        # A worker's own tmux identity must not leak in: the children probe a stand-in core.
+        _leaky = ("TMUX", "TMUX_PANE", "SUTANDO_TMUX_SESSION", "SUTANDO_TMUX_SOCKET")
+        self.env = {**{k: v for k, v in os.environ.items() if k not in _leaky},
+                    "SUTANDO_WORKSPACE": str(self.tmp),
                     "SUTANDO_TEST_MODE": "1",
                     "SUTANDO_HOST_LABEL": _short_host()}
+        # Registered first so it runs last: a child reaped later must not recreate the tree.
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
-    def tearDown(self):
-        import shutil
-        shutil.rmtree(self.tmp, ignore_errors=True)
+    def _spawn(self, argv, **kwargs):
+        proc = subprocess.Popen(argv, **kwargs)
+        self.addCleanup(_reap, proc)
+        return proc
+
+    def _core_env(self):
+        """A toolchain that reports a live core, so the writer publishes a beat."""
+        _bin = self.tmp / "fakebin"
+        _bin.mkdir(parents=True, exist_ok=True)
+        for _name, _body in (
+            ("tmux",  "#!/bin/sh\nexit 0\n"),
+            ("pgrep", "#!/bin/sh\necho 4242\n"),
+            ("ps",    "#!/bin/sh\necho 'claude --name sutando-core --resume'\n"),
+        ):
+            _f = _bin / _name
+            _f.write_text(_body)
+            _f.chmod(0o755)
+        return {**self.env, "PATH": f"{_bin}:{self.env.get('PATH', '')}"}
 
     def test_once_flag_writes_single_beat_and_exits(self):
         script = ROOT / "src" / "core_heartbeat.py"
@@ -691,22 +845,7 @@ class TestHeartbeatCli(unittest.TestCase):
         # healthy). This test is about SIGTERM cleanup, and it needs a file to
         # clean up — so give the child a toolchain that reports a real core
         # instead of asserting the pre-4fda4a4b fail-open behaviour.
-        _bin = self.tmp / "fakebin"
-        _bin.mkdir(parents=True, exist_ok=True)
-        for _name, _body in (
-            ("tmux",  "#!/bin/sh\nexit 0\n"),
-            ("pgrep", "#!/bin/sh\necho 4242\n"),
-            ("ps",    "#!/bin/sh\necho 'claude --name sutando-core --resume'\n"),
-        ):
-            _f = _bin / _name
-            _f.write_text(_body)
-            _f.chmod(0o755)
-        _env = dict(self.env)
-        _env["PATH"] = f"{_bin}:{_env.get('PATH', '')}"
-        proc = subprocess.Popen(
-            [sys.executable, str(script), "--interval", "0.5"],
-            env=_env,
-        )
+        proc = self._spawn([sys.executable, str(script), "--interval", "0.5"], env=self._core_env())
         # Wait for first beat to land.
         alive = self.tmp / "state" / "cores" / f"{_short_host()}.alive"
         for _ in range(40):
@@ -719,6 +858,44 @@ class TestHeartbeatCli(unittest.TestCase):
         proc.send_signal(_signal.SIGTERM)
         proc.wait(timeout=5)
         self.assertFalse(alive.exists(), ".alive should have been unlinked on SIGTERM")
+
+    @unittest.skipIf(os.name == "nt", "POSIX SIGTERM cleanup")
+    def test_a_failing_sigterm_test_leaves_no_writer_behind(self):
+        # An assertion that fails before the SIGTERM must still stop the writer it started.
+        spawned = []
+        real_popen = subprocess.Popen
+
+        def recording_popen(*a, **k):
+            proc = real_popen(*a, **k)
+            spawned.append(proc)
+            return proc
+        self.addCleanup(lambda: [_reap(p) for p in spawned])
+
+        class Failing(TestHeartbeatCli):
+            def assertTrue(self, expr, msg=None):
+                raise self.failureException("forced failure before SIGTERM")
+        result = unittest.TestResult()
+        with patch.object(subprocess, "Popen", recording_popen):
+            Failing("test_sigterm_cleans_up_alive_file").run(result)
+        self.assertEqual(len(result.failures), 1, result.errors)
+        self.assertEqual(len(spawned), 1)
+        self.assertIsNotNone(spawned[0].poll(), "the writer outlived its failed test")
+
+    @unittest.skipIf(os.name == "nt", "POSIX advisory lock")
+    def test_a_second_writer_for_the_same_host_exits_and_leaves_the_first_beating(self):
+        script = ROOT / "src" / "core_heartbeat.py"
+        env = self._core_env()
+        first = self._spawn([sys.executable, str(script), "--interval", "0.5"], env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        alive = self.tmp / "state" / "cores" / f"{_short_host()}.alive"
+        self.assertIsNotNone(_wait_file(alive), "the first writer never beat")
+        second = subprocess.run([sys.executable, str(script), "--interval", "0.5"], env=env,
+                                capture_output=True, text=True, timeout=8)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("another writer already beats", second.stderr)
+        self.assertIsNone(first.poll(), "the first writer must keep running")
+        time.sleep(1.0)
+        self.assertEqual(json.loads(_wait_file(alive))["heartbeat_pid"], first.pid)
 
 
 if __name__ == "__main__":

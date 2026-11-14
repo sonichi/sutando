@@ -5,6 +5,12 @@ A claim RENAMES the task file, so between `_pending_task_files()` listing a
 path and the probe stat()ing it, any entry can already be gone. The task-queue
 probe is called unwrapped, so one unguarded stat() takes down every later check.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import sys
 import tempfile

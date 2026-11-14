@@ -16,6 +16,11 @@ Run: python3 tests/health-check-quarantine-skip-markers.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import shutil
@@ -43,7 +48,7 @@ def _load(workspace: Path):
 class QuarantineSkipMarkerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="quarantine-markers-"))
-        self._env = dict(os.environ)
+        self._env = isolated_child_env()
         (self.tmp / "results" / "undelivered").mkdir(parents=True)
         self.mod = _load(self.tmp)
         self.mod.WORKSPACE_DIR = self.tmp

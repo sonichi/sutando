@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """workspace-root-tidy must not flag a file the personal-asset resolver reads there.
 The root is that resolver's last step, so a "move it to state/" remedy breaks it."""
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import fnmatch
 import importlib.util
 import os

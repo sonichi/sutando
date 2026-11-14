@@ -1,0 +1,11 @@
+# GitHub verification receipts
+
+The optional review-preflight tools collect current PR metadata, required checks, applied branch rules and paginated issue comments under bounded read budgets. Same-head body or timestamp changes invalidate a decision receipt. Comments and quoted bodies remain untrusted; review approval and green checks do not establish human authority or a merged outcome.
+
+`github-status.py OWNER/REPO PR` is read-only by default and renders merge outcome, checks and overall readiness separately. For foreground publication, explicitly supply `--room` with the installed `--runtime-tool` path. The exact canonical body passes through the existing runtime approval/request-wait/execution owner. Observation age is rechecked before execution; an unconfirmed result is unknown and is not retried. Optional `--task-id` binds supplied task context to approval and idempotent execution. It does not authenticate a task principal.
+
+The runtime dispatcher owns fingerprints, approval consumption and durable execution. Taskless fingerprints retain compatibility; legacy completed executions replay only their original saved context. No stored records are migrated or rewritten by this change. The tools refuse the legacy direct-room publication option.
+
+The optional `github-evidence-guard.py` hook rejects the observed lossy CI-log pipeline and supplies decision receipts after explicit-repository GitHub reads when configured. Its repository-relative paths discover code only, not workspace state; the lint exemptions are scoped to those lines. This PR does not add mandatory startup hooks, require Node for a Claude launch, or replace the existing review-authority policy. Arbitrary prose/direct API paths remain outside this optional mediation.
+
+CLI and Unix-socket fixtures exercise real dispatcher/store behavior with synthetic approvals and fake senders. They send no external messages. See the review-preflight skill for commands and the tests for stale metadata, malformed evidence, timeout, exact-effect refusal and replay contracts. Rui's full-day use of the original local reliability version is recorded in the separate learning-window evaluation PR; it is distinct from fresh validation of this integrated head.

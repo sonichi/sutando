@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 """Two guards that used to answer a question they never asked.
 
-RUNTIME: the record named one runtime and the launcher chose another, because
-the dispatcher rereads the CORE's configuration. A worker no longer goes
-through that dispatcher at all -- its own launcher only ever runs claude
-(WORKER_MODE_RUNTIMES), so there is no argv selector to drift from the record.
-A runtime whose adapter has no worker mode is still refused BEFORE any
-identity state exists -- a record for a worker that cannot run is worse than no
-worker.
+RUNTIME: the worker's own launcher selects Claude or Codex from the runtime
+the spawner recorded in its environment. An unknown adapter is refused BEFORE
+any identity state exists.
 
 SENTINEL: the guard asked whether `util_paths.py` CONTAINS `def
 watcher_sentinel_path`. A checkout that resolves one shared sentinel passes
@@ -19,11 +15,14 @@ Run: python3 tests/skills/worker-pool/spawn-worker-runtime-and-sentinel.test.py
 from __future__ import annotations
 
 import importlib.util
+import os
+import plistlib
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = Path(__file__).resolve().parents[3] / "skills/worker-pool/scripts"
@@ -40,8 +39,19 @@ class Runner:
     real, and records what the launcher was asked to run."""
     def __init__(self, runtime="claude", existing=()):
         self.launches, self.existing, self.runtime = [], set(existing), runtime
+        self.loaded = set()
 
     def __call__(self, argv, **kw):
+        if argv[0] == "launchctl":
+            if argv[1] == "print":
+                return subprocess.CompletedProcess(argv, 0 if argv[2] in self.loaded else 113, "", "")
+            if argv[1] == "bootout":
+                self.loaded.discard(argv[2])
+            if argv[1] == "bootstrap":
+                with open(argv[3], "rb") as fh:
+                    label = plistlib.load(fh)["Label"]
+                self.loaded.add(f"gui/{os.getuid()}/{label}")
+            return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[0] == "bash" and argv[1].endswith("sutando-config.sh"):
             return subprocess.CompletedProcess(argv, 0, self.runtime + "\n", "")
         if argv[0] == "bash" and argv[1].endswith("launch-worker-session.sh"):
@@ -106,19 +116,27 @@ class TestRuntimeSelector(unittest.TestCase):
         self._t = tempfile.TemporaryDirectory()
         self.addCleanup(self._t.cleanup)
         self.ws = Path(self._t.name)
+        self.la = self.ws / "LaunchAgents"
+        real_ensure = sw.ensure_remedy_timer
+        patcher = mock.patch.object(
+            sw, "ensure_remedy_timer",
+            side_effect=lambda ws, repo, **kw: real_ensure(ws, repo, launch_agents=self.la, **kw))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_the_plan_hands_the_launcher_no_runtime_selector(self):
-        """No --runtime in the argv at all: the worker's own launcher only
-        ever runs claude (WORKER_MODE_RUNTIMES), so there is nothing to
-        select and nothing that could drift from the record."""
+        """The runtime is an environment value, not a dispatcher argv flag."""
         p = sw.plan(self.ws, REPO, runtime="claude")
         argv = p["launcher_argv"]
         self.assertNotIn("--runtime", argv)
         self.assertTrue(argv[1].endswith("launch-worker-session.sh"), argv)
+        self.assertEqual(p["env"]["SUTANDO_WORKER_RUNTIME"], "claude")
 
     def test_the_spawn_launches_the_workers_own_script(self):
         r = Runner()
         got = sw.spawn(self.ws, REPO, runner=r, require_sentinel=False)
+        if sys.platform == "darwin":
+            self.assertEqual(Path(got["remedy_timer"]["plist"]).parent, self.la)
         self.assertEqual(len(r.launches), 1)
         argv = r.launches[0]
         self.assertNotIn("--runtime", argv)
@@ -126,7 +144,7 @@ class TestRuntimeSelector(unittest.TestCase):
 
     def test_a_runtime_without_worker_mode_is_refused(self):
         with self.assertRaises(sw.SpawnRefused) as e:
-            sw.spawn(self.ws, REPO, runtime="codex", runner=Runner(),
+            sw.spawn(self.ws, REPO, runtime="nonesuch", runner=Runner(),
                      require_sentinel=False)
         self.assertIn("worker mode", str(e.exception))
 
@@ -135,18 +153,20 @@ class TestRuntimeSelector(unittest.TestCase):
         success this gate exists to prevent."""
         r = Runner()
         with self.assertRaises(sw.SpawnRefused):
-            sw.spawn(self.ws, REPO, runtime="codex", runner=r, require_sentinel=False)
+            sw.spawn(self.ws, REPO, runtime="nonesuch", runner=r, require_sentinel=False)
         self.assertFalse((self.ws / "state" / "workers").exists())
         self.assertFalse((self.ws / "deliveries").exists())
         self.assertEqual(r.launches, [])
 
-    def test_a_codex_configured_core_refuses_rather_than_running_claude(self):
-        """The probe keweichen ran: requested=codex, dispatcher_selected=claude.
-        With no explicit runtime the core's config decides, and it must not
-        silently resolve to the one adapter that does have worker mode."""
-        with self.assertRaises(sw.SpawnRefused):
-            sw.spawn(self.ws, REPO, runner=Runner(runtime="codex"),
-                     require_sentinel=False)
+    def test_a_codex_configured_core_launches_codex_without_claiming_a_session_id(self):
+        r = Runner(runtime="codex")
+        made = sw.spawn(self.ws, REPO, runner=r, require_sentinel=False)
+        self.assertEqual(made["runtime"], "codex")
+        self.assertIsNone(made["runtime_session_id"])
+        self.assertEqual(made["env"]["SUTANDO_WORKER_RUNTIME"], "codex")
+        self.assertEqual(sw.wi.sessions(self.ws, made["worker_id"]), [])
+        self.assertIsNone(sw.wi.current(self.ws, made["worker_id"])["session_id"])
+        self.assertEqual(len(r.launches), 1)
 
 
 class TestDispatcherHonoursTheSelector(unittest.TestCase):

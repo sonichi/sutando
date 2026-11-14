@@ -12,7 +12,14 @@ import time
 # line; a file-level allowlist entry would blind the lint to the whole file.
 ROOT = pathlib.Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 sys.path.insert(0, str(ROOT / "src"))
-from workspace_default import resolve_workspace  # noqa: E402
+from workspace_default import resolve_workspace, status_path, write_status  # noqa: E402
+
+CACHE_NAME = "sync-conflicts-report-cache.json"
+LAST_RUN_NAME = "sync-conflicts-report-last-run.json"
+DAILY_SECONDS = 24 * 3600
+# A change to this file invalidates every cached row, so a fixed comparison rule
+# never serves results computed by the old one.
+_SCANNER_VERSION = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()[:16]
 
 _HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s")
 
@@ -109,7 +116,36 @@ def _entry_key(batch: str, rel: pathlib.PurePath, saved_text: str) -> str:
     return f"{batch}/{rel}@{digest}"
 
 
-def unmerged(workspace: pathlib.Path):
+def _stat_key(p: pathlib.Path):
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    return [st.st_mtime_ns, st.st_ctime_ns, st.st_size]
+
+
+def _load_cache(workspace: pathlib.Path) -> dict:
+    try:
+        data = json.loads(status_path(CACHE_NAME, workspace).read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict) or data.get("version") != _SCANNER_VERSION:
+        return {}
+    entries = data.get("entries")
+    return entries if isinstance(entries, dict) else {}
+
+
+def _row_to_json(n):
+    return list(n) if isinstance(n, tuple) else n
+
+
+def _row_from_json(n):
+    return tuple(n) if isinstance(n, list) else n
+
+
+def unmerged(workspace: pathlib.Path, full: bool = False):
+    """Rows of unreconciled preserved copies. Unless `full`, a copy whose saved and
+    live stat keys match the previous run reuses that run's row without a read."""
     if not workspace.is_dir():
         return None, f"no such directory: {workspace}"
     # `git rev-parse` SEARCHES ANCESTORS, so a non-repo workspace answers about
@@ -134,32 +170,61 @@ def unmerged(workspace: pathlib.Path):
     if not root.is_dir():
         return [], None
     retired = _load_retired(root)
+    cache = {} if full else _load_cache(workspace)
+    fresh: "dict[str, dict]" = {}
     out = []
     for batch in sorted(p for p in root.iterdir() if p.is_dir()):
         for saved in batch.rglob("*"):
             if not saved.is_file():
                 continue
-            saved_text = saved.read_text(errors="replace")
             rel = saved.relative_to(batch)
-            # A RETIRED entry stays silent whatever the live file does later:
-            # "never merged" and "merged then retracted" are identical on disk.
-            if _entry_key(batch.name, rel, saved_text) in retired:
-                continue
             live = workspace / rel
             if not live.exists():
-                out.append((batch.name, rel, None))
+                live_key = "missing"
+            elif not live.is_file():
+                live_key = NOT_A_FILE
+            else:
+                live_key = _stat_key(live)
+            saved_key = _stat_key(saved)
+            ck = f"{batch.name}/{rel}"
+            hit = cache.get(ck)
+            if (hit and saved_key is not None and live_key is not None
+                    and hit.get("saved") == saved_key and hit.get("live") == live_key):
+                key, n = hit["key"], _row_from_json(hit["row"])
+            else:
+                key, n = _scan_one(batch.name, rel, saved, live)
+            if saved_key is not None and live_key is not None:
+                fresh[ck] = {"saved": saved_key, "live": live_key, "key": key,
+                             "row": _row_to_json(n)}
+            # A RETIRED entry stays silent whatever the live file does later:
+            # "never merged" and "merged then retracted" are identical on disk.
+            if key in retired or n == "clean":
                 continue
-            # A saved path can resolve to a directory, which read_text() cannot
-            # read. Non-comparable is not reconciled, so the row stays.
-            if not live.is_file():
-                out.append((batch.name, rel, NOT_A_FILE))
-                continue
-            live_text = live.read_text(errors="replace")
-            extra = _new_content(saved_text, live_text)
-            if extra:
-                absent, resectioned = _split_by_reason(extra, live_text)
-                out.append((batch.name, rel, (len(extra), len(absent), len(resectioned))))
+            out.append((batch.name, rel, n))
+    try:
+        write_status(CACHE_NAME, {"version": _SCANNER_VERSION, "entries": fresh}, workspace)
+    except OSError:
+        pass  # a cache that cannot be written costs speed, never correctness
     return out, None
+
+
+def _scan_one(batch_name: str, rel: pathlib.PurePath, saved: pathlib.Path,
+              live: pathlib.Path):
+    """(retirement key, row) for one preserved copy; row "clean" means nothing to report."""
+    saved_text = saved.read_text(errors="replace")
+    key = _entry_key(batch_name, rel, saved_text)
+    if not live.exists():
+        return key, None
+    # A saved path can resolve to a directory, which read_text() cannot
+    # read. Non-comparable is not reconciled, so the row stays.
+    if not live.is_file():
+        return key, NOT_A_FILE
+    live_text = live.read_text(errors="replace")
+    extra = _new_content(saved_text, live_text)
+    if not extra:
+        return key, "clean"
+    absent, resectioned = _split_by_reason(extra, live_text)
+    return key, (len(extra), len(absent), len(resectioned))
 
 
 def retire(workspace: pathlib.Path, targets: "list[str]"):
@@ -214,6 +279,13 @@ def retire(workspace: pathlib.Path, targets: "list[str]"):
     return done, None
 
 
+def _seconds_since_last_run(ws: pathlib.Path):
+    try:
+        return int(time.time()) - int(json.loads(status_path(LAST_RUN_NAME, ws).read_text())["ts"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def main() -> int:
     # No positional arg -> canonical resolver, never Path.cwd(): the cron path
     # invokes this from the repo. `migrate=False` -- read-only diagnostic.
@@ -223,6 +295,9 @@ def main() -> int:
         i = argv.index("--retire")
         targets = argv[i + 1:] or []
         argv = argv[:i]
+    # --daily: the sync cron's gate. --force: run despite it. --full: ignore the cache.
+    flags = {a for a in argv if a in ("--daily", "--force", "--full")}
+    argv = [a for a in argv if a not in flags]
     ws = pathlib.Path(argv[0]) if argv else pathlib.Path(
         resolve_workspace(migrate=False))
     if "--retire" in sys.argv:
@@ -238,10 +313,20 @@ def main() -> int:
         for d in done:
             print(f"  {d}")
         return 0
-    rows, err = unmerged(ws)
+    if "--daily" in flags and "--force" not in flags:
+        age = _seconds_since_last_run(ws)
+        if age is not None and 0 <= age < DAILY_SECONDS:
+            print(f"sync-conflicts: skipped (last report {age // 3600}h ago; at most "
+                  f"once per 24h; --force runs it now)")
+            return 0
+    rows, err = unmerged(ws, full=True) if "--full" in flags else unmerged(ws)
     if err:
         print(f"sync-conflicts: {err}")
         return 2
+    try:
+        write_status(LAST_RUN_NAME, {"ts": int(time.time())}, ws)
+    except OSError:
+        pass
     if not rows:
         # Name the workspace even on the clean path: "no unmerged peer content"
         # means nothing unless the reader can see WHICH workspace was examined.

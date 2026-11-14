@@ -4,13 +4,22 @@ never manufacture a second delivery.
 
 Epoch assertions run against the SHIPPED key derivation, not a re-computation.
 """
+import contextlib
+import hashlib
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+import unittest.mock as um
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -25,9 +34,10 @@ ITEM = "task-abc"
 OTHER = "task-def"
 
 
-def _parked(root: Path, item_id: str = ITEM, attempts: int = 5) -> None:
+def _parked(root: Path, item_id: str = ITEM, attempts: int = 5, payload: str = "the reply") -> None:
+    # A gateway record stores its result as the payload; payload="" is a body-external lane.
     outbox._write_item(root, item_id, {"item_id": item_id, "attempts": attempts,
-                                       "status": "QUEUED", "reason": None})
+                                       "status": "QUEUED", "reason": None, "payload": payload})
     outbox.park_item(root, item_id, "max-attempts")
 
 
@@ -218,6 +228,82 @@ class IdempotencyKeyChanges(unittest.TestCase):
         self.assertEqual(_resend_epoch(object(), ITEM), 0)
 
 
+class BodyExternalLane(unittest.TestCase):
+    """The Slack and Discord reply legs publish an empty payload and keep the body in
+    results/. On a terminal park the bridge archives that body and drops the reply's
+    target, so a requeue that reports success leaves the item QUEUED with nothing to
+    send, forever. It must refuse before changing anything, and say where the body is."""
+
+    def _lane(self, td):
+        results = Path(td) / "results"
+        root = results / ".outbox-slack-results"
+        _parked(root, ITEM, payload="")
+        return results, root
+
+    def test_a_parked_reply_whose_body_was_archived_is_refused_and_left_parked(self):
+        with TemporaryDirectory() as td:
+            results, root = self._lane(td)
+            archived = results / "archive" / "2026-10" / f"{ITEM}.txt"
+            archived.parent.mkdir(parents=True)
+            archived.write_text("the reply", encoding="utf-8")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = outbox_cli.main(["--root", str(root), "--json", "requeue", ITEM])
+            self.assertEqual(rc, 5)
+            rec = json.loads(out.getvalue())
+            self.assertEqual(rec["result"], "refused")
+            self.assertIn(str(archived), rec["error"])
+            self.assertIn("re-send it manually", rec["error"])
+            self.assertEqual(outbox.read_item(root, ITEM)["status"], "PARKED", "nothing changed")
+
+    def test_the_archived_copy_named_is_this_tasks_never_a_prefix_match(self):
+        # task-abcd's body is another conversation's: naming it would have the operator re-send it.
+        with TemporaryDirectory() as td:
+            results, root = self._lane(td)
+            month = results / "archive" / "2026-10"
+            month.mkdir(parents=True)
+            (month / f"{ITEM}d.txt").write_text("someone else's reply", encoding="utf-8")
+            gone = outbox_cli.body_gone(root, ITEM)
+            self.assertIn("no archived copy was found", gone)
+            self.assertNotIn(f"{ITEM}d.txt", gone)
+            (month / f"{ITEM}.txt").write_text("the reply", encoding="utf-8")
+            self.assertIn(str(month / f"{ITEM}.txt"), outbox_cli.body_gone(root, ITEM))
+
+    def test_an_archived_copy_in_the_gateways_flat_layout_is_named(self):
+        with TemporaryDirectory() as td:
+            results, root = self._lane(td)
+            (results / "archive").mkdir(parents=True)
+            flat = results / "archive" / f"{ITEM}-1730000000.txt"
+            flat.write_text("the reply", encoding="utf-8")
+            self.assertIn(str(flat), outbox_cli.body_gone(root, ITEM))
+
+    def test_a_live_or_quarantined_body_still_requeues(self):
+        for where in ("live", "quarantined"):
+            with self.subTest(where=where), TemporaryDirectory() as td:
+                results, root = self._lane(td)
+                live = results / f"{ITEM}.txt"
+                live.write_text("the reply", encoding="utf-8")
+                if where == "quarantined":
+                    uq.place(live, results, ITEM, when=1700000000)
+                self.assertEqual(outbox_cli.main(["--root", str(root), "requeue", ITEM]), 0)
+                self.assertEqual(outbox.read_item(root, ITEM)["status"], "QUEUED")
+
+    def test_an_id_that_is_not_a_task_id_is_not_judged(self):
+        # A proactive file's id is `name#mtime`; its body is filed under the name alone.
+        with TemporaryDirectory() as td:
+            root = Path(td) / "results" / ".outbox-discord-proactive"
+            item = "proactive-1.txt#1700000000000000000"
+            _parked(root, item, payload="")
+            self.assertIsNone(outbox_cli.body_gone(root, item))
+            self.assertEqual(outbox_cli.main(["--root", str(root), "requeue", item]), 0)
+
+    def test_control_a_gateway_record_with_its_payload_is_never_judged_gone(self):
+        with TemporaryDirectory() as td:
+            root = Path(td) / "results" / ".outbox"
+            _parked(root, ITEM)
+            self.assertIsNone(outbox_cli.body_gone(root, ITEM))
+
+
 class CliSurface(unittest.TestCase):
     def test_requeue_exit_codes_distinguish_recovered_from_nothing_to_do(self):
         with TemporaryDirectory() as td:
@@ -261,7 +347,7 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
         root = (results / ".outbox-test") if root_inside_results else Path(td) / "ob"
         _parked(root)
         (results / f"{ITEM}.txt").write_text("the reply", encoding="utf-8")
-        uq.quarantine(results / f"{ITEM}.txt", results, when=1700000000)
+        uq.place(results / f"{ITEM}.txt", results, f"{ITEM}", when=1700000000)
         return root, results
 
     def test_the_DEFAULT_requeue_restores_the_body(self):
@@ -309,6 +395,97 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
             self.assertTrue(live.exists(), "the body must be back in the drain's view")
             self.assertEqual(len(uq.find_quarantined(results, ITEM)), 0)
 
+    def _no_primitive(self, links=True):
+        import unittest.mock as um
+        m = outbox_cli.undelivered_quarantine
+        ctx = [um.patch.object(m, "_RENAME", None), um.patch.object(m, "RENAME_PRIMITIVE", "none")]
+        if not links:
+            ctx.append(um.patch("os.link", side_effect=PermissionError(1, "no hard links")))
+        import contextlib
+        stack = contextlib.ExitStack()
+        for c in ctx:
+            stack.enter_context(c)
+        return stack
+
+    def test_without_a_no_replace_rename_requeue_still_restores_the_body(self):
+        with TemporaryDirectory() as td:
+            root, results = self._quarantined(td, root_inside_results=True)
+            with self._no_primitive():
+                rc = outbox_cli.main(["--root", str(root), "requeue", ITEM])
+            self.assertEqual(rc, 0)
+            self.assertEqual((results / f"{ITEM}.txt").read_text(encoding="utf-8"), "the reply")
+            self.assertEqual(outbox.item_status(root, ITEM), "QUEUED")
+
+    def test_a_body_that_cannot_be_restored_fails_loudly_and_stays_queued(self):
+        with TemporaryDirectory() as td:
+            root, results = self._quarantined(td, root_inside_results=True)
+            out = []
+            real = outbox_cli._emit
+            outbox_cli._emit = lambda rec, as_json: out.append(dict(rec))
+            try:
+                with self._no_primitive(links=False):
+                    rc = outbox_cli.main(["--root", str(root), "requeue", ITEM])
+            finally:
+                outbox_cli._emit = real
+            self.assertEqual(rc, 4, "a requeue that left the body quarantined must not exit 0")
+            self.assertEqual(outbox.item_status(root, ITEM), "QUEUED",
+                             "parking again would terminally refuse a reply published under this id")
+            self.assertEqual(out[-1]["result"], "requeued")
+            self.assertIn("could not be moved back", out[-1]["error"])
+            self.assertIn("stays queued", out[-1]["error"])
+            self.assertFalse((results / f"{ITEM}.txt").exists())
+            self.assertEqual(len(uq.find_quarantined(results, ITEM)), 1, "the body must stay intact")
+
+    def test_an_unrestorable_body_on_an_already_queued_record_is_left_queued(self):
+        """Exit 4 names the failure; the record is not parked by the CLI,
+        whichever run committed the transition."""
+        with TemporaryDirectory() as td:
+            root, results = self._quarantined(td, root_inside_results=True)
+            outbox.requeue_item(root, ITEM)                  # the record half committed earlier
+            with self._no_primitive(links=False):
+                rc = outbox_cli.main(["--root", str(root), "requeue", ITEM])
+            self.assertEqual(rc, 4)
+            self.assertEqual(outbox.item_status(root, ITEM), "QUEUED")
+
+    def test_a_peer_requeue_after_this_ones_lock_is_never_undone(self):
+        """A peer parks and requeues to a new epoch right after this call's
+        transition released the item lock; the rollback must leave the peer's cycle."""
+        with TemporaryDirectory() as td:
+            root, results = self._quarantined(td, root_inside_results=True)
+            real_lock, fired = outbox._item_lock, []
+
+            @contextlib.contextmanager
+            def lock_then_peer(*a, **k):
+                with real_lock(*a, **k):
+                    yield
+                if not fired:
+                    fired.append(1)
+                    outbox.park_item(root, ITEM, "peer parked")
+                    outbox.requeue_item(root, ITEM, operator="peer")
+
+            out = []
+            with self._no_primitive(links=False), \
+                    um.patch.object(outbox, "_item_lock", lock_then_peer), \
+                    um.patch.object(outbox_cli, "_emit", lambda rec, as_json: out.append(dict(rec))):
+                rc = outbox_cli.main(["--root", str(root), "requeue", ITEM])
+            rec = outbox.read_item(root, ITEM) or {}
+            self.assertEqual((rec.get("status"), rec.get("resend_epoch"), rec.get("requeued_by")),
+                             ("QUEUED", 2, "peer"), "the peer's requeue must stand")
+            self.assertEqual(rc, 4)
+            self.assertEqual(out[-1]["resend_epoch"], 1, "the epoch this call wrote, not the peer's")
+
+    def test_a_delivered_record_never_gets_its_body_back(self):
+        """A copy left listed in undelivered/ (its aside rename failed) is not
+        owed again once the record is DELIVERED: a re-run restores nothing."""
+        with TemporaryDirectory() as td:
+            root, results = self._quarantined(td, root_inside_results=True)
+            outbox.record_delivered(root, ITEM)
+            rc = outbox_cli.main(["--root", str(root), "requeue", ITEM])
+            self.assertEqual(rc, 3)
+            self.assertFalse((results / f"{ITEM}.txt").exists(), "a delivered body went live again")
+            self.assertEqual(len(uq.find_quarantined(results, ITEM)), 1)
+
+
     def test_a_retry_with_nothing_to_do_still_reports_nothing_to_do(self):
         """The exit code must not become 0 for every already-queued item, or the
         idempotent re-run loses the distinction the code exists to carry."""
@@ -335,7 +512,7 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
             broker_id, local_id = "task-abc", "task-dev~task-abc"
             _parked(root, broker_id)
             (results / f"{local_id}.txt").write_text("the reply", encoding="utf-8")
-            uq.quarantine(results / f"{local_id}.txt", results, when=1700000000)
+            uq.place(results / f"{local_id}.txt", results, f"{local_id}", when=1700000000)
 
             # the local id addresses no record
             self.assertEqual(
@@ -374,7 +551,7 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
             self.assertEqual(uq.restore(results, ITEM)[0],
                              uq.RestoreOutcome.NOTHING_QUARANTINED)
             (results / f"{ITEM}.txt").write_text("old", encoding="utf-8")
-            uq.quarantine(results / f"{ITEM}.txt", results)
+            uq.place(results / f"{ITEM}.txt", results, f"{ITEM}")
             (results / f"{ITEM}.txt").write_text("newer", encoding="utf-8")
             self.assertEqual(uq.restore(results, ITEM)[0],
                              uq.RestoreOutcome.LIVE_RESULT_PRESENT)
@@ -386,7 +563,7 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
             results = Path(td) / "results"; results.mkdir()
             for body in ("first", "second"):
                 (results / f"{ITEM}.txt").write_text(body, encoding="utf-8")
-                uq.quarantine(results / f"{ITEM}.txt", results)
+                uq.place(results / f"{ITEM}.txt", results, f"{ITEM}")
             self.assertEqual(len(uq.find_quarantined(results, ITEM)), 2)
 
     def test_requeue_with_results_dir_returns_the_body_to_the_drain(self):
@@ -424,7 +601,152 @@ class BodyRestoredNotJustTheRecord(unittest.TestCase):
         bridge = (ROOT / "packages" / "ag2-sparrow" / "ag2_sparrow"
                   / "remote_gateway_bridge.py").read_text(encoding="utf-8")
         self.assertNotIn('f"{rfile.stem}-{int(time.time())}.txt"', bridge)
-        self.assertIn("undelivered_quarantine.quarantine(", bridge)
+        # Every quarantine goes through the lifecycle owner, which names files
+        # only through undelivered_quarantine.place().
+        self.assertIn("disposal.quarantine_current(", bridge)
+        self.assertIn("disposal.quarantine_generation(", bridge)
+
+
+class RequeueNeverChangesThePayload(unittest.TestCase):
+    """A requeue sends the stored body; a later publish of the id is refused."""
+
+    def test_the_stored_payload_survives_a_requeue_and_a_later_publish(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "packages" / "ag2-sparrow"))
+        from ag2_sparrow.delivery_core import DesignAClaimBackend
+        with TemporaryDirectory() as td:
+            root = Path(td) / "ob"
+            _parked(root)
+            outbox._write_item(root, ITEM, dict(outbox.read_item(root, ITEM), payload="A"))
+            outbox.requeue_item(root, ITEM)
+            self.assertFalse(DesignAClaimBackend(root).publish(ITEM, b"B"))
+            self.assertEqual(outbox.read_item(root, ITEM)["payload"], "A")
+
+
+class DeliveredBodyDiffers(unittest.TestCase):
+    """The owner rule: a live reply at a delivered id is sent only if its body is
+    the one the delivered record stores."""
+
+    def _rec(self, td, **fields):
+        root = Path(td) / "ob"
+        outbox._write_item(root, ITEM, dict(fields, item_id=ITEM))
+        return root
+
+    def test_cases(self):
+        env = json.dumps({"id": ITEM, "body": "A"})
+        other = json.dumps({"id": ITEM, "body": "B"})
+        dig = outbox.source_digest
+
+        def proof(source, payload=env):
+            return outbox.source_proof_fields(dig(source), payload, "p1")
+        for name, fields, live, differs in (
+                ("no record", None, "C", False),
+                ("queued", {"status": "QUEUED", "payload": env, **proof("A")}, "C", False),
+                ("delivered, same source", {"status": "DELIVERED", "payload": env,
+                                            **proof("[dm-only]\nA")}, "[dm-only]\nA", False),
+                ("delivered, other source, same wire body", {"status": "DELIVERED", "payload": env,
+                                                             **proof("A")}, "[dm-only]\nA", True),
+                ("delivered, a proof written for another payload (stale), unchanged body",
+                 {"status": "DELIVERED", "payload": env, **proof("B", other)}, "A", False),
+                ("delivered, a proof with no payload binding", {"status": "DELIVERED", "payload": env,
+                                                               "source_ready_sha256": dig("B")}, "A", False),
+                ("legacy delivered, identical unmarked source", {"status": "DELIVERED", "payload": env}, "A", False),
+                ("legacy delivered, marked source", {"status": "DELIVERED", "payload": env}, "[dm-only]\nA", True),
+                ("legacy delivered, other source", {"status": "DELIVERED", "payload": env}, "C", True),
+                ("legacy delivered, no envelope stored", {"status": "DELIVERED"}, "A", True),
+                ("legacy delivered, unreadable envelope", {"status": "DELIVERED", "payload": "{"}, "A", True),
+                ("legacy delivered, envelope not an object", {"status": "DELIVERED", "payload": "[]"}, "A", True),
+                ("delivered, earlier source_sha256 only, identical body",
+                 {"status": "DELIVERED", "payload": env, "source_sha256": dig("other")}, "A", False),
+                ("delivered, earlier source_sha256 only, marked body",
+                 {"status": "DELIVERED", "payload": env, "source_sha256": dig("[dm-only]\nA")}, "[dm-only]\nA", True),
+                ("delivered, nothing readable live", {"status": "DELIVERED", "payload": env,
+                                                      **proof("A")}, None, True)):
+            with self.subTest(case=name), TemporaryDirectory() as td:
+                root = self._rec(td, **fields) if fields is not None else Path(td) / "ob"
+                self.assertIs(outbox.delivered_body_differs(root, ITEM, live), differs)
+
+    def test_only_this_writers_stamp_with_a_matching_binding_is_trusted(self):
+        env = json.dumps({"id": ITEM, "body": "A"})
+        stamped = dict(outbox.source_proof_fields(outbox.source_digest("A"), env, "p1"),
+                       payload=env, published_at=7.0)
+        self.assertEqual(outbox.source_proof(stamped), outbox.source_digest("A"))
+        for name, change in (("no stamp", {"proof_version": None}),
+                             ("another stamp", {"proof_version": 2}),
+                             ("payload rewritten by another writer", {"payload": env + " "}),
+                             ("another publication", {"publication_id": "p2"}),
+                             ("no publication id", {"publication_id": None}),
+                             ("payload-only binding of an earlier head",
+                              {"source_payload_sha256": hashlib.sha256(env.encode()).hexdigest()})):
+            with self.subTest(case=name):
+                self.assertIsNone(outbox.source_proof(dict(stamped, **change)))
+        self.assertIsNone(outbox.source_proof(None))
+
+    def test_invariant_publication_identity_is_unique_and_written_with_its_proof(self):
+        """Two publications in the same millisecond never share an identity, and a
+        requeue gives the record a new one, re-binding only a proof still trusted."""
+        ids = {outbox.new_publication_id() for _ in range(1000)}
+        self.assertEqual(len(ids), 1000)
+        with TemporaryDirectory() as td:
+            root = Path(td) / "ob"
+            env = json.dumps({"id": ITEM, "body": "A"})
+            outbox._write_item(root, ITEM, {"item_id": ITEM, "status": "PARKED", "payload": env,
+                                            "published_at": 7.0,
+                                            **outbox.source_proof_fields(outbox.source_digest("A"), env, "p1")})
+            outbox.requeue_item(root, ITEM)
+            rec = outbox.read_item(root, ITEM)
+            self.assertNotEqual(rec["publication_id"], "p1")
+            self.assertEqual(outbox.source_proof(rec), outbox.source_digest("A"))
+            outbox._write_item(root, ITEM, dict(rec, status="PARKED", payload=env + " "))
+            outbox.requeue_item(root, ITEM)
+            self.assertIsNone(outbox.source_proof(outbox.read_item(root, ITEM)), "a stale proof is never re-bound")
+
+    def test_the_source_digest_is_of_the_ready_body(self):
+        self.assertEqual(outbox.source_digest("A"), hashlib.sha256(b"A").hexdigest())
+
+
+class WithdrawUnsent(unittest.TestCase):
+    """A publication taken back before it left; never one that may be sending or is out."""
+    def item(self, root, status="READY", **extra):
+        outbox._write_item(root, ITEM, {"item_id": ITEM, "attempts": 0, "status": status,
+                                        "payload": '{"id": "x"}', **extra})
+
+    def test_an_unsent_matching_item_is_withdrawn(self):
+        for status in ("READY", "QUEUED"):
+            with self.subTest(status=status), TemporaryDirectory() as td:
+                root = Path(td)
+                self.item(root, status)
+                self.assertTrue(outbox.withdraw_unsent(root, ITEM, lambda p: '"x"' in p))
+                self.assertIsNone(outbox.read_item(root, ITEM))
+
+    def test_another_payload_absent_refused_or_delivered_is_left_and_nothing_remains_to_send(self):
+        for status, matches in (("READY", False), ("PARKED", True), ("DELIVERED", True)):
+            with self.subTest(status=status, matches=matches), TemporaryDirectory() as td:
+                root = Path(td)
+                self.item(root, status)
+                self.assertTrue(outbox.withdraw_unsent(root, ITEM, lambda p, m=matches: m))
+                self.assertEqual(outbox.read_item(root, ITEM)["status"], status)
+        with TemporaryDirectory() as td:
+            self.assertTrue(outbox.withdraw_unsent(Path(td), ITEM, lambda p: True))
+
+    def test_one_that_may_be_sending_is_kept_and_reported(self):
+        cases = {"claimed": {}, "dispatching": {"dispatching": {"incarnation": "w", "at": 1}},
+                 "receipt": {"provider_ref": "r1"}}
+        for case, extra in cases.items():
+            with self.subTest(case=case), TemporaryDirectory() as td:
+                root = Path(td)
+                self.item(root, **extra)
+                if case == "claimed":
+                    self.assertTrue(outbox.acquire_delivery_claim(root, ITEM, "w"))
+                self.assertFalse(outbox.withdraw_unsent(root, ITEM, lambda p: True))
+                self.assertIsNotNone(outbox.read_item(root, ITEM))
+
+    def test_an_unreadable_record_is_never_judged(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            self.item(root)
+            outbox._item_path(root, ITEM).write_text("{torn")
+            self.assertFalse(outbox.withdraw_unsent(root, ITEM, lambda p: True))
+            self.assertTrue(outbox._item_path(root, ITEM).exists())
 
 
 class CliRenderingAndErrorPaths(unittest.TestCase):
@@ -515,14 +837,15 @@ class OutboxReaderEdges(unittest.TestCase):
             self.assertIsNone(outbox.read_item(root, "ghost"))
             self.assertEqual(outbox.list_items(root), [])
 
-    def test_a_corrupt_record_is_skipped_not_fatal(self):
+    def test_a_corrupt_record_is_listed_parked_not_skipped_or_fatal(self):
         with TemporaryDirectory() as td:
             root = Path(td)
             _parked(root)
             (outbox._items_dir(root) / "torn.json").write_text("{not json",
                                                               encoding="utf-8")
             got = outbox.list_items(root)
-            self.assertEqual([r["item_id"] for r in got], [ITEM])
+            self.assertEqual([(r.get("item_id"), r.get("file"), r["reason"]) for r in got],
+                             [(ITEM, None, "max-attempts"), (None, "torn.json", outbox.UNREADABLE_ITEM)])
 
     def test_a_non_integer_epoch_reads_as_zero(self):
         with TemporaryDirectory() as td:
@@ -568,7 +891,7 @@ class EntryPointImportsInThePackage(unittest.TestCase):
 
     def _run(self, code: str, pkg_parent: str):
         import subprocess
-        env = dict(os.environ, PYTHONPATH=pkg_parent, PYTHONDONTWRITEBYTECODE="1")
+        env = hermetic_env(PYTHONPATH=pkg_parent, PYTHONDONTWRITEBYTECODE="1")
         return subprocess.run([sys.executable, "-c", code], env=env,
                               capture_output=True, text=True, cwd=tempfile.gettempdir())
 

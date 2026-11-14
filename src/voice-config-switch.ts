@@ -14,8 +14,9 @@
  *
  * Presets (named after the only knob that matters — Web grounding):
  *   - 'search'    → 2.5-flash-native-audio + googleSearch:true  (Web grounding ON)
- *   - 'no-search' → 3.1-flash-live-preview + googleSearch:false (newer model, no Web)
- *   - 'latest-search' → 3.1-flash-live-preview + googleSearch:true (needs a paid-tier VOICE key)
+ *   - 'no-search'     → 3.1-flash-live-preview + googleSearch:false (legacy 3.1 mode)
+ *   - 'gemini-3.8'    → 3.8-live + googleSearch:false (default low-latency mode)
+ *   - 'latest-search' → 3.8-live + googleSearch:true (newest model with Web grounding)
  *
  * The tool returns BEFORE the restart fires (small setTimeout) so Gemini
  * can speak the ack before the transport closes. The guarded takeover kills
@@ -26,9 +27,9 @@ import { z } from 'zod';
 import { writeFileSync, renameSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import type { ToolDefinition } from 'bodhi-realtime-agent';
-import { VOICE_CONFIG_DEFAULTS, type VoiceConfig } from './voice-config.js';
+import { MODEL_CHOSEN_KEY, VOICE_CONFIG_DEFAULTS, type ModelRevert, type VoiceConfig } from './voice-config.js';
 import { resolveWorkspace } from './workspace_default.js';
 
 const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -48,25 +49,65 @@ export const GUARDED_RESTART_SCRIPT = join(REPO_ROOT, 'scripts', 'restart-voice-
  * takeover-blocked, nothing signaled; missing interpreter ⇒ the wrapper fails
  * closed before touching the lock. `spawnImpl` is injectable for tests.
  */
-export function fireGuardedRestart(spawnImpl: typeof spawn = spawn): void {
+export function fireGuardedRestart(
+	spawnImpl: typeof spawn = spawn,
+	onExit?: (code: number | null) => void,
+): void {
 	// detached so the wrapper outlives this process — the takeover it runs
 	// kills the current voice-agent (we ARE the lock holder) mid-script.
 	const child = spawnImpl('bash', [GUARDED_RESTART_SCRIPT], {
 		detached: true,
 		stdio: 'ignore',
 	});
+	// Fires only if this process is still alive, i.e. the wrapper refused or failed.
+	if (onExit) child.on('exit', (code) => onExit(code));
 	child.unref();
+}
+
+/** The guarded wrapper refuses (exit 5) unless voice-agent runs under this launchd job. */
+export function isVoiceAgentLaunchdManaged(spawnSyncImpl: typeof spawnSync = spawnSync): boolean {
+	const uid = typeof process.getuid === 'function' ? process.getuid() : -1;
+	if (uid < 0) return false;
+	const r = spawnSyncImpl('launchctl', ['print', `gui/${uid}/com.sutando.voice-agent`], { stdio: 'ignore' });
+	return r.status === 0;
+}
+
+/**
+ * After a model revert, restart only where something will respawn voice-agent, and tell the owner
+ * what actually happens: a restart, or voice down until Sutando is restarted.
+ */
+export function restartAfterModelRevert(
+	revert: ModelRevert,
+	fromModel: string,
+	deps: {
+		launchdManaged: boolean;
+		restart: (onExit: (code: number | null) => void) => void;
+		notify: (message: string) => void;
+	},
+): 'restarting' | 'needs-manual-restart' | 'nothing' {
+	if (!revert.reverted || !revert.model) return 'nothing';
+	const to = revert.model;
+	const down = `Voice model ${fromModel} isn't available for your Gemini key. Voice is set back to ${to} but stays down until Sutando restarts — restart Sutando to bring voice back on ${to}.`;
+	if (!deps.launchdManaged) {
+		deps.notify(down);
+		return 'needs-manual-restart';
+	}
+	deps.notify(`Voice model ${fromModel} isn't available for your Gemini key, so voice went back to ${to} and is restarting.`);
+	deps.restart((code) => {
+		if (code !== 0) deps.notify(down);
+	});
+	return 'restarting';
 }
 
 // Presets carry only the two knobs this tool switches (model + googleSearch);
 // owner_mode / channels are merged in from VOICE_CONFIG_DEFAULTS at write time.
 type VoiceConfigPreset = Pick<VoiceConfig, 'model' | 'googleSearch'>;
 
-export const PRESETS: Record<'search' | 'no-search' | 'latest-search', VoiceConfigPreset> = {
+export const PRESETS: Record<'search' | 'no-search' | 'gemini-3.8' | 'latest-search', VoiceConfigPreset> = {
 	search: { model: 'gemini-2.5-flash-native-audio-preview-12-2025', googleSearch: true },
 	'no-search': { model: 'gemini-3.1-flash-live-preview', googleSearch: false },
-	// 3.1 + search: a free-tier VOICE key closes with 1011; a paid-tier key holds.
-	'latest-search': { model: 'gemini-3.1-flash-live-preview', googleSearch: true },
+	'gemini-3.8': { model: 'gemini-3.8-live', googleSearch: false },
+	'latest-search': { model: 'gemini-3.8-live', googleSearch: true },
 };
 
 const ts = () => new Date().toISOString().slice(11, 23);
@@ -100,7 +141,8 @@ export function nextSwitchConfig(
 		existingRaw && typeof existingRaw === 'object' && !Array.isArray(existingRaw)
 			? (existingRaw as Partial<VoiceConfig>)
 			: {};
-	return { ...VOICE_CONFIG_DEFAULTS, ...existing, ...preset };
+	const next = { ...VOICE_CONFIG_DEFAULTS, ...existing, ...preset, [MODEL_CHOSEN_KEY]: preset.model };
+	return next;
 }
 
 export const switchVoiceConfigTool: ToolDefinition = {
@@ -108,24 +150,25 @@ export const switchVoiceConfigTool: ToolDefinition = {
 	description:
 		'Switch voice-agent to a different model + googleSearch preset and restart. ' +
 		'Use when the user explicitly asks to switch — e.g. "switch to search mode", ' +
-		'"switch to no-search mode", "use 2.5", "use 3.1", "turn search on", "turn search off". ' +
+		'"switch to no-search mode", "use 2.5", "use 3.1", "use Gemini 3.8", "turn search on", "turn search off". ' +
 		'Presets: ' +
 		'"search" = gemini-2.5-flash-native-audio + googleSearch:true (best for Q&A with Web grounding); ' +
-		'"no-search" = gemini-3.1-flash-live-preview + googleSearch:false (newer model, no Web grounding); ' +
-		'"latest-search" = gemini-3.1-flash-live-preview + googleSearch:true (newest model with Web grounding; needs a paid-tier VOICE key). ' +
+		'"no-search" = gemini-3.1-flash-live-preview + googleSearch:false (legacy 3.1 mode); ' +
+		'"gemini-3.8" = gemini-3.8-live + googleSearch:false (default low-latency mode); ' +
+		'"latest-search" = gemini-3.8-live + googleSearch:true (newest model with Web grounding; availability depends on the Gemini project/account quota). ' +
 		'Restart takes ~2-3 seconds during which voice will be silent; the web client auto-reconnects. ' +
 		'HIGH-IMPACT: this restarts the whole voice session. Call it ONLY on one of those explicit switch ' +
 		'requests — NEVER because the conversation merely mentions search/searching, and never on filler ' +
 		'or garbled speech; when unsure, fire nothing.',
 	parameters: z.object({
-		preset: z.enum(['search', 'no-search', 'latest-search']).describe('Which preset to switch to. "search" = 2.5+Web grounding. "no-search" = 3.1+no-Web. "latest-search" = 3.1+Web grounding.'),
+	preset: z.enum(['search', 'no-search', 'gemini-3.8', 'latest-search']).describe('Which preset to switch to. "search" = 2.5+Web grounding. "no-search" = legacy 3.1 without Web. "gemini-3.8" = 3.8 without Web. "latest-search" = 3.8 with Web grounding; availability depends on Gemini project/account quota.'),
 	}),
 	execution: 'inline',
 	async execute(args) {
-		const { preset } = args as { preset: 'search' | 'no-search' | 'latest-search' };
+		const { preset } = args as { preset: 'search' | 'no-search' | 'gemini-3.8' | 'latest-search' };
 		const cfg = PRESETS[preset];
 		if (!cfg) {
-			return { error: `Unknown preset "${preset}". Use "search", "no-search" or "latest-search".` };
+			return { error: `Unknown preset "${preset}". Use "search", "no-search", "gemini-3.8" or "latest-search".` };
 		}
 
 		// The voice-agent config is per-user data — it lives in the workspace
@@ -158,8 +201,10 @@ export const switchVoiceConfigTool: ToolDefinition = {
 		const summary = preset === 'search'
 			? 'Switching to search mode: Gemini 2.5 with Web grounding. Restarting now…'
 			: preset === 'latest-search'
-				? 'Switching to latest-search mode: Gemini 3.1 with Web grounding. Restarting now…'
-				: 'Switching to no-search mode: Gemini 3.1, no Web grounding. Restarting now…';
+				? 'Switching to latest-search mode: Gemini 3.8 with Web grounding. Restarting now…'
+				: preset === 'gemini-3.8'
+					? 'Switching to Gemini 3.8 Live, no Web grounding. Restarting now…'
+					: 'Switching to no-search mode: Gemini 3.1, no Web grounding. Restarting now…';
 		return {
 			ok: true,
 			preset,

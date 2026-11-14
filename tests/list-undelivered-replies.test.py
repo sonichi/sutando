@@ -113,6 +113,15 @@ class Lister(unittest.TestCase):
         self.assertIn("dest   UNKNOWN", out)
         self.assertIn("do NOT guess a room", out)
 
+    def test_the_listing_never_tells_the_operator_to_send(self):
+        self._orphan("task-maybe-sent")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            lur.main(["--workspace", str(self.ws)])
+        out = buf.getvalue()
+        self.assertIn("may already have been delivered", out)
+        self.assertNotIn("before sending", out)
+
     def test_empty_workspace_says_so(self):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):

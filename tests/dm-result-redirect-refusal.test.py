@@ -5,6 +5,11 @@ parse_markers() STRIPS the marker, so a dropped redirect is invisible downstream
 the body arrives in the owner DM looking well-formed, addressed to nobody in particular.
 """
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 from contextlib import redirect_stderr
 import importlib.util
 import io

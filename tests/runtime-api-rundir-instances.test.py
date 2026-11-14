@@ -12,6 +12,12 @@ able to run at once, which scoping by instance alone made impossible.
 Run: python3 tests/runtime-api-rundir-instances.test.py
 Exit: 0 on pass, 1 on fail.
 """
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import json
 import os
 import socket
@@ -117,7 +123,7 @@ class LiveDoubleStartTests(unittest.TestCase):
 
     def _start(self, agent, tag=None):
         root = Path(self.tmp.name) / (tag or agent)
-        env = {**os.environ,
+        env = {**isolated_child_env(),
                "SUTANDO_RUN_DIR": str(Path(self.tmp.name) / "run"),
                "SUTANDO_AGENT_ID": agent,
                "SUTANDO_INSTANCE_ID": "default",

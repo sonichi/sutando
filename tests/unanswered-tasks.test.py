@@ -241,8 +241,7 @@ with tempfile.TemporaryDirectory() as d:
           "quiet when the dedup target is the SAME room and sender (what dedup is for)")
 
 
-# A [no-send] / [REPLIED] holder never delivered, so the bridge requeues. This
-# is `dedup_holder_delivered`'s verdict, not a rule restated here.
+# A REPLIED holder asserts an out-of-band answer; no-send does not.
 for marker in ("[no-send]", "[REPLIED]"):
     with tempfile.TemporaryDirectory() as d:
         import os
@@ -254,8 +253,11 @@ for marker in ("[no-send]", "[REPLIED]"):
         (root / "results" / "task-src.txt").write_text("[deduped: task-dst]\n")
         (root / "results" / "task-dst.txt").write_text(marker + "\n")
         rows = uat.unanswered(root, 120)
-        check(len(rows) == 1 and rows[0][2].startswith("HOLDER-SKIPPED"),
-              f"a {marker} holder is not a delivery — flagged, as the bridge requeues it")
+        if marker == "[REPLIED]":
+            check(rows == [], "a REPLIED holder was answered through another route")
+        else:
+            check(len(rows) == 1 and rows[0][2].startswith("HOLDER-SKIPPED"),
+                  "a no-send holder is flagged, as the bridge requeues it")
 
 
 # The guard must fire on an EMPTY queue too: a lazy per-task import means a
@@ -369,6 +371,38 @@ finally:
 check(uat._markers() is not None,
       "CONTROL: _markers still works afterwards — the refusal test restored global state")
 
+
+# "Held" has one owner, src/task_delegation.py:holder; this checker delegates to it (#5918).
+import os as _os
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+import task_delegation as _td  # noqa: E402
+
+with tempfile.TemporaryDirectory() as d:
+    root = ws(d)
+    _td.mark(root, "task-abc123", 1800, now=time.time() - 300)
+    check(uat.unanswered(root, 120) == [], "quiet: a task with a live background-delegation marker is held")
+    wake = time.time() - 200
+    _os.utime(root / "tasks" / "task-abc123.txt", (wake, wake))
+    check([r[0] for r in uat.unanswered(root, 120)] == ["task-abc123"],
+          "FIRES: a wake turn rewritten after the marker is owed again")
+
+with tempfile.TemporaryDirectory() as d:
+    root = ws(d)
+    _td.mark(root, "task-abc123", 60, now=time.time() - 61)
+    check([r[0] for r in uat.unanswered(root, 120)] == ["task-abc123"], "FIRES: an expired marker holds nothing")
+
+with tempfile.TemporaryDirectory() as d:
+    root = ws(d)
+    seen = []
+    _real_holder = _td.holder
+    _td.holder = lambda *a, **k: (seen.append((a, k)), "pinned")[1]
+    try:
+        rows = uat.unanswered(root, 120)
+    finally:
+        _td.holder = _real_holder
+    check(rows == [] and len(seen) == 1 and seen[0][1].get("worker_holder") is uat._pool_holder
+          and seen[0][1].get("task_file") == root / "tasks" / "task-abc123.txt",
+          "_holder delegates to task_delegation.holder with the worker lookup and the task file injected")
 
 print(f"\nunanswered-tasks: {PASS} passed, {FAIL} failed")
 sys.exit(1 if FAIL else 0)

@@ -127,6 +127,9 @@ class HumanActionAdapter:
         self.manager.create(req)
         return req.id
 
+    def cancel(self, action_id: str) -> None:
+        self.manager.cancel(action_id)
+
     def close(self, action_id: str, resolved_by: str, note: Optional[str] = None) -> None:
         """Settle a still-open requirement out-of-band (API completion path) so
         the card does not dangle: the requester already settled it."""
@@ -142,6 +145,17 @@ class HumanActionAdapter:
                 req.answer = {"note": note}
             self.manager.store.save(req)
         self.manager.resolve(action_id)
+
+    def expire(self, request_id: str) -> None:
+        """Expire only the existing requirement belonging to this request."""
+        aid = ha_action_id(request_id)
+        with self.manager.store.locked():
+            req = self.manager.get(aid)
+            if (req is None or req.terminal or req.runtime != RUNTIME
+                    or req.subject.get("runtime_request_id") != request_id
+                    or req.guard != f"runtime:{request_id}"):
+                return
+            self.manager.expire(aid)
 
     # ── inbound: resolved requirement → runtime terminal state ─────────────
     def poll_resolution(self, action_id: str):

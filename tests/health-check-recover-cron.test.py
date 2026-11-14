@@ -56,9 +56,17 @@ Exit code: 0 on pass, 1 on fail.
 """
 
 from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -442,6 +450,7 @@ def _fake_tmux(td: Path, has_rc: int, send_rc: int) -> "tuple[str, Path]":
     script = td / "tmux"
     script.write_text(
         "#!/bin/sh\n"
+        f'. "{REPO}/tests/lib/tmux-fake-unwrap.sh"\n'
         f'echo "$@" >> "{log}"\n'
         f'case "$*" in *has-session*) exit {has_rc};; *send-keys*) exit {send_rc};; esac\n'
         "exit 0\n"
@@ -457,9 +466,10 @@ def case_n_real_nudge_subprocess_path() -> list[str]:
     fails = []
     with tempfile.TemporaryDirectory() as td:
         tdp = Path(td)
+        sock = str(tdp / "x.sock")
         # Missing session: has-session exits non-zero → False, no send-keys.
         bin_a, log_a = _fake_tmux(tdp, has_rc=1, send_rc=0)
-        if hc._default_cron_nudge(tmux_bin=bin_a, sock="/tmp/x.sock", session="sutando-core"):
+        if hc._default_cron_nudge(tmux_bin=bin_a, sock=sock, session="sutando-core"):
             fails.append("n) missing tmux session should return False")
         if log_a.exists() and "send-keys" in log_a.read_text():
             fails.append("n) must not send-keys when the session is missing")
@@ -467,21 +477,21 @@ def case_n_real_nudge_subprocess_path() -> list[str]:
         # Live session: True, and the send-keys call carries the exact
         # re-arm keystroke on the resolved socket + session.
         bin_b, log_b = _fake_tmux(tdp, has_rc=0, send_rc=0)
-        if not hc._default_cron_nudge(tmux_bin=bin_b, sock="/tmp/x.sock", session="sutando-core"):
+        if not hc._default_cron_nudge(tmux_bin=bin_b, sock=sock, session="sutando-core"):
             fails.append("n) live session should return True")
         sent = log_b.read_text() if log_b.exists() else ""
         send_lines = [ln for ln in sent.splitlines() if "send-keys" in ln]
         if len(send_lines) != 1:
             fails.append(f"n) expected exactly one send-keys call, log: {sent!r}")
-        elif not all(tok in send_lines[0] for tok in ("-S /tmp/x.sock", "-t sutando-core", "/schedule-crons", "Enter")):
+        elif not all(tok in send_lines[0] for tok in (f"-S {sock}", "-t =sutando-core:", "/schedule-crons", "Enter")):
             fails.append(f"n) send-keys must type /schedule-crons + Enter at the pane, got: {send_lines[0]!r}")
         log_b.unlink(missing_ok=True)
         # send-keys itself fails → False (nudge did not land).
         bin_c, _ = _fake_tmux(tdp, has_rc=0, send_rc=1)
-        if hc._default_cron_nudge(tmux_bin=bin_c, sock="/tmp/x.sock", session="sutando-core"):
+        if hc._default_cron_nudge(tmux_bin=bin_c, sock=sock, session="sutando-core"):
             fails.append("n) failed send-keys should return False")
         # Binary missing entirely → exception path → False, never raises.
-        if hc._default_cron_nudge(tmux_bin=str(tdp / "no-such-tmux"), sock="/tmp/x.sock", session="s"):
+        if hc._default_cron_nudge(tmux_bin=str(tdp / "no-such-tmux"), sock=sock, session="s"):
             fails.append("n) missing tmux binary should return False")
         # Default sock/session resolution: with only the binary injected, the
         # socket must come from the live heartbeat (via _live_core_socket) and
@@ -498,7 +508,7 @@ def case_n_real_nudge_subprocess_path() -> list[str]:
             if not hc._default_cron_nudge(tmux_bin=bin_d):
                 fails.append("n) default sock/session resolution should still nudge")
             logged = log_d.read_text() if log_d.exists() else ""
-            if "-S /tmp/hb.sock" not in logged or "-t sutando-core" not in logged:
+            if "-S /tmp/hb.sock" not in logged or "-t =sutando-core" not in logged:
                 fails.append(f"n) defaults must resolve heartbeat socket + canonical session, got: {logged!r}")
         finally:
             hc.WORKSPACE_DIR = saved_ws
@@ -508,6 +518,41 @@ def case_n_real_nudge_subprocess_path() -> list[str]:
         # socket no server listens on: fails closed, never raises.
         if hc._default_cron_nudge(sock=str(tdp / "no-server.sock"), session="sutando-core-test"):
             fails.append("n) default tmux against a serverless socket should return False")
+        fails += _real_tmux_nudge_targets_only_the_core(tdp)
+    return fails
+
+
+def _real_tmux_nudge_targets_only_the_core(tdp: Path) -> list[str]:
+    """With the core gone, a bare target prefix-matches its `-watcher` session: the nudge
+    must not type there, and must type into the core's own pane when it exists."""
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        print("  skip  real tmux nudge target (tmux not installed)")
+        return []
+    fails = []
+    sock = str(tdp / "real.sock")
+    pane = lambda s: subprocess.run([tmux, "-S", sock, "capture-pane", "-p", "-t", f"={s}:"],
+                                    capture_output=True, text=True).stdout
+    try:
+        subprocess.run([tmux, "-S", sock, "new-session", "-d", "-s", "sutando-core-watcher", "cat"], check=True)
+        if hc._default_cron_nudge(tmux_bin=tmux, sock=sock, session="sutando-core"):
+            fails.append("n) with only the watcher session, the nudge must report the core missing")
+        time.sleep(0.2)
+        if "/schedule-crons" in pane("sutando-core-watcher"):
+            fails.append("n) the nudge typed into the watcher pane")
+        subprocess.run([tmux, "-S", sock, "new-session", "-d", "-s", "sutando-core", "cat"], check=True)
+        if not hc._default_cron_nudge(tmux_bin=tmux, sock=sock, session="sutando-core"):
+            fails.append("n) a live core session should be nudged")
+        for _ in range(20):
+            if "/schedule-crons" in pane("sutando-core"):
+                break
+            time.sleep(0.1)
+        else:
+            fails.append("n) the nudge never reached the core pane")
+        if "/schedule-crons" in pane("sutando-core-watcher"):
+            fails.append("n) the nudge reached the watcher pane")
+    finally:
+        subprocess.run([tmux, "-S", sock, "kill-server"], check=False)
     return fails
 
 

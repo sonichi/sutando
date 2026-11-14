@@ -113,6 +113,26 @@ class TestChatSecretFilter(unittest.TestCase):
         text = "Please explain how API keys work without showing one."
         self.assertEqual(filter_chat_secrets(text).text, text)
 
+    def test_unterminated_private_key_is_withheld_without_optional_scanner(self):
+        text = "public prefix\n-----BEGIN PRIVATE KEY-----\nfixture payload\nmore payload"
+        scanner = types.SimpleNamespace(scan_and_redact=mock.Mock(side_effect=RuntimeError()))
+        with mock.patch.dict(sys.modules, {"secret_scanner": scanner}):
+            result = filter_chat_secrets(text)
+        self.assertEqual(result.text, "public prefix\n[REDACTED-Private Key]")
+
+    def test_scanner_private_key_hit_withholds_unterminated_tail(self):
+        from secret_scanner import SecretHit, redact_secrets
+        text = "public prefix\n-----BEGIN PRIVATE KEY-----\nfixture payload\nmore payload"
+        output = redact_secrets(text, [SecretHit("Private Key", 2)])
+        self.assertEqual(output, "public prefix\n[STORED-IN-KEYCHAIN-Private Key]")
+
+    def test_complete_private_key_preserves_following_prose(self):
+        text = "public prefix\n-----BEGIN PRIVATE KEY-----\nfixture payload\n-----END PRIVATE KEY-----\npublic suffix"
+        result = filter_chat_secrets(text)
+        self.assertNotIn("fixture payload", result.text)
+        self.assertIn("public prefix", result.text)
+        self.assertIn("public suffix", result.text)
+
     def test_discord_and_slack_notice_requires_source_message_cleanup(self):
         for surface in ("Discord", "Slack"):
             notice = secret_handling_instruction(surface, ["GitHub Token"])

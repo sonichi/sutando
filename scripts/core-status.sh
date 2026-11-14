@@ -22,8 +22,13 @@ set -euo pipefail
 
 STATUS="${1:?usage: core-status.sh <status> [step]}"
 STEP="${2-}"
+LOOP_HOST=""
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ "${3-}" = "--loop-complete" ]; then
+    [ "$STATUS" = idle ] || { echo "loop completion requires idle" >&2; exit 2; }
+    LOOP_HOST="$(bash "$REPO_ROOT/scripts/sutando-config.sh" host-label)"
+fi
 
 # Bare `python3` is Apple's stub on a Mac without Command Line Tools: executing
 # it raises the install modal, and this wrapper runs on EVERY status transition.
@@ -35,11 +40,11 @@ if [ -z "$PY_BIN" ]; then
 fi
 
 # Quoted heredoc + argv: REPO_ROOT is data, never spliced into Python source.
-exec "$PY_BIN" - "$REPO_ROOT" "$STATUS" "$STEP" <<'PY'
+exec "$PY_BIN" - "$REPO_ROOT" "$STATUS" "$STEP" "$LOOP_HOST" <<'PY'
 import importlib.util, sys, time
 from pathlib import Path
 
-repo_root, status, step = sys.argv[1], sys.argv[2], sys.argv[3]
+repo_root, status, step, loop_host = sys.argv[1:5]
 spec = importlib.util.spec_from_file_location(
     "wd", str(Path(repo_root) / "src" / "workspace_default.py"))
 wd = importlib.util.module_from_spec(spec)
@@ -62,14 +67,8 @@ except Exception as exc:
     print(f"core-status: pending queue not counted: {exc}", file=sys.stderr)
 print(wd.write_status("core-status.json", payload, workspace=ws))
 
-# `idle` closes a proactive-loop pass, so stamp the liveness marker
-# check_cron_schedule reads. core-status.json is NOT a substitute: owner turns
-# refresh it, so it stays fresh through a dead schedule.
-if status == "idle":
-    try:
-        m = wd.resolve_workspace() / "state" / "last-loop-ok"
-        m.parent.mkdir(parents=True, exist_ok=True)
-        m.touch()
-    except Exception as exc:
-        print(f"core-status: last-loop-ok not stamped: {exc}", file=sys.stderr)
+if loop_host:
+    sys.path.insert(0, str(Path(repo_root) / "src"))
+    from loop_completion import write_completion
+    write_completion(ws, loop_host)
 PY

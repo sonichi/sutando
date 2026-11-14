@@ -26,6 +26,14 @@ matrix.to deep-link is clickable there. If the active channel is a non-bridge su
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+_SRC = str(Path(__file__).resolve().parents[2] / "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
+from ag2space_links import room_link  # noqa: E402
+
 # Update kinds a cron can emit. Only a subset is worth pulling the owner's attention
 # to their active channel; routine "nothing changed" ticks stay silent (in-room only).
 #   owner_action — the cron needs an owner decision/input  → PING
@@ -78,20 +86,14 @@ def is_attention_worthy(kind: str, summary: str = "") -> bool:
     return False          # every clause is an empty signal → downgrade
 
 
-def deep_link(room_id: str, event_id: str = "", via: str = "ag2.space") -> str:
-    """Build a matrix.to deep-link to a room (and optional event).
-
-    Format per roadmap Track 13a: matrix.to/#/<room>/<event>?via=<homeserver>.
-    A room-only link (no event) omits the event segment. `via` is the routing
-    hint homeservers need to find the room; empty `via` drops the query.
-    """
-    frag = room_id if not event_id else f"{room_id}/{event_id}"
-    base = f"https://matrix.to/#/{frag}"
-    return f"{base}?via={via}" if via else base
+def deep_link(room_id: str, event_id: str = "", via: "str | None" = None) -> str:
+    """The room (or event) link the app opens in place: core's `ag2space_links.room_link`;
+    `via` None is the linked room's own server (`!x:server`)."""
+    return room_link(room_id, event_id, via)
 
 
 def format_ping(cron: str, summary: str, room_id: str, event_id: str = "",
-                via: str = "ag2.space", max_summary: int = 140) -> str:
+                via: "str | None" = None, max_summary: int = 140) -> str:
     """One-line ping for the owner's active channel: `⏰ <cron>: <summary> → <deep-link>`.
 
     Summary is collapsed to a single line and truncated (the full detail lives in the
@@ -198,8 +200,9 @@ def _repo_root():
     return str(Path(__file__).resolve().parents[2])
 
 
-def _load_gateway(repo=None):
+def _load_gateway(repo=None, room=None):
     """Return (base_url, secret) for the gateway, or (None, None) if unconfigured.
+    With several connections it is the one serving `room`'s server (no room: the primary).
 
     Delegates to the canonical resolver (ensure-cron-room.py:resolve_token) so
     cron-notify honors the SAME cred contract as every other client: process env
@@ -209,7 +212,7 @@ def _load_gateway(repo=None):
     invoked from any cwd still resolves — the prior cwd-relative, `.env`-only,
     `AG2_REMOTE_TOKEN`-only reader returned (None, None) for a supported
     split-token install and from a non-repo cwd (#2346 review)."""
-    return _canonical_resolver()(repo if repo is not None else _repo_root())
+    return _canonical_resolver()(repo if repo is not None else _repo_root(), room)
 
 
 def _post_to_room(room_id, body, repo=None):
@@ -217,7 +220,11 @@ def _post_to_room(room_id, body, repo=None):
     import json
     import urllib.error
     import urllib.request
-    base, secret = _load_gateway(repo)
+    try:
+        base, secret = _load_gateway(repo, room_id)
+    except RuntimeError as e:
+        print(f"cron-notify: {e}", file=sys.stderr)
+        return None
     if not base:
         return None
     req = urllib.request.Request(
@@ -350,7 +357,8 @@ def main(argv=None):
              "— e.g. cron-room detail linked into the owner's active channel.",
     )
     ap.add_argument("--event-id", default="", help="cron-room event to deep-link to")
-    ap.add_argument("--via", default="ag2.space")
+    ap.add_argument("--via", default=None,
+                    help="matrix.to via server (default: the linked room's own server)")
     ap.add_argument("--state-file", default="",
                     help="JSON rate-limit state (cron→last-ping epoch). Default: "
                          "<workspace>/state/cron-notify-cooldown.json — omitting it "

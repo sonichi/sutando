@@ -52,3 +52,30 @@ for k, v in cfg.items():
 ' "$m"
   done
 }
+
+# Prints each enabled skill's "claude_plugin" directory, NUL-terminated, for
+# the Claude adapter's --plugin-dir. Only a real directory inside the skill.
+skill_manifest_claude_plugins() {
+  local repo="$1" py="$2" m
+  [ -n "$py" ] && [ -x "$py" ] || return 0
+  for m in "$repo"/skills/*/manifest.json; do
+    [ -f "$m" ] || continue
+    "$py" -c '
+import json, os, sys
+
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+rel = data.get("claude_plugin")
+if data.get("enabled") is not True or not isinstance(rel, str) or not rel:
+    sys.exit(0)
+skill = os.path.realpath(os.path.dirname(sys.argv[1]))
+path = os.path.realpath(os.path.join(skill, rel))
+if not path.startswith(skill + os.sep) or not os.path.isdir(path):
+    print(f"skill-manifest-config: {sys.argv[1]}: ignoring claude_plugin {rel!r}", file=sys.stderr)
+    sys.exit(0)
+sys.stdout.write(path + "\0")
+' "$m"
+  done
+}

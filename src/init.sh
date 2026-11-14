@@ -93,17 +93,6 @@ create_dir_if_missing() {
   fi
 }
 
-# Repo-rooted copy helper — for shipping example configs from the checkout
-# into a stable location. Used today only for skills/schedule-crons/crons.json
-# which lives in the repo, NOT the workspace.
-copy_if_missing() {
-  local src="$1"; local dst="$2"
-  if [ ! -f "$REPO/$dst" ] && [ -f "$REPO/$src" ]; then
-    cp "$REPO/$src" "$REPO/$dst"
-    echo "  ✓ created $dst (from $src)"
-  fi
-}
-
 # One-time migration of stale repo-root runtime state into $WORKSPACE. Fires
 # only when the migration sentinel is absent — same idempotent posture as
 # workspace_default.py's _migrate_from_legacy (PR #762). Non-destructive on
@@ -287,12 +276,6 @@ tier1() {
   # there by workspace_default.py + dashboard/health-check readers expect it
   # at WORKSPACE_DIR / "build_log.md". Not seeded here.
 
-  create_file_if_missing "pending-questions.md" \
-    "# Pending Questions
-
-_(none open)_
-"
-
   # Status files live under state/ (the workspace root is structural —
   # directories only). create_file_if_missing mkdir's the parent.
   create_file_if_missing "state/contextual-chips.json" \
@@ -307,8 +290,7 @@ _(none open)_
     "{\"connected\":false,\"ts\":$(date +%s)}
 "
 
-  # crons.json — copy from the example if present
-  copy_if_missing "skills/schedule-crons/crons.example.json" "skills/schedule-crons/crons.json"
+  # No crons file here: /schedule-crons seeds hosts/<host>/crons.json without opt-in jobs.
 }
 
 # --- Tier 2: preflight (warn, don't block) ---

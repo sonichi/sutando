@@ -104,7 +104,7 @@ if ($missing -eq 1) {
 function Install-WindowsDependencies($repo) {
     if (-not (Test-Path (Join-Path $repo 'node_modules'))) {
         Write-Host "  Installing npm dependencies..."
-        # The pinned bodhi package includes dist; its POSIX lifecycle hook fails under cmd.exe.
+        # The pinned npm bodhi package ships dist; lifecycle scripts stay skipped on Windows.
         npm ci --ignore-scripts
         if ($LASTEXITCODE -ne 0) { throw 'npm ci --ignore-scripts failed' }
         Write-Host "  + Dependencies installed"

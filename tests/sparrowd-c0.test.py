@@ -17,9 +17,15 @@ import threading
 import time
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
 
+from ag2_sparrow.control_socket import control_socket_path  # noqa: E402
 from ag2_sparrow.sparrowd import (  # noqa: E402
     ControlServer, SingleInstance, Supervisor, WorkerSpec)
 
@@ -185,7 +191,7 @@ with tempfile.TemporaryDirectory() as td6:
     from ag2_sparrow.sparrowd import run as _run
     t6 = Path(td6)
     w6 = t6 / "w.py"; w6.write_text("import time\nwhile True: time.sleep(0.2)\n")
-    sock6 = t6 / "state" / "sparrowd.sock"
+    sock6 = control_socket_path(t6 / "state")
 
     def stop_when_up():
         if not wait_for(sock6.exists, 8):
@@ -262,7 +268,7 @@ raise SystemExit(run([WorkerSpec("w", [sys.executable, {str(w)!r}])], {str(t2 / 
 """)
     proc = subprocess.Popen([sys.executable, str(runner)],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    sock = t2 / "state" / "sparrowd.sock"
+    sock = control_socket_path(t2 / "state")
     check(wait_for(sock.exists, 8), "run(): control socket appears")
 
     def ask2(payload):
@@ -317,10 +323,12 @@ check(len(_specs) == 1 and _specs[0].name == "remote-gateway-bridge",
 check(Path(_specs[0].argv[1]).exists(),
       "the spec's target script exists at the resolved path")
 _calls = []
-_l.run = lambda specs, sd: (_calls.append((specs, sd)), 0)[1]
+_l.run = lambda specs, sd, **kw: (_calls.append((specs, sd, kw)), 0)[1]
 _l.external_supervisor = lambda marker: None  # guard has its own tests below
 check(_l.main() == 0 and _calls and str(_calls[0][1]).endswith("state/sparrowd"),
       "main() wires worker_specs into run with the workspace state dir")
+check(_calls and callable(_calls[0][2].get("rescan")) and _calls[0][2].get("rescan_s") == 30.0,
+      "main() hands run the declaration rescan (every 30s by default)")
 
 # adapter edge: forbidden set derives from the adapter's specs so the
 # guard grows with the worker list; static tokens have no spec-side source.

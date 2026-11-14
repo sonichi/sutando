@@ -46,6 +46,29 @@ class Normalization(unittest.TestCase):
         # No blanket digit stripping (owner review): a bare number is content until a trace says otherwise.
         self.assertIn("run 42", n)
 
+    def test_a_compound_duration_is_one_field(self):
+        self.assertEqual(w.normalize("(12s · esc to interrupt)"), w.normalize("(1h 3m 12s · esc to interrupt)"))
+        self.assertEqual(w.normalize("took 3.5s"), "took <dur>")
+
+    def test_spelled_out_durations_are_one_field(self):
+        self.assertEqual(w.normalize("Retrying in 5 seconds"), w.normalize("Retrying in 4 seconds"))
+        self.assertEqual(w.normalize("waited 2 minutes 1 second"), "waited <dur>")
+
+    def test_the_spinner_lines_cycling_glyph_is_not_a_new_state(self):
+        frames = [f"{g} Hatching… (9s · ↓ 1.2k tokens · esc to interrupt)" for g in "✻✶✳✢·✽*"]
+        self.assertEqual(len({w.state_id(f) for f in frames}), 1)
+        self.assertNotEqual(w.state_id("✻ Hatching… (9s)"), w.state_id("✻ Cooking… (9s)"))
+
+    def test_a_hyphenated_spinner_verb_cycles_its_glyph_without_a_new_state(self):
+        for verb in ("Dilly-dallying", "Re-ticulating", "Topsy-turvying"):
+            with self.subTest(verb=verb):
+                frames = [f"{g} {verb}… (9s · ↓ 1.2k tokens · esc to interrupt)" for g in "✻✶✳✢·✽*"]
+                self.assertEqual(len({w.state_id(f) for f in frames}), 1)
+
+    def test_a_markdown_bullet_is_content_not_a_spinner(self):
+        self.assertNotEqual(w.state_id("* Fix the parser\n"), w.state_id("· Fix the parser\n"))
+        self.assertIn("* Fix the parser", w.normalize("* Fix the parser"))
+
     def test_semantic_digits_are_progress_not_noise(self):
         self.assertNotEqual(w.state_id("editing migration_41.sql\n"), w.state_id("editing migration_42.sql\n"))
         self.assertNotEqual(w.state_id("processing shard 17\n"), w.state_id("processing shard 18\n"))
@@ -200,6 +223,27 @@ class Classifier(unittest.TestCase):
         entries = [{"ts": 0.0, "state": "t", "raw_state": "t", "patterns": ["timeout"]}] + \
                   [{"ts": 60.0 * i, "state": "i", "raw_state": "i", "patterns": []} for i in range(1, 12)]
         self.assertEqual(w.classify_window(entries, (False, ""), 660.0)["kind"], "idle")
+
+    def test_a_tool_status_line_carrying_a_timeout_setting_is_not_a_timeout(self):
+        for line in ("  \u23bf  Monitor started \u00b7 task btr403775 \u00b7 timeout 1800s",
+                     "Monitor started \u00b7 task b1 \u00b7 timeout 30s", "timeout=600", "timeout: 30",
+                     "Bash(sleep 5) timeout: 600000"):
+            self.assertNotIn("timeout", w.matched_patterns([line]), line)
+        for line in ("Request timed out", "API Error: Request timed out.", "Connection error: timed out",
+                     "timeout of 30000ms exceeded", "command timed out after 30s", "timed out 3 times",
+                     "Timeout 30000ms exceeded", "Operation timed out: 60", "Error: timeout 30s exceeded"):
+            self.assertIn("timeout", w.matched_patterns([line]), line)
+
+    def test_two_frames_with_only_the_monitor_line_are_not_a_retry_loop(self):
+        frame = IDLE + "  \u23bf  Monitor started \u00b7 task btr403775 \u00b7 timeout 1800s\n"
+        self.assertNotEqual(w.classify([frame, frame], False, 60)["kind"], "retry-loop")
+        with tempfile.TemporaryDirectory() as d:
+            entries = []
+            for t in (0.0, 60.0):
+                entries = w.append_window(Path(d), frame, t)
+            v = w.classify_window(entries, (False, ""), 60.0)
+        self.assertNotEqual(v["kind"], "retry-loop")
+        self.assertEqual(v["matched_patterns"], [])
 
     def test_retry_text_must_be_current_and_recurrent(self):
         # retry-loop = low novelty AND retry text that is current and recurrent
@@ -1138,6 +1182,9 @@ class LiveParkedBanner(unittest.TestCase):
         ("compacting", "Compacting conversation…"),
         ("needs-login", "Please log in to continue"),
         ("needs-login", "Session expired. Run /login"),
+        ("needs-login", "  ⎿  Login expired · Please run /login"),
+        ("needs-login", "OAuth access token has expired · Please run /login"),
+        ("needs-login", "Not logged in · Please run /login"),
         ("quota-limit", "You have hit your usage limit · resets 3pm"),
         ("out-of-credits", "Credit balance is too low"),
         ("awaiting-input", "Waiting for your approval"),
@@ -1150,6 +1197,9 @@ class LiveParkedBanner(unittest.TestCase):
         "the network error we saw yesterday was different",
         "I logged in to continue the review",
         "the usage limit is documented here",
+        "Login expired is what the banner said",
+        "not logged in yet, will retry",
+        "the OAuth access token has expired, so I ran /login and it worked fine",
     )
 
     def test_each_live_banner_is_found_with_its_family_and_name(self):

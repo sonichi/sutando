@@ -19,6 +19,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 
 
@@ -100,6 +105,10 @@ import worker_picker_commands as wpc  # noqa: E402
 check("worker_picker_commands lists channel_kind as a below-task writer field", "channel_kind" in wpc._WRITER_BELOW_TASK)
 
 print()
+_t = _write(channel_kind="dm")
+check("the writer declares task_layout: mid above task:",
+      "\ntask_layout: mid\ntask: " in _t, _t)
+
 if failures:
     print(f"FAILED ({len(failures)}): " + ", ".join(failures))
     sys.exit(1)

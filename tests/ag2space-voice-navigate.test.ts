@@ -31,10 +31,12 @@ const {
 } = await plugin('navigate-protocol.ts');
 const { SESSION_CONTEXT_TYPE, SESSION_CONTEXT_CAPABILITY_MAX_CHARS, SESSION_CONTEXT_MAX_CAPABILITIES, parseSessionContextCapabilities } = await plugin('session-context.ts');
 const {
-	navigateUi, navigateUiTool, navigateUiAvailable, installVoiceNavigateClient, resolveUiNavigated, failPendingNavigations, pendingNavigationCount,
+	navigateUi, navigateUiTool, navigateUiAvailable, enabledConnectionExists, setConnectionProbe, installVoiceNavigateClient, resolveUiNavigated, failPendingNavigations, pendingNavigationCount,
 	NAVIGATE_UI_TIMEOUT_MS, NAVIGATE_UI_UNSUPPORTED_MESSAGE, NAVIGATE_UI_CLIENT_OUTDATED_MESSAGE, NAVIGATE_UI_ROOM_QUERY_MISSING_MESSAGE, NAVIGATION_PROMPT_RULE,
 } = await plugin('navigate.ts');
 const pluginTools = await plugin('tools.ts');
+const { pythonOnPath, resetCacheForTests } = await import('../src/python-binary.js');
+const { CURRENT_ROOM_PROMPT_RULE, CURRENT_ROOM_TURN_CHECK_RULE, setVoiceRoomVerifier } = await plugin('room-binding.ts');
 type SessionContextFrame = Record<string, unknown> & { version: number };
 /** The frame the AG2 Space client sends (webapp voiceRoomBinding.ts), before capabilities are added. */
 const buildSessionContextFrame = (ctx: { roomId: string; roomName?: string } | null): SessionContextFrame => ctx
@@ -402,18 +404,24 @@ describe('navigate_ui exposure — declared only where a client can answer it', 
 		getSecondsSinceLastTurn: () => null,
 	});
 	const OVERRIDES = { standIdentityJson: '{}', voiceContext: '', repoUrl: 'https://example.invalid', voiceAgentContext: '' };
-	const surfaceWith = (env: Record<string, string>) => {
+	const surfaceWith = (env: Record<string, string>, connection = false) => {
 		const home = mkdtempSync(join(tmpdir(), 'sutando-navigate-surface-'));
 		const saved = { ...process.env };
 		process.env.CLAUDE_CONFIG_DIR = home;
 		for (const k of ['REMOTE_TASK_TOKEN', 'AG2_REMOTE_TOKEN']) delete process.env[k];
 		Object.assign(process.env, env);
+		setConnectionProbe(() => connection);
 		try { return pluginTools.voiceSurface(); } finally {
+			setConnectionProbe(null);
 			for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k];
 			Object.assign(process.env, saved);
 			rmSync(home, { recursive: true, force: true });
 		}
 	};
+
+	it('an install with only a connection row (no legacy token) offers navigation', () => {
+		assert.deepEqual(surfaceWith({}, true).tools.map((t: { name: string }) => t.name), ['navigate_ui', 'current_room']);
+	});
 
 	it('the shared tool tables never carry it: phone calls and other installs get no such tool', async () => {
 		const { inlineTools, ownerOnlyTools, anyCallerTools } = await import('../src/inline-tools.js');
@@ -426,38 +434,90 @@ describe('navigate_ui exposure — declared only where a client can answer it', 
 	it('without the channel the skill contributes no tool and no rule; with it, both reach the prompt', async () => {
 		const { buildInstructions } = await import('../src/voice-agent-config.js');
 		const offSurface = surfaceWith({});
-		assert.deepEqual([offSurface.tools, offSurface.promptRules], [[], []]);
+		assert.deepEqual([offSurface.tools, offSurface.promptRules, offSurface.answeringTools, offSurface.turnCheckRules], [[], [], [], []]);
 		for (const off of [buildInstructions(ctx(offSurface) as never, OVERRIDES), buildInstructions(ctx() as never, OVERRIDES)]) {
 			assert.ok(!off.includes('NAVIGATION:'));
 			assert.ok(!off.includes('navigate_ui'));
+			assert.ok(!off.includes('current_room'));
 		}
 		const onSurface = surfaceWith({ REMOTE_TASK_TOKEN: 'tok' });
-		assert.deepEqual(onSurface.tools.map((t: { name: string }) => t.name), ['navigate_ui']);
-		assert.deepEqual(onSurface.promptRules, [NAVIGATION_PROMPT_RULE]);
+		assert.deepEqual(onSurface.tools.map((t: { name: string }) => t.name), ['navigate_ui', 'current_room']);
+		assert.deepEqual(onSurface.promptRules, [NAVIGATION_PROMPT_RULE, CURRENT_ROOM_PROMPT_RULE]);
+		assert.deepEqual(onSurface.answeringTools, ['current_room'], 'a turn current_room answers is not also sent to the core');
+		assert.deepEqual(onSurface.turnCheckRules, [CURRENT_ROOM_TURN_CHECK_RULE]);
 		const lines = buildInstructions(ctx(onSurface) as never, OVERRIDES).split('\n');
 		assert.equal(lines.filter(l => l.startsWith('- NAVIGATION: ')).length, 1);
 		const rule = lines.findIndex(l => l.startsWith('- NAVIGATION: '));
-		assert.ok(lines[rule - 1].startsWith('- For SIMPLE actions') && lines[rule + 1].startsWith('- For IN-PLACE EDITS'), 'where the rule has always sat');
+		assert.ok(lines[rule - 1].startsWith('- For SIMPLE actions') && lines[rule + 1].startsWith('- WHERE YOU ARE: ') && lines[rule + 2].startsWith('- For IN-PLACE EDITS'), 'where the rules have always sat');
 		assert.ok(lines.some(l => l.startsWith('- navigate_ui: ') && l.endsWith('. Instant.')), 'listed with the instant tools');
-		assert.ok(lines.some(l => l.includes(', navigate_ui — call these directly')), 'and in the joined names line');
+		assert.ok(lines.some(l => l.startsWith('- current_room: The AG2 Space room this voice session is docked in right now') && l.endsWith('. Instant.')));
+		assert.ok(lines.some(l => l.includes(', navigate_ui, current_room — call these directly')), 'and in the joined names line');
+	});
+
+	it('the declared current_room reads the binding setup() wired to the client\'s frames', async () => {
+		setVoiceRoomVerifier(async (room: string) => ({ room_id: room, verified: true, reason: 'joined', checked_at: Date.now() / 1000 }));
+		const frameHandlers: Array<(f: Record<string, unknown>) => unknown> = [];
+		const goneHandlers: Array<() => void> = [];
+		pluginTools.setup({
+			session: {}, injectText: () => {}, injectContext: () => {},
+			clientAttached: () => true, sendClientFrame: () => true,
+			onClientFrame: (h: (f: Record<string, unknown>) => unknown) => { frameHandlers.push(h); },
+			onClientDisconnected: (h: () => void) => { goneHandlers.push(h); },
+			setVoiceSessionOrigin: () => {}, getVoiceSessionOrigin: () => null, setVoiceTaskOriginResolver: () => {},
+		});
+		const tool = surfaceWith({ REMOTE_TASK_TOKEN: 'tok' }).tools.find((t: { name: string }) => t.name === 'current_room');
+		const ask = () => tool.execute({}, {} as never);
+		frameHandlers.forEach(h => h(buildSessionContextFrame({ roomId: '!wired:ag2.space', roomName: 'Wired' })));
+		await delay(5);
+		assert.deepEqual(await ask(), { docked: true, room: 'Wired' });
+		goneHandlers.forEach(h => h());
+		assert.deepEqual(await ask(), { docked: false, room: null }, 'the client leaving releases the room');
+		setVoiceRoomVerifier(null);
 	});
 
 	it('navigateUiAvailable: a gateway token in the env or in channels/ag2space/.env, nothing else', () => {
 		const home = mkdtempSync(join(tmpdir(), 'sutando-navigate-available-'));
 		const saved = process.env.CLAUDE_CONFIG_DIR;
 		process.env.CLAUDE_CONFIG_DIR = home;
+		const none = () => false;
 		try {
-			assert.equal(navigateUiAvailable({}), false, 'no channel dir at all');
+			assert.equal(navigateUiAvailable({}, none), false, 'no channel dir at all');
+			assert.equal(navigateUiAvailable({}, () => true), true, 'an enabled connection row alone');
 			mkdirSync(join(home, 'channels', 'ag2space'), { recursive: true });
 			writeFileSync(join(home, 'channels', 'ag2space', '.env'), 'REMOTE_TASK_URL=https://gw.example\nREMOTE_TASK_TOKEN=\n');
-			assert.equal(navigateUiAvailable({}), false, 'a channel file with no token is not a provisioned channel');
+			assert.equal(navigateUiAvailable({}, none), false, 'a channel file with no token is not a provisioned channel');
 			writeFileSync(join(home, 'channels', 'ag2space', '.env'), 'REMOTE_TASK_URL=https://gw.example\nAG2_REMOTE_TOKEN=tok\n');
-			assert.equal(navigateUiAvailable({}), true);
+			assert.equal(navigateUiAvailable({}, none), true);
 			rmSync(join(home, 'channels'), { recursive: true, force: true });
-			assert.equal(navigateUiAvailable({ REMOTE_TASK_TOKEN: 'tok' }), true, 'env wins without a file');
+			assert.equal(navigateUiAvailable({ REMOTE_TASK_TOKEN: 'tok' }, none), true, 'env wins without a file');
 		} finally {
 			if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = saved;
 			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	it('enabledConnectionExists asks the connections owner: an enabled row counts, a parked or disabled one does not', () => {
+		const ws = mkdtempSync(join(tmpdir(), 'sutando-navigate-connections-'));
+		const row = (instance: string, server: string, extra: Record<string, unknown>) => ({
+			server, instance, gateway_url: `https://chat.${server}`, token_ref: `AG2_REMOTE_TOKEN_${instance.toUpperCase().replace(/-/g, '_')}`,
+			primary: false, added_by: 'login', added_at: '2026-10-01T00:00:00Z', verified: true, server_source: 'identity', ...extra,
+		});
+		const write = (rows: unknown[]) => writeFileSync(join(ws, 'state', 'connections.json'), JSON.stringify({ schema_version: 1, connections: rows }));
+		// A Linux runner's /usr/bin/python3 reads as the macOS stub; name the interpreter outright.
+		const savedPy = process.env.SUTANDO_PY;
+		process.env.SUTANDO_PY = pythonOnPath() ?? '';
+		resetCacheForTests();
+		try {
+			assert.equal(enabledConnectionExists(ws), false, 'no record');
+			mkdirSync(join(ws, 'state'), { recursive: true });
+			write([row('ag2-space', 'ag2.space', { parked: true }), row('dev-s-space', 'dev.s.space', { disabled: true })]);
+			assert.equal(enabledConnectionExists(ws), false, 'parked and disabled rows serve nothing');
+			write([row('s-space', 's.space', { primary: true })]);
+			assert.equal(enabledConnectionExists(ws), true, 'an s.space-only install');
+		} finally {
+			if (savedPy === undefined) delete process.env.SUTANDO_PY; else process.env.SUTANDO_PY = savedPy;
+			resetCacheForTests();
+			rmSync(ws, { recursive: true, force: true });
 		}
 	});
 

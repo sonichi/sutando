@@ -29,6 +29,11 @@ Discord bridge, and touches no real config, token, or workspace path.
 Run: python3 tests/dm-result-adoption-gap.test.py
 """
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os

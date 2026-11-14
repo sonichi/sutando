@@ -5,6 +5,11 @@ Run: python3 tests/discord-ingress-identity.test.py   (stdlib only)
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import os
 import re
 import sys

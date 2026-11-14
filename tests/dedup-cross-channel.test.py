@@ -68,6 +68,14 @@ class DedupCrossChannel(unittest.TestCase):
         body = "task: mentions channel_id: 123 inline but no real field\n"
         self.assertIsNone(dedup_cross_channel_target(ASK_CH, body))
 
+    def test_telegram_chat_id_is_a_destination(self):
+        self.assertIsNone(dedup_cross_channel_target(-1001, "chat_id: -1001\n"))
+        self.assertEqual(dedup_cross_channel_target(-1001, "chat_id: -1002\n"), "-1002")
+
+    def test_unknown_asking_destination_is_not_a_mismatch(self):
+        for destination in (None, ""):
+            self.assertIsNone(dedup_cross_channel_target(destination, _holder(HOLDER_CH)))
+
     def test_parse_markers_still_yields_deduped_extra(self):
         # Guard the contract this feature relies on: deduped → extra = holder id.
         r = parse_markers("[deduped: task-holder]")

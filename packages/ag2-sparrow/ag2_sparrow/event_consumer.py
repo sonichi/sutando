@@ -21,15 +21,13 @@ import json
 import os
 import time
 
+from . import diagnostics
 from .chat_secret_filter import filter_chat_secrets
+from .local_task_protocol import local_time_value
 
 MEANINGFUL_TYPES = frozenset({
     "message.created", "message.edited", "reaction.added",
     "member.joined", "member.left",
-    # artifact.updated (be#190, deployed 2026-07-24): vault/doc writes fan out
-    # as events — a doc change in an observed room is exactly the kind of
-    # ambient activity taskify should batch for the Core's attention.
-    "artifact.updated",
 })
 
 # Mirrors the bridge's in-band block (defense-in-depth, not a boundary — the
@@ -99,7 +97,7 @@ class TaskifyHandler:
             self.last_path = self._promote(room)
         except Exception as e:  # noqa: BLE001 — isolated; retried on re-drain
             self._log(f"event-consumer: promotion failed for {room} "
-                      f"(kept for retry): {e}")
+                      f"(kept for retry): {diagnostics.describe(e)}")
             return []
         settled = list(self._seen.get(room) or ())
         self._batch[room] = []
@@ -140,6 +138,7 @@ class TaskifyHandler:
         body = "\n".join([
             f"id: {task_id}",
             "timestamp: " + time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "local_time: " + local_time_value(),
             f"task: [taskify] {n} room events — review and act if needed "
             f"(promoted from {n} subscribed events in {room})",
             "source: events-promotion",

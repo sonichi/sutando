@@ -1,0 +1,21 @@
+{
+  "name": "learning-window",
+  "enabled": false,
+  "access_tier": "owner",
+  "description": "Optional dispatcher-owned collection receipts; configure explicit scope capabilities before use.",
+  "config": {
+    "capabilities": {},
+    "bootstrap_ms": null,
+    "pages": 20,
+    "collection_timeout": 600,
+    "consumer_timeout": 1800,
+    "consumer_argv": [],
+    "consumer_prompt": "",
+    "proposal_stores": null,
+    "proposal_check_argv": null,
+    "document_readback_argv": null
+  },
+  "version": "0.1.0",
+  "owner": "Rui",
+  "stability": "experimental"
+}

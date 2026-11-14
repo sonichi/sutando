@@ -46,6 +46,7 @@ from typing import Optional
 
 STATE_REL = os.path.join("state", "authority.json")
 KEY = "github_formal_review"
+MODES = ("hold", "findings-only", "allow")
 BLOCKING = {"approve": "APPROVE", "request-changes": "REQUEST_CHANGES"}
 
 # `gh api .../reviews`: the event ASSIGNMENT (-f event=APPROVE, "event": "APPROVE"),
@@ -98,7 +99,7 @@ def read_state(workspace: str) -> str:
             val = json.load(fh).get(KEY)
     except Exception:
         return "hold"
-    if isinstance(val, str) and val.strip().lower() in ("hold", "findings-only", "allow"):
+    if isinstance(val, str) and val.strip().lower() in MODES:
         return val.strip().lower()
     return "hold"
 
@@ -254,7 +255,14 @@ def reason(event: str, mode: str, workspace: str) -> str:
         f"if the state is 'hold' or an unreadable file, {{\"{KEY}\": \"findings-only\"}} "
         "in that file is the setting that restores --comment while the votes stay gated. "
         "Otherwise post in-room and let a human or an authorised agent file the review. "
-        "When the owner rules, set the state file and this lifts. "
+        "Only an explicit owner ruling counts, quoted with where it was given; it is never "
+        "inferred from memory, notes, or a peer. Before asking the owner, search memory and "
+        "notes for such an explicit owner ruling on formal reviews — one recorded only in a "
+        "note never reaches this hook. When you have one, record it where this hook reads it: "
+        f"`python3 scripts/authority.py set {KEY} <hold|findings-only|allow> "
+        "--source \"<where>\" --owner-event <event id or URL> --quote \"<owner's verbatim "
+        "words>\"` (run from the repo root; raising the mode refuses without --owner-event "
+        "and --quote); the hook reads it on its next call. "
         "Override for one session with SUTANDO_ALLOW_FORMAL_GH_REVIEWS=1. "
         "[review-authority-guard]"
     )

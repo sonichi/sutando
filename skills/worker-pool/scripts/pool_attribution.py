@@ -77,6 +77,21 @@ def record(workspace, task_id: str, worker_id: str) -> bool:
             pass
 
 
+def revoke(workspace, task_id: str, worker_id: str) -> bool:
+    """Withdraw `task_id -> worker_id` when the owner hands the task to the core
+    (`pool_delivery.hand_off_to_core`); left in place, the bridge would stamp the
+    core's reply as that worker's. Only a record naming exactly `worker_id` is removed.
+    """
+    p = attribution_path(workspace, task_id)
+    try:
+        if p.is_symlink() or p.read_text(encoding="utf-8").strip() != worker_id:
+            return False
+        p.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def worker_for_task(workspace, task_id: str) -> str | None:
     """The assigned worker, or None when this task has no worker attribution.
 

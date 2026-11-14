@@ -21,6 +21,11 @@ Run: python3 tests/health-check-conversation-server-pin-composes.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import tempfile
@@ -56,7 +61,10 @@ def _row(pinned: bool, stale: bool = False) -> tuple:
         env = repo / ".env"
         # No TWILIO_WEBHOOK_URL: the tunnel block is entered but does no network.
         # A tunnel URL so the ngrok probe is reachable — it is the observable.
+        # All three the phone gate asks for (twilio_configured): without the
+        # number the server exits, so the check is not run and there is no row.
         env.write_text("TWILIO_ACCOUNT_SID=ACtest\nTWILIO_AUTH_TOKEN=tok\n"
+                       "TWILIO_PHONE_NUMBER=+14155550100\n"
                        "TWILIO_WEBHOOK_URL=https://example.ngrok.io/hook\n")
 
         mod = _load()

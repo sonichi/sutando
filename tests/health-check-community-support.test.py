@@ -10,6 +10,11 @@ Run: python3 tests/health-check-community-support.test.py  (exit 0/1)
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import sys
 from pathlib import Path

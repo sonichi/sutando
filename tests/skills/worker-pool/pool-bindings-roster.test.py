@@ -170,8 +170,8 @@ class TestLabelResolution(unittest.TestCase):
         r = {"workers": {"a" * 32: {"state": "live", "label": "dup"},
                          "b" * 32: {"state": "live", "label": "dup"}},
              "bindings": {}}
-        self.assertEqual(pr.targets_for(r, "", "dup"), ["dup"])
-        self.assertEqual(pr.unknown_targets(r, ["dup"]), ["dup"])
+        with self.assertRaises(pr.AmbiguousWorkerName):
+            pr.targets_for(r, "", "dup")
 
     def test_a_requested_worker_overrides_the_binding(self):
         r = dict(self.ROSTER, bindings={"!room:x": "b" * 32})

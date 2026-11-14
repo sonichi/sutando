@@ -35,28 +35,20 @@ if [ -n "$OUT" ]; then
 	for f in meta.txt git-log.txt git-status.txt build_log-tail.md health.txt quota.txt; do
 		[ -f "$OUT/$f" ] && pass "expected file exists: $f" || fail "missing file: $f"
 	done
-	# pending-questions.md is OPTIONAL: gather.sh:140-143 probes hosts/<host>/,
-	# then the workspace root, then the repo root, and `cp … || true` produces
-	# nothing when all three are absent. Requiring it unconditionally made this
-	# suite non-hermetic — green only on a host that happens to have the file,
-	# red in a clean worktree for behaviour the collector got right. The header
-	# already states the contract: "non-empty when source exists". Asserted BOTH
-	# ways so a genuinely missed copy still fails.
-	_pq_src=""
-	for _c in "$_TG_WS/hosts/$_TG_HOST/pending-questions.md" \
-	          "$_TG_WS/pending-questions.md" \
-	          "$_TG_REPO/pending-questions.md"; do
-		[ -f "$_c" ] && { _pq_src="$_c"; break; }
-	done
-	if [ -n "$_pq_src" ]; then
-		[ -f "$OUT/pending-questions.md" ] \
-			&& pass "pending-questions.md copied (source: ${_pq_src#"$_TG_WS/"})" \
-			|| fail "pending-questions.md MISSING despite a source at $_pq_src"
+	# Pending questions are read through src/pending_questions_reader.py list --json: the listing (or the
+	# reason it failed, in .err) is always produced; the retired .md never is.
+	if [ -s "$OUT/pending-questions.json" ]; then
+		python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$OUT/pending-questions.json" \
+			&& pass "pending-questions.json is a JSON listing" \
+			|| fail "pending-questions.json is not JSON"
 	else
-		[ -f "$OUT/pending-questions.md" ] \
-			&& fail "pending-questions.md present but NO source exists — where did it come from?" \
-			|| pass "pending-questions.md absent, correctly: no source in any of the 3 probed locations"
+		[ -f "$OUT/pending-questions.err" ] \
+			&& pass "pending-questions.json empty; the reason is in pending-questions.err" \
+			|| fail "neither pending-questions.json nor .err was produced"
 	fi
+	[ -f "$OUT/pending-questions.md" ] \
+		&& fail "pending-questions.md present — the retired file must not be gathered" \
+		|| pass "pending-questions.md not gathered (retired)"
 fi
 
 # Test 3: meta.txt contains window + repo

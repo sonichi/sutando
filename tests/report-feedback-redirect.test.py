@@ -25,6 +25,7 @@ RECEIVED: list[dict] = []
 
 class Handler(BaseHTTPRequestHandler):
     redirect_to: str | None = None
+    answer: bytes = b'{"ok":true}'
 
     def do_POST(self):  # noqa: N802
         body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
@@ -43,7 +44,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(b'{"ok":true}')
+        self.wfile.write(type(self).answer)
 
     def log_message(self, *a):  # silence
         pass
@@ -59,6 +60,7 @@ class TestRedirect(unittest.TestCase):
     def setUp(self):
         RECEIVED.clear()
         Handler.redirect_to = None
+        Handler.answer = b'{"ok":true}'
         self.srv, self.base = serve()
         self.addCleanup(self.srv.shutdown)
         self.host = urllib.parse.urlsplit(self.base).hostname
@@ -134,6 +136,36 @@ class TestRedirect(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as cm:
             rf.post_feedback(f"{self.base}/api/feedback", {"title": "x"}, "tok")
         self.assertEqual(cm.exception.code, 307)
+
+
+class TestReference(unittest.TestCase):
+    """The feedback API answers `{"ok": true, "id": <uuid>}`; the id is what the agent quotes back."""
+
+    setUp = TestRedirect.setUp
+
+    def test_the_answer_s_id_reaches_the_receipt(self):
+        Handler.answer = b'{"ok":true,"id":"5f0c-feedback-id"}'
+        receipt: dict = {}
+        self.assertEqual(rf.post_feedback(f"{self.base}/api/feedback", {"title": "x"}, "tok",
+                                          receipt=receipt), 200)
+        self.assertEqual(receipt, {"id": "5f0c-feedback-id"})
+        self.assertEqual(rf.reference_note(receipt), " Reference: 5f0c-feedback-id.")
+
+    def test_the_id_survives_a_redirect_hop(self):
+        Handler.redirect_to = f"{self.base}/api/feedback2"
+        Handler.answer = b'{"ok":true,"id":"after-the-hop"}'
+        receipt: dict = {}
+        rf.post_feedback(f"{self.base}/api/feedback", {"title": "x"}, "tok", receipt=receipt)
+        self.assertEqual(receipt["id"], "after-the-hop")
+
+    def test_an_answer_without_a_usable_id_is_still_a_filed_report(self):
+        for answer in (b'{"ok":true}', b"not json", b'{"ok":true,"id":42}', b"[]", b""):
+            Handler.answer = answer
+            receipt: dict = {}
+            self.assertEqual(rf.post_feedback(f"{self.base}/api/feedback", {"title": "x"}, "tok",
+                                              receipt=receipt), 200, answer)
+            self.assertIsNone(receipt["id"], answer)
+            self.assertEqual(rf.reference_note(receipt), "", answer)
 
 
 class TestTrustedHosts(unittest.TestCase):

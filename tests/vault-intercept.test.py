@@ -9,6 +9,11 @@ afterwards, so an unredirected run writes fake key names into the real
 `<workspace>/state/secret-vault/keys.json`.
 """
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import sys
@@ -126,6 +131,24 @@ class TestHermeticManifest(unittest.TestCase):
             with open(real) as f:
                 after = f.read()
         self.assertEqual(before, after, f"suite wrote the real manifest at {real}")
+
+
+class TestLookupVaultKey(unittest.TestCase):
+    """Only errSecItemNotFound reads as absent; any other failure raises, never None."""
+
+    def test_present_absent_and_unreadable(self):
+        found = MagicMock(returncode=0, stdout=b"sk-value\n")
+        with patch("vault_intercept.subprocess.run", return_value=found):
+            self.assertEqual(vault_intercept.lookup_vault_key("K"), "sk-value")
+        with patch("vault_intercept.subprocess.run", return_value=MagicMock(returncode=44, stdout=b"")):
+            self.assertIsNone(vault_intercept.lookup_vault_key("K"))
+        with patch("vault_intercept.subprocess.run", return_value=MagicMock(returncode=51, stdout=b"")):
+            with self.assertRaises(RuntimeError):
+                vault_intercept.lookup_vault_key("K")
+        import subprocess
+        with patch("vault_intercept.subprocess.run", side_effect=subprocess.TimeoutExpired("security", 5)):
+            with self.assertRaises(RuntimeError):
+                vault_intercept.lookup_vault_key("K")
 
 
 class TestNoVaultCommands(unittest.TestCase):
@@ -516,6 +539,32 @@ class TestKeychainInteraction(unittest.TestCase):
         self.assertEqual(args[w_idx + 1], value)
 
 
+class TestKeychainReadDeadline(unittest.TestCase):
+    """get_vault_key — `security` can block on a locked keychain's unlock
+    dialog; a reader on the startup / health-check path must read no answer
+    as "not present", not hang behind it (review of #4666)."""
+
+    def test_read_carries_a_deadline(self):
+        with patch("vault_intercept.subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout=b"value\n")) as mock_run:
+            self.assertEqual(vault_intercept.get_vault_key("MY_KEY"), "value")
+        self.assertEqual(mock_run.call_args.kwargs.get("timeout"), vault_intercept._KEYCHAIN_READ_TIMEOUT_S)
+        self.assertGreater(vault_intercept._KEYCHAIN_READ_TIMEOUT_S, 0)
+
+    def test_no_answer_within_the_deadline_is_not_present(self):
+        import subprocess as _sp
+        expired = _sp.TimeoutExpired(cmd=["security"], timeout=vault_intercept._KEYCHAIN_READ_TIMEOUT_S)
+        with patch("vault_intercept.subprocess.run", side_effect=expired):
+            with self.assertRaises(KeyError) as ctx:
+                vault_intercept.get_vault_key("MY_KEY")
+            self.assertIn("no answer", str(ctx.exception))
+            # The channel-token tier the bridges, startup.sh and health-check
+            # read through turns that KeyError into '' — the gate stays closed.
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+            import channel_token
+            self.assertEqual(channel_token.token_from_vault("MY_KEY"), "")
+
+
 class TestRedactVaultCommands(unittest.TestCase):
     """redact_vault_commands — scrubs vault patterns without touching Keychain."""
 
@@ -588,6 +637,308 @@ class TestErrorHandling(unittest.TestCase):
         self.assertIsInstance(result.failed, list)
 
 
+class TestWriterLock(unittest.TestCase):
+    """Every vault writer runs under writer_lock: with it held elsewhere, each entry point waits."""
+
+    def _waits_for_the_lock(self, label, entry):
+        import threading
+        done = threading.Event()
+        errors = []
+
+        def run():
+            try:
+                entry()
+            except BaseException as e:  # noqa: BLE001
+                errors.append(e)
+            done.set()
+        with _mock_store():
+            with vault_intercept.writer_lock():
+                t = threading.Thread(target=run)
+                t.start()
+                self.assertFalse(done.wait(0.3), f"{label} wrote while the writer lock was held")
+            self.assertTrue(done.wait(5), f"{label} never finished after the lock was released")
+            t.join(5)
+        self.assertEqual(errors, [], label)
+
+    def test_every_writer_entry_point_takes_the_lock(self):
+        import io
+        cli_spec = importlib.util.spec_from_file_location(
+            "secret_vault_cli", REPO / "skills" / "secret-vault" / "secret-vault.py")
+        cli = importlib.util.module_from_spec(cli_spec)
+        cli_spec.loader.exec_module(cli)
+        secret = "sk-" + "a" * 20 + "T3BlbkFJ" + "b" * 20
+
+        def cli_set():
+            with patch.object(sys, "stdin", io.StringIO("cli-value\n")), patch("builtins.print"):
+                cli.cmd_set("LOCK_CLI")
+
+        def cli_delete():
+            with patch("builtins.print"):
+                cli.cmd_delete("LOCK_CLI")
+        for label, entry in (("set_vault_key", lambda: vault_intercept.set_vault_key("LOCK_SET", "v")),
+                             ("delete_vault_key", lambda: vault_intercept.delete_vault_key("LOCK_SET")),
+                             ("chat interception", lambda: intercept_vault_commands(f"vault set LOCK_CHAT {secret}")),
+                             ("secret-vault CLI set", cli_set), ("secret-vault CLI delete", cli_delete)):
+            self._waits_for_the_lock(label, entry)
+
+    def test_every_entry_point_mutates_only_inside_the_one_writer_contract(self):
+        """Delegation: each entry's Keychain mutation and manifest write run with writer_lock held."""
+        import io
+        cli_spec = importlib.util.spec_from_file_location(
+            "secret_vault_cli", REPO / "skills" / "secret-vault" / "secret-vault.py")
+        cli = importlib.util.module_from_spec(cli_spec)
+        cli_spec.loader.exec_module(cli)
+        seen = []
+        real_register, real_deregister = vault_intercept._register_key, vault_intercept._deregister_key
+
+        def run(argv, **kw):
+            if argv[1] != "find-generic-password":
+                seen.append((argv[1], getattr(vault_intercept._WRITER, "depth", 0)))
+            return MagicMock(returncode=0, stdout=b"")
+
+        def register(key):
+            seen.append(("manifest", getattr(vault_intercept._WRITER, "depth", 0)))
+            real_register(key)
+
+        def deregister(key):
+            seen.append(("manifest", getattr(vault_intercept._WRITER, "depth", 0)))
+            real_deregister(key)
+        secret = "sk-" + "a" * 20 + "T3BlbkFJ" + "b" * 20
+        entries = (("set_vault_key", lambda: vault_intercept.set_vault_key("DELEG_SET", "v")),
+                   ("delete_vault_key", lambda: vault_intercept.delete_vault_key("DELEG_SET")),
+                   ("chat interception", lambda: intercept_vault_commands(f"vault set DELEG_CHAT {secret}")),
+                   ("CLI set", lambda: cli.cmd_set("DELEG_CLI")), ("CLI delete", lambda: cli.cmd_delete("DELEG_CLI")))
+        with patch("vault_intercept.subprocess.run", side_effect=run), \
+                patch.object(vault_intercept, "_register_key", register), \
+                patch.object(vault_intercept, "_deregister_key", deregister), \
+                patch.object(sys, "stdin", io.StringIO("cli-value\n")), patch("builtins.print"):
+            for label, entry in entries:
+                seen.clear()
+                entry()
+                self.assertTrue(seen and all(depth > 0 for _, depth in seen), (label, seen))
+
+    def test_the_lock_is_re_entrant_in_one_thread_and_never_takes_connections_lock(self):
+        with _mock_store(), vault_intercept.writer_lock(), vault_intercept.writer_lock():
+            vault_intercept.set_vault_key("LOCK_NESTED", "v")
+            vault_intercept.delete_vault_key("LOCK_NESTED")
+        self.assertEqual(getattr(vault_intercept._WRITER, "depth", 0), 0)
+        source = (REPO / "src" / "vault_intercept.py").read_text()
+        self.assertNotIn("connections", source.replace("connections.lock may take this", "")
+                         .replace("never takes connections.lock", ""), "a vault writer must not reach connections")
+
+    def test_the_lock_is_released_on_an_exception(self):
+        import threading
+        with self.assertRaises(ValueError):
+            with vault_intercept.writer_lock():
+                raise ValueError("boom")
+        self.assertEqual(getattr(vault_intercept._WRITER, "depth", 0), 0)
+        got = threading.Event()
+
+        def take():
+            with vault_intercept.writer_lock():
+                got.set()
+        t = threading.Thread(target=take)
+        t.start()
+        self.assertTrue(got.wait(5), "another holder takes it after the exception")
+        t.join(5)
+
+    def test_a_holder_killed_with_sigkill_leaves_no_held_lock(self):
+        import signal
+        import subprocess
+        import threading
+        code = ("import sys, time; sys.path.insert(0, sys.argv[1]); import vault_intercept as v;"
+                "v._manifest_path = lambda: sys.argv[2]; cm = v.writer_lock(); cm.__enter__();"
+                "print('held', flush=True); time.sleep(60)")
+        child = subprocess.Popen([sys.executable, "-c", code, str(REPO / "src"), vault_intercept._manifest_path()],
+                                 stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "held")
+            blocked = threading.Event()
+
+            def take():
+                with vault_intercept.writer_lock():
+                    blocked.set()
+            t = threading.Thread(target=take, daemon=True)
+            t.start()
+            self.assertFalse(blocked.wait(0.3), "the child holds it")
+            os.kill(child.pid, signal.SIGKILL if hasattr(signal, "SIGKILL") else signal.SIGTERM)
+            child.wait(5)
+            self.assertTrue(blocked.wait(5), "the kernel released the dead holder's lock")
+            t.join(5)
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+            child.stdout.close()
+
+    def test_neither_the_lock_file_nor_the_manifest_holds_a_secret_or_its_digest(self):
+        import hashlib
+        value = "sk-" + "q" * 40
+        with _mock_store():
+            vault_intercept.set_vault_key("NO_LEAK", value)
+        digests = {hashlib.sha256(value.encode()).hexdigest(), hashlib.md5(value.encode()).hexdigest()}
+        for path in (vault_intercept.writer_lock_path(), vault_intercept._manifest_path()):
+            body = open(path, encoding="utf-8", errors="replace").read()
+            self.assertNotIn(value, body, path)
+            for d in digests:
+                self.assertNotIn(d, body, path)
+        self.assertEqual(os.path.getsize(vault_intercept.writer_lock_path()), 0, "the lock file stays empty")
+
+    def test_a_lock_that_cannot_be_taken_fails_the_write(self):
+        with patch.object(vault_intercept, "writer_lock_path", return_value="/dev/null/no/writer.lock"), _mock_store():
+            with self.assertRaises(RuntimeError):
+                vault_intercept.set_vault_key("LOCK_FAIL", "v")
+            result = intercept_vault_commands("vault set LOCK_FAIL " + "sk-" + "a" * 20 + "T3BlbkFJ" + "b" * 20)
+        self.assertEqual(result.failed, ["LOCK_FAIL"], "the chat path redacts and reports a failed store")
+
+
+class TestWriterDeadlines(unittest.TestCase):
+    """A held writer lock or a hung `security` call fails the write closed within a bound."""
+
+    def _hold_in_child(self):
+        import subprocess
+        code = ("import sys, time; sys.path.insert(0, sys.argv[1]); import vault_intercept as v;"
+                "v._manifest_path = lambda: sys.argv[2]; cm = v.writer_lock(); cm.__enter__();"
+                "print('held', flush=True); time.sleep(60)")
+        child = subprocess.Popen([sys.executable, "-c", code, str(REPO / "src"), vault_intercept._manifest_path()],
+                                 stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (child.kill(), child.wait(), child.stdout.close()))
+        self.assertEqual(child.stdout.readline().strip(), "held")
+        return child
+
+    def _keys(self):
+        return set(vault_intercept._read_manifest())
+
+    def test_a_held_lock_times_out_and_the_write_fails_closed(self):
+        import time
+        self._hold_in_child()
+        with patch.object(vault_intercept, "_WRITER_LOCK_WAIT_S", 0.5), _mock_store() as run:
+            began = time.monotonic()
+            with self.assertRaises(vault_intercept.VaultBusy) as ctx:
+                vault_intercept.set_vault_key("DEADLINE_HELD", "v")
+            waited = time.monotonic() - began
+            result = intercept_vault_commands("vault set DEADLINE_CHAT " + "sk-" + "a" * 20 + "T3BlbkFJ" + "b" * 20)
+        self.assertLess(waited, 5, "the wait is bounded")
+        self.assertTrue(str(ctx.exception).startswith(vault_intercept.VaultBusy.CODE), str(ctx.exception))
+        self.assertEqual(ctx.exception.CODE, "vault_busy")
+        self.assertEqual(result.failed, ["DEADLINE_CHAT"], "the chat path redacts and reports a failed store")
+        self.assertFalse(run.called, "no Keychain call is made without the lock")
+        self.assertFalse({"DEADLINE_HELD", "DEADLINE_CHAT"} & self._keys(), "nothing reaches the manifest")
+        self.assertEqual(getattr(vault_intercept._WRITER, "depth", 0), 0)
+
+    def test_a_zero_wait_probe_refuses_at_once(self):
+        import time
+        self._hold_in_child()
+        began = time.monotonic()
+        with self.assertRaises(vault_intercept.VaultBusy):
+            with vault_intercept.writer_lock(0):
+                self.fail("taken while held")
+        self.assertLess(time.monotonic() - began, 0.5)
+        self.assertEqual(getattr(vault_intercept._WRITER, "depth", 0), 0)
+
+    def _hung_security(self, *flags):
+        """A `security` stand-in whose writes hang; `commits` makes a write land first, `find_hangs`
+        hangs the read-back too. The item lives in a file beside it."""
+        import stat
+        bindir = tempfile.mkdtemp(prefix="hung-security-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(bindir, ignore_errors=True))
+        for flag in flags:
+            open(os.path.join(bindir, flag), "w").close()
+        self.item = os.path.join(bindir, "item")
+        stub = os.path.join(bindir, "security")
+        with open(stub, "w") as f:
+            f.write(f"""#!/bin/sh
+D='{bindir}'; verb="$1"; shift; v=""
+while [ $# -gt 0 ]; do [ "$1" = "-w" ] && [ "$verb" = add-generic-password ] && v="$2"; shift; done
+case "$verb" in
+  find-generic-password) [ -f "$D/find_hangs" ] && exec sleep 30; [ -f "$D/item" ] && {{ cat "$D/item"; exit 0; }}; exit 44;;
+  add-generic-password) [ -f "$D/commits" ] && printf '%s' "$v" > "$D/item";;
+  delete-generic-password) [ -f "$D/commits" ] && rm -f "$D/item";;
+esac
+exec sleep 30
+""")
+        os.chmod(stub, stat.S_IRWXU)
+        return patch.dict(os.environ, {"PATH": bindir + os.pathsep + os.environ.get("PATH", "")})
+
+    def _deadlines(self):
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch.object(vault_intercept, "_KEYCHAIN_WRITE_TIMEOUT_S", 0.5))
+        stack.enter_context(patch.object(vault_intercept, "_KEYCHAIN_READ_TIMEOUT_S", 0.5))
+        return stack
+
+    def _lock_is_free(self):
+        import threading
+        got = threading.Event()
+
+        def take():
+            with vault_intercept.writer_lock():
+                got.set()
+        t = threading.Thread(target=take, daemon=True)
+        t.start()
+        free = got.wait(2)
+        t.join(5)
+        return free
+
+    def test_a_hung_security_write_times_out_and_leaves_the_lock_free(self):
+        import time
+        with self._hung_security(), self._deadlines():
+            began = time.monotonic()
+            with self.assertRaises(RuntimeError) as ctx:
+                vault_intercept.set_vault_key("DEADLINE_HUNG", "v")
+            self.assertLess(time.monotonic() - began, 5, "the security call is bounded")
+            self.assertTrue(str(ctx.exception).startswith(vault_intercept.KEYCHAIN_TIMEOUT_CODE), str(ctx.exception))
+            self.assertNotIn("DEADLINE_HUNG", self._keys(), "a timed-out store registers nothing")
+            vault_intercept._register_key("DEADLINE_KEEP")
+            open(self.item, "w").write("kept")
+            with self.assertRaises(RuntimeError) as gone:
+                vault_intercept.delete_vault_key("DEADLINE_KEEP")
+            self.assertTrue(str(gone.exception).startswith(vault_intercept.KEYCHAIN_TIMEOUT_CODE))
+            self.assertIn("DEADLINE_KEEP", self._keys(), "a timed-out delete keeps the manifest entry")
+        self.assertEqual(getattr(vault_intercept._WRITER, "depth", 0), 0)
+        self.assertTrue(self._lock_is_free(), "the lock is released after the timeout")
+        vault_intercept._deregister_key("DEADLINE_KEEP")
+
+    def test_a_store_that_lands_then_hangs_is_read_back_and_registered(self):
+        with self._hung_security("commits"), self._deadlines():
+            vault_intercept.set_vault_key("LANDED_SET", "v-set")
+            self.assertIn("LANDED_SET", self._keys(), "the manifest matches what the Keychain holds")
+            secret = "sk-" + "a" * 20 + "T3BlbkFJ" + "b" * 20
+            result = intercept_vault_commands(f"vault set LANDED_CHAT {secret}")
+        self.assertEqual((result.stored, result.failed), (["LANDED_CHAT"], []))
+        self.assertIn("LANDED_CHAT", self._keys())
+        for k in ("LANDED_SET", "LANDED_CHAT"):
+            vault_intercept._deregister_key(k)
+
+    def test_a_delete_that_lands_then_hangs_drops_the_manifest_entry(self):
+        with self._hung_security("commits"), self._deadlines():
+            vault_intercept._register_key("LANDED_DEL")
+            open(self.item, "w").write("v")
+            vault_intercept.delete_vault_key("LANDED_DEL")
+        self.assertNotIn("LANDED_DEL", self._keys())
+
+    def test_an_unreadable_read_back_is_state_unknown_and_changes_no_manifest(self):
+        with self._hung_security("commits", "find_hangs"), self._deadlines():
+            with self.assertRaises(RuntimeError) as ctx:
+                vault_intercept.set_vault_key("UNKNOWN_SET", "v-unknown")
+            vault_intercept._register_key("UNKNOWN_DEL")
+            with self.assertRaises(RuntimeError) as gone:
+                vault_intercept.delete_vault_key("UNKNOWN_DEL")
+        for e in (ctx.exception, gone.exception):
+            self.assertTrue(str(e).startswith(vault_intercept.KEYCHAIN_STATE_UNKNOWN_CODE), str(e))
+            self.assertNotIn("v-unknown", str(e))
+        self.assertNotIn("UNKNOWN_SET", self._keys())
+        self.assertIn("UNKNOWN_DEL", self._keys(), "an unknown delete keeps the entry, so no secret is stranded")
+        vault_intercept._deregister_key("UNKNOWN_DEL")
+        self.assertTrue(self._lock_is_free())
+
+    def test_the_lock_wait_outlasts_the_worst_legitimate_hold(self):
+        # update_token's hold: snapshot read, store + read-back, restore read, restore + read-back, final read.
+        worst = 2 * (vault_intercept._KEYCHAIN_WRITE_TIMEOUT_S + vault_intercept._KEYCHAIN_READ_TIMEOUT_S) \
+            + 3 * vault_intercept._KEYCHAIN_READ_TIMEOUT_S
+        self.assertGreater(vault_intercept._WRITER_LOCK_WAIT_S, worst)
+
+
 if __name__ == "__main__":
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
@@ -595,13 +946,17 @@ if __name__ == "__main__":
     # added here or it silently never runs (no error, just missing coverage).
     for cls in [
         TestNoVaultCommands,
+        TestWriterDeadlines,
         TestSingleVaultSet,
         TestUnrecognizedValueFailsClosed,
         TestMultipleVaultSets,
         TestHermeticManifest,
         TestKeychainInteraction,
+        TestKeychainReadDeadline,
+        TestLookupVaultKey,
         TestRedactVaultCommands,
         TestErrorHandling,
+        TestWriterLock,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
     runner = unittest.TextTestRunner(verbosity=2)

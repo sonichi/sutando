@@ -5,7 +5,9 @@ Every case here is a store that existed on a real host on 2026-08-28 and
 broke a prior revision: wrapped {quick_lookup:}, flat {people:}, MALFORMED
 yaml, roster-only, and a multi-host merge leaving one person under two keys.
 """
+import contextlib
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -67,6 +69,35 @@ class StoreShapes(unittest.TestCase):
                       roster=ROSTER)
             q, _ = lk.load(d)          # must not raise
             self.assertEqual(q, {})
+            rows = lk.load_roster(d)
+            hits = lk.match(rows, "john-the-dev")
+            self.assertEqual(hits[0]["agent_mxid"], "@sutando-rui:ag2.space")
+
+    def test_missing_pyyaml_degrades_to_roster(self):
+        # Each store has its OWN import, so a fixture writing one leaves the other
+        # unpinned; both warnings are asserted so neither degradation goes silent.
+        with tempfile.TemporaryDirectory() as t:
+            d = store(t, "people:\n    - id: present\n", roster=ROSTER)
+            (d / "entities.yaml").write_text("entities:\n  - entity_id: present\n")
+            saved = sys.modules.get("yaml", "absent")
+            sys.modules["yaml"] = None      # makes `import yaml` raise ImportError
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(err):
+                    q, ents = lk.load(d)    # must not raise
+            finally:
+                if saved == "absent":
+                    del sys.modules["yaml"]
+                else:
+                    sys.modules["yaml"] = saved
+            self.assertEqual(q, {})
+            self.assertEqual(ents, [])
+            warned = err.getvalue()
+            # Count, not substring: the quick-lookup warning does not name its file,
+            # so the entities one alone satisfies any shared-phrase assertion.
+            self.assertEqual(warned.count("PyYAML missing"), 2, warned)
+            self.assertIn("using roster only", warned, warned)
+            self.assertIn("entities.yaml", warned, warned)
             rows = lk.load_roster(d)
             hits = lk.match(rows, "john-the-dev")
             self.assertEqual(hits[0]["agent_mxid"], "@sutando-rui:ag2.space")

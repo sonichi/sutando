@@ -31,6 +31,12 @@ Deliberately: these cases never import plistlib themselves, so this file runs to
 completion on exactly the broken interpreter it describes. Only the
 no-regression case needs a real plist, and it skips when plistlib is missing.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import sys

@@ -23,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 from readiness_window_helpers import (  # noqa: E402
     watcher_env, handlers, workspace, publish, write_task, start, pump,
-    stop, wait_ready,
+    stop, wait_ready, feed_start,
 )
 
 FAILURES: list[str] = []
@@ -66,27 +66,31 @@ def scenario_resolver_publishes_between_refresh_and_decision():
 def scenario_runtime_dir_unwritable():
     """A must-handle config is published while the watcher's runtime dir cannot
     take the snapshot copy: the task is held, never announced, and handled once
-    the dir is writable again (the read-timeout tick retries the reload)."""
+    the dir is writable again and the config's next event runs the replay.
+    No tick exists: the feed emits the events, and the poll interval is far
+    beyond the test so only events can move the held task."""
     tmp, ws, b = workspace("ready-broken-")
     cfg = ws / "state" / "task-event-handler.json"
     log = tmp / "handler.log"
     h = handlers(tmp, log, (("hB", 3), ("hC", 4)))
     publish(cfg, h["hB"])
-    env = watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": "1"})
-    p = start(ws, env)
+    env = watcher_env(tmp, ws, b)
+    p, emit, real_tasks = feed_start(tmp, ws, b, env)
     out: list[str] = []
     runtime = None
     try:
-        wait_ready(ws)
         runtime = next(iter(tmp.glob("sutando-task-watch.*")))
         os.chmod(runtime, 0o500)
         publish(cfg, h["hC"])
+        emit(os.path.realpath(cfg))
         time.sleep(0.5)
         write_task(ws, "task-team")
+        emit(real_tasks / "task-team.txt")
         pump(p, out, lambda: log.exists() or any("task-team" in ln for ln in out), timeout=6, settle=0.5)
         held_out = list(out)
         held_log = log.read_text().split() if log.exists() else []
         os.chmod(runtime, 0o700)
+        emit(os.path.realpath(cfg))  # the config's own event: reload succeeds now, held tasks replay
         pump(p, out, lambda: log.exists() or any("task-team" in ln for ln in out), timeout=12)
         handled = log.read_text().split() if log.exists() else []
         return held_out, held_log, out, handled
@@ -179,38 +183,30 @@ check("stderr holds only the watcher's own announce line",
 def scenario_absent_then_unreadable_config_appears():
     """No config at start. A must-handle config appears but cannot be read
     (mode 000), with the task's event delivered before the config's. The task
-    must be held, then handled once the config is readable."""
+    must be held, then handled once the config is readable and its own event
+    runs the replay. The feed orders the events; no tick exists."""
     tmp, ws, b = workspace("ready-unread-")
     cfg = ws / "state" / "task-event-handler.json"
     log = tmp / "handler.log"
     h = handlers(tmp, log, (("hC", 4),))
-    env = watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": "1"})
-    p = start(ws, env)
+    env = watcher_env(tmp, ws, b)
+    p, emit, real_tasks = feed_start(tmp, ws, b, env)
     out: list[str] = []
-    stub = []
     try:
-        wait_ready(ws)
-        kids = subprocess.run(["pgrep", "-P", str(p.pid)], capture_output=True, text=True).stdout.split()
-        stub = [k for k in kids if "fswatch" in subprocess.run(["ps", "-o", "command=", "-p", k],
-                                                                capture_output=True, text=True).stdout]
-        for k in stub:
-            os.kill(int(k), 19)
         write_task(ws, "task-team")
         publish(cfg, h["hC"])
         os.chmod(cfg, 0)
-        for k in stub:
-            os.kill(int(k), 18)
-        stub = []
+        emit(real_tasks / "task-team.txt")  # the task's event first
+        emit(os.path.realpath(cfg))                           # then the (unreadable) config's
         pump(p, out, lambda: log.exists() or any("task-team" in ln for ln in out), timeout=6, settle=0.5)
         held_out = list(out)
         held_log = log.read_text().split() if log.exists() else []
         os.chmod(cfg, 0o644)
+        emit(os.path.realpath(cfg))  # the config's own event once readable: reload and replay
         pump(p, out, lambda: log.exists() or any("task-team" in ln for ln in out), timeout=12)
         handled = log.read_text().split() if log.exists() else []
         return held_out, held_log, out, handled
     finally:
-        for k in stub:
-            os.kill(int(k), 18)
         try:
             os.chmod(cfg, 0o644)
         except OSError:
@@ -219,9 +215,10 @@ def scenario_absent_then_unreadable_config_appears():
 
 
 def scenario_held_task_own_event_after_recovery():
-    """A task held while the config was unreadable receives its own file event
-    once the config is readable again: it must be dispatched exactly once.
-    Needs the host's fswatch (an Updated event on the same name)."""
+    """A task held while the config was unreadable is replayed by the config's
+    own event once it is readable again, then receives its own file event with
+    unchanged content: it must be dispatched exactly once. Needs the host's
+    fswatch (an Updated event on the same name)."""
     import shutil
     if not shutil.which("fswatch"):
         return None
@@ -232,7 +229,7 @@ def scenario_held_task_own_event_after_recovery():
     h = handlers(tmp, log, (("hO", 0),))  # optional handler: accepts and runs, writes no result
     publish(cfg, h["hO"])
     os.chmod(cfg, 0)
-    env = watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": "60"})
+    env = watcher_env(tmp, ws, b)
     p = start(ws, env)
     out: list[str] = []
     try:
@@ -240,11 +237,13 @@ def scenario_held_task_own_event_after_recovery():
         write_task(ws, "task-held")
         pump(p, out, lambda: log.exists() or any("task-held" in ln for ln in out), timeout=5, settle=0.5)
         held_log = log.read_text().split() if log.exists() else []
-        os.chmod(cfg, 0o644)
-        time.sleep(1.0)
-        with open(ws / "tasks" / "task-held.txt", "a") as fh:  # the held task's own Updated event
-            fh.write("note: touched\n")
-        pump(p, out, lambda: log.exists(), timeout=12, settle=3.0)
+        os.chmod(cfg, 0o644)  # fswatch reports this as the config's Updated event: reload and replay
+        pump(p, out, lambda: log.exists(), timeout=12, settle=1.0)
+        task_path = ws / "tasks" / "task-held.txt"
+        body = task_path.read_text()
+        with open(task_path, "w") as fh:  # the held task's own Updated event, content unchanged
+            fh.write(body)
+        pump(p, out, lambda: False, timeout=4, settle=0.0)
         handled = log.read_text().split() if log.exists() else []
         return held_log, out, handled
     finally:
@@ -279,37 +278,49 @@ else:
 
 def scenario_dangling_symlink_config():
     """The config path is a dangling symlink: a config that exists and cannot
-    be read, so the task is held, never announced; once the link resolves to
-    a must-handle config, the task is handled once."""
+    be read, so the task is held, never announced. The target appearing
+    outside the watched dir is no watched event, so the task stays held; the
+    link being re-pointed in place is one, and the task replays exactly once."""
     tmp, ws, b = workspace("ready-dangling-")
     cfg = ws / "state" / "task-event-handler.json"
+    cfg_event = Path(os.path.realpath(cfg.parent)) / cfg.name
     log = tmp / "handler.log"
     h = handlers(tmp, log, (("hC", 4),))
     target = tmp / "real-config.json"
     os.symlink(target, cfg)  # dangling: the target does not exist yet
-    env = watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": "1", "SUTANDO_HELD_RETRY_INTERVAL": "1"})
-    p = start(ws, env)
+    env = watcher_env(tmp, ws, b)
+    p, emit, real_tasks = feed_start(tmp, ws, b, env)
     out: list[str] = []
     try:
-        wait_ready(ws)
         write_task(ws, "task-team")
+        emit(real_tasks / "task-team.txt")
         pump(p, out, lambda: log.exists() or any("task-team" in ln for ln in out), timeout=4, settle=0.3)
         held_out = list(out)
         held_log = log.read_text().split() if log.exists() else []
-        target.write_text(json.dumps({"handler": str(h["hC"])}))
+        target.write_text(json.dumps({"handler": str(h["hC"])}))  # no watched event
+        pump(p, out, lambda: False, timeout=3, settle=0.0)
+        still_out = list(out)
+        still_log = log.read_text().split() if log.exists() else []
+        link = cfg.with_name(".cfg.link")
+        os.symlink(target, link)
+        os.replace(link, cfg)  # the link re-pointed in place: a genuine watched event
+        emit(cfg_event)
         pump(p, out, lambda: log.exists() or any("task-team" in ln for ln in out), timeout=10)
         handled = log.read_text().split() if log.exists() else []
-        return held_out, held_log, out, handled
+        return held_out, held_log, still_out, still_log, out, handled
     finally:
         stop(p)
 
 
 print("the config path is a dangling symlink:")
-held_out, held_log, out, handled = scenario_dangling_symlink_config()
+held_out, held_log, still_out, still_log, out, handled = scenario_dangling_symlink_config()
 check("the task was held (a symlink that resolves nowhere is broken, not absent): no announcement, no handler run",
       not any("task-team" in ln for ln in held_out) and held_log == [],
       f"stdout={held_out!r} handler log={held_log!r}")
-check("once the link resolved, the held task was handled once by C, never announced",
+check("the target appearing outside the watched dir is no event: the task stays held",
+      not any("task-team" in ln for ln in still_out) and still_log == [],
+      f"stdout={still_out!r} handler log={still_log!r}")
+check("once the link was re-pointed in place, the held task was handled once by C, never announced",
       not any(ln.startswith("TASK_FILE: task-team") for ln in out) and handled == ["probe-hC", "handle-hC"],
       f"stdout={out!r} handler log={handled!r}")
 

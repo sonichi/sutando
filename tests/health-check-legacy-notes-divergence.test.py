@@ -9,6 +9,11 @@ that split is invisible to an .md-only TOP-LEVEL glob because it lives in
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import sys
 import tempfile

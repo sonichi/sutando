@@ -82,11 +82,10 @@ describe('init.sh --auto (Tier 1: placeholder files)', () => {
 		);
 	});
 
-	it('creates pending-questions.md with an empty placeholder', () => {
+	it('does not seed the retired pending-questions.md', () => {
 		runInit(scratch, '--auto');
-		const body = readFileSync(join(workspace, 'pending-questions.md'), 'utf-8');
-		assert.match(body, /^# Pending Questions/);
-		assert.match(body, /none open/);
+		assert.equal(existsSync(join(workspace, 'pending-questions.md')), false,
+			'pending questions live in the room database, not a seeded file');
 	});
 
 	it('creates state/contextual-chips.json with a parseable shape', () => {
@@ -156,17 +155,17 @@ describe('init.sh --auto (Tier 1: placeholder files)', () => {
 	});
 });
 
-describe('init.sh --auto (Tier 1: crons.json copy)', () => {
-	it('copies crons.example.json → crons.json when example exists and target is missing', () => {
+describe('init.sh --auto (Tier 1: no in-checkout crons.json)', () => {
+	it('does not create skills/schedule-crons/crons.json from the example', () => {
 		const exampleDir = join(scratch, 'skills', 'schedule-crons');
 		mkdirSync(exampleDir, { recursive: true });
 		writeFileSync(join(exampleDir, 'crons.example.json'), '[{"name":"foo","cron":"* * * * *"}]');
-		runInit(scratch, '--auto');
-		const body = readFileSync(join(exampleDir, 'crons.json'), 'utf-8');
-		assert.match(body, /"foo"/);
+		const out = runInit(scratch, '--auto');
+		assert.equal(out.status, 0);
+		assert.equal(existsSync(join(exampleDir, 'crons.json')), false);
 	});
 
-	it('does NOT copy when the target already exists', () => {
+	it('leaves an existing in-checkout crons.json untouched', () => {
 		const exampleDir = join(scratch, 'skills', 'schedule-crons');
 		mkdirSync(exampleDir, { recursive: true });
 		writeFileSync(join(exampleDir, 'crons.example.json'), '[{"name":"example"}]');
@@ -174,12 +173,6 @@ describe('init.sh --auto (Tier 1: crons.json copy)', () => {
 		runInit(scratch, '--auto');
 		const body = readFileSync(join(exampleDir, 'crons.json'), 'utf-8');
 		assert.match(body, /my-custom/);
-	});
-
-	it('skips silently when no example file exists (fresh template install case)', () => {
-		const out = runInit(scratch, '--auto');
-		assert.equal(out.status, 0);
-		assert.equal(existsSync(join(scratch, 'skills/schedule-crons/crons.json')), false);
 	});
 });
 

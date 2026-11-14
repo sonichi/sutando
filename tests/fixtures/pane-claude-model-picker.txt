@@ -1,0 +1,12 @@
+● Switching models.
+──────────────────────────────────────────────────────────────────────
+ Select model
+ Switch between Claude models. Your pick applies to this session and future sessions.
+
+   1. Default (recommended)   Opus 5.5 · Most capable for complex work
+   2. Opus 5.5
+   3. Sonnet 5 (1M context)
+   4. Fable 5.1
+ ❯ 5. Haiku                   Haiku 4.5 · Fastest for quick answers
+
+ Enter to set as default · s to use this session only · Esc to cancel

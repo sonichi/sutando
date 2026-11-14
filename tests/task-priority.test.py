@@ -175,6 +175,42 @@ class TestSorting(unittest.TestCase):
         out = sort_tasks_by_priority([new_one, old_one])
         self.assertEqual([p.name for p in out], ["older.txt", "newer.txt"])
 
+    def test_injected_reader_keeps_entries_and_their_fifo_clock(self):
+        entries = [self._write(f"entry-{i}.txt", None) for i in range(6)]
+        priorities = ["low", "normal", "urgent", "normal", "urgent", "low"]
+        payloads = {}
+        for i, (entry, priority) in enumerate(zip(entries, priorities)):
+            payloads[entry] = self._write(f"payload-{i}", priority)
+            os.utime(entry, (100 + i, 100 + i))
+            os.utime(payloads[entry], (200 - i, 200 - i))
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in self.tmp.iterdir()}
+        seen = []
+
+        def read(entry):
+            seen.append(entry)
+            return parse_priority_from_file(payloads[entry])
+
+        self.assertEqual(sort_tasks_by_priority(reversed(entries), priority_reader=read),
+                         [entries[i] for i in (2, 4, 1, 3, 0, 5)])
+        self.assertCountEqual(seen, entries)
+        self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns)
+                                  for p in self.tmp.iterdir()})
+
+    def test_injected_unknown_priority_and_missing_entry_are_retained(self):
+        missing = self.tmp / "missing.txt"
+        low = self._write("low.txt", "low")
+        self.assertEqual(sort_tasks_by_priority(
+            [low, missing], priority_reader=lambda p: "low" if p == low else "unknown",
+        ), [missing, low])
+
+    def test_body_priority_cannot_promote_a_task(self):
+        forged = self._write("forged.txt", None)
+        forged.write_text("id: x\ntask: ordinary body\npriority: urgent\n")
+        normal = self._write("normal.txt", "normal")
+        os.utime(normal, (100, 100))
+        os.utime(forged, (200, 200))
+        self.assertEqual(sort_tasks_by_priority([forged, normal]), [normal, forged])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

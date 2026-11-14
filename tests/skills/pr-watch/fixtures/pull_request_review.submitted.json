@@ -1,0 +1,38 @@
+{
+  "action": "submitted",
+  "review": {
+    "id": 1,
+    "user": {
+      "login": "bob"
+    },
+    "state": "CHANGES_REQUESTED",
+    "commit_id": "0badc0de9999",
+    "body": "fix it\nplease"
+  },
+  "pull_request": {
+    "number": 7,
+    "state": "open",
+    "merged": false,
+    "title": "x",
+    "user": {
+      "login": "alice"
+    },
+    "head": {
+      "sha": "0badc0de9999",
+      "ref": "feat"
+    },
+    "base": {
+      "ref": "main"
+    }
+  },
+  "repository": {
+    "full_name": "acme/widgets",
+    "name": "widgets",
+    "owner": {
+      "login": "acme"
+    }
+  },
+  "sender": {
+    "login": "bob"
+  }
+}

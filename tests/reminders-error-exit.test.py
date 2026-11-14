@@ -134,7 +134,9 @@ else:
         fake_result = sp.CompletedProcess(
             args=[], returncode=1, stdout="", stderr="Error: Not authorized (-1743)"
         )
-        with patch.object(sp, "run", return_value=fake_result):
+        import os
+        with patch.dict(os.environ, {"MORNING_BRIEFING_CALENDAR_SOURCE": "macos"}), \
+             patch.object(sp, "run", return_value=fake_result):
             result = mb.get_reminders()
 
         self.assertIsNone(

@@ -11,6 +11,12 @@ Found on a live host: `.last-pq-notify` and `.voice-agent.pid` had accumulated
 at the root, in none of the 23 existing probes and none of the migrator's five
 names.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import sys
 import tempfile

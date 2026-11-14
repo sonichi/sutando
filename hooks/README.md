@@ -143,8 +143,13 @@ events above, argv[1] = hook name as a stdin fallback. Test:
 
 Denies the **claude.ai Gmail MCP connector's WRITE-scoped tools** (create_draft,
 label_thread, unlabel_thread, create_label, apply_sensitive_*_label, archive,
-trash, send, …) and routes the model to the app-password IMAP/SMTP path
-(docs/built-in-tools.md → Email). Field report 05cb849a: the connector's OAuth
+trash, send, …) and routes the model to the **Station Gmail connector**
+(`composio_find` → `composio_exec`, a different tool name this guard never
+matches), with a read-back after every send; the app-password IMAP/SMTP path
+(docs/built-in-tools.md → Email) is named only as the fallback when the Station
+tools are absent. (Until 2026-09-23 the reason led with IMAP/SMTP, so an owner
+with Gmail connected in Settings → Integrations was still asked to generate an
+app password by hand.) Field report 05cb849a: the connector's OAuth
 flow doesn't actually grant Gmail write scopes (label/archive fail with a raw
 "insufficient authentication scopes" error) and `create_draft` caused 7
 documented incidents incl. a wrong-recipient send — while READ tools work fine
@@ -185,6 +190,241 @@ PY
 
 Test: `python3 tests/gmail-write-guard.test.py`.
 
+## `gdocs-write-guard.py`
+
+One script on two events for the Station's `composio_exec` tool, toolkit
+`googledocs`. **PreToolUse** denies a body-replacing action
+(`GOOGLEDOCS_UPDATE_DOCUMENT_MARKDOWN` — "replaces the entire content of an
+existing document" — plus `UPDATE_EXISTING_DOCUMENT`, `REPLACE_DOCUMENT`,
+`DELETE_CONTENT_RANGE`) unless a snapshot of that document younger than
+`SUTANDO_GDOCS_BACKUP_MAX_AGE_S` (900 s) exists, with a reason that says to read
+the doc first and to prefer the partial-edit actions (`INSERT_TEXT_ACTION`,
+`REPLACE_ALL_TEXT`, `INSERT_TEXT_IN_TABLE_CELL`, always allowed).
+**PostToolUse** keeps every *successful* read (`GET_DOCUMENT_PLAINTEXT`,
+`GET_DOCUMENT_BY_ID`) as `<workspace>/data/gdocs-backups/<doc id>/<epoch>.md`
+(the document text when the envelope carries it, newest 20), so a wrong rewrite
+can be restored from the last thing the owner had. A read whose envelope says
+`successful: false` / `error` / `is_error`, or that returns no text, is never a
+snapshot: it could restore nothing, so it must not lift the deny. Owner report
+(user feedback): a doc "gets unexpectedly cleared, or unrelated content is
+inserted or rewritten" — the whole-replace action was the natural pick for
+"update the doc", and nothing warned or kept a copy.
+
+**The repo root is CONFIGURED, never discovered** (same rule as
+`result-file-marker-guard.py`): `build-core-settings.mjs` registers the hook as
+`python3 <hook> --repo <checkout>`; `$SUTANDO_REPO_ROOT` is the fallback. The
+workspace then comes from `workspace_default.resolve_workspace`. Without a root
+no snapshot can be recorded, so a whole replace stays denied and stderr says why.
+
+Settings are read through `sutando_config` (`env` stanza of
+`sutando.config.local.json`, environment as the fallback): the max age above and
+the operator override `SUTANDO_ALLOW_GDOCS_WHOLE_REPLACE=1`. Inside a session the
+way past the deny is the read itself — one call, then the replace is allowed.
+Fail-OPEN on uncaught hook errors. Registered for every core session by
+`build-core-settings.mjs` (arg 5, matcher `mcp__.*__composio_exec` on both
+events). Test: `python3 tests/gdocs-write-guard.test.py`.
+
+## `native-pim-guard.py`
+
+Denies **Bash commands that drive the native macOS Calendar, Reminders or Contacts
+app** — `osascript`/JXA by app name or bundle id (`tell application "Calendar"`,
+`application id "com.apple.iCal"`, `Application("com.apple.reminders")`), an
+`osascript` script file whose name or first 64 KB scripts one of the apps,
+`open -a`/`-ga`/`-gja`, `open -b com.apple.iCal`, `.app` paths, `open
+x-apple-reminderkit://…`, and `shortcuts run` (a shortcut can drive any of the
+three; `shortcuts list`/`view` pass) — with a reason that gives the order: the
+Station connector first (`composio_find {"apps": ["google calendar"]}` →
+`composio_exec`), then the owner's own `mcp__claude_ai_Google_Calendar__*` tools if
+present, then ask the owner; and never re-prompt once the owner denied the
+permission. Driving those apps raises a macOS Automation prompt on the owner's
+screen (user report, 2026-09-24). Only a command at **command position** counts
+(the start, or after `;`, `&&`, `||`, `|`, `$(`, a backtick, `(`/`{`, an env-prefix
+chain): `grep -rn "open -gja Calendar" src/`, `git log -S "open -a Contacts"` and
+`grep osascript f | grep 'application "Calendar"'` are reads and pass, while a
+wrapper (`bash -c`, `sh -c`, `xargs`, `sudo`, `env`, `eval`, …) is scanned whole and
+an `osascript` heredoc or `;`-joined script is scanned to the end of the command.
+Unrelated `osascript`/`open` commands and every other tool pass through.
+
+Consent, any of: the command's env prefix `SUTANDO_ALLOW_NATIVE_PIM=1` **at command
+position** (start, or after `;`, `&&`, `|`, `(`, or an env-prefix chain — `echo
+SUTANDO_ALLOW_NATIVE_PIM=1; open -a Calendar` does not count), that variable in the
+hook's own environment, or the owner's persisted host opt-in
+`<workspace>/state/native-pim-consent`, written by `python3
+skills/macos-tools/scripts/native_pim_consent.py grant` in the **owner's own
+terminal**. The agent never writes that record: the hook denies `grant`, any command
+outside a read-only one (`cat`, `ls`, `grep`, `git`, `test`, …) that names
+`native-pim-consent` or a `*-automation-denied` marker — `touch`, `echo … >`, `tee`,
+`cp`, `rm`, `python3 -c "open(…)"`, `sed -i` — and any Python that imports or runs
+`native_pim_consent` other than the CLI's `status`/`revoke` (with their
+`--workspace` option). A redirect onto the marker is denied even from a read-only
+command. The file tools are matched too: a `Write`, `Edit`, `MultiEdit` or
+`NotebookEdit` whose `file_path`/`notebook_path` resolves (symlinks followed) to the
+consent marker or a denial marker under `<workspace>/state/` is denied; any other
+path, and every `Read`, passes. Fail-OPEN on hook errors.
+
+**Known limits.** The Bash side is a command-string matcher and cannot close
+obfuscated forms: `native""-pim-consent`, `native\-pim-consent`, the glob
+`native-pim-consen?`, a `$var` concatenation, `'native-pim-'+'consent'` or
+`importlib.import_module('native_pim'+'_consent')` inside `python -c`,
+`base64 -d | sh`, or running a script written earlier; a script file that names the
+app only indirectly, or a split string such as `"Cont"&"acts"`, gets past the app
+match the same way. Those are the documented gap of an initiative guard, not an
+authorisation boundary.
+
+**One policy.** The marker names, the host opt-in and the bound task's tier are
+`native_pim_consent.py`'s (`skills/macos-tools/scripts/`), which this hook imports;
+the hook only parses the command line. The scripts, the morning briefing and the
+voice `call_contact` tool (through `native_pim_consent.py check` / `report-error`)
+read the same module, so there is no second copy to drift.
+
+**What this consent is, honestly.** The prefix and the env var are strings the
+model writes, so on their own they guard against the agent acting on its own
+initiative; they are **not an authorisation boundary** for who asked. The hook
+binds them where the session tells it whose task is running: when
+`<workspace>/state/bindings/active-execution.json` names the task and
+`<workspace>/tasks/<task_id>.txt` resolves (via `policy.egress.result.
+resolve_access_tier`) to a non-owner tier (`team`, `guest`, unreadable), every form
+of consent is ignored and the command is denied with a reason saying so. Without a
+binding — a chat session, a cron, a binding the core did not write — the consent is
+self-attested and a task's injected text saying "the owner asked" is not
+distinguishable from the owner asking. Do not rely on this hook as access control.
+The scripts apply the same tier inside an agent session (`CLAUDECODE=1`): on a
+non-owner task `--owner-asked`, the env var and the marker are all refused (exit 2),
+so the script gate does not accept what the hook would deny. A cron such as the
+morning briefing is not the core's bound task and is not tier-checked.
+
+**Codex cores.** This is a Claude-runtime `PreToolUse` hook. On a Codex core only
+the script gate (`native_pim_consent.py`, exit 2 without consent) and the inline
+`call_contact` tool's own check protect; ad-hoc `osascript`/`open` commands there
+are not intercepted.
+
+### Registration
+
+**Auto-registered** for every core session, next to `gmail-write-guard.py`:
+`session-launch.sh` passes this hook to `build-core-settings.mjs` (arg 6, after the
+Google Docs guard), which registers
+it under `PreToolUse` with matcher `Bash|Write|Edit|MultiEdit|NotebookEdit` (the
+file tools, so the consent record cannot be written directly — the same reason the
+results-dir and `MEMORY.md` guards below match `Write`/`Edit`/`MultiEdit`). For a
+non-core session, add the same `PreToolUse` entry by hand as in the block above,
+with that matcher and command `python3 <deployed path>/native-pim-guard.py`.
+
+Test: `python3 tests/native-pim-guard.test.py`.
+
+## `shell-trap-guard.py`
+
+Catches **Bash commands that fail, or quietly do the wrong thing, on a macOS/zsh
+host** before they run. Three are **blocked** (exit 2, the fix on stderr), each only
+where the host's tool is the BSD one, so a Linux host or a GNU tool first on `PATH` is
+not blocked:
+
+- `timeout ...` when no `timeout` is on the hook's `PATH` or on the user's shell `PATH`
+  (stock macOS has none) and the command does not probe for it (`command -v` / `type` / `which` / `hash timeout`) — use the
+  Bash tool's `timeout` parameter or a Python `subprocess.run(..., timeout=N)`;
+- GNU `sed -i` / `--in-place` with no suffix argument, with `/usr/bin/sed` on macOS —
+  use `sed -i '' ...`;
+- GNU `base64 <file>`, with `/usr/bin/base64` on macOS — use `base64 -i <file>` or
+  `base64 < <file>`.
+
+Two are **warned** (exit 0, JSON `additionalContext`; the call still runs):
+
+- `pgrep -f pat` with no self-exclusion **in its own pipeline** (`[p]at`, `$$`, or a
+  later `| grep -v`): the pattern also matches the shell running the command, so a
+  wait loop sees a finished job as still running. A `grep -v` in another part of a
+  compound command does not count;
+- `for x in $VAR` where `VAR` was assigned from `$(...)` or backticks, when `$SHELL` is
+  zsh: zsh does not word-split it, so the loop runs once over the whole output.
+
+A command named by path (`/opt/homebrew/opt/coreutils/libexec/gnubin/timeout`) is
+judged by that path, not by the hook's `PATH`: it is blocked only when it resolves to
+the BSD tool in `/usr/bin` (so a path `timeout` is never blocked on macOS).
+
+The user's shell `PATH` is what Claude Code's Bash tool sees: its shell snapshot is
+taken from a login `$SHELL` that sources the rc file (`~/.zshrc`, `~/.bashrc`), so the
+hook asks the same shell, `$SHELL -l -c '. ~/.zshrc; printf "$PATH"'` (stdin closed,
+minimal env, 2 s timeout, relative entries dropped). It runs only when the command
+mentions `timeout` and the hook's own `PATH` has none, and the answer (a failure
+included) is cached for 10 minutes in `<workspace>/state/guards/shell_path_cache.json`,
+keyed by `$SHELL`, the hook's `PATH` and the rc files' mtimes
+(`SHELL_TRAP_GUARD_SHELL_PATH_CACHE` overrides the path). With no cache location, or on
+any probe failure, it falls back to the hook's `PATH` alone.
+
+The command is read with the shared `_shell_scan` scanner, so quoted text, comments
+and heredoc bodies are data, not commands.
+
+Each hit is appended to `<workspace>/state/guards/shell_trap_hits.jsonl`
+(`{ts, rule, action, command}`, command cut at 2000 characters so false positives can
+be audited, with values after `--token`/`--password`, `Authorization:`, `Bearer ` and
+`*TOKEN=`/`*KEY=`/`password=` redacted); `SHELL_TRAP_GUARD_LOG` overrides the path. The workspace comes from
+`workspace_default.resolve_workspace` under the configured checkout (`--repo <path>`,
+else `$SUTANDO_REPO_ROOT`); with neither, nothing is logged and the guard still
+decides. `SHELL_TRAP_GUARD_RULES=pgrep_self,timeout` replaces the host-derived rule
+set; `SHELL_TRAP_GUARD_DISABLE=1` turns it off. Fail-OPEN on any internal error.
+
+**Known limits.** Five patterns only; a warning is advice and nothing records whether
+it was followed. A `timeout` that an earlier `brew install coreutils &&` in the same
+command would provide, or one added through a file the rc file sources (its mtime is
+not in the cache key) until the 10-minute cache expires, is still blocked; call it by path or probe for it first. `xargs sed -i` and `find -exec sed -i`
+are not caught.
+
+### Registration
+
+**Auto-registered** for every core session: `session-launch.sh` passes this hook to
+`build-core-settings.mjs` (arg 7, after the native PIM guard), which registers it
+under `PreToolUse` with matcher `Bash` and command `python3 <hook> --repo
+<checkout>`. For a non-core session, add the same entry by hand.
+
+Test: `python3 tests/shell-trap-guard.test.py`.
+
+## `stale-head-post-guard.py`
+
+Blocks **posting a PR review or PR comment against a head that has moved** since it
+was checked. It reads three posting commands:
+
+- `gh api repos/<o>/<r>/pulls/<n>/reviews` with POST (`-X POST` / `--method POST`, or
+  implied by `-f`/`-F`/`--raw-field`/`--field`/`--input`), taking `commit_id` and `body`
+  from the fields (`-F body=@file` reads the file) or from the `--input` JSON;
+- `gh pr review <n|url>` and `gh pr comment <n|url>`, taking the body from
+  `--body`/`-b` or `--body-file`/`-F`.
+
+In the body it looks for a **sha claim**: `at <sha>`, `Reviewed at <sha>`, `head <sha>`
+or `@ <sha>`, where the sha is 7-40 hex characters with at least one digit and one
+letter (so `at 1234567 rows` is not a claim).
+
+When there is a literal hex `commit_id` or a claim, and the repo is named (in the API
+path, `--repo`/`-R`, or a PR URL), it reads the current head with
+`gh api repos/<o>/<r>/pulls/<n> --jq .head.sha` (8 s timeout, once per PR). It **blocks**
+(exit 2, both shas on stderr, "re-read the PR at the new head before posting") when
+`commit_id` is not a prefix of the head, or when a claimed sha is not, unless the body
+also contains the head's short sha (then the old sha is only being referred to).
+
+It **allows**, without reading GitHub, a post with nothing to check or with no repo
+named (it never guesses one from the working directory). A failed or timed-out head
+read allows the post and prints one warning line on stderr.
+
+A `-` argument reads the command's heredoc; a body file that does not exist yet is
+matched to the heredoc that writes it (`cat > f <<EOF ... gh pr comment --body-file f`).
+Relative paths resolve against the hook input's `cwd`.
+
+`SUTANDO_ALLOW_STALE_POST=1` as an unquoted word in the command (`SUTANDO_ALLOW_STALE_POST=1 gh api ...`)
+allows the post. `STALE_HEAD_POST_GUARD_DISABLE=1` turns the hook off, and
+`STALE_HEAD_POST_GUARD_GH` names the `gh` binary used for the head read. The command
+is read with the shared `_shell_scan` scanner. Fail-OPEN on any internal error.
+
+**Known limits.** Only the three commands above; a `commit_id` given as `$VAR` or
+`$(...)` is not checked, and a claim phrased any other way is not seen. A `cd` earlier
+in the command does not move the `cwd` relative paths resolve against. A sha claim
+that names a different PR's head is judged against this PR.
+
+### Registration
+
+**Auto-registered** for every core session: `session-launch.sh` passes this hook to
+`build-core-settings.mjs` (arg 8, after the shell-trap guard), which registers it under
+`PreToolUse` with matcher `Bash` and command `python3 <hook>`. For a non-core session,
+add the same entry by hand.
+
+Test: `python3 tests/stale-head-post-guard.test.py`.
+
 ## `review-authority-guard.py`
 
 Denies a **formal GitHub review** filed from Bash — `gh pr review --approve` /
@@ -193,7 +433,7 @@ carrying `APPROVE` / `REQUEST_CHANGES` — while the owner's standing answer on
 review authority is unresolved. An APPROVE moves a merge gate, and merges are
 the owner's; verifying a change carefully is not authorization to vote on it.
 The mode lives in `<workspace>/state/authority.json`:
-An owner who ruled *verbally* has no file yet, so that ruling reads as `hold` until someone writes it — register the file on the node whose owner already answered.
+An owner who ruled *verbally* has no file yet, so that ruling reads as the default until someone writes it. Record it with `python3 scripts/authority.py set github_formal_review <mode> --source "<where>"`; raising the mode also requires `--owner-event <event id or URL> --quote "<owner's verbatim words>"` (only an explicit owner ruling counts, never one inferred from memory, notes or a peer). The write is atomic, keeps other keys, mode bits and a symlink, stamps `granted_at`/`source`, and refuses a corrupt file unless `--replace-corrupt`; `python3 scripts/authority.py get` shows the mode in force.
 
 ```json
 {"github_formal_review": "hold" | "findings-only" | "allow"}

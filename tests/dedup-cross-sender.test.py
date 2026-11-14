@@ -94,6 +94,13 @@ class PlanRefusesCrossSenderDedup(unittest.TestCase):
         self.assertEqual(second, "report", "cross-sender re-asks without bound")
         self.assertIn("asked by someone else", msg)
 
+    def test_replied_holder_still_requires_the_same_sender(self):
+        self.assertEqual(self._plan("@alice:ag2.space", "[REPLIED]"), ("honour", None))
+        self.assertEqual(self._plan("@bob:ag2.space", "[REPLIED]")[0], "requeue")
+        action, message = self._plan("@bob:ag2.space", "[REPLIED]", count=1)
+        self.assertEqual(action, "report")
+        self.assertIn("asked by someone else", message)
+
     def test_holder_empty_cap_still_works(self):
         # Positive control: the branch the existing cap does guard.
         self.assertEqual(self._plan("@alice:ag2.space", holder_result="[no-send]\n")[0], "requeue")

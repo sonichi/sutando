@@ -41,7 +41,7 @@ def scenario_held_task_under_a_busy_stream():
     h = handlers(tmp, log, (("hC", 4),))
     publish(cfg, h["hC"])
     os.chmod(cfg, 0)
-    env = watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": "30", "SUTANDO_HELD_RETRY_INTERVAL": "2"})
+    env = watcher_env(tmp, ws, b, {"SUTANDO_HELD_RETRY_INTERVAL": "2"})
     p = start(ws, env)
     out: list[str] = []
     try:
@@ -102,7 +102,7 @@ def scenario_held_task_events_after_recovery_feed():
     h = handlers(tmp, log, (("hO", 0),))
     publish(cfg, h["hO"])
     os.chmod(cfg, 0)
-    env = watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": "60", "SUTANDO_HELD_RETRY_INTERVAL": "1"})
+    env = watcher_env(tmp, ws, b, {"SUTANDO_HELD_RETRY_INTERVAL": "1"})
     p = start(ws, env)
     out: list[str] = []
     real_tasks = Path(os.path.realpath(ws / "tasks"))
@@ -154,18 +154,17 @@ check("its later Created and Updated events did not admit it again",
       f"stdout={out!r} handler log={handled!r}")
 
 
-def scenario_held_task_during_shutdown(trigger):
+def scenario_held_task_during_shutdown():
     """A task held on a broken config, then the shutdown sentinel is written and
-    the config recovers: the held task must not be replayed by the config event
-    ("event") nor by the poll tick ("tick"); it stays in the inbox."""
-    tmp, ws, b = workspace(f"ready-shutdown-{trigger}-")
+    the config recovers: the held task must not be replayed by the config's own
+    event, the only replay path there is; it stays in the inbox."""
+    tmp, ws, b = workspace("ready-shutdown-")
     cfg = ws / "state" / "task-event-handler.json"
     log = tmp / "handler.log"
     h = handlers(tmp, log, (("hC", 4),))
     publish(cfg, h["hC"])
     os.chmod(cfg, 0)
-    poll = "1" if trigger == "tick" else "60"
-    env = watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": poll, "SUTANDO_HELD_RETRY_INTERVAL": "60"})
+    env = watcher_env(tmp, ws, b, {"SUTANDO_HELD_RETRY_INTERVAL": "60"})
     p, emit, real_tasks = feed_start(tmp, ws, b, env)
     out: list[str] = []
     try:
@@ -175,8 +174,7 @@ def scenario_held_task_during_shutdown(trigger):
         held_log = log.read_text().split() if log.exists() else []
         (ws / "state" / "shutdown.sentinel").write_text("")
         os.chmod(cfg, 0o644)
-        if trigger == "event":
-            emit(cfg)  # the config's own event runs the reload and the held replay
+        emit(os.path.realpath(cfg))  # the config's own event runs the reload and the held replay
         time.sleep(4.0)
         try:
             os.set_blocking(p.stdout.fileno(), False)
@@ -196,13 +194,12 @@ def scenario_held_task_during_shutdown(trigger):
         stop(p)
 
 
-for trigger in ("event", "tick"):
-    print(f"a held task, then the shutdown sentinel, then the config recovers via the {trigger} path:")
-    held_log, out, handled, still_there = scenario_held_task_during_shutdown(trigger)
-    check(f"[{trigger}] setup: the task was held first", held_log == [], f"handler log={held_log!r}")
-    check(f"[{trigger}] the held task was NOT replayed mid-shutdown and remains in the inbox",
-          handled == [] and not any("task-team" in ln for ln in out) and still_there,
-          f"stdout={out!r} handler log={handled!r} still_there={still_there}")
+print("a held task, then the shutdown sentinel, then the config recovers via its own event:")
+held_log, out, handled, still_there = scenario_held_task_during_shutdown()
+check("setup: the task was held first", held_log == [], f"handler log={held_log!r}")
+check("the held task was NOT replayed mid-shutdown and remains in the inbox",
+      handled == [] and not any("task-team" in ln for ln in out) and still_there,
+      f"stdout={out!r} handler log={handled!r} still_there={still_there}")
 
 
 def scenario_foreign_claim_then_retry():
@@ -220,7 +217,7 @@ def scenario_foreign_claim_then_retry():
     task_path = os.path.realpath(ws / "tasks" / "task-team.txt")
     # run_handler_now's claim record: owner pid, watcher id, payload, disposition
     (claims / "task-team.txt").write_text(f"{os.getpid()}\nforeign-1\n{task_path}\nmust-handle\n")
-    env = watcher_env(tmp, ws, b, {"SUTANDO_HANDLER_POLL_INTERVAL": "60"})
+    env = watcher_env(tmp, ws, b)
     p, emit, real_tasks = feed_start(tmp, ws, b, env)
     out: list[str] = []
     try:

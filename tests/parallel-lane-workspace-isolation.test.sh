@@ -10,18 +10,23 @@ fail=0
 TRIALS="${ISOLATION_TRIALS:-4}"
 
 # --- 1. Baseline control: the shared-cwd shape must FAIL, or nothing below
-# means anything — the collision needs overlap and a single trial can pass.
-shared=0
-for ((i=0; i<TRIALS; i++)); do
-    ( cd "$here" && python3 "$A" >/dev/null 2>&1 ) & pid=$!
-    sleep 0.12
-    ( cd "$here" && python3 "$B" >/dev/null 2>&1 )
-    wait $pid || shared=$((shared+1))
-done
-if [ "$shared" -eq 0 ]; then
-    echo "  FAIL: shared-cwd baseline passed $TRIALS/$TRIALS — control cannot detect the race"; fail=1
+# means anything. B runs whole inside A's baseline-to-check window, so overlap is certain.
+ctrl_out="$(cd "$here" && A="$A" B="$B" python3 - 2>&1 <<'PY'
+import importlib.util, os, subprocess, sys
+spec = importlib.util.spec_from_file_location("lane_ctrl_a", os.environ["A"])
+a = importlib.util.module_from_spec(spec); spec.loader.exec_module(a)
+check = a.test_no_writes_reach_the_live_workspace
+def racing(ws):
+    subprocess.run([sys.executable, os.environ["B"]], capture_output=True)
+    return check(ws)
+a.test_no_writes_reach_the_live_workspace = racing
+sys.exit(a.main())
+PY
+)"; ctrl_rc=$?
+if [ "$ctrl_rc" -ne 0 ] && grep -q "live workspace was written to" <<<"$ctrl_out"; then
+    echo "  ok   shared cwd collides (B's write inside A's window fails A)"
 else
-    echo "  ok   shared cwd collides ($shared/$TRIALS failed)"
+    echo "  FAIL: shared-cwd baseline did not fail on B's write (rc=$ctrl_rc) — control cannot detect the race"; fail=1
 fi
 
 # --- 2. The same racing pair through the SHIPPED scheduler: with 2 workers the

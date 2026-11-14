@@ -18,6 +18,11 @@ still deliverable.
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
@@ -28,6 +33,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(REPO / "tests" / "_helpers"))
+import bridge_paths  # noqa: E402
 
 FAILURES: list[str] = []
 
@@ -92,6 +99,9 @@ class _Tick(Exception):
 
 def _one_pass(results: Path, access: dict | None, owner: str | None = None,
               sent: list | None = None):
+    # The watcher also gates on REPO (presenter sentinel) and STATE_DIR (receipts,
+    # owner-activity routing); a CI lane's earlier suites leave those under the live tree.
+    bridge_paths.rebind_workspace(sb, results)
     sb.RESULTS_DIR = results
     acc = results / "access.json"
     if access is None:

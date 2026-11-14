@@ -65,6 +65,19 @@ class HostLabelPrecedence(unittest.TestCase):
              patch.object(util_paths.socket, "gethostname", return_value="slow.local"):
             self.assertEqual(util_paths._host_label(), "slow")
 
+    def test_scutil_called_by_absolute_path(self):
+        # A bare "scutil" resolves via PATH, which a restrictive launchd PATH
+        # can omit (2026-10-04, 1,227 failing runs from the wrong fallback).
+        with patch.object(util_paths.subprocess, "run", return_value=_scutil(0, "Chis-MacBook-Pro\n")) as run:
+            util_paths._host_label()
+            self.assertEqual(run.call_args[0][0][0], "/usr/sbin/scutil")
+
+    def test_scutil_bin_env_overrides_the_default_path(self):
+        with patch.dict(os.environ, {"SCUTIL_BIN": "/opt/stub/scutil"}), \
+             patch.object(util_paths.subprocess, "run", return_value=_scutil(0, "Chis-MacBook-Pro\n")) as run:
+            util_paths._host_label()
+            self.assertEqual(run.call_args[0][0][0], "/opt/stub/scutil")
+
 
 if __name__ == "__main__":
     unittest.main()

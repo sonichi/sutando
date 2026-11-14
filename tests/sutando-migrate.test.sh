@@ -114,14 +114,28 @@ mkdir -p "$C/.claude-sutando/skills/custom" "$C/.claude-sutando/hooks"
 echo "custom skill body" > "$C/.claude-sutando/skills/custom/SKILL.md"
 echo "print('hook')" > "$C/.claude-sutando/hooks/pre-task.py"
 
+# A step that exits non-zero prints what it said before `set -e` ends the run;
+# the aggregator otherwise shows the header and nothing else.
+RUN_MIGRATE_OR_DIE() {
+    local out rc
+    out="$(RUN_MIGRATE "$@" 2>&1)" && rc=0 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "  FAIL: sutando-migrate $1 exited $rc; its output:" >&2
+        printf '%s\n' "$out" | tail -40 | sed 's/^/    /' >&2
+        exit 1
+    fi
+    printf '%s\n' "$out"
+}
+
 echo "==== TEST: scan ===="
-RUN_MIGRATE scan --source A,B,C 2>&1 \
+SCAN_OUT="$(RUN_MIGRATE_OR_DIE scan --source A,B,C)"
+echo "$SCAN_OUT" \
     | grep -E "Source A|Source B|Source C|Cross-source|of which identical|genuine|notable|append\] build_log" \
     | head -25 || true
 
 echo
 echo "==== TEST: commit ===="
-COMMIT_OUT="$(RUN_MIGRATE commit --source A,B,C 2>&1)"
+COMMIT_OUT="$(RUN_MIGRATE_OR_DIE commit --source A,B,C)"
 echo "$COMMIT_OUT" | grep -E "Committing source|copied:|identical:|kept-dest:|sidecar:|skipped:|sentinel:|backup|COMMIT" | head -40
 INITIAL_BACKUP_ID="$(echo "$COMMIT_OUT" | grep -E "migration-backup-.*\.tar\.gz" | head -1 | sed -E 's@.*migration-backup-(.+)\.tar\.gz.*@\1@' || true)"
 

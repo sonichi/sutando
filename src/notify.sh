@@ -5,7 +5,7 @@
 # Channels (in order):
 # 1. Voice (results/proactive-*.txt) — if voice client is connected
 # 2. Discord DM — always
-# 3. macOS notification — always (local only)
+# 3. macOS notification — only when notifications.macos is on (local only)
 
 MSG="$1"
 if [ -z "$MSG" ]; then echo "Usage: bash src/notify.sh 'message'"; exit 1; fi
@@ -15,7 +15,7 @@ TS=$(date +%s%3N)
 
 # 1. Voice — write proactive message if voice agent is up
 if curl -s -o /dev/null -w "%{http_code}" http://localhost:9900 2>/dev/null | grep -q "426"; then
-  echo "$MSG" > "$REPO_DIR/results/proactive-$TS.txt"
+  printf '%s\n' "$MSG" | python3 "$REPO_DIR/src/result_publish.py" "$REPO_DIR/results/proactive-$TS.txt"
 fi
 
 # 2. Discord DM — via dm-result.py's send_dm, which owns token/owner
@@ -37,4 +37,4 @@ sys.exit(0 if mod.send_dm(sys.argv[1]) else 1)
 PY
 
 # 3. macOS notification
-osascript -e "display notification \"$MSG\" with title \"Sutando\"" 2>/dev/null
+bash "$REPO_DIR/src/macos-notify.sh" "$MSG" || true

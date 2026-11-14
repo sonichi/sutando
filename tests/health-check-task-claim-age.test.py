@@ -2,6 +2,12 @@
 """check_task_claim_age must make a LEAKED handler claim loud while it is leaking,
     not only at watcher exit. Run: python3 tests/health-check-task-claim-age.test.py"""
 from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os

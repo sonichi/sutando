@@ -12,7 +12,7 @@ Pass the baton to the next Sutando session. Where `session-handoff.sh` writes st
 
 ## Why this exists
 
-`src/session-handoff.sh` pulls together the structured state for the next session — system status, recent commits, open PRs, pending questions, tasks, conversation tail, quota, repo stats — and writes it to `session-state.md`. But "I was about to land PR #X and Mini's review said Y matters most" isn't captured by `git log`, `gh pr list`, or `pending-questions.md` tail. The next session reads structured facts but has to RE-INFER the continuity, which costs context and frequently misses the load-bearing decision.
+`src/session-handoff.sh` pulls together the structured state for the next session — system status, recent commits, open PRs, pending questions, tasks, conversation tail, quota, repo stats — and writes it to `session-state.md`. But "I was about to land PR #X and Mini's review said Y matters most" isn't captured by `git log`, `gh pr list`, or `src/pending_questions_reader.py list`. The next session reads structured facts but has to RE-INFER the continuity, which costs context and frequently misses the load-bearing decision.
 
 The relay note encodes intent + judgment — the thing only the LLM that lived through the session can write.
 
@@ -82,4 +82,4 @@ If the session was genuinely uneventful (read-only, no decisions, no in-flight w
 
 ## Where it lives
 
-`workspace/relay/relay-{YYYYMMDD}T{HHMMSS}Z.md` (pending) + `workspace/relay/processed/relay-{YYYYMMDD}T{HHMMSS}Z.md` (drained by session-handoff). Workspace-root parallel to `build_log.md` + `pending-questions.md` + `tasks/`. Owner-readable; both LLM and human can `cat` it cleanly.
+`workspace/relay/relay-{YYYYMMDD}T{HHMMSS}Z.md` (pending) + `workspace/relay/processed/relay-{YYYYMMDD}T{HHMMSS}Z.md` (drained by session-handoff). Workspace-root parallel to `build_log.md` + `tasks/`. Owner-readable; both LLM and human can `cat` it cleanly.

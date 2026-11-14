@@ -12,10 +12,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from _helpers.hermetic_gateway import assert_hermetic, isolate_then_import  # noqa: E402
+_GW, _IMPORT_READS = isolate_then_import()   # before anything else imports the bridge
+
 _REPO = Path(__file__).resolve().parent.parent
 _PKG = _REPO / "packages" / "ag2-sparrow"
 if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 TID = "task-22d83e59601f3a1fef"
 
@@ -51,7 +56,7 @@ class _Harness:
         gw._req = lambda method, path, payload=None, **kw: (
             self.posts.append({"method": method, "path": path, "payload": payload}) or {}
         )
-        gw._save_inflight = lambda *a, **k: None
+        gw._save_inflight = lambda *a, **k: True
         gw._forget_task_room = lambda *a, **k: None
         gw._load_task_rooms = lambda *a, **k: {}
         return self
@@ -165,6 +170,11 @@ class GatewayEmptyResultTest(unittest.TestCase):
         r = self._run(None)
         self.assertEqual(r.posts, [])
         self.assertIn(TID, r.inflight)
+
+
+class BridgeImportIsHermetic(unittest.TestCase):
+    def test_the_bridge_import_reads_no_host_config_token_or_vault(self):
+        assert_hermetic(self, _IMPORT_READS)
 
 
 if __name__ == "__main__":

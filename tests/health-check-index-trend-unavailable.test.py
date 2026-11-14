@@ -10,6 +10,12 @@ is simply not running and nothing says so.
 
 Same principle the prose-cap gate applies: never a bare PASS when nothing was read.
 """
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import subprocess
@@ -54,7 +60,7 @@ def index_in(dirpath, size, gitted, revisions=1):
         return idx
     # Bare `git` inherits the host's gc/maintenance settings and hooks, so ambient
     # config decides whether a background writer touches .git/objects (#3542).
-    genv = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+    genv = isolated_child_env(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
                 GIT_CONFIG_NOSYSTEM="1")
     git = ["git", "-c", "gc.auto=0", "-c", "maintenance.auto=false", "-c", "core.fsmonitor=false"]
     subprocess.run(git + ["init", "-q", str(d)], env=genv, check=True)

@@ -39,6 +39,7 @@
  *   recordConversation('phone-caller', 'hi');       // → phone table
  */
 import { DatabaseSync } from 'node:sqlite';
+import { Worker } from 'node:worker_threads';
 import { mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { resolveWorkspace } from './workspace_default.js';
@@ -358,21 +359,83 @@ function rowValues(cols: string[], parts: {
  *  speaker columns; others ignore it, so existing callers are unaffected. */
 export function recordConversation(role: string, text: string, sessionId?: string, meta?: SpeakerMeta): void {
 	init();
-	const source = sourceFromRole(role);
-	const s = stmtFor(source);
+	const s = stmtFor(sourceFromRole(role));
 	if (!s) return;
 	try {
-		s.stmt.run(...rowValues(s.cols, {
-			tsUnix: meta?.tsUnix ?? Date.now() / 1000, kind: kindFromRole(role), text,
-			durationMs: null, sessionId: sessionId ?? null, meta,
-		}));
+		s.stmt.run(...conversationValues(s.cols, role, text, sessionId, meta));
 	} catch (e) {
 		console.error('[conversation-store] insert failed:', e);
 	}
 }
 
+/** The row a conversation line makes: the one contract both the sync and the async writer use. */
+function conversationValues(cols: string[], role: string, text: string, sessionId?: string, meta?: SpeakerMeta) {
+	return rowValues(cols, {
+		tsUnix: meta?.tsUnix ?? Date.now() / 1000, kind: kindFromRole(role), text,
+		durationMs: null, sessionId: sessionId ?? null, meta,
+	});
+}
+
+// node:sqlite is synchronous: the async writer runs the INSERT in a worker thread, so the voice
+// event loop never waits on disk or busy_timeout. Inline source, as the voice agent ships bundled.
+const ASYNC_WRITER_SOURCE = `
+const { parentPort, workerData } = require('node:worker_threads');
+const { DatabaseSync } = require('node:sqlite');
+let db = null;
+const stmts = new Map();
+parentPort.on('message', ({ id, sql, values }) => {
+  let ok = true;
+  try {
+    if (!db) { db = new DatabaseSync(workerData.dbPath); db.exec('PRAGMA journal_mode = WAL'); db.exec('PRAGMA busy_timeout = 1000'); }
+    let s = stmts.get(sql);
+    if (!s) { s = db.prepare(sql); stmts.set(sql, s); }
+    s.run(...values);
+  } catch (e) { ok = false; }
+  parentPort.postMessage({ id, ok });
+});
+`;
+let asyncWriter: Worker | null = null;
+let asyncSeq = 0;
+const asyncPending = new Map<number, (ok: boolean) => void>();
+function writer(): Worker | null {
+	if (asyncWriter) return asyncWriter;
+	try {
+		const w = new Worker(ASYNC_WRITER_SOURCE, { eval: true, workerData: { dbPath: DB_PATH } });
+		w.unref();
+		w.on('message', (m: { id: number; ok: boolean }) => { asyncPending.get(m.id)?.(m.ok); asyncPending.delete(m.id); });
+		const down = () => { asyncWriter = null; for (const done of asyncPending.values()) done(false); asyncPending.clear(); };
+		w.on('error', down);
+		w.on('exit', down);
+		asyncWriter = w;
+	} catch (e) {
+		console.error('[conversation-store] async writer failed to start:', e);
+	}
+	return asyncWriter;
+}
+
+/** recordConversation off the event loop: resolves once the row is written (or the write failed, logged). */
+export function recordConversationAsync(role: string, text: string, sessionId?: string, meta?: SpeakerMeta): Promise<void> {
+	init();
+	const s = surfaces.get(sourceFromRole(role));
+	const w = s && db ? writer() : null;
+	if (!s || !w) return Promise.resolve();
+	const sql = `INSERT INTO ${s.table} (${s.insertCols.join(', ')}) VALUES (${s.insertCols.map(() => '?').join(', ')})`;
+	const id = ++asyncSeq;
+	return new Promise((resolve) => {
+		asyncPending.set(id, (ok) => {
+			if (!ok) console.error('[conversation-store] async insert failed');
+			resolve();
+		});
+		w.postMessage({ id, sql, values: conversationValues(s.insertCols, role, text, sessionId, meta) });
+	});
+}
+
 export function recordSessionBoundary(reason: string = 'user_goodbye', sessionId?: string): void {
 	recordConversation('SESSION_END', reason, sessionId);
+}
+
+export function recordSessionBoundaryAsync(reason: string = 'user_goodbye', sessionId?: string): Promise<void> {
+	return recordConversationAsync('SESSION_END', reason, sessionId);
 }
 
 /**

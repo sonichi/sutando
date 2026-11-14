@@ -1,15 +1,15 @@
 ---
 name: ag2space-voice
-description: "AG2 Space voice surface — binds the room the AG2 Space client announces to the voice session's origin, so work delegated by voice in a room is answered in that room, and moves the client by voice (navigate_ui)."
-when_to_use: "Loaded automatically at voice-agent startup as a manifest skill. Not slash-invoked. Only an AG2 Space client sends the frames it handles; on any other install it stays idle."
+description: "s.space voice surface — binds the room the s.space client announces to the voice session's origin, so work delegated by voice in a room is answered in that room, and moves the client by voice (navigate_ui)."
+when_to_use: "Loaded automatically at voice-agent startup as a manifest skill. Not slash-invoked. Only an s.space client sends the frames it handles; on any other install it stays idle."
 ---
 
-# AG2 Space voice
+# s.space voice
 
-Optional plugin for installs that talk to an AG2 Space client (desktop app or webapp).
+Optional plugin for installs that talk to an s.space client (desktop app or webapp).
 The host engine carries a product-neutral *voice session origin* (`VoiceSessionOrigin`,
 `src/task-bridge.ts`) and offers client frames to skills (`setup(ctx)`, see
-[`skills/MANIFEST.md`](../MANIFEST.md)). This skill owns everything AG2 Space specific on
+[`skills/MANIFEST.md`](../MANIFEST.md)). This skill owns everything s.space specific on
 top of that. Remove the directory and the engine boots, types and tests unchanged.
 
 ## Wire contract (client side: webapp `features/room/voice/`)
@@ -36,8 +36,23 @@ top of that. Remove the directory and the engine boots, types and tests unchange
   `[dm-only]` delivery note, and a `verify` that re-asks the gateway bridge when the
   result is delivered. Results therefore land as
   `results/proactive-result-<task>-<ts>.to-ag2space.txt` with `[channel: <room>]` first.
+- **In-flight work** keeps the origin and recent context from when the `work` call
+  began (or the turn the relay agent's turn check sends), including across the relay
+  agent's wait for the user to finish, its request check, a room switch or
+  disconnect/reconnect. A pending
+  transcription is omitted if the room changes, the turns provider is replaced,
+  or the client disconnects; the new session's words never fill that old task.
+  Re-announcing the room already bound, and a spoken farewell ("research X, bye"),
+  change none of these, so the owner's words for that task are kept. Delivery
+  still re-checks the original room's membership and honors `[dm-only]`.
 - **Prompt**: a `ROOM:` context line while docked, and one system notice per actual
   room change.
+- **`current_room`** — "which room are you in?" is answered from the binding at the
+  moment it is asked, never from what the model remembers: the notice comes once per
+  change, can be missed (a reconnect, a busy session) and can be outweighed by an
+  earlier room still in context. It sits with `navigate_ui` in `voiceSurface()`, under
+  the same condition, with its WHERE YOU ARE prompt rule and a turn-check rule. It is
+  listed as an answering tool, so the turn never also goes to the core.
 - **`navigate.ts` / `navigate-protocol.ts`** — the `navigate_ui` tool ("let's talk in my
   DM", "take me to GTM in Investors", "go home"). It is contributed through
   `voiceSurface()`, so it is on the web voice session only, never the phone tool table,

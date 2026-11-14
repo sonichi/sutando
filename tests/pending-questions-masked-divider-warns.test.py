@@ -20,7 +20,7 @@ import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "skills" / "pending-questions" / "scripts"))
 from pending_questions_md import active_region  # noqa: E402
 
 TICK = chr(96)

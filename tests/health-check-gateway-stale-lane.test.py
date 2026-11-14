@@ -7,6 +7,12 @@ So with the primary serving, `check_gateway_bridge` read `ok` for as long as a
 lane stayed dead. The silence of the sidecar is the only evidence, and this
 suite pins that the verdict reads it.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import shutil

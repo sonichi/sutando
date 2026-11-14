@@ -13,6 +13,12 @@ contract, and best-effort stays the caller's policy at the edge.
 
 Run: python3 tests/runtime-health-atomic-writes.test.py
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os

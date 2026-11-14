@@ -1,4 +1,4 @@
-"""Triage-queue policy for pending-questions.md: ranking, re-check verdict, dismissal.
+"""Triage-queue policy for owner pending questions: ranking, re-check verdict, dismissal.
 
 Policy only — no file reads, no subprocesses. The HTTP adapter owns the IO (reading
 the markdown, probing GitHub, serving rows) and calls in here for every decision, so

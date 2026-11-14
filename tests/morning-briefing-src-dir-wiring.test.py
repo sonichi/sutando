@@ -28,6 +28,12 @@ reasons and only one of them is evidence:
 assertion. A reader who runs the obvious whole-file revert will see the bigger
 number and credit this file with more than it earns.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import sys
 import unittest

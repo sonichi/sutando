@@ -12,10 +12,12 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "skills/worker-pool/scripts"))
@@ -158,6 +160,26 @@ class TestItRefusesBeforeCreating(Base):
         self.assertEqual(self.spawned, [])
         self.assertIsNone(pr.load_roster(self.ws))
 
+    def test_roster_validation_delegates_before_preview_or_spawn(self):
+        for args in ((), ("--dry-run",)):
+            with self.subTest(args=args), mock.patch.object(
+                    pr, "validate_current_roster", side_effect=pr.RosterError("roster refusal")) as validate, \
+                    mock.patch.object(sw, "plan") as plan, \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(self.run_cli(*args), cw.REFUSED)
+                validate.assert_called_once_with(str(self.ws))
+                plan.assert_not_called()
+                self.assertEqual(self.spawned, [])
+                self.assertIn("create-worker: roster refusal", err.getvalue())
+
+    def test_preflight_does_not_broaden_the_validators_policy(self):
+        p = pr.roster_path(self.ws)
+        p.parent.mkdir(parents=True)
+        p.write_text(json.dumps({"version": "unchecked", "workers": None}))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.run_cli("--dry-run"), 0)
+        self.assertEqual(self.spawned, [])
+
 
 class TestFailuresAreLoud(Base):
     """The two paths that leave the owner without a usable worker: both must
@@ -174,6 +196,55 @@ class TestFailuresAreLoud(Base):
             raise sw.SpawnRefused("tmux session already exists")
         sw.spawn = boom
         self.assertEqual(self.run_cli(), cw.REFUSED)
+
+    def test_a_timer_repo_conflict_warns_a_non_json_user(self):
+        fake_spawn = sw.spawn
+
+        def conflicted(*a, **kw):
+            return {**fake_spawn(*a, **kw), "remedy_timer": {
+                "ensured": False, "conflict": True,
+                "why": "timer belongs to another checkout"}}
+
+        sw.spawn = conflicted
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.run_cli("--label", "reviewer")
+        self.assertEqual(rc, 0)
+        self.assertIn("worker ", out.getvalue())
+        self.assertIn("WARNING", err.getvalue())
+        self.assertIn("unattended recovery is unavailable", err.getvalue())
+        self.assertIn("another checkout", err.getvalue())
+
+    def test_a_timer_bootstrap_failure_warns_a_non_json_user(self):
+        fake_spawn = sw.spawn
+
+        def failed(*a, **kw):
+            return {**fake_spawn(*a, **kw), "remedy_timer": {
+                "ensured": False, "why": "RuntimeError: launchctl bootstrap failed"}}
+
+        sw.spawn = failed
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = self.run_cli("--label", "reviewer")
+        self.assertEqual(rc, 0)
+        self.assertIn("worker ", out.getvalue())
+        self.assertIn("WARNING", err.getvalue())
+        self.assertIn("unattended recovery is unavailable", err.getvalue())
+        self.assertIn("bootstrap failed", err.getvalue())
+
+    def test_an_existing_timer_or_non_macos_no_op_stays_quiet(self):
+        fake_spawn = sw.spawn
+        for why in ("already installed", "launchd is macOS-only"):
+            with self.subTest(why=why):
+                def unchanged(*a, **kw):
+                    return {**fake_spawn(*a, **kw), "remedy_timer": {
+                        "ensured": False, "why": why}}
+
+                sw.spawn = unchanged
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    self.assertEqual(self.run_cli(), 0)
+                self.assertNotIn("WARNING", err.getvalue())
 
     def test_a_worker_created_but_unrostered_fails_loudly(self):
         # The worst outcome: the worker exists and routing cannot see it. It
@@ -249,21 +320,15 @@ class TestDryRunPredictsTheSameRuntimeAsTheRealRun(Base):
         self.assertEqual(self.run_cli(), 0)
         self.assertEqual(planned, "claude")
 
-    def test_omitted_runtime_with_an_unsupported_core_refuses_both_ways(self):
+    def test_omitted_runtime_with_a_codex_core_matches(self):
         sw.core_runtime = lambda repo, runner=None: "codex"
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            dry_rc = self.run_cli("--dry-run")
-        self.assertEqual(dry_rc, cw.REFUSED)
-        self.assertIn("worker mode", err.getvalue())
-        self.assertEqual(self.spawned, [])
-
-        err2 = io.StringIO()
-        with contextlib.redirect_stderr(err2):
-            real_rc = self.run_cli()
-        self.assertEqual(real_rc, cw.REFUSED)
-        self.assertIn("worker mode", err2.getvalue())
-        self.assertEqual(self.spawned, [])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.run_cli("--dry-run"), 0)
+        self.assertEqual(json.loads(out.getvalue())["runtime"], "codex")
+        self.assertEqual(self.run_cli(), 0)
+        self.assertEqual(pr.load_roster(self.ws)["workers"][self.spawned[-1]]["runtime"],
+                         "codex")
 
     def test_explicit_supported_runtime_is_honored(self):
         out = io.StringIO()
@@ -296,15 +361,16 @@ class TestTheWriterRefusesAnUnreadableOrMalformedRosterViaTheCli(Base):
         p = pr.roster_path(self.ws)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps({"version": 7, "workers": {"a" * 32: {
-            "label": "keeper", "state": "idle"}}, "bindings": {}}))
+            "label": "keeper", "state": "live"}}, "bindings": {}}))
         before = p.read_bytes()
         p.chmod(0o000)
         self.addCleanup(lambda: p.chmod(0o644))
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            rc = self.run_cli()
-        self.assertNotEqual(rc, 0)
-        self.assertIn(self.spawned[0], err.getvalue())
+        for args in ((), ("--dry-run",)):
+            err = io.StringIO()
+            with self.subTest(args=args), contextlib.redirect_stderr(err):
+                self.assertEqual(self.run_cli(*args), cw.REFUSED)
+                self.assertIn("roster unreadable", err.getvalue())
+                self.assertEqual(self.spawned, [])
         p.chmod(0o644)
         self.assertEqual(p.read_bytes(), before)
 
@@ -312,8 +378,12 @@ class TestTheWriterRefusesAnUnreadableOrMalformedRosterViaTheCli(Base):
         p = pr.roster_path(self.ws)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("{not json")
-        rc = self.run_cli()
-        self.assertNotEqual(rc, 0)
+        for args in ((), ("--dry-run",)):
+            err = io.StringIO()
+            with self.subTest(args=args), contextlib.redirect_stderr(err):
+                self.assertEqual(self.run_cli(*args), cw.REFUSED)
+                self.assertIn("roster is not valid JSON", err.getvalue())
+                self.assertEqual(self.spawned, [])
         self.assertEqual(p.read_text(), "{not json")
 
     def test_an_absent_roster_still_succeeds(self):
@@ -326,6 +396,170 @@ class TestABindingNeedsARouter(Base):
     """A room binding with no task-event handler sends that room's work to the
     core instead — silently, while the binding claims otherwise. Creation must
     refuse BEFORE any of the four side effects, not report success."""
+
+    def configure_handler(self):
+        os.environ.pop("SUTANDO_TASK_EVENT_HANDLER", None)
+        config = self.ws / "state" / "task-event-handler.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps({"handler": str(self.handler)}))
+        return config
+
+    def snapshot(self):
+        return {str(p.relative_to(self.ws)): (
+            p.stat().st_mode, p.stat().st_mtime_ns,
+            p.read_bytes() if p.is_file() else None)
+            for p in self.ws.rglob("*")}
+
+    def assert_bound_refused_without_writes(self, *messages):
+        for args in ((), ("--dry-run",)):
+            with self.subTest(args=args):
+                before = self.snapshot()
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    rc = self.run_cli("--room", ROOM, *args)
+                self.assertEqual(rc, cw.REFUSED)
+                self.assertEqual(out.getvalue(), "")
+                for message in messages:
+                    self.assertIn(message, err.getvalue())
+                self.assertEqual(self.spawned, [])
+                self.assertEqual(self.snapshot(), before)
+
+    def test_configured_handler_dry_run_returns_the_plan_without_writes(self):
+        self.ws = self.ws / "workspace with 'quotes' $literal"
+        self.ws.mkdir()
+        self.handler = self.handler.rename(self.ws / "handler with 'quotes' $literal ")
+        self.configure_handler()
+        before = self.snapshot()
+        result = subprocess.run(
+            [sys.executable, str(REPO / "skills/worker-pool/scripts/create_worker.py"),
+             "--workspace", str(self.ws), "--repo", str(REPO), "--runtime", "claude",
+             "--room", ROOM, "--dry-run"],
+            capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["would_bind"], ROOM)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_configured_handler_registers_the_worker_and_binding(self):
+        self.configure_handler()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = self.run_cli("--room", ROOM, "--label", "configured", "--json")
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.spawned), 1)
+        wid = self.spawned[0]
+        self.assertEqual(json.loads(out.getvalue())["worker_id"], wid)
+        self.assertEqual(json.loads(out.getvalue())["room"], ROOM)
+        roster = pr.load_roster(self.ws)
+        self.assertEqual(roster["workers"][wid]["label"], "configured")
+        self.assertEqual(pr.load_bindings(self.ws), {ROOM: wid})
+        self.assertEqual(pr.targets_for(roster, ROOM), [wid])
+        advertisement = json.loads((self.ws / "state/pool-advertisement.json").read_text())
+        self.assertEqual(advertisement["profile_workers"][wid]["label"], "configured")
+
+    def test_handler_paths_preserve_line_endings(self):
+        config = self.ws / "state" / "task-event-handler.json"
+        for source in ("config", "pin"):
+            for name in ("router\rcandidate", "router\r\ncandidate", "router\ncandidate",
+                         "router\r", "router\n\n"):
+                with self.subTest(source=source, name=name):
+                    self.handler = self.handler.rename(self.ws / name)
+                    config.unlink(missing_ok=True)
+                    if source == "config":
+                        self.configure_handler()
+                    else:
+                        os.environ["SUTANDO_TASK_EVENT_HANDLER"] = str(self.handler)
+                    before = self.snapshot()
+                    spawned_before = list(self.spawned)
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out):
+                        self.assertEqual(self.run_cli("--room", ROOM, "--dry-run"), 0)
+                    self.assertEqual(json.loads(out.getvalue())["would_bind"], ROOM)
+                    self.assertEqual(self.snapshot(), before)
+                    self.assertEqual(self.spawned, spawned_before)
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(self.run_cli("--room", ROOM), 0)
+                    self.assertEqual(len(self.spawned), len(spawned_before) + 1)
+                    self.assertEqual(pr.load_bindings(self.ws), {ROOM: self.spawned[-1]})
+                    self.assertEqual(pr.targets_for(pr.load_roster(self.ws), ROOM),
+                                     [self.spawned[-1]])
+
+    def test_directory_paths_cannot_change_line_endings_to_match_a_file(self):
+        lookalike = self.ws / "router\ncandidate"
+        lookalike.write_text("#!/usr/bin/env python3\n")
+        lookalike.chmod(0o755)
+        for name in ("router\rcandidate", "router\r\ncandidate"):
+            directory = self.ws / name
+            directory.mkdir()
+            self.assertTrue(os.access(directory, os.X_OK))
+            for source in ("config", "pin"):
+                with self.subTest(source=source, name=name):
+                    config = self.configure_handler()
+                    if source == "config":
+                        config.write_text(json.dumps({"handler": str(directory)}))
+                    else:
+                        os.environ["SUTANDO_TASK_EVENT_HANDLER"] = str(directory)
+                    self.assert_bound_refused_without_writes(
+                        repr(str(directory)), "not an executable file")
+
+    def test_invalid_pin_never_falls_back_to_a_valid_declaration(self):
+        self.configure_handler()
+        dud = self.ws / "not-executable"
+        dud.write_text("fixture")
+        dud.chmod(0o600)
+        for pin in (self.ws / "missing", self.ws, dud):
+            with self.subTest(pin=pin):
+                os.environ["SUTANDO_TASK_EVENT_HANDLER"] = str(pin)
+                self.assert_bound_refused_without_writes(
+                    "SUTANDO_TASK_EVENT_HANDLER", str(pin), "not an executable file")
+
+    def test_unusable_configuration_refuses_before_creating(self):
+        config = self.configure_handler()
+        dud = self.ws / "not-executable"
+        dud.write_text("fixture")
+        dud.chmod(0o600)
+        contents = [None, "{broken", "[]", "null", "{}", '{"handler": 42}']
+        contents.extend(json.dumps({"handler": str(path)})
+                        for path in (self.ws / "missing", self.ws, dud))
+        for content in contents:
+            with self.subTest(content=content):
+                if content is None:
+                    config.unlink()
+                else:
+                    config.write_text(content)
+                self.assert_bound_refused_without_writes(
+                    "task-event handler", str(config), "SUTANDO_TASK_EVENT_HANDLER")
+
+    def test_valid_pin_wins_over_malformed_configuration(self):
+        config = self.configure_handler()
+        config.write_text("{broken")
+        os.environ["SUTANDO_TASK_EVENT_HANDLER"] = str(self.handler)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.run_cli("--room", ROOM, "--dry-run"), 0)
+            self.assertEqual(self.run_cli("--room", ROOM), 0)
+        self.assertEqual(pr.load_bindings(self.ws), {ROOM: self.spawned[0]})
+
+    def test_configured_handler_cannot_bypass_core_or_sentinel_guards(self):
+        self.configure_handler()
+        with mock.patch.dict(os.environ, SUTANDO_INSTANCE_ID="a" * 32):
+            self.assert_bound_refused_without_writes("a worker cannot create workers")
+        with mock.patch.object(sw, "per_instance_sentinel_supported", return_value=False):
+            self.assert_bound_refused_without_writes("ONE watcher sentinel")
+
+    def test_lookup_invocation_failure_refuses_before_creating(self):
+        self.configure_handler()
+        for error in (OSError("cannot run lookup"), subprocess.TimeoutExpired("bash", 10)):
+            with self.subTest(error=error):
+                with mock.patch.object(cw.subprocess, "run", side_effect=error):
+                    self.assert_bound_refused_without_writes("handler lookup failed")
+
+    def test_empty_or_failed_lookup_cannot_authorize_creation(self):
+        self.configure_handler()
+        for status, output in ((0, b""), (1, os.fsencode(self.handler) + b"\n")):
+            with self.subTest(status=status):
+                result = subprocess.CompletedProcess([], status, output, b"")
+                with mock.patch.object(cw.subprocess, "run", return_value=result):
+                    self.assert_bound_refused_without_writes("task-event handler")
 
     def test_binding_a_room_without_a_handler_is_refused(self):
         os.environ.pop("SUTANDO_TASK_EVENT_HANDLER", None)

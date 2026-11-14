@@ -2,6 +2,12 @@
 """`--jsonl` carries each message's id and jump link; the text mode stays byte-for-byte as it was.
 The owner's triage card asked for links on message rows (2026-09-12); the text lines carry no id.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib.util
 import io

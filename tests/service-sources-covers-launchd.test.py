@@ -11,6 +11,11 @@ Scope is deliberately KeepAlive jobs only. A StartInterval job is short-lived, s
 row for one would report staleness nondeterministically.
 """
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import pathlib

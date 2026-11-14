@@ -9,6 +9,12 @@ structure assertions, plus a behavioral test that exec's the real
 `_socket_connected` source with its production filename and line numbers
 against fake handlers. Run: python3 tests/slack-bridge-heartbeat-wedge.test.py
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import re
 import types
 from pathlib import Path
@@ -59,14 +65,13 @@ check("socket-connected-checks-is_connected",
       re.search(r"def _socket_connected\(\)", SRC) is not None and "is_connected()" in SRC,
       "_socket_connected() must call the client's is_connected()")
 
-# 3. The handler is wired to the module ref BEFORE handler.start() so the
-#    heartbeat thread (started earlier) can read live state.
+# 3. Wired BEFORE main()'s blocking start so the earlier heartbeat thread reads live state;
+#    the start goes through _start_socket_mode(), which must call handler.start().
 wire = SRC.find("_socket_handler = handler")
-# rfind: the real `handler.start()` call is the LAST occurrence — an earlier
-# mention lives in a code comment.
-start = SRC.rfind("handler.start()")
+start = SRC.find("_start_socket_mode(handler)  # blocks")
+helper = re.search(r"def _start_socket_mode\(handler\)[^\n]*\n(?:[ \t]+[^\n]*\n|\n)*?[ \t]+handler\.start\(\)", SRC)
 check("handler-wired-before-start",
-      wire != -1 and start != -1 and wire < start,
+      wire != -1 and start != -1 and wire < start and helper is not None,
       "_socket_handler must be set before handler.start()")
 
 # Exec the real _socket_connected source standalone: exercises production code

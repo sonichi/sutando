@@ -59,7 +59,7 @@ phone_gate="$(env -i PATH="/usr/bin:/bin" bash -c '
 ' _ "$REPO")"
 grep -qx $'disabled\nenabled' <<<"$phone_gate"
 grep -q '^elif ! phone_stack_enabled; then$' "$REPO/src/startup.sh"
-grep -q '^if phone_stack_enabled && grep -qE ' "$REPO/src/startup.sh"
+grep -q '^if phone_stack_enabled && twilio_creds_present; then$' "$REPO/src/startup.sh"
 
 # Exercise verify-setup rather than inspecting its source. Stub only external
 # prerequisites; the actual verifier resolves the selected runtime and auth.

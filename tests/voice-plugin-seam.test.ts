@@ -111,7 +111,23 @@ describe('collectVoiceSurface', () => {
 
 	it('no hooks: nothing is added', () => {
 		const merged = collectVoiceSurface([]);
-		assert.deepEqual([merged.tools, merged.promptRules, merged.contextLines()], [[], [], []]);
+		assert.deepEqual([merged.tools, merged.promptRules, merged.contextLines(), merged.answeringTools, merged.turnCheckRules], [[], [], [], [], []]);
+	});
+
+	it('collects the tools that fetch the answer themselves', () => {
+		const merged = collectVoiceSurface([
+			() => ({ answeringTools: ['read_room', ''] }),
+			() => ({ tools: [] }),
+		]);
+		assert.deepEqual(merged.answeringTools, ['read_room']);
+	});
+
+	it('collects the rules a skill gives the turn check', () => {
+		const merged = collectVoiceSurface([
+			() => ({ turnCheckRules: ['- none: room questions', ''] }),
+			() => ({ turnCheckRules: 'nope' as never }),
+		]);
+		assert.deepEqual(merged.turnCheckRules, ['- none: room questions']);
 	});
 });
 

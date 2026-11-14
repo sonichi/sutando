@@ -22,6 +22,8 @@ export type SkillSetupCtx = {
 	getVoiceSessionOrigin: () => VoiceSessionOrigin | null;
 	/** Recover the origin of a task written before a restart from its header lines. */
 	setVoiceTaskOriginResolver: (resolver: VoiceTaskOriginResolver | null) => void;
+	/** Each time the user's speech is transcribed: a skill holding a change for a spoken yes knows someone spoke. */
+	onUserSpoke?: (handler: () => void) => void;
 };
 export type SkillSetup = (ctx: SkillSetupCtx) => void;
 
@@ -33,6 +35,10 @@ export interface VoiceSurfaceContribution {
 	promptRules?: string[];
 	/** Context lines, re-evaluated at every prompt build. */
 	contextLines?: () => string[];
+	/** Tools that fetch the answer themselves: a turn the voice model answers with one is not also sent to the core. */
+	answeringTools?: string[];
+	/** Rule lines for the relay agent's turn check: what the voice model answers itself and the core is never asked. */
+	turnCheckRules?: string[];
 }
 export type VoiceSurfaceHook = () => VoiceSurfaceContribution;
 
@@ -44,6 +50,8 @@ export function collectVoiceSurface(
 	const tools: ToolDefinition[] = [];
 	const promptRules: string[] = [];
 	const contextFns: Array<() => string[]> = [];
+	const answeringTools: string[] = [];
+	const turnCheckRules: string[] = [];
 	for (const hook of hooks) {
 		try {
 			const c = hook();
@@ -51,6 +59,8 @@ export function collectVoiceSurface(
 			if (Array.isArray(c.tools)) tools.push(...c.tools);
 			if (Array.isArray(c.promptRules)) promptRules.push(...c.promptRules.filter(l => typeof l === 'string' && l));
 			if (typeof c.contextLines === 'function') contextFns.push(c.contextLines);
+			if (Array.isArray(c.answeringTools)) answeringTools.push(...c.answeringTools.filter(n => typeof n === 'string' && n));
+			if (Array.isArray(c.turnCheckRules)) turnCheckRules.push(...c.turnCheckRules.filter(l => typeof l === 'string' && l));
 		} catch (err) {
 			log('[voice-surface] hook threw:', err instanceof Error ? err.message : err);
 		}
@@ -67,7 +77,7 @@ export function collectVoiceSurface(
 		}
 		return out;
 	};
-	return { tools, promptRules, contextLines };
+	return { tools, promptRules, contextLines, answeringTools, turnCheckRules };
 }
 
 function isThenable(v: unknown): v is PromiseLike<unknown> {

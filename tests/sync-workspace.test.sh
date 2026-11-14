@@ -53,7 +53,8 @@ _REAL_SYNC_DIR="${SUTANDO_MEMORY_SYNC_DIR:-$HOME/.sutando/memory-sync}"
 # operator's own clone by hand.
 # shellcheck source=lib/real-clone-guard.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/real-clone-guard.sh"
-rcg_snapshot "$_REAL_SYNC_DIR"
+# rcg_snapshot comes below, under the private git config: the guard digests
+# `ls-files --exclude-standard`, so an inherited core.excludesFile alone trips it.
 
 # Deny by default. Per-test fixtures still set these explicitly per invocation.
 _DENIED_SYNC_DIR="$(mktemp -d -t sync-ws-denied.XXXXXX)"
@@ -71,8 +72,7 @@ _assert_real_clone_untouched() {
 # that is set globally and the dependency is invisible; on the ubuntu-latest
 # runner it is not, and every commit dies with
 #   Author identity unknown / *** Please tell me who you are.
-# which is why this suite sits in tests/shell-ci-known-failures.txt. Pin an
-# identity here so the suite carries its own, rather than borrowing one.
+# Pin an identity here so the suite carries its own, rather than borrowing one.
 export GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-sync-workspace-test}"
 export GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-sync-workspace-test@invalid}"
 export GIT_COMMITTER_NAME="${GIT_COMMITTER_NAME:-sync-workspace-test}"
@@ -81,9 +81,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 TEST_ROOT="$(mktemp -d -t sync-workspace-test.XXXXXX)"
+# Every git in this run reads ONE config, written here: the operator's global
+# config (gpgsign, hooksPath, defaultBranch, rerere) never reaches a fixture.
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL="$TEST_ROOT/gitconfig"
+printf '[user]\n\tname = %s\n\temail = %s\n' "$GIT_AUTHOR_NAME" "$GIT_AUTHOR_EMAIL" > "$GIT_CONFIG_GLOBAL"
+# Under the same config the EXIT trap's rcg_assert reads (see above).
+rcg_snapshot "$_REAL_SYNC_DIR"
 # bash traps REPLACE rather than stack, so the tripwire must run from the SAME EXIT
 # trap as the cleanup or a later trap silently discards it.
 trap '_assert_real_clone_untouched; rm -rf "$TEST_ROOT" "$_DENIED_SYNC_DIR"' EXIT
+# The script's log defaults to ONE file under $TMPDIR, shared by every suite in a lane.
+export SYNC_WORKSPACE_LOG="$TEST_ROOT/sync-workspace.log"
+# The fixtures below that start from a bare environment (`env -i`) must carry the
+# identity and the config too, or on a runner with no global git config their
+# commits die with 128 ("Author identity unknown"); and the lock, or they take the
+# script's host-global default and a sibling suite's run makes theirs skip (exit 0).
+BARE_ENV=(env -i HOME="$HOME" PATH="$PATH"
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$GIT_CONFIG_GLOBAL"
+  SYNC_WORKSPACE_LOG="$SYNC_WORKSPACE_LOG"
+  SUTANDO_SYNC_LOCK_DIR="$TEST_ROOT/sync.lock.d"
+  GIT_AUTHOR_NAME="$GIT_AUTHOR_NAME" GIT_AUTHOR_EMAIL="$GIT_AUTHOR_EMAIL"
+  GIT_COMMITTER_NAME="$GIT_COMMITTER_NAME" GIT_COMMITTER_EMAIL="$GIT_COMMITTER_EMAIL")
 
 fail=0
 pass=0
@@ -500,6 +519,10 @@ if [ "$POST_NOTE_COUNT" -ge "$PRE_NOTE_COUNT" ]; then
 else
   echo "  FAIL: tripwire didn't restore working tree ($PRE_NOTE_COUNT → $POST_NOTE_COUNT)"; fail=$((fail+1))
 fi
+# Retire the mass-deleting peer: every later pull would merge it first, and
+# Test 12's peer would then land as 60 rename/delete conflicts on an already
+# emptied notes/, not as the delete-and-add it stages.
+git --git-dir="$FIXTURE_VAULT" branch -q -D "host/peerhost2"
 
 # ============================================================================
 echo
@@ -581,7 +604,9 @@ git clone -q "$FIXTURE_VAULT" "$PEER3_WS" 2>/dev/null
     cd "$PEER3_WS"
     git checkout -B "host/peerhost3" "origin/host/${HOST}/${WS_ID}" >/dev/null 2>&1
     rm -f notes/note-*.md
-    for i in $(seq 1 60); do echo "n$i" > "notes/replacement-$i.md"; done
+    # New bytes, not the deleted note's: an identical body is a rename to git,
+    # and the tripwire exempts renames (-M) by design.
+    for i in $(seq 1 60); do echo "replacement $i" > "notes/replacement-$i.md"; done
     git add -A
     git -c user.email=peer3@test -c user.name=peer3 commit -q -m "peer3 deletes 60 + adds 60 (net zero)" >/dev/null 2>&1
     git push -q origin "host/peerhost3" 2>/dev/null
@@ -620,15 +645,16 @@ fi
 PRE_HEAD2=$(cd "$FIXTURE_WS" && git rev-parse HEAD 2>/dev/null)
 N_ITER=10
 drift_count=0
+drift_heads=""
 for i in $(seq 1 "$N_ITER"); do
     run_sync --pull-only >/dev/null 2>&1 || true
     cur_head=$(cd "$FIXTURE_WS" && git rev-parse HEAD 2>/dev/null)
-    [ "$cur_head" = "$PRE_HEAD2" ] || drift_count=$((drift_count + 1))
+    [ "$cur_head" = "$PRE_HEAD2" ] || { drift_count=$((drift_count + 1)); drift_heads="$drift_heads $cur_head"; }
 done
 if [ "$drift_count" = "0" ]; then
   echo "  OK: HEAD unchanged across $N_ITER repeated tripwire pulls ($PRE_HEAD2)"; pass=$((pass+1))
 else
-  echo "  FAIL: HEAD drifted in $drift_count of $N_ITER pulls"; fail=$((fail+1))
+  echo "  FAIL: HEAD drifted in $drift_count of $N_ITER pulls: expected $PRE_HEAD2, saw$drift_heads"; fail=$((fail+1))
 fi
 
 # Mini #1445 v4 test gap: assert git status is clean (no leftover staged/unmerged)
@@ -1078,7 +1104,7 @@ mkdir -p "$WSA_WS/.claude-sutando/projects/${WSA_SLUG}/memory"
 mkdir -p "$WSA_WS/notes"
 echo "from workspace A" > "$WSA_WS/.claude-sutando/projects/${WSA_SLUG}/memory/feedback_wsA.md"
 
-env -i HOME="$HOME" PATH="$PATH" \
+"${BARE_ENV[@]}" \
     SUTANDO_REPO_DIR="$WSA_REPO" \
     SUTANDO_WORKSPACE="$WSA_WS" \
     SUTANDO_TEST_MODE=1 \
@@ -1103,7 +1129,7 @@ mkdir -p "$WSB_WS/.claude-sutando/projects/${WSB_SLUG}/memory"
 mkdir -p "$WSB_WS/notes"
 echo "from workspace B" > "$WSB_WS/.claude-sutando/projects/${WSB_SLUG}/memory/feedback_wsB.md"
 
-env -i HOME="$HOME" PATH="$PATH" \
+"${BARE_ENV[@]}" \
     SUTANDO_REPO_DIR="$WSB_REPO" \
     SUTANDO_WORKSPACE="$WSB_WS" \
     SUTANDO_TEST_MODE=1 \
@@ -1137,7 +1163,7 @@ else
 fi
 
 # Re-run --init on wsA WITHOUT override → must NOT regenerate, reads persisted
-RERUN_OUT=$(env -i HOME="$HOME" PATH="$PATH" \
+RERUN_OUT=$("${BARE_ENV[@]}" \
     SUTANDO_REPO_DIR="$WSA_REPO" \
     SUTANDO_WORKSPACE="$WSA_WS" \
     SUTANDO_TEST_MODE=1 \
@@ -1184,7 +1210,7 @@ echo "hostA note" > "$HOSTA_WS/notes/hostA-note.md"
 # Run --init on host A — hostname is the same across both hosts (same machine
 # running the test), so we override HOST per-invocation via the
 # SUTANDO_HOST_OVERRIDE test-only shim in the script.
-env -i HOME="$HOME" PATH="$PATH" \
+"${BARE_ENV[@]}" \
     SUTANDO_REPO_DIR="$HOSTA_REPO" \
     SUTANDO_WORKSPACE="$HOSTA_WS" \
     SUTANDO_TEST_MODE=1 \
@@ -1211,7 +1237,7 @@ mkdir -p "$HOSTB_WS/notes"
 echo "from hostB" > "$HOSTB_WS/.claude-sutando/projects/${HOSTB_SLUG}/memory/feedback_hostB.md"
 echo "hostB note" > "$HOSTB_WS/notes/hostB-note.md"
 
-env -i HOME="$HOME" PATH="$PATH" \
+"${BARE_ENV[@]}" \
     SUTANDO_REPO_DIR="$HOSTB_REPO" \
     SUTANDO_WORKSPACE="$HOSTB_WS" \
     SUTANDO_TEST_MODE=1 \
@@ -1237,7 +1263,7 @@ else
 fi
 
 # Now run --pull-only on host B → should merge hostA in via --allow-unrelated-histories
-PULL_OUT=$(env -i HOME="$HOME" PATH="$PATH" \
+PULL_OUT=$("${BARE_ENV[@]}" \
     SUTANDO_REPO_DIR="$HOSTB_REPO" \
     SUTANDO_WORKSPACE="$HOSTB_WS" \
     SUTANDO_TEST_MODE=1 \
@@ -1376,7 +1402,7 @@ else
 fi
 
 # Run the NEW sync (default bidirectional). Migration should fire.
-T27_OUT=$(env -i HOME="$HOME" PATH="$PATH" \
+T27_OUT=$("${BARE_ENV[@]}" \
     SUTANDO_REPO_DIR="$T27_REPO" \
     SUTANDO_WORKSPACE="$T27_WS" \
     SUTANDO_TEST_MODE=1 \
@@ -1422,7 +1448,8 @@ echo "==== Test 28: clean tree re-pushes a commit the remote never received (pus
 T28_ROOT="$TEST_ROOT/t28"; mkdir -p "$T28_ROOT"
 T28_VAULT="$T28_ROOT/vault.git"; git init -q --bare "$T28_VAULT"
 T28_WS="$T28_ROOT/ws"; mkdir -p "$T28_WS/notes"; echo "n" > "$T28_WS/notes/t28.md"
-t28_env=(SUTANDO_REPO_DIR="$FIXTURE_REPO" SUTANDO_WORKSPACE="$T28_WS" SUTANDO_TEST_MODE=1 SUTANDO_WS_ID_OVERRIDE=t28ws SUTANDO_HOST_OVERRIDE=t28host)
+t28_env=(SUTANDO_REPO_DIR="$FIXTURE_REPO" SUTANDO_WORKSPACE="$T28_WS" SUTANDO_TEST_MODE=1 SUTANDO_WS_ID_OVERRIDE=t28ws SUTANDO_HOST_OVERRIDE=t28host
+  SUTANDO_SYNC_LOCK_DIR="$TEST_ROOT/sync.lock.d")
 T28_BR="refs/heads/host/t28host/t28ws"
 env "${t28_env[@]}" bash "$SYNC" --vault-url "$T28_VAULT" --init >/dev/null 2>&1
 # Simulate a lost / never-completed push: branch gone from the vault, tree clean.

@@ -2,13 +2,15 @@
 """
 Sutando contacts reader — search macOS Contacts via AppleScript.
 
-Usage:
-  python3 contacts.py search "Bob"                          # search by name
-  python3 contacts.py search "bob@x.com"                    # search by email
-  python3 contacts.py add "Bob Smith" --phone 123 --email a@b.com  # add
-  python3 contacts.py update "Bob" --phone 456              # update phone
-  python3 contacts.py update "Bob" --email new@x.com        # update email
-  python3 contacts.py all                                   # list all (first 50)
+Usage (``--owner-asked`` only when the owner asked for the local Contacts app —
+it raises a macOS permission prompt; without it the script refuses, exit 2; a
+macOS denial (-1743) exits 3 with no retry):
+  python3 contacts.py search "Bob" --owner-asked            # search by name
+  python3 contacts.py search "bob@x.com" --owner-asked      # search by email
+  python3 contacts.py add "Bob Smith" --phone 123 --email a@b.com --owner-asked
+  python3 contacts.py update "Bob" --phone 456 --owner-asked          # update phone
+  python3 contacts.py update "Bob" --email new@x.com --owner-asked    # update email
+  python3 contacts.py all --owner-asked                     # list all (first 50)
 
 Output: name, email, phone for matching contacts.
 """
@@ -17,6 +19,17 @@ import json
 import re
 import subprocess
 import sys
+from pathlib import Path
+
+# Sibling helper: the scripts run by path, so their directory is not on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import native_pim_consent as consent  # noqa: E402
+
+
+def _osascript(script: str, timeout: int) -> subprocess.CompletedProcess:
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=timeout)
+    consent.exit_if_denied("Contacts", result.stderr)
+    return result
 
 
 def search_contacts(query: str) -> list[dict]:
@@ -45,10 +58,7 @@ tell application "Contacts"
     return output
 end tell
 """
-    result = subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True, text=True, timeout=30,
-    )
+    result = _osascript(script, timeout=30)
     if result.returncode != 0:
         return [{"error": result.stderr.strip()}]
 
@@ -71,14 +81,16 @@ end tell
     return contacts
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 src/contacts.py search 'name or email'")
+def main(argv=None):
+    argv = consent.require_consent("Contacts", argv)
+    consent.exit_if_denied_earlier("Contacts")
+    if len(argv) < 2:
+        print("Usage: python3 contacts.py search 'name or email' --owner-asked")
         sys.exit(1)
 
-    cmd = sys.argv[1]
-    if cmd == "search" and len(sys.argv) > 2:
-        query = sys.argv[2]
+    cmd = argv[1]
+    if cmd == "search" and len(argv) > 2:
+        query = argv[2]
         results = search_contacts(query)
         if not results:
             print(f"No contacts matching '{query}'")
@@ -92,16 +104,16 @@ def main():
                 print(f"    email: {e}")
             for p in c["phones"]:
                 print(f"    phone: {p}")
-    elif cmd == "add" and len(sys.argv) >= 3:
-        name = sys.argv[2]
+    elif cmd == "add" and len(argv) >= 3:
+        name = argv[2]
         phone = None
         email = None
         i = 3
-        while i < len(sys.argv):
-            if sys.argv[i] == "--phone" and i + 1 < len(sys.argv):
-                phone = sys.argv[i + 1]; i += 2
-            elif sys.argv[i] == "--email" and i + 1 < len(sys.argv):
-                email = sys.argv[i + 1]; i += 2
+        while i < len(argv):
+            if argv[i] == "--phone" and i + 1 < len(argv):
+                phone = argv[i + 1]; i += 2
+            elif argv[i] == "--email" and i + 1 < len(argv):
+                email = argv[i + 1]; i += 2
             else:
                 i += 1
         parts = name.split(" ", 1)
@@ -120,21 +132,21 @@ def main():
             lines.append(f'make new email at end of emails of newPerson with properties {{label:"home", value:"{email}"}}')
         lines.append("save")
         script = 'tell application "Contacts"\n' + "\n".join(lines) + '\nend tell'
-        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=15)
+        result = _osascript(script, timeout=15)
         if result.returncode != 0:
             print(f"Error: {result.stderr.strip()}")
             sys.exit(1)
         print(f"Added {name}" + (f" phone:{phone}" if phone else "") + (f" email:{email}" if email else ""))
-    elif cmd == "update" and len(sys.argv) >= 3:
-        name = sys.argv[2]
+    elif cmd == "update" and len(argv) >= 3:
+        name = argv[2]
         phone = None
         email = None
         i = 3
-        while i < len(sys.argv):
-            if sys.argv[i] == "--phone" and i + 1 < len(sys.argv):
-                phone = sys.argv[i + 1]; i += 2
-            elif sys.argv[i] == "--email" and i + 1 < len(sys.argv):
-                email = sys.argv[i + 1]; i += 2
+        while i < len(argv):
+            if argv[i] == "--phone" and i + 1 < len(argv):
+                phone = argv[i + 1]; i += 2
+            elif argv[i] == "--email" and i + 1 < len(argv):
+                email = argv[i + 1]; i += 2
             else:
                 i += 1
         if not phone and not email:
@@ -162,7 +174,7 @@ def main():
         lines.append("save")
         lines.append('return "OK: updated " & (name of p)')
         script = 'tell application "Contacts"\n' + "\n".join(lines) + '\nend tell'
-        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=15)
+        result = _osascript(script, timeout=15)
         if result.returncode != 0:
             print(f"Error: {result.stderr.strip()}")
             sys.exit(1)
@@ -174,9 +186,9 @@ def main():
             return
         print(json.dumps(results, indent=2))
     else:
-        print("Usage: python3 contacts.py search 'name'")
-        print("       python3 contacts.py add 'Name' --phone 123 --email a@b.com")
-        print("       python3 contacts.py update 'Name' --phone 456 --email new@x.com")
+        print("Usage: python3 contacts.py search 'name' --owner-asked")
+        print("       python3 contacts.py add 'Name' --phone 123 --email a@b.com --owner-asked")
+        print("       python3 contacts.py update 'Name' --phone 456 --email new@x.com --owner-asked")
         sys.exit(1)
 
 

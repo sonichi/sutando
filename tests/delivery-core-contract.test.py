@@ -22,9 +22,10 @@ if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
 
 from ag2_sparrow.delivery_core import (  # noqa: E402
-    BackendCapabilities, ClaimToken, DeliveryCore, DeliveryOutcome, DeliveryReceipt,
+    BackendCapabilities, ClaimToken, Defer, DeliveryCore, DeliveryOutcome, DeliveryReceipt,
     DesignAClaimBackend, DrainStatus, ProviderCapabilities,
-    ProviderIndeterminate, ProviderRefused, RetryPolicy, idempotency_key)
+    ProviderIndeterminate, ProviderPermanentRefused, ProviderRefused, RetryPolicy,
+    idempotency_key)
 from ag2_sparrow.delivery_core.core import _resend_epoch  # noqa: E402
 from ag2_sparrow.delivery_core.backend_c import DesignCClaimBackend  # noqa: E402
 from ag2_sparrow import outbox  # noqa: E402
@@ -225,6 +226,39 @@ class ContractCase(unittest.TestCase):
                                    msg="non-declaring backend must raise, "
                                        "never silently no-op"):
                 self.backend.force_release(ITEM)
+
+    def test_a_deferring_revalidation_neither_sends_nor_withdraws(self):
+        """A `Defer` answer releases the claim unsent with no attempt; the next pass sends."""
+        self.backend.publish(ITEM, b"x")
+        p = _Recorder([DeliveryOutcome.CONFIRMED])
+        answers = [Defer("cannot check yet"), None]
+        core = DeliveryCore(self.backend, p, worker="w1", revalidate=lambda *_a: answers.pop(0))
+        r = core.deliver_one(ITEM, b"x")
+        self.assertIs(r.status, DrainStatus.DEFERRED)
+        self.assertIsNone(r.outcome)
+        self.assertEqual(r.detail, "cannot check yet")
+        self.assertEqual(p.deliver_calls, [], "no provider call on a deferral")
+        self.assertFalse(self.backend.is_terminal(ITEM), "never parked")
+        self.assertEqual(self.backend.attempts(ITEM), 0, "no attempt counted")
+        r = core.deliver_one(ITEM, b"x")
+        self.assertIs(r.outcome, DeliveryOutcome.CONFIRMED)
+        self.assertEqual(len(p.deliver_calls), 1)
+
+    def test_release_by_a_stale_token_changes_nothing(self):
+        self.backend.publish(ITEM, b"x")
+        t = self.backend.claim(ITEM, "w1")
+        self.assertTrue(self.backend.release(t))
+        self.assertFalse(self.backend.release(t), "an already-released token owns nothing")
+        t2 = self.backend.claim(ITEM, "w2")
+        self.assertIsNotNone(t2, "released means claimable again")
+        self.assertFalse(self.backend.release(t), "nor may it release a successor's claim")
+        self.assertIsNone(self.backend.claim(ITEM, "w3"), "the successor still owns it")
+        self.assertTrue(self.backend.release(t2))
+        t3 = self.backend.claim(ITEM, "w1")
+        self.assertIsNotNone(t3)
+        self.assertNotEqual(t3.incarnation, t.incarnation)
+        self.assertFalse(self.backend.release(t), "the same worker's earlier incarnation owns nothing")
+        self.assertIsNone(self.backend.claim(ITEM, "w4"), "w1's live incarnation still owns it")
 
 
 class SharedRootResendEpoch(unittest.TestCase):
@@ -457,6 +491,63 @@ class CorePolicy(unittest.TestCase):
         p = _Recorder([ProviderRefused("rejected before dispatch")])
         r = self._core(p).deliver_one(ITEM, b"x")
         self.assertIs(r.outcome, DeliveryOutcome.NOT_DELIVERED)
+
+    def replaced(self, hook, outcomes) -> "tuple[list, dict, list]":
+        """A backend with `replace_refused`, the payload "x" published with a source proof, and a
+        drain per outcome: what was sent, the record left, and the keys each send used."""
+        with tempfile.TemporaryDirectory() as d:
+            backend = DesignAClaimBackend(Path(d), replace_refused=hook)
+            backend.publish(ITEM, b"x", source_ready_sha256="ab" * 32)
+            sent: list = []
+
+            class _Sends(_Recorder):
+                def deliver(self, item_id, payload, key):
+                    sent.append(payload)
+                    return super().deliver(item_id, payload, key)
+            provider = _Sends(outcomes)
+            core = DeliveryCore(backend, provider)
+            for _ in range(len(outcomes) + 1):
+                core.deliver_one(ITEM, b"x")
+            return sent, outbox._read_item(backend.root, ITEM), [k for _i, k in provider.deliver_calls]
+
+    def test_a_refusal_for_good_parks_unless_a_replacement_is_configured(self):
+        """`replace_refused` is opt-in. Without it a refusal for good parks, as before. With it
+        the replacement is stored once, the refused payload and the source proof kept, under a
+        new resend epoch, and it is what the next attempt sends."""
+        self._core(_Recorder([ProviderPermanentRefused("HTTP 400")])).deliver_one(ITEM, b"x")
+        self.assertEqual(outbox._read_item(self.backend.root, ITEM)["reason"], "permanent-refusal")
+        sent, record, keys = self.replaced(lambda stored: "y", [ProviderPermanentRefused("HTTP 400"),
+                                                                DeliveryOutcome.CONFIRMED])
+        self.assertEqual(sent, [b"x", b"y"])
+        self.assertEqual((record["status"], record["payload"], record["refused_payload"]),
+                         ("DELIVERED", "y", "x"))
+        self.assertEqual(outbox.source_proof(record), "ab" * 32)
+        self.assertEqual(keys, [idempotency_key(ITEM, 0), idempotency_key(ITEM, 1)],
+                         "the replacement did not get an idempotency key of its own")
+
+    def test_a_refused_replacement_or_none_to_offer_parks_as_refused_for_good(self):
+        refusal = ProviderPermanentRefused("HTTP 400")
+        # A hook that always has another replacement: still only one is ever tried.
+        sent, record, _keys = self.replaced(lambda stored: stored + "'", [refusal, refusal, refusal])
+        self.assertEqual(sent, [b"x", b"x'"], "a refused replacement was replaced again")
+        # The refusal's own reason is kept after the prefix.
+        self.assertEqual((record["status"], record["reason"], record["payload"]),
+                         ("PARKED", "refused-for-good:permanent-refusal", "x'"))
+        sent, record, _keys = self.replaced(lambda stored: None, [refusal])
+        self.assertEqual(sent, [b"x"])
+        self.assertEqual((record["status"], record["reason"], record["payload"]),
+                         ("PARKED", "refused-for-good:permanent-refusal", "x"))
+        self.assertNotIn("refused_payload", record)
+
+    def test_a_refused_for_good_reason_is_matched_with_or_without_the_refusals_reason(self):
+        from ag2_sparrow.delivery_core import REFUSED_FOR_GOOD, is_refused_for_good, refused_for_good
+        self.assertEqual(refused_for_good("HTTP 400"), "refused-for-good:HTTP 400")
+        self.assertEqual((refused_for_good(None), refused_for_good("")), (REFUSED_FOR_GOOD,) * 2)
+        # The bare prefix is what an earlier build parked with.
+        for reason in (REFUSED_FOR_GOOD, "refused-for-good:permanent-refusal"):
+            self.assertTrue(is_refused_for_good(reason), reason)
+        for reason in (None, "", 7, "permanent-refusal", "refused-for-goodness", "x:refused-for-good"):
+            self.assertFalse(is_refused_for_good(reason), reason)
 
     def test_programming_error_propagates(self):
         """Owner review finding 5, the other half: a bare Exception is a

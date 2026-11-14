@@ -29,7 +29,7 @@ PRODUCERS = {
     "src/github-webhook.py": ["github"],
     "src/task-bridge.ts": ["chat", "voice", "context-drop"],
     "src/Sutando/main.swift": ["context-drop"],
-    "CLAUDE.md": ["chat"],
+    "docs/claude-md-moved-detail.md": ["chat"],
 }
 
 # Serialized `source: <value>` at a write site: inside an f-string/template

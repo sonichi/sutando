@@ -28,7 +28,7 @@ v0 methods:
   sutando.status        {}
   sutando.owner         {}
   sutando.allowlist     {}
-  task.submit           {task, priority?}
+  task.submit           {task, priority?, idempotencyKey?}
   task.status           {taskId}
   task.get_result       {taskId?}   (no taskId → the newest result)
   task.list_results     {}          (all results, newest first, with preview)
@@ -40,9 +40,16 @@ v0 methods:
   human_action.complete {requestId, note?}
   human_action.decline  {requestId, note?}
   human_action.status   {requestId}
-  task.list             {}
+  task.list             {unfinishedOnly?}  (boolean, default false)
   request.list          {}
   schedule.list         {}          (every crons.json entry, owner-tagged)
+
+task.list returns this channel's live task files, newest first, with canonical
+taskId, state and preview. With unfinishedOnly=true, it excludes status "done"
+before the 200-row limit; truncated=true appears only if eligible rows remain.
+Omitted or false preserves the default 200-file window, including completed
+tasks still present in the queue. Non-boolean unfinishedOnly is invalid params.
+Neither mode enumerates task archives or changes lifecycle classification.
 
 Error codes follow JSON-RPC: -32700 parse, -32600 invalid request,
 -32601 unknown method, -32602 invalid params, -32000 server error.

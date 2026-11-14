@@ -167,8 +167,17 @@ class TestDoubleDelivery(Base):
         d = pd.deliveries_dir(self.ws, W1)
         d.mkdir(parents=True, exist_ok=True)
         os.close(os.open(d / "task-1.txt", os.O_CREAT | os.O_EXCL))
-        with patch.object(pd, "find", return_value=None):   # check misses it
+        # The anchored check (`find_in`) misses it, so the O_EXCL create must be
+        # what arbitrates: prove the create was attempted and lost.
+        real_open, opens = os.open, []
+
+        def counting_open(*a, **kw):
+            if a and isinstance(a[0], str) and a[0].startswith("task-1") and (a[1] & os.O_EXCL):
+                opens.append(a[0])
+            return real_open(*a, **kw)
+        with patch.object(pd, "find_in", return_value=None), patch.object(rt.os, "open", counting_open):
             got = rt.route(self.ws, self.task(), r)
+        self.assertEqual(opens, ["task-1.txt"], "the O_EXCL create never ran: the race was not reached")
         self.assertEqual(got["already"], [W1])
         self.assertEqual(got["delivered"], [])
 
@@ -274,11 +283,13 @@ class TestPublishIsOneTransitionUnderArbitration(Base):
         self.roster()
         self.task(tid)
         paused, resume = threading.Event(), threading.Event()
-        real_find = pd.find
+        # The publish body reads through the anchored `find_in` (directory fd), so
+        # that is the seam the pause instruments; the lock file itself is unchanged.
+        real_find_in = pd.find_in
         first = threading.local()
 
-        def pausing_find(workspace, recipient, task_id):
-            got = real_find(workspace, recipient, task_id)
+        def pausing_find(dir_fd, task_id):
+            got = real_find_in(dir_fd, task_id)
             if getattr(first, "publisher", False) and not paused.is_set():
                 paused.set()
                 resume.wait(10)
@@ -295,7 +306,7 @@ class TestPublishIsOneTransitionUnderArbitration(Base):
             pending = pd.find(self.ws, W1, tid)
             outcomes["accept"] = pd.accept(pending).name if pending and pending.suffix == ".txt" else None
 
-        rt.pd.find = pausing_find
+        rt.pd.find_in = pausing_find
         try:
             a = threading.Thread(target=publisher_a)
             a.start()
@@ -307,7 +318,7 @@ class TestPublishIsOneTransitionUnderArbitration(Base):
             resume.set()
             a.join(10); b.join(10)
         finally:
-            rt.pd.find = real_find
+            rt.pd.find_in = real_find_in
         return outcomes, b_blocked
 
     def test_an_accept_during_publish_cannot_leave_two_sentinels(self):

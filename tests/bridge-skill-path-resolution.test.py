@@ -27,6 +27,11 @@ Run: python3 tests/bridge-skill-path-resolution.test.py   (exit 0 pass / 1 fail)
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import itertools
 import os
@@ -151,7 +156,7 @@ if p_owner:
         line for line in body.splitlines() if "NOTIFY FIRST:" in line
     )
     notify_command = notify_line.split("NOTIFY FIRST:", 1)[1].strip()
-    clean_env = os.environ.copy()
+    clean_env = isolated_child_env()
     clean_env.pop("CLAUDE_CONFIG_DIR", None)
     clean_env.pop("CLAUDE_HOME", None)
     ran = subprocess.run(

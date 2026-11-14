@@ -12,6 +12,11 @@ Run: python3 tests/mention-gate.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import ast
 import asyncio
 import contextlib
@@ -490,7 +495,7 @@ class CliRoundTrip(unittest.TestCase):
     CLI = REPO / "skills" / "mention-gate" / "scripts" / "mention-gate.py"
 
     def _run(self, ws, *args):
-        env = dict(os.environ, SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws))
+        env = isolated_child_env(SUTANDO_TEST_MODE="1", SUTANDO_WORKSPACE=str(ws))
         return subprocess.run([*PYBASE, str(self.CLI), *args],
                               capture_output=True, text=True, env=env, timeout=60)
 

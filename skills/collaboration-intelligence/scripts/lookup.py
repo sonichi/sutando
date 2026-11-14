@@ -27,9 +27,15 @@ def load(d):
     # Each store loads on its OWN existence check — either may exist alone.
     yp = d / "quick-lookup.yaml"
     if yp.exists():
-        import yaml
+        # The import belongs INSIDE the try: an interpreter without PyYAML is the same
+        # degradation as an unparseable file, and outside it the ImportError crashes.
         try:
+            import yaml
             raw = yaml.safe_load(yp.read_text()) or {}
+        except ImportError:
+            print(f"warning: PyYAML missing under {sys.executable} — using roster only",
+                  file=sys.stderr)
+            raw = {}
         except Exception as e:
             print(f"warning: {yp} unparseable ({type(e).__name__}) — using roster only",
                   file=sys.stderr)
@@ -37,9 +43,15 @@ def load(d):
         q = raw.get("quick_lookup") or raw if isinstance(raw, dict) else {}
     ep = d / "entities.yaml"
     if ep.exists():
-        import yaml
         try:
+            import yaml
             ents = yaml.safe_load(ep.read_text()).get("entities") or []
+        except ImportError:
+            # Silently empty entities reads as "no entities", which is a different
+            # fact from "this interpreter cannot parse them".
+            print(f"warning: PyYAML missing under {sys.executable} — {ep.name} not read",
+                  file=sys.stderr)
+            ents = []
         except Exception:
             ents = []
     return q, ents

@@ -2,6 +2,12 @@
 """The gateway warn line must carry HOW LONG the outage has run.
 Run: python3 tests/health-check-gateway-outage-duration.test.py"""
 from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import pathlib
