@@ -132,6 +132,12 @@ valid entries remain reusable. `--full` bypasses the cache entirely. Rescanning
 updates the cache without changing the preserved copies, live files, or retirement
 records.
 
+Validation checks cache structure and association with the same batch and path;
+it does not authenticate cached content hashes or rows. Anyone able to write the
+cache can forge a well-shaped entry, including a retirement key with a different
+content hash for that same copy. Use `--full` to recompute from preserved content
+when cache integrity is in doubt.
+
 ## Config keys
 
 | Key | Default | Notes |

@@ -305,6 +305,21 @@ class TestMalformedCache(_Base):
                 self.assertEqual(self._main(str(self.ws)), self.expected)
                 self.assertCountEqual(self.calls, [Path(self.rel), Path("notes/other.md")])
 
+    def test_boolean_stat_fields_are_rescanned_despite_integer_equality(self):
+        real = MOD._stat_key
+        MOD._stat_key = lambda _path: [1, 1, 0]
+        self.addCleanup(setattr, MOD, "_stat_key", real)
+        self.assertEqual(self._main(str(self.ws), "--full"), self.expected)
+        self.cache = json.loads(self.cache_path.read_text())
+        for field in ("saved", "live"):
+            for index, value in enumerate((True, True, False)):
+                with self.subTest(field=field, index=index):
+                    stat = [1, 1, 0]
+                    stat[index] = value
+                    self.assertEqual(stat, [1, 1, 0])
+                    original = self.cache["entries"][self.ck]
+                    self._assert_recovers(dict(original, **{field: stat}))
+
     def test_another_copys_retirement_key_cannot_silence_a_row(self):
         other_ck = f"{self.batch.name}/notes/other.md"
         done, err = MOD.retire(self.ws, [other_ck])
