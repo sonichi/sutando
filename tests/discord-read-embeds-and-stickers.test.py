@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """discord-read.py must render TOP-LEVEL embeds and stickers, not a blank line.
 
-The third instance of one defect, each a branch apart in `_render`: #2458 fixed
-forwarded content, discord-read-attachments fixed top-level attachments, and the
-top level still dropped `embeds` and `sticker_items` — while the forward branch
-labelled embeds. So an embed-only post read as empty in the reader that
-`context-reconstruct` runs on every proactive pass.
-
-Measured 2026-09-23: one community member's post in the dev channel rendered
-as an empty body. Blank was ambiguous across three different inputs — genuinely
-empty, embed-only, and sticker-only — so nothing in the output could tell the
-reader whether a record existed at all. The fix routes BOTH levels through one
-`_payload_marks()`, so the two cannot drift apart a fourth time.
-
-This does NOT claim that particular post was embed-only; its raw payload was
-never fetched. The claim under test is about the code path.
+A blank body is ambiguous across three inputs (genuinely empty, embed-only and
+sticker-only), so the reader cannot tell whether a record exists. Both levels
+of `_render` (top level and forwarded) go through one `_payload_marks()`, so
+they label a payload the same way.
 """
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import pathlib
 import sys
