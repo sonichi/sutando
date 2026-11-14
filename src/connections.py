@@ -509,15 +509,17 @@ def host_of_url(url: str) -> str:
 
 
 def origin_of_url(url: str) -> str:
-    """`host:port` of an http(s) URL, the port made explicit (443, 80) so a default and a stated one
-    agree; '' for anything else. Two URLs name the same endpoint only when these are equal."""
+    """`scheme://host:port` of an http(s) URL, the port made explicit (443, 80) so a default and a stated
+    one agree; '' for any other scheme or port 0. Two URLs name the same endpoint only when these are equal."""
     try:
         u = urllib.parse.urlsplit(url or "")
-        host, port = (u.hostname or "").lower(), u.port
+        scheme, host, port = u.scheme.lower(), (u.hostname or "").lower(), u.port
     except ValueError:
         return ""
-    port = port or {"https": 443, "http": 80}.get(u.scheme.lower())
-    return f"{host}:{port}" if host and port else ""
+    if scheme not in ("https", "http"):
+        return ""
+    port = {"https": 443, "http": 80}[scheme] if port is None else port
+    return f"{scheme}://{host}:{port}" if host and port else ""
 
 
 def worker_instance_for(server: str, worker: str) -> str:

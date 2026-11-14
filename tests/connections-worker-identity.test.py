@@ -794,7 +794,9 @@ class TwoServers(Base):
             for url in ("https://evil-chat.alpha-fixture.net", "https://chat.alpha-fixture.net.evil.example",
                         "https://chat.alpha-fixture.net:8444", "http://chat.alpha-fixture.net",
                         "https://relay.beta-fixture.net", "https://relay.beta-fixture.net:443",
-                        "https://evil-relay.beta-fixture.net:8443", "https://relay.beta-fixture.net:8443.evil.example"):
+                        "https://evil-relay.beta-fixture.net:8443", "https://relay.beta-fixture.net:8443.evil.example",
+                        "https://chat.alpha-fixture.net:0", "http://chat.alpha-fixture.net:443",
+                        "ftp://chat.alpha-fixture.net:443", "http://relay.beta-fixture.net:8443"):
                 with self.assertRaises(C.NoWorkerCredential, msg=(key, url)) as e:
                     self._seat({"lane": "primary", key: url + "/v1/mcp/token"})
                 self.assertEqual(e.exception.reason, "descriptor_unresolved", (key, url))
@@ -804,9 +806,11 @@ class TwoServers(Base):
                     ("https://relay.beta-fixture.net:8443", "beta-fixture.net", "secret-reviewer-b")):
                 cred = self._seat({"lane": "primary", key: url + "/v1/mcp/token"})
                 self.assertEqual((cred["server"], cred["bearer"]), (server, secret), (key, url))
-        self.assertEqual(C.origin_of_url("https://h.example"), "h.example:443")
-        self.assertEqual(C.origin_of_url("http://H.example:80/p"), "h.example:80")
-        for bad in ("", "h.example", "ftp://h.example", "https://h.example:notaport", "https://:8443"):
+        self.assertEqual(C.origin_of_url("https://h.example"), "https://h.example:443")
+        self.assertEqual(C.origin_of_url("http://H.example:80/p"), "http://h.example:80")
+        self.assertNotEqual(C.origin_of_url("http://h.example:443"), C.origin_of_url("https://h.example"))
+        for bad in ("", "h.example", "ftp://h.example", "ftp://h.example:443", "https://h.example:0",
+                    "https://h.example:notaport", "https://:8443"):
             self.assertEqual(C.origin_of_url(bad), "", bad)
 
     def test_a_named_descriptor_that_cannot_be_read_is_refused_not_replaced(self):
