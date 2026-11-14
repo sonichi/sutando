@@ -51,6 +51,15 @@ resolve_claude_py
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:?launch-worker-session.sh needs SUTANDO_TMUX_SESSION (spawn_worker.py always sets it)}"
 : "${SUTANDO_INSTANCE_ID:?launch-worker-session.sh needs SUTANDO_INSTANCE_ID (spawn_worker.py always sets it)}"
+# Every worker's watcher needs the pool delivery writer: refuse before anything below
+# queries tmux. The --print-env probe may still inspect an incomplete env.
+if [ "${1:-}" != "--print-env" ] && {
+     [ -z "${SUTANDO_POOL_DELIVERY_SCRIPT:-}" ] || \
+     [ ! -f "$SUTANDO_POOL_DELIVERY_SCRIPT" ] || \
+     [ ! -r "$SUTANDO_POOL_DELIVERY_SCRIPT" ]; }; then
+  echo "launch-worker-session.sh needs SUTANDO_POOL_DELIVERY_SCRIPT to name a readable file" >&2
+  exit 2
+fi
 # A worker never gets the owner-facing surfaces (remote control, Chrome) —
 # those are the canonical core's alone.
 SURFACE_ARGS=()
@@ -146,16 +155,6 @@ fi
 if [ "${1:-}" = "--print-env" ]; then
   printf '%s\n' ${ENV_ARGS[@]+"${ENV_ARGS[@]}"}
   exit 0
-fi
-
-# The watcher sees SUTANDO_INSTANCE_ID in every worker session and therefore
-# requires the pool delivery writer. Fail before creating a session that could
-# receive tasks but cannot safely acknowledge them.
-if [ -z "${SUTANDO_POOL_DELIVERY_SCRIPT:-}" ] || \
-   [ ! -f "$SUTANDO_POOL_DELIVERY_SCRIPT" ] || \
-   [ ! -r "$SUTANDO_POOL_DELIVERY_SCRIPT" ]; then
-  echo "launch-worker-session.sh needs SUTANDO_POOL_DELIVERY_SCRIPT to name a readable file" >&2
-  exit 2
 fi
 
 # Same onboarding/hooks treatment a core launch gets: a worker is also
