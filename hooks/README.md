@@ -697,6 +697,10 @@ Each trigger makes **one** `gh api graphql` read (5 s budget) carrying every sea
 - **Files** (`pr create`: local `git diff --name-only origin/<base>...HEAD`; `pr review`: the
   reviewed PR's files): the 25 most recently updated open PRs. For the top 3 by shared files,
   `gh pr diff` is read within the same budget and the `@@` hunk-header functions compared.
+  Only another author's PR counts (the author is the reviewed PR's, or the `gh` user for
+  `pr create`). A promote or back-port of the same change (same head branch, or the same title
+  on another base) is skipped, and so are common files: lockfiles, changelogs, `src-map.md`,
+  catalogs and `ENGINE_MANIFEST.json`.
 
 The output ranks ticket-id hits, then PRs changing the same function, then keyword hits.
 File-only overlap is printed only as a count, and only beside another hit. The PR itself and

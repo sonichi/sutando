@@ -50,7 +50,9 @@ TICKET_NUM = re.compile(r"#(\d{2,6})\b")
 CLOSES_NUM = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d{2,6})\b", re.I)
 PR_URL = re.compile(r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)(?:[/?#].*)?$")
 GITHUB_REMOTE = re.compile(r"github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$")
-NOISE_FILES = re.compile(r"(^|/)(CHANGELOG[^/]*|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|uv\.lock|poetry\.lock)$")
+NOISE_FILES = re.compile(r"(^|/)(CHANGELOG[^/]*|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|uv\.lock|poetry\.lock"
+                         r"|src-map\.md|[^/]*catalog[^/]*\.json|ENGINE_MANIFEST\.json|[^/]*\.lock)$")
+PROMOTE_WORDS = re.compile(r"^(?:promote|back-?port|cherry-?pick)\b[:\s]*|\s*\(#\d+\)$", re.I)
 STOP = set("""fix fixes feat feature chore docs doc refactor test tests ci build perf style wip tmp temp
 update add adds remove change changes and the for with from into onto main master dev prod release
 codex claude sutando pr branch new old v1 v2 v3 bump use via of to in on at by is a an
@@ -58,7 +60,7 @@ followup follow up hotfix patch minor misc""".split())
 HUNK = re.compile(r"^@@ [^@]* @@ ?(.*)$")
 DIFF_FILE = re.compile(r"^\+\+\+ b/(.*)$")
 MAX_FN = 3
-PR_FIELDS = "number title state headRefName closedAt url"
+PR_FIELDS = "number title state headRefName baseRefName author{login} closedAt url"
 GH_VALUE_FLAGS = {"-R", "--repo", "-b", "--body", "-F", "--body-file", "-t", "--title", "-H", "--head",
                   "-B", "--base", "-a", "--assignee", "-l", "--label", "-m", "--milestone", "-p", "--project",
                   "-r", "--reviewer", "-T", "--template"}
@@ -195,8 +197,9 @@ def build_query(repo: str, t: dict, kws: List[str], tks: List[str], since: str, 
     if t["trigger"] == "review":
         owner, name = repo.split("/", 1)
         decl += ["$o:String!", "$n:String!", "$pr:Int!"]
-        parts.append("me:repository(owner:$o,name:$n){pullRequest(number:$pr){headRefName files(first:100){nodes{path}}}}")
+        parts.append("me:repository(owner:$o,name:$n){pullRequest(number:$pr){title headRefName baseRefName author{login} files(first:100){nodes{path}}}}")
         args += ["-f", f"o={owner}", "-f", f"n={name}", "-F", f"pr={t['pr']}"]
+    parts.append("viewer{login}")
     return f"query({','.join(decl)}){{{' '.join(parts)}}}", args, q
 
 
@@ -276,7 +279,21 @@ def hunk_functions(diff_text: Optional[str]) -> Dict[str, set]:
     return res
 
 
-def match(t: dict, data: dict, kws: List[str], mine: Optional[set], since: str) -> dict:
+def _login(n: dict) -> Optional[str]:
+    return ((n.get("author") or {}).get("login") or "").lower() or None
+
+
+def promote_pair(me: dict, n: dict) -> bool:
+    """The same change on another base: one head branch, or one title bar a promote/back-port tag."""
+    if me.get("branch") and me["branch"] == n.get("headRefName"):
+        return True
+    if me.get("base") and me["base"] == n.get("baseRefName"):
+        return False
+    norm = lambda x: PROMOTE_WORDS.sub("", (x or "").strip()).strip().lower()
+    return bool(norm(me.get("title"))) and norm(me.get("title")) == norm(n.get("title"))
+
+
+def match(t: dict, data: dict, kws: List[str], mine: Optional[set], since: str, me: Optional[dict] = None) -> dict:
     """Candidate PRs by reason, self and own branch excluded; `files` holds file-overlap rows."""
     own_branch, own_pr = t.get("branch"), t.get("pr")
 
@@ -302,8 +319,11 @@ def match(t: dict, data: dict, kws: List[str], mine: Optional[set], since: str) 
     for n in _nodes(data, "ro") if mine else []:
         if mine_too(n):
             continue
-        shared = sorted(mine & {f.get("path") for f in ((n.get("files") or {}).get("nodes") or []) if f})
-        if shared and not all(NOISE_FILES.search(f) for f in shared):
+        if (me or {}).get("author") and _login(n) == me["author"] or promote_pair(me or {}, n):
+            continue
+        shared = sorted(f for f in mine & {f.get("path") for f in ((n.get("files") or {}).get("nodes") or []) if f}
+                        if not NOISE_FILES.search(f))
+        if shared:
             out["files"].append(row(n, shared_files=shared[:10], shared_file_count=len(shared)))
     out["keyword"].sort(key=lambda x: -len(x["keywords"]))
     out["files"].sort(key=lambda x: -x["shared_file_count"])
@@ -436,7 +456,12 @@ def _one(t: dict, run: Run) -> tuple:
         if not me:
             raise GhError(f"PR #{t['pr']} not found in {repo}")
         mine = {f.get("path") for f in ((me.get("files") or {}).get("nodes") or []) if f}
-    found = match(t, data, kws, mine, since)
+        who = {"author": _login(me), "title": me.get("title"), "branch": me.get("headRefName"),
+               "base": me.get("baseRefName")}
+    else:
+        who = {"author": ((data.get("viewer") or {}).get("login") or "").lower() or None, "title": t.get("title"), "branch": t.get("branch"),
+               "base": t.get("base")}
+    found = match(t, data, kws, mine, since, who)
     function_overlap(found, my_fns, lambda n: pr_diff(run, repo, n, deadline - time.monotonic()))
     r = ranked(found)
     detail.update({k: [x["number"] for x in r[k]] for k in ("ticket", "function", "keyword")})

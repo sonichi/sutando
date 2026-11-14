@@ -43,9 +43,13 @@ def bash(cmd, **extra):
                  "cwd": "/w"}, **extra)
 
 
-def pr(number, title, branch, state="OPEN", files=(), closed=None):
+def pr(number, title, branch, state="OPEN", files=(), closed=None, author=None, base=None):
     n = {"number": number, "title": title, "headRefName": branch, "state": state, "closedAt": closed,
          "url": f"https://github.com/o/r/pull/{number}"}
+    if author:
+        n["author"] = {"login": author}
+    if base:
+        n["baseRefName"] = base
     if files:
         n["files"] = {"nodes": [{"path": f} for f in files]}
     return n
@@ -89,9 +93,10 @@ class Fake:
         if cmd[1:3] == ["pr", "diff"]:
             return ok(self.diffs.get(int(cmd[3]), ""))
         self.query = cmd
-        data = {a: {"issueCount": len(v), "nodes": v} for a, v in self.search.items() if a != "me"}
-        if "me" in self.search:
-            data["me"] = self.search["me"]
+        data = {a: {"issueCount": len(v), "nodes": v} for a, v in self.search.items() if a not in ("me", "viewer")}
+        for k in ("me", "viewer"):
+            if k in self.search:
+                data[k] = self.search[k]
         return ok(json.dumps({"data": data}))
 
 
@@ -181,6 +186,51 @@ class Matching(Base):
         text, _ = self.run_hook("gh pr create -t 'fix: x' -b y", fake)
         self.assertEqual(text, "")
         self.assertEqual((self.rows()[0]["verdict"], self.rows()[0]["file_only"]), ("OK", [3952]))
+
+    def _overlap(self, other, files=("pkg/bridge.py",), fn="def _one_line(v):", title="fix: fold separators",
+                 base="dev", viewer="me-bot", branch="fix/rmabcdefghij12-x", mine_files=None):
+        mine_files = list(mine_files or files)
+        fake = Fake({"ro": [other], "viewer": {"login": viewer}}, diffs={other["number"]: diff(*[(f, fn) for f in files])},
+                    local=mine_files, local_fns=[(f, fn) for f in mine_files], branch=branch)
+        return self.run_hook(f"gh pr create --title '{title}' --base {base} --body x", fake)[0]
+
+    def test_same_function_by_another_author_is_flagged(self):
+        text = self._overlap(pr(7, "other change", "fix/o", files=["pkg/bridge.py"], author="someone", base="dev"))
+        self.assertIn("Same function changed in an open PR:\n  #7", text)
+
+    def test_same_file_different_function_is_not_flagged(self):
+        other = pr(7, "other change", "fix/o", files=["pkg/bridge.py"], author="someone", base="dev")
+        fake = Fake({"ro": [other], "viewer": {"login": "me-bot"}}, diffs={7: diff(("pkg/bridge.py", "def post():"))},
+                    local=["pkg/bridge.py"], local_fns=[("pkg/bridge.py", "def _one_line(v):")], branch="fix/rmabcdefghij12-x")
+        self.assertEqual(self.run_hook("gh pr create -t 'fix: x' -b y", fake)[0], "")
+
+    def test_promote_pair_is_not_flagged(self):
+        for other in (pr(7, "promote: fix: fold separators (#6)", "promote/x", files=["pkg/bridge.py"], author="someone", base="main"),
+                      pr(7, "fix: fold separators", "fix/rmabcdefghij12-x", files=["pkg/bridge.py"], author="someone", base="main")):
+            self.assertEqual(self._overlap(other, base="dev"), "")
+        same_base = pr(7, "fix: fold separators", "fix/o", files=["pkg/bridge.py"], author="someone", base="dev")
+        self.assertIn("#7", self._overlap(same_base, base="dev"))
+
+    def test_common_files_are_not_flagged(self):
+        for f in ("docs/src-map.md", "docs/catalog.json", "uv.lock", "package-lock.json", "CHANGELOG.md"):
+            other = pr(7, "other change", "fix/o", files=[f], author="someone", base="dev")
+            self.assertEqual(self._overlap(other, files=(f,), fn="## entry"), "", f)
+
+    def test_the_authors_own_prs_are_not_flagged(self):
+        other = pr(7, "other change", "fix/o", files=["pkg/bridge.py"], author="Me-Bot", base="dev")
+        self.assertEqual(self._overlap(other, viewer="me-bot"), "")
+
+    def test_review_uses_the_reviewed_prs_author_and_base(self):
+        f = "pkg/bridge.py"
+        me = {"pullRequest": {"title": "fix: fold", "headRefName": "fix/m", "baseRefName": "dev", "author": {"login": "alice"},
+                              "files": {"nodes": [{"path": f}]}}}
+        ro = [pr(7, "x", "fix/a", files=[f], author="alice", base="dev"), pr(8, "y", "fix/b", files=[f], author="bob", base="dev"),
+              pr(9, "fix: fold", "fix/c", files=[f], author="bob", base="main")]
+        fake = Fake({"me": me, "ro": ro}, diffs={n: diff((f, "def g():")) for n in (7, 8, 9)} | {99: diff((f, "def g():"))})
+        text, _ = self.run_hook("gh pr review 99 --repo o/r --approve -b ok", fake)
+        self.assertIn("#8", text)
+        self.assertNotIn("#7 [", text)
+        self.assertNotIn("#9 [", text)
 
     def test_no_match_prints_nothing(self):
         text, r = self.run_hook("git checkout -b fix/rmabcdefghij12-thing", Fake({"tk": [], "ko": [], "kc": []}))
