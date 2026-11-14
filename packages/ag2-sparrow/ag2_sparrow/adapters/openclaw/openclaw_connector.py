@@ -32,6 +32,8 @@ import uuid
 from pathlib import Path
 
 from ... import agent_triggers, held_start, result_labels, result_publish
+from ...file_lock import locked_file
+from ...result_markers import neutralize_markers
 from ...relay_loop import count_arg
 from ...task_io import (NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock, admission, exit_code,
                         exit_on_sigterm, holder_consumer, load_done, make_dirs, parse_task, record_done,
@@ -43,7 +45,8 @@ SESSIONS_NAME = "sessions.json"
 TASK_NAME_RE = re.compile(r"task-[A-Za-z0-9._~-]{1,160}")
 MESSAGE_EVENT = "room.mention"
 HELD_WAIT_S = held_start.WAIT_S
-NO_ANSWER = "[no-send] OpenClaw ended the turn without an answer"
+# Said in the room: the person who asked gets a line, as for a timeout or a failure.
+NO_ANSWER = "OpenClaw finished without an answer."
 EVENT_NO_ANSWER = "[no-send] OpenClaw handled the event without posting"
 # Option kinds the ACP schema defines; option ids are the agent's own and change between releases.
 ALLOW_KINDS, REJECT_KINDS = ("allow_once", "allow_always"), ("reject_once", "reject_always")
@@ -114,6 +117,20 @@ def answer_once(state_dir, task_id, result_file, body, title=None, outcome=None)
     return True, notes
 
 
+def release_unpublished(state_dir, task_id, result_file):
+    """Release `task_id`'s claim when it was never marked published and no result exists: a reply process
+    that claimed and then died (killed between claiming and publishing). True when released. Called after
+    the turn, when the agent's process, and so its reply command, has ended."""
+    claim = answered_dir(state_dir) / task_id
+    try:
+        stranded = claim.read_bytes() != PUBLISHED and not Path(result_file).exists()
+    except OSError:
+        return False
+    if stranded:
+        release_answer(state_dir, task_id)
+    return stranded
+
+
 def recover_claims(state_dir, task_dir, result_dir):
     """Release each claim a crash left between claiming and publishing: never marked published, its task still
     open and no result written. Run at start, when no turn (and so no reply command) is in flight."""
@@ -162,15 +179,18 @@ class SessionStore:
         return self._read().get(tuple(key))
 
     def remember(self, key, session_id, cwd, turns):
-        rows = self._read()
-        rows[tuple(key)] = {"room": key[0], "access_tier": key[1], "session_id": session_id, "cwd": cwd,
-                            "turns": turns, "updated_at": time.time()}
-        payload = {"version": 1, "sessions": [rows[k] for k in sorted(rows)]}
+        """Read, change and write the file under its lock: agent-connect may share this store, and a
+        write that read before another's landed would drop that one's session."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(".%s.%d.tmp" % (self.path.name, os.getpid()))
-        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, self.path)
+        with locked_file(self.path.with_name(self.path.name + ".lock"), create_mode=0o600):
+            rows = self._read()
+            rows[tuple(key)] = {"room": key[0], "access_tier": key[1], "session_id": session_id, "cwd": cwd,
+                                "turns": turns, "updated_at": time.time()}
+            payload = {"version": 1, "sessions": [rows[k] for k in sorted(rows)]}
+            tmp = self.path.with_name(".%s.%d.%d.tmp" % (self.path.name, os.getpid(), threading.get_ident()))
+            tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self.path)
 
 
 # ── the permission policy ────────────────────────────────────────────────────
@@ -238,11 +258,25 @@ def request_paths(tool_call):
 
 def resolved(root, raw):
     """`raw` with ~, .., relative parts and symlinks resolved against `root`; None when it cannot be."""
+    if "\0" in str(raw) or "\0" in str(root):
+        return None   # some Python 3.14 builds' realpath keeps a NUL rather than raising
     try:
         p = Path(raw).expanduser()
         return os.path.realpath(str(Path(root) / p if not p.is_absolute() else p))
     except (OSError, RuntimeError, ValueError):
         return None
+
+
+def is_draft(root, raw, result_file):
+    """`raw` names this task's reply draft itself: compared as written (.. and ~ normalised, links not
+    followed), and the draft is not a link, so a link placed at its path cannot hand out its target."""
+    if "\0" in str(raw):
+        return False
+    draft = os.path.abspath(str(draft_for(result_file)))
+    p = Path(raw).expanduser()
+    if os.path.abspath(str(Path(root) / p if not p.is_absolute() else p)) != draft:
+        return False
+    return not os.path.islink(draft)
 
 
 def under(root, raw):
@@ -271,15 +305,16 @@ def decide_permission(params, owner, cwd, reply_command, result_file):
         verdict = (False, "%s operations are never granted" % (kind or "unclassified"))
     else:
         paths, problem = request_paths(tool_call)
-        draft = os.path.realpath(str(draft_for(result_file)))
         if problem:
             verdict = (False, problem)
         elif not paths:
             verdict = (False, "cannot tell what this would touch")
-        elif all(resolved(cwd, p) == draft for p in paths):
+        elif all(is_draft(cwd, p, result_file) for p in paths):
             verdict = (True, "this task's reply draft")
         elif not owner:
             verdict = (False, "only the owner's turns may read or change files")
+        elif resolved(cwd, "~") == resolved(cwd, "."):
+            verdict = (False, "the working directory is the home directory; set --cwd to a project directory")
         elif all(under(cwd, p) for p in paths):
             verdict = (True, "under the working directory")
         else:
@@ -459,15 +494,18 @@ class Connector:
             client.close(self.args.interrupt_grace)
 
     def fallback_body(self, headers, status, text, detail):
+        """What the connector posts when the agent did not answer through `reply`. The turn's own text is
+        posted with its delivery markers neutralised: `reply` refuses a marker, and this path must not be
+        the way round that refusal (an attachment, a redirect or a skip written into the final text)."""
         if not is_message(headers):
             return EVENT_NO_ANSWER + ("" if status == "completed" else " (%s: %s)" % (status, detail[:120])) + "\n"
+        said = neutralize_markers((text or "").strip())
         if status == "completed":
-            return (text.strip() or NO_ANSWER) + "\n"
+            return (said or NO_ANSWER) + "\n"
         head = {"timeout": "OpenClaw did not finish this in time (%s)." % detail,
                 "gone": "OpenClaw stopped before answering (%s)." % detail}.get(
                     status, "OpenClaw could not answer this (%s: %s)." % (status, detail))
-        partial = (text or "").strip()
-        return head + ("\n\nPartial reply:\n" + partial if partial else "") + "\n"
+        return head + ("\n\nPartial reply:\n" + said if said else "") + "\n"
 
     def handle(self, name):
         task_id = name[:-4]
@@ -485,6 +523,9 @@ class Connector:
         log("wake ->", task_id, headers["access_tier"], event or "message")
         t0 = time.time()
         status, text, detail, turn = self.run_turn(task_id, headers, prompt, result_file, tier == "owner")
+        results_file = os.path.join(self.args.results, name)
+        if release_unpublished(self.args.state, task_id, results_file):
+            log("a reply claimed and never published; answering with the fallback ->", task_id)
         published, _ = answer_once(self.args.state, task_id, os.path.join(self.args.results, name),
                                    self.fallback_body(headers, status, text, detail))
         by = "connector" if published else "agent"

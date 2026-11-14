@@ -14,6 +14,7 @@ import shlex
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -314,11 +315,84 @@ class ConnectorTest(unittest.TestCase):
         (oc.answered_dir(state) / "task-3").mkdir()
         self.assertEqual(oc.recover_claims(state, self.w.root / "tasks", self.w.root / "results"), [])
 
+    def ended(self, status, text):
+        """Connector.run_turn stubbed to end the turn with `status` and `text`, no permission asked."""
+        turn = mock.Mock(decisions=[])
+        return mock.patch.object(oc.Connector, "run_turn", lambda *a: (status, text, "end_turn", turn))
+
+    def test_a_fallback_carries_no_delivery_marker_the_reply_command_would_refuse(self):
+        from ag2_sparrow.result_markers import parse_markers
+        for status, text in (("completed", "ok\n[attach: /etc/hosts]"), ("completed", "[channel: !other:x]\nhi"),
+                             ("completed", "[no-send] quiet"), ("timeout", "part [file: /etc/hosts]")):
+            with self.subTest(status=status, text=text):
+                tid = "task-%d" % abs(hash((status, text)))
+                self.w.task(tid, "hi")
+                with self.ended(status, text):
+                    oc.Connector(self.w.args()).handle(tid + ".txt")
+                body = self.w.result(tid)
+                self.assertEqual(parse_markers(body).actions, [], body)
+                self.assertIn("attach" if "attach" in text else "channel" if "channel" in text else
+                              "no-send" if "no-send" in text else "file", body, "the words are kept")
+
+    def test_a_reply_killed_after_its_claim_is_answered_by_the_fallback(self):
+        self.w.task("task-1", "hi")
+        state = self.w.root / "state"
+
+        def killed(*a):
+            oc.claim_answer(state, "task-1")   # the reply claimed, then died before publishing
+            return "completed", "text from the turn", "end_turn", mock.Mock(decisions=[])
+        with mock.patch.object(oc.Connector, "run_turn", killed):
+            rec = oc.Connector(self.w.args()).handle("task-1.txt")
+        self.assertEqual(self.w.result("task-1"), "text from the turn\n")
+        self.assertEqual(rec["answered_by"], "connector")
+        self.assertEqual((oc.answered_dir(state) / "task-1").read_bytes(), oc.PUBLISHED)
+
+    def test_a_reply_that_published_is_never_answered_twice(self):
+        self.w.task("task-1", "hi")
+        state, result = self.w.root / "state", self.w.root / "results" / "task-1.txt"
+
+        def replied(*a):
+            oc.answer_once(state, "task-1", result, "from the agent\n")
+            return "completed", "turn text", "end_turn", mock.Mock(decisions=[])
+        with mock.patch.object(oc.Connector, "run_turn", replied):
+            rec = oc.Connector(self.w.args()).handle("task-1.txt")
+        self.assertEqual(self.w.result("task-1"), "from the agent\n")
+        self.assertEqual(rec["answered_by"], "agent")
+
     def test_an_answered_task_is_never_woken_again(self):
         self.w.task("task-1", "STUB:TEXT hi")
         oc.claim_answer(self.w.root / "state", "task-1")
         a = self.w.args()
         self.assertEqual(oc.Connector(a).pending_tasks(set()), [])
+
+
+class SessionStoreTest(unittest.TestCase):
+    def test_two_writers_never_lose_each_others_session(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = oc.SessionStore(Path(d) / "sessions.json")
+            real, first = oc.SessionStore._read, threading.Event()
+            started = threading.Event()
+
+            def slow_read(self):
+                rows = real(self)
+                if not first.is_set():
+                    first.set()
+                    started.set()
+                    time_to_interleave.wait(2)
+                return rows
+            time_to_interleave = threading.Event()
+            with mock.patch.object(oc.SessionStore, "_read", slow_read):
+                a = threading.Thread(target=store.remember, args=(("!a:x", "owner"), "s-a", "/c", 1))
+                a.start()
+                started.wait(2)
+                b = threading.Thread(target=store.remember, args=(("!b:x", "owner"), "s-b", "/c", 1))
+                b.start()
+                b.join(0.3)
+                time_to_interleave.set()
+                a.join(5)
+                b.join(5)
+            self.assertEqual(store.get(("!a:x", "owner"))["session_id"], "s-a")
+            self.assertEqual(store.get(("!b:x", "owner"))["session_id"], "s-b")
 
 
 class PermissionTest(unittest.TestCase):
@@ -406,6 +480,34 @@ class PermissionTest(unittest.TestCase):
         draft = str(oc.draft_for(self.result))
         self.assertTrue(self.decide({"kind": "edit", "rawInput": {"path": draft, "content": "hi"}}, owner=False))
         self.assertFalse(self.decide({"kind": "edit", "rawInput": {"path": draft + ".x"}}, owner=False))
+
+    def test_a_symlink_at_the_draft_path_is_not_the_draft(self):
+        outside = self.work.parent / "outside.txt"
+        outside.write_text("keep")
+        draft = oc.draft_for(self.result)
+        draft.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(outside, draft)
+        self.assertFalse(self.decide({"kind": "edit", "rawInput": {"path": str(draft), "content": "x"}}, owner=False))
+        self.assertFalse(self.decide({"kind": "edit", "rawInput": {"path": str(outside), "content": "x"}}, owner=False))
+
+    def test_the_home_directory_is_never_an_owner_working_directory(self):
+        w = str(self.work)
+        with mock.patch.dict(os.environ, {"HOME": w}):
+            self.assertFalse(self.decide({"kind": "edit", "rawInput": {"path": w + "/.zshrc", "content": "x"}}))
+            self.assertFalse(self.decide({"kind": "read", "rawInput": {"path": "sub/a.txt"}}))
+            draft = str(oc.draft_for(self.result))
+            self.assertTrue(self.decide({"kind": "edit", "rawInput": {"path": draft, "content": "hi"}}),
+                            "the reply draft stays writable")
+
+    def test_a_nul_in_a_path_never_resolves(self):
+        # Some Python 3.14 builds return a path with the NUL from realpath instead of raising;
+        # simulated here, since the interpreter running the suite may raise.
+        keeps_nul = lambda p, *a, **k: os.path.normpath(p)  # noqa: E731
+        for realpath in (os.path.realpath, keeps_nul):
+            with self.subTest(realpath=realpath), mock.patch.object(oc.os.path, "realpath", realpath):
+                self.assertIsNone(oc.resolved(str(self.work), "a\0b"))
+                self.assertIsNone(oc.resolved(str(self.work), str(self.work) + "/a\0b"))
+                self.assertFalse(self.decide({"kind": "read", "rawInput": {"path": "a\0b"}}))
 
     def test_no_allow_option_means_refused(self):
         params = {"toolCall": {"kind": "read", "locations": [{"path": str(self.work / "a")}]},
@@ -734,7 +836,11 @@ class RunTurnTest(unittest.TestCase):
         self.assertIn("stopped before answering", c.fallback_body({}, "gone", "", "died"))
         self.assertIn("Partial reply:\npart", c.fallback_body({}, "timeout", "part", "900s"))
         self.assertIn("(timeout: 900s)", c.fallback_body({"event_type": "room.joined"}, "timeout", "", "900s"))
-        self.assertEqual(c.fallback_body({}, "completed", " ", ""), oc.NO_ANSWER + "\n")
+        # A message that got no answer says so in the room; only an event posts nothing.
+        empty = c.fallback_body({}, "completed", " ", "")
+        self.assertFalse(empty.startswith("[no-send]"), empty)
+        self.assertIn("without an answer", empty)
+        self.assertTrue(c.fallback_body({"event_type": "room.joined"}, "completed", "", "").startswith("[no-send]"))
 
 
 class EntryTest(unittest.TestCase):
