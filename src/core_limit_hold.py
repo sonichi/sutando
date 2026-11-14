@@ -43,7 +43,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
 import sys
 import time
@@ -394,16 +393,27 @@ def _binds(hold: dict, launch_model: Optional[str], launch_account: Optional[str
     return _same_family(hold.get("model"), launch_model) and _same_account(hold.get("account"), launch_account)
 
 
+_RESOLVE_CCD = 'source "$1/src/claude_config_dir.sh" && resolve_claude_config_dir "$1" core-limit-hold'
+
+
 def _launch_config_dir() -> Optional[str]:
-    """The config dir the launcher runs the core in: its export when set, else the resolver it
-    exports from, so a caller the launcher did not start (the watchdog) reads the same seat."""
-    if os.environ.get("CLAUDE_CONFIG_DIR"):
-        return os.environ["CLAUDE_CONFIG_DIR"]
-    try:
-        from sutando_config import resolve_claude_sutando_config_dir
-        return str(resolve_claude_sutando_config_dir())
-    except Exception:
+    """The config dir the launcher runs the core in, from the launcher's own resolver
+    (src/claude_config_dir.sh), so the watchdog and the gate read the seat it launches.
+    None where the launcher would refuse to start: the hold then keeps binding."""
+    import subprocess
+    from sutando_config import _find_repo_root
+    repo = _find_repo_root()
+    if repo is None:
         return None
+    try:
+        run = subprocess.run(["bash", "-c", _RESOLVE_CCD, "core-limit-hold", str(repo)],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # Command substitution drops trailing newlines only; a seat name may end in spaces.
+    seat = run.stdout.rstrip("\n")
+    # rc 2 is the resolver's "helper absent, caller's CLAUDE_CONFIG_DIR used" success.
+    return seat if run.returncode in (0, 2) and seat else None
 
 
 def launch_identity(workspace: Path, config_dir: Optional[str] = None) -> tuple:
@@ -472,7 +482,7 @@ def _present_card(hold: dict, card_entry: str, now: float) -> bool:
     Detached: the card's DM mirror may take its own deadline, and the launch must not wait on it."""
     import subprocess
     body = f"Paused: {hold['reason'].split(': ', 1)[-1]}. Pick another model to keep working now."
-    # The card lasts as long as the hold: notice_queued stops a second present for this pause.
+    # The card lasts as long as the hold; card_for_until stops a second present for this window.
     ttl = int(max(600, float(hold.get("until") or now) - now))
     try:
         subprocess.Popen([sys.executable, card_entry, "present", "core-model", "--set", f"body={body}",
@@ -485,23 +495,29 @@ def _present_card(hold: dict, card_entry: str, now: float) -> bool:
 
 def _ensure_notice(workspace: Path, hold: dict, card_entry: Optional[str] = None,
                    now: Optional[float] = None) -> bool:
-    """Queue the hold's owed DM under its stable name, once, and present the core-model card
-    with it when the launcher provides one. True when it is queued.
+    """Queue the hold's owed DM under its stable name, once per incident, and present the
+    core-model card once per hold window (again when the hold is extended past the window it
+    was presented for) when the launcher provides one. True when the record changed.
     A retry rewrites the same name, so it cannot become a second message."""
-    if hold.get("notice_queued"):
-        return False
-    from local_record import write_text_whole
     card = bool(card_entry) and Path(card_entry).is_file()
-    body = _notice_body(hold, card)
-    try:
-        write_text_whole(Path(workspace) / "results" / hold["notice"], body)
-    except OSError:
-        return False
-    hold["notice_queued"] = True
-    hold["notice_line"] = body.split("\n", 1)[1].split("\n", 1)[0]
-    if card:
+    changed = False
+    if not hold.get("notice_queued"):
+        from local_record import write_text_whole
+        body = _notice_body(hold, card)
+        try:
+            write_text_whole(Path(workspace) / "results" / hold["notice"], body)
+        except OSError:
+            return False
+        hold["notice_queued"] = True
+        hold["notice_line"] = body.split("\n", 1)[1].split("\n", 1)[0]
+        changed = True
+    shown = hold.get("card_for_until")
+    until = hold.get("until")
+    if card and (not isinstance(shown, (int, float)) or (isinstance(until, (int, float)) and until > shown)):
         hold["card_presented"] = _present_card(hold, card_entry, time.time() if now is None else now)
-    return True
+        hold["card_for_until"] = until
+        changed = True
+    return changed
 
 
 def _hold_until(limit: Limit, strikes: int, now: float) -> float:
@@ -565,6 +581,7 @@ def decide(workspace: Path, now: Optional[float] = None, *, quota=None,
         if hold and hold.get("status") == "held" and hold.get("notice"):
             for key in ("started_at", "notice", "notice_queued", "notice_line", "present_at_hold", "held_tasks"):
                 new[key] = hold.get(key)
+            new.update({k: hold[k] for k in ("card_presented", "card_for_until") if k in hold})
             new["started_at"] = new["started_at"] or hold.get("set_at") or now
         else:
             from proactive_routing import proactive_filename

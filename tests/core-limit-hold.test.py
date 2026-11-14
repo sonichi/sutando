@@ -722,7 +722,7 @@ class AccountChange(unittest.TestCase):
         self.td = tempfile.TemporaryDirectory()
         self.ws = Path(self.td.name)
         (self.ws / "state").mkdir()
-        self.cfg = self.ws / "claude-config"
+        self.cfg = self.ws / ".claude-sutando"  # the seat the launcher resolves for this workspace
         self.cfg.mkdir()
         self.now = time.time()
         (self.ws / "state" / "quota-state.json").write_text(json.dumps(limited_record(self.now)))
@@ -739,9 +739,9 @@ class AccountChange(unittest.TestCase):
         import io
         import os
         from unittest import mock
+        env = {"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(self.ws), "CLAUDE_CONFIG_DIR": str(self.cfg)}
         with mock.patch.object(clh, "resolve_workspace", return_value=self.ws), \
-                mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.cfg)}), \
-                contextlib.redirect_stdout(io.StringIO()):
+                mock.patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()):
             return clh.main(["gate", "--cwd", str(self.ws)])
 
     def test_signing_in_to_another_account_lifts_the_hold(self):
@@ -1138,16 +1138,82 @@ class ModelSwitchWayOut(unittest.TestCase):
             self.pick("opus")
             self.assertIsNone(hc._core_limit_hold(self.now + 1), "a seat switched away is revived")
 
+    def seat_config(self, value: str, *, legacy: bool = False) -> None:
+        cfg = {"core_config_dirs": [{"id": "claude", "type": "claude", "env_name": "CLAUDE_CONFIG_DIR",
+                                     "synced": True, "value": value}]}
+        if legacy:
+            cfg["claude_sutando_config_dir"] = {"subdir": ".legacy"}
+        (self.ws / "sutando.config.local.json").write_text(json.dumps(cfg))
+
     def test_an_unresolvable_seat_falls_back_to_the_model_switch_record(self):
+        """The launcher refuses to start on an invalid seat config; the gate reads no seat."""
         import os
         from unittest import mock
-        import sutando_config
         self.pick("sonnet")
-        with mock.patch.object(sutando_config, "resolve_claude_sutando_config_dir",
-                               side_effect=ValueError("both config fields set")), \
-                mock.patch.dict(os.environ, {}):
-            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        self.seat_config("${WORKSPACE_DIR}/seat", legacy=True)
+        env = {"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(self.ws), "CLAUDE_CONFIG_DIR": str(self.ws)}
+        with mock.patch.dict(os.environ, env):
+            self.assertIsNone(clh._launch_config_dir())
             self.assertEqual(clh.launch_identity(self.ws), ("sonnet", None))
+
+    def test_a_seat_name_ending_in_a_space_is_kept(self):
+        """The launcher's `$(...)` keeps a seat's trailing space; the gate must read the same dir."""
+        import os
+        from unittest import mock
+        self.pick("sonnet")
+        seat = self.ws / "seat-opus "
+        seat.mkdir()
+        (seat / "settings.json").write_text(json.dumps({"model": "opus"}))
+        self.seat_config("${WORKSPACE_DIR}/seat-opus ")
+        env = {"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(self.ws)}
+        with mock.patch.dict(os.environ, env):
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            shell = subprocess.run(
+                ["bash", "-c", 'source "$1/src/claude_config_dir.sh"; d="$(resolve_claude_config_dir "$1" t)";'
+                 ' printf "%s" "$d"', "t", str(REPO)], capture_output=True, text=True, timeout=60)
+            self.assertTrue(shell.stdout.endswith("seat-opus "), repr(shell.stdout))
+            self.assertEqual(clh._launch_config_dir(), shell.stdout)
+            self.assertEqual(clh.launch_identity(self.ws)[0], "opus")
+
+    def test_no_launcher_resolver_reads_as_no_seat(self):
+        """No checkout to find the resolver in, or no bash to run it: the gate reads no seat."""
+        from unittest import mock
+        import sutando_config
+        with mock.patch.object(sutando_config, "_find_repo_root", return_value=None):
+            self.assertIsNone(clh._launch_config_dir())
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError("bash")):
+            self.assertIsNone(clh._launch_config_dir())
+
+    def test_watchdog_reads_the_configured_seat_not_a_foreign_env_seat(self):
+        """Review of #6300: the launcher takes the configured seat over CLAUDE_CONFIG_DIR, so a
+        watchdog whose env names another seat must still read the configured one, or it calls
+        a held core unbound and its restart meets the gate's exit 75 in a loop."""
+        import os
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("hc_6300_env", str(REPO / "src" / "health-check.py"))
+        hc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hc)
+        foreign = self.ws / "other-seat"
+        foreign.mkdir()
+        (foreign / "settings.json").write_text(json.dumps({"model": "sonnet"}))
+        for configured in (None, "${WORKSPACE_DIR}/seat-opus"):
+            with self.subTest(configured=configured):
+                seat = self.ws / (".claude-sutando" if configured is None else "seat-opus")
+                seat.mkdir(exist_ok=True)
+                (seat / "settings.json").write_text(json.dumps({"model": "opus"}))
+                if configured:
+                    self.seat_config(configured)
+                env = {"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(self.ws),
+                       "CLAUDE_CONFIG_DIR": str(foreign)}
+                with mock.patch.dict(os.environ, env), mock.patch.object(hc, "WORKSPACE_DIR", self.ws):
+                    shell = subprocess.run(
+                        ["bash", "-c", 'source "$1/src/claude_config_dir.sh"; resolve_claude_config_dir "$1" t',
+                         "t", str(REPO)], capture_output=True, text=True, timeout=60)
+                    self.assertEqual(Path(shell.stdout.strip()).resolve(), seat.resolve(), shell.stderr)
+                    self.assertEqual(Path(clh._launch_config_dir() or "").resolve(), seat.resolve())
+                    self.assertEqual(clh.launch_identity(self.ws)[0], "opus")
+                    self.assertIsNotNone(hc._core_limit_hold(self.now + 1),
+                                         "the watchdog read the env's seat, not the one the launcher runs")
 
     def test_health_check_revives_a_core_switched_away_from_the_hold(self):
         from unittest import mock
@@ -1225,6 +1291,32 @@ class ModelSwitchWayOut(unittest.TestCase):
             ttl = int(argv[argv.index("--ttl") + 1])
             self.assertGreaterEqual(self.now + ttl, d.hold["until"] - 1,
                                     "the card expires before the hold it offers a way out of")
+
+    def test_an_extended_hold_re_presents_the_card_once(self):
+        """Review of #6300: a hold extended while still held kept notice_queued, so the card,
+        sized to the old end, expired for the whole extension. One DM; one card per window."""
+        from unittest import mock
+        entry = self.ws / "local-card.py"
+        entry.write_text("")
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            (ws / "state").mkdir()
+            t = self.now
+            with mock.patch("subprocess.Popen") as popen:
+                first = clh.decide(ws, t, quota=limited_record(t, reset_in=600), card_entry=str(entry))
+                self.assertFalse(first.launch)
+                later = first.hold["until"] + 30  # past the old end, no release in between
+                ext = clh.decide(ws, later, quota=limited_record(later, reset_in=20 * 3600, ago=5),
+                                 card_entry=str(entry))
+                self.assertFalse(ext.launch)
+                self.assertGreater(ext.hold["until"], first.hold["until"])
+                clh.decide(ws, later + 60, quota=limited_record(later, reset_in=20 * 3600, ago=5),
+                           card_entry=str(entry))
+            self.assertEqual(popen.call_count, 2, "the card was not re-presented for the extended hold")
+            argv = popen.call_args[0][0]
+            ttl = int(argv[argv.index("--ttl") + 1])
+            self.assertGreaterEqual(later + ttl, ext.hold["until"] - 1, "the card expires during the extension")
+            self.assertEqual(len(list((ws / "results").glob("proactive-*.txt"))), 1, "an extension sent a second DM")
 
     def test_no_card_presenter_keeps_the_plain_notice(self):
         body = next((self.ws / "results").glob("proactive-*.txt")).read_text()
