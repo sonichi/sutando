@@ -157,11 +157,52 @@ class Migration(Base):
         self.pointer("task-live")
         self.pointer("task-ghost")
         first = ta.retire_archived_pointers(self.ws, log=lambda m: None)
-        self.assertEqual(first, {"retired": 6, "kept_pending": 1, "kept_unarchived": 1})
+        self.assertEqual(first, {"retired": 6, "kept_pending": 1, "kept_unarchived": 1, "failed": 0})
         self.assertEqual(sorted(p.name for p in self.inbox.iterdir() if p.is_file()),
                          [".lock", "task-ghost.txt", "task-live.txt"])
         second = ta.retire_archived_pointers(self.ws, log=lambda m: None)
-        self.assertEqual(second, {"retired": 0, "kept_pending": 1, "kept_unarchived": 1})
+        self.assertEqual(second, {"retired": 0, "kept_pending": 1, "kept_unarchived": 1, "failed": 0})
+
+    def test_a_task_requeued_after_the_snapshot_keeps_its_pointer(self):
+        self.task("task-rq", live=False)
+        ptr = self.pointer("task-rq")
+        real_root = ta.deliveries_root_for
+
+        def requeue_then_root(tasks):  # after the live snapshot, before any inbox lock
+            self.task("task-rq")
+            return real_root(tasks)
+        with patch.object(ta, "deliveries_root_for", side_effect=requeue_then_root):
+            counts = ta.retire_archived_pointers(self.ws, log=lambda m: None)
+        self.assertEqual(counts, {"retired": 0, "kept_pending": 1, "kept_unarchived": 0, "failed": 0})
+        self.assertTrue(ptr.exists())
+        self.assertFalse((self.inbox / ta.POINTER_ARCHIVE_DIR / "task-rq.txt").exists())
+
+    def test_the_archive_step_keeps_the_pointer_of_a_task_live_again(self):
+        self.task("task-rq2")
+        ptr = self.pointer("task-rq2")
+        self.assertEqual(ta.retire_delivery_pointers(self.ws / "deliveries", "task-rq2", log=lambda m: None), [])
+        self.assertTrue(ptr.exists())
+
+    def test_an_inbox_it_cannot_lock_fails_the_run_and_a_later_run_retires_it(self):
+        import fcntl
+        self.task("task-lk", live=False)
+        ptr = self.pointer("task-lk")
+        fd = os.open(self.inbox / ta.POINTER_LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            with patch.object(ta, "_POINTER_LOCK_WAIT_S", 0.1):
+                counts = ta.retire_archived_pointers(self.ws, log=lambda m: None)
+            self.assertEqual((counts["retired"], counts["failed"]), (0, 1))
+            run = subprocess.run([sys.executable, str(REPO / "src" / "task_archive.py"),
+                                  "retire-archived-pointers", str(self.ws)],
+                                 capture_output=True, text=True, env=hermetic_env())
+            self.assertEqual(run.returncode, 1, run.stderr)
+            self.assertIn('"failed": 1', run.stdout)
+            self.assertTrue(ptr.exists())
+        finally:
+            os.close(fd)
+        self.assertEqual(ta.retire_archived_pointers(self.ws, log=lambda m: None)["retired"], 1)
+        self.assertFalse(ptr.exists())
 
     def test_cli(self):
         self.task("task-c1", live=False)

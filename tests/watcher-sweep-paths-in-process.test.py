@@ -396,7 +396,7 @@ class ArchiveErrors(Base):
         (self.tasks / "processed" / "task-a.txt").write_text("id: task-a\ntask: x\n")
         ptr = self.ptr("task-a", payload=False)
         counts = ta.retire_archived_pointers(self.ws, log=lambda m: None)
-        self.assertEqual(counts, {"retired": 1, "kept_pending": 0, "kept_unarchived": 0})
+        self.assertEqual(counts, {"retired": 1, "kept_pending": 0, "kept_unarchived": 0, "failed": 0})
         self.assertFalse(ptr.exists())
         self.assertTrue((self.inbox / ta.POINTER_ARCHIVE_DIR / "task-a.txt").is_file())
 
@@ -404,7 +404,7 @@ class ArchiveErrors(Base):
         ws = self.ws / "other"
         (ws / "tasks" / "archive").mkdir(parents=True)
         self.assertEqual(ta.retire_archived_pointers(ws, log=lambda m: None),
-                         {"retired": 0, "kept_pending": 0, "kept_unarchived": 0})
+                         {"retired": 0, "kept_pending": 0, "kept_unarchived": 0, "failed": 0})
 
     def test_migration_logs_a_folder_it_cannot_retire_in(self):
         (self.tasks / "archive" / "task-a.txt").write_text("id: task-a\ntask: x\n")
@@ -412,7 +412,7 @@ class ArchiveErrors(Base):
         self.fifo_lock()
         logs = []
         counts = ta.retire_archived_pointers(self.ws, log=logs.append)
-        self.assertEqual(counts["retired"], 0)
+        self.assertEqual((counts["retired"], counts["failed"]), (0, 1))
         self.assertTrue(ptr.exists())
         self.assertEqual(len(logs), 1)
         self.assertIn("retire pointer for task-a in", logs[0])

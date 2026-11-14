@@ -222,8 +222,9 @@ def _regular_at(name: str, dir_fd: int) -> bool:
         return False
 
 
-def _retire_in_folder(folder: str, task_id: str) -> list[str]:
-    """Rename this inbox's pointers for `task_id` into its archive/, under its lock."""
+def _retire_in_folder(folder: str, task_id: str, tasks_dir: Path) -> list[str] | None:
+    """Rename this inbox's pointers for `task_id` into its archive/, under its lock; None, moving
+    nothing, when the task is live in `tasks_dir` again (a requeue owns its pointer)."""
     import fcntl
     import os
     import stat
@@ -246,6 +247,8 @@ def _retire_in_folder(folder: str, task_id: str) -> list[str]:
                     if time.monotonic() >= deadline:
                         raise
                     time.sleep(0.05)
+            if find_task_file(Path(tasks_dir), task_id) is not None:
+                return None
             try:
                 os.mkdir(POINTER_ARCHIVE_DIR, 0o755, dir_fd=dfd)
             except FileExistsError:
@@ -286,7 +289,7 @@ def retire_delivery_pointers(deliveries_root: Path, task_id: str, *, log=print) 
     moved: list[str] = []
     for folder in folders:
         try:
-            moved += _retire_in_folder(folder, task_id)
+            moved += _retire_in_folder(folder, task_id, Path(deliveries_root).parent / "tasks") or []
         except OSError as e:
             log(f"  retire pointer for {task_id} in {folder} failed: {e}")
     return moved
@@ -305,7 +308,8 @@ def _ids_in(directory: Path) -> set[str]:
 def retire_archived_pointers(workspace: Path, *, log=print) -> dict:
     """One-time, idempotent migration: retire pointers whose task body is archived.
 
-    A pointer whose body is still live in tasks/ is pending and is never touched.
+    A pointer whose body is still live in tasks/ is pending and is never touched, rechecked
+    under each inbox's lock. `failed` counts pointers left for a retry: the CLI then exits 1.
     """
     import os
     import re
@@ -322,20 +326,29 @@ def retire_archived_pointers(workspace: Path, *, log=print) -> dict:
     for m in months:
         archived |= _ids_in(Path(m))
     root = deliveries_root_for(tasks)
-    counts = {"retired": 0, "kept_pending": 0, "kept_unarchived": 0}
+    counts = {"retired": 0, "kept_pending": 0, "kept_unarchived": 0, "failed": 0}
     try:
         with os.scandir(root) as entries:
             folders = [e.path for e in entries if e.is_dir(follow_symlinks=False)]
-    except OSError:
+    except FileNotFoundError:
+        return counts
+    except OSError as e:
+        log(f"  retire pointers: cannot list {root}: {e}")
+        counts["failed"] += 1
         return counts
     for folder in folders:
         ids = set()
-        with os.scandir(folder) as entries:
-            for e in entries:
-                for suffix in POINTER_SUFFIXES:
-                    if e.name.startswith("task-") and e.name.endswith(suffix):
-                        ids.add(e.name[: -len(suffix)])
-                        break
+        try:
+            with os.scandir(folder) as entries:
+                for e in entries:
+                    for suffix in POINTER_SUFFIXES:
+                        if e.name.startswith("task-") and e.name.endswith(suffix):
+                            ids.add(e.name[: -len(suffix)])
+                            break
+        except OSError as e:
+            log(f"  retire pointers in {folder}: cannot list it: {e}")
+            counts["failed"] += 1
+            continue
         for task_id in sorted(ids):
             if task_id in live:
                 counts["kept_pending"] += 1
@@ -343,9 +356,15 @@ def retire_archived_pointers(workspace: Path, *, log=print) -> dict:
                 counts["kept_unarchived"] += 1
             else:
                 try:
-                    counts["retired"] += len(_retire_in_folder(folder, task_id))
+                    moved = _retire_in_folder(folder, task_id, tasks)
                 except OSError as e:
                     log(f"  retire pointer for {task_id} in {folder} failed: {e}")
+                    counts["failed"] += 1
+                    continue
+                if moved is None:
+                    counts["kept_pending"] += 1
+                else:
+                    counts["retired"] += len(moved)
     return counts
 
 
@@ -355,5 +374,6 @@ if __name__ == "__main__":
     if len(sys.argv) != 3 or sys.argv[1] != "retire-archived-pointers":
         print("usage: task_archive.py retire-archived-pointers <workspace>", file=sys.stderr)
         sys.exit(2)
-    print(json.dumps(retire_archived_pointers(Path(sys.argv[2]),
-                                              log=lambda m: print(m, file=sys.stderr))))
+    counts = retire_archived_pointers(Path(sys.argv[2]), log=lambda m: print(m, file=sys.stderr))
+    print(json.dumps(counts))
+    sys.exit(1 if counts["failed"] else 0)
