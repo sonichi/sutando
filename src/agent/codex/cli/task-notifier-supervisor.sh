@@ -147,7 +147,13 @@ if [ -n "${SUTANDO_NOTIFIER_LOCK_DIR:-}" ]; then
   LOCK_DIR="$SUTANDO_NOTIFIER_LOCK_DIR"
 else
   LOCK_KEY="$(_lease_key "$TMUX_SOCKET" "$SESSION")" || exit 1
-  LOCK_DIR="${TMPDIR:-/tmp}/sutando-notifier-$LOCK_KEY.lock"
+  # Under the workspace, never $TMPDIR: launchd and a terminal see different TMPDIRs.
+  if [ -n "$TASKS_DIR" ]; then LEASE_WS="$(workspace_dir_for_inbox "$TASKS_DIR")"
+  else LEASE_WS="${SUTANDO_WORKSPACE_DIR:-$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)}"; fi
+  if [ -z "$LEASE_WS" ] || ! mkdir -p "$LEASE_WS/state/locks" 2>/dev/null; then
+    echo "task-notifier-supervisor: cannot resolve the workspace lease dir; refusing to run" >&2; exit 1
+  fi
+  LOCK_DIR="$LEASE_WS/state/locks/notifier-$LOCK_KEY.lock"
 fi
 RECLAIM_DIR="$LOCK_DIR.reclaim"
 RECLAIM_HOOK="${SUTANDO_NOTIFIER_RECLAIM_HOOK:-}"

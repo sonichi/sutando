@@ -304,18 +304,32 @@ class LeaseOwnershipTest(unittest.TestCase):
         self._await_run("B")
         self.assertIsNone(other.poll(), "a second socket was suppressed by the first")
 
+    def test_a_start_under_another_tmpdir_takes_the_same_workspace_lease(self):
+        """launchd and a terminal see different $TMPDIRs; the lease is per workspace."""
+        other_tmp = self.d / "other-tmp"
+        other_tmp.mkdir()
+        self._bg("launchd", SUTANDO_TMUX_SOCKET="/tmp/sock-T", SUTANDO_TMUX_SESSION="s")
+        self._await_run("launchd")
+        r = self._run("terminal", TMPDIR=str(other_tmp), SUTANDO_TMUX_SOCKET="/tmp/sock-T",
+                      SUTANDO_TMUX_SESSION="s")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self._ran(), ["launchd"], "a second TMPDIR took a second lease")
+        self.assertEqual(len(list((self.d / "workspace" / "state" / "locks").glob("notifier-*.lock"))), 1)
+        self.assertEqual(list(other_tmp.iterdir()), [])
+
     def test_a_holder_started_under_another_locale_or_timezone_is_still_live(self):
         self._bg("A", LC_ALL="C", LANG="C", TZ="UTC")
         self._await_run("A")
-        token = (self.d / next(p.name for p in self.d.iterdir() if p.name.startswith("sutando-notifier-")
-                               and p.is_dir()) / "token").read_text()
+        locks = self.d / "workspace" / "state" / "locks"
+        token = (locks / next(p.name for p in locks.iterdir() if p.name.startswith("notifier-")
+                              and p.is_dir()) / "token").read_text()
         for tag, env in (("tz", {"LC_ALL": "C", "TZ": "America/Los_Angeles"}),
                          ("locale", {"LC_ALL": "de_DE.UTF-8", "LANG": "de_DE.UTF-8", "TZ": "Asia/Shanghai"})):
             r = self._run(tag, **env)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertNotIn(tag, self._ran(), f"a {tag} difference judged the live holder stale")
         self.assertEqual(self._ran(), ["A"])
-        self.assertEqual(next(p for p in self.d.iterdir() if p.name.startswith("sutando-notifier-")
+        self.assertEqual(next(p for p in locks.iterdir() if p.name.startswith("notifier-")
                               and p.is_dir()).joinpath("token").read_text(), token)
 
     # --- P1: reclamation is serialized and re-judged under its own lock ---
@@ -701,7 +715,7 @@ with open(sys.argv[1], 'w') as guard:
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("cannot derive the lease key", r.stderr)
         self.assertEqual(self._ran(), [])
-        self.assertEqual(list(self.d.glob("sutando-notifier-*.lock")), [],
+        self.assertEqual(list(self.d.rglob("*notifier-*.lock")), [],
                          "a lease was taken under a collapsed key")
 
     def _python_with_malformed_digest(self):
@@ -729,7 +743,7 @@ with open(sys.argv[1], 'w') as guard:
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("cannot derive the lease key", r.stderr)
         self.assertEqual(self._ran(), [])
-        self.assertEqual(list(self.d.glob("sutando-notifier-*.lock")), [],
+        self.assertEqual(list(self.d.rglob("*notifier-*.lock")), [],
                          "a lease was taken under a malformed key")
 
     # --- P1: an unmeasurable start identity is contended, never stale ---
