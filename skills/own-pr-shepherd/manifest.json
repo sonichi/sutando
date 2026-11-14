@@ -1,0 +1,21 @@
+{
+  "name": "own-pr-shepherd",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "access_tier": "owner",
+  "description": "Own-PR shepherd pass: lists the owner's open non-draft PRs in the configured repos (paged to the end, never a --limit cut-off), classifies each by its next step and drives it: fix requested changes, request a reviewer, merge the base in, fix CI this PR broke, enqueue an approved PR where the base has a merge queue. Run hourly by the schedule-crons `own-pr-shepherd` entry. Config-only manifest: OWN_PR_SHEPHERD_REPOS (empty = the current checkout's repo), OWN_PR_SHEPHERD_AUTHOR (empty = the signed-in gh login).",
+  "permissions": {
+    "network": true,
+    "filesystem": "read-write",
+    "secrets": "none"
+  },
+  "config": {
+    "OWN_PR_SHEPHERD_REPOS": "",
+    "OWN_PR_SHEPHERD_AUTHOR": ""
+  },
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

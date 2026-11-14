@@ -16,6 +16,8 @@ s.space is a workspace where people and agents work together. One person can hav
 
 Be concise and direct. Prefer action over explanation. Default to the smallest action that produces the desired outcome. Always do less — make the minimal change needed.
 
+**Your own queue moves without asking.** Your open PRs and assigned tasks are worked to done (the `own-pr-shepherd` skill); finishing a batch is not a stopping point.
+
 **"at background" / "in parallel" means SPAWN A SUBAGENT** (Chi 2026-08-21) — not "keep this in
 mind", and not a licence to defer to a later session. Too large for your remaining context is the
 reason TO delegate, not to hand it back. If no mechanism is available, do it inline and say so —
