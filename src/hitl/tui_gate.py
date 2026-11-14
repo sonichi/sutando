@@ -6,6 +6,8 @@ import hashlib
 import re
 from typing import Dict, List, Optional, Tuple
 
+from owner_text import FOLDED, named, resets
+
 from .schema import Action, HumanRequirement
 
 SOURCE = "tui"
@@ -83,15 +85,29 @@ def limit_card_holds(req: HumanRequirement, pane: Optional[str], runtime: Option
     return limit_standing(pane, runtime, outrun)
 
 
+def limit_sentence(name: Optional[str], reset_at: Optional[float] = None,
+                   now: Optional[float] = None, owes: bool = False) -> str:
+    """A usage limit in one line: who, and when it lifts if the runtime said."""
+    who = named(name) + (" has work waiting and" if owes else "")
+    when = resets(reset_at, now)
+    if when:
+        return f"{who} has reached its usage limit. {when[:-1]} and it continues by itself then."
+    return f"{who} has reached its usage limit and continues by itself when it resets."
+
+
 def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None) -> str:
-    """How the owner lifts a usage limit, for the card body; the steps are the runtime's own."""
-    where = f"open its terminal (tmux session {session})" if session else "open its terminal"
+    """The runtime's own ways to lift a usage limit sooner: a card's detail line, never its
+    first. `session` is accepted for older callers and never shown."""
     if runtime == "codex":
-        return (f"It continues when the limit resets. To unblock it sooner, {where} and run "
-                "`codex login` to switch to another account.")
-    return (f"It continues when the limit resets. To unblock it sooner, {where} and run "
-            "/usage-credits to use extra credits, /login to switch to another account, "
-            "or /model to switch to a model with usage left.")
+        return "To continue sooner, its terminal takes `codex login` to switch to another account."
+    return ("To continue sooner, its terminal takes /usage-credits to use extra credits, /login to "
+            "switch to another account, or /model to switch to a model with usage left.")
+
+
+def blocked_title(name: Optional[str], limit: bool = False) -> str:
+    """The blocked card's title: who, and a plain state. Never a session name or a state code."""
+    who = named(name)
+    return f"{who} has reached its usage limit" if limit else f"{who} is waiting for you"
 
 
 def sign_in_copy(runtime: Optional[str] = None) -> Tuple[str, str, str]:
@@ -165,11 +181,14 @@ def _open_terminal() -> Action:
 def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
                     session: str, detail: str, fallback_message: str,
                     runtime: Optional[str] = None,
-                    episode: Optional[str] = None) -> HumanRequirement:
+                    episode: Optional[str] = None,
+                    name: Optional[str] = None) -> HumanRequirement:
     """The requirement a gate deserves; unparseable or non-semantic gates keep the
     blocked card with no button, so a key is never guessed. A session with no stamped
     runtime predates the stamp and ran Claude, so `runtime` falls back to "claude".
-    `episode` LIMIT_EPISODE keys the card on the seat, not the screen, and announces it once."""
+    `episode` LIMIT_EPISODE keys the card on the seat, not the screen, and announces it once.
+    `name` is the agent's display name, for the title and the device a person reads; the
+    session stays in `device.id` and the subject, where the terminal jump and the driver read it."""
     options, caret = parse_options(prompt)
     subject: Dict[str, object] = {
         "session": session,
@@ -180,7 +199,8 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
         "options": options,
         "caret": caret,
     }
-    kind, title, message, actions = FALLBACK_KIND, f"{session} · {state}", fallback_message, []
+    kind, message, actions = FALLBACK_KIND, fallback_message, []
+    title = blocked_title(name, episode == LIMIT_EPISODE)
     option_for_action: Dict[str, int] = {}
 
     if (episode == LIMIT_EPISODE or _NEVER_ONE_CLICK.search(prompt or "")
@@ -211,6 +231,8 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
             actions = [Action(id=f"opt{i + 1}", kind="select", label=o) for i, o in enumerate(options)]
 
     subject["option_for_action"] = option_for_action
+    if kind == FALLBACK_KIND:
+        subject[FOLDED] = True
     guard = guard_for(session, prompt, state)
     if episode == LIMIT_EPISODE:
         guard = limit_guard(session)
@@ -218,7 +240,7 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
     return HumanRequirement(
         kind=kind, runtime=runtime or "claude", message=message, title=title,
         guard=guard,
-        device={"id": session, "name": session},
+        device={"id": session, "name": named(name)},
         actions=actions + [_open_terminal()],
         subject=subject,
     )

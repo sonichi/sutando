@@ -17,6 +17,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -123,6 +124,14 @@ def card(ws, which, pane, routed=False):
     return out, t, manager(ws).get(out.get("hitl_id", "")) if out.get("hitl_id") else None
 
 
+def first_line(req):
+    return req.message.split("\n", 1)[0]
+
+
+def details(req):
+    return req.message.partition("\n\n")[2]
+
+
 def press(ws, req, action_id):
     manager(ws).apply_action(ActionReply(hitl_id=req.id, expected_revision=req.revision,
                                          action_id=action_id, guard=req.guard))
@@ -210,8 +219,8 @@ class FrozenCard(unittest.TestCase):
         out, t, req = card(self.ws, FROZEN, PANES["frozen"])
         self.assertEqual(out["outcome"], "carded")
         self.assertIn(("send_escape", "Send Escape"), [(a.id, a.label) for a in req.actions])
-        self.assertIn(f"Open terminal ({NAME})", [a.label for a in req.actions])
-        self.assertEqual(req.device["name"], f"worker comm ({WID})")
+        self.assertIn("Open terminal", [a.label for a in req.actions])
+        self.assertEqual(req.device, {"id": NAME, "name": "comm", "socket": SOCK})
         self.assertEqual(t.acted(), [])
         t2 = Tmux(PANES["frozen"])
         self.assertEqual(wc.drive_escapes(self.ws, runner=t2, manager=manager(self.ws)), {})
@@ -250,8 +259,8 @@ class CauseCard(unittest.TestCase):
     def test_quotes_the_banner_line_and_names_the_cause(self):
         _, t, req = card(self.ws, CAUSE, PANES["abnormal"])
         self.assertIn(BANNER.lstrip("⎿ ").strip(), req.message)
-        self.assertIn("api-error", req.message)
-        self.assertIn("api-error", req.title)
+        self.assertIn("Cause: api-error.", req.message)
+        self.assertEqual(req.title, "comm is stopped on an error from the AI service")
         self.assertTrue(any("API Error: 500" in ln for ln in req.subject["cause_lines"]))
         self.assertEqual(t.acted(), [])
 
@@ -323,10 +332,10 @@ class LoginCard(unittest.TestCase):
     def test_quotes_the_banner_and_tells_the_owner_to_run_login(self):
         _, t, req = card(self.ws, LOGIN, PANES["logged-out"])
         self.assertIn("Login expired · Please run /login", req.message)
-        self.assertIn("is logged out", req.message)
-        self.assertIn("Run /login in that session", req.message)
-        self.assertNotIn("owes work", req.message)
-        self.assertIn("needs-login", req.title)
+        self.assertTrue(req.message.startswith("comm is signed out, so every task sent to it waits"))
+        self.assertIn("/login signs it in", details(req))
+        self.assertNotIn("has work waiting", req.message)
+        self.assertEqual(req.title, "comm is signed out")
         self.assertEqual(req.kind, "core-blocked")
         self.assertEqual([a.id for a in req.actions], ["open_terminal"])
         self.assertEqual(req.subject["wedge"], LOGIN)
@@ -339,7 +348,7 @@ class LoginCard(unittest.TestCase):
 
     def test_a_cause_card_still_reads_other_banners_with_the_owes_work_lead(self):
         _, _, req = card(self.ws, CAUSE, PANES["abnormal"])
-        self.assertIn("owes work", req.message)
+        self.assertTrue(first_line(req).startswith("comm has work waiting and "), first_line(req))
 
     def test_a_seat_still_wedged_on_another_kind_retires_the_login_card(self):
         _, _, req = card(self.ws, LOGIN, PANES["logged-out"])
@@ -455,6 +464,133 @@ class CardEdges(unittest.TestCase):
             self.assertEqual(mod.ESCAPE_ACTION, "send_escape")
         finally:
             sys.modules.update(saved)
+
+
+class CardsReadPlainly(unittest.TestCase):
+    """What a person reads first (the title, the first line, every button) names the worker by
+    its display name and says the cause; ids, the session, the socket, commands and the
+    terminal's own lines sit below the first line, where the card folds them."""
+
+    VARIANTS = (("gate", HUMAN, PANES["gate"]), ("limit", HUMAN, PANES["limit"]),
+                ("frozen", FROZEN, PANES["frozen"]), ("cause", CAUSE, PANES["abnormal"]),
+                ("login", LOGIN, PANES["logged-out"]), ("undelivered", UNDELIVERED, f"❯ \n{FOOTER}\n"))
+
+    def raised(self, which, pane, routed=False, block=None, now=None):
+        ws = pool()
+        with patch.object(wc, "live_owed_tasks", return_value=["task-1"]), \
+                patch.object(sup, "delivery_block", return_value=block):
+            out = wc.raise_card(ws, WID, which, runner=Tmux(pane), routed=lambda *a: routed,
+                                manager=manager(ws), now=now)
+        self.assertEqual(out["outcome"], "carded", out)
+        return manager(ws).get(out["hitl_id"])
+
+    def shown(self, req):
+        return [req.title, first_line(req)] + [a.label for a in req.actions]
+
+    def test_no_variant_shows_an_internal_before_the_details(self):
+        import owner_text
+        for label, which, pane in self.VARIANTS:
+            for routed in (False, True):
+                req = self.raised(which, pane, routed=routed)
+                for text in self.shown(req):
+                    with self.subTest(card=label, routed=routed, text=text):
+                        self.assertEqual(owner_text.internals(text), [])
+                        for leak in (WID, WID[:8], NAME, SOCK, "tmux", "python3", "launchctl", "sk-"):
+                            self.assertNotIn(leak, text)
+                        self.assertNotIn("worker comm", text, "the name alone, not 'worker <name> (<id>)'")
+                self.assertTrue(first_line(req).startswith("comm "), first_line(req))
+                self.assertTrue(req.title.startswith("comm "), req.title)
+                self.assertTrue(req.subject[owner_text.FOLDED])
+
+    def test_the_ids_a_tool_needs_stay_in_the_details_and_the_structured_fields(self):
+        for label, which, pane in self.VARIANTS:
+            with self.subTest(card=label):
+                req = self.raised(which, pane)
+                for line in (f"Worker id: {WID}", f"Session: {NAME}", f"Socket: {SOCK}"):
+                    self.assertIn(line, details(req))
+                self.assertEqual((req.subject["worker_id"], req.subject["session"]), (WID, NAME))
+                self.assertEqual((req.device["id"], req.device["socket"]), (NAME, SOCK))
+
+    def test_an_undelivered_task_is_said_in_one_sentence_and_its_recovery_in_another(self):
+        req = self.raised(UNDELIVERED, f"❯ \n{FOOTER}\n", block="pane-key-fence")
+        minutes = int(ps.UNDELIVERED_AFTER_S // 60)
+        self.assertEqual(first_line(req), f"comm has a task that wasn't delivered for {minutes} minutes, "
+                                          "because automatic typing into its terminal is paused.")
+        self.assertIn(f"python3 src/tmux_pane_keys.py recover {SOCK}", details(req), "the remedy is kept, below")
+        self.assertEqual(req.subject["cleared"], "It has it now.")
+        self.assertEqual(req.subject["cause"], ["pane-key-fence"])
+
+    def test_a_cause_that_was_not_identified_says_what_was_checked(self):
+        req = self.raised(UNDELIVERED, f"❯ \n{FOOTER}\n")
+        self.assertIn("I checked that it is idle, that its task watcher is running", first_line(req))
+        self.assertIn("found no cause", first_line(req))
+        self.assertEqual(req.subject["cause"], [])
+
+    def test_a_usage_limit_says_when_it_resets_when_the_pane_says(self):
+        import owner_text
+        now = time.mktime((2026, 11, 11, 9, 0, 0, 0, 0, -1))
+        req = self.raised(HUMAN, PANES["limit"], now=now)
+        self.assertEqual(first_line(req), "comm has work waiting and has reached its usage limit. "
+                                          "It resets at 12:10 PM and it continues by itself then.")
+        self.assertEqual(req.title, "comm has reached its usage limit")
+        self.assertIn("/usage-credits", details(req))
+        silent = self.raised(HUMAN, "  ⎿  You've hit your session limit\n❯ \n" + FOOTER + "\n", now=now)
+        self.assertEqual(first_line(silent), "comm has work waiting and has reached its usage limit "
+                                             "and continues by itself when it resets.")
+        self.assertEqual(owner_text.resets(now - 1, now), "")
+
+    def test_each_known_cause_is_named_in_words(self):
+        cases = {("quota-limit",): "has reached its usage limit", ("out-of-credits",): "is out of usage credits",
+                 ("needs-login",): "is signed out", ("network-error",): "cannot reach the AI service",
+                 ("retry:retrying",): "keeps retrying a request that does not go through",
+                 ("retry:retrying", "api-error"): "keeps retrying a request that does not go through"}
+        for names, words in cases.items():
+            self.assertEqual(wc.cause_words(names), words, names)
+        self.assertEqual(wc.cause_words(("api-error",), ["API Error: prompt is too long: 210000 tokens"]),
+                         "has reached its token limit for this conversation")
+        self.assertEqual(wc.cause_words(("api-error",), ["API Error: 403 forbidden"]),
+                         "had its request refused by the AI service")
+        self.assertEqual(wc.cause_words(("api-error",), ["API Error: 500 internal server error"]),
+                         "is stopped on an error from the AI service")
+        self.assertEqual(wc.cause_words(("something-new",)), wc.UNKNOWN_CAUSE)
+
+    def test_a_cause_card_for_a_usage_limit_banner_gives_the_reset_time(self):
+        now = time.mktime((2026, 11, 11, 9, 0, 0, 0, 0, -1))
+        with patch.object(wc.cw, "frame_abnormal",
+                          return_value=wc.cw.FrameAbnormal("provider-limit", ("quota-limit",), False)):
+            req = self.raised(CAUSE, "You've hit your usage limit · resets 12:10pm\n❯ \n", now=now)
+        self.assertIn("It resets at 12:10 PM", first_line(req))
+        self.assertEqual(req.title, "comm has reached its usage limit")
+
+    def test_an_unidentified_screen_is_titled_stuck(self):
+        with patch.object(wc.cw, "frame_abnormal",
+                          return_value=wc.cw.FrameAbnormal("abnormal", ("something-new",), False)):
+            req = self.raised(CAUSE, PANES["abnormal"])
+        self.assertEqual(req.title, "comm looks stuck")
+        self.assertIn("could not tell why", first_line(req))
+
+    def test_a_key_on_the_pane_is_redacted_in_the_details(self):
+        key = "sk-ant-api03-" + "a1B2" * 8
+        req = self.raised(CAUSE, f"  ⎿  API Error: 401 invalid x-api-key {key}\n❯ \n{FOOTER}\n")
+        self.assertNotIn(key, req.message)
+        self.assertNotIn("sk-ant", req.message)
+        self.assertIn("API Error: 401", details(req))
+
+    def test_a_worker_with_no_label_is_a_worker_never_its_id(self):
+        ws = pool()
+        roster = ws / "state" / "roster.json"
+        data = json.loads(roster.read_text())
+        del data["workers"][WID]["label"]
+        roster.write_text(json.dumps(data))
+        self.assertEqual(wc.seat_label(ws, WID), "A worker")
+        data["workers"]["0aaa" + WID[4:]] = {"state": "live"}
+        roster.write_text(json.dumps(data))
+        with patch.object(sup, "supervised_workers", return_value=data["workers"]):
+            names = [wc.seat_label(ws, w) for w in sorted(data["workers"])]
+        self.assertEqual(names, ["Worker 1", "Worker 2"], "two unnamed workers are told apart, never by id")
+        roster.write_text(json.dumps({"workers": {WID: {"state": "live"}}}))
+        out = wc.raise_card(ws, WID, FROZEN, runner=Tmux(PANES["frozen"]), manager=manager(ws))
+        self.assertTrue(first_line(manager(ws).get(out["hitl_id"])).startswith("A worker has work waiting"))
 
 
 if __name__ == "__main__":

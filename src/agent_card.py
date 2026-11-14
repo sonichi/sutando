@@ -523,11 +523,11 @@ def owner_may_act(headers: Mapping[str, str], owner_mxid: str = "", *, dm_only: 
 
 NOT_A_CARD, FORGED, WORDS, COMMAND = "not_a_card", "forged_or_stale_click", "owner_words", "command"
 # What the agent says, once, to a click it cannot match; it then does nothing else with the message.
-UNMATCHED_CLICK = ("I couldn't match that button to a card I sent, so I haven't done anything. "
-                   "Tell me what you'd like in your own words.")
+WAY_THROUGH = "Tell me in your own words what you'd like and I'll do it."
+UNMATCHED_CLICK = f"I couldn't match that button to a card I sent, so I haven't done anything. {WAY_THROUGH}"
 # The same, for a button's own text sent as a reply to the card without a tap.
-UNTAPPED_ACTION = ("That reads like a button on my card, but it didn't arrive as a tap, so I haven't done "
-                   "anything. Tap the button, or tell me what you'd like in your own words.")
+UNTAPPED_ACTION = ("I couldn't confirm that came from a button on my card, so I haven't done anything. "
+                   + WAY_THROUGH)
 _PICKER_ASK = re.compile(r"Connect \S.{0,200}")
 _HANDLER_RE = re.compile(r"skills/[A-Za-z0-9_-]+/scripts/[A-Za-z0-9_-]+\.py( [a-z-]+)?")
 

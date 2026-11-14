@@ -5,7 +5,11 @@ A wedged live session is never restarted: a fresh session meets the same network
 error, rate limit or API error and loses the turn in flight. The pool tick raises
 a card instead, through the engine's hitl store:
 
-- abnormal text on the pane: the card quotes the banner line and names its cause.
+Every card says who is stuck and why in its first line, by the worker's name. The worker id,
+the session, the socket, the terminal's own lines and any command sit below it, where a card
+folds them behind "Details" (owner_text.card_text).
+
+- abnormal text on the pane: the card names its cause and quotes the banner line below.
   When the seat is routed through the credential proxy and the cause is a retry,
   an API error or a network error, the card offers the proxy restart, the remedy
   src/restart.sh already runs; the worker's session is never the target.
@@ -19,6 +23,7 @@ import importlib.util
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -36,7 +41,8 @@ def _sibling(name):
 
 sup = _sibling("pool_supervise")
 ps, cw = sup.ps, sup.cw
-import quota_availability as qa  # noqa: E402  (src/ is on the path via pool_delivery)
+import owner_text  # noqa: E402  (src/ is on the path via pool_delivery)
+import quota_availability as qa  # noqa: E402
 import tmux_pane_keys  # noqa: E402
 
 SOURCE = "pool-wedge"
@@ -47,6 +53,22 @@ PROXY_LABEL = "com.sutando.credential-proxy"
 PROXY_REMEDY = f"launchctl kickstart -k gui/$(id -u)/{PROXY_LABEL}"
 _PROXY_CAUSES = ("api-error", "network-error")
 REFUSED_NOTE = "The turn is no longer frozen on the frame this card was raised for; nothing was typed."
+UNNAMED_SEAT = "A worker"
+DELIVERED_NOTE = "It has it now."
+# Each known cause in words, completing "<name> ..."; an unlisted one is reported as not identified.
+CAUSE_WORDS = {
+    "quota-limit": "has reached its usage limit",
+    "out-of-credits": "is out of usage credits",
+    "needs-login": "is signed out",
+    "compacting": "has been compacting its conversation without finishing",
+    "awaiting-input": "is waiting for an answer in its terminal",
+    "api-error": "is stopped on an error from the AI service",
+    "network-error": "cannot reach the AI service",
+    "retry:retrying": "keeps retrying a request that does not go through",
+}
+_TOKEN_LIMIT = re.compile(r"prompt is too long|context (?:window|length)|token limit|too many tokens", re.I)
+_REFUSED = re.compile(r"\b4\d\d\b|refus|rejected|forbidden|not allowed|permission denied", re.I)
+UNKNOWN_CAUSE = "looks stuck: I read its screen and its task queue and could not tell why"
 
 
 def manager_for(workspace):
@@ -55,9 +77,33 @@ def manager_for(workspace):
 
 
 def seat_label(workspace, worker_id) -> str:
-    row = sup.supervised_workers(workspace).get(worker_id) or {}
+    workers = sup.supervised_workers(workspace)
+    row = workers.get(worker_id) or {}
     label = sup.pr.display_label(row, worker_id)
-    return f"worker {label}" if label == worker_id else f"worker {label} ({worker_id})"
+    if label != worker_id:
+        return owner_text.named(label, UNNAMED_SEAT)
+    # Several workers with no name are told apart by their order, never by an id.
+    unnamed = sorted(w for w, r in workers.items() if sup.pr.display_label(r, w) == w)
+    return UNNAMED_SEAT if len(unnamed) < 2 or worker_id not in unnamed else f"Worker {unnamed.index(worker_id) + 1}"
+
+
+def cause_words(names, lines=()) -> str:
+    """The first known cause in words; the banner's own text tells a token limit and a refusal
+    apart from any other service error."""
+    shown = " ".join(lines)
+    for name in names:
+        if name == "api-error" and _TOKEN_LIMIT.search(shown):
+            return "has reached its token limit for this conversation"
+        if name == "api-error" and _REFUSED.search(shown):
+            return "had its request refused by the AI service"
+        if name in CAUSE_WORDS:
+            return CAUSE_WORDS[name]
+    return UNKNOWN_CAUSE
+
+
+def seat_details(worker_id, session, socket) -> list[str]:
+    """What identifies the seat to a tool, below the card's first line."""
+    return [f"Worker id: {worker_id}", f"Session: {session}", f"Socket: {socket}"]
 
 
 def worker_runtime(workspace, worker_id) -> str | None:
@@ -137,14 +183,22 @@ def live_owed_tasks(workspace, worker_id) -> list[str]:
     return [t for t in owned if f"{t}.txt" not in ready and find_task_file(tasks, t) is not None]
 
 
+def limit_line(seat, text, now) -> str:
+    """The usage-limit line for a seat that owes work, with the reset time its pane states."""
+    from hitl import tui_gate
+    return tui_gate.limit_sentence(seat, sup.pl.reset_at(text, now), now, owes=True)
+
+
 def _jump(session):
+    """The jump reads the session from `device.id`; its label stays plain."""
     from hitl.schema import Action
-    return Action(id="open_terminal", kind="open_terminal", label=f"Open terminal ({session})")
+    return Action(id="open_terminal", kind="open_terminal", label="Open terminal")
 
 
 def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=proxy_routed,
-               manager=None) -> dict:
+               manager=None, now=None) -> dict:
     """One card for this wedge episode, from the pane as it reads NOW. Types nothing."""
+    from hitl import tui_gate
     from hitl.cards import choice_request
     from hitl.schema import Action
     socket, session = sup._open_tmux(workspace, worker_id)
@@ -162,27 +216,30 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
     pane = sup.classify_pane_text(text, runtime, workspace=workspace,
                                   socket=socket, session=session)
     subject = {"source": SOURCE, "worker_id": worker_id, "session": session, "wedge": which,
-               "frame": frame}
+               "frame": frame, owner_text.FOLDED: True}
+    ids = seat_details(worker_id, session, socket)
+    now = time.time() if now is None else now
     device = {"id": session, "name": seat, "socket": str(socket)}
     if which == ps.CARD_HUMAN:
         if pane not in (ps.PANE_GATE, ps.PANE_LIMIT):
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
     if which == ps.CARD_HUMAN and at_limit(text, pane, runtime, workspace=workspace,
                                            socket=socket, session=session):
-        from hitl import tui_gate
         # The seat monitor's card for this limit shares the guard, so one card serves both.
         subject.update(episode=tui_gate.LIMIT_EPISODE, remind=False)
         req = choice_request(
-            (f"{seat} (tmux session {session}) owes work and has hit its usage limit. "
-             + tui_gate.limit_unblock(session, runtime)),
+            owner_text.card_text(
+                limit_line(seat, text, now),
+                [tui_gate.limit_unblock(session, runtime)] + ids),
             [_jump(session)], tui_gate.limit_guard(session), subject, runtime=runtime,
-            title=f"{seat} · usage limit", device=device, kind="core-blocked", turn_on_action=False)
+            title=tui_gate.blocked_title(seat, limit=True), device=device, kind="core-blocked",
+            turn_on_action=False)
     elif which == ps.CARD_HUMAN:
         req = choice_request(
-            (f"{seat} (tmux session {session}) owes work and is waiting at a gate "
-             "or usage limit. Open its terminal to review the decision."),
+            owner_text.card_text(
+                f"{seat} has work waiting and is stopped at a question in its terminal.", ids),
             [_jump(session)], f"{SOURCE}:{session}:human", subject, runtime=runtime,
-            title=f"{seat} · needs your decision", device=device, kind="core-blocked",
+            title=tui_gate.blocked_title(seat), device=device, kind="core-blocked",
             turn_on_action=False)
     elif which == ps.CARD_UNDELIVERED:
         if pane != ps.PANE_IDLE:
@@ -194,32 +251,34 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
             # Owed only by sentinels whose task is archived or gone: nothing to deliver.
             return {"worker_id": worker_id, "outcome": "cleared", "pane": "no-live-task"}
         cause = sup.delivery_block(socket)
-        body = [f"{seat} (tmux session {session}) owes work, its watcher is running, and its pane "
-                f"has read idle at the prompt for over {int(ps.UNDELIVERED_AFTER_S // 60)} minutes: "
-                "its task appears not to have been delivered."]
+        late = f"{seat} has a task that wasn't delivered for {int(ps.UNDELIVERED_AFTER_S // 60)} minutes"
         if cause == "pane-key-fence":
-            body += ["", f"Cause: automated sends on {socket} are blocked by the pane-keys fence "
-                     "(docs/codex-core.md). Once no send can still be in flight, clear it with:",
-                     f"  python3 src/tmux_pane_keys.py recover {socket}",
-                     "The retained tasks are typed in on the notifier's next wake."]
+            head = f"{late}, because automatic typing into its terminal is paused."
+            details = [f"Cause: automated sends on {socket} are blocked by the pane-keys fence "
+                       "(docs/codex-core.md). Once no send can still be in flight, clear it with:",
+                       f"  python3 src/tmux_pane_keys.py recover {socket}",
+                       "The retained tasks are typed in on the notifier's next wake."]
         else:
-            body += ["", f"Cause: not identified. The {session}-watcher session logs each delivery "
-                     "attempt and why it was refused."]
-        subject.update(cause=[cause] if cause else [])
+            head = (f"{late}. I checked that it is idle, that its task watcher is running and that "
+                    "typing into its terminal is allowed, and found no cause.")
+            details = [f"The {session}-watcher session logs each delivery attempt and why it was refused."]
+        subject.update(cause=[cause] if cause else [], cleared=DELIVERED_NOTE)
         req = choice_request(
-            "\n".join(body), [_jump(session)], f"{SOURCE}:{session}:undelivered:{cause or 'unknown'}",
-            subject, runtime=runtime, title=f"{seat} · tasks not delivered", device=device,
+            owner_text.card_text(head, details + ids), [_jump(session)],
+            f"{SOURCE}:{session}:undelivered:{cause or 'unknown'}",
+            subject, runtime=runtime, title=f"{seat} has an undelivered task", device=device,
             kind="core-blocked", turn_on_action=False)
     elif which == ps.CARD_FROZEN:
         if pane != ps.PANE_WORKING:
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
         req = choice_request(
-            (f"{seat} (tmux session {session}) owes work and its screen has not changed "
-             "across supervision ticks. Send Escape interrupts the turn; it is typed only "
-             "if you press it, and only if the screen is still the same frozen frame."),
+            owner_text.card_text(
+                f"{seat} has work waiting and its screen has stopped changing.",
+                ["Send Escape interrupts the turn; it is typed only if you press it, and only "
+                 "if the screen is still the same frozen frame."] + ids),
             [Action(id=ESCAPE_ACTION, kind="confirmation", label="Send Escape"), _jump(session)],
             f"{SOURCE}:{session}:frozen:{frame}", subject, runtime=runtime,
-            title=f"{seat} · its turn looks frozen", device=device, kind="confirmation",
+            title=f"{seat} looks frozen", device=device, kind="confirmation",
             turn_on_action=False)
     else:
         abn = cw.frame_abnormal(text)
@@ -229,28 +288,30 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
         via_proxy = runtime == "claude" and routed(socket, session) is True and (
             abn.retrying or any(n in _PROXY_CAUSES for n in abn.names))
         cause = ", ".join(abn.names)
+        words = CAUSE_WORDS["needs-login"] if which == ps.CARD_LOGIN else cause_words(abn.names, lines)
         if which == ps.CARD_LOGIN:
-            body = [f"{seat} (tmux session {session}) is logged out and its pane shows:"]
+            head = f"{seat} is signed out, so every task sent to it waits until it is signed in again."
+        elif words == CAUSE_WORDS["quota-limit"]:
+            head = limit_line(seat, text, now)
         else:
-            body = [f"{seat} (tmux session {session}) owes work and its pane shows:"]
-        body += [f"  {ln}" for ln in lines] + ["", f"Cause: {cause}."]
+            head = f"{seat} has work waiting and {words}."
+        details = ["Its terminal shows:"] + [f"  {ln}" for ln in lines] + [f"Cause: {cause}."]
         if via_proxy:
-            body += ["", "This seat is routed through the credential proxy. Restarting the proxy "
-                     f"(`{PROXY_REMEDY}`, as src/restart.sh does) can clear it."]
+            details += ["This seat is routed through the credential proxy. Restarting the proxy "
+                        f"(`{PROXY_REMEDY}`, as src/restart.sh does) can clear it."]
         if which == ps.CARD_LOGIN:
-            body += [f"Run /login in that session. Until then every task routed to {seat} waits: "
-                     "the worker's session is not restarted, a fresh session meets the same "
-                     "expired login."]
+            details += ["In its terminal, /login signs it in. The worker's session is not "
+                        "restarted: a fresh session meets the same expired login."]
         else:
-            body += ["The worker's session is not restarted: a fresh session meets the same cause."]
+            details += ["The worker's session is not restarted: a fresh session meets the same cause."]
         subject.update(cause=list(abn.names), cause_lines=lines,
                        remedy=PROXY_REMEDY if via_proxy else None)
         actions = ([Action(id=PROXY_ACTION, kind="confirmation", label="Restart the credential proxy")]
                    if via_proxy else []) + [_jump(session)]
         req = choice_request(
-            "\n".join(body), actions, f"{SOURCE}:{session}:cause:{cause}", subject,
-            runtime=runtime, title=f"{seat} · {abn.kind}: {cause}", device=device,
-            kind="choice" if via_proxy else "core-blocked", turn_on_action=via_proxy)
+            owner_text.card_text(head, details + ids), actions, f"{SOURCE}:{session}:cause:{cause}",
+            subject, runtime=runtime, title=f"{seat} {'looks stuck' if words == UNKNOWN_CAUSE else words}",
+            device=device, kind="choice" if via_proxy else "core-blocked", turn_on_action=via_proxy)
     manager = manager or manager_for(workspace)
     made = manager.create(req)
     return {"worker_id": worker_id, "outcome": "carded", "hitl_id": made.id, "wedge": which}

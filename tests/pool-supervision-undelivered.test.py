@@ -189,8 +189,8 @@ check("and its documented recovery for this socket", f"tmux_pane_keys.py recover
 check("the card records the cause", (req.subject or {}).get("cause"), ["pane-key-fence"])
 check("raising it never acts on the session", [c for c in t.calls if any(a in c for a in Tmux.ACTING)], [])
 out, _, req = card(pool(tmp / "unblocked.sock"), IDLE)
-check("with no fence the card says the cause is unidentified",
-      "not identified" in (req.prompt if hasattr(req, "prompt") else str(req.__dict__)), True)
+check("with no fence the card says what it checked and that it found no cause",
+      "found no cause" in req.message.splitlines()[0], True)
 leftover = pool(fenced)
 (leftover / "tasks" / "task-owed1.txt").unlink()  # archived or gone: only its sentinel remains
 out, _, _ = card(leftover, IDLE)
@@ -204,7 +204,9 @@ out, _, _ = card(pool(fenced), AGENT)
 check("a seat whose background agent still runs is not carded", (out.get("outcome"), out.get("pane")),
       ("cleared", "background-agent"))
 out, _, req = card(pool(fenced), IDLE)
-check("the card's words are diagnostic, not a claim", "appears not to have been delivered" in json.dumps(req.__dict__, default=str), True)
+check("the card's first line says what happened, by the seat's name",
+      req.message.splitlines()[0].startswith("rev has a task that wasn't delivered for "), True)
+check("and carries no id, session or socket", [x for x in (WID, WID[:8], NAME, str(fenced), "tmux") if x in req.message.splitlines()[0] + req.title], [])
 
 # A pause that lands between the sweep and the remedy stops the card, as it does a gate's.
 ws_p = pool(fenced)

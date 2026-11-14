@@ -44,11 +44,13 @@ from hitl.schema import STATUS_RESOLVED  # noqa: E402
 
 SESSION = "sutando-worker-1"
 SEAT = "worker comm"
-UNBLOCK = ("It continues when the limit resets. To unblock it sooner, open its terminal (tmux session "
-           "sutando-worker-1) and run /usage-credits to use extra credits, /login to switch to another "
-           "account, or /model to switch to a model with usage left.")
-CODEX_UNBLOCK = ("It continues when the limit resets. To unblock it sooner, open its terminal (tmux session "
-                 "sutando-worker-1) and run `codex login` to switch to another account.")
+UNBLOCK = ("To continue sooner, its terminal takes /usage-credits to use extra credits, /login to "
+           "switch to another account, or /model to switch to a model with usage left.")
+CODEX_UNBLOCK = "To continue sooner, its terminal takes `codex login` to switch to another account."
+
+
+def _details(body):
+    return body.partition("\n\n")[2].splitlines()
 _FOOTER = ("────────\n❯ \n────────\n"
            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")
 
@@ -234,8 +236,9 @@ class UnblockGuidance(unittest.TestCase):
             with self.subTest(kind=kind):
                 body = M.escalation_message("blocked-human", f"awaiting user: {kind}", kind,
                                             prompt, SESSION)
-                self.assertEqual(body.splitlines()[-1], UNBLOCK)
-                self.assertNotIn("Nothing else I do can clear this one", body)
+                self.assertIn(UNBLOCK, _details(body))
+                self.assertNotIn("/usage-credits", body.splitlines()[0], "the steps are details")
+                self.assertIn("has reached its usage limit", body.splitlines()[0])
 
     def test_the_raised_card_carries_it(self):
         with tempfile.TemporaryDirectory() as td:
@@ -247,7 +250,7 @@ class UnblockGuidance(unittest.TestCase):
     def test_a_codex_seat_gets_codex_steps(self):
         body = M.escalation_message("blocked-human", "d", "turn-rejected",
                                     "You've hit your usage limit", SESSION, runtime="codex")
-        self.assertEqual(body.splitlines()[-1], CODEX_UNBLOCK)
+        self.assertIn(CODEX_UNBLOCK, _details(body))
         self.assertNotIn("/usage-credits", body)
         with tempfile.TemporaryDirectory() as td:
             m = HitlManager(HitlStore(pathlib.Path(td)))
@@ -258,7 +261,7 @@ class UnblockGuidance(unittest.TestCase):
     def test_other_gates_keep_their_wording(self):
         body = M.escalation_message("blocked-human", "d", "turn-rejected", "not logged in", SESSION)
         self.assertNotIn("/usage-credits", body)
-        self.assertIn("Open the Runtime panel", body)
+        self.assertIn("is waiting on a question in its terminal", body.splitlines()[0])
 
 
 def _pool():
@@ -318,7 +321,8 @@ class PoolAndMonitorShareOneCard(_PoolSeat):
         self.assertEqual(pool_card.guard, tui_gate.limit_guard(name))
         self.assertIn("/usage-credits to use extra credits, /login to switch to another account",
                       pool_card.message)
-        self.assertIn(f"tmux session {name}", pool_card.message)
+        self.assertNotIn(name, pool_card.message.splitlines()[0])
+        self.assertIn(f"Session: {name}", pool_card.message.partition("\n\n")[2])
         watched = M.escalate(m, "blocked-human", "d", "session-limit", _MENU, name,
                              seat="worker comm", runtime="claude")
         self.assertEqual(watched.id, pool_card.id)

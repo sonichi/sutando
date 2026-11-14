@@ -27,6 +27,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`agent_card.py`** — Agent panel cards (`space.ag2.card`, kind `agent_panel`, v 1): build, check, send, and read the replies.
 - **`agent_display_name.py`** — The name this agent introduces itself by: its live s.space display name, never a persona name.
 - **`agent_endpoint.py`** — Agent Endpoint resolver — resolve(endpoint, mode) → a transport route.
+- **`agent_local_name.py`** — This agent's display name for text the owner reads, from local records only.
 - **`agent_triggers.py`** — AgentTrigger vocabulary and playbook dispatch: which platform events a task may name and which skill runs it.
 - **`agent_turn.py`** — Per-invocation turn context and the 3-outcome turn gate for relay tasks.
 - **`archive-stale-results.py`** — Archive stale `results/*.txt` files to `results/archive-YYYY-MM-DD/`.
@@ -175,6 +176,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`owner_activity.py`** — Atomic publication of the owner's most recent messaging activity.
 - **`owner_channel.py`** — May the core speak in this channel?
 - **`owner_room_access.py`** — How a room-database adapter reaches the owner's room: capability lookup, owner DM, agent identity and credentials.
+- **`owner_text.py`** — Text the owner reads, in one place: say the cause in one plain sentence, keep the rest behind it.
 - **`peer-watch.py`** — Read a peer host's restart-watch signal WITHOUT confusing a stale view for a dead peer.
 - **`pending_questions_reader.py`** — The one way core reads owner pending questions: through the store adapter an installed skill declares in its manifest (`pending_questions_store`), loaded by the path an edge injects — core names no skill, scans no root and carries no question schema.
 - **`pending_questions_triage.py`** — Triage-queue policy for owner pending questions: ranking, re-check verdict, dismissal.
