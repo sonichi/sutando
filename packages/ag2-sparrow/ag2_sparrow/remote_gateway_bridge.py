@@ -3213,6 +3213,12 @@ def _read_by(resp, deadline: float) -> bytes:
         # read1 returns what one socket read gave; read(n) would wait for all n bytes.
         chunk = (resp.read1 if hasattr(resp, "read1") else resp.read)(4096)
         if not chunk:
+            # read1 ends with b"" when the deadline's shutdown cuts the socket, and when the peer
+            # hangs up early: neither is a whole body, which a short read would otherwise pass for.
+            if time.monotonic() >= deadline:
+                raise TimeoutError("response body still arriving at its deadline")
+            if getattr(resp, "length", None):
+                raise http.client.IncompleteRead(b"".join(chunks), resp.length)
             return b"".join(chunks)
         chunks.append(chunk)
 
@@ -11041,8 +11047,9 @@ def main() -> None:
             prev_ok, prev_ok_awake = poll_grace_since, poll_ok_awake
             _RESP_META.last = None
             try:
+                # The whole poll is bounded, not each socket read: a body that drips held it open.
                 resp = _req("GET", f"/v1/tasks?wait={_poll_wait(inflight)}{_POLL_PROOF}",
-                            timeout=POLL_WAIT + 10)
+                            timeout=POLL_WAIT + 10, deadline=time.monotonic() + POLL_WAIT + 10)
                 last_poll_ok = poll_grace_since = time.time()
                 stall_anchor = poll_ok_awake = time.monotonic()
                 # A completed poll remains evidence even if accepting its tasks fails.
