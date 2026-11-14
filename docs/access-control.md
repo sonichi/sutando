@@ -60,6 +60,10 @@ The `context-source-guard` PreToolUse hook — **which is deployed per node, not
 
 `src/read_discord_channel.py --serving <task channel_id> --target <id>` is the **graceful** path — it applies the same blacklist and returns a clear "blocked" (exit 2, fail-closed) instead of a raw hook denial. Prefer it when a target *might* be blacklisted; for clearly-public reads a direct fetch is fine. The bridge `<#ref>` prefetch enforces the same blacklist (all tiers). Helper: `src/read_discord_channel.py`; hook: `hooks/context-source-guard.py`; tests: `tests/read-discord-channel-gate.test.py`, `tests/context-source-guard.test.py`.
 
+### Result delivery markers
+
+A task result carrying `[dm-only]` is delivered to the **owner's DM only** on Telegram and Discord — a body marked private never posts to the shared channel it came from. On Telegram the reply destination resolves to the owner id for any non-private chat; on Discord the reply path reroutes the delivery channel to the owner DM resolved by `discord_config.dm_only_route` (a result that already originated in a DM needs no reroute). When no owner can be resolved the result is held for retry rather than posted to the source channel. Independently of routing, `[dm-only]` also suppresses any `[channel:]` redirect on the same body at parse time (`src/result_markers.py`), so a redirect can never pull private content out to a shared room. Slack does not yet reroute dm-only results.
+
 ## Slack access control
 
 Slack tasks include an `access_tier` field set by the bridge:
