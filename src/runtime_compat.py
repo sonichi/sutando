@@ -913,25 +913,28 @@ class Incident:
 
     def notify(self, body: str) -> bool:
         """Queue the incident's DM if it is not queued yet. True when this call queued it."""
-        from owner_reply import queue_notice
+        from owner_reply import notice_text, owner_dm, queue_notice
         self._open()
         if self.rec.get("notice_queued") or not queue_notice(self.workspace, self.rec["notice"], body):
             return False
-        self.rec["notice_queued"] = True
+        self.rec.update(notice_queued=True, dm=owner_dm(self.workspace),
+                        notice_texts=[notice_text(body)])
         self._save()
         return True
 
     def take_replies(self) -> None:
         """Record the owner's new replies to this incident before anything acts on them.
         After an app fix, a late reply to its DM is recorded as already answered."""
-        from owner_reply import matching_replies
+        from owner_reply import matching_replies, owner_dm
         late = (not self.open and self.rec.get("resolved_by") == "app"
                 and self.rec.get("notice_queued") and self.rec.get("fixed_reply"))
         if not self.open and not late:
             return
         known = {e["task"] for e in self.entries}
         got = list(matching_replies(self.workspace, (install_phrase(self.runtime), RETRY_PHRASE),
-                                    skip=known, since=self.rec.get("opened_at")))
+                                    skip=known, since=self.rec.get("opened_at"),
+                                    dm=self.rec.get("dm") or owner_dm(self.workspace),
+                                    notices=self.rec.get("notice_texts") or ()))
         done = {"applied": True, "reply": self.rec["fixed_reply"]} if late else {}
         if got:
             self.rec["actions"] = self.entries + [
@@ -953,8 +956,10 @@ class Incident:
         self.apply(None, reply)
         self.finish()
         if self.rec.get("notice_queued"):
-            queue_notice(self.workspace, self.rec["notice"].replace(".txt", "-fixed.txt"),
-                         f"Fixed from the app: {detail}. No reply needed.\n")
+            fixed = f"Fixed from the app: {detail}. No reply needed.\n"
+            queue_notice(self.workspace, self.rec["notice"].replace(".txt", "-fixed.txt"), fixed)
+            from owner_reply import notice_text
+            self.rec["notice_texts"] = list(self.rec.get("notice_texts") or ()) + [notice_text(fixed)]
         self.rec.update(status="resolved", resolved_at=int(self.clock()), resolved_by="app",
                         fixed_reply=reply)
         self._save()

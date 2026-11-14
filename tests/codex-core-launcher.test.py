@@ -133,6 +133,10 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/runtime_compat.py",
             "src/auth_preflight.py",
             "src/owner_reply.py",
+            # owner_reply reads the owner's DM through owner_room_access.
+            "src/owner_room_access.py",
+            "src/connections.py",
+            "src/workspace_lock.py",
             "src/local_record.py",
             "src/policy/__init__.py",
             "src/policy/egress/__init__.py",
@@ -1152,6 +1156,8 @@ while [ $# -gt 0 ]; do [ "$1" = --prefix ] && PREFIX="$2"; shift; done
 mkdir -p "$PREFIX/bin"
 cp "$CODEX_GOOD" "$PREFIX/bin/codex"
 """)
+        (ws / "state").mkdir(parents=True, exist_ok=True)
+        (ws / "state" / "owner-routing.json").write_text('{"owner_dm": "!dm:x"}')
         first = self.run_launcher()
         self.assertEqual(first.returncode, 3, first.stderr)
         self.assertNotIn("new-session -d -s sutando-core ", self._tmux_calls())
@@ -1164,7 +1170,8 @@ cp "$CODEX_GOOD" "$PREFIX/bin/codex"
         good.chmod(0o755)
         reply = ws / "tasks" / "task-900.txt"
         reply.parent.mkdir(parents=True, exist_ok=True)
-        reply.write_text("source: ag2space\naccess_tier: owner\ntask: install compatible codex\n")
+        reply.write_text("source: ag2space\nchannel_id: !dm:x\naccess_tier: owner\n"
+                         "task: install compatible codex\n")
         done = self.run_launcher(env_extra={"CODEX_GOOD": str(good)})
         self.assertEqual(done.returncode, 0, done.stderr)
         managed = Path(self.tmp.name) / "runtimes" / "bin" / "codex"
@@ -1211,13 +1218,16 @@ while [ $# -gt 0 ]; do [ "$1" = --prefix ] && PREFIX="$2"; shift; done
 mkdir -p "$PREFIX/bin"
 cp "$CODEX_GOOD" "$PREFIX/bin/codex"
 """)
+        (ws / "state").mkdir(parents=True, exist_ok=True)
+        (ws / "state" / "owner-routing.json").write_text('{"owner_dm": "!dm:x"}')
         self.assertEqual(self.run_launcher().returncode, 3)
         good = Path(self.tmp.name) / "codex-good"
         good.write_text(installed_stub)
         good.chmod(0o755)
         reply = ws / "tasks" / "task-901.txt"
         reply.parent.mkdir(parents=True, exist_ok=True)
-        reply.write_text("source: ag2space\naccess_tier: owner\ntask: install compatible codex\n")
+        reply.write_text("source: ag2space\nchannel_id: !dm:x\naccess_tier: owner\n"
+                         "task: install compatible codex\n")
         result = self.run_launcher(env_extra={"CODEX_GOOD": str(good)})
         return result, (ws / "results" / "task-901.txt").read_text()
 

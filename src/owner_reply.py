@@ -33,8 +33,8 @@ def normalize(text: str) -> str:
     return _TRAILING.sub("", " ".join((text or "").split()).lower())
 
 
-def owner_reply(path: Path) -> Optional[Tuple[Optional[dict], str]]:
-    """(the message it quotes, or None; the reply body) of an owner-tier task, else None."""
+def _owner_task(path: Path) -> Optional[Tuple[Optional[dict], str, str]]:
+    """(quoted message or None, reply body, channel_id) of an owner-tier task, else None."""
     from local_task_protocol import parse_task_headers_lenient, split_reply_context
     from policy.egress.result import resolve_access_tier
     if resolve_access_tier(path) != "owner":
@@ -43,8 +43,15 @@ def owner_reply(path: Path) -> Optional[Tuple[Optional[dict], str]]:
         text = Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    quoted, body = split_reply_context(parse_task_headers_lenient(text).body)
-    return quoted, body.strip()
+    parsed = parse_task_headers_lenient(text)
+    quoted, body = split_reply_context(parsed.body)
+    return quoted, body.strip(), (parsed.headers.get("channel_id") or "").strip()
+
+
+def owner_reply(path: Path) -> Optional[Tuple[Optional[dict], str]]:
+    """(the message it quotes, or None; the reply body) of an owner-tier task, else None."""
+    got = _owner_task(path)
+    return None if got is None else got[:2]
 
 
 def owner_reply_text(path: Path) -> Optional[str]:
@@ -53,9 +60,26 @@ def owner_reply_text(path: Path) -> Optional[str]:
     return None if got is None else got[1]
 
 
-def _asks_for(quoted: Optional[dict], phrase: str) -> bool:
-    # A reply to some other message counts only when that message asked for this phrase.
-    return quoted is None or f'"{normalize(phrase)}"' in (quoted.get("body") or "").lower()
+def notice_text(body: str) -> str:
+    """A queued notice as the owner reads it, normalized: what a reply quoting it carries."""
+    from result_markers import neutralize_markers
+    return normalize(neutralize_markers(body))
+
+
+def owner_dm(workspace: Optional[Path]) -> str:
+    """The owner's DM room as the gateway last recorded it; "" when unknown."""
+    try:
+        from owner_room_access import owner_dm as dm, owner_routing
+        return dm(owner_routing(_ws(workspace)))
+    except Exception:
+        return ""
+
+
+def _belongs(quoted: Optional[dict], channel: str, dm: str, notices: Iterable[str]) -> bool:
+    # A quoted reply must quote this incident's notice; a bare one must be in the notice's DM.
+    if quoted is not None:
+        return normalize(quoted.get("body") or "") in set(notices)
+    return bool(dm) and channel == dm
 
 
 def _mtime(path: Path) -> Optional[float]:
@@ -77,13 +101,14 @@ def unclaimed_task_id(path: Path) -> Optional[str]:
 
 
 def matching_replies(workspace: Optional[Path], phrases: Iterable[str],
-                     skip: Iterable[str] = (), since: Optional[float] = None
+                     skip: Iterable[str] = (), since: Optional[float] = None,
+                     dm: str = "", notices: Iterable[str] = ()
                      ) -> Iterator[Tuple[Path, str, str]]:
     """(task file, task id, phrase) for each unclaimed, unanswered owner task whose whole
-    message is one phrase, written at or after `since`, quoting nothing or a message
-    that asked for it."""
+    message is one phrase, written at or after `since`, that quotes one of `notices`
+    (`notice_text` values) or quotes nothing and was sent in `dm`."""
     wanted = {normalize(p): p for p in phrases}
-    skip = set(skip)
+    skip, notices = set(skip), {n for n in notices if n}
     workspace = _ws(workspace)
     from local_task_protocol import find_result
     for path in sorted((workspace / "tasks").glob("task-*.txt")):
@@ -92,12 +117,11 @@ def matching_replies(workspace: Optional[Path], phrases: Iterable[str],
             continue
         if since is not None and (_mtime(path) or 0) < since:
             continue
-        got = owner_reply(path)
+        got = _owner_task(path)
         if got is None or normalize(got[1]) not in wanted:
             continue
-        phrase = wanted[normalize(got[1])]
-        if _asks_for(got[0], phrase):
-            yield path, tid, phrase
+        if _belongs(got[0], got[2], dm, notices):
+            yield path, tid, wanted[normalize(got[1])]
 
 
 def queue_notice(workspace: Optional[Path], name: str, body: str) -> bool:
