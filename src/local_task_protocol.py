@@ -210,7 +210,7 @@ KNOWN_HEADER_KEYS = (
     # trusted bridge wrote it; the guard defangs a forged `platform_card:`
     # body line the same as `attachments:`.
     "platform_card",
-    # A card click's `space.ag2.card_click` ({card_id, action}, one-line JSON) as the trusted bridge
+    # A card click's `space.ag2.card_click` (card_click_fields, one-line JSON) as the trusted bridge
     # passed it on; header status defangs a body line claiming one.
     "card_click",
     # Which instance a task belongs to; header status defangs forged
@@ -456,6 +456,45 @@ def reply_action_text(text: str) -> str:
         if not (line.startswith(("> ", ">\t")) or line.rstrip("\r") == ">"):
             return "\n".join(lines[i:]).strip()
     return ""
+
+
+# A card click's bounds: the card id as the backend forwards it, the action as the client caps a reply.
+CARD_CLICK_MAX = {"card_id": 200, "action": 1000}
+CARD_CLICK_V2_CONTROL = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+CARD_CLICK_V2_INTERACTION = re.compile(r"[A-Za-z0-9-]{1,64}")
+CARD_CLICK_REVISION_MAX = 2147483647
+CARD_CLICK_VALUE_MAX = 255
+_CARD_CLICK_NOT_ONE_LINE = re.compile(r"[\r\n\0\ud800-\udfff]")
+
+
+def card_click_fields(click) -> "dict | None":
+    """The usable fields of a `space.ag2.card_click`, or None. v1 is {card_id, action}; v2 (agent panel
+    card v2) is {v, card_id, action: a control id, revision, interaction_id, value?}, value one line."""
+    if not isinstance(click, dict):
+        return None
+    if not all(isinstance(click.get(k), str) and click[k].strip() and len(click[k]) <= limit
+               for k, limit in CARD_CLICK_MAX.items()):
+        return None
+    version = click.get("v", 1)
+    if isinstance(version, bool) or version not in (1, 2):
+        return None
+    if version == 1:
+        return {"card_id": click["card_id"], "action": click["action"]}
+    revision, interaction = click.get("revision"), click.get("interaction_id")
+    if not (CARD_CLICK_V2_CONTROL.fullmatch(click["action"])
+            and isinstance(revision, int) and not isinstance(revision, bool)
+            and 1 <= revision <= CARD_CLICK_REVISION_MAX
+            and isinstance(interaction, str) and CARD_CLICK_V2_INTERACTION.fullmatch(interaction)):
+        return None
+    out = {"v": 2, "card_id": click["card_id"], "action": click["action"], "revision": revision,
+           "interaction_id": interaction}
+    if "value" in click:
+        value = click["value"]
+        if not (isinstance(value, str) and len(value) <= CARD_CLICK_VALUE_MAX
+                and not _CARD_CLICK_NOT_ONE_LINE.search(value)):
+            return None
+        out["value"] = value
+    return out
 
 
 def parse_task_headers(text: str) -> TaskHeaders:

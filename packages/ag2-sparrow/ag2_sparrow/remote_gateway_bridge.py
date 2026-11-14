@@ -2854,9 +2854,6 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # A room question this agent is asked: one line of quoted room data (branch below).
                 "room_question")
 
-# A card click's bounds: the card id as the backend forwards it, the action as the client caps a reply.
-_CARD_CLICK_MAX = {"card_id": 200, "action": 1000}
-
 # platform_card passes through with exactly these subkeys — a signed pointer
 # {card_url, card_sha256, sig, key_id, alg} to the platform's canonical agent
 _PLATFORM_CARD_KEYS = ("card_url", "card_sha256", "sig", "key_id", "alg")
@@ -6439,10 +6436,9 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
                 lines.append(f"ui_origin: {uo}")
         elif f == "card_click":
             click = task.get(f)
-            if isinstance(click, dict) and all(isinstance(click.get(k), str) and click[k].strip()
-                                               and len(click[k]) <= limit for k, limit in _CARD_CLICK_MAX.items()):
-                lines.append("card_click: " + json.dumps({"card_id": click["card_id"], "action": click["action"]},
-                                                         separators=(",", ":")))
+            fields = local_task_protocol.card_click_fields(click)
+            if fields:
+                lines.append("card_click: " + json.dumps(fields, separators=(",", ":")))
             elif click not in (None, ""):
                 # A click that cannot be used stays a click: the agent refuses it, never reads it as chat.
                 lines.append("card_click: invalid")

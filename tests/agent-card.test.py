@@ -27,6 +27,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import re
 import sys
 import tempfile
@@ -410,6 +411,14 @@ class Replies(unittest.TestCase):
     def test_the_click_header_is_read_only_whole(self):
         good = '{"card_id":"c1","action":"Go"}'
         self.assertEqual(ac.card_click({"card_click": good}), {"card_id": "c1", "action": "Go"})
+        self.assertEqual(ac.card_click({"card_click": '{"card_id":"c1","action":"Go","v":1,"x":2}'}),
+                         {"card_id": "c1", "action": "Go"})
+        v2 = {"v": 2, "card_id": "c1", "action": "mode", "revision": 1, "interaction_id": "i-1", "value": "on"}
+        self.assertEqual(ac.card_click({"card_click": json.dumps({**v2, "extra": 1})}), v2)
+        for bad in ({**v2, "v": 3}, {**v2, "v": True}, {**v2, "action": "Choose mode"}, {**v2, "revision": 0},
+                    {**v2, "revision": True}, {**v2, "interaction_id": "a b"}, {**v2, "value": "a\nb"},
+                    {**v2, "value": "v" * 256}, {**v2, "value": "\ud800"}, {**v2, "value": 7}):
+            self.assertIsNone(ac.card_click({"card_click": json.dumps(bad)}), bad)
         for bad in ("", "{broken", "[]", '{"card_id":"c1"}', '{"card_id":"","action":"Go"}',
                     json.dumps({"card_id": "c" * 201, "action": "Go"}), json.dumps({"card_id": "c", "action": "G" * 1001})):
             self.assertIsNone(ac.card_click({"card_click": bad}), bad)
@@ -666,6 +675,205 @@ class Dispatch(Issued):
         with contextlib.redirect_stdout(out), mock.patch("workspace_default.resolve_workspace", lambda: str(self.ws)):
             rc = ac.main(["click", "--task-file", str(self.ws / "absent.txt")])
         self.assertEqual((rc, json.loads(out.getvalue())["status"]), (2, "refused"))
+
+
+def v2_card(**kw):
+    """A v2 card (contracts/agent-panel-card-v2.md) with one pick and one input."""
+    card = {"kind": "agent_panel", "v": 2, "revision": 3, "id": "workers", "state": "pending",
+            "header": {"title": "Workers"},
+            "buttons": [{"kind": "pick", "id": "mode", "label": "Choose mode", "class": "safe",
+                         "fallback": "Tell me which mode you want.",
+                         "options": [{"id": "on", "label": "On"}, {"id": "off", "label": "Off"}], "value": "off"},
+                        {"kind": "input", "id": "rename", "label": "Save name", "class": "safe",
+                         "fallback": "Reply with a new name.",
+                         "field": {"name": "name", "label": "Name", "min_length": 2, "max_length": 12}}]}
+    card.update(kw)
+    return card
+
+
+class V2Choices(unittest.TestCase):
+    """A v2 pick or input choice acts only on the recorded card, revision, control and value, once."""
+    HANDLER = "skills/worker-pool/scripts/pool_identity.py card-reply"
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.ws = Path(tmp.name)
+        self.assertTrue(issued_cards.record(self.ws, "$v2", v2_card(), room=DM, lane="s_dspace",
+                                            handler=self.HANDLER, now=1000.0))
+
+    def ask(self, *, task_id="task-1", now=1001.0, reply_to_event="$v2", **click):
+        c = {"v": 2, "card_id": "workers", "action": "mode", "revision": 3, "interaction_id": "i-1", "value": "on",
+             **click}
+        c = {k: v for k, v in c.items() if v is not None}
+        h = {"id": task_id, "access_tier": "owner", "user_id": OWNER, "channel_kind": "dm", "channel_id": DM,
+             "reply_to_event": reply_to_event, "card_click": json.dumps(c)}
+        return ac.click_verdict(h, "Choose mode: On", self.ws, lambda lane: OWNER if lane == "s_dspace" else "",
+                                now=now)
+
+    def forged(self, why, **click):
+        got = self.ask(**click)
+        self.assertEqual((got.verdict, got.choice), (ac.FORGED, None), click)
+        self.assertIn(why, got.why, click)
+        self.assertEqual(ac.click_answer(got, "x")["say"], ac.UNMATCHED_CLICK)
+
+    def test_the_record_keeps_each_control_its_options_or_bounds_and_the_revision(self):
+        entry = issued_cards.live(self.ws, "$v2", now=1001.0)
+        self.assertEqual((entry["v"], entry["revision"], entry["controls"]),
+                         (2, 3, {"mode": {"kind": "pick", "options": ["on", "off"]},
+                                 "rename": {"kind": "input", "min_length": 2, "max_length": 12}}))
+
+    def test_a_valid_pick_is_the_command_with_its_choice(self):
+        got = self.ask()
+        self.assertEqual((got.verdict, got.handler, got.lane), (ac.COMMAND, self.HANDLER, "s_dspace"))
+        self.assertEqual(got.choice, {"card_id": "workers", "revision": 3, "control": "mode", "kind": "pick",
+                                      "value": "on", "interaction_id": "i-1"})
+        self.assertEqual(ac.click_answer(got, "Choose mode: On"),
+                         {"status": "other_card", "card": "workers", "choice": dict(got.choice), "run": self.HANDLER})
+
+    def test_a_value_the_pick_did_not_offer_is_refused(self):
+        self.forged("did not offer that value", value="maybe")
+        self.forged("carries no value", value=None)
+
+    def test_an_input_within_its_bounds_acts_and_one_outside_is_refused(self):
+        got = self.ask(action="rename", value="Pylon")
+        self.assertEqual((got.verdict, got.choice["kind"], got.choice["value"]), (ac.COMMAND, "input", "Pylon"))
+        self.forged("outside the field's bounds", action="rename", value="x" * 13, interaction_id="i-2")
+        self.forged("outside the field's bounds", action="rename", value="x", interaction_id="i-3")
+
+    def test_a_stale_revision_or_a_replaced_card_is_refused(self):
+        self.forged("changed since", revision=2)
+        issued_cards.record(self.ws, "$v2b", v2_card(revision=4), room=DM, lane="s_dspace", now=1000.5)
+        self.forged("does not answer a card I posted")
+
+    def test_a_control_or_card_the_record_does_not_hold_is_refused(self):
+        self.forged("did not offer it", action="other")
+        self.forged("does not answer a card I posted", card_id="someone-else")
+        issued_cards.record(self.ws, "$v1", a_card(buttons=[ac.button("Go", "reply", reply="Go")])[1], room=DM,
+                            lane="s_dspace", now=1000.0)
+        got = ac.click_verdict({"id": "task-1", "access_tier": "owner", "user_id": OWNER, "channel_kind": "dm",
+                                "channel_id": DM, "reply_to_event": "$v1",
+                                "card_click": json.dumps({"v": 2, "card_id": "worker-approval:w1:s.space",
+                                                          "action": "mode", "revision": 3,
+                                                          "interaction_id": "i-9", "value": "on"})},
+                               "Choose mode: On", self.ws, lambda lane: OWNER, now=1001.0)
+        self.assertEqual((got.verdict, got.why), (ac.FORGED, "the card has changed since that choice was made"))
+
+    def test_a_repeated_submission_id_is_a_no_op(self):
+        self.assertEqual(self.ask().verdict, ac.COMMAND)
+        self.assertEqual(self.ask().verdict, ac.COMMAND, "the claiming task's handler reads it again")
+        got = self.ask(task_id="task-2")
+        self.assertEqual((got.verdict, got.choice), (ac.DUPLICATE, None))
+        self.assertEqual(ac.click_answer(got, "x"), {"status": "duplicate", "why": "that choice was already submitted"})
+        self.assertEqual(self.ask(task_id="task-3", value="off").verdict, ac.DUPLICATE)
+        self.assertEqual(self.ask(task_id="task-4", interaction_id="i-5", value="off").verdict, ac.COMMAND)
+        self.forged("no id", task_id="", interaction_id="i-6")
+
+    def test_an_untrusted_claims_file_refuses_every_claim_and_is_never_rewritten(self):
+        path = self.ws.joinpath(*issued_cards.CLAIMS)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shapes = {"garbage": b"{broken", "a list": b"[]", "claims a list": b'{"claims": []}',
+                  "entry without claimant": b'{"claims": {"i-0": {"expires_at": 1e18}}}',
+                  "entry with text expiry": b'{"claims": {"i-0": {"claimant": "task-0", "expires_at": "soon"}}}'}
+        for name, raw in shapes.items():
+            path.write_bytes(raw)
+            for task_id in ("task-1", "task-2"):
+                got = self.ask(task_id=task_id)
+                self.assertEqual((got.verdict, got.why), (ac.FORGED, "the choice could not be claimed"), name)
+            self.assertEqual(path.read_bytes(), raw, name)
+        path.write_bytes(b'{"claims": {}}')
+        path.chmod(0)
+        self.addCleanup(path.chmod, 0o600)
+        if not os.access(path, os.R_OK):
+            self.assertEqual(self.ask().verdict, ac.FORGED)
+            path.chmod(0o600)
+            self.assertEqual(path.read_bytes(), b'{"claims": {}}')
+        path.unlink()
+        self.assertEqual(self.ask().verdict, ac.COMMAND, "only a missing file is an empty one")
+
+    def test_a_claim_lives_as_long_as_its_card_and_a_full_file_refuses_instead_of_evicting(self):
+        expiry = issued_cards.live(self.ws, "$v2", now=1001.0)["expires_at"]
+        with mock.patch.object(issued_cards, "MAX_CLAIMS", 2):
+            self.assertEqual(self.ask(interaction_id="i-1", task_id="t1").verdict, ac.COMMAND)
+            self.assertEqual(self.ask(interaction_id="i-2", task_id="t2", now=1002.0).verdict, ac.COMMAND)
+            got = self.ask(interaction_id="i-3", task_id="t3", now=1003.0)
+            self.assertEqual((got.verdict, got.why), (ac.FORGED, "the choice could not be claimed"))
+            held = json.loads(self.ws.joinpath(*issued_cards.CLAIMS).read_text())["claims"]
+            self.assertEqual(sorted(held), ["i-1", "i-2"])
+            self.assertEqual({v["expires_at"] for v in held.values()}, {expiry})
+            self.assertEqual(self.ask(interaction_id="i-1", task_id="t9", now=expiry - 1).verdict, ac.DUPLICATE)
+            self.assertEqual(issued_cards.claim(self.ws, "i-4", "t4", {}, expires_at=expiry + 10, now=expiry + 1),
+                             issued_cards.CLAIMED, "expired claims make room")
+
+    def test_an_empty_input_clears_an_optional_field_only(self):
+        self.forged("not one line of text", action="rename", value="", interaction_id="e-1")
+        issued_cards.record(self.ws, "$opt", v2_card(id="optional", buttons=[{**v2_card()["buttons"][1], "field": {
+            "name": "name", "min_length": 0, "max_length": 12}}]), room=DM, lane="s_dspace", now=1000.0)
+        got = self.ask(card_id="optional", action="rename", value="", interaction_id="e-2", reply_to_event="$opt")
+        self.assertEqual((got.verdict, got.choice and got.choice["value"]), (ac.COMMAND, ""))
+        self.assertEqual(self.ask(card_id="optional", action="rename", value="a\x1b", interaction_id="e-3",
+                                  reply_to_event="$opt").why, "the value is not one line of text")
+
+    def test_an_input_must_be_text_on_one_line_and_the_record_must_be_well_formed(self):
+        for i, value in enumerate(("   ", "Py\x1blon", "Py\u2028lon", "Py\u2029lon", "Py\x7flon")):
+            self.forged("not one line of text", action="rename", value=value, interaction_id=f"w-{i}")
+        path = issued_cards.ledger_path(self.ws)
+        data = json.loads(path.read_text())
+        data["cards"]["$v2"]["controls"] = {"mode": {"kind": "pick", "options": "on off"},
+                                            "rename": {"kind": "input", "min_length": "1", "max_length": 12}}
+        path.write_text(json.dumps(data))
+        self.forged("did not offer that value", value="on")
+        self.forged("did not offer that value", value="o")
+        self.forged("bounds are unreadable", action="rename", value="Pylon")
+
+    def test_choices_act_only_for_the_owner_in_their_dm_in_the_card_s_room(self):
+        def as_(**h):
+            base = {"id": "task-1", "access_tier": "owner", "user_id": OWNER, "channel_kind": "dm",
+                    "channel_id": DM, "reply_to_event": "$v2",
+                    "card_click": json.dumps({"v": 2, "card_id": "workers", "action": "mode", "revision": 3,
+                                              "interaction_id": "i-7", "value": "on"})}
+            return ac.click_verdict({**base, **h}, "Choose mode: On", self.ws, lambda lane: OWNER, now=1001.0)
+        for h in ({"user_id": "@member:s.space"}, {"access_tier": "team"}, {"channel_kind": "room"},
+                  {"channel_id": ROOM}, {"collaborator": "true"}):
+            self.assertEqual(as_(**h).verdict, ac.FORGED, h)
+        self.assertEqual(as_().verdict, ac.COMMAND, "a refused click claims nothing")
+
+    def test_a_settled_disabled_or_unreadable_v2_card_records_no_choice(self):
+        bad = {"done": v2_card(state="done"), "no revision": v2_card(revision=None), "v1 shape": v2_card(v=1),
+               "two inputs": v2_card(buttons=v2_card()["buttons"] + [{**v2_card()["buttons"][1], "id": "again"}]),
+               "repeated id": v2_card(buttons=[v2_card()["buttons"][0], {**v2_card()["buttons"][1], "id": "mode"}]),
+               "disabled": v2_card(buttons=[{**b, "disabled": True} for b in v2_card()["buttons"]]),
+               "dynamic source": v2_card(buttons=[{**v2_card()["buttons"][0], "options": None,
+                                                    "source": {"kind": "models", "scope": "this_agent"}}])}
+        for name, card in bad.items():
+            self.assertFalse(issued_cards.record(self.ws, f"$bad{name.replace(' ', '')}", {**card, "id": name},
+                                                 room=DM, now=1000.0), name)
+        footer = v2_card(buttons=[], footer_link=v2_card()["buttons"][0])
+        self.assertFalse(issued_cards.record(self.ws, "$footer", {**footer, "id": "footer"}, room=DM, now=1000.0))
+        row = v2_card(buttons=[], groups=[{"rows": [{"title": "Pylon", "actions": [v2_card()["buttons"][1]]}]}])
+        self.assertTrue(issued_cards.record(self.ws, "$row", {**row, "id": "row"}, room=DM, now=1000.0))
+
+    def test_the_cli_hands_the_choice_to_the_card_s_handler(self):
+        path = self.ws / "task.txt"
+        click = {"v": 2, "card_id": "workers", "action": "mode", "revision": 3, "interaction_id": "i-8", "value": "on"}
+        path.write_text("\n".join(["id: task-8", "task_layout: mid", "access_tier: owner", f"user_id: {OWNER}",
+                                   "channel_kind: dm", f"channel_id: {DM}", "reply_to_event: $v2",
+                                   f"card_click: {json.dumps(click)}", "task: Choose mode: On",
+                                   "source: ag2space"]) + "\n")
+
+        def run(task_file):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), \
+                    mock.patch("connections.read_rows", lambda ws=None: [{"instance": "s_dspace", "owner_mxid": OWNER}]), \
+                    mock.patch.object(issued_cards.time, "time", lambda: 1001.0):
+                rc = ac.main(["click", "--task-file", str(task_file), "--workspace", str(self.ws)])
+            return rc, json.loads(out.getvalue())
+        rc, out = run(path)
+        self.assertEqual((rc, out["status"], out["run"], out["choice"]["value"]), (0, "command", self.HANDLER, "on"))
+        self.assertEqual(run(path)[1]["status"], "command")
+        again = self.ws / "again.txt"
+        again.write_text(path.read_text().replace("id: task-8", "id: task-9"))
+        self.assertEqual(run(again), (0, {"status": "duplicate", "why": "that choice was already submitted"}))
 
 
 if __name__ == "__main__":
