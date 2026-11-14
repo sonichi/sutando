@@ -33,9 +33,10 @@ from _helpers import proactive_lane as pl
 from ag2_sparrow.delivery_core import ProviderBoundedRefused, ProviderPermanentRefused, ProviderRefused
 from ag2_sparrow.delivery_core.provider_ag2space import AG2SpaceRoomMessageProvider
 import importlib.util
+import os
 import shlex
+import subprocess
 
-import outbox_cli
 
 from ag2_sparrow import send_failure_policy
 from ag2_sparrow.delivery_core.provider_ag2space import room_refused_sender
@@ -51,6 +52,9 @@ ISO = pl.scratch("gw-room-refusal-")
 check = pl.Checks()
 
 NOT_IN_ROOM = {"error": "send failed: sender is not in this room (HTTP 403)"}
+REPO = Path(__file__).resolve().parents[1]
+# What the Sutando adapter injects: logged commands name the workspace through it.
+RESOLVER = "bash scripts/sutando-config.sh workspace"
 # The outbox's retry window is 600s; an hour of 1s scans is well past it.
 SCANS = 3600
 
@@ -107,6 +111,7 @@ def classify(is_room_membership_refusal, where: str) -> None:
     for body in (NOT_IN_ROOM, {"error": "not a room member (HTTP 403)"},
                  {"error": "Sender is not in this room"}, {"error": "User @a:s NOT IN ROOM !r:s"},
                  {"message": "sender is not in this room"}, {"detail": "not a room member"},
+                 {"message": "Send Failed: Sender Is Not In This Room"}, {"detail": "NOT A ROOM MEMBER"},
                  {"errcode": "M_FORBIDDEN", "error": "User @a:s not in room !r:s"},
                  json.dumps(NOT_IN_ROOM), json.dumps(NOT_IN_ROOM).encode("utf-8")):
         check(is_room_membership_refusal(403, body), f"{where}: a room refusal is recognised: {str(body)[:50]}")
@@ -158,7 +163,11 @@ def provider() -> None:
 def a_room_refusal_parks_after_its_budget() -> None:
     lane = pl.Lane(gb, ISO, refuse(403, NOT_IN_ROOM))
     lane.write("proactive-notinroom.txt", "[channel: !gone:example.org]\nhourly report\n")
-    raised, parked = scan_for_an_hour(lane, "proactive-notinroom")
+    saved, gb._WORKSPACE_RESOLVER = getattr(gb, "_WORKSPACE_RESOLVER", None), RESOLVER
+    try:
+        raised, parked = scan_for_an_hour(lane, "proactive-notinroom")
+    finally:
+        gb._WORKSPACE_RESOLVER = saved
     check(2 <= ROOM_REFUSAL_ATTEMPTS <= 5, f"the budget is small ({ROOM_REFUSAL_ATTEMPTS})")
     check(len(lane.posts) == ROOM_REFUSAL_ATTEMPTS,
           f"a room refusal is sent exactly {ROOM_REFUSAL_ATTEMPTS} times ({len(lane.posts)} sends in an hour of scans)")
@@ -169,12 +178,19 @@ def a_room_refusal_parks_after_its_budget() -> None:
           f"its outbox item parks as a permanent refusal ({[p.get('reason') for p in parked]})")
     check(any("PARKED" in m and "permanent-refusal" in m and "will NOT be re-sent" in m for m in lane.logs),
           "the park is logged with its reason")
-    cmd = next((shlex.split(m.split("To send it again: ", 1)[1]) for m in lane.logs
-                if "permanent-refusal" in m and "To send it again: " in m), None)
+    line = next((m.split("To send it again: ", 1)[1] for m in lane.logs
+                 if "permanent-refusal" in m and "To send it again: " in m), None)
+    cmd = shlex.split(line) if line else None
     check(cmd is not None and "--reset-attempts" in cmd,
           f"and with the requeue command, restoring the full budget ({cmd})")
+    check(line is not None and str(lane.ws) not in line and str(lane.ws.resolve()) not in line
+          and f'--root "$({RESOLVER})"/results/' in line,
+          f"the command names its root through the workspace resolver, not a path ({line})")
     if cmd:
-        check(outbox_cli.main(cmd[2:]) == 0, "the logged command requeues it")
+        # As an operator pastes it: a shell in the checkout, the resolver printing this workspace.
+        ran = subprocess.run(["bash", "-c", line], cwd=REPO, capture_output=True, text=True, timeout=60,
+                             env={**os.environ, "SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(lane.ws)})
+        check(ran.returncode == 0, f"the logged command requeues it ({ran.returncode}: {ran.stderr[-300:]})")
         lane.respond = refuse_until_joined(ROOM_REFUSAL_ATTEMPTS - 1)
         before = len(lane.posts)
         scan_for_an_hour(lane, "proactive-notinroom")
@@ -182,6 +198,25 @@ def a_room_refusal_parks_after_its_budget() -> None:
               and lane.where("proactive-notinroom") == "archived",
               f"and the requeued message gets the whole budget again "
               f"({len(lane.posts) - before} sends, {lane.where('proactive-notinroom')})")
+
+
+def a_logged_command_names_no_home_path() -> None:
+    home = Path.home()
+    under_home = home / "Library" / "Application Support" / "ws" / "results" / ".outbox-proactive"
+    saved, gb._WORKSPACE_RESOLVER = getattr(gb, "_WORKSPACE_RESOLVER", None), ""
+    try:
+        bare = gb._requeue_command(under_home, "wr_1.c")
+    finally:
+        gb._WORKSPACE_RESOLVER = saved
+    check(str(home) not in bare and bare.startswith('python3 src/outbox_cli.py --root "$HOME"/'),
+          f"without a resolver, a root under the home dir is named from $HOME ({bare})")
+    ran = subprocess.run(["bash", "-c", f"printf '%s\\n' {bare.split(' --root ', 1)[1]}"],
+                         capture_output=True, text=True, env={**os.environ, "HOME": str(home)})
+    check(ran.stdout.splitlines() == [str(under_home), "requeue", "wr_1.c"],
+          f"and the shell expands it back to the root, spaces intact ({ran.stdout!r})")
+    elsewhere = Path("/srv/agent ws/results/.outbox-proactive")
+    got = shlex.split(gb._requeue_command(elsewhere, "wr_1.c"))
+    check(got[3] == str(elsewhere), f"a root outside both is quoted whole ({got})")
 
 
 def a_join_landing_on_the_third_send_delivers() -> None:
@@ -212,6 +247,7 @@ def main() -> int:
     an_unreadable_body_is_no_room_refusal()
     provider()
     a_room_refusal_parks_after_its_budget()
+    a_logged_command_names_no_home_path()
     a_join_landing_on_the_third_send_delivers()
     another_403_keeps_its_handling_and_stays_bounded()
     return check.exit_code()
