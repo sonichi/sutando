@@ -64,6 +64,8 @@ def report_once(key: str, log: Log, line: str) -> None:
 
 
 def _probe_rename() -> "tuple[str, Optional[Callable[[bytes, bytes], int]]]":
+    if sys.platform == "win32":
+        return "os.rename", None
     try:
         libc = ctypes.CDLL(None, use_errno=True)  # find_library("c") spawns ldconfig on Linux
     except OSError:  # pragma: no cover - no libc to speak of
@@ -79,8 +81,6 @@ def _probe_rename() -> "tuple[str, Optional[Callable[[bytes, bytes], int]]]":
         fn.restype = ctypes.c_int
         at_fdcwd = -100
         return "renameat2", lambda a, b: fn(at_fdcwd, a, at_fdcwd, b, 1)  # RENAME_NOREPLACE
-    if sys.platform == "win32":  # pragma: no cover - os.rename refuses a taken name there
-        return "os.rename", None
     return "none", None
 
 

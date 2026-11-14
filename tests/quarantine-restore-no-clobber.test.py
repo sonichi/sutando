@@ -24,6 +24,14 @@ uq = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(uq)
 
 
+class RenamePrimitiveProbe(unittest.TestCase):
+    def test_windows_selects_native_rename_without_loading_libc(self):
+        with unittest.mock.patch.object(sys, "platform", "win32"), \
+                unittest.mock.patch.object(uq.ctypes, "CDLL", side_effect=AssertionError) as load:
+            self.assertEqual(uq._probe_rename(), ("os.rename", None))
+        load.assert_not_called()
+
+
 class ConcurrentProducerAtTheMoveBoundary(unittest.TestCase):
     def setUp(self):
         import tempfile
