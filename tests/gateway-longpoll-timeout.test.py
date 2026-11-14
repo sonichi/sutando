@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Long-poll timeout grace preserves retry timing without inventing poll evidence."""
+"""Long-poll timeout grace preserves retry timing without inventing poll evidence.
+
+A held poll inside the grace is the documented empty poll, so it neither backs off
+nor logs an outage; it is still not a success, so it leaves `last_ok_ts` alone and
+its status write says the poll timed out (#5678).
+"""
 from __future__ import annotations
 
 import re
@@ -225,11 +230,12 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
             self.assertEqual(loop.clock.slept, [1])
 
     def test_confirmed_poll_retains_evidence_through_the_inclusive_grace_boundary(self):
+        # last_ok_ts survives the grace; a timed-out poll itself never reads as serving.
         with _StatusLoop(_GW) as loop:
             ok = int(loop.clock.time()) + 1
             loop.run([(1, self.EMPTY), self.timeout(), self.timeout(_GW.POLL_TIMEOUT_GRACE_S - 1)])
             self.assertEqual([r["last_ok_ts"] for r in loop.records], [None, ok, ok, ok])
-            self.assertEqual(loop.serving, [False, True, True, True])
+            self.assertEqual(loop.serving, [False, True, False, False])
             self.assertEqual(loop.clock.slept, [])
             self.assertFalse(any("poll network error" in m for m in loop.logs))
 
@@ -252,7 +258,7 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
             task_ok = empty_ok + _GW.POLL_TIMEOUT_GRACE_S + 4
             self.assertEqual([r["last_ok_ts"] for r in loop.records],
                              [None, None, empty_ok, empty_ok, empty_ok, task_ok, task_ok])
-            self.assertEqual(loop.serving, [False, False, True, True, False, True, True])
+            self.assertEqual(loop.serving, [False, False, True, False, False, True, False])
             self.assertEqual(loop.clock.slept, [1])
             self.assertEqual(len(loop.acks), 1)
             ack = loop.acks[0]
@@ -277,7 +283,7 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
                          + [self.timeout()] * 7)
                 records = loop.records[1 + len(prefix):]
                 self.assertEqual([r["last_ok_ts"] for r in records], [ok] * 10)
-                self.assertEqual(loop.serving[1 + len(prefix):], [False, True] + [False] * 8)
+                self.assertEqual(loop.serving[1 + len(prefix):], [False] * 10)
                 self.assertIn("unexpected:", records[0]["error"])
                 self.assertTrue(any("FileExistsError" in m for m in loop.logs))
                 self.assertEqual(loop.clock.slept, [1, 1, 2, 4, 8, 16, 32, 60, 60])
@@ -303,7 +309,7 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
             self.assertEqual(failed, [True])
             self.assertEqual([r["last_ok_ts"] for r in loop.records],
                              [None, 1_000_001, 1_000_001, 1_000_001])
-            self.assertEqual(loop.serving, [False, False, True, False])
+            self.assertEqual(loop.serving, [False, False, False, False])
             self.assertEqual(loop.acks, [])
 
     def test_http_and_auth_failures_preserve_evidence_and_existing_handling(self):
@@ -339,7 +345,7 @@ class LongPollTimeoutTest(unittest.TestCase):
 
     # ── the policy on its own ────────────────────────────────────────────
     def test_the_grace_covers_at_least_one_whole_poll_window(self):
-        self.assertGreaterEqual(self.gw.POLL_TIMEOUT_GRACE_S, self.gw.POLL_WAIT + 10)
+        self.assertGreaterEqual(self.gw.POLL_TIMEOUT_GRACE_S, self.gw.POLL_READ_TIMEOUT_S)
 
     def test_benign_from_zero_up_to_and_including_the_boundary(self):
         g = self.gw.POLL_TIMEOUT_GRACE_S
@@ -359,8 +365,11 @@ class LongPollTimeoutTest(unittest.TestCase):
         self.assertEqual(loop.clock.slept, [], "a benign empty poll must not back off")
         self.assertNotIn("poll network error",
                          " ".join(loop.logs), "and must not log an outage")
-        self.assertIn((False, {"poll_ok_ts": None}), loop.status,
-                      "startup grace alone does not establish connectivity")
+        self.assertNotIn(True, [c for c, _ in loop.status],
+                         "startup grace alone does not establish connectivity")
+        self.assertIsNone(loop.status[-1][1].get("poll_ok_ts"), "a timeout stamped poll evidence")
+        self.assertIn("timed out", str(loop.status[-1][1].get("error")),
+                      "the iteration completes and says the poll timed out")
 
     def test_a_timeout_past_the_grace_takes_the_outage_path(self):
         grace = self.gw.POLL_TIMEOUT_GRACE_S
@@ -739,7 +748,7 @@ class RoundAccountingTest(unittest.TestCase):
         with _Loop(self.gw, poll_raises=TimeoutError("The read operation timed out"),
                    advance=1.0) as loop:
             loop.run()
-        self.assertTrue(any(m.startswith("poll read timed out after 35s inside the")
+        self.assertTrue(any(m.startswith(f"poll read timed out after {self.gw.POLL_READ_TIMEOUT_S}s inside the")
                             for m in loop.logs))
 
 
@@ -956,7 +965,7 @@ class SlowDripTest(unittest.TestCase):
             start = loop.clock.now
             with patch.object(urllib.request.OpenerDirector, "open", new=lambda *a, **k: drip()):
                 loop.run()
-        budget = self.gw.POLL_WAIT + 10
+        budget = self.gw.POLL_READ_TIMEOUT_S
         self.assertLessEqual(loop.clock.now - start, budget + 1, "the whole poll is bounded by its budget")
         self.assertTrue(any(f"poll read timed out after {budget}s" in m for m in loop.logs), loop.logs)
 
@@ -975,7 +984,7 @@ class SlowDripTest(unittest.TestCase):
         self.assertTrue(seen, "the loop made no poll")
         for start, deadline in seen:
             self.assertIsNotNone(deadline, "the poll carries no deadline")
-            self.assertGreaterEqual(deadline - start, self.gw.POLL_WAIT + 10)
+            self.assertGreaterEqual(deadline - start, self.gw.POLL_READ_TIMEOUT_S)
 
     def test_a_body_that_ends_empty_past_its_deadline_is_a_timeout(self):
         # No Content-Length to catch the cut: only the clock says the body is not whole.
