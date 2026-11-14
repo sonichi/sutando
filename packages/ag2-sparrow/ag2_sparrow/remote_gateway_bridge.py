@@ -1225,8 +1225,10 @@ def _shell_root(root) -> str:
     return shlex.quote(str(root))
 
 
-def _outbox_cli_command(root, *args: str) -> str:
-    return f"python3 src/outbox_cli.py --root {_shell_root(root)} {shlex.join(args)}"
+def _outbox_cli_command(root, *args: str, program: str = "python3 src/outbox_cli.py",
+                        results_dir=None) -> str:
+    tail = f" --results-dir {_shell_root(results_dir)}" if results_dir is not None else ""
+    return f"{program} --root {_shell_root(root)} {shlex.join(args)}{tail}"
 
 
 def _requeue_command(root, item_id: str) -> str:
@@ -9054,11 +9056,10 @@ def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
             _log(f"result {tid}: {why} — quarantined to {UNDELIVERABLE_RESULTS_DIR.name}/; "
                  f"{not_requeueable_because}")
             return
-        _log(f"result {tid}: {why} — quarantined to "
-             f"{UNDELIVERABLE_RESULTS_DIR.name}/ — `ag2-sparrow-outbox "
-             f"--root {gateway_instance.outbox_root(RESULTS_DIR, GATEWAY_INSTANCE)} "
-             f"requeue {outbox_item_id or _broker_tid(_delivery_tid(tid) or tid)} --reset-attempts "
-             f"--results-dir {RESULTS_DIR} --body-id {tid}` restores it")
+        how = _outbox_cli_command(gateway_instance.outbox_root(RESULTS_DIR, GATEWAY_INSTANCE), "requeue",
+                                  outbox_item_id or _broker_tid(_delivery_tid(tid) or tid), "--reset-attempts",
+                                  "--body-id", tid, program="ag2-sparrow-outbox", results_dir=RESULTS_DIR)
+        _log(f"result {tid}: {why} — quarantined to {UNDELIVERABLE_RESULTS_DIR.name}/ — `{how}` restores it")
     except disposal.KeptQuarantined:
         return                                          # the lifecycle owner named where it waits
     except disposal.GenerationReplaced:
