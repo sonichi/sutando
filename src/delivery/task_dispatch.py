@@ -27,8 +27,8 @@ CLI, for bash callers with only an interpreter path:
     task_dispatch.py wake-turn <tasks_dir> <filename>                  # exit 0 = a woken task's new turn
     task_dispatch.py find-ready <results_dir> <filename>                 # prints path, exit 0/1
     task_dispatch.py head-abandoned <results_dir> <filename> <payload>  # exit 0 = drop the queue head
-    task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir D]
-    task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir D]
+    task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir D] [--typable]
+    task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir D] [--typable]
     task_dispatch.py inflight-mark <inflight_dir> <filename> <incarnation>
     task_dispatch.py inflight-live <inflight_dir> <filename> <incarnation>   # exit 0/1
     task_dispatch.py inflight-clear <inflight_dir> <filename>
@@ -78,11 +78,15 @@ from task_priority import parse_priority_from_file, sort_tasks_by_priority  # no
 
 __all__ = [
     "find_ready_result", "has_ready_result", "find_ready_result_for_filename", "ready_result_filenames",
-    "pending_candidates", "next_pending_task",
+    "TASK_NAME_RE", "pending_candidates", "next_pending_task",
     "mark_inflight", "inflight_is_live", "clear_inflight",
     "mark_partial_paste", "partial_paste_leftover",
     "announced_entry",
 ]
+
+# What `--typable` offers: a name typed verbatim into a pane that skips permission prompts.
+# Same rule as the agy backstop; fullmatch, since `$` also matches before a trailing newline.
+TASK_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+\.txt$")
 
 
 def announced_entry(tasks_dir: "Path | str", announced: str, *,
@@ -280,6 +284,7 @@ def pending_candidates(
     *,
     claims_dir: "Path | str | None" = None,
     deliveries_dir: "Path | str | None" = None,
+    typable_only: bool = False,
 ) -> Iterator[str]:
     """Task filenames without a ready result, priority-sorted (mtime FIFO within a tier).
 
@@ -287,7 +292,9 @@ def pending_candidates(
     task with a worker sentinel under `deliveries_dir` (`worker_holds`) was routed
     away from the core and is skipped. Only regular files are yielded, never a
     name that carries a path separator or traversal sentinel, whatever the sort
-    step handed back.
+    step handed back. With `typable_only`, a name outside `TASK_NAME_RE` is not
+    offered either: a consumer that would refuse to type it must not be handed it
+    as the head of the queue, or the tasks behind it never come up.
     """
     claims = Path(claims_dir) if claims_dir else None
     tasks = [t for t in sort_tasks_by_priority(Path(tasks_dir).glob("*.txt"))
@@ -297,6 +304,8 @@ def pending_candidates(
     ready = ready_result_filenames(results_dir, [t.name for t in tasks])
     for task in tasks:
         name = task.name
+        if typable_only and not TASK_NAME_RE.fullmatch(name):
+            continue
         if name in ready:
             continue
         if claims is not None and (claims / name).is_file():
@@ -318,10 +327,11 @@ def next_pending_task(
     *,
     claims_dir: "Path | str | None" = None,
     deliveries_dir: "Path | str | None" = None,
+    typable_only: bool = False,
 ) -> str | None:
     """First entry of `pending_candidates`, or None."""
     for name in pending_candidates(tasks_dir, results_dir, claims_dir=claims_dir,
-                                   deliveries_dir=deliveries_dir):
+                                   deliveries_dir=deliveries_dir, typable_only=typable_only):
         return name
     return None
 
@@ -447,8 +457,8 @@ _USAGE = (
     "       task_dispatch.py sort-by-priority <tasks_dir> [--resolve-inbox WORKSPACE HELPER [--resolution-cache DIR]]\n"
     "       task_dispatch.py reuse-inbox-resolution <cache_dir> <entry>   # exit 5 if changed or uncached\n"
     "       task_dispatch.py priority-tier <task_file>   # prints urgent|normal|low, the file's own header\n"
-    "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
-    "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
+    "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR] [--typable]\n"
+    "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR] [--typable]\n"
     "       task_dispatch.py worker-holds <deliveries_dir> <filename>   # exit 0 held / 1 not / 2 cannot decide\n"
     "       task_dispatch.py announced-entry <tasks_dir> <announced> [--resolved <payload_dir>]   # prints key<TAB>payload; exit 1 refused\n"
     "       task_dispatch.py owned-by <deliveries_dir> <recipient>   # one id per line; exit 2 cannot decide\n"
@@ -464,11 +474,15 @@ _DIR_OPTIONS = {"--claims-dir": "claims_dir", "--deliveries-dir": "deliveries_di
 
 
 def _parse_dir_options(rest: list[str]) -> dict:
-    """`[--claims-dir DIR] [--deliveries-dir DIR]` after the two positional dirs, each at
-    most once; anything else is a usage error."""
+    """`[--claims-dir DIR] [--deliveries-dir DIR] [--typable]` after the two positional
+    dirs, each at most once; anything else is a usage error."""
     opts: dict = {}
     i = 0
     while i < len(rest):
+        if rest[i] == "--typable" and "typable_only" not in opts:
+            opts["typable_only"] = True
+            i += 1
+            continue
         key = _DIR_OPTIONS.get(rest[i])
         if key is None or key in opts or i + 1 >= len(rest) or not rest[i + 1]:
             raise ValueError(_USAGE)
