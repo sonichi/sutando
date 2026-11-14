@@ -599,7 +599,7 @@ if os.name != "nt":
 
         def rollback_then_lock(fd):
             if not rolled:  # B opened the old inode; A rolls back before B locks it
-                rolled.append(os.fstat(fd).st_ino)
+                rolled.append(os.dup(fd))  # held open so the freed inode number is not reused
                 os.unlink(str(path))
                 pub.unlock_fd(holder_a)
                 os.close(holder_a)
@@ -611,7 +611,7 @@ if os.name != "nt":
             pub.try_lock_fd = real_try
         holder_c = pub.claim_open(str(path))
         check(holder_b is not None and holder_c is None
-              and os.fstat(holder_b).st_ino == path.stat().st_ino != rolled[0],
+              and os.fstat(holder_b).st_ino == path.stat().st_ino != os.fstat(rolled[0]).st_ino,
               "a claim locked after its rollback unlink is reopened: one holder, on the live path")
         rc, so, se = publish_in(ws, task, j)
         check(rc == 2 and "publication in progress" in se and not (ws / "results" / task.name).exists(),
@@ -619,6 +619,8 @@ if os.name != "nt":
         if holder_b is not None:
             pub.unlock_fd(holder_b)
             os.close(holder_b)
+        for kept in rolled:
+            os.close(kept)
 
 # (10c) no `fcntl`, as on Windows: a fake `msvcrt` with real in-process lock semantics
 # drives the claim state machine. Windows filesystem semantics are NOT exercised here.
