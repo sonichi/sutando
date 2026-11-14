@@ -26,6 +26,7 @@ import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
@@ -1509,6 +1510,9 @@ class QuotaAllowed(unittest.TestCase):
 
     # The proxy's ledger holds the 429's body as it arrived: compressed, so unreadable here.
     ENCODED = "\ufffd8\x00\x00\ufffd\ufffd\ufffd\ufffd\ufffd\ufffdt\ufffd\x1eL\ufffd&7"
+    ALLOWED = {"anthropic-ratelimit-unified-status": "allowed",
+               "anthropic-ratelimit-unified-7d-status": "allowed",
+               "anthropic-ratelimit-unified-7d-utilization": "0.41"}
 
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
@@ -1519,11 +1523,17 @@ class QuotaAllowed(unittest.TestCase):
     def tearDown(self):
         self.td.cleanup()
 
-    def fable_429(self, snippet: str) -> dict:
+    def fable_429(self, snippet: str, own=ALLOWED) -> dict:
         rec = limited_record(self.now, rejected=False, model="claude-fable-5-2", ago=20)
-        rec["headers"]["anthropic-ratelimit-unified-7d-utilization"] = "0.41"
-        rec["recent_rejections"][0]["snippet"] = snippet
+        rec["headers"] = dict(self.ALLOWED)
+        rej = rec["recent_rejections"][0]
+        rej["snippet"] = snippet
+        if own is not None:
+            rej["limit_headers"] = dict(own)
         return rec
+
+    def launches(self, rec: dict, model: str = "claude-fable-5-2") -> bool:
+        return clh.decide(self.ws, self.now, quota=rec, launch_model=model).launch
 
     def test_a_throttle_with_quota_left_does_not_pause_the_core(self):
         for snippet in (self.ENCODED, '{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}'):
@@ -1543,25 +1553,39 @@ class QuotaAllowed(unittest.TestCase):
     def test_an_exhausted_account_still_holds(self):
         rec = limited_record(self.now, model="claude-fable-5-2")
         rec["recent_rejections"][0]["snippet"] = self.ENCODED
+        rec["recent_rejections"][0]["limit_headers"] = dict(rec["headers"])
         d = clh.decide(self.ws, self.now, quota=rec, launch_model="claude-fable-5-2")
         self.assertFalse(d.launch)
         self.assertEqual(d.hold["kind"], "usage-limit")
 
-    def test_headers_from_an_earlier_response_do_not_clear_the_429(self):
-        rec = self.fable_429(self.ENCODED)
-        rec["last_checked"] = iso(self.now - 600)
-        self.assertFalse(clh.decide(self.ws, self.now, quota=rec, launch_model="claude-fable-5-2").launch)
+    def test_a_headerless_429_keeps_the_backoff_whatever_answered_just_before(self):
+        # An allowed response 1 s before writes the record's headers; the 429 carried none.
+        for own in (None, {}):
+            rec = self.fable_429(self.ENCODED, own=own)
+            rec["last_checked"] = iso(self.now - 21)
+            self.assertFalse(self.launches(rec), own)
+            clh.clear(self.ws, self.now)
+            (self.ws / "state" / clh.HOLD_FILE).unlink()
 
-    def transcript(self, text: str) -> Path:
+    def test_another_requests_allowed_headers_do_not_clear_this_429(self):
+        # Interleaved: this 429 was rejected on its own response, another request answered allowed after.
+        rec = self.fable_429(self.ENCODED, own={"anthropic-ratelimit-unified-status": "rejected",
+                                                "anthropic-ratelimit-unified-7d-status": "rejected"})
+        rec["last_checked"] = iso(self.now - 19)
+        self.assertFalse(self.launches(rec))
+
+    def transcript(self, text: str, served: Optional[str] = None) -> Path:
         proj = self.ws / "projects"
         proj.mkdir(exist_ok=True)
         now = time.time()
-        served = {"type": "assistant", "timestamp": iso(now - 60),
-                  "message": {"model": "claude-fable-5-2", "content": [{"type": "text", "text": "ok"}]}}
-        err = {"isApiErrorMessage": True, "timestamp": iso(now - 20), "type": "assistant",
-               "message": {"model": "<synthetic>", "content": [{"type": "text", "text": text}]}}
-        (proj / "s.jsonl").write_text(json.dumps({"type": "user"}) + "\n" + json.dumps(served) + "\n"
-                                      + json.dumps({"type": "user"}) + "\n" + json.dumps(err) + "\n")
+        lines = [{"type": "user"}]
+        if served:
+            lines += [{"type": "assistant", "timestamp": iso(now - 60),
+                       "message": {"model": served, "content": [{"type": "text", "text": "ok"}]}},
+                      {"type": "user"}]
+        lines.append({"isApiErrorMessage": True, "timestamp": iso(now - 20), "type": "assistant",
+                      "message": {"model": "<synthetic>", "content": [{"type": "text", "text": text}]}})
+        (proj / "s.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
         return proj
 
     def test_the_clis_not_your_usage_limit_error_does_not_pause_the_core(self):
@@ -1571,13 +1595,21 @@ class QuotaAllowed(unittest.TestCase):
                        launch_model="claude-fable-5-2")
         self.assertTrue(d.launch, d.line)
 
-    def test_the_clis_fable_limit_holds_fable_only(self):
-        proj = self.transcript("You've reached your Fable limit.")
+    def _fable_cap_holds_fable_only(self, served: Optional[str]):
+        proj = self.transcript("You've reached your Fable limit.", served)
         now = time.time()
-        self.assertTrue(clh.decide(self.ws, now, quota=None, projects_dir=proj, launch_model="sonnet").launch)
+        for other in ("sonnet", "claude-sonnet-5"):
+            self.assertTrue(clh.decide(self.ws, now, quota=None, projects_dir=proj, launch_model=other).launch,
+                            (served, other))
         d = clh.decide(self.ws, now, quota=None, projects_dir=proj, launch_model="claude-fable-5-2")
         self.assertFalse(d.launch)
-        self.assertEqual((d.hold["kind"], d.hold["model"]), ("usage-limit", "claude-fable-5-2"))
+        self.assertEqual((d.hold["kind"], d.hold["model"]), ("usage-limit", "fable"))
+
+    def test_a_fable_cap_on_the_first_turn_holds_fable_only(self):
+        self._fable_cap_holds_fable_only(None)
+
+    def test_a_fable_cap_after_a_sonnet_turn_holds_fable_not_sonnet(self):
+        self._fable_cap_holds_fable_only("claude-sonnet-5")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

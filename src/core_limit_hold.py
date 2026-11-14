@@ -80,7 +80,8 @@ _CLI_LIMIT = tuple(rx for name, rx in cli_wedge.ABNORMAL_PATTERNS
 # The window-named banner ("5-hour limit reached"), a per-model cap ("You've reached your Fable
 # limit."), and the API's own words for a refusal.
 _USAGE_EXTRA = re.compile(r"\b\d+-hour limit (?:reached|exceeded|hit)\b|\bquota\b.{0,20}\b(?:exceeded|exhausted)\b"
-                          r"|\breached your [A-Za-z][\w.-]{0,24} limit\b|\binsufficient_quota\b", re.I)
+                          r"|\binsufficient_quota\b", re.I)
+_NAMED_CAP = re.compile(r"\breached your ([A-Za-z][\w.-]{0,24}) limit\b", re.I)
 # The CLI's words for a 429 the account's quota did not cause: the server is throttling.
 _NOT_A_LIMIT = re.compile(r"\bnot your usage limit\b", re.I)
 # A 429 counts only as a status (API Error, HTTP, a status field), never as a number in a URL or id.
@@ -152,7 +153,11 @@ def classify_text(text: str, at: float, model: Optional[str] = None,
     """A provider limit named by refusal text, or None for any other error."""
     if not text or _NOT_A_LIMIT.search(text):
         return None
-    if any(rx.search(text) for rx in _CLI_LIMIT) or _USAGE_EXTRA.search(text):
+    named = _NAMED_CAP.search(text)
+    if named:
+        # The banner names the capped model; an earlier turn may have run another one.
+        model = qa._model_family(named.group(1).lower()) or model
+    if named or any(rx.search(text) for rx in _CLI_LIMIT) or _USAGE_EXTRA.search(text):
         kind = "usage-limit"
     elif _RATE.search(text):
         kind = "rate-limit"
@@ -204,7 +209,7 @@ def record_evidence(payload, now: float) -> Optional[Limit]:
     headers = payload.get("headers") if isinstance(payload.get("headers"), dict) else {}
     model = qa._norm_model(rej.get("model")) or qa.record_model(payload)
     found = classify_text(str(rej.get("snippet") or ""), at, model, "provider-record")
-    if state == "allowed" and _answered_allowed(payload, headers, at) and not (
+    if _own_headers_allowed(rej) and not (
             found and (found.kind == "usage-limit" or (found.reset_at or 0) > now)):
         return None  # a throttle on an account with quota; the CLI retries it itself
     kind = "usage-limit" if state == "rejected" else (found.kind if found else "rate-limit")
@@ -214,12 +219,13 @@ def record_evidence(payload, now: float) -> Optional[Limit]:
     return Limit(kind, at, reset, model, "provider-record")
 
 
-def _answered_allowed(payload: dict, headers: dict, at: float) -> bool:
-    """Whether the record's headers are the 429's own and carry the provider's status for it.
-    Headers written well before the 429 are an earlier response's, so they say nothing of it."""
-    checked = qa._parse_when(payload.get("last_checked"))
-    return bool(headers.get("anthropic-ratelimit-unified-status")) and checked is not None \
-        and abs(checked - at) <= SERVED_SLACK_S
+def _own_headers_allowed(rej: dict) -> bool:
+    """Whether the 429's own response, as the proxy recorded it with the rejection, reported
+    every limit allowed. Absent or status-less headers say nothing, so the old backoff applies."""
+    own = rej.get("limit_headers")
+    if not isinstance(own, dict) or not own.get("anthropic-ratelimit-unified-status"):
+        return False
+    return qa.classify_limit_state({"headers": own}) == "allowed"
 
 
 def _entry_text(entry: dict) -> str:
