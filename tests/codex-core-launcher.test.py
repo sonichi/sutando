@@ -129,6 +129,9 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/local_services.sh",
             "src/core_runtime_record.py",
             "src/codex_project_trust.py",
+            "src/codex_host_instructions.py",
+            "src/codex_home.py",
+            "src/agent/codex/codex-home.sh",
             "src/toml_fallback.py",
             "src/result_publish.py",
             "src/agent/task-event-handler-lookup.sh",
@@ -727,6 +730,7 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertIn("--ask-for-approval never", calls)
         self.assertIn("--search", calls)
         self.assertIn("-c check_for_update_on_startup=false", calls)
+        self.assertIn("-c project_doc_max_bytes=131072", calls)
         self.assertIn("-m gpt-test", calls)
         self.assertIn("Reply exactly READY. Do not use tools.", calls)
         self.assertIn("new-session -d -s sutando-core-watcher", calls)
@@ -814,6 +818,117 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("could not record Codex project trust", result.stderr)
         self.assertFalse((self.root / "codex-home" / "config.toml").exists())
+
+    def _desktop_hosted(self):
+        """The fixture as a desktop install, its Codex home on a symlink-free physical path."""
+        base = Path(self.tmp.name).resolve()
+        engine = base / "app-support" / "engine"
+        hosted = engine / "sutando"
+        shutil.copytree(self.root, hosted, symlinks=True)
+        self.root = hosted
+        (engine / "AGENTS.md").write_text("# Sutando in AG2 Space\n")
+        home = base / "app-support" / "workspace" / ".codex-sutando"
+        config = json.loads((hosted / "sutando.config.json").read_text())
+        config["core_config_dirs"][0]["value"] = str(home)
+        (hosted / "sutando.config.json").write_text(json.dumps(config))
+        return home
+
+    def test_a_desktop_hosted_core_gets_the_hosts_agents_md_in_its_codex_home(self):
+        """Codex never reads AGENTS.md above its project root, so the desktop's own
+        first-contact and Getting started instructions reach the core only this way."""
+        home = self._desktop_hosted()
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("could not link the host's AGENTS.md", result.stderr)
+        self.assertNotIn("the host's AGENTS.md was not linked", result.stderr)
+        self.assertTrue(home.is_dir(), "the launcher did not create the app home")
+        self.assertNotIn("not creating it", result.stderr)
+        linked = home / "AGENTS.md"
+        self.assertTrue(linked.is_symlink(), result.stdout)
+        self.assertEqual(linked.read_text(), "# Sutando in AG2 Space\n")
+        self.assertIn("new-session -d -s sutando-core", self._tmux_calls())
+
+    def _owner_linked_to_missing_app_home(self):
+        home = self._desktop_hosted()
+        user_home = Path(self.tmp.name) / "home"
+        user_home.mkdir(parents=True, exist_ok=True)
+        (user_home / ".codex").symlink_to(home)
+        # A git checkout, so project trust would write config.toml into CODEX_HOME.
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        return home
+
+    def test_a_desktop_owner_link_to_the_missing_app_home_is_never_written(self):
+        """~/.codex -> the app home: no launcher step may create or write into it."""
+        home = self._owner_linked_to_missing_app_home()
+        result = self.run_launcher(env_extra={"SUTANDO_CODEX_WORKING_DIR": str(self.root)})
+        self.assertFalse(os.path.lexists(home.parent), "the launcher created the app home's parent")
+        self.assertFalse(os.path.lexists(home / "config.toml"))
+        self.assertIn("not creating it", result.stderr)
+        self.assertIn("not recording Codex project trust or linking the host's AGENTS.md", result.stderr)
+        self.assertIn("is, or leads into, the owner's own Codex home", result.stderr)
+        # This fake Codex reports signed in, so the core still starts with the unchanged env.
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("new-session -d -s sutando-core", self._tmux_calls())
+
+    def test_a_real_codex_with_the_refused_missing_home_stops_the_launch_writing_nothing(self):
+        """Real Codex 0.164 exits 1 from `login status` when CODEX_HOME does not exist."""
+        home = self._owner_linked_to_missing_app_home()
+        self._write_exe("codex", '#!/bin/bash\n[ -d "${CODEX_HOME:-}" ] || exit 1\nexit 0\n')
+        result = self.run_launcher(env_extra={"SUTANDO_CODEX_WORKING_DIR": str(self.root)})
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("not authenticated", result.stderr)
+        self.assertFalse(os.path.lexists(home.parent))
+        self.assertNotIn("new-session -d -s sutando-core", self._tmux_calls())
+
+    def test_a_failing_home_checker_refuses_the_desktop_home_and_writes_nothing(self):
+        """The checker cannot run: the launcher must refuse, not fall back to creating it."""
+        home = self._desktop_hosted()
+        (self.root / "src/codex_host_instructions.py").write_text("import sys\nsys.exit(7)\n")
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        result = self.run_launcher(env_extra={"SUTANDO_CODEX_WORKING_DIR": str(self.root)})
+        self.assertFalse(os.path.lexists(home.parent), "the launcher created the app home")
+        self.assertIn("not creating it", result.stderr)
+        self.assertFalse(os.path.lexists(Path(self.tmp.name) / "home" / ".codex"))
+
+    def test_an_alternate_env_name_on_a_desktop_writes_nothing_under_the_owners_codex(self):
+        home = self._desktop_hosted()
+        config = json.loads((self.root / "sutando.config.json").read_text())
+        config["core_config_dirs"][0]["env_name"] = "CODEX_CONFIG_DIR"
+        (self.root / "sutando.config.json").write_text(json.dumps(config))
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        result = self.run_launcher(env_extra={"SUTANDO_CODEX_WORKING_DIR": str(self.root)})
+        owner = Path(self.tmp.name) / "home" / ".codex"
+        self.assertFalse(os.path.lexists(owner / "config.toml"), result.stderr)
+        self.assertFalse(os.path.lexists(home.parent))
+        self.assertIn("not a CODEX_HOME", result.stderr)
+
+    def test_an_override_in_the_codex_home_is_kept_and_reported(self):
+        home = self._desktop_hosted()
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "AGENTS.override.md").write_text("owner\n")
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("AGENTS.override.md replaces the host's AGENTS.md", result.stderr)
+        self.assertFalse((home / "AGENTS.md").exists())
+        self.assertEqual((home / "AGENTS.override.md").read_text(), "owner\n")
+
+    def test_a_checkout_outside_a_desktop_host_writes_no_agents_md(self):
+        (Path(self.tmp.name) / "AGENTS.md").write_text("not a host's\n")
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        self.fake_core_pane("codex")
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / "codex-home" / "AGENTS.md").exists())
 
     def test_reconciles_session_crons_before_codex_launch(self):
         workspace = self.root / "workspace"
@@ -3000,6 +3115,28 @@ class CoreWindowRestartTests(unittest.TestCase):
         fake.symlink_to(shutil.which("sleep"))
         self.addCleanup(shutil.rmtree, fake.parent, True)
         self.session_with(("monitor", ["sleep", "300"]), ("gateway-x", [str(fake), "300"]))
+        before = self.panes()
+        result = self.case.run_launcher(env_extra={"SUTANDO_TMUX_SOCKET": self.sock})
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertEqual(self.panes(), before, "a second core must not be created")
+
+    def test_restart_keeps_a_bare_gateway_window_as_a_sibling(self):
+        # Desktop installs name the primary gateway window `gateway`, the secondary `gateway-<lane>`.
+        self.session_with(("core", [str(self.case.bin / "codex"), "-C", "old"]),
+                          ("gateway", ["exec sleep 300"]), ("gateway-s_dspace", ["sleep", "300"]))
+        stale = self.core()
+        siblings = [p for p in self.panes() if p["name"].startswith("gateway")]
+        result = self.case.run_launcher("--restart", env_extra={"SUTANDO_TMUX_SOCKET": self.sock})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for sibling in siblings:
+            self.assertIn(sibling, self.panes(), "a gateway pane did not survive the restart")
+        self.assertNotEqual(self.core()["wid"], stale["wid"])
+
+    def test_a_core_cli_under_the_bare_gateway_name_still_blocks_the_heal(self):
+        fake = Path(tempfile.mkdtemp()) / "claude"
+        fake.symlink_to(shutil.which("sleep"))
+        self.addCleanup(shutil.rmtree, fake.parent, True)
+        self.session_with(("monitor", ["sleep", "300"]), ("gateway", [str(fake), "300"]))
         before = self.panes()
         result = self.case.run_launcher(env_extra={"SUTANDO_TMUX_SOCKET": self.sock})
         self.assertEqual(result.returncode, 3, result.stdout + result.stderr)

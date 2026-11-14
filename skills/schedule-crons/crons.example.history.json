@@ -1,0 +1,86 @@
+[
+  {
+    "name": "main-loop",
+    "sha256": "048d5f477c4b2f9e11fd68b3a074a9cbe37ba2559c147e49dcab3f7a7496f210"
+  },
+  {
+    "name": "morning-briefing",
+    "sha256": "8e812d6261cebfa2f0adf1d3b05572592f6e02990ffe43638f8871bbbd2e65ab"
+  },
+  {
+    "name": "daily-insight",
+    "sha256": "f07fd3c01e09ca525e49d4b25c19c330253f01f9d23d45767fad7f7b75262ea6"
+  },
+  {
+    "name": "pending-questions",
+    "sha256": "691126a728bbf58be70f92ac2b9fa85b8b1c40ee0e933a8171d9026392e3c11f"
+  },
+  {
+    "name": "sync-memory",
+    "sha256": "d7bd0855d003a80f0c5ee9c35984029b5ffd7d03a02494d10587748d480db3e6"
+  },
+  {
+    "name": "cross-node-sync",
+    "sha256": "788d6054d3c2101c8a54ab69fc14871bdf0812388c9831eb1b522a8eb3e65919"
+  },
+  {
+    "name": "sync-memory",
+    "sha256": "2d0d06fec5a39f94f480138a6d8f484813157309a707eabbb1371b59302330e4"
+  },
+  {
+    "name": "sync-memory",
+    "sha256": "fef4853fb38436f4e58bc416c10a816921b42c69cc3745c697b0dbeb51ba15af"
+  },
+  {
+    "name": "morning-briefing",
+    "sha256": "c51587a9ddbec3194a18c2168cda0724c458ca529c40c21fe6b28fc4db384352"
+  },
+  {
+    "name": "learned-skills-scan",
+    "sha256": "dd831d11536e7a810175568888f01d3e419c3a97711b4ad4cffae8f3806d5e2b"
+  },
+  {
+    "name": "obsidian-dream",
+    "sha256": "206c7125a3b3a5b36e6a6bac1b849b177664913ab2af638e111dfabfe23662dd"
+  },
+  {
+    "name": "pending-questions",
+    "sha256": "37c4adc3857ca0fbecb7c7e351f8bd7608b0aa1e91a643c1aad32ab6b6bc962e"
+  },
+  {
+    "name": "sync-memory",
+    "sha256": "9418225c6352d69050ba2425c7566ebc07efb5079f7ad72f0fe696c30bec5c2f"
+  },
+  {
+    "name": "learned-skills-scan",
+    "sha256": "dca2efc3b824dfeccefca827ebed6c9e8650722bbaf9fda88937d2801e35bbdb"
+  },
+  {
+    "name": "sync-workspace",
+    "sha256": "9dd235070a70c8e265ac5e8892a5f3165be69ffaa0f4cbd37599a7e612b6d2d9"
+  },
+  {
+    "name": "agent-landscape-digest",
+    "sha256": "5ef8a40c38bee839a947522f2aef71231c1427fc971e94bb948e437c43abe9e3"
+  },
+  {
+    "name": "morning-briefing",
+    "sha256": "fab6b4fc8fbdb589e3c961ab334b8a89f71693c3cc0245b7c6511e5ac9e73606"
+  },
+  {
+    "name": "example-digest",
+    "sha256": "ff6123367df9196d953954f9b46ccde1e1a2c4bda2496d6a39138055d8b12876"
+  },
+  {
+    "name": "agent-landscape-digest",
+    "sha256": "bac987b43fd3030ab7cbafaaf6e6f0709ea54642ee29c4b8f3ad428587b2b47b"
+  },
+  {
+    "name": "main-loop",
+    "sha256": "c1fec62f1757732ce77e511ca8cf61a83927f30fdea5c110a2f30ba3b04f5d7d"
+  },
+  {
+    "name": "sync-workspace",
+    "sha256": "25f29fe42df775a596a7a0503f9d490abd681dfb26314de2ea205e2e2a5b6f4a"
+  }
+]

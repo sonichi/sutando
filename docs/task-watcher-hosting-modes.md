@@ -88,6 +88,57 @@ Measured on the Pro host on 2026-09-22 (the #4585 witness, live core, no restart
 notifier typing nothing; after the session watcher was killed, the standby was re-armed in 51 s under
 the same supervisor pid; the second handoff took 12 s.
 
+## Opt-in: the session watcher hosted by the task-watch Mod (Claude seats)
+
+A `Monitor` ends at its 30-minute timeout and the session has to re-arm it. On a Claude seat the
+same session watcher can instead be run by a Claude Code Mod, `src/agent/claude/task-watch-mod/`:
+
+- At `session.start` it asks `watcher_rearm.py watch-argv` for the command (the same inbox the Stop
+  hook checks; a worker's `SUTANDO_WATCHER_CMD`), asks `watcher_identity.py role-present session
+  --inbox <inbox>`, and spawns the unchanged `watch-tasks-stream.sh <inbox> --role session --inbox
+  <inbox>` only on `no` or `unknown`. The script keeps priority order, the queue count, the standby
+  hand-off and its own holder check.
+- Each `TASK_FILE: <name>` line, with the `QUEUE:` line that follows it, is submitted with
+  `$.prompt.submit`, so the session gets the text a `Monitor` notification carries. Nothing else is
+  ever submitted: only a plain file name (or an absolute path ending in one) passes, the Mod never
+  reads a task file, and the session still reads the task's headers (`access_tier`, sender, HMAC) from
+  the file itself. While a turn runs, announcements wait and arrive together when it ends.
+- An exit 0 is a hand-off (the inbox is held, or the watcher was told to stop): the Mod polls
+  `role-present` every 30 s and starts again once no session watcher holds the inbox. Any other early
+  exit restarts after 5 s, doubling to 5 min; after 8 in a row it stops and logs, and the Stop hook's
+  unwatched-inbox gate then asks the session for a `Monitor` watcher. Exit 64 (bad arguments) is not
+  retried.
+- The session's end (not `/clear`, not a resume) kills the one child the Mod spawned, nothing else.
+- The launcher sets `SUTANDO_TASK_WATCH_MOD=1` in the session only when it installed the Mod, and
+  sets it empty otherwise. `CLAUDE.md`, `/startup` and `/schedule-crons` skip their `Monitor` step
+  only when `watcher_rearm.py mod-ready` prints `yes`: the marker is `1` AND a ready session watcher
+  holds the inbox (waiting up to 30 s for the Mod's to come up). A Mod that refused (old engine),
+  never loaded or gave up therefore leaves `no`, and the session starts the `Monitor` as before. The
+  compaction/resume hint fires on an unwatched inbox whatever the marker. The launcher gates the
+  version on the same absolute `claude` path the session runs (the one the tmux pane's `PATH`
+  resolves). Codex seats and Claude seats without the Mod keep the `Monitor` path unchanged.
+
+The opt-in is per launcher, off by default: `SUTANDO_TASK_WATCH_MOD_WORKER=1` in the environment of
+a worker spawn, `SUTANDO_TASK_WATCH_MOD_CORE=1` for the core launcher. Either way the launcher installs
+the Mod only when `claude --version` is at least `MIN_CLAUDE_VERSION` in
+`src/agent/claude/task-watch-mod/hooks/version.ts`; below it, it logs one line and the session keeps
+the `Monitor`. The Mod checks the same floor itself.
+
+### How to enable it on one worker
+
+1. Confirm the installed Claude Code passes: `bash scripts/task-watch-mod-witness.sh`. It loads the
+   Mod into a headless `claude -p --input-format stream-json` session on a temp workspace, drops one
+   task whose body carries instructions, and checks that the gate sees a ready session watcher, that a
+   turn starts with exactly `TASK_FILE: <name>`, and that the session's end stops the watcher. Run it
+   again after every Claude Code upgrade, and before raising `MIN_CLAUDE_VERSION`.
+2. Spawn one worker with the flag in the spawner's environment, for example
+   `SUTANDO_TASK_WATCH_MOD_WORKER=1 python3 skills/worker-pool/scripts/spawn_worker.py --workspace <ws>`.
+   Other workers and the core are untouched.
+3. Check the worker: `python3 src/watcher_identity.py role-present session --inbox <ws>/deliveries/<id>
+   --ready <ws>/state` answers `yes`, the watcher's parent is the worker's `claude` process (not a
+   `Monitor` shell), and a test task to that worker starts a turn from "The task-watch plugin".
+4. To go back, spawn the worker again without the flag.
+
 ## What each party may do
 
 - The **session** (the agent) starts its session watcher at boot and re-arms it when the loop finds
@@ -189,3 +240,7 @@ how `tests/watch-tasks-stream-shutdown-leaves-inflight-claim.test.py` interrupts
   CI floor): the readiness window, buffered replay before the sweep, holds and admissions.
 - `tests/watcher-identity.test.py`: the verdicts, their inbox scoping and the ready gate.
 - `tests/start-cli-claude-task-notifier.test.py`: the launcher starts the supervisor for the core.
+- `src/agent/claude/task-watch-mod/tests/task-watch.test.ts` (`claude plugin test`, in CI): the Mod's
+  spawn, announcement, restart, hand-off and session-end rules, and that a task body is never submitted.
+- `tests/task-watch-mod-launch.test.sh`: the launchers' opt-in, version floor and session marker.
+- `scripts/task-watch-mod-witness.sh` (local, needs a logged-in `claude`): the Mod in a real headless session.

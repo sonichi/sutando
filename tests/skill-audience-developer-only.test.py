@@ -196,7 +196,8 @@ class InstallShEndToEnd(unittest.TestCase):
     """skills/install.sh, copied with its helpers into a throwaway repo with fake skills."""
 
     COPIED = ("skills/install.sh", "scripts/sutando-config.sh", "scripts/python-binary.sh",
-              "src/sutando_config.py", "src/skill_audience.py")
+              "src/sutando_config.py", "src/skill_audience.py", "src/agent/codex/codex-home.sh",
+              "src/codex_home.py", "src/codex_host_instructions.py")
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

@@ -99,12 +99,15 @@ SHIM = ("def launchd_exit", "def run_launchd", "signal.signal(sig, forward)")
 OWNED_STEPS = {"adapters/claude_code/hold.py": HOLDER_STEPS + WORDS + SHIM,
                "adapters/claude_code/cli.py": HOLDER_STEPS + WORDS + SHIM,
                "adapters/claude_code/launcher.py": HOLDER_STEPS + SHIM,
-               "adapters/codex/connect_cli.py": HOLDER_STEPS + WORDS + SHIM}
+               "adapters/codex/connect_cli.py": HOLDER_STEPS + WORDS + SHIM,
+               "adapters/openclaw/cli.py": HOLDER_STEPS + WORDS + SHIM}
 LAUNCHER_SIDE = tuple(OWNED_STEPS)
 DELEGATES = {"adapters/claude_code/hold.py": ("cm.hold_and_supervise(", "cm.supervise_child("),
              "adapters/claude_code/cli.py": ("cm.holder_words(", "cm.occupancy_line(", "cm.run_child_argv("),
              "adapters/codex/connect_cli.py": ("cm.hold_and_supervise(", "cm.supervise_child(", "cm.holder_words(",
-                                               "cm.occupancy_line(", "cm.run_launchd(", "cm.run_child_argv(")}
+                                               "cm.occupancy_line(", "cm.run_launchd(", "cm.run_child_argv("),
+             "adapters/openclaw/cli.py": ("cm.hold_and_supervise(", "cm.supervise_child(", "cm.holder_words(",
+                                         "cm.occupancy_line(", "cm.run_launchd(", "cm.run_child_argv(")}
 
 
 def direct_imports(text, steps):
@@ -117,7 +120,7 @@ def direct_imports(text, steps):
 
 # One owner, connect_bridge: the agent bridge's launch env, its unit or declaration, and connect's
 # redemption into the seat. Neither -local adapter builds any of them itself.
-BRIDGE_ADAPTERS = ("claude_code", "codex")
+BRIDGE_ADAPTERS = ("claude_code", "codex", "openclaw")
 BRIDGE_CALLS = {"seat_bridge_environ", "write_bridge_declaration", "remove_bridge_declaration", "render_supervisor",
                 "start_supervisor", "stop_supervisor", "write_seat_credentials", "write_seat", "redeem_code",
                 "read_code", "relay_problem", "code_problem"}
@@ -127,7 +130,9 @@ BRIDGE_DELEGATES = {"adapters/claude_code/cli.py": ("cb.wire_bridge(", "cb.wire_
                                                     "cb.host_problem(", "cb.agent_root("),
                     "adapters/claude_code/shape.py": ("bridge_shape(LOCAL)",),
                     "adapters/codex/connect_cli.py": ("cb.wire_bridge_bound(", "cb.unwire_bridge(", "cb.redeem_into_seat(",
-                                                      "cb.host_problem(", "cb.agent_root(", "cb.bridge_shape(LOCAL)")}
+                                                      "cb.host_problem(", "cb.agent_root(", "cb.bridge_shape(LOCAL)"),
+                    "adapters/openclaw/cli.py": ("cb.wire_bridge_bound(", "cb.unwire_bridge(", "cb.host_problem(",
+                                                 "cb.agent_root(", "cb.bridge_shape(local)")}
 
 
 def bridge_builders(tree):
@@ -162,6 +167,21 @@ class SharedAgentBridge(unittest.TestCase):
         self.assertEqual(sorted(bridge_builders(ast.parse(copy))), [("call", "seat_bridge_environ"),
                                                                     ("call", "start_supervisor"),
                                                                     ("env key", "AGENT_CONNECT_TASK_DIR")])
+
+
+# One owner, held_start: how a connector run --held under a launcher enters the held root and waits to be attached.
+HELD_CONNECTORS = ("adapters/codex/codex_connector.py", "adapters/openclaw/openclaw_connector.py")
+HELD_OWNED = ("os.fchdir(", "holder_consumer(", "start_time(os.getpid())")
+
+
+class SharedHeldStart(unittest.TestCase):
+    def test_both_connectors_delegate_the_held_start_and_keep_no_copy(self):
+        for rel in HELD_CONNECTORS:
+            text = (PKG_ROOT / PKG / rel).read_text(encoding="utf-8")
+            with self.subTest(module=rel):
+                self.assertIn("held_start.enter(args.root_fd, HELD_WAIT_S, holder_consumer)", text)
+                self.assertIn("HELD_WAIT_S = held_start.WAIT_S", text)
+                self.assertEqual([step for step in HELD_OWNED if step in text], [], "a copy of held_start's policy")
 
 
 class BoundaryTest(unittest.TestCase):
