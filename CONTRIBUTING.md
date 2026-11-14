@@ -260,7 +260,7 @@ The goal of this phase is to provide evidence the maintainer can verify quickly.
 
    Note the corollary of the status being SHA-bound: **pushing to the branch after this drops the status again.** If you reopen to fix the CLA and then push a review fix, expect to be back where you started.
 
-   **When to expect it.** `license/cla` is a *commit status*, so it binds to one SHA. **Every push gives the PR a new head SHA that carries no CLA status**, which is what [`.github/workflows/cla-recheck-on-push.yml`](.github/workflows/cla-recheck-on-push.yml) exists to repair — it comments the `@cla-assistant check` trigger on each `synchronize`. That repair is not reliable, so a PR you have pushed to can end up permanently short of a required check.
+   **When to expect it.** `license/cla` is a *commit status*, so it binds to one SHA. **Every push gives the PR a new head SHA that carries no CLA status** until CLA-Assistant handles that push's `synchronize` event. It usually does, but not always, so a PR you have pushed to can end up permanently short of a required check.
 
    **The model the evidence supports: the status is SHA-bound, and the write can fail *after* CLA-Assistant has received and acknowledged the event.** A push guarantees you need a *fresh* delivery, so pushed PRs are over-represented among the missing — but a push is not required for the status to be absent, and **close+reopen is a retry, not a push-specific fix.**
 
@@ -283,7 +283,7 @@ The goal of this phase is to provide evidence the maintainer can verify quickly.
    merge_group, pull_request
    ```
 
-   The distinction matters because "unreliable" invites a retry and "inert" ends it: no number of trigger comments, from a workflow or a human, can produce a status. Use a fresh head or close+reopen instead — `pull_request/reopened` acknowledges at 200, while `closed` returns 204 and is discarded, so the reopen is the half that does the work. (`.github/workflows/cla-recheck-on-push.yml` posts that comment on every `synchronize` and reports success every run; it is tracked separately as an open issue, since removing versus reworking it is a maintainer call.)
+   The distinction matters because "unreliable" invites a retry and "inert" ends it: no number of trigger comments, from a workflow or a human, can produce a status. Use a fresh head or close+reopen instead — `pull_request/reopened` acknowledges at 200, while `closed` returns 204 and is discarded, so the reopen is the half that does the work. A repo admin can also redeliver the PR's latest `synchronize` (or `opened`) delivery from the webhook's delivery log (`POST .../hooks/<id>/deliveries/<delivery-id>/attempts`), which retries without touching the PR. Read delivery ids as strings: they exceed a double's precision, so a JSON tool that parses them as numbers returns ids that 404.
 
    This section previously said only "do not rely on" the comment, which was right about the behaviour and silent about the cause. Of the 99 open non-draft PRs on 2026-08-04, **91 had the status and 8 did not**; all 8 had been pushed since opening, and they span eight days (2026-07-27 to 2026-08-04), so this is not a time window. Read that 8 as a *snapshot of what was still broken*, not as a population of causes: PRs recovered earlier the same day had already left the set, and those are exactly the ones that show `opened`-side failure.
 
