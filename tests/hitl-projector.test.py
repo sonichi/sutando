@@ -1048,6 +1048,43 @@ class RoomMembershipRefusalTests(_RefusalDrive):
         self.assertEqual(self.mgr.store.projection(left.id).get("failed_notice"), left.revision)
         self.assertNotIn(left.id, pending_ids(self.mgr, clock=lambda: time.time() + self.t))
 
+    def _notices(self, payloads):
+        return [p for p in payloads if NOTICE_FIELD in p["extra_content"]]
+
+    def test_a_notice_its_room_refuses_reaches_the_owner_dm(self):
+        left = self.mgr.create(make_req(guard="a", device={"id": "da", "name": "n"}, room="!left:x"))
+        send = _room_refusing("!left:x")
+        raised = [self.drive(send, step=60)[1] for _ in range(30)]
+        self.assertEqual(raised, [None] * 30)
+        self.assertEqual([p["room_id"] for p in self._notices(send.refused)], ["!left:x"])
+        delivered = self._notices(send.ok.sent)
+        self.assertEqual([p["room_id"] for p in delivered], [ROOM], "the owner DM got the notice, once")
+        self.assertEqual(delivered[0]["extra_content"][NOTICE_FIELD]["ids"], [left.id])
+        self.assertEqual(self.mgr.store.projection(left.id).get("failed_notice"), left.revision)
+
+    def test_a_notice_the_owner_dm_also_refuses_is_bounded(self):
+        left = self.mgr.create(make_req(guard="a", device={"id": "da", "name": "n"}, room="!left:x"))
+        dm = _room_refusing(ROOM)
+        send = _room_refusing("!left:x", ok=dm)
+        raised = [self.drive(send, step=60)[1] for _ in range(30)]
+        self.assertEqual(raised, [None] * 30, "two refusing rooms are not the relay's failure")
+        self.assertEqual([p["room_id"] for p in self._notices(send.refused + dm.refused)], ["!left:x", ROOM],
+                         "one try in the card's room, one in the DM, then nothing")
+        self.assertEqual(self._notices(dm.ok.sent), [])
+        self.assertEqual(self.mgr.store.projection(left.id).get("failed_notice"), left.revision)
+        self.assertNotIn(left.id, pending_ids(self.mgr, clock=lambda: time.time() + self.t))
+
+    def test_a_card_in_the_owner_dm_is_not_sent_its_notice_twice(self):
+        for room in (ROOM, None):
+            with self.subTest(room=room):
+                req = self.mgr.create(make_req(guard=f"dm{room}", device={"id": "dd", "name": "n"}, room=room))
+                send = _room_refusing(ROOM)
+                raised = [self.drive(send, step=60)[1] for _ in range(30)]
+                self.assertEqual(raised, [None] * 30)
+                self.assertEqual(len(self._notices(send.refused)), 1, "the DM is the card's room: one try")
+                self.assertEqual(self._notices(send.ok.sent), [])
+                self.assertEqual(self.mgr.store.projection(req.id).get("failed_notice"), req.revision)
+
     def test_any_other_403_still_reaches_the_caller_and_charges_nothing(self):
         req = self.card("a")
         for body in ("", "<html>edge</html>", '{"error": "token expired"}',

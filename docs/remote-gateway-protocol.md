@@ -908,7 +908,8 @@ so:
   pass goes on to the cards behind it with no bridge backoff, the card waits out its own
   backoff, and after `ROOM_REFUSAL_ATTEMPTS` sends that revision is marked failed (logged,
   and kept live where health-check sees it). Its failure notice, refused by the same room, is
-  recorded as sent and not repeated. Any other 403 still raises to the caller's backoff.
+  sent once to the owner DM instead; if the DM refuses it too, it is recorded as sent and not
+  repeated. Any other 403 still raises to the caller's backoff.
 - **A message about a task** is named `proactive-about-<task id>--<ts>.txt`
   (`proactive_routing.about_task_filename`). In the task's own room it posts in the task's
   thread: an ask already in a thread keeps that thread's root, a top-level ask is rooted at
