@@ -56,7 +56,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 
 <!-- refactor(), perf(), docs() changes visible to operators go here -->
 - macOS notifications are off by default. Sutando posts no macOS desktop notification (pending questions, bridge restarts, health checks, the agent shepherd, voice offline/online, context drop, screen recording) unless `sutando.config.local.json` sets `"notifications": {"macos": true}`. The same alerts still reach the owner's DM or the core's task queue. There is no exception: the gateway bridge's no-workspace alert, which has no DM to fall back on, is silent too unless you opt in. Windows and Linux notifications are unchanged.
-- worker-pool: pool workers now run their task watcher in the task-watch Mod by default instead of a `Monitor` that must be re-armed every 30 minutes. A worker whose Claude Code is below the Mod's floor keeps the `Monitor`, and `SUTANDO_TASK_WATCH_MOD_WORKER=0` in the spawner's environment opts a worker out. The core is unchanged (still opt-in with `SUTANDO_TASK_WATCH_MOD_CORE=1`).
+- worker-pool: pool workers now run their task watcher in the task-watch Mod by default instead of a `Monitor` that must be re-armed every 30 minutes. A worker whose Claude Code is below the Mod's floor keeps the `Monitor`, and `SUTANDO_TASK_WATCH_MOD_WORKER=0` in the spawner's environment opts a worker out. The core is unchanged (still opt-in with `SUTANDO_TASK_WATCH_MOD_CORE=1`). ([#6450])
 
 ## Security
 
