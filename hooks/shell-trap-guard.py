@@ -77,7 +77,6 @@ PREFIX_WORDS = {"sudo", "command", "exec", "nohup", "time", "builtin", "then", "
 PIPE_OPS = {"|"}
 ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 REDIRECT_RE = re.compile(r"^[0-9]*(?:<<<|<<|<>|<&|<|>>|>\||>&|>)")
-HEREDOC_RE = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 CMD_SUBST_ASSIGN_RE = re.compile(
     r"(?:^|[\s;&|(])(?:local\s+|export\s+|typeset\s+|declare\s+|readonly\s+)?"
     r"([A-Za-z_][A-Za-z0-9_]*)=(?:\$\(|`)")
@@ -204,15 +203,7 @@ def user_shell_path(argv=()):
 
 def strip_heredocs(cmd):
     """Drop heredoc bodies: they are data on stdin, not commands."""
-    out, pending = [], []
-    for line in cmd.split("\n"):
-        if pending:
-            if line.strip() == pending[0]:
-                pending.pop(0)
-            continue
-        out.append(line)
-        pending.extend(m.group(2) for m in HEREDOC_RE.finditer(line))
-    return "\n".join(out)
+    return _shell_scan.heredocs(cmd)[0]
 
 
 def pipelines(cmd):

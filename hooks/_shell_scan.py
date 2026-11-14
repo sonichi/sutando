@@ -14,6 +14,7 @@ and whether we are at a word start. `bash` is the oracle the tests compare to.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from typing import List
 
@@ -291,3 +292,23 @@ def segments(command: str) -> List[List[Word]]:
             continue
         out[-1].append(w)
     return [seg for seg in out if seg]
+
+
+HEREDOC_RE = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def heredocs(command: str):
+    """(command without heredoc bodies, [(opener line, body), ...]); a body is data, not commands."""
+    out, docs, pending = [], [], []
+    for line in command.split("\n"):
+        if pending:
+            tag, opener, buf = pending[0]
+            if line.strip() == tag:
+                docs.append((opener, "\n".join(buf)))
+                pending.pop(0)
+            else:
+                buf.append(line)
+            continue
+        out.append(line)
+        pending.extend((m.group(2), line, []) for m in HEREDOC_RE.finditer(line))
+    return "\n".join(out), docs
