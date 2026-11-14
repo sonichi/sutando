@@ -194,3 +194,32 @@ a consequence of this freeze.
 No file-format changes, no new fields written, no migration, no daemon-contract
 changes. Enforcement tests (a ratchet suite failing on R1/R3 violations in new
 code) are slice 2's opening move, not part of the freeze itself.
+
+
+## Canonical constructors (B slice 2)
+
+`ag2_sparrow.identity` exposes typed task, delivery, attempt, idempotency and
+incarnation values, pure constructors, parsers, record embedding and legacy
+artifact adapters. Committed vectors pin the serialized contract. The legacy
+provider-key adapter retains the shipped opaque `<item_id>#<epoch>` bytes,
+including empty and long item ids. The delivery core validates that domain
+before claiming, then derives the actual key from the claimed item's current
+resend epoch. Current backends advance that epoch on operator requeue or payload
+replacement; this preserves current delivery behavior rather than imposing the
+historical same-key park/requeue description above.
+
+The source ratchet inventories syntactic task-prefix constructions and delivery
+identity references by file and function. Its baseline includes existing
+provider-derived ingress, path normalization and fixture constructions, not just
+clock mints. A new site fails, and a removed site requires lowering its pin.
+Delivery certification is conservative across exception bindings and loop-carried
+assignments: a value established before a loop is not enough if a previous
+iteration may replace it. A canonical assignment before the use in each iteration
+is accepted. This is a bounded static check, not a general Python proof.
+
+Legacy readable components are at most 80 encoded units. Longer components use
+a whole-character prefix plus a separator and 16 hex digest units; Unicode
+prefixes can be shorter than 78 units (100 copies of 界 or 💥 produce an 89-unit
+component). Digest forms remain longer than 80, keeping the encodings disjoint.
+The package supplies APIs without migrating bridge schemas or replacing the
+existing ingress owner in this slice.
