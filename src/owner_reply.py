@@ -72,7 +72,14 @@ def owner_dm(workspace: Optional[Path]) -> str:
         from owner_room_access import owner_dm as dm, owner_routing
         return dm(owner_routing(_ws(workspace)))
     except Exception:
+        pass
+    # A launcher copy without the connections record reads the unsuffixed routing file.
+    try:
+        import json
+        routing = json.loads((_ws(workspace) / "state" / "owner-routing.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         return ""
+    return str(routing.get("owner_dm") or "").strip() if isinstance(routing, dict) else ""
 
 
 def _belongs(quoted: Optional[dict], channel: str, dm: str, notices: Iterable[str]) -> bool:

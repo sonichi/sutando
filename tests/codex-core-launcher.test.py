@@ -133,10 +133,6 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/runtime_compat.py",
             "src/auth_preflight.py",
             "src/owner_reply.py",
-            # owner_reply reads the owner's DM through owner_room_access.
-            "src/owner_room_access.py",
-            "src/connections.py",
-            "src/workspace_lock.py",
             "src/local_record.py",
             "src/policy/__init__.py",
             "src/policy/egress/__init__.py",
@@ -904,7 +900,8 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
     def test_a_real_codex_with_the_refused_missing_home_stops_the_launch_writing_nothing(self):
         """Real Codex 0.164 exits 1 from `login status` when CODEX_HOME does not exist."""
         home = self._owner_linked_to_missing_app_home()
-        self._write_exe("codex", '#!/bin/bash\n[ -d "${CODEX_HOME:-}" ] || exit 1\nexit 0\n')
+        self._write_exe("codex", CODEX_STUB.replace(
+            "esac\nexit 0", '  login) [ -d "${CODEX_HOME:-}" ] || exit 1 ;;\nesac\nexit 0'))
         result = self.run_launcher(env_extra={"SUTANDO_CODEX_WORKING_DIR": str(self.root)})
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("not authenticated", result.stderr)
