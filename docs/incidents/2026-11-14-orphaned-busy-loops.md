@@ -1,7 +1,7 @@
 # Incident: orphaned CPU busy-loops starve the credential proxy and stall the core (2026-11-14)
 
-**Status:** core reachable again; task delivery still recovering when this was written (07:56 PST)
-**Duration of full delivery outage:** 06:59 PST (last delivered result) → not yet resumed at 07:56 PST
+**Status:** recovering as of 08:59 PST. Results are being delivered again (11 between 08:40 and 08:56) and load is ~18, but the proxy still shows upstream idle timeouts.
+**Full delivery outage:** 06:59 → 07:57 PST. Delivery was then intermittent until 08:54 PST.
 **Host:** one 14-core macOS host running the live core, ~10 pool workers and the credential proxy
 
 ## Summary
@@ -24,15 +24,26 @@ stalled because the launchd wrapper's `lsof` port check hung under the load.
 The failure fed itself. The loops caused the proxy outage, and the outage
 also stopped the worker that spawned the loops from ever cleaning them up.
 
+Killing the loops brought the core back at 07:48, but only partly. At 08:26
+load climbed back to 273. A second leak turned up: 8–9 `zsh` shells that a
+review session had left running for **20 hours** in a flaky-test rerun loop,
+each using 22–45% CPU. On top of that, one Sutando `task-notifier.sh` was
+spinning at ~67%, and Chrome, the iOS Simulator, Docker and Dropbox were all
+busy. The core went back to `502`/`408` retries until that load was cleared.
+By 08:59 the leaked shells were gone, the Simulator and Docker had been quit,
+and load was ~18.
+
 ## Impact
 
-- **No results delivered after 06:59:37 PST.** Six owner and s.space tasks
-  queued without replies. Before the incident the core was delivering 8–14
-  results an hour overnight.
+- **No results delivered from 06:59:37 to 07:57 PST.** Delivery then trickled:
+  5 results between 07:57 and 08:40, against 8–14 an hour overnight. It
+  recovered at 08:54, with 11 results by 08:56. Up to 8 owner and s.space
+  tasks were queued without replies at the worst point.
 - **The live core** (same session, so conversation history is intact) could
-  not reach the API from ~07:30 until 07:47. After that it was very slow:
-  it had to reread a multi-day session after an earlier `/login` to a
-  different organization, and the host was still recovering from the load.
+  not reach the API from ~07:30 until 07:47. From 08:23 to ~08:40 it failed
+  again with `502`/`408` retries. In between it was very slow: it had to
+  reread a multi-day session after an earlier `/login` to a different
+  organization, and the host never got far below ~100 load.
 - **Pool workers** sharing the proxy failed with the same errors. That
   includes the worker that started the loops.
 - **The whole host** became unusable for other work (load > 20× core count).
@@ -54,7 +65,13 @@ also stopped the worker that spawned the loops from ever cleaning them up.
 | 07:44 | Owner kills the loops with an escaped pattern: `pkill -f 'node -e for\(;;\)\{\}'`. |
 | 07:45–07:47 | Proxy kickstarted again; the wrapper's two `lsof` calls hang again and are killed; proxy listens at 07:47:41 and loads the token from the Keychain. |
 | 07:48 | Core API calls succeed (`unified-status: allowed`, 23% of 7-day limit); its task watcher re-arms. |
-| 07:56 | Load 104 and falling. Core is working but slow; no result delivered yet. |
+| 07:57 | First results delivered since 06:59 (3). Load ~104. |
+| 08:18 | One more result. Core working but slow. |
+| 08:23 | Core shows `API error · Retrying` again. Proxy logs Keychain pass-through, `write EPIPE`, `read ECONNRESET`. |
+| 08:25 | An empty probe through the proxy gets no answer in 30 s, while the API answers directly in 0.1 s. `taskpolicy -B` lifts background throttling on the proxy pid; probes still time out. |
+| 08:26 | Load back at 273; the proxy is runnable but gets ~0% CPU. Found 8 orphaned `zsh` shells (ppid 1, 20 h old) from a review session's flaky-test rerun loop at 22–45% CPU each, plus `task-notifier.sh` spinning at ~67%. Chrome (41 runnable), a WebKit page, the Dropbox GPU helper, the iOS Simulator and the Docker VM make up the rest. |
+| 08:28–08:40 | Load 110–180. Core alternates between `408`/`502` retries and progress. A probe takes 18 s to return a 401. One result at 08:29, four at 08:40. |
+| by 08:59 | Leaked shells gone, iOS Simulator and Docker quit. Load ~18. 11 results delivered 08:54–08:56. Chrome and Dropbox still running; the proxy still logs upstream idle timeouts and an empty probe still timed out. |
 
 ## Root cause
 
@@ -80,6 +97,17 @@ returned the same false "0 left" as the cleanup itself. The loops had no
 time bound and ran at normal priority, so nothing else would ever have
 stopped them.
 
+### A second leak of the same kind
+
+The relapse at 08:26 came from a separate leak. A review session (Claude
+session `fca351ae…`, working in a `wt-4209-main` worktree scratchpad
+`rev532`) had started a loop that kept rerunning a flaky test. That session
+ended about 20 hours earlier without stopping it. Its 8–9 `zsh` shells
+were reparented to launchd and used ~3.5 cores in total for the whole time.
+Nothing noticed until the host was already saturated. It was a different
+agent with a different command, but the failure was the same: background
+work an agent started outlived the agent, and nothing reaps such orphans.
+
 ## Contributing factors
 
 1. **The host was already overloaded** before the loops started: Chrome
@@ -101,7 +129,9 @@ stopped them.
    and workers report problems by running agent turns, which need the proxy.
    No out-of-band check notified the owner that load was > 20× core count or
    that the proxy was down.
-4. **The core session is large and was switched to another organization
+4. **A Sutando `task-notifier.sh` was spinning** at ~67% CPU (it had been
+   running for nearly 3 days). That is a known bug with a fix open in #6141.
+5. **The core session is large and was switched to another organization
    mid-session.** That slows recovery: once the API returns, the core first has
    to reread the session without its cached thinking.
 
@@ -119,6 +149,14 @@ stopped them.
 4. Confirmed the proxy was listening and had loaded the Keychain token, and
    that the core's next request succeeded and its task watcher re-armed. The
    core session was **not** restarted, so its conversation history is intact.
+5. When the core relapsed (08:23), tried lifting the proxy's background
+   throttling in place with `taskpolicy -B -p <pid>`. It did not help: the
+   proxy was starved by total load, not just by its priority class.
+6. Found the second leak (the 20-hour-old `rev532` rerun shells) and the
+   remaining heavy apps, and asked the owner to clear them. A precise
+   `pkill -f 'scratchpad/rev532'` was checked beforehand to match only those
+   shells. By 08:59 the shells were gone and the iOS Simulator and Docker had
+   been quit. Load fell to ~18 and delivery resumed.
 
 ## How to avoid a repeat
 
@@ -183,7 +221,21 @@ It should send a macOS notification and write a pending-question entry when:
   that were started from an agent scratchpad or worktree; or
 - `localhost:7846` refuses connections for more than 2 minutes.
 
-### 6. Keep the core session recoverable
+### 6. Reap agent orphans
+
+Two unrelated sessions leaked processes on the same day. Per-agent discipline
+(items 1–2) won't be enough on its own. Add a reaper to the health check: list
+processes with ppid 1 whose command line names an agent scratchpad, worktree
+or `claude-*` temp path. Report any that have run longer than their owning
+session, or longer than an hour, with their CPU use. Kill them automatically
+only after an owner opt-in. Until then, notify the owner with the exact PIDs.
+
+### 7. Land the notifier spin fix
+
+Merge #6141, so a closed events pipe can't leave `task-notifier.sh` spinning
+indefinitely.
+
+### 8. Keep the core session recoverable
 
 Avoid `/login` to a different organization inside the live core. Rotate the
 core into a fresh session before it reaches multi-day size, so recovering
