@@ -4,7 +4,10 @@
 Covers src/lane_dedupe.py and the gateway bridge's delegation to it:
   1. the same event on two lanes queues one task; the second lane answers its own
      task id with the redelivery control result, so the broker settles it;
-  2. the same lane seeing the message again keeps today's behaviour;
+  2. the same lane seeing the message again: a redelivery or later run of the queued task is
+     unchanged; a second broker task with the latest content is settled while the first is still
+     held (queued, archived or answered) and queued once it is lost or its write failed; any edit,
+     including one back to earlier text, is queued; two copies in one served round queue one task;
   3. a task without source_message_id is never deduped; a hook or Summon task dedupes on its own fire
      or Summon identity, never on a message id;
   4. claims expire after the TTL;
@@ -112,9 +115,111 @@ def main():
     again = on_lane("", "task-A1", source_message_id="$ev1", **room)
     check("a same-lane redelivery of the queued task is unchanged",
           again is not None and again[0] == "task-A1" and not (rgb.RESULTS_DIR / "task-A1.txt").exists())
+    logs.clear()
     other = on_lane("", "task-A2", source_message_id="$ev1", **room)
-    check("the same lane is never deduped against itself",
-          other == ("task-A2", True) and (rgb.TASKS_DIR / "task-A2.txt").exists())
+    check("a second broker task for the same message and content on one lane is settled, not queued",
+          other == ("task-A2", True) and not (rgb.TASKS_DIR / "task-A2.txt").exists()
+          and (rgb.RESULTS_DIR / "task-A2.txt").read_text() == rgb.GATEWAY_REDELIVERY_RESULT, repr(other))
+    check("its log line names the task already holding it",
+          any("already queued as task-A1" in m for m in logs), repr(logs))
+    edited = on_lane("", "task-A3", source_message_id="$ev1", task="hello, edited", **room)
+    check("an edit of the same message (new content) on the same lane is queued",
+          edited == ("task-A3", True) and (rgb.TASKS_DIR / "task-A3.txt").exists(), repr(edited))
+    # 2b. Fold only while the first copy is still held here; otherwise the copy is the answer.
+    on_lane("", "task-L1", source_message_id="$lost", task="lost", **room)
+    (rgb.TASKS_DIR / "task-L1.txt").unlink()
+    lost = on_lane("", "task-L2", source_message_id="$lost", task="lost", **room)
+    check("a copy whose first task is gone (not queued, archived or answered) is queued",
+          lost == ("task-L2", True) and (rgb.TASKS_DIR / "task-L2.txt").exists(), repr(lost))
+    real_stage = rgb._stage_durable
+    rgb._stage_durable = lambda path, text: None
+    try:
+        failed = on_lane("", "task-F7", source_message_id="$fail", task="fail", **room)
+    finally:
+        rgb._stage_durable = real_stage
+    retry = on_lane("", "task-F8", source_message_id="$fail", task="fail", **room)
+    check("a copy after the first task's write failed is queued",
+          failed is None and retry == ("task-F8", True) and (rgb.TASKS_DIR / "task-F8.txt").exists(),
+          repr((failed, retry)))
+    for tid, body in (("task-E1", "Set it to Monday"), ("task-E2", "Set it to Tuesday"),
+                      ("task-E3", "Set it to Monday")):
+        on_lane("", tid, source_message_id="$edit", task=body, **room)
+    check("an edit back to earlier text (A, B, A) is queued each time",
+          all((rgb.TASKS_DIR / f"{t}.txt").exists() for t in ("task-E1", "task-E2", "task-E3")))
+    on_lane("", "task-V1", source_message_id="$arch", task="arch", **room)
+    (rgb.TASKS_DIR / "archive").mkdir(exist_ok=True)
+    (rgb.TASKS_DIR / "task-V1.txt").rename(rgb.TASKS_DIR / "archive" / "task-V1.txt")
+    on_lane("", "task-V2", source_message_id="$arch", task="arch", **room)
+    on_lane("", "task-W1", source_message_id="$ans", task="ans", **room)
+    (rgb.TASKS_DIR / "task-W1.txt").unlink()
+    (rgb.RESULTS_DIR / "task-W1.txt").write_text("the answer\n")
+    on_lane("", "task-W2", source_message_id="$ans", task="ans", **room)
+    check("a copy of an archived or answered first task is still settled",
+          not (rgb.TASKS_DIR / "task-V2.txt").exists() and not (rgb.TASKS_DIR / "task-W2.txt").exists()
+          and (rgb.RESULTS_DIR / "task-V2.txt").read_text() == rgb.GATEWAY_REDELIVERY_RESULT)
+    # 2c. An ack_first entry holds only while it is live: staged file present, not refused, not ending.
+    def staged_then(n, change):
+        first, copy = f"task-H{n}a", f"task-H{n}b"
+        on_lane("", first, hold=True, source_message_id=f"$held{n}", task="held", **room)
+        entry = (rgb._load_held() or {}).get(first)
+        if entry is not None:
+            change(first, entry)
+        on_lane("", copy, source_message_id=f"$held{n}", task="held", **room)
+        return entry is not None, (rgb.TASKS_DIR / f"{copy}.txt").exists()
+    live = staged_then(1, lambda tid, e: None)
+    check("a copy of a live staged ack_first task is settled", live == (True, False), repr(live))
+    refused = staged_then(2, lambda tid, e: rgb._put_held(tid, {**e, "refused": True}))
+    check("a copy of a refused ack_first entry is queued", refused == (True, True), repr(refused))
+    ending = staged_then(3, lambda tid, e: rgb._put_held(tid, {**e, "ending": True}))
+    check("a copy of an ending ack_first entry is queued", ending == (True, True), repr(ending))
+    gone = staged_then(4, lambda tid, e: (rgb._held_dir() / e["staged"]).unlink())
+    check("a copy of an ack_first entry whose staged file is gone is queued", gone == (True, True), repr(gone))
+    acks, real_post = [], rgb._post_task_ack
+    rgb._post_task_ack = lambda tid, durable, lease, dropped=None: acks.append(tid) or True
+    try:
+        pair = [{"id": f"task-Z{n}", "task": "same moment", "source_message_id": "$moment", **room}
+                for n in (1, 2)]
+        rgb._take_served_round(pair, set(), [], {rgb._served_key(t): None for t in pair}, [])
+    finally:
+        rgb._post_task_ack = real_post
+    check("two copies served in one round queue one task and ack both",
+          (rgb.TASKS_DIR / "task-Z1.txt").exists() and not (rgb.TASKS_DIR / "task-Z2.txt").exists()
+          and sorted(acks) == ["task-Z1", "task-Z2"], repr(acks))
+    same = lane_dedupe.duplicate_reason
+    sd = tmp / "same-lane"
+    base = {"id": "task-R1", "task": "hi", "source_message_id": "$r1", **room}
+    same(sd, base, "")
+    check("a later run of the same broker task is not its own duplicate",
+          same(sd, {**base, "id": "task-R1~~2"}, "") is None)
+    check("a card click or picker press on one message is never folded by content",
+          same(sd, {**base, "id": "task-R2", "hitl_click": "true"}, "") is None
+          and same(sd, {**base, "id": "task-R3", "picker_command": "add"}, "") is None
+          and same(sd, {**base, "id": "task-R4", "event_type": "room.joined"}, "") is None)
+    check("the same content in another room is a different message",
+          same(sd, {**base, "id": "task-R5", "channel_id": "!other:x", "source_room_id": "!other:x"}, "") is None)
+    check("a copy under another broker task id is",
+          (same(sd, {**base, "id": "task-R7"}, "") or "").startswith("lane dedupe:"))
+    check("but not once the holder is no longer held",
+          same(sd, {**base, "id": "task-R7b"}, "", held=lambda tid: False) is None)
+    check("a holder check that raises delivers the copy",
+          same(sd, {**base, "id": "task-R7c"}, "", held=lambda tid: 1 / 0) is None)
+    check("a different interaction type is not a copy",
+          same(sd, {**base, "id": "task-R6", "interaction_type": "reaction"}, "") is None)
+    check("a context task is never folded by content",
+          same(sd, {**base, "id": "task-R8", "hook": {"fire_id": "f9"}}, "") is None
+          and same(sd, {**base, "id": "task-R9", "hook": {"fire_id": "f9"}}, "") is None)
+    broken = tmp / "broken-content"
+    broken.write_text("x")
+    cw = []
+    check("an unusable store delivers the copy",
+          lane_dedupe.content_copy_of(broken / "s", "e", "", "", "c", "task-1", log=cw.append) is None
+          and lane_dedupe.content_copy_of(broken / "s", "e", "", "", "c", "task-2", log=cw.append) is None
+          and len(cw) == 1, repr(cw))
+    old = tmp / "content-ttl"
+    lane_dedupe.content_copy_of(old, "e", "", "", "c", "task-1", now=1000.0, ttl=60)
+    check("a content claim expires after the TTL",
+          lane_dedupe.content_copy_of(old, "e", "", "", "c", "task-2", now=1059.0, ttl=60) == "task-1"
+          and lane_dedupe.content_copy_of(old, "e", "", "", "c", "task-3", now=1061.0, ttl=60) is None)
 
     # 3. No message id, or a hook task: never deduped.
     on_lane("", "task-N1", **room)

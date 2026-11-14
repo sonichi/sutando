@@ -6335,15 +6335,7 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         return tid, _repair_pending_task(tid, task)
     # Relay redelivery of already-handled work: on reconnect the gateway replays
     # its unacked pool, including tasks this node long since processed (the
-    _task_archive = TASKS_DIR / "archive"
-    task_archived = (
-        # legacy flat layout: tasks/archive/<taskId>.txt
-        (_task_archive / f"{tid}.txt").exists()
-        # active month-partitioned layout: tasks/archive/YYYY-MM/<taskId>.txt
-        # (see src/task-bridge.ts). Glob one level of month subdirs for this
-        or next(_task_archive.glob(f"*/{tid}.txt"), None) is not None
-    )
-    if not woken and (task_archived or _delivered_copy_exists(tid)):
+    if not woken and (_task_archived(tid) or _delivered_copy_exists(tid)):
         durable = _settle_as_handled(tid)
         _log(f"dedup: {tid} already handled — not re-queued")
         return tid, durable
@@ -6551,6 +6543,25 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
     _mark_published(tid)
     _on_published(tid, dest, task_text, task, sender_tier)
     return tid, True
+
+
+def _task_archived(tid: str) -> bool:
+    """Flat `tasks/archive/<tid>.txt` or month-partitioned `tasks/archive/YYYY-MM/<tid>.txt`."""
+    archive = TASKS_DIR / "archive"
+    return (archive / f"{tid}.txt").exists() or next(archive.glob(f"*/{tid}.txt"), None) is not None
+
+
+def _staged_live(tid: str) -> bool:
+    """An `ack_first` entry that will still run: its staged file exists and it is neither refused nor ending."""
+    entry = (_load_held() or {}).get(tid)
+    return (_held_entry_ok(tid, entry) and entry.get("refused") is not True
+            and entry.get("ending") is not True and (_held_dir() / entry["staged"]).exists())
+
+
+def _task_held(tid: str) -> bool:
+    """Is this local task still held here: queued, claimed, staged, archived or answered?"""
+    return (_task_pending(tid) or _staged_live(tid) or _task_archived(tid)
+            or (RESULTS_DIR / f"{tid}.txt").exists() or _delivered_copy_exists(tid))
 
 
 def _serve_attempt(broker_tid: str, first: str, task: dict, hold: bool) -> "tuple[str, str | None, bool] | None":
