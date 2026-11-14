@@ -825,6 +825,26 @@ def _forget_review_room() -> None:
         _atomic_private_json(_WITHHELD_DM_CACHE, {**cached, "private": False})
 
 
+def _reroute_refused_review(artifact: Path, verdict, refused: int):
+    """After the review room refused the agent ROOM_REFUSAL_ATTEMPTS times, send the same review once
+    to a new private room. -> the verdict to settle on, or None to leave the result for the next pass."""
+    _forget_review_room()
+    try:
+        if _route_withheld_review(artifact):
+            _log(f"withheld review {artifact.stem}: the review room refused the agent {refused} times "
+                 "(HTTP 403, not in the room); sent to a new private review room")
+            return verdict
+        return None
+    except urllib.error.HTTPError as exc:
+        if not room_refused_sender(exc):
+            return None
+    _log(f"withheld review {artifact.stem}: DROPPED, not delivered to the owner: the review room and a new "
+         f"one both refused the agent (HTTP 403, not in the room); the record stays at {artifact}")
+    return verdict._replace(reason=(
+        f"{verdict.reason}; owner review {artifact.stem} dropped: every private review room refused "
+        f"the agent; the record stays at {artifact}"))
+
+
 def _review_messages(record: dict) -> list[str]:
     rid = str(record.get("review_id") or "")
     context = record.get("context") or {}
@@ -1797,12 +1817,9 @@ def _guarded_result_body(tid: str, body: str):
                 return None, (f"{verdict.reason}; private review room refused the agent "
                               f"(send {refused}/{ROOM_REFUSAL_ATTEMPTS})")
             _REVIEW_ROOM_REFUSALS.pop(artifact.stem, None)
-            _forget_review_room()
-            verdict = verdict._replace(reason=(
-                f"{verdict.reason}; the private review room refused the agent (HTTP 403, not in the "
-                f"room), review {artifact.stem} kept unsent"))
-            _log(f"withheld review {artifact.stem}: the private review room refused the agent "
-                 f"{refused} times (HTTP 403, not in the room); not retried, the review record is kept")
+            verdict = _reroute_refused_review(artifact, verdict, refused)
+            if verdict is None:
+                return None, "private owner review failed in its new room; retried on the next pass"
         except Exception as exc:  # noqa: BLE001 — retain result file for retry
             return None, f"{verdict.reason}; private owner review failed: {diagnostics.describe(exc)}"
     result = (verdict.body, verdict.reason)

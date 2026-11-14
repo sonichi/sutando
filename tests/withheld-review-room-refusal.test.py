@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """A private review DM whose room refuses the agent (HTTP 403 "sender is not in this room")
-gets send_failure_policy.ROOM_REFUSAL_ATTEMPTS spaced sends, then the withheld result is settled
-instead of re-sent on every 1 s scan, and the next withheld result reaches the owner through a
-fresh private room (#5054)."""
+gets send_failure_policy.ROOM_REFUSAL_ATTEMPTS spaced sends, then is sent once to a new private room
+and the result is settled instead of re-sent on every 1 s scan; if that room refuses too, the
+review is reported as dropped (#5054)."""
 import io
 import json
 import pathlib
@@ -66,17 +66,30 @@ with tempfile.TemporaryDirectory() as td:
     m._STATE.mkdir(parents=True)
     m._WITHHELD_DM_CACHE.write_text(json.dumps({"owner": OWNER, "room_id": LEFT, "private": True}))
 
-    sent, refusal = [], [NOT_IN_ROOM]
+
+    sent, refusal, refusing = [], [NOT_IN_ROOM], {LEFT}
+    created = [FRESH]
 
     def fake_req(method, path, payload=None, timeout=35):
         if path == "/v1/room" and payload.get("op") == "create":
-            return {"ok": True, "room_id": FRESH}
+            return {"ok": True, "room_id": created[0]}
         if path == "/v1/room" and payload.get("op") == "message":
             sent.append(payload["room_id"])
-            if payload["room_id"] == LEFT:
+            if payload["room_id"] in refusing:
                 raise forbidden(refusal[0])
             return {"ok": True, "event_id": f"$e{len(sent)}"}
         raise AssertionError((method, path, payload))
+
+    def scan_for_a_minute(tid):
+        clock, got = [1000.0], []
+        with mock.patch.object(m.time, "monotonic", lambda: clock[0]):
+            for _ in range(60):  # one scan a second, as the result drain does
+                got.append(m._guarded_result_body(tid, BODY))
+                clock[0] += 1.0
+        return got
+
+    def record_of(tid):
+        return json.loads(m.team_result_guard.withheld_review_artifact(m._STATE, tid, BODY).read_text())
 
     m._req = fake_req
     try:
@@ -94,38 +107,49 @@ with tempfile.TemporaryDirectory() as td:
             check(json.loads(m._WITHHELD_DM_CACHE.read_text()).get("room_id") == LEFT,
                   "and the private review room stays cached")
 
-        # --- the room refuses the sender: a bounded, spaced set of sends, then settled
+        # --- the room refuses the sender: bounded sends, then THIS review goes to a new room
         sent.clear()
         refusal[0] = NOT_IN_ROOM
-        write_task(tasks, "task-refused")
         cap = m.ROOM_REFUSAL_ATTEMPTS if hasattr(m, "ROOM_REFUSAL_ATTEMPTS") else 5
-        clock = [1000.0]
-        got = []
-        with mock.patch.object(m.time, "monotonic", lambda: clock[0]):
-            for _ in range(60):  # one scan a second for a minute, as the result drain does
-                got.append(m._guarded_result_body("task-refused", BODY))
-                clock[0] += 1.0
+        write_task(tasks, "task-refused")
+        got = scan_for_a_minute("task-refused")
         check(sent.count(LEFT) == cap, f"the refused review DM is sent {cap} times in 60 scans "
                                        f"(sent {sent.count(LEFT)})")
+        check(sent.count(FRESH) == 2, "then the same review is sent once, to a new private room "
+                                      f"(its 2 parts; sent {sent.count(FRESH)})")
         settled = [g for g in got if g[0] is not None]
         check(bool(settled) and all(g == settled[0] for g in settled) and got[-1] == settled[0],
               "once settled, every later scan gets the same verdict")
-        body, reason = settled[0] if settled else (None, None)
-        check(body == "[no-send]", "the withheld result is still suppressed from the shared room")
-        check("refused" in (reason or "") and "not in" in (reason or ""),
-              "the reason names the room's refusal")
-        record = json.loads(m.team_result_guard.withheld_review_artifact(
-            m._STATE, "task-refused", BODY).read_text())
-        check(record.get("status") == "pending_dm", "the review record is kept for the owner")
-        check(json.loads(m._WITHHELD_DM_CACHE.read_text()).get("private") is not True,
-              "the refusing room is no longer trusted as the private review room")
+        check((settled[0][0] if settled else None) == "[no-send]",
+              "the withheld result is still suppressed from the shared room")
+        record = record_of("task-refused")
+        check((record.get("status"), record.get("dm_room_id")) == ("awaiting_owner", FRESH),
+              f"the owner's review is open in the new room ({record.get('status')})")
+        cache = json.loads(m._WITHHELD_DM_CACHE.read_text())
+        check((cache.get("room_id"), cache.get("private")) == (FRESH, True),
+              "the new room is the cached private review room")
 
-        # --- the next withheld result is not blocked: it reaches the owner in a new room
+        # --- the next withheld result goes straight to the new room
         sent.clear()
         write_task(tasks, "task-next")
-        body, reason = m._guarded_result_body("task-next", BODY)
-        check(body == "[no-send]" and LEFT not in sent and FRESH in sent,
-              "the next review goes to a fresh private room")
+        body, _ = m._guarded_result_body("task-next", BODY)
+        check(body == "[no-send]" and sent == [FRESH, FRESH], "the next review goes to the new room")
+
+        # --- every room refuses: settled, and the log and reason say the review was dropped
+        sent.clear()
+        refusing.update({FRESH, "!fresh2:ag2.space"})
+        created[0] = "!fresh2:ag2.space"
+        logged = []
+        with mock.patch.object(m, "_log", logged.append):
+            write_task(tasks, "task-dropped")
+            got = scan_for_a_minute("task-dropped")
+        check(sent.count(FRESH) == cap and sent.count("!fresh2:ag2.space") == 1,
+              f"bounded sends, then one to a new room ({sent})")
+        settled = [g for g in got if g[0] is not None]
+        reason = settled[0][1] if settled else ""
+        check(bool(settled) and "dropped" in reason, "the reason says the owner review was dropped")
+        check(any("DROPPED" in line for line in logged), "and so does the log line")
+        check(record_of("task-dropped").get("status") == "pending_dm", "the record is kept on disk")
     finally:
         for n, v in saved.items():
             setattr(m, n, v)
