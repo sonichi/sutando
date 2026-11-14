@@ -652,7 +652,7 @@ class RetireRollback(Base):
         self.assertEqual((rc, out["result"]), (1, "failed"))
         self.assertEqual(self.row()["state"], "retired")
         self.assertEqual(pr.load_bindings(self.ws), {"!room:example": WID})
-        code, _, _ = handler.classify(self.ws, {"id": "t", "channel_id": "!room:example"})
+        code, _, _ = handler.classify(self.ws, {"id": "task-t", "channel_id": "!room:example"})
         self.assertEqual(code, handler.DECLINE)
         rc, out = self.main("enable", WID, "--no-start")
         self.assertEqual((rc, self.row()["state"]), (0, "live"))
