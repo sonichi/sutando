@@ -343,6 +343,7 @@ from . import delivery_destination as _delivery_destination
 from .outbox import dispatch_unsettled, record_provider_ref, released_by_operator
 from .outbox import RetrySchedule, delivered_body_differs, effective_item_id, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome, withdraw_unsent
+from .outbox import forget_first_attempt, note_first_attempt
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
 from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, ROOM_REFUSAL_ATTEMPTS
 from .delivery_core import (WITHDRAWN, DeliveryCore, DesignAClaimBackend, DrainStatus,
@@ -9963,6 +9964,7 @@ def _start_delivery(items: list, inflight: "set[str]", room: "str | None" = None
             _DELIVERING_ROOMS.add(room)
 
     def run():
+        n = 0
         try:
             for n, (tid, rfile, raw, generation) in enumerate(items):
                 _delivery_worker(tid, rfile, raw, generation, inflight)
@@ -9970,6 +9972,10 @@ def _start_delivery(items: list, inflight: "set[str]", room: "str | None" = None
                     _release_unsent(items[n + 1:])
                     _log(f"room order: {tid} is still in flight — its room's later replies wait")
                     break
+        except Exception as e:  # noqa: BLE001 — the rest go back to be offered again, in order
+            _log(f"room order: the worker failed at {items[n][0]} ({diagnostics.describe(e)}) — "
+                 f"{len(items) - n} repl{'y' if len(items) - n == 1 else 'ies'} offered again next pass")
+            _release_unsent(items[n:])
         finally:
             if room:
                 with _DELIVERING_MUTEX:
@@ -10019,15 +10025,33 @@ def _reply_room(tid: str, rfile: Path, rooms: "dict[str, str]") -> "str | None":
     return _ordered_room(tid, raw, rooms)
 
 
+def _first_send_attempt(tid: str, rfile: Path) -> "float | None":
+    """When the drain first tried to send tid's reply (kept in the outbox across restarts); the
+    reply's write time when that stamp cannot be kept."""
+    try:
+        at = note_first_attempt(_delivery_core().backend.root, _broker_tid(tid))
+    except Exception:  # noqa: BLE001 — falls back to the write time below
+        at = None
+    if at is not None:
+        return at
+    try:
+        return rfile.stat().st_mtime
+    except OSError:
+        return None
+
+
 def _holds_room(tid: str, rfile: Path, inflight: "set[str]") -> bool:
     """Whether tid's reply, not yet settled, still holds its room's later replies back; past
-    ROOM_ORDER_MAX_WAIT_S it stops holding them, so one stuck reply never silences a room."""
+    ROOM_ORDER_MAX_WAIT_S from its first send attempt it stops, so one stuck reply never
+    silences a room."""
     if _result_settled(tid, inflight):
+        with contextlib.suppress(Exception):
+            forget_first_attempt(_delivery_core().backend.root, _broker_tid(tid))
         return False
-    try:
-        waited = time.time() - rfile.stat().st_mtime
-    except OSError:
+    first = _first_send_attempt(tid, rfile)
+    if first is None:
         return True
+    waited = time.time() - first
     if waited <= ROOM_ORDER_MAX_WAIT_S:
         return True
     _log_backoff((tid, "room-order"), f"room order: {tid} unsent after {int(waited)}s — "
@@ -10087,6 +10111,8 @@ def _post_ready_results(inflight: set[str]) -> None:
         if reply_room and (reply_room in held or _room_busy(reply_room)):
             held.add(reply_room)
             continue                            # an earlier reply in its room is not out yet
+        if reply_room:
+            _first_send_attempt(tid, rfile)
         try:
             changed |= _offer_result(tid, rfile, inflight, rooms, queued, started)
         finally:

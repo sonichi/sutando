@@ -525,8 +525,10 @@ Sutando checkout around it sends neither field.
   60 s per attachment upload). A reply that is still in flight after its turn (a deferred upload,
   an unreadable alias ledger, a held result, an unconfirmed post) holds its room's later replies
   until its outbox item is terminal (delivered or parked) or its task is settled; past
-  `ROOM_ORDER_MAX_WAIT_S` (120 s from the reply's write) it stops holding them, and a log line
-  says so. A result that posts nothing (`[no-send]`, `[REPLIED]`, `[deduped:]`) and one with no
+  `ROOM_ORDER_MAX_WAIT_S` (120 s from the reply's first send attempt, stamped once under the
+  outbox's `.first-attempts/` so a restart keeps it) it stops holding them, and a log line
+  says so. A room worker that fails mid-run logs once and hands its remaining replies back, so the
+  next pass offers them again in order. A result that posts nothing (`[no-send]`, `[REPLIED]`, `[deduped:]`) and one with no
   recorded room are delivered on a worker of their own. Right after an upgrade the map was
   written sorted, so the first pass may order the tasks already in flight by id.
 - Earlier ledgers (`relay-task-attempts.json`, `relay-task-attempts-v2.json`) are not read or
