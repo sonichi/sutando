@@ -8187,10 +8187,11 @@ def _proactive_item_id(stem: str, body: str) -> str:
     return proactive_item_id(stem, body)
 
 
-def _proactive_requeue_command(root, item_id: str, body_sha256: str) -> str:
+def _proactive_requeue_command(root, item_id: str, body_sha256: str, reset_attempts: bool = False) -> str:
     """The operator's resend: requeue the item and restore exactly its own quarantined body."""
     return shlex.join(["python3", "src/outbox_cli.py", "--root", str(root), "requeue", item_id,
-                       "--body-id", item_id.rsplit("~", 1)[0], "--body-sha256", body_sha256])
+                       "--body-id", item_id.rsplit("~", 1)[0], "--body-sha256", body_sha256]
+                      + (["--reset-attempts"] if reset_attempts else []))
 
 
 def _proactive_outbox_root() -> Path:
@@ -8656,7 +8657,9 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
             body_sha256 = ""
         retired = _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
         # No digest, no command: an unfiltered restore can install another generation's body.
-        how = (f"{_proactive_requeue_command(core.backend.root, item_id, body_sha256)}" if body_sha256
+        # A refusal spent its whole budget: a requeue that keeps the count gets one try.
+        how = (f"{_proactive_requeue_command(core.backend.root, item_id, body_sha256, reason == 'permanent-refusal')}"
+               if body_sha256
                else f"NO recovery command: its body could not be read to pin which parked copy "
                     f"is its own; requeue {item_id} by hand with --body-sha256 of that copy")
         where = (f"PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/" if retired
@@ -8670,7 +8673,8 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
                  f"To send it to {room}: {how}")
         else:
             _log(f"proactive {f.name} PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ ({reason}"
-                 f"{': ' + result.detail if result.detail else ''}) — it will NOT be re-sent")
+                 f"{': ' + result.detail if result.detail else ''}) — it will NOT be re-sent. "
+                 f"To send it again: {how}")
         return
     _hand_back(claim, f)  # still owed: the outbox's retry schedule decides when it is tried again
     if result.status is DrainStatus.ATTEMPTED:

@@ -33,6 +33,9 @@ from _helpers import proactive_lane as pl
 from ag2_sparrow.delivery_core import ProviderBoundedRefused, ProviderPermanentRefused, ProviderRefused
 from ag2_sparrow.delivery_core.provider_ag2space import AG2SpaceRoomMessageProvider
 import importlib.util
+import shlex
+
+import outbox_cli
 
 from ag2_sparrow import send_failure_policy
 from ag2_sparrow.delivery_core.provider_ag2space import room_refused_sender
@@ -103,6 +106,7 @@ def classifier() -> None:
 def classify(is_room_membership_refusal, where: str) -> None:
     for body in (NOT_IN_ROOM, {"error": "not a room member (HTTP 403)"},
                  {"error": "Sender is not in this room"}, {"error": "User @a:s NOT IN ROOM !r:s"},
+                 {"message": "sender is not in this room"}, {"detail": "not a room member"},
                  {"errcode": "M_FORBIDDEN", "error": "User @a:s not in room !r:s"},
                  json.dumps(NOT_IN_ROOM), json.dumps(NOT_IN_ROOM).encode("utf-8")):
         check(is_room_membership_refusal(403, body), f"{where}: a room refusal is recognised: {str(body)[:50]}")
@@ -165,6 +169,19 @@ def a_room_refusal_parks_after_its_budget() -> None:
           f"its outbox item parks as a permanent refusal ({[p.get('reason') for p in parked]})")
     check(any("PARKED" in m and "permanent-refusal" in m and "will NOT be re-sent" in m for m in lane.logs),
           "the park is logged with its reason")
+    cmd = next((shlex.split(m.split("To send it again: ", 1)[1]) for m in lane.logs
+                if "permanent-refusal" in m and "To send it again: " in m), None)
+    check(cmd is not None and "--reset-attempts" in cmd,
+          f"and with the requeue command, restoring the full budget ({cmd})")
+    if cmd:
+        check(outbox_cli.main(cmd[2:]) == 0, "the logged command requeues it")
+        lane.respond = refuse_until_joined(ROOM_REFUSAL_ATTEMPTS - 1)
+        before = len(lane.posts)
+        scan_for_an_hour(lane, "proactive-notinroom")
+        check(len(lane.posts) - before == ROOM_REFUSAL_ATTEMPTS
+              and lane.where("proactive-notinroom") == "archived",
+              f"and the requeued message gets the whole budget again "
+              f"({len(lane.posts) - before} sends, {lane.where('proactive-notinroom')})")
 
 
 def a_join_landing_on_the_third_send_delivers() -> None:
