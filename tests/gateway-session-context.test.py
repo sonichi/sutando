@@ -435,6 +435,53 @@ class SessionContext(unittest.TestCase):
         self.assertTrue(prefix.startswith(f"[live session: {CARD}; guest last on an unknown page] hello"), prefix)
         self.assertNotIn("last session message", prefix)
 
+    def _assert_clean(self, text):
+        for secret in (FAKE_SK, FAKE_GHP):
+            self.assertNotIn(secret, text)
+
+    def _reloaded_write(self, task: dict) -> str:
+        """The task written by a freshly loaded bridge: what survives a restart is the ledger file."""
+        fresh = _load(self.ws)
+        fresh._vault_intercept_fns = lambda: (None, None)
+        with patch.object(fresh, "_req", side_effect=self._fake_req):
+            written = fresh._write_task(task)
+        return (fresh.TASKS_DIR / f"{written[0]}.txt").read_text()
+
+    def test_a_secret_in_a_content_move_title_is_never_kept_or_replayed(self):
+        self.mod._vault_intercept_fns = lambda: (None, None)
+        self.assertIsNone(self._serve(move_mark("task-move-tok", title=f"{FAKE_SK} {FAKE_GHP}")))
+        self._assert_clean(self.mod.SESSION_LEDGER_FILE.read_text())
+        self._assert_clean(self._serve(_event("task-after-move", "next?")))
+        self._assert_clean(self._reloaded_write(_event(
+            "task-other-after-reload", "hi", thread=False, tier="guest",
+            sender="@guest:ag2.space", name="guest")))
+
+    def test_a_secret_in_a_content_message_title_never_reaches_its_task(self):
+        self.mod._vault_intercept_fns = lambda: (None, None)
+        self._seed()
+        text = self._serve(at_message("task-at-tok", title=f"{FAKE_SK} {FAKE_GHP}"))
+        self._assert_clean(text)
+        self.assertIn("session_page", _headers_above_task(text))
+        self._assert_clean(self.mod.SESSION_LEDGER_FILE.read_text())
+
+    def test_a_secret_in_the_envelope_title_reaches_no_header_ledger_or_other_member(self):
+        self.mod._vault_intercept_fns = lambda: (None, None)
+        task = _event("task-env-tok", "hello")
+        task["session_context"] = session_record(True, title=f"{FAKE_SK} {FAKE_GHP}")
+        text = self._serve(task)
+        self._assert_clean(text)
+        self.assertIn("session_ctx", _headers_above_task(text))
+        self._assert_clean(self.mod.SESSION_LEDGER_FILE.read_text())
+        other = self._reloaded_write(_event("task-env-other", "hi", thread=False, tier="guest",
+                                            sender="@guest:ag2.space", name="guest"))
+        self._assert_clean(other)
+        self.assertIn("session_ctx", _headers_above_task(other))
+
+    def test_a_secret_in_the_sender_name_is_not_kept(self):
+        self.mod._vault_intercept_fns = lambda: (None, None)
+        self.assertIsNone(self._serve(move_mark("task-move-name", name=FAKE_GHP)))
+        self._assert_clean(self.mod.SESSION_LEDGER_FILE.read_text())
+
     def test_a_pre_fix_ledger_file_is_ignored_and_rewritten(self):
         from ag2_sparrow import session_context as sc
         old = {"v": 1, "rooms": {ROOM: {CARD: {

@@ -6067,18 +6067,44 @@ def _observe_session(task: dict) -> _SessionObservation:
         return _SessionObservation()
 
 
+def _redact_session_value(value):
+    if isinstance(value, str):
+        return filter_chat_secrets(_local_redact_vault_set(value)).text
+    if isinstance(value, dict):
+        return {k: _redact_session_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_session_value(v) for v in value]
+    return value
+
+
+# Member-writable fields the ledger may keep or render besides the body.
+_SESSION_META_KEYS = ("content", "session_context", "sender_name")
+
+
+def _session_view(task: dict, body: str) -> dict:
+    """The task as the session ledger sees it: the filtered body, every metadata string redacted."""
+    view = {**task, "task": body}
+    for key in _SESSION_META_KEYS:
+        if key in task:
+            try:
+                view[key] = _redact_session_value(task[key])
+            except Exception:  # noqa: BLE001 — unredactable metadata is dropped, never kept raw
+                del view[key]
+    return view
+
+
 def _consume_session_mark(task: dict) -> bool:
     """A move or Join/Leave mark in a known session thread is recorded, never queued."""
     try:
-        mark = _session_ledger().classify(task)
+        body = filter_chat_secrets(_local_redact_vault_set(str(task.get("task") or ""))).text
+        view = _session_view(task, body)
+        mark = _session_ledger().classify(view)
     except Exception as exc:  # noqa: BLE001 — an unreadable ledger makes it an ordinary task
         _log(f"session mark check skipped for {task.get('id')}: {diagnostics.describe(exc)}")
         return False
     if mark is None or mark.kind not in ("move", "member"):
         return False
-    # The ledger keeps a move's page title: filter it the way _write_task filters a body.
-    body = filter_chat_secrets(_local_redact_vault_set(str(task.get("task") or ""))).text
-    return _observe_session({**task, "task": body}).consumed
+    return _observe_session(view).consumed
 
 
 def _on_task_env() -> "dict[str, str]":
@@ -6381,7 +6407,7 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
                      f"{', '.join(sorted(_secret_types))}")
             # Only the FILTERED body reaches the session ledger; after the dedup
             # returns above, so a redelivery is not recorded twice.
-            _sess = _observe_session({**task, "task": _filtered.text})
+            _sess = _observe_session(_session_view(task, _filtered.text))
             # Session context the bridge derived, above task: so a body cannot claim it.
             if _sess.page_header:
                 lines.append(f"session_page: {_one_line(_sess.page_header)}")
