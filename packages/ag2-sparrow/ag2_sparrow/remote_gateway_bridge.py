@@ -344,7 +344,7 @@ from .outbox import dispatch_unsettled, record_provider_ref, released_by_operato
 from .outbox import RetrySchedule, delivered_body_differs, effective_item_id, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome, withdraw_unsent
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
-from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS
+from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, ROOM_REFUSAL_ATTEMPTS
 from .delivery_core import (WITHDRAWN, DeliveryCore, DesignAClaimBackend, DrainStatus,
                             ProviderRefused, RetryPolicy)
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
@@ -391,6 +391,8 @@ UI_ORIGIN_NOTE = (
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 _WITHHELD_TASK_OUTPUT: "dict[tuple, tuple]" = {}
+# review id -> (sends the review room refused, monotonic time the next send is due).
+_REVIEW_ROOM_REFUSALS: "dict[str, tuple[int, float]]" = {}
 _WITHHELD_DM_CACHE = _STATE / "withheld-review-dm.json"
 _WITHHELD_CONTROL_DIR = _STATE / "withheld-review-control-results"
 _GATEWAY_OWNER_DM_HINT = ""
@@ -814,6 +816,35 @@ def _owner_review_dm(owner: str) -> str:
         raise RuntimeError("gateway did not return a private review room")
     _atomic_private_json(_WITHHELD_DM_CACHE, {"owner": owner, "room_id": room, "private": True})
     return room
+
+
+def _forget_review_room() -> None:
+    """Unmark the cached review room as private, so the next review opens a new one."""
+    cached = _read_private_json(_WITHHELD_DM_CACHE)
+    if cached and cached.get("private") is True:
+        _atomic_private_json(_WITHHELD_DM_CACHE, {**cached, "private": False})
+
+
+def _reroute_refused_review(artifact: Path, verdict, refused: int):
+    """After the review room refused the agent ROOM_REFUSAL_ATTEMPTS times, send the same review once
+    to a new private room. -> the verdict to settle on, or None to leave the result for the next pass."""
+    try:
+        _forget_review_room()
+        if _route_withheld_review(artifact):
+            _log(f"withheld review {artifact.stem}: the review room refused the agent {refused} times "
+                 "(HTTP 403, not in the room); sent to a new private review room")
+            return verdict
+        return None
+    except Exception as exc:  # noqa: BLE001 - runs inside the caller's except clause, past its catch-all
+        if not (isinstance(exc, urllib.error.HTTPError) and room_refused_sender(exc)):
+            _log(f"withheld review {artifact.stem}: the re-route to a new private review room failed: "
+                 f"{diagnostics.describe(exc)}; retried on the next pass")
+            return None
+    _log(f"withheld review {artifact.stem}: DROPPED, not delivered to the owner: the review room and a new "
+         f"one both refused the agent (HTTP 403, not in the room); the record stays at {artifact}")
+    return verdict._replace(reason=(
+        f"{verdict.reason}; owner review {artifact.stem} dropped: every private review room refused "
+        f"the agent; the record stays at {artifact}"))
 
 
 def _review_messages(record: dict) -> list[str]:
@@ -1797,9 +1828,25 @@ def _guarded_result_body(tid: str, body: str):
         artifact = review_artifact(_STATE, tid, body)
         if not artifact.is_file():
             return None, verdict.reason
+        refused, due = _REVIEW_ROOM_REFUSALS.get(artifact.stem, (0, 0.0))
+        if time.monotonic() < due:
+            return None, f"{verdict.reason}; private review room refused the agent, next send not due yet"
         try:
             if not _route_withheld_review(artifact):
                 return None, f"{verdict.reason}; private owner review unavailable"
+            _REVIEW_ROOM_REFUSALS.pop(artifact.stem, None)
+        except urllib.error.HTTPError as exc:
+            if not room_refused_sender(exc):
+                return None, f"{verdict.reason}; private owner review failed: {diagnostics.describe(exc)}"
+            refused += 1
+            if refused < ROOM_REFUSAL_ATTEMPTS:  # a join may still be landing: 2 s doubling, as the outbox
+                _REVIEW_ROOM_REFUSALS[artifact.stem] = (refused, time.monotonic() + 2.0 * 2 ** (refused - 1))
+                return None, (f"{verdict.reason}; private review room refused the agent "
+                              f"(send {refused}/{ROOM_REFUSAL_ATTEMPTS})")
+            _REVIEW_ROOM_REFUSALS.pop(artifact.stem, None)
+            verdict = _reroute_refused_review(artifact, verdict, refused)
+            if verdict is None:
+                return None, "private owner review failed in its new room; retried on the next pass"
         except Exception as exc:  # noqa: BLE001 — retain result file for retry
             return None, f"{verdict.reason}; private owner review failed: {diagnostics.describe(exc)}"
     result = (verdict.body, verdict.reason)

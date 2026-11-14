@@ -914,6 +914,13 @@ so:
   and kept live where health-check sees it). Its failure notice, refused by the same room, is
   sent once to the owner DM instead; if the DM refuses it too, it is recorded as sent and not
   repeated. Any other 403 still raises to the caller's backoff.
+- **A private review DM whose room refuses the sender** (a non-owner result the guard
+  withheld) gets the same `ROOM_REFUSAL_ATTEMPTS` sends, 2 s doubling apart. Then the cached
+  review room is no longer trusted and the same review is sent once to a new private room,
+  which later reviews use; the result stays withheld (no room post) and is settled. If the new
+  room refuses too, the review is logged as `DROPPED` (not delivered to the owner) with the
+  path of its record, kept in `state/withheld-team-results/`. Any other 403 keeps the result
+  for the next pass, as before.
 - **A message about a task** is named `proactive-about-<task id>--<ts>.txt`
   (`proactive_routing.about_task_filename`). In the task's own room it posts in the task's
   thread: an ask already in a thread keeps that thread's root, a top-level ask is rooted at
