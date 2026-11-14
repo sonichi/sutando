@@ -32,6 +32,9 @@ Source = "https://github.com/sonichi/sutando"
 # Meta Hatch adapter (ag2_sparrow/adapters/hatch): stdlib-only, so the extra
 # only names the feature; `ag2-sparrow-hatch install` sets it up.
 hatch = []
+# OpenClaw adapter (ag2_sparrow/adapters/openclaw): stdlib-only, so the extra
+# only names the feature; `ag2-sparrow-openclaw install` sets it up.
+openclaw = []
 
 [project.scripts]
 ag2-sparrow = "ag2_sparrow.remote_gateway_bridge:main"
@@ -42,6 +45,7 @@ ag2-sparrow-outbox = "ag2_sparrow.outbox_cli:main"
 ag2-sparrow-hatch = "ag2_sparrow.adapters.hatch.cli:main"
 ag2-sparrow-claude-local = "ag2_sparrow.adapters.claude_code.cli:main"
 ag2-sparrow-codex-local = "ag2_sparrow.adapters.codex.connect_cli:main"
+ag2-sparrow-openclaw = "ag2_sparrow.adapters.openclaw.cli:main"
 ag2-sparrow-mcp = "ag2_sparrow.mcp_auth:main"
 
 # Discovered, not listed: a hand-written list silently drops a new subpackage.

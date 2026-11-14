@@ -11,10 +11,15 @@ cp "$REPO_REAL/src/startup-runtime.sh" "$REPO/src/startup-runtime.sh"
 # startup-runtime.sh sources its sibling resolver and the core-CLI gate; stage them all.
 cp "$REPO_REAL/src/repo_root.sh" "$REPO/src/repo_root.sh"
 for f in src/agent/runtime-compat-gate.sh src/runtime_compat.py src/file_lock.py src/auth_preflight.py \
-         scripts/python-binary.sh; do
+         src/agent/codex/codex-home.sh src/codex_home.py src/codex_host_instructions.py \
+         src/sutando_config.py scripts/python-binary.sh; do
   mkdir -p "$REPO/$(dirname "$f")"
   cp "$REPO_REAL/$f" "$REPO/$f"
 done
+# The Codex home is resolved by the shared owner from the repo's real config.
+touch "$REPO/src/__init__.py"
+printf '{"workspace": {"path": "%s"}, "core_config_dirs": [{"id": "x", "type": "codex", "env_name": "CODEX_HOME", "synced": false, "value": "%s"}]}\n' \
+  "$TMP/workspace" "$TMP/codex-home" > "$REPO/sutando.config.json"
 
 cat > "$REPO/scripts/sutando-config.sh" <<'SH'
 #!/bin/bash

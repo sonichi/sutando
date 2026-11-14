@@ -37,6 +37,7 @@ export const HEADER_KEYS: readonly string[] = [
 	'caller',
 	'lane',
 	'wake_episode',
+	'recent_tasks',
 	'thread_root',
 	'source_room_id',
 	'channel_kind',
@@ -52,11 +53,13 @@ export const HEADER_KEYS: readonly string[] = [
 	'media_form',
 	'attachments',
 	'platform_card',
+	'card_click',
 	'instance_id',
 	'collaborator',
 	'requested_worker',
 	'hitl_click',
 	'owner_mentioned',
+	'asked_by',
 	'task_layout',
 	'hook',
 	'summon',
@@ -66,6 +69,7 @@ export const HEADER_KEYS: readonly string[] = [
 	'event_type',
 	'agent_trigger_id',
 	'playbook',
+	'ui_origin',
 ];
 
 /** Alternation source for a header-line guard. Keys are plain

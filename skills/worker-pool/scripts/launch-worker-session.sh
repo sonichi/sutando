@@ -123,6 +123,10 @@ if [ -n "$PY" ] && [ -x "$PY" ]; then
   [ -n "$WORKER_PY" ] && [ -x "$WORKER_PY" ] || WORKER_PY=""
 fi
 ENV_ARGS+=(-e "SUTANDO_PY=$WORKER_PY")
+# The seat's s-space MCP proxy asks this resolver whose agent to mint as; the token stays in the vault.
+. "$REPO/skills/worker-pool/scripts/worker-mcp-credential.sh"
+MCP_WORKER_CREDENTIAL="$(worker_mcp_credential "$REPO" "$WORKER_PY" "${SUTANDO_WORKER_ID:-$SUTANDO_INSTANCE_ID}" "${SUTANDO_WORKSPACE_DIR:-}")"
+ENV_ARGS+=(-e "AG2_MCP_WORKER_CREDENTIAL=$MCP_WORKER_CREDENTIAL")
 # Forward the embedder-provided default workspace for the same reason as
 # above (tmux takes the server env, not this shell's).
 [ -n "${SUTANDO_DEFAULT_WORKSPACE:-}" ] && ENV_ARGS+=(-e "SUTANDO_DEFAULT_WORKSPACE=$SUTANDO_DEFAULT_WORKSPACE")

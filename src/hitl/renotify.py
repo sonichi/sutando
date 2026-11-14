@@ -186,7 +186,7 @@ def body(notice: str, req: HumanRequirement, now: float,
     if notice == FAILED:
         head = _headline(req)
         head = head if len(head) <= _FAILED_HEADLINE_MAX else head[:_FAILED_HEADLINE_MAX - 1] + "…"
-        return f"⚠ Sutando could not show you a card — {head}. The relay refused it."
+        return f"⚠ Sutando could not show you a card — {head}. The card could not be delivered."
     if notice == RECOVERY:
         tail = (f"resuming {n} queued task{'s' if n != 1 else ''}" if n
                 else "Sutando has continued its work")
@@ -197,7 +197,7 @@ def body(notice: str, req: HumanRequirement, now: float,
     waiting = f" {n} task{'s are' if n != 1 else ' is'} waiting." if n else ""
     started = req.created_at if since is None else since
     return (f"⚠ Still blocked after {_duration(now - started)} — "
-            f"{_headline(req)}.{waiting} The card above has the way to clear it.")
+            f"{_headline(req)}.{waiting} Its card has the way to clear it.")
 
 
 def dedupe_key(notice: str, req: HumanRequirement, projection: Dict,

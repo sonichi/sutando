@@ -439,5 +439,7 @@ a hold binds only the model family it was seen on, so the watchdog revives a cor
 it too. While it is held, the owner's bare reply "switch to <model>" sets the model for the next
 launch (`switch-model.sh --offline`) and lifts the hold; "retry now" lifts it as is; the next revive
 then starts the core. A hold binds only the Claude account it was seen under: after signing in to
-another account, the next restart launches the core at once. For engineers: `python3 src/core_limit_hold.py status` prints the hold and
+another account, the next restart launches the core at once. Signing in with `/login` in the running
+core's terminal resumes it in place: once the pane sits idle with nothing run since "Login successful",
+the core supervisor types `/startup` once, which re-arms the task watcher and crons. For engineers: `python3 src/core_limit_hold.py status` prints the hold and
 `... clear` lifts it.
