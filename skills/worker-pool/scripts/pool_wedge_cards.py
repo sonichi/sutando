@@ -12,6 +12,9 @@ a card instead, through the engine's hitl store:
 - a frozen turn: the card offers "Send Escape". Nothing is typed unless the owner
   presses it, and `drive_escapes` re-reads the pane first: a pane that no longer
   shows the same frozen frame is refused and nothing is typed.
+- undelivered work behind the pane-keys fence: the card offers "Clear the send fence".
+  Nothing is cleared unless the owner presses it, and only the fence the card was raised
+  for: `drive_fence_clears` refuses a send in flight or a newer fence, and offers the card again.
 """
 from __future__ import annotations
 
@@ -41,6 +44,12 @@ import tmux_pane_keys  # noqa: E402
 
 SOURCE = "pool-wedge"
 ESCAPE_ACTION = "send_escape"
+FENCE_ACTION = "clear_send_fence"
+FENCE_RETRY_NOTES = {
+    "refused": "The last press did not clear it: a send was in flight then. Press again once nothing is typing.",
+    "changed": "The last press did not clear it: this is a newer interrupted send than the one you approved.",
+    "failed": "The last press did not clear it: the recovery itself failed. Press again, or use the terminal line above.",
+}
 PROXY_ACTION = "restart_credential_proxy"
 PROXY_LABEL = "com.sutando.credential-proxy"
 # What src/restart.sh runs for a launchd-supervised proxy; named, never run from here.
@@ -143,8 +152,9 @@ def _jump(session):
 
 
 def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=proxy_routed,
-               manager=None) -> dict:
-    """One card for this wedge episode, from the pane as it reads NOW. Types nothing."""
+               manager=None, note="", cause=None, replacing=None) -> dict:
+    """One card for this wedge episode, from the pane as it reads NOW. Types nothing. For a fence card offered
+    again, `note` says why, `cause` keeps it about the fence, and `replacing` closes only once this one exists."""
     from hitl.cards import choice_request
     from hitl.schema import Action
     socket, session = sup._open_tmux(workspace, worker_id)
@@ -193,21 +203,27 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
         if not live_owed_tasks(workspace, worker_id):
             # Owed only by sentinels whose task is archived or gone: nothing to deliver.
             return {"worker_id": worker_id, "outcome": "cleared", "pane": "no-live-task"}
-        cause = sup.delivery_block(socket)
+        cause = cause or sup.delivery_block(socket)
         body = [f"{seat} (tmux session {session}) owes work, its watcher is running, and its pane "
                 f"has read idle at the prompt for over {int(ps.UNDELIVERED_AFTER_S // 60)} minutes: "
                 "its task appears not to have been delivered."]
+        actions = [_jump(session)]
         if cause == "pane-key-fence":
-            body += ["", f"Cause: automated sends on {socket} are blocked by the pane-keys fence "
-                     "(docs/codex-core.md). Once no send can still be in flight, clear it with:",
-                     f"  python3 src/tmux_pane_keys.py recover {socket}",
-                     "The retained tasks are typed in on the notifier's next wake."]
+            body += ["", "Cause: an earlier automated send to this worker was interrupted, so it cannot be "
+                     "told whether those keys arrived, and sends stay blocked by the pane-keys fence "
+                     f"(docs/codex-core.md) until that is settled. If nothing is still typing into {session}, "
+                     "press Clear the send fence: the fence is checked again first, and the waiting tasks are "
+                     "typed in on the notifier's next wake. From a terminal, the same recovery is:",
+                     f"  python3 src/tmux_pane_keys.py recover {socket}"] + (["", note] if note else [])
+            actions.insert(0, Action(id=FENCE_ACTION, kind="confirmation", label="Clear the send fence"))
+            subject["fence_episode"] = tmux_pane_keys.fence_episode(socket)
         else:
             body += ["", f"Cause: not identified. The {session}-watcher session logs each delivery "
                      "attempt and why it was refused."]
         subject.update(cause=[cause] if cause else [])
         req = choice_request(
-            "\n".join(body), [_jump(session)], f"{SOURCE}:{session}:undelivered:{cause or 'unknown'}",
+            "\n".join(body), actions,
+            f"{SOURCE}:{session}:undelivered:{cause or 'unknown'}" + (f":after:{replacing}" if replacing else ""),
             subject, runtime=runtime, title=f"{seat} · tasks not delivered", device=device,
             kind="core-blocked", turn_on_action=False)
     elif which == ps.CARD_FROZEN:
@@ -253,6 +269,8 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
             kind="choice" if via_proxy else "core-blocked", turn_on_action=via_proxy)
     manager = manager or manager_for(workspace)
     made = manager.create(req)
+    if replacing:
+        manager.expire(replacing)
     return {"worker_id": worker_id, "outcome": "carded", "hitl_id": made.id, "wedge": which}
 
 
@@ -295,6 +313,60 @@ def drive_escapes(workspace, *, runner=subprocess.run, manager=None) -> dict:
         _note(manager, r.id, escape_sent=sent)
         (manager.resolve if sent else manager.expire)(r.id)
         out[r.id] = "sent" if sent else "failed"
+    return out
+
+
+def _recover_fence(socket, episode, runner) -> int | None:
+    """The guard's own recovery for exactly this fence, or None when it could not be run."""
+    recover = [sys.executable, str(Path(tmux_pane_keys.__file__).resolve()), "recover-episode", str(socket), episode]
+    try:
+        return runner(recover, capture_output=True, text=True, timeout=tmux_pane_keys.TIMEOUT_S).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def drive_fence_clears(workspace, *, runner=subprocess.run, routed=proxy_routed, manager=None) -> dict:
+    """Settle each pressed fence card, for the fence it was raised for and no other. Anything short of cleared
+    replaces it with a fresh card; the episode is already escalated, so a replacement not yet made stays owed."""
+    from hitl.schema import STATUS_IN_PROGRESS
+    manager = manager or manager_for(workspace)
+    out = {}
+    for r in manager.active():
+        subj = r.subject or {}
+        if (subj.get("source") != SOURCE or subj.get("wedge") != ps.CARD_UNDELIVERED
+                or r.status != STATUS_IN_PROGRESS or r.chosen_action != FENCE_ACTION):
+            continue
+        socket, episode = (r.device or {}).get("socket"), subj.get("fence_episode")
+        state = tmux_pane_keys.fence_status(socket) if socket else "busy"
+        if state == "clear":
+            _note(manager, r.id, fence="already-clear")
+            manager.resolve(r.id)
+            out[r.id] = "already-clear"
+            continue
+        owed = subj.get("fence_outcome")
+        if owed:
+            outcome = owed  # that press is spent: only its replacement card is still owed
+        elif state != "uncertain":
+            outcome = "refused"
+        elif not episode:
+            outcome = "changed"
+        else:
+            rc = _recover_fence(socket, episode, runner)
+            if rc == 0:
+                _note(manager, r.id, fence_cleared=True)
+                manager.resolve(r.id)
+                out[r.id] = "cleared"
+                continue
+            outcome = {tmux_pane_keys.FENCE_CHANGED: "changed", tmux_pane_keys.BUSY: "refused"}.get(rc, "failed")
+        _note(manager, r.id, fence_cleared=False, fence_outcome=outcome)
+        try:
+            made = raise_card(workspace, subj.get("worker_id"), ps.CARD_UNDELIVERED, runner=runner, routed=routed,
+                              manager=manager, note=FENCE_RETRY_NOTES[outcome], cause="pane-key-fence", replacing=r.id)
+        except OSError:
+            made = {"outcome": "indeterminate"}  # not saved: this card stays as the debt
+        if made.get("outcome") not in ("carded", "indeterminate"):
+            manager.expire(r.id)
+        out[r.id] = outcome
     return out
 
 
