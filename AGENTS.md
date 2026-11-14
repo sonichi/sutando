@@ -303,13 +303,13 @@ On "tutorial"/"walk me through": read `notes/first-time-tutorial.md`, deliver se
 
 ## Vault — secure secret storage
 
-Secrets passed via Slack/Discord (`vault set KEY VALUE`) are intercepted by the bridge and stored in macOS Keychain. They never touch a file on disk.
+Secrets the owner sends as `vault set KEY VALUE` in any owner channel (the s.space DM, Slack, Discord, Telegram) are intercepted by the bridge and stored in macOS Keychain; they never touch a file on disk. On the Mac itself, `python3 skills/secret-vault/secret-vault.py set KEY` reads the value from stdin.
 
 **When writing any integration that needs an API key, token, or password — always use vault:**
 
 Python + CLI recipes: [`docs/claude-md-moved-detail.md`](docs/claude-md-moved-detail.md#vault-recipes).
 
-If an integration needs a key that isn't in the vault yet, ask the user to send `vault set KEY value` via Slack or Discord — the bridge intercepts it securely before it touches disk.
+If an integration needs a key that isn't in the vault yet, ask the owner to send `vault set KEY value` in their owner channel (or run the stdin command above on the Mac); the bridge intercepts it before it touches disk.
 
 ## Built-in tools
 
