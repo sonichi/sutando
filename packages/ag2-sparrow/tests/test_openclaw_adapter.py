@@ -500,9 +500,9 @@ class PermissionTest(unittest.TestCase):
                             "the reply draft stays writable")
 
     def test_a_nul_in_a_path_never_resolves(self):
-        # Some Python 3.14 builds return a path with the NUL from realpath instead of raising;
-        # simulated here, since the interpreter running the suite may raise.
-        keeps_nul = lambda p, *a, **k: os.path.normpath(p)  # noqa: E731
+        # Some Python 3.14 builds' realpath keeps a NUL instead of raising: simulated here.
+        def keeps_nul(p, *a, **k):
+            return os.path.normpath(p)
         for realpath in (os.path.realpath, keeps_nul):
             with self.subTest(realpath=realpath), mock.patch.object(oc.os.path, "realpath", realpath):
                 self.assertIsNone(oc.resolved(str(self.work), "a\0b"))
