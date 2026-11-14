@@ -451,6 +451,9 @@ reap_stale_task_watcher() {
 # by the caller — same contract as every other block in startup.sh.
 start_gateway_lanes() {
   local _DOT_ENV _TOKEN_ENV="" _RELAY_ENV=""
+  # What happened, for a caller that reports it; startup.sh runs under set -e, so never a status.
+  GATEWAY_LANES_CONFIGURED=0
+  GATEWAY_LANES_NOT_LAUNCHED=0
   _DOT_ENV="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env)"
   if [ -n "${PY:-}" ]; then
     # Which file defines the credential is content, not filename: where `.env`
@@ -463,6 +466,7 @@ start_gateway_lanes() {
       && _TOKEN_ENV="$_DOT_ENV"
   fi
   if [ -n "$_TOKEN_ENV" ] || [ -n "${REMOTE_TASK_TOKEN:-}${AG2_REMOTE_TOKEN:-}" ]; then
+    GATEWAY_LANES_CONFIGURED=1
     # `.env` is sourced whatever holds the token: it may carry channel POLICY
     # (tier, marker) and shell-form credentials a KEY=VALUE reader cannot see.
     [ -f "$_DOT_ENV" ] && { set -a; . "$_DOT_ENV"; set +a; }
@@ -591,6 +595,7 @@ start_gateway_lanes() {
           echo "  ✓ gateway bridge ($_gw_inst — self-defers if already running)"
         else
           echo "  ⊘ gateway bridge ($_gw_inst) not launched — see remote-gateway-bridge.log"
+          GATEWAY_LANES_NOT_LAUNCHED=$((GATEWAY_LANES_NOT_LAUNCHED + 1))
         fi
       done <<< "$_gw_plan"
     else
