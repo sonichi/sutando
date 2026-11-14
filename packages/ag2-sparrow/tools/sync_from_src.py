@@ -2,7 +2,7 @@
 """Regenerate the package modules from the canonical sutando src/ (single source).
 
 Everything in MAP below is bundled verbatim from sonichi/sutando `src/`, which is
-canonical for those modules — currently 41 of them, including outbox.py and its
+canonical for those modules — currently 44 of them, including outbox.py and its
 transport seam outbox_adapter.py. Only the modules NOT in MAP are package-canonical
 and intentionally diverge from src (remote_gateway_bridge, _dirs, send_allowlist:
 dir-interface, no workspace-resolution).
@@ -58,6 +58,8 @@ MAP = {
     "src/workspace_lock.py": "workspace_lock.py",
     "src/chat_secret_filter.py": "chat_secret_filter.py",
     "src/policy/egress/result.py": "team_result_guard.py",
+    # which digests a Team result may carry; the guard and the chat filter share it
+    "src/policy/egress/public_digest.py": "public_digest.py",
     "src/policy/guardrail.py": "team_guardrail.py",
     "src/vault_set_grammar.py": "vault_set_grammar.py",
     "src/send_failure_policy.py": "send_failure_policy.py",

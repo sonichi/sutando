@@ -68,6 +68,7 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "stand",          # this instance's `Stand:` commit-trailer value
     "skills",
     "notifications",
+    "egress",
 }
 
 # Blocks every consumer reads with `.get()`. A scalar here is what the schema's
@@ -83,6 +84,7 @@ _OBJECT_TOP_LEVEL_KEYS = {
     "bridges",
     "skills",
     "notifications",
+    "egress",
 }
 
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
