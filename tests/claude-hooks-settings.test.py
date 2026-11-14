@@ -326,9 +326,8 @@ with tempfile.TemporaryDirectory() as tmp:
           and "(re-pointed)" in r.stdout, "install-watcher-rearm-hook.sh re-points an older tree's entry",
           r.stdout + r.stderr + str(cmds))
 
-    # ── the current entry's own settings survive, whichever order it sits in ──────
-    # An older live checkout's copy before the current entry must not replace it: the
-    # current hook owns its timeout and async metadata.
+    # An older checkout's copy before the current entry must not replace it: the current
+    # hook owns its timeout and async settings, in whichever order the two sit.
     older = tmp / "older" / "src" / "personal-claude-compact-hint.sh"
     older.parent.mkdir(parents=True, exist_ok=True)
     older.write_text("#!/bin/bash\n")
