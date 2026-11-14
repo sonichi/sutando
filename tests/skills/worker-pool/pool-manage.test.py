@@ -15,6 +15,8 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -213,6 +215,39 @@ class Enable(Base):
         self.assertEqual(self.spawned, [])
 
 
+class Reseat(Base):
+    """A seat's s-space tools decide at start whom they act as; an identity added later needs a restart."""
+
+    def reseat(self):
+        with mock.patch.object(rem, "ensure_supervisor", return_value={"outcome": rem.SUPERVISED}), \
+                mock.patch.object(rem, "ensure_input_watch", return_value={"outcome": rem.WATCHING}):
+            return pm.reseat(self.ws, REPO, "pool worker 1", runner=self.tmux, spawn=self.spawn)
+
+    def test_a_running_idle_seat_is_restarted_on_the_same_session_and_left_unpaused(self):
+        out = self.reseat()
+        self.assertEqual((out["result"], out["start"]["result"]), ("reseated", "restarted"))
+        self.assertEqual(self.tmux.killed(), [f"={SEAT}-watcher", f"={SEAT}-input", f"={SEAT}"])
+        self.assertFalse(sup.is_paused(self.ws, WID))
+        self.assertEqual(self.spawned[-1]["resume"], wi.sessions(self.ws, WID)[-1]["session_id"])
+        self.assertEqual(self.row()["state"], "live")
+
+    def test_a_stopped_worker_or_one_with_no_seat_is_left_alone(self):
+        self.tmux.alive.discard(SEAT)
+        self.assertEqual(self.reseat()["result"], "skipped")
+        self.main("stop", WID)
+        self.tmux.alive.add(SEAT)
+        self.assertEqual(self.reseat()["result"], "skipped")
+        self.assertTrue(sup.is_paused(self.ws, WID))
+        self.assertEqual(self.spawned, [])
+
+    def test_the_script_verb_prints_one_json_line(self):
+        with mock.patch.object(rem, "ensure_supervisor", return_value={"outcome": rem.SUPERVISED}), \
+                mock.patch.object(rem, "ensure_input_watch", return_value={"outcome": rem.WATCHING}), \
+                mock.patch.object(rem, "recover", return_value={"worker_id": WID, "outcome": rem.RECOVERED}):
+            rc, out = self.main("reseat", WID)
+        self.assertEqual((rc, out["action"], out["result"]), (0, "reseat", "reseated"))
+
+
 class Remove(Base):
     def test_remove_refuses_a_live_worker_and_drops_a_retired_one(self):
         rc, out = self.main("remove", WID)
@@ -225,6 +260,60 @@ class Remove(Base):
         self.assertIsNotNone(self.row(OTHER))
         pr.validate_current_roster(self.ws)
         self.assertTrue(wi.worker_dir(self.ws, WID).is_dir())
+
+
+class BareRunTmux(FakeTmux):
+    """Like a bare `subprocess.run`: no stderr comes back unless the caller asks to capture it."""
+
+    def __call__(self, argv, **kw):
+        r = super().__call__(argv, **kw)
+        return r if kw.get("capture_output") else subprocess.CompletedProcess(argv, r.returncode)
+
+
+class CliWithAnUncapturingRunner(Base):
+    def setUp(self):
+        super().setUp()
+        self.tmux = BareRunTmux(self.tmux.alive)
+
+    def test_stop_confirms_the_sessions_gone_and_closes_the_run(self):
+        rc, out = self.main("stop", WID)
+        self.assertEqual((rc, out["result"]), (0, "stopped"))
+        self.assertEqual(set(out["sessions"].values()), {"killed"})
+        self.assertEqual([r["end_reason"] for r in wi.incarnations(self.ws, WID)], ["killed"])
+
+    def test_retire_unbind_and_remove_complete(self):
+        pr.bind_room(self.ws, "!room:example", WID)
+        rc, out = self.main("retire", WID, "--unbind")
+        self.assertEqual((rc, out["result"]), (0, "retired"))
+        self.assertEqual(out["unbound"], ["!room:example"])
+        self.assertEqual(pr.load_bindings(self.ws), {})
+        rc, out = self.main("remove", WID)
+        self.assertEqual((rc, out["result"]), (0, "removed"))
+
+
+
+@unittest.skipUnless(shutil.which("tmux"), "tmux not installed")
+class CliAgainstRealTmux(unittest.TestCase):
+    def test_the_script_stops_a_worker_on_a_live_server(self):
+        short = tempfile.mkdtemp(prefix="pm-", dir="/tmp")  # a unix socket path has a length limit
+        self.addCleanup(shutil.rmtree, short, True)
+        sock = os.path.join(short, "s")
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        ws = Path(td.name) / "ws"
+        (ws / "state").mkdir(parents=True)
+        wi.create_worker(ws, runtime="claude", tmux_socket=sock, worker_id=WID, cwd=str(REPO))
+        pr.register_worker(ws, WID, "pool worker 1", runtime="claude")
+        tmux = lambda *a: subprocess.run(["tmux", "-S", sock, *a], capture_output=True, text=True)
+        self.addCleanup(tmux, "kill-server")
+        for name in ("keepalive", SEAT, SEAT + "-watcher", SEAT + "-input"):
+            tmux("new-session", "-d", "-s", name, "sleep 600")
+        r = subprocess.run([sys.executable, str(SCRIPTS / "pool_manage.py"), "--workspace", str(ws),
+                            "stop", WID], capture_output=True, text=True, timeout=60)
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+        self.assertEqual((r.returncode, out["result"]), (0, "stopped"), r.stdout + r.stderr)
+        self.assertEqual(set(out["sessions"].values()), {"killed"})
+        self.assertEqual(tmux("ls", "-F", "#{session_name}").stdout.split(), ["keepalive"])
 
 
 class Listing(Base):
@@ -307,6 +396,13 @@ class OwedDeliveries(OwedBase):
         rc, out = self.main("stop", WID, "--force")
         self.assertEqual((rc, out["owed_kept"]), (0, ["task-a", "task-p"]))
         self.assertEqual(self.replay("task-a"), {"code": 0, "targets": [WID]})
+
+    def test_reseat_leaves_an_owing_seat_running_and_names_the_restart(self):
+        out = pm.reseat(self.ws, REPO, WID, runner=self.tmux, spawn=self.spawn)
+        self.assertEqual((out["result"], out["owed"]), ("deferred", ["task-a", "task-p"]))
+        self.assertIn(f"pool_manage.py reseat {WID}", out["why"])
+        self.assertEqual(self.tmux.killed(), [])
+        self.assertFalse(sup.is_paused(self.ws, WID))
 
     def test_retire_refuses_without_hand_off_and_changes_nothing(self):
         rc, out = self.main("retire", WID)

@@ -2,10 +2,11 @@
 
 A desktop install keeps the agent's relay token and URL in the channel env file, which a skill's
 own process may not have sourced. `channel_credentials(names)` returns the listed variables from
-the file the shared resolver picks (`channel_env_resolve`), read through `channel_token`. It
+the file the shared resolver picks (`channel_env_resolve.channel_values`), read through `channel_token`. It
 returns nothing when the environment already names any of them, so a token never mixes with a
 URL from another source. On an install with several connections, `room_env(...)` names the
-credential of the connection serving a room instead (`connections.room_credential`). Stdlib only.
+credential of the connection serving a room instead (`connections.room_credential`), and
+`room_agent_mxid(room)` the agent identity on that same connection. Stdlib only.
 """
 from __future__ import annotations
 
@@ -22,18 +23,13 @@ CHANNEL = "ag2space"
 def channel_credentials(names: Iterable[str], environ: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
     """{name: value} for each listed variable the channel env file sets; {} when the environment
     sets any of them, when `names` is empty, or when no file resolves."""
-    from channel_env_resolve import resolve_channel_env
-    from channel_token import token_from_env_file
+    from channel_env_resolve import channel_values
     from util_paths import claude_home_path
     env = os.environ if environ is None else environ
     names = tuple(names)
     if not names or any(env.get(v) for v in names):
         return {}
-    path = resolve_channel_env(claude_home_path("channels"), CHANNEL)
-    if path is None:
-        return {}
-    found = {v: token_from_env_file(v, path) for v in names}
-    return {v: x for v, x in found.items() if x}
+    return channel_values(claude_home_path("channels"), CHANNEL, names)
 
 
 def channel_value(name: str, environ: Optional[Mapping[str, str]] = None) -> str:
@@ -59,3 +55,12 @@ def room_env(url_vars: Iterable[str], token_vars: Iterable[str], room: Optional[
     if not connections.gateway_url_of(token):
         token = f"{gateway_url}|{token}"
     return {**{v: "" for v in (*url_vars, *token_vars)}, token_vars[0]: token}
+
+
+def room_agent_mxid(room: Optional[str], *, environ: Optional[Mapping[str, str]] = None,
+                    workspace: Optional[Path] = None) -> Optional[str]:
+    """The agent identity on the connection serving `room`, the one `room_env` routes to. None keeps
+    the caller's own resolution (one connection); '' when that connection names none, so another
+    server's identity is never used; `NoConnectionForRoom` is raised as `room_env` raises it."""
+    import connections
+    return connections.room_agent_mxid(room, workspace=workspace, environ=environ)

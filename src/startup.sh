@@ -96,7 +96,9 @@ export SUTANDO_ROOT="$REPO"
 # re-exec). A raw `npx tsx` call site silently fails to start its service on
 # such hosts (web-client outage 2026-07-17).
 _APP_NODE_DIR="$(bash "$REPO/scripts/sutando-config.sh" app-node-dir)"
-[ -d "$_APP_NODE_DIR" ] && case ":$PATH:" in *":$_APP_NODE_DIR:"*) ;; *) PATH="$_APP_NODE_DIR:$PATH"; export PATH ;; esac
+# Recorded as a launch default, so the core launcher exec'd at the end still puts CODEX_NODE_BIN first.
+. "$REPO/src/agent/launch-path.sh"
+sutando_prepend_default_dir "$_APP_NODE_DIR"
 # `|| true`: tsx-bin prints nothing AND returns nonzero on a bare bundled
 # runtime (no tsx anywhere) — under set -e that exited startup at this line
 # before the bundled-mode gate could run (Codex blocking finding #2).
@@ -160,7 +162,7 @@ if [ "$BUNDLED_MODE" = "1" ]; then
 fi
 if [ -n "${SUTANDO_NODE:-}" ]; then
   _SUTANDO_NODE_DIR="$(dirname "$SUTANDO_NODE")"
-  case ":$PATH:" in *":$_SUTANDO_NODE_DIR:"*) ;; *) PATH="$_SUTANDO_NODE_DIR:$PATH"; export PATH ;; esac
+  sutando_prepend_default_dir "$_SUTANDO_NODE_DIR"
 fi
 run_node_service() {
   # $1 = dist basename (build-bundle artifact), $2 = ts entry (as run_tsx

@@ -151,6 +151,9 @@ ALLOWLIST = {
     # station_stamp never resolves the workspace — read_station_stamp(ws) takes the
     # dir from its caller (marketplace / connect-apps resolve it).
     "src/station_stamp.py",
+    # owner_channel never resolves the workspace — bound_worker(workspace, …) and
+    # its `--workspace` CLI both take the root from the caller (the loop step).
+    "src/owner_channel.py",
     # runtime-api views + registry never resolve the workspace — server.py
     # (the composition root) imports the canonical resolver and injects dirs.
     "src/runtime-api/instance_registry.py",
@@ -158,6 +161,12 @@ ALLOWLIST = {
     # tasks_view: flagged tokens are RPC status fields ("state": "pending"),
     # not filesystem paths; tasks/results dirs are injected by server.py.
     "src/runtime-api/tasks_view.py",
+    # agent_card: flagged tokens are card/row "state" schema fields; the module
+    # does no file I/O and names no workspace path.
+    "src/agent_card.py",
+    # issued_cards never resolves the workspace: its ledger path is composed FROM the
+    # caller's workspace, task_archive.py's caller-supplies-the-path rationale.
+    "src/issued_cards.py",
     # runtime-cli talks to the daemon over the socket only — it renders the
     # daemon's "state" fields and owns no workspace paths.
     "src/runtime-cli/sutando-runtime.py",

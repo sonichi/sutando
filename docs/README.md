@@ -25,7 +25,7 @@ Machine-readable ownership and lifecycle metadata lives in
 - [Worker pool design notes](worker-pool-design-notes.md) — the record behind the v1 design: rejected alternatives, the failure model taken from the #3860 draft, and the owner decisions it encodes.
 - [Migration transition window](migration-transition-window.md) — 30-day reader fallback.
 - [Learn from demonstration](learn-from-demonstration.md) — owner-taught preference capture.
-- [Tutorial delivery](tutorial-delivery.md) — the `tutorial` skill: voice walkthrough and the AG2 Space Getting started page.
+- [Tutorial delivery](tutorial-delivery.md) — the `tutorial` skill: voice walkthrough and the s.space Getting started page.
 - [Graceful shutdown](graceful-shutdown.md) — which restart path signals the core to exit cleanly.
 - [Proactive loop rationale](proactive-loop-rationale.md) — the measurements and incidents behind each step of `skills/proactive-loop/SKILL.md`, which itself carries only the commands.
 - [Task watcher hosting modes](task-watcher-hosting-modes.md) — session watcher vs the supervisor's standby: the tag, the two per-inbox verdicts, the readiness proof, the handoff contract and its timings, the known gaps.
@@ -41,6 +41,7 @@ Machine-readable ownership and lifecycle metadata lives in
 
 ## Operations
 
+- [PR-watch runner lifecycle](pr-watch-lifecycle.md) — thread and process draining, shutdown limits, and isolated verification.
 - [Recovery issue metrics](recovery-issue-metrics.md) — persistent issue IDs and recovery-rate definitions.
 
 - [Release process and migrations](release-process.md)
@@ -66,6 +67,7 @@ Machine-readable ownership and lifecycle metadata lives in
 ## Architecture and decisions
 
 - [Architecture boundaries](architecture-boundaries.md)
+- [Agent-native design rules](agent-native-design-rules.md) — the rules every contribution follows: an agent can do what a person can through an Action; what an agent needs from a person is a control, not a sentence; the contributor and reviewer checklist.
 - [ag2-sparrow v1 delivery contract](sparrow-v1-contract.md)
 - [D1 identity/state census (strangler Slice 1)](census/d1-identity-census.md)
 - [The file delivery protocol as a formal state machine](delivery-protocol.md)
@@ -117,3 +119,5 @@ python3 skills/release/scripts/docs_audit.py
 - [GitHub verification receipts](github-verification.md) — bounded PR evidence and governed foreground publication.
 
 - [Outstanding cron payload preservation](cron-outstanding-payload.md) — immutable prompt tasks until retirement.
+
+- [Task wedge detection](task-wedge-detection.md): detector coverage, recovery, origin-message status and latency evidence.

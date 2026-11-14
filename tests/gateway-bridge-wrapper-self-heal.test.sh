@@ -10,6 +10,7 @@
 #   deliberate window -> restart happens but no alert / no proactive result file
 #   no token      -> wrapper exits 0 at once (no child); startup-runtime's idle-job
 #                    kickstart owns that case, and a live idle PID would read as running
+#   SIGTERM/SIGHUP to the wrapper -> logged, child stopped, wrapper exits 128+signo (never 0)
 #
 # Run: bash tests/gateway-bridge-wrapper-self-heal.test.sh
 set -uo pipefail
@@ -33,7 +34,7 @@ EOS
   echo "import sys; sys.exit($code)" > "$d/src/remote-gateway-bridge.py"
   # the agent-bridge supervisor the wrapper keeps beside the bridge (its own suite pins it)
   printf 'import time\nwhile True: time.sleep(0.2)\n' > "$d/src/sparrowd.py"
-  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$d/src/"
+  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_labels.py" "$d/src/"
   # the wrapper calls the literal `python3`; shim it to the resolved interpreter
   printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"
   printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
@@ -99,7 +100,7 @@ EOS
   # each child records the token it was launched with, then exits 0 (relaunch path)
   printf 'import os,sys\nopen("%s/seen.log","a").write(os.environ.get("REMOTE_TASK_TOKEN","<unset>")+"\\n")\nsys.exit(0)\n' "$d" > "$d/src/remote-gateway-bridge.py"
   printf 'import time\nwhile True: time.sleep(0.2)\n' > "$d/src/sparrowd.py"
-  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$d/src/"
+  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_labels.py" "$d/src/"
   printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"; printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
   chmod +x "$d/shims/python3" "$d/shims/osascript"
   ( cd "$d"; env -u REMOTE_TASK_TOKEN -u AG2_REMOTE_TOKEN PATH="$d/shims:$PATH" SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY=1 \
@@ -130,7 +131,7 @@ EOS
   printf 'import os,sys\nsys.exit(0 if sys.argv[1:] == ["legacy-parked"] and os.path.exists("%s/parked") else 1)\n' "$d" > "$d/scripts/connections.py"
   printf 'import time\nopen("%s/launched.log","a").write("x\\n")\nwhile True: time.sleep(0.2)\n' "$d" > "$d/src/remote-gateway-bridge.py"
   printf 'import time\nwhile True: time.sleep(0.2)\n' > "$d/src/sparrowd.py"
-  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$d/src/"
+  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_labels.py" "$d/src/"
   printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"; printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
   chmod +x "$d/shims/python3" "$d/shims/osascript"
   touch "$d/parked"
@@ -153,6 +154,39 @@ echo "parked legacy -> alive=$p_alive launched-while-parked=$p_early agents=$p_a
 [ "$p_agents" -eq 1 ] || { echo "FAIL: the agent-bridge supervisor was not kept up while parked"; fail=1; }
 [ "$p_resumed" -eq 1 ] || { echo "FAIL: the bridge did not launch after the row was unparked"; fail=1; }
 [ "$p_alerts" -eq 0 ] || { echo "FAIL: parking raised an owner alert"; fail=1; }
+
+# A signal the wrapper did not get from launchctl must not end it with rc 0: the plist's
+# KeepAlive is crash-only, so a clean exit leaves the job down with no line in the log.
+# Prints: <wrapper-rc> <signal-lines> <bridge-alive-after>
+signal_case() {
+  local sig="$1" d; d=$(mktemp -d); mkdir -p "$d/src/launchd" "$d/scripts" "$d/ws/state/channel-bridge-supervisor" "$d/ws/results" "$d/shims"
+  cat > "$d/scripts/sutando-config.sh" <<EOS
+#!/bin/bash
+case "\${1:-}" in workspace) echo "$d/ws" ;; *) echo "$d/none.env" ;; esac
+EOS
+  chmod +x "$d/scripts/sutando-config.sh"
+  printf 'import os,time\nopen("%s/bridge.pid","w").write(str(os.getpid()))\nwhile True: time.sleep(0.2)\n' "$d" > "$d/src/remote-gateway-bridge.py"
+  printf 'import time\nwhile True: time.sleep(0.2)\n' > "$d/src/sparrowd.py"
+  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_labels.py" "$d/src/"
+  printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"; printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
+  chmod +x "$d/shims/python3" "$d/shims/osascript"
+  ( cd "$d" || exit 1; env -u AG2_REMOTE_TOKEN PATH="$d/shims:$PATH" REMOTE_TASK_TOKEN=t SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY=1 \
+      bash src/launchd/gateway-bridge-wrapper.sh > o.log 2>&1 & p=$!
+    for _ in $(seq 1 30); do [ -s bridge.pid ] && break; sleep 0.2; done
+    kill "-$sig" $p 2>/dev/null; wait $p; echo $? > rc.txt )
+  local bpid alive=0; bpid="$(cat "$d/bridge.pid" 2>/dev/null)"
+  sleep 0.3; [ -n "$bpid" ] && kill -0 "$bpid" 2>/dev/null && { alive=1; kill "$bpid" 2>/dev/null; }
+  echo "$(cat "$d/rc.txt") $(grep -c "received SIG$sig" "$d/o.log") $alive"
+  rm -rf "$d"
+}
+for sig in TERM HUP; do
+  read -r s_rc s_lines s_alive <<<"$(signal_case $sig)"
+  want=$(( 128 + $(kill -l $sig) ))
+  echo "SIG$sig to wrapper -> rc=$s_rc log-lines=$s_lines bridge-alive=$s_alive (want rc=$want, lines>0, alive=0)"
+  [ "$s_rc" = "$want" ] || { echo "FAIL: SIG$sig ended the wrapper with rc $s_rc; launchd does not restart a clean exit"; fail=1; }
+  [ "$s_lines" -gt 0 ] || { echo "FAIL: SIG$sig ended the wrapper without saying so in its log"; fail=1; }
+  [ "$s_alive" -eq 0 ] || { echo "FAIL: the bridge outlived its wrapper after SIG$sig"; fail=1; }
+done
 
 [ "$fail" -eq 0 ] && echo "PASS"
 exit $fail

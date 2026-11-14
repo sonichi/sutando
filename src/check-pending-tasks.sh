@@ -116,23 +116,20 @@ print("1" if isinstance(d, dict) and d.get("stop_hook_active") is True else "0")
 #     answered from its OWN deliveries folder only, never the core's tasks/
 #     queue, which is not this session's to report on.
 owned_task_ids() {
-  # What THIS worker was handed. Same owner as claimed_by_a_worker's contract
+  # What THIS worker was handed. Same owner as held_elsewhere's worker contract
   # (src/delivery/task_dispatch.py), so the sentinel suffixes are spelled there
   # and never here. rc 2 = cannot decide: reported, never silently skipped.
   "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" owned-by "$DELIVERIES_DIR" "$1"
 }
 
-claimed_by_a_worker() {
-  # The sentinel layout is src/delivery/task_dispatch.py:worker_holds's contract,
-  # shared with the task notifiers; no python reads as "not held" (reported, like already_delivered).
-  local task_id="$1" rc
-  [ -n "$PYBIN" ] || return 1
-  # A missing script (minimal bundle) can hold nothing -- its rc 2 must not
-  # collapse into the same code path as "deliveries root unreadable" below.
-  [ -f "$REPO_DIR/src/delivery/task_dispatch.py" ] || return 1
-  "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" worker-holds "$DELIVERIES_DIR" "$task_id.txt" >/dev/null 2>&1; rc=$?
-  # 2 = cannot decide (root unreadable): hold, never report it to the core.
-  [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]
+held_elsewhere() {
+  # One predicate (src/task_delegation.py holder): a worker sentinel, else a live delegation
+  # marker postdating $2. rc 0 held, 3 undecidable (held); no python or script reads as not held.
+  local rc
+  [ -n "$PYBIN" ] && [ -f "$REPO_DIR/src/task_delegation.py" ] || return 1
+  "$PYBIN" "$REPO_DIR/src/task_delegation.py" holder "$1" --task-file "$2" \
+    --deliveries "$DELIVERIES_DIR" --workspace "$WORKSPACE" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]
 }
 
 # A delivered result is claimed out of results/ within about a second
@@ -151,10 +148,12 @@ claimed_by_a_worker() {
 # archive-YYYY-MM-DD layout and the prefix-collision case the shared module's
 # own test suite pins), which is exactly the duplicated-policy failure mode
 # the shared owner exists to close off.
+# With the queued file as $2: when it is a wake turn, an older result answered an earlier turn.
 already_delivered() {
-  local task_id="$1"
+  local task_id="$1" since=()
   [ -n "$PYBIN" ] || return 1
-  "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" has-result "$RESULTS_DIR" "$task_id.txt" >/dev/null 2>&1
+  [ -z "${2:-}" ] || since=(--task-file "$2")
+  "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" has-result "$RESULTS_DIR" "$task_id.txt" ${since[@]+"${since[@]}"} >/dev/null 2>&1
 }
 
 # A task the core is on RIGHT NOW is not a stop-time orphan (user report
@@ -162,8 +161,18 @@ already_delivered() {
 # life of a task it was working, ~6/hour). The scheduler's own activity snapshot
 # (src/activity_bus.py, state/activity/<task-id>.json) says RUNNING with fresh
 # activity; queued, waiting on a person, stale, unreadable or absent still blocks.
+# A wake turn ($2) left unanswered by a turn that recorded a no-send is not in progress.
 task_in_progress() {
   [ -n "$PYBIN" ] || return 1
+  if [ -z "${NO_SEND_THIS_TURN:-}" ]; then
+    NO_SEND_THIS_TURN=no
+    "$PYBIN" "$REPO_DIR/src/turn_ledger.py" --workspace "$WORKSPACE" no-send-this-turn >/dev/null 2>&1 \
+      && NO_SEND_THIS_TURN=yes
+  fi
+  if [ "$NO_SEND_THIS_TURN" = yes ] && [ -n "${2:-}" ] \
+    && "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" wake-turn "$(dirname "$2")" "$(basename "$2")" >/dev/null 2>&1; then
+    return 1
+  fi
   [ -f "$REPO_DIR/src/activity_bus.py" ] || return 1
   "$PYBIN" "$REPO_DIR/src/activity_bus.py" in-progress "$1" --workspace "$WORKSPACE" \
     --max-age "${SUTANDO_STOP_HOOK_IN_PROGRESS_MAX_AGE:-1800}" >/dev/null 2>&1
@@ -215,9 +224,9 @@ else
   for f in "$TASKS_DIR"/*.txt; do
     BASENAME=$(basename "$f")
     TASK_ID="${BASENAME%.txt}"
-    claimed_by_a_worker "$TASK_ID" && continue
-    already_delivered "$TASK_ID" && continue
-    task_in_progress "$TASK_ID" && continue
+    held_elsewhere "$TASK_ID" "$f" && continue
+    already_delivered "$TASK_ID" "$f" && continue
+    task_in_progress "$TASK_ID" "$f" && continue
     UNPROCESSED_NAMES="$UNPROCESSED_NAMES $BASENAME"
     if [ -f "$RESULTS_DIR/$BASENAME" ]; then
       # Readiness is owned by src/delivery/readiness.py; existence is not

@@ -52,7 +52,7 @@ unique base and display labels resolve to a worker ID where intent is captured.
 A human name shared by workers is refused. New broker display names equal to
 `core`, any existing worker ID, or shaped like a full 32-hex ID are refused.
 Registration refuses a new ID already used as another worker's name. The
-optional `display_label` from AG2 Space also changes the name shown to people;
+optional `display_label` from s.space also changes the name shown to people;
 removing it restores the base label. Human status renders the effective name
 with the full ID, such as
 `kc-reviewer-ryan (274cb60d473744dba54040a9de119877)`.
@@ -61,7 +61,7 @@ with the full ID, such as
 |---|---|---|
 | `worker_id` | `7c54b230a8d94ea9b86f52d70134ac68` | routing, directories, binding references, message headers; immutable |
 | `label` | `worker-1`, `code reviewer` | base routing alias; renameable |
-| `display_label` | `kc-reviewer-ryan` | optional AG2 Space display override; unique names can address the worker |
+| `display_label` | `kc-reviewer-ryan` | optional s.space display override; unique names can address the worker |
 | `incarnation_id` | minted per session | which run of that worker accepted an attempt |
 
 **The id is `uuid.uuid4().hex`** — 32 lowercase hex, exactly the
@@ -113,7 +113,21 @@ tasks/task-123.txt                                              the payload: imm
 deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.txt        a sentinel, 0 bytes — existing IS the assignment
 deliveries/7c54b230a8d94ea9b86f52d70134ac68/task-123.accepted   the same sentinel, suffix substituted
 tasks/archive/task-123.txt                                      finish (sentinel removed, payload archived)
+deliveries/7c54b230a8d94ea9b86f52d70134ac68/archive/task-123.txt  a finished task's sentinel, moved; nothing reads it as owed
 ```
+
+**A spent task's sentinel moves to `archive/`, and nothing deletes one.** One rule,
+`pool_delivery.sentinel_retirable`, says when a sentinel may leave: its task is archived or gone
+from everywhere, or answered with its payload out of `tasks/` or this recipient's done flag
+written. Until then the bridge still reads it for whose reply it is delivering.
+`pool_delivery.archive_finished` is the only mover: it moves such sentinels into the recipient's
+`archive/` under the folder lock and re-checks the rule there, so a task re-queued meanwhile keeps
+its hold. `task_ids=` narrows it to some tasks; without it (the watcher's startup pass) a missing
+task's sentinel stays, because the inbox resolver still judges those. `prune_spent`, the boot
+`sweep` and the supervisor's retire name their ids and all go through it. A move that cannot happen (an unusable `archive/`) leaves
+the sentinel in the inbox. Every reader lists only the folder's top level, so an archived sentinel
+is no hold. `pool_delivery.py archive-finished <worker> --dry-run` prints the counts.
+`prune_spent` also removes regular files in `archive/` older than 14 days by mtime (`ARCHIVE_MAX_AGE_DAYS`), fail-open and without following links. The clock counts from delivery: the hard-link move keeps the sentinel's mtime, so the first `prune_spent` pass after this deploys archives the old backlog and prunes everything older than 14 days at once.
 
 **Files under `deliveries/` are sentinels, not tasks.** A sentinel needs no content:
 the id is its name, the recipient is its folder, and the worker reads the payload from
@@ -705,3 +719,33 @@ Each of these is out of scope for v1, and none is an oversight.
 5. Identity persistence versus context restoration — resuming is not remembering.
 6. How a steering message reaches the in-flight task it steers.
 7. Per-worker schedule durability, and suppression on pause.
+
+### Usage-limit recovery requests
+
+A live pane classified as `limit` with outstanding deliveries uses a separate
+persisted wait, instead of the watcher-loss or human-card ladder. A printed reset
+time (including its named timezone) sets the first due time, parsed once per
+banner: an unchanged banner keeps that deadline across midnight, and a yearless
+date more than half a year past names the next year. A time without a date names
+its next occurrence, rolling to tomorrow if it is not in the future; an explicit
+`today` or dated past reset stays past. Month/day dates accept an optional comma.
+Unreadable or absent reset text uses a 15-minute probe interval. A due tick requests one fresh turn
+through `pool_ask` and the normal recipient routing path, asking the worker to
+re-arm its session watcher and process its existing inbox. For Claude, a fresh limit capture and empty composer permit a wake-up line
+through the existing guarded line sender, pointing at that routed payload.
+Under its lock, the sender rechecks both the empty composer and that the pane
+still waits on the limit alone (`--require-limit`: no running turn, no other
+dialog); refusals consume an attempt
+and retain the queued task. The worker is never restarted for this action.
+
+Still-limited observations back off for 15, 30, 60 and 120 minutes, with at most
+four delivery requests before escalation. The attempt count survives supervisor
+restarts and every non-limit observation except an idle pane: a recovery
+submission can show a spinner before the same refusal returns, so only a turn
+that finished without a limit starts a new episode. Paused workers and workers without outstanding work receive no request.
+
+The standalone notifier deliberately holds limit refusals. The bounded recovery
+action supplies the wake-up through the guarded sender instead of waiting for
+that notifier. A successful send proves submission, not that the provider accepted
+the turn; continued limit observations use the same backoff. Non-Claude workers
+are currently refused by the recovery action.

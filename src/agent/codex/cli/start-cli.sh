@@ -135,19 +135,10 @@ CODEX_INSTALL_BIN="${CODEX_INSTALL_BIN:-$HOME/.npm-global/bin}"
 # system node, so the app's bundled runtime must be reachable or every codex
 # invocation dies with "env: node: No such file or directory" (exit 127) —
 # which the auth probe below would otherwise misreport as "not authenticated".
-# The engine lives at <app-support>/engine; this script runs from
-# <app-support>/engine/sutando, so the runtime is one level up from $REPO.
-CODEX_NODE_BIN="${CODEX_NODE_BIN:-$(cd "$REPO/.." 2>/dev/null && pwd)/runtime/node/bin}"
-# APPEND, never prepend: an operator (or a test harness) who put a codex or
-# node earlier on PATH must keep winning; we only add a fallback.
-for _d in "$CODEX_NODE_BIN" "$CODEX_INSTALL_BIN"; do
-  [ -d "$_d" ] || continue
-  case ":$PATH:" in
-    *":$_d:"*) ;;
-    *) PATH="$PATH:$_d" ;;
-  esac
-done
-export PATH
+# launch-path.sh owns where the bundled runtime lives; it only appends, so an
+# operator's (or a test harness's) codex or node earlier on PATH keeps winning.
+. "$REPO/src/agent/launch-path.sh"
+sutando_append_launch_path "$REPO" "${CODEX_NODE_BIN:-$(sutando_bundled_node_dir "$REPO")}" "$CODEX_INSTALL_BIN"
 
 # The core can be launched while the app is still installing Codex (observed:
 # engine unpacked at :25, codex landed at :32 of the following minute). Exiting
@@ -196,15 +187,30 @@ if ! command -v codex >/dev/null 2>&1; then
   fi
 fi
 
-# Use the configured CODEX_HOME (or another env name chosen by the operator).
-# The default points at ~/.codex to reuse the existing authenticated install.
-config_env="$(bash "$REPO/scripts/sutando-config.sh" core-config-dir-env-name codex)"
-config_value="$(bash "$REPO/scripts/sutando-config.sh" core-config-dir-value codex)"
-if [ -n "$config_env" ] && [ -n "$config_value" ]; then
-  mkdir -p "$config_value"
-  export "$config_env=$config_value"
-  echo "  ✓ $config_env=$config_value"
-fi
+# One interpreter for the heartbeat, start and stop alike: the repository resolver, never a bare
+# `python3` (on a clean macOS host PATH can hand that name to Apple's developer-tools stub).
+# Resolved ONCE, in this shell, never inside $(...): a subshell's assignment cannot reach the
+# parent, so stop and start would each resolve on their own and could disagree.
+_HB_PY=""
+resolve_heartbeat_python() {
+  [ -r "$REPO/scripts/python-binary.sh" ] || return 0
+  # shellcheck source=scripts/python-binary.sh
+  . "$REPO/scripts/python-binary.sh"
+  _HB_PY="$(resolve_python "$REPO" 2>/dev/null || true)"
+}
+heartbeat_python() {
+  [ -n "$_HB_PY" ] && printf '%s' "$_HB_PY"
+}
+resolve_heartbeat_python
+
+# The configured CODEX_HOME is resolved, checked and created only by src/codex_home.py;
+# CODEX_HOME_DIR is the one home every later step uses, empty when nothing may be written.
+# shellcheck source=../codex-home.sh
+. "$REPO/src/agent/codex/codex-home.sh"
+sutando_codex_home_prepare "$REPO" "$(heartbeat_python)" || true
+CODEX_HOME_DIR="$SUTANDO_CODEX_HOME"
+CODEX_HOME_REFUSED="$SUTANDO_CODEX_HOME_REFUSED"
+[ -n "${CODEX_HOME:-}" ] && echo "  ✓ CODEX_HOME=$CODEX_HOME"
 
 # `|| _codex_auth_rc=$?` keeps set -e from killing the script on a non-zero
 # probe — the exit code IS the signal here, not a failure.
@@ -214,7 +220,7 @@ if [ "$_codex_auth_rc" -eq 127 ]; then
   # 127 is "could not execute", not "not logged in" — almost always a missing
   # node on PATH. Saying "run codex login" here sends people the wrong way.
   echo "Codex CLI could not run (exit 127) — its node runtime was not found." >&2
-  echo "  PATH lacked a usable node; looked in $CODEX_NODE_BIN" >&2
+  echo "  PATH lacked a usable node: PATH=$PATH" >&2
   exit 127
 fi
 if [ "$_codex_auth_rc" -ne 0 ]; then
@@ -274,23 +280,55 @@ CODEX_ARGS=(
   # The core runs headless: an interactive "Update available" menu at startup
   # blocks it until someone answers, so the startup update check stays off.
   -c check_for_update_on_startup=false
+  # The checkout's AGENTS.md is larger than Codex's 32 KiB default, which drops its tail.
+  -c project_doc_max_bytes=131072
 )
 if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   CODEX_ARGS+=(-m "$SUTANDO_CORE_MODEL")
 fi
-
 # A git checkout's first Codex launch stops on "Trust this folder?", which a headless core
 # never answers; see src/codex_project_trust.py. Best effort: a failure leaves the prompt.
 ensure_codex_project_trust() {
   local py out
   py="$(heartbeat_python)"
   [ -n "$py" ] || return 0
-  if out="$("$py" "$REPO/src/codex_project_trust.py" "${CODEX_HOME:-$HOME/.codex}" "$WORKING_DIR" "$REPO")"; then
+  if out="$("$py" "$REPO/src/codex_project_trust.py" "$CODEX_HOME_DIR" "$WORKING_DIR" "$REPO")"; then
     [ "$out" = trusted ] && echo "  ✓ Codex project trust recorded for $WORKING_DIR"
   else
     echo "  ⚠ could not record Codex project trust; the core may wait on a trust prompt" >&2
   fi
   return 0
+}
+
+# A desktop host's own AGENTS.md sits above the checkout, where Codex never looks; see
+# src/codex_host_instructions.py. Best effort: a failure leaves the core without it.
+ensure_codex_host_instructions() {
+  local py out
+  py="$(heartbeat_python)"
+  [ -n "$py" ] || return 0
+  if out="$("$py" "$REPO/src/codex_host_instructions.py" "$CODEX_HOME_DIR" "$REPO")"; then
+    case "$out" in
+      linked) echo "  ✓ Codex core given the host's AGENTS.md" ;;
+      overridden) echo "  ⚠ $CODEX_HOME_DIR/AGENTS.override.md replaces the host's AGENTS.md for the core" >&2 ;;
+      invalid-home) echo "  ⚠ $CODEX_HOME_DIR is relative, contains '..', or has a symlink or non-directory component; the host's AGENTS.md was not linked" >&2 ;;
+      dangling) echo "  ⚠ $CODEX_HOME_DIR/AGENTS.md is a broken link; remove it so the core gets the host's AGENTS.md" >&2 ;;
+      foreign) echo "  ⚠ an existing AGENTS.md entry in $CODEX_HOME_DIR is not the host's and was kept; the host's AGENTS.md was not linked" >&2 ;;
+      owner-home) echo "  ⚠ $CODEX_HOME_DIR is the owner's own Codex home; the host's AGENTS.md was not linked" >&2 ;;
+    esac
+  else
+    echo "  ⚠ could not link the host's AGENTS.md; the core may miss its first-contact instructions" >&2
+  fi
+  return 0
+}
+
+# A refused home gets no write from the launcher: not the trust entry, not the link.
+prepare_codex_home() {
+  if [ -n "$CODEX_HOME_REFUSED" ] || [ -z "$CODEX_HOME_DIR" ]; then
+    echo "  ⚠ not recording Codex project trust or linking the host's AGENTS.md: the Codex home was refused" >&2
+    return 0
+  fi
+  ensure_codex_project_trust
+  ensure_codex_host_instructions
 }
 
 apply_tmux_defaults() {
@@ -317,7 +355,7 @@ ensure_task_notifier() {
   expected_version="$(
     cksum "${version_files[@]}" \
       | cksum | awk '{print $1 "-" $2}'
-  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')"
+  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-s$(printf '%s' "${SUTANDO_STOP_INTERRUPT:-}" | cksum | awk '{print $1}')"
   if session_exists "$WATCHER_SESSION"; then
     active_version="$(
       tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \
@@ -332,6 +370,9 @@ ensure_task_notifier() {
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
+  # The stop handler reads it in the watcher's environment; it is in the version, so a change restarts it.
+  # Always set, empty included: an omitted one inherits whatever the tmux server's global env holds.
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
   [ -n "${SUTANDO_ISOLATED_WORKING_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_ISOLATED_WORKING_DIR=$SUTANDO_ISOLATED_WORKING_DIR")
   [ -n "${CODEX_HOME:-}" ] && NOTIFIER_ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
   [ -n "${SUTANDO_CORE_MODEL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_CORE_MODEL=$SUTANDO_CORE_MODEL")
@@ -402,20 +443,6 @@ ensure_core_monitor() {
 # migrate schedules and then silently suppress every fire. Start it here (once).
 # Guard on the $REPO-anchored path so the check is per-checkout (won't cross-match
 # a heartbeat from a different checkout/bundle, and stays hermetic under test).
-# One interpreter for the heartbeat, start and stop alike: the repository resolver, never a bare
-# `python3` (on a clean macOS host PATH can hand that name to Apple's developer-tools stub).
-# Resolved ONCE, in this shell, never inside $(...): a subshell's assignment cannot reach the
-# parent, so stop and start would each resolve on their own and could disagree.
-_HB_PY=""
-resolve_heartbeat_python() {
-  [ -r "$REPO/scripts/python-binary.sh" ] || return 0
-  # shellcheck source=scripts/python-binary.sh
-  . "$REPO/scripts/python-binary.sh"
-  _HB_PY="$(resolve_python "$REPO" 2>/dev/null || true)"
-}
-heartbeat_python() {
-  [ -n "$_HB_PY" ] && printf '%s' "$_HB_PY"
-}
 ensure_core_heartbeat() {
   if [ -n "$EXTERNAL_HELPERS" ]; then check_external_helpers; return; fi
   local _py
@@ -487,11 +514,18 @@ ensure_codex_auto_reset_timer() {
     return 0
   fi
   ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 0
-  if ! "$py" "$timer" ensure --workspace "$ws" --codex-home "${CODEX_HOME:-$HOME/.codex}" >/dev/null; then
+  [ -n "$CODEX_HOME_DIR" ] || return 0
+  if ! "$py" "$timer" ensure --workspace "$ws" --codex-home "$CODEX_HOME_DIR" >/dev/null; then
     echo "  ⚠ Could not reconcile the Codex earned-reset timer" >&2
   fi
 }
 
+prepare_codex_bootstrap() {
+  local prompt
+  [ -n "$_HB_PY" ] || { echo "start-cli: no runnable Python for managed Codex bootstrap" >&2; return 1; }
+  prompt="$("$_HB_PY" "$REPO/src/delivery/codex_recovery.py" prompt)" || return 1
+  CODEX_ARGS+=("$prompt")
+}
 # Codex has no session CronCreate surface. Two complementary reconcilers run on
 # each default invocation, partitioned by reconcile_launchd.py's eligibility
 # rules so no entry is double-owned: ensure_durable_schedules moves ordinary
@@ -499,7 +533,6 @@ ensure_codex_auto_reset_timer() {
 # codex-task entries, and anything already launchd-owned), and
 # ensure_codex_scheduler owns execution:codex-task entries plus the canonical
 # five-minute main loop while this runtime is selected.
-resolve_heartbeat_python
 if [ "$RECONCILE_SCHEDULES" = 1 ]; then
   ensure_durable_schedules
   ensure_codex_scheduler
@@ -634,7 +667,8 @@ if ! tmux_available; then
     echo "  ⚠ codex not found — not clearing the shutdown sentinel, no core can start." >&2
     exit 127
   fi
-  ensure_codex_project_trust
+  prepare_codex_bootstrap || exit 1
+  prepare_codex_home
   stash_shutdown_sentinel
   clear_shutdown_sentinel
   # errexit would exit on the failed exec before the restore below is reached;
@@ -687,10 +721,11 @@ heal_core_window() {
     return 3
   fi
   echo "  ⚠ $SESSION exists but its Codex core is gone — healing core window (sibling windows preserved)" >&2
+  prepare_codex_bootstrap || return 1
   for _win in $(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" all codex); do
     tmux -S "$TMUX_SOCKET" kill-window -t "$_win" 2>/dev/null || true
   done
-  ensure_codex_project_trust
+  prepare_codex_home
   if ! idx="$(sutando_new_core_window "$TMUX_SOCKET" "$SESSION" "${CORE_ENV_ARGS[@]}" -c "$REPO" codex "${CODEX_ARGS[@]}")" \
      || [ -z "$idx" ]; then
     echo "  ⚠ could not create a core window in $SESSION — sentinel NOT cleared, no core is serving." >&2
@@ -724,7 +759,8 @@ fi
 # Creates the core session, waits for has-session within the configured budget
 # (new-session rc=0 only means tmux accepted it), then starts the helpers.
 start_core_session_and_helpers() {
-  ensure_codex_project_trust
+  prepare_codex_bootstrap || return 1
+  prepare_codex_home
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"
   wait_core_up "$SESSION" session_exists "$SESSION" || return 1
   log_session_start

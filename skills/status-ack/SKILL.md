@@ -1,6 +1,6 @@
 ---
 name: status-ack
-description: Live-agent runner that tells a requester, once, that their AG2 Space task was received when no session has picked it up and no activity card or progress notice shows it by its first-ack deadline, and tells the owner once per outage when only the standby watcher is reading the inbox. Off by default (STATUS_ACK_ENABLED). Not slash-invoked.
+description: Live-agent runner that tells a requester, once, that their s.space task was received when no session has picked it up and no activity card or progress notice shows it by its first-ack deadline, and tells the owner once per outage when only the standby watcher is reading the inbox. Off by default (STATUS_ACK_ENABLED). Not slash-invoked.
 ---
 
 # status-ack

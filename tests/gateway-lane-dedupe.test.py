@@ -5,7 +5,8 @@ Covers src/lane_dedupe.py and the gateway bridge's delegation to it:
   1. the same event on two lanes queues one task; the second lane answers its own
      task id with the redelivery control result, so the broker settles it;
   2. the same lane seeing the message again keeps today's behaviour;
-  3. a task without source_message_id, or a hook task, is never deduped;
+  3. a task without source_message_id is never deduped; a hook or Summon task dedupes on its own fire
+     or Summon identity, never on a message id;
   4. claims expire after the TTL;
   5. an unwritable or malformed store fails open, with one warning line;
   6. processes racing on one key: exactly one wins (real multiprocessing), and a claim
@@ -122,8 +123,53 @@ def main():
           (rgb.TASKS_DIR / "task-N1.txt").exists() and (rgb.TASKS_DIR / "task-sspace~task-N2.txt").exists())
     on_lane("", "task-H1", source_message_id="$ev2", hook={"id": "h"}, **room)
     on_lane("sspace", "task-H2", source_message_id="$ev2", hook={"id": "h"}, **room)
-    check("hook tasks are delivered on both lanes",
+    check("a hook task with no fire id is delivered on both lanes",
           (rgb.TASKS_DIR / "task-H1.txt").exists() and (rgb.TASKS_DIR / "task-sspace~task-H2.txt").exists())
+    # 3b. A Commons context task dedupes on its own fire or Summon, never on a message id.
+    # Each lane's agent has its own id, so the copies' broker task ids differ; the context does not.
+    fire = {"hook_id": "hk", "fire_id": "fire-1", "caused_by": "fire-1"}
+    on_lane("", "task-F1", hook=fire, **room)
+    on_lane("sspace", "task-F2", hook=fire, **room)
+    check("the same hook fire on both lanes is handled once",
+          (rgb.TASKS_DIR / "task-F1.txt").exists() and not (rgb.TASKS_DIR / "task-sspace~task-F2.txt").exists()
+          and (rgb.RESULTS_DIR / "task-sspace~task-F2.txt").exists())
+    summon = {"task_id": "task-on-lane-a", "caused_by": "task-on-lane-a", "room_id": "!room:example.org",
+              "database": "db1", "row_id": "r1", "update_id": 41}
+    on_lane("", "task-S1", summon=summon, **room)
+    on_lane("sspace", "task-S2", summon={**summon, "task_id": "task-on-lane-b", "caused_by": "task-on-lane-b"},
+            **room)
+    check("the same Summon on both lanes is handled once",
+          (rgb.TASKS_DIR / "task-S1.txt").exists() and not (rgb.TASKS_DIR / "task-sspace~task-S2.txt").exists()
+          and (rgb.RESULTS_DIR / "task-sspace~task-S2.txt").exists())
+    on_lane("", "task-S3", summon={**summon, "update_id": 42}, **room)
+    on_lane("sspace", "task-M3", source_message_id="$ev3", **room)
+    on_lane("", "task-S4", source_message_id="$ev3", summon={**summon, "update_id": 43}, **room)
+    # On the OTHER lane, so dropping update_id from the key would fail here (same-lane claims always pass).
+    on_lane("sspace", "task-S3b", summon={**summon, "update_id": 44}, **room)
+    check("a later update of the same row is a new Summon, on the same lane or the other",
+          (rgb.TASKS_DIR / "task-S3.txt").exists() and (rgb.TASKS_DIR / "task-sspace~task-S3b.txt").exists())
+    # Distinct fields that would join to the same string must stay distinct Summons.
+    piped = {**summon, "update_id": 1}
+    on_lane("", "task-P1", summon={**piped, "database": "db|part", "row_id": "row"}, **room)
+    on_lane("sspace", "task-P2", summon={**piped, "database": "db", "row_id": "part|row"}, **room)
+    check("two distinct Summons whose fields share a joined form are both delivered",
+          (rgb.TASKS_DIR / "task-P1.txt").exists() and (rgb.TASKS_DIR / "task-sspace~task-P2.txt").exists()
+          and not (rgb.RESULTS_DIR / "task-sspace~task-P2.txt").exists())
+    check("a Summon is never folded into a message task that shares its message id",
+          (rgb.TASKS_DIR / "task-sspace~task-M3.txt").exists() and (rgb.TASKS_DIR / "task-S4.txt").exists())
+    key = lane_dedupe.key_of
+    check("context keys ignore the message id and the per-agent task id",
+          key({"source_message_id": "$x", "hook": fire}) == key({"hook": fire})
+          != key({"channel_id": "!r", "source_message_id": "$x"})
+          and key({"summon": summon}) == key({"summon": {**summon, "task_id": "other"}}) is not None)
+    check("no context key equals a message key, whatever the room and message id",
+          key({"hook": {"fire_id": "f"}}) != key({"channel_id": "hook", "source_message_id": "f"})
+          and key({"summon": summon}) != key({"channel_id": "summon", "source_message_id":
+                                               "!room:example.org|db1|r1|41"}))
+    check("a context missing its identity has no key, so it is delivered",
+          key({"source_message_id": "$x", "hook": {"hook_id": "h"}}) is None
+          and key({"source_message_id": "$x", "summon": {"task_id": "t"}}) is None
+          and key({"summon": {**summon, "update_id": None}}) is None)
     check("the key falls back to channel_id and is absent without a message id",
           lane_dedupe.key_of({"channel_id": "!r", "source_message_id": "$x"})
           == lane_dedupe.key_of({"source_room_id": "!r", "source_message_id": "$x"})
@@ -332,11 +378,14 @@ def main():
             rgb.GATEWAY_INSTANCE = ""
             rgb._post_task_ack = real_post
         at = dict(acks)
+        wait = rgb._INTAKE_ROUND_WAIT_S
+        # Judged against the wait itself, not wall-clock bounds a loaded runner can overrun.
         check("the sibling with no owner wait is acked before any waited message",
-              at.get("task-W3", 9) < 0.3, repr(acks))
+              at.get("task-W3", 9) < min(wait, at.get("task-W1", 0), at.get("task-W2", 0)), repr(acks))
         check("the waited messages are still answered once the wait ends",
-              {"task-W1", "task-W2"} <= set(at) and at["task-W1"] >= 0.5, repr(acks))
-        check("a round waits once, not once per message", at.get("task-W2", 9) < 0.9, repr(acks))
+              {"task-W1", "task-W2"} <= set(at) and at["task-W1"] >= wait - 0.1, repr(acks))
+        check("a round waits once, not once per message",
+              at.get("task-W2", 9) - at.get("task-W1", 0) < wait, repr(acks))
     finally:
         connections.event_owner_lanes = real_owner
         lane_dedupe.OWNER_WAIT_S = real_wait

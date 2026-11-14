@@ -20,13 +20,9 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # does (cd … && pwd -P), so the hook lands in the project Claude will actually
 # read. Writing to $REPO/.claude/settings.json in the SUTANDO_CLAUDE_WORKING_DIR
 # configuration installs the hook in the wrong project and it never fires.
-if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
-  _cwd_exp="${SUTANDO_CLAUDE_WORKING_DIR/#\~/$HOME}"
-  mkdir -p "$_cwd_exp" || { echo "  ✗ can't create core working dir: $_cwd_exp" >&2; exit 1; }
-  TARGET_DIR="$(cd "$_cwd_exp" && pwd -P)"
-else
-  TARGET_DIR="$REPO"
-fi
+# shellcheck disable=SC1091
+. "$REPO/scripts/core-working-dir.sh"
+TARGET_DIR="$(sutando_core_working_dir "$REPO")" || { echo "  ✗ SUTANDO_CLAUDE_WORKING_DIR rejected — hook not installed" >&2; exit 1; }
 
 SETTINGS="$TARGET_DIR/.claude/settings.json"
 # The hint script itself always lives in this checkout ($REPO) — the working

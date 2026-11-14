@@ -550,5 +550,113 @@ class WindowsIdentityTest(unittest.TestCase):
         self.assertEqual(self.mod.acquire("r", self.ws).status, "deferred", "UNKNOWN is never a generation mismatch")
 
 
+class DarwinBootSessionTest(unittest.TestCase):
+    """On macOS the token's boot part is kern.bootsessionuuid, so stepping the wall clock (which
+    the kernel answers by recomputing kern.boottime) never makes a live writer read as gone."""
+
+    setUp, tearDown, _lock_path = LockTest.setUp, LockTest.tearDown, LockTest._lock_path
+
+    def _darwin(self, boot_session, start=(1_793_000_000, 123_456)):
+        import struct
+        info = struct.pack("=qi", *start) + b"\0" * 16
+        self.mod._IS_WINDOWS = False
+        self.mod.sys = types.SimpleNamespace(platform="darwin")
+        self.mod._darwin_boot_session = lambda: boot_session
+        self.mod._darwin_sysctl = lambda mib: info if list(mib[:3]) == [1, 14, 1] else \
+            self.fail(f"the token reads no other sysctl (asked for {mib})")
+
+    def test_the_token_is_the_boot_session_and_the_start_time(self):
+        self._darwin("3F1C577F-F628-4A69-97F8-84904C4785A6")
+        self.assertEqual(self.mod.proc_start(77, self.ws / "absent"),
+                         "darwin-3F1C577F-F628-4A69-97F8-84904C4785A6:1793000000.123456")
+        self._darwin(None)
+        self.assertIsNone(self.mod.proc_start(77, self.ws / "absent"), "an unreadable boot session reads nothing")
+
+    def test_same_start_matches_a_legacy_boottime_token_on_its_start_time_alone(self):
+        same = self.mod.same_start
+        new = "darwin-3F1C577F-F628-4A69-97F8-84904C4785A6:1793000000.123456"
+        self.assertTrue(same(new, new))
+        self.assertTrue(same("darwin-1792990000.000001:1793000000.123456", new), "written before the fix")
+        self.assertTrue(same("darwin-1792990000.000001:1793000000.123456",
+                             "darwin-1792990000.000777:1793000000.123456"), "boottime moved by a clock step")
+        self.assertFalse(same("darwin-1792990000.000001:1793000000.999999", new), "another start time")
+        self.assertFalse(same("darwin-AAAAAAAA-0000-0000-0000-000000000000:1793000000.123456", new),
+                         "two boot sessions are two boots")
+        self.assertFalse(same("b-1:12345", "b-2:12345"), "Linux tokens match exactly")
+        for missing in (None, "", 7):
+            self.assertFalse(same(missing, new))
+            self.assertFalse(same(new, missing))
+
+    def test_a_live_writer_whose_lease_names_a_legacy_token_is_not_taken_over(self):
+        me = os.getpid()
+        current = "darwin-3F1C577F-F628-4A69-97F8-84904C4785A6:1793000000.123456"
+        self.mod._probe = lambda pid: ("alive", current) if pid == me else ("dead", None)
+        holder = {"role": "gw", "pid": me, "host": HOST, "workspace": str(self.ws),
+                  "acquired_at": time.time(), "heartbeat_at": time.time(), "schema_version": 1,
+                  "proc_start": "darwin-1792990000.000001:1793000000.123456"}
+        self.assertFalse(self.mod._holder_is_dead(holder, HOST))
+        self.assertTrue(self.mod.lease_is_live(holder), "a second bridge defers to it")
+        self.assertEqual(self.mod.lease_process(holder), me)
+        holder["proc_start"] = "darwin-1792990000.000001:1700000000.000000"
+        self.assertTrue(self.mod._holder_is_dead(holder, HOST), "a recycled pid is still caught")
+        self.assertEqual(self.mod.lease_process(holder), 0)
+
+
+class DarwinBootSessionReadTest(unittest.TestCase):
+    """The kern.bootsessionuuid read, through a stand-in libc: runs on any platform."""
+
+    def setUp(self):
+        self.mod = _load()
+        self.reads = 0
+
+    def _libc(self, value=b"3F1C577F-F628-4A69-97F8-84904C4785A6", probe=0, fetch=0, size=None, raises=None):
+        import ctypes
+        test = self
+
+        class Libc:
+            def sysctlbyname(self, name, buf, sizeref, newp, newlen):
+                test.assertEqual(name, b"kern.bootsessionuuid")
+                if raises:
+                    raise raises
+                if buf is None:
+                    test.reads += 1
+                    sizeref._obj.value = len(value) + 1 if size is None else size
+                    return probe
+                ctypes.memmove(buf, value + b"\0", len(value) + 1)
+                return fetch
+        return unittest.mock.patch("ctypes.CDLL", lambda *a, **k: Libc()), \
+            unittest.mock.patch("ctypes.util.find_library", lambda name: "libc")
+
+    def _read(self, **kw):
+        cdll, find = self._libc(**kw)
+        with cdll, find:
+            return self.mod._read_darwin_boot_session()
+
+    def test_a_readable_session_is_returned(self):
+        self.assertEqual(self._read(), "3F1C577F-F628-4A69-97F8-84904C4785A6")
+
+    def test_an_unreadable_session_is_none(self):
+        self.assertIsNone(self._read(probe=-1), "the size probe failed")
+        self.assertIsNone(self._read(size=0), "an empty value")
+        self.assertIsNone(self._read(fetch=-1), "the read failed")
+        self.assertIsNone(self._read(value=b"  "), "blank")
+        self.assertIsNone(self._read(value=b"a:b"), "a ':' would split the token")
+        self.assertIsNone(self._read(raises=OSError("no libc")))
+
+    def test_the_first_good_read_is_kept_and_a_failed_one_is_retried(self):
+        self.mod._BOOT_SESSION.clear()
+        cdll, find = self._libc(probe=-1)
+        with cdll, find:
+            self.assertIsNone(self.mod._darwin_boot_session())
+            self.assertIsNone(self.mod._darwin_boot_session())
+        self.assertEqual(self.reads, 2, "a failed read is not cached")
+        cdll, find = self._libc()
+        with cdll, find:
+            first = self.mod._darwin_boot_session()
+            second = self.mod._darwin_boot_session()
+        self.assertEqual((first, second), ("3F1C577F-F628-4A69-97F8-84904C4785A6",) * 2)
+        self.assertEqual(self.reads, 3, "one more read, then the kept value")
+
+
 if __name__ == "__main__":
     unittest.main()

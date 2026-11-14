@@ -78,9 +78,10 @@ class PersonOnlyGates(unittest.TestCase):
 class GateEvidence(unittest.TestCase):
     def test_completed_recap_requires_completion_context(self):
         recap = "※ recap: if you typed X, press Enter there to send it."
-        pane = recap + "\nNothing needs you this round.\n❯ \n" + FOOTER
-        self.assertNotRegex(pg.gate_evidence(pane), pg.AWAIT_HINT)
-        self.assertEqual(state(pane, "claude"), "idle-ready")
+        for composer in ("❯ ", "  ❯ "):
+            pane = recap + "\nNothing needs you this round.\n" + composer + "\n" + FOOTER
+            self.assertNotRegex(pg.gate_evidence(pane), pg.AWAIT_HINT)
+            self.assertEqual(state(pane, "claude"), "idle-ready")
         self.assertIn(recap, pg.gate_evidence(recap + "\n❯ "))
 
     def test_unknown_dialog_evidence_survives_idle_chrome(self):
@@ -230,6 +231,49 @@ class ClaudeClassification(unittest.TestCase):
         self.assertEqual(state(f"❯ \n{FOOTER}\n", "claude"), "idle-ready")
 
 
+class CodexSingleLineComposer(unittest.TestCase):
+    PROMPT = "Reply exactly READY. Do not use tools."
+    FOOTER = ("  \x1b[38;5;223mgpt-test default\x1b[39m · "
+              "\x1b[38;5;151m/tmp/test…\x1b[39m  ⚠ "
+              "\x1b[38;5;179m2 warnings\x1b[39m · \x1b[1mf2\x1b[0m to view")
+
+    def test_colored_footer_with_one_structural_gap_preserves_exact_input(self):
+        capture = f"\x1b[1m›\x1b[0m {self.PROMPT}\n\n{self.FOOTER}\n\n"
+        self.assertEqual(pg.composer_text(capture, pg.CODEX), self.PROMPT)
+        with mock.patch.object(sys, "stdin", io.StringIO(capture)), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(pg.main(["composer-text", "--runtime", "codex"]), 0)
+        self.assertEqual(output.getvalue(), self.PROMPT + "\n")
+
+    def test_wrapped_old_probe_extra_rows_and_unknown_frame_are_not_exact_input(self):
+        old_wrapped = ("Sutando managed liveness check. Reply exactly READY. Do not use tools, read\n"
+                       "  or write files, or send messages.")
+        cases = [old_wrapped, self.PROMPT + "\n  user draft", self.PROMPT + "\n\n",
+                 self.PROMPT + "\n" + self.FOOTER,
+                 self.PROMPT + "\n  ⚠ 2 warnings · f2 to view"]
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertIsNone(pg.composer_text(f"› {text}\n\n{self.FOOTER}\n", pg.CODEX))
+        for capture in [f"› {self.PROMPT}", f"› {self.PROMPT}\n  unknown status",
+                        f"› {self.PROMPT}\n\n{self.FOOTER}\n  unexpected row"]:
+            self.assertIsNone(pg.composer_text(capture, pg.CODEX))
+
+    def test_indented_glyph_is_a_continuation_not_a_new_empty_or_exact_composer(self):
+        for prefix in ["unknown draft", self.PROMPT]:
+            for glyph in ["›", "»"]:
+                capture = f"› {prefix}\n  {glyph} {self.PROMPT}\n\n{self.FOOTER}\n"
+                self.assertIsNone(pg.composer_text(capture, pg.CODEX))
+        self.assertIsNone(pg.composer_text(f"  › {self.PROMPT}\n{self.FOOTER}\n", pg.CODEX))
+
+    def test_visible_spaces_and_control_bytes_are_never_folded_into_a_match(self):
+        for suffix in [" ", " extra", "\t", "\r", "\v", "\x1f", "\x1b[2J", "\x1b[2m extra\x1b[0m"]:
+            with self.subTest(suffix=repr(suffix)):
+                self.assertNotEqual(pg.composer_text(f"› {self.PROMPT}{suffix}\n{self.FOOTER}\n",
+                                                    pg.CODEX), self.PROMPT)
+        text = self.PROMPT.replace("exactly READY", "exactly  READY")
+        self.assertEqual(pg.composer_text(f"› {text}\n{self.FOOTER}\n", pg.CODEX), text)
+
+
 class CodexClassification(unittest.TestCase):
     def test_model_footer_without_a_composer_is_not_permission_to_type(self):
         self.assertEqual(pg.classify_pane(CODEX_157_FOOTER, pg.CODEX).state, "unknown")
@@ -251,7 +295,7 @@ class CodexClassification(unittest.TestCase):
     def test_both_codex_glyphs_are_recognized_when_the_prompt_changes(self):
         capture = "› stale draft\n\x1b[1m»\x1b[0m current draft\n"
         self.assertEqual(pg.pending_text(capture, pg.CODEX), "current draft")
-        self.assertEqual(pg.composer_text(capture, pg.CODEX), "current draft")
+        self.assertEqual(pg.composer_text(capture + CODEX_157_FOOTER, pg.CODEX), "current draft")
         self.assertEqual(pg.after_prompt(capture, pg.CODEX), "")
 
     def test_current_codex_picker_row_is_busy(self):
@@ -1487,6 +1531,173 @@ class SharedLimitStepUnknownQueueHolds(unittest.TestCase):
         self.assertTrue(self.step(False))
         self.assertFalse(self.step(None))
         self.assertFalse(self.step(True))
+
+
+class SpinnerAboveComposerOutrunsTheBanner(unittest.TestCase):
+    """A turn in flight above the composer outruns the limit banner pinned under it; the
+    same banner under a finished turn, with work owed, still stands."""
+
+    RULE = "\u2500" * 40 + "\n"
+    BANNER = ("  \u26a0 Usage limit reached \u00b7 continuing automatically at 1am \u00b7 esc to cancel\n"
+              "  \u26a0 /usage-credits to continue now\n")
+    TAIL = ("  \u2714 Update installed \u00b7 Restart to update\n" + RULE + "\u276f \n" + RULE
+            + BANNER + "  " + FOOTER)
+    MID_TURN = ("\u25cf Writing the result file now.\n"
+                "\u2733 Choreographing\u2026 (running Stop hooks\u2026 2/3 \u00b7 2m 37s)\n" + TAIL)
+    STANDING = "\u25cf Logged. Standing by.\n\u273b Worked for 3m \u00b7 done 3:16 PM\n" + TAIL
+
+    def outrun(self, pane):
+        baseline = pg.limit_step(pane, None, "/nonexistent-ws", owes_work=True)[1]
+        return pg.limit_step(pane, baseline, "/nonexistent-ws", owes_work=True)[0]
+
+    def test_a_turn_in_flight_outruns_the_banner_for_every_caller(self):
+        self.assertTrue(pg.turn_in_flight(self.MID_TURN))
+        outrun = self.outrun(self.MID_TURN)
+        self.assertTrue(outrun)
+        self.assertFalse(pg.limit_standing(self.MID_TURN, "claude", outrun))
+        self.assertNotIn("usage", pg.strip_limit_banners(self.MID_TURN).lower())
+        v = pg.classify_pane(self.MID_TURN, pg.CLAUDE, "/nonexistent-ws")
+        self.assertEqual((v.state, v.reason), ("busy", "working"))
+        self.assertFalse(pg.is_usage_limit(v.reason, self.MID_TURN))
+
+    def test_control_a_banner_under_a_finished_turn_still_stands(self):
+        self.assertFalse(pg.turn_in_flight(self.STANDING))
+        outrun = self.outrun(self.STANDING)
+        self.assertFalse(outrun)
+        self.assertTrue(pg.limit_standing(self.STANDING, "claude", outrun))
+        v = pg.classify_pane(self.STANDING, pg.CLAUDE, "/nonexistent-ws")
+        self.assertEqual((v.state, v.reason), ("busy", "usage-limit"))
+
+    def test_a_spinner_in_scrollback_under_a_later_finished_turn_is_not_in_flight(self):
+        pane = self.MID_TURN.replace("2m 37s)\n", "2m 37s)\n\u273b Worked for 3m \u00b7 done 3:16 PM\n")
+        self.assertFalse(pg.turn_in_flight(pane))
+        self.assertFalse(self.outrun(pane))
+
+    def test_a_delivery_seconds_old_is_not_yet_outrun(self):
+        pane = self.MID_TURN.replace("running Stop hooks\u2026 2/3 \u00b7 2m 37s", "2s \u00b7 esc to interrupt")
+        self.assertFalse(pg.turn_in_flight(pane))
+        self.assertFalse(self.outrun(pane))
+        self.assertTrue(pg.turn_in_flight(pane.replace("(2s", "(12s")))
+
+    def spinner(self, paren):
+        return self.MID_TURN.replace("(running Stop hooks\u2026 2/3 \u00b7 2m 37s)", paren)
+
+    def test_the_threshold_is_inclusive(self):
+        at = pg.FLIGHT_MIN_S
+        self.assertTrue(pg.turn_in_flight(self.spinner(f"({at}s \u00b7 esc to interrupt)")))
+        self.assertFalse(pg.turn_in_flight(self.spinner(f"({at - 1}s \u00b7 esc to interrupt)")))
+
+    def test_only_the_spinners_own_clock_counts(self):
+        for paren, secs in (("(8s \u00b7 \u2193 42 tokens \u00b7 thought for 4s)", 8),
+                            ("(5s \u00b7 thought for 6s)", 5),
+                            ("(running Stop hooks\u2026 2/3 \u00b7 2m 37s)", 157),
+                            ("(1h 2m \u00b7 \u2193 1.2k tokens)", 3720),
+                            ("(thought for 40s)", None)):
+            with self.subTest(paren=paren):
+                self.assertEqual(pg.spinner_elapsed(f"\u2733 Pondering\u2026 {paren}"), secs)
+        self.assertFalse(pg.turn_in_flight(self.spinner("(8s \u00b7 \u2193 42 tokens \u00b7 thought for 4s)")))
+
+    def test_control_a_turn_waiting_on_a_limit_or_retry_mid_turn_still_stands(self):
+        waits = (
+            ("spinner names the limit", self.spinner(
+                "(Usage limit reached \u00b7 continuing automatically at 1am \u00b7 esc to cancel \u00b7 2m 37s)")),
+            ("spinner names a retry", self.spinner("(retrying in 30s \u00b7 attempt 3/10 \u00b7 2m 37s)")),
+            ("spinner names a rate limit", self.spinner("(rate limited \u00b7 2m 37s \u00b7 esc to interrupt)")),
+            ("wait row under the spinner", self.MID_TURN.replace(
+                "  \u2714 Update installed",
+                "  \u23bf  Continuing automatically at 1am \u00b7 esc to cancel\n  \u2714 Update installed")),
+            ("retry row under the spinner", self.MID_TURN.replace(
+                "  \u2714 Update installed",
+                "  \u23bf  API Error (529 Overloaded) \u00b7 Retrying in 8 seconds\u2026 (attempt 2/10)\n"
+                "  \u2714 Update installed")),
+        )
+        for name, pane in waits:
+            with self.subTest(wait=name):
+                self.assertFalse(pg.turn_in_flight(pane))
+                outrun = self.outrun(pane)
+                self.assertFalse(outrun)
+                self.assertTrue(pg.limit_standing(pane, "claude", outrun))
+                v = pg.classify_pane(pane, pg.CLAUDE, "/nonexistent-ws")
+                self.assertNotEqual((v.state, v.reason), ("busy", "working"))
+
+    def test_a_spinner_below_the_composer_is_not_a_turn_in_flight(self):
+        row = "\u2733 Choreographing\u2026 (30s \u00b7 esc to interrupt)\n"
+        self.assertTrue(pg.turn_in_flight(self.STANDING.replace("\u273b Worked for 3m \u00b7 done 3:16 PM\n", row)))
+        pane = self.STANDING.replace(self.BANNER, self.BANNER + row)
+        self.assertFalse(pg.turn_in_flight(pane))
+        self.assertFalse(self.outrun(pane))
+
+
+class ALoginAfterTheLimitReleasesThePane(unittest.TestCase):
+    """#6322: after /login to a seat with headroom the refusal above it is the old account's,
+    so the pane takes input again; the same refusal with no login after it still holds."""
+
+    RULE = "\u2500" * 40 + "\n"
+    REFUSED = ("\u276f Process task-123\n"
+               "  \u23bf  You've hit your weekly limit \u00b7 resets Nov 12, 5pm (America/Los_Angeles)\n"
+               "\u273b Worked for 0s\n\n")
+    LOGIN = "\u276f /login\n  \u23bf  Login successful\n\n"
+    IDLE = RULE + "\u276f \n" + RULE + "  " + FOOTER + "\n"
+
+    def classify(self, pane):
+        return pg.classify_pane(pane, pg.CLAUDE, "/nonexistent-ws", None, "sutando-core")
+
+    def test_a_login_after_the_refusal_accepts_input(self):
+        v = self.classify(self.REFUSED + self.LOGIN + self.IDLE)
+        self.assertEqual(v.state, "idle-ready")
+        self.assertTrue(pg.accepts_input(v))
+
+    def test_the_notifiers_healthy_check_passes(self):
+        pane = self.REFUSED + self.LOGIN + self.IDLE
+        with mock.patch.object(sys, "stdin", io.StringIO(pane)), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(pg.main(["healthy", "--runtime", "claude", "--workspace", "/nonexistent-ws",
+                                      "--session", "sutando-core"]), 0)
+
+    def test_control_no_login_still_holds(self):
+        v = self.classify(self.REFUSED + self.IDLE)
+        self.assertEqual((v.state, v.reason), ("abnormal", "quota-limit"))
+
+    def test_the_words_in_a_quoted_prompt_do_not_release_the_limit(self):
+        quoted = "\u276f the worker said:\n  Login successful\n  is that enough?\n"
+        self.assertFalse(pg.signed_in_after_limit(self.REFUSED + quoted + self.IDLE))
+        v = self.classify(self.REFUSED + quoted + self.IDLE)
+        self.assertEqual((v.state, v.reason), ("abnormal", "quota-limit"))
+
+    def test_control_a_refusal_after_the_login_still_holds(self):
+        v = self.classify(self.LOGIN + self.REFUSED + self.IDLE)
+        self.assertEqual((v.state, v.reason), ("abnormal", "quota-limit"))
+
+
+class LimitHolds(unittest.TestCase):
+    """The recovery sender's under-lock predicate: a limit alone, nothing running or asking."""
+
+    GATE = ("──────── seat-1 ─\n❯ \n────────\n"
+            "  ⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"
+            "    Continuing automatically at Oct 13 at 11pm · esc to cancel\n")
+
+    def holds(self, capture):
+        return pg.limit_holds(capture, pg.CLAUDE)
+
+    def test_a_limit_alone_holds(self):
+        self.assertTrue(self.holds("  ⎿  You've hit your weekly limit · resets 2pm (UTC)\n❯ \n"))
+        self.assertTrue(self.holds(self.GATE))
+
+    def test_anything_else_refuses(self):
+        for capture in ("", "   \n", "❯ \n",
+                        "You've hit your weekly limit\n✳ Moonwalking… (3s · esc to interrupt)\n❯ \n",
+                        "  ⎿  You've hit your weekly limit\n❯ draft\n",
+                        "  ⎿  You've hit your weekly limit\n",
+                        "❯ \n Do you want to make this edit?\n Enter to confirm · Esc to cancel\n",
+                        "──────── seat-1 ─\n❯ \n────────\n  ⚠ Usage limit reached · limit resets Oct 13 at 11pm\n"):
+            with self.subTest(capture=capture):
+                self.assertFalse(self.holds(capture))
+
+    def test_cli_exit_codes(self):
+        for capture, code in ((self.GATE, 0), ("❯ \n", pg.EXIT_UNSAFE)):
+            with mock.patch.object(sys, "stdin", io.StringIO(capture)), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(pg.main(["limit-holds", "--runtime", "claude"]), code)
 
 
 if __name__ == "__main__":

@@ -44,7 +44,8 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
         sys.path.insert(0, _p)
 
 from proactive_routing import (BRIDGE_CHANNELS, body_target_channel,  # noqa: E402
-                               proactive_destination, should_claim_proactive)
+                               lane_claims_proactive, proactive_destination,
+                               should_claim_proactive)
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 from voice_room_membership import (CHECK_DIR_NAME, VERDICT_TTL_S,  # noqa: E402
@@ -110,6 +111,9 @@ def _sutando_apply_worker_label_overrides(labels: dict, config_version: int,
 # An install without worker-pool has no callback and makes no profile read.
 _SUTANDO_WORKER_LABEL_APPLIER = (_sutando_apply_worker_label_overrides
                                  if _WORKER_LABEL_SCRIPT.is_file() else None)
+
+# Logged recovery commands name the workspace through its resolver, never its absolute path.
+_SUTANDO_WORKSPACE_RESOLVER = "bash scripts/sutando-config.sh workspace"
 
 # Runtime self-report, injected BEFORE the exec (anything after it is
 # unreachable when the exec'd source's own __main__ guard fires; see #3285).
@@ -237,16 +241,12 @@ def _voice_room_owner() -> str:
     bad_at = _VOICE_OWNER["bad_at"]
     if bad_at is not None and 0 <= now - bad_at < VOICE_OWNER_RETRY_S:
         return ""
-    identity = _reenroll_identity()  # noqa: F821
     try:
-        answer = _req("GET", "/v1/agents", timeout=10)  # noqa: F821
+        owner = _registry_owner(timeout=10)[0]  # noqa: F821
     except Exception as e:  # noqa: BLE001
         _voice_owner_read_failed(e)
-        answer = None
-    agents = answer.get("agents") if isinstance(answer, dict) else None
-    row = next((r for r in (agents or []) if isinstance(r, dict) and r.get("id") == identity), None)
-    owner = str((row or {}).get("owner") or "")
-    if not (owner.startswith("@") and ":" in owner):
+        owner = ""
+    if not owner:
         _VOICE_OWNER.update(mxid="", bad_at=now)
         return ""
     _VOICE_OWNER.update(mxid=owner, at=now, bad_at=None)
@@ -303,7 +303,10 @@ def _ag2space_proactive_room_gate(path: Path, room: str) -> bool:
 
 def _ag2space_proactive_claim_gate(path: Path) -> bool:
     """Claim when routing says the owner lives here; otherwise claim only what
-    no other bridge will ever take (see _routed_bridge_still_owns)."""
+    no other bridge will ever take (see _routed_bridge_still_owns). A file a pool
+    worker's session stamped is that worker's own lane's, never a core lane's."""
+    if not lane_claims_proactive(path.name):
+        return False
     if _tagged_voice_result(path.name) and not _voice_result_room_verified(path):
         return False
     dest = proactive_destination(path.name)
@@ -401,6 +404,7 @@ def _intake_gate(task: dict):
 
 
 _STATUS_ACK_MANIFEST = _REPO / "skills" / "status-ack" / "manifest.json"
+_AGENT_ACTIVITY_MANIFEST = _REPO / "skills" / "agent-activity" / "manifest.json"
 
 
 def _legacy_keeps_proactive_room() -> bool:
@@ -414,8 +418,22 @@ def _legacy_stand_down():
 
 
 def _owns_unaddressed() -> bool:
-    from connections import owns_unaddressed
+    from connections import owns_unaddressed, unaddressed_owner
+    owner, handed_from = unaddressed_owner(WS)  # noqa: F821
+    if handed_from is not None and owner is not None:
+        _log_backoff(("unaddressed-handoff", handed_from["instance"], owner["instance"]),  # noqa: F821
+                     f"unaddressed owner messages: lane {handed_from['instance'] or 'primary'} has no owner DM, "
+                     f"so lane {owner['instance'] or 'primary'} delivers them")
     return owns_unaddressed(GATEWAY_INSTANCE, WS)  # noqa: F821
+
+
+def _stop_interrupt_enabled(environ=None) -> bool:
+    """The agent-activity skill's Stop interrupt switch; off when it cannot be read."""
+    try:
+        from skill_config import enabled
+        return enabled("SUTANDO_STOP_INTERRUPT", _AGENT_ACTIVITY_MANIFEST, environ)
+    except Exception:  # noqa: BLE001 - a switch that cannot be read is off
+        return False
 
 
 def _status_ack_gate(environ=None):
@@ -442,10 +460,73 @@ PROACTIVE_ROOM_GATE = _ag2space_proactive_room_gate
 OWNER_DM_UPGRADED_NOTIFY = _ag2space_owner_dm_upgraded
 PROACTIVE_DISPATCH_GATE = _ag2space_proactive_dispatch_gate
 PROACTIVE_ACK_GATE = _status_ack_gate()
+STOP_INTERRUPT = _stop_interrupt_enabled()
 PROACTIVE_ROUTE_GATE = _ag2space_proactive_route_gate
+from skill_config import enabled as _skill_enabled
+TASK_STEP_PUBLICATION_ENABLED = lambda: _skill_enabled(
+    "LEDGER_STEP_PUBLISH_ENABLED", _REPO / "skills" / "agent-activity" / "manifest.json")
+
+
+def _ag2space_task_status(local_tid: str):
+    """A task's published status (agent-activity's phase_line): the Basic fields only, since the
+    owner's share_live_status defaults off and is not read here yet."""
+    scripts = str(_REPO / "skills" / "agent-activity" / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import phase_line
+    return phase_line.published_status(WS, local_tid)  # noqa: F821
+
+
+TASK_STATUS = _ag2space_task_status
 TASK_INTAKE_GATE = _intake_gate if not gateway_credential_sources.is_seat(os.environ) else None  # noqa: F821
 PROACTIVE_ROOM_KEEP = _legacy_keeps_proactive_room if not GATEWAY_INSTANCE else None  # noqa: F821
 OWNS_UNADDRESSED = _owns_unaddressed
+
+
+def _ag2space_lane_server() -> str:
+    """The homeserver this lane's connection row names: a secondary lane's relay answer on another
+    server is refused."""
+    from connections import lane_server
+    return lane_server(GATEWAY_INSTANCE, WS)  # noqa: F821
+
+
+LANE_SERVER = _ag2space_lane_server
+
+
+def _lane_worker() -> str:
+    """The pool worker whose own agent this lane runs as, or "": exits rather than start a lane
+    that cannot tell, since a worker's lane run as the core's would post the core's messages."""
+    from connections import LaneIdentityUnknown, lane_worker_at_start
+    try:
+        worker, problem = lane_worker_at_start(GATEWAY_INSTANCE, os.environ, WS)  # noqa: F821
+    except LaneIdentityUnknown as e:
+        _log(f"FATAL: lane {GATEWAY_INSTANCE} refuses to start: {e}")  # noqa: F821
+        sys.exit(f"FATAL: lane {GATEWAY_INSTANCE} refuses to start: {e}")  # noqa: F821
+    if problem:
+        _log(f"ERROR: lane {GATEWAY_INSTANCE}: {problem} (worker {worker})")  # noqa: F821
+    return worker
+
+
+def _worker_lane_claim_gate(worker: str):
+    """A worker's own lane shares results/ with the core's lanes: it claims only the proactive files
+    its worker's session stamped (`lane_claims_proactive`), which it posts as the worker's agent."""
+    return lambda path: lane_claims_proactive(path.name, worker)
+
+
+def _install_worker_lane(worker: str) -> None:
+    """This lane runs as `worker`'s own agent: every task it queues is addressed to that worker,
+    and the only proactive files it claims and owns are the ones that worker's session wrote."""
+    global TASK_ADDRESSEE, PROACTIVE_CLAIM_GATE, PROACTIVE_OWN_FILE
+    TASK_ADDRESSEE = lambda: worker  # noqa: E731
+    PROACTIVE_CLAIM_GATE = PROACTIVE_OWN_FILE = _worker_lane_claim_gate(worker)
+
+
+# Read once: a lane's row names its worker for the life of the process (a change relaunches it).
+_LANE_WORKER = _lane_worker() if GATEWAY_INSTANCE else ""  # noqa: F821
+if _LANE_WORKER:
+    _log(f"lane {GATEWAY_INSTANCE} runs as worker {_LANE_WORKER}'s own agent: its tasks go to that worker, "  # noqa: F821
+         "and it posts only the proactive files that worker's session writes")
+    _install_worker_lane(_LANE_WORKER)
 STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
                    and not gateway_credential_sources.is_seat(os.environ) else None)  # noqa: F821
 

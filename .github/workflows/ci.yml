@@ -305,6 +305,7 @@ jobs:
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_pool_advertisement_push.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_lock_heartbeat_thread.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_worker_profile_labels.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_agent_profile_placement.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_agent_profile_host_id.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_inbox_channel.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_consumer.py
@@ -351,6 +352,8 @@ jobs:
           timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test ag2space-inbox
           cd "$GITHUB_WORKSPACE/skills/pr-watch"
           timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test mod
+          cd "$GITHUB_WORKSPACE/src/agent/claude"
+          timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test task-watch-mod
 
   shell-standalone-tests:
     name: shell tests (lanes)
@@ -493,7 +496,9 @@ jobs:
           export RECDIR
           # `skills` too: a skill owns its own tests/, so a suite that moves into one
           # keeps running; the root is optional, so it is added only when present.
-          bash scripts/discover-python-tests.sh > "$RECDIR/all"
+          bash scripts/discover-python-tests.sh > "$RECDIR/discovered"
+          # Quarantined flakes leave every gating leg; `python quarantined tests` still runs them.
+          bash scripts/select-quarantined-suites.sh without tests/python-quarantine.txt < "$RECDIR/discovered" > "$RECDIR/all"
           # The two legs after the shared ones run the listed load-sensitive suites (a timing
           # suite beside a CPU-heavy neighbour misses its own window); the shared legs get the rest.
           LIST=tests/python-load-sensitive-suites.txt
@@ -584,6 +589,51 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 3
+
+  python-quarantined-tests:
+    name: python quarantined tests (non-blocking)
+    # Not in required-tests' needs: it reports the quarantined flakes and never gates.
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies (clean)
+        run: npm ci
+
+      - name: Install Python test deps
+        run: python3 -m pip install coverage 'detect-secrets>=1.5.0' 'discord.py>=2.3'
+
+      - name: Install fswatch
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fswatch
+
+      - name: Run quarantined Python tests (report only)
+        run: |
+          LIST=tests/python-quarantine.txt
+          bash scripts/discover-python-tests.sh > /tmp/discovered
+          bash scripts/select-quarantined-suites.sh only "$LIST" < /tmp/discovered > /tmp/quarantined
+          echo "### Quarantined Python tests" >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r f; do
+            issue="$(awk -v f="$f" '$1 == f {print $2}' "$LIST")"
+            start=$SECONDS
+            if output="$(PYTHONFAULTHANDLER=1 timeout -k 5 -s ABRT 240 python3 "$f" 2>&1)"; then
+              echo "→ $f passed ($((SECONDS - start))s)"
+              echo "- passed: \`$f\` ($issue)" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::warning::quarantined test failed (not gating): $f — $issue"
+              echo "$output" | tail -n 60
+              echo "- **failed**: \`$f\` ($issue)" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done < /tmp/quarantined
 
   coverage-gate:
     name: diff coverage >= 95% (python)

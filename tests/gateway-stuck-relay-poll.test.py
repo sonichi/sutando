@@ -165,19 +165,23 @@ class _Bridge:
             setattr(gw, n, lambda *a, **k: None)
         real_req = self._saved["_req"]
 
-        def req(method, path, payload=None, timeout=gw._REQ_TIMEOUT_S):
+        def req(method, path, payload=None, timeout=gw._REQ_TIMEOUT_S, deadline=None, **kw):
             if path.startswith("/v1/tasks?wait="):
                 # Scaled: the loop's own budget against a real late answer; else a held poll.
                 short = timeout * self.time_scale if self.time_scale else _SHORT_READ_TIMEOUT_S
+                if deadline is not None:   # the whole-poll bound, on the same scale
+                    deadline = self.clock.monotonic() + short
                 try:
-                    resp = real_req(method, path, payload, timeout=short)
+                    resp = real_req(method, path, payload, timeout=short, deadline=deadline, **kw)
                 except TimeoutError:
                     self.poll_outcomes.append("timeout")
                     self.clock.offset += timeout   # what the real hold costs
                     raise
                 self.poll_outcomes.append("answered")
                 return resp
-            return real_req(method, path, payload, timeout=timeout)
+            if deadline is not None:
+                kw["deadline"] = deadline
+            return real_req(method, path, payload, timeout=timeout, **kw)
 
         gw._req = req
         gw._log = lambda m: self.logs.append(str(m))
