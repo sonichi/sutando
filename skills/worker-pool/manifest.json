@@ -1,0 +1,19 @@
+{
+  "name": "worker-pool",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Optional worker-pool routing prerequisite. SUTANDO_TASK_ROUTING_REQUIREMENT declares a probe receiving the workspace path: exit 0 permits unrouted intake; any other status refuses it. Handler resolution remains the live task-event-handler.json declaration.",
+  "permissions": {
+    "network": false,
+    "filesystem": "read-write",
+    "secrets": "none"
+  },
+  "config": {
+    "SUTANDO_TASK_ROUTING_REQUIREMENT": "./scripts/routing_requirement.py"
+  },
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

@@ -19,6 +19,24 @@ The watcher script decides everything about a task (routing through the task-eve
 dedupe, holds); the notifier only executes what the watcher announces (#4561). So the two modes differ
 in how an announcement reaches the agent, never in what is announced.
 
+## Unrouted startup prerequisite
+
+Before the core watcher announces backlog, an installed skill may declare
+`SUTANDO_TASK_ROUTING_REQUIREMENT` in its manifest config. The executable receives
+one argument, the resolved workspace: exit 0 permits startup without routing;
+a nonzero status, unusable executable, ambiguous provider or ten-second timeout
+refuses startup with exit 78. No installed provider means no prerequisite.
+The pool provider uses its canonical binding loader and refuses when workers are
+bound or their declaration cannot be read. It does not install or select a router.
+
+The router still comes from the live `state/task-event-handler.json` declaration
+(or the explicit `SUTANDO_TASK_EVENT_HANDLER` override), and must be an executable
+regular file. Fix the declaration before re-arming. An operator may deliberately
+bypass the startup prerequisite with `SUTANDO_ALLOW_UNROUTED_BINDINGS=1`.
+Worker delivery inboxes skip this core-only prerequisite because their work is
+already assigned. This is a startup backstop, not a replacement for publishing
+the router whenever bindings change during a watcher's lifetime.
+
 ## The tag, and why it matters
 
 A session watcher is started **tagged**: `--role session --inbox <inbox>`. The tag is how every other

@@ -112,7 +112,8 @@ def preflight(workspace, repo, room: str) -> None:
             raise Refused(
                 diagnostic
                 + (f" (it names {invalid!r}, which is not an executable file)"
-                   if invalid else ""))
+                   if invalid else f" ({os.fsdecode(lookup.stderr).strip()})"
+                   if lookup.stderr else ""))
 
 
 def compile_with(workspace, worker_id: str, label: str, room, runtime=None) -> dict:
