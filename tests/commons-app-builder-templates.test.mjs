@@ -1779,7 +1779,8 @@ for (const [reason, shown] of [
   askButtons(r)[0].click();
   await settle();
   const [request] = sent(r);
-  check('review/hidden-characters-are-removed', () => assert.doesNotMatch(request.text, /[\u200b\u202e\u0007]/));
+  check('review/hidden-characters-are-removed', () =>
+    assert.ok(['\u200b', '\u202e', '\u0007'].every((c) => !request.text.includes(c)), JSON.stringify(request.text)));
   check('review/blank-runs-are-collapsed', () => {
     assert.doesNotMatch(request.text, /\n\s*\n/);
     assert.doesNotMatch(request.text, / {2,}/);
