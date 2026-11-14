@@ -52,6 +52,10 @@
                                reason when it did not start
   import-env                   rows once for REMOTE_TASK_TOKEN and each AG2_REMOTE_TOKEN_<INST>
   launch-plan                  one 'instance<TAB>token_ref<TAB>channel_dir<TAB>primary' line per bridge
+  keep-lanes --repo DIR --logs-dir DIR [--max-s N]
+                               one pass of the primary gateway wrapper: start each launch-plan lane
+                               no bridge holds, backing off a lane that does not start; one line per try.
+                               A pass still running after N seconds (default 300) says so and exits 3
   worker-mcp-credential [--worker ID]
                                one JSON line for a worker seat's MCP proxy: the worker's own identity
                                and vault token, or acts_as=core for a worker with no enabled identity
@@ -342,6 +346,12 @@ def cmd_launch_plan(args) -> int:
     return 0
 
 
+def cmd_keep_lanes(args) -> int:
+    connections.keep_lanes_bounded(max_s=args.max_s, repo=args.repo, logs_dir=args.logs_dir,
+                                   workspace=args.workspace)
+    return 0
+
+
 def _launch_args(s) -> None:
     s.add_argument("instance")
     s.add_argument("--repo", type=Path, required=True)
@@ -390,6 +400,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_update_token)
     sub.add_parser("import-env").set_defaults(fn=cmd_import_env)
     sub.add_parser("launch-plan").set_defaults(fn=cmd_launch_plan)
+    s = sub.add_parser("keep-lanes"); s.add_argument("--repo", type=Path, required=True)
+    s.add_argument("--logs-dir", type=Path, required=True); s.set_defaults(fn=cmd_keep_lanes)
+    s.add_argument("--max-s", type=float, default=connections.LANE_PASS_MAX_S)
     s = sub.add_parser("worker-mcp-credential"); s.add_argument("--worker", default="")
     s.add_argument("--server", default="", help="the identity on this server, for a worker with several")
     s.set_defaults(fn=cmd_worker_mcp_credential)

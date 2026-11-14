@@ -902,8 +902,18 @@ so:
   nothing is raised to the poll loop's credential recovery. Only a join can change it, so the
   send gets `send_failure_policy.ROOM_REFUSAL_ATTEMPTS` (5) tries on the outbox's own backoff
   (about 30s, which covers a join or an invite acceptance still landing); then the item parks
-  (`permanent-refusal`) and the file moves to `results/undelivered/` with a log line. Any other
+  (`permanent-refusal`) and the file moves to `results/undelivered/` with a log line that
+  prints the requeue command (with `--reset-attempts`, so the resend gets the whole budget). It
+  names its root through `bash scripts/sutando-config.sh workspace` (run it from the engine
+  checkout), so the log carries no home path. The
+  wording is read from the body's `error`, `errcode`, `message` and `detail`. Any other
   403 keeps the retry above (`send_failure_policy.is_room_membership_refusal` decides).
+- **A runtime prompt card whose room refuses the sender** is charged to that card alone: the
+  pass goes on to the cards behind it with no bridge backoff, the card waits out its own
+  backoff, and after `ROOM_REFUSAL_ATTEMPTS` sends that revision is marked failed (logged,
+  and kept live where health-check sees it). Its failure notice, refused by the same room, is
+  sent once to the owner DM instead; if the DM refuses it too, it is recorded as sent and not
+  repeated. Any other 403 still raises to the caller's backoff.
 - **A message about a task** is named `proactive-about-<task id>--<ts>.txt`
   (`proactive_routing.about_task_filename`). In the task's own room it posts in the task's
   thread: an ask already in a thread keeps that thread's root, a top-level ask is rooted at

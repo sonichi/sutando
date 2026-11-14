@@ -1206,8 +1206,33 @@ def _settlement_record(directory: Path, review_id: str) -> "dict | None":
     return {}
 
 
+# Set before the exec by an adapter whose RESULTS_DIR sits in the workspace this command prints.
+_WORKSPACE_RESOLVER: str = globals().get("_SUTANDO_WORKSPACE_RESOLVER") or ""
+
+
+def _shell_root(root) -> str:
+    """`root` as a logged command names it: behind the workspace resolver, else `$HOME`, so the log
+    carries no home path. Run from the engine checkout, as `src/outbox_cli.py` already requires."""
+    root = Path(root)
+    bases = ([(RESULTS_DIR.parent, f'"$({_WORKSPACE_RESOLVER})"')] if _WORKSPACE_RESOLVER else []) + [
+        (Path.home(), '"$HOME"')]
+    for base, prefix in bases:
+        try:
+            rel = root.relative_to(base)
+        except ValueError:
+            continue
+        return prefix if rel == Path(".") else f"{prefix}/{shlex.quote(rel.as_posix())}"
+    return shlex.quote(str(root))
+
+
+def _outbox_cli_command(root, *args: str, program: str = "python3 src/outbox_cli.py",
+                        results_dir=None) -> str:
+    tail = f" --results-dir {_shell_root(results_dir)}" if results_dir is not None else ""
+    return f"{program} --root {_shell_root(root)} {shlex.join(args)}{tail}"
+
+
 def _requeue_command(root, item_id: str) -> str:
-    return shlex.join(["python3", "src/outbox_cli.py", "--root", str(root), "requeue", item_id])
+    return _outbox_cli_command(root, "requeue", item_id)
 
 
 def _reread_record(path: Path) -> dict:
@@ -1915,7 +1940,7 @@ def _project_hitl(log=print) -> int:
             f"{projector.PROJECTION_MAX_REFUSALS}; retrying it in {delay:g}s")
     for req_id, revision, error in gave_up:
         log(f"hitl: card {req_id} could not be projected at revision {revision}: refused "
-            f"{projector.PROJECTION_MAX_REFUSALS} times ({error}); no further retries for this "
+            f"({error}); no further retries for this "
             f"revision, health-check reports it")
     if failed:
         _hitl_backoff_bump(log)  # a refusing or raising sender
@@ -3213,6 +3238,12 @@ def _read_by(resp, deadline: float) -> bytes:
         # read1 returns what one socket read gave; read(n) would wait for all n bytes.
         chunk = (resp.read1 if hasattr(resp, "read1") else resp.read)(4096)
         if not chunk:
+            # read1 ends with b"" when the deadline's shutdown cuts the socket, and when the peer
+            # hangs up early: neither is a whole body, which a short read would otherwise pass for.
+            if time.monotonic() >= deadline:
+                raise TimeoutError("response body still arriving at its deadline")
+            if getattr(resp, "length", None):
+                raise http.client.IncompleteRead(b"".join(chunks), resp.length)
             return b"".join(chunks)
         chunks.append(chunk)
 
@@ -8187,10 +8218,10 @@ def _proactive_item_id(stem: str, body: str) -> str:
     return proactive_item_id(stem, body)
 
 
-def _proactive_requeue_command(root, item_id: str, body_sha256: str) -> str:
+def _proactive_requeue_command(root, item_id: str, body_sha256: str, reset_attempts: bool = False) -> str:
     """The operator's resend: requeue the item and restore exactly its own quarantined body."""
-    return shlex.join(["python3", "src/outbox_cli.py", "--root", str(root), "requeue", item_id,
-                       "--body-id", item_id.rsplit("~", 1)[0], "--body-sha256", body_sha256])
+    return _outbox_cli_command(root, "requeue", item_id, "--body-id", item_id.rsplit("~", 1)[0],
+                               "--body-sha256", body_sha256, *(["--reset-attempts"] if reset_attempts else []))
 
 
 def _proactive_outbox_root() -> Path:
@@ -8656,7 +8687,9 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
             body_sha256 = ""
         retired = _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
         # No digest, no command: an unfiltered restore can install another generation's body.
-        how = (f"{_proactive_requeue_command(core.backend.root, item_id, body_sha256)}" if body_sha256
+        # A refusal spent its whole budget: a requeue that keeps the count gets one try.
+        how = (f"{_proactive_requeue_command(core.backend.root, item_id, body_sha256, reason == 'permanent-refusal')}"
+               if body_sha256
                else f"NO recovery command: its body could not be read to pin which parked copy "
                     f"is its own; requeue {item_id} by hand with --body-sha256 of that copy")
         where = (f"PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/" if retired
@@ -8670,7 +8703,8 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
                  f"To send it to {room}: {how}")
         else:
             _log(f"proactive {f.name} PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ ({reason}"
-                 f"{': ' + result.detail if result.detail else ''}) — it will NOT be re-sent")
+                 f"{': ' + result.detail if result.detail else ''}) — it will NOT be re-sent. "
+                 f"To send it again: {how}")
         return
     _hand_back(claim, f)  # still owed: the outbox's retry schedule decides when it is tried again
     if result.status is DrainStatus.ATTEMPTED:
@@ -9022,11 +9056,10 @@ def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
             _log(f"result {tid}: {why} — quarantined to {UNDELIVERABLE_RESULTS_DIR.name}/; "
                  f"{not_requeueable_because}")
             return
-        _log(f"result {tid}: {why} — quarantined to "
-             f"{UNDELIVERABLE_RESULTS_DIR.name}/ — `ag2-sparrow-outbox "
-             f"--root {gateway_instance.outbox_root(RESULTS_DIR, GATEWAY_INSTANCE)} "
-             f"requeue {outbox_item_id or _broker_tid(_delivery_tid(tid) or tid)} --reset-attempts "
-             f"--results-dir {RESULTS_DIR} --body-id {tid}` restores it")
+        how = _outbox_cli_command(gateway_instance.outbox_root(RESULTS_DIR, GATEWAY_INSTANCE), "requeue",
+                                  outbox_item_id or _broker_tid(_delivery_tid(tid) or tid), "--reset-attempts",
+                                  "--body-id", tid, program="ag2-sparrow-outbox", results_dir=RESULTS_DIR)
+        _log(f"result {tid}: {why} — quarantined to {UNDELIVERABLE_RESULTS_DIR.name}/ — `{how}` restores it")
     except disposal.KeptQuarantined:
         return                                          # the lifecycle owner named where it waits
     except disposal.GenerationReplaced:
@@ -11037,8 +11070,9 @@ def main() -> None:
             prev_ok, prev_ok_awake = poll_grace_since, poll_ok_awake
             _RESP_META.last = None
             try:
+                # The whole poll is bounded, not each socket read: a body that drips held it open.
                 resp = _req("GET", f"/v1/tasks?wait={_poll_wait(inflight)}{_POLL_PROOF}",
-                            timeout=POLL_WAIT + 10)
+                            timeout=POLL_WAIT + 10, deadline=time.monotonic() + POLL_WAIT + 10)
                 last_poll_ok = poll_grace_since = time.time()
                 stall_anchor = poll_ok_awake = time.monotonic()
                 # A completed poll remains evidence even if accepting its tasks fails.
