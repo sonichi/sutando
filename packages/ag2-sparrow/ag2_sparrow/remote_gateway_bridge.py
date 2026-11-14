@@ -349,7 +349,8 @@ from .delivery_core import (WITHDRAWN, DeliveryCore, DesignAClaimBackend, DrainS
                             ProviderRefused, RetryPolicy)
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
 from .delivery_core import is_refused_for_good
-from .delivery_core.provider_ag2space import AG2SpaceRoomMessageProvider, room_response_refused
+from .delivery_core.provider_ag2space import (AG2SpaceRoomMessageProvider, room_refused_sender,
+                                              room_response_refused)
 from .delivery_core.provider_ag2space import (AG2SpaceResultProvider, RESULT_THREAD_ASK,
                                               RESULT_THREAD_FIELD)
 from .result_ready import (identity_of, read_ready_result, read_ready_result_with_identity,
@@ -8695,7 +8696,8 @@ def _post_proactive_message(room: str, body: str, dedupe_key: str, thread_root: 
     except urllib.error.HTTPError as e:
         seen = _PROACTIVE_SEND.__dict__.setdefault("seen", {})
         if e.code in (401, 403):
-            seen["auth"] = e
+            if not room_refused_sender(e):  # a room's refusal is the message's, never the bearer's
+                seen["auth"] = e
         elif e.code == 400:
             replacement = _room_upgraded_to(_http_error_body(e))
             if replacement is not None:
