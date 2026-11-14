@@ -1104,8 +1104,13 @@ class agent_fence:
         return False
 
 
+def _holder_noun(rec: dict) -> str:
+    """What the lock record's pid is: connect's own process when it holds the root, else a launcher."""
+    return "connector" if rec.get("adapter") == CONNECT_HOLDER else "launcher"
+
+
 def holder_line(root: str) -> str:
-    """held by launcher pid N | held by an unrecorded holder | free | unknown (why). The flock is held
+    """held by launcher|connector pid N | held by an unrecorded holder | free | unknown (why). The flock is held
     by a launcher for its own life only, so a held lock names a live launcher or a holder between its
     flock and its record; a dead pid in the record under a held lock is the latter, never a child."""
     state = lock_held(root)
@@ -1114,7 +1119,7 @@ def holder_line(root: str) -> str:
     if state == "unknown":
         return f"unknown (the lock of {root} could not be probed)"
     rec = lock_holder(root)
-    return f"held by launcher pid {rec['pid']}" if rec.get("live") else "held by an unrecorded holder"
+    return f"held by {_holder_noun(rec)} pid {rec['pid']}" if rec.get("live") else "held by an unrecorded holder"
 
 
 def holder_words(root: str, labels: tuple, _rec=None) -> str:
@@ -1150,7 +1155,7 @@ def occupancy_line(shape: Shape, root: str, labels=None) -> str:
 
 def recovery_lines(shape: Shape, root: str) -> list:
     rec, lock = lock_holder(root), lock_path(root)
-    who = (f"kill {rec['pid']} (the launcher pid in the lock record)" if rec.get("live") else
+    who = (f"kill {rec['pid']} (the {_holder_noun(rec)} pid in the lock record)" if rec.get("live") else
            f"no live launcher is recorded; find the holder with: lsof {shlex.quote(lock or '<lock file>')}")
     return [f"Manual recovery: 1. stop the job by hand: {stop_command(shape)}",
             f"2. stop what holds the work root {root}: {who}",
@@ -1615,7 +1620,7 @@ def _root_lock(shape: Shape, root: str) -> "tuple[str, str, bool]":
         return f"{root} is {holder_line(root)} and {job_name(shape)} is {manager}", manager, False
     if state == "held" and manager != "active":
         rec = lock_holder(root)
-        who = f"launcher pid {rec['pid']}" if rec.get("live") else "an unrecorded holder; lsof the lock file"
+        who = f"{_holder_noun(rec)} pid {rec['pid']}" if rec.get("live") else "an unrecorded holder; lsof the lock file"
         return (f"{root} is held by a session no job of {job_name(shape)} manages ({who}); stop it, then run "
                 "install again"), manager, False
     if state == "held":
