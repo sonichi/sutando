@@ -290,12 +290,38 @@ class NormalizeCommonsCommentTests(unittest.TestCase):
         self.assertNotIn("commons_comment", out[0])
         self.assertNotIn("commons_comment_line", out[0])
 
-    def test_malformed_view_is_kept_but_gets_no_line(self):
+    def test_malformed_view_is_dropped_and_gets_no_line(self):
         cc = {"area": {"x": "1", "y": 2, "w": 3, "h": 4}, "image": "https://evil"}
         out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "x",
                               "commons_comment": cc}])
-        self.assertEqual(out[0]["commons_comment"], cc)
+        self.assertNotIn("commons_comment", out[0])
         self.assertNotIn("commons_comment_line", out[0])
+
+    SECRET = "sk-ant-api03-" + "A" * 95
+
+    def test_token_in_an_allowed_string_field_is_redacted_like_the_body(self):
+        cc = dict(self.CC, page=self.SECRET)
+        out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "tok " + self.SECRET,
+                              "commons_comment": cc}])
+        self.assertNotIn(self.SECRET, out[0]["body"])
+        self.assertNotIn(self.SECRET, json.dumps(out[0]))
+        self.assertIn("page", out[0]["commons_comment"])
+
+    def test_unknown_keys_never_pass(self):
+        cc = dict(self.CC, note="token " + self.SECRET, extra={"deep": self.SECRET})
+        out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "x",
+                              "commons_comment": cc}])
+        self.assertEqual(out[0]["commons_comment"], self.CC)
+        self.assertNotIn(self.SECRET, json.dumps(out[0]))
+
+    def test_fail_closed_redactor_withholds_comment_strings_too(self):
+        withheld = "[REDACTION UNAVAILABLE — body withheld]"
+        with mock.patch.object(rd, "_REDACTOR", lambda s: withheld if s else s):
+            out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "x",
+                                  "commons_comment": dict(self.CC, page=self.SECRET)}])
+        self.assertEqual(out[0]["body"], withheld)
+        self.assertEqual(out[0]["commons_comment"]["page"], withheld)
+        self.assertNotIn(self.SECRET, json.dumps(out[0]))
 
     def _assert_clean_line(self, line, injected):
         self.assertNotIn("\n", line)
@@ -313,7 +339,7 @@ class NormalizeCommonsCommentTests(unittest.TestCase):
         self._assert_clean_line(line, ("SYSTEM", "obey", "mxc://a/b", "doc"))
         out = rd._normalize([{"event_id": "$e", "sender": HS, "body": "x",
                               "commons_comment": cc}])
-        self.assertEqual(out[0]["commons_comment"], cc)
+        self.assertEqual(out[0]["commons_comment"], {"area": {"x": 1, "y": 2, "w": 3, "h": 4}})
 
     def test_bracket_newline_space_in_each_field_never_reach_the_line(self):
         for bad in ("]", "\n", " ", "\r"):
