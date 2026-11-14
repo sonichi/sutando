@@ -551,6 +551,15 @@ def _left_for(workspace, worker_id, runner=None) -> tuple[str | None, bool]:
     return "I'll try again on a later sweep", False
 
 
+def _release_try(workspace, worker_id) -> None:
+    """A try skipped before any kill is not spent, so the attempt cap still allows it later."""
+    try:
+        sup.release_relogin_try(workspace, worker_id)
+    except Exception as e:  # noqa: BLE001 - at worst the skipped try counts
+        print(f"pool_remedy: {worker_id}'s skipped try could not be released ({type(e).__name__}: {e})",
+              file=sys.stderr)
+
+
 def restart_new_logins(workspace, repo, worker_ids, *, runner=None, spawn=None) -> dict:
     """The owner signed in again: say which seats restart, restart them without waiting for an
     answer, and write again only when one did not come back. A note that cannot be queued
@@ -568,6 +577,8 @@ def restart_new_logins(workspace, repo, worker_ids, *, runner=None, spawn=None) 
         if _try_owner(workspace, "pool-new-login",
                       f"I'm back on a new login; restarting {n} worker{'s' if n != 1 else ''} parked on the old "
                       f"limit: {', '.join(names)}.") is None:
+            for w in worker_ids:  # nothing was killed: the try is not spent, as for a suspended skip
+                _release_try(workspace, w)
             return {w: {"worker_id": w, "outcome": "note-failed",
                         "why": "the owner's note could not be queued; nothing was restarted"} for w in worker_ids}
         try:
@@ -581,11 +592,7 @@ def restart_new_logins(workspace, repo, worker_ids, *, runner=None, spawn=None) 
         except Exception as e:  # noqa: BLE001 - one seat's error never stops the others or the note
             done[w] = {"worker_id": w, "outcome": FAILED, "why": f"an unexpected error ({type(e).__name__}: {e})"}
         if done[w]["outcome"] == SUSPENDED and "taken_down" not in done[w]:
-            try:  # skipped before any kill: the try is not spent, so the cap still allows it later
-                sup.release_relogin_try(workspace, w)
-            except Exception as e:  # noqa: BLE001 - at worst the skipped try counts
-                print(f"pool_remedy: {w}'s skipped try could not be released ({type(e).__name__}: {e})",
-                      file=sys.stderr)
+            _release_try(workspace, w)
     back = [w for w, r in done.items() if r["outcome"] == RECOVERED]
     left, telling = [], []
     for w, r in done.items():

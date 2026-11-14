@@ -297,6 +297,20 @@ class NewLogin(Pool):
         self.assertEqual(self.sweep_until(mars)[1]["outcome"], rem.RECOVERED, "a later sweep tries again")
         self.assertEqual(self.spawned, [(mars, "s0")])
 
+    def test_notes_that_cannot_be_queued_never_spend_the_restart_budget(self):
+        mars = next(iter(self.WORKERS))
+        self.show(mars, PARKED)
+        self.sweep()
+        self.account = B
+        with patch.object(rem, "tell_owner", side_effect=OSError("disk full")):
+            for _ in range(ps.RELOGIN_MAX_ATTEMPTS + 1):
+                _, out = self.sweep()
+                self.assertEqual(out["recoveries"][mars]["outcome"], "note-failed")
+        self.assertEqual(sup.load_state(self.ws).workers[mars].relogin_attempts, 0)
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.sweep_until(mars)[1]["outcome"], rem.RECOVERED, "healthy writes recover it")
+        self.assertEqual(self.spawned, [(mars, "s0")])
+
     def test_a_failing_take_down_never_leaves_the_seat_paused(self):
         mars = next(iter(self.WORKERS))
         self.show(mars, PARKED)
