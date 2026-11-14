@@ -34,18 +34,10 @@ A pool worker is an instance, not the canonical core. It shares the host's works
    REPO="$(cd "$(dirname "$SUTANDO_WATCHER_CMD")/.." && pwd)"
    H="$(bash "$REPO/scripts/sutando-config.sh" host-label)"
    CF="$SUTANDO_WORKSPACE_DIR/hosts/$H/crons.json"
-   "$SUTANDO_PY" -c "
-   import json, sys
-   sys.path.insert(0, '$REPO/src')
-   from cron_ownership import entries_for_owner
-   try:
-       cfg = json.load(open('$CF'))
-   except FileNotFoundError:
-       cfg = []
-   print(json.dumps(entries_for_owner(cfg, '$SUTANDO_INSTANCE_ID')))"
+   "$SUTANDO_PY" "$REPO/src/cron_prompt_gate.py" "$CF" --owner "$SUTANDO_INSTANCE_ID" --workspace "$SUTANDO_WORKSPACE_DIR"
    ```
 
-   The repo root is derived from `$SUTANDO_WATCHER_CMD` rather than assumed from cwd, for the same reason step 2 does. For each entry the filter returns, `CronCreate` it exactly as `/schedule-crons` step 3 would (`prompt_skill` → `/skill-name`; otherwise the `prompt` string) — an entry pinned to a worker is never a `monitor`, `execution: "codex-task"`, or `launchd: true` entry (those ownership models are core-only), so no further filtering is needed. If `crons.json` doesn't exist, or nothing is pinned to `$SUTANDO_INSTANCE_ID`, there is nothing to do here — that is the common case for most workers.
+   The repo root is derived from `$SUTANDO_WATCHER_CMD` rather than assumed from cwd, for the same reason step 2 does. The gate preamble names the gate by its absolute path and checks this worker's assigned workspace (`--workspace`), so it works from any cwd. A missing `crons.json` prints `[]`. For each entry the filter returns, `CronCreate` it exactly as `/schedule-crons` step 3 would: `prompt: <registered_prompt>` from the helper's output, which already carries the owner-task gate preamble when the entry fires more than once a day (`src/cron_prompt_gate.py`; a daily-or-rarer entry is registered verbatim, and `"gate": true` / `"gate": false` on the entry overrides either way) — an entry pinned to a worker is never a `monitor`, `execution: "codex-task"`, or `launchd: true` entry (those ownership models are core-only), so no further filtering is needed. If `crons.json` doesn't exist, or nothing is pinned to `$SUTANDO_INSTANCE_ID`, there is nothing to do here — that is the common case for most workers.
 
 3. Report what actually happened, never a fixed line: `start` → `worker <instance> ready: watching <inbox>` (plus `+ N cron(s) registered` when step 2.5 registered any) — unless the watcher's first line is `WATCHER_HELD:`, which means a holder this session did not start (the gate's `why=` names it) still owns the inbox: report that line verbatim, claim no readiness, and leave `--force-restart` to the owner's word; `skip` → `worker <instance> already watching <inbox>` (nothing was started); `unknown` → start NOTHING and report the gate's `why=` verbatim. Reporting readiness after an `unknown` is the failure this step exists to prevent: it claims a watcher that does not exist.
 
@@ -84,7 +76,7 @@ Note: this step runs BEFORE step 2 so that the watcher (started by step 2's down
 
 Invoke `/schedule-crons`. This handles:
 - Reading `<workspace>/hosts/<hostname>/crons.json` (`<hostname>` = `bash scripts/sutando-config.sh host-label`) — the canonical per-host config.
-  **Not `skills/schedule-crons/crons.json`.** That path is git-ignored and installer-managed: `src/init.sh` seeds it from `crons.example.json` when it is absent and leaves it untouched when it is present. So the in-checkout copy holds whatever the host last left there — shipped sample jobs, or a stale legacy schedule — and nothing keeps it in step with the per-host file. `skills/schedule-crons/SKILL.md` records the move; `/startup` was never updated to match, so registering from the in-checkout copy silently replaces the host's real schedule with legacy state.
+  **Not `skills/schedule-crons/crons.json`.** That path is git-ignored: older releases' `src/init.sh` seeded it from `crons.example.json`, and nothing writes it now. So the in-checkout copy holds whatever the host last left there — shipped sample jobs, or a stale legacy schedule — and nothing keeps it in step with the per-host file. `/schedule-crons` step 1 never seeds the per-host file from it. `skills/schedule-crons/SKILL.md` records the move; `/startup` was never updated to match, so registering from the in-checkout copy silently replaces the host's real schedule with legacy state.
 - Starting the streaming task watcher via the `Monitor` tool, unless `python3 src/watcher_rearm.py mod-ready --repo "$PWD" --workspace "$(bash scripts/sutando-config.sh workspace)"` prints `yes` (the task-watch Mod runs it then) (`bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"` — `$SUTANDO_TASKS_DIR` as the inbox when set; the tag is what lets the external standby supervisor see it and stand down — `timeout_ms: 1800000`, re-armed on the expiry notice and on any early-exit notice, description `"Streaming task watcher"`) — **first**, before any cron is registered (2026-08-24: moved ahead of registration so a task arriving during the registration loop isn't queued unprocessed; see `skills/schedule-crons/SKILL.md` step 1.5 for the measured impact)
 - Calling `CronCreate` for each entry that isn't already scheduled
 - Invoke the skill rather than hand-rolling `CronCreate` from this list: `/schedule-crons` also writes

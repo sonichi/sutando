@@ -72,6 +72,9 @@ What Commons work runs over MCP today:
 
 `space.action.read` always targets the owner's account and answers only when the owner asked this agent
 directly in s.space; without the owner message's `task_id` (a local session with no task) it is refused.
+When your owner asks about their agents in a direct message, read `account.agents.list` with
+`space.action.read` and pass the `task_id` of their message. The list is private to your owner: if they ask
+in a room with other people, don't post it there; say it's private and ask them to ask you in a direct message.
 
 Edit Commons pages and databases only through these Actions, never through room
 messages or state events.
