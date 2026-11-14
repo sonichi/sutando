@@ -79,6 +79,44 @@ for unstable in ("'ask.' + Date.now()", "String(Math.random())", "crypto.randomU
           not got["ok"] and "agent-task-key-unstable" in rules(got, "errors"))
 old_name = cp.check(ASK.replace("art.agent.sendTask(", "art.sendToMyAgent(").replace(", key: 'ask.row1.0'", ""))
 check("error-agent-task-key-on-the-old-name", "agent-task-key" in rules(old_name, "errors"))
+# The key is judged on the call's own argument, not on any `key` elsewhere in the page.
+other_key = cp.check(ASK.replace("await db.read(id);", "await db.read(id); const unrelated = { key: 'x' };")
+                     .replace(", key: 'ask.row1.0'", ""))
+check("error-agent-task-key-despite-another-key-in-the-page",
+      "agent-task-key" in rules(other_key, "errors"))
+other_clock = cp.check(ASK.replace("await db.read(id);", "await db.read(id); const unrelated = { key: Date.now() };"))
+check("a-clock-key-elsewhere-is-not-this-requests-key",
+      other_clock["ok"] and "agent-task-key-unstable" not in rules(other_clock, "errors"))
+nested = cp.check(ASK.replace("text: 'Review row 1'", "text: label({ key: Date.now() })"))
+check("a-key-nested-in-another-argument-is-not-the-request-key", nested["ok"])
+check("bracket-call-without-a-key-is-caught",
+      "agent-task-key" in rules(cp.check(ASK.replace("art.agent.sendTask(", "art.agent['sendTask'](")
+                                         .replace(", key: 'ask.row1.0'", "")), "errors"))
+# A key that comes from a helper cannot be proved from the source: a warning names the helper.
+HELPER = "const rid = (k) => 'hp-' + k + Date.now().toString(36) + Math.random().toString(36);"
+helper = cp.check(ASK.replace("await db.read(id);", "await db.read(id); " + HELPER)
+                  .replace("key: 'ask.row1.0'", "key: rid('x')"))
+check("warning-agent-task-key-unproven-helper",
+      helper["ok"] and "agent-task-key-unproven" in rules(helper, "warnings"))
+check("the-unproven-warning-names-the-helper",
+      any("`rid`" in w["message"] for w in helper["warnings"]))
+alias = cp.check(ASK.replace("await db.read(id);", "await db.read(id); const key = Date.now().toString();")
+                 .replace("key: 'ask.row1.0'", "key"))
+check("warning-agent-task-key-unproven-alias", "agent-task-key-unproven" in rules(alias, "warnings"))
+fn = cp.check(ASK.replace("await db.read(id);", "await db.read(id); function makeKey(r) { return r + Math.random(); }")
+              .replace("key: 'ask.row1.0'", "key: makeKey(1)"))
+check("warning-agent-task-key-unproven-function", "agent-task-key-unproven" in rules(fn, "warnings"))
+stable_helper = cp.check(ASK.replace("await db.read(id);", "await db.read(id); const keyFor = (r) => 'ask.' + r;")
+                         .replace("key: 'ask.row1.0'", "key: keyFor(1)"))
+check("a-stable-helper-is-clean", stable_helper["ok"] and not stable_helper["warnings"])
+# What cannot be judged is left alone: a request built elsewhere, or spread in.
+check("a-request-passed-as-a-variable-is-not-judged",
+      cp.check(ASK.replace("{ agentId: a.id, text: 'Review row 1', key: 'ask.row1.0' }", "request"))["ok"])
+check("a-spread-request-is-not-judged",
+      cp.check(ASK.replace("{ agentId: a.id, text: 'Review row 1', key: 'ask.row1.0' }", "{ ...request }"))["ok"])
+check("a-key-with-a-comma-in-a-string-is-read-whole",
+      cp.check(ASK.replace("key: 'ask.row1.0'", "key: ['ask', 'a,b'].join('.')"))["ok"])
+
 check("stable-key-from-a-variable-passes",
       cp.check(ASK.replace("key: 'ask.row1.0'", "key: keyFor(row.id)"))["ok"])
 check("shorthand-key-passes", cp.check(ASK.replace("key: 'ask.row1.0'", "key"))["ok"])

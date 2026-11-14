@@ -118,6 +118,7 @@ const fakeArtifact = (opts = {}) => {
   const snap = () => ({ id: 'd1', name: opts.dbName, props, rows });
   const state = new Map(Object.entries(opts.state || {}));
   const taskAnswers = (opts.taskAnswers || []).slice();
+  const receipts = new Map();
   return {
     calls,
     snapshot: snap,
@@ -146,10 +147,16 @@ const fakeArtifact = (opts = {}) => {
       // Only a room that has the agent calls offers them: `agents` undefined is an older room.
       ...(opts.agents === undefined ? {} : { agent: {
         list: async () => (typeof opts.agents === 'function' ? opts.agents() : opts.agents),
+        // As the host: one receipt per key. The same key again answers from the record, with
+        // no question to the viewer and nothing delivered.
         sendTask: async (request) => {
           calls.push(['sendTask', request]);
+          if (receipts.has(request.key)) return receipts.get(request.key);
           const next = taskAnswers.length ? taskAnswers.shift() : { ok: true, eventId: 'e1' };
-          return typeof next === 'function' ? next() : next;
+          const result = await (typeof next === 'function' ? next() : next);
+          if (result && (result.ok || result.reason === 'declined')) receipts.set(request.key, result);
+          if (result && result.ok) calls.push(['delivered', request]);
+          return result;
         },
       } }),
       db: {
@@ -1609,15 +1616,20 @@ const REVIEW_PROPS = [
   { id: 'l', name: 'Link', type: 'url' },
   { id: 'b', name: 'Created by', type: 'created_by' },
 ];
-const SCOUT = { id: 'u' + 'a'.repeat(64), name: 'Scout', kind: 'agent' };
-const QUILL = { id: 'u' + 'b'.repeat(64), name: 'Quill', kind: 'agent' };
-const reviewOpts = (over = {}) => ({ dbName: 'Review — Items', props: REVIEW_PROPS, agents: [SCOUT], ...over });
+const ONE = { id: 'u' + 'a'.repeat(64), name: 'Agent One', kind: 'agent' };
+const TWO = { id: 'u' + 'b'.repeat(64), name: 'Agent Two', kind: 'agent' };
+const reviewOpts = (over = {}) => ({ dbName: 'Review — Items', props: REVIEW_PROPS, agents: [ONE], ...over });
 const reviewRows = () => [
   { id: 'r1', cells: { Item: 'Blue kettle', Verdict: 'To review', Notes: 'Boils fast', Link: 'https://example.com/k' } },
   { id: 'r2', cells: { Item: 'Red toaster', Verdict: 'Keep' } },
 ];
 const askButtons = (r) => r.byId.get('list').buttons().filter((b) => b.textContent === 'Ask my agent about this');
 const sent = (r) => r.calls.filter((c) => c[0] === 'sendTask').map((c) => plain(c[1]));
+const delivered = (r) => r.calls.filter((c) => c[0] === 'delivered').map((c) => plain(c[1]));
+// A key is "ask.<32 hex of the row and the agent>.<attempt>".
+const KEY = /^ask\.([0-9a-f]{32})\.(\d+)$/;
+const slotOf = (key) => (KEY.exec(key) || [])[1];
+const attemptOf = (key) => Number((KEY.exec(key) || [])[2]);
 
 {
   const r = await run('review-list', { noBridge: true });
@@ -1651,8 +1663,8 @@ const sent = (r) => r.calls.filter((c) => c[0] === 'sendTask').map((c) => plain(
   await settle();
   const [request] = sent(r);
   check('review/ask-sends-one-request', () => assert.equal(sent(r).length, 1));
-  check('review/ask-names-the-viewers-agent', () => assert.equal(request.agentId, SCOUT.id));
-  check('review/ask-key-is-stable-per-row', () => assert.equal(request.key, 'ask.r1.0'));
+  check('review/ask-names-the-viewers-agent', () => assert.equal(request.agentId, ONE.id));
+  check('review/ask-key-is-a-hash-and-a-first-attempt', () => { assert.match(request.key, KEY); assert.equal(attemptOf(request.key), 0); });
   check('review/ask-key-fits-the-host-pattern', () => assert.match(request.key, /^[a-z0-9][a-z0-9._-]{0,63}$/i));
   check('review/ask-text-says-what-the-row-says', () => {
     assert.match(request.text, /Item: Blue kettle/);
@@ -1662,11 +1674,12 @@ const sent = (r) => r.calls.filter((c) => c[0] === 'sendTask').map((c) => plain(
   check('review/ask-carries-nothing-but-agent-text-and-key', () =>
     assert.deepEqual(Object.keys(request).sort(), ['agentId', 'key', 'text']));
   check('review/accepted-says-where-the-answer-goes', () =>
-    assert.match(r.text(), /Sent to Scout\. The answer comes to your chat with it, not to this page\./));
+    assert.match(r.text(), /Sent to Agent One\. The answer comes to your chat with it, not to this page\./));
   // Asking again for the same row uses the same key: the host answers from its record.
   askButtons(r)[0].click();
   await settle();
-  check('review/asking-again-reuses-the-key', () => assert.deepEqual(sent(r).map((q) => q.key), ['ask.r1.0', 'ask.r1.0']));
+  check('review/asking-again-reuses-the-key', () => assert.equal(sent(r)[1].key, sent(r)[0].key));
+  check('review/asking-again-delivers-nothing-more', () => assert.equal(delivered(r).length, 1));
 }
 { // One question in front of the viewer at a time.
   let release;
@@ -1692,19 +1705,31 @@ const sent = (r) => r.calls.filter((c) => c[0] === 'sendTask').map((c) => plain(
   check('review/cancel-is-said-plainly', () => assert.match(r.text(), /Not sent: you cancelled\. Tap again to ask\./));
   askButtons(r)[0].click();
   await settle();
-  check('review/after-a-cancel-the-key-moves-on', () => assert.deepEqual(sent(r).map((q) => q.key), ['ask.r1.0', 'ask.r1.1']));
+  check('review/after-a-cancel-the-key-moves-on', () => {
+    const [a, b] = sent(r).map((q) => q.key);
+    assert.equal(slotOf(a), slotOf(b));
+    assert.deepEqual([attemptOf(a), attemptOf(b)], [0, 1]);
+  });
+  check('review/after-a-cancel-the-next-tap-is-delivered', () => assert.equal(delivered(r).length, 1));
   check('review/after-a-cancel-the-other-row-keeps-its-key', () => {
     askButtons(r)[1].click();
   });
   await settle();
-  check('review/other-row-key', () => assert.equal(sent(r)[2].key, 'ask.r2.0'));
+  check('review/other-row-key', () => {
+    assert.notEqual(slotOf(sent(r)[2].key), slotOf(sent(r)[0].key));
+    assert.equal(attemptOf(sent(r)[2].key), 0);
+  });
 }
 { // The attempt count is kept for the viewer, so a reload does not replay an old cancel.
-  const state = { ['ask.u1']: { r1: 2 } };
+  const first = await run('review-list', reviewOpts({ rows: reviewRows() }));
+  askButtons(first)[0].click();
+  await settle();
+  const slot = slotOf(sent(first)[0].key);
+  const state = { ['ask.u1']: { [slot]: 2 } };
   const r = await run('review-list', reviewOpts({ rows: reviewRows(), state }));
   askButtons(r)[0].click();
   await settle();
-  check('review/kept-attempts-are-read-back', () => assert.equal(sent(r)[0].key, 'ask.r1.2'));
+  check('review/kept-attempts-are-read-back', () => assert.equal(sent(r)[0].key, `ask.${slot}.2`));
 }
 for (const [reason, shown] of [
   ['not_subscribed', /not set up to take requests from apps/],
@@ -1720,7 +1745,7 @@ for (const [reason, shown] of [
   ['confirmation interrupted', /closed before you answered/],
   ['send outcome unknown', /may or may not have been sent/],
   ['request timed out; retry with the same key', /will not be sent twice/],
-  ['a reason nobody has heard of', /Not sent \(a reason nobody has heard of\)\./],
+  ['a reason nobody has heard of', /No confirmation that it was sent \(a reason nobody has heard of\)\./],
 ]) {
   const r = await run('review-list', reviewOpts({ rows: reviewRows(), taskAnswers: [{ ok: false, reason }] }));
   askButtons(r)[0].click();
@@ -1730,13 +1755,13 @@ for (const [reason, shown] of [
   // Only a cancel starts a new request: every other refusal keeps the key.
   askButtons(r)[0].click();
   await settle();
-  check(`review/refusal-keeps-the-key:${reason}`, () => assert.deepEqual(sent(r).map((q) => q.key), ['ask.r1.0', 'ask.r1.0']));
+  check(`review/refusal-keeps-the-key:${reason}`, () => assert.equal(sent(r)[1].key, sent(r)[0].key));
 }
 { // A refusal with no reason, and a call that throws, still say something.
   const r = await run('review-list', reviewOpts({ rows: reviewRows(), taskAnswers: [{ ok: false }, () => { throw new Error('gone'); }] }));
   askButtons(r)[0].click();
   await settle();
-  check('review/refusal-with-no-reason', () => assert.match(r.text(), /Not sent \(no reason given\)\./));
+  check('review/refusal-with-no-reason', () => assert.match(r.text(), /No confirmation that it was sent \(no reason given\)\./));
   askButtons(r)[0].click();
   await settle();
   check('review/a-throwing-call-is-a-refusal', () => assert.match(r.text(), /cannot be reached from this page/));
@@ -1756,16 +1781,50 @@ for (const [reason, shown] of [
   check('review/list-refusal-is-no-agents', () => assert.match(r.text(), /No agent of yours is available/));
 }
 { // Two agents: the viewer picks, and the pick is the one asked.
-  const r = await run('review-list', reviewOpts({ rows: reviewRows(), agents: [SCOUT, QUILL] }));
+  const r = await run('review-list', reviewOpts({ rows: reviewRows(), agents: [ONE, TWO] }));
   check('review/two-agents-show-the-picker', () => {
     assert.equal(r.byId.get('who').hidden, false);
-    assert.deepEqual(r.byId.get('agent').options.map((o) => o.textContent), ['Scout', 'Quill']);
+    assert.deepEqual(r.byId.get('agent').options.map((o) => o.textContent), ['Agent One', 'Agent Two']);
   });
-  r.byId.get('agent').value = QUILL.id;
+  r.byId.get('agent').value = TWO.id;
   askButtons(r)[0].click();
   await settle();
-  check('review/the-picked-agent-is-asked', () => assert.equal(sent(r)[0].agentId, QUILL.id));
-  check('review/the-picked-agent-is-named', () => assert.match(r.text(), /Sent to Quill\./));
+  check('review/the-picked-agent-is-asked', () => assert.equal(sent(r)[0].agentId, TWO.id));
+  check('review/the-picked-agent-is-named', () => assert.match(r.text(), /Sent to Agent Two\./));
+}
+{ // Row ids that differ only in punctuation, or share a long ending, are different requests.
+  const tail = 'x'.repeat(48);
+  const ids = ['a.b', 'ab', 'A.' + tail, 'B.' + tail];
+  const rows = ids.map((id) => ({ id, cells: { Item: 'Item ' + id.slice(0, 3), Verdict: 'To review' } }));
+  const r = await run('review-list', reviewOpts({ rows }));
+  for (let i = 0; i < rows.length; i += 1) {
+    askButtons(r)[i].click();
+    await settle();
+  }
+  check('review/every-row-has-its-own-key', () => assert.equal(new Set(sent(r).map((q) => q.key)).size, ids.length));
+  check('review/every-row-is-delivered', () => assert.equal(delivered(r).length, ids.length));
+  check('review/every-key-fits-the-host-pattern', () =>
+    sent(r).forEach((q) => assert.match(q.key, /^[a-z0-9][a-z0-9._-]{0,63}$/i)));
+}
+{ // The same row asked of a second agent is a second request, delivered to that agent.
+  const r = await run('review-list', reviewOpts({ rows: reviewRows(), agents: [ONE, TWO] }));
+  askButtons(r)[0].click();
+  await settle();
+  r.byId.get('agent').value = TWO.id;
+  askButtons(r)[0].click();
+  await settle();
+  check('review/a-second-agent-has-its-own-key', () => assert.notEqual(sent(r)[1].key, sent(r)[0].key));
+  check('review/a-second-agent-is-really-asked', () =>
+    assert.deepEqual(delivered(r).map((q) => q.agentId), [ONE.id, TWO.id]));
+  check('review/the-second-agent-is-the-one-named', () => assert.match(r.text(), /Sent to Agent Two\./));
+  // Back to the first agent: its receipt stands, and nothing more is delivered.
+  r.byId.get('agent').value = ONE.id;
+  askButtons(r)[0].click();
+  await settle();
+  check('review/the-first-agent-keeps-its-receipt', () => {
+    assert.equal(sent(r)[2].key, sent(r)[0].key);
+    assert.equal(delivered(r).length, 2);
+  });
 }
 { // An older room without the agent calls: the list works, and no dead button is drawn.
   const r = await run('review-list', reviewOpts({ rows: reviewRows(), agents: undefined }));
@@ -1785,7 +1844,7 @@ for (const [reason, shown] of [
     assert.doesNotMatch(request.text, /\n\s*\n/);
     assert.doesNotMatch(request.text, / {2,}/);
   });
-  check('review/an-odd-row-id-still-makes-a-valid-key', () => assert.equal(request.key, 'ask.r1x.0'));
+  check('review/an-odd-row-id-still-makes-a-valid-key', () => assert.match(request.key, KEY));
 }
 { // The database going away while the page is open.
   const r = await run('review-list', reviewOpts({ rows: reviewRows() }));

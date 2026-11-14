@@ -99,7 +99,7 @@ const FIXTURES = {
     ],
     rows: [{ id: 'r1', cells: { Item: LONG_TITLE, Verdict: 'To review', Notes: LONG, Link: 'https://example.com/' + LONG } }],
     // Two agents, so the picker is drawn too, one with a name that does not break.
-    agents: [{ id: 'u' + 'a'.repeat(64), name: LONG_NAME, kind: 'agent' }, { id: 'u' + 'b'.repeat(64), name: 'Scout', kind: 'agent' }],
+    agents: [{ id: 'u' + 'a'.repeat(64), name: LONG_NAME, kind: 'agent' }, { id: 'u' + 'b'.repeat(64), name: 'Agent Two', kind: 'agent' }],
   },
   'turn-game': {
     db: 'Game — Moves',

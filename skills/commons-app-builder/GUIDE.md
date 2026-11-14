@@ -289,10 +289,14 @@ asks one of them.
 
 ```js
 const art = window.artifact;
-// A stable key: the same row and attempt always give the same key, so a double tap or a
-// reload never asks twice. Letters, digits, dot, dash, underscore; at most 64 characters.
-const keyFor = (rowId, attempt) =>
-  'ask.' + String(rowId).replace(/[^A-Za-z0-9_-]/g, '').slice(-40) + '.' + attempt;
+// A stable key: the same row, agent and attempt always give the same key, so a double tap or a
+// reload never asks twice. It must also tell apart everything that is a DIFFERENT request,
+// because the host answers a repeated key from its record without asking or sending: another
+// row, and the same row asked of another agent. So hash the whole row id and the agent id;
+// never trim or strip an id ("a.b" and "ab" are two rows). `hash` is the 32-character one in
+// the review-list template. Letters, digits, dot, dash, underscore; at most 64 characters.
+const keyFor = (rowId, agentId, attempt) =>
+  'ask.' + hash(String(rowId).length + ':' + rowId + '|' + agentId) + '.' + attempt;
 
 async function askMyAgent(row, attempt) {
   const agents = await art.agent.list();
@@ -301,7 +305,7 @@ async function askMyAgent(row, attempt) {
   // The text is the whole request. Say what the row says, in words a person can check.
   const text = 'Please review this item and tell me whether to keep it or drop it, and why.\n'
     + 'Item: ' + row.title + '\nNotes: ' + row.notes;
-  return art.agent.sendTask({ agentId: agent.id, text, key: keyFor(row.id, attempt) });
+  return art.agent.sendTask({ agentId: agent.id, text, key: keyFor(row.id, agent.id, attempt) });
 }
 ```
 
@@ -318,7 +322,8 @@ async function askMyAgent(row, attempt) {
 
 **The rule: the text is what the viewer confirms, and everything else is data.** The host
 shows the viewer the agent's name and the exact `text`, and nothing is sent until they say yes.
-That text is the only thing the agent treats as the request. So:
+That text is the only thing the agent treats as the request. (The host adds a line of its own
+saying which page the request comes from; the viewer sees that line too.) So:
 
 - Put the whole ask in `text`. Do not rely on anything the viewer did not read.
 - Never build `text` from hidden fields, and never make it say less than what you want done.
@@ -332,12 +337,15 @@ arrives there too**. It never appears in the room, and the page never receives i
 
 **What the page learns back.** Only whether the request went out.
 
-- `{ok: true, eventId}`: accepted. Accepted means the request reached the agent's queue, not
-  that it was answered: the answer arrives later, in the viewer's own chat with the agent.
+- `{ok: true, eventId}`: accepted. Accepted means the request was handed on to the agent, not
+  that it was answered: today that is the message sent into the viewer's chat with the agent,
+  and with the rollout below it is the request reaching the agent's queue. Either way the
+  answer arrives later, in the viewer's own chat with the agent.
   `eventId` is an opaque receipt, not a task id: you cannot look anything up with it. Say
   where the answer will arrive: "Sent to *name*. The answer comes to your chat with it, not to
   this page."
 - `{ok: false, reason}`: nothing was sent, or it is not known. Show a sentence for the reason.
+  For a reason you do not know, do not say "not sent": say there is no confirmation that it was.
 - The same `key` again returns the recorded result without asking again. That is the point of
   the key, and it is why it must be stable.
 - There is no "working" or "answered" state to read. Do not draw a spinner that waits for an
@@ -351,7 +359,7 @@ reason to a sentence, and show any reason you do not know as it came.
 | `declined` | "Not sent: you cancelled. Tap again to ask." | Move to a new key (attempt + 1): a cancelled key stays cancelled. |
 | `confirmation interrupted` | "The question closed before you answered. Tap again." | Same key. |
 | `page permission required` | "Allow this page to use this room, then tap again." | Same key. |
-| `too many agent requests`, `too many requests`, `rate` | "Too many requests just now. Wait a minute, then tap again." | Same key. The limit is 10 a minute for one viewer and agent. |
+| `too many agent requests`, `too many requests`, `rate` | "Too many requests just now. Wait a minute, then tap again." | Same key. The limit is about 10 a minute; today it is counted per open page. |
 | `agent not owned or unavailable`, `not_yours` | "That agent is not yours to ask." | Reload the list. |
 | `request timed out; retry with the same key` | "No answer yet about whether it was sent. Tap again: it will not be sent twice." | Same key. |
 | `send outcome unknown` | "It may or may not have been sent. Check your chat with the agent before asking again." | Do not resend by yourself. |
@@ -369,9 +377,10 @@ depends on it:** until it is on in a room, the page gets the reasons in the uppe
 request is delivered as an ordinary message in the viewer's chat with their agent. The page code
 is the same either way, so handle both sets and you need change nothing later.
 
-Only `declined` moves to a new key. Keep the attempt number for the viewer in `artifact.state`
-under a key that includes `me.id` (shortened: a state key is at most 64 characters), so a reload
-does not replay an old cancel.
+Only `declined` moves to a new key. Keep the attempt number, per row and agent, for the viewer
+in `artifact.state` under a key that includes `me.id` (shortened: a state key is at most 64
+characters), so a reload does not replay an old cancel. A state value is small (4 KB), so keep
+only the latest few dozen counts, and treat a refused save as "kept until reload".
 
 **To reach someone else's agent, post in the room instead.** A page can never trigger another
 member's agent. What it can do is put a message in its own room as the viewer:
@@ -379,11 +388,13 @@ member's agent. What it can do is put a message in its own room as the viewer:
 ```js
 const members = await art.members();                       // [{id, name, kind}]
 const helper = members.find((m) => m.kind === 'agent');
+if (!helper) return;                                       // no agent in the room: say so instead
 const r = await art.room.post({ text: '<@' + helper.id + '> please check row 12', key: 'check.12' });
 // { posted: true, eventId } or { posted: false, reason }
 ```
 
-The viewer confirms the exact message first. A mention is written `<@id>` with an `id` from
+The viewer confirms the message first, as the host shows it (the host adds a line saying which
+page it comes from, to the dialog and to the message alike). A mention is written `<@id>` with an `id` from
 `members()`, at most 20 of them, and a group mention such as the whole room is refused. Whether
 the mentioned agent then answers is up to the room's own rules for mentions, exactly as if the
 viewer had typed the message. Label the button for what it does ("Post to the room"), and show

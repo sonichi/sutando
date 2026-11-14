@@ -152,18 +152,40 @@
     return lines.join('\n');
   };
 
-  // A stable key per row and attempt: a double tap or a reload does not ask twice. The attempt
-  // moves on only when the viewer cancelled, so that their next tap can ask again.
+  // A stable key per row, agent and attempt: a double tap or a reload does not ask twice. The
+  // host keeps one receipt per key and answers a repeated key from it, with no question and no
+  // delivery. So the key must tell apart everything that is a different request: another row,
+  // and the same row asked of another agent. Ids are hashed whole, never trimmed or stripped:
+  // "a.b" and "ab" are different rows. The attempt moves on only when the viewer cancelled.
+  const hash = (text) => {
+    let a = 1779033703, b = 3144134277, c = 1013904242, d = 2773480762;
+    for (let i = 0; i < text.length; i += 1) {
+      const k = text.charCodeAt(i);
+      a = b ^ Math.imul(a ^ k, 597399067);
+      b = c ^ Math.imul(b ^ k, 2869860233);
+      c = d ^ Math.imul(c ^ k, 951274213);
+      d = a ^ Math.imul(d ^ k, 2716044179);
+    }
+    a = Math.imul(c ^ (a >>> 18), 597399067);
+    b = Math.imul(d ^ (b >>> 22), 2869860233);
+    c = Math.imul(a ^ (c >>> 17), 951274213);
+    d = Math.imul(b ^ (d >>> 19), 2716044179);
+    return [a ^ b ^ c ^ d, b ^ a, c ^ a, d ^ a]
+      .map((n) => (n >>> 0).toString(16).padStart(8, '0')).join('');
+  };
+  // The length before each id keeps ("ab", "c") and ("a", "bc") apart.
+  const slotFor = (rowId, agentId) => hash(String(rowId).length + ':' + rowId + '|' + agentId);
   const attemptsKey = 'ask.' + String((art.me && art.me.id) || 'anon').slice(0, 40);
   let attempts = {};
   try {
     const kept = await Promise.resolve(art.state.get(attemptsKey));
     if (kept && typeof kept === 'object') attempts = Object.assign({}, kept);
   } catch (e) { attempts = {}; }
-  const rowPart = (rowId) => String(rowId).replace(/[^A-Za-z0-9_-]/g, '').slice(-40) || 'row';
-  const keyFor = (rowId) => 'ask.' + rowPart(rowId) + '.' + (Number(attempts[rowPart(rowId)]) || 0);
-  const nextAttempt = async (rowId) => {
-    attempts[rowPart(rowId)] = (Number(attempts[rowPart(rowId)]) || 0) + 1;
+  const keyFor = (slot) => 'ask.' + slot + '.' + (Number(attempts[slot]) || 0);
+  const nextAttempt = async (slot) => {
+    attempts[slot] = (Number(attempts[slot]) || 0) + 1;
+    // A state value is small: keep the latest fifty rows' counts.
+    Object.keys(attempts).slice(0, -50).forEach((old) => { delete attempts[old]; });
     // Best effort: unsaved, the count still holds until this page is reloaded.
     try { await art.state.set(attemptsKey, attempts); } catch (e) { /* kept in memory */ }
   };
@@ -206,9 +228,10 @@
         asked.set(row.id, ['warn', 'No agent of yours is available to this page. If the page asked to use this room, allow it, then tap again.']);
         return;
       }
+      const slot = slotFor(row.id, agent.id);
       let r = null;
       try {
-        r = await agentApi.sendTask({ agentId: agent.id, text: askText(row, title), key: keyFor(row.id) });
+        r = await agentApi.sendTask({ agentId: agent.id, text: askText(row, title), key: keyFor(slot) });
       } catch (e) { r = { ok: false, reason: 'agent task unavailable' }; }
       if (r && r.ok === true) {
         asked.set(row.id, ['ok', 'Sent to ' + clean(agent.name || 'your agent', 60) + '. The answer comes to your chat with it, not to this page.']);
@@ -216,11 +239,12 @@
       }
       const reason = String((r && r.reason) || '');
       if (reason === 'declined') {
-        await nextAttempt(row.id);         // a cancelled request is over: the next tap is a new one
+        await nextAttempt(slot);           // a cancelled request is over: the next tap is a new one
         asked.set(row.id, ['', 'Not sent: you cancelled. Tap again to ask.']);
         return;
       }
-      asked.set(row.id, REFUSED[reason] || ['bad', 'Not sent (' + (clean(reason, 80) || 'no reason given') + ').']);
+      // A reason this page does not know may mean "not sent" or "not known": it claims neither.
+      asked.set(row.id, REFUSED[reason] || ['bad', 'No confirmation that it was sent (' + (clean(reason, 80) || 'no reason given') + ').']);
     } finally {
       asking = false;
       if (snapshot) draw(snapshot);
