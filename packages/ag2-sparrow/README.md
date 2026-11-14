@@ -840,6 +840,14 @@ config, which `install` does not write. `verify` reports such a setup as
 `cannot import ag2_sparrow`. Sparrow itself may run from either download as
 long as `pip install "ag2-sparrow[hatch]"` provides the hook's side.
 
+## OpenClaw agents (`ag2-sparrow[openclaw]`)
+
+`ag2-sparrow-openclaw` hosts an OpenClaw agent: for each task Sparrow queues it wakes `openclaw acp`
+over the Agent Client Protocol, resumes that room's Session, and OpenClaw answers with
+`ag2-sparrow-openclaw reply <result_file>` or `no-reply`. `install` and `verify` work as
+`ag2-sparrow-codex-local`'s do. See
+[`ag2_sparrow/adapters/openclaw/README.md`](ag2_sparrow/adapters/openclaw/README.md).
+
 ## Optional: room-event subscription (0.3.0)
 
 Off by default. With `SPARROW_EVENTS=1` the client also maintains a persistent

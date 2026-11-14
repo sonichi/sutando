@@ -272,6 +272,29 @@ class TokenStdin(fx.AgentRootBase):
                     self.assertTrue(jobs.bridges[first].active, "the first bridge is left running")
                     self.assertEqual(self.snapshot(), before)
 
+    def test_a_codex_resume_thread_that_cannot_be_used_is_refused_before_stdin_is_read(self):
+        thread = "019a1b70-4175-7721-8b53-5c79b079372d"
+        for mac in (False, True):
+            for bad, why in (("not-a-uuid", "is not a Codex conversation id"), (thread, "no Codex conversation")):
+                with self.subTest(mac=mac, bad=bad):
+                    self.fresh(CX.name, mac)
+                    shutil.rmtree(self.codex_home / "sessions", ignore_errors=True)
+                    before = self.snapshot()
+                    rc, out, err, stdin, _ = self.paste(CX.name, TOKEN, mac, None, "--resume-thread", bad)
+                    self.assertEqual(rc, cm.EXIT_UNUSABLE, out + err)
+                    self.assertEqual(stdin.tell(), 0, "stdin is never read")
+                    self.assertIn(why, err)
+                    self.assertEqual(self.relay_fake.calls, [], "the relay is never asked")
+                    self.assertEqual(self.snapshot(), before, "no seat, config or unit")
+            with self.subTest(mac=mac, case="saved, in capitals"):
+                self.fresh(CX.name, mac)
+                day = self.codex_home / "sessions" / "2026" / "11" / "12"
+                day.mkdir(parents=True, exist_ok=True)
+                (day / f"rollout-2026-11-12T03-00-00-{thread}.jsonl").write_text("{}\n")
+                rc, out, err, _stdin, jobs = self.paste(CX.name, TOKEN, mac, None, "--resume-thread", thread.upper())
+                self.assertEqual(rc, 0, out + err)
+                self.assertEqual(cm.read_config(cm.config_path(CX))["RESUME_THREAD"], thread, "kept lowercase")
+
     def test_a_running_job_is_refused_before_stdin_is_read(self):
         for name, mac in self.each():
             with self.subTest(name=name, mac=mac):

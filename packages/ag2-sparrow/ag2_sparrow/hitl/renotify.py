@@ -207,7 +207,7 @@ def body(notice: str, req: HumanRequirement, now: float,
     waiting = f" {n} task{'s are' if n != 1 else ' is'} waiting." if n else ""
     started = req.created_at if since is None else since
     return (f"⚠ Still blocked after {_duration(now - started)} — "
-            f"{_headline(req)}.{waiting} The card above has the way to clear it.")
+            f"{_headline(req)}.{waiting} Its card has the way to clear it.")
 
 
 def dedupe_key(notice: str, req: HumanRequirement, projection: Dict,
