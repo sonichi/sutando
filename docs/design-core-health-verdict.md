@@ -130,3 +130,24 @@ GET /health?agent=all|core|workers|<worker id>&view=summary|full
 Not touching bridge/service health (those are separate `services-status.json`
 concerns). Not changing what counts as `working`/`offline` in `derive()` — only
 adding the severity layer on top and centralizing who reads it.
+
+## Source-backed service restarts in health-check
+
+The `health-check.py --fix` issues loop checks the checkout before each
+source-backed service action: `com.sutando.*` jobs, launchd-backed services,
+bridge restarts, stuck-CONNECTING voice recovery and conversation-server recovery.
+The check is lazy and is repeated for each action; a clean verdict from an earlier
+restart does not authorize a later action after the checkout becomes dirty.
+
+A source checkout must be clean and on `SUTANDO_EXPECTED_BRANCH`, then
+`core.expected_branch`, then `main` in precedence order. Unreadable git state,
+a broken `.git` link or an unverified non-git tree refuses the action. A shipped
+non-git engine with a readable parent `ENGINE_MANIFEST.json` containing a nonempty
+SHA retains recovery. The engine-drift check shares that manifest parser.
+
+This gate composes with pin vetoes, bridge supervision/verified eviction and the
+phone server's idle/drain policy; it does not replace them. Compiled-app launch
+and external ngrok/Tailscale recovery are separate cases. These checks narrow the
+authorization window but do not lock the working tree against concurrent edits.
+The action-inventory test covers this issues loop, not every fixer elsewhere in
+the health-check program.
