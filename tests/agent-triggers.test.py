@@ -51,7 +51,8 @@ class Registry(unittest.TestCase):
         self.assertEqual(at.EVENT_PLAYBOOKS["room.mention"], "reply")
         # The backend's trigger registry names these playbooks (intake/triggers.py REGISTRY).
         self.assertEqual(at.EVENT_PLAYBOOKS["commons.summon"], "summon")
-        self.assertEqual(at.EVENT_PLAYBOOKS["email.received"], "email")
+        # No email playbook ships here, so email.received has no registry default.
+        self.assertNotIn("email.received", at.EVENT_PLAYBOOKS)
         self.assertEqual(at.EVENT_TYPES, frozenset(at.EVENT_PLAYBOOKS))
         for pb in at.EVENT_PLAYBOOKS.values():
             self.assertEqual(at.playbook_value(pb), pb, "a default must be a valid id")
@@ -96,7 +97,8 @@ class Dispatch(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         base = Path(self.tmp.name)
         self.skills = base / "skills"
-        manifests = {"room-onboard": None, "other-playbook": '{"name": "other-playbook", "playbook": true}',
+        manifests = {"room-onboard": '{"name": "room-onboard", "playbook": true}',
+                     "other-playbook": '{"name": "other-playbook", "playbook": true}',
                      "plain-skill": '{"name": "plain-skill"}',
                      "truthy-skill": '{"name": "truthy-skill", "playbook": "yes"}',
                      "broken-skill": '{"playbook": true'}
@@ -120,7 +122,7 @@ class Dispatch(unittest.TestCase):
                          self.skills / "other-playbook" / "SKILL.md")
 
     def test_only_allowed_playbooks_run(self):
-        self.assertTrue(at.is_playbook(self.skills, "room-onboard"), "registry playbook")
+        self.assertTrue(at.is_playbook(self.skills, "room-onboard"), "registry id that opts in")
         self.assertTrue(at.is_playbook(self.skills, "other-playbook"), "manifest opt-in")
         for name in ("plain-skill", "truthy-skill", "broken-skill", "no-such-skill", "../evil"):
             self.assertFalse(at.is_playbook(self.skills, name), name)
@@ -153,22 +155,51 @@ class Dispatch(unittest.TestCase):
         self.assertEqual(self.resolve("commons.page_moved", "other-playbook"),
                          self.skills / "other-playbook" / "SKILL.md", "an allowed playbook still runs")
 
-    def test_summon_and_email_run_their_default_playbook(self):
-        for event, pb in (("commons.summon", "summon"), ("email.received", "email")):
-            self.assertIsNone(self.resolve(event, pb), f"{event}: no {pb} skill yet, a message")
-            self.assertIsNone(self.resolve(event, None), event)
-            (self.skills / pb).mkdir()
-            (self.skills / pb / "SKILL.md").write_text(f"# {pb}\n")
-            want = self.skills / pb / "SKILL.md"
-            for header in (pb, None, "", "plain-skill", "no-such-skill", "../evil"):
-                self.assertEqual(self.resolve(event, header), want, (event, header))
-            self.assertEqual(self.resolve(event, "other-playbook"),
-                             self.skills / "other-playbook" / "SKILL.md", "the task's own playbook wins")
+    def test_summon_runs_its_default_playbook(self):
+        event, pb = "commons.summon", "summon"
+        self.assertIsNone(self.resolve(event, pb), "no summon skill yet, a message")
+        self.assertIsNone(self.resolve(event, None), event)
+        (self.skills / pb).mkdir()
+        (self.skills / pb / "SKILL.md").write_text(f"# {pb}\n")
+        (self.skills / pb / "manifest.json").write_text('{"name": "summon", "playbook": true}')
+        want = self.skills / pb / "SKILL.md"
+        for header in (pb, None, "", "plain-skill", "no-such-skill", "../evil"):
+            self.assertEqual(self.resolve(event, header), want, header)
+        self.assertEqual(self.resolve(event, "other-playbook"),
+                         self.skills / "other-playbook" / "SKILL.md", "the task's own playbook wins")
+
+    def test_registry_id_without_opt_in_is_refused(self):
+        # A skill named like a registry playbook but with no `"playbook": true` never runs.
+        for pb, manifest in (("summon", None), ("summon", '{"name": "summon"}'),
+                             ("reply", '{"name": "reply", "playbook": "yes"}')):
+            d = self.skills / pb
+            d.mkdir(exist_ok=True)
+            (d / "SKILL.md").write_text(f"# {pb}\n")
+            if manifest is None:
+                (d / "manifest.json").unlink(missing_ok=True)
+            else:
+                (d / "manifest.json").write_text(manifest)
+            self.assertFalse(at.is_playbook(self.skills, pb), (pb, manifest))
+            self.assertIsNone(self.resolve("room.mention", pb), (pb, manifest))
+            self.assertIsNone(self.resolve("commons.summon", pb), (pb, manifest))
+            self.assertIsNone(at.allowed_playbook_value(pb, self.skills), (pb, manifest))
+        (self.skills / "room-onboard" / "manifest.json").write_text('{"name": "room-onboard"}')
+        self.assertIsNone(self.resolve("room.joined", None), "a registry default needs the opt-in too")
+        self.assertIsNone(self.resolve("", "room-onboard"))
+
+    def test_email_received_has_no_default(self):
+        self.assertIsNone(at.default_playbook("email.received"))
+        (self.skills / "email").mkdir()
+        (self.skills / "email" / "SKILL.md").write_text("# email\n")
+        self.assertIsNone(self.resolve("email.received", None), "no default: an ordinary message")
+        self.assertIsNone(self.resolve("email.received", "email"), "no opt-in: refused")
+        (self.skills / "email" / "manifest.json").write_text('{"name": "email", "playbook": true}')
+        self.assertEqual(self.resolve("email.received", "email"), self.skills / "email" / "SKILL.md")
 
     def test_registry_playbooks_cross_a_bridge_with_no_skills_tree(self):
         # The hatch and openclaw adapters have no skills tree: a playbook missing here is dropped there.
-        for pb in ("summon", "email"):
-            self.assertEqual(at.allowed_playbook_value(pb), pb)
+        self.assertEqual(at.allowed_playbook_value("summon"), "summon")
+        self.assertIsNone(at.allowed_playbook_value("email"), "not a registry id here")
 
     def test_allowed_playbook_value_uses_the_same_allowlist(self):
         for pb in ("room-onboard", "reply"):
@@ -235,6 +266,21 @@ class Dispatch(unittest.TestCase):
             self.assertEqual(at.resolve_playbook("commons.summon", header, REPO / "skills"), want)
         errors, _warnings = lint._lint_manifest(REPO / "skills" / "summon")
         self.assertEqual(errors, [])
+
+    def test_shipped_summon_playbook_passes_asked_by(self):
+        text = " ".join((REPO / "skills" / "summon" / "SKILL.md").read_text().split())
+        self.assertIn("`asked_by` = the task's `user_id`", text)
+        self.assertIn("`asked_by` = `user_id`", text, "the Outcome write names it too")
+
+    def test_cli_refuses_a_registry_named_skill_with_no_opt_in(self):
+        def run(*args):
+            return subprocess.run([sys.executable, str(REPO / "src" / "agent_triggers.py"), "resolve",
+                                   "--skills-root", str(self.skills), *args],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+        (self.skills / "summon").mkdir()
+        (self.skills / "summon" / "SKILL.md").write_text("# summon\n")
+        self.assertEqual(run("--event-type", "room.mention", "--playbook", "summon"), "none")
+        self.assertEqual(run("--event-type", "commons.summon"), "none")
 
     def test_shipped_room_onboard_opts_in(self):
         manifest = json.loads((REPO / "skills" / "room-onboard" / "manifest.json").read_text())
