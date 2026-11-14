@@ -65,6 +65,11 @@
   primary                      the primary row's instance ('' = the legacy bridge); exit 2 when none
   enabled                      each row a bridge serves (neither disabled nor parked), one instance per
                                line ('' = the legacy bridge); exit 1 when there is none
+  sync-mcp-lanes [--json] [--descriptor PATH]
+                               write one MCP proxy lane descriptor (+ 0600 env file) per enabled
+                               connection the main descriptor does not serve, and remove stale ones;
+                               a successful launch and park/disconnect/remove keep them current.
+                               Exit 1 with no readable main descriptor (nothing touched)
 
 Each verb parses, calls one unit and prints; policy lives in the module.
 """
@@ -345,6 +350,21 @@ def cmd_launch_plan(args) -> int:
     return 0
 
 
+def cmd_sync_mcp_lanes(args) -> int:
+    out = connections.sync_mcp_lanes(args.workspace, descriptor=args.descriptor)
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+    elif not out["ok"]:
+        print(f"connections: MCP lanes not synced: {out['reason']}", file=sys.stderr)
+    else:
+        for key in ("written", "unchanged", "removed"):
+            for slug in out[key]:
+                print(f"{key}\t{slug}")
+        for slug, reason in sorted(out["skipped"].items()):
+            print(f"skipped\t{slug}\t{reason}")
+    return 0 if out["ok"] else 1
+
+
 def cmd_keep_lanes(args) -> int:
     connections.keep_lanes_bounded(max_s=args.max_s, repo=args.repo, logs_dir=args.logs_dir,
                                    workspace=args.workspace)
@@ -409,6 +429,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_worker_mcp_credential_argv)
     sub.add_parser("primary").set_defaults(fn=cmd_primary)
     sub.add_parser("enabled").set_defaults(fn=cmd_enabled)
+    s = sub.add_parser("sync-mcp-lanes"); s.add_argument("--json", action="store_true")
+    s.add_argument("--descriptor", type=Path, default=None, help="the main MCP descriptor (default: discovered)")
+    s.set_defaults(fn=cmd_sync_mcp_lanes)
     return p
 
 

@@ -5489,6 +5489,18 @@ class Move(MoveFixtures):
         self.assertEqual((out["ok"], out["mcp"]), (True, "write_failed"))
         self.assertEqual(self.descriptor_json()["mcp_url"], "https://mcp.ag2.space/mcp")
 
+    def test_a_code_the_env_line_cannot_quote_is_refused_and_the_descriptor_left(self):
+        path = self.descriptor()
+        env_file = self.ws / "channels" / "s.space" / ".env"
+        with self.assertLogs("connections", "WARNING") as logs:
+            out = C.repoint_mcp_descriptor(path, legacy="ag2.space", code="https://chat.s.space/relay|a'b",
+                                           agent_mxid="@sutando-x:s.space", env_file=env_file,
+                                           space_of=move_resolver)
+        self.assertEqual(out, "write_failed")
+        self.assertEqual(self.descriptor_json()["mcp_url"], "https://mcp.ag2.space/mcp")
+        self.assertFalse(env_file.exists())
+        self.assertNotIn("a'b", "".join(logs.output))
+
     def test_the_stale_digest_of_another_secret_is_dropped(self):
         self.descriptor(bearer_digest="0" * 64)
         self.assertEqual(self.move()["mcp"], "repointed")
