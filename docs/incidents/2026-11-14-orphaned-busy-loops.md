@@ -1,7 +1,7 @@
 # Incident: orphaned CPU busy-loops starve the credential proxy and stall the core (2026-11-14)
 
-**Status:** recovering as of 08:59 PST. Results are being delivered again (11 between 08:40 and 08:56) and load is ~18, but the proxy still shows upstream idle timeouts.
-**Full delivery outage:** 06:59 → 07:57 PST. Delivery was then intermittent until 08:54 PST.
+**Status:** recovering as of 09:11 PST. The same worker hit the host again at 08:59 with a 220-loop load test, which the owner killed at 09:10. The worker has been told not to repeat it.
+**Full delivery outage:** 06:59 → 07:57 PST. Delivery was intermittent until 08:54, then failed again from ~09:03 to 09:11 PST.
 **Host:** one 14-core macOS host running the live core, ~10 pool workers and the credential proxy
 
 ## Summary
@@ -31,7 +31,21 @@ each using 22–45% CPU. On top of that, one Sutando `task-notifier.sh` was
 spinning at ~67%, and Chrome, the iOS Simulator, Docker and Dropbox were all
 busy. The core went back to `502`/`408` retries until that load was cleared.
 By 08:59 the leaked shells were gone, the Simulator and Docker had been quit,
-and load was ~18.
+and load briefly read ~18.
+
+**It happened again, deliberately and bigger.** At 08:59 and again at 09:03,
+the same worker started `under_load.py` with `BUSY=220`: 220
+`node -e "for(;;){}"` loops while it reran a WebKit smoke suite 10 and then 20
+times. It ran in the background of the worker's own shell. Load peaked at
+**485**, the proxy stopped answering, and the core went back to API errors.
+The owner killed the script and its 220 loops by parent PID at 09:10. This
+recurrence shows that rules for agents (items 1–3 below) are not enough
+without a limit enforced on the host (item 4).
+
+The same investigation found a third, unrelated load source: two copies of
+OpenClaw (`ai.openclaw.gateway` and its older name `com.clawdbot.gateway`)
+had been crash-looping under launchd for over a day. Each crashed at startup
+on a revoked Slack token, and each had been restarted ~23,600 times.
 
 ## Impact
 
@@ -43,7 +57,8 @@ and load was ~18.
   not reach the API from ~07:30 until 07:47. From 08:23 to ~08:40 it failed
   again with `502`/`408` retries. In between it was very slow: it had to
   reread a multi-day session after an earlier `/login` to a different
-  organization, and the host never got far below ~100 load.
+  organization, and the host never got far below ~100 load. From ~09:03 to
+  09:11 it failed again under the second 220-loop run.
 - **Pool workers** sharing the proxy failed with the same errors. That
   includes the worker that started the loops.
 - **The whole host** became unusable for other work (load > 20× core count).
@@ -71,7 +86,14 @@ and load was ~18.
 | 08:25 | An empty probe through the proxy gets no answer in 30 s, while the API answers directly in 0.1 s. `taskpolicy -B` lifts background throttling on the proxy pid; probes still time out. |
 | 08:26 | Load back at 273; the proxy is runnable but gets ~0% CPU. Found 8 orphaned `zsh` shells (ppid 1, 20 h old) from a review session's flaky-test rerun loop at 22–45% CPU each, plus `task-notifier.sh` spinning at ~67%. Chrome (41 runnable), a WebKit page, the Dropbox GPU helper, the iOS Simulator and the Docker VM make up the rest. |
 | 08:28–08:40 | Load 110–180. Core alternates between `408`/`502` retries and progress. A probe takes 18 s to return a 401. One result at 08:29, four at 08:40. |
-| by 08:59 | Leaked shells gone, iOS Simulator and Docker quit. Load ~18. 11 results delivered 08:54–08:56. Chrome and Dropbox still running; the proxy still logs upstream idle timeouts and an empty probe still timed out. |
+| by 08:59 | Leaked shells gone, iOS Simulator and Docker quit. 1-minute load briefly reads ~18. 11 results delivered 08:54–08:56. Chrome and Dropbox still running. |
+| 08:59:38 | Same worker starts `under_load.py` in the background with `BUSY=220 RUNS=10`. |
+| 09:01–09:03 | Load back to ~250. Two launchd jobs found crash-looping: `ai.openclaw.gateway` and `com.clawdbot.gateway`, each restarting every few seconds on a Slack `invalid_auth` (~23,600 runs each). |
+| 09:03:27 | Worker starts a second run, `BUSY=220 RUNS=20` (WebKit + run-smokes). |
+| 09:03–09:05 | Owner boots out both OpenClaw jobs. They are disabled, their plists moved aside, and both npm installs removed. |
+| 09:08 | Load **485**; 220 runnable `node -e for(;;){}` processes, all children of the worker's script. Core: `API error · Retrying`. A proxy probe gets nothing in 30 s; the API answers directly in 0.13 s. |
+| 09:10 | Owner kills the script and its loops by parent PID. The worker gets a standing instruction not to run CPU-load reproductions on this host. |
+| 09:11 | Load falling (336); the proxy answers a probe in 10 s. |
 
 ## Root cause
 
@@ -129,9 +151,18 @@ work an agent started outlived the agent, and nothing reaps such orphans.
    and workers report problems by running agent turns, which need the proxy.
    No out-of-band check notified the owner that load was > 20× core count or
    that the proxy was down.
-4. **A Sutando `task-notifier.sh` was spinning** at ~67% CPU (it had been
+4. **Third-party crash loops.** Two copies of OpenClaw (a separate agent
+   product) were set up under launchd with `KeepAlive`. Both crashed at
+   startup on a revoked Slack token and were restarted ~23,600 times each,
+   burning a core on every start for over a day. Nobody noticed, because
+   nothing watches launchd restart counts.
+5. **Nothing limits how much CPU a worker can take.** A pool worker could
+   start 220 busy loops on a 14-core host that is shared with the core and the
+   credential proxy. Nothing enforced a limit, and the same worker did it a
+   second time, 2 hours after the first.
+6. **A Sutando `task-notifier.sh` was spinning** at ~67% CPU (it had been
    running for nearly 3 days). That is a known bug with a fix open in #6141.
-5. **The core session is large and was switched to another organization
+7. **The core session is large and was switched to another organization
    mid-session.** That slows recovery: once the API returns, the core first has
    to reread the session without its cached thinking.
 
@@ -156,7 +187,16 @@ work an agent started outlived the agent, and nothing reaps such orphans.
    remaining heavy apps, and asked the owner to clear them. A precise
    `pkill -f 'scratchpad/rev532'` was checked beforehand to match only those
    shells. By 08:59 the shells were gone and the iOS Simulator and Docker had
-   been quit. Load fell to ~18 and delivery resumed.
+   been quit, and delivery resumed.
+7. Removed OpenClaw and Clawdbot at the owner's request. Both launchd jobs
+   were booted out and disabled, their plists moved to a dated
+   `LaunchAgents.disabled-*` folder (not deleted), and both global npm
+   installs removed. Their shared data directory was kept.
+8. Traced the 220-loop recurrence to the same worker's `under_load.py`
+   (`BUSY=220`). The owner killed it by parent PID:
+   `pkill -P <script-pid> -f 'node -e for\(;;\)\{\}'; kill <script-pid>`.
+   The worker was then told, in its own session, not to run CPU-load
+   reproductions on this host.
 
 ## How to avoid a repeat
 
@@ -201,7 +241,22 @@ reach for `pkill -f "<literal command>"` by habit, and that habit fails
 silently whenever the command contains a regex metacharacter
 (`( ) { } [ ] . * + ? |`).
 
-### 4. Make the credential proxy survive load
+### 4. Enforce a CPU limit on workers at the host level
+
+Rules for agents (items 1–3) were not enough. The same worker started a much
+larger load (220 loops) two hours after its first one. The limit has to be
+enforced on the host, not left to the agent:
+
+- Launch pool workers, and everything they spawn, at background priority
+  (`taskpolicy -b` / `nice -n 10`). The core and the credential proxy stay at
+  normal priority, so a worker's load can't starve them.
+- Have the pool supervisor watch each worker's process tree. If it holds more
+  than N cores for more than a minute, `SIGSTOP` the tree and notify the
+  owner with the tree's PIDs.
+- Make load/stress reproductions an explicit capability the owner grants
+  per task, not something a worker can decide to run on its own.
+
+### 5. Make the credential proxy survive load
 
 - Drop `ProcessType = Background` from
   `src/launchd/com.sutando.credential-proxy.plist`. The proxy sits on the
@@ -211,7 +266,7 @@ silently whenever the command contains a regex metacharacter
 - Retry the startup Keychain read a few times with backoff instead of
   exiting on the first 5 s timeout.
 
-### 5. Add an out-of-band alarm
+### 6. Add an out-of-band alarm
 
 Add a check to the existing health check that runs without the model API.
 It should send a macOS notification and write a pending-question entry when:
@@ -219,9 +274,11 @@ It should send a macOS notification and write a pending-question entry when:
 - 5-minute load / core count stays above ~4 for 10 minutes. The notification
   names the top five CPU consumers and any high-CPU processes with ppid 1
   that were started from an agent scratchpad or worktree; or
-- `localhost:7846` refuses connections for more than 2 minutes.
+- `localhost:7846` refuses connections for more than 2 minutes; or
+- any launchd job's run count rises by more than ~50 an hour (a crash
+  loop, as with OpenClaw here).
 
-### 6. Reap agent orphans
+### 7. Reap agent orphans
 
 Two unrelated sessions leaked processes on the same day. Per-agent discipline
 (items 1–2) won't be enough on its own. Add a reaper to the health check: list
@@ -230,12 +287,12 @@ or `claude-*` temp path. Report any that have run longer than their owning
 session, or longer than an hour, with their CPU use. Kill them automatically
 only after an owner opt-in. Until then, notify the owner with the exact PIDs.
 
-### 7. Land the notifier spin fix
+### 8. Land the notifier spin fix
 
 Merge #6141, so a closed events pipe can't leave `task-notifier.sh` spinning
 indefinitely.
 
-### 8. Keep the core session recoverable
+### 9. Keep the core session recoverable
 
 Avoid `/login` to a different organization inside the live core. Rotate the
 core into a fresh session before it reaches multi-day size, so recovering
@@ -247,7 +304,11 @@ after an outage doesn't mean rereading the whole history.
    the cause before restarting anything; restarts stall under this load.
 2. List runnable processes by command:
    `ps -Ao state,comm | awk '$1 ~ /^R/ {print $2}' | sort | uniq -c | sort -rn | head`.
-   Check for orphans (`ppid 1`) with an agent-shaped command line.
+   Check for orphans (`ppid 1`) with an agent-shaped command line, and for
+   large groups sharing one live parent
+   (`ps -Ao ppid,comm | awk '{print $1}' | sort | uniq -c | sort -rn | head`).
+   Walk that parent's chain up to the agent session that owns it. Also check
+   `launchctl list` for jobs whose PID keeps changing (crash loops).
 3. Trace an orphan to its source by searching agent transcripts
    (`<workspace>/.claude-sutando/projects/*/*.jsonl`) for its command string.
 4. Kill it by PID, or with a fully escaped pattern.
