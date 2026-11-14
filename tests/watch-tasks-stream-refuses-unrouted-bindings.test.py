@@ -86,6 +86,22 @@ class TestCapability(unittest.TestCase):
         os.environ["SUTANDO_MEMORY_DIR"] = str(other)
         self.assertEqual(self.check(), 1)
 
+    def test_a_provider_installed_only_in_the_workspace_is_found(self):
+        repo, ws = self.root / "repo", self.root / "ws"
+        (repo / "skills").mkdir(parents=True)
+        self.skill(ws, code="echo workers-declared; exit 1")
+        self.assertEqual(smc.main(["--check", str(repo), KEY, str(ws)]), 1)
+        self.assertEqual(smc.main(["--check", str(repo), KEY, str(self.root / "empty")]), 0)
+
+    def test_one_provider_linked_from_another_root_counts_once(self):
+        target = self.skill()
+        private = self.root / "private" / "skills"
+        private.mkdir(parents=True)
+        (private / "provider").symlink_to(target.parent)
+        os.environ["SUTANDO_MEMORY_DIR"] = str(self.root / "private")
+        self.assertEqual(smc.providers(self.root, KEY), [("provider", target.resolve())])
+        self.assertEqual(self.check(), 0)
+
     def test_nonproviders_are_skipped_and_usage_is_rejected(self):
         target = self.skill()
         manifest = target.parent / "manifest.json"
