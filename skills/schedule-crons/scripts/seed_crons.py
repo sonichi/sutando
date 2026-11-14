@@ -23,7 +23,8 @@ that match neither a published entry nor any template entry ever shipped
 (``crons.example.history.json`` holds their digests; compared without the template-only ``opt_in`` key) may include
 jobs of the owner's own, such as a customised entry under a starter name. The file is kept as
 ``hosts/<host>/crons.legacy.json`` (``crons.legacy.<n>.json`` when that name holds other content) and their names
-are printed on a ``not-enabled`` line, so the agent can ask the owner. Nothing from it is
+are printed on a ``not-enabled`` line, so the agent can ask the owner; if that copy fails, the line
+names the legacy file itself. Nothing from it is
 registered without the owner's word.
 
 Owner notices (``restored`` and ``not-enabled`` lines) are also recorded in
@@ -149,7 +150,10 @@ def seed(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR,
         except ValueError:
             not_enabled = []
         if not_enabled:
-            kept = keep_legacy(host_dir, raw)
+            try:
+                kept = keep_legacy(host_dir, raw)
+            except OSError:
+                kept = legacy_path  # the notice must survive: the next run reports "exists"
     return ("restored" if restoring else "seeded"), target, source, not_enabled, kept
 
 

@@ -124,6 +124,26 @@ class SeedPolicy(unittest.TestCase):
         out = self.run_step1()
         path = Path(out.split("kept at ", 1)[1].strip())
         self.assertIn(own, json.loads(path.read_text()))
+        self.assertEqual((kept_dir / "crons.legacy.json").read_text(), '[{"name":"older"}]')
+
+    def test_a_restore_reuses_the_backup_already_holding_the_legacy_file(self):
+        self.assertIn("not-enabled my-report", self._seed_with_an_owner_legacy_job())
+        self.target.unlink()
+        out = self.run_step1()
+        kept_dir = self.ws / "hosts" / "h1"
+        self.assertIn(f"kept at {kept_dir / 'crons.legacy.json'}", out)
+        self.assertEqual(sorted(p.name for p in kept_dir.glob("crons.legacy*")), ["crons.legacy.json"])
+
+    def test_a_failed_backup_still_tells_the_owner(self):
+        kept_dir = self.ws / "hosts" / "h1"
+        (kept_dir / "crons.legacy.json").mkdir(parents=True)
+        self.target.write_text('[{"name":"mine"}]')
+        self.run_step1()
+        self.target.unlink()
+        out = self._seed_with_an_owner_legacy_job()
+        self.assertIn(f"restored {self.target}", out)
+        self.assertIn(f"not-enabled my-report kept at {self.legacy.resolve()}", out)
+        self.assertIn("not-enabled my-report", self.run_step1())
 
     def test_a_restored_file_tells_the_owner_their_jobs_need_adding_back(self):
         self.target.parent.mkdir(parents=True)
