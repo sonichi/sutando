@@ -31,6 +31,9 @@ ARGUMENTS: $ARGUMENTS
 
 If the request explicitly names `codex`, `gemini`, or `pi`, honor that directly.
 
+A PR review whose diff is mostly images or video (screenshots, recordings) needs a model that reads
+them: name `gemini` explicitly, since keyword routing sends any prompt containing "review" to `codex`.
+
 ## When NOT to Use
 
 - **Interactive code review or task hand-off from this Claude Code session** → use the `/codex:*` plugin commands directly (`/codex:review`, `/codex:adversarial-review`, `/codex:rescue`, `/codex:status`). The router is for programmatic delegation from scripts, cron, and bridges — it goes through the `claude-codex` skill's bash wrapper, not the plugin.
