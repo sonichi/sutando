@@ -64,7 +64,8 @@ class Fake:
     """Stands in for subprocess.run inside _dup_work: git answers locally, gh from fixtures."""
 
     def __init__(self, search=None, diffs=None, local=(), local_fns=(), branch="feat/x", fail=False,
-                 origin="git@github.com:o/r.git"):
+                 origin="git@github.com:o/r.git", bad_diffs=()):
+        self.bad_diffs = set(bad_diffs)
         self.search, self.diffs, self.fail = search or {}, diffs or {}, fail
         self.local, self.local_fns, self.branch, self.origin = list(local), list(local_fns), branch, origin
         self.calls = []
@@ -91,6 +92,8 @@ class Fake:
         if self.fail:
             return subprocess.CompletedProcess(cmd, 1, "", "HTTP 502: Bad Gateway")
         if cmd[1:3] == ["pr", "diff"]:
+            if int(cmd[3]) in self.bad_diffs:
+                return subprocess.CompletedProcess(cmd, 1, "", "HTTP 502")
             return ok(self.diffs.get(int(cmd[3]), ""))
         self.query = cmd
         data = {a: {"issueCount": len(v), "nodes": v} for a, v in self.search.items() if a not in ("me", "viewer")}
@@ -370,14 +373,38 @@ class Edges(Base):
             text, _ = self.run_hook("git checkout -b fix/rmabcdefghij12-x", run)
             self.assertIn("could not run (unreadable search response)", text, out)
 
-    def test_pr_diff_unavailable_or_out_of_time_is_no_function_signal(self):
-        self.assertIsNone(dw.pr_diff(Fake(), "o/r", 5, 0.0))
+    def _review(self, bad):
+        f = "pkg/bridge.py"
+        me = {"pullRequest": {"title": "fix: fold", "headRefName": "fix/m", "baseRefName": "dev", "author": {"login": "a"},
+                              "files": {"nodes": [{"path": f}]}}}
+        fake = Fake({"me": me, "ro": [pr(8, "y", "fix/b", files=[f], author="bob", base="dev")]},
+                    diffs={n: diff((f, "def g():")) for n in (8, 99)}, bad_diffs=bad)
+        return self.run_hook("gh pr review 99 --repo o/r --approve -b ok", fake)[0]
 
-        def broken(cmd, **kw):
-            raise OSError("gone")
-        self.assertIsNone(dw.pr_diff(broken, "o/r", 5, 2.0))
-        fail = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "HTTP 404")
-        self.assertIsNone(dw.pr_diff(fail, "o/r", 5, 2.0))
+    def test_review_with_both_diffs_readable_flags_the_same_function(self):
+        self.assertIn("Same function changed in an open PR:\n  #8", self._review(()))
+
+    def test_review_with_an_unreadable_diff_is_unknown_not_ok(self):
+        for bad in ((99,), (8,)):
+            text = self._review(bad)
+            self.assertIn("could not run (Function comparison incomplete", text, bad)
+            self.assertEqual(self.rows()[-1]["verdict"], "UNKNOWN", bad)
+
+    def test_a_flag_keeps_its_hits_and_names_the_unread_diffs(self):
+        ro = [pr(7, "x", "fix/a", files=["pkg/bridge.py"], author="al", base="dev"),
+              pr(8, "fix: fold separators", "fix/rmabcdefghij12-b", files=["pkg/bridge.py"], author="bob", base="dev")]
+        fake = Fake({"ro": ro, "viewer": {"login": "me-bot"}, "tk": [pr(5, "t", "fix/rmabcdefghij12-t")]},
+                    diffs={7: diff(("pkg/bridge.py", "def g():"))}, local=["pkg/bridge.py"],
+                    local_fns=[("pkg/bridge.py", "def g():")], branch="fix/rmabcdefghij12-x", bad_diffs=(8,))
+        text, _ = self.run_hook("gh pr create --title t --base dev --body x", fake)
+        self.assertIn("#5", text)
+        self.assertIn("Function comparison incomplete: 1 diff read(s)", text)
+        self.assertEqual(self.rows()[-1]["verdict"], "FLAG")
+
+    def test_pr_diff_out_of_time_reads_nothing(self):
+        fake = Fake()
+        self.assertIsNone(dw.pr_diff(fake, "o/r", 5, 0.0))
+        self.assertEqual(fake.calls, [])
 
     def test_ticket_hits_beyond_the_first_page_name_the_total(self):
         nodes = [dict(pr(10 + i, f"t{i}", f"b{i}"), branch=f"b{i}") for i in range(3)]
@@ -522,6 +549,15 @@ class Delegation(unittest.TestCase):
         self.assertEqual(seen, [("git checkout -b feat/a", "/w", str(REPO))])
         self.assertEqual(r, {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "stubbed advice"}})
 
+    def test_parser_supported_forms_reach_the_check_through_decide(self):
+        for cmd in ("git checkout --quiet -b fix/rmabcdefghij12-test", "git checkout  -b fix/rmabcdefghij12-test",
+                    "git  switch --quiet -c fix/rmabcdefghij12-test", "gh pr  review 9 -R o/r --comment -b x"):
+            fake = Fake({"me": {"pullRequest": {"files": {"nodes": []}}}})
+            with mock.patch.object(dw, "log_path", return_value=Path(tempfile.mkdtemp()) / "l"), \
+                    mock.patch.object(dw, "enabled", return_value=True), mock.patch.object(dw.subprocess, "run", fake):
+                guard.decide(bash(cmd), ARGV)
+            self.assertTrue(fake.gh_calls(), cmd)
+
     def test_only_before_the_tool_and_unchanged_without_the_flag(self):
         with mock.patch.object(dw, "check", side_effect=AssertionError("called")):
             self.assertEqual(guard.decide(bash("git checkout -b feat/a", hook_event_name="PostToolUse"), ARGV), {})
@@ -584,9 +620,19 @@ class Delegation(unittest.TestCase):
 
 
 class Registration(unittest.TestCase):
-    def test_the_launcher_registers_the_check(self):
-        launch = (REPO / "src" / "agent" / "claude" / "cli" / "session-launch.sh").read_text()
-        self.assertIn('"$REPO/hooks/stale-head-post-guard.py" "$REPO/hooks/github-evidence-guard.py"', launch)
+    def _launcher_settings(self):
+        script = ('REPO="$1"; . "$REPO/src/agent/claude/cli/session-launch.sh"; '
+                  'resolve_claude_settings_args >/dev/null 2>&1; printf %s "${SETTINGS_ARGS[1]}"')
+        out = subprocess.run(["/bin/bash", "-c", script, "x", str(REPO)], capture_output=True, text=True,
+                             timeout=60, env=isolated_child_env()).stdout
+        return json.loads(out)
+
+    def test_the_launcher_registers_the_check_in_the_settings_it_builds(self):
+        pre = self._launcher_settings()["hooks"]["PreToolUse"]
+        cmds = [h["command"] for b in pre if b["matcher"] == "Bash" for h in b["hooks"]]
+        mine = [c for c in cmds if "github-evidence-guard.py" in c]
+        self.assertEqual(len(mine), 1, cmds)
+        self.assertIn(f"--dup-check --repo {REPO}", mine[0].replace("'", ""))
 
     def test_the_builder_registers_it_on_bash_with_dup_check_and_its_checkout(self):
         builder = REPO / "src" / "agent" / "claude" / "cli" / "build-core-settings.mjs"

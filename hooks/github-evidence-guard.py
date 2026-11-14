@@ -58,13 +58,13 @@ def decision_context(command):
             json.dumps(receipts, ensure_ascii=False)) if receipts else ""
 
 
-DUP_TRIGGER_KEYS = ("checkout -b", "checkout -B", "switch -c", "switch -C", "switch --create",
-                    "switch --force-create", "worktree add", "pr create", "pr review")
+# Conservative on purpose: the parser decides; this only skips commands that cannot trigger it.
+DUP_TRIGGER_RE = re.compile(r"\bgit\b.*\b(?:checkout|switch|worktree)\b|\bgh\b.*\bpr\b.*\b(?:create|review)\b", re.S)
 
 
 def dup_check(data: dict, command: str, argv) -> dict:
     """PreToolUse advice naming PRs that may already cover this work (`--dup-check` registration only)."""
-    if data.get("hook_event_name", "PreToolUse") != "PreToolUse" or not any(k in command for k in DUP_TRIGGER_KEYS):
+    if data.get("hook_event_name", "PreToolUse") != "PreToolUse" or not DUP_TRIGGER_RE.search(command):
         return {}
     import _dup_work
     root = next((argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--repo"), None)
@@ -113,7 +113,7 @@ def main() -> None:
     try:
         result = decide(json.loads(raw), sys.argv[1:])
     except Exception as exc:
-        if "--dup-check" not in sys.argv[1:] or not any(k in raw for k in DUP_TRIGGER_KEYS):
+        if "--dup-check" not in sys.argv[1:] or not DUP_TRIGGER_RE.search(raw):
             raise
         # Advisory only: say the check did not run, never block.
         result = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext":

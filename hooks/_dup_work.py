@@ -331,18 +331,22 @@ def match(t: dict, data: dict, kws: List[str], mine: Optional[set], since: str, 
     return out
 
 
-def function_overlap(found: dict, my_fns: Dict[str, set], fetch: Callable[[int], Optional[str]]) -> None:
-    """Mark the top file-overlap rows that change the same enclosing function (bounded diff reads)."""
+def function_overlap(found: dict, my_fns: Dict[str, set], fetch: Callable[[int], Optional[str]]) -> int:
+    """Mark the top file-overlap rows that change the same enclosing function (bounded diff reads).
+    Returns how many candidate diffs could not be read."""
     pool = [x for x in found["files"] if x["number"] not in {k["number"] for k in found["ticket"]}][:MAX_FN]
     if not (my_fns and pool):
-        return
+        return 0
     with cf.ThreadPoolExecutor(max_workers=MAX_FN) as ex:
         diffs = list(ex.map(lambda x: (x, fetch(x["number"])), pool))
     for x, d in diffs:
+        if d is None:
+            continue
         theirs = hunk_functions(d)
         fns = sorted({fn for f in x["shared_files"] for fn in my_fns.get(f, set()) & theirs.get(f, set())})
         if fns:
             x["functions"] = fns[:5]
+    return sum(d is None for _, d in diffs)
 
 
 def ranked(found: dict) -> dict:
@@ -439,6 +443,7 @@ def _one(t: dict, run: Run) -> tuple:
         return "UNKNOWN", "no GitHub repository (no --repo and no github.com origin remote)", detail
     if t["trigger"] == "review" and not t.get("pr"):
         return "UNKNOWN", "the reviewed PR is not named by number or URL", detail
+    own = ""
     mine, my_fns = local_diff(run, cwd, t.get("base")) if t["trigger"] == "pr-create" else (None, {})
     with_files = t["trigger"] == "review" or bool(mine)
     if not (kws or tks or with_files):
@@ -450,7 +455,8 @@ def _one(t: dict, run: Run) -> tuple:
                      if t["trigger"] == "review" else None)
         data = search(run, query, args, deadline - time.monotonic())
         if mine_diff is not None:
-            my_fns = hunk_functions(mine_diff.result())
+            own = mine_diff.result()
+            my_fns = hunk_functions(own)
     if t["trigger"] == "review":
         me = ((data.get("me") or {}).get("pullRequest") or {})
         if not me:
@@ -462,13 +468,20 @@ def _one(t: dict, run: Run) -> tuple:
         who = {"author": ((data.get("viewer") or {}).get("login") or "").lower() or None, "title": t.get("title"), "branch": t.get("branch"),
                "base": t.get("base")}
     found = match(t, data, kws, mine, since, who)
-    function_overlap(found, my_fns, lambda n: pr_diff(run, repo, n, deadline - time.monotonic()))
+    unread = function_overlap(found, my_fns, lambda n: pr_diff(run, repo, n, deadline - time.monotonic()))
+    if t["trigger"] == "review" and own is None and found["files"]:
+        unread += 1
+    gap = (f"Function comparison incomplete: {unread} diff read(s) failed or timed out, so same-function "
+           "overlap may be missed.") if unread else ""
     r = ranked(found)
     detail.update({k: [x["number"] for x in r[k]] for k in ("ticket", "function", "keyword")})
     detail.update({"file_only": r["file_only"], "local_file_count": None if mine is None else len(mine)})
     if not (r["ticket"] or r["function"] or r["keyword"]):
+        if gap:
+            return "UNKNOWN", gap.rstrip("."), detail
         return "OK", weak, detail
-    return "FLAG", advice(t, repo, r, q.get("tk", "")) + ("\n" + weak if weak else ""), detail
+    return ("FLAG", advice(t, repo, r, q.get("tk", "")) + ("\n" + gap if gap else "") + ("\n" + weak if weak else ""),
+            detail)
 
 
 def check(command: str, cwd: Optional[str], repo_root, run: Optional[Run] = None) -> str:
