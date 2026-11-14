@@ -119,6 +119,19 @@ To avoid conflicts in the first place:
 
 First-cross-host pull is handled specially — [#1458](https://github.com/sonichi/sutando/pull/1458) catches the "unrelated histories" git error from the initial bootstrap and lets the pull proceed via `--allow-unrelated-histories`.
 
+### Inspect preserved peer content
+
+Run `python3 scripts/sync-conflicts-report.py <workspace>` to list preserved peer
+copies whose content is absent from the live file or appears under another heading.
+The command exits 1 when it finds unreconciled copies, 0 when none remain, and 2
+when the workspace cannot be inspected.
+
+The incremental cache under `state/` is disposable: unreadable or invalid JSON
+is ignored, and structurally malformed entries are rescanned individually while
+valid entries remain reusable. `--full` bypasses the cache entirely. Rescanning
+updates the cache without changing the preserved copies, live files, or retirement
+records.
+
 ## Config keys
 
 | Key | Default | Notes |
