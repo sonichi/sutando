@@ -207,6 +207,35 @@ class SeedPolicy(unittest.TestCase):
         self.run_step1()
         self.assertEqual(self._queued_dms(), [], "a delivered notice is not queued again")
 
+    def test_a_new_notice_is_added_beside_an_unacknowledged_one(self):
+        self.assertIn("not-enabled my-report", self._seed_with_an_owner_legacy_job())
+        self.legacy.unlink()
+        self.target.unlink()
+        out = self.run_step1()
+        self.assertIn(f"restored {self.target}", out)
+        self.assertIn("not-enabled my-report", out)
+
+    def test_an_unreadable_notice_record_is_set_aside_and_reported(self):
+        self.target.parent.mkdir(parents=True)
+        self.target.write_text('[{"name":"mine"}]')
+        self._notice_record().write_text('{"notices": [trunc')
+        out = self.run_step1()
+        bad = self.ws / "hosts" / "h1" / "crons-notice.bad.json"
+        self.assertIn(f"notice-record-unreadable kept at {bad}", out)
+        self.assertEqual(bad.read_text(), '{"notices": [trunc')
+        lines = [n["line"] for n in json.loads(self._notice_record().read_text())["notices"]]
+        self.assertEqual(lines, [f"notice-record-unreadable kept at {bad}"])
+
+    def test_backup_names_are_bounded(self):
+        kept_dir = self.ws / "hosts" / "h1"
+        kept_dir.mkdir(parents=True)
+        (kept_dir / "crons.legacy.json").write_text("[]")
+        for n in range(1, 40):
+            (kept_dir / f"crons.legacy.{n}.json").write_text("[]")
+        out = self._seed_with_an_owner_legacy_job()
+        self.assertIn(f"not-enabled my-report kept at {self.legacy.resolve()}", out)
+        self.assertFalse((kept_dir / "crons.legacy.40.json").exists())
+
     def test_a_failed_notice_write_commits_nothing_and_a_retry_regenerates_it(self):
         self._notice_record().mkdir(parents=True)
         self.legacy.write_text(json.dumps([{"name": "my-report", "cron": "0 9 * * *", "prompt": "x"}]))

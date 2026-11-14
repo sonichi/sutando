@@ -31,7 +31,9 @@ Owner notices (``restored`` and ``not-enabled``) are recorded in ``hosts/<host>/
 before the per-host file is published, written whole. Each is queued once to the owner's DM
 through the proactive outbox (``results/proactive-crons-notice-*.txt``), retried on a later run
 if queueing failed, and its line is printed at most once a day until ``--notice-sent`` clears the
-record. Printing or queueing never clears it.
+record. Printing or queueing never clears it; a new notice is added beside pending ones. An
+unreadable record is moved to ``crons-notice.bad.json`` and reported as a notice of its own.
+At most 20 numbered legacy backups are kept; past that the notice names the legacy file.
 
 The per-host file is published with temp file + ``os.link``, which refuses an existing name,
 so a concurrent seeder or the owner is never clobbered.
@@ -54,6 +56,7 @@ MARKER = ".crons-seeded"
 LEGACY_KEPT = "crons.legacy.json"
 NOTICE = "crons-notice.json"
 REPLAY_S = 86400
+MAX_BACKUPS = 20
 HISTORY = "crons.example.history.json"
 
 
@@ -181,12 +184,11 @@ def seed(workspace: Path, host_label: str, skill_dir: Path = SKILL_DIR,
 
 def keep_legacy(host_dir: Path, raw: bytes) -> Path:
     """Write ``raw`` beside the host file under the first name free or already holding it."""
-    n = 0
-    while True:
+    for n in range(MAX_BACKUPS + 1):
         kept = host_dir / (LEGACY_KEPT if n == 0 else f"crons.legacy.{n}.json")
         if _publish(kept, raw) or kept.read_bytes() == raw:
             return kept
-        n += 1
+    raise OSError(f"{MAX_BACKUPS} legacy backups already kept in {host_dir}")
 
 
 def _restored_notice(target: Path) -> dict:
@@ -204,15 +206,34 @@ def _not_enabled_notice(names: list[str], kept: Path) -> dict:
 
 
 def _read_record(host_dir: Path) -> dict:
+    """The pending notices; an unreadable record is set aside and reported, never dropped."""
+    path = host_dir / NOTICE
     try:
-        data = json.loads((host_dir / NOTICE).read_text())
-    except (FileNotFoundError, ValueError):
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
         return {"notices": [], "last_shown": 0}
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        bad = _set_aside(path)
+        return {"notices": [{"line": f"notice-record-unreadable kept at {bad}"}], "last_shown": 0}
     notices = data.get("notices") if isinstance(data, dict) else None
     notices = [n for n in notices if isinstance(n, dict) and isinstance(n.get("line"), str)] \
         if isinstance(notices, list) else []
     shown = data.get("last_shown") if isinstance(data, dict) else 0
     return {"notices": notices, "last_shown": shown if isinstance(shown, (int, float)) else 0}
+
+
+def _set_aside(path: Path) -> Path:
+    for n in range(MAX_BACKUPS + 1):
+        bad = path.with_name("crons-notice.bad.json" if n == 0 else f"crons-notice.bad.{n}.json")
+        try:
+            os.link(path, bad)
+        except FileExistsError:
+            continue
+        path.unlink()
+        return bad
+    raise OSError(f"{MAX_BACKUPS} unreadable notice records already kept beside {path}")
 
 
 def _write_record(host_dir: Path, record: dict) -> None:
