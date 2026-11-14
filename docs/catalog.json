@@ -443,7 +443,7 @@
    ],
    "status": "canonical",
    "canonical_for": "workspace synchronization mechanics",
-   "last_verified": null
+   "last_verified": "2026-11-14"
   },
   "docs/benchmarks/gaia-100-2026-08-26.md": {
    "title": "GAIA-100 benchmark run (2026-08-26)",

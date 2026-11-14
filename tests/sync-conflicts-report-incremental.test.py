@@ -252,6 +252,95 @@ class TestFailSafeBranches(_Base):
         self.assertTrue((self.ws / "state").is_file())
 
 
+class TestMalformedCache(_Base):
+    def setUp(self):
+        super().setUp()
+        self.rel = "notes/a+[1].md"
+        self.ck = f"{self.batch.name}/{self.rel}"
+        for rel in (self.rel, "notes/other.md"):
+            self._live(rel, "local fact\n")
+            self._saved(rel, "peer fact\n")
+        self.expected = self._main(str(self.ws))
+        self.cache_path = self.ws / "state" / MOD.CACHE_NAME
+        self.cache = json.loads(self.cache_path.read_text())
+        self.calls = self._count_scans()
+
+    def _assert_recovers(self, entry):
+        data = json.loads(json.dumps(self.cache))
+        data["entries"][self.ck] = entry
+        self.cache_path.write_text(json.dumps(data))
+        self.calls.clear()
+        self.assertEqual(self._main(str(self.ws)), self.expected)
+        self.assertEqual(self.calls, [Path(self.rel)])
+        self.assertEqual(json.loads(self.cache_path.read_text()), self.cache)
+
+    def test_non_object_entries_are_rescanned(self):
+        for entry in (None, False, True, 0, 1, "entry", [], [1]):
+            with self.subTest(entry=entry):
+                self._assert_recovers(entry)
+
+    def test_incomplete_or_invalid_fields_are_rescanned(self):
+        original = self.cache["entries"][self.ck]
+        for field in ("saved", "live", "key", "row"):
+            with self.subTest(missing=field):
+                self._assert_recovers({k: v for k, v in original.items() if k != field})
+        invalid = {
+            "saved": [None, {}, [1], [1, 2, -1], [True, 2, 3]],
+            "live": [None, {}, [1], [1, 2, -1], [1, 2.0, 3], "unknown"],
+            "key": [None, [], {}, 1, "other-copy@0123456789abcdef", self.ck + "@invalid"],
+            "row": [None, {}, "unknown", [], [1], [0, 0, 0], [-1, -1, 0],
+                    [1, 2, -1], [1, 0, 0], [1, True, 0], [1, 1.0, 0], ["1", 1, 0]],
+        }
+        for field, values in invalid.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    self._assert_recovers(dict(original, **{field: value}))
+
+    def test_invalid_entry_collections_are_ignored(self):
+        for entries in (None, [], [1], "entries", 1):
+            with self.subTest(entries=entries):
+                data = dict(self.cache, entries=entries)
+                self.cache_path.write_text(json.dumps(data))
+                self.calls.clear()
+                self.assertEqual(self._main(str(self.ws)), self.expected)
+                self.assertCountEqual(self.calls, [Path(self.rel), Path("notes/other.md")])
+
+    def test_another_copys_retirement_key_cannot_silence_a_row(self):
+        other_ck = f"{self.batch.name}/notes/other.md"
+        done, err = MOD.retire(self.ws, [other_ck])
+        self.assertEqual((done, err), ([other_ck], None))
+        expected = self._main(str(self.ws))
+        self.assertIn(self.rel, expected[1])
+        self.assertNotIn("other.md", expected[1])
+        data = json.loads(self.cache_path.read_text())
+        data["entries"][self.ck]["key"] = data["entries"][other_ck]["key"]
+        self.cache_path.write_text(json.dumps(data))
+        self.calls.clear()
+        self.assertEqual(self._main(str(self.ws)), expected)
+        self.assertEqual(self.calls, [Path(self.rel)])
+
+    def test_valid_row_variants_are_reused(self):
+        self._live("notes/clean.md", "peer fact\n")
+        self._saved("notes/clean.md", "peer fact\n")
+        self._saved("notes/missing.md", "peer fact\n")
+        self._saved("notes/directory.md", "peer fact\n")
+        (self.ws / "notes/directory.md").mkdir()
+        expected = self._main(str(self.ws), "--full")
+        self.calls.clear()
+        self.assertEqual(self._main(str(self.ws)), expected)
+        self.assertEqual(self.calls, [])
+        data = json.loads(self.cache_path.read_text())
+        for rel, row in (("notes/missing.md", "clean"),
+                         ("notes/directory.md", None)):
+            with self.subTest(rel=rel):
+                data["entries"][f"{self.batch.name}/{rel}"]["row"] = row
+                self.cache_path.write_text(json.dumps(data))
+                self.calls.clear()
+                self.assertEqual(self._main(str(self.ws)), expected)
+                self.assertIn(Path(rel), self.calls)
+                data = json.loads(self.cache_path.read_text())
+
+
 class TestDailyGate(_Base):
     def setUp(self):
         super().setUp()

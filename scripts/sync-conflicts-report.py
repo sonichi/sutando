@@ -132,7 +132,37 @@ def _load_cache(workspace: pathlib.Path) -> dict:
     if not isinstance(data, dict) or data.get("version") != _SCANNER_VERSION:
         return {}
     entries = data.get("entries")
-    return entries if isinstance(entries, dict) else {}
+    if not isinstance(entries, dict):
+        return {}
+    return {ck: hit for ck, hit in entries.items() if _valid_cache_entry(ck, hit)}
+
+
+def _valid_cache_entry(ck: str, hit) -> bool:
+    """Only reuse complete rows that could have been produced for this copy."""
+    if not isinstance(hit, dict) or not isinstance(hit.get("key"), str):
+        return False
+    prefix = ck + "@"
+    if not hit["key"].startswith(prefix) or not re.fullmatch(r"[0-9a-f]{16}", hit["key"][len(prefix):]):
+        return False
+
+    def stat_key(value):
+        return (isinstance(value, list) and len(value) == 3
+                and all(type(n) is int for n in value) and value[2] >= 0)
+
+    if not stat_key(hit.get("saved")) or "row" not in hit:
+        return False
+    live, row = hit.get("live"), hit["row"]
+    if live == "missing":
+        return row is None
+    if live == NOT_A_FILE:
+        return row == NOT_A_FILE
+    if not stat_key(live):
+        return False
+    if row == "clean":
+        return True
+    return (isinstance(row, list) and len(row) == 3
+            and all(type(n) is int and n >= 0 for n in row)
+            and row[0] > 0 and row[0] == row[1] + row[2])
 
 
 def _row_to_json(n):
