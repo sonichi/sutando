@@ -24,6 +24,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`ag2space_links.py`** — Links a person clicks to open an AG2 Space room, message or room surface inside the app.
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
 - **`agent_availability.py`** — Two room-visible projections of one private runtime: what this agent is doing on THIS task, and whether it can take more work.
+- **`agent_card.py`** — Agent panel cards (`space.ag2.card`, kind `agent_panel`, v 1): build, check, send, and read the replies.
 - **`agent_display_name.py`** — The name this agent introduces itself by: its live s.space display name, never a persona name.
 - **`agent_endpoint.py`** — Agent Endpoint resolver — resolve(endpoint, mode) → a transport route.
 - **`agent_triggers.py`** — AgentTrigger vocabulary and playbook dispatch: which platform events a task may name and which skill runs it.
@@ -138,6 +139,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`install-gateway-bridge-launchd.sh`** — Install / uninstall / check the launchd-supervised gateway-bridge.
 - **`install-health-check-launchd.sh`** — Install / uninstall the launchd-supervised health-check FALLBACK job.
 - **`install-sutando-app-launchd.sh`** — Install / uninstall / check the launchd-supervised Sutando.app job.
+- **`issued_cards.py`** — The agent panel cards this agent itself posted, so a card click counts only as an answer to one of them.
 - **`lane_dedupe.py`** — Cross-lane duplicate guard: one room message becomes one task, answered by its owner lane when known.
 - **`launch_hooks.py`** — Launch hooks: the scripts installed skills declare with the manifest field `on_launch`, each started once per core launch, detached, so no launch waits on or fails because of one.
 - **`live-agent-runtime.ts`** — LiveAgentRuntime — step 5a-2 of the interaction-planes refactor.

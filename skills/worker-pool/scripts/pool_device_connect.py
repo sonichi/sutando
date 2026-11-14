@@ -2,7 +2,8 @@
 """A pool worker's own agent through s.space's device-connect flow: the agent starts it, the owner approves.
 
 The core asks its own server for a device code (`POST /api/connect/start` with the agent's `label` and
-`display_name`), sends the owner the approval link in their DM, and asks again (`POST /api/connect/poll`)
+`display_name`), sends the owner the approval link in their DM as an approval card (src/agent_card.py; the
+text note when no card can be posted), and asks again (`POST /api/connect/poll`)
 until the owner has approved it in a browser or the code expires. The answered bearer goes straight into
 the vault as the worker's connection, and only after the gateway confirms it is the agent the poll
 named, a new agent owned by the core's owner. `rotate=True` asks the same way for a new token of the
@@ -14,10 +15,15 @@ writes or raises either; callers get the agent id and a status.
 from __future__ import annotations
 
 import contextlib
+import json
+import os
 import re
+import secrets
+import subprocess
 import sys
 import time
 import urllib.parse
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -25,6 +31,8 @@ _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parents[2]
 sys.path[:0] = [p for p in (str(_HERE), str(_REPO / "src")) if p not in sys.path]
 
+import agent_card as ac
+import issued_cards
 import connections
 import pool_provision as pp
 import pool_roster as pr
@@ -127,28 +135,59 @@ def collect(base: str, pending: dict, *, request=pp.http_json, sleep=time.sleep,
                                               f"{', ' + pp.error_code(out) if pp.error_code(out) else ''})", known))
 
 
-def approval_note(worker_label: str, label: str, verify_url: str, expires_at: float) -> str:
-    """The owner's DM: what they approve, the link, and when it stops working."""
-    until = time.strftime("%H:%M %Z", time.localtime(expires_at))
-    return (f"[dm-only]\nApprove the agent \"{label}\" for pool worker {worker_label}: open this link "
-            f"and approve it. It works until {until}.\n\n{verify_url}\n\nNothing is saved until you approve, "
-            "and I check that the agent is yours before the worker uses it.")
+def _at(ts: float, now: float) -> str:
+    """`ts` as the owner reads a clock: "3:52 PM", with "tomorrow" (or the date) when it is not today."""
+    t, today = time.localtime(ts), time.localtime(now)
+    hm = time.strftime("%I:%M %p", t).lstrip("0")
+    if t[:3] == today[:3]:
+        return f"{hm} today"
+    if t[:3] == time.localtime(now + 86400)[:3]:
+        return f"{hm} tomorrow"
+    return f"{hm} on {time.strftime('%b', t)} {t.tm_mday}"
 
 
-def expiry_note(worker_label: str, label: str, expires_at: float) -> str:
+def _minutes(seconds: float) -> str:
+    n = max(1, int(round(seconds / 60)))
+    return f"{n} minute{'' if n == 1 else 's'}"
+
+
+_md_url, _md = ac.md_url, ac.md_escape
+
+
+def approval_note(worker_label: str, label: str, verify_url: str, expires_at: float, *, now: float,
+                  display_name: str = "", rotated: bool = False) -> str:
+    """The owner's DM: what they approve, on which server, a labelled link (the code-bearing URL is never
+    the visible text), and how long it works."""
+    host = _md(urllib.parse.urlsplit(verify_url).hostname or "")
+    on = f" on {host}" if host else ""
+    name, worker_label = _md(display_name or label), _md(worker_label)
+    if rotated:
+        head = f"**Approve a new token for {worker_label}'s agent**"
+        what = f"Its agent \"{name}\"{on} gets a new token; the old one stops working once you approve."
+    else:
+        head = f"**Approve an agent for your worker {worker_label}**"
+        what = f"It will work{on} as its own agent, \"{name}\"."
+    return (f"[dm-only]\n{head}\n\n{what}\n\n**[Approve {name}{on} \u2192]({_md_url(verify_url)})**\n\n"
+            f"Works for {_minutes(expires_at - now)}, until {_at(expires_at, now)}. Nothing is saved until you "
+            "approve, and I check that the agent is yours before the worker uses it.")
+
+
+def expiry_note(worker_label: str, label: str, expires_at: float, *, now: float) -> str:
     """The owner's DM once an unapproved link has lapsed: nothing changed, and how to get a new one."""
-    until = time.strftime("%H:%M %Z", time.localtime(expires_at))
-    return (f"[dm-only]\nThe approval link for agent \"{label}\" (pool worker {worker_label}) expired at {until} "
-            "before it was approved, so nothing was set up. Ask me for a new link whenever you are ready.")
+    worker_label, label = _md(worker_label), _md(label)
+    return (f"[dm-only]\n**The approval link for {worker_label} expired**\n\nIt expired at {_at(expires_at, now)} "
+            f"before agent \"{label}\" was approved, so nothing was set up. Ask me for a new link whenever "
+            "you are ready.")
 
 
 def done_note(worker_label: str, label: str, agent_id: str, *, rotated: bool = False) -> str:
     """The owner's DM once the approval is saved: which agent it is and where to find it."""
+    worker_label, label = _md(worker_label), _md(label)
     if rotated:
-        return (f"[dm-only]\nDone: agent \"{label}\" ({agent_id}) has a new token, and pool worker {worker_label} "
-                "uses it. The old token no longer works.")
-    return (f"[dm-only]\nDone: agent \"{label}\" ({agent_id}) is set up as pool worker {worker_label}'s own agent. "
-            "Find it in your agents list (or in your DMs); mention it in a room to give it work there.")
+        return (f"[dm-only]\n**Done: {worker_label}'s agent has a new token**\n\nAgent \"{label}\" "
+                f"(`{agent_id}`) now uses it, and the old token no longer works.")
+    return (f"[dm-only]\n**Done: {worker_label} has its own agent**\n\nAgent \"{label}\" (`{agent_id}`) "
+            "is ready. Find it in your agents list or your DMs, and mention it in a room to give it work there.")
 
 
 def send_to_owner(workspace: Path, text: str) -> str:
@@ -159,14 +198,299 @@ def send_to_owner(workspace: Path, text: str) -> str:
                             text).name
 
 
+RUNTIME_NAMES = {"claude": "Claude", "codex": "Codex"}
+CARD_KIND = "worker-approval"
+CARD_HANDLER = "skills/worker-pool/scripts/pool_identity.py card-reply"
+RESEND = "resend"
+
+
+def _until(expires_at: float) -> str:
+    return time.strftime("%H:%M %Z", time.localtime(expires_at))
+
+
+def card_id(worker: str, server: str) -> str:
+    return f"{CARD_KIND}:{worker}:{server or 'server'}"
+
+
+def worker_subtitle(workspace: Optional[Path], worker: str, host: str = "") -> str:
+    """"Worker · runs on <runtime> on <host>", from the roster's runtime and this machine's label."""
+    row = ((pr.load_roster(connections._workspace(workspace)) or {}).get("workers") or {}).get(worker) or {}
+    runtime = str(row.get("runtime") or "claude").lower()
+    if not host:
+        from util_paths import _host_label
+        host = _host_label()
+    return f"Worker · runs on {RUNTIME_NAMES.get(runtime, runtime.title())}" + (f" on {host}" if host else "")
+
+
+def approval_card(worker: str, worker_label: str, label: str, verify_url: str, expires_at: float, *,
+                  server: str, subtitle: str, rotate: bool = False, now: Optional[float] = None) -> tuple:
+    """(body, card) asking the owner to approve agent `label` for the worker; the link is labelled, never bare."""
+    until = _until(expires_at)
+    what = (f"a new token for the agent {label}" if rotate else f"the agent {label}")
+    host = urllib.parse.urlsplit(verify_url).hostname or ""
+    approve = f"Approve on {host}" if host else "Approve"
+    return ac.build(
+        card_id(worker, server), "pending", title=worker_label, subtitle=subtitle, avatar_=ac.avatar(seed=label),
+        text=(f"Approve {what} so {worker_label} works as its own agent. Nothing is saved until you approve, "
+              "and I check that the agent is yours before the worker uses it."),
+        fields=[{"label": "Agent", "value": label}] + ([{"label": "Server", "value": server or host}]
+                                                        if server or host else []),
+        buttons=[ac.button(f"{approve} →", "url", style="primary", url=verify_url)],
+        note=f"Works for {max(1, round((expires_at - (time.time() if now is None else now)) / 60))} minutes, until {until}.", note_tone="dim",
+        expires_at_ms=int(expires_at * 1000),
+        body=ac.body_line(f"Approve agent \"{label}\" for pool worker {worker_label} (works until {until}):",
+                          link_label=approve, url=verify_url))
+
+
+def done_card(worker: str, worker_label: str, label: str, agent_id: str, *, server: str, subtitle: str,
+              rotated: bool = False) -> tuple:
+    """(body, card) once the approval is saved: the agent, a DM with it, and a way to give it a room."""
+    text = (f"{label} has a new token, and {worker_label} uses it. The old token no longer works." if rotated
+            else f"{label} is {worker_label}'s own agent now. Mention it in a room to give it work there.")
+    buttons = [ac.button(f"Message {label}", "open_dm", style="primary", user_id=agent_id, disabled=False)]
+    if not rotated:
+        buttons.append(ac.button(f"Add {label} to a room", "reply", style="secondary",
+                                 reply=f"Add {label} to a room", disabled=False))
+    return ac.build(card_id(worker, server), "done", title=worker_label, subtitle=subtitle,
+                    avatar_=ac.avatar(mxid=agent_id), status="Approved", text=text,
+                    fields=[{"label": "Agent", "value": agent_id}], buttons=buttons,
+                    body=ac.body_line(f"Done: agent \"{label}\" ({agent_id}) "
+                                      + ("has a new token." if rotated else f"is {worker_label}'s own agent.")))
+
+
+def resend_text(worker_label: str) -> str:
+    """What the owner's click on the expired card says: the button's own words, so it needs no second tap."""
+    return f"Get a new link for {worker_label}"
+
+
+def _resend_button(worker: str, worker_label: str) -> dict:
+    return ac.button(resend_text(worker_label), "reply", style="primary", reply=resend_text(worker_label),
+                     command=ac.reply(CARD_KIND, worker, RESEND), disabled=False)
+
+
+def failed_card(worker: str, worker_label: str, label: str, why: str, *, server: str, subtitle: str) -> tuple:
+    """(body, card) once a resend ended without a new link: why, and the same one tap to try again."""
+    why = " ".join(str(why).split())[:300]
+    return ac.build(card_id(worker, server), "error", title=worker_label, subtitle=subtitle,
+                    avatar_=ac.avatar(seed=label), status="Couldn't make a link",
+                    text=f"I couldn't make a new approval link for {label}: {why}.",
+                    buttons=[_resend_button(worker, worker_label)],
+                    body=ac.body_line(f"I couldn't make a new approval link for agent \"{label}\" (pool worker "
+                                      f"{worker_label}): {why}. Ask me for a new link."))
+
+
+def expired_card(worker: str, worker_label: str, label: str, expires_at: float, *, server: str,
+                 subtitle: str) -> tuple:
+    """(body, card) once the link lapsed unapproved: nothing changed, and one tap for a new link."""
+    until = _until(expires_at)
+    return ac.build(card_id(worker, server), "expired", title=worker_label, subtitle=subtitle,
+                    avatar_=ac.avatar(seed=label), status="Link expired",
+                    text=f"The approval link for {label} expired at {until} before it was approved, so nothing "
+                         "was set up.",
+                    buttons=[_resend_button(worker, worker_label)],
+                    note="A new link works for 15 minutes.", note_tone="dim",
+                    body=ac.body_line(f"The approval link for agent \"{label}\" (pool worker {worker_label}) expired "
+                                      f"at {until}; nothing was set up. Ask me for a new link."))
+
+
+@dataclass
+class CardSink:
+    """Approval cards in the owner's checked DM, posted as the core's own agent on connection `lane`;
+    with `workspace`, each posted card is recorded (issued_cards) so only a click on it can act, and the
+    card it replaces stops acting."""
+    execute: ac.Execute
+    room: str
+    workspace: Optional[Path] = None
+    lane: str = ""
+
+    def show(self, body: str, card: dict, operation_id: str, previous: str = "") -> str:
+        """The event now showing `card`; "" when it could not be posted (the caller sends the text)."""
+        try:
+            if previous:
+                eid = ac.update_card(self.execute, self.room, previous, body, card, operation_id=operation_id,
+                                     owner_dm=self.room)
+            else:
+                eid = ac.send_card(self.execute, self.room, body, card, operation_id=operation_id, owner_dm=self.room)
+        except (ac.CardError, pp.ProvisionError, pp.TransportError):
+            return ""
+        if self.workspace is not None:
+            try:
+                issued_cards.record(self.workspace, eid, card, room=self.room, lane=self.lane, handler=CARD_HANDLER)
+            except OSError:
+                pass  # unrecorded, the card's own buttons do nothing; the flow itself still completes
+        return eid
+
+
+def default_cards(workspace: Optional[Path], core: dict, vault=None, request=None) -> Optional[CardSink]:
+    """A CardSink for the core's lane and owner DM; None when either is unknown, so the text path runs."""
+    room = connections.owner_dm(core, workspace)
+    if not room:
+        return None
+    try:
+        actions, _ = pp.core_actions(workspace, str(core.get("instance") or ""), vault=vault, request=request)
+    except (pp.ProvisionError, connections.ConnectionsError):
+        return None
+    return CardSink(actions.execute, room, connections._workspace(workspace), str(core.get("instance") or ""))
+
+
+def record_path(workspace: Optional[Path], worker: str) -> Path:
+    return Path(connections._workspace(workspace)) / "state" / "agent-cards" / f"{CARD_KIND}-{worker}.json"
+
+
+def read_record(workspace: Optional[Path], worker: str) -> dict:
+    try:
+        rec = json.loads(record_path(workspace, worker).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return rec if isinstance(rec, dict) else {}
+
+
+def write_record(workspace: Optional[Path], worker: str, record: dict) -> None:
+    """What a resend needs to start the same flow again; never the device code or a bearer."""
+    from local_record import write_whole
+    path = record_path(workspace, worker)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_whole(path, record)
+
+
+def _record_lock(workspace: Optional[Path], worker: str):
+    """The one lock every writer of the worker's approval record takes."""
+    from file_lock import locked_file
+    path = record_path(workspace, worker)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return locked_file(path.with_name(path.name + ".lock"))
+
+
+RESEND_STALE_S = 15 * 60
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _resend_live(rec: dict, now: float) -> bool:
+    """Whether a "resending" record still has its flow on the way: younger than RESEND_STALE_S and, when its
+    process is known, that process still running. A dead or silent attempt leaves the button usable again."""
+    if rec.get("state") != "resending" or now - float(rec.get("resend_at") or 0) > RESEND_STALE_S:
+        return False
+    pid = rec.get("resend_pid")
+    return not isinstance(pid, int) or _alive(pid)
+
+
+def _why_not(worker: str, rec: dict, now: float) -> Optional[str]:
+    who = rec.get("worker_label") or worker
+    if not rec.get("label"):
+        return f"no approval card was sent for worker {worker}"
+    if _resend_live(rec, now):
+        return f"a new approval link for {who} is already on its way to your DM"
+    if rec.get("state") == "pending" and float(rec.get("expires_at") or 0) > now:
+        return f"the approval link for {who} still works; use Approve on the newest card"
+    if rec.get("state") == "done":
+        return f"{who} already has its own agent"
+    return None
+
+
+def resend(worker: str, *, workspace: Optional[Path] = None, spawn=None, clock=time.time) -> dict:
+    """Start a fresh device flow for `worker` from its expired or failed card, in the background: {status, why?}.
+    The claim is one locked read-check-write, so two clicks start one flow, and the flow's own writes
+    take the same lock: the pid is added only while the record is still this attempt's claim, so it never
+    replaces what the child has written since. The caller has already checked that the owner clicked
+    (agent_card.click_verdict)."""
+    with _record_lock(workspace, worker):
+        rec, now = read_record(workspace, worker), clock()
+        why = _why_not(worker, rec, now)
+        if why:
+            return {"status": "refused", "why": why}
+        resend_id = secrets.token_hex(8)
+        argv = [sys.executable, str(_HERE / "pool_identity.py"), "--workspace", str(connections._workspace(workspace)),
+                "rotate" if rec.get("rotate") else "add", worker, "--device-flow", "--label", str(rec["label"]),
+                "--resend-id", resend_id]
+        if rec.get("display_name"):
+            argv += ["--display-name", str(rec["display_name"])]
+        if rec.get("lane") is not None:
+            argv += ["--lane", str(rec["lane"])]
+        claimed = {**rec, "state": "resending", "resend_id": resend_id, "resend_at": now}
+        claimed.pop("resend_pid", None)
+        write_record(workspace, worker, claimed)
+
+    def still_claimed(then: Callable[[dict], dict]) -> None:
+        with _record_lock(workspace, worker):
+            current = read_record(workspace, worker)
+            if current.get("state") == "resending" and current.get("resend_id") == resend_id:
+                write_record(workspace, worker, then(current))
+
+    logs = Path(connections._workspace(workspace)) / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    try:
+        if spawn is not None:
+            pid = spawn(argv)
+        else:
+            with open(logs / "worker-approval-resend.log", "ab") as log:
+                pid = getattr(subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                               start_new_session=True), "pid", None)
+    except OSError as e:
+        still_claimed(lambda current: rec)
+        return {"status": "failed", "why": f"the new approval flow did not start ({type(e).__name__})"}
+    if isinstance(pid, int):
+        still_claimed(lambda current: {**current, "resend_pid": pid})
+    return {"status": "started"}
+
+
+def resend_failed(workspace: Optional[Path], worker: str, resend_id: str, why: str,
+                  deliver: Optional[Callable[[str], object]] = None, cards: Optional[CardSink] = None) -> bool:
+    """A resend attempt that ended before its new card was posted: its record becomes "failed" (the
+    button works again) and the owner sees why, on a card (`cards`; by default the core's own, unless
+    `deliver` is given) or as text. Only the same attempt is touched; False when it is not."""
+    if not resend_id:
+        return False
+    with _record_lock(workspace, worker):
+        rec = read_record(workspace, worker)
+        if rec.get("state") != "resending" or rec.get("resend_id") != resend_id:
+            return False
+        write_record(workspace, worker, {**{k: v for k, v in rec.items() if not k.startswith("resend_")},
+                                         "state": "failed", "why": why})
+    who = rec.get("worker_label") or worker
+    if cards is None and deliver is None:
+        try:
+            cards = default_cards(workspace, pp.core_lane(workspace, rec.get("lane")))
+        except (pp.ProvisionError, connections.ConnectionsError, OSError):
+            cards = None
+    shown = ""
+    if cards is not None:
+        try:
+            card = failed_card(worker, who, str(rec.get("label") or who), why, server=str(rec.get("server") or ""),
+                               subtitle=worker_subtitle(workspace, worker))
+            shown = cards.show(*card, f"{CARD_KIND}:{worker}:{resend_id}:failed",
+                               previous=str(rec.get("event_id") or ""))
+        except (ac.CardError, OSError):
+            shown = ""
+    if shown:
+        with _record_lock(workspace, worker):
+            now = read_record(workspace, worker)
+            if now.get("state") == "failed":
+                write_record(workspace, worker, {**now, "room": cards.room, "event_id": shown})
+        return True
+    send = deliver or (lambda text: send_to_owner(workspace or connections._workspace(None), text))
+    send(f"[dm-only]\nI couldn't make a new approval link for {who}: {why}. Tap \"{resend_text(who)}\" on the "
+         "card to try again.")
+    return True
+
+
 def connect(worker: str, *, label: str, display_name: str = "", worker_label: str = "", rotate: bool = False,
             workspace: Optional[Path] = None, vault=None, lane: Optional[str] = None, base: str = "",
             request=pp.http_json, preview=None, deliver: Optional[Callable[[str], object]] = None,
-            say: Callable[[str], None] = lambda text: None, sleep=time.sleep, clock=time.time,
-            repo: Optional[Path] = None, logs_dir: Optional[Path] = None,
+            cards: Optional[CardSink] = None, say: Callable[[str], None] = lambda text: None, sleep=time.sleep,
+            clock=time.time, repo: Optional[Path] = None, logs_dir: Optional[Path] = None,
             start_lane: Optional[Callable[[dict], Optional[dict]]] = None) -> dict:
     """Give `worker` its own agent, or with `rotate` a new token for the one it has: {agent_id, status, row}.
-    `deliver(text)` sends the owner the approval note (default: their DM). The token is saved only when
+    The owner gets an approval card in their DM (`cards`; by default the core's own, unless `deliver` is
+    given), and `deliver(text)` the text note when no card was posted. The token is saved only when
     the gateway confirms the agent the poll named, on the core's server and owned by the core's owner, and
     the save and `start_lane(row)` run under `fenced`, so a worker retired during the wait gets neither."""
     core = pp.core_lane(workspace, lane)
@@ -187,16 +511,44 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     pending = start(base, label, display_name, server=server,
                     welcome_core="" if rotate else str(core.get("agent_mxid") or ""), request=request, clock=clock)
     known = [pending["device_code"]]
-    note = approval_note(worker_label or worker, label, pending["verify_url"], pending["expires_at"])
+    who = worker_label or worker
     send = deliver or (lambda text: send_to_owner(workspace or connections._workspace(None), text))
-    send(note)
-    say(f"approval link sent to the owner; it works until "
-        f"{time.strftime('%H:%M %Z', time.localtime(pending['expires_at']))}")
+    if cards is None and deliver is None:
+        cards = default_cards(workspace, core, vault)
+    server = str(core.get("server") or "")
+    subtitle = worker_subtitle(workspace, worker)
+    op = f"{CARD_KIND}:{worker}:{secrets.token_hex(6)}"
+    record = {"label": label, "display_name": display_name, "worker_label": who, "rotate": rotate,
+              "lane": core.get("instance"), "server": server, "expires_at": pending["expires_at"],
+              "state": "pending"}
+    shown = ""
+    if cards is not None:
+        shown = cards.show(*approval_card(worker, who, label, pending["verify_url"], pending["expires_at"],
+                                          server=server, subtitle=subtitle, rotate=rotate, now=clock()), f"{op}:pending")
+    if shown:
+        record.update(room=cards.room, event_id=shown)
+    else:
+        send(approval_note(who, label, pending["verify_url"], pending["expires_at"], now=clock(),
+                           display_name=display_name, rotated=rotate))
+    _keep(workspace, worker, record)
+    say(f"approval link sent to the owner; it works until {_until(pending['expires_at'])}")
+
+    def tell(card: tuple, note: str, state: str) -> None:
+        nonlocal shown
+        moved = cards.show(*card, f"{op}:{state}", previous=shown) if shown else ""
+        if not moved:
+            send(note)
+        shown = moved or shown
+        _keep(workspace, worker, {**record, "state": state, **({"event_id": moved} if moved else {})})
+
     try:
         got = collect(base, pending, request=request, sleep=sleep, clock=clock)
     except DeviceConnectError as e:
         if e.status == "expired":
-            send(expiry_note(worker_label or worker, label, pending["expires_at"]))
+            tell(expired_card(worker, who, label, pending["expires_at"], server=server, subtitle=subtitle),
+                 expiry_note(who, label, pending["expires_at"], now=clock()), "expired")
+        else:
+            _keep(workspace, worker, {**record, "state": e.status})
         raise
     known.append(got["bearer"])
     token = f"{got['relay_url']}|{got['bearer']}"
@@ -211,12 +563,23 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
             if start_lane is not None and not rotate:
                 out["launch"] = start_lane(out["row"])
     except DeviceConnectError as e:
+        _keep(workspace, worker, {**record, "state": e.status})
         raise DeviceConnectError(pp.scrub(str(e), known), status=e.status) from None
     except (pp.ProvisionError, connections.ConnectionsError) as e:
+        _keep(workspace, worker, {**record, "state": "failed"})
         raise DeviceConnectError(pp.scrub(f"{pp._said(e)}; the approved agent {got['agent_id']} was not "
                                           "saved", known)) from None
-    send(done_note(worker_label or worker, label, out["agent_id"], rotated=rotate))
+    tell(done_card(worker, who, label, out["agent_id"], server=server, subtitle=subtitle, rotated=rotate),
+         done_note(who, label, out["agent_id"], rotated=rotate), "done")
     return out
+
+
+def _keep(workspace: Optional[Path], worker: str, record: dict) -> None:
+    try:
+        with _record_lock(workspace, worker):
+            write_record(workspace, worker, record)
+    except OSError:
+        pass  # only a later resend reads it; the flow itself never depends on it
 
 
 def _save(worker, token, agent_id, core, current, *, workspace, vault, preview, repo, logs_dir) -> dict:
