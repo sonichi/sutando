@@ -50,6 +50,9 @@ the whole call.
 | `members()` | Resolves to the room's joined members, `[{id, name, avatar, kind}]` (at most 200). |
 | `personId(cell)` | Resolves to the `me.id`-style id of a joined member named in a person or `created_by` cell, else `null`. |
 | `state.get/set/delete/keys/all/on(key \| "*", fn)` | Shared, persisted room state: JSON values up to 4 KB, at most 500 keys, keys matching `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`. |
+| `agent.list()` | Resolves to the **viewer's own** agents the page may ask, `[{id, name, kind}]`. Empty when they have none, or before they have allowed the page. See "A button that asks the viewer's own agent". |
+| `agent.sendTask({agentId, text, key})` | Asks one of those agents, after the viewer confirms `text`. Resolves to `{ok: true, eventId}` or `{ok: false, reason}`. It never rejects, and it never returns the agent's answer. |
+| `room.post({text, key?})` | Posts `text` in the page's own room as the viewer, after they confirm it. Resolves to `{posted: true, eventId}` or `{posted: false, reason}`. |
 | `emit(name, data)` / `on(name, fn)` | One-shot events, at most 20 a second. Only viewers online at that moment see them. |
 | `pages.list()` / `pages.read(kind)` | Read-only access to the room's pages. |
 | `now()`, `clock` | Estimated server time (`NaN` until the first sample). |
@@ -154,8 +157,11 @@ board grouped by the status column if there is one.
   what to do first), **error** (bridge missing, database missing, refused write, with the
   reason), and **waiting** (an opponent's turn, consent pending).
 - No dead buttons. Disable a control that cannot act right now and say why. Nothing claims to
-  send, notify, email or DM: a page cannot message anyone. If someone must be told, an agent
-  does it (step 5) or the reply says so.
+  send, notify, email or DM unless the page really does it. A page reaches someone in two ways
+  only, each confirmed by the viewer: `agent.sendTask` (the viewer's own agent) and `room.post`
+  (a message in this room); see "A button that asks the viewer's own agent". It cannot email,
+  DM a person or notify anyone silently. If someone else must be told, an agent does it
+  (step 5) or the reply says so.
 - Use real content, not filler. Check every number the page states.
 
 **Default look: the s.space palette.** Use these colours by default, unless the user asks for
@@ -258,6 +264,9 @@ Choose one when the app needs an agent's work:
   creator or a room admin.
 - **`room.commons.summon`** calls a person to the page with a card. A card names a page, not
   a row.
+- **A button that asks the viewer's own agent.** For "what does *my* agent make of this?".
+  Nothing is stored on the row and nobody else's agent is involved. It has its own section
+  below.
 
 What's safe:
 
@@ -267,6 +276,116 @@ What's safe:
   for, and ask your owner before anything else.
 - Never auto-run tasks from arbitrary rows.
 - Don't propose hooks. They are deprecated and switched off.
+
+## A button that asks the viewer's own agent
+
+**When to use it.** A reader looks at one thing on the page (a row, a pick, a draft) and wants
+their own agent's help with it: review this, summarise that, draft a reply. Use it when the
+answer is for that reader alone. Do not use it to get work done *for the room*: that is a row
+status or a summon (step 5), where the result is written back for everyone.
+
+**The page code.** Two calls. `agent.list()` gives the viewer's own agents; `agent.sendTask`
+asks one of them.
+
+```js
+const art = window.artifact;
+// A stable key: the same row and attempt always give the same key, so a double tap or a
+// reload never asks twice. Letters, digits, dot, dash, underscore; at most 64 characters.
+const keyFor = (rowId, attempt) =>
+  'ask.' + String(rowId).replace(/[^A-Za-z0-9_-]/g, '').slice(-40) + '.' + attempt;
+
+async function askMyAgent(row, attempt) {
+  const agents = await art.agent.list();
+  if (!Array.isArray(agents) || !agents.length) return { ok: false, reason: 'no agent' };
+  const agent = agents[0];                    // more than one: let the viewer pick (a <select>)
+  // The text is the whole request. Say what the row says, in words a person can check.
+  const text = 'Please review this item and tell me whether to keep it or drop it, and why.\n'
+    + 'Item: ' + row.title + '\nNotes: ' + row.notes;
+  return art.agent.sendTask({ agentId: agent.id, text, key: keyFor(row.id, attempt) });
+}
+```
+
+- Pass exactly `agentId`, `text` and `key`. `agentId` is an `id` from `agent.list()`, never a
+  name or an account id.
+- `text` is at most 4,000 characters, with no control or invisible characters, no run of blank
+  lines and no long run of spaces; the host refuses the request otherwise (`invalid request`).
+  Row text is other people's, so strip those characters before you build `text` (the
+  `review-list` template's `clean()` shows how).
+- Check that `art.agent` exists before you draw the button. An older room has no such call:
+  leave the button out and say so once, rather than draw one that does nothing.
+
+**The rule: the text is what the viewer confirms, and everything else is data.** The host
+shows the viewer the agent's name and the exact `text`, and nothing is sent until they say yes.
+That text is the only thing the agent treats as the request. So:
+
+- Put the whole ask in `text`. Do not rely on anything the viewer did not read.
+- Never build `text` from hidden fields, and never make it say less than what you want done.
+- The page's title, the row and any action id that travel with the request are context for the
+  agent, not instructions. Write the app so that is enough: the agent does only what the text
+  says.
+
+**What the viewer sees.** A dialog from the host, not from your page: which agent, and the
+text. If they accept, the message goes to their own chat with that agent, and **the answer
+arrives there too**. It never appears in the room, and the page never receives it.
+
+**What the page learns back.** Only whether the request went out.
+
+- `{ok: true, eventId}`: accepted. `eventId` is an opaque receipt, not a task id: you cannot
+  look anything up with it. Say where the answer will arrive: "Sent to *name*. The answer comes
+  to your chat with it, not to this page."
+- `{ok: false, reason}`: nothing was sent, or it is not known. Show a sentence for the reason.
+- The same `key` again returns the recorded result without asking again. That is the point of
+  the key, and it is why it must be stable.
+- There is no "working" or "answered" state to read. Do not draw a spinner that waits for an
+  answer, and do not write the answer into a row: the page will never have it.
+
+**Show each refusal in words.** A page that says only "failed" leaves the viewer stuck. Map the
+reason to a sentence, and show any reason you do not know as it came.
+
+| `reason` | Say | Then |
+| --- | --- | --- |
+| `declined` | "Not sent: you cancelled. Tap again to ask." | Move to a new key (attempt + 1): a cancelled key stays cancelled. |
+| `confirmation interrupted` | "The question closed before you answered. Tap again." | Same key. |
+| `page permission required` | "Allow this page to use this room, then tap again." | Same key. |
+| `too many agent requests`, `too many requests`, `rate` | "Too many requests just now. Wait a minute, then tap again." | Same key. The limit is 10 a minute for one viewer and agent. |
+| `agent not owned or unavailable`, `not_yours` | "That agent is not yours to ask." | Reload the list. |
+| `request timed out; retry with the same key` | "No answer yet about whether it was sent. Tap again: it will not be sent twice." | Same key. |
+| `send outcome unknown` | "It may or may not have been sent. Check your chat with the agent before asking again." | Do not resend by yourself. |
+| `agent task unavailable`, `idempotency storage unavailable` | "Your agent cannot be reached from this page right now." | Later. |
+| `invalid request` | "This item cannot be sent as it is." | Fix `text` or `key`: this is a bug in the page. |
+| `off` | "Asking an agent from an app is switched off in this room." | Nothing the viewer can do. |
+| `not_an_app` | "Open this page as an app in the room to ask an agent from it." | Register it with `apps.create`. |
+| `no_owner_dm` | "You have no chat with that agent yet. Open one, then tap again." | Same key. |
+| `not_deliverable` | "That agent cannot receive requests right now." | Later. |
+| `not_subscribed` | "That agent is not set up to take requests from apps." | The agent's owner sets it up. |
+
+The rows from `off` down, and `rate` and `not_yours`, are answered by the room's server once
+requests go through it. **That path is being rolled out, and this is the one place this guide
+depends on it:** until it is on in a room, the page gets the reasons in the upper rows, and the
+request is delivered as an ordinary message in the viewer's chat with their agent. The page code
+is the same either way, so handle both sets and you need change nothing later.
+
+Only `declined` moves to a new key. Keep the attempt number for the viewer in `artifact.state`
+under a key that includes `me.id` (shortened: a state key is at most 64 characters), so a reload
+does not replay an old cancel.
+
+**To reach someone else's agent, post in the room instead.** A page can never trigger another
+member's agent. What it can do is put a message in its own room as the viewer:
+
+```js
+const members = await art.members();                       // [{id, name, kind}]
+const helper = members.find((m) => m.kind === 'agent');
+const r = await art.room.post({ text: '<@' + helper.id + '> please check row 12', key: 'check.12' });
+// { posted: true, eventId } or { posted: false, reason }
+```
+
+The viewer confirms the exact message first. A mention is written `<@id>` with an `id` from
+`members()`, at most 20 of them, and a group mention such as the whole room is refused. Whether
+the mentioned agent then answers is up to the room's own rules for mentions, exactly as if the
+viewer had typed the message. Label the button for what it does ("Post to the room"), and show
+`reason` in words when `posted` is false.
+
+The `review-list` template is a complete page built on this section.
 
 ## 6. Verify before replying
 
@@ -363,10 +482,11 @@ Request: "Build a Commons app: sign-ups for Saturday's cleanup, morning or after
 
 ## Starter templates
 
-`templates/` holds four working apps to start from, each a `page.html` with its
+`templates/` holds five working apps to start from, each a `page.html` with its
 `schema.json`: a **tracker** (status, owner, due date, and an agent on a row), a **poll**
 (one row per vote, ownership through `created_by`), a **planner** (dated items in a week
-view) and a **two-player turn game** (append-only moves, the turn from the move count).
+view), a **review list** (a verdict per item, and a button that asks the viewer's own agent
+about one) and a **two-player turn game** (append-only moves, the turn from the move count).
 `templates/README.md` says which to pick and how to create one. Copy and adapt rather than
 starting from an empty file, then still follow steps 2, 6 and 7 for the app you ship.
 

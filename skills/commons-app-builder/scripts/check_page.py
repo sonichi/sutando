@@ -2,7 +2,8 @@
 """Static pre-flight for a Commons app page against GUIDE.md's hard rules.
 
 Catches what a read of the source can prove (sandbox-blocked APIs, missing viewport or dark
-mode, no consent retry, a hard-coded database id). It is no substitute for rendering the page.
+mode, no consent retry, a hard-coded database id, a request to the viewer's agent with no
+stable key). It is no substitute for rendering the page.
 
 Usage: python3 check_page.py page.html [--json]
 Exit 0 = no errors (warnings may remain), 1 = errors, 2 = unreadable input.
@@ -67,8 +68,27 @@ def check(src: str) -> dict:
         if re.search(r"\b(?:display|visibility|opacity)\s*:", m.group(1)):
             add(warnings, "hover-only", "a :hover rule changes display/visibility/opacity: controls must not be hover-only")
             break
-    if re.search(r">\s*(?:Send|Notify|Email|DM|Message)\b[^<]{0,40}</button>", code, re.I):
-        add(warnings, "no-fake-send", "a button claims to send or notify: a page cannot message anyone")
+    # GUIDE "A button that asks the viewer's own agent": the two calls that do reach someone.
+    asks_agent = re.search(r"\b(?:sendTask|sendToMyAgent)\s*\(", code) is not None
+    posts = re.search(r"\broom\s*\.\s*post\s*\(", code) is not None
+    if asks_agent:
+        # The host refuses a request with no key, so the button would never work.
+        if not re.search(r"\bkey\b\s*[:,}]", code):
+            add(errors, "agent-task-key", "sendTask without a key: the host refuses it. Pass a stable key per action")
+        # A key made new on every call defeats the point of it: a double tap asks twice.
+        elif re.search(r"\bkey\s*:\s*[^,}\n]*(?:Date\.now|Math\.random|randomUUID|performance\.now)", code):
+            add(errors, "agent-task-key-unstable",
+                "the sendTask key changes on every call (time or random): a double tap or a reload "
+                "asks twice. Derive it from the row or action")
+        if not re.search(r"\.reason\b", code):
+            add(warnings, "agent-task-refusal",
+                "sendTask's refusal reason is never read: say why nothing was sent")
+    if posts and not re.search(r"\.reason\b|\.posted\b", code):
+        add(warnings, "room-post-refusal", "room.post's result is never read: say whether it was posted")
+    if (not asks_agent and not posts
+            and re.search(r">\s*(?:Send|Notify|Email|DM|Message)\b[^<]{0,40}</button>", code, re.I)):
+        add(warnings, "no-fake-send",
+            "a button claims to send or notify, and the page calls neither agent.sendTask nor room.post")
     return {"ok": not errors, "errors": errors, "warnings": warnings}
 
 

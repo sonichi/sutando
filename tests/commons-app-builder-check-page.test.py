@@ -64,6 +64,38 @@ for rule, warn in [
     got = cp.check(warn)
     check(f"warning-{rule}", got["ok"] and rule in rules(got, "warnings"))
 
+# --- asking the viewer's own agent, and posting in the room -------------------------------
+ASK = GOOD.replace("await db.read(id);", """await db.read(id);
+  const a = (await art.agent.list())[0];
+  const sent = await art.agent.sendTask({ agentId: a.id, text: 'Review row 1', key: 'ask.row1.0' });
+  if (!sent.ok) console.log(sent.reason);""")
+ask = cp.check(ASK)
+check("ask-my-agent-page-passes", ask["ok"] and not ask["warnings"])
+no_key = cp.check(ASK.replace(", key: 'ask.row1.0'", ""))
+check("error-agent-task-key", not no_key["ok"] and "agent-task-key" in rules(no_key, "errors"))
+for unstable in ("'ask.' + Date.now()", "String(Math.random())", "crypto.randomUUID()"):
+    got = cp.check(ASK.replace("key: 'ask.row1.0'", "key: " + unstable))
+    check(f"error-agent-task-key-unstable:{unstable}",
+          not got["ok"] and "agent-task-key-unstable" in rules(got, "errors"))
+old_name = cp.check(ASK.replace("art.agent.sendTask(", "art.sendToMyAgent(").replace(", key: 'ask.row1.0'", ""))
+check("error-agent-task-key-on-the-old-name", "agent-task-key" in rules(old_name, "errors"))
+check("stable-key-from-a-variable-passes",
+      cp.check(ASK.replace("key: 'ask.row1.0'", "key: keyFor(row.id)"))["ok"])
+check("shorthand-key-passes", cp.check(ASK.replace("key: 'ask.row1.0'", "key"))["ok"])
+silent = cp.check(ASK.replace("if (!sent.ok) console.log(sent.reason);", "").replace("r.reason", "r.why"))
+check("warning-agent-task-refusal", silent["ok"] and "agent-task-refusal" in rules(silent, "warnings"))
+POST = GOOD.replace("await db.read(id);", """await db.read(id);
+  const p = await art.room.post({ text: 'Lunch is ready', key: 'lunch.1' });
+  if (!p.posted) console.log(p.reason);""")
+check("room-post-page-passes", cp.check(POST)["ok"] and not cp.check(POST)["warnings"])
+unread = cp.check(POST.replace("if (!p.posted) console.log(p.reason);", "").replace("r.reason", "r.why"))
+check("warning-room-post-refusal", "room-post-refusal" in rules(unread, "warnings"))
+# A button that says Send is honest once the page really posts or asks.
+check("send-button-allowed-with-room-post",
+      "no-fake-send" not in rules(cp.check(POST.replace("Sign me up</button>", "Send to the room</button>")), "warnings"))
+check("send-button-allowed-with-sendTask",
+      "no-fake-send" not in rules(cp.check(ASK.replace("Sign me up</button>", "Send to my agent</button>")), "warnings"))
+
 check("own-confirm-function-allowed", cp.check(GOOD.replace("await art.ready;", "await art.ready; function confirm(x) {}"))["ok"])
 check("commented-fetch-ignored", cp.check(GOOD.replace("await art.ready;", "await art.ready; /* fetch(x) */"))["ok"])
 check("db-only-page-needs-no-ready",

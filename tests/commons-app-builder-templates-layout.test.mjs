@@ -87,6 +87,20 @@ const FIXTURES = {
     ],
     rows: [{ id: 'r1', cells: { Item: LONG_TITLE, Day: '2026-11-11', Slot: 'Morning', State: 'Planned' } }],
   },
+  'review-list': {
+    db: 'Review — Items',
+    props: [
+      { id: 't', name: 'Item', type: 'title' },
+      { id: 'v', name: 'Verdict', type: 'status', options: [
+        { name: 'To review', group: 'todo' }, { name: 'Keep', group: 'done' }, { name: 'Drop', group: 'done' }] },
+      { id: 'n', name: 'Notes', type: 'text' },
+      { id: 'l', name: 'Link', type: 'url' },
+      { id: 'b', name: 'Created by', type: 'created_by' },
+    ],
+    rows: [{ id: 'r1', cells: { Item: LONG_TITLE, Verdict: 'To review', Notes: LONG, Link: 'https://example.com/' + LONG } }],
+    // Two agents, so the picker is drawn too, one with a name that does not break.
+    agents: [{ id: 'u' + 'a'.repeat(64), name: LONG_NAME, kind: 'agent' }, { id: 'u' + 'b'.repeat(64), name: 'Scout', kind: 'agent' }],
+  },
   'turn-game': {
     db: 'Game — Moves',
     props: [
@@ -121,6 +135,7 @@ window.artifact = (() => {
              all: async () => ({}), on: () => () => {} },
     emit: () => {}, on: () => () => {},
     pages: { list: async () => [], read: async () => null },
+    agent: { list: async () => ${JSON.stringify(f.agents || [])}, sendTask: async () => ({ ok: false, reason: 'declined' }) },
     db: { list: async () => [{ id: 'd1', name: ${JSON.stringify(f.db)} }],
           read: async () => snap(), write: async () => ({ ok: true }),
           createRow: async () => ({ ok: true, rowId: 'r9' }), onChange: () => () => {} },

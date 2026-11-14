@@ -25,7 +25,7 @@ def check(name, cond):
     passed.append(name)
 
 
-TEMPLATES = ["tracker", "poll", "planner", "turn-game"]
+TEMPLATES = ["tracker", "poll", "planner", "turn-game", "review-list"]
 # The property types GUIDE.md's prop_add table allows.
 TYPES = {
     "title", "text", "number", "date", "checkbox", "select", "status",
@@ -36,7 +36,7 @@ GROUPS = {"todo", "doing", "done"}
 
 check("templates-dir-exists", _TPL.is_dir())
 check("readme-exists", (_TPL / "README.md").is_file())
-check("all-four-present", sorted(p.name for p in _TPL.iterdir() if p.is_dir()) == sorted(TEMPLATES))
+check("all-templates-present", sorted(p.name for p in _TPL.iterdir() if p.is_dir()) == sorted(TEMPLATES))
 
 readme = (_TPL / "README.md").read_text(encoding="utf-8")
 guide = (_SKILL / "GUIDE.md").read_text(encoding="utf-8")
