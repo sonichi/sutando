@@ -45,11 +45,12 @@ def _poll_budget(gw) -> float:
 class _StubRelay:
     """Holds every task poll (after `first_tasks`, served once) and answers the rest."""
 
-    def __init__(self, first_tasks=None, fail_acks=False, hold_s=None):
+    def __init__(self, first_tasks=None, fail_acks=False, hold_s=None, poll_502_at=()):
         self.release = threading.Event()
         self.hits: list[str] = []
         stub = self
         pending = [list(first_tasks)] if first_tasks is not None else []
+        polls = [0]
 
         class H(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -71,6 +72,10 @@ class _StubRelay:
             def do_GET(self):
                 stub.hits.append(f"GET {self.path}")
                 if self.path.startswith("/v1/tasks?"):
+                    polls[0] += 1
+                    if polls[0] - 1 in poll_502_at:   # answered, not held
+                        self._send(502, {"error": "bad gateway"})
+                        return
                     if pending:
                         self._send(200, {"tasks": pending.pop(0)})
                         return
@@ -291,6 +296,19 @@ class StuckRelayPollTest(unittest.TestCase):
         self.assertIs(last["connected"], False)
         stuck_lines = [m for m in b.logs if m.startswith("stuck relay poll: ") and "consecutive" in m]
         self.assertEqual(len(stuck_lines), 1, "logged once per episode")
+
+    def test_a_poll_answered_with_an_error_ends_the_timeout_streak(self):
+        # N-1 held polls, one answered 502, one more held: N timeouts, never N in a row.
+        n = self.n()
+        self.relay.close()
+        self.relay = _StubRelay(poll_502_at={n - 1})
+        with _Bridge(self.gw, self.relay, self.root) as b:
+            rc = b.run(passes=n + 1)
+        self.assertIsNone(rc, "timeouts on both sides of an answered poll were counted as one streak")
+        self.assertEqual(b.poll_outcomes.count("timeout"), n, b.poll_outcomes)
+        self.assertTrue(any("HTTP 502" in m for m in b.logs), "the 502 poll was not reached")
+        self.assertEqual(b.writes[-1].get("consecutive_poll_timeouts"), 1)
+        self.assertNotIn("stuck_poll", b.writes[-1])
 
     def test_with_no_restart_owner_a_stuck_poll_is_surfaced_but_never_exits(self):
         # A bare `&` lane has nothing to relaunch it, so exiting would end it for good.
