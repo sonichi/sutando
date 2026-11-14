@@ -1505,7 +1505,7 @@ class WitnessFindings(unittest.TestCase):
 
 
 class QuotaAllowed(unittest.TestCase):
-    """A 429 on an account the provider says has quota is not a limit (rmwflgs2c28gt0)."""
+    """A 429 on an account the provider says has quota is not a limit."""
 
     # The proxy's ledger holds the 429's body as it arrived: compressed, so unreadable here.
     ENCODED = "\ufffd8\x00\x00\ufffd\ufffd\ufffd\ufffd\ufffd\ufffdt\ufffd\x1eL\ufffd&7"
@@ -1565,6 +1565,25 @@ class QuotaAllowed(unittest.TestCase):
             self.assertFalse(self.launches(rec), own)
             clh.clear(self.ws, self.now)
             (self.ws / "state" / clh.HOLD_FILE).unlink()
+
+    def test_an_allowed_throttle_finishing_last_does_not_hide_a_rejected_account(self):
+        # Two seats on one proxy: B's rejected 429 wrote the record's headers, A's throttle body ended last.
+        rec = limited_record(self.now, model="claude-fable-5-2", ago=3)
+        rej_b = rec["recent_rejections"][0]
+        rej_b["limit_headers"] = dict(rec["headers"])
+        rec["recent_rejections"].append(dict(rej_b, ts=iso(self.now - 1), snippet=self.ENCODED,
+                                             limit_headers=dict(self.ALLOWED)))
+        lim = clh.record_evidence(rec, self.now)
+        self.assertIsNotNone(lim)
+        self.assertEqual(lim.kind, "usage-limit")
+        self.assertFalse(self.launches(rec))
+
+    def test_an_unrecognised_or_differently_cased_status_is_not_allowed(self):
+        for status in ("foo", "", "Rejected"):
+            own = dict(self.ALLOWED, **{"anthropic-ratelimit-unified-status": status})
+            self.assertIsNotNone(clh.record_evidence(self.fable_429(self.ENCODED, own=own), self.now), status)
+        own = dict(self.ALLOWED, **{"anthropic-ratelimit-unified-status": "Allowed"})
+        self.assertIsNone(clh.record_evidence(self.fable_429(self.ENCODED, own=own), self.now))
 
     def test_another_requests_allowed_headers_do_not_clear_this_429(self):
         # Interleaved: this 429 was rejected on its own response, another request answered allowed after.

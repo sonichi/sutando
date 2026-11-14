@@ -209,7 +209,7 @@ def record_evidence(payload, now: float) -> Optional[Limit]:
     headers = payload.get("headers") if isinstance(payload.get("headers"), dict) else {}
     model = qa._norm_model(rej.get("model")) or qa.record_model(payload)
     found = classify_text(str(rej.get("snippet") or ""), at, model, "provider-record")
-    if _own_headers_allowed(rej) and not (
+    if state != "rejected" and _own_headers_allowed(rej) and not (
             found and (found.kind == "usage-limit" or (found.reset_at or 0) > now)):
         return None  # a throttle on an account with quota; the CLI retries it itself
     kind = "usage-limit" if state == "rejected" else (found.kind if found else "rate-limit")
@@ -223,8 +223,11 @@ def _own_headers_allowed(rej: dict) -> bool:
     """Whether the 429's own response, as the proxy recorded it with the rejection, reported
     every limit allowed. Absent or status-less headers say nothing, so the old backoff applies."""
     own = rej.get("limit_headers")
-    if not isinstance(own, dict) or not own.get("anthropic-ratelimit-unified-status"):
+    if not isinstance(own, dict):
         return False
+    own = {k: str(v).strip().lower() for k, v in own.items()}
+    if own.get("anthropic-ratelimit-unified-status") not in qa.OVERAGE_OK:
+        return False  # absent or unrecognised: fail closed
     return qa.classify_limit_state({"headers": own}) == "allowed"
 
 
