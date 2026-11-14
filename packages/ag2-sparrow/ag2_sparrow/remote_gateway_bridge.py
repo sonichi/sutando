@@ -1237,8 +1237,33 @@ def _settlement_record(directory: Path, review_id: str) -> "dict | None":
     return {}
 
 
+# Set before the exec by an adapter whose RESULTS_DIR sits in the workspace this command prints.
+_WORKSPACE_RESOLVER: str = globals().get("_SUTANDO_WORKSPACE_RESOLVER") or ""
+
+
+def _shell_root(root) -> str:
+    """`root` as a logged command names it: behind the workspace resolver, else `$HOME`, so the log
+    carries no home path. Run from the engine checkout, as `src/outbox_cli.py` already requires."""
+    root = Path(root)
+    bases = ([(RESULTS_DIR.parent, f'"$({_WORKSPACE_RESOLVER})"')] if _WORKSPACE_RESOLVER else []) + [
+        (Path.home(), '"$HOME"')]
+    for base, prefix in bases:
+        try:
+            rel = root.relative_to(base)
+        except ValueError:
+            continue
+        return prefix if rel == Path(".") else f"{prefix}/{shlex.quote(rel.as_posix())}"
+    return shlex.quote(str(root))
+
+
+def _outbox_cli_command(root, *args: str, program: str = "python3 src/outbox_cli.py",
+                        results_dir=None) -> str:
+    tail = f" --results-dir {_shell_root(results_dir)}" if results_dir is not None else ""
+    return f"{program} --root {_shell_root(root)} {shlex.join(args)}{tail}"
+
+
 def _requeue_command(root, item_id: str) -> str:
-    return shlex.join(["python3", "src/outbox_cli.py", "--root", str(root), "requeue", item_id])
+    return _outbox_cli_command(root, "requeue", item_id)
 
 
 def _reread_record(path: Path) -> dict:
@@ -8242,9 +8267,8 @@ def _proactive_item_id(stem: str, body: str) -> str:
 
 def _proactive_requeue_command(root, item_id: str, body_sha256: str, reset_attempts: bool = False) -> str:
     """The operator's resend: requeue the item and restore exactly its own quarantined body."""
-    return shlex.join(["python3", "src/outbox_cli.py", "--root", str(root), "requeue", item_id,
-                       "--body-id", item_id.rsplit("~", 1)[0], "--body-sha256", body_sha256]
-                      + (["--reset-attempts"] if reset_attempts else []))
+    return _outbox_cli_command(root, "requeue", item_id, "--body-id", item_id.rsplit("~", 1)[0],
+                               "--body-sha256", body_sha256, *(["--reset-attempts"] if reset_attempts else []))
 
 
 def _proactive_outbox_root() -> Path:
@@ -9079,11 +9103,10 @@ def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
             _log(f"result {tid}: {why} — quarantined to {UNDELIVERABLE_RESULTS_DIR.name}/; "
                  f"{not_requeueable_because}")
             return
-        _log(f"result {tid}: {why} — quarantined to "
-             f"{UNDELIVERABLE_RESULTS_DIR.name}/ — `ag2-sparrow-outbox "
-             f"--root {gateway_instance.outbox_root(RESULTS_DIR, GATEWAY_INSTANCE)} "
-             f"requeue {outbox_item_id or _broker_tid(_delivery_tid(tid) or tid)} --reset-attempts "
-             f"--results-dir {RESULTS_DIR} --body-id {tid}` restores it")
+        how = _outbox_cli_command(gateway_instance.outbox_root(RESULTS_DIR, GATEWAY_INSTANCE), "requeue",
+                                  outbox_item_id or _broker_tid(_delivery_tid(tid) or tid), "--reset-attempts",
+                                  "--body-id", tid, program="ag2-sparrow-outbox", results_dir=RESULTS_DIR)
+        _log(f"result {tid}: {why} — quarantined to {UNDELIVERABLE_RESULTS_DIR.name}/ — `{how}` restores it")
     except disposal.KeptQuarantined:
         return                                          # the lifecycle owner named where it waits
     except disposal.GenerationReplaced:

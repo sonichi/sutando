@@ -215,7 +215,8 @@ def project_pass(manager: HitlManager, send: Sender, room_id: str, clock: Option
                  monotonic: Optional[Clock] = None) -> ProjectionPass:
     """Drive every requirement whose revision is ahead of its projection, then
     send each follow-up notice that is due as a NEW message. Each goes to its
-    requirement's `room` when set, else to `room_id`.
+    requirement's `room` when set, else to `room_id` (the owner DM), which also takes a
+    notice that the requirement's room refused.
 
     A rejected send is skipped (nothing recorded) so the next drive retries it.
     A 403 whose room refused the sender is charged to its card alone, failing it after ROOM_REFUSAL_ATTEMPTS.
@@ -316,21 +317,26 @@ def _send_notices(manager: HitlManager, send: Sender, room_id: str, now: float,
         notice = {"notice": n.notice, "ids": [r.id for r, _ in n.members],
                   "runtime": n.req.runtime, "device": device.get("id") or "",
                   "host": device.get("host") or ""}
-        try:
-            answer = send(wire_safe({"room_id": n.req.room or room_id, "op": "message",
-                                     "body": renotify.body(n.notice, n.req, now, since=n.since, queued=n.queued),
-                                     "dedupe_key": renotify.dedupe_key(n.notice, n.req, ledger, n.reminders),
-                                     "extra_content": {NOTICE_FIELD: notice}}))
-        except Exception as e:  # noqa: BLE001 — only a room's refusal of the sender is settled here
-            if _room_refusal(describe, e) is None:
-                raise
-            answer = None  # the room will refuse it every time: stamped below, never re-sent
-        else:
+        payload = {"op": "message",
+                   "body": renotify.body(n.notice, n.req, now, since=n.since, queued=n.queued),
+                   "dedupe_key": renotify.dedupe_key(n.notice, n.req, ledger, n.reminders),
+                   "extra_content": {NOTICE_FIELD: notice}}
+        # A card's room that refuses the sender is tried once, then the owner DM; a refusing DM ends it.
+        rooms = [n.req.room or room_id] + ([room_id] if room_id and n.req.room and n.req.room != room_id else [])
+        answer, refused = None, True  # stays True only when every room refused: stamped, never re-sent
+        for room in rooms:
+            try:
+                answer, refused = send(wire_safe({"room_id": room, **payload})), False
+                break
+            except Exception as e:  # noqa: BLE001 — only a room's refusal of the sender is settled here
+                if _room_refusal(describe, e) is None:
+                    raise
+        if not refused:
             if not isinstance(answer, dict) or not (answer.get("ok") or answer.get("event_id")):
                 continue
             _accepted(manager)
         # Every card the notice covered is stamped, so none of them is ever sent again.
         for r, pj in n.members:
             manager.record_notice(r.id, renotify.after(n.notice, pj, now, n.reminders))
-        if answer is not None:
+        if not refused:
             out.append((n.req.id, str(answer.get("event_id") or "") or None))

@@ -960,6 +960,56 @@ class SlowDripTest(unittest.TestCase):
         self.assertLessEqual(loop.clock.now - start, budget + 1, "the whole poll is bounded by its budget")
         self.assertTrue(any(f"poll read timed out after {budget}s" in m for m in loop.logs), loop.logs)
 
+    def test_the_poll_deadline_outlasts_the_server_hold(self):
+        # Shorter than the hold, every idle poll is cut, and past the grace that reads as an outage.
+        seen = []
+        with _Loop(self.gw) as loop:
+            poll = self.gw._req
+
+            def _req(method, path, payload=None, **kw):
+                if path.startswith("/v1/tasks?wait="):
+                    seen.append((loop.clock.now, kw.get("deadline")))
+                return poll(method, path, payload, **kw)
+            self.gw._req = _req
+            loop.run()
+        self.assertTrue(seen, "the loop made no poll")
+        for start, deadline in seen:
+            self.assertIsNotNone(deadline, "the poll carries no deadline")
+            self.assertGreaterEqual(deadline - start, self.gw.POLL_WAIT + 10)
+
+    def test_a_body_that_ends_empty_past_its_deadline_is_a_timeout(self):
+        # No Content-Length to catch the cut: only the clock says the body is not whole.
+        import urllib.request
+        clock = _Clock()
+        start = clock.now
+
+        class _Resp:
+            status = 200
+            headers = {}
+            length = None
+
+            def __init__(self):
+                self.left = [b'{"tasks": []}']
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read1(self, amt=None):
+                if self.left:
+                    return self.left.pop(0)
+                clock.now = start + 6        # blocked in the read until the deadline's cut
+                return b""
+            read = read1
+
+        with patch.object(self.gw, "time", clock), \
+                patch.object(self.gw, "TOKEN", "secret"), patch.object(self.gw, "URL", "http://relay.invalid"), \
+                patch.object(urllib.request.OpenerDirector, "open", new=lambda *a, **k: _Resp()):
+            with self.assertRaises(TimeoutError, msg="the cut body passed for a whole {'tasks': []}"):
+                self.gw._req("GET", "/v1/tasks?wait=0", timeout=10, deadline=start + 5)
+
     def test_the_budgeted_retry_gives_up_at_the_budget(self):
         import urllib.request
         clock = _Clock()
