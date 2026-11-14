@@ -28,6 +28,7 @@ import threading
 import time
 import uuid
 
+from ... import held_start
 from ...relay_loop import count_arg
 from ...task_io import (DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock,  # noqa: F401
                         admission, attested_headers, exit_on_sigterm, holder_consumer, load_done, make_dirs,
@@ -41,7 +42,8 @@ NON_OWNER_SANDBOX = "read-only"
 NO_REPLY = "[no reply] Codex completed the turn without a message."
 # --held: the launcher that spawned this process holds the work root and attaches it as the consumer
 # whose liveness fences the root; the connector waits this long for that record, then refuses.
-HELD_WAIT_S = 30.0
+HELD_WAIT_S = held_start.WAIT_S
+RESUME_MARKER = "resume-thread-taken"   # under state/: the --resume-thread id already carried over
 
 
 def log(*a):
@@ -212,10 +214,24 @@ class Connector:
         self.thread_id = res["thread"]["id"]
         log("started thread", self.thread_id, "owner" if owner else "non-owner", "ephemeral" if ephemeral else "durable")
 
-    def open_owner_thread(self, channel_id):
-        """The channel's durable thread: resume the saved id when it is still known, else start one."""
+    def carried_thread(self, kind):
+        """The owner's conversation `--resume-thread` names, for the owner's DM, until it has been taken
+        once (the marker holds the id taken, so a new id given at a reinstall is taken again)."""
+        if not self.args.resume_thread or kind != "dm" or self.args.ephemeral:
+            return None
+        try:
+            with open(os.path.join(self.args.state, RESUME_MARKER), encoding="utf-8") as f:
+                taken = f.readline().strip()
+        except FileNotFoundError:
+            taken = ""
+        return None if taken == self.args.resume_thread else self.args.resume_thread
+
+    def open_owner_thread(self, channel_id, kind=""):
+        """The channel's durable thread: in the owner's DM, the conversation carried over the first time;
+        else resume the saved id when it is still known, else start one."""
         key = channel_key(channel_id)
-        if key in self.live:
+        carried = self.carried_thread(kind)
+        if key in self.live and not carried:
             self.thread_id = self.live[key]
             return
         path = os.path.join(self.args.state, "threads", key)
@@ -223,7 +239,10 @@ class Connector:
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 wanted = f.readline().strip() or None
-        wanted = wanted or bound_thread_id(self.args.thread_id, channel_id)
+        wanted = carried or wanted or bound_thread_id(self.args.thread_id, channel_id)
+        if carried:
+            # Taken once whatever the resume answers: a failed one is not retried on every task.
+            write_atomic(os.path.join(self.args.state, RESUME_MARKER), carried + "\n")
         if wanted and not self.args.ephemeral:
             try:
                 res = self.rpc.request("thread/resume", dict(self.thread_params(True), threadId=wanted),
@@ -242,7 +261,7 @@ class Connector:
         """Owner: the channel's durable thread. Anyone else: a fresh ephemeral, read-only
         thread in an empty temp dir, so no room's tasks or results are in its cwd."""
         if is_owner(headers):
-            self.open_owner_thread(headers.get("channel_id"))
+            self.open_owner_thread(headers.get("channel_id"), (headers.get("channel_kind") or "").strip().lower())
         else:
             self.drop_scratch()
             self.scratch_cwd = tempfile.mkdtemp(prefix="codex-nonowner-")
@@ -495,6 +514,8 @@ def build_parser():
                          "never needs it: it always gets that ephemeral read-only thread.")
     ap.add_argument("--thread-id", default=None, metavar="CHANNEL_ID=THREAD",
                     help="resume THREAD for exactly this owner channel when it has no saved thread yet")
+    ap.add_argument("--resume-thread", default=None, metavar="THREAD",
+                    help="the owner's own Codex conversation to continue in the owner's DM (taken once)")
     ap.add_argument("--ephemeral", action="store_true", help="owner threads too: do not persist to the Codex home")
     ap.add_argument("--developer-instructions", default=None)
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
@@ -548,29 +569,10 @@ def serve_held(args, cwd_given):
     holder's record names this process as the consumer (a hand start with --held is refused). The
     process lives inside the held inode (fchdir on --root-fd) and names tasks/, results/ and state/
     relative to it: the pathname the launcher saw may be renamed or replaced, this inode cannot."""
-    try:
-        os.fchdir(args.root_fd)
-    except OSError as e:
-        sys.stderr.write("refusing to start: --root-fd %d is not the held root's directory (%s)\n" % (args.root_fd, e))
-        return 2
+    refused = held_start.enter(args.root_fd, HELD_WAIT_S, holder_consumer)
+    if refused is not None:
+        return refused
     args.work = "."     # the held inode, wherever its pathname goes
-    deadline = time.monotonic() + HELD_WAIT_S
-    while True:
-        consumer = holder_consumer(args.work)
-        if consumer and consumer.get("pid") == os.getpid():
-            # The record must name this incarnation (pid and start) and verify it alive: a stale record
-            # naming a reused pid, or one whose lineage cannot be read, serves nothing.
-            if consumer.get("live") is True and consumer.get("start") == start_time(os.getpid()):
-                break
-            why = ("a start time that is not this process's" if consumer.get("start") != start_time(os.getpid())
-                   else "liveness unknown" if consumer.get("live") is None else "liveness false")
-            sys.stderr.write("refusing to start: --held, but the holder of %s names this pid with %s, not verified\n"
-                             % (os.getcwd(), why))
-            return 2
-        if stop_requested() or time.monotonic() >= deadline:
-            sys.stderr.write("refusing to start: --held, but no holder of %s attached this process\n" % os.getcwd())
-            return 2
-        time.sleep(0.05)
     args.inbox, args.results, args.state = "tasks", "results", "state"
     # The owner thread's cwd is a pathname by protocol: None here means the inode's current one, per turn.
     args.cwd = os.path.abspath(cwd_given) if cwd_given else None

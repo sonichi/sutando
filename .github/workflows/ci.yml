@@ -352,6 +352,8 @@ jobs:
           timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test ag2space-inbox
           cd "$GITHUB_WORKSPACE/skills/pr-watch"
           timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test mod
+          cd "$GITHUB_WORKSPACE/src/agent/claude"
+          timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test task-watch-mod
 
   shell-standalone-tests:
     name: shell tests (lanes)

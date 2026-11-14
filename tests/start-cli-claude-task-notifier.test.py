@@ -36,8 +36,8 @@ class Harness:
         # Only the worker's own launcher, not the whole skill: this harness
         # tests the launch mechanics, not worker-pool's own behavior.
         (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True)
-        shutil.copy2(REPO / "skills/worker-pool/scripts/launch-worker-session.sh",
-                    root / "skills/worker-pool/scripts/launch-worker-session.sh")
+        for name in ("launch-worker-session.sh", "worker-mcp-credential.sh"):
+            shutil.copy2(REPO / "skills/worker-pool/scripts" / name, root / "skills/worker-pool/scripts" / name)
         self.root = root
         ws = self.td / "ws"
         (ws / "state").mkdir(parents=True)

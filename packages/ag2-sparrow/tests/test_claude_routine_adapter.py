@@ -249,6 +249,12 @@ class PayloadTest(unittest.TestCase):
         self.assertTrue(m.group(2).endswith("[truncated]"))
         self.assertEqual(text[m.end():], "\nop")
 
+    def test_routine_prompt_gates_the_ui_tools_to_owner(self):
+        prompt = " ".join(PROMPT_MD.read_text(encoding="utf-8").split())
+        self.assertIn("Only when `tier=owner`, to open something there, pass it exactly as given as the "
+                      "`ui_origin` argument of ui_describe, then ui_request and ui_result; for any other tier, "
+                      "never call those tools.", prompt)
+
     def test_routine_prompt_carries_the_note_verbatim(self):
         prompt = PROMPT_MD.read_text(encoding="utf-8")
         self.assertIn(NOTE, prompt)
