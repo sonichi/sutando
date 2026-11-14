@@ -33,7 +33,9 @@ Owner notices (``restored`` and ``not-enabled``) are recorded in ``hosts/<host>/
 before the per-host file is published, written whole, under a per-host lock that serializes
 seeder runs. A notice already pending under the same id is merged, not repeated; a run that loses
 the race to publish withdraws only the notices it still owns. Each notice is queued once to the
-owner's DM through the proactive outbox (``results/proactive-crons-notice-*.txt``); a failed
+owner's DM through the proactive outbox (``results/proactive-crons-notice-*.txt``, named by the
+notice's id and an episode id drawn when it is first recorded, so a recurrence after
+``--notice-sent`` is a new outbox item and a retry is the same one); a failed
 enqueue is reported on stderr and retried on a later run. Its line is printed at most once a day.
 ``--notice-sent`` clears only the notices already printed. An unreadable or wrong-shape record is
 set aside (``crons-notice.bad.json``, numbered, then ``.bad.latest.json``) and reported as a notice
@@ -266,7 +268,8 @@ def _read_record(host_dir: Path) -> dict:
     if isinstance(data, dict) and isinstance(data.get("lines"), list) and "notices" not in data:
         migrated = [_migrate_line(x) for x in data["lines"] if isinstance(x, str)]
         if all(migrated):
-            return {"notices": [dict(n, queued=False, shown=False) for n in migrated], "last_shown": 0}
+            return {"notices": [dict(n, queued=False, shown=False, episode=os.urandom(8).hex())
+                                for n in migrated], "last_shown": 0}
     elif isinstance(data, dict) and isinstance(data.get("notices"), list) \
             and all(_valid(n) for n in data["notices"]):
         shown = data.get("last_shown")
@@ -274,7 +277,8 @@ def _read_record(host_dir: Path) -> dict:
                 "last_shown": shown if isinstance(shown, (int, float)) else 0}
     bad = _set_aside(path)
     return {"notices": [{"id": f"unreadable:{bad}", "line": f"notice-record-unreadable kept at {bad}",
-                         "queued": False, "shown": False}], "last_shown": 0}
+                         "queued": False, "shown": False, "episode": os.urandom(8).hex()}],
+            "last_shown": 0}
 
 
 def _set_aside(path: Path) -> Path:
@@ -326,7 +330,7 @@ def _merge(record: dict, new: list[dict], token: str) -> dict:
     for n in new:
         same = next((i for i, old in enumerate(notices) if old["id"] == n["id"]), None)
         if same is None:
-            notices.append(dict(n, queued=False, shown=False, by=token))
+            notices.append(dict(n, queued=False, shown=False, by=token, episode=os.urandom(8).hex()))
         else:
             notices[same] = dict(notices[same], by=token)
     return {"notices": notices, "last_shown": 0}
@@ -340,7 +344,8 @@ def _queue_owner_dm(workspace: Path, notice: dict) -> None:
     """Hand the notice to the durable proactive outbox, which delivers it to the owner's DM."""
     from proactive_routing import proactive_filename
     from result_publish import publish_text
-    digest = hashlib.sha256(notice["id"].encode()).hexdigest()[:24]
+    key = f"{notice['id']}#{notice.get('episode', '')}"
+    digest = hashlib.sha256(key.encode()).hexdigest()[:24]
     path = workspace / "results" / proactive_filename(f"crons-notice-{digest}")
     path.parent.mkdir(parents=True, exist_ok=True)
     publish_text(path, f"[dm-only]\n{notice['message']}\n")

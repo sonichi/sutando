@@ -345,6 +345,24 @@ class SeedPolicy(unittest.TestCase):
         self.run_step1()
         self.assertTrue(self.target.exists())
 
+    def test_a_recurring_restore_after_acknowledgement_is_queued_again(self):
+        self.target.parent.mkdir(parents=True)
+        self.target.write_text('[{"name":"mine"}]')
+        self.run_step1()
+        self.target.unlink()
+        self.assertIn("restored", self.run_step1())
+        first = self._queued_dms()
+        ack = subprocess.run(["python3", "skills/schedule-crons/scripts/seed_crons.py", "--notice-sent"],
+                             cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(ack.returncode, 0, ack.stderr)
+        self.target.unlink()
+        self.assertIn("restored", self.run_step1())
+        second = self._queued_dms()
+        self.assertEqual(len(first), 1, first)
+        self.assertEqual(len(second), 2, "a new episode is queued under a new outbox name")
+        self.run_step1()
+        self.assertEqual(self._queued_dms(), second, "retries of one episode reuse its name")
+
     def test_notice_sent_keeps_notices_never_shown(self):
         self._owner_job()
         self._seed_in_process(self._seeder())
