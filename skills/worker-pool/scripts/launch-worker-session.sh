@@ -55,9 +55,9 @@ SESSION="${SUTANDO_TMUX_SESSION:?launch-worker-session.sh needs SUTANDO_TMUX_SES
 # those are the canonical core's alone.
 SURFACE_ARGS=()
 add_skill_claude_plugins
-# Opt-in per spawn: SUTANDO_TASK_WATCH_MOD_WORKER=1 runs this worker's watcher in the
-# task-watch Mod instead of a Monitor (docs/task-watcher-hosting-modes.md).
-add_task_watch_mod "${SUTANDO_TASK_WATCH_MOD_WORKER:-}"
+# On by default: the task-watch Mod hosts this worker's watcher instead of a Monitor;
+# SUTANDO_TASK_WATCH_MOD_WORKER=0 opts out (docs/task-watcher-hosting-modes.md).
+add_task_watch_mod "${SUTANDO_TASK_WATCH_MOD_WORKER:-1}"
 # `/startup --worker` is the pool worker's own boot ceremony (orphan recovery
 # and session crons are core-only; the worker gate is what it runs instead).
 BOOT_PROMPT="/startup --worker"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The task-watch Mod is installed only on an explicit per-launcher opt-in and a Claude Code at
-# or above the Mod's own floor; the session marker says which watcher path the session is on.
+# The task-watch Mod is installed per launcher (workers by default, the core on opt-in) and only on a
+# Claude Code at or above the Mod's own floor; the session marker says which watcher path is on.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pass=0; fail=0
@@ -73,12 +73,16 @@ WORKER_ENV=(SUTANDO_INSTANCE_ID=w-test SUTANDO_TMUX_SESSION=sutando-worker-w-tes
 worker_env() { env -i HOME="$HOME" PATH="$STUB_PATH" STUB_VERSION=9.9.9 "${WORKER_ENV[@]}" "$@" \
   bash "$REPO/skills/worker-pool/scripts/launch-worker-session.sh" --print-env 2>/dev/null; }
 out="$(worker_env)"
-echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD="; check $? "a worker is launched with the marker explicitly empty by default"
+echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD=1"; check $? "a worker gets the Mod by default (flag unset)"
+[ "$(echo "$out" | grep -c '^SUTANDO_TASK_WATCH_MOD=')" = 1 ]; check $? "the worker marker appears once"
 out="$(worker_env SUTANDO_TASK_WATCH_MOD_WORKER=1)"
 echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD=1"; check $? "SUTANDO_TASK_WATCH_MOD_WORKER=1 marks the worker's session"
-out="$(worker_env SUTANDO_TASK_WATCH_MOD_CORE=1)"
-echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD="; check $? "the core's flag does not switch a worker"
-[ "$(echo "$out" | grep -c '^SUTANDO_TASK_WATCH_MOD=')" = 1 ]; check $? "the worker marker appears once"
+out="$(worker_env SUTANDO_TASK_WATCH_MOD_WORKER=0)"
+echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD="; check $? "SUTANDO_TASK_WATCH_MOD_WORKER=0 opts a worker out, marker explicitly empty"
+out="$(worker_env STUB_VERSION=2.1.0)"
+echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD="; check $? "a default worker keeps the Monitor below the floor"
+out="$(worker_env SUTANDO_TASK_WATCH_MOD_CORE=0)"
+echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD=1"; check $? "the core's flag does not switch a worker"
 
 # The core launcher's env probe.
 core_env() { env -i HOME="$HOME" PATH="$STUB_PATH" STUB_VERSION=9.9.9 "$@" \
