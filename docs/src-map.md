@@ -20,6 +20,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`ack_overlap.py`** — Whether a task's initial status ack would duplicate what the room already sees about it.
 - **`activity_bus.py`** — ActivityCard is the UI projection of a durable TaskRun state machine; runtime instrumentation only enriches that state machine with observations.
 - **`activity_policy.py`** — Access tier → capabilities → audience policy → projection.
+- **`activity_projection.py`** — Read-time origin correlation for the existing local activity media projection.
 - **`activity_rows.py`** — The agent-activity row writer: one JSON row per line at <workspace>/state/agent-activity.jsonl, the live window the desktop renders, its per-day archive, the per-task index that keeps a summary exact after rotation, and the summary left at done.
 - **`ag2space_links.py`** — Links a person clicks to open an AG2 Space room, message or room surface inside the app.
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
@@ -273,6 +274,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`task_envelope.ts`** — task_envelope.ts — TypeScript mirror of src/task_envelope.py's stamping half, for the TS task writers (voice delegation seam, context-drop, wearable).
 - **`task_envelope_census.py`** — Soak census for HMAC task envelopes: the read-only measurement behind the "writer census reaches zero" gate.
 - **`task_lifecycle.py`** — Task execution lifecycle for an adapter that serves one work dir and calls a provider per task.
+- **`task_origins.py`** — Bounded task/message correlation; one locked, atomic sidecar writer.
 - **`task_priority.py`** — Task priority taxonomy + readers.
 - **`task_queue.py`** — The pending task queue, in one place: which task files are waiting, in the order the core will take them, and where a given task stands in that order.
 - **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.

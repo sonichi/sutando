@@ -1123,6 +1123,39 @@ This bridge change requires loading the updated bridge code. It does not require
 a core restart or change the broker's health schema. The broker's existing
 contact timeout still detects a disconnected bridge or host.
 
+### Local task origin correlation
+
+Tasks with `source_message_id` also carry an `origin_message_ids:` header
+(comma-separated message IDs). The gateway seeds it before `task:`; the shared
+local serializer, Discord and Telegram writers do the same. Sources without a
+message ID omit the header. `source_message_id` remains unchanged.
+
+When shared dedup recovery accepts `[deduped: X]` (including an answer pending
+provider acceptance), `src/task_origins.py` merges the holder and folded task's
+origins into `state/task-origins/X.json`. The gateway, Slack, Telegram and
+Discord adapters pass their resolved state directory explicitly, so it need not
+be a sibling of the task directory. Rejected folds do not contribute.
+This sidecar leaves task files and their signed envelopes untouched. One writer
+locks per task, reads and merges, fsyncs a unique temporary file, then atomically
+replaces the record. Retries are idempotent; concurrent processes share the lock.
+
+Records keep the first 128 unique IDs, each at most 512 characters, with no
+whitespace, control characters or commas. Excess IDs are dropped; this is a
+bounded correlation window, not an exhaustive audit trail. The read cap includes
+JSON surrogate-pair escaping for all 128 maximum-length non-BMP IDs. Missing or malformed
+records read as empty. Write failures are logged by dedup recovery and do not
+change delivery behavior. There is no migration or new configuration; rollback
+leaves sidecars inert. Sidecar retention follows workspace retention.
+
+New activity rows expose `task.origins` when IDs are available, merging the
+header with the latest sidecar at append time; `task.event` keeps its original
+meaning. The existing loopback `/media/state/agent-activity.jsonl` route and its
+summaries, legacy archive and dated archive variants also merge sidecar origins
+at read time. Thus an accepted fold after the holder is done appears on the next
+fetch without another activity row. These projected responses use `no-store`;
+row timestamps, lifecycle fields and stored activity files remain unchanged.
+Clients that ignore the new field retain their current behavior.
+
 ### Local hook activity attribution
 
 The agent-activity hook attributes working and turn-end thinking rows to the

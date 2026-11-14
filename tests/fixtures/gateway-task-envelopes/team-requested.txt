@@ -6,6 +6,7 @@ priority: normal
 source: ag2space
 channel_id: !room:ag2.space
 task_layout: mid
+origin_message_ids: $evt
 task: please look at the parser
 room_name: Group-Dev
 sender_name: Someone
