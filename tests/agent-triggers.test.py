@@ -205,6 +205,15 @@ class Dispatch(unittest.TestCase):
             errors, _warnings = lint._lint_manifest(d)
             self.assertEqual(not any("playbook must be a boolean" in e for e in errors), ok, (value, errors))
 
+    def test_shipped_email_playbook_resolves(self):
+        # The backend's email.received trigger names playbook "email" (intake/triggers.py).
+        manifest = json.loads((REPO / "skills" / "email" / "manifest.json").read_text())
+        self.assertIs(manifest.get("playbook"), True)
+        self.assertEqual(at.resolve_playbook("email.received", "email", REPO / "skills"),
+                         REPO / "skills" / "email" / "SKILL.md")
+        errors, _warnings = lint._lint_manifest(REPO / "skills" / "email")
+        self.assertEqual(errors, [])
+
     def test_shipped_room_onboard_opts_in(self):
         manifest = json.loads((REPO / "skills" / "room-onboard" / "manifest.json").read_text())
         self.assertIs(manifest.get("playbook"), True)
