@@ -15,6 +15,8 @@ TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
 # shellcheck source=../../../tasks-dir-resolve.sh
 source "$REPO/src/tasks-dir-resolve.sh"
+# shellcheck source=../../../notifier-guard.sh
+source "$REPO/src/notifier-guard.sh"
 # No positional inbox arg for a supervisor invocation -- SUTANDO_TASKS_DIR (if
 # set) or the canonical loader, same as the watcher it's standing in for would
 # resolve. A resolution failure leaves TASKS_DIR empty: role_present() then
@@ -125,6 +127,10 @@ health_alert() {
   bash "$REPO/src/macos-notify.sh" "A Sutando session looks idle but its heartbeat is stale. It may need a restart." || true
 }
 RESTART_DELAY="${SUTANDO_NOTIFIER_RESTART_DELAY:-1}"
+# A notifier dying within RESTART_HEALTHY_S of its start is restarted after a doubling delay, up to the cap.
+RESTART_DELAY_MAX="${SUTANDO_NOTIFIER_RESTART_DELAY_MAX:-60}"
+RESTART_HEALTHY_S="${SUTANDO_NOTIFIER_RESTART_HEALTHY_S:-30}"
+restart_streak=0
 TARGET_POLL="${SUTANDO_NOTIFIER_TARGET_POLL:-2}"
 NOTIFIER="${SUTANDO_NOTIFIER_SCRIPT:-$REPO/src/agent/codex/cli/task-notifier.sh}"
 # Standby gating. GRACE_PERIOD: how long "no session-role watcher for
@@ -161,15 +167,114 @@ session_role_verdict() {
 
 stop_child() {
   [ -n "$child_pid" ] || return 0
-  # The Python child calls setsid(), so its PID is also the notifier process
-  # group's ID. Stop the whole group; fall back to the leader during the tiny
-  # pre-setsid race.
-  kill -TERM "-$child_pid" 2>/dev/null || kill -TERM "$child_pid" 2>/dev/null || true
-  wait "$child_pid" 2>/dev/null || true
+  # The child leads its own group (setsid); bounded, so a notifier ignoring TERM cannot outlive this supervisor.
+  stop_group_bounded "$child_pid"
   child_pid=""
+  # Killed before its own cleanup ran, the notifier leaves its watcher (a session of its own): stop that too.
+  stop_recorded_watcher "$WATCHER_PIDFILE"
+}
+
+WATCHER_PIDFILE="${TMPDIR:-/tmp}/sutando-notifier-watcher.$$"
+
+# Start the notifier as the leader of its own group, telling it where to record its watcher. With an inbox it
+# holds the serving lock for its whole tree, so no successor's notifier can start while it or its watcher lives.
+start_child() {
+  rm -f "$WATCHER_PIDFILE"
+  if [ -n "$TASKS_DIR" ]; then
+    SUTANDO_NOTIFIER_WATCHER_PIDFILE="$WATCHER_PIDFILE" "$PY" "$REPO/src/notifier_slot.py" serve \
+      --inbox "$TASKS_DIR" -- /bin/bash "$NOTIFIER" &
+  else
+    SUTANDO_NOTIFIER_WATCHER_PIDFILE="$WATCHER_PIDFILE" "$PY" -c \
+      'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", sys.argv[1]])' \
+      "$NOTIFIER" &
+  fi
+  child_pid=$!
+}
+
+# Sets NEXT_DELAY for a notifier that lived $1 s (set, not echoed: a subshell would lose the streak).
+# A fractional RESTART_DELAY is used as given: bash has no float math.
+NEXT_DELAY=""
+next_restart_delay() {
+  local d="$RESTART_DELAY" i=0
+  if [ "$1" -ge "$RESTART_HEALTHY_S" ]; then
+    restart_streak=0
+  else
+    restart_streak=$((restart_streak + 1))
+  fi
+  case "$d$RESTART_DELAY_MAX" in
+    *[!0-9]*) NEXT_DELAY="$d"; return 0 ;;
+  esac
+  while [ "$i" -lt "$restart_streak" ] && [ "$d" -lt "$RESTART_DELAY_MAX" ]; do
+    d=$((d * 2)); i=$((i + 1))
+  done
+  [ "$d" -le "$RESTART_DELAY_MAX" ] || d="$RESTART_DELAY_MAX"
+  NEXT_DELAY="$d"
+}
+
+# One supervisor per inbox: notifier_slot.py holds a lock on the inbox directory for this process's life.
+# A live holder is never signalled; a newcomer waits SLOT_WAIT_S for it to exit, then stands down.
+SLOT_WAIT_S="${SUTANDO_NOTIFIER_SLOT_WAIT_S:-15}"
+SLOT_RETRY_S="${SUTANDO_NOTIFIER_SLOT_RETRY_S:-5}"
+SLOT_UNDECIDED=""
+SLOT_PID=""
+claim_supervisor_slot() {
+  local out verdict deadline wait_s="${1:-$SLOT_WAIT_S}"
+  [ -n "$TASKS_DIR" ] || return 0
+  out="$(mktemp "${TMPDIR:-/tmp}/notifier-slot.XXXXXX")" || return 2
+  "$PY" "$REPO/src/notifier_slot.py" hold --inbox "$TASKS_DIR" --parent "$$" --wait "$wait_s" >"$out" 2>/dev/null &
+  SLOT_PID=$!
+  deadline=$((SECONDS + wait_s + 10))
+  while [ ! -s "$out" ] && kill -0 "$SLOT_PID" 2>/dev/null && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.1; done
+  verdict="$(head -1 "$out" 2>/dev/null)"
+  rm -f "$out"
+  case "$verdict" in
+    held) SLOT_UNDECIDED=""; return 0 ;;
+    busy\ *)
+      echo "task-notifier-supervisor: another supervisor holds ${TASKS_DIR} (pid start: ${verdict#busy }); standing down" >&2
+      SLOT_PID=""
+      return 1 ;;
+  esac
+  [ "$SLOT_UNDECIDED" = "${verdict:-no answer}" ] ||
+    echo "task-notifier-supervisor: the slot for ${TASKS_DIR} is undecided (${verdict:-no answer}); not serving it until it is held" >&2
+  SLOT_UNDECIDED="${verdict:-no answer}"
+  release_supervisor_slot
+  return 2
+}
+
+# Serve nothing until the slot is held: an undecided slot is retried, a busy one or a dead target stands down.
+await_slot() {
+  local rc
+  while :; do
+    claim_supervisor_slot "${1:-$SLOT_WAIT_S}"
+    rc=$?
+    [ "$rc" -eq 2 ] || return "$rc"
+    target_alive || return 1
+    sleep "$SLOT_RETRY_S"
+  done
+}
+
+# The slot is this supervisor's only while its helper lives. A dead helper stops the notifier first, then the
+# slot is reclaimed (returns 3: start a fresh one) or, held by another supervisor now, this one exits.
+fence_slot() {
+  [ -n "$SLOT_PID" ] || return 0
+  notifier_proc_live "$SLOT_PID" && return 0
+  wait "$SLOT_PID" 2>/dev/null || true
+  echo "task-notifier-supervisor: the slot helper for ${TASKS_DIR} is gone; stopping the notifier and reclaiming the slot" >&2
+  SLOT_PID=""
+  stop_child
+  await_slot 0 || exit 0
+  return 3
+}
+
+release_supervisor_slot() {
+  [ -n "$SLOT_PID" ] || return 0
+  kill -TERM "$SLOT_PID" 2>/dev/null || true
+  wait "$SLOT_PID" 2>/dev/null || true
+  SLOT_PID=""
 }
 
 trap 'stop_child; exit 0' HUP INT TERM
+trap 'release_supervisor_slot; rm -f "$WATCHER_PIDFILE"' EXIT
 
 # One notifier lifetime while armed. Returns 0 when it crashed and should be
 # restarted (caller's armed-loop continues), 1 when the target died (caller's
@@ -179,10 +284,8 @@ trap 'stop_child; exit 0' HUP INT TERM
 run_notifier_once() {
   # The notifier leads its own group, so stop_child's group signal ends the
   # notifier's tree and never reaches this supervisor or the tmux session hosting it.
-  "$PY" -c \
-    'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", sys.argv[1]])' \
-    "$NOTIFIER" &
-  child_pid=$!
+  start_child
+  local started=$SECONDS
   # Watch the role verdict while the child runs, UNCONDITIONALLY -- a
   # session-role watcher can arm at any moment and must end this notifier's
   # turn whether or not a pane/window was declared. Target liveness is only
@@ -190,6 +293,7 @@ run_notifier_once() {
   # behavior); undeclared, it's still caught at the outer `while target_alive`
   # once this notifier lifetime ends, same as before this change.
   while kill -0 "$child_pid" 2>/dev/null; do
+    fence_slot || return 0
     if declared_target && ! target_alive; then
       stop_child
       return 1
@@ -200,16 +304,21 @@ run_notifier_once() {
   wait "$child_pid"
   local status=$?
   child_pid=""
+  stop_recorded_watcher "$WATCHER_PIDFILE"
   target_alive || return 1
   [ "$(session_role_verdict)" = "yes" ] && return 2
-  echo "task-notifier-supervisor: notifier exited with status $status; restarting" >&2
-  sleep "$RESTART_DELAY"
+  next_restart_delay $((SECONDS - started))
+  echo "task-notifier-supervisor: notifier exited with status $status; restarting in ${NEXT_DELAY}s" >&2
+  sleep "$NEXT_DELAY"
   return 0
 }
 
 # Sourced by a test to exercise the helpers in isolation: stop here, before the
 # standby loop, so decide_action and its callees can be invoked directly.
 if [ "${SUTANDO_SUPERVISOR_SOURCE_ONLY:-}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
+
+target_alive || exit 0
+await_slot || exit 0
 
 # "unknown" keeps whatever runs: while armed, the notifier stays; in standby,
 # nothing is running to keep, and a host whose ps never answers would otherwise
@@ -220,6 +329,7 @@ unknown_since=""
 # grace the re-arm waits, so this log says why and how long the inbox was uncovered.
 prev_verdict=""
 while target_alive; do
+  fence_slot
   verdict="$(session_role_verdict)"
   if [ "$verdict" = "yes" ]; then
     prev_verdict=yes
@@ -243,6 +353,7 @@ while target_alive; do
     waited=0
     clear_to_arm=1
     while [ "$waited" -lt "$GRACE_PERIOD" ]; do
+      fence_slot
       target_alive || { clear_to_arm=0; break; }
       sleep "$ROLE_POLL"
       waited=$((waited + ROLE_POLL))

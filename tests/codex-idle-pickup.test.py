@@ -446,7 +446,7 @@ class RetryCadenceTests(unittest.TestCase):
             fifo = ws/"events"
             os.mkfifo(fifo)
             fd = os.open(fifo, os.O_RDWR)
-            script = '''set -euo pipefail
+            script = 'source ' + shlex.quote(str(REPO/'src/notifier-guard.sh')) + "\n" + '''set -euo pipefail
 core_incarnation() { printf '7:start'; }
 pickup_event() { :; }
 reconcile_finished_pickups() { :; }

@@ -24,6 +24,8 @@ DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
 # shellcheck source=../../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
+# shellcheck source=../../../notifier-guard.sh
+. "$REPO/src/notifier-guard.sh"
 NOTIFIER_PY="$(require_python "$REPO" "resolve pane state")" || exit 1
 # shellcheck source=../../../delivery/worker-stage.sh
 source "$REPO/src/delivery/worker-stage.sh"
@@ -67,12 +69,10 @@ workstream_context_file=""
 # head) -- not a bash array, since bash 3.2's `set -u` errors on an empty one.
 queue_dir=""
 
+# Bounded: a watcher stuck mid-exit must not hold this notifier's exit forever.
 stop_watcher() {
   [ -n "$watcher_pid" ] || return 0
-  kill -TERM "-$watcher_pid" 2>/dev/null \
-    || kill -TERM "$watcher_pid" 2>/dev/null \
-    || true
-  wait "$watcher_pid" 2>/dev/null || true
+  stop_group_bounded "$watcher_pid"
   watcher_pid=""
 }
 
@@ -88,7 +88,7 @@ cleanup_notifier() {
 }
 
 trap cleanup_notifier EXIT
-trap 'exit 0' HUP INT TERM
+trap 'notifier_signal 0' HUP INT TERM
 
 clear_workstream_context() {
   if [ -n "$workstream_context_file" ]; then
@@ -552,6 +552,8 @@ mkdir -p "$queue_dir" "$PAYLOAD_DIR"
   'import os, sys; os.setsid(); os.execv("/bin/bash", ["bash", *sys.argv[1:]])' \
   "$REPO/src/watch-tasks-stream.sh" "$TASKS_DIR" --role standby --inbox "$TASKS_DIR" > "$event_dir/events" &
 watcher_pid=$!
+notifier_record_watcher "$watcher_pid" "${SUTANDO_NOTIFIER_WATCHER_PIDFILE:-}"
+NOTIFIER_WAKE_PID="$watcher_pid"
 
 # A narrower net than the watcher's own routing, for a worker claim that
 # outlives its handler declaration (the pool de-registers mid-flight).
@@ -776,8 +778,11 @@ fi
 while :; do
   event="" rrc=0
   retry_interval="$(queue_retry_interval)"
-  wait_started=$SECONDS
+  read_at=$SECONDS
+  NOTIFIER_IN_READ=1
   IFS= read -r -t "$retry_interval" event || rrc=$?
+  NOTIFIER_IN_READ=0
+  [ -z "$NOTIFIER_STOP" ] || exit "$NOTIFIER_STOP"
   if [ "$rrc" -eq 0 ]; then
     case "$event" in
       "TASK_FILE: "*)
@@ -787,15 +792,19 @@ while :; do
     esac
     continue
   fi
-  # macOS's /bin/bash (3.2) returns 1 for a read TIMEOUT and for EOF alike, so
-  # the code cannot tell them apart -- ask whether the watcher is still alive.
-  if kill -0 "$watcher_pid" 2>/dev/null; then
-    if { [ "$rrc" -ne 1 ] && [ "$rrc" -le 128 ]; } || [ "$((SECONDS - wait_started))" -lt "$retry_interval" ]; then
+  # bash 3.2 reports both EOF and timeout as 1; a live writer alone is insufficient.
+  if notifier_proc_live "$watcher_pid"; then
+    if { [ "$rrc" -ne 1 ] && [ "$rrc" -le 128 ]; } || [ "$((SECONDS - read_at))" -lt "$retry_interval" ]; then
       log_notifier "watcher read failed before the retry deadline (status $rrc); leaving queued work unsent"
+      log_notifier "standby watcher (pid $watcher_pid) closed its events pipe but is still running; stopping it and this notifier"
       exit 1
     fi
+  fi
+  if ! events_stream_ended "$watcher_pid" "$((SECONDS - read_at))" "$retry_interval"; then
     process_announced_queue  # retry the same announced task; never rescans
     continue
   fi
-  break   # the watcher died -- genuine EOF, stop the notifier
+  notifier_proc_live "$watcher_pid" \
+    && log_notifier "standby watcher (pid $watcher_pid) closed its events pipe but is still running; stopping it and this notifier"
+  break   # the events stream ended -- stop the notifier
 done < "$event_dir/events"

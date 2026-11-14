@@ -68,6 +68,7 @@ from channel_env_resolve import channel_configured  # noqa: E402
 from util_paths import _host_label, actor_env_names, channel_access_path, claude_home_path, default_memory_dir, legacy_dotted_workspace, shared_personal_path, stated_default_identity, watcher_sentinel_path, watcher_sentinel_paths  # noqa: E402
 import slack_access  # noqa: E402
 import session_runtime  # noqa: E402
+import helper_cpu_guard  # noqa: E402
 import wedge_probes  # noqa: E402
 from workspace_default import resolve_workspace, status_read_path  # noqa: E402
 from sutando_platform import (  # noqa: E402
@@ -10924,6 +10925,12 @@ def check_claude_task_notifier() -> dict:
     return _probe_task_notifier(target, name=name, expected=supervisor, script=notifier)
 
 
+def check_helper_cpu() -> dict:
+    """A Sutando helper (notifier, supervisor, watcher, ...) averaging over 50% CPU for 10+ min,
+    named by pid and script: a silent busy loop otherwise shows nowhere."""
+    return helper_cpu_guard.check(REPO_DIR, WORKSPACE_DIR / "state" / "helper-cpu-samples.json")
+
+
 def _process_alive(pid: int) -> bool:
     """Whether `pid` is a running process we may signal (kill -0)."""
     if pid <= 0:
@@ -13924,6 +13931,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_withheld_reviews_readable())
     checks.append(check_codex_task_notifier())
     checks.append(check_claude_task_notifier())
+    checks.append(check_helper_cpu())
     checks.append(check_codex_presence())
     checks.append(check_sandbox_delegation())
     checks.append(check_skill_symlinks())
