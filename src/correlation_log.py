@@ -10,6 +10,9 @@ record names exact ids only; nothing here infers a link.
         {kind, at, handoff_id, parent_task_id, path, child_ref, delegate_label, holds?, parent_generation?}
     kind "handoff_closed": that work came back, failed, or timed out
         {kind, at, handoff_id, outcome}
+    kind "outcome_signal": evidence about how a task's result landed, attached beside its label and
+    never replacing it; for now a reaction on the agent's own result message
+        {kind, at, signal, value, reactor_id, reactor_relation, evidence, ref, source_event_id, task_id?, room_id?}
 
     kind "interaction": an ask we made, so the answer can be joined back by its id, with where it
     happened, captured when it happens and by id only (no names)
@@ -36,9 +39,13 @@ import secrets
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from file_lock import locked_file  # noqa: E402
-from local_task_protocol import valid_archive_lookup_id  # noqa: E402
+try:  # relative-first, so the ag2-sparrow package's synced copy uses its own siblings
+    from .file_lock import locked_file
+    from .local_task_protocol import valid_archive_lookup_id
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from file_lock import locked_file  # noqa: E402
+    from local_task_protocol import valid_archive_lookup_id  # noqa: E402
 
 LOG_NAME = "correlation.jsonl"
 MAX_BYTES = 8 * 1024 * 1024
@@ -73,6 +80,12 @@ PATTERNS = {
     "object": re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}#\d{1,9}$"),
     "interaction_id": INTERACTION_RE,
 }
+PATTERNS["reactor_id"] = PATTERNS["counterpart"]
+PATTERNS["ref"] = PATTERNS["event_id"]
+# The delivering event's own id, as the broker numbers it: what makes a replay recognisable.
+PATTERNS["source_event_id"] = re.compile(r"^[A-Za-z0-9$_:.+/=~-]{1,255}$")
+# A reaction key as Matrix carries it: an emoji or a short token, one line, no spaces.
+PATTERNS["value"] = re.compile(r"^[^\s\x00-\x1f\x7f]{1,16}$")
 HANDOFF_RE = re.compile(r"^ho_[0-9a-f]{12}$")
 PATTERNS["handoff_id"] = HANDOFF_RE
 PATTERNS["parent_generation"] = re.compile(r"^\d{1,9}$")
@@ -83,6 +96,9 @@ CHILD_REF = {"pool": is_task_id, "agent": re.compile(r"^toolu_[A-Za-z0-9]{8,64}$
 CHECKS = {"task_id": is_task_id, "run_id": is_run_id, "parent_task_id": is_task_id}
 
 KINDS = {
+    "outcome_signal": {"required": ("signal", "value", "reactor_id", "reactor_relation", "evidence", "ref",
+                                    "source_event_id"),
+                       "optional": ("task_id", "room_id")},
     "handoff": {"required": ("handoff_id", "parent_task_id", "path", "child_ref", "delegate_label"),
                 "optional": ("holds", "parent_generation")},
     "handoff_closed": {"required": ("handoff_id", "outcome"), "optional": ()},
@@ -92,6 +108,8 @@ KINDS = {
 }
 ENUMS = {"counterpart_kind": ("person", "agent", "owner"), "counterpart_scope": ("internal", "external", "unknown"),
          "room_kind": ("dm", "room", "unknown"), "channel": ("room", "dm", "thread"),
+         "signal": ("reaction", "reaction_removed"), "reactor_relation": ("owner", "member"),
+         "evidence": ("direct", "correlated", "weak", "inferred"),
          "path": tuple(CHILD_REF), "holds": ("yes", "no"), "outcome": ("done", "failed", "timeout")}
 
 _warned = False
