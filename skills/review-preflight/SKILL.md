@@ -48,8 +48,12 @@ unskippable, so the guarantee is structural rather than disciplinary.
 
 ```bash
 python3 skills/review-preflight/scripts/review-preflight.py <PR>      # run before reviewing; reads <repo>/REVIEW.md
+python3 skills/review-preflight/scripts/review-preflight.py https://github.com/o/n/pull/<N>  # another repo's PR: the URL sets the repo
 python3 skills/review-preflight/scripts/ci-triage.py <PR> [--repo o/n] # a red check is a pointer into the record: search its SUBJECT, not its name
 ```
+
+A bare `<PR>` number is looked up in `--repo`, else `$SUTANDO_REVIEW_REPO`, else this checkout's git
+remote. The header's `Repo:` line says which, because the same number in another repo is a different PR.
 
 `review-preflight.py` resolves the repo root via `git rev-parse --show-toplevel`, falling back to three
 levels above its own file. `ci-triage.py` is advisory (exit 0), and is the module review-preflight will
