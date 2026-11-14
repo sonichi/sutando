@@ -58,14 +58,28 @@ def claim_path(workspace: Path, task_file: str) -> Path:
     return workspace / "state" / "role-status" / "claims" / Path(task_file).stem
 
 
+CLAIM_OPEN_TRIES = 5
+
+
 def claim_open(path: str) -> Optional[int]:
     """Create-if-absent (never truncate) and lock the claim; the lock outlives nothing
-    but this process, so an unlocked empty claim is a crash. None = held by another."""
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
-    if not try_lock_fd(fd):
+    but this process, so an unlocked empty claim is a crash. None = held by another.
+    A lock taken on an inode a rollback already unlinked is no claim: reopen the path."""
+    for _ in range(CLAIM_OPEN_TRIES):
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        if not try_lock_fd(fd):
+            os.close(fd)
+            return None
+        try:
+            here = os.stat(path)
+        except FileNotFoundError:
+            here = None
+        st = os.fstat(fd)
+        if here is not None and (here.st_dev, here.st_ino) == (st.st_dev, st.st_ino):
+            return fd
+        unlock_fd(fd)
         os.close(fd)
-        return None
-    return fd
+    return None
 
 
 def claim_body(fd: int) -> str:

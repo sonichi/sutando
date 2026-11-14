@@ -586,6 +586,40 @@ with tempfile.TemporaryDirectory() as td:
           and not claim_of(ws).exists() and "Traceback" not in se,
           "commit fails with the claim already unlinked: rc 0, result stands, the missing claim is not an error")
 
+# (10b2) a caller that opened the claim before a rollback unlinked it never holds the claim:
+# it reopens the path, so a third caller cannot claim the same task beside it.
+if os.name != "nt":
+    with tempfile.TemporaryDirectory() as td:
+        ws, task, j = fresh_ws(td)
+        path = claim_of(ws)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        holder_a = pub.claim_open(str(path))
+        real_try = pub.try_lock_fd
+        rolled = []
+
+        def rollback_then_lock(fd):
+            if not rolled:  # B opened the old inode; A rolls back before B locks it
+                rolled.append(os.fstat(fd).st_ino)
+                os.unlink(str(path))
+                pub.unlock_fd(holder_a)
+                os.close(holder_a)
+            return real_try(fd)
+        pub.try_lock_fd = rollback_then_lock
+        try:
+            holder_b = pub.claim_open(str(path))
+        finally:
+            pub.try_lock_fd = real_try
+        holder_c = pub.claim_open(str(path))
+        check(holder_b is not None and holder_c is None
+              and os.fstat(holder_b).st_ino == path.stat().st_ino != rolled[0],
+              "a claim locked after its rollback unlink is reopened: one holder, on the live path")
+        rc, so, se = publish_in(ws, task, j)
+        check(rc == 2 and "publication in progress" in se and not (ws / "results" / task.name).exists(),
+              "...and a publisher beside that holder refuses rather than publishing a second result")
+        if holder_b is not None:
+            pub.unlock_fd(holder_b)
+            os.close(holder_b)
+
 # (10c) no `fcntl`, as on Windows: a fake `msvcrt` with real in-process lock semantics
 # drives the claim state machine. Windows filesystem semantics are NOT exercised here.
 NOFCNTL = r"""
