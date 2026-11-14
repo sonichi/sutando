@@ -786,6 +786,29 @@ class TwoServers(Base):
                     self._seat(desc)
                 self.assertEqual(e.exception.reason, "descriptor_unresolved", desc)
 
+    def test_a_relay_or_mint_endpoint_matches_a_row_exactly_host_and_port(self):
+        """Only the row's own endpoint names its server: a look-alike host, a longer host ending in another
+        domain, or the same host on another port names none. A port stated as the scheme's default is the
+        same endpoint as one left out, and a host's case does not matter."""
+        for key in ("relay", "mint_url"):
+            for url in ("https://evil-chat.alpha-fixture.net", "https://chat.alpha-fixture.net.evil.example",
+                        "https://chat.alpha-fixture.net:8444", "http://chat.alpha-fixture.net",
+                        "https://relay.beta-fixture.net", "https://relay.beta-fixture.net:443",
+                        "https://evil-relay.beta-fixture.net:8443", "https://relay.beta-fixture.net:8443.evil.example"):
+                with self.assertRaises(C.NoWorkerCredential, msg=(key, url)) as e:
+                    self._seat({"lane": "primary", key: url + "/v1/mcp/token"})
+                self.assertEqual(e.exception.reason, "descriptor_unresolved", (key, url))
+            for url, server, secret in (
+                    ("https://chat.alpha-fixture.net:443", "alpha-fixture.net", "secret-reviewer"),
+                    ("https://CHAT.Alpha-Fixture.NET", "alpha-fixture.net", "secret-reviewer"),
+                    ("https://relay.beta-fixture.net:8443", "beta-fixture.net", "secret-reviewer-b")):
+                cred = self._seat({"lane": "primary", key: url + "/v1/mcp/token"})
+                self.assertEqual((cred["server"], cred["bearer"]), (server, secret), (key, url))
+        self.assertEqual(C.origin_of_url("https://h.example"), "h.example:443")
+        self.assertEqual(C.origin_of_url("http://H.example:80/p"), "h.example:80")
+        for bad in ("", "h.example", "ftp://h.example", "https://h.example:notaport", "https://:8443"):
+            self.assertEqual(C.origin_of_url(bad), "", bad)
+
     def test_a_named_descriptor_that_cannot_be_read_is_refused_not_replaced(self):
         """A seat told to use one descriptor is never resolved by another, even when the workspace has one."""
         self._seat({"version": 1, "lane": "primary", "agent_id": BETA_CORE})
