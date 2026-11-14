@@ -427,13 +427,36 @@ class PinnedEntries(unittest.TestCase):
     def test_identical_stamps_at_both_ends_ask_the_next_pair(self):
         """Ends tying must not decide; look inward, and say None when nothing decides."""
         E = lambda st, n: f"## STATE {st} — {n}\n" + ("x" * 500) + "\n"
-        same = "2026-09-06T08:33:10Z"
-        entries = ct.split(E(same, "a") + E("2026-09-06T09:00:00Z", "b") + E(same, "c"))[1]
+        day = "2026-09-06"
+        entries = ct.split(E(day, "a") + E("2026-09-06T08:00:00Z", "b") + E("2026-09-06T09:00:00Z", "c"))[1]
         self.assertIs(ct._orientation(entries), False)
-        entries = ct.split(E(same, "a") + E("2026-09-06T07:00:00Z", "b") + E(same, "c"))[1]
+        entries = ct.split(E(day, "a") + E("2026-09-06T09:00:00Z", "b") + E("2026-09-06T08:00:00Z", "c"))[1]
         self.assertIs(ct._orientation(entries), True)
-        flat = ct.split(E(same, "a") + E(same, "b"))[1]
+        flat = ct.split(E("2026-09-06T08:33:10Z", "a") + E("2026-09-06T08:33:10Z", "b"))[1]
         self.assertIsNone(ct._orientation(flat))
+
+    def test_a_newest_entry_in_the_middle_is_undetermined(self):
+        """One pair each way is a tie: neither end can be shown to be the newest."""
+        E = lambda st, n: f"## STATE {st} — {n}\n" + ("x" * 500) + "\n"
+        same = "2026-09-06T08:33:10Z"
+        peak = ct.split(E(same, "a") + E("2026-09-06T09:00:00Z", "b") + E(same, "c"))[1]
+        self.assertIsNone(ct._orientation(peak))
+        dip = ct.split(E(same, "a") + E("2026-09-06T07:00:00Z", "b") + E(same, "c"))[1]
+        self.assertIsNone(ct._orientation(dip))
+
+    def test_a_living_section_on_top_of_an_oldest_first_file_does_not_archive_the_newest(self):
+        """The reported layout: a dated living section first, then append-only entries, newest last."""
+        E = lambda st, n: f"## {n} — {st}\n" + ("x" * 600) + "\n"
+        text = ("# track\n\n" + E("reconciled 2026-10-18 ~11:4xZ", "Other open rows")
+                + E("reconciled 2026-10-17", "A12 ReconnectSpike")
+                + E("2026-10-17T09:00:00Z", "older work")
+                + E("2026-10-18T08:00:00Z", "yesterday")
+                + E("2026-10-18T12:30:00Z", "just appended"))
+        self.assertIs(ct._orientation(ct.split(text)[1]), False, "two pairs say newest-last, one says first")
+        r = ct.plan(text, 2200)
+        self.assertIn("just appended", r.head, "the newest, just-appended entry left the head")
+        self.assertNotIn("just appended", r.archived)
+        self.assertTrue(r.archived, "nothing rotated, so the walk was never exercised")
 
     def test_a_coarse_current_stamp_is_not_read_as_older(self):
         """Zero-filling made '2026-09-06' sort below '2026-09-06T08:00:00Z' and archive it."""
