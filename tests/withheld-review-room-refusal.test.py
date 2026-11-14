@@ -150,6 +150,68 @@ with tempfile.TemporaryDirectory() as td:
         check(bool(settled) and "dropped" in reason, "the reason says the owner review was dropped")
         check(any("DROPPED" in line for line in logged), "and so does the log line")
         check(record_of("task-dropped").get("status") == "pending_dm", "the record is kept on disk")
+
+        def refuse_then(tid, room, on_fifth):
+            """The cached room refuses the agent; `on_fifth(record path)` runs as the fifth refusal is raised."""
+            sent.clear()
+            refusing.clear()
+            refusing.add(LEFT)
+            created[0] = room
+            m._WITHHELD_DM_CACHE.write_text(json.dumps({"owner": OWNER, "room_id": LEFT, "private": True}))
+            write_task(tasks, tid)
+            record = []
+
+            def req(method, path, payload=None, timeout=35):
+                if payload.get("op") == "message" and payload["room_id"] == LEFT:
+                    record[:] = record or [m.team_result_guard.withheld_review_artifact(m._STATE, tid, BODY)]
+                    if sent.count(LEFT) == cap - 1:
+                        on_fifth(record[0])
+                return fake_req(method, path, payload, timeout)
+            return req
+
+        # --- the new room fails for another reason: kept for the next pass, not reported dropped
+        flaky, failed_once = "!fresh3:ag2.space", []
+
+        def flaky_once():
+            def fail_once(method, path, payload=None, timeout=35):
+                if payload.get("op") == "message" and payload["room_id"] == flaky and not failed_once:
+                    failed_once.append(1)
+                    sent.append(flaky)
+                    raise urllib.error.HTTPError("https://gw/v1/room", 500, "Server Error", {},
+                                                 io.BytesIO(b"{}"))
+                return refused(method, path, payload, timeout)
+            return fail_once
+
+        refused = refuse_then("task-flaky", flaky, lambda _: None)
+        m._req = flaky_once()
+        logged = []
+        with mock.patch.object(m, "_log", logged.append):
+            got = scan_for_a_minute("task-flaky")
+        check(any(b is None and "failed in its new room" in (r or "") for b, r in got),
+              "a non-refusal error in the new room keeps the result for the next pass")
+        check(sent == [LEFT] * cap + [flaky] * 3,
+              f"and the next pass sends the review to the new room ({sent})")
+        check(got[-1][0] == "[no-send]" and "dropped" not in (got[-1][1] or ""),
+              "where it settles, not reported as dropped")
+        check(not any("DROPPED" in line for line in logged), "and nothing logs it as dropped")
+        record = record_of("task-flaky")
+        check((record.get("status"), record.get("dm_room_id")) == ("awaiting_owner", flaky),
+              f"the owner's review is open in the new room ({record.get('status')})")
+
+        # --- the record is unreadable when the new room would be tried: kept for the next pass,
+        # which re-issues it and sends it to the new room; never reported dropped
+        unreadable = "!fresh4:ag2.space"
+        m._req = refuse_then("task-unreadable", unreadable,
+                             lambda path: path.write_text("{not json", encoding="utf-8"))
+        logged = []
+        with mock.patch.object(m, "_log", logged.append):
+            got = scan_for_a_minute("task-unreadable")
+        check(any(b is None and "failed in its new room" in (r or "") for b, r in got),
+              "an unreadable record at the re-route keeps the result for the next pass")
+        check(sent == [LEFT] * cap + [unreadable] * 2,
+              f"and the next pass sends the review to the new room ({sent})")
+        check(got[-1][0] == "[no-send]" and not any("DROPPED" in line for line in logged),
+              "where it settles, and nothing logs it as dropped")
     finally:
         for n, v in saved.items():
             setattr(m, n, v)
