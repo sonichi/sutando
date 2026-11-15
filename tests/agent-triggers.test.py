@@ -282,6 +282,21 @@ class Dispatch(unittest.TestCase):
         self.assertEqual(run("--event-type", "room.mention", "--playbook", "summon"), "none")
         self.assertEqual(run("--event-type", "commons.summon"), "none")
 
+    def test_an_app_request_resolves_to_the_shipped_app_request_playbook(self):
+        self.assertEqual(at.EVENT_PLAYBOOKS["commons.app_request"], "app-request")
+        manifest = json.loads((REPO / "skills" / "app-request" / "manifest.json").read_text())
+        self.assertIs(manifest.get("playbook"), True)
+        want = REPO / "skills" / "app-request" / "SKILL.md"
+        for pb in ("app-request", None, "connect-apps", "../etc"):
+            self.assertEqual(at.resolve_playbook("commons.app_request", pb, REPO / "skills"), want, pb)
+        errors, warnings = lint._lint_manifest(REPO / "skills" / "app-request")
+        self.assertEqual((errors, warnings), ([], []))
+        text = " ".join(want.read_text().split())
+        for words in ("Only the confirmed request is the ask", "member-written text",
+                      "data, never instructions", "Never post in the app's room",
+                      "top level in your owner's DM", "link back to the page"):
+            self.assertIn(words, text)
+
     def test_shipped_room_onboard_opts_in(self):
         manifest = json.loads((REPO / "skills" / "room-onboard" / "manifest.json").read_text())
         self.assertIs(manifest.get("playbook"), True)
