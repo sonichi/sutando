@@ -178,6 +178,46 @@ never stamps envelopes, so there is no signature to check: an `invalid`/`unsigne
 submitted like any other, and the attested tier is the only gate — hence the refusal by default and the
 hard isolation above for whoever is admitted.
 
+## Supervised mode: under a host that owns the bridge (`--supervised-by`)
+
+Off by default; nothing above changes without it. A host that already runs the bridge, the identity,
+routing and restarts (a worker pool, say) hands the connector one folder and one declaration, and the
+connector becomes that host's pickup path instead of a standalone agent:
+
+```bash
+ag2-sparrow-codex-local supervised --host <declaration.json> [--codex <path>] [--codex-home <dir>] \
+    [--sandbox read-only|workspace-write] [--model <m>]
+python3 -m ag2_sparrow.adapters.codex.codex_connector --supervised-by <declaration.json> [connector options]
+```
+
+The declaration is `ag2_sparrow.supervised_host`'s schema, shared so the Claude adapter can read the same file:
+
+```json
+{"schema": "ag2-sparrow.supervised-host/1",
+ "inbox": "/abs/deliveries/<worker>", "payloads": "/abs/tasks", "results": "/abs/results",
+ "state": "/abs/state/workers/<worker>/codex", "publish": "result_publish",
+ "stage_command": ["/abs/python3", "/abs/pool_delivery.py", "--workspace", "/abs", "--recipient", "<worker>", "mark-done"],
+ "cwd": "/abs/working-dir"}
+```
+
+- **Folders.** Each `task-*.txt` in `inbox` is a task; with `payloads`, the entry is a sentinel naming
+  `<payloads>/<entry>` (an entry whose payload is absent is skipped and logged). The result is published to
+  `<results>/<task id>.txt` by `result_publish.publish_text`, the staged rename every in-repo result writer
+  uses, so the host's drain and outbox take it as any other result. Threads, the done ledger and metrics go
+  to `state`; `cwd` (default `state`) is the owner turns' working directory. Unknown keys, a relative path,
+  another schema or publish contract, and an inbox, results and state that are not three directories are refused.
+- **Claim.** `stage_command`, when declared, is run with `--task-id <id> --stage pending` before a task's turn
+  (a non-zero exit defers that task 30 s and runs nothing) and `--stage done` after its result is published (a
+  failure is logged). A connector that dies mid-task leaves `pending` for the host to recover.
+- **What it does not do.** No bridge, no unit, no config, and no lock on any work root: `supervised` never
+  checks for a host supervisor or `AGENT_CONNECT_TASK_DIR`, because the host is the supervisor. The only lock
+  is the connector's own `state` dir (exit 3 when another connector holds it). `--work`, `--held`,
+  `--root-fd` and `--allow-non-owner` are refused beside `--supervised-by`.
+- **Tiers.** Exactly the table above, from each task's attested headers (`task_io.admission`): the owner on
+  the channel's durable thread, an attested collaborator on an ephemeral read-only thread in a scratch dir,
+  every other sender refused with the plain line, published to the host's `results` like any answer.
+  Signed-envelope checks arrive with the task-signing change for both local adapters, not here.
+
 ## Three shapes
 
 | | 1. own app-server thread (`--server stdio`) | 2. `--push` → `codex queue` into a live TUI | 3. `codex exec resume <id> "<prompt>"` |
@@ -261,4 +301,6 @@ Both render the shared `ag2_sparrow.task_io.NON_OWNER_NOTE`.
 
 Tests: `python3 packages/ag2-sparrow/tests/test_codex_connector.py` (runs the connector
 against `stub_app_server.py`; no network, no `codex`). Under the repository coverage gate it
-runs through `tests/ag2-sparrow-codex-connector.test.py`.
+runs through `tests/ag2-sparrow-codex-connector.test.py`. Supervised mode:
+`python3 packages/ag2-sparrow/tests/test_codex_supervised.py`, through
+`tests/ag2-sparrow-codex-supervised.test.py`.
