@@ -163,6 +163,35 @@ def resolve_label(roster: dict, name: str) -> str:
     return next(iter(hits)) if hits else name
 
 
+def normalize_spoken_name(name: str) -> str:
+    """A worker name as heard: case and runs of space, `_` or `-` do not matter."""
+    return re.sub(r"[\s_-]+", "-", (name or "").strip().lower()).strip("-")
+
+
+def resolve_spoken_name(roster: dict, spoken: str) -> dict:
+    """A name said aloud, to the one recipient it names, compared normalised.
+
+    -> {"worker": id} or {"error": "unknown"|"ambiguous", "known": [names]}.
+    An unknown name is refused here, not sent to the core as the router would.
+    """
+    want = normalize_spoken_name(spoken)
+    workers = roster.get("workers") or {}
+    known = sorted({display_label(row, wid) for wid, row in workers.items()})
+    if not want:
+        return {"error": "unknown", "known": known}
+    if want == CORE:
+        return {"worker": CORE}
+    hits = set()
+    for wid, row in workers.items():
+        row = row if isinstance(row, dict) else {}
+        names = (wid, row.get("label"), row.get("display_label"))
+        if any(n and normalize_spoken_name(n) == want for n in names):
+            hits.add(wid)
+    if len(hits) == 1:
+        return {"worker": next(iter(hits))}
+    return {"error": "ambiguous" if hits else "unknown", "known": known}
+
+
 LEGACY_WORKER_FIELD = "target_worker"
 
 
