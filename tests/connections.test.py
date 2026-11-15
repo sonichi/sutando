@@ -1192,6 +1192,76 @@ class ImportFromChannelFile(ChannelFileBase):
         self.assertFalse(C.record_path(self.ws).exists())
 
 
+class ImportSplitUrlAndToken(ChannelFileBase):
+    """The gateway address and the secret as two variables, REMOTE_TASK_URL + a bare REMOTE_TASK_TOKEN,
+    import as the one legacy row the combined `url|secret` form gives; half a pair imports nothing."""
+
+    URL, SECRET = "https://chat.alpha-fixture.net", "secret-alpha"
+
+    def assert_one_legacy_row(self, created):
+        self.assertEqual([(r["instance"], r["token_ref"], r["primary"], r["server"], r["gateway_url"])
+                          for r in created],
+                         [("", "REMOTE_TASK_TOKEN", True, "alpha-fixture.net", "https://chat.alpha-fixture.net")])
+        self.assertEqual(self.vault.store, {"REMOTE_TASK_TOKEN": TOKEN_A}, "the vault holds the joined url|secret")
+
+    def test_split_pair_in_the_channel_file_imports_the_legacy_row(self):
+        path = self.write_relay_env(f"AGENT_ID=agent-1\nREMOTE_TASK_PROVIDER=ag2space\n"
+                                    f"REMOTE_TASK_TOKEN={self.SECRET}\nREMOTE_TASK_URL={self.URL}/")
+        before = path.read_bytes()
+        self.assertEqual(C.primary_token_from_channel_file({}), TOKEN_A)
+        self.assert_one_legacy_row(C.import_from_env({}, workspace=self.ws, vault=self.vault))
+        self.assertEqual(path.read_bytes(), before, "the channel file is never rewritten")
+        self.assertNotIn(self.SECRET, C.record_path(self.ws).read_text(), "the secret goes to the vault only")
+        self.assertEqual(C.import_from_env({}, workspace=self.ws, vault=self.vault), [], "once")
+
+    def test_legacy_url_spelling_in_the_file_counts_too(self):
+        self.write_relay_env(f"AG2_REMOTE_TOKEN={self.SECRET}\nAG2_REMOTE_URL={self.URL}")
+        self.assert_one_legacy_row(C.import_from_env({}, workspace=self.ws, vault=self.vault))
+
+    def test_split_pair_in_the_environment_imports_the_legacy_row(self):
+        env = {"REMOTE_TASK_TOKEN": self.SECRET, "REMOTE_TASK_URL": self.URL}
+        self.assert_one_legacy_row(C.import_from_env(env, workspace=self.ws, vault=self.vault))
+
+    def test_an_environment_url_pairs_with_the_file_secret_as_the_bridge_pairs_them(self):
+        self.write_relay_env(f"REMOTE_TASK_TOKEN={self.SECRET}\nREMOTE_TASK_URL=https://relay.beta-fixture.net:8443")
+        self.assert_one_legacy_row(C.import_from_env({"REMOTE_TASK_URL": self.URL}, workspace=self.ws,
+                                                     vault=self.vault))
+
+    def test_combined_form_is_unchanged_beside_a_url(self):
+        env = {"REMOTE_TASK_TOKEN": TOKEN_A, "REMOTE_TASK_URL": "https://relay.beta-fixture.net:8443"}
+        self.assert_one_legacy_row(C.import_from_env(env, workspace=self.ws, vault=self.vault))
+        self.assertEqual(C.legacy_relay_token(TOKEN_A, ""), TOKEN_A)
+
+    def test_half_a_pair_imports_nothing(self):
+        for env in ({"REMOTE_TASK_TOKEN": self.SECRET}, {"REMOTE_TASK_URL": self.URL},
+                    {"REMOTE_TASK_TOKEN": "  ", "REMOTE_TASK_URL": self.URL}):
+            with self.subTest(env=sorted(env)):
+                self.assertEqual(C.import_from_env(env, workspace=self.ws, vault=self.vault), [])
+        for text in (f"REMOTE_TASK_TOKEN={self.SECRET}", f"REMOTE_TASK_URL={self.URL}",
+                     f"REMOTE_TASK_TOKEN=\nREMOTE_TASK_URL={self.URL}"):
+            with self.subTest(file=text.split("=")[0]):
+                self.write_relay_env(text)
+                self.assertEqual(C.primary_token_from_channel_file({}), "")
+                self.assertEqual(C.import_from_env({}, workspace=self.ws, vault=self.vault), [])
+        self.assertFalse(C.record_path(self.ws).exists())
+        self.assertEqual(self.vault.store, {})
+
+    def test_an_environment_secret_never_borrows_the_file_url(self):
+        self.write_relay_env(f"REMOTE_TASK_URL={self.URL}")
+        self.assertEqual(C.import_from_env({"REMOTE_TASK_TOKEN": self.SECRET}, workspace=self.ws, vault=self.vault), [])
+
+    def test_a_url_that_is_no_gateway_url_is_refused(self):
+        for url in ("ws://chat.alpha-fixture.net", "chat.alpha-fixture.net", "ftp://chat.alpha-fixture.net",
+                    "https://u:p@chat.alpha-fixture.net", "https://chat.alpha-fixture.net/x|y"):
+            with self.subTest(url=url):
+                env = {"REMOTE_TASK_TOKEN": self.SECRET, "REMOTE_TASK_URL": url}
+                self.assertEqual(C.import_from_env(env, workspace=self.ws, vault=self.vault), [])
+                self.write_relay_env(f"REMOTE_TASK_TOKEN={self.SECRET}\nREMOTE_TASK_URL={url}")
+                self.assertEqual(C.import_from_env({}, workspace=self.ws, vault=self.vault), [])
+        self.assertFalse(C.record_path(self.ws).exists())
+        self.assertEqual(self.vault.store, {})
+
+
 class AddAdoptsLaunchKeys(ChannelFileBase):
     """A launch key the desktop host wrote but no row holds: an add of its server must adopt it under
     the instance the host's launcher runs (the key's own suffix), never start a second bridge."""
