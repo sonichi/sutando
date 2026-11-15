@@ -82,5 +82,9 @@
   {
     "name": "sync-workspace",
     "sha256": "25f29fe42df775a596a7a0503f9d490abd681dfb26314de2ea205e2e2a5b6f4a"
+  },
+  {
+    "name": "own-pr-shepherd",
+    "sha256": "a6f20beaf6ea8de405162099948a135856436d67bed63f8c7c649652d22c6e58"
   }
 ]

@@ -1,0 +1,23 @@
+{
+  "name": "own-pr-shepherd",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "access_tier": "owner",
+  "description": "Own-PR shepherd pass, opt-in: lists the owner's open non-draft PRs in the configured repos (paged to the end, never a --limit cut-off), keeps only PRs whose last non-merge commit is the owner's email, classifies each by its next step and drives it: fix requested changes, ask a reviewer, merge the base in, fix CI this PR broke; an approved PR goes to the owner, never merged or enqueued. Run hourly by the schedule-crons `own-pr-shepherd` entry once the owner enables it. Config-only manifest: OWN_PR_SHEPHERD_REPOS (required; empty = skip), OWN_PR_SHEPHERD_AUTHOR (empty = the signed-in gh login), OWN_PR_SHEPHERD_EMAIL (empty = git config user.email), OWN_PR_SHEPHERD_MIN_QUOTA (GraphQL points floor).",
+  "permissions": {
+    "network": true,
+    "filesystem": "read-write",
+    "secrets": "none"
+  },
+  "config": {
+    "OWN_PR_SHEPHERD_REPOS": "",
+    "OWN_PR_SHEPHERD_AUTHOR": "",
+    "OWN_PR_SHEPHERD_EMAIL": "",
+    "OWN_PR_SHEPHERD_MIN_QUOTA": "500"
+  },
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}
