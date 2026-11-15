@@ -488,11 +488,13 @@ class RealGit(Base):
         g("update-ref", "refs/remotes/origin/main", "HEAD")
         return work, g, env
 
-    def _check(self, old, new):
+    def _check(self, old, new, mine=None):
+        """Other PR: `old` -> `new`; my change: `mine` (old, new), the same edit by default."""
         with tempfile.TemporaryDirectory() as d:
             work, g, env = self._repo(d)
             edited = self.SRC.replace(old, new)
-            assert edited != self.SRC
+            my_edit = self.SRC.replace(*mine) if mine else edited
+            assert edited != self.SRC and my_edit != self.SRC
             g("checkout", "-qb", "other")
             Path(work, "m.py").write_text(edited)
             g("commit", "-qam", "other edit")
@@ -500,7 +502,7 @@ class RealGit(Base):
             self.assertIn("@@ def alpha():", theirs) if old == "    y = x + 1\n" else None
             g("checkout", "-q", "main")
             g("checkout", "-qb", "mine")
-            Path(work, "m.py").write_text(edited)
+            Path(work, "m.py").write_text(my_edit)
             g("commit", "-qam", "my edit")
             other = pr(7, "other change", "other", files=["m.py"], author="someone", base="main")
             fake = Fake({"ro": [other], "viewer": {"login": "me-bot"}}, diffs={7: theirs})
@@ -518,6 +520,24 @@ class RealGit(Base):
 
     def test_same_edit_mid_function_matches_across_real_git_and_gh_pr_diff(self):
         text = self._check("    u = v * 5\n", "    u = v * 50\n")
+        self.assertIn("`def foo(x):`", text)
+
+    FOO = ("def foo(x):\n    y = x + 1\n    z = y * 2\n    w = z - 3\n    v = w + 4\n    u = v * 5\n"
+           "    return u\n")
+    BODY_EDIT = ("    w = z - 3\n", "    w = z - 30\n")
+
+    def test_signature_change_matches_a_body_edit_of_the_same_function(self):
+        text = self._check(*self.BODY_EDIT, mine=("def foo(x):\n", "def foo(x, k=0):\n"))
+        self.assertIn("Same function changed in an open PR:\n  #7", text)
+        self.assertIn("`def foo(x):`", text)
+
+    def test_signature_change_does_not_match_the_function_above(self):
+        text = self._check("    c = 3\n", "    c = 30\n", mine=("def foo(x):\n", "def foo(x, k=0):\n"))
+        self.assertEqual(text, "")
+
+    def test_deleting_a_whole_function_is_flagged_against_a_body_edit_of_it(self):
+        text = self._check(*self.BODY_EDIT, mine=("\n\n" + self.FOO, "\n"))
+        self.assertIn("Same function changed in an open PR:\n  #7", text)
         self.assertIn("`def foo(x):`", text)
 
     def test_different_functions_still_do_not_match(self):

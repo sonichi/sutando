@@ -703,8 +703,9 @@ The local side is the working tree against its merge base (branch), `origin/<bas
 non-common file, the check ends there with no GitHub call. Otherwise one `gh api graphql` read
 (5 s budget) lists the 25 most recently updated open PRs with their files; the top 3 by shared
 non-common files are diffed. Both sides use 3 lines of context (the `gh pr diff` shape), and each
-changed line is attributed to its enclosing function in the post-image: the `@@` header seeds it and
-a context or added line that git's default rule names a function takes over below it. So an edit on
+changed line is attributed to its enclosing function: the `@@` header seeds it, and a line that
+git's default rule names a function takes over below it. Removed lines follow the old file and added
+lines the new one, so a signature change or a deleted function keeps its old name. So an edit on
 the first lines of a body matches even when git heads the hunk with the previous function.
 
 A failed or timed-out diff read, or same-file candidates beyond the top 3 left undiffed, makes

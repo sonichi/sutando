@@ -214,10 +214,10 @@ def _nodes(data: dict, alias: str) -> List[dict]:
 
 def hunk_functions(diff_text: Optional[str]) -> Dict[str, set]:
     """{file: {enclosing function of each changed line}}, independent of the diff's context size.
-    The `@@` header seeds the function; a context or added line that git's default rule would name a
-    function (starts with a letter, `_` or `$`) takes over for the lines below it in the post-image."""
+    The `@@` header seeds both sides; a line git's default rule names a function (it starts with a letter,
+    `_` or `$`) takes over below it: removed lines follow the pre-image, added lines the post-image."""
     res: Dict[str, set] = {}
-    cur = fn = None
+    cur = pre = post = None
     in_hunk = False
     for line in (diff_text or "").splitlines():
         if line.startswith("diff --git "):
@@ -230,14 +230,18 @@ def hunk_functions(diff_text: Optional[str]) -> Dict[str, set]:
             continue
         m = HUNK.match(line)
         if m:
-            in_hunk, fn = bool(cur), (m[1].strip()[:120] or None)
+            in_hunk, pre = bool(cur), (m[1].strip()[:120] or None)
+            post = pre
             continue
         if not in_hunk or not line or line[0] not in " +-":
             continue
-        body = line[1:]
-        if line[0] in " +" and FUNC_LINE.match(body):
-            fn = body.strip()[:120]
-        if line[0] in "+-" and fn:
+        name = line[1:].strip()[:120] if FUNC_LINE.match(line[1:]) else None
+        if name and line[0] in " -":
+            pre = name
+        if name and line[0] in " +":
+            post = name
+        fn = pre if line[0] == "-" else post if line[0] == "+" else None
+        if fn:
             res[cur].add(fn)
     return res
 
