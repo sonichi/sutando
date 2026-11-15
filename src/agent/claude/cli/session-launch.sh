@@ -68,6 +68,25 @@ claude_named_pids() {
       *" --name $SESSION "*|*" --name=$SESSION "*) echo "$pid" ;;
     esac
   done
+  claude_session_unnamed_pids
+}
+
+# Claude processes without --name hosted in a pane of $SESSION (pane pid or a child):
+# the CLI re-execs mid-life as `claude.exe --resume <id>`, dropping --name.
+claude_session_unnamed_pids() {
+  command -v tmux > /dev/null 2>&1 || return 0
+  local pane pid args prog
+  for pane in $(tmux -S "$TMUX_SOCKET" list-panes -s -t "=$SESSION" -F '#{pane_pid}' 2>/dev/null); do
+    for pid in "$pane" $(pgrep -P "$pane" 2>/dev/null); do
+      args="$(ps -p "$pid" -o args= 2>/dev/null)" || continue
+      # Program path up to the first flag: an install path may contain spaces.
+      prog="${args%% -*}"
+      case "${prog##*/}" in claude|claude.exe) ;; *) continue ;; esac
+      case " $args " in *" --name "*|*" --name="*) continue ;; esac
+      echo "$pid"
+    done
+  done
+  return 0
 }
 
 claude_named_process_running() {

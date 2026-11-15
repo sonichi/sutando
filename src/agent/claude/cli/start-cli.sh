@@ -266,32 +266,40 @@ if [ -n "$RESTART_REQUESTED" ] && sutando_restart_guard_refuses "$CALLER_CORE_SE
   log_restart_attempt "$SUTANDO_RESTART_GUARD_REASON"
   exit 1
 fi
+_old_core_pids=""
+restart_core_alive() {
+  { claude_named_tmux_session_exists || claude_named_process_running; } && return 0
+  for _p in $_old_core_pids; do kill -0 "$_p" 2>/dev/null && return 0; done
+  return 1
+}
 if [ -n "$RESTART_REQUESTED" ]; then
   log_restart_attempt "begin (session=$(claude_named_tmux_session_exists && echo up || echo none) core=$(claude_named_process_running && echo up || echo none))"
   if claude_named_tmux_session_exists || claude_named_process_running; then
     echo "Killing existing $SESSION session..."
+    # Snapshot first: a resumed core is found through its pane, gone once the session is.
+    _old_core_pids="$(claude_named_pids)"
     tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
     tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
-    claude_named_pids | while read -r pid; do
-      [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    for pid in $_old_core_pids $(claude_named_pids); do
+      kill "$pid" 2>/dev/null || true
     done
     # The kill is already issued, so this wait can only be bounded, never
     # abandoned: a SessionEnd handoff takes longer than a few seconds.
     GRACE_S="${SUTANDO_RESTART_GRACE_S:-90}"
     _ticks=$(( GRACE_S * 5 ))
-    while [ "$_ticks" -gt 0 ] && { claude_named_tmux_session_exists || claude_named_process_running; }; do
+    while [ "$_ticks" -gt 0 ] && restart_core_alive; do
       sleep 0.2; _ticks=$(( _ticks - 1 ))
     done
-    if claude_named_tmux_session_exists || claude_named_process_running; then
+    if restart_core_alive; then
       if [ -n "$FORCE_RESTART" ]; then
         # force-restart: the core is wedged; escalate to SIGKILL, then poll ~3s.
         echo "  core still alive ${GRACE_S}s after SIGTERM — force-restart escalating to SIGKILL" >&2
         tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
-        claude_named_pids | while read -r pid; do
-          [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
+        for pid in $_old_core_pids $(claude_named_pids); do
+          kill -9 "$pid" 2>/dev/null || true
         done
         for _ in $(seq 1 15); do
-          claude_named_tmux_session_exists || claude_named_process_running || break
+          restart_core_alive || break
           sleep 0.2
         done
       else
@@ -306,7 +314,7 @@ if [ -n "$RESTART_REQUESTED" ]; then
     fi
     # After force escalation, still alive → hard abort rather than stack a second
     # core on a survivor (double task-consumer) or exit-0 a half-torn-down state.
-    if claude_named_tmux_session_exists || claude_named_process_running; then
+    if restart_core_alive; then
       echo "  ⚠ $SESSION core did not die after SIGKILL — aborting force-restart." >&2
       echo "    Investigate the stuck pid; rerun once it's gone." >&2
       log_restart_attempt "abort: core survived SIGKILL"
