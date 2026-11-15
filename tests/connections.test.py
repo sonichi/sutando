@@ -2192,6 +2192,48 @@ class OwnerScopedListing(Base):
         self.assertEqual(C.learn_missing_identities(self.ws, environ=environ, vault=self.vault,
                                                     fetch=lambda *a: self.fail("probed a known row")), [])
 
+    def test_a_legacy_row_with_a_bare_secret_learns_its_agent_through_its_own_gateway(self):
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        for environ, vaulted in (({"REMOTE_TASK_TOKEN": "secret-alpha"}, TOKEN_A), ({}, "secret-alpha")):
+            with self.subTest(environ=sorted(environ)):
+                self.vault.store["REMOTE_TASK_TOKEN"] = vaulted
+                with C._transaction(self.ws) as rec:
+                    rec["rows"][0].pop("agent_mxid", None)
+                    rec["rows"][0].pop("owner_mxid", None)
+                seen = []
+
+                def fetch(url, token, address=None):
+                    seen.append(token)
+                    return self.FLEET(url, token)
+                learned = C.learn_missing_identities(self.ws, environ=environ, vault=self.vault, fetch=fetch,
+                                                     whoami=whoami_says("@sutando:alpha-fixture.net"))
+                self.assertEqual(learned, [""])
+                self.assertEqual(seen, [TOKEN_A], "the bare secret was joined to the row's own gateway")
+                self.assertEqual(self.rows()[0]["agent_mxid"], "@sutando:alpha-fixture.net")
+                self.assertEqual(C.connection_credential(self.rows()[0], environ, vault=self.vault),
+                                 ("https://chat.alpha-fixture.net", TOKEN_A))
+
+    def test_a_combined_token_is_handed_over_unchanged(self):
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        row = self.rows()[0]
+        self.assertEqual(C.connection_credential(row, {"REMOTE_TASK_TOKEN": TOKEN_A}, vault=self.vault),
+                         ("https://chat.alpha-fixture.net", TOKEN_A))
+        self.assertEqual(C.row_token(row, TOKEN_A), TOKEN_A)
+
+    def test_a_bare_secret_beside_a_row_gateway_that_is_no_gateway_url_learns_nothing(self):
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        self.vault.store["REMOTE_TASK_TOKEN"] = "secret-alpha"
+        with C._transaction(self.ws) as rec:
+            rec["rows"][0]["gateway_url"] = "https://u:p@chat.alpha-fixture.net"
+        self.assertEqual(C.row_token(self.rows()[0], "secret-alpha"), "")
+        for environ in ({"REMOTE_TASK_TOKEN": "secret-alpha"}, {}):
+            self.assertEqual(C.learn_missing_identities(self.ws, environ=environ, vault=self.vault,
+                                                        fetch=lambda *a: self.fail("probed")), [])
+            with self.assertRaises(C.NoConnectionForRoom) as cm:
+                C.connection_credential(self.rows()[0], environ, vault=self.vault)
+            self.assertNotIn("secret-alpha", str(cm.exception))
+        self.assertIsNone(self.rows()[0].get("agent_mxid"))
+
     def test_a_row_without_a_token_or_a_disabled_one_is_left_alone(self):
         C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
         self.assertEqual(C.learn_missing_identities(self.ws, environ={}, vault=self.vault,

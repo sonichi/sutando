@@ -560,7 +560,10 @@ connection to use. The rule:
 A domain no row serves, or a disconnected row, is refused with `NoConnectionForRoom` naming the
 server, and so is a row with no token for its own gateway. The token is the first of the row's
 environment variable, its launch keys, its channel env file and its vault key whose embedded
-gateway, if any, is the row's own host: another server's token is never used. `room_ops.py`
+gateway, if any, is the row's own host: another server's token is never used. A bare secret
+(no embedded gateway) is handed on joined to the row's own `gateway_url` as `url|secret`, so the
+identity learner's preview reaches that gateway; a row gateway that is not a gateway URL makes
+it no token. `room_ops.py`
 prints `{"ok": false, "reason": ...}` and exits 1; `channel-env.sh` prints nothing and exits 1.
 
 The same rule serves every other gateway client: the pending-questions and Crons room databases
