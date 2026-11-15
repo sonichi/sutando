@@ -132,6 +132,119 @@ def _agent_task_keys(code: str) -> List[Tuple[str, str]]:
     return found
 
 
+_ROOM_POST = re.compile(r"\broom\s*\.\s*post\s*\(")
+_GESTURES = r"(?:click|submit|keydown|keyup|pointerup|touchend)"
+_NAME = r"[A-Za-z_$][\w$]*"
+_FN_HEAD = re.compile(
+    r"\bfunction\s+(" + _NAME + r")\s*\("
+    r"|\b(?:const|let|var)\s+(" + _NAME + r")\s*=\s*(?=(?:async\b\s*)?"
+    r"(?:function\b|\([^()]*\)\s*=>|" + _NAME + r"\s*=>))")
+# Where code runs with nobody having pressed anything: a timer, a data watch, a non-gesture event.
+_UNPROMPTED = re.compile(
+    r"\b(?:setTimeout|setInterval|requestAnimationFrame|queueMicrotask)\s*\("
+    r"|\.\s*(?:onChange|on)\s*\("
+    r"|addEventListener\s*\(\s*['\"](?!" + _GESTURES + r"['\"])[\w-]+['\"]")
+
+
+def _expression_end(code: str, start: int) -> int:
+    """Where the expression starting at `start` ends: after the block it opens, or at its `;`."""
+    depth, i, quote = 0, start, ""
+    while i < len(code):
+        ch = code[i]
+        if quote:
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                quote = ""
+        elif ch in "'\"`":
+            quote = ch
+        elif ch == "{" and depth == 0:
+            return i + 2 + len(_balanced(code, i))
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth < 0:
+                return i
+        elif ch == ";" and depth == 0:
+            return i
+        i += 1
+    return len(code)
+
+
+def _call_span(code: str, match: "re.Match") -> Tuple[int, int]:
+    """The span of the call a regex match opens: from the match to its closing bracket."""
+    paren = code.index("(", match.start())
+    return match.start(), paren + 2 + len(_balanced(code, paren))
+
+
+def _sends_without_a_click(code: str) -> Tuple[int, int, int]:
+    """(sends, refused, unproven) for agent.sendTask and room.post calls, read from the source.
+
+    A send is fine when it sits in a gesture handler (a click, a submit, a key press), or in a
+    named function that is only ever referred to from such handlers or from other such
+    functions. It is REFUSED when it sits in a timer, a data watch or a non-gesture listener
+    with no gesture handler around it, or when the page has no gesture handler at all. Anything
+    else (a send at the top of the script, in a method or an unnamed callback) cannot be shown
+    to need a click and is UNPROVEN. This reads text, not a parse: it errs towards asking the
+    author to look."""
+    code = re.sub(r"(?<![:'\"\\])//[^\n]*", lambda m: " " * len(m.group(0)), code)
+    sends = [m.start() for rx in (_AGENT_CALL, _ROOM_POST) for m in rx.finditer(code)]
+    if not sends:
+        return 0, 0, 0
+    gestures: List[Tuple[int, int]] = []
+    for m in re.finditer(r"addEventListener\s*\(\s*['\"]" + _GESTURES + r"['\"]", code):
+        gestures.append(_call_span(code, m))
+    for m in re.finditer(r"\.\s*on" + _GESTURES + r"\s*=(?!=)", code):
+        gestures.append((m.start(), _expression_end(code, m.end())))
+    for m in re.finditer(r"\son" + _GESTURES + r"\s*=\s*([\"'])(.*?)\1", code, re.S):
+        gestures.append((m.start(2), m.end(2)))
+    if not gestures:
+        return len(sends), len(sends), 0
+    unprompted = [_call_span(code, m) for m in _UNPROMPTED.finditer(code)]
+    functions: List[Tuple[str, int, int, int]] = []          # name, where the name is, start, end
+    for m in _FN_HEAD.finditer(code):
+        if m.group(1):
+            paren = m.end() - 1
+            brace = code.find("{", paren + 1 + len(_balanced(code, paren)))
+            end = brace + 2 + len(_balanced(code, brace)) if brace >= 0 else len(code)
+            functions.append((m.group(1), m.start(1), m.start(), end))
+        else:
+            functions.append((m.group(2), m.start(2), m.start(), _expression_end(code, m.end())))
+
+    def within(pos: int, spans: List[Tuple[int, int]]) -> bool:
+        return any(start <= pos < end for start, end in spans)
+
+    def owner(pos: int) -> str:
+        holding = [f for f in functions if f[2] <= pos < f[3]]
+        return min(holding, key=lambda f: f[3] - f[2])[0] if holding else ""
+
+    def click_only(name: str, seen: frozenset) -> bool:
+        if name in seen:
+            return True
+        declared = {f[1] for f in functions if f[0] == name}
+        for m in re.finditer(r"(?<![\w.$])" + re.escape(name) + r"(?![\w$])", code):
+            if m.start() in declared or within(m.start(), gestures):
+                continue
+            holder = owner(m.start())
+            if not holder or not click_only(holder, seen | {name}):
+                return False
+        return True
+
+    refused = unproven = 0
+    for pos in sends:
+        if within(pos, gestures):
+            continue
+        holder = owner(pos)
+        if holder and click_only(holder, frozenset()):
+            continue
+        if within(pos, unprompted):
+            refused += 1
+        else:
+            unproven += 1
+    return len(sends), refused, unproven
+
+
 def _strip_comments(src: str) -> str:
     src = re.sub(r"<!--.*?-->", "", src, flags=re.S)
     return re.sub(r"/\*.*?\*/", "", src, flags=re.S)
@@ -193,6 +306,18 @@ def check(src: str) -> dict:
                 "sendTask's refusal reason is never read: say why nothing was sent")
     if posts and not re.search(r"\.reason\b|\.posted\b", code):
         add(warnings, "room-post-refusal", "room.post's result is never read: say whether it was posted")
+    # GUIDE "only a deliberate click sends": the host asks the viewer on every call, so a page
+    # that sends from a timer, a watch or page load trains people to press yes unread.
+    _, refused, unproven = _sends_without_a_click(code)
+    if refused:
+        add(errors, "send-not-from-click",
+            "agent.sendTask or room.post runs with no click behind it (a timer, a data watch, a "
+            "load or change event, or a page with no click handler): send only from the handler "
+            "of a control the viewer pressed")
+    elif unproven:
+        add(warnings, "send-click-unproven",
+            "could not show from the source that every agent.sendTask or room.post call is only "
+            "reached from a click: check that none runs on load, from a timer or from a watch")
     if (not asks_agent and not posts
             and re.search(r">\s*(?:Send|Notify|Email|DM|Message)\b[^<]{0,40}</button>", code, re.I)):
         add(warnings, "no-fake-send",

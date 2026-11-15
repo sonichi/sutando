@@ -67,8 +67,10 @@ for rule, warn in [
 # --- asking the viewer's own agent, and posting in the room -------------------------------
 ASK = GOOD.replace("await db.read(id);", """await db.read(id);
   const a = (await art.agent.list())[0];
+  document.getElementById('go').onclick = async () => {
   const sent = await art.agent.sendTask({ agentId: a.id, text: 'Review row 1', key: 'ask.row1.0' });
-  if (!sent.ok) console.log(sent.reason);""")
+  if (!sent.ok) console.log(sent.reason);
+  };""")
 ask = cp.check(ASK)
 check("ask-my-agent-page-passes", ask["ok"] and not ask["warnings"])
 no_key = cp.check(ASK.replace(", key: 'ask.row1.0'", ""))
@@ -123,8 +125,10 @@ check("shorthand-key-passes", cp.check(ASK.replace("key: 'ask.row1.0'", "key"))[
 silent = cp.check(ASK.replace("if (!sent.ok) console.log(sent.reason);", "").replace("r.reason", "r.why"))
 check("warning-agent-task-refusal", silent["ok"] and "agent-task-refusal" in rules(silent, "warnings"))
 POST = GOOD.replace("await db.read(id);", """await db.read(id);
+  document.getElementById('go').onclick = async () => {
   const p = await art.room.post({ text: 'Lunch is ready', key: 'lunch.1' });
-  if (!p.posted) console.log(p.reason);""")
+  if (!p.posted) console.log(p.reason);
+  };""")
 check("room-post-page-passes", cp.check(POST)["ok"] and not cp.check(POST)["warnings"])
 unread = cp.check(POST.replace("if (!p.posted) console.log(p.reason);", "").replace("r.reason", "r.why"))
 check("warning-room-post-refusal", "room-post-refusal" in rules(unread, "warnings"))
@@ -138,6 +142,52 @@ check("own-confirm-function-allowed", cp.check(GOOD.replace("await art.ready;", 
 check("commented-fetch-ignored", cp.check(GOOD.replace("await art.ready;", "await art.ready; /* fetch(x) */"))["ok"])
 check("db-only-page-needs-no-ready",
       cp.check(GOOD.replace("await art.ready;", "").replace("art.me.name", "'x'"))["ok"])
+# --- only a deliberate click sends ------------------------------------------------------------
+SEND = "await art.agent.sendTask({ agentId: a.id, text: 'Review row 1', key: 'ask.row1.0' })"
+CLICK = "document.getElementById('go').onclick = async () => {"
+check("click-fixture-has-the-pieces", SEND in ASK and CLICK in ASK)
+for name, page in [
+    ("timer", ASK.replace(CLICK, "setInterval(async () => {").replace("\n  };", "\n  }, 60000);")),
+    ("data-watch", ASK.replace(CLICK, "db.onChange(id, async () => {").replace("\n  };", "\n  });")),
+    ("page-event", ASK.replace(CLICK, "art.on('ping', async () => {").replace("\n  };", "\n  });")),
+    ("load", ASK.replace(CLICK, "window.addEventListener('load', async () => {").replace("\n  };", "\n  });")),
+    ("input-change", ASK.replace(CLICK, "document.getElementById('go').addEventListener('change', async () => {")
+     .replace("\n  };", "\n  });")),
+    ("no-click-handler-at-all", ASK.replace(CLICK, "{").replace("\n  };", "\n  }")),
+    ("room-post-from-a-timer", ASK + "<script>document.body.onclick = () => {}; setTimeout(() => "
+     "window.artifact.room.post({ text: 'hi' }).then((r) => r.posted), 5);</script>"),
+]:
+    got = cp.check(page)
+    check(f"error-send-not-from-click:{name}", not got["ok"] and "send-not-from-click" in rules(got, "errors"))
+for name, page in [
+    ("addEventListener-click", ASK.replace(CLICK, "document.getElementById('go').addEventListener('click', async () => {")
+     .replace("\n  };", "\n  });")),
+    ("named-function-called-from-a-click", ASK.replace(CLICK, "const askNow = async () => {")
+     .replace("\n  };", "\n  };\n  document.getElementById('go').onclick = () => askNow();")),
+    ("through-two-named-functions", ASK.replace(CLICK, "async function askNow() {")
+     .replace("\n  };", "\n  }\n  const press = () => askNow();\n  document.getElementById('go').onclick = press;")),
+    ("a-timer-started-by-the-click", ASK.replace(CLICK, CLICK + " setTimeout(async () => {")
+     .replace("\n  };", "\n  }, 0); };")),
+    ("a-watch-that-draws-the-button", ASK.replace(CLICK, "db.onChange(id, () => { document.getElementById('go').onclick = async () => {")
+     .replace("\n  };", "\n  }; });")),
+    ("a-line-comment-naming-the-function", ASK.replace(CLICK, "// askNow runs on a click\n  const askNow = async () => {")
+     .replace("\n  };", "\n  };\n  document.getElementById('go').onclick = askNow;")),
+]:
+    got = cp.check(page)
+    check(f"click-only-send-passes:{name}", got["ok"] and not got["warnings"])
+for name, page in [
+    ("the-top-of-the-script", ASK.replace(CLICK, "document.body.onclick = () => {}; {").replace("\n  };", "\n  }")),
+    ("a-named-function-also-called-on-load", ASK.replace(CLICK, "const askNow = async () => {")
+     .replace("\n  };", "\n  };\n  document.getElementById('go').onclick = askNow;\n  askNow();")),
+    ("a-named-function-handed-to-a-timer", ASK.replace(CLICK, "const askNow = async () => {")
+     .replace("\n  };", "\n  };\n  document.getElementById('go').onclick = askNow;\n  setInterval(askNow, 9000);")),
+]:
+    got = cp.check(page)
+    check(f"warning-send-click-unproven:{name}",
+          got["ok"] and "send-click-unproven" in rules(got, "warnings"))
+check("a-page-that-sends-nothing-has-neither-finding",
+      not {"send-not-from-click", "send-click-unproven"} & (rules(good, "errors") | rules(good, "warnings")))
+
 check("body-size-warns", "body-size" in rules(cp.check(GOOD + " " * cp.MAX_BODY_BYTES), "warnings"))
 
 with tempfile.TemporaryDirectory() as tmp:
