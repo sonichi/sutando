@@ -440,6 +440,12 @@ check("other rows give another id (a retry that re-ran the connector is a new op
       fr.operation_id({**write_a, "rows": ROWS_B})["operation_id"] != op_a)
 check("no rows is still its own id", fr.operation_id({**write_a, "rows": []})["operation_id"]
       not in (op_a,))
+# The backend binds an id to the exact rows sent, so rows in another order are another id: one
+# id never carries two argument sets, which the backend would refuse as a conflict.
+TWO = ROWS_A + [{"_id": "e2", "Title": "Review", "Start": "2026-11-09T20:00:00Z"}]
+check("rows in another order give another id (the id covers the rows exactly as sent)",
+      fr.operation_id({**write_a, "rows": TWO})["operation_id"]
+      != fr.operation_id({**write_a, "rows": TWO[::-1]})["operation_id"])
 fail_a = {"grant_id": "gabc123def", "run_key": KEY, "code": "connector_error"}
 op_f = fr.operation_id(fail_a)["operation_id"]
 check("a failure's id is the run key, a fail part and 16 hex", re.fullmatch(

@@ -353,11 +353,8 @@ def current(run: dict, now_ms: int) -> dict:
 
 
 def operation_id(arguments: dict) -> dict:
-    """The operation_id for one feeds.write or feeds.fail call: the run key plus a short hash of
-    what the call writes (its rows, or its failure code). The backend binds an operation_id to
-    the arguments it was first sent with, so a retry that re-ran the connector and got other
-    rows must be a new operation; the run key stays the backend's dedupe (within its
-    run-key history, which `current` keeps the write inside)."""
+    """The run key plus a hash of the rows (or failure code) sent: the backend binds an id to its
+    first arguments, so other rows need another id. Hashed exactly as sent, in the read's order."""
     run_key = arguments.get("run_key")
     if not isinstance(run_key, str) or not run_key:
         raise Refused("the arguments have no run_key")
