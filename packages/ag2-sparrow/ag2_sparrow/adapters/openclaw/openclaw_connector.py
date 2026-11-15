@@ -366,7 +366,7 @@ def decide_permission(params, owner, cwd, reply_command, result_file):
 
 def trigger_of(headers):
     """(event_type, playbook): the event type when well-formed (None reads as a message), the playbook
-    only when it is a registry playbook."""
+    only when it is a registry id (the core still checks the opt-in)."""
     event = agent_triggers.event_type_value(headers.get("event_type"))
     return event, agent_triggers.allowed_playbook_value(headers.get("playbook"))
 

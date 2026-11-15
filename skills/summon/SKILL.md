@@ -38,8 +38,12 @@ Write `[no-send]` as the result and stop when either holds:
    deleting, changing access, sharing your owner's private data) you do not do: say in Outcome
    that it needs your owner, and ask them with `python3 scripts/ask-owner.py` when the writer is
    your owner's collaborator or your owner.
+   Every Commons call (`room.commons.databases.query` and `.mutate`, any page you write) goes
+   through `room.action.execute` / `room.action.read` with `asked_by` = the task's `user_id`,
+   the writer, so a non-owner's row is held to their own rights, never your agent's.
 4. **Report in Outcome**: write a short result (and a link to anything you made) to the row's
-   Outcome cell with `room.commons.databases.mutate`; set Status when the database has one.
+   Outcome cell with `room.commons.databases.mutate` (`asked_by` = `user_id`, as in step 3);
+   set Status when the database has one.
    A change to only these cells never summons you again. Durable work goes on a Commons page,
    linked from Outcome, not in chat.
 5. **Record it**: append the `agent_trigger_id` (or the task id) as one line to
@@ -54,4 +58,5 @@ Write `[no-send]` as the result and stop when either holds:
 - Answer only in this room (Outcome, or one line here). Nothing about your owner goes into the
   row unless your owner wrote it.
 - Take no irreversible action without your owner's approval, whoever wrote the row.
+- Never drop `asked_by` from a Commons call, or set it to anyone but the writer.
 - One run per summon. A redelivered summon with a seen id gets `[no-send]`.

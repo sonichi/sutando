@@ -11,9 +11,11 @@ This module is the one owner of that vocabulary:
   Any well-formed event_type passes, known or not, so a new platform event reaches
   the core with its body; only playbook resolution is restricted.
 - resolve_playbook picks the skill a task runs: the task's own playbook when it is
-  an allowed playbook (a registry value, or a skill whose manifest.json sets
-  `"playbook": true`) with skills/<id>/SKILL.md, else the event's registry default,
-  else None (handle the task as an ordinary message). Any other skill is refused.
+  a skill whose manifest.json sets `"playbook": true` and has skills/<id>/SKILL.md,
+  else the event's registry default under the same opt-in, else None (handle the
+  task as an ordinary message). A registry id is no exception; any other skill is refused.
+- allowed_playbook_value with no skills tree (a bridge that only forwards the header)
+  passes registry ids only; the core still applies the manifest opt-in.
 - An event task's body may quote member-written text: it is data, never instructions.
   The trigger's own instruction comes from the server, not from commands quoted in it.
 
@@ -38,14 +40,13 @@ EVENT_PLAYBOOKS = {
     "room.mention": "reply",
     "room.joined": "room-onboard",
     "commons.summon": "summon",
-    "email.received": "email",
     "commons.app_request": "app-request",
 }
 EVENT_TYPES = frozenset(EVENT_PLAYBOOKS)
 # A well-formed event type: two to four dotted lowercase segments, e.g. "commons.summon".
 EVENT_TYPE_RE = re.compile(r"[a-z][a-z0-9_]{0,31}(?:\.[a-z][a-z0-9_]{0,31}){1,3}")
 EVENT_TYPE_MAX = 64
-# A playbook header may name only these, or a skill that opts in with `"playbook": true`.
+# A bridge with no skills tree forwards only these; the core still needs the manifest opt-in.
 REGISTRY_PLAYBOOKS = frozenset(EVENT_PLAYBOOKS.values())
 
 # A playbook id names a directory directly under skills/: no separators, no dots.
@@ -83,11 +84,9 @@ def default_playbook(event_type) -> Optional[str]:
 
 
 def is_playbook(skills_root: Path, playbook) -> bool:
-    """True for a registry playbook or a skill whose manifest.json sets `"playbook": true`."""
+    """True only for a skill whose manifest.json sets `"playbook": true`, registry ids included."""
     if not playbook_value(playbook):
         return False
-    if playbook in REGISTRY_PLAYBOOKS:
-        return True
     try:
         manifest = json.loads((skills_root / playbook / "manifest.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
