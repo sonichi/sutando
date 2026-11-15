@@ -694,9 +694,18 @@ def strip_limit_banners(capture: str) -> str:
     return "\n".join(ln for i, ln in enumerate(lines) if i < first_below or not _limit_row(ln))
 
 
+def signed_in_after_limit(capture: Optional[str], runtime: Optional[str] = None) -> bool:
+    """The CLI signed in again ("Login successful", or work it did) after the pane's last
+    limit row: the limit belongs to the account /login replaced, not to the seat now."""
+    lines = [_SGR.sub("", ln) for ln in (capture or "").splitlines()]
+    last = max((i for i, ln in enumerate(lines) if _limit_row(ln)), default=None)
+    return last is not None and signed_in_since("\n".join(lines[last + 1:]), runtime)
+
+
 def limit_is_stale(abn, workspace, socket, session, probe=False, capture=None, baseline=None) -> bool:
     """A quota-only banner is a line from before the reset, scrollback, not a hold, when
-    the seat shows it is not held: a turn is in flight above the composer, the newest turn
+    the seat shows it is not held: a turn is in flight above the composer, the CLI signed in
+    again after the limit (signed_in_after_limit), the newest turn
     finished since `baseline` (limit_baseline of the first capture showing the banner) ran,
     or a FRESH proxy record says accepted for a seat ROUTED through that proxy. A newest
     turn that was refused holds whatever the record says. Anything else keeps the hold --
@@ -708,6 +717,8 @@ def limit_is_stale(abn, workspace, socket, session, probe=False, capture=None, b
     if any(n not in PROVIDER_LIMIT_PATTERNS for n in abn.names):
         return False
     if turn_in_flight(capture):
+        return True
+    if signed_in_after_limit(capture):
         return True
     if capture is not None and baseline is not None:
         new = [ran for key, ran in _turns(capture) if key not in baseline.seen]

@@ -1,0 +1,40 @@
+{
+  "app": "Tracker",
+  "summary": "Work items with a status, an owner and a due date; an agent can be summoned on a row.",
+  "databases": [
+    {
+      "name": "Tracker — Items",
+      "template": "blank",
+      "role": "primary",
+      "props": [
+        {
+          "name": "Status",
+          "type": "status",
+          "options": [
+            { "name": "Requested", "group": "todo" },
+            { "name": "Working", "group": "doing" },
+            { "name": "Done", "group": "done" },
+            { "name": "Blocked", "group": "doing" }
+          ]
+        },
+        { "name": "Owner", "type": "person" },
+        { "name": "Due", "type": "date" },
+        { "name": "Notes", "type": "text" },
+        { "name": "Outcome", "type": "text", "filled_by": "agent" },
+        { "name": "Actor", "type": "person", "note": "Name an agent here to summon it on this row. Leave empty on rows anyone may create." },
+        { "name": "Created by", "type": "created_by" }
+      ],
+      "views": [
+        { "layout": "table", "name": "All items" },
+        { "layout": "board", "name": "By status", "groupBy": "Status" }
+      ],
+      "summon_policy": "owner"
+    }
+  ],
+  "agent_hook": "summon-on-row",
+  "notes": [
+    "The title column is created by the blank template; read its name from databases.list, never assume it.",
+    "Outcome is the agent's column: a change that touches only Status or Outcome does not re-summon.",
+    "Leave Actor empty unless the owner asks for an agent on the row, and leave summon_policy at owner."
+  ]
+}

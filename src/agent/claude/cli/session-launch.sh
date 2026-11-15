@@ -120,9 +120,8 @@ claude_named_session_running() {
 resolve_claude_cwd_args() {
   CWD_ARGS=()
   if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
-    _cwd_exp="${SUTANDO_CLAUDE_WORKING_DIR/#\~/$HOME}"
-    mkdir -p "$_cwd_exp" || { echo "  ✗ can't create working dir: $_cwd_exp" >&2; exit 1; }
-    SUTANDO_CLAUDE_WORKING_DIR="$(cd "$_cwd_exp" && pwd -P)"
+    . "$REPO/scripts/core-working-dir.sh"
+    SUTANDO_CLAUDE_WORKING_DIR="$(sutando_core_working_dir "$REPO")" || { echo "  ✗ SUTANDO_CLAUDE_WORKING_DIR rejected — not launching the core there" >&2; exit 1; }
     export SUTANDO_CLAUDE_WORKING_DIR
     CWD_ARGS=(-c "$SUTANDO_CLAUDE_WORKING_DIR")
     echo "  ✓ working dir: $SUTANDO_CLAUDE_WORKING_DIR"
@@ -361,6 +360,24 @@ claude_version_at_least() {
   return 0
 }
 
+# Prints the first word of `$1 --version`; a probe still running after ~5s prints nothing and is
+# killed and reaped. A file, not a pipe, so a hung probe's open stdout cannot hold the caller.
+claude_probe_version() {
+  local out pid i=0
+  out="$(mktemp "${TMPDIR:-/tmp}/claude-version.XXXXXX")" || return 0
+  "$1" --version >"$out" 2>/dev/null </dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null; sleep 0.2; kill -KILL "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+  else
+    wait "$pid" 2>/dev/null
+    awk 'NR==1 {print $1}' "$out"
+  fi
+  rm -f "$out"
+}
+
 # With $1 = "1": --plugin-dir for the task-watch Mod and TASK_WATCH_MOD=1, gated on CLAUDE_BIN,
 # the claude the session's PATH resolves, which the launch then runs. Reads REPO.
 add_task_watch_mod() {
@@ -370,8 +387,8 @@ add_task_watch_mod() {
   local dir="$REPO/src/agent/claude/task-watch-mod" min have
   CLAUDE_BIN="$(PATH="$(claude_pane_path)"; hash -r; command -v claude 2>/dev/null)" || CLAUDE_BIN=""
   case "$CLAUDE_BIN" in /*) ;; *) CLAUDE_BIN="" ;; esac
-  min="$(sed -n "s/^export const MIN_CLAUDE_VERSION = '\([0-9.]*\)'.*/\1/p" "$dir/hooks/version.ts" 2>/dev/null)"
-  have="$([ -n "$CLAUDE_BIN" ] && "$CLAUDE_BIN" --version 2>/dev/null | awk 'NR==1 {print $1}')"
+  min="$(sed -n "s/^export const MIN_CLAUDE_VERSION = '\([0-9.]*\)'.*/\1/p" "$dir/hooks/version.ts" 2>/dev/null)" || min=""
+  have="$([ -n "$CLAUDE_BIN" ] && claude_probe_version "$CLAUDE_BIN")" || have=""
   if [ -z "$min" ] || [ -z "$have" ] || ! claude_version_at_least "$have" "$min"; then
     echo "task-watch Mod: Claude Code ${have:-unknown} is not at least ${min:-unknown}; this session keeps the Monitor watcher" >&2
     return 0
@@ -424,8 +441,8 @@ repair_claude_hook_paths() {
   [ -n "${PY:-}" ] && [ -f "$REPO/src/claude_hooks_settings.py" ] || return 0
   local _dirs=("$REPO") _wd _d _args=()
   if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
-    _wd="${SUTANDO_CLAUDE_WORKING_DIR/#\~/$HOME}"
-    [ -d "$_wd" ] && _dirs+=("$(cd "$_wd" && pwd -P)")
+    . "$REPO/scripts/core-working-dir.sh"
+    _wd="$(sutando_core_working_dir "$REPO")" && _dirs+=("$_wd")
   fi
   for _d in "${_dirs[@]}"; do
     _args+=(--settings "$_d/.claude/settings.json" --settings "$_d/.claude/settings.local.json")

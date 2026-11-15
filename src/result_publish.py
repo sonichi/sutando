@@ -11,7 +11,7 @@ only what to say and where. The staged name starts with a dot and ends in
 `.tmp`, so no drain's `*.txt` glob can match it, and it is unique per call so
 two publishers of one name never rename each other's bytes. Shell writers use
 the CLI: `python3 src/result_publish.py <path>` with the body on stdin.
-`--title`/`--outcome` publish the result's Activity labels first, bound to this body
+`--title`/`--outcome`/`--parent` publish the result's Activity labels first, bound to this body
 (`result_labels`); a `[no-send]` reason is the outcome when none is given.
 Publishing a task's live `results/` body clears that task's delegation marker
 (`task_delegation`), best effort: the hand-off it recorded has ended.
@@ -126,6 +126,19 @@ def _helpers():
     return local_task_protocol, result_markers, task_archive, workspace_default
 
 
+def worker_published_path(path: str | Path, environ=None) -> Path:
+    """Where this session publishes `path`: a proactive file from a pool worker's session that acts as
+    its own agent carries the worker's stamp (`connections.session_proactive_name`), so only that
+    worker's lane delivers it. The core's session, a worker acting through the core, a copy of this
+    module without the engine's `connections`, and every task result publish under the name given."""
+    path = Path(path)
+    try:
+        import connections
+    except ImportError:
+        return path
+    return path.with_name(connections.session_proactive_name(path.name, environ))
+
+
 def _unrouted_cron_task(path: str | Path) -> str | None:
     """The task id when `path` is the live result of a `source: cron` task naming no destination.
 
@@ -215,11 +228,11 @@ def _no_send_reason(text: str) -> str:
     return text[at + len("[no-send]"):] if at >= 0 else ""
 
 
-def result_labels_for(text: str, title=None, outcome=None) -> "tuple[dict, list]":
-    """(labels, notes) for a body: each flag fitted to its limit, with a note when cut; a
-    `[no-send]` body with no --outcome takes its reason as the outcome."""
+def result_labels_for(text: str, title=None, outcome=None, parent=None) -> "tuple[dict, list]":
+    """(labels, notes) for a body: each flag fitted to its limit, with a note when cut or not a
+    task id; a `[no-send]` body with no --outcome takes its reason as the outcome."""
     labels_mod = _labels_module()
-    labels, notes = labels_mod.check(title, outcome)
+    labels, notes = labels_mod.check(title, outcome, parent)
     if "outcome" not in labels and not labels_mod.clean(outcome):
         reason = labels_mod.fit(_no_send_reason(text), labels_mod.OUTCOME_MAX)
         if reason:
@@ -227,18 +240,19 @@ def result_labels_for(text: str, title=None, outcome=None) -> "tuple[dict, list]
     return labels, notes
 
 
-_USAGE = ("usage: result_publish.py [--allow-undeliverable] [--title TEXT] [--outcome TEXT] <path>"
+_USAGE = ("usage: result_publish.py [--allow-undeliverable] [--title TEXT] [--outcome TEXT]"
+          " [--parent TASK_ID] <path>"
           "   (body on stdin)")
 
 
 def _parse(args: list[str]):
-    """(path, allow, title, outcome), or None for a malformed command line."""
+    """(path, allow, title, outcome, parent), or None for a malformed command line."""
     allow, flags, paths = False, {}, []
     it = iter(args)
     for a in it:
         if a == "--allow-undeliverable":
             allow = True
-        elif a in ("--title", "--outcome"):
+        elif a in ("--title", "--outcome", "--parent"):
             value = next(it, None)
             if value is None or a in flags:
                 return None
@@ -249,7 +263,7 @@ def _parse(args: list[str]):
             paths.append(a)
     if len(paths) != 1:
         return None
-    return paths[0], allow, flags.get("--title"), flags.get("--outcome")
+    return paths[0], allow, flags.get("--title"), flags.get("--outcome"), flags.get("--parent")
 
 
 def main(argv: list[str]) -> int:
@@ -257,7 +271,12 @@ def main(argv: list[str]) -> int:
     if parsed is None:
         print(_USAGE, file=sys.stderr)
         return 2
-    path, allow, title, outcome = parsed
+    path, allow, title, outcome, parent = parsed
+    stamped = worker_published_path(path)
+    if stamped.name != Path(path).name:
+        print(f"result_publish: publishing {Path(path).name} as {stamped.name}: a pool worker's "
+              "proactive file carries its worker's stamp, so its own lane delivers it", file=sys.stderr)
+        path = str(stamped)
     text = sys.stdin.read()
     reason = None if allow else undeliverable_reason(path, text)
     if reason:
@@ -278,18 +297,18 @@ def main(argv: list[str]) -> int:
         labels_mod = _labels_module()
     except ImportError:
         # Labels are optional: a copy without its label writer still publishes the result.
-        if title is not None or outcome is not None:
+        if title is not None or outcome is not None or parent is not None:
             print("result_publish: warning: no result_labels module; published without "
-                  "--title/--outcome", file=sys.stderr)
+                  "--title/--outcome/--parent", file=sys.stderr)
         publish_text(path, text)
         return 0
-    labels, notes = result_labels_for(text, title, outcome)
+    labels, notes = result_labels_for(text, title, outcome, parent)
     for note in notes:
         print(f"result_publish: warning: {note}", file=sys.stderr)
     try:
         labels_mod.write(Path(path), labels, text)
     except Exception as exc:  # noqa: BLE001 — labels are optional; the result never waits on them
-        print(f"result_publish: warning: published without --title/--outcome: {exc}",
+        print(f"result_publish: warning: published without --title/--outcome/--parent: {exc}",
               file=sys.stderr)
     publish_text(path, text)
     return 0

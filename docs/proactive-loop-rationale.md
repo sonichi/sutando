@@ -33,6 +33,14 @@ entry. Autonomy pause and self-development settings do not exempt the health
 pass. These checks diagnose missing configuration; they do not recreate a driver
 or modify the host's schedules.
 
+The loop is also the one session cron that can never be made to yield to queued
+owner work: `/schedule-crons` registers every other `crons.json` entry that
+fires more than once a day behind the cron gate's check preamble (see that
+skill's "Defer crons" section; a daily-or-rarer entry is not gated unless it
+sets `"gate": true`) so a scheduled job stops when owner tasks are waiting, and
+the loop is exempt because it is what drains that queue — gating it would
+deadlock the owner's own messages.
+
 The archived rationale below predates this completion contract where it refers
 to ordinary `idle` as the final pass command.
 

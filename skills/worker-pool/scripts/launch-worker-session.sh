@@ -51,13 +51,22 @@ resolve_claude_py
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:?launch-worker-session.sh needs SUTANDO_TMUX_SESSION (spawn_worker.py always sets it)}"
 : "${SUTANDO_INSTANCE_ID:?launch-worker-session.sh needs SUTANDO_INSTANCE_ID (spawn_worker.py always sets it)}"
+# Every worker's watcher needs the pool delivery writer: refuse before anything below
+# queries tmux. The --print-env probe may still inspect an incomplete env.
+if [ "${1:-}" != "--print-env" ] && {
+     [ -z "${SUTANDO_POOL_DELIVERY_SCRIPT:-}" ] || \
+     [ ! -f "$SUTANDO_POOL_DELIVERY_SCRIPT" ] || \
+     [ ! -r "$SUTANDO_POOL_DELIVERY_SCRIPT" ]; }; then
+  echo "launch-worker-session.sh needs SUTANDO_POOL_DELIVERY_SCRIPT to name a readable file" >&2
+  exit 2
+fi
 # A worker never gets the owner-facing surfaces (remote control, Chrome) —
 # those are the canonical core's alone.
 SURFACE_ARGS=()
 add_skill_claude_plugins
-# Opt-in per spawn: SUTANDO_TASK_WATCH_MOD_WORKER=1 runs this worker's watcher in the
-# task-watch Mod instead of a Monitor (docs/task-watcher-hosting-modes.md).
-add_task_watch_mod "${SUTANDO_TASK_WATCH_MOD_WORKER:-}"
+# On by default: the task-watch Mod hosts this worker's watcher instead of a Monitor;
+# SUTANDO_TASK_WATCH_MOD_WORKER=0 opts out (docs/task-watcher-hosting-modes.md).
+add_task_watch_mod "${SUTANDO_TASK_WATCH_MOD_WORKER:-1}"
 # `/startup --worker` is the pool worker's own boot ceremony (orphan recovery
 # and session crons are core-only; the worker gate is what it runs instead).
 BOOT_PROMPT="/startup --worker"
@@ -123,6 +132,10 @@ if [ -n "$PY" ] && [ -x "$PY" ]; then
   [ -n "$WORKER_PY" ] && [ -x "$WORKER_PY" ] || WORKER_PY=""
 fi
 ENV_ARGS+=(-e "SUTANDO_PY=$WORKER_PY")
+# The seat's s-space MCP proxy asks this resolver whose agent to mint as; the token stays in the vault.
+. "$REPO/skills/worker-pool/scripts/worker-mcp-credential.sh"
+MCP_WORKER_CREDENTIAL="$(worker_mcp_credential "$REPO" "$WORKER_PY" "${SUTANDO_WORKER_ID:-$SUTANDO_INSTANCE_ID}" "${SUTANDO_WORKSPACE_DIR:-}")"
+ENV_ARGS+=(-e "AG2_MCP_WORKER_CREDENTIAL=$MCP_WORKER_CREDENTIAL")
 # Forward the embedder-provided default workspace for the same reason as
 # above (tmux takes the server env, not this shell's).
 [ -n "${SUTANDO_DEFAULT_WORKSPACE:-}" ] && ENV_ARGS+=(-e "SUTANDO_DEFAULT_WORKSPACE=$SUTANDO_DEFAULT_WORKSPACE")
@@ -142,16 +155,6 @@ fi
 if [ "${1:-}" = "--print-env" ]; then
   printf '%s\n' ${ENV_ARGS[@]+"${ENV_ARGS[@]}"}
   exit 0
-fi
-
-# The watcher sees SUTANDO_INSTANCE_ID in every worker session and therefore
-# requires the pool delivery writer. Fail before creating a session that could
-# receive tasks but cannot safely acknowledge them.
-if [ -z "${SUTANDO_POOL_DELIVERY_SCRIPT:-}" ] || \
-   [ ! -f "$SUTANDO_POOL_DELIVERY_SCRIPT" ] || \
-   [ ! -r "$SUTANDO_POOL_DELIVERY_SCRIPT" ]; then
-  echo "launch-worker-session.sh needs SUTANDO_POOL_DELIVERY_SCRIPT to name a readable file" >&2
-  exit 2
 fi
 
 # Same onboarding/hooks treatment a core launch gets: a worker is also

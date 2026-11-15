@@ -253,6 +253,15 @@ class LauncherWiring(unittest.TestCase):
         self.assertLess(repair, src.index("\ninstall_claude_personal_hook\n"))
 
     def test_the_launcher_function_repairs_both_project_settings(self):
+        self._repair_with_working_dir(lambda tmp: str(tmp / "stable-work"))
+
+    def test_a_tilde_working_dir_resolves_through_the_shared_resolver(self):
+        self._repair_with_working_dir(lambda tmp: "~/stable-work")
+
+    def test_a_refused_working_dir_is_skipped_and_never_created(self):
+        self._repair_with_working_dir(lambda tmp: "~nobody/stable-work", work_repaired=False)
+
+    def _repair_with_working_dir(self, wd_value, work_repaired=True):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             new = tmp / "new root" / "sutando"
@@ -261,6 +270,9 @@ class LauncherWiring(unittest.TestCase):
                 (new / rel).write_text("#!/bin/bash\n")
             (new / "src" / "claude_hooks_settings.py").write_text(
                 (REPO / "src" / "claude_hooks_settings.py").read_text())
+            (new / "scripts").mkdir(parents=True, exist_ok=True)
+            (new / "scripts" / "core-working-dir.sh").write_text(
+                (REPO / "scripts" / "core-working-dir.sh").read_text())
             work = tmp / "stable-work"
             old = str(tmp / "old root" / "sutando")
             stop = {"hooks": {"Stop": [group(owned(old)["Stop"])]}}
@@ -271,12 +283,14 @@ class LauncherWiring(unittest.TestCase):
                       f'PY={shlex.quote(sys.executable)}; repair_claude_hook_paths')
             r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
                                env={"PATH": "/usr/bin:/bin", "HOME": str(tmp),
-                                    "SUTANDO_CLAUDE_WORKING_DIR": str(work)})
+                                    "SUTANDO_CLAUDE_WORKING_DIR": wd_value(tmp)})
             self.assertEqual(r.returncode, 0, r.stderr)
-            for path in (new / ".claude" / "settings.json", work / ".claude" / "settings.local.json"):
+            for path, want in ((new / ".claude" / "settings.json", new),
+                               (work / ".claude" / "settings.local.json", new if work_repaired else old)):
                 data = json.loads(path.read_text())
                 self.assertEqual(data["hooks"]["Stop"][0]["hooks"][0]["command"],
-                                 owned(str(new))["Stop"], path.name)
+                                 owned(str(want))["Stop"], path.name)
+            self.assertFalse((tmp / "nobody").exists(), "~user must not become $HOME/user")
 
 
 if __name__ == "__main__":

@@ -10,6 +10,15 @@ mkdir -p "$REPO/src" "$REPO/scripts" "$TMP/bin" "$TMP/home"
 cp "$REPO_REAL/src/startup-runtime.sh" "$REPO/src/startup-runtime.sh"
 # startup-runtime.sh sources its sibling resolver; a staged repo needs both.
 cp "$REPO_REAL/src/repo_root.sh" "$REPO/src/repo_root.sh"
+# The Codex home is resolved by the shared owner from the repo's real config.
+mkdir -p "$REPO/src/agent/codex"
+for f in src/agent/codex/codex-home.sh src/codex_home.py src/codex_host_instructions.py \
+         src/sutando_config.py scripts/python-binary.sh; do
+  cp "$REPO_REAL/$f" "$REPO/$f"
+done
+touch "$REPO/src/__init__.py"
+printf '{"workspace": {"path": "%s"}, "core_config_dirs": [{"id": "x", "type": "codex", "env_name": "CODEX_HOME", "synced": false, "value": "%s"}]}\n' \
+  "$TMP/workspace" "$TMP/codex-home" > "$REPO/sutando.config.json"
 
 cat > "$REPO/scripts/sutando-config.sh" <<'SH'
 #!/bin/bash
