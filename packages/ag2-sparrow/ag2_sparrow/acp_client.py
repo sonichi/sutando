@@ -1,6 +1,6 @@
 """A minimal Agent Client Protocol client over a child's stdio. Stdlib only.
 
-This process is the ACP Client; the adapter's agent command (`openclaw acp`, `gemini --acp`, ...) is the ACP
+This process is the ACP Client; the adapter's agent command (`openclaw acp`, `agy acp`, ...) is the ACP
 Agent. The wire is
 newline-delimited JSON-RPC 2.0. The client offers no filesystem or terminal methods: the agent does its
 own I/O and asks through `session/request_permission`, which `on_permission` answers. Every

@@ -848,13 +848,13 @@ over the Agent Client Protocol, resumes that room's Session, and OpenClaw answer
 `ag2-sparrow-codex-local`'s do. See
 [`ag2_sparrow/adapters/openclaw/README.md`](ag2_sparrow/adapters/openclaw/README.md).
 
-## Gemini CLI agents (`ag2-sparrow[gemini]`)
+## Antigravity agents (`ag2-sparrow[antigravity]`)
 
-`ag2-sparrow-gemini-local` hosts Gemini CLI (`--runtime antigravity`: Antigravity's `agy`) as an agent:
-for each task Sparrow queues it wakes `gemini --acp` over the Agent Client Protocol, resumes that room's
-Session, and posts the turn's final message (`NO_REPLY` posts nothing). `install` refuses until Gemini
-CLI is signed in on the machine; `install` and `verify` otherwise work as `ag2-sparrow-codex-local`'s
-do. See [`ag2_sparrow/adapters/gemini/README.md`](ag2_sparrow/adapters/gemini/README.md).
+`ag2-sparrow-antigravity-local` hosts Google's Antigravity CLI (`agy`) as an agent: for each task Sparrow
+queues it wakes `agy acp` over the Agent Client Protocol, resumes that room's Session, and posts the turn's
+final message (`NO_REPLY` posts nothing). `install` refuses until agy is signed in on the machine;
+`install` and `verify` otherwise work as `ag2-sparrow-codex-local`'s do. See
+[`ag2_sparrow/adapters/antigravity/README.md`](ag2_sparrow/adapters/antigravity/README.md).
 
 ## Optional: room-event subscription (0.3.0)
 

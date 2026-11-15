@@ -101,7 +101,7 @@ OWNED_STEPS = {"adapters/claude_code/hold.py": HOLDER_STEPS + WORDS + SHIM,
                "adapters/claude_code/launcher.py": HOLDER_STEPS + SHIM,
                "adapters/codex/connect_cli.py": HOLDER_STEPS + WORDS + SHIM,
                "adapters/openclaw/cli.py": HOLDER_STEPS + WORDS + SHIM,
-               "adapters/gemini/cli.py": HOLDER_STEPS + WORDS + SHIM}
+               "adapters/antigravity/cli.py": HOLDER_STEPS + WORDS + SHIM}
 LAUNCHER_SIDE = tuple(OWNED_STEPS)
 DELEGATES = {"adapters/claude_code/hold.py": ("cm.hold_and_supervise(", "cm.supervise_child("),
              "adapters/claude_code/cli.py": ("cm.holder_words(", "cm.occupancy_line(", "cm.run_child_argv("),
@@ -109,8 +109,8 @@ DELEGATES = {"adapters/claude_code/hold.py": ("cm.hold_and_supervise(", "cm.supe
                                                "cm.occupancy_line(", "cm.run_launchd(", "cm.run_child_argv("),
              "adapters/openclaw/cli.py": ("cm.hold_and_supervise(", "cm.supervise_child(", "cm.holder_words(",
                                          "cm.occupancy_line(", "cm.run_launchd(", "cm.run_child_argv("),
-             "adapters/gemini/cli.py": ("cm.hold_and_supervise(", "cm.supervise_child(", "cm.holder_words(",
-                                       "cm.occupancy_line(", "cm.run_launchd(", "cm.run_child_argv(")}
+             "adapters/antigravity/cli.py": ("cm.hold_and_supervise(", "cm.supervise_child(", "cm.holder_words(",
+                                            "cm.occupancy_line(", "cm.run_launchd(", "cm.run_child_argv(")}
 
 
 def direct_imports(text, steps):
@@ -123,7 +123,7 @@ def direct_imports(text, steps):
 
 # One owner, connect_bridge: the agent bridge's launch env, its unit or declaration, and connect's
 # redemption into the seat. Neither -local adapter builds any of them itself.
-BRIDGE_ADAPTERS = ("claude_code", "codex", "openclaw", "gemini")
+BRIDGE_ADAPTERS = ("claude_code", "codex", "openclaw", "antigravity")
 BRIDGE_CALLS = {"seat_bridge_environ", "write_bridge_declaration", "remove_bridge_declaration", "render_supervisor",
                 "start_supervisor", "stop_supervisor", "write_seat_credentials", "write_seat", "redeem_code",
                 "read_code", "relay_problem", "code_problem"}
@@ -136,8 +136,8 @@ BRIDGE_DELEGATES = {"adapters/claude_code/cli.py": ("cb.wire_bridge(", "cb.wire_
                                                       "cb.host_problem(", "cb.agent_root(", "cb.bridge_shape(LOCAL)"),
                     "adapters/openclaw/cli.py": ("cb.wire_bridge_bound(", "cb.unwire_bridge(", "cb.host_problem(",
                                                  "cb.agent_root(", "cb.bridge_shape(local)"),
-                    "adapters/gemini/cli.py": ("cb.wire_bridge_bound(", "cb.unwire_bridge(", "cb.host_problem(",
-                                               "cb.agent_root(", "cb.bridge_shape(local)")}
+                    "adapters/antigravity/cli.py": ("cb.wire_bridge_bound(", "cb.unwire_bridge(", "cb.host_problem(",
+                                                    "cb.agent_root(", "cb.bridge_shape(local)")}
 
 
 def bridge_builders(tree):
@@ -176,7 +176,7 @@ class SharedAgentBridge(unittest.TestCase):
 
 # One owner, held_start: how a connector run --held under a launcher enters the held root and waits to be attached.
 HELD_CONNECTORS = ("adapters/codex/codex_connector.py", "adapters/openclaw/openclaw_connector.py",
-                   "adapters/gemini/gemini_connector.py")
+                   "adapters/antigravity/antigravity_connector.py")
 HELD_OWNED = ("os.fchdir(", "holder_consumer(", "start_time(os.getpid())")
 
 
@@ -191,7 +191,8 @@ class SharedHeldStart(unittest.TestCase):
 
 
 # One owner, acp_host: the ACP turn, the Session store and the permission policy every ACP connector uses.
-ACP_CONNECTORS = ("adapters/openclaw/openclaw_connector.py", "adapters/gemini/gemini_connector.py")
+ACP_CONNECTORS = ("adapters/openclaw/openclaw_connector.py",
+                  "adapters/antigravity/antigravity_connector.py")
 ACP_OWNED = ('"session/prompt"', '"session/new"', "class SessionStore", "class Turn", "def request_paths(",
              "def at_or_above_home(", "def task_framing(")
 

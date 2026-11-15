@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""`ag2-sparrow-gemini-local`: host Gemini CLI (or Antigravity) on this machine as an s.space agent.
+"""`ag2-sparrow-antigravity-local`: host Antigravity CLI (`agy`) on this machine as an s.space agent.
 
 `install` checks that the ACP command answers and is signed in (refused otherwise), records it, the
-runtime, the Session working directory and the session store in a 0600 marked config, writes the marked
+Session working directory and the session store in a 0600 marked config, writes the marked
 unit (a systemd user unit on Linux, a launchd agent on macOS) and requires the managed launcher to hold
 the work root; `run` is what the manager runs: connect_common's holder sequence starts the connector as
 its direct child with `--held`. `verify` checks each part, the sign-in included; `uninstall` removes only
 what install wrote; `list` shows the jobs. The lifecycle is connect_common's and the agent's own bridge is
 connect_bridge's, as for codex-local and openclaw. With `--token-env-file` (or `--token-stdin`) and no
-`--work`, the root is the agent's own and install also wires its bridge. The Gemini sign-in stays in
-~/.gemini: nothing copies it. Stdlib only.
+`--work`, the root is the agent's own and install also wires its bridge. The Antigravity sign-in stays
+where agy keeps it (the macOS Keychain): nothing copies it. Stdlib only.
 """
 from __future__ import annotations
 
@@ -26,19 +26,19 @@ from ... import _dirs, connect_bridge as cb, connect_common as cm, task_io
 from ...acp_client import AUTH_REQUIRED, AcpError
 from ...connect_bridge import EXTERNAL, UNIT
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, Shape
-from . import gemini_connector as gc
+from . import antigravity_connector as gc
 
-SHAPE = "gemini-local"
-COMMAND = "ag2-sparrow-gemini-local"
+SHAPE = "antigravity-local"
+COMMAND = "ag2-sparrow-antigravity-local"
 ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "TMPDIR", "SHELL")
-REQUIRED_KEYS = ("RUNTIME", "ACP_COMMAND", "CWD", "INBOX_DIR", "RESULTS_DIR")
-CONFIG_KEYS = ("RUNTIME", "ACP_COMMAND", "CWD", "SESSION_STORE", "INBOX_DIR", "RESULTS_DIR",
+REQUIRED_KEYS = ("ACP_COMMAND", "CWD", "INBOX_DIR", "RESULTS_DIR")
+CONFIG_KEYS = ("ACP_COMMAND", "CWD", "SESSION_STORE", "INBOX_DIR", "RESULTS_DIR",
                "ALLOW_NON_OWNER") + cb.CONFIG_KEYS
-LOCAL = Shape(name=SHAPE, command=COMMAND, description="Gemini CLI on Sparrow",
-              cli="Gemini CLI", min_version=(0, 0, 0), version_anchor=r"^\d",
+LOCAL = Shape(name=SHAPE, command=COMMAND, description="Antigravity CLI on Sparrow",
+              cli="Antigravity CLI", min_version=(0, 0, 0), version_anchor=r"^\d",
               version_note="the ACP wake and the sign-in are checked by verify, not by a version",
               required_keys=REQUIRED_KEYS, config_keys=CONFIG_KEYS, env_keep=ENV_KEEP,
-              kept="the Gemini sign-in (~/.gemini) and the session store with every room's session id",
+              kept="the Antigravity sign-in (agy's own, in the Keychain) and the session store with every room's session id",
               run_args=("run", "--launchd"), keep_alive_on_success=False)
 WORK_DIRS = ("tasks", "results", "state", "workspace")
 DEFAULT_CWD = "workspace"   # under the work root: the Session directory when --cwd is not given
@@ -54,21 +54,20 @@ def load_config(shape: Shape = LOCAL) -> "tuple[dict, str]":
     return cm.load_config(shape)
 
 
-def acp_command(runtime: str, acp: "str | None") -> "tuple[str, str]":
+def acp_command(acp: "str | None") -> "tuple[str, str]":
     """(the ACP command line with its executable made absolute, '') or ('', why)."""
-    argv = shlex.split(acp or gc.RUNTIMES[runtime][1])
+    argv = shlex.split(acp or gc.DEFAULT_ACP_COMMAND)
     if not argv:
         return "", "--acp-command is empty"
     exe = shutil.which(argv[0])
     if not exe:
-        name = gc.RUNTIMES[runtime][0]
-        return "", f"{argv[0]} is not on PATH; install {name} (or pass --acp-command with its full path)"
+        return "", (f"{argv[0]} is not on PATH; install Antigravity CLI (curl -fsSL "
+                    "https://antigravity.google/cli/install.sh | bash) or pass --acp-command with its full path")
     return shlex.join([os.path.abspath(exe)] + argv[1:]), ""
 
 
 def child_env(cfg: dict, environ=None) -> dict:
-    """The allowlist, the ACP command's own directory first on PATH, and the package root for `-m`; the
-    connector adds GEMINI_CLI_NO_RELAUNCH for the agent it spawns."""
+    """The allowlist, the ACP command's own directory first on PATH, and the package root for `-m`."""
     env = cm.child_env_from(ENV_KEEP, environ)
     rest = [p for p in env.get("PATH", "/usr/bin:/bin").split(os.pathsep) if p]
     first = os.path.dirname(shlex.split(cfg["ACP_COMMAND"])[0])
@@ -79,7 +78,7 @@ def child_env(cfg: dict, environ=None) -> dict:
 
 def connector_argv(cfg: dict, root: str, root_fd: int) -> list:
     argv = [sys.executable, "-m", gc.__name__, "--work", root, "--held", "--root-fd", str(root_fd),
-            "--runtime", cfg["RUNTIME"], "--acp-command", cfg["ACP_COMMAND"], "--cwd", cfg["CWD"]]
+            "--acp-command", cfg["ACP_COMMAND"], "--cwd", cfg["CWD"]]
     if cfg.get("SESSION_STORE"):
         argv += ["--session-store", cfg["SESSION_STORE"]]
     if cfg.get("ALLOW_NON_OWNER") == "1":
@@ -89,11 +88,10 @@ def connector_argv(cfg: dict, root: str, root_fd: int) -> list:
 
 def probe(cfg: dict, factory=gc.AcpClient, timeout: float = PROBE_TIMEOUT_S) -> "tuple[str, str]":
     """(what the agent said, '') when it answers `initialize` and opens a Session (so it is signed in), or ('', why
-    not). Gemini lists its sign-in methods at every `initialize`, signed in or not: only `session/new` tells."""
-    runtime = cfg.get("RUNTIME") or gc.DEFAULT_RUNTIME
-    with tempfile.TemporaryDirectory(prefix="ag2-sparrow-gemini-probe-") as cwd:
+    not). agy lists its sign-in methods at every `initialize`, signed in or not: only `session/new` tells."""
+    with tempfile.TemporaryDirectory(prefix="ag2-sparrow-antigravity-probe-") as cwd:
         try:
-            client = factory(shlex.split(cfg["ACP_COMMAND"]), cwd=cwd, env=gc.agent_env(child_env(cfg)))
+            client = factory(shlex.split(cfg["ACP_COMMAND"]), cwd=cwd, env=child_env(cfg))
         except OSError as e:
             return "", f"{cfg['ACP_COMMAND']} did not start ({e})"
         try:
@@ -101,7 +99,7 @@ def probe(cfg: dict, factory=gc.AcpClient, timeout: float = PROBE_TIMEOUT_S) -> 
             client.call("session/new", {"cwd": cwd, "mcpServers": []}, timeout)
         except AcpError as e:
             if e.code == AUTH_REQUIRED:
-                return "", gc.not_signed_in(runtime) % e
+                return "", gc.NOT_SIGNED_IN % e
             return "", f"{cfg['ACP_COMMAND']} did not answer ({e})"
         finally:
             client.close(5.0)
@@ -145,7 +143,7 @@ def resolve_root(args) -> "tuple[dict, str]":
     return {"root": root, "mode": mode, "agent_id": agent_id, "token_file": token_file}, problem
 
 
-RECORDED = (("RUNTIME", "runtime", str), ("ACP_COMMAND", "acp_command", str), ("CWD", "cwd", str),
+RECORDED = (("ACP_COMMAND", "acp_command", str), ("CWD", "cwd", str),
             ("SESSION_STORE", "session_store", str), ("ALLOW_NON_OWNER", "allow_non_owner", lambda v: v == "1"))
 
 
@@ -153,14 +151,14 @@ def signed_in_problem(args, acp: str) -> str:
     """'' when the agent answers and is signed in (checked once per install), else why not."""
     if getattr(args, "signed_in", False):
         return ""
-    _said, problem = probe({"RUNTIME": args.runtime, "ACP_COMMAND": acp})
+    _said, problem = probe({"ACP_COMMAND": acp})
     args.signed_in = not problem
     return problem
 
 
 def preflight(args) -> str:
     """'' when this host can run the agent, checked before the token is written; else why not."""
-    acp, problem = acp_command(args.runtime, args.acp_command)
+    acp, problem = acp_command(args.acp_command)
     return cb.host_problem(COMMAND) or problem or signed_in_problem(args, acp)
 
 
@@ -168,7 +166,7 @@ def install(args) -> int:
     if getattr(args, "token_stdin", False):
         return cb.install_token_stdin(args, LOCAL, lambda: preflight(args), install, COMMAND, work=None)
     problem = cb.recorded_install_args(args, LOCAL, RECORDED)
-    acp, why = ("", problem) if problem else acp_command(args.runtime, args.acp_command)
+    acp, why = ("", problem) if problem else acp_command(args.acp_command)
     why = why or signed_in_problem(args, acp)
     where, why = ({}, why) if why else resolve_root(args)
     if not why:
@@ -186,7 +184,7 @@ def install(args) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     bridge = cb.bridge_shape(local)
-    values = {"RUNTIME": args.runtime, "ACP_COMMAND": acp, "CWD": cwd or str(Path(root) / DEFAULT_CWD),
+    values = {"ACP_COMMAND": acp, "CWD": cwd or str(Path(root) / DEFAULT_CWD),
               "SESSION_STORE": str(Path(args.session_store).expanduser().resolve()) if args.session_store else "",
               "INBOX_DIR": str(Path(root) / "tasks"), "RESULTS_DIR": str(Path(root) / "results"),
               "ALLOW_NON_OWNER": "1" if args.allow_non_owner else "", "AGENT_ID": where["agent_id"],
@@ -299,7 +297,6 @@ def verify(args, factory=gc.AcpClient) -> int:
     for key in ("INBOX_DIR", "RESULTS_DIR"):
         cm.check(results, Path(cfg[key]).is_dir(), key.lower().replace("_dir", ""), cfg[key])
     store = cfg.get("SESSION_STORE") or str(Path(cm.work_root(cfg)) / "state" / gc.SESSIONS_NAME)
-    print(f"INFO runtime: {gc.RUNTIMES.get(cfg['RUNTIME'], ('?',))[0]}")
     print(f"INFO sessions: {store} (resumed per room; never retired)")
     print(f"INFO non-owner: {'served, no file operations (--allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '1' else 'refused unless attested collaborator'}")
     if cb.bridge_mode(cfg) != EXTERNAL:
@@ -330,9 +327,7 @@ def list_cmd(_args) -> int:
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def session_options(p) -> None:
-    p.add_argument("--runtime", choices=sorted(gc.RUNTIMES), default=gc.DEFAULT_RUNTIME,
-                   help="gemini (Gemini CLI, the default) or antigravity (agy; not yet checked live)")
-    p.add_argument("--acp-command", help="the ACP agent's command line (default: gemini --acp, or agy acp)")
+    p.add_argument("--acp-command", help="the ACP agent's command line (default: agy acp)")
     p.add_argument("--cwd", help="the Session working directory, where the owner's turns may read and edit "
                    "(default: <work root>/workspace)")
     p.add_argument("--session-store", help="the sessions.json to resume from and record to (default: the work "
@@ -342,7 +337,7 @@ def session_options(p) -> None:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog=COMMAND, description="Gemini CLI on this machine as an agent on "
+    ap = argparse.ArgumentParser(prog=COMMAND, description="Antigravity CLI (agy) on this machine as an agent on "
                                  "Sparrow, woken over ACP.")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("install", help="check the sign-in, record the settings, write the unit, have the manager "

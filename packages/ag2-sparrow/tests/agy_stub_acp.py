@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""A stand-in for `gemini --acp`: an ACP agent over stdio for the Gemini adapter tests.
+"""A stand-in for `agy acp`: an ACP agent over stdio for the Antigravity adapter tests.
 
-It behaves as Gemini CLI 0.59 measured on a real host: `initialize` always lists the sign-in methods, signed in
-or not; `session/new` fails with -32000 when not signed in; permission requests carry `locations` and no
-`rawInput`. Without GEMINI_CLI_NO_RELAUNCH=true it plays the relaunch race lost: the first copy read the request
-and the second never sees it, so nothing is answered. Its sign-in, session
+`initialize` and a signed-out `session/new` answer as agy 1.5.9 did on a real host: the sign-in methods are
+listed signed in or not, and `session/new` fails with -32000 "Authentication required". The permission
+requests (generic option ids picked by `kind`, `locations`, no `rawInput`) are assumed: no signed-in agy turn
+has been measured yet. Its sign-in, session
 and log files live under $HOME (the one variable the launcher's allowlist always passes): `signed-in` marks it
 signed in, `stub-sessions.json` keeps its sessions, `stub.log` records each request and permission outcome.
 A prompt marker picks the turn: STUB:TEXT, STUB:NOREPLY, STUB:MARKER, STUB:EDIT, STUB:SHELL, STUB:HANG.
@@ -43,19 +43,19 @@ def send(obj):
 
 
 def ask(session_id, tool_call):
-    """Ask the client as Gemini does (proceed_once / cancel option ids), wait for its answer; True when allowed."""
+    """Ask the client (option ids it must pick by kind), wait for its answer; True when allowed."""
     _next[0] += 1
     rid = _next[0]
     send({"jsonrpc": "2.0", "id": rid, "method": "session/request_permission",
           "params": {"sessionId": session_id, "toolCall": dict(tool_call, toolCallId="c-%d" % rid, status="pending"),
-                     "options": [{"optionId": "proceed_once", "name": "Allow once", "kind": "allow_once"},
-                                 {"optionId": "proceed_always", "name": "Allow always", "kind": "allow_always"},
-                                 {"optionId": "cancel", "name": "Deny", "kind": "reject_once"}]}})
+                     "options": [{"optionId": "opt-a1", "name": "Allow once", "kind": "allow_once"},
+                                 {"optionId": "opt-a2", "name": "Allow always", "kind": "allow_always"},
+                                 {"optionId": "opt-r1", "name": "Deny", "kind": "reject_once"}]}})
     for line in sys.stdin:
         m = json.loads(line)
         if m.get("id") == rid and "method" not in m:
             outcome = (m.get("result") or {}).get("outcome") or {}
-            allowed = outcome.get("optionId") == "proceed_once"
+            allowed = outcome.get("optionId") == "opt-a1"
             log({"permission": tool_call.get("title"), "allowed": allowed})
             return allowed
     return False
@@ -88,16 +88,12 @@ def prompt(rid, params):
         ask(sid, {"title": "rm -rf ~ [current working directory]", "kind": "execute", "locations": []})
         chunk(sid, "tried a command")
     else:
-        chunk(sid, "hello from gemini-stub")
+        chunk(sid, "hello from agy-stub")
     send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
 
 
 def main():
-    log({"argv": sys.argv[1:], "no_relaunch": os.environ.get("GEMINI_CLI_NO_RELAUNCH")})
-    if os.environ.get("GEMINI_CLI_NO_RELAUNCH") != "true":
-        for _ in sys.stdin:     # the request went to the copy that relaunched: nothing answers it
-            pass
-        return
+    log({"argv": sys.argv[1:]})
     for line in sys.stdin:
         m = json.loads(line)
         method, rid, params = m.get("method"), m.get("id"), m.get("params") or {}
@@ -107,14 +103,16 @@ def main():
             log({"method": method, "params": params})
         if method == "initialize":
             send({"jsonrpc": "2.0", "id": rid, "result": {
-                "protocolVersion": 1, "agentInfo": {"name": "gemini-cli", "title": "Gemini CLI", "version": "0.59.0"},
-                "agentCapabilities": {"loadSession": True},
+                "protocolVersion": 1, "agentInfo": {"name": "Antigravity ACP Server", "version": "1.5.9"},
+                "agentCapabilities": {"loadSession": True, "sessionCapabilities": {"load": {}, "resume": {}}},
                 "authMethods": [{"id": "oauth-personal", "name": "Log in with Google"},
-                                {"id": "gemini-api-key", "name": "Gemini API key"}]}})
+                                {"id": "oauth-business", "name": "Log in with Gemini Enterprise"},
+                                {"id": "gemini-api-key", "name": "Gemini API key"},
+                                {"id": "agent-platform", "name": "Gemini Enterprise Agent Platform"}]}})
         elif method == "session/new":
             if not os.path.exists(os.path.join(HOME, "signed-in")):
                 send({"jsonrpc": "2.0", "id": rid,
-                      "error": {"code": -32000, "message": "Gemini API key is missing or not configured."}})
+                      "error": {"code": -32000, "message": "Authentication required"}})
                 continue
             s = sessions()
             sid = "s-%d" % (len(s) + 1)

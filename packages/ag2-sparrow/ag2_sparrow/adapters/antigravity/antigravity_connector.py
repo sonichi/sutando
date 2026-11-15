@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Wake Gemini CLI (or Antigravity) over ACP for each task file Sparrow queues.
+"""Wake Antigravity CLI (`agy`) over ACP for each task file Sparrow queues.
 
-Transport: the Agent Client Protocol over the stdio of `gemini --acp` (`agy acp` for Antigravity), through
-acp_host's turn: per task, spawn the command, `initialize`, resume the task's Session with `session/load`
-(else `session/new`), send one `session/prompt` and wait for it to stop. The agent's environment always
-carries GEMINI_CLI_NO_RELAUNCH=true: without it Gemini CLI starts a second copy of itself on the same
-pipe, and a request the first copy already read is lost, so `initialize` can go unanswered.
+Transport: the Agent Client Protocol over the stdio of `agy acp`, through acp_host's turn: per task, spawn
+the command, `initialize`, resume the task's Session with `session/load` (else `session/new`), send one
+`session/prompt` and wait for it to stop.
 
-`<dir>/tasks/task-*.txt` in, `<dir>/results/<task>.txt` out. The turn's final message is the answer: Gemini
-asks permission without a rawInput, so no reply command can be granted exactly, and its own text is posted
+`<dir>/tasks/task-*.txt` in, `<dir>/results/<task>.txt` out. The turn's final message is the answer: no
+reply command is granted (no shell command is), and the agent's own text is posted
 with every delivery marker neutralised. A final message of exactly NO_REPLY posts nothing. A message whose
 turn failed gets a line saying so; an event that failed posts nothing.
 
@@ -33,36 +31,24 @@ from ...task_io import (NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_
                         exit_on_sigterm, holder_consumer, load_done, make_dirs, parse_task, record_done,
                         release_lock, root_path, stop_requested)
 
-# runtime -> (its name in the room, the ACP command line)
-RUNTIMES = {"gemini": ("Gemini", "gemini --acp"), "antigravity": ("Antigravity", "agy acp")}
-DEFAULT_RUNTIME = "gemini"
-NO_RELAUNCH = ("GEMINI_CLI_NO_RELAUNCH", "true")
+NAME = "Antigravity"
+DEFAULT_ACP_COMMAND = "agy acp"
 NO_REPLY = "NO_REPLY"
 HELD_WAIT_S = held_start.WAIT_S
 RETRY_S = 60.0
-STDERR_NAME = "gemini-acp.stderr"
-NOT_SIGNED_IN = ("%s is not signed in on this computer (%%s): run `%s` once in a terminal and sign in, or put "
-                 "GEMINI_API_KEY in ~/.gemini/.env")
+STDERR_NAME = "agy-acp.stderr"
+NOT_SIGNED_IN = ("Antigravity is not signed in on this computer (%s): run `agy` once in a terminal and sign in, "
+                 "or run `agy acp --login`")
 
 
 class AcpClient(_SharedClient):
-    client_info = {"name": "ag2-sparrow-gemini", "version": "0.1.0"}
+    client_info = {"name": "ag2-sparrow-antigravity", "version": "0.1.0"}
 
 
 def log(*a):
     print(time.strftime("%H:%M:%S"), *a, file=sys.stderr, flush=True)
 
 
-def agent_env(environ=None):
-    """The ACP agent's environment: the connector's own (the launcher already narrowed it), never relaunching."""
-    env = dict(os.environ if environ is None else environ)
-    env[NO_RELAUNCH[0]] = NO_RELAUNCH[1]
-    return env
-
-
-def not_signed_in(runtime):
-    name, command = RUNTIMES.get(runtime, RUNTIMES[DEFAULT_RUNTIME])
-    return NOT_SIGNED_IN % (name, command.split()[0])
 
 
 def publish(result_file, body):
@@ -92,7 +78,7 @@ class Connector:
         self.client_factory = client_factory
         self.note = note if note is not None else NON_OWNER_NOTE
         self.store = SessionStore(args.session_store)
-        self.name = RUNTIMES[args.runtime][0]
+        self.name = NAME
         self.retry_at = {}
 
     def run_turn(self, task_id, headers, prompt, owner):
@@ -100,7 +86,7 @@ class Connector:
         cwd = self.args.cwd
         return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
                                    lambda params: acp_host.decide_permission(params, owner, cwd), self.store,
-                                   STDERR_NAME, not_signed_in(self.args.runtime), log)
+                                   STDERR_NAME, NOT_SIGNED_IN, log)
 
     def answer_body(self, headers, status, text, detail):
         """What Sparrow posts: the turn's own text, quoted so no delivery marker in it acts; NO_REPLY or a
@@ -190,10 +176,7 @@ def build_parser():
     ap.add_argument("--held", action="store_true", help="the launcher holds the work root and attaches this "
                     "process as its consumer; take no lock (needs --root-fd)")
     ap.add_argument("--root-fd", type=int, default=None, help="with --held: the held root's directory descriptor")
-    ap.add_argument("--runtime", choices=sorted(RUNTIMES), default=DEFAULT_RUNTIME,
-                    help="gemini (Gemini CLI, the default) or antigravity; names the agent and its default command")
-    ap.add_argument("--acp-command", default=None, help="the ACP agent's command line (default: the runtime's, "
-                    "gemini --acp or agy acp)")
+    ap.add_argument("--acp-command", default=None, help="the ACP agent's command line (default: agy acp)")
     ap.add_argument("--cwd", default=None, help="the Session working directory (default: the current directory)")
     ap.add_argument("--session-store", default=None,
                     help="the sessions.json to resume from and record to (default: <work>/state/sessions.json)")
@@ -209,11 +192,11 @@ def build_parser():
 
 
 def _prepare(args):
-    args.acp_argv = shlex.split(args.acp_command or RUNTIMES[args.runtime][1])
+    args.acp_argv = shlex.split(args.acp_command or DEFAULT_ACP_COMMAND)
     if not args.acp_argv:
         raise SystemExit("--acp-command is empty")
     args.cwd = os.path.abspath(os.path.expanduser(args.cwd or os.getcwd()))
-    args.child_env = agent_env()
+    args.child_env = dict(os.environ)
 
 
 def _paths(args, base):
@@ -235,7 +218,7 @@ def main(argv=None):
         return serve_held(args)
     owner = None
     try:
-        owner = acquire_lock(args.work, "gemini")
+        owner = acquire_lock(args.work, "antigravity")
         make_dirs(owner, ("tasks", "results", "state"))
         args.work = root_path(owner, args.work)
         _paths(args, args.work)
