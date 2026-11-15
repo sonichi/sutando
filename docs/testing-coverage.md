@@ -61,8 +61,8 @@ main; until then the numbers are in the job summary.
 `scripts/parallel-suite-lane.sh` pins the caller's input commit once and runs each
 worker in its own disposable worktree. Between suites it restores that commit
 with detached HEAD and removes non-ignored untracked files. A suite's commits,
-revision checkouts, staged changes and unstaged changes cannot become the next
-suite's source. Recovery leaves a branch selected by a suite at its existing tip.
+revision checkouts, staged changes and unstaged changes are reset before the next
+suite starts. Recovery leaves a branch selected by a suite at its existing tip.
 Ignored files, coverage fragments and the shared `node_modules` link survive.
 The scheduler resolves the source repository before clearing Git's repository-local
 environment variables, so suite commands and recovery cannot use the caller's
@@ -71,6 +71,17 @@ worktree or staged index through inherited Git selectors.
 If a worker cannot restore its worktree, it stops before taking another suite
 and the scheduler exits nonzero. Other workers finish their remaining work;
 the run must be fixed and repeated before treating its results as complete.
+Recovery validates each worker's original canonical path and Git/index identity
+before destructive operations, refusing redirected Git metadata or a replaced
+worktree path. An identity mismatch retains the suspect worktree for inspection
+instead of removing it through redirected metadata. Interrupts terminate owned
+process groups and wait for workers before worktree cleanup.
+
+Worktrees are not an OS security sandbox: suites run with the caller's permissions
+and share repository objects and refs. These guards protect scheduler recovery;
+they do not prevent a suite from directly changing files outside its worktree.
+Processes deliberately escaping the scheduler's process groups are also outside
+its cancellation contract.
 
 ## What counts / doesn't count
 

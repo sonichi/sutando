@@ -6,6 +6,8 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LANE="$here/scripts/parallel-suite-lane.sh"
 T="$(mktemp -d "${TMPDIR:-/tmp}/lane-head-XXXXXX")"
 trap 'rm -rf "$T"' EXIT
+mkdir "$T/tmp"
+export TMPDIR="$T/tmp"
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 mkdir "$T/repo"
@@ -15,7 +17,8 @@ git -C "$T/repo" config user.email fixture@example.com
 git -C "$T/repo" config core.hooksPath /dev/null
 git -C "$T/repo" config commit.gpgSign false
 printf 'older\n' > "$T/repo/tracked"
-git -C "$T/repo" add tracked
+printf '.coverage.*\nnode_modules/\n' > "$T/repo/.gitignore"
+git -C "$T/repo" add tracked .gitignore
 git -C "$T/repo" commit -qm older
 git -C "$T/repo" branch saved
 saved="$(git -C "$T/repo" rev-parse saved)"
@@ -143,6 +146,175 @@ if [ "$rc" = 0 ] && [ "$(cat "$T/git-env/1.rc")" = 0 ] &&
 else
     echo 'FAIL: inherited Git selectors reached the caller or prevented suite isolation'
     cat "$T/git-env/log"
+    failed=1
+fi
+cat > "$T/redirect.sh" <<'EOF'
+set -e
+worker="$(pwd -P)"
+admin="$(git rev-parse --absolute-git-dir)"
+case "$LANE_REDIRECT" in
+    gitfile) printf 'gitdir: %s/.git\n' "$LANE_CALLER" > .git ;;
+    symlink) mv "$worker" "$worker.saved"; ln -s "$LANE_CALLER" "$worker" ;;
+    config) git config --local core.worktree "$LANE_CALLER" ;;
+    commondir) printf '%s/.git\n' "$LANE_OTHER" > "$admin/commondir" ;;
+    index) rm "$admin/index"; ln -s "$LANE_CALLER/.git/index" "$admin/index" ;;
+    backlink) printf '%s/.git\n' "$LANE_CALLER" > "$admin/gitdir" ;;
+    admin) mv "$admin" "$admin.saved"; ln -s "$LANE_CALLER/.git" "$admin" ;;
+esac
+echo redirected-worker
+EOF
+git clone -q --no-local "$T/repo" "$T/other"
+export LANE_OTHER="$T/other"
+for mode in gitfile symlink config commondir index backlink admin; do
+    caller="$T/$mode-repo"
+    git clone -q --no-local "$T/repo" "$caller"
+    caller_head="$(git -C "$caller" symbolic-ref HEAD)"
+    caller_oid="$(git -C "$caller" rev-parse HEAD)"
+    printf 'caller-staged\n' > "$caller/tracked"
+    git -C "$caller" add tracked
+    cp "$caller/.git/index" "$T/$mode.index"
+    printf 'caller-unstaged\n' > "$caller/tracked"
+    printf 'keep\n' > "$caller/untracked"
+    mkdir "$T/$mode"
+    printf '%s\n' "$T/redirect.sh" "$T/observe.sh" > "$T/$mode/files"
+    rc=0
+    (cd "$caller" && LANE_REDIRECT="$mode" LANE_CALLER="$caller" \
+        bash "$LANE" 1 "$T/$mode/files" "$T/$mode" bash) > "$T/$mode/log" 2>&1 || rc=$?
+    index_same=false
+    cmp -s "$T/$mode.index" "$caller/.git/index" && index_same=true
+    staged="$(git --git-dir="$caller/.git" show :tracked)"
+    working="$(cat "$caller/tracked")"
+    untracked=false
+    [ -f "$caller/untracked" ] && [ "$(cat "$caller/untracked")" = keep ] && untracked=true
+    head_same=false
+    if [ "$(git --git-dir="$caller/.git" symbolic-ref -q HEAD)" = "$caller_head" ] &&
+        [ "$(git --git-dir="$caller/.git" rev-parse HEAD)" = "$caller_oid" ]; then head_same=true; fi
+    if [ "$rc" -ne 0 ] && [ "$(cat "$T/$mode/1.rc")" = 0 ] &&
+        [ ! -e "$T/$mode/2.rc" ] && [ "$index_same" = true ] &&
+        [ "$staged" = caller-staged ] && [ "$working" = caller-unstaged ] &&
+        [ "$untracked" = true ] && [ "$head_same" = true ]; then
+        echo "PASS: $mode redirection fails without changing caller index bytes or local work"
+    else
+        echo "FAIL: $mode rc=$rc index_unchanged=$index_same staged=$staged working=$working untracked=$untracked head_unchanged=$head_same"
+        cat "$T/$mode/log"
+        failed=1
+    fi
+done
+
+cat > "$T/suite-failure.sh" <<'EOF'
+printf 'coverage-fragment\n' > .coverage.lane-probe
+echo suite-failed
+exit 7
+EOF
+mkdir "$T/suite-failure"
+printf '%s\n' "$T/suite-failure.sh" "$T/observe.sh" > "$T/suite-failure/files"
+rc=0
+(cd "$T/repo" && bash "$LANE" 1 "$T/suite-failure/files" "$T/suite-failure" bash) > "$T/suite-failure/log" 2>&1 || rc=$?
+if [ "$rc" = 0 ] && [ "$(cat "$T/suite-failure/1.rc")" = 7 ] &&
+    [ "$(cat "$T/suite-failure/2.rc")" = 0 ] &&
+    [ "$(cat "$T/repo/.coverage.lane-probe")" = coverage-fragment ]; then
+    echo 'PASS: suite failure stays in its record, next suite runs, and coverage comes home'
+else
+    echo 'FAIL: suite failure changed scheduler status, blocked the queue, or lost coverage'
+    cat "$T/suite-failure/log"
+    failed=1
+fi
+
+cat > "$T/interrupt.py" <<'EOF'
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+rec = Path(os.environ["LANE_INTERRUPT_RECDIR"])
+ready, late = rec / "ready", rec / "late"
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+watcher = """import sys, time
+from pathlib import Path
+root, marker = map(Path, sys.argv[1:])
+for _ in range(400):
+    if not root.exists():
+        marker.write_text("cleanup reached a running descendant\\n")
+        break
+    time.sleep(0.01)
+"""
+child = subprocess.Popen([sys.executable, "-c", watcher, str(Path.cwd()), str(rec / "cleanup-live")])
+ready.write_text(f"{os.getpid()} {child.pid} {Path.cwd()}\n")
+child.wait()
+late.write_text("suite continued after interruption\n")
+EOF
+mkdir "$T/interrupt"
+printf '%s\n' "$T/interrupt.py" > "$T/interrupt/files"
+rc=0
+python3 - "$LANE" "$T/repo" "$T/interrupt" <<'EOF' || rc=$?
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+lane, repo, rec = sys.argv[1:]
+rec = Path(rec)
+ready, late = rec / "ready", rec / "late"
+index = Path(repo, ".git/index").read_bytes()
+with (rec / "log").open("w") as log:
+    scheduler = subprocess.Popen(["bash", lane, "1", str(rec / "files"), str(rec),
+                                  sys.executable], cwd=repo, stdout=log, stderr=log,
+                                 start_new_session=True,
+                                 env=dict(os.environ, LANE_INTERRUPT_RECDIR=str(rec)))
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists():
+            assert scheduler.poll() is None, "scheduler exited before suite started"
+            assert time.monotonic() < deadline, "suite did not become ready"
+            time.sleep(0.02)
+        suite, child, worker = ready.read_text().split()
+        os.killpg(scheduler.pid, signal.SIGINT)
+        status = scheduler.wait(timeout=5)
+        def running(pid):
+            try:
+                os.kill(int(pid), 0)
+            except ProcessLookupError:
+                return False
+            stat = Path("/proc", pid, "stat")
+            if not Path("/proc").exists():
+                return True
+            try:
+                return stat.read_text().rsplit(")", 1)[1].split()[0] != "Z"
+            except FileNotFoundError:
+                return False
+        assert status != 0, f"interrupt returned {status}"
+        deadline = time.monotonic() + 1
+        while (running(suite) or running(child)) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not running(suite) and not running(child), "suite descendants survived scheduler exit"
+        assert not late.exists(), "suite continued after interruption"
+        assert not (rec / "cleanup-live").exists(), "cleanup reached a running descendant"
+        assert not Path(worker).exists(), "worker was not cleaned up"
+        assert not list(rec.glob(".claim-*")), "interrupt left queue claims"
+        assert Path(repo, ".git/index").read_bytes() == index, "caller index changed"
+        assert Path(repo, "tracked").read_text() == "caller-unstaged\n", "caller work changed"
+        assert Path(repo, "untracked").read_text() == "keep\n", "caller untracked file changed"
+    finally:
+        if scheduler.poll() is None:
+            os.killpg(scheduler.pid, signal.SIGKILL)
+            scheduler.wait()
+        if ready.exists():
+            for pid in ready.read_text().split()[:2]:
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+EOF
+if [ "$rc" = 0 ]; then
+    echo 'PASS: SIGINT terminates suite descendants before cleanup and preserves caller work'
+else
+    echo 'FAIL: SIGINT left running suites, scheduler resources, or changed caller work'
+    cat "$T/interrupt/log"
     failed=1
 fi
 exit "$failed"
