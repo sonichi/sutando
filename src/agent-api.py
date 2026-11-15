@@ -103,7 +103,8 @@ def validate_twilio_signature(handler, body: str) -> bool:
 
     mac = hmac.new(auth_token.encode(), param_string.encode(), hashlib.sha1)
     expected = base64.b64encode(mac.digest()).decode()
-    return hmac.compare_digest(expected, signature)
+    from secret_compare import secret_equal
+    return secret_equal(signature, expected)
 
 
 # Two separate concerns (per qingyun review on PR #775):
