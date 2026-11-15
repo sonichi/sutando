@@ -368,47 +368,70 @@ arrives there too**. It never appears in the room, and the page never receives i
 **What the page learns back.** Only whether the request went out.
 
 - `{ok: true, eventId}`: accepted. Accepted means the request was handed on to the agent, not
-  that it was answered: today that is the message sent into the viewer's chat with the agent,
-  and with the rollout below it is the request reaching the agent's queue. Either way the
-  answer arrives later, in the viewer's own chat with the agent.
+  that it was answered. The answer arrives later, in the viewer's own chat with the agent.
   `eventId` is an opaque receipt, not a task id: you cannot look anything up with it. Say
   where the answer will arrive: "Sent to *name*. The answer comes to your chat with it, not to
   this page."
-- `{ok: false, reason}`: nothing was sent, or it is not known. Show a sentence for the reason.
-  For a reason you do not know, do not say "not sent": say there is no confirmation that it was.
-- The same `key` again returns the recorded result without asking again. That is the point of
-  the key, and it is why it must be stable.
+- `{ok: false, reason}`: nothing was sent, or it is not known. `reason` is one of the host's
+  own fixed sentences, listed below. It is never the server's wording and never a code.
+- The same `key` again returns the recorded result without asking again, once the request was
+  sent or cancelled. That is the point of the key, and it is why it must be stable.
 - There is no "working" or "answered" state to read. Do not draw a spinner that waits for an
   answer, and do not write the answer into a row: the page will never have it.
 
-**Show each refusal in words.** A page that says only "failed" leaves the viewer stuck. Map the
-reason to a sentence, and show any reason you do not know as it came.
+**Two routes, one result.** The host picks how the request travels; the page does not choose and
+is not told which was used.
 
-| `reason` | Say | Then |
-| --- | --- | --- |
-| `declined` | "Not sent: you cancelled. Tap again to ask." | Move to a new key (attempt + 1): a cancelled key stays cancelled. |
-| `confirmation interrupted` | "The question closed before you answered. Tap again." | Same key. |
-| `page permission required` | "Allow this page to use this room, then tap again." | Same key. |
-| `too many agent requests`, `too many requests`, `rate` | "Too many requests just now. Wait a minute, then tap again." | Same key. The limit is about 10 a minute; today it is counted per open page. |
-| `agent not owned or unavailable`, `not_yours` | "That agent is not yours to ask." | Reload the list. |
-| `request timed out; retry with the same key` | "No answer yet about whether it was sent. Tap again: it will not be sent twice." | Same key. |
-| `send outcome unknown` | "It may or may not have been sent. Check your chat with the agent before asking again." | Do not resend by yourself. |
-| `agent task unavailable`, `idempotency storage unavailable` | "Your agent cannot be reached from this page right now." | Later. |
-| `invalid request` | "This item cannot be sent as it is." | Fix `text` or `key`: this is a bug in the page. |
-| `off` | "Asking an agent from an app is switched off in this room." | Nothing the viewer can do. |
-| `not_an_app` | "Open this page as an app in the room to ask an agent from it." | Register it with `apps.create`. |
-| `no_owner_dm` | "You have no chat with that agent yet. Open one, then tap again." | Same key. |
-| `in_owner_dm` | "This app is in your own chat with that agent: ask the agent in this chat directly." | Nothing to retry: the app lives in the very chat the answer would go to. |
-| `not_deliverable` | "That agent cannot receive requests right now." | Later. |
-| `not_subscribed` | "That agent is not set up to take requests from apps." | The agent's owner sets it up. |
+- *Through the room.* For a page registered as an app, in a room whose server takes app
+  requests, the request goes to the agent through the room.
+- *The private chat.* In every other case the request is sent as an ordinary message in the
+  viewer's own chat with the agent: the page is not registered as an app, the room's server
+  does not take app requests or has them switched off, or the app sits in the viewer's own
+  chat with that agent.
+- When the first route turns out to be unavailable after the viewer has confirmed, the host
+  asks them **once more**, for the private chat, and sends there. Nothing was delivered by the
+  first route. The page still gets one result, for the request as a whole.
 
-The rows from `off` down (`in_owner_dm` among them), and `rate` and `not_yours`, are answered by the room's server once
-requests go through it. **That path is being rolled out, and this is the one place this guide
-depends on it:** until it is on in a room, the page gets the reasons in the upper rows, and the
-request is delivered as an ordinary message in the viewer's chat with their agent. The page code
-is the same either way, so handle both sets and you need change nothing later.
+So a page never has to handle "off", "not an app" or "in the agent's own chat": those end in a
+sent message, or in one of the reasons below.
 
-Only `declined` moves to a new key. Keep the attempt number, per row and agent, for the viewer
+**Match `reason` exactly.** Compare the whole string with `===` or look it up in a table.
+Never test it with a pattern, `includes` or `startsWith`: several reasons share words ("request
+outcome unknown", "send outcome unknown"), and a looser match files one under the other. Show
+any string you do not know as it came, and do not call it "not sent".
+
+**`declined` is the only cancel.** It means the viewer read the question and said no. No other
+reason means that: "confirmation interrupted" is the dialog closing by itself, and the
+"outcome unknown" reasons may mean the request arrived.
+
+| `reason`, exactly | What happened | Say | Then |
+| --- | --- | --- | --- |
+| `declined` | The viewer said no. | "Not sent: you cancelled. Tap again to ask." | Move to a new key (attempt + 1): a cancelled key stays cancelled. |
+| `confirmation interrupted` | The dialog closed before an answer (the page lost its permission, or the view went away). | "The question closed before you answered. Tap again." | Same key. |
+| `another request is in progress` | Another request from this page has the dialog. | "Finish the question already open, then tap again." | Same key. One request at a time. |
+| `page permission required` | The viewer has not allowed the page, or has left the room. | "Allow this page to use this room, then tap again." | Same key. |
+| `too many agent requests` | More than about 10 calls a minute from this open page (`agent.list()` counts too), or the room's own limit. | "Too many requests just now. Wait a minute, then tap again." | Same key. |
+| `too many requests` | More than 32 calls from the page are waiting at once. | The same sentence. | Same key. A loop is calling: fix the page. |
+| `request timed out; retry with the same key` | No answer from the host in five minutes (a dialog left open). | "No answer yet about whether it was sent. Tap again: it will not be sent twice." | Same key. |
+| `agent not owned or unavailable` | The agent is not the viewer's, or is gone. | "That agent is not yours to ask from here, or it is unavailable." | Reload the list. |
+| `agent has no private DM with you` | The viewer has no chat with that agent. | "You have no chat with that agent yet. Open one, then tap again." | Same key. |
+| `agent cannot take app requests now` | The agent cannot be reached at the moment. | "That agent cannot receive requests right now." | Later, same key. |
+| `agent is not listening for app requests` | The agent is not set up for requests from apps. | "That agent is not set up to take requests from apps." | Its owner sets it up. |
+| `request waiting for approval` | The request is held for an approval. | "This request is waiting for an approval." | Do not resend by yourself. |
+| `agent request refused` | Refused, with no reason the host passes on. | "Your agent's room refused this request." | Later. |
+| `request outcome unknown` | Sent through the room, and no answer settled it. It may have arrived. | "It may or may not have reached your agent. Tap again: the same request is checked, not sent twice." | Same key: the host takes up the same request and asks the viewer again. |
+| `send outcome unknown` | Sent to the private chat, and no confirmation came back. It may have arrived. | "It may or may not have been sent. Check your chat with the agent before asking again." | Do not resend by yourself. The key keeps this answer. |
+| `key already used` | This key still has an unsettled request with a different text (the row changed since). | "This item changed since your earlier request, which may or may not have arrived. Check your chat with the agent, then tap again." | Move to a new key (attempt + 1). |
+| `agent task unavailable` | The private chat could not be opened, or the host failed. Nothing was sent. | "Your agent cannot be reached from this page right now." | Later. |
+| `idempotency storage unavailable` | The browser cannot keep the record that stops a double send. Nothing was sent. | "This browser cannot keep track of requests, so nothing was sent." | Nothing the page can do. |
+| `page task limit reached` | This page has used 1,000 keys on this device. | "This page has used up its requests on this device." | Nothing the page can do. |
+| `invalid request` | `agentId`, `text`, `key` or the extras are malformed. | "This item cannot be sent as it is." | Fix the page: this is a bug in it. |
+
+`agent.list()` normally resolves to an array. When it is refused (`too many agent requests`,
+`too many requests`, a timeout) it resolves to `{ok: false, reason}` instead, so check
+`Array.isArray` before you use it, and treat anything else as "no agent available right now".
+
+Only `declined` and `key already used` move to a new key. Keep the attempt number, per row and agent, for the viewer
 in `artifact.state` under a key that includes `me.id` (shortened: a state key is at most 64
 characters), so a reload does not replay an old cancel. A state value is small (4 KB), so keep
 only the latest few dozen counts, and treat a refused save as "kept until reload".

@@ -1769,14 +1769,25 @@ const attemptOf = (key) => Number((KEY.exec(key) || [])[2]);
   check('review/kept-attempts-are-read-back', () => assert.equal(sent(r)[0].key, `ask.${slot}.2`));
 }
 for (const [reason, shown] of [
-  ['not_subscribed', /not set up to take requests from apps/],
-  ['not_yours', /not yours to ask/],
-  ['rate', /Too many requests just now/],
-  ['off', /switched off in this room/],
-  ['not_an_app', /Open this page as an app/],
-  ['no_owner_dm', /no chat with that agent yet/],
-  ['in_owner_dm', /ask the agent in this chat directly/],
-  ['not_deliverable', /cannot receive requests right now/],
+  ['agent is not listening for app requests', /not set up to take requests from apps/],
+  ['agent has no private DM with you', /no chat with that agent yet/],
+  ['agent cannot take app requests now', /cannot receive requests right now/],
+  ['request waiting for approval', /waiting for an approval/],
+  ['agent request refused', /room refused this request/],
+  ['request outcome unknown', /may or may not have reached your agent/],
+  ['another request is in progress', /Finish the question already open/],
+  ['too many requests', /Too many requests just now/],
+  ['agent task unavailable', /cannot be reached from this page right now/],
+  ['idempotency storage unavailable', /cannot keep track of requests/],
+  ['page task limit reached', /used up its requests/],
+  ['invalid request', /cannot be sent as it is/],
+  // The server's codes never reach a page; one that did would be an unknown string, shown as it came.
+  ['not_yours', /No confirmation that it was sent \(not_yours\)\./],
+  ['off', /No confirmation that it was sent \(off\)\./],
+  ['in_owner_dm', /No confirmation that it was sent \(in_owner_dm\)\./],
+  // Whole-string matching: a near miss is an unknown reason, not its neighbour.
+  ['request outcome unknown.', /No confirmation that it was sent \(request outcome unknown\.\)\./],
+  ['Declined', /No confirmation that it was sent \(Declined\)\./],
   ['too many agent requests', /Too many requests just now/],
   ['agent not owned or unavailable', /not yours to ask from here/],
   ['page permission required', /Allow this page to use this room/],
@@ -1794,6 +1805,19 @@ for (const [reason, shown] of [
   askButtons(r)[0].click();
   await settle();
   check(`review/refusal-keeps-the-key:${reason}`, () => assert.equal(sent(r)[1].key, sent(r)[0].key));
+}
+{ // A key whose unsettled request had another text is spent, like a cancelled one.
+  const r = await run('review-list', reviewOpts({ rows: reviewRows(), taskAnswers: [{ ok: false, reason: 'key already used' }] }));
+  askButtons(r)[0].click();
+  await settle();
+  check('review/key-already-used-says-the-item-changed', () => assert.match(r.text(), /changed since your earlier request/));
+  check('review/key-already-used-never-reads-as-sent', () => assert.doesNotMatch(r.text(), /Sent to/));
+  askButtons(r)[0].click();
+  await settle();
+  check('review/key-already-used-moves-to-a-new-key', () => {
+    assert.equal(slotOf(sent(r)[1].key), slotOf(sent(r)[0].key));
+    assert.equal(attemptOf(sent(r)[1].key), attemptOf(sent(r)[0].key) + 1);
+  });
 }
 { // A refusal with no reason, and a call that throws, still say something.
   const r = await run('review-list', reviewOpts({ rows: reviewRows(), taskAnswers: [{ ok: false }, () => { throw new Error('gone'); }] }));

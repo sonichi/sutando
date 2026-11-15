@@ -205,26 +205,31 @@
   // What a refusal means to the person, by the reason the page is given. The first group is what
   // a room answers today; the second is what it answers once requests go through the room's
   // server. Anything else is shown as it came.
+  // The host's own sentences, matched whole: never by a pattern, since several share words.
   const REFUSED = Object.assign(Object.create(null), {
     'confirmation interrupted': ['warn', 'Not sent: the question closed before you answered. Tap again to ask.'],
+    'another request is in progress': ['warn', 'Finish the question already open, then tap again.'],
+    'page permission required': ['warn', 'Allow this page to use this room, then tap again.'],
     'too many agent requests': ['warn', 'Too many requests just now. Wait a minute, then tap again.'],
     'too many requests': ['warn', 'Too many requests just now. Wait a minute, then tap again.'],
-    'agent not owned or unavailable': ['bad', 'That agent is not yours to ask from here, or it is unavailable.'],
-    'page permission required': ['warn', 'Allow this page to use this room, then tap again.'],
     'request timed out; retry with the same key': ['warn', 'No answer yet about whether it was sent. Tap again: it will not be sent twice.'],
+    'agent not owned or unavailable': ['bad', 'That agent is not yours to ask from here, or it is unavailable.'],
+    'agent has no private DM with you': ['warn', 'You have no chat with that agent yet. Open a chat with it, then tap again.'],
+    'agent cannot take app requests now': ['bad', 'That agent cannot receive requests right now.'],
+    'agent is not listening for app requests': ['bad', 'That agent is not set up to take requests from apps.'],
+    'request waiting for approval': ['warn', 'This request is waiting for an approval.'],
+    'agent request refused': ['bad', 'Your agent\'s room refused this request.'],
+    'request outcome unknown': ['warn', 'It may or may not have reached your agent. Tap again: the same request is checked, not sent twice.'],
     'send outcome unknown': ['warn', 'It may or may not have been sent. Check your chat with the agent before asking again.'],
     'agent task unavailable': ['bad', 'Your agent cannot be reached from this page right now. Try again later.'],
     'idempotency storage unavailable': ['bad', 'This browser cannot keep track of requests, so nothing was sent.'],
     'page task limit reached': ['bad', 'This page has used up its requests on this device.'],
     'invalid request': ['bad', 'This item cannot be sent as it is: it may be too long.'],
-    off: ['bad', 'Asking an agent from an app is switched off in this room.'],
-    not_an_app: ['bad', 'Open this page as an app in the room to ask an agent from it.'],
-    not_yours: ['bad', 'That agent is not yours to ask.'],
-    no_owner_dm: ['warn', 'You have no chat with that agent yet. Open a chat with it, then tap again.'],
-    in_owner_dm: ['', 'This app is in your own chat with that agent: ask the agent in this chat directly.'],
-    rate: ['warn', 'Too many requests just now. Wait a minute, then tap again.'],
-    not_deliverable: ['bad', 'That agent cannot receive requests right now.'],
-    not_subscribed: ['bad', 'That agent is not set up to take requests from apps.'],
+  });
+  // The two answers that end a key: the next tap is a new request.
+  const NEW_KEY = Object.assign(Object.create(null), {
+    declined: ['', 'Not sent: you cancelled. Tap again to ask.'],
+    'key already used': ['warn', 'This item changed since your earlier request, which may or may not have arrived. Check your chat with the agent, then tap again.'],
   });
   const asked = new Map();                 // row id -> [class, text]: survives a redraw
   let asking = false;
@@ -251,9 +256,9 @@
         return;
       }
       const reason = String((r && r.reason) || '');
-      if (reason === 'declined') {
-        await nextAttempt(slot);           // a cancelled request is over: the next tap is a new one
-        asked.set(row.id, ['', 'Not sent: you cancelled. Tap again to ask.']);
+      if (NEW_KEY[reason]) {
+        await nextAttempt(slot);           // that key is spent: the next tap is a new request
+        asked.set(row.id, NEW_KEY[reason]);
         return;
       }
       // A reason this page does not know may mean "not sent" or "not known": it claims neither.
