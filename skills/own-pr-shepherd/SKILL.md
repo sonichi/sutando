@@ -51,7 +51,8 @@ SUMMARY author=<login> email=<owner email> repos=1 prs=44 not_mine=3 due=12 comp
   for this PR was logged in `state/review-asks.jsonl` (by `notify_reviewers.py`, from this pass
   or any other path) after the last non-merge commit. Skip it. `sha` is the last non-merge
   commit, so a base merge (`gh pr update-branch`) re-asks no reviewer and not the owner; for
-  `conflicting` and `behind` it is the head, since the base moving again needs another merge.
+  `conflicting`, `behind` and `ci_red` it is the head, since the base moving again can need
+  another merge or bring a new CI failure.
 
 ## 2. Act on each PR, primary class first
 
@@ -85,9 +86,9 @@ python3 skills/own-pr-shepherd/scripts/own_prs.py record <o/r#N> <class> --sha <
 
 `<sha>` is the `sha` the listing printed when the step pushed nothing. After a push it is the
 branch's last non-merge commit (`git log -1 --no-merges --format=%H`), or the new head for
-`conflicting` and `behind`. `list` then shows `acted=yes` for that class until that commit
-moves, so a reviewer is asked once per change, a CI failure that is not this PR's is triaged
-once, and the owner is asked once.
+`conflicting`, `behind` and `ci_red`. `list` then shows `acted=yes` for that class until that
+commit moves, so a reviewer is asked once per change, a CI failure that is not this PR's is
+triaged once per head, and the owner is asked once.
 
 ## 4. Notify reviewers
 
