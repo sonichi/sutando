@@ -3622,13 +3622,13 @@ def _forget_deleted_identity(agent_id: str) -> None:
 
 
 def _bearer_check() -> str:
-    """This bearer, tested now: "accepted" on an authed answer, "refused" on a 401 or 403, "unknown"
-    on anything else (an outage proves nothing either way)."""
+    """This bearer, tested now: "accepted" on an authed answer, "refused" only on a 401, "unknown" on
+    anything else. A 403 can be an edge's WAF or rate rule answering a valid bearer, so it proves nothing."""
     try:
         _req("GET", "/v1/agents", timeout=15)
         return "accepted"
     except urllib.error.HTTPError as e:
-        return "refused" if e.code in (401, 403) else "unknown"
+        return "refused" if e.code == 401 else "unknown"
     except Exception:  # noqa: BLE001 - unknown, never a refusal
         return "unknown"
 
@@ -3636,7 +3636,7 @@ def _bearer_check() -> str:
 def _wait_after_deletion(code: int) -> bool:
     """The owner deleted this agent: no further claims. The server's answer names an id, not this
     bearer, so the binding is retired only on a 401, only when the file ties the two, and only right
-    after this bearer is itself refused again; until then it is tested every cycle, and an accepted
+    after this bearer is itself refused again with a 401; until then it is tested every cycle, and an accepted
     bearer resumes, since the stale id may sit beside another, live agent's token. A new credential
     resumes too; True either way, like a rotation."""
     deleted = _reenroll_state["deleted"]

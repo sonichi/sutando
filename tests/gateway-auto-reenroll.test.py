@@ -935,6 +935,7 @@ class _Deleted(unittest.TestCase):
                  "REENROLL_PROBE_EVERY", "GATEWAY_STATUS_FILE", "_log", "_heartbeat_singleton",
                  "_auth_probe", "_bearer_check")
         self._saved = {n: getattr(gw, n) for n in names}
+        self._saved_reload = gw._reload_rotated_token
         self._env = gw.os.environ.get("AGENT_MXID")
         gw.os.environ["AGENT_MXID"] = "@gone.agent:ag2.space"
         self.dir = Path(tempfile.mkdtemp())
@@ -1328,7 +1329,7 @@ class _Deleted(unittest.TestCase):
             gw._recover_auth(401)
         self.assertEqual(seen, [True, True, False], "retired only after the bearer itself was refused")
 
-    def test_the_bearer_check_reads_only_a_401_or_403_as_refused(self):
+    def test_the_bearer_check_reads_only_a_401_as_refused(self):
         def raising(exc):
             def req(*a, **k):
                 raise exc
@@ -1337,13 +1338,45 @@ class _Deleted(unittest.TestCase):
         self.addCleanup(setattr, gw, "_req", saved)
         gw._bearer_check = self._saved["_bearer_check"]
         for exc, want in ((urllib.error.HTTPError("u", 401, "x", {}, io.BytesIO(b"")), "refused"),
-                          (urllib.error.HTTPError("u", 403, "x", {}, io.BytesIO(b"")), "refused"),
+                          (urllib.error.HTTPError("u", 403, "x", {}, io.BytesIO(b"")), "unknown"),
+                          (urllib.error.HTTPError("u", 403, "x", {}, io.BytesIO(
+                              b'{"code":"AGENT_CREDENTIAL_REVOKED"}')), "unknown"),
                           (urllib.error.HTTPError("u", 502, "x", {}, io.BytesIO(b"")), "unknown"),
                           (OSError("down"), "unknown")):
             gw._req = raising(exc)
             self.assertEqual(gw._bearer_check(), want, exc)
         gw._req = lambda *a, **k: {"agents": []}
         self.assertEqual(gw._bearer_check(), "accepted")
+
+    def test_an_edge_403_after_the_id_only_410_never_retires_a_live_token(self):
+        # The reviewer's sequence: the file pairs a stale deleted id with a working token; one transient
+        # 401, the claim's id-only 410, then the bearer check meets a Cloudflare 1020 page, not the gateway.
+        before = self.env.read_text()
+        self._answer(410, b'{"error":"agent_deleted"}')
+        gw._bearer_check = self._saved["_bearer_check"]
+        cloudflare = (b"<!DOCTYPE html><title>Access denied | chat.example used Cloudflare to restrict access"
+                      b"</title><p>Error code 1020</p>")
+        answers = iter([urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(cloudflare)), None])
+
+        def req(*a, **k):
+            exc = next(answers)
+            if exc:
+                raise exc
+            return {"agents": []}   # the next pass: the token works
+        saved = gw._req
+        gw._req = req
+        self.addCleanup(setattr, gw, "_req", saved)
+        beats = {"n": 0}
+
+        def beat():   # bounded: a regression that retires exits instead of hanging
+            beats["n"] += 1
+            return beats["n"] < 3
+        gw._heartbeat_singleton = beat
+        gw._reload_rotated_token = lambda: False
+        self.addCleanup(setattr, gw, "_reload_rotated_token", self._saved_reload)
+        self.assertTrue(gw._recover_auth(401))
+        self.assertEqual(self.env.read_text(), before, "the live token stays")
+        self.assertFalse(Path(str(self.env) + ".retired").exists())
 
 if __name__ == "__main__":
     import urllib.request  # noqa: F401 — used via gw.urllib in fixtures
