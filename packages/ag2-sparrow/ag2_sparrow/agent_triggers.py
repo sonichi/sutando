@@ -40,6 +40,8 @@ EVENT_PLAYBOOKS = {
     "room.mention": "reply",
     "room.joined": "room-onboard",
     "commons.summon": "summon",
+    "commons.app_request": "app-request",
+    "email.received": "email",
 }
 EVENT_TYPES = frozenset(EVENT_PLAYBOOKS)
 # A well-formed event type: two to four dotted lowercase segments, e.g. "commons.summon".

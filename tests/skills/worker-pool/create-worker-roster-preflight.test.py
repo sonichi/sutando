@@ -102,7 +102,7 @@ class RosterPreflightTests(unittest.TestCase):
         self.endpoint = self.base / "endpoint/claude"
         self.endpoint.parent.mkdir()
         self.run_command(["cc", str(source), "-o", str(self.endpoint)])
-        self.executable(self.bin / "claude", "#!/bin/sh\nexec " + shlex.quote(str(self.endpoint)) + ' "$@"\n')
+        self.executable(self.bin / "claude", "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nexec " + shlex.quote(str(self.endpoint)) + ' "$@"\n')
         self.server_log = self.base / "tmux.log"
         argv = ["tmux", "-D", "-f", "/dev/null", "-S", self.socket]
         with self.server_log.open("w") as log:

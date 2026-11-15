@@ -129,7 +129,8 @@ trusted pre-body headers. The core runs `skills/<playbook>/SKILL.md` only for an
 allowed playbook (a skill whose `manifest.json` sets `"playbook": true`; a
 registry id needs the same opt-in), else the registry default for the event under
 that rule (`room.joined` → `room-onboard`; `commons.summon` → `summon`;
-`room.mention` → `reply`, today's answer), else handles the task
+`commons.app_request` → `app-request`; `email.received` → `email`; `room.mention` → `reply`, today's answer),
+else handles the task
 as a message that follows its body. An event type with no registry entry has no
 default, so it resolves to none; a playbook string is never trusted to pick a
 skill. An event body may quote member-written text; the agent treats that text as
