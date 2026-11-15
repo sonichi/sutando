@@ -65,13 +65,16 @@ Work in a fresh temporary directory; `$S` is `skills/commons-feed-runner/scripts
       `python3 $S/feed_runner.py fail run.json connector.json > fail.json`, then
       `room.action.execute` `room.commons.feeds.fail` with the arguments in `fail.json` (a
       closed code, never the connector's text), the task's `task_id` and
-      `execution_generation`, and `operation_id` = the run key + `:fail`. Close the task
+      `execution_generation`, and `operation_id` from `python3 $S/feed_runner.py opid fail.json`.
+      Close the task
       `failed` with the outcome "The feed refresh could not read its source". For
       `connector_not_connected`, also tell the owner in your DM with them, once a day at most,
       that their account needs connecting. Then go on to the next run.
    4. `room.action.execute` `room.commons.feeds.write` in `run.room_id` with the arguments in
-      `write.json`, `task_id` and `execution_generation` from step 1, and `operation_id` =
-      the run key. Save the whole reply, success or refusal, to `result.json`.
+      `write.json`, `task_id` and `execution_generation` from step 1, and `operation_id` from
+      `python3 $S/feed_runner.py opid write.json` (the run key plus a hash of the rows: a retry
+      that re-ran the connector and got other rows is a new operation, and the backend still
+      writes the run key once). Save the whole reply, success or refusal, to `result.json`.
    5. `python3 $S/feed_runner.py outcome result.json`. Close the task with its `task_status` and
       `outcome` (`room.task.update`). `wait` means the backend's schedule is ahead of yours;
       `stop` means the grant was revoked, paused or expired: there is nothing to do but close.

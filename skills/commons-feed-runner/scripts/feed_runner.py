@@ -10,6 +10,7 @@ judgment. It never calls anything itself and holds no state.
   rows    <run.json> <composio.json>    the feeds.write arguments for one run
   outcome <write.json>                  done, wait (retry_after_s), stop or fail
   fail    <run.json> <connector.json>   the feeds.fail arguments for a run that could not write
+  opid    <write.json | fail.json>      the operation_id to send those arguments with
   capable <describe.json>               whether this backend takes room.commons.feeds.fail
 
 Each JSON file is a tool's whole reply as it came back, wrapper included. The backend holds
@@ -19,6 +20,7 @@ for what the grant does not cover.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import re
 import sys
@@ -329,6 +331,25 @@ def failure(run: dict, reply) -> dict:
     return {"grant_id": run["grant_id"], "run_key": run["run_key"], "code": code}
 
 
+def operation_id(arguments: dict) -> dict:
+    """The operation_id for one feeds.write or feeds.fail call: the run key plus a short hash of
+    what the call writes (its rows, or its failure code). The backend binds an operation_id to
+    the arguments it was first sent with, so a retry that re-ran the connector and got other
+    rows must be a new operation; the run key stays the dedupe the backend enforces."""
+    run_key = arguments.get("run_key")
+    if not isinstance(run_key, str) or not run_key:
+        raise Refused("the arguments have no run_key")
+    if "rows" in arguments:
+        part, payload = "rows", arguments["rows"]
+    elif "code" in arguments:
+        part, payload = "fail", arguments["code"]
+    else:
+        raise Refused("the arguments are neither a write (rows) nor a failure (code)")
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    digest = hashlib.sha256(canonical.encode()).hexdigest()[:16]
+    return {"operation_id": f"{run_key}:{part}:{digest}"}
+
+
 def capable(reply) -> dict:
     """Whether the backend offers this agent room.commons.feeds.fail, from room.actions.describe's
     reply (an unknown Action answers a refusal). A backend from before it still takes writes:
@@ -393,7 +414,7 @@ def _read(path: str):
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2 or argv[1] not in ("due", "rows", "outcome", "fail", "capable"):
+    if len(argv) < 2 or argv[1] not in ("due", "rows", "outcome", "fail", "opid", "capable"):
         print(__doc__.strip(), file=sys.stderr)
         return 2
     now_ms = int(datetime.datetime.now(UTC).timestamp() * 1000)
@@ -409,6 +430,8 @@ def main(argv: list[str]) -> int:
             answer = outcome(_read(argv[2]))
         elif argv[1] == "fail" and len(argv) == 4:
             answer = failure(_read(argv[2]), _read(argv[3]))
+        elif argv[1] == "opid" and len(argv) == 3:
+            answer = operation_id(_read(argv[2]))
         elif argv[1] == "capable" and len(argv) == 3:
             answer = capable(_read(argv[2]))
         else:

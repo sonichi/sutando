@@ -422,4 +422,54 @@ check("a result-wrapped missing connection is connector_not_connected",
       fr.failure(run, {"result": {"error": "connect_required"}})["code"]
       == "connector_not_connected")
 
+# The operation_id: the run key plus a hash of what is written. The backend binds an
+# operation_id to the arguments it was first sent with, so a retry whose connector run
+# returned other rows must be a new operation, and an identical retry the same one.
+KEY = "cron:gabc123def:1794679200000"
+ROWS_A = [{"_id": "e1", "Title": "Standup", "Start": "2026-11-09T18:30:00Z"}]
+ROWS_B = [{"_id": "e1", "Title": "Standup (moved)", "Start": "2026-11-09T19:00:00Z"}]
+write_a = {"grant_id": "gabc123def", "run_key": KEY, "rows": ROWS_A}
+op_a = fr.operation_id(write_a)["operation_id"]
+check("a write's id is the run key, a rows part and 16 hex", re.fullmatch(
+    re.escape(KEY) + r":rows:[0-9a-f]{16}", op_a) is not None)
+check("the same rows give the same id (a plain retry is the same operation)",
+      fr.operation_id(json.loads(json.dumps(write_a)))["operation_id"] == op_a)
+check("key order inside a row does not change the id",
+      fr.operation_id({**write_a, "rows": [dict(reversed(list(ROWS_A[0].items())))]})
+      ["operation_id"] == op_a)
+check("other rows give another id (a retry that re-ran the connector is a new operation)",
+      fr.operation_id({**write_a, "rows": ROWS_B})["operation_id"] != op_a)
+check("no rows is still its own id", fr.operation_id({**write_a, "rows": []})["operation_id"]
+      not in (op_a,))
+fail_a = {"grant_id": "gabc123def", "run_key": KEY, "code": "connector_error"}
+op_f = fr.operation_id(fail_a)["operation_id"]
+check("a failure's id is the run key, a fail part and 16 hex", re.fullmatch(
+    re.escape(KEY) + r":fail:[0-9a-f]{16}", op_f) is not None)
+check("another failure code is another id",
+      fr.operation_id({**fail_a, "code": "connector_rate_limited"})["operation_id"] != op_f)
+check("a failure's id never equals a write's", op_f != op_a)
+for bad in ({"rows": ROWS_A}, {"run_key": "", "rows": ROWS_A}, {"run_key": KEY}):
+    try:
+        fr.operation_id(bad)
+        refused = False
+    except fr.Refused:
+        refused = True
+    check(f"opid refuses {sorted(bad)}", refused)
+with tempfile.TemporaryDirectory() as tmp:
+    path = Path(tmp) / "write.json"
+    path.write_text(json.dumps(write_a))
+    cli = subprocess.run([sys.executable, str(_SCRIPT), "opid", str(path)],
+                         capture_output=True, text=True)
+    check("the opid command prints the id", cli.returncode == 0
+          and json.loads(cli.stdout) == {"operation_id": op_a})
+    (Path(tmp) / "bad.json").write_text("{}")
+    bad_cli = subprocess.run([sys.executable, str(_SCRIPT), "opid", str(Path(tmp) / "bad.json")],
+                             capture_output=True, text=True)
+    check("the opid command refuses arguments with no run key", bad_cli.returncode == 1)
+skill = (_ROOT / "skills" / "commons-feed-runner" / "SKILL.md").read_text()
+check("the skill sends both calls with opid's id",
+      skill.count("feed_runner.py opid write.json") == 1
+      and skill.count("feed_runner.py opid fail.json") == 1
+      and "the run key + `:fail`" not in skill)
+
 print(f"commons-feed-runner: {len(passed)} passed")
