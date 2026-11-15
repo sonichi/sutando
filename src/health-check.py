@@ -7181,6 +7181,58 @@ def check_gateway_bridge() -> "dict | None":
     return _gateway_ok_unless_lane_stalled("running")
 
 
+OWNER_DM_STALE_MIN_AGE_S = 1800.0
+
+
+def check_owner_dm_routing_stale(min_age_sec: float = OWNER_DM_STALE_MIN_AGE_S) -> "dict | None":
+    """WARN when the owner's last recorded ag2.space activity names a room that still
+    differs from the one proactive messages route to, sustained past `min_age_sec`.
+
+    `refresh_routing()` (remote_gateway_bridge.py) treats the gateway's `owner_dm_room`
+    as authoritative by design (#3995) and never adopts a room from local observation —
+    reversing that caused the flapping #4284 fixed. This probe changes no routing; it only
+    surfaces a divergence nothing else self-heals (#5072): a stale `owner_dm_room` on the
+    gateway has no owner/agent Action to redesignate it, so proactive messages can be stuck
+    on an old DM indefinitely.
+
+    Heuristic, not proof: `last-owner-activity.json` records wherever the owner last spoke,
+    a shared room included, so a stray ping there can look identical to a moved DM. None
+    when no gateway connection is configured, or either file is absent.
+    """
+    name = "owner-dm-routing-stale"
+    if not _gateway_configured():
+        return None
+    import owner_room_access  # noqa: PLC0415
+    routing = owner_room_access.owner_routing(WORKSPACE_DIR)
+    current_dm = owner_room_access.owner_dm(routing)
+    if not current_dm:
+        return {"name": name, "status": "ok", "detail": "no owner DM routing reading yet"}
+    try:
+        activity = json.loads(status_read_path("last-owner-activity.json", WORKSPACE_DIR)
+                              .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"name": name, "status": "ok", "detail": "no owner activity recorded yet"}
+    if not isinstance(activity, dict) or activity.get("channel") != "ag2space":
+        return {"name": name, "status": "ok", "detail": "owner's last recorded activity is not on ag2space"}
+    last_room = str(activity.get("channel_id") or "").strip()
+    if not last_room or last_room == current_dm:
+        return {"name": name, "status": "ok", "detail": "owner's last-active room matches proactive routing"}
+    ts = _gateway_num(activity.get("ts"), nonneg=True) or 0.0
+    age = max(0.0, time.time() - ts) if ts else 0.0
+    if age < min_age_sec:
+        return {"name": name, "status": "ok",
+                "detail": f"owner active in {last_room} {int(age)}s ago, within the "
+                          f"{int(min_age_sec)}s settle window — not yet sustained"}
+    return {
+        "name": name,
+        "status": "warn",
+        "detail": (f"owner's last ag2.space message ({int(age // 60)}m ago) came from {last_room}, "
+                   f"but proactive messages still route to {current_dm} — the gateway's owner_dm_room "
+                   "may be stuck stale (#5072), and no agent/owner Action exists yet to redesignate "
+                   "it; this signal is heuristic, a shared-room message reads the same as a moved DM"),
+    }
+
+
 def _gateway_rows(workspace: "Path | None" = None) -> "list[dict]":
     """Every row as stored (no sidecar read, no lease probe); [] with no connections record."""
     import connections  # noqa: PLC0415
@@ -13840,6 +13892,7 @@ def run_all_checks() -> list[dict]:
     # branches are unit-tested in tests/health-check-gateway-bridge.test.py; this
     # call site is exercised by the running health check, not that unit test.)
     checks += [c for c in (check_gateway_bridge(),) if c is not None]  # pragma: no cover
+    checks += [c for c in (check_owner_dm_routing_stale(),) if c is not None]  # pragma: no cover
     checks += [c for c in (check_sspace_migration(),) if c is not None]  # pragma: no cover
 
     # (External plugin probes moved out with their plugins in #1427 round ④ —
