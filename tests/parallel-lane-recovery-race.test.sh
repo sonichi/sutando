@@ -94,7 +94,9 @@ for _ in range(1000):
 
 with tempfile.TemporaryDirectory(prefix="lane-race-", dir=os.environ.get("TMPDIR")) as tmp:
     root = Path(tmp).resolve()
-    for mode in ("checkout", "clean", "child-checkout", "child-clean", "descendants", "spawn-interrupt", "cancel-failure"):
+    creation_modes = tuple(f"create-{boundary}-{sig}" for boundary in ("added", "partial")
+                           for sig in ("INT", "TERM", "HUP"))
+    for mode in ("checkout", "clean", "child-checkout", "child-clean", "descendants", "spawn-interrupt", "cancel-failure") + creation_modes:
         rec = root / mode
         rec.mkdir()
         repo = rec / "repo"
@@ -179,10 +181,23 @@ print("suite-returned")
     esac' DEBUG
 ''')
             env["BASH_ENV"] = str(bash_env)
+        if mode in creation_modes:
+            _, boundary, sig = mode.split("-")
+            env["LANE_CREATION_SIGNAL"] = sig
+            env["LANE_CREATION_BOUNDARY"] = 'CREATED="$_w"' if boundary == "added" else 'worker_backlinks[$_w]='
+            bash_env = rec / "bash-env"
+            bash_env.write_text('''trap 'if [ "$0" = "$LANE_SCHEDULER" ] && [ "${_w:-0}" = 2 ] &&
+        [[ "$BASH_COMMAND" == "$LANE_CREATION_BOUNDARY"* ]] && [ ! -e "$LANE_RACE_RECORD/signalled" ]; then
+            [ -f "$WTDIR/$_w/.git" ] || exit 99
+            printf "%s\\n" "$WTDIR/$_w" > "$LANE_RACE_RECORD/signalled"
+            kill -"$LANE_CREATION_SIGNAL" "$$"
+        fi' DEBUG
+''')
+            env["BASH_ENV"] = str(bash_env)
         scheduler = None
         try:
             with (rec / "log").open("w") as log:
-                scheduler = subprocess.Popen(["bash", lane, "1", str(rec / "files"), str(rec),
+                scheduler = subprocess.Popen(["bash", lane, "2" if mode in creation_modes else "1", str(rec / "files"), str(rec),
                                               sys.executable], cwd=repo, env=env,
                                              stdout=log, stderr=log, start_new_session=True)
                 if mode in ("checkout", "clean", "child-checkout", "child-clean"):
@@ -204,7 +219,13 @@ print("suite-returned")
             assert git(repo, "rev-parse", "HEAD") == head, "caller HEAD changed"
             assert git(repo, "symbolic-ref", "HEAD") == symbolic, "caller symbolic HEAD changed"
             assert git(repo, "show-ref") == refs, "shared branch refs changed"
-            if mode in ("checkout", "clean"):
+            if mode in creation_modes:
+                assert (rec / "signalled").exists(), "creation interrupt was not injected"
+                assert status == {"INT": 130, "TERM": 143, "HUP": 129}[sig], f"{sig} returned {status}"
+                assert not (rec / "worker").exists(), "suite started after creation interrupt"
+                assert git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1, "creation interrupt leaked a registration"
+                assert not list(lane_tmp.iterdir()), "creation interrupt leaked lane files"
+            elif mode in ("checkout", "clean"):
                 assert status != 0, "swapped worker accepted"
                 assert worker.is_symlink(), "suspect worker removed"
                 assert Path(str(worker) + ".saved").is_dir(), "original worker removed"

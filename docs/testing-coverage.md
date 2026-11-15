@@ -78,8 +78,9 @@ instead of removing it through redirected metadata. Checkout and clean run from
 the checked directory held as the current directory, so replacing its old pathname
 cannot redirect those commands. Each suite's owned process group is terminated
 and joined before recovery, including descendants left after normal suite exit.
-Interrupts defer exit until newly launched workers and suites are registered,
-then terminate owned process groups and wait before worktree cleanup.
+Interrupts defer exit through worktree creation and identity capture, and until
+newly launched workers and suites are registered. They then terminate owned
+process groups and wait before worktree cleanup.
 If descendant termination cannot be confirmed, the run fails and retains that
 worker and its registration for inspection.
 

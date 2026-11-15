@@ -183,6 +183,7 @@ trap '_lane_signal 130' INT
 trap '_lane_signal 143' TERM
 trap '_lane_signal 129' HUP
 for _w in $(seq 1 "$WORKERS"); do
+    SPAWNING=1
     _lane_git worktree add --detach -q "$WTDIR/$_w" "$REVISION" || exit 1
     CREATED="$_w"
     worker_dirs[$_w]="$WTDIR/$_w"
@@ -193,6 +194,7 @@ for _w in $(seq 1 "$WORKERS"); do
     worker_commondirs[$_w]="$(cat "${worker_gitdirs[$_w]}/commondir")" || exit 1
     worker_backlinks[$_w]="$(cat "${worker_gitdirs[$_w]}/gitdir")" || exit 1
     worker_configured_roots[$_w]="$(git -C "$WTDIR/$_w" config --get core.worktree)" || worker_configured_roots[$_w]=""
+    _lane_spawn_done
     # Installed deps are untracked, so a fresh worktree has none; share the caller's.
     if [ -d node_modules ]; then
         ln -s "$PWD/node_modules" "$WTDIR/$_w/node_modules" || exit 1
