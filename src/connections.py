@@ -1773,10 +1773,17 @@ def _channel_dir_tokens(channel_dir: Optional[str]) -> list:
         return []
 
 
+def row_token(row: Mapping[str, object], token: str) -> str:
+    """`token` as the `url|secret` a row's credential is: a combined one as it is, a bare secret joined
+    to the row's own gateway_url (`legacy_relay_token`); '' when that gateway is no gateway URL."""
+    return legacy_relay_token(token, str(row.get("gateway_url") or ""))
+
+
 def connection_credential(row: Mapping[str, object], environ: Optional[Mapping[str, str]] = None, *,
                           vault=None) -> "tuple[str, str]":
     """(gateway_url, token) for one row: the first token among its env var, its launch keys, its
-    channel env file and its vault key whose embedded gateway (if any) is the row's own host."""
+    channel env file and its vault key whose embedded gateway (if any) is the row's own host. The
+    token is always `url|secret`: a bare secret is joined to the row's gateway (`row_token`)."""
     environ = os.environ if environ is None else environ
     ref, instance = str(row["token_ref"]), str(row["instance"])
     refs = [ref] + [str(k) for k in row.get("launch_keys") or []]
@@ -1788,8 +1795,8 @@ def connection_credential(row: Mapping[str, object], environ: Optional[Mapping[s
     host = host_of_url(str(row["gateway_url"]))
 
     def own(tok) -> str:
-        tok = (tok or "").strip()
-        return tok if tok and (not gateway_url_of(tok) or host_of_url(gateway_url_of(tok)) == host) else ""
+        tok = row_token(row, tok)
+        return tok if tok and host_of_url(gateway_url_of(tok)) == host else ""
     tok = next((own(t) for t in candidates if own(t)), "")
     if not tok:
         try:
@@ -2904,7 +2911,7 @@ def _learn_missing_identity(instance: str, environ: Mapping[str, str], workspace
 
     def token_of(r):
         ref = str(r["token_ref"])
-        return (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
+        return row_token(r, (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref))
     _learn_row_identity(row, token_of, workspace, fetch=fetch, getaddrinfo=getaddrinfo)
 
 
