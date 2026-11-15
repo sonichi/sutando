@@ -1378,6 +1378,39 @@ class _Deleted(unittest.TestCase):
         self.assertEqual(self.env.read_text(), before, "the live token stays")
         self.assertFalse(Path(str(self.env) + ".retired").exists())
 
+    def test_joined_and_bare_lines_holding_the_same_secret_both_match(self):
+        # connections hands a lane its bearer joined to its gateway (<url>|<secret>); the bridge holds
+        # the bare secret either way, and a file line matches in every shape a writer may use.
+        from ag2_sparrow import gateway_credential_sources as sources
+        url = "https://chat.example/relay"
+        for raw in (f"{url}|{self.SECRET}", f"{url}%7C{self.SECRET}", self.SECRET):
+            found = sources.discover({"REMOTE_TASK_TOKEN": raw, "REMOTE_TASK_URL": "" if "|" in raw or "%7C" in raw
+                                      else url})
+            self.assertEqual(found.token, self.SECRET, raw)
+        for line in (f"AG2_REMOTE_TOKEN='{url}|{self.SECRET}'", f"AG2_REMOTE_TOKEN={url}%7C{self.SECRET}",
+                     f"REMOTE_TASK_TOKEN={self.SECRET}", f'export REMOTE_TASK_TOKEN="{self.SECRET}"'):
+            text = f"{line}\nAGENT_MXID=@gone.agent:ag2.space\nREMOTE_TASK_URL={url}\n"
+            kept, _r, keys = sources.split_deleted_binding(text, secret=self.SECRET, agent_id="@gone.agent:ag2.space")
+            self.assertEqual((kept, len(keys)), (f"REMOTE_TASK_URL={url}\n", 2), line)
+        both = (f"AG2_REMOTE_TOKEN='{url}|{self.SECRET}'\nREMOTE_TASK_TOKEN={self.SECRET}\n"
+                f"AGENT_MXID=@gone.agent:ag2.space\n")
+        self.assertEqual(sources.split_deleted_binding(both, secret=self.SECRET, agent_id="@gone.agent:ag2.space")[2],
+                         ["AG2_REMOTE_TOKEN", "REMOTE_TASK_TOKEN", "AGENT_MXID"])
+        # A joined value is never the secret itself: matching it unsplit would miss every joined line.
+        self.assertEqual(sources.split_deleted_binding(both, secret=f"{url}|{self.SECRET}",
+                                                       agent_id="@gone.agent:ag2.space")[2], [])
+
+    def test_the_bearer_check_sends_the_bare_secret(self):
+        sent = []
+        saved = gw._req
+        self.addCleanup(setattr, gw, "_req", saved)
+        gw._bearer_check = self._saved["_bearer_check"]
+        gw._req = lambda *a, **k: sent.append(gw._AUTH_HEADERS["Authorization"]) or {}
+        gw._AUTH_HEADERS["Authorization"] = f"Bearer {self.SECRET}"
+        self.addCleanup(gw._AUTH_HEADERS.__setitem__, "Authorization", f"Bearer {self._saved['TOKEN']}")
+        self.assertEqual(gw._bearer_check(), "accepted")
+        self.assertEqual(sent, [f"Bearer {self.SECRET}"])
+
 if __name__ == "__main__":
     import urllib.request  # noqa: F401 — used via gw.urllib in fixtures
     unittest.main(verbosity=1)
