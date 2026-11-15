@@ -155,6 +155,13 @@ admin="$(git rev-parse --absolute-git-dir)"
 case "$LANE_REDIRECT" in
     gitfile) printf 'gitdir: %s/.git\n' "$LANE_CALLER" > .git ;;
     symlink) mv "$worker" "$worker.saved"; ln -s "$LANE_CALLER" "$worker" ;;
+    replacement)
+        mv "$worker" "$worker.saved"
+        mkdir "$worker"
+        cp "$worker.saved/.git" "$worker/.git"
+        printf 'retain-replacement\n' > "$worker/replacement-marker"
+        printf '%s\n' "$worker" > "$LANE_REPLACEMENT_RECORD"
+        ;;
     config) git config --local core.worktree "$LANE_CALLER" ;;
     commondir) printf '%s/.git\n' "$LANE_OTHER" > "$admin/commondir" ;;
     index) rm "$admin/index"; ln -s "$LANE_CALLER/.git/index" "$admin/index" ;;
@@ -165,7 +172,7 @@ echo redirected-worker
 EOF
 git clone -q --no-local "$T/repo" "$T/other"
 export LANE_OTHER="$T/other"
-for mode in gitfile symlink config commondir index backlink admin; do
+for mode in gitfile symlink replacement config commondir index backlink admin; do
     caller="$T/$mode-repo"
     git clone -q --no-local "$T/repo" "$caller"
     caller_head="$(git -C "$caller" symbolic-ref HEAD)"
@@ -178,7 +185,7 @@ for mode in gitfile symlink config commondir index backlink admin; do
     mkdir "$T/$mode"
     printf '%s\n' "$T/redirect.sh" "$T/observe.sh" > "$T/$mode/files"
     rc=0
-    (cd "$caller" && LANE_REDIRECT="$mode" LANE_CALLER="$caller" \
+    (cd "$caller" && LANE_REDIRECT="$mode" LANE_CALLER="$caller" LANE_REPLACEMENT_RECORD="$T/replacement-path" \
         bash "$LANE" 1 "$T/$mode/files" "$T/$mode" bash) > "$T/$mode/log" 2>&1 || rc=$?
     index_same=false
     cmp -s "$T/$mode.index" "$caller/.git/index" && index_same=true
@@ -189,13 +196,19 @@ for mode in gitfile symlink config commondir index backlink admin; do
     head_same=false
     if [ "$(git --git-dir="$caller/.git" symbolic-ref -q HEAD)" = "$caller_head" ] &&
         [ "$(git --git-dir="$caller/.git" rev-parse HEAD)" = "$caller_oid" ]; then head_same=true; fi
+    retained=true
+    if [ "$mode" = replacement ]; then
+        replacement="$(cat "$T/replacement-path")"
+        [ -f "$replacement/replacement-marker" ] &&
+            [ "$(cat "$replacement/replacement-marker")" = retain-replacement ] || retained=false
+    fi
     if [ "$rc" -ne 0 ] && [ "$(cat "$T/$mode/1.rc")" = 0 ] &&
         [ ! -e "$T/$mode/2.rc" ] && [ "$index_same" = true ] &&
         [ "$staged" = caller-staged ] && [ "$working" = caller-unstaged ] &&
-        [ "$untracked" = true ] && [ "$head_same" = true ]; then
+        [ "$untracked" = true ] && [ "$head_same" = true ] && [ "$retained" = true ]; then
         echo "PASS: $mode redirection fails without changing caller index bytes or local work"
     else
-        echo "FAIL: $mode rc=$rc index_unchanged=$index_same staged=$staged working=$working untracked=$untracked head_unchanged=$head_same"
+        echo "FAIL: $mode rc=$rc index_unchanged=$index_same staged=$staged working=$working untracked=$untracked head_unchanged=$head_same retained=$retained"
         cat "$T/$mode/log"
         failed=1
     fi
@@ -274,7 +287,8 @@ with (rec / "log").open("w") as log:
             time.sleep(0.02)
         suite, child, worker = ready.read_text().split()
         os.killpg(scheduler.pid, signal.SIGINT)
-        status = scheduler.wait(timeout=5)
+        # Allow worker cancellation, descendant escalation and final cleanup.
+        status = scheduler.wait(timeout=15)
         def running(pid):
             try:
                 os.kill(int(pid), 0)

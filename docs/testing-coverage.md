@@ -71,11 +71,17 @@ worktree or staged index through inherited Git selectors.
 If a worker cannot restore its worktree, it stops before taking another suite
 and the scheduler exits nonzero. Other workers finish their remaining work;
 the run must be fixed and repeated before treating its results as complete.
-Recovery validates each worker's original canonical path and Git/index identity
-before destructive operations, refusing redirected Git metadata or a replaced
+Recovery validates each worker's original directory identity, canonical path and
+Git/index identity before destructive operations, refusing redirected Git metadata or a replaced
 worktree path. An identity mismatch retains the suspect worktree for inspection
-instead of removing it through redirected metadata. Interrupts terminate owned
-process groups and wait for workers before worktree cleanup.
+instead of removing it through redirected metadata. Checkout and clean run from
+the checked directory held as the current directory, so replacing its old pathname
+cannot redirect those commands. Each suite's owned process group is terminated
+and joined before recovery, including descendants left after normal suite exit.
+Interrupts defer exit until newly launched workers and suites are registered,
+then terminate owned process groups and wait before worktree cleanup.
+If descendant termination cannot be confirmed, the run fails and retains that
+worker and its registration for inspection.
 
 Worktrees are not an OS security sandbox: suites run with the caller's permissions
 and share repository objects and refs. These guards protect scheduler recovery;
