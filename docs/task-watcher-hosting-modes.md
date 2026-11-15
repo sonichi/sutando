@@ -110,6 +110,8 @@ in the environment of a worker spawn opts that worker out. The core is off by de
 the Mod only when `claude --version` is at least `MIN_CLAUDE_VERSION` in
 `src/agent/claude/task-watch-mod/hooks/version.ts`; below it, it logs one line and the session keeps
 the `Monitor`. The Mod checks the same floor itself.
+The worker default covers Claude workers only: `launch-worker-session.sh` hands a Codex worker to
+`launch-codex-worker-session.sh` before `add_task_watch_mod`, so a Codex worker keeps the supervisor's task notifier.
 
 ### How to check it on a worker, or turn it off
 
