@@ -10,6 +10,7 @@ reply is a result file for that task, which the asker can wait on.
     pool_ask.py --workspace WS --who                      who can be reached, and are they alive
     pool_ask.py --workspace WS --to Iiya --ask "..."      deliver a question to a worker (or `core`)
     pool_ask.py --workspace WS --to core --ask "..." --wait 300
+    pool_ask.py --workspace WS --read task-<id> [--wait 60]   read an earlier ask's reply; sends nothing
 
 The answerer replies by writing `results/<task id>.txt`; a `[no-send]` first
 line keeps it off every room, and `--wait` returns the body as soon as it lands.
@@ -44,6 +45,7 @@ sys.path.insert(0, str(_HERE))
 # it lands in is parsed for headers. Repo root is parents[3] from here.
 sys.path.insert(0, str(_HERE.parents[2] / "src"))
 from task_body_guard import confine_user_content, header_safe_value  # noqa: E402
+from local_task_protocol import iter_result_candidates, valid_archive_lookup_id  # noqa: E402
 
 pr = _sibling("pool_roster")
 rt = _sibling("pool_router")
@@ -173,14 +175,14 @@ def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
 
 
 def wait_for_reply(workspace, task_id: str, wait_s: float, *, sleep=time.sleep) -> "str | None":
-    """The reply body once `results/<task_id>.txt` exists (live, or already archived
-    by a drain), or None at the deadline."""
+    """The reply body once `results/<task_id>.txt` exists, live or in any archive layout
+    the shared locator knows, or None at the deadline."""
     ws = Path(workspace)
     deadline = time.monotonic() + wait_s
     while True:
-        for p in (ws / "results" / f"{task_id}.txt", ws / "results" / "archive" / f"{task_id}.txt"):
-            if p.exists():
-                body = p.read_text(encoding="utf-8", errors="replace")
+        for p in iter_result_candidates(ws / "results", task_id):
+            body = p.read_text(encoding="utf-8", errors="replace")
+            if body:    # an empty placeholder must not hide a published body
                 return body.split("\n", 1)[1] if body.startswith(NO_SEND) else body
         if time.monotonic() >= deadline:
             return None
@@ -194,6 +196,8 @@ def main(argv=None) -> int:
     p.add_argument("--to")
     p.add_argument("--ask")
     p.add_argument("--wait", type=float, default=0.0, help="seconds to wait for the reply")
+    p.add_argument("--read", metavar="TASK_ID",
+                   help="print the reply to an earlier ask (its task id); sends nothing")
     p.add_argument("--relayed-from", help="who the question really comes from, when it is not you")
     p.add_argument("--tier", choices=TIERS, default="team",
                    help="the tier of relayed content (never owner); default team")
@@ -206,6 +210,17 @@ def main(argv=None) -> int:
         import correlation_log
         if not correlation_log.is_task_id(a.parent_task):
             p.error(f"--parent-task {a.parent_task!r} is not a task id")
+    if a.read is not None:
+        if a.who or a.to or a.ask:
+            p.error("--read sends nothing: it does not go with --who, --to or --ask")
+        if not valid_archive_lookup_id(a.read):
+            p.error(f"--read {a.read!r} is not a task id")
+        reply = wait_for_reply(a.workspace, a.read, a.wait)
+        if a.json:
+            print(json.dumps({"task_id": a.read, "reply": reply}, indent=2, sort_keys=True))
+        else:
+            print(reply if reply is not None else f"(no reply to {a.read} yet)")
+        return 0 if reply is not None else 1
     if a.who == bool(a.to or a.ask):
         p.error("pass --who, or --to with --ask")
     if bool(a.to) != bool(a.ask):
