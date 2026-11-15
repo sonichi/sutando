@@ -51,6 +51,7 @@ PROMOTE_WORDS = re.compile(r"^(?:chore\((?:promote|back-?port)\)|(?:promote|back
                            r"|\s*\(#\d+\)$", re.I)
 HUNK = re.compile(r"^@@ [^@]* @@ ?(.*)$")
 DIFF_FILE = re.compile(r"^\+\+\+ b/(.*)$")
+FUNC_LINE = re.compile(r"[A-Za-z_$]")  # git's default funcname rule (no diff driver)
 MAX_FN = 3
 PR_FIELDS = "number title state headRefName baseRefName author{login} url"
 GH_VALUE_FLAGS = {"-R", "--repo", "-b", "--body", "-F", "--body-file", "-t", "--title", "-H", "--head",
@@ -168,7 +169,7 @@ def local_diff(run: Run, cwd: str, base: Optional[str], worktree: bool = False):
     base = base if base.startswith("origin/") else "origin/" + base
     rng = ["--merge-base", base] if worktree else [f"{base}...HEAD"]
     names = _git(run, cwd, "diff", "--name-only", *rng)
-    text = _git(run, cwd, "diff", "-U0", *rng) if names is not None else None
+    text = _git(run, cwd, "diff", "-U3", *rng) if names is not None else None  # same context as `gh pr diff`
     if text is None:
         return None, {}
     return set(filter(None, names.splitlines())), hunk_functions(text)
@@ -212,18 +213,32 @@ def _nodes(data: dict, alias: str) -> List[dict]:
 
 
 def hunk_functions(diff_text: Optional[str]) -> Dict[str, set]:
-    """{file: {hunk-header context}}: the enclosing function git names in each `@@` line."""
+    """{file: {enclosing function of each changed line}}, independent of the diff's context size.
+    The `@@` header seeds the function; a context or added line that git's default rule would name a
+    function (starts with a letter, `_` or `$`) takes over for the lines below it in the post-image."""
     res: Dict[str, set] = {}
-    cur = None
+    cur = fn = None
+    in_hunk = False
     for line in (diff_text or "").splitlines():
+        if line.startswith("diff --git "):
+            cur, in_hunk = None, False
+            continue
         m = DIFF_FILE.match(line)
-        if m:
+        if m and not in_hunk:
             cur = m[1]
             res.setdefault(cur, set())
             continue
         m = HUNK.match(line)
-        if m and cur and m[1].strip():
-            res[cur].add(m[1].strip()[:120])
+        if m:
+            in_hunk, fn = bool(cur), (m[1].strip()[:120] or None)
+            continue
+        if not in_hunk or not line or line[0] not in " +-":
+            continue
+        body = line[1:]
+        if line[0] in " +" and FUNC_LINE.match(body):
+            fn = body.strip()[:120]
+        if line[0] in "+-" and fn:
+            res[cur].add(fn)
     return res
 
 
@@ -377,10 +392,13 @@ def _one(t: dict, run: Run) -> tuple:
         unread += 1
     fn = [x for x in files if x.get("functions")]
     file_only = [x["number"] for x in files if not x.get("functions")]
+    undiffed = max(0, len(files) - MAX_FN) if _code_fns(my_fns) else 0
     detail.update({"function": [x["number"] for x in fn], "file_only": file_only, "unread_diffs": unread,
+                   "undiffed": undiffed,
                    "local_file_count": len(mine)})
-    gap = (f"Function comparison incomplete: {unread} diff read(s) failed or timed out, so same-function "
-           "overlap may be missed.") if unread else ""
+    why = ([f"{unread} diff read(s) failed or timed out"] if unread else []) + (
+        [f"{undiffed} same-file open PR(s) beyond the top {MAX_FN} were not diffed"] if undiffed else [])
+    gap = f"Function comparison incomplete: {'; '.join(why)}, so same-function overlap may be missed." if why else ""
     if not fn:
         return ("UNKNOWN", gap.rstrip("."), detail) if gap else ("OK", "", detail)
     return "FLAG", advice(t, repo, fn, len(file_only)) + ("\n" + gap if gap else ""), detail

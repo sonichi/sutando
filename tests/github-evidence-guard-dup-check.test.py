@@ -60,7 +60,7 @@ def pr(number, title, branch, state="OPEN", files=(), author=None, base=None):
 
 def diff(*hunks):
     """A unified diff: (file, enclosing-function) pairs."""
-    return "".join(f"diff --git a/{f} b/{f}\n--- a/{f}\n+++ b/{f}\n@@ -1,2 +1,3 @@ {fn}\n+x\n" for f, fn in hunks)
+    return "".join(f"diff --git a/{f} b/{f}\n--- a/{f}\n+++ b/{f}\n@@ -1,2 +1,3 @@ {fn}\n+    x = 1\n" for f, fn in hunks)
 
 
 class Fake:
@@ -89,7 +89,7 @@ class Fake:
                 return ok("origin/main\n")
             if rest[:2] == ["diff", "--name-only"]:
                 return ok("\n".join(self.local) + "\n")
-            if rest[:2] == ["diff", "-U0"]:
+            if rest[:2] == ["diff", "-U3"]:
                 return ok(diff(*self.local_fns))
             return subprocess.CompletedProcess(cmd, 1, "", "unknown git")
         if self.fail:
@@ -371,6 +371,18 @@ class Edges(Base):
         self.assertIn("Function comparison incomplete: 1 diff read(s)", text)
         self.assertEqual(self.rows()[-1]["verdict"], "FLAG")
 
+    def test_same_file_prs_beyond_the_diff_cap_are_named_not_silent(self):
+        ro = [pr(n, f"t{n}", f"fix/{n}", files=[F], author="bob", base="dev") for n in (21, 22, 23, 24)]
+        fake = Fake({"ro": ro, "viewer": {"login": "me-bot"}}, diffs={n: diff((F, "def other():")) for n in (21, 22, 23, 24)},
+                    **WORK)
+        text, _ = self.run_hook("gh pr create --title t --base dev --body x", fake)
+        self.assertIn("could not run (Function comparison incomplete: 1 same-file open PR(s) beyond the top 3 "
+                      "were not diffed", text)
+        self.assertEqual((self.rows()[-1]["verdict"], self.rows()[-1]["undiffed"]), ("UNKNOWN", 1))
+        fake = Fake({"ro": ro[:3], "viewer": {"login": "me-bot"}}, diffs={n: diff((F, "def other():")) for n in (21, 22, 23)},
+                    **WORK)
+        self.assertEqual(self.run_hook("gh pr create --title t --base dev --body x", fake)[0], "")
+
     def test_pr_diff_out_of_time_reads_nothing(self):
         fake = Fake()
         self.assertIsNone(dw.pr_diff(fake, "o/r", 5, 0.0))
@@ -447,6 +459,74 @@ class Replay(Base):
         self.assertIn("Same function changed in an open PR:\n  #3877", text)
         self.assertIn("other open PR(s) touch the same files", text)
         self.assertEqual(sum(line.startswith("  #") for line in text.splitlines()), 1)
+        self.assertIn("5 same-file open PR(s) beyond the top 3 were not diffed", text)
+
+
+class RealGit(Base):
+    """Both sides from real git: the local diff from `git diff`, the other PR's in `gh pr diff` form (3 lines
+    of context). An edit near the top of a function body must match even though git heads the
+    3-context hunk with the previous function."""
+
+    SRC = ("def alpha():\n    a = 1\n    b = 2\n    c = 3\n    return a + b + c\n\n\n"
+           "def foo(x):\n    y = x + 1\n    z = y * 2\n    w = z - 3\n    v = w + 4\n    u = v * 5\n    return u\n")
+
+    real_run = staticmethod(subprocess.run)  # the hook's subprocess.run is patched in run_hook
+
+    def _repo(self, d):
+        env = isolated_child_env(GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                                 GIT_COMMITTER_EMAIL="t@t")
+        work = Path(d, "work")
+
+        def g(*a):
+            return subprocess.run(["git", "-C", str(work), *a], check=True, capture_output=True, text=True,
+                                  env=env).stdout
+        subprocess.run(["git", "init", "-q", "-b", "main", str(work)], check=True, env=env)
+        g("remote", "add", "origin", "https://github.com/o/r.git")
+        Path(work, "m.py").write_text(self.SRC)
+        g("add", "m.py")
+        g("commit", "-qm", "base")
+        g("update-ref", "refs/remotes/origin/main", "HEAD")
+        return work, g, env
+
+    def _check(self, old, new):
+        with tempfile.TemporaryDirectory() as d:
+            work, g, env = self._repo(d)
+            edited = self.SRC.replace(old, new)
+            assert edited != self.SRC
+            g("checkout", "-qb", "other")
+            Path(work, "m.py").write_text(edited)
+            g("commit", "-qam", "other edit")
+            theirs = g("diff", "-U3", "main", "other")  # the shape `gh pr diff` returns
+            self.assertIn("@@ def alpha():", theirs) if old == "    y = x + 1\n" else None
+            g("checkout", "-q", "main")
+            g("checkout", "-qb", "mine")
+            Path(work, "m.py").write_text(edited)
+            g("commit", "-qam", "my edit")
+            other = pr(7, "other change", "other", files=["m.py"], author="someone", base="main")
+            fake = Fake({"ro": [other], "viewer": {"login": "me-bot"}}, diffs={7: theirs})
+
+            def run(cmd, **kw):
+                if cmd[0] == "git":
+                    return self.real_run(cmd, **dict(kw, env=env))
+                return fake(cmd, **kw)
+            return self.run_hook("gh pr create -t 'fix: y' -b z", run, cwd=str(work))[0]
+
+    def test_same_edit_on_the_first_body_line_matches_across_real_git_and_gh_pr_diff(self):
+        text = self._check("    y = x + 1\n", "    y = x + 10\n")
+        self.assertIn("Same function changed in an open PR:\n  #7", text)
+        self.assertIn("`def foo(x):`", text)
+
+    def test_same_edit_mid_function_matches_across_real_git_and_gh_pr_diff(self):
+        text = self._check("    u = v * 5\n", "    u = v * 50\n")
+        self.assertIn("`def foo(x):`", text)
+
+    def test_different_functions_still_do_not_match(self):
+        self.assertEqual(dw.hunk_functions(
+            "+++ b/m.py\n@@ -1,4 +1,4 @@ \n def alpha():\n-    a = 1\n+    a = 9\n     b = 2\n"),
+            {"m.py": {"def alpha():"}})
+        self.assertEqual(dw.hunk_functions(
+            "+++ b/m.py\n@@ -6,6 +6,6 @@ def alpha():\n \n \n def foo(x):\n-    y = x + 1\n+    y = x + 10\n"),
+            {"m.py": {"def foo(x):"}})
 
 
 class Cost(unittest.TestCase):

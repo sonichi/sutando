@@ -702,22 +702,30 @@ The local side is the working tree against its merge base (branch), `origin/<bas
 (`pr create`), or the reviewed PR's `gh pr diff` (review). When it changes no function in a
 non-common file, the check ends there with no GitHub call. Otherwise one `gh api graphql` read
 (5 s budget) lists the 25 most recently updated open PRs with their files; the top 3 by shared
-non-common files are diffed and their `@@` hunk-header functions compared.
+non-common files are diffed. Both sides use 3 lines of context (the `gh pr diff` shape), and each
+changed line is attributed to its enclosing function in the post-image: the `@@` header seeds it and
+a context or added line that git's default rule names a function takes over below it. So an edit on
+the first lines of a body matches even when git heads the hunk with the previous function.
 
-A failed or timed-out read with no hit prints one line, `Duplicate-work check could not run
-(...)`, and logs UNKNOWN; with a hit, the FLAG names the unread diffs. Output is PreToolUse
+A failed or timed-out diff read, or same-file candidates beyond the top 3 left undiffed, makes
+the comparison incomplete: with no hit that prints one line, `Duplicate-work check could not run
+(Function comparison incomplete: ...)`, and logs UNKNOWN; with a hit, the FLAG names the gap. Output is PreToolUse
 `additionalContext` (exit 0). This hook never emits `permissionDecision: deny`.
 
 One row per trigger goes to `<workspace>/logs/dup-work.jsonl` (`ts`, `trigger`, `repo`,
-`branch`, `pr`, `verdict` FLAG / OK / UNKNOWN, `function`, `file_only`, `unread_diffs`,
+`branch`, `pr`, `verdict` FLAG / OK / UNKNOWN, `function`, `file_only`, `unread_diffs`, `undiffed`,
 `local_file_count`, `elapsed_ms`). `python3 hooks/_dup_work.py --summary` prints counts by
 verdict and trigger and p50/p95 `elapsed_ms`. `env.DUP_WORK_CHECK: off` in
 `sutando.config.local.json` turns it off.
 
-**Known limits.** One command at a time: a branch made by a script, alias or another tool is
-not seen. A new branch with no local change yet has nothing to compare. Only the 25 most
-recently updated open PRs are seen and 3 are diffed. Function identity is git's hunk-header
-context. Duplicates by ticket id or title, and closed or merged prior work, are no longer
+**Known limits.** It is a pre-review collision detector, not a before-you-start check: a new
+branch on a clean tree has nothing to compare, so in the usual flow it fires at `pr create` or
+review. One command at a time: a branch made by a script, alias or another tool is not seen.
+Only the 25 most recently updated open PRs are seen; same-file PRs past the top 3 are named as
+undiffed, but older open PRs outside the 25 are not. "Another author" is the GitHub login, so
+agents sharing one login are never flagged against each other. Function identity follows git's
+default funcname rule (a line starting with a letter, `_` or `$`), so an indented method counts
+under its class. Duplicates by ticket id or title, and closed or merged prior work, are no longer
 reported. Codex-core sessions do not load Claude hooks.
 
 ### Registration
