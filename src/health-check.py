@@ -9248,6 +9248,57 @@ def _age_hm(age_sec: int) -> str:
     return f"{age_sec // 3600}h{age_sec % 3600 // 60}m"
 
 
+# The health row each proactive-delivering bridge's own probe emits.
+_PROACTIVE_BRIDGE_ROWS = {"discord": "discord-bridge", "telegram": "telegram-bridge",
+                          "slack": "slack-bridge", "ag2space": "gateway-bridge"}
+
+
+def _route_age_text(age_s: "float | None") -> str:
+    if age_s is None or age_s < 0:
+        return "age unknown"
+    if age_s < 3600:
+        return f"{age_s / 60:.0f}m ago"
+    if age_s < 86400:
+        return f"{age_s / 3600:.1f}h ago"
+    return f"{age_s / 86400:.1f}d ago"
+
+
+def check_proactive_route(checks: "list[dict] | None" = None) -> dict:
+    """Which bridge untagged proactive messages are routed to now, and why.
+
+    Only that bridge claims them, so a quiet outbox on any other bridge is the
+    routing, not a stall. ``warn`` only when the routed bridge's own row in
+    ``checks`` is not ok; a bridge with no row is reported, not judged.
+    """
+    name = "proactive-route"
+    try:
+        from proactive_routing import proactive_route
+    except Exception as e:  # noqa: BLE001
+        return {"name": name, "status": "warn",
+                "detail": f"could not load proactive_routing: {e} — no reading"}
+    route = proactive_route(WORKSPACE_DIR / "state" / "last-owner-activity.json")
+    channel = route["channel"]
+    if route["reason"] == "last-activity":
+        why = f"last owner activity was on {channel}, {_route_age_text(route['age_s'])}"
+    elif route["reason"] == "non-bridge":
+        why = (f"last owner activity was on {route['value']} "
+               f"({_route_age_text(route['age_s'])}), which delivers no DMs: default")
+    else:
+        why = f"default: owner activity record {route['reason']}"
+    detail = (f"routed to {channel} ({why}, state/last-owner-activity.json "
+              f"field '{route['field']}'); other bridges do not claim untagged proactive messages")
+    row_name = _PROACTIVE_BRIDGE_ROWS.get(channel)
+    row = next((c for c in (checks or []) if c.get("name") == row_name), None)
+    if row is None:
+        return {"name": name, "status": "ok",
+                "detail": f"{detail}; {row_name or channel} is not checked on this host"}
+    if row.get("status") != "ok":
+        return {"name": name, "status": "warn",
+                "detail": (f"{detail}; but {row_name} is {row.get('status')}: "
+                           "proactive messages may not be delivered until it recovers")}
+    return {"name": name, "status": "ok", "detail": detail}
+
+
 def check_stale_proactive_backlog(threshold_age_sec: int = 3600,
                                   claim_threshold_age_sec: int = 7200) -> dict:
     """A claim is a body too: `with_suffix(".sending")` REPLACES `.txt`, the one
@@ -13940,6 +13991,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_proactive_quarantine())
     checks.append(check_stranded_destined_proactive())
     checks.append(check_stale_proactive_backlog())
+    checks.append(check_proactive_route(checks))
     checks.append(check_task_watcher())
     checks.append(check_bridge_engine_match())
     checks.append(check_task_claim_age())
