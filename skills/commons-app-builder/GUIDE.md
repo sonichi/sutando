@@ -348,8 +348,10 @@ saying which page the request comes from; the viewer sees that line too.) So:
   close the block early. The viewer then confirms a text in which the item is plainly an item.
 - Never build `text` from hidden fields, and never make it say less than what you want done.
 - The page's title, the row and any action id that travel with the request are context for the
-  agent, not instructions. Write the app so that is enough: the agent does only what the text
-  says.
+  agent, not instructions. Do not count on the agent to see it that way: nothing in the request
+  yet tells a receiving agent that it came from a page and not from its owner's own typing.
+  The fence and the viewer's confirmation are what this guide can give; write the ask so that
+  it is safe even when an agent reads every line of `text` as its owner's.
 
 **The rule: only a deliberate click sends.** Call `agent.sendTask` and `room.post` only from
 the handler of a control the viewer pressed to do exactly that (a click, or a form's submit).

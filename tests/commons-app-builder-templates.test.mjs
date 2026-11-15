@@ -1819,6 +1819,18 @@ for (const [reason, shown] of [
     assert.equal(attemptOf(sent(r)[1].key), attemptOf(sent(r)[0].key) + 1);
   });
 }
+{ // The guide's table and the template's maps are two copies of one list: they must agree.
+  const guide = readFileSync(join(ROOT, 'skills', 'commons-app-builder', 'GUIDE.md'), 'utf8');
+  const table = guide.slice(guide.indexOf('| `reason`, exactly |'), guide.indexOf('`agent.list()` normally resolves'));
+  const inGuide = [...table.matchAll(/^\| `([^`]+)` \|/gm)].map((row) => row[1]).filter((r) => r !== 'reason').sort();
+  const page = readFileSync(join(ROOT, 'skills', 'commons-app-builder', 'templates', 'review-list', 'page.html'), 'utf8');
+  const maps = page.slice(page.indexOf('const REFUSED ='), page.indexOf('const asked = new Map()'));
+  const inPage = [...maps.matchAll(/^\s+(?:'([^']+)'|([a-z]+)): \[/gm)].map((row) => row[1] || row[2]).sort();
+  check('review/the-guide-table-and-the-template-list-the-same-reasons', () => {
+    assert.ok(inGuide.length >= 20, String(inGuide.length));
+    assert.deepEqual(inPage, inGuide);
+  });
+}
 { // A refusal with no reason, and a call that throws, still say something.
   const r = await run('review-list', reviewOpts({ rows: reviewRows(), taskAnswers: [{ ok: false }, () => { throw new Error('gone'); }] }));
   askButtons(r)[0].click();
