@@ -62,6 +62,8 @@ class FakeSession:
     """One Claude session's scheduler: unique ids, creates, deletes, a truncating CronList."""
     def __init__(self):
         self.jobs = []
+        self.fail_delete = set()   # ids whose CronDelete fails; "*" fails every delete
+        self.deletes = []          # every delete attempted, in order
 
     def create(self, cron, prompt):
         job_id = f"job-{next(_ids)}"
@@ -69,7 +71,11 @@ class FakeSession:
         return job_id
 
     def delete(self, job_id):
+        self.deletes.append(job_id)
+        if job_id in self.fail_delete or "*" in self.fail_delete:
+            return False
         self.jobs = [j for j in self.jobs if j["id"] != job_id]
+        return True
 
     def cron_list(self):
         return [dict(j, prompt=j["prompt"][:TRUNC]) for j in self.jobs]
@@ -126,17 +132,24 @@ class Case(unittest.TestCase):
         r = subprocess.run(["bash", "-c", block], capture_output=True, text=True, env=self.env(owner))
         return r.returncode, (json.loads(r.stdout) if r.returncode == 0 else None), r.stderr
 
-    def record(self, name, job_id):
-        """The step's own `--record` command, with its variables defined as the block defines them."""
-        m = re.search(r"`(\"\$SUTANDO_PY\"[^`]*--record <name> <new job id>)`", step25())
+    def step_cmd(self, flag, name, job_id):
+        """One of the step's own helper commands, with its variables defined as the block defines them."""
+        m = re.search(r"`(\"\$SUTANDO_PY\"[^`]*" + re.escape(flag) + r" <name> <[a-z ]*id>)`", step25())
         if not m:
             return None
         defs = "\n".join(ln for ln in self.block().splitlines() if re.match(r"(REPO|H|CF|REG)=", ln))
-        cmd = m.group(1).replace("<name>", name).replace("<new job id>", job_id)
+        cmd = re.sub(r"<name>", name, m.group(1))
+        cmd = re.sub(r"<[a-z ]*id>", job_id, cmd)
         return subprocess.run(["bash", "-c", defs + "\n" + cmd], capture_output=True, text=True,
                               env=self.env(W))
 
-    def startup(self, watcher_ready=True, jobs=None):
+    def record(self, name, job_id):
+        return self.step_cmd("--record", name, job_id)
+
+    def confirm_deleted(self, name, job_id):
+        return self.step_cmd("--confirm-deleted", name, job_id)
+
+    def startup(self, watcher_ready=True, jobs=None, crash_after_record=False):
         """Worker-mode steps 1-2.5 as the SKILL text directs them."""
         answer = self.bootstrap(watcher_ready)
         if answer not in answers_that_register(step25()):
@@ -145,13 +158,18 @@ class Case(unittest.TestCase):
         if rc != 0:
             return answer, rc
         for item in plan:
-            if item.get("action", "create") == "keep":
+            name = item["name"]
+            if item.get("action", "create") != "keep":
+                new = self.session.create(item["cron"], item["registered_prompt"])
+                self.record(name, new)
+            if crash_after_record:
                 continue
-            new = self.session.create(item["cron"], item["registered_prompt"])
-            self.record(item["name"], new)
             for old in item.get("delete_ids", []):
-                assert new in [j["id"] for j in self.session.jobs]
                 self.session.delete(old)
+                if old not in [j["id"] for j in self.session.jobs]:
+                    self.confirm_deleted(name, old)
+            for gone in item.get("clear_ids", []):
+                self.confirm_deleted(name, gone)
         return answer, 0
 
     def view(self):
@@ -296,6 +314,115 @@ class TestRegistry(Case):
         self.assertFalse(self.registry.exists())
 
 
+class TestReplacementCleanup(Case):
+    """A replacement is create, record, delete: the old id must outlive a failed or skipped delete."""
+    def change_cron(self, cron):
+        self.crons[0]["cron"] = cron
+
+    def ids(self):
+        return [j["id"] for j in self.session.jobs]
+
+    def test_a_failed_delete_is_retried_alone_on_the_next_startup(self):
+        self.startup()
+        (old,) = self.ids()
+        self.change_cron("9 * * * *")
+        self.session.fail_delete = {old}
+        self.startup()
+        self.assertEqual(len(self.session.jobs), 2)
+        self.session.fail_delete = set()
+        self.session.deletes.clear()
+        plan = self.plan()
+        self.assertEqual([(p["action"], p["delete_ids"]) for p in plan], [("keep", [old])])
+        self.startup()
+        self.assertEqual(self.session.deletes, [old])
+        self.assertEqual(len(self.session.jobs), 1)
+        self.assertEqual(self.session.jobs[0]["cron"], "9 * * * *")
+
+    def test_crash_after_record_before_delete_deletes_the_old_id_exactly_once(self):
+        self.startup()
+        (old,) = self.ids()
+        self.change_cron("9 * * * *")
+        self.startup(crash_after_record=True)
+        self.assertEqual(len(self.session.jobs), 2)
+        self.session.deletes.clear()
+        self.startup()
+        self.startup()
+        self.assertEqual(self.session.deletes, [old])
+        self.assertEqual(len(self.session.jobs), 1)
+
+    def test_a_confirmed_delete_clears_the_pending_id_and_the_next_plan_is_keep(self):
+        self.startup()
+        (old,) = self.ids()
+        self.change_cron("9 * * * *")
+        self.startup()
+        self.assertEqual(cpg.load_registry(str(self.registry))["event-mining-hourly"]["pending"], [])
+        plan = self.plan()
+        self.assertEqual([(p["action"], p["delete_ids"], p["clear_ids"]) for p in plan], [("keep", [], [])])
+        self.assertNotIn(old, self.ids())
+
+    def test_two_replacements_while_a_delete_keeps_failing_lose_neither_pending_id(self):
+        self.startup()
+        (first,) = self.ids()
+        self.session.fail_delete = {"*"}
+        self.change_cron("9 * * * *")
+        self.startup()
+        second = [i for i in self.ids() if i != first][0]
+        self.change_cron("11 * * * *")
+        self.startup()
+        self.assertEqual(len(self.session.jobs), 3)
+        pending = cpg.load_registry(str(self.registry))["event-mining-hourly"]["pending"]
+        self.assertEqual(sorted(pending), sorted([first, second]))
+        self.session.fail_delete = set()
+        self.startup()
+        self.assertEqual(len(self.session.jobs), 1)
+        self.assertEqual(self.session.jobs[0]["cron"], "11 * * * *")
+        self.assertEqual(cpg.load_registry(str(self.registry))["event-mining-hourly"]["pending"], [])
+
+    def test_a_pending_id_already_gone_is_cleared_not_deleted(self):
+        self.startup()
+        (old,) = self.ids()
+        self.change_cron("9 * * * *")
+        self.session.fail_delete = {old}
+        self.startup()
+        # the job vanishes on its own (session expiry or a manual delete)
+        self.session.jobs = [j for j in self.session.jobs if j["id"] != old]
+        self.session.deletes.clear()
+        (p,) = self.plan()
+        self.assertEqual((p["action"], p["delete_ids"], p["clear_ids"]), ("keep", [], [old]))
+        self.startup()
+        self.assertEqual(self.session.deletes, [])
+        self.assertEqual(cpg.load_registry(str(self.registry))["event-mining-hourly"]["pending"], [])
+
+    def test_a_gone_recorded_job_still_deletes_a_pending_one_still_listed(self):
+        self.startup()
+        (old,) = self.ids()
+        self.change_cron("9 * * * *")
+        self.session.fail_delete = {old}
+        self.startup()
+        new = [i for i in self.ids() if i != old][0]
+        self.session.jobs = [j for j in self.session.jobs if j["id"] != new]
+        (p,) = self.plan()
+        self.assertEqual((p["action"], p["delete_ids"]), ("create", [old]))
+
+    def test_confirm_deleted_refuses_an_unknown_entry_and_ignores_an_unknown_id(self):
+        self.startup()
+        reg = str(self.registry)
+        self.assertEqual(self.confirm_deleted("no-such-entry", "x").returncode, 3)
+        before = self.registry.read_text()
+        self.assertEqual(self.confirm_deleted("event-mining-hourly", "not-pending").returncode, 0)
+        self.assertEqual(self.registry.read_text(), before)
+        self.assertEqual(cpg.load_registry(reg)["event-mining-hourly"]["pending"], [])
+
+    def test_a_corrupt_pending_field_registers_nothing(self):
+        self.startup()
+        data = json.loads(self.registry.read_text())
+        data["entries"]["event-mining-hourly"]["pending"] = "oops"
+        self.registry.write_text(json.dumps(data))
+        rc, plan, err = self.helper(W)
+        self.assertEqual((rc, plan), (3, None))
+        self.assertIn("corrupt", err)
+
+
 class TestFailClosed(Case):
     def refused(self, body=None, expect="register nothing"):
         rc, plan, err = self.helper(W, jobs=body)
@@ -404,6 +531,34 @@ class TestInProcess(Case):
             cpg.plan_cron_actions(view, [], {})
         self.assertEqual(cpg.plan_cron_actions([{"name": "m", "registered_prompt": None}], [], {}), [])
 
+    def test_record_moves_the_superseded_id_to_pending_and_confirm_clears_it(self):
+        reg = str(self.d / "state" / "p.json")
+        entry = self.view()[0]
+        cpg.record(reg, entry, entry["registered_prompt"], "old")
+        cpg.record(reg, entry, entry["registered_prompt"], "old")
+        self.assertEqual(cpg.load_registry(reg)[entry["name"]]["pending"], [])
+        cpg.record(reg, entry, entry["registered_prompt"], "new")
+        cpg.record(reg, entry, entry["registered_prompt"], "newer")
+        self.assertEqual(cpg.load_registry(reg)[entry["name"]]["pending"], ["old", "new"])
+        cpg.confirm_deleted(reg, entry["name"], "old")
+        cpg.confirm_deleted(reg, entry["name"], "never-pending")
+        self.assertEqual(cpg.load_registry(reg)[entry["name"]]["pending"], ["new"])
+        with self.assertRaises(cpg.ListingError):
+            cpg.confirm_deleted(reg, "other", "x")
+
+    def test_main_confirm_deleted(self):
+        reg = str(self.d / "state" / "c.json")
+        entry = self.view()[0]
+        cpg.record(reg, entry, entry["registered_prompt"], "a")
+        cpg.record(reg, entry, entry["registered_prompt"], "b")
+        rc, out, err = self.run_main(self.cfg(), "--owner", W, "--registry", reg,
+                                     "--confirm-deleted", entry["name"], "a")
+        self.assertEqual(rc, 0)
+        self.assertEqual(cpg.load_registry(reg)[entry["name"]]["pending"], [])
+        rc, out, err = self.run_main(self.cfg(), "--owner", W, "--registry", reg,
+                                     "--confirm-deleted", "nope", "a")
+        self.assertEqual(rc, 3)
+
     def test_main_plan_record_and_refusals(self):
         rf = self.d / "listing.json"
         rf.write_text("[]")
@@ -444,7 +599,8 @@ class TestSkillText(unittest.TestCase):
         step = step25()
         for needle in ('LISTING="$(mktemp', "<<'JSON'", '--registered "$LISTING"', '--registry "$REG"',
                        "--record <name> <new job id>", "Fail closed", "create-confirm-delete",
-                       "delete_ids", "unknowable", "exactly its configured"):
+                       "delete_ids", "clear_ids", "--confirm-deleted <name> <deleted id>", "pending",
+                       "unknowable", "exactly its configured"):
             self.assertIn(needle, step)
 
 

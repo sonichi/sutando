@@ -210,7 +210,9 @@ def entry_hash(entry: dict, prompt: str) -> str:
 
 
 def load_registry(path) -> dict:
-    """{name: {id, hash}} this worker recorded; an absent file means nothing recorded yet."""
+    """{name: {id, hash, pending}} this worker recorded; an absent file means nothing recorded yet.
+
+    `pending` lists superseded job ids not yet confirmed deleted."""
     if not path:
         raise ListingError("registry path is empty")
     try:
@@ -224,18 +226,20 @@ def load_registry(path) -> dict:
     except ValueError as exc:
         raise ListingError(f"registry {path} is corrupt: {exc}")
     ents = data.get("entries") if isinstance(data, dict) else None
-    if not isinstance(ents, dict) or not all(
-            isinstance(v, dict) and _text(v.get("id")) and _text(v.get("hash")) for v in ents.values()):
+    ok = isinstance(ents, dict)
+    if ok:
+        for v in ents.values():
+            pend = v.get("pending", []) if isinstance(v, dict) else None
+            ok = ok and isinstance(v, dict) and _text(v.get("id")) and _text(v.get("hash")) \
+                and isinstance(pend, list) and all(_text(i) for i in pend)
+    if not ok:
         raise ListingError(f"registry {path} is corrupt: unexpected shape")
+    for v in ents.values():
+        v["pending"] = [str(i) for i in v.get("pending", [])]
     return ents
 
 
-def record(path, entry: dict, prompt: str, job_id) -> None:
-    """Write one entry's job id and content hash into the registry (atomic)."""
-    if not _text(job_id):
-        raise ListingError("job id to record is blank")
-    ents = load_registry(path)
-    ents[entry["name"]] = {"id": str(job_id), "hash": entry_hash(entry, prompt)}
+def _save(path, ents: dict) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(target.name + f".tmp{os.getpid()}")
@@ -243,11 +247,36 @@ def record(path, entry: dict, prompt: str, job_id) -> None:
     os.replace(tmp, target)
 
 
+def record(path, entry: dict, prompt: str, job_id) -> None:
+    """Record the new job id for an entry; the id it supersedes becomes pending deletion."""
+    if not _text(job_id):
+        raise ListingError("job id to record is blank")
+    ents = load_registry(path)
+    old = ents.get(entry["name"], {})
+    pending = list(old.get("pending", []))
+    if old.get("id") and old["id"] != str(job_id) and old["id"] not in pending:
+        pending.append(old["id"])
+    ents[entry["name"]] = {"id": str(job_id), "hash": entry_hash(entry, prompt),
+                           "pending": [i for i in pending if i != str(job_id)]}
+    _save(path, ents)
+
+
+def confirm_deleted(path, name: str, job_id) -> None:
+    """Drop a pending id once the session has seen it gone from CronList."""
+    ents = load_registry(path)
+    if name not in ents:
+        raise ListingError(f"no registry record for {name!r}")
+    ents[name]["pending"] = [i for i in ents[name]["pending"] if i != str(job_id)]
+    _save(path, ents)
+
+
 def plan_cron_actions(view: list, jobs: list, registry: dict) -> list:
-    """Per entry: create / keep / replace (old id to delete once the new job is confirmed).
+    """Per entry: create / keep / replace, plus the old ids to delete and the settled ones to clear.
 
     Identity is the job id the worker recorded, matched against the listed ids, which
-    CronList never truncates; the dispatched prompt is exactly the configured one."""
+    CronList never truncates; the dispatched prompt is exactly the configured one.
+    `delete_ids` are superseded jobs still listed (retried every startup until gone);
+    `clear_ids` are pending ids already absent, for --confirm-deleted."""
     names = [e.get("name") for e in view]
     dupes = sorted({n for n in names if isinstance(n, str) and names.count(n) > 1})
     if dupes:
@@ -259,13 +288,17 @@ def plan_cron_actions(view: list, jobs: list, registry: dict) -> list:
         if not prompt or not isinstance(name, str) or not name.strip():
             continue
         rec = registry.get(name)
+        pending = rec["pending"] if rec else []
+        delete = [i for i in pending if i in listed]
         if rec and rec["id"] in listed:
             action = "keep" if rec["hash"] == entry_hash(e, prompt) else "replace"
+            if action == "replace":
+                delete = [rec["id"]] + delete
         else:
             action = "create"
         plan.append({"name": name, "action": action, "cron": e.get("cron"),
-                     "registered_prompt": prompt,
-                     "delete_ids": [rec["id"]] if action == "replace" else []})
+                     "registered_prompt": prompt, "delete_ids": delete,
+                     "clear_ids": [i for i in pending if i not in listed]})
     return plan
 
 
@@ -283,6 +316,8 @@ def main(argv=None) -> int:
                     help="this worker's record of the job id behind each registered entry")
     ap.add_argument("--record", nargs=2, metavar=("NAME", "JOB_ID"), default=None,
                     help="record the job id CronCreate returned for NAME, then exit")
+    ap.add_argument("--confirm-deleted", nargs=2, metavar=("NAME", "JOB_ID"), default=None,
+                    help="clear JOB_ID from NAME's pending deletions after CronList shows it gone")
     args = ap.parse_args(argv)
     try:
         cfg = json.loads(Path(args.crons_json).read_text())
@@ -295,7 +330,7 @@ def main(argv=None) -> int:
     unnamed = [e for e in view if not isinstance(e.get("name"), str) or not e["name"].strip()]
     if unnamed:
         print(f"refusing {len(unnamed)} pinned entr(y/ies) with no name", file=sys.stderr)
-    if args.record is not None or args.registered is not None:
+    if args.record is not None or args.confirm_deleted is not None or args.registered is not None:
         try:
             if args.record is not None:
                 name, job_id = args.record
@@ -303,6 +338,9 @@ def main(argv=None) -> int:
                 if entry is None or not entry.get("registered_prompt"):
                     raise ListingError(f"no pinned entry named {name!r} to record")
                 record(args.registry, entry, entry["registered_prompt"], job_id)
+                return 0
+            if args.confirm_deleted is not None:
+                confirm_deleted(args.registry, *args.confirm_deleted)
                 return 0
             view = plan_cron_actions(view, load_jobs(args.registered), load_registry(args.registry))
         except ListingError as exc:
