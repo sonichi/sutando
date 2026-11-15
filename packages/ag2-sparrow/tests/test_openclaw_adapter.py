@@ -166,10 +166,10 @@ class ConnectorTest(unittest.TestCase):
         self.assertEqual(self.metrics()[0]["event_type"], "room.joined")
 
     def test_trigger_of_keeps_registry_playbooks_only(self):
-        for pb in ("room-onboard", "summon"):
+        for pb in ("room-onboard", "summon", "email"):
             self.assertEqual(oc.trigger_of({"event_type": "commons.summon", "playbook": pb}),
                              ("commons.summon", pb))
-        for pb in ("email", "plain-skill", "../evil", "Summon", ""):
+        for pb in ("plain-skill", "../evil", "Summon", ""):
             self.assertEqual(oc.trigger_of({"event_type": "commons.summon", "playbook": pb}),
                              ("commons.summon", None), pb)
 
