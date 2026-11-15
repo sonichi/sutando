@@ -545,6 +545,36 @@ def token_file_url(text: str) -> str:
     return first(_assignments(text, URL_KEYS), URL_KEYS)[0]
 
 
+def split_deleted_binding(text: str, *, secret: str, agent_id: str) -> "tuple[str, list[str], list[str]]":
+    """(kept text, removed lines, their keys) for a credential file whose agent the server deleted: the
+    lines holding `secret` under a token key (a lane-suffixed one included) or alone (a token file's bare
+    line), and the AGENT_MXID / AGENT_ID lines naming `agent_id`. Any other credential stays."""
+    kept: "list[str]" = []
+    removed: "list[str]" = []
+    keys: "list[str]" = []
+    for line in text.splitlines(keepends=True):
+        bare = line.strip()
+        key, _, val = bare.partition("=")
+        key = key.strip()
+        key = key[len("export "):].strip() if key.startswith("export ") else key
+        assigned = bool(bare) and not bare.startswith("#") and "=" in bare
+        value = unquote(val) if assigned else ""
+        if assigned and secret and any(key == k or key.startswith(k + "_") for k in TOKEN_KEYS) \
+                and contract.parse_onboarding_token(value)[1] == secret:
+            hit = key
+        elif assigned and agent_id and key in ("AGENT_MXID", "AGENT_ID") and value == agent_id:
+            hit = key
+        elif bare and not assigned and not bare.startswith("#") and secret \
+                and contract.parse_onboarding_token(bare)[1] == secret:
+            hit = "token"
+        else:
+            kept.append(line)
+            continue
+        removed.append(line if line.endswith("\n") else line + "\n")
+        keys.append(hit)
+    return "".join(kept), removed, keys
+
+
 def token_from_files(files: "Sequence[EnvFile]"):
     """The file tier: (token, url, path, values) of the first file carrying a token, with the URL
     from that same file; ('', '', '', {}) when none does. A blank secret is absence."""

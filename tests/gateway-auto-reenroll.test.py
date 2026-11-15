@@ -924,6 +924,118 @@ class _Refused(unittest.TestCase):
                                     "refused (HTTP 503 reenroll_disabled)")
 
 
+class _Deleted(unittest.TestCase):
+    """An agent its owner deleted: the claim's 410 agent_deleted ends retrying and unbinds the file."""
+
+    SECRET = "cd" * 24
+    OTHER = "ef" * 24
+
+    def setUp(self):
+        names = ("URL", "TOKEN", "TOKEN_FILE", "REENROLL_ENABLED", "AUTH_RECHECK_INTERVAL",
+                 "REENROLL_PROBE_EVERY", "GATEWAY_STATUS_FILE", "_log", "_heartbeat_singleton",
+                 "_auth_probe")
+        self._saved = {n: getattr(gw, n) for n in names}
+        self._env = gw.os.environ.get("AGENT_MXID")
+        gw.os.environ["AGENT_MXID"] = "@gone.agent:ag2.space"
+        self.dir = Path(tempfile.mkdtemp())
+        self.env = self.dir / ".env"
+        self.env.write_text(
+            "# desktop connect\n"
+            f"AG2_REMOTE_TOKEN='https://chat.example/relay|{self.SECRET}'\n"
+            "AGENT_MXID=@gone.agent:ag2.space\n"
+            f"AG2_REMOTE_TOKEN_S_DSPACE='https://chat.s.example/relay|{self.OTHER}'\n"
+            "REMOTE_PROACTIVE_ROOM=!keep:ag2.space\n")
+        self.env.chmod(0o600)
+        gw.URL = "https://chat.example/relay"
+        gw.TOKEN = self.SECRET
+        gw.TOKEN_FILE = str(self.env)
+        gw.REENROLL_ENABLED = True
+        gw.AUTH_RECHECK_INTERVAL = 0
+        gw.REENROLL_PROBE_EVERY = 1
+        gw.GATEWAY_STATUS_FILE = self.dir / "gateway-status.json"
+        gw._log = lambda m: None
+        gw._auth_probe = lambda: self.fail("probed a deleted agent's bearer")
+        self.claims = []
+        _reset()
+
+    def tearDown(self):
+        for n, v in self._saved.items():
+            setattr(gw, n, v)
+        if self._env is None:
+            gw.os.environ.pop("AGENT_MXID", None)
+        else:
+            gw.os.environ["AGENT_MXID"] = self._env
+        _reset()
+
+    def _answer(self, status, body):
+        def opener(req, timeout=0):
+            self.claims.append(req.full_url)
+            raise urllib.error.HTTPError(req.full_url, status, "x", {}, io.BytesIO(body))
+        real = gw.urllib.request.urlopen
+        gw.urllib.request.urlopen = opener
+        self.addCleanup(setattr, gw.urllib.request, "urlopen", real)
+
+    def _status(self):
+        return json.loads(gw.GATEWAY_STATUS_FILE.read_text())
+
+    def test_deleted_agent_stops_retrying_unbinds_and_resumes_on_a_new_credential(self):
+        self._answer(410, b'{"error":"agent_deleted"}')
+        beats = {"n": 0}
+        seen = []
+
+        def beat():
+            beats["n"] += 1
+            if beats["n"] == 1:
+                seen.append(self._status())
+                seen.append(self.env.read_text())
+            if beats["n"] == 3:   # a new agent's connect writes a fresh credential
+                self.env.write_text(self.env.read_text()
+                                    + "AG2_REMOTE_TOKEN='https://chat.example/relay|" + "12" * 24 + "'\n")
+            return True
+        gw._heartbeat_singleton = beat
+        self.assertTrue(gw._recover_auth(401))
+        self.assertEqual(len(self.claims), 1, "a deleted agent is claimed once, never again")
+        status, unbound = seen
+        self.assertEqual(status["binding"], "deleted")
+        self.assertEqual(status["reenroll"]["deleted"], True)
+        self.assertEqual(status["reenroll"]["agent_id"], "@gone.agent:ag2.space")
+        self.assertTrue(status["reenroll"]["credential_retired"])
+        self.assertIn("agent deleted", status["error"])
+        self.assertNotIn(self.SECRET, unbound)
+        self.assertNotIn("AGENT_MXID", unbound)
+        self.assertIn(self.OTHER, unbound, "another lane's credential stays")
+        self.assertIn("REMOTE_PROACTIVE_ROOM=!keep:ag2.space", unbound)
+        retired = Path(str(self.env) + ".retired")
+        self.assertIn(self.SECRET, retired.read_text())
+        self.assertIn("AGENT_MXID=@gone.agent:ag2.space", retired.read_text())
+        self.assertEqual(retired.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.env.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(gw.TOKEN, "12" * 24)
+        self.assertNotIn("deleted", gw._reenroll_state)
+
+    def test_other_refusals_keep_the_binding(self):
+        for status, body in ((410, b'{"error":"gone"}'), (403, b'{"error":"reenroll_blocked"}'),
+                             (503, b'{"error":"agent_deleted"}')):
+            _reset()
+            self._answer(status, body)
+            gw._reenroll_claim()
+            self.assertNotIn("deleted", gw._reenroll_state, (status, body))
+        self.assertIn(self.SECRET, self.env.read_text())
+
+    def test_split_retired_moves_only_the_dead_secret_and_id(self):
+        from ag2_sparrow import gateway_credential_sources as sources
+        text = ("export REMOTE_TASK_TOKEN=" + self.SECRET + "\n"
+                "AGENT_ID=@someone.else:ag2.space\n"
+                "AGENT_MXID='@gone.agent:ag2.space'\n"
+                "https://chat.example/relay|" + self.SECRET + "\n"
+                "AG2_REMOTE_TOKEN='https://chat.example/relay|" + self.OTHER + "'\n")
+        kept, retired, keys = sources.split_deleted_binding(text, secret=self.SECRET,
+                                                            agent_id="@gone.agent:ag2.space")
+        self.assertEqual(keys, ["REMOTE_TASK_TOKEN", "AGENT_MXID", "token"])
+        self.assertEqual(kept, "AGENT_ID=@someone.else:ag2.space\n"
+                               "AG2_REMOTE_TOKEN='https://chat.example/relay|" + self.OTHER + "'\n")
+        self.assertEqual(len(retired), 3)
+
 if __name__ == "__main__":
     import urllib.request  # noqa: F401 — used via gw.urllib in fixtures
     unittest.main(verbosity=1)

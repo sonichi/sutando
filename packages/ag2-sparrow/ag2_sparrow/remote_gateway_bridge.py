@@ -332,6 +332,7 @@ from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import has_skip_action
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
+from . import deleted_binding
 from . import result_labels
 from .proactive_routing import (PROACTIVE_OUTBOX_DIRNAME, about_task, about_task_ts, proactive_filename,
                                 proactive_item_id)
@@ -2645,6 +2646,8 @@ REENROLL_ENABLED = str(os.environ.get("REMOTE_REENROLL", "1")).strip().lower() \
 REENROLL_PROBE_EVERY = max(1, int(os.environ.get("REMOTE_REENROLL_PROBE_EVERY") or "2"))
 REENROLL_CLAIM_RETRY_S = int(os.environ.get("REMOTE_REENROLL_CLAIM_RETRY_S") or "600")
 _reenroll_state: dict = {"last_attempt_at": None, "code": None, "claimed_at": None}
+# The provision API's answer to a claim for an id its owner deleted (a tombstone): final, never a retry.
+AGENT_DELETED_ERROR = "agent_deleted"
 
 
 def _provision_base() -> str:
@@ -2704,7 +2707,7 @@ def _lane_whoami() -> str:
 def _reenroll_claim() -> None:
     """Best-effort claim: one live code per episode; failed POSTs retry no
     sooner than REENROLL_CLAIM_RETRY_S; never raises into the caller."""
-    if not REENROLL_ENABLED or _reenroll_state["code"]:
+    if not REENROLL_ENABLED or _reenroll_state["code"] or _reenroll_state.get("deleted"):
         return
     last = _reenroll_state["last_attempt_at"]
     # Monotonic: a wall-clock step backward must not suppress claims (review
@@ -2763,6 +2766,8 @@ def _reenroll_claim() -> None:
         err = diagnostics.code_field(err, URL)
         _reenroll_state["refused"] = {"status": e.code, "error": err, "at": int(time.time())}
         _log(f"reenroll: claim refused HTTP {e.code}" + (f" ({err})" if err else ""))
+        if e.code == 410 and err == AGENT_DELETED_ERROR:
+            _reenroll_state["deleted"] = {"at": int(time.time()), "agent_id": agent_id}
     except Exception as e:  # noqa: BLE001 — recovery must never crash the loop
         _log(f"reenroll: claim failed: {diagnostics.describe(e)}")
 
@@ -2774,6 +2779,7 @@ def _reenroll_clear(recovered: bool = False) -> None:
     prior_attempt = _reenroll_state.get("last_attempt_at")
     _reenroll_state.update({"last_attempt_at": None, "code": None, "claimed_at": None})
     _reenroll_state.pop("refused", None)
+    _reenroll_state.pop("deleted", None)
     if not was_pending:
         # No claim was granted this episode — preserve its cadence, or a
         # probe-only resume lets every future episode re-claim immediately.
@@ -3525,6 +3531,8 @@ def _recover_auth(code: int) -> bool:
         _reenroll_clear()
         return True
     _reenroll_claim()
+    if _reenroll_state.get("deleted"):
+        return _wait_after_deletion(code)
     if not TOKEN_FILE and not _reenroll_state["code"] \
             and not (REENROLL_ENABLED and TOKEN):
         # Historical FATAL contract survives ONLY where recovery is truly
@@ -3560,6 +3568,8 @@ def _recover_auth(code: int) -> bool:
             # A transient failure isn't a lost episode: retry stays in the
             # loop, cadence-bounded internally (safe while nothing is parked).
             _reenroll_claim()
+            if _reenroll_state.get("deleted"):
+                return _wait_after_deletion(code)
         cycle += 1
         if cycle % REENROLL_PROBE_EVERY == 0 and _auth_probe():
             # Re-read: `pending` above predates this iteration's own claim,
@@ -3570,6 +3580,42 @@ def _recover_auth(code: int) -> bool:
             # _reenroll_clear re-reads current state for was_pending, so this
             # is correct whether or not a code was parked when we got here.
             _reenroll_clear(recovered=True)
+            return True
+
+
+def _retire_deleted_binding(agent_id: str) -> bool:
+    """Move the deleted agent's bearer and id out of the token file (deleted_binding.retire); True
+    when anything moved. An env-supplied token has no file to retire it from."""
+    if not TOKEN_FILE or not TOKEN:
+        return False
+    try:
+        keys = deleted_binding.retire(TOKEN_FILE, secret=TOKEN, agent_id=agent_id)
+    except OSError as e:
+        _log(f"agent deleted: could not retire its binding from {TOKEN_FILE} ({diagnostics.describe(e)})")
+        return False
+    if keys:
+        _log(f"agent deleted: moved {', '.join(keys)} from {TOKEN_FILE} to "
+             f"{TOKEN_FILE}{deleted_binding.RETIRED_SUFFIX}")
+    return bool(keys)
+
+
+def _wait_after_deletion(code: int) -> bool:
+    """The owner deleted this agent, so its bearer will never be accepted again: no further claims or
+    probes. The binding is retired once, then only a new credential in the token file (a new agent's
+    connect) resumes; True then, like a rotation."""
+    deleted = _reenroll_state["deleted"]
+    if "retired" not in deleted:
+        deleted["retired"] = _retire_deleted_binding(deleted.get("agent_id") or "")
+        _log(f"AGENT DELETED — {deleted.get('agent_id') or 'this agent'} was deleted by its owner; "
+             "no longer reconnecting. Set up a new agent to use this machine again")
+    while True:
+        _emit_gateway_status(False, error=f"auth rejected HTTP {code} — agent deleted by its owner")
+        time.sleep(AUTH_RECHECK_INTERVAL)
+        if not _heartbeat_singleton():
+            sys.exit("FATAL: lost poller singleton while waiting after the agent's deletion")
+        if _reload_rotated_token():
+            _log("new credential detected after the agent's deletion — resuming")
+            _reenroll_clear()
             return True
 
 
@@ -5813,7 +5859,18 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             payload["relay_results_retrying"] = retrying
         # Recovery surface: recovered ONLY via the probe-success terminal; a
         # missing block means "no episode known", never success.
-        if _reenroll_state.get("code"):
+        deleted = _reenroll_state.get("deleted")
+        if deleted:
+            # Final: the server deleted the agent; readers stop offering Reconnect for it.
+            payload["binding"] = "deleted"
+            payload["reenroll"] = {
+                "pending": False,
+                "deleted": True,
+                "agent_id": deleted.get("agent_id") or None,
+                "deleted_at": deleted["at"],
+                "credential_retired": bool(deleted.get("retired")),
+            }
+        elif _reenroll_state.get("code"):
             payload["reenroll"] = {
                 "pending": True,
                 "approval_code": _reenroll_state["code"],
