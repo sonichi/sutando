@@ -78,5 +78,9 @@
   {
     "name": "main-loop",
     "sha256": "c1fec62f1757732ce77e511ca8cf61a83927f30fdea5c110a2f30ba3b04f5d7d"
+  },
+  {
+    "name": "sync-workspace",
+    "sha256": "25f29fe42df775a596a7a0503f9d490abd681dfb26314de2ea205e2e2a5b6f4a"
   }
 ]
