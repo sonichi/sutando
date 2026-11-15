@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """hooks/github-evidence-guard.py --dup-check: before a branch, `gh pr create` or `gh pr review`,
-existing PRs that may cover the work are named as advisory context, never a denial; every other
+another author's open PR changing the same function is named as advisory context, never a denial; every other
 command passes with no subprocess and no file read; the matching lives in hooks/_dup_work.py,
 and the core launcher registers the check. No network.
 
@@ -35,7 +35,10 @@ guard = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(guard)
 
 ARGV = ["--dup-check", "--repo", str(REPO)]
-RECENT = "2026-11-01T00:00:00Z"
+REVIEW = "gh pr review {n} --repo o/r --approve -b ok"
+REVIEW_URL = "gh pr review https://github.com/o/r/pull/9 --comment -b hi"
+REVIEW_R = "gh pr review -R o/r --approve 9"
+REVIEW_BARE = "gh pr review --approve"
 
 
 def bash(cmd, **extra):
@@ -43,8 +46,8 @@ def bash(cmd, **extra):
                  "cwd": "/w"}, **extra)
 
 
-def pr(number, title, branch, state="OPEN", files=(), closed=None, author=None, base=None):
-    n = {"number": number, "title": title, "headRefName": branch, "state": state, "closedAt": closed,
+def pr(number, title, branch, state="OPEN", files=(), author=None, base=None):
+    n = {"number": number, "title": title, "headRefName": branch, "state": state,
          "url": f"https://github.com/o/r/pull/{number}"}
     if author:
         n["author"] = {"login": author}
@@ -121,145 +124,125 @@ class Base(unittest.TestCase):
         return [json.loads(x) for x in self.log.read_text().splitlines()] if self.log.exists() else []
 
 
+F = "pkg/bridge.py"
+WORK = {"local": [F], "local_fns": [(F, "def g():")]}
+
+
 class Matching(Base):
-    def test_ticket_id_match_is_flagged(self):
-        fake = Fake({"tk": [pr(1808, "fix(settings): show a confirmation after Save", "fix/settings-save-feedback", "MERGED")]})
-        text, r = self.run_hook("git checkout -b fix/rmaaaabbbbcccc-save-confirmation", fake)
-        self.assertIn("Ticket-id hits", text)
-        self.assertIn("#1808 [MERGED]", text)
-        self.assertNotIn("permissionDecision", r["hookSpecificOutput"])
-        self.assertEqual(self.rows()[0]["verdict"], "FLAG")
-        self.assertEqual(self.rows()[0]["ticket"], [1808])
+    """The rule: flag only another author's OPEN PR that changes the same function."""
 
-    def test_ticket_search_is_all_states_and_separate_from_keywords(self):
-        fake = Fake({})
-        self.run_hook("git switch -c fix/rmaaaabbbbcccc-save-confirmation", fake)
-        q = dict(a.split("=", 1) for a in fake.query[4:] if "=" in a and not a.startswith("query="))
-        self.assertEqual(q["tk"], "repo:o/r is:pr rmaaaabbbbcccc")
-        self.assertNotIn("is:open", q["tk"])
-        self.assertNotIn("closed:", q["tk"])
-        self.assertIn("is:open", q["ko"])
-
-    def test_ticket_hit_survives_many_keyword_hits(self):
-        noise = [pr(100 + i, f"save confirmation tweak {i}", f"fix/save-confirmation-{i}") for i in range(20)]
-        tk = [pr(1808, "fix(settings): show a confirmation after Save", "fix/settings-save-feedback", "MERGED")]
-        tk += [pr(2000 + i, f"unrelated mention {i}", f"b{i}", "CLOSED") for i in range(29)]
-        fake = Fake({"tk": tk, "ko": noise})
-        text, _ = self.run_hook("git checkout -b fix/rmaaaabbbbcccc-save-confirmation", fake)
-        lines = text.splitlines()
-        self.assertEqual(lines[1], "Ticket-id hits (any state; every hit is listed):")
-        self.assertIn("#1808", lines[2])
-        self.assertEqual(sum("mentions the same ticket id" in x for x in lines), 30)
-        self.assertLess(text.index("#1808"), text.index("Keyword overlap"))
-        self.assertEqual(sum(" - keywords " in x for x in lines), dw.SHOWN)
-
-    def test_keyword_match_is_flagged(self):
-        fake = Fake({"ko": [pr(3877, "fix(gateway): flatten field values on the separator set", "fix/one-line-separator-parity")]})
-        text, _ = self.run_hook("git checkout -b fix/one-line-folds-every-separator", fake)
-        self.assertIn("Keyword overlap", text)
-        self.assertIn("#3877", text)
-        self.assertIn("keywords line, one, separator", text)
-        self.assertIn("No ticket id in the branch name", text)
-
-    def test_one_keyword_is_not_enough(self):
-        fake = Fake({"ko": [pr(750, "fix(meter): say whether the meter fetch timed out", "fix/meter-transport-errors")]})
-        text, _ = self.run_hook("git checkout -b fix/meter-request-failed", fake)
-        self.assertEqual(text, "No ticket id in the branch name, so the duplicate check is weaker.")
-
-    def test_function_overlap_is_flagged_and_file_only_is_a_count(self):
-        f = "pkg/bridge.py"
-        ro = [pr(3877, "flatten field values", "fix/a", files=[f]), pr(3952, "other bridge change", "fix/b", files=[f]),
-              pr(3929, "third bridge change", "fix/c", files=[f])]
-        fake = Fake({"ro": ro}, diffs={3877: diff((f, "def _one_line(value):")), 3952: diff((f, "def post():")),
-                                       3929: diff((f, "class Bridge:"))},
-                    local=[f], local_fns=[(f, "def _one_line(value):")], branch="fix/rmabcdefghij12-x")
-        text, _ = self.run_hook("gh pr create --title 'fix: fold separators' --body x", fake)
-        self.assertIn("Same function changed in an open PR:", text)
-        self.assertIn("#3877", text)
-        self.assertIn("`def _one_line(value):`", text)
-        self.assertIn("(2 other open PR(s) touch the same files, no other signal.)", text)
-        self.assertNotIn("#3952", text)
-        self.assertEqual(self.rows()[0]["function"], [3877])
-        self.assertEqual(self.rows()[0]["file_only"], [3952, 3929])
-
-    def test_file_only_overlap_alone_prints_no_warning(self):
-        f = "pkg/bridge.py"
-        fake = Fake({"ro": [pr(3952, "other", "fix/b", files=[f])]}, diffs={3952: diff((f, "def post():"))},
-                    local=[f], local_fns=[(f, "def _one_line():")], branch="fix/rmabcdefghij12-x")
-        text, _ = self.run_hook("gh pr create -t 'fix: x' -b y", fake)
-        self.assertEqual(text, "")
-        self.assertEqual((self.rows()[0]["verdict"], self.rows()[0]["file_only"]), ("OK", [3952]))
-
-    def _overlap(self, other, files=("pkg/bridge.py",), fn="def _one_line(v):", title="fix: fold separators",
-                 base="dev", viewer="me-bot", branch="fix/rmabcdefghij12-x", mine_files=None):
-        mine_files = list(mine_files or files)
+    def _overlap(self, other, files=(F,), fn="def _one_line(v):", title="fix: fold separators",
+                 base="dev", viewer="me-bot", branch="fix/x"):
         fake = Fake({"ro": [other], "viewer": {"login": viewer}}, diffs={other["number"]: diff(*[(f, fn) for f in files])},
-                    local=mine_files, local_fns=[(f, fn) for f in mine_files], branch=branch)
-        return self.run_hook(f"gh pr create --title '{title}' --base {base} --body x", fake)[0]
+                    local=list(files), local_fns=[(f, fn) for f in files], branch=branch)
+        return self.run_hook(f"gh pr create --title '{title}' --base {base} --body x", fake)
 
-    def test_same_function_by_another_author_is_flagged(self):
-        text = self._overlap(pr(7, "other change", "fix/o", files=["pkg/bridge.py"], author="someone", base="dev"))
+    # The four cases the narrowing is defined by.
+    def test_case1_same_function_other_author_open_pr_is_flagged(self):
+        text, r = self._overlap(pr(7, "other change", "fix/o", files=[F], author="someone", base="dev"))
+        self.assertIn("Same function changed in an open PR:\n  #7 [OPEN]", text)
+        self.assertIn("`def _one_line(v):`", text)
+        self.assertNotIn("permissionDecision", r["hookSpecificOutput"])
+        self.assertEqual((self.rows()[0]["verdict"], self.rows()[0]["function"]), ("FLAG", [7]))
+
+    def test_case2_promote_pair_is_not_flagged(self):
+        for other in (pr(7, "promote: fix: fold separators (#6)", "promote/x", files=[F], author="someone", base="main"),
+                      pr(7, "chore(promote): fix: fold separators", "chore/promote-x", files=[F], author="someone", base="main"),
+                      pr(7, "fix: fold separators", "fix/x", files=[F], author="someone", base="main")):
+            self.assertEqual(self._overlap(other, base="dev")[0], "", other["title"])
+            self.assertEqual(self.rows()[-1]["verdict"], "OK")
+        same_base = pr(7, "fix: fold separators", "fix/o", files=[F], author="someone", base="dev")
+        self.assertIn("#7", self._overlap(same_base, base="dev")[0])
+
+    def test_case3_common_files_are_not_flagged(self):
+        for f in ("docs/src-map.md", "docs/catalog.json", "uv.lock", "package-lock.json", "CHANGELOG.md",
+                  "hooks/README.md", "ENGINE_MANIFEST.json"):
+            other = pr(7, "other change", "fix/o", files=[f], author="someone", base="dev")
+            fake = Fake({"ro": [other], "viewer": {"login": "me-bot"}}, diffs={7: diff((f, "## entry"))},
+                        local=[f], local_fns=[(f, "## entry")])
+            self.assertEqual(self.run_hook("gh pr create -t 'fix: x' -b y", fake)[0], "", f)
+            self.assertEqual(fake.gh_calls(), [], f)
+
+    def test_case3_common_files_neither_count_nor_crowd_out_the_real_collision(self):
+        noisy = [pr(n, f"bump {n}", f"chore/b{n}", files=["CHANGELOG.md", "uv.lock"], author="someone", base="dev")
+                 for n in (11, 12, 13)]
+        real = pr(7, "other change", "fix/o", files=[F], author="someone", base="dev")
+        fake = Fake({"ro": noisy + [real], "viewer": {"login": "me-bot"}},
+                    diffs={n: diff(("CHANGELOG.md", "## 1.2"), ("uv.lock", "x")) for n in (11, 12, 13)}
+                    | {7: diff((F, "def g():"))},
+                    local=["CHANGELOG.md", "uv.lock", F], local_fns=[("CHANGELOG.md", "## 1.2"), (F, "def g():")])
+        text, _ = self.run_hook("gh pr create -t 'fix: x' -b y", fake)
         self.assertIn("Same function changed in an open PR:\n  #7", text)
+        self.assertEqual(self.rows()[0]["file_only"], [])
+
+    def test_case4_the_authors_own_prs_are_not_flagged(self):
+        other = pr(7, "other change", "fix/o", files=[F], author="Me-Bot", base="dev")
+        self.assertEqual(self._overlap(other, viewer="me-bot")[0], "")
+
+    def test_only_open_prs_count(self):
+        for state in ("MERGED", "CLOSED"):
+            other = pr(7, "other change", "fix/o", state, files=[F], author="someone", base="dev")
+            self.assertEqual(self._overlap(other)[0], "", state)
 
     def test_same_file_different_function_is_not_flagged(self):
-        other = pr(7, "other change", "fix/o", files=["pkg/bridge.py"], author="someone", base="dev")
-        fake = Fake({"ro": [other], "viewer": {"login": "me-bot"}}, diffs={7: diff(("pkg/bridge.py", "def post():"))},
-                    local=["pkg/bridge.py"], local_fns=[("pkg/bridge.py", "def _one_line(v):")], branch="fix/rmabcdefghij12-x")
+        other = pr(7, "other change", "fix/o", files=[F], author="someone", base="dev")
+        fake = Fake({"ro": [other], "viewer": {"login": "me-bot"}}, diffs={7: diff((F, "def post():"))},
+                    local=[F], local_fns=[(F, "def _one_line(v):")])
+        self.assertEqual(self.run_hook("gh pr create -t 'fix: x' -b y", fake)[0], "")
+        self.assertEqual(self.rows()[0]["file_only"], [7])
+
+    def test_a_common_file_beside_a_code_file_does_not_widen_the_match(self):
+        other = pr(7, "other", "fix/o", files=["CHANGELOG.md", F], author="someone", base="dev")
+        fake = Fake({"ro": [other], "viewer": {"login": "me-bot"}},
+                    diffs={7: diff(("CHANGELOG.md", "## 1.2"), (F, "def post():"))},
+                    local=["CHANGELOG.md", F], local_fns=[("CHANGELOG.md", "## 1.2"), (F, "def g():")])
         self.assertEqual(self.run_hook("gh pr create -t 'fix: x' -b y", fake)[0], "")
 
-    def test_promote_pair_is_not_flagged(self):
-        for other in (pr(7, "promote: fix: fold separators (#6)", "promote/x", files=["pkg/bridge.py"], author="someone", base="main"),
-                      pr(7, "fix: fold separators", "fix/rmabcdefghij12-x", files=["pkg/bridge.py"], author="someone", base="main")):
-            self.assertEqual(self._overlap(other, base="dev"), "")
-        same_base = pr(7, "fix: fold separators", "fix/o", files=["pkg/bridge.py"], author="someone", base="dev")
-        self.assertIn("#7", self._overlap(same_base, base="dev"))
-
-    def test_common_files_are_not_flagged(self):
-        for f in ("docs/src-map.md", "docs/catalog.json", "uv.lock", "package-lock.json", "CHANGELOG.md"):
-            other = pr(7, "other change", "fix/o", files=[f], author="someone", base="dev")
-            self.assertEqual(self._overlap(other, files=(f,), fn="## entry"), "", f)
-
-    def test_the_authors_own_prs_are_not_flagged(self):
-        other = pr(7, "other change", "fix/o", files=["pkg/bridge.py"], author="Me-Bot", base="dev")
-        self.assertEqual(self._overlap(other, viewer="me-bot"), "")
+    def test_function_overlap_is_flagged_and_file_only_is_a_count(self):
+        ro = [pr(3877, "flatten field values", "fix/a", files=[F]), pr(3952, "other bridge change", "fix/b", files=[F]),
+              pr(3929, "third bridge change", "fix/c", files=[F])]
+        fake = Fake({"ro": ro}, diffs={3877: diff((F, "def _one_line(value):")), 3952: diff((F, "def post():")),
+                                       3929: diff((F, "class Bridge:"))},
+                    local=[F], local_fns=[(F, "def _one_line(value):")])
+        text, _ = self.run_hook("gh pr create --title 'fix: fold separators' --body x", fake)
+        self.assertIn("#3877", text)
+        self.assertIn("(2 other open PR(s) touch the same files, no other signal.)", text)
+        self.assertNotIn("#3952", text)
+        self.assertEqual((self.rows()[0]["function"], self.rows()[0]["file_only"]), ([3877], [3952, 3929]))
 
     def test_review_uses_the_reviewed_prs_author_and_base(self):
-        f = "pkg/bridge.py"
         me = {"pullRequest": {"title": "fix: fold", "headRefName": "fix/m", "baseRefName": "dev", "author": {"login": "alice"},
-                              "files": {"nodes": [{"path": f}]}}}
-        ro = [pr(7, "x", "fix/a", files=[f], author="alice", base="dev"), pr(8, "y", "fix/b", files=[f], author="bob", base="dev"),
-              pr(9, "fix: fold", "fix/c", files=[f], author="bob", base="main")]
-        fake = Fake({"me": me, "ro": ro}, diffs={n: diff((f, "def g():")) for n in (7, 8, 9)} | {99: diff((f, "def g():"))})
-        text, _ = self.run_hook("gh pr review 99 --repo o/r --approve -b ok", fake)
+                              "files": {"nodes": [{"path": F}]}}}
+        ro = [pr(7, "x", "fix/a", files=[F], author="alice", base="dev"), pr(8, "y", "fix/b", files=[F], author="bob", base="dev"),
+              pr(9, "fix: fold", "fix/c", files=[F], author="bob", base="main")]
+        fake = Fake({"me": me, "ro": ro}, diffs={n: diff((F, "def g():")) for n in (7, 8, 9, 99)})
+        text, _ = self.run_hook(REVIEW.format(n=99), fake)
         self.assertIn("#8", text)
         self.assertNotIn("#7 [", text)
         self.assertNotIn("#9 [", text)
 
-    def test_no_match_prints_nothing(self):
-        text, r = self.run_hook("git checkout -b fix/rmabcdefghij12-thing", Fake({"tk": [], "ko": [], "kc": []}))
-        self.assertEqual((text, r), ("", {}))
+    def test_branch_trigger_compares_the_working_tree_with_the_merge_base(self):
+        other = pr(7, "other change", "fix/o", files=[F], author="someone", base="dev")
+        fake = Fake({"ro": [other], "viewer": {"login": "me-bot"}}, diffs={7: diff((F, "def g():"))}, **WORK)
+        text, _ = self.run_hook("git checkout -b fix/new-thing", fake)
+        self.assertIn("#7", text)
+        diffs = [c for c in fake.calls if c[0] == "git" and "diff" in c]
+        self.assertTrue(diffs and all("--merge-base" in c for c in diffs), diffs)
+
+    def test_a_branch_with_no_local_change_makes_no_search(self):
+        fake = Fake({})
+        text, r = self.run_hook("git checkout -b fix/new-thing", fake)
+        self.assertEqual((text, r, fake.gh_calls()), ("", {}, []))
         self.assertEqual(self.rows()[0]["verdict"], "OK")
 
     def test_current_pr_and_own_branch_are_excluded(self):
-        f = "a.py"
-        me = {"pullRequest": {"headRefName": "fix/mine", "files": {"nodes": [{"path": f}]}}}
-        ro = [pr(3964, "this very PR", "fix/mine", files=[f]), pr(3965, "same branch elsewhere", "fix/mine", files=[f])]
-        fake = Fake({"me": me, "ro": ro}, diffs={3964: diff((f, "def g():"))})
-        text, _ = self.run_hook("gh pr review 3964 --repo o/r --approve -b ok", fake)
-        self.assertEqual(text, "")
-        fake = Fake({"tk": [pr(42, "my own PR", "fix/rmabcdefghij12-x")]}, branch="fix/rmabcdefghij12-x")
-        text, _ = self.run_hook("gh pr create -t t -b b", fake)
-        self.assertEqual(text, "")
-
-    def test_closed_keyword_hits_older_than_30_days_are_dropped(self):
-        old = pr(10, "separator one line fold", "fix/one-line", "CLOSED", closed="2020-01-01T00:00:00Z")
-        new = pr(11, "separator one line fold", "fix/one-line-2", "CLOSED", closed="2099-01-01T00:00:00Z")
-        text, _ = self.run_hook("git checkout -b fix/one-line-separator", Fake({"kc": [old, new]}))
-        self.assertIn("#11", text)
-        self.assertNotIn("#10 ", text)
+        me = {"pullRequest": {"headRefName": "fix/mine", "files": {"nodes": [{"path": F}]}}}
+        ro = [pr(3964, "this very PR", "fix/mine", files=[F]), pr(3965, "same branch elsewhere", "fix/mine", files=[F])]
+        fake = Fake({"me": me, "ro": ro}, diffs={n: diff((F, "def g():")) for n in (3964, 3965)})
+        self.assertEqual(self.run_hook(REVIEW.format(n=3964), fake)[0], "")
 
     def test_gh_failure_is_unknown_and_one_line(self):
-        text, r = self.run_hook("git checkout -b fix/rmabcdefghij12-thing", Fake(fail=True))
+        text, r = self.run_hook("git checkout -b fix/thing", Fake(fail=True, **WORK))
         self.assertEqual(len(text.splitlines()), 1)
         self.assertIn("could not run (HTTP 502: Bad Gateway)", text)
         self.assertNotIn("permissionDecision", r["hookSpecificOutput"])
@@ -269,41 +252,40 @@ class Matching(Base):
         def slow(cmd, **kw):
             if cmd[0] == "gh":
                 raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
-            return Fake()(cmd, **kw)
-        text, _ = self.run_hook("git checkout -b fix/rmabcdefghij12-thing", slow)
+            return Fake(**WORK)(cmd, **kw)
+        text, _ = self.run_hook("git checkout -b fix/thing", slow)
         self.assertIn("did not answer within 5s", text)
 
     def test_no_github_origin_is_unknown(self):
         text, _ = self.run_hook("git checkout -b feat/a-b", Fake(origin="/local/bare.git"))
         self.assertIn("could not run (no GitHub repository", text)
 
-    def test_heredoc_bodies_are_data_but_feed_ticket_ids(self):
+    def test_heredoc_bodies_are_data(self):
         fake = Fake({})
         text, r = self.run_hook("cat > notes.txt <<'EOF'\ngit checkout -b fix/x-y\nEOF", fake)
         self.assertEqual((text, r, fake.calls), ("", {}, []))
-        fake = Fake({}, branch="fix/rmabcdefghij12-x")
-        self.run_hook("gh pr create -t 'fix: x' --body \"$(cat <<'EOF'\nRow rmzzzzzzzzzz99 and fixes #77\nEOF\n)\"", fake)
-        q = [a for a in fake.query if a.startswith("tk=")][0]
-        self.assertEqual(q, "tk=repo:o/r is:pr rmabcdefghij12 OR rmzzzzzzzzzz99 OR 77")
 
     def test_trigger_parsing(self):
         got = [(t["trigger"], t.get("branch") or t.get("pr"), t["cwd"]) for t in dw.triggers(
             "cd sub && git -C repo switch --create=feat/a-b; git worktree add -b feat/c ../wt; "
-            "gh pr review https://github.com/o/r/pull/9 --comment -b hi; FOO=1 git checkout -B feat/d", "/w")]
+            + REVIEW_URL + "; FOO=1 git checkout -B feat/d", "/w")]
         self.assertEqual(got, [("branch", "feat/a-b", "/w/sub/repo"), ("branch", "feat/c", "/w/sub"),
                                ("review", 9, "/w/sub"), ("branch", "feat/d", "/w/sub")])
         self.assertEqual(dw.triggers("git checkout main; git worktree add ../wt main; echo 'pr create'", "/w"), [])
 
-    def test_one_search_per_branch_trigger(self):
-        fake = Fake({})
-        self.run_hook("git checkout -b fix/rmabcdefghij12-thing && git switch -c feat/other-thing", fake)
+    def test_one_search_per_trigger(self):
+        fake = Fake({}, **WORK)
+        self.run_hook("git checkout -b fix/thing && git switch -c feat/other-thing", fake)
         self.assertEqual([c[:3] for c in fake.gh_calls()], [["gh", "api", "graphql"]] * 2)
         self.assertEqual([r["trigger"] for r in self.rows()], ["branch", "branch"])
+        searches = [a.split("=", 1)[0] for a in fake.query[4:] if "=" in a and not a.startswith("query=")]
+        self.assertEqual(searches, ["ro"])  # no ticket or keyword search: those matched closed and own PRs
+        self.assertIn("is:open", " ".join(fake.query))
 
     def test_off_switch_is_silent_and_logs_nothing(self):
         with mock.patch.object(dw, "enabled", return_value=False):
-            fake = Fake({"tk": [pr(1, "x", "y")]})
-            text, _ = self.run_hook("git checkout -b fix/rmabcdefghij12-thing", fake)
+            fake = Fake({}, **WORK)
+            text, _ = self.run_hook("git checkout -b fix/thing", fake)
         self.assertEqual((text, fake.calls, self.rows()), ("", [], []))
 
 
@@ -315,39 +297,30 @@ class Edges(Base):
             self.assertEqual(dw.triggers("git checkout -b feat/a", "/w"), [])
         self.assertEqual([t["branch"] for t in dw.triggers("FOO=1; git checkout -b feat/a", "/w")], ["feat/a"])
         self.assertEqual(dw.triggers("git push", "/w"), [])
-        (t,) = dw.triggers("gh pr review -R o/r --approve 9", "/w")
+        (t,) = dw.triggers(REVIEW_R, "/w")
         self.assertEqual((t["repo"], t["pr"]), ("o/r", 9))
-        (t,) = dw.triggers("gh pr review --approve", "/w")
+        (t,) = dw.triggers(REVIEW_BARE, "/w")
         self.assertIsNone(t["pr"])
-        with tempfile.TemporaryDirectory() as d:
-            Path(d, "body.md").write_text("Row rmqqqqrrrrssss here")
-            (t,) = dw.triggers("gh pr create -t x -F body.md", d)
-            self.assertIn("rmqqqqrrrrssss", t["body"])
-            (t,) = dw.triggers("gh pr create -t x -F missing.md", d)
-            self.assertEqual(t["body"].strip(), "")
+        (t,) = dw.triggers("gh pr create -t x -H me:fix/y -B dev", "/w")
+        self.assertEqual((t["branch"], t["base"], t["title"]), ("fix/y", "dev", "x"))
 
     def test_review_without_a_number_is_unknown(self):
-        text, _ = self.run_hook("gh pr review --approve -b ok", Fake({}))
+        text, _ = self.run_hook(REVIEW_BARE + " -b ok", Fake({}))
         self.assertIn("could not run (the reviewed PR is not named", text)
 
     def test_review_of_a_missing_pr_is_unknown(self):
-        text, _ = self.run_hook("gh pr review 5 -R o/r --approve", Fake({"ro": []}))
+        text, _ = self.run_hook(REVIEW.format(n=5), Fake({"ro": []}))
         self.assertIn("could not run (PR #5 not found in o/r)", text)
 
-    def test_nothing_to_search_prints_only_the_weak_line(self):
-        fake = Fake({})
-        text, _ = self.run_hook("git checkout -b feat/a", fake)
-        self.assertEqual(text, "No ticket id in the branch name, so the duplicate check is weaker.")
-        self.assertEqual(fake.gh_calls(), [])
-
-    def test_unreadable_local_diff_skips_file_overlap(self):
+    def test_unreadable_local_diff_is_unknown(self):
         def run(cmd, **kw):
             if cmd[:1] == ["git"] and "diff" in cmd:
                 return subprocess.CompletedProcess(cmd, 128, "", "bad revision")
             return fake(cmd, **kw)
-        fake = Fake({}, branch="fix/rmabcdefghij12-x")
-        self.run_hook("gh pr create -t t -b b", run)
-        self.assertNotIn("ro=", " ".join(fake.query))
+        fake = Fake({})
+        text, _ = self.run_hook("gh pr create -t t -b b", run)
+        self.assertIn("could not run (the local diff against the base could not be read)", text)
+        self.assertEqual(fake.gh_calls(), [])
 
     def test_git_and_gh_that_cannot_start(self):
         def no_git(cmd, **kw):
@@ -360,8 +333,8 @@ class Edges(Base):
         def no_gh(cmd, **kw):
             if cmd[0] == "gh":
                 raise OSError("no gh")
-            return Fake()(cmd, **kw)
-        text, _ = self.run_hook("git checkout -b fix/rmabcdefghij12-x", no_gh)
+            return Fake(**WORK)(cmd, **kw)
+        text, _ = self.run_hook("git checkout -b fix/x", no_gh)
         self.assertIn("could not run (gh could not run: no gh)", text)
 
     def test_unreadable_search_responses(self):
@@ -369,17 +342,16 @@ class Edges(Base):
             def run(cmd, out=out, **kw):
                 if cmd[0] == "gh":
                     return subprocess.CompletedProcess(cmd, 0, out, "")
-                return Fake()(cmd, **kw)
-            text, _ = self.run_hook("git checkout -b fix/rmabcdefghij12-x", run)
+                return Fake(**WORK)(cmd, **kw)
+            text, _ = self.run_hook("git checkout -b fix/x", run)
             self.assertIn("could not run (unreadable search response)", text, out)
 
     def _review(self, bad):
-        f = "pkg/bridge.py"
         me = {"pullRequest": {"title": "fix: fold", "headRefName": "fix/m", "baseRefName": "dev", "author": {"login": "a"},
-                              "files": {"nodes": [{"path": f}]}}}
-        fake = Fake({"me": me, "ro": [pr(8, "y", "fix/b", files=[f], author="bob", base="dev")]},
-                    diffs={n: diff((f, "def g():")) for n in (8, 99)}, bad_diffs=bad)
-        return self.run_hook("gh pr review 99 --repo o/r --approve -b ok", fake)[0]
+                              "files": {"nodes": [{"path": F}]}}}
+        fake = Fake({"me": me, "ro": [pr(8, "y", "fix/b", files=[F], author="bob", base="dev")]},
+                    diffs={n: diff((F, "def g():")) for n in (8, 99)}, bad_diffs=bad)
+        return self.run_hook(REVIEW.format(n=99), fake)[0]
 
     def test_review_with_both_diffs_readable_flags_the_same_function(self):
         self.assertIn("Same function changed in an open PR:\n  #8", self._review(()))
@@ -390,14 +362,12 @@ class Edges(Base):
             self.assertIn("could not run (Function comparison incomplete", text, bad)
             self.assertEqual(self.rows()[-1]["verdict"], "UNKNOWN", bad)
 
-    def test_a_flag_keeps_its_hits_and_names_the_unread_diffs(self):
-        ro = [pr(7, "x", "fix/a", files=["pkg/bridge.py"], author="al", base="dev"),
-              pr(8, "fix: fold separators", "fix/rmabcdefghij12-b", files=["pkg/bridge.py"], author="bob", base="dev")]
-        fake = Fake({"ro": ro, "viewer": {"login": "me-bot"}, "tk": [pr(5, "t", "fix/rmabcdefghij12-t")]},
-                    diffs={7: diff(("pkg/bridge.py", "def g():"))}, local=["pkg/bridge.py"],
-                    local_fns=[("pkg/bridge.py", "def g():")], branch="fix/rmabcdefghij12-x", bad_diffs=(8,))
+    def test_a_flag_keeps_its_hit_and_names_the_unread_diffs(self):
+        ro = [pr(7, "x", "fix/a", files=[F], author="al", base="dev"),
+              pr(8, "y", "fix/b", files=[F], author="bob", base="dev")]
+        fake = Fake({"ro": ro, "viewer": {"login": "me-bot"}}, diffs={7: diff((F, "def g():"))}, bad_diffs=(8,), **WORK)
         text, _ = self.run_hook("gh pr create --title t --base dev --body x", fake)
-        self.assertIn("#5", text)
+        self.assertIn("#7", text)
         self.assertIn("Function comparison incomplete: 1 diff read(s)", text)
         self.assertEqual(self.rows()[-1]["verdict"], "FLAG")
 
@@ -406,18 +376,17 @@ class Edges(Base):
         self.assertIsNone(dw.pr_diff(fake, "o/r", 5, 0.0))
         self.assertEqual(fake.calls, [])
 
-    def test_ticket_hits_beyond_the_first_page_name_the_total(self):
-        nodes = [dict(pr(10 + i, f"t{i}", f"b{i}"), branch=f"b{i}") for i in range(3)]
-        found = {"ticket": nodes, "function": [], "keyword": [], "file_only": [], "ticket_total": 140}
-        text = dw.advice({"trigger": "branch", "branch": "x"}, "o/r", found, "repo:o/r is:pr rmabcdefghij12")
-        self.assertIn("... 140 PRs in total: gh search prs 'repo:o/r is:pr rmabcdefghij12'", text)
+    def test_pr_diff_that_cannot_finish_reads_nothing(self):
+        def boom(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, 1)
+        self.assertIsNone(dw.pr_diff(boom, "o/r", 5, 2.0))
 
     def test_no_repo_root_says_so(self):
         self.assertIn("repo root not configured", dw.check("git checkout -b feat/a", "/w", None))
 
     def test_unwritable_or_unresolvable_log_still_answers(self):
         with mock.patch.object(dw, "log_path", side_effect=RuntimeError("no workspace")):
-            text, _ = self.run_hook("git checkout -b fix/rmabcdefghij12-x", Fake(fail=True))
+            text, _ = self.run_hook("git checkout -b fix/x", Fake(fail=True, **WORK))
         self.assertIn("could not run", text)
         self.assertEqual(self.rows(), [])
 
@@ -459,7 +428,7 @@ class Edges(Base):
 
 
 class Replay(Base):
-    """The recorded incidents, as GitHub answered at the time (fixtures from the real PRs)."""
+    """The recorded incident, as GitHub answered at the time (fixtures from the real PRs)."""
 
     BRIDGE = "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py"
 
@@ -473,32 +442,11 @@ class Replay(Base):
         diffs = {3964: diff((self.BRIDGE, "def _one_line(value: str) -> str:")),
                  3877: diff((self.BRIDGE, "def _one_line(value: str) -> str:"))}
         diffs.update({n: diff((self.BRIDGE, f"def other_{n}():")) for n in others})
-        text, _ = self.run_hook("gh pr review 3964 -R sonichi/sutando --approve",
+        text, _ = self.run_hook(REVIEW.format(n=3964).replace("o/r", "sonichi/sutando"),
                                 Fake({"me": me, "ro": ro}, diffs=diffs))
         self.assertIn("Same function changed in an open PR:\n  #3877", text)
         self.assertIn("other open PR(s) touch the same files", text)
-
-    def test_branch_for_3964_finds_3877_by_keywords(self):
-        ko = [pr(3877, "fix(gateway): flatten field values on the separator set readers actually split on",
-                 "fix/one-line-separator-parity")]
-        text, _ = self.run_hook("git checkout -b fix/one-line-folds-every-separator", Fake({"ko": ko}))
-        self.assertIn("#3877", text)
-
-    def test_web_client_1808_by_ticket_and_by_title_keywords(self):
-        n = pr(1808, "fix(settings): show a confirmation after Save",
-               "fix/settings-save-feedback", "MERGED", closed=RECENT)
-        text, _ = self.run_hook("git checkout -b fix/rmaaaabbbbcccc-save-confirmation", Fake({"tk": [n]}))
-        self.assertIn("#1808", text)
-        text, _ = self.run_hook("git checkout -b fix/save-confirmation", Fake({"kc": [n]}))
-        self.assertIn("#1808", text)
-
-    def test_desktop_app_750_caught_by_ticket_missed_by_title_with_a_weak_line(self):
-        n = pr(750, "fix(meter): say whether the meter fetch timed out",
-               "fix/meter-transport-errors", "MERGED", closed=RECENT)
-        text, _ = self.run_hook("git checkout -b fix/rmddddeeeeffff-meter-request-failed", Fake({"tk": [n]}))
-        self.assertIn("#750", text)
-        text, _ = self.run_hook("git checkout -b fix/meter-request-failed", Fake({"kc": [n]}))
-        self.assertEqual(text, "No ticket id in the branch name, so the duplicate check is weaker.")
+        self.assertEqual(sum(line.startswith("  #") for line in text.splitlines()), 1)
 
 
 class Cost(unittest.TestCase):
@@ -520,11 +468,11 @@ class Cost(unittest.TestCase):
 
     def test_trigger_makes_one_gh_search(self):
         d = Path(tempfile.mkdtemp())
-        fake = Fake({})
+        fake = Fake({}, **WORK)
         with mock.patch.object(dw, "log_path", return_value=d / "l.jsonl"), \
                 mock.patch.object(dw, "enabled", return_value=True), mock.patch.object(dw.subprocess, "run", fake):
             start = time.perf_counter()
-            guard.decide(bash("git checkout -b fix/rmabcdefghij12-thing"), ARGV)
+            guard.decide(bash("git checkout -b fix/thing"), ARGV)
             ms = (time.perf_counter() - start) * 1e3
         self.assertEqual([c[:3] for c in fake.gh_calls()], [["gh", "api", "graphql"]])
         print(f"\n  branch trigger, stubbed gh: 1 gh call, {ms:.2f} ms excluding the network", file=sys.stderr)
@@ -550,9 +498,9 @@ class Delegation(unittest.TestCase):
         self.assertEqual(r, {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "stubbed advice"}})
 
     def test_parser_supported_forms_reach_the_check_through_decide(self):
-        for cmd in ("git checkout --quiet -b fix/rmabcdefghij12-test", "git checkout  -b fix/rmabcdefghij12-test",
-                    "git  switch --quiet -c fix/rmabcdefghij12-test", "gh pr  review 9 -R o/r --comment -b x"):
-            fake = Fake({"me": {"pullRequest": {"files": {"nodes": []}}}})
+        for cmd in ("git checkout --quiet -b fix/test", "git checkout  -b fix/test",
+                    "git  switch --quiet -c fix/test", "gh pr  review 9 -R o/r --comment -b x"):
+            fake = Fake({"me": {"pullRequest": {"files": {"nodes": []}}}}, **WORK)
             with mock.patch.object(dw, "log_path", return_value=Path(tempfile.mkdtemp()) / "l"), \
                     mock.patch.object(dw, "enabled", return_value=True), mock.patch.object(dw.subprocess, "run", fake):
                 guard.decide(bash(cmd), ARGV)
@@ -568,16 +516,25 @@ class Delegation(unittest.TestCase):
             root = fake_checkout(d)
             work = Path(d, "work")
             work.mkdir()
-            subprocess.run(["git", "init", "-q", str(work)], check=True)
-            subprocess.run(["git", "-C", str(work), "remote", "add", "origin", "https://github.com/o/r.git"], check=True)
+            env = isolated_child_env(PATH=f"{d}{os.pathsep}{os.environ['PATH']}", GIT_AUTHOR_NAME="t",
+                                     GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+
+            def g(*a):
+                subprocess.run(["git", "-C", str(work), *a], check=True, capture_output=True, env=env)
+            subprocess.run(["git", "init", "-q", str(work)], check=True, env=env)
+            g("remote", "add", "origin", "https://github.com/o/r.git")
+            Path(work, "a.py").write_text("def g():\n    return 1\n")
+            g("add", "a.py")
+            g("commit", "-qm", "base")
+            g("update-ref", "refs/remotes/origin/main", "HEAD")
+            Path(work, "a.py").write_text("def g():\n    return 2\n")
             gh = Path(d, "gh")
             gh.write_text("#!/bin/sh\necho 'HTTP 502' >&2\nexit 1\n")
             gh.chmod(0o755)
-            env = isolated_child_env(PATH=f"{d}{os.pathsep}{os.environ['PATH']}")
             run = lambda cmd: subprocess.run([sys.executable, str(HOOK), "--dup-check", "--repo", str(root)],
                                              capture_output=True, text=True, env=env,
                                              input=json.dumps(bash(cmd, cwd=str(work))), timeout=60)
-            out = json.loads(run("git checkout -b fix/rmabcdefghij12-x").stdout)["hookSpecificOutput"]
+            out = json.loads(run("git checkout -b fix/x").stdout)["hookSpecificOutput"]
             self.assertNotIn("permissionDecision", out)
             self.assertIn("Duplicate-work check could not run (HTTP 502)", out["additionalContext"])
             self.assertEqual(run("ls").stdout, "")

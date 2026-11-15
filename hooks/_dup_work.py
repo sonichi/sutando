@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Duplicate-work check: before a branch, a PR or a review, name existing PRs that may cover it.
+"""Duplicate-work check: before a branch, a PR or a review, name another author's open PR that
+changes the same function.
 
 Policy for `github-evidence-guard.py --dup-check`. Triggers: `git checkout -b|-B`, `git switch
--c|-C|--create`, `git worktree add -b|-B`, `gh pr create`, `gh pr review`. Each trigger makes one
-`gh api graphql` read (5 s budget) that carries every search:
+-c|-C|--create`, `git worktree add -b|-B`, `gh pr create`, `gh pr review`. The local side is the
+working tree against its base (branch), `origin/<base>...HEAD` (create) or the reviewed PR's diff
+(review). When it changes a function in a non-common file, one `gh api graphql` read (5 s budget)
+lists the 25 most recently updated open PRs with their files; the top 3 by shared files are diffed
+and their `@@` hunk-header functions compared.
 
-- ticket ids (`rm[a-z0-9]{10,14}`, `#NNNN`) from the branch, title or body: any state, reported
-  first and never truncated;
-- keywords from the branch name and title: open PRs and PRs closed in the last 30 days;
-- for `pr create` and `pr review`, the 25 most recently updated open PRs with their files,
-  compared with the local `git diff --name-only` (create) or the reviewed PR's files (review).
-
-It never blocks. A match is advisory context; a failed read is UNKNOWN plus one line. One row
-per trigger goes to <workspace>/logs/dup-work.jsonl. `env.DUP_WORK_CHECK: off` in
-sutando.config.local.json turns it off.
+Only one thing is flagged: an OPEN PR by another author that changes the same function in the
+same file. The author's own PRs, a promote or back-port of the same change, and common files
+(lockfiles, changelogs, docs, JSON, manifests) never count. It never blocks. A failed read with
+no hit is UNKNOWN plus one line. One row per trigger goes to <workspace>/logs/dup-work.jsonl.
+`env.DUP_WORK_CHECK: off` in sutando.config.local.json turns it off.
 
   python3 hooks/_dup_work.py --summary [--log PATH]
 """
@@ -39,28 +39,20 @@ import _shell_scan  # noqa: E402
 SWITCH_KEY = "DUP_WORK_CHECK"
 GH_TIMEOUT = 5.0
 GIT_TIMEOUT = 2.0
-CLOSED_DAYS = 30
-MAX_KW = 6
 RECENT_OPEN = 25
-KW_FIRST = 20
-TICKET_FIRST = 100
 SHOWN = 5
-TICKET_RM = re.compile(r"\b(rm[a-z0-9]{10,14})\b")
-TICKET_NUM = re.compile(r"#(\d{2,6})\b")
-CLOSES_NUM = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d{2,6})\b", re.I)
 PR_URL = re.compile(r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)(?:[/?#].*)?$")
 GITHUB_REMOTE = re.compile(r"github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$")
-NOISE_FILES = re.compile(r"(^|/)(CHANGELOG[^/]*|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|uv\.lock|poetry\.lock"
-                         r"|src-map\.md|[^/]*catalog[^/]*\.json|ENGINE_MANIFEST\.json|[^/]*\.lock)$")
-PROMOTE_WORDS = re.compile(r"^(?:promote|back-?port|cherry-?pick)\b[:\s]*|\s*\(#\d+\)$", re.I)
-STOP = set("""fix fixes feat feature chore docs doc refactor test tests ci build perf style wip tmp temp
-update add adds remove change changes and the for with from into onto main master dev prod release
-codex claude sutando pr branch new old v1 v2 v3 bump use via of to in on at by is a an
-followup follow up hotfix patch minor misc""".split())
+# Files many unrelated PRs touch, and data/prose whose hunk headers are not functions.
+COMMON_FILES = re.compile(r"(^|/)(CHANGELOG[^/]*|README[^/]*|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|uv\.lock"
+                          r"|poetry\.lock|go\.sum|ENGINE_MANIFEST\.json|[^/]*\.lock)$"
+                          r"|\.(?:md|mdx|rst|txt|json|jsonl|csv)$", re.I)
+PROMOTE_WORDS = re.compile(r"^(?:chore\((?:promote|back-?port)\)|(?:promote|back-?port|cherry-?pick)\b)[:\s]*"
+                           r"|\s*\(#\d+\)$", re.I)
 HUNK = re.compile(r"^@@ [^@]* @@ ?(.*)$")
 DIFF_FILE = re.compile(r"^\+\+\+ b/(.*)$")
 MAX_FN = 3
-PR_FIELDS = "number title state headRefName baseRefName author{login} closedAt url"
+PR_FIELDS = "number title state headRefName baseRefName author{login} url"
 GH_VALUE_FLAGS = {"-R", "--repo", "-b", "--body", "-F", "--body-file", "-t", "--title", "-H", "--head",
                   "-B", "--base", "-a", "--assignee", "-l", "--label", "-m", "--milestone", "-p", "--project",
                   "-r", "--reviewer", "-T", "--template"}
@@ -100,7 +92,7 @@ def _git_branch(tail: List[str]) -> Optional[str]:
 
 def triggers(command: str, cwd: Optional[str]) -> List[dict]:
     """Every trigger in a command line, with the directory it runs in (`cd X &&`, `git -C X`)."""
-    stripped, docs = _shell_scan.heredocs(command)
+    stripped, _docs = _shell_scan.heredocs(command)
     try:
         segs = _shell_scan.segments(stripped)
     except ValueError:
@@ -126,14 +118,9 @@ def triggers(command: str, cwd: Optional[str]) -> List[dict]:
                 out.append({"trigger": "branch", "branch": name, "cwd": where})
         elif prog == "gh" and tail[:2] == ["pr", "create"]:
             t = tail[2:]
-            body = "\n".join([_flag(t, ("-b", "--body")) or ""] + [d for _, d in docs])
-            body_file = _flag(t, ("-F", "--body-file"))
-            if body_file and body_file != "-":
-                with contextlib.suppress(OSError):
-                    body += "\n" + Path(where, body_file).read_text(errors="replace")[:200_000]
             head = _flag(t, ("-H", "--head"))
             out.append({"trigger": "pr-create", "branch": head.split(":", 1)[-1] if head else None,
-                        "title": _flag(t, ("-t", "--title")) or "", "body": body,
+                        "title": _flag(t, ("-t", "--title")) or "",
                         "repo": _flag(t, ("-R", "--repo")), "base": _flag(t, ("-B", "--base")), "cwd": where})
         elif prog == "gh" and tail[:2] == ["pr", "review"]:
             t, repo, pr = tail[2:], None, None
@@ -147,60 +134,18 @@ def triggers(command: str, cwd: Optional[str]) -> List[dict]:
     return out
 
 
-def keywords(*texts) -> List[str]:
-    out: List[str] = []
-    for t in texts:
-        for tok in re.split(r"[^A-Za-z0-9]+", (t or "").lower()):
-            if len(tok) < 3 or tok in STOP or tok.isdigit() or TICKET_RM.fullmatch(tok) or tok in out:
-                continue
-            out.append(tok)
-    return out[:MAX_KW]
-
-
-def tickets(branch: str = "", title: str = "", body: str = "") -> List[str]:
-    """Row ids anywhere; `#NNNN` in the branch or title, or after closes/fixes/resolves in the body."""
-    out: List[str] = []
-    for t in (branch, title, body):
-        out += [m for m in TICKET_RM.findall((t or "").lower()) if m not in out]
-    nums = TICKET_NUM.findall(f"{branch or ''} {title or ''}") + CLOSES_NUM.findall(body or "")
-    out += ["#" + n for n in dict.fromkeys(nums) if "#" + n not in out]
-    return out
-
-
-def kw_hits(kws: List[str], node: dict) -> List[str]:
-    """Keywords in a PR's title or branch; a shared prefix of 4+ chars counts (confirm ~ confirmation)."""
-    hay = [t for t in re.split(r"[^a-z0-9]+", f"{node.get('title') or ''} {node.get('headRefName') or ''}".lower())
-           if len(t) >= 3]
-    return sorted(k for k in kws if any(k == t or (min(len(k), len(t)) >= 4 and (k.startswith(t) or t.startswith(k)))
-                                        for t in hay))
-
-
-def build_query(repo: str, t: dict, kws: List[str], tks: List[str], since: str, with_files: bool):
-    scope = f"repo:{repo} is:pr"
-    q: Dict[str, str] = {}
-    if tks:
-        q["tk"] = f"{scope} " + " OR ".join(x.lstrip("#") for x in tks)
-    if kws:
-        terms = " OR ".join(kws)
-        q["ko"] = f"{scope} is:open {terms}"
-        q["kc"] = f"{scope} is:closed closed:>={since} {terms}"
-    if with_files:
-        q["ro"] = f"{scope} is:open sort:updated-desc"
-    parts, args = [], []
-    for alias, query in q.items():
-        n = {"tk": TICKET_FIRST, "ro": RECENT_OPEN}.get(alias, KW_FIRST)
-        files = " files(first:100){nodes{path}}" if alias == "ro" else ""
-        parts.append(f"{alias}:search(type:ISSUE,query:${alias},first:{n})"
-                     f"{{issueCount nodes{{... on PullRequest{{{PR_FIELDS}{files}}}}}}}")
-        args += ["-f", f"{alias}={query}"]
-    decl = [f"${a}:String!" for a in q]
+def build_query(repo: str, t: dict):
+    q = {"ro": f"repo:{repo} is:pr is:open sort:updated-desc"}
+    parts = [f"ro:search(type:ISSUE,query:$ro,first:{RECENT_OPEN})"
+             f"{{issueCount nodes{{... on PullRequest{{{PR_FIELDS} files(first:100){{nodes{{path}}}}}}}}}}"]
+    decl, args = ["$ro:String!"], ["-f", f"ro={q['ro']}"]
     if t["trigger"] == "review":
         owner, name = repo.split("/", 1)
         decl += ["$o:String!", "$n:String!", "$pr:Int!"]
         parts.append("me:repository(owner:$o,name:$n){pullRequest(number:$pr){title headRefName baseRefName author{login} files(first:100){nodes{path}}}}")
         args += ["-f", f"o={owner}", "-f", f"n={name}", "-F", f"pr={t['pr']}"]
     parts.append("viewer{login}")
-    return f"query({','.join(decl)}){{{' '.join(parts)}}}", args, q
+    return f"query({','.join(decl)}){{{' '.join(parts)}}}", args
 
 
 def _git(run: Run, cwd: str, *args) -> Optional[str]:
@@ -216,14 +161,17 @@ def _origin_repo(run: Run, cwd: str) -> Optional[str]:
     return m[1] if m else None
 
 
-def local_diff(run: Run, cwd: str, base: Optional[str]):
-    """(changed files, {file: functions}) of HEAD against its base, from local git only."""
+def local_diff(run: Run, cwd: str, base: Optional[str], worktree: bool = False):
+    """(changed files, {file: functions}) against the base, from local git only; None when unreadable.
+    `worktree` compares the working tree (uncommitted edits included) with the merge base."""
     base = base or (_git(run, cwd, "symbolic-ref", "--short", "refs/remotes/origin/HEAD") or "origin/main")
     base = base if base.startswith("origin/") else "origin/" + base
-    names = _git(run, cwd, "diff", "--name-only", f"{base}...HEAD")
-    if names is None:
+    rng = ["--merge-base", base] if worktree else [f"{base}...HEAD"]
+    names = _git(run, cwd, "diff", "--name-only", *rng)
+    text = _git(run, cwd, "diff", "-U0", *rng) if names is not None else None
+    if text is None:
         return None, {}
-    return set(filter(None, names.splitlines())), hunk_functions(_git(run, cwd, "diff", "-U0", f"{base}...HEAD"))
+    return set(filter(None, names.splitlines())), hunk_functions(text)
 
 
 class GhError(RuntimeError):
@@ -293,48 +241,29 @@ def promote_pair(me: dict, n: dict) -> bool:
     return bool(norm(me.get("title"))) and norm(me.get("title")) == norm(n.get("title"))
 
 
-def match(t: dict, data: dict, kws: List[str], mine: Optional[set], since: str, me: Optional[dict] = None) -> dict:
-    """Candidate PRs by reason, self and own branch excluded; `files` holds file-overlap rows."""
-    own_branch, own_pr = t.get("branch"), t.get("pr")
-
-    def mine_too(n):
-        return n["number"] == own_pr or (own_branch and n.get("headRefName") == own_branch)
-
-    def row(n, **extra):
-        return dict({"number": n["number"], "title": (n.get("title") or "")[:100], "state": n.get("state"),
-                     "branch": n.get("headRefName"), "url": n.get("url")}, **extra)
-
-    out: Dict[str, list] = {"ticket": [], "keyword": [], "files": []}
-    out["ticket"] = [row(n) for n in _nodes(data, "tk") if not mine_too(n)]
-    seen = {x["number"] for x in out["ticket"]}
-    need = max(2, (len(kws) + 1) // 2)
-    for alias in ("ko", "kc"):
-        for n in _nodes(data, alias):
-            if mine_too(n) or n["number"] in seen or (alias == "kc" and (n.get("closedAt") or "") < since):
-                continue
-            hits = kw_hits(kws, n)
-            if len(hits) >= need:
-                seen.add(n["number"])
-                out["keyword"].append(row(n, keywords=hits))
-    for n in _nodes(data, "ro") if mine else []:
-        if mine_too(n):
+def match(t: dict, data: dict, mine: set, me: Optional[dict] = None) -> List[dict]:
+    """Open PRs by another author sharing a non-common file; self, own branch and promote pairs excluded."""
+    me = me or {}
+    out = []
+    for n in _nodes(data, "ro"):
+        if n["number"] == t.get("pr") or (t.get("branch") and n.get("headRefName") == t["branch"]):
             continue
-        if (me or {}).get("author") and _login(n) == me["author"] or promote_pair(me or {}, n):
+        if n.get("state", "OPEN") != "OPEN" or (me.get("author") and _login(n) == me["author"]) or promote_pair(me, n):
             continue
         shared = sorted(f for f in mine & {f.get("path") for f in ((n.get("files") or {}).get("nodes") or []) if f}
-                        if not NOISE_FILES.search(f))
+                        if not COMMON_FILES.search(f))
         if shared:
-            out["files"].append(row(n, shared_files=shared[:10], shared_file_count=len(shared)))
-    out["keyword"].sort(key=lambda x: -len(x["keywords"]))
-    out["files"].sort(key=lambda x: -x["shared_file_count"])
-    out["ticket_total"] = (data.get("tk") or {}).get("issueCount")
+            out.append({"number": n["number"], "title": (n.get("title") or "")[:100], "state": n.get("state"),
+                        "branch": n.get("headRefName"), "url": n.get("url"), "shared_files": shared[:10],
+                        "shared_file_count": len(shared)})
+    out.sort(key=lambda x: -x["shared_file_count"])
     return out
 
 
-def function_overlap(found: dict, my_fns: Dict[str, set], fetch: Callable[[int], Optional[str]]) -> int:
+def function_overlap(files: List[dict], my_fns: Dict[str, set], fetch: Callable[[int], Optional[str]]) -> int:
     """Mark the top file-overlap rows that change the same enclosing function (bounded diff reads).
     Returns how many candidate diffs could not be read."""
-    pool = [x for x in found["files"] if x["number"] not in {k["number"] for k in found["ticket"]}][:MAX_FN]
+    pool = files[:MAX_FN]
     if not (my_fns and pool):
         return 0
     with cf.ThreadPoolExecutor(max_workers=MAX_FN) as ex:
@@ -349,45 +278,18 @@ def function_overlap(found: dict, my_fns: Dict[str, set], fetch: Callable[[int],
     return sum(d is None for _, d in diffs)
 
 
-def ranked(found: dict) -> dict:
-    """Ticket hits, then function overlap, then keyword hits; file-only overlap is just a count."""
-    tk = {x["number"] for x in found["ticket"]}
-    files = {x["number"]: x for x in found["files"]}
-    fn = [x for x in found["files"] if x.get("functions") and x["number"] not in tk]
-    fn_n = {x["number"] for x in fn}
-    kw = []
-    for x in found["keyword"]:
-        if x["number"] not in fn_n:
-            kw.append(dict(x, shared_file_count=(files.get(x["number"]) or {}).get("shared_file_count", 0)))
-    kw_n = {x["number"] for x in kw}
-    file_only = [n for n in files if n not in tk | fn_n | kw_n]
-    return {"ticket": found["ticket"], "function": fn, "keyword": kw, "file_only": file_only,
-            "ticket_total": found.get("ticket_total")}
-
-
 def _line(x: dict, why: str) -> str:
     return f"  #{x['number']} [{x['state']}] {x['title']} (branch {x['branch']}) - {why}"
 
 
-def advice(t: dict, repo: str, r: dict, tk_query: str) -> str:
+def advice(t: dict, repo: str, fn: List[dict], file_only: int) -> str:
     what = {"branch": f"new branch `{t.get('branch')}`", "pr-create": f"PR from `{t.get('branch') or 'HEAD'}`",
             "review": f"review of #{t.get('pr')}"}[t["trigger"]]
-    lines = [f"Duplicate-work check (advisory; nothing was blocked): the {what} may repeat existing work in {repo}."]
-    if r["ticket"]:
-        lines.append("Ticket-id hits (any state; every hit is listed):")
-        lines += [_line(x, "mentions the same ticket id") for x in r["ticket"]]
-        if (r.get("ticket_total") or 0) > len(r["ticket"]) + 1:
-            lines.append(f"  ... {r['ticket_total']} PRs in total: gh search prs '{tk_query}'")
-    if r["function"]:
-        lines.append("Same function changed in an open PR:")
-        lines += [_line(x, "changes " + ", ".join(f"`{f}`" for f in x["functions"][:3])) for x in r["function"][:SHOWN]]
-    if r["keyword"]:
-        lines.append("Keyword overlap (open, or closed in the last 30 days):")
-        lines += [_line(x, "keywords " + ", ".join(x["keywords"])
-                        + (f"; also {x['shared_file_count']} shared file(s)" if x["shared_file_count"] else ""))
-                  for x in r["keyword"][:SHOWN]]
-    if r["file_only"]:
-        lines.append(f"  ({len(r['file_only'])} other open PR(s) touch the same files, no other signal.)")
+    lines = [f"Duplicate-work check (advisory; nothing was blocked): the {what} changes a function that another "
+             f"author's open PR in {repo} also changes.", "Same function changed in an open PR:"]
+    lines += [_line(x, "changes " + ", ".join(f"`{f}`" for f in x["functions"][:3])) for x in fn[:SHOWN]]
+    if file_only:
+        lines.append(f"  ({file_only} other open PR(s) touch the same files, no other signal.)")
     lines.append(f"Read these before continuing. Off switch: env.{SWITCH_KEY}=off in sutando.config.local.json.")
     return "\n".join(lines)
 
@@ -426,6 +328,10 @@ def _log(path: Optional[Path], row: dict) -> None:
             fh.write(json.dumps(row, sort_keys=True) + "\n")
 
 
+def _code_fns(fns: Dict[str, set]) -> Dict[str, set]:
+    return {f: v for f, v in fns.items() if v and not COMMON_FILES.search(f)}
+
+
 def _one(t: dict, run: Run) -> tuple:
     """(verdict, text, detail) for one trigger."""
     deadline = time.monotonic() + GH_TIMEOUT
@@ -434,25 +340,23 @@ def _one(t: dict, run: Run) -> tuple:
     if t["trigger"] == "pr-create" and not t.get("branch"):
         head = _git(run, cwd, "rev-parse", "--abbrev-ref", "HEAD")
         t["branch"] = head if head and head != "HEAD" else None
-    kws = keywords(t.get("branch"), t.get("title")) if t["trigger"] != "review" else []
-    tks = tickets(t.get("branch") or "", t.get("title") or "", t.get("body") or "")
-    weak = ("No ticket id in the branch name, so the duplicate check is weaker."
-            if t["trigger"] != "review" and not tickets(t.get("branch") or "") else "")
-    detail = {"repo": repo, "branch": t.get("branch"), "pr": t.get("pr"), "keywords": kws, "tickets": tks}
+    detail = {"repo": repo, "branch": t.get("branch"), "pr": t.get("pr")}
     if not repo or "/" not in repo:
         return "UNKNOWN", "no GitHub repository (no --repo and no github.com origin remote)", detail
     if t["trigger"] == "review" and not t.get("pr"):
         return "UNKNOWN", "the reviewed PR is not named by number or URL", detail
     own = ""
-    mine, my_fns = local_diff(run, cwd, t.get("base")) if t["trigger"] == "pr-create" else (None, {})
-    with_files = t["trigger"] == "review" or bool(mine)
-    if not (kws or tks or with_files):
-        return "OK", weak, dict(detail, reason="nothing to search")
-    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=CLOSED_DAYS)).date().isoformat()
-    query, args, q = build_query(repo, t, kws, tks, since, with_files)
+    if t["trigger"] != "review":
+        mine, my_fns = local_diff(run, cwd, t.get("base"), worktree=t["trigger"] == "branch")
+        if mine is None:
+            return "UNKNOWN", "the local diff against the base could not be read", detail
+        detail["local_file_count"] = len(mine)
+        if not _code_fns(my_fns):
+            return "OK", "", dict(detail, reason="no changed function in a non-common file")
     with cf.ThreadPoolExecutor(max_workers=2) as ex:
         mine_diff = (ex.submit(pr_diff, run, repo, t["pr"], deadline - time.monotonic())
                      if t["trigger"] == "review" else None)
+        query, args = build_query(repo, t)
         data = search(run, query, args, deadline - time.monotonic())
         if mine_diff is not None:
             own = mine_diff.result()
@@ -465,23 +369,21 @@ def _one(t: dict, run: Run) -> tuple:
         who = {"author": _login(me), "title": me.get("title"), "branch": me.get("headRefName"),
                "base": me.get("baseRefName")}
     else:
-        who = {"author": ((data.get("viewer") or {}).get("login") or "").lower() or None, "title": t.get("title"), "branch": t.get("branch"),
-               "base": t.get("base")}
-    found = match(t, data, kws, mine, since, who)
-    unread = function_overlap(found, my_fns, lambda n: pr_diff(run, repo, n, deadline - time.monotonic()))
-    if t["trigger"] == "review" and own is None and found["files"]:
+        who = {"author": ((data.get("viewer") or {}).get("login") or "").lower() or None, "title": t.get("title"),
+               "branch": t.get("branch"), "base": t.get("base")}
+    files = match(t, data, mine, who)
+    unread = function_overlap(files, _code_fns(my_fns), lambda n: pr_diff(run, repo, n, deadline - time.monotonic()))
+    if t["trigger"] == "review" and own is None and files:
         unread += 1
+    fn = [x for x in files if x.get("functions")]
+    file_only = [x["number"] for x in files if not x.get("functions")]
+    detail.update({"function": [x["number"] for x in fn], "file_only": file_only, "unread_diffs": unread,
+                   "local_file_count": len(mine)})
     gap = (f"Function comparison incomplete: {unread} diff read(s) failed or timed out, so same-function "
            "overlap may be missed.") if unread else ""
-    r = ranked(found)
-    detail.update({k: [x["number"] for x in r[k]] for k in ("ticket", "function", "keyword")})
-    detail.update({"file_only": r["file_only"], "local_file_count": None if mine is None else len(mine)})
-    if not (r["ticket"] or r["function"] or r["keyword"]):
-        if gap:
-            return "UNKNOWN", gap.rstrip("."), detail
-        return "OK", weak, detail
-    return ("FLAG", advice(t, repo, r, q.get("tk", "")) + ("\n" + gap if gap else "") + ("\n" + weak if weak else ""),
-            detail)
+    if not fn:
+        return ("UNKNOWN", gap.rstrip("."), detail) if gap else ("OK", "", detail)
+    return "FLAG", advice(t, repo, fn, len(file_only)) + ("\n" + gap if gap else ""), detail
 
 
 def check(command: str, cwd: Optional[str], repo_root, run: Optional[Run] = None) -> str:
