@@ -56,6 +56,22 @@ what keeps the write token safe. Note `workflow_run` executes the default
 branch's copy of the file, so the comment half activates once merged to
 main; until then the numbers are in the job summary.
 
+## Lane worktree isolation
+
+`scripts/parallel-suite-lane.sh` pins the caller's input commit once and runs each
+worker in its own disposable worktree. Between suites it restores that commit
+with detached HEAD and removes non-ignored untracked files. A suite's commits,
+revision checkouts, staged changes and unstaged changes cannot become the next
+suite's source. Recovery leaves a branch selected by a suite at its existing tip.
+Ignored files, coverage fragments and the shared `node_modules` link survive.
+The scheduler resolves the source repository before clearing Git's repository-local
+environment variables, so suite commands and recovery cannot use the caller's
+worktree or staged index through inherited Git selectors.
+
+If a worker cannot restore its worktree, it stops before taking another suite
+and the scheduler exits nonzero. Other workers finish their remaining work;
+the run must be fixed and repeated before treating its results as complete.
+
 ## What counts / doesn't count
 
 - **Scope**: `hooks/`, `packages/ag2-sparrow/`, `src/`, `scripts/`, and
