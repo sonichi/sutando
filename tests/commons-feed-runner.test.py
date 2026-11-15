@@ -461,6 +461,11 @@ with tempfile.TemporaryDirectory() as tmp:
                          capture_output=True, text=True)
     check("the opid command prints the id", cli.returncode == 0
           and json.loads(cli.stdout) == {"operation_id": op_a})
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = fr.main(["feed_runner.py", "opid", str(path)])
+    check("main's opid answers the same id in process", code == 0
+          and json.loads(out.getvalue()) == {"operation_id": op_a})
     (Path(tmp) / "bad.json").write_text("{}")
     bad_cli = subprocess.run([sys.executable, str(_SCRIPT), "opid", str(Path(tmp) / "bad.json")],
                              capture_output=True, text=True)
