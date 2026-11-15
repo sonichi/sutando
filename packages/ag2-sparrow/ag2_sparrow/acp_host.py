@@ -4,12 +4,15 @@ permission policy, the task framing and the guard on text it posts. Stdlib only.
 An adapter owns its command line, how its agent answers (a reply command, or the turn's own text) and
 the words it says when a turn fails; everything here is the same for every ACP agent. Sessions are kept
 in agent-connect's `sessions.json` shape, keyed (room, access tier; a collaborator's own per room), and
-never retired. The permission policy is default deny: the owner may read or edit under the working
-directory, and an adapter may add its own exact grants (a command line, a file of its own).
+never retired; an adapter may instead run a turn `Isolated`: its own command line, directory and
+environment, a throwaway Session and a required session mode. The permission policy is default deny: the
+owner may read or edit under the working directory, and an adapter may add its own exact grants (a
+command line, a file of its own).
 """
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import os
 import re
@@ -311,13 +314,39 @@ class Turn:
             return "".join(self.chunks)
 
 
-def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, stderr_name, not_signed_in, log):
+@dataclasses.dataclass(frozen=True)
+class Isolated:
+    """A turn run apart from the owner's: `argv`, `cwd` and `env` replace the adapter's, its Session is new and
+    never stored, and `choose_mode(modes)` names the session mode set before the prompt (None refuses the turn,
+    `refused % why` saying so)."""
+    argv: list
+    cwd: str
+    env: dict
+    choose_mode: object
+    refused: str = "%s"
+
+
+def pick_mode(modes, wanted):
+    """The id of the first offered mode whose id or name is in `wanted` (compared lowercased), else None."""
+    offered = (modes or {}).get("availableModes") if isinstance(modes, dict) else None
+    for mode in offered if isinstance(offered, list) else []:
+        if isinstance(mode, dict) and isinstance(mode.get("id"), str) and mode["id"] and any(
+                isinstance(mode.get(k), str) and mode[k].strip().lower() in wanted for k in ("id", "name")):
+            return mode["id"]
+    return None
+
+
+def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, stderr_name, not_signed_in, log,
+               isolated=None):
     """One task's turn: spawn `args.acp_argv`, `initialize`, resume the task's Session (else open one), send one
     `session/prompt` and wait for it to stop. `decide(params) -> (allowed, reason, result)` answers each
-    permission request. (status, text, detail, turn): status is completed | cancelled | timeout | gone | failed;
-    an agent that is not signed in fails with `not_signed_in % its error`."""
+    permission request. (status, text, detail, turn): status is completed | cancelled | timeout | gone | failed
+    | refused; an agent that is not signed in fails with `not_signed_in % its error`. With `isolated`, the turn
+    runs as `Isolated` says, and is refused unless its session mode is offered and set."""
     turn = Turn()
-    cwd = args.cwd
+    cwd = isolated.cwd if isolated else args.cwd
+    argv = isolated.argv if isolated else args.acp_argv
+    env = isolated.env if isolated else args.child_env
 
     def on_permission(params):
         ok, why, result = decide(params)
@@ -326,7 +355,7 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
         return result
 
     try:
-        client = client_factory(args.acp_argv, cwd=cwd, env=args.child_env,
+        client = client_factory(argv, cwd=cwd, env=env,
                                 stderr_path=os.path.join(args.state, stderr_name),
                                 on_permission=on_permission, on_update=turn.on_update)
     except OSError as e:
@@ -335,7 +364,7 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
         init = client.initialize(args.rpc_timeout)
         loadable = bool((init.get("agentCapabilities") or {}).get("loadSession"))
         key = session_key(headers, task_id)
-        rec = store.get(key)
+        rec = None if isolated else store.get(key)
         session_id, turns = None, 0
         if rec and rec.get("cwd") == cwd and loadable:
             try:
@@ -348,11 +377,18 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
             except AcpError as e:
                 log("session/load refused, opening a new session:", str(e)[:200])
         if session_id is None:
-            session_id = client.call("session/new", {"cwd": cwd, "mcpServers": []}, args.rpc_timeout).get("sessionId")
+            opened = client.call("session/new", {"cwd": cwd, "mcpServers": []}, args.rpc_timeout)
+            session_id = opened.get("sessionId")
             if not session_id:
                 return "failed", "", "session/new returned no sessionId", turn
-            log("new session", session_id, "for", key)
-        store.remember(key, session_id, cwd, turns + 1)
+            log("new session", session_id, "for", key, *(("(isolated)",) if isolated else ()))
+            if isolated:
+                refused = _set_mode(client, session_id, opened.get("modes"), isolated, args.rpc_timeout)
+                if refused:
+                    log("isolated turn refused:", refused)
+                    return "refused", "", isolated.refused % refused, turn
+        if not isolated:
+            store.remember(key, session_id, cwd, turns + 1)
         turn.live = True
         params = {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt}]}
         try:
@@ -375,3 +411,19 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
         return "failed", turn.text, str(e), turn
     finally:
         client.close(args.interrupt_grace)
+
+
+def _set_mode(client, session_id, modes, isolated, timeout):
+    """'' once the mode `isolated.choose_mode` names is set on the Session; else why the turn is refused."""
+    mode = isolated.choose_mode(modes)
+    if not mode:
+        offered = [m.get("id") for m in ((modes or {}).get("availableModes") or []) if isinstance(m, dict)] \
+            if isinstance(modes, dict) else []
+        return "no read-only session mode is offered (offered: %s)" % (", ".join(map(str, offered)) or "none")
+    try:
+        client.call("session/set_mode", {"sessionId": session_id, "modeId": mode}, timeout)
+    except (AcpTimeout, AcpGone):
+        raise
+    except AcpError as e:
+        return "setting session mode %s failed (%s)" % (mode, str(e)[:160])
+    return ""

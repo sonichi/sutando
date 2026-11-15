@@ -297,8 +297,11 @@ def verify(args, factory=gc.AcpClient) -> int:
     for key in ("INBOX_DIR", "RESULTS_DIR"):
         cm.check(results, Path(cfg[key]).is_dir(), key.lower().replace("_dir", ""), cfg[key])
     store = cfg.get("SESSION_STORE") or str(Path(cm.work_root(cfg)) / "state" / gc.SESSIONS_NAME)
-    print(f"INFO sessions: {store} (resumed per room; never retired)")
-    print(f"INFO non-owner: {'served, no file operations (--allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '1' else 'refused unless attested collaborator'}")
+    print(f"INFO sessions: {store} (the owner's resumed per room, never retired; a non-owner's turn is a "
+          "throwaway session)")
+    print(f"INFO non-owner: {'served (--allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '1' else 'refused unless attested collaborator'}; "
+          "each turn in its own temporary directory and agy home, deny-all rules, read-only (plan) mode, "
+          "no file operations")
     if cb.bridge_mode(cfg) != EXTERNAL:
         print(f"INFO agent: {cfg.get('AGENT_ID')}")
         problem = cb.bridge_problem(cfg, COMMAND, bridge)

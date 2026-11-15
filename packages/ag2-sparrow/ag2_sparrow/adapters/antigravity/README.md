@@ -4,7 +4,8 @@ Runs Google's Antigravity CLI (`agy`) on this computer as an s.space agent, the 
 `ag2-sparrow-claude-local` and `ag2-sparrow-codex-local` run Claude Code and Codex: people @-mention the
 agent in a room and Antigravity answers there. For each task file Sparrow queues, the connector wakes
 Antigravity over the Agent Client Protocol: it spawns `agy acp`, sends `initialize`, resumes the room's
-Session with `session/load` (or opens one with `session/new`) and sends one `session/prompt`. Stdlib only;
+Session with `session/load` (or opens one with `session/new`) and sends one `session/prompt`; a
+non-owner's turn runs isolated instead (see Tiers and permissions). Stdlib only;
 opt-in; the core never imports it.
 
 Status: the handshake and the sign-in check were run against a real `agy` 1.5.9 (signed out); a full turn
@@ -55,13 +56,38 @@ final message is the only answer path.
 ## Tiers and permissions
 
 The owner and an attested collaborator are served; any other non-owner is refused with one line unless
-`--allow-non-owner`. agy's `session/request_permission` is answered by `acp_host`'s policy, default deny:
+`--allow-non-owner`.
+
+**The owner's turns** resume the room's Session in the working directory, with agy's own home
+(`~/.gemini`: its settings, rules and context).
+
+**A non-owner's turn** (an attested collaborator, or anyone `--allow-non-owner` admits) runs isolated:
+
+- a fresh temporary directory per task holds the Session's working directory and a separate agy home,
+  passed as `agy acp --gemini-dir <dir>`; that home has only a `settings.json` whose permission rules deny
+  every tool (`read_file(*)`, `write_file(*)`, `read_url(*)`, `execute_url(*)`, `download_url(*)`,
+  `command(*)`, `mcp(*)`) and no global rules or context; the directory is removed after the turn. `HOME`
+  and the rest of the environment are unchanged, so agy finds the sign-in in the Keychain as for the owner;
+- a new Session for every task, never resumed and never recorded in the session store;
+- the Session is put in a read-only mode with `session/set_mode` (`plan`, or a mode named `read-only`),
+  picked from the `modes` that `session/new` returns. If agy offers no such mode, or refuses it, the turn
+  is not run: a message gets a line saying so, an event posts nothing.
+
+`--gemini-dir` is agy's flag: a custom `--acp-command` must accept it, or non-owner turns fail.
+
+agy's `session/request_permission` is answered by `acp_host`'s policy, default deny:
 
 - the owner only: a `read` or `edit` whose every path resolves (after `..`, `~` and symlinks) under the
   working directory; never when the working directory is the home directory or above it;
 - nothing else: no shell command, and no `execute`, `fetch`, `delete`, `move` or unclassified call.
 
-This binds only what agy asks about. agy applies its own permission rules first (an action they already
-allow runs without asking), and `--dangerously-skip-permissions` or an allow rule in
-`~/.gemini/antigravity-cli/settings.json` makes it run tools without asking, for every tier. Keep agy's
-default rules for agents that serve anyone but the owner.
+For the owner's turns, agy applies its own permission rules first (an action they already allow runs
+without asking), and `--dangerously-skip-permissions` makes it run tools without asking; never add that
+flag to an agent others can reach.
+
+Measured against a real agy 1.5.9 (signed out): with `--gemini-dir` an absolute path, agy keeps its app
+data, `settings.json`, logs, conversations and `config/` under that directory, reads the settings file
+there, and nothing is written to `~/.gemini`; `initialize` and the -32000 "Authentication required" answer
+to `session/new` are the same as without it. Not yet measured, because no signed-in agy was available:
+that a signed-in agy finds its sign-in with `--gemini-dir`, which modes `session/new` lists, and that
+global rules are read only from the `--gemini-dir` home.

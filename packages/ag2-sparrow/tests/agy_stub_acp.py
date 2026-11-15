@@ -8,6 +8,12 @@ has been measured yet. Its sign-in, session
 and log files live under $HOME (the one variable the launcher's allowlist always passes): `signed-in` marks it
 signed in, `stub-sessions.json` keeps its sessions, `stub.log` records each request and permission outcome.
 A prompt marker picks the turn: STUB:TEXT, STUB:NOREPLY, STUB:MARKER, STUB:EDIT, STUB:SHELL, STUB:HANG.
+
+Its first log line reports the agy home it would use (`--gemini-dir`, else $HOME/.gemini), whether that
+home holds a settings.json (and its text) or any global context file, and its process directory.
+`session/new` offers the modes default, accept-edits and plan as agy's `--mode` names them (assumed: no
+signed-in agy has listed its ACP modes yet); `no-modes` under $HOME offers none, `set-mode-fails` makes
+`session/set_mode` fail.
 """
 import json
 import os
@@ -92,8 +98,32 @@ def prompt(rid, params):
     send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
 
 
+GLOBAL_CONTEXT = ("GEMINI.md", "AGENTS.md", "config/GEMINI.md", "config/AGENTS.md")
+MODES = {"currentModeId": "default", "availableModes": [
+    {"id": "default", "name": "Default"}, {"id": "accept-edits", "name": "Accept edits"},
+    {"id": "plan", "name": "Plan"}]}
+
+
+def agy_home(argv):
+    if "--gemini-dir" in argv[:-1]:
+        return argv[argv.index("--gemini-dir") + 1]
+    return os.path.join(HOME, ".gemini")
+
+
+def boot_record(argv):
+    home = agy_home(argv)
+    settings = os.path.join(home, "antigravity-cli", "settings.json")
+    try:
+        with open(settings, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        text = None
+    return {"argv": argv, "agy_home": home, "settings": text, "process_cwd": os.getcwd(),
+            "global_context": [n for n in GLOBAL_CONTEXT if os.path.exists(os.path.join(home, n))]}
+
+
 def main():
-    log({"argv": sys.argv[1:]})
+    log(boot_record(sys.argv[1:]))
     for line in sys.stdin:
         m = json.loads(line)
         method, rid, params = m.get("method"), m.get("id"), m.get("params") or {}
@@ -118,7 +148,15 @@ def main():
             sid = "s-%d" % (len(s) + 1)
             s[sid] = params.get("cwd")
             save(s)
-            send({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": sid}})
+            result = {"sessionId": sid}
+            if not os.path.exists(os.path.join(HOME, "no-modes")):
+                result["modes"] = MODES
+            send({"jsonrpc": "2.0", "id": rid, "result": result})
+        elif method == "session/set_mode":
+            if os.path.exists(os.path.join(HOME, "set-mode-fails")):
+                send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "mode not allowed"}})
+            else:
+                send({"jsonrpc": "2.0", "id": rid, "result": {}})
         elif method == "session/load":
             if params.get("sessionId") in sessions():
                 chunk(params["sessionId"], "replayed history")

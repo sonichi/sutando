@@ -170,6 +170,99 @@ class ConnectorTest(unittest.TestCase):
         prompt = next(r["text"] for r in self.w.records() if r.get("method") == "session/prompt")
         self.assertIn("You may not read or change files.", prompt)
 
+    def boots(self):
+        return [r for r in self.w.records() if "agy_home" in r]
+
+    def owner_home_with_context(self):
+        home = self.w.home / ".gemini"
+        (home / "antigravity-cli").mkdir(parents=True)
+        (home / "GEMINI.md").write_text("owner's saved context")
+        (home / "antigravity-cli" / "settings.json").write_text('{"permissions": {"allow": ["command(*)"]}}')
+        return home
+
+    def test_a_non_owner_turn_never_loads_the_owners_agy_home_or_working_directory(self):
+        self.owner_home_with_context()
+        self.w.task("task-1", "STUB:TEXT hi", tier="team", collaborator=True)
+        self.w.task("task-2", "STUB:TEXT hi", tier="team", channel="!b:s.space")
+        os.utime(self.w.root / "tasks" / "task-2.txt", (2e9, 2e9))
+        self.w.serve(2, "--allow-non-owner")
+        self.assertEqual(self.w.result("task-1"), "hello from agy-stub\n")
+        boots = self.boots()
+        self.assertEqual(len(boots), 2)
+        news = [r["params"]["cwd"] for r in self.w.records() if r.get("method") == "session/new"]
+        for boot, cwd in zip(boots, news):
+            home = boot["agy_home"]
+            self.assertEqual(boot["argv"][-2:], ["--gemini-dir", home])
+            self.assertTrue(os.path.basename(os.path.dirname(home)).startswith(gc.GUEST_PREFIX), home)
+            self.assertFalse(home.startswith(str(self.w.home)), "never under the owner's home")
+            self.assertEqual(boot["global_context"], [])
+            self.assertEqual(json.loads(boot["settings"]), gc.GUEST_SETTINGS)
+            self.assertIn("command(*)", json.loads(boot["settings"])["permissions"]["deny"])
+            self.assertEqual(boot["process_cwd"], cwd)
+            self.assertEqual(os.path.dirname(cwd), os.path.dirname(home))
+            self.assertFalse(cwd.startswith(str(self.w.cwd)), "never the owner's working directory")
+            self.assertFalse(os.path.exists(os.path.dirname(home)), "the temporary directory is removed")
+        self.assertNotEqual(boots[0]["agy_home"], boots[1]["agy_home"])
+        self.assertTrue(all(m["isolated"] for m in self.w.metrics()))
+
+    def test_each_non_owner_task_gets_a_throwaway_session_in_read_only_mode(self):
+        self.w.task("task-1", "STUB:TEXT one", tier="team", collaborator=True)
+        self.w.serve()
+        self.w.task("task-2", "STUB:TEXT two", tier="team", collaborator=True)
+        self.w.serve()
+        methods = self.w.methods()
+        self.assertNotIn("session/load", methods)
+        self.assertEqual([m for m in methods if m.startswith("session/")],
+                         ["session/new", "session/set_mode", "session/prompt"] * 2)
+        modes = [r["params"] for r in self.w.records() if r.get("method") == "session/set_mode"]
+        self.assertEqual(modes, [{"sessionId": "s-1", "modeId": "plan"}, {"sessionId": "s-2", "modeId": "plan"}])
+        store = acp_host.SessionStore(self.w.root / "state" / gc.SESSIONS_NAME)
+        self.assertIsNone(store.get(("!room:s.space", "collaborator:@alice:s.space")))
+        self.assertEqual(self.w.result("task-2"), "hello from agy-stub\n")
+
+    def test_a_non_owner_turn_is_refused_when_no_read_only_mode_is_offered_or_set(self):
+        for marker in ("no-modes", "set-mode-fails"):
+            with self.subTest(marker):
+                for p in (self.w.home / "stub.log", self.w.root / "results" / "task-1.txt",
+                          self.w.root / "state" / "done"):
+                    p.unlink(missing_ok=True)
+                (self.w.home / marker).write_text("")
+                self.w.task("task-1", "STUB:TEXT hi", tier="team", collaborator=True)
+                self.w.serve()
+                (self.w.home / marker).unlink()
+                said = self.w.result("task-1")
+                self.assertIn("Antigravity did not take this: it answers non-owners only in a read-only session mode", said)
+                self.assertIn("no read-only session mode is offered" if marker == "no-modes"
+                              else "setting session mode plan failed", said)
+                self.assertNotIn("session/prompt", self.w.methods())
+                self.assertEqual(self.w.metrics()[-1]["status"], "refused")
+        self.w.task("task-2", "say hi", tier="team", collaborator=True, event_type="room.joined")
+        (self.w.home / "no-modes").write_text("")
+        self.w.serve()
+        self.assertTrue(self.w.result("task-2").startswith("[no-send]"))
+
+    def test_the_owner_turn_keeps_its_home_directory_and_room_session(self):
+        home = self.owner_home_with_context()
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        boot = self.boots()[0]
+        self.assertEqual((boot["agy_home"], boot["process_cwd"]), (str(home), os.path.realpath(self.w.cwd)))
+        self.assertNotIn("--gemini-dir", boot["argv"])
+        self.assertNotIn("session/set_mode", self.w.methods())
+        new = next(r for r in self.w.records() if r.get("method") == "session/new")
+        self.assertEqual(new["params"]["cwd"], str(self.w.cwd))
+        store = acp_host.SessionStore(self.w.root / "state" / gc.SESSIONS_NAME)
+        self.assertEqual(store.get(("!room:s.space", "owner"))["session_id"], "s-1")
+        self.assertFalse(self.w.metrics()[0]["isolated"])
+
+    def test_the_read_only_mode_is_picked_by_id_or_name(self):
+        pick = lambda modes: acp_host.pick_mode(modes, gc.READ_ONLY_MODES)  # noqa: E731
+        self.assertEqual(pick({"availableModes": [{"id": "default"}, {"id": "plan"}]}), "plan")
+        self.assertEqual(pick({"availableModes": [{"id": "m2", "name": "Read-only"}]}), "m2")
+        for modes in (None, {}, {"availableModes": [{"id": "default"}, {"id": "auto"}]}, {"availableModes": "plan"},
+                      {"availableModes": [{"name": "plan"}]}):
+            self.assertIsNone(pick(modes), modes)
+
     def test_a_guest_is_refused_without_waking_agy(self):
         self.w.task("task-1", "STUB:TEXT hi", tier="guest")
         self.w.serve()

@@ -11,15 +11,21 @@ with every delivery marker neutralised. A final message of exactly NO_REPLY post
 turn failed gets a line saying so; an event that failed posts nothing.
 
 Sessions, the permission policy and the framing are acp_host's: the owner may read or edit under the working
-directory, no command is ever granted, and tier admission is task_io.admission's. Stdlib only.
+directory, no command is ever granted, and tier admission is task_io.admission's. A non-owner turn runs
+isolated: a fresh temporary directory per task holds its working directory and its own agy home
+(`--gemini-dir`, with deny-all permission rules and no global context), its Session is new and never stored,
+and it is refused unless agy offers a read-only (plan) session mode and accepts it. Stdlib only.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shlex
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -41,6 +47,14 @@ NOT_SIGNED_IN = ("Antigravity is not signed in on this computer (%s): run `agy` 
                  "or run `agy acp --login`")
 
 
+READ_ONLY_MODES = frozenset({"plan", "read-only", "readonly", "read_only"})
+GUEST_PREFIX = "ag2-sparrow-antigravity-guest-"
+GUEST_REFUSED = "it answers non-owners only in a read-only session mode, and %s"
+# agy evaluates Deny > Ask > Allow, and deny rules apply in every mode.
+GUEST_SETTINGS = {"agentMode": "plan", "permissions": {"allow": [], "ask": [], "deny": [
+    "read_file(*)", "write_file(*)", "read_url(*)", "execute_url(*)", "download_url(*)", "command(*)", "mcp(*)"]}}
+
+
 class AcpClient(_SharedClient):
     client_info = {"name": "ag2-sparrow-antigravity", "version": "0.1.0"}
 
@@ -56,6 +70,27 @@ def publish(result_file, body):
     labels, _notes = result_publish.result_labels_for(body)
     result_labels.write(Path(result_file), labels, body)
     result_publish.publish_text(result_file, body)
+
+
+@contextlib.contextmanager
+def guest_turn(args):
+    """An `acp_host.Isolated` for one non-owner task: a new 0700 temporary directory holding the Session's
+    working directory and agy's home (`--gemini-dir`, deny-all settings only), removed after the turn."""
+    base = os.path.realpath(tempfile.mkdtemp(prefix=GUEST_PREFIX))
+    try:
+        home, cwd = os.path.join(base, "agy"), os.path.join(base, "cwd")
+        os.makedirs(os.path.join(home, "antigravity-cli"), mode=0o700)
+        os.mkdir(cwd, 0o700)
+        settings = os.path.join(home, "antigravity-cli", "settings.json")
+        fd = os.open(settings, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(GUEST_SETTINGS, f)
+        yield acp_host.Isolated(argv=list(args.acp_argv) + ["--gemini-dir", home], cwd=cwd,
+                                env=dict(args.child_env),
+                                choose_mode=lambda modes: acp_host.pick_mode(modes, READ_ONLY_MODES),
+                                refused=GUEST_REFUSED)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
 
 
 def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_NOTE):
@@ -82,11 +117,17 @@ class Connector:
         self.retry_at = {}
 
     def run_turn(self, task_id, headers, prompt, owner):
-        """(status, text, detail, turn): status is completed | cancelled | timeout | gone | failed."""
-        cwd = self.args.cwd
-        return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
-                                   lambda params: acp_host.decide_permission(params, owner, cwd), self.store,
-                                   STDERR_NAME, NOT_SIGNED_IN, log)
+        """(status, text, detail, turn): status is completed | cancelled | timeout | gone | failed | refused.
+        The owner's turn resumes the room's Session in the working directory; any other runs `guest_turn`."""
+        if owner:
+            cwd = self.args.cwd
+            return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
+                                       lambda params: acp_host.decide_permission(params, True, cwd), self.store,
+                                       STDERR_NAME, NOT_SIGNED_IN, log)
+        with guest_turn(self.args) as isolated:
+            return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
+                                       lambda params: acp_host.decide_permission(params, False, isolated.cwd),
+                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=isolated)
 
     def answer_body(self, headers, status, text, detail):
         """What Sparrow posts: the turn's own text, quoted so no delivery marker in it acts; NO_REPLY or a
@@ -105,7 +146,8 @@ class Connector:
             return "[no-send] %s handled the event without posting" % self.name + quoted(
                 " (%s: %s)" % (status, detail[:120])) + "\n"
         head = {"timeout": "%s did not finish this in time (%s)." % (self.name, detail),
-                "gone": "%s stopped before answering (%s)." % (self.name, detail)}.get(
+                "gone": "%s stopped before answering (%s)." % (self.name, detail),
+                "refused": "%s did not take this: %s." % (self.name, detail)}.get(
                     status, "%s could not answer this (%s: %s)." % (self.name, status, detail))
         return quoted(head + ("\n\nPartial reply:\n" + said if said else "")) + "\n"
 
@@ -126,7 +168,8 @@ class Connector:
         status, text, detail, turn = self.run_turn(task_id, headers, prompt, tier == "owner")
         publish(result_file, self.answer_body(headers, status, text, detail))
         return {"task": task_id, "status": status, "detail": detail[:200], "event_type": event,
-                "tier": headers["access_tier"], "turn_s": round(time.time() - t0, 3), "permissions": turn.decisions}
+                "tier": headers["access_tier"], "isolated": tier != "owner", "turn_s": round(time.time() - t0, 3),
+                "permissions": turn.decisions}
 
     def pending_tasks(self, seen):
         now = time.time()
