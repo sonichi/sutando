@@ -166,9 +166,8 @@ print("suite-returned")
         if mode == "spawn-interrupt":
             env["LANE_HOLD_SUITE"] = "1"
             bash_env = rec / "bash-env"
-            bash_env.write_text('''if [ "$0" = "$LANE_SCHEDULER" ]; then
-    trap 'case "$BASH_COMMAND" in pids+=*)
-        if [ ! -e "$LANE_RACE_RECORD/signalled" ]; then
+            bash_env.write_text('''trap 'case "$BASH_COMMAND" in pids+=*)
+        if [ "$0" = "$LANE_SCHEDULER" ] && [ ! -e "$LANE_RACE_RECORD/signalled" ]; then
             printf "%s\\n" "$!" > "$LANE_RACE_RECORD/spawned"
             for _probe in {1..100}; do
                 [ -e "$LANE_RACE_RECORD/children" ] && break
@@ -178,7 +177,6 @@ print("suite-returned")
             kill -INT "$$"
         fi ;;
     esac' DEBUG
-fi
 ''')
             env["BASH_ENV"] = str(bash_env)
         scheduler = None
