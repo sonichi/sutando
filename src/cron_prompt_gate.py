@@ -178,43 +178,70 @@ def registration_view(entries: list, owner_id: str = CORE,
     return out
 
 
-def marker(entry: dict, prompt: str) -> str:
-    """Prefix that survives CronList truncation: names the entry and the prompt it was built from."""
-    digest = hashlib.sha256(prompt.encode()).hexdigest()[:8]
-    return f"[sutando-cron:{entry.get('name')}:{digest}] "
+MARKER = re.compile(r"\[sc:([0-9a-f]{10}):([0-9a-f]{8})\]")
+
+
+def _hex(text: str, n: int) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:n]
+
+
+def marker(owner: str, name: str, prompt: str) -> str:
+    """Fixed-length tag (24 chars): who owns the job, then the exact prompt it was built from."""
+    return f"[sc:{_hex(owner + chr(0) + name, 10)}:{_hex(prompt, 8)}]"
+
+
+def tagged_prompt(owner: str, name: str, prompt: str) -> str:
+    """Marker after a leading /skill token (the slash must still dispatch), else in front."""
+    tag = marker(owner, name, prompt)
+    if prompt.startswith("/"):
+        head, sep, rest = prompt.partition(" ")
+        return f"{head} {tag}{sep}{rest}"
+    return f"{tag} {prompt}"
 
 
 class ListingError(ValueError):
     """The CronList receipt was not observed or is not usable."""
 
 
-def load_jobs(path: str) -> list:
-    """Jobs as [{id, cron, prompt}] from a file the session wrote after calling CronList."""
+def _scalar(v) -> bool:
+    return isinstance(v, (str, int)) and not isinstance(v, bool) and str(v) != ""
+
+
+def load_jobs(path) -> list:
+    """Jobs as [{id, cron, prompt}] from the file the session wrote after calling CronList."""
+    if not path:
+        raise ListingError("CronList receipt path is empty")
     try:
         jobs = json.loads(Path(path).read_text())
     except (OSError, ValueError) as exc:
         raise ListingError(f"CronList receipt {path} not readable: {exc}")
-    ok = isinstance(jobs, list) and all(isinstance(j, dict) and "id" in j for j in jobs)
-    if not ok:
-        raise ListingError(f"CronList receipt {path} is not a list of jobs with ids")
+    good = isinstance(jobs, list) and all(
+        isinstance(j, dict) and _scalar(j.get("id")) and _scalar(j.get("cron"))
+        and isinstance(j.get("prompt"), str) for j in jobs)
+    if not good:
+        raise ListingError(f"CronList receipt {path} is not a list of jobs with id, cron and prompt")
     return jobs
 
 
-def reconcile(view: list, jobs: list) -> list:
+def plan_cron_actions(view: list, jobs: list, owner: str) -> list:
     """Per entry: create / keep / replace (old ids to delete after the new one is confirmed)."""
     plan = []
     for e in view:
-        if not e.get("registered_prompt"):
+        base = e.get("registered_prompt")
+        name = e.get("name")
+        if not base or not isinstance(name, str) or not name:
             continue
-        tag = marker(e, e["registered_prompt"])
-        stem = tag.rsplit(":", 1)[0] + ":"
-        mine = [j for j in jobs if str(j.get("prompt", "")).lstrip().startswith(stem)]
-        ids = [str(j["id"]) for j in mine]
-        fresh = len(mine) == 1 and mine[0]["prompt"].lstrip().startswith(tag) \
-            and _same_cron(mine[0].get("cron"), e.get("cron"))
+        tag = marker(owner, name, base)
+        mine = []
+        for j in jobs:
+            m = MARKER.search(j["prompt"])
+            if m and m.group(1) == tag[4:14]:
+                mine.append(j)
+        fresh = len(mine) == 1 and tag in mine[0]["prompt"] and _same_cron(mine[0]["cron"], e.get("cron"))
         action = "keep" if fresh else ("replace" if mine else "create")
-        plan.append({"name": e.get("name"), "action": action, "cron": e.get("cron"),
-                     "registered_prompt": tag + e["registered_prompt"], "delete_ids": ids if action == "replace" else []})
+        plan.append({"name": name, "action": action, "cron": e.get("cron"),
+                     "registered_prompt": tagged_prompt(owner, name, base),
+                     "delete_ids": [str(j["id"]) for j in mine] if action == "replace" else []})
     return plan
 
 
@@ -241,9 +268,12 @@ def main(argv=None) -> int:
         print(f"{args.crons_json}: expected a JSON list", file=sys.stderr)
         return 2
     view = registration_view(cfg, args.owner, args.workspace)
-    if args.registered:
+    unnamed = [e for e in view if not isinstance(e.get("name"), str) or not e["name"]]
+    if unnamed:
+        print(f"refusing {len(unnamed)} pinned entr(y/ies) with no name", file=sys.stderr)
+    if args.registered is not None:
         try:
-            view = reconcile(view, load_jobs(args.registered))
+            view = plan_cron_actions(view, load_jobs(args.registered), args.owner)
         except ListingError as exc:
             print(f"{exc}; register nothing", file=sys.stderr)
             return 3
