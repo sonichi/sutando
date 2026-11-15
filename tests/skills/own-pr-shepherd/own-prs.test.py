@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """skills/own-pr-shepherd/scripts/own_prs.py: the classifier over fabricated PR nodes, search
 paging to the end (the `--limit` trap) and the incomplete verdict, the smaller-page retry, the
-quota floor, ownership by commit email, `approved` always going to the owner, the acted-at-head
-record (locked), the shared review-asks ledger, and the list CLI. No network: GraphQL is a stub."""
+quota floor, ownership by commit email, `approved` always going to the owner, the acted record
+(locked) keyed on the last non-merge commit, the shared review-asks ledger, and the list CLI. No
+network: GraphQL is a stub."""
 import importlib.util
 import contextlib
 import io
@@ -52,6 +53,13 @@ def pr(number=1, decision="REVIEW_REQUIRED", mergeable="MERGEABLE", mss="BLOCKED
                                           "statusCheckRollup": {"state": rollup,
                                                                 "contexts": {"nodes": list(contexts)}}}}]},
     }
+
+
+def merged_base(number=1, **kw):
+    """A PR whose head is a base merge (update-branch) on top of the owner's commit "c1"."""
+    p = pr(number, committed="2026-11-14T13:00:00Z",
+           recent=[commit("c1", "2026-11-14T10:00:00Z"), commit(HEAD, "2026-11-14T13:00:00Z", merge=True)], **kw)
+    return p
 
 
 def review(state, oid="", at="2026-11-14T11:00:00Z", who="rev"):
@@ -202,7 +210,7 @@ class Search(unittest.TestCase):
 
 
 class Record(unittest.TestCase):
-    def test_acted_holds_until_the_head_moves(self):
+    def test_acted_holds_until_the_commit_moves(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "state" / "own-pr-shepherd.json"
             op.record(path, "o/r#1", "needs_reviewer", HEAD, now=1)
@@ -210,8 +218,25 @@ class Record(unittest.TestCase):
             self.assertTrue(op.acted(rec, "o/r#1", "needs_reviewer", HEAD))
             self.assertFalse(op.acted(rec, "o/r#1", "ci_red", HEAD))
             self.assertFalse(op.acted(rec, "o/r#1", "needs_reviewer", "new"))
+            self.assertFalse(op.acted(rec, "o/r#1", "needs_reviewer", ""))
             op.record(path, "o/r#1", "ci_red", "new", now=2)
-            self.assertEqual(json.loads(path.read_text())["o/r#1"], {"head": "new", "acted": ["ci_red"], "at": 2})
+            self.assertEqual(json.loads(path.read_text())["o/r#1"],
+                             {"acted": {"needs_reviewer": HEAD, "ci_red": "new"}, "at": 2})
+            path.write_text(json.dumps({"o/r#1": {"head": HEAD, "acted": ["ci_red"]}}))
+            self.assertFalse(op.acted(op.load_record(path), "o/r#1", "ci_red", HEAD), "an old-shape entry")
+            op.record(path, "o/r#1", "ci_red", "x", now=3)
+            self.assertEqual(op.load_record(path)["o/r#1"], {"acted": {"ci_red": "x"}, "at": 3})
+
+    def test_the_mark_is_the_last_non_merge_commit_except_for_base_classes(self):
+        p = merged_base()
+        self.assertEqual(op.content_commit(p)["oid"], "c1")
+        for cls in ("needs_reviewer", "changes_addressed", "approved", "ci_red"):
+            self.assertEqual(op.acted_sha(p, cls), "c1", cls)
+        for cls in ("conflicting", "behind"):
+            self.assertEqual(op.acted_sha(p, cls), HEAD, "the base moving again needs another merge")
+        only_merges = pr(recent=[commit(HEAD, merge=True)])
+        self.assertEqual(op.content_commit(only_merges)["oid"], HEAD, "falls back to the head")
+        self.assertEqual(op.acted_sha(pr(recent=[]), "approved"), HEAD)
 
     def test_the_record_is_bounded(self):
         with tempfile.TemporaryDirectory() as d:
@@ -240,7 +265,7 @@ class Record(unittest.TestCase):
                     t.join()
             self.assertEqual(len(real(path)), 12)
 
-    def test_the_shared_ask_ledger_covers_ask_classes_since_the_head(self):
+    def test_the_shared_ask_ledger_covers_ask_classes_since_the_content(self):
         with tempfile.TemporaryDirectory() as d:
             ledger = Path(d) / "review-asks.jsonl"
             ledger.write_text("\n".join([
@@ -250,21 +275,64 @@ class Record(unittest.TestCase):
             asks = op.load_asks(ledger)
             self.assertEqual(asks, {"o/r#1": "2026-11-14T11:00:00Z"})
             p = pr(committed="2026-11-14T10:00:00Z")
-            self.assertTrue(op.asked_since_head(asks, "o/r#1", "needs_reviewer", p))
-            self.assertTrue(op.asked_since_head(asks, "o/r#1", "changes_addressed", p))
-            self.assertFalse(op.asked_since_head(asks, "o/r#1", "ci_red", p), "only reviewer asks")
-            self.assertFalse(op.asked_since_head(asks, "o/r#1", "needs_reviewer", pr(committed="2026-11-14T12:00:00Z")))
-            self.assertFalse(op.asked_since_head(asks, "o/r#2", "needs_reviewer", p))
+            self.assertTrue(op.asked_since_content(asks, "o/r#1", "needs_reviewer", p))
+            self.assertTrue(op.asked_since_content(asks, "o/r#1", "changes_addressed", p))
+            self.assertFalse(op.asked_since_content(asks, "o/r#1", "ci_red", p), "only reviewer asks")
+            self.assertFalse(op.asked_since_content(asks, "o/r#1", "needs_reviewer", pr(committed="2026-11-14T12:00:00Z")))
+            self.assertFalse(op.asked_since_content(asks, "o/r#2", "needs_reviewer", p))
             self.assertEqual(op.load_asks(Path(d) / "missing"), {})
             self.assertEqual(op.load_asks(None), {})
+
+    def test_an_ask_before_a_base_merge_still_covers_it(self):
+        asks = {"o/r#1": "2026-11-14T11:00:00Z"}
+        self.assertTrue(op.asked_since_content(asks, "o/r#1", "needs_reviewer", merged_base()),
+                        "the merge at 13:00 is newer than the ask; the owner's commit is not")
 
     def test_the_ledger_path_comes_from_its_writer(self):
         path = op._ledger_path()
         self.assertIsNotNone(path)
         self.assertEqual(path.name, "review-asks.jsonl")
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(op, "REPO_ROOT", Path(d)):
+            self.assertIsNone(op._ledger_path(), "no collaboration-intelligence skill")
+
+    def test_the_state_lives_under_the_workspace(self):
+        path = op.state_path()
+        self.assertEqual((path.name, path.parent.name), ("own-pr-shepherd.json", "state"))
 
     def test_record_refuses_an_unknown_class(self):
-        self.assertEqual(op.main(["record", "o/r#1", "bogus", "--head", HEAD]), 2)
+        self.assertEqual(op.main(["record", "o/r#1", "bogus", "--sha", HEAD]), 2)
+
+    def test_record_cli_writes_the_mark(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "s.json"
+            out = io.StringIO()
+            with mock.patch.object(op, "state_path", lambda: path), contextlib.redirect_stdout(out):
+                self.assertEqual(op.main(["record", "o/r#1", "approved", "--sha", "c1" * 20]), 0)
+            self.assertEqual(out.getvalue().strip(), "RECORDED o/r#1 approved sha=c1c1c1c1")
+            self.assertTrue(op.acted(op.load_record(path), "o/r#1", "approved", "c1" * 20))
+
+
+class GraphQL(unittest.TestCase):
+    def test_variables_and_errors(self):
+        seen = []
+
+        def runner(cmd, **_kw):
+            seen.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"data": {"ok": 1}}))
+        self.assertEqual(op.gh_graphql("Q", {"q": "s", "n": 5, "after": None}, runner=runner), {"ok": 1})
+        self.assertEqual(seen[0], ["gh", "api", "graphql", "-f", "query=Q", "-f", "q=s", "-F", "n=5"])
+
+        def failing(cmd, **_kw):
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="HTTP 504")
+        with self.assertRaisesRegex(RuntimeError, "HTTP 504"):
+            op.gh_graphql("Q", {}, runner=failing)
+        with self.assertRaisesRegex(RuntimeError, "gh api graphql failed"):
+            op.gh_graphql("Q", {}, runner=lambda c, **k: subprocess.CompletedProcess(c, 1, stdout="", stderr=""))
+
+        def errors(cmd, **_kw):
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"errors": [{"message": "bad"}]}))
+        with self.assertRaisesRegex(RuntimeError, "bad"):
+            op.gh_graphql("Q", {}, runner=errors)
 
 
 class Config(unittest.TestCase):
@@ -283,6 +351,10 @@ class Config(unittest.TestCase):
             self.assertEqual(op.configured_email(None, runner=git), "me@x.org")
             self.assertEqual(op.configured_email(None, runner=lambda c, **k: subprocess.CompletedProcess(c, 1, stdout="")), "")
             self.assertEqual(op.configured_email("Set@Y.org", runner=git), "set@y.org")
+
+            def no_git(_cmd, **_kw):
+                raise OSError("git not found")
+            self.assertEqual(op.configured_email(None, runner=no_git), "")
 
     def test_author_from_config_else_viewer(self):
         with mock.patch.dict(os.environ, {"OWN_PR_SHEPHERD_AUTHOR": ""}):
@@ -359,14 +431,51 @@ class ListCli(unittest.TestCase):
         self.assertTrue(any(l.startswith("PR o/r#3 class=approved next=ask-owner") for l in lines))
         self.assertIn("prs=2 not_mine=1 due=2 complete=yes", lines[-1])
 
-    def test_acted_is_keyed_on_the_primary_class_and_head(self):
+    def test_acted_is_keyed_on_the_primary_class_and_commit(self):
         op.record(self.state, "o/r#1", "needs_reviewer", HEAD)
         _rc, out = self.run_list(self.search([pr(1)]))
         self.assertIn("acted=yes", out)
         self.assertIn("due=0", out)
-        op.record(self.state, "o/r#1", "ci_red", "other-head")
+        op.record(self.state, "o/r#1", "ci_red", "other-commit")
+        _rc, out = self.run_list(self.search([pr(1)]))
+        self.assertIn("acted=yes", out, "another class's mark leaves this one")
+        op.record(self.state, "o/r#1", "needs_reviewer", "other-commit")
         _rc, out = self.run_list(self.search([pr(1)]))
         self.assertIn("acted=no", out)
+
+    def test_a_base_merge_after_an_ask_re_pings_no_one(self):
+        ledger = Path(self.tmp.name) / "review-asks.jsonl"
+        # The reviewer was asked (ledger, 11:00) and the owner was asked (record) about commit c1.
+        ledger.write_text(json.dumps({"repo": "o/r", "pr": 1, "ts": "2026-11-14T11:00:00Z"}) + "\n")
+        op.record(self.state, "o/r#2", "approved", "c1")
+        merged = [merged_base(1), merged_base(2, decision="APPROVED", mss="CLEAN")]
+        with mock.patch.object(op, "_ledger_path", lambda: ledger):
+            _rc, out = self.run_list(self.search(merged))
+        lines = {l.split()[1]: l for l in out.splitlines() if l.startswith("PR ")}
+        self.assertIn("class=needs_reviewer next=request-review acted=yes", lines["o/r#1"])
+        self.assertIn("class=approved next=ask-owner acted=yes", lines["o/r#2"])
+        self.assertIn("sha=c1 ", lines["o/r#2"])
+        self.assertIn("due=0", out.splitlines()[-1])
+
+        # A real commit after the merge is new work: both are asked again.
+        recent = [commit("c1", "2026-11-14T10:00:00Z"), commit("m", "2026-11-14T13:00:00Z", merge=True),
+                  commit(HEAD, "2026-11-14T14:00:00Z")]
+        moved = [pr(1, committed="2026-11-14T14:00:00Z", recent=recent),
+                 pr(2, decision="APPROVED", mss="CLEAN", committed="2026-11-14T14:00:00Z", recent=recent)]
+        with mock.patch.object(op, "_ledger_path", lambda: ledger):
+            _rc, out = self.run_list(self.search(moved))
+        lines = {l.split()[1]: l for l in out.splitlines() if l.startswith("PR ")}
+        self.assertIn("acted=no", lines["o/r#1"])
+        self.assertIn("acted=no", lines["o/r#2"])
+        self.assertIn("due=2", out.splitlines()[-1])
+
+    def test_a_merge_base_class_is_keyed_on_the_head(self):
+        op.record(self.state, "o/r#1", "behind", "c1")
+        _rc, out = self.run_list(self.search([merged_base(1, requests=1, mss="BEHIND")]))
+        self.assertIn("class=behind next=merge-base acted=no", out, "behind again after the base moved")
+        op.record(self.state, "o/r#1", "behind", HEAD)
+        _rc, out = self.run_list(self.search([merged_base(1, requests=1, mss="BEHIND")]))
+        self.assertIn("acted=yes", out)
 
     def test_the_shared_ledger_marks_an_ask_as_acted(self):
         ledger = Path(self.tmp.name) / "review-asks.jsonl"
@@ -396,7 +505,8 @@ class ListCli(unittest.TestCase):
     def test_json_rows(self):
         _rc, out = self.run_list(self.search([pr(1)]), "json", True)
         row = json.loads(out.splitlines()[0])
-        self.assertEqual((row["key"], row["next"], row["acted"]), ("o/r#1", "request-review", False))
+        self.assertEqual((row["key"], row["next"], row["acted"], row["sha"]),
+                         ("o/r#1", "request-review", False, HEAD))
         self.assertNotIn("merge_queue", row)
 
 

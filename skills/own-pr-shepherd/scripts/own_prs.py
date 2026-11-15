@@ -3,14 +3,15 @@
 next step it needs, so a shepherd pass acts on every PR instead of the ones it remembers.
 
   own_prs.py list   [--repo o/r ...] [--author LOGIN] [--email ADDR] [--json]
-  own_prs.py record o/r#N CLASS --head SHA
+  own_prs.py record o/r#N CLASS --sha SHA
 
 `list` prints one `PR` line per pull request and a closing `SUMMARY` line. It pages GitHub's
 search API to the end (no `--limit` cut-off) and exits 1 when the listing is incomplete, so a
 partial pass is never mistaken for a whole one. A PR is the owner's only when its last non-merge
 commit is authored by the owner's email: a login several agents share does not make a PR ours.
-`record` notes that CLASS was handled at head SHA; `list` then reports `acted=yes` for it until
-the head moves. A reviewer ask logged by notify_reviewers.py since the head counts as acted too.
+`record` notes that CLASS was handled at SHA: the last non-merge commit, so a base merge does not
+re-ask, or the head for the merge-base classes. `list` reports `acted=yes` until that commit
+moves. A reviewer ask logged by notify_reviewers.py since the last non-merge commit counts too.
 
 Settings (CLI > env > manifest `config`): OWN_PR_SHEPHERD_REPOS (comma or space separated;
 required, empty means SKIP), OWN_PR_SHEPHERD_AUTHOR (empty means the signed-in gh login),
@@ -46,6 +47,7 @@ RECORD_CAP = 500
 RECENT_COMMITS = 30
 DEFAULT_MIN_QUOTA = 500
 ASK_CLASSES = {"needs_reviewer", "changes_addressed"}
+HEAD_KEYED = {"conflicting", "behind"}  # the base moves these, so the same content can need them again
 
 # Primary class first: the first applicable one decides `next`.
 NEXT = {
@@ -160,6 +162,21 @@ def last_author_email(pr: dict) -> str:
     return ""
 
 
+def content_commit(pr: dict) -> dict:
+    """The last non-merge commit (the head when none is listed): what a base merge leaves unchanged."""
+    for c in reversed(_recent(pr)):
+        if not _is_merge(c):
+            return c
+    return _head_commit(pr)
+
+
+def acted_sha(pr: dict, cls: str) -> str:
+    """The commit an `acted` mark for cls is keyed on."""
+    if cls in HEAD_KEYED:
+        return pr.get("headRefOid") or ""
+    return content_commit(pr).get("oid") or pr.get("headRefOid") or ""
+
+
 def is_mine(pr: dict, email: str) -> bool:
     return bool(email) and last_author_email(pr) == email.strip().lower()
 
@@ -212,7 +229,7 @@ def next_step(cls: str) -> str:
     return NEXT[cls]
 
 
-# --- acted-at-head record -------------------------------------------------------------------
+# --- acted record -----------------------------------------------------------------------------
 
 def state_path() -> Path:
     from workspace_default import resolve_workspace
@@ -227,22 +244,20 @@ def load_record(path: Path) -> dict:
         return {}
 
 
-def record(path: Path, key: str, cls: str, head: str, now: Optional[float] = None) -> dict:
+def record(path: Path, key: str, cls: str, sha: str, now: Optional[float] = None) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
     # Read-modify-write under one lock: concurrent records must not drop each other's entry.
     with open(path.with_name(path.name + ".lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return _record_locked(path, key, cls, head, now)
+        return _record_locked(path, key, cls, sha, now)
 
 
-def _record_locked(path: Path, key: str, cls: str, head: str, now: Optional[float]) -> dict:
+def _record_locked(path: Path, key: str, cls: str, sha: str, now: Optional[float]) -> dict:
     data = load_record(path)
     entry = data.get(key) if isinstance(data.get(key), dict) else {}
-    if entry.get("head") != head:
-        entry = {"head": head, "acted": []}
-    if cls not in entry["acted"]:
-        entry["acted"].append(cls)
-    entry["at"] = int(now if now is not None else time.time())
+    marks = entry.get("acted") if isinstance(entry.get("acted"), dict) else {}
+    marks[cls] = sha
+    entry = {"acted": marks, "at": int(now if now is not None else time.time())}
     data[key] = entry
     if len(data) > RECORD_CAP:
         keep = sorted(data, key=lambda k: data[k].get("at", 0), reverse=True)[:RECORD_CAP]
@@ -254,9 +269,9 @@ def _record_locked(path: Path, key: str, cls: str, head: str, now: Optional[floa
     return data
 
 
-def acted(rec: dict, key: str, cls: str, head: str) -> bool:
-    entry = rec.get(key) or {}
-    return entry.get("head") == head and cls in (entry.get("acted") or [])
+def acted(rec: dict, key: str, cls: str, sha: str) -> bool:
+    marks = (rec.get(key) or {}).get("acted")
+    return bool(sha) and isinstance(marks, dict) and marks.get(cls) == sha
 
 
 def _ledger_path() -> Optional[Path]:
@@ -288,9 +303,9 @@ def load_asks(path: Optional[Path]) -> dict:
     return out
 
 
-def asked_since_head(asks: dict, key: str, cls: str, pr: dict) -> bool:
-    """A reviewer ask any path logged after the head commit covers this head's ask class."""
-    committed = _head_commit(pr).get("committedDate") or ""
+def asked_since_content(asks: dict, key: str, cls: str, pr: dict) -> bool:
+    """A reviewer ask any path logged after the last non-merge commit covers its ask class."""
+    committed = content_commit(pr).get("committedDate") or ""
     return cls in ASK_CLASSES and bool(committed) and asks.get(key, "") >= committed
 
 
@@ -355,12 +370,12 @@ def cmd_list(args, gql=gh_graphql) -> int:
                 others += 1
                 continue
             classes = classify(pr)
-            key, head = f"{repo}#{pr['number']}", pr.get("headRefOid") or ""
+            key, head, sha = f"{repo}#{pr['number']}", pr.get("headRefOid") or "", acted_sha(pr, classes[0])
             rows.append({"key": key, "url": pr.get("url"), "head": head, "base": pr.get("baseRefName"),
-                         "classes": classes, "next": next_step(classes[0]),
+                         "sha": sha, "classes": classes, "next": next_step(classes[0]),
                          "failing": failing_checks(pr),
-                         "acted": acted(rec, key, classes[0], head)
-                         or asked_since_head(asks, key, classes[0], pr)})
+                         "acted": acted(rec, key, classes[0], sha)
+                         or asked_since_content(asks, key, classes[0], pr)})
         if low:
             break
     todo = 0
@@ -372,7 +387,8 @@ def cmd_list(args, gql=gh_graphql) -> int:
             continue
         failing = f" failing={','.join(r['failing'])}" if r["failing"] else ""
         print(f"PR {r['key']} class={','.join(r['classes'])} next={r['next']} "
-              f"acted={'yes' if r['acted'] else 'no'} head={r['head'][:8]} base={r['base']}"
+              f"acted={'yes' if r['acted'] else 'no'} head={r['head'][:8]} sha={r['sha']} "
+              f"base={r['base']}"
               f"{failing} url={r['url']}")
     print(f"SUMMARY author={author} email={email} repos={len(repos)} prs={len(rows)} "
           f"not_mine={others} due={todo} complete={'yes' if complete else 'no'}")
@@ -381,10 +397,10 @@ def cmd_list(args, gql=gh_graphql) -> int:
 
 def cmd_record(args) -> int:
     if args.cls not in NEXT or not re.fullmatch(r"[\w.-]+/[\w.-]+#\d+", args.pr):
-        print("usage: record o/r#N CLASS --head SHA", file=sys.stderr)
+        print("usage: record o/r#N CLASS --sha SHA", file=sys.stderr)
         return 2
-    record(state_path(), args.pr, args.cls, args.head)
-    print(f"RECORDED {args.pr} {args.cls} head={args.head[:8]}")
+    record(state_path(), args.pr, args.cls, args.sha)
+    print(f"RECORDED {args.pr} {args.cls} sha={args.sha[:8]}")
     return 0
 
 
@@ -399,7 +415,7 @@ def main(argv=None) -> int:
     rc = sub.add_parser("record")
     rc.add_argument("pr")
     rc.add_argument("cls")
-    rc.add_argument("--head", required=True)
+    rc.add_argument("--sha", required=True)
     args = ap.parse_args(argv)
     return cmd_list(args) if args.cmd == "list" else cmd_record(args)
 

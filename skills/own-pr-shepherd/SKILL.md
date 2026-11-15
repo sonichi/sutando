@@ -26,7 +26,7 @@ python3 skills/own-pr-shepherd/scripts/own_prs.py list
 One line per PR, then a `SUMMARY` line:
 
 ```
-PR o/r#123 class=changes_requested,ci_red next=fix acted=no head=1a2b3c4d base=main failing=lint url=…
+PR o/r#123 class=changes_requested,ci_red next=fix acted=no head=1a2b3c4d sha=<40 hex> base=main failing=lint url=…
 SUMMARY author=<login> email=<owner email> repos=1 prs=44 not_mine=3 due=12 complete=yes
 ```
 
@@ -47,9 +47,11 @@ SUMMARY author=<login> email=<owner email> repos=1 prs=44 not_mine=3 due=12 comp
 - **The `--limit` trap.** `gh pr list` returns 30 PRs unless told otherwise, and says nothing
   about the rest. The script pages the search API to the end. When you list PRs by hand for
   this work, always pass `--limit 1000` and compare the count with the total.
-- `acted=yes` means this class was already handled at this head (see step 3), or a reviewer ask
+- `acted=yes` means this class was already handled at `sha` (see step 3), or a reviewer ask
   for this PR was logged in `state/review-asks.jsonl` (by `notify_reviewers.py`, from this pass
-  or any other path) after the head commit. Skip it.
+  or any other path) after the last non-merge commit. Skip it. `sha` is the last non-merge
+  commit, so a base merge (`gh pr update-branch`) re-asks no reviewer and not the owner; for
+  `conflicting` and `behind` it is the head, since the base moving again needs another merge.
 
 ## 2. Act on each PR, primary class first
 
@@ -78,11 +80,14 @@ subagent per `docs/subagent-delegation.md`. Cheap steps (`re-solicit`, `request-
 After each handled step:
 
 ```bash
-python3 skills/own-pr-shepherd/scripts/own_prs.py record <o/r#N> <class> --head <full head sha after your push>
+python3 skills/own-pr-shepherd/scripts/own_prs.py record <o/r#N> <class> --sha <sha>
 ```
 
-`list` then shows `acted=yes` for that class until the head moves, so a reviewer is asked
-once per head, a CI failure that is not this PR's is triaged once, and the owner is asked once.
+`<sha>` is the `sha` the listing printed when the step pushed nothing. After a push it is the
+branch's last non-merge commit (`git log -1 --no-merges --format=%H`), or the new head for
+`conflicting` and `behind`. `list` then shows `acted=yes` for that class until that commit
+moves, so a reviewer is asked once per change, a CI failure that is not this PR's is triaged
+once, and the owner is asked once.
 
 ## 4. Notify reviewers
 
