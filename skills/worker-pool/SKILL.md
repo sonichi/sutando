@@ -347,6 +347,7 @@ counts your inbox, and that count is the only queue you have.
 ```
 python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --who
 python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|core> --ask "..." [--wait 300]
+python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --read <task id> [--wait 60]
 ```
 
 - `--who` lists `core` and each worker as `name (full worker_id)`, with bound
@@ -367,6 +368,8 @@ python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|
   receiver to key on. `owner` is never a tier an ask can claim, and non-owner content must
   never be relayed as your own: the tier must say where the question came from, not who ran
   the script.
+- `--read <task id>` prints the reply to an earlier ask, live or archived, and sends nothing;
+  it exits 1 while no reply has landed. Never re-ask just to fetch a reply.
 - Refused, never guessed: an unknown name, a name shared by recipients, and asking yourself.
 
 Not yet: the reply is read from `results/` by the asker, not delivered into the

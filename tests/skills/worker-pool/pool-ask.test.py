@@ -184,6 +184,22 @@ class Waiting(Base):
         (self.ws / "results" / "archive" / f"{out['task_id']}.txt").write_text("done\n")
         self.assertEqual(pa.wait_for_reply(self.ws, out["task_id"], 1, sleep=lambda s: None), "done\n")
 
+    def test_a_reply_archived_into_a_month_dir_still_counts(self):
+        # The bridges archive as results/archive/<YYYY-MM>/<id>.txt.
+        out = pa.ask(self.ws, "alpha", "status?")
+        month = self.ws / "results" / "archive" / "2026-11"
+        month.mkdir(parents=True)
+        (month / f"{out['task_id']}.txt").write_text("[no-send]\nPONG\n")
+        self.assertEqual(pa.wait_for_reply(self.ws, out["task_id"], 0, sleep=lambda s: None), "PONG\n")
+
+    def test_an_empty_live_placeholder_does_not_hide_the_archived_body(self):
+        out = pa.ask(self.ws, "alpha", "status?")
+        month = self.ws / "results" / "archive" / "2026-11"
+        month.mkdir(parents=True)
+        (month / f"{out['task_id']}.txt").write_text("done\n")
+        (self.ws / "results" / f"{out['task_id']}.txt").write_text("")
+        self.assertEqual(pa.wait_for_reply(self.ws, out["task_id"], 0, sleep=lambda s: None), "done\n")
+
     def test_no_reply_by_the_deadline_is_none_not_an_exception(self):
         out = pa.ask(self.ws, "alpha", "status?")
         self.assertIsNone(pa.wait_for_reply(self.ws, out["task_id"], 0, sleep=lambda s: None))
@@ -227,6 +243,33 @@ class TheCommandLine(Base):
         rc, out, _ = self._run("--to", "alpha", "--ask", "?", "--wait", "0.01")
         self.assertEqual(rc, 1)
         self.assertIn("no reply", out)
+
+    def _tasks(self):
+        return sorted(p.name for p in (self.ws / "tasks").glob("task-*.txt"))
+
+    def test_read_prints_an_arrived_reply_and_sends_nothing(self):
+        out = pa.ask(self.ws, "alpha", "status?")
+        month = self.ws / "results" / "archive" / "2026-11"
+        month.mkdir(parents=True)
+        (month / f"{out['task_id']}.txt").write_text("[no-send]\nPONG\n")
+        before = self._tasks()
+        rc, printed, _ = self._run("--read", out["task_id"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(printed, "PONG\n\n")
+        self.assertEqual(self._tasks(), before)
+
+    def test_read_without_a_reply_exits_nonzero_and_sends_nothing(self):
+        out = pa.ask(self.ws, "alpha", "status?")
+        before = self._tasks()
+        rc, printed, _ = self._run("--read", out["task_id"])
+        self.assertEqual(rc, 1)
+        self.assertIn("no reply", printed)
+        self.assertEqual(self._tasks(), before)
+
+    def test_read_refuses_to_go_with_an_ask_or_a_bad_id(self):
+        self.assertEqual(self._run("--read", "task-1", "--to", "alpha", "--ask", "?")[0], 2)
+        self.assertEqual(self._run("--read", "../etc/passwd")[0], 2)
+        self.assertEqual(self._tasks(), [])
 
 
 if __name__ == "__main__":
