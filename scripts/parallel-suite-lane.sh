@@ -148,7 +148,7 @@ _lane_cleanup() {
     local status="$?" id suite unsafe=0
     trap '' INT TERM HUP
     if [ "$WORKERS_JOINED" = 0 ]; then _lane_cancel; fi
-    for id in $(seq 1 "$CREATED"); do
+    for ((id=1; id<=CREATED; id++)); do
         if [ -e "$RECDIR/.suite-$id.pid" ]; then
             suite=""
             read -r suite < "$RECDIR/.suite-$id.pid" || true

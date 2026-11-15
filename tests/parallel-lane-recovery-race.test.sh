@@ -96,6 +96,8 @@ with tempfile.TemporaryDirectory(prefix="lane-race-", dir=os.environ.get("TMPDIR
     root = Path(tmp).resolve()
     creation_modes = tuple(f"create-{boundary}-{sig}" for boundary in ("added", "partial")
                            for sig in ("INT", "TERM", "HUP"))
+    startup_modes = tuple(f"startup-{sig}" for sig in ("INT", "TERM", "HUP"))
+    creation_modes += startup_modes
     for mode in ("checkout", "clean", "child-checkout", "child-clean", "descendants", "spawn-interrupt", "cancel-failure") + creation_modes:
         rec = root / mode
         rec.mkdir()
@@ -182,13 +184,22 @@ print("suite-returned")
 ''')
             env["BASH_ENV"] = str(bash_env)
         if mode in creation_modes:
-            _, boundary, sig = mode.split("-")
+            if mode in startup_modes:
+                boundary, sig = "startup", mode.split("-")[1]
+            else:
+                _, boundary, sig = mode.split("-")
             env["LANE_CREATION_SIGNAL"] = sig
-            env["LANE_CREATION_BOUNDARY"] = 'CREATED="$_w"' if boundary == "added" else 'worker_backlinks[$_w]='
+            env["LANE_CREATION_WORKER"] = "1" if boundary == "startup" else "2"
+            env["LANE_CREATION_BOUNDARY"] = {"startup": "SPAWNING=1", "added": 'CREATED="$_w"',
+                                             "partial": 'worker_backlinks[$_w]='}[boundary]
             bash_env = rec / "bash-env"
-            bash_env.write_text('''trap 'if [ "$0" = "$LANE_SCHEDULER" ] && [ "${_w:-0}" = 2 ] &&
+            bash_env.write_text('''trap 'if [ "$0" = "$LANE_SCHEDULER" ] && [ "${_w:-0}" = "$LANE_CREATION_WORKER" ] &&
         [[ "$BASH_COMMAND" == "$LANE_CREATION_BOUNDARY"* ]] && [ ! -e "$LANE_RACE_RECORD/signalled" ]; then
-            [ -f "$WTDIR/$_w/.git" ] || exit 99
+            if [ "$LANE_CREATION_WORKER" = 1 ]; then
+                [ "$CREATED" = 0 ] && [ ! -e "$WTDIR/$_w" ] || exit 99
+            else
+                [ -f "$WTDIR/$_w/.git" ] || exit 99
+            fi
             printf "%s\\n" "$WTDIR/$_w" > "$LANE_RACE_RECORD/signalled"
             kill -"$LANE_CREATION_SIGNAL" "$$"
         fi' DEBUG
