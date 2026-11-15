@@ -44,13 +44,14 @@ def _same(path: str, text: str, st: os.stat_result) -> bool:
 
 
 def _append_sidecar(path: str, lines: str) -> None:
-    fd = os.open(path + RETIRED_SUFFIX, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    fd = os.open(path + RETIRED_SUFFIX, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "a", encoding="utf-8", newline="") as fh:
         os.fchmod(fh.fileno(), 0o600)
         fh.write(lines)
 
 
-def retire(path: str, *, secret: str, agent_id: str, now: "Optional[float]" = None) -> "List[str]":
+def retire(path: str, *, secret: str, agent_id: str, now: "Optional[float]" = None,
+           bearer_proven: bool = False) -> "List[str]":
     """Move the deleted binding's lines from `path` to `path + RETIRED_SUFFIX`; the keys moved, []
     when nothing moved (see the writer contract above). The sidecar is written before the file is
     replaced, so a failure part-way loses no line. An OSError writing propagates."""
@@ -58,7 +59,8 @@ def retire(path: str, *, secret: str, agent_id: str, now: "Optional[float]" = No
     if got is None:
         return []
     text, st = got
-    kept, retired, keys = gateway_credential_sources.split_deleted_binding(text, secret=secret, agent_id=agent_id)
+    kept, retired, keys = gateway_credential_sources.split_deleted_binding(
+        text, secret=secret, agent_id=agent_id, bearer_proven=bearer_proven)
     if not retired:
         return []
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if now is None else now))

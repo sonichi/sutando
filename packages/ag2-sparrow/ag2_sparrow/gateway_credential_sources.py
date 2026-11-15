@@ -548,29 +548,38 @@ def token_file_url(text: str) -> str:
 DELETED_BINDING_ID_KEYS = ("AGENT_MXID", "AGENT_ID")
 
 
-def split_deleted_binding(text: str, *, secret: str, agent_id: str) -> "tuple[str, list[str], list[str]]":
+def _binding_line(line: str) -> "tuple[bool, str, str]":
+    """(is an assignment, key, unquoted value) of one credential-file line; `export ` dropped."""
+    bare = line.strip()
+    key, _, val = bare.partition("=")
+    key = key.strip()
+    key = key[len("export "):].strip() if key.startswith("export ") else key
+    assigned = bool(bare) and not bare.startswith("#") and "=" in bare
+    return assigned, key, unquote(val) if assigned else ""
+
+
+def split_deleted_binding(text: str, *, secret: str, agent_id: str,
+                          bearer_proven: bool = False) -> "tuple[str, list[str], list[str]]":
     """(kept text, removed lines, their keys) for a credential file whose agent the server deleted: the
     lines holding `secret` under a token key (a lane-suffixed one included) or alone (a token file's bare
     line), and the AGENT_MXID / AGENT_ID lines naming `agent_id`. The server's answer names an id, not a
     bearer, so nothing moves unless the file itself ties the two: it names `agent_id` and no other agent,
-    and holds `secret`. Line endings are kept as they are; any other credential stays."""
+    and holds `secret`. `bearer_proven`: another file already tied this bearer to that id, so its lines
+    move here without the tie, and an id line moves only where the file names that id alone. Line
+    endings are kept as they are; any other credential stays."""
+    lines = text.splitlines(keepends=True)
+    ids = {v for assigned, k, v in map(_binding_line, lines) if assigned and k in DELETED_BINDING_ID_KEYS and v}
+    tied = bool(agent_id) and ids == {agent_id}
     kept: "list[str]" = []
     removed: "list[str]" = []
     keys: "list[str]" = []
-    ids: "set[str]" = set()
-    for line in text.splitlines(keepends=True):
+    for line in lines:
+        assigned, key, value = _binding_line(line)
         bare = line.strip()
-        key, _, val = bare.partition("=")
-        key = key.strip()
-        key = key[len("export "):].strip() if key.startswith("export ") else key
-        assigned = bool(bare) and not bare.startswith("#") and "=" in bare
-        value = unquote(val) if assigned else ""
-        if assigned and key in DELETED_BINDING_ID_KEYS and value:
-            ids.add(value)
         if assigned and secret and any(key == k or key.startswith(k + "_") for k in TOKEN_KEYS) \
                 and contract.parse_onboarding_token(value)[1] == secret:
             hit = key
-        elif assigned and agent_id and key in DELETED_BINDING_ID_KEYS and value == agent_id:
+        elif assigned and tied and key in DELETED_BINDING_ID_KEYS and value == agent_id:
             hit = key
         elif bare and not assigned and not bare.startswith("#") and secret \
                 and contract.parse_onboarding_token(bare)[1] == secret:
@@ -580,7 +589,8 @@ def split_deleted_binding(text: str, *, secret: str, agent_id: str) -> "tuple[st
             continue
         removed.append(line if line.endswith(("\n", "\r")) else line + "\n")
         keys.append(hit)
-    if not agent_id or ids != {agent_id} or not any(k not in DELETED_BINDING_ID_KEYS for k in keys):
+    bearer_moves = any(k not in DELETED_BINDING_ID_KEYS for k in keys)
+    if not bearer_moves or not (tied or bearer_proven):
         return text, [], []
     return "".join(kept), removed, keys
 

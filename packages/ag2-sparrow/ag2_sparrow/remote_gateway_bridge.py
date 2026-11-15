@@ -3584,21 +3584,28 @@ def _recover_auth(code: int) -> bool:
 
 
 def _retire_deleted_binding(agent_id: str) -> bool:
-    """Move the deleted agent's bearer and id out of the token file (deleted_binding.retire); True
-    when anything moved. Nothing moves unless the file names that id beside this bearer, and an
-    env-supplied token has no file to retire it from."""
-    if not TOKEN_FILE or not TOKEN or not agent_id:
+    """Move the deleted agent's bearer and id out of the credential files this bridge reads
+    (deleted_binding.retire); True when anything moved. A file moves lines only when it names that
+    id beside this bearer; once one did, the same bearer's lines also leave the others (a lane's
+    key in the primary .env). An env-only token with no such file retires nothing."""
+    if not TOKEN or not agent_id:
         return False
-    try:
-        keys = deleted_binding.retire(TOKEN_FILE, secret=TOKEN, agent_id=agent_id)
-    except OSError as e:
-        _log_backoff(("retire-deleted", type(e).__name__),
-                     f"agent deleted: could not retire its binding from {TOKEN_FILE} ({diagnostics.describe(e)})")
-        return False
-    if keys:
-        _log(f"agent deleted: moved {', '.join(keys)} from {TOKEN_FILE} to "
-             f"{TOKEN_FILE}{deleted_binding.RETIRED_SUFFIX}")
-    return bool(keys)
+    paths = list(dict.fromkeys(p for p in [TOKEN_FILE, *(p for p, _v in _channel_env_candidates())] if p))
+    moved: "dict[str, list]" = {}
+    for proven in (False, True):
+        for path in paths:
+            if path in moved or (proven and not moved):
+                continue
+            try:
+                keys = deleted_binding.retire(path, secret=TOKEN, agent_id=agent_id, bearer_proven=proven)
+            except OSError as e:
+                _log_backoff(("retire-deleted", path, type(e).__name__),
+                             f"agent deleted: could not retire its binding from {path} ({diagnostics.describe(e)})")
+                continue
+            if keys:
+                moved[path] = keys
+                _log(f"agent deleted: moved {', '.join(keys)} from {path} to {path}{deleted_binding.RETIRED_SUFFIX}")
+    return bool(moved)
 
 
 def _forget_deleted_identity(agent_id: str) -> None:

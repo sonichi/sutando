@@ -1125,7 +1125,12 @@ class _Deleted(unittest.TestCase):
             probes["n"] += 1
             return True   # the bearer is fine: the 401 was transient
         gw._auth_probe = probe
-        gw._heartbeat_singleton = lambda: True
+        beats = {"n": 0}
+
+        def beat():   # bounded: a regression that stops probing exits instead of hanging
+            beats["n"] += 1
+            return beats["n"] < 5
+        gw._heartbeat_singleton = beat
         statuses = []
         real_emit = gw._emit_gateway_status
 
@@ -1199,6 +1204,76 @@ class _Deleted(unittest.TestCase):
         self.assertEqual(race.read_text(), "AG2_REMOTE_TOKEN=" + "56" * 24 + "\n")
         self.assertFalse(Path(str(race) + ".retired").exists())
         self.assertEqual(sorted(p.name for p in self.dir.iterdir() if p.name.startswith(".race")), [])
+
+    PRIMARY_ID = "@primary.agent:ag2.space"
+    LANE_ID = "@lane.agent:s.space"
+
+    def _desktop_files(self):
+        """The desktop's shape: the primary .env holds the primary bearer, its one AGENT_MXID and the
+        s.space lane's launch key; channels/s.space/.env holds the lane's bearer and id."""
+        primary = self.dir / "ag2space.env"
+        primary.write_text(f"AG2_REMOTE_TOKEN='https://chat.example/relay|{self.OTHER}'\n"
+                           f"AGENT_MXID={self.PRIMARY_ID}\n"
+                           f"AG2_REMOTE_TOKEN_S_DSPACE='https://chat.s.example/relay|{self.SECRET}'\n")
+        lane = self.dir / "s.space.env"
+        lane.write_text(f"AG2_REMOTE_TOKEN='https://chat.s.example/relay|{self.SECRET}'\n"
+                        f"AGENT_MXID={self.LANE_ID}\n")
+        return primary, lane
+
+    def test_a_deleted_lane_agent_retires_its_lane_file_and_its_key_in_the_primary(self):
+        primary, lane = self._desktop_files()
+        gw.TOKEN, gw.TOKEN_FILE = self.SECRET, str(lane)
+        saved = gw._channel_env_candidates
+        gw._channel_env_candidates = lambda: [(str(primary), {}), (str(lane), {})]
+        self.addCleanup(setattr, gw, "_channel_env_candidates", saved)
+        self.assertTrue(gw._retire_deleted_binding(self.LANE_ID))
+        self.assertEqual(lane.read_text(), "")
+        self.assertEqual(primary.read_text(), f"AG2_REMOTE_TOKEN='https://chat.example/relay|{self.OTHER}'\n"
+                                              f"AGENT_MXID={self.PRIMARY_ID}\n", "the primary agent stays")
+        self.assertIn("AG2_REMOTE_TOKEN_S_DSPACE", Path(str(primary) + ".retired").read_text())
+
+    def test_the_single_id_naming_the_other_lane_proves_nothing(self):
+        primary, _lane = self._desktop_files()
+        before = primary.read_text()
+        gw.TOKEN, gw.TOKEN_FILE = self.SECRET, str(primary)
+        saved = gw._channel_env_candidates
+        gw._channel_env_candidates = lambda: [(str(primary), {})]
+        self.addCleanup(setattr, gw, "_channel_env_candidates", saved)
+        self.assertFalse(gw._retire_deleted_binding(self.LANE_ID))
+        self.assertEqual(primary.read_text(), before)
+
+    def test_a_deleted_primary_agent_keeps_the_lane_key(self):
+        primary, lane = self._desktop_files()
+        lane_before = lane.read_text()
+        gw.TOKEN, gw.TOKEN_FILE = self.OTHER, str(primary)
+        saved = gw._channel_env_candidates
+        gw._channel_env_candidates = lambda: [(str(primary), {}), (str(lane), {})]
+        self.addCleanup(setattr, gw, "_channel_env_candidates", saved)
+        self.assertTrue(gw._retire_deleted_binding(self.PRIMARY_ID))
+        self.assertEqual(primary.read_text(),
+                         f"AG2_REMOTE_TOKEN_S_DSPACE='https://chat.s.example/relay|{self.SECRET}'\n")
+        self.assertEqual(lane.read_text(), lane_before)
+
+    def test_a_proven_bearer_moves_without_a_tie_but_never_another_agents_id(self):
+        from ag2_sparrow import gateway_credential_sources as sources
+        text = f"AG2_REMOTE_TOKEN_S_DSPACE={self.SECRET}\nAGENT_MXID={self.PRIMARY_ID}\n"
+        self.assertEqual(sources.split_deleted_binding(text, secret=self.SECRET, agent_id=self.LANE_ID)[2], [])
+        kept, _removed, keys = sources.split_deleted_binding(text, secret=self.SECRET, agent_id=self.LANE_ID,
+                                                             bearer_proven=True)
+        self.assertEqual((kept, keys), (f"AGENT_MXID={self.PRIMARY_ID}\n", ["AG2_REMOTE_TOKEN_S_DSPACE"]))
+        self.assertEqual(sources.split_deleted_binding(f"AGENT_MXID={self.LANE_ID}\n", secret=self.SECRET,
+                                                       agent_id=self.LANE_ID, bearer_proven=True)[2], [])
+
+    def test_the_sidecar_is_never_written_through_a_link(self):
+        from ag2_sparrow import deleted_binding
+        self.env.write_text(f"AG2_REMOTE_TOKEN={self.SECRET}\nAGENT_MXID=@gone.agent:ag2.space\n")
+        elsewhere = self.dir / "elsewhere"
+        elsewhere.write_text("")
+        Path(str(self.env) + ".retired").symlink_to(elsewhere)
+        with self.assertRaises(OSError):
+            deleted_binding.retire(str(self.env), secret=self.SECRET, agent_id="@gone.agent:ag2.space")
+        self.assertEqual(elsewhere.read_text(), "")
+        self.assertIn(self.SECRET, self.env.read_text())
 
 if __name__ == "__main__":
     import urllib.request  # noqa: F401 — used via gw.urllib in fixtures
