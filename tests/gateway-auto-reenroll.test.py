@@ -1058,6 +1058,8 @@ class _Deleted(unittest.TestCase):
         self.assertEqual(keys, ["AG2_REMOTE_TOKEN", "AGENT_MXID", "token"])
         self.assertEqual(kept, "# note\nREMOTE_TASK_TOKEN=" + self.OTHER)
         self.assertTrue(all(line.endswith("\n") for line in removed))
+        self.assertEqual(src.retirement_paths({"CLAUDE_CONFIG_DIR": "/w", "SUTANDO_APP_SUPPORT": "/app"}, "/t.env"),
+                         ["/t.env", "/w/channels/ag2space/.env", "/app/channels/ag2space/.env"])
 
     def test_retire_leaves_a_file_without_the_binding_alone(self):
         from ag2_sparrow import deleted_binding
@@ -1209,50 +1211,73 @@ class _Deleted(unittest.TestCase):
     LANE_ID = "@lane.agent:s.space"
 
     def _desktop_files(self):
-        """The desktop's shape: the primary .env holds the primary bearer, its one AGENT_MXID and the
-        s.space lane's launch key; channels/s.space/.env holds the lane's bearer and id."""
-        primary = self.dir / "ag2space.env"
+        """A desktop install with an s.space sign-in, as the connections launcher runs its lane: the bridge's
+        token file is $CLAUDE_CONFIG_DIR/channels/s.space/.env (<workspace>/.claude-sutando), and the host
+        keeps its own copies under SUTANDO_APP_SUPPORT: channels/ag2space/.env with the primary bearer, its one
+        AGENT_MXID and the lane's launch key, and channels/s.space/.env with the lane's bearer and id."""
+        app, ccd = self.dir / "app", self.dir / "workspace" / ".claude-sutando"
+        primary = app / "channels" / "ag2space" / ".env"
+        host_lane = app / "channels" / "s.space" / ".env"
+        lane = ccd / "channels" / "s.space" / ".env"
+        for f in (primary, host_lane, lane):
+            f.parent.mkdir(parents=True)
         primary.write_text(f"AG2_REMOTE_TOKEN='https://chat.example/relay|{self.OTHER}'\n"
                            f"AGENT_MXID={self.PRIMARY_ID}\n"
                            f"AG2_REMOTE_TOKEN_S_DSPACE='https://chat.s.example/relay|{self.SECRET}'\n")
-        lane = self.dir / "s.space.env"
-        lane.write_text(f"AG2_REMOTE_TOKEN='https://chat.s.example/relay|{self.SECRET}'\n"
-                        f"AGENT_MXID={self.LANE_ID}\n")
-        return primary, lane
+        for f in (host_lane, lane):
+            f.write_text(f"AG2_REMOTE_TOKEN='https://chat.s.example/relay|{self.SECRET}'\n"
+                         f"AGENT_MXID={self.LANE_ID}\n")
+        env = {"CLAUDE_CONFIG_DIR": str(ccd), "REMOTE_TASK_CHANNEL_DIR": "s.space",
+               "SUTANDO_APP_SUPPORT": str(app)}
+        saved = {k: gw.os.environ.get(k) for k in (*env, "AG2_DEVICE_ENV")}
+        gw.os.environ.pop("AG2_DEVICE_ENV", None)   # the lane launcher drops it for a named lane
+        gw.os.environ.update(env)
 
-    def test_a_deleted_lane_agent_retires_its_lane_file_and_its_key_in_the_primary(self):
-        primary, lane = self._desktop_files()
+        def restore():
+            for k, v in saved.items():
+                if v is None:
+                    gw.os.environ.pop(k, None)
+                else:
+                    gw.os.environ[k] = v
+        self.addCleanup(restore)
+        return primary, host_lane, lane
+
+    def test_a_deleted_lane_agent_is_cleared_from_its_workspace_file_and_the_hosts_copies(self):
+        primary, host_lane, lane = self._desktop_files()
         gw.TOKEN, gw.TOKEN_FILE = self.SECRET, str(lane)
-        saved = gw._channel_env_candidates
-        gw._channel_env_candidates = lambda: [(str(primary), {}), (str(lane), {})]
-        self.addCleanup(setattr, gw, "_channel_env_candidates", saved)
         self.assertTrue(gw._retire_deleted_binding(self.LANE_ID))
-        self.assertEqual(lane.read_text(), "")
+        self.assertEqual(lane.read_text(), "", "the bridge's own token file")
+        self.assertEqual(host_lane.read_text(), "", "the host's lane file")
         self.assertEqual(primary.read_text(), f"AG2_REMOTE_TOKEN='https://chat.example/relay|{self.OTHER}'\n"
                                               f"AGENT_MXID={self.PRIMARY_ID}\n", "the primary agent stays")
         self.assertIn("AG2_REMOTE_TOKEN_S_DSPACE", Path(str(primary) + ".retired").read_text())
 
     def test_the_single_id_naming_the_other_lane_proves_nothing(self):
-        primary, _lane = self._desktop_files()
+        primary, host_lane, lane = self._desktop_files()
+        for f in (host_lane, lane):
+            f.unlink()
         before = primary.read_text()
         gw.TOKEN, gw.TOKEN_FILE = self.SECRET, str(primary)
-        saved = gw._channel_env_candidates
-        gw._channel_env_candidates = lambda: [(str(primary), {})]
-        self.addCleanup(setattr, gw, "_channel_env_candidates", saved)
         self.assertFalse(gw._retire_deleted_binding(self.LANE_ID))
         self.assertEqual(primary.read_text(), before)
 
     def test_a_deleted_primary_agent_keeps_the_lane_key(self):
-        primary, lane = self._desktop_files()
+        primary, host_lane, lane = self._desktop_files()
         lane_before = lane.read_text()
         gw.TOKEN, gw.TOKEN_FILE = self.OTHER, str(primary)
-        saved = gw._channel_env_candidates
-        gw._channel_env_candidates = lambda: [(str(primary), {}), (str(lane), {})]
-        self.addCleanup(setattr, gw, "_channel_env_candidates", saved)
         self.assertTrue(gw._retire_deleted_binding(self.PRIMARY_ID))
         self.assertEqual(primary.read_text(),
                          f"AG2_REMOTE_TOKEN_S_DSPACE='https://chat.s.example/relay|{self.SECRET}'\n")
-        self.assertEqual(lane.read_text(), lane_before)
+        self.assertEqual((lane.read_text(), host_lane.read_text()), (lane_before, lane_before))
+
+    def test_retirement_paths_name_the_token_file_channel_files_and_the_hosts_copies(self):
+        from ag2_sparrow import gateway_credential_sources as sources
+        env = {"AG2_DEVICE_ENV": "/a/dev.env", "CLAUDE_CONFIG_DIR": "/w/.claude-sutando",
+               "REMOTE_TASK_CHANNEL_DIR": "s.space", "SUTANDO_APP_SUPPORT": "/app"}
+        self.assertEqual(sources.retirement_paths(env, "/w/.claude-sutando/channels/s.space/.env"),
+                         ["/w/.claude-sutando/channels/s.space/.env", "/a/dev.env",
+                          "/app/channels/ag2space/.env", "/app/channels/s.space/.env"])
+        self.assertEqual(sources.retirement_paths({}, ""), [])
 
     def test_a_proven_bearer_moves_without_a_tie_but_never_another_agents_id(self):
         from ag2_sparrow import gateway_credential_sources as sources

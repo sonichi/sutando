@@ -469,6 +469,23 @@ def channel_env_paths(env: Mapping[str, str], channel_dir: str = DEFAULT_CHANNEL
     return [p for p in paths if p]
 
 
+# The desktop app's own data dir, where its host keeps the channel .env files it reads for "bound".
+APP_SUPPORT_KEY = "SUTANDO_APP_SUPPORT"
+
+
+def retirement_paths(env: Mapping[str, str], token_file: str = "") -> "list[str]":
+    """Every file a deleted agent's bearer may sit in for a bridge given `env`: its token file, the
+    channel .env files it reads (channel_env_paths), and on a desktop install the host's copies under
+    APP_SUPPORT_KEY: the primary channels/ag2space/.env, which carries a lane's launch key, and the
+    lane's channels/<dir>/.env. In order, without repeats. Paths only: the caller reads them."""
+    paths = [token_file, *channel_env_paths(env, channel_dir(env))]
+    app = env.get(APP_SUPPORT_KEY) or ""
+    if app:
+        paths += [os.path.join(app, "channels", DEFAULT_CHANNEL_DIR, ".env"),
+                  os.path.join(app, "channels", channel_dir(env), ".env")]
+    return [p for p in dict.fromkeys(paths) if p]
+
+
 def first(values: Mapping[str, str], keys) -> "tuple[str, str]":
     """(value, key) of the first key with a non-empty value; ('', '') when none. The values are
     already parsed (parse_env_text, _assignments): unquoting them again would change a padded token."""

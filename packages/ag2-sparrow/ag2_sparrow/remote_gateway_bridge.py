@@ -3584,13 +3584,13 @@ def _recover_auth(code: int) -> bool:
 
 
 def _retire_deleted_binding(agent_id: str) -> bool:
-    """Move the deleted agent's bearer and id out of the credential files this bridge reads
-    (deleted_binding.retire); True when anything moved. A file moves lines only when it names that
+    """Move the deleted agent's bearer and id out of every file it may sit in
+    (gateway_credential_sources.retirement_paths, deleted_binding.retire); True when anything moved. A file moves lines only when it names that
     id beside this bearer; once one did, the same bearer's lines also leave the others (a lane's
     key in the primary .env). An env-only token with no such file retires nothing."""
     if not TOKEN or not agent_id:
         return False
-    paths = list(dict.fromkeys(p for p in [TOKEN_FILE, *(p for p, _v in _channel_env_candidates())] if p))
+    paths = gateway_credential_sources.retirement_paths(os.environ, TOKEN_FILE)
     moved: "dict[str, list]" = {}
     for proven in (False, True):
         for path in paths:
