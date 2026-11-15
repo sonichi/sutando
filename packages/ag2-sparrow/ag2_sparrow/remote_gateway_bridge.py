@@ -3585,13 +3585,15 @@ def _recover_auth(code: int) -> bool:
 
 def _retire_deleted_binding(agent_id: str) -> bool:
     """Move the deleted agent's bearer and id out of the token file (deleted_binding.retire); True
-    when anything moved. An env-supplied token has no file to retire it from."""
-    if not TOKEN_FILE or not TOKEN:
+    when anything moved. Nothing moves unless the file names that id beside this bearer, and an
+    env-supplied token has no file to retire it from."""
+    if not TOKEN_FILE or not TOKEN or not agent_id:
         return False
     try:
         keys = deleted_binding.retire(TOKEN_FILE, secret=TOKEN, agent_id=agent_id)
     except OSError as e:
-        _log(f"agent deleted: could not retire its binding from {TOKEN_FILE} ({diagnostics.describe(e)})")
+        _log_backoff(("retire-deleted", type(e).__name__),
+                     f"agent deleted: could not retire its binding from {TOKEN_FILE} ({diagnostics.describe(e)})")
         return False
     if keys:
         _log(f"agent deleted: moved {', '.join(keys)} from {TOKEN_FILE} to "
@@ -3599,22 +3601,47 @@ def _retire_deleted_binding(agent_id: str) -> bool:
     return bool(keys)
 
 
+def _forget_deleted_identity(agent_id: str) -> None:
+    """A deleted id the launcher exported must not name the next agent's claims: drop it from this
+    process, or, where the launcher pinned it, exit so the launcher starts over from the new file."""
+    if not agent_id:
+        return
+    named = [k for k in ("AGENT_MXID", "AGENT_ID") if os.environ.get(k) == agent_id]
+    if named and os.environ.get(agent_identity.PINNED_KEY):
+        _log("new credential after the agent's deletion, but the launcher pinned the deleted id — restarting")
+        sys.exit(POLL_STALL_EXIT_CODE)
+    for k in named:
+        os.environ.pop(k, None)
+
+
 def _wait_after_deletion(code: int) -> bool:
-    """The owner deleted this agent, so its bearer will never be accepted again: no further claims or
-    probes. The binding is retired once, then only a new credential in the token file (a new agent's
-    connect) resumes; True then, like a rotation."""
+    """The owner deleted this agent: no further claims. The server's answer names an id, not this
+    bearer, so the binding is retired only on a 401 and only when the file ties the two; until it
+    is, the bearer is still probed, since it may belong to another, live agent. Only a new
+    credential (or that bearer being accepted) resumes; True then, like a rotation."""
     deleted = _reenroll_state["deleted"]
+    agent_id = deleted.get("agent_id") or ""
     if "retired" not in deleted:
-        deleted["retired"] = _retire_deleted_binding(deleted.get("agent_id") or "")
-        _log(f"AGENT DELETED — {deleted.get('agent_id') or 'this agent'} was deleted by its owner; "
-             "no longer reconnecting. Set up a new agent to use this machine again")
+        deleted["retired"] = False
+        _log(f"AGENT DELETED — {agent_id or 'this agent'} was deleted by its owner; no longer "
+             "reconnecting. Set up a new agent to use this machine again")
+    cycle = 0
     while True:
+        if code == 401 and not deleted["retired"]:
+            deleted["retired"] = _retire_deleted_binding(agent_id)
         _emit_gateway_status(False, error=f"auth rejected HTTP {code} — agent deleted by its owner")
         time.sleep(AUTH_RECHECK_INTERVAL)
         if not _heartbeat_singleton():
             sys.exit("FATAL: lost poller singleton while waiting after the agent's deletion")
         if _reload_rotated_token():
             _log("new credential detected after the agent's deletion — resuming")
+            _forget_deleted_identity(agent_id)
+            _reenroll_clear()
+            return True
+        cycle += 1
+        if not deleted["retired"] and cycle % REENROLL_PROBE_EVERY == 0 and _auth_probe():
+            _log("token accepted again — the deleted id was not this bearer's; resuming")
+            _forget_deleted_identity(agent_id)
             _reenroll_clear()
             return True
 

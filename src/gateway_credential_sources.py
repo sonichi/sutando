@@ -545,13 +545,19 @@ def token_file_url(text: str) -> str:
     return first(_assignments(text, URL_KEYS), URL_KEYS)[0]
 
 
+DELETED_BINDING_ID_KEYS = ("AGENT_MXID", "AGENT_ID")
+
+
 def split_deleted_binding(text: str, *, secret: str, agent_id: str) -> "tuple[str, list[str], list[str]]":
     """(kept text, removed lines, their keys) for a credential file whose agent the server deleted: the
     lines holding `secret` under a token key (a lane-suffixed one included) or alone (a token file's bare
-    line), and the AGENT_MXID / AGENT_ID lines naming `agent_id`. Any other credential stays."""
+    line), and the AGENT_MXID / AGENT_ID lines naming `agent_id`. The server's answer names an id, not a
+    bearer, so nothing moves unless the file itself ties the two: it names `agent_id` and no other agent,
+    and holds `secret`. Line endings are kept as they are; any other credential stays."""
     kept: "list[str]" = []
     removed: "list[str]" = []
     keys: "list[str]" = []
+    ids: "set[str]" = set()
     for line in text.splitlines(keepends=True):
         bare = line.strip()
         key, _, val = bare.partition("=")
@@ -559,10 +565,12 @@ def split_deleted_binding(text: str, *, secret: str, agent_id: str) -> "tuple[st
         key = key[len("export "):].strip() if key.startswith("export ") else key
         assigned = bool(bare) and not bare.startswith("#") and "=" in bare
         value = unquote(val) if assigned else ""
+        if assigned and key in DELETED_BINDING_ID_KEYS and value:
+            ids.add(value)
         if assigned and secret and any(key == k or key.startswith(k + "_") for k in TOKEN_KEYS) \
                 and contract.parse_onboarding_token(value)[1] == secret:
             hit = key
-        elif assigned and agent_id and key in ("AGENT_MXID", "AGENT_ID") and value == agent_id:
+        elif assigned and agent_id and key in DELETED_BINDING_ID_KEYS and value == agent_id:
             hit = key
         elif bare and not assigned and not bare.startswith("#") and secret \
                 and contract.parse_onboarding_token(bare)[1] == secret:
@@ -570,8 +578,10 @@ def split_deleted_binding(text: str, *, secret: str, agent_id: str) -> "tuple[st
         else:
             kept.append(line)
             continue
-        removed.append(line if line.endswith("\n") else line + "\n")
+        removed.append(line if line.endswith(("\n", "\r")) else line + "\n")
         keys.append(hit)
+    if not agent_id or ids != {agent_id} or not any(k not in DELETED_BINDING_ID_KEYS for k in keys):
+        return text, [], []
     return "".join(kept), removed, keys
 
 

@@ -1012,6 +1012,7 @@ class _Deleted(unittest.TestCase):
         self.assertEqual(self.env.stat().st_mode & 0o777, 0o600)
         self.assertEqual(gw.TOKEN, "12" * 24)
         self.assertNotIn("deleted", gw._reenroll_state)
+        self.assertIsNone(gw.os.environ.get("AGENT_MXID"), "the deleted id no longer names this process")
 
     def test_other_refusals_keep_the_binding(self):
         for status, body in ((410, b'{"error":"gone"}'), (403, b'{"error":"reenroll_blocked"}'),
@@ -1029,12 +1030,175 @@ class _Deleted(unittest.TestCase):
                 "AGENT_MXID='@gone.agent:ag2.space'\n"
                 "https://chat.example/relay|" + self.SECRET + "\n"
                 "AG2_REMOTE_TOKEN='https://chat.example/relay|" + self.OTHER + "'\n")
+        # The file names another agent too: it does not tie the deleted id to this bearer.
+        self.assertEqual(sources.split_deleted_binding(text, secret=self.SECRET, agent_id="@gone.agent:ag2.space"),
+                         (text, [], []))
+        text = text.replace("AGENT_ID=@someone.else:ag2.space\n", "")
         kept, retired, keys = sources.split_deleted_binding(text, secret=self.SECRET,
                                                             agent_id="@gone.agent:ag2.space")
         self.assertEqual(keys, ["REMOTE_TASK_TOKEN", "AGENT_MXID", "token"])
-        self.assertEqual(kept, "AGENT_ID=@someone.else:ag2.space\n"
-                               "AG2_REMOTE_TOKEN='https://chat.example/relay|" + self.OTHER + "'\n")
+        self.assertEqual(kept, "AG2_REMOTE_TOKEN='https://chat.example/relay|" + self.OTHER + "'\n")
         self.assertEqual(len(retired), 3)
+        # Only the id, no bearer: nothing to retire.
+        self.assertEqual(sources.split_deleted_binding("AGENT_MXID=@gone.agent:ag2.space\n", secret=self.SECRET,
+                                                       agent_id="@gone.agent:ag2.space")[2], [])
+
+    def test_src_owner_classifies_the_same_lines(self):
+        import importlib.util
+        sys.path.insert(0, str(_REPO / "shared"))
+        self.addCleanup(sys.path.remove, str(_REPO / "shared"))
+        spec = importlib.util.spec_from_file_location("gcs_src_deleted", _REPO / "src" / "gateway_credential_sources.py")
+        src = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = src
+        self.addCleanup(sys.modules.pop, spec.name, None)
+        spec.loader.exec_module(src)
+        text = ("# note\nAG2_REMOTE_TOKEN='https://chat.example/relay|" + self.SECRET + "'\n"
+                "AGENT_MXID=@gone.agent:ag2.space\n" + self.SECRET + "\nREMOTE_TASK_TOKEN=" + self.OTHER)
+        kept, removed, keys = src.split_deleted_binding(text, secret=self.SECRET, agent_id="@gone.agent:ag2.space")
+        self.assertEqual(keys, ["AG2_REMOTE_TOKEN", "AGENT_MXID", "token"])
+        self.assertEqual(kept, "# note\nREMOTE_TASK_TOKEN=" + self.OTHER)
+        self.assertTrue(all(line.endswith("\n") for line in removed))
+
+    def test_retire_leaves_a_file_without_the_binding_alone(self):
+        from ag2_sparrow import deleted_binding
+        self.env.write_text("REMOTE_PROACTIVE_ROOM=!keep:ag2.space\n")
+        self.assertEqual(deleted_binding.retire(str(self.env), secret=self.SECRET, agent_id="@gone.agent:ag2.space"), [])
+        self.assertFalse(Path(str(self.env) + ".retired").exists())
+
+    def test_a_failed_replace_keeps_the_env_and_leaves_no_temp_file(self):
+        from ag2_sparrow import deleted_binding
+        before = self.env.read_text()
+
+        def boom(*a, **k):
+            raise OSError("disk full")
+        with mock.patch.object(deleted_binding.os, "replace", boom):
+            with self.assertRaises(OSError):
+                deleted_binding.retire(str(self.env), secret=self.SECRET, agent_id="@gone.agent:ag2.space")
+        self.assertEqual(self.env.read_text(), before)
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), [".env", ".env.retired"])
+
+    def test_retire_needs_a_token_file_and_survives_an_os_error(self):
+        gw.TOKEN_FILE = ""
+        self.assertFalse(gw._retire_deleted_binding("@gone.agent:ag2.space"))
+        gw.TOKEN_FILE = str(self.env)
+        logs = []
+        gw._log = logs.append
+        with mock.patch.object(gw.deleted_binding, "retire", side_effect=OSError("read-only")):
+            self.assertFalse(gw._retire_deleted_binding("@gone.agent:ag2.space"))
+        self.assertTrue(any("could not retire" in line for line in logs))
+        self.assertIn(self.SECRET, self.env.read_text())
+
+    def test_deletion_learned_inside_the_wait_loop_ends_it(self):
+        calls = {"n": 0}
+
+        def claim():
+            calls["n"] += 1
+            if calls["n"] == 2:   # the first claim failed in transit; the retry is answered 410
+                gw._reenroll_state["deleted"] = {"at": 1, "agent_id": "@gone.agent:ag2.space"}
+        saved = gw._reenroll_claim
+        gw._reenroll_claim = claim
+        self.addCleanup(setattr, gw, "_reenroll_claim", saved)
+        gw._auth_probe = lambda: False
+        beats = {"n": 0}
+
+        def beat():
+            beats["n"] += 1
+            return beats["n"] < 3
+        gw._heartbeat_singleton = beat
+        with self.assertRaises(SystemExit) as stop:
+            gw._recover_auth(401)
+        self.assertIn("deletion", str(stop.exception))
+        self.assertEqual(calls["n"], 2, "no claim after the deletion")
+        self.assertNotIn(self.SECRET, self.env.read_text())
+
+    def test_a_stale_deleted_id_never_retires_another_agents_live_token(self):
+        # The launcher still exports the deleted id; the file holds a new agent's working token.
+        live = "34" * 24
+        self.env.write_text(f"AG2_REMOTE_TOKEN='https://chat.example/relay|{live}'\n"
+                            "AGENT_MXID=@new.agent:ag2.space\n")
+        before = self.env.read_text()
+        gw.TOKEN = live
+        self._answer(410, b'{"error":"agent_deleted"}')
+        probes = {"n": 0}
+
+        def probe():
+            probes["n"] += 1
+            return True   # the bearer is fine: the 401 was transient
+        gw._auth_probe = probe
+        gw._heartbeat_singleton = lambda: True
+        statuses = []
+        real_emit = gw._emit_gateway_status
+
+        def emit(*a, **k):
+            real_emit(*a, **k)
+            statuses.append(self._status())
+        gw._emit_gateway_status = emit
+        self.addCleanup(setattr, gw, "_emit_gateway_status", real_emit)
+        self.assertTrue(gw._recover_auth(401))
+        self.assertEqual(self.env.read_text(), before, "the live token stays")
+        self.assertFalse(Path(str(self.env) + ".retired").exists())
+        self.assertEqual(statuses[0]["reenroll"]["credential_retired"], False)
+        self.assertEqual(probes["n"], 1)
+        self.assertIsNone(gw.os.environ.get("AGENT_MXID"), "the stale id is dropped on resume")
+
+    def test_a_403_never_retires(self):
+        self._answer(410, b'{"error":"agent_deleted"}')
+        beats = {"n": 0}
+
+        def beat():
+            beats["n"] += 1
+            return beats["n"] < 2
+        gw._heartbeat_singleton = beat
+        gw._auth_probe = lambda: False
+        with self.assertRaises(SystemExit):
+            gw._recover_auth(403)
+        self.assertIn(self.SECRET, self.env.read_text())
+
+    def test_a_pinned_deleted_identity_restarts_instead_of_resuming(self):
+        gw.os.environ[gw.agent_identity.PINNED_KEY] = "1"
+        self.addCleanup(gw.os.environ.pop, gw.agent_identity.PINNED_KEY, None)
+        with self.assertRaises(SystemExit) as stop:
+            gw._forget_deleted_identity("@gone.agent:ag2.space")
+        self.assertEqual(stop.exception.code, gw.POLL_STALL_EXIT_CODE)
+        gw._forget_deleted_identity("")   # nothing named: nothing to do
+
+    def test_writer_contract_links_encodings_line_ends_and_races(self):
+        from ag2_sparrow import deleted_binding
+        args = dict(secret=self.SECRET, agent_id="@gone.agent:ag2.space")
+        # CRLF stays CRLF, byte for byte.
+        self.env.write_bytes(self.env.read_bytes().replace(b"\n", b"\r\n"))
+        deleted_binding.retire(str(self.env), **args)
+        self.assertTrue(self.env.read_bytes().endswith(b"!keep:ag2.space\r\n"))
+        self.assertNotIn(b"\n", self.env.read_bytes().replace(b"\r\n", b""))
+        # A wider pre-existing sidecar is narrowed.
+        retired = Path(str(self.env) + ".retired")
+        retired.chmod(0o644)
+        self.env.write_text(f"AG2_REMOTE_TOKEN={self.SECRET}\nAGENT_MXID=@gone.agent:ag2.space\n")
+        self.assertEqual(deleted_binding.retire(str(self.env), **args), ["AG2_REMOTE_TOKEN", "AGENT_MXID"])
+        self.assertEqual(retired.stat().st_mode & 0o777, 0o600)
+        # A symlink and a non-UTF-8 file are left alone.
+        target = self.dir / "real.env"
+        target.write_text(f"AG2_REMOTE_TOKEN={self.SECRET}\nAGENT_MXID=@gone.agent:ag2.space\n")
+        link = self.dir / "link.env"
+        link.symlink_to(target)
+        self.assertEqual(deleted_binding.retire(str(link), **args), [])
+        self.assertTrue(link.is_symlink())
+        bad = self.dir / "bad.env"
+        bad.write_bytes(b"AG2_REMOTE_TOKEN=" + self.SECRET.encode() + b"\n\xff\xfe\n")
+        self.assertEqual(deleted_binding.retire(str(bad), **args), [])
+        # A file rewritten between the read and the replace is not overwritten, and no sidecar line is added.
+        race = self.dir / "race.env"
+        race.write_text(f"AG2_REMOTE_TOKEN={self.SECRET}\nAGENT_MXID=@gone.agent:ag2.space\n")
+        real_same = deleted_binding._same
+
+        def connect_writes(path, text, st):
+            Path(path).write_text("AG2_REMOTE_TOKEN=" + "56" * 24 + "\n")
+            return real_same(path, text, st)
+        with mock.patch.object(deleted_binding, "_same", connect_writes):
+            self.assertEqual(deleted_binding.retire(str(race), **args), [])
+        self.assertEqual(race.read_text(), "AG2_REMOTE_TOKEN=" + "56" * 24 + "\n")
+        self.assertFalse(Path(str(race) + ".retired").exists())
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir() if p.name.startswith(".race")), [])
 
 if __name__ == "__main__":
     import urllib.request  # noqa: F401 — used via gw.urllib in fixtures
