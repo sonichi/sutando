@@ -177,6 +177,17 @@ def registration_view(entries: list, owner_id: str = CORE,
     return out
 
 
+def _norm(text: str) -> str:
+    return " ".join(text.split())
+
+
+def not_yet_registered(view: list, listing: str) -> list:
+    """Drop entries whose registered prompt already appears in a session's CronList text."""
+    seen = _norm(listing)
+    return [e for e in view if not e.get("registered_prompt")
+            or _norm(e["registered_prompt"]) not in seen]
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("crons_json", help="path to the host's crons.json")
@@ -184,6 +195,8 @@ def main(argv=None) -> int:
                     help="session registering: 'core' (default) or a worker's bare id")
     ap.add_argument("--workspace", default=None,
                     help="workspace whose queue the gate checks (a worker's assigned one)")
+    ap.add_argument("--registered", default=None, metavar="FILE",
+                    help="file holding this session's CronList output; entries already in it are omitted")
     args = ap.parse_args(argv)
     try:
         cfg = json.loads(Path(args.crons_json).read_text())
@@ -192,7 +205,14 @@ def main(argv=None) -> int:
     if not isinstance(cfg, list):
         print(f"{args.crons_json}: expected a JSON list", file=sys.stderr)
         return 2
-    print(json.dumps(registration_view(cfg, args.owner, args.workspace)))
+    view = registration_view(cfg, args.owner, args.workspace)
+    if args.registered:
+        try:
+            listing = Path(args.registered).read_text()
+        except FileNotFoundError:
+            listing = ""
+        view = not_yet_registered(view, listing)
+    print(json.dumps(view))
     return 0
 
 
