@@ -174,6 +174,12 @@ class StoreAdapterAsk(_Ws):
         self.assertEqual(out["proactive_file"], "proactive-from-helper.txt")
         self.assertTrue(calls and all(ws == self.ws for _, ws in calls), calls)
 
+    def test_an_asker_that_cannot_be_read_never_blocks_the_ask(self):
+        with self.as_worker(), mock.patch.object(C, "proactive_author_agent", side_effect=OSError("unreadable")):
+            out = self.ask()
+        [name] = self.proactive()
+        self.assertEqual((pr.proactive_worker(name), out["question"]["asked_by"]), (W, None))
+
     def test_a_decision_card_stays_the_cores_and_no_stamped_text_goes_beside_it(self):
         (self.ws / "state" / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space"}))
         from hitl.manager import HitlManager, HitlStore
@@ -209,6 +215,11 @@ class NoStoreAsk(_Ws):
             names, rec = self.run_cli()
         self.assertEqual((names, rec["queued"]), (["proactive-from-helper.txt"], "proactive-from-helper.txt"))
         self.assertEqual(fake.call_args.kwargs["workspace"], self.ws)
+
+    def test_an_asker_that_cannot_be_read_never_blocks_the_ask(self):
+        with self.as_worker(), mock.patch.object(C, "proactive_author_agent", side_effect=OSError("unreadable")):
+            names, rec = self.run_cli()
+        self.assertEqual(([pr.proactive_worker(n) for n in names], rec["asked_by"]), ([W], None))
 
     def test_the_core_and_a_worker_without_an_enabled_identity_queue_unstamped(self):
         for label, kw, worker in (("core", {}, ""), ("none", {"own": False}, W), ("disabled", {"disabled": True}, W)):
