@@ -34,6 +34,7 @@ sys.path.insert(0, str(REPO / "src"))
 import pending_questions_reader as reader  # noqa: E402
 from local_record import RecordDir, iso, new_name, write_text_whole
 from proactive_routing import proactive_filename
+from result_publish import worker_published_path
 from result_markers import neutralize_markers
 from skill_roots import declared
 from util_paths import host_label
@@ -48,6 +49,14 @@ def _option(text: str):
     return label.strip(), consequence.strip()
 
 
+def _asker(name: str, ws: Path):
+    try:
+        import connections  # noqa: PLC0415 — heavy loader
+        return connections.proactive_author_agent(name, ws)
+    except Exception:  # noqa: BLE001 — a missing asker never blocks the ask
+        return None
+
+
 def ask_without_store(question: str, context, ws: Path, why: str) -> list:
     """Core's part alone: the DM through the proactive path, then one generic local record.
     Returns the report lines; nothing raises past here."""
@@ -60,9 +69,11 @@ def ask_without_store(question: str, context, ws: Path, why: str) -> list:
         body += f"\n{neutralize_markers(context).strip()}\n"
     body += "\nReply here.\n"
     lines = [f"recorded: NO STORE — {why}; nothing lists, counts, closes or reminds this question"]
-    queued, send_error = None, None
+    queued, send_error, asker = None, None, None
     try:
-        queued = write_text_whole(ws / "results" / proactive_filename(name, None), body)  # a drain claims it on sight
+        target = worker_published_path(ws / "results" / proactive_filename(name, None), workspace=ws)
+        asker = _asker(target.name, ws)
+        queued = write_text_whole(target, body)  # a drain claims it on sight
         lines.append(f"sent: queued owner-dm (last-active bridge) via results/{queued.name} "
                      "(a bridge drain delivers it; nothing re-raises it without the skill)")
     except Exception as e:  # noqa: BLE001 — the record below still says it was asked
@@ -71,7 +82,7 @@ def ask_without_store(question: str, context, ws: Path, why: str) -> list:
     try:
         p = RecordDir(status_path(RECORDS, ws)).write(name, {
             "id": name, "title": title, "body": body, "created": iso(),
-            "queued": queued.name if queued else None, "error": send_error})
+            "queued": queued.name if queued else None, "error": send_error, "asked_by": asker})
         lines.append(f"record: {p}")
     except Exception as e:  # noqa: BLE001
         lines.append(f"record: FAILED — {type(e).__name__}: {e} (NOT recorded anywhere; ask by hand)")

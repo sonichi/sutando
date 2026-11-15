@@ -104,11 +104,29 @@ def entry_heading(question: str, now: float) -> str:
 
 
 def question_dict(ask_id: str, question: str, context: Optional[str], asked_at: float,
-                  default_action: Optional[str], reason: Optional[str], options, priority: str) -> dict:
+                  default_action: Optional[str], reason: Optional[str], options, priority: str,
+                  asked_by: Optional[str] = None) -> dict:
     """The outbox's `question` record; the store skill's Question dataclass reads the same keys."""
     return {"ask_id": ask_id, "question": question, "context": context, "asked_at": asked_at,
             "default_action": default_action, "reason": reason,
-            "options": [list(o) for o in options or ()], "priority": priority or "Medium"}
+            "options": [list(o) for o in options or ()], "priority": priority or "Medium",
+            "asked_by": asked_by}
+
+
+def published_name(ws: Path, name: str) -> str:
+    """`name` as this session publishes it: `result_publish`'s stamp, so a pool worker acting as its
+    own agent asks through its own lane; the core's session and any other worker keep `name`."""
+    from result_publish import worker_published_path  # noqa: PLC0415
+    return worker_published_path(Path(ws) / "results" / name, workspace=Path(ws)).name
+
+
+def asked_by(ws: Path, name: str) -> Optional[str]:
+    """The agent a question queued under `name` is asked as; None for the core's own agent."""
+    try:
+        import connections  # noqa: PLC0415
+        return connections.proactive_author_agent(published_name(ws, name), Path(ws))
+    except Exception:  # noqa: BLE001 — a missing asker never blocks the ask
+        return None
 
 
 def queued_send(body: str):
@@ -474,6 +492,7 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
             dest = destination_from_task(Path(task_file).read_text(encoding="utf-8"), ws)
         except (OSError, UnicodeDecodeError) as e:
             out["send_error"] = f"task file unreadable ({e}); queued for the owner's DM instead"
+    out["question"]["asked_by"] = asked_by(ws, proactive_filename(ask_id, dest.bridge))
     card = None
     if wants_card(default_action, options) and card_reaches_owner(dest, ws):
         try:
@@ -510,7 +529,7 @@ def _ask_by_text(out: dict, question, context, host, dest, link, intro) -> None:
                     f"{dest.bridge} owner-dm" if dest.bridge else "owner-dm (last-active bridge)")
     out["card"] = None
     try:
-        name = proactive_filename(out["ask_id"], dest.bridge)
+        name = published_name(Path(out["workspace"]), proactive_filename(out["ask_id"], dest.bridge))
         write_proactive(Path(out["workspace"]) / "results", name, body)
         out["proactive_file"] = name
     except Exception as e:  # noqa: BLE001 — the question is still recorded
