@@ -101,8 +101,10 @@ class Record(Base):
         (self.tmp / "bare").mkdir()
         bad_json = make_plugin(self.tmp, "badjson")
         (bad_json / ".claude-plugin" / "plugin.json").write_text("not json")
+        empty = make_plugin(self.tmp, "empty")
+        (empty / ".claude-plugin" / "plugin.json").write_text("{}")
         (self.tmp / "file").write_text("x")
-        for path in (self.tmp / "bare", bad_json, self.tmp / "file", self.tmp / "missing"):
+        for path in (self.tmp / "bare", bad_json, empty, self.tmp / "file", self.tmp / "missing"):
             rc, out = self.main("plugins", WID, "add", str(path))
             self.assertEqual((rc, out["result"]), (2, "refused"), path)
         self.assertNotIn("plugin_dirs", self.row())
@@ -123,7 +125,70 @@ class Record(Base):
             pr.validate_workers({WID: {"state": "live", "plugin_dirs": ["relative/dir"]}})
 
 
+class States(Base):
+    def test_list_reports_each_recorded_dirs_state_now(self):
+        dirs = {n: make_plugin(self.mods, n) for n in ("ok", "gone", "broken", "swapped")}
+        for d in dirs.values():
+            self.main("plugins", WID, "add", str(d))
+        shutil.rmtree(dirs["gone"])
+        (dirs["broken"] / ".claude-plugin" / "plugin.json").write_text("{}")
+        elsewhere = make_plugin(self.tmp, "elsewhere")
+        shutil.rmtree(dirs["swapped"])
+        dirs["swapped"].symlink_to(elsewhere)
+        rc, out = self.main("plugins", WID, "list")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out["states"], {str(dirs["ok"]): "ok", str(dirs["gone"]): "missing",
+                                         str(dirs["broken"]): "not a plugin",
+                                         str(dirs["swapped"]): "redirected"})
+
+
 class Launch(Base):
+    def test_a_symlink_swap_is_skipped_not_followed(self):
+        """Record A, then make A's path a symlink to plugin B: the launch must not load B."""
+        self.main("plugins", WID, "add", str(self.plugin))
+        other = make_plugin(self.tmp, "unapproved")
+        shutil.rmtree(self.plugin)
+        self.plugin.symlink_to(other)
+        err = io.StringIO()
+        from contextlib import redirect_stderr
+        with redirect_stderr(err):
+            p = sw.plan(self.ws, REPO, worker_id=WID)
+        self.assertEqual(p["env"]["SUTANDO_WORKER_PLUGIN_DIRS"], "")
+        self.assertNotIn(str(other), p["env"]["SUTANDO_WORKER_PLUGIN_DIRS"])
+        self.assertEqual(p["plugin_dirs_skipped"], [{"dir": str(self.plugin), "state": "redirected"}])
+        self.assertIn("skipping recorded plugin dir", err.getvalue())
+
+    def test_a_parent_directory_swap_is_skipped_too(self):
+        self.main("plugins", WID, "add", str(self.plugin))
+        moved = self.tmp / "moved-mods"
+        self.mods.rename(moved)
+        self.mods.symlink_to(moved)
+        from contextlib import redirect_stderr
+        with redirect_stderr(io.StringIO()):
+            p = sw.plan(self.ws, REPO, worker_id=WID)
+        self.assertEqual(p["plugin_dirs_skipped"], [{"dir": str(self.plugin), "state": "redirected"}])
+
+    def test_the_recovery_result_carries_the_skipped_dirs(self):
+        self.main("plugins", WID, "add", str(self.plugin))
+        shutil.rmtree(self.plugin)
+        rem = pm.rem
+
+        def fake_spawn(workspace, repo, **kw):
+            p = sw.plan(workspace, repo, worker_id=WID)
+            return {**p, "runtime_session_id": kw.get("resume")}
+
+        wi.start_incarnation(self.ws, WID, wi.sessions(self.ws, WID)[-1]["session_id"],
+                             tmux_socket=str(self.tmp / "s"), tmux_session=wi.tmux_session_name(WID))
+
+        def tmux(argv, **kw):
+            return subprocess.CompletedProcess(argv, 1, "", "can't find session\n")
+        from contextlib import redirect_stderr
+        with redirect_stderr(io.StringIO()):
+            out = rem.recover(self.ws, REPO, WID, runner=tmux, spawn=fake_spawn)
+        self.assertEqual(out["outcome"], rem.RECOVERED)
+        self.assertEqual(out["plugin_dirs_skipped"], [{"dir": str(self.plugin), "state": "missing"}])
+
+
     def test_plan_hands_this_workers_dirs_and_nobody_elses(self):
         self.main("plugins", WID, "add", str(self.plugin))
         self.assertEqual(sw.plan(self.ws, REPO, worker_id=WID)["env"]["SUTANDO_WORKER_PLUGIN_DIRS"],
@@ -141,6 +206,7 @@ class Launch(Base):
         with redirect_stderr(err):
             env = sw.plan(self.ws, REPO, worker_id=WID)["env"]
         self.assertEqual(env["SUTANDO_WORKER_PLUGIN_DIRS"], str(second))
+        self.assertEqual(sw.plan(self.ws, REPO, worker_id=OTHER)["plugin_dirs_skipped"], [])
         self.assertIn("skipping recorded plugin dir", err.getvalue())
 
     def test_the_launcher_turns_each_line_into_one_plugin_dir(self):

@@ -235,7 +235,12 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
     socket = socket or default_socket()
     worker_id = worker_id or wi.new_worker_id()
     delivery_dir = str(pd.deliveries_dir(workspace, worker_id))
+    skipped: list = []
+    plugin_dirs = pr.worker_plugin_dirs(workspace, worker_id, skipped=skipped,
+                                        warn=lambda m: print(m, file=sys.stderr))
     return {
+        # Recorded dirs this start leaves out, so the start's result shows what is missing.
+        "plugin_dirs_skipped": skipped,
         "worker_id": worker_id,
         "label": label or worker_id,
         "runtime": runtime,
@@ -277,8 +282,7 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
                 "SUTANDO_POOL_DELIVERY_SCRIPT": str(_SCRIPTS / "pool_delivery.py"),
                 # The owner's per-worker plugin opt-in (pool_manage.py plugins), one per line;
                 # always set, so a value inherited from the caller never loads into this worker.
-                "SUTANDO_WORKER_PLUGIN_DIRS": "\n".join(pr.worker_plugin_dirs(
-                    workspace, worker_id, warn=lambda m: print(m, file=sys.stderr)))},
+                "SUTANDO_WORKER_PLUGIN_DIRS": "\n".join(plugin_dirs)},
     }
 
 

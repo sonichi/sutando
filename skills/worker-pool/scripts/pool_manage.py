@@ -261,7 +261,9 @@ def plugins(workspace, target, op: str, path: str = "") -> dict:
     wid, row = _worker(workspace, target)
     base = {"worker_id": wid, "action": "plugins", "op": op}
     if op == "list":
-        return {**base, "result": "listed", "plugin_dirs": list(row.get("plugin_dirs") or [])}
+        dirs = pr.recorded_plugin_dirs(workspace, wid)
+        return {**base, "result": "listed", "plugin_dirs": dirs,
+                "states": {d: pr.plugin_dir_state(d) for d in dirs}}
     if not path:
         raise Refused(f"plugins {op} needs a directory")
     _, dirs, roster = pr.set_worker_plugin_dirs(workspace, wid, **{op: path})

@@ -90,9 +90,16 @@ python3 skills/worker-pool/scripts/pool_manage.py plugins <worker> list
   row (`plugin_dirs`, absolute real paths). Every start of that worker (spawn,
   recovery, `enable`, `reseat`) passes each with `--plugin-dir`; the core and
   other workers are unaffected. `add` refuses a dir without a readable
-  `.claude-plugin/plugin.json`, and a launch skips (and reports) a recorded dir
-  that stopped being one. This is the owner's opt-in: record a plugin only on the
-  owner's explicit word for that worker, never on your own. It applies at the
+  `.claude-plugin/plugin.json` naming the plugin. A launch loads each recorded
+  path exactly as recorded and skips one that is missing, no longer a plugin, or
+  redirected (its real path is no longer the recorded path, e.g. a symlink swap);
+  the start's JSON result lists those under `plugin_dirs_skipped`, and
+  `plugins list` shows each dir's state (`ok`, `missing`, `not a plugin`,
+  `redirected`). Approving a dir approves a path, not its contents: what is
+  inside an approved dir can still change after it is recorded. This is the
+  owner's opt-in: record a plugin only on the owner's explicit word for that
+  worker, never on your own. The command does not check who calls it, like the
+  other verbs here; the owner's word is the only gate. It applies at the
   worker's next start; `reseat` applies it now.
 
 ## Codex CLI workers

@@ -621,6 +621,28 @@ def remove_worker(workspace, target: str) -> "tuple[str, dict, dict]":
         return wid, row, compile_roster(workspace, workers, bindings, removed=tombstones | {wid})
 
 
+PLUGIN_OK, PLUGIN_MISSING, PLUGIN_INVALID, PLUGIN_REDIRECTED = (
+    "ok", "missing", "not a plugin", "redirected")
+
+
+def _has_plugin_manifest(real: str) -> bool:
+    try:
+        m = json.loads((Path(real) / CLAUDE_PLUGIN_MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(m, dict) and isinstance(m.get("name"), str) and bool(m["name"].strip())
+
+
+def plugin_dir_state(recorded: str) -> str:
+    """A recorded dir's state now. `redirected`: its real path is no longer the recorded
+    path itself (a component became a symlink), so it may name a directory nobody approved."""
+    if not os.path.isdir(recorded):
+        return PLUGIN_MISSING
+    if os.path.realpath(recorded) != recorded:
+        return PLUGIN_REDIRECTED
+    return PLUGIN_OK if _has_plugin_manifest(recorded) else PLUGIN_INVALID
+
+
 def claude_plugin_dir(path: str) -> str:
     """`path` as the absolute real path of a Claude Code plugin directory, or RosterError.
     A newline is refused because the launcher receives the list newline-separated."""
@@ -629,13 +651,9 @@ def claude_plugin_dir(path: str) -> str:
         raise RosterError(f"not a usable plugin directory: {path!r}")
     if not os.path.isdir(real):
         raise RosterError(f"{path!r} is not a directory")
-    manifest = Path(real) / CLAUDE_PLUGIN_MANIFEST
-    try:
-        ok = isinstance(json.loads(manifest.read_text(encoding="utf-8")), dict)
-    except (OSError, ValueError):
-        ok = False
-    if not ok:
-        raise RosterError(f"{path!r} has no readable {CLAUDE_PLUGIN_MANIFEST}; not a Claude plugin")
+    if not _has_plugin_manifest(real):
+        raise RosterError(f"{path!r} has no readable {CLAUDE_PLUGIN_MANIFEST} naming the plugin; "
+                          "not a Claude plugin")
     return real
 
 
@@ -669,18 +687,25 @@ def set_worker_plugin_dirs(workspace, target: str, *, add=None, remove=None
         return wid, dirs, compile_roster(workspace, workers, load_bindings(workspace))
 
 
-def worker_plugin_dirs(workspace, worker_id: str, warn=None) -> list:
-    """The recorded plugin dirs a launch of `worker_id` loads: each re-checked, and one that
-    stopped being a plugin is skipped and reported through `warn`."""
+def recorded_plugin_dirs(workspace, worker_id: str) -> list:
     row = ((load_roster(workspace) or {}).get("workers") or {}).get(worker_id)
     dirs = row.get("plugin_dirs") if isinstance(row, dict) else None
+    return [d for d in dirs if isinstance(d, str)] if isinstance(dirs, list) else []
+
+
+def worker_plugin_dirs(workspace, worker_id: str, warn=None, skipped=None) -> list:
+    """The recorded plugin dirs a launch of `worker_id` loads, exactly as recorded. One not
+    `ok` now is left out, reported through `warn` and appended to `skipped` as {dir, state}."""
     out = []
-    for d in dirs if isinstance(dirs, list) else []:
-        try:
-            out.append(claude_plugin_dir(d))
-        except RosterError as e:
-            if warn:
-                warn(f"worker {worker_id}: skipping recorded plugin dir: {e}")
+    for d in recorded_plugin_dirs(workspace, worker_id):
+        state = plugin_dir_state(d)
+        if state == PLUGIN_OK:
+            out.append(d)
+            continue
+        if warn:
+            warn(f"worker {worker_id}: skipping recorded plugin dir {d!r}: {state}")
+        if skipped is not None:
+            skipped.append({"dir": d, "state": state})
     return out
 
 
