@@ -476,4 +476,32 @@ check("the skill sends both calls with opid's id",
       and skill.count("feed_runner.py opid fail.json") == 1
       and "the run key + `:fail`" not in skill)
 
+# A run writes only within its own slot, so its key is always among the backend's newest.
+every_ms = EVERY * 60_000
+slot_start = NOW // every_ms * every_ms
+check("due gives each run the end of its slot", fr.slot_until(EVERY, NOW) == slot_start + every_ms
+      and run["slot_until"] == slot_start + every_ms)
+in_slot = {"slot_until": slot_start + every_ms}
+check("a run inside its slot is current", fr.current(in_slot, NOW) == {"current": True})
+for name, run, at in (("at the slot's end", in_slot, slot_start + every_ms),
+                      ("with no slot_until", {}, NOW),
+                      ("with a boolean slot_until", {"slot_until": True}, NOW)):
+    try:
+        fr.current(run, at)
+        refused = False
+    except fr.Refused:
+        refused = True
+    check(f"a run {name} is not current", refused)
+with tempfile.TemporaryDirectory() as tmp:
+    for name, until, code_want in (("current", 2 ** 62, 0), ("past", 1, 1)):
+        path = Path(tmp) / f"{name}.json"
+        path.write_text(json.dumps({"slot_until": until}))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = fr.main(["feed_runner.py", "current", str(path)])
+        check(f"the current command exits {code_want} for a {name} slot", code == code_want)
+check("the skill checks the slot before writing, and qualifies the run-key history",
+      skill.count("feed_runner.py current run.json") == 1 and "16 per grant" in skill
+      and "writes the run key once" not in skill)
+
 print(f"commons-feed-runner: {len(passed)} passed")

@@ -11,6 +11,7 @@ judgment. It never calls anything itself and holds no state.
   outcome <write.json>                  done, wait (retry_after_s), stop or fail
   fail    <run.json> <connector.json>   the feeds.fail arguments for a run that could not write
   opid    <write.json | fail.json>      the operation_id to send those arguments with
+  current <run.json>                    whether the run's slot is still the current one
   capable <describe.json>               whether this backend takes room.commons.feeds.fail
 
 Each JSON file is a tool's whole reply as it came back, wrapper included. The backend holds
@@ -94,11 +95,18 @@ def _ms(value) -> int | None:
     return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
+def slot_until(every_minutes: int, now_ms: int) -> int:
+    """When the current slot of this cadence ends (epoch ms)."""
+    every_ms = every_minutes * 60_000
+    return now_ms // every_ms * every_ms + every_ms
+
+
 def slot_key(grant_id: str, every_minutes: int, now_ms: int) -> str:
     """C3's slot key for the grant's schedule: cron:<trigger>:<slot_ts>, the trigger being the
     grant. Derived from the schedule, never from when the run happens to start, so every retry
-    of one slot carries the same key and the backend writes it once. Catch-up is `latest`: a
-    runner that was down for several slots runs only the current one."""
+    of one slot carries the same key, which the backend writes once within its bounded run-key
+    history. Catch-up is `latest`: a runner that was down for several slots runs only the
+    current one."""
     every_ms = every_minutes * 60_000
     return f"cron:{grant_id}:{now_ms // every_ms * every_ms}"
 
@@ -165,6 +173,7 @@ def due(me: str, replies: list, now_ms: int) -> dict:
                 skipped.append({"room_id": room, "grant_id": gid, "why": str(exc)})
                 continue
             runs.append({"room_id": room, "grant_id": gid, "run_key": key, "kind": kind,
+                         "slot_until": slot_until(every, now_ms),
                          "fields": list(grant.get("fields") or []),
                          "max_rows": grant["max_rows"], "connector": call,
                          "task": {"idempotency_key": key, "source_kind": "proactive_cron",
@@ -331,11 +340,24 @@ def failure(run: dict, reply) -> dict:
     return {"grant_id": run["grant_id"], "run_key": run["run_key"], "code": code}
 
 
+def current(run: dict, now_ms: int) -> dict:
+    """{"current": True} while the run's slot has not ended, else Refused. The backend keeps
+    a bounded history of run keys, so a run written only within its own slot is always among
+    the newest it remembers: a late retry of a past slot never writes again."""
+    until = run.get("slot_until")
+    if isinstance(until, bool) or not isinstance(until, int):
+        raise Refused("the run has no slot_until; plan it again with due")
+    if now_ms >= until:
+        raise Refused("the run's slot has passed; the next slot refreshes the feed")
+    return {"current": True}
+
+
 def operation_id(arguments: dict) -> dict:
     """The operation_id for one feeds.write or feeds.fail call: the run key plus a short hash of
     what the call writes (its rows, or its failure code). The backend binds an operation_id to
     the arguments it was first sent with, so a retry that re-ran the connector and got other
-    rows must be a new operation; the run key stays the dedupe the backend enforces."""
+    rows must be a new operation; the run key stays the backend's dedupe (within its
+    run-key history, which `current` keeps the write inside)."""
     run_key = arguments.get("run_key")
     if not isinstance(run_key, str) or not run_key:
         raise Refused("the arguments have no run_key")
@@ -414,7 +436,8 @@ def _read(path: str):
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2 or argv[1] not in ("due", "rows", "outcome", "fail", "opid", "capable"):
+    if len(argv) < 2 or argv[1] not in ("due", "rows", "outcome", "fail", "opid", "current",
+                                        "capable"):
         print(__doc__.strip(), file=sys.stderr)
         return 2
     now_ms = int(datetime.datetime.now(UTC).timestamp() * 1000)
@@ -432,6 +455,8 @@ def main(argv: list[str]) -> int:
             answer = failure(_read(argv[2]), _read(argv[3]))
         elif argv[1] == "opid" and len(argv) == 3:
             answer = operation_id(_read(argv[2]))
+        elif argv[1] == "current" and len(argv) == 3:
+            answer = current(_read(argv[2]), now_ms)
         elif argv[1] == "capable" and len(argv) == 3:
             answer = capable(_read(argv[2]))
         else:
