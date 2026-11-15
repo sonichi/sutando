@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manage the pool's workers: list, stop, retire, enable, remove.
+"""Manage the pool's workers: list, stop, retire, enable, remove, reseat, plugins.
 
 The owner's (or the agent's, on the owner's behalf) one supported way to take a
 worker out of service and bring it back. Each verb goes through the writer that
@@ -19,6 +19,10 @@ already owns its fact, so the remedy, the sweep and the router honour it:
     remove  drop a retired worker's roster row; its records stay on disk.
     reseat  restart a running seat that owes nothing, so its tools pick up an
             agent identity added after it started; one that owes work is left.
+    plugins record or drop an extra Claude Code plugin dir (a folder holding
+            .claude-plugin/plugin.json) that every launch and reseat of this worker
+            loads with --plugin-dir. The owner's opt-in: run it only on their word.
+            It takes effect at the next start; `reseat` applies it now.
 
     python3 pool_manage.py [--workspace WS] [--repo REPO] list [--json]
     python3 pool_manage.py [--workspace WS] stop   <worker id or label> [--force]
@@ -26,6 +30,8 @@ already owns its fact, so the remedy, the sweep and the router honour it:
     python3 pool_manage.py [--workspace WS] [--repo REPO] enable <worker> [--no-start]
     python3 pool_manage.py [--workspace WS] remove <worker> [--hand-off]
     python3 pool_manage.py [--workspace WS] [--repo REPO] reseat <worker>
+    python3 pool_manage.py [--workspace WS] plugins <worker> add|remove <dir>
+    python3 pool_manage.py [--workspace WS] plugins <worker> list
 
 Every verb prints one JSON line. Exit 0 done, 1 failed, 2 refused.
 """
@@ -250,6 +256,20 @@ def reseat(workspace, repo, target, *, runner=subprocess.run, spawn=None) -> dic
             "start": {"result": restarted["result"], "detail": restarted["detail"]}}
 
 
+def plugins(workspace, target, op: str, path: str = "") -> dict:
+    """The worker's recorded plugin dirs after `op`; a dir that is not a Claude plugin is refused."""
+    wid, row = _worker(workspace, target)
+    base = {"worker_id": wid, "action": "plugins", "op": op}
+    if op == "list":
+        return {**base, "result": "listed", "plugin_dirs": list(row.get("plugin_dirs") or [])}
+    if not path:
+        raise Refused(f"plugins {op} needs a directory")
+    _, dirs, roster = pr.set_worker_plugin_dirs(workspace, wid, **{op: path})
+    result = ("added" if op == "add" else "removed") if roster is not None else "unchanged"
+    return {**base, "result": result, "plugin_dirs": dirs,
+            "applies": "at this worker's next start; pool_manage.py reseat applies it now"}
+
+
 def remove(workspace, target, *, hand_off=False, runner=subprocess.run) -> dict:
     """A retired worker is already fenced, so its owed set cannot grow while this runs."""
     wid, row = _worker(workspace, target)
@@ -309,6 +329,10 @@ def main(argv=None, *, runner=subprocess.run) -> int:
         if name == "enable":
             sp.add_argument("--no-start", action="store_true",
                             help="lift the stop/retire without starting a session now")
+    pl = sub.add_parser("plugins")
+    pl.add_argument("worker")
+    pl.add_argument("op", choices=("add", "remove", "list"))
+    pl.add_argument("dir", nargs="?", default="")
     a = p.parse_args(argv)
     ws = Path(a.workspace) if a.workspace else resolve_workspace()
     try:
@@ -330,6 +354,8 @@ def main(argv=None, *, runner=subprocess.run) -> int:
                          runner=None if runner is subprocess.run else runner)
         elif a.cmd == "reseat":
             out = reseat(ws, a.repo, a.worker, runner=runner)
+        elif a.cmd == "plugins":
+            out = plugins(ws, a.worker, a.op, a.dir)
         else:
             out = remove(ws, a.worker, hand_off=a.hand_off, runner=runner)
     except (Refused, pr.RosterError, wi.IdentityError, ValueError) as e:

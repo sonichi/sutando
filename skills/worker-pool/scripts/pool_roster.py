@@ -42,6 +42,8 @@ STATES = ("live", "recovering", "abandoned", "retired")
 MAX_DISPLAY_LABEL_LENGTH = 120
 PROFILE_WORKER_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 RESERVED_DISPLAY_ID_RE = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
+# The file Claude Code reads to recognise a --plugin-dir as a plugin.
+CLAUDE_PLUGIN_MANIFEST = Path(".claude-plugin") / "plugin.json"
 
 
 class RosterError(Exception):
@@ -251,6 +253,11 @@ def validate_workers(workers) -> None:
             raise RosterError(f"worker {wid!r} has state {state!r}; expected one of {STATES}")
         if "display_label" in row:
             _validate_display_label(row["display_label"], wid)
+        if "plugin_dirs" in row:
+            dirs = row["plugin_dirs"]
+            if not isinstance(dirs, list) or not all(
+                    isinstance(d, str) and os.path.isabs(d) and "\n" not in d for d in dirs):
+                raise RosterError(f"worker {wid!r} plugin_dirs must be a list of absolute paths")
 
 
 def _validate_display_label(label, worker_id: str) -> str:
@@ -384,8 +391,9 @@ def register_worker(workspace, worker_id: str, label: str, room=None, runtime=No
         publish_task_event_handler(workspace)
         previous = workers.get(worker_id) or {}
         workers[worker_id] = {"state": "live", "label": label or worker_id}
-        if isinstance(previous, dict) and "display_label" in previous:
-            workers[worker_id]["display_label"] = previous["display_label"]
+        for kept in ("display_label", "plugin_dirs"):
+            if isinstance(previous, dict) and kept in previous:
+                workers[worker_id][kept] = previous[kept]
         if runtime:
             workers[worker_id]["runtime"] = str(runtime)
         bindings = dict(load_bindings(workspace))
@@ -611,6 +619,69 @@ def remove_worker(workspace, target: str) -> "tuple[str, dict, dict]":
         # The tombstone keeps the retirement fence after the row is gone.
         tombstones = set((_load_existing_roster_strict(workspace) or {}).get("removed") or [])
         return wid, row, compile_roster(workspace, workers, bindings, removed=tombstones | {wid})
+
+
+def claude_plugin_dir(path: str) -> str:
+    """`path` as the absolute real path of a Claude Code plugin directory, or RosterError.
+    A newline is refused because the launcher receives the list newline-separated."""
+    real = os.path.realpath(os.path.expanduser(str(path or "")))
+    if not path or "\n" in real:
+        raise RosterError(f"not a usable plugin directory: {path!r}")
+    if not os.path.isdir(real):
+        raise RosterError(f"{path!r} is not a directory")
+    manifest = Path(real) / CLAUDE_PLUGIN_MANIFEST
+    try:
+        ok = isinstance(json.loads(manifest.read_text(encoding="utf-8")), dict)
+    except (OSError, ValueError):
+        ok = False
+    if not ok:
+        raise RosterError(f"{path!r} has no readable {CLAUDE_PLUGIN_MANIFEST}; not a Claude plugin")
+    return real
+
+
+def set_worker_plugin_dirs(workspace, target: str, *, add=None, remove=None
+                           ) -> "tuple[str, list, dict | None]":
+    """Record (add) or drop (remove) one extra Claude plugin dir on a worker's row, under the
+    roster lock. Returns (worker id, dirs after, roster), roster None on a no-op."""
+    with _locked(workspace):
+        _, workers, wid = _locked_worker(workspace, target)
+        row = workers[wid]
+        dirs = list(row.get("plugin_dirs") or [])
+        if add is not None:
+            if row.get("runtime") not in (None, "claude"):
+                raise RosterError(f"worker {wid} runs {row.get('runtime')!r}; plugin dirs are Claude-only")
+            real = claude_plugin_dir(add)
+            if real in dirs:
+                return wid, dirs, None
+            dirs.append(real)
+        elif remove is not None:
+            raw = os.path.expanduser(str(remove))
+            gone = {os.path.realpath(raw), os.path.abspath(raw)}
+            if not gone & set(dirs):
+                return wid, dirs, None
+            dirs = [d for d in dirs if d not in gone]
+        else:
+            return wid, dirs, None
+        if dirs:
+            row["plugin_dirs"] = dirs
+        else:
+            row.pop("plugin_dirs", None)
+        return wid, dirs, compile_roster(workspace, workers, load_bindings(workspace))
+
+
+def worker_plugin_dirs(workspace, worker_id: str, warn=None) -> list:
+    """The recorded plugin dirs a launch of `worker_id` loads: each re-checked, and one that
+    stopped being a plugin is skipped and reported through `warn`."""
+    row = ((load_roster(workspace) or {}).get("workers") or {}).get(worker_id)
+    dirs = row.get("plugin_dirs") if isinstance(row, dict) else None
+    out = []
+    for d in dirs if isinstance(dirs, list) else []:
+        try:
+            out.append(claude_plugin_dir(d))
+        except RosterError as e:
+            if warn:
+                warn(f"worker {worker_id}: skipping recorded plugin dir: {e}")
+    return out
 
 
 def unbind_room(workspace, room: str) -> dict:

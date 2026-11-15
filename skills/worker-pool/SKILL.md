@@ -18,8 +18,8 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `rename_worker.py` — change a worker's base routing alias after creation: `python3 skills/worker-pool/scripts/rename_worker.py --worker <id-or-label> --label "<new alias>" [--workspace W]`. The id and its tmux session name stay.
 - `apply_profile_label_overrides.py` — apply an s.space profile's complete worker display-label map from JSON stdin with `--workspace W --profile-mxid M --config-version N`.
 - `worker_bootstrap.py` — a worker session's first-turn decision (worker vs core mode) from its env.
-- `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write. `set_worker_state` / `remove_worker` are its writers for a worker's lifecycle.
-- `pool_manage.py` — stop, retire, re-enable or remove a worker (below).
+- `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write. `set_worker_state` / `remove_worker` are its writers for a worker's lifecycle; `set_worker_plugin_dirs` writes a row's `plugin_dirs`.
+- `pool_manage.py` — stop, retire, re-enable, remove or reseat a worker, and record its extra Claude plugin dirs (below).
 - `pool_identity.py` — give a worker an s.space agent of its own, show it, rotate its token or remove it (below).
 - `pool_provision.py` — the local half of creating that agent without a pasted token: claim secret, redeem, retire (below).
 - `provision_e2e.py` — check that whole flow against one server, with a scan for leaked secrets (below).
@@ -36,7 +36,7 @@ python3 skills/worker-pool/scripts/pool_sessions.py list --workspace "$WS" [--ro
 
 Suites live at `tests/skills/worker-pool/`.
 
-## Managing workers: stop, retire, enable, remove
+## Managing workers: stop, retire, enable, remove, plugins
 
 Killing a worker's tmux session does not stop it: the remedy timer's next sweep
 (every 5 minutes) sees a dead session and resumes it on the same conversation.
@@ -52,6 +52,8 @@ python3 skills/worker-pool/scripts/pool_manage.py stop   <worker id or label> [-
 python3 skills/worker-pool/scripts/pool_manage.py retire <worker> [--unbind] [--hand-off]
 python3 skills/worker-pool/scripts/pool_manage.py enable <worker> [--no-start]
 python3 skills/worker-pool/scripts/pool_manage.py remove <worker> [--hand-off]
+python3 skills/worker-pool/scripts/pool_manage.py plugins <worker> add|remove <dir>
+python3 skills/worker-pool/scripts/pool_manage.py plugins <worker> list
 ```
 
 - `stop` writes the worker's pause (`pool_supervise.set_paused`) under the remedy
@@ -84,6 +86,14 @@ python3 skills/worker-pool/scripts/pool_manage.py remove <worker> [--hand-off]
   its id in the roster's `removed` list so late deliveries stay fenced. Its
   records under `state/workers/<id>/` and its `deliveries/<id>/` folder stay as
   history.
+- `plugins` records an extra Claude Code plugin dir on one Claude worker's roster
+  row (`plugin_dirs`, absolute real paths). Every start of that worker (spawn,
+  recovery, `enable`, `reseat`) passes each with `--plugin-dir`; the core and
+  other workers are unaffected. `add` refuses a dir without a readable
+  `.claude-plugin/plugin.json`, and a launch skips (and reports) a recorded dir
+  that stopped being one. This is the owner's opt-in: record a plugin only on the
+  owner's explicit word for that worker, never on your own. It applies at the
+  worker's next start; `reseat` applies it now.
 
 ## Codex CLI workers
 

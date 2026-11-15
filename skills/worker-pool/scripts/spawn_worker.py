@@ -274,7 +274,11 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
                 "SUTANDO_CORE_SESSION": "",
                 # The done-flag writer, so a finished delivery can reach
                 # `finished` instead of being re-reported on every boot.
-                "SUTANDO_POOL_DELIVERY_SCRIPT": str(_SCRIPTS / "pool_delivery.py")},
+                "SUTANDO_POOL_DELIVERY_SCRIPT": str(_SCRIPTS / "pool_delivery.py"),
+                # The owner's per-worker plugin opt-in (pool_manage.py plugins), one per line;
+                # always set, so a value inherited from the caller never loads into this worker.
+                "SUTANDO_WORKER_PLUGIN_DIRS": "\n".join(pr.worker_plugin_dirs(
+                    workspace, worker_id, warn=lambda m: print(m, file=sys.stderr)))},
     }
 
 
