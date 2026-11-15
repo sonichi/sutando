@@ -50,7 +50,8 @@ COMMON_FILES = re.compile(r"(^|/)(CHANGELOG[^/]*|README[^/]*|package-lock\.json|
 PROMOTE_WORDS = re.compile(r"^(?:chore\((?:promote|back-?port)\)|(?:promote|back-?port|cherry-?pick)\b)[:\s]*"
                            r"|\s*\(#\d+\)$", re.I)
 HUNK = re.compile(r"^@@ [^@]* @@ ?(.*)$")
-DIFF_FILE = re.compile(r"^\+\+\+ b/(.*)$")
+DIFF_FILE = re.compile(r"^\+\+\+ (?:b/(.*)|/dev/null)$")
+OLD_FILE = re.compile(r"^--- (?:a/(.*)|/dev/null)$")
 FUNC_LINE = re.compile(r"[A-Za-z_$]")  # git's default funcname rule (no diff driver)
 MAX_FN = 3
 PR_FIELDS = "number title state headRefName baseRefName author{login} url"
@@ -217,16 +218,22 @@ def hunk_functions(diff_text: Optional[str]) -> Dict[str, set]:
     The `@@` header seeds both sides; a line git's default rule names a function (it starts with a letter,
     `_` or `$`) takes over below it: removed lines follow the pre-image, added lines the post-image."""
     res: Dict[str, set] = {}
-    cur = pre = post = None
+    cur = old = pre = post = None
     in_hunk = False
     for line in (diff_text or "").splitlines():
         if line.startswith("diff --git "):
-            cur, in_hunk = None, False
+            cur = old = None
+            in_hunk = False
+            continue
+        m = OLD_FILE.match(line)
+        if m and not in_hunk:
+            old = m[1]
             continue
         m = DIFF_FILE.match(line)
         if m and not in_hunk:
-            cur = m[1]
-            res.setdefault(cur, set())
+            cur = m[1] or old  # a deleted file (`+++ /dev/null`) keeps its old path
+            if cur:
+                res.setdefault(cur, set())
             continue
         m = HUNK.match(line)
         if m:

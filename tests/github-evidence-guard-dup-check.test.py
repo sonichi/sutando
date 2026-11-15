@@ -488,21 +488,28 @@ class RealGit(Base):
         g("update-ref", "refs/remotes/origin/main", "HEAD")
         return work, g, env
 
+    DELETE = ("", "")  # as an edit: delete m.py
+
+    def _write(self, work, edit):
+        if edit is self.DELETE:
+            Path(work, "m.py").unlink()
+        else:
+            assert self.SRC.replace(*edit) != self.SRC
+            Path(work, "m.py").write_text(self.SRC.replace(*edit))
+
     def _check(self, old, new, mine=None):
-        """Other PR: `old` -> `new`; my change: `mine` (old, new), the same edit by default."""
+        """Other PR: `old` -> `new` (or `DELETE`); my change: `mine` (old, new) or `DELETE`, the same by default."""
+        theirs_edit = self.DELETE if (old, new) == self.DELETE else (old, new)
         with tempfile.TemporaryDirectory() as d:
             work, g, env = self._repo(d)
-            edited = self.SRC.replace(old, new)
-            my_edit = self.SRC.replace(*mine) if mine else edited
-            assert edited != self.SRC and my_edit != self.SRC
             g("checkout", "-qb", "other")
-            Path(work, "m.py").write_text(edited)
+            self._write(work, theirs_edit)
             g("commit", "-qam", "other edit")
             theirs = g("diff", "-U3", "main", "other")  # the shape `gh pr diff` returns
             self.assertIn("@@ def alpha():", theirs) if old == "    y = x + 1\n" else None
             g("checkout", "-q", "main")
             g("checkout", "-qb", "mine")
-            Path(work, "m.py").write_text(my_edit)
+            self._write(work, mine or theirs_edit)
             g("commit", "-qam", "my edit")
             other = pr(7, "other change", "other", files=["m.py"], author="someone", base="main")
             fake = Fake({"ro": [other], "viewer": {"login": "me-bot"}}, diffs={7: theirs})
@@ -539,6 +546,24 @@ class RealGit(Base):
         text = self._check(*self.BODY_EDIT, mine=("\n\n" + self.FOO, "\n"))
         self.assertIn("Same function changed in an open PR:\n  #7", text)
         self.assertIn("`def foo(x):`", text)
+
+    def test_deleting_the_whole_file_is_flagged_against_a_body_edit_in_it(self):
+        text = self._check(*self.BODY_EDIT, mine=self.DELETE)
+        self.assertIn("Same function changed in an open PR:\n  #7", text)
+        self.assertIn("`def foo(x):`", text)
+
+    def test_a_body_edit_is_flagged_against_another_pr_deleting_the_file(self):
+        text = self._check(*self.DELETE, mine=self.BODY_EDIT)
+        self.assertIn("Same function changed in an open PR:\n  #7", text)
+        self.assertIn("`def foo(x):`", text)
+
+    def test_file_paths_from_deleted_and_new_files(self):
+        self.assertEqual(dw.hunk_functions(
+            "diff --git a/m.py b/m.py\ndeleted file mode 100644\n--- a/m.py\n+++ /dev/null\n@@ -1,2 +0,0 @@\n"
+            "-def foo(x):\n-    y = 1\n"), {"m.py": {"def foo(x):"}})
+        self.assertEqual(dw.hunk_functions(
+            "diff --git a/n.py b/n.py\nnew file mode 100644\n--- /dev/null\n+++ b/n.py\n@@ -0,0 +1,2 @@\n"
+            "+def bar():\n+    z = 2\n"), {"n.py": {"def bar():"}})
 
     def test_different_functions_still_do_not_match(self):
         self.assertEqual(dw.hunk_functions(
