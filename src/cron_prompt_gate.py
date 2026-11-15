@@ -29,6 +29,7 @@ CLI (prints the owner-filtered entries, each with `registered_prompt`):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shlex
@@ -177,15 +178,48 @@ def registration_view(entries: list, owner_id: str = CORE,
     return out
 
 
-def _norm(text: str) -> str:
-    return " ".join(text.split())
+def marker(entry: dict, prompt: str) -> str:
+    """Prefix that survives CronList truncation: names the entry and the prompt it was built from."""
+    digest = hashlib.sha256(prompt.encode()).hexdigest()[:8]
+    return f"[sutando-cron:{entry.get('name')}:{digest}] "
 
 
-def not_yet_registered(view: list, listing: str) -> list:
-    """Drop entries whose registered prompt already appears in a session's CronList text."""
-    seen = _norm(listing)
-    return [e for e in view if not e.get("registered_prompt")
-            or _norm(e["registered_prompt"]) not in seen]
+class ListingError(ValueError):
+    """The CronList receipt was not observed or is not usable."""
+
+
+def load_jobs(path: str) -> list:
+    """Jobs as [{id, cron, prompt}] from a file the session wrote after calling CronList."""
+    try:
+        jobs = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as exc:
+        raise ListingError(f"CronList receipt {path} not readable: {exc}")
+    ok = isinstance(jobs, list) and all(isinstance(j, dict) and "id" in j for j in jobs)
+    if not ok:
+        raise ListingError(f"CronList receipt {path} is not a list of jobs with ids")
+    return jobs
+
+
+def reconcile(view: list, jobs: list) -> list:
+    """Per entry: create / keep / replace (old ids to delete after the new one is confirmed)."""
+    plan = []
+    for e in view:
+        if not e.get("registered_prompt"):
+            continue
+        tag = marker(e, e["registered_prompt"])
+        stem = tag.rsplit(":", 1)[0] + ":"
+        mine = [j for j in jobs if str(j.get("prompt", "")).lstrip().startswith(stem)]
+        ids = [str(j["id"]) for j in mine]
+        fresh = len(mine) == 1 and mine[0]["prompt"].lstrip().startswith(tag) \
+            and _same_cron(mine[0].get("cron"), e.get("cron"))
+        action = "keep" if fresh else ("replace" if mine else "create")
+        plan.append({"name": e.get("name"), "action": action, "cron": e.get("cron"),
+                     "registered_prompt": tag + e["registered_prompt"], "delete_ids": ids if action == "replace" else []})
+    return plan
+
+
+def _same_cron(a, b) -> bool:
+    return " ".join(str(a).split()) == " ".join(str(b).split())
 
 
 def main(argv=None) -> int:
@@ -196,7 +230,8 @@ def main(argv=None) -> int:
     ap.add_argument("--workspace", default=None,
                     help="workspace whose queue the gate checks (a worker's assigned one)")
     ap.add_argument("--registered", default=None, metavar="FILE",
-                    help="file holding this session's CronList output; entries already in it are omitted")
+                    help="JSON file of the session's CronList jobs [{id, cron, prompt}]; prints a "
+                         "create/keep/replace plan and fails closed when it is unreadable")
     args = ap.parse_args(argv)
     try:
         cfg = json.loads(Path(args.crons_json).read_text())
@@ -208,10 +243,10 @@ def main(argv=None) -> int:
     view = registration_view(cfg, args.owner, args.workspace)
     if args.registered:
         try:
-            listing = Path(args.registered).read_text()
-        except FileNotFoundError:
-            listing = ""
-        view = not_yet_registered(view, listing)
+            view = reconcile(view, load_jobs(args.registered))
+        except ListingError as exc:
+            print(f"{exc}; register nothing", file=sys.stderr)
+            return 3
     print(json.dumps(view))
     return 0
 
