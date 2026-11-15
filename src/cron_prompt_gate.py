@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shlex
 import sys
@@ -178,33 +179,12 @@ def registration_view(entries: list, owner_id: str = CORE,
     return out
 
 
-MARKER = re.compile(r"\[sc:([0-9a-f]{10}):([0-9a-f]{8})\]")
-
-
-def _hex(text: str, n: int) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()[:n]
-
-
-def marker(owner: str, name: str, prompt: str) -> str:
-    """Fixed-length tag (24 chars): who owns the job, then the exact prompt it was built from."""
-    return f"[sc:{_hex(owner + chr(0) + name, 10)}:{_hex(prompt, 8)}]"
-
-
-def tagged_prompt(owner: str, name: str, prompt: str) -> str:
-    """Marker after a leading /skill token (the slash must still dispatch), else in front."""
-    tag = marker(owner, name, prompt)
-    if prompt.startswith("/"):
-        head, sep, rest = prompt.partition(" ")
-        return f"{head} {tag}{sep}{rest}"
-    return f"{tag} {prompt}"
-
-
 class ListingError(ValueError):
-    """The CronList receipt was not observed or is not usable."""
+    """The CronList receipt or the registry was not observed or is not usable."""
 
 
-def _scalar(v) -> bool:
-    return isinstance(v, (str, int)) and not isinstance(v, bool) and str(v) != ""
+def _text(v) -> bool:
+    return isinstance(v, (str, int)) and not isinstance(v, bool) and str(v).strip() != ""
 
 
 def load_jobs(path) -> list:
@@ -216,37 +196,77 @@ def load_jobs(path) -> list:
     except (OSError, ValueError) as exc:
         raise ListingError(f"CronList receipt {path} not readable: {exc}")
     good = isinstance(jobs, list) and all(
-        isinstance(j, dict) and _scalar(j.get("id")) and _scalar(j.get("cron"))
-        and isinstance(j.get("prompt"), str) for j in jobs)
+        isinstance(j, dict) and _text(j.get("id")) and _text(j.get("cron"))
+        and isinstance(j.get("prompt"), str) and j["prompt"].strip() != "" for j in jobs)
     if not good:
-        raise ListingError(f"CronList receipt {path} is not a list of jobs with id, cron and prompt")
+        raise ListingError(f"CronList receipt {path} is not a list of jobs with non-blank id, cron and prompt")
     return jobs
 
 
-def plan_cron_actions(view: list, jobs: list, owner: str) -> list:
-    """Per entry: create / keep / replace (old ids to delete after the new one is confirmed)."""
+def entry_hash(entry: dict, prompt: str) -> str:
+    """What a registered job was built from: its schedule and exact prompt."""
+    cron = " ".join(str(entry.get("cron")).split())
+    return hashlib.sha256(f"{cron}\0{prompt}".encode()).hexdigest()[:16]
+
+
+def load_registry(path) -> dict:
+    """{name: {id, hash}} this worker recorded; an absent file means nothing recorded yet."""
+    if not path:
+        raise ListingError("registry path is empty")
+    try:
+        raw = Path(path).read_text()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise ListingError(f"registry {path} not readable: {exc}")
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise ListingError(f"registry {path} is corrupt: {exc}")
+    ents = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(ents, dict) or not all(
+            isinstance(v, dict) and _text(v.get("id")) and _text(v.get("hash")) for v in ents.values()):
+        raise ListingError(f"registry {path} is corrupt: unexpected shape")
+    return ents
+
+
+def record(path, entry: dict, prompt: str, job_id) -> None:
+    """Write one entry's job id and content hash into the registry (atomic)."""
+    if not _text(job_id):
+        raise ListingError("job id to record is blank")
+    ents = load_registry(path)
+    ents[entry["name"]] = {"id": str(job_id), "hash": entry_hash(entry, prompt)}
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps({"version": 1, "entries": ents}))
+    os.replace(tmp, target)
+
+
+def plan_cron_actions(view: list, jobs: list, registry: dict) -> list:
+    """Per entry: create / keep / replace (old id to delete once the new job is confirmed).
+
+    Identity is the job id the worker recorded, matched against the listed ids, which
+    CronList never truncates; the dispatched prompt is exactly the configured one."""
+    names = [e.get("name") for e in view]
+    dupes = sorted({n for n in names if isinstance(n, str) and names.count(n) > 1})
+    if dupes:
+        raise ListingError(f"duplicate pinned names {dupes}")
+    listed = {str(j["id"]) for j in jobs}
     plan = []
     for e in view:
-        base = e.get("registered_prompt")
-        name = e.get("name")
-        if not base or not isinstance(name, str) or not name:
+        prompt, name = e.get("registered_prompt"), e.get("name")
+        if not prompt or not isinstance(name, str) or not name.strip():
             continue
-        tag = marker(owner, name, base)
-        mine = []
-        for j in jobs:
-            m = MARKER.search(j["prompt"])
-            if m and m.group(1) == tag[4:14]:
-                mine.append(j)
-        fresh = len(mine) == 1 and tag in mine[0]["prompt"] and _same_cron(mine[0]["cron"], e.get("cron"))
-        action = "keep" if fresh else ("replace" if mine else "create")
+        rec = registry.get(name)
+        if rec and rec["id"] in listed:
+            action = "keep" if rec["hash"] == entry_hash(e, prompt) else "replace"
+        else:
+            action = "create"
         plan.append({"name": name, "action": action, "cron": e.get("cron"),
-                     "registered_prompt": tagged_prompt(owner, name, base),
-                     "delete_ids": [str(j["id"]) for j in mine] if action == "replace" else []})
+                     "registered_prompt": prompt,
+                     "delete_ids": [rec["id"]] if action == "replace" else []})
     return plan
-
-
-def _same_cron(a, b) -> bool:
-    return " ".join(str(a).split()) == " ".join(str(b).split())
 
 
 def main(argv=None) -> int:
@@ -259,6 +279,10 @@ def main(argv=None) -> int:
     ap.add_argument("--registered", default=None, metavar="FILE",
                     help="JSON file of the session's CronList jobs [{id, cron, prompt}]; prints a "
                          "create/keep/replace plan and fails closed when it is unreadable")
+    ap.add_argument("--registry", default=None, metavar="FILE",
+                    help="this worker's record of the job id behind each registered entry")
+    ap.add_argument("--record", nargs=2, metavar=("NAME", "JOB_ID"), default=None,
+                    help="record the job id CronCreate returned for NAME, then exit")
     args = ap.parse_args(argv)
     try:
         cfg = json.loads(Path(args.crons_json).read_text())
@@ -268,12 +292,19 @@ def main(argv=None) -> int:
         print(f"{args.crons_json}: expected a JSON list", file=sys.stderr)
         return 2
     view = registration_view(cfg, args.owner, args.workspace)
-    unnamed = [e for e in view if not isinstance(e.get("name"), str) or not e["name"]]
+    unnamed = [e for e in view if not isinstance(e.get("name"), str) or not e["name"].strip()]
     if unnamed:
         print(f"refusing {len(unnamed)} pinned entr(y/ies) with no name", file=sys.stderr)
-    if args.registered is not None:
+    if args.record is not None or args.registered is not None:
         try:
-            view = plan_cron_actions(view, load_jobs(args.registered), args.owner)
+            if args.record is not None:
+                name, job_id = args.record
+                entry = next((e for e in view if e.get("name") == name), None)
+                if entry is None or not entry.get("registered_prompt"):
+                    raise ListingError(f"no pinned entry named {name!r} to record")
+                record(args.registry, entry, entry["registered_prompt"], job_id)
+                return 0
+            view = plan_cron_actions(view, load_jobs(args.registered), load_registry(args.registry))
         except ListingError as exc:
             print(f"{exc}; register nothing", file=sys.stderr)
             return 3

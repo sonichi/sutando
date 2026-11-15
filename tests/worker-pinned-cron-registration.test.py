@@ -3,14 +3,16 @@
 
 The driver plays step 2.5 of skills/startup/SKILL.md against a fake session
 (CronList/CronCreate/CronDelete over a job table, prompts truncated to 80 chars as
-the real CronList does). It runs the SKILL's own bash block, its heredoc filled as
-the session would fill it, plus the real worker_bootstrap.decide. STARTUP_SKILL
-points it at another copy of the SKILL (the parent's, for the before run); the
-step's own text decides which bootstrap answers register crons.
+the real CronList does, ids unique per job). It runs the SKILL's own bash block, its
+heredoc filled as the session would fill it, and its own `--record` command, plus
+the real worker_bootstrap.decide. STARTUP_SKILL points it at another copy of the
+SKILL (the parent's, for the before run); the step's own text decides which
+bootstrap answers register crons.
 """
 import contextlib
 import importlib.util
 import io
+import itertools
 import json
 import os
 import re
@@ -39,6 +41,7 @@ wb = load("worker_bootstrap", "skills/worker-pool/scripts/worker_bootstrap.py")
 
 W = "d" * 32
 TRUNC = 80
+_ids = itertools.count(1)
 
 
 def step25() -> str:
@@ -56,14 +59,14 @@ def answers_that_register(step: str) -> set:
 
 
 class FakeSession:
-    """This session's own scheduler: ids, creates, deletes, a truncating CronList."""
+    """One Claude session's scheduler: unique ids, creates, deletes, a truncating CronList."""
     def __init__(self):
-        self.jobs, self.n = [], 0
+        self.jobs = []
 
     def create(self, cron, prompt):
-        self.n += 1
-        self.jobs.append({"id": f"job{self.n}", "cron": cron, "prompt": prompt})
-        return f"job{self.n}"
+        job_id = f"job-{next(_ids)}"
+        self.jobs.append({"id": job_id, "cron": cron, "prompt": prompt})
+        return job_id
 
     def delete(self, job_id):
         self.jobs = [j for j in self.jobs if j["id"] != job_id]
@@ -85,6 +88,10 @@ class Case(unittest.TestCase):
             {"name": "core-briefing", "cron": "57 6 * * *", "prompt": "briefing"},
         ]
 
+    @property
+    def registry(self):
+        return self.d / "state" / f"worker-crons-{W}.json"
+
     def bootstrap(self, watcher_ready):
         if watcher_ready:
             import util_paths
@@ -100,20 +107,34 @@ class Case(unittest.TestCase):
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    def env(self, owner):
+        return dict(os.environ, SUTANDO_WATCHER_CMD=str(REPO / "src/watch-tasks-stream.sh"),
+                    SUTANDO_WORKSPACE_DIR=str(self.d), SUTANDO_INSTANCE_ID=owner,
+                    SUTANDO_PY=sys.executable, TMPDIR=str(self.d))
+
+    def block(self):
+        return textwrap.dedent(re.search(r"```bash\n(.*?)```", step25(), re.S).group(1))
+
     def helper(self, owner, jobs=None):
         """Run the SKILL's own bash block; `jobs` is the text pasted into its heredoc."""
         (self.host_dir() / "crons.json").write_text(json.dumps(self.crons))
-        block = re.search(r"```bash\n(.*?)```", step25(), re.S).group(1)
-        block = textwrap.dedent(block)
+        block = self.block()
         if "<<'JSON'" in block:
             body = json.dumps(self.session.cron_list()) if jobs is None else jobs
             block = re.sub(r"(<<'JSON'\n).*?(\nJSON)", lambda m: m.group(1) + body + m.group(2),
                            block, flags=re.S)
-        env = dict(os.environ, SUTANDO_WATCHER_CMD=str(REPO / "src/watch-tasks-stream.sh"),
-                   SUTANDO_WORKSPACE_DIR=str(self.d), SUTANDO_INSTANCE_ID=owner,
-                   SUTANDO_PY=sys.executable, TMPDIR=str(self.d))
-        r = subprocess.run(["bash", "-c", block], capture_output=True, text=True, env=env)
+        r = subprocess.run(["bash", "-c", block], capture_output=True, text=True, env=self.env(owner))
         return r.returncode, (json.loads(r.stdout) if r.returncode == 0 else None), r.stderr
+
+    def record(self, name, job_id):
+        """The step's own `--record` command, with its variables defined as the block defines them."""
+        m = re.search(r"`(\"\$SUTANDO_PY\"[^`]*--record <name> <new job id>)`", step25())
+        if not m:
+            return None
+        defs = "\n".join(ln for ln in self.block().splitlines() if re.match(r"(REPO|H|CF|REG)=", ln))
+        cmd = m.group(1).replace("<name>", name).replace("<new job id>", job_id)
+        return subprocess.run(["bash", "-c", defs + "\n" + cmd], capture_output=True, text=True,
+                              env=self.env(W))
 
     def startup(self, watcher_ready=True, jobs=None):
         """Worker-mode steps 1-2.5 as the SKILL text directs them."""
@@ -127,6 +148,7 @@ class Case(unittest.TestCase):
             if item.get("action", "create") == "keep":
                 continue
             new = self.session.create(item["cron"], item["registered_prompt"])
+            self.record(item["name"], new)
             for old in item.get("delete_ids", []):
                 assert new in [j["id"] for j in self.session.jobs]
                 self.session.delete(old)
@@ -136,7 +158,8 @@ class Case(unittest.TestCase):
         return cpg.registration_view(self.crons, W, str(self.d))
 
     def plan(self):
-        return cpg.plan_cron_actions(self.view(), self.session.cron_list(), W)
+        reg = cpg.load_registry(str(self.registry))
+        return cpg.plan_cron_actions(self.view(), self.session.cron_list(), reg)
 
 
 class TestStartup(Case):
@@ -146,7 +169,7 @@ class TestStartup(Case):
         self.assertEqual(len(self.session.jobs), 1, "the original failure: skip registered nothing")
         self.assertIn("mine events", self.session.jobs[0]["prompt"])
 
-    def test_repeat_startup_leaves_exactly_one_despite_truncated_listing(self):
+    def test_repeat_startup_leaves_exactly_one(self):
         for _ in range(3):
             self.startup()
         self.assertEqual(len(self.session.jobs), 1)
@@ -162,66 +185,76 @@ class TestStartup(Case):
         self.assertEqual(len(self.session.jobs), 1)
 
 
-class TestIdentity(Case):
-    def test_long_names_stay_recognised_under_the_truncated_listing(self):
-        for n in (30, 56, 60, 65, 66, 70, 120):
-            with self.subTest(name_length=n):
-                self.session = FakeSession()
-                self.crons = [{"name": "n" * n, "cron": "7 * * * *", "prompt": "mine events", "owner": W}]
+class TestDispatchedPrompt(Case):
+    def test_an_argument_free_skill_entry_registers_exactly_its_configured_prompt(self):
+        self.crons = [{"name": "dream", "cron": "37 3 * * *", "prompt_skill": "obsidian-dream", "owner": W}]
+        self.startup()
+        self.assertEqual([j["prompt"] for j in self.session.jobs], ["/obsidian-dream"])
+
+    def test_a_plain_prompt_is_registered_verbatim_too(self):
+        self.crons = [{"name": "daily", "cron": "5 6 * * *", "prompt": "Summarize the inbox", "owner": W}]
+        self.startup()
+        self.assertEqual([j["prompt"] for j in self.session.jobs], ["Summarize the inbox"])
+
+    def test_long_skill_names_plan_nothing_on_repeat(self):
+        for n in (30, 55, 56, 70, 120):
+            with self.subTest(skill_name_length=n):
+                self.setUp()
+                self.crons = [{"name": "dream", "cron": "37 3 * * *", "prompt_skill": "s" * n, "owner": W}]
                 self.startup()
                 first = list(self.session.jobs)
+                self.assertEqual(first[0]["prompt"], "/" + "s" * n)
                 self.assertEqual([p["action"] for p in self.plan()], ["keep"])
                 self.startup()
                 self.assertEqual(self.session.jobs, first)
 
-    def test_marker_is_fixed_length_and_visible_in_the_truncated_listing(self):
-        self.crons[0]["name"] = "x" * 70
-        self.startup()
-        (job,) = self.session.cron_list()
-        self.assertEqual(len(cpg.marker(W, "x" * 70, "p")), 24)
-        self.assertIsNotNone(cpg.MARKER.search(job["prompt"]), job["prompt"])
+    def test_long_entry_names_plan_nothing_on_repeat(self):
+        for n in (56, 66, 70, 120):
+            with self.subTest(name_length=n):
+                self.setUp()
+                self.crons = [{"name": "n" * n, "cron": "7 * * * *", "prompt": "mine events", "owner": W}]
+                self.startup()
+                first = list(self.session.jobs)
+                self.startup()
+                self.assertEqual(self.session.jobs, first)
 
-    def test_names_a_and_a_colon_b_do_not_collide(self):
+    def test_names_a_and_a_colon_b_stay_independent(self):
         self.crons = [{"name": "a", "cron": "7 * * * *", "prompt": "one", "owner": W},
                       {"name": "a:b", "cron": "8 * * * *", "prompt": "two", "owner": W}]
         self.startup()
-        self.assertEqual(len(self.session.jobs), 2)
         self.crons[0]["cron"] = "9 * * * *"
         plan = {p["name"]: p for p in self.plan()}
         by_id = {j["id"]: j for j in self.session.jobs}
         self.assertEqual(plan["a"]["action"], "replace")
-        self.assertEqual(len(plan["a"]["delete_ids"]), 1)
-        self.assertEqual(by_id[plan["a"]["delete_ids"][0]]["cron"], "7 * * * *")
+        self.assertEqual([by_id[i]["cron"] for i in plan["a"]["delete_ids"]], ["7 * * * *"])
         self.assertEqual(plan["a:b"]["action"], "keep")
 
-    def test_owner_is_part_of_the_identity(self):
+
+class TestRegistry(Case):
+    def test_registry_records_the_job_id_and_survives_a_restart_of_the_helper(self):
         self.startup()
-        other = cpg.plan_cron_actions(self.view(), self.session.cron_list(), "e" * 32)
-        self.assertEqual(other[0]["action"], "create")
+        data = json.loads(self.registry.read_text())
+        (job,) = self.session.jobs
+        self.assertEqual(data["entries"]["event-mining-hourly"]["id"], job["id"])
+        rc, plan, _ = self.helper(W)
+        self.assertEqual([p["action"] for p in plan], ["keep"])
 
-    def test_skill_entry_keeps_its_leading_slash(self):
-        self.crons = [{"name": "dream", "cron": "37 3 * * *", "prompt_skill": "obsidian-dream", "owner": W}]
-        (item,) = self.plan()
-        self.assertTrue(item["registered_prompt"].startswith("/obsidian-dream "), item)
-        self.assertEqual(item["registered_prompt"].split()[1], cpg.marker(W, "dream", "/obsidian-dream"))
+    def test_id_missing_from_the_listing_recreates_exactly_once(self):
         self.startup()
-        self.assertEqual([p["action"] for p in self.plan()], ["keep"])
-
-    def test_unnamed_entry_is_refused_not_shared(self):
-        self.crons = [{"cron": "7 * * * *", "prompt": "a", "owner": W},
-                      {"name": "", "cron": "8 * * * *", "prompt": "b", "owner": W},
-                      {"name": "ok", "cron": "9 * * * *", "prompt": "c", "owner": W}]
-        rc, plan, err = self.helper(W)
-        self.assertEqual([p["name"] for p in plan], ["ok"])
-        self.assertIn("no name", err)
-
-
-class TestReconcile(Case):
-    def test_truncated_listing_of_the_same_job_is_keep(self):
+        self.session = FakeSession()
         self.startup()
-        self.assertEqual([p["action"] for p in self.plan()], ["keep"])
+        self.assertEqual(len(self.session.jobs), 1)
+        self.startup()
+        self.assertEqual(len(self.session.jobs), 1)
 
-    def test_stale_schedule_is_replaced_and_the_old_id_named(self):
+    def test_job_deleted_by_hand_is_recreated_once(self):
+        self.startup()
+        self.session.delete(self.session.jobs[0]["id"])
+        self.startup()
+        self.startup()
+        self.assertEqual(len(self.session.jobs), 1)
+
+    def test_changed_schedule_or_prompt_is_replaced_create_confirm_delete(self):
         self.startup()
         old = self.session.jobs[0]["id"]
         self.crons[0]["cron"] = "9 * * * *"
@@ -229,45 +262,46 @@ class TestReconcile(Case):
         self.assertEqual((p["action"], p["delete_ids"]), ("replace", [old]))
         self.startup()
         self.assertEqual([j["cron"] for j in self.session.jobs], ["9 * * * *"])
-
-    def test_stale_prompt_is_replaced_even_when_the_difference_is_past_truncation(self):
-        self.startup()
         self.crons[0]["prompt"] = "mine events " + "x" * 200 + " --stand new"
-        self.assertEqual(self.plan()[0]["action"], "replace")
-
-    def test_preexisting_duplicates_collapse_to_one(self):
-        self.startup()
-        job = self.session.jobs[0]
-        self.session.create(job["cron"], job["prompt"])
         self.assertEqual(self.plan()[0]["action"], "replace")
         self.startup()
         self.assertEqual(len(self.session.jobs), 1)
+        self.assertTrue(self.session.jobs[0]["prompt"].endswith("--stand new"))
 
-    def test_two_entries_with_the_same_prompt_each_get_their_own_job(self):
+    def test_same_prompt_entries_are_independent(self):
         self.crons.append(dict(self.crons[0], name="event-mining-twin"))
-        self.assertEqual([p["action"] for p in self.plan()], ["create", "create"])
         self.startup()
         self.startup()
         self.assertEqual(len(self.session.jobs), 2)
 
-    def test_one_existing_job_does_not_hide_its_same_prompt_twin(self):
-        self.startup()
-        self.crons.append(dict(self.crons[0], name="event-mining-twin"))
-        self.assertEqual([p["action"] for p in self.plan()], ["keep", "create"])
-
-    def test_entry_without_a_prompt_is_not_planned(self):
-        self.assertEqual(cpg.plan_cron_actions([{"name": "m", "registered_prompt": None}], [], W), [])
-
-    def test_a_premarker_job_is_not_recognised_so_one_duplicate_is_planned(self):
+    def test_a_job_with_no_record_is_unknowable_and_one_duplicate_is_planned(self):
         self.session.create("7 * * * *", "mine events")
         self.assertEqual(self.plan()[0]["action"], "create")
 
+    def test_registry_is_per_owner(self):
+        self.startup()
+        reg = cpg.load_registry(str(self.registry))
+        self.assertEqual(cpg.plan_cron_actions(self.view(), self.session.cron_list(), {})[0]["action"], "create")
+        self.assertIn("event-mining-hourly", reg)
+
+    def test_record_refuses_an_unknown_name_or_blank_id(self):
+        r = self.record("no-such-entry", "job-1")
+        self.assertEqual(r.returncode, 3)
+        (self.host_dir() / "crons.json").write_text(json.dumps(self.crons))
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cpg.main([str(self.host_dir() / "crons.json"), "--owner", W, "--registry",
+                           str(self.registry), "--record", "event-mining-hourly", "  "])
+        self.assertEqual(rc, 3)
+        self.assertFalse(self.registry.exists())
+
 
 class TestFailClosed(Case):
-    def refused(self, body):
+    def refused(self, body=None, expect="register nothing"):
         rc, plan, err = self.helper(W, jobs=body)
-        self.assertEqual((rc, plan), (3, None), body)
-        self.assertIn("register nothing", err)
+        self.assertEqual((rc, plan), (3, None), (body, err))
+        self.assertIn(expect, err)
+        self.assertEqual(self.session.jobs, [])
 
     def test_garbage_receipt_registers_nothing(self):
         self.refused("1 job: <truncated listing text>")
@@ -275,35 +309,43 @@ class TestFailClosed(Case):
         self.assertEqual(rc, 3)
         self.assertEqual(self.session.jobs, [])
 
-    def test_short_or_wrong_typed_jobs_are_refused(self):
+    def test_short_blank_or_wrong_typed_jobs_are_refused(self):
         for body in ('[{"id":"job1"}]', '[{"id":"j","cron":"x"}]', '[{"id":"j","prompt":"p"}]',
-                     '[{"id":"","cron":"x","prompt":"p"}]', '[{"id":["j"],"cron":"x","prompt":"p"}]',
+                     '[{"id":"","cron":"x","prompt":"p"}]', '[{"id":"j","cron":"7 * * * *","prompt":""}]',
+                     '[{"id":"j","cron":"  ","prompt":"p"}]', '[{"id":"j","cron":"x","prompt":"   "}]',
+                     '[{"id":" ","cron":"x","prompt":"p"}]', '[{"id":["j"],"cron":"x","prompt":"p"}]',
                      '[{"id":true,"cron":"x","prompt":"p"}]', '[{"id":"j","cron":"x","prompt":5}]',
                      '{"a": 1}', '["job"]'):
             self.refused(body)
 
-    def test_cli_empty_path_is_not_absence(self):
-        cf = self.d / "c.json"
-        cf.write_text(json.dumps(self.crons))
-        out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            rc = cpg.main([str(cf), "--owner", W, "--registered", ""])
-        self.assertEqual((rc, out.getvalue()), (3, ""))
-        self.assertIn("empty", err.getvalue())
+    def test_corrupt_or_unreadable_registry_registers_nothing(self):
+        for body in ("not json", "[]", '{"entries": []}', '{"entries": {"a": {"id": "x"}}}',
+                     '{"entries": {"a": {"id": "", "hash": "h"}}}'):
+            self.registry.write_text(body)
+            self.refused(expect="corrupt")
+        self.registry.unlink()
+        self.registry.mkdir()
+        self.refused(expect="not readable")
 
-    def test_cli_missing_file_is_refused(self):
-        cf = self.d / "c.json"
-        cf.write_text(json.dumps(self.crons))
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(cpg.main([str(cf), "--owner", W, "--registered", str(self.d / "nope")]), 3)
+    def test_duplicate_pinned_names_register_nothing(self):
+        self.crons = [{"name": "dup", "cron": "7 * * * *", "prompt": "one", "owner": W},
+                      {"name": "dup", "cron": "8 * * * *", "prompt": "two", "owner": W}]
+        self.refused(expect="duplicate pinned names")
+        self.assertFalse(self.registry.exists())
 
-    def test_without_the_flag_the_core_output_is_unchanged(self):
-        cf = self.d / "c.json"
-        cf.write_text(json.dumps(self.crons))
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            cpg.main([str(cf)])
-        self.assertNotIn("action", json.loads(out.getvalue())[0])
+    def test_duplicate_names_across_owners_are_not_a_conflict(self):
+        self.crons = [{"name": "dup", "cron": "7 * * * *", "prompt": "one", "owner": W},
+                      {"name": "dup", "cron": "8 * * * *", "prompt": "two", "owner": "e" * 32}]
+        rc, plan, _ = self.helper(W)
+        self.assertEqual((rc, [p["name"] for p in plan]), (0, ["dup"]))
+
+    def test_unnamed_entry_is_refused(self):
+        self.crons = [{"cron": "7 * * * *", "prompt": "a", "owner": W},
+                      {"name": " ", "cron": "8 * * * *", "prompt": "b", "owner": W},
+                      {"name": "ok", "cron": "9 * * * *", "prompt": "c", "owner": W}]
+        rc, plan, err = self.helper(W)
+        self.assertEqual([p["name"] for p in plan], ["ok"])
+        self.assertIn("no name", err)
 
     def test_unknown_bootstrap_answer_registers_nothing(self):
         self.assertNotIn("unknown", answers_that_register(step25()))
@@ -311,12 +353,22 @@ class TestFailClosed(Case):
 
 class TestInProcess(Case):
     """The same refusals through direct calls, so the coverage gate sees them."""
-    def test_load_jobs_accepts_good_and_refuses_bad(self):
+    def run_main(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cpg.main(list(args))
+        return rc, out.getvalue(), err.getvalue()
+
+    def cfg(self):
+        f = self.d / "c.json"
+        f.write_text(json.dumps(self.crons))
+        return str(f)
+
+    def test_load_jobs(self):
         f = self.d / "r.json"
         f.write_text('[{"id": 7, "cron": "* * * * *", "prompt": "p"}]')
         self.assertEqual(len(cpg.load_jobs(str(f))), 1)
-        for body in ('[{"id":"job1"}]', '{"a":1}', '[{"id":true,"cron":"x","prompt":"p"}]',
-                     '[{"id":"j","cron":"","prompt":"p"}]', 'nope'):
+        for body in ('[{"id":"job1"}]', '{"a":1}', '[{"id":"j","cron":"x","prompt":""}]', 'nope'):
             f.write_text(body)
             with self.assertRaises(cpg.ListingError):
                 cpg.load_jobs(str(f))
@@ -324,28 +376,75 @@ class TestInProcess(Case):
             with self.assertRaises(cpg.ListingError):
                 cpg.load_jobs(bad)
 
-    def test_main_refuses_unnamed_entry_and_non_list_config(self):
-        cf, rf = self.d / "c.json", self.d / "r.json"
+    def test_load_registry_and_record(self):
+        reg = self.d / "state" / "r.json"
+        self.assertEqual(cpg.load_registry(str(reg)), {})
+        entry = self.view()[0]
+        cpg.record(str(reg), entry, entry["registered_prompt"], "job-9")
+        got = cpg.load_registry(str(reg))
+        self.assertEqual(got[entry["name"]]["id"], "job-9")
+        for bad in ("", None):
+            with self.assertRaises(cpg.ListingError):
+                cpg.load_registry(bad)
+        with self.assertRaises(cpg.ListingError):
+            cpg.record(str(reg), entry, "p", "")
+
+    def test_registry_corruption_duplicates_and_promptless_entries(self):
+        reg = self.d / "state" / "r.json"
+        for body in ("not json", "[]", '{"entries": {"a": {"id": ""}}}'):
+            reg.write_text(body)
+            with self.assertRaises(cpg.ListingError):
+                cpg.load_registry(str(reg))
+        reg.unlink()
+        reg.mkdir()
+        with self.assertRaises(cpg.ListingError):
+            cpg.load_registry(str(reg))
+        view = [{"name": "d", "registered_prompt": "p", "cron": "x"}] * 2
+        with self.assertRaises(cpg.ListingError):
+            cpg.plan_cron_actions(view, [], {})
+        self.assertEqual(cpg.plan_cron_actions([{"name": "m", "registered_prompt": None}], [], {}), [])
+
+    def test_main_plan_record_and_refusals(self):
+        rf = self.d / "listing.json"
         rf.write_text("[]")
-        cf.write_text(json.dumps([{"cron": "7 * * * *", "prompt": "a", "owner": W},
-                                  {"name": "ok", "cron": "9 * * * *", "prompt": "c", "owner": W}]))
-        out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            rc = cpg.main([str(cf), "--owner", W, "--registered", str(rf)])
-        self.assertEqual((rc, [p["name"] for p in json.loads(out.getvalue())]), (0, ["ok"]))
-        self.assertIn("no name", err.getvalue())
-        cf.write_text('{"a": 1}')
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(cpg.main([str(cf)]), 2)
-            cf.unlink()
-            self.assertEqual(cpg.main([str(cf)]), 0)
+        reg = str(self.d / "state" / "reg.json")
+        rc, out, err = self.run_main(self.cfg(), "--owner", W, "--registered", str(rf), "--registry", reg)
+        self.assertEqual((rc, [p["action"] for p in json.loads(out)]), (0, ["create"]))
+        rc, out, err = self.run_main(self.cfg(), "--owner", W, "--registry", reg, "--record",
+                                     "event-mining-hourly", "job-1")
+        self.assertEqual(rc, 0)
+        rf.write_text('[{"id": "job-1", "cron": "7 * * * *", "prompt": "x"}]')
+        rc, out, err = self.run_main(self.cfg(), "--owner", W, "--registered", str(rf), "--registry", reg)
+        self.assertEqual([p["action"] for p in json.loads(out)], ["keep"])
+        rc, out, err = self.run_main(self.cfg(), "--owner", W, "--registered", "", "--registry", reg)
+        self.assertEqual((rc, out), (3, ""))
+        rc, out, err = self.run_main(self.cfg(), "--owner", W, "--registered", str(rf))
+        self.assertEqual((rc, out), (3, ""))
+        self.assertIn("registry path is empty", err)
+        rc, out, err = self.run_main(self.cfg(), "--owner", W, "--registry", reg, "--record", "nope", "j")
+        self.assertEqual(rc, 3)
+
+    def test_main_non_list_config_and_missing_config_and_unnamed(self):
+        f = self.d / "c.json"
+        f.write_text('{"a": 1}')
+        self.assertEqual(self.run_main(str(f))[0], 2)
+        f.unlink()
+        self.assertEqual(self.run_main(str(f))[0], 0)
+        self.crons = [{"cron": "7 * * * *", "prompt": "a", "owner": W}]
+        rc, out, err = self.run_main(self.cfg(), "--owner", W)
+        self.assertIn("no name", err)
+
+    def test_without_the_flags_the_core_output_is_unchanged(self):
+        rc, out, _ = self.run_main(self.cfg())
+        self.assertNotIn("action", json.loads(out)[0])
 
 
 class TestSkillText(unittest.TestCase):
-    def test_step_defines_the_receipt_and_the_contract(self):
+    def test_step_defines_the_receipt_registry_and_contract(self):
         step = step25()
-        for needle in ('LISTING="$(mktemp', "<<'JSON'", '--registered "$LISTING"', "Fail closed",
-                       "create-confirm-delete", "delete_ids", "spans the upgrade"):
+        for needle in ('LISTING="$(mktemp', "<<'JSON'", '--registered "$LISTING"', '--registry "$REG"',
+                       "--record <name> <new job id>", "Fail closed", "create-confirm-delete",
+                       "delete_ids", "unknowable", "exactly its configured"):
             self.assertIn(needle, step)
 
 
