@@ -10198,6 +10198,86 @@ def check_outbox_parked(workspace_dir: Optional[Path] = None) -> dict:
             "detail": f"no parked replies across {len(roots)} outbox root(s)"}
 
 
+# Past this margin a quiet leg is not a slow pass; its consumer stopped claiming.
+_FANOUT_LAG_THRESHOLD_S = 3600
+# Beyond this a quiet leg reads as abandoned (its bridge uninstalled), not stalled.
+_FANOUT_ABANDONED_S = 30 * 86400
+
+
+def check_proactive_fanout_lag(workspace_dir: Optional[Path] = None,
+                               lag_threshold_sec: int = _FANOUT_LAG_THRESHOLD_S) -> dict:
+    """A proactive message claims exactly one sibling `.outbox-*-proactive` leg
+    (ag2space / discord / ...). When one leg's consumer stops claiming, a
+    sibling's routing can keep delivering while the first goes dark with
+    nothing to say so — an item-level delivery check that only reads the live
+    leg's own outbox cannot see that the other has stalled. Flag a leg whose
+    newest item write lags every live sibling's by more than
+    `lag_threshold_sec`, while a sibling is itself recent enough to prove the
+    fan-out as a whole is not simply quiet."""
+    name = "proactive-fanout-lag"
+    results = Path(workspace_dir or WORKSPACE_DIR) / "results"
+    now = time.time()
+    try:
+        roots = sorted(p for p in results.iterdir()
+                       if p.name.startswith(".outbox-") and p.name.endswith("-proactive"))
+    except FileNotFoundError:
+        roots = []
+    except OSError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"{results.name}/ unreadable ({exc}) — fan-out legs unjudged"}
+    if len(roots) < 2:
+        return {"name": name, "status": "ok",
+                "detail": f"{len(roots)} proactive outbox root(s) — no sibling to compare"}
+    try:
+        import outbox  # noqa: PLC0415 - src-local, imported only when a sibling exists
+    except ImportError as exc:
+        return {"name": name, "status": "warn",
+                "detail": f"cannot read the outbox ({exc}) — fan-out legs unjudged"}
+    newest: "dict[str, Optional[float]]" = {}
+    for root in roots:
+        items_dir = root / outbox.ITEMS_DIR
+        try:
+            mtimes = [p.stat().st_mtime for p in items_dir.iterdir() if p.suffix == ".json"]
+        except FileNotFoundError:
+            mtimes = []
+        except OSError as exc:
+            return {"name": name, "status": "warn",
+                    "detail": f"{root.name}/{outbox.ITEMS_DIR} unreadable ({exc}) — fan-out legs unjudged"}
+        newest[root.name] = max(mtimes) if mtimes else None
+    live = {k: v for k, v in newest.items() if v is not None}
+    if not live:
+        return {"name": name, "status": "ok",
+                "detail": f"no items yet in any of {len(roots)} proactive outbox root(s)"}
+    freshest_name = max(live, key=live.get)
+    freshest_age = now - live[freshest_name]
+    if freshest_age > lag_threshold_sec:
+        # The whole fan-out is quiet together, not one leg behind its
+        # siblings; check_stale_proactive_backlog owns total silence.
+        return {"name": name, "status": "ok",
+                "detail": f"newest proactive activity ({freshest_name}) is "
+                          f"{_age_hm(int(freshest_age))} old — no leg is recent enough to compare against"}
+    stalled = []
+    for root_name, mtime in sorted(newest.items()):
+        if root_name == freshest_name or mtime is None:
+            continue  # the freshest leg itself, or a leg that never held an item
+        age = now - mtime
+        if age - freshest_age <= lag_threshold_sec or age > _FANOUT_ABANDONED_S:
+            continue
+        stalled.append((root_name, age))
+    if stalled:
+        detail = "; ".join(f"{r} last claimed {_age_hm(int(a))} ago" for r, a in stalled)
+        return {"name": name, "status": "warn",
+                "detail": (f"{len(stalled)} proactive fan-out leg(s) stalled while "
+                           f"{freshest_name} delivered as recently as "
+                           f"{_age_hm(int(freshest_age))} ago: {detail} — the owner may be "
+                           "missing messages on the stalled leg's channel even though a "
+                           "sibling leg kept delivering; a delivery check that only reads "
+                           "one leg's outbox cannot see this")}
+    return {"name": name, "status": "ok",
+            "detail": f"all {len(roots)} proactive outbox root(s) active within "
+                      f"{lag_threshold_sec // 60}m of each other"}
+
+
 def check_task_claim_age(workspace_dir: Optional[Path] = None) -> dict:
     """A claim whose task file still exists is queued or running, so no age condemns it;
     one whose task is archived is leaked at any age. Not a --fix: release may drop work."""
@@ -13945,6 +14025,7 @@ def run_all_checks() -> list[dict]:
     checks.append(check_task_claim_age())
     checks.append(check_a_fallback_hits())
     checks.append(check_outbox_parked())
+    checks.append(check_proactive_fanout_lag())
     checks.append(check_withheld_reviews_readable())
     checks.append(check_codex_task_notifier())
     checks.append(check_claude_task_notifier())
