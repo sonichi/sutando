@@ -490,7 +490,11 @@ overwriting a row), then launches one bridge per `launch-plan` line through
 (the one `scripts/channel-env.sh` resolves; `REMOTE_TASK_TOKEN` or the legacy
 `AG2_REMOTE_TOKEN`, environment first when both exist): a desktop install signs in after
 the engine started, so the connect flow reaches the file but never this process's
-environment. `list` runs that import once when the record has never been written (an initialized record
+environment. A bare secret (no `https://<gateway>|` prefix) counts only beside a gateway URL,
+`REMOTE_TASK_URL` or the legacy `AG2_REMOTE_URL`, paired as the bridge pairs them: an environment
+secret with the environment's URL, a file secret with the environment's URL, else that file's.
+The vault then holds the joined `url|secret`; half a pair, or a URL that is not a gateway URL,
+imports nothing. `list` runs that import once when the record has never been written (an initialized record
 that is empty stays empty: its rows were removed on purpose), so the panel
 shows the connection on its next refresh without an engine restart; an import that fails
 is logged and the list still answers. A record that exists still adopts, on `list`, any
