@@ -34,7 +34,7 @@ ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "TMPDIR", "SHELL")
 REQUIRED_KEYS = ("RUNTIME", "ACP_COMMAND", "CWD", "INBOX_DIR", "RESULTS_DIR")
 CONFIG_KEYS = ("RUNTIME", "ACP_COMMAND", "CWD", "SESSION_STORE", "INBOX_DIR", "RESULTS_DIR",
                "ALLOW_NON_OWNER") + cb.CONFIG_KEYS
-LOCAL = Shape(name=SHAPE, command=COMMAND, description="Gemini CLI as an s.space agent",
+LOCAL = Shape(name=SHAPE, command=COMMAND, description="Gemini CLI on Sparrow",
               cli="Gemini CLI", min_version=(0, 0, 0), version_anchor=r"^\d",
               version_note="the ACP wake and the sign-in are checked by verify, not by a version",
               required_keys=REQUIRED_KEYS, config_keys=CONFIG_KEYS, env_keep=ENV_KEEP,
@@ -342,8 +342,8 @@ def session_options(p) -> None:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog=COMMAND, description="Gemini CLI on this machine as an s.space agent, "
-                                 "woken over ACP.")
+    ap = argparse.ArgumentParser(prog=COMMAND, description="Gemini CLI on this machine as an agent on "
+                                 "Sparrow, woken over ACP.")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("install", help="check the sign-in, record the settings, write the unit, have the manager "
                        "start the connector")
