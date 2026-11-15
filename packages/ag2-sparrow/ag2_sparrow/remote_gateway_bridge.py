@@ -3621,33 +3621,46 @@ def _forget_deleted_identity(agent_id: str) -> None:
         os.environ.pop(k, None)
 
 
+def _bearer_check() -> str:
+    """This bearer, tested now: "accepted" on an authed answer, "refused" on a 401 or 403, "unknown"
+    on anything else (an outage proves nothing either way)."""
+    try:
+        _req("GET", "/v1/agents", timeout=15)
+        return "accepted"
+    except urllib.error.HTTPError as e:
+        return "refused" if e.code in (401, 403) else "unknown"
+    except Exception:  # noqa: BLE001 - unknown, never a refusal
+        return "unknown"
+
+
 def _wait_after_deletion(code: int) -> bool:
     """The owner deleted this agent: no further claims. The server's answer names an id, not this
-    bearer, so the binding is retired only on a 401 and only when the file ties the two; until it
-    is, the bearer is still probed, since it may belong to another, live agent. Only a new
-    credential (or that bearer being accepted) resumes; True then, like a rotation."""
+    bearer, so the binding is retired only on a 401, only when the file ties the two, and only right
+    after this bearer is itself refused again; until then it is tested every cycle, and an accepted
+    bearer resumes, since the stale id may sit beside another, live agent's token. A new credential
+    resumes too; True either way, like a rotation."""
     deleted = _reenroll_state["deleted"]
     agent_id = deleted.get("agent_id") or ""
     if "retired" not in deleted:
         deleted["retired"] = False
         _log(f"AGENT DELETED — {agent_id or 'this agent'} was deleted by its owner; no longer "
              "reconnecting. Set up a new agent to use this machine again")
-    cycle = 0
     while True:
-        if code == 401 and not deleted["retired"]:
-            deleted["retired"] = _retire_deleted_binding(agent_id)
+        if not deleted["retired"]:
+            check = _bearer_check()
+            if check == "accepted":
+                _log("token accepted again — the deleted id was not this bearer's; resuming")
+                _forget_deleted_identity(agent_id)
+                _reenroll_clear()
+                return True
+            if check == "refused" and code == 401:
+                deleted["retired"] = _retire_deleted_binding(agent_id)
         _emit_gateway_status(False, error=f"auth rejected HTTP {code} — agent deleted by its owner")
         time.sleep(AUTH_RECHECK_INTERVAL)
         if not _heartbeat_singleton():
             sys.exit("FATAL: lost poller singleton while waiting after the agent's deletion")
         if _reload_rotated_token():
             _log("new credential detected after the agent's deletion — resuming")
-            _forget_deleted_identity(agent_id)
-            _reenroll_clear()
-            return True
-        cycle += 1
-        if not deleted["retired"] and cycle % REENROLL_PROBE_EVERY == 0 and _auth_probe():
-            _log("token accepted again — the deleted id was not this bearer's; resuming")
             _forget_deleted_identity(agent_id)
             _reenroll_clear()
             return True

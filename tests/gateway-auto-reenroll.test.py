@@ -933,7 +933,7 @@ class _Deleted(unittest.TestCase):
     def setUp(self):
         names = ("URL", "TOKEN", "TOKEN_FILE", "REENROLL_ENABLED", "AUTH_RECHECK_INTERVAL",
                  "REENROLL_PROBE_EVERY", "GATEWAY_STATUS_FILE", "_log", "_heartbeat_singleton",
-                 "_auth_probe")
+                 "_auth_probe", "_bearer_check")
         self._saved = {n: getattr(gw, n) for n in names}
         self._env = gw.os.environ.get("AGENT_MXID")
         gw.os.environ["AGENT_MXID"] = "@gone.agent:ag2.space"
@@ -955,6 +955,8 @@ class _Deleted(unittest.TestCase):
         gw.GATEWAY_STATUS_FILE = self.dir / "gateway-status.json"
         gw._log = lambda m: None
         gw._auth_probe = lambda: self.fail("probed a deleted agent's bearer")
+        self.checks = []
+        gw._bearer_check = lambda: self.checks.append("refused") or "refused"   # the deleted bearer, refused
         self.claims = []
         _reset()
 
@@ -1125,8 +1127,8 @@ class _Deleted(unittest.TestCase):
 
         def probe():
             probes["n"] += 1
-            return True   # the bearer is fine: the 401 was transient
-        gw._auth_probe = probe
+            return "accepted"   # the bearer is fine: the 401 was transient
+        gw._bearer_check = probe
         beats = {"n": 0}
 
         def beat():   # bounded: a regression that stops probing exits instead of hanging
@@ -1144,7 +1146,7 @@ class _Deleted(unittest.TestCase):
         self.assertTrue(gw._recover_auth(401))
         self.assertEqual(self.env.read_text(), before, "the live token stays")
         self.assertFalse(Path(str(self.env) + ".retired").exists())
-        self.assertEqual(statuses[0]["reenroll"]["credential_retired"], False)
+        self.assertEqual(statuses, [], "resumed on the first check, before any deleted status")
         self.assertEqual(probes["n"], 1)
         self.assertIsNone(gw.os.environ.get("AGENT_MXID"), "the stale id is dropped on resume")
 
@@ -1299,6 +1301,49 @@ class _Deleted(unittest.TestCase):
             deleted_binding.retire(str(self.env), secret=self.SECRET, agent_id="@gone.agent:ag2.space")
         self.assertEqual(elsewhere.read_text(), "")
         self.assertIn(self.SECRET, self.env.read_text())
+
+    def test_a_live_bearer_beside_a_stale_deleted_id_in_the_file_is_never_retired(self):
+        # The file itself records the deleted id beside a token that still works: one transient 401,
+        # then the claim's id-only 410. The bearer is tested before anything moves, and it is accepted.
+        before = self.env.read_text()
+        self._answer(410, b'{"error":"agent_deleted"}')
+        gw._bearer_check = lambda: "accepted"
+        gw._heartbeat_singleton = lambda: self.fail("waited instead of testing the bearer first")
+        self.assertTrue(gw._recover_auth(401))
+        self.assertEqual(self.env.read_text(), before, "the binding stays live")
+        self.assertFalse(Path(str(self.env) + ".retired").exists())
+        self.assertNotIn("deleted", gw._reenroll_state)
+
+    def test_an_unknown_bearer_check_never_retires(self):
+        self._answer(410, b'{"error":"agent_deleted"}')
+        answers = iter(["unknown", "unknown", "refused"])
+        gw._bearer_check = lambda: next(answers)
+        seen = []
+
+        def beat():
+            seen.append(self.SECRET in self.env.read_text())
+            return len(seen) < 3
+        gw._heartbeat_singleton = beat
+        with self.assertRaises(SystemExit):
+            gw._recover_auth(401)
+        self.assertEqual(seen, [True, True, False], "retired only after the bearer itself was refused")
+
+    def test_the_bearer_check_reads_only_a_401_or_403_as_refused(self):
+        def raising(exc):
+            def req(*a, **k):
+                raise exc
+            return req
+        saved = gw._req
+        self.addCleanup(setattr, gw, "_req", saved)
+        gw._bearer_check = self._saved["_bearer_check"]
+        for exc, want in ((urllib.error.HTTPError("u", 401, "x", {}, io.BytesIO(b"")), "refused"),
+                          (urllib.error.HTTPError("u", 403, "x", {}, io.BytesIO(b"")), "refused"),
+                          (urllib.error.HTTPError("u", 502, "x", {}, io.BytesIO(b"")), "unknown"),
+                          (OSError("down"), "unknown")):
+            gw._req = raising(exc)
+            self.assertEqual(gw._bearer_check(), want, exc)
+        gw._req = lambda *a, **k: {"agents": []}
+        self.assertEqual(gw._bearer_check(), "accepted")
 
 if __name__ == "__main__":
     import urllib.request  # noqa: F401 — used via gw.urllib in fixtures
