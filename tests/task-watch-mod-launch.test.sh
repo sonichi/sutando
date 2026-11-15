@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The task-watch Mod is installed only on an explicit per-launcher opt-in and a Claude Code at
-# or above the Mod's own floor; the session marker says which watcher path the session is on.
+# The task-watch Mod is installed per launcher (workers by default, the core on opt-in) and only on a
+# Claude Code at or above the Mod's own floor; the session marker says which watcher path is on.
 set -uo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 pass=0; fail=0
@@ -73,12 +73,16 @@ WORKER_ENV=(SUTANDO_INSTANCE_ID=w-test SUTANDO_TMUX_SESSION=sutando-worker-w-tes
 worker_env() { env -i HOME="$HOME" PATH="$STUB_PATH" STUB_VERSION=9.9.9 "${WORKER_ENV[@]}" "$@" \
   bash "$REPO/skills/worker-pool/scripts/launch-worker-session.sh" --print-env 2>/dev/null; }
 out="$(worker_env)"
-echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD="; check $? "a worker is launched with the marker explicitly empty by default"
+echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD=1"; check $? "a worker gets the Mod by default (flag unset)"
+[ "$(echo "$out" | grep -c '^SUTANDO_TASK_WATCH_MOD=')" = 1 ]; check $? "the worker marker appears once"
 out="$(worker_env SUTANDO_TASK_WATCH_MOD_WORKER=1)"
 echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD=1"; check $? "SUTANDO_TASK_WATCH_MOD_WORKER=1 marks the worker's session"
-out="$(worker_env SUTANDO_TASK_WATCH_MOD_CORE=1)"
-echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD="; check $? "the core's flag does not switch a worker"
-[ "$(echo "$out" | grep -c '^SUTANDO_TASK_WATCH_MOD=')" = 1 ]; check $? "the worker marker appears once"
+out="$(worker_env SUTANDO_TASK_WATCH_MOD_WORKER=0)"
+echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD="; check $? "SUTANDO_TASK_WATCH_MOD_WORKER=0 opts a worker out, marker explicitly empty"
+out="$(worker_env STUB_VERSION=2.1.0)"
+echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD="; check $? "a default worker keeps the Monitor below the floor"
+out="$(worker_env SUTANDO_TASK_WATCH_MOD_CORE=0)"
+echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD=1"; check $? "the core's flag does not switch a worker"
 
 # The core launcher's env probe.
 core_env() { env -i HOME="$HOME" PATH="$STUB_PATH" STUB_VERSION=9.9.9 "$@" \
@@ -91,6 +95,33 @@ out="$(core_env SUTANDO_TASK_WATCH_MOD_CORE=1)"
 echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD=1"; check $? "only SUTANDO_TASK_WATCH_MOD_CORE=1 switches the core"
 out="$(core_env SUTANDO_TASK_WATCH_MOD_CORE=1 STUB_VERSION=2.1.0)"
 echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD="; check $? "the core keeps the Monitor below the floor"
+
+# A `claude --version` that hangs, silent or after printing a version, keeps the Monitor and the
+# launch goes on within the probe's bound; the hung probe is killed, not left behind.
+mkdir -p "$TMP/hang" "$TMP/vhang"
+printf '#!/bin/sh\necho $$ > "$HOME/probe.pid"\nexec sleep 30\n' > "$TMP/hang/claude"
+printf '#!/bin/sh\necho $$ > "$HOME/probe.pid"\necho "9.9.9 (Claude Code)"\nexec sleep 30\n' > "$TMP/vhang/claude"
+chmod +x "$TMP/hang/claude" "$TMP/vhang/claude"
+bounded() {  # bounded <secs> <fn> <args...>: the fn's stdout, or exit 124 once it outlives <secs>
+  local secs="$1" i=0 pid; shift
+  "$@" > "$TMP/bounded.out" 2>/dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt $((secs * 10)) ]; do sleep 0.1; i=$((i + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return 124; fi
+  wait "$pid"; cat "$TMP/bounded.out"
+}
+for kind in hang vhang; do
+  rm -f "$HOME/probe.pid"
+  out="$(bounded 12 pane "$TMP/$kind:$TMP/bin:/usr/bin:/bin")"; r=$?
+  case "$r|$out" in "0||$TMP/$kind/claude|"*" new-session "*" $TMP/$kind/claude --name sutando-test "*)
+    case "$out" in *"--plugin-dir"*) r=1 ;; *) r=0 ;; esac ;; *) r=1 ;; esac
+  check "$r" "$kind: a hung --version probe ends in the bound, the session is created on the Monitor" "$out"
+  p="$(cat "$HOME/probe.pid" 2>/dev/null)"
+  [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; check $? "$kind: the timed-out probe is killed and reaped" "pid ${p:-none}"
+  out="$(STUB_PATH="$TMP/$kind:$STUB_PATH" bounded 12 worker_env)"; r=$?
+  [ "$r" = 0 ] && echo "$out" | grep -qx "SUTANDO_TASK_WATCH_MOD="
+  check $? "$kind: a default worker's launcher keeps the Monitor within the bound" "exit $r"
+done
 
 echo "$pass passed, $fail failed"
 [ "$fail" = "0" ]

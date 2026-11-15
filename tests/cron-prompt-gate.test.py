@@ -272,12 +272,15 @@ def main() -> int:
     check("example sync-workspace (*/30) is gated at registration",
           view["sync-workspace"]["registered_prompt"].startswith(
               f"First run `{gate_cmd} --check sync-workspace`"))
+    check("example own-pr-shepherd (hourly) is gated at registration",
+          view["own-pr-shepherd"]["registered_prompt"].startswith(
+              f"First run `{gate_cmd} --check own-pr-shepherd`"))
     for daily in ("morning-briefing", "learned-skills-scan", "example-digest"):
         check(f"example daily {daily} registers verbatim",
               view[daily]["registered_prompt"] == view[daily]["prompt"])
     check("every example entry is accounted for",
           set(view) == {"main-loop", "sync-workspace", "morning-briefing",
-                        "learned-skills-scan", "example-digest"}, sorted(view))
+                        "learned-skills-scan", "example-digest", "own-pr-shepherd"}, sorted(view))
     for name, e in view.items():
         if "health" in name or "watchdog" in name:
             check(f"example {name} opts out of the gate", e.get("gate") is False)
