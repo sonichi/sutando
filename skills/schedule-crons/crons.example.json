@@ -22,6 +22,7 @@
   },
   {
     "name": "own-pr-shepherd",
+    "opt_in": true,
     "cron": "23 * * * *",
     "prompt_skill": "own-pr-shepherd"
   },
