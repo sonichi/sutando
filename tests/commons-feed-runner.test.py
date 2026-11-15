@@ -422,9 +422,8 @@ check("a result-wrapped missing connection is connector_not_connected",
       fr.failure(run, {"result": {"error": "connect_required"}})["code"]
       == "connector_not_connected")
 
-# The operation_id: the run key plus a hash of what is written. The backend binds an
-# operation_id to the arguments it was first sent with, so a retry whose connector run
-# returned other rows must be a new operation, and an identical retry the same one.
+# The operation_id is the run key plus a hash of what is written: other rows are a new
+# operation, an identical retry the same one.
 KEY = "cron:gabc123def:1794679200000"
 ROWS_A = [{"_id": "e1", "Title": "Standup", "Start": "2026-11-09T18:30:00Z"}]
 ROWS_B = [{"_id": "e1", "Title": "Standup (moved)", "Start": "2026-11-09T19:00:00Z"}]
