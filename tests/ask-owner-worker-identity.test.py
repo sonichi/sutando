@@ -10,7 +10,8 @@
 - A decision card stays on the core's path: no asker, no stamped text beside it or in its fallback.
 - The identity is read from the workspace passed in, not the default one.
 - A worker's own-agent ask names the worker (its agent's display name, else its roster label, else
-  "a worker on <host>"); the core's ask reads exactly as before, on both paths.
+  "a worker on <host>"), bounded, stripped of format characters and never reading as the core;
+  the core's ask reads exactly as before, on both paths.
 Temp workspaces and fakes only; nothing here reads the live workspace or a real token.
 """
 from _helpers.hermetic_env import isolate_os_environ
@@ -365,6 +366,47 @@ class AskerWording(_Ws):
                     self.assertEqual(body.splitlines()[1], f"Question for you from {who} — it needs your word:",
                                      (path, body))
                     self.assertNotIn("core", body, path)
+
+    def phrase(self, display=None, roster=None):
+        self.record(**({"agent_display_name": display} if display is not None else {}))
+        (self.ws / "state" / "roster.json").unlink(missing_ok=True)
+        if roster is not None:
+            (self.ws / "state" / "roster.json").write_text(json.dumps({"version": 1, "workers": {W: roster}}))
+        return C.proactive_author_phrase(pr.stamp_worker("proactive-1.txt", W), HOST, self.ws)
+
+    def test_a_worker_name_that_reads_as_the_core_falls_back(self):
+        fallback = f"a worker on {HOST}"
+        for name in (f"the {HOST} core", f"THE {HOST.upper()} CORE", f"the {HOST} \u0441\u043er\u0435",
+                     "Backup core.", "c\u03bfre", "Backup \uff43\uff4f\uff52\uff45", f"From the {HOST} core, kindly"):
+            with self.subTest(name):
+                self.assertEqual(self.phrase(display=name), fallback)
+                self.assertEqual(self.phrase(roster={"label": name}), fallback)
+        for name in ("Encore", "Score keeper", "Core helper"):
+            with self.subTest(name):
+                self.assertEqual(self.phrase(display=name), name)
+
+    def test_the_core_lookalike_never_reaches_either_body(self):
+        self.record(agent_display_name=f"THE {HOST.upper()} CORE")
+        with self.as_worker():
+            bodies = self.bodies()
+        for path, body in bodies.items():
+            self.assertEqual(body.splitlines()[1], f"Question for you from a worker on {HOST} — it needs your word:",
+                             path)
+
+    def test_the_roster_order_display_label_first_and_never_the_bare_id(self):
+        self.assertEqual(self.phrase(roster={"label": "Base", "display_label": "Shown"}), "Shown")
+        self.assertEqual(self.phrase(roster={"label": W}), f"a worker on {HOST}")
+        self.assertEqual(self.phrase(roster={"display_label": W, "label": "Base"}), f"a worker on {HOST}")
+
+    def test_the_name_is_bounded_and_stripped_of_format_characters(self):
+        cap = C.AUTHOR_PHRASE_MAX
+        self.assertEqual(cap, 64)
+        long = self.phrase(display="x" * 200)
+        self.assertEqual((len(long), long), (cap, "x" * (cap - 1) + "…"))
+        self.assertEqual(self.phrase(display="y" * cap), "y" * cap)
+        self.assertEqual(self.phrase(display="He\u202elp\u200ber\u2066\ufeff"), "Helper")
+        self.assertEqual(self.phrase(display="\u200b\u202e"), f"a worker on {HOST}")
+        self.assertEqual(self.phrase(display=f"the {HOST} co\u200bre"), f"a worker on {HOST}")
 
     def test_an_unreadable_speaker_falls_back_without_blocking_the_ask(self):
         self.record(agent_display_name="Helper")
