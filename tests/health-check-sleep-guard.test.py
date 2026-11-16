@@ -20,6 +20,7 @@ import os
 import subprocess
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -193,6 +194,29 @@ class Ensure(unittest.TestCase):
         spawn = SpawnStub()
         self.assertTrue(sg.ensure(lambda: "", platform="linux", spawn=spawn)[0])
         self.assertEqual(spawn.calls, [])
+
+
+class Cli(unittest.TestCase):
+    """`sleep_guard.py ensure` is what startup.sh runs; its exit code picks the tick or the warning."""
+
+    def run_main(self, argv, result=None):
+        real, out = sg.ensure, io.StringIO()
+        if result is not None:
+            sg.ensure = lambda snapshot: result
+        try:
+            with unittest.mock.patch("sys.stdout", out), unittest.mock.patch("sys.stderr", io.StringIO()):
+                return sg.main(argv), out.getvalue()
+        finally:
+            sg.ensure = real
+
+    def test_exit_code_follows_ensure(self):
+        self.assertEqual(self.run_main(["sleep_guard.py", "ensure"], (True, "caffeinate -s already running")),
+                         (0, "caffeinate -s already running\n"))
+        self.assertEqual(self.run_main(["sleep_guard.py", "ensure"], (False, "caffeinate did not start (x)"))[0], 1)
+
+    def test_bad_usage(self):
+        self.assertEqual(self.run_main(["sleep_guard.py"])[0], 2)
+        self.assertEqual(self.run_main(["sleep_guard.py", "start"])[0], 2)
 
 
 if __name__ == "__main__":
