@@ -65,6 +65,8 @@
   primary                      the primary row's instance ('' = the legacy bridge); exit 2 when none
   enabled                      each row a bridge serves (neither disabled nor parked), one instance per
                                line ('' = the legacy bridge); exit 1 when there is none
+  bridge-pid [INSTANCE]        the pid proven to hold that bridge's lease ('' = the legacy bridge);
+                               nothing when none runs; exit 3 when the lease proves neither
 
 Each verb parses, calls one unit and prints; policy lives in the module.
 """
@@ -312,6 +314,19 @@ def cmd_primary(args) -> int:
     return 0
 
 
+def cmd_bridge_pid(args) -> int:
+    """Print the pid proven to hold the instance's bridge lease; nothing when none runs, exit 3 when
+    the lease proves neither (`connections.bridge_pid`). A caller may signal only a printed pid."""
+    try:
+        pid = connections.bridge_pid(args.instance, args.workspace)
+    except connections.BridgeLeaseIndeterminate as e:
+        print(f"connections: {e}", file=sys.stderr)
+        return 3
+    if pid:
+        print(pid)
+    return 0
+
+
 def cmd_enabled(args) -> int:
     rows = connections.enabled_rows(args.workspace)
     for r in rows:
@@ -409,6 +424,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_worker_mcp_credential_argv)
     sub.add_parser("primary").set_defaults(fn=cmd_primary)
     sub.add_parser("enabled").set_defaults(fn=cmd_enabled)
+    s = sub.add_parser("bridge-pid"); s.add_argument("instance", nargs="?", default="")
+    s.set_defaults(fn=cmd_bridge_pid)
     return p
 
 
