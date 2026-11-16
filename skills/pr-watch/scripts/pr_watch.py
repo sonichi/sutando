@@ -17,7 +17,8 @@ Subcommands:
 
 `run` prints `PR_WATCH_PROMPT_TEMPLATE <json>` on start and on SIGHUP, one `PR_EVENT ...` line per
 relevant event (upserting that PR's row in tracker.json), and `PR_WATCH_NOTE ...` lines for problems
-the session should see. `track` prints `PR_WATCH_PUBLISH ...` when the session must publish the page
+the session should see. With PR_WATCH_ROUTE_CMD set, an event that command hands off is noted
+instead of printed as a `PR_EVENT`. `track` prints `PR_WATCH_PUBLISH ...` when the session must publish the page
 itself (PR_WATCH_TRACKER_PUBLISH=session, or the CLI publish failed). State lives in
 <workspace>/state/pr-watch/, never in the mod folder. Settings: manifest.json `config`, read as
 CLI > env > manifest > config.json. Standard library only, plus `gh` with cli/gh-webhook.
@@ -31,6 +32,7 @@ import html
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -55,7 +57,7 @@ def _is_state_copy(here: Path) -> bool:
 MANIFEST = (Path(__file__).resolve().parent / "manifest.json" if _is_state_copy(Path(__file__).resolve().parent)
             else SKILL_DIR / "manifest.json")
 SETTINGS = ("PR_WATCH_PROMPT", "PR_WATCH_TRACKER_ROOM", "PR_WATCH_TRACKER_TITLE", "PR_WATCH_COMMONS_SCRIPT",
-            "PR_WATCH_TRACKER_PUBLISH")
+            "PR_WATCH_TRACKER_PUBLISH", "PR_WATCH_ROUTE_CMD")
 TEMPLATE_MARK = "PR_WATCH_PROMPT_TEMPLATE "
 NOTE_MARK = "PR_WATCH_NOTE "
 PUBLISH_MARK = "PR_WATCH_PUBLISH "
@@ -83,6 +85,9 @@ LOCK_WAIT_S = 20
 RUNNER_GH_TIMEOUT_S = 10
 SHUTDOWN_CLEANUP_S = 10
 TERMINATE_WAIT_S = 2
+ROUTE_TIMEOUT_S = 15
+ROUTE_DEDUPE_S = 60
+HANDED_RE = re.compile(r"^handed (\S{1,80})$")
 MAX_TAIL = 16 * 1024 * 1024
 # Generated per install, or by Claude Code when it loads the mod.
 SKIP_IN_MOD = ("node_modules", "tsconfig.json", ".claude-plugin/types", "hooks/paths.ts")
@@ -631,6 +636,8 @@ class Runner:
         self.wake_cond = threading.Condition()
         self.wake_gen = 0
         self.backoff_lock = threading.Lock()
+        self.route_lock = threading.Lock()
+        self.routed: Dict[str, Tuple[float, bool]] = {}
 
     def _start_thread(self, target, *args) -> Optional[threading.Thread]:
         with self.procs_lock, self.thread_lock:
@@ -689,7 +696,10 @@ class Runner:
             self.process_groups.discard(proc)
 
     def _gh(self, args: List[str], check=False, timeout=None, *, cleanup=False):
-        proc = self._spawn(["gh"] + args, cleanup=cleanup)
+        return self._run(["gh"] + args, args, check=check, timeout=timeout, cleanup=cleanup)
+
+    def _run(self, argv: List[str], args: List[str], check=False, timeout=None, *, cleanup=False):
+        proc = self._spawn(argv, cleanup=cleanup)
         if proc is None:
             return subprocess.CompletedProcess(args, 130, "", "pr-watch stopped")
         try:
@@ -810,7 +820,7 @@ class Runner:
                 line = classify(payload, watches, self.reviewed)
                 if line:
                     self.track_row(payload)
-                    self.emit(line)
+                    self.deliver(line, payload)
         proc.wait()
         with self.procs_lock:
             self._retire_group_locked(proc)
@@ -829,6 +839,50 @@ class Runner:
             return self.back_off(repo, f"GitHub refused a second forwarder ({HOOK_EXISTS})",
                                  f"{repo}: GitHub refused a second forwarder ({HOOK_EXISTS}); retrying later")
         return RESTART_DELAY_S
+
+    def deliver(self, line: str, payload: dict) -> None:
+        """Print the event for this session, unless the route command hands it to someone else."""
+        handed = self.route(line, payload)
+        if handed is None:
+            self.emit(line)
+        elif handed:
+            self.note(f"handed to {_safe(handed)}: {line}")
+
+    def route(self, line: str, payload: dict) -> Optional[str]:
+        """The recipient PR_WATCH_ROUTE_CMD handed `line` to, "" for a repeat already handed, None for local.
+
+        Fails open: no command, a failure, a timeout or any other answer keeps the event here."""
+        cmd = setting("PR_WATCH_ROUTE_CMD", st=self.st)
+        if not cmd:
+            return None
+        now = time.monotonic()
+        with self.route_lock:
+            self.routed = {k: v for k, v in self.routed.items() if now - v[0] < ROUTE_DEDUPE_S}
+            if line in self.routed:
+                return "" if self.routed[line][1] else None
+        try:
+            argv = shlex.split(cmd)
+        except ValueError as exc:
+            self.note(f"PR_WATCH_ROUTE_CMD is not a command line ({exc}); kept the event here")
+            return None
+        pr = payload.get("pull_request") or {}
+        repo = (payload.get("repository") or {}).get("full_name") or ""
+        args = ["--event", line, "--repo", repo, "--number", str(pr.get("number") or ""),
+                "--head", str((pr.get("head") or {}).get("sha") or ""),
+                "--cache-dir", str(self.st.root / "route")]
+        try:
+            r = self._run(argv + args, argv + args, timeout=ROUTE_TIMEOUT_S)
+        except OSError as exc:
+            self.note(f"route command did not start ({str(exc)[:200]}); kept the event here")
+            return None
+        lines = (r.stdout or "").strip().splitlines()
+        m = HANDED_RE.match(lines[-1].strip()) if lines and r.returncode == 0 else None
+        if r.returncode != 0:
+            why = "timed out" if r.returncode == 124 else f"exited {r.returncode}"
+            self.note(f"route command {why}; kept the event here")
+        with self.route_lock:
+            self.routed[line] = (now, m is not None)
+        return m.group(1) if m else None
 
     def track_row(self, payload: dict) -> None:
         try:

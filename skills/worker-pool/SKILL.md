@@ -29,6 +29,7 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `pool_delivery.py` — a recipient's own folder: sentinels in, accept, release, done flags, and the owner's `hand_off_to_core`.
 - `pool_ask.py` — ask another instance a question through the front door (below).
 - `pool_handoff.py` — `pool_ask` over s.space to a worker with its own agent, behind a flag (below).
+- `pool_pr_route.py` — pr-watch's `PR_WATCH_ROUTE_CMD`: hands a PR event to the worker driving that PR (below).
 - `pool_sessions.py` — read-only: which worker tmux sessions a viewer could attach, and the exact-match argv for each. Adds no state and nothing in the pool calls it; it exists for the desktop app's terminal picker. It deliberately does not describe the core, whose socket resolution belongs to the app.
 
 ```bash
@@ -388,6 +389,22 @@ python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|
   never be relayed as your own: the tier must say where the question came from, not who ran
   the script.
 - Refused, never guessed: an unknown name, a name shared by recipients, and asking yourself.
+
+### PR events to the worker that drives the PR
+
+Every worker pushes as the same GitHub login, so the one pr-watch runner on a host cannot tell
+whose PR an event is. `pool_pr_route.py` is its route command: it reads the PR's commits (one
+`gh api` call per head, cached), takes the newest `Sutando-Task:` trailer, and looks the task's
+worker up in `state/attribution/<task id>`. A worker other than the watching session gets a
+`pool_ask` carrying only the event line and the standing ask (read the PR, act on it, tell the
+owner only if it needs them), and the script prints `handed <worker id>`. No trailer, no
+attribution, the watching session itself (`$SUTANDO_INSTANCE_ID`, else the core) or a failed ask
+prints `local`, and the watcher keeps the event. On, on the host running the pr-watch runner:
+
+```bash
+python3 skills/pr-watch/scripts/pr_watch.py config set PR_WATCH_ROUTE_CMD \
+  "python3 $PWD/skills/worker-pool/scripts/pool_pr_route.py"
+```
 
 ### Over s.space, to a worker with its own agent (flag, off by default)
 
