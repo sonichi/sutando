@@ -2270,9 +2270,9 @@ def _reads_as_core(phrase: str, host: str) -> bool:
 
 def proactive_author_phrase(name, host: str, workspace: Optional[Path] = None) -> str:
     """Who a proactive file named `name` speaks as, for its text: "the <host> core" for an unstamped
-    name; for a worker's stamped one, its own agent's display name, else its roster label, else
-    "a worker on <host>". A worker's name is stripped of format characters, bounded, and never
-    allowed to read as the core (it equals or ends with "core", or holds the core's phrase)."""
+    name; for a worker's stamped one, "<name> (a worker on <host>)" with its own agent's display name,
+    else its roster label, else just "a worker on <host>". The name is stripped of format characters
+    and bounded; one that reads as the core (ends with "core", or holds the core's phrase) is dropped."""
     from proactive_routing import proactive_worker
     worker = proactive_worker(name)
     if not worker:
@@ -2288,7 +2288,7 @@ def proactive_author_phrase(name, host: str, workspace: Optional[Path] = None) -
     if len(label) > AUTHOR_PHRASE_MAX:
         label = label[:AUTHOR_PHRASE_MAX - 1].rstrip() + "…"
     fallback = f"a worker on {host}"
-    return fallback if not label or _reads_as_core(label, host) else label
+    return fallback if not label or _reads_as_core(label, host) else f"{label} ({fallback})"
 
 
 def worker_mcp_credential(worker: str, *, workspace: Optional[Path] = None,

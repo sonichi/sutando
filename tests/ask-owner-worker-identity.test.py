@@ -9,9 +9,9 @@
 - The question records who asked (the worker's agent id when stamped) in the outbox and the row.
 - A decision card stays on the core's path: no asker, no stamped text beside it or in its fallback.
 - The identity is read from the workspace passed in, not the default one.
-- A worker's own-agent ask names the worker (its agent's display name, else its roster label, else
-  "a worker on <host>"), bounded, stripped of format characters and never reading as the core;
-  the core's ask reads exactly as before, on both paths.
+- A worker's own-agent ask names the worker as "<name> (a worker on <host>)" (its agent's display
+  name, else its roster label), else just "a worker on <host>"; the name is bounded, stripped of
+  format characters, and dropped if it reads as the core. The core's ask reads exactly as before.
 Temp workspaces and fakes only; nothing here reads the live workspace or a real token.
 """
 from _helpers.hermetic_env import isolate_os_environ
@@ -351,8 +351,8 @@ class AskerWording(_Ws):
             self.assertEqual(body.splitlines()[1], self.CORE_LEAD, label)
 
     def test_a_worker_with_its_own_agent_names_itself_not_the_core(self):
-        cases = (("display name", {"agent_display_name": "Helper"}, "Docs bee", "Helper"),
-                 ("roster label", {}, "Docs bee", "Docs bee"),
+        cases = (("display name", {"agent_display_name": "Helper"}, "Docs bee", f"Helper (a worker on {HOST})"),
+                 ("roster label", {}, "Docs bee", f"Docs bee (a worker on {HOST})"),
                  ("neither", {}, None, f"a worker on {HOST}"))
         for label, extra, roster_label, who in cases:
             with self.subTest(label):
@@ -383,7 +383,7 @@ class AskerWording(_Ws):
                 self.assertEqual(self.phrase(roster={"label": name}), fallback)
         for name in ("Encore", "Score keeper", "Core helper"):
             with self.subTest(name):
-                self.assertEqual(self.phrase(display=name), name)
+                self.assertEqual(self.phrase(display=name), f"{name} (a worker on {HOST})")
 
     def test_the_core_lookalike_never_reaches_either_body(self):
         self.record(agent_display_name=f"THE {HOST.upper()} CORE")
@@ -393,18 +393,33 @@ class AskerWording(_Ws):
             self.assertEqual(body.splitlines()[1], f"Question for you from a worker on {HOST} — it needs your word:",
                              path)
 
+    def test_a_worker_name_never_stands_alone_so_no_probe_reads_as_the_core(self):
+        for name in ("\u03f2ore", "c\u0585re", "\u1d04ore", f"{HOST} core (main)", "core team", "c0re",
+                     f"the {HOST} core"):
+            with self.subTest(name):
+                self.record(agent_display_name=name)
+                with self.as_worker():
+                    bodies = self.bodies()
+                for path, body in bodies.items():
+                    lead = body.splitlines()[1]
+                    self.assertNotEqual(lead, self.CORE_LEAD, path)
+                    self.assertIn(f"a worker on {HOST}", lead, path)
+                    self.assertTrue(lead.endswith(" — it needs your word:"), lead)
+                    if name != f"the {HOST} core":
+                        self.assertIn(f"(a worker on {HOST}) — it needs your word:", lead, path)
+
     def test_the_roster_order_display_label_first_and_never_the_bare_id(self):
-        self.assertEqual(self.phrase(roster={"label": "Base", "display_label": "Shown"}), "Shown")
+        self.assertEqual(self.phrase(roster={"label": "Base", "display_label": "Shown"}), f"Shown (a worker on {HOST})")
         self.assertEqual(self.phrase(roster={"label": W}), f"a worker on {HOST}")
         self.assertEqual(self.phrase(roster={"display_label": W, "label": "Base"}), f"a worker on {HOST}")
 
     def test_the_name_is_bounded_and_stripped_of_format_characters(self):
         cap = C.AUTHOR_PHRASE_MAX
         self.assertEqual(cap, 64)
-        long = self.phrase(display="x" * 200)
-        self.assertEqual((len(long), long), (cap, "x" * (cap - 1) + "…"))
-        self.assertEqual(self.phrase(display="y" * cap), "y" * cap)
-        self.assertEqual(self.phrase(display="He\u202elp\u200ber\u2066\ufeff"), "Helper")
+        tail = f" (a worker on {HOST})"
+        self.assertEqual(self.phrase(display="x" * 200), "x" * (cap - 1) + "…" + tail)
+        self.assertEqual(self.phrase(display="y" * cap), "y" * cap + tail)
+        self.assertEqual(self.phrase(display="He\u202elp\u200ber\u2066\ufeff"), "Helper" + tail)
         self.assertEqual(self.phrase(display="\u200b\u202e"), f"a worker on {HOST}")
         self.assertEqual(self.phrase(display=f"the {HOST} co\u200bre"), f"a worker on {HOST}")
 

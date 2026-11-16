@@ -614,9 +614,9 @@ it. `scripts/ask-owner.py` and the pending-questions skill name their text ask t
 helper (`result_publish.worker_published_path`), so a worker asks the owner as its own agent, and
 the question records that agent (`asked_by`, the row's `Asked by`, via
 `connections.proactive_author_agent`). Its text names that worker, not the core
-(`connections.proactive_author_phrase`: the agent's display name, else the worker's roster label,
-else "a worker on <host>"; a name that reads as the core falls back to that too, and it is bounded
-and stripped of format characters). A decision card stays the core's: only a core lane issues
+(`connections.proactive_author_phrase`: "<name> (a worker on <host>)", with the agent's display
+name, else the worker's roster label; else just "a worker on <host>". The name never stands alone;
+it is bounded and stripped of format characters, and one that reads as the core is dropped). A decision card stays the core's: only a core lane issues
 and verifies cards, so a question asked by card records no asker, and its fallback text, if the
 card cannot be stored, is the core's too. A skill writing a proactive file itself still publishes
 the name it gives.
