@@ -71,7 +71,8 @@ checkout changes branch or updates. Re-run it after updating this skill.
 
 Loading the mod is the owner's one step: **enable hot reload of the mods folder in the
 session's terminal** (one click), or start the session with `claude --plugin-dir <mods-dir>/pr-watch`.
-Never enable it for them.
+Never enable it for them. For a pool worker, the other owner-approved way is to record it on that
+worker when the owner says so: `pool_manage.py plugins <worker> add <mods-dir>/pr-watch` (worker-pool skill).
 
 Other commands:
 
@@ -231,7 +232,9 @@ HTML-escaped and only `http(s)` links become links. Run `track` from a checkout:
 5. **Lifetime.** The runner lives as long as the mod's module: a reload or session end kills it,
    and the next `session.start` respawns it. One runner per state dir (a lock); a second exits.
    If the runner exits on its own it is restarted after 30 s, except for a missing extension or
-   a held lock.
+   a held lock. A normal stop drains its repository and helper threads before releasing the
+   lock; runner-owned GitHub calls are cancellable and time bounded. See
+   [the shutdown contract](../../docs/pr-watch-lifecycle.md).
 6. **Events while no session runs are lost.** `gh webhook forward` does not replay; after a gap,
    check the watched PRs once by hand.
 

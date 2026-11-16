@@ -1,0 +1,11 @@
+{
+  "name": "commons-feed-runner",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "Refresh the Room Commons connector feeds an owner granted their agent (C4 E4): find the due grants, run each one's single read-only connector query, project to the granted fields, and write through room.commons.feeds.write.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}

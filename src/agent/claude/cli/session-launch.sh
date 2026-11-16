@@ -68,6 +68,25 @@ claude_named_pids() {
       *" --name $SESSION "*|*" --name=$SESSION "*) echo "$pid" ;;
     esac
   done
+  claude_session_unnamed_pids
+}
+
+# Claude processes without --name hosted in a pane of $SESSION (pane pid or a child):
+# the CLI re-execs mid-life as `claude.exe --resume <id>`, dropping --name.
+claude_session_unnamed_pids() {
+  command -v tmux > /dev/null 2>&1 || return 0
+  local pane pid args prog
+  for pane in $(tmux -S "$TMUX_SOCKET" list-panes -s -t "=$SESSION" -F '#{pane_pid}' 2>/dev/null); do
+    for pid in "$pane" $(pgrep -P "$pane" 2>/dev/null); do
+      args="$(ps -p "$pid" -o args= 2>/dev/null)" || continue
+      # Program path up to the first flag: an install path may contain spaces.
+      prog="${args%% -*}"
+      case "${prog##*/}" in claude|claude.exe) ;; *) continue ;; esac
+      case " $args " in *" --name "*|*" --name="*) continue ;; esac
+      echo "$pid"
+    done
+  done
+  return 0
 }
 
 claude_named_process_running() {
@@ -360,24 +379,35 @@ claude_version_at_least() {
   return 0
 }
 
+# Prints the first word of `$1 --version`; a probe still running after ~5s prints nothing and is
+# killed and reaped. A file, not a pipe, so a hung probe's open stdout cannot hold the caller.
+claude_probe_version() {
+  local out pid i=0
+  out="$(mktemp "${TMPDIR:-/tmp}/claude-version.XXXXXX")" || return 0
+  "$1" --version >"$out" 2>/dev/null </dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null; sleep 0.2; kill -KILL "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+  else
+    wait "$pid" 2>/dev/null
+    awk 'NR==1 {print $1}' "$out"
+  fi
+  rm -f "$out"
+}
+
 # With $1 = "1": --plugin-dir for the task-watch Mod and TASK_WATCH_MOD=1, gated on CLAUDE_BIN,
 # the claude the session's PATH resolves, which the launch then runs. Reads REPO.
 add_task_watch_mod() {
   TASK_WATCH_MOD=""
   CLAUDE_BIN=""
   [ "${1:-}" = "1" ] || return 0
-  local dir="$REPO/src/agent/claude/task-watch-mod" min have out
+  local dir="$REPO/src/agent/claude/task-watch-mod" min have
   CLAUDE_BIN="$(PATH="$(claude_pane_path)"; hash -r; command -v claude 2>/dev/null)" || CLAUDE_BIN=""
   case "$CLAUDE_BIN" in /*) ;; *) CLAUDE_BIN="" ;; esac
   min="$(sed -n "s/^export const MIN_CLAUDE_VERSION = '\([0-9.]*\)'.*/\1/p" "$dir/hooks/version.ts" 2>/dev/null)" || min=""
-  # A missing, silent or hung claude must neither end a `set -e` launcher nor stall it: all mean "keep the Monitor".
-  # Read from a file, not a pipe: a killed claude's own children could hold a pipe open.
-  have=""
-  if [ -n "$CLAUDE_BIN" ] && out="$(mktemp "${TMPDIR:-/tmp}/claude-version.XXXXXX")"; then
-    ( . "$REPO/src/bounded-wait.sh"; run_bounded 5 -- "$CLAUDE_BIN" --version </dev/null >"$out" 2>/dev/null ) || true
-    have="$(awk 'NR==1 {print $1}' "$out" 2>/dev/null)" || have=""
-    rm -f "$out"
-  fi
+  have="$([ -n "$CLAUDE_BIN" ] && claude_probe_version "$CLAUDE_BIN")" || have=""
   if [ -z "$min" ] || [ -z "$have" ] || ! claude_version_at_least "$have" "$min"; then
     echo "task-watch Mod: Claude Code ${have:-unknown} is not at least ${min:-unknown}; this session keeps the Monitor watcher" >&2
     return 0

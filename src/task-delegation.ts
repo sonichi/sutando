@@ -28,11 +28,11 @@
  * read / archive), so the same watcher semantics run over either backend.
  */
 
-import { writeFileSync, readdirSync, readFileSync, accessSync, constants, mkdirSync, existsSync } from 'node:fs';
+import { writeFileSync, readdirSync, readFileSync, accessSync, constants, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
-import { findRepoRoot } from './sutando_config.js';
+import { repoSrcScriptPath } from './sutando_config.js';
 import { tryStampText } from './task_envelope.js';
 
 function ts(): string { return new Date().toISOString().slice(11, 23); }
@@ -50,12 +50,7 @@ function ts(): string { return new Date().toISOString().slice(11, 23); }
 // src/*.py travel as a SIBLING of dist/ (same defect class as the
 // screen-capture-server path, field report 2026-08-14). Module-sibling stays
 // as the dev fallback; the fire-and-forget execFile tolerates a miss either way.
-const _TELEMETRY_PY = (() => {
-	const moduleDir = dirname(fileURLToPath(import.meta.url));
-	const root = findRepoRoot(moduleDir);
-	const canonical = root ? join(root, 'src', 'telemetry.py') : null;
-	return canonical && existsSync(canonical) ? canonical : join(moduleDir, 'telemetry.py');
-})();
+const _TELEMETRY_PY = repoSrcScriptPath('telemetry.py', dirname(fileURLToPath(import.meta.url)));
 /** Read the coarse surface bucket from a task file's own `source:` header —
  * `voice` / `chat` / `context-drop` / … — falling back to `unknown` when the
  * header is absent. Pure + exported so the tag is unit-tested without spawning. */

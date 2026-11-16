@@ -36,6 +36,7 @@ const DEPS = {
 		safeContext: 'Owner said: anchor line',
 		repoUrl: 'https://github.com/sonichi/sutando',
 		standIdentityJson: '{"name":"AnchorStand"}',
+		agentName: 'Display Name X',
 		now: new Date('2026-07-07T12:00:00Z'),
 	},
 };
@@ -51,6 +52,13 @@ const VARIANTS: Record<string, Parameters<typeof cfg.buildPhoneInstructions>[0]>
 	outbound_owner: { ...base, isOwner: true, purpose: 'remind about the meeting' },
 	outbound_owner_no_search: { ...base, isOwner: true, purpose: 'remind about the meeting' },
 };
+
+// The fixture holds the prompts as they read before the display name: restoring the old names must
+// give them back byte for byte, so the name is the only thing that changed.
+const SHOWN = 'Display Name X';
+function asBefore(text: string): string {
+	return text.replace(`say "I'm ${SHOWN}."`, 'say "I\'m Sutando — AnchorStand."').split(SHOWN).join('Sutando');
+}
 
 const outputs: Record<string, string> = {};
 for (const [name, session] of Object.entries(VARIANTS)) {
@@ -70,7 +78,7 @@ function region(startMarker: string, endMarker: string): string {
 const anchors = {
 	note: 'Step-5b phone anchors (post-extraction: real factory output across the call-variant matrix). Deliberate prompt changes regenerate via ANCHOR_UPDATE=1 with the diff called out.',
 	variant_hashes: Object.fromEntries(Object.entries(outputs).map(
-		([k, v]) => [k, createHash('sha256').update(v).digest('hex')])),
+		([k, v]) => [k, createHash('sha256').update(asBefore(v)).digest('hex')])),
 	regions: {
 		try_fast_path: createHash('sha256').update(
 			region('function tryFastPath(callSession: CallSession, task: string):',
@@ -103,6 +111,46 @@ test('variant semantics: the tuned conditionals land correctly', () => {
 	assert.ok(outputs.outbound_owner.includes('You are calling your owner AnchorOwner.'));
 	assert.ok(outputs.outbound_owner.includes('Owner-local time: '));
 	assert.ok(!outputs.inbound_verified.includes('## Tools'), 'owner-only sections stay owner-only');
+});
+
+test('spoken introductions use the display name; role lines and the meeting menu keep Sutando', () => {
+	assert.ok(outputs.inbound_owner.includes(`Say exactly: "Hi, this is ${SHOWN}. How can I help?"`));
+	assert.ok(outputs.inbound_owner.includes(`When asked your name, say "I'm ${SHOWN}."`));
+	assert.ok(outputs.inbound_verified.includes(`Say "Hello, this is ${SHOWN}. How can I help?"`));
+	assert.ok(outputs.inbound_unverified.includes(`Greet them with "Hello, this is ${SHOWN}. How can I help?"`));
+	assert.ok(outputs.child_call.includes(`When the person picks up, introduce yourself as ${SHOWN}.`));
+	assert.ok(outputs.child_call.includes('You are Sutando — NOT the person you are calling.'), 'role line kept');
+	assert.ok(outputs.inbound_owner.includes('YOU are Sutando — the AI assistant.'), 'role line kept');
+	for (const name of ['meeting_verified', 'meeting_unverified']) {
+		assert.ok(!outputs[name].includes(SHOWN), name);
+		assert.ok(outputs[name].includes('announce yourself briefly as "Sutando"'), 'meeting menu kept');
+	}
+	for (const [name, text] of Object.entries(outputs)) {
+		assert.ok(!/this is Sutando|introduce yourself as Sutando|I'm Sutando/.test(text), name);
+	}
+});
+
+test('the name answer is given with or without a Stand name; only the Stand line is gated', () => {
+	for (const [standIdentityJson, named] of [['{}', false], ['not json', false], ['{"name":"AnchorStand"}', true]] as const) {
+		for (const variant of ['inbound_owner', 'inbound_verified', 'inbound_unverified', 'outbound_owner'] as const) {
+			const deps = { ...DEPS, overrides: { ...DEPS.overrides, standIdentityJson } };
+			const text = cfg.buildPhoneInstructions(VARIANTS[variant], deps);
+			assert.ok(text.includes(`When asked your name, say "I'm ${SHOWN}."`), `${variant} ${standIdentityJson}`);
+			assert.strictEqual(text.includes('Your Stand name is AnchorStand.'), named, `${variant} ${standIdentityJson}`);
+			assert.strictEqual(text.includes('Your Stand name is'), named, `${variant} ${standIdentityJson}`);
+		}
+	}
+});
+
+test('the call greeting speaks the display name, and the server uses it', () => {
+	const pinned = { agentName: SHOWN };
+	assert.strictEqual(cfg.buildCallGreeting({ isMeeting: false, purpose: null }, pinned),
+		`[Speak this greeting to the caller now]: Hi, this is ${SHOWN}. How can I help?`);
+	assert.strictEqual(cfg.buildCallGreeting({ isMeeting: false, purpose: 'book a table' }, pinned),
+		`[Speak this greeting to the caller now]: Hi, this is ${SHOWN} calling.`);
+	assert.strictEqual(cfg.buildCallGreeting({ isMeeting: true, purpose: null }, pinned), '');
+	assert.ok(cs.includes('greeting: buildCallGreeting(callSession),'));
+	assert.ok(!cs.includes('Hi, this is Sutando'));
 });
 
 test('tryFastPath tripwire unchanged', () => {

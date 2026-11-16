@@ -332,6 +332,7 @@ from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import has_skip_action
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
+from . import deleted_binding
 from . import result_labels
 from .proactive_routing import (PROACTIVE_OUTBOX_DIRNAME, about_task, about_task_ts, proactive_filename,
                                 proactive_item_id)
@@ -344,12 +345,13 @@ from .outbox import dispatch_unsettled, record_provider_ref, released_by_operato
 from .outbox import RetrySchedule, delivered_body_differs, effective_item_id, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome, withdraw_unsent
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
-from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS
+from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, ROOM_REFUSAL_ATTEMPTS
 from .delivery_core import (WITHDRAWN, DeliveryCore, DesignAClaimBackend, DrainStatus,
                             ProviderRefused, RetryPolicy)
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
 from .delivery_core import is_refused_for_good
-from .delivery_core.provider_ag2space import AG2SpaceRoomMessageProvider, room_response_refused
+from .delivery_core.provider_ag2space import (AG2SpaceRoomMessageProvider, room_refused_sender,
+                                              room_response_refused)
 from .delivery_core.provider_ag2space import (AG2SpaceResultProvider, RESULT_THREAD_ASK,
                                               RESULT_THREAD_FIELD)
 from .result_ready import (identity_of, read_ready_result, read_ready_result_with_identity,
@@ -390,6 +392,8 @@ UI_ORIGIN_NOTE = (
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 _WITHHELD_TASK_OUTPUT: "dict[tuple, tuple]" = {}
+# review id -> (sends the review room refused, monotonic time the next send is due).
+_REVIEW_ROOM_REFUSALS: "dict[str, tuple[int, float]]" = {}
 _WITHHELD_DM_CACHE = _STATE / "withheld-review-dm.json"
 _WITHHELD_CONTROL_DIR = _STATE / "withheld-review-control-results"
 _GATEWAY_OWNER_DM_HINT = ""
@@ -815,6 +819,35 @@ def _owner_review_dm(owner: str) -> str:
     return room
 
 
+def _forget_review_room() -> None:
+    """Unmark the cached review room as private, so the next review opens a new one."""
+    cached = _read_private_json(_WITHHELD_DM_CACHE)
+    if cached and cached.get("private") is True:
+        _atomic_private_json(_WITHHELD_DM_CACHE, {**cached, "private": False})
+
+
+def _reroute_refused_review(artifact: Path, verdict, refused: int):
+    """After the review room refused the agent ROOM_REFUSAL_ATTEMPTS times, send the same review once
+    to a new private room. -> the verdict to settle on, or None to leave the result for the next pass."""
+    try:
+        _forget_review_room()
+        if _route_withheld_review(artifact):
+            _log(f"withheld review {artifact.stem}: the review room refused the agent {refused} times "
+                 "(HTTP 403, not in the room); sent to a new private review room")
+            return verdict
+        return None
+    except Exception as exc:  # noqa: BLE001 - runs inside the caller's except clause, past its catch-all
+        if not (isinstance(exc, urllib.error.HTTPError) and room_refused_sender(exc)):
+            _log(f"withheld review {artifact.stem}: the re-route to a new private review room failed: "
+                 f"{diagnostics.describe(exc)}; retried on the next pass")
+            return None
+    _log(f"withheld review {artifact.stem}: DROPPED, not delivered to the owner: the review room and a new "
+         f"one both refused the agent (HTTP 403, not in the room); the record stays at {artifact}")
+    return verdict._replace(reason=(
+        f"{verdict.reason}; owner review {artifact.stem} dropped: every private review room refused "
+        f"the agent; the record stays at {artifact}"))
+
+
 def _review_messages(record: dict) -> list[str]:
     rid = str(record.get("review_id") or "")
     context = record.get("context") or {}
@@ -1205,8 +1238,33 @@ def _settlement_record(directory: Path, review_id: str) -> "dict | None":
     return {}
 
 
+# Set before the exec by an adapter whose RESULTS_DIR sits in the workspace this command prints.
+_WORKSPACE_RESOLVER: str = globals().get("_SUTANDO_WORKSPACE_RESOLVER") or ""
+
+
+def _shell_root(root) -> str:
+    """`root` as a logged command names it: behind the workspace resolver, else `$HOME`, so the log
+    carries no home path. Run from the engine checkout, as `src/outbox_cli.py` already requires."""
+    root = Path(root)
+    bases = ([(RESULTS_DIR.parent, f'"$({_WORKSPACE_RESOLVER})"')] if _WORKSPACE_RESOLVER else []) + [
+        (Path.home(), '"$HOME"')]
+    for base, prefix in bases:
+        try:
+            rel = root.relative_to(base)
+        except ValueError:
+            continue
+        return prefix if rel == Path(".") else f"{prefix}/{shlex.quote(rel.as_posix())}"
+    return shlex.quote(str(root))
+
+
+def _outbox_cli_command(root, *args: str, program: str = "python3 src/outbox_cli.py",
+                        results_dir=None) -> str:
+    tail = f" --results-dir {_shell_root(results_dir)}" if results_dir is not None else ""
+    return f"{program} --root {_shell_root(root)} {shlex.join(args)}{tail}"
+
+
 def _requeue_command(root, item_id: str) -> str:
-    return shlex.join(["python3", "src/outbox_cli.py", "--root", str(root), "requeue", item_id])
+    return _outbox_cli_command(root, "requeue", item_id)
 
 
 def _reread_record(path: Path) -> dict:
@@ -1771,9 +1829,25 @@ def _guarded_result_body(tid: str, body: str):
         artifact = review_artifact(_STATE, tid, body)
         if not artifact.is_file():
             return None, verdict.reason
+        refused, due = _REVIEW_ROOM_REFUSALS.get(artifact.stem, (0, 0.0))
+        if time.monotonic() < due:
+            return None, f"{verdict.reason}; private review room refused the agent, next send not due yet"
         try:
             if not _route_withheld_review(artifact):
                 return None, f"{verdict.reason}; private owner review unavailable"
+            _REVIEW_ROOM_REFUSALS.pop(artifact.stem, None)
+        except urllib.error.HTTPError as exc:
+            if not room_refused_sender(exc):
+                return None, f"{verdict.reason}; private owner review failed: {diagnostics.describe(exc)}"
+            refused += 1
+            if refused < ROOM_REFUSAL_ATTEMPTS:  # a join may still be landing: 2 s doubling, as the outbox
+                _REVIEW_ROOM_REFUSALS[artifact.stem] = (refused, time.monotonic() + 2.0 * 2 ** (refused - 1))
+                return None, (f"{verdict.reason}; private review room refused the agent "
+                              f"(send {refused}/{ROOM_REFUSAL_ATTEMPTS})")
+            _REVIEW_ROOM_REFUSALS.pop(artifact.stem, None)
+            verdict = _reroute_refused_review(artifact, verdict, refused)
+            if verdict is None:
+                return None, "private owner review failed in its new room; retried on the next pass"
         except Exception as exc:  # noqa: BLE001 — retain result file for retry
             return None, f"{verdict.reason}; private owner review failed: {diagnostics.describe(exc)}"
     result = (verdict.body, verdict.reason)
@@ -1914,7 +1988,7 @@ def _project_hitl(log=print) -> int:
             f"{projector.PROJECTION_MAX_REFUSALS}; retrying it in {delay:g}s")
     for req_id, revision, error in gave_up:
         log(f"hitl: card {req_id} could not be projected at revision {revision}: refused "
-            f"{projector.PROJECTION_MAX_REFUSALS} times ({error}); no further retries for this "
+            f"({error}); no further retries for this "
             f"revision, health-check reports it")
     if failed:
         _hitl_backoff_bump(log)  # a refusing or raising sender
@@ -2572,6 +2646,8 @@ REENROLL_ENABLED = str(os.environ.get("REMOTE_REENROLL", "1")).strip().lower() \
 REENROLL_PROBE_EVERY = max(1, int(os.environ.get("REMOTE_REENROLL_PROBE_EVERY") or "2"))
 REENROLL_CLAIM_RETRY_S = int(os.environ.get("REMOTE_REENROLL_CLAIM_RETRY_S") or "600")
 _reenroll_state: dict = {"last_attempt_at": None, "code": None, "claimed_at": None}
+# The provision API's answer to a claim for an id its owner deleted (a tombstone): final, never a retry.
+AGENT_DELETED_ERROR = "agent_deleted"
 
 
 def _provision_base() -> str:
@@ -2631,7 +2707,7 @@ def _lane_whoami() -> str:
 def _reenroll_claim() -> None:
     """Best-effort claim: one live code per episode; failed POSTs retry no
     sooner than REENROLL_CLAIM_RETRY_S; never raises into the caller."""
-    if not REENROLL_ENABLED or _reenroll_state["code"]:
+    if not REENROLL_ENABLED or _reenroll_state["code"] or _reenroll_state.get("deleted"):
         return
     last = _reenroll_state["last_attempt_at"]
     # Monotonic: a wall-clock step backward must not suppress claims (review
@@ -2690,6 +2766,8 @@ def _reenroll_claim() -> None:
         err = diagnostics.code_field(err, URL)
         _reenroll_state["refused"] = {"status": e.code, "error": err, "at": int(time.time())}
         _log(f"reenroll: claim refused HTTP {e.code}" + (f" ({err})" if err else ""))
+        if e.code == 410 and err == AGENT_DELETED_ERROR:
+            _reenroll_state["deleted"] = {"at": int(time.time()), "agent_id": agent_id}
     except Exception as e:  # noqa: BLE001 — recovery must never crash the loop
         _log(f"reenroll: claim failed: {diagnostics.describe(e)}")
 
@@ -2701,6 +2779,7 @@ def _reenroll_clear(recovered: bool = False) -> None:
     prior_attempt = _reenroll_state.get("last_attempt_at")
     _reenroll_state.update({"last_attempt_at": None, "code": None, "claimed_at": None})
     _reenroll_state.pop("refused", None)
+    _reenroll_state.pop("deleted", None)
     if not was_pending:
         # No claim was granted this episode — preserve its cadence, or a
         # probe-only resume lets every future episode re-claim immediately.
@@ -2759,6 +2838,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # The UI-control handle, present only when the owner's message was stamped.
                 # Above "task" so the strict parser reads it and a body cannot claim it.
                 "ui_origin",
+                # A card click's `space.ag2.card_click`, one JSON line (branch below). Above "task" so a
+                # body cannot claim it; the agent acts on a card command only with it.
+                "card_click",
                 "task",
                 # Context enrichment (AG2 broker writer side): human room/sender
                 # names + reply reference. Serialized only when the gateway sends
@@ -2777,6 +2859,9 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 "platform_card",
                 # A room question this agent is asked: one line of quoted room data (branch below).
                 "room_question")
+
+# A card click's bounds: the card id as the backend forwards it, the action as the client caps a reply.
+_CARD_CLICK_MAX = {"card_id": 200, "action": 1000}
 
 # platform_card passes through with exactly these subkeys — a signed pointer
 # {card_url, card_sha256, sig, key_id, alg} to the platform's canonical agent
@@ -3206,6 +3291,12 @@ def _read_by(resp, deadline: float) -> bytes:
         # read1 returns what one socket read gave; read(n) would wait for all n bytes.
         chunk = (resp.read1 if hasattr(resp, "read1") else resp.read)(4096)
         if not chunk:
+            # read1 ends with b"" when the deadline's shutdown cuts the socket, and when the peer
+            # hangs up early: neither is a whole body, which a short read would otherwise pass for.
+            if time.monotonic() >= deadline:
+                raise TimeoutError("response body still arriving at its deadline")
+            if getattr(resp, "length", None):
+                raise http.client.IncompleteRead(b"".join(chunks), resp.length)
             return b"".join(chunks)
         chunks.append(chunk)
 
@@ -3440,6 +3531,8 @@ def _recover_auth(code: int) -> bool:
         _reenroll_clear()
         return True
     _reenroll_claim()
+    if _reenroll_state.get("deleted"):
+        return _wait_after_deletion(code)
     if not TOKEN_FILE and not _reenroll_state["code"] \
             and not (REENROLL_ENABLED and TOKEN):
         # Historical FATAL contract survives ONLY where recovery is truly
@@ -3475,6 +3568,8 @@ def _recover_auth(code: int) -> bool:
             # A transient failure isn't a lost episode: retry stays in the
             # loop, cadence-bounded internally (safe while nothing is parked).
             _reenroll_claim()
+            if _reenroll_state.get("deleted"):
+                return _wait_after_deletion(code)
         cycle += 1
         if cycle % REENROLL_PROBE_EVERY == 0 and _auth_probe():
             # Re-read: `pending` above predates this iteration's own claim,
@@ -3485,6 +3580,89 @@ def _recover_auth(code: int) -> bool:
             # _reenroll_clear re-reads current state for was_pending, so this
             # is correct whether or not a code was parked when we got here.
             _reenroll_clear(recovered=True)
+            return True
+
+
+def _retire_deleted_binding(agent_id: str) -> bool:
+    """Move the deleted agent's bearer and id out of every file it may sit in
+    (gateway_credential_sources.retirement_paths, deleted_binding.retire); True when anything moved. A file moves lines only when it names that
+    id beside this bearer; once one did, the same bearer's lines also leave the others (a lane's
+    key in the primary .env). An env-only token with no such file retires nothing."""
+    if not TOKEN or not agent_id:
+        return False
+    paths = gateway_credential_sources.retirement_paths(os.environ, TOKEN_FILE)
+    moved: "dict[str, list]" = {}
+    for proven in (False, True):
+        for path in paths:
+            if path in moved or (proven and not moved):
+                continue
+            try:
+                keys = deleted_binding.retire(path, secret=TOKEN, agent_id=agent_id, bearer_proven=proven)
+            except OSError as e:
+                _log_backoff(("retire-deleted", path, type(e).__name__),
+                             f"agent deleted: could not retire its binding from {path} ({diagnostics.describe(e)})")
+                continue
+            if keys:
+                moved[path] = keys
+                _log(f"agent deleted: moved {', '.join(keys)} from {path} to {path}{deleted_binding.RETIRED_SUFFIX}")
+    return bool(moved)
+
+
+def _forget_deleted_identity(agent_id: str) -> None:
+    """A deleted id the launcher exported must not name the next agent's claims: drop it from this
+    process, or, where the launcher pinned it, exit so the launcher starts over from the new file."""
+    if not agent_id:
+        return
+    named = [k for k in ("AGENT_MXID", "AGENT_ID") if os.environ.get(k) == agent_id]
+    if named and os.environ.get(agent_identity.PINNED_KEY):
+        _log("new credential after the agent's deletion, but the launcher pinned the deleted id — restarting")
+        sys.exit(POLL_STALL_EXIT_CODE)
+    for k in named:
+        os.environ.pop(k, None)
+
+
+def _bearer_check() -> str:
+    """This bearer, tested now: "accepted" on an authed answer, "refused" only on a 401, "unknown" on
+    anything else. A 403 can be an edge's WAF or rate rule answering a valid bearer, so it proves nothing."""
+    try:
+        _req("GET", "/v1/agents", timeout=15)
+        return "accepted"
+    except urllib.error.HTTPError as e:
+        return "refused" if e.code == 401 else "unknown"
+    except Exception:  # noqa: BLE001 - unknown, never a refusal
+        return "unknown"
+
+
+def _wait_after_deletion(code: int) -> bool:
+    """The owner deleted this agent: no further claims. The server's answer names an id, not this
+    bearer, so the binding is retired only on a 401, only when the file ties the two, and only right
+    after this bearer is itself refused again with a 401; until then it is tested every cycle, and an accepted
+    bearer resumes, since the stale id may sit beside another, live agent's token. A new credential
+    resumes too; True either way, like a rotation."""
+    deleted = _reenroll_state["deleted"]
+    agent_id = deleted.get("agent_id") or ""
+    if "retired" not in deleted:
+        deleted["retired"] = False
+        _log(f"AGENT DELETED — {agent_id or 'this agent'} was deleted by its owner; no longer "
+             "reconnecting. Set up a new agent to use this machine again")
+    while True:
+        if not deleted["retired"]:
+            check = _bearer_check()
+            if check == "accepted":
+                _log("token accepted again — the deleted id was not this bearer's; resuming")
+                _forget_deleted_identity(agent_id)
+                _reenroll_clear()
+                return True
+            if check == "refused" and code == 401:
+                deleted["retired"] = _retire_deleted_binding(agent_id)
+        _emit_gateway_status(False, error=f"auth rejected HTTP {code} — agent deleted by its owner")
+        time.sleep(AUTH_RECHECK_INTERVAL)
+        if not _heartbeat_singleton():
+            sys.exit("FATAL: lost poller singleton while waiting after the agent's deletion")
+        if _reload_rotated_token():
+            _log("new credential detected after the agent's deletion — resuming")
+            _forget_deleted_identity(agent_id)
+            _reenroll_clear()
             return True
 
 
@@ -5728,7 +5906,18 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             payload["relay_results_retrying"] = retrying
         # Recovery surface: recovered ONLY via the probe-success terminal; a
         # missing block means "no episode known", never success.
-        if _reenroll_state.get("code"):
+        deleted = _reenroll_state.get("deleted")
+        if deleted:
+            # Final: the server deleted the agent; readers stop offering Reconnect for it.
+            payload["binding"] = "deleted"
+            payload["reenroll"] = {
+                "pending": False,
+                "deleted": True,
+                "agent_id": deleted.get("agent_id") or None,
+                "deleted_at": deleted["at"],
+                "credential_retired": bool(deleted.get("retired")),
+            }
+        elif _reenroll_state.get("code"):
             payload["reenroll"] = {
                 "pending": True,
                 "approval_code": _reenroll_state["code"],
@@ -6352,6 +6541,15 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             uo = task.get(f)
             if isinstance(uo, str) and _UI_ORIGIN_RE.fullmatch(uo):
                 lines.append(f"ui_origin: {uo}")
+        elif f == "card_click":
+            click = task.get(f)
+            if isinstance(click, dict) and all(isinstance(click.get(k), str) and click[k].strip()
+                                               and len(click[k]) <= limit for k, limit in _CARD_CLICK_MAX.items()):
+                lines.append("card_click: " + json.dumps({"card_id": click["card_id"], "action": click["action"]},
+                                                         separators=(",", ":")))
+            elif click not in (None, ""):
+                # A click that cannot be used stays a click: the agent refuses it, never reads it as chat.
+                lines.append("card_click: invalid")
         elif f == "owner_mentioned":
             if task.get(f) == "true":  # the broker's exact string only; nothing else is a claim
                 lines.append("owner_mentioned: true")
@@ -8171,10 +8369,10 @@ def _proactive_item_id(stem: str, body: str) -> str:
     return proactive_item_id(stem, body)
 
 
-def _proactive_requeue_command(root, item_id: str, body_sha256: str) -> str:
+def _proactive_requeue_command(root, item_id: str, body_sha256: str, reset_attempts: bool = False) -> str:
     """The operator's resend: requeue the item and restore exactly its own quarantined body."""
-    return shlex.join(["python3", "src/outbox_cli.py", "--root", str(root), "requeue", item_id,
-                       "--body-id", item_id.rsplit("~", 1)[0], "--body-sha256", body_sha256])
+    return _outbox_cli_command(root, "requeue", item_id, "--body-id", item_id.rsplit("~", 1)[0],
+                               "--body-sha256", body_sha256, *(["--reset-attempts"] if reset_attempts else []))
 
 
 def _proactive_outbox_root() -> Path:
@@ -8640,7 +8838,9 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
             body_sha256 = ""
         retired = _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
         # No digest, no command: an unfiltered restore can install another generation's body.
-        how = (f"{_proactive_requeue_command(core.backend.root, item_id, body_sha256)}" if body_sha256
+        # A refusal spent its whole budget: a requeue that keeps the count gets one try.
+        how = (f"{_proactive_requeue_command(core.backend.root, item_id, body_sha256, reason == 'permanent-refusal')}"
+               if body_sha256
                else f"NO recovery command: its body could not be read to pin which parked copy "
                     f"is its own; requeue {item_id} by hand with --body-sha256 of that copy")
         where = (f"PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/" if retired
@@ -8654,7 +8854,8 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
                  f"To send it to {room}: {how}")
         else:
             _log(f"proactive {f.name} PARKED to {UNDELIVERABLE_RESULTS_DIR.name}/ ({reason}"
-                 f"{': ' + result.detail if result.detail else ''}) — it will NOT be re-sent")
+                 f"{': ' + result.detail if result.detail else ''}) — it will NOT be re-sent. "
+                 f"To send it again: {how}")
         return
     _hand_back(claim, f)  # still owed: the outbox's retry schedule decides when it is tried again
     if result.status is DrainStatus.ATTEMPTED:
@@ -8680,7 +8881,8 @@ def _post_proactive_message(room: str, body: str, dedupe_key: str, thread_root: 
     except urllib.error.HTTPError as e:
         seen = _PROACTIVE_SEND.__dict__.setdefault("seen", {})
         if e.code in (401, 403):
-            seen["auth"] = e
+            if not room_refused_sender(e):  # a room's refusal is the message's, never the bearer's
+                seen["auth"] = e
         elif e.code == 400:
             replacement = _room_upgraded_to(_http_error_body(e))
             if replacement is not None:
@@ -9005,11 +9207,10 @@ def _quarantine_undelivered(rfile, tid: str, why: str, outbox_item_id=None,
             _log(f"result {tid}: {why} — quarantined to {UNDELIVERABLE_RESULTS_DIR.name}/; "
                  f"{not_requeueable_because}")
             return
-        _log(f"result {tid}: {why} — quarantined to "
-             f"{UNDELIVERABLE_RESULTS_DIR.name}/ — `ag2-sparrow-outbox "
-             f"--root {gateway_instance.outbox_root(RESULTS_DIR, GATEWAY_INSTANCE)} "
-             f"requeue {outbox_item_id or _broker_tid(_delivery_tid(tid) or tid)} --reset-attempts "
-             f"--results-dir {RESULTS_DIR} --body-id {tid}` restores it")
+        how = _outbox_cli_command(gateway_instance.outbox_root(RESULTS_DIR, GATEWAY_INSTANCE), "requeue",
+                                  outbox_item_id or _broker_tid(_delivery_tid(tid) or tid), "--reset-attempts",
+                                  "--body-id", tid, program="ag2-sparrow-outbox", results_dir=RESULTS_DIR)
+        _log(f"result {tid}: {why} — quarantined to {UNDELIVERABLE_RESULTS_DIR.name}/ — `{how}` restores it")
     except disposal.KeptQuarantined:
         return                                          # the lifecycle owner named where it waits
     except disposal.GenerationReplaced:
@@ -10829,6 +11030,16 @@ def _poll_timeout_is_empty(last_ok: float, now: float,
     return (now - last_ok) <= grace
 
 
+def _awake_note(wall_s: float, awake_s: float) -> str:
+    """`, Ns of it awake` when the host slept through a poll gap, else "": time.time() counts a
+    sleeping Mac's hours, time.monotonic() does not, and the gap alone cannot tell the two apart."""
+    return f", {int(awake_s)}s of it awake" if wall_s - awake_s >= _ASLEEP_NOTE_MIN_S else ""
+
+
+# Below this, wall and monotonic readings differ only by clock noise, not by a sleep.
+_ASLEEP_NOTE_MIN_S = 30
+
+
 def _poll_stalled(last_ok: float, now: float,
                   limit: float = POLL_STALL_EXIT_S) -> bool:
     """Whether the poll loop has gone `limit` seconds without a success."""
@@ -10972,6 +11183,7 @@ def main() -> None:
              f"prefer launching through startup.sh for full diagnostics")
     backoff = 1
     poll_grace_since = time.time()
+    poll_ok_awake = time.monotonic()  # poll_grace_since on the clock a host sleep does not advance
     last_poll_ok: float | None = None
     poll_failures = 0  # consecutive network failures; the next good poll resets it
     stall_anchor = time.monotonic()  # excludes system sleep on macOS, unlike time.time()
@@ -11006,13 +11218,14 @@ def main() -> None:
             _push_pool_advertisement()
             if _advance_held_tasks(inflight):   # a retried ack, or a publish after a restart
                 wake_outbound()
-            prev_ok = poll_grace_since
+            prev_ok, prev_ok_awake = poll_grace_since, poll_ok_awake
             _RESP_META.last = None
             try:
+                # The whole poll is bounded, not each socket read: a body that drips held it open.
                 resp = _req("GET", f"/v1/tasks?wait={_poll_wait(inflight)}{_POLL_PROOF}",
-                            timeout=POLL_WAIT + 10)
+                            timeout=POLL_WAIT + 10, deadline=time.monotonic() + POLL_WAIT + 10)
                 last_poll_ok = poll_grace_since = time.time()
-                stall_anchor = time.monotonic()
+                stall_anchor = poll_ok_awake = time.monotonic()
                 # A completed poll remains evidence even if accepting its tasks fails.
                 _emit_gateway_status(True, poll_ok_ts=last_poll_ok)
             except (TimeoutError, socket.timeout):
@@ -11025,7 +11238,8 @@ def main() -> None:
                 resp = {"tasks": []}
             received_at = time.monotonic()           # the dropped-ack retry budget runs from here
             if poll_failures and poll_grace_since != prev_ok:  # a real answer, not the grace path
-                _log(f"poll recovered after {poll_failures} failures, {int(poll_grace_since - prev_ok)}s")
+                _log(f"poll recovered after {poll_failures} failures, {int(poll_grace_since - prev_ok)}s"
+                     f"{_awake_note(poll_grace_since - prev_ok, poll_ok_awake - prev_ok_awake)}")
                 poll_failures = 0
             added = False
             pending_ack = []
@@ -11076,7 +11290,8 @@ def main() -> None:
         except _NETWORK_ERRORS as e:
             poll_failures += 1
             _log(f"poll network error: {diagnostics.describe(e)} — {poll_failures} consecutive, "
-                 f"{int(time.time() - poll_grace_since)}s since last successful poll — "
+                 f"{int(time.time() - poll_grace_since)}s since last successful poll"
+                 f"{_awake_note(time.time() - poll_grace_since, time.monotonic() - poll_ok_awake)} — "
                  f"backing off {backoff}s")
             _emit_gateway_status(False, error=f"network: {diagnostics.describe(e)}", backoff_s=backoff,
                                  poll_ok_ts=last_poll_ok)

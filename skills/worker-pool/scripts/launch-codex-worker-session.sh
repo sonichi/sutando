@@ -23,16 +23,15 @@ SESSION="$SUTANDO_TMUX_SESSION"
 . "$REPO/src/agent/launch-path.sh"
 sutando_append_launch_path "$REPO" "$REPO/../bin" "$(sutando_bundled_node_dir "$REPO")" "$HOME/.npm-global/bin"
 
-config_env="$(bash "$REPO/scripts/sutando-config.sh" core-config-dir-env-name codex)"
-config_value="$(bash "$REPO/scripts/sutando-config.sh" core-config-dir-value codex)"
-if [ -n "$config_env" ] && [ -n "$config_value" ]; then
-  mkdir -p "$config_value"
-  export "$config_env=$config_value"
-fi
 # shellcheck source=../../../scripts/python-binary.sh
 . "$REPO/scripts/python-binary.sh"
 WORKER_PY="$(require_python "$REPO" "launch Codex worker")" || exit 1
 export SUTANDO_PY="$WORKER_PY"
+# src/codex_home.py alone resolves, checks and creates the Codex home.
+# shellcheck source=../../../src/agent/codex/codex-home.sh
+. "$REPO/src/agent/codex/codex-home.sh"
+sutando_codex_home_prepare "$REPO" "$WORKER_PY" || true
+CODEX_HOME_DIR="$SUTANDO_CODEX_HOME"
 
 WORKING_DIR="${SUTANDO_CODEX_WORKING_DIR:-$REPO}"
 WORKING_DIR="${WORKING_DIR/#\~/$HOME}"
@@ -52,8 +51,8 @@ for forwarded in SUTANDO_INSTANCE_ID SUTANDO_WORKER_ID SUTANDO_TASKS_DIR SUTANDO
   [ -n "${!forwarded:-}" ] && ENV_ARGS+=(-e "$forwarded=${!forwarded}")
 done
 [ -n "${CODEX_HOME:-}" ] && ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
-if [ -n "$config_env" ] && [ -n "$config_value" ]; then
-  ENV_ARGS+=(-e "$config_env=$config_value")
+if [ -n "$SUTANDO_CODEX_HOME_ENV" ]; then
+  ENV_ARGS+=(-e "$SUTANDO_CODEX_HOME_ENV=$SUTANDO_CODEX_HOME_VALUE")
 fi
 if [ "${SUTANDO_SELF_DEVELOPMENT_ENABLED+x}" = x ]; then
   ENV_ARGS+=(-e "SUTANDO_SELF_DEVELOPMENT_ENABLED=$SUTANDO_SELF_DEVELOPMENT_ENABLED")
@@ -98,9 +97,9 @@ CODEX_ARGS=(-C "$WORKING_DIR" --add-dir "$HOME" --sandbox danger-full-access
 # Headless: Codex's trust prompt would hold the seat, and answering it trusts the whole enclosing repo.
 # Record the worker's own folder only; a `-c projects...` override does not answer the prompt.
 # With no Sutando Codex home the file would be the user's own ~/.codex config: leave that to them.
-if [ -z "${CODEX_HOME:-}" ]; then
+if [ -z "${CODEX_HOME:-}" ] || [ -z "$CODEX_HOME_DIR" ]; then
   echo "launch-codex-worker-session: no Sutando Codex home; not recording trust in the user's own Codex config, so $SESSION may wait on Codex's trust prompt" >&2
-elif ! trust_out="$("$WORKER_PY" "$REPO/src/codex_project_trust.py" --folder-only "$CODEX_HOME" "$WORKING_DIR" 2>&1)"; then
+elif ! trust_out="$("$WORKER_PY" "$REPO/src/codex_project_trust.py" --folder-only "$CODEX_HOME_DIR" "$WORKING_DIR" 2>&1)"; then
   echo "launch-codex-worker-session: could not record trust for $WORKING_DIR ($trust_out); $SESSION may wait on Codex's trust prompt" >&2
 fi
 # Codex passes a stdio MCP server only the variables its entry names: the seat's s-space entry names both.
@@ -144,8 +143,8 @@ fi
 
 if [ "$(uname -s)" = "Darwin" ]; then
   reset_timer="$REPO/skills/proactive-loop/scripts/codex-auto-reset-timer.py"
-  if [ -f "$reset_timer" ] && ! "$WORKER_PY" "$reset_timer" ensure \
-      --workspace "$SUTANDO_WORKSPACE_DIR" --codex-home "${CODEX_HOME:-$HOME/.codex}" >/dev/null; then
+  if [ -f "$reset_timer" ] && [ -n "$CODEX_HOME_DIR" ] && ! "$WORKER_PY" "$reset_timer" ensure \
+      --workspace "$SUTANDO_WORKSPACE_DIR" --codex-home "$CODEX_HOME_DIR" >/dev/null; then
     echo "launch-codex-worker-session: could not reconcile the Codex earned-reset timer" >&2
   fi
 fi
