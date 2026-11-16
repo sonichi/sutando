@@ -85,7 +85,7 @@ LOCK_WAIT_S = 20
 RUNNER_GH_TIMEOUT_S = 10
 SHUTDOWN_CLEANUP_S = 10
 TERMINATE_WAIT_S = 2
-ROUTE_TIMEOUT_S = 45
+ROUTE_TIMEOUT_S = 30
 ROUTE_DEDUPE_S = 60
 HANDED_RE = re.compile(r"^handed (\S{1,80})$")
 MAX_TAIL = 16 * 1024 * 1024
@@ -867,8 +867,10 @@ class Runner:
             return None
         pr = payload.get("pull_request") or {}
         repo = (payload.get("repository") or {}).get("full_name") or ""
+        watch = next((w for w in self.watches() if w["repo"].lower() == repo.lower()), {})
         args = ["--event", line, "--repo", repo, "--number", str(pr.get("number") or ""),
                 "--head", str((pr.get("head") or {}).get("sha") or ""),
+                "--authors", ",".join(watch.get("authors", [])),
                 "--cache-dir", str(self.st.root / "route")]
         try:
             r = self._run(argv + args, argv + args, timeout=ROUTE_TIMEOUT_S)

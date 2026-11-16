@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import signal
 import stat
 import subprocess
@@ -1676,8 +1677,9 @@ class RouteCmd(_Tmp):
         script.write_text(ROUTE_SCRIPT)
         self.route_log = self.tmp / "route.log"
         os.environ["ROUTE_LOG"] = str(self.route_log)
-        os.environ["PR_WATCH_ROUTE_CMD"] = f"{sys.executable} {script}"
+        os.environ["PR_WATCH_ROUTE_CMD"] = shlex.join([sys.executable, str(script)])
         self.payload = fixture("pull_request_review.submitted")
+        self.cli("add", "--repo", "acme/widgets", "--author", "alice", "--author", "bob")
         self.runner = pw.Runner(self.st)
 
     def deliver(self, line=None):
@@ -1692,7 +1694,16 @@ class RouteCmd(_Tmp):
     def test_a_handed_event_is_noted_not_sent_and_the_command_gets_the_event(self):
         self.assertEqual(self.deliver(), [f"PR_WATCH_NOTE handed to w-1: {self.LINE}"])
         self.assertEqual(self.runs(), [["--event", self.LINE, "--repo", "acme/widgets", "--number", "7",
-                                        "--head", "0badc0de9999", "--cache-dir", str(self.state / "route")]])
+                                        "--head", "0badc0de9999", "--authors", "alice,bob",
+                                        "--cache-dir", str(self.state / "route")]])
+
+    def test_a_command_whose_path_has_a_space_runs_when_quoted(self):
+        spaced = self.tmp / "Application Support"
+        spaced.mkdir()
+        script = spaced / "route.py"
+        script.write_text(ROUTE_SCRIPT)
+        os.environ["PR_WATCH_ROUTE_CMD"] = shlex.join([sys.executable, str(script)])
+        self.assertEqual(self.deliver(), [f"PR_WATCH_NOTE handed to w-1: {self.LINE}"])
 
     def test_a_repeat_within_the_window_is_dropped_without_rerunning(self):
         self.deliver()

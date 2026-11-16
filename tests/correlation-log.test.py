@@ -15,7 +15,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import correlation_log as cl  # noqa: E402
@@ -229,7 +228,7 @@ class Trailers(unittest.TestCase):
 
     def test_the_cli_mints_and_renders(self):
         out = io.StringIO()
-        with contextlib.redirect_stdout(out), mock.patch.object(cl, "session_agent", return_value=""):
+        with contextlib.redirect_stdout(out):
             self.assertEqual(cl.main(["mint"]), 0)
             self.assertEqual(cl.main(["trailers", "--task", "task-1", "--interaction", "ix_0123456789ab"]), 0)
         lines = out.getvalue().splitlines()
@@ -239,24 +238,6 @@ class Trailers(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             self.assertEqual(cl.main(["trailers", "--task", "bad id"]), 2)
         self.assertIn("not an id", err.getvalue())
-
-    def test_the_agent_trailer_is_added_beside_an_id_when_known(self):
-        agent = "@blue-fox.agent:example.invalid"
-        self.assertEqual(cl.trailers("task-1", agent_mxid=agent), f"Sutando-Task: task-1\nSutando-Agent: {agent}")
-        self.assertEqual(cl.trailers("task-1", agent_mxid=""), "Sutando-Task: task-1")
-        self.assertEqual(cl.trailers("task-1", agent_mxid="Blue Fox"), "Sutando-Task: task-1")
-        self.assertEqual(cl.trailers(agent_mxid=agent), "")
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out), mock.patch.object(cl, "session_agent", return_value=agent):
-            cl.main(["trailers", "--task", "task-1"])
-        self.assertEqual(out.getvalue().splitlines(), ["Sutando-Task: task-1", f"Sutando-Agent: {agent}"])
-
-    def test_the_session_agent_is_the_display_name_modules_or_unknown(self):
-        import agent_display_name
-        with mock.patch.object(agent_display_name, "session_agent_mxid", return_value="@a.agent:x.invalid"):
-            self.assertEqual(cl.session_agent(), "@a.agent:x.invalid")
-        with mock.patch.object(agent_display_name, "session_agent_mxid", side_effect=RuntimeError("no record")):
-            self.assertEqual(cl.session_agent(), "")
 
     def test_the_default_log_is_under_the_resolved_workspace(self):
         from unittest.mock import patch

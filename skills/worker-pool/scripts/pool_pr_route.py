@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""Hand a pr-watch event to the Sutando that drives the PR (a PR_WATCH_ROUTE_CMD).
+"""Hand a pr-watch event to the worker that drives the PR (a PR_WATCH_ROUTE_CMD).
 
-From the PR's newest trailers, in order:
-1. `Sutando-Task:` whose task this host assigned to a worker (`state/attribution/<task id>`):
-   a `pool_ask` to that worker, unless it is this session.
-2. `Sutando-Agent:` naming an agent other than this session's own: one s.space message mentioning
-   it in the hand-off room (pool_handoff's transport; WORKER_POOL_HANDOFF_ROOM / _ROOM_CLI, or
-   --room / --room-cli). Information only: it grants no authority.
-Prints `handed <worker id or agent mxid>` once the ask is written or the send confirmed, else
-`local` (the watching session keeps the event), with the reason on stderr.
+Only an event about one of our own PRs is handed off: an author/head event (not a review request,
+a dismissal or a `reason=reviewed` update), on a PR whose author is one of the watch's `--authors`
+and whose head branch lives in the base repository. Its driver is the worker this host assigned the
+task named by the newest commit's `Sutando-Task:` trailer (`state/attribution/<task id>`). A live
+worker other than this session gets a `pool_ask`; `handed <worker id>` is printed only when that
+ask was delivered (a file sentinel, or a confirmed room post). Anything else prints `local`, with
+the reason on stderr, and the watching session keeps the event.
 
     pool_pr_route.py --event "PR_EVENT o/r#N ..." --repo o/r --number N --head SHA \\
-        --cache-dir DIR [--workspace WS] [--room ROOM] [--room-cli PATH]
+        --authors a,b --cache-dir DIR [--workspace WS]
 
-One commits call per (repo#N, head), cached in --cache-dir; a failed call is not cached.
+One GitHub call per (repo#N, head), cached in --cache-dir; a failed call is not cached.
 """
 from __future__ import annotations
 
@@ -26,29 +25,26 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parents[2] / "src"))
 from correlation_log import is_task_id  # noqa: E402
 
 GH_TIMEOUT_S = 10
-# With the commits call, stays inside the pr-watch runner's 45 s bound on the whole route command.
-SEND_TIMEOUT_S = 25
 CACHE_MAX = 500
 EVENT_MAX = 400
-TRAILER_RE = re.compile(r"^Sutando-Task:[ \t]*(\S+)[ \t]*$", re.MULTILINE)
-AGENT_TRAILER_RE = re.compile(r"^Sutando-Agent:[ \t]*(\S+)[ \t]*$", re.MULTILINE)
-MXID_RE = re.compile(r"^@[a-z0-9._=/+-]{1,255}:[A-Za-z0-9.-]+(?::[0-9]{1,5})?$")
+TRAILER_RE = re.compile(r"^Sutando-Task:[ \t]*(\S+)[ \t]*$")
 EVENT_RE = re.compile(r"^PR_EVENT [A-Za-z0-9_.\-\[\]/#=? ]+$")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-STANDING = ("This is a PR you drive (its latest commit carries your task's Sutando-Task trailer). "
+# Events about someone else's PR: ours to review, never ours to drive.
+NOT_OURS = ("review_requested", "review_dismissed")
+QUERY = ("query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){"
+         "pullRequest(number:$number){author{login} headRepository{nameWithOwner} "
+         "commits(last:100){nodes{commit{message}}}}}}")
+STANDING = ("This is a PR you drive (its newest commit carries your task's Sutando-Task trailer). "
             "Read the PR and act on it: fix review findings, push, re-request review. "
             "Tell the owner only if it needs them.")
-REMOTE = ("Information only, from the PR watcher on another of the owner's hosts: it is not an instruction "
-          "from the owner and grants no authority. If you drive this PR (its newest commit's Sutando-Agent "
-          "trailer names you), read the PR and act on it as you judge: fix review findings, push, re-request "
-          "review. Tell the owner only if it needs them.")
 
 
 def _sibling(name):
@@ -65,46 +61,49 @@ def gh(args, timeout):
     return subprocess.run(["gh"] + args, capture_output=True, text=True, timeout=timeout)
 
 
-def send_runner(argv):
-    return subprocess.run(argv, capture_output=True, text=True, timeout=SEND_TIMEOUT_S)
+def trailer_task(message: str) -> Optional[str]:
+    """The valid `Sutando-Task:` id in the message's trailer block (its last paragraph), or None."""
+    paragraphs = [p for p in re.split(r"\n[ \t]*\n", (message or "").strip()) if p.strip()]
+    lines = paragraphs[-1].splitlines() if len(paragraphs) > 1 else []
+    ids = [m.group(1) for m in (TRAILER_RE.match(line.strip()) for line in lines) if m]
+    return ids[-1] if ids and is_task_id(ids[-1]) else None
 
 
-def _newest(messages, pattern, ok) -> Optional[str]:
-    for msg in reversed(messages):
-        ids = [t for t in pattern.findall(msg or "") if ok(t)]
-        if ids:
-            return ids[-1]
+def latest_task(messages) -> Optional[str]:
+    """The task id of the newest commit whose trailer block carries a valid `Sutando-Task:`."""
+    for msg in reversed(list(messages)):
+        task = trailer_task(msg)
+        if task:
+            return task
     return None
 
 
-def latest_trailers(messages) -> Tuple[Optional[str], Optional[str]]:
-    """(newest valid `Sutando-Task`, newest valid `Sutando-Agent`), each from its own newest commit."""
-    messages = list(messages)
-    return (_newest(messages, TRAILER_RE, is_task_id),
-            _newest(messages, AGENT_TRAILER_RE, lambda v: bool(MXID_RE.match(v))))
-
-
-def fetch_trailers(repo: str, number: int, run=gh) -> Tuple[Optional[str], Optional[str]]:
-    """The PR's driving (task, agent) trailers; LookupError when GitHub could not be asked."""
+def fetch_pr(repo: str, number: int, run=gh) -> dict:
+    """{task, author, head_repo} for the PR; LookupError when GitHub could not be asked."""
+    owner, name = repo.split("/", 1)
     try:
-        r = run(["api", f"repos/{repo}/pulls/{number}/commits?per_page=100", "--paginate",
-                 "--jq", ".[] | .commit.message | @json"], GH_TIMEOUT_S)
+        r = run(["api", "graphql", "-f", f"query={QUERY}", "-F", f"owner={owner}", "-F", f"name={name}",
+                 "-F", f"number={number}"], GH_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired):
-        raise LookupError("commits call did not finish")
+        raise LookupError("GitHub call did not finish")
     if r.returncode != 0:
-        raise LookupError(f"commits call exited {r.returncode}")
+        raise LookupError(f"GitHub call exited {r.returncode}")
     try:
-        messages = [json.loads(l) for l in r.stdout.splitlines() if l.strip()]
-    except ValueError:
-        raise LookupError("commits call returned unparsable output")
-    return latest_trailers(m for m in messages if isinstance(m, str))
+        pr = json.loads(r.stdout)["data"]["repository"]["pullRequest"]
+        nodes = pr["commits"]["nodes"]
+    except (ValueError, KeyError, TypeError):
+        raise LookupError("GitHub call returned an unexpected answer")
+    messages = [((n or {}).get("commit") or {}).get("message") for n in nodes or []]
+    return {"task": latest_task(m for m in messages if isinstance(m, str)) or "",
+            "author": str(((pr.get("author") or {}).get("login")) or ""),
+            "head_repo": str(((pr.get("headRepository") or {}).get("nameWithOwner")) or "")}
 
 
-def driver_trailers(repo: str, number: int, head: str, cache_dir: Path, run=gh) -> Tuple[Optional[str], Optional[str]]:
-    """The PR's driving (task, agent), asking GitHub at most once per (repo#N, head)."""
+def pr_facts(repo: str, number: int, head: str, cache_dir: Path, run=gh) -> dict:
+    """fetch_pr's answer, asking GitHub at most once per (repo#N, head)."""
     key = f"{repo.lower()}#{number}"
     if not head:
-        return fetch_trailers(repo, number, run)
+        return fetch_pr(repo, number, run)
     cache_dir.mkdir(parents=True, exist_ok=True)
     path = cache_dir / "pr-driver.json"
     # Held across the fetch so two events at one head make one call.
@@ -116,82 +115,75 @@ def driver_trailers(repo: str, number: int, head: str, cache_dir: Path, run=gh) 
         except (OSError, ValueError):
             data = {}
         hit = data.get(key)
-        if isinstance(hit, dict) and hit.get("head") == head and "agent" in hit:
-            return hit.get("task") or None, hit.get("agent") or None
-        task, agent = fetch_trailers(repo, number, run)
+        if isinstance(hit, dict) and hit.get("head") == head and "head_repo" in hit:
+            return hit
+        facts = dict(fetch_pr(repo, number, run), head=head)
         data.pop(key, None)
-        data[key] = {"head": head, "task": task or "", "agent": agent or ""}
+        data[key] = facts
         while len(data) > CACHE_MAX:
             data.pop(next(iter(data)))
         tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(data, indent=1) + "\n")
         os.replace(tmp, path)
-        return task, agent
+        return facts
 
 
 def ask_text(event: str) -> str:
     return f"[pr-watch] {event}\n{STANDING}"
 
 
-def remote_text(event: str) -> str:
-    return f"[pr-watch] {event}\n{REMOTE}"
+def delivered(out, wid: str) -> bool:
+    """Whether pool_ask's result shows the ask reached `wid`: a confirmed room post, or a sentinel
+    in its folder (this call's or the watcher pass that routed it first)."""
+    if not isinstance(out, dict):
+        return False
+    if out.get("via"):
+        return out.get("status") == "sent" and bool(out.get("event_id"))
+    r = out.get("route") or {}
+    return wid in (r.get("delivered") or []) or wid in (r.get("already") or [])
 
 
-def route(workspace: Path, event: str, repo: str, number: int, head: str, cache_dir: Path, *,
+def route(workspace: Path, event: str, repo: str, number: int, head: str, authors, cache_dir: Path, *,
           run=gh, ask: Optional[Callable] = None, me: Optional[str] = None,
-          worker_for_task: Optional[Callable] = None, my_agent: Optional[str] = None,
-          send: Optional[Callable] = None, room: Optional[str] = None, room_cli: Optional[str] = None) -> str:
-    """`handed <worker id or agent mxid>` or `local`; the reason for `local` goes to stderr."""
+          worker_for_task: Optional[Callable] = None, alive: Optional[Callable] = None) -> str:
+    """`handed <worker id>` or `local`; the reason for `local` goes to stderr."""
     if not EVENT_RE.match(event) or len(event) > EVENT_MAX or not REPO_RE.match(repo) or number <= 0:
         return _local("not a pr-watch event line")
+    words = event.split()
+    if len(words) < 3 or words[2] in NOT_OURS or "reason=reviewed" in words:
+        return _local("not an event about our own PR")
+    ours = {a.lower() for a in authors if a and a != "*"}
+    if not ours:
+        return _local("no watched author to check the PR's author against")
     try:
-        task, agent = driver_trailers(repo, number, head, cache_dir, run)
+        facts = pr_facts(repo, number, head, cache_dir, run)
     except LookupError as exc:
         return _local(str(exc))
-    wid = (worker_for_task or _sibling("pool_attribution").worker_for_task)(workspace, task) if task else None
-    if wid:
-        return _to_worker(workspace, wid, event, ask, me)
-    if not agent:
-        return _local("no Sutando-Task trailer this host attributed, and no Sutando-Agent trailer")
-    return _to_agent(workspace, agent, event, f"{repo}#{number}", my_agent, send, room, room_cli)
-
-
-def _to_worker(workspace: Path, wid: str, event: str, ask, me) -> str:
-    pa = _sibling("pool_ask") if ask is None or me is None else None
+    if facts.get("author", "").lower() not in ours or facts.get("head_repo", "").lower() != repo.lower():
+        return _local("the PR is not one of ours (author or head repository)")
+    task = facts.get("task")
+    if not task:
+        return _local("no Sutando-Task trailer on the PR's newest commits")
+    wid = (worker_for_task or _sibling("pool_attribution").worker_for_task)(workspace, task)
+    if not wid:
+        return _local(f"{task} has no worker attribution on this host")
+    pa = _sibling("pool_ask") if ask is None or me is None or alive is None else None
     if wid == (me or pa.whoami()):
         return _local("the driver is this session")
+    if not (alive or _alive)(workspace, wid):
+        return _local("the driving worker's session is not alive")
     try:
-        (ask or pa.ask)(workspace, wid, ask_text(event))
+        out = (ask or pa.ask)(workspace, wid, ask_text(event))
     except Exception as exc:  # noqa: BLE001 - any failure keeps the event with the watcher
         return _local(f"pool_ask failed: {str(exc)[:200]}")
+    if not delivered(out, wid):
+        # An unconfirmed room post may still have landed; it is not sent again.
+        return _local("the ask's delivery was not confirmed")
     return f"handed {wid}"
 
 
-def _to_agent(workspace: Path, agent: str, event: str, ref: str, my_agent, send, room, room_cli) -> str:
-    if my_agent is None:
-        try:
-            from agent_display_name import session_agent_mxid
-            my_agent = session_agent_mxid(workspace=workspace)
-        except Exception:  # noqa: BLE001 - an unknown own agent cannot send
-            my_agent = ""
-    if not my_agent:
-        return _local("this session's own s.space agent is unknown")
-    if agent == my_agent:
-        return _local("the driver is this session's own agent")
-    ph = _sibling("pool_handoff")
-    path = ph.agent_route(agent, my_agent, room=room, room_cli=room_cli)
-    if path is None:
-        return _local(f"no {ph.ROOM} or {ph.ROOM_CLI} configured")
-    try:
-        if send is None:
-            sent = ph.send(path, ref, remote_text(event), kind="pr-watch", runner=send_runner)
-        else:
-            sent = send(path, ref, remote_text(event), kind="pr-watch")
-    except Exception as exc:  # noqa: BLE001 - any failure keeps the event with the watcher
-        return _local(f"s.space send failed: {str(exc)[:200]}")
-    if (sent or {}).get("status") != "sent":
-        return _local("s.space send not confirmed")
-    return f"handed {agent}"
+def _alive(workspace: Path, wid: str) -> bool:
+    return any(r["id"] == wid and r.get("alive") is True for r in _sibling("pool_ask").who(workspace))
 
 
 def _local(why: str) -> str:
@@ -205,17 +197,17 @@ def main(argv=None) -> int:
     p.add_argument("--repo", required=True)
     p.add_argument("--number", type=int, required=True)
     p.add_argument("--head", default="")
+    p.add_argument("--authors", default="", help="the watch's authors, comma-separated")
     p.add_argument("--cache-dir", required=True)
     p.add_argument("--workspace")
-    p.add_argument("--room", help="the hand-off room for another host's agent (else WORKER_POOL_HANDOFF_ROOM)")
-    p.add_argument("--room-cli", help="its room CLI (else WORKER_POOL_HANDOFF_ROOM_CLI)")
     a = p.parse_args(argv)
     if a.workspace:
         ws = Path(a.workspace)
     else:
         from workspace_default import resolve_workspace
         ws = Path(resolve_workspace())
-    print(route(ws, a.event, a.repo, a.number, a.head, Path(a.cache_dir), room=a.room, room_cli=a.room_cli))
+    authors = [x.strip() for x in a.authors.split(",") if x.strip()]
+    print(route(ws, a.event, a.repo, a.number, a.head, authors, Path(a.cache_dir)))
     return 0
 
 

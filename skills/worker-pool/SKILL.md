@@ -29,7 +29,7 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `pool_delivery.py` — a recipient's own folder: sentinels in, accept, release, done flags, and the owner's `hand_off_to_core`.
 - `pool_ask.py` — ask another instance a question through the front door (below).
 - `pool_handoff.py` — `pool_ask` over s.space to a worker with its own agent, behind a flag (below).
-- `pool_pr_route.py` — pr-watch's `PR_WATCH_ROUTE_CMD`: hands a PR event to the worker or other host's agent driving that PR (below).
+- `pool_pr_route.py` — pr-watch's `PR_WATCH_ROUTE_CMD`: hands an event about our own PR to the worker driving it (below).
 - `pool_sessions.py` — read-only: which worker tmux sessions a viewer could attach, and the exact-match argv for each. Adds no state and nothing in the pool calls it; it exists for the desktop app's terminal picker. It deliberately does not describe the core, whose socket resolution belongs to the app.
 
 ```bash
@@ -390,32 +390,31 @@ python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|
   the script.
 - Refused, never guessed: an unknown name, a name shared by recipients, and asking yourself.
 
-### PR events to the Sutando that drives the PR
+### PR events to the worker that drives the PR
 
-Every Sutando pushes as the same GitHub login, so the one pr-watch runner on a host cannot tell
-whose PR an event is. `pool_pr_route.py` is its route command. It reads the PR's commits (one
-`gh api` call per head, cached) and takes the newest of each trailer the commit trailers carry
-(`python3 src/correlation_log.py trailers` prints `Sutando-Agent: <mxid>` beside the task id when
-the session's s.space agent is known):
+Every worker pushes as the same GitHub login, so the one pr-watch runner on a host cannot tell
+whose PR an event is. `pool_pr_route.py` is its route command. It hands an event off only when all
+of these hold, and prints `local` (the watcher keeps the event) otherwise:
 
-1. The newest `Sutando-Task:` names a task this host assigned to a worker
-   (`state/attribution/<task id>`): that worker gets a `pool_ask` carrying only the event line and
-   the standing ask (read the PR, act on it, tell the owner only if it needs them). If it is the
-   watching session itself (`$SUTANDO_INSTANCE_ID`, else the core), the watcher keeps the event.
-2. Else the newest `Sutando-Agent:` names an agent other than the watching session's own (a
-   worker's own enabled identity, else this host's agent): one s.space message mentioning it in the
-   hand-off room, through the same transport as the hand-off below (`WORKER_POOL_HANDOFF_ROOM`,
-   `WORKER_POOL_HANDOFF_ROOM_CLI`, or `--room` / `--room-cli` in the route command, which win). It
-   says it is information only and grants no authority. Both agents must be members of that room.
-3. Else, or when the room or CLI is not set, the send fails or is not confirmed: `local`, and the
-   watcher keeps the event.
+- The event is about our own PR: not a `review_requested` or `review_dismissed`, not a
+  `reason=reviewed` update; and the PR's author is one of the watch's authors and its head branch
+  is in the base repository. Author, head repository and the commits come from one GitHub call per
+  head, cached.
+- The newest commit whose trailer block carries a valid `Sutando-Task:` names a task this host
+  assigned to a worker (`state/attribution/<task id>`). Newest wins, so a stacked or promoted PR
+  goes to whoever made its last commit.
+- That worker is not the watching session (`$SUTANDO_INSTANCE_ID`, else the core) and its session
+  is alive (`pool_ask --who`).
+- The `pool_ask` (only the event line, plus: read the PR, act on it, tell the owner only if it
+  needs them) was delivered: a sentinel in the worker's folder, or, over s.space, a confirmed post.
+  An unconfirmed post is not sent again.
 
-`handed <worker id or agent mxid>` is printed only for a written ask or a confirmed send. On, on
-the host running the pr-watch runner:
+Then it prints `handed <worker id>`. A PR driven from another host stays with the watcher here.
+On, on the host running the pr-watch runner, from the checkout:
 
 ```bash
 python3 skills/pr-watch/scripts/pr_watch.py config set PR_WATCH_ROUTE_CMD \
-  "python3 $PWD/skills/worker-pool/scripts/pool_pr_route.py --room '!room:server' --room-cli $PWD/skills/owner-agent-consult/scripts/consult.py"
+  "$(python3 -c 'import shlex, sys; print(shlex.join(sys.argv[1:]))' python3 "$PWD/skills/worker-pool/scripts/pool_pr_route.py")"
 ```
 
 ### Over s.space, to a worker with its own agent (flag, off by default)

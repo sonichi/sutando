@@ -20,8 +20,7 @@ Identity fields are checked per field: Matrix ids for counterpart/room/event, `o
 object, the engine's task and run id shapes; a display name or prose never lands in a record or a
 trailer. `record()` never raises, whatever it is given: correlation is bookkeeping beside the work,
 so a failed or partial write returns None (said once on stderr) and leaves the file as it was.
-`trailers()` renders the git trailers our commits and PRs carry; the CLI adds `Sutando-Agent: <mxid>`
-when this session's s.space agent is known.
+`trailers()` renders the git trailers our commits and PRs carry.
 
     python3 src/correlation_log.py mint
     python3 src/correlation_log.py trailers --task <task id> [--run <run id>] [--interaction <id>]
@@ -207,9 +206,8 @@ def read(kind: "str | None" = None, *, workspace=None, path: "Path | None" = Non
 
 
 def trailers(task_id: "str | None" = None, run_id: "str | None" = None,
-             interaction_id: "str | None" = None, agent_mxid: "str | None" = None) -> str:
-    """Git trailer lines for a commit or PR body; empty when no id is given. `Sutando-Agent` (the
-    session's s.space agent) is added only beside another id, and dropped when it is not an mxid."""
+             interaction_id: "str | None" = None) -> str:
+    """Git trailer lines for a commit or PR body; empty when no id is given."""
     lines = []
     for label, value, ok in (("Sutando-Task", task_id, is_task_id), ("Sutando-Run", run_id, is_run_id),
                              ("Interaction-Id", interaction_id, INTERACTION_RE.match)):
@@ -218,19 +216,7 @@ def trailers(task_id: "str | None" = None, run_id: "str | None" = None,
             if not ok(value):
                 raise ValueError(f"{label}: {value!r} is not an id")
             lines.append(f"{label}: {value}")
-    agent = str(agent_mxid or "").strip()
-    if lines and PATTERNS["counterpart"].match(agent):
-        lines.append(f"Sutando-Agent: {agent}")
     return "\n".join(lines)
-
-
-def session_agent() -> str:
-    """This session's s.space agent mxid, or '' when it cannot be told."""
-    try:
-        from agent_display_name import session_agent_mxid
-        return session_agent_mxid()
-    except Exception:  # noqa: BLE001 - an unknown agent only drops its trailer
-        return ""
 
 
 def main(argv=None) -> int:
@@ -246,7 +232,7 @@ def main(argv=None) -> int:
         print(mint_interaction_id())
         return 0
     try:
-        print(trailers(a.task, a.run, a.interaction, session_agent()))
+        print(trailers(a.task, a.run, a.interaction))
     except ValueError as e:
         print(f"correlation_log: {e}", file=sys.stderr)
         return 2

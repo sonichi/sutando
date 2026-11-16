@@ -193,28 +193,5 @@ class GreetingPathsTest(Fixture):
         self.assertIn("python3 src/agent_display_name.py --room <channel_id>", onboard)
 
 
-class SessionAgentTest(unittest.TestCase):
-    """session_agent_mxid: a worker's own enabled identity, else this host's agent."""
-    W = "02e4302f00844397bac09533fc398248"
-
-    def test_a_worker_with_its_own_identity_is_its_agent(self):
-        import connections
-        env = {connections.SESSION_WORKER_ENV: self.W}
-        with mock.patch.object(connections, "worker_enabled_identity", return_value={"agent_mxid": MXID}) as w, \
-                mock.patch.object(adn, "agent_mxid", return_value="@core.agent:example.invalid"):
-            self.assertEqual(adn.session_agent_mxid(env, Path("/ws")), MXID)
-        w.assert_called_once_with(self.W, Path("/ws"))
-        with mock.patch.object(connections, "worker_enabled_identity", return_value={"agent_mxid": "not an id"}):
-            self.assertEqual(adn.session_agent_mxid(env), "")
-
-    def test_the_core_or_a_worker_without_one_is_the_hosts_agent(self):
-        import connections
-        with mock.patch.object(connections, "worker_enabled_identity", return_value=None), \
-                mock.patch.object(adn, "agent_mxid", return_value=MXID) as host:
-            self.assertEqual(adn.session_agent_mxid({}), MXID)
-            self.assertEqual(adn.session_agent_mxid({connections.SESSION_WORKER_ENV: self.W}), MXID)
-        self.assertEqual(host.call_count, 2)
-
-
 if __name__ == "__main__":
     unittest.main()
