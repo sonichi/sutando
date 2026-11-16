@@ -35,7 +35,7 @@ def ws(tmp, task_id="task-abc123", result=None, age_sec=600):
     (root / "tasks").mkdir(parents=True, exist_ok=True)
     (root / "results").mkdir(parents=True, exist_ok=True)
     t = root / "tasks" / f"{task_id}.txt"
-    t.write_text("id: x\n")
+    t.write_text(f"id: {t.stem}\n")
     old = time.time() - age_sec
     import os
     os.utime(t, (old, old))
@@ -122,7 +122,7 @@ def dedup_case(tmp, *, target_exists, chain=False, cycle=False):
     (root / "tasks").mkdir(parents=True, exist_ok=True)
     (root / "results").mkdir(parents=True, exist_ok=True)
     t = root / "tasks" / "task-src.txt"
-    t.write_text("id: x\n")
+    t.write_text(f"id: {t.stem}\n")
     old = time.time() - 600
     os.utime(t, (old, old))
     res = root / "results"
@@ -165,7 +165,7 @@ with tempfile.TemporaryDirectory() as d:
     import os
     root = Path(d)
     (root / "tasks").mkdir(parents=True); (root / "results" / "archive" / "2026-09").mkdir(parents=True)
-    t = root / "tasks" / "task-src.txt"; t.write_text("id: x\n")
+    t = root / "tasks" / "task-src.txt"; t.write_text(f"id: {t.stem}\n")
     old = time.time() - 600; os.utime(t, (old, old))
     (root / "results" / "task-src.txt").write_text("[deduped: task-dst]\n")
     (root / "results" / "archive" / "2026-09" / "task-dst-1788376009.txt").write_text("the actual reply\n")
@@ -179,7 +179,7 @@ with tempfile.TemporaryDirectory() as d:
     import os
     root = Path(d)
     (root / "tasks").mkdir(parents=True); (root / "results" / "archive" / "2026-09").mkdir(parents=True)
-    t = root / "tasks" / "task-src.txt"; t.write_text("id: x\n")
+    t = root / "tasks" / "task-src.txt"; t.write_text(f"id: {t.stem}\n")
     old = time.time() - 600; os.utime(t, (old, old))
     (root / "results" / "task-src.txt").write_text("[deduped: task-dst]\n")
     a = root / "results" / "archive" / "2026-09"
@@ -196,11 +196,11 @@ def split_case(tmp, *, target_task_exists):
     import os
     root = Path(tmp)
     (root / "tasks" / "archive").mkdir(parents=True); (root / "results").mkdir(parents=True)
-    t = root / "tasks" / "task-src.txt"; t.write_text("id: x\n")
+    t = root / "tasks" / "task-src.txt"; t.write_text(f"id: {t.stem}\n")
     old = time.time() - 600; os.utime(t, (old, old))
     (root / "results" / "task-src.txt").write_text("[deduped: task-dst]\n")
     if target_task_exists:
-        (root / "tasks" / "archive" / "task-dst.txt").write_text("id: dst\n")
+        (root / "tasks" / "archive" / "task-dst.txt").write_text("id: task-dst\n")
     return root
 
 
@@ -222,10 +222,10 @@ def cross_room_case(tmp, *, same_channel):
     root = Path(tmp)
     (root / "tasks" / "archive").mkdir(parents=True); (root / "results").mkdir(parents=True)
     t = root / "tasks" / "task-src.txt"
-    t.write_text("id: src\nchannel_id: !roomA:ag2.space\n")
+    t.write_text("id: task-src\nchannel_id: !roomA:ag2.space\n")
     old = time.time() - 600; os.utime(t, (old, old))
     dest = "!roomA:ag2.space" if same_channel else "!roomB:ag2.space"
-    (root / "tasks" / "archive" / "task-dst.txt").write_text(f"id: dst\nchannel_id: {dest}\n")
+    (root / "tasks" / "archive" / "task-dst.txt").write_text(f"id: task-dst\nchannel_id: {dest}\n")
     (root / "results" / "task-src.txt").write_text("[deduped: task-dst]\n")
     (root / "results" / "task-dst.txt").write_text("the reply, delivered to task-dst's room\n")
     return root
@@ -247,9 +247,9 @@ for marker in ("[no-send]", "[REPLIED]"):
         import os
         root = Path(d)
         (root / "tasks" / "archive").mkdir(parents=True); (root / "results").mkdir(parents=True)
-        t = root / "tasks" / "task-src.txt"; t.write_text("id: src\n")
+        t = root / "tasks" / "task-src.txt"; t.write_text("id: task-src\n")
         old = time.time() - 600; os.utime(t, (old, old))
-        (root / "tasks" / "archive" / "task-dst.txt").write_text("id: dst\n")
+        (root / "tasks" / "archive" / "task-dst.txt").write_text("id: task-dst\n")
         (root / "results" / "task-src.txt").write_text("[deduped: task-dst]\n")
         (root / "results" / "task-dst.txt").write_text(marker + "\n")
         rows = uat.unanswered(root, 120)
@@ -300,11 +300,11 @@ def same_room_case(tmp, *, same_sender):
     root = Path(tmp)
     (root / "tasks" / "archive").mkdir(parents=True); (root / "results").mkdir(parents=True)
     t = root / "tasks" / "task-src.txt"
-    t.write_text("id: src\nchannel_id: !room:ag2.space\nuser_id: @alice:ag2.space\n")
+    t.write_text("id: task-src\nchannel_id: !room:ag2.space\nuser_id: @alice:ag2.space\n")
     old = time.time() - 600; os.utime(t, (old, old))
     who = "@alice:ag2.space" if same_sender else "@bob:ag2.space"
     (root / "tasks" / "archive" / "task-dst.txt").write_text(
-        f"id: dst\nchannel_id: !room:ag2.space\nuser_id: {who}\n")
+        f"id: task-dst\nchannel_id: !room:ag2.space\nuser_id: {who}\n")
     (root / "results" / "task-src.txt").write_text("[deduped: task-dst]\n")
     (root / "results" / "task-dst.txt").write_text("the reply, delivered to dst's sender\n")
     return root
@@ -328,7 +328,7 @@ _ds = uat.dedup_soundness
 
 with tempfile.TemporaryDirectory() as d:
     root = Path(d); (root / "tasks").mkdir()
-    (root / "tasks" / "task-live.txt").write_text("id: live\n")
+    (root / "tasks" / "task-live.txt").write_text("id: task-live\n")
     check(_ds.task_exists(root / "tasks", "task-live") is True,
           "task_exists: True while the task is still LIVE in tasks/ (not yet archived)")
     check(_ds.task_exists(root / "tasks", "task-never") is False,

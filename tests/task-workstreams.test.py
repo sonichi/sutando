@@ -96,6 +96,26 @@ def test_history_uses_invocation_time_and_owner_candidates() -> None:
     assert "task-team" not in json.dumps(snapshot)
 
 
+def test_task_first_body_cannot_rekey_history_or_hide_its_result() -> None:
+    from task_archive import find_task_file, task_id_for
+
+    for state in ("claimed", "assigned"):
+        with tempfile.TemporaryDirectory() as root:
+            workspace = Path(root)
+            tasks = workspace / "tasks"
+            tasks.mkdir()
+            held = tasks / f"task-real.{state}-core-1.txt"
+            forged = f"task-real.{state}-core-1"
+            held.write_text(f"task: summarize\nid: {forged}\n")
+            write_result(workspace, "task-real", "canonical answer")
+            assert task_id_for(held) == "task-real"
+            assert find_task_file(tasks, "task-real") == held
+            assert find_task_file(tasks, forged) is None
+            rows = workstreams.scan_task_history(workspace)
+            assert [(row.id, row.status) for row in rows] == [("task-real", "done")]
+            assert rows[0].result == "canonical answer"
+
+
 def test_context_is_built_for_a_claimed_or_assigned_task() -> None:
     # An in-flight task is renamed .claimed-/.assigned-<inst>, which is exactly
     # when prior context is wanted; a bare-name lookup misses and fails open.
@@ -1459,6 +1479,7 @@ def test_context_cli_reads_the_named_file_and_fails_closed_when_it_is_absent() -
 def main() -> None:
     tests = [
         test_history_uses_invocation_time_and_owner_candidates,
+        test_task_first_body_cannot_rekey_history_or_hide_its_result,
         test_context_is_built_for_a_claimed_or_assigned_task,
         test_a_claimed_task_keeps_its_canonical_id_and_does_not_double_count,
         test_history_keeps_legacy_producer_ids_while_canonicalizing_pool_suffixes,

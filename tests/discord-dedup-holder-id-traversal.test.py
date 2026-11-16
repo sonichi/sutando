@@ -49,7 +49,7 @@ def main() -> int:
     # 1. The primitive is real: find_task_file alone escapes its directory.
     root = pathlib.Path(tempfile.mkdtemp(prefix="dedup-traversal-"))
     (root / "tasks").mkdir()
-    (root / "secret.txt").write_text("OWNER ONLY", encoding="utf-8")
+    (root / "secret.txt").write_text("id: ../secret\ntask: OWNER ONLY\n", encoding="utf-8")
     escaped = find_task_file(root / "tasks", "../secret")
     check(escaped is not None and escaped.resolve() == (root / "secret.txt").resolve(),
           "1) find_task_file resolves ../secret OUTSIDE tasks_dir (the primitive)")
