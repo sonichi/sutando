@@ -2255,6 +2255,24 @@ def proactive_author_agent(name, workspace: Optional[Path] = None) -> Optional[s
     return str((row or {}).get("agent_mxid") or "").strip() or None
 
 
+def proactive_author_phrase(name, host: str, workspace: Optional[Path] = None) -> str:
+    """Who a proactive file named `name` speaks as, for its text: "the <host> core" for an unstamped
+    name; for a worker's stamped one, its own agent's display name, else its roster label, else
+    "a worker on <host>"."""
+    from proactive_routing import proactive_worker
+    worker = proactive_worker(name)
+    if not worker:
+        return f"the {host} core"
+    label = str((worker_identity(worker, workspace) or {}).get("agent_display_name") or "").strip()
+    if not label:
+        rows = _read_json(_workspace(workspace) / "state" / "roster.json").get("workers")
+        row = rows.get(worker) if isinstance(rows, dict) else None
+        row = row if isinstance(row, dict) else {}
+        label = str(row.get("display_label") or row.get("label") or "").strip()
+        label = "" if label == worker else label
+    return " ".join(label.split()) or f"a worker on {host}"
+
+
 def worker_mcp_credential(worker: str, *, workspace: Optional[Path] = None,
                           environ: Optional[Mapping[str, str]] = None, vault=None) -> dict:
     """Whose credential a worker session's MCP proxy mints with. A worker that acts as its own agent

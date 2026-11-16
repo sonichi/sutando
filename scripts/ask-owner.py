@@ -33,7 +33,7 @@ REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allo
 sys.path.insert(0, str(REPO / "src"))
 import pending_questions_reader as reader  # noqa: E402
 from local_record import RecordDir, iso, new_name, write_text_whole
-from proactive_routing import proactive_filename
+from proactive_routing import proactive_filename, proactive_worker
 from result_publish import worker_published_path
 from result_markers import neutralize_markers
 from skill_roots import declared
@@ -57,27 +57,41 @@ def _asker(name: str, ws: Path):
         return None
 
 
+def _speaker(name, ws: Path) -> str:
+    try:
+        import connections  # noqa: PLC0415 — heavy loader
+        return connections.proactive_author_phrase(name, host_label(), ws)
+    except Exception:  # noqa: BLE001 — an unreadable name never blocks the ask
+        return f"a worker on {host_label()}" if proactive_worker(name or "") else f"the {host_label()} core"
+
+
 def ask_without_store(question: str, context, ws: Path, why: str) -> list:
     """Core's part alone: the DM through the proactive path, then one generic local record.
     Returns the report lines; nothing raises past here."""
     from workspace_default import status_path  # noqa: PLC0415 — heavy loader
     name = new_name("ask")
     title = " ".join(neutralize_markers(question).split())[:120]
-    body = f"[dm-only]\nQuestion for you from the {host_label()} core — it needs your word:\n\n" \
+    lines = [f"recorded: NO STORE — {why}; nothing lists, counts, closes or reminds this question"]
+    queued, send_error, asker, target = None, None, None, None
+    try:
+        target = worker_published_path(ws / "results" / proactive_filename(name, None), workspace=ws)
+    except Exception as e:  # noqa: BLE001 — reported below; the record still says it was asked
+        send_error = f"{type(e).__name__}: {e}"
+    speaker = neutralize_markers(_speaker(target.name if target else None, ws))
+    body = f"[dm-only]\nQuestion for you from {speaker} — it needs your word:\n\n" \
            f"{neutralize_markers(question).strip()}\n"
     if context and context.strip():
         body += f"\n{neutralize_markers(context).strip()}\n"
     body += "\nReply here.\n"
-    lines = [f"recorded: NO STORE — {why}; nothing lists, counts, closes or reminds this question"]
-    queued, send_error, asker = None, None, None
-    try:
-        target = worker_published_path(ws / "results" / proactive_filename(name, None), workspace=ws)
-        asker = _asker(target.name, ws)
-        queued = write_text_whole(target, body)  # a drain claims it on sight
-        lines.append(f"sent: queued owner-dm (last-active bridge) via results/{queued.name} "
-                     "(a bridge drain delivers it; nothing re-raises it without the skill)")
-    except Exception as e:  # noqa: BLE001 — the record below still says it was asked
-        send_error = f"{type(e).__name__}: {e}"
+    if target is not None:
+        try:
+            asker = _asker(target.name, ws)
+            queued = write_text_whole(target, body)  # a drain claims it on sight
+            lines.append(f"sent: queued owner-dm (last-active bridge) via results/{queued.name} "
+                         "(a bridge drain delivers it; nothing re-raises it without the skill)")
+        except Exception as e:  # noqa: BLE001 — the record below still says it was asked
+            send_error = f"{type(e).__name__}: {e}"
+    if queued is None:
         lines.append(f"sent: FAILED — {send_error} (ask by hand)")
     try:
         p = RecordDir(status_path(RECORDS, ws)).write(name, {

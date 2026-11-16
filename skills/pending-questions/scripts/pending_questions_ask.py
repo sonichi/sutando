@@ -129,6 +129,16 @@ def asked_by(ws: Path, name: str) -> Optional[str]:
         return None
 
 
+def speaker(ws: Path, name: str, host: str) -> str:
+    """Who a question published under `name` comes from, as its text names it (the core, or the worker)."""
+    try:
+        import connections  # noqa: PLC0415
+        return connections.proactive_author_phrase(name, host, Path(ws))
+    except Exception:  # noqa: BLE001 — an unreadable name never blocks the ask
+        from proactive_routing import proactive_worker  # noqa: PLC0415
+        return f"a worker on {host}" if proactive_worker(name) else f"the {host} core"
+
+
 def queued_send(body: str):
     """(proactive file name, epoch) of the entry's queue record; None when it
     carries none or the stamp does not parse (a bad stamp reads as no stamp)."""
@@ -350,13 +360,15 @@ def destination_from_task(text: str, workspace: Optional[Path] = None) -> Destin
 
 
 def proactive_body(question: str, context: Optional[str], host: str,
-                   dest: Destination, link: Optional[str] = None, intro: Optional[str] = None):
+                   dest: Destination, link: Optional[str] = None, intro: Optional[str] = None,
+                   asker: Optional[str] = None):
     """(body, routed): routed is True when a `[channel:]` redirect leads the body.
     `link` is where the owner can also answer, when the store knows it; `intro` is one
-    extra paragraph the store adds the first time."""
+    extra paragraph the store adds the first time; `asker` names who asks (default the core)."""
     routed = dest.bridge in _ROOM_MARKER_BRIDGES and bool(dest.channel)
+    who = neutralize_markers(asker) if asker else f"the {host} core"
     lines = [f"[channel: {dest.channel}]" if routed else "[dm-only]",
-             f"Question for you from the {host} core — it needs your word:", "",
+             f"Question for you from {who} — it needs your word:", "",
              neutralize_markers(question).strip()]
     if context and context.strip():
         lines += ["", neutralize_markers(context).strip()]
@@ -523,20 +535,28 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
 
 def _ask_by_text(out: dict, question, context, host, dest, link, intro, as_session: bool = True) -> None:
     """`as_session` False keeps the core's name: a question first asked by the core's card stays the core's."""
-    body, routed = proactive_body(question, context, host, dest, link, intro)
+    ws, name, who, err = Path(out["workspace"]), None, None, None
+    try:
+        name = proactive_filename(out["ask_id"], dest.bridge)
+        if as_session:
+            name = published_name(ws, name)
+            out["question"]["asked_by"] = asked_by(ws, name)
+            who = speaker(ws, name, host)
+    except Exception as e:  # noqa: BLE001 — the question is still recorded
+        err = f"{type(e).__name__}: {e}"
+    body, routed = proactive_body(question, context, host, dest, link, intro, who)
     out["bridge"], out["channel"] = dest.bridge, dest.channel if routed else None
     out["where"] = (f"{dest.bridge} {dest.channel}" if routed else
                     f"{dest.bridge} owner-dm" if dest.bridge else "owner-dm (last-active bridge)")
     out["card"] = None
-    try:
-        name = proactive_filename(out["ask_id"], dest.bridge)
-        if as_session:
-            name = published_name(Path(out["workspace"]), name)
-            out["question"]["asked_by"] = asked_by(Path(out["workspace"]), name)
-        write_proactive(Path(out["workspace"]) / "results", name, body)
-        out["proactive_file"] = name
-    except Exception as e:  # noqa: BLE001 — the question is still recorded
-        out["send_error"] = f"{type(e).__name__}: {e}"
+    if err is None:
+        try:
+            write_proactive(ws / "results", name, body)
+            out["proactive_file"] = name
+        except Exception as e:  # noqa: BLE001 — the question is still recorded
+            err = f"{type(e).__name__}: {e}"
+    if err is not None:
+        out["send_error"] = err
     if out["proactive_file"]:
         out["sent_line"] = f"**Sent:** queued {out['where']} via {out['proactive_file']} at {_iso(time.time())}"
     else:

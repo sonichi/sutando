@@ -9,6 +9,8 @@
 - The question records who asked (the worker's agent id when stamped) in the outbox and the row.
 - A decision card stays on the core's path: no asker, no stamped text beside it or in its fallback.
 - The identity is read from the workspace passed in, not the default one.
+- A worker's own-agent ask names the worker (its agent's display name, else its roster label, else
+  "a worker on <host>"); the core's ask reads exactly as before, on both paths.
 Temp workspaces and fakes only; nothing here reads the live workspace or a real token.
 """
 from _helpers.hermetic_env import isolate_os_environ
@@ -304,6 +306,78 @@ class NoStoreAsk(_Ws):
                     names, rec = self.run_cli()
                 self.assertEqual([pr.proactive_worker(n) for n in names], [None])
                 self.assertIsNone(rec["asked_by"])
+
+
+class AskerWording(_Ws):
+    CORE_LEAD = f"Question for you from the {HOST} core — it needs your word:"
+
+    def store_body(self):
+        room_db.ask_owner("Merge #12 now?", urgency="durable", workspace=self.ws, host=HOST, store=None)
+        [name] = self.proactive()
+        return (self.ws / "results" / name).read_text()
+
+    def no_store_body(self):
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(ask_owner_cli, "declared", return_value=None):
+            ask_owner_cli.main(["Ship it?", "--workspace", str(self.ws), "--urgency", "durable"])
+        [name] = self.proactive()
+        return (self.ws / "results" / name).read_text()
+
+    def bodies(self):
+        out = {}
+        for label, fn in (("store", self.store_body), ("no store", self.no_store_body)):
+            for f in (self.ws / "results").glob("*"):
+                f.unlink()
+            out[label] = fn()
+        return out
+
+    def roster(self, label):
+        (self.ws / "state" / "roster.json").write_text(json.dumps({"version": 1, "workers": {
+            W: {"state": "live", "label": label}}}))
+
+    def test_the_cores_ask_reads_exactly_as_before(self):
+        bodies = self.bodies()
+        self.assertEqual(bodies["no store"],
+                         f"[dm-only]\n{self.CORE_LEAD}\n\nShip it?\n\nReply here.\n")
+        self.assertEqual(bodies["store"].splitlines()[:4],
+                         ["[dm-only]", self.CORE_LEAD, "", "Merge #12 now?"])
+
+    def test_a_worker_acting_through_the_core_still_reads_as_the_core(self):
+        self.record(disabled=True, agent_display_name="Helper")
+        with self.as_worker():
+            bodies = self.bodies()
+        for label, body in bodies.items():
+            self.assertEqual(body.splitlines()[1], self.CORE_LEAD, label)
+
+    def test_a_worker_with_its_own_agent_names_itself_not_the_core(self):
+        cases = (("display name", {"agent_display_name": "Helper"}, "Docs bee", "Helper"),
+                 ("roster label", {}, "Docs bee", "Docs bee"),
+                 ("neither", {}, None, f"a worker on {HOST}"))
+        for label, extra, roster_label, who in cases:
+            with self.subTest(label):
+                self.record(**extra)
+                (self.ws / "state" / "roster.json").unlink(missing_ok=True)
+                if roster_label:
+                    self.roster(roster_label)
+                with self.as_worker():
+                    bodies = self.bodies()
+                for path, body in bodies.items():
+                    self.assertEqual(body.splitlines()[1], f"Question for you from {who} — it needs your word:",
+                                     (path, body))
+                    self.assertNotIn("core", body, path)
+
+    def test_a_decision_cards_text_fallback_stays_the_cores(self):
+        self.record(agent_display_name="Helper")
+        (self.ws / "state" / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space"}))
+        manager = mock.Mock()
+        manager.create.side_effect = OSError("store refused")
+        manager.get.return_value = None
+        with self.as_worker():
+            out = pqa.queue_question("Merge it?", workspace=self.ws, host=HOST, default_action="merge",
+                                     options=[("Hold", "wait")], manager=manager)
+            pqa.create_card(out)
+        [name] = self.proactive()
+        self.assertEqual((self.ws / "results" / name).read_text().splitlines()[1], self.CORE_LEAD)
 
 
 if __name__ == "__main__":
