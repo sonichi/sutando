@@ -140,9 +140,6 @@ _LIMIT_WAIT_GAP = 4
 # affordance hint that gates it are src/delivery/pane_gate.py's, shared with the notifiers.
 _SIGNATURES = list(CLAUDE_GATE_SIGNATURES)
 _AWAIT_HINT = AWAIT_HINT
-# The CLI's retry countdown ("Continuing shortly · Esc to cancel") resumes by itself: its Esc
-# stops a retry, it answers nothing. Only the hint search skips it; a dialog under it still reads.
-_RETRY_COUNTDOWN = re.compile(r"^[ \t]*Continuing shortly\b[^\n]*$", re.I | re.M)
 _IDLE = CLAUDE_IDLE
 #: A pane-border/rule row (box-drawing chars only) -- never legitimate composer text.
 _BORDER_LINE = BORDER_LINE
@@ -253,7 +250,7 @@ def classify(pane: str, styled_pane: "str | None" = None):
                    if styled_lines is not None and kept and max(kept) < len(styled_lines)
                    else tail)
     tail = gate_evidence(tail, styled_tail, CLAUDE)
-    if not _AWAIT_HINT.search(_RETRY_COUNTDOWN.sub("", tail)):
+    if not _AWAIT_HINT.search(tail):
         return None
     # Two gates in one pane (one in scrollback): the live one is nearest the bottom.
     hits = [(m.start(), i, kind) for i, (kind, rx) in enumerate(_SIGNATURES)

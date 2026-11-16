@@ -2160,46 +2160,48 @@ class TestLiveIdleSeatUnderAPinnedBanner(unittest.TestCase):
         self.assertEqual((st[0], st[3]), ("blocked-human", "usage-limit"))
 
 
-class TestRetryCountdownIsNotAGate(unittest.TestCase):
-    """The CLI's countdown after a failed request resumes by itself. Its "Esc to cancel" once
-    read as a key hint, no signature matched, and the pane fell to the "unknown" gate:
-    blocked-human, with a card telling the owner the seat needed them. The panes below are
-    synthetic, reduced from a real capture to the rows that still tripped it."""
+class TestUsageLimitContinuingShortly(unittest.TestCase):
+    """Near the reset the CLI's usage-limit footer reads "Usage limit reached · limit resets <t>" over
+    "Continuing shortly · Esc to cancel". The captured tail often holds only the second row, which
+    read as an unknown prompt: a held seat was carded as "awaiting user: unknown" instead of as its
+    usage limit. The panes are synthetic, reduced from a real capture."""
 
-    PANES = {
-        "request failed, empty composer":
+    FULL = "  Usage limit reached · limit resets 3pm\n  Continuing shortly · Esc to cancel\n"
+    ROW_ONLY = {
+        "status line, empty composer":
             "  Agent: request failed\n  ❯\n  Continuing shortly · Esc to cancel\n",
-        "request failed, no composer":
+        "status line, no composer":
             "  Agent: request failed\n  Continuing shortly · Esc to cancel\n",
-        "a tool running, empty composer":
-            "  Agent: using a tool\n  ❯\n  Continuing shortly · Esc to cancel\n",
     }
 
-    def test_the_countdown_alone_is_no_gate(self):
-        for name, pane in self.PANES.items():
+    def test_the_full_footer_is_the_usage_limit(self):
+        self.assertEqual(classify(self.FULL)[0], "usage-limit")
+        self.assertEqual(compose_state(self.FULL, "idle", True)[:2],
+                         ("blocked-human", "awaiting user: usage-limit"))
+
+    def test_the_continuing_row_alone_is_the_usage_limit_not_an_unknown_prompt(self):
+        for name, pane in self.ROW_ONLY.items():
             with self.subTest(name):
-                self.assertIsNone(classify(pane))
+                self.assertEqual(classify(pane)[0], "usage-limit")
+                self.assertEqual(compose_state(pane, "idle", True)[1], "awaiting user: usage-limit")
 
-    def test_an_idle_seat_under_the_countdown_is_idle_ready(self):
-        for name, pane in self.PANES.items():
-            with self.subTest(name):
-                self.assertEqual(compose_state(pane, "idle", True)[0], "idle-ready")
+    def test_the_footer_under_a_session_limit_stays_that_screen(self):
+        pane = "  You've hit your session limit · resets 3pm\n  Continuing shortly · Esc to cancel\n"
+        self.assertEqual(classify(pane)[0], "session-limit")
 
-    def test_a_working_seat_under_the_countdown_is_running(self):
-        pane = self.PANES["a tool running, empty composer"]
-        self.assertEqual(compose_state(pane, "working", True)[0], "running")
+    def test_the_earlier_phase_of_the_same_footer_reads_the_same(self):
+        for row in ("Continuing automatically at 3pm · Esc to cancel",
+                    "Continuing automatically shortly · Esc to cancel"):
+            with self.subTest(row):
+                self.assertEqual(classify(f"  Agent: idle\n  {row}\n")[0], "usage-limit")
 
-    def test_a_real_dialog_under_the_countdown_still_reads(self):
-        """Only the countdown row is ignored: a live dialog below it keeps its own hint."""
-        pane = "  Continuing shortly · Esc to cancel\n" + _LOGIN_MENU
-        self.assertIsNotNone(classify(pane))
-        self.assertEqual(compose_state(pane, "idle", True)[0], "blocked-human")
+    def test_only_the_cancellable_row_is_the_limit(self):
+        """A "Continuing shortly" row that asks for Enter is not the footer and keeps its own reading."""
+        pane = "  Something new\n  Continuing shortly · Press Enter to retry now\n"
+        self.assertNotEqual(classify(pane)[0], "usage-limit")
 
-    def test_an_esc_to_cancel_that_is_not_the_countdown_still_reads(self):
-        """A dialog the patterns do not know, with a plain "Esc to cancel" hint, stays the
-        unknown gate: the owner's no-dead-end rule for an unforeseen prompt is unchanged."""
-        pane = "  Something new needs an answer\n  Esc to cancel\n"
-        self.assertEqual(classify(pane)[0], "unknown")
+    def test_a_real_dialog_under_the_footer_is_that_dialog(self):
+        self.assertEqual(classify(self.FULL + _LOGIN_MENU)[0], "login")
 
 
 if __name__ == "__main__":
