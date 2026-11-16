@@ -5,7 +5,8 @@ Only a long-lived caffeinate holding -s keeps a lid-closed Mac on AC awake; `caf
 `-w PID` or one wrapping a command ends on its own and must not count. `check` reads a `PID PPID ARGS`
 snapshot (None means ps could not run, so the answer is unknown, never absent); `start` launches the
 holder detached and returns only once it is seen alive. The match is host-wide on purpose: staying
-awake is a property of the host, so any user's or checkout's holder counts.
+awake is a property of the host, so any user's or checkout's holder counts. `sleep_guard.enabled: false`
+in sutando config turns it off: nothing is started and the row reads ok; a running holder is never killed.
 
 CLI (startup.sh):  sleep_guard.py ensure   start the holder unless one already runs (no-op off macOS)
 """
@@ -21,6 +22,18 @@ NAME = "sleep-guard"
 COMMAND = ("caffeinate", "-d", "-i", "-s")
 _VALUE_FLAGS = {"t", "w"}  # each takes a value and makes caffeinate exit on its own
 SETTLE_S = 0.5
+CONFIG_KEY = "sleep_guard.enabled"
+_OFF_HINT = 'turn it off with {"sleep_guard": {"enabled": false}} in sutando.config.local.json'
+
+
+def is_enabled() -> bool:
+    """The config switch; on when the key is absent or the config cannot be read."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from sutando_config import resolve_sleep_guard_enabled
+        return resolve_sleep_guard_enabled()
+    except Exception:  # noqa: BLE001 — an unreadable switch leaves the guard on
+        return True
 
 
 class StartFailed(Exception):
@@ -53,10 +66,13 @@ def holder_present(ps_output: Optional[str]) -> Optional[bool]:
     return False
 
 
-def check(ps_output: Optional[str], platform: str = sys.platform) -> Optional[dict]:
-    """Health row for the sleep guard, or None off macOS."""
+def check(ps_output: Optional[str], platform: str = sys.platform,
+          enabled: Optional[bool] = None) -> Optional[dict]:
+    """Health row for the sleep guard, or None off macOS. `enabled` None reads the config."""
     if platform != "darwin":
         return None
+    if not (is_enabled() if enabled is None else enabled):
+        return {"name": NAME, "status": "ok", "detail": f"disabled by config ({CONFIG_KEY})"}
     present = holder_present(ps_output)
     if present is None:
         return {"name": NAME, "status": "unknown",
@@ -65,7 +81,8 @@ def check(ps_output: Optional[str], platform: str = sys.platform) -> Optional[di
         return {"name": NAME, "status": "ok", "detail": "caffeinate -s holder running"}
     return {"name": NAME, "status": "warn",
             "detail": ("no caffeinate -s holder: a lid-closed Mac on AC will sleep and agents answer "
-                       "in bursts. Fix: python3 src/health-check.py --fix (starts caffeinate -d -i -s)")}
+                       "in bursts. Fix: python3 src/health-check.py --fix (starts caffeinate -d -i -s), or "
+                       f"{_OFF_HINT}")}
 
 
 def start(spawn: Callable = subprocess.Popen, settle_s: float = SETTLE_S) -> int:
@@ -90,10 +107,12 @@ def start(spawn: Callable = subprocess.Popen, settle_s: float = SETTLE_S) -> int
 
 
 def ensure(snapshot: Callable[[], Optional[str]], platform: str = sys.platform,
-           spawn: Callable = subprocess.Popen) -> tuple:
+           spawn: Callable = subprocess.Popen, enabled: Optional[bool] = None) -> tuple:
     """(ok, message): start the holder when none is seen. An unreadable table starts nothing."""
     if platform != "darwin":
         return True, "skipped: not macOS"
+    if not (is_enabled() if enabled is None else enabled):
+        return True, f"sleep guard off by config ({CONFIG_KEY}): caffeinate not started"
     present = holder_present(snapshot())
     if present is None:
         return False, "sleep guard unknown: ps could not run, caffeinate not started"

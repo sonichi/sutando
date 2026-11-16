@@ -68,6 +68,7 @@ _KNOWN_TOP_LEVEL_KEYS = {
     "stand",          # this instance's `Stand:` commit-trailer value
     "skills",
     "notifications",
+    "sleep_guard",
 }
 
 # Blocks every consumer reads with `.get()`. A scalar here is what the schema's
@@ -83,6 +84,7 @@ _OBJECT_TOP_LEVEL_KEYS = {
     "bridges",
     "skills",
     "notifications",
+    "sleep_guard",
 }
 
 _SUPPORTED_CORE_RUNTIMES = {"claude", "codex"}
@@ -643,6 +645,25 @@ def resolve_macos_notifications(repo_root: Optional[Path] = None) -> bool:
               f"treated as false", file=sys.stderr)
         return False
     return val is True
+
+
+def resolve_sleep_guard_enabled(repo_root: Optional[Path] = None) -> bool:
+    """``sleep_guard.enabled``: whether Sutando keeps a macOS caffeinate -s holder running.
+
+    On by default. Only a JSON ``false`` turns it off; any other value, or a config that
+    cannot be read, leaves it on, so a malformed switch never lets the Mac sleep unasked.
+    """
+    try:
+        val = (load_config(repo_root).get("sleep_guard") or {}).get("enabled")
+    except Exception as exc:  # noqa: BLE001 — the guard must stay on when config is unreadable
+        print(f"sutando config: cannot read sleep_guard.enabled ({exc}); treated as true",
+              file=sys.stderr)
+        return True
+    if val is not None and not isinstance(val, bool):
+        print(f"sutando config: sleep_guard.enabled must be a JSON boolean, got {val!r}; "
+              f"treated as true", file=sys.stderr)
+        return True
+    return val is not False
 
 
 def resolve_dotenv(repo_root: Optional[Path] = None,

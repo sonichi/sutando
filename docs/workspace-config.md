@@ -82,6 +82,10 @@ Sutando posts no macOS desktop notifications unless you opt in:
 
 Off by default. Only a JSON `true` turns them on; any other value, or a config that cannot be read, leaves them off. Every macOS sender asks the one reader: `resolve_macos_notifications()` in `src/sutando_config.py` (TypeScript: `resolveMacosNotifications()` in `src/sutando_config.ts`; shell: `bash scripts/sutando-config.sh macos-notifications`, used by `src/macos-notify.sh`). With it off, pending questions, bridge restarts, the agent shepherd and health alerts still reach you through your DM or the core's task queue; a banner that only acknowledged your own action (a context drop, a screen recording) is simply not shown.
 
+## macOS keep-awake guard (`sleep_guard.enabled`)
+
+On by default: startup keeps a `caffeinate -d -i -s` holder running and health-check `--fix` restarts it. `{ "sleep_guard": { "enabled": false } }` turns it off (only a JSON `false` does); startup and `--fix` then start nothing, the `sleep-guard` row reads ok, and a holder already running is left alone. Read by `resolve_sleep_guard_enabled()` in `src/sutando_config.py`, through `src/sleep_guard.py`.
+
 ## Three common overrides
 
 ```json

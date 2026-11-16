@@ -201,6 +201,18 @@
         }
       }
     },
+    "sleep_guard": {
+      "type": "object",
+      "description": "The macOS keep-awake holder (caffeinate -d -i -s) that startup starts and health-check restarts. See docs/workspace-config.md.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Keep a caffeinate -s holder running so a lid-closed Mac on AC stays awake. On by default; only JSON false turns it off, and any other value or an unreadable config leaves it on. Off: startup and health-check --fix start nothing and the sleep-guard row reads ok; an already-running holder is not stopped. Read by resolve_sleep_guard_enabled() in src/sutando_config.py, through src/sleep_guard.py."
+        }
+      }
+    },
     "notifications": {
       "type": "object",
       "description": "Desktop notifications Sutando may post on this host. See docs/workspace-config.md.",
