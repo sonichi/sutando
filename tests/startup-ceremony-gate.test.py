@@ -40,19 +40,22 @@ if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
     PYBASE += ["-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}"]
 
 
-def _workspace(root: Path, *, started_at: float, stamp_ts: float | None) -> Path:
+def _workspace(root: Path, *, started_at: float, stamp_ts: float | None,
+               entries: list | None = None) -> Path:
+    entries = ENTRIES if entries is None else entries
     ws = root / "workspace"
     cfg = ws / "hosts" / HOST / "crons.json"
     cfg.parent.mkdir(parents=True)
-    cfg.write_text(json.dumps(ENTRIES))
+    cfg.write_text(json.dumps(entries))
     state = ws / "state"
     state.mkdir()
     (state / "session-starts.log").write_text(
         json.dumps({"host": HOST, "session_started_at": started_at}) + "\n"
     )
     if stamp_ts is not None:
+        n = len(entries)
         (cfg.parent / "schedule-crons-stamp.json").write_text(
-            json.dumps({"ts": stamp_ts, "registered": 1, "config_total": 1})
+            json.dumps({"ts": stamp_ts, "registered": n, "config_total": n})
         )
     return ws
 
@@ -100,6 +103,36 @@ class VerifyCeremonyGate(unittest.TestCase):
             (ws / "hosts" / HOST / "schedule-crons-stamp.json").write_text(
                 json.dumps({"ts": 1_000_300.0, "registered": 1, "config_total": 1})
             )
+            self.assertEqual(_run(ws).returncode, 0)
+
+    def test_empty_crons_with_stale_stamp_refuses_completion(self):
+        """crons.json is `[]` (owner paused every job): the health probe calls a stale stamp ok
+        because nothing is expected, but the desktop compares only stamp vs boundary and would
+        re-send /startup every 10 minutes. The gate must hold the desktop's criterion."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = _workspace(Path(td), started_at=1_000_000.0, stamp_ts=900_000.0, entries=[])
+            r = _run(ws)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("predates this session", r.stderr)
+            self.assertIn("NOT complete", r.stderr)
+
+    def test_empty_crons_with_fresh_zero_stamp_passes(self):
+        """A ceremony that legitimately registered nothing completes once it stamps."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = _workspace(Path(td), started_at=1_000_000.0, stamp_ts=1_000_300.0, entries=[])
+            r = _run(ws)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_empty_crons_without_stamp_passes(self):
+        """No stamp at all is "no evidence" for the desktop too; never a re-send."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = _workspace(Path(td), started_at=1_000_000.0, stamp_ts=None, entries=[])
+            self.assertEqual(_run(ws).returncode, 0)
+
+    def test_stamp_within_launch_skew_passes(self):
+        """The desktop allows 2 s of launcher skew; the gate must not be stricter."""
+        with tempfile.TemporaryDirectory() as td:
+            ws = _workspace(Path(td), started_at=1_000_000.0, stamp_ts=999_998.5, entries=[])
             self.assertEqual(_run(ws).returncode, 0)
 
     def test_missing_probe_is_rc2_not_rc1(self):
