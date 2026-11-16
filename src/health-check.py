@@ -6705,18 +6705,23 @@ def check_battery() -> dict:
 
     return {"name": name, "status": "ok", "detail": "power state unknown"}
 
-def check_sleep_guard(snapshot=None, platform: Optional[str] = None) -> "dict | None":
+def check_sleep_guard(snapshot=None, platform: Optional[str] = None,
+                      enabled: Optional[bool] = None) -> "dict | None":
     """The long-lived caffeinate -s holder startup.sh starts (src/sleep_guard.py); None off macOS."""
     plat = sys.platform if platform is None else platform
     if plat != "darwin":
         return None
-    return sleep_guard.check((snapshot or _ps_snapshot)(), platform=plat)
+    on = sleep_guard.is_enabled() if enabled is None else enabled
+    return sleep_guard.check((snapshot or _ps_snapshot)() if on else None, platform=plat, enabled=on)
 
 
-def apply_sleep_guard_fix(checks: list, stream=None, spawn=None, snapshot=None) -> Optional[int]:
+def apply_sleep_guard_fix(checks: list, stream=None, spawn=None, snapshot=None,
+                          enabled: Optional[bool] = None) -> Optional[int]:
     """--fix for `sleep-guard`: start a detached holder when none runs; returns its pid once seen running."""
     row = next((c for c in checks if c and c.get("name") == sleep_guard.NAME), None)
     if not row or row.get("status") != "warn":
+        return None
+    if not (sleep_guard.is_enabled() if enabled is None else enabled):
         return None
     out = stream or sys.stdout
     look = snapshot or _ps_snapshot

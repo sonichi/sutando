@@ -16,6 +16,7 @@ isolate_os_environ(CLAUDE_CONFIG_DIR=tempfile.mkdtemp(prefix="sleepguard-ccd-"))
 
 import importlib.util
 import io
+import json
 import os
 import subprocess
 import sys
@@ -26,6 +27,18 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 import sleep_guard as sg  # noqa: E402
+import sutando_config  # noqa: E402
+
+_REAL_IS_ENABLED = sg.is_enabled
+
+
+def setUpModule():
+    # A host's own config must not decide the default-path tests; the switch is tested explicitly.
+    sg.is_enabled = lambda: True
+
+
+def tearDownModule():
+    sg.is_enabled = _REAL_IS_ENABLED
 
 HEADER = "  PID  PPID ARGS\n"
 WITH_HOLDER = HEADER + "  101     1 /usr/sbin/cfprefsd agent\n  202     1 caffeinate -d -i -s\n"
@@ -194,6 +207,81 @@ class Ensure(unittest.TestCase):
         spawn = SpawnStub()
         self.assertTrue(sg.ensure(lambda: "", platform="linux", spawn=spawn)[0])
         self.assertEqual(spawn.calls, [])
+
+
+class Disabled(unittest.TestCase):
+    """`sleep_guard.enabled: false`: nothing is started, the row is ok, a running holder is left alone."""
+    hc = load_hc()
+
+    def test_check_row_is_ok_and_names_key(self):
+        for snap in (SHORT_ONLY, WITH_HOLDER, None):
+            row = sg.check(snap, platform="darwin", enabled=False)
+            self.assertEqual(row["status"], "ok")
+            self.assertEqual(row["detail"], "disabled by config (sleep_guard.enabled)")
+
+    def test_health_row_skips_ps_when_off(self):
+        called = []
+        row = self.hc.check_sleep_guard(snapshot=lambda: called.append(1), platform="darwin", enabled=False)
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(called, [])
+
+    def test_health_row_reads_switch_by_default(self):
+        with unittest.mock.patch.object(sg, "is_enabled", return_value=False):
+            row = self.hc.check_sleep_guard(snapshot=lambda: SHORT_ONLY, platform="darwin")
+        self.assertEqual(row["status"], "ok")
+
+    def test_ensure_starts_nothing(self):
+        spawn, snaps = SpawnStub(), []
+        ok, msg = sg.ensure(lambda: snaps.append(1), platform="darwin", spawn=spawn, enabled=False)
+        self.assertTrue(ok)
+        self.assertIn("off by config (sleep_guard.enabled)", msg)
+        self.assertEqual((spawn.calls, snaps), ([], []))
+
+    def test_fix_starts_nothing_even_on_a_warn_row(self):
+        row = self.hc.check_sleep_guard(snapshot=lambda: SHORT_ONLY, platform="darwin", enabled=True)
+        spawn = SpawnStub()
+        self.assertIsNone(self.hc.apply_sleep_guard_fix([row], stream=io.StringIO(), spawn=spawn,
+                                                        snapshot=lambda: SHORT_ONLY, enabled=False))
+        self.assertEqual(spawn.calls, [])
+
+    def test_warn_row_names_the_off_switch(self):
+        row = sg.check(SHORT_ONLY, platform="darwin", enabled=True)
+        self.assertEqual(row["status"], "warn")
+        self.assertIn('"sleep_guard": {"enabled": false}', row["detail"])
+
+    def test_is_enabled_delegates_to_config_and_fails_on(self):
+        with unittest.mock.patch.object(sutando_config, "resolve_sleep_guard_enabled", return_value=False):
+            self.assertFalse(_REAL_IS_ENABLED())
+
+        def boom():
+            raise RuntimeError("bad config")
+        with unittest.mock.patch.object(sutando_config, "resolve_sleep_guard_enabled", boom):
+            self.assertTrue(_REAL_IS_ENABLED())
+
+
+class ConfigKey(unittest.TestCase):
+    """`sleep_guard.enabled` as the canonical loader reads it from a tmp checkout."""
+
+    def resolve(self, cfg):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "sutando.config.json").write_text(json.dumps(cfg))
+            sutando_config._reset_cache_for_tests()
+            try:
+                with unittest.mock.patch("sys.stderr", io.StringIO()):
+                    return sutando_config.resolve_sleep_guard_enabled(repo_root=root)
+            finally:
+                sutando_config._reset_cache_for_tests()
+
+    def test_default_is_on(self):
+        self.assertTrue(self.resolve({}))
+        self.assertTrue(self.resolve({"sleep_guard": {}}))
+
+    def test_only_json_false_turns_it_off(self):
+        self.assertFalse(self.resolve({"sleep_guard": {"enabled": False}}))
+        self.assertTrue(self.resolve({"sleep_guard": {"enabled": True}}))
+        for junk in ("false", 0, None):
+            self.assertTrue(self.resolve({"sleep_guard": {"enabled": junk}}), junk)
 
 
 class Cli(unittest.TestCase):
