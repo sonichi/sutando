@@ -8743,6 +8743,8 @@ def _post_proactive() -> None:
             _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
             continue
         dest_room = resolve_destination(CURRENT_ROOM, room_id=room_override) if room_override else resolve_destination(OWNER_PRIVATE)
+        if room_override:
+            body = _guard_proactive_for_room(f.name, claimed_text, body, dest_room)
         thread_root = _proactive_thread_root(claimed_text, f.name)
         about = about_task(f.name)
         if about:
@@ -8751,6 +8753,17 @@ def _post_proactive() -> None:
                     **({"thread_root": thread_root} if thread_root else {}),
                     **({"task_id": about} if about else {})}
         _send_proactive(claim, f, envelope, room_override is None, noticed)
+
+
+def _guard_proactive_for_room(name: str, text: str, body: str, room: str) -> str:
+    """The body a redirected proactive may post in `room`: the shared guard's verdict. No room
+    record states its audience tier, so every room but the owner DM guards as a non-owner one."""
+    _, withheld = team_result_guard.guard_proactive_for_destination(
+        text, room, resolve_destination(OWNER_PRIVATE), "guest", None, secret_filter=filter_chat_secrets)
+    if withheld is None:
+        return body
+    _log(f"[team-guard] withheld proactive {name} for {room}: {withheld}")
+    return team_result_guard.TEAM_LEAK_RESULT
 
 
 def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, noticed: set) -> None:
