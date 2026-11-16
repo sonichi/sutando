@@ -99,6 +99,19 @@ class CoreWatcher(unittest.TestCase):
         self.assertIn("task-free.txt", calls)
         self.assertIn("TASK_FILE: task-free.txt", out)
 
+    def test_a_held_task_under_the_cores_own_dead_claim_is_still_replayed(self):
+        self.task("task-mine")
+        self.hold("task-mine")
+        claims = self.ws / "state" / "task-event-handler-claims"
+        claims.mkdir(parents=True)
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        (claims / "task-mine.txt").write_text(
+            f"{dead.pid}\nold-watcher\n{self.ws / 'tasks' / 'task-mine.txt'}\nfallback\n\n")
+        out, err, calls = self.run_watcher(lambda o, e: self.calls.exists() and "task-mine" in self.calls.read_text())
+        self.assertIn("task-mine.txt", calls, "the core finishes its own interrupted routing")
+        self.assertNotIn("held by a worker, not routing it: task-mine.txt", err)
+
     @unittest.skipIf(os.geteuid() == 0, "root reads an unreadable folder")
     def test_deliveries_that_cannot_be_read_still_go_to_the_handler(self):
         self.task("task-unsure")
