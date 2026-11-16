@@ -17,13 +17,13 @@ import importlib.util
 import contextlib
 import io
 import json
-import multiprocessing
 import os
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
@@ -107,8 +107,9 @@ class ClaimRun(unittest.TestCase):
                          .returncode, 0)
 
     def test_concurrent_claimants_of_one_slot_have_one_winner(self):
-        with multiprocessing.get_context("spawn").Pool(8) as pool:
-            got = pool.map(_claim_in_child, [(str(self.ws), KEY, f"t{i}") for i in range(16)])
+        # Threads: each opens its own lock descriptor, and no spawned child re-imports this file.
+        with ThreadPoolExecutor(8) as pool:
+            got = list(pool.map(_claim_in_child, [(str(self.ws), KEY, f"t{i}") for i in range(16)]))
         self.assertEqual(got.count("run"), 1)
         self.assertEqual(got.count("skip"), 15)
 
