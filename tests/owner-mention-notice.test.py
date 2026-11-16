@@ -299,6 +299,46 @@ class Run(unittest.TestCase):
         self.run_with(notice(eid="$d"), "next", ok, 2000, "task-4.txt")
         self.assertEqual(sent[-1], "Mention notice: next\n", "the published batch is settled")
 
+    def failing(self, attr, owner=None):
+        def boom(*a, **k):
+            raise OSError("read-only")
+        owner = owner or on
+        real = getattr(owner, attr)
+        setattr(owner, attr, boom)
+        self.addCleanup(setattr, owner, attr, real)
+
+    def test_a_state_or_lock_error_on_a_same_task_retry_keeps_the_published_result(self):
+        def crash(result, text, extra):
+            Path(result).write_text(text)
+            raise KeyboardInterrupt
+        sent = []
+        ok = lambda result, text, extra: sent.append(text) or 0  # noqa: E731
+        self.run_with(engage(eid="$a"), "first", ok, 1000)
+        self.run_with(engage(eid="$b"), "held", ok, 1100, "task-2.txt")
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_with(engage(eid="$c"), "third", crash, 1700, "task-3.txt")
+        result = self.ws / "results" / "task-3.txt"
+        for attr, owner in (("_write", on), ("locked_file", on.file_lock)):
+            with self.subTest(attr):
+                self.failing(attr, owner)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    verdict = self.run_with(engage(eid="$c"), "third", ok, 1701, "task-3.txt")
+                self.doCleanups()
+                self.assertEqual(verdict, ("skip: already published", 0))
+                self.assertEqual(result.read_text(), "Mention notice: third\nAlso: held\n")
+        self.assertEqual(len(sent), 2, "nothing published again")
+
+    def test_a_state_error_in_the_claim_window_publishes_nothing(self):
+        results = self.ws / "results"
+        (results / (".task-3.disposing-1-1-1-1-1-" + "0" * 64 + "-ab")).write_text("out")
+        sent = []
+        ok = lambda result, text, extra: sent.append(text) or 0  # noqa: E731
+        self.failing("_write")
+        with contextlib.redirect_stderr(io.StringIO()):
+            verdict = self.run_with(engage(eid="$c"), "third", ok, 1700, "task-3.txt")
+        self.assertEqual((verdict, sent), (("skip: already published", 0), []))
+        self.assertFalse((results / "task-3.txt").exists())
+
     def test_an_empty_note_publishes_nothing(self):
         rc, _verdict, body = self.main(notice(), "  \n")
         self.assertEqual((rc, body), (2, None))

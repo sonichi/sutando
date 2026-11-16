@@ -21,7 +21,8 @@ means failed. A task whose own result already exists never writes it again. Ever
 made one line with nothing hidden in it, the message opens with `Mention notice:` (what the
 owner's client reads as notices), and it is quoted with `result_markers.neutralize_markers`.
 When the state cannot be read or written before the publish (a read-only turn) the note is
-sent unbatched rather than lost; once the publisher has run, a state error is only reported.
+sent unbatched rather than lost, unless this task's result is already out or its outcome is
+unknown; once the publisher has run, a state error is only reported.
 
 Usage:
   owner_notice.py publish --task-file <task> <result path> [--window-min N] [--workspace DIR]
@@ -44,8 +45,7 @@ REPO = Path(__file__).resolve().parents[3]  # lint-workspace-resolution: allow-r
 if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
 import file_lock, local_task_protocol, result_markers  # noqa: E401,E402
-from delivery import disposal  # noqa: E402
-from delivery.task_dispatch import find_ready_result  # noqa: E402
+from delivery import disposal, task_dispatch  # noqa: E402
 
 PUBLISHER = REPO / "src" / "result_publish.py"
 SKIP_BODY = "[no-send]"
@@ -134,7 +134,7 @@ def published(result: str) -> "bool | None":
     archived), None while a disposal claim or delivery pin holds it, else False."""
     path = Path(result)
     results, stem = path.parent, path.stem
-    if find_ready_result(results, stem) is not None:
+    if task_dispatch.find_ready_result(results, stem) is not None:
         return True
     if disposal.find_claims(results, stem) or os.path.lexists(disposal.pin_path(results, stem)):
         return None
@@ -194,6 +194,10 @@ def run(task_text: str, note: str, result: str, extra: list, *, workspace: Path,
                 inflight[key] = {"status": "publishing", "result": result, "lines": lines}
             _write(path, state)
         except OSError as e:
+            if published(result) is not False:
+                print(f"owner_notice: state unwritable ({type(e).__name__}); result kept",
+                      file=sys.stderr)
+                return "skip: already published", 0
             print(f"owner_notice: state unwritable ({type(e).__name__}); sending unbatched",
                   file=sys.stderr)
             return "sent", publisher(result, compose([note]), extra)
