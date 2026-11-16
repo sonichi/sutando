@@ -192,14 +192,15 @@ def handoff_ask(ws: Path, route: dict, task_id: str, rid: str, sender: str, ques
            "event_id": rec["event_id"]}
     if wait_s > 0:
         got = ph.collect(ws, task_id, wait_s, runner=runner, sleep=sleep)
-        out["reply"], out["reply_status"] = got["reply"], got["status"]
+        out["reply"], out["reply_status"], out["reply_typed"] = got["reply"], got["status"], got["typed"]
     return out
 
 
 def collect(workspace, task_id: str, wait_s: float, *, sleep=time.sleep, runner=None) -> dict:
     """The reply to an earlier s.space hand-off, waiting up to `wait_s`."""
     got = _sibling("pool_handoff").collect(workspace, task_id, wait_s, runner=runner, sleep=sleep)
-    return {"task_id": task_id, "via": "room", "reply": got["reply"], "reply_status": got["status"]}
+    return {"task_id": task_id, "via": "room", "reply": got["reply"], "reply_status": got["status"],
+            "reply_typed": got["typed"]}
 
 
 def wait_for_reply(workspace, task_id: str, wait_s: float, *, sleep=time.sleep) -> "str | None":
@@ -273,7 +274,8 @@ def main(argv=None) -> int:
         via = " as a room hand-off" if out.get("via") else ""
         print(f"asked {out['to'][:8]} as {out['task_id']}{via}")
         if out.get("status") == "unconfirmed":
-            print("the hand-off could not be confirmed; it is not sent again", file=sys.stderr)
+            print("the hand-off could not be confirmed; it is not sent again, and only a reply that "
+                  "starts with its typed header will be matched", file=sys.stderr)
         if a.wait > 0:
             _print_reply(out, a.wait)
     return _exit_code(out, a.wait)

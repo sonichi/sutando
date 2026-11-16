@@ -4,7 +4,8 @@ build and parse its reply, and pick the reply out of a room read, all keyed by o
 
 Stdlib only, used by both sides: the delegating core and the agent that answers. A request is
 the work in plain words with one trailer line; a reply is a message from the asked agent that
-starts with `ref <task id> <status>:`, or any message of its that replies to the request.
+starts with `ref <task id> <status>:`. A typed `done` or `failed` ends the hand-off; an untyped
+reply to the request is only the fallback once the asker's deadline passes.
 
     python3 src/handoff_contract.py parse --task-file F       {"kind": "request"|"reply"|null, ...}
     python3 src/handoff_contract.py reply --task-id ID --status done|failed|working < body
@@ -88,28 +89,50 @@ def parse_reply(body) -> "dict | None":
     return {"task_id": m.group(1), "status": m.group(2), "text": body[m.end():].strip()}
 
 
-def find_reply(messages, *, task_id: str, agent: str, event_id: "str | None") -> "dict | None":
-    """The asked agent's earliest final answer to this hand-off in a room read, else None.
+def _hit(m: dict, status: str, text: str, typed: bool) -> dict:
+    return {"status": status, "text": text, "typed": typed, "event_id": m.get("event_id"), "ts": m.get("ts")}
 
-    A message counts when its sender is `agent` and it replies to or threads under the request
-    event, or its typed header names `task_id`. A typed header naming another task never counts;
-    an untyped reply to the request is `done`; `working` is progress, skipped."""
+
+def find_reply(messages, *, task_id: str, agent: str, event_id: "str | None" = None) -> "dict | None":
+    """The asked agent's earliest typed final answer (`done` or `failed`) naming `task_id`, else
+    None. Only a typed final ends a hand-off; an untyped message may be an acknowledgement."""
     hits = []
     for m in messages or ():
-        if not isinstance(m, dict) or m.get("sender") != agent:
-            continue
-        typed = parse_reply(m.get("body"))
-        related = bool(event_id) and event_id in (m.get("in_reply_to"), m.get("thread_root"))
-        if typed is not None:
-            if typed["task_id"] != task_id or typed["status"] not in FINAL:
-                continue
-            hits.append((m, typed["status"], typed["text"]))
-        elif related and isinstance(m.get("body"), str):
-            hits.append((m, "done", m["body"].strip()))
+        if isinstance(m, dict) and m.get("sender") == agent:
+            typed = parse_reply(m.get("body"))
+            if typed is not None and typed["task_id"] == task_id and typed["status"] in FINAL:
+                hits.append((m, typed))
     if not hits:
         return None
-    m, status, text = min(hits, key=lambda h: h[0].get("ts") or 0)
-    return {"status": status, "text": text, "event_id": m.get("event_id"), "ts": m.get("ts")}
+    m, typed = min(hits, key=lambda h: h[0].get("ts") or 0)
+    return _hit(m, typed["status"], typed["text"], True)
+
+
+def latest_untyped(messages, *, agent: str, event_id: "str | None") -> "dict | None":
+    """The asked agent's latest untyped message replying to or threaded under the request event:
+    the answer only when no typed final has come by the deadline. None without an event id."""
+    if not event_id:
+        return None
+    hits = [m for m in messages or () if isinstance(m, dict) and m.get("sender") == agent
+            and isinstance(m.get("body"), str) and parse_reply(m["body"]) is None
+            and event_id in (m.get("in_reply_to"), m.get("thread_root"))]
+    if not hits:
+        return None
+    m = max(hits, key=lambda h: h.get("ts") or 0)
+    return _hit(m, "done", m["body"].strip(), False)
+
+
+def request_seen(messages, *, task_id: str, sender: str, event_id: "str | None") -> bool:
+    """Whether a room read reaches back to the request itself, so every reply to it is inside."""
+    for m in messages or ():
+        if not isinstance(m, dict):
+            continue
+        if event_id and m.get("event_id") == event_id:
+            return True
+        req = parse_request(m.get("body")) if m.get("sender") == sender else None
+        if req is not None and req["task_id"] == task_id:
+            return True
+    return False
 
 
 def main(argv=None) -> int:

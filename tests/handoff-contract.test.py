@@ -88,9 +88,11 @@ class Find(unittest.TestCase):
                          msg(WORKER, hc.build_reply(TID, "done", "first"), 5, "$b")])
         self.assertEqual(got["text"], "first")
 
-    def test_an_untyped_reply_to_the_request_is_done(self):
-        got = self.find([msg(WORKER, "plain answer", 4, "$a", in_reply_to="$req")])
-        self.assertEqual((got["status"], got["text"]), ("done", "plain answer"))
+    def test_an_untyped_reply_is_never_the_final(self):
+        ack = msg(WORKER, "On it, will report back.", 3, "$a", in_reply_to="$req")
+        self.assertIsNone(self.find([ack]))
+        got = self.find([ack, msg(WORKER, hc.build_reply(TID, "done", "42"), 5, "$b")])
+        self.assertEqual((got["text"], got["typed"]), ("42", True), "the typed final wins over an earlier ack")
 
     def test_others_never_count(self):
         self.assertIsNone(self.find([
@@ -99,9 +101,31 @@ class Find(unittest.TestCase):
             msg(WORKER, "unrelated", 3, "$z"),
             "not a dict"]))
 
-    def test_no_event_id_still_matches_a_typed_reply_only(self):
-        self.assertIsNone(self.find([msg(WORKER, "plain", 1, "$a", in_reply_to=None)], event_id=None))
-        self.assertIsNotNone(self.find([msg(WORKER, hc.build_reply(TID, "done", "x"), 1, "$a")], event_id=None))
+
+class Fallback(unittest.TestCase):
+    def test_the_latest_untyped_reply_to_the_request(self):
+        got = hc.latest_untyped([msg(WORKER, "On it", 1, "$a", in_reply_to="$req"),
+                                 msg(WORKER, "Here it is", 4, "$b", thread_root="$req"),
+                                 msg(WORKER, "elsewhere", 9, "$c"),
+                                 msg(CORE, "me", 10, "$d", in_reply_to="$req"),
+                                 msg(WORKER, hc.build_reply(TID, "working", "x"), 11, "$e", in_reply_to="$req")],
+                                agent=WORKER, event_id="$req")
+        self.assertEqual((got["text"], got["typed"], got["status"]), ("Here it is", False, "done"))
+
+    def test_without_an_event_nothing_untyped_can_be_matched(self):
+        self.assertIsNone(hc.latest_untyped([msg(WORKER, "plain", 1, "$a", in_reply_to=None)],
+                                            agent=WORKER, event_id=None))
+
+
+class RequestSeen(unittest.TestCase):
+    def test_by_event_or_by_the_request_body(self):
+        body = hc.build_request(TID, "q")
+        self.assertTrue(hc.request_seen([msg(CORE, "x", 1, "$req")], task_id=TID, sender=CORE, event_id="$req"))
+        self.assertTrue(hc.request_seen([msg(CORE, body, 1, "$r")], task_id=TID, sender=CORE, event_id=None))
+        self.assertFalse(hc.request_seen([msg(WORKER, body, 1, "$r"), "x"], task_id=TID, sender=CORE, event_id=None),
+                         "a quoted request from someone else is not the boundary")
+        self.assertFalse(hc.request_seen([msg(CORE, hc.build_request("task-other", "q"), 1, "$r")],
+                                         task_id=TID, sender=CORE, event_id="$req"))
 
 
 class Cli(unittest.TestCase):

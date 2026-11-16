@@ -379,8 +379,13 @@ worker's agent in `WORKER_POOL_HANDOFF_ROOM` (the owner-only consult room, or a 
 through the room CLI at `WORKER_POOL_HANDOFF_ROOM_CLI` (the consult skill's `mention` / `read`
 verbs). The worker's own lane delivers it like any message to that agent. `--wait` reads the room
 for the reply, correlated by task id; with no `--wait`, `--collect <task id> [--wait N]` reads it
-later. Timeouts and exit codes are the folder path's; a `failed` reply exits 1, an unreadable room
-or a refused post exits 2, and an unconfirmed post is never sent again.
+later. Each read reaches back to the hand-off itself (up to 1000 messages), so a reply that busy
+traffic pushed out of the latest page is still found, and a typed answer, once found, is kept in
+`state/pool-handoff/<task id>.json` for later collects. A typed `done` or `failed` returns at
+once; an untyped reply ("On it") is progress, and the latest one is returned only when the wait
+ends with no typed answer. Timeouts and exit codes are the folder path's; a `failed` reply exits
+1, an unreadable room or a refused post exits 2, and an unconfirmed post is never sent again
+(only a typed reply can be matched to it, since it has no event to reply to).
 
 Kept on the folder path: a worker with no, a disabled or a parked identity; a worker's own ask;
 a relayed ask (`--relayed-from`, so its tier is kept); an ask with `--parent-task`; and the
@@ -391,8 +396,9 @@ quietly sent through the folder.
 **Answering a hand-off (the worker).** `python3 src/handoff_contract.py parse --task-file <task>`
 says whether the task is a hand-off and gives its task id. Answer as an ordinary result, so the
 lane posts it as a reply to the hand-off, starting with the typed header:
-`python3 src/handoff_contract.py reply --task-id <id> --status done|failed < answer`. A plain reply
-to the hand-off message also counts as `done`. If the core's own lane gets the reply as a task, it
+`python3 src/handoff_contract.py reply --task-id <id> --status done|failed < answer`. An
+acknowledgement may come first (plain, or `--status working`); only the typed final ends the
+hand-off, and a plain reply counts only if no typed one arrives in time. If the core's own lane gets the reply as a task, it
 answers `[no-send]`: `pool_ask` collects it from the room.
 
 **Authority.** A hand-off is a message from the core's agent, at the tier the room gives that

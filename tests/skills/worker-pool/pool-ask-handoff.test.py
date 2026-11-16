@@ -37,11 +37,12 @@ ON = {ph.FLAG: "1", ph.ROOM: ROOM, ph.ROOM_CLI: "/fake/room_cli.py"}
 
 
 class FakeRoom:
-    """The room transport: records each call, posts the hand-off, answers reads from a script."""
+    """The room transport: records each call, posts the hand-off, and answers each read newest
+    first, honouring --limit, from the request plus the scripted replies."""
 
     def __init__(self, *, mention=None, replies=None, read_ok=True):
         self.calls, self.mention_out, self.replies, self.read_ok = [], mention, replies, read_ok
-        self.posted = None
+        self.posted, self.reads = None, 0
 
     def __call__(self, argv):
         verb = argv[2]
@@ -51,13 +52,21 @@ class FakeRoom:
             out = self.mention_out if self.mention_out is not None else {"ok": True, "event_id": "$req", "posted": True}
             stdout = out if isinstance(out, str) else json.dumps(out)
         else:
+            self.reads += 1
             tid = hc.parse_request(self.posted)["task_id"] if self.posted else "task-none"
-            msgs = self.replies(tid) if callable(self.replies) else (self.replies or [])
-            stdout = json.dumps({"ok": True, "messages": msgs}) if self.read_ok else "gateway down"
+            msgs = self.replies(tid) if callable(self.replies) else list(self.replies or [])
+            if self.posted:
+                msgs.append({"sender": CORE_AGENT, "body": self.posted, "ts": 0, "event_id": "$req"})
+            msgs.sort(key=lambda m: m["ts"], reverse=True)
+            limit = int(argv[argv.index("--limit") + 1])
+            stdout = json.dumps({"ok": True, "messages": msgs[:limit]}) if self.read_ok else "gateway down"
         return subprocess.CompletedProcess(argv, 0, stdout, "")
 
     def verbs(self):
         return [a[2] for a in self.calls]
+
+    def limits(self):
+        return [a[a.index("--limit") + 1] for a in self.calls if a[2] == "read"]
 
 
 def make_worker(ws, label):
@@ -166,10 +175,57 @@ class FlagOn(Base):
         rec = ph.read_record(self.ws, out["task_id"])
         self.assertEqual((rec["event_id"], rec["to_agent"], rec["worker"]), ("$req", WORKER_AGENT, self.alpha))
 
-    def test_an_untyped_reply_to_the_request_is_the_answer(self):
-        room = FakeRoom(replies=[{"sender": WORKER_AGENT, "body": "plain", "ts": 1, "event_id": "$p",
+    def test_an_acknowledgement_then_a_typed_answer_returns_the_answer(self):
+        ack = {"sender": WORKER_AGENT, "body": "On it, will report back.", "ts": 1, "event_id": "$a",
+               "in_reply_to": "$req"}
+
+        def replies(tid):
+            if self.room.reads < 2:          # the first poll sees only the acknowledgement
+                return [ack]
+            return [ack, {"sender": WORKER_AGENT, "body": hc.build_reply(tid, "done", "the answer"), "ts": 2,
+                          "event_id": "$d", "in_reply_to": "$req"}]
+        self.room = FakeRoom(replies=replies)
+        out = self.ask(self.room, wait_s=30)
+        self.assertEqual((out["reply"], out["reply_status"], out["reply_typed"]), ("the answer", "done", True))
+        self.assertGreaterEqual(self.room.reads, 2, "there was a poll between the two")
+        self.assertTrue(self.sleeps, "it waited instead of returning the acknowledgement")
+
+    def test_the_latest_untyped_reply_is_the_answer_only_at_the_deadline(self):
+        room = FakeRoom(replies=[{"sender": WORKER_AGENT, "body": "On it", "ts": 1, "event_id": "$a",
+                                  "in_reply_to": "$req"},
+                                 {"sender": WORKER_AGENT, "body": "plain answer", "ts": 2, "event_id": "$p",
                                   "in_reply_to": "$req"}])
-        self.assertEqual(self.ask(room, wait_s=5)["reply"], "plain")
+        out = self.ask(room, wait_s=0.05)
+        self.assertEqual((out["reply"], out["reply_typed"]), ("plain answer", False))
+        self.assertGreater(room.reads, 1, "untyped replies are progress until the deadline")
+        self.assertNotIn("result", ph.read_record(self.ws, out["task_id"]), "an untyped answer is not kept")
+
+    def test_a_reply_past_the_latest_page_is_found_and_kept(self):
+        room = FakeRoom()
+        tid = self.ask(room)["task_id"]
+        noise = [{"sender": "@someone:srv", "body": f"chatter {n}", "ts": 10 + n, "event_id": f"$n{n}"}
+                 for n in range(60)]
+        room.replies = [{"sender": WORKER_AGENT, "body": hc.build_reply(tid, "done", "buried"), "ts": 5,
+                         "event_id": "$r"}] + noise
+        got = pa.collect(self.ws, tid, 0, runner=room, sleep=self.sleep)
+        self.assertEqual((got["reply"], got["reply_status"]), ("buried", "done"))
+        self.assertEqual(room.limits(), [str(ph.READ_LIMIT), str(ph.READ_LIMIT * 2)], "it paged back to the request")
+        room.replies = noise
+        again = pa.collect(self.ws, tid, 0, runner=room, sleep=self.sleep)
+        self.assertEqual(again["reply"], "buried", "a collected answer is kept, not lost to traffic")
+        self.assertEqual(len(room.limits()), 2, "a kept answer needs no read")
+
+    def test_paging_stops_at_the_end_of_history_and_at_the_cap(self):
+        room = FakeRoom()
+        tid = self.ask(room)["task_id"]
+        room.posted = None                   # the request is not in this room's history
+        room.replies = [{"sender": "@someone:srv", "body": "x", "ts": n, "event_id": f"$x{n}"} for n in range(70)]
+        self.assertEqual(pa.collect(self.ws, tid, 0, runner=room, sleep=self.sleep)["reply_status"], "waiting")
+        self.assertEqual(room.limits(), ["50", "100"], "a short page means no more history")
+        room.calls.clear()
+        room.replies = [{"sender": "@someone:srv", "body": "x", "ts": n, "event_id": f"$x{n}"} for n in range(2000)]
+        pa.collect(self.ws, tid, 0, runner=room, sleep=self.sleep)
+        self.assertEqual(room.limits()[-1], str(ph.MAX_READ))
 
     def test_no_wait_sends_and_collect_reads_it_later(self):
         room = FakeRoom()
@@ -287,7 +343,7 @@ class Cli(Base):
         room = FakeRoom(mention="not json")
         rc, out, err = self.run_cli("--to", "alpha", "--ask", "?", room=room)
         self.assertEqual(rc, 0)
-        self.assertIn("could not be confirmed", err)
+        self.assertIn("only a reply that starts with its typed header will be matched", err)
         tid = out.split(" as ")[1].split()[0]
         room.replies = [{"sender": WORKER_AGENT, "body": hc.build_reply(tid, "done", "fine"), "ts": 1, "event_id": "$e"}]
         rc, out, _ = self.run_cli("--collect", tid, room=room)
@@ -295,8 +351,8 @@ class Cli(Base):
         rc, out, _ = self.run_cli("--collect", tid, "--json", room=room)
         self.assertEqual((rc, json.loads(out)["reply_status"]), (0, "done"))
         room.replies = []
-        rc, _, _ = self.run_cli("--collect", tid, room=room)
-        self.assertEqual(rc, 1, "no reply yet")
+        rc, out, _ = self.run_cli("--collect", tid, room=room)
+        self.assertEqual((rc, out.strip()), (0, "fine"), "a collected typed answer is kept")
 
     def test_collect_goes_alone(self):
         with self.assertRaises(SystemExit) as cm:
