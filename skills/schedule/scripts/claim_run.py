@@ -4,20 +4,22 @@
 The run's key is (schedule id, slot) from the server's briefing line, the first line of the
 task body; without one it is the task's `agent_trigger_id`, then its `id`. The record lives
 under `<workspace>/state/schedule/claims/` and every transition holds a per-key lock, so of any
-number of concurrent or retried tasks for one run exactly one is told `run`.
+number of concurrent or retried tasks for one run exactly one is told `run`. That claim gets a
+run id; every later transition must present it, so no other task can resume or close the run.
 
 States: claimed -> waiting_approval -> claimed (resumed) -> done. A `claimed` record older than
---stale-minutes whose task has no ready result becomes `needs_reconcile`: it is reported to the
-owner, never re-run. At most once, with reconciliation; not exactly once.
+--stale-minutes is settled from the outbox's own outcome for its task's result: CONFIRMED is
+done; NOT_DELIVERED, OUTCOME_UNKNOWN or no item is `needs_reconcile`, reported to the owner and
+never replayed. At most once, with reconciliation; not exactly once.
 
 Usage (all take --workspace <dir>):
   claim_run.py claim  --task-file <task> [--stale-minutes N]
-      run <key> | resume <key> (exit 0); skip: <why> (exit 3); needs-reconcile <key> (exit 4)
+      run <key> <run id> (exit 0); skip: <why> (exit 3); needs-reconcile <key> <run id> (exit 4)
   claim_run.py sweep  [--stale-minutes N]   prints each run that newly needs reconciling
-  claim_run.py wait   --key <key>    claimed -> waiting_approval
-  claim_run.py resume --key <key>    waiting_approval -> claimed (the owner approved)
-  claim_run.py done   --key <key>    claimed|waiting_approval|needs_reconcile -> done
-  claim_run.py release --key <key>   needs_reconcile -> removed (the owner chose to re-run)
+  claim_run.py wait|resume|done|release --key <key> --run-id <run id>
+      wait: claimed -> waiting_approval; resume: waiting_approval -> claimed (owner approved);
+      done: claimed|waiting_approval|needs_reconcile -> done;
+      release: needs_reconcile -> removed (the owner chose to run the slot again)
 """
 from __future__ import annotations
 
@@ -29,14 +31,15 @@ import os
 import re
 import sys
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]  # lint-workspace-resolution: allow-repo-root
 if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
+import outbox  # noqa: E402
 from local_task_protocol import parse_task_headers  # noqa: E402
-from task_disposition import ANSWERED, task_disposition  # noqa: E402
 
 SKIP_EXIT, RECONCILE_EXIT, REFUSED_EXIT = 3, 4, 5
 CLAIMED, WAITING, DONE, RECONCILE = "claimed", "waiting_approval", "done", "needs_reconcile"
@@ -69,8 +72,7 @@ def _record_path(workspace: Path, key: str) -> Path:
 
 @contextmanager
 def _locked(workspace: Path, key: str):
-    d = claims_dir(workspace)
-    d.mkdir(parents=True, exist_ok=True)
+    claims_dir(workspace).mkdir(parents=True, exist_ok=True)
     with open(_record_path(workspace, key).with_suffix(".lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield _record_path(workspace, key)
@@ -82,7 +84,7 @@ def read(workspace: Path, key: str) -> "dict | None":
     except FileNotFoundError:
         return None
     except (OSError, ValueError):
-        return {"key": key, "state": RECONCILE, "task_id": "unknown", "updated_at": 0}
+        return {"key": key, "state": RECONCILE, "task_id": "unknown", "run_id": "", "updated_at": 0}
 
 
 def _write(path: Path, record: dict) -> None:
@@ -94,42 +96,50 @@ def _write(path: Path, record: dict) -> None:
     os.replace(tmp, path)
 
 
-def _answered(workspace: Path, task_id: str) -> bool:
-    try:
-        return task_disposition(workspace, task_id) == ANSWERED
-    except ValueError:
+def delivery_outcome(workspace: Path, task_id: str) -> "str | None":
+    """The outbox's outcome for this task's result across every gateway outbox; None when none holds it."""
+    results = workspace / "results"
+    roots = sorted(p for p in results.iterdir() if p.name.startswith(".outbox")) if results.is_dir() else []
+    outcome = None
+    for root in roots:
+        item = outbox.read_item(root, task_id) if task_id else None
+        if item is None:
+            continue
+        if item.get("status") == "DELIVERED":
+            return outbox.DeliveryOutcome.CONFIRMED.value
+        if item.get("unreadable") or item.get("status") == "PARKED" or outbox.dispatch_unsettled(item):
+            outcome = outbox.DeliveryOutcome.OUTCOME_UNKNOWN.value
+        elif outcome is None:
+            outcome = outbox.DeliveryOutcome.NOT_DELIVERED.value
+    return outcome
+
+
+def _settle_stale(workspace: Path, path: Path, rec: dict, now: float, stale_minutes: int) -> bool:
+    """A stale `claimed` is done only on a CONFIRMED delivery; anything else needs reconciling."""
+    if now - rec.get("updated_at", 0) < stale_minutes * 60:
         return False
+    delivery = delivery_outcome(workspace, rec.get("task_id", ""))
+    confirmed = delivery == outbox.DeliveryOutcome.CONFIRMED.value
+    rec.update(state=DONE if confirmed else RECONCILE, delivery=delivery or "none",
+               updated_at=int(now))
+    _write(path, rec)
+    return True
 
 
 def claim(workspace: Path, key: str, task_id: str, *, stale_minutes: int = STALE_MINUTES,
           now: "float | None" = None) -> "tuple[str, dict]":
-    """('run'|'resume'|'skip'|'reconcile', record) for this task's attempt at the run."""
+    """('run'|'skip'|'reconcile', record) for this task's attempt at the run."""
     now = time.time() if now is None else now
     with _locked(workspace, key) as path:
         rec = read(workspace, key)
         if rec is None:
-            rec = {"key": key, "task_id": task_id, "state": CLAIMED,
+            rec = {"key": key, "task_id": task_id, "run_id": uuid.uuid4().hex, "state": CLAIMED,
                    "claimed_at": int(now), "updated_at": int(now)}
             _write(path, rec)
             return "run", rec
-        state = rec.get("state")
-        if state == WAITING:
-            rec.update(state=CLAIMED, task_id=task_id, updated_at=int(now))
-            _write(path, rec)
-            return "resume", rec
-        if state == CLAIMED and _settle_stale(workspace, path, rec, now, stale_minutes):
+        if rec.get("state") == CLAIMED and _settle_stale(workspace, path, rec, now, stale_minutes):
             return ("reconcile" if rec["state"] == RECONCILE else "skip"), rec
         return "skip", rec
-
-
-def _settle_stale(workspace: Path, path: Path, rec: dict, now: float, stale_minutes: int) -> bool:
-    """A stale `claimed` becomes done when its task was answered, else needs_reconcile."""
-    if now - rec.get("updated_at", 0) < stale_minutes * 60:
-        return False
-    answered = _answered(workspace, rec.get("task_id", ""))
-    rec.update(state=DONE if answered else RECONCILE, updated_at=int(now))
-    _write(path, rec)
-    return True
 
 
 def sweep(workspace: Path, *, stale_minutes: int = STALE_MINUTES,
@@ -139,8 +149,9 @@ def sweep(workspace: Path, *, stale_minutes: int = STALE_MINUTES,
     found = []
     d = claims_dir(workspace)
     for p in sorted(d.glob("*.json")) if d.is_dir() else []:
-        key = _key_of(p)
-        if key is None:
+        try:
+            key = json.loads(p.read_text(encoding="utf-8")).get("key")
+        except (OSError, ValueError):
             continue
         with _locked(workspace, key) as path:
             rec = read(workspace, key)
@@ -150,19 +161,13 @@ def sweep(workspace: Path, *, stale_minutes: int = STALE_MINUTES,
     return found
 
 
-def _key_of(path: Path) -> "str | None":
-    try:
-        return json.loads(path.read_text(encoding="utf-8")).get("key")
-    except (OSError, ValueError):
-        return None
-
-
-def transition(workspace: Path, key: str, cmd: str, *, now: "float | None" = None) -> "dict | None":
-    """Apply wait/resume/done/release; None when the record is not in a state that allows it."""
+def transition(workspace: Path, key: str, cmd: str, run_id: str, *,
+               now: "float | None" = None) -> "dict | None":
+    """Apply wait/resume/done/release for the claim holding `run_id`; None when refused."""
     now = time.time() if now is None else now
     with _locked(workspace, key) as path:
         rec = read(workspace, key)
-        if rec is None:
+        if rec is None or not run_id or rec.get("run_id") != run_id:
             return None
         if cmd == "release":
             if rec.get("state") != RECONCILE:
@@ -184,32 +189,38 @@ def _workspace(arg: "str | None") -> Path:
     return resolve_workspace(migrate=False)
 
 
+def _reconcile_line(rec: dict) -> str:
+    return (f"needs-reconcile {rec['key']} {rec.get('run_id', '')} "
+            f"(task {rec.get('task_id')}, delivery {rec.get('delivery', 'none')})")
+
+
 def main(argv: "list[str] | None" = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("claim")
     c.add_argument("--task-file", required=True)
-    c.add_argument("--stale-minutes", type=int, default=STALE_MINUTES)
-    c.add_argument("--workspace")
     w = sub.add_parser("sweep")
-    w.add_argument("--stale-minutes", type=int, default=STALE_MINUTES)
-    w.add_argument("--workspace")
+    for p in (c, w):
+        p.add_argument("--stale-minutes", type=int, default=STALE_MINUTES)
+        p.add_argument("--workspace")
     for name in ("wait", "resume", "done", "release"):
         t = sub.add_parser(name)
         t.add_argument("--key", required=True)
+        t.add_argument("--run-id", required=True)
         t.add_argument("--workspace")
     args = ap.parse_args(argv)
     ws = _workspace(args.workspace)
 
     if args.cmd == "sweep":
         for rec in sweep(ws, stale_minutes=args.stale_minutes):
-            print(f"needs-reconcile {rec['key']} (claimed by {rec.get('task_id')}, no result)")
+            print(_reconcile_line(rec))
         return 0
     if args.cmd != "claim":
-        rec = transition(ws, args.key, args.cmd)
+        rec = transition(ws, args.key, args.cmd, args.run_id)
         if rec is None:
             cur = read(ws, args.key)
-            print(f"refused: {args.key} is {cur.get('state') if cur else 'unclaimed'}")
+            print(f"refused: {args.key} is {cur.get('state') if cur else 'unclaimed'} "
+                  "or held by another run id")
             return REFUSED_EXIT
         print(f"{args.cmd} {args.key}")
         return 0
@@ -219,11 +230,11 @@ def main(argv: "list[str] | None" = None) -> int:
     task_id = (parse_task_headers(text).get("id") or "").strip() or task_file.stem
     key = run_key(text, task_file.stem)
     verdict, rec = claim(ws, key, task_id, stale_minutes=args.stale_minutes)
-    if verdict in ("run", "resume"):
-        print(f"{verdict} {key}")
+    if verdict == "run":
+        print(f"run {key} {rec['run_id']}")
         return 0
     if verdict == "reconcile":
-        print(f"needs-reconcile {key} (claimed by {rec.get('task_id')}, no result)")
+        print(_reconcile_line(rec))
         return RECONCILE_EXIT
     print(f"skip: {key} is {rec.get('state')} (task {rec.get('task_id', 'unknown')})")
     return SKIP_EXIT
