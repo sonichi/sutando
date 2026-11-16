@@ -576,14 +576,8 @@ if [ $missing -eq 1 ]; then echo ""; echo "Fix the above and try again."; exit 1
 
 # Check macOS permissions (can't grant programmatically, just warn)
 # Prevent display sleep (important for always-on Mac Mini — Zoom/summon fails on lock screen)
-# Only a caffeinate holding -s keeps a lid-closed Mac on AC awake; short-lived `-i -t N` ones must not count.
-SLEEP_GUARD_PATTERN='(^|/)caffeinate( [^ ]+)* -[a-zA-Z]*s( |$)'
-if ! pgrep -qf "$SLEEP_GUARD_PATTERN"; then
-  caffeinate -d -i -s &
-  echo "  ✓ caffeinate started (prevents display and system sleep on AC)"
-else
-  echo "  ✓ caffeinate -s already running"
-fi
+# The holder's definition lives in sleep_guard.py; health-check reuses it to detect and restart a dead one.
+echo "  ✓ $("$PY" "$REPO/src/sleep_guard.py" ensure)"
 
 echo "Checking permissions..."
 # macOS 15+ silently writes a tiny PNG when Screen Recording is denied (exit 0).

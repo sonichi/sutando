@@ -100,6 +100,7 @@ from task_archive import find_task_file  # noqa: E402
 from sutando_config import config_get  # noqa: E402
 import skill_roots  # noqa: E402
 import system_load  # noqa: E402
+import sleep_guard  # noqa: E402
 # Workspace = runtime-state root (tasks/, results/, state/). REPO_DIR stays the
 # source-code root (src/, skills/, logs/, .env, build_log.md). Before PR #762's
 # resolver existed, every consumer hardcoded REPO_DIR / "tasks" — so when the
@@ -6703,6 +6704,30 @@ def check_battery() -> dict:
         return {"name": name, "status": "warn", "detail": f"on battery at {pct}% — no AC power"}
 
     return {"name": name, "status": "ok", "detail": "power state unknown"}
+
+def check_sleep_guard(snapshot=None, platform: Optional[str] = None) -> "dict | None":
+    """The long-lived caffeinate -s holder startup.sh starts (src/sleep_guard.py); None off macOS."""
+    plat = sys.platform if platform is None else platform
+    if plat != "darwin":
+        return None
+    return sleep_guard.check((snapshot or _ps_snapshot)(), platform=plat)
+
+
+def apply_sleep_guard_fix(checks: list, stream=None, spawn=None) -> Optional[int]:
+    """--fix for `sleep-guard`: start a detached holder when the probe saw none; returns its pid."""
+    row = next((c for c in checks if c and c.get("name") == sleep_guard.NAME), None)
+    if not row or row.get("status") != "warn":
+        return None
+    out = stream or sys.stdout
+    try:
+        pid = sleep_guard.start(spawn) if spawn else sleep_guard.start()
+    except OSError as e:
+        print(f"sleep-guard: could not start caffeinate: {e}", file=out, flush=True)
+        return None
+    row.update(status="ok", detail=f"caffeinate -s holder started by --fix (pid {pid})")
+    print(f"sleep-guard: started caffeinate -d -i -s (pid {pid})", file=out, flush=True)
+    return pid
+
 
 def check_memory() -> dict:
     """Warn/fail on real macOS memory pressure, not raw 'unused' pages. Issue #1485.
@@ -13928,6 +13953,9 @@ def run_all_checks() -> list[dict]:
     queue_age_sec = int(config_get("SUTANDO_HEALTH_QUEUE_AGE_SEC", "300"))
     queue_count = int(config_get("SUTANDO_HEALTH_QUEUE_COUNT", "3"))
     checks.append(check_battery())
+    sleep_guard_row = check_sleep_guard()
+    if sleep_guard_row:
+        checks.append(sleep_guard_row)
     checks.append(check_memory())
     checks.append(check_core_proactive_loop(threshold_sec=loop_stale_sec))
     checks.append(check_cron_schedule())
@@ -15568,6 +15596,7 @@ def main():
         apply_task_watcher_sentinel_fix(checks, stream=sys.stderr if as_json else sys.stdout)
         apply_claude_hooks_fix(checks, stream=sys.stderr if as_json else sys.stdout)
         apply_system_load_reap(checks, stream=sys.stderr if as_json else sys.stdout)
+        apply_sleep_guard_fix(checks, stream=sys.stderr if as_json else sys.stdout)
 
     # Optional: the owner's ag2.space DM via the gateway, core-independent. It runs first,
     # so --notify-on-fail falls back to macOS only for a set this DM did not deliver.

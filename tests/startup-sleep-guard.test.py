@@ -3,9 +3,9 @@
 
 A bare `pgrep -q caffeinate` was satisfied by the short `caffeinate -i -t 300`
 processes worker sessions spawn, so startup skipped the -s guard and a lid-closed
-Mac on AC really slept once they exited. This test uses the REAL pattern line
-from src/startup.sh, both against argv strings and against live processes it
-spawns itself (matched by pid, so other caffeinates on the host do not count).
+Mac on AC really slept once they exited. This test uses the REAL pattern from
+src/sleep_guard.py (which startup.sh calls), both against argv strings and against
+live processes it spawns itself (matched by pid, so other caffeinates do not count).
 """
 import pathlib
 import re
@@ -18,18 +18,25 @@ STARTUP = REPO / "src" / "startup.sh"
 
 
 def _pattern() -> str:
-    lines = [ln.strip() for ln in STARTUP.read_text().splitlines()
-             if ln.strip().startswith("SLEEP_GUARD_PATTERN=")]
-    assert len(lines) == 1, f"expected one SLEEP_GUARD_PATTERN line in src/startup.sh, found {len(lines)}"
-    out = subprocess.run(["bash", "-c", f'{lines[0]}; printf %s "$SLEEP_GUARD_PATTERN"'],
-                         capture_output=True, text=True, check=True)
-    return out.stdout
+    sys.path.insert(0, str(REPO / "src"))
+    import sleep_guard
+    return sleep_guard.PATTERN
+
+
+def _startup_delegates() -> list[str]:
+    text = STARTUP.read_text()
+    fails = []
+    if 'src/sleep_guard.py" ensure' not in text:
+        fails.append("src/startup.sh no longer calls sleep_guard.py ensure")
+    if "caffeinate" in text:
+        fails.append("src/startup.sh names caffeinate itself instead of leaving it to sleep_guard.py")
+    return fails
 
 
 def _argv_cases(pat: str) -> list[str]:
     rx = re.compile(pat)
     held = ["caffeinate -s", "caffeinate -d -i -s", "caffeinate -dims", "/usr/bin/caffeinate -s -w 123",
-            "caffeinate -s -t 30"]
+            "caffeinate -s -t 30", "caffeinate -dis"]
     not_held = ["caffeinate -i -t 300", "caffeinate -d", "caffeinate -i", "caffeinate", "mycaffeinate -s",
                 "grep caffeinate -s"]
     fails = [f"should hold: {a!r}" for a in held if not rx.search(a)]
@@ -56,7 +63,7 @@ def _live_cases(pat: str) -> list[str]:
 
 def main() -> int:
     pat = _pattern()
-    fails = _argv_cases(pat) + _live_cases(pat)
+    fails = _startup_delegates() + _argv_cases(pat) + _live_cases(pat)
     for f in fails:
         print("FAIL", f)
     print("all passed" if not fails else f"{len(fails)} failed")
