@@ -335,7 +335,7 @@ from . import undelivered_quarantine
 from . import deleted_binding
 from . import result_labels
 from .proactive_routing import (PROACTIVE_OUTBOX_DIRNAME, about_task, about_task_ts, proactive_filename,
-                                proactive_item_id)
+                                proactive_item_id, resolve_attachment_path)
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from . import health_command
@@ -7913,7 +7913,7 @@ def _read_attachment(path_str: str, confine_root=None) -> "tuple[str, str, str]"
     ("", "", reason) — the refusals both upload routes report in-band."""
     if confine_root is _CONFINE_UNRESOLVED:
         return "", "", "task provenance unavailable"
-    fpath = os.path.realpath(os.path.expanduser(path_str.strip()))
+    fpath = resolve_attachment_path(path_str)
     if not is_path_sendable(fpath):
         return "", "", "path not allowlisted"
     if confine_root is not None:
@@ -8384,7 +8384,7 @@ def _payload_room(payload) -> "str | None":
 
 
 def _proactive_item_id(stem: str, body: str, attachments=()) -> str:
-    return proactive_item_id(stem, body, attachments)
+    return proactive_item_id(stem, body, attachments, admit=is_path_sendable, max_bytes=MAX_MEDIA_BYTES)
 
 
 def _proactive_requeue_command(root, item_id: str, body_sha256: str, reset_attempts: bool = False) -> str:

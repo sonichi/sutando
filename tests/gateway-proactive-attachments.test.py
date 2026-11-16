@@ -12,6 +12,10 @@
   i) a redirect whose body the destination guard withholds -> the notice, no upload, file name only
   j) a clean redirect whose file is refused -> the refusal names only the file name
   k) an item with no attachments keeps its pre-change id
+  l) a `~/` path whose bytes changed is a new send, fingerprinted as the uploader resolves it
+  m) a FIFO outside the allowlist never stalls the drain: the text is sent, nothing uploaded
+  n) a file outside the allowlist is never opened to fingerprint it
+  o) an allowlisted file over the size cap is never read to fingerprint it
 
 Imports the vendored module with an isolated env; never execs the wrapper.
 Run: python3 tests/gateway-proactive-attachments.test.py
@@ -168,6 +172,75 @@ def main() -> int:
     check(len(messages) == 1 and media == [], f"j) text sent, nothing uploaded, got {messages} {media}")
     check(len(refused) == 1 and OUTSIDE.name in refused[0] and str(OUTSIDE.parent) not in refused[0],
           f"j) a guest room's refusal names only the file name, got {refused}")
+
+    # l) HOME is the allowlisted dir, so `~/tilde.csv` is uploadable and lives there.
+    tilde = _ISO / "result" / "tilde.csv"
+    tilde.write_text("t1\n", encoding="utf-8")
+    saved_home = os.environ["HOME"]
+    os.environ["HOME"] = str(_ISO / "result")
+    try:
+        messages, media, _ = drain(["tilde export\n[file: ~/tilde.csv]\n"] * 2, name="proactive-l.txt",
+                                   between=lambda _i: tilde.write_text("t2 changed\n", encoding="utf-8"))
+    finally:
+        os.environ["HOME"] = saved_home
+    check(len(media) == 2 and media[0][1]["content_b64"] != media[1][1]["content_b64"],
+          f"l) changed bytes under a ~/ path upload again, got {len(media)} uploads")
+
+    import threading
+    fifo = _ISO / "outside.fifo"
+    os.mkfifo(fifo)
+    box: dict = {}
+    worker = threading.Thread(target=lambda: box.update(out=drain(f"fifo?\n[file: {fifo}]\n",
+                                                                     name="proactive-m.txt")), daemon=True)
+    worker.start()
+    worker.join(10)
+    stalled = worker.is_alive()
+    if stalled:  # release the blocked reader so the run can finish
+        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        os.close(fd)
+        worker.join(10)
+    check(not stalled, "m) a FIFO outside the allowlist does not block the drain")
+    messages, media, _ = box.get("out", ([], [], []))
+    check(len(messages) == 1 and media == [], f"m) its text is sent and nothing uploaded, got {messages} {media}")
+
+    from ag2_sparrow import proactive_routing as pr
+    opened: list = []
+    import builtins
+    real_open, real_os_open = builtins.open, os.open
+
+    def spy_open(path, *a, **kw):
+        opened.append(str(path))
+        return real_open(path, *a, **kw)
+
+    def spy_os_open(path, *a, **kw):
+        opened.append(str(path))
+        return real_os_open(path, *a, **kw)
+
+    pr.open, os.open = spy_open, spy_os_open
+    try:
+        gb._proactive_item_id("proactive-n", "x", [str(OUTSIDE)])
+    finally:
+        del pr.open
+        os.open = real_os_open
+    check(not any(OUTSIDE.name in p for p in opened), f"n) a refused file is not opened, opened {opened}")
+
+    big = _ISO / "result" / "big.bin"
+    big.write_bytes(b"z" * 64)
+    saved_cap = gb.MAX_MEDIA_BYTES
+    gb.MAX_MEDIA_BYTES = 16
+    pr.open, os.open = spy_open, spy_os_open
+    opened.clear()
+    reads: list = []
+    real_read = os.read
+    os.read = lambda fd, n: reads.append(n) or real_read(fd, n)
+    try:
+        ident = pr.attachment_identity(str(big), gb.is_path_sendable, 16) \
+            if "admit" in pr.attachment_identity.__code__.co_varnames else pr.attachment_identity(str(big))
+    finally:
+        del pr.open
+        os.open, os.read = real_os_open, real_read
+        gb.MAX_MEDIA_BYTES = saved_cap
+    check("oversize" in ident and not reads, f"o) an oversize file is named, not read, got {ident!r} reads={reads}")
 
     print(f"\n{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failure(s)")
     return 1 if FAILS else 0

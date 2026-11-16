@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 from pathlib import Path
 
 # Bridges that deliver proactive files; any other activity channel (voice, github-commits)
@@ -170,23 +172,47 @@ def about_task_filename(task_id: str, ts, channel: "str | None" = None, worker: 
 PROACTIVE_OUTBOX_DIRNAME = ".outbox-ag2space-proactive"
 
 
-def attachment_identity(path: str) -> str:
-    """`<path> <sha256 of its bytes>`, or `<path> -` when it cannot be read: a changed file under
-    the same path is a different attachment."""
-    digest = hashlib.sha256()
+def resolve_attachment_path(path: str) -> str:
+    """The file an attach marker names, as an uploader opens it: `~` expanded, links resolved."""
+    return os.path.realpath(os.path.expanduser(path.strip()))
+
+
+def attachment_identity(path: str, admit=None, max_bytes: int = 0) -> str:
+    """`<resolved path> <size> <sha256>` for a file `admit` allows that is regular and at most
+    `max_bytes`; anything else is named, never read, so a refused file cannot stall the caller."""
+    resolved = resolve_attachment_path(path)
+    if admit is None or not admit(resolved):
+        return f"{resolved} refused"
     try:
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                digest.update(chunk)
+        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     except OSError:
-        return f"{path} -"
-    return f"{path} {digest.hexdigest()}"
+        return f"{resolved} unreadable"
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return f"{resolved} refused"
+        if info.st_size > max_bytes:
+            return f"{resolved} {info.st_size} oversize"
+        digest, left = hashlib.sha256(), max_bytes + 1
+        while left > 0:
+            chunk = os.read(fd, min(1 << 20, left))
+            if not chunk:
+                break
+            digest.update(chunk)
+            left -= len(chunk)
+        return f"{resolved} {info.st_size} {digest.hexdigest()}"
+    except OSError:
+        return f"{resolved} unreadable"
+    finally:
+        os.close(fd)
 
 
-def proactive_item_id(stem: str, body: str, attachments=()) -> str:
+def proactive_item_id(stem: str, body: str, attachments=(), admit=None, max_bytes: int = 0) -> str:
     """One outbox item per file name, body and attachments: a new body or a changed attachment
-    under a delivered name is a new send. The room and thread are re-resolved on every pass."""
-    key = body if not attachments else "\0".join([body, *(attachment_identity(a) for a in attachments)])
+    under a delivered name is a new send. The room and thread are re-resolved on every pass.
+    Only files `admit` allows, up to `max_bytes`, are read: the uploader's own gate."""
+    key = body if not attachments else "\0".join(
+        [body, *(attachment_identity(a, admit, max_bytes) for a in attachments)])
     return f"{stem}~{hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]}"
 
 
