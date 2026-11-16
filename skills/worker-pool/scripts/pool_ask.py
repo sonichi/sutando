@@ -157,8 +157,7 @@ def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
         route = ph.route_for(ws, rid, sender=sender, core=pr.CORE, tier=tier,
                              relayed_from=relayed_from, parent_task=parent_task)
         if route is not None:
-            return handoff_ask(ws, route, task_id, rid, sender, question, wait_s=wait_s,
-                               sleep=sleep, runner=runner)
+            return handoff_ask(ws, route, task_id, rid, sender, question, wait_s=wait_s, runner=runner)
     tasks = ws / "tasks"
     tasks.mkdir(parents=True, exist_ok=True)
     tmp = tasks / f".{task_id}.txt.tmp"
@@ -184,23 +183,26 @@ def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
 
 
 def handoff_ask(ws: Path, route: dict, task_id: str, rid: str, sender: str, question: str, *,
-                wait_s: float, sleep=time.sleep, runner=None) -> dict:
-    """The s.space leg (pool_handoff): no task file and no delivery; the reply is collected from the room."""
+                wait_s: float = 0.0, runner=None) -> dict:
+    """The s.space leg (pool_handoff): one message and one ask record, no task file, no delivery and
+    no wait. The reply is the worker's threaded answer, which arrives as a new task."""
     ph = _sibling("pool_handoff")
-    rec = ph.send(ws, route, task_id, rid, f"[pool-ask from {sender}] {question.strip()}", runner=runner)
-    out = {"task_id": task_id, "to": rid, "from": sender, "via": "room", "status": rec["status"],
-           "event_id": rec["event_id"]}
+    text = f"[pool-ask from {sender}] {question.strip()}"
+    sent = ph.send(route, task_id, text, runner=runner)
+    out = {"task_id": task_id, "to": rid, "from": sender, "via": "room", "status": sent["status"],
+           "event_id": sent["event_id"]}
+    try:
+        ph.record_ask(ws, route, task_id, rid, sent, question)
+    except OSError as e:
+        out["record_error"] = str(e)
     if wait_s > 0:
-        got = ph.collect(ws, task_id, wait_s, runner=runner, sleep=sleep)
-        out["reply"], out["reply_status"], out["reply_typed"] = got["reply"], got["status"], got["typed"]
+        out["reply"], out["wait_honoured"] = None, False
     return out
 
 
-def collect(workspace, task_id: str, wait_s: float, *, sleep=time.sleep, runner=None) -> dict:
-    """The reply to an earlier s.space hand-off, waiting up to `wait_s`."""
-    got = _sibling("pool_handoff").collect(workspace, task_id, wait_s, runner=runner, sleep=sleep)
-    return {"task_id": task_id, "via": "room", "reply": got["reply"], "reply_status": got["status"],
-            "reply_typed": got["typed"]}
+def asked(workspace) -> list:
+    """Recent room hand-offs no core task has answered from the asked agent (pool_handoff.asked)."""
+    return _sibling("pool_handoff").asked(workspace)
 
 
 def wait_for_reply(workspace, task_id: str, wait_s: float, *, sleep=time.sleep) -> "str | None":
@@ -231,18 +233,18 @@ def main(argv=None) -> int:
     p.add_argument("--parent-task", help="the task this ask is part of (its `id:` header): the parent "
                    "shows as delegated until this ask's result exists")
     p.add_argument("--parent-generation", type=int, help="the parent task's execution generation, when known")
-    p.add_argument("--collect", metavar="TASK_ID", help="read the reply to an earlier room hand-off "
-                   "(with --wait, wait for it)")
+    p.add_argument("--asked", action="store_true", help="list recent room hand-offs with no reply "
+                   "task from the asked worker's agent yet")
     p.add_argument("--json", action="store_true")
     a = p.parse_args(argv)
     if a.parent_task:
         import correlation_log
         if not correlation_log.is_task_id(a.parent_task):
             p.error(f"--parent-task {a.parent_task!r} is not a task id")
-    if a.collect:
+    if a.asked:
         if a.who or a.to or a.ask:
-            p.error("--collect goes alone, with --wait")
-        return _cli_collect(a)
+            p.error("--asked goes alone")
+        return _cli_asked(a)
     if a.who == bool(a.to or a.ask):
         p.error("pass --who, or --to with --ask")
     if bool(a.to) != bool(a.ask):
@@ -270,41 +272,38 @@ def main(argv=None) -> int:
         return 2
     if a.json:
         print(json.dumps(out, indent=2, sort_keys=True))
-    else:
-        via = " as a room hand-off" if out.get("via") else ""
-        print(f"asked {out['to'][:8]} as {out['task_id']}{via}")
+    if out.get("via"):
+        if not a.json:
+            print(f"asked {out['to'][:8]} as {out['task_id']} as a room hand-off; the reply arrives as a "
+                  "new task, threaded to this message")
         if out.get("status") == "unconfirmed":
-            print("the hand-off could not be confirmed; it is not sent again, and only a reply that "
-                  "starts with its typed header will be matched", file=sys.stderr)
+            print("the hand-off could not be confirmed; it is not sent again", file=sys.stderr)
+        if out.get("record_error"):
+            print(f"pool_ask: the ask was posted but not recorded: {out['record_error']}", file=sys.stderr)
         if a.wait > 0:
-            _print_reply(out, a.wait)
-    return _exit_code(out, a.wait)
+            print("pool_ask: --wait cannot be honoured for a room hand-off: the ask was posted, and its "
+                  "reply arrives later as a new task", file=sys.stderr)
+            return 2
+        return 0
+    if not a.json:
+        print(f"asked {out['to'][:8]} as {out['task_id']}")
+        if a.wait > 0:
+            print(out["reply"] if out["reply"] is not None else f"(no reply within {a.wait:.0f}s)")
+    return 0 if not a.wait or out.get("reply") is not None else 1
 
 
-def _print_reply(out: dict, wait: float) -> None:
-    if out.get("reply_status") == "failed":
-        print(f"(the worker reported failure) {out['reply']}")
-    else:
-        print(out["reply"] if out["reply"] is not None else f"(no reply within {wait:.0f}s)")
-
-
-def _exit_code(out: dict, wait: float) -> int:
-    if out.get("reply_status") == "failed":
-        return 1
-    return 0 if not wait or out.get("reply") is not None else 1
-
-
-def _cli_collect(a) -> int:
-    try:
-        out = collect(a.workspace, a.collect, a.wait)
-    except (ValueError, OSError) as e:
-        print(f"pool_ask: {e}", file=sys.stderr)
-        return 2
+def _cli_asked(a) -> int:
+    rows = asked(a.workspace)
     if a.json:
-        print(json.dumps(out, indent=2, sort_keys=True))
-    else:
-        _print_reply(out, a.wait)
-    return 0 if out["reply_status"] == "done" else 1
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return 0
+    for r in rows:
+        others = ", ".join(o["sender"] for o in r["other_replies"])
+        print(f"{r['sent_at']} {r['task_id']} -> {str(r.get('worker'))[:8]} ({r.get('status')}) "
+              f"{r.get('question')}" + (f"  [replies only from: {others}]" if others else ""))
+    if not rows:
+        print("no unanswered room hand-offs")
+    return 0
 
 
 if __name__ == "__main__":

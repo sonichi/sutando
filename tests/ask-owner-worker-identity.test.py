@@ -9,6 +9,9 @@
 - The question records who asked (the worker's agent id when stamped) in the outbox and the row.
 - A decision card stays on the core's path: no asker, no stamped text beside it or in its fallback.
 - The identity is read from the workspace passed in, not the default one.
+- A worker's own-agent ask names the worker as "<name> (a worker on <host>)" (its agent's display
+  name, else its roster label), else just "a worker on <host>"; the name is bounded, stripped of
+  format characters, and dropped if it reads as the core. The core's ask reads exactly as before.
 Temp workspaces and fakes only; nothing here reads the live workspace or a real token.
 """
 from _helpers.hermetic_env import isolate_os_environ
@@ -304,6 +307,161 @@ class NoStoreAsk(_Ws):
                     names, rec = self.run_cli()
                 self.assertEqual([pr.proactive_worker(n) for n in names], [None])
                 self.assertIsNone(rec["asked_by"])
+
+
+class AskerWording(_Ws):
+    CORE_LEAD = f"Question for you from the {HOST} core — it needs your word:"
+
+    def store_body(self):
+        room_db.ask_owner("Merge #12 now?", urgency="durable", workspace=self.ws, host=HOST, store=None)
+        [name] = self.proactive()
+        return (self.ws / "results" / name).read_text()
+
+    def no_store_body(self):
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(ask_owner_cli, "declared", return_value=None):
+            ask_owner_cli.main(["Ship it?", "--workspace", str(self.ws), "--urgency", "durable"])
+        [name] = self.proactive()
+        return (self.ws / "results" / name).read_text()
+
+    def bodies(self):
+        out = {}
+        for label, fn in (("store", self.store_body), ("no store", self.no_store_body)):
+            for f in (self.ws / "results").glob("*"):
+                f.unlink()
+            out[label] = fn()
+        return out
+
+    def roster(self, label):
+        (self.ws / "state" / "roster.json").write_text(json.dumps({"version": 1, "workers": {
+            W: {"state": "live", "label": label}}}))
+
+    def test_the_cores_ask_reads_exactly_as_before(self):
+        bodies = self.bodies()
+        self.assertEqual(bodies["no store"],
+                         f"[dm-only]\n{self.CORE_LEAD}\n\nShip it?\n\nReply here.\n")
+        self.assertEqual(bodies["store"].splitlines()[:4],
+                         ["[dm-only]", self.CORE_LEAD, "", "Merge #12 now?"])
+
+    def test_a_worker_acting_through_the_core_still_reads_as_the_core(self):
+        self.record(disabled=True, agent_display_name="Helper")
+        with self.as_worker():
+            bodies = self.bodies()
+        for label, body in bodies.items():
+            self.assertEqual(body.splitlines()[1], self.CORE_LEAD, label)
+
+    def test_a_worker_with_its_own_agent_names_itself_not_the_core(self):
+        cases = (("display name", {"agent_display_name": "Helper"}, "Docs bee", f"Helper (a worker on {HOST})"),
+                 ("roster label", {}, "Docs bee", f"Docs bee (a worker on {HOST})"),
+                 ("neither", {}, None, f"a worker on {HOST}"))
+        for label, extra, roster_label, who in cases:
+            with self.subTest(label):
+                self.record(**extra)
+                (self.ws / "state" / "roster.json").unlink(missing_ok=True)
+                if roster_label:
+                    self.roster(roster_label)
+                with self.as_worker():
+                    bodies = self.bodies()
+                for path, body in bodies.items():
+                    self.assertEqual(body.splitlines()[1], f"Question for you from {who} — it needs your word:",
+                                     (path, body))
+                    self.assertNotIn("core", body, path)
+
+    def phrase(self, display=None, roster=None):
+        self.record(**({"agent_display_name": display} if display is not None else {}))
+        (self.ws / "state" / "roster.json").unlink(missing_ok=True)
+        if roster is not None:
+            (self.ws / "state" / "roster.json").write_text(json.dumps({"version": 1, "workers": {W: roster}}))
+        return C.proactive_author_phrase(pr.stamp_worker("proactive-1.txt", W), HOST, self.ws)
+
+    def test_a_worker_name_that_reads_as_the_core_falls_back(self):
+        fallback = f"a worker on {HOST}"
+        for name in (f"the {HOST} core", f"THE {HOST.upper()} CORE", f"the {HOST} \u0441\u043er\u0435",
+                     "Backup core.", "c\u03bfre", "Backup \uff43\uff4f\uff52\uff45", f"From the {HOST} core, kindly"):
+            with self.subTest(name):
+                self.assertEqual(self.phrase(display=name), fallback)
+                self.assertEqual(self.phrase(roster={"label": name}), fallback)
+        for name in ("Encore", "Score keeper", "Core helper"):
+            with self.subTest(name):
+                self.assertEqual(self.phrase(display=name), f"{name} (a worker on {HOST})")
+
+    def test_the_core_lookalike_never_reaches_either_body(self):
+        self.record(agent_display_name=f"THE {HOST.upper()} CORE")
+        with self.as_worker():
+            bodies = self.bodies()
+        for path, body in bodies.items():
+            self.assertEqual(body.splitlines()[1], f"Question for you from a worker on {HOST} — it needs your word:",
+                             path)
+
+    def test_a_worker_name_never_stands_alone_so_no_probe_reads_as_the_core(self):
+        for name in ("\u03f2ore", "c\u0585re", "\u1d04ore", f"{HOST} core (main)", "core team", "c0re",
+                     f"the {HOST} core"):
+            with self.subTest(name):
+                self.record(agent_display_name=name)
+                with self.as_worker():
+                    bodies = self.bodies()
+                for path, body in bodies.items():
+                    lead = body.splitlines()[1]
+                    self.assertNotEqual(lead, self.CORE_LEAD, path)
+                    self.assertIn(f"a worker on {HOST}", lead, path)
+                    self.assertTrue(lead.endswith(" — it needs your word:"), lead)
+                    if name != f"the {HOST} core":
+                        self.assertIn(f"(a worker on {HOST}) — it needs your word:", lead, path)
+
+    def test_the_roster_order_display_label_first_and_never_the_bare_id(self):
+        self.assertEqual(self.phrase(roster={"label": "Base", "display_label": "Shown"}), f"Shown (a worker on {HOST})")
+        self.assertEqual(self.phrase(roster={"label": W}), f"a worker on {HOST}")
+        self.assertEqual(self.phrase(roster={"display_label": W, "label": "Base"}), f"a worker on {HOST}")
+
+    def test_the_name_is_bounded_and_stripped_of_format_characters(self):
+        cap = C.AUTHOR_PHRASE_MAX
+        self.assertEqual(cap, 64)
+        tail = f" (a worker on {HOST})"
+        self.assertEqual(self.phrase(display="x" * 200), "x" * (cap - 1) + "…" + tail)
+        self.assertEqual(self.phrase(display="y" * cap), "y" * cap + tail)
+        self.assertEqual(self.phrase(display="He\u202elp\u200ber\u2066\ufeff"), "Helper" + tail)
+        self.assertEqual(self.phrase(display="\u200b\u202e"), f"a worker on {HOST}")
+        self.assertEqual(self.phrase(display=f"the {HOST} co\u200bre"), f"a worker on {HOST}")
+
+    def test_an_unreadable_speaker_falls_back_without_blocking_the_ask(self):
+        self.record(agent_display_name="Helper")
+        with mock.patch.object(C, "proactive_author_phrase", side_effect=OSError("unreadable")):
+            for worker, who in ((W, f"a worker on {HOST}"), ("", f"the {HOST} core")):
+                with self.subTest(worker or "core"), self.as_worker(worker):
+                    if not worker:
+                        os.environ.pop("SUTANDO_WORKER_ID", None)
+                    for path, body in self.bodies().items():
+                        self.assertEqual(body.splitlines()[1],
+                                         f"Question for you from {who} — it needs your word:", path)
+
+    def test_a_name_that_cannot_be_worked_out_still_records_the_cores_question(self):
+        boom = OSError("no name")
+        with mock.patch.object(ask_owner_cli, "worker_published_path", side_effect=boom), \
+                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()) as outp, \
+                mock.patch.object(ask_owner_cli, "declared", return_value=None):
+            ask_owner_cli.main(["Ship it?", "--workspace", str(self.ws), "--urgency", "durable"])
+        self.assertEqual(self.proactive(), [])
+        self.assertIn("sent: FAILED — OSError: no name", outp.getvalue())
+        [rec] = [json.loads(p.read_text()) for p in (self.ws / "state").rglob("ask-*.json")]
+        self.assertEqual((rec["error"], rec["body"].splitlines()[1]), ("OSError: no name", self.CORE_LEAD))
+        with mock.patch.object(pqa, "published_name", side_effect=boom), self.as_worker():
+            out = room_db.ask_owner("Merge #12 now?", urgency="durable", workspace=self.ws, host=HOST, store=None)
+        self.assertEqual((self.proactive(), out["proactive_file"], out["send_error"]), ([], None, "OSError: no name"))
+        [q] = self.outbox_questions()
+        self.assertEqual(q["question"], "Merge #12 now?", "the question is still held")
+
+    def test_a_decision_cards_text_fallback_stays_the_cores(self):
+        self.record(agent_display_name="Helper")
+        (self.ws / "state" / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space"}))
+        manager = mock.Mock()
+        manager.create.side_effect = OSError("store refused")
+        manager.get.return_value = None
+        with self.as_worker():
+            out = pqa.queue_question("Merge it?", workspace=self.ws, host=HOST, default_action="merge",
+                                     options=[("Hold", "wait")], manager=manager)
+            pqa.create_card(out)
+        [name] = self.proactive()
+        self.assertEqual((self.ws / "results" / name).read_text().splitlines()[1], self.CORE_LEAD)
 
 
 if __name__ == "__main__":

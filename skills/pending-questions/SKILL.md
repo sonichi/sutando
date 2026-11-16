@@ -53,7 +53,9 @@ count (`python3 src/pending_questions_reader.py summary`).
 - From a pool worker that acts as its own agent, the text ask is queued under the name
   `result_publish.worker_published_path` gives it (`.by-<worker>`, unless it is bound for
   Discord, Slack or Telegram, which deliver it themselves), so that worker's own lane asks as its
-  agent, and the row's `Asked by` names that agent. A decision card is still the core's: only the
+  agent, the row's `Asked by` names that agent, and the text says it is from that worker
+  ("<name> (a worker on <host>)", with its agent's display name, else its roster label; else just
+  "a worker on <host>"). A decision card is still the core's: only the
   core's lane issues and verifies cards, so a question asked by card has no `Asked by`, and its
   fallback text, if the card cannot be stored, is the core's too.
 - `list` is READ-ONLY — it writes no file, not even the history marker — and lists each ask

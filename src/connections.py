@@ -78,6 +78,7 @@ import ssl
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -2253,6 +2254,41 @@ def proactive_author_agent(name, workspace: Optional[Path] = None) -> Optional[s
     worker = proactive_worker(name)
     row = worker_identity(worker, workspace) if worker else None
     return str((row or {}).get("agent_mxid") or "").strip() or None
+
+
+# Lower-case Cyrillic and Greek letters that render like Latin ones, folded before the core check.
+_CONFUSABLES = str.maketrans("аеорсухікмтвнгјѕοεαρκτνιυ", "aeopcyxikmtbhrjsoeapktviu")
+AUTHOR_PHRASE_MAX = 64
+
+
+def _reads_as_core(phrase: str, host: str) -> bool:
+    def fold(text):
+        return unicodedata.normalize("NFKC", text).casefold().translate(_CONFUSABLES)
+    folded = re.sub(r"[\W_]+$", "", fold(phrase))
+    return bool(re.search(r"(^|[\W_])core$", folded)) or fold(f"the {host} core") in fold(phrase)
+
+
+def proactive_author_phrase(name, host: str, workspace: Optional[Path] = None) -> str:
+    """Who a proactive file named `name` speaks as, for its text: "the <host> core" for an unstamped
+    name; for a worker's stamped one, "<name> (a worker on <host>)" with its own agent's display name,
+    else its roster label, else just "a worker on <host>". The name is stripped of format characters
+    and bounded; one that reads as the core (ends with "core", or holds the core's phrase) is dropped."""
+    from proactive_routing import proactive_worker
+    worker = proactive_worker(name)
+    if not worker:
+        return f"the {host} core"
+    label = str((worker_identity(worker, workspace) or {}).get("agent_display_name") or "").strip()
+    if not label:
+        rows = _read_json(_workspace(workspace) / "state" / "roster.json").get("workers")
+        row = rows.get(worker) if isinstance(rows, dict) else None
+        row = row if isinstance(row, dict) else {}
+        label = str(row.get("display_label") or row.get("label") or "").strip()
+        label = "" if label == worker else label
+    label = " ".join("".join(ch for ch in label if unicodedata.category(ch) != "Cf").split())
+    if len(label) > AUTHOR_PHRASE_MAX:
+        label = label[:AUTHOR_PHRASE_MAX - 1].rstrip() + "…"
+    fallback = f"a worker on {host}"
+    return fallback if not label or _reads_as_core(label, host) else f"{label} ({fallback})"
 
 
 def worker_mcp_credential(worker: str, *, workspace: Optional[Path] = None,
