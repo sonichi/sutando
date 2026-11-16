@@ -398,8 +398,8 @@ of these hold, and prints `local` (the watcher keeps the event) otherwise:
 
 - The event is about our own PR: not a `review_requested` or `review_dismissed`, not a
   `reason=reviewed` update; and the PR's author is one of the watch's authors and its head branch
-  is in the base repository. Author, head repository and the commits come from one GitHub call per
-  head, cached.
+  is in the base repository. Author, head repository and the PR's last 100 commits (older ones are
+  not read) come from one GitHub call per head, cached.
 - The newest commit whose trailer block carries a valid `Sutando-Task:` names a task this host
   assigned to a worker (`state/attribution/<task id>`). Newest wins, so a stacked or promoted PR
   goes to whoever made its last commit.

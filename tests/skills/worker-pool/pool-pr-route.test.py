@@ -170,6 +170,12 @@ class Ownership(Base):
         dismissed = "PR_EVENT acme/widgets#7 review_dismissed reviewer=owner-me author=mallory head=0badc0de"
         self.assertEqual(self.route(event=dismissed)[0], "local")
 
+    def test_a_reviewed_update_to_our_own_pr_is_local(self):
+        event = "PR_EVENT acme/widgets#7 synchronize author=alice head=0badc0de merged=false reason=reviewed"
+        out, err = self.route(event=event)
+        self.assertEqual((out, self.asks), ("local", []))
+        self.assertIn("not an event about our own PR", err)
+
     def test_a_pr_by_someone_not_watched_or_from_a_fork_is_local(self):
         for gh in (FakeGh(author="mallory"), FakeGh(head_repo="mallory/widgets"), FakeGh(head_repo="")):
             out, err = self.route(gh, head="")

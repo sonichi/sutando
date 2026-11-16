@@ -4,7 +4,8 @@
 Only an event about one of our own PRs is handed off: an author/head event (not a review request,
 a dismissal or a `reason=reviewed` update), on a PR whose author is one of the watch's `--authors`
 and whose head branch lives in the base repository. Its driver is the worker this host assigned the
-task named by the newest commit's `Sutando-Task:` trailer (`state/attribution/<task id>`). A live
+task named by the `Sutando-Task:` trailer of the newest commit that carries one, among the PR's last
+100 commits (`state/attribution/<task id>`). A live
 worker other than this session gets a `pool_ask`; `handed <worker id>` is printed only when that
 ask was delivered (a file sentinel, or a confirmed room post). Anything else prints `local`, with
 the reason on stderr, and the watching session keeps the event.
