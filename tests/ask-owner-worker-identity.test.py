@@ -8,6 +8,7 @@
 - An ask bound for Discord, Slack or Telegram keeps its bare name, so that bridge delivers it.
 - The question records who asked (the worker's agent id when stamped) in the outbox and the row.
 - A decision card stays on the core's path: no asker, no stamped text beside it or in its fallback.
+- The identity is read from the workspace passed in, not the default one.
 Temp workspaces and fakes only; nothing here reads the live workspace or a real token.
 """
 from _helpers.hermetic_env import isolate_os_environ
@@ -109,6 +110,11 @@ class _Ws(unittest.TestCase):
         f = self.ws / "tasks" / "task-1.txt"
         f.write_text(headers + "task: x\n")
         return str(f)
+
+    def empty_default_workspace(self):
+        empty = self.tmp / "default-workspace"
+        (empty / "state").mkdir(parents=True)
+        return mock.patch("workspace_default.resolve_workspace", return_value=empty)
 
     def proactive(self):
         return sorted(p.name for p in (self.ws / "results").glob("proactive-*"))
@@ -218,6 +224,12 @@ class StoreAdapterAsk(_Ws):
         self.assertEqual((pr.proactive_destination(name), pr.proactive_worker(name)), ("ag2space", W), name)
         self.assertEqual(out["question"]["asked_by"], AGENT)
 
+    def test_the_identity_is_read_from_the_workspace_passed_not_the_default(self):
+        with self.as_worker(), self.empty_default_workspace():
+            out = self.ask()
+        [name] = self.proactive()
+        self.assertEqual((pr.proactive_worker(name), out["question"]["asked_by"]), (W, AGENT))
+
     def test_a_decision_card_stays_the_cores_with_no_asker_and_no_stamped_text_beside_it(self):
         (self.ws / "state" / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space"}))
         from hitl.manager import HitlManager, HitlStore
@@ -273,6 +285,11 @@ class NoStoreAsk(_Ws):
         with self.as_worker(), mock.patch.object(C, "proactive_author_agent", side_effect=OSError("unreadable")):
             names, rec = self.run_cli()
         self.assertEqual(([pr.proactive_worker(n) for n in names], rec["asked_by"]), ([W], None))
+
+    def test_the_identity_is_read_from_the_workspace_passed_not_the_default(self):
+        with self.as_worker(), self.empty_default_workspace():
+            names, rec = self.run_cli()
+        self.assertEqual(([pr.proactive_worker(n) for n in names], rec["asked_by"]), ([W], AGENT))
 
     def test_the_core_and_a_worker_without_an_enabled_identity_queue_unstamped(self):
         for label, kw, worker in (("core", {}, ""), ("none", {"own": False}, W), ("disabled", {"disabled": True}, W)):
