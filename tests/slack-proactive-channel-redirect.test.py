@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""A proactive Slack body led by [channel: <id>] is delivered to <id>, stripped (#4971).
+"""A proactive Slack body led by [channel: <id>] is delivered to <id>, stripped,
+and guarded at <id>'s audience tier (#4971).
 
 Drives the real `result_watcher` loop and `_send_reply`: the redirect and attach
-markers come from `parse_markers`, and the delivery log names the real destination.
+markers come from `parse_markers`, the delivery log names the real destination,
+and the guard is the shared `guard_proactive_for_destination`.
 """
 from __future__ import annotations
 
@@ -54,6 +56,11 @@ class _RecordingClient:
     def chat_postMessage(self, **kwargs):
         self.calls.append(kwargs)
         return {"ok": True}
+
+    def conversations_info(self, **kwargs):
+        # D0OWNERALT is a second DM whose peer is the owner; every other D is a non-owner's DM.
+        peer = "owner-1" if kwargs["channel"] == "D0OWNERALT" else "U-STRANGER"
+        return {"channel": {"id": kwargs["channel"], "is_im": True, "user": peer}}
 
 
 class _FakeApp:
@@ -152,6 +159,40 @@ def main() -> int:
           len(sent) == 1 and "sent to D0OTHERDM1" in sent[0], repr(sent))
     check("the delivery log shows the parsed body, not the raw markers",
           len(sent) == 1 and "[channel:" not in sent[0], repr(sent))
+
+    from policy.egress.result import TEAM_LEAK_RESULT as NOTICE
+
+    def deliver(name, body):
+        start = len(calls)
+        (results / name).write_text(body)
+        _settle(lambda: len(calls) > start and not (results / name).exists())
+        time.sleep(0.2)
+        return calls[start:]
+
+    leak = "copy failed: [Errno 2] No such file: /Users/someone/private/plan.md"
+    posts = deliver("proactive-leak-other.txt", f"[channel: D0STRANGER]\n{leak}\n")
+    check("a redirected internal error reaches the non-owner DM only as the standard notice",
+          [p.get("channel") for p in posts] == ["D0STRANGER"]
+          and posts[0].get("text") == NOTICE, repr(posts))
+    check("the guard ran with the destination's tier, not owner",
+          any("withheld proactive" in line and "tier=other" in line for line in logged), "")
+
+    posts = deliver("proactive-leak-owner.txt", f"{leak}\n")
+    check("the same body to the owner DM is delivered unchanged",
+          [(p.get("channel"), p.get("text")) for p in posts] == [("D-OWNER", leak)], repr(posts))
+
+    posts = deliver("proactive-leak-owner-alt.txt", f"[channel: D0OWNERALT]\n{leak}\n")
+    check("a redirect to a DM whose peer is owner-tier is delivered unchanged",
+          [(p.get("channel"), p.get("text")) for p in posts] == [("D0OWNERALT", leak)], repr(posts))
+
+    posts = deliver("proactive-leak-room.txt", f"[channel: C0SHARED]\n{leak}\n")
+    check("a redirect to a shared channel is guarded too",
+          [(p.get("channel"), p.get("text")) for p in posts] == [("C0SHARED", NOTICE)],
+          repr(posts))
+
+    src = (REPO / "src" / "slack-bridge.py").read_text()
+    check("the bridge delegates to the shared guard, not a copy",
+          "guard_proactive_for_destination(" in src and "_INTERNAL_ERROR_RE" not in src)
 
     print()
     if FAILURES:

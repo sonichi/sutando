@@ -1296,3 +1296,24 @@ def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
         state_dir, task_id = suppress_journal
         journal_quarantined_attachment(body, state_dir, task_id)
     return verdict.body, verdict.reason
+
+
+def redirect_destination(body: str) -> "str | None":
+    """The `[channel:]` target the shared parser executes for this body, or None."""
+    return next((a.value for a in parse_markers(body or "").actions if a.kind == "redirect"), None)
+
+
+def guard_proactive_for_destination(body: str, destination, owner_destination, destination_tier,
+                                    repo, secret_filter=None, scan_sensitive_data: bool = True):
+    """(body, None) to deliver an owner-authored proactive body as written, or
+    (notice, reason) to send `destination` the withheld notice instead.
+
+    A body the adapter routed to a destination other than the owner's conversation (None means
+    the owner's) is read by that audience, so the text it shows is guarded at `destination_tier`;
+    its markers stay the owner's to issue.
+    """
+    if destination is None or destination == owner_destination:
+        return body, None
+    safe, reason = guard_result_for_tier(parse_markers(body or "").body, destination_tier, repo,
+                                         secret_filter, scan_sensitive_data, honor_suppressions=False)
+    return (body, None) if reason is None else (safe, reason)
