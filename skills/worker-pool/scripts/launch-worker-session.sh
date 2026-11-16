@@ -53,7 +53,7 @@ SESSION="${SUTANDO_TMUX_SESSION:?launch-worker-session.sh needs SUTANDO_TMUX_SES
 : "${SUTANDO_INSTANCE_ID:?launch-worker-session.sh needs SUTANDO_INSTANCE_ID (spawn_worker.py always sets it)}"
 # Every worker's watcher needs the pool delivery writer: refuse before anything below
 # queries tmux. The --print-env probe may still inspect an incomplete env.
-if [ "${1:-}" != "--print-env" ] && {
+if [ "${1:-}" != "--print-env" ] && [ "${1:-}" != "--print-surface-args" ] && {
      [ -z "${SUTANDO_POOL_DELIVERY_SCRIPT:-}" ] || \
      [ ! -f "$SUTANDO_POOL_DELIVERY_SCRIPT" ] || \
      [ ! -r "$SUTANDO_POOL_DELIVERY_SCRIPT" ]; }; then
@@ -67,6 +67,16 @@ add_skill_claude_plugins
 # On by default: the task-watch Mod hosts this worker's watcher instead of a Monitor;
 # SUTANDO_TASK_WATCH_MOD_WORKER=0 opts out (docs/task-watcher-hosting-modes.md).
 add_task_watch_mod "${SUTANDO_TASK_WATCH_MOD_WORKER:-1}"
+# The plugin dirs the owner recorded for this worker (pool_manage.py plugins). Used as given:
+# spawn_worker.plan() is what checks them, so a launch outside it gets no check here.
+while IFS= read -r _plugin_dir; do
+  if [ -n "$_plugin_dir" ]; then SURFACE_ARGS+=(--plugin-dir "$_plugin_dir"); fi
+done <<< "${SUTANDO_WORKER_PLUGIN_DIRS:-}"
+unset _plugin_dir
+if [ "${1:-}" = "--print-surface-args" ]; then
+  printf '%s\n' ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"}
+  exit 0
+fi
 # `/startup --worker` is the pool worker's own boot ceremony (orphan recovery
 # and session crons are core-only; the worker gate is what it runs instead).
 BOOT_PROMPT="/startup --worker"

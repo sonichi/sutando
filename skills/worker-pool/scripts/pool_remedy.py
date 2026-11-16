@@ -278,7 +278,8 @@ def recover(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
         return {"worker_id": worker_id, "outcome": FAILED, "why": str(e),
                 "closed_runs": closed}
     return {"worker_id": worker_id, "outcome": RECOVERED, "closed_runs": closed,
-            "session_id": out.get("runtime_session_id")}
+            "session_id": out.get("runtime_session_id"),
+            **({"plugin_dirs_skipped": out["plugin_dirs_skipped"]} if out.get("plugin_dirs_skipped") else {})}
 
 
 SUPERVISOR_SCRIPT = "skills/worker-pool/scripts/worker-watcher-supervisor.sh"
