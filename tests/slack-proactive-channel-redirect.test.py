@@ -106,7 +106,12 @@ def _read_either(*paths):
     return None
 
 
-def _settle(predicate, timeout=4.0, interval=0.1):
+# A deadline, not a window: a finished delivery returns at once, and a slow first
+# watcher pass on a loaded runner gets time instead of a FAIL.
+DELIVERY_DEADLINE = 60.0
+
+
+def _settle(predicate, timeout=DELIVERY_DEADLINE, interval=0.05):
     """Poll until predicate holds; the watcher runs on its own cadence."""
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -182,15 +187,27 @@ def main() -> int:
 
     destination_tier_units(bridge)
 
-    missing = "/nonexistent-4971/report.png"
-    name = "proactive-redirect-4971.txt"
-    (results / name).write_text(f"[channel: D0OTHERDM1]\nhello other DM\n[attach: {missing}]\n")
-
     threading.Thread(target=bridge.result_watcher, daemon=True).start()
-    calls = bridge.app.client.calls
-    check("the proactive file was delivered",
-          _settle(lambda: len(calls) >= 2 and not (results / name).exists()),
-          f"{len(calls)} post(s)")
+
+    def finished(name):
+        """The watcher unlinks a file's `.sending` claim last, after every post and the
+        delivery log line; with neither name on disk that delivery is complete."""
+        return not (results / name).exists() and not (results / name).with_suffix(".sending").exists()
+
+    def deliver(name, body):
+        """One case: a fresh recording client, the file, then wait for that delivery to
+        finish, so no post or log line of one case can land in another's record."""
+        client = bridge.app.client = _RecordingClient()
+        mark = len(logged)
+        (results / name).write_text(body)
+        check(f"{name} finished delivery", _settle(lambda: finished(name)),
+              f"still on disk after {DELIVERY_DEADLINE:.0f}s")
+        return client.calls, logged[mark:]
+
+    missing = "/nonexistent-4971/report.png"
+    calls, case_log = deliver("proactive-redirect-4971.txt",
+                              f"[channel: D0OTHERDM1]\nhello other DM\n[attach: {missing}]\n")
+    check("the proactive file was delivered", len(calls) >= 2, f"{len(calls)} post(s)")
 
     channels = {c.get("channel") for c in calls}
     texts = [c.get("text", "") for c in calls]
@@ -201,7 +218,7 @@ def main() -> int:
     check("the attach marker is acted on, not shown",
           not any("[attach:" in t for t in texts), repr(texts))
 
-    sent = [line for line in logged if "[proactive] sent to" in line]
+    sent = [line for line in case_log if "[proactive] sent to" in line]
     check("the delivery log names the redirect target",
           len(sent) == 1 and "sent to D0OTHERDM1" in sent[0], repr(sent))
     check("the delivery log shows the parsed body, not the raw markers",
@@ -209,30 +226,23 @@ def main() -> int:
 
     from policy.egress.result import TEAM_LEAK_RESULT as NOTICE
 
-    def deliver(name, body):
-        start = len(calls)
-        (results / name).write_text(body)
-        _settle(lambda: len(calls) > start and not (results / name).exists())
-        time.sleep(0.2)
-        return calls[start:]
-
     leak = "copy failed: [Errno 2] No such file: /Users/someone/private/plan.md"
-    posts = deliver("proactive-leak-other.txt", f"[channel: D0STRANGER]\n{leak}\n")
+    posts, case_log = deliver("proactive-leak-other.txt", f"[channel: D0STRANGER]\n{leak}\n")
     check("a redirected internal error reaches the non-owner DM only as the standard notice",
           [p.get("channel") for p in posts] == ["D0STRANGER"]
           and posts[0].get("text") == NOTICE, repr(posts))
     check("the guard ran with the destination's tier, not owner",
-          any("withheld proactive" in line and "tier=other" in line for line in logged), "")
+          any("withheld proactive" in line and "tier=other" in line for line in case_log), repr(case_log))
 
-    posts = deliver("proactive-leak-owner.txt", f"{leak}\n")
+    posts, _ = deliver("proactive-leak-owner.txt", f"{leak}\n")
     check("the same body to the owner DM is delivered unchanged",
           [(p.get("channel"), p.get("text")) for p in posts] == [("D-OWNER", leak)], repr(posts))
 
-    posts = deliver("proactive-leak-owner-alt.txt", f"[channel: D0OWNERALT]\n{leak}\n")
+    posts, _ = deliver("proactive-leak-owner-alt.txt", f"[channel: D0OWNERALT]\n{leak}\n")
     check("a redirect to a DM whose peer is owner-tier is delivered unchanged",
           [(p.get("channel"), p.get("text")) for p in posts] == [("D0OWNERALT", leak)], repr(posts))
 
-    posts = deliver("proactive-leak-room.txt", f"[channel: C0SHARED]\n{leak}\n")
+    posts, _ = deliver("proactive-leak-room.txt", f"[channel: C0SHARED]\n{leak}\n")
     check("a redirect to a shared channel is guarded too",
           [(p.get("channel"), p.get("text")) for p in posts] == [("C0SHARED", NOTICE)],
           repr(posts))
@@ -246,13 +256,13 @@ def main() -> int:
     bridge._is_path_sendable = lambda p: p.endswith("public.png")
     bridge._send_file = lambda ch, ts, p: uploads.append((ch, p)) or True
     try:
-        posts = deliver("proactive-notice-other.txt",
-                        f"[channel: D0STRANGER]\nweekly summary\n[attach: {private}]\n[attach: {missing}]\n")
+        posts, _ = deliver("proactive-notice-other.txt",
+                           f"[channel: D0STRANGER]\nweekly summary\n[attach: {private}]\n[attach: {missing}]\n")
         texts = [p.get("text", "") for p in posts]
         check("a redirected body's denied / missing notices name no local path",
               "(file access denied: report.png)" in texts and "(file not found: missing.png)" in texts
               and not any(str(private.parent) in t or "/Users/" in t for t in texts), repr(texts))
-        posts = deliver("proactive-notice-owner.txt", f"weekly summary\n[attach: {missing}]\n")
+        posts, _ = deliver("proactive-notice-owner.txt", f"weekly summary\n[attach: {missing}]\n")
         check("the owner DM still gets the full path in its notice",
               f"(file not found: {missing})" in [p.get("text") for p in posts], repr(posts))
         public = str(private.parent / "public.png")
