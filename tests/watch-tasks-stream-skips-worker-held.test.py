@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""The core's watcher never routes or announces a task a worker already holds.
+
+A worker's own lane routes each task it queues before publishing it to `tasks/`, so the task is
+held (a sentinel in `deliveries/<worker>/`) when the core's watcher first sees it. The watcher
+leaves it alone: no handler probe or run, no TASK_FILE. A task nobody holds is routed as before, and
+a deliveries folder that cannot be read still goes to the handler, which fails closed.
+
+Run: python3 tests/watch-tasks-stream-skips-worker-held.test.py
+"""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
+from clean_watcher_env import clean_env  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
+
+REPO = Path(__file__).resolve().parent.parent
+W = "d" * 32
+DEADLINE_S = 40.0
+
+
+class CoreWatcher(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="skip-held-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.ws = self.tmp / "ws"
+        for d in ("tasks", "results/archive", "state"):
+            (self.ws / d).mkdir(parents=True)
+        feed = self.tmp / "feed"
+        feed.write_text("")
+        b = self.tmp / "bin"
+        b.mkdir()
+        (b / "fswatch").write_text(f"#!/bin/sh\nexec tail -n +1 -f {feed}\n")
+        (b / "fswatch").chmod(0o755)
+        self.calls = self.tmp / "handler-calls.log"
+        self.handler = self.tmp / "handler.sh"
+        # Declines every task, so a routed one is announced to the core.
+        self.handler.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {self.calls}\nexit 3\n')
+        self.handler.chmod(0o755)
+
+    def task(self, tid):
+        (self.ws / "tasks" / f"{tid}.txt").write_text(f"id: {tid}\naccess_tier: owner\ntask: hi\n")
+
+    def hold(self, tid):
+        folder = self.ws / "deliveries" / W
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{tid}.txt").touch()
+
+    def run_watcher(self, until):
+        env = clean_env()
+        env.update(PATH=f"{self.tmp / 'bin'}:{env['PATH']}", TMPDIR=str(self.tmp),
+                   SUTANDO_RESULTS_DIR=str(self.ws / "results"), SUTANDO_TASK_EVENT_HANDLER=str(self.handler))
+        errf = open(self.tmp / "watcher.err", "w+")
+        p = popen_bound(["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks"),
+                         "--role", "standby", "--inbox", str(self.ws / "tasks")],
+                        cwd=str(REPO), env=env, stdout=subprocess.PIPE, stderr=errf)
+        os.set_blocking(p.stdout.fileno(), False)
+        out, end = b"", time.time() + DEADLINE_S
+        try:
+            while time.time() < end and p.poll() is None:
+                try:
+                    out += os.read(p.stdout.fileno(), 65536) or b""
+                except BlockingIOError:
+                    pass
+                errf.seek(0)
+                if until(out.decode(), errf.read()):
+                    break
+                time.sleep(0.1)
+        finally:
+            try:
+                os.killpg(os.getpgid(p.pid), 15)
+            except OSError:
+                pass
+            p.wait(timeout=10)
+            p.stdout.close()
+            errf.seek(0)
+            err = errf.read()
+            errf.close()
+        calls = self.calls.read_text() if self.calls.exists() else ""
+        return out.decode(), err, calls
+
+    def test_a_held_task_is_not_routed_and_a_free_one_is(self):
+        self.task("task-held")
+        self.hold("task-held")
+        self.task("task-free")
+        out, err, calls = self.run_watcher(
+            lambda o, e: "TASK_FILE: task-free.txt" in o and "task-held.txt" in e)
+        self.assertIn("held by a worker, not routing it: task-held.txt", err)
+        self.assertNotIn("task-held", calls, "the router never ran for the held task")
+        self.assertNotIn("task-held", out)
+        self.assertIn("task-free.txt", calls)
+        self.assertIn("TASK_FILE: task-free.txt", out)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads an unreadable folder")
+    def test_deliveries_that_cannot_be_read_still_go_to_the_handler(self):
+        self.task("task-unsure")
+        self.hold("task-unsure")
+        (self.ws / "deliveries").chmod(0)
+        self.addCleanup((self.ws / "deliveries").chmod, 0o755)
+        out, err, calls = self.run_watcher(lambda o, e: "TASK_FILE: task-unsure.txt" in o)
+        self.assertIn("task-unsure.txt", calls)
+        self.assertNotIn("held by a worker", err)
+
+
+if __name__ == "__main__":
+    unittest.main()

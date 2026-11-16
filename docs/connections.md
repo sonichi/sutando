@@ -589,13 +589,15 @@ answers before the rule above:
   and the core's session all fall through to the rule above. The core never acts as a worker's
   agent.
 
-A worker's lane delivers each task it queues to its worker itself. The task file goes to
-`tasks/` with `requested_worker` set, as every lane's does, and the lane then runs the core's
-declared task-event handler (the pool router, from `state/task-event-handler.json`) on it with
-`--from-lane`, through the bridge's wake command. That writes the delivery sentinel and the
-attribution in `deliveries/<worker>/` under the router's own locks, so the worker's watcher picks it
-up without waiting for the core's watcher. The core's watcher still sees the task, finds it
-committed and delivers nothing twice; with no handler declared it routes the task as before. A
+A worker's lane delivers each task it queues to its worker itself, before the core can see it.
+The lane stages the task file, runs the core's declared task-event handler (the pool router, from
+`state/task-event-handler.json`) on the staged copy with `--from-lane --payload <staged>`, and only
+then publishes it to `tasks/`. The router writes the delivery sentinel and the attribution in
+`deliveries/<worker>/` under its own locks, so the task is already held when it appears, and the
+core's watcher never routes or announces a task a worker holds. The payload stays in `tasks/`, where
+the worker's resolver, `task_disposition.py`, archiving and the bridges read it. A worker off the
+roster or retired, a picker command, a router that fails or takes longer than 10 s, or no handler
+declared: nothing is held, the task is published as before and the core's watcher routes it. A
 lane started from inside a session (`connections.py start` from a worker's shell) carries none of
 that session's variables (`connections.SESSION_ENV`), so it runs as the lane keeper's launch would.
 

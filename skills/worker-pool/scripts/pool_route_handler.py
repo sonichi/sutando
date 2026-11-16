@@ -15,9 +15,9 @@ The watcher's handler protocol carries the design's recipient rules exactly:
                           inherit it, and 0 would release the claim on nothing.
 
 Run: called by src/watch-tasks-stream.sh; see dispatch_task there. A worker's own
-gateway lane also runs it (`--from-lane`) on each task it queues, so the worker's
-delivery does not wait for the core's watcher; the watcher's later pass finds it
-committed and settles the same way.
+gateway lane also runs it (`--from-lane --payload <staged copy>`) on each task it
+queues, BEFORE publishing it to `tasks/`, so the task is already its worker's when
+it appears and the core's watcher leaves it alone (it never routes a held task).
 """
 from __future__ import annotations
 
@@ -45,14 +45,15 @@ MUST_HANDLE = 4
 PICKER_WIRE = "worker-picker"
 
 
-def read_task(task_file: str) -> dict:
+def read_task(task_file: str, payload: "str | None" = None) -> dict:
     """The watcher hands a task FILE; the router takes a task DICT.
 
     `requested_worker` (and its legacy alias) is read only from ABOVE `task:`,
     so a body cannot forge it. `channel_id`/`source` are read leniently: the gateway stamps them
-    below `task:`, where the strict parse never looks.
+    below `task:`, where the strict parse never looks. `payload` holds the bytes of a task
+    not yet published at `task_file`, which still names it.
     """
-    text = Path(task_file).read_text(encoding="utf-8", errors="replace")
+    text = Path(payload or task_file).read_text(encoding="utf-8", errors="replace")
     task: dict = {"id": Path(task_file).stem}
     # A stop from a trusted source must reach whoever holds the task it names; anything else is a task.
     stop_of = activity_bus.trusted_cancel_target(text, task_file)
@@ -163,6 +164,8 @@ def main(argv=None) -> int:
     p.add_argument("--results-dir", default=None)
     # A worker's own lane routing the task it queued: the same decision, but not the watcher's receipt.
     p.add_argument("--from-lane", action="store_true")
+    # The lane's staged copy of `--task-file`, routed before it is published there.
+    p.add_argument("--payload", default=None)
     for ignored in ("--runtime", "--repo"):
         p.add_argument(ignored, default=None)
     args, _unknown = p.parse_known_args(argv)
@@ -180,8 +183,9 @@ def main(argv=None) -> int:
     except Exception as e:  # noqa: BLE001 — ANY failure, per the contract above:
         # an escape here routes a BOUND task to the unrestricted live core.
         print(f"pool_route_handler: advertisement not ensured: {e!r}", file=sys.stderr)
-    task = read_task(args.task_file)
-    if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
+    task = read_task(args.task_file, args.payload)
+    # A picker command is the core's to apply, from the published file.
+    if PICKER_WIRE in (task.get("wire_source"), task.get("source")) and not args.payload:
         apply_picker(ws, args.task_file, args.results_dir)
     code, targets, roster = classify(ws, task)
     stem = Path(args.task_file).stem
@@ -199,7 +203,7 @@ def main(argv=None) -> int:
         return DECLINE
 
     try:
-        out = rt.route(ws, task, roster)
+        out = rt.route(ws, task, roster, payload=args.payload)
     except rt.RouterRefused as e:
         # The pass refused; the core must not silently inherit the task.
         print(f"pool_route_handler: {e}", file=sys.stderr)

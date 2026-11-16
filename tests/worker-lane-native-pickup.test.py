@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""A worker's own lane delivers each task it queues to its worker, without waiting for the core.
+"""A worker's own lane delivers each task it queues to its worker before the core can see it.
 
 - `_install_worker_lane` makes the core's declared task-event handler (the pool router) the lane's
-  wake command, with `--from-lane`; with no handler declared, or a wake command of its own, it
-  changes nothing and the core's watcher routes as before.
-- One queued task, end to end through the real handler: one sentinel in the worker's delivery
-  folder and the attribution beside it, the payload where readers resolve it, no watcher receipt.
-  The watcher's own later pass finds it committed and delivers nothing twice.
-- A worker no longer on the roster gets nothing from its lane: the core's watcher decides.
+  pre-publish step, with `--from-lane --payload <staged copy>`; with no handler declared it changes
+  nothing and the core's watcher routes as before. A lane's own wake command is left alone.
+- One queued task, end to end through the real handler and the bridge's publish: the sentinel and
+  attribution are written BEFORE the payload reaches `tasks/`, so the core's watcher finds it held
+  (and skips it); the payload is where every reader resolves it; no watcher receipt.
+- A worker off the roster or retired gets nothing from its lane: the task is published unheld and
+  the core's watcher routes it. A router that fails or hangs never holds the task back.
 
 Run: python3 tests/worker-lane-native-pickup.test.py
 """
@@ -34,6 +35,7 @@ import pool_roster
 import pool_route_handler as handler
 import pool_routing_receipt as prr
 import resolve_inbox_entry
+from delivery.task_dispatch import worker_holds
 from task_disposition import task_disposition
 
 W = "d" * 32
@@ -62,8 +64,9 @@ class Base(unittest.TestCase):
         (self.ws / "state" / "roster.json").write_text(json.dumps(
             {"version": 1, "workers": {W: {"state": "live", "label": "fast"}}, "bindings": {}}))
         self.saved = {k: getattr(rgb, k) for k in ("WS", "RESULTS_DIR", "TASK_ADDRESSEE", "PROACTIVE_CLAIM_GATE",
-                                                   "PROACTIVE_OWN_FILE", "ON_TASK_CMD", "_log")}
-        rgb.WS, rgb.RESULTS_DIR, rgb.ON_TASK_CMD = self.ws, self.ws / "results", ""
+                                                   "PROACTIVE_OWN_FILE", "ON_TASK_CMD", "TASK_PRE_PUBLISH",
+                                                   "_log")}
+        rgb.WS, rgb.RESULTS_DIR, rgb.ON_TASK_CMD, rgb.TASK_PRE_PUBLISH = self.ws, self.ws / "results", "", None
         self.logged = []
         rgb._log = self.logged.append
 
@@ -74,11 +77,12 @@ class Base(unittest.TestCase):
     def declare_handler(self):
         pool_roster.publish_task_event_handler(self.ws)
 
-    def queue(self, tid, worker):
-        path = self.ws / "tasks" / f"{tid}.txt"
-        path.write_text(f"id: {tid}\nsource: ag2space\nchannel_id: !room:alpha-fixture.net\n"
-                        f"requested_worker: {worker}\ntask: hello\n")
-        return path
+    def stage(self, tid, worker, source="ag2space"):
+        """The bridge's staged copy beside its destination, as `_stage_durable` leaves it."""
+        staged = self.ws / "tasks" / f".{tid}.txt.abc123.tmp"
+        staged.write_text(f"id: {tid}\nsource: {source}\nchannel_id: !room:alpha-fixture.net\n"
+                          f"requested_worker: {worker}\ntask: hello\n")
+        return staged, self.ws / "tasks" / f"{tid}.txt"
 
     def sentinels(self, worker):
         folder = self.ws / "deliveries" / worker
@@ -86,18 +90,20 @@ class Base(unittest.TestCase):
             if folder.is_dir() else []
 
 
-class TheWakeCommand(Base):
-    def test_a_worker_lane_runs_the_declared_handler_from_the_lane(self):
+class TheLaneRouter(Base):
+    def test_a_worker_lane_routes_through_the_declared_handler_from_the_lane(self):
         self.declare_handler()
         self.rgb._install_worker_lane(W)
-        argv = shlex.split(self.rgb.ON_TASK_CMD)
+        self.assertIsNotNone(self.rgb.TASK_PRE_PUBLISH)
+        self.assertEqual(self.rgb.ON_TASK_CMD, "", "no wake command is borrowed for routing")
+        argv = self.rgb._lane_route_argv()
         self.assertEqual(Path(argv[0]).name, "pool_route_handler.py")
         self.assertEqual(argv[1:], ["--workspace", str(self.ws), "--results-dir", str(self.ws / "results"),
-                                    "--from-lane", "--task-file"])
+                                    "--from-lane"])
 
     def test_no_declared_handler_leaves_routing_to_the_cores_watcher(self):
         self.rgb._install_worker_lane(W)
-        self.assertEqual(self.rgb.ON_TASK_CMD, "")
+        self.assertIsNone(self.rgb.TASK_PRE_PUBLISH)
         self.assertTrue(any("no task-event handler" in line for line in self.logged), self.logged)
 
     def test_a_handler_lookup_that_cannot_run_leaves_routing_to_the_cores_watcher(self):
@@ -106,41 +112,45 @@ class TheWakeCommand(Base):
         self.declare_handler()
         for exc in (OSError("no bash"), subprocess.TimeoutExpired("bash", 10)):
             with self.subTest(exc=type(exc).__name__), mock.patch.object(subprocess, "run", side_effect=exc):
-                self.rgb.ON_TASK_CMD = ""
                 self.rgb._install_worker_lane(W)
-                self.assertEqual(self.rgb.ON_TASK_CMD, "")
+                self.assertIsNone(self.rgb.TASK_PRE_PUBLISH)
 
     def test_the_lane_says_whose_agent_it_runs_as(self):
         self.rgb._install_worker_lane(W)
         self.assertTrue(any(f"runs as worker {W}'s own agent" in line for line in self.logged), self.logged)
 
-    def test_a_lanes_own_wake_command_is_kept(self):
+    def test_a_lanes_own_wake_command_is_kept_and_the_lane_still_routes(self):
         self.declare_handler()
         self.rgb.ON_TASK_CMD = "my-agent run-task"
         self.rgb._install_worker_lane(W)
         self.assertEqual(self.rgb.ON_TASK_CMD, "my-agent run-task")
+        self.assertIsNotNone(self.rgb.TASK_PRE_PUBLISH)
 
 
 class OneQueuedTask(Base):
-    def fire(self, tid, worker):
+    def publish(self, tid, worker, **kw):
+        """The bridge's own publish step, with this lane's router installed."""
         self.declare_handler()
-        self.rgb._install_worker_lane(worker)
-        path = self.queue(tid, worker)
-        self.rgb._fire_on_task(tid, path)
-        return path
+        self.rgb._install_worker_lane(W)
+        staged, dest = self.stage(tid, worker, **kw)
+        seen = {}
+        hook = self.rgb.TASK_PRE_PUBLISH
 
-    def wait_for(self, check, timeout=30.0):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if check():
-                return True
-            time.sleep(0.05)
-        return False
+        def watching(t, s, d):
+            hook(t, s, d)
+            seen["held_before_publish"] = worker_holds(self.ws / "deliveries", d.name)
+            seen["published_before_route"] = d.exists()
+        self.rgb.TASK_PRE_PUBLISH = watching
+        self.assertTrue(self.rgb._publish_task(tid, staged, dest))
+        self.assertFalse(staged.exists())
+        self.assertTrue(dest.is_file())
+        return dest, seen
 
-    def test_the_worker_gets_one_delivery_without_the_core(self):
+    def test_the_worker_holds_the_task_before_the_core_can_see_it(self):
         tid = "task-lane-1"
-        payload = self.fire(tid, W)
-        self.assertTrue(self.wait_for(lambda: pa.attribution_path(self.ws, tid).is_file()), self.logged)
+        payload, seen = self.publish(tid, W)
+        self.assertFalse(seen["published_before_route"], "routed from the staged copy")
+        self.assertTrue(seen["held_before_publish"], "held when it reaches tasks/: the core's watcher skips it")
         self.assertEqual(self.sentinels(W), [f"{tid}.txt"])
         self.assertEqual(pa.attribution_path(self.ws, tid).read_text().strip(), W)
         self.assertEqual(resolve_inbox_entry.resolve(str(self.ws / "deliveries" / W / f"{tid}.txt"), self.ws),
@@ -149,18 +159,90 @@ class OneQueuedTask(Base):
         self.assertIsNone(prr.read(self.ws), "a lane's run is not the watcher's receipt")
         rc = handler.guarded_main(["--task-file", str(payload), "--workspace", str(self.ws),
                                    "--results-dir", str(self.ws / "results")])
-        self.assertEqual(rc, 0, "the watcher's pass finds it committed")
+        self.assertEqual(rc, 0, "a watcher pass that runs anyway finds it committed")
         self.assertEqual(self.sentinels(W), [f"{tid}.txt"], "and delivers nothing twice")
-        self.assertEqual(prr.read(self.ws)["task_id"], tid)
 
-    def test_a_worker_off_the_roster_gets_nothing_from_its_lane(self):
+    def test_a_replayed_publish_delivers_nothing_twice(self):
+        tid = "task-lane-3"
+        payload, _ = self.publish(tid, W)
+        payload.unlink()
+        self.publish(tid, W)
+        self.assertEqual(self.sentinels(W), [f"{tid}.txt"])
+
+    def test_a_worker_off_the_roster_gets_nothing_and_the_core_routes_it(self):
         tid = "task-lane-2"
-        self.fire(tid, OTHER)
-        self.assertTrue(self.wait_for(lambda: any("on-task command exited" in line for line in self.logged)),
-                        self.logged)
-        self.assertEqual(self.sentinels(OTHER), [])
-        self.assertEqual(self.sentinels(W), [])
+        payload, seen = self.publish(tid, OTHER)
+        self.assertFalse(seen["held_before_publish"])
+        self.assertEqual(self.sentinels(OTHER) + self.sentinels(W), [])
         self.assertFalse(pa.attribution_path(self.ws, tid).exists())
+        self.assertTrue(payload.is_file(), "published to the shared inbox for the core's watcher")
+        self.assertTrue(any(f"{tid} not delivered to it (router exit 3)" in line for line in self.logged),
+                        self.logged)
+
+    def test_a_retired_worker_gets_nothing_and_the_core_routes_it(self):
+        (self.ws / "state" / "roster.json").write_text(json.dumps(
+            {"version": 2, "workers": {W: {"state": "retired", "label": "fast"}}, "bindings": {}}))
+        payload, seen = self.publish("task-lane-4", W)
+        self.assertFalse(seen["held_before_publish"])
+        self.assertEqual(self.sentinels(W), [])
+        self.assertTrue(payload.is_file())
+
+    def test_a_picker_command_is_left_for_the_core(self):
+        payload, seen = self.publish("task-lane-5", W, source="worker-picker")
+        self.assertFalse(seen["held_before_publish"])
+        self.assertTrue(payload.is_file())
+
+    def test_a_router_that_fails_or_hangs_never_holds_the_task_back(self):
+        import subprocess
+        from unittest import mock
+        for exc in (OSError("gone"), subprocess.TimeoutExpired("router", 10)):
+            with self.subTest(exc=type(exc).__name__), mock.patch.object(subprocess, "run", side_effect=exc):
+                route = self.rgb._lane_router(W, ["router"])
+                staged, dest = self.stage("task-lane-6", W)
+                route("task-lane-6", staged, dest)
+                self.assertTrue(any("routing task-lane-6 failed" in line for line in self.logged), self.logged)
+                self.assertEqual(self.sentinels(W), [])
+
+    def test_a_pre_publish_hook_that_raises_still_publishes(self):
+        def broken(*_):
+            raise RuntimeError("boom")
+        self.rgb.TASK_PRE_PUBLISH = broken
+        staged, dest = self.stage("task-lane-7", W)
+        self.assertTrue(self.rgb._publish_task("task-lane-7", staged, dest))
+        self.assertTrue(dest.is_file())
+        self.assertTrue(any("pre-publish hook failed for task-lane-7" in line for line in self.logged), self.logged)
+
+
+class TheRouterOnAStagedCopy(Base):
+    """The handler in-process, as the lane runs it: `--task-file` names the destination, `--payload` the
+    staged bytes, which is all the router reads until the task is published."""
+
+    def run_handler(self, tid, worker, source="ag2space"):
+        staged, dest = self.stage(tid, worker, source)
+        rc = handler.guarded_main(["--task-file", str(dest), "--payload", str(staged), "--workspace", str(self.ws),
+                                   "--results-dir", str(self.ws / "results"), "--from-lane"])
+        return rc, dest
+
+    def test_delivers_from_the_staged_copy(self):
+        rc, dest = self.run_handler("task-staged-1", W)
+        self.assertEqual(rc, 0)
+        self.assertFalse(dest.exists())
+        self.assertEqual(self.sentinels(W), ["task-staged-1.txt"])
+        self.assertIsNone(prr.read(self.ws))
+
+    def test_a_picker_command_is_declined_and_not_applied(self):
+        from unittest import mock
+        with mock.patch.object(handler, "apply_picker") as applied:
+            rc, _ = self.run_handler("task-staged-2", W, source="worker-picker")
+        self.assertEqual(rc, handler.DECLINE)
+        applied.assert_not_called()
+        self.assertEqual(self.sentinels(W), [])
+
+    def test_without_a_payload_anywhere_nothing_is_delivered(self):
+        import pool_router
+        self.assertEqual(pool_router.deliver_one(self.ws, W, "task-staged-3",
+                                                 payload=self.ws / "tasks" / ".gone.tmp"), "no-payload")
+        self.assertEqual(self.sentinels(W), [])
 
 
 if __name__ == "__main__":
