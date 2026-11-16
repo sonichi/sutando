@@ -8253,6 +8253,23 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
     return _delivery_destination.route(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
 
 
+def _proactive_attachments(body: str) -> "list[str]":
+    """The `[file:]`/`[send:]`/`[attach:]` paths a proactive body names, in order."""
+    parsed = parse_markers(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
+    return [a.value for a in parsed.actions if a.kind == "attach"]
+
+
+def _upload_proactive_attachments(name: str, room: str, attaches: "list[str]") -> None:
+    """Upload a delivered proactive message's files to its room. The text is already sent,
+    so a refusal cannot go in-band: each outcome is logged, a refused file loudly."""
+    for fp in attaches:
+        ok, reason = _upload_attachment(room, fp)
+        if ok:
+            _log(f"attached {fp} to proactive {name} in {room}")
+        else:
+            _log(f"proactive {name}: attachment NOT sent to {room}: {fp} ({reason})")
+
+
 def _proactive_thread_root(body: str, name: str = "") -> "str | None":
     """The `[thread:]` root a proactive body names, or None (top level). A
     malformed value is logged and posted top level, never into a guessed thread."""
@@ -8720,7 +8737,8 @@ def _post_proactive() -> None:
             _log(f"proactive {f.name} carries a skip marker — archiving, no send")
             _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR)
             continue
-        body = routed_body.strip()
+        attaches = _proactive_attachments(claimed_text)
+        body = routed_body.strip() or ("(file attached)" if attaches else "")
         if not body:
             # An empty claim means the producer has not flushed the body yet.
             # NEVER move this inode: no observable signal proves the writer is
@@ -8750,10 +8768,11 @@ def _post_proactive() -> None:
         envelope = {"room_id": dest_room, "body": body,
                     **({"thread_root": thread_root} if thread_root else {}),
                     **({"task_id": about} if about else {})}
-        _send_proactive(claim, f, envelope, room_override is None, noticed)
+        _send_proactive(claim, f, envelope, room_override is None, noticed, attaches)
 
 
-def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, noticed: set) -> None:
+def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, noticed: set,
+                    attaches: "list[str] | None" = None) -> None:
     """Hand one claimed proactive file to the outbox, which owns the claim, the send and its
     outcome, then move the file as that outcome says. An uncertain send is parked, not resent."""
     core = _delivery_core("proactive")
@@ -8809,6 +8828,8 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
         if result.status is DrainStatus.ATTEMPTED and result.detail != "settled by a recorded receipt":
             _ENGINE_COUNTS["core_confirmed"] += 1
             _log(f"delivered proactive {f.name} to {room} ({item.get('provider_ref')})")
+            # Only after this pass's own send: a resend never repeats an upload.
+            _upload_proactive_attachments(f.name, room, attaches or [])
         else:
             _log(f"proactive {f.name} was already delivered to {room} "
                  f"({item.get('provider_ref') or 'receipt recorded'}) — archived, not sent again")
