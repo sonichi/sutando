@@ -192,7 +192,7 @@ When `core.runtime` is `codex`, the canonical unmarked `main-loop` entry (`promp
    DIGESTS="$(python3 src/cron_entry_digest.py "$WS/hosts/$H/crons.json")"
    echo "{\"ts\": $(date +%s), \"registered\": <count>, \"config_total\": <total entries in crons.json>, \"config_digests\": $DIGESTS}" > "$WS/hosts/$H/schedule-crons-stamp.json"
    ```
-   `health-check.py`'s `session-crons` probe compares this host-owned stamp against the same host's core heartbeat `started_at`: a stamp older than the boot means session crons died with a previous session and were never re-registered (the silent 2/18 failure observed on a peer instance 2026-07-23). Do not skip the stamp on re-runs, or when this run registered 0 entries (an empty `crons.json` stamps `"registered": 0`) — a fresh stamp is what keeps the guard quiet, and the desktop re-sends `/startup` every 10 minutes while it is stale.
+   `health-check.py`'s `session-crons` probe compares this host-owned stamp against the same host's core heartbeat `started_at`: a stamp older than the boot means session crons died with a previous session and were never re-registered (the silent 2/18 failure observed on a peer instance 2026-07-23). Do not skip the stamp on re-runs, or when `crons.json` holds no entries: step 4 still registers the fallback `/proactive-loop`, so that run stamps `"registered": 1`. A fresh stamp is what stops the desktop re-sending `/startup` every 10 minutes. The gate still reports that case as incomplete (1 registered against 0 session-owned), so `/startup complete` is not printed for it.
 
    **`config_digests` is what makes an edit visible.** Everything else in the stamp is a COUNT, and a
    count cannot see an entry whose prompt changed after it was registered. Stamp the digest map of
