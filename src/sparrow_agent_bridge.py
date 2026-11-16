@@ -8,6 +8,10 @@ key, the token variable and the exact env (three dirs plus `AGENT_MXID`, whose i
 segment) are each compared; any difference skips the declaration with one reason line. A seat's declaration
 (one `connect` wired) names no vault key: its env is the adapter's launch_env over the seat .env beside the
 root, whose token file must be the seat's own, and its bridge runs with exactly that, never a vault token.
+A pool worker's declaration (`worker_lane.py declare`) is run only when the connection record names its
+`AGENT_MXID` as one worker's own agent (`worker_lane.serving`); that worker and its lane instance come from
+the record, never the file, and the bridge runs as the worker's lane does (`worker_lane.bridge_overlay`)
+with the shared worker wiring (`worker_lane.install`) set before the package's main() starts.
 
 `declarations(workspace, vault_keys)` lists the valid ones whose vault key exists. What a declaration's
 own bytes can be (not UTF-8, not JSON, too deep, too large, not a regular file) skips that one entry with a
@@ -42,9 +46,10 @@ from ag2_sparrow import connect_bridge as adapter  # noqa: E402
 from ag2_sparrow.adapters.claude_code.shape import LOCAL as CLAUDE_LOCAL  # noqa: E402
 from ag2_sparrow.bounded_file_read import read_regular  # noqa: E402
 from ag2_sparrow.adapters.codex.connect_cli import COMMAND as CODEX_LOCAL_COMMAND  # noqa: E402
+import worker_lane  # noqa: E402
 
 WRITTEN_BY = f"{CLAUDE_LOCAL.command} install"
-WRITERS = (WRITTEN_BY, f"{CODEX_LOCAL_COMMAND} install")
+WRITERS = (WRITTEN_BY, f"{CODEX_LOCAL_COMMAND} install", worker_lane.WRITTEN_BY)
 BRIDGE_MODULE = "ag2_sparrow.remote_gateway_bridge"
 SUFFIX = ".bridge"
 MAX_DECLARATION_BYTES = _sources.MAX_DECLARATION_BYTES
@@ -124,7 +129,9 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
         return None, f"{path}: AGENT_MXID {mxid!r} is not the agent the segment {segment} names"
     root = str(Path(agents).resolve() / segment)
     seat = _sources.is_seat(env)
-    if not seat and decl["written_by"] != WRITTEN_BY:
+    if seat and decl["written_by"] == worker_lane.WRITTEN_BY:
+        return None, f"{path}: {worker_lane.WRITTEN_BY} declares no seat's bridge"
+    if not seat and decl["written_by"] not in (WRITTEN_BY, worker_lane.WRITTEN_BY):
         return None, f"{path}: {decl['written_by']} declares only a seat's bridge"
     want_env, problem = seat_env(root, mxid) if seat else (adapter.bridge_env(root, mxid), "")
     if problem:
@@ -143,7 +150,17 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
         same = False
     if not same:
         return None, f"{path}: env is not the canonical one for {segment}"
-    return dict(want, url_vault_key=adapter.url_vault_key(segment), digest=hashlib.sha256(raw).hexdigest()), ""
+    served = {}
+    if decl["written_by"] == worker_lane.WRITTEN_BY:
+        try:
+            worker, instance, problem = worker_lane.serving(mxid, Path(agents).resolve().parent)
+        except worker_lane.RecordUnreadable as e:
+            raise DeclarationUnreadable(f"{path}: {e}") from e
+        if problem:
+            return None, f"{path}: {problem}"
+        served = {"worker": worker, "instance": instance}
+    return dict(want, url_vault_key=adapter.url_vault_key(segment), digest=hashlib.sha256(raw).hexdigest(),
+                **served), ""
 
 
 def bridge_environ(decl: dict, token: str, base=None, url: str = "") -> dict:
@@ -304,15 +321,27 @@ def main(argv=None, workspace=None, get_key=None, run=runpy.run_module) -> int:
             print(f"sparrow-agent-bridge: not starting: {problem}", file=sys.stderr)
             return 1
     environ = bridge_environ(decl, token, url=url)
+    worker = decl.get("worker")
+    # A worker's bridge runs on its lane's dirs and instance, derived from the record, never the file.
+    overlay = worker_lane.bridge_overlay(workspace, decl["instance"]) if worker else {}
+    dirs = dict(decl["env"], **overlay)
     os.environ.clear()
     os.environ.update(environ)
+    os.environ.update(overlay)
     from ag2_sparrow._dirs import set_dirs
     from ag2_sparrow.local_task_protocol import set_task_stamper
     from task_envelope import stamp_text
-    set_dirs(task_dir=decl["env"]["AGENT_CONNECT_TASK_DIR"], result_dir=decl["env"]["AGENT_CONNECT_RESULT_DIR"],
-             state_dir=decl["env"]["AGENT_CONNECT_STATE_DIR"])
+    set_dirs(task_dir=dirs["AGENT_CONNECT_TASK_DIR"], result_dir=dirs["AGENT_CONNECT_RESULT_DIR"],
+             state_dir=dirs["AGENT_CONNECT_STATE_DIR"])
     set_task_stamper(stamp_text)
-    run(BRIDGE_MODULE, run_name="__main__", alter_sys=True)
+    if not worker:
+        run(BRIDGE_MODULE, run_name="__main__", alter_sys=True)
+        return 0
+    # Not run as __main__: the hooks must be in the module's namespace before its main() starts.
+    ns = run(BRIDGE_MODULE, run_name=BRIDGE_MODULE, alter_sys=False)
+    worker_lane.install(ns, worker, workspace=Path(workspace), results_dir=ns["RESULTS_DIR"], log=ns["_log"],
+                        who=f"agent bridge {decl['name']} (lane {decl['instance']})")
+    ns["main"]()
     return 0
 
 

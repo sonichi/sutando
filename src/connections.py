@@ -2386,12 +2386,37 @@ def lane_worker_at_start(instance: str, environ: Optional[Mapping[str, str]] = N
     if said is not None and said != recorded:
         raise LaneIdentityUnknown(f"the launch names worker {said or '<core>'} but the row names "
                                   f"{recorded or '<core>'}")
-    if recorded:
-        owners = {r.get("owner_mxid") for r in _core_rows(rows) if r.get("owner_mxid")}
-        if not row.get("owner_mxid") or row.get("owner_mxid") not in owners:
-            raise LaneIdentityUnknown(f"worker {recorded}'s agent is held by {row.get('owner_mxid') or 'no owner'}, "
-                                      "not the core's owner")
+    problem = _worker_owner_problem(row, rows) if recorded else None
+    if problem:
+        raise LaneIdentityUnknown(problem)
     return recorded, None
+
+
+def _worker_owner_problem(row: dict, rows: list) -> Optional[str]:
+    """Why the worker row `row` must not be served as its worker's agent: one no core row's owner holds."""
+    owners = {r.get("owner_mxid") for r in _core_rows(rows) if r.get("owner_mxid")}
+    if not row.get("owner_mxid") or row.get("owner_mxid") not in owners:
+        return f"worker {row.get('worker')}'s agent is held by {row.get('owner_mxid') or 'no owner'}, not the core's owner"
+    return None
+
+
+def worker_serving_agent(agent_mxid: str, workspace: Optional[Path] = None) -> "tuple[str, str, Optional[str]]":
+    """(worker, its row's instance, None) when the record names `agent_mxid` exactly as one pool worker's own
+    agent; ("", "", None) when no worker row names it; ("", "", why) when one does but must not be served
+    (two rows, an owner no core row has, disabled). A parked row is served. Raises on an unreadable record."""
+    rows = _read(record_path(workspace))
+    named = [r for r in rows if r.get("worker") and r.get("agent_mxid") == agent_mxid]
+    if not named:
+        return "", "", None
+    if len(named) > 1:
+        return "", "", f"{len(named)} worker rows name agent {agent_mxid}"
+    row = named[0]
+    problem = _worker_owner_problem(row, rows)
+    if not problem and row.get("disabled"):
+        problem = f"worker {row['worker']}'s row is disabled"
+    if not problem and not row.get("instance"):
+        problem = f"worker {row['worker']}'s row names no lane instance"
+    return ("", "", problem) if problem else (str(row["worker"]), str(row["instance"]), None)
 
 
 def lane_worker(instance: str, workspace: Optional[Path] = None) -> str:

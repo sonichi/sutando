@@ -661,6 +661,51 @@ the reseat to run once it is done.
 lane that queued it (`task-<instance>~…`). Each row of `state/agent-activity.jsonl` for such a
 task carries it as `agent`.
 
+### A worker's agent as a declared Sparrow bridge
+
+A worker's own agent can run as a Sparrow agent bridge that sparrowd supervises
+(`src/sparrowd.py --agent-bridges`) instead of as a lane the gateway wrapper's lane loop starts.
+The worker wiring above (addressee, routing before publish and the re-raise after it, the claim and
+own-file gates) is one module, `src/worker_lane.py`, which both the lane loader
+(`remote-gateway-bridge.py`) and the agent bridge (`sparrow_agent_bridge.py`) install.
+
+`python3 src/worker_lane.py declare --worker <id>` writes the declaration
+(`<workspace>/agents/<segment>.bridge/worker.json`, `written_by: worker-lane declare`), where the
+segment is the one the worker row's `agent_mxid` names. The file chooses nothing: the agent bridge
+re-derives its name, vault key and env from the segment, as for any declaration, and runs it only
+when the connection record names its `AGENT_MXID` as exactly one worker's own agent, held by the
+core's owner and not disabled (`connections.worker_serving_agent`). The worker and its lane
+instance come from that row. Such a bridge runs as the worker's lane does: the workspace's
+`tasks/`, `results/` and `state/`, with `GATEWAY_INSTANCE` set to the row's instance. A record that
+cannot be read keeps a running bridge as it is; any other mismatch skips the declaration with its
+reason. `withdraw --worker <id>` removes the declaration, and sparrowd stops the bridge on its next
+scan. The token is read from the vault under the declaration's own key (`declare` prints it), not
+the row's `token_ref`, so the owner stores the worker's relay token there too.
+
+One bridge serves a worker's agent at a time because both run under the same lease: the gateway
+bridge's poller lock for its instance (`state/locks/gateway-bridge.<instance>.lock`). A second
+bridge for that instance exits 75 at start while the first holds it, and sparrowd restarts a
+declared bridge with backoff (at most 60 s) whatever its exit code. `connections.py park` and
+`disconnect` stop whichever process holds that lease, the declared bridge included.
+
+Cutting a worker over:
+
+1. `python3 src/worker_lane.py declare --worker <id>`, then `vault set` the key it prints.
+2. sparrowd picks the declaration up on its next scan. Its bridge finds the lane holding the lease
+   and exits 75; sparrowd keeps retrying.
+3. `python3 scripts/connections.py park <instance>` stops the lane and marks its row parked, so the
+   lane keeper does not start it again. On its next retry the declared bridge takes the lease.
+4. Check with a live round trip: a message to the worker's agent reaches the worker and its reply
+   is posted as that agent.
+
+Undo: `withdraw`, then `connections.py unpark <instance> --repo <checkout> --logs-dir <dir>`.
+
+Known gap: a parked row also makes `connections.worker_enabled_identity` answer None, so while the
+row is parked the worker's session stops stamping its proactive files and its MCP proxy acts as the
+core's agent. The declared bridge still serves the worker's tasks. A row state that stops the lane
+without retiring the identity does not exist yet, and the cut-over needs it before a live worker is
+moved.
+
 ## Known servers
 
 `known_servers()` is the Add picker's offer: every DotSpace the resolver registers
