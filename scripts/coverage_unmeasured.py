@@ -6,16 +6,16 @@
 passes without having looked at it. Naming those files is what separates "not
 measured" from "measured and clean".
 
-Usage: coverage_unmeasured.py <base-ref> <coverage.xml> [--rcfile .coveragerc]
+Usage: coverage_unmeasured.py <base-ref> <coverage.json> [--rcfile .coveragerc]
 Prints one repo-relative path per line; empty output means nothing was missed.
 """
 from __future__ import annotations
 
 import configparser
 import fnmatch
+import json
 import subprocess
 import sys
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
@@ -44,25 +44,26 @@ def unmeasured(changed: "list[str]", measured: "set[str]",
                globs: "list[str]") -> "list[str]":
     """Changed files that are neither omitted on purpose nor present in the report.
 
-    `measured` holds coverage.xml's `filename` values, which are relative to a
-    `<source>` root, so a path is matched by suffix rather than equality.
+    `measured` holds coverage.json's repository-relative file identities.
+    XML filenames can lose the source root and alias unrelated files.
     """
     out = []
     for path in changed:
         if is_omitted(path, globs):
             continue
-        if any(path == m or path.endswith("/" + m) for m in measured):
+        if path in measured:
             continue
         out.append(path)
     return out
 
 
-def measured_files(xml_path: "str | Path") -> "set[str]":
+def measured_files(report_path: "str | Path") -> "set[str]":
     try:
-        root = ET.parse(xml_path).getroot()
-    except (ET.ParseError, OSError):
+        report = json.loads(Path(report_path).read_text())
+    except (ValueError, OSError):
         return set()
-    return {el.get("filename") for el in root.iter("class") if el.get("filename")}
+    files = report.get("files") if isinstance(report, dict) else None
+    return {Path(name).as_posix() for name in files} if isinstance(files, dict) else set()
 
 
 def changed_py(base: str) -> "list[str]":
@@ -79,9 +80,9 @@ def main(argv: "list[str]") -> int:
     if len(argv) < 3:
         print(__doc__.strip(), file=sys.stderr)
         return 2
-    base, xml_path = argv[1], argv[2]
+    base, report_path = argv[1], argv[2]
     rcfile = argv[4] if len(argv) > 4 and argv[3] == "--rcfile" else ".coveragerc"
-    for path in unmeasured(changed_py(base), measured_files(xml_path), omit_globs(rcfile)):
+    for path in unmeasured(changed_py(base), measured_files(report_path), omit_globs(rcfile)):
         print(path)
     return 0
 
