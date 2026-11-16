@@ -100,6 +100,20 @@ class TheWakeCommand(Base):
         self.assertEqual(self.rgb.ON_TASK_CMD, "")
         self.assertTrue(any("no task-event handler" in line for line in self.logged), self.logged)
 
+    def test_a_handler_lookup_that_cannot_run_leaves_routing_to_the_cores_watcher(self):
+        import subprocess
+        from unittest import mock
+        self.declare_handler()
+        for exc in (OSError("no bash"), subprocess.TimeoutExpired("bash", 10)):
+            with self.subTest(exc=type(exc).__name__), mock.patch.object(subprocess, "run", side_effect=exc):
+                self.rgb.ON_TASK_CMD = ""
+                self.rgb._install_worker_lane(W)
+                self.assertEqual(self.rgb.ON_TASK_CMD, "")
+
+    def test_the_lane_says_whose_agent_it_runs_as(self):
+        self.rgb._install_worker_lane(W)
+        self.assertTrue(any(f"runs as worker {W}'s own agent" in line for line in self.logged), self.logged)
+
     def test_a_lanes_own_wake_command_is_kept(self):
         self.declare_handler()
         self.rgb.ON_TASK_CMD = "my-agent run-task"

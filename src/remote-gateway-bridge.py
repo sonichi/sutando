@@ -540,6 +540,8 @@ def _install_worker_lane(worker: str) -> None:
     routed by the lane itself (`_lane_route_command`), and the only proactive files it claims and
     owns are the ones that worker's session wrote."""
     global TASK_ADDRESSEE, PROACTIVE_CLAIM_GATE, PROACTIVE_OWN_FILE, ON_TASK_CMD
+    _log(f"lane {GATEWAY_INSTANCE} runs as worker {worker}'s own agent: it delivers its tasks to that worker, "  # noqa: F821
+         "and it posts only the proactive files that worker's session writes")
     TASK_ADDRESSEE = lambda: worker  # noqa: E731
     PROACTIVE_CLAIM_GATE = PROACTIVE_OWN_FILE = _worker_lane_claim_gate(worker)
     if ON_TASK_CMD:  # noqa: F821
@@ -553,8 +555,6 @@ def _install_worker_lane(worker: str) -> None:
 # Read once: a lane's row names its worker for the life of the process (a change relaunches it).
 _LANE_WORKER = _lane_worker() if GATEWAY_INSTANCE else ""  # noqa: F821
 if _LANE_WORKER:
-    _log(f"lane {GATEWAY_INSTANCE} runs as worker {_LANE_WORKER}'s own agent: it delivers its tasks to that worker, "  # noqa: F821
-         "and it posts only the proactive files that worker's session writes")
     _install_worker_lane(_LANE_WORKER)
 STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
                    and not gateway_credential_sources.is_seat(os.environ) else None)  # noqa: F821
