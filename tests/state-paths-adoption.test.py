@@ -167,6 +167,9 @@ ALLOWLIST = {
     # issued_cards never resolves the workspace: its ledger path is composed FROM the
     # caller's workspace, task_archive.py's caller-supplies-the-path rationale.
     "src/issued_cards.py",
+    # task_dispatch never resolves the workspace: worker_committed(workspace, …) reads the
+    # attribution record under the root its caller (the watcher) resolved.
+    "src/delivery/task_dispatch.py",
     # runtime-cli talks to the daemon over the socket only — it renders the
     # daemon's "state" fields and owns no workspace paths.
     "src/runtime-cli/sutando-runtime.py",
