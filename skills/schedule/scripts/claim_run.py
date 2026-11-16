@@ -45,10 +45,8 @@ if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
 if str(REPO / "packages" / "ag2-sparrow") not in sys.path:
     sys.path.append(str(REPO / "packages" / "ag2-sparrow"))
-import outbox  # noqa: E402
+import file_lock, local_task_protocol, outbox  # noqa: E401,E402
 from ag2_sparrow import gateway_instance  # noqa: E402
-from file_lock import locked_file  # noqa: E402
-from local_task_protocol import parse_task_headers  # noqa: E402
 
 SKIP_EXIT, RECONCILE_EXIT, REFUSED_EXIT = 3, 4, 5
 CLAIMED, WAITING, DONE, RECONCILE = "claimed", "waiting_approval", "done", "needs_reconcile"
@@ -60,7 +58,7 @@ _TRANSITIONS = {"wait": ({CLAIMED}, WAITING), "resume": ({WAITING}, CLAIMED),
 
 def run_key(task_text: str, fallback_id: str = "") -> str:
     """The run's identity: `schedule:<id>@<slot>`, else `trigger:<id>`, else `task:<id>`."""
-    parsed = parse_task_headers(task_text)
+    parsed = local_task_protocol.parse_task_headers(task_text)
     first = parsed.body.split("\n", 1)[0].strip()
     m = _BRIEFING_RE.match(first)
     if m:
@@ -81,7 +79,8 @@ def _record_path(workspace: Path, key: str) -> Path:
 
 @contextmanager
 def _locked(workspace: Path, key: str):
-    with locked_file(_record_path(workspace, key).with_suffix(".lock"), create_mode=0o600):
+    lock = _record_path(workspace, key).with_suffix(".lock")
+    with file_lock.locked_file(lock, create_mode=0o600):
         yield _record_path(workspace, key)
 
 
@@ -204,7 +203,7 @@ def transition(workspace: Path, key: str, cmd: str, run_id: str, attempt: int, *
 
 
 def _task_id(task_file: Path, text: str) -> str:
-    return (parse_task_headers(text).get("id") or "").strip() or task_file.stem
+    return (local_task_protocol.parse_task_headers(text).get("id") or "").strip() or task_file.stem
 
 
 def _workspace(arg: "str | None") -> Path:
