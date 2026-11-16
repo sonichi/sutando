@@ -53,6 +53,7 @@ OFF_WARNINGS = {"agent.blocked.terminal": "You won't see when your agent is stuc
 OUT_OF_DATE = "This card was out of date, so I changed nothing. These are your current settings."
 _TARGET = re.compile(r"r(\d{1,9})=(.+)")
 _MXID = re.compile(r"@[^\s:]+:\S+")
+_UNSAFE = re.compile(r"[^A-Za-z0-9._=+/:@-]")
 
 
 def agent_key(mxid: str) -> str:
@@ -92,6 +93,20 @@ def names_for(doc: Mapping, known: Optional[Mapping[str, str]] = None) -> dict:
     for name in raw.values():
         counts[name] = counts.get(name, 0) + 1
     return {aid: (name if counts[name] == 1 else f"{name} ({aid})")[:100] for aid, name in raw.items()}
+
+
+def said_names(doc: Mapping) -> dict:
+    """agent id -> how the owner's own reply text names it: the id's localpart in a safe charset (the
+    whole id when two share one), never an agent-chosen display name."""
+    raw = {}
+    for a in doc.get("agents") or []:
+        aid = str(a.get("agent_id") or "") if isinstance(a, dict) else ""
+        if aid:
+            raw[aid] = _UNSAFE.sub("", localpart(aid))[:60] or "agent"
+    counts: dict = {}
+    for name in raw.values():
+        counts[name] = counts.get(name, 0) + 1
+    return {aid: name if counts[name] == 1 else (_UNSAFE.sub("", aid)[:100] or name) for aid, name in raw.items()}
 
 
 def saved_line(updated_by: object, names: Mapping[str, str], owner_name: str = "") -> str:
@@ -145,7 +160,7 @@ def triggers_card(doc: Mapping, view: Optional[View] = None, *, names: Optional[
     """(body, card): each event type once for all agents ("on for N of M"), one opened for per-agent
     edits behind Edit, then the ranked notifiers."""
     view = view or View()
-    names = names or names_for(doc)
+    names, said = names or names_for(doc), said_names(doc)
     rev = revision_of(doc)
     agents = [a for a in doc.get("agents") or [] if isinstance(a, dict) and a.get("agent_id")]
     total = f"{len(agents)}{'+' if doc.get('agents_truncated') else ''}"
@@ -176,10 +191,10 @@ def triggers_card(doc: Mapping, view: Optional[View] = None, *, names: Optional[
             for a in agents[:50]:
                 aid = a["agent_id"]
                 v, mine = _effective(doc, aid, ev), ev in (a.get("overrides") or {})
-                acts = [_act("Turn off" if v else "Turn on", f"Turn {'off' if v else 'on'} \"{label}\" for {names.get(aid, aid)}",
+                acts = [_act("Turn off" if v else "Turn on", f"Turn {'off' if v else 'on'} \"{label}\" for {said[aid]}",
                              ac.reply(TRIGGERS, target(rev, ev, agent_key(aid)), "agent-off" if v else "agent-on"))]
                 if mine:
-                    acts.append(_act("Use all-agents", f"{names.get(aid, aid)} follows all agents for \"{label}\"",
+                    acts.append(_act("Use all-agents", f"{said[aid]} follows all agents for \"{label}\"",
                                      ac.reply(TRIGGERS, target(rev, ev, agent_key(aid)), "agent-follow")))
                 rows.append(ac.row(names.get(aid, aid)[:120], tag="1st notifier" if notifiers[:1] == [aid] else "",
                                    subtitle=f"{'On' if v else 'Off'} · {'own setting' if mine else 'follows all agents'}",
@@ -188,16 +203,16 @@ def triggers_card(doc: Mapping, view: Optional[View] = None, *, names: Optional[
             editor = ac.group(f"{label}: each agent"[:80], rows)
     nf_rows = []
     for i, aid in enumerate(notifiers[:NOTIFIERS_MAX]):
-        name = names.get(aid, localpart(aid))
+        name, who = names.get(aid, localpart(aid)), said.get(aid) or _UNSAFE.sub("", aid)
         acts = []
         if i:
-            acts.append(_act("↑", f"Move {name} up in my notifiers", ac.reply(TRIGGERS, target(rev, "nf", agent_key(aid)), "nf-up")))
-        acts.append(_act("Remove", f"Remove {name} from my notifiers", ac.reply(TRIGGERS, target(rev, "nf", agent_key(aid)), "nf-remove")))
+            acts.append(_act("↑", f"Move {who} up in my notifiers", ac.reply(TRIGGERS, target(rev, "nf", agent_key(aid)), "nf-up")))
+        acts.append(_act("Remove", f"Remove {who} from my notifiers", ac.reply(TRIGGERS, target(rev, "nf", agent_key(aid)), "nf-remove")))
         nf_rows.append(ac.row(f"{i + 1}. {name}"[:120], avatar_=ac.avatar(mxid=aid) if _MXID.fullmatch(aid) else None,
                               actions=acts))
     candidates = [a["agent_id"] for a in agents if a["agent_id"] not in notifiers][:8]
     if len(notifiers) < NOTIFIERS_MAX and candidates:
-        items = [_act(names.get(aid, aid)[:80], f"Add {names.get(aid, aid)} to my notifiers",
+        items = [_act(names.get(aid, aid)[:80], f"Add {said[aid]} to my notifiers",
                       ac.reply(TRIGGERS, target(rev, "nf", agent_key(aid)), "nf-add")) for aid in candidates]
         nf_rows.append(ac.row("Add a notifier", subtitle="Up to 5, tried in order",
                               actions=[ac.button("+ Add", "menu", items=items)]))

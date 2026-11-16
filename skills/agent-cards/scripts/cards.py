@@ -22,7 +22,8 @@ but the owner and in any room but their DM.
 - triggers, notices: the owner's preferences on s.space, read with the account Actions
   `agent.triggers.get` / `notice.prefs.get` as the core's own agent (prefs_cards.py builds them). A click
   sets them with `agent.triggers.set` / `notice.prefs.set`, passing the click's task_id (the server's
-  owner-asked gate) and the card's revision; the card is drawn again with the outcome on it.
+  owner-asked gate) and the card's revision; the card is drawn again with the outcome on it, and only
+  then spent, one click at a time under its lock. A click with no task_id saves nothing and says so.
 
 `reply` handles the owner's click on one of these cards (agent_card.click_verdict decides; a click that
 matches no card this agent posted prints the fixed refusal and nothing acts): Reconnect and Make main run
@@ -35,6 +36,7 @@ Every command prints one JSON object. Exit 0 done, 1 a negative answer, 2 refuse
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import re
 import sys
@@ -360,7 +362,7 @@ def prefs_doc(action: str, answer: object) -> dict:
         raise PrefsError(action, "", {})
     error = answer.get("error") if isinstance(answer.get("error"), dict) else {}
     details = answer.get("details") if isinstance(answer.get("details"), dict) else error.get("details") or {}
-    if answer.get("is_error") or (answer.get("code") and "revision" not in answer):
+    if answer.get("is_error") or ((answer.get("code") or error.get("code")) and "revision" not in answer):
         raise PrefsError(action, str(answer.get("code") or error.get("code") or ""), dict(details))
     doc = answer.get("result") if isinstance(answer.get("result"), dict) else answer
     if not isinstance(doc.get("schema_version"), int):
@@ -507,7 +509,11 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, now=time.time, account
         return _emit(other, 1)
     said, clicked = verdict.command, str(headers.get("reply_to_event") or "")
     destructive = (said.kind, said.verb) in DESTRUCTIVE
-    if said.confirmed or said.verb == "keep" or said.kind in PREFS + (OFFER,):
+    if said.kind in PREFS:
+        lane = verdict.lane or str(core.get("instance") or "")
+        out = _prefs_click(ws, said, clicked, headers, lane, account, execute, now())
+        return _emit(out, {"refused": 2, "failed": 1, ac.FORGED: 1}.get(out["status"], 0))
+    if said.confirmed or said.verb == "keep" or said.kind == OFFER:
         # Claim the confirm card under its record lock before anything runs: one answer, the first.
         try:
             claimed = issued_cards.settle(ws, clicked)
@@ -518,8 +524,6 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, now=time.time, account
     try:
         if said.kind == OFFER:
             out = {"status": "say", "say": "Okay. I won't ask again for at least a week."}
-        elif said.kind in PREFS:
-            out = _prefs_reply(ws, said, headers, verdict.lane or str(core.get("instance") or ""), account, execute, now())
         elif said.verb == "keep":
             out = {"status": "say", "say": "Okay, I left it as it is."}
         elif destructive and not said.confirmed:
@@ -533,6 +537,28 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, now=time.time, account
         out = {"status": "failed", "why": f"{type(e).__name__}: {e}"}
     code = {"refused": 2, "failed": 1}.get(out["status"], 0)
     return _emit(out, code)
+
+
+def _prefs_click(ws: Path, said: ac.Reply, clicked: str, headers: dict, lane: str, account, execute,
+                 now: float) -> dict:
+    """A settings click, one card at a time under its lock: the card is spent only once its redraw is
+    posted, so a failed read or post leaves it working; a revision bump stops a second set."""
+    from file_lock import locked_file
+    path = issued_cards.ledger_path(ws)
+    try:
+        with locked_file(path.with_name(path.name + ".click.lock")):
+            if issued_cards.live(ws, clicked) is None:
+                return {"status": ac.FORGED, "say": ac.UNMATCHED_CLICK, "why": "that card was already answered"}
+            try:
+                out = _prefs_reply(ws, said, headers, lane, account, execute, now)
+            except Exception as e:  # noqa: BLE001 — each unit's refusal is reported in its own words
+                out = {"status": "failed", "why": f"{type(e).__name__}: {e}"}
+            if out.get("event_id"):
+                with contextlib.suppress(OSError):
+                    issued_cards.settle(ws, clicked)
+    except OSError as e:
+        return {"status": "failed", "why": f"the card could not be claimed ({type(e).__name__})"}
+    return out
 
 
 def _prefs_reply(ws: Path, said: ac.Reply, headers: dict, lane: str, account, execute, now: float) -> dict:
@@ -551,10 +577,13 @@ def _prefs_reply(ws: Path, said: ac.Reply, headers: dict, lane: str, account, ex
     view, status = step.view, "asked" if step.view.confirm else "redrawn"
     if view.outcome == pc.OUT_OF_DATE:
         status = "out_of_date"
-    if step.step == "set":
+    if step.step == "set" and not task_id:
+        view, status = pc.View(edit=view.edit, outcome="Not saved: this click came without a task id, so I "
+                               "couldn't save it safely. Please tap it again.", tone="warn"), "not_saved"
+    elif step.step == "set":
         try:
             doc = prefs_doc(pc.SET[kind], account.execute(pc.SET[kind], step.arguments, task_id=task_id,
-                                                          operation_id=f"{task_id or headers.get('id') or 'task'}:{kind}-set"))
+                                                          operation_id=f"{task_id}:{kind}-set"))
         except Exception as e:  # noqa: BLE001 — any failed save is said on a card that still works
             view, status = pc.View(edit=view.edit, outcome=f"Not saved: {_save_error(e)}.", tone="warn"), "not_saved"
             if isinstance(e, PrefsError) and e.code == "CONFLICT":

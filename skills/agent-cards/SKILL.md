@@ -81,8 +81,8 @@ for all agents ("on for N of M"), per-agent exceptions behind Edit, and the noti
 notices card has a toggle per notice kind and "Show at least". Types the server does not let the owner
 change are shown read-only.
 
-A click claims the card, reads the settings again, and posts the card again in its place with what happened
-on it; reply `[REPLIED]` to every status that carries an `event_id`:
+A click reads the settings again and posts the card again in its place with what happened on it; the old
+card is spent only once that post succeeds, so a failed read or post leaves it working; reply `[REPLIED]` to every status that carries an `event_id`:
 
 - `saved`: the set Action ran with the click's task_id (the server's owner-asked gate) and the card's
   revision; the card says "Saved · <agent> on behalf of <owner> · <change>".
