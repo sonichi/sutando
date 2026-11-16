@@ -28,6 +28,7 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `pool_route_handler.py` — the core watcher's task-event handler (`SUTANDO_TASK_EVENT_HANDLER`): declines unbound work, delivers bound work as sentinels.
 - `pool_delivery.py` — a recipient's own folder: sentinels in, accept, release, done flags, and the owner's `hand_off_to_core`.
 - `pool_ask.py` — ask another instance a question through the front door (below).
+- `pool_handoff.py` — `pool_ask` over s.space to a worker with its own agent, behind a flag (below).
 - `pool_sessions.py` — read-only: which worker tmux sessions a viewer could attach, and the exact-match argv for each. Adds no state and nothing in the pool calls it; it exists for the desktop app's terminal picker. It deliberately does not describe the core, whose socket resolution belongs to the app.
 
 ```bash
@@ -385,6 +386,44 @@ python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|
   never be relayed as your own: the tier must say where the question came from, not who ran
   the script.
 - Refused, never guessed: an unknown name, a name shared by recipients, and asking yourself.
+
+### Over s.space, to a worker with its own agent (flag, off by default)
+
+With `WORKER_POOL_SSPACE_HANDOFF` on (manifest `config`, `CLI > env > manifest`), an ask **from the
+core**, at team tier, to a worker whose own identity row is enabled (`src/connections.py`) is a
+typed hand-off (`src/handoff_contract.py`) instead of a task file: the core's agent mentions the
+worker's agent in `WORKER_POOL_HANDOFF_ROOM` (the owner-only consult room, or a room both are in)
+through the room CLI at `WORKER_POOL_HANDOFF_ROOM_CLI` (the consult skill's `mention` / `read`
+verbs). The worker's own lane delivers it like any message to that agent. `--wait` reads the room
+for the reply, correlated by task id; with no `--wait`, `--collect <task id> [--wait N]` reads it
+later. Each read reaches back to the hand-off itself (up to 1000 messages), so a reply that busy
+traffic pushed out of the latest page is still found, and a typed answer, once found, is kept in
+`state/pool-handoff/<task id>.json` for later collects. A typed `done` or `failed` returns at
+once; an untyped reply ("On it") is progress, and the latest one is returned only when the wait
+ends with no typed answer. Timeouts and exit codes are the folder path's; a `failed` reply exits
+1, an unreadable room or a refused post exits 2, and an unconfirmed post is never sent again
+(only a typed reply can be matched to it, since it has no event to reply to).
+
+Kept on the folder path: a worker with no, a disabled or a parked identity; a worker's own ask;
+a relayed ask (`--relayed-from`, so its tier is kept); an ask with `--parent-task`; and the
+limit-recovery probe, whose pane prompt names the routed payload. A worker with an identity that
+the flag cannot address (no room, CLI, agent id or core lane on its server) is refused, never
+quietly sent through the folder.
+
+**Answering a hand-off (the worker).** `python3 src/handoff_contract.py parse --task-file <task>`
+says whether the task is a hand-off and gives its task id. Answer as an ordinary result, so the
+lane posts it as a reply to the hand-off, starting with the typed header:
+`python3 src/handoff_contract.py reply --task-id <id> --status done|failed < answer`. An
+acknowledgement may come first (plain, or `--status working`); only the typed final ends the
+hand-off, and a plain reply counts only if no typed one arrives in time. If the core's own lane gets the reply as a task, it
+answers `[no-send]`: `pool_ask` collects it from the room.
+
+**Authority.** A hand-off is a message from the core's agent, at the tier the room gives that
+agent; nothing here grants more. No rule tiers the owner's other agents as owner: in s.space the
+room's access setting decides. Give the core's agent **Team** with Agent Native **Collaborator
+access** in the hand-off room; that matches a folder ask (`access_tier: team` +
+`collaborator: true`). Plain Team lands on the sandboxed read-only path, and Owner access would
+raise hand-offs above what `pool_ask` gives today. Owner-tier work cannot be delegated either way.
 
 Not yet: the reply is read from `results/` by the asker, not delivered into the
 asker's inbox (`reply_to_instance` is recorded for that later leg), and a worker
