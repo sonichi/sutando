@@ -366,6 +366,33 @@ class AskerWording(_Ws):
                                      (path, body))
                     self.assertNotIn("core", body, path)
 
+    def test_an_unreadable_speaker_falls_back_without_blocking_the_ask(self):
+        self.record(agent_display_name="Helper")
+        with mock.patch.object(C, "proactive_author_phrase", side_effect=OSError("unreadable")):
+            for worker, who in ((W, f"a worker on {HOST}"), ("", f"the {HOST} core")):
+                with self.subTest(worker or "core"), self.as_worker(worker):
+                    if not worker:
+                        os.environ.pop("SUTANDO_WORKER_ID", None)
+                    for path, body in self.bodies().items():
+                        self.assertEqual(body.splitlines()[1],
+                                         f"Question for you from {who} — it needs your word:", path)
+
+    def test_a_name_that_cannot_be_worked_out_still_records_the_cores_question(self):
+        boom = OSError("no name")
+        with mock.patch.object(ask_owner_cli, "worker_published_path", side_effect=boom), \
+                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()) as outp, \
+                mock.patch.object(ask_owner_cli, "declared", return_value=None):
+            ask_owner_cli.main(["Ship it?", "--workspace", str(self.ws), "--urgency", "durable"])
+        self.assertEqual(self.proactive(), [])
+        self.assertIn("sent: FAILED — OSError: no name", outp.getvalue())
+        [rec] = [json.loads(p.read_text()) for p in (self.ws / "state").rglob("ask-*.json")]
+        self.assertEqual((rec["error"], rec["body"].splitlines()[1]), ("OSError: no name", self.CORE_LEAD))
+        with mock.patch.object(pqa, "published_name", side_effect=boom), self.as_worker():
+            out = room_db.ask_owner("Merge #12 now?", urgency="durable", workspace=self.ws, host=HOST, store=None)
+        self.assertEqual((self.proactive(), out["proactive_file"], out["send_error"]), ([], None, "OSError: no name"))
+        [q] = self.outbox_questions()
+        self.assertEqual(q["question"], "Merge #12 now?", "the question is still held")
+
     def test_a_decision_cards_text_fallback_stays_the_cores(self):
         self.record(agent_display_name="Helper")
         (self.ws / "state" / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space"}))
