@@ -28,6 +28,9 @@ adapter that already resolves the workspace stays the one that decides. Shape:
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+import time
 import os
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -294,3 +297,179 @@ def armed_detail(results: list):
         if verdict == ARMED:
             return detail
     return None
+
+
+def live_lstart_by_pid():
+    """{pid: lstart} for every running process from one `ps` call, or None when
+    the enumeration itself failed — unknown is not the empty set."""
+    try:
+        out = subprocess.run(["ps", "-eo", "pid=,lstart="], capture_output=True,
+                             text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    table = {}
+    for line in out.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            return None      # a row that does not parse makes the whole table unusable
+        table[parts[0]] = parts[1].strip()
+    # rc 0 with no rows is not "no processes": it is an answer that cannot be right.
+    return table or None
+
+
+def _identity(pin: dict) -> tuple:
+    return (str(pin.get("service") or ""), str(pin.get("pid") or ""),
+            str(pin.get("lstart") or "").strip())
+
+
+def merge_snapshots(newer: list, older: list, lstart_by_pid, now_ts: float) -> tuple:
+    """Union of two pin snapshots that are independent sources, not one history.
+
+    The newer snapshot is taken whole. An older-only pin survives only while it
+    could still veto: unexpired, its pid live, its lstart matching. Unknown
+    liveness keeps it — a pin only ever suppresses a restart, so the safe error
+    is an extra pin, never a lost one. Returns (merged, kept, dropped).
+    """
+    seen = {_identity(p) for p in newer}
+    merged, kept, dropped = list(newer), [], []
+    for pin in older:
+        if _identity(pin) in seen:
+            continue
+        if _expired(pin, now_ts):
+            dropped.append(pin)
+            continue
+        if lstart_by_pid is not None:
+            live = lstart_by_pid.get(str(pin.get("pid") or ""))
+            if live is None or str(live).strip() != str(pin.get("lstart") or "").strip():
+                dropped.append(pin)
+                continue
+        merged.append(pin)
+        kept.append(pin)
+        seen.add(_identity(pin))
+    return merged, kept, dropped
+
+
+def _mtime_ns_portable(path: Path):
+    """Nanosecond mtime via the PATH-resolved `stat` command — the same four
+    candidate forms, in the same order, as scripts/sutando-migrate.sh's own
+    mtime_ns() (GNU vs BSD, with/without subsecond, LC_ALL=C against comma
+    locales). A native `path.stat()` syscall would be simpler, but it cannot be
+    redirected: sutando-migrate.sh's own test suite verifies pins-union's
+    ordering against an injected `stat` shim (for locale/GNU-version coverage,
+    and for exact deterministic sub-second control no filesystem sleep could
+    give), and a syscall read is invisible to a PATH shim. Reading it this way,
+    still fully inside merge_into()'s lock, keeps both properties: the read is
+    atomic with the comparison (fixing the race), and it stays shim-observable.
+    Returns None if every candidate form fails or prints something unparseable.
+    """
+    env = dict(os.environ)
+    env["LC_ALL"] = "C"
+    for args in (["stat", "-f", "%Fm"], ["stat", "-c", "%.9Y"],
+                 ["stat", "-f", "%m"], ["stat", "-c", "%Y"]):
+        try:
+            r = subprocess.run(args + [str(path)], capture_output=True, text=True,
+                               env=env, timeout=10)
+        except OSError:
+            continue
+        if r.returncode != 0:
+            continue
+        v = r.stdout.strip()
+        if not v or any(c not in "0123456789." for c in v) or v.count(".") > 1 \
+                or v.startswith(".") or v.endswith("."):
+            continue
+        # sec/frac are guaranteed pure-digit by the character/shape check above
+        # (nonempty, digits-and-at-most-one-interior-dot), so int() cannot raise here.
+        sec, _, frac = v.partition(".")
+        frac = (frac + "0" * 9)[:9]
+        return int(sec) * 10 ** 9 + int(frac)
+    return None
+
+
+def merge_into(dst, incoming, now_ts=None) -> tuple:
+    """One locked transaction: order, strict loads, liveness probe, union, write.
+
+    `dst` is the live, lock-protected file; `incoming` is the snapshot being
+    migrated in. Ordering by mtime is decided HERE, under the lock, from a
+    fresh stat of both files — never by a caller that read `dst`'s mtime (or
+    hash) before acquiring it. A caller-side pre-decision has two separate
+    reads (mtime, then a hash to detect drift) with a gap between them: an
+    arm/release landing in that gap changes `dst`'s bytes AND its mtime, but
+    if the caller's hash read happens after the arm, the hash matches current
+    state and no drift is detected — so the caller's stale mtime-based
+    ordering (computed before the arm) is trusted anyway, and a legacy
+    same-identity record from `incoming` silently wins over the fresh arm
+    (reproduced 2026-09-30 from keweichen's review of #3356: kept=0, the
+    2099-expiry fresh arm lost to a 2028-expiry legacy record). Reading both
+    mtimes in the same atomic section that holds the lock removes the gap
+    entirely: an arm/release either completes fully before this section reads
+    `dst`, and is seen; or runs fully after this section releases the lock,
+    and is irrelevant to this merge. Two snapshots with equal mtimes and
+    different bytes are an ambiguity, not a tie to break by scan order.
+    Returns (kept, dropped, total, newer_is_dst). Raises ValueError to refuse.
+    """
+    dst, incoming = Path(dst), Path(incoming)
+    with _locked(dst):
+        # Source probed before destination; a source failure short-circuits
+        # before the more consequential (live, lock-protected) file is touched.
+        i_mt = 0
+        if incoming.exists():
+            i_mt = _mtime_ns_portable(incoming)
+            if i_mt is None:
+                raise ValueError(f"mtime unavailable for source {incoming} — resolve by hand")
+        d_mt = 0
+        if dst.exists():
+            d_mt = _mtime_ns_portable(dst)
+            if d_mt is None:
+                raise ValueError(f"mtime unavailable for destination {dst} — resolve by hand")
+        if d_mt == i_mt and dst.exists() and incoming.exists() \
+                and dst.read_bytes() != incoming.read_bytes():
+            raise ValueError("equal mtimes with different content — resolve by hand")
+        if i_mt > d_mt:
+            newer_p, older_p, n_mt, o_mt = incoming, dst, i_mt, d_mt
+        else:
+            newer_p, older_p, n_mt, o_mt = dst, incoming, d_mt, i_mt
+        newer, older = _load_strict(newer_p), _load_strict(older_p)
+        merged, kept, dropped = merge_snapshots(newer, older, live_lstart_by_pid(),
+                                                time.time() if now_ts is None else now_ts)
+        if len(merged) > MAX_PINS:
+            raise ValueError(f"{len(merged)} pins exceeds the bound of {MAX_PINS}")
+        if kept:
+            save_pins(dst, merged)
+        elif newer_p != dst:
+            # The newer snapshot IS the answer: its bytes, verbatim, under the same lock.
+            tmp = dst.with_name(f".{dst.name}.tmp-{os.getpid()}-{os.urandom(4).hex()}")
+            try:
+                tmp.write_bytes(newer_p.read_bytes())
+                os.replace(tmp, dst)
+            finally:
+                tmp.unlink(missing_ok=True)
+        # Provenance is the inputs' newest mtime, never the migration's write time.
+        prov = max(n_mt, o_mt)
+        if prov:
+            os.utime(dst, ns=(prov, prov))
+        return len(kept), len(dropped), len(merged), newer_p == dst
+
+
+def _cli(argv) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(prog="process_pins")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    m = sub.add_parser("merge", help="union --incoming into --into; ordering is decided under the lock, not by the caller")
+    m.add_argument("--into", required=True, help="the live, lock-protected destination")
+    m.add_argument("--incoming", required=True, help="the snapshot being migrated in")
+    a = ap.parse_args(argv)
+    try:
+        kept, dropped, total, newer_is_dst = merge_into(a.into, a.incoming)
+    except ValueError as e:
+        print(f"merge refused: {e}", file=sys.stderr)
+        return 2
+    print(f"merged kept={kept} dropped={dropped} total={total} newer={'dst' if newer_is_dst else 'src'}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_cli(sys.argv[1:]))
