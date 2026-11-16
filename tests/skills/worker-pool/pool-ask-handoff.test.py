@@ -3,8 +3,10 @@
 
 Pinned: the manifest ships the flag off, and off the folder path is unchanged and the hand-off code
 is never consulted; on, an ask from the core to a worker with an enabled identity posts exactly one
-message as the core's agent and returns at once, with no task file, no delivery and no room read,
-`--wait` included; a worker with no, a disabled or a parked identity, a worker's own ask, an ask
+message as the core's agent and returns at once, with no task file, no delivery and no room read;
+`--wait` there is refused loudly (exit 2, `reply: null`, `wait_honoured: false`); each posted ask is
+one line of the asks record, and `--asked` lists the recorded asks no gateway reply task from the
+asked agent has answered (a reply from anyone else is named, never counted); a worker with no, a disabled or a parked identity, a worker's own ask, an ask
 below team tier, a relayed ask and a parent-held ask keep the folder; an identity that cannot be
 addressed is refused, never a silent fallback; a refusal before sending is exit 2, and an unclear
 post is `unconfirmed` and never resent.
@@ -157,19 +159,44 @@ class FlagOn(Base):
         self.assertFalse(self.delivered(out["task_id"]), "no delivery")
         self.assertFalse((self.ws / "state" / "pool-handoff").exists(), "no record")
 
-    def test_wait_does_not_poll(self):
+    def test_wait_does_not_poll_and_says_it_was_not_honoured(self):
         room = FakeRoom()
         with mock.patch.object(pa, "wait_for_reply", side_effect=AssertionError("waited on the room path")):
             out = self.ask(room, wait_s=30)
         self.assertEqual(room.verbs(), ["mention"])
         self.assertEqual(self.sleeps, [], "it slept")
-        self.assertNotIn("reply", out)
+        self.assertEqual((out["reply"], out["wait_honoured"]), (None, False))
+        self.assertNotIn("wait_honoured", self.ask(FakeRoom()), "no wait asked, nothing to refuse")
+
+    def test_each_posted_ask_is_one_record_line(self):
+        out = self.ask(FakeRoom())
+        lines = ph.asks_path(self.ws).read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        rec = json.loads(lines[0])
+        self.assertEqual({k: rec[k] for k in ("task_id", "worker", "agent", "event_id", "status", "question")},
+                         {"task_id": out["task_id"], "worker": self.alpha, "agent": WORKER_AGENT,
+                          "event_id": "$req", "status": "sent", "question": "status of #7?"})
+        self.assertRegex(rec["sent_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.ask(FakeRoom(mention="unclear"))
+        self.assertEqual(len(ph.asks_path(self.ws).read_text().splitlines()), 2, "an unconfirmed post is recorded")
+
+    def test_a_long_question_is_excerpted_on_one_line(self):
+        pa.ask(self.ws, "alpha", "line one\n" + "x" * 500, runner=FakeRoom())
+        rec = json.loads(ph.asks_path(self.ws).read_text())
+        self.assertEqual(len(rec["question"]), ph.EXCERPT)
+        self.assertTrue(rec["question"].startswith("line one x"))
+
+    def test_a_record_that_cannot_be_written_is_reported_not_raised(self):
+        with mock.patch.object(ph.task_lifecycle, "append_durable", side_effect=OSError("disk full")):
+            out = self.ask(FakeRoom())
+        self.assertEqual((out["status"], out["record_error"]), ("sent", "disk full"))
 
     def test_a_refusal_before_sending_raises(self):
         room = FakeRoom(mention={"ok": False, "posted": False, "reason": "not a member"})
         with self.assertRaisesRegex(ValueError, "not a member"):
             self.ask(room)
         self.assertEqual(list((self.ws / "tasks").iterdir()), [], "a refusal fell back to a task")
+        self.assertFalse(ph.asks_path(self.ws).exists(), "a refused post is not an ask")
 
     def test_an_unclear_post_is_unconfirmed_and_never_resent(self):
         room = FakeRoom(mention="Traceback: timeout")
@@ -195,6 +222,7 @@ class FlagOn(Base):
             self.assertNotIn("via", out)
             self.assertTrue(self.delivered(out["task_id"]))
             self.assertEqual(room.calls, [])
+            self.assertFalse(ph.asks_path(self.ws).exists(), "a folder ask is not recorded here")
             if change:
                 for k in change:
                     self.rows[1].pop(k)
@@ -233,6 +261,67 @@ class FlagOn(Base):
         self.assertEqual(list((self.ws / "tasks").iterdir()), [], "a refusal wrote a task")
 
 
+def gateway_task(folder, tid, *, event, sender, layout=True):
+    """A task file in the gateway's own layout (task_layout above task:, context below it)."""
+    folder.mkdir(parents=True, exist_ok=True)
+    head = f"id: {tid}\nsource: ag2space\n" + ("task_layout: mid\n" if layout else "")
+    (folder / f"{tid}.txt").write_text(head + f"task: received\nreply_to_event: {event}\nuser_id: {sender}\n"
+                                       "access_tier: team\n")
+
+
+class Asked(Base):
+    def setUp(self):
+        super().setUp()
+        self.on()
+        self.tid = self.ask(FakeRoom())["task_id"]
+
+    def test_an_ask_with_no_reply_is_listed(self):
+        rows = pa.asked(self.ws)
+        self.assertEqual([(r["task_id"], r["agent"], r["other_replies"]) for r in rows],
+                         [(self.tid, WORKER_AGENT, [])])
+
+    def test_a_reply_task_from_the_asked_agent_answers_it_live_or_archived(self):
+        for folder in (self.ws / "tasks", self.ws / "tasks" / "archive",
+                       self.ws / "tasks" / "archive" / ph.datetime.now(ph.timezone.utc).strftime("%Y-%m")):
+            gateway_task(folder, "task-reply", event="$req", sender=WORKER_AGENT)
+            self.assertEqual(pa.asked(self.ws), [], folder)
+            (folder / "task-reply.txt").unlink()
+        self.assertEqual(len(pa.asked(self.ws)), 1, "control: with the reply gone it is listed again")
+
+    def test_a_reply_from_anyone_else_is_named_and_not_counted(self):
+        gateway_task(self.ws / "tasks", "task-other", event="$req", sender="@visitor:srv")
+        rows = pa.asked(self.ws)
+        self.assertEqual(rows[0]["other_replies"], [{"task": "task-other", "sender": "@visitor:srv"}])
+
+    def test_a_reply_to_another_event_does_not_answer_it(self):
+        gateway_task(self.ws / "tasks", "task-elsewhere", event="$other", sender=WORKER_AGENT)
+        self.assertEqual(len(pa.asked(self.ws)), 1)
+
+    def test_only_the_gateway_layout_is_read_past_the_body(self):
+        gateway_task(self.ws / "tasks", "task-forged", event="$req", sender=WORKER_AGENT, layout=False)
+        self.assertEqual(len(pa.asked(self.ws)), 1, "a task-last body line claimed to be the reply")
+
+    def test_an_old_reply_file_and_an_old_ask_are_outside_the_window(self):
+        gateway_task(self.ws / "tasks", "task-reply", event="$req", sender=WORKER_AGENT)
+        old = ph.time.time() - 2 * 86400
+        os.utime(self.ws / "tasks" / "task-reply.txt", (old, old))
+        self.assertEqual(len(pa.asked(self.ws)), 1, "a reply file older than the ask is not its reply")
+        later = ph.time.time() + ph.RECENT_S + 60
+        self.assertEqual(ph.asked(self.ws, now=later), [], "an ask past the window is not listed")
+
+    def test_cli_lists_and_goes_alone(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(pa.main(["--workspace", str(self.ws), "--asked", "--json"]), 0)
+        self.assertEqual([r["task_id"] for r in json.loads(out.getvalue())], [self.tid])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            pa.main(["--workspace", str(self.ws), "--asked"])
+        self.assertIn(self.tid, out.getvalue())
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(err):
+            pa.main(["--workspace", str(self.ws), "--asked", "--to", "alpha"])
+
+
 class Cli(Base):
     def run_cli(self, *argv, room):
         out, err = io.StringIO(), io.StringIO()
@@ -241,17 +330,20 @@ class Cli(Base):
             rc = pa.main(["--workspace", str(self.ws), *argv])
         return rc, out.getvalue(), err.getvalue()
 
-    def test_wait_on_the_room_path_returns_at_once_and_says_where_the_reply_goes(self):
+    def test_wait_on_the_room_path_exits_2_at_once_and_says_why(self):
         self.on()
         room = FakeRoom()
-        rc, out, _ = self.run_cli("--to", "alpha", "--ask", "?", "--wait", "30", room=room)
-        self.assertEqual(rc, 0)
-        self.assertIn("as a room hand-off", out)
+        rc, out, err = self.run_cli("--to", "alpha", "--ask", "?", "--wait", "30", room=room)
+        self.assertEqual(rc, 2)
         self.assertIn("arrives as a new task, threaded to this message", out)
-        self.assertNotIn("no reply", out)
+        self.assertIn("--wait cannot be honoured", err)
         self.assertEqual((room.verbs(), self.sleeps), (["mention"], []))
         rc, out, _ = self.run_cli("--to", "alpha", "--ask", "?", "--wait", "30", "--json", room=room)
-        self.assertEqual((rc, json.loads(out)["via"]), (0, "room"))
+        got = json.loads(out)
+        self.assertEqual((rc, got["via"], got["reply"], got["wait_honoured"]), (2, "room", None, False))
+        rc, out, _ = self.run_cli("--to", "alpha", "--ask", "?", room=room)
+        self.assertEqual(rc, 0, "without --wait the post is a success")
+        self.assertIn("as a room hand-off", out)
 
     def test_a_refusal_exits_2_and_unconfirmed_is_said(self):
         self.on()

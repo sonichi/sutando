@@ -9,26 +9,33 @@ row is enabled; every other ask keeps `deliveries/<worker>/`. The room transport
 WORKER_POOL_HANDOFF_ROOM_CLI (the consult skill's `mention` verb), run as a subprocess.
 
 A hand-off arrives at the worker as a message from the core's agent, at the tier the room gives
-that agent; this module grants no authority.
+that agent; this module grants no authority. Each posted ask is one line of
+<workspace>/state/pool-handoff-asks.jsonl, so `asked` can list the asks no core task has answered:
+a reply is a gateway task whose `reply_to_event` is the ask's event, and its `user_id` is the
+sender, compared with the agent that was asked.
 """
 from __future__ import annotations
 
 import json
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parents[2]
 sys.path[:0] = [p for p in (str(_HERE), str(_REPO / "src")) if p not in sys.path]
 
-import skill_config  # noqa: E402
+import local_task_protocol, skill_config, task_lifecycle  # noqa: E401,E402
 
 MANIFEST = _HERE.parent / "manifest.json"
 FLAG = "WORKER_POOL_SSPACE_HANDOFF"
 ROOM = "WORKER_POOL_HANDOFF_ROOM"
 ROOM_CLI = "WORKER_POOL_HANDOFF_ROOM_CLI"
 CALL_TIMEOUT_S = 60
+EXCERPT = 200
+RECENT_S = 7 * 86400
 
 
 class HandoffError(ValueError):
@@ -107,3 +114,97 @@ def send(route: dict, task_id: str, question: str, *, runner=None) -> dict:
     if isinstance(out, dict) and out.get("ok") and out.get("event_id"):
         return {"status": "sent", "event_id": out["event_id"]}
     return {"status": "unconfirmed", "event_id": None}
+
+
+def asks_path(workspace) -> Path:
+    return Path(workspace) / "state" / "pool-handoff-asks.jsonl"
+
+
+def record_ask(workspace, route: dict, task_id: str, worker: str, sent: dict, question: str,
+               *, now=None) -> dict:
+    """Append one line for a posted ask: the asking side's only trace of it."""
+    rec = {"task_id": task_id, "worker": worker, "agent": route["to_agent"], "room": route["room"],
+           "event_id": sent.get("event_id"), "status": sent.get("status"),
+           "sent_at": datetime.fromtimestamp(time.time() if now is None else now, timezone.utc)
+           .strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "question": " ".join((question or "").split())[:EXCERPT]}
+    path = asks_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    task_lifecycle.append_durable(path, json.dumps(rec, sort_keys=True) + "\n")
+    return rec
+
+
+def _epoch(stamp) -> "float | None":
+    try:
+        return datetime.strptime(str(stamp), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def _read_asks(workspace, since: float) -> list:
+    try:
+        lines = asks_path(workspace).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        at = _epoch(rec.get("sent_at")) if isinstance(rec, dict) else None
+        if at is not None and at >= since:
+            out.append(rec)
+    return out
+
+
+def _task_files(tasks: Path, since: float):
+    """Live and archived task files modified since `since`; month folders older than it are skipped."""
+    month = datetime.fromtimestamp(since, timezone.utc).strftime("%Y-%m")
+    dirs = [tasks, tasks / "archive"]
+    archive = tasks / "archive"
+    if archive.is_dir():
+        dirs += sorted(d for d in archive.iterdir() if d.is_dir() and d.name >= month)
+    for d in dirs:
+        for f in d.glob("task-*.txt"):
+            try:
+                if f.stat().st_mtime >= since:
+                    yield f
+            except OSError:
+                continue
+
+
+def replies_by_event(workspace, since: float) -> dict:
+    """{event id: [{task, sender}]} from core tasks the gateway wrote as replies to an event."""
+    out: dict = {}
+    for f in _task_files(Path(workspace) / "tasks", since):
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # Only the gateway's own layout, declared above task:, may be read past the body.
+        if (local_task_protocol.parse_task_headers(text).headers.get("task_layout") or "").strip() != "mid":
+            continue
+        h = local_task_protocol.parse_task_headers_trusted(text).headers
+        event = (h.get("reply_to_event") or "").strip()
+        if event:
+            out.setdefault(event, []).append({"task": (h.get("id") or f.stem).strip(),
+                                              "sender": (h.get("user_id") or "").strip()})
+    return out
+
+
+def asked(workspace, *, now=None, window_s: float = RECENT_S) -> list:
+    """Recent asks with no reply from the agent that was asked, newest first. `other_replies` names
+    replies to the same event from anyone else: those are not the asked worker's answer."""
+    now = time.time() if now is None else now
+    asks = _read_asks(workspace, now - window_s)
+    if not asks:
+        return []
+    replies = replies_by_event(workspace, min(_epoch(a["sent_at"]) for a in asks) - 60)
+    out = []
+    for a in asks:
+        got = replies.get(a.get("event_id") or "", [])
+        if any(g["sender"] == a.get("agent") for g in got):
+            continue
+        out.append({**a, "other_replies": [g for g in got if g["sender"] != a.get("agent")]})
+    return sorted(out, key=lambda a: a["sent_at"], reverse=True)

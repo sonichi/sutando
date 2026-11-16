@@ -396,8 +396,15 @@ ordinary message instead of a task file: the core's agent mentions the worker's 
 at `WORKER_POOL_HANDOFF_ROOM_CLI` (the consult skill's `mention` verb). The message carries the
 ask's task id in plain words, so a person can match the two; nothing parses it. `pool_ask` returns
 at once with `status` (`sent`, or `unconfirmed` when the post's outcome is unclear; that one is
-never sent again), `via: room`, `event_id`, `task_id` and `to`. It does not wait or read the room:
-`--wait` does not apply. A refused post exits 2.
+never sent again), `via: room`, `event_id`, `task_id` and `to`. It does not wait or read the room.
+`--wait` cannot be honoured there: the ask is still posted, the JSON says `"reply": null,
+"wait_honoured": false`, and the exit is 2. A refused post also exits 2.
+
+Each posted ask is one line of `state/pool-handoff-asks.jsonl` (task id, worker, the asked agent,
+room, event id, status, time, a question excerpt). `pool_ask.py --workspace WS --asked [--json]`
+lists the last 7 days' asks that no core task has answered from the asked agent: a reply is a task
+the gateway wrote with `reply_to_event` = the ask's event and `user_id` = that agent. A reply from
+anyone else is listed under the ask as `other_replies`, never counted as its answer.
 
 Kept on the folder path: a worker with no, a disabled or a parked identity; a worker's own ask;
 a relayed ask (`--relayed-from`, so its tier is kept); an ask with `--parent-task`; and the
@@ -408,7 +415,9 @@ quietly sent through the folder.
 **The reply.** The worker's lane delivers the hand-off like any message to its agent, and the
 worker answers it as an ordinary result: a reply in that message's thread. The core's gateway
 delivers that reply to the core as a new task, threaded to the hand-off message
-(`reply_to_event`). That task is the result path; the core handles it like any other task.
+(`reply_to_event`). That task is the result path; the core handles it like any other task, at the
+replying sender's own tier in that room. The hand-off grants a reply nothing; `--asked` is where to
+check that the asked worker's agent, and not someone else in the room, answered.
 
 **Authority.** A hand-off is a message from the core's agent, at the tier the room gives that
 agent; nothing here grants more. No rule tiers the owner's other agents as owner: in s.space the

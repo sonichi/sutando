@@ -700,7 +700,8 @@ neither reads nor migrates; removing it is a separate cleanup.
 Behind `WORKER_POOL_SSPACE_HANDOFF` (worker-pool manifest `config`, off by default), `pool_ask`
 from the core at team tier to a worker whose identity row is enabled skips the task file and the
 router. The core's agent posts one ordinary message to the worker's agent in the configured
-hand-off room, and `pool_ask` returns at once; the worker's threaded reply reaches the core as a new task.
+hand-off room, records the ask, and returns at once; the worker's threaded reply reaches the core as a
+new task, and `pool_ask --asked` lists the recorded asks the asked agent has not answered.
 Relayed asks, parent-held asks, a worker's own ask and the usage-limit recovery probe (which
 names its routed payload) stay on the folder. A hand-off carries the tier the room gives the core's
 agent, so owner-tier work is not delegated this way. Use and authority: `skills/worker-pool/SKILL.md`.
