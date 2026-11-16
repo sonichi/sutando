@@ -63,6 +63,9 @@ class Reply(unittest.TestCase):
             hc.build_reply(TID, "maybe", "x")
         self.assertIsNone(hc.parse_reply(f"ref {TID} maybe: x"))
 
+    def test_a_non_text_body_is_no_reply(self):
+        self.assertIsNone(hc.parse_reply(None))
+
     def test_a_marker_line_is_not_produced(self):
         self.assertFalse(hc.build_reply(TID, "done", "x").startswith("["))
 

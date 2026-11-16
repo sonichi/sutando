@@ -31,6 +31,7 @@ sys.path.insert(0, str(REPO / "src"))
 import handoff_contract as hc, pool_ask as pa, pool_handoff as ph, skill_config  # noqa: E401,E402
 
 pr, wi = pa.pr, pa.sup.wi
+REAL_ROWS = ph._rows
 CORE_AGENT, WORKER_AGENT, ROOM = "@core:srv", "@alpha-agent:srv", "!handoff:srv"
 ON = {ph.FLAG: "1", ph.ROOM: ROOM, ph.ROOM_CLI: "/fake/room_cli.py"}
 
@@ -123,6 +124,22 @@ class FlagOff(Base):
                 pa.ask(self.ws, "alpha", "same?", runner=FakeRoom())
             texts.append((self.ws / "tasks" / f"{fixed}.txt").read_text())
         self.assertEqual(texts[0], texts[1])
+
+
+class Plumbing(Base):
+    def test_route_for_is_none_while_off_and_rows_come_from_the_connections_record(self):
+        self.assertIsNone(ph.route_for(self.ws, self.alpha, sender=pr.CORE, core=pr.CORE, environ={}))
+        self.assertEqual(REAL_ROWS(self.ws), [], "an empty workspace has no rows")
+
+    def test_the_default_runner_runs_the_argv(self):
+        r = ph._default_runner([sys.executable, "-c", "print('{}')"])
+        self.assertEqual(r.stdout.strip(), "{}")
+
+    def test_a_transport_that_cannot_start_leaves_the_post_unconfirmed(self):
+        def broken(argv):
+            raise OSError("no such file")
+        self.on()
+        self.assertEqual(self.ask(broken)["status"], "unconfirmed")
 
 
 class FlagOn(Base):
@@ -264,6 +281,27 @@ class Cli(Base):
         rc, out, _ = self.run_cli("--to", "alpha", "--ask", "?", "--wait", "5", room=failing)
         self.assertEqual(rc, 1)
         self.assertIn("reported failure", out)
+
+    def test_unconfirmed_is_said_and_collect_reads_it_later_in_both_forms(self):
+        self.on()
+        room = FakeRoom(mention="not json")
+        rc, out, err = self.run_cli("--to", "alpha", "--ask", "?", room=room)
+        self.assertEqual(rc, 0)
+        self.assertIn("could not be confirmed", err)
+        tid = out.split(" as ")[1].split()[0]
+        room.replies = [{"sender": WORKER_AGENT, "body": hc.build_reply(tid, "done", "fine"), "ts": 1, "event_id": "$e"}]
+        rc, out, _ = self.run_cli("--collect", tid, room=room)
+        self.assertEqual((rc, out.strip()), (0, "fine"))
+        rc, out, _ = self.run_cli("--collect", tid, "--json", room=room)
+        self.assertEqual((rc, json.loads(out)["reply_status"]), (0, "done"))
+        room.replies = []
+        rc, _, _ = self.run_cli("--collect", tid, room=room)
+        self.assertEqual(rc, 1, "no reply yet")
+
+    def test_collect_goes_alone(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.run_cli("--collect", "task-cccccccccccccccccc", "--to", "alpha", room=FakeRoom())
+        self.assertEqual(cm.exception.code, 2)
 
     def test_collect_an_unknown_id_exits_2(self):
         rc, _, err = self.run_cli("--collect", "task-cccccccccccccccccc", room=FakeRoom())
