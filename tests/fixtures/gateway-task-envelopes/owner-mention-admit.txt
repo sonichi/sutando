@@ -7,6 +7,7 @@ source: ag2space
 channel_id: !room:ag2.space
 task_layout: mid
 owner_mentioned: true
+origin_message_ids: $evt
 task: please look at the parser
 room_name: Group-Dev
 sender_name: Someone

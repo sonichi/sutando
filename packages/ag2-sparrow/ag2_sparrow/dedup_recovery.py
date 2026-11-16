@@ -34,6 +34,7 @@ try:  # pragma: no cover - exercised by whichever context imports it
         parse_markers,
     )
     from .task_archive import find_task_file
+    from .task_origins import append_origins, origins_from_text, read_origins
 except ImportError:  # pragma: no cover - flat src/ import path
     from local_task_protocol import find_archived_task, find_result, valid_archive_lookup_id
     from result_markers import (
@@ -49,6 +50,7 @@ except ImportError:  # pragma: no cover - flat src/ import path
         parse_markers,
     )
     from task_archive import find_task_file
+    from task_origins import append_origins, origins_from_text, read_origins
 
 __all__ = [
     "plan_dedup_recovery",
@@ -120,6 +122,7 @@ def plan_dedup_recovery(
     commit_identity=None,
     channel_dir: str = "",
     holder_delivery_state=None,
+    state_dir: "Path | None" = None,
 ) -> tuple[str, str | None]:
     """Decide and perform the filesystem half of dedup recovery.
 
@@ -165,6 +168,15 @@ def plan_dedup_recovery(
     reason = "cross-channel" if cross_channel else "cross-sender" if cross_sender else "holder-empty"
     template = (CROSS_CHANNEL_TEMPLATE if cross_channel else
                 CROSS_SENDER_TEMPLATE if cross_sender else REPORT_TEMPLATE)
+    def record_origins():
+        # state and task dirs resolve independently, so the sibling is only the
+        # default-layout fallback: a split layout must inject state_dir.
+        resolved = Path(state_dir) if state_dir is not None else Path(tasks_dir).parent / "state"
+        origins = [*origins_from_text(holder_task), *origins_from_text(orig_text),
+                   *read_origins(resolved, task_id)]
+        if not append_origins(resolved, holder, origins):
+            print(f"[dedup] could not record origins for {holder}", file=sys.stderr)
+
     if holder_delivery_state is not None and holder and not (cross_channel or cross_sender):
         state = holder_delivery_state(holder)
         if state != "missing":
@@ -180,13 +192,16 @@ def plan_dedup_recovery(
                     "⚠️ The holder's delivery destination or sender could not be verified. "
                     "This question needs a direct answer.")
             if state == "accepted":
+                record_origins()
                 return "honour", None
             if state == "pending":
+                record_origins()
                 return "wait", holder
             return "report", (
                 f"⚠️ The existing answer for `{holder}` is retained but its gateway "
                 "delivery requires operator recovery. No new answer was requested.")
     if decision == "honour" and not (cross_channel or cross_sender):
+        record_origins()
         return "honour", None
     if dedup_requeue_count(orig_text) >= 1:
         return "report", template.format(holder=holder)
