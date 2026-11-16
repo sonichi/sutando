@@ -140,8 +140,8 @@ that is the real workspace; from a fresh clone with no `workspace` symlink it is
 ## Handing events off
 
 One runner watches for the whole host, but the session that should act on an event may be another
-one, e.g. the session that pushed the PR. With `PR_WATCH_ROUTE_CMD` set, the runner runs that
-command for each event line, before printing it, as argv (no shell, 15 s timeout) with
+one, e.g. the session that pushed the PR, possibly on another machine. With `PR_WATCH_ROUTE_CMD` set, the runner runs that
+command for each event line, before printing it, as argv (no shell, 45 s timeout) with
 `--event "<the PR_EVENT line>" --repo O/R --number N --head <full head sha> --cache-dir
 <state dir>/route` appended, in the runner's own environment. If its last stdout line is
 `handed <recipient>` and it exits 0, the event is not sent to this session; the mod logs
@@ -150,11 +150,12 @@ timeout, a command that cannot start) keeps today's behaviour: the event comes h
 lost. The same line within 60 s gets the first answer again without re-running the command. The
 tracker row is updated either way.
 
-The worker-pool skill provides one (`pool_pr_route.py`, see its SKILL.md). Turn it on with an
-absolute path, since the runner copy runs outside the checkout:
+The worker-pool skill provides one (`pool_pr_route.py`, see its SKILL.md): a worker on this host
+gets a pool ask, another host's agent an s.space message. Turn it on with absolute paths, since the
+runner copy runs outside the checkout (the room flags are needed only for other hosts):
 
 ```bash
-python3 $S config set PR_WATCH_ROUTE_CMD "python3 <checkout>/skills/worker-pool/scripts/pool_pr_route.py"
+python3 $S config set PR_WATCH_ROUTE_CMD "python3 <checkout>/skills/worker-pool/scripts/pool_pr_route.py --room '!room:server' --room-cli <checkout>/skills/owner-agent-consult/scripts/consult.py"
 ```
 
 ## Tracker

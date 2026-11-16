@@ -78,6 +78,16 @@ def route_for(workspace, worker: str, *, sender: str, core: str, tier: str = "te
     return {"room": room, "room_cli": cli, "to_agent": to_agent, "from_agent": str(core_row["agent_mxid"])}
 
 
+def agent_route(to_agent: str, from_agent: str, *, room=None, room_cli=None, environ=None) -> "dict | None":
+    """A route that mentions `to_agent` as `from_agent` in the hand-off room (`room`/`room_cli` are the
+    CLI layer), for an agent that is not one of this pool's workers; None when either is not set."""
+    room = skill_config.config_value(ROOM, MANIFEST, cli=room, environ=environ)
+    cli = skill_config.config_value(ROOM_CLI, MANIFEST, cli=room_cli, environ=environ)
+    if not (room and cli and to_agent and from_agent):
+        return None
+    return {"room": room, "room_cli": cli, "to_agent": to_agent, "from_agent": from_agent}
+
+
 def _default_runner(argv):
     return subprocess.run(argv, capture_output=True, text=True, timeout=CALL_TIMEOUT_S)
 
@@ -95,19 +105,19 @@ def _call(runner, route: dict, verb_args: list) -> "dict | None":
     return parsed if isinstance(parsed, dict) else None
 
 
-def build_message(task_id: str, question: str) -> str:
+def build_message(task_id: str, question: str, kind: str = "pool-ask") -> str:
     """The message body; the transport adds the worker's mention in front. The id is for people."""
     text = (question or "").strip()
     if not text:
         raise HandoffError("the work to hand over is empty")
-    return f"{text}\n\n(pool-ask {task_id}: reply in this message's thread)"
+    return f"{text}\n\n({kind} {task_id}: reply in this message's thread)"
 
 
-def send(route: dict, task_id: str, question: str, *, runner=None) -> dict:
+def send(route: dict, task_id: str, question: str, *, runner=None, kind: str = "pool-ask") -> dict:
     """Post the hand-off once. {status: sent|unconfirmed, event_id}; an unclear outcome is never
     posted again, and a refusal made before sending raises."""
     runner = runner or _default_runner
-    body = build_message(task_id, question)
+    body = build_message(task_id, question, kind)
     out = _call(runner, route, ["mention", route["to_agent"], body, route["room"]])
     if isinstance(out, dict) and out.get("ok") is False and out.get("posted") is False:
         raise HandoffError(f"hand-off not sent: {out.get('reason') or 'the room CLI refused'}")

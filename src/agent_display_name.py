@@ -132,6 +132,19 @@ def agent_mxid(environ: Optional[Mapping[str, str]] = None) -> str:
     return next((v for v in (token_from_env_file("AGENT_MXID", f) for f in files if f.is_file()) if v), "")
 
 
+def session_agent_mxid(environ: Optional[Mapping[str, str]] = None, workspace: Optional[Path] = None) -> str:
+    """The agent this session acts as: a pool worker's own enabled identity (connections), else this
+    host's agent (`agent_mxid`); '' when neither names one."""
+    import connections
+    env = os.environ if environ is None else environ
+    worker = connections.session_worker(env)
+    row = connections.worker_enabled_identity(worker, workspace) if worker else None
+    if row is not None:
+        mxid = str(row.get("agent_mxid") or "").strip()
+        return mxid if MXID.match(mxid) else ""
+    return agent_mxid(env)
+
+
 def resolve(mxid: Optional[str] = None, *, fetch: Optional[Fetch] = None,
             environ: Optional[Mapping[str, str]] = None,
             workspace: Optional[Path] = None, offline: bool = False) -> Tuple[str, str]:
