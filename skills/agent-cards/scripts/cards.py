@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """The owner's "show my …" cards (agent panel, src/agent_card.py) and the replies their buttons send.
 
-    python3 cards.py [--workspace WS] show connections|workers|apps|circle --task-file PATH [--print]
+    python3 cards.py [--workspace WS] show connections|workers|apps|circle|triggers|notices --task-file PATH [--print]
     python3 cards.py [--workspace WS] reply --task-file PATH
+    python3 cards.py [--workspace WS] offer [--print]
 
 `show` builds one card from what this machine already knows and posts it as the core's own agent in the
 owner's checked DM, as a reply to the asking message, and prints {"event_id"}; `--print` prints
@@ -18,6 +19,10 @@ but the owner and in any room but their DM.
   Not connected row and "+ Connect an app" sign the owner in on the card, and `show` starts any waiter
   that is not running, so a waiting request resumes once its app is connected.
 - circle: the collaboration map's quick-lookup index (collaboration-intelligence), else an empty state.
+- triggers, notices: the owner's preferences on s.space, read with the account Actions
+  `agent.triggers.get` / `notice.prefs.get` as the core's own agent (prefs_cards.py builds them). A click
+  sets them with `agent.triggers.set` / `notice.prefs.set`, passing the click's task_id (the server's
+  owner-asked gate) and the card's revision; the card is drawn again with the outcome on it.
 
 `reply` handles the owner's click on one of these cards (agent_card.click_verdict decides; a click that
 matches no card this agent posted prints the fixed refusal and nothing acts): Reconnect and Make main run
@@ -40,7 +45,7 @@ from typing import Callable, Optional
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parents[2]
 _SKILLS = _REPO / "skills"
-for _p in (str(_REPO / "src"), str(_SKILLS / "worker-pool" / "scripts"), str(_SKILLS / "connect-apps" / "scripts")):
+for _p in (str(_HERE), str(_REPO / "src"), str(_SKILLS / "worker-pool" / "scripts"), str(_SKILLS / "connect-apps" / "scripts")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -48,8 +53,13 @@ import agent_card as ac  # noqa: E402
 import connections  # noqa: E402
 import dotspace
 import issued_cards
+import prefs_cards as pc
 
-KINDS = ("connections", "workers", "apps", "circle")
+KINDS = ("connections", "workers", "apps", "circle", pc.TRIGGERS, pc.NOTICES)
+PREFS = (pc.TRIGGERS, pc.NOTICES)
+OFFER = "prefs-offer"
+OFFER_STATE = ("state", "agent-cards", "prefs-offer.json")
+MANIFEST = _HERE.parent / "manifest.json"
 HANDLER = "skills/agent-cards/scripts/cards.py reply"
 # The first click on one of these only asks; what the confirm card says under the question.
 DESTRUCTIVE = {("connections", "disconnect"): "Its token is kept, so you can reconnect later.",
@@ -319,7 +329,80 @@ def gate(ws: Path, task_text: str, core: Optional[dict] = None) -> tuple:
 
 # ── commands ──────────────────────────────────────────────────────────────────
 
-def cmd_show(ws: Path, args, *, core=None, execute=None, spawn=None) -> int:
+class PrefsError(RuntimeError):
+    """An account Action that answered with an error: its `code` and `details`."""
+
+    def __init__(self, action: str, code: str, details: dict):
+        super().__init__(f"{action} answered {code or 'an error'}")
+        self.code, self.details = code, details
+
+
+class Account:
+    """Account-target Actions as the core's own agent, over the injected Actions' MCP tool call."""
+
+    def __init__(self, actions):
+        self.actions = actions
+
+    def read(self, action: str, arguments: Optional[dict] = None) -> dict:
+        return self.actions.tool("room.action.read", {"action": action, "target_kind": "account",
+                                                      "arguments": arguments or {}})
+
+    def execute(self, action: str, arguments: dict, *, operation_id: str, task_id: str = "") -> dict:
+        payload = {"action": action, "target_kind": "account", "arguments": arguments, "operation_id": operation_id}
+        if task_id:
+            payload["task_id"] = task_id
+        return self.actions.tool("room.action.execute", payload)
+
+
+def prefs_doc(action: str, answer: object) -> dict:
+    """The preferences document an account Action answered, or PrefsError."""
+    if not isinstance(answer, dict):
+        raise PrefsError(action, "", {})
+    error = answer.get("error") if isinstance(answer.get("error"), dict) else {}
+    details = answer.get("details") if isinstance(answer.get("details"), dict) else error.get("details") or {}
+    if answer.get("is_error") or (answer.get("code") and "revision" not in answer):
+        raise PrefsError(action, str(answer.get("code") or error.get("code") or ""), dict(details))
+    doc = answer.get("result") if isinstance(answer.get("result"), dict) else answer
+    if not isinstance(doc.get("schema_version"), int):
+        raise PrefsError(action, "UNREADABLE", {})
+    return doc
+
+
+def _why(e: PrefsError) -> str:
+    reason = str(e.details.get("reason") or "")
+    if e.code == "NOT_FOUND":
+        return "your s.space server does not offer these settings yet"
+    if e.code == "FORBIDDEN" and reason:
+        return f"s.space did not let me change them ({reason}); ask me again in our DM"
+    return f"{e} ({reason})" if reason else str(e)
+
+
+def _known_names(ws: Path) -> dict:
+    """agent id -> display name for this machine's own connections."""
+    try:
+        rows = connections.read_rows(ws)
+    except Exception:  # noqa: BLE001 — names are a nicety; ids stand in for them
+        return {}
+    return {str(r["agent_mxid"]): str(r["agent_display_name"]) for r in rows
+            if r.get("agent_mxid") and r.get("agent_display_name")}
+
+
+def prefs_build(kind: str, doc: dict, view=None, names=None) -> tuple:
+    if kind == pc.TRIGGERS:
+        return pc.triggers_card(doc, view, names=names)
+    return pc.notices_card(doc, view)
+
+
+def _account_of(ws: Path, lane: str, account, execute):
+    """(account, execute): the injected ones, else both as the core's own agent on `lane`."""
+    if account is not None and execute is not None:
+        return account, execute
+    import pool_provision
+    actions = pool_provision.core_actions(ws, lane or None)[0]
+    return account or Account(actions), execute or actions.execute
+
+
+def cmd_show(ws: Path, args, *, core=None, execute=None, spawn=None, account=None) -> int:
     text = Path(args.task_file).read_text(encoding="utf-8")
     try:
         core = core if core is not None else _core(ws)
@@ -328,8 +411,17 @@ def cmd_show(ws: Path, args, *, core=None, execute=None, spawn=None) -> int:
         return _emit({"status": "refused", "why": f"{type(e).__name__}: {e}"}, 2)
     if why:
         return _emit({"status": "refused", "why": why}, 2)
+    lane = str(core.get("instance") or "")
     try:
-        body, card = build_kind(args.kind, ws)
+        if args.kind in PREFS:
+            account, execute = _account_of(ws, lane, account, execute)
+            try:
+                doc = prefs_doc(pc.GET[args.kind], account.read(pc.GET[args.kind]))
+            except PrefsError as e:
+                return _emit({"status": "failed", "why": _why(e)}, 1)
+            body, card = prefs_build(args.kind, doc, names=pc.names_for(doc, _known_names(ws)))
+        else:
+            body, card = build_kind(args.kind, ws)
     except Exception as e:  # noqa: BLE001 — a source that cannot be read is named, never guessed
         return _emit({"status": "failed", "why": f"{args.kind} could not be read ({type(e).__name__}: {e})"}, 1)
     if args.print:
@@ -339,7 +431,7 @@ def cmd_show(ws: Path, args, *, core=None, execute=None, spawn=None) -> int:
         execute = pool_provision.core_actions(ws, None)[0].execute
     waits = arm_waits(ws, spawn) if args.kind == "apps" else []
     task_id = str(headers.get("task_id") or headers.get("id") or "task")
-    out = _post(ws, execute, headers, body, card, f"{task_id}:{args.kind}-card", dm, str(core.get("instance") or ""))
+    out = _post(ws, execute, headers, body, card, f"{task_id}:{args.kind}-card", dm, lane)
     return _emit({**out, **({"waits": waits} if waits else {})}, 0 if out["status"] == "posted" else 1)
 
 
@@ -399,19 +491,19 @@ def _apps_reply(ws: Path, said: ac.Reply) -> dict:
     return {"status": "refused", "why": f"an apps card has no {said.verb!r} action"}
 
 
-def cmd_reply(ws: Path, args, *, core=None, execute=None, now=time.time) -> int:
+def cmd_reply(ws: Path, args, *, core=None, execute=None, now=time.time, account=None) -> int:
     headers, words = ac.reply_words(Path(args.task_file).read_text(encoding="utf-8"))
     try:
         core = core if core is not None else _core(ws)
     except Exception:  # noqa: BLE001 — a card records its own lane; only one without it needs the core's owner
         core = {}
     verdict = ac.click_verdict(headers, words, ws, ac.lane_owner(ws, str(core.get("owner_mxid") or "")))
-    other = ac.click_answer(verdict, words, KINDS)
+    other = ac.click_answer(verdict, words, KINDS + (OFFER,))
     if other is not None:
         return _emit(other, 1)
     said, clicked = verdict.command, str(headers.get("reply_to_event") or "")
     destructive = (said.kind, said.verb) in DESTRUCTIVE
-    if said.confirmed or said.verb == "keep":
+    if said.confirmed or said.verb == "keep" or said.kind in PREFS + (OFFER,):
         # Claim the confirm card under its record lock before anything runs: one answer, the first.
         try:
             claimed = issued_cards.settle(ws, clicked)
@@ -420,7 +512,11 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, now=time.time) -> int:
         if not claimed:
             return _emit({"status": ac.FORGED, "say": ac.UNMATCHED_CLICK, "why": "that card was already answered"}, 1)
     try:
-        if said.verb == "keep":
+        if said.kind == OFFER:
+            out = {"status": "say", "say": "Okay. I won't ask again for at least a week."}
+        elif said.kind in PREFS:
+            out = _prefs_reply(ws, said, headers, verdict.lane or str(core.get("instance") or ""), account, execute, now())
+        elif said.verb == "keep":
             out = {"status": "say", "say": "Okay, I left it as it is."}
         elif destructive and not said.confirmed:
             out = _ask(ws, said, words, headers, verdict.lane or str(core.get("instance") or ""), execute, now())
@@ -435,6 +531,111 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, now=time.time) -> int:
     return _emit(out, code)
 
 
+def _prefs_reply(ws: Path, said: ac.Reply, headers: dict, lane: str, account, execute, now: float) -> dict:
+    """One click on a triggers or notices card: read the current settings, then set or ask or just
+    redraw, and post the card again in the room the click came from with what happened on it."""
+    account, execute = _account_of(ws, lane, account, execute)
+    kind, task_id = said.kind, str(headers.get("task_id") or "")
+    try:
+        doc = prefs_doc(pc.GET[kind], account.read(pc.GET[kind]))
+    except PrefsError as e:
+        return {"status": "failed", "why": _why(e)}
+    names = pc.names_for(doc, _known_names(ws))
+    step = pc.plan(said, doc, names)
+    if step.step == "refused":
+        return {"status": "refused", "why": step.why}
+    view, status = step.view, "asked" if step.view.confirm else "redrawn"
+    if view.outcome == pc.OUT_OF_DATE:
+        status = "out_of_date"
+    if step.step == "set":
+        try:
+            doc = prefs_doc(pc.SET[kind], account.execute(pc.SET[kind], step.arguments, task_id=task_id,
+                                                          operation_id=f"{task_id or headers.get('id') or 'task'}:{kind}-set"))
+        except PrefsError as e:
+            if e.code != "CONFLICT":
+                view = pc.View(edit=view.edit, outcome=f"Not saved: {_why(e)}.", tone="warn")
+                status = "not_saved"
+            else:
+                try:
+                    doc = prefs_doc(pc.GET[kind], account.read(pc.GET[kind]))
+                except PrefsError as again:
+                    return {"status": "failed", "why": f"they changed since this card ({_why(again)})"}
+                view, status = pc.View(edit=view.edit, outcome=pc.OUT_OF_DATE, tone="warn"), "conflict"
+                names = pc.names_for(doc, _known_names(ws))
+        else:
+            names = pc.names_for(doc, _known_names(ws))
+            view.outcome = f"{pc.saved_line(doc.get('updated_by'), names)} · {step.change}"[:600]
+            view.tone, status = "ok", "saved"
+    body, card = prefs_build(kind, doc, view, names)
+    out = _post(ws, execute, headers, body, card, f"{task_id or headers.get('id') or 'task'}:{kind}-card",
+                str(headers.get("channel_id") or ""), lane, CONFIRM_TTL_S if view.confirm else issued_cards.TTL_S)
+    if not out.get("event_id"):
+        return {**out, "status": "failed", **({"saved": step.change} if status == "saved" else {})}
+    return {**out, "status": status, **({"outcome": view.outcome} if view.outcome else {})}
+
+
+def _offer_state(ws: Path) -> dict:
+    try:
+        data = json.loads(ws.joinpath(*OFFER_STATE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _offer_save(ws: Path, state: dict) -> None:
+    from local_record import write_whole
+    path = ws.joinpath(*OFFER_STATE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_whole(path, state)
+
+
+def record_dismissal(ws: Path, kind: str) -> dict:
+    """Count one dismissed notice of `kind` toward the offer's 3-dismissals rule."""
+    from file_lock import locked_file
+    path = ws.joinpath(*OFFER_STATE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with locked_file(path.with_name(path.name + ".lock")):
+        state = _offer_state(ws)
+        counts = state.get("dismissals") if isinstance(state.get("dismissals"), dict) else {}
+        counts[kind] = int(counts.get(kind) or 0) + 1
+        state["dismissals"] = counts
+        _offer_save(ws, state)
+    return {"status": "recorded", "kind": kind, "count": counts[kind]}
+
+
+def cmd_offer(ws: Path, args, *, core=None, execute=None, account=None, now=time.time) -> int:
+    """Post the one-line offer in the owner's DM when it is on (manifest AGENT_CARDS_PREFS_OFFER) and due."""
+    import skill_config
+    if not skill_config.enabled("AGENT_CARDS_PREFS_OFFER", MANIFEST):
+        return _emit({"status": "off"})
+    try:
+        core = core if core is not None else _core(ws)
+        dm, lane = connections.owner_dm(core, ws), str(core.get("instance") or "")
+        account, execute = _account_of(ws, lane, account, execute)
+        doc = prefs_doc(pc.GET[pc.TRIGGERS], account.read(pc.GET[pc.TRIGGERS]))
+    except PrefsError as e:
+        return _emit({"status": "failed", "why": _why(e)}, 1)
+    except Exception as e:  # noqa: BLE001 — no core lane or DM: nothing is offered
+        return _emit({"status": "failed", "why": f"{type(e).__name__}: {e}"}, 1)
+    types = [str(e.get("event_type")) for e in doc.get("event_types") or [] if e.get("event_type")]
+    state, t = _offer_state(ws), now()
+    if "event_types" not in state:
+        _offer_save(ws, {**state, "event_types": types})
+        return _emit({"status": "not_due", "why": "first look: event types remembered"})
+    why = pc.offer_due(state, t, types)
+    if why is None:
+        return _emit({"status": "not_due"})
+    body, card = pc.offer_card()
+    if args.print:
+        return _emit({"status": "due", "why": why, "body": body, "card": card})
+    if not dm:
+        return _emit({"status": "failed", "why": "no owner DM is known"}, 1)
+    out = _post(ws, execute, {"channel_id": dm}, body, card, f"prefs-offer-{int(t)}", dm, lane)
+    if out.get("event_id"):
+        _offer_save(ws, {"last_offered_at": t, "event_types": types, "dismissals": {}})
+    return _emit({**out, "why": why}, 0 if out["status"] == "posted" else 1)
+
+
 def _ask(ws: Path, said: ac.Reply, words: str, headers: dict, lane: str, execute, now: float) -> dict:
     """Post the confirm card for a destructive click in the room it came from; nothing is done yet."""
     if execute is None:
@@ -447,7 +648,7 @@ def _ask(ws: Path, said: ac.Reply, words: str, headers: dict, lane: str, execute
     return {**out, "status": "asked"} if out.get("event_id") and "why" not in out else {**out, "status": "failed"}
 
 
-def main(argv=None, *, core=None, execute=None, spawn=None) -> int:
+def main(argv=None, *, core=None, execute=None, spawn=None, account=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--workspace", default=None)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -457,6 +658,10 @@ def main(argv=None, *, core=None, execute=None, spawn=None) -> int:
     s.add_argument("--print", action="store_true")
     r = sub.add_parser("reply")
     r.add_argument("--task-file", required=True)
+    o = sub.add_parser("offer")
+    o.add_argument("--print", action="store_true")
+    d = sub.add_parser("record-dismissal")
+    d.add_argument("kind")
     args = p.parse_args(argv)
     if args.workspace:
         ws = Path(args.workspace)
@@ -464,8 +669,12 @@ def main(argv=None, *, core=None, execute=None, spawn=None) -> int:
         from workspace_default import resolve_workspace
         ws = Path(resolve_workspace())
     if args.cmd == "show":
-        return cmd_show(ws, args, core=core, execute=execute, spawn=spawn)
-    return cmd_reply(ws, args, core=core, execute=execute)
+        return cmd_show(ws, args, core=core, execute=execute, spawn=spawn, account=account)
+    if args.cmd == "offer":
+        return cmd_offer(ws, args, core=core, execute=execute, account=account)
+    if args.cmd == "record-dismissal":
+        return _emit(record_dismissal(ws, args.kind))
+    return cmd_reply(ws, args, core=core, execute=execute, account=account)
 
 
 if __name__ == "__main__":

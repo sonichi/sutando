@@ -1,6 +1,6 @@
 ---
 name: agent-cards
-description: "Show the owner a card instead of a list when they ask 'show my connections', 'what am I connected to', 'show my workers', 'what apps are you connected to', 'show my apps', 'who do you work with' or 'show my circle', in their DM; and run a click on one of those cards when `src/agent_card.py click` names this skill's script."
+description: "Show the owner a card instead of a list when they ask 'show my connections', 'what am I connected to', 'show my workers', 'what apps are you connected to', 'show my apps', 'who do you work with', 'show my circle', 'show my triggers', 'what wakes you up', 'show my notices' or 'what shows above my message box', in their DM; and run a click on one of those cards when `src/agent_card.py click` names this skill's script."
 ---
 
 # Agent cards: "show my …"
@@ -15,6 +15,8 @@ python3 $K show connections --task-file <task file>   # servers, chat apps, work
 python3 $K show workers --task-file <task file>       # runtime, own agent, status, Message / Pause / Restart / Retire
 python3 $K show apps --task-file <task file>          # Connected / Not connected, Switch account, Connect, + Connect an app
 python3 $K show circle --task-file <task file>        # people and agents from the collaboration map
+python3 $K show triggers --task-file <task file>      # which events reach your agents, notifier order
+python3 $K show notices --task-file <task file>       # which notices show above your message box
 python3 $K reply --task-file <task file>              # a click on one of those cards, when the dispatcher names it
 ```
 
@@ -24,6 +26,8 @@ python3 $K reply --task-file <task file>              # a click on one of those 
 | "show my workers", "my workers" | `show workers` |
 | "what apps are you connected to", "show my apps", "my integrations" | `show apps` |
 | "who do you work with", "show my circle", "my people" | `show circle` |
+| "show my triggers", "what wakes you up", "which events do you get" | `show triggers` |
+| "show my notices", "what shows above my message box", "stop showing X here" | `show notices` |
 
 `show` prints `{"status": "posted", "event_id": …}`: write the result `[REPLIED]`. `{"status": "refused"}`
 (not the owner, or not their DM): from a room with other people, say "I sent it to you in our DM." only
@@ -68,3 +72,28 @@ work is left running, `deferred`), Retire (after its confirm card) `retire`; app
 connect-apps Step 3c. An agent never disconnects an app: the card says where ("Settings → Integrations").
 A card records the room and connection it was posted on, lives three days, and stops acting once a newer
 card of the same kind is posted in that DM.
+
+## Triggers and notices
+
+Both are views over the owner's settings on s.space, never stored here: `show` reads `agent.triggers.get`
+/ `notice.prefs.get` (account Actions) as the core's own agent. The triggers card has each event type once
+for all agents ("on for N of M"), per-agent exceptions behind Edit, and the notifier order (up to 5). The
+notices card has a toggle per notice kind and "Show at least". Types the server does not let the owner
+change are shown read-only.
+
+A click claims the card, reads the settings again, and posts the card again in its place with what happened
+on it; reply `[REPLIED]` to every status that carries an `event_id`:
+
+- `saved`: the set Action ran with the click's task_id (the server's owner-asked gate) and the card's
+  revision; the card says "Saved · <agent> on behalf of <owner> · <change>".
+- `asked`: a risky change (an agent reading your mentions, the 1st notifier or every agent going quiet on
+  them, turning off a blocking notice, "Blocking only", Reset) shows the question on the card; only its
+  Yes, within ten minutes, sets it.
+- `out_of_date` / `conflict`: the settings changed since the card was drawn; nothing was set and the card
+  shows the current values and says so.
+- `not_saved`: the server refused (the outcome line names why); the card still works.
+- `redrawn`: Edit, Close or Keep.
+
+An occasional one-line offer ("Want to review what I watch for you…?") is `cards.py offer`: off unless
+`AGENT_CARDS_PREFS_OFFER` is true (manifest config), at most once a week, and only after a new event type
+appears or 3+ dismissals of one notice kind (`cards.py record-dismissal <kind>`). Nothing calls either yet.
