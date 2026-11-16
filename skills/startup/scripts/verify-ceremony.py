@@ -18,8 +18,10 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
-# Mirrors STAMP_SKEW_TOLERANCE_SECS in the desktop ceremony_health.rs (launcher `date +%s` skew).
+# Must equal STAMP_SKEW_TOLERANCE_SECS in the desktop's ceremony_health.rs; change both together.
 STAMP_SKEW_TOLERANCE_SECS = 2.0
+# Private health-check names the gate reads; a missing one is "cannot answer" (rc 2), not rc 1.
+REQUIRED_PROBE_NAMES = ("check_session_cron_registration", "_last_core_launch_at", "_host_label", "WORKSPACE_DIR")
 
 
 def load_health_check():
@@ -65,15 +67,19 @@ def main(argv=None) -> int:
     ap.add_argument("--host-label", default=None)
     a = ap.parse_args(argv)
     mod = load_health_check()
-    probe = getattr(mod, "check_session_cron_registration", None) if mod else None
-    if probe is None:
+    if mod is None or any(not hasattr(mod, n) for n in REQUIRED_PROBE_NAMES):
         print("verify-ceremony: session-crons probe unavailable — cannot confirm; do not report complete", file=sys.stderr)
         return 2
-    result = probe(a.workspace, host_label=a.host_label)
+    result = mod.check_session_cron_registration(a.workspace, host_label=a.host_label)
     status, detail = result.get("status"), result.get("detail", "")
     if status == "ok":
         # The probe forgives a stale stamp when no session cron is expected; the desktop does not.
-        stale = stamp_predates_launch(mod, a.workspace, a.host_label)
+        try:
+            stale = stamp_predates_launch(mod, a.workspace, a.host_label)
+        except (AttributeError, TypeError) as exc:  # helper drifted after the name check
+            print(f"verify-ceremony: launch-boundary check unavailable ({exc}) — cannot confirm; "
+                  "do not report complete", file=sys.stderr)
+            return 2
         if stale is not None:
             status = "warn"
             detail = (f"stamp predates this session's launch ({stale}s older) — the desktop re-sends "
