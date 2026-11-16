@@ -14,7 +14,11 @@ SKILL.md runs the claim before the job.
 Run: python3 tests/schedule-claim-run.test.py
 """
 import importlib.util
+import contextlib
+import io
+import json
 import multiprocessing
+import os
 import subprocess
 import sys
 import tempfile
@@ -32,6 +36,11 @@ SKILL = REPO / "skills/schedule/SKILL.md"
 
 sys.path.insert(0, str(REPO / "src"))
 import outbox  # noqa: E402
+
+# The CLI runs under coverage when the gate asks, so the measured lines include main().
+PYBASE = [sys.executable]
+if os.environ.get("SUTANDO_TEST_SUBPROCESS_COVERAGE") == "1":
+    PYBASE += ["-m", "coverage", "run", f"--rcfile={REPO / '.coveragerc'}"]
 
 _spec = importlib.util.spec_from_file_location("claim_run", SCRIPT)
 claim_run = importlib.util.module_from_spec(_spec)
@@ -61,7 +70,7 @@ class ClaimRun(unittest.TestCase):
         self.tmp.cleanup()
 
     def _cli(self, *args):
-        return subprocess.run([sys.executable, str(SCRIPT), *args, "--workspace", str(self.ws)],
+        return subprocess.run([*PYBASE, str(SCRIPT), *args, "--workspace", str(self.ws)],
                               capture_output=True, text=True, env=isolated_child_env())
 
     def _claim_cli(self, text, name, *extra):
@@ -175,7 +184,8 @@ class ClaimRun(unittest.TestCase):
                          ("waiting_approval", "task-1", rid, 1))
 
     def test_illegal_transitions_are_refused(self):
-        self.assertEqual(self._t("wait", "x", 1).returncode, claim_run.REFUSED_EXIT)
+        r0 = self._t("wait", "x", 1)
+        self.assertEqual(r0.returncode, claim_run.REFUSED_EXIT, r0.stdout + r0.stderr)
         rid = self._run()
         self.assertEqual(self._resume(rid, 1, "task-click").returncode, claim_run.REFUSED_EXIT)
         self.assertEqual(self._t("release", rid, 1).returncode, claim_run.REFUSED_EXIT)
@@ -278,6 +288,67 @@ class ClaimRun(unittest.TestCase):
         self.assertEqual(self._t("release", rid, 1).returncode, 0)
         self.assertIsNone(claim_run.read(self.ws, KEY))
         self.assertEqual(self._claim_cli(task("t2", "trg2"), "t2").returncode, 0)
+
+    def test_unreadable_record_reads_as_needs_reconcile_and_refuses_transitions(self):
+        rid = self._run()
+        claim_run._record_path(self.ws, KEY).write_text("{torn", encoding="utf-8")
+        self.assertEqual(claim_run.read(self.ws, KEY)["state"], "needs_reconcile")
+        self.assertEqual(self._t("done", rid, 1).returncode, claim_run.REFUSED_EXIT)
+        again = self._claim_cli(task("t2", "trg2"), "t2")
+        self.assertEqual(again.returncode, claim_run.SKIP_EXIT)
+        self.assertIn("is needs_reconcile", again.stdout)
+
+    def test_sweep_skips_an_unreadable_record(self):
+        self._run(now=time.time() - 2 * HOUR)
+        (claim_run.claims_dir(self.ws) / "zz-torn.json").write_text("{torn", encoding="utf-8")
+        swept = self._cli("sweep")
+        self.assertEqual(swept.returncode, 0, swept.stderr)
+        self.assertEqual(len(swept.stdout.strip().splitlines()), 1)
+
+    def test_a_stale_fire_whose_run_was_confirmed_skips_and_settles_done(self):
+        self._run(now=time.time() - 2 * HOUR)
+        self._outbox_item("task-1", status="DELIVERED", provider_ref="$e")
+        fire = self._claim_cli(task("t2", "trg2"), "t2")
+        self.assertEqual(fire.returncode, claim_run.SKIP_EXIT, fire.stderr)
+        self.assertIn("is done", fire.stdout)
+
+    def test_transitions_out_of_their_states_are_refused(self):
+        rid = self._run()
+        self.assertEqual(self._t("done", rid, 1).returncode, 0)
+        for cmd in ("wait", "done", "release"):
+            r = self._t(cmd, rid, 1)
+            self.assertEqual(r.returncode, claim_run.REFUSED_EXIT, cmd)
+            self.assertIn("refused: " + KEY + " is done", r.stdout)
+        self.assertIn("is unclaimed", self._cli("wait", "--key", "task:nope", "--run-id", "x",
+                                                "--attempt", "1").stdout)
+
+    def test_owner_done_closes_a_needs_reconcile_run(self):
+        rid = self._run(now=time.time() - 2 * HOUR)
+        claim_run.sweep(self.ws)
+        done = self._t("done", rid, 1)
+        self.assertEqual(done.stdout.split(), ["done", KEY, rid, "1"])
+        self.assertEqual(self._state(), "done")
+
+    def test_main_in_process_and_default_workspace(self):
+        f = self.ws / "t1.txt"
+        f.write_text("task: no id header\n", encoding="utf-8")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(claim_run.main(["claim", "--task-file", str(f),
+                                             "--workspace", str(self.ws)]), 0)
+        self.assertTrue(out.getvalue().startswith("run task:t1 "))
+        fake = type(sys)("workspace_default")
+        fake.resolve_workspace = lambda migrate=True: self.ws / "resolved"
+        saved = sys.modules.get("workspace_default")
+        sys.modules["workspace_default"] = fake
+        try:
+            self.assertEqual(claim_run._workspace(None), self.ws / "resolved")
+        finally:
+            if saved is None:
+                sys.modules.pop("workspace_default", None)
+            else:
+                sys.modules["workspace_default"] = saved
+        self.assertEqual(json.loads(json.dumps(claim_run.read(self.ws, "task:t1")))["state"], "claimed")
 
     def test_skill_claims_before_acting_and_states_the_guarantee(self):
         text = SKILL.read_text(encoding="utf-8")
