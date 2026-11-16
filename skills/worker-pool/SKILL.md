@@ -138,7 +138,7 @@ creates that agent in AG2 Space, and its access token becomes a connection row n
 - It answers only what is addressed to that agent.
 - It hands every task it queues to the worker (`requested_worker`).
 - It posts only the proactive files its worker's session writes (`proactive-<ts>.by-<worker>.txt`,
-  stamped by `result_publish.py` while the identity is enabled; `ask-owner.py` text asks too), into its own agent's owner DM;
+  stamped by `result_publish.py` while the identity is enabled; `ask-owner.py` text asks too; not one bound for Discord, Slack or Telegram), into its own agent's owner DM;
   nothing the core's session wrote. A worker with no identity, or a disabled one, still publishes
   unstamped notes that a core lane sends.
 - It never becomes primary, and owns no unaddressed message or owner card.

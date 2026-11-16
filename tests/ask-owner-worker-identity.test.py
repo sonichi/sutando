@@ -5,6 +5,7 @@
   queued under the name `result_publish.worker_published_path` gives it (`.by-<worker>`), so that
   worker's own lane delivers it; the store adapter and the no-store path both do.
 - The core's session, and a worker with no identity or a disabled one, queue unstamped names.
+- An ask bound for Discord, Slack or Telegram keeps its bare name, so that bridge delivers it.
 - The question records who asked (the worker's agent id when stamped) in the outbox and the row.
 - A decision card stays on the core's path: no stamped text is sent beside it.
 Temp workspaces and fakes only; nothing here reads the live workspace or a real token.
@@ -103,6 +104,12 @@ class _Ws(unittest.TestCase):
     def as_worker(self, worker=W):
         return mock.patch.dict(os.environ, {"SUTANDO_WORKER_ID": worker} if worker else {})
 
+    def task(self, headers):
+        (self.ws / "tasks").mkdir(exist_ok=True)
+        f = self.ws / "tasks" / "task-1.txt"
+        f.write_text(headers + "task: x\n")
+        return str(f)
+
     def proactive(self):
         return sorted(p.name for p in (self.ws / "results").glob("proactive-*"))
 
@@ -179,6 +186,37 @@ class StoreAdapterAsk(_Ws):
             out = self.ask()
         [name] = self.proactive()
         self.assertEqual((pr.proactive_worker(name), out["question"]["asked_by"]), (W, None))
+
+    def test_an_ask_bound_for_another_bridge_keeps_its_bare_name_for_that_bridge(self):
+        cases = {
+            "discord": ("access_tier: owner\nsource: discord\nchannel_id: 123456789012345678\n"
+                        "channel_name: DM\nguild_name: DM\n", "[channel: 123456789012345678]"),
+            "slack": ("access_tier: owner\nsource: slack\nchannel_id: D0123456789\n", "[channel: D0123456789]"),
+            "telegram": ("access_tier: owner\nsource: telegram\nchat_id: 42\n", "[dm-only]"),
+            "discord [dm-only]": ("access_tier: owner\nsource: discord\nchannel_id: 123456789012345678\n"
+                                  "channel_name: general\nguild_name: G\n", "[dm-only]"),
+        }
+        for label, (headers, lead) in cases.items():
+            with self.subTest(label):
+                for f in (self.ws / "results").glob("*"):
+                    f.unlink()
+                with self.as_worker():
+                    out = self.ask(task_file=self.task(headers))
+                [name] = self.proactive()
+                bridge = label.split()[0]
+                self.assertEqual((pr.proactive_destination(name), pr.proactive_worker(name)), (bridge, None), name)
+                self.assertEqual((self.ws / "results" / name).read_text().splitlines()[0], lead)
+                self.assertTrue(pr.lane_claims_proactive(name), "the named bridge claims it")
+                self.assertFalse(pr.lane_claims_proactive(name, W), "the worker's lane does not")
+                self.assertIsNone(out["question"]["asked_by"])
+
+    def test_an_ask_bound_for_ag2space_is_the_worker_lanes(self):
+        headers = "access_tier: owner\nsource: ag2space\nchannel_id: !dm:alpha-fixture.test\nchannel_kind: dm\n"
+        with self.as_worker():
+            out = self.ask(task_file=self.task(headers))
+        [name] = self.proactive()
+        self.assertEqual((pr.proactive_destination(name), pr.proactive_worker(name)), ("ag2space", W), name)
+        self.assertEqual(out["question"]["asked_by"], AGENT)
 
     def test_a_decision_card_stays_the_cores_and_no_stamped_text_goes_beside_it(self):
         (self.ws / "state" / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space"}))

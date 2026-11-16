@@ -125,9 +125,14 @@ def proactive_worker(name) -> "str | None":
     return m.group(1) if m else None
 
 
+# The bridge a worker's own lane runs on; a name destined for any other bridge is that bridge's.
+WORKER_LANE_CHANNEL = "ag2space"
+
+
 def stamp_worker(name, worker: str) -> str:
     """`name` as `worker`'s session publishes it: a proactive name gains the `.by-<worker>` tag
-    unless it carries one; a task result, or a name published by the core ("" worker), is unchanged."""
+    unless it carries one; a task result, a name published by the core ("" worker), and a name
+    destined for a bridge other than the worker lane's own are unchanged, so that bridge delivers it."""
     base = Path(name).name
     if not worker or not base.startswith("proactive-") or not base.endswith(".txt") \
             or proactive_worker(base) is not None:
@@ -135,6 +140,8 @@ def stamp_worker(name, worker: str) -> str:
     if not _WORKER_ID_RE.match(worker):
         raise ValueError(f"not a worker id: {worker!r}")
     dest = proactive_destination(base)
+    if dest not in (None, WORKER_LANE_CHANNEL):
+        return base
     head = base[: -len(f".to-{dest}.txt")] if dest else base[: -len(".txt")]
     return f"{head}.by-{worker}" + (f".to-{dest}.txt" if dest else ".txt")
 

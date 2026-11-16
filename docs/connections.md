@@ -608,7 +608,9 @@ agent's own owner DM; a core lane and every other bridge (Discord, Slack, Telegr
 fallbacks) refuse it, and a worker's lane claims nothing unstamped. The gateway's drain asks its
 host (`PROACTIVE_OWN_FILE`) whether an owner-directed file is the lane's own, so a worker's lane
 delivers its worker's files although it owns no unaddressed ones and projects no cards.
-`scripts/ask-owner.py` and the pending-questions skill name their text ask through the same
+Only a name with no destination, or one destined for `ag2space` (the worker lane's own bridge), is
+stamped; a name destined for Discord, Slack or Telegram keeps its bare name so that bridge delivers
+it. `scripts/ask-owner.py` and the pending-questions skill name their text ask through the same
 helper (`result_publish.worker_published_path`), so a worker asks the owner as its own agent, and
 the question records that agent (`asked_by`, the row's `Asked by`, via
 `connections.proactive_author_agent`). A decision card stays the core's: only a core lane issues
