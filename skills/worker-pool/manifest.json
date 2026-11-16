@@ -6,7 +6,7 @@
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
-  "description": "Pool workers the core delegates to. No tools; manifest present to DECLARE config per this convention: WORKER_POOL_SSPACE_HANDOFF (off by default) sends pool_ask from the core to a worker that has its own enabled agent identity as a typed hand-off in a room both agents are in instead of through deliveries/<worker>/.",
+  "description": "Pool workers the core delegates to. No tools; manifest present to DECLARE config per this convention: WORKER_POOL_SSPACE_HANDOFF (off by default) sends pool_ask from the core to a worker that has its own enabled agent identity as one message in a room both agents are in instead of through deliveries/<worker>/; the worker's threaded reply arrives as a new task.",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   },

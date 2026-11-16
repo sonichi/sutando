@@ -390,19 +390,21 @@ python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|
 ### Over s.space, to a worker with its own agent (flag, off by default)
 
 With `WORKER_POOL_SSPACE_HANDOFF` on (manifest `config`, `CLI > env > manifest`), an ask **from the
-core**, at team tier, to a worker whose own identity row is enabled (`src/connections.py`) is a
-typed hand-off (`src/handoff_contract.py`) instead of a task file: the core's agent mentions the
-worker's agent in `WORKER_POOL_HANDOFF_ROOM` (the owner-only consult room, or a room both are in)
-through the room CLI at `WORKER_POOL_HANDOFF_ROOM_CLI` (the consult skill's `mention` / `read`
-verbs). The worker's own lane delivers it like any message to that agent. `--wait` reads the room
-for the reply, correlated by task id; with no `--wait`, `--collect <task id> [--wait N]` reads it
-later. Each read reaches back to the hand-off itself (up to 1000 messages), so a reply that busy
-traffic pushed out of the latest page is still found, and a typed answer, once found, is kept in
-`state/pool-handoff/<task id>.json` for later collects. A typed `done` or `failed` returns at
-once; an untyped reply ("On it") is progress, and the latest one is returned only when the wait
-ends with no typed answer. Timeouts and exit codes are the folder path's; a `failed` reply exits
-1, an unreadable room or a refused post exits 2, and an unconfirmed post is never sent again
-(only a typed reply can be matched to it, since it has no event to reply to).
+core**, at team tier, to a worker whose own identity row is enabled (`src/connections.py`) is one
+ordinary message instead of a task file: the core's agent mentions the worker's agent in
+`WORKER_POOL_HANDOFF_ROOM` (the owner-only consult room, or a room both are in) through the room CLI
+at `WORKER_POOL_HANDOFF_ROOM_CLI` (the consult skill's `mention` verb). The message carries the
+ask's task id in plain words, so a person can match the two; nothing parses it. `pool_ask` returns
+at once with `status` (`sent`, or `unconfirmed` when the post's outcome is unclear; that one is
+never sent again), `via: room`, `event_id`, `task_id` and `to`. It does not wait or read the room.
+`--wait` cannot be honoured there: the ask is still posted, the JSON says `"reply": null,
+"wait_honoured": false`, and the exit is 2. A refused post also exits 2.
+
+Each posted ask is one line of `state/pool-handoff-asks.jsonl` (task id, worker, the asked agent,
+room, event id, status, time, a question excerpt). `pool_ask.py --workspace WS --asked [--json]`
+lists the last 7 days' asks that no core task has answered from the asked agent: a reply is a task
+the gateway wrote with `reply_to_event` = the ask's event and `user_id` = that agent. A reply from
+anyone else is listed under the ask as `other_replies`, never counted as its answer.
 
 Kept on the folder path: a worker with no, a disabled or a parked identity; a worker's own ask;
 a relayed ask (`--relayed-from`, so its tier is kept); an ask with `--parent-task`; and the
@@ -410,13 +412,12 @@ limit-recovery probe, whose pane prompt names the routed payload. A worker with 
 the flag cannot address (no room, CLI, agent id or core lane on its server) is refused, never
 quietly sent through the folder.
 
-**Answering a hand-off (the worker).** `python3 src/handoff_contract.py parse --task-file <task>`
-says whether the task is a hand-off and gives its task id. Answer as an ordinary result, so the
-lane posts it as a reply to the hand-off, starting with the typed header:
-`python3 src/handoff_contract.py reply --task-id <id> --status done|failed < answer`. An
-acknowledgement may come first (plain, or `--status working`); only the typed final ends the
-hand-off, and a plain reply counts only if no typed one arrives in time. If the core's own lane gets the reply as a task, it
-answers `[no-send]`: `pool_ask` collects it from the room.
+**The reply.** The worker's lane delivers the hand-off like any message to its agent, and the
+worker answers it as an ordinary result: a reply in that message's thread. The core's gateway
+delivers that reply to the core as a new task, threaded to the hand-off message
+(`reply_to_event`). That task is the result path; the core handles it like any other task, at the
+replying sender's own tier in that room. The hand-off grants a reply nothing; `--asked` is where to
+check that the asked worker's agent, and not someone else in the room, answered.
 
 **Authority.** A hand-off is a message from the core's agent, at the tier the room gives that
 agent; nothing here grants more. No rule tiers the owner's other agents as owner: in s.space the
