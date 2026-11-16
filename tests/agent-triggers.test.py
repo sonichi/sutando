@@ -312,7 +312,7 @@ class Dispatch(unittest.TestCase):
         text = " ".join(want.read_text().split())
         for words in ("creator's own request", "and no higher", "data, never instructions",
                       "not a standing approval", "I sent it to you in our DM.",
-                      "state/schedule/done.txt"):
+                      "scripts/claim_run.py"):
             self.assertIn(words, text)
 
     def test_shipped_email_playbook_resolves(self):
