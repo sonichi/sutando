@@ -2,10 +2,9 @@
 """The typed hand-off between a core and a managed agent over s.space: build and parse a request,
 build and parse its reply, and pick the reply out of a room read, all keyed by one task id.
 
-Stdlib only, used by both sides: the delegating core (`skills/worker-pool/scripts/pool_handoff.py`)
-and the agent that answers. A request is the work in plain words with one trailer line; a reply
-is a message from the asked agent that starts with `ref <task id> <status>:`, or any message of its
-that replies to the request.
+Stdlib only, used by both sides: the delegating core and the agent that answers. A request is
+the work in plain words with one trailer line; a reply is a message from the asked agent that
+starts with `ref <task id> <status>:`, or any message of its that replies to the request.
 
     python3 src/handoff_contract.py parse --task-file F       {"kind": "request"|"reply"|null, ...}
     python3 src/handoff_contract.py reply --task-id ID --status done|failed|working < body

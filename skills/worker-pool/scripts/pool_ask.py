@@ -188,7 +188,7 @@ def handoff_ask(ws: Path, route: dict, task_id: str, rid: str, sender: str, ques
     """The s.space leg (pool_handoff): no task file and no delivery; the reply is collected from the room."""
     ph = _sibling("pool_handoff")
     rec = ph.send(ws, route, task_id, rid, f"[pool-ask from {sender}] {question.strip()}", runner=runner)
-    out = {"task_id": task_id, "to": rid, "from": sender, "via": "s.space", "status": rec["status"],
+    out = {"task_id": task_id, "to": rid, "from": sender, "via": "room", "status": rec["status"],
            "event_id": rec["event_id"]}
     if wait_s > 0:
         got = ph.collect(ws, task_id, wait_s, runner=runner, sleep=sleep)
@@ -199,7 +199,7 @@ def handoff_ask(ws: Path, route: dict, task_id: str, rid: str, sender: str, ques
 def collect(workspace, task_id: str, wait_s: float, *, sleep=time.sleep, runner=None) -> dict:
     """The reply to an earlier s.space hand-off, waiting up to `wait_s`."""
     got = _sibling("pool_handoff").collect(workspace, task_id, wait_s, runner=runner, sleep=sleep)
-    return {"task_id": task_id, "via": "s.space", "reply": got["reply"], "reply_status": got["status"]}
+    return {"task_id": task_id, "via": "room", "reply": got["reply"], "reply_status": got["status"]}
 
 
 def wait_for_reply(workspace, task_id: str, wait_s: float, *, sleep=time.sleep) -> "str | None":
@@ -230,7 +230,7 @@ def main(argv=None) -> int:
     p.add_argument("--parent-task", help="the task this ask is part of (its `id:` header): the parent "
                    "shows as delegated until this ask's result exists")
     p.add_argument("--parent-generation", type=int, help="the parent task's execution generation, when known")
-    p.add_argument("--collect", metavar="TASK_ID", help="read the reply to an earlier s.space hand-off "
+    p.add_argument("--collect", metavar="TASK_ID", help="read the reply to an earlier room hand-off "
                    "(with --wait, wait for it)")
     p.add_argument("--json", action="store_true")
     a = p.parse_args(argv)
@@ -270,7 +270,7 @@ def main(argv=None) -> int:
     if a.json:
         print(json.dumps(out, indent=2, sort_keys=True))
     else:
-        via = " over s.space" if out.get("via") else ""
+        via = " as a room hand-off" if out.get("via") else ""
         print(f"asked {out['to'][:8]} as {out['task_id']}{via}")
         if out.get("status") == "unconfirmed":
             print("the hand-off could not be confirmed; it is not sent again", file=sys.stderr)

@@ -71,7 +71,7 @@ def route_for(workspace, worker: str, *, sender: str, core: str, tier: str = "te
                                     ("an enabled core lane on the worker's server", core_row),
                                     (ROOM, room), (ROOM_CLI, cli)) if not v]
     if missing:
-        raise HandoffError("s.space hand-off is on but cannot be addressed: no " + ", no ".join(missing))
+        raise HandoffError("room hand-off is on but cannot be addressed: no " + ", no ".join(missing))
     return {"room": room, "room_cli": cli, "to_agent": to_agent, "from_agent": str(core_row["agent_mxid"])}
 
 
@@ -108,7 +108,7 @@ def read_record(workspace, task_id: str) -> dict:
     try:
         return json.loads(record_path(workspace, task_id).read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
-        raise HandoffError(f"no s.space hand-off {task_id!r} recorded here") from e
+        raise HandoffError(f"no room hand-off {task_id!r} recorded here") from e
 
 
 def send(workspace, route: dict, task_id: str, worker: str, question: str, *, runner=None) -> dict:

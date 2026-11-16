@@ -137,7 +137,7 @@ class FlagOn(Base):
              "in_reply_to": "$req"}])
         out = self.ask(room, wait_s=30)
         self.assertEqual((out["via"], out["status"], out["reply"], out["reply_status"]),
-                         ("s.space", "sent", "#7 is green", "done"))
+                         ("room", "sent", "#7 is green", "done"))
         mention = room.calls[0]
         self.assertEqual(mention[2:4], ["mention", WORKER_AGENT])
         self.assertEqual(mention[5:], [ROOM, "--agent", CORE_AGENT], "sent as the core's agent")
@@ -253,7 +253,7 @@ class Cli(Base):
         self.on()
         rc, out, _ = self.run_cli("--to", "alpha", "--ask", "?", "--wait", "0.05", room=FakeRoom(replies=[]))
         self.assertEqual(rc, 1)
-        self.assertIn("over s.space", out)
+        self.assertIn("as a room hand-off", out)
         self.assertIn("no reply", out)
         rc, _, err = self.run_cli("--to", "alpha", "--ask", "?",
                                   room=FakeRoom(mention={"ok": False, "posted": False, "reason": "denied"}))
@@ -268,7 +268,7 @@ class Cli(Base):
     def test_collect_an_unknown_id_exits_2(self):
         rc, _, err = self.run_cli("--collect", "task-cccccccccccccccccc", room=FakeRoom())
         self.assertEqual(rc, 2)
-        self.assertIn("no s.space hand-off", err)
+        self.assertIn("no room hand-off", err)
 
     def test_off_the_cli_output_is_unchanged(self):
         rc, out, _ = self.run_cli("--to", "alpha", "--ask", "?", room=FakeRoom())
