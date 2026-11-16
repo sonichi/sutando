@@ -27,8 +27,8 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `pool_router.py` — resolve one task to its recipients from the roster.
 - `pool_route_handler.py` — the core watcher's task-event handler (`SUTANDO_TASK_EVENT_HANDLER`): declines unbound work, delivers bound work as sentinels.
 - `pool_delivery.py` — a recipient's own folder: sentinels in, accept, release, done flags, and the owner's `hand_off_to_core`.
-- `pool_ask.py` — ask another instance a question through the front door (below).
-- `pool_handoff.py` — `pool_ask` over s.space to a worker with its own agent, behind a flag (below).
+- `pool_ask.py` — ask another instance a question (below): a worker over s.space, the core through its `tasks/`.
+- `pool_handoff.py` — the s.space leg of `pool_ask`, the only path to a worker (below).
 - `pool_pr_route.py` — pr-watch's `PR_WATCH_ROUTE_CMD`: hands an event about our own PR to the worker driving it (below).
 - `pool_sessions.py` — read-only: which worker tmux sessions a viewer could attach, and the exact-match argv for each. Adds no state and nothing in the pool calls it; it exists for the desktop app's terminal picker. It deliberately does not describe the core, whose socket resolution belongs to the app.
 
@@ -356,8 +356,10 @@ and (when known) `runtime`, never `display_label` or a self-marker.
 You are one instance of a pool: the **core** (the canonical session, owning `tasks/`)
 and zero or more **workers**, each with its own tmux session, watcher and inbox
 (`deliveries/<worker id>/`). There is deliberately no back channel between them —
-what there is, is the task file. `pool_ask` uses it, so an ask is an ordinary task
-the owner can see, and a reply is an ordinary result.
+an ask to the core is a task file in the core's `tasks/`, and an ask to a worker is one
+message from the core's agent to the worker's own agent over s.space (below). A worker
+with no enabled agent of its own cannot be asked: convert it first (`pool_identity.py
+unconverted` lists them).
 
 **A worker's queue is its own inbox and nothing else.** `tasks/` holds every
 instance's payloads, the core's and every other worker's in flight; a task is yours
@@ -374,17 +376,16 @@ python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|
 - `--who` lists `core` and each worker as `name (full worker_id)`, with bound
   rooms and session liveness; `(you)` marks the caller. It shows the base routing
   alias separately when an s.space display override differs.
-- `--to X --ask "..."` writes `tasks/<task id>.txt` with `source: pool-ask`,
-  `requested_worker: <id>` (never for the core, which is the default recipient) and
-  `reply_to_instance: <asker>`, then routes it. A worker finds it in its inbox like
-  any other delivery; the core's watcher takes an ask addressed to the core.
-- **To answer an ask**, write `results/<task id>.txt` whose first line is `[no-send]`
+- `--to core --ask "..."` writes `tasks/<task id>.txt` with `source: pool-ask` and
+  `reply_to_instance: <asker>`; the core's watcher takes it. `--to <worker>` is a room
+  hand-off (below), never a task file.
+- **To answer an ask to the core**, write `results/<task id>.txt` whose first line is `[no-send]`
   — the asker reads the file (with `--wait`, as soon as it lands) and nothing is
   posted to any room. The ask's body says so, so an answerer needs no other briefing.
 - An ask carries `access_tier: team` + `collaborator: true` + `priority: low`: the asker is
   another instance, not the owner, so a standing ask never reads as an owner waiting to
   `scripts/cron-gate.sh` or the shepherds (measured: an owner-tier ask deferred `sync-workspace`).
-- **Relaying someone else's question** — a peer's, a guest's — is `--relayed-from <who>
+- **Relaying someone else's question to the core** — a peer's, a guest's — is `--relayed-from <who>
   --tier <team|other|guest>`: the task keeps *their* tier and carries `relayed_from:` for the
   receiver to key on. `owner` is never a tier an ask can claim, and non-owner content must
   never be relayed as your own: the tier must say where the question came from, not who ran
@@ -407,8 +408,8 @@ of these hold, and prints `local` (the watcher keeps the event) otherwise:
 - That worker is not the watching session (`$SUTANDO_INSTANCE_ID`, else the core) and its session
   is alive (`pool_ask --who`).
 - The `pool_ask` (only the event line, plus: read the PR, act on it, tell the owner only if it
-  needs them) was delivered: a sentinel in the worker's folder, or, over s.space, a confirmed post.
-  An unconfirmed post is not sent again.
+  needs them) was delivered: a confirmed post over s.space to the worker's own agent. An
+  unconfirmed post is not sent again, and a worker with no agent of its own keeps the event local.
 
 Then it prints `handed <worker id>`. A PR driven from another host stays with the watcher here.
 On, on the host running the pr-watch runner, from the checkout:
@@ -418,11 +419,10 @@ python3 skills/pr-watch/scripts/pr_watch.py config set PR_WATCH_ROUTE_CMD \
   "$(python3 -c 'import shlex, sys; print(shlex.join(sys.argv[1:]))' python3 "$PWD/skills/worker-pool/scripts/pool_pr_route.py")"
 ```
 
-### Over s.space, to a worker with its own agent (flag, off by default)
+### To a worker: over s.space, to its own agent
 
-With `WORKER_POOL_SSPACE_HANDOFF` on (manifest `config`, `CLI > env > manifest`), an ask **from the
-core**, at team tier, to a worker whose own identity row is enabled (`src/connections.py`) is one
-ordinary message instead of a task file: the core's agent mentions the worker's agent in
+An ask **from the core**, at team tier, to a worker whose own identity row is enabled
+(`src/connections.py`) is one ordinary message: the core's agent mentions the worker's agent in
 `WORKER_POOL_HANDOFF_ROOM` (the owner-only consult room, or a room both are in) through the room CLI
 at `WORKER_POOL_HANDOFF_ROOM_CLI` (the consult skill's `mention` verb). The message carries the
 ask's task id in plain words, so a person can match the two; nothing parses it. `pool_ask` returns
@@ -437,11 +437,17 @@ lists the last 7 days' asks that no core task has answered from the asked agent:
 the gateway wrote with `reply_to_event` = the ask's event and `user_id` = that agent. A reply from
 anyone else is listed under the ask as `other_replies`, never counted as its answer.
 
-Kept on the folder path: a worker with no, a disabled or a parked identity; a worker's own ask;
-a relayed ask (`--relayed-from`, so its tier is kept); an ask with `--parent-task`; and the
-limit-recovery probe, whose pane prompt names the routed payload. A worker with an identity that
-the flag cannot address (no room, CLI, agent id or core lane on its server) is refused, never
-quietly sent through the folder.
+Refused, with nothing posted and no task file written: a worker with no, a disabled or a parked
+identity (the refusal says `convert it first: my-agents convert <worker>`); a worker's own ask (ask
+the core with `--to core`); a relayed ask or one below team tier, since a hand-off carries the core
+agent's own tier; an ask with `--parent-task`, since a hand-off cannot hold a parent; and a worker
+whose identity cannot be addressed (no room, CLI, agent id or core lane on its server). Room and CLI
+are the manifest's `WORKER_POOL_HANDOFF_ROOM` and `WORKER_POOL_HANDOFF_ROOM_CLI` (`CLI > env >
+manifest`). The usage-limit recovery probe is not an ask: the supervisor routes it into the
+worker's own folder (`pool_remedy.queue_recovery`).
+
+`pool_identity.py unconverted [--json]` lists every worker not retired that has no enabled agent of
+its own, with the same fix, and exits 1 while any is left.
 
 **The reply.** The worker's lane delivers the hand-off like any message to its agent, and the
 worker answers it as an ordinary result: a reply in that message's thread. The core's gateway
@@ -457,7 +463,7 @@ access** in the hand-off room; that matches a folder ask (`access_tier: team` +
 `collaborator: true`). Plain Team lands on the sandboxed read-only path, and Owner access would
 raise hand-offs above what `pool_ask` gives today. Owner-tier work cannot be delegated either way.
 
-Not yet: the reply is read from `results/` by the asker, not delivered into the
+Not yet: a reply to an ask to the core is read from `results/` by the asker, not delivered into the
 asker's inbox (`reply_to_instance` is recorded for that later leg), and a worker
 learns this section by reading it — surfacing it in `/startup --worker` is one line
 in the startup skill, outside this one.

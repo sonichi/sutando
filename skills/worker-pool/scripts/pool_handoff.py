@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""pool_ask over s.space: the core posts one ordinary message, addressed to a worker that has its
-own enabled agent identity, in a room both agents are in. Nothing here waits for or reads a reply:
-the worker answers in that message's thread, and the core's gateway delivers the answer as a task.
+"""pool_ask over s.space, the only path from the core to a worker: the core posts one ordinary
+message, addressed to a worker that has its own enabled agent identity, in a room both agents are in.
+Nothing here waits for or reads a reply: the worker answers in that message's thread, and the core's
+gateway delivers the answer as a task.
 
-Off unless the worker-pool manifest's WORKER_POOL_SSPACE_HANDOFF is on (CLI > env > manifest). Then
 `route_for` answers a route only for an ask from the core, at team tier, to a worker whose identity
-row is enabled; every other ask keeps `deliveries/<worker>/`. The room transport is the CLI at
-WORKER_POOL_HANDOFF_ROOM_CLI (the consult skill's `mention` verb), run as a subprocess.
+row is enabled, and refuses every other ask to a worker with the reason and the fix: there is no
+folder fallback. The room transport is the CLI at WORKER_POOL_HANDOFF_ROOM_CLI (the consult skill's
+`mention` verb), run as a subprocess; the room is WORKER_POOL_HANDOFF_ROOM (CLI > env > manifest).
 
 A hand-off arrives at the worker as a message from the core's agent, at the tier the room gives
 that agent; this module grants no authority. Each posted ask is one line of
@@ -30,7 +31,6 @@ sys.path[:0] = [p for p in (str(_HERE), str(_REPO / "src")) if p not in sys.path
 import local_task_protocol, skill_config, task_lifecycle  # noqa: E401,E402
 
 MANIFEST = _HERE.parent / "manifest.json"
-FLAG = "WORKER_POOL_SSPACE_HANDOFF"
 ROOM = "WORKER_POOL_HANDOFF_ROOM"
 ROOM_CLI = "WORKER_POOL_HANDOFF_ROOM_CLI"
 CALL_TIMEOUT_S = 60
@@ -42,8 +42,12 @@ class HandoffError(ValueError):
     """The hand-off was refused before it was posted; pool_ask reports it and exits 2."""
 
 
-def enabled(environ=None) -> bool:
-    return skill_config.enabled(FLAG, MANIFEST, environ=environ)
+class NoIdentity(HandoffError):
+    """The worker has no enabled agent of its own, so nothing can reach it."""
+
+
+def convert_hint(name: str) -> str:
+    return f"convert it first: my-agents convert {name}"
 
 
 def _rows(workspace):
@@ -51,19 +55,31 @@ def _rows(workspace):
     return connections.read_rows(Path(workspace))
 
 
-def route_for(workspace, worker: str, *, sender: str, core: str, tier: str = "team",
-              relayed_from=None, parent_task=None, environ=None, rows=None) -> "dict | None":
-    """The s.space route for this ask, or None for the folder path. Raises HandoffError when the
-    worker has its own identity but the hand-off cannot be addressed: never a silent fallback."""
-    if not enabled(environ):
-        return None
-    # Only the core delegates this way; relayed or parent-held asks keep the folder's tier and hold.
-    if sender != core or worker == core or tier != "team" or relayed_from is not None or parent_task:
-        return None
-    rows = _rows(workspace) if rows is None else rows
+def enabled_identity(rows, worker: str) -> "dict | None":
+    """`worker`'s own identity row when it can act: present, not disabled, not parked."""
     mine = next((r for r in rows if r.get("worker") == worker), None)
     if mine is None or mine.get("disabled") or mine.get("parked"):
         return None
+    return mine
+
+
+def route_for(workspace, worker: str, *, sender: str, core: str, tier: str = "team",
+              relayed_from=None, parent_task=None, name=None, environ=None, rows=None) -> dict:
+    """The s.space route for this ask to `worker`. Raises HandoffError (NoIdentity for a worker
+    with no enabled agent) naming the reason; never a fallback to another path."""
+    name = name or worker
+    if sender != core:
+        raise HandoffError("only the core hands work to a worker; ask the core with --to core")
+    if tier != "team" or relayed_from is not None:
+        raise HandoffError("a room hand-off carries the core agent's own tier: relay a question below "
+                           "team tier, or someone else's, by posting it in a room the worker's agent is in")
+    if parent_task:
+        raise HandoffError("a room hand-off cannot hold a parent task: ask without --parent-task")
+    rows = _rows(workspace) if rows is None else rows
+    mine = enabled_identity(rows, worker)
+    if mine is None:
+        raise NoIdentity(f"{name} has no enabled s.space agent of its own, so no hand-off can reach it; "
+                         + convert_hint(name))
     to_agent = str(mine.get("agent_mxid") or "")
     server = str(mine.get("server") or "").lower()
     core_row = next((r for r in rows if not r.get("worker") and not r.get("disabled") and not r.get("parked")
@@ -74,8 +90,22 @@ def route_for(workspace, worker: str, *, sender: str, core: str, tier: str = "te
                                     ("an enabled core lane on the worker's server", core_row),
                                     (ROOM, room), (ROOM_CLI, cli)) if not v]
     if missing:
-        raise HandoffError("room hand-off is on but cannot be addressed: no " + ", no ".join(missing))
+        raise HandoffError("room hand-off cannot be addressed: no " + ", no ".join(missing))
     return {"room": room, "room_cli": cli, "to_agent": to_agent, "from_agent": str(core_row["agent_mxid"])}
+
+
+def unconverted_live_workers(workspace, *, roster=None, rows=None) -> list:
+    """[{id, label}] for each roster worker not retired that has no enabled agent of its own."""
+    if roster is None:
+        import pool_roster
+        roster = pool_roster.load_roster(Path(workspace)) or {}
+    rows = _rows(workspace) if rows is None else rows
+    out = []
+    for wid, row in sorted((roster.get("workers") or {}).items()):
+        row = row if isinstance(row, dict) else {}
+        if row.get("state") != "retired" and enabled_identity(rows, wid) is None:
+            out.append({"id": wid, "label": row.get("label") or wid})
+    return out
 
 
 def _default_runner(argv):

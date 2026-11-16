@@ -185,14 +185,13 @@ class LimitRecovery(unittest.TestCase):
 
     def test_rearm_routes_then_uses_guarded_line_sender(self):
         import pool_remedy as remedy
-        import pool_ask
         with tempfile.TemporaryDirectory() as directory:
             ws = Path(directory)
             wid = sup.wi.new_worker_id()
             sup.wi.create_worker(ws, runtime="claude", cwd=str(ws), host="fixture",
                 session_id="11111111-1111-4111-8111-111111111111", worker_id=wid)
             sup.pr.register_worker(ws, wid, "fixture-worker")
-            pool_ask.ask(ws, wid, "Outstanding fixture work")
+            remedy.queue_recovery(ws, wid, "Outstanding fixture work")
             calls = []
             def runner(argv, **kwargs):
                 calls.append(argv)
@@ -222,8 +221,7 @@ class LimitRecovery(unittest.TestCase):
             with patch.object(remedy.sup, "_open_tmux", return_value=("fixture.sock", "fixture-worker")):
                 with patch.object(remedy.subprocess, "run", side_effect=OSError("capture failed")):
                     self.assertEqual(remedy.retry_limit(ws, REPO, wid)["outcome"], "capture-failed")
-                ask = remedy._sibling("pool_ask")
-                with patch.object(ask, "ask", side_effect=ValueError("routing failed")):
+                with patch.object(remedy, "queue_recovery", side_effect=ValueError("routing failed")):
                     self.assertEqual(remedy.retry_limit(ws, REPO, wid, runner=runner)["outcome"], "delivery-failed")
                 with patch.object(remedy.sup, "is_paused", side_effect=[False, True]):
                     self.assertEqual(remedy.retry_limit(ws, REPO, wid, runner=runner)["outcome"], "rearm-queued")
@@ -238,7 +236,6 @@ class LimitRecovery(unittest.TestCase):
     @unittest.skipUnless(shutil.which("tmux"), "tmux required")
     def test_real_guarded_sender_wakes_an_isolated_limit_pane(self):
         import pool_remedy as remedy
-        import pool_ask
         with tempfile.TemporaryDirectory() as directory:
             ws = Path(directory)
             socket = str(ws / "tmux.sock")
@@ -263,7 +260,7 @@ class LimitRecovery(unittest.TestCase):
                 sup.wi.create_worker(ws, runtime="claude", cwd=str(ws), host="fixture",
                     session_id="11111111-1111-4111-8111-111111111111", worker_id=wid)
                 sup.pr.register_worker(ws, wid, "fixture-worker")
-                pool_ask.ask(ws, wid, "Outstanding fixture work")
+                remedy.queue_recovery(ws, wid, "Outstanding fixture work")
                 with patch.object(remedy.sup, "_open_tmux", return_value=(socket, "fixture")):
                     result = remedy.retry_limit(ws, REPO, wid)
                 self.assertEqual(result["outcome"], "rearm-sent", result)
@@ -276,7 +273,7 @@ class LimitRecovery(unittest.TestCase):
             finally:
                 subprocess.run(cmd + ["kill-server"], capture_output=True)
 
-    def test_recovery_probe_keeps_the_folder_with_the_room_handoff_on(self):
+    def test_recovery_probe_is_routed_even_for_a_worker_with_its_own_agent(self):
         import os
         import pool_remedy as remedy
         ask = remedy._sibling("pool_ask")
@@ -287,7 +284,7 @@ class LimitRecovery(unittest.TestCase):
             sup.wi.create_worker(ws, runtime="claude", cwd=str(ws), host="fixture",
                 session_id="11111111-1111-4111-8111-111111111111", worker_id=wid)
             sup.pr.register_worker(ws, wid, "fixture-worker")
-            ask.ask(ws, wid, "Outstanding fixture work")
+            remedy.queue_recovery(ws, wid, "Outstanding fixture work")
             rows = [{"instance": "core", "server": "srv", "agent_mxid": "@core:srv"},
                     {"instance": "w", "server": "srv", "agent_mxid": "@w:srv", "worker": wid}]
             room_calls = []
@@ -300,12 +297,11 @@ class LimitRecovery(unittest.TestCase):
                 if argv[0] == "tmux":
                     return subprocess.CompletedProcess(argv, 0, "You've hit your weekly limit\n❯ \n", "")
                 return subprocess.CompletedProcess(argv, 0, "sent", "")
-            env = {ph.FLAG: "1", ph.ROOM: "!r:srv", ph.ROOM_CLI: "/fixture/room_cli.py"}
+            env = {ph.ROOM: "!r:srv", ph.ROOM_CLI: "/fixture/room_cli.py"}
             with patch.dict(os.environ, env), patch.object(ph, "_rows", lambda ws: rows), \
                     patch.object(ph, "_default_runner", room), \
+                    patch.object(ask, "ask", side_effect=AssertionError("the probe is not an ask")), \
                     patch.object(remedy.sup, "_open_tmux", return_value=("fixture.sock", "fixture-worker")):
-                self.assertIsNotNone(ph.route_for(ws, wid, sender=sup.pr.CORE, core=sup.pr.CORE),
-                                     "control: an ordinary ask to this worker would go to the room")
                 result = remedy.retry_limit(ws, REPO, wid, runner=runner)
             self.assertEqual(result["outcome"], "rearm-sent", result)
             self.assertEqual(room_calls, [], "the probe never posts a room hand-off")
@@ -314,7 +310,6 @@ class LimitRecovery(unittest.TestCase):
     @unittest.skipUnless(shutil.which("tmux"), "tmux required")
     def test_sender_refuses_a_pane_that_turned_busy_after_routing(self):
         import pool_remedy as remedy
-        import pool_ask
         frames = {"working": "✳ Moonwalking… (15s · esc to interrupt)",
                   "dialog": None}
         for name, above in frames.items():
@@ -346,7 +341,7 @@ class LimitRecovery(unittest.TestCase):
                     sup.wi.create_worker(ws, runtime="claude", cwd=str(ws), host="fixture",
                         session_id="11111111-1111-4111-8111-111111111111", worker_id=wid)
                     sup.pr.register_worker(ws, wid, "fixture-worker")
-                    pool_ask.ask(ws, wid, "Outstanding fixture work")
+                    remedy.queue_recovery(ws, wid, "Outstanding fixture work")
                     def stale_capture(argv, **kwargs):
                         if argv[0] == "tmux":
                             return subprocess.CompletedProcess(argv, 0, "You've hit your weekly limit\n❯ \n", "")

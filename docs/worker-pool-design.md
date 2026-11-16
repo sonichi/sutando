@@ -695,16 +695,18 @@ clear field rather than beside a live predecessor. What remains is dead state â€
 `state/pool/affinity.json`, `assignments.json` and their siblings â€” which Stage 1
 neither reads nor migrates; removing it is a separate cleanup.
 
-### s.space hand-off for a worker with its own agent (flag)
+### s.space hand-off: the only path from `pool_ask` to a worker
 
-Behind `WORKER_POOL_SSPACE_HANDOFF` (worker-pool manifest `config`, off by default), `pool_ask`
-from the core at team tier to a worker whose identity row is enabled skips the task file and the
-router. The core's agent posts one ordinary message to the worker's agent in the configured
-hand-off room, records the ask, and returns at once; the worker's threaded reply reaches the core as a
-new task, and `pool_ask --asked` lists the recorded asks the asked agent has not answered.
-Relayed asks, parent-held asks, a worker's own ask and the usage-limit recovery probe (which
-names its routed payload) stay on the folder. A hand-off carries the tier the room gives the core's
-agent, so owner-tier work is not delegated this way. Use and authority: `skills/worker-pool/SKILL.md`.
+`pool_ask` from the core at team tier to a worker whose identity row is enabled skips the task file
+and the router. The core's agent posts one ordinary message to the worker's agent in the configured
+hand-off room, records the ask, and returns at once; the worker's threaded reply reaches the core as
+a new task, and `pool_ask --asked` lists the recorded asks the asked agent has not answered. Every
+other ask to a worker is refused with its reason, never sent through the folder: a worker with no
+enabled identity (the refusal names the fix, `my-agents convert <worker>`), a worker's own ask, a
+relayed or below-team ask, and a parent-held ask. An ask to the core stays a task file in the
+core's `tasks/`. The usage-limit recovery probe is the supervisor's own routed write, not an ask. A
+hand-off carries the tier the room gives the core's agent, so owner-tier work is not delegated this
+way. Use and authority: `skills/worker-pool/SKILL.md`.
 
 ### Migration
 
@@ -741,7 +743,7 @@ date more than half a year past names the next year. A time without a date names
 its next occurrence, rolling to tomorrow if it is not in the future; an explicit
 `today` or dated past reset stays past. Month/day dates accept an optional comma.
 Unreadable or absent reset text uses a 15-minute probe interval. A due tick requests one fresh turn
-through `pool_ask` and the normal recipient routing path, asking the worker to
+through the supervisor's own routed task (`pool_remedy.queue_recovery`), asking the worker to
 re-arm its session watcher and process its existing inbox. For Claude, a fresh limit capture and empty composer permit a wake-up line
 through the existing guarded line sender, pointing at that routed payload.
 Under its lock, the sender rechecks both the empty composer and that the pane

@@ -363,15 +363,16 @@ def _roster_reads(sequence):
     return log, lambda: setattr(pr_, "load_roster", real)
 
 
-def scenario_pool_ask_decides_on_one_roster_snapshot() -> None:
-    print("\nscenario: pool_ask to A while A (marked) holds a claim; later roster reads would disagree")
-    import pool_ask as pk
+def scenario_recovery_probe_decides_on_one_roster_snapshot() -> None:
+    print("\nscenario: the recovery probe to A while A (marked) holds a claim; later roster reads would disagree")
+    import pool_remedy as pk
     ws = workspace(A)
     (ws / "deliveries" / A).mkdir(parents=True, exist_ok=True)
     (ws / "deliveries" / A / pd.NON_EXCLUSIVE_MARKER).write_text("")
     both = {"version": 1, "workers": {A: {"state": "live"}, B: {"state": "live"}}, "bindings": {}}
     only_b = {"version": 2, "workers": {B: {"state": "live"}}, "bindings": {}}
-    real_route = pk.rt.route
+    rt_ = pk._sibling("pool_router")
+    real_route = rt_.route
     seen: dict = {}
 
     def claiming_route(workspace_, task_dict, *a, **kw):
@@ -379,18 +380,17 @@ def scenario_pool_ask_decides_on_one_roster_snapshot() -> None:
         (ws / "deliveries" / A / f"{task_dict['id']}.accepted").write_text("")
         return real_route(workspace_, task_dict, *a, **kw)
     log, restore = _roster_reads([both, only_b, both])
-    pk.rt.route = claiming_route
+    rt_.route = claiming_route
     os.environ.pop("SUTANDO_INSTANCE_ID", None)
     try:
-        out = pk.ask(ws, A, "q")
-        result = ("returned", out.get("route"))
+        result = ("returned", pk.queue_recovery(ws, A, "q"))
     except rt.RouterRefused as e:
         result = ("refused", str(e))
     finally:
-        pk.rt.route = real_route
+        rt_.route = real_route
         restore()
     tid = seen.get("id", "")
-    check("the whole ask reads the roster once", len(log) == 1, str(log))
+    check("the whole probe reads the roster once", len(log) == 1, str(log))
     check("the marked claim is refused, not adopted as a delivery", result[0] == "refused", str(result))
     check("...no attribution to A", not pa.attribution_path(ws, tid).exists())
     check("...no pending sentinel in A", not (ws / "deliveries" / A / f"{tid}.txt").exists())
@@ -685,7 +685,7 @@ def main() -> int:
     scenario_marker_is_judged_against_the_admitted_roster()
     scenario_valid_json_malformed_roster_never_lets_a_marker_hide_a_worker()
     scenario_an_admitted_absent_roster_is_not_reread_by_route()
-    scenario_pool_ask_decides_on_one_roster_snapshot()
+    scenario_recovery_probe_decides_on_one_roster_snapshot()
     scenario_omitted_roster_route_reads_once()
     scenario_never_deliver_into_a_marked_folder()
     scenario_handler_settles_by_the_routes_targets()

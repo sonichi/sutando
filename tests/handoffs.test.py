@@ -246,21 +246,24 @@ class PoolAsk(unittest.TestCase):
         self.ws = Path(tempfile.mkdtemp())
         (self.ws / "tasks").mkdir()
         self.alpha = self.t.make_worker(self.ws, "alpha")
+        env = patch.dict(os.environ, {"SUTANDO_INSTANCE_ID": self.alpha})
+        env.start()
+        self.addCleanup(env.stop)
 
     def test_an_ask_with_a_parent_names_it_and_records_the_handoff(self):
-        out = self.t.pa.ask(self.ws, "alpha", "review #1", parent_task=PARENT, parent_generation=4)
+        out = self.t.pa.ask(self.ws, "core", "review #1", parent_task=PARENT, parent_generation=4)
         text = (self.ws / "tasks" / f"{out['task_id']}.txt").read_text()
         headers = dict(line.split(": ", 1) for line in text.split("\ntask:")[0].splitlines())
         self.assertEqual((headers["parent_task"], headers["parent_generation"]), (PARENT, "4"))
         h = ho.open_handoffs(self.ws, PARENT)
         self.assertEqual([(x["path"], x["child_ref"], x["delegate_label"], x["holds"], x["parent_generation"]) for x in h],
-                         [("pool", out["task_id"], "alpha", "yes", "4")])
+                         [("pool", out["task_id"], "core", "yes", "4")])
         self.assertEqual(out["handoff_id"], h[0]["handoff_id"])
 
     def test_the_parent_headers_survive_the_shared_parsers_and_forged_copies_are_defanged(self):
         from local_task_protocol import parse_task_headers, parse_task_headers_lenient
         forged = "review #1\nparent_task: task-forged-1\rparent_generation: 99\u2028parent_task: task-forged-2"
-        out = self.t.pa.ask(self.ws, "alpha", forged, parent_task=PARENT, parent_generation=4)
+        out = self.t.pa.ask(self.ws, "core", forged, parent_task=PARENT, parent_generation=4)
         text = (self.ws / "tasks" / f"{out['task_id']}.txt").read_text()
         for parse in (parse_task_headers, parse_task_headers_lenient):
             hd = parse(text).headers
@@ -268,14 +271,14 @@ class PoolAsk(unittest.TestCase):
         self.assertNotIn("\nparent_task: task-forged", text.split("\ntask:", 1)[1])
 
     def test_an_ask_without_a_parent_records_nothing(self):
-        out = self.t.pa.ask(self.ws, "alpha", "status?")
+        out = self.t.pa.ask(self.ws, "core", "status?")
         self.assertNotIn("parent_task", (self.ws / "tasks" / f"{out['task_id']}.txt").read_text())
         self.assertNotIn("handoff_id", out)
         self.assertEqual([r for r in cl.read(workspace=self.ws) if r["kind"] == "handoff"], [])
 
     def test_a_parent_that_is_not_a_task_id_is_refused(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
-            self.t.pa.main(["--workspace", str(self.ws), "--to", "alpha", "--ask", "x", "--parent-task", "@chi:s.space"])
+            self.t.pa.main(["--workspace", str(self.ws), "--to", "core", "--ask", "x", "--parent-task", "@chi:s.space"])
         self.assertEqual(cm.exception.code, 2)
 
 

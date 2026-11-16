@@ -401,6 +401,22 @@ def ensure_input_watches(workspace, repo, observations: dict, *, runner=None) ->
             for w, o in observations.items() if o.get("session_alive") is True}
 
 
+def queue_recovery(workspace, worker_id: str, text: str) -> str:
+    """Write one task addressed to `worker_id` and route it into its own folder. The supervisor's
+    own write, not an ask: a usage-limited worker cannot take a room hand-off. Returns the task id."""
+    import secrets
+    ask = _sibling("pool_ask")
+    task_id = f"task-{secrets.token_hex(9)}"
+    tasks = Path(workspace) / "tasks"
+    tasks.mkdir(parents=True, exist_ok=True)
+    tmp = tasks / f".{task_id}.txt.tmp"
+    tmp.write_text(ask.compose(task_id, worker_id, text, sender=sup.pr.CORE, wait=False), encoding="utf-8")
+    os.replace(tmp, tasks / f"{task_id}.txt")
+    _sibling("pool_router").route(workspace, {"id": task_id, "source": ask.SOURCE,
+                                              "requested_worker": worker_id})
+    return task_id
+
+
 def retry_limit(workspace, repo, worker_id, *, runner=None):
     """Route the recovery task and wake its limited worker through the guarded sender."""
     if (sup.is_paused(workspace, worker_id)
@@ -422,17 +438,14 @@ def retry_limit(workspace, repo, worker_id, *, runner=None):
             or sup.classify_pane_text(capture.stdout, runtime) != ps.PANE_LIMIT
             or sup.pane_gate.pending_text(capture.stdout, sup.pane_gate.CLAUDE) != ""):
         return {"worker_id": worker_id, "outcome": "pane-changed-or-pending"}
-    ask = _sibling("pool_ask")
     try:
-        delivery = ask.ask(workspace, worker_id,
+        task_id = queue_recovery(workspace, worker_id,
             "The usage-limit recovery probe is due. Re-arm your session-role task watcher "
             "using the normal worker bootstrap, then process your outstanding deliveries. "
             "Do not run core startup or core schedules. If still usage-limited, leave the "
-            "deliveries pending; supervision will back off. Reply [no-send] when re-armed.",
-            allow_handoff=False)  # the pane prompt below names the routed payload
+            "deliveries pending; supervision will back off. Reply [no-send] when re-armed.")
     except (OSError, ValueError) as exc:
         return {"worker_id": worker_id, "outcome": "delivery-failed", "why": str(exc)}
-    task_id = delivery["task_id"]
     if sup.is_paused(workspace, worker_id) or suspension(workspace):
         return {"worker_id": worker_id, "outcome": "rearm-queued", "task_id": task_id}
     prompt = f"Read {pd.payload_path(Path(workspace), task_id)} and complete that routed recovery task."

@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Ask another instance of this pool a question, through the front door.
+"""Ask another instance of this pool a question.
 
-The pool has no back channel between the core and a worker by design; what it
-has is the task file. `pool_ask` writes one, addressed by `requested_worker`,
-and hands it to the router — the same path a room message takes — so the
-recipient sees an ordinary delivery and the owner sees an ordinary task. The
-reply is a result file for that task, which the asker can wait on.
+To a worker, an ask is a room hand-off (pool_handoff): the core's agent posts one message to the
+worker's own agent, and the worker's threaded reply reaches the core as a new task. A worker with no
+enabled agent of its own is refused with the fix; there is no other path to it. To the core, an ask
+is a task file in the core's own `tasks/`, which the core's watcher picks up; the reply is a result
+file for that task, which the asker can wait on.
 
     pool_ask.py --workspace WS --who                      who can be reached, and are they alive
-    pool_ask.py --workspace WS --to Iiya --ask "..."      deliver a question to a worker (or `core`)
+    pool_ask.py --workspace WS --to Iiya --ask "..."      hand a question to a worker over s.space
     pool_ask.py --workspace WS --to core --ask "..." --wait 300
 
-The answerer replies by writing `results/<task id>.txt`; a `[no-send]` first
-line keeps it off every room, and `--wait` returns the body as soon as it lands.
+The core answers an ask by writing `results/<task id>.txt`; a `[no-send]` first line keeps it off
+every room, and `--wait` returns the body as soon as it lands.
 """
 from __future__ import annotations
 
@@ -44,10 +44,9 @@ sys.path.insert(0, str(_HERE))
 # it lands in is parsed for headers. Repo root is parents[3] from here.
 sys.path.insert(0, str(_HERE.parents[2] / "src"))
 from task_body_guard import confine_user_content, header_safe_value  # noqa: E402
-import skill_config  # noqa: E402
 
 pr = _sibling("pool_roster")
-rt = _sibling("pool_router")
+ph = _sibling("pool_handoff")
 sup = _sibling("pool_supervise")
 
 SOURCE = "pool-ask"
@@ -55,8 +54,6 @@ NO_SEND = "[no-send]"
 # An ask never claims owner authority: the asker is an instance, and relayed content
 # keeps the tier of whoever wrote it. `owner` is deliberately not offered.
 TIERS = ("team", "other", "guest")
-MANIFEST = _HERE.parent / "manifest.json"
-HANDOFF_FLAG = "WORKER_POOL_SSPACE_HANDOFF"
 
 
 def whoami() -> str:
@@ -144,20 +141,20 @@ def compose(task_id: str, to: str, question: str, *, sender: str, wait: bool,
 def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
         sleep=time.sleep, tier: str = "team", relayed_from: "str | None" = None,
         parent_task: "str | None" = None, parent_generation: "int | None" = None,
-        allow_handoff: bool = True, runner=None) -> dict:
+        runner=None) -> dict:
     ws = Path(workspace)
-    roster = pr.load_roster(ws)     # one snapshot: the recipient is resolved and routed against it
+    roster = pr.load_roster(ws)     # one snapshot: the recipient is resolved against it
     rid = resolve_in(roster, to)
     sender = whoami()
     if rid == sender:
         raise ValueError("that is you")
+    if tier not in TIERS:
+        raise ValueError(f"tier must be one of {TIERS}: {tier!r}")
     task_id = f"task-{secrets.token_hex(9)}"
-    if allow_handoff and skill_config.enabled(HANDOFF_FLAG, MANIFEST):
-        ph = _sibling("pool_handoff")
-        route = ph.route_for(ws, rid, sender=sender, core=pr.CORE, tier=tier,
-                             relayed_from=relayed_from, parent_task=parent_task)
-        if route is not None:
-            return handoff_ask(ws, route, task_id, rid, sender, question, wait_s=wait_s, runner=runner)
+    if rid != pr.CORE:
+        route = ph.route_for(ws, rid, sender=sender, core=pr.CORE, tier=tier, relayed_from=relayed_from,
+                             parent_task=parent_task, name=to)
+        return handoff_ask(ws, route, task_id, rid, sender, question, wait_s=wait_s, runner=runner)
     tasks = ws / "tasks"
     tasks.mkdir(parents=True, exist_ok=True)
     tmp = tasks / f".{task_id}.txt.tmp"
@@ -168,15 +165,9 @@ def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
     out = {"task_id": task_id, "to": rid, "from": sender, "task_file": str(tasks / f"{task_id}.txt")}
     if parent_task:
         import handoffs
-        row = (roster.get("workers") or {}).get(rid) if isinstance(roster, dict) else None
-        label = handoffs.label_for("pool", to, verified=(row or {}).get("label"))
+        label = handoffs.label_for("pool", to, verified=pr.CORE)
         out["handoff_id"] = handoffs.open_handoff(ws, parent_task, "pool", task_id, label,
                                                   holds=True, parent_generation=parent_generation)
-    if rid != pr.CORE:
-        # Routed here as well as by the watcher's own pass: the router is idempotent,
-        # so whichever runs second reports `already` and delivers nothing twice.
-        task = {"id": task_id, "source": SOURCE, "requested_worker": rid}
-        out["route"] = rt.route(ws, task, roster)
     if wait_s > 0:
         out["reply"] = wait_for_reply(ws, task_id, wait_s, sleep=sleep)
     return out
@@ -186,7 +177,6 @@ def handoff_ask(ws: Path, route: dict, task_id: str, rid: str, sender: str, ques
                 wait_s: float = 0.0, runner=None) -> dict:
     """The s.space leg (pool_handoff): one message and one ask record, no task file, no delivery and
     no wait. The reply is the worker's threaded answer, which arrives as a new task."""
-    ph = _sibling("pool_handoff")
     text = f"[pool-ask from {sender}] {question.strip()}"
     sent = ph.send(route, task_id, text, runner=runner)
     out = {"task_id": task_id, "to": rid, "from": sender, "via": "room", "status": sent["status"],
@@ -202,7 +192,7 @@ def handoff_ask(ws: Path, route: dict, task_id: str, rid: str, sender: str, ques
 
 def asked(workspace) -> list:
     """Recent room hand-offs no core task has answered from the asked agent (pool_handoff.asked)."""
-    return _sibling("pool_handoff").asked(workspace)
+    return ph.asked(workspace)
 
 
 def wait_for_reply(workspace, task_id: str, wait_s: float, *, sleep=time.sleep) -> "str | None":
@@ -267,7 +257,7 @@ def main(argv=None) -> int:
             p.error("--tier below team needs --relayed-from: whose content is it?")
         out = ask(a.workspace, a.to, a.ask, wait_s=a.wait, tier=a.tier, relayed_from=a.relayed_from,
                   parent_task=a.parent_task, parent_generation=a.parent_generation)
-    except (ValueError, OSError, rt.RouterRefused) as e:
+    except (ValueError, OSError) as e:
         print(f"pool_ask: {e}", file=sys.stderr)
         return 2
     if a.json:

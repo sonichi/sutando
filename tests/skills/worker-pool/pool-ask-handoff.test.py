@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""pool_ask over s.space (WORKER_POOL_SSPACE_HANDOFF): flag-gated, fakes only.
+"""pool_ask over s.space, the only path to a worker: fakes only.
 
-Pinned: the manifest ships the flag off, and off the folder path is unchanged and the hand-off code
-is never consulted; on, an ask from the core to a worker with an enabled identity posts exactly one
-message as the core's agent and returns at once, with no task file, no delivery and no room read;
-`--wait` there is refused loudly (exit 2, `reply: null`, `wait_honoured: false`); each posted ask is
-one line of the asks record, and `--asked` lists the recorded asks no gateway reply task from the
-asked agent has answered (a reply from anyone else is named, never counted); a worker with no, a disabled or a parked identity, a worker's own ask, an ask
-below team tier, a relayed ask and a parent-held ask keep the folder; an identity that cannot be
-addressed is refused, never a silent fallback; a refusal before sending is exit 2, and an unclear
-post is `unconfirmed` and never resent.
+Pinned: an ask from the core to a worker with an enabled identity posts exactly one message as the
+core's agent and returns at once, with no task file, no delivery and no room read; `--wait` there is
+refused loudly (exit 2, `reply: null`, `wait_honoured: false`); each posted ask is one line of the
+asks record, and `--asked` lists the recorded asks no gateway reply task from the asked agent has
+answered (a reply from anyone else is named, never counted). A worker with no, a disabled or a
+parked identity is refused with the fix (`my-agents convert <worker>`); a worker's own ask, an ask
+below team tier, a relayed ask and a parent-held ask to a worker are refused; an identity that
+cannot be addressed is refused. No refusal writes a task file or a delivery. A refusal before
+sending is exit 2, and an unclear post is `unconfirmed` and never resent. `unconverted` lists each
+worker not retired without an enabled identity.
 
 Run: python3 tests/skills/worker-pool/pool-ask-handoff.test.py
 """
@@ -30,12 +31,12 @@ REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "skills/worker-pool/scripts"))
 sys.path.insert(0, str(REPO / "src"))
 
-import pool_ask as pa, pool_handoff as ph, skill_config  # noqa: E401,E402
+import pool_ask as pa, pool_handoff as ph, pool_identity  # noqa: E401,E402
 
 pr, wi = pa.pr, pa.sup.wi
 REAL_ROWS = ph._rows
 CORE_AGENT, WORKER_AGENT, ROOM = "@core:srv", "@alpha-agent:srv", "!handoff:srv"
-ON = {ph.FLAG: "1", ph.ROOM: ROOM, ph.ROOM_CLI: "/fake/room_cli.py"}
+ON = {ph.ROOM: ROOM, ph.ROOM_CLI: "/fake/room_cli.py"}
 
 
 class FakeRoom:
@@ -76,7 +77,7 @@ class Base(unittest.TestCase):
         patch_rows = mock.patch.object(ph, "_rows", lambda ws: self.rows)
         patch_rows.start()
         self.addCleanup(patch_rows.stop)
-        clean = {k: v for k, v in os.environ.items() if k not in (ph.FLAG, ph.ROOM, ph.ROOM_CLI, "SUTANDO_INSTANCE_ID")}
+        clean = {k: v for k, v in os.environ.items() if k not in (ph.ROOM, ph.ROOM_CLI, "SUTANDO_INSTANCE_ID")}
         env = mock.patch.dict(os.environ, clean, clear=True)
         env.start()
         self.addCleanup(env.stop)
@@ -94,39 +95,20 @@ class Base(unittest.TestCase):
     def delivered(self, tid):
         return (self.ws / "deliveries" / self.alpha / f"{tid}.txt").exists()
 
-
-class FlagOff(Base):
-    def test_the_manifest_ships_it_off(self):
-        cfg = skill_config.manifest_config(ph.MANIFEST)
-        self.assertEqual(cfg.get(ph.FLAG), "0")
-        self.assertFalse(ph.enabled({}))
-
-    def test_off_the_folder_path_is_unchanged_and_the_handoff_is_never_consulted(self):
-        room = FakeRoom()
-        with mock.patch.object(ph, "route_for", side_effect=AssertionError("consulted while off")):
-            out = self.ask(room)
-        self.assertEqual(set(out), {"task_id", "to", "from", "task_file", "route"})
-        self.assertTrue(self.delivered(out["task_id"]))
-        self.assertEqual(room.calls, [])
-        self.assertFalse((self.ws / "state" / "pool-handoff").exists())
-
-    def test_off_the_task_file_matches_on_with_no_identity(self):
-        fixed = "task-aaaaaaaaaaaaaaaaaa"
-        texts = []
-        for setup in (lambda: None, lambda: (self.on(), self.rows.pop())):
-            setup()
-            with mock.patch.object(pa.secrets, "token_hex", return_value=fixed[5:]), \
-                    mock.patch.object(pa, "datetime") as dt:
-                dt.now.return_value.strftime.return_value = "2026-11-15T00:00:00Z"
-                pa.ask(self.ws, "alpha", "same?", runner=FakeRoom())
-            texts.append((self.ws / "tasks" / f"{fixed}.txt").read_text())
-        self.assertEqual(texts[0], texts[1])
+    def nothing_written(self):
+        self.assertEqual(list((self.ws / "tasks").iterdir()), [], "a refusal wrote a task")
+        self.assertFalse((self.ws / "deliveries").exists(), "a refusal made a delivery")
+        self.assertFalse(ph.asks_path(self.ws).exists(), "a refusal was recorded as an ask")
 
 
 class Plumbing(Base):
-    def test_route_for_is_none_while_off_and_rows_come_from_the_connections_record(self):
-        self.assertIsNone(ph.route_for(self.ws, self.alpha, sender=pr.CORE, core=pr.CORE, environ={}))
+    def test_rows_come_from_the_connections_record(self):
         self.assertEqual(REAL_ROWS(self.ws), [], "an empty workspace has no rows")
+
+    def test_the_manifest_no_longer_declares_a_flag(self):
+        cfg = json.loads(ph.MANIFEST.read_text())["config"]
+        self.assertNotIn("WORKER_POOL_SSPACE_HANDOFF", cfg)
+        self.assertEqual(set(cfg), {ph.ROOM, ph.ROOM_CLI})
 
     def test_the_default_runner_runs_the_argv(self):
         r = ph._default_runner([sys.executable, "-c", "print('{}')"])
@@ -139,7 +121,7 @@ class Plumbing(Base):
         self.assertEqual(self.ask(broken)["status"], "unconfirmed")
 
 
-class FlagOn(Base):
+class Handoff(Base):
     def setUp(self):
         super().setUp()
         self.on()
@@ -211,43 +193,54 @@ class FlagOn(Base):
                     "task-aaaaaaaaaaaaaaaaaa", "  ", runner=room)
         self.assertEqual(room.calls, [])
 
-    def test_without_an_enabled_identity_the_folder_is_kept(self):
+    def test_without_an_enabled_identity_the_ask_is_refused_with_the_fix(self):
         for change in ({"disabled": True}, {"parked": True}, None):
             if change is None:
                 self.rows.pop()
             else:
                 self.rows[1].update(change)
             room = FakeRoom()
-            out = self.ask(room)
-            self.assertNotIn("via", out)
-            self.assertTrue(self.delivered(out["task_id"]))
+            with self.assertRaises(ph.NoIdentity) as cm:
+                self.ask(room)
+            self.assertIn("convert it first: my-agents convert alpha", str(cm.exception))
             self.assertEqual(room.calls, [])
-            self.assertFalse(ph.asks_path(self.ws).exists(), "a folder ask is not recorded here")
+            self.nothing_written()
             if change:
                 for k in change:
                     self.rows[1].pop(k)
 
-    def test_asks_the_handoff_must_not_carry_keep_the_folder(self):
+    def test_asks_the_handoff_cannot_carry_are_refused(self):
         beta = make_worker(self.ws, "beta")
-        cases = [dict(tier="other"), dict(relayed_from="@visitor:x"),
-                 dict(tier="guest", relayed_from="@visitor:x"), dict(parent_task="task-bbbbbbbbbbbbbbbbbb")]
-        for kw in cases:
+        cases = [(dict(tier="other"), "tier"), (dict(relayed_from="@visitor:x"), "tier"),
+                 (dict(tier="guest", relayed_from="@visitor:x"), "tier"),
+                 (dict(parent_task="task-bbbbbbbbbbbbbbbbbb"), "parent")]
+        for kw, why in cases:
             room = FakeRoom()
-            with mock.patch("handoffs.open_handoff", return_value="h1"):
-                out = self.ask(room, **kw)
-            self.assertNotIn("via", out, kw)
-            self.assertTrue(self.delivered(out["task_id"]), kw)
+            with self.assertRaisesRegex(ph.HandoffError, why, msg=kw):
+                self.ask(room, **kw)
             self.assertEqual(room.calls, [], kw)
         os.environ["SUTANDO_INSTANCE_ID"] = beta
         room = FakeRoom()
-        self.assertNotIn("via", self.ask(room), "a worker's own ask keeps the folder")
+        with self.assertRaisesRegex(ph.HandoffError, "--to core"):
+            self.ask(room)
         self.assertEqual(room.calls, [])
+        self.nothing_written()
 
-    def test_allow_handoff_false_keeps_the_folder(self):
+    def test_the_cli_refusal_names_the_fix_and_exits_2(self):
+        self.rows.pop()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc = pa.main(["--workspace", str(self.ws), "--to", "alpha", "--ask", "status?"])
+        self.assertEqual(rc, 2)
+        self.assertIn("my-agents convert alpha", err.getvalue())
+        self.nothing_written()
+
+    def test_an_ask_to_the_core_is_still_a_task_file(self):
+        os.environ["SUTANDO_INSTANCE_ID"] = self.alpha
         room = FakeRoom()
-        out = self.ask(room, allow_handoff=False)
-        self.assertTrue(self.delivered(out["task_id"]))
-        self.assertEqual(room.calls, [])
+        out = pa.ask(self.ws, "core", "may I?", runner=room)
+        self.assertTrue((self.ws / "tasks" / f"{out['task_id']}.txt").exists())
+        self.assertEqual(room.calls, [], "the core is reached through its own tasks/")
 
     def test_an_identity_that_cannot_be_addressed_is_refused(self):
         for drop in (ph.ROOM, ph.ROOM_CLI):
@@ -258,7 +251,32 @@ class FlagOn(Base):
         self.rows[0]["server"] = "elsewhere"
         with self.assertRaisesRegex(ValueError, "core lane"):
             self.ask(FakeRoom())
-        self.assertEqual(list((self.ws / "tasks").iterdir()), [], "a refusal wrote a task")
+        self.nothing_written()
+
+
+class Unconverted(Base):
+    def test_lists_each_live_worker_without_an_enabled_identity(self):
+        beta = make_worker(self.ws, "beta")
+        self.assertEqual(ph.unconverted_live_workers(self.ws), [{"id": beta, "label": "beta"}])
+        self.rows[1]["disabled"] = True
+        self.assertEqual({w["id"] for w in ph.unconverted_live_workers(self.ws)}, {self.alpha, beta})
+        pr.set_worker_state(self.ws, beta, "retired")
+        self.assertEqual([w["id"] for w in ph.unconverted_live_workers(self.ws)], [self.alpha],
+                         "a retired worker needs no agent")
+
+    def test_the_cli_exits_1_while_any_is_left_and_0_when_none_is(self):
+        beta = make_worker(self.ws, "beta")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(pool_identity.main(["--workspace", str(self.ws), "unconverted"]), 1)
+        self.assertIn(f"beta ({beta})", out.getvalue())
+        self.assertIn("my-agents convert beta", out.getvalue())
+        self.assertNotIn(self.alpha, out.getvalue())
+        pr.set_worker_state(self.ws, beta, "retired")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(pool_identity.main(["--workspace", str(self.ws), "unconverted", "--json"]), 0)
+        self.assertEqual(json.loads(out.getvalue()), [])
 
 
 def gateway_task(folder, tid, *, event, sender, layout=True):
@@ -392,16 +410,20 @@ class Cli(Base):
             self.run_cli("--collect", "task-cccccccccccccccccc", room=FakeRoom())
         self.assertEqual(cm.exception.code, 2)
 
-    def test_off_the_cli_output_is_unchanged(self):
-        rc, out, _ = self.run_cli("--to", "alpha", "--ask", "?", room=FakeRoom())
-        self.assertEqual(rc, 0)
-        self.assertRegex(out, r"^asked \w{8} as task-[0-9a-f]{18}\n$")
+    def test_unconfigured_the_ask_is_refused_not_sent_another_way(self):
+        rc, _, err = self.run_cli("--to", "alpha", "--ask", "?", room=FakeRoom())
+        self.assertEqual(rc, 2)
+        self.assertIn(ph.ROOM, err)
+        self.nothing_written()
 
-    def test_off_a_wait_that_times_out_still_exits_1(self):
-        rc, out, _ = self.run_cli("--to", "alpha", "--ask", "?", "--wait", "0.01", room=FakeRoom())
+    def test_an_ask_to_the_core_prints_as_before_and_a_timed_out_wait_exits_1(self):
+        os.environ["SUTANDO_INSTANCE_ID"] = self.alpha
+        rc, out, _ = self.run_cli("--to", "core", "--ask", "?", room=FakeRoom())
+        self.assertEqual(rc, 0)
+        self.assertRegex(out, r"^asked core as task-[0-9a-f]{18}\n$")
+        rc, out, _ = self.run_cli("--to", "core", "--ask", "?", "--wait", "0.01", room=FakeRoom())
         self.assertEqual(rc, 1)
         self.assertIn("no reply within", out)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

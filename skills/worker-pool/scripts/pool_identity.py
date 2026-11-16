@@ -19,6 +19,7 @@ worker, and posts nothing proactively. Retiring the worker (pool_manage retire) 
     python3 pool_identity.py [--workspace WS] provision-abort <worker>
     python3 pool_identity.py [--workspace WS] retire-remote <worker> [--local-anyway]
     python3 pool_identity.py [--workspace WS] card-reply --task-file PATH
+    python3 pool_identity.py [--workspace WS] unconverted [--json]
 
 TOKEN is the agent's access token from its settings page in AG2 Space. Leave it out to type it
 at a hidden prompt, or pass '-' to read it from stdin; it is stored in the secret vault, never in
@@ -39,6 +40,9 @@ the core's own agent, asks again until the owner has approved it, and redeems th
 `provision-finish` redeems a claim an earlier call already returned, for the agent id it returned.
 Both print the agent id and a status. `retire-remote` removes the identity once its server rejects
 the token. Each prints one JSON line and never a secret.
+
+`unconverted` lists every worker not retired that has no enabled agent of its own (pool_ask cannot
+reach one), and exits 1 while any is listed, 0 when none is.
 """
 from __future__ import annotations
 
@@ -296,6 +300,20 @@ def cmd_card_reply(args, ws: Path) -> int:
     return 0 if out["status"] == "started" else 1
 
 
+def cmd_unconverted(args, ws: Path) -> int:
+    import pool_handoff
+    left = pool_handoff.unconverted_live_workers(ws)
+    if args.json:
+        print(json.dumps(left, sort_keys=True))
+    else:
+        for w in left:
+            print(f"{w['label']} ({w['id']}) has no enabled agent of its own; "
+                  + pool_handoff.convert_hint(w["label"]))
+        if not left:
+            print("every worker has an enabled agent of its own")
+    return 1 if left else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="pool_identity", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -331,6 +349,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("retire-remote"); s.add_argument("worker"); s.add_argument("--local-anyway", action="store_true")
     s.set_defaults(fn=cmd_retire_remote)
     s = sub.add_parser("card-reply"); s.add_argument("--task-file", required=True); s.set_defaults(fn=cmd_card_reply)
+    s = sub.add_parser("unconverted"); s.add_argument("--json", action="store_true"); s.set_defaults(fn=cmd_unconverted)
     return p
 
 
