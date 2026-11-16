@@ -132,6 +132,14 @@ class Clean(unittest.TestCase):
         body = on.compose([on.clean("A\nB"), on.clean("C\x00D")])
         self.assertEqual(body, "Mention notice: A B\nAlso: C D\n")
 
+    def test_the_quoted_room_survives(self):
+        note = on.clean("Bob mentioned you in «Q4: Planning»: ship it? link Suggested reply: \"Yes.\"")
+        body = on.compose([note])
+        self.assertEqual(
+            body,
+            "Mention notice: Bob mentioned you in «Q4: Planning»: ship it? link "
+            "Suggested reply: \"Yes.\"\n")
+
 
 class Run(unittest.TestCase):
     def setUp(self):

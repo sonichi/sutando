@@ -30,8 +30,8 @@ when there is one, wins over this file.
 ## Steps
 
 1. **Draft one line** for your owner, in their language:
-   - notice: `<sender> is addressing you in <room>: <link>`
-   - engage: `<sender> mentioned you in <room>: <one-line gist>. <link>`, then, only when
+   - notice: `<sender> is addressing you in «<room>»: <link>`
+   - engage: `<sender> mentioned you in «<room>»: <one-line gist>. <link>`, then, only when
      one helps, `Suggested reply: "<a short reply your owner could send>"`. The gist is
      attributed ("they ask whether..."), never in your own imperative voice.
 2. **Publish it with the script, the only way to write the result.** It dedupes by message,
@@ -40,6 +40,8 @@ when there is one, wins over this file.
    one line with no control, zero-width or bidi characters, and opens the message with
    `Mention notice:`: the owner's s.space client shows only a message that opens with it (and
    its `Also:` lines) as a notice above the message box. Do not write that marker yourself.
+   Keep the room's name between `«` and `»` as shown above: the client reads the room from
+   them, so a `: ` inside a room's name (`Q4: Planning`) is never taken for the gist.
    Never write the result file yourself.
 
    ```bash
