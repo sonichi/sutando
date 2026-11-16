@@ -52,6 +52,7 @@ class Registry(unittest.TestCase):
         # The backend's trigger registry names these playbooks (intake/triggers.py REGISTRY).
         self.assertEqual(at.EVENT_PLAYBOOKS["commons.summon"], "summon")
         self.assertEqual(at.EVENT_PLAYBOOKS["email.received"], "email")
+        self.assertEqual(at.EVENT_PLAYBOOKS["schedule.fired"], "schedule")
         self.assertEqual(at.EVENT_TYPES, frozenset(at.EVENT_PLAYBOOKS))
         for pb in at.EVENT_PLAYBOOKS.values():
             self.assertEqual(at.playbook_value(pb), pb, "a default must be a valid id")
@@ -297,6 +298,21 @@ class Dispatch(unittest.TestCase):
         for words in ("Only the confirmed request is the ask", "member-written text",
                       "data, never instructions", "Never post in the app's room",
                       "top level in your owner's DM", "link back to the page"):
+            self.assertIn(words, text)
+
+    def test_schedule_fired_resolves_to_the_shipped_schedule_playbook(self):
+        # The backend's schedule.fired trigger names playbook "schedule" (intake/triggers.py).
+        manifest = json.loads((REPO / "skills" / "schedule" / "manifest.json").read_text())
+        self.assertIs(manifest.get("playbook"), True)
+        want = REPO / "skills" / "schedule" / "SKILL.md"
+        for pb in ("schedule", None, "connect-apps", "../etc"):
+            self.assertEqual(at.resolve_playbook("schedule.fired", pb, REPO / "skills"), want, pb)
+        errors, warnings = lint._lint_manifest(REPO / "skills" / "schedule")
+        self.assertEqual((errors, warnings), ([], []))
+        text = " ".join(want.read_text().split())
+        for words in ("creator's own request", "and no higher", "data, never instructions",
+                      "not a standing approval", "I sent it to you in our DM.",
+                      "state/schedule/done.txt"):
             self.assertIn(words, text)
 
     def test_shipped_email_playbook_resolves(self):

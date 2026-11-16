@@ -1,0 +1,12 @@
+{
+  "name": "schedule",
+  "version": "0.1.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "playbook": true,
+  "description": "Playbook for the schedule.fired AgentTrigger: a job someone scheduled with this agent in a room is due. Do the job as its creator's own request at the tier the task carries, and post the outcome once, top level, in that room. Idempotent by agent_trigger_id.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}
