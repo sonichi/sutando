@@ -70,30 +70,44 @@ link_skills() {
     fi
   done
 
-  if [ -n "$WS" ] && [ -d "$WS/skills" ]; then
-    for skill_dir in "$WS"/skills/*/; do
+  local roots root kind claimed=$'\n' excluded label
+  roots="$(bash "$CONFIG" skill-roots "$WS")" || { echo "skill root scan failed" >&2; return 1; }
+  while IFS= read -r root; do
+    [ -n "$root" ] || continue
+    [ "$(cd "$root" && pwd -P)" = "$(cd "$SKILLS_DIR" && pwd -P)" ] && continue
+    excluded="$(excluded_in "$root")" || return 1
+    kind="$root"; [ "$root" != "$WS/skills" ] || kind="workspace"
+    label="skill from $root"; [ "$root" != "$WS/skills" ] || label="workspace skill"
+    for skill_dir in "$root"/*/; do
       [ -d "$skill_dir" ] || continue
       skill_name=$(basename "$skill_dir")
       [ ! -f "$skill_dir/SKILL.md" ] && continue
       if [ -d "$SKILLS_DIR/$skill_name" ] && [ -f "$SKILLS_DIR/$skill_name/SKILL.md" ]; then
-        echo "  ⚠ $skill_name (workspace copy shadowed by the shipped skill of the same name — rename yours)"
+        echo "  ⚠ $skill_name ($kind copy shadowed by the shipped skill of the same name — rename yours)"
         continue
       fi
-      reason="$(excluded_reason "$WS_EXCLUDED" "$skill_name")"
-      if [ -n "$reason" ]; then skip_excluded "$reason" "$TARGET" "$skill_name" "workspace skill, "; continue; fi
+      case "$claimed" in *$'\n'"$skill_name"$'\n'*)
+        echo "  ⚠ $skill_name ($kind copy shadowed by an earlier skill root)"; continue ;;
+      esac
+      claimed="$claimed$skill_name"$'\n'
+      reason="$(excluded_reason "$excluded" "$skill_name")"
+      if [ -n "$reason" ]; then skip_excluded "$reason" "$TARGET" "$skill_name" "$label, "; continue; fi
       if [ -L "$TARGET/$skill_name" ] && [ "$(readlink "$TARGET/$skill_name")" = "${skill_dir%/}" ]; then
-        echo "  ↻ $skill_name (workspace skill, symlink exists)"
+        echo "  ↻ $skill_name ($label, symlink exists)"
       elif [ -L "$TARGET/$skill_name" ] && [ ! -e "$TARGET/$skill_name" ]; then
         rm "$TARGET/$skill_name"; ln -s "${skill_dir%/}" "$TARGET/$skill_name"
-        echo "  ✓ $skill_name (workspace skill, relinked — old symlink was broken)"
+        echo "  ✓ $skill_name ($label, relinked — old symlink was broken)"
+      elif [ -L "$TARGET/$skill_name" ] && [ ! -f "$TARGET/$skill_name/SKILL.md" ]; then
+        rm "$TARGET/$skill_name"; ln -s "${skill_dir%/}" "$TARGET/$skill_name"
+        echo "  ✓ $skill_name ($label, relinked — old link pointed at a folder with no SKILL.md)"
       elif [ -e "$TARGET/$skill_name" ]; then
-        echo "  ⚠ $skill_name (workspace skill; target exists, skipping)"
+        echo "  ⚠ $skill_name ($label; target exists, skipping)"
       else
         ln -s "${skill_dir%/}" "$TARGET/$skill_name"
-        echo "  ✓ $skill_name (workspace skill)"
+        echo "  ✓ $skill_name ($label)"
       fi
     done
-  fi
+  done <<< "$roots"
 }
 
 link_skills "$TARGET"

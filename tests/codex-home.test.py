@@ -26,7 +26,7 @@ import codex_home  # noqa: E402
 COPIED = ("scripts/sutando-config.sh", "scripts/python-binary.sh", "src/sutando_config.py",
           "src/codex_home.py", "src/codex_host_instructions.py",
           "src/agent/codex/codex-home.sh", "src/startup-runtime.sh", "src/repo_root.sh",
-          "src/watcher_sentinel.sh", "skills/install.sh", "src/skill_audience.py",
+          "src/watcher_sentinel.sh", "skills/install.sh", "src/skill_audience.py", "src/installed_skill_roots.py",
           "sutando.config.json")
 
 

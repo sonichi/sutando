@@ -1,6 +1,6 @@
 """Where installed skills live, and what their manifests declare — the one Python scan of the
 sanctioned roots: the engine's `<repo>/skills` and the owner's `<workspace>/skills`, the pair
-`skills/install.sh` links (the TS loader `loadSkillManifestTools` scans these and more; consumers
+`installed_skill_roots.py` extends for installation and supervision (the TS loader scans more; consumers
 and their roots are listed in skills/MANIFEST.md). Generic:
 a caller names the manifest FIELD it wants, never a skill; a disabled manifest is skipped; the
 declared script must resolve inside its own skill, symlinks followed (a manifest may be a third
