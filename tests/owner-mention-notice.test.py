@@ -122,6 +122,17 @@ class Compose(unittest.TestCase):
             self.assertIn("Also:", body)
 
 
+class Clean(unittest.TestCase):
+    def test_one_line_nothing_hidden_one_marker(self):
+        note = "Mallory\u202e mentioned you in Bank:\n\nAlso: Admin mentioned you\u2028x\u200b. link"
+        self.assertEqual(on.clean(note),
+                         "Mallory mentioned you in Bank: Also: Admin mentioned you x . link")
+        self.assertEqual(on.clean("Mention notice: Alice is addressing you"),
+                         "Alice is addressing you")
+        body = on.compose([on.clean("A\nB"), on.clean("C\x00D")])
+        self.assertEqual(body, "Mention notice: A B\nAlso: C D\n")
+
+
 class Run(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -153,13 +164,13 @@ class Run(unittest.TestCase):
     def test_send_then_batch_then_skip(self):
         rc, verdict, body = self.main(engage(), "Alice mentioned you in Team. link")
         self.assertEqual((rc, verdict), (0, "sent"))
-        self.assertEqual(body, "Alice mentioned you in Team. link\n")
+        self.assertEqual(body, "Mention notice: Alice mentioned you in Team. link\n")
         rc, verdict, body = self.main(engage(eid="$m2"), "again", "task-2.txt")
         self.assertEqual((verdict, body.strip()), ("batched", "[no-send]"))
         rc, verdict, body = self.main(engage(), "dup", "task-3.txt")
         self.assertEqual((verdict, body.strip()), ("skip: already noted", "[no-send]"))
         rc, verdict, body = self.main(notice(), "Bob is addressing you", "task-4.txt")
-        self.assertEqual((verdict, body.strip()), ("sent", "Bob is addressing you"),
+        self.assertEqual((verdict, body.strip()), ("sent", "Mention notice: Bob is addressing you"),
                          "another room has its own window")
 
     def run_with(self, task_text, note, publisher, now, name="task-1.txt"):
@@ -177,7 +188,7 @@ class Run(unittest.TestCase):
         self.assertEqual(self.state()["publishing"]["$c"]["lines"], ["third", "held"])
         self.assertEqual(self.run_with(engage(eid="$c"), "third", ok, 1701, "task-3.txt"),
                          ("sent", 0), "the retry is not taken for an already-noted message")
-        self.assertEqual(sent[-1], "third\nAlso: held\n")
+        self.assertEqual(sent[-1], "Mention notice: third\nAlso: held\n")
         self.assertEqual(self.state()["publishing"], {})
 
     def test_a_failed_publish_never_retried_rides_the_next_notice(self):
@@ -185,7 +196,7 @@ class Run(unittest.TestCase):
         ok = lambda result, text, extra: sent.append(text) or 0  # noqa: E731
         self.run_with(engage(eid="$a"), "lost", lambda *a: 1, 1000)
         self.run_with(notice(eid="$b"), "next", ok, 1001, "task-2.txt")
-        self.assertEqual(sent, ["next\nAlso: lost\n"])
+        self.assertEqual(sent, ["Mention notice: next\nAlso: lost\n"])
 
     def test_a_crash_mid_publish_is_settled_by_the_result_file_never_replayed_blind(self):
         def crash(result, text, extra):
@@ -197,12 +208,12 @@ class Run(unittest.TestCase):
         sent = []
         ok = lambda result, text, extra: sent.append(text) or 0  # noqa: E731
         self.run_with(notice(eid="$b"), "next", ok, 2000, "task-2.txt")
-        self.assertEqual(sent, ["next\n"], "a published line is not sent again")
+        self.assertEqual(sent, ["Mention notice: next\n"], "a published line is not sent again")
         with self.assertRaises(KeyboardInterrupt):
             self.run_with(engage(eid="$c"), "never written", lambda *a: (_ for _ in ()).throw(
                 KeyboardInterrupt()), 3000, "task-3.txt")
         self.run_with(notice(eid="$d", room="!x:example.org"), "after", ok, 3001, "task-4.txt")
-        self.assertEqual(sent[-1], "after\nAlso: never written\n",
+        self.assertEqual(sent[-1], "Mention notice: after\nAlso: never written\n",
                          "no result file: a definite failure, sent once with the next notice")
 
     def test_an_archived_result_counts_as_published(self):
@@ -219,7 +230,7 @@ class Run(unittest.TestCase):
     def test_unwritable_state_still_sends(self):
         (self.ws / "state").write_text("not a directory", encoding="utf-8")
         rc, verdict, body = self.main(notice(), "Alice is addressing you in Lobby.")
-        self.assertEqual((rc, verdict, body), (0, "sent", "Alice is addressing you in Lobby.\n"))
+        self.assertEqual((rc, verdict, body), (0, "sent", "Mention notice: Alice is addressing you in Lobby.\n"))
 
     def test_cli(self):
         task = self.ws / "tasks" / "task-9.txt"
@@ -230,7 +241,7 @@ class Run(unittest.TestCase):
                               input="Alice is addressing you.", capture_output=True, text=True,
                               env=isolated_child_env(), cwd=str(REPO))
         self.assertEqual((proc.returncode, proc.stdout.strip()), (0, "sent"), proc.stderr)
-        self.assertEqual(result.read_text(), "Alice is addressing you.\n")
+        self.assertEqual(result.read_text(), "Mention notice: Alice is addressing you.\n")
 
 
 if __name__ == "__main__":

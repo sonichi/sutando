@@ -36,8 +36,11 @@ when there is one, wins over this file.
      attributed ("they ask whether..."), never in your own imperative voice.
 2. **Publish it with the script, the only way to write the result.** It dedupes by message,
    holds a room's later mentions for one notice per 10 minutes (sent with the next notice), and
-   quotes the line so a name or excerpt cannot act as a result marker. Never write the result
-   file yourself.
+   quotes the line so a name or excerpt cannot act as a result marker. It also makes the line
+   one line with no control, zero-width or bidi characters, and opens the message with
+   `Mention notice:`: the owner's s.space client shows only a message that opens with it (and
+   its `Also:` lines) as a notice above the message box. Do not write that marker yourself.
+   Never write the result file yourself.
 
    ```bash
    python3 skills/owner-mention/scripts/owner_notice.py publish \

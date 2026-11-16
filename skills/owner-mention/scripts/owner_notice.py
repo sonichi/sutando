@@ -15,7 +15,9 @@ Lines leave state only with a durable result. The lines a notice drains are kept
 `publishing` record until the publisher returns 0. A failure (non-zero) marks it `failed`, and
 its lines go out with this task's retry or, folded in, with the next notice. A record a crash
 left `publishing` is settled, never blindly replayed: the publisher writes atomically, so its
-result at its path (or in the archive) means published, and none means failed. Every line is quoted with `result_markers.neutralize_markers`. When the
+result at its path (or in the archive) means published, and none means failed. Every line is
+made one line with nothing hidden in it, the message opens with `Mention notice:` (what the
+owner's client reads as notices), and it is quoted with `result_markers.neutralize_markers`. When the
 state cannot be written (a read-only turn) the note is sent unbatched rather than lost.
 
 Usage:
@@ -100,9 +102,24 @@ def decide(state: dict, room: str, event: "str | None", note: str, now: float,
     return "sent", lines
 
 
+# The owner's client reads a message as notices only when it opens with this (cinny-webclient
+# #4463); every later notice in it is an "Also:" line.
+MARKER = "Mention notice:"
+# Control, zero-width and bidi characters: a quoted name or excerpt never breaks or reorders a line.
+_HIDDEN = re.compile("[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2028\u2029\u2066-\u2069]")
+_OWN_MARKER = re.compile(r"^\s*mention notice:\s*", re.I)
+
+
+def clean(note: str) -> str:
+    """One line, nothing hidden in it, and no marker of its own: compose() adds that."""
+    return _OWN_MARKER.sub("", " ".join(_HIDDEN.sub(" ", note).split()))
+
+
 def compose(lines: list) -> str:
     head, rest = lines[0], lines[1:]
-    body = head if not rest else head + "\n" + "\n".join(f"Also: {x}" for x in rest)
+    body = f"{MARKER} {head}"
+    if rest:
+        body += "\n" + "\n".join(f"Also: {x}" for x in rest)
     return result_markers.neutralize_markers(body.strip()) + "\n"
 
 
@@ -143,7 +160,7 @@ def run(task_text: str, note: str, result: str, extra: list, *, workspace: Path,
     """(verdict, publisher return code). A drained line stays in a `publishing` record until
     the publisher returns 0; a failed one goes out with this task's retry or the next notice."""
     m = mention_of(task_text)
-    note = " ".join(note.split())
+    note = clean(note)
     room, key = m["room"] or "unknown", m["event"] or f"result:{result}"
     path = _state_path(workspace)
     try:
