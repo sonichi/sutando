@@ -193,7 +193,7 @@ class Cli(Base):
 
     def test_main_resolves_the_workspace_when_not_given(self):
         fake = types.ModuleType("workspace_default")
-        fake.resolve_workspace = lambda: str(self.ws)
+        fake.resolve_workspace = lambda *a, **kw: str(self.ws)
         with mock.patch.dict(sys.modules, {"workspace_default": fake}), \
                 mock.patch.object(route_mod, "route", return_value="local") as r, \
                 contextlib.redirect_stdout(io.StringIO()):
