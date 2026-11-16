@@ -397,6 +397,27 @@ class IsThisHostRouting(Base):
         self._archived_task(now + 1, task_id="task-xyz")
         self.assertIn("task-xyz", sup.routing_status(self.ws)["alarm"] or "", "an unattributed task still is")
 
+    def test_with_no_receipt_lane_delivered_tasks_are_routing_evidence(self):
+        # A host whose bound rooms are all served by worker lanes never writes a receipt.
+        wid = self._bind()
+        self._archived_task(1000.0, task_id="task-lane")
+        sup.pa.record(self.ws, "task-lane", wid)
+        self.assertIsNone(sup.routing_status(self.ws)["alarm"])
+
+    def test_with_no_receipt_an_unattributed_task_beside_lane_ones_is_the_alarm(self):
+        wid = self._bind()
+        self._archived_task(1000.0, task_id="task-lane")
+        sup.pa.record(self.ws, "task-lane", wid)
+        self._archived_task(999.0, task_id="task-xyz")
+        alarm = sup.routing_status(self.ws)["alarm"] or ""
+        self.assertIn("task-xyz", alarm)
+        self.assertIn("processed it unrouted", alarm)
+
+    def test_with_no_receipt_and_only_unattributed_tasks_the_handler_was_never_consulted(self):
+        self._bind()
+        self._archived_task(1000.0, task_id="task-xyz")
+        self.assertIn("never been consulted", sup.routing_status(self.ws)["alarm"] or "")
+
     def test_an_attribution_that_cannot_be_read_counts_as_unrouted(self):
         self._bind()
         sup.prr.record(self.ws, mode="run", task_id="task-abc", now=1000.0)
