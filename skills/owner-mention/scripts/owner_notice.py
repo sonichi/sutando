@@ -14,11 +14,14 @@ server's own link, and only fixed text after it.
 Lines leave state only with a durable result. The lines a notice drains are kept in a
 `publishing` record until the publisher returns 0. A failure (non-zero) marks it `failed`, and
 its lines go out with this task's retry or, folded in, with the next notice. A record a crash
-left `publishing` is settled, never blindly replayed: the publisher writes atomically, so its
-result at its path (or in the archive) means published, and none means failed. Every line is
+left `publishing` is settled, never blindly replayed, through the shared result lifecycle for
+its exact task id: a ready result (live or archived) means published, a disposal claim or
+delivery pin means the outcome is not known yet and the record is kept as it is, and nothing
+means failed. A task whose own result already exists never writes it again. Every line is
 made one line with nothing hidden in it, the message opens with `Mention notice:` (what the
-owner's client reads as notices), and it is quoted with `result_markers.neutralize_markers`. When the
-state cannot be written (a read-only turn) the note is sent unbatched rather than lost.
+owner's client reads as notices), and it is quoted with `result_markers.neutralize_markers`.
+When the state cannot be read or written before the publish (a read-only turn) the note is
+sent unbatched rather than lost; once the publisher has run, a state error is only reported.
 
 Usage:
   owner_notice.py publish --task-file <task> <result path> [--window-min N] [--workspace DIR]
@@ -27,6 +30,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -40,6 +44,8 @@ REPO = Path(__file__).resolve().parents[3]  # lint-workspace-resolution: allow-r
 if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
 import file_lock, local_task_protocol, result_markers  # noqa: E401,E402
+from delivery import disposal  # noqa: E402
+from delivery.task_dispatch import find_ready_result  # noqa: E402
 
 PUBLISHER = REPO / "src" / "result_publish.py"
 SKIP_BODY = "[no-send]"
@@ -123,13 +129,16 @@ def compose(lines: list) -> str:
     return result_markers.neutralize_markers(body.strip()) + "\n"
 
 
-def published(result: str) -> bool:
-    """Whether `result` was written: still at its path, or already moved to the archive."""
+def published(result: str) -> "bool | None":
+    """Whether `result` was published: True for a ready result of its exact task id (live or
+    archived), None while a disposal claim or delivery pin holds it, else False."""
     path = Path(result)
-    if path.exists():
+    results, stem = path.parent, path.stem
+    if find_ready_result(results, stem) is not None:
         return True
-    archive = path.parent / "archive"
-    return archive.is_dir() and any(archive.rglob(f"{path.stem}*"))
+    if disposal.find_claims(results, stem) or os.path.lexists(disposal.pin_path(results, stem)):
+        return None
+    return False
 
 
 def publish(result: str, text: str, extra: list) -> int:
@@ -145,13 +154,14 @@ def _workspace(arg: "str | None") -> Path:
 
 
 def _settle(inflight: dict) -> None:
-    """A record left `publishing` by a crash: the publisher writes atomically, so its result is
-    either at its path (or archived), published, or nowhere, a definite failure."""
+    """A record left `publishing` by a crash: published, dropped; unknown, kept as it is;
+    nothing at all, a definite failure."""
     for key, record in list(inflight.items()):
         if record.get("status") == "publishing":
-            if published(record.get("result", "")):
+            outcome = published(record.get("result", ""))
+            if outcome:
                 del inflight[key]
-            else:
+            elif outcome is False:
                 record["status"] = "failed"
 
 
@@ -163,35 +173,45 @@ def run(task_text: str, note: str, result: str, extra: list, *, workspace: Path,
     note = clean(note)
     room, key = m["room"] or "unknown", m["event"] or f"result:{result}"
     path = _state_path(workspace)
-    try:
-        with file_lock.locked_file(path.with_suffix(".lock"), create_mode=0o600):
+    with contextlib.ExitStack() as held:
+        try:
+            held.enter_context(file_lock.locked_file(path.with_suffix(".lock"), create_mode=0o600))
             state = _read(path)
             inflight = state.setdefault("publishing", {})
             _settle(inflight)
+            if published(result) is not False:
+                # This task's result is already out (a crashed retry): never overwrite it.
+                _write(path, state)
+                return "skip: already published", 0
             retry = inflight.pop(key, None)
             if retry is not None:
-                lines = retry["lines"]
+                lines, verdict = retry["lines"], "sent"
             else:
                 verdict, lines = decide(state, room, m["event"], note, now, window_s)
-                if verdict != "sent":
-                    _write(path, state)
-                    rc = publisher(result, SKIP_BODY + "\n", extra)
-                    return ("skip: already noted" if verdict == "skip" else "batched"), rc
-            for other in [k for k, r in inflight.items() if r.get("status") == "failed"]:
-                lines = lines + inflight.pop(other)["lines"]
-            inflight[key] = {"status": "publishing", "result": result, "lines": lines}
+            if verdict == "sent":
+                for other in [k for k, r in inflight.items() if r.get("status") == "failed"]:
+                    lines = lines + inflight.pop(other)["lines"]
+                inflight[key] = {"status": "publishing", "result": result, "lines": lines}
             _write(path, state)
-            rc = publisher(result, compose(lines), extra)
-            if rc == 0:
-                del inflight[key]
-            else:
-                inflight[key]["status"] = "failed"
+        except OSError as e:
+            print(f"owner_notice: state unwritable ({type(e).__name__}); sending unbatched",
+                  file=sys.stderr)
+            return "sent", publisher(result, compose([note]), extra)
+        if verdict != "sent":
+            rc = publisher(result, SKIP_BODY + "\n", extra)
+            return ("skip: already noted" if verdict == "skip" else "batched"), rc
+        rc = publisher(result, compose(lines), extra)
+        if rc == 0:
+            del inflight[key]
+        else:
+            inflight[key]["status"] = "failed"
+        try:
             _write(path, state)
-            return "sent", rc
-    except OSError as e:
-        print(f"owner_notice: state unwritable ({type(e).__name__}); sending unbatched",
-              file=sys.stderr)
-        return "sent", publisher(result, compose([note]), extra)
+        except OSError as e:
+            # The record stays `publishing` on disk; the next run settles it from the result.
+            print(f"owner_notice: published, state not recorded ({type(e).__name__})",
+                  file=sys.stderr)
+        return "sent", rc
 
 
 def main(argv: "list[str] | None" = None) -> int:

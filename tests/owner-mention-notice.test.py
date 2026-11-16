@@ -231,6 +231,74 @@ class Run(unittest.TestCase):
         self.assertTrue(on.published(str(self.ws / "results" / "task-9.txt")))
         self.assertFalse(on.published(str(self.ws / "results" / "task-8.txt")))
 
+    def test_a_longer_id_or_a_directory_is_not_this_tasks_result(self):
+        archived = self.ws / "results" / "archive"
+        archived.mkdir()
+        (archived / "task-123.txt").write_text("x")
+        (self.ws / "results" / "task-7.txt").mkdir()
+        self.assertFalse(on.published(str(self.ws / "results" / "task-12.txt")))
+        self.assertFalse(on.published(str(self.ws / "results" / "task-7.txt")))
+
+    def test_a_claim_or_pin_mid_retirement_keeps_the_record_unsettled(self):
+        results = self.ws / "results"
+        claim = results / (".task-5.disposing-1-1-1-1-1-" + "0" * 64 + "-ab")
+        claim.write_text("published")
+        pin = results / ".delivering" / "task-6.pin"
+        pin.parent.mkdir()
+        pin.write_text("published")
+        for name in ("task-5.txt", "task-6.txt"):
+            self.assertIsNone(on.published(str(results / name)))
+        inflight = {"$a": {"status": "publishing", "result": str(results / "task-5.txt"),
+                           "lines": ["went out"]}}
+        on._settle(inflight)
+        self.assertEqual(inflight["$a"]["status"], "publishing")
+        sent = []
+        ok = lambda result, text, extra: sent.append(text) or 0  # noqa: E731
+        self.run_with(engage(eid="$a"), "went out", lambda r, t, e: 1, 1000, "task-5.txt")
+        self.run_with(notice(eid="$b"), "next", ok, 2000, "task-2.txt")
+        self.assertEqual(sent, ["Mention notice: next\n"], "an unknown outcome is not folded")
+
+    def test_a_same_task_retry_after_a_crash_keeps_the_published_result(self):
+        def crash(result, text, extra):
+            Path(result).write_text(text)
+            raise KeyboardInterrupt
+        ok = lambda result, text, extra: 0  # noqa: E731
+        self.run_with(engage(eid="$a"), "first", ok, 1000)
+        self.run_with(engage(eid="$b"), "held", ok, 1100, "task-2.txt")
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_with(engage(eid="$c"), "third", crash, 1700, "task-3.txt")
+        result = self.ws / "results" / "task-3.txt"
+        self.assertEqual(self.run_with(engage(eid="$c"), "third", ok, 1701, "task-3.txt"),
+                         ("skip: already published", 0))
+        self.assertEqual(result.read_text(), "Mention notice: third\nAlso: held\n")
+        self.assertEqual(self.state()["publishing"], {})
+
+    def test_a_state_write_error_after_publish_never_publishes_again(self):
+        sent = []
+        ok = lambda result, text, extra: sent.append(text) or 0  # noqa: E731
+        self.run_with(engage(eid="$a"), "first", ok, 1000)
+        self.run_with(engage(eid="$b"), "held", ok, 1100, "task-2.txt")
+        real, calls = on._write, []
+
+        def flaky(path, data):
+            calls.append(path)
+            if len(calls) == 2:
+                raise OSError("disk full")
+            real(path, data)
+        on._write = flaky
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                verdict = self.run_with(engage(eid="$c"), "third", ok, 1700, "task-3.txt")
+        finally:
+            on._write = real
+        self.assertEqual(verdict, ("sent", 0))
+        self.assertEqual(sent[2:], ["Mention notice: third\nAlso: held\n"], "published once")
+        self.assertIn("state not recorded", err.getvalue())
+        Path(self.ws / "results" / "task-3.txt").write_text(sent[-1])
+        self.run_with(notice(eid="$d"), "next", ok, 2000, "task-4.txt")
+        self.assertEqual(sent[-1], "Mention notice: next\n", "the published batch is settled")
+
     def test_an_empty_note_publishes_nothing(self):
         rc, _verdict, body = self.main(notice(), "  \n")
         self.assertEqual((rc, body), (2, None))
