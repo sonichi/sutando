@@ -112,8 +112,15 @@ if [ -f "$_EVICT_HELPER" ]; then
   fi
   # Same script path serves every gateway instance in this checkout, so scope by
   # GATEWAY_INSTANCE too — unset here means the primary/prod gateway.
-  EVICT_PROVEN_PID="$_EVICT_PROVEN" EVICT_WAIT_S=15 \
-    evict_own_bridge "remote-gateway" "$REPO" "GATEWAY_INSTANCE" "${GATEWAY_INSTANCE:-}"
+  _EVICT_RC=0
+  EVICT_PROVEN_PID="$_EVICT_PROVEN" EVICT_WAIT_S="${SUTANDO_GATEWAY_EVICT_WAIT_S:-15}" \
+    evict_own_bridge "remote-gateway" "$REPO" "GATEWAY_INSTANCE" "${GATEWAY_INSTANCE:-}" || _EVICT_RC=$?
+  # A child beside a surviving straggler would stand down (rc 75) and end the job; exit
+  # non-zero instead so launchd (KeepAlive SuccessfulExit=false) retries the eviction.
+  if [ "$_EVICT_RC" -ne 0 ]; then
+    echo "[gateway-bridge-wrapper] eviction did not complete (rc $_EVICT_RC); not launching, exiting non-zero so launchd retries" >&2
+    exit "$_EVICT_RC"
+  fi
   sleep 0.3
 fi
 

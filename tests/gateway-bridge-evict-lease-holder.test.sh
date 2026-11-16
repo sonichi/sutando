@@ -53,6 +53,51 @@ sleep 0.6
 EVICT_PROVEN_PID="$SLOW" EVICT_WAIT_S=10 evict_own_bridge "$CH" "$TMP/slow" GATEWAY_INSTANCE "" 2>/dev/null
 assert_dead "evict_own_bridge returns only after the evicted pid exited" "$SLOW"
 
+echo "### a killed pid still alive at the deadline"
+# Ignores SIGTERM, so it outlives any wait; a successor launched beside it would stand down.
+mkdir -p "$TMP/stuck/src"
+printf 'import signal,time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(120)\n' \
+  > "$TMP/stuck/src/$CH-bridge.py"
+( exec "$PY" "$TMP/stuck/src/$CH-bridge.py" ) & STUCK=$!
+sleep 0.6
+EVICT_PROVEN_PID="$STUCK" EVICT_WAIT_S=1 evict_own_bridge "$CH" "$TMP/stuck" GATEWAY_INSTANCE "" 2>/dev/null; rc=$?
+if [ "$rc" = 4 ]; then echo "  ok   deadline exceeded: rc 4 (still running)"
+else echo "  FAIL deadline exceeded: rc=$rc want 4"; FAILED=1; fi
+assert_alive "no SIGKILL escalation: the straggler is left running" "$STUCK"
+EVICT_PROVEN_PID="$STUCK" evict_own_bridge "$CH" "$TMP/stuck" GATEWAY_INSTANCE "" 2>/dev/null; rc=$?
+if [ "$rc" = 0 ]; then echo "  ok   no EVICT_WAIT_S: rc 0 as before"
+else echo "  FAIL no EVICT_WAIT_S: rc=$rc want 0"; FAILED=1; fi
+kill -KILL "$STUCK" 2>/dev/null; wait "$STUCK" 2>/dev/null
+
+echo "### the wrapper does not launch beside a straggler it could not evict"
+# The straggler and the wrapper's child share the bridge script; STRAGGLER picks the role.
+W="$TMP/wrap"; mkdir -p "$W/src/launchd" "$W/scripts" "$W/ws" "$W/shims"
+W="$(cd "$W" && pwd -P)"
+cp "$REPO_ROOT/src/launchd/gateway-bridge-wrapper.sh" "$REPO_ROOT/src/launchd/evict-own-bridge.sh" "$W/src/launchd/"
+printf 'import os,signal,sys,time\nif os.environ.get("STRAGGLER"):\n    signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)\nopen("%s/launched","w").close(); sys.exit(75)\n' \
+  "$W" > "$W/src/remote-gateway-bridge.py"
+printf 'import time\nwhile True: time.sleep(0.2)\n' > "$W/src/sparrowd.py"
+printf '#!/bin/bash\ncase "${1:-}" in workspace) echo "%s/ws" ;; *) echo "%s/none.env" ;; esac\n' "$W" "$W" \
+  > "$W/scripts/sutando-config.sh"
+printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$W/shims/python3"
+chmod +x "$W/scripts/sutando-config.sh" "$W/shims/python3"
+( cd "$W" && exec env STRAGGLER=1 "$PY" "$W/src/remote-gateway-bridge.py" ) & STRAY=$!
+sleep 0.6
+# connections.py: bridge-pid proves the straggler; every other verb reports "no".
+printf 'import sys\nif "bridge-pid" in sys.argv: print(%s); sys.exit(0)\nsys.exit(1)\n' "$STRAY" > "$W/scripts/connections.py"
+( cd "$W" && exec env -u AG2_REMOTE_TOKEN -u GATEWAY_INSTANCE PATH="$W/shims:$PATH" REMOTE_TASK_TOKEN=t \
+    SUTANDO_GATEWAY_EVICT_WAIT_S=1 SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY=1 \
+    bash src/launchd/gateway-bridge-wrapper.sh > "$W/o.log" 2>&1 ) & WRAP=$!
+for _ in $(seq 1 300); do kill -0 "$WRAP" 2>/dev/null || break; sleep 0.1; done
+if kill -0 "$WRAP" 2>/dev/null; then kill -TERM "$WRAP" 2>/dev/null; wrc="still running"; fi
+wait "$WRAP" 2>/dev/null; wrc="${wrc:-$?}"
+if [ "$wrc" != "still running" ] && [ "$wrc" != 0 ]; then echo "  ok   wrapper exits non-zero (rc $wrc) so launchd retries"
+else echo "  FAIL wrapper exit: rc=$wrc want non-zero"; FAILED=1; fi
+if [ -e "$W/launched" ]; then echo "  FAIL wrapper launched its child beside the straggler"; FAILED=1
+else echo "  ok   no child launched beside the straggler"; fi
+assert_alive "wrapper did not SIGKILL the straggler" "$STRAY"
+kill -KILL "$STRAY" 2>/dev/null; wait "$STRAY" 2>/dev/null
+
 echo "### connections.py bridge-pid"
 WS="$TMP/ws"; mkdir -p "$WS/state"
 out="$("$PY" "$REPO_ROOT/scripts/connections.py" --workspace "$WS" bridge-pid)"; rc=$?
