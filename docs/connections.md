@@ -594,15 +594,15 @@ lane stages the task file, runs the core's declared task-event handler (the pool
 `state/task-event-handler.json`) on the staged copy with `--from-lane --payload <staged>`, and only
 then publishes it to `tasks/`. The router writes the delivery sentinel and the attribution in
 `deliveries/<worker>/` under its own locks, so the task is already held when it appears, and the
-core's watcher never routes or announces a task a worker holds. A task its worker already held when
-served again (an earlier serve's lane died between the router and the publish) gets its sentinel
-replaced once published (`--renotify`), so a worker's watcher that gave up on the bare pointer is
-told. The payload stays in `tasks/`, where the worker's resolver, `task_disposition.py`, archiving
-and the bridges read it. A worker off the roster or retired, a picker command, a router that fails
-or takes longer than 10 s, or no handler declared: nothing is held, the task is published as before
-and the core's watcher routes it. A lane started from inside a session (`connections.py start` from
-a worker's shell) carries none of that session's variables (`connections.SESSION_ENV`), so it runs
-as the lane keeper's launch would.
+core's watcher never routes or announces a task a worker holds. Once the task is published, the lane
+runs the router again with `--renotify`, which replaces a still-pending sentinel, so a worker's
+watcher that gave up on the bare pointer (a slow or killed router, or a lane that died and the task
+was served again) is told. The payload stays in `tasks/`, where the worker's resolver,
+`task_disposition.py`, archiving and the bridges read it. A worker off the roster or retired, a
+picker command, a router that fails or takes longer than 10 s, or no handler declared: nothing is
+held, the task is published as before and the core's watcher routes it. A lane started from inside a
+session (`connections.py start` from a worker's shell) carries none of that session's variables
+(`connections.SESSION_ENV`), so it runs as the lane keeper's launch would.
 
 A worker's row has no channel env file: its token is in the vault alone, so
 `channel-env.sh <its lane>` exits 1 saying so, and room clients resolve it by room.

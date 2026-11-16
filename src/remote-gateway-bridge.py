@@ -542,8 +542,6 @@ def _lane_router(worker: str, argv: "list[str]"):
     the worker's when it appears and the core's watcher, which never routes a held task, leaves it."""
     import subprocess
 
-    from delivery.task_dispatch import WorkerHoldUnreadable, worker_holds
-
     def run(tid: str, args: "list[str]", step: str) -> "int | None":
         try:
             return subprocess.run(argv + args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -553,19 +551,14 @@ def _lane_router(worker: str, argv: "list[str]"):
             return None
 
     def route(tid: str, staged: Path, dest: Path):
-        # Held already: an earlier serve's sentinel, whose watcher may have given up on its absent payload.
-        try:
-            held = worker_holds(WS / "deliveries", dest.name)
-        except WorkerHoldUnreadable:
-            held = True
         rc = run(tid, ["--task-file", str(dest), "--payload", str(staged)], "routing")
-        if rc is None:
-            return None
-        if rc != 0:
+        if rc is not None and rc != 0:
             _log(f"lane for worker {worker}: {tid} not delivered to it (router exit {rc}); "  # noqa: F821
                  "the core's watcher routes it")
             return None
-        return (lambda: run(tid, ["--task-file", str(dest), "--renotify"], "re-raising")) if held else None
+        # The worker's watcher may have given up on the sentinel before the payload appeared (a slow or
+        # killed router, or an earlier serve's): once published, its pending sentinel is raised afresh.
+        return lambda: run(tid, ["--task-file", str(dest), "--renotify"], "re-raising")
     return route
 
 

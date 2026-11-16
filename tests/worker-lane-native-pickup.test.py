@@ -9,8 +9,8 @@
   (and skips it); the payload is where every reader resolves it; no watcher receipt.
 - A worker off the roster or retired gets nothing from its lane: the task is published unheld and
   the core's watcher routes it. A router that fails or hangs never holds the task back.
-- A lane that died between the router and the publish: when the task is served again, its sentinel is
-  replaced after the publish, so the worker's watcher, which gave up on the bare pointer, is told.
+- After every publish the lane re-raises the worker's sentinel, so a worker's watcher that gave up on the
+  bare pointer (a slow first serve, or a lane that died and the task was served again) is told.
 
 Run: python3 tests/worker-lane-native-pickup.test.py
 """
@@ -166,9 +166,23 @@ class OneQueuedTask(Base):
         self.assertEqual(rc, 0, "a watcher pass that runs anyway finds it committed")
         self.assertEqual(self.sentinels(W), [f"{tid}.txt"], "and delivers nothing twice")
 
-    def test_a_fresh_delivery_is_not_re_raised(self):
-        _, seen = self.publish("task-lane-8", W)
-        self.assertIsNone(seen["after"], "the router's own new sentinel already raised its event")
+    def test_a_fresh_delivery_is_re_raised_once_published(self):
+        tid = "task-lane-8"
+        sentinel = self.ws / "deliveries" / W / f"{tid}.txt"
+        inodes = []
+        self.declare_handler()
+        self.rgb._install_worker_lane(W)
+        hook = self.rgb.TASK_PRE_PUBLISH
+
+        def watching(t, s, d):
+            after = hook(t, s, d)
+            inodes.append(sentinel.stat().st_ino)
+            return after
+        self.rgb.TASK_PRE_PUBLISH = watching
+        staged, dest = self.stage(tid, W)
+        self.assertTrue(self.rgb._publish_task(tid, staged, dest))
+        self.assertNotEqual(sentinel.stat().st_ino, inodes[0], "a watcher that gave up in the gap sees it again")
+        self.assertEqual(self.sentinels(W), [f"{tid}.txt"])
 
     def test_a_task_its_worker_already_held_is_re_raised_once_published(self):
         # An earlier serve's lane wrote the sentinel and died before publishing: its watcher gave up.
@@ -187,17 +201,15 @@ class OneQueuedTask(Base):
         self.assertEqual(sorted(p.name for p in sentinel.parent.iterdir() if p.name.endswith(".renew")), [])
         self.assertEqual(resolve_inbox_entry.resolve(str(sentinel), self.ws), payload)
 
-    def test_a_held_check_that_cannot_decide_re_raises(self):
+    def test_a_router_that_hung_after_committing_is_still_followed_by_a_re_raise(self):
         import subprocess
         from unittest import mock
-        import delivery.task_dispatch as td
-        ok = subprocess.CompletedProcess([], 0)
-        with mock.patch.object(td, "worker_holds", side_effect=WorkerHoldUnreadable("eio")):
-            route = self.rgb._lane_router(W, ["router"])
+        route = self.rgb._lane_router(W, ["router"])
         staged, dest = self.stage("task-lane-10", W)
-        with mock.patch.object(subprocess, "run", side_effect=[ok, OSError("gone")]) as run:
+        with mock.patch.object(subprocess, "run", side_effect=[subprocess.TimeoutExpired("router", 10),
+                                                               OSError("gone")]) as run:
             after = route("task-lane-10", staged, dest)
-            self.assertIsNotNone(after, "re-raising is harmless; a missed one leaves the worker untold")
+            self.assertIsNotNone(after, "a router killed at the bound may have committed")
             after()
         self.assertEqual(run.call_args.args[0], ["router", "--task-file", str(dest), "--renotify"])
         self.assertTrue(any("re-raising task-lane-10 failed" in line for line in self.logged), self.logged)
@@ -297,6 +309,16 @@ class TheRouterOnAStagedCopy(Base):
         applied.assert_not_called()
         self.assertEqual(self.sentinels(W), [])
 
+    def test_a_lanes_re_raise_never_applies_a_picker_command(self):
+        from unittest import mock
+        staged, dest = self.stage("task-staged-5", W, "worker-picker")
+        dest.write_text(staged.read_text())
+        with mock.patch.object(handler, "apply_picker") as applied:
+            rc = handler.guarded_main(["--task-file", str(dest), "--workspace", str(self.ws), "--from-lane",
+                                       "--renotify"])
+        self.assertEqual(rc, handler.DECLINE)
+        applied.assert_not_called()
+
     def test_an_accepted_sentinel_is_never_re_raised(self):
         import pool_router
         tid = "task-staged-4"
@@ -314,19 +336,18 @@ class TheRouterOnAStagedCopy(Base):
         self.assertEqual(self.sentinels(W), [])
 
 
-class ALaneThatDiedBeforePublishing(Base):
-    """The lane committed the task to its worker and died before publishing it. The worker's watcher
-    gave up on the pointer, and its catch-up pass never revisits an entry it has passed; when the task
-    is served again, the lane re-raises the sentinel after publishing, and the worker is told."""
+class ASentinelLongBeforeItsPayload(Base):
+    """The worker's watcher gives up on a sentinel whose payload is not there, and its catch-up pass never
+    revisits an entry it has passed. The lane re-raises the sentinel after every publish, so the worker is
+    told: whether the gap was a slow first serve or a lane that died and the task was served again."""
 
-    def test_the_worker_is_told_once_the_task_is_published(self):
+    def start_worker_watcher(self):
         import os
         import subprocess
         sys.path.insert(0, str(ROOT / "tests" / "fixtures"))
         sys.path.insert(0, str(ROOT / "tests"))
         from clean_watcher_env import clean_env
         from _helpers.process_group import popen_bound
-        tid = "task-died-1"
         inbox = self.ws / "deliveries" / W
         inbox.mkdir()
         feed = self.ws / "feed"
@@ -370,14 +391,37 @@ class ALaneThatDiedBeforePublishing(Base):
         self.addCleanup(stop)
         self.declare_handler()
         self.rgb._install_worker_lane(W)
-        staged, dest = self.stage(tid, W)
-        self.assertIsNone(self.rgb.TASK_PRE_PUBLISH(tid, staged, dest))   # routed; the lane dies here
-        staged.unlink()
+        return inbox, feed, out, wait_for
+
+    def gave_up(self, tid, inbox, feed, out, wait_for):
         with feed.open("a") as f:
             f.write(f"{inbox / (tid + '.txt')}\n")
         self.assertTrue(wait_for(lambda o, e: "did not resolve" in e and f"{tid}.txt" in e), "the watcher gave up")
         time.sleep(2.5)   # past a catch-up pass, which skips the entry as already passed
         self.assertNotIn(tid, out[0].decode())
+
+    def test_a_slow_first_serve(self):
+        tid = "task-slow-1"
+        inbox, feed, out, wait_for = self.start_worker_watcher()
+        hook = self.rgb.TASK_PRE_PUBLISH
+
+        def slow(t, s, d):
+            after = hook(t, s, d)
+            self.gave_up(tid, inbox, feed, out, wait_for)
+            return after
+        self.rgb.TASK_PRE_PUBLISH = slow
+        staged, dest = self.stage(tid, W)
+        self.assertTrue(self.rgb._publish_task(tid, staged, dest))
+        self.assertTrue(wait_for(lambda o, e: f"/tasks/{tid}.txt" in o and "TASK_FILE:" in o),
+                        "the worker is told of its task")
+
+    def test_a_lane_that_died_before_publishing(self):
+        tid = "task-died-1"
+        inbox, feed, out, wait_for = self.start_worker_watcher()
+        staged, dest = self.stage(tid, W)
+        self.assertIsNotNone(self.rgb.TASK_PRE_PUBLISH(tid, staged, dest))   # routed; the lane dies here
+        staged.unlink()
+        self.gave_up(tid, inbox, feed, out, wait_for)
         staged, dest = self.stage(tid, W)
         self.assertTrue(self.rgb._publish_task(tid, staged, dest))
         self.assertTrue(wait_for(lambda o, e: f"/tasks/{tid}.txt" in o and "TASK_FILE:" in o),

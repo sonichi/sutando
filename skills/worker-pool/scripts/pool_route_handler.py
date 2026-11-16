@@ -166,7 +166,7 @@ def main(argv=None) -> int:
     p.add_argument("--from-lane", action="store_true")
     # The lane's staged copy of `--task-file`, routed before it is published there.
     p.add_argument("--payload", default=None)
-    # The lane again, after publishing a task its worker already held: re-raise that worker's sentinel.
+    # The lane again, once the task is published: re-raise its worker's pending sentinel.
     p.add_argument("--renotify", action="store_true")
     for ignored in ("--runtime", "--repo"):
         p.add_argument(ignored, default=None)
@@ -186,8 +186,8 @@ def main(argv=None) -> int:
         # an escape here routes a BOUND task to the unrestricted live core.
         print(f"pool_route_handler: advertisement not ensured: {e!r}", file=sys.stderr)
     task = read_task(args.task_file, args.payload)
-    # A picker command is the core's to apply, from the published file.
-    if PICKER_WIRE in (task.get("wire_source"), task.get("source")) and not args.payload:
+    # A picker command is the core's to apply, from the published file, never a lane's.
+    if PICKER_WIRE in (task.get("wire_source"), task.get("source")) and not (args.payload or args.renotify):
         apply_picker(ws, args.task_file, args.results_dir)
     code, targets, roster = classify(ws, task)
     stem = Path(args.task_file).stem
