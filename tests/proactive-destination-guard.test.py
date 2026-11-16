@@ -92,6 +92,14 @@ def main() -> int:
           and guard.redirect_destination("x\n[channel: C123]") is None
           and guard.redirect_destination("[dm-only]\n[channel: C123]\nx") is None)
 
+    name = guard.attachment_notice_name
+    check("an attachment notice names the full path only for the owner",
+          name("/Users/someone/x/report.png", "owner") == "/Users/someone/x/report.png"
+          and name("/Users/someone/x/report.png", "team") == "report.png"
+          and name("C:\\Users\\someone\\report.png", "guest") == "report.png"
+          and name("/tmp/run/out.log", None) == "out.log"
+          and name("", "other") == "(unnamed file)")
+
     print()
     if FAILURES:
         print(f"FAIL — {len(FAILURES)} check(s)")

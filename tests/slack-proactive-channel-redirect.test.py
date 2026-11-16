@@ -190,6 +190,31 @@ def main() -> int:
           [(p.get("channel"), p.get("text")) for p in posts] == [("C0SHARED", NOTICE)],
           repr(posts))
 
+    # Attachment notices are generated after the guard, by the sender itself.
+    private = Path(tempfile.mkdtemp(prefix="slack-redirect-private-")) / "report.png"
+    private.write_bytes(b"png")
+    missing = "/Users/someone/private/missing.png"
+    uploads: list = []
+    real_sendable, real_send_file = bridge._is_path_sendable, bridge._send_file
+    bridge._is_path_sendable = lambda p: p.endswith("public.png")
+    bridge._send_file = lambda ch, ts, p: uploads.append((ch, p)) or True
+    try:
+        posts = deliver("proactive-notice-other.txt",
+                        f"[channel: D0STRANGER]\nweekly summary\n[attach: {private}]\n[attach: {missing}]\n")
+        texts = [p.get("text", "") for p in posts]
+        check("a redirected body's denied / missing notices name no local path",
+              "(file access denied: report.png)" in texts and "(file not found: missing.png)" in texts
+              and not any(str(private.parent) in t or "/Users/" in t for t in texts), repr(texts))
+        posts = deliver("proactive-notice-owner.txt", f"weekly summary\n[attach: {missing}]\n")
+        check("the owner DM still gets the full path in its notice",
+              f"(file not found: {missing})" in [p.get("text") for p in posts], repr(posts))
+        public = str(private.parent / "public.png")
+        deliver("proactive-notice-public.txt", f"[channel: D0STRANGER]\nchart\n[attach: {public}]\n")
+        check("an allowlisted attachment to a non-owner destination is still uploaded",
+              ("D0STRANGER", public) in uploads, repr(uploads))
+    finally:
+        bridge._is_path_sendable, bridge._send_file = real_sendable, real_send_file
+
     src = (REPO / "src" / "slack-bridge.py").read_text()
     check("the bridge delegates to the shared guard, not a copy",
           "guard_proactive_for_destination(" in src and "_INTERNAL_ERROR_RE" not in src)

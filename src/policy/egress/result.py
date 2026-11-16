@@ -1298,6 +1298,15 @@ def guard_result_for_tier(body: str, tier, repo: Path, secret_filter=None,
     return verdict.body, verdict.reason
 
 
+def attachment_notice_name(path, tier) -> str:
+    """What a transport's attachment notice (denied, not found) may name for a reader at `tier`:
+    the path for the owner, only its file name for anyone else, so no local path reaches them."""
+    path = str(path or "")
+    if not is_guarded_tier(tier):
+        return path
+    return os.path.basename(path.rstrip("/\\").replace("\\", "/")) or "(unnamed file)"
+
+
 def redirect_destination(body: str) -> "str | None":
     """The `[channel:]` target the shared parser executes for this body, or None."""
     return next((a.value for a in parse_markers(body or "").actions if a.kind == "redirect"), None)

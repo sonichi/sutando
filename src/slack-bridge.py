@@ -99,8 +99,8 @@ from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import fresh_reask_id, plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 from policy.egress.unfurl import should_unfurl  # noqa: E402
-from policy.egress.result import (guard_proactive_for_destination, guard_result_for_tier,  # noqa: E402
-                                  redirect_destination, resolve_route_tier)
+from policy.egress.result import (attachment_notice_name, guard_proactive_for_destination,  # noqa: E402
+                                  guard_result_for_tier, redirect_destination, resolve_route_tier)
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
@@ -1691,7 +1691,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
             try:
                 app.client.chat_postMessage(
                     channel=channel,
-                    text=f"(file access denied: {fpath})",
+                    text=f"(file access denied: {attachment_notice_name(fpath, access_tier)})",
                     **({"thread_ts": thread_ts} if thread_ts else {}),
                 )
                 _parts_visible += 1
@@ -1706,7 +1706,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
             try:
                 app.client.chat_postMessage(
                     channel=channel,
-                    text=f"(file not found: {fpath})",
+                    text=f"(file not found: {attachment_notice_name(fpath, access_tier)})",
                     **({"thread_ts": thread_ts} if thread_ts else {}),
                 )
                 _parts_visible += 1
