@@ -34,27 +34,31 @@ Each run has one record, keyed by (schedule id, slot) from the briefing (else `a
 else the task id), under `<workspace>/state/schedule/claims/`. Its states are
 `claimed` -> `waiting_approval` -> `claimed` -> `done`, plus `needs_reconcile`. Every change
 holds a per-key lock, so concurrent fires of one slot get exactly one `run`. That claim's run id
-is the only handle on the run: `wait`, `resume`, `done` and `release` refuse any other.
+and current attempt are the only handle on the run: `wait`, `resume`, `done` and `release`
+refuse any other, and `resume` starts a new attempt, so a late call from an earlier attempt is
+refused.
 
 Before anything else, run, with `S=skills/schedule/scripts/claim_run.py`:
 
-1. `python3 $S sweep`. Each `needs-reconcile <key> <run id>` line it prints is a run claimed
-   over an hour ago whose result the outbox does not report CONFIRMED (not delivered, outcome
-   unknown, or never published). Its side effect may or may not have happened. Ask your owner
-   what to do with `python3 scripts/ask-owner.py`, naming the key and run id. Never re-run it
-   yourself. The owner's answer closes it: `python3 $S done --key <key> --run-id <run id>` (it
-   happened) or `python3 $S release --key <key> --run-id <run id>` (run it again; the next fire
-   of that slot then claims it fresh).
+1. `python3 $S sweep`. Each `needs-reconcile <key> <run id> <attempt>` line it prints is a run
+   claimed over an hour ago whose current attempt's result the outbox does not report
+   CONFIRMED (not delivered, outcome unknown, or never published). Its side effect may or may
+   not have happened. Ask your owner what to do with `python3 scripts/ask-owner.py`, naming the
+   key, run id and attempt. Never re-run it yourself. The owner's answer closes it with
+   `--key <key> --run-id <run id> --attempt <attempt>`: `python3 $S done ...` (it happened) or
+   `python3 $S release ...` (run it again; the next fire of that slot then claims it fresh).
 2. `python3 $S claim --task-file <task file>`:
-   - `run <key> <run id>` (exit 0): go on, keeping the key and run id.
+   - `run <key> <run id> <attempt>` (exit 0): go on, keeping all three.
    - `skip: ...` (exit 3): write `[no-send]` as the result and stop. The run is in progress,
      waiting on your owner, or done. A redelivered fire never takes over a waiting run.
-   - `needs-reconcile <key> <run id>` (exit 4): this fire found its own slot stale. Ask your
-     owner as in step 1 and write `[no-send]`.
+   - `needs-reconcile <key> <run id> <attempt> ...` (exit 4): this fire found its own slot
+     stale. Ask your owner as in step 1 and write `[no-send]`.
 
 This is at most once, with reconciliation, not exactly once. A run is never started twice by
-itself. Whether a stale run's result went out is read from the outbox's own outcome; only
-CONFIRMED settles it to `done`, and an uncertain one is reported to your owner, never replayed.
+itself. Whether a stale run's result went out is read from the outbox's own item for the
+current attempt's task (under the gateway's broker id), never from an earlier attempt's waiting
+notice. Only CONFIRMED settles it to `done`; an uncertain one is reported to your owner, never
+replayed.
 
 ## Steps
 
@@ -62,17 +66,19 @@ CONFIRMED settles it to `done`, and an uncertain one is reported to your owner, 
    What only your owner may approve (sending mail, spending money, deleting, changing access,
    sharing your owner's private data) still needs that approval: a schedule is not a standing
    approval unless your owner gave one. To ask, run
-   `python3 $S wait --key <key> --run-id <run id>`, then `python3 scripts/ask-owner.py` with the
-   key and run id in `--context`. Say in the room that the run is waiting on your owner, and
-   stop without `done`. When the approval click arrives, run
-   `python3 $S resume --key <key> --run-id <run id>` with the ids from that question and finish
-   the run from there. A refused `resume` means the run is no longer waiting: do nothing more.
+   `python3 $S wait --key <key> --run-id <run id> --attempt <attempt>`, then
+   `python3 scripts/ask-owner.py` with the key, run id and attempt in `--context`. Say in the
+   room that the run is waiting on your owner, and stop without `done`. When the approval click
+   arrives, run `python3 $S resume --key <key> --run-id <run id> --attempt <attempt>
+   --task-file <the click's task file>` with the ids from that question. It prints the new
+   attempt; finish the run from there, and that task's result is the run's outcome. A refused
+   `resume` means the run is no longer waiting: do nothing more.
 2. **Post the outcome once**, as the task result: a short line or two, top level in the room.
    When the slot is more than an hour before now, say the run is late and for which slot.
    Durable output (a report, a table) goes on a Commons page via `room-commons`, linked from the
    result.
-3. **Close the run**: `python3 $S done --key <key> --run-id <run id>`, right after the result is
-   written.
+3. **Close the run**: `python3 $S done --key <key> --run-id <run id> --attempt <attempt>`, with
+   the current attempt, right after the result is written.
 
 ## Rules
 
