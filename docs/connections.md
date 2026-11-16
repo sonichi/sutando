@@ -589,6 +589,16 @@ answers before the rule above:
   and the core's session all fall through to the rule above. The core never acts as a worker's
   agent.
 
+A worker's lane delivers each task it queues to its worker itself. The task file goes to
+`tasks/` with `requested_worker` set, as every lane's does, and the lane then runs the core's
+declared task-event handler (the pool router, from `state/task-event-handler.json`) on it with
+`--from-lane`, through the bridge's wake command. That writes the delivery sentinel and the
+attribution in `deliveries/<worker>/` under the router's own locks, so the worker's watcher picks it
+up without waiting for the core's watcher. The core's watcher still sees the task, finds it
+committed and delivers nothing twice; with no handler declared it routes the task as before. A
+lane started from inside a session (`connections.py start` from a worker's shell) carries none of
+that session's variables (`connections.SESSION_ENV`), so it runs as the lane keeper's launch would.
+
 A worker's row has no channel env file: its token is in the vault alone, so
 `channel-env.sh <its lane>` exits 1 saying so, and room clients resolve it by room.
 
