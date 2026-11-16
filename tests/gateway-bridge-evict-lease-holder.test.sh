@@ -1,10 +1,6 @@
 #!/bin/bash
-# #4360: a straggler bridge whose identity ps cannot show (INDETERMINATE) was never
-# evicted, even when it held this bridge's lease, so the wrapper's own child deferred
-# to it (rc 75) and the job ended unsupervised. evict_own_bridge now kills an
-# indeterminate candidate only when it is the pid the caller proved from the lease
-# (EVICT_PROVEN_PID), waits for it to exit (EVICT_WAIT_S), and `connections.py
-# bridge-pid` prints that proven pid. Run: bash <this file> (exit 0/1)
+# evict_own_bridge kills an indeterminate straggler only when it is the lease holder the
+# caller proved (EVICT_PROVEN_PID). Run: bash <this file> (exit 0/1)
 set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
