@@ -498,6 +498,156 @@ class CliCursorsTest(unittest.TestCase):
             self.assertEqual(rc, 0)
 
 
+class SafeCursorValueTest(unittest.TestCase):
+    """Susan's CHANGES_REQUESTED on #6515: SKILL.md advanced a source's cursor to the
+    newest FETCHED item even when an earlier one failed to send, so the failed item
+    was never fetched again (`updated:>cursor` skips it; dedupe never sees it)."""
+
+    def _github(self, updated_at, number=4402):
+        raw = {**GITHUB_REVIEW_REQUEST_FIXTURE, "number": number, "updated_at": updated_at}
+        return ib.map_github(raw, "review_requested", ib.DEFAULT_RULES)
+
+    def test_every_fetched_item_confirmed_advances_to_the_given_value(self):
+        item = self._github("2026-11-16T12:00:00Z")
+        value, advanced = ib.safe_cursor_value([item["id"]], [item["id"]], item["updated_at"])
+        self.assertTrue(advanced)
+        self.assertEqual(value, item["updated_at"])
+
+    def test_one_unconfirmed_item_refuses_to_advance_at_all(self):
+        # Exact scenario Susan named: 12:00 fails, 12:01 succeeds.
+        failed = self._github("2026-11-16T12:00:00Z", number=4402)
+        sent = self._github("2026-11-16T12:01:00Z", number=4403)
+        value, advanced = ib.safe_cursor_value(
+            [failed["id"], sent["id"]], [sent["id"]], sent["updated_at"]
+        )
+        self.assertFalse(advanced)
+        self.assertIsNone(value)
+
+    def test_every_send_failing_loses_nothing_either(self):
+        failed = self._github("2026-11-16T12:00:00Z")
+        value, advanced = ib.safe_cursor_value([failed["id"]], [], "2026-11-16T12:00:00Z")
+        self.assertFalse(advanced)
+        self.assertIsNone(value)
+
+    def test_the_partial_send_regression_the_next_polls_predicate_still_returns_the_failed_item(self):
+        # Models the actual next-fetch predicate (`updated:>cursor`) with a plain
+        # lexical compare, valid for these ISO8601 UTC timestamps.
+        original_cursor = "2026-11-16T11:00:00Z"
+        failed = self._github("2026-11-16T12:00:00Z", number=4402)  # send failed
+        sent = self._github("2026-11-16T12:01:00Z", number=4403)  # send succeeded
+        value, advanced = ib.safe_cursor_value(
+            [failed["id"], sent["id"]], [sent["id"]], sent["updated_at"]
+        )
+        cursor_after_this_poll = value if advanced else original_cursor
+        self.assertFalse(advanced)
+        self.assertEqual(cursor_after_this_poll, original_cursor)
+        # The failed item is still fetchable next time...
+        self.assertGreater(failed["updated_at"], cursor_after_this_poll)
+        # ...and the confirmed one is correctly excluded by dedupe, not by the cursor.
+        self.assertEqual(
+            ib.dedupe_new([failed, sent], ib.record_sent({}, [sent])),
+            [failed],
+        )
+
+    def test_blindly_setting_the_cursor_to_newest_the_way_the_old_playbook_did_would_have_lost_it(self):
+        # Demonstrates the bug `cursors advance` replaces: naively using `cursors set`
+        # with the newest FETCHED (not confirmed) value loses the failed item.
+        failed = self._github("2026-11-16T12:00:00Z", number=4402)
+        sent = self._github("2026-11-16T12:01:00Z", number=4403)
+        naive_new_cursor = sent["updated_at"]  # what the old SKILL.md step 4 did
+        self.assertLessEqual(failed["updated_at"], naive_new_cursor)  # would be skipped
+
+
+class CliCursorsAdvanceTest(unittest.TestCase):
+    def _write(self, path, items):
+        path.write_text(json.dumps(items))
+
+    def test_advance_cli_dry_run_does_not_persist_even_when_fully_confirmed(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            item = ib.map_github(GITHUB_REVIEW_REQUEST_FIXTURE, "review_requested", ib.DEFAULT_RULES)
+            fetched_file, confirmed_file = ws / "fetched.json", ws / "confirmed.json"
+            self._write(fetched_file, [item])
+            self._write(confirmed_file, [item])
+            ib.main(
+                [
+                    "--workspace",
+                    str(ws),
+                    "cursors",
+                    "advance",
+                    "--source",
+                    "github",
+                    "--value",
+                    item["updated_at"],
+                    "--fetched-file",
+                    str(fetched_file),
+                    "--confirmed-file",
+                    str(confirmed_file),
+                ]
+            )
+            self.assertFalse(ib.cursors_path(ws).exists())
+
+    def test_advance_cli_live_fully_confirmed_persists(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            item = ib.map_github(GITHUB_REVIEW_REQUEST_FIXTURE, "review_requested", ib.DEFAULT_RULES)
+            fetched_file, confirmed_file = ws / "fetched.json", ws / "confirmed.json"
+            self._write(fetched_file, [item])
+            self._write(confirmed_file, [item])
+            ib.main(
+                [
+                    "--workspace",
+                    str(ws),
+                    "cursors",
+                    "advance",
+                    "--source",
+                    "github",
+                    "--value",
+                    item["updated_at"],
+                    "--fetched-file",
+                    str(fetched_file),
+                    "--confirmed-file",
+                    str(confirmed_file),
+                    "--live",
+                ]
+            )
+            saved = json.loads(ib.cursors_path(ws).read_text())
+            self.assertEqual(saved["github"], item["updated_at"])
+
+    def test_advance_cli_live_with_one_unconfirmed_leaves_the_cursor_file_untouched(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            failed = ib.map_github(
+                {**GITHUB_REVIEW_REQUEST_FIXTURE, "number": 1}, "review_requested", ib.DEFAULT_RULES
+            )
+            sent = ib.map_github(
+                {**GITHUB_REVIEW_REQUEST_FIXTURE, "number": 2}, "review_requested", ib.DEFAULT_RULES
+            )
+            fetched_file, confirmed_file = ws / "fetched.json", ws / "confirmed.json"
+            self._write(fetched_file, [failed, sent])
+            self._write(confirmed_file, [sent])
+            ib.main(["--workspace", str(ws), "cursors", "set", "--source", "github", "--value", "seed", "--live"])
+            ib.main(
+                [
+                    "--workspace",
+                    str(ws),
+                    "cursors",
+                    "advance",
+                    "--source",
+                    "github",
+                    "--value",
+                    sent["updated_at"],
+                    "--fetched-file",
+                    str(fetched_file),
+                    "--confirmed-file",
+                    str(confirmed_file),
+                    "--live",
+                ]
+            )
+            saved = json.loads(ib.cursors_path(ws).read_text())
+            self.assertEqual(saved["github"], "seed")  # unchanged, not advanced
+
+
 class HelperEdgeCasesTest(unittest.TestCase):
     def test_as_iso_passes_through_a_string_unchanged(self):
         self.assertEqual(ib._as_iso("2026-11-16T00:00:00Z"), "2026-11-16T00:00:00Z")

@@ -16,6 +16,8 @@ Usage:
   inbox_feed.py find-room --file ROOMS.json --owner MXID
   inbox_feed.py cursors get --source {github,gmail,slack} [--workspace PATH]
   inbox_feed.py cursors set --source {github,gmail,slack} --value VALUE [--live] [--workspace PATH]
+  inbox_feed.py cursors advance --source {github,gmail,slack} --value VALUE
+      --fetched-file FETCHED.json --confirmed-file CONFIRMED.json [--live] [--workspace PATH]
   inbox_feed.py log-sent --file ITEMS.json [--live] [--workspace PATH]
   inbox_feed.py digest [--hours N] [--workspace PATH]
 
@@ -23,8 +25,13 @@ Usage:
 `map`, `dedupe` and `find-room` are always read-only. `dedupe` only SELECTS
 candidates; `mark-sent` is the only command that records an item as sent, and it
 must be called only with items a `room.event.send` call actually confirmed — never
-before the send, never for one that failed or is unconfirmed. Default is dry-run
-everywhere `--live` is accepted.
+before the send, never for one that failed or is unconfirmed. `cursors advance` is
+the only way the poll loop may move a source's cursor: it refuses to advance unless
+every id in `--fetched-file` is also in `--confirmed-file`, so an unconfirmed item is
+never skipped by the next poll's own `updated:>cursor`-style query. `cursors set` is
+a direct, unconditional write for seeding or manual recovery only — the poll loop
+itself must never call it to "advance". Default is dry-run everywhere `--live` is
+accepted.
 """
 from __future__ import annotations
 
@@ -376,6 +383,24 @@ def record_sent(
     return updated
 
 
+# --- cursors: never skip an item that never reached the room -----------------------
+
+
+def safe_cursor_value(
+    fetched_ids: List[str], confirmed_ids: List[str], new_value: str
+) -> "tuple[Optional[str], bool]":
+    """Whether a source's cursor may advance to `new_value`, and to what. A source is
+    polled with `updated:>cursor` (or the equivalent for Gmail's `historyId`/Slack's
+    `ts`), so advancing past an item that was fetched but never confirmed sent means
+    that item is never fetched again — `dedupe_new` cannot resurrect what it never
+    sees. Safe only when EVERY id this poll fetched for the source is also in
+    `confirmed_ids`; otherwise the cursor must not move at all, so the next poll's
+    own source query still returns the unconfirmed item(s)."""
+    if set(fetched_ids) <= set(confirmed_ids):
+        return new_value, True
+    return None, False
+
+
 # --- finding the owner's Inbox room ---------------------------------------------------
 
 _NO_INBOX_STATE = object()  # sentinel: this room carries no readable space.ag2.inbox state
@@ -505,9 +530,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     find_room_p.add_argument("--owner", required=True)
 
     cursors_p = sub.add_parser("cursors")
-    cursors_p.add_argument("action", choices=["get", "set"])
+    cursors_p.add_argument("action", choices=["get", "set", "advance"])
     cursors_p.add_argument("--source", required=True, choices=["github", "gmail", "slack"])
     cursors_p.add_argument("--value", default=None)
+    cursors_p.add_argument("--fetched-file", default=None)
+    cursors_p.add_argument("--confirmed-file", default=None)
     cursors_p.add_argument("--live", action="store_true")
 
     log_sent_p = sub.add_parser("log-sent")
@@ -569,6 +596,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.action == "get":
             print(json.dumps({"source": args.source, "value": cursors.get(args.source)}))
             return 0
+        if args.action == "advance":
+            fetched = _read_json_file(args.fetched_file)
+            confirmed = _read_json_file(args.confirmed_file)
+            new_value, advanced = safe_cursor_value(
+                [i["id"] for i in fetched], [i["id"] for i in confirmed], args.value
+            )
+            if advanced and args.live:
+                cursors[args.source] = new_value
+                _atomic_write(path, json.dumps(cursors))
+            print(
+                json.dumps(
+                    {
+                        "source": args.source,
+                        "advanced": advanced,
+                        "value": new_value if advanced else cursors.get(args.source),
+                        "persisted": advanced and args.live,
+                    }
+                )
+            )
+            return 0
+        # action == "set": unconditional write for seeding/recovery only — the poll
+        # loop itself must always use "advance" instead.
         cursors[args.source] = args.value
         if args.live:
             _atomic_write(path, json.dumps(cursors))

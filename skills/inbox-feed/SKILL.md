@@ -96,7 +96,8 @@ Both default to a dry run — nothing is sent to the Inbox room unless you say `
    status change, a re-request on the same object surfaces again — it's a new fact,
    not a duplicate). `dedupe` never writes state; it only ever tells you what's a
    candidate. **Without `--live` (step 4 below), stop here — do not call
-   `room.event.send`.**
+   `room.event.send`.** Split `new_items` by `source.app` and keep each source's
+   slice around (e.g. `github-fetched.json`) — step 4's `cursors advance` needs it.
 
 4. **On `--live`, send each new item, then mark ONLY the ones that actually sent.**
 
@@ -122,11 +123,31 @@ Both default to a dry run — nothing is sent to the Inbox room unless you say `
    An item whose `room.event.send` call failed, was denied, or whose outcome is
    unknown (lost response, etc.) must **not** appear in `confirmed.json` — leave it
    out, and it stays eligible on the next `poll` run rather than vanishing silently.
-   Finally, advance each source's cursor (also gated on `--live`) and append every
-   confirmed item to the local digest log:
+
+   **Advancing a source's cursor past an item that never reached the room loses that
+   item for good** — the next poll fetches with `updated:>cursor` (or the equivalent
+   for Gmail's `historyId`/Slack's `ts`), so anything at or before the cursor is never
+   fetched again, and `dedupe_new` cannot resurrect what it never sees. So: per
+   source, write the items `dedupe` returned for that source this run to
+   `github-fetched.json` (etc.) *before* sending — that's everything which needed to
+   be confirmed — then call `cursors advance`, never `cursors set`, after the sends:
 
    ```bash
-   python3 skills/inbox-feed/scripts/inbox_feed.py cursors set --source github --value <newest updated_at> --live
+   python3 skills/inbox-feed/scripts/inbox_feed.py cursors advance --source github \
+       --value <newest updated_at among github-fetched.json> \
+       --fetched-file github-fetched.json --confirmed-file confirmed.json --live
+   ```
+
+   `advance` only moves the cursor when **every** id in `--fetched-file` is also in
+   `--confirmed-file` (`confirmed.json` may hold items from every source at once —
+   `advance` only looks at the ones matching `--fetched-file`'s ids). If even one
+   fetched item for that source is missing from `confirmed.json`, the cursor is left
+   exactly where it was, on purpose, so the next poll's own fetch still returns the
+   unconfirmed item(s). `cursors set` still exists for seeding a cursor's first value
+   or manual recovery — **the poll loop itself must never call `set` to advance.**
+   Finally, append every confirmed item to the local digest log:
+
+   ```bash
    python3 skills/inbox-feed/scripts/inbox_feed.py log-sent --file confirmed.json --live
    ```
 
