@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """One record per schedule run, so a slot is started at most once and a lost run is reconciled.
 
-The run's key is (schedule id, slot) from the server's briefing line, the first line of the
-task body; without one it is the task's `agent_trigger_id`, then its `id`. The record lives
-under `<workspace>/state/schedule/claims/` and every transition holds a per-key lock, so of any
-number of concurrent or retried tasks for one run exactly one is told `run`. That claim gets a
-run id and attempt 1; every later transition must present both, and `resume` starts the next
-attempt, so a delayed transition from an earlier attempt is refused.
+The run's key is (schedule id, slot), read from the gateway-written `agent_trigger_id` header of
+a `schedule.fired` task (`schedule|<room>|<schedule id>|<slot>|<agent>`), never from the body;
+without one it is the raw `agent_trigger_id`, then the task's `id`. The run's tier is the
+fire's attested `access_tier`, stored at claim; a missing or unknown tier is `guest`. The
+record lives under `<workspace>/state/schedule/claims/` and every transition holds a per-key
+lock, so of any number of concurrent or retried tasks for one run exactly one is told `run`.
+That claim gets a run id and attempt 1; every later transition must present both, and
+`resume` starts the next attempt, so a delayed transition from an earlier attempt is refused.
 
 States: claimed -> waiting_approval -> claimed (resumed) -> done. Each attempt records the task
 whose result is its outcome; `resume` takes the resuming task, so an earlier attempt's waiting
@@ -17,12 +19,12 @@ the owner and never replayed. At most once, with reconciliation; not exactly onc
 
 Usage (all take --workspace <dir>):
   claim_run.py claim  --task-file <task> [--stale-minutes N]
-      run <key> <run id> <attempt> (exit 0); skip: <why> (exit 3);
+      run <key> <run id> <attempt> <tier> (exit 0); skip: <why> (exit 3);
       needs-reconcile <key> <run id> <attempt> ... (exit 4)
   claim_run.py sweep  [--stale-minutes N]   prints each run that newly needs reconciling
   claim_run.py wait|done|release --key <key> --run-id <run id> --attempt <n>
   claim_run.py resume --key <key> --run-id <run id> --attempt <n> --task-file <resuming task>
-      prints `resume <key> <run id> <n+1>`
+      prints `resume <key> <run id> <n+1> <tier>`
       wait: claimed -> waiting_approval; resume: waiting_approval -> claimed (owner approved);
       done: claimed|waiting_approval|needs_reconcile -> done;
       release: needs_reconcile -> removed (the owner chose to run the slot again)
@@ -45,28 +47,40 @@ if str(REPO / "src") not in sys.path:
     sys.path.insert(0, str(REPO / "src"))
 if str(REPO / "packages" / "ag2-sparrow") not in sys.path:
     sys.path.append(str(REPO / "packages" / "ag2-sparrow"))
-import file_lock, local_task_protocol, outbox  # noqa: E401,E402
+import file_lock, local_task_protocol, outbox, task_envelope  # noqa: E401,E402
 from ag2_sparrow import gateway_instance  # noqa: E402
 
 SKIP_EXIT, RECONCILE_EXIT, REFUSED_EXIT = 3, 4, 5
 CLAIMED, WAITING, DONE, RECONCILE = "claimed", "waiting_approval", "done", "needs_reconcile"
 STALE_MINUTES = 60
-_BRIEFING_RE = re.compile(r"^\[Scheduled job ([^\s,\]]+), run ([^\s,\]]+), set up by [^\]]*\]")
+_SCHEDULE_TRIGGER_RE = re.compile(
+    r"schedule\|![^|]+\|(sch-[0-9a-f]+)\|(\d{4}-\d\d-\d\dT\d\d:\d\d:00Z)\|@[^|]+")
 _TRANSITIONS = {"wait": ({CLAIMED}, WAITING), "resume": ({WAITING}, CLAIMED),
                 "done": ({CLAIMED, WAITING, RECONCILE}, DONE)}
 
 
-def run_key(task_text: str, fallback_id: str = "") -> str:
-    """The run's identity: `schedule:<id>@<slot>`, else `trigger:<id>`, else `task:<id>`."""
-    parsed = local_task_protocol.parse_task_headers(task_text)
-    first = parsed.body.split("\n", 1)[0].strip()
-    m = _BRIEFING_RE.match(first)
-    if m:
+def _headers(task_text: str, workspace: "Path | None") -> dict:
+    return task_envelope.attested_task_headers(task_text, workspace).headers
+
+
+def run_key(task_text: str, fallback_id: str = "", workspace: "Path | None" = None) -> str:
+    """The run's identity from attested headers only: `schedule:<id>@<slot>`, else
+    `trigger:<id>`, else `task:<id>`."""
+    h = _headers(task_text, workspace)
+    trig = (h.get("agent_trigger_id") or "").strip()
+    m = _SCHEDULE_TRIGGER_RE.fullmatch(trig)
+    if m and (h.get("event_type") or "").strip() == "schedule.fired":
         return f"schedule:{m.group(1)}@{m.group(2)}"
-    trig = (parsed.get("agent_trigger_id") or "").strip()
     if trig:
         return f"trigger:{trig}"
-    return f"task:{(parsed.get('id') or '').strip() or fallback_id}"
+    return f"task:{(h.get('id') or '').strip() or fallback_id}"
+
+
+def run_tier(task_text: str, workspace: "Path | None" = None) -> str:
+    """The fire's attested tier; anything missing or outside the broker's tiers is `guest`."""
+    raw = _headers(task_text, workspace).get("access_tier")
+    tier = local_task_protocol.canonical_access_tier(raw)
+    return tier if tier in local_task_protocol.BROKER_WIRE_TIERS else "guest"
 
 
 def claims_dir(workspace: Path) -> Path:
@@ -141,14 +155,14 @@ def _settle_stale(workspace: Path, path: Path, rec: dict, now: float, stale_minu
 
 
 def claim(workspace: Path, key: str, task_id: str, *, stale_minutes: int = STALE_MINUTES,
-          now: "float | None" = None) -> "tuple[str, dict]":
+          now: "float | None" = None, tier: str = "guest") -> "tuple[str, dict]":
     """('run'|'skip'|'reconcile', record) for this task's attempt at the run."""
     now = time.time() if now is None else now
     with _locked(workspace, key) as path:
         rec = read(workspace, key)
         if rec is None:
             rec = {"key": key, "task_id": task_id, "run_id": uuid.uuid4().hex, "attempt": 1,
-                   "state": CLAIMED, "claimed_at": int(now), "updated_at": int(now)}
+                   "tier": tier, "state": CLAIMED, "claimed_at": int(now), "updated_at": int(now)}
             _write(path, rec)
             return "run", rec
         if rec.get("state") == CLAIMED and _settle_stale(workspace, path, rec, now, stale_minutes):
@@ -253,16 +267,17 @@ def main(argv: "list[str] | None" = None) -> int:
             print(f"refused: {args.key} is {cur.get('state') if cur else 'unclaimed'}, "
                   "or another run id or attempt holds it")
             return REFUSED_EXIT
-        print(f"{args.cmd} {args.key} {rec['run_id']} {rec['attempt']}")
+        print(f"{args.cmd} {args.key} {rec['run_id']} {rec['attempt']} {rec.get('tier', 'guest')}")
         return 0
 
     task_file = Path(args.task_file)
     text = task_file.read_text(encoding="utf-8", errors="replace")
     task_id = _task_id(task_file, text)
-    key = run_key(text, task_file.stem)
-    verdict, rec = claim(ws, key, task_id, stale_minutes=args.stale_minutes)
+    key = run_key(text, task_file.stem, ws)
+    verdict, rec = claim(ws, key, task_id, stale_minutes=args.stale_minutes,
+                         tier=run_tier(text, ws))
     if verdict == "run":
-        print(f"run {key} {rec['run_id']} {rec['attempt']}")
+        print(f"run {key} {rec['run_id']} {rec['attempt']} {rec['tier']}")
         return 0
     if verdict == "reconcile":
         print(_reconcile_line(rec))
