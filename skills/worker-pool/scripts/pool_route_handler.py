@@ -14,7 +14,10 @@ The watcher's handler protocol carries the design's recipient rules exactly:
                           target left without a sentinel: the core must not
                           inherit it, and 0 would release the claim on nothing.
 
-Run: called by src/watch-tasks-stream.sh; see dispatch_task there.
+Run: called by src/watch-tasks-stream.sh; see dispatch_task there. A worker's own
+gateway lane also runs it (`--from-lane`) on each task it queues, so the worker's
+delivery does not wait for the core's watcher; the watcher's later pass finds it
+committed and settles the same way.
 """
 from __future__ import annotations
 
@@ -158,6 +161,8 @@ def main(argv=None) -> int:
     # The watcher passes its RESOLVED results dir; the replay gate reads it, so
     # it is a real argument here rather than one parsed and thrown away.
     p.add_argument("--results-dir", default=None)
+    # A worker's own lane routing the task it queued: the same decision, but not the watcher's receipt.
+    p.add_argument("--from-lane", action="store_true")
     for ignored in ("--runtime", "--repo"):
         p.add_argument(ignored, default=None)
     args, _unknown = p.parse_known_args(argv)
@@ -165,7 +170,7 @@ def main(argv=None) -> int:
     ws = args.workspace
     # First, before anything can fail: the receipt is the only proof outside this
     # process that the watcher routes at all, and a write failure changes nothing.
-    if ws and not prr.record(ws, mode="probe" if args.probe else "run",
+    if ws and not args.from_lane and not prr.record(ws, mode="probe" if args.probe else "run",
                              task_id=Path(args.task_file).stem):
         print("pool_route_handler: routing receipt not written", file=sys.stderr)
     # An inherited roster has no advertisement until something publishes it;

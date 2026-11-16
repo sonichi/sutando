@@ -185,6 +185,8 @@ row already runs as (`worker_identity_shared`). It also refuses an agent whose o
 connection already serves (`worker_owner_mismatch`), so a worker never runs as another person's agent. The token goes into the secret vault. It never goes into a file and is
 never printed. `rotate` accepts a new token only for the same agent. A worker's lane is launched naming its worker. If
 the launch and the record disagree, or neither can say, the lane refuses to start rather than run as the core's.
+The lane routes each task it queues itself (`pool_route_handler.py --from-lane`), so its worker's delivery does not
+wait for the core's watcher; see `docs/connections.md`, "In a pool worker's session".
 
 `pool_manage.py retire` also removes the worker's agent identity: its lane, its row and its vault secret. The agent
 itself stays on its server until the owner deletes it there.

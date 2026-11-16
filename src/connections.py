@@ -2864,13 +2864,14 @@ def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]]
     """The bridge's environment for one plan entry: the token from the env var of its token_ref,
     else the vault; no gateway URL beside the token; the proactive room only for the primary.
     A named entry runs as its row's own agent (`NoIdentity` when the row has none), never one the
-    environment inherited, and without the legacy device env file."""
+    environment inherited, and without the legacy device env file. Nothing of the calling session
+    (`SESSION_ENV`) is passed on, so a start from a worker's shell runs as the lane keeper's would."""
     environ = os.environ if environ is None else environ
     ref = str(entry["token_ref"])
     token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
     if not token:
         raise NoToken(f"no token under {ref}")
-    env = dict(environ)
+    env = {k: v for k, v in environ.items() if k not in SESSION_ENV}
     if entry["instance"]:
         mxid = str(entry.get("agent_mxid") or "").strip()
         if not server_of_mxid(mxid):
@@ -2894,6 +2895,18 @@ def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]]
 
 # The bridge's intake reads its row's `not_before` here; empty when the row has none.
 NOT_BEFORE_ENV = "SUTANDO_INTAKE_NOT_BEFORE"
+# What a core's or pool worker's session carries about itself: a bridge started from inside one is
+# the host's, so none of it is passed on (the lane keeper's launches never had it).
+SESSION_ENV = frozenset((
+    "SUTANDO_INSTANCE_ID", "SUTANDO_WORKER_ID", "SUTANDO_WORKER_RUNTIME", "SUTANDO_WORKER_SEAT",
+    "SUTANDO_CORE_ID", "SUTANDO_CORE_POOL_SIZE", "SUTANDO_CORE_SESSION", "SUTANDO_CORE_RUNTIME",
+    "SUTANDO_TMUX_SOCKET", "SUTANDO_TMUX_SESSION", "SUTANDO_TASKS_DIR", "SUTANDO_RESULTS_DIR",
+    "SUTANDO_WORKSPACE_DIR", "SUTANDO_INBOX_KIND", "SUTANDO_INBOX_RESOLVER", "SUTANDO_INBOX_RESOLVER_TIMEOUT",
+    "SUTANDO_CLAUDE_WORKING_DIR", "SUTANDO_CODEX_WORKING_DIR", "SUTANDO_WORKER_BOOTSTRAP",
+    "SUTANDO_POOL_DELIVERY_SCRIPT", "SUTANDO_WORKER_PLUGIN_DIRS", "SUTANDO_WATCHER_CMD", "SUTANDO_WATCHER_BEAT",
+    "SUTANDO_TASK_WATCH_MOD", "SUTANDO_TASK_WATCH_MOD_WORKER", "SUTANDO_TASK_EVENT_HANDLER",
+    "SUTANDO_CLAUDE_SESSION_ID", "SUTANDO_CLAUDE_RESUME", "AG2_MCP_WORKER_CREDENTIAL",
+))
 # The worker a lane runs as (a row's `worker`), empty for a core lane: the lane's start check.
 LANE_WORKER_ENV = "SUTANDO_LANE_WORKER"
 
