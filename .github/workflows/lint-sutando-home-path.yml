@@ -25,7 +25,7 @@ concurrency:
 jobs:
   lint-sutando-home-path:
     name: refuse new inline ~/.sutando/ install-path literal
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
 
     steps:
