@@ -166,6 +166,8 @@ def main(argv=None) -> int:
     p.add_argument("--from-lane", action="store_true")
     # The lane's staged copy of `--task-file`, routed before it is published there.
     p.add_argument("--payload", default=None)
+    # The lane again, after publishing a task its worker already held: re-raise that worker's sentinel.
+    p.add_argument("--renotify", action="store_true")
     for ignored in ("--runtime", "--repo"):
         p.add_argument(ignored, default=None)
     args, _unknown = p.parse_known_args(argv)
@@ -203,7 +205,7 @@ def main(argv=None) -> int:
         return DECLINE
 
     try:
-        out = rt.route(ws, task, roster, payload=args.payload)
+        out = rt.route(ws, task, roster, payload=args.payload, renotify=args.renotify)
     except rt.RouterRefused as e:
         # The pass refused; the core must not silently inherit the task.
         print(f"pool_route_handler: {e}", file=sys.stderr)

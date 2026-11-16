@@ -39,6 +39,7 @@ pr = _sibling("pool_roster")
 wi = _sibling("worker_identity")
 pl = _sibling("pool_limit")
 prr = _sibling("pool_routing_receipt")
+pa = _sibling("pool_attribution")
 pd = _sibling("pool_delivery")
 
 _SRC = _HERE.parents[2] / "src"
@@ -347,11 +348,20 @@ def session_watcher_holds(workspace, worker_id, *, runner=subprocess.run) -> boo
     return False
 
 
+def _lane_delivered(workspace, task_id: str) -> bool:
+    """A worker's own lane routes its tasks without a receipt: their attribution names that worker."""
+    try:
+        return pa.worker_for_task(workspace, task_id) is not None
+    except OSError:
+        return False
+
+
 def routing_status(workspace) -> dict:
     """Is this host routing at all? Bindings say it should; the handler's receipt
     says whether the watcher ever consults it. A task the core processed after
     the last receipt went past the handler — which is the core answering for a
-    worker, the failure the pool exists to prevent, and it is silent otherwise.
+    worker, the failure the pool exists to prevent, and it is silent otherwise —
+    unless a worker's attribution shows it was routed elsewhere.
     """
     roster = pr.load_roster(workspace) or {}
     core = getattr(pr, "CORE", "core")
@@ -373,7 +383,7 @@ def routing_status(workspace) -> dict:
         if newest is None or mtime > newest:
             newest, newest_id = mtime, f.stem
         if (consulted is not None and mtime > consulted and f.stem != own
-                and (unrouted is None or mtime > unrouted[0])):
+                and (unrouted is None or mtime > unrouted[0]) and not _lane_delivered(workspace, f.stem)):
             unrouted = (mtime, f.stem)
     alarm = None
     if bound and consulted is None:

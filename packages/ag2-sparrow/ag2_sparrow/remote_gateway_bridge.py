@@ -2293,9 +2293,9 @@ PROACTIVE_OWN_FILE: Callable[[Path], bool] | None = None
 # Host-injected () -> the worker every task this lane queues is addressed to (`requested_worker`),
 # or "". None (standalone default) leaves each task's field as the gateway sent it.
 TASK_ADDRESSEE: Callable[[], str] | None = None
-# Host-injected (task id, staged file, destination) -> None, run before a served task's file is
+# Host-injected (task id, staged file, destination) -> None or a callable run once the file is
 # published; a raise is logged and the task is published. None (standalone default) runs nothing.
-TASK_PRE_PUBLISH: Callable[[str, Path, Path], None] | None = None
+TASK_PRE_PUBLISH: Callable[[str, Path, Path], "Callable[[], None] | None"] | None = None
 # Host-injected () -> the homeserver this lane's connection row names, or "": a secondary lane's
 # relay answer on another server is refused. None (standalone default) checks nothing.
 LANE_SERVER: Callable[[], str] | None = None
@@ -6963,12 +6963,20 @@ def _mark_published(tid: str) -> None:
 
 def _publish_task(tid: str, staged: Path, dest: Path) -> bool:
     """Publish a served task's staged file into the queue, after TASK_PRE_PUBLISH has seen it."""
+    after = None
     if TASK_PRE_PUBLISH is not None:
         try:
-            TASK_PRE_PUBLISH(tid, staged, dest)
+            after = TASK_PRE_PUBLISH(tid, staged, dest)
         except Exception as exc:  # noqa: BLE001 — a broken hook must never hold a task back
             _log(f"pre-publish hook failed for {tid}: {diagnostics.describe(exc)}; publishing")
-    return _publish_staged(staged, dest)
+    if not _publish_staged(staged, dest):
+        return False
+    if callable(after):
+        try:
+            after()
+        except Exception as exc:  # noqa: BLE001 — the task is already published
+            _log(f"post-publish step failed for {tid}: {diagnostics.describe(exc)}")
+    return True
 
 
 def _on_published(tid: str, dest: Path, task_text: str, task: dict, sender_tier: str) -> None:

@@ -542,17 +542,30 @@ def _lane_router(worker: str, argv: "list[str]"):
     the worker's when it appears and the core's watcher, which never routes a held task, leaves it."""
     import subprocess
 
-    def route(tid: str, staged: Path, dest: Path) -> None:
+    from delivery.task_dispatch import WorkerHoldUnreadable, worker_holds
+
+    def run(tid: str, args: "list[str]", step: str) -> "int | None":
         try:
-            rc = subprocess.run(argv + ["--task-file", str(dest), "--payload", str(staged)],
-                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                timeout=_LANE_ROUTE_TIMEOUT_S).returncode
+            return subprocess.run(argv + args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=_LANE_ROUTE_TIMEOUT_S).returncode
         except (OSError, subprocess.TimeoutExpired) as exc:
-            _log(f"lane for worker {worker}: routing {tid} failed ({exc!r}); the core's watcher routes it")  # noqa: F821
-            return
+            _log(f"lane for worker {worker}: {step} {tid} failed ({exc!r})")  # noqa: F821
+            return None
+
+    def route(tid: str, staged: Path, dest: Path):
+        # Held already: an earlier serve's sentinel, whose watcher may have given up on its absent payload.
+        try:
+            held = worker_holds(WS / "deliveries", dest.name)
+        except WorkerHoldUnreadable:
+            held = True
+        rc = run(tid, ["--task-file", str(dest), "--payload", str(staged)], "routing")
+        if rc is None:
+            return None
         if rc != 0:
             _log(f"lane for worker {worker}: {tid} not delivered to it (router exit {rc}); "  # noqa: F821
                  "the core's watcher routes it")
+            return None
+        return (lambda: run(tid, ["--task-file", str(dest), "--renotify"], "re-raising")) if held else None
     return route
 
 

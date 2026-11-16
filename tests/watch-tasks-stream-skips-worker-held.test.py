@@ -6,7 +6,8 @@ held (a sentinel in `deliveries/<worker>/`) when the core's watcher first sees i
 leaves it alone: no handler probe or run, no TASK_FILE. A task nobody holds is routed as before, and
 a deliveries folder that cannot be read still goes to the handler, which fails closed. "Holds" means
 the delivery committed: a sentinel with the attribution naming that worker. A sentinel alone (a router
-that died between the two writes) goes to the handler, whose replay attributes it.
+that died between the two writes) goes to the handler, whose replay attributes it. The skip is the
+core's only: the worker's own watcher announces the task it holds.
 
 Run: python3 tests/watch-tasks-stream-skips-worker-held.test.py
 """
@@ -59,13 +60,18 @@ class CoreWatcher(unittest.TestCase):
             (self.ws / "state" / "attribution").mkdir(parents=True, exist_ok=True)
             (self.ws / "state" / "attribution" / tid).write_text(W + "\n")
 
-    def run_watcher(self, until):
+    def run_watcher(self, until, worker=False):
         env = clean_env()
         env.update(PATH=f"{self.tmp / 'bin'}:{env['PATH']}", TMPDIR=str(self.tmp),
                    SUTANDO_RESULTS_DIR=str(self.ws / "results"), SUTANDO_TASK_EVENT_HANDLER=str(self.handler))
+        inbox = self.ws / "tasks"
+        if worker:
+            inbox = self.ws / "deliveries" / W
+            env.update(SUTANDO_WORKSPACE_DIR=str(self.ws), SUTANDO_INSTANCE_ID=W, SUTANDO_INBOX_RESOLVER=str(
+                REPO / "skills" / "worker-pool" / "scripts" / "resolve_inbox_entry.py"))
         errf = open(self.tmp / "watcher.err", "w+")
-        p = popen_bound(["bash", "src/watch-tasks-stream.sh", str(self.ws / "tasks"),
-                         "--role", "standby", "--inbox", str(self.ws / "tasks")],
+        p = popen_bound(["bash", "src/watch-tasks-stream.sh", str(inbox),
+                         "--role", "standby", "--inbox", str(inbox)],
                         cwd=str(REPO), env=env, stdout=subprocess.PIPE, stderr=errf)
         os.set_blocking(p.stdout.fileno(), False)
         out, end = b"", time.time() + DEADLINE_S
@@ -123,6 +129,15 @@ class CoreWatcher(unittest.TestCase):
         out, err, calls = self.run_watcher(lambda o, e: self.calls.exists() and "task-mine" in self.calls.read_text())
         self.assertIn("task-mine.txt", calls, "the core finishes its own interrupted routing")
         self.assertNotIn("held by a worker, not routing it: task-mine.txt", err)
+
+    def test_the_workers_own_watcher_still_announces_its_committed_task(self):
+        # The skip is the core's: to the worker holding it, a committed task is exactly what to run.
+        self.task("task-mine-w")
+        self.hold("task-mine-w")
+        out, err, _ = self.run_watcher(lambda o, e: "task-mine-w.txt" in o or "task-mine-w.txt" in e, worker=True)
+        self.assertIn("TASK_FILE:", out)
+        self.assertIn("/tasks/task-mine-w.txt", out)
+        self.assertNotIn("held by a worker", err)
 
     @unittest.skipIf(os.geteuid() == 0, "root reads an unreadable folder")
     def test_deliveries_that_cannot_be_read_still_go_to_the_handler(self):
