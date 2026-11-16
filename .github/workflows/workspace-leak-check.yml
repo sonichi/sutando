@@ -28,7 +28,7 @@ concurrency:
 jobs:
   workspace-leak-check:
     name: refuse workspace/ contents in commits
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
 
     steps:
