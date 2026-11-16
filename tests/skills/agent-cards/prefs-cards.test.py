@@ -405,6 +405,80 @@ class Clicks(Base):
         self.assertEqual(self.poster.card()["groups"][1]["label"], "The agent is added to a room: each agent")
 
 
+class Transport(Base):
+    """The real Account over the real Actions client; only the HTTP request is fake."""
+
+    def account(self, docs):
+        import pool_provision
+        self.rpc = []
+
+        def request(method, url, bearer="", headers=None, payload=None):
+            if url.endswith(pool_provision.DISCOVERY_PATH):
+                return 200, {}, {"mint_url": "https://gw.test/mint", "mcp_url": "https://gw.test/mcp"}
+            if url == "https://gw.test/mint":
+                return 200, {}, {"access_token": "tok"}
+            self.rpc.append(payload["params"])
+            doc = docs[payload["params"]["arguments"]["action"]]
+            return 200, {}, {"result": {"structuredContent": {"status": "ok", "result": copy.deepcopy(doc)}}}
+        return cards.Account(pool_provision.Actions("https://gw.test", "lane", request, []))
+
+    def test_a_set_carries_the_click_s_task_id_on_the_wire(self):
+        after = triggers_doc(revision=4)
+        acct = self.account({"agent.triggers.get": triggers_doc(), "agent.triggers.set": after})
+        event, card = self.show("triggers", acct)
+        rc, out = self.click(event, card, 'Turn off "The agent is added to a room" for all agents', acct)
+        self.assertEqual((rc, out["status"]), (0, "saved"), out)
+        read, write = self.rpc[-2:]
+        self.assertEqual((read["name"], read["arguments"]),
+                         ("room.action.read", {"action": "agent.triggers.get", "target_kind": "account", "arguments": {}}))
+        self.assertEqual((write["name"], write["arguments"]), ("room.action.execute", {
+            "action": "agent.triggers.set", "target_kind": "account", "task_id": "t-click",
+            "operation_id": "t-click:triggers-set",
+            "arguments": {"all": {"room.joined": False}, "expected_revision": 3}}))
+
+
+class Claim(Base):
+    def test_a_settings_click_claims_its_card_before_anything_is_read_or_set(self):
+        acct = FakeAccount(triggers_doc(), set_answer=triggers_doc(revision=4))
+        event, card = self.show("triggers", acct)
+        claimed = []
+        with mock.patch.object(cards.issued_cards, "settle", lambda ws, eid: claimed.append(eid) or False):
+            rc, out = self.click(event, card, 'Turn off "The agent is added to a room" for all agents', acct)
+        self.assertEqual(claimed, [event])
+        self.assertEqual((rc, out["status"], out["why"]), (1, "forged_or_stale_click", "that card was already answered"))
+        self.assertEqual((acct.reads, acct.sets), (["agent.triggers.get"], []), "a lost claim reads and sets nothing")
+
+
+class SaveErrors(Base):
+    def test_a_save_that_raises_posts_the_card_again_with_a_clear_line(self):
+        acct = FakeAccount(triggers_doc())
+        event, card = self.show("triggers", acct)
+
+        def boom(*a, **kw):
+            raise OSError("socket closed")
+        acct.execute = boom
+        rc, out = self.click(event, card, 'Turn off "The agent is added to a room" for all agents', acct)
+        self.assertEqual((rc, out["status"]), (0, "not_saved"))
+        self.assertEqual(out["outcome"], f"Not saved: I couldn't reach {cards.dotspace.SUCCESSOR_SERVER} (OSError).")
+        again = self.poster.card()
+        self.assertEqual((again["note"], again["note_tone"]), (out["outcome"], "warn"))
+        self.assertIsNotNone(cards.issued_cards.live(self.ws, out["event_id"]), "the card still works")
+
+    def test_a_conflict_whose_re_read_fails_still_posts_the_card(self):
+        acct = FakeAccount(triggers_doc(), set_answer={"is_error": True, "code": "CONFLICT", "details": {}})
+        event, card = self.show("triggers", acct)
+        acct.read = lambda action, arguments=None: {"is_error": True, "code": "UPSTREAM_UNAVAILABLE"}
+        rc, out = self.click(event, card, 'Turn off "The agent is added to a room" for all agents', acct)
+        self.assertEqual((rc, out["status"]), (1, "failed"), "the click's own read fails first")
+        acct2 = FakeAccount(triggers_doc(), set_answer={"is_error": True, "code": "CONFLICT", "details": {}})
+        event, card = self.show("triggers", acct2)
+        reads = iter([{"status": "ok", "result": triggers_doc()}, {"is_error": True, "code": "UPSTREAM_UNAVAILABLE"}])
+        acct2.read = lambda action, arguments=None: next(reads)
+        rc, out = self.click(event, card, 'Turn off "The agent is added to a room" for all agents', acct2)
+        self.assertEqual((rc, out["status"]), (0, "not_saved"))
+        self.assertIn("they changed since this card", out["outcome"])
+
+
 class Offer(Base):
     def test_off_by_default(self):
         os.environ.pop("AGENT_CARDS_PREFS_OFFER", None)

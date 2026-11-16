@@ -25,6 +25,7 @@ if str(_REPO / "src") not in sys.path:
     sys.path.insert(0, str(_REPO / "src"))
 
 import agent_card as ac  # noqa: E402
+import dotspace  # noqa: E402
 
 TRIGGERS, NOTICES = "triggers", "notices"
 GET = {TRIGGERS: "agent.triggers.get", NOTICES: "notice.prefs.get"}
@@ -168,7 +169,7 @@ def triggers_card(doc: Mapping, view: Optional[View] = None, *, names: Optional[
             actions.append(_act("Close" if opened else "Edit", f"{'Close' if opened else 'Edit'} \"{label}\" per agent",
                                 ac.reply(TRIGGERS, target(rev, ev), "close" if opened else "edit")))
         else:
-            sub += " · set by s.space"
+            sub += f" · set by {dotspace.SUCCESSOR_SERVER}"
         event_rows.append(ac.row(label, subtitle=sub[:300], state="on" if on else "off", actions=actions))
         if view.edit == ev and et.get("configurable") and agents:
             rows = []

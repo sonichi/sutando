@@ -371,10 +371,14 @@ def prefs_doc(action: str, answer: object) -> dict:
 def _why(e: PrefsError) -> str:
     reason = str(e.details.get("reason") or "")
     if e.code == "NOT_FOUND":
-        return "your s.space server does not offer these settings yet"
+        return f"your {dotspace.SUCCESSOR_SERVER} server does not offer these settings yet"
     if e.code == "FORBIDDEN" and reason:
-        return f"s.space did not let me change them ({reason}); ask me again in our DM"
+        return f"{dotspace.SUCCESSOR_SERVER} did not let me change them ({reason}); ask me again in our DM"
     return f"{e} ({reason})" if reason else str(e)
+
+
+def _save_error(e: Exception) -> str:
+    return _why(e) if isinstance(e, PrefsError) else f"I couldn't reach {dotspace.SUCCESSOR_SERVER} ({type(e).__name__})"
 
 
 def _known_names(ws: Path) -> dict:
@@ -551,17 +555,16 @@ def _prefs_reply(ws: Path, said: ac.Reply, headers: dict, lane: str, account, ex
         try:
             doc = prefs_doc(pc.SET[kind], account.execute(pc.SET[kind], step.arguments, task_id=task_id,
                                                           operation_id=f"{task_id or headers.get('id') or 'task'}:{kind}-set"))
-        except PrefsError as e:
-            if e.code != "CONFLICT":
-                view = pc.View(edit=view.edit, outcome=f"Not saved: {_why(e)}.", tone="warn")
-                status = "not_saved"
-            else:
+        except Exception as e:  # noqa: BLE001 — any failed save is said on a card that still works
+            view, status = pc.View(edit=view.edit, outcome=f"Not saved: {_save_error(e)}.", tone="warn"), "not_saved"
+            if isinstance(e, PrefsError) and e.code == "CONFLICT":
                 try:
                     doc = prefs_doc(pc.GET[kind], account.read(pc.GET[kind]))
-                except PrefsError as again:
-                    return {"status": "failed", "why": f"they changed since this card ({_why(again)})"}
-                view, status = pc.View(edit=view.edit, outcome=pc.OUT_OF_DATE, tone="warn"), "conflict"
-                names = pc.names_for(doc, _known_names(ws))
+                except Exception as again:  # noqa: BLE001 — the card as it was, with why
+                    view.outcome = f"Not saved: they changed since this card, and I couldn't read them again ({_save_error(again)})."
+                else:
+                    view, status = pc.View(edit=view.edit, outcome=pc.OUT_OF_DATE, tone="warn"), "conflict"
+                    names = pc.names_for(doc, _known_names(ws))
         else:
             names = pc.names_for(doc, _known_names(ws))
             view.outcome = f"{pc.saved_line(doc.get('updated_by'), names)} · {step.change}"[:600]
