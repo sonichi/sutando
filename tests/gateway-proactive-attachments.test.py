@@ -324,10 +324,10 @@ def main() -> int:
         once.clear()
         check(pr_mod.read_attachment(str(CSV), admit_once, 99)[2] == "changed after its check",
               f"r) {label}: a file the recheck no longer admits is refused")
-        real_stat = os.stat
+        real_stat, gone_path = os.stat, os.path.realpath(CSV)  # resolved before the hook: resolve() calls os.stat
 
-        def stat_gone(p, *a, real_stat=real_stat, **kw):  # the file vanishes after its open
-            if str(p) == str(CSV.resolve()):
+        def stat_gone(p, *a, real_stat=real_stat, gone_path=gone_path, **kw):  # vanishes after its open
+            if os.fspath(p) == gone_path:
                 raise FileNotFoundError(p)
             return real_stat(p, *a, **kw)
         os.stat = stat_gone
