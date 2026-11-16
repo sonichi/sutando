@@ -577,7 +577,11 @@ if [ $missing -eq 1 ]; then echo ""; echo "Fix the above and try again."; exit 1
 # Check macOS permissions (can't grant programmatically, just warn)
 # Prevent display sleep (important for always-on Mac Mini — Zoom/summon fails on lock screen)
 # The holder's definition lives in sleep_guard.py; health-check reuses it to detect and restart a dead one.
-echo "  ✓ $("$PY" "$REPO/src/sleep_guard.py" ensure)"
+if sleep_msg="$("$PY" "$REPO/src/sleep_guard.py" ensure 2>&1)"; then
+  echo "  ✓ $sleep_msg"
+else
+  echo "  ⚠ $sleep_msg"
+fi
 
 echo "Checking permissions..."
 # macOS 15+ silently writes a tiny PNG when Screen Recording is denied (exit 0).

@@ -6713,16 +6713,22 @@ def check_sleep_guard(snapshot=None, platform: Optional[str] = None) -> "dict | 
     return sleep_guard.check((snapshot or _ps_snapshot)(), platform=plat)
 
 
-def apply_sleep_guard_fix(checks: list, stream=None, spawn=None) -> Optional[int]:
-    """--fix for `sleep-guard`: start a detached holder when the probe saw none; returns its pid."""
+def apply_sleep_guard_fix(checks: list, stream=None, spawn=None, snapshot=None) -> Optional[int]:
+    """--fix for `sleep-guard`: start a detached holder when none runs; returns its pid once seen running."""
     row = next((c for c in checks if c and c.get("name") == sleep_guard.NAME), None)
     if not row or row.get("status") != "warn":
         return None
     out = stream or sys.stdout
+    look = snapshot or _ps_snapshot
+    if sleep_guard.holder_present(look()) is not False:
+        return None
     try:
         pid = sleep_guard.start(spawn) if spawn else sleep_guard.start()
-    except OSError as e:
+    except (OSError, sleep_guard.StartFailed) as e:
         print(f"sleep-guard: could not start caffeinate: {e}", file=out, flush=True)
+        return None
+    if not sleep_guard.holder_present(look()):
+        print(f"sleep-guard: started caffeinate (pid {pid}) but no holder is visible", file=out, flush=True)
         return None
     row.update(status="ok", detail=f"caffeinate -s holder started by --fix (pid {pid})")
     print(f"sleep-guard: started caffeinate -d -i -s (pid {pid})", file=out, flush=True)
