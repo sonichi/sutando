@@ -170,10 +170,24 @@ def about_task_filename(task_id: str, ts, channel: "str | None" = None, worker: 
 PROACTIVE_OUTBOX_DIRNAME = ".outbox-ag2space-proactive"
 
 
-def proactive_item_id(stem: str, body: str) -> str:
-    """One outbox item per file name and body: a new body under a delivered name is a new send.
-    The room and thread are left out, since they are re-resolved on every pass."""
-    return f"{stem}~{hashlib.sha256(body.encode('utf-8')).hexdigest()[:16]}"
+def attachment_identity(path: str) -> str:
+    """`<path> <sha256 of its bytes>`, or `<path> -` when it cannot be read: a changed file under
+    the same path is a different attachment."""
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError:
+        return f"{path} -"
+    return f"{path} {digest.hexdigest()}"
+
+
+def proactive_item_id(stem: str, body: str, attachments=()) -> str:
+    """One outbox item per file name, body and attachments: a new body or a changed attachment
+    under a delivered name is a new send. The room and thread are re-resolved on every pass."""
+    key = body if not attachments else "\0".join([body, *(attachment_identity(a) for a in attachments)])
+    return f"{stem}~{hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]}"
 
 
 def about_task(name) -> "str | None":

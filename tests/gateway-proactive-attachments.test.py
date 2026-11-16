@@ -6,6 +6,12 @@
   c) a file outside the allowlist     -> the text is delivered, nothing uploaded, the refusal logged
   d) [file:] alone                    -> "(file attached)" is sent, not handed back as empty forever
   e) a second pass over a delivered item never uploads again
+  f) the same name and prose re-published with a different attachment -> sent and uploaded again
+  g) attachment-only, then a different attachment-only file under the same name -> both uploaded
+  h) the same path whose bytes changed -> a new send and upload
+  i) a redirect whose body the destination guard withholds -> the notice, no upload, file name only
+  j) a clean redirect whose file is refused -> the refusal names only the file name
+  k) an item with no attachments keeps its pre-change id
 
 Imports the vendored module with an isolated env; never execs the wrapper.
 Run: python3 tests/gateway-proactive-attachments.test.py
@@ -55,11 +61,12 @@ def check(cond: bool, msg: str) -> None:
         FAILS.append(msg)
 
 
-def drain(body: str, passes: int = 1, name: str = "proactive-1.txt"):
-    """`passes` _post_proactive passes over one file; returns (message POSTs, media POSTs, logs)."""
+def drain(body, passes: int = 1, name: str = "proactive-1.txt", between=None):
+    """`passes` _post_proactive passes over one file name, each writing the next body of `body`
+    (a list) or the same one; returns (message POSTs, media POSTs, logs)."""
+    bodies = body if isinstance(body, list) else [body] * passes
     tmp = Path(tempfile.mkdtemp(dir=_ISO, prefix="drain-"))
     (tmp / "archive").mkdir()
-    (tmp / name).write_text(body, encoding="utf-8")
     messages: list[dict] = []
     media: list[tuple[str, dict]] = []
     logs: list[str] = []
@@ -78,9 +85,10 @@ def drain(body: str, passes: int = 1, name: str = "proactive-1.txt"):
     gb._log = logs.append
     gb._ROUTING.update(owner_dm=OWNER_DM, loaded=True, next=gb.time.time() + 3600)
     try:
-        for i in range(passes):
-            if i:  # the same body comes back, as a hand-back or a re-written file would
-                (tmp / name).write_text(body, encoding="utf-8")
+        for i, text in enumerate(bodies):
+            if i and between:
+                between(i)
+            (tmp / name).write_text(text, encoding="utf-8")
             gb._post_proactive()
     finally:
         (gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR, gb.PROACTIVE_ROOM,
@@ -120,6 +128,46 @@ def main() -> int:
     messages, media, logs = drain(f"once\n[file: {CSV}]\n", passes=2)
     check(len(messages) == 1, f"e) one message across two passes, got {len(messages)}")
     check(len(media) == 1, f"e) one upload across two passes, got {media}")
+
+    import hashlib
+    legacy = f"proactive-x~{hashlib.sha256(b'body').hexdigest()[:16]}"
+    check(gb._proactive_item_id("proactive-x", "body") == legacy,
+          "k) an item with no attachments keeps its existing id, so queued items are not re-sent")
+
+    other = _ISO / "result" / "other.csv"
+    other.write_text("c,d\n3,4\n", encoding="utf-8")
+    messages, media, _ = drain([f"same prose\n[file: {CSV}]\n", f"same prose\n[file: {other}]\n"],
+                               name="proactive-f.txt")
+    check(len(messages) == 2, f"f) a changed attachment is a new send, got {len(messages)} messages")
+    check([m[1].get("filename") for m in media] == ["report.csv", "other.csv"],
+          f"f) both files uploaded in order, got {[m[1].get('filename') for m in media]}")
+
+    messages, media, _ = drain([f"[file: {CSV}]\n", f"[file: {other}]\n"], name="proactive-g.txt")
+    check([m[1].get("filename") for m in media] == ["report.csv", "other.csv"],
+          f"g) attachment-only bodies no longer collide, got {[m[1].get('filename') for m in media]}")
+
+    changing = _ISO / "result" / "changing.csv"
+    changing.write_text("v1\n", encoding="utf-8")
+    messages, media, _ = drain([f"export\n[file: {changing}]\n"] * 2, name="proactive-h.txt",
+                               between=lambda _i: changing.write_text("v2 changed\n", encoding="utf-8"))
+    check(len(media) == 2 and media[0][1]["content_b64"] != media[1][1]["content_b64"],
+          f"h) changed bytes under the same path upload again, got {len(media)} uploads")
+
+    messages, media, logs = drain(f"[channel: {ROOM}]\nsee /Users/someone/private/notes.txt\n[file: {CSV}]\n",
+                                  name="proactive-i.txt")
+    check(len(messages) == 1 and messages[0].get("body") == gb.team_result_guard.TEAM_LEAK_RESULT,
+          f"i) the withheld notice is posted, got {messages}")
+    check(media == [], f"i) no attachment reaches a room whose body was withheld, got {media}")
+    withheld = [line for line in logs if "attachment(s) withheld" in line]
+    check(len(withheld) == 1 and "report.csv" in withheld[0] and str(CSV.parent) not in withheld[0],
+          f"i) the withhold names only the file name, got {withheld}")
+
+    messages, media, logs = drain(f"[channel: {ROOM}]\nfor the room\n[file: {OUTSIDE}]\n",
+                                  name="proactive-j.txt")
+    refused = [line for line in logs if "attachment NOT sent" in line]
+    check(len(messages) == 1 and media == [], f"j) text sent, nothing uploaded, got {messages} {media}")
+    check(len(refused) == 1 and OUTSIDE.name in refused[0] and str(OUTSIDE.parent) not in refused[0],
+          f"j) a guest room's refusal names only the file name, got {refused}")
 
     print(f"\n{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failure(s)")
     return 1 if FAILS else 0

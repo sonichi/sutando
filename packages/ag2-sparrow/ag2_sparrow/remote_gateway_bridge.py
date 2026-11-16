@@ -8259,15 +8259,16 @@ def _proactive_attachments(body: str) -> "list[str]":
     return [a.value for a in parsed.actions if a.kind == "attach"]
 
 
-def _upload_proactive_attachments(name: str, room: str, attaches: "list[str]") -> None:
+def _upload_proactive_attachments(name: str, room: str, attaches: "list[str]", tier: str = "owner") -> None:
     """Upload a delivered proactive message's files to its room. The text is already sent,
     so a refusal cannot go in-band: each outcome is logged, a refused file loudly."""
     for fp in attaches:
         ok, reason = _upload_attachment(room, fp)
+        shown = team_result_guard.attachment_notice_name(fp, tier)
         if ok:
-            _log(f"attached {fp} to proactive {name} in {room}")
+            _log(f"attached {shown} to proactive {name} in {room}")
         else:
-            _log(f"proactive {name}: attachment NOT sent to {room}: {fp} ({reason})")
+            _log(f"proactive {name}: attachment NOT sent to {room}: {shown} ({reason})")
 
 
 def _proactive_thread_root(body: str, name: str = "") -> "str | None":
@@ -8382,8 +8383,8 @@ def _payload_room(payload) -> "str | None":
         return None
 
 
-def _proactive_item_id(stem: str, body: str) -> str:
-    return proactive_item_id(stem, body)
+def _proactive_item_id(stem: str, body: str, attachments=()) -> str:
+    return proactive_item_id(stem, body, attachments)
 
 
 def _proactive_requeue_command(root, item_id: str, body_sha256: str, reset_attempts: bool = False) -> str:
@@ -8761,22 +8762,43 @@ def _post_proactive() -> None:
             _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
             continue
         dest_room = resolve_destination(CURRENT_ROOM, room_id=room_override) if room_override else resolve_destination(OWNER_PRIVATE)
+        tier = "owner"
+        if room_override:
+            body, withheld = _guard_proactive_for_room(f.name, claimed_text, body, dest_room)
+            tier = "owner" if dest_room == resolve_destination(OWNER_PRIVATE) else "guest"
+            if withheld and attaches:
+                # A withheld body's files are the owner's output too: none reach that room.
+                _log(f"[team-guard] proactive {f.name}: {len(attaches)} attachment(s) withheld from {dest_room}: "
+                     + ", ".join(team_result_guard.attachment_notice_name(a, tier) for a in attaches))
+                attaches = []
         thread_root = _proactive_thread_root(claimed_text, f.name)
         about = about_task(f.name)
         if about:
             thread_root = _task_thread_root(_about_task_headers(about), dest_room) or thread_root
         envelope = {"room_id": dest_room, "body": body,
                     **({"thread_root": thread_root} if thread_root else {}),
-                    **({"task_id": about} if about else {})}
-        _send_proactive(claim, f, envelope, room_override is None, noticed, attaches)
+                    **({"task_id": about} if about else {}),
+                    **({"attachments": attaches} if attaches else {})}
+        _send_proactive(claim, f, envelope, room_override is None, noticed, tier)
+
+
+def _guard_proactive_for_room(name: str, text: str, body: str, room: str) -> "tuple[str, bool]":
+    """(the body a redirected proactive may post in `room`, whether the guard withheld it). No room
+    record states its audience tier, so every room but the owner DM guards as a non-owner one."""
+    _, withheld = team_result_guard.guard_proactive_for_destination(
+        text, room, resolve_destination(OWNER_PRIVATE), "guest", None, secret_filter=filter_chat_secrets)
+    if withheld is None:
+        return body, False
+    _log(f"[team-guard] withheld proactive {name} for {room}: {withheld}")
+    return team_result_guard.TEAM_LEAK_RESULT, True
 
 
 def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, noticed: set,
-                    attaches: "list[str] | None" = None) -> None:
+                    tier: str = "owner") -> None:
     """Hand one claimed proactive file to the outbox, which owns the claim, the send and its
     outcome, then move the file as that outcome says. An uncertain send is parked, not resent."""
     core = _delivery_core("proactive")
-    item_id = _proactive_item_id(f.stem, envelope["body"])
+    item_id = _proactive_item_id(f.stem, envelope["body"], envelope.get("attachments") or ())
     payload = json.dumps(envelope, sort_keys=True).encode("utf-8")
     seen = _PROACTIVE_SEND.__dict__.setdefault("seen", {})
     seen.clear()
@@ -8829,7 +8851,7 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
             _ENGINE_COUNTS["core_confirmed"] += 1
             _log(f"delivered proactive {f.name} to {room} ({item.get('provider_ref')})")
             # Only after this pass's own send: a resend never repeats an upload.
-            _upload_proactive_attachments(f.name, room, attaches or [])
+            _upload_proactive_attachments(f.name, room, envelope.get("attachments") or [], tier)
         else:
             _log(f"proactive {f.name} was already delivered to {room} "
                  f"({item.get('provider_ref') or 'receipt recorded'}) — archived, not sent again")
