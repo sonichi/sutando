@@ -5,7 +5,7 @@
   "license": "MIT",
   "stability": "experimental",
   "playbook": true,
-  "description": "Playbook for the schedule.fired AgentTrigger: a job someone scheduled with this agent in a room is due. Do the job as its creator's own request at the tier the task carries, and post the outcome once, top level, in that room. Idempotent by agent_trigger_id.",
+  "description": "Playbook for the schedule.fired AgentTrigger: a job someone scheduled with this agent in a room is due. Do the job as its creator's own request at the tier the task carries, and post the outcome once, top level, in that room. One run record per (schedule id, slot): claimed, waiting_approval, done; a stale claim with no result is reported for reconciliation, never re-run. At most once with reconciliation, not exactly once.",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   }
