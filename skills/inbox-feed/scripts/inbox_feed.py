@@ -11,7 +11,8 @@ Usage:
   inbox_feed.py rules init [--workspace PATH]
   inbox_feed.py map --source {github,gmail,slack} --kind KIND --file RAW.json
       [--account NAME] [--workspace PATH]
-  inbox_feed.py dedupe --file ITEMS.json [--live] [--workspace PATH]
+  inbox_feed.py dedupe --file ITEMS.json [--workspace PATH]
+  inbox_feed.py mark-sent --file CONFIRMED_ITEMS.json [--live] [--workspace PATH]
   inbox_feed.py find-room --file ROOMS.json --owner MXID
   inbox_feed.py cursors get --source {github,gmail,slack} [--workspace PATH]
   inbox_feed.py cursors set --source {github,gmail,slack} --value VALUE [--live] [--workspace PATH]
@@ -19,8 +20,11 @@ Usage:
   inbox_feed.py digest [--hours N] [--workspace PATH]
 
 `--live` is the one gate between "show what would happen" and "persist state" —
-`map` and `find-room` are read-only either way. Default is dry-run everywhere `--live`
-is accepted.
+`map`, `dedupe` and `find-room` are always read-only. `dedupe` only SELECTS
+candidates; `mark-sent` is the only command that records an item as sent, and it
+must be called only with items a `room.event.send` call actually confirmed — never
+before the send, never for one that failed or is unconfirmed. Default is dry-run
+everywhere `--live` is accepted.
 """
 from __future__ import annotations
 
@@ -32,7 +36,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from workspace_default import resolve_workspace  # noqa: E402
@@ -152,6 +156,14 @@ def _repo_full_name(raw: Dict[str, Any]) -> str:
     return m.group(1) if m else "unknown/unknown"
 
 
+def _identity(external_id: str, kind: str) -> str:
+    """The dedupe id: the object plus which KIND of fact this is. A later kind about
+    the same object (review_requested, then checks_failed on the same PR) is a
+    different fact, not a duplicate, and must not share an id with the first — only
+    `thread_key` (unqualified by kind) groups them as the same underlying object."""
+    return f"{external_id}:{kind}"
+
+
 def map_github(
     raw: Dict[str, Any], kind: str, rules: List[Dict[str, str]], account: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -177,7 +189,7 @@ def map_github(
         source["account"] = account
     return {
         "schema_version": SCHEMA_VERSION,
-        "id": external_id,
+        "id": _identity(external_id, kind),
         "external_id": external_id,
         "source": source,
         "actor": actor,
@@ -207,7 +219,7 @@ def map_gmail(
         source["account"] = account
     return {
         "schema_version": SCHEMA_VERSION,
-        "id": external_id,
+        "id": _identity(external_id, kind),
         "external_id": external_id,
         "source": source,
         "actor": {
@@ -240,7 +252,7 @@ def map_slack(
         source["account"] = account
     return {
         "schema_version": SCHEMA_VERSION,
-        "id": external_id,
+        "id": _identity(external_id, kind),
         "external_id": external_id,
         "source": source,
         "actor": {
@@ -281,75 +293,136 @@ def _slack_ts_to_iso(ts: str) -> str:
         return ""
 
 
-# --- dedupe: never send the same id twice -------------------------------------------
+# --- dedupe: never send the same (object, kind) twice, but let a newer fact through --
 
 
-def load_sent_ids(workspace: Path) -> Dict[str, str]:
+def _normalize_sent_entry(value: Any) -> Dict[str, str]:
+    """A legacy entry (this field used to be a bare ISO timestamp string) reads as
+    `revision: ""`, which is older than any real item's `updated_at` — so it
+    resurfaces once under the new scheme, then self-heals into the new shape."""
+    if isinstance(value, dict):
+        return {"seen_at": str(value.get("seen_at") or ""), "revision": str(value.get("revision") or "")}
+    return {"seen_at": str(value or ""), "revision": ""}
+
+
+def load_sent_ids(workspace: Path) -> Dict[str, Dict[str, str]]:
     try:
         data = json.loads(sent_ids_path(workspace).read_text())
     except (OSError, ValueError):
         return {}
     ids = data.get("ids") if isinstance(data, dict) else None
-    return ids if isinstance(ids, dict) else {}
+    if not isinstance(ids, dict):
+        return {}
+    return {item_id: _normalize_sent_entry(entry) for item_id, entry in ids.items()}
 
 
-def prune_sent_ids(ids: Dict[str, str], now: Optional[datetime] = None) -> Dict[str, str]:
+def prune_sent_ids(
+    ids: Dict[str, Dict[str, str]], now: Optional[datetime] = None
+) -> Dict[str, Dict[str, str]]:
     now = now or datetime.now(timezone.utc)
     cutoff = now - timedelta(days=SENT_IDS_MAX_AGE_DAYS)
-    kept: Dict[str, str] = {}
-    for item_id, seen_at in ids.items():
+    kept: Dict[str, Dict[str, str]] = {}
+    for item_id, entry in ids.items():
+        entry = _normalize_sent_entry(entry)
         try:
-            when = datetime.strptime(seen_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            when = datetime.strptime(entry["seen_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
         except (TypeError, ValueError):
             continue
         if when >= cutoff:
-            kept[item_id] = seen_at
+            kept[item_id] = entry
     return kept
 
 
-def dedupe_new(
-    items: List[Dict[str, Any]], sent_ids: Dict[str, str]
-) -> Tuple[List[Dict[str, Any]], Dict[str, str]]:
-    """Items not already in `sent_ids`, and the updated map (existing entries pruned,
-    the new items' ids added) — the caller decides whether to persist it."""
-    now = datetime.now(timezone.utc)
+def _collapse_batch(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Two hits sharing an id in the SAME batch (overlapping source queries) are one
+    candidate: the one carrying the newest `updated_at`."""
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        item_id = item.get("id")
+        existing = by_id.get(item_id)
+        if existing is None or (item.get("updated_at") or "") > (existing.get("updated_at") or ""):
+            by_id[item_id] = item
+    return list(by_id.values())
+
+
+def dedupe_new(items: List[Dict[str, Any]], sent_ids: Dict[str, Dict[str, str]]) -> List[Dict[str, Any]]:
+    """Candidates not already sent, OR already sent but with a strictly newer
+    `updated_at` than what was recorded — a later reply, status change or re-request
+    on the same (object, kind) is a newer fact, not a duplicate, and must resurface.
+    Read-only: never writes anything. `mark_sent` is the only writer, called only
+    after a send is confirmed — see its docstring for why these are split."""
+    pruned = prune_sent_ids(sent_ids)
+    new_items = []
+    for item in _collapse_batch(items):
+        prior = pruned.get(item.get("id"))
+        if prior is None or (item.get("updated_at") or "") > prior["revision"]:
+            new_items.append(item)
+    return new_items
+
+
+def record_sent(
+    sent_ids: Dict[str, Dict[str, str]], confirmed_items: List[Dict[str, Any]], now: Optional[datetime] = None
+) -> Dict[str, Dict[str, str]]:
+    """The updated sent-ids map after `confirmed_items` were actually, successfully
+    sent — never called for an item whose send failed, was denied or is unconfirmed
+    (that is the whole point of splitting this from `dedupe_new`: a crash or a
+    partial batch between selection and send must leave the unsent items eligible
+    again next run, not silently lost for the retention window)."""
+    now = now or datetime.now(timezone.utc)
     now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    pruned = prune_sent_ids(sent_ids, now)
-    new_items = [i for i in items if i.get("id") not in pruned]
-    updated = dict(pruned)
-    for item in new_items:
-        updated[item["id"]] = now_str
-    return new_items, updated
+    updated = dict(prune_sent_ids(sent_ids, now))
+    for item in confirmed_items:
+        updated[item["id"]] = {"seen_at": now_str, "revision": item.get("updated_at") or ""}
+    return updated
 
 
 # --- finding the owner's Inbox room ---------------------------------------------------
 
+_NO_INBOX_STATE = object()  # sentinel: this room carries no readable space.ag2.inbox state
+
+
+def _room_state_owner(room: Dict[str, Any]) -> Any:
+    for event in room.get("state_events") or []:
+        if event.get("type") == INBOX_STATE_TYPE:
+            return (event.get("content") or {}).get("owner")
+    return _NO_INBOX_STATE
+
 
 def find_inbox_room(rooms: List[Dict[str, Any]], owner_mxid: str) -> Dict[str, Any]:
     """`rooms`: [{room_id, joined (bool), state_events?: [{type, content}],
-    topic?: str, name?: str}]. Picks by the task's own priority: a joined room whose
-    `space.ag2.inbox` state names the owner; else its topic; else the name "Inbox".
-    A matching room this agent is not joined to answers not_member, never found —
-    the caller must ask to be invited and stop."""
+    topic?: str, name?: str}].
 
-    def names_owner(room: Dict[str, Any]) -> bool:
-        for event in room.get("state_events") or []:
-            if event.get("type") == INBOX_STATE_TYPE and (event.get("content") or {}).get(
-                "owner"
-            ) == owner_mxid:
-                return True
-        return False
+    `status: "found"` only when a room's own `space.ag2.inbox` state names this
+    owner — the one check that actually proves the room is theirs. A topic or bare
+    name match is weak evidence (useful for a freshly-created room whose state
+    hasn't synced yet) and answers `status: "needs_confirmation"` instead: SKILL.md
+    must ask the owner before any `--live` send there, never send on a weak match
+    alone. A room whose readable state names a DIFFERENT owner is proven not to be
+    this owner's room and is excluded even from the weak paths — a topic or name
+    coincidence never overrides contradicting state. `not_member` (for any match
+    type) means ask to be invited and stop; `not_found` means no candidate at all.
+    """
+    owner_of = {r["room_id"]: _room_state_owner(r) for r in rooms}
 
-    by_state = [r for r in rooms if names_owner(r)]
-    by_topic = [r for r in rooms if TOPIC_MARKER in (r.get("topic") or "")]
-    by_name = [r for r in rooms if (r.get("name") or "") == INBOX_ROOM_NAME]
+    by_state = [r for r in rooms if owner_of[r["room_id"]] == owner_mxid]
+    # Only a room with NO readable state at all is eligible for the weak match —
+    # one that contradicts (names someone else) must never be reached this way.
+    unknown_state = [r for r in rooms if owner_of[r["room_id"]] is _NO_INBOX_STATE]
+    by_topic = [r for r in unknown_state if TOPIC_MARKER in (r.get("topic") or "")]
+    by_name = [r for r in unknown_state if (r.get("name") or "") == INBOX_ROOM_NAME]
 
-    for candidates, matched_by in ((by_state, "state"), (by_topic, "topic"), (by_name, "name")):
+    if by_state:
+        joined = [r for r in by_state if r.get("joined")]
+        if joined:
+            return {"status": "found", "room_id": joined[0]["room_id"], "matched_by": "state"}
+        return {"status": "not_member", "room_id": by_state[0]["room_id"], "matched_by": "state"}
+
+    for candidates, matched_by in ((by_topic, "topic"), (by_name, "name")):
         if not candidates:
             continue
         joined = [r for r in candidates if r.get("joined")]
         if joined:
-            return {"status": "found", "room_id": joined[0]["room_id"], "matched_by": matched_by}
+            return {"status": "needs_confirmation", "room_id": joined[0]["room_id"], "matched_by": matched_by}
         return {"status": "not_member", "room_id": candidates[0]["room_id"], "matched_by": matched_by}
     return {"status": "not_found"}
 
@@ -422,7 +495,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     dedupe_p = sub.add_parser("dedupe")
     dedupe_p.add_argument("--file", required=True)
-    dedupe_p.add_argument("--live", action="store_true")
+
+    mark_sent_p = sub.add_parser("mark-sent")
+    mark_sent_p.add_argument("--file", required=True)
+    mark_sent_p.add_argument("--live", action="store_true")
 
     find_room_p = sub.add_parser("find-room")
     find_room_p.add_argument("--file", required=True)
@@ -466,10 +542,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "dedupe":
         items = _read_json_file(args.file)
         sent_ids = load_sent_ids(workspace)
-        new_items, updated_ids = dedupe_new(items, sent_ids)
+        new_items = dedupe_new(items, sent_ids)
+        print(json.dumps({"new_items": new_items}, indent=2))
+        return 0
+
+    if args.command == "mark-sent":
+        confirmed_items = _read_json_file(args.file)
+        sent_ids = load_sent_ids(workspace)
+        updated_ids = record_sent(sent_ids, confirmed_items)
         if args.live:
             _atomic_write(sent_ids_path(workspace), json.dumps({"ids": updated_ids}))
-        print(json.dumps({"new_items": new_items, "persisted": args.live}, indent=2))
+        print(json.dumps({"marked": len(confirmed_items), "persisted": args.live}, indent=2))
         return 0
 
     if args.command == "find-room":

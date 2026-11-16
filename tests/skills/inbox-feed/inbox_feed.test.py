@@ -109,8 +109,8 @@ class MapGithubTest(unittest.TestCase):
     def test_review_requested_maps_every_field(self):
         item = ib.map_github(GITHUB_REVIEW_REQUEST_FIXTURE, "review_requested", ib.DEFAULT_RULES)
         self.assertEqual(item["schema_version"], 1)
-        self.assertEqual(item["id"], "github:ag2-space/cinny-webclient#4402")
-        self.assertEqual(item["external_id"], item["id"])
+        self.assertEqual(item["external_id"], "github:ag2-space/cinny-webclient#4402")
+        self.assertEqual(item["id"], "github:ag2-space/cinny-webclient#4402:review_requested")
         self.assertEqual(item["source"], {"app": "github"})
         self.assertEqual(item["actor"]["id"], "liususan091219")
         self.assertEqual(item["actor"]["avatar_url"], GITHUB_REVIEW_REQUEST_FIXTURE["user"]["avatar_url"])
@@ -145,7 +145,8 @@ class MapGithubTest(unittest.TestCase):
 class MapGmailTest(unittest.TestCase):
     def test_unread_thread_maps_needs_you_by_default_rules(self):
         item = ib.map_gmail(GMAIL_UNREAD_FIXTURE, "thread_needs_reply", ib.DEFAULT_RULES)
-        self.assertEqual(item["id"], "gmail:18c9f1a2b3d4e5f6")
+        self.assertEqual(item["external_id"], "gmail:18c9f1a2b3d4e5f6")
+        self.assertEqual(item["id"], "gmail:18c9f1a2b3d4e5f6:thread_needs_reply")
         self.assertEqual(item["source"], {"app": "gmail"})
         self.assertEqual(item["actor"]["display_name"], "Mark")
         self.assertIn("scheduler promotion", item["what"]["summary"])
@@ -168,7 +169,8 @@ class MapGmailTest(unittest.TestCase):
 class MapSlackTest(unittest.TestCase):
     def test_dm_maps_needs_you(self):
         item = ib.map_slack(SLACK_DM_FIXTURE, "dm", ib.DEFAULT_RULES)
-        self.assertEqual(item["id"], "slack:D0123456:1795000000.000100")
+        self.assertEqual(item["external_id"], "slack:D0123456:1795000000.000100")
+        self.assertEqual(item["id"], "slack:D0123456:1795000000.000100:dm")
         self.assertEqual(item["thread_key"], "slack:D0123456:1795000000.000100")
         self.assertEqual(item["actor"]["display_name"], "chi")
         self.assertEqual(item["priority"], "needs_you")
@@ -177,8 +179,10 @@ class MapSlackTest(unittest.TestCase):
     def test_threaded_message_groups_under_thread_ts_not_its_own_ts(self):
         raw = {**SLACK_DM_FIXTURE, "ts": "1795000005.000200", "thread_ts": "1795000000.000100"}
         item = ib.map_slack(raw, "mention", ib.DEFAULT_RULES)
+        # Groups with the thread root (not this message's own ts)...
         self.assertEqual(item["thread_key"], "slack:D0123456:1795000000.000100")
-        self.assertNotEqual(item["id"], item["thread_key"].replace("slack:", "slack:", 1))
+        # ...but its own identity is still its own message, not the thread root's.
+        self.assertEqual(item["external_id"], "slack:D0123456:1795000005.000200")
 
     def test_channel_activity_without_mention_is_fyi(self):
         item = ib.map_slack(SLACK_DM_FIXTURE, "channel_activity", ib.DEFAULT_RULES)
@@ -188,14 +192,58 @@ class MapSlackTest(unittest.TestCase):
 class DedupeTest(unittest.TestCase):
     def test_new_item_passes_through_once(self):
         item = ib.map_github(GITHUB_REVIEW_REQUEST_FIXTURE, "review_requested", ib.DEFAULT_RULES)
-        new_items, updated = ib.dedupe_new([item], {})
-        self.assertEqual(new_items, [item])
-        self.assertIn(item["id"], updated)
+        self.assertEqual(ib.dedupe_new([item], {}), [item])
 
-    def test_already_sent_id_is_dropped(self):
+    def test_dedupe_cli_never_writes_anything_itself(self):
+        # dedupe has no --live at all any more: selection and delivery are split
+        # (review P2 — marking "sent" must happen only after a confirmed send).
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            item = ib.map_github(GITHUB_REVIEW_REQUEST_FIXTURE, "review_requested", ib.DEFAULT_RULES)
+            items_file = ws / "items.json"
+            items_file.write_text(json.dumps([item]))
+            ib.main(["--workspace", str(ws), "dedupe", "--file", str(items_file)])
+            self.assertFalse(ib.sent_ids_path(ws).exists())
+
+    def test_already_sent_same_revision_is_dropped(self):
         item = ib.map_github(GITHUB_REVIEW_REQUEST_FIXTURE, "review_requested", ib.DEFAULT_RULES)
-        new_items, _ = ib.dedupe_new([item], {item["id"]: "2026-11-15T00:00:00Z"})
-        self.assertEqual(new_items, [])
+        sent_ids = {item["id"]: {"seen_at": "2026-11-15T00:00:00Z", "revision": item["updated_at"]}}
+        self.assertEqual(ib.dedupe_new([item], sent_ids), [])
+
+    def test_a_newer_revision_of_an_already_sent_id_resurfaces(self):
+        # A later reply/status-change on the SAME (object, kind) must not be
+        # permanently swallowed just because an earlier revision was already sent.
+        item_v1 = ib.map_github(GITHUB_REVIEW_REQUEST_FIXTURE, "review_requested", ib.DEFAULT_RULES)
+        later_raw = {**GITHUB_REVIEW_REQUEST_FIXTURE, "updated_at": "2026-11-17T00:00:00Z"}
+        item_v2 = ib.map_github(later_raw, "review_requested", ib.DEFAULT_RULES)
+        sent_ids = {item_v1["id"]: {"seen_at": "2026-11-16T00:00:00Z", "revision": item_v1["updated_at"]}}
+        self.assertEqual(ib.dedupe_new([item_v2], sent_ids), [item_v2])
+
+    def test_a_different_kind_on_the_same_object_is_not_a_duplicate(self):
+        # The exact review repro: review_requested already sent must not swallow a
+        # later checks_failed on the SAME PR — they are different facts.
+        pr_raw = GITHUB_REVIEW_REQUEST_FIXTURE
+        review_requested = ib.map_github(pr_raw, "review_requested", ib.DEFAULT_RULES)
+        later_raw = {**pr_raw, "updated_at": "2026-11-17T00:00:00Z"}
+        checks_failed = ib.map_github(later_raw, "checks_failed", ib.DEFAULT_RULES)
+        self.assertNotEqual(review_requested["id"], checks_failed["id"])
+        self.assertEqual(review_requested["thread_key"], checks_failed["thread_key"])
+        sent_ids = {
+            review_requested["id"]: {
+                "seen_at": "2026-11-16T00:00:00Z",
+                "revision": review_requested["updated_at"],
+            }
+        }
+        self.assertEqual(ib.dedupe_new([checks_failed], sent_ids), [checks_failed])
+
+    def test_two_hits_sharing_an_id_in_one_batch_collapse_to_the_newest(self):
+        pr_raw = GITHUB_REVIEW_REQUEST_FIXTURE
+        stale = ib.map_github(pr_raw, "review_requested", ib.DEFAULT_RULES)
+        fresh_raw = {**pr_raw, "updated_at": "2026-11-18T00:00:00Z", "title": "retitled"}
+        fresh = ib.map_github(fresh_raw, "review_requested", ib.DEFAULT_RULES)
+        new_items = ib.dedupe_new([stale, fresh], {})
+        self.assertEqual(len(new_items), 1)
+        self.assertEqual(new_items[0]["updated_at"], "2026-11-18T00:00:00Z")
 
     def test_prune_drops_entries_older_than_the_window(self):
         from datetime import datetime, timedelta, timezone
@@ -203,28 +251,70 @@ class DedupeTest(unittest.TestCase):
         now = datetime(2026, 11, 16, tzinfo=timezone.utc)
         old = (now - timedelta(days=ib.SENT_IDS_MAX_AGE_DAYS + 1)).strftime("%Y-%m-%dT%H:%M:%SZ")
         fresh = (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        pruned = ib.prune_sent_ids({"old-id": old, "fresh-id": fresh}, now=now)
-        self.assertEqual(pruned, {"fresh-id": fresh})
+        sent_ids = {"old-id": {"seen_at": old, "revision": "x"}, "fresh-id": {"seen_at": fresh, "revision": "x"}}
+        pruned = ib.prune_sent_ids(sent_ids, now=now)
+        self.assertEqual(set(pruned), {"fresh-id"})
 
-    def test_dry_run_cli_never_writes_sent_ids_file(self):
+    def test_a_legacy_bare_timestamp_entry_is_tolerated_and_resurfaces_once(self):
+        # A legacy bare-string entry must not crash load/prune; it resurfaces once
+        # (revision "" < any real updated_at), then self-heals into the new shape.
+        item = ib.map_github(GITHUB_REVIEW_REQUEST_FIXTURE, "review_requested", ib.DEFAULT_RULES)
+        legacy_sent_ids = {item["id"]: "2026-11-15T00:00:00Z"}
+        self.assertEqual(ib.dedupe_new([item], legacy_sent_ids), [item])
+
+
+class MarkSentTest(unittest.TestCase):
+    def test_record_sent_is_pure_and_only_covers_what_it_is_given(self):
+        item = ib.map_github(GITHUB_REVIEW_REQUEST_FIXTURE, "review_requested", ib.DEFAULT_RULES)
+        updated = ib.record_sent({}, [item])
+        self.assertIn(item["id"], updated)
+        self.assertEqual(updated[item["id"]]["revision"], item["updated_at"])
+
+    def test_selection_alone_never_marks_anything_sent_the_review_p2_repro(self):
+        # Exact review repro: dedupe --live used to mark "sent" with zero sends
+        # in between. Now dedupe writes nothing; only mark-sent does.
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)
             item = ib.map_github(GITHUB_REVIEW_REQUEST_FIXTURE, "review_requested", ib.DEFAULT_RULES)
             items_file = ws / "items.json"
             items_file.write_text(json.dumps([item]))
-            rc = ib.main(["--workspace", str(ws), "dedupe", "--file", str(items_file)])
-            self.assertEqual(rc, 0)
+            ib.main(["--workspace", str(ws), "dedupe", "--file", str(items_file)])
+            # No room.event.send ever happened (nothing here ever calls it). A retry
+            # must still see the item as new.
+            retried = ib.dedupe_new([item], ib.load_sent_ids(ws))
+            self.assertEqual(retried, [item])
+
+    def test_mark_sent_dry_run_does_not_persist(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            item = ib.map_github(GITHUB_REVIEW_REQUEST_FIXTURE, "review_requested", ib.DEFAULT_RULES)
+            items_file = ws / "items.json"
+            items_file.write_text(json.dumps([item]))
+            ib.main(["--workspace", str(ws), "mark-sent", "--file", str(items_file)])
             self.assertFalse(ib.sent_ids_path(ws).exists())
 
-    def test_live_cli_persists_sent_ids(self):
+    def test_mark_sent_live_persists_and_then_dedupe_drops_it(self):
         with tempfile.TemporaryDirectory() as td:
             ws = Path(td)
             item = ib.map_github(GITHUB_REVIEW_REQUEST_FIXTURE, "review_requested", ib.DEFAULT_RULES)
             items_file = ws / "items.json"
             items_file.write_text(json.dumps([item]))
-            ib.main(["--workspace", str(ws), "dedupe", "--file", str(items_file), "--live"])
+            ib.main(["--workspace", str(ws), "mark-sent", "--file", str(items_file), "--live"])
             saved = json.loads(ib.sent_ids_path(ws).read_text())
             self.assertIn(item["id"], saved["ids"])
+            self.assertEqual(ib.dedupe_new([item], ib.load_sent_ids(ws)), [])
+
+    def test_an_unconfirmed_item_left_out_of_mark_sent_stays_eligible(self):
+        # Simulating a partial batch: only one of two sent items is confirmed.
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            sent_ok = ib.map_github(GITHUB_REVIEW_REQUEST_FIXTURE, "review_requested", ib.DEFAULT_RULES)
+            unconfirmed = ib.map_github(GITHUB_MERGED_PR_FIXTURE, "pr_merged", ib.DEFAULT_RULES)
+            confirmed_file = ws / "confirmed.json"
+            confirmed_file.write_text(json.dumps([sent_ok]))  # unconfirmed deliberately left out
+            ib.main(["--workspace", str(ws), "mark-sent", "--file", str(confirmed_file), "--live"])
+            remaining = ib.dedupe_new([sent_ok, unconfirmed], ib.load_sent_ids(ws))
+            self.assertEqual(remaining, [unconfirmed])
 
 
 class FindInboxRoomTest(unittest.TestCase):
@@ -254,18 +344,30 @@ class FindInboxRoomTest(unittest.TestCase):
         self.assertEqual(result["status"], "not_member")
         self.assertEqual(result["room_id"], "!inbox:s.space")
 
-    def test_falls_back_to_topic_when_no_state_is_readable(self):
+    def test_topic_match_with_no_readable_state_needs_confirmation_not_found(self):
+        # A weak match must never auto-qualify as "found" — SKILL.md requires asking
+        # the owner before any --live send on this status (review P1 remediation).
         rooms = [
             {"room_id": "!a:s.space", "joined": True, "topic": "general chat"},
             {"room_id": "!inbox:s.space", "joined": True, "topic": "Your private Inbox. Ask your agent..."},
         ]
         result = ib.find_inbox_room(rooms, self.OWNER)
-        self.assertEqual(result, {"status": "found", "room_id": "!inbox:s.space", "matched_by": "topic"})
+        self.assertEqual(
+            result, {"status": "needs_confirmation", "room_id": "!inbox:s.space", "matched_by": "topic"}
+        )
 
-    def test_falls_back_to_the_name_inbox_last(self):
+    def test_name_match_with_no_readable_state_needs_confirmation_not_found(self):
         rooms = [{"room_id": "!inbox:s.space", "joined": True, "name": "Inbox"}]
         result = ib.find_inbox_room(rooms, self.OWNER)
-        self.assertEqual(result, {"status": "found", "room_id": "!inbox:s.space", "matched_by": "name"})
+        self.assertEqual(result, {"status": "needs_confirmation", "room_id": "!inbox:s.space", "matched_by": "name"})
+
+    def test_a_room_named_inbox_for_an_unrelated_reason_is_never_auto_found(self):
+        # Exact repro from the review: a team's own generic triage room happens to be
+        # named "Inbox", carries no space.ag2.inbox state at all. Must not be `found`.
+        rooms = [{"room_id": "!team-triage:s.space", "joined": True, "name": "Inbox"}]
+        result = ib.find_inbox_room(rooms, self.OWNER)
+        self.assertNotEqual(result["status"], "found")
+        self.assertEqual(result["status"], "needs_confirmation")
 
     def test_a_same_owner_different_agent_is_not_fooled_by_a_different_owner(self):
         rooms = [
@@ -276,6 +378,47 @@ class FindInboxRoomTest(unittest.TestCase):
             }
         ]
         self.assertEqual(ib.find_inbox_room(rooms, self.OWNER), {"status": "not_found"})
+
+    def test_a_room_with_contradicting_owner_state_is_never_matched_via_its_topic(self):
+        # The topic contains the marker text, but the room's OWN state names a
+        # different owner — that contradiction must win, not even needs_confirmation.
+        rooms = [
+            {
+                "room_id": "!someone-elses-inbox:s.space",
+                "joined": True,
+                "topic": "Your private Inbox for someone else entirely",
+                "state_events": [{"type": "space.ag2.inbox", "content": {"owner": "@someone-else:s.space"}}],
+            }
+        ]
+        self.assertEqual(ib.find_inbox_room(rooms, self.OWNER), {"status": "not_found"})
+
+    def test_a_room_with_contradicting_owner_state_is_never_matched_via_its_name(self):
+        rooms = [
+            {
+                "room_id": "!someone-elses-inbox:s.space",
+                "joined": True,
+                "name": "Inbox",
+                "state_events": [{"type": "space.ag2.inbox", "content": {"owner": "@someone-else:s.space"}}],
+            }
+        ]
+        self.assertEqual(ib.find_inbox_room(rooms, self.OWNER), {"status": "not_found"})
+
+    def test_a_genuine_owner_state_room_still_wins_outright_over_a_weak_match(self):
+        rooms = [
+            {"room_id": "!decoy:s.space", "joined": True, "name": "Inbox"},
+            {
+                "room_id": "!real-inbox:s.space",
+                "joined": True,
+                "state_events": [{"type": "space.ag2.inbox", "content": {"owner": self.OWNER, "version": 1}}],
+            },
+        ]
+        result = ib.find_inbox_room(rooms, self.OWNER)
+        self.assertEqual(result, {"status": "found", "room_id": "!real-inbox:s.space", "matched_by": "state"})
+
+    def test_weak_match_not_joined_is_not_member_not_needs_confirmation(self):
+        rooms = [{"room_id": "!inbox:s.space", "joined": False, "name": "Inbox"}]
+        result = ib.find_inbox_room(rooms, self.OWNER)
+        self.assertEqual(result["status"], "not_member")
 
     def test_nothing_matches_anything(self):
         rooms = [{"room_id": "!a:s.space", "joined": True, "name": "random"}]
@@ -402,8 +545,13 @@ class HelperEdgeCasesTest(unittest.TestCase):
             self.assertEqual(ib.load_rules(ws), ib.DEFAULT_RULES)
 
     def test_prune_skips_an_unparseable_timestamp_rather_than_crashing(self):
-        pruned = ib.prune_sent_ids({"bad-id": "not-a-timestamp", "good-id": "2026-11-16T00:00:00Z"})
+        sent_ids = {
+            "bad-id": {"seen_at": "not-a-timestamp", "revision": "x"},
+            "good-id": {"seen_at": "2026-11-16T00:00:00Z", "revision": "x"},
+        }
+        pruned = ib.prune_sent_ids(sent_ids)
         self.assertNotIn("bad-id", pruned)
+        self.assertIn("good-id", pruned)
 
     def test_digest_recent_check_tolerates_a_missing_or_bad_timestamp(self):
         item = {

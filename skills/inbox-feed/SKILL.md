@@ -43,7 +43,16 @@ Both default to a dry run — nothing is sent to the Inbox room unless you say `
    python3 skills/inbox-feed/scripts/inbox_feed.py find-room --file rooms.json --owner <owner mxid>
    ```
 
-   - `{"status": "found", "room_id": "..."}` → that's the Inbox room, continue.
+   - `{"status": "found", "room_id": "..."}` → the room's own `space.ag2.inbox` state
+     names this owner. That's the only status allowed to proceed straight to a
+     `--live` send; continue.
+   - `{"status": "needs_confirmation", "room_id": "...", "matched_by": "topic"|"name"}`
+     → only a topic or a bare room name matched — no state, so **never** trust this on
+     its own. Ask the owner to confirm that room is their real Inbox before any
+     `--live` send there (one message is enough: "I found a room named/topic-matching
+     Inbox, is `<room_id>` your real Inbox room?"); treat it exactly like
+     `not_member` until they say yes. A room whose state names a *different* owner is
+     never returned here at all — it's excluded outright, not merely weak evidence.
    - `{"status": "not_member", ...}` → **reply "invite me to your Inbox room" and
      stop.** Do not try `room.invite.*` yourself — the client doesn't invite the
      agent yet (confirmed in research), so there is nothing to call that would work.
@@ -76,31 +85,49 @@ Both default to a dry run — nothing is sent to the Inbox room unless you say `
 
    Collect every mapped item from every source/kind into one array.
 
-3. **Dedupe, then decide live vs dry-run.**
+3. **Dedupe — selection only, never records anything.**
 
    ```bash
-   python3 skills/inbox-feed/scripts/inbox_feed.py dedupe --file items.json           # preview
-   python3 skills/inbox-feed/scripts/inbox_feed.py dedupe --file items.json --live    # also persists
+   python3 skills/inbox-feed/scripts/inbox_feed.py dedupe --file items.json
    ```
 
-   `new_items` is what hasn't been sent before. Without `--live` this previews only —
-   nothing is marked sent, so a dry run never causes the next real run to skip
-   anything. **Without `--live` anywhere in this flow, stop after printing
-   `new_items` — do not call `room.event.send`.**
+   `new_items` is every candidate not already sent, **plus** any item whose
+   `updated_at` is newer than what was last recorded for its `id` (a later reply, a
+   status change, a re-request on the same object surfaces again — it's a new fact,
+   not a duplicate). `dedupe` never writes state; it only ever tells you what's a
+   candidate. **Without `--live` (step 4 below), stop here — do not call
+   `room.event.send`.**
 
-4. **On `--live`, send each new item**, as yourself, into the Inbox room:
+4. **On `--live`, send each new item, then mark ONLY the ones that actually sent.**
 
    ```
    room.event.send(room_id=<inbox room>, type="space.ag2.inbox.item", content=<item>)
    ```
 
-   one call per item (`room.event.send` takes one event, not a batch). After sending
-   all of them, advance each source's cursor and append the sent items to the local
-   log, both also gated on `--live`:
+   One call per item (`room.event.send` takes one event, not a batch). **Selection
+   and delivery are two different steps on purpose**: `dedupe` must never be the
+   thing that marks an item sent, because a crash, a denial, or a partial batch
+   between selection and the actual send would otherwise lose the unsent items for
+   the whole 45-day retention window — they'd look "already sent" forever even
+   though they never reached the room. So: after each `room.event.send` call
+   succeeds, add that item to a `confirmed` list; after the loop (or incrementally,
+   per item — either is fine, the point is "after success, not before"), record only
+   the confirmed ones:
+
+   ```bash
+   python3 skills/inbox-feed/scripts/inbox_feed.py mark-sent --file confirmed.json         # preview
+   python3 skills/inbox-feed/scripts/inbox_feed.py mark-sent --file confirmed.json --live  # persists
+   ```
+
+   An item whose `room.event.send` call failed, was denied, or whose outcome is
+   unknown (lost response, etc.) must **not** appear in `confirmed.json` — leave it
+   out, and it stays eligible on the next `poll` run rather than vanishing silently.
+   Finally, advance each source's cursor (also gated on `--live`) and append every
+   confirmed item to the local digest log:
 
    ```bash
    python3 skills/inbox-feed/scripts/inbox_feed.py cursors set --source github --value <newest updated_at> --live
-   python3 skills/inbox-feed/scripts/inbox_feed.py log-sent --file items.json --live
+   python3 skills/inbox-feed/scripts/inbox_feed.py log-sent --file confirmed.json --live
    ```
 
 ## `/inbox-feed digest [--hours N] [--live]`
@@ -133,9 +160,16 @@ ahead of the catch-all rule. No code change, no redeploy, no PR.
 
 - `poll` and `digest` are **dry-run by default**. `--live` is required to write
   anything — into the Inbox room or into this skill's own state files.
-- `room.event.send` and `room.message.send` run under this agent's own authority,
-  into a room only its owner's Inbox can be (confirmed by `space.ag2.inbox.owner`,
-  never a room_id you pick) — no new UI, no change to sign-in, credentials or
-  approval holds; nothing here needs an approval card.
-- The rules file and the cursor/sent-id state are per-workspace data, not secrets —
-  they hold no account content, only ids, timestamps and a priority label.
+- `room.event.send` and `room.message.send` run under this agent's own authority. A
+  `--live` send only ever proceeds on `find-room`'s `found` status, which is proven
+  by `space.ag2.inbox.owner` naming this owner — never a bare `room_id` you pick, and
+  never a `needs_confirmation` match without the owner's own yes first. No new UI, no
+  change to sign-in, credentials or approval holds; nothing here needs an approval
+  card.
+- The rules file, the cursors and the sent-ids state hold no account content, only
+  ids, timestamps and a priority label. **The one exception is the sent-log**
+  (`log-sent`, which backs `digest` with no `--file`): it stores each sent item
+  verbatim, including `what.summary` — up to 280 characters of a real email
+  subject/snippet, Slack message or GitHub title. That's a deliberate trade for a
+  useful digest, not an oversight; if that's unwanted, pass `--file` to `digest`
+  explicitly and never call `log-sent --live`.
