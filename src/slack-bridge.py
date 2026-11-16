@@ -1934,7 +1934,10 @@ def result_watcher():
                             dm_channel = resp["channel"]["id"]
                             if _send_reply(dm_channel, None, text, access_tier="owner"):
                                 mark_proactive_delivered(STATE_DIR, delivery_id)
-                                print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
+                                # Log where _send_reply posted: a [channel:] body never reaches the owner's DM.
+                                _sent = parse_markers(text)
+                                _dest = next((a.value for a in _sent.actions if a.kind == "redirect"), owner_id)
+                                print(f"  [proactive] sent to {_dest}: {_sent.body[:80]}", flush=True)
                                 claim.unlink(missing_ok=True)
                             else:
                                 # Slack refused WITHOUT raising, which is the ordinary

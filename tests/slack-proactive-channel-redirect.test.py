@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""A proactive Slack body led by [channel: <id>] is delivered to <id>, stripped (#4971).
+
+Drives the real `result_watcher` loop and `_send_reply`: the redirect and attach
+markers come from `parse_markers`, and the delivery log names the real destination.
+"""
+from __future__ import annotations
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import threading
+import time
+import types
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+# MODULE level, before any exec_module: the bridge resolves ACCESS_FILE during
+# import and falls back to the real ~/.claude when CLAUDE_CONFIG_DIR is unset.
+_CCD = tempfile.mkdtemp(prefix="sutando-slack-redirect-ccd-")
+os.environ["CLAUDE_CONFIG_DIR"] = _CCD
+_cfg_slack = Path(_CCD) / "channels" / "slack"
+_cfg_slack.mkdir(parents=True, exist_ok=True)
+(_cfg_slack / "access.json").write_text('{"allowFrom": []}')
+
+FAILURES: list[str] = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    if cond:
+        print(f"  ok   {name}")
+    else:
+        FAILURES.append(f"{name}{(' — ' + detail) if detail else ''}")
+        print(f"  FAIL {name} {detail}")
+
+
+class _RecordingClient:
+    def __init__(self):
+        self.calls = []
+        self.opened_for = None
+
+    def conversations_open(self, **kwargs):
+        self.opened_for = kwargs["users"]
+        return {"channel": {"id": "D-OWNER"}}
+
+    def chat_postMessage(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"ok": True}
+
+
+class _FakeApp:
+    def __init__(self, token=None):
+        self.client = _RecordingClient()
+
+    def _decorator(self, *args, **kwargs):
+        return lambda fn: fn
+
+    event = message = command = action = shortcut = view = _decorator
+
+
+def _load_bridge():
+    bolt = types.ModuleType("slack_bolt")
+    bolt.App = _FakeApp
+    sys.modules["slack_bolt"] = bolt
+    sys.modules["slack_bolt.adapter"] = types.ModuleType("slack_bolt.adapter")
+    socket = types.ModuleType("slack_bolt.adapter.socket_mode")
+    socket.SocketModeHandler = type("SocketModeHandler", (), {})
+    sys.modules["slack_bolt.adapter.socket_mode"] = socket
+
+    os.environ["SUTANDO_WORKSPACE"] = tempfile.mkdtemp(prefix="sutando-slack-redirect-")
+    os.environ["SUTANDO_TEST_MODE"] = "1"
+    os.environ["SLACK_BOT_TOKEN"] = "xoxb-test-not-real"
+    os.environ["SLACK_APP_TOKEN"] = "xapp-test-not-real"
+    spec = importlib.util.spec_from_file_location(
+        "slackbridge_proactive_redirect_test", REPO / "src" / "slack-bridge.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _read_either(*paths):
+    """Return the body from whichever name currently exists.
+    exists()-then-read races the watcher's rename between the two calls."""
+    for _ in range(100):
+        for p in paths:
+            try:
+                return p.read_text()
+            except FileNotFoundError:
+                continue
+        time.sleep(0.02)
+    return None
+
+
+def _settle(predicate, timeout=4.0, interval=0.1):
+    """Poll until predicate holds; the watcher runs on its own cadence."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+
+def main() -> int:
+    bridge = _load_bridge()
+    results = Path(bridge.RESULTS_DIR)
+    access = Path(os.environ["SUTANDO_WORKSPACE"]) / "access.json"
+    access.write_text(json.dumps({"allowFrom": ["owner-1"],
+                                  "tierMap": {"owner-1": "owner"},
+                                  "tofuOwner": "owner-1"}))
+    bridge.ACCESS_FILE = access
+
+    logged: list[str] = []
+    real_print = print
+
+    def _capture(*args, **kwargs):
+        logged.append(" ".join(str(a) for a in args))
+        real_print(*args, **kwargs)
+
+    bridge.print = _capture
+
+    missing = "/nonexistent-4971/report.png"
+    name = "proactive-redirect-4971.txt"
+    (results / name).write_text(f"[channel: D0OTHERDM1]\nhello other DM\n[attach: {missing}]\n")
+
+    threading.Thread(target=bridge.result_watcher, daemon=True).start()
+    calls = bridge.app.client.calls
+    check("the proactive file was delivered",
+          _settle(lambda: len(calls) >= 2 and not (results / name).exists()),
+          f"{len(calls)} post(s)")
+
+    channels = {c.get("channel") for c in calls}
+    texts = [c.get("text", "") for c in calls]
+    check("every post goes to the redirect target, none to the owner's DM",
+          channels == {"D0OTHERDM1"}, f"posted to {sorted(map(str, channels))}")
+    check("the body arrives without the redirect marker",
+          "hello other DM" in texts and not any("[channel:" in t for t in texts), repr(texts))
+    check("the attach marker is acted on, not shown",
+          not any("[attach:" in t for t in texts), repr(texts))
+
+    sent = [line for line in logged if "[proactive] sent to" in line]
+    check("the delivery log names the redirect target",
+          len(sent) == 1 and "sent to D0OTHERDM1" in sent[0], repr(sent))
+    check("the delivery log shows the parsed body, not the raw markers",
+          len(sent) == 1 and "[channel:" not in sent[0], repr(sent))
+
+    print()
+    if FAILURES:
+        print(f"FAIL — {len(FAILURES)} check(s):")
+        for f in FAILURES:
+            print(f"  - {f}")
+        return 1
+    print("PASS: a [channel:] proactive Slack body goes to its target, markers stripped")
+    return 0
+
+
+if __name__ == "__main__":
+    rc = main()
+    # result_watcher is a daemon thread with no stop condition; exit before finalization races it.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(rc)
