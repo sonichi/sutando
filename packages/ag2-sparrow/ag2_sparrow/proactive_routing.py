@@ -33,7 +33,6 @@ import hashlib
 import json
 import os
 import re
-import stat
 from pathlib import Path
 
 # Bridges that deliver proactive files; any other activity channel (voice, github-commits)
@@ -177,34 +176,34 @@ def resolve_attachment_path(path: str) -> str:
     return os.path.realpath(os.path.expanduser(path.strip()))
 
 
-def attachment_identity(path: str, admit=None, max_bytes: int = 0) -> str:
-    """`<resolved path> <size> <sha256>` for a file `admit` allows that is regular and at most
-    `max_bytes`; anything else is named, never read, so a refused file cannot stall the caller."""
+def read_attachment(path: str, admit, max_bytes: int) -> "tuple[str, bytes | None, str]":
+    """(resolved path, its bytes, "") for a regular file `admit` allows, of at most `max_bytes`,
+    read through one descriptor proven to be the admitted file; (resolved path, None, reason) else."""
+    try:  # pragma: no cover - imported here so a routing-only caller needs no reader
+        from .bounded_file_read import read_regular_bytes
+    except ImportError:  # pragma: no cover - flat src/ import path
+        from bounded_file_read import read_regular_bytes
     resolved = resolve_attachment_path(path)
     if admit is None or not admit(resolved):
-        return f"{resolved} refused"
-    try:
-        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
-    except OSError:
-        return f"{resolved} unreadable"
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            return f"{resolved} refused"
-        if info.st_size > max_bytes:
-            return f"{resolved} {info.st_size} oversize"
-        digest, left = hashlib.sha256(), max_bytes + 1
-        while left > 0:
-            chunk = os.read(fd, min(1 << 20, left))
-            if not chunk:
-                break
-            digest.update(chunk)
-            left -= len(chunk)
-        return f"{resolved} {info.st_size} {digest.hexdigest()}"
-    except OSError:
-        return f"{resolved} unreadable"
-    finally:
-        os.close(fd)
+        return resolved, None, "path not allowlisted"
+
+    def same_file(info) -> str:
+        try:
+            ok = os.path.samestat(info, os.stat(resolved)) and admit(resolved)
+        except OSError:
+            ok = False
+        return "" if ok else "changed after its check"
+    data, reason = read_regular_bytes(resolved, max_bytes, follow=False, verify=same_file)
+    return (resolved, data, "") if data is not None else (resolved, None, reason or "not found")
+
+
+def attachment_identity(path: str, admit=None, max_bytes: int = 0) -> str:
+    """`<resolved path> <size> <sha256>` of what read_attachment would send, or the path and
+    why it would refuse: a changed file under the same path is a different attachment."""
+    resolved, data, reason = read_attachment(path, admit, max_bytes)
+    if data is None:
+        return f"{resolved} {reason}"
+    return f"{resolved} {len(data)} {hashlib.sha256(data).hexdigest()}"
 
 
 def proactive_item_id(stem: str, body: str, attachments=(), admit=None, max_bytes: int = 0) -> str:

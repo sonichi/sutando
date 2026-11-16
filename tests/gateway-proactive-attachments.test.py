@@ -16,6 +16,9 @@
   m) a FIFO outside the allowlist never stalls the drain: the text is sent, nothing uploaded
   n) a file outside the allowlist is never opened to fingerprint it
   o) an allowlisted file over the size cap is never read to fingerprint it
+  p) the upload reader: a file that grows after its check is refused, never read past the cap
+  q) the upload reader: an allowlisted file swapped for a symlink after its check is refused
+  r) the canonical src/ copy gives the same identities and reads as the vendored one
 
 Imports the vendored module with an isolated env; never execs the wrapper.
 Run: python3 tests/gateway-proactive-attachments.test.py
@@ -240,7 +243,113 @@ def main() -> int:
         del pr.open
         os.open, os.read = real_os_open, real_read
         gb.MAX_MEDIA_BYTES = saved_cap
-    check("oversize" in ident and not reads, f"o) an oversize file is named, not read, got {ident!r} reads={reads}")
+    check(ident.endswith("over 16 bytes") and not reads, f"o) an oversize file is named, not read, got {ident!r} reads={reads}")
+
+    import builtins
+    grower = _ISO / "result" / "grower.bin"
+    grower.write_bytes(b"g" * 10)
+    real_b_open, real_os_open2 = builtins.open, os.open
+    grown: list = []
+
+    def grow_on_open(opener):
+        def wrapped(path, *a, **kw):
+            out = opener(path, *a, **kw)
+            if str(path).endswith("grower.bin") and not grown:
+                grown.append(1)
+                with real_b_open(grower, "ab") as g:
+                    g.write(b"G" * 1000)
+            return out
+        return wrapped
+    saved_cap = gb.MAX_MEDIA_BYTES
+    gb.MAX_MEDIA_BYTES = 16
+    builtins.open, os.open = grow_on_open(real_b_open), grow_on_open(real_os_open2)
+    try:
+        name, b64, reason = gb._read_attachment(str(grower))
+    finally:
+        builtins.open, os.open = real_b_open, real_os_open2
+        gb.MAX_MEDIA_BYTES = saved_cap
+    sent = len(gb.base64.b64decode(b64)) if b64 else 0
+    check(grown and not b64 and "exceeds" in reason,
+          f"p) a file grown past the cap after its check is refused, sent {sent} bytes, reason {reason!r}")
+
+    swapped = _ISO / "result" / "swapped.txt"
+    swapped.write_text("allowed\n", encoding="utf-8")
+    real_admit = gb.is_path_sendable
+    swaps: list = []
+
+    def admit_then_swap(path):
+        ok = real_admit(path)
+        if ok and str(path).endswith("swapped.txt") and not swaps:
+            swaps.append(1)
+            os.unlink(swapped)
+            os.symlink(OUTSIDE, swapped)
+        return ok
+    gb.is_path_sendable = admit_then_swap
+    try:
+        name, b64, reason = gb._read_attachment(str(swapped))
+    finally:
+        gb.is_path_sendable = real_admit
+    leaked = gb.base64.b64decode(b64) if b64 else b""
+    check(swaps and not b64 and b"not for sending" not in leaked,
+          f"q) a symlink swapped in after the check is refused, got {leaked!r} reason {reason!r}")
+
+    import importlib.util
+
+    def _src(name):  # the canonical src/ copy by file: the vendored dir can shadow a flat import
+        spec = importlib.util.spec_from_file_location(name, REPO / "src" / f"{name}.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules[name] = mod
+        return mod
+    src_bfr = _src("bounded_file_read")
+    src_pr = _src("proactive_routing")
+    from ag2_sparrow import proactive_routing as pkg_pr  # noqa: E402
+    fifo2 = _ISO / "result" / "inside.fifo"
+    os.mkfifo(fifo2)
+    once: list = []
+
+    def admit_once(path):  # admits, then says no on the post-open recheck
+        once.append(path)
+        return len(once) == 1
+    cases = [(str(CSV), real_admit, 1 << 20), (str(OUTSIDE), real_admit, 1 << 20), (str(big), real_admit, 16),
+             (str(fifo2), lambda _p: True, 1 << 20), (str(_ISO / "result" / "missing.csv"), lambda _p: True, 99),
+             (str(CSV), None, 99)]
+    for path, admit, cap in cases:
+        check(src_pr.attachment_identity(path, admit, cap) == pkg_pr.attachment_identity(path, admit, cap),
+              f"r) src and vendored identities agree for {Path(path).name}")
+    from ag2_sparrow import bounded_file_read as pkg_bfr  # noqa: E402
+    for label, pr_mod, bfr in (("src", src_pr, src_bfr), ("vendored", pkg_pr, pkg_bfr)):
+        check(pr_mod.read_attachment(str(CSV), real_admit, 99)[1] == CSV.read_bytes(),
+              f"r) {label}: the reader returns the admitted file's bytes")
+        once.clear()
+        check(pr_mod.read_attachment(str(CSV), admit_once, 99)[2] == "changed after its check",
+              f"r) {label}: a file the recheck no longer admits is refused")
+        real_stat = os.stat
+
+        def stat_gone(p, *a, real_stat=real_stat, **kw):  # the file vanishes after its open
+            if str(p) == str(CSV.resolve()):
+                raise FileNotFoundError(p)
+            return real_stat(p, *a, **kw)
+        os.stat = stat_gone
+        try:
+            gone = pr_mod.read_attachment(str(CSV), lambda _p: True, 99)
+        finally:
+            os.stat = real_stat
+        check(gone[2] == "changed after its check", f"r) {label}: a file gone after its open is refused")
+        rfd, wfd = os.pipe()
+        os.write(wfd, b"x" * 40)
+        os.close(wfd)
+        tiny = os.stat(CSV)  # a regular file's fstat claiming 8 bytes, while 40 arrive
+        fake = os.stat_result((tiny.st_mode, 0, 0, 0, 0, 0, 8, 0, 0, 0))
+        check(bfr.read_fd_bytes(rfd, 16, fake) == (None, "over 16 bytes"),
+              f"r) {label}: bytes past the cap after the fstat are refused")
+        os.close(rfd)
+    check(src_pr.resolve_attachment_path(" ~/x ") == os.path.realpath(os.path.expanduser("~/x")),
+          "r) the src resolver expands ~ and resolves links")
+    check(src_bfr.read_regular("/nonexistent-dir/x") == (None, ""), "r) read_regular still reports absence")
+    utf = _ISO / "result" / "bad.txt"
+    utf.write_bytes(b"\xff\xfe")
+    check(src_bfr.read_regular(str(utf)) == (None, "not UTF-8"), "r) read_regular still refuses non-UTF-8")
 
     print(f"\n{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failure(s)")
     return 1 if FAILS else 0

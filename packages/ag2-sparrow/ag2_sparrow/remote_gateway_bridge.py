@@ -327,7 +327,7 @@ from .local_task_protocol import find_archived_task
 from . import (agent_identity, agent_triggers, diagnostics, gateway_credential_io, gateway_credential_sources,
                gateway_credentials, gateway_instance, local_task_protocol, routing_migrations,
                setup_fetch)
-from .bounded_file_read import read_private, read_regular, read_regular_text
+from .bounded_file_read import read_fd_bytes, read_private, read_regular, read_regular_text
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import has_skip_action
 from .result_markers import neutralize_markers
@@ -335,7 +335,7 @@ from . import undelivered_quarantine
 from . import deleted_binding
 from . import result_labels
 from .proactive_routing import (PROACTIVE_OUTBOX_DIRNAME, about_task, about_task_ts, proactive_filename,
-                                proactive_item_id, resolve_attachment_path)
+                                proactive_item_id, read_attachment, resolve_attachment_path)
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from . import health_command
@@ -7923,24 +7923,25 @@ def _read_attachment(path_str: str, confine_root=None) -> "tuple[str, str, str]"
         except (OSError, ValueError):
             return "", "", "outside the task's media directory"
         try:
-            with os.fdopen(fd, "rb") as f:
-                if os.fstat(f.fileno()).st_size > MAX_MEDIA_BYTES:
-                    return "", "", f"file exceeds {MAX_MEDIA_BYTES} bytes"
-                return (os.path.basename(confined_path),
-                        base64.b64encode(f.read()).decode("ascii"), "")
+            data, reason = read_fd_bytes(fd, MAX_MEDIA_BYTES)
+            if data is not None:
+                return os.path.basename(confined_path), base64.b64encode(data).decode("ascii"), ""
         except OSError as e:
-            return "", "", f"read failed: {e}"
-    try:
-        size = os.path.getsize(fpath)
-    except OSError as e:
-        return "", "", f"stat failed: {e}"
-    if size > MAX_MEDIA_BYTES:
-        return "", "", f"file exceeds {MAX_MEDIA_BYTES} bytes"
-    try:
-        with open(fpath, "rb") as f:
-            return os.path.basename(fpath), base64.b64encode(f.read()).decode("ascii"), ""
-    except OSError as e:
-        return "", "", f"read failed: {e}"
+            reason = f"unreadable ({e})"
+        finally:
+            os.close(fd)
+        return "", "", _attachment_refusal(reason)
+    _, data, reason = read_attachment(path_str, is_path_sendable, MAX_MEDIA_BYTES)
+    if data is None:
+        return "", "", _attachment_refusal(reason)
+    return os.path.basename(fpath), base64.b64encode(data).decode("ascii"), ""
+
+
+def _attachment_refusal(reason: str) -> str:
+    """The in-band refusal for a shared reader's reason."""
+    if reason.startswith("over "):
+        return f"file exceeds {MAX_MEDIA_BYTES} bytes"
+    return reason if reason == "path not allowlisted" else f"read failed: {reason}"
 
 
 def _upload_attachment(room: str, path_str: str) -> tuple[bool, str]:
