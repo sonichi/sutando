@@ -279,7 +279,7 @@ claude_session_outside_checkout() {
 # check-pending-tasks.sh (start-cli.sh installs it there); another clone's copy does not count.
 claude_cwd_has_pending_stop_hook() {
   command -v node > /dev/null 2>&1 || return 1
-  node "$REPO/src/agent/claude/cli/project-has-stop-hook.mjs" "$REPO/src/check-pending-tasks.sh" \
+  node "$REPO/src/agent/claude/cli/project-has-stop-hook.mjs" "$SUTANDO_CLAUDE_WORKING_DIR" "$REPO/src/check-pending-tasks.sh" \
     "$SUTANDO_CLAUDE_WORKING_DIR/.claude/settings.json" "$SUTANDO_CLAUDE_WORKING_DIR/.claude/settings.local.json"
 }
 

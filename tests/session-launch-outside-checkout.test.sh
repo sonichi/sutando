@@ -8,6 +8,9 @@ check() { if [ "$1" = "0" ]; then echo "  ok  $2"; pass=$((pass+1)); else echo "
 command -v node >/dev/null 2>&1 || { echo "SKIP: node unavailable"; exit 0; }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(cd "$TMP" && pwd -P)"
+# The launchers run from the checkout; a relative hook path must not resolve against it.
+cd "$REAL_REPO" || exit 1
 mkdir -p "$TMP/project"
 
 # shellcheck source=/dev/null
@@ -83,6 +86,45 @@ printf '{"permissions":{"allow":["Bash(bash %s/src/check-pending-tasks.sh)"]}}' 
 settings_for "$TMP/perm-only"
 [ "$(stop_commands)" = "bash '$REAL_REPO/src/check-pending-tasks.sh'" ]
 check $? "an override dir that only mentions the script in a permission still gets the Stop hook"
+
+# A relative Stop command runs in the session's folder, so it resolves there, not in the checkout.
+stop_hook_file() { mkdir -p "$1/.claude"; printf '{"hooks":{"%s":[{"hooks":[{"type":"command","command":"%s"}]}]}}' "$2" "$3" > "$1/.claude/settings.json"; }
+stop_hook_file "$TMP/rel-missing" Stop "bash src/check-pending-tasks.sh"
+settings_for "$TMP/rel-missing"
+[ "$(stop_commands)" = "bash '$REAL_REPO/src/check-pending-tasks.sh'" ]
+check $? "a relative Stop command naming a script the folder does not have: the hook is added"
+
+stop_hook_file "$TMP/rel-foreign" Stop "bash src/check-pending-tasks.sh"
+mkdir -p "$TMP/rel-foreign/src"; : > "$TMP/rel-foreign/src/check-pending-tasks.sh"
+settings_for "$TMP/rel-foreign"
+[ "$(stop_commands)" = "bash '$REAL_REPO/src/check-pending-tasks.sh'" ]
+check $? "a relative Stop command naming the folder's own different script: the hook is added"
+
+stop_hook_file "$TMP/rel-linked" Stop "bash src/check-pending-tasks.sh"
+ln -s "$REAL_REPO/src" "$TMP/rel-linked/src"
+settings_for "$TMP/rel-linked"
+[ -z "$(stop_commands)" ]
+check $? "a relative Stop command reaching this checkout's script through a symlink: counted, no second copy"
+
+stop_hook_file "$TMP/other-event" PostToolUse "bash '$REAL_REPO/src/check-pending-tasks.sh'"
+settings_for "$TMP/other-event"
+[ "$(stop_commands)" = "bash '$REAL_REPO/src/check-pending-tasks.sh'" ]
+check $? "the same command under another hook event is not a Stop hook: the hook is added"
+
+# The helper itself: relative paths from the checkout or a symlink to it, and a bare spaced path.
+HELPER="$REAL_REPO/src/agent/claude/cli/project-has-stop-hook.mjs"
+stop_hook_file "$TMP/rel-settings" Stop "bash src/check-pending-tasks.sh"
+node "$HELPER" "$REAL_REPO" "$REAL_REPO/src/check-pending-tasks.sh" "$TMP/rel-settings/.claude/settings.json"
+check $? "helper: a relative command from this checkout's folder is this checkout's hook"
+node "$HELPER" "$TMP/repo-link" "$REAL_REPO/src/check-pending-tasks.sh" "$TMP/rel-settings/.claude/settings.json"
+check $? "helper: a relative command from a symlink to this checkout is this checkout's hook"
+mkdir -p "$TMP/a b"; : > "$TMP/a b/hook.sh"
+stop_hook_file "$TMP/spaced-bare" Stop "bash $TMP/a b/hook.sh"
+! node "$HELPER" "$TMP" "$TMP/a b/hook.sh" "$TMP/spaced-bare/.claude/settings.json"
+check $? "helper: an unquoted path with a space is split by bash, so it is not counted"
+stop_hook_file "$TMP/spaced-quoted" Stop "bash '$TMP/a b/hook.sh'"
+node "$HELPER" "$TMP" "$TMP/a b/hook.sh" "$TMP/spaced-quoted/.claude/settings.json"
+check $? "helper: the same path single-quoted is counted"
 
 echo "session-launch-outside-checkout: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
