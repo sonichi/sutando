@@ -18,8 +18,8 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `rename_worker.py` — change a worker's base routing alias after creation: `python3 skills/worker-pool/scripts/rename_worker.py --worker <id-or-label> --label "<new alias>" [--workspace W]`. The id and its tmux session name stay.
 - `apply_profile_label_overrides.py` — apply an s.space profile's complete worker display-label map from JSON stdin with `--workspace W --profile-mxid M --config-version N`.
 - `worker_bootstrap.py` — a worker session's first-turn decision (worker vs core mode) from its env.
-- `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write. `set_worker_state` / `remove_worker` are its writers for a worker's lifecycle.
-- `pool_manage.py` — stop, retire, re-enable or remove a worker (below).
+- `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write. `set_worker_state` / `remove_worker` are its writers for a worker's lifecycle; `set_worker_plugin_dirs` writes a row's `plugin_dirs`.
+- `pool_manage.py` — stop, retire, re-enable, remove or reseat a worker, and record its extra Claude plugin dirs (below).
 - `pool_identity.py` — give a worker an s.space agent of its own, show it, rotate its token or remove it (below).
 - `pool_provision.py` — the local half of creating that agent without a pasted token: claim secret, redeem, retire (below).
 - `provision_e2e.py` — check that whole flow against one server, with a scan for leaked secrets (below).
@@ -28,6 +28,7 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `pool_route_handler.py` — the core watcher's task-event handler (`SUTANDO_TASK_EVENT_HANDLER`): declines unbound work, delivers bound work as sentinels.
 - `pool_delivery.py` — a recipient's own folder: sentinels in, accept, release, done flags, and the owner's `hand_off_to_core`.
 - `pool_ask.py` — ask another instance a question through the front door (below).
+- `pool_handoff.py` — `pool_ask` over s.space to a worker with its own agent, behind a flag (below).
 - `pool_sessions.py` — read-only: which worker tmux sessions a viewer could attach, and the exact-match argv for each. Adds no state and nothing in the pool calls it; it exists for the desktop app's terminal picker. It deliberately does not describe the core, whose socket resolution belongs to the app.
 
 ```bash
@@ -36,7 +37,7 @@ python3 skills/worker-pool/scripts/pool_sessions.py list --workspace "$WS" [--ro
 
 Suites live at `tests/skills/worker-pool/`.
 
-## Managing workers: stop, retire, enable, remove
+## Managing workers: stop, retire, enable, remove, plugins
 
 Killing a worker's tmux session does not stop it: the remedy timer's next sweep
 (every 5 minutes) sees a dead session and resumes it on the same conversation.
@@ -52,6 +53,8 @@ python3 skills/worker-pool/scripts/pool_manage.py stop   <worker id or label> [-
 python3 skills/worker-pool/scripts/pool_manage.py retire <worker> [--unbind] [--hand-off]
 python3 skills/worker-pool/scripts/pool_manage.py enable <worker> [--no-start]
 python3 skills/worker-pool/scripts/pool_manage.py remove <worker> [--hand-off]
+python3 skills/worker-pool/scripts/pool_manage.py plugins <worker> add|remove <dir>
+python3 skills/worker-pool/scripts/pool_manage.py plugins <worker> list
 ```
 
 - `stop` writes the worker's pause (`pool_supervise.set_paused`) under the remedy
@@ -84,6 +87,21 @@ python3 skills/worker-pool/scripts/pool_manage.py remove <worker> [--hand-off]
   its id in the roster's `removed` list so late deliveries stay fenced. Its
   records under `state/workers/<id>/` and its `deliveries/<id>/` folder stay as
   history.
+- `plugins` records an extra Claude Code plugin dir on one Claude worker's roster
+  row (`plugin_dirs`, absolute real paths). Every start of that worker (spawn,
+  recovery, `enable`, `reseat`) passes each with `--plugin-dir`; the core and
+  other workers are unaffected. `add` refuses a dir without a readable
+  `.claude-plugin/plugin.json` naming the plugin. A launch loads each recorded
+  path exactly as recorded and skips one that is missing, no longer a plugin, or
+  redirected (its real path is no longer the recorded path, e.g. a symlink swap);
+  the start's JSON result lists those under `plugin_dirs_skipped`, and
+  `plugins list` shows each dir's state (`ok`, `missing`, `not a plugin`,
+  `redirected`). Approving a dir approves a path, not its contents: what is
+  inside an approved dir can still change after it is recorded. This is the
+  owner's opt-in: record a plugin only on the owner's explicit word for that
+  worker, never on your own. The command does not check who calls it, like the
+  other verbs here; the owner's word is the only gate. It applies at the
+  worker's next start; `reseat` applies it now.
 
 ## Codex CLI workers
 
@@ -138,7 +156,7 @@ creates that agent in AG2 Space, and its access token becomes a connection row n
 - It answers only what is addressed to that agent.
 - It hands every task it queues to the worker (`requested_worker`).
 - It posts only the proactive files its worker's session writes (`proactive-<ts>.by-<worker>.txt`,
-  stamped by `result_publish.py` while the identity is enabled), into its own agent's owner DM;
+  stamped by `result_publish.py` while the identity is enabled; `ask-owner.py` text asks too; not one bound for Discord, Slack or Telegram), into its own agent's owner DM;
   nothing the core's session wrote. A worker with no identity, or a disabled one, still publishes
   unstamped notes that a core lane sends.
 - It never becomes primary, and owns no unaddressed message or owner card.
@@ -368,6 +386,44 @@ python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|
   never be relayed as your own: the tier must say where the question came from, not who ran
   the script.
 - Refused, never guessed: an unknown name, a name shared by recipients, and asking yourself.
+
+### Over s.space, to a worker with its own agent (flag, off by default)
+
+With `WORKER_POOL_SSPACE_HANDOFF` on (manifest `config`, `CLI > env > manifest`), an ask **from the
+core**, at team tier, to a worker whose own identity row is enabled (`src/connections.py`) is a
+typed hand-off (`src/handoff_contract.py`) instead of a task file: the core's agent mentions the
+worker's agent in `WORKER_POOL_HANDOFF_ROOM` (the owner-only consult room, or a room both are in)
+through the room CLI at `WORKER_POOL_HANDOFF_ROOM_CLI` (the consult skill's `mention` / `read`
+verbs). The worker's own lane delivers it like any message to that agent. `--wait` reads the room
+for the reply, correlated by task id; with no `--wait`, `--collect <task id> [--wait N]` reads it
+later. Each read reaches back to the hand-off itself (up to 1000 messages), so a reply that busy
+traffic pushed out of the latest page is still found, and a typed answer, once found, is kept in
+`state/pool-handoff/<task id>.json` for later collects. A typed `done` or `failed` returns at
+once; an untyped reply ("On it") is progress, and the latest one is returned only when the wait
+ends with no typed answer. Timeouts and exit codes are the folder path's; a `failed` reply exits
+1, an unreadable room or a refused post exits 2, and an unconfirmed post is never sent again
+(only a typed reply can be matched to it, since it has no event to reply to).
+
+Kept on the folder path: a worker with no, a disabled or a parked identity; a worker's own ask;
+a relayed ask (`--relayed-from`, so its tier is kept); an ask with `--parent-task`; and the
+limit-recovery probe, whose pane prompt names the routed payload. A worker with an identity that
+the flag cannot address (no room, CLI, agent id or core lane on its server) is refused, never
+quietly sent through the folder.
+
+**Answering a hand-off (the worker).** `python3 src/handoff_contract.py parse --task-file <task>`
+says whether the task is a hand-off and gives its task id. Answer as an ordinary result, so the
+lane posts it as a reply to the hand-off, starting with the typed header:
+`python3 src/handoff_contract.py reply --task-id <id> --status done|failed < answer`. An
+acknowledgement may come first (plain, or `--status working`); only the typed final ends the
+hand-off, and a plain reply counts only if no typed one arrives in time. If the core's own lane gets the reply as a task, it
+answers `[no-send]`: `pool_ask` collects it from the room.
+
+**Authority.** A hand-off is a message from the core's agent, at the tier the room gives that
+agent; nothing here grants more. No rule tiers the owner's other agents as owner: in s.space the
+room's access setting decides. Give the core's agent **Team** with Agent Native **Collaborator
+access** in the hand-off room; that matches a folder ask (`access_tier: team` +
+`collaborator: true`). Plain Team lands on the sandboxed read-only path, and Owner access would
+raise hand-offs above what `pool_ask` gives today. Owner-tier work cannot be delegated either way.
 
 Not yet: the reply is read from `results/` by the asker, not delivered into the
 asker's inbox (`reply_to_instance` is recorded for that later leg), and a worker

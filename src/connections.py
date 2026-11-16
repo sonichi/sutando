@@ -1773,10 +1773,17 @@ def _channel_dir_tokens(channel_dir: Optional[str]) -> list:
         return []
 
 
+def row_token(row: Mapping[str, object], token: str) -> str:
+    """`token` as the `url|secret` a row's credential is: a combined one as it is, a bare secret joined
+    to the row's own gateway_url (`legacy_relay_token`); '' when that gateway is no gateway URL."""
+    return legacy_relay_token(token, str(row.get("gateway_url") or ""))
+
+
 def connection_credential(row: Mapping[str, object], environ: Optional[Mapping[str, str]] = None, *,
                           vault=None) -> "tuple[str, str]":
     """(gateway_url, token) for one row: the first token among its env var, its launch keys, its
-    channel env file and its vault key whose embedded gateway (if any) is the row's own host."""
+    channel env file and its vault key whose embedded gateway (if any) is the row's own host. The
+    token is always `url|secret`: a bare secret is joined to the row's gateway (`row_token`)."""
     environ = os.environ if environ is None else environ
     ref, instance = str(row["token_ref"]), str(row["instance"])
     refs = [ref] + [str(k) for k in row.get("launch_keys") or []]
@@ -1788,8 +1795,8 @@ def connection_credential(row: Mapping[str, object], environ: Optional[Mapping[s
     host = host_of_url(str(row["gateway_url"]))
 
     def own(tok) -> str:
-        tok = (tok or "").strip()
-        return tok if tok and (not gateway_url_of(tok) or host_of_url(gateway_url_of(tok)) == host) else ""
+        tok = row_token(row, tok)
+        return tok if tok and host_of_url(gateway_url_of(tok)) == host else ""
     tok = next((own(t) for t in candidates if own(t)), "")
     if not tok:
         try:
@@ -2239,6 +2246,15 @@ def session_proactive_name(name, environ: Optional[Mapping[str, str]] = None,
     return stamp_worker(name, worker) if worker and worker_enabled_identity(worker, workspace) else Path(name).name
 
 
+def proactive_author_agent(name, workspace: Optional[Path] = None) -> Optional[str]:
+    """The agent a proactive file named `name` is posted as when a worker's session stamped it
+    (`session_proactive_name`): that worker's own identity's `agent_mxid`; None for an unstamped name."""
+    from proactive_routing import proactive_worker
+    worker = proactive_worker(name)
+    row = worker_identity(worker, workspace) if worker else None
+    return str((row or {}).get("agent_mxid") or "").strip() or None
+
+
 def worker_mcp_credential(worker: str, *, workspace: Optional[Path] = None,
                           environ: Optional[Mapping[str, str]] = None, vault=None) -> dict:
     """Whose credential a worker session's MCP proxy mints with. A worker that acts as its own agent
@@ -2412,17 +2428,49 @@ def env_token_vars(environ: Mapping[str, str]) -> list:
     return out
 
 
+def legacy_relay_token(token: str, url: str) -> str:
+    """The legacy row's `url|secret`: a combined `token` as it is, a bare secret joined to `url` (the
+    gateway the bridge pairs it with); '' when either is missing or `url` is no gateway URL."""
+    token = (token or "").strip()
+    if gateway_url_of(token):
+        return token
+    url = (url or "").strip()
+    if not token or not url:
+        return ""
+    import channel_token  # noqa: F401 - puts the shared credential contract on the path
+    from gateway_credential_sources import contract, gateway_url_problem
+    if gateway_url_problem(url):
+        return ""
+    creds = contract.normalize_credentials(token, explicit_url=url)
+    joined = f"{creds.base_url}|{creds.token}"
+    return joined if gateway_url_of(joined) else ""
+
+
+def _env_gateway_url(environ: Mapping[str, str]) -> str:
+    """REMOTE_TASK_URL (legacy AG2_REMOTE_URL) as the bridge reads it from its environment; '' when unset."""
+    import channel_token  # noqa: F401 - puts the shared credential contract on the path
+    from gateway_credential_sources import URL_KEYS, first_env
+    return first_env(environ, URL_KEYS)[0]
+
+
 def primary_token_from_channel_file(environ: Mapping[str, str]) -> str:
     """The relay token (`url|secret`) the AG2 Space channel env file holds under either relay
-    spelling, read through the resolver `scripts/channel-env.sh` uses; '' when the environment
-    names one itself, when no file resolves, or when the file holds none."""
+    spelling, read through the resolver `scripts/channel-env.sh` uses; a bare secret is joined to
+    the gateway URL the bridge would pair it with (the environment's, else that file's). '' when
+    the environment names a token itself, when no file resolves, or when the file holds none."""
     try:
         from channel_credentials import channel_credentials
         from channel_token import RELAY_TOKEN_VARS
-        found = channel_credentials(RELAY_TOKEN_VARS, environ)
+        from gateway_credential_sources import URL_KEYS
+        if any(environ.get(v) for v in RELAY_TOKEN_VARS):
+            return ""
+        # Token and URL in one read, so both come from the same file; only a token in the env gates it.
+        found = channel_credentials(RELAY_TOKEN_VARS + URL_KEYS, {})
+        token = next((found[var].strip() for var in RELAY_TOKEN_VARS if found.get(var)), "")
+        file_url = next((found[var].strip() for var in URL_KEYS if found.get(var)), "")
+        return legacy_relay_token(token, _env_gateway_url(environ) or file_url)
     except Exception:  # noqa: BLE001 - no channel home or an unreadable file is simply no token
         return ""
-    return next((found[var].strip() for var in RELAY_TOKEN_VARS if found.get(var)), "")
 
 
 def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
@@ -2432,6 +2480,7 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
     The REMOTE_TASK_TOKEN row comes from the environment, else from the channel env file the
     connect flow writes (`primary_token_from_channel_file`): a desktop install signs in after
     the engine started, so the token reaches the file but never this process's environment.
+    A bare REMOTE_TASK_TOKEN counts beside a REMOTE_TASK_URL, joined as `legacy_relay_token`.
     Env rows are unverified: the resolver's server when it knows the host, else the host. The
     REMOTE_TASK_TOKEN row (the legacy unsuffixed bridge) becomes primary when the install has none.
     A named env row becomes primary only when it is then the record's sole row, with no primary,
@@ -2445,7 +2494,9 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
     """
     environ = os.environ if environ is None else environ
     candidates = []
-    primary_token = environ.get(PRIMARY_TOKEN_REF, "").strip() or primary_token_from_channel_file(environ)
+    env_token = environ.get(PRIMARY_TOKEN_REF, "").strip()
+    primary_token = (legacy_relay_token(env_token, _env_gateway_url(environ)) if env_token
+                     else primary_token_from_channel_file(environ))
     if gateway_url_of(primary_token):
         candidates.append(("", PRIMARY_TOKEN_REF, primary_token))
     for inst, var in env_token_vars(environ):
@@ -2869,7 +2920,7 @@ def _learn_missing_identity(instance: str, environ: Mapping[str, str], workspace
 
     def token_of(r):
         ref = str(r["token_ref"])
-        return (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
+        return row_token(r, (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref))
     _learn_row_identity(row, token_of, workspace, fetch=fetch, getaddrinfo=getaddrinfo)
 
 
