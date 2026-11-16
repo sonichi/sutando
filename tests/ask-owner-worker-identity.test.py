@@ -7,7 +7,7 @@
 - The core's session, and a worker with no identity or a disabled one, queue unstamped names.
 - An ask bound for Discord, Slack or Telegram keeps its bare name, so that bridge delivers it.
 - The question records who asked (the worker's agent id when stamped) in the outbox and the row.
-- A decision card stays on the core's path: no stamped text is sent beside it.
+- A decision card stays on the core's path: no asker, no stamped text beside it or in its fallback.
 Temp workspaces and fakes only; nothing here reads the live workspace or a real token.
 """
 from _helpers.hermetic_env import isolate_os_environ
@@ -218,7 +218,7 @@ class StoreAdapterAsk(_Ws):
         self.assertEqual((pr.proactive_destination(name), pr.proactive_worker(name)), ("ag2space", W), name)
         self.assertEqual(out["question"]["asked_by"], AGENT)
 
-    def test_a_decision_card_stays_the_cores_and_no_stamped_text_goes_beside_it(self):
+    def test_a_decision_card_stays_the_cores_with_no_asker_and_no_stamped_text_beside_it(self):
         (self.ws / "state" / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space"}))
         from hitl.manager import HitlManager, HitlStore
         manager = HitlManager(HitlStore(self.ws / "state" / "hitl" / "requirements"))
@@ -227,7 +227,22 @@ class StoreAdapterAsk(_Ws):
                                      options=[("Hold", "wait")], manager=manager)
             self.assertEqual(pqa.create_card(out), pqa.CARD_STORED)
         self.assertEqual(self.proactive(), [], "the card is the ask; no text is queued")
-        self.assertEqual(out["question"]["asked_by"], AGENT)
+        self.assertIsNone(out["question"]["asked_by"], "the card is the core's")
+        [q] = self.outbox_questions()
+        self.assertIsNone(q["asked_by"])
+
+    def test_a_card_that_cannot_be_stored_falls_back_to_the_cores_text(self):
+        (self.ws / "state" / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space"}))
+        manager = mock.Mock()
+        manager.create.side_effect = OSError("store refused")
+        manager.get.return_value = None
+        with self.as_worker():
+            out = pqa.queue_question("Merge it?", workspace=self.ws, host=HOST, default_action="merge",
+                                     options=[("Hold", "wait")], manager=manager)
+            self.assertEqual(pqa.create_card(out), pqa.CARD_NOT_STORED)
+        [name] = self.proactive()
+        self.assertIsNone(pr.proactive_worker(name), "a core card's fallback text is the core's")
+        self.assertIsNone(out["question"]["asked_by"])
 
 
 class NoStoreAsk(_Ws):

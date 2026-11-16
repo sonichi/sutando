@@ -54,7 +54,8 @@ count (`python3 src/pending_questions_reader.py summary`).
   `result_publish.worker_published_path` gives it (`.by-<worker>`, unless it is bound for
   Discord, Slack or Telegram, which deliver it themselves), so that worker's own lane asks as its
   agent, and the row's `Asked by` names that agent. A decision card is still the core's: only the
-  core's lane issues and verifies cards.
+  core's lane issues and verifies cards, so a question asked by card has no `Asked by`, and its
+  fallback text, if the card cannot be stored, is the core's too.
 - `list` is READ-ONLY — it writes no file, not even the history marker — and lists each ask
   id in exactly one bucket, by precedence: a terminal or locally closed row is done; a
   complete open row waits; an open row whose body has not landed is stood in for by its held

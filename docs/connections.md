@@ -614,7 +614,9 @@ it. `scripts/ask-owner.py` and the pending-questions skill name their text ask t
 helper (`result_publish.worker_published_path`), so a worker asks the owner as its own agent, and
 the question records that agent (`asked_by`, the row's `Asked by`, via
 `connections.proactive_author_agent`). A decision card stays the core's: only a core lane issues
-and verifies cards. A skill writing a proactive file itself still publishes the name it gives.
+and verifies cards, so a question asked by card records no asker, and its fallback text, if the
+card cannot be stored, is the core's too. A skill writing a proactive file itself still publishes
+the name it gives.
 
 The seat's `s-space` MCP proxy (the desktop app's `ag2-mcp-proxy.mjs`) mints its access token
 from the worker's own credential when the worker acts as its own agent. The launcher exports

@@ -121,10 +121,10 @@ def published_name(ws: Path, name: str) -> str:
 
 
 def asked_by(ws: Path, name: str) -> Optional[str]:
-    """The agent a question queued under `name` is asked as; None for the core's own agent."""
+    """The agent a question published under `name` is asked as; None for the core's own agent."""
     try:
         import connections  # noqa: PLC0415
-        return connections.proactive_author_agent(published_name(ws, name), Path(ws))
+        return connections.proactive_author_agent(name, Path(ws))
     except Exception:  # noqa: BLE001 — a missing asker never blocks the ask
         return None
 
@@ -492,7 +492,6 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
             dest = destination_from_task(Path(task_file).read_text(encoding="utf-8"), ws)
         except (OSError, UnicodeDecodeError) as e:
             out["send_error"] = f"task file unreadable ({e}); queued for the owner's DM instead"
-    out["question"]["asked_by"] = asked_by(ws, proactive_filename(ask_id, dest.bridge))
     card = None
     if wants_card(default_action, options) and card_reaches_owner(dest, ws):
         try:
@@ -522,14 +521,18 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
     return out
 
 
-def _ask_by_text(out: dict, question, context, host, dest, link, intro) -> None:
+def _ask_by_text(out: dict, question, context, host, dest, link, intro, as_session: bool = True) -> None:
+    """`as_session` False keeps the core's name: a question first asked by the core's card stays the core's."""
     body, routed = proactive_body(question, context, host, dest, link, intro)
     out["bridge"], out["channel"] = dest.bridge, dest.channel if routed else None
     out["where"] = (f"{dest.bridge} {dest.channel}" if routed else
                     f"{dest.bridge} owner-dm" if dest.bridge else "owner-dm (last-active bridge)")
     out["card"] = None
     try:
-        name = published_name(Path(out["workspace"]), proactive_filename(out["ask_id"], dest.bridge))
+        name = proactive_filename(out["ask_id"], dest.bridge)
+        if as_session:
+            name = published_name(Path(out["workspace"]), name)
+            out["question"]["asked_by"] = asked_by(Path(out["workspace"]), name)
         write_proactive(Path(out["workspace"]) / "results", name, body)
         out["proactive_file"] = name
     except Exception as e:  # noqa: BLE001 — the question is still recorded
@@ -584,7 +587,7 @@ def card_to_text(out: dict, dest, link, intro) -> None:
     before the hold leaves a record naming an absent card, which the reminder reads as due: text
     again, never silence."""
     q = out["question"]
-    _ask_by_text(out, q["question"], q.get("context"), out["host"], dest, link, intro)
+    _ask_by_text(out, q["question"], q.get("context"), out["host"], dest, link, intro, as_session=False)
     try:
         out["outbox"] = str(Outbox(Path(out["workspace"])).save(q, out["sent_line"], redeliver=True))
     except Exception as e:  # noqa: BLE001
