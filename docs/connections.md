@@ -607,9 +607,16 @@ is claimed only by the lane running as that worker, which posts it as the worker
 agent's own owner DM; a core lane and every other bridge (Discord, Slack, Telegram, their
 fallbacks) refuse it, and a worker's lane claims nothing unstamped. The gateway's drain asks its
 host (`PROACTIVE_OWN_FILE`) whether an owner-directed file is the lane's own, so a worker's lane
-delivers its worker's files although it owns no unaddressed ones and projects no cards. Writers
-that do not go through `result_publish.py` (`scripts/ask-owner.py`, a skill writing the file
-itself) still publish unstamped names, which a core lane sends.
+delivers its worker's files although it owns no unaddressed ones and projects no cards.
+Only a name with no destination, or one destined for `ag2space` (the worker lane's own bridge), is
+stamped; a name destined for Discord, Slack or Telegram keeps its bare name so that bridge delivers
+it. `scripts/ask-owner.py` and the pending-questions skill name their text ask through the same
+helper (`result_publish.worker_published_path`), so a worker asks the owner as its own agent, and
+the question records that agent (`asked_by`, the row's `Asked by`, via
+`connections.proactive_author_agent`). A decision card stays the core's: only a core lane issues
+and verifies cards, so a question asked by card records no asker, and its fallback text, if the
+card cannot be stored, is the core's too. A skill writing a proactive file itself still publishes
+the name it gives.
 
 The seat's `s-space` MCP proxy (the desktop app's `ag2-mcp-proxy.mjs`) mints its access token
 from the worker's own credential when the worker acts as its own agent. The launcher exports

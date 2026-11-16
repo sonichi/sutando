@@ -2246,6 +2246,15 @@ def session_proactive_name(name, environ: Optional[Mapping[str, str]] = None,
     return stamp_worker(name, worker) if worker and worker_enabled_identity(worker, workspace) else Path(name).name
 
 
+def proactive_author_agent(name, workspace: Optional[Path] = None) -> Optional[str]:
+    """The agent a proactive file named `name` is posted as when a worker's session stamped it
+    (`session_proactive_name`): that worker's own identity's `agent_mxid`; None for an unstamped name."""
+    from proactive_routing import proactive_worker
+    worker = proactive_worker(name)
+    row = worker_identity(worker, workspace) if worker else None
+    return str((row or {}).get("agent_mxid") or "").strip() or None
+
+
 def worker_mcp_credential(worker: str, *, workspace: Optional[Path] = None,
                           environ: Optional[Mapping[str, str]] = None, vault=None) -> dict:
     """Whose credential a worker session's MCP proxy mints with. A worker that acts as its own agent
