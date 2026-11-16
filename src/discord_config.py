@@ -207,3 +207,22 @@ def auto_seed_if_missing(access_data: dict, *, logger_=None) -> dict:
 
     save_config(seed)
     return seed
+
+
+def dm_only_route(
+    actions,
+    channel_is_dm: bool,
+    access_data: dict,
+    *,
+    config: Optional[dict] = None,
+) -> "tuple[bool, Optional[str]]":
+    """(reroute, owner_id) for a result body's [dm-only] decision.
+
+    reroute False: no dm-only action, or the source is already a DM — deliver
+    as planned. True + owner_id: deliver to that user's DM. True + None: the
+    marker demands privacy but no owner resolves — the caller must hold the
+    result for retry, never fall back to the source channel.
+    """
+    if channel_is_dm or not any(getattr(a, "kind", None) == "dm-only" for a in actions):
+        return False, None
+    return True, resolve_owner_id(access_data, config=config)

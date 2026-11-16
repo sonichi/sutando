@@ -54,6 +54,18 @@ class Transport:
 
 
 def main() -> int:
+    # Shared helper semantics are used by both REST and gateway delivery.
+    check("validator_refusal: no validator allows",
+          drc.validator_refusal(None, "c", {"content": "x"}) is None)
+    check("validator_refusal: falsy result allows",
+          drc.validator_refusal(lambda cid, payload: None, "c", {}) is None)
+    refusal = drc.validator_refusal(lambda cid, payload: "policy refusal", "c", {})
+    check("validator_refusal: reason is returned", refusal == "refused by validator: policy refusal")
+    crashed = drc.validator_refusal(
+        lambda cid, payload: (_ for _ in ()).throw(RuntimeError("policy crash")),
+        "c", {})
+    check("validator_refusal: exceptions refuse", crashed is not None and "policy crash" in crashed)
+
     # 1. Default: no validator -> delivery proceeds untouched.
     t = Transport((200, {"id": "10"}))
     r = drc.DiscordRestClient("tok", transport=t).send_message("c1", {"content": "x"})

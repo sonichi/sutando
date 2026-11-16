@@ -15,7 +15,21 @@ import tempfile
 import sys
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+from _helpers.subprocess_coverage import covered_code
+
+isolate_os_environ()
+
 HOOK = str(Path(__file__).resolve().parent.parent / "hooks" / "context-source-guard.py")
+
+
+def _hook_argv(hook):
+    # `python -c` + exec, so the coverage runner's child prefix can trace the
+    # hook; the globals keep __file__/__name__ identical to a file invocation.
+    p = str(hook)
+    code = (f"exec(compile(open({p!r}).read(), {p!r}, 'exec'), "
+            f"{{'__file__': {p!r}, '__name__': '__main__'}})")
+    return [sys.executable, "-c", covered_code(code)]
 
 # --- fictitious fixtures (NOT real ids) ---
 PUBLIC_CH = "900000000000000001"       # public channel that blacklists the private guild
@@ -39,9 +53,9 @@ CFG_DIR.mkdir(parents=True, exist_ok=True)
 acc = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
 json.dump({"groups": {PUBLIC_CH: {"contextNotFrom": [PRIVATE_GUILD]}}}, acc); acc.close()
 
-ENV = {**os.environ, "CLAUDE_CONFIG_DIR": str(CFG_DIR), "SUTANDO_DISCORD_ACCESS_FILE": acc.name}
-ENV.pop("SUTANDO_WORKSPACE", None)  # dropped in v0.8 — must not influence resolution
-ENV.pop("DISCORD_BOT_TOKEN", None)  # force offline (cache-only) guild resolution
+# hermetic env: no SUTANDO_WORKSPACE (dropped in v0.8) and no DISCORD_BOT_TOKEN,
+# so guild resolution stays offline on the seeded cache either way.
+ENV = isolated_child_env(CLAUDE_CONFIG_DIR=str(CFG_DIR), SUTANDO_DISCORD_ACCESS_FILE=acc.name)
 
 
 def run(payload, env=ENV):
@@ -56,7 +70,7 @@ def run(payload, env=ENV):
     #
     # Same shape as the audit-script false green: a subprocess check that reads
     # output but discards returncode cannot tell "ran" from "crashed".
-    proc = subprocess.run([sys.executable, HOOK], input=json.dumps(payload),
+    proc = subprocess.run(_hook_argv(HOOK), input=json.dumps(payload),
                           capture_output=True, text=True, timeout=20, env=env)
     assert proc.returncode == 0, (
         f"hook exited {proc.returncode} (expected 0). "
@@ -145,6 +159,130 @@ run(read_task(PUBLIC_CH)[0], env=ENV_HOST)
 assert is_deny(run(bash_read(PRIVATE_CH), env=ENV_HOST)), \
     "per-host CLAUDE_CONFIG_DIR: walk up to nearest .claude-sutando ancestor, resolution stays on <WS>"
 
+def reader_read(command):
+    return {"tool_name": "Bash", "tool_input": {"command": command}}
+
+
+run(read_task(PUBLIC_CH)[0])
+assert is_deny(run(reader_read(
+    f"python3 src/discord-read.py {PRIVATE_CH} --operator"))), \
+    "discord-read CLI target in a blacklisted guild must be denied"
+
+run(read_task(PUBLIC_CH)[0])
+assert is_deny(run(reader_read(
+    f"python3 src/discord-read.py {PRIVATE_CH} --serving {OTHER_PUB_CH}"))), \
+    "a model-selected serving channel must not replace the recorded serving channel"
+
+run(read_task(PUBLIC_CH)[0])
+assert is_deny(run(reader_read(
+    f"python3 src/read_discord_channel.py --serving {OTHER_PUB_CH} --target {PRIVATE_CH}"))), \
+    "read_discord_channel must use the recorded serving channel's blacklist"
+
+run(read_task(PUBLIC_CH)[0])
+assert not is_deny(run(reader_read(
+    f"python3 src/discord-read.py {OTHER_PUB_CH} --operator --limit 5 --after 123"))), \
+    "CLI option values must not be treated as channel targets"
+
+run(read_task(PUBLIC_CH)[0])
+assert is_deny(run(reader_read(
+    'python3 src/discord-read.py "$CH" --operator'))), \
+    "a non-literal reader target must be denied under an active blacklist"
+
+(STATE_DIR / "active-serving-channel.json").unlink(missing_ok=True)
+assert not is_deny(run(reader_read(
+    f"python3 src/discord-read.py {PRIVATE_CH} --operator"))), \
+    "reader CLI must remain available without a recorded serving channel"
+
+(reader_invocations, expected_command) = (
+    [
+        f"python3 -u src/discord-read.py {PRIVATE_CH} --operator",
+        f"python3 -W ignore src/discord-read.py {PRIVATE_CH} --operator",
+        f"python3 -X dev src/discord-read.py {PRIVATE_CH} --operator",
+        f"/usr/bin/python3 src/discord-read.py {PRIVATE_CH} --operator",
+        f"python3.11 src/discord-read.py {PRIVATE_CH} --operator",
+        f"uv run python src/discord-read.py {PRIVATE_CH} --operator",
+        f"env X=1 python3 src/discord-read.py {PRIVATE_CH} --operator",
+        f"true;python3 src/discord-read.py {PRIVATE_CH} --operator",
+    ],
+    "all Python reader invocations in a command segment must be detected",
+)
+for command in reader_invocations:
+    run(read_task(PUBLIC_CH)[0])
+    assert is_deny(run(reader_read(command))), f"{expected_command}: {command}"
+
+for command in (
+        "cat src/discord-read.py",
+        "grep x src/discord-read.py",
+        "python3 -m py_compile src/discord-read.py",
+        "python3 -c 'print(1)' src/discord-read.py"):
+    run(read_task(PUBLIC_CH)[0])
+    assert not is_deny(run(reader_read(command))), \
+        f"a reader script path used as a non-invocation must remain allowed: {command}"
+
+# 9.5) reader-CLI argument edge cases: every ambiguous or malformed invocation
+# fails CLOSED while a blacklist is active; only unambiguous non-readers pass.
+run(read_task(PUBLIC_CH)[0])
+assert is_deny(run(reader_read(
+    f"src/discord-read.py {PRIVATE_CH} --operator"))), \
+    "a reader script invoked at argv[0] must be denied under a blacklist"
+
+for bad in (
+        "python3 src/discord-read.py --bogus=1",
+        f"python3 src/read_discord_channel.py --target={PRIVATE_CH}",
+        "python3 src/discord-read.py --serving",
+        "python3 src/discord-read.py -z",
+        f"python3 src/read_discord_channel.py --target {PRIVATE_CH} {OTHER_PUB_CH}",
+        f"python3 src/discord-read.py {PRIVATE_CH} {OTHER_PUB_CH}",
+        "# src/discord-read.py"):
+    run(read_task(PUBLIC_CH)[0])
+    assert is_deny(run(reader_read(bad))), \
+        f"ambiguous reader invocation must fail closed under a blacklist: {bad}"
+
+# prefix-only, bare -c, and script-file arguments carry no scan payload
+for innocuous in ("env FOO=1", "bash -c", "bash run-me.sh"):
+    run(read_task(PUBLIC_CH)[0])
+    assert not is_deny(run(reader_read(innocuous))), \
+        f"a non-reader command must be allowed: {innocuous}"
+
+# 10) shell-wrapped reader invocations must not bypass the guard.
+wrapped_invocations = (
+    f"bash -c 'python3 src/discord-read.py {PRIVATE_CH} --operator'",
+    f"env FOO=1 exec bash -c 'python3 src/discord-read.py {PRIVATE_CH} --operator'",
+    f"sh -c 'cd /tmp && python3 src/discord-read.py {PRIVATE_CH} --operator'",
+    f"bash -c 'echo hi; python3 src/discord-read.py {PRIVATE_CH} --operator'",
+)
+for command in wrapped_invocations:
+    run(read_task(PUBLIC_CH)[0])
+    assert is_deny(run(reader_read(command))), \
+        f"shell-wrapped reader invocation must be denied: {command}"
+
+run(read_task(PUBLIC_CH)[0])
+assert not is_deny(run(reader_read("bash -c 'echo hello'"))), \
+    "a wrapped non-reader command must be allowed"
+for command in (
+        f"bash -c 'echo python3 src/discord-read.py {PRIVATE_CH}'",
+        f"printf 'python3 src/discord-read.py {PRIVATE_CH}\\n'",
+        f"echo python3 src/discord-read.py {PRIVATE_CH}"):
+    run(read_task(PUBLIC_CH)[0])
+    assert not is_deny(run(reader_read(command))), \
+        f"a command that only PRINTS a reader invocation must be allowed: {command}"
+run(read_task(PUBLIC_CH)[0])
+assert is_deny(run(reader_read(
+    "bash -c 'python3 src/discord-read.py \"$CH\" --operator'"))), \
+    "a wrapped non-literal reader target must be denied under an active blacklist"
+
+# 11) missing _shell_scan sibling: the hook must DENY a channel read, not crash-open.
+import shutil
+lonely_dir = Path(tempfile.mkdtemp())
+lonely_hook = lonely_dir / "context-source-guard.py"
+shutil.copy(HOOK, lonely_hook)
+proc = subprocess.run(_hook_argv(lonely_hook),
+                      input=json.dumps(bash_read(PRIVATE_CH)),
+                      capture_output=True, text=True, timeout=20, env=ENV)
+assert proc.returncode == 0, f"hook crashed without its sibling: {proc.stderr[:200]}"
+assert is_deny(proc.stdout.strip()), \
+    "deployed without _shell_scan.py the guard must deny channel reads, not crash-open"
+
 # 9) inner-fail-closed: exception inside the gated section (non-empty blacklist) must DENY,
 #    not allow. Import the hook as a module and monkey-patch _resolve_guild to throw; the
 #    inner try/except re-raises SystemExit from _deny() correctly and wraps other exceptions.
@@ -190,7 +328,79 @@ finally:
 # the test completed without an unhandled exception and the SystemExit was raised.
 assert _denied_in_gated_section, "inner gated section: exception must fail-closed (deny), not fail-open"
 
+# 12) in-process paths a file-child cannot attribute (coverage maps children
+#     by filename) or reach (segments() never raises on str): ship-file direct.
+
+# 12a) missing _shell_scan sibling, on the shipped file itself.
+import builtins
+spec_ns = importlib.util.spec_from_file_location("csg_nosib", HOOK)
+nosib = importlib.util.module_from_spec(spec_ns)
+_real_import = builtins.__import__
+def _block_scan(name, *a, **k):
+    if name == "_shell_scan":
+        raise ImportError("blocked for test")
+    return _real_import(name, *a, **k)
+builtins.__import__ = _block_scan
+try:
+    spec_ns.loader.exec_module(nosib)
+finally:
+    builtins.__import__ = _real_import
+assert nosib._shell_scan is None, "the _shell_scan import block did not take"
+sys.stdin = io.StringIO(json.dumps(bash_read(PRIVATE_CH)))
+try:
+    nosib.main()
+    raise AssertionError("missing-sibling hook allowed a channel read")
+except SystemExit as e:
+    assert e.code == 0, f"missing-sibling deny must exit 0, got {e.code}"
+sys.stdin = io.StringIO(json.dumps({"tool_name": "Bash",
+                                  "tool_input": {"command": "ls -la"}}))
+try:
+    nosib.main()
+    raise AssertionError("missing-sibling hook did not exit cleanly on a non-read")
+except SystemExit as e:
+    assert e.code == 0, f"missing-sibling non-read path must exit 0, got {e.code}"
+finally:
+    sys.stdin = _orig_stdin
+
+# 12b) _unwrap_segments edges: depth cap, prefix-only, bare -c, script arg.
+assert csg_mod._unwrap_segments(["deep"], depth=5) == [["deep"]]
+assert csg_mod._unwrap_segments(["env", "FOO=1"]) == [["env", "FOO=1"]]
+assert csg_mod._unwrap_segments(["bash", "-c"]) == [["bash", "-c"]]
+assert csg_mod._unwrap_segments(["bash", "run-me.sh"]) == [["bash", "run-me.sh"]]
+
+# 12c) an inner -c payload whose scan raises propagates None (and one level up).
+W = lambda t: type("W", (), {"text": t})()
+
+class _FakeScan:
+    def __init__(self): self.n = 0
+    def segments(self, cmd):
+        self.n += 1
+        if self.n == 1:        # the outer command
+            return [[W("bash"), W("-c"), W("MID")]]
+        if cmd == "MID":       # the -c payload is another wrapper
+            return [[W("bash"), W("-c"), W("INNER")]]
+        raise RuntimeError("inner parse boom")
+_scan = csg_mod._shell_scan
+_orig_segments = _scan.segments
+_scan.segments = _FakeScan().segments
+try:
+    assert csg_mod._reader_cli_targets("OUTER src/discord-read.py") == (True, [], True), \
+        "an unparseable wrapped payload must fail closed when a reader is named"
+finally:
+    _scan.segments = _orig_segments
+
+# 12d) a top-level scan exception: reader name -> suspicious; non-reader -> allow.
+def _raise_segments(cmd):
+    raise RuntimeError("parse boom")
+_scan.segments = _raise_segments
+try:
+    assert csg_mod._reader_cli_targets("python3 src/discord-read.py 1") == (True, [], True)
+    assert csg_mod._reader_cli_targets("echo hi") == (False, [], False)
+finally:
+    _scan.segments = _orig_segments
+
 print("PASS: context-source-guard — serve public-ch blocks a private-guild read (Read- and cat-paths, "
       "+ fail-closed), allows public channels, serving the private channel reads itself, plain bash untouched, "
       "+ SUTANDO_WORKSPACE ignored (#1698), + per-host CLAUDE_CONFIG_DIR resolves via nearest .claude-sutando ancestor, "
-      "+ inner gated section: exception fails-closed (security finding #4 fix)")
+      "+ inner gated section: exception fails-closed (security finding #4 fix), "
+      "+ shell-wrapped reader invocations denied, + missing _shell_scan sibling fails closed")

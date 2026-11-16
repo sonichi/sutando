@@ -246,6 +246,162 @@ async def _case_access_file_unreadable():
     )
 
 
+class _RecordingChannel:
+    """A guild-channel stand-in that records every send — a [dm-only] result
+    must never land here."""
+
+    def __init__(self, channel_id=42):
+        self.id = channel_id
+        self.sent = []
+
+
+async def _case_dm_only_reroutes_to_owner_dm():
+    """A [dm-only] result on a non-DM origin is delivered to the owner's DM;
+    the source channel never receives it."""
+    task_id = "task-dm-only-route"
+    cap = _CapturingDM()
+
+    async def _create_dm():
+        return cap
+
+    async def _fetch_user(_uid):
+        return types.SimpleNamespace(bot=False, create_dm=_create_dm)
+
+    source = _RecordingChannel()
+
+    class _SrcClient:
+        def is_ready(self):
+            return False
+
+        async def fetch_user(self, uid):
+            return await _fetch_user(uid)
+
+        async def fetch_channel(self, _cid):
+            return source
+
+    orig_client = bridge.client
+    bridge.client = _SrcClient()
+    access = WORKSPACE / "access-dm-only.json"
+    access.write_text(json.dumps({"allowFrom": ["999"]}))
+    bridge.ACCESS_FILE = access
+    bridge.discord_config.resolve_owner_id = lambda _data, **_kw: "999"
+    bridge._emit_channel = lambda *_a, **_k: None
+    bridge.save_pending_replies = lambda: None
+
+    bridge.TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    (bridge.TASKS_DIR / f"{task_id}.txt").write_text(
+        f"id: {task_id}\nsource: discord\nchannel_id: 42\naccess_tier: owner\n")
+    (bridge.RESULTS_DIR / f"{task_id}.txt").write_text("[dm-only]\nPrivate answer.\n")
+    bridge.pending_replies.clear()
+    bridge.pending_replies[task_id] = source
+    bridge.pending_task_tiers.clear()
+    bridge.pending_task_tiers[task_id] = "owner"
+
+    try:
+        await asyncio.wait_for(bridge.poll_results(), timeout=0.25)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        bridge.client = orig_client
+    assert source.sent == [], \
+        f"[dm-only] content was posted to the source channel: {source.sent}"
+    assert any("Private answer." in (t or "") for t in cap.sent), \
+        f"owner DM never received the [dm-only] result: {cap.sent}"
+    assert not (bridge.RESULTS_DIR / f"{task_id}.txt").exists(), \
+        "a delivered [dm-only] result must be archived, not left to re-poll"
+
+
+async def _case_dm_only_unresolvable_owner_holds_for_retry():
+    """[dm-only] with no resolvable owner releases the outbox claim for retry —
+    it must NOT post private content to the source channel."""
+    task_id = "task-dm-only-hold"
+
+    class _SrcClient:
+        def is_ready(self):
+            return False
+
+        async def fetch_channel(self, _cid):
+            return source
+
+    source = _RecordingChannel(channel_id=770000000000000077)
+    orig_client = bridge.client
+    bridge.client = _SrcClient()
+    access = WORKSPACE / "access-dm-only-empty.json"
+    access.write_text(json.dumps({"allowFrom": []}))
+    bridge.ACCESS_FILE = access
+    bridge.discord_config.resolve_owner_id = lambda _data, **_kw: None
+    bridge._emit_channel = lambda *_a, **_k: None
+    bridge.save_pending_replies = lambda: None
+
+    bridge.TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    (bridge.TASKS_DIR / f"{task_id}.txt").write_text(
+        f"id: {task_id}\nsource: discord\nchannel_id: 770000000000000077\naccess_tier: owner\n")
+    result_file = bridge.RESULTS_DIR / f"{task_id}.txt"
+    result_file.write_text("[dm-only]\nPrivate answer.\n")
+    bridge.pending_replies.clear()
+    bridge.pending_replies[task_id] = source
+    bridge.pending_task_tiers.clear()
+    bridge.pending_task_tiers[task_id] = "owner"
+
+    try:
+        await asyncio.wait_for(bridge.poll_results(), timeout=0.25)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        bridge.client = orig_client
+    assert source.sent == [], \
+        f"[dm-only] content leaked to the source channel when no owner resolved: {source.sent}"
+    assert result_file.exists(), \
+        "an unroutable [dm-only] result was dropped instead of held for retry"
+
+
+async def _case_dm_only_owner_dm_fetch_raises_holds_for_retry():
+    """The owner resolves but fetch_user/create_dm raises → same kept-for-
+    retry behavior, still nothing posted to the source channel."""
+    task_id = "task-dm-only-raise"
+
+    class _SrcClient:
+        def is_ready(self):
+            return False
+
+        async def fetch_user(self, _uid):
+            raise RuntimeError("discord API down")
+
+        async def fetch_channel(self, _cid):
+            return source
+
+    source = _RecordingChannel(channel_id=770000000000000088)
+    orig_client = bridge.client
+    bridge.client = _SrcClient()
+    access = WORKSPACE / "access-dm-only-raise.json"
+    access.write_text(json.dumps({"allowFrom": ["999"]}))
+    bridge.ACCESS_FILE = access
+    bridge.discord_config.resolve_owner_id = lambda _data, **_kw: "999"
+    bridge._emit_channel = lambda *_a, **_k: None
+    bridge.save_pending_replies = lambda: None
+
+    bridge.TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    (bridge.TASKS_DIR / f"{task_id}.txt").write_text(
+        f"id: {task_id}\nsource: discord\nchannel_id: 770000000000000088\naccess_tier: owner\n")
+    result_file = bridge.RESULTS_DIR / f"{task_id}.txt"
+    result_file.write_text("[dm-only]\nPrivate answer.\n")
+    bridge.pending_replies.clear()
+    bridge.pending_replies[task_id] = source
+    bridge.pending_task_tiers.clear()
+    bridge.pending_task_tiers[task_id] = "owner"
+
+    try:
+        await asyncio.wait_for(bridge.poll_results(), timeout=0.25)
+    except asyncio.TimeoutError:
+        pass
+    finally:
+        bridge.client = orig_client
+    assert source.sent == [], \
+        f"[dm-only] content leaked to the source channel on DM fetch failure: {source.sent}"
+    assert result_file.exists(), \
+        "a [dm-only] result whose owner DM could not be fetched was dropped"
+
+
 async def _case_notice_send_fails():
     """Owner DM resolves but ``send`` raises → the final handler swallows it
     (the failure reporter must never raise)."""
@@ -285,6 +441,9 @@ def main():
     asyncio.run(_case_no_owner_resolvable())
     asyncio.run(_case_emit_channel_raises())
     asyncio.run(_case_access_file_unreadable())
+    asyncio.run(_case_dm_only_reroutes_to_owner_dm())
+    asyncio.run(_case_dm_only_unresolvable_owner_holds_for_retry())
+    asyncio.run(_case_dm_only_owner_dm_fetch_raises_holds_for_retry())
     asyncio.run(_case_notice_send_fails())
 
     print("PASS — Discord attachment failures are visible, audited, and observable")

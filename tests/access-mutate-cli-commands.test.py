@@ -410,6 +410,30 @@ class TestGroupAddRemove(_Isolated):
         self.assertNotIn("ch-8", self._read()["groups"])
         self.assertFalse(self._ok(["group-rm", "ch-8"])["removed"])
 
+    def test_group_rm_allow_rejects_emptying_nonempty_allowlist(self):
+        self._write({
+            "dmPolicy": "allowlist", "allowFrom": [],
+            "groups": {"ch-9": {"requireMention": True, "allowFrom": ["member"]}},
+        })
+        before = self.access_file.read_text()
+        result = self._fail(["group-rm-allow", "ch-9", "member"])
+        self.assertEqual(
+            result["error"],
+            "cannot remove the last channel allowlist member: an empty allowFrom "
+            "admits every channel member; use `group rm ch-9` to close the channel "
+            "or `group add ch-9` to open it to every member",
+        )
+        self.assertEqual(self.access_file.read_text(), before)
+
+    def test_group_rm_allow_keeps_one_of_two_members(self):
+        self._write({
+            "dmPolicy": "allowlist", "allowFrom": [],
+            "groups": {"ch-10": {"requireMention": True, "allowFrom": ["one", "two"]}},
+        })
+        result = self._ok(["group-rm-allow", "ch-10", "one"])
+        self.assertEqual(result["removed"], ["one"])
+        self.assertEqual(self._read()["groups"]["ch-10"]["allowFrom"], ["two"])
+
 
 class TestSet(_Isolated):
     def setUp(self):
