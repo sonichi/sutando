@@ -275,11 +275,12 @@ claude_session_outside_checkout() {
   [ "$_wd_real" != "$_repo_real" ]
 }
 
-# 0 when the working dir's own project settings already register the pending-tasks Stop hook
-# (start-cli.sh installs it there); --settings then must not add a second copy.
+# 0 when the working dir's project settings hold a Stop hook running THIS checkout's
+# check-pending-tasks.sh (start-cli.sh installs it there); another clone's copy does not count.
 claude_cwd_has_pending_stop_hook() {
-  grep -sqF "src/check-pending-tasks.sh" "$SUTANDO_CLAUDE_WORKING_DIR/.claude/settings.json" \
-    "$SUTANDO_CLAUDE_WORKING_DIR/.claude/settings.local.json"
+  command -v node > /dev/null 2>&1 || return 1
+  node "$REPO/src/agent/claude/cli/project-has-stop-hook.mjs" "$REPO/src/check-pending-tasks.sh" \
+    "$SUTANDO_CLAUDE_WORKING_DIR/.claude/settings.json" "$SUTANDO_CLAUDE_WORKING_DIR/.claude/settings.local.json"
 }
 
 # One `--settings` flag carries every hook a headless session needs (multiple

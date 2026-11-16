@@ -50,15 +50,39 @@ settings_for ""
 check $? "no working dir (the default, cwd = checkout): unchanged"
 
 
-# start-cli.sh installs the project hooks into an override dir first: --settings must not repeat it.
-mkdir -p "$TMP/core-override/.claude"
-printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"bash \\"%s/src/check-pending-tasks.sh\\""}]}]}}' \
-  "$REAL_REPO" > "$TMP/core-override/.claude/settings.json"
-settings_for "$TMP/core-override"
-[ -z "$(stop_commands)" ]
-check $? "an override dir whose project settings hold the Stop hook: no second copy in --settings"
-P="$(prompt_arg)"; case "$P" in *"Read $REAL_REPO/CLAUDE.md"*) true ;; *) false ;; esac
-check $? "an override dir whose project settings hold the Stop hook: the CLAUDE.md pointer stays"
+# start-cli.sh runs the real installer into an override dir first: --settings must not repeat it.
+if command -v jq >/dev/null 2>&1; then
+  mkdir -p "$TMP/core-override" "$TMP/home"
+  HOME="$TMP/home" SUTANDO_CLAUDE_WORKING_DIR="$TMP/core-override" SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 \
+    bash "$REAL_REPO/src/install-claude-hooks.sh" >/dev/null 2>&1
+  jq -e --arg c "src/check-pending-tasks.sh" '[.hooks.Stop[]?.hooks[]?.command | select(contains($c))] | length == 1' \
+    "$TMP/core-override/.claude/settings.json" >/dev/null
+  check $? "fixture: the real installer wrote this checkout's Stop hook into the override dir"
+  settings_for "$TMP/core-override"
+  [ -z "$(stop_commands)" ]
+  check $? "an override dir holding this checkout's installed Stop hook: no second copy in --settings"
+  P="$(prompt_arg)"; case "$P" in *"Read $REAL_REPO/CLAUDE.md"*) true ;; *) false ;; esac
+  check $? "an override dir holding this checkout's installed Stop hook: the CLAUDE.md pointer stays"
+else
+  echo "  skip installer-fixture cases (jq unavailable)"
+fi
+
+# Another clone's hook watches that clone's workspace, never this worker's deliveries.
+mkdir -p "$TMP/other-clone/.claude" "$TMP/elsewhere/sutando/src"
+: > "$TMP/elsewhere/sutando/src/check-pending-tasks.sh"
+printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"bash '"'"'%s/elsewhere/sutando/src/check-pending-tasks.sh'"'"'"}]}]}}' \
+  "$TMP" > "$TMP/other-clone/.claude/settings.json"
+settings_for "$TMP/other-clone"
+[ "$(stop_commands)" = "bash '$REAL_REPO/src/check-pending-tasks.sh'" ]
+check $? "an override dir holding ANOTHER clone's Stop hook still gets this checkout's"
+
+# A mention outside hooks.Stop (a permission entry) is not a registered hook.
+mkdir -p "$TMP/perm-only/.claude"
+printf '{"permissions":{"allow":["Bash(bash %s/src/check-pending-tasks.sh)"]}}' "$REAL_REPO" \
+  > "$TMP/perm-only/.claude/settings.local.json"
+settings_for "$TMP/perm-only"
+[ "$(stop_commands)" = "bash '$REAL_REPO/src/check-pending-tasks.sh'" ]
+check $? "an override dir that only mentions the script in a permission still gets the Stop hook"
 
 echo "session-launch-outside-checkout: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
