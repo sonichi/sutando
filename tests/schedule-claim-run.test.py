@@ -56,6 +56,20 @@ def task(tid, trig, slot="2026-11-15T09:00Z", job="Summarize the open PRs."):
             f"task: [Scheduled job sch_1, run {slot}, set up by @a:s.space]\n{job}\n")
 
 
+# A racer: load the CLI, report ready, wait for the shared barrier, then claim. Exit 97: no barrier.
+_RACER = (
+    "import importlib.util, os, sys, time\n"
+    "script, ready, barrier, *argv = sys.argv[1:]\n"
+    "spec = importlib.util.spec_from_file_location('claim_run', script)\n"
+    "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)\n"
+    "open(ready, 'w').close()\n"
+    "deadline = time.monotonic() + 8\n"
+    "while not os.path.exists(barrier):\n"
+    "    if time.monotonic() > deadline: sys.exit(97)\n"
+    "    time.sleep(0.0005)\n"
+    "sys.exit(mod.main(argv))\n")
+
+
 def _claim_in_child(args):
     ws, key, tid = args
     return claim_run.claim(Path(ws), key, tid)[0]
@@ -112,6 +126,37 @@ class ClaimRun(unittest.TestCase):
             got = list(pool.map(_claim_in_child, [(str(self.ws), KEY, f"t{i}") for i in range(16)]))
         self.assertEqual(got.count("run"), 1)
         self.assertEqual(got.count("skip"), 15)
+
+    def test_independent_cli_processes_racing_one_slot_have_one_winner(self):
+        n, procs = 12, []
+        gate = self.ws / "gate"
+        gate.mkdir()
+        try:
+            for i in range(n):
+                f = self.ws / f"r{i}.txt"
+                f.write_text(task(f"r{i}", f"trg{i}"), encoding="utf-8")
+                procs.append(subprocess.Popen(
+                    [sys.executable, "-c", _RACER, str(SCRIPT), str(gate / f"ready{i}"),
+                     str(gate / "go"), "claim", "--task-file", str(f), "--workspace", str(self.ws)],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                    env=isolated_child_env()))
+            deadline = time.monotonic() + 6
+            while len(list(gate.glob("ready*"))) < n and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(list(gate.glob("ready*"))), n, "racers did not all load")
+            (gate / "go").touch()
+            codes, outs = [], []
+            for p in procs:
+                out, err = p.communicate(timeout=max(0.1, deadline + 3 - time.monotonic()))
+                codes.append(p.returncode)
+                outs.append(out + err)
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+                    p.wait()
+        self.assertEqual(codes.count(0), 1, outs)
+        self.assertEqual(codes.count(claim_run.SKIP_EXIT), n - 1, outs)
 
     def _run(self, tid="task-1", **kw):
         verdict, rec = claim_run.claim(self.ws, KEY, tid, **kw)
