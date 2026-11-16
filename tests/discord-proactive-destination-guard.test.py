@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -32,6 +33,7 @@ sys.path.insert(0, str(REPO / "src"))
 from proactive_routing import (  # noqa: E402
     body_claimable_by as _real_body_claimable_by,
     body_target_channel as _real_body_target_channel,
+    fallback_claims_name as _real_fallback_claims,
     lane_claims_proactive as _real_lane_claims,
     redirect_target_is_foreign as _real_redirect_target_is_foreign,
 )
@@ -90,7 +92,7 @@ class _Sentinel(Exception):
 GUILD, OWNER_PEER_DM, TEAM_PEER_DM, OWNER_DM = 1530802402603700415, 1530802402603700777, 1530802402603700888, 4242
 
 
-def _run_one_pass(results: Path, classify=None):
+def _run_one_pass(results: Path, classify=None, coroutine="poll_proactive"):
     """One pass; returns [(channel_id, text)] for every text post and upload."""
     db.RESULTS_DIR = results
     db.ACCESS_FILE = Path(_CFG) / "channels" / "discord" / "access.json"
@@ -101,6 +103,7 @@ def _run_one_pass(results: Path, classify=None):
     routing.body_claimable_by = _real_body_claimable_by
     routing.lane_claims_proactive = _real_lane_claims
     routing.should_claim_proactive_peeked = lambda *_a, **_k: True
+    routing.fallback_claims_name = _real_fallback_claims
     sys.modules["proactive_routing"] = routing
     posts: list = []
 
@@ -157,7 +160,7 @@ def _run_one_pass(results: Path, classify=None):
     _orig_sleep = db.asyncio.sleep
     db.asyncio.sleep = _sleep
     try:
-        asyncio.run(db.poll_proactive())
+        asyncio.run(getattr(db, coroutine)())
     except _Sentinel:
         pass
     finally:
@@ -169,6 +172,20 @@ def _one(body, classify=None):
     box = Path(tempfile.mkdtemp(prefix="proactive-destguard-"))
     (box / "proactive-1.txt").write_text(body)
     return _run_one_pass(box, classify)
+
+
+def _fallback(body, classify=None):
+    """One poll_dm_fallback pass over an owner task's aged result naming a redirect."""
+    box = Path(tempfile.mkdtemp(prefix="dm-fallback-destguard-"))
+    tasks = box / "tasks"
+    tasks.mkdir()
+    db.TASKS_DIR = tasks
+    (tasks / "question-1.txt").write_text("id: question-1\naccess_tier: owner\ntask: probe\n")
+    result = box / "question-1.txt"
+    result.write_text(body)
+    aged = time.time() - 400
+    os.utime(result, (aged, aged))
+    return _run_one_pass(box, classify, coroutine="poll_dm_fallback")
 
 
 def main() -> int:
@@ -197,6 +214,19 @@ def main() -> int:
     chart.write_bytes(b"png")
     posts = _one(f"[channel: {GUILD}]\nchart\n[attach: {chart}]\n", classify=sendable)
     check("f) an allowlisted attachment is still uploaded", (GUILD, "<file>") in posts, repr(posts))
+
+    posts = _fallback(f"[channel: {GUILD}]\n{leak}\n")
+    check("g) dm-fallback: a guild channel gets only the standard notice",
+          posts == [(GUILD, NOTICE)], repr(posts))
+    posts = _fallback(f"[channel: {OWNER_PEER_DM}]\n{leak}\n")
+    check("g) dm-fallback: a DM with an owner-tier recipient is unchanged",
+          posts == [(OWNER_PEER_DM, leak)], repr(posts))
+    posts = _fallback(f"[channel: {GUILD}]\nweekly summary\n[attach: /Users/someone/private/report.png]\n",
+                      classify=refused)
+    texts = [t for _c, t in posts]
+    check("g) dm-fallback: clean prose is delivered and its refusal notice names no path",
+          (GUILD, "weekly summary") in posts and any("report.png" in t for t in texts)
+          and not any("/Users/" in t for t in texts), repr(posts))
 
     src = (REPO / "src" / "discord-bridge.py").read_text()
     check("the bridge delegates to the shared guard and notice policy",

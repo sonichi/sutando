@@ -117,12 +117,57 @@ def _settle(predicate, timeout=4.0, interval=0.1):
 
 
 
+class _InfoClient:
+    """conversations_info answers from a table; a missing entry raises like a Slack API error."""
+
+    def __init__(self, table):
+        self.table, self.asked = table, []
+
+    def conversations_info(self, **kwargs):
+        self.asked.append(kwargs["channel"])
+        answer = self.table[kwargs["channel"]]
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+
+def destination_tier_units(bridge) -> None:
+    """Every branch of `_slack_destination_tier`, called directly, before the watcher starts."""
+    def im(user, is_im=True):
+        return {"channel": {"is_im": is_im, **({"user": user} if user else {})}}
+
+    owner_im = im("owner-1")
+    client = _InfoClient({
+        "C0SHARED": owner_im, "G0LEGACY": owner_im,
+        "D0OWNERPEER": owner_im, "D0TEAMPEER": im("U-TEAM"), "D0STRANGER": im("U-STRANGER"),
+        "D0UNREADABLE": RuntimeError("missing_scope"), "D0NOTIM": im("owner-1", is_im=False),
+        "D0NOPEER": im(None), "D0NOCHANNEL": {"ok": True},
+    })
+    real = bridge.app.client
+    bridge.app.client = client
+    try:
+        tier = bridge._slack_destination_tier
+        check("tier: a shared channel is other, without asking Slack",
+              tier("C0SHARED") == "other" and tier("G0LEGACY") == "other"
+              and not {"C0SHARED", "G0LEGACY"} & set(client.asked), repr(client.asked))
+        check("tier: a DM whose peer is owner in tierMap is owner", tier("D0OWNERPEER") == "owner")
+        check("tier: a DM whose peer is team in tierMap is team", tier("D0TEAMPEER") == "team")
+        check("tier: a DM whose peer is not in tierMap is other", tier("D0STRANGER") == "other")
+        check("tier: a DM conversations_info cannot read is other (fail closed)",
+              tier("D0UNREADABLE") == "other")
+        check("tier: a non-IM answer is other, even naming an owner", tier("D0NOTIM") == "other")
+        check("tier: an IM with no peer is other", tier("D0NOPEER") == "other")
+        check("tier: an answer with no channel is other", tier("D0NOCHANNEL") == "other")
+    finally:
+        bridge.app.client = real
+
+
 def main() -> int:
     bridge = _load_bridge()
     results = Path(bridge.RESULTS_DIR)
     access = Path(os.environ["SUTANDO_WORKSPACE"]) / "access.json"
     access.write_text(json.dumps({"allowFrom": ["owner-1"],
-                                  "tierMap": {"owner-1": "owner"},
+                                  "tierMap": {"owner-1": "owner", "U-TEAM": "team"},
                                   "tofuOwner": "owner-1"}))
     bridge.ACCESS_FILE = access
 
@@ -134,6 +179,8 @@ def main() -> int:
         real_print(*args, **kwargs)
 
     bridge.print = _capture
+
+    destination_tier_units(bridge)
 
     missing = "/nonexistent-4971/report.png"
     name = "proactive-redirect-4971.txt"
@@ -234,4 +281,11 @@ if __name__ == "__main__":
     # result_watcher is a daemon thread with no stop condition; exit before finalization races it.
     sys.stdout.flush()
     sys.stderr.flush()
+    try:  # os._exit skips coverage's atexit save
+        import coverage
+        _cov = coverage.Coverage.current()
+        if _cov is not None:
+            _cov.save()
+    except Exception:
+        pass
     os._exit(rc)

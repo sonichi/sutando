@@ -6073,6 +6073,13 @@ async def poll_dm_fallback():
                             # File markers (parity with poll_results 2761-2784).
                             text_only = clean_body  # _parsed_fb.body already stripped
                             file_list = [a.value for a in _parsed_fb.actions if a.kind == "attach"]
+                            _fb_tier = _redirect_destination_tier(target_channel, None)
+                            _fb_safe, _fb_withheld = guard_proactive_for_destination(
+                                _peek, str(target_channel_id), None, _fb_tier, REPO)
+                            if _fb_withheld:
+                                print(f"  [team-guard] withheld {f.name} for {target_channel_id} "
+                                      f"(tier={_fb_tier}): {_fb_withheld}", flush=True)
+                                text_only, file_list = _fb_safe, []
                             if text_only:
                                 for chunk in _chunk_for_discord(text_only):
                                     await target_channel.send(chunk)
@@ -6105,7 +6112,7 @@ async def poll_dm_fallback():
                                           "EMPTY path — malformed, surfaced", flush=True)
                                 elif _outcome == _ATTACH_REFUSED:
                                     await target_channel.send("(file not allowed: "
-                                        f"{attachment_notice_name(fpath, _redirect_destination_tier(target_channel, None))})")
+                                        f"{attachment_notice_name(fpath, _fb_tier)})")
                                     print(f"  [dm-fallback channel-redirect] REJECTED file (not in allowlist): {fpath}", flush=True)
                             print(f"  [dm-fallback channel-redirect] sent {f.name} to channel {target_channel_id}", flush=True)
                             _task_file = TASKS_DIR / f"{_task_id}.txt"
