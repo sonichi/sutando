@@ -4,7 +4,9 @@
 A worker's own lane routes each task it queues before publishing it to `tasks/`, so the task is
 held (a sentinel in `deliveries/<worker>/`) when the core's watcher first sees it. The watcher
 leaves it alone: no handler probe or run, no TASK_FILE. A task nobody holds is routed as before, and
-a deliveries folder that cannot be read still goes to the handler, which fails closed.
+a deliveries folder that cannot be read still goes to the handler, which fails closed. "Holds" means
+the delivery committed: a sentinel with the attribution naming that worker. A sentinel alone (a router
+that died between the two writes) goes to the handler, whose replay attributes it.
 
 Run: python3 tests/watch-tasks-stream-skips-worker-held.test.py
 """
@@ -49,10 +51,13 @@ class CoreWatcher(unittest.TestCase):
     def task(self, tid):
         (self.ws / "tasks" / f"{tid}.txt").write_text(f"id: {tid}\naccess_tier: owner\ntask: hi\n")
 
-    def hold(self, tid):
+    def hold(self, tid, attributed=True):
         folder = self.ws / "deliveries" / W
         folder.mkdir(parents=True, exist_ok=True)
         (folder / f"{tid}.txt").touch()
+        if attributed:
+            (self.ws / "state" / "attribution").mkdir(parents=True, exist_ok=True)
+            (self.ws / "state" / "attribution" / tid).write_text(W + "\n")
 
     def run_watcher(self, until):
         env = clean_env()
@@ -98,6 +103,13 @@ class CoreWatcher(unittest.TestCase):
         self.assertNotIn("task-held", out)
         self.assertIn("task-free.txt", calls)
         self.assertIn("TASK_FILE: task-free.txt", out)
+
+    def test_a_sentinel_with_no_attribution_goes_to_the_router_to_be_finished(self):
+        self.task("task-half")
+        self.hold("task-half", attributed=False)
+        out, err, calls = self.run_watcher(lambda o, e: self.calls.exists() and "task-half" in self.calls.read_text())
+        self.assertIn("task-half.txt", calls, "a lane's router that died before attributing it is repaired by the core")
+        self.assertNotIn("held by a worker, not routing it: task-half.txt", err)
 
     def test_a_held_task_under_the_cores_own_dead_claim_is_still_replayed(self):
         self.task("task-mine")

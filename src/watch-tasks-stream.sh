@@ -913,11 +913,11 @@ dispatch_task() {
     printf 'already answered, not dispatching again: %s\n' "$announce" >&2
     return 0
   fi
-  # The core never routes or announces a task a worker already holds (a worker's lane delivers its own
+  # The core never routes or announces a task a worker's delivery committed (a worker's lane does so
   # before publishing it), unless this core's own handler claim on it, live or retired, is unfinished.
   if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ -d "$WORKSPACE_DIR/deliveries" ] && [ ! -e "$CLAIMS_DIR/$filename" ] \
      && ! printf '%s' "$RETIRED_CLAIMS" | grep -qxF -- "$filename" \
-     && "$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" worker-holds "$WORKSPACE_DIR/deliveries" "$filename" 2>/dev/null; then
+     && "$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" worker-committed "$WORKSPACE_DIR" "$filename" 2>/dev/null; then
     printf 'held by a worker, not routing it: %s\n' "$announce" >&2
     return 0
   fi

@@ -35,7 +35,7 @@ import pool_roster
 import pool_route_handler as handler
 import pool_routing_receipt as prr
 import resolve_inbox_entry
-from delivery.task_dispatch import worker_holds
+from delivery.task_dispatch import WorkerHoldUnreadable, worker_committed, worker_holds
 from task_disposition import task_disposition
 
 W = "d" * 32
@@ -243,6 +243,100 @@ class TheRouterOnAStagedCopy(Base):
         self.assertEqual(pool_router.deliver_one(self.ws, W, "task-staged-3",
                                                  payload=self.ws / "tasks" / ".gone.tmp"), "no-payload")
         self.assertEqual(self.sentinels(W), [])
+
+
+class AnInterruptedLane(Base):
+    """The lane's router died after the sentinel and before the attribution: not committed, so the core's
+    watcher does not skip it, and its router pass repairs the attribution the bridge reads for the reply."""
+
+    def test_the_core_finishes_a_delivery_the_lane_left_half_made(self):
+        import pool_router
+        self.declare_handler()
+        tid = "task-half-1"
+        staged, dest = self.stage(tid, W)
+        dest.write_text(staged.read_text())
+        staged.unlink()
+        with self.assertRaises(RuntimeError):
+            def die():
+                raise RuntimeError("router killed")
+            pool_router.deliver_one(self.ws, W, tid, _between_sentinel_and_attribution=die)
+        self.assertTrue(worker_holds(self.ws / "deliveries", dest.name))
+        self.assertFalse(worker_committed(self.ws, dest.name), "a sentinel alone is not a committed delivery")
+        rc = handler.guarded_main(["--task-file", str(dest), "--workspace", str(self.ws),
+                                   "--results-dir", str(self.ws / "results")])
+        self.assertEqual(rc, 0)
+        self.assertTrue(worker_committed(self.ws, dest.name))
+        self.assertEqual(self.sentinels(W), [f"{tid}.txt"])
+        saved = self.rgb._STATE
+        self.addCleanup(setattr, self.rgb, "_STATE", saved)
+        self.rgb._STATE = self.ws / "state"
+        self.assertEqual(self.rgb._assigned_worker(tid), W, "the bridge attributes the worker's reply")
+
+    def test_committed_means_the_attribution_names_a_holder(self):
+        tid = "task-half-2"
+        folder = self.ws / "deliveries" / W
+        folder.mkdir()
+        (folder / f"{tid}.accepted").touch()
+        att = pa.attribution_dir(self.ws)
+        att.mkdir(parents=True)
+        for value, want in ((OTHER, False), ("", False), ("..", False), (W, True)):
+            with self.subTest(value=value):
+                (att / tid).write_text(value)
+                self.assertEqual(worker_committed(self.ws, f"{tid}.txt"), want)
+        self.assertFalse(worker_committed(self.ws, "task-nobody.txt"))
+
+    def test_an_unreadable_record_cannot_decide(self):
+        import os
+        from unittest import mock
+        tid = "task-half-3"
+        folder = self.ws / "deliveries" / W
+        folder.mkdir()
+        (folder / f"{tid}.txt").touch()
+        pa.attribution_dir(self.ws).mkdir(parents=True)
+        (pa.attribution_dir(self.ws) / tid).mkdir()
+        with self.assertRaises(WorkerHoldUnreadable):
+            worker_committed(self.ws, f"{tid}.txt")
+        (pa.attribution_dir(self.ws) / tid).rmdir()
+        (pa.attribution_dir(self.ws) / tid).write_text(W)
+        real = os.lstat
+
+        def flaky(path, *a, **k):
+            if str(path).endswith(f"{W}/{tid}.txt") and flaky.armed:
+                raise PermissionError("denied")
+            return real(path, *a, **k)
+        flaky.armed = False
+        with mock.patch("os.lstat", side_effect=flaky):
+            import delivery.task_dispatch as td
+            with mock.patch.object(td, "worker_holds", return_value=True):
+                flaky.armed = True
+                with self.assertRaises(WorkerHoldUnreadable):
+                    worker_committed(self.ws, f"{tid}.txt")
+
+    def test_the_cli(self):
+        import subprocess
+        tid = "task-half-4"
+        script = str(ROOT / "src" / "delivery" / "task_dispatch.py")
+
+        def cli(*args):
+            import contextlib
+            import io
+            import delivery.task_dispatch as td
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = td._main(["worker-committed", *args])
+            self.assertEqual(subprocess.run([sys.executable, script, "worker-committed", *args],
+                                            capture_output=True).returncode, rc)
+            return rc
+        self.assertEqual(cli(str(self.ws), f"{tid}.txt"), 1)
+        folder = self.ws / "deliveries" / W
+        folder.mkdir()
+        (folder / f"{tid}.txt").touch()
+        pa.attribution_dir(self.ws).mkdir(parents=True)
+        (pa.attribution_dir(self.ws) / tid).mkdir()
+        self.assertEqual(cli(str(self.ws), f"{tid}.txt"), 2)
+        (pa.attribution_dir(self.ws) / tid).rmdir()
+        (pa.attribution_dir(self.ws) / tid).write_text(W)
+        self.assertEqual(cli(str(self.ws), f"{tid}.txt"), 0)
+        self.assertEqual(cli(str(self.ws), f"{tid}.txt", "extra"), 2)
 
 
 if __name__ == "__main__":
