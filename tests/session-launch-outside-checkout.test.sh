@@ -49,5 +49,16 @@ settings_for ""
 [ "$rc" = 0 ] && [ -z "$(stop_commands)" ] && [ -z "$(prompt_arg)" ]
 check $? "no working dir (the default, cwd = checkout): unchanged"
 
+
+# start-cli.sh installs the project hooks into an override dir first: --settings must not repeat it.
+mkdir -p "$TMP/core-override/.claude"
+printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"bash \\"%s/src/check-pending-tasks.sh\\""}]}]}}' \
+  "$REAL_REPO" > "$TMP/core-override/.claude/settings.json"
+settings_for "$TMP/core-override"
+[ -z "$(stop_commands)" ]
+check $? "an override dir whose project settings hold the Stop hook: no second copy in --settings"
+P="$(prompt_arg)"; case "$P" in *"Read $REAL_REPO/CLAUDE.md"*) true ;; *) false ;; esac
+check $? "an override dir whose project settings hold the Stop hook: the CLAUDE.md pointer stays"
+
 echo "session-launch-outside-checkout: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

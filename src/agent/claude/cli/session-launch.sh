@@ -275,6 +275,13 @@ claude_session_outside_checkout() {
   [ "$_wd_real" != "$_repo_real" ]
 }
 
+# 0 when the working dir's own project settings already register the pending-tasks Stop hook
+# (start-cli.sh installs it there); --settings then must not add a second copy.
+claude_cwd_has_pending_stop_hook() {
+  grep -sqF "src/check-pending-tasks.sh" "$SUTANDO_CLAUDE_WORKING_DIR/.claude/settings.json" \
+    "$SUTANDO_CLAUDE_WORKING_DIR/.claude/settings.local.json"
+}
+
 # One `--settings` flag carries every hook a headless session needs (multiple
 # --settings flags are undocumented/last-wins, so compose into a single JSON):
 #  * AskUserQuestion guard — ALWAYS registered. No interactive user can answer
@@ -282,8 +289,8 @@ claude_session_outside_checkout() {
 #  * obs collector hooks — added to the SAME JSON only when an export
 #    endpoint is set ($SUTANDO_OBS_ENDPOINT).
 #  * outside the checkout (SUTANDO_CLAUDE_WORKING_DIR not the repo): the Stop
-#    hook, plus an --append-system-prompt naming the repo's CLAUDE.md; neither
-#    the project hooks nor CLAUDE.md load from another cwd.
+#    hook unless that folder's project settings hold it, plus an
+#    --append-system-prompt naming the repo's CLAUDE.md, which never loads there.
 # Built by node helpers, not shell string interpolation (a $REPO with a space
 # or a `"` broke hand-rolled interpolation in the past). Reads REPO and the
 # working dir resolve_claude_cwd_args canonicalized. Sets SETTINGS_ARGS and
@@ -292,11 +299,10 @@ resolve_claude_settings_args() {
   OBS_ENDPOINT="${SUTANDO_OBS_ENDPOINT:-}"
   export SUTANDO_OBS_ENDPOINT="$OBS_ENDPOINT"
   SETTINGS_ARGS=()
-  local _outside="" _stop_hook=""
+  local _stop_hook=""
   if claude_session_outside_checkout; then
-    _outside=1
-    _stop_hook="$REPO/src/check-pending-tasks.sh"
-    SETTINGS_ARGS+=(--append-system-prompt "This session's working folder is not the Sutando checkout, so the checkout's CLAUDE.md was not loaded. Read $REPO/CLAUDE.md now and follow it for every task. Answer each TASK_FILE by publishing <workspace>/results/<task id>.txt (workspace: \$SUTANDO_WORKSPACE_DIR, else the output of bash '$REPO/scripts/sutando-config.sh' workspace) with \"\${SUTANDO_PY:-python3}\" '$REPO/src/result_publish.py' (body on stdin), never only in this terminal.")
+    claude_cwd_has_pending_stop_hook || _stop_hook="$REPO/src/check-pending-tasks.sh"
+    SETTINGS_ARGS+=(--append-system-prompt "This session's working folder is not the Sutando checkout, so the checkout's CLAUDE.md was not loaded. Read $REPO/CLAUDE.md now and follow it for every task. Answer each TASK_FILE through \"\${SUTANDO_PY:-python3}\" '$REPO/src/result_publish.py' (body on stdin; its path argument is the task's result file, named after the task id in the workspace's results folder; workspace: \$SUTANDO_WORKSPACE_DIR, else the output of bash '$REPO/scripts/sutando-config.sh' workspace), never only in this terminal.")
   fi
   if ! command -v node > /dev/null 2>&1; then
     echo "session hooks: node unavailable — cannot safely build --settings JSON; AskUserQuestion guard + obs disabled this session" >&2
@@ -317,7 +323,7 @@ resolve_claude_settings_args() {
   if [ -n "$CLAUDE_SETTINGS_JSON" ]; then
     SETTINGS_ARGS+=(--settings "$CLAUDE_SETTINGS_JSON")
     echo "session hooks: AskUserQuestion guard registered (PreToolUse deny — a headless session can't answer it)"
-    if [ -n "$_outside" ]; then echo "session hooks: Stop hook registered (cwd is outside the checkout)"; fi
+    if [ -n "$_stop_hook" ]; then echo "session hooks: Stop hook registered (cwd is outside the checkout)"; fi
   else
     echo "session hooks: settings build failed — AskUserQuestion guard NOT registered this session" >&2
   fi
