@@ -6,12 +6,17 @@ kept as pending and goes out with the next notice that is sent, for that room or
 pending line is never sent twice. A message already noted is skipped.
 
 The backend (s.space `owner.mentioned_by_*`) queues both of its shapes in the owner DM, so the
-result posts there and carries no redirect: a notice (no message text) and an engage task (a
-quoted excerpt). The room and message are read only from the server's own briefing lines; the
-excerpt is one JSON-quoted line that starts with the sender, so it cannot forge one.
-Every line is quoted with `result_markers.neutralize_markers`, so a name or excerpt the note
-repeats cannot act as a result marker. State lives in `<workspace>/state/owner-mention/`; when
-it cannot be written (a sandboxed turn) the note is sent unbatched rather than lost.
+result posts there and carries no redirect. The gateway folds the briefing onto one line
+(`task: ...`), so the message is read from the LAST matrix.to link in the body: everything a
+sender controls (their name, the room's name, the JSON-quoted excerpt) comes before the
+server's own link, and only fixed text after it.
+
+Lines leave state only with a durable result. The lines a notice drains are kept in a
+`publishing` record until the publisher returns 0. A failure (non-zero) marks it `failed`, and
+its lines go out with this task's retry or, folded in, with the next notice. A record a crash
+left `publishing` is settled, never blindly replayed: the publisher writes atomically, so its
+result at its path (or in the archive) means published, and none means failed. Every line is quoted with `result_markers.neutralize_markers`. When the
+state cannot be written (a read-only turn) the note is sent unbatched rather than lost.
 
 Usage:
   owner_notice.py publish --task-file <task> <result path> [--window-min N] [--workspace DIR]
@@ -27,6 +32,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import unquote
 
 REPO = Path(__file__).resolve().parents[3]  # lint-workspace-resolution: allow-repo-root
 if str(REPO / "src") not in sys.path:
@@ -38,25 +44,17 @@ SKIP_BODY = "[no-send]"
 WINDOW_MIN = 10
 PENDING_MAX = 20
 SEEN_MAX = 500
-_ROOM_ID = r"![A-Za-z0-9._=\-]+:[A-Za-z0-9.\-]+(?::\d+)?"
-_ENGAGE_LINE_RE = re.compile(
-    rf"^2\. You may answer the message in the room ({_ROOM_ID}) \(reply to (\$[^)\s]+)\)", re.M)
-_NOTICE_LINE_RE = re.compile(r"^.* is addressing your owner .*$", re.M)
-_LINK_RE = re.compile(r"https://matrix\.to/#/(%21[^/\s]+)/(%24\S+?)(?=[\s,]|$)")
+# quote(safe=''): a room id is %21..., an event id %24..., only unreserved chars and %XX.
+_LINK_RE = re.compile(r"https://matrix\.to/#/(%21[A-Za-z0-9._~%-]+)/(%24[A-Za-z0-9._~%-]+)")
 
 
 def mention_of(task_text: str) -> dict:
-    """{mode, room, event}: engage when the server's reply line is there, else notice; room
-    and event None when the task names none."""
+    """{room, event} from the server's own link, the last in the body; None when absent."""
     body = local_task_protocol.parse_task_headers(task_text).body
-    engage = _ENGAGE_LINE_RE.search(body)
-    if engage:
-        return {"mode": "engage", "room": engage.group(1), "event": engage.group(2)}
-    from urllib.parse import unquote
-    line = _NOTICE_LINE_RE.search(body)
-    links = _LINK_RE.findall(line.group(0)) if line else []
-    room, event = (unquote(links[-1][0]), unquote(links[-1][1])) if links else (None, None)
-    return {"mode": "notice", "room": room, "event": event}
+    links = _LINK_RE.findall(body)
+    if not links:
+        return {"room": None, "event": None}
+    return {"room": unquote(links[-1][0]), "event": unquote(links[-1][1])}
 
 
 def _state_path(workspace: Path) -> Path:
@@ -108,6 +106,15 @@ def compose(lines: list) -> str:
     return result_markers.neutralize_markers(body.strip()) + "\n"
 
 
+def published(result: str) -> bool:
+    """Whether `result` was written: still at its path, or already moved to the archive."""
+    path = Path(result)
+    if path.exists():
+        return True
+    archive = path.parent / "archive"
+    return archive.is_dir() and any(archive.rglob(f"{path.stem}*"))
+
+
 def publish(result: str, text: str, extra: list) -> int:
     return subprocess.run([sys.executable, str(PUBLISHER), *extra, result], input=text,
                           text=True).returncode
@@ -120,25 +127,54 @@ def _workspace(arg: "str | None") -> Path:
     return resolve_workspace(migrate=False)
 
 
-def run(task_text: str, note: str, *, workspace: Path, now: float,
-        window_s: float) -> "tuple[str, str | None]":
-    """(verdict, result body or None for [no-send]); the state write is best-effort."""
+def _settle(inflight: dict) -> None:
+    """A record left `publishing` by a crash: the publisher writes atomically, so its result is
+    either at its path (or archived), published, or nowhere, a definite failure."""
+    for key, record in list(inflight.items()):
+        if record.get("status") == "publishing":
+            if published(record.get("result", "")):
+                del inflight[key]
+            else:
+                record["status"] = "failed"
+
+
+def run(task_text: str, note: str, result: str, extra: list, *, workspace: Path, now: float,
+        window_s: float, publisher=publish) -> "tuple[str, int]":
+    """(verdict, publisher return code). A drained line stays in a `publishing` record until
+    the publisher returns 0; a failed one goes out with this task's retry or the next notice."""
     m = mention_of(task_text)
     note = " ".join(note.split())
-    room = m["room"] or "unknown"
+    room, key = m["room"] or "unknown", m["event"] or f"result:{result}"
     path = _state_path(workspace)
     try:
         with file_lock.locked_file(path.with_suffix(".lock"), create_mode=0o600):
             state = _read(path)
-            verdict, lines = decide(state, room, m["event"], note, now, window_s)
+            inflight = state.setdefault("publishing", {})
+            _settle(inflight)
+            retry = inflight.pop(key, None)
+            if retry is not None:
+                lines = retry["lines"]
+            else:
+                verdict, lines = decide(state, room, m["event"], note, now, window_s)
+                if verdict != "sent":
+                    _write(path, state)
+                    rc = publisher(result, SKIP_BODY + "\n", extra)
+                    return ("skip: already noted" if verdict == "skip" else "batched"), rc
+            for other in [k for k, r in inflight.items() if r.get("status") == "failed"]:
+                lines = lines + inflight.pop(other)["lines"]
+            inflight[key] = {"status": "publishing", "result": result, "lines": lines}
             _write(path, state)
+            rc = publisher(result, compose(lines), extra)
+            if rc == 0:
+                del inflight[key]
+            else:
+                inflight[key]["status"] = "failed"
+            _write(path, state)
+            return "sent", rc
     except OSError as e:
         print(f"owner_notice: state unwritable ({type(e).__name__}); sending unbatched",
               file=sys.stderr)
-        verdict, lines = "sent", [note]
-    if verdict != "sent":
-        return ("skip: already noted" if verdict == "skip" else "batched"), None
-    return "sent", compose(lines)
+        return "sent", publisher(result, compose([note]), extra)
 
 
 def main(argv: "list[str] | None" = None) -> int:
@@ -157,12 +193,12 @@ def main(argv: "list[str] | None" = None) -> int:
         print("owner_notice: empty note on stdin; nothing published", file=sys.stderr)
         return 2
     task_text = args.task_file.read_text(encoding="utf-8", errors="replace")
-    verdict, body = run(task_text, note, workspace=_workspace(args.workspace), now=time.time(),
-                        window_s=args.window_min * 60)
-    print(verdict)
     extra = [x for flag in ("title", "outcome") if getattr(args, flag)
              for x in (f"--{flag}", getattr(args, flag))]
-    return publish(args.result, body if body is not None else SKIP_BODY + "\n", extra)
+    verdict, rc = run(task_text, note, args.result, extra, workspace=_workspace(args.workspace),
+                      now=time.time(), window_s=args.window_min * 60)
+    print(verdict)
+    return rc
 
 
 if __name__ == "__main__":

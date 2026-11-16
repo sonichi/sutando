@@ -11,13 +11,14 @@ backend sends it to ONE of your owner's agents per message: if you have it, you 
 telling your owner. If the message also named you, you get an ordinary mention instead.
 
 Both shapes are queued in your owner DM, so the task's answer goes to your owner, and to no one
-else. The body tells them apart:
+else. The gateway folds the body onto one line. The body tells them apart:
 
-- **notice**: the sender's tier is one your owner does not let you engage with. The body says
+- **notice**: the sender is held for your owner (a guest), or no agent of your owner was online
+  when it was sent. The body says
   `<sender> is addressing your owner <owner> in the room <room>: <link>` and nothing else. You
   were not given the message. Do not read it, do not open the room's timeline for it, and do
   not post in that room.
-- **engage**: the sender's tier is team, guest or collaborator, and `access_tier` is that tier.
+- **engage**: the sender's tier is team or collaborator, and `access_tier` is that tier.
   The body quotes a bounded excerpt of the message and names it:
   `2. You may answer the message in the room <room id> (reply to <event id>) ...`.
 
@@ -46,7 +47,13 @@ when there is one, wins over this file.
    ```
 
    It prints `sent`, `batched` (published `[no-send]`; the line goes out with the next notice)
-   or `skip: <why>` (published `[no-send]`).
+   or `skip: <why>` (published `[no-send]`). A non-zero exit means the result was not
+   published: run the same command again for this task; nothing is lost or sent twice.
+
+   **A read-only turn** (a non-owner tier run by a sandboxed connector such as `codex-local`,
+   which cannot run the script or write the result file and writes your answer itself): your
+   answer is the one line, and nothing else. Dedupe and batching do not run on that path, and
+   the delivering bridge withholds any result marker a non-owner answer carries.
 3. **A reply in the room** is allowed only in an engage task, only within the sender's tier,
    and only when a reply from you, not your owner, clearly helps (for example, saying your
    owner has been told). Post it with the room's `room.message.send` Action in that room,
