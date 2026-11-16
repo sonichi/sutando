@@ -38,9 +38,8 @@
 //   arg8 (optional): path to hooks/stale-head-post-guard.py — registered under
 //                    PreToolUse[Bash]: blocks a PR review or comment whose
 //                    commit_id or sha claim names a head the PR has moved past.
-//   arg9 (optional): path to src/check-pending-tasks.sh — registered as a Stop
-//                    hook. The launcher passes it only when the session's cwd is
-//                    not the checkout, whose project settings already carry it.
+//   arg9 (optional): path to src/check-pending-tasks.sh, registered as a Stop hook;
+//                    passed only when the cwd is not the checkout (whose settings carry it).
 // Prints the merged settings JSON to stdout (exit 2 on a missing guard path,
 // exit 3 on an unparseable obs-settings blob).
 
