@@ -94,7 +94,8 @@ count (`python3 src/pending_questions_reader.py summary`).
 A question asked with `--default-action` and/or `--option` whose destination is s.space (its
 task's bridge, else the bridge the owner was last active on) is asked as a decision card, built by
 `src/hitl/cards.py` (the one builder every card producer uses): one button per choice — with a
-default, one per `ordered_options()` entry, Approve first and carrying it; with options alone,
+default, one per `ordered_options()` entry, Approve first and carrying it (an option named like
+the default is that same choice: Approve takes its consequence and it is not shown twice); with options alone,
 exactly the options as given, with no Approve — and `subject.choices` holding each consequence.
 
 - **Order.** The card is built and its id allocated; the question is held in the outbox and its
