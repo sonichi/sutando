@@ -293,11 +293,7 @@ def main(argv=None) -> int:
 
 
 def _cli_asked(a) -> int:
-    try:
-        rows = asked(a.workspace)
-    except (ValueError, OSError) as e:
-        print(f"pool_ask: {e}", file=sys.stderr)
-        return 2
+    rows = asked(a.workspace)
     if a.json:
         print(json.dumps(rows, indent=2, sort_keys=True))
         return 0

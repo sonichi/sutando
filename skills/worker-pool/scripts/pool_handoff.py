@@ -159,19 +159,14 @@ def _read_asks(workspace, since: float) -> list:
 
 
 def _task_files(tasks: Path, since: float):
-    """Live and archived task files modified since `since`; month folders older than it are skipped."""
+    """Live and archived task files; month folders older than `since` are skipped."""
     month = datetime.fromtimestamp(since, timezone.utc).strftime("%Y-%m")
     dirs = [tasks, tasks / "archive"]
     archive = tasks / "archive"
     if archive.is_dir():
         dirs += sorted(d for d in archive.iterdir() if d.is_dir() and d.name >= month)
     for d in dirs:
-        for f in d.glob("task-*.txt"):
-            try:
-                if f.stat().st_mtime >= since:
-                    yield f
-            except OSError:
-                continue
+        yield from d.glob("task-*.txt")
 
 
 def replies_by_event(workspace, since: float) -> dict:
@@ -179,6 +174,8 @@ def replies_by_event(workspace, since: float) -> dict:
     out: dict = {}
     for f in _task_files(Path(workspace) / "tasks", since):
         try:
+            if f.stat().st_mtime < since:
+                continue
             text = f.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue

@@ -309,6 +309,31 @@ class Asked(Base):
         later = ph.time.time() + ph.RECENT_S + 60
         self.assertEqual(ph.asked(self.ws, now=later), [], "an ask past the window is not listed")
 
+    def test_no_record_means_no_asks(self):
+        ph.asks_path(self.ws).unlink()
+        self.assertEqual(pa.asked(self.ws), [])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(pa.main(["--workspace", str(self.ws), "--asked"]), 0)
+        self.assertEqual(out.getvalue().strip(), "no unanswered room hand-offs")
+
+    def test_unreadable_record_lines_are_skipped(self):
+        with ph.asks_path(self.ws).open("a") as f:
+            f.write("not json\n[1, 2]\n" + json.dumps({"task_id": "task-x", "sent_at": "yesterday"}) + "\n")
+        self.assertEqual([r["task_id"] for r in pa.asked(self.ws)], [self.tid])
+
+    def test_a_task_file_that_cannot_be_read_is_skipped(self):
+        (self.ws / "tasks" / "task-dangling.txt").symlink_to(self.ws / "nowhere.txt")
+        gateway_task(self.ws / "tasks", "task-reply", event="$req", sender=WORKER_AGENT)
+        self.assertEqual(pa.asked(self.ws), [], "one unreadable file stopped the scan")
+
+    def test_cli_names_replies_from_others_and_an_unrecorded_ask(self):
+        gateway_task(self.ws / "tasks", "task-other", event="$req", sender="@visitor:srv")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            pa.main(["--workspace", str(self.ws), "--asked"])
+        self.assertIn("[replies only from: @visitor:srv]", out.getvalue())
+
     def test_cli_lists_and_goes_alone(self):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -344,6 +369,13 @@ class Cli(Base):
         rc, out, _ = self.run_cli("--to", "alpha", "--ask", "?", room=room)
         self.assertEqual(rc, 0, "without --wait the post is a success")
         self.assertIn("as a room hand-off", out)
+
+    def test_a_record_that_cannot_be_written_is_said(self):
+        self.on()
+        with mock.patch.object(ph.task_lifecycle, "append_durable", side_effect=OSError("disk full")):
+            rc, _, err = self.run_cli("--to", "alpha", "--ask", "?", room=FakeRoom())
+        self.assertEqual(rc, 0)
+        self.assertIn("posted but not recorded: disk full", err)
 
     def test_a_refusal_exits_2_and_unconfirmed_is_said(self):
         self.on()
