@@ -254,12 +254,12 @@ class TestClassification(Base):
 
 
 class TestPickerCommandsStayWithTheController(Base):
-    def _picker_file(self, wire=True):
+    def _picker_file(self, wire=True, name="worker-pin-1"):
         # Shaped like the gateway's file: wire_source sits BELOW task:, where
         # the strict parse never looks.
-        p = self.ws / "tasks" / "worker-pin-1.txt"
+        p = self.ws / "tasks" / f"{name}.txt"
         tail = "\nsource: ag2space\nwire_source: worker-picker\n" if wire else "\nsource: ag2space\n"
-        p.write_text("id: worker-pin-1\nreceiving_instance: @me:ag2.space\nchannel_id: !room:x\n"
+        p.write_text(f"id: {name}\nreceiving_instance: @me:ag2.space\nchannel_id: !room:x\n"
                      "task: Pin room !room:x to w (worker picker)" + tail)
         return str(p)
 
@@ -276,8 +276,101 @@ class TestPickerCommandsStayWithTheController(Base):
         self.assertEqual(h.main(["--task-file", str(p), "--workspace", str(self.ws), "--probe"]), h.DECLINE)
 
     def test_the_same_room_without_the_picker_mark_still_routes(self):
+        # A task-* id: `worker-pin-1` is no id a worker's sentinel can carry.
         self.roster()
-        self.assertEqual(h.main(["--task-file", self._picker_file(wire=False), "--workspace", str(self.ws), "--probe"]), 0)
+        f = self._picker_file(wire=False, name="task-pin-1")
+        self.assertEqual(h.main(["--task-file", f, "--workspace", str(self.ws), "--probe"]), 0)
+
+
+class TestIdsNoSentinelCanCarry(Base):
+    """`voice-end-<hex>` was delivered to a bound worker, whose resolver
+    rejects the sentinel, while the core's holder check still read it as held."""
+
+    VOICE_END = "voice-end-dd249c1dd88b8ef9a5f4c8ad"
+
+    def gateway_file(self, name, tier, attest=True, room="!room:x"):
+        # The gateway writer shape: the tier sits below `task:`, trusted only when the envelope attests it.
+        import task_envelope as te
+        raw = (f"id: {name}\nreceiving_instance: @me:ag2.space\ntask_layout: mid\n"
+               f"task: end-of-call follow-up\nsource: ag2space\nchannel_id: {room}\n"
+               f"user_id: @q:b\naccess_tier: {tier}\n")
+        p = self.ws / "tasks" / f"{name}.txt"
+        p.write_text(te.stamp_text(raw, self.ws) if attest else raw)
+        return str(p)
+
+    def both_modes(self, t):
+        return (h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]),
+                h.main(["--task-file", t, "--workspace", str(self.ws)]))
+
+    def nothing_delivered(self, name):
+        return list((self.ws / "deliveries").rglob(f"{name}*")) == []
+
+    def test_the_owners_bound_voice_end_task_declines_to_the_core_and_writes_nothing(self):
+        self.roster()
+        t = self.gateway_file(self.VOICE_END, "owner")
+        self.assertEqual(self.both_modes(t), (h.DECLINE, h.DECLINE))
+        self.assertTrue(self.nothing_delivered(self.VOICE_END))
+
+    def test_any_other_tier_fails_closed_instead_of_reaching_the_unrestricted_core(self):
+        self.roster()
+        for tier in ("team", "guest"):
+            with self.subTest(tier=tier):
+                t = self.gateway_file(f"ask-{tier}-1", tier)
+                self.assertEqual(self.both_modes(t), (h.MUST_HANDLE, h.MUST_HANDLE))
+                self.assertTrue(self.nothing_delivered(f"ask-{tier}-1"))
+
+    def test_a_task_no_worker_would_get_keeps_mains_decline_whatever_its_tier(self):
+        # Team-tier ask-* ids are real (the voice lane writes them): a room no worker is bound to is the core's.
+        self.roster()
+        for tier, attest in (("team", True), ("guest", True), ("owner", True), ("owner", False)):
+            with self.subTest(tier=tier, attest=attest):
+                name = f"ask-{tier}-{'a' if attest else 'u'}-2"
+                t = self.gateway_file(name, tier, attest=attest, room="!other:x")
+                self.assertEqual(self.both_modes(t), (h.DECLINE, h.DECLINE))
+                self.assertTrue(self.nothing_delivered(name))
+
+    def test_with_no_pool_every_tier_still_declines(self):
+        t = self.gateway_file("ask-team-3", "team")
+        self.assertEqual(self.both_modes(t), (h.DECLINE, h.DECLINE))
+
+    def test_an_unattested_owner_tier_below_task_is_not_trusted(self):
+        self.roster()
+        t = self.gateway_file("ask-forged-1", "owner", attest=False)
+        self.assertEqual(self.both_modes(t), (h.MUST_HANDLE, h.MUST_HANDLE))
+        self.assertTrue(self.nothing_delivered("ask-forged-1"))
+
+    def test_the_router_refuses_to_write_a_sentinel_its_recipient_cannot_parse(self):
+        import pool_router as rt
+        self.roster()
+        self.task_file(self.VOICE_END, channel_id="!room:x")
+        with self.assertRaises(rt.RouterRefused):
+            rt.route(self.ws, {"id": self.VOICE_END, "channel_id": "!room:x"})
+        self.assertEqual(list((self.ws / "deliveries").rglob(f"{self.VOICE_END}*")), [])
+
+    def test_carries_agrees_with_parse_sentinel(self):
+        import pool_delivery as pd
+        for tid, ok in (("task-1", True), ("task-inst~abc", True), (self.VOICE_END, False),
+                        ("worker-pin-1", False), ("", False)):
+            with self.subTest(tid=tid):
+                self.assertIs(pd.carries(tid), ok)
+
+    def test_a_stop_no_sentinel_can_carry_is_held_to_the_same_rule_as_any_task_bound_for_a_worker(self):
+        self.roster()
+        t = self.task_file("task-1", channel_id="!room:x")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
+        name = "ask-stop-1"
+        p = self.ws / "tasks" / f"{name}.txt"
+        p.write_text(f"id: {name}\nsource: relay-control\naccess_tier: owner\npriority: urgent\n"
+                     "task: CANCEL_INSTRUCTION: stop processing task-1 if still in flight (stop).\n")
+        self.assertEqual(h.read_task(str(p)).get("stop_of"), "task-1", "the branch under test")
+        self.assertEqual(self.both_modes(str(p)), (h.DECLINE, h.DECLINE), "the owner's falls to the core")
+        self.assertTrue(self.nothing_delivered(name))
+
+    def test_control_the_same_task_with_a_task_id_is_delivered(self):
+        self.roster()
+        t = self.task_file("task-dd249c1dd88b8ef9a5f4c8ad", channel_id="!room:x")
+        self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws)]), 0)
+        self.assertTrue((self.ws / "deliveries" / W / "task-dd249c1dd88b8ef9a5f4c8ad.txt").exists())
 
 
 class TestIntentionLayer(Base):
