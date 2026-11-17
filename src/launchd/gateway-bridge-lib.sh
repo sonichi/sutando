@@ -1,6 +1,6 @@
 #!/bin/bash
 # The legacy gateway bridge's launch policy, one copy for both launchers: sourced by the launchd wrapper,
-# run as `gateway-bridge-lib.sh env|alert` by src/sparrow_core_bridge.py. Needs $REPO.
+# run as `gateway-bridge-lib.sh env|alert|core-gate` by its other callers. Needs $REPO.
 
 # What the process environment provided, kept apart from what the .env provides, so a re-read can
 # drop a removed .env token without dropping an environment-provided one.
@@ -43,6 +43,10 @@ gateway_legacy_env() {
     export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
 }
 
+# The opt-in gate: set, sparrowd (`src/sparrowd.py --core`) runs the core gateway bridge instead of the
+# wrapper or startup's bare launch. docs/connections.md has the cut-over and undo.
+gateway_core_gate() { [ -n "${1:-}" ] && [ -f "$1/state/sparrowd/core.enabled" ]; }
+
 _gw_age() { local t; t="$(cat "$1" 2>/dev/null || echo 0)"; echo $(( $(date +%s) - ${t:-0} )); }
 
 # Tell the owner an unexpected restart happened (needs $WORKSPACE): quiet inside the deliberate-restart
@@ -78,6 +82,7 @@ if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
       WORKSPACE="${WORKSPACE:?WORKSPACE is required}"
       gateway_restart_alert
       ;;
-    *) echo "usage: gateway-bridge-lib.sh env|alert" >&2; exit 2 ;;
+    core-gate) gateway_core_gate "${2:-}" ;;
+    *) echo "usage: gateway-bridge-lib.sh env|alert|core-gate WORKSPACE" >&2; exit 2 ;;
   esac
 fi

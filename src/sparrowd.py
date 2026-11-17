@@ -139,7 +139,7 @@ def _static_specs() -> "tuple[list, list[str]]":
 
 
 CORE_LAUNCHER = _SRC / "sparrow_core_bridge.py"
-CORE_WORKER = "core-gateway-bridge"
+from sparrow_core_bridge import CORE_WORKER  # noqa: E402
 
 
 def core_spec(workspace=None, environ=None) -> "tuple[WorkerSpec | None, str]":
@@ -156,32 +156,61 @@ def core_spec(workspace=None, environ=None) -> "tuple[WorkerSpec | None, str]":
     if decision is None:
         return None, why
     return WorkerSpec(name=CORE_WORKER, argv=[sys.executable, str(CORE_LAUNCHER), f"--expect={decision['instance']}"],
-                      cwd=str(REPO), revision=core.revision(decision, ws), hold_rc=core.HOLD_RC), ""
+                      cwd=str(REPO), revision=core.revision(decision, ws), hold_rc=core.HOLD_RC,
+                      held_healthy=False), ""
 
 
 class CoreScan:
-    """The core worker as of each pass: [] while there is nothing to run, its last spec kept while the
-    connections cannot be read. A reason is printed when it first appears, not every pass."""
+    """The core worker as of each pass: [] while the opt-in gate is off or there is nothing to run, its
+    last spec kept while the connections cannot be read. A core held after a stand-down is re-armed (its
+    revision bumped, and kept until the connections change) once its lease is free. A reason is printed
+    when it first appears, not every pass."""
 
     def __init__(self, workspace=None):
         self._workspace = workspace
         self._last: list = []
         self._said = ""
+        self._base = ""
+        self._rearm = 0
 
     def _say(self, why: str) -> None:
         if why and why != self._said:
             print(f"sparrowd: core gateway bridge — {why}", file=sys.stderr)
         self._said = why
 
-    def __call__(self) -> list:
+    def __call__(self, status=None) -> list:
+        import sparrow_core_bridge as core
+        ws = self._workspace or resolve_workspace()
+        if not core.core_gate(ws):
+            try:
+                if core.holds_lock(ws, os.getpid()):
+                    core.write_claim(ws, None)
+            except OSError:
+                pass
+            self._say("not supervised: the core gate is off")
+            self._last = []
+            return []
         try:
-            spec, why = core_spec(self._workspace)
+            spec, why = core_spec(ws)
         except Exception as e:  # noqa: BLE001 - an unreadable scan keeps the running core
             self._say(f"not rescanned ({type(e).__name__}: {e}); keeping the current one")
             return list(self._last)
         self._say(why and f"not supervised: {why}")
+        if spec is not None:
+            spec = self._rearmed(spec, status, ws)
         self._last = [spec] if spec else []
         return list(self._last)
+
+    def _rearmed(self, spec, status, ws):
+        import dataclasses
+        import sparrow_core_bridge as core
+        if spec.revision != self._base:
+            self._base, self._rearm = spec.revision, 0
+        held = ((status or {}).get("workers") or {}).get(CORE_WORKER, {}).get("state") == "held"
+        if held and core.lease_free(spec.argv[-1].split("=", 1)[1], ws):
+            self._rearm += 1
+            self._say("re-armed: it stood down to another holder, and that lease is now free")
+        return dataclasses.replace(spec, revision=f"{self._base}:{self._rearm}") if self._rearm else spec
 
 
 def worker_specs() -> list:
@@ -277,15 +306,15 @@ def main(argv=None) -> int:
             return 2
     import sparrow_agent_bridge as agent_bridge
     scan = AgentBridgeScan()
-    core = CoreScan() if args.core else (lambda: [])
+    core = CoreScan() if args.core else (lambda status=None: [])
     try:
         agents = scan()
     except agent_bridge.ScanUnavailable as e:  # picked up on the first pass that can be made
         print(f"sparrowd: agent bridges not scanned yet — {e}", file=sys.stderr)
         agents = []
     state_dir = resolve_workspace() / "state" / "sparrowd"
-    return run(static + core() + agents, state_dir, rescan=lambda: static + core() + scan(),
-               rescan_s=args.rescan_s, wait_for_lock=args.agent_bridges)
+    return run(static + core() + agents, state_dir, rescan=lambda status=None: static + core(status) + scan(),
+               rescan_s=args.rescan_s, wait_for_lock=args.agent_bridges, rescan_status=True)
 
 
 if __name__ == "__main__":  # pragma: no cover
