@@ -111,6 +111,19 @@ class TaskHome(Base):
         self.assertEqual(C.task_home("task-unknown-lane~abc", self.ws),
                          {"lane": "unknown-lane", "worker": "", **shared})
 
+    def test_an_id_its_lane_did_not_queue_is_its_when_its_tasks_folder_holds_it(self):
+        self.standard(dirs="own")
+        root = self.own_root()
+        probe = "task-0123abcd"
+        self.assertFalse(C.task_home(probe, self.ws)["own"])
+        (root / "tasks" / "archive").mkdir(parents=True)
+        (root / "tasks" / f"{probe}.txt").write_text("t")
+        self.assertEqual(C.task_home(probe, self.ws), {"lane": "", "worker": W, "tasks": root / "tasks",
+                                                       "results": root / "results", "own": True})
+        (root / "tasks" / f"{probe}.txt").rename(root / "tasks" / "archive" / f"{probe}.txt")
+        self.assertTrue(C.task_home(probe, self.ws)["own"], "archived there still lives there")
+        self.assertFalse(C.task_home("../escape", self.ws)["own"])
+
     def test_an_unreadable_record_is_shared(self):
         self.standard(dirs="own")
         C.record_path(self.ws).write_text("{not json")
