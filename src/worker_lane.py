@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import os
 import re
-import shlex
 import subprocess
 import sys
 import time
@@ -215,39 +214,61 @@ def processes() -> "dict[int, tuple[int, int, str]]":
     return procs
 
 
-def _argv(command: str) -> "list[str]":
-    try:
-        return shlex.split(command)
-    except ValueError:
-        return command.split()
+CAPABILITY = re.compile(r"^ACCEPTS_WORKER_DECLARATIONS = 1$", re.M)
+# What sparrowd loads when it starts and scans declarations; a newer copy needs a restart.
+LOADED_CODE = (("src", AGENT_BRIDGE_SCRIPT), ("src", "worker_lane.py"),
+               ("packages", "ag2-sparrow", "ag2_sparrow", "connect_bridge.py"))
+_FLAG = re.compile(r"(^|\s)--agent-bridges(\s|$)")
 
 
-def _same_file(a: str, b) -> bool:
-    return os.path.realpath(a) == os.path.realpath(str(b))
+def _script_path(command: str, script: str) -> str:
+    """The longest absolute path ending in `/script` that the command line names and that is a file; ''
+    when none. `ps` joins argv with spaces unquoted, so a path with a space cannot be split out by tokens."""
+    for m in re.finditer(re.escape("/" + script) + r"(?=\s|$)", command):
+        end = m.end()
+        starts = [i for i, ch in enumerate(command[:end]) if ch == "/" and (i == 0 or command[i - 1] == " ")]
+        for i in starts:
+            if os.path.isfile(command[i:end]):
+                return command[i:end]
+    return ""
+
+
+def _names_script(command: str, script: str) -> bool:
+    return re.search(r"(^|[\s/])" + re.escape(script) + r"(\s|$)", command) is not None
 
 
 def sparrowd_runs(procs: dict, now=None) -> "list[dict]":
     """Each running sparrowd: its pid, whether it runs `--agent-bridges`, its checkout, whether that
-    checkout's agent bridge accepts a worker declaration, and whether that code changed after it started."""
+    checkout's agent bridge accepts a worker declaration, and whether the code it loaded changed after it
+    started."""
     now = time.time() if now is None else now
     found = []
     for pid, (_ppid, age, command) in sorted(procs.items()):
-        argv = _argv(command)
-        script = next((a for a in argv if Path(a).name == SPARROWD_SCRIPT), "")
-        if not script:
+        if not _names_script(command, SPARROWD_SCRIPT):
             continue
-        src = Path(script).parent if os.path.isabs(script) else None
-        bridge = src / AGENT_BRIDGE_SCRIPT if src else None
+        script = _script_path(command, SPARROWD_SCRIPT)
+        checkout = Path(script).parent.parent if script else None
         try:
-            serves = bool(bridge) and (src / "worker_lane.py").is_file() and WRITTEN_BY in \
-                (src / "worker_lane.py").read_text(encoding="utf-8") and "worker_lane" in bridge.read_text(encoding="utf-8")
-            stale = serves and bridge.stat().st_mtime > now - age
+            serves = bool(checkout) and CAPABILITY.search(
+                (checkout / "src" / AGENT_BRIDGE_SCRIPT).read_text(encoding="utf-8")) is not None
+            stale = serves and any((checkout.joinpath(*rel)).stat().st_mtime > now - age
+                                   for rel in LOADED_CODE if checkout.joinpath(*rel).is_file())
         except OSError:
             serves = stale = False
-        found.append({"pid": pid, "agent_bridges": "--agent-bridges" in argv,
-                      "checkout": str(src.parent) if src else "", "serves_workers": serves,
+        found.append({"pid": pid, "agent_bridges": _FLAG.search(command) is not None,
+                      "checkout": str(checkout) if checkout else "", "serves_workers": serves,
                       "code_changed_since_start": stale})
     return found
+
+
+def _runs_declaration(command: str, declaration) -> bool:
+    """The agent bridge's command line for `declaration`: `<python> <...>/sparrow_agent_bridge.py <path>`,
+    the path compared by its realpath, so a spaced or linked path is the same file."""
+    marker = "/" + AGENT_BRIDGE_SCRIPT + " "
+    at = command.rfind(marker)
+    if at < 0:
+        return False
+    return os.path.realpath(command[at + len(marker):]) == os.path.realpath(str(declaration))
 
 
 def held_by(pid: int, procs: dict, declaration) -> str:
@@ -257,13 +278,11 @@ def held_by(pid: int, procs: dict, declaration) -> str:
         return "none"
     if pid not in procs:
         return "unknown"
-    argv = _argv(procs[pid][2])
-    mine = len(argv) >= 2 and any(Path(a).name == AGENT_BRIDGE_SCRIPT for a in argv[:-1]) \
-        and _same_file(argv[-1], declaration)
+    mine = _runs_declaration(procs[pid][2], declaration)
     ancestor, hops = procs[pid][0], 0
     while mine and ancestor in procs and hops < ANCESTOR_HOPS:
-        up = _argv(procs[ancestor][2])
-        if any(Path(a).name == SPARROWD_SCRIPT for a in up) and "--agent-bridges" in up:
+        up = procs[ancestor][2]
+        if _names_script(up, SPARROWD_SCRIPT) and _FLAG.search(up):
             return "declared-bridge"
         ancestor, hops = procs[ancestor][0], hops + 1
     return "other"
