@@ -19,6 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import task_lookup  # noqa: E402
 from connections import task_home  # noqa: E402
 from delivery.task_dispatch import find_ready_result, ready_result_filenames
 from local_task_protocol import find_archived_task, valid_archive_lookup_id  # noqa: E402
@@ -36,8 +37,9 @@ def task_disposition(workspace, task_id: str, *, unanswered: bool = False) -> st
     if not valid_archive_lookup_id(task_id):
         raise ValueError("not a task id")
     home = task_home(task_id, Path(workspace))
-    answered = not unanswered and find_ready_result(home["results"], task_id) is not None
-    return _decide(home["tasks"], task_id, answered)
+    answered = not unanswered and (find_ready_result(home["results"], task_id) is not None
+                                   or task_lookup.find_other_archived_ready_result(workspace, task_id) is not None)
+    return _decide(workspace, home["tasks"], task_id, answered)
 
 
 def task_dispositions(workspace, task_ids) -> dict:
@@ -50,17 +52,18 @@ def task_dispositions(workspace, task_ids) -> dict:
     out = {}
     for (tasks, results), ids in homes.items():
         ready = ready_result_filenames(results, [f"{t}.txt" for t in ids])
-        out.update({t: _decide(tasks, t, f"{t}.txt" in ready) for t in ids})
+        out.update({t: _decide(root, tasks, t, f"{t}.txt" in ready
+                               or task_lookup.find_other_archived_ready_result(root, t) is not None) for t in ids})
     return dict(sorted(out.items()))
 
 
-def _decide(tasks: Path, task_id: str, answered: bool) -> str:
+def _decide(workspace, tasks: Path, task_id: str, answered: bool) -> str:
     if answered:
         return ANSWERED
     live = find_task_file(tasks, task_id)
     if live is not None:
         return PENDING if live.name == f"{task_id}.txt" else CLAIMED
-    if find_archived_task(tasks, task_id) is not None:
+    if find_archived_task(tasks, task_id) is not None or task_lookup.find_other_archived_task(workspace, task_id):
         return ARCHIVED
     return MISSING
 

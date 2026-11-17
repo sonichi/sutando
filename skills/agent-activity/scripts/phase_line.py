@@ -558,9 +558,9 @@ def _task_context(workspace, task_id: str) -> "tuple[str | None, list[str]]":
     """(goal, people) for an owner-tier task, from its file via the shared lookup; (None, []) for any
     other task, which is never sent."""
     try:
-        from connections import task_home
-        from local_task_protocol import find_archived_task, parse_task_headers_lenient
-        path = find_archived_task(task_home(task_id, Path(workspace))["tasks"], task_id)
+        from local_task_protocol import parse_task_headers_lenient
+        from task_lookup import find_task
+        path = find_task(workspace, task_id)
         if path is None:
             return None, []
         text = path.read_text(encoding="utf-8", errors="replace")

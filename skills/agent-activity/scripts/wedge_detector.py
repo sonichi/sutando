@@ -13,9 +13,9 @@ import re
 import time
 from pathlib import Path
 
-from connections import task_home
 from file_lock import locked_file
-from local_task_protocol import find_archived_task, find_result, parse_task_headers, valid_local_task_id
+from local_task_protocol import parse_task_headers, valid_local_task_id
+from task_lookup import find_result, find_task
 from ag2space_links import room_link
 from proactive_routing import proactive_filename
 
@@ -121,7 +121,7 @@ def _activity(workspace, task_id, status, now):
 def _notice_context(workspace, task_id):
     snap = _read(workspace / "state" / "activity" / f"{task_id}.json")
     room, event = snap.get("room"), snap.get("message_event_id")
-    task = find_archived_task(task_home(task_id, workspace)["tasks"], task_id)
+    task = find_task(workspace, task_id)
     if task is not None:
         headers = parse_task_headers(task.read_text(encoding="utf-8")).headers
         room = room or headers.get("source_room_id") or headers.get("channel_id")
@@ -176,7 +176,7 @@ def _status_for(workspace, task_id, status, *, now=None, signals=None, silence_s
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     with locked_file(root / ".lock", create_mode=0o600):
         previous = _read(path)
-        if find_result(task_home(task_id, workspace)["results"], task_id) is not None:
+        if find_result(workspace, task_id) is not None:
             path.unlink(missing_ok=True)
             return status
         if status is None:

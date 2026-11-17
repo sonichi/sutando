@@ -26,7 +26,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 ACTIVITY = ROOT / "skills" / "agent-activity" / "scripts"
 sys.path[:0] = [str(ROOT / "src"), str(ROOT / "packages" / "ag2-sparrow"), str(ACTIVITY)]
-import connections as C, handoffs, result_publish, task_disposition as td  # noqa: E401,E402
+import connections as C, handoffs, result_publish, task_disposition as td, task_lookup  # noqa: E401,E402
 
 import phase_line, stop_interrupt, wedge_detector  # noqa: E401,E402
 from ag2_sparrow import agent_identity  # noqa: E402
@@ -88,6 +88,51 @@ class Disposition(Base):
         self.task(self.ws / "tasks", CORE_ID)
         self.assertEqual(td.task_dispositions(self.ws, [CORE_ID, OWN_ID, "bad id"]),
                          {CORE_ID: td.PENDING, OWN_ID: td.ANSWERED})
+
+
+class HistoryAcrossTheSwitch(Base):
+    """A lane's answers archived before a switch (own <-> shared) stay findable from the new home."""
+
+    def archived(self, tasks: Path, results: Path, tid=OWN_ID):
+        (tasks / "archive").mkdir(exist_ok=True)
+        (results / "archive").mkdir(exist_ok=True)
+        self.task(tasks / "archive", tid)
+        self.result(results / "archive", tid)
+
+    def assert_found(self):
+        self.assertEqual(td.task_disposition(self.ws, OWN_ID), td.ANSWERED)
+        self.assertEqual(td.task_dispositions(self.ws, [OWN_ID]), {OWN_ID: td.ANSWERED})
+        self.assertEqual(td.task_disposition(self.ws, OWN_ID, unanswered=True), td.ARCHIVED)
+        self.assertIsNotNone(task_lookup.find_task(self.ws, OWN_ID))
+        self.assertTrue(handoffs._child_ready(self.ws, {"path": "pool", "child_ref": OWN_ID}))
+        self.assertIsNotNone(task_lookup.find_result(self.ws, OWN_ID))
+
+    def test_an_answer_archived_before_migration(self):
+        self.archived(self.ws / "tasks", self.ws / "results")
+        self.assert_found()
+
+    def test_an_answer_archived_in_its_own_folders_before_undo(self):
+        self.archived(self.own / "tasks", self.own / "results")
+        self.write()
+        self.assert_found()
+
+    def test_a_stale_live_file_in_the_other_home_is_never_current(self):
+        self.task(self.ws / "tasks", OWN_ID)
+        self.result(self.ws / "results", OWN_ID)
+        self.assertEqual(td.task_disposition(self.ws, OWN_ID), td.MISSING)
+        self.assertIsNone(task_lookup.find_task(self.ws, OWN_ID))
+        self.assertIsNone(task_lookup.find_result(self.ws, OWN_ID))
+
+    def test_a_core_task_or_a_worker_without_an_agent_has_no_other_home(self):
+        self.assertIsNone(C.task_other_home(CORE_ID, self.ws))
+        self.assertIsNone(task_lookup.find_other_archived_ready_result(self.ws, CORE_ID))
+        self.assertIsNone(task_lookup.find_other_archived_task(self.ws, CORE_ID))
+        path = C.record_path(self.ws)
+        rec = json.loads(path.read_text())
+        rec["connections"][1].pop("agent_mxid")
+        rec["connections"][1].pop("dirs")
+        path.write_text(json.dumps(rec))
+        self.assertIsNone(C.task_other_home(OWN_ID, self.ws))
 
 
 class UnroutedCron(Base):
