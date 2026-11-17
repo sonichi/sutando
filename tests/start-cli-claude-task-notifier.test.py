@@ -22,7 +22,7 @@ REPO = Path(__file__).resolve().parent.parent
 TMUX = shutil.which("tmux") or shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
 PGREP_STUB = ('[ "$*" = "-ax claude" ] || exit 0\n'
               '[ -s "$HOME/claude.pid" ] && echo "$(cat "$HOME/claude.pid") claude"\n')
-CLAUDE_STUB = 'echo $$ > "$HOME/claude.pid"\nsleep 120\n'
+CLAUDE_STUB = '[ "$1" = --version ] && exit 0\necho $$ > "$HOME/claude.pid"\nsleep 120\n'
 
 
 class Harness:
@@ -36,8 +36,8 @@ class Harness:
         # Only the worker's own launcher, not the whole skill: this harness
         # tests the launch mechanics, not worker-pool's own behavior.
         (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True)
-        shutil.copy2(REPO / "skills/worker-pool/scripts/launch-worker-session.sh",
-                    root / "skills/worker-pool/scripts/launch-worker-session.sh")
+        for name in ("launch-worker-session.sh", "worker-mcp-credential.sh"):
+            shutil.copy2(REPO / "skills/worker-pool/scripts" / name, root / "skills/worker-pool/scripts" / name)
         self.root = root
         ws = self.td / "ws"
         (ws / "state").mkdir(parents=True)
@@ -60,7 +60,9 @@ class Harness:
         self.sock = self.td / "t.sock"
         self.env = {"PATH": f"{bind}:{Path(TMUX).parent}:/usr/bin:/bin:/usr/sbin",
                     "HOME": str(self.td / "home"), "SUTANDO_TMUX_SOCKET": str(self.sock),
-                    "SUTANDO_TEST_MODE": "1"}
+                    "SUTANDO_TEST_MODE": "1",
+                    # The stub claude never answers --version; the Mod has its own launch tests.
+                    "SUTANDO_TASK_WATCH_MOD_CORE": "0"}
 
     def tm(self, *a):
         return subprocess.run([TMUX, "-S", str(self.sock), *a], capture_output=True, text=True)

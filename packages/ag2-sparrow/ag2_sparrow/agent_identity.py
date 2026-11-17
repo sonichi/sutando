@@ -461,3 +461,12 @@ def root_segment(agent_id: str) -> str:
     readable = _UNSAFE.sub("-", raw.lower().lstrip("@").replace(":", "_")).lstrip("._-")
     readable = readable[:SEGMENT_MAX - DIGEST_HEX - 2].rstrip("._-") or "agent"
     return f"{readable}__{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:DIGEST_HEX]}"
+
+
+def owns_segment(agent_id, segment: str) -> bool:
+    """Whether `agent_id` is exactly the agent the root segment `segment` names: the one identity rule for a
+    bridge declared or recovered at `<agents>/<segment>` (an id with surrounding whitespace is not exact)."""
+    try:
+        return isinstance(agent_id, str) and agent_id == agent_id.strip() and root_segment(agent_id) == segment
+    except ValueError:
+        return False

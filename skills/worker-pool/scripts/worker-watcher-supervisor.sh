@@ -62,6 +62,8 @@ for v in SUTANDO_WORKSPACE_DIR SUTANDO_RESULTS_DIR SUTANDO_INBOX_KIND \
      && [ "$v" = SUTANDO_TASK_EVENT_HANDLER ]; then continue; fi
   if [ -n "${!v:-}" ]; then ENV_ARGS+=(-e "$v=${!v}"); fi
 done
+# A worker on its own folders reads a plain inbox: its empty kind and resolver are forwarded empty.
+[ "${SUTANDO_INBOX_KIND-unset}" = "" ] && ENV_ARGS+=(-e SUTANDO_INBOX_KIND= -e SUTANDO_INBOX_RESOLVER=)
 # Always set, empty included: an omitted one inherits whatever the tmux server's global env holds.
 ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
 CMD=(tmux -S "$SOCK" new-session -d -s "$SUP_SESSION" "${ENV_ARGS[@]}" bash "$SUPERVISOR")

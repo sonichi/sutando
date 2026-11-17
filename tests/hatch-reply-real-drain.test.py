@@ -47,7 +47,7 @@ class Gateway:
 
 
 class ReplyThroughTheRealDrain(unittest.TestCase):
-    def start(self, refuse=False, instance=''):
+    def start(self, refuse=False, instance='', tier='owner'):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
@@ -78,7 +78,7 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
         self.tid = gw._local_tid(TID)
         (tasks / f'{self.tid}.txt').write_text(
             f'id: {self.tid}\nsource: ag2space\nchannel_id: !r:ag2.space\nuser_id: @bob:ag2.space\n'
-            'access_tier: owner\ntask: what is 2+2?\n')
+            f'access_tier: {tier}\ntask: what is 2+2?\n')
         gw._record_task_room(self.tid, '!r:ag2.space')
 
     def reply(self, body, *cmd):
@@ -140,6 +140,134 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
         self.assertEqual(self.inflight, set())
         self.assertFalse((self.results / f'{self.tid}.txt').exists())
         self.assertEqual(outbox.item_status(self.results / '.outbox', TID), 'DELIVERED')
+
+    def side(self):
+        return self.results / f'{self.tid}.meta.json'
+
+    def archived_sides(self):
+        return sorted((self.results / 'archive').glob(f'{self.tid}-*.meta.json'))
+
+    def test_reply_carries_its_title_and_outcome_and_archives_them(self):
+        self.start()
+        rc, out, err = self.reply('4\n', 'reply', '--title', 'Add two and two',
+                                  '--outcome', 'Answered 4.')
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual([(c['body'], c.get('title'), c.get('outcome')) for c in self.server.calls],
+                         [('4', 'Add two and two', 'Answered 4.')])
+        self.assertFalse(self.side().exists())
+        self.assertEqual(len(self.archived_sides()), 1)
+
+    def test_without_labels_the_result_is_posted_as_before(self):
+        self.start()
+        rc, out, err = self.reply('4\n')
+        self.assertEqual(rc, 0, out + err)
+        self.assertNotIn('title', self.server.calls[0])
+        self.assertNotIn('outcome', self.server.calls[0])
+        self.assertFalse(self.side().exists())
+
+    def test_a_reply_without_labels_removes_a_side_file_left_by_an_earlier_attempt(self):
+        self.start()
+        self.side().write_text('{"title": "Stale", "outcome": "From a crashed attempt."}')
+        rc, out, err = self.reply('4\n')
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual([(c.get('title'), c.get('outcome')) for c in self.server.calls], [(None, None)])
+
+    def test_no_reply_outcome_defaults_to_its_reason(self):
+        self.start()
+        rc, out, err = self.reply('', 'no-reply', '--reason', 'an acknowledgement')
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual([(c.get('no_send'), c.get('title'), c.get('outcome'))
+                          for c in self.server.calls], [(True, None, 'an acknowledgement')])
+
+    def test_no_reply_takes_an_explicit_title_and_outcome(self):
+        self.start()
+        rc, out, err = self.reply('', 'no-reply', '--reason', 'ack', '--title', 'Acknowledge',
+                                  '--outcome', 'Acknowledged the thanks.')
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual([(c.get('title'), c.get('outcome')) for c in self.server.calls],
+                         [('Acknowledge', 'Acknowledged the thanks.')])
+
+    def test_labels_are_one_line_without_control_characters(self):
+        self.start()
+        rc, out, err = self.reply('4\n', 'reply', '--title', 'Add\x07 two\n\tand two\u2028now',
+                                  '--outcome', '  Answered\x1b[31m 4. ')
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual([(c.get('title'), c.get('outcome')) for c in self.server.calls],
+                         [('Add two and two now', 'Answered [31m 4.')])
+
+    def test_an_over_long_label_is_cut_to_fit_with_a_warning(self):
+        for flag, n in (('--title', 61), ('--outcome', 151)):
+            with self.subTest(flag=flag):
+                self.start()
+                rc, out, err = self.reply('4\n', 'reply', flag, 'x' * n)
+                self.assertEqual(rc, 0, out + err)
+                self.assertIn(f'warning: {flag} was over {n - 1} characters and was cut to fit', err)
+                label = self.server.calls[0][flag[2:]]
+                self.assertEqual((len(label), label[-1]), (n - 1, '…'))
+
+    def test_bidi_controls_go_and_an_emoji_zwj_sequence_stays(self):
+        self.start()
+        coder = '\U0001f469\u200d\U0001f4bb'
+        rc, out, err = self.reply('4\n', 'reply', '--title', f'Ask {coder}\u202egnp.exe\u2066x')
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.server.calls[0]['title'], f'Ask {coder} gnp.exe x')
+
+    def test_a_long_reason_is_cut_to_the_outcome_limit(self):
+        self.start()
+        rc, out, err = self.reply('', 'no-reply', '--reason', 'r' * 180)
+        self.assertEqual(rc, 0, out + err)
+        outcome = self.server.calls[0]['outcome']
+        self.assertEqual((len(outcome), outcome[-1]), (150, '…'))
+
+    def test_labels_ride_a_dm_only_result(self):
+        # A core writes a marked result itself; the hatch reply refuses markers.
+        self.start()
+        result, body = self.results / f'{self.tid}.txt', '[dm-only]\n4\n'
+        gw.result_labels.write(result, {'title': 'Add two and two'}, body)
+        result.write_text(body)
+        gw._post_ready_results({self.tid})
+        self.assertEqual([(c['dm_only'], c.get('title')) for c in self.server.calls],
+                         [(True, 'Add two and two')])
+
+    def test_a_non_owner_label_passes_the_result_guard_or_is_left_out(self):
+        self.start(tier='team')
+        rc, out, err = self.reply('4\n', 'reply', '--title', 'Add two and two',
+                                  '--outcome', 'Sent ghp_' + 'a' * 36)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual([(c['body'], c.get('title'), c.get('outcome')) for c in self.server.calls],
+                         [('4', 'Add two and two', None)])
+
+    def test_an_answered_item_keeps_the_side_file_it_was_answered_with(self):
+        self.start()
+        (self.results / f'{self.tid}.txt').write_text('first\n')
+        self.side().write_text('{"title": "First"}')
+        env = hermetic_env()
+        env.update(HOME=str(self.home), PYTHONPATH=str(PKG),
+                   AGENT_CONNECT_RESULT_DIR=str(self.results), AGENT_CONNECT_TASK_DIR=str(self.tasks),
+                   AGENT_CONNECT_STATE_DIR=str(self.home / 'state'))
+        proc = subprocess.run(
+            [sys.executable, '-m', 'ag2_sparrow.adapters.hatch.cli', 'reply',
+             str(self.results / f'{self.tid}.txt'), '--title', 'Second', '--wait', '0'],
+            input='second\n', capture_output=True, text=True, env=env, cwd=str(self.home))
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.side().read_text(), '{"title": "First"}')
+
+    def test_an_orphaned_side_file_is_archived_once_it_is_old(self):
+        self.start()
+        young, old = self.results / 'task-young.meta.json', self.results / 'task-old.meta.json'
+        for f in (young, old):
+            f.write_text('{"title": "Orphan"}')
+        stale = time.time() - gw.RESULT_LABELS_ORPHAN_S - 1
+        os.utime(old, (stale, stale))
+        live = self.results / 'task-live.meta.json'
+        live.write_text('{"title": "Live"}')
+        os.utime(live, (stale, stale))
+        (self.results / 'task-live.txt').write_text('pending\n')
+        gw._sweep_orphan_result_labels(time.time())
+        self.assertTrue(young.exists())
+        self.assertTrue(live.exists())
+        self.assertFalse(old.exists())
+        self.assertEqual(len(list((self.results / 'archive').glob('task-old-*.meta.json'))), 1)
 
     def test_no_reply_is_not_settled_when_the_gateway_refused_it(self):
         self.start(refuse=True)
@@ -224,6 +352,24 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
         rc, out, err = self.reply('[channel: !other:ag2.space]\nhello\n')
         self.assertEqual(rc, 2, out + err)
         self.assertEqual(self.server.calls, [])
+
+
+class FitKeepsGraphemes(unittest.TestCase):
+    """The cut counts code points, as the server does, and never splits a grapheme it can see."""
+
+    def test_the_cut_steps_back_over_marks_and_zwj_sequences(self):
+        from ag2_sparrow import result_labels as rl
+        family = '\U0001f468\u200d\U0001f469\u200d\U0001f467'
+        for text in ('a' * 8 + family, 'a' * 8 + 'e\u0301\u0301\u0301\u0301',
+                     'a' * 8 + '\U0001f44d\U0001f3fd' + 'b' * 4):
+            with self.subTest(text=text):
+                out = rl.fit(text, 10)
+                self.assertLessEqual(len(out), 10)
+                self.assertEqual(out, 'a' * 8 + '…')
+
+    def test_a_short_value_is_unchanged(self):
+        from ag2_sparrow import result_labels as rl
+        self.assertEqual(rl.fit('Fix the bug', 60), 'Fix the bug')
 
 
 class SharedInstanceMapping(unittest.TestCase):

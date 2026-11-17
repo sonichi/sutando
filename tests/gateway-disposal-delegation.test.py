@@ -1284,9 +1284,13 @@ class BridgeDelegates(unittest.TestCase):
               "_retire_proactive", "_send_proactive", "_drop_staged", "_stop_run", "_unlink_reserve", "_read_ack_json",
               "_withdraw_closed"}
 
-    def movers(self):
+    # Modules the bridge hands a move to, and every function in each that moves a file.
+    # result_labels moves only the Activity side file `<tid>.meta.json`, never a result.
+    DELEGATED_MOVERS = {"result_labels.py": {"write", "archive"}}
+
+    def movers(self, tree=None):
         out = {}
-        for f in (n for n in ast.walk(self.tree) if isinstance(n, ast.FunctionDef)):
+        for f in (n for n in ast.walk(tree or self.tree) if isinstance(n, ast.FunctionDef)):
             for c in (n for n in ast.walk(f) if isinstance(n, ast.Call)):
                 fn = c.func
                 if not isinstance(fn, ast.Attribute):
@@ -1312,6 +1316,16 @@ class BridgeDelegates(unittest.TestCase):
         self.assertEqual(links, [], "a hard link in the bridge is a private move into undelivered/")
         for literal in (".disposing-", "disposing-*", ".restore"):
             self.assertNotIn(literal, self.src, "the bridge must not know the claim namespace")
+
+    def test_a_delegated_mover_moves_only_what_it_is_listed_for(self):
+        for name, allowed in self.DELEGATED_MOVERS.items():
+            tree = ast.parse((BRIDGE.parent / name).read_text())
+            self.assertEqual(set(self.movers(tree)), allowed, name)
+        callers = {f.name for f in ast.walk(self.tree) if isinstance(f, ast.FunctionDef)
+                   and any(isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                           and c.func.attr == "archive" and isinstance(c.func.value, ast.Name)
+                           and c.func.value.id == "result_labels" for c in ast.walk(f))}
+        self.assertEqual(callers, {"_archive_result_labels"})
 
     def test_the_vendored_copy_is_the_canonical_module(self):
         pkg = REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "result_disposal.py"

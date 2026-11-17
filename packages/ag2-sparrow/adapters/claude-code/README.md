@@ -353,19 +353,38 @@ which the poll is ≤1 s. The installed shape is the interactive one.
 ## Launch: `ag2-sparrow-claude-local`
 
 ```bash
-ag2-sparrow-claude-local connect --base <url> --agent <@agent:server>   # asks for the code; or, by hand:
+ag2-sparrow-claude-local install --agent <@agent:server> --token-stdin   # paste the relay token when asked
+ag2-sparrow-claude-local connect --base <url> --agent <@agent:server>   # or with a code; or, by hand:
 ag2-sparrow-claude-local install \
   --claude-config-dir <dir> \
   [--token-env-file <the agent's .env>] [--work <work>]
-ag2-sparrow-claude-local verify
-ag2-sparrow-claude-local attach          # the live pane; detach with the tmux prefix + d
-ag2-sparrow-claude-local stop --confirm  # confirm an open stall card's Stop on this machine
-ag2-sparrow-claude-local uninstall
+ag2-sparrow-claude-local verify [<selector>]
+ag2-sparrow-claude-local attach [<selector>]   # the live pane; detach with the tmux prefix + d
+ag2-sparrow-claude-local stop --confirm [<selector>]  # confirm an open stall card's Stop here
+ag2-sparrow-claude-local uninstall [<selector>]
+ag2-sparrow-claude-local list            # each job installed here, its agent, state and selector
+# <selector>: --agent <@agent:server> | --key <agent key> | --work <dir> (an explicit-root job) | --single (the fixed job)
 ```
 
 The session loads the ag2space-inbox plugin this package ships;
 `--plugin-dir <dir>` on `install` or `connect` loads another copy instead (a
 working tree under edit, say).
+
+**Install with a pasted token.** `install --agent <the agent's Matrix ID> --token-stdin` asks for the
+agent's relay token without echoing it (on a terminal), or reads one line from stdin when it is piped. It
+takes the bare `<relay_url>|<secret>` token or a `REMOTE_TASK_TOKEN=…` / `AG2_REMOTE_TOKEN='…'` line (quotes
+and `export ` stripped); anything else, or a relay that is not https (plain http only on a loopback host, for tests), is
+refused with nothing written. Before anything is written, the relay's `GET /v1/whoami` (5 s timeout) must name exactly
+`--agent` for the token: a token for another agent (both ids named), a rejected token (401/403), an answer
+naming no agent, a redirect (never followed with the token), or no answer at all is refused and nothing
+is written. An agent id from the relay is shown only when it is a plain Matrix ID holding no part of the token. The
+token goes to the same seat `connect` writes for that agent (`<root>.bridge/channels/ag2space/`, mode 600,
+through a temp file and a rename; a seat file that is a link, a FIFO or anything but a regular file is
+refused, never followed), so a later switch to the other adapter reuses it. Every refusal that needs no
+token comes before it is read: the other adapter already serving the agent (with its `uninstall --agent`
+command), this agent's job still running (stop it first), and `--token-env-file`, `--work` or `--inbox`
+given too. Install then runs as with `--token-env-file <that seat's .env>`. The token is never on a
+command line, so no shell history, `ps` or `set -x` trace holds it.
 
 **Connect with a code.** On a host with no core, the two steps s.space shows
 are the agent's whole setup:
@@ -420,6 +439,68 @@ Sparrow's device env; the token is never copied). `uninstall` stops and
 removes that marked unit and keeps the bridge's state. Install refuses an agent
 whose fresh gateway status shows another bridge already serving it (one token,
 one bridge). One agent is one bridge whichever adapter runs it: install refuses, before it writes anything, and `connect` before its code is spent, while another adapter's config or bridge unit names the agent, unless that bridge was a unit whose file and job are both gone (a host supervisor's declaration counts until that adapter's uninstall); run that adapter's `uninstall` first. `connect` takes the agent's Matrix ID as `--agent` (s.space's connect command names it), so this check runs for that agent alone before the code is spent: another agent's bridge on the host does not refuse it. Without `--agent` it refuses before reading the code; a code s.space redeems for a different agent than `--agent` is spent but writes no seat.
+
+**Several agents on one host.** Each agent installed on its own root (no
+`--work` or `--inbox`) runs as a job of its own: `ai.ag2.sparrow.claude-local.<agent key>`
+(systemd: `ag2-sparrow-claude-local.<agent key>.service`), its bridge
+`…claude-local-bridge.<agent key>`, and its config and run files under
+`~/.config/ag2-sparrow/agents/<agent key>/`; its operation lock is
+`~/.config/ag2-sparrow/locks/<job>.oplock`, which no cleanup removes. The unit
+sets `AG2_SPARROW_AGENT=<agent key>`, so `run` reads that agent's config, and
+`AG2_SPARROW_ROOT=<root>`, which binds recovery to that job's own root. The agent
+key is the agent's root segment (above), the same name as its root: readable for
+a plain id, up to 64 characters, and one per agent as the root is. The tmux
+socket has a path limit, so an agent's own job keeps it in a short dir,
+`~/.config/ag2-sparrow/run/<16 hex of the key's sha256>/`. `uninstall` removes
+the agent's config dir and run dir once they hold only this job's own files (its
+locks, alarm, socket and a pane-keys guard holding only its mutex); a file it
+did not write, another adapter's config or an uncertain fence keeps the dir, and
+says so. A job whose config
+records an agent that is not the one asked for, or whose key is not that
+agent's, is refused and never acted on. `verify`, `uninstall`, `attach` and
+`stop` take one selector: `--agent <Matrix ID>`, `--key <agent key>` (an agent's
+own job, even one left without its config), `--work <dir>` (the job whose recorded
+root is that directory: an explicit-root install), or `--single` (the fixed job,
+even a unit left without its config). With one job installed it can
+be left out; with several the command refuses and lists each job with its
+selector. `list` shows each job, its agent, the manager's state, its root and
+its selector: the one that names exactly that job in the current install state
+(`--agent` only when it selects that job alone). Every command a line tells you
+to run uses that same selector; the stall card's attach line, which leaves the
+host, never carries a path. An explicit-root job
+records the host's agent; when that agent also has its own job, `--agent` refuses
+as ambiguous and names each job's `--work <root>`. Installing,
+reinstalling (the restart) or uninstalling one agent never names another's job.
+`install <selector>` with no token
+file is the repair `verify` prints: it reuses the job's recorded token file and
+install flags, rewrites a marked config that no longer loads when the root it and
+the unit record is the same, and mints a new session id for a malformed one. An
+install's bridge starts (or its declaration is written) only once the session
+holds its root; when it never does, the bridge is left stopped, its unit removed
+or its declaration withdrawn. A repair reads and runs nothing recorded until the
+record is proven the job's: a marked config whose every recorded root (and its
+unit's) is the root the selector names. Every install, connect and uninstall of
+an agent, on either adapter, holds that agent's fence
+(`~/.config/ag2-sparrow/locks/agent.<agent key>.fence`) from start through the
+settle of the session it started, so no other operation on the agent lands in
+between; a failed install that leaves the session not running stops the agent's
+bridge too (or withdraws its declaration).
+An explicit root keeps the single fixed job.
+
+**From a single-agent install.** A job an earlier release installed keeps its
+fixed name (`ai.ag2.sparrow.claude-local`) for the agent its config names:
+`verify`, `install` (the restart) and `uninstall`, with or without `--agent`,
+act on it as before. Nothing is moved, and nothing is stopped by name. Other
+agents install beside it as jobs of their own. To give it a job of its own,
+`uninstall --agent <id>`, then `install` again. A job whose config is gone or
+unreadable (say, removed by hand as its refusal says) is found again by its own
+marked bridge unit, or under a host supervisor by the bridge declaration beside
+the root its own unit records (`<root>.bridge/worker.json`). A declaration is
+never adopted by search: a unit from an earlier release records no root, so its
+job is not recovered from a declaration, and a declaration no job here is proven
+to own is left, with the manual `rm` named. A recovered job's record: `install` keeps that job
+and writes the config again, and `uninstall --agent <id>` stops it, unwires its
+bridge (the unit, or the declaration) and removes its units.
 
 Under Sutando, run the entry `python3 src/sparrow-claude-local.py` instead of
 the console script: it injects `<workspace>/state`, `<workspace>/agents` and the
@@ -521,6 +602,30 @@ stays the pane's. The session runs `claude --plugin-dir … --permission-mode �
 `--session-id <id>`: `install` mints the id, a reinstall keeps it, and
 `install --new-session` rotates it only once the old generation is proven
 gone (quiescent; otherwise the old id stays and the command says so).
+
+**Resuming a conversation you already have.** `install` or `connect` with
+`--resume-session <uuid>` hosts an existing Claude Code conversation instead
+of a new one: the id is recorded as the session id and the pane starts
+`claude --resume <uuid>`. Its transcript must exist as `<uuid>.jsonl` in some
+project folder of the config dir's `projects/` (pass the `--claude-config-dir`
+it was made in), and no running Claude Code process may have it open (the CLI's
+own `sessions/` registry); otherwise nothing is changed and, for `connect`, the
+code is not spent. Claude Code finds a transcript by id from any working
+directory, so nothing is copied or linked: the conversation keeps growing in
+its own file, and new turns record the pane's `<work>/tasks` as their cwd. A
+kept id is replaced under the same rule as `--new-session`; when it cannot be
+(the old session is not proven gone), the agent is installed and running under
+the kept id, its bridge included, and the command exits **79** with a line
+naming the stop to run before installing again. Find the id with
+`/status` in that conversation, or as the file name under `projects/`.
+A host that gives the agent a config dir of its own places a copy (a clone,
+never a link to the owner's file) at
+`<claude-config-dir>/projects/<any folder>/<uuid>.jsonl` before install, and
+passes `--claude-config-dir <claude-config-dir> --resume-session <uuid>`; only
+that config dir is searched. Exit 0: the conversation is the session; 79: the
+agent runs under its earlier session id instead (nothing torn down); 2: refused
+before anything changed (bad id, no transcript, or the conversation open in a
+running Claude Code process).
 
 **Folder trust and startup dialogs.** Before it creates a session the launcher
 records Claude Code's own trust for exactly `<work>/tasks` (never a parent):

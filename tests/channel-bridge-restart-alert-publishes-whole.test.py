@@ -46,7 +46,8 @@ class RestartAlertPublishesWhole(unittest.TestCase):
                       ws / "results", shims):
                 d.mkdir(parents=True)
             shutil.copy2(REPO / "src" / "launchd" / "channel-bridge-wrapper.sh", repo / "src" / "launchd")
-            shutil.copy2(REPO / "src" / "result_publish.py", repo / "src")
+            for name in ("result_publish.py", "result_labels.py"):
+                shutil.copy2(REPO / "src" / name, repo / "src")
             (repo / "src" / "slack-bridge.py").write_text("# dummy\n")
             _exe(repo / "scripts" / "sutando-config.sh",
                  f"#!/bin/bash\nif [ \"$1\" = workspace ]; then echo '{ws}'; else echo '{root}/none.env'; fi\n")

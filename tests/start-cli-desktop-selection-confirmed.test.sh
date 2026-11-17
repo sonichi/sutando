@@ -10,7 +10,7 @@ say() { echo "$1  $2"; [ "$1" = FAIL ] && fails=$((fails+1)); return 0; }
 
 APP="$TD/app"; FIX="$APP/engine/sutando"
 mkdir -p "$APP/run" "$FIX/src/agent/claude/cli" "$FIX/src/agent/codex/cli" "$FIX/scripts" "$FIX/bin"
-for f in src/agent/start-cli.sh src/agent/restart-guard.sh src/agent/tmux-socket-guard.sh \
+for f in src/agent/start-cli.sh src/agent/restart-guard.sh src/agent/tmux-socket-guard.sh src/agent/launch-path.sh \
          src/agent/core-runtime-record.sh src/sutando_config.py \
          scripts/sutando-config.sh scripts/python-binary.sh; do
   cp "$REPO/$f" "$FIX/$f"

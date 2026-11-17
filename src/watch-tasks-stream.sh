@@ -390,6 +390,8 @@ fi
 HANDLER_STATE="absent"
 HELD_NAMES=""
 HELD_RETRY_AT=0
+# Tasks whose dead handler claim this watcher retired: their replay is the core's, held or not.
+RETIRED_CLAIMS=""
 DISPATCHED_IDS=""
 DECISION_IDENTITY=""
 # Called only where a task is actually admitted: announced to the core, or
@@ -639,8 +641,10 @@ reconcile_dead_claims() {
     claim_is_live "$claim" && continue
     task_path="$(sed -n '3p' "$claim" 2>/dev/null)"
     retire_stale_claim "$claim" || continue
-    [ "${1:-}" = "hold" ] || continue
     fn="$(basename "$task_path")"
+    RETIRED_CLAIMS="$RETIRED_CLAIMS$fn
+"
+    [ "${1:-}" = "hold" ] || continue
     [ -f "$TASKS_DIR/$fn" ] || continue
     hold_task "$fn" now
   done
@@ -909,6 +913,16 @@ dispatch_task() {
     printf 'already answered, not dispatching again: %s\n' "$announce" >&2
     return 0
   fi
+  # The core never routes or announces a task a worker's delivery committed (a worker's lane does so
+  # before publishing it), unless this core's own handler claim on it, live or retired, is unfinished.
+  if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ -d "$WORKSPACE_DIR/deliveries" ] && [ ! -e "$CLAIMS_DIR/$filename" ] \
+     && ! printf '%s' "$RETIRED_CLAIMS" | grep -qxF -- "$filename" \
+     && "$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" worker-committed "$WORKSPACE_DIR" "$filename" 2>/dev/null; then
+    printf 'held by a worker, not routing it: %s\n' "$announce" >&2
+    return 0
+  fi
+  [ -z "$RETIRED_CLAIMS" ] || RETIRED_CLAIMS="$(printf '%s' "$RETIRED_CLAIMS" | grep -vxF -- "$filename")
+"
   # By announce, not filename: a resolved entry's activity row must key on
   # the real payload, never the sentinel that basename alone would resolve.
   queued_activity_row "$announce"

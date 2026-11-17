@@ -376,6 +376,55 @@ under `PreToolUse` with matcher `Bash` and command `python3 <hook> --repo
 
 Test: `python3 tests/shell-trap-guard.test.py`.
 
+## `stale-head-post-guard.py`
+
+Blocks **posting a PR review or PR comment against a head that has moved** since it
+was checked. It reads three posting commands:
+
+- `gh api repos/<o>/<r>/pulls/<n>/reviews` with POST (`-X POST` / `--method POST`, or
+  implied by `-f`/`-F`/`--raw-field`/`--field`/`--input`), taking `commit_id` and `body`
+  from the fields (`-F body=@file` reads the file) or from the `--input` JSON;
+- `gh pr review <n|url>` and `gh pr comment <n|url>`, taking the body from
+  `--body`/`-b` or `--body-file`/`-F`.
+
+In the body it looks for a **sha claim**: `at <sha>`, `Reviewed at <sha>`, `head <sha>`
+or `@ <sha>`, where the sha is 7-40 hex characters with at least one digit and one
+letter (so `at 1234567 rows` is not a claim).
+
+When there is a literal hex `commit_id` or a claim, and the repo is named (in the API
+path, `--repo`/`-R`, or a PR URL), it reads the current head with
+`gh api repos/<o>/<r>/pulls/<n> --jq .head.sha` (8 s timeout, once per PR). It **blocks**
+(exit 2, both shas on stderr, "re-read the PR at the new head before posting") when
+`commit_id` is not a prefix of the head, or when a claimed sha is not, unless the body
+also contains the head's short sha (then the old sha is only being referred to).
+
+It **allows**, without reading GitHub, a post with nothing to check or with no repo
+named (it never guesses one from the working directory). A failed or timed-out head
+read allows the post and prints one warning line on stderr.
+
+A `-` argument reads the command's heredoc; a body file that does not exist yet is
+matched to the heredoc that writes it (`cat > f <<EOF ... gh pr comment --body-file f`).
+Relative paths resolve against the hook input's `cwd`.
+
+`SUTANDO_ALLOW_STALE_POST=1` as an unquoted word in the command (`SUTANDO_ALLOW_STALE_POST=1 gh api ...`)
+allows the post. `STALE_HEAD_POST_GUARD_DISABLE=1` turns the hook off, and
+`STALE_HEAD_POST_GUARD_GH` names the `gh` binary used for the head read. The command
+is read with the shared `_shell_scan` scanner. Fail-OPEN on any internal error.
+
+**Known limits.** Only the three commands above; a `commit_id` given as `$VAR` or
+`$(...)` is not checked, and a claim phrased any other way is not seen. A `cd` earlier
+in the command does not move the `cwd` relative paths resolve against. A sha claim
+that names a different PR's head is judged against this PR.
+
+### Registration
+
+**Auto-registered** for every core session: `session-launch.sh` passes this hook to
+`build-core-settings.mjs` (arg 8, after the shell-trap guard), which registers it under
+`PreToolUse` with matcher `Bash` and command `python3 <hook>`. For a non-core session,
+add the same entry by hand.
+
+Test: `python3 tests/stale-head-post-guard.test.py`.
+
 ## `review-authority-guard.py`
 
 Denies a **formal GitHub review** filed from Bash — `gh pr review --approve` /

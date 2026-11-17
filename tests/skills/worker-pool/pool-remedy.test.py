@@ -721,7 +721,7 @@ class TheSweepOnALoggedOutWorker(Base):
         super().setUp()
         sup.pr.register_worker(self.ws, self.wid, "alpha")
         for name, value in (("probe_session", True), ("session_watcher_holds", False),
-                            ("observe_pane", (ps.PANE_LOGGED_OUT, "f1"))):
+                            ("observe_pane", (ps.PANE_LOGGED_OUT, "f1", None))):
             p = mock.patch.object(sup, name, return_value=value)
             p.start()
             self.addCleanup(p.stop)
@@ -769,7 +769,7 @@ class TheSweepOnALoggedOutWorker(Base):
         with mock.patch.object(rem, "time", types.SimpleNamespace(time=lambda: clock[0])):
             _, first = self._run("--sweep")
             login_id = first["cards"][self.wid]["hitl_id"]
-            with mock.patch.object(sup, "observe_pane", return_value=(ps.PANE_ABNORMAL, "f2")), \
+            with mock.patch.object(sup, "observe_pane", return_value=(ps.PANE_ABNORMAL, "f2", None)), \
                     mock.patch.object(sup, "work_outstanding", return_value=True), \
                     mock.patch.object(rem.wc, "capture", return_value=API_PANE), \
                     mock.patch.object(rem.wc.qa, "seat_env_base_url",
@@ -800,7 +800,7 @@ class PressedProxyRecovery(Base):
         with contextlib.ExitStack() as stack:
             for obj, name, value in (
                 (sup, "probe_session", alive), (sup, "session_watcher_holds", True),
-                (sup, "observe_pane", (pane, frame)), (sup, "work_outstanding", pending),
+                (sup, "observe_pane", (pane, frame, None)), (sup, "work_outstanding", pending),
                 (sup, "is_paused", paused), (rem, "suspension", held),
                 (rem, "ensure_supervisors", {}), (rem, "ensure_input_watches", {}),
                 (rem.wc, "raise_card", {"outcome": "refused"})):
@@ -874,9 +874,9 @@ class PressedProxyRecovery(Base):
                        subprocess.CompletedProcess([], 0, "", "")):
             with self.subTest(returncode=result.returncode):
                 with mock.patch.object(sup, "_open_tmux", return_value=(SOCK, "seat")):
-                    pane, frame = real_observe(self.ws, self.wid,
+                    pane, frame, reset = real_observe(self.ws, self.wid,
                                                runner=lambda *a, **k: result)
-                self.assertEqual((pane, frame), (None, None))
+                self.assertEqual((pane, frame, reset), (None, None, None))
                 rid = self.pressed_card()
                 self.assertEqual(self.sweep(pane, frame, True)["cards_closed"], [])
                 manager = rem.wc.manager_for(self.ws)

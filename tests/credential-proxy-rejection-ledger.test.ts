@@ -188,3 +188,18 @@ test('a body that inflates past the decode cap is named rather than expanded', (
 	const bomb = gzipSync(Buffer.alloc(8 * 1024 * 1024, 0x61));
 	assert.match(rejectionSnippet(bomb, 'gzip'), /^<\d+-byte body, content-encoding gzip, not decodable>$/);
 });
+
+test('a rejection carries its own response\'s rate-limit headers, and {} when that response had none', async () => {
+	let headers: Record<string, string> = { 'anthropic-ratelimit-unified-status': 'allowed', 'anthropic-ratelimit-unified-7d-status': 'allowed', 'x-other': '1' };
+	upstreamHandler = (_req, res) => { res.writeHead(429, headers); res.end('{"error":"throttled"}'); };
+	const port = await startProxy();
+	await call(port);
+	headers = {};
+	await call(port);
+	await settle();
+	assert.equal(recorded.length, 2);
+	assert.deepEqual(recorded[0].limit_headers, {
+		'anthropic-ratelimit-unified-status': 'allowed', 'anthropic-ratelimit-unified-7d-status': 'allowed',
+	}, 'only the rate-limit headers of this response');
+	assert.deepEqual(recorded[1].limit_headers, {}, 'a header-less 429 is not given an earlier response\'s headers');
+});

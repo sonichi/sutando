@@ -433,7 +433,13 @@ or refused core turn. Read `<workspace>/state/quota-state.json` (written by the 
 core paused on "usage limit reached" resumes on its own at `resets_at_5h`; switching to a smaller
 model (above) is the way to keep going before then. A core that died on a limit is not relaunched
 until the reset (or a backoff of 5 to 60 minutes when none is given), and the owner gets one DM
-saying so. While it is held, the owner's bare reply "switch to <model>" sets the model for the next
+saying so; on the desktop the same moment presents the `core-model` card. Picking a model there
+(Agent Settings, Runtime, Model) while the core is held writes it and starts the core on it at once;
+a hold binds only the model family it was seen on, so the watchdog revives a core switched away from
+it too. While it is held, the owner's bare reply "switch to <model>" sets the model for the next
 launch (`switch-model.sh --offline`) and lifts the hold; "retry now" lifts it as is; the next revive
-then starts the core. For engineers: `python3 src/core_limit_hold.py status` prints the hold and
+then starts the core. A hold binds only the Claude account it was seen under: after signing in to
+another account, the next restart launches the core at once. Signing in with `/login` in the running
+core's terminal resumes it in place: once the pane sits idle with nothing run since "Login successful",
+the core supervisor types `/startup` once, which re-arms the task watcher and crons. For engineers: `python3 src/core_limit_hold.py status` prints the hold and
 `... clear` lifts it.
