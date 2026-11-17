@@ -10,6 +10,7 @@ re-arm before anything else. Both must name the same inbox and command.
     watcher_rearm.py session-start --repo R --workspace W  # hook JSON, or nothing
     watcher_rearm.py watch-argv --repo R --workspace W     # the same command, one argument per line
     watcher_rearm.py mod-ready --repo R --workspace W      # yes: skip the Monitor; no: start it
+    watcher_rearm.py mod-note --repo R --workspace W       # the Mod's lead-in to a re-arm, or nothing
 
 watch-argv serves the task-watch Mod, so it watches the inbox the Stop hook checks; mod-ready
 answers yes only when the Mod is installed AND a ready session watcher holds that inbox.
@@ -67,15 +68,28 @@ def session_verdict(inbox: str, state_dir: str, timeout: float = 15) -> str:
     return lines[0] if lines and lines[0] in ("yes", "no") else "unknown"
 
 
-def session_start_context(repo: str, workspace: str, instance_id: Optional[str]) -> Optional[dict]:
+def mod_note(repo: str, workspace: str, env=None) -> str:
+    """Under the task-watch Mod, a re-arm instruction leads with this; empty without the Mod."""
+    env = os.environ if env is None else env
+    if env.get("SUTANDO_TASK_WATCH_MOD") != "1":
+        return ""
+    check = f'python3 "{repo}/src/watcher_rearm.py" mod-ready --repo "{repo}" --workspace "{workspace}"'
+    return (f"the task-watch Mod restarts the watcher on its own, so run {check} and only if it "
+            "prints no, start one ")
+
+
+def session_start_context(repo: str, workspace: str, instance_id: Optional[str], env=None) -> Optional[dict]:
     inbox, command = target(repo, workspace, instance_id)
     if session_verdict(inbox, f"{workspace}/state") != "no":
         return None
+    note = mod_note(repo, workspace, env)
+    why = "" if note else (
+        "A Monitor ends at its timeout and does not survive a resume, and an expiry notice that "
+        "arrived during compaction may be lost to the summary. ")
     text = (
         f"SUTANDO WATCHER: no ready session-role task watcher holds {inbox}, so tasks arriving "
-        "now are announced to no one. A Monitor ends at its timeout and does not survive a "
-        "resume, and an expiry notice that arrived during compaction may be lost to the summary. "
-        "Re-arm it NOW, before any other work: via the Monitor tool, "
+        f"now are announced to no one. {why}"
+        f"Re-arm it NOW, before any other work: {note}via the Monitor tool, "
         f'command: {command}, timeout_ms: 1800000, description: "Streaming task watcher". '
         "Then read any task files already waiting in that inbox."
     )
@@ -116,10 +130,10 @@ def main(argv=None) -> int:
     try:
         cmd = args[0]
         opts = _opts(args[1:])
-        if cmd not in ("target", "session-start", "watch-argv", "mod-ready"):
+        if cmd not in ("target", "session-start", "watch-argv", "mod-ready", "mod-note"):
             raise ValueError(cmd)
     except (IndexError, ValueError, StopIteration):
-        print("usage: watcher_rearm.py target|session-start|watch-argv|mod-ready --repo R --workspace W", file=sys.stderr)
+        print("usage: watcher_rearm.py target|session-start|watch-argv|mod-ready|mod-note --repo R --workspace W", file=sys.stderr)
         return 64
     instance_id = os.environ.get("SUTANDO_INSTANCE_ID") or None
     if cmd == "target":
@@ -131,6 +145,9 @@ def main(argv=None) -> int:
         except ValueError as err:
             print(f"watcher_rearm.py: {err}", file=sys.stderr)
             return 1
+        return 0
+    if cmd == "mod-note":
+        sys.stdout.write(mod_note(opts["repo"], opts["workspace"]))
         return 0
     if cmd == "mod-ready":
         print(mod_ready(opts["repo"], opts["workspace"], instance_id))
