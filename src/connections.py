@@ -1031,6 +1031,8 @@ def _validate_row(row: object, index: int) -> dict:
             raise SchemaError(f"connections.json: row {index} worker is not a pool worker id")
         if row["primary"] or not row["instance"]:
             raise SchemaError(f"connections.json: row {index} is a worker's identity, so it is a named, non-primary row")
+    if WORKER_DIRS_KEY in row and (row[WORKER_DIRS_KEY] != WORKER_DIRS_OWN or "worker" not in row):
+        raise SchemaError(f"connections.json: row {index} {WORKER_DIRS_KEY} is {WORKER_DIRS_OWN!r} on a worker's row only")
     return row
 
 
@@ -2178,6 +2180,79 @@ def worker_identity(worker: str, workspace: Optional[Path] = None) -> Optional[d
     except (SchemaError, OSError):
         return None
     return next((dict(r) for r in rows if r.get("worker") == worker), None)
+
+
+# A worker row's `dirs: "own"`: its tasks and results live in its agent's own folder, not the shared ones.
+WORKER_DIRS_KEY = "dirs"
+WORKER_DIRS_OWN = "own"
+WORKER_AGENTS_DIR = "agents"
+
+
+def worker_root(agent_mxid: str, workspace: Optional[Path] = None) -> Path:
+    """`<workspace>/agents/<segment of agent_mxid>`: the agent's own folder; ValueError on an empty id."""
+    return _workspace(workspace) / WORKER_AGENTS_DIR / _agent_identity().root_segment(agent_mxid)
+
+
+def _row_dirs(row: Optional[Mapping[str, object]], workspace: Optional[Path]) -> "Optional[tuple[Path, Path]]":
+    mxid = str((row or {}).get("agent_mxid") or "").strip()
+    if not row or not row.get("worker") or row.get(WORKER_DIRS_KEY) != WORKER_DIRS_OWN or not mxid:
+        return None
+    root = worker_root(mxid, workspace)
+    return root / "tasks", root / "results"
+
+
+def worker_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":
+    """(tasks dir, results dir) of `worker` when its identity row names an agent and `dirs: "own"`;
+    None otherwise (the worker uses the workspace's shared tasks/ and results/), or when unreadable."""
+    return _row_dirs(worker_identity(worker, workspace), workspace) if worker else None
+
+
+def task_home(task_id: str, workspace: Optional[Path] = None) -> dict:
+    """Where `task_id` lives: {"lane", "worker", "tasks", "results", "own"}. A task an own-dir worker's
+    lane queued (`task_lane`) is in that worker's dirs, as is any other id whose task file (live or
+    archived) is in an own-dir worker's tasks folder; else, or on an unreadable record, the shared ones."""
+    ws = _workspace(workspace)
+    home = {"lane": task_lane(task_id), "worker": "", "tasks": ws / "tasks", "results": ws / "results", "own": False}
+    try:
+        rows = _read(record_path(ws))
+    except (SchemaError, OSError):
+        return home
+    if home["lane"]:
+        row = next((r for r in rows if home["lane"] in [r["instance"]] + alias_instances(r)), None)
+    else:
+        row = next((r for r in rows if _row_dirs(r, ws) and _holds_task(_row_dirs(r, ws)[0], task_id)), None)
+    home["worker"] = str((row or {}).get("worker") or "")
+    dirs = _row_dirs(row, ws)
+    if dirs:
+        home.update(tasks=dirs[0], results=dirs[1], own=True)
+    return home
+
+
+def _holds_task(tasks_dir: Path, task_id: str) -> bool:
+    """Whether `tasks_dir` holds `task_id`'s task file: live under any claimed or assigned name, or archived."""
+    import local_task_protocol
+    import task_archive
+    if not local_task_protocol.valid_archive_lookup_id(task_id):
+        return False
+    try:
+        return (task_archive.find_task_file(tasks_dir, task_id) or
+                local_task_protocol.find_archived_task(tasks_dir, task_id)) is not None
+    except (OSError, ValueError):
+        return False
+
+
+def set_worker_dirs(worker: str, own: bool, *, workspace: Optional[Path] = None) -> dict:
+    """Set (`own`) or clear `worker`'s `dirs: "own"` under the record lock; returns the row. Refused
+    (`ConnectionsError`) when the worker has no identity row or its row names no agent."""
+    with _transaction(workspace) as record:
+        row = next((r for r in record["rows"] if r.get("worker") == worker), None)
+        if row is None or not str(row.get("agent_mxid") or "").strip():
+            raise ConnectionsError(f"worker {worker} has no agent identity row")
+        if own:
+            row[WORKER_DIRS_KEY] = WORKER_DIRS_OWN
+        else:
+            row.pop(WORKER_DIRS_KEY, None)
+        return dict(row)
 
 
 # A worker's seat names its worker here (the pool launchers export it); the core's names none.
