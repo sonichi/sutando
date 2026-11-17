@@ -146,6 +146,28 @@ class PublishedPath(Base):
         self.assertIn("its own results folder", err.getvalue())
 
 
+class TheVendoredCopy(Base):
+    """The package's copy of result_publish behaves the same when the engine's `connections` is importable."""
+
+    def setUp(self):
+        super().setUp()
+        spec = importlib.util.spec_from_file_location(
+            "vendored_result_publish", ROOT / "packages" / "ag2-sparrow" / "ag2_sparrow" / "result_publish.py")
+        self.rp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.rp)
+
+    def test_it_moves_a_shared_target_and_says_so(self):
+        env = {C.SESSION_WORKER_ENV: W}
+        self.assertEqual(self.rp.worker_published_path(self.ws / "results" / "task-1.txt", env, self.ws),
+                         self.own / "results" / "task-1.txt")
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env), mock.patch.object(C, "_workspace", lambda ws: self.ws), \
+                mock.patch.object(sys, "stdin", io.StringIO("[no-send]\n")), contextlib.redirect_stderr(err):
+            self.assertEqual(self.rp.main(["result_publish.py", str(self.ws / "results" / "task-2.txt")]), 0)
+        self.assertTrue((self.own / "results" / "task-2.txt").is_file())
+        self.assertIn("its own results folder", err.getvalue())
+
+
 class RearmTarget(unittest.TestCase):
     def test_an_own_dir_worker_watches_its_named_inbox(self):
         env = {"SUTANDO_INBOX_KIND": "", "SUTANDO_TASKS_DIR": "/w/agents/a/tasks"}
