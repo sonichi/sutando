@@ -229,6 +229,16 @@ class FullGateUnmeasuredPaths(unittest.TestCase):
     def test_literal_paths_preserve_a_failing_gate(self):
         self._assert_literal_paths_preserve_verdict(7)
 
+    def test_helper_lines_preserve_backslashes_and_leading_whitespace(self):
+        paths = [" \tleading.py", "outside/back\\slash.py"]
+        (self.repo / "scripts" / "coverage_unmeasured.py").write_text(
+            "".join(f"print({path!r})\n" for path in paths)
+        )
+        output, summary = self._assert_summary(self._run_gate(diff_cover_rc=7), 7)
+        self.assertEqual([line[2:] for line in output.splitlines() if line.startswith("  ")],
+                         paths, output)
+        self.assertEqual(re.findall(r"(?m)^-\s+`([^`]+)`$", summary), paths, summary)
+
     def _assert_json_failure_preserves_verdict(self, status):
         (self.repo / "coverage.json").write_text(json.dumps({"files": {}}))
         result = self._run_gate(json_rc=23, diff_cover_rc=status)
