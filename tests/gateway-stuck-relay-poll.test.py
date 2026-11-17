@@ -542,6 +542,8 @@ class SupervisorRelaunchTest(unittest.TestCase):
             (d / "src" / "sparrowd.py").write_text("import time\ntime.sleep(60)\n")
             wrapper = d / "src" / "launchd" / "gateway-bridge-wrapper.sh"
             wrapper.write_text((_REPO / "src" / "launchd" / "gateway-bridge-wrapper.sh").read_text())
+            lib = d / "src" / "launchd" / "gateway-bridge-lib.sh"
+            lib.write_text((_REPO / "src" / "launchd" / "gateway-bridge-lib.sh").read_text())
             (d / "shims" / "python3").write_text(f'#!/bin/bash\nexec "{sys.executable}" "$@"\n')
             (d / "shims" / "osascript").write_text("#!/bin/bash\nexit 0\n")
             for f in ("scripts/sutando-config.sh", "shims/python3", "shims/osascript"):

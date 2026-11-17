@@ -24,7 +24,7 @@ v = os.environ.get("REMOTE_TASK_TOKEN_FILE")
 print("REMOTE_TASK_TOKEN_FILE=" + (v if v else "<unset>"))
 sys.exit(75)
 EOS
-cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"
+cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$REPO/src/launchd/gateway-bridge-lib.sh" "$d/src/launchd/"
 printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"
 printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
 chmod +x "$d/shims/python3" "$d/shims/osascript"
