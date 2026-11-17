@@ -104,9 +104,9 @@ same session watcher can instead be run by a Claude Code Mod, `src/agent/claude/
   version on the same absolute `claude` path the session runs (the one the tmux pane's `PATH`
   resolves). Codex seats and Claude seats without the Mod keep the `Monitor` path unchanged.
 
-The switch is per launcher. Pool workers have the Mod by default: `SUTANDO_TASK_WATCH_MOD_WORKER=0`
-in the environment of a worker spawn opts that worker out. The core is off by default and opts in with
-`SUTANDO_TASK_WATCH_MOD_CORE=1`. Either way the launcher installs
+The switch is per launcher, and both launchers install the Mod by default. `SUTANDO_TASK_WATCH_MOD_CORE=0`
+in the core launcher's environment keeps the core on the `Monitor`; `SUTANDO_TASK_WATCH_MOD_WORKER=0`
+in the environment of a worker spawn opts that worker out. Either way the launcher installs
 the Mod only when `claude --version` is at least `MIN_CLAUDE_VERSION` in
 `src/agent/claude/task-watch-mod/hooks/version.ts`; below it, it logs one line and the session keeps
 the `Monitor`. The Mod checks the same floor itself.
