@@ -475,6 +475,10 @@ def _task_homes() -> "list[tuple[Path, Path, str]]":
                                            for h in own_worker_homes(WORKSPACE_DIR)]
 
 
+def _same_dir(a: Path, b: Path) -> bool:
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
 def _active_task_rows() -> list[dict]:
     """Reconcile task/result files into the ten most recent history rows; an own-folder pool worker's
     task row carries its `worker`."""
@@ -519,6 +523,9 @@ def _active_task_rows() -> list[dict]:
             if candidate.exists():
                 archived_file = candidate
                 break
+        if archived_file is None:
+            import task_lookup
+            archived_file = task_lookup.find_other_archived_result(WORKSPACE_DIR, task_id)
         result_text = _read_or_none(result_file)
         if result_text is not None:
             status = "done"
@@ -541,9 +548,12 @@ def _active_task_rows() -> list[dict]:
         if worker:
             task_history[task_id]["worker"] = worker
 
-    # Results may outlive their task files after bridge cleanup.
-    for result_file in _newest_first(RESULT_DIR.glob("task-*.txt"))[:10]:
-        _remember_done_result_file(result_file)
+    # Results may outlive their task files after bridge cleanup; a live result counts only in its task's home.
+    from connections import task_home
+    for _tasks_dir, results_dir, _worker in _task_homes():
+        for result_file in _newest_first(results_dir.glob("task-*.txt"))[:10]:
+            if _same_dir(task_home(result_file.stem, WORKSPACE_DIR)["results"], results_dir):
+                _remember_done_result_file(result_file)
 
     # Reconcile stale rows after the disk scans above.
     import time as _time

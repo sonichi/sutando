@@ -203,6 +203,68 @@ class UnansweredInInbox(Base):
             self.assertEqual(task_dispatch.unanswered_in_inbox(self.own / "tasks", self.own / "results"), [])
 
 
+class CompletionArchivedInTheFormerSharedFolder(Base):
+    """After a switch, a task in the own inbox answered and archived under the shared results/ is not owed."""
+
+    def setUp(self):
+        super().setUp()
+        (self.own / "tasks" / f"{OWN_ID}.txt").write_text(f"id: {OWN_ID}\ntask: hi\n")
+        (self.ws / "results" / "archive").mkdir()
+        self.archived = self.ws / "results" / "archive" / f"{OWN_ID}.txt"
+        self.archived.write_text("answered before the switch\n")
+
+    def test_the_inbox_rule_and_supervision_see_it_with_a_workspace(self):
+        from delivery import task_dispatch
+        tasks, results = self.own / "tasks", self.own / "results"
+        self.assertEqual(task_dispatch.unanswered_in_inbox(tasks, results, workspace=self.ws), [])
+        self.assertEqual([t for t, _f in task_dispatch.unanswered_in_inbox(tasks, results)], [OWN_ID])
+        self.assertEqual(sup.owed_task_ids(self.ws, W), [])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(task_dispatch._main(["unanswered-in", str(tasks), str(results), "--workspace", str(self.ws)]), 0)
+        self.assertEqual(out.getvalue(), "")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(task_dispatch._main(["unanswered-in", str(tasks), str(results), "--nope", "x"]), 2)
+
+    def test_a_wake_turn_newer_than_that_archive_is_still_owed(self):
+        from delivery import task_dispatch
+        old = time.time() - 600
+        os.utime(self.archived, (old, old))
+        (self.own / "tasks" / f"{OWN_ID}.txt").write_text(f"id: {OWN_ID}\nwake_episode: 2\ntask: hi\n")
+        self.assertEqual([t for t, _f in task_dispatch.unanswered_in_inbox(
+            self.own / "tasks", self.own / "results", workspace=self.ws)], [OWN_ID])
+
+    def test_the_active_row_reads_it_as_done(self):
+        api = _load("agent_api_former", ROOT / "src" / "agent-api.py")
+        with mock.patch.object(api, "TASK_DIR", self.ws / "tasks"), \
+                mock.patch.object(api, "RESULT_DIR", self.ws / "results"), \
+                mock.patch.object(api, "WORKSPACE_DIR", self.ws), \
+                mock.patch.dict(api.task_history, {}, clear=True):
+            row = next(r for r in api._active_task_rows() if r["id"] == OWN_ID)
+        self.assertEqual((row["status"], row["result"].strip(), row["worker"]),
+                         ("done", "answered before the switch", W))
+
+
+class LiveResultsCountOnlyInTheirTasksHome(Base):
+    def test_a_stale_shared_live_result_does_not_mark_a_pending_own_row_done(self):
+        (self.own / "tasks" / f"{OWN_ID}.txt").write_text(f"id: {OWN_ID}\ntask: own one\nsource: chat\n")
+        (self.ws / "results" / f"{OWN_ID}.txt").write_text("stale shared copy\n")
+        (self.ws / "results" / f"{CORE_ID}.txt").write_text("core answer\n")
+        api = _load("agent_api_live", ROOT / "src" / "agent-api.py")
+        with mock.patch.object(api, "TASK_DIR", self.ws / "tasks"), \
+                mock.patch.object(api, "RESULT_DIR", self.ws / "results"), \
+                mock.patch.object(api, "WORKSPACE_DIR", self.ws), \
+                mock.patch.dict(api.task_history, {}, clear=True):
+            rows = {r["id"]: r for r in api._active_task_rows()}
+            (self.own / "results" / f"{OWN_ID}.txt").write_text("own answer\n")
+            api.task_history.pop(OWN_ID)
+            (self.own / "tasks" / f"{OWN_ID}.txt").unlink()
+            later = {r["id"]: r for r in api._active_task_rows()}
+        self.assertEqual(rows[OWN_ID]["status"], "working")
+        self.assertEqual((rows[CORE_ID]["status"], rows[CORE_ID]["result"]), ("done", "core answer"))
+        self.assertEqual((later[OWN_ID]["status"], later[OWN_ID]["result"]), ("done", "own answer"))
+
+
 class AProbeShapedId(Base):
     PROBE = "task-0123456789abcdef01"
 
