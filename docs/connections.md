@@ -723,6 +723,27 @@ Cutting a worker over:
 Undo: `python3 src/worker_lane.py withdraw --worker <id>`; the keeper starts the lane on its next
 pass, which takes the lease once sparrowd has stopped the bridge.
 
+### A worker on its own folders (`dirs: "own"`)
+
+A worker whose identity row carries `dirs: "own"` keeps its tasks and results in its agent's own folder,
+`<workspace>/agents/<segment>/{tasks,results}` (the folder a claude-local bridge for that agent uses), not
+the workspace's shared `tasks/` and `results/`; `state/` stays shared. `connections.worker_dirs(worker)` is
+the one answer (None for every other worker) and `connections.task_home(task_id)` maps a lane-queued task to
+its folders. Its lane, whether the gateway wrapper's or a declared Sparrow bridge, runs on those folders
+(`worker_lane.lane_dirs`): the folder is the worker's inbox, so no router runs; the pre-publish hook only
+records the task as the worker's (`--attribute-only`), and the worker's stamped proactive files still landing
+in the shared `results/` are moved into its own. Its session reads a plain inbox of task files and answers in
+its own results (`spawn_worker.inbox_env`, `result_publish`). A worker without the field is unchanged.
+
+`python3 src/worker_lane.py migrate-dirs --worker <id>` switches a worker over: it creates the folders, sets
+the field (which restarts a declared bridge), has the declared task-event handler empty the worker's
+`deliveries/<id>/` folder under the router's locks (a task its own lane queued moves into its tasks folder
+and its sentinel is archived; any other is handed back to the core and touched so the core's watcher picks
+it up; an answered one keeps its sentinel), and moves the worker's unclaimed live results into its own
+results. It prints one JSON line and is idempotent: a refusal says why and a re-run finishes. It restarts no
+session: respawn the worker so its session takes the new inbox. `--undo` clears the field and returns the
+worker's live tasks (touched) and results to the shared folders.
+
 ## Known servers
 
 `known_servers()` is the Add picker's offer: every DotSpace the resolver registers

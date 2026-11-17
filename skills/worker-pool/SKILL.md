@@ -190,6 +190,11 @@ The lane routes each task it queues itself (`pool_route_handler.py --from-lane -
 the task is its worker's when it reaches `tasks/` and the core's watcher, which never routes a held task, leaves it;
 see `docs/connections.md`, "In a pool worker's session".
 
+A worker with its own agent can be switched onto its own task and result folders
+(`python3 src/worker_lane.py migrate-dirs --worker <id>`, `--undo` to switch back; then respawn it): its lane
+queues straight into `<workspace>/agents/<segment>/tasks`, nothing is routed through `deliveries/<id>/`, and
+its session answers in that folder's `results/`; see `docs/connections.md`, "A worker on its own folders".
+
 `pool_manage.py retire` also removes the worker's agent identity: its lane, its row and its vault secret. The agent
 itself stays on its server until the owner deletes it there.
 

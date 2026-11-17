@@ -269,6 +269,59 @@ def _hand_off_pass(ws: Path, recipient: str, out: dict) -> set:
             return _owed_names(dfd) - set(out["kept"]) - set(task_ids)
 
 
+def migrate_to_own_dirs(workspace, recipient: str, own_tasks, own_origin) -> dict:
+    """Empty `recipient`'s deliveries folder into its own tasks folder, for a worker switched to its own
+    folders. Under each task's lock and the folder lock: a task its own lane queued (`own_origin(id)`) has
+    its payload moved into `own_tasks` and its sentinel archived; any other task is withdrawn (sentinel,
+    `.pending` record, attribution) and its payload touched so the core's watcher picks it up again. A task
+    with a ready result keeps its sentinel. Idempotent. Returns {"moved", "returned", "kept": {id: why}}."""
+    import pool_attribution
+    import pool_router
+    import undelivered_quarantine
+
+    ws, own_tasks = Path(workspace), Path(own_tasks)
+    require_recipient(recipient)
+    out = {"moved": [], "returned": [], "kept": {}}
+    task_ids = sorted({parse_sentinel(p.name)[0] for p in accepted(ws, recipient) + pending(ws, recipient)
+                       if is_regular_file(p)})
+    with contextlib.ExitStack() as locks:
+        for task_id in task_ids:
+            locks.enter_context(pool_router.task_arbitration(ws, task_id))
+        with arbitration(ws, recipient) as dfd:
+            for task_id in task_ids:
+                if find_in(dfd, task_id) is None:
+                    continue
+                payload = payload_path(ws, task_id)
+                if not own_origin(task_id):
+                    if find_ready_result(results_dir(ws), task_id) is not None:
+                        out["kept"][task_id] = "answered"
+                        continue
+                    _withdraw_locked(ws, recipient, task_id, dfd)
+                    pool_attribution.revoke(ws, task_id, recipient)
+                    with contextlib.suppress(FileNotFoundError):
+                        os.utime(payload)
+                    out["returned"].append(task_id)
+                    continue
+                if is_regular_file(payload):
+                    own_tasks.mkdir(parents=True, exist_ok=True)
+                    try:
+                        undelivered_quarantine.rename_noreplace(payload, own_tasks / payload.name)
+                    except FileExistsError:
+                        out["kept"][task_id] = "own-folder-holds-the-name"
+                        continue
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(pending_flag(ws, recipient, task_id))
+                afd = _open_archive(dfd)
+                try:
+                    for name in sentinel_names(task_id):
+                        if regular_file_state(name, dir_fd=dfd) == "regular":
+                            _move_into_archive(dfd, afd, name)
+                finally:
+                    os.close(afd)
+                out["moved"].append(task_id)
+    return out
+
+
 def writer_path() -> Path:
     """The executable a spawner injects as SUTANDO_POOL_DELIVERY_SCRIPT: this file,
     absolute. The core never locates it (docs/architecture-boundaries.md); the
