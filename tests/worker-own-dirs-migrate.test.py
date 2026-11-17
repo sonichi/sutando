@@ -266,10 +266,61 @@ class TheLane(Base):
         self.assertIsNotNone(proc.wait(timeout=10))
         self.assertEqual(C.bridge_pid(self.lane, self.ws), 0)
 
-    def test_a_declared_bridge_is_left_to_sparrowd(self):
-        with mock.patch.object(C, "bridge_pid", return_value=4242), \
+    def test_a_declared_bridge_is_waited_for_until_sparrowd_replaces_it(self):
+        pids = iter([4242, 4242, C.BridgeLeaseIndeterminate(self.lane, "x"), 4343])
+
+        def holder(*a):
+            v = next(pids)
+            if isinstance(v, Exception):
+                raise v
+            return v
+        slept = []
+        with mock.patch.object(C, "bridge_pid", side_effect=holder), \
                 mock.patch.object(worker_lane, "held_by", return_value="declared-bridge"):
-            self.assertEqual(worker_lane.relaunch_lane(W, self.ws, procs={}), ("restarted-by-sparrowd", ""))
+            self.assertEqual(worker_lane.relaunch_lane(W, self.ws, procs={}, sleep=slept.append),
+                             ("restarted-by-sparrowd", ""))
+        self.assertEqual(len(slept), 2)
+
+    def test_a_late_move_by_the_old_bridge_is_drained_after_it_is_gone(self):
+        self.migrate()
+        stray = f"task-{self.lane}~late.txt"
+        real = worker_lane._stop_unless_declared
+
+        def old_bridge_moves_then_exits(*a, **k):
+            (self.own / "results" / stray).write_text("reply")  # the old bridge's last adopt
+            return real(*a, **k)
+        with mock.patch.object(worker_lane, "_stop_unless_declared", old_bridge_moves_then_exits):
+            out, why = self.migrate(undo=True)
+        self.assertEqual(why, "")
+        self.assertIn(stray, out["results_returned"])
+        self.assertTrue((self.ws / "results" / stray).is_file())
+        self.assertFalse((self.own / "results" / stray).exists())
+
+    def test_the_field_is_written_under_the_lock_the_keeper_starts_take(self):
+        seen = []
+        real = C._records_lock
+
+        def watched(ws):
+            seen.append("lock")
+            return real(ws)
+        with mock.patch.object(C, "_records_lock", watched), \
+                mock.patch.object(C, "set_worker_dirs", wraps=C.set_worker_dirs) as setter:
+            self.migrate()
+        self.assertEqual(seen[0], "lock")
+        self.assertTrue(setter.called)
+
+    def test_a_lingering_declared_bridge_moves_nothing(self):
+        (self.ws / "results").mkdir(parents=True)
+        (self.ws / "results" / f"{self.mine}.txt").write_text("r")
+        clock = iter(range(0, 1000, 100))
+        with mock.patch.object(C, "bridge_pid", return_value=4242), \
+                mock.patch.object(worker_lane, "held_by", return_value="declared-bridge"), \
+                mock.patch.object(worker_lane.time, "sleep", lambda s: None), \
+                mock.patch.object(worker_lane.time, "monotonic", lambda: next(clock)):
+            out, why = self.migrate(procs={})
+        self.assertIn("pending: sparrowd has not replaced the declared bridge (pid 4242)", why)
+        self.assertNotIn("results_moved", out)
+        self.assertTrue((self.ws / "results" / f"{self.mine}.txt").is_file())
 
     def test_a_lane_that_will_not_stop_or_cannot_be_told_says_rerun(self):
         with mock.patch.object(C, "bridge_pid", side_effect=C.BridgeLeaseIndeterminate(self.lane, "torn")):

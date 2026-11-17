@@ -470,10 +470,28 @@ def _live_txt(folder) -> "list[str]":
         return []
 
 
-def relaunch_lane(worker: str, workspace, kill=None, procs=None) -> "tuple[str, str]":
+# How long migrate-dirs waits for sparrowd to replace a declared bridge (its rescan plus restart backoff).
+RELAUNCH_WAIT_S = 180.0
+
+
+def relaunch_lane(worker: str, workspace, kill=None, procs=None, wait_s: "float | None" = None,
+                  sleep=time.sleep, clock=time.monotonic, switch=None) -> "tuple[str, str]":
     """Make the process serving `worker`'s lane pick up its folders anew; (what happens, '' or why not).
-    A declared bridge is restarted by sparrowd (the field is in its revision); any other holder is
-    stopped, so the lane keeper starts it again on the switched folders."""
+    A declared bridge is restarted by sparrowd (the field is in its revision): this waits until its old
+    process no longer holds the lease. Any other holder is stopped, and the lane keeper starts it again.
+    `switch` (the field change) runs first under the record lock, which the keeper's starts take, so a
+    stopped lane cannot be started again before the field it must start on is written."""
+    from connections import _records_lock
+    with _records_lock(Path(workspace)):
+        if switch is not None:
+            switch()
+        kind, pid, why = _stop_unless_declared(worker, workspace, kill, procs)
+    if why or kind != "declared":
+        return kind, why
+    return _await_replacement(worker, workspace, pid, wait_s, sleep, clock)
+
+
+def _stop_unless_declared(worker: str, workspace, kill, procs) -> "tuple[str, int, str]":
     from connections import BridgeLeaseIndeterminate, BridgeStillRunning, _stop_row, bridge_pid, worker_identity
     ws = Path(workspace)
     row = worker_identity(worker, ws) or {}
@@ -481,17 +499,35 @@ def relaunch_lane(worker: str, workspace, kill=None, procs=None) -> "tuple[str, 
     try:
         pid = bridge_pid(instance, ws) if instance else 0
     except BridgeLeaseIndeterminate as e:
-        return "", f"whether the lane runs cannot be told ({e}); re-run"
+        return "", 0, f"whether the lane runs cannot be told ({e}); re-run"
     if not pid:
-        return "not-running", ""
+        return "not-running", 0, ""
     decl, _why = _declaration_for(worker, ws)
     if decl and held_by(pid, processes() if procs is None else procs, decl["path"]) == "declared-bridge":
-        return "restarted-by-sparrowd", ""
+        return "declared", pid, ""
     try:
         _stop_row(row, ws, kill)
     except (BridgeStillRunning, BridgeLeaseIndeterminate) as e:
-        return "", f"lane {instance} did not stop ({e}); re-run"
-    return f"stopped pid {pid}; the lane keeper starts it again", ""
+        return "", pid, f"lane {instance} did not stop ({e}); re-run"
+    return f"stopped pid {pid}; the lane keeper starts it again", pid, ""
+
+
+def _await_replacement(worker: str, workspace, pid: int, wait_s, sleep, clock) -> "tuple[str, str]":
+    from connections import BridgeLeaseIndeterminate, bridge_pid, worker_identity
+    ws = Path(workspace)
+    instance = str((worker_identity(worker, ws) or {}).get("instance") or "")
+    deadline = clock() + (RELAUNCH_WAIT_S if wait_s is None else wait_s)
+    while True:
+        try:
+            now_pid = bridge_pid(instance, ws)
+        except BridgeLeaseIndeterminate:
+            now_pid = pid
+        if now_pid != pid:
+            return "restarted-by-sparrowd", ""
+        if clock() >= deadline:
+            return "", (f"pending: sparrowd has not replaced the declared bridge (pid {pid}) yet; nothing was "
+                        "moved, re-run once it has")
+        sleep(1.0)
 
 
 def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=subprocess.run,
@@ -507,8 +543,8 @@ def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=s
     tasks, results = root / "tasks", root / "results"
     out = {"worker": worker, "tasks": str(tasks), "results": str(results), "undo": undo, "respawn_needed": True}
     if undo:
-        set_worker_dirs(worker, False, workspace=ws)
-        out["lane"], why = relaunch_lane(worker, ws, kill, procs)
+        out["lane"], why = relaunch_lane(worker, ws, kill, procs,
+                                         switch=lambda: set_worker_dirs(worker, False, workspace=ws))
         if why:
             return out, why
         from delivery.task_dispatch import has_ready_result
@@ -531,12 +567,13 @@ def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=s
         if owed:
             return out, (f"{len(owed)} task(s) delivered to {worker} but no task-event handler can move them; "
                          "nothing was switched")
-    try:
+    def switch():
         set_worker_dirs(worker, True, workspace=ws)
         ensure_worker_dirs(worker, ws)
+    try:
+        out["lane"], why = relaunch_lane(worker, ws, kill, procs, switch=switch)
     except (ConnectionsError, OSError) as e:
         return out, str(e)
-    out["lane"], why = relaunch_lane(worker, ws, kill, procs)
     if why:
         return out, why
     if handler:
