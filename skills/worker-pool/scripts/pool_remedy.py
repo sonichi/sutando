@@ -431,7 +431,7 @@ def retry_limit(workspace, repo, worker_id, *, runner=None):
     task_id = delivery["task_id"]
     if sup.is_paused(workspace, worker_id) or suspension(workspace):
         return {"worker_id": worker_id, "outcome": "rearm-queued", "task_id": task_id}
-    prompt = f"Read {pd.payload_path(Path(workspace), task_id)} and complete that routed recovery task."
+    prompt = f"Read {delivery.get('task_file') or pd.payload_path(Path(workspace), task_id)} and complete that routed recovery task."
     try:
         sent = sup.pane_gate.deliver(prompt, session, runtime, socket_path=str(socket),
             refuse_if_pending=True, require_limit=True, runner=run,

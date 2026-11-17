@@ -57,7 +57,9 @@ WS = resolve_workspace()
 
 from ag2_sparrow._dirs import set_dirs  # noqa: E402
 
-set_dirs(task_dir=WS / "tasks", result_dir=WS / "results", state_dir=WS / "state")
+# A converted worker's lane runs on that worker's own tasks/ and results/; every other lane on the shared ones.
+_TASK_DIR, _RESULT_DIR, _OWN_DIRS = worker_lane.lane_dirs(WS, (os.environ.get("GATEWAY_INSTANCE") or "").strip())
+set_dirs(task_dir=_TASK_DIR, result_dir=_RESULT_DIR, state_dir=WS / "state")
 
 from task_envelope import stamp_text  # noqa: E402  (adapter-edge stamper)
 from ag2_sparrow.local_task_protocol import set_task_stamper  # noqa: E402
@@ -520,7 +522,7 @@ def _lane_router(worker: str, argv: "list[str]"):
 def _install_worker_lane(worker: str) -> None:
     """This lane runs as `worker`'s own agent: the shared worker wiring, in this module's namespace."""
     worker_lane.install(globals(), worker, workspace=WS, results_dir=RESULTS_DIR,  # noqa: F821
-                        log=lambda line: _log(line), who=f"lane {GATEWAY_INSTANCE}")  # noqa: F821
+                        log=lambda line: _log(line), who=f"lane {GATEWAY_INSTANCE}", own=_OWN_DIRS)  # noqa: F821
 
 
 # Read once: a lane's row names its worker for the life of the process (a change relaunches it).

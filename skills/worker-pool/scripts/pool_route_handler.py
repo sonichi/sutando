@@ -38,6 +38,7 @@ import worker_picker_commands as wpc  # noqa: E402
 
 import pool_router as rt  # noqa: E402
 import pool_advertise as pa
+import pool_attribution as pat  # noqa: E402
 import pool_routing_receipt as prr  # noqa: E402
 
 DECLINE = 3
@@ -125,6 +126,14 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     # binding, a name never created -- is the core's, which is a real recipient.
     if targets == [pr.CORE] or pr.unknown_targets(roster, targets):
         return DECLINE, targets, roster
+    # A worker on its own folders is reached through its own agent, never routed to.
+    own = rt.own_dir_workers(workspace, targets)
+    targets = rt.without_own_dir_workers(workspace, targets)
+    if own:
+        print(f"pool_route_handler: {task.get('id')} not routed to {', '.join(own)} (on its own folders, "
+              f"reached through its own agent)", file=sys.stderr)
+    if targets == [pr.CORE]:
+        return DECLINE, targets, roster
     # Liveness is deliberately NOT asked: the sentinel is durable, so a worker
     # that starts later finds its work.
     return 0, targets, roster
@@ -154,6 +163,23 @@ def apply_picker(workspace, task_file, results_dir=None) -> "dict | None":
     return out
 
 
+def attribute_only(workspace, task_id: str, worker: str) -> int:
+    """0 once `task_id` is recorded as `worker`'s (now or before); 1 when it is not a worker id or another
+    worker holds the record."""
+    if not workspace or not pat.is_worker_id(worker):
+        print(f"pool_route_handler: --attribute-only needs a workspace and a worker id, not {worker!r}",
+              file=sys.stderr)
+        return 1
+    if pat.record(workspace, task_id, worker):
+        return 0
+    held = pat.worker_for_task(workspace, task_id) or ""
+    if held == worker:
+        return 0
+    print(f"pool_route_handler: {task_id} is attributed to {held or 'an unreadable record'}, not {worker}",
+          file=sys.stderr)
+    return 1
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--task-file", required=True)
@@ -168,11 +194,16 @@ def main(argv=None) -> int:
     p.add_argument("--payload", default=None)
     # The lane again, once the task is published: re-raise its worker's pending sentinel.
     p.add_argument("--renotify", action="store_true")
+    # A worker's own-dir lane: its folder is the inbox, so the task is only recorded as `--worker`'s.
+    p.add_argument("--attribute-only", action="store_true")
+    p.add_argument("--worker", default="")
     for ignored in ("--runtime", "--repo"):
         p.add_argument(ignored, default=None)
     args, _unknown = p.parse_known_args(argv)
 
     ws = args.workspace
+    if args.attribute_only:
+        return attribute_only(ws, Path(args.task_file).stem, args.worker)
     # First, before anything can fail: the receipt is the only proof outside this
     # process that the watcher routes at all, and a write failure changes nothing.
     if ws and not args.from_lane and not prr.record(ws, mode="probe" if args.probe else "run",

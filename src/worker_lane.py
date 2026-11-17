@@ -10,9 +10,14 @@ and owns are the ones its worker's session stamped (PROACTIVE_CLAIM_GATE, PROACT
 handler is found through `state/task-event-handler.json`, so no skill is named here.
 
 A declared bridge serves a worker only when the connection record names the declaration's agent as
-that worker's own (`serving`); it then runs the lane's own loader under `bridge_overlay` (the core
-workspace's tasks/, results/ and state/ and the lane's identity env), so it carries every host gate the
-lane does, and the two share one per-instance poller lock and never poll together.
+that worker's own (`serving`); it then runs the lane's own loader under `bridge_overlay` (the lane's
+tasks/ and results/, the core workspace's state/ and the lane's identity env), so it carries every host
+gate the lane does, and the two share one per-instance poller lock and never poll together.
+
+A worker whose row carries `dirs: "own"` (`connections.worker_dirs`) has its lane run on its own
+tasks/ and results/ (`lane_dirs`): its folder is its inbox, so no router is installed, only an
+attribution-only pre-publish hook (`attributor`), and its stamped proactive files still written to the
+shared results/ are moved into its own (`adopt_stray_proactive`).
 
 The token is the row's own (`credential`), read where the lane reads it, so no second copy is stored.
 While a valid declaration exists and its bridge holds the lane's lease, or has had a bounded grace to
@@ -88,6 +93,121 @@ def router(worker: str, argv: "list[str]", log):
     return route
 
 
+def attributor(worker: str, argv: "list[str]", log):
+    """TASK_PRE_PUBLISH for an own-dir worker's bridge: its folder is its inbox, so nothing is routed;
+    the declared handler only records the task as `worker`'s (`--attribute-only`)."""
+
+    def attribute(tid: str, staged: Path, dest: Path):
+        try:
+            rc = subprocess.run(argv + ["--task-file", str(dest), "--payload", str(staged), "--attribute-only",
+                                        "--worker", worker], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=ROUTE_TIMEOUT_S).returncode
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            rc = repr(exc)
+        if rc != 0:
+            log(f"lane for worker {worker}: {tid} not attributed to it ({rc}); published to its own folder")
+        return None
+    return attribute
+
+
+def _holds_lane(worker: str, workspace) -> bool:
+    """Whether this process holds `worker`'s lane lease: only the bridge serving the lane now may adopt."""
+    from connections import BridgeLeaseIndeterminate, bridge_pid, worker_identity
+    instance = str((worker_identity(worker, Path(workspace)) or {}).get("instance") or "")
+    try:
+        return bool(instance) and bridge_pid(instance, Path(workspace)) == os.getpid()
+    except BridgeLeaseIndeterminate:
+        return False
+
+
+def _still_own(worker: str, workspace, own_results, lease: bool = True) -> bool:
+    """Whether `own_results` is still `worker`'s own results folder and this process still serves its lane:
+    a switch replaces the bridge (`migrate-dirs` waits for that), so an older one adopts nothing."""
+    from connections import worker_dirs
+    dirs = worker_dirs(worker, Path(workspace))
+    return bool(dirs) and dirs[1].resolve() == Path(own_results).resolve() and (not lease or _holds_lane(worker, workspace))
+
+
+def _adopt(worker: str, shared_results, own_results, names, log, belongs=lambda name: True,
+           lease: bool = True, failed: "list[str] | None" = None) -> "list[str]":
+    import undelivered_quarantine
+    moved = []
+    for name in names:
+        # Re-checked right before each move: the field can be cleared while a pass runs.
+        if not _still_own(worker, Path(shared_results).parent, own_results, lease) or not belongs(name):
+            continue
+        try:
+            Path(own_results).mkdir(parents=True, exist_ok=True)
+            undelivered_quarantine.rename_noreplace(Path(shared_results) / name, Path(own_results) / name)
+        except FileExistsError as e:
+            if undelivered_quarantine.no_primitive(e):
+                undelivered_quarantine.report_once("worker-lane:adopt", log or (lambda _m: None),
+                                                   f"lane for worker {worker}: no no-replace rename on this "
+                                                   "platform; its files in the shared results/ stay there")
+                if failed is not None:
+                    failed.append(f"{name}: no no-replace rename on this platform")
+                return moved
+            continue
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            if failed is not None:
+                failed.append(f"{name}: {type(e).__name__}: {e}")
+            continue
+        moved.append(name)
+    return moved
+
+
+def _names(folder, pattern: str) -> "list[str]":
+    try:
+        return sorted(p.name for p in Path(folder).glob(pattern))
+    except OSError:
+        return []
+
+
+def adopt_stray_proactive(worker: str, shared_results, own_results, log=None, lease: bool = True,
+                          failed: "list[str] | None" = None) -> "list[str]":
+    """Move the proactive files `worker`'s session stamped (`lane_claims_proactive`) from the shared
+    results/ into its own; returns the names moved. The move never replaces a file: a name already in its
+    folder, or one another consumer took first, is left for a later pass. Without a no-replace rename
+    nothing is moved (a link-then-unlink could delete a file a producer just republished there). `lease`
+    False: a caller that is not the bridge and runs once the old bridge is gone (`migrate-dirs`); `failed`
+    collects a move that failed for any reason but a lost race, for a caller that must report it."""
+    from proactive_routing import lane_claims_proactive
+    if not worker:
+        return []
+    names = [n for n in _names(shared_results, "proactive-*.txt") if lane_claims_proactive(n, worker)]
+    return _adopt(worker, shared_results, own_results, names, log, lease=lease, failed=failed)
+
+
+def adopt_stray_results(worker: str, workspace, own_results, log=None, lease: bool = True,
+                        failed: "list[str] | None" = None) -> "list[str]":
+    """Move the results of tasks whose home is `worker`'s own folder, `own_results` (`connections.task_home`),
+    from the shared results/ into it, as `adopt_stray_proactive` does: a late answer an older session wrote."""
+    from connections import task_home
+    ws = Path(workspace)
+    if not worker:
+        return []
+    def belongs(name: str) -> bool:
+        home = task_home(Path(name).stem, ws)
+        return home["own"] and home["worker"] == worker and home["results"].resolve() == Path(own_results).resolve()
+    return _adopt(worker, ws / "results", own_results, _names(ws / "results", "task-*.txt"), log, belongs, lease,
+                  failed)
+
+
+# How often an own-dir bridge looks for its worker's proactive files still landing in the shared results/.
+ADOPT_INTERVAL_S = 10.0
+
+
+def _adopt_loop(worker: str, shared_results, own_results, log, stop, interval_s: float) -> None:
+    while True:
+        for name in adopt_stray_proactive(worker, shared_results, own_results, log) + \
+                adopt_stray_results(worker, Path(shared_results).parent, own_results, log):
+            log(f"lane for worker {worker}: moved {name} from the shared results/ to its own")
+        if stop.wait(interval_s):
+            return
+
+
 def claim_gate(worker: str):
     """A worker's bridge shares results/ with the core's lanes: it claims only the proactive files its
     worker's session stamped (`lane_claims_proactive`), which it posts as the worker's agent."""
@@ -95,17 +215,48 @@ def claim_gate(worker: str):
     return lambda path: lane_claims_proactive(path.name, worker)
 
 
-def install(ns: dict, worker: str, *, workspace, results_dir, log, who: str) -> None:
-    """Set the worker hooks in the bridge module namespace `ns`; `who` names the bridge in the log."""
-    log(f"{who} runs as worker {worker}'s own agent: it delivers its tasks to that worker, "
-        "and it posts only the proactive files that worker's session writes")
+def install(ns: dict, worker: str, *, workspace, results_dir, log, who: str, own: bool = False,
+            adopt_interval_s: "float | None" = None) -> None:
+    """Set the worker hooks in the bridge module namespace `ns`; `who` names the bridge in the log. `own`:
+    the bridge runs on the worker's own folders (`lane_dirs`), so no router is installed and its adopt
+    thread's stop event is `ns["WORKER_ADOPT_STOP"]`."""
     ns["TASK_ADDRESSEE"] = lambda: worker
     ns["PROACTIVE_CLAIM_GATE"] = ns["PROACTIVE_OWN_FILE"] = claim_gate(worker)
     argv = route_argv(workspace, results_dir)
+    if own:
+        ns["WORKER_ADOPT_STOP"] = _install_own(ns, worker, argv, workspace=workspace, results_dir=results_dir, log=log, who=who,
+                            interval_s=ADOPT_INTERVAL_S if adopt_interval_s is None else adopt_interval_s)
+        return
+    log(f"{who} runs as worker {worker}'s own agent: it delivers its tasks to that worker, "
+        "and it posts only the proactive files that worker's session writes")
     if not argv:
         log(f"lane for worker {worker}: no task-event handler is declared; the core's watcher routes its tasks")
         return
     ns["TASK_PRE_PUBLISH"] = router(worker, argv, log)
+
+
+def _install_own(ns: dict, worker: str, argv, *, workspace, results_dir, log, who: str, interval_s: float):
+    import threading
+    log(f"{who} runs as worker {worker}'s own agent on its own folders: its tasks are queued there for that "
+        "worker alone, and it posts only the proactive files that worker's session writes")
+    if argv:
+        ns["TASK_PRE_PUBLISH"] = attributor(worker, argv, log)
+    else:
+        log(f"lane for worker {worker}: no task-event handler is declared; its tasks are not attributed")
+    stop = threading.Event()
+    threading.Thread(target=_adopt_loop, args=(worker, Path(workspace) / "results", Path(results_dir), log, stop,
+                                               interval_s), name=f"adopt-{worker}", daemon=True).start()
+    return stop
+
+
+def lane_dirs(workspace, instance: str) -> "tuple[Path, Path, bool]":
+    """(tasks dir, results dir, own) a lane `instance` runs on: its worker's own folders when that worker
+    has them (`connections.worker_dirs`), else the workspace's shared tasks/ and results/. Paths are
+    lexical under `workspace` as given; resolve both sides before comparing with a recorded realpath."""
+    from connections import ensure_worker_dirs, lane_worker
+    ws = Path(workspace)
+    own = ensure_worker_dirs(lane_worker(instance, ws), ws) if instance else None
+    return (own[0], own[1], True) if own else (ws / "tasks", ws / "results", False)
 
 
 def serving(agent_mxid: str, workspace) -> "tuple[str, str, str]":
@@ -137,7 +288,7 @@ class NotServable(Exception):
 
 
 def bridge_overlay(workspace, instance: str) -> "dict[str, str]":
-    """What a worker's declared bridge runs under beyond its declaration: the lane's dirs and the lane's
+    """What a worker's declared bridge runs under beyond its declaration: the lane's dirs (`lane_dirs`) and the lane's
     own identity env (`connections.lane_identity_env`), so it runs the loader exactly as its lane does."""
     from connections import ConnectionsError, SchemaError, lane_identity_env, plan_entry
     ws = Path(workspace)
@@ -145,7 +296,8 @@ def bridge_overlay(workspace, instance: str) -> "dict[str, str]":
         entry = plan_entry(instance, workspace=ws)
     except (ConnectionsError, SchemaError, OSError) as e:
         raise NotServable(f"lane {instance} is not in the launch plan ({type(e).__name__})") from e
-    return {"AGENT_CONNECT_TASK_DIR": str(ws / "tasks"), "AGENT_CONNECT_RESULT_DIR": str(ws / "results"),
+    tasks, results, _own = lane_dirs(ws, instance)
+    return {"AGENT_CONNECT_TASK_DIR": str(tasks), "AGENT_CONNECT_RESULT_DIR": str(results),
             "AGENT_CONNECT_STATE_DIR": str(ws / "state"), "REMOTE_MEDIA_DIR": str(ws / "data" / "remote-media"),
             **lane_identity_env(entry)}
 
@@ -168,7 +320,7 @@ def _declaration_for(worker: str, workspace) -> "tuple[dict | None, str]":
     from connections import WORKER_RE, worker_identity, worker_root
     if not WORKER_RE.match(worker or ""):
         return None, f"{worker!r} is not a worker id"
-    mxid = str((worker_identity(worker, Path(workspace)) or {}).get("agent_mxid") or "")
+    mxid = str((worker_identity(worker, Path(workspace)) or {}).get("agent_mxid") or "").strip()
     if not mxid:
         return None, f"worker {worker} has no agent identity row"
     from ag2_sparrow import connect_bridge as adapter
@@ -183,10 +335,11 @@ def declared_bridge(worker: str, workspace) -> bool:
     """Whether `worker`'s agent has a declaration the agent bridge runs as that worker: the one check the
     lane keeper asks before starting the worker's lane. Raises when the record or the file cannot be read."""
     import sparrow_agent_bridge
+    from connections import worker_agents_dir
     decl, _why = _declaration_for(worker, workspace)
     if decl is None:
         return False
-    loaded, _why = sparrow_agent_bridge.load(decl["path"], Path(workspace) / "agents")
+    loaded, _why = sparrow_agent_bridge.load(decl["path"], worker_agents_dir(Path(workspace)))
     return bool(loaded) and loaded.get("worker") == worker
 
 
