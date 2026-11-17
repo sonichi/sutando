@@ -157,7 +157,18 @@ def sentinel_ids(workspace, worker_id) -> tuple[list[str], set[str]]:
 
 
 def owed_task_ids(workspace, worker_id) -> list[str]:
-    return sentinel_ids(workspace, worker_id)[0]
+    """What this worker owes: its own inbox's tasks without a ready result when it has its own folders
+    (`connections.worker_dirs`), else its owed sentinels."""
+    import connections
+    from task_archive import task_id_from_filename
+    own = connections.worker_dirs(worker_id, Path(workspace))
+    if own is None:
+        return sentinel_ids(workspace, worker_id)[0]
+    tasks, results = own
+    names = [f.name for f in tasks.glob("task-*.txt")] if tasks.is_dir() else []
+    ids = sorted({t for t in map(task_id_from_filename, names) if t})
+    ready = td.ready_result_filenames(results, [f"{t}.txt" for t in ids])
+    return [t for t in ids if f"{t}.txt" not in ready]
 
 
 def work_outstanding(workspace, worker_id) -> bool | None:

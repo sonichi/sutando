@@ -468,13 +468,24 @@ def _newest_first(paths) -> list:
     return [p for _, p in pairs]
 
 
+def _task_homes() -> "list[tuple[Path, Path, str]]":
+    """(tasks dir, results dir, worker): the shared folders, then each own-folder pool worker's."""
+    from connections import own_worker_homes
+    return [(TASK_DIR, RESULT_DIR, "")] + [(h["tasks"], h["results"], h["worker"])
+                                           for h in own_worker_homes(WORKSPACE_DIR)]
+
+
 def _active_task_rows() -> list[dict]:
-    """Reconcile task/result files into the ten most recent history rows."""
+    """Reconcile task/result files into the ten most recent history rows; an own-folder pool worker's
+    task row carries its `worker`."""
+    homes = {}
+    for tasks_dir, results_dir, worker in _task_homes():
+        homes.update({path: (results_dir, worker) for path in tasks_dir.glob("*.txt")})
     # Classifier tasks are machinery, not user work, so they stay out of the
     # history the UI shows.
     for task_file in _newest_first(
         path
-        for path in TASK_DIR.glob("*.txt")
+        for path in homes
         if not path.stem.startswith(
             (
                 task_workstreams.CLASSIFIER_TASK_PREFIX,
@@ -482,6 +493,7 @@ def _active_task_rows() -> list[dict]:
             )
         )
     )[:10]:
+        results_dir, worker = homes[task_file]
         # A CLAIMED task is task-{id}.claimed-core-N.txt, but every writer puts
         # the reply at results/{id}.txt — so key AND look up by the canonical id.
         task_id = task_id_from_filename(task_file.name)
@@ -497,12 +509,12 @@ def _active_task_rows() -> list[dict]:
         # First `source:` and `task:` regardless of field order; body
         # lookalikes must not override the real headers.
         task_line, source_line = _task_display_fields(content)
-        result_file = RESULT_DIR / f"{task_id}.txt"
+        result_file = results_dir / f"{task_id}.txt"
         existing = task_history.get(task_id, {})
         # Priority: live file, then in-memory history, then archive. The
         # archive lookup is what survives a restart, when history is empty.
         archived_file = None
-        for month_dir in (RESULT_DIR / "archive").glob("*/"):
+        for month_dir in (results_dir / "archive").glob("*/"):
             candidate = month_dir / f"{task_id}.txt"
             if candidate.exists():
                 archived_file = candidate
@@ -526,6 +538,8 @@ def _active_task_rows() -> list[dict]:
             "result": result_text,
             "source": source_line or existing.get("source", ""),
         }
+        if worker:
+            task_history[task_id]["worker"] = worker
 
     # Results may outlive their task files after bridge cleanup.
     for result_file in _newest_first(RESULT_DIR.glob("task-*.txt"))[:10]:
@@ -538,8 +552,11 @@ def _active_task_rows() -> list[dict]:
     for task_id, task_data in list(task_history.items()):
         if task_data.get("status") != "working":
             continue
-        task_file = TASK_DIR / f"{task_id}.txt"
-        result_file = RESULT_DIR / f"{task_id}.txt"
+        task_file, result_file = TASK_DIR / f"{task_id}.txt", RESULT_DIR / f"{task_id}.txt"
+        if task_data.get("worker"):
+            from connections import task_home
+            home = task_home(task_id, WORKSPACE_DIR)
+            task_file, result_file = home["tasks"] / f"{task_id}.txt", home["results"] / f"{task_id}.txt"
         if result_file.exists():
             task_data["status"] = "done"
             task_data["result"] = result_file.read_text().strip()
