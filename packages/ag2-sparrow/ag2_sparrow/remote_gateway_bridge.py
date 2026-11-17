@@ -327,7 +327,7 @@ from .local_task_protocol import find_archived_task
 from . import (agent_identity, agent_triggers, diagnostics, gateway_credential_io, gateway_credential_sources,
                gateway_credentials, gateway_instance, local_task_protocol, routing_migrations,
                setup_fetch)
-from .bounded_file_read import read_private, read_regular, read_regular_text
+from .bounded_file_read import read_fd_bytes, read_private, read_regular, read_regular_text
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import has_skip_action
 from .result_markers import neutralize_markers
@@ -335,7 +335,7 @@ from . import undelivered_quarantine
 from . import deleted_binding
 from . import result_labels
 from .proactive_routing import (PROACTIVE_OUTBOX_DIRNAME, about_task, about_task_ts, proactive_filename,
-                                proactive_item_id)
+                                proactive_item_id, read_attachment, resolve_attachment_path)
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from . import health_command
@@ -7934,7 +7934,7 @@ def _read_attachment(path_str: str, confine_root=None) -> "tuple[str, str, str]"
     ("", "", reason) — the refusals both upload routes report in-band."""
     if confine_root is _CONFINE_UNRESOLVED:
         return "", "", "task provenance unavailable"
-    fpath = os.path.realpath(os.path.expanduser(path_str.strip()))
+    fpath = resolve_attachment_path(path_str)
     if not is_path_sendable(fpath):
         return "", "", "path not allowlisted"
     if confine_root is not None:
@@ -7944,24 +7944,25 @@ def _read_attachment(path_str: str, confine_root=None) -> "tuple[str, str, str]"
         except (OSError, ValueError):
             return "", "", "outside the task's media directory"
         try:
-            with os.fdopen(fd, "rb") as f:
-                if os.fstat(f.fileno()).st_size > MAX_MEDIA_BYTES:
-                    return "", "", f"file exceeds {MAX_MEDIA_BYTES} bytes"
-                return (os.path.basename(confined_path),
-                        base64.b64encode(f.read()).decode("ascii"), "")
+            data, reason = read_fd_bytes(fd, MAX_MEDIA_BYTES)
+            if data is not None:
+                return os.path.basename(confined_path), base64.b64encode(data).decode("ascii"), ""
         except OSError as e:
-            return "", "", f"read failed: {e}"
-    try:
-        size = os.path.getsize(fpath)
-    except OSError as e:
-        return "", "", f"stat failed: {e}"
-    if size > MAX_MEDIA_BYTES:
-        return "", "", f"file exceeds {MAX_MEDIA_BYTES} bytes"
-    try:
-        with open(fpath, "rb") as f:
-            return os.path.basename(fpath), base64.b64encode(f.read()).decode("ascii"), ""
-    except OSError as e:
-        return "", "", f"read failed: {e}"
+            reason = f"unreadable ({e})"
+        finally:
+            os.close(fd)
+        return "", "", _attachment_refusal(reason)
+    _, data, reason = read_attachment(path_str, is_path_sendable, MAX_MEDIA_BYTES)
+    if data is None:
+        return "", "", _attachment_refusal(reason)
+    return os.path.basename(fpath), base64.b64encode(data).decode("ascii"), ""
+
+
+def _attachment_refusal(reason: str) -> str:
+    """The in-band refusal for a shared reader's reason."""
+    if reason.startswith("over "):
+        return f"file exceeds {MAX_MEDIA_BYTES} bytes"
+    return reason if reason == "path not allowlisted" else f"read failed: {reason}"
 
 
 def _upload_attachment(room: str, path_str: str) -> tuple[bool, str]:
@@ -8274,6 +8275,24 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
     return _delivery_destination.route(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
 
 
+def _proactive_attachments(body: str) -> "list[str]":
+    """The `[file:]`/`[send:]`/`[attach:]` paths a proactive body names, in order."""
+    parsed = parse_markers(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
+    return [a.value for a in parsed.actions if a.kind == "attach"]
+
+
+def _upload_proactive_attachments(name: str, room: str, attaches: "list[str]", tier: str = "owner") -> None:
+    """Upload a delivered proactive message's files to its room. The text is already sent,
+    so a refusal cannot go in-band: each outcome is logged, a refused file loudly."""
+    for fp in attaches:
+        ok, reason = _upload_attachment(room, fp)
+        shown = team_result_guard.attachment_notice_name(fp, tier)
+        if ok:
+            _log(f"attached {shown} to proactive {name} in {room}")
+        else:
+            _log(f"proactive {name}: attachment NOT sent to {room}: {shown} ({reason})")
+
+
 def _proactive_thread_root(body: str, name: str = "") -> "str | None":
     """The `[thread:]` root a proactive body names, or None (top level). A
     malformed value is logged and posted top level, never into a guessed thread."""
@@ -8386,8 +8405,8 @@ def _payload_room(payload) -> "str | None":
         return None
 
 
-def _proactive_item_id(stem: str, body: str) -> str:
-    return proactive_item_id(stem, body)
+def _proactive_item_id(stem: str, body: str, attachments=()) -> str:
+    return proactive_item_id(stem, body, attachments, admit=is_path_sendable, max_bytes=MAX_MEDIA_BYTES)
 
 
 def _proactive_requeue_command(root, item_id: str, body_sha256: str, reset_attempts: bool = False) -> str:
@@ -8741,7 +8760,8 @@ def _post_proactive() -> None:
             _log(f"proactive {f.name} carries a skip marker — archiving, no send")
             _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR)
             continue
-        body = routed_body.strip()
+        attaches = _proactive_attachments(claimed_text)
+        body = routed_body.strip() or ("(file attached)" if attaches else "")
         if not body:
             # An empty claim means the producer has not flushed the body yet.
             # NEVER move this inode: no observable signal proves the writer is
@@ -8764,34 +8784,43 @@ def _post_proactive() -> None:
             _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
             continue
         dest_room = resolve_destination(CURRENT_ROOM, room_id=room_override) if room_override else resolve_destination(OWNER_PRIVATE)
+        tier = "owner"
         if room_override:
-            body = _guard_proactive_for_room(f.name, claimed_text, body, dest_room)
+            body, withheld = _guard_proactive_for_room(f.name, claimed_text, body, dest_room)
+            tier = "owner" if dest_room == resolve_destination(OWNER_PRIVATE) else "guest"
+            if withheld and attaches:
+                # A withheld body's files are the owner's output too: none reach that room.
+                _log(f"[team-guard] proactive {f.name}: {len(attaches)} attachment(s) withheld from {dest_room}: "
+                     + ", ".join(team_result_guard.attachment_notice_name(a, tier) for a in attaches))
+                attaches = []
         thread_root = _proactive_thread_root(claimed_text, f.name)
         about = about_task(f.name)
         if about:
             thread_root = _task_thread_root(_about_task_headers(about), dest_room) or thread_root
         envelope = {"room_id": dest_room, "body": body,
                     **({"thread_root": thread_root} if thread_root else {}),
-                    **({"task_id": about} if about else {})}
-        _send_proactive(claim, f, envelope, room_override is None, noticed)
+                    **({"task_id": about} if about else {}),
+                    **({"attachments": attaches} if attaches else {})}
+        _send_proactive(claim, f, envelope, room_override is None, noticed, tier)
 
 
-def _guard_proactive_for_room(name: str, text: str, body: str, room: str) -> str:
-    """The body a redirected proactive may post in `room`: the shared guard's verdict. No room
+def _guard_proactive_for_room(name: str, text: str, body: str, room: str) -> "tuple[str, bool]":
+    """(the body a redirected proactive may post in `room`, whether the guard withheld it). No room
     record states its audience tier, so every room but the owner DM guards as a non-owner one."""
     _, withheld = team_result_guard.guard_proactive_for_destination(
         text, room, resolve_destination(OWNER_PRIVATE), "guest", None, secret_filter=filter_chat_secrets)
     if withheld is None:
-        return body
+        return body, False
     _log(f"[team-guard] withheld proactive {name} for {room}: {withheld}")
-    return team_result_guard.TEAM_LEAK_RESULT
+    return team_result_guard.TEAM_LEAK_RESULT, True
 
 
-def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, noticed: set) -> None:
+def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, noticed: set,
+                    tier: str = "owner") -> None:
     """Hand one claimed proactive file to the outbox, which owns the claim, the send and its
     outcome, then move the file as that outcome says. An uncertain send is parked, not resent."""
     core = _delivery_core("proactive")
-    item_id = _proactive_item_id(f.stem, envelope["body"])
+    item_id = _proactive_item_id(f.stem, envelope["body"], envelope.get("attachments") or ())
     payload = json.dumps(envelope, sort_keys=True).encode("utf-8")
     seen = _PROACTIVE_SEND.__dict__.setdefault("seen", {})
     seen.clear()
@@ -8843,6 +8872,8 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
         if result.status is DrainStatus.ATTEMPTED and result.detail != "settled by a recorded receipt":
             _ENGINE_COUNTS["core_confirmed"] += 1
             _log(f"delivered proactive {f.name} to {room} ({item.get('provider_ref')})")
+            # Only after this pass's own send: a resend never repeats an upload.
+            _upload_proactive_attachments(f.name, room, envelope.get("attachments") or [], tier)
         else:
             _log(f"proactive {f.name} was already delivered to {room} "
                  f"({item.get('provider_ref') or 'receipt recorded'}) — archived, not sent again")
