@@ -11,7 +11,8 @@ root, whose token file must be the seat's own, and its bridge runs with exactly 
 A pool worker's declaration (`worker_lane.py declare`) is run only when the connection record names its
 `AGENT_MXID` as one worker's own agent (`worker_lane.serving`); that worker and its lane instance come from
 the record, never the file, and the bridge runs as the worker's lane does (`worker_lane.bridge_overlay`)
-with the shared worker wiring (`worker_lane.install`) set before the package's main() starts.
+with the shared worker wiring (`worker_lane.install`) set before the package's main() starts. It names no
+vault key: its token is the worker row's own, read as the lane reads it (`worker_lane.credential`).
 
 `declarations(workspace, vault_keys)` lists the valid ones whose vault key exists. What a declaration's
 own bytes can be (not UTF-8, not JSON, too deep, too large, not a regular file) skips that one entry with a
@@ -136,7 +137,9 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
     want_env, problem = seat_env(root, mxid) if seat else (adapter.bridge_env(root, mxid), "")
     if problem:
         return None, f"{path}: {problem}"
-    want = {"name": adapter.worker_name(segment), "token_vault_key": "" if seat else adapter.vault_key(segment),
+    by_worker = decl["written_by"] == worker_lane.WRITTEN_BY
+    want = {"name": adapter.worker_name(segment),
+            "token_vault_key": "" if seat or by_worker else adapter.vault_key(segment),
             **_sources.bridge_declaration_fields(), "module": BRIDGE_MODULE, "env": want_env}
     for key in [k for k in want if k != "env"]:
         if decl.get(key) != want[key]:
@@ -151,7 +154,7 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
     if not same:
         return None, f"{path}: env is not the canonical one for {segment}"
     served = {}
-    if decl["written_by"] == worker_lane.WRITTEN_BY:
+    if by_worker:
         try:
             worker, instance, problem = worker_lane.serving(mxid, Path(agents).resolve().parent)
         except worker_lane.RecordUnreadable as e:
@@ -210,7 +213,7 @@ def declarations(workspace: Path, vault_keys, held=None) -> "tuple[list, list]":
             decl, why = None, str(e)
             if held is not None:
                 held.append(adapter.worker_name(home.name[:-len(SUFFIX)]))
-        if decl is not None and not is_seat(decl) and decl["token_vault_key"] not in names:
+        if decl is not None and decl["token_vault_key"] and decl["token_vault_key"] not in names:
             decl, why = None, f"{path}: the vault has no {decl['token_vault_key']}; vault set it to the agent's relay token"
         if decl is None:
             skipped.append(why)
@@ -248,7 +251,7 @@ def endpoint(decl: dict, token: str, get_key) -> "tuple[str, str]":
     return ("", f"{key} {problem}") if problem else (url, "")
 
 
-def preflight(workspace, get_key) -> int:
+def preflight(workspace, get_key, vault=None) -> int:
     """One line per declared agent bridge: whether it can start (its token in the vault, and its gateway in
     the token or under its URL key). 1 when any cannot. No value is printed."""
     agents, bad = Path(workspace) / "agents", []
@@ -270,7 +273,12 @@ def preflight(workspace, get_key) -> int:
         if decl is not None and is_seat(decl):
             print(f"ok: {decl['name']} (gateway from its seat's token file)")
             continue
-        if decl is not None:
+        if decl is not None and decl.get("worker"):
+            why = worker_lane.credential(decl["worker"], workspace, None, vault)[1]
+            if not why:
+                print(f"ok: {decl['name']} (worker {decl['worker']}'s token, from its connection row)")
+                continue
+        if decl is not None and not decl.get("worker"):
             try:
                 token = get_key(decl["token_vault_key"])
             except KeyError:
@@ -281,13 +289,14 @@ def preflight(workspace, get_key) -> int:
                     where = "its token" if not url else decl["url_vault_key"]
                     print(f"ok: {decl['name']} (gateway from {where})")
                     continue
+        if decl is not None:
             why = f"{decl['name']}: {why}"
         bad.append(why)
         print(f"WILL NOT START: {why}")
     return 1 if bad else 0
 
 
-def main(argv=None, workspace=None, get_key=None, run=runpy.run_module) -> int:
+def main(argv=None, workspace=None, get_key=None, run=runpy.run_module, vault=None) -> int:
     args = sys.argv[1:] if argv is None else argv
     if len(args) != 1:
         print("usage: sparrow_agent_bridge.py <workspace>/agents/<agent>.bridge/worker.json | --preflight",
@@ -299,7 +308,7 @@ def main(argv=None, workspace=None, get_key=None, run=runpy.run_module) -> int:
     if get_key is None and args[0] == "--preflight":
         from vault_intercept import get_vault_key as get_key
     if args[0] == "--preflight":
-        return preflight(workspace, get_key)
+        return preflight(workspace, get_key, vault)
     try:
         decl, why = load(Path(args[0]), Path(workspace) / "agents")
     except ScanUnavailable as e:
@@ -308,7 +317,12 @@ def main(argv=None, workspace=None, get_key=None, run=runpy.run_module) -> int:
         print(f"sparrow-agent-bridge: not starting: {why}", file=sys.stderr)
         return 2
     token, url = "", ""
-    if not is_seat(decl):
+    if decl.get("worker"):
+        token, problem = worker_lane.credential(decl["worker"], workspace, None, vault)
+        if problem:
+            print(f"sparrow-agent-bridge: not starting: {problem}", file=sys.stderr)
+            return 1
+    elif not is_seat(decl):
         if get_key is None:
             from vault_intercept import get_vault_key as get_key
         try:

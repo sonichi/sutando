@@ -2403,7 +2403,7 @@ def _worker_owner_problem(row: dict, rows: list) -> Optional[str]:
 def worker_serving_agent(agent_mxid: str, workspace: Optional[Path] = None) -> "tuple[str, str, Optional[str]]":
     """(worker, its row's instance, None) when the record names `agent_mxid` exactly as one pool worker's own
     agent; ("", "", None) when no worker row names it; ("", "", why) when one does but must not be served
-    (two rows, an owner no core row has, disabled). A parked row is served. Raises on an unreadable record."""
+    (two rows, an owner no core row has, disabled or parked). Raises on an unreadable record."""
     rows = _read(record_path(workspace))
     named = [r for r in rows if r.get("worker") and r.get("agent_mxid") == agent_mxid]
     if not named:
@@ -2412,8 +2412,8 @@ def worker_serving_agent(agent_mxid: str, workspace: Optional[Path] = None) -> "
         return "", "", f"{len(named)} worker rows name agent {agent_mxid}"
     row = named[0]
     problem = _worker_owner_problem(row, rows)
-    if not problem and row.get("disabled"):
-        problem = f"worker {row['worker']}'s row is disabled"
+    if not problem and (row.get("disabled") or row.get("parked")):
+        problem = f"worker {row['worker']}'s row is {'disabled' if row.get('disabled') else 'parked'}"
     if not problem and not row.get("instance"):
         problem = f"worker {row['worker']}'s row names no lane instance"
     return ("", "", problem) if problem else (str(row["worker"]), str(row["instance"]), None)
@@ -3443,8 +3443,9 @@ def _keep_lane(inst: str, state: dict, now: float, say: Callable[[str], None], *
                environ: Mapping[str, str], workspace: Optional[Path], vault, spawn, python: Optional[str]) -> None:
     """`keep_lanes_up` for one lane, under the record lock."""
     with _records_lock(workspace):
-        if inst not in {e["instance"] for e in launch_plan(environ, workspace=workspace)}:
-            state.pop(inst, None)  # disconnected, parked or removed since the plan was read
+        entry = next((e for e in launch_plan(environ, workspace=workspace) if e["instance"] == inst), None)
+        if entry is None or _declared_bridge_serves(entry, workspace):
+            state.pop(inst, None)  # disconnected, parked, removed or handed to a declared bridge
             return
         row = _row_named(inst, workspace) or {}
         if any(_proven_holder(n, workspace) for n in [inst] + alias_instances(row)):
@@ -3468,6 +3469,18 @@ def _keep_lane(inst: str, state: dict, now: float, say: Callable[[str], None], *
         state.pop(inst, None)
         if rec.get("lease") == "held":
             say(f"lane {inst} was down; started it (pid {rec.get('pid')})")
+
+
+def _declared_bridge_serves(entry: Mapping[str, object], workspace: Optional[Path]) -> bool:
+    """Whether a worker lane's agent runs as a valid declared Sparrow bridge instead (`worker_lane`);
+    a check that cannot be made answers False, and the bridge lease still keeps one poller."""
+    if not entry.get("worker"):
+        return False
+    try:
+        import worker_lane
+        return worker_lane.declared_bridge(str(entry["worker"]), _workspace(workspace))
+    except Exception:  # noqa: BLE001 - an unanswerable check never keeps a lane down
+        return False
 
 
 def keep_lanes_up(*, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,

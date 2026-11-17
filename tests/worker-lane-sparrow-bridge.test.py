@@ -4,7 +4,11 @@
 - The shared module: `install` sets the worker hooks in a bridge namespace (addressee, claim and own-file
   gates, and the pre-publish router when a task-event handler is declared); `serving` answers which pool
   worker a connection row names an agent as, and why one is not served; `bridge_overlay` is the lane's dirs.
-- `worker_lane.py declare|withdraw`: the declaration sparrowd runs a worker's agent bridge from.
+- `worker_lane.py declare|withdraw`: the declaration sparrowd runs a worker's agent bridge from. It names
+  no vault key: the bridge reads the row's own token, as the lane does.
+- The lane keeper does not start a lane whose worker has a valid declared bridge, starts it again once the
+  declaration is withdrawn, and the row stays enabled throughout, so the worker keeps its own identity.
+  `connections.py stop <instance>` stops the running lane once.
 - `sparrow_agent_bridge`: a worker declaration runs as that worker's lane does, with the hooks set before
   the package's main(); a claude-local declaration is run as before, with none; a worker declaration whose
   agent the record does not name as a servable worker is skipped with its reason.
@@ -92,9 +96,9 @@ class Serving(Base):
     def test_a_workers_agent_is_served_as_that_worker_on_its_rows_lane(self):
         self.assertEqual(worker_lane.serving(WORKER_AGENT, self.ws), (W, self.row["instance"], ""))
 
-    def test_a_parked_row_is_still_served(self):
+    def test_a_parked_row_is_not_served(self):
         self.edit_worker_row(parked=True)
-        self.assertEqual(worker_lane.serving(WORKER_AGENT, self.ws)[0], W)
+        self.assertIn("row is parked", worker_lane.serving(WORKER_AGENT, self.ws)[2])
 
     def test_why_an_agent_is_not_served(self):
         self.assertIn("is no pool worker's own agent", worker_lane.serving(CORE_AGENT, self.ws)[2])
@@ -174,13 +178,16 @@ class Declare(Base):
         loaded, why = bridge.load(decl, self.agents)
         self.assertEqual(why, "")
         self.assertEqual((loaded["worker"], loaded["instance"]), (W, self.row["instance"]))
+        self.assertEqual(body["token_vault_key"], "", "no second copy of the token is named")
         rc, said = self.cli("declare", "--worker", W)
         self.assertEqual(rc, 0, "declaring again rewrites its own file")
-        self.assertIn(cli.vault_key(SEG), said)
+        self.assertIn("with the token its connection row names", said)
+        self.assertNotIn("vault set", said)
 
     def test_withdraw_removes_only_its_own(self):
         decl = self.declare()
-        self.assertEqual(self.cli("withdraw", "--worker", W), (0, f"removed: {decl}\n"))
+        self.assertEqual(self.cli("withdraw", "--worker", W),
+                         (0, f"removed: {decl} (the lane keeper starts the worker's lane on its next pass)\n"))
         self.assertEqual(self.cli("withdraw", "--worker", W)[1], f"nothing declared at {decl}\n")
         decl.mkdir(parents=True)
         for action in ("declare", "withdraw"):
@@ -200,6 +207,11 @@ class Declare(Base):
             self.edit_worker_row(disabled=False)
             self.assertEqual(self.cli("declare", "--worker", W), (1, "worker_lane: declare refused: gone\n"))
 
+    def test_withdraw_works_whatever_the_row_now_says(self):
+        decl = self.declare()
+        self.edit_worker_row(disabled=True)
+        self.assertEqual(self.cli("withdraw", "--worker", W)[0], 0)
+        self.assertFalse(decl.exists())
 
     def test_the_workspace_defaults_to_the_resolved_one(self):
         import workspace_default
@@ -212,6 +224,9 @@ class Declare(Base):
 class TheAgentBridge(Base):
     def vault_get(self):
         return {cli.vault_key(SEG): TOKEN_W}.__getitem__
+
+    def no_vault_key(self, key):
+        self.fail(f"a worker's bridge read the vault key {key}")
 
     def test_a_worker_declaration_runs_as_its_lane_with_the_hooks_set_before_main(self):
         handler = self.declare_handler()
@@ -226,7 +241,7 @@ class TheAgentBridge(Base):
             ns = {"RESULTS_DIR": self.ws / "results", "_log": lambda line: None}
             ns["main"] = lambda: started.append(dict(ns))
             return ns
-        rc = bridge.main([str(decl)], workspace=self.ws, get_key=self.vault_get(), run=fake_run)
+        rc = bridge.main([str(decl)], workspace=self.ws, get_key=self.no_vault_key, run=fake_run, vault=self.vault)
         self.assertEqual(rc, 0)
         self.assertEqual(seen, {"module": bridge.BRIDGE_MODULE, "run_name": bridge.BRIDGE_MODULE, "alter_sys": False,
                                 "task": self.ws / "tasks", "result": self.ws / "results", "state": self.ws / "state",
@@ -266,10 +281,36 @@ class TheAgentBridge(Base):
                 self.assertIn(why, " ".join(skipped))
                 run = mock.Mock()
                 with contextlib.redirect_stderr(io.StringIO()) as err:
-                    self.assertEqual(bridge.main([str(decl)], workspace=self.ws, get_key=self.vault_get(), run=run), 2)
+                    self.assertEqual(bridge.main([str(decl)], workspace=self.ws, get_key=self.no_vault_key, run=run,
+                                                 vault=self.vault), 2)
                 run.assert_not_called()
                 self.assertIn(why, err.getvalue())
                 C.record_path(self.ws).write_text(good)
+
+    def test_the_rows_token_is_required_and_no_vault_key_is_listed(self):
+        decl = self.declare()
+        found, skipped = bridge.declarations(self.ws, [])
+        self.assertEqual(([p for p, _ in found], skipped), ([decl], []), "listed with no vault key at all")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bridge.main(["--preflight"], workspace=self.ws, get_key=self.no_vault_key,
+                                         vault=self.vault), 0)
+        self.assertIn(f"worker {W}'s token, from its connection row", out.getvalue())
+        self.vault.store.clear()
+        run = mock.Mock()
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(bridge.main([str(decl)], workspace=self.ws, get_key=self.no_vault_key, run=run,
+                                         vault=self.vault), 1)
+        run.assert_not_called()
+        self.assertIn("has no token for its gateway", err.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(bridge.main(["--preflight"], workspace=self.ws, get_key=self.no_vault_key,
+                                         vault=self.vault), 1)
+        self.assertIn(f"WILL NOT START: {cli.worker_name(SEG)}: ", out.getvalue())
+
+    def test_the_credential_needs_an_identity_row(self):
+        self.assertEqual(worker_lane.credential("b" * 32, self.ws, {}, self.vault),
+                         ("", f"worker {'b' * 32} has no agent identity row"))
 
     def test_an_unreadable_record_holds_the_running_bridge(self):
         self.declare()
@@ -289,6 +330,51 @@ class TheAgentBridge(Base):
         body = json.loads(decl.read_text())
         decl.write_text(json.dumps(dict(body, env=dict(body["env"], AGENT_CONNECT_TASK_DIR=str(self.ws / "tasks")))))
         self.assertIn("env is not the canonical one", bridge.load(decl, self.agents)[1])
+
+
+class TheLaneKeeper(Base):
+    def keep(self):
+        started = []
+        C.keep_lanes_up(repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
+                        vault=self.vault, spawn=self.bridge_spawn(lambda argv, env, log: started.append(
+                            env["GATEWAY_INSTANCE"])), log=lambda line: None)
+        return started
+
+    def test_a_declared_workers_lane_is_not_started_and_starts_again_after_withdraw(self):
+        lane = self.row["instance"]
+        self.declare()
+        self.assertTrue(worker_lane.declared_bridge(W, self.ws))
+        self.assertNotIn(lane, self.keep(), "the declared bridge serves the worker's agent")
+        self.assertIsNotNone(C.worker_enabled_identity(W, self.ws), "the row stays enabled")
+        self.assertEqual(C.session_proactive_name("proactive-1.txt", {"SUTANDO_WORKER_ID": W}, self.ws),
+                         f"proactive-1.by-{W}.txt", "its session still stamps its own files")
+        self.assertEqual(self.cli("withdraw", "--worker", W)[0], 0)
+        self.assertFalse(worker_lane.declared_bridge(W, self.ws))
+        self.assertEqual(self.keep(), [lane])
+
+    def test_an_invalid_or_unanswerable_declaration_keeps_the_lane(self):
+        lane = self.row["instance"]
+        decl = self.declare()
+        body = json.loads(decl.read_text())
+        decl.write_text(json.dumps(dict(body, name="bridge-other-00000000")))
+        self.assertFalse(worker_lane.declared_bridge(W, self.ws))
+        decl.write_text(json.dumps(body))
+        with mock.patch.object(worker_lane, "declared_bridge", side_effect=OSError("unreadable")):
+            self.assertIn(lane, self.keep())
+        self.assertFalse(worker_lane.declared_bridge("../x", self.ws))
+
+    def test_stop_stops_the_lane_once_and_leaves_the_row(self):
+        spec = importlib.util.spec_from_file_location("connections_cli_wl", ROOT / "scripts" / "connections.py")
+        cli_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli_mod)
+        lane = self.row["instance"]
+        for pid, said in ((4242, f"stopped {lane} (pid 4242)"), (0, f"{lane} was not running")):
+            with mock.patch.object(cli_mod.connections, "stop_bridge", return_value=pid) as stop, \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(cli_mod.main(["--workspace", str(self.ws), "stop", lane]), 0)
+            stop.assert_called_once_with(lane, workspace=self.ws)
+            self.assertEqual(out.getvalue().strip(), said)
+        self.assertIsNotNone(C.worker_enabled_identity(W, self.ws))
 
 
 if __name__ == "__main__":

@@ -47,6 +47,8 @@
   launch INSTANCE --repo DIR --logs-dir DIR [--env-only]
                                start one bridge from the launch plan (--env-only: from the
                                AG2_REMOTE_TOKEN_<INST> variable alone, when the record is unreadable)
+  stop INSTANCE                stop the process holding that bridge's lease, once; the row is unchanged
+                               (the lane keeper starts it again unless a declared bridge serves it)
   start INSTANCE --repo DIR --logs-dir DIR
                                launch unless a bridge already holds the lease; exit 1 naming the
                                reason when it did not start
@@ -262,6 +264,12 @@ def cmd_launch(args) -> int:
     return 0
 
 
+def cmd_stop(args) -> int:
+    pid = connections.stop_bridge(args.instance, workspace=args.workspace)
+    print(f"stopped {args.instance or '(legacy)'} (pid {pid})" if pid else f"{args.instance or '(legacy)'} was not running")
+    return 0
+
+
 def cmd_start(args) -> int:
     record = connections.start(args.instance, repo=args.repo, logs_dir=args.logs_dir, workspace=args.workspace)
     if not record.get("ok"):
@@ -389,6 +397,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_known_servers)
     s = sub.add_parser("launch"); _launch_args(s); s.add_argument("--env-only", action="store_true")
     s.set_defaults(fn=cmd_launch)
+    s = sub.add_parser("stop"); s.add_argument("instance"); s.set_defaults(fn=cmd_stop)
     s = sub.add_parser("start"); _launch_args(s); s.set_defaults(fn=cmd_start)
     s = sub.add_parser("reconnect"); _launch_args(s); s.set_defaults(fn=cmd_reconnect)
     s = sub.add_parser("update-token"); s.add_argument("instance")

@@ -14,6 +14,9 @@ that worker's own (`serving`); `bridge_overlay` then runs it on the core workspa
 and state/ under the worker row's lane instance, exactly as the worker's lane runs, so the two share
 one per-instance poller lock and never poll together.
 
+The token is the row's own (`credential`), read where the lane reads it, so no second copy is stored.
+While a valid declaration exists the lane keeper does not start the worker's lane (`declared_bridge`).
+
 Run as a script: `declare --worker <w>` writes the declaration sparrowd runs that worker's agent bridge
 from (`<workspace>/agents/<segment>.bridge/worker.json`), `withdraw --worker <w>` removes it.
 """
@@ -120,25 +123,45 @@ def bridge_overlay(workspace, instance: str) -> "dict[str, str]":
             "REMOTE_MEDIA_DIR": str(ws / "data" / "remote-media")}
 
 
+def credential(worker: str, workspace, environ, vault=None) -> "tuple[str, str]":
+    """(token, '') for `worker`'s bridge, from its row's own source as its lane reads it
+    (`connections.connection_credential`), or ('', why)."""
+    from connections import ConnectionsError, connection_credential, worker_identity
+    row = worker_identity(worker, Path(workspace))
+    if row is None:
+        return "", f"worker {worker} has no agent identity row"
+    try:
+        return connection_credential(row, environ, vault=vault)[1], ""
+    except ConnectionsError as e:
+        return "", str(e)
+
+
 def _declaration_for(worker: str, workspace) -> "tuple[dict | None, str]":
-    """The declaration fields for `worker`'s agent, or (None, why)."""
+    """Where `worker`'s declaration lives and what it holds, from its identity row's agent, or (None, why)."""
     from connections import WORKER_RE, worker_identity
     if not WORKER_RE.match(worker or ""):
         return None, f"{worker!r} is not a worker id"
     mxid = str((worker_identity(worker, Path(workspace)) or {}).get("agent_mxid") or "")
     if not mxid:
         return None, f"worker {worker} has no agent identity row"
-    _worker, _instance, problem = serving(mxid, workspace)
-    if problem:
-        return None, problem
     from ag2_sparrow import agent_identity
     from ag2_sparrow import connect_bridge as adapter
     segment = agent_identity.root_segment(mxid)
     root = Path(workspace) / "agents" / segment
-    return {"path": adapter.bridge_home(root) / adapter.DECLARATION, "segment": segment,
+    return {"path": adapter.bridge_home(root) / adapter.DECLARATION, "agent": mxid,
             "name": adapter.worker_name(segment), "module": adapter.BRIDGE_MODULE,
-            "env": adapter.bridge_env(str(root), mxid), "token_vault_key": adapter.vault_key(segment),
-            "url_vault_key": adapter.url_vault_key(segment)}, ""
+            "env": adapter.bridge_env(str(root), mxid)}, ""
+
+
+def declared_bridge(worker: str, workspace) -> bool:
+    """Whether `worker`'s agent has a declaration the agent bridge runs as that worker: the one check the
+    lane keeper asks before starting the worker's lane. Raises when the record or the file cannot be read."""
+    import sparrow_agent_bridge
+    decl, _why = _declaration_for(worker, workspace)
+    if decl is None:
+        return False
+    loaded, _why = sparrow_agent_bridge.load(decl["path"], Path(workspace) / "agents")
+    return bool(loaded) and loaded.get("worker") == worker
 
 
 def main(argv=None, workspace=None) -> int:
@@ -151,10 +174,13 @@ def main(argv=None, workspace=None) -> int:
         from workspace_default import resolve_workspace
         workspace = resolve_workspace()
     from ag2_sparrow import gateway_credential_sources as sources
-    try:
-        decl, why = _declaration_for(args.worker, workspace)
-    except RecordUnreadable as e:
-        decl, why = None, str(e)
+    decl, why = _declaration_for(args.worker, workspace)
+    if decl is not None and args.action == "declare":
+        try:
+            why = serving(decl["agent"], workspace)[2]
+        except RecordUnreadable as e:
+            why = str(e)
+        decl = None if why else decl
     if decl is None:
         print(f"worker_lane: {args.action} refused: {why}", file=sys.stderr)
         return 1
@@ -163,17 +189,17 @@ def main(argv=None, workspace=None) -> int:
         if problem:
             print(f"worker_lane: withdraw refused: {problem}", file=sys.stderr)
             return 1
-        print(f"removed: {decl['path']}" if removed else f"nothing declared at {decl['path']}")
+        print(f"removed: {decl['path']} (the lane keeper starts the worker's lane on its next pass)" if removed
+              else f"nothing declared at {decl['path']}")
         return 0
     problem = sources.write_bridge_declaration(
         decl["path"], written_by=WRITTEN_BY, host=DECLARED_HOST, name=decl["name"], module=decl["module"],
-        env=decl["env"], token_vault_key=decl["token_vault_key"])
+        env=decl["env"], token_vault_key="")
     if problem:
         print(f"worker_lane: declare refused: {problem}", file=sys.stderr)
         return 1
-    print(f"declared: {decl['path']} (sparrowd runs it as {decl['name']} on its next scan; vault set "
-          f"{decl['token_vault_key']} <the worker's relay token>, and {decl['url_vault_key']} <its gateway URL> "
-          "if that token is a bare secret)")
+    print(f"declared: {decl['path']} (sparrowd runs it as {decl['name']} on its next scan, with the token its "
+          "connection row names; the lane keeper no longer starts the worker's lane)")
     return 0
 
 
