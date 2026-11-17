@@ -2250,9 +2250,14 @@ def task_home(task_id: str, workspace: Optional[Path] = None) -> dict:
 
 
 def _holds_task(tasks_dir: Path, task_id: str) -> bool:
+    """Whether `tasks_dir` holds `task_id`'s task file: live under any claimed or assigned name, or archived."""
     import local_task_protocol
+    import task_archive
+    if not local_task_protocol.valid_archive_lookup_id(task_id):
+        return False
     try:
-        return local_task_protocol.find_archived_task(tasks_dir, task_id) is not None
+        return (task_archive.find_task_file(tasks_dir, task_id) or
+                local_task_protocol.find_archived_task(tasks_dir, task_id)) is not None
     except (OSError, ValueError):
         return False
 
