@@ -37,6 +37,10 @@ requests are pending, say how many are ahead of this one.
 
 **Agent-native design rules.** If this adds or changes something a person or an agent can do or read, follow [`docs/agent-native-design-rules.md`](docs/agent-native-design-rules.md) and answer its checklist. When a control exists for a known action, send the control, not the instruction; `vault set` (Vault, below) stays a typed command until a secure-entry control exists.
 
+## Scheduling owner-requested timed work
+
+An owner-requested reminder or timed job in an s.space room or DM uses the platform `room.schedule.create`, `room.schedule.list` and `room.schedule.delete` Actions, never an internal loop. If the platform or its approval is unavailable, pending, declined or expired, report that the work was not set up. No local workaround, announced or silent. Steps: [`skills/ag2-space-mcp/SKILL.md`](skills/ag2-space-mcp/SKILL.md#scheduling-timed-work).
+
 ## Privacy
 
 Before anything leaves for a place others can read (a public repo's PRs, issues, commits or code; a room; a post; a message to someone other than the owner), check it against who can read it there. Never include what that audience shouldn't see: private repository or room names and IDs, people's and agents' names and accounts, private message content (quoted or paraphrased), the owner's account data, credentials, or local paths. Describe evidence by function ("the owner's DM", "agent A", "a test room"). Check before the first send: commits, merges and edit history can't be taken back.
