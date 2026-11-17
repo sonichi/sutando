@@ -159,6 +159,53 @@ class WorkerWithOwnAgent(Base):
         self.assertEqual(ops.mentions(), [])
 
 
+    def test_an_unlistable_joined_rooms_still_tries_the_recorded_room(self):
+        ops = FakeRoomOps({"!triage:x": [WAGENT, "@sutando-rui:x", "@sutando-kim:x"]})
+
+        def run(argv, **kw):
+            if argv[2] == "rooms":
+                ops.calls.append(["rooms"])
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+            return FakeRoomOps.__call__(ops, argv, **kw)
+        conns = fake_connections(WORKER, self.ROW, {"!triage:x": self.ROW})
+        rc, out, err = self.run_main(run, conns)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("joined rooms could not be listed", err)
+        self.assertEqual([c[3] for c in ops.mentions()], ["!triage:x", "!triage:x"])
+
+
+class RoomOpsReader(Base):
+    """An unusable room_ops answer is unread, never an empty list."""
+
+    def _read(self, rc, stdout):
+        run = lambda argv, **kw: types.SimpleNamespace(returncode=rc, stdout=stdout, stderr="")
+        with patch.object(self.mod.subprocess, "run", run):
+            return self.mod.room_members("!a:x"), self.mod.worker_joined_rooms()
+
+    def test_a_failed_call_is_unread(self):
+        (ids, why), (rooms, rwhy) = self._read(1, "")
+        self.assertIsNone(ids)
+        self.assertIn("members rc=1", why)
+        self.assertEqual(rooms, [])
+        self.assertIn("rooms rc=1", rwhy)
+
+    def test_unparseable_and_non_object_output_is_unread(self):
+        (ids, why), _ = self._read(0, "not json")
+        self.assertIsNone(ids)
+        self.assertIn("unparseable members", why)
+        (ids, why), _ = self._read(0, "[1]")
+        self.assertIsNone(ids)
+        self.assertIn("non-object members", why)
+
+    def test_a_raising_call_is_unread(self):
+        def boom(argv, **kw):
+            raise OSError("gone")
+        with patch.object(self.mod.subprocess, "run", boom):
+            ids, why = self.mod.room_members("!a:x")
+        self.assertIsNone(ids)
+        self.assertIn("OSError", why)
+
+
 class CorePathUnchanged(Base):
     def _core_run(self, conns):
         ops = FakeRoomOps({"!triage:x": ["@sutando-rui:x", "@sutando-kim:x"]}, joined=["!other:x"])
