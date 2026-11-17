@@ -11237,12 +11237,14 @@ def _stuck_poll_restart_due(now: float) -> bool:
 
 # Set once a stuck-poll exit has begun: the loop then only waits for the outbound worker.
 _STUCK_EXIT_PENDING = False
+# Set when that exit may proceed: main() returns the code so run() exits through _exit_bounded.
+_STUCK_EXIT_READY = False
 
 
 def _on_poll_timeout(inflight: set[str], before_exit: Callable[[], bool]) -> bool:
-    """Count one held task poll; exit for a relaunch once that makes a stuck session.
-    True while the exit waits for the outbound worker: the caller must skip the beat."""
-    global _STUCK_EXIT_PENDING
+    """Count one held task poll; mark the exit ready once that makes a stuck session.
+    True while the exit waits or is ready: the caller must skip the beat."""
+    global _STUCK_EXIT_PENDING, _STUCK_EXIT_READY
     if not _STUCK_EXIT_PENDING:
         if not _stuck_poll_restart_due(time.time()):
             return False
@@ -11254,7 +11256,8 @@ def _on_poll_timeout(inflight: set[str], before_exit: Callable[[], bool]) -> boo
     _save_inflight(inflight)  # claimed tasks reload from it on start
     _log(f"stuck relay poll: exiting {STUCK_POLL_EXIT_CODE} so {POLL_STALL_RESTART_OWNER} "
          "relaunches the bridge")
-    sys.exit(STUCK_POLL_EXIT_CODE)
+    _STUCK_EXIT_READY = True
+    return True
 
 
 def _awake_note(wall_s: float, awake_s: float) -> str:
@@ -11427,6 +11430,8 @@ def main() -> int | None:
         try:
             if _abort_if_poll_stalled(stall_anchor, stop_workers):
                 continue
+            if _STUCK_EXIT_READY:
+                return STUCK_POLL_EXIT_CODE
             if _STUCK_EXIT_PENDING and _on_poll_timeout(inflight, stop_workers):
                 continue
             if _LOCK_LOST.is_set() or not _heartbeat_singleton():
@@ -11465,7 +11470,7 @@ def main() -> int | None:
             except (TimeoutError, socket.timeout):
                 # Read timeout only (URLError takes the outage path below).
                 # socket.timeout only aliases TimeoutError on 3.10+, not 3.9.
-                if _on_poll_timeout(inflight, stop_workers):  # may exit
+                if _on_poll_timeout(inflight, stop_workers):  # may mark the exit ready
                     continue
                 if not _poll_timeout_is_empty(poll_grace_since, time.time()):
                     raise

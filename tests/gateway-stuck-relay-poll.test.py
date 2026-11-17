@@ -151,7 +151,8 @@ class _Bridge:
         names = ("TOKEN", "URL", "time", "_acquire_singleton", "_heartbeat_singleton", "_req",
                  "_log", "_emit_gateway_status", "GATEWAY_STATUS_FILE", "STUCK_POLL_RECOVERY_FILE",
                  "_last_heartbeat_at", "_heartbeat_retry_at", "_ack_disabled_until",
-                 "POLL_STALL_RESTART_OWNER", "_STUCK_EXIT_PENDING") + self._NOOP
+                 "POLL_STALL_RESTART_OWNER", "_STUCK_EXIT_PENDING", "_STUCK_EXIT_READY",
+                 "_exit_bounded") + self._NOOP
         for n in names:
             self._saved[n] = getattr(gw, n, None)
         # Absent before the fix: the harness must run there so the asserts can fail.
@@ -159,10 +160,13 @@ class _Bridge:
         self._req_ok = dict(getattr(gw, "_LAST_REQ_OK", {}))
         gw._OUTBOUND_STOP.clear()
         gw._OUTBOUND_WAKE.clear()
+        # An earlier case's lock-heartbeat thread can set it; this case starts holding the lock.
+        gw._LOCK_LOST.clear()
         gw.TOKEN, gw.URL = "secret", self.relay.url
         # The exit is armed only where something relaunches the bridge (the launchd plist).
         gw.POLL_STALL_RESTART_OWNER = self.owner
         gw._STUCK_EXIT_PENDING = False
+        gw._STUCK_EXIT_READY = False
         self.clock = gw.time = _Clock(gw)
         gw._acquire_singleton = lambda *a, **k: True
         gw._last_heartbeat_at = gw._heartbeat_retry_at = gw._ack_disabled_until = 0.0
@@ -211,14 +215,15 @@ class _Bridge:
         gw._OUTBOUND_STOP.set(); gw._OUTBOUND_WAKE.set()
         return False
 
-    def run(self, passes: int):
+    def run(self, passes: int, entry=None):
         alive = [True] * passes + [False]
         self.gw._heartbeat_singleton = lambda *a, **k: alive.pop(0) if alive else False
         try:
-            self.gw.main()
-        except SystemExit as e:
+            code = (entry or self.gw.main)()
+        except SystemExit as e:   # the stall exit still leaves through sys.exit
             return e.code
-        return None
+        # The harness ends the loop by dropping the poller lock.
+        return None if code == getattr(self.gw, "LOCK_LOST_EXIT_CODE", None) else code
 
 
 class StuckRelayPollTest(unittest.TestCase):
@@ -296,6 +301,13 @@ class StuckRelayPollTest(unittest.TestCase):
         self.assertIs(last["connected"], False)
         stuck_lines = [m for m in b.logs if m.startswith("stuck relay poll: ") and "consecutive" in m]
         self.assertEqual(len(stuck_lines), 1, "logged once per episode")
+
+    def test_the_stuck_poll_exit_leaves_through_the_bounded_exit(self):
+        handed = []
+        with _Bridge(self.gw, self.relay, self.root) as b:
+            self.gw._exit_bounded = handed.append
+            rc = b.run(passes=self.n(), entry=self.gw.run)
+        self.assertEqual(handed, [self.code()], f"run() never handed the exit to _exit_bounded (rc={rc})")
 
     def test_a_poll_answered_with_an_error_ends_the_timeout_streak(self):
         # N-1 held polls, one answered 502, one more held: N timeouts, never N in a row.
