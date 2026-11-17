@@ -588,4 +588,4 @@ STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
     __name__ = "__main__"
     VOICE_ROOM_VERIFIER.start()
-    main()  # noqa: F821  (defined by the exec above)
+    run()  # noqa: F821  (defined by the exec above)

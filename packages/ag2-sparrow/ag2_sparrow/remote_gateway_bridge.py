@@ -10887,6 +10887,31 @@ def _start_lock_heartbeat() -> None:
                          daemon=True).start()
 
 
+# Not 0 (a supervisor reads it as a deliberate stop) and not 75 (stand-down): restart me.
+LOCK_LOST_EXIT_CODE = 70
+# Exit hooks wait on flocks and a push join; past this the process ends without them.
+_EXIT_HOOKS_BOUND_S = 30.0
+
+
+def _force_exit(code: int) -> None:
+    line = (f"[remote-gateway-bridge] exit {code} still pending after {_EXIT_HOOKS_BOUND_S:g}s "
+            "(an exit hook or shutdown is hung) — forcing it\n")
+    for flush in (lambda: os.write(2, line.encode()), sys.stdout.flush, sys.stderr.flush):
+        try:
+            flush()
+        except Exception:  # noqa: BLE001 — nothing may stand between this and the exit
+            pass
+    os._exit(code)
+
+
+def _exit_bounded(code: int) -> None:
+    """sys.exit(code), but no hung exit hook or interpreter shutdown can hold the process open."""
+    t = threading.Timer(_EXIT_HOOKS_BOUND_S, _force_exit, args=(code,))
+    t.daemon = True
+    t.start()
+    sys.exit(code)
+
+
 def _exit_on_signal(signum, _frame) -> None:
     """Exit 0 as before, but say which signal ended the process."""
     line = f"[remote-gateway-bridge] received {signal.Signals(signum).name} — exiting"
@@ -11149,7 +11174,8 @@ def _abort_if_poll_stalled(anchor: float,
     sys.exit(POLL_STALL_EXIT_CODE)
 
 
-def main() -> None:
+def main() -> int | None:
+    """Serve until the process must end; a returned code is one a supervisor should restart on."""
     # This process holds the gateway URL: nothing uncaught, in any thread, prints it raw.
     gateway_instance.install_scrubbing_excepthooks(lambda: URL)
     if _FOUND.fatal:
@@ -11245,7 +11271,7 @@ def main() -> None:
                          "waiting for it to stop before exiting")
                     _LOCK_LOST.set()  # the next pass must come back here, never poll
                     continue
-                return
+                return LOCK_LOST_EXIT_CODE
             _post_heartbeat(inflight)
             _retry_withheld_reviews()
             # LAST of the beat's work, on a daemon thread: two optional 15 s
@@ -11339,5 +11365,12 @@ def main() -> None:
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
 
 
+def run() -> None:
+    """Process entry: main(), then a bounded exit with the code it returned."""
+    code = main()
+    if code:
+        _exit_bounded(code)
+
+
 if __name__ == "__main__":
-    main()
+    run()
