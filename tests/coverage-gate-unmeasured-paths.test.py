@@ -202,6 +202,33 @@ class FullGateUnmeasuredPaths(unittest.TestCase):
         self.assertEqual(sum(args[0] == "json" for args in self._calls("coverage-calls.jsonl")), 1)
         self.assertEqual(len(self._calls("helper-calls.jsonl")), 1)
 
+    def _assert_literal_paths_preserve_verdict(self, status):
+        paths = {
+            "outside/a file.py",
+            "outside/ leading and trailing .py",
+            "outside/star*.py",
+            "outside/query?.py",
+            "outside/[ab].py",
+            "outside/$cash;quote'.py",
+        }
+        for name in paths:
+            (self.repo / name).write_text("value = 1\n")
+        self._git("add", "outside")
+        self._git("commit", "-qm", "literal filename fixture")
+        for name in ("outside/star-match.py", "outside/query1.py", "outside/a.py"):
+            (self.repo / name).write_text("untracked = 1\n")
+        output, summary = self._assert_summary(self._run_gate(diff_cover_rc=status), status)
+        expected = sorted(UNMEASURED | paths)
+        self.assertEqual([line[2:] for line in output.splitlines() if line.startswith("  ")],
+                         expected, output)
+        self.assertEqual(re.findall(r"(?m)^-\s+`([^`]+)`$", summary), expected, summary)
+
+    def test_literal_paths_preserve_a_passing_gate(self):
+        self._assert_literal_paths_preserve_verdict(0)
+
+    def test_literal_paths_preserve_a_failing_gate(self):
+        self._assert_literal_paths_preserve_verdict(7)
+
     def _assert_json_failure_preserves_verdict(self, status):
         (self.repo / "coverage.json").write_text(json.dumps({"files": {}}))
         result = self._run_gate(json_rc=23, diff_cover_rc=status)
