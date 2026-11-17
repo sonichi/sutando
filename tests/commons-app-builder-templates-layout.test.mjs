@@ -106,6 +106,43 @@ const FIXTURES = {
     rows: [{ id: 'm1', cells: { Game: 1, Seat: 'X', Row: 1, Col: 1 } }],
     state: { 'seat.X': { id: 'u1', name: LONG_NAME }, 'seat.O': { id: 'u2', name: LONG_NAME } },
   },
+  // Two databases and the viewer's own agents: a long unbroken source link, a long agent name.
+  'research-desk': {
+    db: 'Research Desk — Findings',
+    props: [
+      { id: 't', name: 'Finding', type: 'title' },
+      { id: 'p', name: 'Topic', type: 'text' },
+      { id: 's', name: 'Source', type: 'url' },
+      { id: 'b', name: 'Basis', type: 'text' },
+      { id: 'c', name: 'Change', type: 'text' },
+      { id: 'st', name: 'State', type: 'status', options: [{ name: 'Proposed', group: 'todo' }, { name: 'Accepted', group: 'done' }] },
+      { id: 'cb', name: 'Created by', type: 'created_by' },
+    ],
+    rows: [{ id: 'r1', cells: { Finding: LONG_TITLE, Topic: LONG_OPTION, Source: 'https://example.org/' + LONG, Basis: LONG, Change: LONG, 'Created by': ['@me:x'] } }],
+    extra: { d2: { name: 'Research Desk — Reviews', props: [
+      { id: 't', name: 'Review', type: 'title' }, { id: 'f', name: 'Finding', type: 'text' },
+      { id: 'v', name: 'Verdict', type: 'select', options: [{ name: 'Accepted' }, { name: 'Rejected' }] },
+      { id: 'cb', name: 'Created by', type: 'created_by' }],
+      rows: [{ id: 'v1', cells: { Review: 'x', Finding: 'r1', Verdict: 'Accepted', 'Created by': ['@me:x'] } }] } },
+    members: [{ id: 'u1', name: LONG_NAME, avatar: null, kind: 'human' }],
+    agents: [{ id: 'u' + 'a'.repeat(64), name: LONG_NAME, kind: 'agent' }],
+  },
+  'task-board': {
+    db: 'Task Board — Tasks',
+    props: [
+      { id: 't', name: 'Task', type: 'title' },
+      { id: 's', name: 'Status', type: 'status', options: [
+        { name: 'Requested', group: 'todo' }, { name: 'Working', group: 'doing' },
+        { name: 'Blocked', group: 'doing' }, { name: LONG_OPTION, group: 'done' }] },
+      { id: 'b', name: 'Blocker', type: 'text' },
+      { id: 'r', name: 'Result', type: 'text' },
+      { id: 'a', name: 'Actor', type: 'person' },
+      { id: 'cb', name: 'Created by', type: 'created_by' },
+    ],
+    rows: [{ id: 'r1', cells: { Task: LONG_TITLE, Status: 'Blocked', Blocker: LONG, Result: LONG, Actor: ['@me:x'] } }],
+    members: [{ id: 'u1', name: LONG_NAME, avatar: null, kind: 'human' }],
+    agents: [{ id: 'u' + 'a'.repeat(64), name: LONG_NAME, kind: 'agent', userId: '@x:y' }],
+  },
 };
 
 const harness = (f) => `
@@ -115,20 +152,23 @@ window.artifact = (() => {
   const props = ${JSON.stringify(f.props)};
   const state = new Map(Object.entries(${JSON.stringify(f.state || {})}));
   const snap = () => ({ id: 'd1', name: ${JSON.stringify(f.db)}, props, rows });
+  const extra = ${JSON.stringify(f.extra || {})};
   return {
     ready: Promise.resolve(),
     me: { id: 'u1', name: 'Tester', kind: 'human' },
     app: { id: 'a1', name: 'T', database: 'd1' },
     now: () => Date.parse('2026-11-11T12:00:00Z'),
-    members: async () => [],
+    members: async () => ${JSON.stringify(f.members || [])},
     personId: async (c) => (c && c[0] === '@me:x' ? 'u1' : null),
     state: { get: async (k) => state.get(k), set: async () => ({ ok: true }),
              delete: async () => ({ ok: true }), keys: async () => [...state.keys()],
              all: async () => ({}), on: () => () => {} },
     emit: () => {}, on: () => () => {},
     pages: { list: async () => [], read: async () => null },
-    db: { list: async () => [{ id: 'd1', name: ${JSON.stringify(f.db)} }],
-          read: async () => snap(), write: async () => ({ ok: true }),
+    agent: { list: async () => ${JSON.stringify(f.agents || [])}, sendTask: async () => ({ ok: true, eventId: 't1' }) },
+    db: { list: async () => [{ id: 'd1', name: ${JSON.stringify(f.db)} }].concat(
+            Object.entries(extra).map(([id, d]) => ({ id, name: d.name }))),
+          read: async (id) => (extra[id] ? Object.assign({ id }, extra[id]) : snap()), write: async () => ({ ok: true }),
           createRow: async () => ({ ok: true, rowId: 'r9' }), onChange: () => () => {} },
   };
 })();

@@ -414,10 +414,13 @@ Request: "Build a Commons app: sign-ups for Saturday's cleanup, morning or after
 
 ## Starter templates
 
-`templates/` holds four working apps to start from, each a `page.html` with its
+`templates/` holds six working apps to start from, each a `page.html` with its
 `schema.json`: a **tracker** (status, owner, due date, and an agent on a row), a **poll**
 (one row per vote, ownership through `created_by`), a **planner** (dated items in a week
-view) and a **two-player turn game** (append-only moves, the turn from the move count).
+view), a **two-player turn game** (append-only moves, the turn from the move count), a
+**research desk** (sourced findings that stay proposed until a person accepts them, a report,
+and "ask my agent") and a **task board** (a person hands a task to their own agent, which
+reports on the row).
 `templates/README.md` says which to pick and how to create one. Copy and adapt rather than
 starting from an empty file, then still follow steps 2, 6 and 7 for the app you ship.
 

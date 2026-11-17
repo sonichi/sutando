@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Task Board</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfd; --card: #fff; --ink: #16161a; --dim: #5d5d6b;
+    --line: #e3e3ea; --accent: #2f5bea; --warn: #8a5a00; --bad: #b3261e;
+    --todo: #B7B2AD; --doing: #8A5911; --done: #06813D;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111115; --card: #1a1a20; --ink: #f2f2f5; --dim: #a6a6b4;
+      --line: #2c2c36; --accent: #7d9bff; --warn: #ffcf70; --bad: #ff8a80;
+      --todo: #B7B2AD; --doing: #F0E345; --done: #9EE2BF;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 12px; background: var(--bg); color: var(--ink);
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  h1 { font-size: 19px; margin: 0 0 2px; }
+  h2 { font-size: 15px; margin: 4px 0 8px; color: var(--dim); overflow-wrap: anywhere; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 12px; overflow-wrap: anywhere; }
+  .note { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); margin-bottom: 10px; font-size: 14px; overflow-wrap: anywhere; }
+  .note.bad { border-color: var(--bad); color: var(--bad); }
+  .note.warn { border-color: var(--warn); color: var(--warn); }
+  .add { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; margin-bottom: 8px; }
+  .add > * { min-width: 0; max-width: 100%; }
+  input, select, button {
+    font: inherit; color: inherit; min-height: 44px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--card); padding: 0 12px;
+  }
+  button { min-height: 44px; min-width: 44px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button[disabled] { opacity: .55; cursor: not-allowed; }
+  .small { font-size: 13px; color: var(--dim); overflow-wrap: anywhere; margin-bottom: 14px; }
+  .cols { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+  .items { display: grid; gap: 10px; list-style: none; margin: 0; padding: 0; }
+  .item { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; min-width: 0; }
+  .top { flex-wrap: wrap; display: flex; gap: 8px; align-items: baseline; justify-content: space-between; min-width: 0; }
+  .name { font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
+  .chip { max-width: 100%; min-width: 0; overflow-wrap: anywhere; display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--card); color: var(--ink); white-space: normal; }
+  .chip::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--dot, var(--todo)); }
+  .chip.todo { --dot: var(--todo); } .chip.doing { --dot: var(--doing); } .chip.done { --dot: var(--done); }
+  /* Blocker and Result are agent-written: long tokens wrap, never widen the page. */
+  .meta { color: var(--dim); font-size: 13px; margin-top: 6px; overflow-wrap: anywhere; min-width: 0; }
+  .meta.blocked { color: var(--warn); }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .row > * { min-width: 0; max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
+  details { margin-top: 16px; font-size: 14px; }
+  details li { overflow-wrap: anywhere; }
+  @media (min-width: 720px) {
+    .add { grid-template-columns: 2fr 1fr auto; align-items: start; }
+    .cols { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  }
+</style>
+</head>
+<body>
+<h1>Task Board</h1>
+<div class="sub" id="sub">Loading…</div>
+<div id="notes"></div>
+<div class="add">
+  <input id="title" placeholder="What needs doing?" aria-label="Task" autocomplete="off">
+  <select id="who" aria-label="Who does it"></select>
+  <button class="primary" id="add" disabled>Add task</button>
+</div>
+<div class="small" id="who-help">Pick one of your own agents. If it is in this room, the task is named on the row and the agent reports its status, blocker and result here. If it is not, the task goes to your private DM with it after you confirm the text, and this board cannot show its progress.</div>
+<div class="cols" id="cols"></div>
+<details>
+  <summary>What this board cannot show yet</summary>
+  <ul>
+    <li>A task sent to an agent outside the room: no status, blocker or result comes back to the board. Its answer arrives in your private DM with it.</li>
+    <li>Whether a request reached your agent beyond "sent": there is no completion tracking for agent requests yet.</li>
+    <li>Which agent is working on a row right now, unless the agent itself sets Status to Working.</li>
+    <li>Anyone with edit rights can still change any row in the table view: the board shows what the row says.</li>
+  </ul>
+</details>
+<script>
+(async () => {
+  const art = window.artifact;
+  const db = art && art.db;
+  const $ = (id) => document.getElementById(id);
+  const notes = $('notes');
+  const show = (cls, text) => {
+    const el = document.createElement('div');
+    el.className = 'note ' + cls;
+    el.textContent = text;
+    notes.appendChild(el);
+  };
+  const clearNotes = () => { notes.textContent = ''; };
+  let hintShown = false;
+  const hint = (text) => { if (!hintShown) { hintShown = true; show('warn', text); } };
+
+  if (!db) {
+    $('sub').textContent = 'Preview';
+    show('warn', 'Open this page in s.space to use it: this is a preview with no data.');
+    $('add').disabled = true;
+    return;
+  }
+  await art.ready;
+
+  // GUIDE step 3: never hard-code a database id.
+  const byName = (list, name) => (list.find((d) => d.name === name) || {}).id;
+  let dbs = [];
+  try { dbs = await db.list(); } catch (e) { show('bad', e.message); return; }
+  const id = (art.app && art.app.database) || byName(dbs, 'Task Board — Tasks');
+  if (!id) { $('sub').textContent = ''; show('bad', 'The "Task Board — Tasks" database is missing from this room.'); $('add').disabled = true; return; }
+
+  const save = async (call) => {
+    const until = Date.now() + 120000;
+    for (;;) {
+      const r = await call();
+      if (r.ok || !/waiting for the viewer|rate limit|too many/i.test(r.reason || '') || Date.now() > until) return r;
+      hint('Allow this page to edit data in this room, and it will save.');
+      await new Promise((ok) => setTimeout(ok, 1500));
+    }
+  };
+
+  const GROUP = Object.assign(Object.create(null),
+    { Requested: 'todo', Working: 'doing', Blocked: 'doing', Done: 'done' });
+  let titleProp = null, statusOpts = [], busy = false, snapshot = null, generation = 0;
+
+  // ---- your own agents. userId is present only when the agent is a member of this room.
+  let agents = [];
+  const fillAgents = async () => {
+    try { agents = (art.agent && await art.agent.list()) || []; } catch (e) { agents = []; }
+    const sel = $('who');
+    const want = sel.value;
+    sel.textContent = '';
+    const none = document.createElement('option');
+    none.value = ''; none.textContent = 'No agent (a person does it)';
+    sel.appendChild(none);
+    agents.forEach((a) => {
+      const opt = document.createElement('option');
+      opt.value = a.id;
+      opt.textContent = a.userId ? a.name + ' (in this room)' : a.name + ' (asked in your DM)';
+      sel.appendChild(opt);
+    });
+    sel.value = agents.some((a) => a.id === want) ? want : '';
+  };
+
+  // A person cell holds account ids; members() and personId() name it once the viewer allows.
+  const nameOf = async (cell, members) => {
+    if (!cell || !cell.length) return null;
+    if (!members) return '?';
+    try {
+      const pid = await art.personId(cell);
+      const m = pid && members.get(pid);
+      return m ? m.name : 'someone';
+    } catch (e) { return '?'; }
+  };
+
+  const draw = (snap, actors) => {
+    clearNotes();
+    hintShown = false;
+    titleProp = (snap.props.find((p) => p.type === 'title') || {}).name;
+    const status = snap.props.find((p) => p.name === 'Status');
+    statusOpts = (status && status.options) || [];
+    $('add').disabled = !titleProp || busy;
+    if (!titleProp) show('bad', 'This database has no title column, so tasks cannot be named.');
+    $('sub').textContent = snap.rows.length + (snap.rows.length === 1 ? ' task' : ' tasks');
+
+    const cols = $('cols');
+    cols.textContent = '';
+    const names = statusOpts.length ? statusOpts.map((o) => o.name) : ['Requested', 'Working', 'Blocked', 'Done'];
+    if (!snap.rows.length) {
+      const p = document.createElement('div');
+      p.className = 'note';
+      p.textContent = 'No tasks yet. Add the first one above and pick who does it.';
+      cols.appendChild(p);
+      return;
+    }
+    names.forEach((colName) => {
+      const col = document.createElement('section');
+      const h = document.createElement('h2');
+      const rows = snap.rows.filter((r) => (r.cells.Status || names[0]) === colName);
+      h.textContent = colName + ' (' + rows.length + ')';
+      col.appendChild(h);
+      const ul = document.createElement('ul');
+      ul.className = 'items';
+      rows.forEach((row) => {
+        const li = document.createElement('li');
+        li.className = 'item';
+        const top = document.createElement('div');
+        top.className = 'top';
+        const name = document.createElement('span');
+        name.className = 'name';
+        name.textContent = (titleProp && row.cells[titleProp]) || 'Untitled';
+        const st = row.cells.Status || names[0];
+        const chip = document.createElement('span');
+        chip.className = 'chip ' + (typeof GROUP[st] === 'string' ? GROUP[st] : 'todo');
+        chip.textContent = st;
+        top.appendChild(name); top.appendChild(chip);
+        li.appendChild(top);
+        const actor = actors.get(row.id);
+        const m = document.createElement('div');
+        m.className = 'meta';
+        m.textContent = actor ? 'Agent: ' + actor : 'No agent named on this row';
+        li.appendChild(m);
+        if (row.cells.Blocker) {
+          const b = document.createElement('div');
+          b.className = 'meta blocked';
+          b.textContent = 'Blocked on: ' + row.cells.Blocker;
+          li.appendChild(b);
+        }
+        if (row.cells.Result) {
+          const r = document.createElement('div');
+          r.className = 'meta';
+          r.textContent = 'Result: ' + row.cells.Result;
+          li.appendChild(r);
+        }
+        const actions = document.createElement('div');
+        actions.className = 'row';
+        statusOpts.filter((o) => o.name !== st).forEach((o) => {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.textContent = o.name;
+          b.setAttribute('aria-label', 'Set ' + name.textContent + ' to ' + o.name);
+          b.disabled = busy;
+          b.onclick = () => setStatus(row, o.name);
+          actions.appendChild(b);
+        });
+        li.appendChild(actions);
+        ul.appendChild(li);
+      });
+      col.appendChild(ul);
+      cols.appendChild(col);
+    });
+  };
+
+  const render = async (snap) => {
+    const gen = ++generation;
+    snapshot = snap;
+    if (!snap) { clearNotes(); $('cols').textContent = ''; $('sub').textContent = ''; show('bad', 'The Task Board database was removed from this room.'); $('add').disabled = true; return; }
+    let members = null;
+    try { members = new Map((await art.members()).map((m) => [m.id, m])); } catch (e) { members = null; }
+    const actors = new Map();
+    for (const row of snap.rows) {
+      const n = await nameOf(row.cells.Actor, members);
+      if (n) actors.set(row.id, n);
+    }
+    if (gen !== generation) return;
+    draw(snap, actors);
+    if (!members) show('warn', 'Allow the page to see who is who, and the agents on each row will fill in.');
+  };
+
+  const setStatus = async (row, value) => {
+    if (busy) return;
+    busy = true;
+    let r = { ok: false, reason: '' };
+    try {
+      r = await save(() => db.write(id, row.id, 'Status', value));
+    } catch (e) {
+      r = { ok: false, reason: e.message || 'The change was refused.' };
+    } finally {
+      busy = false;
+      if (snapshot) await render(snapshot);
+    }
+    if (!r.ok) show('bad', r.reason || 'The change was refused.');
+  };
+
+  db.onChange(id, render);                 // subscribe, then read: no edit is missed between them
+  try { await render(await db.read(id)); } catch (e) { $('sub').textContent = ''; show('bad', e.message); }
+  await fillAgents();
+
+  const pendingKeys = new Map();
+  $('add').onclick = async () => {
+    if (busy) return;
+    const text = $('title').value.trim();
+    if (!text || !titleProp) return;
+    const agent = agents.find((a) => a.id === $('who').value) || null;
+    const values = { Status: 'Requested' };
+    values[titleProp] = text;
+    // An agent in the room is named on the row: the row summons it, and it reports here.
+    if (agent && agent.userId) values.Actor = [agent.userId];
+    busy = true;
+    $('add').disabled = true;
+    let r = { ok: false, reason: '' };
+    try {
+      r = await save(() => db.createRow(id, values));
+    } catch (e) {
+      r = { ok: false, reason: e.message || 'The task was not saved.' };
+    } finally {
+      busy = false;
+      if (snapshot) await render(snapshot);
+    }
+    if (!r.ok) { show('bad', r.reason || 'The task was not saved.'); return; }
+    if ($('title').value.trim() === text) $('title').value = '';
+    if (!agent || agent.userId) return;
+    // An agent outside the room: ask it in your private DM, after you confirm the text.
+    const what = 'row:' + r.rowId;
+    const key = pendingKeys.get(what) || ('task-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e6).toString(36));
+    pendingKeys.set(what, key);
+    const request = { agentId: agent.id, text: 'Task from the Task Board app: ' + text.slice(0, 500)
+      + '\nIf you can, set its Status, Blocker and Result on its row in the Task Board table so the room can see them.', key, actionId: 'task' };
+    if (r.rowId && /^d[a-z0-9]{1,24}$/.test(id)) request.row = { database: id, rowId: r.rowId };
+    let sent;
+    try { sent = await art.agent.sendTask(request); } catch (e) { sent = { ok: false, reason: e.message }; }
+    if (sent && sent.ok) {
+      pendingKeys.delete(what);
+      show('warn', 'Sent to ' + agent.name + ' in your private DM. This board cannot show its progress or result unless the agent updates the row.');
+    } else {
+      show('bad', 'The task was added, but not sent to ' + agent.name + ': ' + ((sent && sent.reason) || 'unknown reason') + '.');
+    }
+  };
+  $('title').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('add').click(); });
+})();
+</script>
+</body>
+</html>

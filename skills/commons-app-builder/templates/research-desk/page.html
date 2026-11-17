@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Research Desk</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfd; --card: #fff; --ink: #16161a; --dim: #5d5d6b;
+    --line: #e3e3ea; --accent: #2f5bea; --warn: #8a5a00; --bad: #b3261e;
+    --todo: #B7B2AD; --doing: #8A5911; --done: #06813D;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111115; --card: #1a1a20; --ink: #f2f2f5; --dim: #a6a6b4;
+      --line: #2c2c36; --accent: #7d9bff; --warn: #ffcf70; --bad: #ff8a80;
+      --todo: #B7B2AD; --doing: #F0E345; --done: #9EE2BF;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 12px; background: var(--bg); color: var(--ink);
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  h1 { font-size: 19px; margin: 0 0 2px; }
+  h2 { font-size: 16px; margin: 14px 0 6px; overflow-wrap: anywhere; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 12px; overflow-wrap: anywhere; }
+  .note { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); margin-bottom: 10px; font-size: 14px; overflow-wrap: anywhere; }
+  .note.bad { border-color: var(--bad); color: var(--bad); }
+  .note.warn { border-color: var(--warn); color: var(--warn); }
+  .tabs { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+  .tabs button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  .add { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; margin-bottom: 14px; }
+  .add > * { min-width: 0; max-width: 100%; }
+  input, select, textarea, button {
+    font: inherit; color: inherit; min-height: 44px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--card); padding: 0 12px;
+  }
+  textarea { padding: 10px 12px; min-height: 60px; }
+  button { min-height: 44px; min-width: 44px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button[disabled] { opacity: .55; cursor: not-allowed; }
+  .items { display: grid; gap: 10px; list-style: none; margin: 0; padding: 0; }
+  .item { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; min-width: 0; }
+  .top { flex-wrap: wrap; display: flex; gap: 8px; align-items: baseline; justify-content: space-between; min-width: 0; }
+  .name { font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
+  .chip { max-width: 100%; min-width: 0; overflow-wrap: anywhere; display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 9px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--card); color: var(--ink); white-space: normal; }
+  .chip::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--dot, var(--todo)); }
+  .chip.todo { --dot: var(--todo); } .chip.done { --dot: var(--done); } .chip.doing { --dot: var(--doing); }
+  /* Source, basis and agent-written text are other people's: long tokens wrap, never widen. */
+  .meta { color: var(--dim); font-size: 13px; margin-top: 6px; overflow-wrap: anywhere; min-width: 0; }
+  .meta a { color: var(--accent); overflow-wrap: anywhere; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .row > * { min-width: 0; max-width: 100%; overflow-wrap: anywhere; white-space: normal; }
+  .ask { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; margin-bottom: 14px; padding: 10px; border: 1px dashed var(--line); border-radius: 12px; }
+  .ask > * { min-width: 0; max-width: 100%; }
+  .small { font-size: 13px; color: var(--dim); overflow-wrap: anywhere; }
+  @media (min-width: 720px) {
+    .add { grid-template-columns: 2fr 1fr 1fr; align-items: start; }
+    .add textarea { grid-column: span 3; }
+    .ask { grid-template-columns: 2fr 1fr auto; align-items: start; }
+    .ask .small { grid-column: span 3; }
+  }
+</style>
+</head>
+<body>
+<h1>Research Desk</h1>
+<div class="sub" id="sub">Loading…</div>
+<div id="notes"></div>
+<div class="tabs" role="group" aria-label="View">
+  <button type="button" id="tab-findings" aria-pressed="true">Findings</button>
+  <button type="button" id="tab-report" aria-pressed="false">Report</button>
+</div>
+<section id="findings-view">
+  <div class="ask">
+    <input id="ask-topic" placeholder="A topic for your agent to research" aria-label="Topic for your agent" autocomplete="off">
+    <select id="agent" aria-label="Your agent"></select>
+    <button type="button" id="ask-topic-go" disabled>Ask my agent</button>
+    <div class="small" id="ask-help">Asking your agent sends the request to your own agent's private DM with you, after you confirm the exact text. Its answer arrives there, and its progress does not come back to this page yet. What it finds shows up here only as new proposed findings, if it adds them.</div>
+  </div>
+  <div class="add">
+    <input id="claim" placeholder="The finding, in one sentence" aria-label="Finding" autocomplete="off">
+    <input id="topic" placeholder="Topic" aria-label="Topic" autocomplete="off">
+    <input id="source" type="url" placeholder="Source link (required)" aria-label="Source" autocomplete="off">
+    <textarea id="basis" placeholder="On what basis: the evidence or passage it rests on" aria-label="Basis"></textarea>
+    <textarea id="change" placeholder="What it adds to or changes in the report" aria-label="What it changes"></textarea>
+    <button class="primary" id="add" disabled>Propose finding</button>
+  </div>
+  <ul class="items" id="list"></ul>
+</section>
+<section id="report-view" hidden>
+  <div class="small">Only findings a person accepted. Each line carries its source.</div>
+  <div id="report"></div>
+</section>
+<script>
+(async () => {
+  const art = window.artifact;
+  const db = art && art.db;
+  const $ = (id) => document.getElementById(id);
+  const notes = $('notes');
+  const show = (cls, text) => {
+    const el = document.createElement('div');
+    el.className = 'note ' + cls;
+    el.textContent = text;
+    notes.appendChild(el);
+  };
+  const clearNotes = () => { notes.textContent = ''; };
+  let hintShown = false;
+  const hint = (text) => { if (!hintShown) { hintShown = true; show('warn', text); } };
+
+  const view = (name) => {
+    $('findings-view').hidden = name !== 'findings';
+    $('report-view').hidden = name !== 'report';
+    $('tab-findings').setAttribute('aria-pressed', String(name === 'findings'));
+    $('tab-report').setAttribute('aria-pressed', String(name === 'report'));
+    location.hash = name === 'report' ? 'report' : '';
+  };
+  $('tab-findings').onclick = () => view('findings');
+  $('tab-report').onclick = () => view('report');
+  if (location.hash === '#report') view('report');
+
+  if (!db) {
+    $('sub').textContent = 'Preview';
+    show('warn', 'Open this page in s.space to use it: this is a preview with no data.');
+    $('add').disabled = true;
+    return;
+  }
+  await art.ready;
+
+  // GUIDE step 3: never hard-code a database id.
+  const byName = (list, name) => (list.find((d) => d.name === name) || {}).id;
+  let dbs = [];
+  try { dbs = await db.list(); } catch (e) { show('bad', e.message); return; }
+  const id = (art.app && art.app.database) || byName(dbs, 'Research Desk — Findings');
+  const reviewsId = byName(dbs, 'Research Desk — Reviews');
+  if (!id) { $('sub').textContent = ''; show('bad', 'The "Research Desk — Findings" database is missing from this room.'); $('add').disabled = true; return; }
+
+  const save = async (call) => {
+    const until = Date.now() + 120000;
+    for (;;) {
+      const r = await call();
+      if (r.ok || !/waiting for the viewer|rate limit|too many/i.test(r.reason || '') || Date.now() > until) return r;
+      hint('Allow this page to edit data in this room, and it will save.');
+      await new Promise((ok) => setTimeout(ok, 1500));
+    }
+  };
+
+  // ---- people: created_by cells hold account ids; members() names them once the viewer allows.
+  const people = async () => {
+    try {
+      const list = await art.members();
+      return new Map(list.map((m) => [m.id, m]));
+    } catch (e) { return null; }
+  };
+  const personOf = async (cell, members) => {
+    if (!members) return null;
+    try {
+      const pid = await art.personId(cell);
+      return pid ? (members.get(pid) || { id: pid, name: 'A former member', kind: 'human' }) : null;
+    } catch (e) { return null; }
+  };
+
+  // ---- your agents: artifact.agent.list answers [] until the viewer allows the page.
+  let agents = [];
+  const pendingKeys = new Map();     // what -> key: a retry after an unknown outcome reuses its key
+  const fillAgents = async () => {
+    try { agents = (art.agent && await art.agent.list()) || []; } catch (e) { agents = []; }
+    const sel = $('agent');
+    const want = sel.value;
+    sel.textContent = '';
+    agents.forEach((a) => {
+      const opt = document.createElement('option');
+      opt.value = a.id; opt.textContent = a.name;
+      sel.appendChild(opt);
+    });
+    sel.value = agents.some((a) => a.id === want) ? want : (agents[0] ? agents[0].id : '');
+    $('ask-topic-go').disabled = !agents.length || !art.agent;
+    if (!agents.length) $('ask-help').textContent = 'You have no agent of your own here yet, or this page has not been allowed. '
+      + 'Asking your agent sends the request to its private DM with you after you confirm the exact text; its progress does not come back to this page yet.';
+  };
+  const askAgent = async (what, text, row) => {
+    const agentId = $('agent').value;
+    if (!agentId || !art.agent) { show('warn', 'Choose one of your own agents first.'); return; }
+    const key = pendingKeys.get(what) || ('ask-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e6).toString(36));
+    pendingKeys.set(what, key);
+    const request = { agentId, text, key, actionId: 'research' };
+    if (row && /^d[a-z0-9]{1,24}$/.test(id)) request.row = { database: id, rowId: row };
+    let r;
+    try { r = await art.agent.sendTask(request); } catch (e) { r = { ok: false, reason: e.message }; }
+    if (r && r.ok) {
+      pendingKeys.delete(what);
+      show('warn', 'Sent to your agent. Its answer arrives in your private DM with it; this page cannot show its progress or result yet.');
+      return;
+    }
+    const reason = (r && r.reason) || 'The request was not sent.';
+    if (!/outcome unknown|timed out/i.test(reason)) pendingKeys.delete(what);
+    show('bad', 'Not sent: ' + reason + (/outcome unknown|timed out/i.test(reason) ? ' Press again to retry the same request.' : ''));
+  };
+
+  let titleProp = null, reviewTitle = null, busy = false, snapshot = null, reviews = null, generation = 0;
+
+  // The latest review per finding, from a PERSON only: an agent's review is shown, never counted.
+  const verdicts = async (members) => {
+    const out = new Map();
+    if (!reviews) return out;
+    for (const r of reviews.rows) {
+      const f = r.cells.Finding;
+      if (!f || !r.cells.Verdict) continue;
+      const who = await personOf(r.cells['Created by'], members);
+      out.set(f, { verdict: r.cells.Verdict, who, note: r.cells.Note || '' });
+    }
+    return out;
+  };
+
+  const link = (href) => {
+    const a = document.createElement('a');
+    a.textContent = href;
+    if (/^https?:\/\//i.test(href)) a.setAttribute('href', href);
+    return a;
+  };
+
+  const draw = (snap, members, decided) => {
+    clearNotes();
+    hintShown = false;
+    titleProp = (snap.props.find((p) => p.type === 'title') || {}).name;
+    $('add').disabled = !titleProp || busy;
+    if (!titleProp) show('bad', 'This database has no title column, so findings cannot be written.');
+    if (!reviewsId) show('warn', 'The "Research Desk — Reviews" database is missing: findings can be proposed, but nobody can accept them.');
+    if (!members) show('warn', 'Allow the page to see who is who, and authors and reviewers will fill in.');
+    const state = (row) => {
+      const d = decided.get(row.id);
+      return d && d.who && d.who.kind === 'human' ? d.verdict : 'Proposed';
+    };
+    const accepted = snap.rows.filter((r) => state(r) === 'Accepted');
+    $('sub').textContent = snap.rows.length + (snap.rows.length === 1 ? ' finding' : ' findings')
+      + ', ' + accepted.length + ' accepted';
+
+    const list = $('list');
+    list.textContent = '';
+    if (!snap.rows.length) {
+      const li = document.createElement('li');
+      li.className = 'item';
+      li.textContent = 'No findings yet. Propose the first one above, with its source.';
+      list.appendChild(li);
+    }
+    snap.rows.forEach((row) => {
+      const li = document.createElement('li');
+      li.className = 'item';
+      const top = document.createElement('div');
+      top.className = 'top';
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = (titleProp && row.cells[titleProp]) || 'Untitled finding';
+      const st = state(row);
+      const chip = document.createElement('span');
+      chip.className = 'chip ' + (st === 'Proposed' ? 'todo' : 'done');
+      chip.textContent = st;
+      top.appendChild(name); top.appendChild(chip);
+      li.appendChild(top);
+
+      const meta = (label, value) => {
+        if (!value) return;
+        const m = document.createElement('div');
+        m.className = 'meta';
+        m.textContent = label;
+        li.appendChild(m);
+        return m;
+      };
+      if (row.cells.Topic) meta('Topic: ' + row.cells.Topic, true);
+      const src = meta('Source: ', true);
+      if (row.cells.Source) src.appendChild(link(row.cells.Source)); else src.textContent = 'Source: none given';
+      meta('Basis: ' + (row.cells.Basis || ''), row.cells.Basis);
+      meta('What it changes: ' + (row.cells.Change || ''), row.cells.Change);
+      const by = row.author;
+      meta('Proposed by ' + (by ? by.name + (by.kind === 'agent' ? ' (agent)' : '') : '?'), true);
+      const d = decided.get(row.id);
+      if (d) meta((d.verdict === 'Accepted' ? 'Accepted' : 'Rejected') + ' by '
+        + (d.who ? d.who.name + (d.who.kind === 'agent' ? ' (agent: not counted until a person decides)' : '') : '?')
+        + (d.note ? ' — ' + d.note : ''), true);
+
+      const actions = document.createElement('div');
+      actions.className = 'row';
+      if (reviewsId && art.me && art.me.kind !== 'agent') {
+        ['Accepted', 'Rejected'].filter((v) => v !== st).forEach((v) => {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.textContent = v === 'Accepted' ? 'Accept' : 'Reject';
+          b.disabled = busy;
+          b.onclick = () => decide(row, v);
+          actions.appendChild(b);
+        });
+      }
+      const ask = document.createElement('button');
+      ask.type = 'button';
+      ask.textContent = 'Ask my agent about this';
+      ask.disabled = !agents.length || busy;
+      ask.onclick = () => askAgent('row:' + row.id,
+        'Research request from the Research Desk app.\nFinding: ' + String(name.textContent).slice(0, 300)
+        + '\nTopic: ' + String(row.cells.Topic || '').slice(0, 120)
+        + '\nSource: ' + String(row.cells.Source || 'none').slice(0, 300)
+        + '\nCheck it against its source and add what you find as new findings in the Findings table, each with its source. They stay proposed until a person accepts them.',
+        row.id);
+      actions.appendChild(ask);
+      li.appendChild(actions);
+      list.appendChild(li);
+    });
+
+    // The report: accepted findings by topic, each with its source.
+    const report = $('report');
+    report.textContent = '';
+    if (!accepted.length) {
+      const p = document.createElement('div');
+      p.className = 'note';
+      p.textContent = 'Nothing accepted yet: the report assembles findings once a person accepts them.';
+      report.appendChild(p);
+      return;
+    }
+    const topics = new Map();
+    accepted.forEach((r) => {
+      const t = r.cells.Topic || 'Other';
+      topics.set(t, (topics.get(t) || []).concat([r]));
+    });
+    [...topics.keys()].sort().forEach((t) => {
+      const h = document.createElement('h2');
+      h.textContent = t;
+      report.appendChild(h);
+      const ul = document.createElement('ul');
+      ul.className = 'items';
+      topics.get(t).forEach((r) => {
+        const li = document.createElement('li');
+        li.className = 'item';
+        const n = document.createElement('div');
+        n.className = 'name';
+        n.textContent = (titleProp && r.cells[titleProp]) || 'Untitled finding';
+        li.appendChild(n);
+        const s = document.createElement('div');
+        s.className = 'meta';
+        s.textContent = 'Source: ';
+        if (r.cells.Source) s.appendChild(link(r.cells.Source));
+        li.appendChild(s);
+        const d = decided.get(r.id);
+        const w = document.createElement('div');
+        w.className = 'meta';
+        w.textContent = 'Accepted by ' + (d && d.who ? d.who.name : '?');
+        li.appendChild(w);
+        ul.appendChild(li);
+      });
+      report.appendChild(ul);
+    });
+  };
+
+  const render = async (snap) => {
+    const gen = ++generation;                      // a newer render supersedes this one
+    snapshot = snap;
+    if (!snap) { clearNotes(); $('list').textContent = ''; $('sub').textContent = ''; show('bad', 'The Research Desk database was removed from this room.'); $('add').disabled = true; return; }
+    const members = await people();
+    const decided = await verdicts(members);
+    const rows = [];
+    for (const r of snap.rows) rows.push(Object.assign({}, r, { author: await personOf(r.cells['Created by'], members) }));
+    if (gen !== generation) return;                // superseded while resolving people
+    draw(Object.assign({}, snap, { rows }), members, decided);
+  };
+
+  const decide = async (row, verdict) => {
+    if (busy || !reviewsId || !reviewTitle) return;
+    busy = true;
+    let r = { ok: false, reason: '' };
+    try {
+      const values = { Finding: row.id, Verdict: verdict };
+      values[reviewTitle] = String((titleProp && row.cells[titleProp]) || row.id).slice(0, 200);
+      r = await save(() => db.createRow(reviewsId, values));
+      // Keep the table's State column in step for the board view. The page itself trusts Reviews.
+      if (r.ok) await save(() => db.write(id, row.id, 'State', verdict));
+    } catch (e) {
+      r = { ok: false, reason: e.message || 'The decision was not saved.' };
+    } finally {
+      busy = false;
+      if (snapshot) await render(snapshot);
+    }
+    if (!r.ok) show('bad', r.reason || 'The decision was not saved.');
+  };
+
+  if (reviewsId) {
+    db.onChange(reviewsId, (s) => { reviews = s; if (s) reviewTitle = (s.props.find((p) => p.type === 'title') || {}).name; if (snapshot) render(snapshot); });
+    try {
+      reviews = await db.read(reviewsId);
+      reviewTitle = (reviews.props.find((p) => p.type === 'title') || {}).name;
+    } catch (e) { show('bad', e.message); }
+  }
+  db.onChange(id, render);                 // subscribe, then read: no edit is missed between them
+  try { await render(await db.read(id)); } catch (e) { $('sub').textContent = ''; show('bad', e.message); }
+  await fillAgents();
+  if (snapshot) await render(snapshot);    // the per-row "Ask my agent" buttons follow the list
+
+  $('ask-topic-go').onclick = async () => {
+    const topic = $('ask-topic').value.trim();
+    if (!topic) { show('warn', 'Write a topic for your agent first.'); return; }
+    await askAgent('topic:' + topic, 'Research request from the Research Desk app.\nTopic: ' + topic.slice(0, 300)
+      + '\nFind sources on it and add each finding as a new row in the Findings table, with its source and basis. They stay proposed until a person accepts them.');
+  };
+
+  $('add').onclick = async () => {
+    if (busy) return;
+    const claim = $('claim').value.trim();
+    const source = $('source').value.trim();
+    if (!claim || !titleProp) return;
+    if (!/^https?:\/\/\S+$/i.test(source)) { show('bad', 'Every finding needs a source link (https://…).'); return; }
+    const values = { Source: source, State: 'Proposed' };
+    values[titleProp] = claim;
+    const topic = $('topic').value.trim(), basis = $('basis').value.trim(), change = $('change').value.trim();
+    if (topic) values.Topic = topic;
+    if (basis) values.Basis = basis;
+    if (change) values.Change = change;
+    busy = true;
+    $('add').disabled = true;
+    let r = { ok: false, reason: '' };
+    try {
+      r = await save(() => db.createRow(id, values));
+    } catch (e) {
+      r = { ok: false, reason: e.message || 'The finding was not saved.' };
+    } finally {
+      busy = false;
+      if (snapshot) await render(snapshot);
+    }
+    if (!r.ok) { show('bad', r.reason || 'The finding was not saved.'); return; }
+    ['claim', 'source', 'basis', 'change'].forEach((k) => { $(k).value = ''; });
+  };
+  $('claim').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('add').click(); });
+})();
+</script>
+</body>
+</html>

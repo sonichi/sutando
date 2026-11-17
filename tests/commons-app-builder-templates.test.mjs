@@ -156,7 +156,7 @@ const fakeArtifact = (opts = {}) => {
 const run = async (template, opts = {}) => {
   const html = readFileSync(join(TPL, template, 'page.html'), 'utf8');
   const dom = makeDom(html);
-  const bridge = opts.noBridge ? { art: undefined, calls: [], fire: () => {} } : fakeArtifact(opts);
+  const bridge = opts.noBridge ? { art: undefined, calls: [], fire: () => {} } : (opts.bridge || fakeArtifact(opts));
   const location = { hash: opts.hash || '' };
   const sandbox = {
     window: { artifact: bridge.art, addEventListener: () => {} },
@@ -1588,6 +1588,282 @@ const own = (id, choice, extra = {}) => ({ id, cells: { Voter: 'Tester', Choice:
     assert.equal(r.byId.get('comment').value, 'unsaved text'));
   check('poll/row-deleted-during-the-vote-writes-no-comment', () =>
     assert.ok(!r.calls.some((c) => c[3] === 'Comment'), JSON.stringify(r.calls)));
+}
+
+/* ============== research-desk and task-board: two databases, the viewer's own agents ===== */
+// A fake with several databases and artifact.agent, for the two templates that ask agents.
+const fakeMulti = (opts = {}) => {
+  const calls = [];
+  const dbs = opts.dbs;                                 // {id: {name, props, rows}}
+  const watchers = {};
+  let answers = (opts.writeAnswers || []).slice();
+  const answer = () => (answers.length ? answers.shift() : { ok: true });
+  const ACCOUNTS = opts.accounts || { '@me:x': 'u1', '@desk.agent:x': 'u2', '@other:x': 'u3' };
+  const MEMBERS = opts.members || [
+    { id: 'u1', name: 'Tester', avatar: null, kind: 'human' },
+    { id: 'u2', name: 'Desk Agent', avatar: null, kind: 'agent' },
+    { id: 'u3', name: 'Other', avatar: null, kind: 'human' },
+  ];
+  return {
+    calls,
+    fire: (dbId, s) => watchers[dbId] && watchers[dbId](s === undefined ? dbs[dbId] : s),
+    art: {
+      ready: Promise.resolve(),
+      me: opts.me || { id: 'u1', name: 'Tester', kind: 'human' },
+      app: opts.app === null ? null : { id: 'a1', name: 'T', database: opts.primary },
+      now: () => Date.parse('2026-11-11T12:00:00Z'),
+      members: async () => { if (opts.consent === false) throw new Error('page permission required'); return MEMBERS; },
+      personId: async (cell) => {
+        if (opts.consent === false) throw new Error('page permission required');
+        return (cell && ACCOUNTS[cell[0]]) || null;
+      },
+      state: { get: async () => undefined, set: async () => ({ ok: true }), delete: async () => ({ ok: true }),
+        keys: async () => [], all: async () => ({}), on: () => () => {} },
+      emit: () => {},
+      on: () => () => {},
+      pages: { list: async () => [], read: async () => null },
+      agent: {
+        list: async () => opts.agents || [],
+        sendTask: async (req) => { calls.push(['sendTask', req]); return opts.sendAnswer || { ok: true, eventId: 'tabc' }; },
+      },
+      db: {
+        list: async () => Object.entries(dbs).map(([id, d]) => ({ id, name: d.name })),
+        read: async (id) => dbs[id],
+        write: async (...a) => { calls.push(['write', ...a]); return answer(); },
+        createRow: async (...a) => { calls.push(['createRow', ...a]); const r = answer(); return r.ok ? { ok: true, rowId: 'r' + calls.length } : r; },
+        onChange: (id, fn) => { watchers[id] = fn; return () => {}; },
+      },
+    },
+  };
+};
+
+const FINDING_PROPS = [
+  { id: 't', name: 'Finding', type: 'title' },
+  { id: 'p', name: 'Topic', type: 'text' },
+  { id: 's', name: 'Source', type: 'url' },
+  { id: 'b', name: 'Basis', type: 'text' },
+  { id: 'c', name: 'Change', type: 'text' },
+  { id: 'st', name: 'State', type: 'status', options: [{ name: 'Proposed', group: 'todo' }, { name: 'Accepted', group: 'done' }, { name: 'Rejected', group: 'done' }] },
+  { id: 'cb', name: 'Created by', type: 'created_by' },
+];
+const REVIEW_PROPS = [
+  { id: 't', name: 'Review', type: 'title' },
+  { id: 'f', name: 'Finding', type: 'text' },
+  { id: 'v', name: 'Verdict', type: 'select', options: [{ name: 'Accepted' }, { name: 'Rejected' }] },
+  { id: 'n', name: 'Note', type: 'text' },
+  { id: 'cb', name: 'Created by', type: 'created_by' },
+];
+const deskDbs = (findings = [], reviews = []) => ({
+  d1: { id: 'd1', name: 'Research Desk — Findings', props: FINDING_PROPS, rows: findings },
+  d2: { id: 'd2', name: 'Research Desk — Reviews', props: REVIEW_PROPS, rows: reviews },
+});
+const AGENTS = [
+  { id: 'u' + 'a'.repeat(64), name: 'Desk Agent', kind: 'agent', userId: '@desk.agent:x' },
+  { id: 'u' + 'b'.repeat(64), name: 'Home Agent', kind: 'agent' },
+];
+
+{
+  const r = await run('research-desk', { noBridge: true });
+  check('research-desk/no-bridge-preview', () => {
+    assert.match(r.text(), /Open this page in s\.space/);
+    assert.equal(r.byId.get('add').disabled, true);
+  });
+}
+{
+  const b = fakeMulti({ dbs: deskDbs(), primary: 'd1', agents: AGENTS });
+  const r = await run('research-desk', { bridge: b });
+  check('research-desk/empty-state', () => assert.match(r.text(), /No findings yet/));
+  // Static markup: the DOM shim builds only the elements a page addresses, so read the source.
+  check('research-desk/dm-disclaimer-shown', () =>
+    assert.match(readFileSync(join(TPL, 'research-desk', 'page.html'), 'utf8'),
+      /private DM with you[\s\S]*progress does not come back to this page yet/));
+  r.byId.get('claim').value = 'Tides lag the moon';
+  r.byId.get('source').value = 'not a link';
+  r.byId.get('add').click();
+  await settle();
+  check('research-desk/source-required', () => {
+    assert.equal(b.calls.length, 0);
+    assert.match(r.text(), /needs a source link/);
+  });
+  r.byId.get('source').value = 'https://example.org/tides';
+  r.byId.get('topic').value = 'Oceans';
+  r.byId.get('basis').value = 'Table 2';
+  r.byId.get('add').click();
+  await settle();
+  check('research-desk/propose-writes-one-row', () => {
+    assert.equal(b.calls.length, 1);
+    const [kind, db, values] = b.calls[0];
+    assert.equal(kind, 'createRow');
+    assert.equal(db, 'd1');
+    assert.deepEqual(plain(values), { Source: 'https://example.org/tides', State: 'Proposed',
+      Finding: 'Tides lag the moon', Topic: 'Oceans', Basis: 'Table 2' });
+  });
+}
+{
+  const findings = [
+    { id: 'r1', cells: { Finding: 'Claim A', Topic: 'T1', Source: 'https://a.example', State: 'Accepted', 'Created by': ['@desk.agent:x'] } },
+    { id: 'r2', cells: { Finding: 'Claim B', Topic: 'T1', Source: 'https://b.example', 'Created by': ['@other:x'] } },
+  ];
+  // r1's State column says Accepted, but only an agent reviewed it: it must read as proposed.
+  const reviews = [
+    { id: 'v1', cells: { Review: 'Claim A', Finding: 'r1', Verdict: 'Accepted', 'Created by': ['@desk.agent:x'] } },
+    { id: 'v2', cells: { Review: 'Claim B', Finding: 'r2', Verdict: 'Accepted', 'Created by': ['@me:x'] } },
+  ];
+  const b = fakeMulti({ dbs: deskDbs(findings, reviews), primary: 'd1', agents: AGENTS });
+  const r = await run('research-desk', { bridge: b });
+  check('research-desk/agent-review-does-not-accept', () => {
+    const li = r.byId.get('list').children[0];
+    assert.match(li.textContent, /Claim A[\s\S]*Proposed/);
+    assert.match(li.textContent, /not counted until a person decides/);
+    assert.match(li.textContent, /Proposed by Desk Agent \(agent\)/);
+  });
+  check('research-desk/person-review-accepts', () => {
+    const li = r.byId.get('list').children[1];
+    assert.match(li.textContent, /Claim B[\s\S]*Accepted/);
+    assert.match(li.textContent, /Accepted by Tester/);
+  });
+  check('research-desk/report-has-only-accepted-with-source', () => {
+    const rep = r.byId.get('report').textContent;
+    assert.match(rep, /Claim B/);
+    assert.match(rep, /https:\/\/b\.example/);
+    assert.ok(!/Claim A/.test(rep), rep);
+  });
+  const accept = r.byId.get('list').children[0].buttons().find((x) => x.textContent === 'Accept');
+  accept.click();
+  await settle(40);
+  check('research-desk/accept-writes-review-then-state', () => {
+    assert.deepEqual(plain(b.calls[0]), ['createRow', 'd2', { Finding: 'r1', Verdict: 'Accepted', Review: 'Claim A' }]);
+    assert.deepEqual(plain(b.calls[1]), ['write', 'd1', 'r1', 'State', 'Accepted']);
+  });
+  const ask = r.byId.get('list').children[1].buttons().find((x) => /Ask my agent/.test(x.textContent));
+  ask.click();
+  await settle(20);
+  check('research-desk/ask-sends-own-agent-task-with-row', () => {
+    const sent = b.calls.find((c) => c[0] === 'sendTask');
+    assert.ok(sent, JSON.stringify(b.calls));
+    assert.equal(sent[1].agentId, AGENTS[0].id);
+    assert.match(sent[1].text, /Claim B/);
+    assert.match(sent[1].key, /^[a-z0-9][a-z0-9._-]{0,63}$/i);
+    assert.deepEqual(plain(sent[1].row), { database: 'd1', rowId: 'r2' });
+    assert.match(r.text(), /answer arrives in your private DM/);
+  });
+}
+{
+  const b = fakeMulti({ dbs: deskDbs([{ id: 'r1', cells: { Finding: 'X', Source: 'https://x.example' } }]), primary: 'd1',
+    agents: AGENTS, sendAnswer: { ok: false, reason: 'request outcome unknown' } });
+  const r = await run('research-desk', { bridge: b });
+  const ask = () => r.byId.get('list').children[0].buttons().find((x) => /Ask my agent/.test(x.textContent));
+  ask().click(); await settle(20);
+  ask().click(); await settle(20);
+  check('research-desk/unknown-outcome-retries-same-key', () => {
+    const keys = b.calls.filter((c) => c[0] === 'sendTask').map((c) => c[1].key);
+    assert.equal(keys.length, 2);
+    assert.equal(keys[0], keys[1]);
+    assert.match(r.text(), /retry the same request/);
+  });
+}
+{
+  const b = fakeMulti({ dbs: deskDbs([{ id: 'r1', cells: { Finding: 'X', Source: 'https://x.example', 'Created by': ['@me:x'] } }]),
+    primary: 'd1', agents: [], consent: false });
+  const r = await run('research-desk', { bridge: b });
+  check('research-desk/consent-pending-shows-question-marks', () => {
+    assert.match(r.text(), /Proposed by \?/);
+    assert.match(r.text(), /who is who/);
+  });
+  check('research-desk/no-agents-disables-asking', () => assert.equal(r.byId.get('ask-topic-go').disabled, true));
+}
+{
+  const b = fakeMulti({ dbs: deskDbs(), primary: 'd1', agents: AGENTS,
+    writeAnswers: [{ ok: false, reason: 'waiting for the viewer’s answer' }, { ok: true }] });
+  const r = await run('research-desk', { bridge: b });
+  r.byId.get('claim').value = 'Retry me';
+  r.byId.get('source').value = 'https://r.example';
+  r.byId.get('add').click();
+  await settle(40);
+  check('research-desk/consent-refusal-retries-and-hints', () => assert.match(r.text(), /Allow this page to edit data/));
+}
+{
+  const b = fakeMulti({ dbs: deskDbs(), primary: 'd1' });
+  const r = await run('research-desk', { bridge: b });
+  b.fire('d1', null);
+  await settle();
+  check('research-desk/database-removed-error', () => assert.match(r.text(), /was removed from this room/));
+}
+
+const TASK_PROPS = [
+  { id: 't', name: 'Task', type: 'title' },
+  { id: 's', name: 'Status', type: 'status', options: [
+    { name: 'Requested', group: 'todo' }, { name: 'Working', group: 'doing' },
+    { name: 'Blocked', group: 'doing' }, { name: 'Done', group: 'done' }] },
+  { id: 'b', name: 'Blocker', type: 'text' },
+  { id: 'r', name: 'Result', type: 'text' },
+  { id: 'a', name: 'Actor', type: 'person' },
+  { id: 'cb', name: 'Created by', type: 'created_by' },
+];
+const boardDbs = (rows = []) => ({ d1: { id: 'd1', name: 'Task Board — Tasks', props: TASK_PROPS, rows } });
+
+{
+  const r = await run('task-board', { noBridge: true });
+  check('task-board/no-bridge-preview', () => assert.match(r.text(), /Open this page in s\.space/));
+}
+{
+  const b = fakeMulti({ dbs: boardDbs(), primary: 'd1', agents: AGENTS });
+  const r = await run('task-board', { bridge: b });
+  check('task-board/empty-state', () => assert.match(r.text(), /No tasks yet/));
+  check('task-board/agent-choices-say-where', () => {
+    const labels = r.byId.get('who').options.map((o) => o.textContent);
+    assert.deepEqual(labels, ['No agent (a person does it)', 'Desk Agent (in this room)', 'Home Agent (asked in your DM)']);
+  });
+  check('task-board/says-what-it-cannot-show', () =>
+    assert.match(readFileSync(join(TPL, 'task-board', 'page.html'), 'utf8'), /no completion tracking for agent requests yet/));
+  r.byId.get('title').value = 'Book the venue';
+  r.byId.get('who').value = AGENTS[0].id;
+  r.byId.get('add').click();
+  await settle(30);
+  check('task-board/in-room-agent-is-named-in-actor-no-dm', () => {
+    assert.deepEqual(plain(b.calls[0]), ['createRow', 'd1', { Status: 'Requested', Task: 'Book the venue', Actor: ['@desk.agent:x'] }]);
+    assert.ok(!b.calls.some((c) => c[0] === 'sendTask'));
+  });
+}
+{
+  const b = fakeMulti({ dbs: boardDbs(), primary: 'd1', agents: AGENTS });
+  const r = await run('task-board', { bridge: b });
+  r.byId.get('title').value = 'Buy stamps';
+  r.byId.get('who').value = AGENTS[1].id;
+  r.byId.get('add').click();
+  await settle(40);
+  check('task-board/outside-agent-gets-dm-task-after-row', () => {
+    assert.deepEqual(plain(b.calls[0]), ['createRow', 'd1', { Status: 'Requested', Task: 'Buy stamps' }]);
+    const sent = b.calls[1];
+    assert.equal(sent[0], 'sendTask');
+    assert.equal(sent[1].agentId, AGENTS[1].id);
+    assert.deepEqual(plain(sent[1].row), { database: 'd1', rowId: 'r1' });
+    assert.match(r.text(), /cannot show its progress or result/);
+  });
+}
+{
+  const rows = [
+    { id: 'r1', cells: { Task: 'Fix printer', Status: 'Blocked', Blocker: 'needs a part', Actor: ['@desk.agent:x'] } },
+    { id: 'r2', cells: { Task: 'Send invoice', Status: 'Done', Result: 'sent on Monday' } },
+  ];
+  const b = fakeMulti({ dbs: boardDbs(rows), primary: 'd1', agents: AGENTS });
+  const r = await run('task-board', { bridge: b });
+  check('task-board/shows-agent-blocker-result', () => {
+    assert.match(r.text(), /Agent: Desk Agent/);
+    assert.match(r.text(), /Blocked on: needs a part/);
+    assert.match(r.text(), /Result: sent on Monday/);
+  });
+  const btn = r.byId.get('cols').buttons().find((x) => x.textContent === 'Working');
+  btn.click();
+  await settle(20);
+  check('task-board/status-click-writes-status', () => assert.deepEqual(plain(b.calls[0]), ['write', 'd1', 'r1', 'Status', 'Working']));
+}
+{
+  const b = fakeMulti({ dbs: boardDbs(), primary: 'd1' });
+  const r = await run('task-board', { bridge: b });
+  b.fire('d1', null);
+  await settle();
+  check('task-board/database-removed-error', () => assert.match(r.text(), /was removed from this room/));
 }
 
 if (unhandled.length) {
