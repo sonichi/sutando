@@ -151,7 +151,7 @@ def _still_own(worker: str, workspace, own_results, lease: bool = True) -> bool:
 
 
 def _adopt(worker: str, shared_results, own_results, names, log, belongs=lambda name: True,
-           lease: bool = True) -> "list[str]":
+           lease: bool = True, failed: "list[str] | None" = None) -> "list[str]":
     import undelivered_quarantine
     moved = []
     for name in names:
@@ -166,9 +166,15 @@ def _adopt(worker: str, shared_results, own_results, names, log, belongs=lambda 
                 undelivered_quarantine.report_once("worker-lane:adopt", log or (lambda _m: None),
                                                    f"lane for worker {worker}: no no-replace rename on this "
                                                    "platform; its files in the shared results/ stay there")
+                if failed is not None:
+                    failed.append(f"{name}: no no-replace rename on this platform")
                 return moved
             continue
-        except OSError:
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            if failed is not None:
+                failed.append(f"{name}: {type(e).__name__}: {e}")
             continue
         moved.append(name)
     return moved
@@ -181,20 +187,23 @@ def _names(folder, pattern: str) -> "list[str]":
         return []
 
 
-def adopt_stray_proactive(worker: str, shared_results, own_results, log=None, lease: bool = True) -> "list[str]":
+def adopt_stray_proactive(worker: str, shared_results, own_results, log=None, lease: bool = True,
+                          failed: "list[str] | None" = None) -> "list[str]":
     """Move the proactive files `worker`'s session stamped (`lane_claims_proactive`) from the shared
     results/ into its own; returns the names moved. The move never replaces a file: a name already in its
     folder, or one another consumer took first, is left for a later pass. Without a no-replace rename
     nothing is moved (a link-then-unlink could delete a file a producer just republished there). `lease`
-    False: a caller that is not the bridge and runs once the old bridge is gone (`migrate-dirs`)."""
+    False: a caller that is not the bridge and runs once the old bridge is gone (`migrate-dirs`); `failed`
+    collects a move that failed for any reason but a lost race, for a caller that must report it."""
     from proactive_routing import lane_claims_proactive
     if not worker:
         return []
     names = [n for n in _names(shared_results, "proactive-*.txt") if lane_claims_proactive(n, worker)]
-    return _adopt(worker, shared_results, own_results, names, log, lease=lease)
+    return _adopt(worker, shared_results, own_results, names, log, lease=lease, failed=failed)
 
 
-def adopt_stray_results(worker: str, workspace, own_results, log=None, lease: bool = True) -> "list[str]":
+def adopt_stray_results(worker: str, workspace, own_results, log=None, lease: bool = True,
+                        failed: "list[str] | None" = None) -> "list[str]":
     """Move the results of tasks whose home is `worker`'s own folder, `own_results` (`connections.task_home`),
     from the shared results/ into it, as `adopt_stray_proactive` does: a late answer an older session wrote."""
     from connections import task_home
@@ -204,7 +213,8 @@ def adopt_stray_results(worker: str, workspace, own_results, log=None, lease: bo
     def belongs(name: str) -> bool:
         home = task_home(Path(name).stem, ws)
         return home["own"] and home["worker"] == worker and home["results"].resolve() == Path(own_results).resolve()
-    return _adopt(worker, ws / "results", own_results, _names(ws / "results", "task-*.txt"), log, belongs, lease)
+    return _adopt(worker, ws / "results", own_results, _names(ws / "results", "task-*.txt"), log, belongs, lease,
+                  failed)
 
 
 # How often an own-dir bridge looks for its worker's proactive files still landing in the shared results/.
