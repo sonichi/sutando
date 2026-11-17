@@ -78,14 +78,53 @@ def legacy_env(environ: Mapping[str, str], repo: Path = REPO, run: Callable = su
     return env
 
 
+_LEGACY_ENV_CACHE: dict = {}
+_TOKEN_VARS = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_TIER", "AG2_REMOTE_TIER")
+
+
+def _digest_file(path: str) -> str:
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest() if path else ""
+    except OSError:
+        return "unreadable"
+
+
+def _channel_dir_digest() -> str:
+    """Every file of the ag2space channel dir, by name and bytes: what the lib reads the token from."""
+    from util_paths import claude_home_path
+    h = hashlib.sha256()
+    try:
+        for f in sorted(claude_home_path("channels", "ag2space").iterdir()):
+            if f.is_file():
+                h.update(f.name.encode() + b"\0" + f.read_bytes() + b"\0")
+    except OSError:
+        h.update(b"unreadable")
+    return h.hexdigest()
+
+
+def cached_legacy_env(environ: Mapping[str, str], legacy: Callable) -> dict:
+    """`legacy(environ)`, rebuilt only when what it reads changed: the environment's token and tier, the
+    channel dir's files, the last token file's bytes. A rescan then forks the lib only on a change."""
+    last = _LEGACY_ENV_CACHE.get("env") or {}
+    key = (tuple(environ.get(k, "") for k in _TOKEN_VARS), _channel_dir_digest(),
+           _digest_file(str(last.get("REMOTE_TASK_TOKEN_FILE") or "")))
+    if _LEGACY_ENV_CACHE.get("key") != key or _LEGACY_ENV_CACHE.get("legacy") is not legacy:
+        last = legacy(environ)
+        key = key[:2] + (_digest_file(str(last.get("REMOTE_TASK_TOKEN_FILE") or "")),)
+        _LEGACY_ENV_CACHE.update(key=key, env=last, legacy=legacy)
+    return dict(last)
+
+
 def decide(workspace: Path, environ: Mapping[str, str], *,
-           legacy: Optional[Callable] = None) -> "tuple[Optional[dict], str]":
+           legacy: Optional[Callable] = None, cached: bool = False) -> "tuple[Optional[dict], str]":
     """({instance, primary, parked, env?}, "") for the bridge the core runs, or (None, why not). The
-    legacy decision carries its built environment; a named one only its plan entry (no vault read)."""
+    legacy decision carries its built environment (`cached`: from `cached_legacy_env`, as a rescan asks);
+    a named one only its plan entry (no vault read)."""
     parked = connections.legacy_parked(workspace)
     primary = connections.primary_instance(workspace)
     if not parked:
-        env = (legacy or legacy_env)(environ)
+        build = legacy or legacy_env
+        env = cached_legacy_env(environ, build) if cached else build(environ)
         if env.get("REMOTE_TASK_TOKEN"):
             if primary:
                 env["REMOTE_PROACTIVE_ROOM"] = ""
@@ -114,10 +153,7 @@ def token_file(decision: Mapping[str, object]) -> str:
 
 def revision(decision: Mapping[str, object], workspace: Path) -> str:
     path = token_file(decision)
-    try:
-        held = hashlib.sha256(Path(path).read_bytes()).hexdigest() if path else ""
-    except OSError:
-        held = "unreadable"
+    held = _digest_file(path)
     row = _row(str(decision["instance"]), workspace)
     fields = [str(decision["instance"]), str(decision["primary"] or ""), str(bool(decision["parked"])), path, held]
     fields += [str(row.get(k) or "") for k in ("token_ref", "gateway_url", "agent_mxid")]
@@ -230,8 +266,8 @@ def main(argv=None, *, workspace: Optional[Path] = None, environ: Optional[Mappi
         _log(f"core bridge {inst or '(legacy)'} not started: {e}")
         return LAUNCHER_FAILED_RC
     if holder:
-        _log(f"lane {inst} already runs under an alias (pid {holder}); standing down")
-        return 75
+        _log(f"lane {inst} already runs under an alias (pid {holder}); retrying with backoff")
+        return LAUNCHER_FAILED_RC
     owner = outside(inst, ws)
     if owner:
         _log(f"refusing to start: {inst or 'the legacy bridge'} is already supervised outside sparrowd: {owner}. "

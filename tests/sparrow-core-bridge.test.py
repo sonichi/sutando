@@ -245,6 +245,37 @@ class Named(H.Base):
         token.unlink()
         self.assertNotEqual(spec().revision, rotated, "an unreadable token file is a change too")
 
+    def test_a_rescan_forks_the_lib_only_when_what_it_reads_changed(self):
+        token = self.ws / "relay.env"
+        token.write_text("REMOTE_TASK_TOKEN=one\n")
+        built = []
+
+        def legacy(e):
+            built.append(1)
+            return {"REMOTE_TASK_TOKEN": "t", "REMOTE_TASK_TOKEN_FILE": str(token)}
+        core._LEGACY_ENV_CACHE.clear()
+        self.addCleanup(core._LEGACY_ENV_CACHE.clear)
+
+        def revision():
+            with mock.patch.object(C, "legacy_parked", return_value=False), \
+                    mock.patch.object(core, "legacy_env", legacy):
+                return SD.core_spec(self.ws, self.environ)[0].revision
+        first = revision()
+        self.assertEqual((revision(), revision(), len(built)), (first, first, 1), "unchanged: built once")
+        token.write_text("REMOTE_TASK_TOKEN=two\n")
+        self.assertNotEqual(revision(), first, "a token change still changes the revision")
+        self.assertEqual(len(built), 2, "and rebuilds the environment once")
+        channel = self.ws / "home" / "channels" / "ag2space"
+        channel.mkdir(parents=True)
+        (channel / ".env").write_text("REMOTE_TASK_TOKEN=three\n")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.ws / "home")}):
+            revision()
+        self.assertEqual(len(built), 3, "a new channel file is read")
+
+    def test_an_unreadable_channel_dir_is_its_own_digest(self):
+        with mock.patch("util_paths.claude_home_path", return_value=Path("/no/such/channel-dir")):
+            self.assertEqual(core._channel_dir_digest(), core._channel_dir_digest())
+
     def test_a_named_revision_follows_its_rows_token_file(self):
         decision, _ = self.decide()
         before = core.revision(decision, self.ws)
@@ -294,7 +325,7 @@ class Named(H.Base):
                 mock.patch.object(C, "alias_instances", return_value=["alias-x"]), \
                 mock.patch.object(C, "bridge_pid", return_value=4242):
             rc, seen, err = self.run_main([f"--expect={self.inst}"])
-        self.assertEqual((rc, seen), (75, {}))
+        self.assertEqual((rc, seen), (core.LAUNCHER_FAILED_RC, {}), "transient: retried with backoff, not held")
         self.assertIn("already runs under an alias (pid 4242)", err)
         with mock.patch.object(C, "legacy_parked", return_value=True):
             rc, seen, err = self.run_main([f"--expect={self.inst}"], evict=lambda inst, ws: 4)
@@ -402,9 +433,9 @@ class OneExitCodeOwner(unittest.TestCase):
     def test_the_poll_stall_code_is_the_bridges_own(self):
         from ag2_sparrow import exit_codes
         self.assertEqual(core.POLL_STALL_RC, str(exit_codes.POLL_STALL_EXIT_CODE))
-        src = (ROOT / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
-        self.assertIn("from .exit_codes import POLL_STALL_EXIT_CODE", src)
-        self.assertNotIn("POLL_STALL_EXIT_CODE = ", src)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            from ag2_sparrow.remote_gateway_bridge import POLL_STALL_EXIT_CODE
+        self.assertEqual(POLL_STALL_EXIT_CODE, exit_codes.POLL_STALL_EXIT_CODE)
 
 
 class TheCoreScan(unittest.TestCase):

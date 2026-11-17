@@ -147,7 +147,7 @@ def core_spec(workspace=None, environ=None) -> "tuple[WorkerSpec | None, str]":
     cannot be read: an unknown core, not an absent one."""
     import sparrow_core_bridge as core
     ws = workspace or resolve_workspace()
-    decision, why = core.decide(ws, os.environ if environ is None else environ)
+    decision, why = core.decide(ws, os.environ if environ is None else environ, cached=True)
     if decision is None:
         return None, why
     return WorkerSpec(name=CORE_WORKER, argv=[sys.executable, str(CORE_LAUNCHER), f"--expect={decision['instance']}"],
