@@ -115,6 +115,15 @@ class PublishedPath(Base):
         self.assertEqual(stamped.parent, self.own / "results")
         self.assertIn(f".by-{W}", stamped.name)
 
+    def test_a_proactive_file_for_another_channels_bridge_stays_shared(self):
+        from proactive_routing import proactive_filename
+        for channel in ("slack", "discord", "telegram"):
+            with self.subTest(channel=channel):
+                name = proactive_filename(1, channel)
+                self.assertEqual(self.published(self.ws / "results" / name), self.ws / "results" / name)
+        about = self.published(self.ws / "results" / proactive_filename(2, "ag2space"))
+        self.assertEqual(about.parent, self.own / "results")
+
     def test_through_a_symlinked_workspace_too(self):
         link = self.ws.parent / "ws link"
         link.symlink_to(self.ws)

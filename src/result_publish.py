@@ -142,10 +142,12 @@ def worker_published_path(path: str | Path, environ=None, workspace=None) -> Pat
 
 def _own_results_path(connections, path: Path, environ, workspace) -> Path:
     """`path` moved into the session's worker's own results/ when that worker has its own folders
-    (`connections.worker_dirs`) and `path` names the workspace's shared results/; else unchanged."""
+    (`connections.worker_dirs`), `path` names the workspace's shared results/ and the worker's lane is the
+    one that delivers it (a proactive file for another channel's bridge stays shared); else unchanged."""
+    from proactive_routing import lane_claims_proactive
     worker = connections.session_worker(environ)
     own = connections.worker_dirs(worker, workspace) if worker else None
-    if own is None:
+    if own is None or (path.name.startswith("proactive-") and not lane_claims_proactive(path.name, worker)):
         return path
     shared = connections.record_path(workspace).parent.parent / "results"
     return own[1] / path.name if path.parent.resolve() == shared.resolve() else path
