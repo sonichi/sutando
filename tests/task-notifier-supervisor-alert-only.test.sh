@@ -110,23 +110,28 @@ unit $(nos 62) yes yes $(nos 62)
 unit $(for i in $(seq 1 70); do echo unknown; done)
 [ ! -s "$WORK/alerts" ] && r=0 || r=1; check "(5) an unreadable process table never alerts" "$r"
 
-# The real alert text: the seat and the count, never the inbox path or the session name.
-alert_text() {  # alert_text <instance id or empty>; the published alert, the notification, the log
+# The real alert text: the seat (judged from the inbox) and the count, never a path or session name.
+W1=0123456789abcdef
+mkdir -p "$WORK/unit/state" "$WORK/unit/deliveries/$W1" "$WORK/unit/deliveries/retired-one" "$WORK/scratch/tasks" "$WORK/scratch/results"
+printf '{"workers": {"%s": {"state": "idle"}, "retired-one": {"state": "retired"}}}\n' "$W1" > "$WORK/unit/state/roster.json"
+printf 'x\n' > "$WORK/unit/deliveries/$W1/task-7.txt"
+printf 'id: task-8\ntask: s\n' > "$WORK/scratch/tasks/task-8.txt"
+alert_text() {  # alert_text <inbox> <instance id or empty> [seconds]; the published alert, the notification, the log
   local out="$WORK/text"; rm -rf "$out"; mkdir -p "$out"
   (
-    SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_TASKS_DIR="$WORK/unit/tasks" SUTANDO_TMUX_SESSION=secret-session-name \
-      SUTANDO_INSTANCE_ID="$1"
-    export SUTANDO_SUPERVISOR_SOURCE_ONLY SUTANDO_TASKS_DIR SUTANDO_TMUX_SESSION SUTANDO_INSTANCE_ID
+    SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_TASKS_DIR="$1" SUTANDO_TMUX_SESSION=secret-session-name \
+      SUTANDO_INSTANCE_ID="$2" SUTANDO_WORKSPACE_DIR="$WORK/unit"
+    export SUTANDO_SUPERVISOR_SOURCE_ONLY SUTANDO_TASKS_DIR SUTANDO_TMUX_SESSION SUTANDO_INSTANCE_ID SUTANDO_WORKSPACE_DIR
     # shellcheck source=/dev/null
     source "$SUPERVISOR"
     bash() { if [ "$1" = "$REPO/src/macos-notify.sh" ]; then printf '%s\n' "$2" > "$out/notify"; else command bash "$@"; fi; }
     supervisor_log() { echo "$*" >> "$out/log"; }
-    unwatched_alert 600 "$(waiting_count)"
+    unwatched_alert "${3:-600}" "$(waiting_count)"
   )
-  cat "$WORK"/unit/results/proactive-standby-unwatched-*.txt > "$out/proactive" 2>/dev/null
-  rm -f "$WORK"/unit/results/proactive-standby-unwatched-*.txt
+  cat "$WORK"/unit/results/proactive-standby-unwatched-*.txt "$WORK"/scratch/results/proactive-* > "$out/proactive" 2>/dev/null
+  rm -f "$WORK"/unit/results/proactive-standby-unwatched-*.txt "$WORK"/scratch/results/proactive-*
 }
-alert_text ""
+alert_text "$WORK/unit/tasks" ""
 for f in proactive notify; do
   grep -q "the core has had no task watcher for 10 min" "$WORK/text/$f" && grep -q "2 tasks are waiting" "$WORK/text/$f" && r=0 || r=1
   check "(9) the $f alert names the core and the waiting count" "$r" "$(cat "$WORK/text/$f" 2>/dev/null)"
@@ -135,9 +140,23 @@ for f in proactive notify; do
 done
 grep -q "$WORK/unit/tasks" "$WORK/text/log" && grep -q "secret-session-name" "$WORK/text/log" && r=0 || r=1
 check "(9) the local log line keeps the detail" "$r" "$(cat "$WORK/text/log" 2>/dev/null)"
-alert_text "0123456789abcdef"
-grep -q "^Sutando: worker 01234567 has had no task watcher" "$WORK/text/proactive" && r=0 || r=1
-check "(9) a worker's alert names it by its short id" "$r" "$(cat "$WORK/text/proactive" 2>/dev/null)"
+alert_text "$WORK/unit/tasks" "$W1"
+grep -q "^Sutando: the core has had" "$WORK/text/proactive" && r=0 || r=1
+check "(10) the core's inbox is the core even under a worker's instance id" "$r" "$(cat "$WORK/text/proactive" 2>/dev/null)"
+alert_text "$WORK/unit/deliveries/$W1" ""
+grep -q "^Sutando: worker 01234567 has had no task watcher" "$WORK/text/proactive" && grep -q "1 task is waiting" "$WORK/text/proactive" && r=0 || r=1
+check "(10) a rostered worker's delivery inbox is that worker by its short id, with no instance id" "$r" "$(cat "$WORK/text/proactive" 2>/dev/null)"
+for inbox in "$WORK/scratch/tasks" "$WORK/unit/deliveries/retired-one"; do
+  alert_text "$inbox" ""
+  [ ! -s "$WORK/text/proactive" ] && [ ! -e "$WORK/text/notify" ] && grep -q "ALERT: .*$inbox.*owner not paged" "$WORK/text/log" && r=0 || r=1
+  check "(11) ${inbox#"$WORK"/}: no registered seat, so a local ALERT line only and no page" "$r" "$(cat "$WORK/text/proactive" "$WORK/text/log" 2>/dev/null)"
+done
+alert_text "$WORK/unit/tasks" "" 45
+grep -q "no task watcher for under a minute," "$WORK/text/proactive" && ! grep -q "0 min" "$WORK/text/proactive" && r=0 || r=1
+check "(12) a sub-minute duration reads 'under a minute', not '0 min'" "$r" "$(cat "$WORK/text/proactive" 2>/dev/null)"
+alert_text "$WORK/unit/tasks" "" 60
+grep -q "no task watcher for 1 min," "$WORK/text/proactive" && r=0 || r=1
+check "(12) ...and 60 s reads '1 min'" "$r" "$(cat "$WORK/text/proactive" 2>/dev/null)"
 
 # ---- Part 2: the real supervisor in tmux ---------------------------------------------------
 if ! command -v tmux >/dev/null 2>&1; then
@@ -153,7 +172,7 @@ else
 
   start_supervisor() {  # start_supervisor <name> <ws> <mode>
     tmux -S "$SOCK" new-session -d -s "$1" -c "$REPO" \
-      "env -u SUTANDO_INSTANCE_ID -u SUTANDO_WORKSPACE_DIR -u SUTANDO_WORKER_ID PATH=\$PATH \
+      "env -u SUTANDO_INSTANCE_ID -u SUTANDO_WORKER_ID PATH=\$PATH SUTANDO_WORKSPACE_DIR=$2 \
          SUTANDO_TMUX_SOCKET=$SOCK SUTANDO_TMUX_SESSION=target SUTANDO_TASKS_DIR=$2/tasks \
          SUTANDO_NOTIFIER_SCRIPT=$STUB SUTANDO_STUB_MARKER=$2/notifier.marker \
          SUTANDO_NOTIFIER_GRACE_PERIOD=1 SUTANDO_NOTIFIER_ROLE_POLL=1 SUTANDO_NOTIFIER_ALERT_GRACE=3 \
@@ -172,7 +191,7 @@ else
   # shellcheck disable=SC2012
   [ "$(ls "$A/results" | grep -c '^proactive-standby-unwatched-.*\.txt$')" = 1 ] && r=0 || r=1
   check "(6) ...and the owner gets one proactive alert" "$r" "$(ls "$A/results")"
-  grep -q "the core has had no task watcher for 0 min, .*0 tasks are waiting, and nothing types them in" "$A"/results/proactive-standby-unwatched-*.txt 2>/dev/null \
+  grep -q "the core has had no task watcher for under a minute, .*0 tasks are waiting, and nothing types them in" "$A"/results/proactive-standby-unwatched-*.txt 2>/dev/null \
     && ! grep -q "$A" "$A"/results/proactive-standby-unwatched-*.txt && r=0 || r=1
   check "(6) ...naming the core, its waiting count and that nothing is typed, and no path" "$r" "$(cat "$A"/results/proactive-* 2>/dev/null)"
   [ ! -e "$A/notifier.marker" ] && r=0 || r=1; check "(6) ...and the typing notifier never ran" "$r" "$(cat "$A/notifier.marker" 2>/dev/null)"

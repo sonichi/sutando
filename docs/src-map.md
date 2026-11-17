@@ -224,6 +224,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
 - **`screen-capture-server.py`** — Screen capture HTTP server — runs in a terminal (has Screen Recording permission on macOS; needs no special setup on Windows).
 - **`scroll-wheel.swift`** — scroll-wheel.swift — Send OS-level scroll wheel events to Chrome
+- **`seat_inbox.py`** — Which seat an inbox belongs to, judged from the inbox itself and the workspace's records.
 - **`secret_compare.py`** — Constant-time equality for a presented credential string against an expected one.
 - **`secret_scanner.py`** — Library-based secret detection for inbound bridge messages.
 - **`self_opened_gate.py`** — Attribution for a terminal dialog Sutando opened itself, and the one rule that may dismiss it.

@@ -58,6 +58,7 @@ class AlertDecisionTests(unittest.TestCase):
         self.notifier = root / "notifier.sh"
         self.notifier.write_text(NOTIFIER_STUB)
         self.notifier.chmod(0o755)
+        self.osa = root / "osa.log"
         self.alive = root / "alive"
         self.marker = root / "notifier.marker"
         self.env = hermetic_env(
@@ -66,6 +67,7 @@ class AlertDecisionTests(unittest.TestCase):
             SUT_TEST_OSA=str(root / "osa.log"),
             SUTANDO_TMUX_SOCKET=str(root / "none.sock"), SUTANDO_TMUX_SESSION="decision-target",
             SUTANDO_TASKS_DIR=str(self.ws / "tasks"), SUTANDO_NOTIFIER_SCRIPT=str(self.notifier),
+            SUTANDO_WORKSPACE_DIR=str(self.ws),
             SUTANDO_NOTIFIER_GRACE_PERIOD="0", SUTANDO_NOTIFIER_ROLE_POLL="1",
             SUTANDO_NOTIFIER_TARGET_POLL="1", SUTANDO_NOTIFIER_RESTART_DELAY="1",
             SUTANDO_NOTIFIER_ALERT_GRACE="1")
@@ -93,6 +95,18 @@ class AlertDecisionTests(unittest.TestCase):
         self._run("alert", lambda: bool(self._alerts()))
         self.assertTrue(self._alerts(), "the alert branch never alerted")
         self.assertFalse(self.marker.exists(), self.marker.read_text() if self.marker.exists() else "")
+
+    def test_an_unregistered_inbox_is_logged_and_never_pages_the_owner(self):
+        scratch = Path(self.tmp.name) / "scratch" / "tasks"
+        scratch.mkdir(parents=True)
+        self.env["SUTANDO_TASKS_DIR"] = str(scratch)
+        log = self.ws / "logs" / "claude-task-notifier.log"
+        self._run("alert", lambda: log.is_file() and "owner not paged" in log.read_text())
+        self.assertIn("owner not paged", log.read_text() if log.is_file() else "")
+        self.assertEqual(self._alerts(), [])
+        self.assertEqual(sorted((Path(self.tmp.name) / "scratch").rglob("proactive-*")), [])
+        self.assertFalse(self.osa.exists())
+        self.assertFalse(self.marker.exists())
 
     def test_without_the_mode_the_same_harness_sees_the_notifier_start(self):
         self._run(None, self.marker.exists)

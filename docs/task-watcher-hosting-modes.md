@@ -124,9 +124,12 @@ mode the supervisor never starts the notifier: no task and no nudge is typed int
 and alerts the owner: a `results/proactive-standby-unwatched-*.txt` (the owner's DM) and the opt-in macOS
 notification, the same pair a channel bridge's wrapper uses for its notices. While the episode lasts it
 reminds the owner every `SUTANDO_NOTIFIER_ALERT_REPEAT` (1800 s; 0 turns the reminder off). Each alert names
-the seat ("the core", or "worker" and the first 8 characters of its id) and how many tasks wait in its
-inbox, counted by `src/task_queue.py`; it never carries the inbox path or the tmux session name, which
-only the local log line keeps. A ready watcher ends the episode with one log line and nothing sent to the owner. The 300 s covers a seat's boot
+the seat, judged from the inbox by `src/seat_inbox.py` ("the core" for `<workspace>/tasks`, "worker" and the
+first 8 characters of its id for a rostered worker's `deliveries/<id>` or own tasks folder), how long it has
+been unwatched ("under a minute" below 60 s) and how many tasks wait in its inbox, counted by
+`src/task_queue.py`; it never carries the inbox path or the tmux session name, which only the local log
+line keeps. An inbox that is no registered seat (a scratch or test inbox) gets the local `ALERT` line only:
+the owner is never paged for it. A ready watcher ends the episode with one log line and nothing sent to the owner. The 300 s covers a seat's boot
 and restarts: a seat's Mod watcher has been seen ready 51 s after the session started (before
 the launcher trusted the `--add-dir` folder), and a worker relaunched several times took about 2.5 min.
 The Mod's own restart back-off (5 s doubling) passes 300 s only after six early exits in a row. A Codex seat,
@@ -255,7 +258,9 @@ how `tests/watch-tasks-stream-shutdown-leaves-inflight-claim.test.py` interrupts
   after the grace, reminds every repeat interval with the waiting count and no path, and stands down
   silently. Its tmux part prints SKIP where tmux is missing.
 - `tests/task-notifier-supervisor-alert-decision.test.py`: with no tmux, the real supervisor in alert
-  mode alerts and never starts the typing notifier; without the mode it does.
+  mode alerts and never starts the typing notifier; an unregistered inbox is logged and never
+  pages the owner; without the mode the notifier starts.
+- `tests/seat-inbox.test.py`: which inboxes are a registered seat, and the label each gets.
 - `src/agent/claude/task-watch-mod/tests/task-watch.test.ts` (`claude plugin test`, in CI): the Mod's
   spawn, announcement, restart, hand-off and session-end rules, and that a task body is never submitted.
 - `tests/task-watch-mod-launch.test.sh`: the launchers' defaults and opt-outs, version floor and session marker.

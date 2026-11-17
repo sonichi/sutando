@@ -233,33 +233,44 @@ waiting_count() {
     | "$PY" -c 'import json, sys; print(len(json.load(sys.stdin)))' 2>/dev/null
 }
 
-# Who the owner's alert names: never a path or a tmux session name, which leave the machine with it.
-seat_label() {
-  if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
-    printf 'worker %s' "${SUTANDO_INSTANCE_ID:0:8}"
-  else
-    printf 'the core'
-  fi
+# The workspace whose seats count: the same one this seat's beat file is resolved against.
+seat_workspace() { printf '%s' "${SUTANDO_WORKSPACE_DIR:-$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)}"; }
+
+# "<seat>\t<worker>\t<label>" for a registered seat inbox (judged from the inbox, never from
+# SUTANDO_INSTANCE_ID), else "none": no path or session name, as the label leaves the machine.
+inbox_seat() {
+  local ws
+  ws="$(seat_workspace)"
+  { [ -n "$TASKS_DIR" ] && [ -n "$ws" ]; } || { echo none; return; }
+  "$PY" "$REPO/src/seat_inbox.py" seat --inbox "$TASKS_DIR" --workspace "$ws" 2>/dev/null || echo none
 }
 
-# The owner's alert, through the path a bridge wrapper uses for its own notices: a proactive
-# result (the owner's DM, never a worker's lane) and the opt-in macOS notification.
+duration_phrase() {  # duration_phrase <seconds>
+  if [ "$1" -lt 60 ]; then printf 'under a minute'; else printf '%s min' "$(($1 / 60))"; fi
+}
+
+# The owner's alert: a proactive result (the owner's DM, never a worker's lane) and the opt-in macOS
+# notification. An inbox that is no registered seat gets only the local log line, never a page.
 unwatched_alert() {  # unwatched_alert <seconds unwatched> <waiting count or empty> [reminder]
-  local secs="$1" n="$2" kind="${3:-}" ws msg waiting
+  local secs="$1" n="$2" kind="${3:-}" ws msg waiting seat label
+  seat="$(inbox_seat)"
+  label="$(printf '%s' "$seat" | cut -f3)"
+  if [ "$seat" = none ] || [ -z "$label" ]; then
+    supervisor_log "ALERT${kind:+ ($kind)}: no ready session watcher holds ${TASKS_DIR:-this host} (session ${SESSION}) for ${secs}s, ${n:-unknown} waiting (alert-only standby; nothing typed); not a registered seat inbox, owner not paged"
+    return 0
+  fi
   case "$n" in
     '') waiting="an unknown number of tasks are waiting" ;;
     1) waiting="1 task is waiting" ;;
     *) waiting="$n tasks are waiting" ;;
   esac
-  msg="Sutando${kind:+ ($kind)}: $(seat_label) has had no task watcher for $((secs / 60)) min, so it is not picking up its tasks; $waiting, and nothing types them in for it. Restarting that session brings its watcher back."
-  supervisor_log "ALERT${kind:+ ($kind)}: no ready session watcher holds ${TASKS_DIR:-this host} (session ${SESSION}) for ${secs}s, ${n:-unknown} waiting (alert-only standby; nothing typed); owner alerted"
-  if [ -n "$TASKS_DIR" ]; then
-    ws="$(workspace_dir_for_inbox "$TASKS_DIR")"
-    if [ -d "$ws/results" ]; then
-      printf '%s\n' "$msg" | env -u SUTANDO_WORKER_ID "$PY" "$REPO/src/result_publish.py" \
-        "$ws/results/proactive-standby-unwatched-$(now_s)-$$.txt" >/dev/null 2>&1 \
-        || supervisor_log "could not publish the unwatched-inbox alert"
-    fi
+  msg="Sutando${kind:+ ($kind)}: $label has had no task watcher for $(duration_phrase "$secs"), so it is not picking up its tasks; $waiting, and nothing types them in for it. Restarting that session brings its watcher back."
+  supervisor_log "ALERT${kind:+ ($kind)}: no ready session watcher holds ${TASKS_DIR} (session ${SESSION}) for ${secs}s, ${n:-unknown} waiting (alert-only standby; nothing typed); owner alerted"
+  ws="$(seat_workspace)"
+  if [ -d "$ws/results" ]; then
+    printf '%s\n' "$msg" | env -u SUTANDO_WORKER_ID "$PY" "$REPO/src/result_publish.py" \
+      "$ws/results/proactive-standby-unwatched-$(now_s)-$$.txt" >/dev/null 2>&1 \
+      || supervisor_log "could not publish the unwatched-inbox alert"
   fi
   bash "$REPO/src/macos-notify.sh" "$msg" || true
 }
