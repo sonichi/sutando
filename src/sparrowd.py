@@ -10,6 +10,10 @@ are rescanned every `--rescan-s`: a declaration written later is picked up, a
 removed one has its worker stopped, an edited one has it restarted. `--agent-bridges` supervises only those, for
 a host whose gateway bridge another supervisor already runs (the launchd
 wrapper starts this mode beside the bridge).
+
+`--core` also supervises the host's core gateway bridge (`sparrow_core_bridge`), rescanned the same way:
+it is restarted when the connection it serves changes, held after its stand-down (exit 75), and absent
+while there is nothing to run.
 """
 import argparse
 import os
@@ -130,17 +134,49 @@ def supervision_marker(spec) -> str:
 
 
 def _static_specs() -> "tuple[list, list[str]]":
-    """The workers read once, at start: the host's gateway bridge and the skill loops."""
-    specs = [
-        WorkerSpec(
-            name="remote-gateway-bridge",
-            argv=[sys.executable, str(REPO / "src" / "remote-gateway-bridge.py")],
-            cwd=str(REPO),
-        ),
-    ]
-    skill_specs, skipped = _skill_worker_specs()
-    specs.extend(skill_specs)
-    return specs, skipped
+    """The workers read once, at start: the skill loops (the gateway bridge is `--core`'s)."""
+    return _skill_worker_specs()
+
+
+CORE_LAUNCHER = _SRC / "sparrow_core_bridge.py"
+CORE_WORKER = "core-gateway-bridge"
+
+
+def core_spec(workspace=None, environ=None) -> "tuple[WorkerSpec | None, str]":
+    """The core gateway bridge's worker, or (None, why there is none). Raises when the connections
+    cannot be read: an unknown core, not an absent one."""
+    import sparrow_core_bridge as core
+    ws = workspace or resolve_workspace()
+    decision, why = core.decide(ws, os.environ if environ is None else environ)
+    if decision is None:
+        return None, why
+    return WorkerSpec(name=CORE_WORKER, argv=[sys.executable, str(CORE_LAUNCHER), f"--expect={decision['instance']}"],
+                      cwd=str(REPO), revision=core.revision(decision, ws), hold_rc=core.HOLD_RC), ""
+
+
+class CoreScan:
+    """The core worker as of each pass: [] while there is nothing to run, its last spec kept while the
+    connections cannot be read. A reason is printed when it first appears, not every pass."""
+
+    def __init__(self, workspace=None):
+        self._workspace = workspace
+        self._last: list = []
+        self._said = ""
+
+    def _say(self, why: str) -> None:
+        if why and why != self._said:
+            print(f"sparrowd: core gateway bridge — {why}", file=sys.stderr)
+        self._said = why
+
+    def __call__(self) -> list:
+        try:
+            spec, why = core_spec(self._workspace)
+        except Exception as e:  # noqa: BLE001 - an unreadable scan keeps the running core
+            self._say(f"not rescanned ({type(e).__name__}: {e}); keeping the current one")
+            return list(self._last)
+        self._say(why and f"not supervised: {why}")
+        self._last = [spec] if spec else []
+        return list(self._last)
 
 
 def worker_specs() -> list:
@@ -214,6 +250,8 @@ def parse_args(argv=None):
     ap.add_argument("--agent-bridges", action="store_true",
                     help="supervise only the agent bridges declared under <workspace>/agents (the host's "
                          "gateway bridge and the skill loops run elsewhere)")
+    ap.add_argument("--core", action="store_true",
+                    help="also supervise the host's core gateway bridge (src/sparrow_core_bridge.py)")
     ap.add_argument("--rescan-s", type=float, default=30.0, metavar="S",
                     help="seconds between scans of <workspace>/agents for added or removed declarations")
     return ap.parse_args(argv)
@@ -234,14 +272,15 @@ def main(argv=None) -> int:
             return 2
     import sparrow_agent_bridge as agent_bridge
     scan = AgentBridgeScan()
+    core = CoreScan() if args.core else (lambda: [])
     try:
         agents = scan()
     except agent_bridge.ScanUnavailable as e:  # picked up on the first pass that can be made
         print(f"sparrowd: agent bridges not scanned yet — {e}", file=sys.stderr)
         agents = []
     state_dir = resolve_workspace() / "state" / "sparrowd"
-    return run(static + agents, state_dir, rescan=lambda: static + scan(), rescan_s=args.rescan_s,
-               wait_for_lock=args.agent_bridges)
+    return run(static + core() + agents, state_dir, rescan=lambda: static + core() + scan(),
+               rescan_s=args.rescan_s, wait_for_lock=args.agent_bridges)
 
 
 if __name__ == "__main__":  # pragma: no cover
