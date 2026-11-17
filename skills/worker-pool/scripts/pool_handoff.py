@@ -71,7 +71,7 @@ def route_for(workspace, worker: str, *, sender: str, core: str, tier: str = "te
     if sender != core or worker == core or tier != "team" or relayed_from is not None or parent_task:
         if own:
             raise HandoffError(f"worker {worker} keeps its own folders, so only the core's own team-tier "
-                               "ask reaches it (over s.space); this ask cannot")
+                               "ask reaches it (through the room hand-off); this ask cannot")
         return None
     rows = _rows(workspace) if rows is None else rows
     mine = next((r for r in rows if r.get("worker") == worker), None)
