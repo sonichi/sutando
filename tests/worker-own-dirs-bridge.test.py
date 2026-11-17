@@ -45,6 +45,10 @@ class Own(S.Base):
         super().setUp()
         self.own = self.agents / S.SEG
         C.set_worker_dirs(W, True, workspace=self.ws)
+        self.holds_lane = worker_lane._holds_lane
+        lane = mock.patch.object(worker_lane, "_holds_lane", return_value=True)  # this test is the lane's bridge
+        lane.start()
+        self.addCleanup(lane.stop)
 
 
 class LaneDirs(Own):
@@ -251,6 +255,23 @@ class Adopt(Own):
         C.set_worker_dirs(W, True, workspace=self.ws)
         self.assertEqual(worker_lane.adopt_stray_results(W, self.ws, self.ws / "elsewhere"), [])
         self.assertEqual(sorted(p.name for p in shared.glob("*.txt")), sorted([lane, stamped]))
+
+    def test_a_process_that_no_longer_holds_the_lane_adopts_nothing(self):
+        shared, own = self.ws / "results", self.own / "results"
+        shared.mkdir(parents=True, exist_ok=True)
+        stamped = proactive_filename(1, "ag2space", W)
+        (shared / stamped).write_text("r")
+        with mock.patch.object(worker_lane, "_holds_lane", return_value=False):
+            self.assertEqual(worker_lane.adopt_stray_proactive(W, shared, own), [])
+        self.assertTrue((shared / stamped).exists())
+
+    def test_holding_the_lane_is_this_process_holding_its_lease(self):
+        with mock.patch.object(C, "bridge_pid", return_value=os.getpid()):
+            self.assertTrue(self.holds_lane(W, self.ws))
+        with mock.patch.object(C, "bridge_pid", return_value=os.getpid() + 1):
+            self.assertFalse(self.holds_lane(W, self.ws))
+        with mock.patch.object(C, "bridge_pid", side_effect=C.BridgeLeaseIndeterminate("x", "torn")):
+            self.assertFalse(self.holds_lane(W, self.ws))
 
     def test_the_field_cleared_mid_pass_stops_the_next_move(self):
         shared, own = self.ws / "results", self.own / "results"
