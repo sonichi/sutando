@@ -71,19 +71,44 @@ with tempfile.TemporaryDirectory() as td:
     check(not srd.is_delivered(rd, "task-B"),
           "parked is not conflated with delivered")
 
-    # refusal: re-readied for retry, parked at the attempt cap
-    t2 = srd.claim_for_send(rd, "task-C")
-    check(srd.failed(rd, t2) is True, "failed() completes (re-ready)")
-    t2 = srd.claim_for_send(rd, "task-C")
-    check(t2 is not None, "refused item is re-claimable on the next pass")
-    for _ in range(srd.PARK_AT_ATTEMPTS):
-        srd.failed(rd, t2)
-        t2 = srd.claim_for_send(rd, "task-C")
-        if t2 is None:
+# ── refusal: retried on the outbox's wall-clock window, not 5 bare attempts ─
+with tempfile.TemporaryDirectory() as td:
+    rd = Path(td) / "results"
+    rd.mkdir()
+    b = srd.result_backend(rd)
+    check(b.retry_schedule is srd.RETRY_SCHEDULE and srd.RETRY_SCHEDULE.window_s == 600.0,
+          "the Slack backend carries the outbox RetrySchedule (600 s window)")
+    clock = [1000.0]
+    b.clock = lambda: clock[0]
+    t0 = clock[0]
+    # The watcher's cadence: a claim every second, a refusal on every send.
+    sends, parked_at = 0, None
+    for sec in range(0, 700):
+        clock[0] = t0 + sec
+        tok = srd.claim_for_send(rd, "task-C")
+        if tok is not None:
+            sends += 1
+            completed = srd.failed(rd, tok)
+            if sends == 1:
+                check(completed is True, "failed() completes (re-ready)")
+        if sec == 1:
+            check(tok is None and not srd.is_parked(rd, "task-C"),
+                  "1 s after a refusal: claim waits out the backoff, item stays live")
+        if sec == 2:
+            check(tok is not None, "refused item is re-claimable once the backoff elapses")
+        if srd.is_parked(rd, "task-C"):
+            parked_at = sec
             break
-    check(t2 is None and outbox.item_status(
-              srd.result_backend(rd).root, "task-C") == "PARKED",
-          "failed() re-readies until the cap, then parks (no infinite retry)")
+    item = outbox._read_item(b.root, "task-C")
+    failures_seen = item.get("retry", {}).get("failures", item.get("attempts"))
+    print(f"   evidence: {sends} sends, parked at t0+{parked_at}s, "
+          f"reason={item.get('reason')!r}, failures={failures_seen}")
+    check(parked_at is not None and parked_at >= 600,
+          f"never parked inside the 600 s window (parked at t0+{parked_at}s)")
+    check(item.get("reason") == "retry-window-exhausted" and failures_seen >= 5,
+          "parks retry-window-exhausted once the window closed with >= 5 failures")
+    check(5 <= sends <= 30,
+          f"backoff honoured: {sends} sends across ~600 one-second passes")
 
 # ── three-state mapping for Slack send outcomes ────────────────────────────
 r = srd.receipt_for_send(True, _Resp(200, {"ok": True, "ts": "111.222"}))
@@ -124,9 +149,14 @@ with tempfile.TemporaryDirectory() as td:
                      "D123") == "delivered" and srd.is_delivered(rd, "task-S1"),
           "settle(CONFIRMED) -> delivered + outbox DELIVERED")
     tok = srd.claim_for_send(rd, "task-S2")
+    clock = [srd.result_backend(rd).clock()]
+    srd.result_backend(rd).clock = lambda: clock[0]
     check(srd.settle(rd, tok, srd.receipt_for_send(False), "D123") == "retry"
-          and srd.claim_for_send(rd, "task-S2") is not None,
-          "settle(NOT_DELIVERED) below cap -> retry, item re-claimable")
+          and srd.claim_for_send(rd, "task-S2") is None,
+          "settle(NOT_DELIVERED) inside the window -> retry, backing off")
+    clock[0] += srd.RETRY_SCHEDULE.initial_delay_s
+    check(srd.claim_for_send(rd, "task-S2") is not None,
+          "settle(NOT_DELIVERED) -> item re-claimable after the backoff")
     tok = srd.claim_for_send(rd, "task-S3")
     check(srd.settle(rd, tok, srd.receipt_for_send(False, None, TimeoutError()),
                      "D123") == "parked" and srd.is_parked(rd, "task-S3"),
@@ -152,6 +182,11 @@ settle_pos = watcher.find("_srd.settle(RESULTS_DIR, _send_tok")
 check(0 < delivered_pos < claim_pos < send_pos < settle_pos,
       "order: is_delivered -> claim_for_send -> _send_reply -> settle "
       f"({delivered_pos}, {claim_pos}, {send_pos}, {settle_pos})")
+claim_none = watcher[claim_pos:]
+claim_none = claim_none[claim_none.find("if _send_tok is None:"):]
+claim_none = claim_none[:claim_none.find("continue")]
+check("print(" not in claim_none,
+      "a claim refused during backoff is skipped quietly (no per-second log)")
 check("receipt_out=_rcpt" in watcher,
       "the reply send passes receipt_out so the outcome is provider-derived")
 parked_branch = watcher[watcher.find("_srd.is_parked(RESULTS_DIR, task_id)"):]
