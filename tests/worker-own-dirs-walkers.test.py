@@ -174,6 +174,52 @@ class Owed(Base):
         self.assertEqual(sup.owed_task_ids(self.ws, W), [])
 
 
+class UnansweredInInbox(Base):
+    """The one owed rule for a plain inbox, shared by pool supervision and the Stop hook's own-inbox scan."""
+
+    def test_ids_without_a_ready_result_claimed_names_once_and_wake_turns(self):
+        from delivery import task_dispatch
+        tasks, results = self.own / "tasks", self.own / "results"
+        (tasks / "task-a.txt").write_text("id: task-a\ntask: x\n")
+        (tasks / "task-a.claimed-core-1.txt").write_text("id: task-a\ntask: x\n")
+        (tasks / "task-b.txt").write_text("id: task-b\ntask: x\n")
+        (results / "task-b.txt").write_text("done\n")
+        (results / "task-w.txt").write_text("earlier turn\n")
+        old = time.time() - 600
+        os.utime(results / "task-w.txt", (old, old))
+        (tasks / "task-w.txt").write_text("id: task-w\nwake_episode: 2\ntask: x\n")
+        self.assertEqual([t for t, _f in task_dispatch.unanswered_in_inbox(tasks, results)], ["task-a", "task-w"])
+        self.assertEqual(task_dispatch.unanswered_in_inbox(self.ws / "missing", results), [])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(task_dispatch._main(["unanswered-in", str(tasks), str(results)]), 0)
+        self.assertEqual(out.getvalue().split("\n")[0].split("\t")[0], "task-a")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(task_dispatch._main(["unanswered-in", str(tasks), str(results), "x"]), 2)
+
+    def test_an_unlistable_inbox_owes_nothing_listed(self):
+        from delivery import task_dispatch
+        with mock.patch.object(Path, "glob", side_effect=OSError):
+            self.assertEqual(task_dispatch.unanswered_in_inbox(self.own / "tasks", self.own / "results"), [])
+
+
+class AProbeShapedId(Base):
+    PROBE = "task-0123456789abcdef01"
+
+    def test_resolves_to_the_own_home_before_and_after_it_is_answered_and_archived(self):
+        (self.own / "tasks" / f"{self.PROBE}.txt").write_text(f"id: {self.PROBE}\ntask: probe\n")
+        self.assertEqual(sup.owed_task_ids(self.ws, W), [self.PROBE])
+        self.assertFalse(health_snapshot._has_result(self.ws, self.PROBE))
+        (self.own / "results" / f"{self.PROBE}.txt").write_text("done\n")
+        self.assertEqual(sup.owed_task_ids(self.ws, W), [])
+        self.assertTrue(health_snapshot._has_result(self.ws, self.PROBE))
+        for sub in ("tasks", "results"):
+            (self.own / sub / "archive").mkdir()
+            (self.own / sub / f"{self.PROBE}.txt").rename(self.own / sub / "archive" / f"{self.PROBE}.txt")
+        self.assertTrue(C.task_home(self.PROBE, self.ws)["own"])
+        self.assertTrue(health_snapshot._has_result(self.ws, self.PROBE))
+
+
 class ActiveRows(Base):
     def rows(self):
         api = _load("agent_api_own", ROOT / "src" / "agent-api.py")

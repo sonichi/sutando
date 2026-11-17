@@ -168,6 +168,27 @@ def has_ready_result(results_dir: "Path | str", filename: str, *,
     return find_ready_result_for_filename(results_dir, filename, reader=reader) is not None
 
 
+def unanswered_in_inbox(tasks_dir: "Path | str", results_dir: "Path | str") -> "list[tuple[str, Path]]":
+    """(task id, task file) for each task file directly in a plain inbox `tasks_dir` (a worker's own
+    folder) with no ready result in `results_dir` (`has_ready_result`, wake-turn aware); a claimed name
+    counts under its task's id, once. The one rule for what such an inbox still owes."""
+    from task_archive import task_id_from_filename
+    tasks_dir = Path(tasks_dir)
+    try:
+        files = sorted(p for p in tasks_dir.glob("task-*.txt") if p.is_file())
+    except OSError:
+        return []
+    owed, seen = [], set()
+    for f in files:
+        task_id = task_id_from_filename(f.name)
+        if not task_id or task_id in seen:
+            continue
+        seen.add(task_id)
+        if not has_ready_result(results_dir, f"{task_id}.txt", task_file=f):
+            owed.append((task_id, f))
+    return owed
+
+
 def is_wake_turn(task_file: "Path | str") -> bool:
     """A queued file a woken task was written to: a new turn of an id an earlier result answered."""
     try:
@@ -479,6 +500,7 @@ _USAGE = (
     "       task_dispatch.py worker-committed <workspace> <filename>   # held AND attributed: exit 0 / 1 not / 2 cannot decide\n"
     "       task_dispatch.py announced-entry <tasks_dir> <announced> [--resolved <payload_dir>]   # prints key<TAB>payload; exit 1 refused\n"
     "       task_dispatch.py owned-by <deliveries_dir> <recipient>   # one id per line; exit 2 cannot decide\n"
+    "       task_dispatch.py unanswered-in <tasks_dir> <results_dir>   # a plain inbox: id<TAB>task file per line\n"
     "       task_dispatch.py inflight-mark <inflight_dir> <filename> <incarnation>\n"
     "       task_dispatch.py inflight-live <inflight_dir> <filename> <incarnation>   # exit 0/1\n"
     "       task_dispatch.py inflight-clear <inflight_dir> <filename>\n"
@@ -685,6 +707,13 @@ def _main(argv: list[str]) -> int:
             return 2
         for task_id in ids:
             print(task_id)
+        return 0
+    if cmd == "unanswered-in":
+        if rest:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        for task_id, task_file in unanswered_in_inbox(first, second):
+            print(f"{task_id}\t{task_file}")
         return 0
     if cmd == "announced-entry":
         if rest and (len(rest) != 2 or rest[0] != "--resolved" or not rest[1]):
