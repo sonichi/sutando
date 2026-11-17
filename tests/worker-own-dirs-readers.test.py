@@ -135,6 +135,27 @@ class HistoryAcrossTheSwitch(Base):
         self.assertIsNone(C.task_other_home(OWN_ID, self.ws))
 
 
+class AProbeShapedIdInItsInbox(Base):
+    """A plain id (no lane) whose task file is in the own inbox resolves to the own home throughout."""
+    PROBE = "task-0123456789abcdef01"
+
+    def test_before_and_after_it_is_answered_and_archived(self):
+        self.task(self.own / "tasks", self.PROBE)
+        self.assertEqual(td.task_disposition(self.ws, self.PROBE), td.PENDING)
+        self.assertTrue(C.task_home(self.PROBE, self.ws)["own"])
+        self.result(self.own / "results", self.PROBE)
+        self.assertEqual(td.task_disposition(self.ws, self.PROBE), td.ANSWERED)
+        self.assertTrue(handoffs._child_ready(self.ws, {"path": "pool", "child_ref": self.PROBE}))
+        for sub in ("tasks", "results"):
+            (self.own / sub / "archive").mkdir()
+            (self.own / sub / f"{self.PROBE}.txt").rename(self.own / sub / "archive" / f"{self.PROBE}.txt")
+        self.assertTrue(C.task_home(self.PROBE, self.ws)["own"])
+        self.assertEqual(td.task_disposition(self.ws, self.PROBE), td.ANSWERED)
+        self.assertEqual(td.task_dispositions(self.ws, [self.PROBE]), {self.PROBE: td.ANSWERED})
+        self.assertIsNotNone(task_lookup.find_task(self.ws, self.PROBE))
+        self.assertIsNotNone(task_lookup.find_result(self.ws, self.PROBE))
+
+
 class UnroutedCron(Base):
     mod = result_publish
 
