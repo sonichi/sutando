@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.process_group import popen_bound  # noqa: E402
+from _helpers.worker_identity import give_identities  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 W = "a" * 32
@@ -39,6 +40,7 @@ def run(worker_row, bound=True):
         (ws / d).mkdir(parents=True, exist_ok=True)
     (ws / "state" / "roster.json").write_text(json.dumps(
         {"version": 1, "workers": {W: worker_row}, "bindings": {ROOM: W}}))
+    give_identities(ws, W)
 
     feed = tmp / "feed"
     feed.write_text("")

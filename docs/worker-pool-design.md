@@ -219,6 +219,7 @@ roster is a refusal, never a default.
 | a target set, all on the roster | one sentinel per member, one payload; selects no subset |
 | nothing | the core's folder |
 | a target not on the roster | the core's folder — a name never created is not a worker |
+| a worker with no enabled s.space agent of its own | the core takes it, with the fix on stderr; no new work is admitted for it |
 
 **The router asks one question — is every target on the roster? — and never asks
 whether a target is up.** A sentinel is a file in a folder; a worker that starts
@@ -228,6 +229,16 @@ health-check, below, and it is a separate mechanism with its own rules.
 
 The addressed worker is never *substituted by another worker*: unknown names go
 to the core, which is a recipient rather than a fallback.
+
+**Only a worker with an agent of its own is admitted new work.** The handler
+(`pool_route_handler.classify`, through `pool_router.unconverted_targets`) declines a
+bound or requested target whose `connections.py` row is missing, disabled or parked,
+in the core watcher's pass and in a worker bridge's `--from-lane` pass alike, so the
+core takes that task and the refusal names `my-agents convert <worker>`. A record that
+cannot be read is must-handle, never a decline. A task already delivered, and a stop
+for one, still follow that delivery. The supervisor's own recovery probe
+(`pool_remedy.queue_recovery`) routes through `pool_router.route`, not the handler,
+and routes its staged copy before publishing it.
 
 `requested_worker` is honoured when the envelope carries it; the gateway maps the
 broker's `target_worker` onto that name at the boundary, so one field reaches the

@@ -513,7 +513,7 @@
     "maintainers"
    ],
    "status": "draft",
-   "canonical_for": "the v1 worker pool: durable worker identities and run history, zero-byte delivery sentinels under deliveries/<recipient>/ with the payload immutable in tasks/, the router as the core watcher's task-event handler over an owner-declared, core-compiled roster (unknown targets go to the core; liveness never routes), residue-based recovery, and the Phase 1 / Phase 2 split",
+   "canonical_for": "the v1 worker pool: durable worker identities and run history, zero-byte delivery sentinels under deliveries/<recipient>/ with the payload immutable in tasks/, the router as the core watcher's task-event handler over an owner-declared, core-compiled roster (unknown targets, and workers with no s.space agent of their own, go to the core; liveness never routes), residue-based recovery, and the Phase 1 / Phase 2 split",
    "last_verified": "2026-11-16"
   },
   "docs/worker-pool-design-notes.md": {

@@ -43,9 +43,8 @@ class FakeGh:
         return subprocess.CompletedProcess(args, self.rc, out, "")
 
 
-def file_result(**route):
-    return {"task_id": "task-x", "to": W, "route": {"delivered": [], "already": [], "skipped": [],
-                                                    "fenced": [], **route}}
+def room_result(**over):
+    return {"task_id": "task-x", "to": W, "via": "room", "status": "sent", "event_id": "$e1", **over}
 
 
 class Base(unittest.TestCase):
@@ -55,7 +54,7 @@ class Base(unittest.TestCase):
         self.ws = Path(td.name) / "ws"
         self.cache = Path(td.name) / "route"
         self.asks = []
-        self.result = file_result(delivered=[W])
+        self.result = room_result()
 
     def ask(self, ws, to, text):
         self.asks.append((ws, to, text))
@@ -109,13 +108,9 @@ class Route(Base):
         self.assertIn("owner=acme", gh.calls[0])
         self.assertIn("number=7", gh.calls[0])
 
-    def test_a_sentinel_the_watcher_pass_wrote_first_counts(self):
-        self.result = file_result(already=[W])
-        self.assertEqual(self.route()[0], f"handed {W}")
-
-    def test_a_fenced_or_skipped_file_route_is_local(self):
-        for result in (file_result(fenced=[W]), file_result(skipped=[W]), file_result(delivered=["other"]),
-                       None, {"route": None}):
+    def test_a_folder_result_or_a_post_to_another_agent_is_local(self):
+        folder = {"task_id": "task-x", "to": W, "route": {"delivered": [W], "already": []}}
+        for result in (folder, room_result(to="other"), room_result(via=None), None, {"route": None}):
             self.result = result
             out, err = self.route()
             self.assertEqual(out, "local", result)

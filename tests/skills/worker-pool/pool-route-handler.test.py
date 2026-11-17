@@ -8,6 +8,8 @@ Run: python3 tests/skills/worker-pool/pool-route-handler.test.py
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -17,9 +19,11 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "skills/worker-pool/scripts"))
+sys.path.insert(0, str(REPO / "tests"))
 
 import pool_route_handler as h
 import worker_picker_commands as wpc  # noqa: E402
+from _helpers.worker_identity import give_identities  # noqa: E402
 
 W = "a" * 32
 
@@ -31,6 +35,7 @@ class Base(unittest.TestCase):
         self.ws = Path(self._t.name)
         for d in ("tasks", "results", "state", "deliveries"):
             (self.ws / d).mkdir(parents=True, exist_ok=True)
+        give_identities(self.ws, W)
 
     def roster(self, state="live", label=None, bindings=None):
         row = {"state": state}
@@ -251,6 +256,53 @@ class TestClassification(Base):
         t = self.task_file("task-1", channel_id="!room:x")
         self.assertEqual(h.main(["--task-file", t, "--workspace", str(self.ws), "--probe"]),
                          h.DECLINE)
+
+
+class TestAWorkerWithoutItsOwnAgent(Base):
+    """New work is admitted only for a worker whose own s.space agent row is enabled."""
+
+    def handle(self, *extra, name="task-1", **headers):
+        t = self.task_file(name, **(headers or {"channel_id": "!room:x"}))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = h.main(["--task-file", t, "--workspace", str(self.ws), *extra])
+        return rc, err.getvalue()
+
+    def test_bound_or_requested_work_goes_to_the_core_and_names_the_fix(self):
+        self.roster()
+        for flags in ({}, {"disabled": True}, {"parked": True}, None):
+            with self.subTest(flags=flags):
+                if flags is None:
+                    (self.ws / "state" / "connections.json").unlink()
+                else:
+                    give_identities(self.ws, *(() if not flags else (W,)), **flags)
+                for extra in (["--probe"], [], ["--from-lane"]):
+                    rc, err = self.handle(*extra)
+                    self.assertEqual(rc, h.DECLINE, extra)
+                    self.assertIn(f"convert it first: my-agents convert {W}", err)
+                rc, _ = self.handle("--probe", name="task-2", requested_worker=W)
+                self.assertEqual(rc, h.DECLINE)
+                self.assertFalse((self.ws / "deliveries" / W).exists(), "nothing is delivered to it")
+
+    def test_the_core_needs_no_record_and_each_worker_is_judged_alone(self):
+        (self.ws / "state" / "connections.json").write_text("{not json")
+        self.assertEqual(h.rt.unconverted_targets(self.ws, [h.pr.CORE]), [], "the core reads no record")
+        other = "b" * 32
+        give_identities(self.ws, W)
+        self.assertEqual(h.rt.unconverted_targets(self.ws, [W, other, h.pr.CORE]), [other])
+
+    def test_an_unreadable_record_must_not_decline(self):
+        self.roster()
+        (self.ws / "state" / "connections.json").write_text("{not json")
+        rc, err = self.handle("--probe")
+        self.assertEqual(rc, h.MUST_HANDLE)
+        self.assertIn("has an agent of its own", err)
+
+    def test_work_already_delivered_to_it_still_follows_its_delivery(self):
+        self.roster()
+        self.assertEqual(self.handle()[0], 0)
+        give_identities(self.ws)
+        self.assertEqual(self.handle("--probe")[0], 0, "a replay follows the committed delivery")
 
 
 class TestPickerCommandsStayWithTheController(Base):

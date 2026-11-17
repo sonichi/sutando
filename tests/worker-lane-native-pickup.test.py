@@ -15,6 +15,7 @@
 Run: python3 tests/worker-lane-native-pickup.test.py
 """
 from _helpers.hermetic_env import isolate_os_environ
+from _helpers.worker_identity import give_identities
 
 isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
 
@@ -65,6 +66,7 @@ class Base(unittest.TestCase):
             (self.ws / d).mkdir()
         (self.ws / "state" / "roster.json").write_text(json.dumps(
             {"version": 1, "workers": {W: {"state": "live", "label": "fast"}}, "bindings": {}}))
+        give_identities(self.ws, W)
         self.saved = {k: getattr(rgb, k) for k in ("WS", "RESULTS_DIR", "TASK_ADDRESSEE", "PROACTIVE_CLAIM_GATE",
                                                    "PROACTIVE_OWN_FILE", "ON_TASK_CMD", "TASK_PRE_PUBLISH",
                                                    "_log")}
@@ -249,6 +251,13 @@ class OneQueuedTask(Base):
         self.assertTrue(payload.is_file(), "published to the shared inbox for the core's watcher")
         self.assertTrue(any(f"{tid} not delivered to it (router exit 3)" in line for line in self.logged),
                         self.logged)
+
+    def test_a_worker_whose_agent_row_is_disabled_gets_nothing_and_the_core_routes_it(self):
+        give_identities(self.ws, W, disabled=True)
+        payload, seen = self.publish("task-lane-5", W)
+        self.assertFalse(seen["held_before_publish"])
+        self.assertEqual(self.sentinels(W), [])
+        self.assertTrue(payload.is_file())
 
     def test_a_retired_worker_gets_nothing_and_the_core_routes_it(self):
         (self.ws / "state" / "roster.json").write_text(json.dumps(

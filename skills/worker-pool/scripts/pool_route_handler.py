@@ -7,8 +7,9 @@ only — every routing decision belongs to `pool_router`/`pool_roster`.
 
 The watcher's handler protocol carries the design's recipient rules exactly:
 
-    probe 3   decline    not a roster hit -- unbound, or a name never created.
-                          The core takes it; it is a recipient, not a fallback.
+    probe 3   decline    not a roster hit -- unbound, a name never created, or a worker
+                          with no enabled s.space agent of its own. The core takes
+                          it; it is a recipient, not a fallback.
     probe 0   accept     every target is on the roster; the real run delivers.
     4         must-handle a header id that is not the file's, or an admitted
                           target left without a sentinel: the core must not
@@ -124,6 +125,18 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     # One question only: is every target on the roster? Anything else -- no
     # binding, a name never created -- is the core's, which is a real recipient.
     if targets == [pr.CORE] or pr.unknown_targets(roster, targets):
+        return DECLINE, targets, roster
+    # A worker without an agent of its own is admitted no new work: the core takes it,
+    # as for a name never created. An unreadable record is not a decline.
+    try:
+        unconverted = rt.unconverted_targets(workspace, targets)
+    except rt.RouterRefused as e:
+        print(f"pool_route_handler: {e}", file=sys.stderr)
+        return MUST_HANDLE, [], roster
+    if unconverted:
+        print(f"pool_route_handler: {task.get('id')}: {', '.join(unconverted)} has no enabled s.space agent "
+              f"of its own, so the core takes it; convert it first: my-agents convert {unconverted[0]}",
+              file=sys.stderr)
         return DECLINE, targets, roster
     # Liveness is deliberately NOT asked: the sentinel is durable, so a worker
     # that starts later finds its work.

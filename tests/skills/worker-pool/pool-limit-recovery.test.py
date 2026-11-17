@@ -307,6 +307,33 @@ class LimitRecovery(unittest.TestCase):
             self.assertEqual(room_calls, [], "the probe never posts a room hand-off")
             self.assertTrue(sup.pd.find(ws, wid, result["task_id"]), "the probe's payload is routed")
 
+    def test_recovery_probe_is_routed_before_it_is_published(self):
+        import pool_remedy as remedy
+        router = remedy._sibling("pool_router")
+        real_route = router.route
+        seen = []
+
+        def route(ws, task, *a, **kw):
+            published = (Path(ws) / "tasks" / f"{task['id']}.txt").exists()
+            seen.append((published, kw.get("payload") is not None, kw.get("renotify", False)))
+            return real_route(ws, task, *a, **kw)
+        with tempfile.TemporaryDirectory() as directory:
+            ws = Path(directory)
+            wid = sup.wi.new_worker_id()
+            sup.pr.register_worker(ws, wid, "fixture-worker")
+            with patch.object(router, "route", side_effect=route):
+                tid = remedy.queue_recovery(ws, wid, "Outstanding fixture work")
+            self.assertEqual(seen, [(False, True, False), (True, False, True)])
+            self.assertTrue(sup.pd.find(ws, wid, tid))
+            self.assertTrue((ws / "tasks" / f"{tid}.txt").is_file())
+            with patch.object(router, "route", side_effect=router.RouterRefused("no")):
+                with self.assertRaises(router.RouterRefused):
+                    remedy.queue_recovery(ws, wid, "again")
+            with patch.object(router, "route", side_effect=[{}, OSError("renotify")]):
+                tid = remedy.queue_recovery(ws, wid, "a failed re-raise is not a failed delivery")
+            self.assertTrue((ws / "tasks" / f"{tid}.txt").is_file())
+            self.assertEqual([p.name for p in (ws / "tasks").glob(".*.tmp")], [], "no staged copy is left")
+
     @unittest.skipUnless(shutil.which("tmux"), "tmux required")
     def test_sender_refuses_a_pane_that_turned_busy_after_routing(self):
         import pool_remedy as remedy

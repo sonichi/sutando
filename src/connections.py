@@ -1468,6 +1468,11 @@ def read_rows(workspace: Optional[Path] = None) -> list:
         return []
 
 
+def read_rows_strict(workspace: Optional[Path] = None) -> list:
+    """Every row as stored, read only; [] when the record is missing. Raises on an unreadable record."""
+    return _read(record_path(workspace))
+
+
 def primary_server(workspace: Optional[Path] = None) -> str:
     """The primary row's homeserver, "" when there is none: the install's default server, which a
     caller passes to `dotspace` instead of naming one."""

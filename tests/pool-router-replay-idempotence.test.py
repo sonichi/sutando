@@ -31,8 +31,10 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "skills" / "worker-pool" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(REPO / "tests"))
 
 import pool_attribution as pa  # noqa: E402
+from _helpers.worker_identity import give_identities  # noqa: E402
 
 import pool_delivery as pd  # noqa: E402
 import pool_router as rt  # noqa: E402
@@ -60,6 +62,7 @@ def workspace(bound_to: str) -> Path:
     for d in ("tasks", "state", "deliveries"):
         (ws / d).mkdir(parents=True)
     bind(ws, bound_to)
+    give_identities(ws, A, B)
     (ws / "tasks" / "task-r.txt").write_text(
         f"id: task-r\nchannel_id: {ROOM}\nsource: ag2space\naccess_tier: owner\ntask: body\n")
     return ws

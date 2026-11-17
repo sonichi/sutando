@@ -200,6 +200,21 @@ def stop_holder(workspace, task: dict, roster=FROM_DISK) -> "str | None":
     return holder if holder and holder != pr.CORE else None
 
 
+def unconverted_targets(workspace, targets) -> list:
+    """The workers among `targets` with no enabled s.space agent of their own (`connections.py` row):
+    no new work is admitted for one. UnreadableEvidence when the record cannot be read."""
+    workers = [t for t in targets if t != pr.CORE]
+    if not workers:
+        return []
+    import connections
+    import pool_handoff
+    try:
+        rows = connections.read_rows_strict(Path(workspace) if workspace is not None else None)
+    except (connections.SchemaError, OSError) as e:
+        raise UnreadableEvidence(f"cannot tell whether {', '.join(workers)} has an agent of its own: {e}") from e
+    return [t for t in workers if pool_handoff.enabled_identity(rows, t) is None]
+
+
 def deliver_one(workspace, recipient: str, task_id: str,
                 _between_sentinel_and_attribution=None, _arbitration_seams=None, payload=None,
                 renotify=False) -> str:

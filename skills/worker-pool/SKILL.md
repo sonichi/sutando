@@ -25,7 +25,7 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `provision_e2e.py` — check that whole flow against one server, with a scan for leaked secrets (below).
 - `worker_identity.py` — worker / session / incarnation records.
 - `pool_router.py` — resolve one task to its recipients from the roster.
-- `pool_route_handler.py` — the core watcher's task-event handler (`SUTANDO_TASK_EVENT_HANDLER`): declines unbound work, delivers bound work as sentinels.
+- `pool_route_handler.py` — the core watcher's task-event handler (`SUTANDO_TASK_EVENT_HANDLER`), also run by a worker's own bridge (`--from-lane`): declines unbound work and work for a worker with no enabled agent of its own, delivers bound work as sentinels.
 - `pool_delivery.py` — a recipient's own folder: sentinels in, accept, release, done flags, and the owner's `hand_off_to_core`.
 - `pool_ask.py` — ask another instance a question (below): a worker over s.space, the core through its `tasks/`.
 - `pool_handoff.py` — the s.space leg of `pool_ask`, the only path to a worker (below).
@@ -447,7 +447,9 @@ manifest`). The usage-limit recovery probe is not an ask: the supervisor routes 
 worker's own folder (`pool_remedy.queue_recovery`).
 
 `pool_identity.py unconverted [--json]` lists every worker not retired that has no enabled agent of
-its own, with the same fix, and exits 1 while any is left.
+its own, with the same fix, and exits 1 while any is left. The router admits no new work for such a
+worker either: a task bound or addressed to it goes to the core, and the handler's stderr names the
+same fix (`docs/worker-pool-design.md`, Routing).
 
 **The reply.** The worker's lane delivers the hand-off like any message to its agent, and the
 worker answers it as an ordinary result: a reply in that message's thread. The core's gateway

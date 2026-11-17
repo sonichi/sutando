@@ -7,8 +7,8 @@ and whose head branch lives in the base repository. Its driver is the worker thi
 task named by the `Sutando-Task:` trailer of the newest commit that carries one, among the PR's last
 100 commits (`state/attribution/<task id>`). A live
 worker other than this session gets a `pool_ask`; `handed <worker id>` is printed only when that
-ask was delivered (a file sentinel, or a confirmed room post). Anything else prints `local`, with
-the reason on stderr, and the watching session keeps the event.
+ask was delivered (a confirmed room post to the worker's own agent). Anything else prints `local`,
+with the reason on stderr, and the watching session keeps the event.
 
     pool_pr_route.py --event "PR_EVENT o/r#N ..." --repo o/r --number N --head SHA \\
         --authors a,b --cache-dir DIR [--workspace WS]
@@ -141,14 +141,9 @@ def ask_text(event: str) -> str:
 
 
 def delivered(out, wid: str) -> bool:
-    """Whether pool_ask's result shows the ask reached `wid`: a confirmed room post, or a sentinel
-    in its folder (this call's or the watcher pass that routed it first)."""
-    if not isinstance(out, dict):
-        return False
-    if out.get("via"):
-        return out.get("status") == "sent" and bool(out.get("event_id"))
-    r = out.get("route") or {}
-    return wid in (r.get("delivered") or []) or wid in (r.get("already") or [])
+    """Whether pool_ask's result shows the ask reached `wid`: a confirmed room post to it."""
+    return (isinstance(out, dict) and out.get("via") == "room" and out.get("to") == wid
+            and out.get("status") == "sent" and bool(out.get("event_id")))
 
 
 def route(workspace: Path, event: str, repo: str, number: int, head: str, authors, cache_dir: Path, *,

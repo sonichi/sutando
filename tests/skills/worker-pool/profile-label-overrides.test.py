@@ -16,6 +16,7 @@ from unittest import mock
 REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / "skills/worker-pool/scripts"
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(REPO / "tests"))
 
 import pool_advertise as pa  # noqa: E402
 import pool_ask  # noqa: E402
@@ -27,6 +28,7 @@ import pool_roster as pr  # noqa: E402
 import pool_sessions  # noqa: E402
 
 import pool_wedge_cards  # noqa: E402
+from _helpers.worker_identity import give_identities  # noqa: E402
 
 W1 = "02e4302f00844397bac09533fc398248"
 W2 = "212e8040d38d48b5aadab0db295dc33a"
@@ -135,6 +137,7 @@ class ProfileLabelOverrides(unittest.TestCase):
         self.assertFalse((self.ws / "deliveries" / W2 / "task-ambiguous.txt").exists())
 
     def test_exact_id_and_core_work_despite_older_stored_reserved_names(self):
+        give_identities(self.ws, W1, W2)
         for reserved, expected_code in ((W2, 0), ("core", pool_route_handler.DECLINE)):
             with self.subTest(reserved=reserved):
                 roster = pr.load_roster(self.ws)

@@ -403,17 +403,25 @@ def ensure_input_watches(workspace, repo, observations: dict, *, runner=None) ->
 
 def queue_recovery(workspace, worker_id: str, text: str) -> str:
     """Write one task addressed to `worker_id` and route it into its own folder. The supervisor's
-    own write, not an ask: a usage-limited worker cannot take a room hand-off. Returns the task id."""
+    own write, not an ask: a usage-limited worker cannot take a room hand-off. Returns the task id.
+    It is routed before it is published, so the core's watcher never finds it unrouted."""
     import secrets
     ask = _sibling("pool_ask")
+    router = _sibling("pool_router")
     task_id = f"task-{secrets.token_hex(9)}"
     tasks = Path(workspace) / "tasks"
     tasks.mkdir(parents=True, exist_ok=True)
     tmp = tasks / f".{task_id}.txt.tmp"
     tmp.write_text(ask.compose(task_id, worker_id, text, sender=sup.pr.CORE, wait=False), encoding="utf-8")
+    task = {"id": task_id, "source": ask.SOURCE, "requested_worker": worker_id}
+    try:
+        router.route(workspace, task, payload=tmp)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     os.replace(tmp, tasks / f"{task_id}.txt")
-    _sibling("pool_router").route(workspace, {"id": task_id, "source": ask.SOURCE,
-                                              "requested_worker": worker_id})
+    with contextlib.suppress(router.RouterRefused, OSError):  # delivered; this only re-raises the pointer
+        router.route(workspace, task, renotify=True)
     return task_id
 
 
