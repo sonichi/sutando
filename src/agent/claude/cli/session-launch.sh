@@ -162,7 +162,7 @@ resolve_claude_config_dir_and_seed() {
     if [ -n "$PY" ] && "$PY" -c 'import sys' > /dev/null 2>&1; then
       # No override: claude starts in this checkout, which a git repo makes Claude Code ask
       # about (2026-10-22: a PR checkout's core restarted into that prompt and sat there).
-      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-$(cd "$REPO" && pwd -P)}" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" "$PY" - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
+      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-$(cd "$REPO" && pwd -P)}" _home="$(cd "$HOME" 2>/dev/null && pwd -P)" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" "$PY" - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
 import json, os
 ccd = os.environ["_ccd"]
 target = os.path.join(ccd, ".claude.json")
@@ -203,24 +203,20 @@ if (cfg.get("fullscreenUpsellSeenCount") or 0) < 3:
     cfg["fullscreenUpsellSeenCount"] = 3
     changed = True
     upsell_seeded = True
-# Trust-seed for the dir claude starts in. Claude Code keys the
-# folder-trust dialog on projects[<abs cwd>].hasTrustDialogAccepted; a fresh
-# scoped config lacks it, so a detached session would hang on the prompt.
-# Only pre-trust the one dir the caller explicitly chose, or else the launcher's
-# own checkout (physical path, as getcwd() reports it).
-cwd = os.environ.get("_cwd") or ""
-trusted_dir = None
-if cwd:
+# A detached session cannot answer a trust prompt: trust only its start dir and the
+# --add-dir home folder, by physical path (what getcwd() reports).
+trusted_dirs = []
+for d in dict.fromkeys(x for x in (os.environ.get("_cwd"), os.environ.get("_home")) if x):
     projects = cfg.get("projects")
     if not isinstance(projects, dict):
         projects = cfg["projects"] = {}
-    entry = projects.get(cwd)
+    entry = projects.get(d)
     if not isinstance(entry, dict):
-        entry = projects[cwd] = {}
+        entry = projects[d] = {}
     if entry.get("hasTrustDialogAccepted") is not True:
         entry["hasTrustDialogAccepted"] = True
         changed = True
-        trusted_dir = cwd
+        trusted_dirs.append(d)
 # Dangerous-mode seed (env-gated, detached-only). A session launched with
 # --dangerously-skip-permissions shows a "Bypass Permissions mode / Yes, I
 # accept" prompt on first run in a fresh scoped config, which that flag does
@@ -251,8 +247,8 @@ if changed:
     print("  ✓ onboarding-seed: hasCompletedOnboarding set in .claude.json")
     if chrome_seeded:
         print("  ✓ chrome-seed: hasCompletedClaudeInChromeOnboarding set in .claude.json")
-    if trusted_dir:
-        print("  ✓ trust-seed: hasTrustDialogAccepted set for %s" % trusted_dir)
+    for d in trusted_dirs:
+        print("  ✓ trust-seed: hasTrustDialogAccepted set for %s" % d)
     if upsell_seeded:
         print("  ✓ upsell-seed: fullscreenUpsellSeenCount set in .claude.json")
 PY
