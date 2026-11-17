@@ -106,6 +106,39 @@ class Forward(Base):
         self.assertIn("did not run", why)
         self.assertIsNotNone(C.worker_dirs(W, self.ws), "the field stays set: a re-run finishes")
 
+    def test_a_failed_handler_lookup_switches_nothing(self):
+        with mock.patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("bash", 10)):
+            out, why = worker_lane.migrate_dirs(W, self.ws)
+        self.assertIn("lookup failed", why)
+        self.assertIn("nothing was switched", why)
+        self.assertIsNone(C.worker_dirs(W, self.ws))
+
+    def test_a_declared_but_unusable_handler_switches_nothing(self):
+        cfg = self.ws / "state" / "task-event-handler.json"
+        cfg.write_text(json.dumps({"handler": str(self.ws / "missing")}))
+        out, why = worker_lane.migrate_dirs(W, self.ws)
+        self.assertIn("declared but unusable", why)
+        self.assertIsNone(C.worker_dirs(W, self.ws))
+        self.assertEqual(worker_lane.declared_handler(self.ws), "")
+
+    def test_no_handler_with_owed_deliveries_switches_nothing(self):
+        self.deliver(self.core)
+        out, why = worker_lane.migrate_dirs(W, self.ws)
+        self.assertIn("1 task(s) delivered", why)
+        self.assertIsNone(C.worker_dirs(W, self.ws))
+        from delivery import task_dispatch
+        with mock.patch.object(task_dispatch, "owned_task_ids", side_effect=task_dispatch.WorkerHoldUnreadable("io")):
+            self.assertIn("io; nothing was switched", worker_lane.migrate_dirs(W, self.ws)[1])
+
+    def test_no_handler_and_no_deliveries_switches(self):
+        out, why = worker_lane.migrate_dirs(W, self.ws)
+        self.assertEqual(why, "")
+        self.assertIsNotNone(C.worker_dirs(W, self.ws))
+
+    def test_the_declared_handler_is_found(self):
+        handler = self.declare_handler()
+        self.assertEqual(worker_lane.handler_lookup(self.ws), (str(handler), ""))
+
     def test_with_the_real_handler_its_delivered_work_moves(self):
         self.deliver(self.mine)
         self.deliver(self.core)

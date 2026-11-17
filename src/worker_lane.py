@@ -59,17 +59,27 @@ class RecordUnreadable(Exception):
     """The connection record could not be read: whether an agent is a worker's is unknown."""
 
 
-def declared_handler(workspace) -> str:
-    """The core's declared task-event handler (the pool router); "" when none is declared."""
+def handler_lookup(workspace) -> "tuple[str, str]":
+    """(the core's declared task-event handler, ''); ('', '') when provably none is declared (no pin, no
+    config file); ('', why) when the lookup failed or a declared one is unusable."""
     from util_paths import task_event_handler_config_path
     cfg = task_event_handler_config_path(Path(workspace) / "state")
     try:
         out = subprocess.run(["bash", "-c", 'source "$1" && task_event_handler "$2"', "lane-route",
                               str(HANDLER_LOOKUP), str(cfg)], capture_output=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return "", f"the task-event handler lookup failed ({e!r})"
     handler = os.fsdecode(out.stdout.removesuffix(b"\n"))
-    return handler if out.returncode == 0 else ""
+    if out.returncode == 0 and handler:
+        return handler, ""
+    if os.environ.get("SUTANDO_TASK_EVENT_HANDLER") or cfg.exists():
+        return "", f"a task-event handler is declared but unusable (lookup exit {out.returncode})"
+    return "", ""
+
+
+def declared_handler(workspace) -> str:
+    """The core's declared task-event handler (the pool router); "" when none is declared or usable."""
+    return handler_lookup(workspace)[0]
 
 
 def route_argv(workspace, results_dir) -> "list[str]":
@@ -446,13 +456,25 @@ def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=s
                 os.utime(ws / "tasks" / name)  # the core's watcher picks it up again
         out.update(tasks_returned=moved, results_returned=_move_live(results, ws / "results", _live_txt(results)))
         return out, ""
+    # Nothing is committed until it is known who can move the worker's delivered work.
+    handler, problem = handler_lookup(ws) if handler is None else (handler, "")
+    if problem:
+        return out, f"{problem}; nothing was switched, re-run once it is fixed"
+    if not handler:
+        from delivery.task_dispatch import WorkerHoldUnreadable, owned_task_ids
+        try:
+            owed = owned_task_ids(ws / "deliveries", worker)
+        except WorkerHoldUnreadable as e:
+            return out, f"{e}; nothing was switched"
+        if owed:
+            return out, (f"{len(owed)} task(s) delivered to {worker} but no task-event handler can move them; "
+                         "nothing was switched")
     for d in (tasks / "archive", results / "archive"):
         d.mkdir(parents=True, exist_ok=True)
     try:
         set_worker_dirs(worker, True, workspace=ws)
     except ConnectionsError as e:
         return out, str(e)
-    handler = declared_handler(ws) if handler is None else handler
     if handler:
         try:
             done = run([handler, "--workspace", str(ws), "--migrate-dirs", "--worker", worker],
