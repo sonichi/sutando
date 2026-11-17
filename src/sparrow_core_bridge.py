@@ -12,8 +12,12 @@ this one. Unlike a declared agent bridge it keeps the host's owner DM, device en
 `revision` is what sparrowd restarts the core on: the decision, the token file's bytes and the row's
 token_ref, gateway URL and agent. An exit 75 (`HOLD_RC`) is the bridge's stand-down; sparrowd holds it
 until that revision changes. A restart is told the previous exit code (SPARROWD_LAST_RC): 69, the
-bridge's poll stall, raises no alert; any other code the wrapper's alert, with its deliberate-restart
-window and cooldown.
+bridge's poll stall, and 78, this launcher's own failure (no bridge ran), raise no alert; any other code
+the wrapper's alert, with its deliberate-restart window and cooldown.
+
+One supervisor per bridge: a bridge of this checkout already serving the lane is evicted only when it
+is a stray (its parent gone, or this sparrowd); one another live process supervises (an app keepalive,
+the gate-off wrapper) is refused, and the launcher retries with backoff until that supervisor is gone.
 """
 from __future__ import annotations
 
@@ -35,11 +39,14 @@ for _p in (str(_SRC), str(REPO / "packages" / "ag2-sparrow")):
 import connections  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
+from ag2_sparrow.exit_codes import POLL_STALL_EXIT_CODE  # noqa: E402
+
 LOADER = _SRC / "remote-gateway-bridge.py"
 LIB = _SRC / "launchd" / "gateway-bridge-lib.sh"
 EVICT = _SRC / "launchd" / "evict-own-bridge.sh"
 HOLD_RC = frozenset({75})
-POLL_STALL_RC = "69"
+POLL_STALL_RC = str(POLL_STALL_EXIT_CODE)
+LAUNCHER_FAILED_RC = 78  # EX_CONFIG: the launcher could not start a bridge; no bridge exited
 LAST_RC_ENV = "SPARROWD_LAST_RC"
 LOG_TAG = "sparrow-core-bridge"
 
@@ -139,6 +146,27 @@ def evict_stray(instance: str, workspace: Path, repo: Path = REPO, run: Callable
                 "GATEWAY_INSTANCE", instance], env=env).returncode
 
 
+def _ppid(pid: int, run: Callable = subprocess.run) -> int:
+    try:
+        out = run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=10).stdout
+        return int(out.strip() or 0)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0
+
+
+def outside_supervisor(instance: str, workspace: Path, ppid: Callable = _ppid) -> str:
+    """The lease holder serving `instance` with a live parent other than this sparrowd: another supervisor
+    keeps it, so evicting it would start an eviction loop. "" for a stray (orphaned) bridge or none."""
+    try:
+        holder = connections.bridge_pid(instance, workspace)
+    except connections.BridgeLeaseIndeterminate:
+        return ""
+    parent = ppid(holder) if holder else 0
+    if parent in (0, 1, os.getppid()):
+        return ""
+    return f"pid {holder} (parent pid {parent})"
+
+
 def alias_holder(instance: str, workspace: Path) -> int:
     """The pid serving a named lane under one of its launch-key aliases, 0 when none."""
     for alias in connections.alias_instances(_row(instance, workspace)):
@@ -153,7 +181,10 @@ def restart_alert(last_rc: Optional[str], workspace: Path, repo: Path = REPO, ru
     if last_rc is None:
         return
     if last_rc == POLL_STALL_RC:
-        _log("bridge exited on a poll stall (rc 69); relaunching without an owner alert")
+        _log(f"bridge exited on a poll stall (rc {POLL_STALL_RC}); relaunching without an owner alert")
+        return
+    if last_rc == str(LAUNCHER_FAILED_RC):
+        _log("the last start failed before any bridge ran; no owner alert")
         return
     run(["bash", str(Path(repo) / "src" / "launchd" / LIB.name), "alert"],
         env={**os.environ, "REPO": str(repo), "WORKSPACE": str(workspace), "GW_LOG_TAG": LOG_TAG})
@@ -171,7 +202,7 @@ def _lane_log(instance: str, workspace: Path) -> None:
 
 def main(argv=None, *, workspace: Optional[Path] = None, environ: Optional[Mapping[str, str]] = None,
          execve: Callable = os.execve, evict: Callable = evict_stray, alert: Callable = restart_alert,
-         vault=None, legacy: Optional[Callable] = None) -> int:
+         vault=None, legacy: Optional[Callable] = None, outside: Callable = outside_supervisor) -> int:
     ap = argparse.ArgumentParser(description="run the host's core gateway bridge in place (sparrowd --core)")
     ap.add_argument("--expect", default=None, metavar="INSTANCE",
                     help="the bridge sparrowd's scan decided on ('' = legacy); another one now stands down")
@@ -183,7 +214,7 @@ def main(argv=None, *, workspace: Optional[Path] = None, environ: Optional[Mappi
         decision, why = decide(ws, environ, legacy=legacy)
     except (CoreUnavailable, connections.ConnectionsError) as e:
         _log(f"core bridge not started: {e}")
-        return 1
+        return LAUNCHER_FAILED_RC
     if decision is None:
         _log(f"nothing to run: {why}; held until the connections change")
         return 75
@@ -197,14 +228,19 @@ def main(argv=None, *, workspace: Optional[Path] = None, environ: Optional[Mappi
         holder = alias_holder(inst, ws) if inst else 0
     except connections.ConnectionsError as e:
         _log(f"core bridge {inst or '(legacy)'} not started: {e}")
-        return 1
+        return LAUNCHER_FAILED_RC
     if holder:
         _log(f"lane {inst} already runs under an alias (pid {holder}); standing down")
         return 75
+    owner = outside(inst, ws)
+    if owner:
+        _log(f"refusing to start: {inst or 'the legacy bridge'} is already supervised outside sparrowd: {owner}. "
+             "Stop that supervisor first; retrying with backoff")
+        return LAUNCHER_FAILED_RC
     rc = evict(inst, ws)
     if rc != 0:
         _log(f"eviction did not complete (rc {rc}); not launching")
-        return rc
+        return LAUNCHER_FAILED_RC
     alert(last_rc, ws)
     argv_exec = [sys.executable, str(LOADER)]
     if inst:

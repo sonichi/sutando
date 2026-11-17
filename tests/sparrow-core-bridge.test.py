@@ -255,6 +255,7 @@ class Named(H.Base):
         seen = {}
         kw.setdefault("evict", lambda inst, ws: 0)
         kw.setdefault("alert", lambda rc, ws: None)
+        kw.setdefault("outside", lambda inst, ws: "")
         err = io.StringIO()
         with mock.patch.object(core, "_lane_log", lambda inst, ws: seen.update(log=inst)), contextlib.redirect_stderr(err):
             rc = core.main(list(argv), workspace=self.ws, environ=self.environ, vault=self.vault,
@@ -281,11 +282,11 @@ class Named(H.Base):
 
     def test_main_backs_off_when_the_core_cannot_be_read_or_built(self):
         with mock.patch.object(C, "legacy_parked", side_effect=C.SchemaError("bad record")):
-            self.assertEqual(self.run_main()[0], 1)
+            self.assertEqual(self.run_main()[0], core.LAUNCHER_FAILED_RC)
         with mock.patch.object(C, "legacy_parked", return_value=True), \
                 mock.patch.object(C, "launch_env", side_effect=C.NoToken("no token")):
             rc, seen, err = self.run_main([f"--expect={self.inst}"])
-        self.assertEqual((rc, seen), (1, {}))
+        self.assertEqual((rc, seen), (core.LAUNCHER_FAILED_RC, {}))
         self.assertIn("no token", err)
 
     def test_main_stands_down_to_an_alias_and_never_launches_past_a_failed_eviction(self):
@@ -297,7 +298,42 @@ class Named(H.Base):
         self.assertIn("already runs under an alias (pid 4242)", err)
         with mock.patch.object(C, "legacy_parked", return_value=True):
             rc, seen, err = self.run_main([f"--expect={self.inst}"], evict=lambda inst, ws: 4)
-        self.assertEqual((rc, seen), (4, {}))
+        self.assertEqual((rc, seen), (core.LAUNCHER_FAILED_RC, {}))
+
+    def test_a_primary_with_no_recorded_agent_fails_without_an_owner_alert(self):
+        rec = json.loads(C.record_path(self.ws).read_text())
+        for r in rec["connections"]:
+            r.pop("agent_mxid", None)
+        C.record_path(self.ws).write_text(json.dumps(rec))
+        alerts = []
+        with mock.patch.object(C, "legacy_parked", return_value=True):
+            rc, seen, err = self.run_main([f"--expect={self.inst}"])
+        self.assertEqual((rc, seen), (core.LAUNCHER_FAILED_RC, {}))
+        self.assertIn("has no recorded agent", err)
+        with contextlib.redirect_stderr(io.StringIO()) as said:
+            core.restart_alert(str(rc), self.ws, run=lambda *a, **k: alerts.append(a))
+        self.assertEqual(alerts, [], "the restart after a launcher failure tells the owner nothing")
+        self.assertIn("no owner alert", said.getvalue())
+
+    def test_a_bridge_another_live_supervisor_keeps_is_refused_not_evicted(self):
+        evicted = []
+        with mock.patch.object(C, "legacy_parked", return_value=True):
+            rc, seen, err = self.run_main([f"--expect={self.inst}"], outside=lambda inst, ws: "pid 7 (parent pid 9)",
+                                          evict=lambda inst, ws: evicted.append(inst) or 0)
+        self.assertEqual((rc, seen, evicted), (core.LAUNCHER_FAILED_RC, {}, []))
+        self.assertIn("already supervised outside sparrowd: pid 7 (parent pid 9)", err)
+
+    def test_outside_supervisor_names_only_a_holder_with_a_live_foreign_parent(self):
+        cases = ((0, None, ""), (31, 1, ""), (31, 0, ""), (31, os.getppid(), ""), (31, 4242, "pid 31 (parent pid 4242)"))
+        for holder, parent, want in cases:
+            with self.subTest(holder=holder, parent=parent), mock.patch.object(C, "bridge_pid", return_value=holder):
+                self.assertEqual(core.outside_supervisor(self.inst, self.ws, ppid=lambda pid: parent), want)
+        with mock.patch.object(C, "bridge_pid", side_effect=C.BridgeLeaseIndeterminate("", "?")):
+            self.assertEqual(core.outside_supervisor(self.inst, self.ws), "")
+
+    def test_ppid_reads_ps_and_an_unreadable_answer_is_zero(self):
+        self.assertEqual(core._ppid(os.getpid()), os.getppid())
+        self.assertEqual(core._ppid(1, run=lambda *a, **k: subprocess.CompletedProcess(a, 0, "x\n", "")), 0)
 
     def test_alias_holder_is_zero_when_no_alias_serves(self):
         with mock.patch.object(C, "alias_instances", return_value=["alias-x"]), \
@@ -341,8 +377,10 @@ class Edges(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             core.restart_alert(None, Path("/ws"), run=run)
             core.restart_alert("69", Path("/ws"), run=run)
+            core.restart_alert("78", Path("/ws"), run=run)
             core.restart_alert("-15", Path("/ws"), repo=Path("/repo"), run=run)
         self.assertIn("poll stall (rc 69); relaunching without an owner alert", err.getvalue())
+        self.assertIn("failed before any bridge ran; no owner alert", err.getvalue())
         self.assertEqual(calls, [(["bash", "/repo/src/launchd/gateway-bridge-lib.sh", "alert"], "/ws", core.LOG_TAG)])
 
     def test_a_named_lane_logs_to_its_own_file(self):
@@ -358,6 +396,15 @@ class Edges(unittest.TestCase):
                 os.close(saved[0])
                 os.close(saved[1])
             self.assertEqual((Path(d) / "logs" / "remote-gateway-bridge.lane-a.log").read_text(), "out\nerr\n")
+
+
+class OneExitCodeOwner(unittest.TestCase):
+    def test_the_poll_stall_code_is_the_bridges_own(self):
+        from ag2_sparrow import exit_codes
+        self.assertEqual(core.POLL_STALL_RC, str(exit_codes.POLL_STALL_EXIT_CODE))
+        src = (ROOT / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
+        self.assertIn("from .exit_codes import POLL_STALL_EXIT_CODE", src)
+        self.assertNotIn("POLL_STALL_EXIT_CODE = ", src)
 
 
 class TheCoreScan(unittest.TestCase):
