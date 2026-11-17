@@ -474,6 +474,9 @@ class Actions:
     def read(self, action: str, arguments: dict, room_id: str) -> dict:
         return self.tool("room.action.read", {"action": action, "room_id": room_id, "arguments": arguments})
 
+    def read_account(self, action: str, arguments: dict) -> dict:
+        return self.tool("room.action.read", {"action": action, "target_kind": "account", "arguments": arguments})
+
 
 def core_actions(workspace: Optional[Path] = None, lane: Optional[str] = None, *, vault=None,
                  request: Optional[Callable[..., Reply]] = None) -> Tuple["Actions", dict]:
