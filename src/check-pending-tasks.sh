@@ -235,7 +235,7 @@ elif [ -n "$OWN_INBOX" ]; then
 
 "
   else
-    OWED="$("$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" unanswered-in "$TASKS_DIR" "$RESULTS_DIR" 2>/dev/null)"
+    OWED="$("$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" unanswered-in "$TASKS_DIR" "$RESULTS_DIR" --workspace "$WORKSPACE" 2>/dev/null)"
     while IFS=$'\t' read -r TASK_ID f; do
       [ -n "$TASK_ID" ] || continue
       task_in_progress "$TASK_ID" "$f" && continue
