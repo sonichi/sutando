@@ -311,6 +311,7 @@ def route(workspace, task: dict, roster=FROM_DISK, _between_suffix_checks=None, 
         if committed is None:
             committed = stop_holder(workspace, task, roster=snapshot)   # a stop follows its task
         if committed is not None:
+            # Not filtered for own folders: switching a worker to them empties its deliveries/ first.
             targets, unknown, r = [committed], [], (snapshot if isinstance(snapshot, dict) else {})
         else:
             r = snapshot
@@ -327,7 +328,12 @@ def route(workspace, task: dict, roster=FROM_DISK, _between_suffix_checks=None, 
             unknown = pr.unknown_targets(r, targets)
             if unknown:
                 targets = [pr.CORE]
-            targets = without_own_dir_workers(workspace, targets)
+            own = own_dir_workers(workspace, targets)
+            if own:
+                targets = without_own_dir_workers(workspace, targets)
+                unknown = unknown + own
+                print(f"pool_router: {task_id} not delivered to {', '.join(own)}: on its own folders, it is "
+                      f"reached through its own agent; routed to {', '.join(targets)}", file=sys.stderr)
 
         # Liveness is not consulted: a durable sentinel is found by a worker that starts later.
         # "no-payload" stays its own list: folded into `already` a refusal reads as delivered.

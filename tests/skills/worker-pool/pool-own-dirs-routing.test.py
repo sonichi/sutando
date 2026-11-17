@@ -94,12 +94,16 @@ class Base(unittest.TestCase):
 class Router(Base):
     def test_a_room_bound_to_an_own_dir_worker_falls_to_the_core(self):
         pr.bind_room(self.ws, ROOM, self.alpha)
-        out = rt.route(self.ws, self.task("task-r1", channel_id=ROOM))
-        self.assertEqual(out["targets"], [pr.CORE])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            out = rt.route(self.ws, self.task("task-r1", channel_id=ROOM))
+        self.assertEqual((out["targets"], out["redirected"]), ([pr.CORE], [self.alpha]))
+        self.assertIn(f"task-r1 not delivered to {self.alpha}", err.getvalue())
         self.assertEqual(self.sentinels(self.alpha), [])
 
     def test_a_task_naming_an_own_dir_worker_falls_to_the_core(self):
-        out = rt.route(self.ws, self.task("task-r2", requested_worker=self.alpha))
+        with contextlib.redirect_stderr(io.StringIO()):
+            out = rt.route(self.ws, self.task("task-r2", requested_worker=self.alpha))
         self.assertEqual(out["targets"], [pr.CORE])
         self.assertEqual(self.sentinels(self.alpha), [])
 
@@ -121,8 +125,10 @@ class Router(Base):
         tid = "task-h1"
         self.task(tid, channel_id=ROOM)
         argv = ["--task-file", str(self.ws / "tasks" / f"{tid}.txt"), "--workspace", str(self.ws)]
-        with contextlib.redirect_stderr(io.StringIO()):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
             self.assertEqual(prh.main(argv), prh.DECLINE)
+        self.assertIn(f"{tid} not routed to {self.alpha}", err.getvalue())
         self.assertEqual(self.sentinels(self.alpha), [])
         self.record(own=False)
         with contextlib.redirect_stderr(io.StringIO()):

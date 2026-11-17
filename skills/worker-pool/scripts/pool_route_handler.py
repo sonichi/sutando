@@ -126,7 +126,11 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     if targets == [pr.CORE] or pr.unknown_targets(roster, targets):
         return DECLINE, targets, roster
     # A worker on its own folders is reached through its own agent, never routed to.
+    own = rt.own_dir_workers(workspace, targets)
     targets = rt.without_own_dir_workers(workspace, targets)
+    if own:
+        print(f"pool_route_handler: {task.get('id')} not routed to {', '.join(own)} (on its own folders, "
+              f"reached through its own agent)", file=sys.stderr)
     if targets == [pr.CORE]:
         return DECLINE, targets, roster
     # Liveness is deliberately NOT asked: the sentinel is durable, so a worker
