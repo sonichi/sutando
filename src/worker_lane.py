@@ -457,7 +457,32 @@ def _live_txt(folder) -> "list[str]":
         return []
 
 
-def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=subprocess.run) -> "tuple[dict, str]":
+def relaunch_lane(worker: str, workspace, kill=None, procs=None) -> "tuple[str, str]":
+    """Make the process serving `worker`'s lane pick up its folders anew; (what happens, '' or why not).
+    A declared bridge is restarted by sparrowd (the field is in its revision); any other holder is
+    stopped, so the lane keeper starts it again on the switched folders."""
+    from connections import BridgeLeaseIndeterminate, BridgeStillRunning, _stop_row, bridge_pid, worker_identity
+    ws = Path(workspace)
+    row = worker_identity(worker, ws) or {}
+    instance = str(row.get("instance") or "")
+    try:
+        pid = bridge_pid(instance, ws) if instance else 0
+    except BridgeLeaseIndeterminate as e:
+        return "", f"whether the lane runs cannot be told ({e}); re-run"
+    if not pid:
+        return "not-running", ""
+    decl, _why = _declaration_for(worker, ws)
+    if decl and held_by(pid, processes() if procs is None else procs, decl["path"]) == "declared-bridge":
+        return "restarted-by-sparrowd", ""
+    try:
+        _stop_row(row, ws, kill)
+    except (BridgeStillRunning, BridgeLeaseIndeterminate) as e:
+        return "", f"lane {instance} did not stop ({e}); re-run"
+    return f"stopped pid {pid}; the lane keeper starts it again", ""
+
+
+def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=subprocess.run,
+                 kill=None, procs=None) -> "tuple[dict, str]":
     """Switch `worker` onto its own folders (or back, `undo`); (what was done, '' or why it stopped).
     Idempotent: a re-run picks up whatever an interrupted one left."""
     from connections import ConnectionsError, ensure_worker_dirs, set_worker_dirs, worker_identity, worker_root
@@ -467,10 +492,14 @@ def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=s
         return {"worker": worker}, f"worker {worker} has no agent identity row"
     root = worker_root(mxid, ws)
     tasks, results = root / "tasks", root / "results"
-    out = {"worker": worker, "tasks": str(tasks), "results": str(results), "undo": undo}
+    out = {"worker": worker, "tasks": str(tasks), "results": str(results), "undo": undo, "respawn_needed": True}
     if undo:
         set_worker_dirs(worker, False, workspace=ws)
-        moved = _move_live(tasks, ws / "tasks", _live_txt(tasks))
+        out["lane"], why = relaunch_lane(worker, ws, kill, procs)
+        if why:
+            return out, why
+        from delivery.task_dispatch import has_ready_result
+        moved = _move_live(tasks, ws / "tasks", [n for n in _live_txt(tasks) if not has_ready_result(results, n)])
         for name in moved:
             with contextlib.suppress(OSError):
                 os.utime(ws / "tasks" / name)  # the core's watcher picks it up again
@@ -494,6 +523,9 @@ def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=s
         ensure_worker_dirs(worker, ws)
     except (ConnectionsError, OSError) as e:
         return out, str(e)
+    out["lane"], why = relaunch_lane(worker, ws, kill, procs)
+    if why:
+        return out, why
     if handler:
         try:
             done = run([handler, "--workspace", str(ws), "--migrate-dirs", "--worker", worker],
@@ -538,7 +570,7 @@ def main(argv=None, workspace=None, vault=None, procs=None, run=subprocess.run) 
         from workspace_default import resolve_workspace
         workspace = resolve_workspace()
     if args.action == "migrate-dirs":
-        out, why = migrate_dirs(args.worker, workspace, args.undo, run=run)
+        out, why = migrate_dirs(args.worker, workspace, args.undo, run=run, procs=procs)
         print(json.dumps(dict(out, ok=not why, **({"why": why} if why else {})), sort_keys=True))
         return 1 if why else 0
     if args.action == "status":

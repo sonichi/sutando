@@ -230,13 +230,18 @@ class Undo(Base):
         self.migrate()
         (self.own / "tasks" / f"{self.mine}.txt").write_text("t")
         os.utime(self.own / "tasks" / f"{self.mine}.txt", (1, 1))
-        (self.own / "results" / f"{self.mine}.txt").write_text("r")
+        answered = f"task-{self.lane}~b2"
+        (self.own / "tasks" / f"{answered}.txt").write_text("t")
+        (self.own / "results" / "archive").mkdir(parents=True, exist_ok=True)
+        (self.own / "results" / "archive" / f"{answered}.txt").write_text("done")
+        (self.own / "results" / "task-x.txt").write_text("r")
         out, why = self.migrate(undo=True)
-        self.assertEqual((why, out["tasks_returned"], out["results_returned"]),
-                         ("", [f"{self.mine}.txt"], [f"{self.mine}.txt"]))
+        self.assertEqual((why, out["tasks_returned"], out["results_returned"], out["respawn_needed"], out["lane"]),
+                         ("", [f"{self.mine}.txt"], ["task-x.txt"], True, "not-running"))
+        self.assertTrue((self.own / "tasks" / f"{answered}.txt").is_file(), "an answered task stays")
         self.assertIsNone(C.worker_dirs(W, self.ws))
         self.assertGreater((self.ws / "tasks" / f"{self.mine}.txt").stat().st_mtime, 1)
-        self.assertTrue((self.ws / "results" / f"{self.mine}.txt").is_file())
+        self.assertTrue((self.ws / "results" / "task-x.txt").is_file())
         again, why = self.migrate(undo=True)
         self.assertEqual((why, again["tasks_returned"], again["results_returned"]), ("", [], []))
 
@@ -248,6 +253,31 @@ class Undo(Base):
         out, _ = self.migrate(undo=True)
         self.assertEqual(out["results_returned"], [])
         self.assertEqual((self.ws / "results" / "task-x.txt").read_text(), "shared")
+
+
+class TheLane(Base):
+    def test_a_running_wrapper_lane_is_stopped_so_the_keeper_restarts_it_switched(self):
+        from _helpers import bridge_lease
+        proc = bridge_lease.start(self.ws, self.lane)
+        self.addCleanup(bridge_lease.stop, proc)
+        out, why = self.migrate(procs={})
+        self.assertEqual(why, "")
+        self.assertEqual(out["lane"], f"stopped pid {proc.pid}; the lane keeper starts it again")
+        self.assertIsNotNone(proc.wait(timeout=10))
+        self.assertEqual(C.bridge_pid(self.lane, self.ws), 0)
+
+    def test_a_declared_bridge_is_left_to_sparrowd(self):
+        with mock.patch.object(C, "bridge_pid", return_value=4242), \
+                mock.patch.object(worker_lane, "held_by", return_value="declared-bridge"):
+            self.assertEqual(worker_lane.relaunch_lane(W, self.ws, procs={}), ("restarted-by-sparrowd", ""))
+
+    def test_a_lane_that_will_not_stop_or_cannot_be_told_says_rerun(self):
+        with mock.patch.object(C, "bridge_pid", side_effect=C.BridgeLeaseIndeterminate(self.lane, "torn")):
+            self.assertIn("cannot be told", self.migrate()[1])
+        with mock.patch.object(C, "bridge_pid", return_value=4242), \
+                mock.patch.object(C, "_stop_row", side_effect=C.BridgeStillRunning(self.lane, 4242)):
+            out, why = self.migrate(undo=True, procs={})
+        self.assertIn("did not stop", why)
 
 
 class TheCli(Base):
