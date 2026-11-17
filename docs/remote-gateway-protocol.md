@@ -98,15 +98,14 @@ not become approvals. The same parser handles private-result review decisions.
 Owner identity, the target card and its current revision/guard remain required;
 an unthreaded Yes does not approve an arbitrary pending prompt.
 
-A worker-picker button may be sent as `"picker_command"` (`add` | `pin` |
-`unpin`) plus optional `"picker_args"` — a JSON object, either inline or
-already serialized as a string; the bridge writes it as JSON either way. Both
-are written as trusted pre-body headers, because `worker_picker_commands.py`
-reads them with the parser that stops at `task:`. A command the reader cannot
-honour — an unknown verb, args that are not an object, or arguments that do not
-fit the verb — is refused by name rather than resolved from the sentence, and
-the room always comes from `channel_id`, never from `picker_args`. A broker
-that sends no `picker_command` keeps the prose fallback.
+A worker-picker button may be sent as `"picker_command"` plus optional
+`"picker_args"` — a JSON object, either inline or already serialized as a
+string; the bridge writes it as JSON either way. Both are written as trusted
+pre-body headers, so a reader that stops at `task:` sees them and a body copy
+is never one. The task goes to the core, never to a worker bound to the room.
+Only the `add` button remains: the pool no longer applies `pin` or `unpin`, so a
+room is bound to a worker with `pool_roster.py bind`, and a converted worker
+(one on its own task folders) is never routed to at all.
 
 An s.space broker may additionally send `"session_scope": "room"`. The
 bridge writes only that exact value as a trusted pre-body header; missing,

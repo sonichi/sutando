@@ -1035,7 +1035,6 @@
 2 tests/skills/worker-pool/create-worker-command.test.py
 1 tests/skills/worker-pool/create-worker-concurrency.test.py
 31 tests/skills/worker-pool/create-worker-roster-preflight.test.py
-3 tests/skills/worker-pool/picker-apply-concurrency.test.py
 5 tests/skills/worker-pool/pool-advertise.test.py
 1 tests/skills/worker-pool/pool-ask.test.py
 0 tests/skills/worker-pool/pool-attribution.test.py
@@ -1067,7 +1066,6 @@
 3 tests/skills/worker-pool/worker-bootstrap-decision.test.py
 23 tests/skills/worker-pool/worker-config-directory.test.py
 1 tests/skills/worker-pool/worker-identity-records.test.py
-0 tests/skills/worker-pool/worker-picker-commands.test.py
 1 tests/skip-ask-user-question.test.py
 0 tests/slack-access-shared-semantics.test.py
 0 tests/slack-bridge-access-durable-backup.test.py

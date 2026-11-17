@@ -324,8 +324,8 @@ what a run creates on the server.
 ## Binding a room to an existing worker
 
 `pool_roster.py:bind_room(workspace, room, target)` pins one room to one
-already-registered worker (by id or unique label) — the picker's "pin" action
-and `pool_roster.py bind` both go through it. **It does not call
+already-registered worker (by id or unique label) — `pool_roster.py bind` goes
+through it (the picker's pin and unpin buttons are no longer applied). **It does not call
 `publish_task_event_handler()`.** `register_worker()` (and therefore
 `create_worker.py`) does, on every call, because a registration that leaves
 the core watcher without its route handler is a pool the launcher cannot
