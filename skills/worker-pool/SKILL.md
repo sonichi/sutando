@@ -243,6 +243,7 @@ python3 skills/worker-pool/scripts/pool_identity.py rooms <worker>
 python3 skills/worker-pool/scripts/pool_identity.py hand-room <worker> --room <room> [--wait SECONDS]
 python3 skills/worker-pool/scripts/pool_identity.py worked <worker>
 python3 skills/worker-pool/scripts/pool_identity.py join-room <worker> --room <room> [--wait SECONDS]
+python3 skills/worker-pool/scripts/pool_identity.py return-room <worker> --room <room> [--binding KEY ...] [--wait SECONDS]
 ```
 
 - `rooms` prints the rooms bound to the worker, one per room however many server names its bindings carry.
@@ -260,6 +261,10 @@ python3 skills/worker-pool/scripts/pool_identity.py join-room <worker> --room <r
   room of each review-ask interaction the correlation log records for those tasks.
 - `join-room` invites the worker's agent to one of them and waits for it: `joined`, `waiting`, `skipped` (with
   why) or `failed`. The core stays and no binding changes.
+- `return-room <worker> --room <room> [--binding KEY ...] [--wait SECONDS]` undoes a hand-off: the worker's
+  agent invites the core's agent back; once the core is joined, each binding (default: the room's id) is
+  restored unless another worker now holds it, and the worker's agent leaves. `returned` (with `worker_left`),
+  `waiting`, `skipped` (with why) or `failed`.
 
 ### Creating the agent without a pasted token
 

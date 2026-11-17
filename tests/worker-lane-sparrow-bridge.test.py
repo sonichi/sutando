@@ -517,6 +517,35 @@ class TheLaneKeeper(Base):
         self.assertFalse(worker_lane.declared_bridge(W, self.ws))
         self.assertEqual(self.keep(now=5001.0), [lane], "withdrawn: the lane at once")
 
+    def test_work_delivered_before_the_cut_over_still_reaches_the_worker(self):
+        """Stopping the lane touches no delivery: the worker reads its own folder, and the declared bridge
+        routes new tasks through the same handler on the same workspace."""
+        from _helpers import bridge_lease
+        sys.path.insert(0, str(ROOT / "skills" / "worker-pool" / "scripts"))
+        import pool_delivery
+        lane, task = self.row["instance"], "task-1800000000000"
+        folder = pool_delivery.deliveries_dir(self.ws, W)
+        folder.mkdir(parents=True)
+        (folder / pool_delivery.sentinel_names(task)[0]).write_text("")
+        self.declare()
+        holder = bridge_lease.start(self.ws, lane, wait=True)
+        self.children.append(holder)
+        self.assertEqual(C.stop_bridge(lane, workspace=self.ws), holder.pid)
+        self.children.remove(holder)
+        bridge_lease.stop(holder)
+        self.assertEqual([p.name for p in pool_delivery.pending(self.ws, W)], [f"{task}.txt"])
+        handler = self.declare_handler()
+        seen = []
+        for _ in ("lane", "declared bridge"):
+            ns = {}
+            worker_lane.install(ns, W, workspace=self.ws, results_dir=self.ws / "results", log=lambda m: None,
+                                who="x")
+            with mock.patch.object(worker_lane.subprocess, "run",
+                                   side_effect=lambda argv, **k: seen.append(argv) or subprocess.CompletedProcess(argv, 0)):
+                ns["TASK_PRE_PUBLISH"]("task-2", self.ws / "staged", self.ws / "tasks" / "task-2.txt")
+        self.assertEqual(seen[0], seen[1])
+        self.assertEqual(seen[0][:3], [str(handler), "--workspace", str(self.ws)])
+
     def test_an_invalid_or_unanswerable_declaration_keeps_the_lane(self):
         lane = self.row["instance"]
         decl = self.declare()
