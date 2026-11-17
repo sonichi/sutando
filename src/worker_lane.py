@@ -111,10 +111,21 @@ def attributor(worker: str, argv: "list[str]", log):
     return attribute
 
 
-def _adopt(worker: str, shared_results, own_results, names, log) -> "list[str]":
+def _still_own(worker: str, workspace, own_results) -> bool:
+    """Whether `own_results` is still `worker`'s own results folder: once the field is cleared or moved,
+    an older bridge's adopt pass must not pull anything back into it."""
+    from connections import worker_dirs
+    dirs = worker_dirs(worker, Path(workspace))
+    return bool(dirs) and dirs[1].resolve() == Path(own_results).resolve()
+
+
+def _adopt(worker: str, shared_results, own_results, names, log, belongs=lambda name: True) -> "list[str]":
     import undelivered_quarantine
     moved = []
     for name in names:
+        # Re-checked right before each move: the field can be cleared while a pass runs.
+        if not _still_own(worker, Path(shared_results).parent, own_results) or not belongs(name):
+            continue
         try:
             Path(own_results).mkdir(parents=True, exist_ok=True)
             undelivered_quarantine.rename_noreplace(Path(shared_results) / name, Path(own_results) / name)
@@ -151,14 +162,16 @@ def adopt_stray_proactive(worker: str, shared_results, own_results, log=None) ->
 
 
 def adopt_stray_results(worker: str, workspace, own_results, log=None) -> "list[str]":
-    """Move the results of tasks `worker`'s own lane queued (`connections.task_home`) from the shared
-    results/ into its own, as `adopt_stray_proactive` does: a late answer an older session wrote there."""
+    """Move the results of tasks whose home is `worker`'s own folder, `own_results` (`connections.task_home`),
+    from the shared results/ into it, as `adopt_stray_proactive` does: a late answer an older session wrote."""
     from connections import task_home
     ws = Path(workspace)
     if not worker:
         return []
-    names = [n for n in _names(ws / "results", "task-*.txt") if task_home(Path(n).stem, ws)["worker"] == worker]
-    return _adopt(worker, ws / "results", own_results, names, log)
+    def belongs(name: str) -> bool:
+        home = task_home(Path(name).stem, ws)
+        return home["own"] and home["worker"] == worker and home["results"].resolve() == Path(own_results).resolve()
+    return _adopt(worker, ws / "results", own_results, _names(ws / "results", "task-*.txt"), log, belongs)
 
 
 # How often an own-dir bridge looks for its worker's proactive files still landing in the shared results/.
