@@ -334,6 +334,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`wedge_probes.py`** — Watcher and standby wedge signatures for the shared wedge detector: pure probes that publish nothing.
 - **`work-request-check.ts`** — The relay agent's text-model decisions.
 - **`worker_auth_state.py`** — Is a Claude CLI pane still signed out?
+- **`worker_lane.py`** — A pool worker's own agent served by a gateway bridge: the wiring every bridge entry point installs.
 - **`workspace_default.py`** — Canonical workspace-directory resolution for Sutando services.
 - **`workspace_default.ts`** — Canonical workspace-directory resolution for Sutando TS services.
 - **`workspace_layout.py`** — Spawn-time guard for the `<repo>/workspace` wiring: heals recoverable breaks to the durable symlink; a real directory HOLDING data is never touched.
