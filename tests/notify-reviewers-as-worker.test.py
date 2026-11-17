@@ -20,6 +20,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 SCRIPT = (Path(__file__).resolve().parent.parent / "skills"
           / "collaboration-intelligence" / "scripts" / "notify_reviewers.py")
 
@@ -111,7 +116,10 @@ class WorkerWithOwnAgent(Base):
         for call in sent:
             self.assertEqual(call[3], "!shared:x")
             self.assertEqual(call[-2:], ["--agent", WAGENT])
-        self.assertIn("asking as worker", err)
+        self.assertIn("asking as this worker's own agent", err)
+        # Success names neither the worker's identity nor the room chosen.
+        self.assertNotIn(WAGENT, err)
+        self.assertNotIn("!shared:x", err)
         # The core-routed recorded room was never read as a venue.
         self.assertNotIn(["members", "!triage:x"], ops.calls)
 
@@ -123,6 +131,9 @@ class WorkerWithOwnAgent(Base):
         self.assertEqual(ops.mentions(), [])
         self.assertIn("NO SHARED ROOM", err)
         self.assertIn("never falls back to the core", err)
+        # One generic line per reviewer: no candidate rooms, no agent ids.
+        for detail in ("!shared:x", "!triage:x", WAGENT, "@sutando-rui:x", "@sutando-kim:x"):
+            self.assertNotIn(detail, err)
 
     def test_room_flag_is_the_only_candidate(self):
         ops = FakeRoomOps({"!shared:x": [WAGENT, "@sutando-rui:x", "@sutando-kim:x"],

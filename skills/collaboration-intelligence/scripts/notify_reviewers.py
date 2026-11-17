@@ -521,25 +521,16 @@ def worker_joined_rooms() -> "tuple[list, str]":
 def worker_room_for(target: dict, worker: str, agent: str, candidates) -> "tuple[str | None, str]":
     """(room, '') where both `worker`'s own agent and the target's agent are members and a post goes as
     the worker; (None, why) when no candidate is one. Unread membership never counts as present."""
-    stand = target["stand"]
     if not agent:
-        return None, f"worker {worker}'s own agent has no recorded id, so no room can be confirmed to hold it"
-    tried = []
+        return None, "this worker's own agent has no recorded id, so no room can be confirmed to hold it"
     for room in candidates:
         if not routes_as_worker(room, worker):
-            tried.append(f"{room}: a post there would go as the core's agent")
             continue
-        ids, why = room_members(room)
-        if ids is None:
-            tried.append(f"{room}: members {why}")
-        elif agent not in ids:
-            tried.append(f"{room}: the worker's agent is not a member")
-        elif stand not in ids:
-            tried.append(f"{room}: {stand} is not a member")
-        else:
+        ids, _why = room_members(room)
+        if ids is not None and agent in ids and target["stand"] in ids:
             return room, ""
-    return None, (f"no room holds both worker {worker}'s own agent ({agent}) and {stand}"
-                  + (f" (checked {'; '.join(tried)})" if tried else " (no room to check)"))
+    return None, ("no room is shared by this worker's agent and the reviewer's agent; add one to a room "
+                  "the other is in, or pass --room for a room both are in")
 
 
 def command_for(target: dict, message: str) -> "list[str]":
@@ -881,8 +872,8 @@ def main() -> int:
                 if joined is None:
                     joined, why = worker_joined_rooms()
                     if why:
-                        print(f"worker {worker}'s joined rooms could not be listed ({why}); "
-                              "checking recorded rooms only", file=sys.stderr)
+                        print("this worker's joined rooms could not be listed; "
+                              "checking the recorded room only", file=sys.stderr)
                 candidates = list(dict.fromkeys([t["room"], *joined]))
             room, why = worker_room_for(t, worker, worker_agent, candidates)
             if room is None:
@@ -890,7 +881,7 @@ def main() -> int:
                       "its worker's own agent and never falls back to the core's.", file=sys.stderr)
                 refusal_rc = max(refusal_rc, 5)
                 continue
-            print(f"{t['name']}: asking as worker {worker}'s own agent in {room}", file=sys.stderr)
+            print(f"{t['name']}: asking as this worker's own agent", file=sys.stderr)
             reachable.append({**t, "room": room, "agent": worker_agent})
             continue
         if a.room and t["room"] != a.room:
