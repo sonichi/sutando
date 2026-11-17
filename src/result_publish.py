@@ -141,16 +141,23 @@ def worker_published_path(path: str | Path, environ=None, workspace=None) -> Pat
 
 
 def _own_results_path(connections, path: Path, environ, workspace) -> Path:
-    """`path` moved into the session's worker's own results/ when that worker has its own folders
-    (`connections.worker_dirs`), `path` names the workspace's shared results/ and the worker's lane is the
-    one that delivers it (a proactive file for another channel's bridge stays shared); else unchanged."""
+    """Where `path`, aimed at the shared results/ or the session's worker's own, is published. A task's
+    result goes to its task's current home (`connections.task_home`): a late answer to work handed back to
+    the core lands where the core reads it. A proactive file goes to the session's worker's own results/
+    when that worker's lane delivers it (`lane_claims_proactive`); any other target is unchanged."""
     from proactive_routing import lane_claims_proactive
     worker = connections.session_worker(environ)
     own = connections.worker_dirs(worker, workspace) if worker else None
-    if own is None or (path.name.startswith("proactive-") and not lane_claims_proactive(path.name, worker)):
-        return path
     shared = connections.record_path(workspace).parent.parent / "results"
-    return own[1] / path.name if path.parent.resolve() == shared.resolve() else path
+    if path.parent.resolve() not in {d.resolve() for d in [shared] + ([own[1]] if own else [])}:
+        return path
+    if path.name.startswith("proactive-"):
+        dest = own[1] if own and lane_claims_proactive(path.name, worker) else shared
+    elif path.name.startswith("task-") and path.suffix == ".txt":
+        dest = connections.task_home(path.stem, workspace)["results"]
+    else:
+        dest = own[1] if own else path.parent
+    return path if dest.resolve() == path.parent.resolve() else dest / path.name
 
 
 def _task_home(task_id: str, workspace: Path) -> dict:
@@ -301,8 +308,8 @@ def main(argv: list[str]) -> int:
         print(f"result_publish: publishing {Path(path).name} as {stamped.name}: a pool worker's "
               "proactive file carries its worker's stamp, so its own lane delivers it", file=sys.stderr)
     if stamped.parent != Path(path).parent:
-        print(f"result_publish: publishing into {stamped.parent}: this pool worker answers in its own "
-              "results folder, which its own lane drains", file=sys.stderr)
+        print(f"result_publish: publishing into {stamped.parent}: the results folder of its task's home or of "
+              "this pool worker, whose lane delivers it", file=sys.stderr)
     path = str(stamped)
     text = sys.stdin.read()
     reason = None if allow else undeliverable_reason(path, text)

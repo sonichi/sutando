@@ -60,6 +60,9 @@ class Base(unittest.TestCase):
         self.ws = Path(tmp.name) / "ws"
         self.own = self.ws / "agents" / agent_identity.root_segment(WORKER_AGENT)
         self.write(dirs="own")
+        (self.own / "tasks").mkdir(parents=True)
+        for tid in ("task-1", "task-2"):  # tasks in the worker's own inbox
+            (self.own / "tasks" / f"{tid}.txt").write_text("t")
 
     def write(self, **worker_extra):
         path = C.record_path(self.ws)
@@ -124,13 +127,25 @@ class PublishedPath(Base):
         about = self.published(self.ws / "results" / proactive_filename(2, "ag2space"))
         self.assertEqual(about.parent, self.own / "results")
 
+    def test_a_task_result_goes_to_its_tasks_home_whoever_writes_it(self):
+        (self.ws / "tasks").mkdir(parents=True)
+        (self.ws / "tasks" / "task-back.txt").write_text("handed back to the core")
+        for target in (self.ws / "results", self.own / "results"):
+            with self.subTest(target=target):
+                self.assertEqual(self.published(target / "task-back.txt"), self.ws / "results" / "task-back.txt")
+        self.assertEqual(self.published(self.ws / "results" / "task-1.txt", worker=""), self.own / "results" / "task-1.txt")
+        from proactive_routing import proactive_filename
+        slack = proactive_filename(3, "slack")
+        self.assertEqual(self.published(self.own / "results" / slack), self.ws / "results" / slack)
+        self.assertEqual(self.published(self.ws / "results" / "notes.txt"), self.own / "results" / "notes.txt")
+
     def test_through_a_symlinked_workspace_too(self):
         link = self.ws.parent / "ws link"
         link.symlink_to(self.ws)
         self.assertEqual(self.published(link / "results" / "task-1.txt").parent, self.own / "results")
 
     def test_unchanged_for_the_core_a_shared_worker_and_other_dirs(self):
-        self.assertEqual(self.published(self.ws / "results" / "task-1.txt", worker=""), self.ws / "results" / "task-1.txt")
+        self.assertEqual(self.published(self.ws / "results" / "task-9.txt", worker=""), self.ws / "results" / "task-9.txt")
         self.assertEqual(self.published(self.ws / "notes" / "task-1.txt"), self.ws / "notes" / "task-1.txt")
         self.write()
         self.assertEqual(self.published(self.ws / "results" / "task-1.txt"), self.ws / "results" / "task-1.txt")
@@ -143,7 +158,7 @@ class PublishedPath(Base):
             self.assertEqual(result_publish.main(["result_publish.py", str(self.ws / "results" / "task-1.txt")]), 0)
         self.assertEqual((self.own / "results" / "task-1.txt").read_text(), "[no-send]\n")
         self.assertFalse((self.ws / "results" / "task-1.txt").exists())
-        self.assertIn("its own results folder", err.getvalue())
+        self.assertIn("the results folder of its task's home", err.getvalue())
 
 
 class TheVendoredCopy(Base):
@@ -165,7 +180,7 @@ class TheVendoredCopy(Base):
                 mock.patch.object(sys, "stdin", io.StringIO("[no-send]\n")), contextlib.redirect_stderr(err):
             self.assertEqual(self.rp.main(["result_publish.py", str(self.ws / "results" / "task-2.txt")]), 0)
         self.assertTrue((self.own / "results" / "task-2.txt").is_file())
-        self.assertIn("its own results folder", err.getvalue())
+        self.assertIn("the results folder of its task's home", err.getvalue())
 
 
 class RearmTarget(unittest.TestCase):

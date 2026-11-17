@@ -227,9 +227,34 @@ $( [ -f "$PAYLOAD" ] && cat "$PAYLOAD" || echo "(payload not found at $PAYLOAD)"
 
 "
   done
+elif [ -n "$OWN_INBOX" ]; then
+  # An own-folder worker: what its inbox owes is task_dispatch's one rule (unanswered-in),
+  # the same answer pool supervision reads; a task it is on right now is not an orphan.
+  if [ -z "$PYBIN" ]; then
+    UNPROCESSED+="--- $TASKS_DIR/ (no interpreter to tell what it owes) ---
+
+"
+  else
+    OWED="$("$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" unanswered-in "$TASKS_DIR" "$RESULTS_DIR" 2>/dev/null)"
+    while IFS=$'\t' read -r TASK_ID f; do
+      [ -n "$TASK_ID" ] || continue
+      task_in_progress "$TASK_ID" "$f" && continue
+      UNPROCESSED_NAMES="$UNPROCESSED_NAMES $TASK_ID.txt"
+      if [ -f "$RESULTS_DIR/$TASK_ID.txt" ]; then
+        UNPROCESSED+="--- $TASK_ID.txt (result file is EMPTY — it delivers nothing; write a real reply) ---
+
+"
+        continue
+      fi
+      UNPROCESSED+="--- $TASK_ID.txt ---
+$(cat "$f")
+
+"
+    done <<< "$OWED"
+  fi
 else
-  # Core mode (and an own-folder worker's inbox): the queue is tasks/, minus
-  # anything the router already handed to a worker.
+  # Core mode: the queue is tasks/, minus anything the router already handed
+  # to a worker.
   for f in "$TASKS_DIR"/*.txt; do
     BASENAME=$(basename "$f")
     TASK_ID="${BASENAME%.txt}"
