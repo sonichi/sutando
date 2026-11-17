@@ -1596,6 +1596,7 @@ const fakeMulti = (opts = {}) => {
   const calls = [];
   const dbs = opts.dbs;                                 // {id: {name, props, rows}}
   const watchers = {};
+  const declined = new Set();
   let answers = (opts.writeAnswers || []).slice();
   const answer = () => (answers.length ? answers.shift() : { ok: true });
   const ACCOUNTS = opts.accounts || { '@me:x': 'u1', '@desk.agent:x': 'u2', '@other:x': 'u3' };
@@ -1625,10 +1626,15 @@ const fakeMulti = (opts = {}) => {
       agent: {
         // agents may be a function of the calls so far: [] until the page is allowed, then the list.
         list: async () => (typeof opts.agents === 'function' ? opts.agents(calls) : (opts.agents || [])),
+        // As the host does: a key that was declined replays its decline at once and asks nothing.
         sendTask: async (req) => {
+          if (declined.has(req.key)) { calls.push(['sendTask-replayed', req]); return { ok: false, reason: 'declined' }; }
           calls.push(['sendTask', req]);
-          if (Array.isArray(opts.sendAnswer)) return opts.sendAnswer.length ? opts.sendAnswer.shift() : { ok: true, eventId: 'tabc' };
-          return opts.sendAnswer || { ok: true, eventId: 'tabc' };
+          let out;
+          if (Array.isArray(opts.sendAnswer)) out = opts.sendAnswer.length ? opts.sendAnswer.shift() : { ok: true, eventId: 'tabc' };
+          else out = opts.sendAnswer || { ok: true, eventId: 'tabc' };
+          if (out && out.reason === 'declined') declined.add(req.key);
+          return out;
         },
       },
       db: {
@@ -1972,10 +1978,11 @@ const afterFirstWrite = (calls) => (calls.some((c) => c[0] === 'createRow' || c[
   const again = r.byId.get('cols').buttons().find((x) => /Send to Home Agent again/.test(x.textContent));
   check('task-board/failed-ask-offers-retry-on-its-row', () => assert.ok(again, r.text()));
   if (again) { again.click(); await settle(40); }
-  check('task-board/retry-reuses-the-key-and-adds-no-row', () => {
+  check('task-board/retry-after-a-decline-asks-again-with-a-new-key-and-adds-no-row', () => {
+    assert.ok(!b.calls.some((c) => c[0] === 'sendTask-replayed'), 'the retry hit the replayed decline');
     const sends = b.calls.filter((c) => c[0] === 'sendTask').map((c) => c[1]);
     assert.equal(sends.length, 2);
-    assert.equal(sends[0].key, sends[1].key);
+    assert.notEqual(sends[0].key, sends[1].key);
     assert.deepEqual(plain(sends[1].row), { database: 'd1', rowId: 'r1' });
     assert.equal(b.calls.filter((c) => c[0] === 'createRow').length, 1);
     assert.match(r.text(), /Sent to Home Agent in your private DM/);
@@ -2006,6 +2013,89 @@ const afterFirstWrite = (calls) => (calls.some((c) => c[0] === 'createRow' || c[
   check('research-desk/refused-state-write-is-reported', () => {
     assert.equal(b.calls[1][0], 'write');
     assert.match(r.text(), /State column[\s\S]*was not updated: no edit rights on Findings/);
+  });
+}
+
+/* ===== browser run of 3eabdc28: retry after a decline, the State warning, the access question ===== */
+{
+  // An unknown outcome may have gone through: its retry reuses the key, so it never sends twice.
+  const b = fakeMulti({ dbs: boardDbs(), primary: 'd1', agents: AGENTS,
+    sendAnswer: [{ ok: false, reason: 'request outcome unknown' }, { ok: true, eventId: 't2' }] });
+  const r = await run('task-board', { bridge: b });
+  r.byId.get('title').value = 'Maybe sent';
+  r.byId.get('who').value = AGENTS[1].id;
+  r.byId.get('add').click();
+  await settle(40);
+  b.fire('d1', { id: 'd1', name: 'Task Board — Tasks', props: TASK_PROPS,
+    rows: [{ id: 'r1', cells: { Task: 'Maybe sent', Status: 'Requested' } }] });
+  await settle(20);
+  const again = r.byId.get('cols').buttons().find((x) => /again/.test(x.textContent));
+  if (again) { again.click(); await settle(40); }
+  check('task-board/retry-after-an-unknown-outcome-reuses-the-key', () => {
+    const sends = b.calls.filter((c) => c[0] === 'sendTask').map((c) => c[1]);
+    assert.equal(sends.length, 2, JSON.stringify(b.calls.map((c) => c[0])));
+    assert.equal(sends[0].key, sends[1].key);
+  });
+}
+{
+  const findings = [{ id: 'r1', cells: { Finding: 'Claim S', Source: 'https://s.example' } }];
+  const b = fakeMulti({ dbs: deskDbs(findings), primary: 'd1', agents: AGENTS,
+    writeAnswers: [{ ok: true }, { ok: false, reason: 'no edit rights on Findings' }] });
+  const r = await run('research-desk', { bridge: b });
+  r.byId.get('list').children[0].buttons().find((x) => x.textContent === 'Accept').click();
+  await settle(40);
+  // The Reviews row lands and re-renders the page, as it does in a real room.
+  b.fire('d2', { id: 'd2', name: 'Research Desk — Reviews', props: REVIEW_PROPS,
+    rows: [{ id: 'v1', cells: { Review: 'Claim S', Finding: 'r1', Verdict: 'Accepted', 'Created by': ['@me:x'] } }] });
+  await settle(30);
+  check('research-desk/state-warning-survives-the-re-render', () =>
+    assert.match(r.text(), /State column[\s\S]*was not updated: no edit rights on Findings/));
+  const dismiss = r.byId.get('notes').buttons().find((x) => x.textContent === 'Dismiss');
+  if (dismiss) { dismiss.click(); await settle(30); }
+  check('research-desk/state-warning-is-dismissed', () => {
+    assert.ok(dismiss, 'no Dismiss button');
+    assert.ok(!/was not updated/.test(r.text()), r.text());
+  });
+}
+{
+  const findings = [{ id: 'r1', cells: { Finding: 'Claim T', Source: 'https://t.example' } }];
+  const b = fakeMulti({ dbs: deskDbs(findings), primary: 'd1', agents: AGENTS,
+    writeAnswers: [{ ok: true }, { ok: false, reason: 'no edit rights' }, { ok: true }, { ok: true }] });
+  const r = await run('research-desk', { bridge: b });
+  r.byId.get('list').children[0].buttons().find((x) => x.textContent === 'Accept').click();
+  await settle(40);
+  r.byId.get('list').children[0].buttons().find((x) => x.textContent === 'Reject').click();
+  await settle(40);
+  check('research-desk/state-warning-clears-after-a-successful-state-write', () =>
+    assert.ok(!/was not updated/.test(r.text()), r.text()));
+}
+// The access question comes as the page opens; agent.list() waits for its answer.
+for (const tpl of ['task-board', 'research-desk']) {
+  let answer = null;
+  const pending = new Promise((ok) => { answer = ok; });
+  const b = fakeMulti({ dbs: tpl === 'task-board' ? boardDbs() : deskDbs(), primary: 'd1',
+    agents: () => pending, consent: false });
+  const r = await run(tpl, { bridge: b });
+  const pick = r.byId.get(tpl === 'task-board' ? 'who' : 'agent');
+  check(`${tpl}/says-it-is-waiting-while-the-question-is-open`, () => {
+    assert.match(pick.options.map((o) => o.textContent).join('|'), /Waiting for you to allow this page/);
+    if (tpl === 'task-board') assert.equal(pick.options[0].textContent, 'No agent (a person does it)');
+  });
+  answer([]);                              // Cancel: the list is empty and members() is refused
+  await settle(40);
+  check(`${tpl}/after-a-cancel-says-not-allowed-and-reload`, () => {
+    assert.match(pick.options.map((o) => o.textContent).join('|'), /Not allowed: reload/);
+    assert.match(r.byId.get(tpl === 'task-board' ? 'who-help' : 'ask-help').textContent, /not allowed[\s\S]*Reload the page/);
+    if (tpl === 'task-board') assert.equal(pick.options[0].textContent, 'No agent (a person does it)');
+  });
+}
+{
+  // Allowed, but no agents of your own: that is what it says, not "not allowed".
+  const b = fakeMulti({ dbs: boardDbs(), primary: 'd1', agents: [] });
+  const r = await run('task-board', { bridge: b });
+  check('task-board/allowed-with-no-agents-is-not-called-not-allowed', () => {
+    assert.ok(!/Not allowed/.test(r.byId.get('who').options.map((o) => o.textContent).join('|')));
+    assert.ok(!/Waiting/.test(r.byId.get('who').options.map((o) => o.textContent).join('|')));
   });
 }
 

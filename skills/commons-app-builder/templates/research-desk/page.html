@@ -141,8 +141,8 @@
     const until = Date.now() + 120000;
     for (;;) {
       const r = await call();
-      // agent.list() answers [] until the viewer allows the page, which a first write asks for:
-      // once a write lands, read the agents again so a first-time viewer can pick one.
+      // agent.list() answers [] when the page is not allowed. The question usually comes as the page
+      // opens; if it did not, a landed write means the page is allowed now: read the agents again.
       if (r.ok && !agents.length) refreshAgents();
       if (r.ok || !/waiting for the viewer|rate limit|too many/i.test(r.reason || '') || Date.now() > until) return r;
       hint('Allow this page to edit data in this room, and it will save.');
@@ -170,7 +170,19 @@
   let agents = [], agentsShown = false;
   const ASK_HELP = $('ask-help').textContent;
   const pendingKeys = new Map();     // what -> key: a retry after an unknown outcome reuses its key
+  const pageAllowed = async () => {
+    try { await art.members(); return true; } catch (e) { return false; }
+  };
   const fillAgents = async () => {
+    // While the access question is open, agent.list() waits for its answer: say so meanwhile.
+    if (!agentsShown) {
+      const sel = $('agent');
+      sel.textContent = '';
+      const wait = document.createElement('option');
+      wait.value = ''; wait.disabled = true; wait.textContent = 'Waiting for you to allow this page…';
+      sel.appendChild(wait);
+      $('ask-help').textContent = 'Waiting for you to allow this page… Your own agents are listed once you do.';
+    }
     // agent.list() answers an array, or {ok: false, reason} when it cannot: never assume an array.
     let got = [];
     try { got = art.agent ? await art.agent.list() : []; } catch (e) { got = []; }
@@ -189,8 +201,17 @@
     });
     sel.value = agents.some((a) => a.id === want) ? want : (agents[0] ? agents[0].id : '');
     $('ask-topic-go').disabled = !agents.length || !art.agent;
-    $('ask-help').textContent = agents.length ? ASK_HELP : 'You have no agent of your own here yet, or this page has not been allowed. '
-      + 'Asking your agent sends the request to its private DM with you after you confirm the exact text; its progress does not come back to this page yet.';
+    if (agents.length) $('ask-help').textContent = ASK_HELP;
+    else {
+      const allowed = await pageAllowed();
+      const none = document.createElement('option');
+      none.value = ''; none.disabled = true;
+      none.textContent = allowed ? 'You have no agent of your own here' : 'Not allowed: reload to be asked again';
+      sel.appendChild(none);
+      $('ask-help').textContent = allowed
+        ? 'You have no agent of your own in this room yet. ' + ASK_HELP
+        : 'This page was not allowed to see this room, so it cannot list your agents. Reload the page and choose Allow when it asks.';
+    }
     return true;
   };
   // Re-read on demand: after the first allowed write, and whenever the picker is opened.
@@ -249,6 +270,17 @@
     if (!titleProp) show('bad', 'This database has no title column, so findings cannot be written.');
     if (!reviewsId) show('warn', 'The "Research Desk — Reviews" database is missing: findings can be proposed, but nobody can accept them.');
     if (!members) show('warn', 'Allow the page to see who is who, and authors and reviewers will fill in.');
+    stateWarnings.forEach((text, rowId) => {
+      const el = document.createElement('div');
+      el.className = 'note warn';
+      el.textContent = text + ' ';
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = 'Dismiss';
+      b.onclick = () => { stateWarnings.delete(rowId); if (snapshot) render(snapshot); };
+      el.appendChild(b);
+      notes.appendChild(el);
+    });
     const state = (row) => {
       const d = decided.get(row.id);
       return d && d.human ? d.human.verdict : 'Proposed';
@@ -386,10 +418,12 @@
     draw(Object.assign({}, snap, { rows }), members, decided);
   };
 
+  // A refused State write, per finding: shown on every render until that finding's State write
+  // succeeds or the viewer dismisses it (a re-render must not erase it).
+  const stateWarnings = new Map();
   const decide = async (row, verdict) => {
     if (busy || !reviewsId || !reviewTitle) return;
     busy = true;
-    let stateLag = '';
     let r = { ok: false, reason: '' };
     try {
       const values = { Finding: row.id, Verdict: verdict };
@@ -398,8 +432,10 @@
       // Keep the table's State column in step for the board view. The page itself trusts Reviews.
       if (r.ok) {
         const st = await save(() => db.write(id, row.id, 'State', verdict));
-        if (!st.ok) stateLag = 'Your decision is saved, but the State column the table and board views show was not updated: '
-          + (st.reason || 'the write was refused') + '. The table may still say Proposed.';
+        if (st.ok) stateWarnings.delete(row.id);
+        else stateWarnings.set(row.id, 'Your decision on "' + String((titleProp && row.cells[titleProp]) || 'a finding').slice(0, 80)
+          + '" is saved, but the State column the table and board views show was not updated: '
+          + (st.reason || 'the write was refused') + '. The table may still say Proposed.');
       }
     } catch (e) {
       r = { ok: false, reason: e.message || 'The decision was not saved.' };
@@ -408,7 +444,6 @@
       if (snapshot) await render(snapshot);
     }
     if (!r.ok) show('bad', r.reason || 'The decision was not saved.');
-    else if (stateLag) show('warn', stateLag);
   };
 
   if (reviewsId) {

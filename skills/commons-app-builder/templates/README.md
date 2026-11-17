@@ -36,6 +36,10 @@ while the viewer has not answered the consent prompt, and ownership shown as `?`
   someone else does, depends on the server's summon rules; test it in a real room before relying
   on it.
 - What an agent finds reaches `research-desk/` only if the agent writes new findings rows itself.
+- The access question ("Allow this page…") usually comes as the page opens, because both pages read
+  members and agents at load. While it is open, the agent picker says it is waiting; after a
+  Cancel it says the page was not allowed and to reload, since no second question comes in that
+  tab. A write that lands later also makes the page read the agents again.
 - Planned, not available yet: the room will see the *state* of a `sendTask` request (working, needs
   input, done or failed) and whose agent holds it, never the request text, the DM answer or its
   outcome line. The requester is told so in the confirmation dialog. A result is still only what
