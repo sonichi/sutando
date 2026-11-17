@@ -283,7 +283,8 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
                          + [self.timeout()] * 7)
                 records = loop.records[1 + len(prefix):]
                 self.assertEqual([r["last_ok_ts"] for r in records], [ok] * 10)
-                self.assertEqual(loop.serving[1 + len(prefix):], [False] * 10)
+                # The round failed after a good poll: still connected, with the error recorded.
+                self.assertEqual(loop.serving[1 + len(prefix):], [True] + [False] * 9)
                 self.assertIn("unexpected:", records[0]["error"])
                 self.assertTrue(any("FileExistsError" in m for m in loop.logs))
                 self.assertEqual(loop.clock.slept, [1, 1, 2, 4, 8, 16, 32, 60, 60])
@@ -309,7 +310,7 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
             self.assertEqual(failed, [True])
             self.assertEqual([r["last_ok_ts"] for r in loop.records],
                              [None, 1_000_001, 1_000_001, 1_000_001])
-            self.assertEqual(loop.serving, [False, False, False, False])
+            self.assertEqual(loop.serving, [False, True, False, False])
             self.assertEqual(loop.acks, [])
 
     def test_http_and_auth_failures_preserve_evidence_and_existing_handling(self):

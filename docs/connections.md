@@ -490,7 +490,11 @@ overwriting a row), then launches one bridge per `launch-plan` line through
 (the one `scripts/channel-env.sh` resolves; `REMOTE_TASK_TOKEN` or the legacy
 `AG2_REMOTE_TOKEN`, environment first when both exist): a desktop install signs in after
 the engine started, so the connect flow reaches the file but never this process's
-environment. `list` runs that import once when the record has never been written (an initialized record
+environment. A bare secret (no `https://<gateway>|` prefix) counts only beside a gateway URL,
+`REMOTE_TASK_URL` or the legacy `AG2_REMOTE_URL`, paired as the bridge pairs them: an environment
+secret with the environment's URL, a file secret with the environment's URL, else that file's.
+The vault then holds the joined `url|secret`; half a pair, or a URL that is not a gateway URL,
+imports nothing. `list` runs that import once when the record has never been written (an initialized record
 that is empty stays empty: its rows were removed on purpose), so the panel
 shows the connection on its next refresh without an engine restart; an import that fails
 is logged and the list still answers. A record that exists still adopts, on `list`, any
@@ -556,7 +560,10 @@ connection to use. The rule:
 A domain no row serves, or a disconnected row, is refused with `NoConnectionForRoom` naming the
 server, and so is a row with no token for its own gateway. The token is the first of the row's
 environment variable, its launch keys, its channel env file and its vault key whose embedded
-gateway, if any, is the row's own host: another server's token is never used. `room_ops.py`
+gateway, if any, is the row's own host: another server's token is never used. A bare secret
+(no embedded gateway) is handed on joined to the row's own `gateway_url` as `url|secret`, so the
+identity learner's preview reaches that gateway; a row gateway that is not a gateway URL makes
+it no token. `room_ops.py`
 prints `{"ok": false, "reason": ...}` and exits 1; `channel-env.sh` prints nothing and exits 1.
 
 The same rule serves every other gateway client: the pending-questions and Crons room databases
@@ -582,6 +589,21 @@ answers before the rule above:
   and the core's session all fall through to the rule above. The core never acts as a worker's
   agent.
 
+A worker's lane delivers each task it queues to its worker itself, before the core can see it. The
+lane stages the task file, runs the core's declared task-event handler (the pool router, from
+`state/task-event-handler.json`) on the staged copy with `--from-lane --payload <staged>`, and only
+then publishes it to `tasks/`. The router writes the delivery sentinel and the attribution in
+`deliveries/<worker>/` under its own locks, so the task is already held when it appears, and the
+core's watcher never routes or announces a task a worker holds. Once the task is published, the lane
+runs the router again with `--renotify`, which replaces a still-pending sentinel, so a worker's
+watcher that gave up on the bare pointer (a slow or killed router, or a lane that died and the task
+was served again) is told. The payload stays in `tasks/`, where the worker's resolver,
+`task_disposition.py`, archiving and the bridges read it. A worker off the roster or retired, a
+picker command, a router that fails or takes longer than 10 s, or no handler declared: nothing is
+held, the task is published as before and the core's watcher routes it. A lane started from inside a
+session (`connections.py start` from a worker's shell) carries none of that session's variables
+(`connections.SESSION_ENV`), so it runs as the lane keeper's launch would.
+
 A worker's row has no channel env file: its token is in the vault alone, so
 `channel-env.sh <its lane>` exits 1 saying so, and room clients resolve it by room.
 
@@ -600,9 +622,19 @@ is claimed only by the lane running as that worker, which posts it as the worker
 agent's own owner DM; a core lane and every other bridge (Discord, Slack, Telegram, their
 fallbacks) refuse it, and a worker's lane claims nothing unstamped. The gateway's drain asks its
 host (`PROACTIVE_OWN_FILE`) whether an owner-directed file is the lane's own, so a worker's lane
-delivers its worker's files although it owns no unaddressed ones and projects no cards. Writers
-that do not go through `result_publish.py` (`scripts/ask-owner.py`, a skill writing the file
-itself) still publish unstamped names, which a core lane sends.
+delivers its worker's files although it owns no unaddressed ones and projects no cards.
+Only a name with no destination, or one destined for `ag2space` (the worker lane's own bridge), is
+stamped; a name destined for Discord, Slack or Telegram keeps its bare name so that bridge delivers
+it. `scripts/ask-owner.py` and the pending-questions skill name their text ask through the same
+helper (`result_publish.worker_published_path`), so a worker asks the owner as its own agent, and
+the question records that agent (`asked_by`, the row's `Asked by`, via
+`connections.proactive_author_agent`). Its text names that worker, not the core
+(`connections.proactive_author_phrase`: "<name> (a worker on <host>)", with the agent's display
+name, else the worker's roster label; else just "a worker on <host>". The name never stands alone;
+it is bounded and stripped of format characters, and one that reads as the core is dropped). A decision card stays the core's: only a core lane issues
+and verifies cards, so a question asked by card records no asker, and its fallback text, if the
+card cannot be stored, is the core's too. A skill writing a proactive file itself still publishes
+the name it gives.
 
 The seat's `s-space` MCP proxy (the desktop app's `ag2-mcp-proxy.mjs`) mints its access token
 from the worker's own credential when the worker acts as its own agent. The launcher exports

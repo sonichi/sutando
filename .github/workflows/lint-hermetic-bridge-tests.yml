@@ -26,7 +26,7 @@ concurrency:
 jobs:
   lint-hermetic-bridge-tests:
     name: refuse bridge tests that read host config
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
 
     steps:

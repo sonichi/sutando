@@ -332,6 +332,7 @@ from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import has_skip_action
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
+from . import deleted_binding
 from . import result_labels
 from .proactive_routing import (PROACTIVE_OUTBOX_DIRNAME, about_task, about_task_ts, proactive_filename,
                                 proactive_item_id)
@@ -344,7 +345,7 @@ from .outbox import dispatch_unsettled, record_provider_ref, released_by_operato
 from .outbox import RetrySchedule, delivered_body_differs, effective_item_id, read_item, source_digest
 from .outbox import list_items, requeue_item_with_epoch, RequeueOutcome, withdraw_unsent
 from .proactive_recovery import claim_owner_may_be_alive as _pid_alive
-from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS
+from .send_failure_policy import MAX_TRANSIENT_ATTEMPTS, ROOM_REFUSAL_ATTEMPTS
 from .delivery_core import (WITHDRAWN, DeliveryCore, DesignAClaimBackend, DrainStatus,
                             ProviderRefused, RetryPolicy)
 from .delivery_core import DeliveryOutcome as CoreDeliveryOutcome
@@ -391,6 +392,8 @@ UI_ORIGIN_NOTE = (
 RESULTS_DIR = _result_dir()
 _STATE = _state_dir()
 _WITHHELD_TASK_OUTPUT: "dict[tuple, tuple]" = {}
+# review id -> (sends the review room refused, monotonic time the next send is due).
+_REVIEW_ROOM_REFUSALS: "dict[str, tuple[int, float]]" = {}
 _WITHHELD_DM_CACHE = _STATE / "withheld-review-dm.json"
 _WITHHELD_CONTROL_DIR = _STATE / "withheld-review-control-results"
 _GATEWAY_OWNER_DM_HINT = ""
@@ -816,6 +819,35 @@ def _owner_review_dm(owner: str) -> str:
         raise RuntimeError("gateway did not return a private review room")
     _atomic_private_json(_WITHHELD_DM_CACHE, {"owner": owner, "room_id": room, "private": True})
     return room
+
+
+def _forget_review_room() -> None:
+    """Unmark the cached review room as private, so the next review opens a new one."""
+    cached = _read_private_json(_WITHHELD_DM_CACHE)
+    if cached and cached.get("private") is True:
+        _atomic_private_json(_WITHHELD_DM_CACHE, {**cached, "private": False})
+
+
+def _reroute_refused_review(artifact: Path, verdict, refused: int):
+    """After the review room refused the agent ROOM_REFUSAL_ATTEMPTS times, send the same review once
+    to a new private room. -> the verdict to settle on, or None to leave the result for the next pass."""
+    try:
+        _forget_review_room()
+        if _route_withheld_review(artifact):
+            _log(f"withheld review {artifact.stem}: the review room refused the agent {refused} times "
+                 "(HTTP 403, not in the room); sent to a new private review room")
+            return verdict
+        return None
+    except Exception as exc:  # noqa: BLE001 - runs inside the caller's except clause, past its catch-all
+        if not (isinstance(exc, urllib.error.HTTPError) and room_refused_sender(exc)):
+            _log(f"withheld review {artifact.stem}: the re-route to a new private review room failed: "
+                 f"{diagnostics.describe(exc)}; retried on the next pass")
+            return None
+    _log(f"withheld review {artifact.stem}: DROPPED, not delivered to the owner: the review room and a new "
+         f"one both refused the agent (HTTP 403, not in the room); the record stays at {artifact}")
+    return verdict._replace(reason=(
+        f"{verdict.reason}; owner review {artifact.stem} dropped: every private review room refused "
+        f"the agent; the record stays at {artifact}"))
 
 
 def _review_messages(record: dict) -> list[str]:
@@ -1799,9 +1831,25 @@ def _guarded_result_body(tid: str, body: str):
         artifact = review_artifact(_STATE, tid, body)
         if not artifact.is_file():
             return None, verdict.reason
+        refused, due = _REVIEW_ROOM_REFUSALS.get(artifact.stem, (0, 0.0))
+        if time.monotonic() < due:
+            return None, f"{verdict.reason}; private review room refused the agent, next send not due yet"
         try:
             if not _route_withheld_review(artifact):
                 return None, f"{verdict.reason}; private owner review unavailable"
+            _REVIEW_ROOM_REFUSALS.pop(artifact.stem, None)
+        except urllib.error.HTTPError as exc:
+            if not room_refused_sender(exc):
+                return None, f"{verdict.reason}; private owner review failed: {diagnostics.describe(exc)}"
+            refused += 1
+            if refused < ROOM_REFUSAL_ATTEMPTS:  # a join may still be landing: 2 s doubling, as the outbox
+                _REVIEW_ROOM_REFUSALS[artifact.stem] = (refused, time.monotonic() + 2.0 * 2 ** (refused - 1))
+                return None, (f"{verdict.reason}; private review room refused the agent "
+                              f"(send {refused}/{ROOM_REFUSAL_ATTEMPTS})")
+            _REVIEW_ROOM_REFUSALS.pop(artifact.stem, None)
+            verdict = _reroute_refused_review(artifact, verdict, refused)
+            if verdict is None:
+                return None, "private owner review failed in its new room; retried on the next pass"
         except Exception as exc:  # noqa: BLE001 — retain result file for retry
             return None, f"{verdict.reason}; private owner review failed: {diagnostics.describe(exc)}"
     result = (verdict.body, verdict.reason)
@@ -2252,6 +2300,9 @@ PROACTIVE_OWN_FILE: Callable[[Path], bool] | None = None
 # Host-injected () -> the worker every task this lane queues is addressed to (`requested_worker`),
 # or "". None (standalone default) leaves each task's field as the gateway sent it.
 TASK_ADDRESSEE: Callable[[], str] | None = None
+# Host-injected (task id, staged file, destination) -> None or a callable run once the file is
+# published; a raise is logged and the task is published. None (standalone default) runs nothing.
+TASK_PRE_PUBLISH: Callable[[str, Path, Path], "Callable[[], None] | None"] | None = None
 # Host-injected () -> the homeserver this lane's connection row names, or "": a secondary lane's
 # relay answer on another server is refused. None (standalone default) checks nothing.
 LANE_SERVER: Callable[[], str] | None = None
@@ -2605,6 +2656,8 @@ REENROLL_ENABLED = str(os.environ.get("REMOTE_REENROLL", "1")).strip().lower() \
 REENROLL_PROBE_EVERY = max(1, int(os.environ.get("REMOTE_REENROLL_PROBE_EVERY") or "2"))
 REENROLL_CLAIM_RETRY_S = int(os.environ.get("REMOTE_REENROLL_CLAIM_RETRY_S") or "600")
 _reenroll_state: dict = {"last_attempt_at": None, "code": None, "claimed_at": None}
+# The provision API's answer to a claim for an id its owner deleted (a tombstone): final, never a retry.
+AGENT_DELETED_ERROR = "agent_deleted"
 
 
 def _provision_base() -> str:
@@ -2664,7 +2717,7 @@ def _lane_whoami() -> str:
 def _reenroll_claim() -> None:
     """Best-effort claim: one live code per episode; failed POSTs retry no
     sooner than REENROLL_CLAIM_RETRY_S; never raises into the caller."""
-    if not REENROLL_ENABLED or _reenroll_state["code"]:
+    if not REENROLL_ENABLED or _reenroll_state["code"] or _reenroll_state.get("deleted"):
         return
     last = _reenroll_state["last_attempt_at"]
     # Monotonic: a wall-clock step backward must not suppress claims (review
@@ -2723,6 +2776,8 @@ def _reenroll_claim() -> None:
         err = diagnostics.code_field(err, URL)
         _reenroll_state["refused"] = {"status": e.code, "error": err, "at": int(time.time())}
         _log(f"reenroll: claim refused HTTP {e.code}" + (f" ({err})" if err else ""))
+        if e.code == 410 and err == AGENT_DELETED_ERROR:
+            _reenroll_state["deleted"] = {"at": int(time.time()), "agent_id": agent_id}
     except Exception as e:  # noqa: BLE001 — recovery must never crash the loop
         _log(f"reenroll: claim failed: {diagnostics.describe(e)}")
 
@@ -2734,6 +2789,7 @@ def _reenroll_clear(recovered: bool = False) -> None:
     prior_attempt = _reenroll_state.get("last_attempt_at")
     _reenroll_state.update({"last_attempt_at": None, "code": None, "claimed_at": None})
     _reenroll_state.pop("refused", None)
+    _reenroll_state.pop("deleted", None)
     if not was_pending:
         # No claim was granted this episode — preserve its cadence, or a
         # probe-only resume lets every future episode re-claim immediately.
@@ -3491,6 +3547,8 @@ def _recover_auth(code: int) -> bool:
         _reenroll_clear()
         return True
     _reenroll_claim()
+    if _reenroll_state.get("deleted"):
+        return _wait_after_deletion(code)
     if not TOKEN_FILE and not _reenroll_state["code"] \
             and not (REENROLL_ENABLED and TOKEN):
         # Historical FATAL contract survives ONLY where recovery is truly
@@ -3526,6 +3584,8 @@ def _recover_auth(code: int) -> bool:
             # A transient failure isn't a lost episode: retry stays in the
             # loop, cadence-bounded internally (safe while nothing is parked).
             _reenroll_claim()
+            if _reenroll_state.get("deleted"):
+                return _wait_after_deletion(code)
         cycle += 1
         if cycle % REENROLL_PROBE_EVERY == 0 and _auth_probe():
             # Re-read: `pending` above predates this iteration's own claim,
@@ -3536,6 +3596,89 @@ def _recover_auth(code: int) -> bool:
             # _reenroll_clear re-reads current state for was_pending, so this
             # is correct whether or not a code was parked when we got here.
             _reenroll_clear(recovered=True)
+            return True
+
+
+def _retire_deleted_binding(agent_id: str) -> bool:
+    """Move the deleted agent's bearer and id out of every file it may sit in
+    (gateway_credential_sources.retirement_paths, deleted_binding.retire); True when anything moved. A file moves lines only when it names that
+    id beside this bearer; once one did, the same bearer's lines also leave the others (a lane's
+    key in the primary .env). An env-only token with no such file retires nothing."""
+    if not TOKEN or not agent_id:
+        return False
+    paths = gateway_credential_sources.retirement_paths(os.environ, TOKEN_FILE)
+    moved: "dict[str, list]" = {}
+    for proven in (False, True):
+        for path in paths:
+            if path in moved or (proven and not moved):
+                continue
+            try:
+                keys = deleted_binding.retire(path, secret=TOKEN, agent_id=agent_id, bearer_proven=proven)
+            except OSError as e:
+                _log_backoff(("retire-deleted", path, type(e).__name__),
+                             f"agent deleted: could not retire its binding from {path} ({diagnostics.describe(e)})")
+                continue
+            if keys:
+                moved[path] = keys
+                _log(f"agent deleted: moved {', '.join(keys)} from {path} to {path}{deleted_binding.RETIRED_SUFFIX}")
+    return bool(moved)
+
+
+def _forget_deleted_identity(agent_id: str) -> None:
+    """A deleted id the launcher exported must not name the next agent's claims: drop it from this
+    process, or, where the launcher pinned it, exit so the launcher starts over from the new file."""
+    if not agent_id:
+        return
+    named = [k for k in ("AGENT_MXID", "AGENT_ID") if os.environ.get(k) == agent_id]
+    if named and os.environ.get(agent_identity.PINNED_KEY):
+        _log("new credential after the agent's deletion, but the launcher pinned the deleted id — restarting")
+        sys.exit(POLL_STALL_EXIT_CODE)
+    for k in named:
+        os.environ.pop(k, None)
+
+
+def _bearer_check() -> str:
+    """This bearer, tested now: "accepted" on an authed answer, "refused" only on a 401, "unknown" on
+    anything else. A 403 can be an edge's WAF or rate rule answering a valid bearer, so it proves nothing."""
+    try:
+        _req("GET", "/v1/agents", timeout=15)
+        return "accepted"
+    except urllib.error.HTTPError as e:
+        return "refused" if e.code == 401 else "unknown"
+    except Exception:  # noqa: BLE001 - unknown, never a refusal
+        return "unknown"
+
+
+def _wait_after_deletion(code: int) -> bool:
+    """The owner deleted this agent: no further claims. The server's answer names an id, not this
+    bearer, so the binding is retired only on a 401, only when the file ties the two, and only right
+    after this bearer is itself refused again with a 401; until then it is tested every cycle, and an accepted
+    bearer resumes, since the stale id may sit beside another, live agent's token. A new credential
+    resumes too; True either way, like a rotation."""
+    deleted = _reenroll_state["deleted"]
+    agent_id = deleted.get("agent_id") or ""
+    if "retired" not in deleted:
+        deleted["retired"] = False
+        _log(f"AGENT DELETED — {agent_id or 'this agent'} was deleted by its owner; no longer "
+             "reconnecting. Set up a new agent to use this machine again")
+    while True:
+        if not deleted["retired"]:
+            check = _bearer_check()
+            if check == "accepted":
+                _log("token accepted again — the deleted id was not this bearer's; resuming")
+                _forget_deleted_identity(agent_id)
+                _reenroll_clear()
+                return True
+            if check == "refused" and code == 401:
+                deleted["retired"] = _retire_deleted_binding(agent_id)
+        _emit_gateway_status(False, error=f"auth rejected HTTP {code} — agent deleted by its owner")
+        time.sleep(AUTH_RECHECK_INTERVAL)
+        if not _heartbeat_singleton():
+            sys.exit("FATAL: lost poller singleton while waiting after the agent's deletion")
+        if _reload_rotated_token():
+            _log("new credential detected after the agent's deletion — resuming")
+            _forget_deleted_identity(agent_id)
+            _reenroll_clear()
             return True
 
 
@@ -5784,7 +5927,18 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             payload["relay_results_retrying"] = retrying
         # Recovery surface: recovered ONLY via the probe-success terminal; a
         # missing block means "no episode known", never success.
-        if _reenroll_state.get("code"):
+        deleted = _reenroll_state.get("deleted")
+        if deleted:
+            # Final: the server deleted the agent; readers stop offering Reconnect for it.
+            payload["binding"] = "deleted"
+            payload["reenroll"] = {
+                "pending": False,
+                "deleted": True,
+                "agent_id": deleted.get("agent_id") or None,
+                "deleted_at": deleted["at"],
+                "credential_retired": bool(deleted.get("retired")),
+            }
+        elif _reenroll_state.get("code"):
             payload["reenroll"] = {
                 "pending": True,
                 "approval_code": _reenroll_state["code"],
@@ -6516,7 +6670,7 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         return None
     if hold:
         return _hold_staged(tid, tmp, task_text, task, sender_tier)
-    if not _publish_staged(tmp, dest):  # atomic publish: never a partial file
+    if not _publish_task(tid, tmp, dest):  # atomic publish: never a partial file
         tmp.unlink(missing_ok=True)
         return None
     _mark_published(tid)
@@ -6823,6 +6977,24 @@ def _mark_published(tid: str) -> None:
     with _ATTEMPTS.transition(_broker_tid(tid)) as t:
         if t.run_published(tid) is False:
             t.mark_published(tid)
+
+
+def _publish_task(tid: str, staged: Path, dest: Path) -> bool:
+    """Publish a served task's staged file into the queue, after TASK_PRE_PUBLISH has seen it."""
+    after = None
+    if TASK_PRE_PUBLISH is not None:
+        try:
+            after = TASK_PRE_PUBLISH(tid, staged, dest)
+        except Exception as exc:  # noqa: BLE001 — a broken hook must never hold a task back
+            _log(f"pre-publish hook failed for {tid}: {diagnostics.describe(exc)}; publishing")
+    if not _publish_staged(staged, dest):
+        return False
+    if callable(after):
+        try:
+            after()
+        except Exception as exc:  # noqa: BLE001 — the task is already published
+            _log(f"post-publish step failed for {tid}: {diagnostics.describe(exc)}")
+    return True
 
 
 def _on_published(tid: str, dest: Path, task_text: str, task: dict, sender_tier: str) -> None:
@@ -7362,7 +7534,7 @@ def _advance_held(tid: str, entry: dict, inflight: "set[str]") -> bool:
     if _staged_tier_withdrawn(tid, staged):
         _end_withdrawn_relay_ask(tid, entry, staged, inflight)
         return False
-    if not _publish_staged(staged, dest):
+    if not _publish_task(tid, staged, dest):
         return False
     _mark_published(tid)
     served = _HELD_TASKS.pop(tid, None)
@@ -8610,6 +8782,8 @@ def _post_proactive() -> None:
             _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
             continue
         dest_room = resolve_destination(CURRENT_ROOM, room_id=room_override) if room_override else resolve_destination(OWNER_PRIVATE)
+        if room_override:
+            body = _guard_proactive_for_room(f.name, claimed_text, body, dest_room)
         thread_root = _proactive_thread_root(claimed_text, f.name)
         about = about_task(f.name)
         if about:
@@ -8618,6 +8792,17 @@ def _post_proactive() -> None:
                     **({"thread_root": thread_root} if thread_root else {}),
                     **({"task_id": about} if about else {})}
         _send_proactive(claim, f, envelope, room_override is None, noticed)
+
+
+def _guard_proactive_for_room(name: str, text: str, body: str, room: str) -> str:
+    """The body a redirected proactive may post in `room`: the shared guard's verdict. No room
+    record states its audience tier, so every room but the owner DM guards as a non-owner one."""
+    _, withheld = team_result_guard.guard_proactive_for_destination(
+        text, room, resolve_destination(OWNER_PRIVATE), "guest", None, secret_filter=filter_chat_secrets)
+    if withheld is None:
+        return body
+    _log(f"[team-guard] withheld proactive {name} for {room}: {withheld}")
+    return team_result_guard.TEAM_LEAK_RESULT
 
 
 def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, noticed: set) -> None:
@@ -11190,6 +11375,7 @@ def main() -> None:
     stop_workers = lambda: _stop_background_workers(_outbound_thread, _results_watcher)  # noqa: E731
     while True:
         _stamp_loop_progress()
+        polled_ok = False  # a failure after this pass's good poll is not a lost connection
         try:
             if _abort_if_poll_stalled(stall_anchor, stop_workers):
                 continue
@@ -11225,6 +11411,7 @@ def main() -> None:
                 last_poll_ok = poll_grace_since = time.time()
                 stall_anchor = poll_ok_awake = time.monotonic()
                 _poll_streak_reset()
+                polled_ok = True
                 # A completed poll remains evidence even if accepting its tasks fails.
                 _emit_gateway_status(True, poll_ok_ts=last_poll_ok)
             except (TimeoutError, socket.timeout):
@@ -11288,7 +11475,7 @@ def main() -> None:
                 _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}", poll_ok_ts=last_poll_ok)
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
-            _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff, poll_ok_ts=last_poll_ok)
+            _emit_gateway_status(polled_ok, error=f"HTTP {e.code}", backoff_s=backoff, poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except _PollAnomaly:
             # Every anomaly is counted in its line; the log itself thins out a run of them.
@@ -11302,12 +11489,12 @@ def main() -> None:
                  f"{int(time.time() - poll_grace_since)}s since last successful poll"
                  f"{_awake_note(time.time() - poll_grace_since, time.monotonic() - poll_ok_awake)} — "
                  f"backing off {backoff}s")
-            _emit_gateway_status(False, error=f"network: {diagnostics.describe(e)}", backoff_s=backoff,
+            _emit_gateway_status(polled_ok, error=f"network: {diagnostics.describe(e)}", backoff_s=backoff,
                                  poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except Exception as e:  # noqa: BLE001 — keep the loop alive
             _log(f"unexpected: {diagnostics.describe(e)} — backing off {backoff}s")
-            _emit_gateway_status(False, error=f"unexpected: {diagnostics.describe(e)}", backoff_s=backoff,
+            _emit_gateway_status(polled_ok, error=f"unexpected: {diagnostics.describe(e)}", backoff_s=backoff,
                                  poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
 

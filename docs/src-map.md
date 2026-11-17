@@ -23,6 +23,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`activity_rows.py`** — The agent-activity row writer: one JSON row per line at <workspace>/state/agent-activity.jsonl, the live window the desktop renders, its per-day archive, the per-task index that keeps a summary exact after rotation, and the summary left at done.
 - **`ag2space_links.py`** — Links a person clicks to open an AG2 Space room, message or room surface inside the app.
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
+- **`agent-display-name.ts`** — The name the voice and phone prompts introduce the agent by.
 - **`agent_availability.py`** — Two room-visible projections of one private runtime: what this agent is doing on THIS task, and whether it can take more work.
 - **`agent_card.py`** — Agent panel cards (`space.ag2.card`, kind `agent_panel`, v 1): build, check, send, and read the replies.
 - **`agent_display_name.py`** — The name this agent introduces itself by: its live s.space display name, never a persona name.
@@ -50,6 +51,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`channel_env_resolve.py`** — Pick the channel env file a caller should source for `channels/<source>`.
 - **`channel_token.py`** — Shared token-resolution policy for the channel bridges.
 - **`chat-ui.ts`** — Sutando Chat UI — clean full-page chat experience.
+- **`chat_bridges.py`** — The chat-app bridges (Telegram, Discord, Slack): which are skipped on this host, set up, and running.
 - **`chat_redaction.py`** — The chat-body redaction CHAIN, owned in one place.
 - **`chat_secret_filter.py`** — Fail-closed secret redaction for persisted inbound chat content.
 - **`check-pending-questions.py`** — Thin entry for the pending-questions reminder: hands argv to the `remind` of the adapter an installed skill declares (`--store-adapter <path>` overrides), resolved here across the installed roots (src/skill_roots.py) and injected into src/pending_questions_reader.py.
@@ -86,6 +88,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`cron_entry_digest.py`** — Stable per-entry digests for `crons.json`, so config drift is DETECTABLE.
 - **`cron_loop_policy.py`** — Core loop identity and deliberate parking shared by schedule adapters.
 - **`cron_ownership.py`** — Which crons.json entries a given session may register.
+- **`cron_prompt_gate.py`** — The prompt a crons.json entry is registered with, owner-task gate included.
 - **`cron_task_id.py`** — Canonical naming contract for a cron job's task id and result filename.
 - **`current_track.py`** — The one writer for a host's current-track.md: append and rotate share a lock.
 - **`dashboard.py`** — Sutando dashboard — current system status for the local agent.
@@ -179,6 +182,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`pending_questions_triage.py`** — Triage-queue policy for owner pending questions: ranking, re-check verdict, dismissal.
 - **`personal-claude-compact-hint.sh`** — SessionStart(compact) hook — re-inject PERSONAL_CLAUDE.md after context compaction.
 - **`platform.ts`** — Cross-platform OS abstraction layer.
+- **`pool_holder.py`** — Which worker-pool worker holds a queued task, with the pool skill optional.
 - **`pool_suspension.py`** — Shared reader for the worker pool's suspension marker, `state/pool-suspended`.
 - **`presenter-mode.ts`** — Provider-neutral presenter-mode sentinel policy — TS twin of src/presenter_mode.py (#2501).
 - **`presenter_mode.py`** — Provider-neutral presenter-mode sentinel policy.
@@ -220,6 +224,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
 - **`screen-capture-server.py`** — Screen capture HTTP server — runs in a terminal (has Screen Recording permission on macOS; needs no special setup on Windows).
 - **`scroll-wheel.swift`** — scroll-wheel.swift — Send OS-level scroll wheel events to Chrome
+- **`secret_compare.py`** — Constant-time equality for a presented credential string against an expected one.
 - **`secret_scanner.py`** — Library-based secret detection for inbound bridge messages.
 - **`self_opened_gate.py`** — Attribution for a terminal dialog Sutando opened itself, and the one rule that may dismiss it.
 - **`send_allowlist.py`** — Alias of `policy.egress.attachment` (phase-1a restructure); one transition window.
@@ -366,6 +371,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 ## `src/agent/claude/cli/`
 
 - **`build-core-settings.mjs`** — Build the Claude Code `--settings` JSON for the Sutando core session.
+- **`project-has-stop-hook.mjs`** — Exit 0 when a settings file's hooks.Stop runs `bash <script>` for the same file as <script>, else 1.
 - **`session-launch.sh`** — src/agent/claude/cli/session-launch.sh — shared claude-CLI session launch mechanics, sourced by the core's own launcher and by a pool worker's own launcher (a separate script, outside core/src/).
 - **`start-cli.sh`** — src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core tmux session.
 - **`sutando-shell-setup.sh`** — sutando-shell-setup — configure the `claude-sutando` shell alias.
