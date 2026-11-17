@@ -174,22 +174,30 @@ class Adopt(Own):
             self.assertEqual(worker_lane.adopt_stray_proactive(W, shared, own), [])
         self.assertEqual(((own / mine).read_text(), (shared / mine).read_text()), ("published", "stray"))
 
-    def test_without_a_no_replace_rename_a_hard_link_moves_it_and_refuses_a_taken_name(self):
+    def test_without_a_no_replace_rename_nothing_moves_and_a_republished_source_survives(self):
         import errno
         import undelivered_quarantine
         shared, own = self.ws / "results", self.own / "results"
         shared.mkdir(parents=True, exist_ok=True)
-        a, b = proactive_filename(1, "ag2space", W), proactive_filename(2, "ag2space", W)
-        for name in (a, b):
-            (shared / name).write_text("stray")
-        own.mkdir(parents=True)
-        (own / b).write_text("published")
+        mine = proactive_filename(1, "ag2space", W)
+        (shared / mine).write_text("stray")
         nothing = FileExistsError(errno.ENOTSUP, "no primitive")
-        with mock.patch.object(undelivered_quarantine, "rename_noreplace", side_effect=nothing):
-            self.assertEqual(worker_lane.adopt_stray_proactive(W, shared, own), [a])
-        self.assertEqual(((own / a).read_text(), (own / b).read_text(), (shared / b).read_text()),
-                         ("stray", "published", "stray"))
-        self.assertFalse((shared / a).exists())
+
+        def republish(src, dst, log=None):
+            tmp = Path(src).with_name(".republish")
+            tmp.write_text("republished")
+            os.replace(tmp, src)
+            raise nothing
+        logged = []
+        undelivered_quarantine._REPORTED.discard("worker-lane:adopt")
+        self.addCleanup(undelivered_quarantine._REPORTED.discard, "worker-lane:adopt")
+        with mock.patch.object(undelivered_quarantine, "rename_noreplace", republish):
+            self.assertEqual(worker_lane.adopt_stray_proactive(W, shared, own, logged.append), [])
+            self.assertEqual(worker_lane.adopt_stray_proactive(W, shared, own, logged.append), [])
+        self.assertEqual((shared / mine).read_text(), "republished")
+        self.assertFalse((own / mine).exists())
+        self.assertEqual(len(logged), 1)
+        self.assertIn("no no-replace rename", logged[0])
 
     def test_the_loop_logs_each_move_and_stops(self):
         shared, own = self.ws / "results", self.own / "results"

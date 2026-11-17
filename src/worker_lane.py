@@ -111,10 +111,11 @@ def attributor(worker: str, argv: "list[str]", log):
     return attribute
 
 
-def adopt_stray_proactive(worker: str, shared_results, own_results) -> "list[str]":
+def adopt_stray_proactive(worker: str, shared_results, own_results, log=None) -> "list[str]":
     """Move the proactive files `worker`'s session stamped (`lane_claims_proactive`) from the shared
     results/ into its own; returns the names moved. The move never replaces a file: a name already in its
-    folder, or one another consumer took first, is left for a later pass."""
+    folder, or one another consumer took first, is left for a later pass. Without a no-replace rename
+    nothing is moved (a link-then-unlink could delete a file a producer just republished there)."""
     import undelivered_quarantine
     from proactive_routing import lane_claims_proactive
     moved = []
@@ -125,16 +126,16 @@ def adopt_stray_proactive(worker: str, shared_results, own_results) -> "list[str
     for name in names:
         if not worker or not lane_claims_proactive(name, worker):
             continue
-        src, dst = Path(shared_results) / name, Path(own_results) / name
         try:
             Path(own_results).mkdir(parents=True, exist_ok=True)
-            try:
-                undelivered_quarantine.rename_noreplace(src, dst)
-            except FileExistsError as e:
-                if not undelivered_quarantine.no_primitive(e):
-                    raise
-                os.link(src, dst)  # refuses a taken name just as atomically
-                src.unlink()
+            undelivered_quarantine.rename_noreplace(Path(shared_results) / name, Path(own_results) / name)
+        except FileExistsError as e:
+            if undelivered_quarantine.no_primitive(e):
+                undelivered_quarantine.report_once("worker-lane:adopt", log or (lambda _m: None),
+                                                   f"lane for worker {worker}: no no-replace rename on this "
+                                                   "platform; its proactive files in the shared results/ stay there")
+                return moved
+            continue
         except OSError:
             continue
         moved.append(name)
@@ -147,7 +148,7 @@ ADOPT_INTERVAL_S = 10.0
 
 def _adopt_loop(worker: str, shared_results, own_results, log, stop, interval_s: float) -> None:
     while True:
-        for name in adopt_stray_proactive(worker, shared_results, own_results):
+        for name in adopt_stray_proactive(worker, shared_results, own_results, log):
             log(f"lane for worker {worker}: moved {name} from the shared results/ to its own")
         if stop.wait(interval_s):
             return
