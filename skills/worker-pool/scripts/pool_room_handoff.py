@@ -10,14 +10,17 @@ leaves; when it is not, or the invitation is refused or held, the core stays and
 Each run picks up where the last stopped: a member is not invited again, a core that already left is
 not asked to leave again (the worker's agent must see itself in the room and the core gone; a failed
 read is never taken as the core having left). The invite and leave carry an operation id per attempt
-(`attempt`, kept in state/workers/<worker>/room-handoff-attempts.json): a call held for the owner keeps its
-id, and one that ended gets a new one, so a declined invitation is sent again and a later hand-off never
-reuses an earlier leave. `join_room` brings the worker's agent into a room it only worked in (`worked_rooms`), and the
+(`attempt`, kept in state/workers/<worker>/room-handoff-attempts.json): only a definite no, a leave that
+was done, or an invitation the worker's agent no longer holds moves to a new id, so a declined invitation is
+sent again and a later hand-off never reuses an earlier leave, while an error or a held call is resent as
+the same operation. `join_room` brings the worker's agent into a room it only worked in (`worked_rooms`), and the
 core stays there. `hand_room` returns one result: `handed`, `waiting` or `unknown` (run it again), `skipped`
 (the core stays, with why), `not_bound` or `failed` (nothing further was done).
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -31,8 +34,6 @@ import pool_provision as pp
 import pool_roster as pr
 
 POLL_S = 5.0
-# A sent invitation the agent has not joined after this long is spent; the next run invites afresh.
-INVITE_SETTLE_S = 600
 # The newest attributions read for worked rooms: each task file lookup scans the task archive.
 RECENT_TASKS = 500
 
@@ -85,30 +86,56 @@ def _attempts(ws: Path, worker: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def attempt(ws: Path, worker: str, room: str, verb: str, now: float) -> int:
-    """The attempt number this call's `verb` uses in `room`. An operation id is deduplicated by the server,
-    so an attempt that ended (left; refused; sent and not joined within INVITE_SETTLE_S) is never reused;
-    one held for the owner's approval is, so the approval answers it."""
+def attempt(ws: Path, worker: str, room: str, verb: str, invite_gone: bool = False) -> int:
+    """The attempt number this call's `verb` uses in `room`. The server deduplicates an operation id, so
+    the id moves on only once its last call can no longer take effect: a definite no, a leave that was
+    done, or a sent invitation the worker's agent no longer holds (`invite_gone`). An error, a retry or a
+    call held for the owner keeps its id, so a resend is the same operation and never a second one."""
     rec = (_attempts(ws, worker).get(room) or {}).get(verb) or {}
-    n, state, at = int(rec.get("n") or 0), rec.get("state"), float(rec.get("at") or 0)
-    spent = state in ("done", "refused") if verb == "leave" else \
-        state == "refused" or (state == "done" and now - at > INVITE_SETTLE_S)
+    n, state = int(rec.get("n") or 0), rec.get("state")
+    spent = state == "no" or (state == "sent" and (verb == "leave" or invite_gone))
     return n + 1 if spent else n
 
 
-def record_attempt(ws: Path, worker: str, room: str, verb: str, n: int, state: str, now: float) -> None:
-    data = _attempts(ws, worker)
-    data.setdefault(room, {})[verb] = {"n": n, "state": state, "at": now}
+@contextlib.contextmanager
+def _attempts_locked(ws: Path, worker: str):
     path = _attempts_path(ws, worker)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
+    with open(path.with_name(path.name + ".lock"), "a+") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield path
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def record_attempt(ws: Path, worker: str, room: str, verb: str, n: int, state: str, now: float) -> None:
+    """Keep one attempt's outcome (`sent`, `no` or `open`); a locked read-modify-write, so records other
+    runs make for other rooms or verbs of the same worker survive."""
+    with _attempts_locked(ws, worker) as path:
+        data = _attempts(ws, worker)
+        data.setdefault(room, {})[verb] = {"n": n, "state": state, "at": now}
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(data, fh, sort_keys=True)
+            os.replace(tmp, path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+
+
+def invite_held(as_worker, room: str) -> "Optional[bool]":
+    """Whether the worker's agent holds a pending invitation to `room`, from its own `room.invites.list`;
+    None when that cannot be read, which is never taken as gone."""
     try:
-        with os.fdopen(fd, "w") as fh:
-            json.dump(data, fh, sort_keys=True)
-        os.replace(tmp, path)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+        env = as_worker().read_account("room.invites.list", {})
+    except pp.ProvisionError:
+        return None
+    invites = pp.find(env, "invites")
+    if env.get("is_error") or not isinstance(invites, list):
+        return None
+    return any(isinstance(i, dict) and _local(str(i.get("room_id") or "")) == _local(room) for i in invites)
 
 
 def worker_actions(row: dict, vault=None) -> "pp.Actions":
@@ -152,23 +179,28 @@ def _no_agent(worker: str, room: str) -> dict:
 
 
 def _execute(ws: Path, actions, worker: str, agent: str, target: str, verb: str, action: str, arguments: dict,
-             wall) -> "tuple[str, dict]":
+             wall, invite_gone: bool = False) -> "tuple[str, dict]":
     """One invite or leave under this attempt's operation id; (its approval state, the answer), recorded."""
-    now = wall()
-    n = attempt(ws, worker, target, verb, now)
+    n = attempt(ws, worker, target, verb, invite_gone)
     env = actions.execute(action, arguments, operation_id=operation_id(verb, worker, agent, target, n), room_id=target)
     state = pp.approval_state(env)
-    refused = state != "done" or (verb == "invite" and pp.find(env, "invited") is False)
-    record_attempt(ws, worker, target, verb, n, "held" if state == "held" else "refused" if refused else "done", now)
+    if state == "denied" or (state == "done" and verb == "invite" and pp.find(env, "invited") is False):
+        outcome = "no"
+    else:
+        outcome = "sent" if state == "done" else "open"
+    record_attempt(ws, worker, target, verb, n, outcome, wall())
     return state, env
 
 
 def _invite_until_joined(ws: Path, actions, worker: str, agent: str, target: str, members: set, *, wait_s, poll_s,
-                         sleep, clock, wall, stays: str) -> None:
+                         sleep, clock, wall, as_worker, stays: str) -> None:
     """Returns once `agent` is joined; otherwise raises `_Stop` with waiting or skipped."""
     if agent in members:
         return
-    state, env = _execute(ws, actions, worker, agent, target, "invite", "room.member.invite", {"user_id": agent}, wall)
+    last = (_attempts(ws, worker).get(target) or {}).get("invite") or {}
+    gone = last.get("state") == "sent" and invite_held(as_worker, target) is False
+    state, env = _execute(ws, actions, worker, agent, target, "invite", "room.member.invite", {"user_id": agent}, wall,
+                          invite_gone=gone)
     if state == "held":
         raise _Stop("waiting", "the invitation waits for the owner's approval; run this again once approved")
     if state != "done" or pp.find(env, "invited") is False:
@@ -229,7 +261,8 @@ def _hand_room(worker, room, *, workspace, actions, server, core_agent, as_worke
                                "the binding is kept. Run this again")
     try:
         _invite_until_joined(ws, actions, worker, agent, target, members, wait_s=wait_s, poll_s=poll_s, sleep=sleep,
-                             clock=clock, wall=wall, stays="the core stays and the binding is kept")
+                             clock=clock, wall=wall, as_worker=as_worker,
+                             stays="the core stays and the binding is kept")
     except _Stop as stop:
         return done(stop.status, stop.why, **stop.extra)
     members, why = joined(actions, target)
@@ -281,19 +314,22 @@ def worked_rooms(workspace, worker: str, server: str) -> list:
 
 
 def join_room(worker: str, room: str, *, workspace=None, actions=None, server: str = "", wait_s: float = 0.0,
-              poll_s: float = POLL_S, sleep=time.sleep, clock=time.monotonic, wall=time.time, vault=None) -> dict:
+              poll_s: float = POLL_S, sleep=time.sleep, clock=time.monotonic, wall=time.time, vault=None,
+              as_worker: Optional[Callable[[], object]] = None) -> dict:
     """Bring the worker's agent into a room it worked in as the core's agent; the core stays and no binding
     changes. `joined`, `waiting`, `skipped` (with why) or `failed`."""
     return _guarded(_join_room, worker, room, workspace=workspace, actions=actions, server=server, wait_s=wait_s,
-                    poll_s=poll_s, sleep=sleep, clock=clock, wall=wall, vault=vault)
+                    poll_s=poll_s, sleep=sleep, clock=clock, wall=wall, vault=vault, as_worker=as_worker)
 
 
-def _join_room(worker, room, *, workspace, actions, server, wait_s, poll_s, sleep, clock, wall, vault) -> dict:
+def _join_room(worker, room, *, workspace, actions, server, wait_s, poll_s, sleep, clock, wall, vault,
+               as_worker) -> dict:
     ws = Path(connections._workspace(workspace))
     found = _agents(worker, ws, actions, server, "", vault)
     if found is None:
         return _no_agent(worker, room)
-    agent, _ident, actions, server, _core = found
+    agent, ident, actions, server, _core = found
+    as_worker = as_worker or (lambda: worker_actions(ident, vault))
     target = f"{_local(room)}:{server}"
     out = {"worker": worker, "agent": agent, "room": target}
     members, why = joined(actions, target)
@@ -301,7 +337,8 @@ def _join_room(worker, room, *, workspace, actions, server, wait_s, poll_s, slee
         return {**out, "status": "skipped", "why": f"the core cannot read this room ({why}), so it cannot invite"}
     try:
         _invite_until_joined(ws, actions, worker, agent, target, members, wait_s=wait_s, poll_s=poll_s, sleep=sleep,
-                             clock=clock, wall=wall, stays="the core stays")
+                             clock=clock, wall=wall, as_worker=as_worker,
+                             stays="the core stays")
     except _Stop as stop:
         return {**out, "status": stop.status, "why": stop.why, **stop.extra}
     return {**out, "status": "joined", "why": "the worker's agent is a member; the core stays"}
