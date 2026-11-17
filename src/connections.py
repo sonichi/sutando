@@ -2209,21 +2209,31 @@ def worker_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tupl
 
 def task_home(task_id: str, workspace: Optional[Path] = None) -> dict:
     """Where `task_id` lives: {"lane", "worker", "tasks", "results", "own"}. A task an own-dir worker's
-    lane queued (`task_lane`) is in that worker's dirs; any other, or on an unreadable record, the shared ones."""
+    lane queued (`task_lane`) is in that worker's dirs, as is any other id whose task file (live or
+    archived) is in an own-dir worker's tasks folder; else, or on an unreadable record, the shared ones."""
     ws = _workspace(workspace)
     home = {"lane": task_lane(task_id), "worker": "", "tasks": ws / "tasks", "results": ws / "results", "own": False}
-    if not home["lane"]:
-        return home
     try:
         rows = _read(record_path(ws))
     except (SchemaError, OSError):
         return home
-    row = next((r for r in rows if home["lane"] in [r["instance"]] + alias_instances(r)), None)
+    if home["lane"]:
+        row = next((r for r in rows if home["lane"] in [r["instance"]] + alias_instances(r)), None)
+    else:
+        row = next((r for r in rows if _row_dirs(r, ws) and _holds_task(_row_dirs(r, ws)[0], task_id)), None)
     home["worker"] = str((row or {}).get("worker") or "")
     dirs = _row_dirs(row, ws)
     if dirs:
         home.update(tasks=dirs[0], results=dirs[1], own=True)
     return home
+
+
+def _holds_task(tasks_dir: Path, task_id: str) -> bool:
+    import local_task_protocol
+    try:
+        return local_task_protocol.find_archived_task(tasks_dir, task_id) is not None
+    except (OSError, ValueError):
+        return False
 
 
 def set_worker_dirs(worker: str, own: bool, *, workspace: Optional[Path] = None) -> dict:
