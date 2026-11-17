@@ -162,7 +162,7 @@ resolve_claude_config_dir_and_seed() {
     if [ -n "$PY" ] && "$PY" -c 'import sys' > /dev/null 2>&1; then
       # No override: claude starts in this checkout, which a git repo makes Claude Code ask
       # about (2026-10-22: a PR checkout's core restarted into that prompt and sat there).
-      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-$(cd "$REPO" && pwd -P)}" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" "$PY" - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
+      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-$(cd "$REPO" && pwd -P)}" _home="$(cd "$HOME" 2>/dev/null && pwd -P)" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" "$PY" - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
 import json, os
 ccd = os.environ["_ccd"]
 target = os.path.join(ccd, ".claude.json")
@@ -208,19 +208,20 @@ if (cfg.get("fullscreenUpsellSeenCount") or 0) < 3:
 # scoped config lacks it, so a detached session would hang on the prompt.
 # Only pre-trust the one dir the caller explicitly chose, or else the launcher's
 # own checkout (physical path, as getcwd() reports it).
-cwd = os.environ.get("_cwd") or ""
-trusted_dir = None
-if cwd:
+# Also the home folder every launch passes to --add-dir: from Claude Code 2.1.326 an
+# untrusted --add-dir folder asks a per-session question that this key alone answers.
+trusted_dirs = []
+for d in dict.fromkeys(x for x in (os.environ.get("_cwd"), os.environ.get("_home")) if x):
     projects = cfg.get("projects")
     if not isinstance(projects, dict):
         projects = cfg["projects"] = {}
-    entry = projects.get(cwd)
+    entry = projects.get(d)
     if not isinstance(entry, dict):
-        entry = projects[cwd] = {}
+        entry = projects[d] = {}
     if entry.get("hasTrustDialogAccepted") is not True:
         entry["hasTrustDialogAccepted"] = True
         changed = True
-        trusted_dir = cwd
+        trusted_dirs.append(d)
 # Dangerous-mode seed (env-gated, detached-only). A session launched with
 # --dangerously-skip-permissions shows a "Bypass Permissions mode / Yes, I
 # accept" prompt on first run in a fresh scoped config, which that flag does
@@ -251,8 +252,8 @@ if changed:
     print("  ✓ onboarding-seed: hasCompletedOnboarding set in .claude.json")
     if chrome_seeded:
         print("  ✓ chrome-seed: hasCompletedClaudeInChromeOnboarding set in .claude.json")
-    if trusted_dir:
-        print("  ✓ trust-seed: hasTrustDialogAccepted set for %s" % trusted_dir)
+    for d in trusted_dirs:
+        print("  ✓ trust-seed: hasTrustDialogAccepted set for %s" % d)
     if upsell_seeded:
         print("  ✓ upsell-seed: fullscreenUpsellSeenCount set in .claude.json")
 PY
@@ -295,8 +296,7 @@ claude_cwd_has_pending_stop_hook() {
 # Built by node helpers, not shell string interpolation (a $REPO with a space
 # or a `"` broke hand-rolled interpolation in the past). Reads REPO and the
 # working dir resolve_claude_cwd_args canonicalized. Sets SETTINGS_ARGS and
-# exports SUTANDO_OBS_ENDPOINT. $HOME rides in the JSON as an additional directory;
-# only a launch with no JSON falls back to --add-dir, which asks a trust question.
+# exports SUTANDO_OBS_ENDPOINT.
 resolve_claude_settings_args() {
   OBS_ENDPOINT="${SUTANDO_OBS_ENDPOINT:-}"
   export SUTANDO_OBS_ENDPOINT="$OBS_ENDPOINT"
@@ -308,7 +308,6 @@ resolve_claude_settings_args() {
   fi
   if ! command -v node > /dev/null 2>&1; then
     echo "session hooks: node unavailable — cannot safely build --settings JSON; AskUserQuestion guard + obs disabled this session" >&2
-    SETTINGS_ARGS+=(--add-dir "$HOME")
     return 0
   fi
   OBS_JSON=""
@@ -322,14 +321,13 @@ resolve_claude_settings_args() {
       echo "obs hooks: settings build failed — capture disabled this session" >&2
     fi
   fi
-  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py" "$REPO/hooks/shell-trap-guard.py" "$REPO/hooks/stale-head-post-guard.py" "$_stop_hook" "$HOME")"
+  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py" "$REPO/hooks/shell-trap-guard.py" "$REPO/hooks/stale-head-post-guard.py" "$_stop_hook")"
   if [ -n "$CLAUDE_SETTINGS_JSON" ]; then
     SETTINGS_ARGS+=(--settings "$CLAUDE_SETTINGS_JSON")
     echo "session hooks: AskUserQuestion guard registered (PreToolUse deny — a headless session can't answer it)"
     if [ -n "$_stop_hook" ]; then echo "session hooks: Stop hook registered (cwd is outside the checkout)"; fi
   else
     echo "session hooks: settings build failed — AskUserQuestion guard NOT registered this session" >&2
-    SETTINGS_ARGS+=(--add-dir "$HOME")
   fi
 }
 
@@ -540,7 +538,7 @@ launch_claude_session() {
   claude_cli_resolves || return 1
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${CWD_ARGS[@]+"${CWD_ARGS[@]}"} \
     -e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR" \
-    "${CLAUDE_BIN:-claude}" --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions \
+    "${CLAUDE_BIN:-claude}" --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} \
     -- "$BOOT_PROMPT" || true
   for _ in $(seq 1 25); do

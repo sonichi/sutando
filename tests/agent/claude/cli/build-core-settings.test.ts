@@ -309,18 +309,4 @@ describe('build-core-settings.mjs', () => {
 		);
 		assert.equal(o.hooks.Stop, undefined);
 	});
-
-	it('emits arg10 as the one permissions.additionalDirectories entry', () => {
-		const dir = '/Users/x y/home';
-		const o = JSON.parse(
-			execFileSync('node', [CORE_BUILDER, GUARD, '', '', '', '', '', '', '', '', dir], { encoding: 'utf8' }),
-		);
-		assert.deepEqual(o.permissions, { additionalDirectories: [dir] });
-		assert.equal(o.hooks.PreToolUse[0].matcher, 'AskUserQuestion');
-	});
-
-	it('omitting arg10 adds no permissions block', () => {
-		const o = buildCore(GUARD, '');
-		assert.equal(o.permissions, undefined);
-	});
 });

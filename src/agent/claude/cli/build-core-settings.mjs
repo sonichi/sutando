@@ -13,7 +13,7 @@
 // builder treats the obs settings as an opaque JSON blob and array-concats it
 // with the guard, so the two concerns never drift.
 //
-// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>] [<abs-path-to-gdocs-write-guard.py>] [<abs-path-to-native-pim-guard.py>] [<abs-path-to-shell-trap-guard.py>] [<abs-path-to-stale-head-post-guard.py>] [<abs-path-to-check-pending-tasks.sh>] [<additional-directory>]
+// Usage:  node build-core-settings.mjs <abs-path-to-guard-hook.py> [<obs-settings-json>] [<abs-path-to-skill-telemetry-hook.py>] [<abs-path-to-gmail-write-guard.py>] [<abs-path-to-gdocs-write-guard.py>] [<abs-path-to-native-pim-guard.py>] [<abs-path-to-shell-trap-guard.py>] [<abs-path-to-stale-head-post-guard.py>] [<abs-path-to-check-pending-tasks.sh>]
 //   arg1 (required): path to the guard hook script (skip-ask-user-question.py).
 //   arg2 (optional): the obs `--settings` JSON string from build-hook-settings.mjs;
 //                    empty / omitted → obs hooks are not included.
@@ -40,8 +40,6 @@
 //                    commit_id or sha claim names a head the PR has moved past.
 //   arg9 (optional): path to src/check-pending-tasks.sh, registered as a Stop hook;
 //                    passed only when the cwd is not the checkout (whose settings carry it).
-//   arg10 (optional): a directory the session may work in beyond its cwd, emitted as
-//                    permissions.additionalDirectories (the --add-dir flag asks a trust question per start).
 // Prints the merged settings JSON to stdout (exit 2 on a missing guard path,
 // exit 3 on an unparseable obs-settings blob).
 
@@ -174,17 +172,18 @@ if (pendingTasksStopHook.trim()) {
 	pendingTasksStopSettings = { hooks: { Stop: [{ hooks: [{ type: 'command', command: `bash ${shq(pendingTasksStopHook)}` }] }] } };
 }
 
-const additionalDirectory = process.argv[11] || '';
-const merged = mergeHookSettings(
-	guardSettings,
-	obsSettings,
-	skillTelemetrySettings,
-	gmailWriteGuardSettings,
-	gdocsWriteGuardSettings,
-	nativePimGuardSettings,
-	shellTrapGuardSettings,
-	staleHeadPostGuardSettings,
-	pendingTasksStopSettings,
+process.stdout.write(
+	JSON.stringify(
+		mergeHookSettings(
+			guardSettings,
+			obsSettings,
+			skillTelemetrySettings,
+			gmailWriteGuardSettings,
+			gdocsWriteGuardSettings,
+			nativePimGuardSettings,
+			shellTrapGuardSettings,
+			staleHeadPostGuardSettings,
+			pendingTasksStopSettings,
+		),
+	),
 );
-if (additionalDirectory.trim()) merged.permissions = { additionalDirectories: [additionalDirectory] };
-process.stdout.write(JSON.stringify(merged));

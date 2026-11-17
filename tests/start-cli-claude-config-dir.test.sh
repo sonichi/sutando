@@ -63,7 +63,6 @@ setup_sandbox() {
   cat > "$BIN_STUB/claude" << EOF
 #!/bin/bash
 env > "$ENV_DUMP"
-printf '%s\n' "\$@" > "$ENV_DUMP.argv"
 exit 0
 EOF
   chmod +x "$BIN_STUB/claude"
@@ -282,32 +281,6 @@ test_valid_config_exports_env() {
 }
 
 # ----------------------------------------------------------------------
-# 5. The core reaches $HOME through --settings additionalDirectories: a --add-dir
-#    flag makes Claude Code ask a per-session trust question no detached core can answer.
-# ----------------------------------------------------------------------
-test_home_dir_rides_in_settings() {
-  setup_sandbox "yes" ".claude-sutando"
-  bash "$REPO_FAKE/src/agent/claude/cli/start-cli.sh" </dev/null >/dev/null 2>&1
-  argv="$ENV_DUMP.argv"
-  if [ ! -f "$argv" ]; then
-    echo "  FAIL: claude stub never ran"
-    cleanup_sandbox; return 1
-  fi
-  if grep -qx -- '--add-dir' "$argv"; then
-    echo "  FAIL: launch argv still carries --add-dir"
-    cat "$argv"; cleanup_sandbox; return 1
-  fi
-  settings="$(grep -A1 -x -- '--settings' "$argv" | tail -1)"
-  dirs="$(printf '%s' "$settings" | python3 -c 'import json,sys; print(json.load(sys.stdin)["permissions"]["additionalDirectories"])' 2>&1)"
-  if [ "$dirs" != "['$HOME']" ]; then
-    echo "  FAIL: --settings additionalDirectories is not [\$HOME]: $dirs"
-    cleanup_sandbox; return 1
-  fi
-  cleanup_sandbox
-  return 0
-}
-
-# ----------------------------------------------------------------------
 # 3. helper present + INVARIANT-VIOLATING config (e.g. absolute path) →
 #    start-cli refuses, exits 1, claude stub never runs.
 # ----------------------------------------------------------------------
@@ -365,7 +338,6 @@ run_test "1b. helper missing + caller-set dir → honoured"     test_helper_miss
 run_test "2. helper + valid config → env exported"          test_valid_config_exports_env
 run_test "3. helper + invalid config → refuses to start"    test_invalid_config_refuses_to_start
 run_test "4. source-tied guard: delegation present in script" test_block_present_in_start_cli
-run_test "5. home folder via --settings, not --add-dir"   test_home_dir_rides_in_settings
 
 echo
 echo "----------------------------------------"
