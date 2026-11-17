@@ -53,18 +53,20 @@ def _rows(workspace):
     return connections.read_rows(Path(workspace))
 
 
-def own_dirs(workspace, worker: str) -> bool:
-    """Whether `worker` keeps its own task folders (`connections.worker_dirs`)."""
+def own_dirs(workspace, worker: str):
+    """`worker`'s own (tasks, results) folders (`connections.worker_dirs`), or None when it has none."""
     import connections
-    return connections.worker_dirs(worker, Path(workspace)) is not None
+    return connections.worker_dirs(worker, Path(workspace))
 
 
 def route_for(workspace, worker: str, *, sender: str, core: str, tier: str = "team",
-              relayed_from=None, parent_task=None, environ=None, rows=None) -> "dict | None":
+              relayed_from=None, parent_task=None, environ=None, rows=None, own=None) -> "dict | None":
     """The s.space route for this ask, or None for the folder path. Raises HandoffError when the
     worker has its own identity but the hand-off cannot be addressed: never a silent fallback. A worker
-    on its own folders (`own_dirs`) has no folder path, so it is asked this way or refused."""
-    own = own_dirs(workspace, worker) if worker != core else False
+    on its own folders (`own_dirs`; `own` passes a value the caller already read) has no folder path,
+    so it is asked this way or refused."""
+    if own is None:
+        own = worker != core and own_dirs(workspace, worker) is not None
     if not own and not enabled(environ):
         return None
     # Only the core delegates this way; relayed or parent-held asks keep the folder's tier and hold.

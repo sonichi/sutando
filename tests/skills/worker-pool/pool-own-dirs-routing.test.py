@@ -166,6 +166,24 @@ class Ask(Base):
         self.assertNotIn("route", out)
         self.assertEqual(self.sentinels(self.alpha), [])
 
+    def test_the_record_is_read_once_so_a_change_after_it_cannot_split_the_decision(self):
+        real, calls = C.worker_dirs, []
+
+        def then_gone(worker, ws):
+            calls.append(worker)
+            return real(worker, ws) if len(calls) == 1 else None
+        own = self.own_tasks()
+        with mock.patch.object(C, "worker_dirs", then_gone), mock.patch.object(pa, "whoami", return_value=pr.CORE):
+            out = pa.ask(self.ws, self.alpha, "re-arm", allow_handoff=False)
+            self.assertEqual(Path(out["task_file"]).parent, own)
+            fake = FakeRoom()
+            os.environ.update({ph.ROOM: ROOM, ph.ROOM_CLI: "/fake/room_cli.py"})
+            calls.clear()
+            self.assertEqual(pa.ask(self.ws, self.alpha, "review", runner=fake)["via"], "room")
+        self.assertEqual(calls, [self.alpha])
+        self.assertNotIn("route", out)
+        self.assertEqual(self.sentinels(self.alpha), [])
+
     def test_a_shared_dir_worker_with_the_flag_off_keeps_the_folder(self):
         self.record(own=False)
         with mock.patch.object(pa, "whoami", return_value=pr.CORE):

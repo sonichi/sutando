@@ -153,14 +153,16 @@ def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
         raise ValueError("that is you")
     task_id = f"task-{secrets.token_hex(9)}"
     ph = _sibling("pool_handoff")
-    own = rid != pr.CORE and ph.own_dirs(ws, rid)
+    # Read once: every decision below and the folder written use this one answer.
+    dirs = ph.own_dirs(ws, rid) if rid != pr.CORE else None
+    own = dirs is not None
     if allow_handoff and (own or skill_config.enabled(HANDOFF_FLAG, MANIFEST)):
         route = ph.route_for(ws, rid, sender=sender, core=pr.CORE, tier=tier,
-                             relayed_from=relayed_from, parent_task=parent_task)
+                             relayed_from=relayed_from, parent_task=parent_task, own=own)
         if route is not None:
             return handoff_ask(ws, route, task_id, rid, sender, question, wait_s=wait_s, runner=runner)
     # Only a supervision probe (no hand-off allowed) reaches an own-dir worker here: into its own inbox.
-    tasks = _own_tasks_dir(ws, rid) if own else ws / "tasks"
+    tasks = Path(dirs[0]) if own else ws / "tasks"
     tasks.mkdir(parents=True, exist_ok=True)
     tmp = tasks / f".{task_id}.txt.tmp"
     tmp.write_text(compose(task_id, rid, question, sender=sender, wait=wait_s > 0, tier=tier,
@@ -182,11 +184,6 @@ def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
     if wait_s > 0:
         out["reply"] = wait_for_reply(ws, task_id, wait_s, sleep=sleep)
     return out
-
-
-def _own_tasks_dir(ws: Path, worker: str) -> Path:
-    import connections
-    return connections.worker_dirs(worker, ws)[0]
 
 
 def handoff_ask(ws: Path, route: dict, task_id: str, rid: str, sender: str, question: str, *,
