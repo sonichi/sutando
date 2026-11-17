@@ -29,6 +29,7 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `pool_delivery.py` — a recipient's own folder: sentinels in, accept, release, done flags, and the owner's `hand_off_to_core`.
 - `pool_ask.py` — ask another instance a question through the front door (below).
 - `pool_handoff.py` — `pool_ask` over s.space to a worker with its own agent, behind a flag (below).
+- `pool_pr_route.py` — pr-watch's `PR_WATCH_ROUTE_CMD`: hands an event about our own PR to the worker driving it (below).
 - `pool_sessions.py` — read-only: which worker tmux sessions a viewer could attach, and the exact-match argv for each. Adds no state and nothing in the pool calls it; it exists for the desktop app's terminal picker. It deliberately does not describe the core, whose socket resolution belongs to the app.
 
 ```bash
@@ -389,6 +390,33 @@ python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|
   never be relayed as your own: the tier must say where the question came from, not who ran
   the script.
 - Refused, never guessed: an unknown name, a name shared by recipients, and asking yourself.
+
+### PR events to the worker that drives the PR
+
+Every worker pushes as the same GitHub login, so the one pr-watch runner on a host cannot tell
+whose PR an event is. `pool_pr_route.py` is its route command. It hands an event off only when all
+of these hold, and prints `local` (the watcher keeps the event) otherwise:
+
+- The event is about our own PR: not a `review_requested` or `review_dismissed`, not a
+  `reason=reviewed` update; and the PR's author is one of the watch's authors and its head branch
+  is in the base repository. Author, head repository and the PR's last 100 commits (older ones are
+  not read) come from one GitHub call per head, cached.
+- The newest commit whose trailer block carries a valid `Sutando-Task:` names a task this host
+  assigned to a worker (`state/attribution/<task id>`). Newest wins, so a stacked or promoted PR
+  goes to whoever made its last commit.
+- That worker is not the watching session (`$SUTANDO_INSTANCE_ID`, else the core) and its session
+  is alive (`pool_ask --who`).
+- The `pool_ask` (only the event line, plus: read the PR, act on it, tell the owner only if it
+  needs them) was delivered: a sentinel in the worker's folder, or, over s.space, a confirmed post.
+  An unconfirmed post is not sent again.
+
+Then it prints `handed <worker id>`. A PR driven from another host stays with the watcher here.
+On, on the host running the pr-watch runner, from the checkout:
+
+```bash
+python3 skills/pr-watch/scripts/pr_watch.py config set PR_WATCH_ROUTE_CMD \
+  "$(python3 -c 'import shlex, sys; print(shlex.join(sys.argv[1:]))' python3 "$PWD/skills/worker-pool/scripts/pool_pr_route.py")"
+```
 
 ### Over s.space, to a worker with its own agent (flag, off by default)
 
