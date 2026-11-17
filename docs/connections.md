@@ -675,16 +675,25 @@ segment is the one the worker row's `agent_mxid` names. The file chooses nothing
 re-derives its name and env from the segment, as for any declaration, and runs it only when the
 connection record names its `AGENT_MXID` as exactly one worker's own agent, held by the core's
 owner, neither disabled nor parked (`connections.worker_serving_agent`). The worker and its lane
-instance come from that row. Such a bridge runs as the worker's lane does: the workspace's
-`tasks/`, `results/` and `state/`, with `GATEWAY_INSTANCE` set to the row's instance. It names no
+instance come from that row. Such a bridge runs the lane's own loader, `remote-gateway-bridge.py`,
+on the workspace's `tasks/`, `results/` and `state/` with the lane's identity env
+(`connections.lane_identity_env`: `GATEWAY_INSTANCE`, the lane's worker, its `not_before`). It
+therefore carries every host gate the lane does (intake dedupe and backlog, the room and thread
+check, dispatch and ack vetoes, the lane-server check, status, the send roots) and the worker
+wiring, from the one place that sets them. Its revision covers the declaration and what it takes
+from the row, so a record-only change restarts it. It names no
 vault key: its token is the row's own, read where the lane reads it (`connection_credential`, by the
 row's `token_ref`), so no copy of the relay token is stored. A record that cannot be read keeps a
 running bridge as it is; any other mismatch skips the declaration with its reason.
 
-While a valid declaration exists, the lane keeper (`keep_lanes_up`) does not start that worker's
-lane (`worker_lane.declared_bridge`, the agent bridge's own check). The row stays enabled, so
+While a valid declaration exists (`worker_lane.declared_bridge`, the agent bridge's own check), the
+lane keeper (`keep_lanes_up`) leaves the worker's lane down while the declared bridge holds the
+lane's lease, and for up to `DECLARED_BRIDGE_GRACE_S` (180 s) after it first finds nobody holding it.
+Past that, it starts the lane and says so, so a bridge that is not supervised, cannot read its
+token or keeps crashing never leaves the worker's agent silent. The row stays enabled, so
 `worker_enabled_identity` still answers it: the worker's session stamps its proactive files and its
 MCP proxy acts as the worker's agent. A check that cannot be made starts the lane as before.
+`declare` refuses a worker whose row token cannot be read.
 `withdraw --worker <id>` removes the declaration: sparrowd stops the bridge on its next scan and
 the keeper starts the lane on its next pass.
 
@@ -696,10 +705,12 @@ and `disconnect` stop whichever process holds that lease, the declared bridge in
 
 Cutting a worker over:
 
-1. `python3 src/worker_lane.py declare --worker <id>`. sparrowd picks it up on its next scan; its
-   bridge finds the running lane holding the lease and exits 75, and sparrowd keeps retrying.
-2. `python3 scripts/connections.py stop <instance>` stops the lane once. The keeper does not start
-   it again, and the declared bridge takes the lease on its next retry.
+1. `python3 src/worker_lane.py declare --worker <id>`. sparrowd (run with `--agent-bridges`) picks it up
+   on its next scan; its bridge finds the running lane holding the lease and exits 75, and sparrowd
+   keeps retrying.
+2. `python3 scripts/connections.py stop <instance>` stops the lane once. The keeper waits out its
+   grace, and the declared bridge takes the lease on its next retry (sparrowd's backoff is at most
+   60 s). If it does not, the keeper starts the lane again and logs why.
 3. Check with a live round trip: a message to the worker's agent reaches the worker and its reply
    is posted as that agent.
 

@@ -19,7 +19,8 @@ workspace wiring:
      runpy via the deprecated remote-relay-bridge name, and the mock-gateway
      test harness (which loads the file several times under different env and
      mutates module attributes) — sees exactly the same module-level API and
-     import-time env parsing as the pre-switch monolith.
+     import-time env parsing as the pre-switch monolith. A pool worker's declared
+     Sparrow bridge (`sparrow_agent_bridge.py`) runs this file too, as its lane.
 
 Revert: restore this file's previous revision from git (the pre-switch
 monolith is the parent commit of the one introducing this shim). No other

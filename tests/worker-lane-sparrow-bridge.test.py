@@ -76,7 +76,7 @@ class Base(H.Base):
     def cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            rc = worker_lane.main(list(argv), workspace=self.ws)
+            rc = worker_lane.main(list(argv), workspace=self.ws, vault=self.vault)
         return rc, out.getvalue() + err.getvalue()
 
     def declare(self):
@@ -126,11 +126,22 @@ class Serving(Base):
         with self.assertRaises(worker_lane.RecordUnreadable):
             worker_lane.serving(WORKER_AGENT, self.ws)
 
-    def test_the_overlay_is_the_lanes_dirs_and_instance(self):
-        self.assertEqual(worker_lane.bridge_overlay(self.ws, "lane-x"), {
-            "AGENT_CONNECT_TASK_DIR": str(self.ws / "tasks"), "AGENT_CONNECT_RESULT_DIR": str(self.ws / "results"),
-            "AGENT_CONNECT_STATE_DIR": str(self.ws / "state"), "GATEWAY_INSTANCE": "lane-x",
-            "REMOTE_MEDIA_DIR": str(self.ws / "data" / "remote-media")})
+    def test_the_overlay_is_the_lanes_dirs_and_the_lanes_own_identity_env(self):
+        lane = self.row["instance"]
+        overlay = worker_lane.bridge_overlay(self.ws, lane)
+        self.assertEqual({k: overlay[k] for k in ("AGENT_CONNECT_TASK_DIR", "AGENT_CONNECT_RESULT_DIR",
+                                                   "AGENT_CONNECT_STATE_DIR", "REMOTE_MEDIA_DIR")},
+                         {"AGENT_CONNECT_TASK_DIR": str(self.ws / "tasks"), "AGENT_CONNECT_RESULT_DIR": str(self.ws / "results"),
+                          "AGENT_CONNECT_STATE_DIR": str(self.ws / "state"),
+                          "REMOTE_MEDIA_DIR": str(self.ws / "data" / "remote-media")})
+        launched = C.launch_env(C.plan_entry(lane, {}, workspace=self.ws), {}, vault=self.vault)
+        lane_env = C.lane_identity_env(C.plan_entry(lane, workspace=self.ws))
+        self.assertEqual({k: overlay[k] for k in lane_env}, {k: launched[k] for k in lane_env},
+                         "the same identity env the lane is launched with")
+        self.assertEqual((overlay["GATEWAY_INSTANCE"], overlay[C.LANE_WORKER_ENV]), (lane, W))
+        self.edit_worker_row(parked=True)
+        with self.assertRaises(worker_lane.NotServable):
+            worker_lane.bridge_overlay(self.ws, lane)
 
 
 class Install(Base):
@@ -217,41 +228,61 @@ class Declare(Base):
         import workspace_default
         with mock.patch.object(workspace_default, "resolve_workspace", return_value=self.ws), \
                 contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(worker_lane.main(["declare", "--worker", W]), 0)
+            self.assertEqual(worker_lane.main(["declare", "--worker", W], vault=self.vault), 0)
         self.assertTrue((self.agents / f"{SEG}.bridge" / "worker.json").is_file())
 
 
 class TheAgentBridge(Base):
+    def cli_without_token(self):
+        saved = dict(self.vault.store)
+        self.vault.store.clear()
+        try:
+            rc, said = self.cli("declare", "--worker", W)
+        finally:
+            self.vault.store.update(saved)
+        self.assertEqual(rc, 1, "declare refuses a worker whose row token cannot be read")
+        return said
+
     def vault_get(self):
         return {cli.vault_key(SEG): TOKEN_W}.__getitem__
 
     def no_vault_key(self, key):
         self.fail(f"a worker's bridge read the vault key {key}")
 
-    def test_a_worker_declaration_runs_as_its_lane_with_the_hooks_set_before_main(self):
-        handler = self.declare_handler()
-        decl = self.declare()
-        seen, started = {}, []
+    def runs(self, decl, run_path, **kw):
+        import workspace_default
+        with mock.patch.object(workspace_default, "resolve_workspace", return_value=kw.pop("resolved", self.ws)):
+            return bridge.main([str(decl)], workspace=self.ws, get_key=self.no_vault_key, vault=self.vault,
+                               run=kw.pop("run", mock.Mock(side_effect=AssertionError("the bare package ran"))),
+                               run_path=run_path, **kw)
 
-        def fake_run(module, run_name, alter_sys):
-            seen.update(module=module, run_name=run_name, alter_sys=alter_sys, task=_dirs.task_dir(),
-                        result=_dirs.result_dir(), state=_dirs.state_dir(),
-                        instance=os.environ.get("GATEWAY_INSTANCE"), mxid=os.environ.get("AGENT_MXID"),
-                        token=os.environ.get("REMOTE_TASK_TOKEN"))
-            ns = {"RESULTS_DIR": self.ws / "results", "_log": lambda line: None}
-            ns["main"] = lambda: started.append(dict(ns))
-            return ns
-        rc = bridge.main([str(decl)], workspace=self.ws, get_key=self.no_vault_key, run=fake_run, vault=self.vault)
-        self.assertEqual(rc, 0)
-        self.assertEqual(seen, {"module": bridge.BRIDGE_MODULE, "run_name": bridge.BRIDGE_MODULE, "alter_sys": False,
+    def test_a_worker_declaration_runs_the_lanes_own_loader_as_its_lane(self):
+        decl = self.declare()
+        seen = {}
+
+        def fake_run_path(path, run_name):
+            seen.update(path=path, run_name=run_name, task=_dirs.task_dir(), result=_dirs.result_dir(),
+                        state=_dirs.state_dir(), env={k: os.environ.get(k) for k in (
+                            "GATEWAY_INSTANCE", "AGENT_MXID", "REMOTE_TASK_TOKEN", C.LANE_WORKER_ENV,
+                            "SUTANDO_SUPERVISED", "REMOTE_PROACTIVE_ROOM")})
+        self.assertEqual(self.runs(decl, fake_run_path), 0)
+        self.assertEqual(seen, {"path": str(ROOT / "src" / "remote-gateway-bridge.py"), "run_name": "__main__",
                                 "task": self.ws / "tasks", "result": self.ws / "results", "state": self.ws / "state",
-                                "instance": self.row["instance"], "mxid": WORKER_AGENT, "token": TOKEN_W})
-        self.assertEqual(len(started), 1, "the package's main() runs once, after the hooks")
-        ns = started[0]
-        self.assertEqual(ns["TASK_ADDRESSEE"](), W)
-        self.assertIs(ns["PROACTIVE_CLAIM_GATE"], ns["PROACTIVE_OWN_FILE"])
-        self.assertTrue(callable(ns["TASK_PRE_PUBLISH"]))
-        self.assertTrue(handler.is_file())
+                                "env": {"GATEWAY_INSTANCE": self.row["instance"], "AGENT_MXID": WORKER_AGENT,
+                                        "REMOTE_TASK_TOKEN": TOKEN_W, C.LANE_WORKER_ENV: W,
+                                        "SUTANDO_SUPERVISED": "1", "REMOTE_PROACTIVE_ROOM": ""}})
+
+    def test_a_worker_bridge_whose_lane_left_the_plan_or_whose_workspace_differs_never_runs(self):
+        decl = self.declare()
+        loader = mock.Mock()
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(self.runs(decl, loader, resolved=self.ws / "elsewhere"), 1)
+        self.assertIn("resolves another workspace", err.getvalue())
+        with mock.patch.object(worker_lane, "bridge_overlay", side_effect=worker_lane.NotServable("lane gone")), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(self.runs(decl, loader), 1)
+        self.assertIn("lane gone", err.getvalue())
+        loader.assert_not_called()
 
     def test_a_claude_local_declaration_for_the_same_agent_is_run_as_before(self):
         root = self.agents / SEG
@@ -289,6 +320,7 @@ class TheAgentBridge(Base):
 
     def test_the_rows_token_is_required_and_no_vault_key_is_listed(self):
         decl = self.declare()
+        self.assertIn("has no token for its gateway", self.cli_without_token())
         found, skipped = bridge.declarations(self.ws, [])
         self.assertEqual(([p for p, _ in found], skipped), ([decl], []), "listed with no vault key at all")
         out = io.StringIO()
@@ -366,25 +398,98 @@ class TheSupervisedRevision(Base):
         self.assertEqual(bridge.load(decl, self.agents)[0]["digest"], hashlib.sha256(decl.read_bytes()).hexdigest())
 
 
+# Every hook the lane loader sets, worker wiring included: the declared bridge must end with the same set.
+HOOKS = ("TASK_INTAKE_GATE", "PROACTIVE_ROUTE_GATE", "PROACTIVE_DISPATCH_GATE", "PROACTIVE_ACK_GATE", "LANE_SERVER",
+         "PROACTIVE_ROOM_GATE", "OWNER_DM_UPGRADED_NOTIFY", "TASK_STATUS", "TASK_STEP_PUBLICATION_ENABLED",
+         "STOP_INTERRUPT", "OWNS_UNADDRESSED", "PROACTIVE_ROOM_KEEP", "STAND_DOWN_GATE", "PROACTIVE_CLAIM_GATE",
+         "PROACTIVE_OWN_FILE", "TASK_ADDRESSEE", "TASK_PRE_PUBLISH", "_SUTANDO_WORKER_LABEL_APPLIER",
+         "_LANE_WORKER", "GATEWAY_INSTANCE", "TASKS_DIR", "RESULTS_DIR", "VOICE_ROOM_VERIFIER")
+WIRED = ("TASK_INTAKE_GATE", "PROACTIVE_ROUTE_GATE", "PROACTIVE_DISPATCH_GATE", "LANE_SERVER", "PROACTIVE_ROOM_GATE",
+         "OWNER_DM_UPGRADED_NOTIFY", "TASK_STATUS", "OWNS_UNADDRESSED", "PROACTIVE_CLAIM_GATE", "PROACTIVE_OWN_FILE",
+         "TASK_ADDRESSEE", "TASK_PRE_PUBLISH", "VOICE_ROOM_VERIFIER")
+
+
+def _shape(value):
+    if value is None or isinstance(value, (str, bool, int, Path)):
+        return value
+    return getattr(value, "__qualname__", type(value).__qualname__)
+
+
+class TheHookParity(Base):
+    """The lane's launch and the declared bridge both run the real loader: one hook set, every gate wired."""
+
+    def loaded(self, run):
+        import runpy
+        import workspace_default
+        from ag2_sparrow import send_allowlist
+        self.addCleanup(setattr, send_allowlist, "_EXTRA_ROOTS", list(send_allowlist._EXTRA_ROOTS))
+        with mock.patch.object(workspace_default, "resolve_workspace", return_value=self.ws), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            ns = run(lambda path, run_name: runpy.run_path(path, run_name="hook_parity_probe"))
+        self.assertIn(str(self.ws / "notes"), send_allowlist._EXTRA_ROOTS, "the loader's extra send roots")
+        return ns
+
+    def test_the_lane_and_the_declared_bridge_install_the_same_hooks(self):
+        self.declare_handler()
+        lane = self.row["instance"]
+        env = C.launch_env(C.plan_entry(lane, {}, workspace=self.ws), {}, vault=self.vault)
+
+        def as_lane(run_path):  # the lane's launch keys over this process's own (hermetic) environment
+            with mock.patch.dict(os.environ, env):
+                return run_path(str(ROOT / "src" / "remote-gateway-bridge.py"), "__main__")
+        lane_ns = self.loaded(as_lane)
+        decl = self.declare()
+
+        def as_bridge(run_path):
+            out = {}
+            rc = bridge.main([str(decl)], workspace=self.ws, get_key=lambda k: self.fail(k), vault=self.vault,
+                             run=lambda *a, **k: self.fail("the bare package ran"),
+                             run_path=lambda path, run_name: out.update(run_path(path, run_name)))
+            self.assertEqual(rc, 0)
+            return out
+        bridge_ns = self.loaded(as_bridge)
+        self.assertEqual({k: _shape(bridge_ns[k]) for k in HOOKS}, {k: _shape(lane_ns[k]) for k in HOOKS})
+        for ns in (lane_ns, bridge_ns):
+            self.assertEqual([k for k in WIRED if ns[k] is None], [], "every gate wired, none left at None")
+            self.assertEqual((ns["TASK_ADDRESSEE"](), ns["_LANE_WORKER"], ns["GATEWAY_INSTANCE"]), (W, W, lane))
+            self.assertEqual(ns["TASKS_DIR"], self.ws / "tasks")
+
+
 class TheLaneKeeper(Base):
-    def keep(self):
-        started = []
+    def keep(self, now=1000.0):
+        started, said = [], []
         C.keep_lanes_up(repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
                         vault=self.vault, spawn=self.bridge_spawn(lambda argv, env, log: started.append(
-                            env["GATEWAY_INSTANCE"])), log=lambda line: None)
+                            env["GATEWAY_INSTANCE"])), log=said.append, now=now)
+        self.said = said
         return started
 
-    def test_a_declared_workers_lane_is_not_started_and_starts_again_after_withdraw(self):
+    def test_a_declared_workers_lane_waits_out_the_grace_then_starts_and_withdraw_restores_it(self):
         lane = self.row["instance"]
         self.declare()
         self.assertTrue(worker_lane.declared_bridge(W, self.ws))
-        self.assertNotIn(lane, self.keep(), "the declared bridge serves the worker's agent")
+        self.assertNotIn(lane, self.keep(now=1000.0), "the declared bridge's turn to take the lease")
+        self.assertNotIn(lane, self.keep(now=1000.0 + C.DECLARED_BRIDGE_GRACE_S - 1))
         self.assertIsNotNone(C.worker_enabled_identity(W, self.ws), "the row stays enabled")
         self.assertEqual(C.session_proactive_name("proactive-1.txt", {"SUTANDO_WORKER_ID": W}, self.ws),
                          f"proactive-1.by-{W}.txt", "its session still stamps its own files")
+        self.assertEqual(self.keep(now=1000.0 + C.DECLARED_BRIDGE_GRACE_S), [lane],
+                         "no bridge took the lease: the lane serves the worker rather than nothing")
+        self.assertTrue(any("its declared bridge took no lease" in line for line in self.said), self.said)
+
+    def test_a_declared_bridge_holding_the_lease_keeps_the_lane_down(self):
+        from _helpers import bridge_lease
+        lane = self.row["instance"]
+        self.declare()
+        holder = bridge_lease.start(self.ws, lane, wait=True)
+        self.children.append(holder)
+        self.assertNotIn(lane, self.keep(now=1000.0 + 10 * C.DECLARED_BRIDGE_GRACE_S))
+        bridge_lease.stop(holder)
+        self.children.remove(holder)
+        self.assertNotIn(lane, self.keep(now=5000.0), "a fresh grace once the holder is gone")
         self.assertEqual(self.cli("withdraw", "--worker", W)[0], 0)
         self.assertFalse(worker_lane.declared_bridge(W, self.ws))
-        self.assertEqual(self.keep(), [lane])
+        self.assertEqual(self.keep(now=5001.0), [lane], "withdrawn: the lane at once")
 
     def test_an_invalid_or_unanswerable_declaration_keeps_the_lane(self):
         lane = self.row["instance"]

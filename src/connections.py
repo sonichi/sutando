@@ -2905,17 +2905,26 @@ def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]]
         env = _agent_identity().launch_environ(env, mxid)
         env.pop(DEVICE_ENV_VAR, None)
     env.update({
-        "SUTANDO_SUPERVISED": "1",
-        "GATEWAY_INSTANCE": str(entry["instance"]),
         "REMOTE_TASK_TOKEN": token,
         "REMOTE_TASK_URL": "",
         "REMOTE_TASK_TOKEN_FILE": _token_file(entry, environ),
+        **lane_identity_env(entry, environ),
+    })
+    return env
+
+
+def lane_identity_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]] = None) -> dict:
+    """What a plan entry's bridge runs as, short of its token: the same for its lane and for a declared
+    bridge serving that lane's worker (`worker_lane.bridge_overlay`)."""
+    environ = os.environ if environ is None else environ
+    return {
+        "SUTANDO_SUPERVISED": "1",
+        "GATEWAY_INSTANCE": str(entry["instance"]),
         "REMOTE_TASK_CHANNEL_DIR": str(entry["channel_dir"]),
         "REMOTE_PROACTIVE_ROOM": environ.get("REMOTE_PROACTIVE_ROOM", "") if entry.get("primary") else "",
         NOT_BEFORE_ENV: str(entry["not_before"]) if isinstance(entry.get("not_before"), int) else "",
         LANE_WORKER_ENV: str(entry.get("worker") or ""),
-    })
-    return env
+    }
 
 
 # The bridge's intake reads its row's `not_before` here; empty when the row has none.
@@ -3444,14 +3453,21 @@ def _keep_lane(inst: str, state: dict, now: float, say: Callable[[str], None], *
     """`keep_lanes_up` for one lane, under the record lock."""
     with _records_lock(workspace):
         entry = next((e for e in launch_plan(environ, workspace=workspace) if e["instance"] == inst), None)
-        if entry is None or _declared_bridge_serves(entry, workspace):
-            state.pop(inst, None)  # disconnected, parked, removed or handed to a declared bridge
+        if entry is None:
+            state.pop(inst, None)  # disconnected, parked or removed since the plan was read
             return
         row = _row_named(inst, workspace) or {}
         if any(_proven_holder(n, workspace) for n in [inst] + alias_instances(row)):
             state.pop(inst, None)
             return
         due = state.get(inst) or {}
+        declared = _declared_bridge_serves(entry, workspace)
+        if declared:
+            since = due.get("declared_unheld_since") if isinstance(due, dict) else None
+            since = since if isinstance(since, (int, float)) and not isinstance(since, bool) else now
+            if now - since < DECLARED_BRIDGE_GRACE_S:
+                state[inst] = {"declared_unheld_since": since}  # the declared bridge's turn to take the lease
+                return
         try:
             if float(due.get("next_try") or 0) > now:
                 return
@@ -3467,8 +3483,16 @@ def _keep_lane(inst: str, state: dict, now: float, say: Callable[[str], None], *
                 f"next try in {state[inst]['next_try'] - now:.0f}s")
             return
         state.pop(inst, None)
-        if rec.get("lease") == "held":
+        if rec.get("lease") == "held" and declared:
+            say(f"lane {inst}: its declared bridge took no lease in {DECLARED_BRIDGE_GRACE_S:.0f}s; "
+                f"started the lane instead (pid {rec.get('pid')})")
+        elif rec.get("lease") == "held":
             say(f"lane {inst} was down; started it (pid {rec.get('pid')})")
+
+
+# How long a lane whose worker has a declared bridge stays down with no lease holder before the keeper
+# starts the lane anyway: past sparrowd's longest restart backoff and its rescan.
+DECLARED_BRIDGE_GRACE_S = 180.0
 
 
 def _declared_bridge_serves(entry: Mapping[str, object], workspace: Optional[Path]) -> bool:

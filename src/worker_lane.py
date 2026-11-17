@@ -10,12 +10,13 @@ and owns are the ones its worker's session stamped (PROACTIVE_CLAIM_GATE, PROACT
 handler is found through `state/task-event-handler.json`, so no skill is named here.
 
 A declared bridge serves a worker only when the connection record names the declaration's agent as
-that worker's own (`serving`); `bridge_overlay` then runs it on the core workspace's tasks/, results/
-and state/ under the worker row's lane instance, exactly as the worker's lane runs, so the two share
-one per-instance poller lock and never poll together.
+that worker's own (`serving`); it then runs the lane's own loader under `bridge_overlay` (the core
+workspace's tasks/, results/ and state/ and the lane's identity env), so it carries every host gate the
+lane does, and the two share one per-instance poller lock and never poll together.
 
 The token is the row's own (`credential`), read where the lane reads it, so no second copy is stored.
-While a valid declaration exists the lane keeper does not start the worker's lane (`declared_bridge`).
+While a valid declaration exists and its bridge holds the lane's lease, or has had a bounded grace to
+take it, the lane keeper does not start the worker's lane (`declared_bridge`, connections).
 
 Run as a script: `declare --worker <w>` writes the declaration sparrowd runs that worker's agent bridge
 from (`<workspace>/agents/<segment>.bridge/worker.json`), `withdraw --worker <w>` removes it.
@@ -124,12 +125,22 @@ def runtime_identity(worker: str, instance: str, workspace) -> bytes:
     return "\0".join(fields).encode("utf-8")
 
 
+class NotServable(Exception):
+    """The worker's lane is not in the launch plan (its row changed since the declaration was checked)."""
+
+
 def bridge_overlay(workspace, instance: str) -> "dict[str, str]":
-    """What a worker's declared bridge runs under beyond its declaration: the lane's dirs and instance."""
+    """What a worker's declared bridge runs under beyond its declaration: the lane's dirs and the lane's
+    own identity env (`connections.lane_identity_env`), so it runs the loader exactly as its lane does."""
+    from connections import ConnectionsError, SchemaError, lane_identity_env, plan_entry
     ws = Path(workspace)
+    try:
+        entry = plan_entry(instance, workspace=ws)
+    except (ConnectionsError, SchemaError, OSError) as e:
+        raise NotServable(f"lane {instance} is not in the launch plan ({type(e).__name__})") from e
     return {"AGENT_CONNECT_TASK_DIR": str(ws / "tasks"), "AGENT_CONNECT_RESULT_DIR": str(ws / "results"),
-            "AGENT_CONNECT_STATE_DIR": str(ws / "state"), "GATEWAY_INSTANCE": instance,
-            "REMOTE_MEDIA_DIR": str(ws / "data" / "remote-media")}
+            "AGENT_CONNECT_STATE_DIR": str(ws / "state"), "REMOTE_MEDIA_DIR": str(ws / "data" / "remote-media"),
+            **lane_identity_env(entry)}
 
 
 def credential(worker: str, workspace, environ, vault=None) -> "tuple[str, str]":
@@ -173,7 +184,7 @@ def declared_bridge(worker: str, workspace) -> bool:
     return bool(loaded) and loaded.get("worker") == worker
 
 
-def main(argv=None, workspace=None) -> int:
+def main(argv=None, workspace=None, vault=None) -> int:
     import argparse
     p = argparse.ArgumentParser(prog="worker_lane.py", description="A pool worker's agent-bridge declaration.")
     p.add_argument("action", choices=("declare", "withdraw"))
@@ -186,7 +197,7 @@ def main(argv=None, workspace=None) -> int:
     decl, why = _declaration_for(args.worker, workspace)
     if decl is not None and args.action == "declare":
         try:
-            why = serving(decl["agent"], workspace)[2]
+            why = serving(decl["agent"], workspace)[2] or credential(args.worker, workspace, None, vault)[1]
         except RecordUnreadable as e:
             why = str(e)
         decl = None if why else decl

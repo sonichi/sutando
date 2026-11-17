@@ -10,9 +10,10 @@ segment) are each compared; any difference skips the declaration with one reason
 root, whose token file must be the seat's own, and its bridge runs with exactly that, never a vault token.
 A pool worker's declaration (`worker_lane.py declare`) is run only when the connection record names its
 `AGENT_MXID` as one worker's own agent (`worker_lane.serving`); that worker and its lane instance come from
-the record, never the file, and the bridge runs as the worker's lane does (`worker_lane.bridge_overlay`)
-with the shared worker wiring (`worker_lane.install`) set before the package's main() starts. It names no
-vault key: its token is the worker row's own, read as the lane reads it (`worker_lane.credential`).
+the record, never the file, and the bridge runs the lane's own loader (`remote-gateway-bridge.py`) under
+the lane's dirs and identity env (`worker_lane.bridge_overlay`), so every host gate and the worker wiring
+are the lane's. It names no vault key: its token is the worker row's own, read as the lane reads it
+(`worker_lane.credential`).
 
 `declarations(workspace, vault_keys)` lists the valid ones whose vault key exists. What a declaration's
 own bytes can be (not UTF-8, not JSON, too deep, too large, not a regular file) skips that one entry with a
@@ -52,6 +53,7 @@ import worker_lane  # noqa: E402
 WRITTEN_BY = f"{CLAUDE_LOCAL.command} install"
 WRITERS = (WRITTEN_BY, f"{CODEX_LOCAL_COMMAND} install", worker_lane.WRITTEN_BY)
 BRIDGE_MODULE = "ag2_sparrow.remote_gateway_bridge"
+LANE_LOADER = _SRC / "remote-gateway-bridge.py"
 SUFFIX = ".bridge"
 MAX_DECLARATION_BYTES = _sources.MAX_DECLARATION_BYTES
 # Never inherited from sparrowd: the host's token files, its agent identity and its owner DM (and its
@@ -298,7 +300,7 @@ def preflight(workspace, get_key, vault=None) -> int:
     return 1 if bad else 0
 
 
-def main(argv=None, workspace=None, get_key=None, run=runpy.run_module, vault=None) -> int:
+def main(argv=None, workspace=None, get_key=None, run=runpy.run_module, vault=None, run_path=runpy.run_path) -> int:
     args = sys.argv[1:] if argv is None else argv
     if len(args) != 1:
         print("usage: sparrow_agent_bridge.py <workspace>/agents/<agent>.bridge/worker.json | --preflight",
@@ -338,8 +340,12 @@ def main(argv=None, workspace=None, get_key=None, run=runpy.run_module, vault=No
             return 1
     environ = bridge_environ(decl, token, url=url)
     worker = decl.get("worker")
-    # A worker's bridge runs on its lane's dirs and instance, derived from the record, never the file.
-    overlay = worker_lane.bridge_overlay(workspace, decl["instance"]) if worker else {}
+    try:
+        # A worker's bridge runs as its lane: dirs and lane env derived from the record, never the file.
+        overlay = worker_lane.bridge_overlay(workspace, decl["instance"]) if worker else {}
+    except worker_lane.NotServable as e:
+        print(f"sparrow-agent-bridge: not starting: {e}", file=sys.stderr)
+        return 1
     dirs = dict(decl["env"], **overlay)
     os.environ.clear()
     os.environ.update(environ)
@@ -353,11 +359,13 @@ def main(argv=None, workspace=None, get_key=None, run=runpy.run_module, vault=No
     if not worker:
         run(BRIDGE_MODULE, run_name="__main__", alter_sys=True)
         return 0
-    # Not run as __main__: the hooks must be in the module's namespace before its main() starts.
-    ns = run(BRIDGE_MODULE, run_name=BRIDGE_MODULE, alter_sys=False)
-    worker_lane.install(ns, worker, workspace=Path(workspace), results_dir=ns["RESULTS_DIR"], log=ns["_log"],
-                        who=f"agent bridge {decl['name']} (lane {decl['instance']})")
-    ns["main"]()
+    from workspace_default import resolve_workspace
+    if Path(resolve_workspace()).resolve() != Path(workspace).resolve():
+        print(f"sparrow-agent-bridge: not starting: the lane loader resolves another workspace than {workspace}",
+              file=sys.stderr)
+        return 1
+    # The lane's own loader: every host gate and the worker wiring come from the one place that sets them.
+    run_path(str(LANE_LOADER), run_name="__main__")
     return 0
 
 
