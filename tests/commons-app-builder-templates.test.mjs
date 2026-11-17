@@ -2166,14 +2166,17 @@ for (const tpl of ['task-board', 'research-desk']) {
     assert.ok(!/has not picked this up yet/.test(r.text()), r.text()));
 }
 {
-  // Blue's ask: allowed, but no agents of your own, on the research desk.
+  // Allowed (members() resolves), but no agents of your own, on the research desk: say that,
+  // never the not-allowed reload text.
   const b = fakeMulti({ dbs: deskDbs(), primary: 'd1', agents: [] });
   const r = await run('research-desk', { bridge: b });
   check('research-desk/allowed-with-no-agents-says-so-not-not-allowed', () => {
     const opts = r.byId.get('agent').options.map((o) => o.textContent).join('|');
     assert.match(opts, /You have no agent of your own here/);
     assert.ok(!/Not allowed|Waiting/.test(opts), opts);
-    assert.match(r.byId.get('ask-help').textContent, /You have no agent of your own in this room yet/);
+    const help = r.byId.get('ask-help').textContent;
+    assert.match(help, /You have no agent of your own in this room yet/);
+    assert.ok(!/Reload the page|not allowed/i.test(help), help);
   });
 }
 
