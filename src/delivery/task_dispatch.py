@@ -245,6 +245,32 @@ def worker_holds(deliveries_dir: "Path | str", filename: str) -> bool:
     return False
 
 
+def worker_committed(workspace: "Path | str", filename: str) -> bool:
+    """True iff a worker's folder holds this task AND `state/attribution/<id>` names that worker: the
+    router's delivery finished. A sentinel alone may be a router that died before attributing it."""
+    if not worker_holds(Path(workspace) / "deliveries", filename):
+        return False
+    task_id = _task_id_for_filename(filename)
+    try:
+        worker = (Path(workspace) / "state" / "attribution" / task_id).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeDecodeError) as exc:
+        raise WorkerHoldUnreadable(f"cannot read the attribution of {task_id}: {exc}") from exc
+    if not worker or "/" in worker or worker in (".", ".."):
+        return False
+    deliveries = Path(workspace) / "deliveries" / worker
+    for suffix in _WORKER_HOLD_SUFFIXES:
+        try:
+            os.lstat(deliveries / f"{task_id}{suffix}")
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise WorkerHoldUnreadable(f"cannot stat under {deliveries}: {exc}") from exc
+        return True
+    return False
+
+
 def owned_task_ids(deliveries_dir: "Path | str", recipient: str) -> "list[str]":
     """Task ids whose sentinel sits in ONE recipient's folder — the worker's own question.
 
@@ -450,6 +476,7 @@ _USAGE = (
     "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py worker-holds <deliveries_dir> <filename>   # exit 0 held / 1 not / 2 cannot decide\n"
+    "       task_dispatch.py worker-committed <workspace> <filename>   # held AND attributed: exit 0 / 1 not / 2 cannot decide\n"
     "       task_dispatch.py announced-entry <tasks_dir> <announced> [--resolved <payload_dir>]   # prints key<TAB>payload; exit 1 refused\n"
     "       task_dispatch.py owned-by <deliveries_dir> <recipient>   # one id per line; exit 2 cannot decide\n"
     "       task_dispatch.py inflight-mark <inflight_dir> <filename> <incarnation>\n"
@@ -668,6 +695,15 @@ def _main(argv: list[str]) -> int:
             return 1
         print(f"{entry[0]}\t{entry[1]}")
         return 0
+    if cmd == "worker-committed":
+        if rest:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        try:
+            return 0 if worker_committed(first, second) else 1
+        except WorkerHoldUnreadable as exc:
+            print(f"task_dispatch.py: worker-committed: {exc}", file=sys.stderr)
+            return 2
     if cmd == "worker-holds":
         if rest:
             print(_USAGE, file=sys.stderr)

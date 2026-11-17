@@ -126,7 +126,7 @@ def _helpers():
     return local_task_protocol, result_markers, task_archive, workspace_default
 
 
-def worker_published_path(path: str | Path, environ=None) -> Path:
+def worker_published_path(path: str | Path, environ=None, workspace=None) -> Path:
     """Where this session publishes `path`: a proactive file from a pool worker's session that acts as
     its own agent carries the worker's stamp (`connections.session_proactive_name`), so only that
     worker's lane delivers it. The core's session, a worker acting through the core, a copy of this
@@ -136,7 +136,7 @@ def worker_published_path(path: str | Path, environ=None) -> Path:
         import connections
     except ImportError:
         return path
-    return path.with_name(connections.session_proactive_name(path.name, environ))
+    return path.with_name(connections.session_proactive_name(path.name, environ, workspace))
 
 
 def _unrouted_cron_task(path: str | Path) -> str | None:

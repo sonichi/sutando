@@ -44,6 +44,7 @@ sys.path.insert(0, str(_HERE))
 # it lands in is parsed for headers. Repo root is parents[3] from here.
 sys.path.insert(0, str(_HERE.parents[2] / "src"))
 from task_body_guard import confine_user_content, header_safe_value  # noqa: E402
+import skill_config  # noqa: E402
 
 pr = _sibling("pool_roster")
 rt = _sibling("pool_router")
@@ -54,6 +55,8 @@ NO_SEND = "[no-send]"
 # An ask never claims owner authority: the asker is an instance, and relayed content
 # keeps the tier of whoever wrote it. `owner` is deliberately not offered.
 TIERS = ("team", "other", "guest")
+MANIFEST = _HERE.parent / "manifest.json"
+HANDOFF_FLAG = "WORKER_POOL_SSPACE_HANDOFF"
 
 
 def whoami() -> str:
@@ -140,7 +143,8 @@ def compose(task_id: str, to: str, question: str, *, sender: str, wait: bool,
 
 def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
         sleep=time.sleep, tier: str = "team", relayed_from: "str | None" = None,
-        parent_task: "str | None" = None, parent_generation: "int | None" = None) -> dict:
+        parent_task: "str | None" = None, parent_generation: "int | None" = None,
+        allow_handoff: bool = True, runner=None) -> dict:
     ws = Path(workspace)
     roster = pr.load_roster(ws)     # one snapshot: the recipient is resolved and routed against it
     rid = resolve_in(roster, to)
@@ -148,6 +152,12 @@ def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
     if rid == sender:
         raise ValueError("that is you")
     task_id = f"task-{secrets.token_hex(9)}"
+    if allow_handoff and skill_config.enabled(HANDOFF_FLAG, MANIFEST):
+        ph = _sibling("pool_handoff")
+        route = ph.route_for(ws, rid, sender=sender, core=pr.CORE, tier=tier,
+                             relayed_from=relayed_from, parent_task=parent_task)
+        if route is not None:
+            return handoff_ask(ws, route, task_id, rid, sender, question, wait_s=wait_s, runner=runner)
     tasks = ws / "tasks"
     tasks.mkdir(parents=True, exist_ok=True)
     tmp = tasks / f".{task_id}.txt.tmp"
@@ -170,6 +180,29 @@ def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
     if wait_s > 0:
         out["reply"] = wait_for_reply(ws, task_id, wait_s, sleep=sleep)
     return out
+
+
+def handoff_ask(ws: Path, route: dict, task_id: str, rid: str, sender: str, question: str, *,
+                wait_s: float = 0.0, runner=None) -> dict:
+    """The s.space leg (pool_handoff): one message and one ask record, no task file, no delivery and
+    no wait. The reply is the worker's threaded answer, which arrives as a new task."""
+    ph = _sibling("pool_handoff")
+    text = f"[pool-ask from {sender}] {question.strip()}"
+    sent = ph.send(route, task_id, text, runner=runner)
+    out = {"task_id": task_id, "to": rid, "from": sender, "via": "room", "status": sent["status"],
+           "event_id": sent["event_id"]}
+    try:
+        ph.record_ask(ws, route, task_id, rid, sent, question)
+    except OSError as e:
+        out["record_error"] = str(e)
+    if wait_s > 0:
+        out["reply"], out["wait_honoured"] = None, False
+    return out
+
+
+def asked(workspace) -> list:
+    """Recent room hand-offs no core task has answered from the asked agent (pool_handoff.asked)."""
+    return _sibling("pool_handoff").asked(workspace)
 
 
 def wait_for_reply(workspace, task_id: str, wait_s: float, *, sleep=time.sleep) -> "str | None":
@@ -200,12 +233,18 @@ def main(argv=None) -> int:
     p.add_argument("--parent-task", help="the task this ask is part of (its `id:` header): the parent "
                    "shows as delegated until this ask's result exists")
     p.add_argument("--parent-generation", type=int, help="the parent task's execution generation, when known")
+    p.add_argument("--asked", action="store_true", help="list recent room hand-offs with no reply "
+                   "task from the asked worker's agent yet")
     p.add_argument("--json", action="store_true")
     a = p.parse_args(argv)
     if a.parent_task:
         import correlation_log
         if not correlation_log.is_task_id(a.parent_task):
             p.error(f"--parent-task {a.parent_task!r} is not a task id")
+    if a.asked:
+        if a.who or a.to or a.ask:
+            p.error("--asked goes alone")
+        return _cli_asked(a)
     if a.who == bool(a.to or a.ask):
         p.error("pass --who, or --to with --ask")
     if bool(a.to) != bool(a.ask):
@@ -233,11 +272,38 @@ def main(argv=None) -> int:
         return 2
     if a.json:
         print(json.dumps(out, indent=2, sort_keys=True))
-    else:
+    if out.get("via"):
+        if not a.json:
+            print(f"asked {out['to'][:8]} as {out['task_id']} as a room hand-off; the reply arrives as a "
+                  "new task, threaded to this message")
+        if out.get("status") == "unconfirmed":
+            print("the hand-off could not be confirmed; it is not sent again", file=sys.stderr)
+        if out.get("record_error"):
+            print(f"pool_ask: the ask was posted but not recorded: {out['record_error']}", file=sys.stderr)
+        if a.wait > 0:
+            print("pool_ask: --wait cannot be honoured for a room hand-off: the ask was posted, and its "
+                  "reply arrives later as a new task", file=sys.stderr)
+            return 2
+        return 0
+    if not a.json:
         print(f"asked {out['to'][:8]} as {out['task_id']}")
         if a.wait > 0:
             print(out["reply"] if out["reply"] is not None else f"(no reply within {a.wait:.0f}s)")
     return 0 if not a.wait or out.get("reply") is not None else 1
+
+
+def _cli_asked(a) -> int:
+    rows = asked(a.workspace)
+    if a.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return 0
+    for r in rows:
+        others = ", ".join(o["sender"] for o in r["other_replies"])
+        print(f"{r['sent_at']} {r['task_id']} -> {str(r.get('worker'))[:8]} ({r.get('status')}) "
+              f"{r.get('question')}" + (f"  [replies only from: {others}]" if others else ""))
+    if not rows:
+        print("no unanswered room hand-offs")
+    return 0
 
 
 if __name__ == "__main__":

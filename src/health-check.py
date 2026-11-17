@@ -1938,6 +1938,21 @@ def _carrier_representatives(workspace: Path, entry: str) -> "list[Path]":
     return [m for m in matches if not _reaches_through_symlink(workspace, m)]
 
 
+def _stale_with_culprits(stale, culprits, workspace) -> str:
+    """`entry (-> the match git ignores)` so the reader sees which path is dropped."""
+    out = []
+    for entry in stale[:4]:
+        rep = culprits.get(entry)
+        if rep is None or str(rep).rstrip("/").endswith(entry.rstrip("/")):
+            out.append(entry)
+        else:
+            try:
+                shown = rep.relative_to(workspace).as_posix()
+            except ValueError:
+                shown = str(rep)
+            out.append(f"{entry} -> {shown}")
+    return ", ".join(out) + ("…" if len(stale) > 4 else "")
+
 def _reaches_through_symlink(workspace: Path, p: Path) -> bool:
     """True when every file the probe would derive from `p` is "beyond a
     symbolic link" to git: `p` itself is a symlinked DIRECTORY, or any
@@ -2218,6 +2233,7 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
         return None
 
     stale: "list[str]" = []
+    stale_culprit: "dict[str, Path]" = {}
     unmeasured: "list[str]" = []
     for entry in resolved:
         # EVERY materialized match, not one. `_carrier_representative()` (singular)
@@ -2247,13 +2263,19 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
         # probe still say OK. Both that and the directory/contents distinction now
         # live in `_carrier_target_verdict` so the two branches cannot drift.
         verdict = "carried"
+        culprit = None
         for rep in reps:
             got = _carrier_target_verdict(workspace, rep)
             if got != "carried":
                 verdict = got
+                culprit = rep
                 break
         if verdict == "dropped":
             stale.append(entry)
+            # Name the MATCH, not just the entry: a glob entry resolves to several
+            # paths and the reader cannot tell which one git is ignoring.
+            if culprit is not None:
+                stale_culprit[entry] = culprit
         elif verdict == "unmeasured":
             # Could not run the measurement at all. NOT the same as "carried".
             unmeasured.append(entry)
@@ -2403,9 +2425,11 @@ def check_carrier_set_enforced(workspace_dir=None) -> "dict | None":
     if stale:
         parts.append(
             f"{len(stale)} configured carrier path(s) are STILL GIT-IGNORED so the vault is not "
-            f"backing them up ({', '.join(stale[:4])}{'…' if len(stale) > 4 else ''}) — the exclude "
-            f"file is stale and sync refused to regenerate it; fix with "
-            f"`bash scripts/sync-workspace.sh --force-gitignore` (diff it first)"
+            f"backing them up ({_stale_with_culprits(stale, stale_culprit, workspace)}) — usually a "
+            f"stale exclude file, fixed with `bash scripts/sync-workspace.sh --force-gitignore` "
+            f"(diff it first). For a glob-directory entry `<dir>/*/`, a FILE directly in "
+            f"`<dir>/` is outside the `!<dir>/*/**` carve-out; regenerating cannot reach "
+            f"that file — deal with it instead"
         )
     if safe:
         parts.append(
@@ -11766,28 +11790,9 @@ def _drop_launcher_parents(pids: list) -> list:
 
 
 def _should_skip_bridge(channel_name: str, env_path: Path) -> bool:
-    """True if SKIP_<CHANNEL>=1 is set in the main .env or as an env var.
-
-    Lets operators silence a bridge on a specific host without removing its
-    token from the shared config (issue #1916). The flag is per-host: set it
-    in the main .env on the host where the bridge should NOT run. Both the
-    health-check (no warn) and --fix (no restart) honor it.
-    """
-    var = f"SKIP_{channel_name.upper()}"
-    if os.environ.get(var) == "1":
-        return True
-    if env_path.exists():
-        try:
-            for line in env_path.read_text().splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                key, sep, val = line.partition("=")
-                if sep and key.strip() == var and val.strip().strip('"').strip("'") == "1":
-                    return True
-        except Exception:
-            pass
-    return False
+    """True if SKIP_<CHANNEL>=1 is set in the main .env or as an env var (issue #1916; chat_bridges.skipped)."""
+    import chat_bridges
+    return chat_bridges.skipped(channel_name, env_path)
 
 
 def sutando_app_hotkey_detail(workspace_dir) -> str:
@@ -13608,10 +13613,8 @@ def run_all_checks() -> list[dict]:
         channel_name = name.replace("-bridge", "")
         if _should_skip_bridge(channel_name, env_path):
             continue
-        env_file = channels_dir / channel_name / ".env"
-        access_file = channels_dir / channel_name / "access.json"
-        # Check if configured via either .env or access.json
-        if not env_file.exists() and not access_file.exists():
+        import chat_bridges
+        if not chat_bridges.configured(channels_dir, channel_name):
             continue
         try:
             # Anchor to the script suffix; find_pids preserves anchors on every OS.

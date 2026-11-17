@@ -23,6 +23,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`activity_rows.py`** — The agent-activity row writer: one JSON row per line at <workspace>/state/agent-activity.jsonl, the live window the desktop renders, its per-day archive, the per-task index that keeps a summary exact after rotation, and the summary left at done.
 - **`ag2space_links.py`** — Links a person clicks to open an AG2 Space room, message or room surface inside the app.
 - **`agent-api.py`** — Sutando agent API — simple HTTP endpoint for agent-to-agent communication.
+- **`agent-display-name.ts`** — The name the voice and phone prompts introduce the agent by.
 - **`agent_availability.py`** — Two room-visible projections of one private runtime: what this agent is doing on THIS task, and whether it can take more work.
 - **`agent_card.py`** — Agent panel cards (`space.ag2.card`, kind `agent_panel`, v 1): build, check, send, and read the replies.
 - **`agent_display_name.py`** — The name this agent introduces itself by: its live s.space display name, never a persona name.
@@ -37,7 +38,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`auth_preflight.py`** — auth_preflight.py — probe whether a CLAUDE_CONFIG_DIR can boot the claude CLI authenticated (OK vs LOGIN_REQUIRED + exact remedy), before a restart terminates the session that could still fix it.
 - **`body_file.py`** — Bounded read of a CLI `--body-file` argument — the single owner of that policy.
 - **`bounded-wait.sh`** — Shared bounded child run.
-- **`bounded_file_read.py`** — Read a small regular file's text without ever blocking: the one reader for credential files.
+- **`bounded_file_read.py`** — Read a small regular file without ever blocking: the one reader for credential files and attachments.
 - **`bridge_engine.py`** — Whether each running channel bridge runs from this core's engine checkout.
 - **`browser-tools.ts`** — Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
 - **`browser.mjs`** — Sutando browser automation — lightweight Playwright wrapper.
@@ -50,6 +51,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`channel_env_resolve.py`** — Pick the channel env file a caller should source for `channels/<source>`.
 - **`channel_token.py`** — Shared token-resolution policy for the channel bridges.
 - **`chat-ui.ts`** — Sutando Chat UI — clean full-page chat experience.
+- **`chat_bridges.py`** — The chat-app bridges (Telegram, Discord, Slack): which are skipped on this host, set up, and running.
 - **`chat_redaction.py`** — The chat-body redaction CHAIN, owned in one place.
 - **`chat_secret_filter.py`** — Fail-closed secret redaction for persisted inbound chat content.
 - **`check-pending-questions.py`** — Thin entry for the pending-questions reminder: hands argv to the `remind` of the adapter an installed skill declares (`--store-adapter <path>` overrides), resolved here across the installed roots (src/skill_roots.py) and injected into src/pending_questions_reader.py.
@@ -222,6 +224,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
 - **`screen-capture-server.py`** — Screen capture HTTP server — runs in a terminal (has Screen Recording permission on macOS; needs no special setup on Windows).
 - **`scroll-wheel.swift`** — scroll-wheel.swift — Send OS-level scroll wheel events to Chrome
+- **`secret_compare.py`** — Constant-time equality for a presented credential string against an expected one.
 - **`secret_scanner.py`** — Library-based secret detection for inbound bridge messages.
 - **`self_opened_gate.py`** — Attribution for a terminal dialog Sutando opened itself, and the one rule that may dismiss it.
 - **`send_allowlist.py`** — Alias of `policy.egress.attachment` (phase-1a restructure); one transition window.
@@ -331,6 +334,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`wedge_probes.py`** — Watcher and standby wedge signatures for the shared wedge detector: pure probes that publish nothing.
 - **`work-request-check.ts`** — The relay agent's text-model decisions.
 - **`worker_auth_state.py`** — Is a Claude CLI pane still signed out?
+- **`worker_lane.py`** — A pool worker's own agent served by a gateway bridge: the wiring every bridge entry point installs.
 - **`workspace_default.py`** — Canonical workspace-directory resolution for Sutando services.
 - **`workspace_default.ts`** — Canonical workspace-directory resolution for Sutando TS services.
 - **`workspace_layout.py`** — Spawn-time guard for the `<repo>/workspace` wiring: heals recoverable breaks to the durable symlink; a real directory HOLDING data is never touched.
@@ -368,6 +372,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 ## `src/agent/claude/cli/`
 
 - **`build-core-settings.mjs`** — Build the Claude Code `--settings` JSON for the Sutando core session.
+- **`project-has-stop-hook.mjs`** — Exit 0 when a settings file's hooks.Stop runs `bash <script>` for the same file as <script>, else 1.
 - **`session-launch.sh`** — src/agent/claude/cli/session-launch.sh — shared claude-CLI session launch mechanics, sourced by the core's own launcher and by a pool worker's own launcher (a separate script, outside core/src/).
 - **`start-cli.sh`** — src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core tmux session.
 - **`sutando-shell-setup.sh`** — sutando-shell-setup — configure the `claude-sutando` shell alias.
