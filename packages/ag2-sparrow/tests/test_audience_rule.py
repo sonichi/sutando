@@ -1,16 +1,23 @@
 """Every built-in Sparrow prompt carries the audience rule, verbatim from task_io.AUDIENCE_RULE."""
-import importlib
 import json
 import sys
 import unittest
 from pathlib import Path
 
-PKG_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+isolate_os_environ()
+
+PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
-relay_loop, task_io, codex_connector, runtime_text, openclaw_connector = (
-    importlib.import_module("ag2_sparrow." + name) for name in (
-        "relay_loop", "task_io", "adapters.codex.codex_connector", "adapters.hatch.runtime_text",
-        "adapters.openclaw.openclaw_connector"))
+from ag2_sparrow import relay_loop, task_io  # noqa: E402
+from ag2_sparrow.adapters.codex import (  # noqa: E402
+    codex_connector)
+from ag2_sparrow.adapters.hatch import (  # noqa: E402
+    runtime_text)
+from ag2_sparrow.adapters.openclaw import (  # noqa: E402
+    openclaw_connector)
 
 # The s.space server serves this same text to agents connected over MCP; the two stay identical.
 RULE = (
