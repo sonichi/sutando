@@ -1597,6 +1597,7 @@ const fakeMulti = (opts = {}) => {
   const dbs = opts.dbs;                                 // {id: {name, props, rows}}
   const watchers = {};
   const declined = new Set();
+  const postDeclined = new Set();
   let answers = (opts.writeAnswers || []).slice();
   const answer = () => (answers.length ? answers.shift() : { ok: true });
   const ACCOUNTS = opts.accounts || { '@me:x': 'u1', '@desk.agent:x': 'u2', '@other:x': 'u3' };
@@ -1612,7 +1613,17 @@ const fakeMulti = (opts = {}) => {
       ready: Promise.resolve(),
       me: opts.me || { id: 'u1', name: 'Tester', kind: 'human' },
       app: opts.app === null ? null : { id: 'a1', name: 'T', database: opts.primary },
-      now: () => Date.parse('2026-11-11T12:00:00Z'),
+      now: () => (typeof opts.now === 'function' ? opts.now() : Date.parse('2026-11-11T12:00:00Z')),
+      // As the host does: a key that was declined replays its decline and posts nothing.
+      room: {
+        post: async (req) => {
+          if (postDeclined.has(req.key)) { calls.push(['roomPost-replayed', req]); return { posted: false, reason: 'declined' }; }
+          calls.push(['roomPost', req]);
+          const out = (Array.isArray(opts.postAnswer) ? opts.postAnswer.shift() : opts.postAnswer) || { posted: true, eventId: 'e1' };
+          if (out.reason === 'declined') postDeclined.add(req.key);
+          return out;
+        },
+      },
       members: async () => { if (opts.consent === false) throw new Error('page permission required'); return MEMBERS; },
       personId: async (cell) => {
         if (opts.consent === false) throw new Error('page permission required');
@@ -2096,6 +2107,73 @@ for (const tpl of ['task-board', 'research-desk']) {
   check('task-board/allowed-with-no-agents-is-not-called-not-allowed', () => {
     assert.ok(!/Not allowed/.test(r.byId.get('who').options.map((o) => o.textContent).join('|')));
     assert.ok(!/Waiting/.test(r.byId.get('who').options.map((o) => o.textContent).join('|')));
+  });
+}
+
+/* ===== an in-room agent that has not picked a row up: say so, offer a confirmed mention ===== */
+{
+  let t = Date.parse('2026-11-11T12:00:00Z');
+  const b = fakeMulti({ dbs: boardDbs(), primary: 'd1', agents: AGENTS, now: () => t,
+    postAnswer: [{ posted: false, reason: 'declined' }, { posted: true, eventId: 'e2' }] });
+  const r = await run('task-board', { bridge: b });
+  r.byId.get('title').value = 'Book the venue';
+  r.byId.get('who').value = AGENTS[0].id;          // in the room
+  r.byId.get('add').click();
+  await settle(40);
+  const snap = (status) => ({ id: 'd1', name: 'Task Board — Tasks', props: TASK_PROPS,
+    rows: [{ id: 'r1', cells: { Task: 'Book the venue', Status: status, Actor: ['@desk.agent:x'] } }] });
+  b.fire('d1', snap('Requested'));
+  await settle(20);
+  check('task-board/no-pickup-note-before-a-minute', () =>
+    assert.ok(!/has not picked this up yet/.test(r.text()), r.text()));
+  t += 61000;
+  b.fire('d1', snap('Requested'));
+  await settle(20);
+  const tell = () => r.byId.get('cols').buttons().find((x) => /Tell Desk Agent in the room/.test(x.textContent));
+  check('task-board/after-a-minute-says-not-picked-up-and-offers-a-mention', () => {
+    assert.match(r.text(), /Desk Agent has not picked this up yet[\s\S]*listens for row assignments/);
+    assert.ok(tell(), 'no Tell button');
+  });
+  tell().click(); await settle(30);
+  tell().click(); await settle(30);
+  check('task-board/mention-names-the-agent-and-retries-a-decline-with-a-new-key', () => {
+    const posts = b.calls.filter((c) => c[0] === 'roomPost').map((c) => c[1]);
+    assert.equal(posts.length, 2, JSON.stringify(b.calls.map((c) => c[0])));
+    assert.ok(!b.calls.some((c) => c[0] === 'roomPost-replayed'));
+    assert.notEqual(posts[0].key, posts[1].key);
+    assert.match(posts[1].text, new RegExp('^<@' + AGENTS[0].id + '> please take "Book the venue"'));
+    assert.match(posts[1].key, /^[a-z0-9][a-z0-9._-]{0,63}$/i);
+    assert.match(r.text(), /Posted in the room for Desk Agent/);
+    assert.ok(!tell(), 'the button stays after posting');
+  });
+  check('task-board/no-dm-ask-for-an-in-room-agent', () =>
+    assert.ok(!b.calls.some((c) => c[0] === 'sendTask')));
+}
+{
+  // The agent picked it up (Status changed): no note, no button.
+  let t = Date.parse('2026-11-11T12:00:00Z');
+  const b = fakeMulti({ dbs: boardDbs(), primary: 'd1', agents: AGENTS, now: () => t });
+  const r = await run('task-board', { bridge: b });
+  r.byId.get('title').value = 'Fix printer';
+  r.byId.get('who').value = AGENTS[0].id;
+  r.byId.get('add').click();
+  await settle(40);
+  t += 61000;
+  b.fire('d1', { id: 'd1', name: 'Task Board — Tasks', props: TASK_PROPS,
+    rows: [{ id: 'r1', cells: { Task: 'Fix printer', Status: 'Working', Actor: ['@desk.agent:x'] } }] });
+  await settle(20);
+  check('task-board/a-row-the-agent-moved-shows-no-pickup-note', () =>
+    assert.ok(!/has not picked this up yet/.test(r.text()), r.text()));
+}
+{
+  // Blue's ask: allowed, but no agents of your own, on the research desk.
+  const b = fakeMulti({ dbs: deskDbs(), primary: 'd1', agents: [] });
+  const r = await run('research-desk', { bridge: b });
+  check('research-desk/allowed-with-no-agents-says-so-not-not-allowed', () => {
+    const opts = r.byId.get('agent').options.map((o) => o.textContent).join('|');
+    assert.match(opts, /You have no agent of your own here/);
+    assert.ok(!/Not allowed|Waiting/.test(opts), opts);
+    assert.match(r.byId.get('ask-help').textContent, /You have no agent of your own in this room yet/);
   });
 }
 

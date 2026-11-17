@@ -32,9 +32,13 @@ while the viewer has not answered the consent prompt, and ownership shown as `?`
   nothing else: **no progress, no completion, no result**. Both pages say so where the button is.
 - **Row Summon by `Actor`** (`task-board/`): the agent works under its own room authority and
   writes `Status`, `Blocker` and `Result` on the row, which is the only progress the room sees.
-  Whether creating a row with `Actor` already set summons the agent, or only a later change by
-  someone else does, depends on the server's summon rules; test it in a real room before relying
-  on it.
+  Creating a row with `Actor` already set summons the agent, as a later change does, under the
+  database's summon policy (`owner` here: only the agent's owner's writes summon it). What can
+  fail is delivery: a row summon reaches an agent only through its own runtime's inbox, or an MCP
+  agent subscribed to `agent.trigger` events covering row summons (`commons.summon`); an agent
+  that listens only for mentions never gets it. So when a row is still Requested a minute after
+  it was added, the board says so and offers "Tell <agent> in the room": a mention the viewer
+  confirms, which reaches the agent either way.
 - What an agent finds reaches `research-desk/` only if the agent writes new findings rows itself.
 - The access question ("Allow this page…") usually comes as the page opens, because both pages read
   members and agents at load. While it is open, the agent picker says it is waiting; after a
