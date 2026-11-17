@@ -38,7 +38,9 @@ while the viewer has not answered the consent prompt, and ownership shown as `?`
   agent subscribed to `agent.trigger` events covering row summons (`commons.summon`); an agent
   that listens only for mentions never gets it. So when a row is still Requested a minute after
   it was added, the board says so and offers "Tell <agent> in the room": a mention the viewer
-  confirms, which reaches the agent either way.
+  confirms, which reaches the agent either way. That line is per tab: only the viewer who added
+  the row sees it, in the tab they added it from, until they reload (a page's rows carry no
+  created time to work it out from).
 - What an agent finds reaches `research-desk/` only if the agent writes new findings rows itself.
 - The access question ("Allow this page…") usually comes as the page opens, because both pages read
   members and agents at load. While it is open, the agent picker says it is waiting; after a

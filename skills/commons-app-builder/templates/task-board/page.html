@@ -185,8 +185,15 @@
   // A row handed to an agent in the room, per row: if the agent has not changed the row after
   // PICKUP_MS, the row says so and offers a confirmed mention in the room. The row summons the
   // agent only when it listens for row assignments; a mention reaches it either way.
+  // Per tab: a page's rows carry no created time, so only rows this viewer added here, since
+  // this page was opened, are watched; a reload or another member does not see the line.
   const PICKUP_MS = 60000;
-  const clock = () => (typeof art.now === 'function' ? art.now() : Date.now());
+  // artifact.now() is the estimated server time and is NaN until the host's first sample (or
+  // for as long as the host cannot sample): fall back to this device's clock whenever it is.
+  const clock = () => {
+    const t = typeof art.now === 'function' ? art.now() : NaN;
+    return Number.isFinite(t) ? t : Date.now();
+  };
   const waiting = new Map();         // rowId -> {agent, at, key}
   // A DM ask that was not sent, per row: retried with the SAME key, so it never asks twice.
   const unsent = new Map();          // rowId -> {agent, text, key, reason}

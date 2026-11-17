@@ -2177,6 +2177,53 @@ for (const tpl of ['task-board', 'research-desk']) {
   });
 }
 
+/* ===== browser run of 9ec3ccdb: artifact.now() is NaN on dev; the unknown-outcome key ===== */
+{
+  // The host's clock has not sampled: art.now() is NaN. The page falls back to Date.now().
+  const realNow = Date.now;
+  let t = realNow();
+  Date.now = () => t;
+  try {
+    const b = fakeMulti({ dbs: boardDbs(), primary: 'd1', agents: AGENTS, now: () => NaN });
+    const r = await run('task-board', { bridge: b });
+    r.byId.get('title').value = 'Order chairs';
+    r.byId.get('who').value = AGENTS[0].id;
+    r.byId.get('add').click();
+    await settle(40);
+    t += 61000;
+    b.fire('d1', { id: 'd1', name: 'Task Board — Tasks', props: TASK_PROPS,
+      rows: [{ id: 'r1', cells: { Task: 'Order chairs', Status: 'Requested', Actor: ['@desk.agent:x'] } }] });
+    await settle(20);
+    check('task-board/pickup-note-appears-when-artifact-now-is-nan', () =>
+      assert.match(r.text(), /Desk Agent has not picked this up yet/));
+  } finally {
+    Date.now = realNow;
+  }
+}
+{
+  // An unknown outcome may have posted: its retry keeps the key, so the room never gets two.
+  let t = Date.parse('2026-11-11T12:00:00Z');
+  const b = fakeMulti({ dbs: boardDbs(), primary: 'd1', agents: AGENTS, now: () => t,
+    postAnswer: [{ posted: false, reason: 'request outcome unknown' }, { posted: true, eventId: 'e3' }] });
+  const r = await run('task-board', { bridge: b });
+  r.byId.get('title').value = 'Call the caterer';
+  r.byId.get('who').value = AGENTS[0].id;
+  r.byId.get('add').click();
+  await settle(40);
+  t += 61000;
+  b.fire('d1', { id: 'd1', name: 'Task Board — Tasks', props: TASK_PROPS,
+    rows: [{ id: 'r1', cells: { Task: 'Call the caterer', Status: 'Requested', Actor: ['@desk.agent:x'] } }] });
+  await settle(20);
+  const tell = () => r.byId.get('cols').buttons().find((x) => /Tell Desk Agent in the room/.test(x.textContent));
+  tell().click(); await settle(30);
+  tell().click(); await settle(30);
+  check('task-board/mention-retry-after-an-unknown-outcome-keeps-the-key', () => {
+    const posts = b.calls.filter((c) => c[0] === 'roomPost').map((c) => c[1]);
+    assert.equal(posts.length, 2, JSON.stringify(b.calls.map((c) => c[0])));
+    assert.equal(posts[0].key, posts[1].key);
+  });
+}
+
 if (unhandled.length) {
   failures.push(`a page threw and left its promise unhandled (so a control may be stuck): ${[...new Set(unhandled)].join('; ')}`);
 }
