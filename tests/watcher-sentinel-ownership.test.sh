@@ -181,8 +181,13 @@ check "$([ -f "$PF5" ] && echo 0 || echo 1)" \
 
 # Shape half: only the WRITER decides how the file comes to exist, so no
 # behavioural test can catch a future refactor to write-then-mv.
-check "$(grep -qE '^echo "\$\$" > "\$PID_FILE"' "$REPO/src/watch-tasks-stream.sh" && echo 0 || echo 1)" \
+# Indentation is allowed: the stamp may sit inside a role guard.
+STAMP_RE='^[[:space:]]*echo "\$\$" > "\$PID_FILE"'
+check "$(grep -qE "$STAMP_RE" "$REPO/src/watch-tasks-stream.sh" && echo 0 || echo 1)" \
       "p3) watch-tasks-stream.sh still stamps the sentinel in place"
+printf '  echo "$$" > "$tmp"\n  mv -f "$tmp" "$PID_FILE"\n' > "$TMP/write-then-mv.sh"
+check "$(grep -qE "$STAMP_RE" "$TMP/write-then-mv.sh" && echo 1 || echo 0)" \
+      "p4) ...and a write-then-mv stamp does not satisfy that check"
 
 # ------------------------------------------------------------ unmeasurable ownership
 # rc 0 = wrote it, rc 1 = demonstrably did not, rc 2 = UNKNOWN. The old assertion

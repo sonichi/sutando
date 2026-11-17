@@ -340,6 +340,42 @@ class Clicks(Base):
         self.assertEqual(claimant.offer(dict(event, actor_id=OWNER)), ["$e2"])
         self.assertEqual(claimant.last_outcome, "applied", "no tier, the configured owner exactly: accepted")
 
+    def _registry_owner(self, owner):
+        """SPARROW_HA_OWNER unset, and this agent's /v1/agents row names `owner`."""
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        rgb._HITL_OWNER.update(mxid="", at=0.0, bad_at=None)
+        self.addCleanup(rgb._HITL_OWNER.update, mxid="", at=0.0, bad_at=None)
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(mock.patch.object(rgb, "_reenroll_identity", lambda: "@me:ag2.space"))
+        stack.enter_context(mock.patch.object(
+            rgb, "_req", lambda *a, **k: {"agents": [{"id": "@me:ag2.space", "owner": owner}]}))
+
+    def test_unset_variable_owner_click_is_applied_by_the_registry_owner(self):
+        self._registry_owner(OWNER)
+        self.assertEqual(rgb._handle_hitl_action(self.click()), "applied")
+
+    def test_unset_variable_non_owner_click_is_refused_with_nothing_written(self):
+        self._registry_owner(OWNER)
+        before = tree(self.store_root)
+        out = rgb._handle_hitl_action(self.click(user_id="@guest:ag2.space"))
+        self.assertTrue(str(out).startswith("rejected:"), out)
+        self.assertEqual(tree(self.store_root), before)
+
+    def test_unset_variable_event_claimant_reads_the_registry_owner_at_the_click(self):
+        self._registry_owner(OWNER)
+        req = self.store().load(self.req.id)
+        event = {"type": "message.created", "event_id": "$e3", "room_id": DM, "actor_id": "@guest:ag2.space",
+                 "content": {"space.ag2.hitl.action": {"hitl_id": req.id, "expected_revision": req.revision,
+                                                       "action_id": "stop", "guard": req.guard}}}
+        claimant = rgb._ClaudeLocalClicks(None, log=lambda *a: None)
+        before = tree(self.store_root)
+        claimant.offer(event)
+        self.assertTrue(claimant.last_outcome.startswith("rejected:"), claimant.last_outcome)
+        self.assertEqual(tree(self.store_root), before)
+        claimant.offer(dict(event, actor_id=OWNER))
+        self.assertEqual(claimant.last_outcome, "applied")
+
 
 if __name__ == "__main__":
     try:

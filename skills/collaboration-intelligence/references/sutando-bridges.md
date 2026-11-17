@@ -6,7 +6,7 @@ Load the section for the active bridge before resolving identities or room membe
 
 - [Cross-bridge hard pitfalls](#cross-bridge-hard-pitfalls)
 - [Roster refresh policy](#roster-refresh-policy)
-- [AG2 Space (Matrix)](#ag2-space-matrix)
+- [s.space (Matrix)](#sspace-matrix)
 - [Discord](#discord)
 - [Telegram](#telegram)
 - [Slack](#slack)
@@ -32,14 +32,14 @@ Use `100` members as the default operational threshold; allow provider configura
 
 Bridge-specific implications:
 
-- AG2 Space task headers provide the true total in `room_member_count`, but `room_members` is capped at 10 names. Treat a header as full only when the parsed list length equals the reported total.
+- s.space task headers provide the true total in `room_member_count`, but `room_members` is capped at 10 names. Treat a header as full only when the parsed list length equals the reported total.
 - Large Discord servers commonly remain partial even after available enumeration.
 - Telegram through this bridge has no Matrix-style exhaustive member table; do not label an observed-member scan as full.
 - Slack and WhatsApp may support full channel/group reconciliation when the configured bridge can page the entire roster.
 
-## AG2 Space (Matrix)
+## s.space (Matrix)
 
-AG2 Space is an emerging Sutando-native, agent-native workspace.
+s.space is an emerging Sutando-native, agent-native workspace.
 
 ### Identity
 
@@ -56,7 +56,7 @@ AG2 Space is an emerging Sutando-native, agent-native workspace.
   - If `len(room_members) > room_member_count` or parsing is invalid, mark completeness `unknown` and record a header-integrity anomaly.
 - In the current server behavior, rooms with at most 10 members can be full; rooms above 10 are represented by exactly 10 listed names and a larger true count. Use the comparison rule rather than hard-coding room size so the consumer remains correct if the cap changes.
 - A `full` header is complete only at the task timestamp. It is not a permanently live roster.
-- When an agent is in an AG2 Space room, its owner is expected in that room. Check this invariant only from a `full` snapshot or an independent exhaustive membership query. The owner's absence from a truncated header is inconclusive and must not trigger an ownership anomaly.
+- When an agent is in an s.space room, its owner is expected in that room. Check this invariant only from a `full` snapshot or an independent exhaustive membership query. The owner's absence from a truncated header is inconclusive and must not trigger an ownership anomaly.
 
 ### Observation source: the task-file stream
 

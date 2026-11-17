@@ -402,11 +402,17 @@ def _model_family(value: Optional[str]) -> Optional[str]:
 
 def record_speaks_for_seat(quota: Any, env: SeatEnv, workspace) -> bool:
     """True only when the seat's model and the record's are both known and name
-    the same model, EXACTLY, or by family when the seat is a bare alias. A
-    record refreshed on another model may say allowed while THIS seat's model
-    is limited, and the proxy's headers carry no per-model window to catch
-    that (measured: status, 5h, 7d, overage -- nothing per model), so unknown
-    holds.
+    the same model (see `models_match`). A record refreshed on another model
+    may say allowed while THIS seat's model is limited, and the proxy's headers
+    carry no per-model window to catch that (measured: status, 5h, 7d,
+    overage -- nothing per model), so unknown holds."""
+    return models_match(seat_model(env, workspace), record_model(quota))
+
+
+def models_match(mine: Optional[str], theirs: Optional[str]) -> bool:
+    """True when the seat's model `mine` and a proxy-reported model `theirs`
+    are both known and name the same model, EXACTLY (after dropping a context
+    tag like `[1m]`), or by family when `mine` is a bare alias.
 
     A menu alias (`opus`, `sonnet[1m]`, ...) and the full id the proxy reports
     (`claude-opus-5-5`, `claude-sonnet-5`, ...) name the same model but are
@@ -418,7 +424,7 @@ def record_speaks_for_seat(quota: Any, env: SeatEnv, workspace) -> bool:
     `claude-opus-5-5` stays unknown, same as before this match existed, because
     per-model windows may differ within one family and an alias is the only
     name that cannot already identify its own exact pinned version."""
-    mine, theirs = seat_model(env, workspace), record_model(quota)
+    mine, theirs = _norm_model(mine), _norm_model(theirs)
     if mine is None or theirs is None:
         return False
     if mine == theirs:

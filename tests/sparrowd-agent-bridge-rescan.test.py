@@ -36,6 +36,7 @@ for _p in (str(REPO / "src"), str(REPO / "packages" / "ag2-sparrow")):
         sys.path.insert(0, _p)
 
 import sparrow_agent_bridge as bridge  # noqa: E402
+from ag2_sparrow.control_socket import control_socket_path  # noqa: E402
 from ag2_sparrow.sparrowd import Supervisor, WorkerSpec, run  # noqa: E402
 
 from ag2_sparrow.adapters.claude_code import cli  # noqa: E402
@@ -220,7 +221,7 @@ class Reconcile(unittest.TestCase):
         self.addCleanup(shutil.rmtree, td, ignore_errors=True)
         passes = [[], [WorkerSpec("late", SLEEPER)], [WorkerSpec("late", SLEEPER)], []]
         seen = []
-        sock = td / "sparrowd.sock"
+        sock = control_socket_path(td)
 
         def rescan():
             want = passes.pop(0) if passes else []
@@ -249,7 +250,7 @@ class Reconcile(unittest.TestCase):
     def test_an_unavailable_rescan_keeps_the_running_workers_and_is_logged_once_per_episode(self):
         td = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, td, ignore_errors=True)
-        sock = td / "sparrowd.sock"
+        sock = control_socket_path(td)
         calls = []
         # two failing passes, one good, two failing, one good: two episodes
         script = ["fail", "fail", "ok", "fail", "fail", "ok"]
@@ -332,7 +333,7 @@ class Reconcile(unittest.TestCase):
             return WorkerSpec("agent", [sys.executable, "-c", code, str(live), label], revision=label)
         passes = [[spec("B")], [spec("C")]]
         calls, samples, peak = [], [], [0]
-        sock = td / "sparrowd.sock"
+        sock = control_socket_path(td)
 
         def rescan():
             calls.append(1)
@@ -378,7 +379,7 @@ class Reconcile(unittest.TestCase):
         self.addCleanup(shutil.rmtree, td, ignore_errors=True)
         holder = SingleInstance(td / "sparrowd.lock")
         self.assertTrue(holder.acquire())
-        sock = td / "sparrowd.sock"
+        sock = control_socket_path(td)
 
         def release_then_stop():
             time.sleep(0.5)
@@ -509,9 +510,9 @@ class VaultScan(unittest.TestCase):
             return want
 
         def stop_when_done():
-            wait_for(lambda: (td / "sparrowd.sock").exists() and len(counts) >= 2, 10)
+            wait_for(lambda: control_socket_path(td).exists() and len(counts) >= 2, 10)
             c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            c.connect(str(td / "sparrowd.sock"))
+            c.connect(str(control_socket_path(td)))
             c.sendall(b'{"op": "stop"}\n')
             c.makefile("r").readline()
             c.close()

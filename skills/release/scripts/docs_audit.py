@@ -4,6 +4,7 @@
 import argparse
 import json
 import re
+import subprocess
 import sys
 from datetime import date
 from pathlib import Path
@@ -15,6 +16,8 @@ LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 ALLOWED_AUDIENCES = {"users", "operators", "contributors", "maintainers", "agents"}
 ALLOWED_STATUSES = {"canonical", "active", "draft", "historical"}
 REQUIRED_METADATA = {"title", "audience", "status", "canonical_for", "last_verified"}
+FEATURE_LIST = "skills/tutorial/feature-list.json"
+RELEASE_TAG = re.compile(r"^v\d+\.\d+\.\d+$")
 
 
 def repo_root_from_script() -> Path:
@@ -156,6 +159,72 @@ def audit_catalog(repo: Path, expected: Set[str]) -> List[str]:
     return errors
 
 
+def git(repo: Path, *args: str) -> Optional[str]:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False
+    )
+    return result.stdout if result.returncode == 0 else None
+
+
+def release_tag(repo: Path) -> Optional[str]:
+    """The highest plain vMAJ.MIN.PATCH tag reachable from HEAD; -rc/-pre and other suffixes never count."""
+    tags = git(repo, "tag", "--merged", "HEAD", "--list", "v*")
+    plain = [t for t in (tags or "").split() if RELEASE_TAG.match(t)]
+    if not plain:
+        return None
+    return max(plain, key=lambda t: tuple(int(n) for n in t[1:].split(".")))
+
+
+def feature_list_at(repo: Path, ref: str) -> dict:
+    blob = git(repo, "show", f"{ref}:{FEATURE_LIST}")
+    try:
+        data = json.loads(blob) if blob is not None else {}
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def watched(path: str, watch: str) -> bool:
+    if watch.endswith("/"):
+        return path.startswith(watch)
+    return path == watch or path.startswith(watch + "/")
+
+
+def audit_feature_list(repo: Path, since: Optional[str] = None) -> List[str]:
+    """Warn when a path a tour step watches changed since the last release tag, the tour's revision
+    did not, and `reviewed_at` does not record that tag."""
+    repo = repo.resolve()
+    since = since or release_tag(repo)
+    if not since:
+        return []
+    changed = git(repo, "diff", "--name-only", since, "HEAD")
+    if changed is None:
+        return [f"feature-list check skipped: cannot diff {since}..HEAD"]
+    head = feature_list_at(repo, "HEAD")
+    steps = [s for s in head.get("steps") or [] if isinstance(s, dict)]
+    warnings = [
+        f"{FEATURE_LIST}: step {step.get('id')} watches {watch}, which does not exist"
+        for step in steps for watch in step.get("watches") or []
+        if not (repo / watch).exists()
+    ]
+    if head.get("reviewed_at") == since:
+        return warnings
+    if feature_list_at(repo, since).get("revision") != head.get("revision"):
+        return warnings
+    paths = changed.splitlines()
+    hit = [
+        step.get("id") for step in steps
+        if any(watched(path, w) for w in step.get("watches") or [] for path in paths)
+    ]
+    if hit:
+        warnings.append(
+            f"{FEATURE_LIST}: paths watched by step(s) {', '.join(map(str, hit))} changed since {since} "
+            f"but revision {head.get('revision')!r} did not; update those steps and bump revision, "
+            f"or set \"reviewed_at\": \"{since}\" if the tour is unaffected"
+        )
+    return warnings
+
+
 def run(repo: Path) -> Tuple[List[str], int, int]:
     repo = repo.resolve()
     expected = docs_files(repo)
@@ -170,8 +239,11 @@ def run(repo: Path) -> Tuple[List[str], int, int]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=repo_root_from_script())
+    parser.add_argument("--since", help="release ref to compare against (default: highest plain vX.Y.Z tag)")
     args = parser.parse_args()
     errors, docs_count, checked_count = run(args.repo_root)
+    for warning in audit_feature_list(args.repo_root, args.since):
+        print(f"docs-audit: WARN: {warning}", file=sys.stderr)
     if errors:
         for error in errors:
             print(f"docs-audit: ERROR: {error}", file=sys.stderr)

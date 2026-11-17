@@ -53,7 +53,15 @@
 set -u
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-SETTINGS="$REPO_DIR/.claude/settings.json"
+# Claude Code reads project settings from the directory the core LAUNCHES from, which
+# start-cli.sh lets SUTANDO_CLAUDE_WORKING_DIR move; the scripts stay anchored at REPO_DIR.
+# One resolver for every site (scripts/core-working-dir.sh); only needed when the override is set.
+TARGET_DIR="$REPO_DIR"
+if [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ]; then
+  . "$REPO_DIR/scripts/core-working-dir.sh" || { echo "error: scripts/core-working-dir.sh missing — cannot resolve SUTANDO_CLAUDE_WORKING_DIR" >&2; exit 1; }
+  TARGET_DIR="$(sutando_core_working_dir "$REPO_DIR")" || { echo "error: SUTANDO_CLAUDE_WORKING_DIR rejected — hooks NOT installed" >&2; exit 1; }
+fi
+SETTINGS="$TARGET_DIR/.claude/settings.json"
 
 # Hook specs: each line is "<event>|<command>".  Order = install order.
 # $REPO_DIR is expanded HERE, at install time, so the command written into
@@ -124,13 +132,38 @@ HOOK_PRIOR=()
 for _i in "${!HOOKS[@]}"; do HOOK_PRIOR+=(""); done
 
 # Skill-declared hooks via src/skill_hooks.py (the same discovery the health probe reads).
+# The interpreter is the launcher's (SUTANDO_PY > bundled > a PATH python3 that is not
+# Apple's stub); a bare `python3` here reaches the stub on a Mac without the CLT.
+PY=""
+if [ -r "$REPO_DIR/scripts/python-binary.sh" ]; then
+  . "$REPO_DIR/scripts/python-binary.sh"
+  PY="$(resolve_python "$REPO_DIR")"
+else
+  PY="$(command -v python3 || true)"
+fi
+DISCOVERY_RC=0
+DISCOVERED="$(mktemp "${TMPDIR:-/tmp}/skill-hooks.XXXXXX")"
+if [ ! -f "$REPO_DIR/src/skill_hooks.py" ]; then
+  echo "install-claude-hooks: no src/skill_hooks.py in this tree — static hooks only" >&2
+elif [ -z "$PY" ]; then
+  echo "install-claude-hooks: no runnable python3 — skill-declared hooks NOT registered" >&2
+  DISCOVERY_RC=1
+else
+  # `$?` inside an `if ! cmd` branch is the NEGATED status; capture the real one.
+  "$PY" "$REPO_DIR/src/skill_hooks.py" "$REPO_DIR" > "$DISCOVERED" 2>/dev/null || DISCOVERY_RC=$?
+  if [ "$DISCOVERY_RC" != 0 ]; then
+    echo "install-claude-hooks: skill-hook discovery failed (rc=$DISCOVERY_RC via $PY) — skill-declared hooks NOT registered" >&2
+    : > "$DISCOVERED"
+  fi
+fi
 # NUL-framed (-d '') because two of the four fields embed the repo path.
 while IFS= read -r -d '' _ev && IFS= read -r -d '' _tok \
    && IFS= read -r -d '' _cmd && IFS= read -r -d '' _prior; do
   [ -n "${_ev:-}" ] || continue
   HOOKS+=("$_ev|$_tok|$_cmd")
   HOOK_PRIOR+=("$_prior")
-done < <(python3 "$REPO_DIR/src/skill_hooks.py" "$REPO_DIR" 2>/dev/null)
+done < "$DISCOVERED"
+rm -f "$DISCOVERED"
 
 # Deprecated hooks to uninstall on re-run.  Each line: "<event>|<substring>".
 # Matching uses `.command | contains(substring)` so we don't need to track
@@ -159,14 +192,18 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 
-mkdir -p "$REPO_DIR/.claude"
+mkdir -p "$TARGET_DIR/.claude"
 if [ ! -f "$SETTINGS" ]; then
   echo '{}' > "$SETTINGS"
 fi
 
 ADDED=0
 SKIPPED=0
+UPDATED=0
 REMOVED=0
+# Hooks whose stale variant phase 0 swept; phase 1 counts a re-add of one as an update.
+SWEPT=()
+for _i in "${!HOOKS[@]}"; do SWEPT+=(""); done
 
 # Escape a literal string so it can be embedded in a jq (Oniguruma) regex.
 re_escape() { printf '%s' "$1" | sed 's/[][\\^$.*+?(){}|]/\\&/g'; }
@@ -234,8 +271,10 @@ for i in "${!HOOKS[@]}"; do
   # apostrophe bug this file already fixed once; it is a property of shq, so
   # every comparison against an embedded path has to go through it.
   ESC="$(shq "$REPO_DIR")"; ESC="${ESC#\'}"; ESC="${ESC%\'}"
+  # Skill hooks embed the physical path (skill_hooks.py resolves it), which a symlinked REPO_DIR is not.
+  ESC_P="$(shq "$(cd "$REPO_DIR" && pwd -P)")"; ESC_P="${ESC_P#\'}"; ESC_P="${ESC_P%\'}"
   case "$CMD" in
-    *"$ESC"*) ;;
+    *"$ESC"*|*"$ESC_P"*) ;;
     *) continue ;;
   esac
 
@@ -271,14 +310,35 @@ for i in "${!HOOKS[@]}"; do
 
   # SHAPE cannot match the runner-first entry (its first word is `[`), so match the
   # prior command exactly, taken from the emitter — `${CMD#*exec }` splits on a path.
+  # Several legacy shapes per hook, joined by the record separator skill_hooks.py emits.
   LEGACY_SHAPE=""
-  [ -n "${HOOK_PRIOR[$i]:-}" ] && LEGACY_SHAPE="^$(re_escape "${HOOK_PRIOR[$i]}")\$"
+  if [ -n "${HOOK_PRIOR[$i]:-}" ]; then
+    _alts=""
+    while IFS= read -r -d $'\x1e' _p || [ -n "$_p" ]; do
+      [ -n "$_p" ] && _alts="${_alts:+$_alts|}$(re_escape "$_p")"
+    done < <(printf '%s' "${HOOK_PRIOR[$i]}")
+    LEGACY_SHAPE="^($_alts)\$"
+  fi
+  # A skill hook starts with the fail-open guard on ITS OWN path (`[ -f <path> ] || exit 0; `).
+  # Another revision of this installer spells the rest differently (the interpreter resolved at
+  # event time), and no operator writes that guard: an entry that opens with our guard for our
+  # path and carries the marker is ours whatever follows, so the two spellings never coexist.
+  GUARD_SHAPE=""
+  case "$CMD" in
+    "[ -f "*" ] || exit 0; "*)
+      _guard="${CMD%% ] || exit 0; *} ] || exit 0; "
+      GUARD_SHAPE="^$(re_escape "$_guard").*$(re_escape "$MARKER")"
+      # The same guard on another checkout's copy of this skill script is ours too.
+      case "$_guard" in
+        *"/skills/"*) GUARD_SHAPE="$GUARD_SHAPE|^\\[ -f .*/skills/$(re_escape "${_guard##*/skills/}").*$(re_escape "$MARKER")" ;;
+      esac ;;
+  esac
 
   if ! jq -e --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
-           --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" \
+           --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" --arg guard "$GUARD_SHAPE" \
       '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command // "")
        | map(contains($marker) and (. != $cmd)
-             and (test($shape) or ($legacy != "" and test($legacy))))
+             and (test($shape) or ($legacy != "" and test($legacy)) or ($guard != "" and test($guard))))
        | any' \
       "$SETTINGS" >/dev/null 2>&1; then
     continue
@@ -286,14 +346,14 @@ for i in "${!HOOKS[@]}"; do
 
   TMP="$(mktemp "${SETTINGS}.XXXXXX")"
   jq --arg event "$EVENT" --arg marker "$MARKER" --arg cmd "$CMD" \
-     --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" '
+     --arg shape "$SHAPE" --arg legacy "$LEGACY_SHAPE" --arg guard "$GUARD_SHAPE" '
     if (.hooks // {})[$event] then
       .hooks[$event] |= map(
         .hooks |= map(select(
           ((.command // "") | contains($marker))
           and ((.command // "") != $cmd)
           and ((.command // "")
-               | test($shape) or ($legacy != "" and test($legacy)))
+               | test($shape) or ($legacy != "" and test($legacy)) or ($guard != "" and test($guard)))
           | not
         ))
       )
@@ -301,11 +361,13 @@ for i in "${!HOOKS[@]}"; do
     else . end
   ' "$SETTINGS" > "$TMP" || { echo "error: jq stale-variant sweep failed on $EVENT" >&2; rm -f "$TMP"; exit 1; }
   mv "$TMP" "$SETTINGS"
-  REMOVED=$((REMOVED + 1))
+  SWEPT[$i]=1
 done
 
-# Phase 1: install missing current hooks.
-for entry in "${HOOKS[@]}"; do
+# Phase 1: install missing current hooks. A swept variant re-added here is an update;
+# one swept beside an already-present current hook is a removal.
+for i in "${!HOOKS[@]}"; do
+  entry="${HOOKS[$i]}"
   EVENT="${entry%%|*}"
   REST="${entry#*|}"
   CMD="${REST#*|}"
@@ -315,6 +377,7 @@ for entry in "${HOOKS[@]}"; do
       '(.hooks // {})[$event] // [] | map(.hooks // []) | flatten | map(.command) | index($cmd)' \
       "$SETTINGS" >/dev/null 2>&1; then
     SKIPPED=$((SKIPPED + 1))
+    [ -n "${SWEPT[$i]}" ] && REMOVED=$((REMOVED + 1))
     continue
   fi
 
@@ -326,7 +389,7 @@ for entry in "${HOOKS[@]}"; do
     | .hooks[$event][0].hooks += [{"type": "command", "command": $cmd}]
   ' "$SETTINGS" > "$TMP" || { echo "error: jq edit failed on $EVENT" >&2; rm -f "$TMP"; exit 1; }
   mv "$TMP" "$SETTINGS"
-  ADDED=$((ADDED + 1))
+  if [ -n "${SWEPT[$i]}" ]; then UPDATED=$((UPDATED + 1)); else ADDED=$((ADDED + 1)); fi
 done
 
 # Phase 2: uninstall deprecated hooks (substring match).
@@ -367,7 +430,10 @@ if jq -e '(.hooks // {}).PreCompact // [] | map(.hooks // []) | flatten
   mkdir -p "$HOME/Desktop/sutando-conversations"
 fi
 
-echo "install-claude-hooks: added=$ADDED skipped=$SKIPPED removed=$REMOVED → $SETTINGS"
+echo "install-claude-hooks: added=$ADDED skipped=$SKIPPED updated=$UPDATED removed=$REMOVED → $SETTINGS"
+# A failed discovery leaves the static hooks installed and exits non-zero: the
+# launcher prints its warning and the claude-hooks probe names the missing ones.
+[ "$DISCOVERY_RC" = 0 ] || exit 1
 
 # Register hooks in the sutando-hook-manifest so migration-notice can identify
 # them without relying on the hardcoded substring list. (#1502)

@@ -179,7 +179,7 @@ class TestMentionFallback(unittest.TestCase):
             return 200, {"ok": True, "event_id": "$evt"}
 
         self.M.http_json = fake_http_json
-        self.M.gateway = lambda: ("https://relay", {})
+        self.M.gateway = lambda *_a: ("https://relay", {})
         self.M.gate_allows = lambda *a, **k: True
         self.M.load_gate = lambda *a, **k: {}
         # The broker knows nobody unless a test tells it otherwise, so the
@@ -493,7 +493,7 @@ class TestMentionFallback(unittest.TestCase):
         self.assertEqual(self.posted, [])
 
     def test_no_gateway_is_named_after_the_resolve(self):
-        self.M.gateway = lambda: ("", {})
+        self.M.gateway = lambda *_a: ("", {})
         got = self._mention("sutando-sonichi", agents=[{"id": SONICHI}])
         self.assertFalse(got["ok"])
         self.assertEqual(got["reason"], "no gateway configured")

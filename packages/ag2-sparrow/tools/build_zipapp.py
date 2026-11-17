@@ -2,7 +2,7 @@
 """Build ag2-sparrow.pyz: the whole ag2_sparrow package as one stdlib zipapp.
 
 The archive starts the bridge (`ag2-sparrow`). The other console entry runs
-from the same file without a dispatcher, since the bridge's main() reads no argv:
+from the same file without a dispatcher, since the bridge's run() reads no argv:
 
     PYTHONPATH=ag2-sparrow.pyz python3 -m ag2_sparrow.outbox_cli --help
 
@@ -16,7 +16,7 @@ import sys
 import zipapp
 
 PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
-ENTRY = "ag2_sparrow.remote_gateway_bridge:main"
+ENTRY = "ag2_sparrow.remote_gateway_bridge:run"
 INTERPRETER = "/usr/bin/env python3"
 
 

@@ -65,13 +65,16 @@ adapter checks nothing about it beyond the single-process lock. The binary enfor
 
 ## Setup (once)
 
-1. Create the session interactively: `claude --cloud "AG2 Space agent"`. It prints
+1. Create the session interactively: `claude --cloud "s.space agent"`. It prints
    `Created cloud session: … View: https://claude.ai/code/session_… Resume with: claude --teleport session_…`.
    Keep the `session_…` id. The adapter never creates sessions.
 2. Open the session's page, and in the composer's **+** → **Connectors** menu switch the **ag2 space**
    connector on. The session then acts as the agent that connector is linked to; its tools are
    `mcp__ag2_space__*` (`ag2_whoami`, `room_actions_describe`, `room_action_execute`, `room_inspect`,
-   `room_list`).
+   `room_list`, `space_action_read`). The prompt allows `space_action_read` only for owner tasks, with the
+   task's `task_id`; re-paste the prompt into an existing session to pick that up.
+   The prompt is not the control: the server answers an account read only when the `task_id` is a message the owner
+   addressed to this agent, so a task that falsely claims `tier=owner` is refused.
 3. Paste [`session-prompt.md`](session-prompt.md) (the part between its two rules) as the session's
    first message. It should answer `ready`.
 4. Run the adapter with `--session-id session_…` and, so owner-only answers asked in a shared room can
@@ -92,7 +95,7 @@ reply.
 Text:
 
 ```
-[sparrow task] Follow your standing AG2 Space instructions for this message: …
+[sparrow task] Follow your standing s.space instructions for this message: …
 room=<channel_id> thread=<thread_root or none> tier=<owner|team|guest> collaborator=<true|false> task_id=<id> channel_kind=<dm|room|unknown> [owner_dm=<room id>]
 note: <NON_OWNER_NOTE>            (non-owner tiers only)
 <UNTRUSTED_TASK_<nonce>>
@@ -220,7 +223,9 @@ the latest it can have been queued.
 - Any tool that raises a permission prompt inside the session stalls the queue: every turn queued
   after it waits until the owner answers it. In the probe, the connector's `room_list` raised one;
   `ag2_whoami`, `room_actions_describe` and `room_action_execute` did not, so the standing
-  instructions allow only those three connector tools. Claude Code's own tools stay available; they
+  instructions allow only those three connector tools, plus `ui_describe` / `ui_request` / `ui_result`
+  for an owner item carrying `ui_origin`. Those three have not been probed for a prompt yet; if one
+  raises it, it stalls the queue the same way. Claude Code's own tools stay available; they
   ran without prompts in the probes, and one that starts prompting would stall the queue the same
   way. The adapter cannot detect a stall, because the CLI only reports that a turn was queued (tracked in the liveness
   issue), and nothing on the CLI side can answer the prompt. Fix it from the session's page: answer

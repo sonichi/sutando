@@ -79,6 +79,21 @@ class OrphanSkipMarkerTest(unittest.TestCase):
         r = self._run()
         self.assertEqual(r["status"], "ok", r["detail"])
 
+    # --- not silently dropped either: a skip nobody retired is counted --------
+    def test_unretired_skips_are_counted_in_the_detail(self) -> None:
+        self._result("task-nosend-3", "[no-send]\nbookkeeping")
+        self._result("task-replied-3", "[REPLIED]\nposted")
+        self._result("task-nosend-young", "[no-send]\nfresh", age_s=10)
+        r = self._run()
+        self.assertEqual(r["status"], "ok", r["detail"])
+        self.assertIn("2 skip-marked result(s) still live past the threshold, unretired", r["detail"])
+        self.assertNotIn("task-nosend-3", r["detail"])
+
+    def test_no_skips_means_no_unretired_note(self) -> None:
+        self._result("task-plain-3", "a real undelivered reply")
+        r = self._run()
+        self.assertNotIn("unretired", r["detail"])
+
     # --- the deliberate NON-exemption ---------------------------------------
     def test_deduped_is_still_reported(self) -> None:
         """`[deduped:]` promises delivery elsewhere; a broken promise is a lost reply."""

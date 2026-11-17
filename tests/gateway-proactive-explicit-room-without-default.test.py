@@ -73,7 +73,7 @@ def drain(body: str, default_room: str):
     src.write_text(body, encoding="utf-8")
     posts: list[dict] = []
 
-    def _fake_req(method, path, payload=None, timeout=None):
+    def _fake_req(method, path, payload=None, timeout=None, **_kw):
         if method == "POST":  # the routing lookup is a GET, not a send
             posts.append({"path": path, "payload": payload})
         return {"ok": True, "event_id": "$evt"}
@@ -139,7 +139,7 @@ def main() -> int:
              gb._req, gb.PROACTIVE_CLAIM_GATE)
     gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = tmp, tmp / "archive"
     gb.PROACTIVE_ROOM = ""
-    gb._req = lambda m, path, payload=None, timeout=None: (
+    gb._req = lambda m, path, payload=None, timeout=None, **_kw: (
         posts.append(payload) or {"ok": True, "event_id": "$evt"})
     gb.PROACTIVE_CLAIM_GATE = None
     try:
@@ -189,7 +189,7 @@ def main() -> int:
              gb._req, gb.PROACTIVE_CLAIM_GATE, gb._proactive_route)
     gb.RESULTS_DIR, gb.ARCHIVE_RESULTS_DIR = tmp3, tmp3 / "archive"
     gb.PROACTIVE_ROOM = ""
-    gb._req = lambda m, path, payload=None, timeout=None: (
+    gb._req = lambda m, path, payload=None, timeout=None, **_kw: (
         (posts3.append(payload) if m == "POST" else None) or {"ok": True, "event_id": "$evt"})
     gb.PROACTIVE_CLAIM_GATE = None
     gb._proactive_route = _vanishing_route

@@ -27,6 +27,12 @@ REPO = Path(__file__).resolve().parents[1]
 SYNC = REPO / "packages" / "ag2-sparrow" / "tools" / "sync_from_src.py"
 
 
+def test_dotspace_is_bundled():
+    """The bridge imports `.dotspace`; the package must keep bundling it from src/."""
+    assert '"src/dotspace.py": "dotspace.py"' in SYNC.read_text(encoding="utf-8")
+    assert (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "dotspace.py").is_file()
+
+
 def test_ag2_sparrow_bundled_utils_in_sync_with_src():
     assert SYNC.exists(), f"missing {SYNC}"
     command = [sys.executable]
@@ -42,5 +48,6 @@ def test_ag2_sparrow_bundled_utils_in_sync_with_src():
 
 
 if __name__ == "__main__":
+    test_dotspace_is_bundled()
     test_ag2_sparrow_bundled_utils_in_sync_with_src()
     print("PASS — ag2-sparrow bundled utils in sync with src/")

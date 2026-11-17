@@ -66,9 +66,10 @@ def test_write_task_publishes_atomically_and_completely():
         assert len(tier_at) == 1
         tail = lines[tier_at[0] + 1:]
         assert any(ln.startswith("===SKILL INSTRUCTIONS") for ln in tail)
-        # Completeness: the block's final line (the result path) is the file tail —
+        # Completeness: the block's final line (the result step) is the file tail —
         # a truncated write cannot produce it.
-        assert lines[-1].endswith(f"results/{tid}.txt")
+        assert f"results/{tid}.txt;" in lines[-1]
+        assert lines[-1].endswith("Every task ends with a result.")
         assert "id: task-1784500000000" in body
         assert "source: ag2space" in body
         print("PASS test_write_task_publishes_atomically_and_completely")

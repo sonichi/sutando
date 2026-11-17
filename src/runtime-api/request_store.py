@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import json
 import os
+import functools
 import sqlite3
+import threading
 import time
 import uuid
 
@@ -51,9 +53,19 @@ CREATE INDEX IF NOT EXISTS idx_runtime_requests_status
 """
 
 
+def _serialized(method):
+    # One connection, shared across threads: sqlite3 leaves serializing its use to the caller.
+    @functools.wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return locked
+
+
 class RequestStore:
     def __init__(self, db_path: str):
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        self._lock = threading.RLock()
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
         # Idempotent migration BEFORE the schema script: a pre-idempotency v0
@@ -73,6 +85,7 @@ class RequestStore:
         self._db.commit()
 
     # ── lifecycle ───────────────────────────────────────────────────────────
+    @_serialized
     def create(self, request_type: str, method: str, actor_id: str,
                params: dict, task_id=None, execution_id=None,
                expires_in_s=None, idempotency_key=None,
@@ -91,6 +104,7 @@ class RequestStore:
         self._db.commit()
         return self.get(rid)
 
+    @_serialized
     def create_consuming(self, approval_id: str, request_type: str, method: str,
                          actor_id: str, params: dict, task_id=None,
                          idempotency_key=None, fingerprint=None):
@@ -126,6 +140,7 @@ class RequestStore:
             raise
         return self.get(rid)
 
+    @_serialized
     def by_idempotency_key(self, key: str):
         """The existing request created under this key, or None. The unique
         index makes create() with a duplicate key raise — callers must look
@@ -140,6 +155,7 @@ class RequestStore:
             rec["fingerprint"] = row[1]
         return rec
 
+    @_serialized
     def get(self, request_id: str):
         cur = self._db.execute(
             "SELECT request_id, request_type, task_id, execution_id, actor_id,"
@@ -165,6 +181,7 @@ class RequestStore:
                 rec["status"] = "expired"
         return rec
 
+    @_serialized
     def transition(self, request_id: str, new_status: str, result=None,
                    resolved_by=None) -> bool:
         """pending → terminal, exactly once (CAS on status). False = lost the
@@ -178,6 +195,7 @@ class RequestStore:
         self._db.commit()
         return cur.rowcount == 1
 
+    @_serialized
     def consume(self, request_id: str) -> bool:
         """Stamp a one-time-use approval as consumed (approved → consumed_at
         set, exactly once). An approval for one action must not replay."""
@@ -188,11 +206,13 @@ class RequestStore:
         self._db.commit()
         return cur.rowcount == 1
 
+    @_serialized
     def pending(self) -> list:
         cur = self._db.execute(
             "SELECT request_id FROM runtime_requests WHERE status = 'pending'")
         return [self.get(r[0]) for r in cur.fetchall()]
 
+    @_serialized
     def expired(self, request_types) -> list:
         """Durable candidates for retrying incomplete expiry side effects."""
         types = tuple(request_types)
@@ -204,5 +224,6 @@ class RequestStore:
             f" AND request_type IN ({placeholders})", types)
         return [self.get(r[0]) for r in cur.fetchall()]
 
+    @_serialized
     def close(self) -> None:
         self._db.close()

@@ -1,0 +1,232 @@
+{
+  "schema_version": 1,
+  "revision": "tutorial.2026-10-31.3",
+  "steps": [
+    {
+      "id": "dm",
+      "title": "Your DM",
+      "body": [
+        "Your DM with {name} is where you ask for things for yourself. What you ask for yourself (research, mail, calendar) comes back in your DM, never in a room.",
+        "Open {name} under Your agents at the top of the sidebar and ask:"
+      ],
+      "surface": "dm",
+      "screenshot": null,
+      "since_release": "2026-10-15",
+      "paste": "What can you do for me today?"
+    },
+    {
+      "id": "rooms",
+      "title": "Rooms",
+      "body": [
+        "You, your teammates and all of your agents meet in one room. Invite your team, and everyone brings their own agents. Each agent works for its owner, right in the room.",
+        "Press + at the top of the room list and choose Room. Name it and pick {name} under AI stands you own, or later open the room menu (&#8942;), choose Invite, and add {name}."
+      ],
+      "surface": "room",
+      "screenshot": [
+        {
+          "asset": "room-list-add-room",
+          "hd_file": "assets/room-list-add-room.png",
+          "fallback_file": "assets/room-list-add-room.jpg",
+          "alt": "Press + in the room list, then Room"
+        },
+        {
+          "asset": "new-room-dialog",
+          "hd_file": "assets/new-room-dialog.png",
+          "fallback_file": "assets/new-room-dialog.jpg",
+          "alt": "The New Chat Room dialog, with your agent under AI stands you own"
+        },
+        {
+          "asset": "room-menu-invite",
+          "hd_file": "assets/room-menu-invite.png",
+          "fallback_file": "assets/room-menu-invite.jpg",
+          "alt": "The room menu, with Invite"
+        }
+      ],
+      "since_release": "2026-10-15"
+    },
+    {
+      "id": "commons",
+      "title": "Commons",
+      "body": [
+        "Each room's shared Docs, HTML pages, PDFs, Figma files, whiteboards, sheets and databases. Open them with the Commons button at the right of the room header.",
+        "Ask {name} in a room:"
+      ],
+      "surface": "room",
+      "screenshot": [
+        {
+          "asset": "room-header-commons",
+          "hd_file": "assets/room-header-commons.png",
+          "fallback_file": "assets/room-header-commons.jpg",
+          "alt": "The Commons button at the right of the room header"
+        },
+        {
+          "asset": "commons-surfaces",
+          "hd_file": "assets/commons-surfaces.png",
+          "fallback_file": "assets/commons-surfaces.jpg",
+          "alt": "Commons: Doc, Whiteboard, HTML, PDF, Figma, Sheet and Database"
+        }
+      ],
+      "since_release": "2026-10-15",
+      "paste": "Make a plan for our team offsite in Commons."
+    },
+    {
+      "id": "agents",
+      "title": "Connect other agents",
+      "body": [
+        "Bring agents from the apps you already use into your rooms.",
+        "Press + at the top of the room list and choose Agent. In Add an agent, pick Use an agent from another app and Continue. Under Which agent?, pick the app you already use: Dot (by OpenAI, in ChatGPT), Grokbot (in Grok), Muse (by Meta), Duet (in Claude), or Other for Gemini and more. Then connect it inside that app and sign in."
+      ],
+      "surface": "room",
+      "screenshot": [
+        {
+          "asset": "room-list-add",
+          "hd_file": "assets/room-list-add.png",
+          "fallback_file": "assets/room-list-add.jpg",
+          "alt": "The + menu at the top of the room list, with Agent"
+        },
+        {
+          "asset": "add-agent-dialog",
+          "hd_file": "assets/add-agent-dialog.png",
+          "fallback_file": "assets/add-agent-dialog.jpg",
+          "alt": "Add an agent, with Use an agent from another app"
+        },
+        {
+          "asset": "which-agent",
+          "hd_file": "assets/which-agent.png",
+          "fallback_file": "assets/which-agent.jpg",
+          "alt": "Which agent? Dot, Grok Bot, Muse or Other"
+        }
+      ],
+      "since_release": "2026-10-15"
+    },
+    {
+      "id": "teamwork",
+      "title": "Teamwork",
+      "body": [
+        "@-mention any agent in a room to hand it work; it replies in the thread.",
+        "In a room with another agent, type @ in the message box, pick {name} from the Mentions list, and ask:"
+      ],
+      "surface": "room",
+      "screenshot": [
+        {
+          "asset": "mention-list",
+          "hd_file": "assets/mention-list.png",
+          "fallback_file": "assets/mention-list.jpg",
+          "alt": "Typing @ in the message box opens the Mentions list"
+        }
+      ],
+      "since_release": "2026-10-15",
+      "paste": "Research the three best note-taking apps for a small team, then ask another agent in this room to review your answer."
+    },
+    {
+      "id": "calls",
+      "title": "Calls &amp; voice",
+      "body": [
+        "Talk live with {name} in your DM, or with people in any room.",
+        "Press the headphone icon in the room header (Start call). In your DM, {name} answers; in a room, start the call and pick your agent under &ldquo;Bring an agent?&rdquo;."
+      ],
+      "surface": "room",
+      "screenshot": [
+        {
+          "asset": "room-header-call",
+          "hd_file": "assets/room-header-call.png",
+          "fallback_file": "assets/room-header-call.jpg",
+          "alt": "The headphone icon in the room header"
+        }
+      ],
+      "since_release": "2026-10-15",
+      "watches": [
+        "skills/ag2space-voice/"
+      ]
+    },
+    {
+      "id": "apps",
+      "title": "Connect your apps",
+      "body": [
+        "Gmail, Calendar, Drive, Slack and more, so {name} can work with your real data.",
+        "Click your avatar at the bottom left and choose Apps to open Settings &rarr; Apps &rarr; Connected apps, or ask {name} and a Connect button appears:"
+      ],
+      "surface": "dm",
+      "screenshot": [
+        {
+          "asset": "settings-integrations",
+          "hd_file": "assets/settings-integrations.png",
+          "fallback_file": "assets/settings-integrations.jpg",
+          "alt": "Settings → Apps → Connected apps"
+        }
+      ],
+      "since_release": "2026-10-15",
+      "paste": "Connect my Google Calendar.",
+      "watches": [
+        "skills/connect-apps/"
+      ]
+    },
+    {
+      "id": "activity",
+      "title": "Activity &amp; notices",
+      "body": [
+        "The bell at the top of the room list and each room's Activity tab show what needs you and what your agents are working on. The unread badge follows each room's notification setting.",
+        "Try it: open a room's Activity tab while an agent works on something you asked for, then open the room menu (&#8942;), choose Notifications, and pick Mention &amp; Keywords."
+      ],
+      "surface": "room",
+      "screenshot": [
+        {
+          "asset": "room-list-top",
+          "hd_file": "assets/room-list-top.png",
+          "fallback_file": "assets/room-list-top.jpg",
+          "alt": "The bell at the top of the room list"
+        }
+      ],
+      "since_release": "2026-10-15",
+      "watches": [
+        "skills/agent-activity/"
+      ]
+    },
+    {
+      "id": "phone",
+      "title": "Get the mobile app",
+      "body": [
+        "Take your rooms and agents with you: first, put the app on your phone.",
+        "On your phone, search &ldquo;s.space&rdquo; in the App Store (by AG2AI, Inc), or scan this code with your phone&rsquo;s camera. Install the app with this icon and open it. You pair it with this computer in the next step."
+      ],
+      "surface": "mobile",
+      "screenshot": [
+        {
+          "asset": "app-icon",
+          "fallback_file": "assets/app-icon.png",
+          "alt": "The S app icon",
+          "caption": "S"
+        },
+        {
+          "asset": "app-store-qr",
+          "fallback_file": "assets/app-store-qr.png",
+          "alt": "QR code that opens the app in the App Store",
+          "caption": "Scan with your phone"
+        }
+      ],
+      "since_release": "2026-10-30",
+      "link": {
+        "href": "https://apps.apple.com/us/app/s-space/id6788541784",
+        "text": "Open in the App Store"
+      }
+    },
+    {
+      "id": "mobile",
+      "title": "Mobile",
+      "body": [
+        "The same rooms and agents on your phone.",
+        "Click your avatar at the bottom left to open your account menu (User, Agent, Apps, Appearance, Mobile pairing, Notifications, Plan &amp; usage), choose Mobile pairing, press Enable, and scan the code with the mobile app on your phone."
+      ],
+      "surface": "mobile",
+      "screenshot": [
+        {
+          "asset": "mobile-pairing",
+          "hd_file": "assets/mobile-pairing.png",
+          "fallback_file": "assets/mobile-pairing.jpg",
+          "alt": "Settings: Mobile pairing, with Enable"
+        }
+      ],
+      "since_release": "2026-10-15"
+    }
+  ]
+}

@@ -79,7 +79,7 @@ class Harness:
         self.logs: list[str] = []
         self.refuse_thread_400 = refuse_thread_400
 
-        def fake_req(method, path, payload=None, timeout=None):
+        def fake_req(method, path, payload=None, timeout=None, **_kw):
             self.calls.append((method, path, payload))
             if path == "/v1/agents":
                 return {"agents": [{"id": AGENT, "owner": "@o:example.org",

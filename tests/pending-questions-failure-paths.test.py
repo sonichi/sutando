@@ -304,7 +304,7 @@ class TestAdapterLookupsAndMarks(rdb._Ws):
 
     def test_a_link_is_a_convenience_never_a_precondition(self):
         with mock.patch.dict(sys.modules, {"room_collab": None}):
-            self.assertIsNone(adapter._db_link(self.ws / "skills" / "room-collab" / "scripts", "!r:x", ""))
+            self.assertIsNone(adapter.db_link("!r:x", "pendingq"))
 
     def test_reconcile_pass_without_a_store_or_with_a_failing_one_is_an_error_not_a_raise(self):
         rec = adapter.reconcile_pass(Path(tempfile.mkdtemp()), environ={})

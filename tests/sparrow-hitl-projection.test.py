@@ -15,11 +15,14 @@ records nothing so the next pulse retries it.
 """
 from __future__ import annotations
 
+import io
 import os
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest import mock
 
 from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
 
@@ -157,6 +160,156 @@ class ProjectHitl(unittest.TestCase):
             self.assertEqual(len(self.calls), 1)
         finally:
             B._monorepo_src = saved
+
+
+class OneRefusedCard(unittest.TestCase):
+    """One card the relay refuses (a 4xx) never holds back the cards after it in the store's scan
+    order, and is retried a bounded number of times before it is marked failed, said once."""
+
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp())
+        self.posts, self.notices = [], []
+        self._saved = (B._STATE, B.PROACTIVE_ROOM, B._req)
+        B._STATE = self.ws / "state"
+        B.PROACTIVE_ROOM = "!room:example.invalid"
+        B._ROUTING.update(owner_dm="!room:example.invalid", loaded=True, next=B.time.time() + 3600)
+        self.manager = hm.HitlManager(hm.HitlStore(hm.default_store(self.ws)))
+        self.addCleanup(B._hitl_modules()[1]._NO_ACCEPT_SINCE.clear)
+        ids = sorted(self.manager.create(hs.HumanRequirement(
+            kind="choice", runtime="claude", message=f"card {g}", guard=g,
+            actions=[hs.Action(id="ok", kind="answer", label="OK")])).id for g in ("g1", "g2"))
+        self.bad, self.good = ids  # the refused card sorts first: it is scanned before the other
+        B._req = self._send
+        B._hitl_backoff_reset()
+
+    def tearDown(self):
+        B._STATE, B.PROACTIVE_ROOM, B._req = self._saved
+        B._ROUTING.update(owner_dm="", loaded=False, next=0.0)
+        B._hitl_backoff_reset()
+
+    def _send(self, method, path, payload=None, timeout=None):
+        if hs.WIRE_FIELD not in payload["extra_content"]:
+            self.notices.append((payload["extra_content"][hs.NOTICE_FIELD]["notice"], payload["body"]))
+            return {"ok": True, "event_id": f"$n{len(self.notices)}"}
+        card = payload["extra_content"][hs.WIRE_FIELD]["id"]
+        self.posts.append(card)
+        if card == self.bad:
+            raise urllib.error.HTTPError("https://example.invalid/relay/v1/room", 400, "Bad Request", None,
+                                         io.BytesIO(b'{"error": "invalid edit: bad content"}'))
+        return {"ok": True, "event_id": f"$ev{len(self.posts)}"}
+
+    def _pass(self, logs):
+        try:
+            B._project_hitl(log=logs.append)
+        except urllib.error.HTTPError:
+            pass  # the pre-fix driver re-raised into the worker; what was sent is what is checked
+
+    def test_the_next_card_still_projects_in_the_same_pass(self):
+        self._pass([])
+        self.assertEqual(self.posts, [self.bad, self.good])
+        self.assertFalse(self.manager.needs_projection(self.good), "the second card was projected")
+        self.assertTrue(self.manager.needs_projection(self.bad), "the refused one recorded nothing")
+        self.assertEqual(B._HITL_BACKOFF["delay"], 0.0, "one card's refusal is not a relay-wide backoff")
+
+    def test_the_refused_card_stops_after_the_bound_and_is_said_once(self):
+        bound = getattr(B._hitl_modules()[1], "PROJECTION_MAX_REFUSALS", 5)
+        logs = []
+        for _ in range(bound * 3):
+            B._hitl_backoff_reset()
+            later = 10 ** 7 * (len(self.posts) + 1)
+            with mock.patch("time.time", return_value=B.time.time() + later), \
+                    mock.patch("time.monotonic", return_value=B.time.monotonic() + later):
+                self._pass(logs)
+        # Charged at once beside the accepted card; one uncharged try opens the grace.
+        self.assertEqual(self.posts.count(self.bad), bound + 1)
+        self.assertEqual(self.posts.count(self.good), 1)
+        self.assertEqual([n for n, _ in self.notices], ["failed"], "the owner is told once")
+        self.assertIn(self.manager.get(self.bad).message, self.notices[0][1])
+        failed = [line for line in logs if "could not be projected" in line]
+        self.assertEqual(len(failed), 1, logs)
+        self.assertIn(self.bad, failed[0])
+        self.assertIn("HTTP 400", failed[0])
+        self.assertIn("invalid edit: bad content", failed[0], "the relay's own reason reaches the log")
+
+
+class EndpointWideRefusal(OneRefusedCard):
+    """A relay that refuses every card with one status is the relay's fault for a grace period:
+    the driver backs off relay-wide and no card is charged; past it, each card is charged."""
+
+    def setUp(self):
+        super().setUp()
+        projector = B._hitl_modules()[1]
+        for state in (projector._RETRY_DEADLINES, projector._NO_ACCEPT_SINCE):
+            self.addCleanup(state.clear)
+
+    def _send(self, method, path, payload=None, timeout=None):
+        self.posts.append(payload["extra_content"].get(hs.WIRE_FIELD, {}).get("id", "notice"))
+        body = b'{"error": "bad request", "request_id": "r%d"}' % len(self.posts)
+        raise urllib.error.HTTPError("https://example.invalid/relay/v1/room", 400, "Bad Request", None,
+                                     io.BytesIO(body))
+
+    def test_every_card_refused_backs_off_and_fails_none(self):
+        logs = []
+        for i in range(B._hitl_modules()[1].PROJECTION_MAX_REFUSALS * 3):
+            B._HITL_BACKOFF["until"] = 0.0  # let each pulse through, keep the delay
+            later = 10 * (i + 1)
+            with mock.patch("time.time", return_value=B.time.time() + later), \
+                    mock.patch("time.monotonic", return_value=B.time.monotonic() + later):
+                with self.assertRaises(urllib.error.HTTPError):
+                    B._project_hitl(log=logs.append)
+            self.assertGreater(B._HITL_BACKOFF["delay"], 0.0, "the relay-wide backoff engages")
+        for card in (self.bad, self.good):
+            self.assertFalse(self.manager.projection_failed(card))
+            self.assertNotIn("refusals", self.manager.store.projection(card))
+        self.assertFalse([line for line in logs if "could not be projected" in line], logs)
+
+    def test_past_the_grace_a_defect_both_cards_share_ends_in_failed(self):
+        projector = B._hitl_modules()[1]
+        logs = []
+        for i in range(projector.PROJECTION_MAX_REFUSALS + 1):
+            B._HITL_BACKOFF["until"] = 0.0
+            later = 10 ** 7 * (i + 1)
+            with mock.patch("time.time", return_value=B.time.time() + later), \
+                    mock.patch("time.monotonic", return_value=B.time.monotonic() + later):
+                with self.assertRaises(urllib.error.HTTPError):
+                    B._project_hitl(log=logs.append)
+        for card in (self.bad, self.good):
+            self.assertTrue(self.manager.projection_failed(card))
+        self.assertEqual(len([line for line in logs if "could not be projected" in line]), 2, logs)
+
+    test_the_next_card_still_projects_in_the_same_pass = None
+    test_the_refused_card_stops_after_the_bound_and_is_said_once = None
+
+
+class LoneRefusedCard(OneRefusedCard):
+    """The only card owed, refused: the first refusal opens the grace uncharged, later ones are
+    charged toward the bound while the driver backs off; once failed and announced, it idles."""
+
+    def setUp(self):
+        super().setUp()
+        self.manager.cancel(self.good)
+        self.manager.record_projection(self.good, 99, "$x")
+
+    def test_it_is_charged_backed_off_then_failed_and_the_driver_idles(self):
+        bound = B._hitl_modules()[1].PROJECTION_MAX_REFUSALS
+        logs = []
+        for i in range(bound + 1):
+            B._HITL_BACKOFF["until"] = 0.0
+            later = 10 ** 7 * (i + 1)
+            with mock.patch("time.time", return_value=B.time.time() + later), \
+                    mock.patch("time.monotonic", return_value=B.time.monotonic() + later):
+                with self.assertRaises(urllib.error.HTTPError):
+                    B._project_hitl(log=logs.append)
+            self.assertGreater(B._HITL_BACKOFF["delay"], 0.0)
+        self.assertTrue(self.manager.projection_failed(self.bad))
+        self.assertEqual(len([line for line in logs if "could not be projected" in line]), 1, logs)
+        self.assertEqual([n for n, _ in self.notices], ["failed"])
+        B._HITL_BACKOFF["until"] = 0.0
+        self.assertEqual(B._project_hitl(log=logs.append), 0)
+        self.assertEqual(B._HITL_BACKOFF["delay"], 0.0, "nothing owed: the backoff clears")
+
+    test_the_next_card_still_projects_in_the_same_pass = None
+    test_the_refused_card_stops_after_the_bound_and_is_said_once = None
 
 
 if __name__ == "__main__":

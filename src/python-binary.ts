@@ -133,7 +133,12 @@ const SYSTEM_BIN = '/usr/bin';
  * symlink cannot be read, which errs toward treating it as the stub — the safe
  * direction, since the stub is what must be gated.
  */
-export function isSystemStubPath(p: string): boolean {
+export function isSystemStubPath(p: string, platform: string = process.platform): boolean {
+	// The stub exists only on macOS. On Linux `/usr/bin/python3` is the
+	// distribution's real interpreter and `xcode-select` does not exist, so
+	// gating it there returned null on every CI runner ("no python3 to run
+	// the attachment policy" in the upload-media suite).
+	if (platform !== 'darwin') return false;
 	try {
 		return dirname(realpathSync(p)) === SYSTEM_BIN;
 	} catch {

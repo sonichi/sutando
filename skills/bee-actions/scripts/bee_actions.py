@@ -47,8 +47,9 @@ if none is registered and an owner is known (--invite / BEE_ROOM_OWNER), the
 room is auto-registered first: a private room with just the owner invited —
 effectively a DM thread — created via gateway op:create and persisted, so the
 user never has to register by hand. `register-room --room` records a room the
-user picked instead. Gateway creds via the shared contract (GATEWAY_TOKEN >
-RELAY_TOKEN > REMOTE_TASK_TOKEN > AG2_REMOTE_TOKEN; combined url|secret ok).
+user picked instead. Gateway creds: with several connections, the one serving the
+room's server (the primary for a new room); otherwise the shared contract
+(GATEWAY_TOKEN > RELAY_TOKEN > REMOTE_TASK_TOKEN > AG2_REMOTE_TOKEN; combined url|secret ok).
 
 Output is JSON on stdout (machine-readable for the calling agent); errors exit
 non-zero with a one-line reason on stderr.
@@ -92,14 +93,24 @@ def _cfg(args, attr: str, key: str) -> str:
     return ""
 
 
-def _gateway_creds() -> "tuple[str, dict] | None":
-    """(base_url, headers) for the ag2space gateway, or None if unconfigured."""
+def _gateway_creds(room: "str | None" = None) -> "tuple[str, dict] | None":
+    """(base_url, headers) for the ag2space gateway, or None if unconfigured. With several
+    connections it is the one serving `room`'s server (no room: the primary); RuntimeError
+    when that server has none."""
+    import connections
     from ag2_gateway_credentials import normalize_credentials, resolve_alias_precedence
-    raw, _ = resolve_alias_precedence(
-        os.environ, ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN",
-                     "AG2_REMOTE_TOKEN"))
-    url, _ = resolve_alias_precedence(
-        os.environ, ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
+    try:
+        routed = connections.room_credential(room)
+    except connections.ConnectionsError as e:
+        raise RuntimeError(str(e)) from None
+    if routed is not None:
+        url, raw = routed
+    else:
+        raw, _ = resolve_alias_precedence(
+            os.environ, ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN",
+                         "AG2_REMOTE_TOKEN"))
+        url, _ = resolve_alias_precedence(
+            os.environ, ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
     creds = normalize_credentials(raw, explicit_url=url,
                                   source="resolved" if raw else "none")
     if not (creds.base_url and creds.token):
@@ -219,7 +230,10 @@ def main() -> int:
     # Room verbs talk to the ag2space gateway, not the Bee API — resolve and
     # return before the Bee-base gate so they work with no Bee config at all.
     if args.verb in ("post-room", "register-room"):
-        gw = _gateway_creds()
+        try:
+            gw = _gateway_creds(_bee_room(args) if args.verb == "post-room" else None)
+        except RuntimeError as e:
+            return _fail(str(e), 2)
         if not gw:
             return _fail("no gateway configured: set GATEWAY_TOKEN / "
                          "REMOTE_TASK_TOKEN (combined url|secret ok)", 2)

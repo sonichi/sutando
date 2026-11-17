@@ -294,8 +294,10 @@ class TestEntrances(unittest.TestCase):
         self._mkchan("discord", env="DISCORD_TOKEN=x",
                      access=json.dumps({"tofuOwner": "u1"}))
         (self.channels / "README.md").write_text("not a channel dir")
+        (self.state / "auth" / "ag2space.json").write_text(
+            json.dumps({"agent_id": "@stand:x"}))
         (self.state / "auth" / "entrance-links.json").write_text(json.dumps([
-            {"provider": "discord", "status": "active",
+            {"provider": "discord", "status": "active", "stand_id": "@stand:x",
              "authorized_by": "@own:x",
              "provider_subject": {"type": "bot_user", "id": "42"},
              "display": {"name": "SutandoBot"},
@@ -581,7 +583,7 @@ class TestAuthorityBoundaries(unittest.TestCase):
         self.assertEqual(row["stand_id"], "@stand-b:x")
         self.assertEqual(row["authorized_by"], "@owner-b:x")
         r = _mk(self.state, self.channels).resolve("discord", "123")
-        self.assertNotEqual(r.get("stand_id"), self.el._enrolled_stand_id(
+        self.assertNotEqual(r.get("stand_id"), self.el.enrolled_stand_id(
             self.state))
 
     def test_cross_stand_revocation_refused(self):
@@ -777,6 +779,187 @@ class TestEnrolledActorFallback(unittest.TestCase):
                 if saved.get(k) is not None:
                     os.environ[k] = saved[k]
 
+
+
+class TestDesktopEnrollment(unittest.TestCase):
+    """A desktop install records its agent only in the gateway's channel .env;
+    stand_id comes from there or the binding, and only when they agree."""
+    ME, OTHER = "@desk:ag2.space", "@teammate:ag2.space"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.state = root / "state"
+        (self.state / "auth").mkdir(parents=True)
+        self.config = root / "config"
+        self.lane = self.config / "channels" / "ag2space"
+        self.lane.mkdir(parents=True)
+        self.environ = {"CLAUDE_CONFIG_DIR": str(self.config)}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _lane_env(self, text, path=None):
+        (path or self.lane / ".env").write_text(text + "REMOTE_TASK_TOKEN=tok-sekret\n")
+
+    def _bind(self, agent_id):
+        (self.state / "auth" / "ag2space.json").write_text(
+            json.dumps({"agent_id": agent_id}))
+
+    def _card(self, environ=None):
+        return IdentityView(self.state, "@me:x",
+                            channels_dir=self.config / "channels",
+                            environ=self.environ if environ is None else environ
+                            ).stand_card()
+
+    def test_lane_env_alone_sets_stand_id(self):
+        self._lane_env(f"AGENT_ID={self.ME}\n")
+        card = self._card()
+        self.assertEqual(card["stand"].get("stand_id"), self.ME)
+        lane = next(c for c in card["channels"] if c["provider"] == "ag2space")
+        self.assertEqual(lane["evidence"].get("subject_evidence"), self.ME)
+        self.assertNotIn("tok-sekret", json.dumps(card))
+
+    def test_lane_env_and_binding_agreeing_set_stand_id(self):
+        self._lane_env(f"AGENT_MXID={self.ME}\n")
+        self._bind(self.ME)
+        self.assertEqual(self._card()["stand"].get("stand_id"), self.ME)
+
+    def test_lane_env_and_binding_disagreeing_set_none(self):
+        self._lane_env(f"AGENT_ID={self.ME}\n")
+        self._bind(self.OTHER)
+        card = self._card()
+        self.assertNotIn("stand_id", card["stand"])
+        lane = next(c for c in card["channels"] if c["provider"] == "ag2space")
+        self.assertNotIn("subject_evidence", lane.get("evidence", {}))
+
+    def test_neither_record_sets_none(self):
+        self.assertNotIn("stand_id", self._card()["stand"])
+        self.assertNotIn("stand_id", self._card(environ={})["stand"])
+
+    def test_disagreeing_keys_in_the_lane_env_set_none(self):
+        self._lane_env(f"AGENT_MXID={self.ME}\nAGENT_ID={self.OTHER}\n")
+        self.assertNotIn("stand_id", self._card()["stand"])
+
+    def test_device_env_disagreeing_with_config_dir_env_sets_none(self):
+        self._lane_env(f"AGENT_ID={self.ME}\n")
+        device = Path(self.tmp.name) / "device.env"
+        self._lane_env(f"AGENT_ID={self.OTHER}\n", device)
+        env = {**self.environ, "AG2_DEVICE_ENV": str(device)}
+        self.assertNotIn("stand_id", self._card(environ=env)["stand"])
+
+    def test_a_refused_lane_file_sets_none(self):
+        self._lane_env(f"AGENT_ID={self.ME}\n")
+        device = Path(self.tmp.name) / "device.env"
+        device.write_bytes(b"AGENT_ID=\xff\xfe\n")
+        env = {**self.environ, "AG2_DEVICE_ENV": str(device)}
+        self.assertNotIn("stand_id", self._card(environ=env)["stand"])
+
+    def test_unreadable_binding_beside_lane_env_sets_none(self):
+        self._lane_env(f"AGENT_ID={self.ME}\n")
+        (self.state / "auth" / "ag2space.json").write_text("{nope")
+        self.assertNotIn("stand_id", self._card()["stand"])
+
+    def test_process_env_identity_is_not_the_install_record(self):
+        env = {"AGENT_MXID": self.ME, "AGENT_ID": self.ME}
+        self.assertNotIn("stand_id", self._card(environ=env)["stand"])
+
+    def test_a_seat_environment_reads_no_stand_id(self):
+        self._lane_env(f"AGENT_ID={self.ME}\n")
+        env = {**self.environ, "AG2_DEVICE_ENV": str(self.lane / ".env"),
+               "REMOTE_TASK_SEAT": "1"}
+        self.assertNotIn("stand_id", self._card(environ=env)["stand"])
+
+    def test_binding_mutations_follow_the_same_resolver(self):
+        import importlib.util as ilu
+        spec = ilu.spec_from_file_location(
+            "entrance_links",
+            Path(__file__).resolve().parent.parent / "src" / "entrance_links.py")
+        el = ilu.module_from_spec(spec)
+        spec.loader.exec_module(el)
+        self._lane_env(f"AGENT_ID={self.ME}\n")
+        self.assertEqual(el.enrolled_stand_id(self.state, self.environ), self.ME)
+        self._bind(self.OTHER)
+        self.assertIsNone(el.enrolled_stand_id(self.state, self.environ))
+
+
+class TestChannelBindingMatchesStand(unittest.TestCase):
+    """A channel is the card's only when its stored link binds it to the
+    card's stand_id; any other link fails closed, never as active."""
+    A, B = "@stand-a:ag2.space", "@stand-b:ag2.space"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = Path(self.tmp.name) / "state"
+        (self.state / "auth").mkdir(parents=True)
+        self.channels = Path(self.tmp.name) / "channels"
+        d = self.channels / "discord"
+        d.mkdir(parents=True)
+        (d / ".env").write_text("DISCORD_TOKEN=x")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _enroll(self, sid):
+        (self.state / "auth" / "ag2space.json").write_text(
+            json.dumps({"agent_id": sid}))
+
+    def _link(self, sid, subject="b-bot"):
+        (self.state / "auth" / "entrance-links.json").write_text(json.dumps([
+            {"provider": "discord", "status": "active", "stand_id": sid,
+             "authorized_by": "@own:x", "display": {"name": subject},
+             "provider_subject": {"type": "bot_user", "id": subject}}]))
+
+    def _discord(self, details=False):
+        card = IdentityView(self.state, "@me:x", channels_dir=self.channels,
+                            environ={}).stand_card(details)
+        return card, next(c for c in card["channels"]
+                          if c["provider"] == "discord")
+
+    def test_link_bound_to_another_stand_is_not_active(self):
+        self._enroll(self.A)
+        self._link(self.B)
+        card, ent = self._discord(details=True)
+        self.assertEqual(card["stand"]["stand_id"], self.A)
+        self.assertEqual(ent["status"], "policy_invalid")
+        self.assertIn("different Stand", ent["policy_error"])
+        for k in ("identity", "stand_binding", "display", "authorized_by"):
+            self.assertNotIn(k, ent)
+        self.assertNotIn("b-bot", json.dumps(card))
+
+    def test_a_link_reports_the_stand_it_records_not_the_cards(self):
+        self._enroll(self.A)
+        self._link(self.B)
+        _card, ent = self._discord()
+        self.assertEqual(ent["stand_id"], self.B)
+        self.assertNotEqual(ent["status"], "active")
+        self._link(self.A, subject="a-bot")
+        self.assertEqual(self._discord()[1]["stand_id"], self.A)
+        self._link("")
+        self.assertNotIn("stand_id", self._discord()[1])
+
+    def test_link_bound_to_this_stand_is_active(self):
+        self._enroll(self.A)
+        self._link(self.A, subject="a-bot")
+        _card, ent = self._discord()
+        self.assertEqual(ent["status"], "active")
+        self.assertEqual(ent["identity"]["id"], "a-bot")
+        self.assertEqual(ent["stand_binding"], "authorized")
+
+    def test_no_stand_id_means_no_active_channel(self):
+        self._link(self.A, subject="a-bot")
+        card, ent = self._discord()
+        self.assertNotIn("stand_id", card["stand"])
+        self.assertEqual(ent["status"], "policy_invalid")
+        self.assertIn("unresolved", ent["policy_error"])
+        self.assertNotIn("identity", ent)
+
+    def test_link_without_a_stand_is_not_active(self):
+        self._enroll(self.A)
+        self._link("")
+        _card, ent = self._discord()
+        self.assertNotEqual(ent["status"], "active")
+        self.assertNotIn("identity", ent)
 
 
 class ChannelsIterationSkips(unittest.TestCase):

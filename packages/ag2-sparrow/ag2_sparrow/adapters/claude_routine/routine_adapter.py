@@ -166,7 +166,7 @@ def build_parser():
     ap.add_argument("--allow-non-owner", action="store_true",
                     help="fire tasks from non-owner senders without collaborator access too (guests, and any "
                          "collaborator claim the broker did not attest), at the same routine and connector "
-                         "scope as the owner. Off by default: this routine holds the owner's AG2 Space "
+                         "scope as the owner. Off by default: this routine holds the owner's s.space "
                          "connector, and such a sender is bounded only by the prompt's note otherwise. An "
                          "attested collaborator is not covered by it: see --allow-collaborator.")
     ap.add_argument("--allow-collaborator", action="store_true",

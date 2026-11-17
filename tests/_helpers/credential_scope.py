@@ -105,25 +105,46 @@ def selector_names() -> "frozenset[str]":
                      if n.endswith(SELECTOR_SUFFIXES))
 
 
+def _trie(words) -> str:
+    """One regex matching exactly `words`, factored by shared prefix: a flat alternation of a
+    hundred escaped names costs a try per name at every position of every scanned file."""
+    tree: dict = {}
+    for w in words:
+        node = tree
+        for ch in w:
+            node = node.setdefault(ch, {})
+        node[""] = {}
+    def emit(node) -> str:
+        end = "" in node
+        branches = [re.escape(ch) + emit(sub) for ch, sub in sorted(node.items()) if ch]
+        if not branches:
+            return ""
+        body = branches[0] if len(branches) == 1 else "(?:" + "|".join(branches) + ")"
+        return f"(?:{body})?" if end else body
+    return f"(?:{emit(tree)})"
+
+
 @functools.lru_cache(maxsize=None)
 def _patterns() -> "tuple[re.Pattern, re.Pattern]":
     counts = _name_counts()
-    refs, targets = [], []
+    names, stems, dotted = set(), set(), set()
     for p in credential_modules():
         rel = p.relative_to(REPO)
         # A file name shared by another module is only a reference with its directory.
-        name = p.name if counts.get(p.name, 0) <= 1 else f"{p.parent.name}/{p.name}"
-        refs.append(r"(?<![\w-])" + re.escape(name))
-        targets.append(r"(?<![\w-])" + re.escape(name))
+        names.add(p.name if counts.get(p.name, 0) <= 1 else f"{p.parent.name}/{p.name}")
         if p.stem.isidentifier():
-            stem = re.escape(p.stem)
             if counts.get(p.name, 0) <= 1:
-                refs.append(rf"\bimport\s+{stem}\b|\bfrom\s+{stem}\s+import\b")
-                targets.append(rf"^{stem}$")
+                stems.add(p.stem)
             if rel.parts[0] == "packages":
-                dotted = re.escape(".".join(rel.with_suffix("").parts[2:]))
-                refs.append(rf"\b{dotted}\b")
-                targets.append(rf"(^|\.){dotted}$")
+                dotted.add(".".join(rel.with_suffix("").parts[2:]))
+    refs = [r"(?<![\w-])" + _trie(names)]
+    targets = [r"(?<![\w-])" + _trie(names)]
+    if stems:
+        refs.append(rf"\bimport\s+{_trie(stems)}\b|\bfrom\s+{_trie(stems)}\s+import\b")
+        targets.append(rf"^{_trie(stems)}$")
+    if dotted:
+        refs.append(rf"\b{_trie(dotted)}\b")
+        targets.append(rf"(^|\.){_trie(dotted)}$")
     return re.compile("|".join(refs)), re.compile("|".join(targets))
 
 

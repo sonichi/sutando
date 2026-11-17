@@ -24,12 +24,13 @@ from . import hmac_policy
 from .shape import LOCAL
 
 EXIT_OK, EXIT_REFUSED, EXIT_USAGE, EXIT_PROGRESS = 0, 1, 2, 3
-INTERRUPTED_BODY = ("[AG2 Space] This attempt was interrupted before the session answered; send the request "
+INTERRUPTED_BODY = ("[s.space] This attempt was interrupted before the session answered; send the request "
                     "again if it is still wanted.")
-PROTOCOL_FAILURE = "[AG2 Space] The session's turn ended without a reply (%s); send the request again if still wanted."
+PROTOCOL_FAILURE = "[s.space] The session's turn ended without a reply (%s); send the request again if still wanted."
 ROOT_VAR = "AG2_SPARROW_ROOT"
 CONFIG_DIR_VAR = "AG2_SPARROW_CONFIG_DIR"
 ALLOW_NON_OWNER = "ALLOW_NON_OWNER"
+ALLOW_COLLABORATOR = "ALLOW_COLLABORATOR"
 
 
 # The verbs whose success is a durable progress write: one clears the launcher's alarm.
@@ -113,12 +114,21 @@ def _installed_config(environ=None) -> Path:
     return Path(config_dir) / cm.config_path(LOCAL).name if config_dir else cm.config_path(LOCAL)
 
 
-def allow_non_owner(environ=None) -> bool:
-    """The installed --allow-non-owner, read from the config the pane names; unreadable reads as off."""
+def _installed_flag(key, environ=None) -> bool:
     try:
-        return cm.read_config(_installed_config(environ)).get(ALLOW_NON_OWNER) == "1"
+        return cm.read_config(_installed_config(environ)).get(key) == "1"
     except (OSError, ValueError):
         return False
+
+
+def allow_non_owner(environ=None) -> bool:
+    """The installed --allow-non-owner, read from the config the pane names; unreadable reads as off."""
+    return _installed_flag(ALLOW_NON_OWNER, environ)
+
+
+def allow_collaborator(environ=None) -> bool:
+    """The installed --allow-collaborator, read as allow_non_owner is; unreadable reads as off."""
+    return _installed_flag(ALLOW_COLLABORATOR, environ)
 
 
 def envelope(verdict: str, environ=None, key_seen=None) -> dict:
@@ -133,10 +143,11 @@ def envelope(verdict: str, environ=None, key_seen=None) -> dict:
     return {"verdict": verdict, "mode": hmac_policy.mode(cfg), "submit": submit, "reason": reason, "retry": retry}
 
 
-def admit(root, task_id, allow: bool) -> "tuple[str | None, dict, str]":
+def admit(root, task_id, allow: bool, allow_collab: bool = False) -> "tuple[str | None, dict, str]":
     """(admission, headers, why refused) for tasks/<task_id>.txt through the shared task_io.admission. A
-    file with no access_tier header is malformed (Sparrow's bridge always writes one); a collaborator is
-    served only under --allow-non-owner, like every other non-owner."""
+    file with no access_tier header is malformed (Sparrow's bridge always writes one). As the relay loop
+    does, an attested collaborator is served only under --allow-collaborator, which --allow-non-owner
+    does not imply; any other non-owner only under --allow-non-owner."""
     path = os.path.join(root, "tasks", task_id + ".txt")
     with open(path, encoding="utf-8", errors="replace") as f:
         raw = task_io.attested_headers(f.read()).headers
@@ -144,10 +155,11 @@ def admit(root, task_id, allow: bool) -> "tuple[str | None, dict, str]":
         return None, {}, "malformed: no access_tier header"
     headers, _, _ = task_io.parse_task(path)
     kind = task_io.admission(headers, allow)
-    if kind == "collaborator" and not allow:
+    flag = "--allow-collaborator" if kind == "collaborator" else "--allow-non-owner"
+    if kind == "collaborator" and not allow_collab:
         kind = None
-    why = "" if kind else "sender tier %s (collaborator %s) and --allow-non-owner is off" % (
-        headers["access_tier"], headers["collaborator"])
+    why = "" if kind else "sender tier %s (collaborator %s) and %s is off" % (
+        headers["access_tier"], headers["collaborator"], flag)
     return kind, headers, why
 
 
@@ -306,7 +318,7 @@ def claim(root, task_id) -> dict:
         generation = _generation(root)
         verdict, state = lc.decide(task_id)
         if verdict == "call":
-            kind, headers, why = admit(root, task_id, allow_non_owner())
+            kind, headers, why = admit(root, task_id, allow_non_owner(), allow_collaborator())
             if kind is None:
                 outcome = lc.complete_without_call(task_id, task_io.NON_OWNER_REFUSED, why)
                 raise Refused("%s not admitted (%s); the owner-only refusal is %s" % (task_id, why, outcome))
@@ -426,7 +438,7 @@ def interrupt(root, task_id, detail) -> dict:
             elif phase != lifecycle.SETTLED:
                 verdict, state = lc.decide(task_id)
                 if verdict == "call":
-                    kind, _headers, refusal = admit(root, task_id, allow_non_owner())
+                    kind, _headers, refusal = admit(root, task_id, allow_non_owner(), allow_collaborator())
                     body, reason = (INTERRUPTED_BODY, "intake stopped: %s" % detail) if kind else (
                         task_io.NON_OWNER_REFUSED, refusal)
                     answered = lc.complete_without_call(task_id, body, reason) == "settled"

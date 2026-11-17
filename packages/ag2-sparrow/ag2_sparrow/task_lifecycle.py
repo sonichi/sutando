@@ -613,7 +613,7 @@ class SettledIds:
                 tid = raw.decode("utf-8")
             except UnicodeDecodeError:
                 tid = ""
-            if not local_task_protocol.valid_task_id(tid):
+            if not local_task_protocol.valid_local_task_id(tid):
                 raise LedgerError("%s has a malformed record at byte %d" % (self.path, offset))
             ids.add(tid)
             offset += len(raw) + 1
@@ -658,7 +658,7 @@ class SettledIds:
         and never append after a torn tail. An id already visible but not yet durable is synced, never trusted."""
         if task_id in self.durable:
             return
-        if not local_task_protocol.valid_task_id(task_id):
+        if not local_task_protocol.valid_local_task_id(task_id):
             raise LedgerError("%r is not a task id; not appended to %s" % (task_id, self.path))
         data = (task_id + "\n").encode("utf-8")
         try:

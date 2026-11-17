@@ -311,6 +311,120 @@ with that matcher and command `python3 <deployed path>/native-pim-guard.py`.
 
 Test: `python3 tests/native-pim-guard.test.py`.
 
+## `shell-trap-guard.py`
+
+Catches **Bash commands that fail, or quietly do the wrong thing, on a macOS/zsh
+host** before they run. Three are **blocked** (exit 2, the fix on stderr), each only
+where the host's tool is the BSD one, so a Linux host or a GNU tool first on `PATH` is
+not blocked:
+
+- `timeout ...` when no `timeout` is on the hook's `PATH` or on the user's shell `PATH`
+  (stock macOS has none) and the command does not probe for it (`command -v` / `type` / `which` / `hash timeout`) — use the
+  Bash tool's `timeout` parameter or a Python `subprocess.run(..., timeout=N)`;
+- GNU `sed -i` / `--in-place` with no suffix argument, with `/usr/bin/sed` on macOS —
+  use `sed -i '' ...`;
+- GNU `base64 <file>`, with `/usr/bin/base64` on macOS — use `base64 -i <file>` or
+  `base64 < <file>`.
+
+Two are **warned** (exit 0, JSON `additionalContext`; the call still runs):
+
+- `pgrep -f pat` with no self-exclusion **in its own pipeline** (`[p]at`, `$$`, or a
+  later `| grep -v`): the pattern also matches the shell running the command, so a
+  wait loop sees a finished job as still running. A `grep -v` in another part of a
+  compound command does not count;
+- `for x in $VAR` where `VAR` was assigned from `$(...)` or backticks, when `$SHELL` is
+  zsh: zsh does not word-split it, so the loop runs once over the whole output.
+
+A command named by path (`/opt/homebrew/opt/coreutils/libexec/gnubin/timeout`) is
+judged by that path, not by the hook's `PATH`: it is blocked only when it resolves to
+the BSD tool in `/usr/bin` (so a path `timeout` is never blocked on macOS).
+
+The user's shell `PATH` is what Claude Code's Bash tool sees: its shell snapshot is
+taken from a login `$SHELL` that sources the rc file (`~/.zshrc`, `~/.bashrc`), so the
+hook asks the same shell, `$SHELL -l -c '. ~/.zshrc; printf "$PATH"'` (stdin closed,
+minimal env, 2 s timeout, relative entries dropped). It runs only when the command
+mentions `timeout` and the hook's own `PATH` has none, and the answer (a failure
+included) is cached for 10 minutes in `<workspace>/state/guards/shell_path_cache.json`,
+keyed by `$SHELL`, the hook's `PATH` and the rc files' mtimes
+(`SHELL_TRAP_GUARD_SHELL_PATH_CACHE` overrides the path). With no cache location, or on
+any probe failure, it falls back to the hook's `PATH` alone.
+
+The command is read with the shared `_shell_scan` scanner, so quoted text, comments
+and heredoc bodies are data, not commands.
+
+Each hit is appended to `<workspace>/state/guards/shell_trap_hits.jsonl`
+(`{ts, rule, action, command}`, command cut at 2000 characters so false positives can
+be audited, with values after `--token`/`--password`, `Authorization:`, `Bearer ` and
+`*TOKEN=`/`*KEY=`/`password=` redacted); `SHELL_TRAP_GUARD_LOG` overrides the path. The workspace comes from
+`workspace_default.resolve_workspace` under the configured checkout (`--repo <path>`,
+else `$SUTANDO_REPO_ROOT`); with neither, nothing is logged and the guard still
+decides. `SHELL_TRAP_GUARD_RULES=pgrep_self,timeout` replaces the host-derived rule
+set; `SHELL_TRAP_GUARD_DISABLE=1` turns it off. Fail-OPEN on any internal error.
+
+**Known limits.** Five patterns only; a warning is advice and nothing records whether
+it was followed. A `timeout` that an earlier `brew install coreutils &&` in the same
+command would provide, or one added through a file the rc file sources (its mtime is
+not in the cache key) until the 10-minute cache expires, is still blocked; call it by path or probe for it first. `xargs sed -i` and `find -exec sed -i`
+are not caught.
+
+### Registration
+
+**Auto-registered** for every core session: `session-launch.sh` passes this hook to
+`build-core-settings.mjs` (arg 7, after the native PIM guard), which registers it
+under `PreToolUse` with matcher `Bash` and command `python3 <hook> --repo
+<checkout>`. For a non-core session, add the same entry by hand.
+
+Test: `python3 tests/shell-trap-guard.test.py`.
+
+## `stale-head-post-guard.py`
+
+Blocks **posting a PR review or PR comment against a head that has moved** since it
+was checked. It reads three posting commands:
+
+- `gh api repos/<o>/<r>/pulls/<n>/reviews` with POST (`-X POST` / `--method POST`, or
+  implied by `-f`/`-F`/`--raw-field`/`--field`/`--input`), taking `commit_id` and `body`
+  from the fields (`-F body=@file` reads the file) or from the `--input` JSON;
+- `gh pr review <n|url>` and `gh pr comment <n|url>`, taking the body from
+  `--body`/`-b` or `--body-file`/`-F`.
+
+In the body it looks for a **sha claim**: `at <sha>`, `Reviewed at <sha>`, `head <sha>`
+or `@ <sha>`, where the sha is 7-40 hex characters with at least one digit and one
+letter (so `at 1234567 rows` is not a claim).
+
+When there is a literal hex `commit_id` or a claim, and the repo is named (in the API
+path, `--repo`/`-R`, or a PR URL), it reads the current head with
+`gh api repos/<o>/<r>/pulls/<n> --jq .head.sha` (8 s timeout, once per PR). It **blocks**
+(exit 2, both shas on stderr, "re-read the PR at the new head before posting") when
+`commit_id` is not a prefix of the head, or when a claimed sha is not, unless the body
+also contains the head's short sha (then the old sha is only being referred to).
+
+It **allows**, without reading GitHub, a post with nothing to check or with no repo
+named (it never guesses one from the working directory). A failed or timed-out head
+read allows the post and prints one warning line on stderr.
+
+A `-` argument reads the command's heredoc; a body file that does not exist yet is
+matched to the heredoc that writes it (`cat > f <<EOF ... gh pr comment --body-file f`).
+Relative paths resolve against the hook input's `cwd`.
+
+`SUTANDO_ALLOW_STALE_POST=1` as an unquoted word in the command (`SUTANDO_ALLOW_STALE_POST=1 gh api ...`)
+allows the post. `STALE_HEAD_POST_GUARD_DISABLE=1` turns the hook off, and
+`STALE_HEAD_POST_GUARD_GH` names the `gh` binary used for the head read. The command
+is read with the shared `_shell_scan` scanner. Fail-OPEN on any internal error.
+
+**Known limits.** Only the three commands above; a `commit_id` given as `$VAR` or
+`$(...)` is not checked, and a claim phrased any other way is not seen. A `cd` earlier
+in the command does not move the `cwd` relative paths resolve against. A sha claim
+that names a different PR's head is judged against this PR.
+
+### Registration
+
+**Auto-registered** for every core session: `session-launch.sh` passes this hook to
+`build-core-settings.mjs` (arg 8, after the shell-trap guard), which registers it under
+`PreToolUse` with matcher `Bash` and command `python3 <hook>`. For a non-core session,
+add the same entry by hand.
+
+Test: `python3 tests/stale-head-post-guard.test.py`.
+
 ## `review-authority-guard.py`
 
 Denies a **formal GitHub review** filed from Bash — `gh pr review --approve` /

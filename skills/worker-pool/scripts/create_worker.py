@@ -77,6 +77,10 @@ def preflight(workspace, repo, room: str) -> None:
         raise Refused(f"repo is not a directory: {repo}")
     if room is not None and not str(room).strip():
         raise Refused("--room was given but empty")
+    try:
+        pr.validate_current_roster(workspace)
+    except pr.RosterError as e:
+        raise Refused(str(e)) from e
     if not sw.per_instance_sentinel_supported(repo):
         raise Refused("this checkout writes ONE watcher sentinel for every "
                       "watcher, so a second watcher would erase the core's "

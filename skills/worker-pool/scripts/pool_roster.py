@@ -42,6 +42,8 @@ STATES = ("live", "recovering", "abandoned", "retired")
 MAX_DISPLAY_LABEL_LENGTH = 120
 PROFILE_WORKER_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 RESERVED_DISPLAY_ID_RE = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
+# The file Claude Code reads to recognise a --plugin-dir as a plugin.
+CLAUDE_PLUGIN_MANIFEST = Path(".claude-plugin") / "plugin.json"
 
 
 class RosterError(Exception):
@@ -205,9 +207,11 @@ def targets_for(roster: dict, source: str, requested_worker=None) -> list:
 
 
 def unknown_targets(roster: dict, targets) -> list:
-    """Targets absent from the roster. The router fails such a task by name
-    rather than substituting a reachable recipient."""
-    known = set(roster.get("workers") or {}) | {CORE}
+    """Targets absent from the roster, or retired in it. The router sends such a
+    task to the core rather than substituting another reachable recipient."""
+    workers = roster.get("workers") or {}
+    known = {w for w, row in workers.items()
+             if not (isinstance(row, dict) and row.get("state") == "retired")} | {CORE}
     return [t for t in targets if t not in known]
 
 
@@ -249,6 +253,11 @@ def validate_workers(workers) -> None:
             raise RosterError(f"worker {wid!r} has state {state!r}; expected one of {STATES}")
         if "display_label" in row:
             _validate_display_label(row["display_label"], wid)
+        if "plugin_dirs" in row:
+            dirs = row["plugin_dirs"]
+            if not isinstance(dirs, list) or not all(
+                    isinstance(d, str) and os.path.isabs(d) and "\n" not in d for d in dirs):
+                raise RosterError(f"worker {wid!r} plugin_dirs must be a list of absolute paths")
 
 
 def _validate_display_label(label, worker_id: str) -> str:
@@ -269,7 +278,7 @@ def validate_current_roster(workspace) -> None:
 
 def compile_roster(workspace, workers: dict, bindings=None, version=None,
                    *, worker_label_config_version=None,
-                   worker_label_profile_mxid=None) -> dict:
+                   worker_label_profile_mxid=None, removed=None) -> dict:
     """Build the roster the router reads. Refuses declarations it cannot honour
     rather than emitting a roster that routes somewhere unintended."""
     bindings = dict(bindings if bindings is not None else load_bindings(workspace))
@@ -295,9 +304,12 @@ def compile_roster(workspace, workers: dict, bindings=None, version=None,
     roster = {"version": version if version is not None else int(prev.get("version", 0)) + 1,
               "compiled_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "workers": dict(workers or {}), "bindings": bindings}
-    for field in ("config_version", "worker_label_config_version", "worker_label_profile_mxid"):
+    for field in ("config_version", "worker_label_config_version", "worker_label_profile_mxid",
+                  "removed"):
         if field in prev:
             roster[field] = prev[field]
+    if removed is not None:
+        roster["removed"] = sorted(set(removed))
     if worker_label_profile_mxid is not None:
         if roster.get("worker_label_profile_mxid") != worker_label_profile_mxid:
             roster.pop("worker_label_config_version", None)
@@ -379,8 +391,9 @@ def register_worker(workspace, worker_id: str, label: str, room=None, runtime=No
         publish_task_event_handler(workspace)
         previous = workers.get(worker_id) or {}
         workers[worker_id] = {"state": "live", "label": label or worker_id}
-        if isinstance(previous, dict) and "display_label" in previous:
-            workers[worker_id]["display_label"] = previous["display_label"]
+        for kept in ("display_label", "plugin_dirs"):
+            if isinstance(previous, dict) and kept in previous:
+                workers[worker_id][kept] = previous[kept]
         if runtime:
             workers[worker_id]["runtime"] = str(runtime)
         bindings = dict(load_bindings(workspace))
@@ -389,7 +402,9 @@ def register_worker(workspace, worker_id: str, label: str, room=None, runtime=No
             # The next registration reloads bindings.json, not the roster: a
             # binding held only in the compiled roster is discarded by it.
             save_bindings(workspace, bindings)
-        return compile_roster(workspace, workers, bindings)
+        tombstones = set((_load_existing_roster_strict(workspace) or {}).get("removed") or [])
+        return compile_roster(workspace, workers, bindings,
+                              removed=tombstones - {worker_id} if worker_id in tombstones else None)
 
 
 def bind_room(workspace, room: str, target: str) -> dict:
@@ -521,6 +536,177 @@ def apply_profile_label_overrides(workspace, labels: dict, config_version: int,
         return {"changed": True, "stale": False, "roster_version": updated["version"],
                 "worker_label_config_version": config_version if not pending else previous,
                 "pending_worker_ids": pending}
+
+
+class WorkerBound(RosterError):
+    """Retiring or removing a worker that rooms are still bound to would route
+    those rooms' traffic nowhere the owner chose."""
+
+    def __init__(self, worker_id: str, rooms: list):
+        super().__init__(f"worker {worker_id} is bound to {len(rooms)} room(s): "
+                         f"{', '.join(rooms)}; unbind them first")
+        self.worker_id, self.rooms = worker_id, rooms
+
+
+def rooms_bound_to(bindings: dict, worker_id: str) -> list:
+    return sorted(room for room, t in (bindings or {}).items()
+                  if worker_id in (t if isinstance(t, list) else [t]))
+
+
+def _locked_worker(workspace, target: str):
+    """(roster, workers, worker id) for a mutation already holding `_locked`."""
+    raw = _load_existing_roster_strict(workspace)
+    if raw is None:
+        raise RosterError("no roster; no workers to manage")
+    validate_workers(raw.get("workers"))
+    workers = {w: dict(row) for w, row in (raw.get("workers") or {}).items()}
+    wid = resolve_label(raw, target)
+    if wid == CORE or wid not in workers:
+        raise RosterError(f"{target!r} is not a worker id or label")
+    return raw, workers, wid
+
+
+def admits_deliveries(workspace, worker_id: str) -> bool:
+    """The retirement fence, read fresh from disk apart from any pass's roster snapshot:
+    a retired row, or the tombstone `remove_worker` leaves in `removed`, admits nothing.
+    An absent roster fences nobody; one present but unreadable raises RosterError."""
+    raw = _load_existing_roster_strict(workspace)
+    if raw is None:
+        return True
+    if worker_id in (raw.get("removed") or []):
+        return False
+    row = (raw.get("workers") or {}).get(worker_id)
+    return not (isinstance(row, dict) and row.get("state") == "retired")
+
+
+def set_worker_state(workspace, target: str, state: str, *, unbind: bool = False,
+                     keep_bindings: bool = False) -> "tuple[str, str, dict | None, list]":
+    """Move one worker to `state` under the roster lock. Returns (worker id, old
+    state, roster, unbound rooms), roster None on a no-op. Retiring a bound worker
+    is refused unless `unbind`, which drops its bindings in the same transaction,
+    or `keep_bindings`: the router already sends a retired worker's rooms to the core."""
+    if state not in STATES:
+        raise RosterError(f"state must be one of {STATES}: {state!r}")
+    with _locked(workspace):
+        _, workers, wid = _locked_worker(workspace, target)
+        old = workers[wid].get("state")
+        bindings = dict(load_bindings(workspace))
+        rooms = rooms_bound_to(bindings, wid) if state == "retired" and not keep_bindings else []
+        if old == state and not rooms:
+            return wid, old, None, []
+        if rooms and not unbind:
+            raise WorkerBound(wid, rooms)
+        for room in rooms:
+            bindings.pop(room)
+        if rooms:
+            save_bindings(workspace, bindings)
+        workers[wid]["state"] = state
+        return wid, old, compile_roster(workspace, workers, bindings), rooms
+
+
+def remove_worker(workspace, target: str) -> "tuple[str, dict, dict]":
+    """Drop a retired worker's row from the roster. Its identity records and
+    delivery folder stay on disk as history. Returns (worker id, row, roster)."""
+    with _locked(workspace):
+        _, workers, wid = _locked_worker(workspace, target)
+        row = workers[wid]
+        if row.get("state") != "retired":
+            raise RosterError(f"worker {wid} is {row.get('state')!r}; retire it before removing it")
+        bindings = load_bindings(workspace)
+        if rooms_bound_to(bindings, wid):
+            raise WorkerBound(wid, rooms_bound_to(bindings, wid))
+        del workers[wid]
+        # The tombstone keeps the retirement fence after the row is gone.
+        tombstones = set((_load_existing_roster_strict(workspace) or {}).get("removed") or [])
+        return wid, row, compile_roster(workspace, workers, bindings, removed=tombstones | {wid})
+
+
+PLUGIN_OK, PLUGIN_MISSING, PLUGIN_INVALID, PLUGIN_REDIRECTED = (
+    "ok", "missing", "not a plugin", "redirected")
+
+
+def _has_plugin_manifest(real: str) -> bool:
+    try:
+        m = json.loads((Path(real) / CLAUDE_PLUGIN_MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(m, dict) and isinstance(m.get("name"), str) and bool(m["name"].strip())
+
+
+def plugin_dir_state(recorded: str) -> str:
+    """A recorded dir's state now. `redirected`: its real path is no longer the recorded
+    path itself (a component became a symlink), so it may name a directory nobody approved."""
+    if not os.path.isdir(recorded):
+        return PLUGIN_MISSING
+    if os.path.realpath(recorded) != recorded:
+        return PLUGIN_REDIRECTED
+    return PLUGIN_OK if _has_plugin_manifest(recorded) else PLUGIN_INVALID
+
+
+def claude_plugin_dir(path: str) -> str:
+    """`path` as the absolute real path of a Claude Code plugin directory, or RosterError.
+    A newline is refused because the launcher receives the list newline-separated."""
+    real = os.path.realpath(os.path.expanduser(str(path or "")))
+    if not path or "\n" in real:
+        raise RosterError(f"not a usable plugin directory: {path!r}")
+    if not os.path.isdir(real):
+        raise RosterError(f"{path!r} is not a directory")
+    if not _has_plugin_manifest(real):
+        raise RosterError(f"{path!r} has no readable {CLAUDE_PLUGIN_MANIFEST} naming the plugin; "
+                          "not a Claude plugin")
+    return real
+
+
+def set_worker_plugin_dirs(workspace, target: str, *, add=None, remove=None
+                           ) -> "tuple[str, list, dict | None]":
+    """Record (add) or drop (remove) one extra Claude plugin dir on a worker's row, under the
+    roster lock. Returns (worker id, dirs after, roster), roster None on a no-op."""
+    with _locked(workspace):
+        _, workers, wid = _locked_worker(workspace, target)
+        row = workers[wid]
+        dirs = list(row.get("plugin_dirs") or [])
+        if add is not None:
+            if row.get("runtime") not in (None, "claude"):
+                raise RosterError(f"worker {wid} runs {row.get('runtime')!r}; plugin dirs are Claude-only")
+            real = claude_plugin_dir(add)
+            if real in dirs:
+                return wid, dirs, None
+            dirs.append(real)
+        elif remove is not None:
+            raw = os.path.expanduser(str(remove))
+            gone = {os.path.realpath(raw), os.path.abspath(raw)}
+            if not gone & set(dirs):
+                return wid, dirs, None
+            dirs = [d for d in dirs if d not in gone]
+        else:
+            return wid, dirs, None
+        if dirs:
+            row["plugin_dirs"] = dirs
+        else:
+            row.pop("plugin_dirs", None)
+        return wid, dirs, compile_roster(workspace, workers, load_bindings(workspace))
+
+
+def recorded_plugin_dirs(workspace, worker_id: str) -> list:
+    row = ((load_roster(workspace) or {}).get("workers") or {}).get(worker_id)
+    dirs = row.get("plugin_dirs") if isinstance(row, dict) else None
+    return [d for d in dirs if isinstance(d, str)] if isinstance(dirs, list) else []
+
+
+def worker_plugin_dirs(workspace, worker_id: str, warn=None, skipped=None) -> list:
+    """The recorded plugin dirs a launch of `worker_id` loads, exactly as recorded. One not
+    `ok` now is left out, reported through `warn` and appended to `skipped` as {dir, state}."""
+    out = []
+    for d in recorded_plugin_dirs(workspace, worker_id):
+        state = plugin_dir_state(d)
+        if state == PLUGIN_OK:
+            out.append(d)
+            continue
+        if warn:
+            warn(f"worker {worker_id}: skipping recorded plugin dir {d!r}: {state}")
+        if skipped is not None:
+            skipped.append({"dir": d, "state": state})
+    return out
 
 
 def unbind_room(workspace, room: str) -> dict:

@@ -71,6 +71,28 @@ class Declarations(_Tmp):
         self.assertEqual(skill_roots.declared_script(FIELD, self.engine), (ok / "scripts" / "run.py").resolve())
         self.assertIsNone(skill_roots.declared_script(FIELD, self.ws / "skills"))
 
+    def test_a_declaration_that_cannot_be_resolved_is_skipped_and_the_rest_still_count(self):
+        for name, rel in (("a-nul", "scripts/\x00.py"), ("b-long", "scripts/" + "a" * 5000 + ".py")):
+            d = self.engine / name
+            d.mkdir()
+            (d / "manifest.json").write_text(json.dumps({FIELD: rel}))
+        good = self.engine / "c-good"
+        (good / "scripts").mkdir(parents=True)
+        (good / "scripts" / "x.py").write_text("")
+        (good / "manifest.json").write_text(json.dumps({FIELD: "scripts/x.py"}))
+        self.assertEqual([n for n, _ in skill_roots.declared_scripts(FIELD, self.engine)], ["c-good"])
+
+    def test_suffixes_when_given_are_part_of_the_contract(self):
+        d = self.engine / "s"
+        (d / "scripts").mkdir(parents=True)
+        for f in ("run.txt", "run.py"):
+            (d / "scripts" / f).write_text("")
+        for rel, want in (("scripts/run.txt", []), ("scripts/run.py", ["s"])):
+            (d / "manifest.json").write_text(json.dumps({FIELD: rel}))
+            self.assertEqual([n for n, _ in skill_roots.declared_scripts(FIELD, self.engine, (".py", ".sh"))], want, rel)
+        (d / "manifest.json").write_text(json.dumps({FIELD: "scripts/run.txt"}))
+        self.assertEqual([n for n, _ in skill_roots.declared_scripts(FIELD, self.engine)], ["s"], "no suffixes, no filter")
+
     def test_a_declarer_in_each_root_is_a_conflict_and_the_workspace_one_alone_is_picked(self):
         mine = self.skill(self.ws / "skills", "mine", {FIELD: "scripts/run.py"})
         with mock.patch.object(skill_roots, "REPO_SKILLS", self.engine):
@@ -111,6 +133,21 @@ class Declarations(_Tmp):
             skill_roots.declared_script(FIELD, self.engine)
         self.assertEqual(skill_roots.declared(FIELD, roots=[self.engine]).script, None)
 
+
+
+class ReadManifest(_Tmp):
+    def test_only_a_regular_file_within_the_cap_is_read(self):
+        d = Path(tempfile.mkdtemp(dir=self.tmp))
+        ok, big, folder = d / "ok.json", d / "big.json", d / "dir.json"
+        ok.write_text('{"a": 1}')
+        big.write_text('"' + "x" * skill_roots.MANIFEST_MAX_BYTES + '"')
+        folder.mkdir()
+        self.assertEqual(skill_roots.read_manifest(ok), {"a": 1})
+        self.assertRaises(ValueError, skill_roots.read_manifest, big)
+        self.assertRaises(OSError, skill_roots.read_manifest, folder)
+        if hasattr(os, "mkfifo"):  # opened without waiting for a writer, then refused
+            os.mkfifo(d / "fifo.json")
+            self.assertRaises(OSError, skill_roots.read_manifest, d / "fifo.json")
 
 if __name__ == "__main__":
     unittest.main()

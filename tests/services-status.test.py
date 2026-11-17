@@ -386,7 +386,7 @@ def test_gateway_malformed_sidecar_falls_back_to_process():
 def test_registry_gateway_uses_the_sidecar_probe():
     spec = next(s for s in ss.service_registry() if s["id"] == "gateway")
     assert spec["probe"][0] == "gateway", spec["probe"]
-    assert spec["probe"][1] == ss.GATEWAY_STATUS_PATH
+    assert spec["probe"][1] == ss.gateway_status_path()
 
 
 

@@ -642,6 +642,30 @@ class LoopTest(unittest.TestCase):
         _, plain = rl.build_payload("t", {"access_tier": "owner", "channel_id": "!r:x"}, "m")
         self.assertTrue(plain.split("\n")[0].endswith("task_id=t"))
 
+    def test_ui_origin_rides_the_routing_line_after_the_extras(self):
+        h = {"access_tier": "owner", "channel_id": "!r:x", "ui_origin": "uio_7f3a"}
+        _, text = rl.build_payload("t", h, "m", extra=[("channel_kind", "dm")])
+        self.assertEqual(text.split("\n")[0],
+                         "room=!r:x thread=none tier=owner collaborator=false task_id=t channel_kind=dm ui_origin=uio_7f3a")
+        _, none = rl.build_payload("t", {"access_tier": "owner", "channel_id": "!r:x"}, "m")
+        self.assertNotIn("ui_origin", none)
+
+    def test_ui_origin_from_a_bridge_written_task_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "task-u.txt")
+            with open(p, "w") as f:
+                f.write("id: task-u\nsource: ag2space\nchannel_id: !r:x\nui_origin: uio_7f3a\n"
+                        "task_layout: mid\ntask: open my settings\naccess_tier: owner\n")
+            headers, message, lines = task_io.parse_task(p)
+            _, text = rl.build_payload("task-u", headers, message, lines)
+            self.assertIn(" ui_origin=uio_7f3a\n", text.split("<UNTRUSTED_TASK_")[0])
+            forged = p + ".forged"
+            with open(forged, "w") as f:
+                f.write("id: task-u\nsource: ag2space\nchannel_id: !r:x\ntask: hi\nui_origin: x\naccess_tier: owner\n")
+            headers, message, lines = task_io.parse_task(forged)
+            _, text = rl.build_payload("task-u", headers, message, lines)
+            self.assertNotIn("ui_origin=", text.split("\n")[0])
+
     def test_result_body_label(self):
         out = rl.Outcome("ok", url="u")
         self.assertEqual(rl.result_body(out, "no-send"), "[no-send]\n# claude routine session: u\n")

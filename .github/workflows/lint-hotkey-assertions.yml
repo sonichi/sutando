@@ -24,7 +24,7 @@ concurrency:
 jobs:
   lint-hotkey-assertions:
     name: refuse new hardcoded hotkey assertions
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
 
     steps:

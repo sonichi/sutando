@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import call, Mock, patch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
@@ -27,6 +27,7 @@ def load(name):
 def get(module, path):
     handler = module.Handler.__new__(module.Handler)
     handler.path = path
+    handler.headers = {}  # a request with no Origin or Host, as a local tool sends
     handler.wfile = io.BytesIO()
     handler.send_response = Mock()
     handler.send_header = Mock()
@@ -83,7 +84,8 @@ class HttpProcessProbes(unittest.TestCase):
                     "questions_unavailable": None,
                 })
                 handler.send_header.assert_any_call("Content-Type", "application/json")
-                handler.send_header.assert_any_call("Access-Control-Allow-Origin", "*")
+                self.assertNotIn(call("Access-Control-Allow-Origin", "*"), handler.send_header.call_args_list)
+                handler.send_header.assert_any_call("Vary", "Origin")
 
     def test_missing_process_tools_do_not_abort_either_route(self):
         _, dashboard = get(self.dashboard, "/")

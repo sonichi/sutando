@@ -142,13 +142,29 @@ class InflightAbandonment(unittest.TestCase):
                                         "task-next must wait for task-first's result")
                 self.assertNotIn("dropped", log)
 
+    def _assert_shared_abandonment(self, fn):
+        self.assertEqual(fn.count('"$DISPATCH_PY" head-abandoned'), 1)
+        loop = 'while ! has_result "$filename"; do'
+        self.assertEqual(fn.count(loop), 1)
+        wait_loop = fn.split(loop, 1)[1]
+        self.assertNotIn("[ ! -e", wait_loop, "the abandonment rule must not be re-derived in bash")
+
     def test_both_wait_loops_delegate_to_task_dispatch(self):
         for runtime, cfg in NOTIFIERS.items():
             with self.subTest(runtime=runtime):
                 text = cfg["script"].read_text()
                 fn = _function_text("submit_task_grown" if runtime == "claude" else "submit_task", text)
-                self.assertEqual(fn.count('"$DISPATCH_PY" head-abandoned'), 1)
-                self.assertNotIn("[ ! -e", fn, "the abandonment rule must not be re-derived in bash")
+                self._assert_shared_abandonment(fn)
+
+    def test_contract_rejects_copied_payload_absence_check_inside_wait(self):
+        for runtime, cfg in NOTIFIERS.items():
+            with self.subTest(runtime=runtime):
+                text = cfg["script"].read_text()
+                fn = _function_text("submit_task_grown" if runtime == "claude" else "submit_task", text)
+                loop = 'while ! has_result "$filename"; do'
+                copied = fn.replace(loop, loop + '\n  if [ ! -e "$(task_payload "$filename")" ]; then return 0; fi')
+                with self.assertRaisesRegex(AssertionError, "abandonment rule must not be re-derived"):
+                    self._assert_shared_abandonment(copied)
 
     def test_a_timed_out_wait_is_logged_to_the_notifier_log(self):
         # Payload stays present and no result arrives, so only the timeout can end the wait.

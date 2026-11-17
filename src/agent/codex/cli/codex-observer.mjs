@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Read-only observer of the Codex core: publishes its runtime observation record from the rollout
-// file the core's process holds open. Args: --engine --tmux-socket --session [--workspace].
+// file the core's process holds open. Args: --engine --tmux-socket --session [--workspace] [--seat].
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -8,7 +8,7 @@ import { execFile } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 export const OBSERVER = 'codex-observer';
-export const VERSION = '0.1.0';
+export const VERSION = '0.2.0';
 const TICK_MS = 1000;
 const DISCOVER_EVERY = 10;
 const FLUSH_DELAY_MS = 250;
@@ -20,7 +20,7 @@ const TOOL_OUTPUTS = new Set(['function_call_output', 'custom_tool_call_output',
 
 export function newState() {
   return {phase: 'unknown', motion: 'unknown', condition: 'unknown', reason: null, seq: 0, changedAt: 0,
-    conditionSince: null, lastSuccessAt: null, turnSucceeded: false};
+    conditionSince: null, lastSuccessAt: null, lastCompletedAt: null, turnSucceeded: false, activeTask: null, completedTask: null, failedTask: null};
 }
 
 export function errorReason(error) {
@@ -41,9 +41,56 @@ function epoch(ts, fallback) {
   return Number.isFinite(ms) ? ms / 1000 : fallback;
 }
 
+// The user item has no turn_id: accept it only after the matching start/context pair.
+// Only its exact digest survives; incomplete tails and extra inputs provide no receipt.
+function taskChange(state, line) {
+  const p = line?.payload || {};
+  const at = epoch(line?.timestamp, null);
+  const validId = (id) => typeof id === 'string' && id.length > 0 && id.length <= 128;
+  const clear = {activeTask: null, completedTask: null, failedTask: null};
+  if (line?.type === 'event_msg' && p.type === 'task_started') {
+    return {...clear, activeTask: validId(p.turn_id) && at > 0
+      ? {turnId: p.turn_id, startedAt: at, contextSeen: false} : null};
+  }
+  if (line?.type === 'turn_context') {
+    if (!state.activeTask || p.turn_id !== state.activeTask.turnId) return clear;
+    return {activeTask: {...state.activeTask, contextSeen: true}};
+  }
+  if (line?.type === 'response_item' && p.type === 'message' && p.role === 'user') {
+    const active = state.activeTask;
+    const startupContext = Array.isArray(p.content) && p.content.length === 2 && p.content.every((part) => part?.type === 'input_text'
+      && typeof part.text === 'string') && p.content[0].text.startsWith('# AGENTS.md instructions for ')
+      && p.content[0].text.trimEnd().endsWith('</INSTRUCTIONS>')
+      && p.content[1].text.startsWith('<environment_context>')
+      && p.content[1].text.trimEnd().endsWith('</environment_context>');
+    if (active && !active.contextSeen && !active.startupContextSeen && startupContext && at >= active.startedAt) {
+      return {activeTask: {...active, startupContextSeen: true}};
+    }
+    if (!active?.contextSeen || active.promptSha256 || state.turnSucceeded || !(at >= active.startedAt)
+        || p.content?.length !== 1 || p.content[0]?.type !== 'input_text'
+        || typeof p.content[0].text !== 'string' || !p.content[0].text) return clear;
+    return {completedTask: null, failedTask: null, activeTask: {...active, acceptedAt: at,
+      promptSha256: crypto.createHash('sha256').update(p.content[0].text, 'utf8').digest('hex')}};
+  }
+  if (line?.type === 'event_msg' && p.type === 'turn_aborted') return clear;
+  if (line?.type === 'event_msg' && p.type === 'task_complete') {
+    const active = state.activeTask;
+    if (p.error && active?.promptSha256 && p.turn_id === active.turnId && at >= active.acceptedAt) {
+      return {...clear, failedTask: {turn_id: active.turnId, prompt_sha256: active.promptSha256,
+        accepted_at: active.acceptedAt, completed_at: at,
+        error_kind: p.error.codex_error_info === 'server_overloaded' ? 'server-overloaded' : errorReason(p.error)}};
+    }
+    if (p.error || !state.turnSucceeded || !active?.promptSha256
+        || p.turn_id !== active.turnId || !(at >= active.acceptedAt)) return clear;
+    return {activeTask: null, lastCompletedAt: at, completedTask: {prompt_sha256: active.promptSha256,
+      accepted_at: active.acceptedAt, completed_at: at}};
+  }
+  return null;
+}
+
 // One rollout line -> change, or null. A failure is the error on the turn's completion; it
 // stands until a model output proves a later request completed.
-export function lineChange(state, line) {
+function healthChange(state, line) {
   const p = line?.payload || {};
   if (line?.type === 'event_msg') {
     if (p.type === 'task_started') {
@@ -65,12 +112,53 @@ export function lineChange(state, line) {
   return null;
 }
 
+export function lineChange(state, line) {
+  const health = healthChange(state, line);
+  const task = taskChange(state, line);
+  return health || task ? {...health, ...task} : null;
+}
+
+// A Codex tool call as the tool vocabulary phase_line.rules_phase reads, or null for no tool call.
+// The input never leaves this machine: phase_line takes the phase from it and stores no text.
+const ASKS = {request_user_input_async: 'AskUserQuestion', send_message: 'SendMessage', followup_task: 'SendMessage',
+  spawn_agent: 'Agent'};
+function argsOf(p) {
+  if (typeof p.arguments !== 'string') return {};
+  try { const a = JSON.parse(p.arguments); return a && typeof a === 'object' && !Array.isArray(a) ? a : {}; } catch { return {}; }
+}
+export function toolStep(p) {
+  if (!p || !TOOL_CALLS.has(p.type)) return null;
+  if (p.type === 'web_search_call') return {tool: 'WebSearch', input: {}};
+  if (p.type === 'mcp_tool_call') return {tool: `mcp__codex__${p.name || 'tool'}`, input: argsOf(p)};
+  const name = p.name || '';
+  if (name === 'apply_patch') return {tool: 'Edit', input: {}};
+  if (name === 'sleep' || name === 'wait') return {tool: 'Monitor', input: {}};
+  if (ASKS[name]) return {tool: ASKS[name], input: {}};
+  const a = argsOf(p);
+  const cmd = typeof p.input === 'string' ? p.input
+    : Array.isArray(a.command) ? a.command.join(' ') : typeof a.command === 'string' ? a.command
+    : typeof a.cmd === 'string' ? a.cmd : '';
+  return {tool: 'Bash', input: {command: cmd}};
+}
+
+// The task a tool call opens: the last `tasks/task-….txt` its text names (never a result's path).
+const TASK_PATH = /(?:^|[\/"'\s])tasks\/(task-[A-Za-z0-9_~.-]{1,120})\.txt/g;
+export function taskTouched(p) {
+  const text = typeof p?.input === 'string' ? p.input : typeof p?.arguments === 'string' ? p.arguments : '';
+  let id = null;
+  for (const m of text.matchAll(TASK_PATH)) id = m[1];
+  return id;
+}
+
 // Applies a change at `at` (epoch s); true when the record changed.
 export function apply(state, change, at) {
   if (!change) return false;
   let changed = false;
   if (change.success) { state.lastSuccessAt = at; changed = true; }
   if ('turnSucceeded' in change) state.turnSucceeded = change.turnSucceeded;
+  for (const key of ['activeTask', 'completedTask', 'failedTask', 'lastCompletedAt']) {
+    if (key in change) { state[key] = change[key]; changed = true; }
+  }
   const was = {condition: state.condition, reason: state.reason};
   for (const key of ['phase', 'motion', 'condition', 'reason']) {
     if (change[key] !== undefined && change[key] !== state[key]) { state[key] = change[key]; state.changedAt = at; changed = true; }
@@ -87,8 +175,14 @@ export function apply(state, change, at) {
 
 export function buildRecord(state, ident, now) {
   return {
+    ...(state.lastCompletedAt ? {last_completed_at: state.lastCompletedAt} : {}),
+    ...(state.completedTask && ident.coreIncarnation
+      ? {completed_task: {...state.completedTask, core_incarnation: ident.coreIncarnation}} : {}),
+    ...(state.failedTask && state.phase === 'failed' && state.condition === 'abnormal' && ident.coreIncarnation
+      ? {failed_task: {...state.failedTask, core_incarnation: ident.coreIncarnation}} : {}),
+    ...(ident.coreIncarnation ? {core_incarnation: ident.coreIncarnation} : {}),
     schema: 1, observer: OBSERVER, observer_version: VERSION, observer_id: ident.observerId,
-    observer_started_at: ident.startedAt, seat: 'core', session: ident.session, claude_session_id: null,
+    observer_started_at: ident.startedAt, seat: ident.seat || 'core', session: ident.session, claude_session_id: null,
     seq: state.seq, changed_at: state.changedAt || ident.startedAt, condition_since: state.conditionSince,
     last_success_at: state.lastSuccessAt, heartbeat_at: now, phase: state.phase, motion: state.motion,
     condition: state.condition, reason: state.condition === 'abnormal' ? (state.reason || 'api-error') : null,
@@ -99,7 +193,7 @@ export function buildRecord(state, ident, now) {
 // rollouts name a parent; an unreadable one could be top-level, so it is as ambiguous as a second.
 export function pickRollout(metas) {
   if (metas.some((m) => !m)) return null;
-  const top = metas.filter((m) => !m.parent_thread_id && !m.agent_path);
+  const top = metas.filter((m) => !m.parent_thread_id && !m.agent_path && !m.subagent);
   return top.length === 1 ? top[0].path : null;
 }
 
@@ -130,8 +224,11 @@ export class Observer {
     this.ticks = 0;
     this.gone = 0;
     this.misses = 0;
-    this.ident = {observerId: crypto.randomBytes(8).toString('hex'), startedAt: deps.now(), session: opts.session};
+    this.ident = {observerId: crypto.randomBytes(8).toString('hex'), startedAt: deps.now(), session: opts.session,
+      seat: opts.seat || 'core'};
     this.dirty = false;
+    this.bound = [];
+    this.steps = [];
     this.timer = null;
     this.inFlight = false;
     this.python = '';
@@ -148,6 +245,11 @@ export class Observer {
       return false;
     }
     this.gone = 0;
+    const incarnation = this.deps.coreIncarnation ? await this.deps.coreIncarnation(panePid) : '';
+    if (incarnation !== this.ident.coreIncarnation) {
+      this.select(null);
+      this.ident.coreIncarnation = incarnation;
+    }
     const paths = await this.deps.openRollouts(panePid);
     // Only the open files' classification is kept; an unreadable session_meta is retried.
     const kept = new Map();
@@ -155,7 +257,7 @@ export class Observer {
       let kind = this.metas.get(p);
       if (!kind) {
         const meta = await this.deps.readMeta(p);
-        if (meta) kind = {parent_thread_id: meta.parent_thread_id || null, agent_path: meta.agent_path || null};
+        if (meta) kind = {parent_thread_id: meta.parent_thread_id || null, agent_path: meta.agent_path || null, subagent: Boolean(meta.source?.subagent)};
       }
       if (kind) kept.set(p, kind);
     }
@@ -176,8 +278,11 @@ export class Observer {
     if (!file) return;
     const {text, size} = this.deps.readTail(file, TAIL_BYTES);
     this.offset = size;
-    // A tail read can start mid-line; that fragment fails to parse and is skipped.
-    this.feed(text);
+    // A tail read can start mid-line; that fragment fails to parse and is skipped. History binds
+    // the task the core is on but records no step: its steps happened before this observer.
+    this.bound = [];
+    this.steps = [];
+    this.feed(text, true);
     this.markDirty();
   }
 
@@ -189,7 +294,7 @@ export class Observer {
     this.feed(chunk.text);
   }
 
-  feed(text) {
+  feed(text, history = false) {
     const lines = (this.rest + text).split('\n');
     this.rest = lines.pop();
     let changed = false;
@@ -197,8 +302,24 @@ export class Observer {
       let line;
       try { line = JSON.parse(raw); } catch { continue; }
       changed = apply(this.state, lineChange(this.state, line), epoch(line.timestamp, this.deps.now())) || changed;
+      if (line?.type !== 'response_item') continue;
+      // As the Claude hook binds: the first touch of an OPEN task file, never a later mention.
+      const touched = taskTouched(line.payload);
+      if (touched && !this.bound.includes(touched) && this.deps.taskOpen(touched)) this.bound.push(touched);
+      const step = toolStep(line.payload);
+      const task = step && this.currentTask();
+      if (step && task && !history) { this.steps.push({task, ...step}); changed = true; }
     }
     if (changed) this.markDirty();
+  }
+
+  // The newest bound task still open: a finished task's steps fall back to the one before it.
+  currentTask() {
+    for (let i = this.bound.length - 1; i >= 0; i--) {
+      if (this.deps.taskOpen(this.bound[i])) return this.bound[i];
+      this.bound.splice(i, 1);
+    }
+    return null;
   }
 
   async tick() {
@@ -225,6 +346,8 @@ export class Observer {
       this.python ||= await this.deps.resolvePython();
       if (!this.python) return;
       await this.deps.write(this.python, buildRecord(this.state, this.ident, this.deps.now()));
+      const steps = this.steps.splice(0);
+      if (steps.length && this.deps.steps) await this.deps.steps(this.python, steps);
     } catch {
       // The record is best effort; its lease lapses into "no opinion".
     } finally {
@@ -242,7 +365,10 @@ export function parseArgs(argv) {
     out[key] = argv[i + 1];
   }
   for (const key of ['engine', 'tmux-socket', 'session']) if (!out[key]) throw new Error(`missing --${key}`);
-  return {engine: out.engine, tmuxSocket: out['tmux-socket'], session: out.session, workspace: out.workspace || ''};
+  // The seat the record is written for: the core, or a pool worker by its 32-hex id.
+  const seat = out.seat || 'core';
+  if (!/^(core|[0-9a-f]{32})$/.test(seat)) throw new Error('bad --seat');
+  return {engine: out.engine, tmuxSocket: out['tmux-socket'], session: out.session, workspace: out.workspace || '', seat};
 }
 
 // partialOk: exit 1 with output is a result (lsof exits 1 when one listed pid has gone).
@@ -302,6 +428,10 @@ export function fileDeps(opts, io = fs) {
     after: (ms, fn) => setTimeout(fn, ms),
     panePid: async () => Number(((await run('tmux', ['-S', opts.tmuxSocket, 'list-panes', '-t', `=${opts.session}`,
       '-F', '#{pane_pid}'])) || '').split('\n')[0]) || 0,
+    coreIncarnation: async (panePid) => {
+      const started = await run('env', ['LC_ALL=C', 'TZ=UTC', 'ps', '-o', 'lstart=', '-p', String(panePid)]);
+      return started?.trim() ? `${panePid}:${started.trim().replace(/\s+/g, ' ')}` : '';
+    },
     openRollouts: async (panePid) => {
       return lsofRollouts(descendants(panePid, (await run('ps', ['-A', '-o', 'pid=,ppid='])) || ''));
     },
@@ -324,6 +454,14 @@ export function fileDeps(opts, io = fs) {
       const args = [path.join(opts.engine, 'src', 'runtime_observation.py'), 'write'];
       if (opts.workspace) args.push('--workspace', opts.workspace);
       return run(python, args, JSON.stringify(record));
+    },
+    // Open = its task file exists and no result does; without a workspace every task reads as open.
+    taskOpen: (id) => !opts.workspace || (io.existsSync(path.join(opts.workspace, 'tasks', `${id}.txt`))
+      && !io.existsSync(path.join(opts.workspace, 'results', `${id}.txt`))),
+    steps: (python, steps) => {
+      const args = [path.join(opts.engine, 'skills', 'agent-activity', 'scripts', 'phase_line.py'), 'steps'];
+      if (opts.workspace) args.push('--workspace', opts.workspace);
+      return run(python, args, JSON.stringify(steps));
     },
   };
 }
