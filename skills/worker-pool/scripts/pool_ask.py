@@ -152,13 +152,15 @@ def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
     if rid == sender:
         raise ValueError("that is you")
     task_id = f"task-{secrets.token_hex(9)}"
-    if allow_handoff and skill_config.enabled(HANDOFF_FLAG, MANIFEST):
-        ph = _sibling("pool_handoff")
+    ph = _sibling("pool_handoff")
+    own = rid != pr.CORE and ph.own_dirs(ws, rid)
+    if allow_handoff and (own or skill_config.enabled(HANDOFF_FLAG, MANIFEST)):
         route = ph.route_for(ws, rid, sender=sender, core=pr.CORE, tier=tier,
                              relayed_from=relayed_from, parent_task=parent_task)
         if route is not None:
             return handoff_ask(ws, route, task_id, rid, sender, question, wait_s=wait_s, runner=runner)
-    tasks = ws / "tasks"
+    # Only a supervision probe (no hand-off allowed) reaches an own-dir worker here: into its own inbox.
+    tasks = _own_tasks_dir(ws, rid) if own else ws / "tasks"
     tasks.mkdir(parents=True, exist_ok=True)
     tmp = tasks / f".{task_id}.txt.tmp"
     tmp.write_text(compose(task_id, rid, question, sender=sender, wait=wait_s > 0, tier=tier,
@@ -172,7 +174,7 @@ def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
         label = handoffs.label_for("pool", to, verified=(row or {}).get("label"))
         out["handoff_id"] = handoffs.open_handoff(ws, parent_task, "pool", task_id, label,
                                                   holds=True, parent_generation=parent_generation)
-    if rid != pr.CORE:
+    if rid != pr.CORE and not own:
         # Routed here as well as by the watcher's own pass: the router is idempotent,
         # so whichever runs second reports `already` and delivers nothing twice.
         task = {"id": task_id, "source": SOURCE, "requested_worker": rid}
@@ -180,6 +182,11 @@ def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
     if wait_s > 0:
         out["reply"] = wait_for_reply(ws, task_id, wait_s, sleep=sleep)
     return out
+
+
+def _own_tasks_dir(ws: Path, worker: str) -> Path:
+    import connections
+    return connections.worker_dirs(worker, ws)[0]
 
 
 def handoff_ask(ws: Path, route: dict, task_id: str, rid: str, sender: str, question: str, *,

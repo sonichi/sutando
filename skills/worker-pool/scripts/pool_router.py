@@ -274,6 +274,20 @@ def _attribute(workspace, recipient: str, task_id: str) -> None:
         pa.record(workspace, task_id, recipient)
 
 
+def own_dir_workers(workspace, targets) -> list:
+    """The targets that keep their own task folders (`connections.worker_dirs`): their inbox is their
+    own lane's, so the router never delivers to them."""
+    import connections
+    return [t for t in targets if t != pr.CORE and connections.worker_dirs(t, Path(workspace)) is not None]
+
+
+def without_own_dir_workers(workspace, targets) -> list:
+    """`targets` less the own-dir workers; the core when none is left."""
+    own = own_dir_workers(workspace, targets)
+    kept = [t for t in targets if t not in own]
+    return kept if kept or not own else [pr.CORE]
+
+
 def route(workspace, task: dict, roster=FROM_DISK, _between_suffix_checks=None, _arbitration_seams=None,
           payload=None, renotify=False) -> dict:
     """One task through one pass.
@@ -313,6 +327,7 @@ def route(workspace, task: dict, roster=FROM_DISK, _between_suffix_checks=None, 
             unknown = pr.unknown_targets(r, targets)
             if unknown:
                 targets = [pr.CORE]
+            targets = without_own_dir_workers(workspace, targets)
 
         # Liveness is not consulted: a durable sentinel is found by a worker that starts later.
         # "no-payload" stays its own list: folded into `already` a refusal reads as delivered.

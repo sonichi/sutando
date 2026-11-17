@@ -5,7 +5,9 @@ the worker answers in that message's thread, and the core's gateway delivers the
 
 Off unless the worker-pool manifest's WORKER_POOL_SSPACE_HANDOFF is on (CLI > env > manifest). Then
 `route_for` answers a route only for an ask from the core, at team tier, to a worker whose identity
-row is enabled; every other ask keeps `deliveries/<worker>/`. The room transport is the CLI at
+row is enabled; every other ask keeps `deliveries/<worker>/`. A worker on its own task folders
+(`connections.worker_dirs`) has no `deliveries/` path: the core's team-tier ask to it always takes this
+route, flag or not, and any other ask to it is refused. The room transport is the CLI at
 WORKER_POOL_HANDOFF_ROOM_CLI (the consult skill's `mention` verb), run as a subprocess.
 
 A hand-off arrives at the worker as a message from the core's agent, at the tier the room gives
@@ -51,18 +53,31 @@ def _rows(workspace):
     return connections.read_rows(Path(workspace))
 
 
+def own_dirs(workspace, worker: str) -> bool:
+    """Whether `worker` keeps its own task folders (`connections.worker_dirs`)."""
+    import connections
+    return connections.worker_dirs(worker, Path(workspace)) is not None
+
+
 def route_for(workspace, worker: str, *, sender: str, core: str, tier: str = "team",
               relayed_from=None, parent_task=None, environ=None, rows=None) -> "dict | None":
     """The s.space route for this ask, or None for the folder path. Raises HandoffError when the
-    worker has its own identity but the hand-off cannot be addressed: never a silent fallback."""
-    if not enabled(environ):
+    worker has its own identity but the hand-off cannot be addressed: never a silent fallback. A worker
+    on its own folders (`own_dirs`) has no folder path, so it is asked this way or refused."""
+    own = own_dirs(workspace, worker) if worker != core else False
+    if not own and not enabled(environ):
         return None
     # Only the core delegates this way; relayed or parent-held asks keep the folder's tier and hold.
     if sender != core or worker == core or tier != "team" or relayed_from is not None or parent_task:
+        if own:
+            raise HandoffError(f"worker {worker} keeps its own folders, so only the core's own team-tier "
+                               "ask reaches it (over s.space); this ask cannot")
         return None
     rows = _rows(workspace) if rows is None else rows
     mine = next((r for r in rows if r.get("worker") == worker), None)
     if mine is None or mine.get("disabled") or mine.get("parked"):
+        if own:
+            raise HandoffError(f"worker {worker} keeps its own folders but its identity row is not enabled")
         return None
     to_agent = str(mine.get("agent_mxid") or "")
     server = str(mine.get("server") or "").lower()

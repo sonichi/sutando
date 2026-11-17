@@ -125,6 +125,10 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     # binding, a name never created -- is the core's, which is a real recipient.
     if targets == [pr.CORE] or pr.unknown_targets(roster, targets):
         return DECLINE, targets, roster
+    # A worker on its own folders is reached through its own agent, never routed to.
+    targets = rt.without_own_dir_workers(workspace, targets)
+    if targets == [pr.CORE]:
+        return DECLINE, targets, roster
     # Liveness is deliberately NOT asked: the sentinel is durable, so a worker
     # that starts later finds its work.
     return 0, targets, roster
