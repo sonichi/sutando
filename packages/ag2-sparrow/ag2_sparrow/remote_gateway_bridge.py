@@ -10893,22 +10893,13 @@ LOCK_LOST_EXIT_CODE = 70
 _EXIT_HOOKS_BOUND_S = 30.0
 
 
-def _force_exit(code: int) -> None:
-    line = (f"[remote-gateway-bridge] exit {code} still pending after {_EXIT_HOOKS_BOUND_S:g}s "
-            "(an exit hook or shutdown is hung) — forcing it\n")
-    for flush in (lambda: os.write(2, line.encode()), sys.stdout.flush, sys.stderr.flush):
-        try:
-            flush()
-        except Exception:  # noqa: BLE001 — nothing may stand between this and the exit
-            pass
-    os._exit(code)
-
-
 def _exit_bounded(code: int) -> None:
     """sys.exit(code), but no hung exit hook or interpreter shutdown can hold the process open."""
-    t = threading.Timer(_EXIT_HOOKS_BOUND_S, _force_exit, args=(code,))
+    # The deadline does no I/O: a full output pipe must not block the forced exit.
+    t = threading.Timer(_EXIT_HOOKS_BOUND_S, os._exit, args=(code,))
     t.daemon = True
     t.start()
+    _log(f"exiting {code}; forced after {_EXIT_HOOKS_BOUND_S:g}s if an exit hook or shutdown hangs")
     sys.exit(code)
 
 
