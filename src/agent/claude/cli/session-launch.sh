@@ -309,15 +309,23 @@ resolve_claude_settings_args() {
   if [ -z "$OBS_ENDPOINT" ]; then
     echo "obs hooks: not registered (no export endpoint — set SUTANDO_OBS_ENDPOINT to enable capture)"
   else
-    OBS_JSON="$(node "$REPO/src/observability/claude/hooks/build-hook-settings.mjs" "$REPO/src/observability/claude/hooks/obs-hook.sh")"
-    if [ -n "$OBS_JSON" ]; then
+    local _rc=0
+    OBS_JSON="$(node "$REPO/src/observability/claude/hooks/build-hook-settings.mjs" "$REPO/src/observability/claude/hooks/obs-hook.sh")" || _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+      OBS_JSON=""
+      echo "obs hooks: settings builder failed (exit $_rc) — launch continues without obs capture" >&2
+    elif [ -n "$OBS_JSON" ]; then
       echo "obs hooks: → $OBS_ENDPOINT/ingest/claude-code-hooks (collector)"
     else
       echo "obs hooks: settings build failed — capture disabled this session" >&2
     fi
   fi
-  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py" "$REPO/hooks/shell-trap-guard.py" "$REPO/hooks/stale-head-post-guard.py" "$_stop_hook")"
-  if [ -n "$CLAUDE_SETTINGS_JSON" ]; then
+  local _core_rc=0
+  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py" "$REPO/hooks/shell-trap-guard.py" "$REPO/hooks/stale-head-post-guard.py" "$_stop_hook")" || _core_rc=$?
+  if [ "$_core_rc" -ne 0 ]; then
+    CLAUDE_SETTINGS_JSON=""
+    echo "session hooks: settings builder failed (exit $_core_rc) — launch continues without --settings" >&2
+  elif [ -n "$CLAUDE_SETTINGS_JSON" ]; then
     SETTINGS_ARGS+=(--settings "$CLAUDE_SETTINGS_JSON")
     echo "session hooks: AskUserQuestion guard registered (PreToolUse deny — a headless session can't answer it)"
     if [ -n "$_stop_hook" ]; then echo "session hooks: Stop hook registered (cwd is outside the checkout)"; fi
