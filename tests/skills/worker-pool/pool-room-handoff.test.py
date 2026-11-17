@@ -184,6 +184,18 @@ class HandRoom(Base):
         self.assertIn("not a member", out["why"])
         self.assertIn(ROOM, self.bound())
 
+    def test_a_member_entry_that_is_not_join_is_not_joined(self):
+        for membership in ("invite", "leave"):
+            self.setUp()
+            core = FakeActions({CORE, OWNER}, joins=99)
+            listed = {"result": {"members": [{"user_id": CORE, "display_name": ""},
+                                             {"user_id": AGENT, "display_name": "", "membership": membership}]}}
+            core.read = lambda *a: core.calls.append(("read",)) or listed
+            out = self.hand(core)
+            self.assertEqual(out["status"], "waiting", membership)
+            self.assertNotIn("room.leave", [c[0] for c in core.calls], "the core stays")
+            self.assertEqual((self.bound()[ROOM], self.bound()[LEGACY]), (W, W), "binding kept")
+
     def test_a_failed_core_read_is_never_taken_as_the_core_having_left(self):
         limited = {"is_error": True, "message": "rate limited"}
         for worker_side, core_agent in ((FakeActions({AGENT, CORE, OWNER}, me=AGENT), CORE),

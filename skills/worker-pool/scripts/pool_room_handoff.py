@@ -57,7 +57,9 @@ def joined(actions, room: str) -> "tuple[Optional[set], str]":
     members = pp.find(env, "members")
     if env.get("is_error") or not isinstance(members, list):
         return None, _said(env)
-    return {str(m.get("user_id")) for m in members if isinstance(m, dict) and m.get("user_id")}, ""
+    # The Action lists joined members only; an entry naming another membership is still not counted.
+    return {str(m.get("user_id")) for m in members if isinstance(m, dict) and m.get("user_id")
+            and m.get("membership", "join") == "join"}, ""
 
 
 def operation_id(verb: str, worker: str, agent: str, room: str) -> str:
