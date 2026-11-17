@@ -20,6 +20,7 @@ worker, and posts nothing proactively. Retiring the worker (pool_manage retire) 
     python3 pool_identity.py [--workspace WS] retire-remote <worker> [--local-anyway]
     python3 pool_identity.py [--workspace WS] card-reply --task-file PATH
     python3 pool_identity.py [--workspace WS] rooms <worker>
+    python3 pool_identity.py [--workspace WS] worked <worker>
     python3 pool_identity.py [--workspace WS] hand-room <worker> --room ROOM [--wait SECONDS]
     python3 pool_identity.py [--workspace WS] join-room <worker> --room ROOM [--wait SECONDS]
 

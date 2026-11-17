@@ -54,7 +54,7 @@ class FakeActions:
         self.members, self.me, self.joins, self.read_error = set(members), me, joins, read_error
         self.invite = invite if invite is not None else {"result": {"invited": True, "expected_admission": "admitted"}}
         self.leave = leave if leave is not None else {"result": {}}
-        self.calls, self.invited = [], ""
+        self.calls, self.invited, self.ops, self.invites = [], "", {}, []
 
     def read(self, action, arguments, room_id):
         self.calls.append(("read", action, room_id))
@@ -67,8 +67,21 @@ class FakeActions:
         self.joins -= 1
         return {"result": {"members": [{"user_id": m, "display_name": ""} for m in sorted(self.members)]}}
 
+    def read_account(self, action, arguments):
+        self.calls.append(("read_account", action))
+        if isinstance(self.invites, Exception):
+            raise self.invites
+        return self.invites if isinstance(self.invites, dict) else \
+            {"result": {"invites": [{"room_id": r} for r in self.invites]}}
+
     def execute(self, action, arguments, *, operation_id="", room_id=""):
         self.calls.append((action, operation_id, room_id))
+        if operation_id in self.ops:
+            return self.ops[operation_id]  # the server deduplicates an operation id: no second effect
+        self.ops[operation_id] = self._act(action, arguments)
+        return self.ops[operation_id]
+
+    def _act(self, action, arguments):
         if action == "room.member.invite":
             if pp.approval_state(self.invite) == "done" and pp.find(self.invite, "invited") is not False:
                 self.invited = arguments["user_id"]
@@ -92,11 +105,12 @@ class Base(unittest.TestCase):
         ident = mock.patch.object(connections, "worker_identity", lambda w, ws=None: dict(self.row) if w == W else None)
         ident.start()
         self.addCleanup(ident.stop)
-        self.clock = [0.0]
+        self.clock, self.wall = [0.0], [1_000_000.0]
 
     def hand(self, core, room=ROOM, *, worker=None, **kw):
         kw.setdefault("as_worker", lambda: worker or FakeActions(set(), me=AGENT, read_error={"is_error": True}))
         kw.setdefault("core_agent", CORE)
+        kw.setdefault("wall", lambda: self.wall[0])
         return rh.hand_room(W, room, workspace=self.ws, actions=core, server="s.space", sleep=self.sleep,
                             clock=lambda: self.clock[0], **kw)
 
@@ -183,6 +197,104 @@ class HandRoom(Base):
         self.assertEqual(out["status"], "failed")
         self.assertIn("not a member", out["why"])
         self.assertIn(ROOM, self.bound())
+
+    def invite_ids(self, core):
+        return [int(c[1].rsplit("-", 1)[1]) for c in core.calls if c[0] == "room.member.invite"]
+
+    def test_a_sent_invitation_moves_on_only_once_the_agent_no_longer_holds_it(self):
+        core = FakeActions({CORE, OWNER}, joins=10 ** 6)
+        worker_side = FakeActions(set(), me=AGENT)
+        worker_side.invites = [ROOM]
+        for _ in range(2):
+            self.assertEqual(self.hand(core, worker=worker_side)["status"], "waiting")
+        for unreadable in ({"is_error": True, "message": "rate limited"}, pp.ProvisionError("http 502")):
+            worker_side.invites = unreadable
+            self.assertEqual(self.hand(core, worker=worker_side)["status"], "waiting")
+        self.wall[0] += 10 ** 6
+        self.assertEqual(self.invite_ids(core), [0, 0, 0, 0], "held, or not known to be gone: the same operation")
+        core.invited, core.joins, worker_side.invites = "", 0, []  # declined: the agent holds no invitation
+        self.assertEqual(self.hand(core, worker=worker_side)["status"], "handed")
+        self.assertEqual(self.invite_ids(core)[-1], 1)
+
+    def test_an_error_or_held_answer_keeps_the_operation_id(self):
+        for answer in ({"is_error": True, "message": "upstream unavailable"},
+                       {"is_error": True, "details": {"reason": "mint_failed"}},
+                       {"is_error": True, "status": "approval_required"},
+                       {"status": "approval_required", "approval_id": "ap"}):
+            self.setUp()
+            core = FakeActions({CORE}, invite=answer)
+            self.hand(core)
+            self.hand(core)
+            self.assertEqual(self.invite_ids(core), [0, 0], answer)
+            self.setUp()
+            core = FakeActions({CORE, AGENT}, leave=answer)
+            self.hand(core)
+            core.ops.clear()
+            self.hand(core)
+            self.assertEqual({c[1] for c in core.calls if c[0] == "room.leave"},
+                             {rh.operation_id("leave", W, AGENT, ROOM, 0)}, answer)
+            self.assertIn(ROOM, self.bound())
+
+    def test_a_definite_no_moves_to_a_new_operation_id(self):
+        for answer in ({"result": {"invited": False, "reason": "declines"}}, {"status": "denied"}):
+            self.setUp()
+            core = FakeActions({CORE}, invite=answer)
+            self.assertEqual(self.hand(core)["status"], "skipped")
+            core.invite, core.joins = {"result": {"invited": True}}, 0
+            self.assertEqual(self.hand(core)["status"], "handed", answer)
+            self.assertEqual(self.invite_ids(core), [0, 1])
+
+    def test_an_account_read_names_no_room(self):
+        acts = pp.Actions("https://gw", "tok", None, [])
+        with mock.patch.object(acts, "tool", return_value={"result": {}}) as tool:
+            acts.read_account("room.invites.list", {})
+        tool.assert_called_once_with("room.action.read", {"action": "room.invites.list", "target_kind": "account",
+                                                          "arguments": {}})
+
+    def test_records_for_other_rooms_made_at_once_all_survive(self):
+        import threading
+        import time as _time
+        real = rh._attempts
+
+        def slow(ws, worker):
+            data = real(ws, worker)
+            _time.sleep(0.01)
+            return data
+        with mock.patch.object(rh, "_attempts", slow):
+            threads = [threading.Thread(target=rh.record_attempt, args=(self.ws, W, f"!r{i}:s.space", "invite", 0,
+                                                                         "sent", 1.0)) for i in range(12)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual(sorted(rh._attempts(self.ws, W)), sorted(f"!r{i}:s.space" for i in range(12)))
+
+    def test_a_later_hand_off_never_reuses_an_earlier_leave(self):
+        core = FakeActions({CORE, AGENT})
+        self.assertEqual(self.hand(core)["status"], "handed")
+        pr.bind_room(self.ws, ROOM, W)
+        core.members = {CORE, AGENT}  # the core was added to the room again
+        out = self.hand(core)
+        self.assertEqual((out["status"], out["core_left"]), ("handed", True))
+        leaves = [c[1] for c in core.calls if c[0] == "room.leave"]
+        self.assertEqual(leaves, [rh.operation_id("leave", W, AGENT, ROOM, n) for n in (0, 1)])
+        self.assertNotIn(CORE, core.members, "the second leave acted")
+
+    def test_a_held_leave_keeps_its_operation_id(self):
+        core = FakeActions({CORE, AGENT}, leave={"status": "approval_required", "approval_id": "ap"})
+        self.assertEqual(self.hand(core)["status"], "waiting")
+        core.ops.clear()
+        core.leave = {"result": {}}
+        self.wall[0] += 10 ** 6
+        self.assertEqual(self.hand(core)["status"], "handed")
+        self.assertEqual({c[1] for c in core.calls if c[0] == "room.leave"}, {rh.operation_id("leave", W, AGENT, ROOM, 0)})
+
+    def test_an_unreadable_attempts_record_starts_again_at_zero(self):
+        path = rh._attempts_path(self.ws, W)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for text in ("{torn", "[]"):
+            path.write_text(text)
+            self.assertEqual(rh.attempt(self.ws, W, ROOM, "invite"), 0)
 
     def test_a_member_entry_that_is_not_join_is_not_joined(self):
         for membership in ("invite", "leave"):
@@ -285,7 +397,8 @@ class WorkedRooms(Base):
                              (FakeActions(set(), read_error={"is_error": True, "message": "not a member"}), "skipped"),
                              (FakeActions(set(), read_error=pp.ProvisionError("http 502")), "failed")):
             out = rh.join_room(W, "!rev:s.space", workspace=self.ws, actions=core, server="s.space",
-                               sleep=self.sleep, clock=lambda: self.clock[0])
+                               sleep=self.sleep, clock=lambda: self.clock[0],
+                               as_worker=lambda: FakeActions(set(), me=AGENT))
             self.assertEqual(out["status"], status, out)
         self.row["disabled"] = True
         self.assertEqual(rh.join_room(W, "!rev:s.space", workspace=self.ws, actions=FakeActions({CORE}))["status"],

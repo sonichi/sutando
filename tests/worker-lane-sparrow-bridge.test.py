@@ -558,13 +558,14 @@ class Status(Base):
 
     def test_the_declared_bridge_under_sparrowd_holds_the_lease(self):
         decl = self.declare()
-        procs = self.bridge_procs(decl)
+        co = self.checkout("opt-co")
+        procs = {k: (pp, age, cmd.replace("/opt/co", str(co))) for k, (pp, age, cmd) in self.bridge_procs(decl).items()}
         with mock.patch.object(C, "bridge_pid", return_value=11):
             rc, out = self.status(procs)
         self.assertEqual(rc, 0)
         self.assertEqual((out["declared"], out["lease_pid"], out["held_by"], out["instance"], out["agent"]),
                          (True, 11, "declared-bridge", self.row["instance"], WORKER_AGENT))
-        self.assertEqual([(s["pid"], s["agent_bridges"], s["checkout"]) for s in out["sparrowd"]], [(10, True, "/opt/co")])
+        self.assertEqual([(s["pid"], s["agent_bridges"], s["checkout"]) for s in out["sparrowd"]], [(10, True, str(co))])
 
     def test_any_other_holder_is_other_and_no_holder_is_none(self):
         decl = self.declare()
@@ -600,23 +601,61 @@ class Status(Base):
             self.assertEqual(worker_lane.main(["status", "--worker", W], workspace=self.ws, procs={}), 1)
         self.assertEqual(json.loads(out.getvalue())["why"], "torn")
 
-    def test_sparrowd_runs_says_whether_its_checkout_takes_worker_declarations(self):
-        import tempfile
-        co = Path(tempfile.mkdtemp(dir=self.ws))
-        (co / "src").mkdir()
+    def checkout(self, name):
+        co = self.ws / name / "engine"
+        (co / "src").mkdir(parents=True)
         (co / "src" / "sparrowd.py").write_text("")
-        procs = {5: (1, 100, f"python3 {co}/src/sparrowd.py --agent-bridges"), 6: (1, 1, "python3 src/sparrowd.py"),
-                 7: (1, 1, "vim notes.txt"), 8: (1, 1, "sh -c 'unbalanced")}
-        runs = {r["pid"]: r for r in worker_lane.sparrowd_runs(procs, now=10_000.0)}
-        self.assertEqual(sorted(runs), [5, 6])
-        self.assertEqual((runs[5]["serves_workers"], runs[6]["serves_workers"], runs[6]["checkout"]), (False, False, ""))
-        (co / "src" / "worker_lane.py").write_text(f"WRITTEN_BY = {worker_lane.WRITTEN_BY!r}\n")
-        self.assertFalse(worker_lane.sparrowd_runs(procs)[0]["serves_workers"], "no agent bridge beside it")
-        (co / "src" / "sparrow_agent_bridge.py").write_text("import worker_lane\n")
-        os.utime(co / "src" / "sparrow_agent_bridge.py", (9_950.0, 9_950.0))
-        run = worker_lane.sparrowd_runs(procs, now=10_000.0)[0]
-        self.assertEqual((run["serves_workers"], run["code_changed_since_start"], run["checkout"]), (True, True, str(co)))
-        self.assertFalse(worker_lane.sparrowd_runs(procs, now=10_100.0)[0]["code_changed_since_start"])
+        return co
+
+    def test_sparrowd_runs_says_whether_its_checkout_takes_worker_declarations(self):
+        for root in ("opt-co", "Library/Application Support/Desk App"):
+            co = self.checkout(root)
+            procs = {5: (1, 100, f"python3 {co}/src/sparrowd.py --agent-bridges"),
+                     6: (1, 1, "python3 src/sparrowd.py"), 7: (1, 1, "vim notes.txt"),
+                     8: (1, 1, f"python3 {co}/src/sparrowd.py.bak --agent-bridges")}
+            runs = {r["pid"]: r for r in worker_lane.sparrowd_runs(procs, now=10_000.0)}
+            self.assertEqual(sorted(runs), [5, 6], root)
+            self.assertEqual((runs[5]["checkout"], runs[5]["agent_bridges"], runs[5]["serves_workers"]),
+                             (str(co), True, False), root)
+            self.assertEqual((runs[6]["checkout"], runs[6]["agent_bridges"], runs[6]["serves_workers"]), ("", False, False))
+            (co / "src" / "sparrow_agent_bridge.py").write_text("WRITTEN_BY = 'x'\nimport worker_lane\n")
+            self.assertFalse(worker_lane.sparrowd_runs(procs)[0]["serves_workers"], "no capability line")
+            (co / "src" / "sparrow_agent_bridge.py").write_text("ACCEPTS_WORKER_DECLARATIONS = 1\n")
+            os.utime(co / "src" / "sparrow_agent_bridge.py", (9_000.0, 9_000.0))
+            run = worker_lane.sparrowd_runs(procs, now=10_000.0)[0]
+            self.assertEqual((run["serves_workers"], run["code_changed_since_start"]), (True, False), root)
+            for rel in worker_lane.LOADED_CODE[1:]:
+                f = co.joinpath(*rel)
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text("")
+                os.utime(f, (9_950.0, 9_950.0))
+                self.assertTrue(worker_lane.sparrowd_runs(procs, now=10_000.0)[0]["code_changed_since_start"], rel)
+                os.utime(f, (9_000.0, 9_000.0))
+
+    def test_the_capability_line_is_this_checkouts_own(self):
+        self.assertEqual(bridge.ACCEPTS_WORKER_DECLARATIONS, 1)
+        text = (ROOT / "src" / "sparrow_agent_bridge.py").read_text()
+        self.assertIsNotNone(worker_lane.CAPABILITY.search(text))
+
+    def test_a_declared_bridge_under_a_spaced_path_is_recognised(self):
+        spaced = self.ws / "Library" / "Application Support" / "Desk App"
+        decl = spaced / "workspace" / "agents" / "seg.bridge" / "worker.json"
+        decl.parent.mkdir(parents=True)
+        decl.write_text("{}")
+        co = self.checkout("Library/Application Support/Desk App/x")
+        procs = {10: (1, 600, f"/usr/bin/python3 {co}/src/sparrowd.py --agent-bridges"),
+                 11: (10, 500, f"/usr/bin/python3 {co}/src/sparrow_agent_bridge.py {decl}"),
+                 12: (10, 500, f"/usr/bin/python3 {co}/src/sparrow_agent_bridge.py {decl}.old"),
+                 13: (10, 500, f"/usr/bin/python3 {co}/src/other.py {decl}"),
+                 14: (1, 500, f"/usr/bin/python3 {co}/src/sparrow_agent_bridge.py {decl}")}
+        self.assertEqual(worker_lane.held_by(11, procs, decl), "declared-bridge")
+        link = self.ws / "link to ws"
+        link.symlink_to(spaced / "workspace")
+        self.assertEqual(worker_lane.held_by(11, procs, link / "agents" / "seg.bridge" / "worker.json"),
+                         "declared-bridge", "the realpath form matches too")
+        for pid in (12, 13, 14):
+            self.assertEqual(worker_lane.held_by(pid, procs, decl), "other", pid)
+        self.assertEqual(worker_lane.sparrowd_runs(procs)[0]["checkout"], str(co))
 
     def test_processes_reads_ps_and_is_empty_when_it_cannot(self):
         listing = "  1     0 10-02:03:04 /sbin/launchd\n 42     1    01:05 python3 x.py --a b\n bad line\n"

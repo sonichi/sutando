@@ -715,8 +715,11 @@ Cutting a worker over:
    holder pid and `held_by`, which is `declared-bridge` only when that pid is the agent bridge for this
    declaration and a sparrowd running `--agent-bridges` is its parent; `other`, `none` or `unknown`
    otherwise. `sparrowd` lists each running sparrowd: whether it runs `--agent-bridges`, whether its
-   checkout's agent bridge accepts a worker declaration (`serves_workers`), and whether that code
-   changed after it started (`code_changed_since_start`: restart it).
+   checkout's agent bridge accepts a worker declaration (`serves_workers`: its
+   `ACCEPTS_WORKER_DECLARATIONS = 1` line), and whether the code it loaded (the agent bridge,
+   `worker_lane.py`, `connect_bridge.py`) changed after it started (`code_changed_since_start`: restart
+   it). Paths are matched against the raw command line, never split into words, so a checkout or
+   workspace under a folder with a space is read correctly.
 4. Check with a live round trip: a message to the worker's agent reaches the worker and its reply
    is posted as that agent.
 
