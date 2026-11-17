@@ -19,6 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from connections import task_home  # noqa: E402
 from delivery.task_dispatch import find_ready_result, ready_result_filenames
 from local_task_protocol import find_archived_task, valid_archive_lookup_id  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
@@ -34,17 +35,23 @@ def task_disposition(workspace, task_id: str, *, unanswered: bool = False) -> st
     `unanswered=True` is a caller that already looked for a result in bulk; the lookup is skipped."""
     if not valid_archive_lookup_id(task_id):
         raise ValueError("not a task id")
-    root = Path(workspace)
-    answered = not unanswered and find_ready_result(root / "results", task_id) is not None
-    return _decide(root / "tasks", task_id, answered)
+    home = task_home(task_id, Path(workspace))
+    answered = not unanswered and find_ready_result(home["results"], task_id) is not None
+    return _decide(home["tasks"], task_id, answered)
 
 
 def task_dispositions(workspace, task_ids) -> dict:
     """`task_disposition` for many ids, results looked up in one bulk pass; invalid ids are left out."""
     root = Path(workspace)
-    ids = sorted({t for t in task_ids if valid_archive_lookup_id(t)})
-    ready = ready_result_filenames(root / "results", [f"{t}.txt" for t in ids])
-    return {t: _decide(root / "tasks", t, f"{t}.txt" in ready) for t in ids}
+    homes: dict = {}
+    for t in sorted({t for t in task_ids if valid_archive_lookup_id(t)}):
+        home = task_home(t, root)
+        homes.setdefault((home["tasks"], home["results"]), []).append(t)
+    out = {}
+    for (tasks, results), ids in homes.items():
+        ready = ready_result_filenames(results, [f"{t}.txt" for t in ids])
+        out.update({t: _decide(tasks, t, f"{t}.txt" in ready) for t in ids})
+    return dict(sorted(out.items()))
 
 
 def _decide(tasks: Path, task_id: str, answered: bool) -> str:

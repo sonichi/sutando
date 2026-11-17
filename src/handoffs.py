@@ -188,9 +188,11 @@ def _child_ready(workspace, h: dict) -> bool:
     if h["path"] != "pool":
         return False
     try:
+        from connections import task_home
         from local_task_protocol import iter_result_candidates
         from delivery.readiness import read_ready_result
-        return any(read_ready_result(p) for p in iter_result_candidates(Path(workspace) / "results", h["child_ref"]))
+        results = task_home(h["child_ref"], Path(workspace))["results"]
+        return any(read_ready_result(p) for p in iter_result_candidates(results, h["child_ref"]))
     except Exception:  # noqa: BLE001 - unknown is open
         return False
 
