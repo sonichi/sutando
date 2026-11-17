@@ -132,21 +132,10 @@ def attributor(worker: str, argv: "list[str]", log):
     return attribute
 
 
-def adopt_stray_proactive(worker: str, shared_results, own_results, log=None) -> "list[str]":
-    """Move the proactive files `worker`'s session stamped (`lane_claims_proactive`) from the shared
-    results/ into its own; returns the names moved. The move never replaces a file: a name already in its
-    folder, or one another consumer took first, is left for a later pass. Without a no-replace rename
-    nothing is moved (a link-then-unlink could delete a file a producer just republished there)."""
+def _adopt(worker: str, shared_results, own_results, names, log) -> "list[str]":
     import undelivered_quarantine
-    from proactive_routing import lane_claims_proactive
     moved = []
-    try:
-        names = sorted(p.name for p in Path(shared_results).glob("proactive-*.txt"))
-    except OSError:
-        return moved
     for name in names:
-        if not worker or not lane_claims_proactive(name, worker):
-            continue
         try:
             Path(own_results).mkdir(parents=True, exist_ok=True)
             undelivered_quarantine.rename_noreplace(Path(shared_results) / name, Path(own_results) / name)
@@ -154,7 +143,7 @@ def adopt_stray_proactive(worker: str, shared_results, own_results, log=None) ->
             if undelivered_quarantine.no_primitive(e):
                 undelivered_quarantine.report_once("worker-lane:adopt", log or (lambda _m: None),
                                                    f"lane for worker {worker}: no no-replace rename on this "
-                                                   "platform; its proactive files in the shared results/ stay there")
+                                                   "platform; its files in the shared results/ stay there")
                 return moved
             continue
         except OSError:
@@ -163,13 +152,44 @@ def adopt_stray_proactive(worker: str, shared_results, own_results, log=None) ->
     return moved
 
 
+def _names(folder, pattern: str) -> "list[str]":
+    try:
+        return sorted(p.name for p in Path(folder).glob(pattern))
+    except OSError:
+        return []
+
+
+def adopt_stray_proactive(worker: str, shared_results, own_results, log=None) -> "list[str]":
+    """Move the proactive files `worker`'s session stamped (`lane_claims_proactive`) from the shared
+    results/ into its own; returns the names moved. The move never replaces a file: a name already in its
+    folder, or one another consumer took first, is left for a later pass. Without a no-replace rename
+    nothing is moved (a link-then-unlink could delete a file a producer just republished there)."""
+    from proactive_routing import lane_claims_proactive
+    if not worker:
+        return []
+    names = [n for n in _names(shared_results, "proactive-*.txt") if lane_claims_proactive(n, worker)]
+    return _adopt(worker, shared_results, own_results, names, log)
+
+
+def adopt_stray_results(worker: str, workspace, own_results, log=None) -> "list[str]":
+    """Move the results of tasks `worker`'s own lane queued (`connections.task_home`) from the shared
+    results/ into its own, as `adopt_stray_proactive` does: a late answer an older session wrote there."""
+    from connections import task_home
+    ws = Path(workspace)
+    if not worker:
+        return []
+    names = [n for n in _names(ws / "results", "task-*.txt") if task_home(Path(n).stem, ws)["worker"] == worker]
+    return _adopt(worker, ws / "results", own_results, names, log)
+
+
 # How often an own-dir bridge looks for its worker's proactive files still landing in the shared results/.
 ADOPT_INTERVAL_S = 10.0
 
 
 def _adopt_loop(worker: str, shared_results, own_results, log, stop, interval_s: float) -> None:
     while True:
-        for name in adopt_stray_proactive(worker, shared_results, own_results, log):
+        for name in adopt_stray_proactive(worker, shared_results, own_results, log) + \
+                adopt_stray_results(worker, Path(shared_results).parent, own_results, log):
             log(f"lane for worker {worker}: moved {name} from the shared results/ to its own")
         if stop.wait(interval_s):
             return
@@ -220,9 +240,9 @@ def lane_dirs(workspace, instance: str) -> "tuple[Path, Path, bool]":
     """(tasks dir, results dir, own) a lane `instance` runs on: its worker's own folders when that worker
     has them (`connections.worker_dirs`), else the workspace's shared tasks/ and results/. Paths are
     lexical under `workspace` as given; resolve both sides before comparing with a recorded realpath."""
-    from connections import lane_worker, worker_dirs
+    from connections import ensure_worker_dirs, lane_worker
     ws = Path(workspace)
-    own = worker_dirs(lane_worker(instance, ws), ws) if instance else None
+    own = ensure_worker_dirs(lane_worker(instance, ws), ws) if instance else None
     return (own[0], own[1], True) if own else (ws / "tasks", ws / "results", False)
 
 

@@ -92,6 +92,33 @@ class TheDeclaredBridgesDirs(Own):
         self.assertEqual(C.worker_agents_dir(self.ws), self.agents)
 
 
+class TheFolderContract(Own):
+    def test_the_agent_root_is_private_and_holds_both_folders(self):
+        import stat
+        self.own.mkdir(parents=True, mode=0o755)
+        os.chmod(self.own, 0o755)
+        worker_lane.lane_dirs(self.ws, self.row["instance"])
+        self.assertEqual(stat.S_IMODE(self.own.stat().st_mode), 0o700)
+        for d in ("tasks/archive", "results/archive"):
+            self.assertTrue((self.own / d).is_dir(), d)
+        self.assertIsNone(C.ensure_worker_dirs(OTHER, self.ws))
+
+    def test_a_second_worker_row_naming_the_agent_refuses_own_folders(self):
+        import json
+        path = C.record_path(self.ws)
+        rec = json.loads(path.read_text())
+        mine = next(r for r in rec["connections"] if r.get("worker") == W)
+        rec["connections"].append(dict(mine, worker=OTHER, instance="alpha-fixture-net-8d811f22",
+                                       token_ref="AG2_REMOTE_TOKEN_TWIN", server="beta-fixture.net"))
+        mine.pop("dirs", None)
+        path.write_text(json.dumps(rec))
+        with self.assertRaises(C.ConnectionsError) as caught:
+            C.set_worker_dirs(W, True, workspace=self.ws)
+        self.assertIn(f"worker {OTHER}'s row also names agent", str(caught.exception))
+        self.assertIsNone(C.worker_dirs(W, self.ws))
+        self.assertNotIn("dirs", C.set_worker_dirs(W, False, workspace=self.ws))
+
+
 class InstallOwn(Own):
     def install(self, handler=True):
         if handler:
@@ -198,6 +225,18 @@ class Adopt(Own):
         self.assertFalse((own / mine).exists())
         self.assertEqual(len(logged), 1)
         self.assertIn("no no-replace rename", logged[0])
+
+    def test_its_lanes_task_results_move_and_others_stay(self):
+        shared, own = self.ws / "results", self.own / "results"
+        shared.mkdir(parents=True, exist_ok=True)
+        lane, core = f"task-{self.row['instance']}~a1.txt", "task-1700000000000.txt"
+        for name in (lane, core, "task-alpha-fixture-net~b2.txt"):
+            (shared / name).write_text("r")
+        self.assertEqual(worker_lane.adopt_stray_results(W, self.ws, own), [lane])
+        self.assertTrue((own / lane).is_file())
+        self.assertEqual(sorted(p.name for p in shared.glob("*.txt")), sorted([core, "task-alpha-fixture-net~b2.txt"]))
+        self.assertEqual(worker_lane.adopt_stray_results("", self.ws, own), [])
+        self.assertEqual(worker_lane.adopt_stray_proactive("", shared, own), [])
 
     def test_the_loop_logs_each_move_and_stops(self):
         shared, own = self.ws / "results", self.own / "results"
