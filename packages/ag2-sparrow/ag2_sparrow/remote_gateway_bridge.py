@@ -2293,6 +2293,9 @@ PROACTIVE_OWN_FILE: Callable[[Path], bool] | None = None
 # Host-injected () -> the worker every task this lane queues is addressed to (`requested_worker`),
 # or "". None (standalone default) leaves each task's field as the gateway sent it.
 TASK_ADDRESSEE: Callable[[], str] | None = None
+# Host-injected (task id, staged file, destination) -> None or a callable run once the file is
+# published; a raise is logged and the task is published. None (standalone default) runs nothing.
+TASK_PRE_PUBLISH: Callable[[str, Path, Path], "Callable[[], None] | None"] | None = None
 # Host-injected () -> the homeserver this lane's connection row names, or "": a secondary lane's
 # relay answer on another server is refused. None (standalone default) checks nothing.
 LANE_SERVER: Callable[[], str] | None = None
@@ -6649,7 +6652,7 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         return None
     if hold:
         return _hold_staged(tid, tmp, task_text, task, sender_tier)
-    if not _publish_staged(tmp, dest):  # atomic publish: never a partial file
+    if not _publish_task(tid, tmp, dest):  # atomic publish: never a partial file
         tmp.unlink(missing_ok=True)
         return None
     _mark_published(tid)
@@ -6956,6 +6959,24 @@ def _mark_published(tid: str) -> None:
     with _ATTEMPTS.transition(_broker_tid(tid)) as t:
         if t.run_published(tid) is False:
             t.mark_published(tid)
+
+
+def _publish_task(tid: str, staged: Path, dest: Path) -> bool:
+    """Publish a served task's staged file into the queue, after TASK_PRE_PUBLISH has seen it."""
+    after = None
+    if TASK_PRE_PUBLISH is not None:
+        try:
+            after = TASK_PRE_PUBLISH(tid, staged, dest)
+        except Exception as exc:  # noqa: BLE001 — a broken hook must never hold a task back
+            _log(f"pre-publish hook failed for {tid}: {diagnostics.describe(exc)}; publishing")
+    if not _publish_staged(staged, dest):
+        return False
+    if callable(after):
+        try:
+            after()
+        except Exception as exc:  # noqa: BLE001 — the task is already published
+            _log(f"post-publish step failed for {tid}: {diagnostics.describe(exc)}")
+    return True
 
 
 def _on_published(tid: str, dest: Path, task_text: str, task: dict, sender_tier: str) -> None:
@@ -7495,7 +7516,7 @@ def _advance_held(tid: str, entry: dict, inflight: "set[str]") -> bool:
     if _staged_tier_withdrawn(tid, staged):
         _end_withdrawn_relay_ask(tid, entry, staged, inflight)
         return False
-    if not _publish_staged(staged, dest):
+    if not _publish_task(tid, staged, dest):
         return False
     _mark_published(tid)
     served = _HELD_TASKS.pop(tid, None)
@@ -8743,6 +8764,8 @@ def _post_proactive() -> None:
             _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
             continue
         dest_room = resolve_destination(CURRENT_ROOM, room_id=room_override) if room_override else resolve_destination(OWNER_PRIVATE)
+        if room_override:
+            body = _guard_proactive_for_room(f.name, claimed_text, body, dest_room)
         thread_root = _proactive_thread_root(claimed_text, f.name)
         about = about_task(f.name)
         if about:
@@ -8751,6 +8774,17 @@ def _post_proactive() -> None:
                     **({"thread_root": thread_root} if thread_root else {}),
                     **({"task_id": about} if about else {})}
         _send_proactive(claim, f, envelope, room_override is None, noticed)
+
+
+def _guard_proactive_for_room(name: str, text: str, body: str, room: str) -> str:
+    """The body a redirected proactive may post in `room`: the shared guard's verdict. No room
+    record states its audience tier, so every room but the owner DM guards as a non-owner one."""
+    _, withheld = team_result_guard.guard_proactive_for_destination(
+        text, room, resolve_destination(OWNER_PRIVATE), "guest", None, secret_filter=filter_chat_secrets)
+    if withheld is None:
+        return body
+    _log(f"[team-guard] withheld proactive {name} for {room}: {withheld}")
+    return team_result_guard.TEAM_LEAK_RESULT
 
 
 def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, noticed: set) -> None:
@@ -11194,6 +11228,7 @@ def main() -> None:
     _outbound_thread = _start_outbound_worker(inflight)
     while True:
         _stamp_loop_progress()
+        polled_ok = False  # a failure after this pass's good poll is not a lost connection
         try:
             if _abort_if_poll_stalled(stall_anchor, lambda: _stop_background_workers(
                     _outbound_thread, _results_watcher)):
@@ -11226,6 +11261,7 @@ def main() -> None:
                             timeout=POLL_WAIT + 10, deadline=time.monotonic() + POLL_WAIT + 10)
                 last_poll_ok = poll_grace_since = time.time()
                 stall_anchor = poll_ok_awake = time.monotonic()
+                polled_ok = True
                 # A completed poll remains evidence even if accepting its tasks fails.
                 _emit_gateway_status(True, poll_ok_ts=last_poll_ok)
             except (TimeoutError, socket.timeout):
@@ -11279,7 +11315,7 @@ def main() -> None:
                 _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}", poll_ok_ts=last_poll_ok)
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
-            _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff, poll_ok_ts=last_poll_ok)
+            _emit_gateway_status(polled_ok, error=f"HTTP {e.code}", backoff_s=backoff, poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except _PollAnomaly:
             # Every anomaly is counted in its line; the log itself thins out a run of them.
@@ -11293,12 +11329,12 @@ def main() -> None:
                  f"{int(time.time() - poll_grace_since)}s since last successful poll"
                  f"{_awake_note(time.time() - poll_grace_since, time.monotonic() - poll_ok_awake)} — "
                  f"backing off {backoff}s")
-            _emit_gateway_status(False, error=f"network: {diagnostics.describe(e)}", backoff_s=backoff,
+            _emit_gateway_status(polled_ok, error=f"network: {diagnostics.describe(e)}", backoff_s=backoff,
                                  poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except Exception as e:  # noqa: BLE001 — keep the loop alive
             _log(f"unexpected: {diagnostics.describe(e)} — backing off {backoff}s")
-            _emit_gateway_status(False, error=f"unexpected: {diagnostics.describe(e)}", backoff_s=backoff,
+            _emit_gateway_status(polled_ok, error=f"unexpected: {diagnostics.describe(e)}", backoff_s=backoff,
                                  poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
 

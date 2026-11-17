@@ -516,10 +516,13 @@ def _worker_lane_claim_gate(worker: str):
 _HANDLER_LOOKUP = _SRC / "agent" / "task-event-handler-lookup.sh"
 
 
-def _lane_route_command() -> str:
-    """The core's task-event handler as this lane's wake command, run on each task it queues, so the
-    worker's delivery is made at once; "" when none is declared (the core's watcher routes it)."""
-    import shlex
+# The router holds task and folder locks; past this the lane publishes and the core's watcher routes.
+_LANE_ROUTE_TIMEOUT_S = 10
+
+
+def _lane_route_argv() -> "list[str]":
+    """The core's declared task-event handler (the pool router) as run from this lane, short of the
+    task's own paths; [] when none is declared (the core's watcher routes the lane's tasks)."""
     import subprocess
     from util_paths import task_event_handler_config_path
     cfg = task_event_handler_config_path(WS / "state")
@@ -527,29 +530,52 @@ def _lane_route_command() -> str:
         out = subprocess.run(["bash", "-c", 'source "$1" && task_event_handler "$2"', "lane-route",
                               str(_HANDLER_LOOKUP), str(cfg)], capture_output=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
-        return ""
+        return []
     handler = os.fsdecode(out.stdout.removesuffix(b"\n"))
     if out.returncode != 0 or not handler:
-        return ""
-    return shlex.join([handler, "--workspace", str(WS), "--results-dir", str(RESULTS_DIR),  # noqa: F821
-                       "--from-lane", "--task-file"])
+        return []
+    return [handler, "--workspace", str(WS), "--results-dir", str(RESULTS_DIR), "--from-lane"]  # noqa: F821
+
+
+def _lane_router(worker: str, argv: "list[str]"):
+    """TASK_PRE_PUBLISH for `worker`'s lane: route the staged task before it reaches `tasks/`, so it is
+    the worker's when it appears and the core's watcher, which never routes a held task, leaves it."""
+    import subprocess
+
+    def run(tid: str, args: "list[str]", step: str) -> "int | None":
+        try:
+            return subprocess.run(argv + args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=_LANE_ROUTE_TIMEOUT_S).returncode
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            _log(f"lane for worker {worker}: {step} {tid} failed ({exc!r})")  # noqa: F821
+            return None
+
+    def route(tid: str, staged: Path, dest: Path):
+        rc = run(tid, ["--task-file", str(dest), "--payload", str(staged)], "routing")
+        if rc is not None and rc != 0:
+            _log(f"lane for worker {worker}: {tid} not delivered to it (router exit {rc}); "  # noqa: F821
+                 "the core's watcher routes it")
+            return None
+        # The worker's watcher may have given up on the sentinel before the payload appeared (a slow or
+        # killed router, or an earlier serve's): once published, its pending sentinel is raised afresh.
+        return lambda: run(tid, ["--task-file", str(dest), "--renotify"], "re-raising")
+    return route
 
 
 def _install_worker_lane(worker: str) -> None:
     """This lane runs as `worker`'s own agent: every task it queues is addressed to that worker and
-    routed by the lane itself (`_lane_route_command`), and the only proactive files it claims and
-    owns are the ones that worker's session wrote."""
-    global TASK_ADDRESSEE, PROACTIVE_CLAIM_GATE, PROACTIVE_OWN_FILE, ON_TASK_CMD
+    routed to it by the lane before it is published (`_lane_router`), and the only proactive files it
+    claims and owns are the ones that worker's session wrote."""
+    global TASK_ADDRESSEE, PROACTIVE_CLAIM_GATE, PROACTIVE_OWN_FILE, TASK_PRE_PUBLISH
     _log(f"lane {GATEWAY_INSTANCE} runs as worker {worker}'s own agent: it delivers its tasks to that worker, "  # noqa: F821
          "and it posts only the proactive files that worker's session writes")
     TASK_ADDRESSEE = lambda: worker  # noqa: E731
     PROACTIVE_CLAIM_GATE = PROACTIVE_OWN_FILE = _worker_lane_claim_gate(worker)
-    if ON_TASK_CMD:  # noqa: F821
-        _log(f"lane for worker {worker} keeps its own REMOTE_TASK_ON_TASK; the core's watcher routes its tasks")  # noqa: F821
-        return
-    ON_TASK_CMD = _lane_route_command()
-    if not ON_TASK_CMD:
+    argv = _lane_route_argv()
+    if not argv:
         _log(f"lane for worker {worker}: no task-event handler is declared; the core's watcher routes its tasks")  # noqa: F821
+        return
+    TASK_PRE_PUBLISH = _lane_router(worker, argv)
 
 
 # Read once: a lane's row names its worker for the life of the process (a change relaunches it).

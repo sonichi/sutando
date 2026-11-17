@@ -371,6 +371,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 ## `src/agent/claude/cli/`
 
 - **`build-core-settings.mjs`** — Build the Claude Code `--settings` JSON for the Sutando core session.
+- **`project-has-stop-hook.mjs`** — Exit 0 when a settings file's hooks.Stop runs `bash <script>` for the same file as <script>, else 1.
 - **`session-launch.sh`** — src/agent/claude/cli/session-launch.sh — shared claude-CLI session launch mechanics, sourced by the core's own launcher and by a pool worker's own launcher (a separate script, outside core/src/).
 - **`start-cli.sh`** — src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core tmux session.
 - **`sutando-shell-setup.sh`** — sutando-shell-setup — configure the `claude-sutando` shell alias.
