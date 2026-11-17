@@ -143,11 +143,16 @@ CORE_WORKER = "core-gateway-bridge"
 
 
 def core_spec(workspace=None, environ=None) -> "tuple[WorkerSpec | None, str]":
-    """The core gateway bridge's worker, or (None, why there is none). Raises when the connections
-    cannot be read: an unknown core, not an absent one."""
+    """The core gateway bridge's worker, or (None, why there is none), with the claim the lane keeper
+    reads updated to match. Raises when the connections cannot be read: an unknown core, not an absent one."""
     import sparrow_core_bridge as core
     ws = workspace or resolve_workspace()
     decision, why = core.decide(ws, os.environ if environ is None else environ, cached=True)
+    try:
+        if core.holds_lock(ws, os.getpid()):  # a sparrowd still waiting for the lock supervises nothing
+            core.write_claim(ws, None if decision is None else str(decision["instance"]))
+    except OSError as e:  # the keeper then just starts the lane; the core still follows its connections
+        print(f"sparrowd: core claim not written ({type(e).__name__}: {e})", file=sys.stderr)
     if decision is None:
         return None, why
     return WorkerSpec(name=CORE_WORKER, argv=[sys.executable, str(CORE_LAUNCHER), f"--expect={decision['instance']}"],

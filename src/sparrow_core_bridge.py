@@ -9,6 +9,10 @@ from `connections.launch_env` — evicts a stray bridge of this checkout under t
 loader in place. One process with the wrapper child's argv, so every probe matching that child matches
 this one. Unlike a declared agent bridge it keeps the host's owner DM, device env and proactive room.
 
+`write_claim` records, from sparrowd's own process, which lane its core serves; `claims` is the lane
+keeper's check, so it leaves that lane to sparrowd while sparrowd is alive (with a grace: see
+`connections.DECLARED_BRIDGE_GRACE_S`).
+
 `revision` is what sparrowd restarts the core on: the decision, the token file's bytes and the row's
 token_ref, gateway URL and agent. An exit 75 (`HOLD_RC`) is the bridge's stand-down; sparrowd holds it
 until that revision changes. A restart is told the previous exit code (SPARROWD_LAST_RC): 69, the
@@ -41,6 +45,8 @@ from workspace_default import resolve_workspace  # noqa: E402
 
 from ag2_sparrow.exit_codes import POLL_STALL_EXIT_CODE  # noqa: E402
 
+import workspace_lock  # noqa: E402
+
 LOADER = _SRC / "remote-gateway-bridge.py"
 LIB = _SRC / "launchd" / "gateway-bridge-lib.sh"
 EVICT = _SRC / "launchd" / "evict-own-bridge.sh"
@@ -49,6 +55,9 @@ POLL_STALL_RC = str(POLL_STALL_EXIT_CODE)
 LAUNCHER_FAILED_RC = 78  # EX_CONFIG: the launcher could not start a bridge; no bridge exited
 LAST_RC_ENV = "SPARROWD_LAST_RC"
 LOG_TAG = "sparrow-core-bridge"
+
+
+CLAIM = "core.json"
 
 
 class CoreUnavailable(Exception):
@@ -139,6 +148,63 @@ def decide(workspace: Path, environ: Mapping[str, str], *,
     if parked:
         return None, "the legacy connection is parked and no named connection is primary"
     return None, "no REMOTE_TASK_TOKEN configured and no named connection is primary"
+
+
+def claim_path(workspace: Path) -> Path:
+    return Path(workspace) / "state" / "sparrowd" / CLAIM
+
+
+def write_claim(workspace: Path, instance: Optional[str], pid: Optional[int] = None) -> None:
+    """Record that the live process `pid` (this one by default) supervises `instance` as its core; None
+    withdraws the claim. Rewritten only when it changes."""
+    path = claim_path(workspace)
+    if instance is None:
+        path.unlink(missing_ok=True)
+        return
+    pid = pid or os.getpid()
+    body = json.dumps({"instance": instance, "pid": pid, "proc_start": workspace_lock.proc_start(pid)},
+                      sort_keys=True)
+    try:
+        if path.read_text(encoding="utf-8") == body:
+            return
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{CLAIM}.{os.getpid()}.tmp")
+    tmp.write_text(body, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def holds_lock(workspace: Path, pid: int) -> bool:
+    """Whether `pid` is the sparrowd holding this workspace's single-instance lock (the holder writes its
+    pid there; one waiting for the lock writes nothing)."""
+    from ag2_sparrow.sparrowd import LOCK_NAME
+    try:
+        return (Path(workspace) / "state" / "sparrowd" / LOCK_NAME).read_text().strip() == str(pid)
+    except OSError:
+        return False
+
+
+def claims(instance: str, workspace: Path) -> bool:
+    """Whether a live sparrowd claims `instance` as its core: the claimed pid holds sparrowd's lock, runs
+    and, when both are known, started when the claim says. A missing or unreadable claim claims nothing."""
+    try:
+        claim = json.loads(claim_path(workspace).read_text(encoding="utf-8"))
+        pid = claim["pid"]
+        if claim["instance"] != instance or isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return False
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    if not holds_lock(workspace, pid):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        pass  # alive under another uid
+    started, now = claim.get("proc_start"), workspace_lock.proc_start(pid)
+    return not (isinstance(started, str) and started and now is not None and not workspace_lock.same_start(started, now))
 
 
 def _row(instance: str, workspace: Path) -> dict:

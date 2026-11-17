@@ -438,6 +438,38 @@ class OneExitCodeOwner(unittest.TestCase):
         self.assertEqual(POLL_STALL_EXIT_CODE, exit_codes.POLL_STALL_EXIT_CODE)
 
 
+class TheCoreClaim(unittest.TestCase):
+    def test_the_spec_scan_keeps_the_claim_in_step_with_its_decision(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            lock = ws / "state" / "sparrowd" / "sparrowd.lock"
+            lock.parent.mkdir(parents=True)
+            lock.write_text(str(os.getppid()))
+            with mock.patch.object(core, "decide", return_value=({"instance": "lane-a"}, "")), \
+                    mock.patch.object(core, "revision", return_value="r"):
+                self.assertIsNotNone(SD.core_spec(ws, {})[0], "a waiting sparrowd still builds its spec")
+            self.assertFalse(core.claim_path(ws).exists(), "but writes no claim: the lock holder's would be lost")
+            lock.write_text(str(os.getpid()))
+            with mock.patch.object(core, "decide", return_value=({"instance": "lane-a"}, "")), \
+                    mock.patch.object(core, "revision", return_value="r"):
+                self.assertEqual(SD.core_spec(ws, {})[0].argv[-1], "--expect=lane-a")
+            self.assertTrue(core.claims("lane-a", ws))
+            with mock.patch.object(core, "decide", return_value=(None, "parked")):
+                SD.core_spec(ws, {})
+            self.assertFalse(core.claim_path(ws).exists(), "nothing to run: nothing claimed")
+
+    def test_a_claim_that_cannot_be_written_never_stops_the_rescan(self):
+        err = io.StringIO()
+        with mock.patch.object(core, "decide", return_value=({"instance": "lane-a"}, "")), \
+                mock.patch.object(core, "write_claim", side_effect=PermissionError("read-only state")), \
+                mock.patch.object(core, "holds_lock", return_value=True), \
+                mock.patch.object(core, "revision", side_effect=["r1", "r2"]), contextlib.redirect_stderr(err):
+            scan = SD.CoreScan(Path("/ws"))
+            self.assertEqual([s.revision for s in scan()] + [s.revision for s in scan()], ["r1", "r2"],
+                             "a rotation still restarts the core")
+        self.assertIn("core claim not written (PermissionError: read-only state)", err.getvalue())
+
+
 class TheCoreScan(unittest.TestCase):
     def test_it_keeps_the_last_core_while_unreadable_and_says_each_reason_once(self):
         spec = SD.WorkerSpec(name=SD.CORE_WORKER, argv=["py"])
