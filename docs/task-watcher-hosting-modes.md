@@ -69,6 +69,20 @@ did).
    `Monitor` expired), arm again. The supervisor is the recovery owner; its pid does not change
    across handoffs.
 
+The supervisor holds a lease keyed by the tmux socket and session, including while in standby.
+Lease publication and cleanup are serialized by a persistent `.guard` file using Python's
+`fcntl` module. The guard file is not removed: replacing its inode would let contenders lock
+different files. Cleanup checks the observed lease generation before removing known metadata;
+a failed or late publisher must leave a successor's lease intact.
+
+A notifier that exits quickly is restarted with exponential backoff (1–30 s by default).
+A run lasting at least 60 s resets that delay. Exit status 2 is a terminal configuration fault:
+the supervisor exits and its watcher session can disappear. Task wakeups stay stopped until the
+launcher or `health-check.py --fix` recreates that session. A managed restart pauses wakeups
+while the old session is replaced; durable tasks arriving in the gap are recovered by the
+watcher's initial sweep. The post-restart one-task/one-wakeup/one-result live witness for this
+lease change remains pending; isolated concurrency tests do not substitute for it.
+
 Measured on the Pro host on 2026-09-22 (the #4585 witness, live core, no restart): standby armed at
 50 s; handoff to the session watcher 18 s after it started; a task answered 12 s later with the
 notifier typing nothing; after the session watcher was killed, the standby was re-armed in 51 s under
