@@ -321,10 +321,10 @@ with tempfile.TemporaryDirectory() as td:
     starvation.mkdir(parents=True)
     for index in range(512):
         (starvation / f"wr_{index:016x}.json").write_text(json.dumps({
-            "review_id": f"wr_{index:016x}", "status": "published"}))
+            "review_id": f"wr_{index:016x}", "status": "published", "withheld_body": "resolved"}))
     target_id = "wr_ffffffffffffffff"
     (starvation / f"{target_id}.json").write_text(json.dumps({
-        "review_id": target_id, "status": "awaiting_owner"}))
+        "review_id": target_id, "status": "awaiting_owner", "withheld_body": "live"}))
     bridge._STATE = root / "starvation"
     check(any(record.get("review_id") == target_id
               for _path, record in bridge._pending_review_records()),

@@ -33,6 +33,7 @@ import {
 	resetCacheForTests,
 	resolvePython,
 	pythonOnPath,
+	isSystemStubPath,
 	selectPython,
 	shellQuote,
 } from '../src/python-binary.js';
@@ -111,6 +112,14 @@ describe('selectPython ordering', () => {
 			toolsInstalled: never,
 		});
 		assert.equal(py, null);
+	});
+});
+
+describe('isSystemStubPath', () => {
+	it('flags the system path only on macOS; on Linux /usr/bin/python3 is real', () => {
+		assert.equal(isSystemStubPath(STUB, 'darwin'), true);
+		assert.equal(isSystemStubPath(STUB, 'linux'), false);
+		assert.equal(isSystemStubPath('/usr/fake/local/bin/python3', 'darwin'), false);
 	});
 });
 

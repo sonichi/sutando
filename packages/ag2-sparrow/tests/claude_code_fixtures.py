@@ -145,6 +145,15 @@ def write_fake_claude(path, py=sys.executable):
     return path
 
 
+def write_fake_tmux(path, version="3.6"):
+    """A tmux that only answers -V, so no suite depends on the host's tmux to resolve one."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('#!/bin/sh\n[ "$1 $2" = "-u -V" ] || [ "$1" = "-V" ] || exit 1\necho "tmux %s"\n' % version)
+    path.chmod(0o755)
+    return path
+
+
 TOKEN = "tok-FAKE-RELAY-TOKEN-never-copied"
 NONCE = "0123456789abcdef0123456789abcdef"
 HOLD_DRIVER = ("import sys, os, time; sys.path.insert(0, %r)\n"
@@ -191,8 +200,9 @@ CONTENDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connec
              "print('launch', cm.launch_admission(%r)[1] or 'admitted', flush=True)")
 # The manager's start, as every Runner start does it: the production admission, then the root. Its stop
 # (stdin closed) is recorded as a signal, which ends a wait in admission at once, as in production.
-LAUNCHED = ("import sys, threading; sys.path.insert(0, %r)\n"
+LAUNCHED = ("import os, signal, sys, threading; sys.path.insert(0, %r)\n"
             "from ag2_sparrow import connect_common as cm, holder_lock, task_io\n"
+            "signal.signal(cm.RETIRE_SIGNAL, lambda *a: os._exit(75))\n"
             "install = %r\n"
             "if install: holder_lock.install_id = lambda: install\n"
             "state, stopped = {'sig': None}, threading.Event()\n"
@@ -228,12 +238,15 @@ REAL_LAUNCHER = ("import os, subprocess, sys, time; sys.path.insert(0, %r)\n"
                  "    child.kill(); child.wait(); return 0\n"
                  "rc = cm.hold_and_supervise(LOCAL, root, state, prepare, lambda ctx: subprocess.Popen(['sleep', '300']),\n"
                  "                           supervise, lambda c: (c.kill(), c.wait()), 'run', 'test')\n"
-                 "print('refused', rc, flush=True)")
+                 "if os.path.exists(acted + '.stop-fails'): rc = cm.EXIT_RETRY   # its stop did not finish\n"
+                 "rc = cm.retired(state, rc)\n"
+                 "print('refused', rc, flush=True); sys.exit(rc)")
 # launchd's shape: the job's pid is a shim whose child is the launcher; the stop signal is forwarded.
 SHIM = ("import signal, subprocess, sys\n"
         "child = subprocess.Popen([sys.executable, '-c', sys.argv[1]] + sys.argv[2:])\n"
         "signal.signal(signal.SIGTERM, lambda *a: child.terminate())\n"
-        "sys.exit(child.wait())")
+        "signal.signal(signal.SIGURG, lambda *a: child.send_signal(signal.SIGURG))\n"
+        "rc = child.wait(); sys.exit(0 if rc == 75 else rc if rc > 0 else 1)")
 OP_HOLDER = ("import sys; sys.path.insert(0, %r); from ag2_sparrow import connect_common as cm\n"
              "from ag2_sparrow.adapters.claude_code.cli import LOCAL\n"
              "with cm.operation_lock(LOCAL): print('held', flush=True); sys.stdin.read()")
@@ -263,11 +276,50 @@ def hold(root, name="first-launcher", script=STAND_IN, install=""):
     return p
 
 
-def launched(root, adapter, install="", real=False, pause="", acted="", shim=False):
+# claude-local's tree: a daemonized server (no descendant of the launcher) whose pane takes the root, recorded by
+# the launcher with itself in the supervisor record; argv as REAL_LAUNCHER's, and its stop ends the server too.
+TMUX_TREE = ("import os, signal, subprocess, sys, time; sys.path.insert(0, %r)\n"
+             "from ag2_sparrow import claude_local_records as records, task_io\n"
+             "root, acted = sys.argv[1], sys.argv[3]\n"
+             "server_code = ('import os, subprocess, sys\\n'\n"
+             "    'p = subprocess.Popen([sys.executable, \"-c\", sys.argv[1]] + sys.argv[2:], stdin=subprocess.PIPE)\\n'\n"
+             "    'print(os.getpid(), p.pid, flush=True); sys.exit(p.wait())')\n"
+             "daemon = 'import subprocess, sys; subprocess.Popen(sys.argv[1:], start_new_session=True)'\n"
+             "f = subprocess.Popen([sys.executable, '-c', daemon, sys.executable, '-c', server_code, %r] + sys.argv[1:4],\n"
+             "                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True)\n"
+             "server, pane = map(int, f.stdout.readline().split()); f.wait()\n"
+             "def stop(signum=None, frame=None):\n"
+             "    if signum == signal.SIGURG and os.path.exists(acted + '.stop-fails'):\n"
+             "        os._exit(74)    # the session stop failed: the launcher's retry, its server left\n"
+             "    try:\n"
+             "        os.killpg(server, signal.SIGTERM)\n"
+             "    except OSError:\n"
+             "        pass\n"
+             "    while task_io.verify_lineage(server, start) is True:\n"
+             "        time.sleep(0.05)\n"
+             "    os._exit(75 if signum == signal.SIGURG else 0)\n"
+             "start = task_io.start_time(server)\n"
+             "signal.signal(signal.SIGTERM, stop); signal.signal(signal.SIGURG, stop)\n"
+             "from ag2_sparrow.adapters.claude_code import inbox\n"
+             "inbox.prepare_root(root)\n"
+             "records.save_supervisor(root, dict(records.load_supervisor(root), launcher=task_io.process_identity(),\n"
+             "    generation={'server_pid': server, 'server_start': start, 'pane_pid': pane, 'pane_id': '%%0',\n"
+             "                'session_id': '$0', 'session_created': '0', 'start_command': 'hold', 'nonce': '0' * 32}))\n"
+             "sys.stdin.read(); stop()")
+
+
+def tree_server(root):
+    """The fake tmux server a TMUX_TREE launcher recorded for `root`, while it still runs as recorded."""
+    gen = records.load_supervisor(root).get("generation") or {}
+    alive = gen.get("server_pid") and task_io.verify_lineage(gen["server_pid"], gen.get("server_start")) is True
+    return gen["server_pid"] if alive else None
+
+
+def launched(root, adapter, install="", real=False, pause="", acted="", shim=False, tmux=False):
     """The manager's start, not waited for: its launcher waits in admission until the operation that
     started it releases the agent lock."""
     if real:
-        code = REAL_LAUNCHER % (str(PKG),)
+        code = TMUX_TREE % (str(PKG), REAL_LAUNCHER % (str(PKG),)) if tmux else REAL_LAUNCHER % (str(PKG),)
         argv = [sys.executable, "-c", SHIM, code] if shim else [sys.executable, "-c", code]
         argv += [str(root), pause, acted or os.devnull]
     else:
@@ -313,6 +365,11 @@ def oplock_free():
         os.close(fd)
 
 
+def platform_as(mac):
+    """The manager branch a helper runs: None keeps the one the test (or the base, systemd) chose."""
+    return contextlib.nullcontext() if mac is None else mock.patch.object(cm, "is_macos", return_value=mac)
+
+
 class Runner:
     """A manager command table for service_manager._run: (program, verb) -> rc or (rc, out, err); None =
     could not run. With a root, a start verb runs a stand-in launcher (adapter `adapter`, install identity
@@ -321,17 +378,38 @@ class Runner:
     a `registered` job, ActiveState from the stand-in, UnitFileState from enable/disable; `print` likewise."""
 
     def __init__(self, table=None, default=0, root=None, adapter="claude-local", install="", registered=False,
-                 stop_delay=0.0):
+                 stop_delay=0.0, shape=None):
         self.table, self.default, self.calls, self.root = dict(table or {}), default, [], root
+        self.shape = shape or L
         self.session, self.adapter, self.install = None, adapter, install
+        self.invocation, self.since = "", 0
         self.enabled, self.registered, self.stop_delay, self.timers = False, registered, stop_delay, []
-        self.real, self.pause, self.acted, self.shim, self.spawned = False, "", "", False, []
+        self.real, self.pause, self.acted, self.shim, self.spawned, self.tmux = False, "", "", False, [], False
         self.stop_timeout = 10
+        self.keep_alive, self.loaded, self.throttle, self.started_at, self.respawns = False, False, 30.0, 0.0, 0
+        self.last_rc = None
+
+    def respawn_if_due(self, launchd):
+        """The manager's restart policy, when `keep_alive` models it: a started job whose run ended other than
+        the policy's terminal exit (launchd's 0 under SuccessfulExit=false, systemd's RestartPreventExitStatus 75)
+        is spawned again once `throttle` has passed since that run started (at once for a longer run)."""
+        if not (self.keep_alive and self.loaded and self.session is not None and self.session.poll() is not None):
+            return
+        if self.session.returncode == (0 if launchd else 75):
+            return
+        if time.monotonic() - self.started_at >= self.throttle:
+            old, self.session, self.last_rc = self.session, None, self.session.returncode
+            for pipe in (old.stdin, old.stdout):
+                pipe.close()
+            self.respawns += 1
+            self.start_session(by_manager=True)
 
     def start_session(self, by_manager=False):
         self.stop_session()
+        self.invocation, self.since = secrets.token_hex(16), int(time.monotonic() * 1_000_000)
+        self.started_at = time.monotonic()
         self.session = launched(self.root, self.adapter, self.install, self.real, self.pause, self.acted,
-                                self.shim) if by_manager else \
+                                self.shim, self.tmux) if by_manager else \
             hold(self.root, self.adapter, install=self.install)
         self.spawned.append(self.session)
 
@@ -349,7 +427,7 @@ class Runner:
                 except ProcessLookupError:
                     pass
             unhold(self.session)
-            self.session = None
+            self.session, self.last_rc = None, self.session.returncode
 
     def alive(self):
         return self.session is not None and self.session.poll() is None
@@ -374,26 +452,43 @@ class Runner:
     def verb(self, cmd):
         return cmd[1] if cmd[0] == "launchctl" else next(a for a in cmd[1:] if not a.startswith("--"))
 
+    def exit_words(self):
+        """The manager's record of how the last run ended: systemd's ExecMainCode/Status, launchd's line."""
+        rc = self.session.returncode if self.session is not None and self.session.poll() is not None else self.last_rc
+        if rc is None:
+            return {"ExecMainCode": "0", "ExecMainStatus": "0"}, ""
+        if rc < 0:
+            return {"ExecMainCode": "2", "ExecMainStatus": str(-rc)}, f"\tlast terminating signal = {-rc}\n"
+        return {"ExecMainCode": "1", "ExecMainStatus": str(rc)}, f"\tlast exit code = {rc}\n"
+
     def answer(self, verb, cmd):
         if verb == "print":
             if self.alive():
                 return (0, f"\tpid = {self.session.pid}\n\tstate = running\n", "")
-            return (0, "\tstate = waiting\n", "") if self.registered else NOT_LOADED
+            if self.keep_alive and self.loaded:
+                return (0, "\tstate = spawn scheduled\n" + self.exit_words()[1], "")
+            return (0, "\tstate = waiting\n" + self.exit_words()[1], "") if self.registered else NOT_LOADED
         if verb == "show":
-            loaded = cm.service_path(L).exists() or self.registered
+            loaded = cm.service_path(self.shape).exists() or self.registered
             words = {"LoadState": "loaded" if loaded else "not-found", "ActiveState": "active" if self.alive() else "inactive",
                      "SubState": "running" if self.alive() else "dead", "UnitFileState": "enabled" if self.enabled else "disabled",
-                     "MainPID": str(self.session.pid) if self.alive() else "0"}
+                     "MainPID": str(self.session.pid) if self.alive() else "0", "InvocationID": self.invocation,
+                     "ExecMainStartTimestampMonotonic": str(self.since), **self.exit_words()[0]}
             props = cmd[cmd.index("-p") + 1].split(",")
-            return (0, "".join(words[k] + "\n" for k in props), "")
+            shown = (words[k] if "--value" in cmd else f"{k}={words[k]}" for k in props)
+            return (0, "".join(w + "\n" for w in shown), "")
         return self.default
 
     def __call__(self, cmd, timeout=30):
         self.calls.append(list(cmd))
         verb = self.verb(cmd)
+        if self.foreign(cmd):
+            return self.absent(verb, cmd)
+        self.respawn_if_due(cmd[0] == "launchctl")
         loaded = (37, "", "Bootstrap failed: 37: Operation already in progress\n")   # launchd, on a loaded job
+        held = self.alive() or (self.keep_alive and self.loaded)
         got = self.table[(cmd[0], verb)] if (cmd[0], verb) in self.table else \
-            loaded if verb == "bootstrap" and self.alive() else self.answer(verb, cmd)
+            loaded if verb == "bootstrap" and held else self.answer(verb, cmd)
         if callable(got):
             got = got(cmd)
         if got is None:
@@ -404,6 +499,8 @@ class Runner:
             self.registered = self.registered and verb == "enable"
         if rc == 0 and verb == "bootout":
             self.registered = False
+        if rc == 0 and verb in START_VERBS + STOP_VERBS:
+            self.loaded = verb in START_VERBS
         if self.root and rc == 0:
             if verb in START_VERBS and not (verb == "start" and self.alive()):     # start is a no-op when active
                 self.start_session(by_manager=True)
@@ -415,6 +512,21 @@ class Runner:
 
     def verbs(self, program):
         return [self.verb(c) for c in self.calls if c[0] == program]
+
+    def foreign(self, cmd):
+        """A command naming another job than this one: the manager here knows nothing of it."""
+        own = (self.shape.service_name, cm.launchd_service(self.shape), str(cm.supervisor_path(self.shape)))
+        return not any(a in own for a in cmd) and any("ag2-sparrow" in a or "ag2.sparrow" in a for a in cmd)
+
+    def absent(self, verb, cmd):
+        if verb == "print":
+            return subprocess.CompletedProcess(cmd, *NOT_LOADED)
+        words = {"LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead", "UnitFileState": "disabled",
+                 "MainPID": "0", "InvocationID": "", "ExecMainStartTimestampMonotonic": "0", "ExecMainCode": "0",
+                 "ExecMainStatus": "0"}
+        props = cmd[cmd.index("-p") + 1].split(",") if "-p" in cmd else []
+        shown = "".join((words[k] if "--value" in cmd else f"{k}={words[k]}") + "\n" for k in props)
+        return subprocess.CompletedProcess(cmd, 0, shown, "")
 
     def pid(self):
         return self.session.pid if self.alive() else None
@@ -429,6 +541,7 @@ class ConnectBase(unittest.TestCase):
         self.bin = self.home / "bin"
         self.bin.mkdir()
         self.claude = write_fake_claude(self.bin / "claude")
+        self.tmux_bin = write_fake_tmux(self.home / "tmux-bin" / "tmux")
         self.work = self.home / "work"
         self.inbox, self.results = self.work / "tasks", self.work / "results"
         self.plugin = self.home / "plugin"
@@ -440,7 +553,8 @@ class ConnectBase(unittest.TestCase):
         relay.write_text(f"REMOTE_TASK_TOKEN={TOKEN}\n")
         relay.chmod(0o600)
         self.relay = relay
-        env = {"HOME": str(self.home), "USER": "owner", "PATH": f"{self.bin}:/usr/bin:/bin", cm.MANAGED_VAR: "1",
+        env = {"HOME": str(self.home), "USER": "owner", "PATH": f"{self.bin}:{self.tmux_bin.parent}:/usr/bin:/bin",
+               cm.MANAGED_VAR: "1",
                "SUTANDO_WORKSPACE_DIR": "/secret/ws", "REMOTE_TASK_TOKEN": TOKEN,
                "ANTHROPIC_API_KEY": "sk-ant-should-not-pass", "CLAUDE_CODE_OAUTH_TOKEN": "oauth-should-not-pass",
                "AWS_SECRET_ACCESS_KEY": "aws-should-not-pass"}
@@ -483,8 +597,8 @@ class ConnectBase(unittest.TestCase):
                          "--claude-config-dir", str(self.home / ".claude-sutando"),
                          "--hmac-key-file", str(self.home / "task-hmac.key"), *extra)
 
-    def install_with(self, runner, mac=False, *extra):
-        with mock.patch.object(sm, "_run", side_effect=runner), mock.patch.object(cm, "is_macos", return_value=mac):
+    def install_with(self, runner, mac=None, *extra):
+        with mock.patch.object(sm, "_run", side_effect=runner), platform_as(mac):
             return self.install(*extra)
 
     def values(self, **over):
@@ -496,12 +610,12 @@ class ConnectBase(unittest.TestCase):
         v.update(over)
         return v
 
-    def configure(self, **over):
+    def configure(self, shape=None, **over):
         """The config as install writes it, with no manager involved: what run, verify and uninstall read."""
         for d in (self.inbox, self.results):
             d.mkdir(parents=True, exist_ok=True)
-        cm._write(cli.config_path(), cli.render_config(self.values(**over)), 0o600)
-        return cli.config_path()
+        cm._write(cli.config_path(shape or L), cli.render_config(self.values(**over)), 0o600)
+        return cli.config_path(shape or L)
 
     def status(self, state=None, name="gateway-status.json", **over):
         """A bridge's gateway status, as the bridge writes it each poll, feeding this test's root by default."""
@@ -547,12 +661,13 @@ class BridgeFake:
     """The agent bridge's own manager state, so its unit never reaches the launcher's Runner: commands
     naming the bridge's service or label answer here, every other command goes to `runner`."""
 
-    def __init__(self, runner, table=None):
+    def __init__(self, runner, table=None, bridge=None):
         self.runner, self.table, self.calls = runner, dict(table or {}), []
         self.active = self.enabled = self.registered = False
+        self.bridge = bridge or cb.bridge_shape(runner.shape)
 
     def ours(self, cmd):
-        return any(cli.BRIDGE.service_name in a or cli.BRIDGE.agent_label in a for a in cmd)
+        return any(self.bridge.service_name in a or self.bridge.agent_label in a for a in cmd)
 
     def __call__(self, cmd, timeout=30):
         if not self.ours(cmd):
@@ -564,13 +679,13 @@ class BridgeFake:
             return None if got is None else subprocess.CompletedProcess(cmd, got, "", "exit %s" % got)
         out = ""
         if verb == "show":
-            loaded = cm.service_path(cli.BRIDGE).exists() or self.registered
+            loaded = cm.service_path(self.bridge).exists() or self.registered
             words = {"LoadState": "loaded" if loaded else "not-found", "ActiveState": "active" if self.active else "inactive",
                      "UnitFileState": "enabled" if self.enabled else "disabled"}
             out = "".join(words[k] + "\n" for k in cmd[cmd.index("-p") + 1].split(","))
         elif verb == "print":
             if not self.registered:
-                return subprocess.CompletedProcess(cmd, 113, "", 'Could not find service "%s" in domain\n' % cli.BRIDGE.agent_label)
+                return subprocess.CompletedProcess(cmd, 113, "", 'Could not find service "%s" in domain\n' % self.bridge.agent_label)
             return subprocess.CompletedProcess(cmd, 0, "\tstate = running\n" if self.active else "\tstate = waiting\n", "")
         elif verb in ("enable", "disable"):
             self.enabled = verb == "enable"
@@ -586,6 +701,9 @@ class BridgeFake:
 
 
 AGENT = "@probe.agent:ag2.space"
+# An agent-root install runs the agent's own job and bridge.
+LA = cm.for_key(L, cm.agent_key(AGENT))
+BA = cb.bridge_shape(LA)
 
 
 class AgentRootBase(ConnectBase):
@@ -599,17 +717,18 @@ class AgentRootBase(ConnectBase):
         self.addCleanup(self.scripts.stop)
 
     def bridged(self, table=None, root=None, **kw):
-        runner = Runner(table, 0, str(root or self.root), **kw)
+        runner = Runner(table, 0, str(root or self.root), **dict({"shape": LA}, **kw))
         self.runners.append(runner)
         return BridgeFake(runner)
 
-    def install_default(self, fake, *extra, mac=False):
-        with mock.patch.object(sm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=mac):
+    def install_default(self, fake, *extra, mac=None):
+        with mock.patch.object(sm, "_run", side_effect=fake), platform_as(mac):
             return self.main("install", "--plugin-dir", str(self.plugin), "--claude-config-dir", str(self.home / ".claude-sutando"),
                              "--hmac-key-file", str(self.home / "task-hmac.key"), *extra)
 
     def cfg(self):
-        return cli.read_config(cli.config_path())
+        """The installed job's config: the agent's own, or an explicit root's single job."""
+        return cli.read_config(cli.config_path(cm.select_job(L)[0] or LA))
 
 
 BASE = "https://backend.example/api"

@@ -3,12 +3,15 @@
 
 The picker reads two different things and they arrive by different routes:
 
-    POST /v1/workers            live/dead ids  -> each row's STATUS
+    POST /v1/workers            live/dead ids  -> each row's STATUS, AGENT_MXID
     PUT  /v1/agents/<me>/profile workers meta  -> each row's LABEL and runtime
 
 Send only one and the picker is half-right: statuses with raw 32-hex ids for
 names, or names attached to nothing. So both bodies are built here, from the
 one roster, and a caller sends them together.
+
+A worker's own `agent_mxid` rides in the SAME report the broker stores as the
+`/v1/workers` snapshot — never the profile patch, the one place it's read back.
 
 This module builds; it does not send. The transport, its credentials and its
 retry policy belong to whatever already talks to the broker.
@@ -32,6 +35,7 @@ for _p in (str(_SCRIPTS), str(_SCRIPTS.parents[2] / "src")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import connections  # noqa: E402
 import pool_roster as pr  # noqa: E402
 
 # The broker's field names are the affinity era's; the roster is this design's.
@@ -39,6 +43,9 @@ import pool_roster as pr  # noqa: E402
 ACTIVE_STATES = ("live",)
 # Not answering now: a recovering worker is shown as such, never as "available".
 DEAD_STATES = ("abandoned", "recovering")
+# report()'s default: no identity lookup, so a roster naming no real install
+# is reported as before.
+_NO_WORKSPACE = object()
 
 
 def _rows(roster: dict) -> dict:
@@ -73,16 +80,26 @@ def _labels(roster: dict) -> dict:
     return out
 
 
-def report(roster: dict, now=None) -> dict:
-    """The reported leg: runtime facts, plus how far this runtime has applied
-    the user's configuration. Never a source of names or bindings — the broker
-    files `applied` as last-reported and keeps the user's intent apart from it."""
+def _worker_agent_mxid(wid: str, workspace) -> str:
+    """`wid`'s own agent id; empty for a disabled or parked identity row.
+    Reads `agent_mxid` only, never `token_ref`."""
+    row = connections.worker_enabled_identity(wid, workspace)
+    return str((row or {}).get("agent_mxid") or "").strip()
+
+
+def report(roster: dict, now=None, workspace=_NO_WORKSPACE) -> dict:
+    """Runtime facts the broker calls `applied`, never names or bindings.
+    With `workspace`, each worker's own `agent_mxid` rides along too."""
     workers = []
     for wid, row in sorted(_rows(roster).items()):
         row = row or {}
         w = {"id": wid, "state": str(row.get("state"))}
         if row.get("runtime"):
             w["runtime"] = str(row["runtime"])
+        if workspace is not _NO_WORKSPACE:
+            mxid = _worker_agent_mxid(wid, workspace)
+            if mxid:
+                w["agent_mxid"] = mxid
         workers.append(w)
     return {"ts": int(now if now is not None else time.time()),
             "roster_version": roster.get("version"),
@@ -119,11 +136,12 @@ def profile_workers(roster: dict) -> dict:
 
 
 def advertisement(workspace, now=None) -> dict:
-    """Both bodies from one roster read, so they cannot disagree."""
+    """Both bodies from one roster read, so they cannot disagree. `report`
+    carries each worker's `agent_mxid` — the body sent to `POST /v1/workers`."""
     roster = pr.load_roster(workspace)
     if roster is None:
         raise FileNotFoundError("no roster to advertise")
-    return {"report": report(roster, now),
+    return {"report": report(roster, now, workspace),
             "workers_snapshot": snapshot(roster, now),
             "profile_patch": {"workers": profile_workers(roster)}}
 

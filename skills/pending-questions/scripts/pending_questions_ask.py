@@ -41,6 +41,7 @@ for _p in (REPO / "src", HERE):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 from local_record import new_name, write_text_whole
+from sutando_config import resolve_macos_notifications
 from pending_questions_outbox import Outbox, one_line_title
 from proactive_routing import BRIDGE_CHANNELS, proactive_filename, should_claim_proactive
 from result_markers import neutralize_markers
@@ -103,11 +104,39 @@ def entry_heading(question: str, now: float) -> str:
 
 
 def question_dict(ask_id: str, question: str, context: Optional[str], asked_at: float,
-                  default_action: Optional[str], reason: Optional[str], options, priority: str) -> dict:
+                  default_action: Optional[str], reason: Optional[str], options, priority: str,
+                  asked_by: Optional[str] = None) -> dict:
     """The outbox's `question` record; the store skill's Question dataclass reads the same keys."""
     return {"ask_id": ask_id, "question": question, "context": context, "asked_at": asked_at,
             "default_action": default_action, "reason": reason,
-            "options": [list(o) for o in options or ()], "priority": priority or "Medium"}
+            "options": [list(o) for o in options or ()], "priority": priority or "Medium",
+            "asked_by": asked_by}
+
+
+def published_name(ws: Path, name: str) -> str:
+    """`name` as this session publishes it: `result_publish`'s stamp, so a pool worker acting as its
+    own agent asks through its own lane; the core's session and any other worker keep `name`."""
+    from result_publish import worker_published_path  # noqa: PLC0415
+    return worker_published_path(Path(ws) / "results" / name, workspace=Path(ws)).name
+
+
+def asked_by(ws: Path, name: str) -> Optional[str]:
+    """The agent a question published under `name` is asked as; None for the core's own agent."""
+    try:
+        import connections  # noqa: PLC0415
+        return connections.proactive_author_agent(name, Path(ws))
+    except Exception:  # noqa: BLE001 — a missing asker never blocks the ask
+        return None
+
+
+def speaker(ws: Path, name: str, host: str) -> str:
+    """Who a question published under `name` comes from, as its text names it (the core, or the worker)."""
+    try:
+        import connections  # noqa: PLC0415
+        return connections.proactive_author_phrase(name, host, Path(ws))
+    except Exception:  # noqa: BLE001 — an unreadable name never blocks the ask
+        from proactive_routing import proactive_worker  # noqa: PLC0415
+        return f"a worker on {host}" if proactive_worker(name) else f"the {host} core"
 
 
 def queued_send(body: str):
@@ -331,13 +360,15 @@ def destination_from_task(text: str, workspace: Optional[Path] = None) -> Destin
 
 
 def proactive_body(question: str, context: Optional[str], host: str,
-                   dest: Destination, link: Optional[str] = None, intro: Optional[str] = None):
+                   dest: Destination, link: Optional[str] = None, intro: Optional[str] = None,
+                   asker: Optional[str] = None):
     """(body, routed): routed is True when a `[channel:]` redirect leads the body.
     `link` is where the owner can also answer, when the store knows it; `intro` is one
-    extra paragraph the store adds the first time."""
+    extra paragraph the store adds the first time; `asker` names who asks (default the core)."""
     routed = dest.bridge in _ROOM_MARKER_BRIDGES and bool(dest.channel)
+    who = neutralize_markers(asker) if asker else f"the {host} core"
     lines = [f"[channel: {dest.channel}]" if routed else "[dm-only]",
-             f"Question for you from the {host} core — it needs your word:", "",
+             f"Question for you from {who} — it needs your word:", "",
              neutralize_markers(question).strip()]
     if context and context.strip():
         lines += ["", neutralize_markers(context).strip()]
@@ -427,7 +458,10 @@ def write_proactive(results: Path, name: str, body: str) -> Path:
 
 
 def notify_macos(text: str) -> tuple:
-    """(ok, fix). A refused or failed osascript names the fix; it never claims ok."""
+    """(ok, fix). A refused or failed osascript names the fix; it never claims ok.
+    (None, None) when notifications.macos is off: nothing was attempted."""
+    if not resolve_macos_notifications():
+        return None, None
     esc = text.replace("\\", "\\\\").replace('"', '\\"')[:200]
     try:
         r = subprocess.run(["osascript", "-e",
@@ -499,18 +533,30 @@ def queue_question(question: str, context: Optional[str] = None, task_file: Opti
     return out
 
 
-def _ask_by_text(out: dict, question, context, host, dest, link, intro) -> None:
-    body, routed = proactive_body(question, context, host, dest, link, intro)
+def _ask_by_text(out: dict, question, context, host, dest, link, intro, as_session: bool = True) -> None:
+    """`as_session` False keeps the core's name: a question first asked by the core's card stays the core's."""
+    ws, name, who, err = Path(out["workspace"]), None, None, None
+    try:
+        name = proactive_filename(out["ask_id"], dest.bridge)
+        if as_session:
+            name = published_name(ws, name)
+            out["question"]["asked_by"] = asked_by(ws, name)
+            who = speaker(ws, name, host)
+    except Exception as e:  # noqa: BLE001 — the question is still recorded
+        err = f"{type(e).__name__}: {e}"
+    body, routed = proactive_body(question, context, host, dest, link, intro, who)
     out["bridge"], out["channel"] = dest.bridge, dest.channel if routed else None
     out["where"] = (f"{dest.bridge} {dest.channel}" if routed else
                     f"{dest.bridge} owner-dm" if dest.bridge else "owner-dm (last-active bridge)")
     out["card"] = None
-    try:
-        name = proactive_filename(out["ask_id"], dest.bridge)
-        write_proactive(Path(out["workspace"]) / "results", name, body)
-        out["proactive_file"] = name
-    except Exception as e:  # noqa: BLE001 — the question is still recorded
-        out["send_error"] = f"{type(e).__name__}: {e}"
+    if err is None:
+        try:
+            write_proactive(ws / "results", name, body)
+            out["proactive_file"] = name
+        except Exception as e:  # noqa: BLE001 — the question is still recorded
+            err = f"{type(e).__name__}: {e}"
+    if err is not None:
+        out["send_error"] = err
     if out["proactive_file"]:
         out["sent_line"] = f"**Sent:** queued {out['where']} via {out['proactive_file']} at {_iso(time.time())}"
     else:
@@ -561,7 +607,7 @@ def card_to_text(out: dict, dest, link, intro) -> None:
     before the hold leaves a record naming an absent card, which the reminder reads as due: text
     again, never silence."""
     q = out["question"]
-    _ask_by_text(out, q["question"], q.get("context"), out["host"], dest, link, intro)
+    _ask_by_text(out, q["question"], q.get("context"), out["host"], dest, link, intro, as_session=False)
     try:
         out["outbox"] = str(Outbox(Path(out["workspace"])).save(q, out["sent_line"], redeliver=True))
     except Exception as e:  # noqa: BLE001

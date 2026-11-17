@@ -119,6 +119,27 @@ sentinel_pid_wrote_file() {
 
 # True when <pid_file> names a live task watcher other than <self>; an undecidable
 # pid counts as one, so a standby never takes the readiness a session watcher needs.
+# True when <inbox> is its workspace's own: <workspace>/tasks or a delivery folder under it (both resolved).
+inbox_in_workspace() {
+  local inbox ws
+  inbox="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+  ws="$(cd "$2" 2>/dev/null && pwd -P)" || return 1
+  case "$inbox/" in "$ws/tasks/"|"$ws/deliveries/"?*) return 0 ;; esac
+  return 1
+}
+
+# True when <pid_file> names a live watcher that is provably NOT serving <inbox> (a predecessor on the
+# same inbox is a replacement, not an intruder); an unreadable process table proves nothing.
+sentinel_held_by_other_inbox() {
+  local pid_file="$1" self="$2" inbox="$3" py="$4" holder here holders
+  sentinel_held_by_other_watcher "$pid_file" "$self" "$py" || return 1
+  holder="$(tr -d '[:space:]' 2>/dev/null < "$pid_file")"
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  holders="$("$py" "$here/watcher_identity.py" inbox-holders --inbox "$inbox" 2>/dev/null)" || return 1
+  [ "$holders" != "unobserved" ] || return 1
+  ! printf '%s\n' "$holders" | awk '{print $1}' | grep -qx "$holder"
+}
+
 sentinel_held_by_other_watcher() {
   local pid_file="$1" self="$2" py="$3" holder here verdict
   holder="$(tr -d '[:space:]' 2>/dev/null < "$pid_file")"

@@ -12,6 +12,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -94,7 +95,11 @@ class DeployedFenceTest(unittest.TestCase):
         scripts.mkdir(parents=True)
         for name in PINNED:
             (scripts / name).write_bytes(verbatim(name))
-        (scripts.parent / "assets").symlink_to(REPO / "skills" / "tutorial" / "assets")
+        # The deployed writer inlines its own screenshot names; one the repo no longer ships gets a stand-in.
+        assets, shipped = scripts.parent / "assets", REPO / "skills" / "tutorial" / "assets"
+        assets.mkdir()
+        for name in sorted(set(re.findall(r'"([a-z0-9-]+\.jpg)"', verbatim("tour_page.py").decode()))):
+            (assets / name).symlink_to(shipped / name if (shipped / name).exists() else shipped / "room-list-top.jpg")
         self.script = scripts / "getting_started.py"
         (self.tmp / "runner.py").write_text(RUNNER)
         (self.tmp / "room_commons.py").write_text(base.STUB)

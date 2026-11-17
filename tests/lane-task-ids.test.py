@@ -128,9 +128,11 @@ class LaneTaskIds(unittest.TestCase):
         tasks = self.ws / "tasks"
         tasks.mkdir()
         ctl = tasks / "task-ctl.txt"
-        ctl.write_text("id: task-ctl\ntask: CANCEL_INSTRUCTION: stop processing task-dev~ask-5f3c9e0a1b2c now\n")
+        ctl.write_text("id: task-ctl\nsource: relay-control\naccess_tier: owner\n"
+                       "task: CANCEL_INSTRUCTION: stop processing task-dev~ask-5f3c9e0a1b2c now\n")
         stub, record = self.ws / "py", self.ws / "calls"
-        stub.write_text(f'#!/bin/bash\necho "$*" >> "{record}"\n')
+        stub.write_text(f'#!/bin/bash\ncase "$2" in stop-target) exec python3 "$@";; esac\n'
+                        f'echo "$*" >> "{record}"\ncase "$1" in *stop_hooks.py) exit 1;; esac\n')
         stub.chmod(0o755)
         subprocess.run(["bash", "-c", f'source "{REPO}/src/task-emit.sh"; activity_cancel_target task-ctl.txt; wait'],
                        env={"PATH": "/usr/bin:/bin", "HOME": str(self.ws), "SUTANDO_PY_BIN": str(stub), "TASKS_DIR": str(tasks)}, check=True)

@@ -66,11 +66,12 @@ from __future__ import annotations
 import os.path as _osp
 import sys as _sys
 _sys.path.insert(0, _osp.dirname(_osp.abspath(__file__)))
-from gateway_serving import read_verdict as read_gateway_verdict  # noqa: E402
-from worker_auth_state import authenticated_turn, login_expired, refusal_answered  # noqa: E402
+from gateway_serving import read_verdict as read_gateway_verdict, status_path as gateway_status_path  # noqa: E402
+from worker_auth_state import authenticated_turn, idle_since_sign_in, login_expired, refusal_answered  # noqa: E402
 import cli_wedge  # noqa: E402
 import core_gate_notice  # noqa: E402
 import self_opened_gate  # noqa: E402
+import tmux_probe  # noqa: E402
 
 import argparse
 import hashlib
@@ -97,10 +98,9 @@ def _ensure_tmux_on_path():
     runtime-health probes, which share this process env."""
     if shutil.which("tmux"):
         return
-    for cand in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"):
-        if os.path.exists(cand):
-            os.environ["PATH"] = os.path.dirname(cand) + os.pathsep + os.environ.get("PATH", "")
-            return
+    found = tmux_probe.tmux_binary()
+    if os.path.isabs(found):
+        os.environ["PATH"] = os.path.dirname(found) + os.pathsep + os.environ.get("PATH", "")
 
 
 # ---- Shared derivation core: runtime-health.py (#2092). -------------------- #
@@ -191,6 +191,23 @@ TYPED_ANSWER_COOLDOWN_S = 600.0
 #: A re-type within this long of the last one continues its episode: a switch that did not
 #: take is re-typed each cooldown, and the owner hears about the episode once.
 TYPED_EPISODE_GAP_S = 2 * TYPED_ANSWER_COOLDOWN_S
+
+
+#: After a /login the core sits idle and nothing re-runs the boot ceremony its refused turn
+#: missed (watcher, crons); the boot prompt is idempotent, so it is typed once per sign-in.
+RESUME_AFTER_SIGN_IN = ("/startup", "Enter")
+
+
+def resume_step(state, pane, runtime, seat, resumed_at, now, enabled=True):
+    """The boot prompt to type now, or None: the core's own seat sits idle-ready with an
+    empty composer and nothing has run since "Login successful". Once per cooldown."""
+    if not enabled or seat or runtime == "codex" or state != "idle-ready":
+        return None
+    if resumed_at is not None and now - resumed_at < TYPED_ANSWER_COOLDOWN_S:
+        return None
+    if not _composer_is_empty(pane) or not idle_since_sign_in(pane, runtime):
+        return None
+    return RESUME_AFTER_SIGN_IN
 
 
 def typed_episode(prev_at, prev_episode, now):
@@ -390,6 +407,8 @@ _BASE_TO_STATE = {
     # "unknown" = runtime-health saw a live session but a stale/absent core-status
     # ("running" that never advanced) → wedged. That IS the supervisor's `hung`.
     "unknown": ("hung", "core alive but stalled (status stale, no recognized prompt)"),
+    # Held by the launcher for a provider limit: visible, resumes by itself, never a restart.
+    "paused": ("blocked-known", "core paused for a provider limit; it resumes by itself"),
 }
 
 
@@ -425,6 +444,8 @@ def compose_state(pane, base_health, gateway_alive, process=True, prev_pane=None
         pane = strip_limit_banners(pane)
     if base_health == "offline":
         return "crashed", _BASE_TO_STATE["offline"][1], None, None
+    if base_health == "paused":
+        return "blocked-known", _BASE_TO_STATE["paused"][1], None, None
     # An ACTIVE interactive gate in the pane is the finest signal — it distinguishes
     # "sitting at a prompt waiting for input" from the coarse health (e.g. the live
     # /login MENU, which runtime-health's needs_login markers don't match). Check it
@@ -523,11 +544,6 @@ GATEWAY_STATUS_MAX_AGE_S = 90.0
 GATEWAY_OUTAGE_MAX_AGE_S = 90.0
 
 
-def _primary_sidecar_name(state_dir):
-    from connections import primary_sidecar_name
-    return primary_sidecar_name(state_dir)
-
-
 def _gateway_status(state_dir):
     """Read the bridge's own liveness sidecar. Returns True/False if the file
     is present and fresh, else None (meaning: no opinion, fall back to pgrep).
@@ -551,7 +567,7 @@ def _gateway_status(state_dir):
         # Serving verdict is gateway_serving's; the freshness window and the
         # reconnect grace below are this reader's. Stale -> None, as before.
         v = read_gateway_verdict(
-            os.path.join(state_dir, _primary_sidecar_name(state_dir)),
+            gateway_status_path(state_dir),
             now=now,
             max_age=GATEWAY_STATUS_MAX_AGE_S,
         )
@@ -571,7 +587,7 @@ def _gateway_status(state_dir):
 def gateway_alive(app_data, state_dir=None):
     """Whether the relay gateway is up.
 
-    Prefer the bridge's OWN status sidecar (the primary connection's state/gateway-status sidecar), which
+    Prefer the bridge's OWN status sidecar (the active lane's, else the primary connection's), which
     remote_gateway_bridge rewrites on every poll outcome. It reports whether the
     connection is *serving*; the pgrep paths below only ever answered "is there a
     process whose argv looks right", which is a proxy for the wrong thing.
@@ -852,6 +868,30 @@ def resolve_escalations(manager, session, pane=None, runtime=None):
         return []
 
 
+def settle_driven(manager, session, prompt, state):
+    """Resolve each driven card whose dialog has left the screen: its keys took, so a later
+    prompt, even an identical one, mints a new card instead of deduping onto the answered one."""
+    if manager is None:
+        return []
+    try:
+        from hitl import tui_gate
+        from hitl.schema import STATUS_IN_PROGRESS
+        done = []
+        for r in manager.active():
+            subj = r.subject or {}
+            if (subj.get("source") != _TUI_SOURCE or subj.get("session") != session
+                    or r.status != STATUS_IN_PROGRESS or not subj.get("driven_at")
+                    or tui_gate.limit_card(r)):
+                continue
+            if tui_gate.guard_for(session, prompt, state) != r.guard:
+                manager.resolve(r.id)
+                done.append(r.id)
+        return done
+    except Exception as exc:  # noqa: BLE001 — never let the settle take down the monitor
+        print(f"hitl settle failed: {exc}", file=_sys.stderr)
+        return []
+
+
 def drive_escalations(manager, session, prompt, state, send):
     """Realise a click as keys against the dialog on screen NOW, once; a dialog that
     changed since the click expires the card. Returns [(req_id, keys or None)]."""
@@ -980,6 +1020,7 @@ def main():
     typed_at = {}
     typed_episodes = {}
     follow_up = None
+    resumed_at = None
     idle_ticks = 0
     login_since = None
     prev_pane = None
@@ -1007,6 +1048,7 @@ def main():
             runtime=runtime, styled_pane=styled_pane, limit_stale=limit_stale, still_s=still_s)
         prev_pane = pane
         clock = gate_clock(clock, state, prompt, time.time())
+        seen_state, seen_prompt = state, prompt  # before the debounce masks a new dialog
 
         # Debounce prompt escalation: only surface once the SAME prompt persists
         # (not a menu the core is actively navigating through).
@@ -1034,7 +1076,10 @@ def main():
         key = answer_step(state, kind, prompt, answered_prompt, a.auto_answer)
         if isinstance(key, tuple) and time.time() - typed_at.get(kind, 0.0) < TYPED_ANSWER_COOLDOWN_S:
             key = None
+        attempted = bool(key)
+        sent = False
         if key and send_keys(a.socket, a.session, key):
+            sent = True
             answered_prompt = prompt
             last_answered = {"kind": kind, "key": key, "at": time.time()}
             if isinstance(key, tuple):
@@ -1047,7 +1092,13 @@ def main():
         elif follow_up:
             then, follow_up = follow_up_step(follow_up, state, time.time(), pane or "")
             if then:
-                send_keys(a.socket, a.session, then)
+                attempted = True
+                sent = send_keys(a.socket, a.session, then)
+        # Any typed input, even a send that failed part-way, makes this capture stale.
+        rkey = None if attempted else resume_step(state, pane or "", runtime, a.seat, resumed_at, time.time(), a.auto_answer)
+        if rkey and send_keys(a.socket, a.session, rkey):
+            resumed_at = time.time()
+            last_answered = {"kind": "signed-in", "key": rkey, "at": resumed_at}
         dkey = dismiss_step(state_dir, a.session, state, kind, prompt, clock, time.time(), a.auto_answer)
         if dkey and send_keys(a.socket, a.session, dkey):
             self_opened_gate.clear(state_dir, a.session)
@@ -1071,6 +1122,8 @@ def main():
         if a.chat_escalation:
             # A blank capture is no evidence either: "" is what a capture of an
             # emptied pane returns, and it must not resolve a card nobody answered.
+            if pane and pane.strip():
+                settle_driven(hitl, a.session, seen_prompt, seen_state)
             verdict, idle_ticks = card_step(bool(pane and pane.strip()), state, idle_ticks, a.stable, settling)
             if verdict == "escalate":
                 drive_escalations(hitl, a.session, prompt, state,

@@ -44,11 +44,19 @@ instance is a config entry.
    {"core": {"dotspace": {"instances": [
      {"server": "ag2.space", "gateway_host": "chat.ag2.space",
       "cloud_origin": "https://sutando.s.space"},
-     {"server": "s.space", "gateway_host": "chat.s.space"}
+     {"server": "s.space", "gateway_host": "chat.s.space", "app_origin": "https://chat.s.space"}
    ]}}}
    ```
 
-   Optional per entry: `cloud_origin`, `mcp_url`, `link_via` (default: server), `prefer_ipv4`
+   `app_origin` is the browser app origin, independent of the relay gateway. The built-in
+   entries use `https://chat.ag2.space`, `https://dev-chat.ag2.space`, `https://chat.s.space`,
+   and `https://dev-chat.s.space`, respectively. Custom entries must name their own app origin;
+   an absent origin or unknown server gives no app link. This field is config-only, never
+   filled from well-known or a relay token. `ag2space_links.surface_link(room, surface)` and
+   `database_link(room, db)` resolve it from the room server; an optional `origin=` keyword
+   is an explicit override, not a transport fallback.
+
+   Optional per entry: `app_origin`, `cloud_origin`, `mcp_url`, `link_via` (default: server), `prefer_ipv4`
    (default: true). When the section is absent the built-in list applies — ag2.space,
    dev.ag2.space, s.space, dev.s.space with their `chat.` / `dev-chat.` gateways and their MCP
    endpoints (`mcp.` / `dev-mcp.` under ag2.space and s.space, path `/mcp`); `cloud_origin` only
@@ -60,6 +68,34 @@ instance is a config entry.
    is dev.s.space's gateway). A registered instance is trusted without any round trip; an
    explicit `dotspace_for(server)` with the real fetch still reads its well-known, only to
    fill the fields the entry leaves unset.
+
+   **A self-hosted homeserver** (ag2space-backend `deploy/selfhost`, #3165) on this machine or the
+   owner's own network is added with `"allow_local": true` on its entry. A configured
+   `instances` list **replaces** the built-in one, so restate the built-ins beside it:
+
+   ```json
+   {"core": {"dotspace": {"instances": [
+     {"server": "ag2.space", "gateway_host": "chat.ag2.space",
+      "cloud_origin": "https://sutando.s.space", "mcp_url": "https://mcp.ag2.space/mcp"},
+     {"server": "dev.ag2.space", "gateway_host": "dev-chat.ag2.space",
+      "cloud_origin": "https://dev-sutando.ag2.space", "mcp_url": "https://dev-mcp.ag2.space/mcp"},
+     {"server": "s.space", "gateway_host": "chat.s.space", "mcp_url": "https://mcp.s.space/mcp"},
+     {"server": "dev.s.space", "gateway_host": "dev-chat.s.space", "mcp_url": "https://dev-mcp.s.space/mcp"},
+     {"server": "localhost", "gateway_host": "localhost", "allow_local": true}
+   ]}}}
+   ```
+
+   For that entry's gateway host only (its `gateway_host`; its `server` when it names none), a
+   connect code may name a single-label host and must resolve to a loopback, private (RFC 1918,
+   IPv6 ULA) or shared (100.64/10) address, never link-local, unspecified or public
+   (`connections._local_address`). Plain `http` is allowed only when the gateway host itself names
+   loopback (`localhost`, a `*.localhost` name, a 127/8 or `::1` literal), not merely resolves to
+   it: the bearer rides every poll, ack and result, and the bridge re-resolves the name each time,
+   so a LAN server needs `https`. A `gateway_host`
+   with a port (`"localhost:8008"`) covers that port only; without one it covers every port on
+   the host. The probe and its identity check are otherwise unchanged: the gateway's agent
+   listing or `whoami` must still name an agent of the declared server. Nothing a token or a
+   server says can turn this on (`connections.local_server_for`).
 
    **Sutando Cloud is undecided** (per DotSpace or shared), so the s.space defaults carry no
    `cloud_origin`: `cloud_origin_for("s.space")` is `""` and callers fall back to the shared

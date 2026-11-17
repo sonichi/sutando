@@ -60,7 +60,7 @@ path: $FINDER_FILE
 EOF
   echo "[$TIMESTAMP] Dropped: file ($FINDER_FILE)" >> "$LOG_FILE"
   BASENAME=$(basename "$FINDER_FILE")
-  osascript -e "display notification \"File dropped: $BASENAME\" with title \"Sutando\""
+  bash "$(dirname "$0")/macos-notify.sh" "File dropped: $BASENAME"
   exit 0
 elif [ ${#VALID_FILES[@]} -gt 1 ]; then
   # Emit JSON-array on the `paths:` line so a path with spaces or colons
@@ -80,7 +80,7 @@ paths: $PATHS_JSON
 $HUMAN_LIST
 EOF
   echo "[$TIMESTAMP] Dropped: ${#VALID_FILES[@]} files" >> "$LOG_FILE"
-  osascript -e "display notification \"${#VALID_FILES[@]} files dropped\" with title \"Sutando\""
+  bash "$(dirname "$0")/macos-notify.sh" "${#VALID_FILES[@]} files dropped"
   exit 0
 fi
 
@@ -113,7 +113,7 @@ path: $DROP_IMAGE
 [Image dropped from clipboard]
 EOF
     echo "[$TIMESTAMP] Dropped: image ($(wc -c < "$DROP_IMAGE") bytes)" >> "$LOG_FILE"
-    osascript -e 'display notification "Image dropped — processing next pass" with title "Sutando"'
+    bash "$(dirname "$0")/macos-notify.sh" "Image dropped — processing next pass"
     exit 0
   fi
 fi
@@ -149,7 +149,7 @@ fi
 
 if [ -z "$SELECTED" ]; then
   echo "[$TIMESTAMP] Nothing selected" >> "$LOG_FILE"
-  osascript -e 'display notification "Nothing selected — select text first" with title "Sutando"'
+  bash "$(dirname "$0")/macos-notify.sh" "Nothing selected — select text first"
   exit 0
 fi
 
@@ -164,4 +164,4 @@ EOF
 echo "[$TIMESTAMP] Dropped: ${#SELECTED} chars" >> "$LOG_FILE"
 
 # Notify user
-osascript -e "display notification \"${#SELECTED} chars dropped — processing next pass\" with title \"Sutando\""
+bash "$(dirname "$0")/macos-notify.sh" "${#SELECTED} chars dropped — processing next pass"

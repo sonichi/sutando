@@ -390,6 +390,8 @@ fi
 HANDLER_STATE="absent"
 HELD_NAMES=""
 HELD_RETRY_AT=0
+# Tasks whose dead handler claim this watcher retired: their replay is the core's, held or not.
+RETIRED_CLAIMS=""
 DISPATCHED_IDS=""
 DECISION_IDENTITY=""
 # Called only where a task is actually admitted: announced to the core, or
@@ -398,6 +400,14 @@ DECISION_IDENTITY=""
 record_admission() {
   [ -z "$DECISION_IDENTITY" ] || DISPATCHED_IDS="$DISPATCHED_IDS$DECISION_IDENTITY
 "
+}
+# GNU first: on GNU, `stat -f` answers a different question and succeeds, so
+# the result is validated as numeric rather than trusted by exit status.
+file_mtime_s() {
+  local m
+  m="$(stat -c %Y -- "$1" 2>/dev/null || true)"
+  case "$m" in ''|*[!0-9]*) m="$(stat -f %m -- "$1" 2>/dev/null || true)" ;; esac
+  case "$m" in ''|*[!0-9]*) printf '' ;; *) printf '%s' "$m" ;; esac
 }
 # `ls -di` is one line on every POSIX ls; GNU `stat -f` prints a filesystem dump.
 task_file_identity() {
@@ -631,8 +641,10 @@ reconcile_dead_claims() {
     claim_is_live "$claim" && continue
     task_path="$(sed -n '3p' "$claim" 2>/dev/null)"
     retire_stale_claim "$claim" || continue
-    [ "${1:-}" = "hold" ] || continue
     fn="$(basename "$task_path")"
+    RETIRED_CLAIMS="$RETIRED_CLAIMS$fn
+"
+    [ "${1:-}" = "hold" ] || continue
     [ -f "$TASKS_DIR/$fn" ] || continue
     hold_task "$fn" now
   done
@@ -864,12 +876,9 @@ dispatch_task() {
   # Only a fresh sentinel can be racing its payload, and only the resolver's
   # typed "no payload" verdict (rc 4) is about the entry rather than the run.
   local max_attempts=3 mtime now age=0
-  # GNU first: on GNU, `stat -f` answers a different question and succeeds, so
-  # the result is validated as numeric rather than trusted by exit status.
-  mtime="$(stat -c %Y -- "$task_path" 2>/dev/null || true)"
-  case "$mtime" in ''|*[!0-9]*) mtime="$(stat -f %m -- "$task_path" 2>/dev/null || true)" ;; esac
+  mtime="$(file_mtime_s "$task_path")"
   now="$(date +%s)"
-  case "$mtime" in ''|*[!0-9]*) ;; *) age=$((now - mtime)) ;; esac
+  [ -z "$mtime" ] || age=$((now - mtime))
   attempt=0
   while :; do
     rc=5
@@ -904,6 +913,16 @@ dispatch_task() {
     printf 'already answered, not dispatching again: %s\n' "$announce" >&2
     return 0
   fi
+  # The core never routes or announces a task a worker's delivery committed (a worker's lane does so
+  # before publishing it), unless this core's own handler claim on it, live or retired, is unfinished.
+  if [ -z "${SUTANDO_INSTANCE_ID:-}" ] && [ -d "$WORKSPACE_DIR/deliveries" ] && [ ! -e "$CLAIMS_DIR/$filename" ] \
+     && ! printf '%s' "$RETIRED_CLAIMS" | grep -qxF -- "$filename" \
+     && "$SUTANDO_PY_BIN" "$__REPO_ROOT/src/delivery/task_dispatch.py" worker-committed "$WORKSPACE_DIR" "$filename" 2>/dev/null; then
+    printf 'held by a worker, not routing it: %s\n' "$announce" >&2
+    return 0
+  fi
+  [ -z "$RETIRED_CLAIMS" ] || RETIRED_CLAIMS="$(printf '%s' "$RETIRED_CLAIMS" | grep -vxF -- "$filename")
+"
   # By announce, not filename: a resolved entry's activity row must key on
   # the real payload, never the sentinel that basename alone would resolve.
   queued_activity_row "$announce"
@@ -914,11 +933,17 @@ dispatch_task() {
   # One admission per file identity per watcher lifetime: a later event for the
   # same bytes in the same inode is not a new task; a replaced file is.
   identity="$filename|$(task_file_identity "$task_path")"
-  # A malformed identity never dedupes: a duplicate is recoverable, a silently
-  # dropped task is not.
+  # Without a checksum, inode plus mtime still names these bytes well enough to
+  # dedupe a re-examination; no identity at all never dedupes (a duplicate is recoverable).
   case "$identity" in
     *"|"[0-9]*:[0-9]*-[0-9]*) ;;
-    *) echo "watch-tasks-stream: no usable file identity for $filename; dispatching without dedupe" >&2; identity="" ;;
+    *)
+      identity="$filename|$(ls -di -- "$task_path" 2>/dev/null | awk 'NR==1 {print $1}'):m$(file_mtime_s "$task_path")"
+      case "$identity" in
+        *"|"[0-9]*:m[0-9]*) echo "watch-tasks-stream: no usable checksum for $filename; deduping on inode and mtime" >&2 ;;
+        *) echo "watch-tasks-stream: no usable file identity for $filename; dispatching without dedupe" >&2; identity="" ;;
+      esac
+      ;;
   esac
   if [ -n "$identity" ] && [ -n "$DISPATCHED_IDS" ] && printf '%s' "$DISPATCHED_IDS" | grep -qxF -- "$identity"; then
     return 0
@@ -1079,7 +1104,7 @@ cleanup() {
   settle_own_claims_on_shutdown
   if [ -n "${WATCH_RUNTIME_DIR:-}" ]; then
     [ -z "${PRIORITY_RESOLUTION_CACHE:-}" ] || rm -rf "$PRIORITY_RESOLUTION_CACHE"
-    rm -f "$WATCH_RUNTIME_DIR/events"
+    rm -f "$WATCH_RUNTIME_DIR/events" "$WATCH_RUNTIME_DIR/catchup-mark" "$WATCH_RUNTIME_DIR/catchup-mark.cut"
     rmdir "$WATCH_RUNTIME_DIR" 2>/dev/null || true
   fi
   # A group this process does not lead is its launcher's (a wrapper shell waiting
@@ -1105,12 +1130,23 @@ trap cleanup EXIT
 # already-terminating group are both safe no-ops).
 trap 'cleanup; exit 0' HUP INT TERM
 
+# A worker's finished deliveries leave its inbox before the sweep resolves each entry.
+# The injected pool writer decides what is finished; a failure only costs a slower sweep.
+archive_finished_deliveries() {
+  local rc=0
+  [ -n "${SUTANDO_INSTANCE_ID:-}" ] && [ -f "${SUTANDO_POOL_DELIVERY_SCRIPT:-}" ] || return 0
+  run_bounded 120 -- "$SUTANDO_PY_BIN" "$SUTANDO_POOL_DELIVERY_SCRIPT" --workspace "$WORKSPACE_DIR" \
+    --recipient "$SUTANDO_INSTANCE_ID" archive-finished >/dev/null || rc=$?
+  [ "$rc" -eq 0 ] || echo "watch-tasks-stream: could not archive finished deliveries (rc $rc); sweeping every entry" >&2
+}
+
 # Initial sweep — surface any pre-existing tasks that arrived during a
 # restart gap, in priority order. Install cleanup first so an immediately
 # exiting fswatch cannot kill a just-started provider before its durable
 # fallback receipt is emitted.
 startup_sweep() {
   local fn
+  archive_finished_deliveries
   reconcile_dead_claims
   PRIORITY_RESOLUTION_CACHE="$WATCH_RUNTIME_DIR/priority-resolution"
   mkdir -p "$PRIORITY_RESOLUTION_CACHE"
@@ -1119,6 +1155,30 @@ startup_sweep() {
   done < <(priority_sorted_tasks)
   rm -rf "$PRIORITY_RESOLUTION_CACHE"
   PRIORITY_RESOLUTION_CACHE=""
+}
+# Every CATCHUP_INTERVAL seconds, events or not, the inbox is listed for what the event
+# stream never reported. The mark predates the startup sweep's listing; the dedupe absorbs the overlap.
+CATCHUP_INTERVAL="${SUTANDO_WATCHER_CATCHUP_SECONDS:-30}"
+case "$CATCHUP_INTERVAL" in ''|*[!0-9]*) CATCHUP_INTERVAL=30 ;; esac
+CATCHUP_INTERVAL=$((10#$CATCHUP_INTERVAL))
+[ "$CATCHUP_INTERVAL" -gt 0 ] || CATCHUP_INTERVAL=30
+CATCHUP_MARK="$WATCH_RUNTIME_DIR/catchup-mark"
+: > "$CATCHUP_MARK"
+# Entries whose ctime (a rename keeps the mtime; ctime is reset) falls after the previous pass
+# and before the last second meet one pass each. BSD and GNU -cnewer compare to the mark's mtime.
+catchup_sweep() {
+  local cut="$CATCHUP_MARK.cut" at stamp f
+  at=$(( $(date +%s) - 1 ))
+  stamp="$(date -r "$at" +%Y%m%d%H%M.%S 2>/dev/null)" || stamp="$(date -d "@$at" +%Y%m%d%H%M.%S 2>/dev/null)" || return 0
+  touch -t "$stamp" "$cut" 2>/dev/null || return 0
+  if [ ! "$cut" -nt "$CATCHUP_MARK" ]; then
+    rm -f "$cut"
+    return 0
+  fi
+  while IFS= read -r f; do
+    [ -n "$f" ] && handle_event "$f"
+  done < <(find "$TASKS_DIR_ABS" -maxdepth 1 -name '*.txt' -cnewer "$CATCHUP_MARK" ! -cnewer "$cut" 2>/dev/null | sort)
+  mv -f "$cut" "$CATCHUP_MARK"
 }
 # A session watcher sweeps only once the standby has stopped (below); any other
 # role has no peer on its inbox and sweeps before it subscribes, as always.
@@ -1278,6 +1338,10 @@ fi
 # sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
 if [ "$WATCHER_ROLE" = "standby" ] && sentinel_held_by_other_watcher "$PID_FILE" "$$" "$SUTANDO_PY_BIN"; then
   echo "watch-tasks-stream: standby not stamping $PID_FILE: it names live watcher pid $(cat "$PID_FILE" 2>/dev/null)" >&2
+elif ! inbox_in_workspace "$TASKS_DIR_ABS" "$WORKSPACE_DIR" \
+     && sentinel_held_by_other_inbox "$PID_FILE" "$$" "$TASKS_DIR_ABS" "$SUTANDO_PY_BIN"; then
+  # A foreign inbox resolved to this workspace (an inherited SUTANDO_WORKSPACE_DIR): never unready its own watcher.
+  echo "watch-tasks-stream: not stamping $PID_FILE: inbox $TASKS_DIR_ABS is outside $WORKSPACE_DIR and the sentinel names live watcher pid $(cat "$PID_FILE" 2>/dev/null)" >&2
 else
   echo "$$" > "$PID_FILE"
 fi
@@ -1345,18 +1409,30 @@ held_read_timeout() {
   left=$(( HELD_RETRY_AT - $(date +%s) ))
   [ "$left" -gt 0 ] && echo "$left" || echo 1
 }
+CATCHUP_NEXT=$(( SECONDS + CATCHUP_INTERVAL ))
 # fd 3 is the one reader: a second open of the FIFO would race it for bytes.
 while :; do
   # A due deadline is served BEFORE the read, so `-t` is never 0 and the held
   # set and deadline are current when the timeout is computed.
   retry_held_tasks_if_due
+  if [ "$SECONDS" -ge "$CATCHUP_NEXT" ]; then
+    catchup_sweep
+    CATCHUP_NEXT=$(( SECONDS + CATCHUP_INTERVAL ))
+  fi
   path=""
   t="$(held_read_timeout)"
+  catchup_left=$(( CATCHUP_NEXT - SECONDS ))
+  [ "$catchup_left" -gt 0 ] || catchup_left=1
+  if [ "$t" -eq 0 ] || [ "$t" -gt "$catchup_left" ]; then
+    t="$catchup_left"
+  fi
   if [ "$t" -gt 0 ]; then
     IFS= read -r -t "$t" path <&3; rc=$?
   else
     IFS= read -r path <&3; rc=$?
   fi
+  # bash 3.2's `read -t` alarm can cut a TERM trap's cleanup short and resume here.
+  [ "${CLEANING_UP:-0}" -eq 0 ] || { CLEANING_UP=0; cleanup; exit 0; }
   if [ "$rc" -eq 0 ]; then
     handle_event "$path"
   elif [ "$rc" -gt 128 ]; then

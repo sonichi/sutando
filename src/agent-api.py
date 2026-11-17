@@ -103,7 +103,8 @@ def validate_twilio_signature(handler, body: str) -> bool:
 
     mac = hmac.new(auth_token.encode(), param_string.encode(), hashlib.sha1)
     expected = base64.b64encode(mac.digest()).decode()
-    return hmac.compare_digest(expected, signature)
+    from secret_compare import secret_equal
+    return secret_equal(signature, expected)
 
 
 # Two separate concerns (per qingyun review on PR #775):
@@ -124,6 +125,7 @@ from sutando_config import config_get  # noqa: E402
 from sutando_platform import probe_pids  # noqa: E402
 import local_task_protocol  # noqa: E402
 import task_workstreams  # noqa: E402
+import tmux_probe  # noqa: E402
 import health_snapshot  # noqa: E402
 from task_archive import task_id_from_filename  # noqa: E402
 
@@ -138,6 +140,19 @@ if _PORT_ENV is not None and not _PORT_ENV.isdigit():
     # witness port must not silently collide with it.
     raise ValueError(f"AGENT_API_PORT={_PORT_ENV!r} is not a port number")
 PORT = int(_PORT_ENV) if _PORT_ENV is not None else 7843
+# Host names (beyond loopback and IP literals) this API may be reached by, e.g. a LAN name;
+# any other Host is refused as DNS rebinding. The web client's port gets same-host CORS reads.
+ALLOWED_HOSTS = config_get("AGENT_API_ALLOWED_HOSTS", "")
+
+
+def _port_setting(key: str, default: int) -> int:
+    try:
+        return int(config_get(key, str(default)) or default)
+    except ValueError:
+        return default
+
+
+WEB_CLIENT_PORT = _port_setting("CLIENT_PORT", 8080)
 
 # Personal-asset path resolver — see src/util_paths.py. Imported here so the
 # /avatar and /stand-identity endpoints prefer the per-machine private dir
@@ -453,13 +468,28 @@ def _newest_first(paths) -> list:
     return [p for _, p in pairs]
 
 
+def _task_homes() -> "list[tuple[Path, Path, str]]":
+    """(tasks dir, results dir, worker): the shared folders, then each own-folder pool worker's."""
+    from connections import own_worker_homes
+    return [(TASK_DIR, RESULT_DIR, "")] + [(h["tasks"], h["results"], h["worker"])
+                                           for h in own_worker_homes(WORKSPACE_DIR)]
+
+
+def _same_dir(a: Path, b: Path) -> bool:
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
 def _active_task_rows() -> list[dict]:
-    """Reconcile task/result files into the ten most recent history rows."""
+    """Reconcile task/result files into the ten most recent history rows; an own-folder pool worker's
+    task row carries its `worker`."""
+    homes = {}
+    for tasks_dir, results_dir, worker in _task_homes():
+        homes.update({path: (results_dir, worker) for path in tasks_dir.glob("*.txt")})
     # Classifier tasks are machinery, not user work, so they stay out of the
     # history the UI shows.
     for task_file in _newest_first(
         path
-        for path in TASK_DIR.glob("*.txt")
+        for path in homes
         if not path.stem.startswith(
             (
                 task_workstreams.CLASSIFIER_TASK_PREFIX,
@@ -467,6 +497,7 @@ def _active_task_rows() -> list[dict]:
             )
         )
     )[:10]:
+        results_dir, worker = homes[task_file]
         # A CLAIMED task is task-{id}.claimed-core-N.txt, but every writer puts
         # the reply at results/{id}.txt — so key AND look up by the canonical id.
         task_id = task_id_from_filename(task_file.name)
@@ -482,16 +513,19 @@ def _active_task_rows() -> list[dict]:
         # First `source:` and `task:` regardless of field order; body
         # lookalikes must not override the real headers.
         task_line, source_line = _task_display_fields(content)
-        result_file = RESULT_DIR / f"{task_id}.txt"
+        result_file = results_dir / f"{task_id}.txt"
         existing = task_history.get(task_id, {})
         # Priority: live file, then in-memory history, then archive. The
         # archive lookup is what survives a restart, when history is empty.
         archived_file = None
-        for month_dir in (RESULT_DIR / "archive").glob("*/"):
+        for month_dir in (results_dir / "archive").glob("*/"):
             candidate = month_dir / f"{task_id}.txt"
             if candidate.exists():
                 archived_file = candidate
                 break
+        if archived_file is None:
+            import task_lookup
+            archived_file = task_lookup.find_other_archived_result(WORKSPACE_DIR, task_id)
         result_text = _read_or_none(result_file)
         if result_text is not None:
             status = "done"
@@ -511,10 +545,15 @@ def _active_task_rows() -> list[dict]:
             "result": result_text,
             "source": source_line or existing.get("source", ""),
         }
+        if worker:
+            task_history[task_id]["worker"] = worker
 
-    # Results may outlive their task files after bridge cleanup.
-    for result_file in _newest_first(RESULT_DIR.glob("task-*.txt"))[:10]:
-        _remember_done_result_file(result_file)
+    # Results may outlive their task files after bridge cleanup; a live result counts only in its task's home.
+    from connections import task_home
+    for _tasks_dir, results_dir, _worker in _task_homes():
+        for result_file in _newest_first(results_dir.glob("task-*.txt"))[:10]:
+            if _same_dir(task_home(result_file.stem, WORKSPACE_DIR)["results"], results_dir):
+                _remember_done_result_file(result_file)
 
     # Reconcile stale rows after the disk scans above.
     import time as _time
@@ -523,8 +562,11 @@ def _active_task_rows() -> list[dict]:
     for task_id, task_data in list(task_history.items()):
         if task_data.get("status") != "working":
             continue
-        task_file = TASK_DIR / f"{task_id}.txt"
-        result_file = RESULT_DIR / f"{task_id}.txt"
+        task_file, result_file = TASK_DIR / f"{task_id}.txt", RESULT_DIR / f"{task_id}.txt"
+        if task_data.get("worker"):
+            from connections import task_home
+            home = task_home(task_id, WORKSPACE_DIR)
+            task_file, result_file = home["tasks"] / f"{task_id}.txt", home["results"] / f"{task_id}.txt"
         if result_file.exists():
             task_data["status"] = "done"
             task_data["result"] = result_file.read_text().strip()
@@ -1039,10 +1081,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def _bound_port(self) -> "int | None":
+        try:
+            return int(self.server.server_address[1])
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return None
+
+    def send_cors(self) -> None:
+        """Grant cross-origin reads to loopback pages, and to this host's own API and web-client
+        ports, never `*` (local_api_gate.cors_origin)."""
+        ports = {p for p in (self._bound_port(), PORT, WEB_CLIENT_PORT) if p}
+        origin = local_api_gate.cors_origin(self.headers.get("Origin"), self.headers.get("Host", ""), ports)
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+        self.send_header("Vary", "Origin")
+
     def send_json(self, status: int, data: dict):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_cors()
         self.end_headers()
         self.wfile.write(json.dumps(data).encode())
 
@@ -1065,6 +1122,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return True
 
     def do_OPTIONS(self):
+        if not self.host_allowed():
+            return
         if urlparse(self.path).path.startswith(CONNECTIONS_PREFIX):
             # No wildcard grant here: a loopback page may preflight, nothing else gets a header.
             self.send_response(204)
@@ -1077,7 +1136,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_cors()
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
@@ -1136,13 +1195,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
         status, payload = connections_http(method, parsed.path, body, parse_qs(parsed.query))
         self._send_connections(status, payload)
 
+    def host_allowed(self) -> bool:
+        """Refuse a DNS-rebinding request: its Host is the attacker's name, which a loopback name,
+        an IP literal or AGENT_API_ALLOWED_HOSTS never is. Twilio webhooks arrive through a tunnel
+        under its name and carry their own signature; a valid bearer cannot come from a rebinding
+        page either."""
+        if urlparse(self.path).path.startswith("/twilio/"):
+            return True
+        if local_api_gate.rebinding_safe_host(self.headers.get("Host", ""), ALLOWED_HOSTS):
+            return True
+        auth = self.headers.get("Authorization", "")
+        if (API_TOKEN and local_api_gate.bearer_matches(auth, API_TOKEN)) \
+                or local_api_gate.bearer_matches(auth, connections_bearer()):
+            return True
+        try:  # read a small body first, so the refusal reaches the caller instead of a reset
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            if 0 < length <= 65536:
+                self.rfile.read(length)
+        except (TypeError, ValueError, OSError):
+            pass
+        self.send_json(403, {"error": "host not allowed"})
+        return False
+
     def do_DELETE(self):
+        if not self.host_allowed():
+            return
         if urlparse(self.path).path.startswith(CONNECTIONS_PREFIX):
             self._connections_route("DELETE")
             return
         self.send_json(404, {"error": "not found"})
 
     def do_GET(self):
+        if not self.host_allowed():
+            return
         path = urlparse(self.path).path
         if path == "/ping":
             self.send_json(200, {"pong": True})
@@ -1222,10 +1307,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Historical response key is `claude`; its meaning is now "selected
             # core CLI is alive" so existing web clients remain compatible.
             try:
-                tmux_bin = (shutil.which("tmux") or
-                            next((p for p in ("/opt/homebrew/bin/tmux", "/usr/local/bin/tmux")
-                                  if Path(p).is_file()), None))
-                claude_ok = bool(tmux_bin) and subprocess.run(
+                tmux_bin = tmux_probe.tmux_binary()
+                claude_ok = subprocess.run(
                     [tmux_bin, "-S", os.environ.get("SUTANDO_TMUX_SOCKET", "/tmp/sutando-tmux.sock"),
                      "has-session", "-t", "=sutando-core"], capture_output=True,
                 ).returncode == 0
@@ -1267,7 +1350,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
                 self.send_header("Cache-Control", "public, max-age=86400")
-                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_cors()
                 self.end_headers()
                 self.wfile.write(avatar_file.read_bytes())
             else:
@@ -1360,7 +1443,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             mime = SAFE_TYPES.get(ext, 'application/octet-stream')
             self.send_response(200)
             self.send_header("Content-Type", mime)
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_cors()
             self.send_header("Cache-Control", "public, max-age=300")
             self.end_headers()
             self.wfile.write(media_path.read_bytes())
@@ -1492,6 +1575,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         global voice_desired_state
+        if not self.host_allowed():
+            return
         path = urlparse(self.path).path
 
         # Twilio webhook endpoints (no auth — Twilio signs requests)
@@ -1931,6 +2016,10 @@ def _resolve_local_ip() -> str:
 
 if __name__ == "__main__":
     bind = config_get("AGENT_API_BIND", "127.0.0.1")
+    refusal = local_api_gate.lan_bind_refusal(bind, API_TOKEN)
+    if refusal:
+        print(refusal, file=sys.stderr, flush=True)
+        sys.exit(2)
     # ThreadingHTTPServer: the single-threaded HTTPServer wedged whenever one
     # client stalled mid-request or a handler ran a slow subprocess/urlopen —
     # every later request hung on a port that still looked open to startup.sh's
@@ -1959,7 +2048,7 @@ if __name__ == "__main__":
     print("  GET  /status — health + capabilities")
     print("  GET  /ping   — alive check")
     if bind == "127.0.0.1":
-        print("  (localhost only — set AGENT_API_BIND=0.0.0.0 for LAN access)")
+        print("  (localhost only — for LAN access set AGENT_API_BIND=0.0.0.0 and SUTANDO_API_TOKEN)")
     # A supervised replacement of this gateway (desktop token rotation / adopted-process takeover)
     # sends SIGTERM.
     def _reap_and_exit(_signum, _frame):

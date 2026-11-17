@@ -144,6 +144,27 @@ class Edges(unittest.TestCase):
         at.close_turn(self.state, ctx["turn_id"])
         self.assertFalse(path.exists())
 
+    def test_a_turn_closed_once_closes_again_without_error(self):
+        ctx = _ctx(self.state)
+        path = at.write_turn_context(self.state, ctx)
+        self.assertTrue(at.close_turn(self.state, ctx["turn_id"]))
+        closed = self.state / "turns" / f"{ctx['turn_id']}.closed"
+        self.assertEqual(stat.S_IMODE(closed.stat().st_mode), 0o400)
+        path.write_text(json.dumps(ctx))                    # its turn file left by an interrupted close
+        self.assertTrue(at.close_turn(self.state, ctx["turn_id"]), "a second close is no error")
+        self.assertFalse(path.exists(), "and it still drops the turn file")
+        self.assertTrue(at.is_closed(self.state, ctx["turn_id"]))
+
+    def test_a_dangling_closed_entry_is_no_fence_and_keeps_the_turn_file(self):
+        ctx = _ctx(self.state)
+        path = at.write_turn_context(self.state, ctx)
+        closed = self.state / "turns" / f"{ctx['turn_id']}.closed"
+        closed.symlink_to(self.state / "missing-fence")
+        with self.assertRaises(OSError):
+            at.close_turn(self.state, ctx["turn_id"])
+        self.assertTrue(path.exists(), "its turn file stays, so the close is retried")
+        self.assertFalse(at.is_closed(self.state, ctx["turn_id"]), "and nothing reads it as fenced")
+
     def test_odd_journal_lines_and_outcome_shapes(self):
         turn = _ctx(self.state)["turn_id"]
         at.room_actions_path(self.state).write_text(
@@ -352,6 +373,121 @@ class TurnGate(unittest.TestCase):
 
 
 
+class AnsweredInJournal(unittest.TestCase):
+    """A succeeded answer is True, a failed one False; anything that cannot be told is None."""
+
+    def setUp(self):
+        self.state = Path(tempfile.mkdtemp())
+
+    def answer(self, tid, op, status=None):
+        recs = [{"record_type": at.INTENT, "task_id": tid, "operation_id": op, "action": "room.question.answer",
+                 "question_id": "rq"}]
+        if status:
+            recs.append({"record_type": at.OUTCOME, "task_id": tid, "operation_id": op, "operation_status": status})
+        _journal(self.state, *recs)
+
+    def test_each_outcome_reads_as_answered_not_answered_or_unknown(self):
+        self.assertFalse(at.answered_in_journal(self.state, "tsk_A", "rq"), "no journal: not answered")
+        self.answer("tsk_A", "op1", "failed")
+        self.assertFalse(at.answered_in_journal(self.state, "tsk_A", "rq"))
+        self.answer("tsk_B", "op2")
+        self.assertIsNone(at.answered_in_journal(self.state, "tsk_B", "rq"), "sent, outcome unknown")
+        self.answer("tsk_C", "op3", "succeeded")
+        self.assertTrue(at.answered_in_journal(self.state, "tsk_C", "rq"))
+        _journal(self.state, {"record_type": at.INTENT, "task_id": "tsk_D", "operation_id": "op4",
+                              "action": "room.message.send"})
+        self.assertFalse(at.answered_in_journal(self.state, "tsk_D", "rq"), "another action is not an answer")
+
+    def test_an_answer_counts_only_for_the_question_it_names(self):
+        def sent(tid, op, status, **q):
+            _journal(self.state, {"record_type": at.INTENT, "task_id": tid, "operation_id": op,
+                                  "action": "room.question.answer", **q},
+                     {"record_type": at.OUTCOME, "task_id": tid, "operation_id": op, "operation_status": status})
+        sent("tsk_Q", "q1", "succeeded", question_id="rq_other")
+        self.assertIs(at.answered_in_journal(self.state, "tsk_Q", "rq"), False, "another question's answer")
+        self.assertIs(at.answered_in_journal(self.state, "tsk_Q", "rq_other"), True)
+        sent("tsk_Q", "q2", "succeeded", arguments={"question_id": "rq_args"})
+        self.assertIs(at.answered_in_journal(self.state, "tsk_Q", "rq_args"), True, "named in its arguments")
+        sent("tsk_L", "l1", "succeeded")
+        self.assertIsNone(at.answered_in_journal(self.state, "tsk_L", "rq"), "a legacy answer naming no question")
+        sent("tsk_M", "m1", "failed")
+        self.assertIs(at.answered_in_journal(self.state, "tsk_M", "rq"), False, "a failed one is no answer at all")
+
+    def test_a_rotation_mid_read_never_loses_an_answer(self):
+        self.answer("tsk_R", "r1", "succeeded")
+        live = at.room_actions_path(self.state)
+        real, rotations = Path.read_text, []
+
+        def rotating(path, *a, **k):
+            if path == live and len(rotations) < self.rotate_times:
+                rotations.append(1)
+                os.replace(live, live.with_name(live.name + ".1"))
+                live.write_text("")
+            return real(path, *a, **k)
+        self.rotate_times = 1
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=rotating):
+            self.assertIs(at.answered_in_journal(self.state, "tsk_R", "rq"), True, "re-read once the files hold still")
+        self.rotate_times = at.JOURNAL_SNAPSHOT_TRIES + 1
+        rotations.clear()
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=rotating):
+            self.assertIsNone(at.answered_in_journal(self.state, "tsk_R", "rq"), "never still: cannot be told")
+
+    def test_an_answer_seen_in_the_rotated_file_survives_a_rotation_that_drops_it(self):
+        self.answer("tsk_K", "k1", "succeeded")
+        live = at.room_actions_path(self.state)
+        os.replace(live, live.with_name(live.name + ".1"))     # the answer is in .1
+        live.write_text("")
+        real, done = Path.read_text, []
+
+        def rotating(path, *a, **k):
+            out = real(path, *a, **k)
+            if path == live and not done:              # after .1 was read: rotate again, dropping it
+                done.append(1)
+                os.replace(live, live.with_name(live.name + ".1"))
+                live.write_text("")
+            return out
+        with mock.patch.object(Path, "read_text", autospec=True, side_effect=rotating):
+            self.assertIs(at.answered_in_journal(self.state, "tsk_K", "rq"), True, "what an earlier read saw is kept")
+
+    def test_disagreeing_question_ids_or_odd_shapes_read_as_unknown_never_raise(self):
+        _journal(self.state, {"record_type": at.INTENT, "task_id": "tsk_D", "operation_id": "d1",
+                              "action": "room.question.answer", "question_id": "rq",
+                              "arguments": {"question_id": "rq_other"}},
+                 {"record_type": at.OUTCOME, "task_id": "tsk_D", "operation_id": "d1", "operation_status": "succeeded"})
+        self.assertIsNone(at.answered_in_journal(self.state, "tsk_D", "rq"), "it may have answered either")
+        self.assertIs(at.answer_question_id({"question_id": "rq", "arguments": {"question_id": "rq"}}), "rq")
+        for i, (op, status) in enumerate((("e1", ["failed"]), ("e2", {"s": 1}), (["e3"], "failed"), ({"x": 1}, "succeeded"))):
+            with self.subTest(op=op, status=status):
+                tid = f"tsk_E{i}"
+                _journal(self.state, {"record_type": at.INTENT, "task_id": tid, "operation_id": op,
+                                      "action": "room.question.answer", "question_id": "rq"},
+                         {"record_type": at.OUTCOME, "task_id": tid, "operation_id": op, "operation_status": status})
+                self.assertIsNone(at.answered_in_journal(self.state, tid, "rq"))
+
+    def test_only_a_definite_failure_reads_as_not_answered(self):
+        for i, status in enumerate(("dispatched_unknown", "accepted", "running", "timeout", "", None, 7)):
+            with self.subTest(status=status):
+                tid = f"tsk_S{i}"
+                _journal(self.state, {"record_type": at.INTENT, "task_id": tid, "operation_id": f"s{i}",
+                                      "action": "room.question.answer", "question_id": "rq"},
+                         {"record_type": at.OUTCOME, "task_id": tid, "operation_id": f"s{i}",
+                          "operation_status": status})
+                self.assertIsNone(at.answered_in_journal(self.state, tid, "rq"), "its answer may have been applied")
+        self.answer("tsk_F", "f1", "failed")
+        self.assertIs(at.answered_in_journal(self.state, "tsk_F", "rq"), False)
+
+    def test_a_damaged_or_unreadable_journal_is_unknown_only_for_the_task_it_names(self):
+        path = at.room_actions_path(self.state)
+        path.write_text('{"task_id": "tsk_A", "record\n\n{"task_id": "tsk_Z"}\n')
+        self.assertIsNone(at.answered_in_journal(self.state, "tsk_A", "rq"))
+        self.assertFalse(at.answered_in_journal(self.state, "tsk_B", "rq"), "another task's damage is not its")
+        path.write_text('{"task_id": "tsk_A", "record_type": "dispatch_intent"}\n{"task_id": "tsk_A", "parti')
+        self.assertIsNone(at.answered_in_journal(self.state, "tsk_A", "rq"), "an append in progress may be its answer")
+        self.assertFalse(at.answered_in_journal(self.state, "tsk_B", "rq"), "a fresh partial line of another task is not")
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError(13, "denied")):
+            self.assertIsNone(at.answered_in_journal(self.state, "tsk_A", "rq"))
+
+
 class ResultFileDecision(unittest.TestCase):
     def setUp(self):
         self.state = Path(tempfile.mkdtemp())
@@ -407,6 +543,35 @@ class ResultFileDecision(unittest.TestCase):
                          _outcome(turn, 1, phase=phase, terminal=True, requested="done"))
                 d = at.result_file_decision(at.read_turn_records(state, turn), "final answer")
                 self.assertEqual((d.action, d.fields), (at.SETTLE, {}))
+
+    def test_a_lost_or_unknown_ask_outcome_is_never_posted_as_the_reply(self):
+        for outcome in (None, "dispatched_unknown"):
+            with self.subTest(outcome=outcome):
+                state = Path(tempfile.mkdtemp())
+                turn = _ctx(state)["turn_id"]
+                recs = [_intent(turn, 1, action="room.question.ask")]
+                if outcome:
+                    recs.append(_outcome(turn, 1, op_status=outcome))
+                _journal(state, *recs)
+                d = at.result_file_decision(at.read_turn_records(state, turn), "I asked which colour")
+                self.assertEqual((d.action, d.fields), (at.POST, {"status": "waiting_input", "no_send": True}))
+        state = Path(tempfile.mkdtemp())
+        turn = _ctx(state)["turn_id"]
+        _journal(state, _intent(turn, 1, action="room.question.ask"))
+        failed = {"operation_id": f"op_{turn}_1", "operation_status": "failed", "turn_id": turn, "seq": 1}
+        self.assertEqual(at.result_file_decision(at.read_turn_records(state, turn), "I asked",
+                                                 reconciled=[failed]).fields,
+                         {"status": "failed", "no_send": True}, "the ask failed: 'I asked' is never the reply")
+        state = Path(tempfile.mkdtemp())
+        turn = _ctx(state)["turn_id"]
+        _journal(state, _intent(turn, 1, action="room.question.ask"), _outcome(turn, 1, op_status="failed"))
+        self.assertEqual(at.result_file_decision(at.read_turn_records(state, turn), "I asked").fields,
+                         {"status": "failed", "no_send": True}, "a failed ask in the journal itself")
+        state = Path(tempfile.mkdtemp())
+        turn = _ctx(state)["turn_id"]
+        _journal(state, _intent(turn, 1), _outcome(turn, 1, op_status="dispatched_unknown"))
+        self.assertEqual(at.result_file_decision(at.read_turn_records(state, turn), "the answer").fields,
+                         {"status": "completed"}, "a lost message send is not a question")
 
     def test_an_outcome_whose_task_the_ledger_does_not_know_is_unknown_not_terminal_or_suspended(self):
         def unknown(turn, seq, action="room.message.send", status="done"):
@@ -535,6 +700,57 @@ class ResultFileDecision(unittest.TestCase):
         self.assertEqual(at.result_file_decision(at.read_turn_records(state, turn), "x").fields,
                          {"status": "failed", "no_send": True})
 
+
+
+class AnswerOutcomes(unittest.TestCase):
+    """An answer to another task's question never rules this task's turn."""
+
+    def recs(self, *outcomes, action="room.question.answer"):
+        intents = [{"record_type": at.INTENT, "turn_id": "t", "seq": o["seq"],
+                    "operation_id": o["operation_id"], "action": action} for o in outcomes]
+        return at.TurnRecords(intents, list(outcomes), True, (), False)
+
+    def test_another_tasks_input_ready_does_not_suspend_this_one(self):
+        other = {**_outcome("t", 1, phase="input_ready"), "task_id": "tsk_asker"}
+        v = at.classify_turn(self.recs(other), stdout="ok", task_id="tsk_me")
+        self.assertNotEqual(v.outcome, at.DURABLY_SUSPENDED)
+        d = at.result_file_decision(self.recs(other), "Answered blue.", task_id="tsk_me")
+        self.assertEqual((d.action, d.fields), (at.POST, {"status": "completed"}))
+
+    def test_an_answer_outcome_tagged_with_this_task_still_never_rules_it(self):
+        # The proxy tags the record with the caller's task, while the applied state is the asker's.
+        for applied in ({"phase": "input_ready"}, {"phase": "completed", "terminal": True}):
+            with self.subTest(applied=applied):
+                ans = {**_outcome("t", 1, **applied), "task_id": "tsk_me", "action": "room.question.answer"}
+                v = at.classify_turn(self.recs(ans), stdout="ok", task_id="tsk_me")
+                self.assertNotIn(v.outcome, (at.DURABLY_SUSPENDED, at.TERMINAL_CONFIRMED))
+                d = at.result_file_decision(self.recs(ans), "Answered blue.", task_id="tsk_me")
+                self.assertEqual((d.action, d.fields), (at.POST, {"status": "completed"}))
+
+    def test_an_answer_outcome_without_its_own_action_field_still_never_rules_it(self):
+        # The action may sit on the intent only; the outcome is matched to it by operation_id.
+        ans = {**_outcome("t", 1, phase="input_ready"), "task_id": "tsk_me"}
+        self.assertNotIn("action", ans)
+        v = at.classify_turn(self.recs(ans), stdout="ok", task_id="tsk_me")
+        self.assertNotEqual(v.outcome, at.DURABLY_SUSPENDED)
+        d = at.result_file_decision(self.recs(ans), "Answered blue.", task_id="tsk_me")
+        self.assertEqual((d.action, d.fields), (at.POST, {"status": "completed"}))
+
+    def test_its_own_ask_still_suspends_it(self):
+        own = {**_outcome("t", 1, phase="input_ready"), "task_id": "tsk_me"}
+        ask = "room.question.ask"
+        self.assertEqual(at.classify_turn(self.recs(own, action=ask), task_id="tsk_me").outcome,
+                         at.DURABLY_SUSPENDED)
+        untagged = _outcome("t", 1, phase="input_ready")
+        self.assertEqual(at.classify_turn(self.recs(untagged, action=ask), task_id="tsk_me").outcome,
+                         at.DURABLY_SUSPENDED, "an outcome without a task_id is the turn's own")
+
+    def test_another_tasks_terminal_or_reconciled_outcome_does_not_settle_this_one(self):
+        other = {**_outcome("t", 1, phase="completed", terminal=True), "task_id": "tsk_asker"}
+        self.assertNotEqual(at.classify_turn(self.recs(other), task_id="tsk_me").outcome, at.TERMINAL_CONFIRMED)
+        rec = {**_outcome("t", 2, phase="input_ready"), "task_id": "tsk_asker"}
+        v = at.classify_turn(self.recs(), reconciled=[rec], task_id="tsk_me")
+        self.assertNotEqual(v.outcome, at.DURABLY_SUSPENDED)
 
 if __name__ == "__main__":
     unittest.main()

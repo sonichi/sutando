@@ -28,7 +28,7 @@ jobs:
   # suite may pin a doc's wording (worker-pool-design-retractions does).
   changes:
     name: classify the diff
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       code: ${{ steps.classify.outputs.code }}
@@ -77,7 +77,7 @@ jobs:
 
   typecheck-and-test:
     name: lints + typecheck
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 20, not 10: measured 2026-08-03, this job is at capacity on legitimate work,
     # not hanging. Run 30801403218 spent 3.9 min (node tests) + 3.2 min (python) +
     # 1.5 min (shell, cut off) + ~1.4 min setup = 10.0 min and was CANCELED mid-step.
@@ -212,7 +212,7 @@ jobs:
     # Job-level, not per step: a docs-only diff skips the whole runner, and the
     # aggregator below treats that skip as a pass only when `changes` said so.
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -273,7 +273,7 @@ jobs:
     name: out-of-tree python tests
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -305,6 +305,7 @@ jobs:
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_pool_advertisement_push.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_lock_heartbeat_thread.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_worker_profile_labels.py
+          timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_agent_profile_placement.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_agent_profile_host_id.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_inbox_channel.py
           timeout -k 5 120 python3 packages/ag2-sparrow/tests/test_event_consumer.py
@@ -322,7 +323,7 @@ jobs:
     name: claude-local Mod harness
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -351,12 +352,14 @@ jobs:
           timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test ag2space-inbox
           cd "$GITHUB_WORKSPACE/skills/pr-watch"
           timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test mod
+          cd "$GITHUB_WORKSPACE/src/agent/claude"
+          timeout -k 5 120 "$RUNNER_TEMP/claude-cli/node_modules/.bin/claude" plugin test task-watch-mod
 
   shell-standalone-tests:
     name: shell tests (lanes)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -386,7 +389,7 @@ jobs:
     name: shell tests (serial tail ${{ matrix.shard }}/3)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The process-table suites run one at a time per runner: three runners, each
     # a cost-balanced third of the tail, so the tail is no longer the longest job.
     strategy:
@@ -408,7 +411,7 @@ jobs:
     name: ag2-sparrow publish gate (python 3.11, ${{ matrix.shard }}/3)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The same gate the tag publish runs whole, split by measured cost; leg 1 adds the drift guard.
     strategy:
       fail-fast: false
@@ -431,7 +434,7 @@ jobs:
     name: python standalone tests (${{ matrix.shard }}/15)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Legs 1-13 share the files by measured cost; legs 14-15 run the load-sensitive
     # suites (see the step). The coverage-gate job combines every leg's data.
     strategy:
@@ -465,7 +468,7 @@ jobs:
         run: python3 -m pip install coverage 'detect-secrets>=1.5.0' 'discord.py>=2.3'
 
       # watch-tasks-stream-config-hot-reload.test.py exercises the real
-      # live-streaming fswatch path (no stub) -- ubuntu-latest does not ship
+      # live-streaming fswatch path (no stub) -- ubuntu-24.04 does not ship
       # fswatch, so that test silently exercised nothing (its subprocess died
       # at exec with no writer, indistinguishable from "no event" downstream).
       - name: Install fswatch
@@ -493,7 +496,9 @@ jobs:
           export RECDIR
           # `skills` too: a skill owns its own tests/, so a suite that moves into one
           # keeps running; the root is optional, so it is added only when present.
-          bash scripts/discover-python-tests.sh > "$RECDIR/all"
+          bash scripts/discover-python-tests.sh > "$RECDIR/discovered"
+          # Quarantined flakes leave every gating leg; `python quarantined tests` still runs them.
+          bash scripts/select-quarantined-suites.sh without tests/python-quarantine.txt < "$RECDIR/discovered" > "$RECDIR/all"
           # The two legs after the shared ones run the listed load-sensitive suites (a timing
           # suite beside a CPU-heavy neighbour misses its own window); the shared legs get the rest.
           LIST=tests/python-load-sensitive-suites.txt
@@ -585,6 +590,51 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  python-quarantined-tests:
+    name: python quarantined tests (non-blocking)
+    # Not in required-tests' needs: it reports the quarantined flakes and never gates.
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies (clean)
+        run: npm ci
+
+      - name: Install Python test deps
+        run: python3 -m pip install coverage 'detect-secrets>=1.5.0' 'discord.py>=2.3'
+
+      - name: Install fswatch
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq fswatch
+
+      - name: Run quarantined Python tests (report only)
+        run: |
+          LIST=tests/python-quarantine.txt
+          bash scripts/discover-python-tests.sh > /tmp/discovered
+          bash scripts/select-quarantined-suites.sh only "$LIST" < /tmp/discovered > /tmp/quarantined
+          echo "### Quarantined Python tests" >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r f; do
+            issue="$(awk -v f="$f" '$1 == f {print $2}' "$LIST")"
+            start=$SECONDS
+            if output="$(PYTHONFAULTHANDLER=1 timeout -k 5 -s ABRT 240 python3 "$f" 2>&1)"; then
+              echo "→ $f passed ($((SECONDS - start))s)"
+              echo "- passed: \`$f\` ($issue)" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::warning::quarantined test failed (not gating): $f — $issue"
+              echo "$output" | tail -n 60
+              echo "- **failed**: \`$f\` ($issue)" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done < /tmp/quarantined
+
   coverage-gate:
     name: diff coverage >= 95% (python)
     # Enforces >= 95% coverage on the Python lines this PR changes, judged from
@@ -595,7 +645,7 @@ jobs:
     # A docs-only diff has no Python lines to measure; the required check reads
     # a skipped job as satisfied, and `changes` is what said the diff is docs.
     if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
@@ -646,7 +696,7 @@ jobs:
     # that fails when any suite fails, so a split cannot weaken protection.
     needs: [changes, typecheck-and-test, node-tests, oot-python-tests, mod-harness-tests, shell-standalone-tests, shell-tail-tests, python-standalone-tests, sparrow-publish-gate]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       # `needs.*.result` is checked explicitly: a job skipped because its

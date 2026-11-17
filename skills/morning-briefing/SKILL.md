@@ -47,6 +47,13 @@ python3 src/morning-briefing.py
 
 `src/morning-briefing.py` is the single source of truth for core briefing data: weather (Open-Meteo), the calendar cache (or macOS Calendar + Reminders, opt-in only), overnight Discord DMs, pending questions, and system health. It writes output to `results/proactive-<ts>.txt` and sends a Discord DM directly. Review its output before composing the full briefing — do NOT re-fetch those sources manually.
 
+**Weather location:** If the base briefing asks which city or town to use, keep that question in
+the delivered briefing and omit weather until the owner answers. Do not infer a location from
+timezone or use a default city. When the owner answers, resolve their city to coordinates
+(clarify ambiguous place names) and save `WEATHER_LAT` and `WEATHER_LON` in the existing
+`env` stanza of `sutando.config.local.json`, preserving other settings. Subsequent briefings
+use those saved coordinates.
+
 **Then augment with the following if configured (skip if not available):**
 
 1. **Email** — Read the unread inbox through the Station Gmail connector (`composio_find` /

@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import math
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -27,7 +26,8 @@ from typing import Callable
 from activity_rows import append as append_row
 from activity_rows import task_from_file
 from file_lock import locked_file
-from local_task_protocol import valid_local_task_id
+from local_task_protocol import parse_task_headers, valid_local_task_id
+from safe_number import finite
 from task_queue import position as queue_position
 from workspace_default import resolve_workspace
 
@@ -98,6 +98,13 @@ class LifecycleTransition:
 
 
 @dataclass(frozen=True)
+class StopRequest:
+    """A Stop the owner asked for: the room sees it at once, the phase waits for the confirmed stop."""
+    task_id: str
+    ts: float | None = None
+
+
+@dataclass(frozen=True)
 class RuntimeEvent:
     task_id: str
     activity_session_id: str
@@ -165,11 +172,19 @@ _PHASE_ROW = {
 }
 
 
-def reduce(state: TaskActivityState, item: LifecycleTransition | RuntimeEvent) -> tuple[TaskActivityState, list[dict]]:
+def reduce(state: TaskActivityState, item: "LifecycleTransition | RuntimeEvent | StopRequest"
+           ) -> tuple[TaskActivityState, list[dict]]:
     """Pure: returns the next state and the rows that project this step. Duplicates and
     out-of-order items change nothing; a terminal phase never regresses."""
     now = item.ts if item.ts is not None else time.time()
     rows: list[dict] = []
+    if isinstance(item, StopRequest):
+        if state.phase in TERMINAL or "stop_requested" in state.applied:
+            return state, rows
+        state.applied.append("stop_requested")
+        rows.append(_row(state, "notice", "stop requested", now,
+                         audience=state.visibility.get("lifecycle", LIFECYCLE_AUDIENCE), projection="TASK_STATUS"))
+        return state, rows
     if isinstance(item, LifecycleTransition):
         key = item.key(state)
         if key in state.applied:
@@ -252,10 +267,33 @@ CANCEL_RE = re.compile(r"CANCEL_INSTRUCTION:\s*stop processing\s+(task-[A-Za-z0-
 
 
 def cancel_target(task_text: str | None) -> str | None:
-    """The task a CANCEL_INSTRUCTION names, else None: the scheduler marks it CANCELLED on arrival."""
+    """The task a CANCEL_INSTRUCTION names, else None: a stop is requested on arrival, and the task
+    is CANCELLED only once the core has handled the instruction without answering it."""
     m = CANCEL_RE.search(task_text or "")
     tid = m.group(1) if m else None
     return tid if tid and ("~" not in tid or valid_local_task_id(tid)) else None
+
+
+# Who may stop a task: the bridge's own control writer and the owner's local voice session; the
+# runtime API only through task.cancel, which alone writes `interaction_type: task_cancel`.
+STOP_SOURCES = frozenset({"relay-control", "voice", "runtime-api"})
+
+
+def trusted_cancel_target(text: str | None, filename: str | None = None) -> str | None:
+    """The task a stop instruction names, only when the file itself is one a stop may come from:
+    headers above `task:` (which no body can forge) at owner tier from a stop source, its id the
+    file's own, and its task line the instruction. None for anything else."""
+    parsed = parse_task_headers(text or "")
+    h = parsed.headers
+    source = (h.get("source") or "").strip()
+    if (h.get("access_tier") or "").strip() != "owner" or source not in STOP_SOURCES:
+        return None
+    if source == "runtime-api" and (h.get("interaction_type") or "").strip() != "task_cancel":
+        return None
+    if filename is not None and (h.get("id") or "").strip() != Path(filename).name.removesuffix(".txt"):
+        return None
+    task = (parsed.body or "").lstrip()
+    return cancel_target(task.split("\n", 1)[0]) if task.startswith("CANCEL_INSTRUCTION:") else None
 
 
 def transition_from_file(to_phase: str, task_file: Path, *, reason: str = "", into_task: str | None = None,
@@ -309,8 +347,8 @@ def engaged_at(workspace: Path, task_id: str) -> float | None:
                     continue
                 if rec.get("kind") not in _ENGAGED_KINDS:
                     continue
-                ts = rec.get("ts")
-                if isinstance(ts, (int, float)) and not isinstance(ts, bool) and math.isfinite(ts):
+                ts = finite(rec.get("ts"))
+                if ts is not None:
                     newest = ts if newest is None else max(newest, ts)
     except OSError:
         return None
@@ -337,7 +375,7 @@ def in_progress(workspace: Path, task_id: str, max_age: float = IN_PROGRESS_MAX_
     row_ts = engaged_at(workspace, task_id)
     if row_ts is not None:
         stamps.append(row_ts)
-    stamps = [x for x in stamps if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)]
+    stamps = [finite(x) for x in stamps if finite(x) is not None]
     if not stamps:
         return False
     age = (time.time() if now is None else now) - float(max(stamps))
@@ -372,6 +410,8 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--task-file"); t.add_argument("--task-id"); t.add_argument("--reason", default="")
     t.add_argument("--into-task"); t.add_argument("--worker"); t.add_argument("--workspace")
     t.add_argument("--ts", type=float, default=None, help="when this transition happened (epoch); default now")
+    s = sub.add_parser("stop-requested"); s.add_argument("--task-id", required=True); s.add_argument("--workspace")
+    c = sub.add_parser("stop-target"); c.add_argument("--task-file", required=True); c.add_argument("--workspace")
     e = sub.add_parser("event"); e.add_argument("task_id"); e.add_argument("kind", choices=EVENT_KINDS)
     e.add_argument("--session", required=True); e.add_argument("--seq", type=int, required=True)
     e.add_argument("--text", default=""); e.add_argument("--workspace")
@@ -391,6 +431,20 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 return 0
             state = store.apply(item)
+        elif a.cmd == "stop-target":
+            try:
+                text = Path(a.task_file).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                return 0
+            target = trusted_cancel_target(text, a.task_file)
+            if target:
+                print(target)
+            return 0
+        elif a.cmd == "stop-requested":
+            if "~" in a.task_id and not valid_local_task_id(a.task_id):
+                print(f"not a task id: {a.task_id!r}", file=sys.stderr)
+                return 2
+            state = store.apply(StopRequest(a.task_id))
         else:
             state = store.apply(RuntimeEvent(a.task_id, a.session, a.seq, a.kind, text=a.text))
         print(json.dumps({"task_id": state.task_id, "phase": state.phase, "generation": state.generation, "seq": state.seq}))
@@ -432,7 +486,7 @@ class ActivityStore:
         tmp.write_text(json.dumps(asdict(state), ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, p)
 
-    def apply(self, item: LifecycleTransition | RuntimeEvent) -> TaskActivityState:
+    def apply(self, item: "LifecycleTransition | RuntimeEvent | StopRequest") -> TaskActivityState:
         """Load → drain → reduce → save (rows pending) → project → save (drained), all under one lock
         per task, so two emitters serialize their rows as well as their transitions. A projection
         that fails leaves its rows pending in the snapshot; the next apply on that task drains them

@@ -93,6 +93,12 @@ class ViewTests(unittest.TestCase):
         self.ws = Path(self.tmp.name)
         self.vault = FakeVault()
         self.gateway = FakeGateway()
+        import connections
+        # reconnect's preflight asks the target checkout what it resolves; this one is a fixture.
+        probe = unittest.mock.patch.object(connections, "_launch_probe", lambda repo, env, python: {
+            "workspace": str(self.ws.resolve()), "host": connections._this_host()})
+        probe.start()
+        self.addCleanup(probe.stop)
         self.spawned = []
         self.view = ConnectionsView(self.ws, self.ws / "repo", self.ws / "logs", vault=self.vault,
                                     fetch=self.gateway, spawn=self._spawn, kill=lambda *a: None,

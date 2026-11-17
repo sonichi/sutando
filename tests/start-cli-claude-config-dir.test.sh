@@ -52,6 +52,8 @@ setup_sandbox() {
   BIN_STUB="$SANDBOX/bin"
   export HOME="$SANDBOX/home"
   export SUTANDO_WORKSPACE="$SANDBOX/workspace"
+  # The tmux stub runs only a bare `claude`; the Mod's absolute-path launch has its own tests.
+  export SUTANDO_TASK_WATCH_MOD_CORE=0
   # Prevent ambient CLAUDE_CONFIG_DIR (from the test runner's own session) from
   # leaking into the spawned process and breaking the "not set" assertion.
   unset CLAUDE_CONFIG_DIR
@@ -158,8 +160,8 @@ EOF
   cp "$REAL_REPO/src/claude_config_dir.sh" "$REPO_FAKE/src/"
   # Sourced by the launcher before anything else it does here.
   cp "$REAL_REPO/src/agent/restart-guard.sh" "$REPO_FAKE/src/agent/"
-  cp "$REAL_REPO/src/agent/core-runtime-record.sh" "$REAL_REPO/src/agent/core-window.sh" "$REPO_FAKE/src/agent/"
-  cp "$REAL_REPO/src/core_runtime_record.py" "$REAL_REPO/src/result_publish.py" "$REPO_FAKE/src/"
+  cp "$REAL_REPO/src/agent/core-runtime-record.sh" "$REAL_REPO/src/agent/core-window.sh" "$REAL_REPO/src/agent/launch-path.sh" "$REPO_FAKE/src/agent/"
+  cp "$REAL_REPO/src/core_runtime_record.py" "$REAL_REPO/src/result_publish.py" "$REAL_REPO/src/result_labels.py" "$REPO_FAKE/src/"
   cp "$REAL_REPO/src/agent/task-event-handler-lookup.sh" "$REPO_FAKE/src/agent/"
   cp "$REAL_REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO_FAKE/src/agent/claude/cli/"
   cp "$REAL_REPO/hooks/skip-ask-user-question.py" "$REPO_FAKE/hooks/"
@@ -183,7 +185,7 @@ EOF
 
 cleanup_sandbox() {
   [ -n "${SANDBOX:-}" ] && rm -rf "$SANDBOX" || true
-  unset SANDBOX REPO_FAKE ENV_DUMP BIN_STUB HOME SUTANDO_WORKSPACE
+  unset SANDBOX REPO_FAKE ENV_DUMP BIN_STUB HOME SUTANDO_WORKSPACE SUTANDO_TASK_WATCH_MOD_CORE
 }
 
 REAL_REPO="$(cd "$(dirname "$0")/.." && pwd)"

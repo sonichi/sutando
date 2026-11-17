@@ -756,6 +756,58 @@ class TestWorkerHeld(ClassifyBase):
         self.assertFalse((self.ws.root / "deliveries").exists())
         self.assertEqual(self.one()["verdict"], "orphan")
 
+    def test_a_live_background_marker_does_not_hold_at_recovery(self):
+        sys.path.insert(0, str(REPO / "src"))
+        import task_delegation
+        self.held_task()
+        task_delegation.mark(self.ws.root, self.HELD, 1800)
+        self.assertEqual(self.one()["verdict"], "orphan")
+
+    def test_holder_lookup_delegates_to_the_shared_predicate(self):
+        sys.path.insert(0, str(REPO / "src"))
+        import task_delegation
+        with unittest.mock.patch.object(task_delegation, "holder", return_value="w9") as h:
+            self.assertEqual(self.mod._holder_of(self.ws.root, self.HELD), "w9")
+        h.assert_called_once_with(self.ws.root, self.HELD, worker_holder=self.mod._pool_holder,
+                                  include_background=False)
+
+
+class TestLimitHeld(ClassifyBase):
+    """A task that arrived while the core was paused for a provider limit waits for the core:
+    the hold record names it, the classifier reads that record and never archives it."""
+
+    def _hold_then_resume(self, arrived: str) -> None:
+        sys.path.insert(0, str(REPO / "src"))
+        import core_limit_hold as clh
+        now = NOW - 7200
+        rec = {"available": False, "last_checked": iso(now - 30),
+               "headers": {"anthropic-ratelimit-unified-status": "rejected",
+                           "anthropic-ratelimit-unified-7d-status": "rejected",
+                           "anthropic-ratelimit-unified-7d-reset": str(int(now + 600))},
+               "recent_rejections": [{"ts": iso(now - 30), "status": 429, "model": "claude-opus-5-5",
+                                      "snippet": "rate_limit_error usage limit"}]}
+        (self.ws.root / "state").mkdir(exist_ok=True)
+        self.assertFalse(clh.decide(self.ws.root, now, quota=rec).launch)
+        self.ws.task(f"{arrived}.txt", chat_task_text(arrived, now + 60))
+        self.assertFalse(clh.decide(self.ws.root, now + 120, quota=rec).launch)
+        self.assertTrue(clh.decide(self.ws.root, now + 600 + clh.RESET_GRACE_S + 1, quota=rec).launch)
+
+    def test_task_that_arrived_during_a_hold_is_held_not_orphan(self):
+        self._hold_then_resume("task-held-1")
+        row = self.one()
+        self.assertEqual(row["verdict"], "held", row)
+
+    def test_a_result_still_wins_over_held(self):
+        self._hold_then_resume("task-held-2")
+        (self.ws.root / "results" / "task-held-2.txt").write_text("answered\n")
+        self.assertEqual(self.one()["verdict"], "done")
+
+    def test_unlisted_task_keeps_the_age_rule(self):
+        (self.ws.root / "state").mkdir()
+        (self.ws.root / "state" / "core-limit-hold.json").write_text(
+            json.dumps({"status": "released", "held_tasks": ["task-other"]}))
+        self.ws.task("task-old.txt", chat_task_text("task-old", NOW - 3600))
+        self.assertEqual(self.one()["verdict"], "orphan")
 
 
 def local_time(epoch: float) -> str:

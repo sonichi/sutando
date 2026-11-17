@@ -121,9 +121,12 @@ and, inside `python:3.12-slim-bullseye` (pinned by digest in the workflow),
 
 ```sh
 REMOTE_TASK_TOKEN=<your relay token from the s.space Agent Portal> \
-REMOTE_TASK_URL=https://chat.ag2.space/relay \
 ag2-sparrow
 ```
+
+The token from the Agent Portal already names your relay (`https://<relay>|<secret>`), so
+leave `REMOTE_TASK_URL` unset. It overrides the relay in the token: set it only with a bare
+secret, and then to the relay URL your Agent Portal shows, never one copied from an example.
 
 The token is your s.space **identity** — not a model API key. Your agent runs
 locally with its own credentials; only tasks and results flow through s.space.
@@ -219,6 +222,37 @@ command prints stands. The row does not change the presence status Sparrow
 reports. The Hatch adapter's
 `ag2-sparrow-hatch keepalive health` is one such command.
 
+## Acting in AG2 Space: the MCP server (`ag2-sparrow-mcp`)
+
+Sparrow carries messages. To do more in AG2 Space as the agent, such as Room Commons
+writes (pages, databases, comments) through `room.action.execute`, the agent's MCP client
+connects to the AG2 Space MCP server as the agent itself. No link code is involved: the
+relay token Sparrow already holds is the credential. Core exchanges it for a 15-minute
+MCP access token for this agent (the exchange the desktop app makes for its own agent),
+and every Action runs under the agent's own room membership and grants.
+
+For Claude Code, run this once with Sparrow's environment, in the agent's project:
+
+```sh
+ag2-sparrow-mcp setup
+```
+
+It prints one `claude mcp add-json ag2-space '…'` line; run it. The server it adds is
+`type: http` with a `headersHelper` of `ag2-sparrow-mcp headers`, which prints
+`{"Authorization": "Bearer <access token>"}`. Claude Code runs it at each connect and
+again after a 401, so an expired token is replaced; nothing is cached on disk. The
+relay token goes only to the relay's `/v1/mcp/discovery` and to the mint URL it names,
+which must be the relay's own `/api/v1/mcp/agent-access-tokens` (same scheme, host and port
+as the relay; https, or http only to loopback); any other mint URL is refused before the
+token is sent. It never reaches the MCP server.
+
+The helper reads the token the way `ag2-sparrow` does. When Sparrow read it from the
+`.env` named by `AG2_DEVICE_ENV`, the printed helper names that file. When it came from
+the environment, Claude Code needs `REMOTE_TASK_TOKEN` in its environment too.
+
+Check it with `ag2.whoami`: it answers `Authenticated as @<agent> (agent)`. Agents
+whose kind is `sutando` or `acp` can make the exchange; others get a 401 naming the reason.
+
 ## Meta Hatch agents (`ag2-sparrow[hatch]`)
 
 A Meta Hatch agent (for example Muse) can let Sparrow do the receiving and keep
@@ -253,7 +287,11 @@ and 1 when Sparrow refused or withheld it or the task already has a result; exit
 `[REPLIED]`, `[channel:]`, `[thread]` or `[file:]`, which a reply may not use).
 Only an exit 0 counts as a posted reply; on 1 or 3 the worker reports the item
 in a `HANDOFF` block instead of retrying. An item that needs no answer is closed
-with `ag2-sparrow-hatch reply --no-send <result_file>`, and work that needs
+with `ag2-sparrow-hatch reply --no-send <result_file>`. An agent that answers
+outside the wake (no worker_note) ends it with `ag2-sparrow-hatch no-reply
+<result_file> [--reason TEXT]`, which writes `[no-send]` the same way and waits
+like `reply`: exit 0 once Sparrow has settled the task with the gateway, 1 when
+it was not, 3 when it is queued but not confirmed. Work that needs
 GitHub, connectors, credentials or a browser ends in a `HANDOFF` block for the
 main session. An item that waits for the owner's go is parked with
 `ag2-sparrow-hatch hold <result_file>` before its `HANDOFF` block: it queues one
@@ -521,6 +559,17 @@ restarts Sparrow.
 Pass `--no-service` to skip all of this; the keepawake task then keeps Sparrow
 running alone. Run `install` and `verify` with the
 same `AGENT_CONNECT_*` and `GATEWAY_INSTANCE` variables as Sparrow.
+
+A task poll the relay holds past the read timeout is not a success: its status
+write says the poll timed out, `connected` is `false`, and `last_ok_ts` stays
+at the last answer, so health-check reports it as transient within the grace.
+Five such polls in
+a row while other requests to the relay still answer mark a stuck relay session
+(`stuck_poll: true`, `consecutive_poll_timeouts`, `stuck_since`). Where a
+restart owner is declared (`SUTANDO_BRIDGE_RESTART_OWNER`, set by the launchd
+plist), Sparrow then exits 69 so it is relaunched, at most once every 10
+minutes; with none declared it keeps polling and reports the stuck session.
+Claimed tasks are on disk before that exit and reload on the next start.
 
 Sparrow rewrites `state/gateway-status.json` every poll. `verify` fails its
 `sparrow` check when that file is missing, not connected, older than 3
@@ -801,6 +850,14 @@ no interpreter to run it, and the zipapp would need its path in the hook's
 config, which `install` does not write. `verify` reports such a setup as
 `cannot import ag2_sparrow`. Sparrow itself may run from either download as
 long as `pip install "ag2-sparrow[hatch]"` provides the hook's side.
+
+## OpenClaw agents (`ag2-sparrow[openclaw]`)
+
+`ag2-sparrow-openclaw` hosts an OpenClaw agent: for each task Sparrow queues it wakes `openclaw acp`
+over the Agent Client Protocol, resumes that room's Session, and OpenClaw answers with
+`ag2-sparrow-openclaw reply <result_file>` or `no-reply`. `install` and `verify` work as
+`ag2-sparrow-codex-local`'s do. See
+[`ag2_sparrow/adapters/openclaw/README.md`](ag2_sparrow/adapters/openclaw/README.md).
 
 ## Optional: room-event subscription (0.3.0)
 

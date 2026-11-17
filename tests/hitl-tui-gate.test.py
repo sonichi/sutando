@@ -85,6 +85,23 @@ class TestRequirement(unittest.TestCase):
             self.assertEqual([a.kind for a in r.actions], ["authenticate", "open_terminal"])
             self.assertIsNone(G.keys_for(clicked(r, "authenticate"), LOGIN if gate else None, state))
 
+    def test_a_signed_out_codex_core_never_gets_a_claude_sign_in_card(self):
+        expired = "  ⎿  Login expired · Please run /login"
+        for gate, state, prompt in (("login", "blocked-human", LOGIN), (None, "logged-out", None),
+                                    ("login", "logged-out", expired)):
+            r = G.requirement_for(state, gate, prompt, "s", "d", FALLBACK, runtime="codex")
+            self.assertEqual(r.kind, "auth")
+            self.assertEqual(r.runtime, "codex")
+            text = " ".join([r.title or "", r.message] + [a.label for a in r.actions])
+            self.assertNotIn("Claude", text)
+            self.assertEqual(r.title, "Codex needs you to sign in again")
+            self.assertIn("codex login", r.message)
+
+    def test_an_unnamed_runtime_gets_a_generic_sign_in_card(self):
+        r = G.requirement_for("logged-out", None, None, "s", "d", FALLBACK, runtime="agy")
+        self.assertEqual(r.kind, "auth")
+        self.assertNotIn("Claude", " ".join([r.title or "", r.message] + [a.label for a in r.actions]))
+
     def test_press_enter_is_a_confirmation_that_continues(self):
         r = req("press-enter", PRESS)
         self.assertEqual(r.kind, "confirmation")

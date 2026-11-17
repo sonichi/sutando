@@ -78,6 +78,56 @@ The Codex implementation:
 - uses approval policy `never` and sandbox `danger-full-access`, matching the
   full local access required by the owner core;
 - enables web search and makes the user's home directory available;
+- raises Codex's 32 KiB `project_doc_max_bytes` default, which otherwise drops the
+  tail of the checkout's `AGENTS.md`;
+- on a desktop-hosted checkout (`<app-support>/engine/<checkout>`), links the
+  host's `engine/AGENTS.md` into `$CODEX_HOME/AGENTS.md`
+  (`src/codex_host_instructions.py`). Codex reads AGENTS.md only from its project
+  root down, so without the link a Codex core never sees the host's first-contact
+  and Getting started instructions that a Claude core reads from the parent
+  directory. The link is only ever made in the app-private Codex home the launcher
+  created: `CODEX_HOME` must be absolute, contain no `..`, and have no symlink or
+  non-directory component anywhere. Otherwise the helper refuses it as `invalid-home`,
+  creates nothing and the launcher warns; a symlinked `CODEX_HOME` is never followed.
+  One owner, `src/codex_home.py` (shell adapter `src/agent/codex/codex-home.sh`),
+  resolves the configured Codex home once, checks it with the helper's mutation-free
+  `--check`, and creates it only after an explicit `ok` or `no-host`. The startup auth
+  preflight, the core launcher, the worker launcher and `skills/install.sh` all call it
+  and create nothing themselves; project trust, the host link and the reset timer are
+  handed its one resolved home and skip when it is empty. A missing interpreter, a
+  failing or silent checker, or a desktop env name other than `CODEX_HOME` (the only one
+  Codex reads) refuses. `skills/install.sh` takes its `skills/` folder from the same
+  owner (`codex_home.py child`), which on a desktop host refuses a `skills` that is a
+  symlink or not a directory, so no skill is linked through it into another tree,
+  the owner's `~/.codex/skills` included. A non-desktop checkout is unchanged: its home is created as
+  before and the effective home is the one Codex reads. A `CODEX_HOME` that is, case-folded and Unicode-normalized (as APFS compares names), any spelling of `~/.codex` or below
+  is refused as `owner-home` from its path alone, before anything is created. The
+  spellings are `$HOME/.codex`, `realpath($HOME)/.codex`, and every target its symlink
+  chain names, read textually whether or not the target exists; a chain of more than 32
+  links (Darwin's limit) refuses. The helper walks down from `/`
+  one real directory at a time (`O_DIRECTORY|O_NOFOLLOW`, relative to the parent's
+  descriptor). Before each step and before each directory it creates, it compares the
+  open directory's identity with the owner's `~/.codex`, or, while that does not exist
+  yet, with its nearest existing ancestor plus the missing names compared the same way. A match,
+  or an identity it cannot read, refuses the link. That owner record is read again before
+  every directory it creates and right before the link, and any change observed by the
+  recheck refuses. The helper protects against pre-existing/stable aliases and owner-home
+  changes observed before each mutation. Concurrent replacement or retargeting of
+  `$HOME/.codex` (or an ancestor) by the user or another same-UID process while the helper
+  runs is unsupported. In that worst case the host AGENTS.md link can be created in the
+  app home at the instant another process makes that home reachable as `~/.codex`; the
+  helper still never removes or replaces an existing entry. Anything already at
+  `$CODEX_HOME/AGENTS.md`, a broken link included, is left as it is, with a warning.
+  Codex reads `$CODEX_HOME/AGENTS.override.md` in place of `AGENTS.md` only when it can
+  open it as a regular file whose whole content (read to EOF, no cap) is not blank:
+  content that is not valid UTF-8 counts, any non-whitespace character (a NUL included)
+  counts, and blank means only Unicode
+  White_Space characters, as Rust's `char::is_whitespace` (U+0009 to U+000D, U+0020,
+  U+0085, U+00A0, U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F, U+3000).
+  So an empty or whitespace-only file, a directory, FIFO, dangling or looping link, or an unreadable
+  file there does not count and the link is made. When a readable override
+  exists, the launcher links nothing, leaves it as it is and warns that the core reads
+  it instead of the host's file;
 - honors `SUTANDO_CORE_MODEL`, `SUTANDO_CORE_WORKING_DIR`, and the more specific
   `SUTANDO_CODEX_WORKING_DIR`;
 - runs a separate managed `sutando-core-watcher` tmux session that converts
@@ -98,6 +148,75 @@ The Codex implementation:
   with no other window still ends with its core, as before. A live window that is neither a
   known sibling (`gateway-*`, `monitor`) nor started as `codex` could be a core the
   launcher cannot identify, so it refuses to heal (exit 3) rather than start a second core.
+
+### Pickup while delegated work continues
+
+The managed core notifier keeps reading task announcements while a previously
+submitted task awaits its final result. Every new submission, including the first
+one after notifier restart, requires a fresh, healthy, idle observer record bound
+to the same core process incarnation. Missing, unknown, stale or moving runtime
+state blocks submission even if the terminal looks idle. The launcher gives a genuinely new CLI process a fixed managed liveness prompt:
+reply READY without tools, files, or external messages. Existing processes are never
+sent this bootstrap on adoption or notifier restart. The normal observer must see
+the resulting successful turn before task admission; there is no pane-only fallback. The observer must be restarted to emit incarnation data.
+It admits another task only when the
+terminal is positively idle and empty, and the observer has witnessed the exact
+submitted prompt in a successfully completed **parent** turn. The receipt binds
+the prompt digest, its acceptance/completion times and the core process incarnation.
+Subagent completions, aborted/failed turns, stale observations and an idle-looking
+composer alone cannot release the next prompt. Pool-worker notifiers keep their
+existing serial behavior; this does not enable `codex queue` or interrupt a busy turn.
+
+The shared in-flight writer records intent before Enter. A confirmed parent-turn
+receipt is remembered separately until the actual task result arrives, so notifier
+restarts and later observer turns do not replay delegated work. Related workstream
+context remains available until the result is found or the task payload disappears.
+Startup and shutdown reconcile retained artifacts, including tasks completed while
+the notifier was down and therefore omitted from the watcher’s pending sweep.
+Without an explicit `SUTANDO_NOTIFIER_RETRY_INTERVAL`, matching healthy turns are
+checked every second; empty, refused, uncertain or held queues wait 30 seconds.
+An explicit interval must be an integer from 1 to 3600 seconds; invalid values
+refuse notifier startup with a diagnostic. Watcher task announcements wake either wait
+immediately; these intervals do not change admission or recovery eligibility.
+A new core incarnation invalidates the prior incarnation's markers, as in the
+existing shared marker contract; restarting the core is not a duplicate-free retry
+for work that might have completed externally.
+
+Missing proof falls back to waiting for the task's result. After the existing
+completion deadline, an uncertain submission is retained **without automatic
+replay**, and `codex-task-notifier` health reports a warning. A crash between the
+intent record and Enter can therefore require operator inspection. No automatic
+restart or unsafe keystroke recovery is performed. A fully observed failed root turn carries a separate terminal receipt; it never
+acknowledges a task. For `server_overloaded` only, the notifier can send the same
+liveness prompt after a fixed 30-second backoff when no in-flight or yielded task
+markers remain and the positively empty pane and process incarnation still match.
+A durable claim is written before typing. At most one probe is allowed until a
+later successfully completed correlated turn, including across notifier restarts and uncertain
+keystroke outcomes. A failed probe therefore cannot loop requests. Login, quota,
+unclassified API errors, aborted turns, incomplete history and unresolved submitted
+tasks require explicit recovery or disposition. They remain queued without replay.
+Pre-admission refusals are deduplicated in local diagnostics and reported by health.
+The fixed tool-free READY check fits a normal 80-column pane. Recovery requires
+one fully visible composer row and a recognized footer; wrapped or ambiguous drafts
+are refused without folding whitespace. After one paste, recovery polls for up to
+2 seconds on a monotonic clock for the exact probe, accepting only empty or exact
+byte-prefix renderings while waiting. Each check refreshes the candidate receipt
+and process incarnation; unknown or foreign composer content fails closed. Existing
+subprocess timeouts still apply, so this is not a hard 2-second wall-clock limit.
+Recovery never pastes again, and a timeout or refusal leaves the claim spent.
+If a recovery paste leaves a READY check draft or the staged text does not match,
+the claim remains spent. Inspect the pane and manually clear only the draft you
+recognize; automation never clears an unknown human composer to retry recovery.
+For task pickup, a typing failure before Enter is still retried; this change does not establish its underlying cause.
+
+For a trial, restart the managed notifier and observer to load the new code. The
+local `state/codex-pickup.json` records startup code hashes, fixed event counters,
+and the latest 64 timing events. Task keys are hashed; prompt text, pane contents,
+account identifiers and helper stderr are not copied into this evidence. These
+records stay local; publication requires a separate audience/privacy check.
+A useful live witness has a parent return while its worker remains outstanding,
+then a second task answered before the first result. Unit tests alone are not
+that live witness.
 
 Task wakeups leave tmux copy mode before typing. The shared sender issues
 `copy-mode -q` and then, in the same tmux command list, an `if-shell -F

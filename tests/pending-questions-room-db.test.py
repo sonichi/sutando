@@ -301,7 +301,7 @@ class TestDiscoveryAndScriptClient(_Ws):
         self.assertEqual(where, ROOM)
         self.assertIn(AGENT, store.client.argv)
         self.assertEqual(store.lock, self.ws / "state" / "pending-questions-db.lock")
-        self.assertEqual(store.link, "https://collab.test.invalid/home/!ownerdm%3Atest.invalid?surface=database&page=pendingq")
+        self.assertIsNone(store.link, "an unknown server has no app link")
 
     def test_the_script_client_round_trips_through_the_adapter(self):
         _install_fake_capability(self.ws)
@@ -334,7 +334,7 @@ class TestDiscoveryAndScriptClient(_Ws):
         with mock.patch.dict(os.environ, env):
             store, _ = adapter.room_store(self.ws, environ=env)
             self.assertIn("--collab-url", store.client.argv)
-            self.assertTrue(store.link.startswith("https://unreachable.test.invalid/"))
+            self.assertIsNone(store.link, "a transport override never becomes an app link")
             out = self.ask("q?", store=store)
         self.assertIn("service refused the socket", out["db_error"])
         self.assertEqual(len(self.outbox()), 1)

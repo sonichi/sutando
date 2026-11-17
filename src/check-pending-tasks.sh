@@ -49,6 +49,15 @@ fi
 TASKS_DIR="$WORKSPACE/tasks"
 RESULTS_DIR="$WORKSPACE/results"
 DELIVERIES_DIR="$WORKSPACE/deliveries"
+# A pool worker on its own folders: its launcher sets SUTANDO_INBOX_KIND empty (a plain inbox) and
+# names them. It owes what its own inbox holds, judged by the same scan as the core's queue.
+OWN_INBOX=""
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ] && [ "${SUTANDO_INBOX_KIND-unset}" = "" ] \
+   && [ -n "${SUTANDO_TASKS_DIR:-}" ] && [ -n "${SUTANDO_RESULTS_DIR:-}" ]; then
+  OWN_INBOX=1
+  TASKS_DIR="$SUTANDO_TASKS_DIR"
+  RESULTS_DIR="$SUTANDO_RESULTS_DIR"
+fi
 
 # An unmarked session is a guest only while a marked core is alive ON THIS HOST
 # to own the queue (a fresh state/cores/<host-label>.alive; the workspace syncs
@@ -116,23 +125,20 @@ print("1" if isinstance(d, dict) and d.get("stop_hook_active") is True else "0")
 #     answered from its OWN deliveries folder only, never the core's tasks/
 #     queue, which is not this session's to report on.
 owned_task_ids() {
-  # What THIS worker was handed. Same owner as claimed_by_a_worker's contract
+  # What THIS worker was handed. Same owner as held_elsewhere's worker contract
   # (src/delivery/task_dispatch.py), so the sentinel suffixes are spelled there
   # and never here. rc 2 = cannot decide: reported, never silently skipped.
   "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" owned-by "$DELIVERIES_DIR" "$1"
 }
 
-claimed_by_a_worker() {
-  # The sentinel layout is src/delivery/task_dispatch.py:worker_holds's contract,
-  # shared with the task notifiers; no python reads as "not held" (reported, like already_delivered).
-  local task_id="$1" rc
-  [ -n "$PYBIN" ] || return 1
-  # A missing script (minimal bundle) can hold nothing -- its rc 2 must not
-  # collapse into the same code path as "deliveries root unreadable" below.
-  [ -f "$REPO_DIR/src/delivery/task_dispatch.py" ] || return 1
-  "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" worker-holds "$DELIVERIES_DIR" "$task_id.txt" >/dev/null 2>&1; rc=$?
-  # 2 = cannot decide (root unreadable): hold, never report it to the core.
-  [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]
+held_elsewhere() {
+  # One predicate (src/task_delegation.py holder): a worker sentinel, else a live delegation
+  # marker postdating $2. rc 0 held, 3 undecidable (held); no python or script reads as not held.
+  local rc
+  [ -n "$PYBIN" ] && [ -f "$REPO_DIR/src/task_delegation.py" ] || return 1
+  "$PYBIN" "$REPO_DIR/src/task_delegation.py" holder "$1" --task-file "$2" \
+    --deliveries "$DELIVERIES_DIR" --workspace "$WORKSPACE" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]
 }
 
 # A delivered result is claimed out of results/ within about a second
@@ -151,10 +157,12 @@ claimed_by_a_worker() {
 # archive-YYYY-MM-DD layout and the prefix-collision case the shared module's
 # own test suite pins), which is exactly the duplicated-policy failure mode
 # the shared owner exists to close off.
+# With the queued file as $2: when it is a wake turn, an older result answered an earlier turn.
 already_delivered() {
-  local task_id="$1"
+  local task_id="$1" since=()
   [ -n "$PYBIN" ] || return 1
-  "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" has-result "$RESULTS_DIR" "$task_id.txt" >/dev/null 2>&1
+  [ -z "${2:-}" ] || since=(--task-file "$2")
+  "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" has-result "$RESULTS_DIR" "$task_id.txt" ${since[@]+"${since[@]}"} >/dev/null 2>&1
 }
 
 # A task the core is on RIGHT NOW is not a stop-time orphan (user report
@@ -162,8 +170,18 @@ already_delivered() {
 # life of a task it was working, ~6/hour). The scheduler's own activity snapshot
 # (src/activity_bus.py, state/activity/<task-id>.json) says RUNNING with fresh
 # activity; queued, waiting on a person, stale, unreadable or absent still blocks.
+# A wake turn ($2) left unanswered by a turn that recorded a no-send is not in progress.
 task_in_progress() {
   [ -n "$PYBIN" ] || return 1
+  if [ -z "${NO_SEND_THIS_TURN:-}" ]; then
+    NO_SEND_THIS_TURN=no
+    "$PYBIN" "$REPO_DIR/src/turn_ledger.py" --workspace "$WORKSPACE" no-send-this-turn >/dev/null 2>&1 \
+      && NO_SEND_THIS_TURN=yes
+  fi
+  if [ "$NO_SEND_THIS_TURN" = yes ] && [ -n "${2:-}" ] \
+    && "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" wake-turn "$(dirname "$2")" "$(basename "$2")" >/dev/null 2>&1; then
+    return 1
+  fi
   [ -f "$REPO_DIR/src/activity_bus.py" ] || return 1
   "$PYBIN" "$REPO_DIR/src/activity_bus.py" in-progress "$1" --workspace "$WORKSPACE" \
     --max-age "${SUTANDO_STOP_HOOK_IN_PROGRESS_MAX_AGE:-1800}" >/dev/null 2>&1
@@ -173,7 +191,7 @@ UNPROCESSED=""
 UNPROCESSED_NAMES=""
 shopt -s nullglob 2>/dev/null
 
-if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ] && [ -z "$OWN_INBOX" ]; then
   # Worker mode: judge only this instance's own folder, never the core's queue.
   # An unreadable folder (rc 2) must not read as "nothing owed", so the ids are
   # captured first and a non-zero status reports rather than skips.
@@ -209,15 +227,40 @@ $( [ -f "$PAYLOAD" ] && cat "$PAYLOAD" || echo "(payload not found at $PAYLOAD)"
 
 "
   done
+elif [ -n "$OWN_INBOX" ]; then
+  # An own-folder worker: what its inbox owes is task_dispatch's one rule (unanswered-in),
+  # the same answer pool supervision reads; a task it is on right now is not an orphan.
+  if [ -z "$PYBIN" ]; then
+    UNPROCESSED+="--- $TASKS_DIR/ (no interpreter to tell what it owes) ---
+
+"
+  else
+    OWED="$("$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" unanswered-in "$TASKS_DIR" "$RESULTS_DIR" --workspace "$WORKSPACE" 2>/dev/null)"
+    while IFS=$'\t' read -r TASK_ID f; do
+      [ -n "$TASK_ID" ] || continue
+      task_in_progress "$TASK_ID" "$f" && continue
+      UNPROCESSED_NAMES="$UNPROCESSED_NAMES $TASK_ID.txt"
+      if [ -f "$RESULTS_DIR/$TASK_ID.txt" ]; then
+        UNPROCESSED+="--- $TASK_ID.txt (result file is EMPTY — it delivers nothing; write a real reply) ---
+
+"
+        continue
+      fi
+      UNPROCESSED+="--- $TASK_ID.txt ---
+$(cat "$f")
+
+"
+    done <<< "$OWED"
+  fi
 else
   # Core mode: the queue is tasks/, minus anything the router already handed
   # to a worker.
   for f in "$TASKS_DIR"/*.txt; do
     BASENAME=$(basename "$f")
     TASK_ID="${BASENAME%.txt}"
-    claimed_by_a_worker "$TASK_ID" && continue
-    already_delivered "$TASK_ID" && continue
-    task_in_progress "$TASK_ID" && continue
+    held_elsewhere "$TASK_ID" "$f" && continue
+    already_delivered "$TASK_ID" "$f" && continue
+    task_in_progress "$TASK_ID" "$f" && continue
     UNPROCESSED_NAMES="$UNPROCESSED_NAMES $BASENAME"
     if [ -f "$RESULTS_DIR/$BASENAME" ]; then
       # Readiness is owned by src/delivery/readiness.py; existence is not
@@ -243,7 +286,9 @@ $(cat "$f")
   done
 fi
 
-if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
+if [ -n "$OWN_INBOX" ]; then
+  BLOCK_REASON="Unprocessed tasks in $TASKS_DIR/"
+elif [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
   BLOCK_REASON="Unprocessed deliveries in deliveries/$SUTANDO_INSTANCE_ID/"
 else
   BLOCK_REASON="Unprocessed tasks in tasks/"

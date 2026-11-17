@@ -41,6 +41,7 @@ Machine-readable ownership and lifecycle metadata lives in
 
 ## Operations
 
+- [PR-watch runner lifecycle](pr-watch-lifecycle.md) — thread and process draining, shutdown limits, and isolated verification.
 - [Recovery issue metrics](recovery-issue-metrics.md) — persistent issue IDs and recovery-rate definitions.
 
 - [Release process and migrations](release-process.md)
@@ -66,6 +67,7 @@ Machine-readable ownership and lifecycle metadata lives in
 ## Architecture and decisions
 
 - [Architecture boundaries](architecture-boundaries.md)
+- [Agent-native design rules](agent-native-design-rules.md) — the rules every contribution follows: an agent can do what a person can through an Action; what an agent needs from a person is a control, not a sentence; the contributor and reviewer checklist.
 - [ag2-sparrow v1 delivery contract](sparrow-v1-contract.md)
 - [D1 identity/state census (strangler Slice 1)](census/d1-identity-census.md)
 - [The file delivery protocol as a formal state machine](delivery-protocol.md)
@@ -117,3 +119,5 @@ python3 skills/release/scripts/docs_audit.py
 - [GitHub verification receipts](github-verification.md) — bounded PR evidence and governed foreground publication.
 
 - [Outstanding cron payload preservation](cron-outstanding-payload.md) — immutable prompt tasks until retirement.
+
+- [Task wedge detection](task-wedge-detection.md): detector coverage, recovery, origin-message status and latency evidence.

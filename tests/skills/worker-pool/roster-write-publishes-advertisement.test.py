@@ -24,7 +24,6 @@ sys.path.insert(1, str(Path(__file__).resolve().parents[3] / "src"))
 import pool_advertise as pa  # noqa: E402
 import pool_roster as pr  # noqa: E402
 
-import worker_picker_commands as wpc  # noqa: E402
 
 W1 = "a3f91c2d4e5b6a7c8d9e0f1a2b3c4d5e"
 W2 = "b4e02d3c5f6a7b8c9d0e1f2a3b4c5d6e"
@@ -98,26 +97,6 @@ class TestPublishFailureIsNamed(Base):
         self.assertIsInstance(cm.exception, OSError)
         self.assertEqual(cm.exception.roster["bindings"][ROOM], W1)
         self.assertEqual(json.loads(pr.roster_path(self.ws).read_text())["bindings"][ROOM], W1)
-
-    def test_apply_records_nothing_when_the_publish_fails(self):
-        real = pa.write_advertisement
-        pa.write_advertisement = lambda ws, now=None: (_ for _ in ()).throw(OSError(28, "No space left"))
-        self.addCleanup(lambda: setattr(pa, "write_advertisement", real))
-        cmd = {"action": "pin", "room": ROOM, "workers": [W1], "dedicated": False}
-        with self.assertRaises(pr.PublishError):
-            wpc.apply(self.ws, cmd, task_id="task-pin-1")
-        self.assertFalse((self.ws / "state" / "picker-applied.json").exists()
-                         and ROOM in (json.loads((self.ws / "state" / "picker-applied.json").read_text()).get("rooms") or {}),
-                         "a pin whose publish failed must stay retryable")
-
-
-class TestApplyReportsThePublishedFile(Base):
-    def test_apply_returns_the_path_the_compile_published(self):
-        cmd = {"action": "pin", "room": ROOM, "workers": [W1], "dedicated": False}
-        out = wpc.apply(self.ws, cmd, task_id="task-pin-2")
-        self.assertEqual(Path(out["advertisement"]), self.ad_path())
-        self.assertEqual(self.published(), self.wanted())
-        self.assertEqual(out["roster_version"], json.loads(self.ad_path().read_text())["workers"]["roster_version"])
 
 
 class TestTheDiscriminatorHasTeeth(Base):

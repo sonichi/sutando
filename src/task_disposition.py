@@ -19,26 +19,51 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from delivery.task_dispatch import find_ready_result
+import task_lookup  # noqa: E402
+from connections import task_home  # noqa: E402
+from delivery.task_dispatch import find_ready_result, ready_result_filenames
 from local_task_protocol import find_archived_task, valid_archive_lookup_id  # noqa: E402
 from task_archive import find_task_file  # noqa: E402
 
 PENDING, CLAIMED, ANSWERED, ARCHIVED, MISSING = "pending", "claimed", "answered", "archived", "missing"
 SETTLED = frozenset((ANSWERED, ARCHIVED))
+# A worker's delivery sentinel for a task in one of these owes no work.
+SPENT = frozenset((ANSWERED, ARCHIVED, MISSING))
 
 
-def task_disposition(workspace, task_id: str) -> str:
-    """The task's state, answered first: a ready result anywhere settles it whatever the task file says."""
+def task_disposition(workspace, task_id: str, *, unanswered: bool = False) -> str:
+    """The task's state, answered first: a ready result anywhere settles it whatever the task file says.
+    `unanswered=True` is a caller that already looked for a result in bulk; the lookup is skipped."""
     if not valid_archive_lookup_id(task_id):
         raise ValueError("not a task id")
+    home = task_home(task_id, Path(workspace))
+    answered = not unanswered and (find_ready_result(home["results"], task_id) is not None
+                                   or task_lookup.find_other_archived_ready_result(workspace, task_id) is not None)
+    return _decide(workspace, home["tasks"], task_id, answered)
+
+
+def task_dispositions(workspace, task_ids) -> dict:
+    """`task_disposition` for many ids, results looked up in one bulk pass; invalid ids are left out."""
     root = Path(workspace)
-    tasks, results = root / "tasks", root / "results"
-    if find_ready_result(results, task_id) is not None:
+    homes: dict = {}
+    for t in sorted({t for t in task_ids if valid_archive_lookup_id(t)}):
+        home = task_home(t, root)
+        homes.setdefault((home["tasks"], home["results"]), []).append(t)
+    out = {}
+    for (tasks, results), ids in homes.items():
+        ready = ready_result_filenames(results, [f"{t}.txt" for t in ids])
+        out.update({t: _decide(root, tasks, t, f"{t}.txt" in ready
+                               or task_lookup.find_other_archived_ready_result(root, t) is not None) for t in ids})
+    return dict(sorted(out.items()))
+
+
+def _decide(workspace, tasks: Path, task_id: str, answered: bool) -> str:
+    if answered:
         return ANSWERED
     live = find_task_file(tasks, task_id)
     if live is not None:
         return PENDING if live.name == f"{task_id}.txt" else CLAIMED
-    if find_archived_task(tasks, task_id) is not None:
+    if find_archived_task(tasks, task_id) is not None or task_lookup.find_other_archived_task(workspace, task_id):
         return ARCHIVED
     return MISSING
 
