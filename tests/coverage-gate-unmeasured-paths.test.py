@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -133,9 +134,16 @@ class FullGateUnmeasuredPaths(unittest.TestCase):
         (self.repo / ".coverage").write_text("precomputed coverage fixture\n")
         (self.repo / "coverage.xml").write_text(XML)
         (self.repo / "fresh-coverage-payload.json").write_text(json.dumps(FRESH_REPORT))
+        interpreter = self.bin / "fixture python"
+        interpreter.symlink_to(sys.executable)
         for name, source in (("python3", FAKE_PYTHON), ("diff-cover", FAKE_DIFF_COVER)):
+            script = self.bin / (name + ".py")
+            script.write_text(source.lstrip())
             path = self.bin / name
-            path.write_text("#!" + sys.executable + "\n" + source.lstrip())
+            path.write_text(
+                "#!/bin/sh\nexec " + shlex.quote(str(interpreter)) + " "
+                + shlex.quote(str(script)) + ' "$@"\n'
+            )
             path.chmod(0o755)
 
     def _git(self, *args):
