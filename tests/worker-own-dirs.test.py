@@ -120,7 +120,9 @@ class TaskHome(Base):
         (root / "tasks" / f"{probe}.txt").write_text("t")
         self.assertEqual(C.task_home(probe, self.ws), {"lane": "", "worker": W, "tasks": root / "tasks",
                                                        "results": root / "results", "own": True})
-        (root / "tasks" / f"{probe}.txt").rename(root / "tasks" / "archive" / f"{probe}.txt")
+        (root / "tasks" / f"{probe}.txt").rename(root / "tasks" / f"{probe}.claimed-core-1.txt")
+        self.assertTrue(C.task_home(probe, self.ws)["own"], "claimed there still lives there")
+        (root / "tasks" / f"{probe}.claimed-core-1.txt").rename(root / "tasks" / "archive" / f"{probe}.txt")
         self.assertTrue(C.task_home(probe, self.ws)["own"], "archived there still lives there")
         self.assertFalse(C.task_home("../escape", self.ws)["own"])
 
