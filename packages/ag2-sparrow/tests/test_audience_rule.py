@@ -1,4 +1,5 @@
 """Every built-in Sparrow prompt carries the audience rule, verbatim from task_io.AUDIENCE_RULE."""
+import hashlib
 import json
 import sys
 import unittest
@@ -36,6 +37,9 @@ TIERS = ({"access_tier": "owner"}, {"access_tier": "team", "collaborator": "true
 class AudienceRuleTest(unittest.TestCase):
     def test_the_rule_is_the_servers_text(self):
         self.assertEqual(task_io.AUDIENCE_RULE, RULE)
+        # The s.space server serves this same text and pins the same digest.
+        self.assertEqual(hashlib.sha256(task_io.AUDIENCE_RULE.encode()).hexdigest(),
+                         "2991809edca17903b8a17b7ddf59673194dffc542186ca1a6220271cd0731ec3")
         self.assertNotIn("`", RULE)
 
     def test_the_built_in_hatch_prompt_ends_with_the_rule(self):
