@@ -128,6 +128,8 @@ def runtime_identity(worker: str, instance: str, workspace) -> bytes:
     from connections import worker_identity
     row = worker_identity(worker, Path(workspace)) or {}
     fields = [worker, instance] + [str(row.get(k) or "") for k in ("token_ref", "gateway_url", "server")]
+    # Appended only when set, so a shared-dir worker's revision is unchanged.
+    fields += [str(row[k]) for k in ("dirs",) if row.get(k)]
     return "\0".join(fields).encode("utf-8")
 
 
@@ -164,16 +166,15 @@ def credential(worker: str, workspace, environ, vault=None) -> "tuple[str, str]"
 
 def _declaration_for(worker: str, workspace) -> "tuple[dict | None, str]":
     """Where `worker`'s declaration lives and what it holds, from its identity row's agent, or (None, why)."""
-    from connections import WORKER_RE, worker_identity
+    from connections import WORKER_RE, worker_identity, worker_root
     if not WORKER_RE.match(worker or ""):
         return None, f"{worker!r} is not a worker id"
     mxid = str((worker_identity(worker, Path(workspace)) or {}).get("agent_mxid") or "")
     if not mxid:
         return None, f"worker {worker} has no agent identity row"
-    from ag2_sparrow import agent_identity
     from ag2_sparrow import connect_bridge as adapter
-    segment = agent_identity.root_segment(mxid)
-    root = Path(workspace) / "agents" / segment
+    root = worker_root(mxid, Path(workspace))
+    segment = root.name
     return {"path": adapter.bridge_home(root) / adapter.DECLARATION, "agent": mxid,
             "name": adapter.worker_name(segment), "module": adapter.BRIDGE_MODULE,
             "env": adapter.bridge_env(str(root), mxid)}, ""
