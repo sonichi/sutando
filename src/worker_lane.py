@@ -113,7 +113,9 @@ def attributor(worker: str, argv: "list[str]", log):
 
 def adopt_stray_proactive(worker: str, shared_results, own_results) -> "list[str]":
     """Move the proactive files `worker`'s session stamped (`lane_claims_proactive`) from the shared
-    results/ into its own; returns the names moved. A file another consumer took first is skipped."""
+    results/ into its own; returns the names moved. The move never replaces a file: a name already in its
+    folder, or one another consumer took first, is left for a later pass."""
+    import undelivered_quarantine
     from proactive_routing import lane_claims_proactive
     moved = []
     try:
@@ -121,11 +123,18 @@ def adopt_stray_proactive(worker: str, shared_results, own_results) -> "list[str
     except OSError:
         return moved
     for name in names:
-        if not worker or not lane_claims_proactive(name, worker) or (Path(own_results) / name).exists():
+        if not worker or not lane_claims_proactive(name, worker):
             continue
+        src, dst = Path(shared_results) / name, Path(own_results) / name
         try:
             Path(own_results).mkdir(parents=True, exist_ok=True)
-            os.rename(Path(shared_results) / name, Path(own_results) / name)
+            try:
+                undelivered_quarantine.rename_noreplace(src, dst)
+            except FileExistsError as e:
+                if not undelivered_quarantine.no_primitive(e):
+                    raise
+                os.link(src, dst)  # refuses a taken name just as atomically
+                src.unlink()
         except OSError:
             continue
         moved.append(name)

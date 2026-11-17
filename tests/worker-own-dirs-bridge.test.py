@@ -124,10 +124,44 @@ class Adopt(Own):
         (shared / mine).write_text("new")
         (own / mine).write_text("old")
         self.assertEqual(worker_lane.adopt_stray_proactive(W, shared, own), [])
+        self.assertEqual(((shared / mine).read_text(), (own / mine).read_text()), ("new", "old"))
         (own / mine).unlink()
-        with mock.patch.object(os, "rename", side_effect=FileNotFoundError):
+        import undelivered_quarantine
+        with mock.patch.object(undelivered_quarantine, "rename_noreplace", side_effect=FileNotFoundError):
             self.assertEqual(worker_lane.adopt_stray_proactive(W, shared, own), [])
         self.assertEqual(worker_lane.adopt_stray_proactive(W, self.ws / "missing", own), [])
+
+    def test_a_file_published_in_its_folder_just_before_the_move_survives(self):
+        import undelivered_quarantine
+        shared, own = self.ws / "results", self.own / "results"
+        shared.mkdir(parents=True, exist_ok=True)
+        mine = proactive_filename(1, "ag2space", W)
+        (shared / mine).write_text("stray")
+        real = undelivered_quarantine.rename_noreplace
+
+        def racing(src, dst, log=None):
+            Path(dst).write_text("published")
+            return real(src, dst, log)
+        with mock.patch.object(undelivered_quarantine, "rename_noreplace", racing):
+            self.assertEqual(worker_lane.adopt_stray_proactive(W, shared, own), [])
+        self.assertEqual(((own / mine).read_text(), (shared / mine).read_text()), ("published", "stray"))
+
+    def test_without_a_no_replace_rename_a_hard_link_moves_it_and_refuses_a_taken_name(self):
+        import errno
+        import undelivered_quarantine
+        shared, own = self.ws / "results", self.own / "results"
+        shared.mkdir(parents=True, exist_ok=True)
+        a, b = proactive_filename(1, "ag2space", W), proactive_filename(2, "ag2space", W)
+        for name in (a, b):
+            (shared / name).write_text("stray")
+        own.mkdir(parents=True)
+        (own / b).write_text("published")
+        nothing = FileExistsError(errno.ENOTSUP, "no primitive")
+        with mock.patch.object(undelivered_quarantine, "rename_noreplace", side_effect=nothing):
+            self.assertEqual(worker_lane.adopt_stray_proactive(W, shared, own), [a])
+        self.assertEqual(((own / a).read_text(), (own / b).read_text(), (shared / b).read_text()),
+                         ("stray", "published", "stray"))
+        self.assertFalse((shared / a).exists())
 
     def test_the_loop_logs_each_move_and_stops(self):
         shared, own = self.ws / "results", self.own / "results"
