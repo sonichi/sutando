@@ -311,7 +311,7 @@ WRITERS = {
     "skills/schedule-crons/scripts/codex-scheduler.py": "from result_publish import publish_text",
     "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py": "from .result_publish import",
     "src/notify.sh": "result_publish.py",
-    "src/launchd/gateway-bridge-wrapper.sh": "result_publish.py",
+    "src/launchd/gateway-bridge-lib.sh": "result_publish.py",
     "src/launchd/channel-bridge-wrapper.sh": "result_publish.py",
     "src/voice-agent.ts": "publishResultFile(`proactive-voice-${c.category}-",
     "src/live-agent-runtime.ts": "publishResultFile(`proactive-voice-stuck-",

@@ -2261,9 +2261,7 @@ POLL_STALL_EXIT_S = float(os.environ.get("REMOTE_TASK_POLL_STALL_EXIT_S") or "60
 # Exiting only helps where something restarts us. startup-runtime.sh launches the
 # primary and every named lane as a bare `&`, so the owner must be declared here.
 POLL_STALL_RESTART_OWNER = (os.environ.get("SUTANDO_BRIDGE_RESTART_OWNER") or "").strip()
-# EX_UNAVAILABLE: the wrapper relaunches on it without an owner alert, so an outage
-# does not queue a "bridge restarted" message every stall period.
-POLL_STALL_EXIT_CODE = 69
+from .exit_codes import POLL_STALL_EXIT_CODE  # noqa: E402
 # Proactive-message drain: when REMOTE_PROACTIVE_ROOM names a room id, every
 # `results/proactive-*.txt` the agent writes is delivered to that room as a
 _PROACTIVE_ROOM_ENV = os.environ.get("REMOTE_PROACTIVE_ROOM")

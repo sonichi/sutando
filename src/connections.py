@@ -2884,6 +2884,11 @@ def _token_file(entry: Mapping[str, str], environ: Mapping[str, str]) -> str:
     return str(path) if path.is_file() else ""
 
 
+def lane_token_file(entry: Mapping[str, str], environ: Optional[Mapping[str, str]] = None) -> str:
+    """The file a plan entry's bridge re-reads its token from (REMOTE_TASK_TOKEN_FILE); "" when none."""
+    return _token_file(entry, os.environ if environ is None else environ)
+
+
 def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]] = None, *,
                vault=None) -> dict:
     """The bridge's environment for one plan entry: the token from the env var of its token_ref,
@@ -3068,6 +3073,12 @@ def _record_launch(instance: str, workspace: Optional[Path], **fields) -> dict:
             record["last_repo"] = prev.get("repo") or prev.get("last_repo")
     _atomic_json(launch_record_path(instance, workspace), record)
     return record
+
+
+def record_supervised_start(instance: str, *, pid: int, repo: Path, workspace: Optional[Path] = None) -> dict:
+    """The launch record of a lane another supervisor starts in place (sparrowd's core), so its status
+    reads the start and not an earlier failed one; its lease is proven later, by the lease itself."""
+    return _record_launch(instance, workspace, ok=True, pid=pid, lease="supervised", repo=str(Path(repo).resolve()))
 
 
 def _launch_record(instance: str, workspace: Optional[Path]) -> dict:

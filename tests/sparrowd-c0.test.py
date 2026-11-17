@@ -312,16 +312,16 @@ os.close(si3._fd)
 si3.release()
 check(True, "release after external close never raises")
 
-# launcher module: worker_specs() is importable and names the real bridge
+# launcher module: worker_specs() is importable; the gateway bridge is --core's worker, not a static one
 import importlib.util as _ilu
 _spec = _ilu.spec_from_file_location("sparrowd_launcher", REPO / "src" / "sparrowd.py")
 _l = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_l)
 _specs = _l.worker_specs()
-check(len(_specs) == 1 and _specs[0].name == "remote-gateway-bridge",
-      "worker_specs() yields exactly the gateway bridge")
-check(Path(_specs[0].argv[1]).exists(),
-      "the spec's target script exists at the resolved path")
+check(all("gateway" not in s.name for s in _specs),
+      "worker_specs() runs no gateway bridge outside --core")
+check(_l.CORE_LAUNCHER.exists(),
+      "the core worker's launcher exists at the resolved path")
 _calls = []
 _l.run = lambda specs, sd, **kw: (_calls.append((specs, sd, kw)), 0)[1]
 _l.external_supervisor = lambda marker: None  # guard has its own tests below
@@ -333,7 +333,8 @@ check(_calls and callable(_calls[0][2].get("rescan")) and _calls[0][2].get("resc
 # adapter edge: forbidden set derives from the adapter's specs so the
 # guard grows with the worker list; static tokens have no spec-side source.
 pkg = (REPO / "packages" / "ag2-sparrow" / "ag2_sparrow" / "sparrowd.py").read_text()
-_forbidden = {"chat.ag2.space", "discord", "telegram"}
+_forbidden = {"chat.ag2.space", "discord", "telegram", _l.CORE_WORKER, _l.CORE_LAUNCHER.name,
+              "remote-gateway-bridge.py"}
 for _s in _specs:
     _forbidden.add(_s.name)
     _forbidden.add(_s.name.replace("-", "_"))
@@ -343,7 +344,7 @@ for tok in sorted(_forbidden):
 
 # ...and the launcher (the adapter) is where the concrete worker lives
 launcher = (REPO / "src" / "sparrowd.py").read_text()
-check("remote-gateway-bridge.py" in launcher and "worker_specs" in launcher,
+check("sparrow_core_bridge.py" in launcher and "worker_specs" in launcher,
       "launcher owns the concrete worker list")
 check("resolve_workspace" in launcher,
       "launcher resolves state under the workspace helper, not a literal path")
@@ -374,8 +375,9 @@ with _tf.TemporaryDirectory() as _td:
 check("external_supervisor" in launcher and "refusing to start" in launcher,
       "launcher main() wires the refuse-to-start guard")
 _l.external_supervisor = lambda marker: "pid 999 (1 keepalive.sh)"
+_l._static_specs = lambda: ([_l.WorkerSpec(name="loop-x", argv=["py", "/x/skills/x/loop.py"])], [])
 _ran = []
-_l.run = lambda specs, sd: (_ran.append(1), 0)[1]
+_l.run = lambda specs, sd, **kw: (_ran.append(1), 0)[1]
 check(_l.main() == 2 and not _ran,
       "externally-owned worker: main refuses (rc 2) and never calls run()")
 

@@ -34,56 +34,11 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
-# Resolve + load the ag2space channel .env (holds REMOTE_TASK_TOKEN). Honor
-# $CLAUDE_CONFIG_DIR if the plist exports it (claude-sutando installs); the
-# config helper falls back to ~/.claude otherwise.
-# What the process environment (the plist, or a caller) provided, kept apart from
-# what the .env provides, so a re-read can drop a removed .env token without
-# dropping an environment-provided one.
-_ENV_REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-}"; _ENV_AG2_REMOTE_TOKEN="${AG2_REMOTE_TOKEN:-}"
-_ENV_REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-}"; _ENV_AG2_REMOTE_TIER="${AG2_REMOTE_TIER:-}"
-# `.env` first (policy, shell-form credentials), then the file the shared resolver
-# names as holding the token, unless the process environment supplied one.
-_load_channel_env() {
-    local dot="" tok=""
-    dot="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env 2>/dev/null)" || dot=""
-    [ -n "$dot" ] && [ -f "$dot" ] && { set -a; . "$dot"; set +a; }
-    if [ -z "${_ENV_REMOTE_TASK_TOKEN}${_ENV_AG2_REMOTE_TOKEN}" ]; then
-        tok="$(bash "$REPO/scripts/channel-env.sh" ag2space 2>/dev/null)" || tok=""
-        [ -n "$tok" ] && [ -f "$tok" ] && [ "$tok" != "$dot" ] && { set -a; . "$tok"; set +a; }
-    fi
-    # The bridge re-reads the file holding the token on an auth rejection, to pick up a rotated one.
-    local held="$dot"; [ -n "$tok" ] && [ -f "$tok" ] && held="$tok"
-    [ -n "$held" ] && [ -f "$held" ] && export REMOTE_TASK_TOKEN_FILE="$held"
-    # Only the shared rule's "blank" verdict (rc 3) drops it; an unrunnable check keeps it.
-    local v rc
-    for v in REMOTE_TASK_TOKEN AG2_REMOTE_TOKEN; do
-        rc=0
-        printf '%s' "${!v:-}" | python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from channel_token import clean_relay_token as c; sys.exit(0 if c(sys.stdin.read()) else 3)' "$REPO/src" 2>/dev/null || rc=$?
-        [ "$rc" -ne 3 ] || eval "$v="
-    done
-    return 0
-}
-_load_channel_env
-
-# Map legacy AG2_REMOTE_* → REMOTE_TASK_* (the names the bridge reads).
-# Default tier is "owner" for the personal-agent model (PR #2018, 2026-07-08): a
-# user's own gateway authenticates with their own owner bearer and the broker
-# owner-scopes every pull, so its tasks are the owner's own. This MUST match
-# src/startup.sh's inline launch and the bridge's own default — otherwise the
-# launchd path would sandbox the owner's own mobile messages as team-tier
-# (read-only). A shared / multi-user gateway sets REMOTE_TASK_TIER=team in the
-# channel .env explicitly, which this honors.
-REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
-REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
-# AG2 Space tags inbound image/file markers `ag2space-media`; the provider-
-# neutral bridge defaults to `remote-media`, so without this the marker never
-# matches and media URLs land unresolved in task bodies (owner-reported
-# 2026-07-25; fixed on main in startup.sh's launch block). launchd jobs never
-# see startup.sh's exports, so this AG2-specific launch site must default it
-# too. Explicit REMOTE_MEDIA_MARKER from the channel .env still wins.
-REMOTE_MEDIA_MARKER="${REMOTE_MEDIA_MARKER:-ag2space-media}"
-export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
+# Resolve + load the ag2space channel .env (holds REMOTE_TASK_TOKEN) and map the legacy names
+# (gateway-bridge-lib.sh, shared with src/sparrow_core_bridge.py). Honors $CLAUDE_CONFIG_DIR.
+# shellcheck source=gateway-bridge-lib.sh
+. "$REPO/src/launchd/gateway-bridge-lib.sh"
+gateway_legacy_env
 
 # If there's still no token, the bridge would FATAL-exit and KeepAlive would
 # crash-loop. Exit 0 quietly instead — the install path only loads this job when
@@ -137,28 +92,8 @@ fi
 STATE_DIR="$WORKSPACE/state/channel-bridge-supervisor"
 mkdir -p "$STATE_DIR" "$WORKSPACE/results" 2>/dev/null || true
 MARKER="$STATE_DIR/gateway.started"
-DELIBERATE="$STATE_DIR/deliberate-restart"
-DELIBERATE_WINDOW_S="${SUTANDO_BRIDGE_DELIBERATE_WINDOW_S:-180}"
-ALERT_STAMP="$STATE_DIR/gateway.last-alert"
-ALERT_COOLDOWN_S="${SUTANDO_BRIDGE_ALERT_COOLDOWN_S:-600}"
 RESTART_DELAY="${SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY:-10}"
-_age() { local t; t="$(cat "$1" 2>/dev/null || echo 0)"; echo $(( $(date +%s) - ${t:-0} )); }
-emit_restart_alert() {
-  NOW="$(date +%s)"
-  echo "[gateway-bridge-wrapper] previous process exited; automatically restarting" >&2
-  if [ -f "$DELIBERATE" ] && [ "$(_age "$DELIBERATE")" -lt "$DELIBERATE_WINDOW_S" ]; then
-    echo "[gateway-bridge-wrapper] exit within a deliberate restart window; no alert" >&2
-    return 0
-  fi
-  if [ -f "$ALERT_STAMP" ] && [ "$(_age "$ALERT_STAMP")" -lt "$ALERT_COOLDOWN_S" ]; then
-    echo "[gateway-bridge-wrapper] alert cooldown active; not repeating" >&2
-    return 0
-  fi
-  echo "$NOW" > "$ALERT_STAMP"
-  printf '%s\n' "⚠️ The gateway bridge exited and was automatically restarted." \
-    | python3 "$REPO/src/result_publish.py" "$WORKSPACE/results/proactive-gateway-bridge-restarted-$NOW.txt"
-  bash "$REPO/src/macos-notify.sh" "The gateway bridge exited and was automatically restarted." || true
-}
+emit_restart_alert() { gateway_restart_alert; }
 if [ -f "$MARKER" ]; then emit_restart_alert; fi
 date +%s > "$MARKER"
 CHILD_PID=''
@@ -218,14 +153,8 @@ trap 'stop_wrapper TERM' TERM
 trap 'stop_wrapper INT' INT
 trap 'stop_wrapper HUP' HUP
 while [ "$STOPPING" = 0 ]; do
-  # A rotated or removed .env token must reach the next child: reset to the
-  # environment-provided values, re-read the .env, redo the legacy mapping.
-  REMOTE_TASK_TOKEN="$_ENV_REMOTE_TASK_TOKEN"; AG2_REMOTE_TOKEN="$_ENV_AG2_REMOTE_TOKEN"
-  REMOTE_TASK_TIER="$_ENV_REMOTE_TASK_TIER"; AG2_REMOTE_TIER="$_ENV_AG2_REMOTE_TIER"
-  _load_channel_env
-  REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
-  REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
-  export REMOTE_TASK_TOKEN REMOTE_TASK_TIER
+  # A rotated or removed .env token must reach the next child: re-read from the environment-provided values.
+  gateway_legacy_env
   if [ -z "$REMOTE_TASK_TOKEN" ]; then
     echo "[gateway-bridge-wrapper] token removed — nothing to relaunch; exiting cleanly." >&2
     stop_agents_supervisor
