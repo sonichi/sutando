@@ -918,10 +918,10 @@ class VendoredCopyInSync(unittest.TestCase):
         self.assertIn(a.strip(), b, "run tools/sync_from_src.py")
 
     def test_entry_point_is_separate_not_a_dispatcher(self):
-        """remote_gateway_bridge.main() reads no argv, so every invocation today
+        """remote_gateway_bridge.run() reads no argv, so every invocation today
         starts the bridge; a dispatcher would change one of them."""
         toml = (ROOT / "packages" / "ag2-sparrow" / "pyproject.toml").read_text()
-        self.assertIn('ag2-sparrow = "ag2_sparrow.remote_gateway_bridge:main"', toml)
+        self.assertIn('ag2-sparrow = "ag2_sparrow.remote_gateway_bridge:run"', toml)
         self.assertIn('ag2-sparrow-outbox = "ag2_sparrow.outbox_cli:main"', toml)
 
 

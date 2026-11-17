@@ -1399,7 +1399,7 @@ def main() -> int:
     # Once it holds the lease the unsuffixed bridge asks whether it keeps the proactive room.
     check(rtc.PROACTIVE_ROOM_KEEP is rtc._legacy_keeps_proactive_room, "the unsuffixed bridge asks whether it keeps the room")
     _main_src = (SRC_DIR.parent / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
-    _main_src = _main_src[_main_src.index("def main() -> None:"):]
+    _main_src = _main_src[re.search(r"^def main\(", _main_src, re.M).start():]
     check(_main_src.index("_acquire_singleton()") < _main_src.index("_start_lock_heartbeat()")
           < _main_src.index("_settle_proactive_room()"), "the room is settled right after the lease heartbeats")
     _saved_room = (rtc.PROACTIVE_ROOM, rtc.PROACTIVE_ROOM_KEEP)
