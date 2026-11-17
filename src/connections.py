@@ -2278,6 +2278,22 @@ def task_other_home(task_id: str, workspace: Optional[Path] = None) -> Optional[
     return {"tasks": root / "tasks", "results": root / "results"}
 
 
+def own_worker_homes(workspace: Optional[Path] = None) -> list:
+    """[{"worker", "tasks", "results"}] for every worker with its own folders (`worker_dirs`), from one
+    read of the record; [] when it is unreadable. Paths are lexical under the workspace, as worker_dirs'."""
+    ws = _workspace(workspace)
+    try:
+        rows = _read(record_path(ws))
+    except (SchemaError, OSError):
+        return []
+    homes = []
+    for row in rows:
+        dirs = _row_dirs(row, ws)
+        if dirs:
+            homes.append({"worker": str(row["worker"]), "tasks": dirs[0], "results": dirs[1]})
+    return homes
+
+
 def set_worker_dirs(worker: str, own: bool, *, workspace: Optional[Path] = None) -> dict:
     """Set (`own`) or clear `worker`'s `dirs: "own"` under the record lock; returns the row. Refused
     (`ConnectionsError`) when the worker has no identity row or its row names no agent."""

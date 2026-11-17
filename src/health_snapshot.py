@@ -182,12 +182,17 @@ def _wedge_source(ws: Path, now: float) -> dict:
 
 def _has_result(ws: Path, tid: str) -> bool:
     """A result file is the task's last write, so its presence ends the task. Archivers move it
-    within seconds, flat or into a month folder: archive/[<YYYY-MM>/]<id>[-<ts>].txt."""
-    results = ws / "results"
+    within seconds, flat or into a month folder: archive/[<YYYY-MM>/]<id>[-<ts>].txt. A lane's result
+    archived before its worker switched folders is found in the other home's archives (`task_lookup`)."""
+    import task_lookup
+    from connections import task_home
+    results = task_home(tid, ws)["results"]
     if (results / f"{tid}.txt").exists():
         return True
     name = re.compile(re.escape(tid) + r"(?:-\d+)?\.txt")
-    return any(name.fullmatch(f.name) for f in (results / "archive").rglob(f"{tid}*.txt"))
+    if any(name.fullmatch(f.name) for f in (results / "archive").rglob(f"{tid}*.txt")):
+        return True
+    return task_lookup.find_other_archived_result(ws, tid) is not None
 
 
 def _activity_by_agent(ws: Path, now: float, worker_ids) -> dict:
