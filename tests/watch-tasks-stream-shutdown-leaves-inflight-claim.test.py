@@ -78,6 +78,7 @@ sys.path.insert(0, str(REPO / "skills" / "worker-pool" / "scripts"))
 sys.path.insert(0, str(REPO / "src"))
 from clean_watcher_env import clean_env  # noqa: E402
 from _helpers.process_group import bind_to_test, popen_bound, unbind  # noqa: E402
+from _helpers.worker_identity import give_identities  # noqa: E402
 
 import pool_attribution as pa  # noqa: E402
 
@@ -154,6 +155,7 @@ class Workspace:
         (self.ws / "state" / "roster.json").write_text(json.dumps(
             {"version": 1, "workers": {A: {"state": "live"}, B: {"state": "live"}},
              "bindings": {ROOM: worker}}))
+        give_identities(self.ws, A, B)
 
     @property
     def claims(self) -> Path:

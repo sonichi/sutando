@@ -78,7 +78,7 @@ def route_for(workspace, worker: str, *, sender: str, core: str, tier: str = "te
     rows = _rows(workspace) if rows is None else rows
     mine = enabled_identity(rows, worker)
     if mine is None:
-        raise NoIdentity(f"{name} has no enabled s.space agent of its own, so no hand-off can reach it; "
+        raise NoIdentity(f"{name} has no enabled agent of its own, so no hand-off can reach it; "
                          + convert_hint(name))
     to_agent = str(mine.get("agent_mxid") or "")
     server = str(mine.get("server") or "").lower()

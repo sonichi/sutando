@@ -134,7 +134,7 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
         print(f"pool_route_handler: {e}", file=sys.stderr)
         return MUST_HANDLE, [], roster
     if unconverted:
-        print(f"pool_route_handler: {task.get('id')}: {', '.join(unconverted)} has no enabled s.space agent "
+        print(f"pool_route_handler: {task.get('id')}: {', '.join(unconverted)} has no enabled agent "
               f"of its own, so the core takes it; convert it first: my-agents convert {unconverted[0]}",
               file=sys.stderr)
         return DECLINE, targets, roster
