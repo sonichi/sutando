@@ -108,7 +108,7 @@ or a local timer.
 6. A one-off `@at` time needs an explicit offset. A recurring local time needs the owner's IANA
    timezone. Never assume the pod clock is the owner's timezone.
 7. Do not promise update, pause, run-now, recall or history unless the live catalog offers them.
-8. If scheduling is disabled, unavailable, refused, declined or expired, tell the owner the timed
+8. If scheduling is disabled, unavailable, refused, or its approval is pending, denied, declined, expired or revoked (the states `approval.inspect` returns), tell the owner the timed
    work was not set up. Do not switch routes to get around an approval. A native timed-task tool
    is an alternative only when trusted host instructions say it is platform-backed.
 9. A cloud Spacer never creates local timed jobs. An unavailable platform is not a reason to keep
@@ -116,6 +116,9 @@ or a local timer.
 
 Sutando's own startup, maintenance, heartbeat, backend and proactive-loop scheduling stays native.
 Only timed work the owner asks for goes to the platform.
+Engine-run jobs the owner opted into (morning check-in, `room-readme-upkeep`, `commons-feed-runner`)
+stay native. A timed request by voice, Telegram, Discord or local chat has no room to schedule in,
+so it stays on the native path.
 
 ## Troubleshooting
 

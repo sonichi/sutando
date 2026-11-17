@@ -5,8 +5,9 @@ Re-create all session cron jobs for Sutando. Run this on startup or after a sess
 **Usage**: `/schedule-crons`
 
 > **Scope.** This skill schedules Sutando's own startup, maintenance, heartbeat, backend and
-> proactive jobs, and they stay native. A reminder or timed job an owner asks for in an s.space
-> room or DM goes to the platform scheduler instead
+> proactive jobs, and they stay native, as do engine-run jobs the owner opted into (morning
+> check-in, `room-readme-upkeep`, `commons-feed-runner`). A reminder or timed job an owner asks for
+> in an s.space room or DM goes to the platform scheduler instead
 > ([`skills/ag2-space-mcp/SKILL.md`](../ag2-space-mcp/SKILL.md#scheduling-timed-work)); never add
 > one here. This does not disable cron, and starter jobs are not migrated automatically.
 

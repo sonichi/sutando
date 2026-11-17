@@ -39,7 +39,7 @@ requests are pending, say how many are ahead of this one.
 
 ## Scheduling owner-requested timed work
 
-An owner-requested reminder or timed job in an s.space room or DM uses the platform `room.schedule.create`, `room.schedule.list` and `room.schedule.delete` Actions, never an internal loop. If the platform or its approval is unavailable, pending, declined or expired, report that the work was not set up. No local workaround, announced or silent. Steps: [`skills/ag2-space-mcp/SKILL.md`](skills/ag2-space-mcp/SKILL.md#scheduling-timed-work).
+An owner-requested reminder or timed job in an s.space room or DM uses the platform `room.schedule.create`, `room.schedule.list` and `room.schedule.delete` Actions, never an internal loop. If the platform or its approval is unavailable, pending, declined or expired, report that the work was not set up. No local workaround, announced or silent. This covers requests made in an s.space room or DM; a request by voice, Telegram, Discord or local chat has no room to schedule in, so it stays on the native path. Engine-run jobs the owner opted into (morning check-in, `room-readme-upkeep`, `commons-feed-runner`) are not reminders and stay native. Steps: [`skills/ag2-space-mcp/SKILL.md`](skills/ag2-space-mcp/SKILL.md#scheduling-timed-work).
 
 ## Privacy
 
