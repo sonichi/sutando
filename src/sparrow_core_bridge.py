@@ -175,15 +175,27 @@ def write_claim(workspace: Path, instance: Optional[str], pid: Optional[int] = N
     os.replace(tmp, path)
 
 
+def holds_lock(workspace: Path, pid: int) -> bool:
+    """Whether `pid` is the sparrowd holding this workspace's single-instance lock (the holder writes its
+    pid there; one waiting for the lock writes nothing)."""
+    from ag2_sparrow.sparrowd import LOCK_NAME
+    try:
+        return (Path(workspace) / "state" / "sparrowd" / LOCK_NAME).read_text().strip() == str(pid)
+    except OSError:
+        return False
+
+
 def claims(instance: str, workspace: Path) -> bool:
-    """Whether a live sparrowd claims `instance` as its core: the claimed pid runs and, when both are
-    known, started when the claim says. A missing or unreadable claim claims nothing."""
+    """Whether a live sparrowd claims `instance` as its core: the claimed pid holds sparrowd's lock, runs
+    and, when both are known, started when the claim says. A missing or unreadable claim claims nothing."""
     try:
         claim = json.loads(claim_path(workspace).read_text(encoding="utf-8"))
         pid = claim["pid"]
         if claim["instance"] != instance or isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
             return False
     except (OSError, ValueError, KeyError, TypeError):
+        return False
+    if not holds_lock(workspace, pid):
         return False
     try:
         os.kill(pid, 0)

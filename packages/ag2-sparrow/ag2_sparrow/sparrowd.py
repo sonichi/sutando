@@ -41,6 +41,9 @@ class WorkerSpec:
     hold_rc: FrozenSet[int] = frozenset()
 
 
+# The single-instance lock under the state dir; its holder writes its pid into it.
+LOCK_NAME = "sparrowd.lock"
+
 # The previous run's exit code, given to a restarted worker; absent on a first start.
 LAST_RC_ENV = "SPARROWD_LAST_RC"
 
@@ -369,7 +372,7 @@ def run(specs: List[WorkerSpec], state_dir: Path,
     With `wait_for_lock`, a held lock is waited for (one line when the wait
     starts, one when it ends) instead of exiting, so a relauncher never loops."""
     state_dir = Path(state_dir)
-    inst = SingleInstance(state_dir / "sparrowd.lock")
+    inst = SingleInstance(state_dir / LOCK_NAME)
     acquired = inst.acquire()
     if not acquired and not wait_for_lock:
         _log("another sparrowd holds the lock — exiting cleanly")

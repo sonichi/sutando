@@ -149,7 +149,8 @@ def core_spec(workspace=None, environ=None) -> "tuple[WorkerSpec | None, str]":
     ws = workspace or resolve_workspace()
     decision, why = core.decide(ws, os.environ if environ is None else environ, cached=True)
     try:
-        core.write_claim(ws, None if decision is None else str(decision["instance"]))
+        if core.holds_lock(ws, os.getpid()):  # a sparrowd still waiting for the lock supervises nothing
+            core.write_claim(ws, None if decision is None else str(decision["instance"]))
     except OSError as e:  # the keeper then just starts the lane; the core still follows its connections
         print(f"sparrowd: core claim not written ({type(e).__name__}: {e})", file=sys.stderr)
     if decision is None:

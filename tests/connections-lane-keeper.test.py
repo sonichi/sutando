@@ -402,6 +402,13 @@ ALPHA = "alpha-fixture-net"
 DEAD_PID = 4_194_404
 
 
+def hold_sparrowd_lock(ws, pid=None):
+    """What sparrowd's lock holder leaves: its pid in the lock file."""
+    lock = Path(ws) / "state" / "sparrowd" / "sparrowd.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text(str(pid or os.getpid()))
+
+
 class CoreClaim(KeeperBase):
     """sparrowd's core serves the primary lane: the keeper leaves it alone while sparrowd lives, for the grace."""
 
@@ -409,6 +416,7 @@ class CoreClaim(KeeperBase):
         super().setUp()
         self.core = importlib.import_module("sparrow_core_bridge")
         self.lines = []
+        hold_sparrowd_lock(self.ws)
 
     def keep_at(self, now, **kw):
         self.spawned.clear()
@@ -462,6 +470,17 @@ class TheClaimFile(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.ws = Path(self.tmp.name)
         self.core = importlib.import_module("sparrow_core_bridge")
+        hold_sparrowd_lock(self.ws)
+
+    def test_a_sparrowd_waiting_for_the_lock_claims_nothing(self):
+        self.core.write_claim(self.ws, ALPHA)
+        hold_sparrowd_lock(self.ws, os.getppid())
+        self.assertFalse(self.core.claims(ALPHA, self.ws), "alive and started then, but not the lock holder")
+        (self.ws / "state" / "sparrowd" / "sparrowd.lock").unlink()
+        self.assertFalse(self.core.claims(ALPHA, self.ws), "no lock holder at all")
+        self.core.write_claim(self.ws, ALPHA, pid=DEAD_PID)
+        hold_sparrowd_lock(self.ws, DEAD_PID)
+        self.assertFalse(self.core.claims(ALPHA, self.ws), "a lock left by a sparrowd that is gone")
 
     def test_written_once_withdrawn_and_unreadable_claims_nothing(self):
         path = self.core.claim_path(self.ws)
@@ -481,7 +500,6 @@ class TheClaimFile(unittest.TestCase):
 
     def test_a_reused_pid_claims_nothing_and_another_uids_process_still_does(self):
         path = self.core.claim_path(self.ws)
-        path.parent.mkdir(parents=True)
         path.write_text(json.dumps({"instance": ALPHA, "pid": os.getpid(), "proc_start": "linux-x:1"}))
         with unittest.mock.patch.object(self.core.workspace_lock, "proc_start", return_value="linux-x:2"):
             self.assertFalse(self.core.claims(ALPHA, self.ws), "the pid now names a later process")
