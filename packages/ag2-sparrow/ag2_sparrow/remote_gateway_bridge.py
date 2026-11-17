@@ -11280,6 +11280,8 @@ _STALL_REPORTED_FOR: float | None = None
 # Set once the stall exit has stopped the outbound worker: from then on the loop
 # only waits for that stop, because a resumed poll would run with no outbound worker.
 _STALL_EXIT_PENDING = False
+# Set when that exit may proceed: main() returns the code so run() exits through _exit_bounded.
+_STALL_EXIT_READY = False
 
 
 def _worker_stop_budget_s() -> float:
@@ -11309,8 +11311,9 @@ def _abort_if_poll_stalled(anchor: float,
     unsupervised lane that exits stays down; the status sidecar records it either way.
     `before_exit` stops the workers and reports whether they stopped; until they
     have, this returns True and the caller must skip the beat rather than poll.
+    True also once the exit is ready, which main() turns into the returned code.
     """
-    global _STALL_REPORTED_FOR, _STALL_EXIT_PENDING
+    global _STALL_REPORTED_FOR, _STALL_EXIT_PENDING, _STALL_EXIT_READY
     now = time.monotonic()
     # Pass the limit explicitly: the parameter default binds at def time,
     # so a reconfigured module global would otherwise never be read.
@@ -11342,7 +11345,8 @@ def _abort_if_poll_stalled(anchor: float,
         return True
     print(f"FATAL: no successful poll in {stalled_s}s (limit {POLL_STALL_EXIT_S:g}s) "
           f"-- exiting so {POLL_STALL_RESTART_OWNER} restarts the bridge.", file=sys.stderr)
-    sys.exit(POLL_STALL_EXIT_CODE)
+    _STALL_EXIT_READY = True
+    return True
 
 
 def main() -> int | None:
@@ -11428,6 +11432,10 @@ def main() -> int | None:
         _stamp_loop_progress()
         polled_ok = False  # a failure after this pass's good poll is not a lost connection
         try:
+            # Checked before the watchdog, which would otherwise repeat its exit body.
+            if _STALL_EXIT_READY:
+                _save_inflight(inflight)  # claimed tasks reload from it on start
+                return POLL_STALL_EXIT_CODE
             if _abort_if_poll_stalled(stall_anchor, stop_workers):
                 continue
             if _STUCK_EXIT_READY:

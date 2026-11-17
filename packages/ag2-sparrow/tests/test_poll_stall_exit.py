@@ -43,7 +43,7 @@ def test_zero_limit_disables_the_exit():
         assert m._poll_stalled(0.0, 1e9, limit=0) is False
 
 
-def test_abort_exits_nonzero_and_records_the_stall():
+def test_abort_asks_for_the_exit_and_records_the_stall():
     import json
     with tempfile.TemporaryDirectory() as d:
         tmp = pathlib.Path(d)
@@ -51,44 +51,45 @@ def test_abort_exits_nonzero_and_records_the_stall():
         os.environ["SUTANDO_BRIDGE_RESTART_OWNER"] = "launchd"
         m = _load(tmp)
         m.POLL_STALL_EXIT_S = 10
-        # within the limit: returns, does not exit
-        m._abort_if_poll_stalled(time.monotonic())
-        # past it: SystemExit, and the status sidecar names the stall
+        # within the limit: returns False, asks for nothing
+        assert m._abort_if_poll_stalled(time.monotonic()) is False
+        # past it: the exit is marked ready for main(), and the sidecar names the stall
         stopped = []
         err = io.StringIO()
         try:
             with contextlib.redirect_stderr(err):
-                m._abort_if_poll_stalled(time.monotonic() - 60, lambda: stopped.append(1) or True)
+                asked = m._abort_if_poll_stalled(time.monotonic() - 60,
+                                                 lambda: stopped.append(1) or True)
         except SystemExit as e:
-            assert e.code == m.POLL_STALL_EXIT_CODE != 0, e.code
-            assert "no successful poll" in err.getvalue()
-            assert stopped == [1], "the workers must be stopped before the exit"
-        else:
-            raise AssertionError("a stalled poll loop must exit")
+            # The code belongs to main(), so run() can bound the exit hooks.
+            raise AssertionError(f"the stall exit left in place with code {e.code}") from None
+        assert asked is True, "a stalled poll loop must ask the caller to leave"
+        assert m._STALL_EXIT_READY is True, "main() reads this to return the code"
+        assert m.POLL_STALL_EXIT_CODE != 0
+        assert "no successful poll" in err.getvalue()
+        assert stopped == [1], "the workers must be stopped before the exit"
         rec = json.loads(m.GATEWAY_STATUS_FILE.read_text())
         assert rec["connected"] is False
         assert "stalled" in rec["error"]
 
 
-def test_systemexit_is_not_swallowed_by_the_loops_catch_all():
+def test_the_exit_request_survives_the_loops_catch_all():
     """The call site sits inside `try:` whose last handler is `except Exception`.
 
-    SystemExit derives from BaseException, so it escapes — pinned because the
-    whole fix is inert if a future handler widens to BaseException.
+    The request is a flag and a return, not an exception, so no handler can eat
+    it; pinned because the whole fix is inert if the request can be discarded.
     """
     with tempfile.TemporaryDirectory() as d:
         os.environ["SUTANDO_BRIDGE_RESTART_OWNER"] = "launchd"
         m = _load(pathlib.Path(d))
         m.POLL_STALL_EXIT_S = 1
-        raised = False
-        try:
+        with contextlib.redirect_stderr(io.StringIO()):
             try:
-                m._abort_if_poll_stalled(time.monotonic() - 60)
+                asked = m._abort_if_poll_stalled(time.monotonic() - 60)
             except Exception:  # noqa: BLE001 — mirrors the poll loop's catch-all
-                raise AssertionError("SystemExit must not be caught as Exception")
-        except SystemExit:
-            raised = True
-        assert raised
+                raise AssertionError("the exit request must not raise")
+        assert asked is True
+        assert m._STALL_EXIT_READY is True, "the request must outlive the catch-all"
 
 
 def test_unsupervised_lane_does_NOT_exit_and_keeps_retrying():
@@ -121,14 +122,11 @@ def test_declared_owner_arms_the_exit_and_names_it():
             m.POLL_STALL_EXIT_S = 10
             assert m.POLL_STALL_RESTART_OWNER == "launchd"
             err = io.StringIO()
-            try:
-                with contextlib.redirect_stderr(err):
-                    m._abort_if_poll_stalled(time.monotonic() - 60)
-            except SystemExit as e:
-                assert e.code == m.POLL_STALL_EXIT_CODE
-                assert "launchd" in err.getvalue(), err.getvalue()
-            else:
-                raise AssertionError("a declared owner must arm the exit")
+            with contextlib.redirect_stderr(err):
+                asked = m._abort_if_poll_stalled(time.monotonic() - 60)
+            assert asked is True, "a declared owner must arm the exit"
+            assert m._STALL_EXIT_READY is True
+            assert "launchd" in err.getvalue(), err.getvalue()
         finally:
             os.environ.pop("SUTANDO_BRIDGE_RESTART_OWNER", None)
 
@@ -193,13 +191,10 @@ def test_a_worker_still_sending_holds_the_exit_until_it_stops():
             assert m._STALL_EXIT_PENDING is True
             # A fresh anchor must not cancel a requested stop.
             assert m._abort_if_poll_stalled(time.monotonic(), stop) is True
-            try:
-                with contextlib.redirect_stderr(io.StringIO()):
-                    m._abort_if_poll_stalled(time.monotonic(), stop)
-            except SystemExit as e:
-                assert e.code == m.POLL_STALL_EXIT_CODE
-            else:
-                raise AssertionError("the exit must follow once the worker has stopped")
+            with contextlib.redirect_stderr(io.StringIO()):
+                assert m._abort_if_poll_stalled(time.monotonic(), stop) is True
+            assert m._STALL_EXIT_READY is True, \
+                "the exit must follow once the worker has stopped"
             assert len(calls) == 3, calls
         finally:
             os.environ.pop("SUTANDO_BRIDGE_RESTART_OWNER", None)
@@ -219,10 +214,10 @@ if __name__ == "__main__":
     print("PASS test_stalled_only_past_the_limit")
     test_zero_limit_disables_the_exit()
     print("PASS test_zero_limit_disables_the_exit")
-    test_abort_exits_nonzero_and_records_the_stall()
-    print("PASS test_abort_exits_nonzero_and_records_the_stall")
-    test_systemexit_is_not_swallowed_by_the_loops_catch_all()
-    print("PASS test_systemexit_is_not_swallowed_by_the_loops_catch_all")
+    test_abort_asks_for_the_exit_and_records_the_stall()
+    print("PASS test_abort_asks_for_the_exit_and_records_the_stall")
+    test_the_exit_request_survives_the_loops_catch_all()
+    print("PASS test_the_exit_request_survives_the_loops_catch_all")
     test_unsupervised_lane_does_NOT_exit_and_keeps_retrying()
     print("PASS test_unsupervised_lane_does_NOT_exit_and_keeps_retrying")
     test_declared_owner_arms_the_exit_and_names_it()
