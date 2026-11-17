@@ -450,6 +450,39 @@ class ReturnRoom(Base):
         self.assertEqual((self.bound()[ROOM], self.bound()[LEGACY]), (OTHER, W))
         self.assertIn("another worker holds", out["why"])
 
+    def test_a_binding_made_after_the_first_look_is_never_overwritten(self):
+        """The owner binds the room elsewhere just as the restore takes the roster lock."""
+        real = pr._locked
+
+        @contextlib.contextmanager
+        def owner_binds_meanwhile(workspace):
+            with real(workspace):
+                current = dict(pr.load_bindings(workspace))
+                if current.get(ROOM) is None:
+                    pr.save_bindings(workspace, dict(current, **{ROOM: OTHER}))
+                yield
+        mine = FakeActions({AGENT, CORE}, me=AGENT)
+        for key in (ROOM, LEGACY):
+            pr.unbind_room(self.ws, key)
+        with mock.patch.object(pr, "_locked", owner_binds_meanwhile):
+            out = rh.return_room(W, ROOM, bindings=[ROOM], workspace=self.ws, actions=FakeActions(set()),
+                                 server="s.space", core_agent=CORE, as_worker=lambda: mine, wall=lambda: self.wall[0])
+        self.assertEqual((out["status"], out["taken"]), ("returned", [ROOM]))
+        self.assertEqual(self.bound()[ROOM], OTHER)
+
+    def test_bind_room_if_free_decides_under_the_lock(self):
+        pr.unbind_room(self.ws, ROOM)
+        self.assertTrue(pr.bind_room_if_free(self.ws, ROOM, W))
+        self.assertTrue(pr.bind_room_if_free(self.ws, ROOM, "reviewer"), "already this worker's, by label")
+        self.assertFalse(pr.bind_room_if_free(self.ws, ROOM, OTHER))
+        self.assertEqual(self.bound()[ROOM], W)
+        for target in ("core", "nobody"):
+            with self.assertRaises(pr.RosterError):
+                pr.bind_room_if_free(self.ws, ROOM, target)
+        (self.ws / "state" / "roster.json").unlink()
+        with self.assertRaises(pr.RosterError):
+            pr.bind_room_if_free(self.ws, ROOM, W)
+
     def test_the_worker_agent_stays_when_its_leave_or_the_last_check_fails(self):
         mine = FakeActions({AGENT, CORE}, me=AGENT, leave={"is_error": True, "message": "nope"})
         out = self.returned(mine)

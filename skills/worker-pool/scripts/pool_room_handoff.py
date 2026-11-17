@@ -381,11 +381,7 @@ def _return_room(worker, room, *, bindings, workspace, actions, server, core_age
                              stays="the worker's agent stays and the binding stays dropped")
     except _Stop as stop:
         return {**out, "status": stop.status, "why": stop.why, **stop.extra}
-    current = pr.load_bindings(ws)
-    taken = [k for k in keys if current.get(k) not in (None, worker, [worker])]
-    for key in keys:
-        if key not in taken:
-            pr.bind_room(ws, key, worker)
+    taken = [k for k in keys if not pr.bind_room_if_free(ws, k, worker)]
     members, why = joined(mine, target)
     if members is None or core_agent not in members:
         return {**out, "status": "returned", "worker_left": False, "taken": taken,
