@@ -586,7 +586,19 @@ def _prefs_reply(ws: Path, said: ac.Reply, headers: dict, lane: str, account, ex
                                                           operation_id=f"{task_id}:{kind}-set"))
         except Exception as e:  # noqa: BLE001 — any failed save is said on a card that still works
             view, status = pc.View(edit=view.edit, outcome=f"Not saved: {_save_error(e)}.", tone="warn"), "not_saved"
-            if isinstance(e, PrefsError) and e.code == "CONFLICT":
+            if not isinstance(e, PrefsError):
+                # The server may have applied it before the answer was lost: show what is set now.
+                try:
+                    doc = prefs_doc(pc.GET[kind], account.read(pc.GET[kind]))
+                except Exception as again:  # noqa: BLE001 — the card as it was, with why
+                    view.outcome = (f"I couldn't confirm whether it saved ({type(e).__name__}), and I couldn't "
+                                    f"read them again ({_save_error(again)}). Show this card again to check.")
+                else:
+                    names = pc.names_for(doc, _known_names(ws))
+                    view = pc.View(edit=view.edit, outcome=f"I couldn't confirm whether it saved ({type(e).__name__}); "
+                                   "this card shows what is set now.", tone="warn")
+                status = "unknown"
+            elif e.code == "CONFLICT":
                 try:
                     doc = prefs_doc(pc.GET[kind], account.read(pc.GET[kind]))
                 except Exception as again:  # noqa: BLE001 — the card as it was, with why

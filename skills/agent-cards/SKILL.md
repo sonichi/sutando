@@ -92,6 +92,8 @@ card is spent only once that post succeeds, so a failed read or post leaves it w
 - `out_of_date` / `conflict`: the settings changed since the card was drawn; nothing was set and the card
   shows the current values and says so.
 - `not_saved`: the server refused (the outcome line names why); the card still works.
+- `unknown`: the save's answer was lost (a timeout or dropped connection), so it may have applied; the
+  card is drawn again from a fresh read and says it could not confirm the save, never "Not saved".
 - `redrawn`: Edit, Close or Keep.
 
 An occasional one-line offer ("Want to review what I watch for you…?") is `cards.py offer`: off unless

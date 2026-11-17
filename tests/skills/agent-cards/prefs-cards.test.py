@@ -571,11 +571,43 @@ class SaveErrors(Base):
             raise OSError("socket closed")
         acct.execute = boom
         rc, out = self.click(event, card, 'Turn off "The agent is added to a room" for all agents', acct)
-        self.assertEqual((rc, out["status"]), (0, "not_saved"))
-        self.assertEqual(out["outcome"], f"Not saved: I couldn't reach {cards.dotspace.SUCCESSOR_SERVER} (OSError).")
+        self.assertEqual((rc, out["status"]), (0, "unknown"))
+        self.assertNotIn("Not saved", out["outcome"])
+        self.assertIn("couldn't confirm whether it saved (OSError)", out["outcome"])
         again = self.poster.card()
         self.assertEqual((again["note"], again["note_tone"]), (out["outcome"], "warn"))
         self.assertIsNotNone(cards.issued_cards.live(self.ws, out["event_id"]), "the card still works")
+
+    def test_a_save_applied_then_answer_lost_redraws_from_a_fresh_read(self):
+        acct = FakeAccount(triggers_doc(revision=3))
+        event, card = self.show("triggers", acct)
+
+        def applied_then_lost(action, arguments, *, operation_id, task_id=""):
+            acct.sets.append((action, arguments, operation_id, task_id))
+            acct.doc = triggers_doc(revision=4)
+            raise OSError("response lost")
+        acct.execute = applied_then_lost
+        reads_before = len(acct.reads)
+        rc, out = self.click(event, card, 'Turn off "The agent is added to a room" for all agents', acct)
+        self.assertEqual((rc, out["status"]), (0, "unknown"))
+        self.assertNotIn("Not saved", out["outcome"])
+        self.assertIn("shows what is set now", out["outcome"])
+        self.assertEqual(len(acct.reads) - reads_before, 2, "the click's read, then a read-back after the lost answer")
+        self.assertIn("r4=", json.dumps(self.poster.card()), "the redraw carries the fresh revision")
+
+    def test_a_save_lost_and_read_back_failing_says_the_outcome_is_unknown(self):
+        acct = FakeAccount(triggers_doc())
+        event, card = self.show("triggers", acct)
+        reads = iter([{"status": "ok", "result": triggers_doc()}, {"is_error": True, "code": "UPSTREAM_UNAVAILABLE"}])
+        acct.read = lambda action, arguments=None: next(reads)
+
+        def boom(*a, **kw):
+            raise TimeoutError("timed out")
+        acct.execute = boom
+        rc, out = self.click(event, card, 'Turn off "The agent is added to a room" for all agents', acct)
+        self.assertEqual((rc, out["status"]), (0, "unknown"))
+        self.assertNotIn("Not saved", out["outcome"])
+        self.assertIn("couldn't confirm whether it saved (TimeoutError)", out["outcome"])
 
     def test_a_conflict_whose_re_read_fails_still_posts_the_card(self):
         acct = FakeAccount(triggers_doc(), set_answer={"is_error": True, "code": "CONFLICT", "details": {}})
