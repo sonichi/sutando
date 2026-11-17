@@ -34,6 +34,64 @@ def _strip_comments(src: str) -> str:
     return re.sub(r"/\*.*?\*/", "", src, flags=re.S)
 
 
+_SCRIPT = re.compile(r"<script\b[^>]*>(.*?)</script>", re.S | re.I)
+# After one of these (or at the start), a "/" opens a regex literal rather than dividing.
+_REGEX_BEFORE = set("(,=:[!&|?{};+-*%<>~^")
+
+
+def _script_code(src: str) -> str:
+    """The pages' script bodies with comments, string literals and regex literals blanked.
+
+    Used where a rule asks "does the page CALL x?": a commented-out call, or the call's name in a
+    string or a regex, must not count. Template literals are blanked whole, ${} included.
+    """
+    out: List[str] = []
+    for body in _SCRIPT.findall(_strip_comments(src)):
+        i, n, prev = 0, len(body), ""
+        while i < n:
+            c = body[i]
+            if body.startswith("//", i):
+                j = body.find("\n", i)
+                i = n if j < 0 else j
+                continue
+            if body.startswith("/*", i):
+                j = body.find("*/", i + 2)
+                i = n if j < 0 else j + 2
+                out.append(" ")
+                continue
+            word = re.search(r"([A-Za-z_$][\w$]*)\s*$", body[max(0, i - 12):i])
+            regex_ok = c == "/" and (prev == "" or prev in _REGEX_BEFORE
+                                     or (word is not None and word.group(1) in ("return", "typeof", "in", "of", "case")))
+            if c in "'\"`" or regex_ok:
+                j, in_class = i + 1, False
+                while j < n:
+                    d = body[j]
+                    if d == "\\":
+                        j += 2
+                        continue
+                    if regex_ok:
+                        if d == "[":
+                            in_class = True
+                        elif d == "]":
+                            in_class = False
+                        elif d == "/" and not in_class:
+                            break
+                        elif d == "\n":
+                            break
+                    elif d == c:
+                        break
+                    j += 1
+                out.append('""')
+                i, prev = j + 1, '"'
+                continue
+            out.append(c)
+            if not c.isspace():
+                prev = c
+            i += 1
+        out.append("\n")
+    return "".join(out)
+
+
 def check(src: str) -> dict:
     errors: List[dict] = []
     warnings: List[dict] = []
@@ -67,7 +125,7 @@ def check(src: str) -> dict:
         if re.search(r"\b(?:display|visibility|opacity)\s*:", m.group(1)):
             add(warnings, "hover-only", "a :hover rule changes display/visibility/opacity: controls must not be hover-only")
             break
-    sends = re.search(r"\broom\s*\.\s*post\s*\(|\bsendTask\s*\(|\bsendToMyAgent\s*\(", code)
+    sends = re.search(r"\broom\s*\.\s*post\s*\(|\bsendTask\s*\(|\bsendToMyAgent\s*\(", _script_code(src))
     if not sends and re.search(r">\s*(?:Send|Notify|Email|DM|Message)\b[^<]{0,40}</button>", code, re.I):
         add(warnings, "no-fake-send", "a button claims to send or notify, but the page never calls "
             "artifact.room.post or artifact.agent.sendTask: a page messages no one otherwise")

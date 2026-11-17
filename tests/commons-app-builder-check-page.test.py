@@ -69,6 +69,27 @@ for call in ("artifact.room.post({text: 'hi'})", "artifact.agent.sendTask({agent
         "await art.ready;", f"await art.ready; await {call};")
     check(f"send-button-with-real-send-{call.split('(')[0]}", "no-fake-send" not in rules(cp.check(page), "warnings"))
 check("own-confirm-function-allowed", cp.check(GOOD.replace("await art.ready;", "await art.ready; function confirm(x) {}"))["ok"])
+# A call that is not a call does not silence no-fake-send: a // comment, a string, a regex.
+SEND_BTN = GOOD.replace("Sign me up</button>", "Send to everyone</button>")
+for label, snippet in [
+    ("line-comment", "// art.room.post({text: 'hi'});"),
+    ("block-comment", "/* art.room.post({text: 'hi'}) */"),
+    ("single-quoted", "const help = 'call art.room.post( to send';"),
+    ("double-quoted", 'const help = "art.agent.sendTask( is how";'),
+    ("template", "const help = `art.room.post(${1})`;"),
+    ("regex", "const re = /room.post\\(/;"),
+]:
+    page = SEND_BTN.replace("await art.ready;", "await art.ready; " + snippet + "\n")
+    check(f"fake-send-not-silenced-by-{label}", "no-fake-send" in rules(cp.check(page), "warnings"))
+# Real calls still count, also next to a URL, a division and an escaped quote.
+for label, snippet in [
+    ("after-url-string", "const u = 'https://x.example'; await art.room.post({text: u});"),
+    ("after-division", "const half = 4 / 2; await art.room.post({text: 'a/b'});"),
+    ("after-escaped-quote", "const q = 'it\\'s'; await art.agent.sendTask({agentId: 'x', text: q, key: 'k'});"),
+    ("after-regex-with-quote", "const re = /'/g; await art.room.post({text: 'x'.replace(re, '')});"),
+]:
+    page = SEND_BTN.replace("await art.ready;", "await art.ready; " + snippet + "\n")
+    check(f"real-send-counts-{label}", "no-fake-send" not in rules(cp.check(page), "warnings"))
 check("commented-fetch-ignored", cp.check(GOOD.replace("await art.ready;", "await art.ready; /* fetch(x) */"))["ok"])
 check("db-only-page-needs-no-ready",
       cp.check(GOOD.replace("await art.ready;", "").replace("art.me.name", "'x'"))["ok"])
