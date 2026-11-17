@@ -38,7 +38,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`auth_preflight.py`** — auth_preflight.py — probe whether a CLAUDE_CONFIG_DIR can boot the claude CLI authenticated (OK vs LOGIN_REQUIRED + exact remedy), before a restart terminates the session that could still fix it.
 - **`body_file.py`** — Bounded read of a CLI `--body-file` argument — the single owner of that policy.
 - **`bounded-wait.sh`** — Shared bounded child run.
-- **`bounded_file_read.py`** — Read a small regular file's text without ever blocking: the one reader for credential files.
+- **`bounded_file_read.py`** — Read a small regular file without ever blocking: the one reader for credential files and attachments.
 - **`bridge_engine.py`** — Whether each running channel bridge runs from this core's engine checkout.
 - **`browser-tools.ts`** — Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
 - **`browser.mjs`** — Sutando browser automation — lightweight Playwright wrapper.
@@ -334,6 +334,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`wedge_probes.py`** — Watcher and standby wedge signatures for the shared wedge detector: pure probes that publish nothing.
 - **`work-request-check.ts`** — The relay agent's text-model decisions.
 - **`worker_auth_state.py`** — Is a Claude CLI pane still signed out?
+- **`worker_lane.py`** — A pool worker's own agent served by a gateway bridge: the wiring every bridge entry point installs.
 - **`workspace_default.py`** — Canonical workspace-directory resolution for Sutando services.
 - **`workspace_default.ts`** — Canonical workspace-directory resolution for Sutando TS services.
 - **`workspace_layout.py`** — Spawn-time guard for the `<repo>/workspace` wiring: heals recoverable breaks to the durable symlink; a real directory HOLDING data is never touched.

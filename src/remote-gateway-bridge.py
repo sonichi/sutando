@@ -19,7 +19,8 @@ workspace wiring:
      runpy via the deprecated remote-relay-bridge name, and the mock-gateway
      test harness (which loads the file several times under different env and
      mutates module attributes) — sees exactly the same module-level API and
-     import-time env parsing as the pre-switch monolith.
+     import-time env parsing as the pre-switch monolith. A pool worker's declared
+     Sparrow bridge (`sparrow_agent_bridge.py`) runs this file too, as its lane.
 
 Revert: restore this file's previous revision from git (the pre-switch
 monolith is the parent commit of the one introducing this shim). No other
@@ -47,6 +48,7 @@ from proactive_routing import (BRIDGE_CHANNELS, body_target_channel,  # noqa: E4
                                lane_claims_proactive, proactive_destination,
                                should_claim_proactive)
 from workspace_default import resolve_workspace  # noqa: E402
+import worker_lane  # noqa: E402
 from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 from voice_room_membership import (CHECK_DIR_NAME, VERDICT_TTL_S,  # noqa: E402
                                    RoomMembershipVerifier, members_from_room_op)
@@ -507,75 +509,18 @@ def _lane_worker() -> str:
     return worker
 
 
-def _worker_lane_claim_gate(worker: str):
-    """A worker's own lane shares results/ with the core's lanes: it claims only the proactive files
-    its worker's session stamped (`lane_claims_proactive`), which it posts as the worker's agent."""
-    return lambda path: lane_claims_proactive(path.name, worker)
-
-
-_HANDLER_LOOKUP = _SRC / "agent" / "task-event-handler-lookup.sh"
-
-
-# The router holds task and folder locks; past this the lane publishes and the core's watcher routes.
-_LANE_ROUTE_TIMEOUT_S = 10
-
-
 def _lane_route_argv() -> "list[str]":
-    """The core's declared task-event handler (the pool router) as run from this lane, short of the
-    task's own paths; [] when none is declared (the core's watcher routes the lane's tasks)."""
-    import subprocess
-    from util_paths import task_event_handler_config_path
-    cfg = task_event_handler_config_path(WS / "state")
-    try:
-        out = subprocess.run(["bash", "-c", 'source "$1" && task_event_handler "$2"', "lane-route",
-                              str(_HANDLER_LOOKUP), str(cfg)], capture_output=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    handler = os.fsdecode(out.stdout.removesuffix(b"\n"))
-    if out.returncode != 0 or not handler:
-        return []
-    return [handler, "--workspace", str(WS), "--results-dir", str(RESULTS_DIR), "--from-lane"]  # noqa: F821
+    return worker_lane.route_argv(WS, RESULTS_DIR)  # noqa: F821
 
 
 def _lane_router(worker: str, argv: "list[str]"):
-    """TASK_PRE_PUBLISH for `worker`'s lane: route the staged task before it reaches `tasks/`, so it is
-    the worker's when it appears and the core's watcher, which never routes a held task, leaves it."""
-    import subprocess
-
-    def run(tid: str, args: "list[str]", step: str) -> "int | None":
-        try:
-            return subprocess.run(argv + args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL, timeout=_LANE_ROUTE_TIMEOUT_S).returncode
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            _log(f"lane for worker {worker}: {step} {tid} failed ({exc!r})")  # noqa: F821
-            return None
-
-    def route(tid: str, staged: Path, dest: Path):
-        rc = run(tid, ["--task-file", str(dest), "--payload", str(staged)], "routing")
-        if rc is not None and rc != 0:
-            _log(f"lane for worker {worker}: {tid} not delivered to it (router exit {rc}); "  # noqa: F821
-                 "the core's watcher routes it")
-            return None
-        # The worker's watcher may have given up on the sentinel before the payload appeared (a slow or
-        # killed router, or an earlier serve's): once published, its pending sentinel is raised afresh.
-        return lambda: run(tid, ["--task-file", str(dest), "--renotify"], "re-raising")
-    return route
+    return worker_lane.router(worker, argv, lambda line: _log(line))  # noqa: F821
 
 
 def _install_worker_lane(worker: str) -> None:
-    """This lane runs as `worker`'s own agent: every task it queues is addressed to that worker and
-    routed to it by the lane before it is published (`_lane_router`), and the only proactive files it
-    claims and owns are the ones that worker's session wrote."""
-    global TASK_ADDRESSEE, PROACTIVE_CLAIM_GATE, PROACTIVE_OWN_FILE, TASK_PRE_PUBLISH
-    _log(f"lane {GATEWAY_INSTANCE} runs as worker {worker}'s own agent: it delivers its tasks to that worker, "  # noqa: F821
-         "and it posts only the proactive files that worker's session writes")
-    TASK_ADDRESSEE = lambda: worker  # noqa: E731
-    PROACTIVE_CLAIM_GATE = PROACTIVE_OWN_FILE = _worker_lane_claim_gate(worker)
-    argv = _lane_route_argv()
-    if not argv:
-        _log(f"lane for worker {worker}: no task-event handler is declared; the core's watcher routes its tasks")  # noqa: F821
-        return
-    TASK_PRE_PUBLISH = _lane_router(worker, argv)
+    """This lane runs as `worker`'s own agent: the shared worker wiring, in this module's namespace."""
+    worker_lane.install(globals(), worker, workspace=WS, results_dir=RESULTS_DIR,  # noqa: F821
+                        log=lambda line: _log(line), who=f"lane {GATEWAY_INSTANCE}")  # noqa: F821
 
 
 # Read once: a lane's row names its worker for the life of the process (a change relaunches it).
@@ -588,4 +533,4 @@ STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
     __name__ = "__main__"
     VOICE_ROOM_VERIFIER.start()
-    main()  # noqa: F821  (defined by the exec above)
+    run()  # noqa: F821  (defined by the exec above)

@@ -38,6 +38,8 @@ lower-precedence candidate.
 | `REMOTE_TASK_TURN_CONTEXT` | no | off | `1`, with `REMOTE_TASK_LIFECYCLE_V2`, writes each attempt's turn file and gates its result on the turn's room actions. |
 | `REMOTE_ALERT_ROOM` | no | none (gateway alert disabled) | Explicit owner-only room id for core-independent health alerts sent by the launchd fallback. Never inferred from last activity because that room may be shared. |
 
+**Exit codes a supervisor acts on:** `75` means another live bridge holds this workspace's poller lock, so stand down. `69` is the poll-stall exit above. `70` means this bridge lost its poller lock to a successor after a stale takeover; relaunch it, and the relaunch either stands down (`75`) or takes the lock. `0` is a signal stop. Once the bridge has decided to exit `70`, a hung exit hook cannot hold it open: it is force-exited with the same code after 30 s.
+
 **Use the split form** (`REMOTE_TASK_URL` + `REMOTE_TASK_TOKEN`) — it's the recommended way to configure the bridge.
 
 > **Legacy / bootstrap shortcut:** the bridge also accepts a *combined* token of the form `REMOTE_TASK_TOKEN="https://relay.example.com|<secret>"` (URL and secret joined by `|`), which it splits at startup. This exists only so a one-shot onboarding string can carry both halves. If you use it, **quote it in `.env`** — an unquoted `|` is a shell pipe when the file is sourced. Prefer the split form for anything persistent.

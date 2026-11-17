@@ -80,6 +80,12 @@ class Trailer(unittest.TestCase):
         self.assertIsNone(route_mod.trailer_task("s\n\nSutando-Task: not a task"))
         self.assertIsNone(route_mod.trailer_task(""))
 
+    def test_trailer_paragraphs_split_by_a_blank_line_still_count(self):
+        msg = "fix: thing\n\nbody text\n\nSutando-Task: task-abc123\n\nCo-Authored-By: x <y@z>"
+        self.assertEqual(route_mod.trailer_task(msg), "task-abc123")
+        mixed = "fix: thing\n\nSutando-Task: task-abc123\nnot a trailer line\n\nCo-Authored-By: x"
+        self.assertIsNone(route_mod.trailer_task(mixed), "a paragraph with prose is body, not trailer")
+
     def test_the_newest_commit_with_a_trailer_wins(self):
         msgs = ["a\n\nSutando-Task: task-old1", "b\n\nSutando-Task: task-new2", "c no trailer"]
         self.assertEqual(route_mod.latest_task(msgs), "task-new2")

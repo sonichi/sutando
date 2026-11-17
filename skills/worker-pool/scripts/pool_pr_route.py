@@ -36,6 +36,7 @@ GH_TIMEOUT_S = 10
 CACHE_MAX = 500
 EVENT_MAX = 400
 TRAILER_RE = re.compile(r"^Sutando-Task:[ \t]*(\S+)[ \t]*$")
+TRAILER_LINE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*:[ \t]*\S")
 EVENT_RE = re.compile(r"^PR_EVENT [A-Za-z0-9_.\-\[\]/#=? ]+$")
 REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 # Events about someone else's PR: ours to review, never ours to drive.
@@ -63,9 +64,15 @@ def gh(args, timeout):
 
 
 def trailer_task(message: str) -> Optional[str]:
-    """The valid `Sutando-Task:` id in the message's trailer block (its last paragraph), or None."""
+    """The valid `Sutando-Task:` id in the message's trailer block, or None. The block is the run of
+    final paragraphs made only of `Token: value` lines, never the subject."""
     paragraphs = [p for p in re.split(r"\n[ \t]*\n", (message or "").strip()) if p.strip()]
-    lines = paragraphs[-1].splitlines() if len(paragraphs) > 1 else []
+    lines: list = []
+    for para in reversed(paragraphs[1:]):
+        rows = para.strip().splitlines()
+        if not all(TRAILER_LINE_RE.match(r.strip()) for r in rows):
+            break
+        lines = rows + lines
     ids = [m.group(1) for m in (TRAILER_RE.match(line.strip()) for line in lines) if m]
     return ids[-1] if ids and is_task_id(ids[-1]) else None
 
