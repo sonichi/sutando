@@ -203,13 +203,8 @@ if (cfg.get("fullscreenUpsellSeenCount") or 0) < 3:
     cfg["fullscreenUpsellSeenCount"] = 3
     changed = True
     upsell_seeded = True
-# Trust-seed for the dir claude starts in. Claude Code keys the
-# folder-trust dialog on projects[<abs cwd>].hasTrustDialogAccepted; a fresh
-# scoped config lacks it, so a detached session would hang on the prompt.
-# Only pre-trust the one dir the caller explicitly chose, or else the launcher's
-# own checkout (physical path, as getcwd() reports it).
-# Also the home folder every launch passes to --add-dir: from Claude Code 2.1.326 an
-# untrusted --add-dir folder asks a per-session question that this key alone answers.
+# A detached session cannot answer a trust prompt: trust only its start dir and the
+# --add-dir home folder, by physical path (what getcwd() reports).
 trusted_dirs = []
 for d in dict.fromkeys(x for x in (os.environ.get("_cwd"), os.environ.get("_home")) if x):
     projects = cfg.get("projects")
