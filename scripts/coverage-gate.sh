@@ -247,7 +247,9 @@ elif unmeasured="$(python3 scripts/coverage_unmeasured.py "$BASE" coverage.json)
    && [ -n "$unmeasured" ]; then
     echo
     echo "coverage-gate: NOT MEASURED — changed, but absent from coverage.json:"
-    printf '  %s\n' $unmeasured
+    while IFS= read -r path; do
+        printf '  %s\n' "$path"
+    done <<< "$unmeasured"
     echo "coverage-gate: their changed lines are outside the bar, not inside and clean."
     {
         cat diff-cover.md
@@ -257,7 +259,9 @@ elif unmeasured="$(python3 scripts/coverage_unmeasured.py "$BASE" coverage.json)
         echo "Changed, but absent from \`coverage.json\` — coverage did not include"
         echo "these files in its report, so **their changed lines were not examined**:"
         echo
-        printf -- '-   `%s`\n' $unmeasured
+        while IFS= read -r path; do
+            printf -- '-   `%s`\n' "$path"
+        done <<< "$unmeasured"
     } > coverage-gate-report.md
     report="coverage-gate-report.md"
 fi
