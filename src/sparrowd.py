@@ -148,7 +148,10 @@ def core_spec(workspace=None, environ=None) -> "tuple[WorkerSpec | None, str]":
     import sparrow_core_bridge as core
     ws = workspace or resolve_workspace()
     decision, why = core.decide(ws, os.environ if environ is None else environ, cached=True)
-    core.write_claim(ws, None if decision is None else str(decision["instance"]))
+    try:
+        core.write_claim(ws, None if decision is None else str(decision["instance"]))
+    except OSError as e:  # the keeper then just starts the lane; the core still follows its connections
+        print(f"sparrowd: core claim not written ({type(e).__name__}: {e})", file=sys.stderr)
     if decision is None:
         return None, why
     return WorkerSpec(name=CORE_WORKER, argv=[sys.executable, str(CORE_LAUNCHER), f"--expect={decision['instance']}"],

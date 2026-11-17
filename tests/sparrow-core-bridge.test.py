@@ -450,6 +450,16 @@ class TheCoreClaim(unittest.TestCase):
                 SD.core_spec(ws, {})
             self.assertFalse(core.claim_path(ws).exists(), "nothing to run: nothing claimed")
 
+    def test_a_claim_that_cannot_be_written_never_stops_the_rescan(self):
+        err = io.StringIO()
+        with mock.patch.object(core, "decide", return_value=({"instance": "lane-a"}, "")), \
+                mock.patch.object(core, "write_claim", side_effect=PermissionError("read-only state")), \
+                mock.patch.object(core, "revision", side_effect=["r1", "r2"]), contextlib.redirect_stderr(err):
+            scan = SD.CoreScan(Path("/ws"))
+            self.assertEqual([s.revision for s in scan()] + [s.revision for s in scan()], ["r1", "r2"],
+                             "a rotation still restarts the core")
+        self.assertIn("core claim not written (PermissionError: read-only state)", err.getvalue())
+
 
 class TheCoreScan(unittest.TestCase):
     def test_it_keeps_the_last_core_while_unreadable_and_says_each_reason_once(self):
