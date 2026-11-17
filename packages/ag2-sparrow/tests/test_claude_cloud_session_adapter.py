@@ -275,6 +275,13 @@ class PayloadTest(unittest.TestCase):
         self.assertIn("or any other AG2 Space connector tool", forbidden)
         self.assertIn("Claude Code's own tools (shell, files, web, subagents, skills)", prompt)
 
+    def test_session_prompt_keeps_the_agent_list_to_the_owners_dm(self):
+        prompt = PROMPT_MD.read_text(encoding="utf-8")
+        start = prompt.index("you may also call `mcp__ag2_space__space_action_read`")
+        rule = " ".join(prompt[start:prompt.index("Never call", start)].split())
+        self.assertIn("read `account.agents.list` only when `channel_kind=dm`", rule)
+        self.assertIn("don't post the list there: say it's private and ask them to ask you in your DM", rule)
+
     def test_session_prompt_pins_the_message_count(self):
         prompt = PROMPT_MD.read_text(encoding="utf-8")
         rule = prompt[prompt.index("Message count per task_id, exactly:"):prompt.index("End your turn")]

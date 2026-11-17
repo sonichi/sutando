@@ -35,6 +35,8 @@ and stop the work that depends on the blocker; work that does not depend on it p
 reply says which part was not done. No silent retries, no wording that implies success. If several
 requests are pending, say how many are ahead of this one.
 
+**Agent-native design rules.** If this adds or changes something a person or an agent can do or read, follow [`docs/agent-native-design-rules.md`](docs/agent-native-design-rules.md) and answer its checklist. When a control exists for a known action, send the control, not the instruction; `vault set` (Vault, below) stays a typed command until a secure-entry control exists.
+
 ## Privacy
 
 Before anything leaves for a place others can read (a public repo's PRs, issues, commits or code; a room; a post; a message to someone other than the owner), check it against who can read it there. Never include what that audience shouldn't see: private repository or room names and IDs, people's and agents' names and accounts, private message content (quoted or paraphrased), the owner's account data, credentials, or local paths. Describe evidence by function ("the owner's DM", "agent A", "a test room"). Check before the first send: commits, merges and edit history can't be taken back.

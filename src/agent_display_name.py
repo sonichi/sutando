@@ -2,7 +2,8 @@
 """The name this agent introduces itself by: its live s.space display name, never a persona name.
 
 Every self-introduction (the first-contact reply in the owner's DM, the room-onboard greeting, the
-tutorial's Getting started page) takes its name from `resolve()`, in this order:
+tutorial's Getting started page, and the voice and phone prompts through src/agent-display-name.ts)
+takes its name from `resolve()`, in this order:
 
 1. `profile`    - the agent's current Matrix profile displayname from its homeserver: the name
                   s.space shows for it, so a rename there is picked up on the next greeting.
@@ -18,10 +19,11 @@ people greeted know the agent by its s.space display name. The agent's mxid is $
 the channel env file's, else the launcher-named device file or channels/ag2space/.env.
 
 CLI (what an agent runs before introducing itself):
-    python3 src/agent_display_name.py [--room ROOM] [--agent-mxid MXID] [--json]
+    python3 src/agent_display_name.py [--room ROOM] [--agent-mxid MXID] [--offline] [--json]
 prints the name (with --json: {"name", "source", "agent_mxid"}). It never fails. Stdlib only.
 With --room, a room whose connection names no identity, or that no connection serves, resolves with
 no mxid (tiers 3 and 5): another server's room never borrows the primary agent's name.
+--offline skips tier 1 (no network), for a caller that cannot wait on the homeserver.
 """
 from __future__ import annotations
 
@@ -132,15 +134,16 @@ def agent_mxid(environ: Optional[Mapping[str, str]] = None) -> str:
 
 def resolve(mxid: Optional[str] = None, *, fetch: Optional[Fetch] = None,
             environ: Optional[Mapping[str, str]] = None,
-            workspace: Optional[Path] = None) -> Tuple[str, str]:
-    """(name, source) for this agent's self-introduction, in the order the module docstring gives."""
+            workspace: Optional[Path] = None, offline: bool = False) -> Tuple[str, str]:
+    """(name, source) for this agent's self-introduction, in the order the module docstring gives;
+    `offline` skips the live profile tier."""
     if mxid is None:
         try:
             mxid = agent_mxid(environ)
         except Exception:  # noqa: BLE001 - no identity still yields a name
             mxid = ""
     mxid = (mxid or "").strip()
-    for source, name in (("profile", lambda: profile_name(mxid, fetch)),
+    for source, name in (("profile", lambda: "" if offline else profile_name(mxid, fetch)),
                          ("connection", lambda: connection_name(mxid, workspace)),
                          ("configured", lambda: configured_name(environ)),
                          ("localpart", lambda: localpart_name(mxid))):
@@ -157,6 +160,7 @@ def _main(argv) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--room", default="", help="the room the introduction is posted in")
     ap.add_argument("--agent-mxid", default="", help="this agent's mxid, when already known")
+    ap.add_argument("--offline", action="store_true", help="skip the live profile lookup")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
     mxid = args.agent_mxid.strip() or None
@@ -169,7 +173,7 @@ def _main(argv) -> int:
     if mxid is None:
         with contextlib.suppress(Exception):
             mxid = agent_mxid()
-    name, source = resolve(mxid or "")
+    name, source = resolve(mxid or "", offline=args.offline)
     if args.json:
         print(json.dumps({"name": name, "source": source, "agent_mxid": mxid or ""}))
     else:

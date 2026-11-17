@@ -71,7 +71,8 @@ checkout changes branch or updates. Re-run it after updating this skill.
 
 Loading the mod is the owner's one step: **enable hot reload of the mods folder in the
 session's terminal** (one click), or start the session with `claude --plugin-dir <mods-dir>/pr-watch`.
-Never enable it for them.
+Never enable it for them. For a pool worker, the other owner-approved way is to record it on that
+worker when the owner says so: `pool_manage.py plugins <worker> add <mods-dir>/pr-watch` (worker-pool skill).
 
 Other commands:
 

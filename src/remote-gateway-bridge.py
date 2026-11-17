@@ -112,6 +112,9 @@ def _sutando_apply_worker_label_overrides(labels: dict, config_version: int,
 _SUTANDO_WORKER_LABEL_APPLIER = (_sutando_apply_worker_label_overrides
                                  if _WORKER_LABEL_SCRIPT.is_file() else None)
 
+# Logged recovery commands name the workspace through its resolver, never its absolute path.
+_SUTANDO_WORKSPACE_RESOLVER = "bash scripts/sutando-config.sh workspace"
+
 # Runtime self-report, injected BEFORE the exec (anything after it is
 # unreachable when the exec'd source's own __main__ guard fires; see #3285).
 def _build_sha(repo):
@@ -510,19 +513,48 @@ def _worker_lane_claim_gate(worker: str):
     return lambda path: lane_claims_proactive(path.name, worker)
 
 
+_HANDLER_LOOKUP = _SRC / "agent" / "task-event-handler-lookup.sh"
+
+
+def _lane_route_command() -> str:
+    """The core's task-event handler as this lane's wake command, run on each task it queues, so the
+    worker's delivery is made at once; "" when none is declared (the core's watcher routes it)."""
+    import shlex
+    import subprocess
+    from util_paths import task_event_handler_config_path
+    cfg = task_event_handler_config_path(WS / "state")
+    try:
+        out = subprocess.run(["bash", "-c", 'source "$1" && task_event_handler "$2"', "lane-route",
+                              str(_HANDLER_LOOKUP), str(cfg)], capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    handler = os.fsdecode(out.stdout.removesuffix(b"\n"))
+    if out.returncode != 0 or not handler:
+        return ""
+    return shlex.join([handler, "--workspace", str(WS), "--results-dir", str(RESULTS_DIR),  # noqa: F821
+                       "--from-lane", "--task-file"])
+
+
 def _install_worker_lane(worker: str) -> None:
-    """This lane runs as `worker`'s own agent: every task it queues is addressed to that worker,
-    and the only proactive files it claims and owns are the ones that worker's session wrote."""
-    global TASK_ADDRESSEE, PROACTIVE_CLAIM_GATE, PROACTIVE_OWN_FILE
+    """This lane runs as `worker`'s own agent: every task it queues is addressed to that worker and
+    routed by the lane itself (`_lane_route_command`), and the only proactive files it claims and
+    owns are the ones that worker's session wrote."""
+    global TASK_ADDRESSEE, PROACTIVE_CLAIM_GATE, PROACTIVE_OWN_FILE, ON_TASK_CMD
+    _log(f"lane {GATEWAY_INSTANCE} runs as worker {worker}'s own agent: it delivers its tasks to that worker, "  # noqa: F821
+         "and it posts only the proactive files that worker's session writes")
     TASK_ADDRESSEE = lambda: worker  # noqa: E731
     PROACTIVE_CLAIM_GATE = PROACTIVE_OWN_FILE = _worker_lane_claim_gate(worker)
+    if ON_TASK_CMD:  # noqa: F821
+        _log(f"lane for worker {worker} keeps its own REMOTE_TASK_ON_TASK; the core's watcher routes its tasks")  # noqa: F821
+        return
+    ON_TASK_CMD = _lane_route_command()
+    if not ON_TASK_CMD:
+        _log(f"lane for worker {worker}: no task-event handler is declared; the core's watcher routes its tasks")  # noqa: F821
 
 
 # Read once: a lane's row names its worker for the life of the process (a change relaunches it).
 _LANE_WORKER = _lane_worker() if GATEWAY_INSTANCE else ""  # noqa: F821
 if _LANE_WORKER:
-    _log(f"lane {GATEWAY_INSTANCE} runs as worker {_LANE_WORKER}'s own agent: its tasks go to that worker, "  # noqa: F821
-         "and it posts only the proactive files that worker's session writes")
     _install_worker_lane(_LANE_WORKER)
 STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
                    and not gateway_credential_sources.is_seat(os.environ) else None)  # noqa: F821

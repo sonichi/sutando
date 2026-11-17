@@ -78,6 +78,7 @@ import ssl
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -962,6 +963,32 @@ def _lock_path(workspace: Optional[Path]) -> Path:
     return _workspace(workspace) / "state" / LOCK_NAME
 
 
+_LOCK_DEPTH = threading.local()
+
+
+@contextmanager
+def _records_lock(workspace: Optional[Path]) -> Iterator[None]:
+    """The record lock, re-entered without blocking by the thread that already holds it, so a stop and
+    the `launch` after it can share one hold. Other threads and processes still wait for it."""
+    key = os.path.abspath(str(_lock_path(workspace)))
+    depth = getattr(_LOCK_DEPTH, "held", None)
+    if depth is None:
+        depth = _LOCK_DEPTH.held = {}
+    if depth.get(key):
+        depth[key] += 1
+        try:
+            yield
+        finally:
+            depth[key] -= 1
+        return
+    with locked_file(_lock_path(workspace), create_mode=0o600):
+        depth[key] = 1
+        try:
+            yield
+        finally:
+            depth.pop(key, None)
+
+
 def launch_record_path(instance: str, workspace: Optional[Path] = None) -> Path:
     return _workspace(workspace) / "state" / LAUNCH_DIR / f"{instance or 'primary'}.json"
 
@@ -1110,7 +1137,7 @@ def _write(path: Path, record: dict) -> None:
 def _transaction(workspace: Optional[Path]) -> Iterator[dict]:
     """Read-mutate-publish under the record's lock; the yielded record is what gets written."""
     path = record_path(workspace)
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         record = _read_record(path)
         yield record
         _write(path, record)
@@ -1468,7 +1495,7 @@ def legacy_keeps_proactive_room(workspace: Optional[Path] = None) -> bool:
     room. Under the record lock, so a `set_primary` either committed first (False here) or runs
     after and sees this bridge's lease (refused); an unreadable record keeps it (env-only fail-open)."""
     try:
-        with locked_file(_lock_path(workspace), create_mode=0o600):
+        with _records_lock(workspace):
             rows = _read(record_path(workspace))
     except (SchemaError, OSError):
         return True
@@ -1481,7 +1508,7 @@ def legacy_parked(workspace: Optional[Path] = None) -> bool:
     record lock, so a `promote` that is stopping it commits first; an unreadable record parks nothing
     (the env-only fail-open)."""
     try:
-        with locked_file(_lock_path(workspace), create_mode=0o600):
+        with _records_lock(workspace):
             rec = _read_record(record_path(workspace))
     except (SchemaError, OSError):
         return False
@@ -1747,10 +1774,17 @@ def _channel_dir_tokens(channel_dir: Optional[str]) -> list:
         return []
 
 
+def row_token(row: Mapping[str, object], token: str) -> str:
+    """`token` as the `url|secret` a row's credential is: a combined one as it is, a bare secret joined
+    to the row's own gateway_url (`legacy_relay_token`); '' when that gateway is no gateway URL."""
+    return legacy_relay_token(token, str(row.get("gateway_url") or ""))
+
+
 def connection_credential(row: Mapping[str, object], environ: Optional[Mapping[str, str]] = None, *,
                           vault=None) -> "tuple[str, str]":
     """(gateway_url, token) for one row: the first token among its env var, its launch keys, its
-    channel env file and its vault key whose embedded gateway (if any) is the row's own host."""
+    channel env file and its vault key whose embedded gateway (if any) is the row's own host. The
+    token is always `url|secret`: a bare secret is joined to the row's gateway (`row_token`)."""
     environ = os.environ if environ is None else environ
     ref, instance = str(row["token_ref"]), str(row["instance"])
     refs = [ref] + [str(k) for k in row.get("launch_keys") or []]
@@ -1762,8 +1796,8 @@ def connection_credential(row: Mapping[str, object], environ: Optional[Mapping[s
     host = host_of_url(str(row["gateway_url"]))
 
     def own(tok) -> str:
-        tok = (tok or "").strip()
-        return tok if tok and (not gateway_url_of(tok) or host_of_url(gateway_url_of(tok)) == host) else ""
+        tok = row_token(row, tok)
+        return tok if tok and host_of_url(gateway_url_of(tok)) == host else ""
     tok = next((own(t) for t in candidates if own(t)), "")
     if not tok:
         try:
@@ -1870,24 +1904,25 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
     start_kw = dict(repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace, vault=vault,
                     spawn=spawn, python=python)
     try:
-        if not was_primary and not _connected_bridge(snapshot, workspace):
-            # A stop that signals and then is refused has still taken it down: rollback restarts it.
-            undo["relaunched"] = any(bridge_pid(i, workspace) for i in [instance] + alias_instances(snapshot))
-            _stop_row(snapshot, workspace, kill)
-        launch = start(instance, **start_kw)
+        with _records_lock(workspace):  # stop and start in one hold: the lane keeper starts lanes under it
+            if not was_primary and not _connected_bridge(snapshot, workspace):
+                # A stop that signals and then is refused has still taken it down: rollback restarts it.
+                undo["relaunched"] = any(bridge_pid(i, workspace) for i in [instance] + alias_instances(snapshot))
+                _stop_row(snapshot, workspace, kill)
+            launch = start(instance, **start_kw)
         if not launch.get("ok"):
             raise NewPrimaryNotStarted(instance, str(launch.get("reason") or "launch_failed"))
         undo["started"] = int(launch.get("pid") or 0) if launch.get("lease") == "held" else 0
         _await_connected(instance, int(launch.get("holder_pid") or launch.get("pid") or 0), workspace,
                          CONNECT_TIMEOUT_S if connect_timeout_s is None else connect_timeout_s)
     except ConnectionsError:
-        with locked_file(_lock_path(workspace), create_mode=0o600):
+        with _records_lock(workspace):
             _undo_promote(_read_record(record_path(workspace)), **undo)
-        _restart_secondary(undo, start_kw)
+            _restart_secondary(undo, start_kw)
         raise
     path = record_path(workspace)
     failure = None
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):  # a rollback's stop and restart share one hold
         rec = _read_record(path)
         row = next((r for r in rec["rows"] if r["instance"] == instance), None)
         old = next((r for r in rec["rows"] if old_inst is not None and r["instance"] == old_inst), None)
@@ -1912,9 +1947,9 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
             for r in rec["rows"]:
                 r["primary"] = r is row
             _write(path, rec)
-    if failure is not None:
-        _restart_secondary(undo, start_kw)
-        raise failure
+        if failure is not None:
+            _restart_secondary(undo, start_kw)
+            raise failure
     out = dict(row)
     parked = old if park else None
     out.update(previous=None if parked is None else parked["instance"],
@@ -1943,7 +1978,7 @@ def _promote_legacy(workspace: Optional[Path], kill, park: bool = False) -> dict
     primary then it runs without the room and the row carries `relaunch_needed`: its launchers
     restart it (`bash src/restart.sh`)."""
     path = record_path(workspace)
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         rec = _read_record(path)
         row = _find(rec["rows"], "")
         if row.get("disabled"):
@@ -2009,8 +2044,8 @@ def _undo_promote(rec: dict, *, instance: str, before: Optional[str], was_parked
 
 
 def _restart_secondary(undo: dict, start_kw: dict) -> None:
-    """After a rollback, outside the record lock (`launch` takes it): start again, as a secondary,
-    the bridge `promote` stopped to relaunch it."""
+    """After a rollback, in the same hold of the record lock as its stop: start again, as a
+    secondary, the bridge `promote` stopped to relaunch it."""
     if undo["relaunched"]:
         start(undo["instance"], **start_kw)
 
@@ -2042,7 +2077,7 @@ def park(instance: str, *, workspace: Optional[Path] = None, kill=None) -> dict:
     row as it was. `''` with no legacy row parks the rowless legacy bridge (`legacy_parked`). The row
     carries `stopped_pid` (0 when none ran)."""
     path = record_path(workspace)
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         rec = _read_record(path)
         row = next((r for r in rec["rows"] if r["instance"] == instance), None)
         if row is None and instance:
@@ -2069,7 +2104,7 @@ def park_legacy(*, workspace: Optional[Path] = None, kill=None) -> dict:
     {primary, parked: [instance], stopped: {instance: pid}}."""
     path = record_path(workspace)
     parked, stopped = [], {}
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         rec = _read_record(path)
         primary = next((r for r in rec["rows"] if r["primary"]), None)
         if primary is None:
@@ -2101,7 +2136,7 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
     vault = _vault(vault)
     path = record_path(workspace)
     # Cleanup stays under the record lock: a same-name re-add must not have its new files deleted.
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         rec = _read_record(path)
         rows = rec["rows"]
         row = _find(rows, instance)
@@ -2210,6 +2245,50 @@ def session_proactive_name(name, environ: Optional[Mapping[str, str]] = None,
     from proactive_routing import stamp_worker
     worker = session_worker(environ)
     return stamp_worker(name, worker) if worker and worker_enabled_identity(worker, workspace) else Path(name).name
+
+
+def proactive_author_agent(name, workspace: Optional[Path] = None) -> Optional[str]:
+    """The agent a proactive file named `name` is posted as when a worker's session stamped it
+    (`session_proactive_name`): that worker's own identity's `agent_mxid`; None for an unstamped name."""
+    from proactive_routing import proactive_worker
+    worker = proactive_worker(name)
+    row = worker_identity(worker, workspace) if worker else None
+    return str((row or {}).get("agent_mxid") or "").strip() or None
+
+
+# Lower-case Cyrillic and Greek letters that render like Latin ones, folded before the core check.
+_CONFUSABLES = str.maketrans("аеорсухікмтвнгјѕοεαρκτνιυ", "aeopcyxikmtbhrjsoeapktviu")
+AUTHOR_PHRASE_MAX = 64
+
+
+def _reads_as_core(phrase: str, host: str) -> bool:
+    def fold(text):
+        return unicodedata.normalize("NFKC", text).casefold().translate(_CONFUSABLES)
+    folded = re.sub(r"[\W_]+$", "", fold(phrase))
+    return bool(re.search(r"(^|[\W_])core$", folded)) or fold(f"the {host} core") in fold(phrase)
+
+
+def proactive_author_phrase(name, host: str, workspace: Optional[Path] = None) -> str:
+    """Who a proactive file named `name` speaks as, for its text: "the <host> core" for an unstamped
+    name; for a worker's stamped one, "<name> (a worker on <host>)" with its own agent's display name,
+    else its roster label, else just "a worker on <host>". The name is stripped of format characters
+    and bounded; one that reads as the core (ends with "core", or holds the core's phrase) is dropped."""
+    from proactive_routing import proactive_worker
+    worker = proactive_worker(name)
+    if not worker:
+        return f"the {host} core"
+    label = str((worker_identity(worker, workspace) or {}).get("agent_display_name") or "").strip()
+    if not label:
+        rows = _read_json(_workspace(workspace) / "state" / "roster.json").get("workers")
+        row = rows.get(worker) if isinstance(rows, dict) else None
+        row = row if isinstance(row, dict) else {}
+        label = str(row.get("display_label") or row.get("label") or "").strip()
+        label = "" if label == worker else label
+    label = " ".join("".join(ch for ch in label if unicodedata.category(ch) != "Cf").split())
+    if len(label) > AUTHOR_PHRASE_MAX:
+        label = label[:AUTHOR_PHRASE_MAX - 1].rstrip() + "…"
+    fallback = f"a worker on {host}"
+    return fallback if not label or _reads_as_core(label, host) else f"{label} ({fallback})"
 
 
 def worker_mcp_credential(worker: str, *, workspace: Optional[Path] = None,
@@ -2385,17 +2464,49 @@ def env_token_vars(environ: Mapping[str, str]) -> list:
     return out
 
 
+def legacy_relay_token(token: str, url: str) -> str:
+    """The legacy row's `url|secret`: a combined `token` as it is, a bare secret joined to `url` (the
+    gateway the bridge pairs it with); '' when either is missing or `url` is no gateway URL."""
+    token = (token or "").strip()
+    if gateway_url_of(token):
+        return token
+    url = (url or "").strip()
+    if not token or not url:
+        return ""
+    import channel_token  # noqa: F401 - puts the shared credential contract on the path
+    from gateway_credential_sources import contract, gateway_url_problem
+    if gateway_url_problem(url):
+        return ""
+    creds = contract.normalize_credentials(token, explicit_url=url)
+    joined = f"{creds.base_url}|{creds.token}"
+    return joined if gateway_url_of(joined) else ""
+
+
+def _env_gateway_url(environ: Mapping[str, str]) -> str:
+    """REMOTE_TASK_URL (legacy AG2_REMOTE_URL) as the bridge reads it from its environment; '' when unset."""
+    import channel_token  # noqa: F401 - puts the shared credential contract on the path
+    from gateway_credential_sources import URL_KEYS, first_env
+    return first_env(environ, URL_KEYS)[0]
+
+
 def primary_token_from_channel_file(environ: Mapping[str, str]) -> str:
     """The relay token (`url|secret`) the AG2 Space channel env file holds under either relay
-    spelling, read through the resolver `scripts/channel-env.sh` uses; '' when the environment
-    names one itself, when no file resolves, or when the file holds none."""
+    spelling, read through the resolver `scripts/channel-env.sh` uses; a bare secret is joined to
+    the gateway URL the bridge would pair it with (the environment's, else that file's). '' when
+    the environment names a token itself, when no file resolves, or when the file holds none."""
     try:
         from channel_credentials import channel_credentials
         from channel_token import RELAY_TOKEN_VARS
-        found = channel_credentials(RELAY_TOKEN_VARS, environ)
+        from gateway_credential_sources import URL_KEYS
+        if any(environ.get(v) for v in RELAY_TOKEN_VARS):
+            return ""
+        # Token and URL in one read, so both come from the same file; only a token in the env gates it.
+        found = channel_credentials(RELAY_TOKEN_VARS + URL_KEYS, {})
+        token = next((found[var].strip() for var in RELAY_TOKEN_VARS if found.get(var)), "")
+        file_url = next((found[var].strip() for var in URL_KEYS if found.get(var)), "")
+        return legacy_relay_token(token, _env_gateway_url(environ) or file_url)
     except Exception:  # noqa: BLE001 - no channel home or an unreadable file is simply no token
         return ""
-    return next((found[var].strip() for var in RELAY_TOKEN_VARS if found.get(var)), "")
 
 
 def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
@@ -2405,6 +2516,7 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
     The REMOTE_TASK_TOKEN row comes from the environment, else from the channel env file the
     connect flow writes (`primary_token_from_channel_file`): a desktop install signs in after
     the engine started, so the token reaches the file but never this process's environment.
+    A bare REMOTE_TASK_TOKEN counts beside a REMOTE_TASK_URL, joined as `legacy_relay_token`.
     Env rows are unverified: the resolver's server when it knows the host, else the host. The
     REMOTE_TASK_TOKEN row (the legacy unsuffixed bridge) becomes primary when the install has none.
     A named env row becomes primary only when it is then the record's sole row, with no primary,
@@ -2418,7 +2530,9 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
     """
     environ = os.environ if environ is None else environ
     candidates = []
-    primary_token = environ.get(PRIMARY_TOKEN_REF, "").strip() or primary_token_from_channel_file(environ)
+    env_token = environ.get(PRIMARY_TOKEN_REF, "").strip()
+    primary_token = (legacy_relay_token(env_token, _env_gateway_url(environ)) if env_token
+                     else primary_token_from_channel_file(environ))
     if gateway_url_of(primary_token):
         candidates.append(("", PRIMARY_TOKEN_REF, primary_token))
     for inst, var in env_token_vars(environ):
@@ -2750,13 +2864,14 @@ def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]]
     """The bridge's environment for one plan entry: the token from the env var of its token_ref,
     else the vault; no gateway URL beside the token; the proactive room only for the primary.
     A named entry runs as its row's own agent (`NoIdentity` when the row has none), never one the
-    environment inherited, and without the legacy device env file."""
+    environment inherited, and without the legacy device env file. Nothing of the calling session
+    (`SESSION_ENV`) is passed on, so a start from a worker's shell runs as the lane keeper's would."""
     environ = os.environ if environ is None else environ
     ref = str(entry["token_ref"])
     token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
     if not token:
         raise NoToken(f"no token under {ref}")
-    env = dict(environ)
+    env = {k: v for k, v in environ.items() if k not in SESSION_ENV}
     if entry["instance"]:
         mxid = str(entry.get("agent_mxid") or "").strip()
         if not server_of_mxid(mxid):
@@ -2780,6 +2895,18 @@ def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]]
 
 # The bridge's intake reads its row's `not_before` here; empty when the row has none.
 NOT_BEFORE_ENV = "SUTANDO_INTAKE_NOT_BEFORE"
+# What a core's or pool worker's session carries about itself: a bridge started from inside one is
+# the host's, so none of it is passed on (the lane keeper's launches never had it).
+SESSION_ENV = frozenset((
+    "SUTANDO_INSTANCE_ID", "SUTANDO_WORKER_ID", "SUTANDO_WORKER_RUNTIME", "SUTANDO_WORKER_SEAT",
+    "SUTANDO_CORE_ID", "SUTANDO_CORE_POOL_SIZE", "SUTANDO_CORE_SESSION", "SUTANDO_CORE_RUNTIME",
+    "SUTANDO_TMUX_SOCKET", "SUTANDO_TMUX_SESSION", "SUTANDO_TASKS_DIR", "SUTANDO_RESULTS_DIR",
+    "SUTANDO_WORKSPACE_DIR", "SUTANDO_INBOX_KIND", "SUTANDO_INBOX_RESOLVER", "SUTANDO_INBOX_RESOLVER_TIMEOUT",
+    "SUTANDO_CLAUDE_WORKING_DIR", "SUTANDO_CODEX_WORKING_DIR", "SUTANDO_WORKER_BOOTSTRAP",
+    "SUTANDO_POOL_DELIVERY_SCRIPT", "SUTANDO_WORKER_PLUGIN_DIRS", "SUTANDO_WATCHER_CMD", "SUTANDO_WATCHER_BEAT",
+    "SUTANDO_TASK_WATCH_MOD", "SUTANDO_TASK_WATCH_MOD_WORKER", "SUTANDO_TASK_EVENT_HANDLER",
+    "SUTANDO_CLAUDE_SESSION_ID", "SUTANDO_CLAUDE_RESUME", "AG2_MCP_WORKER_CREDENTIAL",
+))
 # The worker a lane runs as (a row's `worker`), empty for a core lane: the lane's start check.
 LANE_WORKER_ENV = "SUTANDO_LANE_WORKER"
 
@@ -2842,7 +2969,7 @@ def _learn_missing_identity(instance: str, environ: Mapping[str, str], workspace
 
     def token_of(r):
         ref = str(r["token_ref"])
-        return (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
+        return row_token(r, (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref))
     _learn_row_identity(row, token_of, workspace, fetch=fetch, getaddrinfo=getaddrinfo)
 
 
@@ -3163,7 +3290,7 @@ def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
     if not env_only:
         _learn_missing_identity(instance, environ, workspace, vault, fetch, getaddrinfo)
     # Holding the lock to the lease is safe: the bridge's startup never reads this record.
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         entry = plan_entry(instance, environ, workspace=workspace, env_only=env_only)
         if env_only and not entry["agent_mxid"]:
             entry["agent_mxid"] = _verified_agent((environ.get(entry["token_ref"]) or "").strip(), fetch, getaddrinfo)
@@ -3255,6 +3382,129 @@ def start_added(row: Mapping[str, object], **launch_kw) -> Optional[dict]:
     return start(str(row["instance"]), **launch_kw)
 
 
+# How soon the lane keeper retries a lane that did not start: doubling from the first, capped.
+LANE_RETRY_FIRST_S = 30.0
+LANE_RETRY_MAX_S = 900.0
+LANE_KEEPER_STATE = "gateway-lane-keeper.json"
+
+
+def lane_keeper_state_path(workspace: Optional[Path] = None) -> Path:
+    return _workspace(workspace) / "state" / LANE_KEEPER_STATE
+
+
+def keeper_environ(environ: Optional[Mapping[str, str]] = None) -> dict:
+    """`environ` with its AG2_REMOTE_TOKEN_<INST> values replaced by what the channel env file holds
+    now: a long-lived supervisor's inherited copy would launch a lane on a rotated-away token."""
+    environ = os.environ if environ is None else environ
+    base = {k: v for k, v in environ.items() if not _ENV_VAR_RE.match(k)}
+    return {**base, **channel_launch_keys(base)}
+
+
+def lane_retry_wait(failures: int) -> float:
+    """Seconds before try `failures + 1`: LANE_RETRY_FIRST_S doubling per failure, capped at
+    LANE_RETRY_MAX_S; the exponent is bounded so no failure count can overflow it."""
+    return min(LANE_RETRY_FIRST_S * 2 ** min(max(failures - 1, 0), 16), LANE_RETRY_MAX_S)
+
+
+def _lane_retry(due: object, now: float) -> dict:
+    try:
+        failures = int((due or {}).get("failures") or 0) + 1  # type: ignore[union-attr]
+    except (AttributeError, TypeError, ValueError):
+        failures = 1
+    return {"failures": failures, "next_try": now + lane_retry_wait(failures)}
+
+
+def _keep_lane(inst: str, state: dict, now: float, say: Callable[[str], None], *, repo: Path, logs_dir: Path,
+               environ: Mapping[str, str], workspace: Optional[Path], vault, spawn, python: Optional[str]) -> None:
+    """`keep_lanes_up` for one lane, under the record lock."""
+    with _records_lock(workspace):
+        if inst not in {e["instance"] for e in launch_plan(environ, workspace=workspace)}:
+            state.pop(inst, None)  # disconnected, parked or removed since the plan was read
+            return
+        row = _row_named(inst, workspace) or {}
+        if any(_proven_holder(n, workspace) for n in [inst] + alias_instances(row)):
+            state.pop(inst, None)
+            return
+        due = state.get(inst) or {}
+        try:
+            if float(due.get("next_try") or 0) > now:
+                return
+        except (AttributeError, TypeError, ValueError):
+            pass  # an unreadable wait is no wait
+        try:
+            rec = launch(inst, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
+                         vault=vault, spawn=spawn, python=python)
+        except ConnectionsError as e:
+            reason = _launch_record(inst, workspace).get("reason") if isinstance(e, LaunchFailed) else None
+            state[inst] = _lane_retry(due, now)
+            say(f"lane {inst} is down and did not start ({reason or _error_reason(e)}); "
+                f"next try in {state[inst]['next_try'] - now:.0f}s")
+            return
+        state.pop(inst, None)
+        if rec.get("lease") == "held":
+            say(f"lane {inst} was down; started it (pid {rec.get('pid')})")
+
+
+def keep_lanes_up(*, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
+                  workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None,
+                  now: Optional[float] = None, log: Optional[Callable[[str], None]] = None) -> list:
+    """One pass of the primary gateway wrapper over the launch plan: `launch` each named lane that no
+    process holds, under the record lock, which every stop-then-start here holds across both steps,
+    so a lane is never started between another caller's stop and its own start. The token is read
+    by `launch` at that moment. A lane that does not start waits LANE_RETRY_FIRST_S, then twice as
+    long each time, up to LANE_RETRY_MAX_S (state in `lane_keeper_state_path`). Exactly one line is
+    logged per start attempt, none for a lane that is up or still waiting. Returns those lines."""
+    environ = keeper_environ(environ)
+    log = log or (lambda line: print(line, flush=True))
+    now = time.time() if now is None else now
+    state_path = lane_keeper_state_path(workspace)
+    state = _read_json(state_path)
+    lines: list = []
+
+    def say(line: str) -> None:
+        lines.append(line)
+        log(line)
+    plan = [e["instance"] for e in launch_plan(environ, workspace=workspace)]
+    for inst in plan:
+        try:
+            _keep_lane(inst, state, now, say, repo=repo, logs_dir=logs_dir, environ=environ,
+                       workspace=workspace, vault=vault, spawn=spawn, python=python)
+        except Exception as e:  # noqa: BLE001 - one lane's fault never costs the others their pass
+            state[inst] = _lane_retry(state.get(inst), now)
+            say(f"lane {inst}: keeper check failed ({type(e).__name__}); "
+                f"next try in {state[inst]['next_try'] - now:.0f}s")
+    for inst in [k for k in state if k not in plan]:
+        state.pop(inst, None)
+    _atomic_json(state_path, state)
+    return lines
+
+
+# The longest one keeper pass may run, and what the process exits with when it is given up.
+LANE_PASS_MAX_S = 300.0
+LANE_PASS_TIMEOUT_RC = 3
+
+
+def keep_lanes_bounded(*, max_s: float = LANE_PASS_MAX_S, log: Optional[Callable[[str], None]] = None,
+                       give_up: Callable[[int], None] = os._exit, **keep_kw) -> list:
+    """`keep_lanes_up`, given up once it has run `max_s`: a pass waiting on a record lock whose holder
+    hangs, or in a lane start that never returns, would otherwise keep its supervisor from ever
+    starting the next pass. A timer thread logs one line and ends the process wherever the pass is
+    blocked, which frees the record lock if this pass held it."""
+    log = log or (lambda line: print(line, flush=True))
+
+    def expired() -> None:
+        log(f"lane keeper pass still running after {max_s:.0f}s (waiting on the connections lock, or in a "
+            "lane start that does not return); gave it up, and no lane is tended until a pass completes")
+        give_up(LANE_PASS_TIMEOUT_RC)
+    timer = threading.Timer(max_s, expired)
+    timer.daemon = True
+    timer.start()
+    try:
+        return keep_lanes_up(log=log, **keep_kw)
+    finally:
+        timer.cancel()
+
+
 def bridge_pid(instance: str, workspace: Optional[Path] = None) -> int:
     """The pid of the process proven to hold `instance`'s bridge lease (workspace_lock's own record
     and identity check), 0 when none runs; `BridgeLeaseIndeterminate` when the lease proves neither."""
@@ -3305,44 +3555,58 @@ def reconnect(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Ma
     _launch_preflight(instance, repo, environ, workspace, vault, python)
     previous = _launch_record(instance, workspace)
     previous_repo = previous.get("repo") or previous.get("last_repo") or ""
-    known = _row_named(instance, workspace)
-    stopped = _stop_row(known, workspace, kill) if known else stop_bridge(instance, workspace=workspace, kill=kill)
-    rows = {r["instance"]: r for r in list_connections(workspace, vault=vault)}
-    if instance in rows:
-        if rows[instance].get("disabled"):
-            _enable(instance, workspace)
-        ref = rows[instance]["token_ref"]
-        token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
-        if token:
-            try:
-                learn_identity(instance, preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo),
-                               workspace=workspace)
-            except ConnectionsError:
-                pass
-    try:
-        record = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
-                        vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
-    except LaunchFailed as e:
-        if not stopped or not previous_repo:
-            raise LaunchFailed(f"{e}; no previous bridge to bring back") from None
-        if Path(previous_repo).resolve() == Path(repo).resolve():
-            raise LaunchFailed(f"{e}; the previous bridge ran from this same checkout, so it was not "
-                               "retried: the lane is down until it is relaunched") from None
-        if not (Path(previous_repo) / "src" / "remote-gateway-bridge.py").is_file():
-            raise LaunchFailed(f"{e}; the previous bridge's checkout {previous_repo} has no bridge any more: "
-                               "the lane is down until it is relaunched") from None
+    # One hold from the stop through the relaunch: the primary wrapper's lane keeper waits on it.
+    with _records_lock(workspace):
+        known = _row_named(instance, workspace)
+        stopped = _stop_row(known, workspace, kill) if known else stop_bridge(instance, workspace=workspace, kill=kill)
+        rows = {r["instance"]: r for r in list_connections(workspace, vault=vault)}
+        if instance in rows:
+            if rows[instance].get("disabled"):
+                _enable(instance, workspace)
+            ref = rows[instance]["token_ref"]
+            token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
+            if token:
+                try:
+                    learn_identity(instance, preview_connection(token, fetch=fetch, getaddrinfo=getaddrinfo),
+                                   workspace=workspace)
+                except ConnectionsError:
+                    pass
         try:
-            back = launch(instance, repo=Path(previous_repo), logs_dir=logs_dir, environ=environ, workspace=workspace,
-                          vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
-        except LaunchFailed as e2:
-            raise LaunchFailed(f"{e}; bringing the previous bridge back from {previous_repo} failed too: {e2}") from None
-        raise LaunchFailed(f"{e}; the previous bridge was brought back from {previous_repo} "
-                           f"(pid {back.get('pid')})") from None
+            record = launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
+                            vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
+        except LaunchFailed as e:
+            if not stopped or not previous_repo:
+                raise LaunchFailed(f"{e}; no previous bridge to bring back") from None
+            if Path(previous_repo).resolve() == Path(repo).resolve():
+                raise LaunchFailed(f"{e}; the previous bridge ran from this same checkout, so it was not "
+                                   "retried: the lane is down until it is relaunched") from None
+            if not (Path(previous_repo) / "src" / "remote-gateway-bridge.py").is_file():
+                raise LaunchFailed(f"{e}; the previous bridge's checkout {previous_repo} has no bridge any more: "
+                                   "the lane is down until it is relaunched") from None
+            try:
+                back = launch(instance, repo=Path(previous_repo), logs_dir=logs_dir, environ=environ, workspace=workspace,
+                              vault=vault, spawn=spawn, python=python, fetch=fetch, getaddrinfo=getaddrinfo)
+            except LaunchFailed as e2:
+                raise LaunchFailed(f"{e}; bringing the previous bridge back from {previous_repo} failed too: {e2}") from None
+            raise LaunchFailed(f"{e}; the previous bridge was brought back from {previous_repo} "
+                               f"(pid {back.get('pid')})") from None
     record["stopped_pid"] = stopped
     return record
 
 
 def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
+                 environ: Optional[Mapping[str, str]] = None, workspace: Optional[Path] = None,
+                 vault=None, spawn=None, kill=None, python: Optional[str] = None, fetch=None,
+                 resolver=None, getaddrinfo=None) -> dict:
+    """`_update_token_held` under one hold of the record lock from its stop through its relaunch, so
+    the primary wrapper's lane keeper cannot start the lane in between, on either code."""
+    with _records_lock(workspace):
+        return _update_token_held(instance, token, repo=repo, logs_dir=logs_dir, environ=environ,
+                                  workspace=workspace, vault=vault, spawn=spawn, kill=kill, python=python,
+                                  fetch=fetch, resolver=resolver, getaddrinfo=getaddrinfo)
+
+
+def _update_token_held(instance: str, token: str, *, repo: Path, logs_dir: Path,
                  environ: Optional[Mapping[str, str]] = None, workspace: Optional[Path] = None,
                  vault=None, spawn=None, kill=None, python: Optional[str] = None, fetch=None,
                  resolver=None, getaddrinfo=None) -> dict:
@@ -3384,7 +3648,7 @@ def update_token(instance: str, token: str, *, repo: Path, logs_dir: Path,
     ref, previous, mutating, stopped, failure, found, restore = "", None, False, 0, None, "", ""
     path = record_path(workspace)
     # Snapshot, effects, publication and any reconcile share one hold of the record lock.
-    with locked_file(_lock_path(workspace), create_mode=0o600):
+    with _records_lock(workspace):
         rec = _read_record(path)
         try:
             row = _find(rec["rows"], instance)

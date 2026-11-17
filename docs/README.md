@@ -67,6 +67,7 @@ Machine-readable ownership and lifecycle metadata lives in
 ## Architecture and decisions
 
 - [Architecture boundaries](architecture-boundaries.md)
+- [Agent-native design rules](agent-native-design-rules.md) — the rules every contribution follows: an agent can do what a person can through an Action; what an agent needs from a person is a control, not a sentence; the contributor and reviewer checklist.
 - [ag2-sparrow v1 delivery contract](sparrow-v1-contract.md)
 - [D1 identity/state census (strangler Slice 1)](census/d1-identity-census.md)
 - [The file delivery protocol as a formal state machine](delivery-protocol.md)
