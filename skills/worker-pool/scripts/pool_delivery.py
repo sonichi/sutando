@@ -311,7 +311,9 @@ def migrate_to_own_dirs(workspace, recipient: str, own_tasks, own_origin) -> dic
                     own_tasks.mkdir(parents=True, exist_ok=True)
                     try:
                         undelivered_quarantine.rename_noreplace(payload, own_tasks / payload.name)
-                    except FileExistsError:
+                    except FileExistsError as e:
+                        if undelivered_quarantine.no_primitive(e):
+                            raise  # nothing moved: the run fails and a re-run retries
                         out["kept"][task_id] = "own-folder-holds-the-name"
                         continue
                 with contextlib.suppress(FileNotFoundError):
