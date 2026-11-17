@@ -103,9 +103,24 @@ _EVICT_HELPER="$REPO/src/launchd/evict-own-bridge.sh"
 if [ -f "$_EVICT_HELPER" ]; then
   # shellcheck source=evict-own-bridge.sh
   . "$_EVICT_HELPER"
+  # A straggler whose identity ps cannot show is still ours when it holds this bridge's lease;
+  # skipping it would leave our own child deferring to it (rc 75) and the job unsupervised.
+  _EVICT_PROVEN=""
+  if _EVICT_WS="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$_EVICT_WS" ]; then
+    _EVICT_PROVEN="$(python3 "$REPO/scripts/connections.py" --workspace "$_EVICT_WS" bridge-pid \
+      "${GATEWAY_INSTANCE:-}" 2>/dev/null || true)"
+  fi
   # Same script path serves every gateway instance in this checkout, so scope by
   # GATEWAY_INSTANCE too — unset here means the primary/prod gateway.
-  evict_own_bridge "remote-gateway" "$REPO" "GATEWAY_INSTANCE" "${GATEWAY_INSTANCE:-}"
+  _EVICT_RC=0
+  EVICT_PROVEN_PID="$_EVICT_PROVEN" EVICT_WAIT_S="${SUTANDO_GATEWAY_EVICT_WAIT_S:-15}" \
+    evict_own_bridge "remote-gateway" "$REPO" "GATEWAY_INSTANCE" "${GATEWAY_INSTANCE:-}" || _EVICT_RC=$?
+  # A child beside a surviving straggler would stand down (rc 75) and end the job; exit
+  # non-zero instead so launchd (KeepAlive SuccessfulExit=false) retries the eviction.
+  if [ "$_EVICT_RC" -ne 0 ]; then
+    echo "[gateway-bridge-wrapper] eviction did not complete (rc $_EVICT_RC); not launching, exiting non-zero so launchd retries" >&2
+    exit "$_EVICT_RC"
+  fi
   sleep 0.3
 fi
 
