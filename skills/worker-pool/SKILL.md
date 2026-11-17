@@ -19,7 +19,7 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `apply_profile_label_overrides.py` — apply an s.space profile's complete worker display-label map from JSON stdin with `--workspace W --profile-mxid M --config-version N`.
 - `worker_bootstrap.py` — a worker session's first-turn decision (worker vs core mode) from its env.
 - `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write. `set_worker_state` / `remove_worker` are its writers for a worker's lifecycle; `set_worker_plugin_dirs` writes a row's `plugin_dirs`.
-- `pool_manage.py` — stop, retire, re-enable, remove or reseat a worker, and record its extra Claude plugin dirs (below).
+- `pool_manage.py` — stop, retire, re-enable, remove or reseat a worker, record its extra Claude plugin dirs, and bind or unbind a room (below).
 - `pool_identity.py` — give a worker an s.space agent of its own, show it, rotate its token or remove it (below).
 - `pool_provision.py` — the local half of creating that agent without a pasted token: claim secret, redeem, retire (below).
 - `provision_e2e.py` — check that whole flow against one server, with a scan for leaked secrets (below).
@@ -56,6 +56,8 @@ python3 skills/worker-pool/scripts/pool_manage.py enable <worker> [--no-start]
 python3 skills/worker-pool/scripts/pool_manage.py remove <worker> [--hand-off]
 python3 skills/worker-pool/scripts/pool_manage.py plugins <worker> add|remove <dir>
 python3 skills/worker-pool/scripts/pool_manage.py plugins <worker> list
+python3 skills/worker-pool/scripts/pool_manage.py bind   <room id> <worker id or label>
+python3 skills/worker-pool/scripts/pool_manage.py unbind <room id>
 ```
 
 - `stop` writes the worker's pause (`pool_supervise.set_paused`) under the remedy
@@ -332,8 +334,9 @@ what a run creates on the server.
 ## Binding a room to an existing worker
 
 `pool_roster.py:bind_room(workspace, room, target)` pins one room to one
-already-registered worker (by id or unique label) — the picker's "pin" action
-and `pool_roster.py bind` both go through it. **It does not call
+already-registered worker (by id or unique label) — `pool_manage.py bind <room> <worker>`
+goes through it, and `pool_manage.py unbind <room>` through `unbind_room` (the picker's pin
+and unpin buttons are no longer applied; `bind` refuses a worker on its own folders). **It does not call
 `publish_task_event_handler()`.** `register_worker()` (and therefore
 `create_worker.py`) does, on every call, because a registration that leaves
 the core watcher without its route handler is a pool the launcher cannot
