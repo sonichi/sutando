@@ -115,6 +115,8 @@ ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
 # itself, so an unforwarded one is the zero-byte read, not a missing option.
 [ -n "${SUTANDO_INBOX_RESOLVER:-}" ] && ENV_ARGS+=(-e "SUTANDO_INBOX_RESOLVER=$SUTANDO_INBOX_RESOLVER")
 [ -n "${SUTANDO_INBOX_RESOLVER_TIMEOUT:-}" ] && ENV_ARGS+=(-e "SUTANDO_INBOX_RESOLVER_TIMEOUT=$SUTANDO_INBOX_RESOLVER_TIMEOUT")
+# A worker on its own folders is spawned with these set empty: forwarded empty, or the tmux server's wins.
+[ "${SUTANDO_INBOX_KIND-unset}" = "" ] && ENV_ARGS+=(-e SUTANDO_INBOX_KIND= -e SUTANDO_INBOX_RESOLVER=)
 # The worker gate `/startup --worker` runs, named by the spawner: this script
 # is the worker's own, but the path itself is still spawn_worker.py's to name
 # (it points at worker_bootstrap.py in this same skill) — forward, don't
