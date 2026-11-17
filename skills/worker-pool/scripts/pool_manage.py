@@ -322,7 +322,8 @@ def bind(workspace, room: str, target: str) -> dict:
     if connections.worker_dirs(wid, Path(workspace)) is not None:
         raise Refused(f"worker {wid} keeps its own folders: the router never delivers to it, so a room "
                       "is not bound to it (the core asks it with pool_ask)")
-    out = pr.bind_room(workspace, room, target)
+    # The checked id, not the label: a rename in between must not bind another worker.
+    out = pr.bind_room(workspace, room, wid)
     return {"action": "bind", "room": room, "worker": wid, "result": "bound",
             "roster_version": out.get("version")}
 

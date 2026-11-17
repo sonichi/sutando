@@ -80,6 +80,21 @@ class Bind(unittest.TestCase):
         self.assertIn("own folders", out["why"])
         self.assertNotIn(ROOM, self.bindings())
 
+    def test_a_label_re_pointed_between_the_check_and_the_write_binds_the_checked_worker(self):
+        from unittest import mock
+        beta = make_worker(self.ws, "beta")
+        real = C.worker_dirs
+
+        def check_then_rename(worker, ws):
+            out = real(worker, ws)
+            pr.rename_worker(self.ws, self.alpha, "alpha-old")
+            pr.rename_worker(self.ws, beta, "alpha")
+            return out
+        with mock.patch.object(C, "worker_dirs", check_then_rename):
+            rc, out = self.cli("bind", ROOM, "alpha")
+        self.assertEqual((rc, out["worker"]), (0, self.alpha))
+        self.assertEqual(self.bindings().get(ROOM), self.alpha)
+
     def test_a_failed_unbind_reports_without_a_worker(self):
         from unittest import mock
         with mock.patch.object(pr, "unbind_room", side_effect=OSError("disk")):
