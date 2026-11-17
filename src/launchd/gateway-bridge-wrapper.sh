@@ -18,6 +18,9 @@
 # agent bridges declared under <workspace>/agents on this install; that child does its own scanning.
 #
 # Killing the wrapper by hand brings it back in about 10 s; use launchctl bootout to stop it for good.
+#
+# With <workspace>/state/sparrowd/core.enabled it launches no bridge: that sparrowd runs `--core` and
+# owns the core bridge (docs/connections.md, "The core bridge under sparrowd").
 
 set -euo pipefail
 
@@ -39,13 +42,16 @@ fi
 # shellcheck source=gateway-bridge-lib.sh
 . "$REPO/src/launchd/gateway-bridge-lib.sh"
 gateway_legacy_env
+# Core gate set: sparrowd decides, evicts and launches the bridge; no token check or eviction here.
+CORE_GATE=""
+gateway_core_gate "$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)" && CORE_GATE=1
 
 # If there's still no token, the bridge would FATAL-exit and KeepAlive would
 # crash-loop. Exit 0 quietly instead — the install path only loads this job when
 # a token is configured, so reaching here means the token was removed after
 # install; don't hammer the system, just stop cleanly (launchd honors the clean
 # exit under our KeepAlive.SuccessfulExit=false policy).
-if [ -z "$REMOTE_TASK_TOKEN" ]; then
+if [ -z "$CORE_GATE" ] && [ -z "$REMOTE_TASK_TOKEN" ]; then
     # Exit 0 into an idle job on purpose: startup-runtime's "loaded but idle"
     # branch kickstarts it once a token exists, and an idle PID would read as running.
     echo "[gateway-bridge-wrapper] no REMOTE_TASK_TOKEN configured — nothing to run; exiting cleanly." >&2
@@ -55,7 +61,7 @@ fi
 # Evict an already-running gateway bridge that belongs to THIS checkout: it has no
 # single-instance lock, so a straggler would double-poll and double-process.
 _EVICT_HELPER="$REPO/src/launchd/evict-own-bridge.sh"
-if [ -f "$_EVICT_HELPER" ]; then
+if [ -z "$CORE_GATE" ] && [ -f "$_EVICT_HELPER" ]; then
   # shellcheck source=evict-own-bridge.sh
   . "$_EVICT_HELPER"
   # A straggler whose identity ps cannot show is still ours when it holds this bridge's lease;
@@ -94,11 +100,17 @@ mkdir -p "$STATE_DIR" "$WORKSPACE/results" 2>/dev/null || true
 MARKER="$STATE_DIR/gateway.started"
 RESTART_DELAY="${SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY:-10}"
 emit_restart_alert() { gateway_restart_alert; }
-if [ -f "$MARKER" ]; then emit_restart_alert; fi
-date +%s > "$MARKER"
+if [ -n "$CORE_GATE" ]; then
+  rm -f "$MARKER"  # the core bridge's restarts are sparrowd's to report
+else
+  if [ -f "$MARKER" ]; then emit_restart_alert; fi
+  date +%s > "$MARKER"
+fi
 CHILD_PID=''
 STOPPING=0
 AGENTS_SUPERVISOR="$REPO/src/sparrowd.py"
+AGENTS_ARGS=(--agent-bridges)
+[ -z "$CORE_GATE" ] || AGENTS_ARGS=(--core --agent-bridges)
 AGENTS_PID=''
 AGENTS_NEXT_START=0
 POLL_S=1
@@ -116,9 +128,9 @@ tend_agents_supervisor() {
     AGENTS_NEXT_START=$(( $(date +%s) + RESTART_DELAY ))
   fi
   [ "$(date +%s)" -ge "$AGENTS_NEXT_START" ] || return 0
-  python3 "$AGENTS_SUPERVISOR" --agent-bridges &
+  python3 "$AGENTS_SUPERVISOR" "${AGENTS_ARGS[@]}" &
   AGENTS_PID=$!
-  echo "[gateway-bridge-wrapper] agent-bridge supervisor started (pid $AGENTS_PID)" >&2
+  echo "[gateway-bridge-wrapper] agent-bridge supervisor started (pid $AGENTS_PID, ${AGENTS_ARGS[*]})" >&2
 }
 # Named lanes (connections.py launch-plan) have no supervisor of their own: one keep-lanes pass every
 # LANES_EVERY_S, never two at once. Each pass starts lanes under the connections lock and backs off.
@@ -152,6 +164,19 @@ stop_wrapper() {
 trap 'stop_wrapper TERM' TERM
 trap 'stop_wrapper INT' INT
 trap 'stop_wrapper HUP' HUP
+if [ -n "$CORE_GATE" ]; then
+  echo "[gateway-bridge-wrapper] core gate set: sparrowd runs the gateway bridge; this wrapper launches none" >&2
+fi
+while [ "$STOPPING" = 0 ] && [ -n "$CORE_GATE" ]; do
+  tend_agents_supervisor
+  tend_lanes
+  sleep "$POLL_S" &
+  CHILD_PID=$!
+  set +e
+  wait "$CHILD_PID"
+  set -e
+  CHILD_PID=''
+done
 while [ "$STOPPING" = 0 ]; do
   # A rotated or removed .env token must reach the next child: re-read from the environment-provided values.
   gateway_legacy_env
