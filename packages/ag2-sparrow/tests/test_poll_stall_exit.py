@@ -20,6 +20,18 @@ from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
 isolate_os_environ()
 
 
+def _ask_to_exit(m, *args):
+    """What _abort_if_poll_stalled answered, with an in-place exit turned into a failure.
+
+    The code belongs to main(), so run() can bound the exit hooks; an exit taken here would
+    otherwise end the whole run with that code and read as a pass.
+    """
+    try:
+        return m._abort_if_poll_stalled(*args)
+    except SystemExit as e:
+        raise AssertionError(f"the stall exit left in place with code {e.code}") from None
+
+
 def _load(tmp):
     os.environ["AGENT_CONNECT_STATE_DIR"] = str(tmp)
     os.environ.setdefault("REMOTE_TASK_URL", "https://gw.example/relay")
@@ -56,13 +68,8 @@ def test_abort_asks_for_the_exit_and_records_the_stall():
         # past it: the exit is marked ready for main(), and the sidecar names the stall
         stopped = []
         err = io.StringIO()
-        try:
-            with contextlib.redirect_stderr(err):
-                asked = m._abort_if_poll_stalled(time.monotonic() - 60,
-                                                 lambda: stopped.append(1) or True)
-        except SystemExit as e:
-            # The code belongs to main(), so run() can bound the exit hooks.
-            raise AssertionError(f"the stall exit left in place with code {e.code}") from None
+        with contextlib.redirect_stderr(err):
+            asked = _ask_to_exit(m, time.monotonic() - 60, lambda: stopped.append(1) or True)
         assert asked is True, "a stalled poll loop must ask the caller to leave"
         assert m._STALL_EXIT_READY is True, "main() reads this to return the code"
         assert m.POLL_STALL_EXIT_CODE != 0
@@ -84,10 +91,7 @@ def test_the_exit_request_survives_the_loops_catch_all():
         m = _load(pathlib.Path(d))
         m.POLL_STALL_EXIT_S = 1
         with contextlib.redirect_stderr(io.StringIO()):
-            try:
-                asked = m._abort_if_poll_stalled(time.monotonic() - 60)
-            except Exception:  # noqa: BLE001 — mirrors the poll loop's catch-all
-                raise AssertionError("the exit request must not raise")
+            asked = _ask_to_exit(m, time.monotonic() - 60)
         assert asked is True
         assert m._STALL_EXIT_READY is True, "the request must outlive the catch-all"
 
@@ -123,7 +127,7 @@ def test_declared_owner_arms_the_exit_and_names_it():
             assert m.POLL_STALL_RESTART_OWNER == "launchd"
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
-                asked = m._abort_if_poll_stalled(time.monotonic() - 60)
+                asked = _ask_to_exit(m, time.monotonic() - 60)
             assert asked is True, "a declared owner must arm the exit"
             assert m._STALL_EXIT_READY is True
             assert "launchd" in err.getvalue(), err.getvalue()
@@ -192,12 +196,27 @@ def test_a_worker_still_sending_holds_the_exit_until_it_stops():
             # A fresh anchor must not cancel a requested stop.
             assert m._abort_if_poll_stalled(time.monotonic(), stop) is True
             with contextlib.redirect_stderr(io.StringIO()):
-                assert m._abort_if_poll_stalled(time.monotonic(), stop) is True
+                assert _ask_to_exit(m, time.monotonic(), stop) is True
             assert m._STALL_EXIT_READY is True, \
                 "the exit must follow once the worker has stopped"
             assert len(calls) == 3, calls
         finally:
             os.environ.pop("SUTANDO_BRIDGE_RESTART_OWNER", None)
+
+
+def test_an_exit_taken_in_place_is_reported_instead_of_ending_the_run():
+    """The guard the cases above call through. Before this fix the stall exit raised SystemExit,
+    which ends the run with code 69 and prints nothing, so a regression could read as a pass."""
+    class _ExitsInPlace:
+        def _abort_if_poll_stalled(self, *_a):
+            raise SystemExit(69)
+
+    reported = ""
+    try:
+        _ask_to_exit(_ExitsInPlace(), 0.0)
+    except AssertionError as e:
+        reported = str(e)
+    assert "left in place with code 69" in reported, reported
 
 
 def test_the_join_budget_outlasts_every_outbound_request_timeout():
@@ -228,6 +247,8 @@ if __name__ == "__main__":
     print("PASS test_wall_clock_jumps_do_not_count_as_a_stall")
     test_a_worker_still_sending_holds_the_exit_until_it_stops()
     print("PASS test_a_worker_still_sending_holds_the_exit_until_it_stops")
+    test_an_exit_taken_in_place_is_reported_instead_of_ending_the_run()
+    print("PASS test_an_exit_taken_in_place_is_reported_instead_of_ending_the_run")
     test_the_join_budget_outlasts_every_outbound_request_timeout()
     print("PASS test_the_join_budget_outlasts_every_outbound_request_timeout")
     print("ALL PASS")
