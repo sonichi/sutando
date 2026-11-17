@@ -649,8 +649,8 @@ def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=s
             out["deliveries"] = done.stdout.strip()[-300:]
     failed: "list[str]" = []
     out["tasks_moved"] = _move_live(ws / "tasks", tasks, _queued_for(worker, ws), failed)
-    out["results_moved"] = adopt_stray_results(worker, ws, results, lease=False)
-    out["proactive_moved"] = adopt_stray_proactive(worker, ws / "results", results, lease=False)
+    out["results_moved"] = adopt_stray_results(worker, ws, results, lease=False, failed=failed)
+    out["proactive_moved"] = adopt_stray_proactive(worker, ws / "results", results, lease=False, failed=failed)
     return out, _failed(out, failed)
 
 
