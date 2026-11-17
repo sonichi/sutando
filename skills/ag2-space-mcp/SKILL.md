@@ -120,7 +120,8 @@ Sutando's own startup, maintenance, heartbeat, backend and proactive-loop schedu
 Only timed work the owner asks for goes to the platform.
 A starter job the owner switches on in `crons.json` is a Sutando feature, not a reminder, and stays
 native. A request with no s.space origin room (Telegram, Discord, local chat, or voice not docked
-in a room) has nowhere to schedule, so it stays native. A voice request made while docked in a
+in a room) has nowhere to schedule, so it stays native on a host with its own scheduler. A cloud Spacer has
+none: it reports the work was not set up. A voice request made while docked in a
 room counts as made in that room. A to-do item stays on Reminders or the vault; a message or job
 delivered at a set time goes to the platform.
 
