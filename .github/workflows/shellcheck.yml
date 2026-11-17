@@ -20,7 +20,7 @@ name: shellcheck
 # always a genuine defect, so it can gate immediately and the bar can be raised
 # in follow-ups as the warning backlog comes down.
 #
-# ubuntu-latest ships shellcheck preinstalled, so there is no install step to
+# ubuntu-24.04 ships shellcheck preinstalled, so there is no install step to
 # pin or cache.
 
 on:
@@ -35,7 +35,7 @@ concurrency:
 jobs:
   shellcheck:
     name: shellcheck over shell scripts
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
 
     steps:

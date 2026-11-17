@@ -41,6 +41,16 @@ Every gate run posts a **sticky PR comment** (one comment, updated per push
 the whole-tree percentage, and the per-file uncovered-lines table on
 failure. The same content lands in the Actions job summary.
 
+The advisory **Not measured** section names changed Python files absent from
+coverage.py's JSON report. JSON retains repository-relative paths, so a reported
+`src/nested/shared.py` cannot hide an unmeasured `scripts/nested/shared.py` or
+`outside/nested/shared.py`. Discovered files with zero executed lines remain in
+the report and count as measured. XML is still used for the diff-coverage check.
+If JSON generation fails, the gate reports that this diagnostic is unavailable
+and preserves the diff-coverage verdict without reading an older JSON report.
+To run the diagnostic directly, generate `python3 -m coverage json --quiet`, then
+run `python3 scripts/coverage_unmeasured.py origin/main coverage.json`.
+
 Mechanically this is one suite run and two jobs in `ci.yml`, then a second
 workflow. `python-standalone-tests` runs the suite once under `coverage run`,
 as fifteen matrix legs: legs 1-13 balanced by measured cost (`scripts/shard-by-cost.sh` over `tests/python-suite-costs.txt`, regenerated with `scripts/gen-suite-costs.sh` from job logs), heaviest suite first; leg 14 the load-sensitive suites, heaviest first, two at a time; leg 15 the ones tagged `serial`, alone. They
@@ -55,6 +65,40 @@ fires on `workflow_run` of `CI` in the base-repo context with
 what keeps the write token safe. Note `workflow_run` executes the default
 branch's copy of the file, so the comment half activates once merged to
 main; until then the numbers are in the job summary.
+
+## Lane worktree isolation
+
+`scripts/parallel-suite-lane.sh` pins the caller's input commit once and runs each
+worker in its own disposable worktree. Between suites it restores that commit
+with detached HEAD and removes non-ignored untracked files. A suite's commits,
+revision checkouts, staged changes and unstaged changes are reset before the next
+suite starts. Recovery leaves a branch selected by a suite at its existing tip.
+Ignored files, coverage fragments and the shared `node_modules` link survive.
+The scheduler resolves the source repository before clearing Git's repository-local
+environment variables, so suite commands and recovery cannot use the caller's
+worktree or staged index through inherited Git selectors.
+
+If a worker cannot restore its worktree, it stops before taking another suite
+and the scheduler exits nonzero. Other workers finish their remaining work;
+the run must be fixed and repeated before treating its results as complete.
+Recovery validates each worker's original directory identity, canonical path and
+Git/index identity before destructive operations, refusing redirected Git metadata or a replaced
+worktree path. An identity mismatch retains the suspect worktree for inspection
+instead of removing it through redirected metadata. Checkout and clean run from
+the checked directory held as the current directory, so replacing its old pathname
+cannot redirect those commands. Each suite's owned process group is terminated
+and joined before recovery, including descendants left after normal suite exit.
+Interrupts defer exit through worktree creation and identity capture, and until
+newly launched workers and suites are registered. They then terminate owned
+process groups and wait before worktree cleanup.
+If descendant termination cannot be confirmed, the run fails and retains that
+worker and its registration for inspection.
+
+Worktrees are not an OS security sandbox: suites run with the caller's permissions
+and share repository objects and refs. These guards protect scheduler recovery;
+they do not prevent a suite from directly changing files outside its worktree.
+Processes deliberately escaping the scheduler's process groups are also outside
+its cancellation contract.
 
 ## What counts / doesn't count
 

@@ -69,6 +69,11 @@ def _until(cond, timeout=30.0) -> bool:
     return bool(cond())
 
 
+def _nothing_delivering() -> bool:
+    with gw._DELIVERING_MUTEX:
+        return not gw._DELIVERING and not gw._DELIVERING_ROOMS
+
+
 class Harness(unittest.TestCase):
     def setUp(self):
         self.logs = []
@@ -76,6 +81,8 @@ class Harness(unittest.TestCase):
         mock.patch.object(gw, "_log", self.logs.append).start()
         self.fake = FakeGateway()
         mock.patch.object(gw, "_req", self.fake).start()
+        # Runs before stopall: a send still running posts into this test's fake, never the next one's.
+        self.addCleanup(lambda: self.assertTrue(_until(_nothing_delivering, 30), "a delivery outlived its test"))
 
     def take(self, tid, room):
         task = {"id": tid, "task": "reply", "source": "ag2space", "user_id": "@o:x",
@@ -126,6 +133,8 @@ class Ordered(Harness):
             second = self.drain(inflight)
             second.join(20)
             self.assertFalse(second.is_alive(), "a pass never waits on room A's send")
+            # The pass may return before room B's worker posts; the order, not the pass, is the claim.
+            self.assertTrue(_until(lambda: self.fake.calls == [b1], 10), repr(self.fake.calls))
             self.assertEqual(self.fake.calls, [b1], "room B is answered while room A is sending")
             self.assertIn(a2, inflight, "room A's second reply waits for its first")
             gw._record_task_room("task-slow-nofile", ROOM_A)

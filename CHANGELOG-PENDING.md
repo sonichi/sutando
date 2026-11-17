@@ -26,6 +26,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 
 <!-- fix() PRs go here -->
 - Task watcher: archived worker tasks now retire their delivery pointers. Startup sweeps filter answered tasks in a batch and run after subscription, so old pointers do not block newly arriving work; resolved task priority and periodic catch-up remain active. ([#5162])
+- ag2-sparrow: a proactive message's `[file:]`/`[send:]`/`[attach:]` attachment is uploaded to the room the message went to, after the message is delivered; a refused file is logged by name, and a message that is only an attachment sends "(file attached)" instead of waiting forever. A re-published message whose attachment changed (another file, or new bytes under the same path) is a new send. A redirected message whose body the destination guard withholds uploads none of its files, and a non-owner room's logs name only the file name. (#4193)
 - ag2-sparrow: the `ag2-sparrow-outbox` recovery command logged for a quarantined result names its `--root` and `--results-dir` through the workspace resolver (`$HOME` without one) and quotes its ids, so the log carries no home path and a workspace path with a space no longer splits the command. ([#6447])
 - schedule-crons: the seeder's owner notices (a restored `crons.json`, legacy jobs not enabled) are recorded before the schedule is written, queued once to the owner's DM through the proactive outbox, and kept, printed at most once a day, until `seed_crons.py --notice-sent`; a failed legacy backup or notice write no longer loses them. ([#6448])
 - ag2-sparrow: the requeue command the bridge logs for a parked message names its outbox root through `bash scripts/sutando-config.sh workspace` (or `$HOME` when no workspace resolver is set), so the log no longer carries a home path; run it from the engine checkout as before. ([#6445])
@@ -57,6 +58,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 
 <!-- refactor(), perf(), docs() changes visible to operators go here -->
 - macOS notifications are off by default. Sutando posts no macOS desktop notification (pending questions, bridge restarts, health checks, the agent shepherd, voice offline/online, context drop, screen recording) unless `sutando.config.local.json` sets `"notifications": {"macos": true}`. The same alerts still reach the owner's DM or the core's task queue. There is no exception: the gateway bridge's no-workspace alert, which has no DM to fall back on, is silent too unless you opt in. Windows and Linux notifications are unchanged.
+- worker-pool: pool workers now run their task watcher in the task-watch Mod by default instead of a `Monitor` that must be re-armed every 30 minutes. A worker whose Claude Code is below the Mod's floor keeps the `Monitor`, and `SUTANDO_TASK_WATCH_MOD_WORKER=0` in the spawner's environment opts a worker out. The core is unchanged (still opt-in with `SUTANDO_TASK_WATCH_MOD_CORE=1`). ([#6450])
 
 ## Security
 

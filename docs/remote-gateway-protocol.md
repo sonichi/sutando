@@ -31,12 +31,14 @@ lower-precedence candidate.
 | `REMOTE_TASK_POLL_WAIT` | no | `25` | Long-poll seconds requested per `/v1/tasks` call. |
 | `REMOTE_TASK_ON_TASK` | no | — | Wake command run once per newly queued task file. Split with `shlex` and run without a shell, the file path appended as the last argument; `SPARROW_TASK_ID` and `SPARROW_TASK_FILE` are set and every relay credential is removed from its environment. Sparrow does not wait for it, kill it, or retry it; a non-zero exit or a start failure is logged once. |
 | `REMOTE_TASK_POLL_STALL_EXIT_S` | no | `600` | Seconds without a completed poll after which a live-but-stalled bridge stops its outbound worker, waits for any send it has in flight to finish (without polling meanwhile), and exits with code `69` so its restart owner relaunches it (`0` disables). Measured on the monotonic clock, so time the host spends asleep never counts, and re-anchored when an auth wait on a human ends, so a re-link never counts either. The launchd wrapper relaunches on `69` without an owner alert. |
-| `SUTANDO_BRIDGE_RESTART_OWNER` | no | — | Name of whatever relaunches the bridge on exit (the launchd plist sets `launchd`). Unset, the stall is logged and written to `gateway-status.json` but the process keeps retrying, because a bare `&` lane has nothing to bring it back. |
+| `SUTANDO_BRIDGE_RESTART_OWNER` | no | — | Name of whatever relaunches the bridge on exit (the launchd plist sets `launchd`). Unset, the stall is logged and written to `gateway-status.json` but the process keeps retrying, because a bare `&` lane has nothing to bring it back. The stuck-relay-poll exit (five task polls held past the read timeout while other requests answer, at most once per 10 minutes) is armed by the same declaration. |
 | `REMOTE_TASK_TIER` | no | `owner` | Local access tier stamped on every inbound task; `owner` for the personal-agent model, set `team`/`guest` for a shared gateway (see Security); `other` is accepted as the legacy spelling of `guest`. |
 | `REMOTE_PROACTIVE_ROOM` *(.env too)* | no | — | The SYSTEM destination only. Owner-directed `results/proactive-*.txt` nudges and runtime prompt cards go to the gateway's `owner_dm_room` for this agent (`GET /v1/agents`), a reading kept identity-bound on disk (`state/owner-routing.json`) across restarts and outages and never replaced by an answer without one. A room is adopted as the owner DM only when `/v1/room` `{"op": "members"}` lists no one but the agent and its owner, re-checked on every refresh; a room with anyone else clears the reading, and an unreadable member list never adopts a new room. Only a record marked `"private": true` is loaded; one saved before this check, including a migrated legacy record, is not. With no reading they are HELD (file left in place, retried every 30 s, logged), never sent here. Unset → read from this instance's `channels/<dir>/.env`. A file naming its own room (`[channel: !room]`) never needs it; the drain runs whether or not it is set. |
 | `REMOTE_TASK_LIFECYCLE_V2` | no | off | `1` turns on the task lifecycle calls below (lease generation, per-task beats, cancel, ledger reconcile). |
 | `REMOTE_TASK_TURN_CONTEXT` | no | off | `1`, with `REMOTE_TASK_LIFECYCLE_V2`, writes each attempt's turn file and gates its result on the turn's room actions. |
 | `REMOTE_ALERT_ROOM` | no | none (gateway alert disabled) | Explicit owner-only room id for core-independent health alerts sent by the launchd fallback. Never inferred from last activity because that room may be shared. |
+
+**Exit codes a supervisor acts on:** `75` means another live bridge holds this workspace's poller lock, so stand down. `69` is the poll-stall exit above. `70` means this bridge lost its poller lock to a successor after a stale takeover; relaunch it, and the relaunch either stands down (`75`) or takes the lock. `0` is a signal stop. Once the bridge has decided to exit `70`, a hung exit hook cannot hold it open: it is force-exited with the same code after 30 s.
 
 **Use the split form** (`REMOTE_TASK_URL` + `REMOTE_TASK_TOKEN`) — it's the recommended way to configure the bridge.
 
@@ -126,9 +128,11 @@ id, for a join `join|<agent mxid>|<room id>`) is passed only as one token of at
 most 256 characters from `[A-Za-z0-9._:@!|=+/-]`, and `"playbook"` only as an id
 matching `[a-z0-9][a-z0-9-]{0,63}`; anything else is dropped. All three are
 trusted pre-body headers. The core runs `skills/<playbook>/SKILL.md` only for an
-allowed playbook (a registry playbook, or a skill whose `manifest.json` sets
-`"playbook": true`), else the registry default for the event (`room.joined` →
-`room-onboard`; `room.mention` → `reply`, today's answer), else handles the task
+allowed playbook (a skill whose `manifest.json` sets `"playbook": true`; a
+registry id needs the same opt-in), else the registry default for the event under
+that rule (`room.joined` → `room-onboard`; `commons.summon` → `summon`;
+`commons.app_request` → `app-request`; `email.received` → `email`; `room.mention` → `reply`, today's answer),
+else handles the task
 as a message that follows its body. An event type with no registry entry has no
 default, so it resolves to none; a playbook string is never trusted to pick a
 skill. An event body may quote member-written text; the agent treats that text as

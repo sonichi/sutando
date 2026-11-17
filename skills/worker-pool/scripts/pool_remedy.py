@@ -278,7 +278,8 @@ def recover(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
         return {"worker_id": worker_id, "outcome": FAILED, "why": str(e),
                 "closed_runs": closed}
     return {"worker_id": worker_id, "outcome": RECOVERED, "closed_runs": closed,
-            "session_id": out.get("runtime_session_id")}
+            "session_id": out.get("runtime_session_id"),
+            **({"plugin_dirs_skipped": out["plugin_dirs_skipped"]} if out.get("plugin_dirs_skipped") else {})}
 
 
 SUPERVISOR_SCRIPT = "skills/worker-pool/scripts/worker-watcher-supervisor.sh"
@@ -427,7 +428,8 @@ def retry_limit(workspace, repo, worker_id, *, runner=None):
             "The usage-limit recovery probe is due. Re-arm your session-role task watcher "
             "using the normal worker bootstrap, then process your outstanding deliveries. "
             "Do not run core startup or core schedules. If still usage-limited, leave the "
-            "deliveries pending; supervision will back off. Reply [no-send] when re-armed.")
+            "deliveries pending; supervision will back off. Reply [no-send] when re-armed.",
+            allow_handoff=False)  # the pane prompt below names the routed payload
     except (OSError, ValueError) as exc:
         return {"worker_id": worker_id, "outcome": "delivery-failed", "why": str(exc)}
     task_id = delivery["task_id"]

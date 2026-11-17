@@ -28,7 +28,7 @@ jobs:
   # suite may pin a doc's wording (worker-pool-design-retractions does).
   changes:
     name: classify the diff
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       code: ${{ steps.classify.outputs.code }}
@@ -77,7 +77,7 @@ jobs:
 
   typecheck-and-test:
     name: lints + typecheck
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 20, not 10: measured 2026-08-03, this job is at capacity on legitimate work,
     # not hanging. Run 30801403218 spent 3.9 min (node tests) + 3.2 min (python) +
     # 1.5 min (shell, cut off) + ~1.4 min setup = 10.0 min and was CANCELED mid-step.
@@ -212,7 +212,7 @@ jobs:
     # Job-level, not per step: a docs-only diff skips the whole runner, and the
     # aggregator below treats that skip as a pass only when `changes` said so.
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -273,7 +273,7 @@ jobs:
     name: out-of-tree python tests
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -323,7 +323,7 @@ jobs:
     name: claude-local Mod harness
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -359,7 +359,7 @@ jobs:
     name: shell tests (lanes)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Checkout
@@ -394,7 +394,7 @@ jobs:
     name: shell tests (serial tail ${{ matrix.shard }}/3)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The process-table suites run one at a time per runner: three runners, each
     # a cost-balanced third of the tail, so the tail is no longer the longest job.
     strategy:
@@ -418,7 +418,7 @@ jobs:
     name: ag2-sparrow publish gate (python 3.11, ${{ matrix.shard }}/3)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The same gate the tag publish runs whole, split by measured cost; leg 1 adds the drift guard.
     strategy:
       fail-fast: false
@@ -441,7 +441,7 @@ jobs:
     name: python standalone tests (${{ matrix.shard }}/15)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Legs 1-13 share the files by measured cost; legs 14-15 run the load-sensitive
     # suites (see the step). The coverage-gate job combines every leg's data.
     strategy:
@@ -475,7 +475,7 @@ jobs:
         run: python3 -m pip install coverage 'detect-secrets>=1.5.0' 'discord.py>=2.3'
 
       # watch-tasks-stream-config-hot-reload.test.py exercises the real
-      # live-streaming fswatch path (no stub) -- ubuntu-latest does not ship
+      # live-streaming fswatch path (no stub) -- ubuntu-24.04 does not ship
       # fswatch, so that test silently exercised nothing (its subprocess died
       # at exec with no writer, indistinguishable from "no event" downstream).
       - name: Install fswatch
@@ -602,7 +602,7 @@ jobs:
     # Not in required-tests' needs: it reports the quarantined flakes and never gates.
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -652,7 +652,7 @@ jobs:
     # A docs-only diff has no Python lines to measure; the required check reads
     # a skipped job as satisfied, and `changes` is what said the diff is docs.
     if: github.event_name == 'pull_request' && needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
@@ -703,7 +703,7 @@ jobs:
     # that fails when any suite fails, so a split cannot weaken protection.
     needs: [changes, typecheck-and-test, node-tests, oot-python-tests, mod-harness-tests, shell-standalone-tests, shell-tail-tests, python-standalone-tests, sparrow-publish-gate]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       # `needs.*.result` is checked explicitly: a job skipped because its

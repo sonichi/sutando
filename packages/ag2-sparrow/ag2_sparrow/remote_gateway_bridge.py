@@ -327,14 +327,15 @@ from .local_task_protocol import find_archived_task
 from . import (agent_identity, agent_triggers, diagnostics, gateway_credential_io, gateway_credential_sources,
                gateway_credentials, gateway_instance, local_task_protocol, routing_migrations,
                setup_fetch)
-from .bounded_file_read import read_private, read_regular, read_regular_text
+from .bounded_file_read import read_fd_bytes, read_private, read_regular, read_regular_text
 from .result_markers import parse_markers, render_skill_prelude
 from .result_markers import has_skip_action
 from .result_markers import neutralize_markers
 from . import undelivered_quarantine
+from . import deleted_binding
 from . import result_labels
 from .proactive_routing import (PROACTIVE_OUTBOX_DIRNAME, about_task, about_task_ts, proactive_filename,
-                                proactive_item_id)
+                                proactive_item_id, read_attachment, resolve_attachment_path)
 from .team_guardrail import ag2space_tier_lines, owner_mention_lines
 from . import team_result_guard
 from . import health_command
@@ -501,6 +502,8 @@ _RELAY_ASK_PREFIX = "ask-"
 # Liveness of the gateway *connection* itself (distinct from _post_heartbeat,
 # which pings the broker). A local supervisor (e.g. the desktop app's
 GATEWAY_STATUS_FILE = _STATE / f"gateway-status{_INST_SUFFIX}.json"
+# When the last stuck-poll recovery exit ran; survives the relaunch it causes.
+STUCK_POLL_RECOVERY_FILE = _STATE / f"gateway-stuck-poll{_INST_SUFFIX}.json"
 # The heartbeat reply's pointers to the served setup; read by adapters, never by Sparrow.
 SETUP_HINT_FILE = _STATE / f"setup-hint{_INST_SUFFIX}.json"
 SETUP_HINT_FIELDS = ("setup_revision", "min_version", "target_version")
@@ -2243,19 +2246,22 @@ diagnostics.register_gateway_url(URL)
 diagnostics.register_secret(TOKEN)
 PROVIDER = os.environ.get("REMOTE_TASK_PROVIDER") or "remote"
 POLL_WAIT = int(os.environ.get("REMOTE_TASK_POLL_WAIT") or "25")
+# The relay holds an empty poll 31-33 s whatever `wait` asks (#3042), so the read
+# budget covers the longer of the two plus room for TLS setup and network jitter.
+_RELAY_HOLD_CEILING_S = 35
+_POLL_READ_MARGIN_S = 25
+POLL_READ_TIMEOUT_S = max(POLL_WAIT, _RELAY_HOLD_CEILING_S) + _POLL_READ_MARGIN_S
 ON_TASK_CMD = os.environ.get("REMOTE_TASK_ON_TASK") or ""
 # A read timeout on the long poll is indistinguishable from the documented
 # `200 {"tasks": []}` hold-window expiry, so it is only an outage once no poll
-POLL_TIMEOUT_GRACE_S = 3 * (POLL_WAIT + 10)
+POLL_TIMEOUT_GRACE_S = 3 * POLL_READ_TIMEOUT_S
 # Backoff alone caps at 60s and never gives up, so a relay that stays down
 # leaves a live process polling into the void. 0 disables the exit.
 POLL_STALL_EXIT_S = float(os.environ.get("REMOTE_TASK_POLL_STALL_EXIT_S") or "600")
 # Exiting only helps where something restarts us. startup-runtime.sh launches the
 # primary and every named lane as a bare `&`, so the owner must be declared here.
 POLL_STALL_RESTART_OWNER = (os.environ.get("SUTANDO_BRIDGE_RESTART_OWNER") or "").strip()
-# EX_UNAVAILABLE: the wrapper relaunches on it without an owner alert, so an outage
-# does not queue a "bridge restarted" message every stall period.
-POLL_STALL_EXIT_CODE = 69
+from .exit_codes import POLL_STALL_EXIT_CODE  # noqa: E402
 # Proactive-message drain: when REMOTE_PROACTIVE_ROOM names a room id, every
 # `results/proactive-*.txt` the agent writes is delivered to that room as a
 _PROACTIVE_ROOM_ENV = os.environ.get("REMOTE_PROACTIVE_ROOM")
@@ -2292,6 +2298,9 @@ PROACTIVE_OWN_FILE: Callable[[Path], bool] | None = None
 # Host-injected () -> the worker every task this lane queues is addressed to (`requested_worker`),
 # or "". None (standalone default) leaves each task's field as the gateway sent it.
 TASK_ADDRESSEE: Callable[[], str] | None = None
+# Host-injected (task id, staged file, destination) -> None or a callable run once the file is
+# published; a raise is logged and the task is published. None (standalone default) runs nothing.
+TASK_PRE_PUBLISH: Callable[[str, Path, Path], "Callable[[], None] | None"] | None = None
 # Host-injected () -> the homeserver this lane's connection row names, or "": a secondary lane's
 # relay answer on another server is refused. None (standalone default) checks nothing.
 LANE_SERVER: Callable[[], str] | None = None
@@ -2645,6 +2654,8 @@ REENROLL_ENABLED = str(os.environ.get("REMOTE_REENROLL", "1")).strip().lower() \
 REENROLL_PROBE_EVERY = max(1, int(os.environ.get("REMOTE_REENROLL_PROBE_EVERY") or "2"))
 REENROLL_CLAIM_RETRY_S = int(os.environ.get("REMOTE_REENROLL_CLAIM_RETRY_S") or "600")
 _reenroll_state: dict = {"last_attempt_at": None, "code": None, "claimed_at": None}
+# The provision API's answer to a claim for an id its owner deleted (a tombstone): final, never a retry.
+AGENT_DELETED_ERROR = "agent_deleted"
 
 
 def _provision_base() -> str:
@@ -2704,7 +2715,7 @@ def _lane_whoami() -> str:
 def _reenroll_claim() -> None:
     """Best-effort claim: one live code per episode; failed POSTs retry no
     sooner than REENROLL_CLAIM_RETRY_S; never raises into the caller."""
-    if not REENROLL_ENABLED or _reenroll_state["code"]:
+    if not REENROLL_ENABLED or _reenroll_state["code"] or _reenroll_state.get("deleted"):
         return
     last = _reenroll_state["last_attempt_at"]
     # Monotonic: a wall-clock step backward must not suppress claims (review
@@ -2763,6 +2774,8 @@ def _reenroll_claim() -> None:
         err = diagnostics.code_field(err, URL)
         _reenroll_state["refused"] = {"status": e.code, "error": err, "at": int(time.time())}
         _log(f"reenroll: claim refused HTTP {e.code}" + (f" ({err})" if err else ""))
+        if e.code == 410 and err == AGENT_DELETED_ERROR:
+            _reenroll_state["deleted"] = {"at": int(time.time()), "agent_id": agent_id}
     except Exception as e:  # noqa: BLE001 — recovery must never crash the loop
         _log(f"reenroll: claim failed: {diagnostics.describe(e)}")
 
@@ -2774,6 +2787,7 @@ def _reenroll_clear(recovered: bool = False) -> None:
     prior_attempt = _reenroll_state.get("last_attempt_at")
     _reenroll_state.update({"last_attempt_at": None, "code": None, "claimed_at": None})
     _reenroll_state.pop("refused", None)
+    _reenroll_state.pop("deleted", None)
     if not was_pending:
         # No claim was granted this episode — preserve its cadence, or a
         # probe-only resume lets every future episode re-claim immediately.
@@ -3257,6 +3271,11 @@ _NETWORK_ERRORS = (urllib.error.URLError, TimeoutError, ConnectionResetError,
                    http.client.IncompleteRead)
 
 
+# When any request to the relay last got an answer; a stuck task poll is only
+# told apart from an outage by other requests still succeeding.
+_LAST_REQ_OK = {"at": 0.0}
+
+
 @contextlib.contextmanager
 def _gateway_call():
     """Every call that receives the gateway URL runs inside this: what it raises carries only
@@ -3440,6 +3459,7 @@ def _parse_response(resp, body: bytes):
                        "content_length": headers.get("Content-Length"),
                        "cf_ray": headers.get("CF-Ray")}
     raw = body.decode().strip()
+    _LAST_REQ_OK["at"] = time.time()
     return json.loads(raw) if raw else {}
 
 
@@ -3525,6 +3545,8 @@ def _recover_auth(code: int) -> bool:
         _reenroll_clear()
         return True
     _reenroll_claim()
+    if _reenroll_state.get("deleted"):
+        return _wait_after_deletion(code)
     if not TOKEN_FILE and not _reenroll_state["code"] \
             and not (REENROLL_ENABLED and TOKEN):
         # Historical FATAL contract survives ONLY where recovery is truly
@@ -3560,6 +3582,8 @@ def _recover_auth(code: int) -> bool:
             # A transient failure isn't a lost episode: retry stays in the
             # loop, cadence-bounded internally (safe while nothing is parked).
             _reenroll_claim()
+            if _reenroll_state.get("deleted"):
+                return _wait_after_deletion(code)
         cycle += 1
         if cycle % REENROLL_PROBE_EVERY == 0 and _auth_probe():
             # Re-read: `pending` above predates this iteration's own claim,
@@ -3570,6 +3594,89 @@ def _recover_auth(code: int) -> bool:
             # _reenroll_clear re-reads current state for was_pending, so this
             # is correct whether or not a code was parked when we got here.
             _reenroll_clear(recovered=True)
+            return True
+
+
+def _retire_deleted_binding(agent_id: str) -> bool:
+    """Move the deleted agent's bearer and id out of every file it may sit in
+    (gateway_credential_sources.retirement_paths, deleted_binding.retire); True when anything moved. A file moves lines only when it names that
+    id beside this bearer; once one did, the same bearer's lines also leave the others (a lane's
+    key in the primary .env). An env-only token with no such file retires nothing."""
+    if not TOKEN or not agent_id:
+        return False
+    paths = gateway_credential_sources.retirement_paths(os.environ, TOKEN_FILE)
+    moved: "dict[str, list]" = {}
+    for proven in (False, True):
+        for path in paths:
+            if path in moved or (proven and not moved):
+                continue
+            try:
+                keys = deleted_binding.retire(path, secret=TOKEN, agent_id=agent_id, bearer_proven=proven)
+            except OSError as e:
+                _log_backoff(("retire-deleted", path, type(e).__name__),
+                             f"agent deleted: could not retire its binding from {path} ({diagnostics.describe(e)})")
+                continue
+            if keys:
+                moved[path] = keys
+                _log(f"agent deleted: moved {', '.join(keys)} from {path} to {path}{deleted_binding.RETIRED_SUFFIX}")
+    return bool(moved)
+
+
+def _forget_deleted_identity(agent_id: str) -> None:
+    """A deleted id the launcher exported must not name the next agent's claims: drop it from this
+    process, or, where the launcher pinned it, exit so the launcher starts over from the new file."""
+    if not agent_id:
+        return
+    named = [k for k in ("AGENT_MXID", "AGENT_ID") if os.environ.get(k) == agent_id]
+    if named and os.environ.get(agent_identity.PINNED_KEY):
+        _log("new credential after the agent's deletion, but the launcher pinned the deleted id — restarting")
+        sys.exit(POLL_STALL_EXIT_CODE)
+    for k in named:
+        os.environ.pop(k, None)
+
+
+def _bearer_check() -> str:
+    """This bearer, tested now: "accepted" on an authed answer, "refused" only on a 401, "unknown" on
+    anything else. A 403 can be an edge's WAF or rate rule answering a valid bearer, so it proves nothing."""
+    try:
+        _req("GET", "/v1/agents", timeout=15)
+        return "accepted"
+    except urllib.error.HTTPError as e:
+        return "refused" if e.code == 401 else "unknown"
+    except Exception:  # noqa: BLE001 - unknown, never a refusal
+        return "unknown"
+
+
+def _wait_after_deletion(code: int) -> bool:
+    """The owner deleted this agent: no further claims. The server's answer names an id, not this
+    bearer, so the binding is retired only on a 401, only when the file ties the two, and only right
+    after this bearer is itself refused again with a 401; until then it is tested every cycle, and an accepted
+    bearer resumes, since the stale id may sit beside another, live agent's token. A new credential
+    resumes too; True either way, like a rotation."""
+    deleted = _reenroll_state["deleted"]
+    agent_id = deleted.get("agent_id") or ""
+    if "retired" not in deleted:
+        deleted["retired"] = False
+        _log(f"AGENT DELETED — {agent_id or 'this agent'} was deleted by its owner; no longer "
+             "reconnecting. Set up a new agent to use this machine again")
+    while True:
+        if not deleted["retired"]:
+            check = _bearer_check()
+            if check == "accepted":
+                _log("token accepted again — the deleted id was not this bearer's; resuming")
+                _forget_deleted_identity(agent_id)
+                _reenroll_clear()
+                return True
+            if check == "refused" and code == 401:
+                deleted["retired"] = _retire_deleted_binding(agent_id)
+        _emit_gateway_status(False, error=f"auth rejected HTTP {code} — agent deleted by its owner")
+        time.sleep(AUTH_RECHECK_INTERVAL)
+        if not _heartbeat_singleton():
+            sys.exit("FATAL: lost poller singleton while waiting after the agent's deletion")
+        if _reload_rotated_token():
+            _log("new credential detected after the agent's deletion — resuming")
+            _forget_deleted_identity(agent_id)
+            _reenroll_clear()
             return True
 
 
@@ -3975,8 +4082,8 @@ _POOL_ADVERTISEMENT_FILE = _STATE / "pool-advertisement.json"
 _POOL_ADVERTISEMENT_MAX_BYTES = 1 << 20
 _workers_pushed_identity = ""
 _workers_push_retry_at = 0.0
-# The broker wants a report at least every 60 s (rows go stale at 120 s); the push only runs
-# between polls, which take up to POLL_WAIT + 10 s, so 20 s keeps the gap under 60 s.
+# The broker wants a report at least every 60 s (rows go stale at 120 s); the push runs between
+# polls, which return in ~33 s (#3042) and at worst POLL_READ_TIMEOUT_S, inside the 120 s.
 WORKERS_REFRESH_S = 20.0
 _workers_pushed_at: "float | None" = None
 _advertisement_unavailable_logged = False
@@ -5805,6 +5912,11 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             "runtime": {**RUNTIME_IDENTITY, "engine": _engine_desc(),
                         **_ENGINE_COUNTS},
         }
+        if _POLL_STREAK["timeouts"]:
+            payload["consecutive_poll_timeouts"] = _POLL_STREAK["timeouts"]
+        if _POLL_STREAK["stuck_since"] is not None:
+            payload["stuck_poll"] = True
+            payload["stuck_since"] = int(_POLL_STREAK["stuck_since"])
         if _HELD_UNRESOLVED:
             # Staged relay asks the bridge can neither publish nor clear without a person.
             payload["ack_first_unresolved"] = sorted(_one_line(t)[:128] for t in _HELD_UNRESOLVED)[:20]
@@ -5813,7 +5925,18 @@ def _emit_gateway_status(connected: bool, *, error: str | None = None,
             payload["relay_results_retrying"] = retrying
         # Recovery surface: recovered ONLY via the probe-success terminal; a
         # missing block means "no episode known", never success.
-        if _reenroll_state.get("code"):
+        deleted = _reenroll_state.get("deleted")
+        if deleted:
+            # Final: the server deleted the agent; readers stop offering Reconnect for it.
+            payload["binding"] = "deleted"
+            payload["reenroll"] = {
+                "pending": False,
+                "deleted": True,
+                "agent_id": deleted.get("agent_id") or None,
+                "deleted_at": deleted["at"],
+                "credential_retired": bool(deleted.get("retired")),
+            }
+        elif _reenroll_state.get("code"):
             payload["reenroll"] = {
                 "pending": True,
                 "approval_code": _reenroll_state["code"],
@@ -6545,7 +6668,7 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         return None
     if hold:
         return _hold_staged(tid, tmp, task_text, task, sender_tier)
-    if not _publish_staged(tmp, dest):  # atomic publish: never a partial file
+    if not _publish_task(tid, tmp, dest):  # atomic publish: never a partial file
         tmp.unlink(missing_ok=True)
         return None
     _mark_published(tid)
@@ -6852,6 +6975,24 @@ def _mark_published(tid: str) -> None:
     with _ATTEMPTS.transition(_broker_tid(tid)) as t:
         if t.run_published(tid) is False:
             t.mark_published(tid)
+
+
+def _publish_task(tid: str, staged: Path, dest: Path) -> bool:
+    """Publish a served task's staged file into the queue, after TASK_PRE_PUBLISH has seen it."""
+    after = None
+    if TASK_PRE_PUBLISH is not None:
+        try:
+            after = TASK_PRE_PUBLISH(tid, staged, dest)
+        except Exception as exc:  # noqa: BLE001 — a broken hook must never hold a task back
+            _log(f"pre-publish hook failed for {tid}: {diagnostics.describe(exc)}; publishing")
+    if not _publish_staged(staged, dest):
+        return False
+    if callable(after):
+        try:
+            after()
+        except Exception as exc:  # noqa: BLE001 — the task is already published
+            _log(f"post-publish step failed for {tid}: {diagnostics.describe(exc)}")
+    return True
 
 
 def _on_published(tid: str, dest: Path, task_text: str, task: dict, sender_tier: str) -> None:
@@ -7391,7 +7532,7 @@ def _advance_held(tid: str, entry: dict, inflight: "set[str]") -> bool:
     if _staged_tier_withdrawn(tid, staged):
         _end_withdrawn_relay_ask(tid, entry, staged, inflight)
         return False
-    if not _publish_staged(staged, dest):
+    if not _publish_task(tid, staged, dest):
         return False
     _mark_published(tid)
     served = _HELD_TASKS.pop(tid, None)
@@ -7809,7 +7950,7 @@ def _read_attachment(path_str: str, confine_root=None) -> "tuple[str, str, str]"
     ("", "", reason) — the refusals both upload routes report in-band."""
     if confine_root is _CONFINE_UNRESOLVED:
         return "", "", "task provenance unavailable"
-    fpath = os.path.realpath(os.path.expanduser(path_str.strip()))
+    fpath = resolve_attachment_path(path_str)
     if not is_path_sendable(fpath):
         return "", "", "path not allowlisted"
     if confine_root is not None:
@@ -7819,24 +7960,25 @@ def _read_attachment(path_str: str, confine_root=None) -> "tuple[str, str, str]"
         except (OSError, ValueError):
             return "", "", "outside the task's media directory"
         try:
-            with os.fdopen(fd, "rb") as f:
-                if os.fstat(f.fileno()).st_size > MAX_MEDIA_BYTES:
-                    return "", "", f"file exceeds {MAX_MEDIA_BYTES} bytes"
-                return (os.path.basename(confined_path),
-                        base64.b64encode(f.read()).decode("ascii"), "")
+            data, reason = read_fd_bytes(fd, MAX_MEDIA_BYTES)
+            if data is not None:
+                return os.path.basename(confined_path), base64.b64encode(data).decode("ascii"), ""
         except OSError as e:
-            return "", "", f"read failed: {e}"
-    try:
-        size = os.path.getsize(fpath)
-    except OSError as e:
-        return "", "", f"stat failed: {e}"
-    if size > MAX_MEDIA_BYTES:
-        return "", "", f"file exceeds {MAX_MEDIA_BYTES} bytes"
-    try:
-        with open(fpath, "rb") as f:
-            return os.path.basename(fpath), base64.b64encode(f.read()).decode("ascii"), ""
-    except OSError as e:
-        return "", "", f"read failed: {e}"
+            reason = f"unreadable ({e})"
+        finally:
+            os.close(fd)
+        return "", "", _attachment_refusal(reason)
+    _, data, reason = read_attachment(path_str, is_path_sendable, MAX_MEDIA_BYTES)
+    if data is None:
+        return "", "", _attachment_refusal(reason)
+    return os.path.basename(fpath), base64.b64encode(data).decode("ascii"), ""
+
+
+def _attachment_refusal(reason: str) -> str:
+    """The in-band refusal for a shared reader's reason."""
+    if reason.startswith("over "):
+        return f"file exceeds {MAX_MEDIA_BYTES} bytes"
+    return reason if reason == "path not allowlisted" else f"read failed: {reason}"
 
 
 def _upload_attachment(room: str, path_str: str) -> tuple[bool, str]:
@@ -8153,6 +8295,24 @@ def _proactive_route(body: str) -> "tuple[str, str | None, str]":
     return _delivery_destination.route(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
 
 
+def _proactive_attachments(body: str) -> "list[str]":
+    """The `[file:]`/`[send:]`/`[attach:]` paths a proactive body names, in order."""
+    parsed = parse_markers(body, skip_after_channel=DELIVERY_SKIP_AFTER_CHANNEL)
+    return [a.value for a in parsed.actions if a.kind == "attach"]
+
+
+def _upload_proactive_attachments(name: str, room: str, attaches: "list[str]", tier: str = "owner") -> None:
+    """Upload a delivered proactive message's files to its room. The text is already sent,
+    so a refusal cannot go in-band: each outcome is logged, a refused file loudly."""
+    for fp in attaches:
+        ok, reason = _upload_attachment(room, fp)
+        shown = team_result_guard.attachment_notice_name(fp, tier)
+        if ok:
+            _log(f"attached {shown} to proactive {name} in {room}")
+        else:
+            _log(f"proactive {name}: attachment NOT sent to {room}: {shown} ({reason})")
+
+
 def _proactive_thread_root(body: str, name: str = "") -> "str | None":
     """The `[thread:]` root a proactive body names, or None (top level). A
     malformed value is logged and posted top level, never into a guessed thread."""
@@ -8265,8 +8425,8 @@ def _payload_room(payload) -> "str | None":
         return None
 
 
-def _proactive_item_id(stem: str, body: str) -> str:
-    return proactive_item_id(stem, body)
+def _proactive_item_id(stem: str, body: str, attachments=()) -> str:
+    return proactive_item_id(stem, body, attachments, admit=is_path_sendable, max_bytes=MAX_MEDIA_BYTES)
 
 
 def _proactive_requeue_command(root, item_id: str, body_sha256: str, reset_attempts: bool = False) -> str:
@@ -8620,7 +8780,8 @@ def _post_proactive() -> None:
             _log(f"proactive {f.name} carries a skip marker — archiving, no send")
             _retire_proactive(claim, f, ARCHIVE_RESULTS_DIR)
             continue
-        body = routed_body.strip()
+        attaches = _proactive_attachments(claimed_text)
+        body = routed_body.strip() or ("(file attached)" if attaches else "")
         if not body:
             # An empty claim means the producer has not flushed the body yet.
             # NEVER move this inode: no observable signal proves the writer is
@@ -8643,21 +8804,43 @@ def _post_proactive() -> None:
             _retire_proactive(claim, f, UNDELIVERABLE_RESULTS_DIR)
             continue
         dest_room = resolve_destination(CURRENT_ROOM, room_id=room_override) if room_override else resolve_destination(OWNER_PRIVATE)
+        tier = "owner"
+        if room_override:
+            body, withheld = _guard_proactive_for_room(f.name, claimed_text, body, dest_room)
+            tier = "owner" if dest_room == resolve_destination(OWNER_PRIVATE) else "guest"
+            if withheld and attaches:
+                # A withheld body's files are the owner's output too: none reach that room.
+                _log(f"[team-guard] proactive {f.name}: {len(attaches)} attachment(s) withheld from {dest_room}: "
+                     + ", ".join(team_result_guard.attachment_notice_name(a, tier) for a in attaches))
+                attaches = []
         thread_root = _proactive_thread_root(claimed_text, f.name)
         about = about_task(f.name)
         if about:
             thread_root = _task_thread_root(_about_task_headers(about), dest_room) or thread_root
         envelope = {"room_id": dest_room, "body": body,
                     **({"thread_root": thread_root} if thread_root else {}),
-                    **({"task_id": about} if about else {})}
-        _send_proactive(claim, f, envelope, room_override is None, noticed)
+                    **({"task_id": about} if about else {}),
+                    **({"attachments": attaches} if attaches else {})}
+        _send_proactive(claim, f, envelope, room_override is None, noticed, tier)
 
 
-def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, noticed: set) -> None:
+def _guard_proactive_for_room(name: str, text: str, body: str, room: str) -> "tuple[str, bool]":
+    """(the body a redirected proactive may post in `room`, whether the guard withheld it). No room
+    record states its audience tier, so every room but the owner DM guards as a non-owner one."""
+    _, withheld = team_result_guard.guard_proactive_for_destination(
+        text, room, resolve_destination(OWNER_PRIVATE), "guest", None, secret_filter=filter_chat_secrets)
+    if withheld is None:
+        return body, False
+    _log(f"[team-guard] withheld proactive {name} for {room}: {withheld}")
+    return team_result_guard.TEAM_LEAK_RESULT, True
+
+
+def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, noticed: set,
+                    tier: str = "owner") -> None:
     """Hand one claimed proactive file to the outbox, which owns the claim, the send and its
     outcome, then move the file as that outcome says. An uncertain send is parked, not resent."""
     core = _delivery_core("proactive")
-    item_id = _proactive_item_id(f.stem, envelope["body"])
+    item_id = _proactive_item_id(f.stem, envelope["body"], envelope.get("attachments") or ())
     payload = json.dumps(envelope, sort_keys=True).encode("utf-8")
     seen = _PROACTIVE_SEND.__dict__.setdefault("seen", {})
     seen.clear()
@@ -8709,6 +8892,8 @@ def _send_proactive(claim: Path, f: Path, envelope: dict, owner_dm: bool, notice
         if result.status is DrainStatus.ATTEMPTED and result.detail != "settled by a recorded receipt":
             _ENGINE_COUNTS["core_confirmed"] += 1
             _log(f"delivered proactive {f.name} to {room} ({item.get('provider_ref')})")
+            # Only after this pass's own send: a resend never repeats an upload.
+            _upload_proactive_attachments(f.name, room, envelope.get("attachments") or [], tier)
         else:
             _log(f"proactive {f.name} was already delivered to {room} "
                  f"({item.get('provider_ref') or 'receipt recorded'}) — archived, not sent again")
@@ -10672,7 +10857,7 @@ _LOCK_HB_MUTEX = threading.Lock()
 _POLL_BACKOFF_MAX_S = 60
 # Typical worst case for one pass (a queued retry backlog can exceed it): the
 # long poll at its timeout, the largest backoff and two requests, doubled.
-_LOCK_PASS_MAX_S = 2 * (POLL_WAIT + 10 + _POLL_BACKOFF_MAX_S + 2 * _REQ_TIMEOUT_S)
+_LOCK_PASS_MAX_S = 2 * (POLL_READ_TIMEOUT_S + _POLL_BACKOFF_MAX_S + 2 * _REQ_TIMEOUT_S)
 _LOOP_TICK = {"at": time.monotonic()}
 
 
@@ -10751,6 +10936,22 @@ def _start_lock_heartbeat() -> None:
     if _lock_on():
         threading.Thread(target=_lock_heartbeat_loop, name="sparrow-lock-heartbeat",
                          daemon=True).start()
+
+
+# Not 0 (a supervisor reads it as a deliberate stop) and not 75 (stand-down): restart me.
+LOCK_LOST_EXIT_CODE = 70
+# Exit hooks wait on flocks and a push join; past this the process ends without them.
+_EXIT_HOOKS_BOUND_S = 30.0
+
+
+def _exit_bounded(code: int) -> None:
+    """sys.exit(code), but no hung exit hook or interpreter shutdown can hold the process open."""
+    # The deadline does no I/O: a full output pipe must not block the forced exit.
+    t = threading.Timer(_EXIT_HOOKS_BOUND_S, os._exit, args=(code,))
+    t.daemon = True
+    t.start()
+    _log(f"exiting {code}; forced after {_EXIT_HOOKS_BOUND_S:g}s if an exit hook or shutdown hangs")
+    sys.exit(code)
 
 
 def _exit_on_signal(signum, _frame) -> None:
@@ -10930,6 +11131,137 @@ def _poll_timeout_is_empty(last_ok: float, now: float,
     return (now - last_ok) <= grace
 
 
+# A relay that holds every task poll past the read timeout while answering the
+# rest is a stuck session; every request already opens a new connection.
+STUCK_POLL_TIMEOUTS = 5
+# Shortest streak that can be judged stuck: N polls, each held to the read timeout.
+STUCK_POLL_DETECTION_WINDOW_S = STUCK_POLL_TIMEOUTS * POLL_READ_TIMEOUT_S
+STUCK_POLL_RECOVERY_INTERVAL_S = 600
+# A live relay answers a heartbeat at least once per pass: one held poll, one
+# back-off and one heartbeat interval. An older success says nothing about now.
+STUCK_POLL_OTHER_OK_WITHIN_S = POLL_READ_TIMEOUT_S + _POLL_BACKOFF_MAX_S + HEARTBEAT_INTERVAL
+# A restart stamp further ahead than this is a clock that moved back, not a restart.
+_STUCK_POLL_CLOCK_SKEW_S = 60
+# The stall exit's code and restart-owner gate: one relaunch contract for both exits.
+STUCK_POLL_EXIT_CODE = POLL_STALL_EXIT_CODE
+_POLL_TIMED_OUT = "poll timed out: the relay held the task poll past the read timeout"
+_POLL_STREAK = {"timeouts": 0, "since": None, "stuck_since": None, "held_logged": False,
+                "stamp_logged": False, "unrecorded_logged": False, "unowned_logged": False}
+# When this process first found the restart stamp unreadable; one hold per episode.
+_BAD_STAMP = {"seen_at": None}
+
+
+def _poll_streak_reset() -> None:
+    if _POLL_STREAK["stuck_since"] is not None:
+        _log(f"stuck relay poll cleared after {_POLL_STREAK['timeouts']} timeouts")
+    _POLL_STREAK.update(timeouts=0, since=None, stuck_since=None, held_logged=False,
+                        stamp_logged=False, unrecorded_logged=False, unowned_logged=False)
+
+
+def _log_stamp_once(msg: str) -> None:
+    if not _POLL_STREAK["stamp_logged"]:
+        _POLL_STREAK["stamp_logged"] = True
+        _log(f"stuck relay poll: {msg}")
+
+
+def _write_stuck_stamp(now: float) -> bool:
+    try:
+        written = _durable_write(STUCK_POLL_RECOVERY_FILE, json.dumps({"at": int(now)}))
+    except Exception:  # noqa: BLE001 — a state write must never break the poll loop
+        return False
+    if written:
+        _BAD_STAMP["seen_at"] = None
+    return written
+
+
+def _last_stuck_recovery(now: float) -> "float | None":
+    """When the last stuck-poll restart ran, or None when none did. An unreadable
+    stamp counts as a restart when first seen, so it holds for one interval only."""
+    try:
+        at = json.loads(STUCK_POLL_RECOVERY_FILE.read_text())["at"]
+        if isinstance(at, bool) or not isinstance(at, (int, float)) or not abs(at) < float("inf"):
+            raise ValueError(f"bad stamp {at!r}")
+    except FileNotFoundError:
+        _BAD_STAMP["seen_at"] = None
+        return None
+    except (OSError, ValueError, TypeError, KeyError) as e:
+        if _BAD_STAMP["seen_at"] is None:
+            _log(f"stuck relay poll: restart stamp unreadable ({type(e).__name__}) — holding "
+                 f"the next restart for {STUCK_POLL_RECOVERY_INTERVAL_S}s")
+            _write_stuck_stamp(now)
+            _BAD_STAMP["seen_at"] = now
+        return _BAD_STAMP["seen_at"]
+    _BAD_STAMP["seen_at"] = None
+    if at > now + _STUCK_POLL_CLOCK_SKEW_S:
+        _log_stamp_once(f"restart stamp is {int(at - now)}s in the future (clock moved back) "
+                        "— ignoring it")
+        return None
+    return float(at)
+
+
+def _stuck_poll_restart_due(now: float) -> bool:
+    """Count one timed-out task poll; True when the bridge should exit and be
+    relaunched, which happens at most once per STUCK_POLL_RECOVERY_INTERVAL_S."""
+    s = _POLL_STREAK
+    if not s["timeouts"]:
+        s["since"] = now
+    s["timeouts"] += 1
+    other_ok = _LAST_REQ_OK["at"]
+    if (s["timeouts"] < STUCK_POLL_TIMEOUTS or other_ok <= s["since"]
+            or now - other_ok > STUCK_POLL_OTHER_OK_WITHIN_S):
+        s["stuck_since"] = None  # the rest stopped answering too: an outage, not a stuck poll
+        return False
+    if s["stuck_since"] is None:
+        s["stuck_since"] = now
+        _log(f"stuck relay poll: {s['timeouts']} consecutive task polls timed out while "
+             f"other requests to {_redact_url(URL)} succeed — the relay is not serving this agent")
+    if not POLL_STALL_RESTART_OWNER:
+        if not s["unowned_logged"]:
+            s["unowned_logged"] = True
+            _log("stuck relay poll: no restart owner declared (SUTANDO_BRIDGE_RESTART_OWNER "
+                 "unset) — staying up, since nothing would relaunch this lane")
+        return False
+    last = _last_stuck_recovery(now)
+    if last is not None and now - last < STUCK_POLL_RECOVERY_INTERVAL_S:
+        if not s["held_logged"]:
+            s["held_logged"] = True
+            _log(f"stuck relay poll: the last restart was {int(now - last)}s ago — next one "
+                 f"allowed in {int(STUCK_POLL_RECOVERY_INTERVAL_S - (now - last))}s")
+        return False
+    # The stamp is what bounds the restarts; unwritten, restarting could loop.
+    if not _write_stuck_stamp(now):
+        if not s["unrecorded_logged"]:
+            s["unrecorded_logged"] = True
+            _log("stuck relay poll: could not record the restart — staying up")
+        return False
+    return True
+
+
+# Set once a stuck-poll exit has begun: the loop then only waits for the outbound worker.
+_STUCK_EXIT_PENDING = False
+# Set when that exit may proceed: main() returns the code so run() exits through _exit_bounded.
+_STUCK_EXIT_READY = False
+
+
+def _on_poll_timeout(inflight: set[str], before_exit: Callable[[], bool]) -> bool:
+    """Count one held task poll; mark the exit ready once that makes a stuck session.
+    True while the exit waits or is ready: the caller must skip the beat."""
+    global _STUCK_EXIT_PENDING, _STUCK_EXIT_READY
+    if not _STUCK_EXIT_PENDING:
+        if not _stuck_poll_restart_due(time.time()):
+            return False
+        _STUCK_EXIT_PENDING = True
+        _emit_gateway_status(False, error="stuck relay poll — restarting the bridge")
+    if not before_exit():
+        _log("stuck relay poll: exit held — the outbound worker is still finishing a send")
+        return True
+    _save_inflight(inflight)  # claimed tasks reload from it on start
+    _log(f"stuck relay poll: exiting {STUCK_POLL_EXIT_CODE} so {POLL_STALL_RESTART_OWNER} "
+         "relaunches the bridge")
+    _STUCK_EXIT_READY = True
+    return True
+
+
 def _awake_note(wall_s: float, awake_s: float) -> str:
     """`, Ns of it awake` when the host slept through a poll gap, else "": time.time() counts a
     sleeping Mac's hours, time.monotonic() does not, and the gap alone cannot tell the two apart."""
@@ -10950,6 +11282,8 @@ _STALL_REPORTED_FOR: float | None = None
 # Set once the stall exit has stopped the outbound worker: from then on the loop
 # only waits for that stop, because a resumed poll would run with no outbound worker.
 _STALL_EXIT_PENDING = False
+# Set when that exit may proceed: main() returns the code so run() exits through _exit_bounded.
+_STALL_EXIT_READY = False
 
 
 def _worker_stop_budget_s() -> float:
@@ -10979,8 +11313,9 @@ def _abort_if_poll_stalled(anchor: float,
     unsupervised lane that exits stays down; the status sidecar records it either way.
     `before_exit` stops the workers and reports whether they stopped; until they
     have, this returns True and the caller must skip the beat rather than poll.
+    True also once the exit is ready, which main() turns into the returned code.
     """
-    global _STALL_REPORTED_FOR, _STALL_EXIT_PENDING
+    global _STALL_REPORTED_FOR, _STALL_EXIT_PENDING, _STALL_EXIT_READY
     now = time.monotonic()
     # Pass the limit explicitly: the parameter default binds at def time,
     # so a reconfigured module global would otherwise never be read.
@@ -11012,10 +11347,12 @@ def _abort_if_poll_stalled(anchor: float,
         return True
     print(f"FATAL: no successful poll in {stalled_s}s (limit {POLL_STALL_EXIT_S:g}s) "
           f"-- exiting so {POLL_STALL_RESTART_OWNER} restarts the bridge.", file=sys.stderr)
-    sys.exit(POLL_STALL_EXIT_CODE)
+    _STALL_EXIT_READY = True
+    return True
 
 
-def main() -> None:
+def main() -> int | None:
+    """Serve until the process must end; a returned code is one a supervisor should restart on."""
     # This process holds the gateway URL: nothing uncaught, in any thread, prints it raw.
     gateway_instance.install_scrubbing_excepthooks(lambda: URL)
     if _FOUND.fatal:
@@ -11092,11 +11429,20 @@ def main() -> None:
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
     _results_watcher = _start_results_watcher()
     _outbound_thread = _start_outbound_worker(inflight)
+    stop_workers = lambda: _stop_background_workers(_outbound_thread, _results_watcher)  # noqa: E731
     while True:
         _stamp_loop_progress()
+        polled_ok = False  # a failure after this pass's good poll is not a lost connection
         try:
-            if _abort_if_poll_stalled(stall_anchor, lambda: _stop_background_workers(
-                    _outbound_thread, _results_watcher)):
+            # Checked before the watchdog, which would otherwise repeat its exit body.
+            if _STALL_EXIT_READY:
+                _save_inflight(inflight)  # claimed tasks reload from it on start
+                return POLL_STALL_EXIT_CODE
+            if _abort_if_poll_stalled(stall_anchor, stop_workers):
+                continue
+            if _STUCK_EXIT_READY:
+                return STUCK_POLL_EXIT_CODE
+            if _STUCK_EXIT_PENDING and _on_poll_timeout(inflight, stop_workers):
                 continue
             if _LOCK_LOST.is_set() or not _heartbeat_singleton():
                 # Lost the poller lock (reaped after being deemed stale). Stop
@@ -11110,7 +11456,7 @@ def main() -> None:
                          "waiting for it to stop before exiting")
                     _LOCK_LOST.set()  # the next pass must come back here, never poll
                     continue
-                return
+                return LOCK_LOST_EXIT_CODE
             _post_heartbeat(inflight)
             _retry_withheld_reviews()
             # LAST of the beat's work, on a daemon thread: two optional 15 s
@@ -11123,21 +11469,32 @@ def main() -> None:
             try:
                 # The whole poll is bounded, not each socket read: a body that drips held it open.
                 resp = _req("GET", f"/v1/tasks?wait={_poll_wait(inflight)}{_POLL_PROOF}",
-                            timeout=POLL_WAIT + 10, deadline=time.monotonic() + POLL_WAIT + 10)
+                            timeout=POLL_READ_TIMEOUT_S,
+                            deadline=time.monotonic() + POLL_READ_TIMEOUT_S)
                 last_poll_ok = poll_grace_since = time.time()
                 stall_anchor = poll_ok_awake = time.monotonic()
+                _poll_streak_reset()
+                polled_ok = True
                 # A completed poll remains evidence even if accepting its tasks fails.
                 _emit_gateway_status(True, poll_ok_ts=last_poll_ok)
             except (TimeoutError, socket.timeout):
                 # Read timeout only (URLError takes the outage path below).
                 # socket.timeout only aliases TimeoutError on 3.10+, not 3.9.
+                if _on_poll_timeout(inflight, stop_workers):  # may mark the exit ready
+                    continue
                 if not _poll_timeout_is_empty(poll_grace_since, time.time()):
                     raise
-                _log(f"poll read timed out after {POLL_WAIT + 10}s inside the "
+                _log(f"poll read timed out after {POLL_READ_TIMEOUT_S}s inside the "
                      f"{POLL_TIMEOUT_GRACE_S:g}s grace — treated as an empty poll")
                 resp = {"tasks": []}
+            except _NETWORK_ERRORS:
+                # Not a held poll. HTTPError is a URLError, so a poll answered 502 ends the
+                # streak too: the relay answered the poll instead of holding it.
+                _poll_streak_reset()
+                raise
             received_at = time.monotonic()           # the dropped-ack retry budget runs from here
-            if poll_failures and poll_grace_since != prev_ok:  # a real answer, not the grace path
+            answered = poll_grace_since != prev_ok   # a real answer, not the grace path
+            if poll_failures and answered:
                 _log(f"poll recovered after {poll_failures} failures, {int(poll_grace_since - prev_ok)}s"
                      f"{_awake_note(poll_grace_since - prev_ok, poll_ok_awake - prev_ok_awake)}")
                 poll_failures = 0
@@ -11167,7 +11524,9 @@ def main() -> None:
             # raising, so a broker without the endpoints costs one deferred log.
             _push_pool_advertisement()
             backoff = 1  # healthy round-trip → reset backoff
-            _emit_gateway_status(last_poll_ok is not None, poll_ok_ts=last_poll_ok)
+            # A timed-out poll claims nothing: not connected, last_ok_ts stays at the last answer.
+            _emit_gateway_status(answered and last_poll_ok is not None, poll_ok_ts=last_poll_ok,
+                                 error=None if answered else _POLL_TIMED_OUT)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 if _recover_auth(e.code):
@@ -11179,7 +11538,7 @@ def main() -> None:
                 _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}", poll_ok_ts=last_poll_ok)
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
             _log(f"poll HTTP {e.code} — backing off {backoff}s")
-            _emit_gateway_status(False, error=f"HTTP {e.code}", backoff_s=backoff, poll_ok_ts=last_poll_ok)
+            _emit_gateway_status(polled_ok, error=f"HTTP {e.code}", backoff_s=backoff, poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except _PollAnomaly:
             # Every anomaly is counted in its line; the log itself thins out a run of them.
@@ -11193,15 +11552,22 @@ def main() -> None:
                  f"{int(time.time() - poll_grace_since)}s since last successful poll"
                  f"{_awake_note(time.time() - poll_grace_since, time.monotonic() - poll_ok_awake)} — "
                  f"backing off {backoff}s")
-            _emit_gateway_status(False, error=f"network: {diagnostics.describe(e)}", backoff_s=backoff,
+            _emit_gateway_status(polled_ok, error=f"network: {diagnostics.describe(e)}", backoff_s=backoff,
                                  poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except Exception as e:  # noqa: BLE001 — keep the loop alive
             _log(f"unexpected: {diagnostics.describe(e)} — backing off {backoff}s")
-            _emit_gateway_status(False, error=f"unexpected: {diagnostics.describe(e)}", backoff_s=backoff,
+            _emit_gateway_status(polled_ok, error=f"unexpected: {diagnostics.describe(e)}", backoff_s=backoff,
                                  poll_ok_ts=last_poll_ok)
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
 
 
+def run() -> None:
+    """Process entry: main(), then a bounded exit with the code it returned."""
+    code = main()
+    if code:
+        _exit_bounded(code)
+
+
 if __name__ == "__main__":
-    main()
+    run()

@@ -708,6 +708,17 @@ clear field rather than beside a live predecessor. What remains is dead state â€
 `state/pool/affinity.json`, `assignments.json` and their siblings â€” which Stage 1
 neither reads nor migrates; removing it is a separate cleanup.
 
+### s.space hand-off for a worker with its own agent (flag)
+
+Behind `WORKER_POOL_SSPACE_HANDOFF` (worker-pool manifest `config`, off by default), `pool_ask`
+from the core at team tier to a worker whose identity row is enabled skips the task file and the
+router. The core's agent posts one ordinary message to the worker's agent in the configured
+hand-off room, records the ask, and returns at once; the worker's threaded reply reaches the core as a
+new task, and `pool_ask --asked` lists the recorded asks the asked agent has not answered.
+Relayed asks, parent-held asks, a worker's own ask and the usage-limit recovery probe (which
+names its routed payload) stay on the folder. A hand-off carries the tier the room gives the core's
+agent, so owner-tier work is not delegated this way. Use and authority: `skills/worker-pool/SKILL.md`.
+
 ### Migration
 
 Both intakes coexist for a release or two. The rule that must hold: **a task is delivered exactly once.** The Task Bridge stamps which intake owns a task at admission, and the old path skips anything stamped for the new one. Removing the old path is its own change, after a release with no dual-path incidents.

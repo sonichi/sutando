@@ -39,6 +39,7 @@ pr = _sibling("pool_roster")
 wi = _sibling("worker_identity")
 pl = _sibling("pool_limit")
 prr = _sibling("pool_routing_receipt")
+pa = _sibling("pool_attribution")
 pd = _sibling("pool_delivery")
 
 _SRC = _HERE.parents[2] / "src"
@@ -347,11 +348,21 @@ def session_watcher_holds(workspace, worker_id, *, runner=subprocess.run) -> boo
     return False
 
 
+def _lane_delivered(workspace, task_id: str) -> bool:
+    """A worker's own lane routes its tasks without a receipt: their attribution names that worker."""
+    try:
+        return pa.worker_for_task(workspace, task_id) is not None
+    except OSError:
+        return False
+
+
 def routing_status(workspace) -> dict:
     """Is this host routing at all? Bindings say it should; the handler's receipt
     says whether the watcher ever consults it. A task the core processed after
     the last receipt went past the handler — which is the core answering for a
-    worker, the failure the pool exists to prevent, and it is silent otherwise.
+    worker, the failure the pool exists to prevent, and it is silent otherwise —
+    unless a worker's attribution shows its lane routed it. A worker's lane writes no
+    receipt, so on a host with none, attributed tasks are the evidence routing runs.
     """
     roster = pr.load_roster(workspace) or {}
     core = getattr(pr, "CORE", "core")
@@ -365,6 +376,7 @@ def routing_status(workspace) -> dict:
     # archive is always newer than its consult; every OTHER task past it is unrouted.
     own = receipt.get("task_id") if receipt else None
     unrouted = None
+    lane_routed = False   # with no receipt, a worker's attribution is the only routing evidence
     for f in (Path(workspace) / "tasks" / "archive").glob("task-*.txt"):
         try:
             mtime = f.stat().st_mtime
@@ -372,14 +384,22 @@ def routing_status(workspace) -> dict:
             continue
         if newest is None or mtime > newest:
             newest, newest_id = mtime, f.stem
-        if (consulted is not None and mtime > consulted and f.stem != own
-                and (unrouted is None or mtime > unrouted[0])):
+        if consulted is not None and (mtime <= consulted or f.stem == own):
+            continue
+        if consulted is not None and unrouted is not None and mtime <= unrouted[0]:
+            continue
+        if _lane_delivered(workspace, f.stem):
+            lane_routed = True
+        elif unrouted is None or mtime > unrouted[0]:
             unrouted = (mtime, f.stem)
     alarm = None
-    if bound and consulted is None:
+    if bound and consulted is None and unrouted is not None and lane_routed:
+        alarm = (f"unrouted: {unrouted[1]} arrived at {unrouted[0]:.0f}, and the route handler has never "
+                 "been consulted on this host — the core processed it unrouted")
+    elif bound and consulted is None and not lane_routed:
         alarm = (f"unrouted: {len(bound)} room(s) bound to workers, but the route handler "
                  "has never been consulted on this host — the watcher runs without it")
-    elif bound and unrouted is not None:
+    elif bound and consulted is not None and unrouted is not None:
         alarm = (f"unrouted: {unrouted[1]} arrived at {unrouted[0]:.0f} after the route handler "
                  f"was last consulted at {consulted:.0f} — the core processed it unrouted")
     return {"bound_rooms": bound, "handler_consulted_at": consulted,

@@ -99,7 +99,7 @@ def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB,
         (ws / "state" / "core-supervisor-relay-loop.pid").write_text(str(os.getpid()))
         bind = td / "bin"; bind.mkdir(); (td / "home").mkdir()
         sock = td / "t.sock"
-        for stub, body in (("claude", 'echo $$ > "$HOME/claude.pid"\nsleep 300\n'), ("pgrep", pgrep_stub),
+        for stub, body in (("claude", '[ "$1" = --version ] && exit 0\necho $$ > "$HOME/claude.pid"\nsleep 300\n'), ("pgrep", pgrep_stub),
                            ("lsof", "exit 1\n"), ("launchctl", "exit 1\n")):
             (bind / stub).write_text("#!/bin/bash\n" + body); (bind / stub).chmod(0o755)
         tm = lambda *a: subprocess.run([tmux, "-S", str(sock), *a], capture_output=True, text=True)

@@ -1399,7 +1399,7 @@ def main() -> int:
     # Once it holds the lease the unsuffixed bridge asks whether it keeps the proactive room.
     check(rtc.PROACTIVE_ROOM_KEEP is rtc._legacy_keeps_proactive_room, "the unsuffixed bridge asks whether it keeps the room")
     _main_src = (SRC_DIR.parent / "packages" / "ag2-sparrow" / "ag2_sparrow" / "remote_gateway_bridge.py").read_text()
-    _main_src = _main_src[_main_src.index("def main() -> None:"):]
+    _main_src = _main_src[re.search(r"^def main\(", _main_src, re.M).start():]
     check(_main_src.index("_acquire_singleton()") < _main_src.index("_start_lock_heartbeat()")
           < _main_src.index("_settle_proactive_room()"), "the room is settled right after the lease heartbeats")
     _saved_room = (rtc.PROACTIVE_ROOM, rtc.PROACTIVE_ROOM_KEEP)
@@ -2772,7 +2772,7 @@ def main() -> int:
     # bridge off (up to 60s) and flipped gateway-status.json to
     # `connected: false` while tasks were still arriving and results delivering.
     grace = rtc.POLL_TIMEOUT_GRACE_S
-    check(grace >= rtc.POLL_WAIT + 10,
+    check(grace >= rtc.POLL_READ_TIMEOUT_S,
           "poll-timeout: the grace covers at least one whole poll window")
     check(rtc._poll_timeout_is_empty(1000.0, 1000.0),
           "poll-timeout: a timeout right after a good poll reads as an empty poll")
