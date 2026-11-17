@@ -79,6 +79,9 @@ for label, snippet in [
     ("template", "const help = `art.room.post(${1})`;"),
     ("regex", "const re = /room.post\\(/;"),
     ("regex-with-slash-in-class", "const re = /[/]room.post\\(/;"),
+    ("regex-after-if-condition", 'if (true) /room.post(abc)/.test("room.postabc");'),
+    ("regex-after-nested-while-condition", "while (f(x)) /sendTask(a)/.test(s);"),
+    ("regex-after-else", "if (a) {} else /room.post(abc)/.test(s);"),
 ]:
     page = SEND_BTN.replace("await art.ready;", "await art.ready; " + snippet + "\n")
     check(f"fake-send-not-silenced-by-{label}", "no-fake-send" in rules(cp.check(page), "warnings"))
@@ -86,6 +89,8 @@ for label, snippet in [
 for label, snippet in [
     ("after-url-string", "const u = 'https://x.example'; await art.room.post({text: u});"),
     ("after-division", "const half = 4 / 2; await art.room.post({text: 'a/b'});"),
+    ("after-call-division", "const q = f(4) / g(2); await art.room.post({text: 'x'});"),
+    ("after-if-call-division", "if (ok) { const q = f(4) / 2; } await art.room.post({text: 'x'});"),
     ("after-escaped-quote", "const q = 'it\\'s'; await art.agent.sendTask({agentId: 'x', text: q, key: 'k'});"),
     ("after-regex-with-quote", "const re = /'/g; await art.room.post({text: 'x'.replace(re, '')});"),
     ("after-unterminated-slash", "const x = (1\n/ 2); const y = [/\n]; await art.room.post({text: 'x'});"),

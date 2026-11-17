@@ -37,6 +37,11 @@ def _strip_comments(src: str) -> str:
 _SCRIPT = re.compile(r"<script\b[^>]*>(.*?)</script>", re.S | re.I)
 # After one of these (or at the start), a "/" opens a regex literal rather than dividing.
 _REGEX_BEFORE = set("(,=:[!&|?{};+-*%<>~^")
+# ...and after these words. A ")" closing an if/while/for/with condition also starts a statement,
+# so a "/" after it opens a regex too; any other ")" ends an expression, and "/" divides.
+_REGEX_AFTER_WORDS = {"return", "typeof", "in", "of", "case", "else", "do", "throw", "void",
+                      "delete", "instanceof", "new", "await", "yield"}
+_CONTROL_WORDS = {"if", "while", "for", "with"}
 
 
 def _script_code(src: str) -> str:
@@ -50,6 +55,7 @@ def _script_code(src: str) -> str:
     out: List[str] = []
     for body in _SCRIPT.findall(_strip_comments(src)):
         i, n, prev = 0, len(body), ""
+        parens: List[bool] = []    # one entry per open "(": does it hold a control condition?
         while i < n:
             c = body[i]
             if body.startswith("//", i):
@@ -58,7 +64,7 @@ def _script_code(src: str) -> str:
                 continue
             word = re.search(r"([A-Za-z_$][\w$]*)\s*$", body[max(0, i - 12):i])
             regex_ok = c == "/" and (prev == "" or prev in _REGEX_BEFORE
-                                     or (word is not None and word.group(1) in ("return", "typeof", "in", "of", "case")))
+                                     or (word is not None and word.group(1) in _REGEX_AFTER_WORDS))
             if c in "'\"`" or regex_ok:
                 j, in_class = i + 1, False
                 while j < n:
@@ -82,7 +88,11 @@ def _script_code(src: str) -> str:
                 i, prev = j + 1, '"'
                 continue
             out.append(c)
-            if not c.isspace():
+            if c == "(":
+                parens.append(word is not None and word.group(1) in _CONTROL_WORDS)
+            if c == ")" and parens and parens.pop():
+                prev = ";"                 # the condition is over: a statement starts here
+            elif not c.isspace():
                 prev = c
             i += 1
         out.append("\n")
