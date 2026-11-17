@@ -485,7 +485,7 @@ RELAUNCH_WAIT_S = 180.0
 
 
 def relaunch_lane(worker: str, workspace, kill=None, procs=None, wait_s: "float | None" = None,
-                  sleep=time.sleep, clock=time.monotonic, switch=None) -> "tuple[str, str]":
+                  sleep=None, clock=None, switch=None) -> "tuple[str, str]":
     """Make the process serving `worker`'s lane pick up its folders anew; (what happens, '' or why not).
     A declared bridge is restarted by sparrowd (the field is in its revision): this waits until its old
     process no longer holds the lease. Any other holder is stopped, and the lane keeper starts it again.
@@ -498,7 +498,7 @@ def relaunch_lane(worker: str, workspace, kill=None, procs=None, wait_s: "float 
         kind, pid, why = _stop_unless_declared(worker, workspace, kill, procs)
     if why or kind != "declared":
         return kind, why
-    return _await_replacement(worker, workspace, pid, wait_s, sleep, clock)
+    return _await_replacement(worker, workspace, pid, wait_s, sleep or time.sleep, clock or time.monotonic)
 
 
 def _stop_unless_declared(worker: str, workspace, kill, procs) -> "tuple[str, int, str]":

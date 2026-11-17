@@ -312,12 +312,16 @@ class TheLane(Base):
     def test_a_lingering_declared_bridge_moves_nothing(self):
         (self.ws / "results").mkdir(parents=True)
         (self.ws / "results" / f"{self.mine}.txt").write_text("r")
-        clock = iter(range(0, 1000, 100))
+        clock, slept = iter(range(0, 1000, 100)), []
         with mock.patch.object(C, "bridge_pid", return_value=4242), \
-                mock.patch.object(worker_lane, "held_by", return_value="declared-bridge"), \
-                mock.patch.object(worker_lane.time, "sleep", lambda s: None), \
-                mock.patch.object(worker_lane.time, "monotonic", lambda: next(clock)):
-            out, why = self.migrate(procs={})
+                mock.patch.object(worker_lane, "held_by", return_value="declared-bridge"):
+            self.assertIn("pending", worker_lane.relaunch_lane(W, self.ws, procs={}, wait_s=250,
+                                                               sleep=slept.append, clock=lambda: next(clock))[1])
+            self.assertEqual(len(slept), 2)
+            real = worker_lane.relaunch_lane
+            with mock.patch.object(worker_lane, "relaunch_lane",
+                                   lambda *a, **k: real(*a, **k, wait_s=0, sleep=lambda s: None)):
+                out, why = self.migrate(procs={})
         self.assertIn("pending: sparrowd has not replaced the declared bridge (pid 4242)", why)
         self.assertNotIn("results_moved", out)
         self.assertTrue((self.ws / "results" / f"{self.mine}.txt").is_file())
