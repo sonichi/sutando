@@ -438,6 +438,19 @@ class OneExitCodeOwner(unittest.TestCase):
         self.assertEqual(POLL_STALL_EXIT_CODE, exit_codes.POLL_STALL_EXIT_CODE)
 
 
+class TheCoreClaim(unittest.TestCase):
+    def test_the_spec_scan_keeps_the_claim_in_step_with_its_decision(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            with mock.patch.object(core, "decide", return_value=({"instance": "lane-a"}, "")), \
+                    mock.patch.object(core, "revision", return_value="r"):
+                self.assertEqual(SD.core_spec(ws, {})[0].argv[-1], "--expect=lane-a")
+            self.assertTrue(core.claims("lane-a", ws))
+            with mock.patch.object(core, "decide", return_value=(None, "parked")):
+                SD.core_spec(ws, {})
+            self.assertFalse(core.claim_path(ws).exists(), "nothing to run: nothing claimed")
+
+
 class TheCoreScan(unittest.TestCase):
     def test_it_keeps_the_last_core_while_unreadable_and_says_each_reason_once(self):
         spec = SD.WorkerSpec(name=SD.CORE_WORKER, argv=["py"])

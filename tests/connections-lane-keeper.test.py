@@ -6,7 +6,8 @@ disconnected or parked is left alone; a lane that does not start backs off (30 s
 capped at 15 min however many failures) and is not retried every pass, nor stops the pass for others; a token update's stop and relaunch share one hold of the record
 lock, so a keeper pass run in between neither starts the lane on the old code nor starts it twice;
 the keeper's environment never carries an inherited lane token; a pass that hangs is given up at
-its bound with one line, and the pass after it tends the lanes; the wrapper runs one pass at a time.
+its bound with one line, and the pass after it tends the lanes; the wrapper runs one pass at a time;
+the primary lane a live sparrowd claims as its core is left to it for the grace, then started anyway.
 
 Run: python3 tests/connections-lane-keeper.test.py
 """
@@ -395,6 +396,98 @@ class WrapperTendsLanes(unittest.TestCase):
             self.assertEqual((run.returncode, run.stdout.strip()), (0, "tended"), run.stderr)
             self.assertEqual(calls.read_text().splitlines(),
                              [f"/repo/scripts/connections.py keep-lanes --repo /repo --logs-dir {tmp}/logs"] * 2)
+
+
+ALPHA = "alpha-fixture-net"
+DEAD_PID = 4_194_404
+
+
+class CoreClaim(KeeperBase):
+    """sparrowd's core serves the primary lane: the keeper leaves it alone while sparrowd lives, for the grace."""
+
+    def setUp(self):
+        super().setUp()
+        self.core = importlib.import_module("sparrow_core_bridge")
+        self.lines = []
+
+    def keep_at(self, now, **kw):
+        self.spawned.clear()
+        self.lines += self.keep(now=now, **kw)
+        return sorted(i for i, _ in self.spawned)
+
+    def test_a_claimed_primary_waits_out_the_grace_then_starts(self):
+        self.core.write_claim(self.ws, ALPHA)
+        grace = C.DECLARED_BRIDGE_GRACE_S
+        self.assertEqual(self.keep_at(1000.0), [BETA], "the other lanes are tended as ever")
+        self.assertEqual(self.keep_at(1000.0 + grace - 1), [])
+        self.assertEqual(self.keep_at(1000.0 + grace), [ALPHA], "no core took the lease: the keeper serves it")
+        self.assertIn(f"lane {ALPHA}: sparrowd's core took no lease in 180s", self.lines[-1])
+
+    def test_a_failed_fallback_start_backs_off_without_a_new_grace(self):
+        self.core.write_claim(self.ws, ALPHA)
+
+        def boom(argv, env, log_path):
+            self.spawned.append((env["GATEWAY_INSTANCE"], ""))
+            raise OSError("no python")
+        self.keep_at(1000.0, spawn=boom)
+        self.assertIn(ALPHA, self.keep_at(1000.0 + C.DECLARED_BRIDGE_GRACE_S, spawn=boom))
+        state = json.loads(C.lane_keeper_state_path(self.ws).read_text())[ALPHA]
+        self.assertEqual((state["failures"], state["declared_unheld_since"]), (1, 1000.0))
+
+    def test_the_core_holding_the_lease_keeps_the_keeper_out(self):
+        self.core.write_claim(self.ws, ALPHA)
+        holder = bridge_lease.start(self.ws, ALPHA, wait=True)
+        self.children.append(holder)
+        self.assertEqual(self.keep_at(1000.0 + 10 * C.DECLARED_BRIDGE_GRACE_S), [BETA])
+
+    def test_no_live_claim_on_this_primary_is_no_wait(self):
+        for inst, pid in ((ALPHA, DEAD_PID), ("", None), (BETA, None)):
+            with self.subTest(inst=inst, pid=pid):
+                self.core.write_claim(self.ws, inst, pid=pid)
+                C.lane_keeper_state_path(self.ws).unlink(missing_ok=True)
+                for child in self.children:
+                    bridge_lease.stop(child)
+                self.children.clear()
+                self.assertEqual(self.keep_at(1000.0), [ALPHA, BETA], "a dead, legacy or non-primary claim")
+
+    def test_an_unanswerable_claim_check_never_keeps_the_lane_down(self):
+        self.core.write_claim(self.ws, ALPHA)
+        with unittest.mock.patch.object(self.core, "claims", side_effect=RuntimeError("boom")):
+            self.assertEqual(self.keep_at(1000.0), [ALPHA, BETA])
+
+
+class TheClaimFile(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ws = Path(self.tmp.name)
+        self.core = importlib.import_module("sparrow_core_bridge")
+
+    def test_written_once_withdrawn_and_unreadable_claims_nothing(self):
+        path = self.core.claim_path(self.ws)
+        self.assertFalse(self.core.claims(ALPHA, self.ws), "no claim yet")
+        self.core.write_claim(self.ws, ALPHA)
+        self.assertTrue(self.core.claims(ALPHA, self.ws))
+        self.assertFalse(self.core.claims(BETA, self.ws))
+        inode = path.stat().st_ino
+        self.core.write_claim(self.ws, ALPHA)
+        self.assertEqual(path.stat().st_ino, inode, "an unchanged claim is not rewritten")
+        self.core.write_claim(self.ws, None)
+        self.assertFalse(path.exists())
+        self.core.write_claim(self.ws, None)
+        for body in ("not json", json.dumps({"instance": ALPHA, "pid": True}), json.dumps({"instance": ALPHA})):
+            path.write_text(body)
+            self.assertFalse(self.core.claims(ALPHA, self.ws), body)
+
+    def test_a_reused_pid_claims_nothing_and_another_uids_process_still_does(self):
+        path = self.core.claim_path(self.ws)
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"instance": ALPHA, "pid": os.getpid(), "proc_start": "linux-x:1"}))
+        with unittest.mock.patch.object(self.core.workspace_lock, "proc_start", return_value="linux-x:2"):
+            self.assertFalse(self.core.claims(ALPHA, self.ws), "the pid now names a later process")
+        with unittest.mock.patch.object(self.core.os, "kill", side_effect=PermissionError()), \
+                unittest.mock.patch.object(self.core.workspace_lock, "proc_start", return_value=None):
+            self.assertTrue(self.core.claims(ALPHA, self.ws))
 
 
 class KeeperEnviron(unittest.TestCase):
