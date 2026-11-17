@@ -299,12 +299,16 @@ def retire_delivery_pointers(deliveries_root: Path, task_id: str, *, tasks_dir: 
     return moved
 
 
-def _ids_in(directory: Path) -> set[str]:
+def _ids_in(directory: Path, failures: list) -> set[str]:
+    """Task ids named in `directory`; an absent folder is empty, any other error goes to `failures`."""
     import os
     try:
         with os.scandir(directory) as entries:
             names = [e.name for e in entries]
-    except OSError:
+    except FileNotFoundError:
+        return set()
+    except OSError as e:
+        failures.append(f"cannot list {directory}: {e}")
         return set()
     return {i for i in (task_id_from_filename(n) for n in names) if i}
 
@@ -318,19 +322,26 @@ def retire_archived_pointers(workspace: Path, *, log=print) -> dict:
     import os
     import re
     tasks = Path(workspace) / "tasks"
-    live = _ids_in(tasks)
+    scan_failures: list[str] = []
+    live = _ids_in(tasks, scan_failures)
     archive = tasks / "archive"
-    archived = _ids_in(archive) | _ids_in(tasks / "processed")
+    archived = _ids_in(archive, scan_failures) | _ids_in(tasks / "processed", scan_failures)
     try:
         with os.scandir(archive) as entries:
             months = [e.path for e in entries
                       if re.fullmatch(r"\d{4}-\d{2}", e.name) and e.is_dir(follow_symlinks=False)]
-    except OSError:
+    except FileNotFoundError:
+        months = []
+    except OSError as e:
+        scan_failures.append(f"cannot list months in {archive}: {e}")
         months = []
     for m in months:
-        archived |= _ids_in(Path(m))
+        archived |= _ids_in(Path(m), scan_failures)
     root = deliveries_root_for(tasks)
-    counts = {"retired": 0, "kept_pending": 0, "kept_unarchived": 0, "failed": 0}
+    # An unreadable archive hides archived bodies, so the pass must not count as complete.
+    for msg in scan_failures:
+        log(f"  retire pointers: {msg}")
+    counts = {"retired": 0, "kept_pending": 0, "kept_unarchived": 0, "failed": len(scan_failures)}
     try:
         with os.scandir(root) as entries:
             folders = [e.path for e in entries if e.is_dir(follow_symlinks=False)]

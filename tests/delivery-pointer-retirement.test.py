@@ -227,6 +227,36 @@ class Migration(Base):
         self.assertEqual(ta.retire_archived_pointers(self.ws, log=lambda m: None)["retired"], 1)
         self.assertFalse(ptr.exists())
 
+    def test_an_unreadable_archive_folder_fails_the_run_and_a_later_run_retires_it(self):
+        month = self.tasks / "archive" / "2026-09"
+        month.mkdir()
+        (month / "task-m1.txt").write_text("id: task-m1\n")
+        self.task("task-f1", live=False)
+        (self.tasks / "processed").mkdir()
+        (self.tasks / "processed" / "task-p1.txt").write_text("id: task-p1\n")
+        real = os.scandir
+        for blocked, held in ((self.tasks / "archive", "task-f1"), (month, "task-m1"),
+                              (self.tasks / "processed", "task-p1")):
+            with self.subTest(blocked=blocked.name):
+                ptrs = [self.pointer(t) for t in ("task-m1", "task-f1", "task-p1")]
+                def scandir(path, _b=blocked):
+                    if Path(path) == _b:
+                        raise PermissionError(13, "denied", str(path))
+                    return real(path)
+                with patch.object(os, "scandir", side_effect=scandir):
+                    counts = ta.retire_archived_pointers(self.ws, log=lambda m: None)
+                self.assertGreaterEqual(counts["failed"], 1, counts)
+                self.assertTrue((self.inbox / f"{held}.txt").exists())
+        self.assertEqual(ta.retire_archived_pointers(self.ws, log=lambda m: None)["failed"], 0)
+        self.assertFalse(any(p.exists() for p in ptrs))
+
+    def test_absent_archive_folders_are_not_a_failure(self):
+        for d in (self.tasks / "archive",):
+            d.rmdir()
+        self.pointer("task-gone")
+        counts = ta.retire_archived_pointers(self.ws, log=lambda m: None)
+        self.assertEqual(counts, {"retired": 0, "kept_pending": 0, "kept_unarchived": 1, "failed": 0})
+
     def test_cli(self):
         self.task("task-c1", live=False)
         self.pointer("task-c1")
