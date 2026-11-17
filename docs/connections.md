@@ -715,13 +715,75 @@ Cutting a worker over:
    holder pid and `held_by`, which is `declared-bridge` only when that pid is the agent bridge for this
    declaration and a sparrowd running `--agent-bridges` is its parent; `other`, `none` or `unknown`
    otherwise. `sparrowd` lists each running sparrowd: whether it runs `--agent-bridges`, whether its
-   checkout's agent bridge accepts a worker declaration (`serves_workers`), and whether that code
-   changed after it started (`code_changed_since_start`: restart it).
+   checkout's agent bridge accepts a worker declaration (`serves_workers`: its
+   `ACCEPTS_WORKER_DECLARATIONS = 1` line), and whether the code it loaded (the agent bridge,
+   `worker_lane.py`, `connect_bridge.py`) changed after it started (`code_changed_since_start`: restart
+   it). Paths are matched against the raw command line, never split into words, so a checkout or
+   workspace under a folder with a space is read correctly.
 4. Check with a live round trip: a message to the worker's agent reaches the worker and its reply
    is posted as that agent.
 
 Undo: `python3 src/worker_lane.py withdraw --worker <id>`; the keeper starts the lane on its next
 pass, which takes the lease once sparrowd has stopped the bridge.
+
+### The core bridge under sparrowd (opt-in)
+
+By default the launchd gateway wrapper launches and supervises the host's core gateway bridge
+itself. A host can move that job to sparrowd. Nothing changes until the opt-in file
+`<workspace>/state/sparrowd/core.enabled` exists. The wrapper checks for it when it starts, and
+`src/startup-runtime.sh` checks for it before its bare launch. When the file is there:
+
+- The wrapper launches no bridge, runs no token check and does no eviction. It keeps
+  `src/sparrowd.py --core --agent-bridges` alive (relaunching it `SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY`
+  after it exits) and still runs the lane keeper. Startup's bare launch starts that same sparrowd. A
+  second sparrowd waits on the first one's lock.
+- sparrowd's `core-gateway-bridge` worker (`src/sparrow_core_bridge.py`) picks the bridge the wrapper
+  would run. That is the legacy one while its row is unparked and it has a token. Otherwise it is the
+  named primary lane. Otherwise there is none (with no token and no named primary, the worker is
+  simply absent and sparrowd says why once).
+- The legacy bridge gets the wrapper's own environment (`src/launchd/gateway-bridge-lib.sh`, which
+  the wrapper sources), with the proactive room emptied once a named row holds the primary. A named
+  primary gets its lane's `launch_env`, logs to `logs/remote-gateway-bridge.<instance>.log` and
+  writes its launch record.
+- The worker evicts a stray bridge of this checkout first, then execs `src/remote-gateway-bridge.py`
+  in place. The process carries the same argv and command line as the wrapper's child, so `pgrep`,
+  health-check and the eviction helper find it as before. It keeps the owner DM, the device env and
+  the proactive room.
+- sparrowd restarts the worker when the connection it serves changes: a primary move, the legacy
+  row parked or unparked, a rotated token file, or the row's token_ref, gateway URL or agent. Exit 75
+  (the bridge's stand-down) holds it until one of those changes, or until a later scan finds the lease
+  free, which re-arms it. While held, sparrowd's `health` reports unhealthy and health-check's
+  gateway-bridge check warns that this install's bridge is not serving. Any other exit is restarted
+  with backoff (at most 60 s).
+- Each restart raises the wrapper's alert, within the same deliberate-restart window and cooldown.
+  There are two exceptions: a poll stall (rc 69), and a start that failed before any bridge ran
+  (rc 78, for example a named primary with no recorded agent).
+- One supervisor per bridge. A stray bridge of this checkout whose parent is gone is evicted. A
+  bridge that another live process keeps (an app's keepalive, the gate-off wrapper) is refused, and
+  the worker retries until that supervisor is gone.
+- sparrowd reads the gate itself on every scan, so removing the file stops the core in whichever
+  sparrowd runs it, including one that startup's fallback started outside the launchd job.
+- The bridge is told sparrowd restarts it (`SUTANDO_BRIDGE_RESTART_OWNER=sparrowd`) unless its
+  environment already names a restart owner (the plist names `launchd`). Its stall exits stay armed
+  either way.
+- While sparrowd's core serves a named primary, it records that in `state/sparrowd/core.json`.
+  The lane keeper then leaves that lane to it, as for a declared bridge: while any process holds the
+  lane's lease, and for `DECLARED_BRIDGE_GRACE_S` (180 s) after it first finds nobody holding it.
+
+Cut-over (on the host, by its owner):
+
+1. `date +%s > "$(bash scripts/sutando-config.sh workspace)/state/channel-bridge-supervisor/deliberate-restart"`
+   so that the restart raises no alert.
+2. `mkdir -p "$(bash scripts/sutando-config.sh workspace)/state/sparrowd" && touch "$(bash scripts/sutando-config.sh workspace)/state/sparrowd/core.enabled"`.
+3. `launchctl kickstart -k gui/$(id -u)/com.sutando.gateway-bridge`. The gateway log then shows
+   `core gate set: sparrowd runs the gateway bridge`, sparrowd's `worker core-gateway-bridge: started`,
+   and the bridge's own `acquired workspace poller lock`.
+4. Check with a live round trip: a message in, the reply delivered.
+
+Undo: `rm "$(bash scripts/sutando-config.sh workspace)/state/sparrowd/core.enabled"`, stamp the
+deliberate restart as in step 1, then `launchctl kickstart -k gui/$(id -u)/com.sutando.gateway-bridge`.
+The wrapper stops sparrowd with its bridge and goes back to launching the bridge itself. Any other
+`sparrowd.py --core` drops its core on its next scan (within 30 s).
 
 ## Known servers
 

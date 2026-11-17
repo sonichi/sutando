@@ -53,6 +53,8 @@ from connections import worker_agents_dir  # noqa: E402
 
 WRITTEN_BY = f"{CLAUDE_LOCAL.command} install"
 WRITERS = (WRITTEN_BY, f"{CODEX_LOCAL_COMMAND} install", worker_lane.WRITTEN_BY)
+# worker_lane.status reads this line from a checkout to tell whether its sparrowd can run a worker declaration.
+ACCEPTS_WORKER_DECLARATIONS = 1
 BRIDGE_MODULE = "ag2_sparrow.remote_gateway_bridge"
 LANE_LOADER = _SRC / "remote-gateway-bridge.py"
 SUFFIX = ".bridge"
