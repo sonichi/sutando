@@ -19,13 +19,14 @@ for _p in (str(_SRC), str(_REPO / "packages" / "ag2-sparrow")):
 
 from workspace_default import resolve_workspace  # noqa: E402
 from ag2_sparrow import _dirs  # noqa: E402
+from connections import worker_agents_dir  # noqa: E402
 
 BRIDGE_HOST = "sparrowd"
 
 
 def main(argv=None) -> int:
     ws = resolve_workspace()
-    _dirs.set_dirs(state_dir=ws / "state", agents_dir=ws / "agents", bridge_host=BRIDGE_HOST)
+    _dirs.set_dirs(state_dir=ws / "state", agents_dir=worker_agents_dir(ws), bridge_host=BRIDGE_HOST)
     from ag2_sparrow.adapters.claude_code.cli import main as cli_main
     return cli_main(argv)
 

@@ -787,7 +787,7 @@ def _iter_archived_result_candidates(results_dir: Path, task_id: str) -> Iterato
     yield from reversed(_epoch_suffixed(archive, task_id))
 
 
-def iter_result_candidates(results_dir: Path, task_id: str) -> Iterator[Path]:
+def iter_result_candidates(results_dir: Path, task_id: str, *, include_live: bool = True) -> Iterator[Path]:
     """Every EXISTING result file for `task_id`, in lookup precedence: the live
     `results/<id>.txt`, then each archive layout in `find_archived_result`
     order, newest first within a layout.
@@ -797,11 +797,12 @@ def iter_result_candidates(results_dir: Path, task_id: str) -> Iterator[Path]:
     live file hiding a ready archived body) walks it until a body is ready.
     Existence is all it checks — readiness belongs to `delivery.readiness`.
     Rejects malformed ids rather than globbing with them (traversal gate).
+    `include_live=False` walks the archive layouts only.
     """
     if not valid_archive_lookup_id(task_id):
         return
     live = Path(results_dir) / f"{task_id}.txt"
-    if live.is_file():
+    if include_live and live.is_file():
         yield live
     yield from _iter_archived_result_candidates(results_dir, task_id)
 
@@ -889,11 +890,12 @@ def find_result(results_dir: Path, task_id: str) -> Path | None:
     return next(iter_result_candidates(results_dir, task_id), None)
 
 
-def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
+def find_archived_task(tasks_dir: Path, task_id: str, *, include_live: bool = True) -> Path | None:
     """Locate a task file across the live dir, the legacy flat archive, and
     the month-partitioned archive — the same candidate set task-bridge's
     `_isVoiceTask` walks. Returns the first existing path or None. Rejects
     malformed ids rather than globbing with them (traversal gate).
+    `include_live=False` skips the live dir: archives only.
 
     The month scan uses `os.scandir` and filters on the NAME before asking
     whether the entry is a directory. The archive root holds one file per
@@ -919,7 +921,7 @@ def find_archived_task(tasks_dir: Path, task_id: str) -> Path | None:
     """
     if not valid_archive_lookup_id(task_id):
         return None
-    dirs = [tasks_dir, tasks_dir / "processed", tasks_dir / "archive"]
+    dirs = ([tasks_dir] if include_live else []) + [tasks_dir / "processed", tasks_dir / "archive"]
     archive_root = tasks_dir / "archive"
     try:
         with os.scandir(archive_root) as entries:

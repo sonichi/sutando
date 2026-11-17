@@ -139,6 +139,15 @@ def worker_published_path(path: str | Path, environ=None, workspace=None) -> Pat
     return path.with_name(connections.session_proactive_name(path.name, environ, workspace))
 
 
+def _task_home(task_id: str, workspace: Path) -> dict:
+    """The task's folders (`connections.task_home`); the shared ones in a copy without the engine's `connections`."""
+    try:
+        import connections
+    except ImportError:
+        return {"tasks": workspace / "tasks", "results": workspace / "results"}
+    return connections.task_home(task_id, workspace)
+
+
 def _unrouted_cron_task(path: str | Path) -> str | None:
     """The task id when `path` is the live result of a `source: cron` task naming no destination.
 
@@ -153,9 +162,10 @@ def _unrouted_cron_task(path: str | Path) -> str | None:
         return None
     try:
         workspace = wsd.resolve_workspace(migrate=False).resolve()
-        if target.parent != workspace / "results":
+        home = _task_home(task_id, workspace)
+        if target.parent not in (workspace / "results", home["results"].resolve()):
             return None
-        tasks_dir = workspace / "tasks"
+        tasks_dir = home["tasks"]
         task_file = (archive.find_task_file(tasks_dir, task_id)
                      or protocol.find_archived_task(tasks_dir, task_id))
         if task_file is None:

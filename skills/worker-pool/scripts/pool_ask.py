@@ -152,13 +152,17 @@ def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
     if rid == sender:
         raise ValueError("that is you")
     task_id = f"task-{secrets.token_hex(9)}"
-    if allow_handoff and skill_config.enabled(HANDOFF_FLAG, MANIFEST):
-        ph = _sibling("pool_handoff")
+    ph = _sibling("pool_handoff")
+    # Read once: every decision below and the folder written use this one answer.
+    dirs = ph.own_dirs(ws, rid) if rid != pr.CORE else None
+    own = dirs is not None
+    if allow_handoff and (own or skill_config.enabled(HANDOFF_FLAG, MANIFEST)):
         route = ph.route_for(ws, rid, sender=sender, core=pr.CORE, tier=tier,
-                             relayed_from=relayed_from, parent_task=parent_task)
+                             relayed_from=relayed_from, parent_task=parent_task, own=own)
         if route is not None:
             return handoff_ask(ws, route, task_id, rid, sender, question, wait_s=wait_s, runner=runner)
-    tasks = ws / "tasks"
+    # Only a supervision probe (no hand-off allowed) reaches an own-dir worker here: into its own inbox.
+    tasks = Path(dirs[0]) if own else ws / "tasks"
     tasks.mkdir(parents=True, exist_ok=True)
     tmp = tasks / f".{task_id}.txt.tmp"
     tmp.write_text(compose(task_id, rid, question, sender=sender, wait=wait_s > 0, tier=tier,
@@ -172,7 +176,7 @@ def ask(workspace, to: str, question: str, *, wait_s: float = 0.0,
         label = handoffs.label_for("pool", to, verified=(row or {}).get("label"))
         out["handoff_id"] = handoffs.open_handoff(ws, parent_task, "pool", task_id, label,
                                                   holds=True, parent_generation=parent_generation)
-    if rid != pr.CORE:
+    if rid != pr.CORE and not own:
         # Routed here as well as by the watcher's own pass: the router is idempotent,
         # so whichever runs second reports `already` and delivers nothing twice.
         task = {"id": task_id, "source": SOURCE, "requested_worker": rid}
