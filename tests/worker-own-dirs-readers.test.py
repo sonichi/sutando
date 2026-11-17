@@ -123,6 +123,19 @@ class HistoryAcrossTheSwitch(Base):
         self.assertIsNone(task_lookup.find_task(self.ws, OWN_ID))
         self.assertIsNone(task_lookup.find_result(self.ws, OWN_ID))
 
+    def test_the_current_homes_archive_wins_over_the_other_homes(self):
+        for tasks, results, body in ((self.own / "tasks", self.own / "results", "current"),
+                                     (self.ws / "tasks", self.ws / "results", "other")):
+            (tasks / "archive").mkdir(exist_ok=True)
+            (results / "archive").mkdir(exist_ok=True)
+            self.task(tasks / "archive", OWN_ID, f"task: {body}\n")
+            self.result(results / "archive", OWN_ID, f"{body}\n")
+        self.assertEqual(task_lookup.find_task(self.ws, OWN_ID).parent, self.own / "tasks" / "archive")
+        self.assertEqual(task_lookup.find_result(self.ws, OWN_ID).read_text(), "current\n")
+        self.assertEqual(task_lookup.find_ready_result(self.ws, OWN_ID).read_text(), "current\n")
+        self.assertEqual([p.read_text() for p in task_lookup.result_candidates(self.ws, OWN_ID)],
+                         ["current\n", "other\n"])
+
     def test_a_core_task_or_a_worker_without_an_agent_has_no_other_home(self):
         self.assertIsNone(C.task_other_home(CORE_ID, self.ws))
         self.assertIsNone(task_lookup.find_other_archived_ready_result(self.ws, CORE_ID))
