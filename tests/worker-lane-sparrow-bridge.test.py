@@ -477,6 +477,32 @@ class TheLaneKeeper(Base):
                          "no bridge took the lease: the lane serves the worker rather than nothing")
         self.assertTrue(any("its declared bridge took no lease" in line for line in self.said), self.said)
 
+    def test_a_failed_start_after_the_grace_backs_off_without_a_new_grace(self):
+        lane = self.row["instance"]
+        self.declare()
+        tried = []
+
+        def boom(argv, env, log_path):
+            tried.append(env["GATEWAY_INSTANCE"])
+            raise OSError("no python")
+
+        def keep(now):
+            C.keep_lanes_up(repo=self.ws / "repo", logs_dir=self.ws / "logs", environ={}, workspace=self.ws,
+                            vault=self.vault, spawn=boom, log=lambda line: None, now=now)
+        grace = C.DECLARED_BRIDGE_GRACE_S
+        keep(1000.0)
+        keep(1000.0 + grace)
+        self.assertEqual(tried.count(lane), 1, "the fallback start, once the grace is out")
+        first = C.lane_retry_wait(1)
+        keep(1000.0 + grace + first - 1)
+        self.assertEqual(tried.count(lane), 1, "inside the backoff: no try")
+        keep(1000.0 + grace + first)
+        self.assertEqual(tried.count(lane), 2, "the backoff's next try, with no fresh grace")
+        state = json.loads(C.lane_keeper_state_path(self.ws).read_text())[lane]
+        self.assertEqual((state["failures"], state["declared_unheld_since"]), (2, 1000.0))
+        keep(1000.0 + grace + first + C.lane_retry_wait(2))
+        self.assertEqual(tried.count(lane), 3, "the wait doubles, as for any lane")
+
     def test_a_declared_bridge_holding_the_lease_keeps_the_lane_down(self):
         from _helpers import bridge_lease
         lane = self.row["instance"]

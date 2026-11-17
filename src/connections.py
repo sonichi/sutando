@@ -3479,6 +3479,8 @@ def _keep_lane(inst: str, state: dict, now: float, say: Callable[[str], None], *
         except ConnectionsError as e:
             reason = _launch_record(inst, workspace).get("reason") if isinstance(e, LaunchFailed) else None
             state[inst] = _lane_retry(due, now)
+            if declared:  # the grace is one window: a failed fallback start backs off, never waits again
+                state[inst]["declared_unheld_since"] = since
             say(f"lane {inst} is down and did not start ({reason or _error_reason(e)}); "
                 f"next try in {state[inst]['next_try'] - now:.0f}s")
             return
