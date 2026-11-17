@@ -2975,6 +2975,11 @@ def _token_file(entry: Mapping[str, str], environ: Mapping[str, str]) -> str:
     return str(path) if path.is_file() else ""
 
 
+def lane_token_file(entry: Mapping[str, str], environ: Optional[Mapping[str, str]] = None) -> str:
+    """The file a plan entry's bridge re-reads its token from (REMOTE_TASK_TOKEN_FILE); "" when none."""
+    return _token_file(entry, os.environ if environ is None else environ)
+
+
 def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]] = None, *,
                vault=None) -> dict:
     """The bridge's environment for one plan entry: the token from the env var of its token_ref,
@@ -3159,6 +3164,12 @@ def _record_launch(instance: str, workspace: Optional[Path], **fields) -> dict:
             record["last_repo"] = prev.get("repo") or prev.get("last_repo")
     _atomic_json(launch_record_path(instance, workspace), record)
     return record
+
+
+def record_supervised_start(instance: str, *, pid: int, repo: Path, workspace: Optional[Path] = None) -> dict:
+    """The launch record of a lane another supervisor starts in place (sparrowd's core), so its status
+    reads the start and not an earlier failed one; its lease is proven later, by the lease itself."""
+    return _record_launch(instance, workspace, ok=True, pid=pid, lease="supervised", repo=str(Path(repo).resolve()))
 
 
 def _launch_record(instance: str, workspace: Optional[Path]) -> dict:
@@ -3553,11 +3564,12 @@ def _keep_lane(inst: str, state: dict, now: float, say: Callable[[str], None], *
             return
         due = state.get(inst) or {}
         declared = _declared_bridge_serves(entry, workspace)
-        if declared:
+        owner = "its declared bridge" if declared else "sparrowd's core" if _core_serves(entry, workspace) else ""
+        if owner:
             since = due.get("declared_unheld_since") if isinstance(due, dict) else None
             since = since if isinstance(since, (int, float)) and not isinstance(since, bool) else now
             if now - since < DECLARED_BRIDGE_GRACE_S:
-                state[inst] = {"declared_unheld_since": since}  # the declared bridge's turn to take the lease
+                state[inst] = {"declared_unheld_since": since}  # its supervisor's turn to take the lease
                 return
         try:
             if float(due.get("next_try") or 0) > now:
@@ -3570,21 +3582,21 @@ def _keep_lane(inst: str, state: dict, now: float, say: Callable[[str], None], *
         except ConnectionsError as e:
             reason = _launch_record(inst, workspace).get("reason") if isinstance(e, LaunchFailed) else None
             state[inst] = _lane_retry(due, now)
-            if declared:  # the grace is one window: a failed fallback start backs off, never waits again
+            if owner:  # the grace is one window: a failed fallback start backs off, never waits again
                 state[inst]["declared_unheld_since"] = since
             say(f"lane {inst} is down and did not start ({reason or _error_reason(e)}); "
                 f"next try in {state[inst]['next_try'] - now:.0f}s")
             return
         state.pop(inst, None)
-        if rec.get("lease") == "held" and declared:
-            say(f"lane {inst}: its declared bridge took no lease in {DECLARED_BRIDGE_GRACE_S:.0f}s; "
+        if rec.get("lease") == "held" and owner:
+            say(f"lane {inst}: {owner} took no lease in {DECLARED_BRIDGE_GRACE_S:.0f}s; "
                 f"started the lane instead (pid {rec.get('pid')})")
         elif rec.get("lease") == "held":
             say(f"lane {inst} was down; started it (pid {rec.get('pid')})")
 
 
-# How long a lane whose worker has a declared bridge stays down with no lease holder before the keeper
-# starts the lane anyway: past sparrowd's longest restart backoff and its rescan.
+# How long a lane another supervisor serves (a worker's declared bridge, sparrowd's core) stays down with
+# no lease holder before the keeper starts the lane anyway: past sparrowd's longest restart backoff and its rescan.
 DECLARED_BRIDGE_GRACE_S = 180.0
 
 
@@ -3596,6 +3608,18 @@ def _declared_bridge_serves(entry: Mapping[str, object], workspace: Optional[Pat
     try:
         import worker_lane
         return worker_lane.declared_bridge(str(entry["worker"]), _workspace(workspace))
+    except Exception:  # noqa: BLE001 - an unanswerable check never keeps a lane down
+        return False
+
+
+def _core_serves(entry: Mapping[str, object], workspace: Optional[Path]) -> bool:
+    """Whether a live sparrowd supervises this primary lane as its core (`sparrow_core_bridge.claims`); a
+    check that cannot be made answers False, and the bridge lease still keeps one poller."""
+    if not entry.get("primary"):
+        return False
+    try:
+        import sparrow_core_bridge
+        return sparrow_core_bridge.claims(str(entry["instance"]), _workspace(workspace))
     except Exception:  # noqa: BLE001 - an unanswerable check never keeps a lane down
         return False
 

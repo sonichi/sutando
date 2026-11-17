@@ -73,7 +73,7 @@ echo "### the wrapper does not launch beside a straggler it could not evict"
 # The straggler and the wrapper's child share the bridge script; STRAGGLER picks the role.
 W="$TMP/wrap"; mkdir -p "$W/src/launchd" "$W/scripts" "$W/ws" "$W/shims"
 W="$(cd "$W" && pwd -P)"
-cp "$REPO_ROOT/src/launchd/gateway-bridge-wrapper.sh" "$REPO_ROOT/src/launchd/evict-own-bridge.sh" "$W/src/launchd/"
+cp "$REPO_ROOT/src/launchd/gateway-bridge-wrapper.sh" "$REPO_ROOT/src/launchd/gateway-bridge-lib.sh" "$REPO_ROOT/src/launchd/evict-own-bridge.sh" "$W/src/launchd/"
 printf 'import os,signal,sys,time\nif os.environ.get("STRAGGLER"):\n    signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(120)\nopen("%s/launched","w").close(); sys.exit(75)\n' \
   "$W" > "$W/src/remote-gateway-bridge.py"
 printf 'import time\nwhile True: time.sleep(0.2)\n' > "$W/src/sparrowd.py"
