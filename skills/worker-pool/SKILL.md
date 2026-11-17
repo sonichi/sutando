@@ -230,6 +230,26 @@ python3 skills/worker-pool/scripts/pool_identity.py rotate <worker> --device-flo
   work is left running and the JSON line says `"seat": "deferred"`; run the reseat once it is done. A seat whose
   `s-space` calls fail with "descriptor changed during the call" is this case: its identity changed; reseat it.
 
+### Handing its rooms to its own agent
+
+Once a worker has its own agent, the rooms bound to it can move from the core's agent to that agent, on the
+owner's word: the worker's agent joins, the core's agent leaves, and the binding is dropped, so the room's work
+reaches the worker's agent directly.
+
+```bash
+python3 skills/worker-pool/scripts/pool_identity.py rooms <worker>
+python3 skills/worker-pool/scripts/pool_identity.py hand-room <worker> --room <room> [--wait SECONDS]
+```
+
+- `rooms` prints the rooms bound to the worker, one per room however many server names its bindings carry.
+- `hand-room` invites the worker's agent as the core's agent, waits up to SECONDS for the room to list it
+  joined, confirms it again, has the core leave, and drops every binding naming that room. It prints one JSON
+  line: `handed`; `waiting` (invited but not joined, or an invitation or leave held for the owner's approval:
+  run it again); `skipped` (the invitation was refused, for example by a direct chat or the core's power level:
+  the core stays and the binding is kept); `not_bound`; or `failed` (exit 1, the binding kept).
+- The core never leaves a room the worker's agent is not confirmed in. A rerun does not invite a member again,
+  and when the core already left, the worker's own agent confirms it is in the room before the binding goes.
+
 ### Creating the agent without a pasted token
 
 The core can create a worker's agent itself, so nobody pastes a token. The server side is the `agent.create`

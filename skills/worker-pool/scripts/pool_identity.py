@@ -19,6 +19,8 @@ worker, and posts nothing proactively. Retiring the worker (pool_manage retire) 
     python3 pool_identity.py [--workspace WS] provision-abort <worker>
     python3 pool_identity.py [--workspace WS] retire-remote <worker> [--local-anyway]
     python3 pool_identity.py [--workspace WS] card-reply --task-file PATH
+    python3 pool_identity.py [--workspace WS] rooms <worker>
+    python3 pool_identity.py [--workspace WS] hand-room <worker> --room ROOM [--wait SECONDS]
 
 TOKEN is the agent's access token from its settings page in AG2 Space. Leave it out to type it
 at a hidden prompt, or pass '-' to read it from stdin; it is stored in the secret vault, never in
@@ -39,6 +41,11 @@ the core's own agent, asks again until the owner has approved it, and redeems th
 `provision-finish` redeems a claim an earlier call already returned, for the agent id it returned.
 Both print the agent id and a status. `retire-remote` removes the identity once its server rejects
 the token. Each prints one JSON line and never a secret.
+
+`rooms` lists the rooms bound to a worker, one line of JSON. `hand-room` hands one of them from the
+core's agent to the worker's own agent (pool_room_handoff.py): the core invites it, waits up to SECONDS
+for it to join, leaves, and drops the binding; the core never leaves a room the worker's agent is not
+confirmed in. It prints one JSON line whose `status` is handed, waiting, skipped, not_bound or failed.
 """
 from __future__ import annotations
 
@@ -55,6 +62,7 @@ import agent_card
 import connections
 import pool_device_connect
 import pool_provision
+import pool_room_handoff
 import pool_roster as pr
 from workspace_default import resolve_workspace
 
@@ -296,6 +304,19 @@ def cmd_card_reply(args, ws: Path) -> int:
     return 0 if out["status"] == "started" else 1
 
 
+def cmd_rooms(args, ws: Path) -> int:
+    wid = live_worker(ws, args.worker)
+    server = str(pool_provision.core_lane(ws, None).get("server") or "")
+    print(json.dumps({"worker": wid, "rooms": pool_room_handoff.bound_rooms(ws, wid, server)}, sort_keys=True))
+    return 0
+
+
+def cmd_hand_room(args, ws: Path) -> int:
+    out = pool_room_handoff.hand_room(live_worker(ws, args.worker), args.room, workspace=ws, wait_s=args.wait)
+    print(json.dumps(out, sort_keys=True))
+    return 1 if out["status"] == "failed" else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="pool_identity", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -331,6 +352,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("retire-remote"); s.add_argument("worker"); s.add_argument("--local-anyway", action="store_true")
     s.set_defaults(fn=cmd_retire_remote)
     s = sub.add_parser("card-reply"); s.add_argument("--task-file", required=True); s.set_defaults(fn=cmd_card_reply)
+    s = sub.add_parser("rooms"); s.add_argument("worker"); s.set_defaults(fn=cmd_rooms)
+    s = sub.add_parser("hand-room"); s.add_argument("worker"); s.add_argument("--room", required=True)
+    s.add_argument("--wait", type=float, default=0.0); s.set_defaults(fn=cmd_hand_room)
     return p
 
 
