@@ -735,14 +735,25 @@ records the task as the worker's (`--attribute-only`), and the worker's stamped 
 in the shared `results/` are moved into its own. Its session reads a plain inbox of task files and answers in
 its own results (`spawn_worker.inbox_env`, `result_publish`). A worker without the field is unchanged.
 
-`python3 src/worker_lane.py migrate-dirs --worker <id>` switches a worker over: it creates the folders, sets
-the field (which restarts a declared bridge), has the declared task-event handler empty the worker's
-`deliveries/<id>/` folder under the router's locks (a task its own lane queued moves into its tasks folder
-and its sentinel is archived; any other is handed back to the core and touched so the core's watcher picks
-it up; an answered one keeps its sentinel), then moves into its own folders any task its own lane queued
-that is still in the shared `tasks/` and the worker's unclaimed live results. It prints one JSON line and is idempotent: a refusal says why and a re-run finishes. It restarts no
-session: respawn the worker so its session takes the new inbox. `--undo` clears the field and returns the
-worker's live tasks (touched) and results to the shared folders.
+`python3 src/worker_lane.py migrate-dirs --worker <id>` shows what switching the worker would do (its
+folders, who holds its lane, what is delivered to it, and which tasks and results would move) and writes
+nothing. With `--apply` it switches the worker over:
+1. It finds the declared task-event handler first. A failed lookup, or work delivered with no handler to
+   move it, refuses before anything changes.
+2. It writes the field and creates the folders (a private agent root), and relaunches the worker's lane
+   under the record lock (a wrapper lane is stopped so the lane keeper starts it on the new folders; a
+   declared bridge is waited for until sparrowd has replaced it).
+3. It has the handler empty the worker's `deliveries/<id>/` under the router's locks. A task its own lane
+   queued moves into its tasks folder and its sentinel is archived. A core task the worker never accepted is
+   handed back (attribution first, then the sentinel) and touched so the core's watcher picks it up. One it
+   accepted or answered stays the worker's until `pool_manage.py retire --hand-off` once its session is gone.
+4. It moves into the worker's folders any task its own lane queued that is still in the shared `tasks/`,
+   and the worker's unclaimed live results.
+
+It prints one JSON line and is idempotent: a refusal, or a file that could not be moved, says why, and a
+re-run finishes. It restarts no session: respawn the worker so its session takes the new inbox.
+`--undo --apply` clears the field, relaunches the lane, and returns the worker's live tasks (touched; one
+already answered stays) and results to the shared folders.
 
 ## Known servers
 

@@ -27,7 +27,8 @@ Run as a script: `declare --worker <w>` writes the declaration sparrowd runs tha
 from (`<workspace>/agents/<segment>.bridge/worker.json`), `withdraw --worker <w>` removes it, and
 `status --worker <w>` prints one JSON line: whether it is declared, which process holds the lane's lease
 (`held_by`: the declared bridge under sparrowd, another process, none) and each running sparrowd.
-`migrate-dirs --worker <w>` switches a worker onto its own folders: it creates them, sets `dirs: "own"`,
+`migrate-dirs --worker <w>` shows what a switch would do; with `--apply` it switches the worker onto its
+own folders: it creates them, sets `dirs: "own"`,
 has the declared handler empty the worker's deliveries folder (its own lane's tasks move into its tasks
 folder, the core's are handed back) and moves its unclaimed live results; `--undo` switches it back and
 returns its live tasks and results to the shared folders. Both are idempotent. Each takes `--workspace`.
@@ -461,18 +462,33 @@ def status(worker: str, workspace, procs=None) -> dict:
 MIGRATE_TIMEOUT_S = 120
 
 
-def _move_live(src_dir, dst_dir, names) -> "list[str]":
-    """Move each of `names` from `src_dir` to `dst_dir` without replacing a file; returns those moved."""
+def _move_live(src_dir, dst_dir, names, failed: "list[str]") -> "list[str]":
+    """Move each of `names` from `src_dir` to `dst_dir` without replacing a file; returns those moved. A
+    name taken at the destination, or already gone, is left; any other failure is added to `failed`."""
     import undelivered_quarantine
     moved = []
     for name in names:
         try:
             Path(dst_dir).mkdir(parents=True, exist_ok=True)
             undelivered_quarantine.rename_noreplace(Path(src_dir) / name, Path(dst_dir) / name)
-        except OSError:
+        except FileExistsError as e:
+            if undelivered_quarantine.no_primitive(e):
+                failed.append(f"{name}: no no-replace rename on this platform")
+            continue
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            failed.append(f"{name}: {type(e).__name__}: {e}")
             continue
         moved.append(name)
     return moved
+
+
+def _failed(out: dict, failed: "list[str]") -> str:
+    if not failed:
+        return ""
+    out["move_failures"] = failed
+    return f"{len(failed)} file(s) could not be moved; re-run to finish"
 
 
 def _live_txt(folder) -> "list[str]":
@@ -560,12 +576,14 @@ def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=s
         if why:
             return out, why
         from delivery.task_dispatch import has_ready_result
-        moved = _move_live(tasks, ws / "tasks", [n for n in _live_txt(tasks) if not has_ready_result(results, n)])
+        failed: "list[str]" = []
+        moved = _move_live(tasks, ws / "tasks", [n for n in _live_txt(tasks) if not has_ready_result(results, n)],
+                           failed)
         for name in moved:
             with contextlib.suppress(OSError):
                 os.utime(ws / "tasks" / name)  # the core's watcher picks it up again
-        out.update(tasks_returned=moved, results_returned=_move_live(results, ws / "results", _live_txt(results)))
-        return out, ""
+        out.update(tasks_returned=moved, results_returned=_move_live(results, ws / "results", _live_txt(results), failed))
+        return out, _failed(out, failed)
     # Nothing is committed until it is known who can move the worker's delivered work.
     handler, problem = handler_lookup(ws) if handler is None else (handler, "")
     if problem:
@@ -600,9 +618,52 @@ def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=s
             out["deliveries"] = json.loads(done.stdout.strip().splitlines()[-1])
         except (ValueError, IndexError):
             out["deliveries"] = done.stdout.strip()[-300:]
-    out["tasks_moved"] = _move_live(ws / "tasks", tasks, _queued_for(worker, ws))
+    failed: "list[str]" = []
+    out["tasks_moved"] = _move_live(ws / "tasks", tasks, _queued_for(worker, ws), failed)
     out["results_moved"] = adopt_stray_results(worker, ws, results, lease=False)
     out["proactive_moved"] = adopt_stray_proactive(worker, ws / "results", results, lease=False)
+    return out, _failed(out, failed)
+
+
+def preview_migrate(worker: str, workspace, undo: bool = False, procs=None) -> "tuple[dict, str]":
+    """What `migrate_dirs` would do, writing nothing: the folders, the lane's holder and the files it would
+    move; ('', why) parts as `migrate_dirs` reports a refusal it can already see."""
+    from connections import BridgeLeaseIndeterminate, bridge_pid, task_home, worker_dirs, worker_identity, worker_root
+    from delivery.task_dispatch import WorkerHoldUnreadable, owned_task_ids
+    from proactive_routing import lane_claims_proactive
+    ws = Path(workspace)
+    row = worker_identity(worker, ws) or {}
+    mxid = str(row.get("agent_mxid") or "").strip()
+    if not mxid:
+        return {"worker": worker, "applied": False}, f"worker {worker} has no agent identity row"
+    root = worker_root(mxid, ws)
+    tasks, results = root / "tasks", root / "results"
+    out = {"worker": worker, "tasks": str(tasks), "results": str(results), "undo": undo, "applied": False,
+           "own_now": worker_dirs(worker, ws) is not None}
+    try:
+        pid = bridge_pid(str(row.get("instance") or ""), ws) if row.get("instance") else 0
+    except BridgeLeaseIndeterminate:
+        pid = -1
+    decl, _why = _declaration_for(worker, ws)
+    out["lane"] = ("unknown" if pid < 0 else "not-running" if not pid else
+                   held_by(pid, processes() if procs is None else procs, decl["path"]) if decl else "other")
+    if undo:
+        out.update(would_return_tasks=_live_txt(tasks), would_return_results=_live_txt(results))
+        return out, ""
+    handler, problem = handler_lookup(ws)
+    out["handler"] = handler or ""
+    try:
+        out["delivered"] = owned_task_ids(ws / "deliveries", worker)
+    except WorkerHoldUnreadable as e:
+        return out, str(e)
+    out["would_move_tasks"] = _queued_for(worker, ws)
+    out["would_move_results"] = [n for n in _live_txt(ws / "results") if
+                                 (task_home(Path(n).stem, ws)["worker"] == worker if n.startswith("task-")
+                                  else n.startswith("proactive-") and lane_claims_proactive(n, worker))]
+    if problem:
+        return out, f"{problem}; nothing would be switched"
+    if not handler and out["delivered"]:
+        return out, f"{len(out['delivered'])} task(s) delivered to {worker} but no task-event handler can move them"
     return out, ""
 
 
@@ -626,13 +687,18 @@ def main(argv=None, workspace=None, vault=None, procs=None, run=subprocess.run) 
     p.add_argument("--worker", required=True)
     p.add_argument("--workspace", type=Path, default=None)
     p.add_argument("--undo", action="store_true", help="migrate-dirs: back onto the shared folders")
+    p.add_argument("--apply", action="store_true", help="migrate-dirs: do it (without, only show what it would do)")
     args = p.parse_args(argv)
     workspace = args.workspace or workspace
     if workspace is None:
         from workspace_default import resolve_workspace
         workspace = resolve_workspace()
     if args.action == "migrate-dirs":
-        out, why = migrate_dirs(args.worker, workspace, args.undo, run=run, procs=procs)
+        if args.apply:
+            out, why = migrate_dirs(args.worker, workspace, args.undo, run=run, procs=procs)
+            out["applied"] = True
+        else:
+            out, why = preview_migrate(args.worker, workspace, args.undo, procs=procs)
         print(json.dumps(dict(out, ok=not why, **({"why": why} if why else {})), sort_keys=True))
         return 1 if why else 0
     if args.action == "status":

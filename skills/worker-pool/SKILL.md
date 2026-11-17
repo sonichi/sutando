@@ -191,7 +191,7 @@ the task is its worker's when it reaches `tasks/` and the core's watcher, which 
 see `docs/connections.md`, "In a pool worker's session".
 
 A worker with its own agent can be switched onto its own task and result folders
-(`python3 src/worker_lane.py migrate-dirs --worker <id>`, `--undo` to switch back; then respawn it): its lane
+(`python3 src/worker_lane.py migrate-dirs --worker <id>` previews, `--apply` does it, `--undo --apply` switches back; then respawn it): its lane
 queues straight into `<workspace>/agents/<segment>/tasks`, nothing is routed through `deliveries/<id>/`, and
 its session answers in that folder's `results/`; see `docs/connections.md`, "A worker on its own folders".
 

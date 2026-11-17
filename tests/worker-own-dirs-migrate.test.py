@@ -194,6 +194,21 @@ class TheHandlerStep(Base):
         self.assertGreater((self.ws / "tasks" / f"{self.core}.txt").stat().st_mtime, 1)
         self.assertEqual(self.handle(), (0, {"kept": {}, "moved": [], "returned": []}))
 
+    def test_a_core_task_the_worker_accepted_stays_its_own(self):
+        self.deliver(self.core, ".accepted")
+        rc, out = self.handle()
+        self.assertEqual(out["kept"], {self.core: "accepted"})
+        self.assertTrue((pd.deliveries_dir(self.ws, W) / f"{self.core}.accepted").is_file())
+        self.assertEqual(pat.worker_for_task(self.ws, self.core), W)
+
+    def test_an_interrupted_hand_back_is_finished_by_a_re_run(self):
+        self.deliver(self.core)
+        with mock.patch.object(pd, "_withdraw_locked", side_effect=OSError("disk")):
+            self.assertEqual(self.handle()[0], 1)
+        self.assertIsNone(pat.worker_for_task(self.ws, self.core), "attribution went first")
+        self.assertTrue((pd.deliveries_dir(self.ws, W) / f"{self.core}.txt").is_file(), "the sentinel stays")
+        self.assertEqual(self.handle(), (0, {"kept": {}, "moved": [], "returned": [self.core]}))
+
     def test_an_answered_core_task_and_a_taken_name_are_kept(self):
         self.deliver(self.mine)
         self.deliver(self.core)
@@ -202,7 +217,7 @@ class TheHandlerStep(Base):
         (self.own / "tasks").mkdir(parents=True)
         (self.own / "tasks" / f"{self.mine}.txt").write_text("already here")
         rc, out = self.handle()
-        self.assertEqual(out["kept"], {self.core: "answered", self.mine: "own-folder-holds-the-name"})
+        self.assertEqual(out["kept"], {self.core: "completed", self.mine: "own-folder-holds-the-name"})
         self.assertEqual((self.own / "tasks" / f"{self.mine}.txt").read_text(), "already here")
         self.assertTrue((self.ws / "tasks" / f"{self.mine}.txt").is_file())
 
@@ -253,6 +268,30 @@ class Undo(Base):
         out, _ = self.migrate(undo=True)
         self.assertEqual(out["results_returned"], [])
         self.assertEqual((self.ws / "results" / "task-x.txt").read_text(), "shared")
+
+
+class MoveFailures(Base):
+    def test_a_failed_move_is_reported_and_asks_for_a_re_run(self):
+        import undelivered_quarantine
+        (self.ws / "tasks").mkdir(parents=True)
+        (self.ws / "tasks" / f"{self.mine}.txt").write_text("t")
+        with mock.patch.object(undelivered_quarantine, "rename_noreplace", side_effect=PermissionError("denied")):
+            out, why = self.migrate()
+        self.assertIn("1 file(s) could not be moved; re-run", why)
+        self.assertIn(f"{self.mine}.txt: PermissionError", out["move_failures"][0])
+        out, why = self.migrate()
+        self.assertEqual((why, out["tasks_moved"]), ("", [f"{self.mine}.txt"]))
+
+    def test_undo_reports_a_failed_move_too(self):
+        import errno
+        import undelivered_quarantine
+        self.migrate()
+        (self.own / "results" / "task-x.txt").write_text("r")
+        nothing = FileExistsError(errno.ENOTSUP, "no primitive")
+        with mock.patch.object(undelivered_quarantine, "rename_noreplace", side_effect=nothing):
+            out, why = self.migrate(undo=True)
+        self.assertIn("could not be moved", why)
+        self.assertIn("no no-replace rename", out["move_failures"][0])
 
 
 class TheLane(Base):
@@ -337,17 +376,56 @@ class TheLane(Base):
 
 class TheCli(Base):
     def test_prints_one_json_line(self):
-        rc, said = self.cli("migrate-dirs", "--worker", W)
+        rc, said = self.cli("migrate-dirs", "--worker", W, "--apply")
         line = json.loads(said)
-        self.assertEqual((rc, line["ok"], line["undo"]), (0, True, False))
-        rc, said = self.cli("migrate-dirs", "--worker", W, "--undo")
+        self.assertEqual((rc, line["ok"], line["undo"], line["applied"]), (0, True, False, True))
+        rc, said = self.cli("migrate-dirs", "--worker", W, "--undo", "--apply")
         self.assertEqual((rc, json.loads(said)["undo"]), (0, True))
 
     def test_a_refusal_exits_1_with_why(self):
         self.edit_worker_row(agent_mxid="")
-        rc, said = self.cli("migrate-dirs", "--worker", W)
+        rc, said = self.cli("migrate-dirs", "--worker", W, "--apply")
         self.assertEqual((rc, json.loads(said)["ok"]), (1, False))
         self.assertIn("why", json.loads(said))
+
+    def test_without_apply_it_only_shows_what_it_would_do(self):
+        self.deliver(self.core)
+        (self.ws / "tasks" / f"{self.mine}.txt").write_text("t")
+        (self.ws / "results").mkdir(parents=True)
+        stamped = proactive_filename(1, "ag2space", W)
+        for name in (f"{self.mine}.txt", "task-other.txt", stamped):
+            (self.ws / "results" / name).write_text("r")
+        before = sorted(str(p.relative_to(self.ws)) for p in self.ws.rglob("*") if p.is_file())
+        rc, said = self.cli("migrate-dirs", "--worker", W)
+        line = json.loads(said)
+        self.assertEqual((rc, line["applied"], line["own_now"], line["lane"], line["delivered"]),
+                         (1, False, False, "not-running", [self.core]))
+        self.assertIn("no task-event handler can move them", line["why"])
+        self.assertEqual(line["would_move_tasks"], [f"{self.mine}.txt"])
+        self.assertEqual(sorted(line["would_move_results"]), sorted([f"{self.mine}.txt", stamped]))
+        self.assertEqual(sorted(str(p.relative_to(self.ws)) for p in self.ws.rglob("*") if p.is_file()), before)
+        self.assertIsNone(C.worker_dirs(W, self.ws))
+        self.declare_handler()
+        rc, said = self.cli("migrate-dirs", "--worker", W)
+        self.assertEqual((rc, json.loads(said)["ok"]), (0, True))
+
+    def test_the_undo_preview_lists_what_would_return(self):
+        self.migrate()
+        (self.own / "tasks" / f"{self.mine}.txt").write_text("t")
+        rc, said = self.cli("migrate-dirs", "--worker", W, "--undo")
+        line = json.loads(said)
+        self.assertEqual((rc, line["own_now"], line["would_return_tasks"]), (0, True, [f"{self.mine}.txt"]))
+
+    def test_a_preview_refuses_without_an_agent_or_a_readable_folder(self):
+        from delivery import task_dispatch
+        with mock.patch.object(task_dispatch, "owned_task_ids", side_effect=task_dispatch.WorkerHoldUnreadable("io")):
+            self.assertEqual(worker_lane.preview_migrate(W, self.ws)[1], "io")
+        with mock.patch.object(C, "bridge_pid", side_effect=C.BridgeLeaseIndeterminate(self.lane, "torn")):
+            self.assertEqual(worker_lane.preview_migrate(W, self.ws, undo=True)[0]["lane"], "unknown")
+        with mock.patch.object(worker_lane, "handler_lookup", return_value=("", "lookup failed")):
+            self.assertIn("nothing would be switched", worker_lane.preview_migrate(W, self.ws)[1])
+        self.edit_worker_row(agent_mxid="")
+        self.assertIn("no agent identity row", worker_lane.preview_migrate(W, self.ws)[1])
 
     def test_the_live_txt_listing_survives_an_unreadable_folder(self):
         with mock.patch.object(Path, "glob", side_effect=OSError):

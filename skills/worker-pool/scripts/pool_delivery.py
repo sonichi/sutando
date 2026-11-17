@@ -272,9 +272,12 @@ def _hand_off_pass(ws: Path, recipient: str, out: dict) -> set:
 def migrate_to_own_dirs(workspace, recipient: str, own_tasks, own_origin) -> dict:
     """Empty `recipient`'s deliveries folder into its own tasks folder, for a worker switched to its own
     folders. Under each task's lock and the folder lock: a task its own lane queued (`own_origin(id)`) has
-    its payload moved into `own_tasks` and its sentinel archived; any other task is withdrawn (sentinel,
-    `.pending` record, attribution) and its payload touched so the core's watcher picks it up again. A task
-    with a ready result keeps its sentinel. Idempotent. Returns {"moved", "returned", "kept": {id: why}}."""
+    its payload moved into `own_tasks` and its sentinel archived. Any other task still `pending` (never
+    accepted) is handed back as `hand_off_to_core` does: attribution revoked first, then sentinel and `.pending`
+    record withdrawn, payload touched so the core's watcher picks it up. One the worker accepted, or answered,
+    stays the worker's: its session may still be running it, so only a hand-off after that session is gone
+    (`pool_manage.py retire --hand-off`) gives it to the core. Idempotent: an interrupted pass leaves the
+    sentinel, so a re-run revisits the task. Returns {"moved", "returned", "kept": {id: why}}."""
     import pool_attribution
     import pool_router
     import undelivered_quarantine
@@ -293,11 +296,13 @@ def migrate_to_own_dirs(workspace, recipient: str, own_tasks, own_origin) -> dic
                     continue
                 payload = payload_path(ws, task_id)
                 if not own_origin(task_id):
-                    if find_ready_result(results_dir(ws), task_id) is not None:
-                        out["kept"][task_id] = "answered"
+                    state = _residue_state(ws, recipient, task_id, find_in(dfd, task_id))
+                    if state != "pending":
+                        out["kept"][task_id] = "accepted" if state == "died-mid-work" else state
                         continue
-                    _withdraw_locked(ws, recipient, task_id, dfd)
+                    # Attribution first: a sentinel left by an interruption makes the next pass revisit.
                     pool_attribution.revoke(ws, task_id, recipient)
+                    _withdraw_locked(ws, recipient, task_id, dfd)
                     with contextlib.suppress(FileNotFoundError):
                         os.utime(payload)
                     out["returned"].append(task_id)
