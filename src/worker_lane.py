@@ -19,13 +19,19 @@ While a valid declaration exists and its bridge holds the lane's lease, or has h
 take it, the lane keeper does not start the worker's lane (`declared_bridge`, connections).
 
 Run as a script: `declare --worker <w>` writes the declaration sparrowd runs that worker's agent bridge
-from (`<workspace>/agents/<segment>.bridge/worker.json`), `withdraw --worker <w>` removes it.
+from (`<workspace>/agents/<segment>.bridge/worker.json`), `withdraw --worker <w>` removes it, and
+`status --worker <w>` prints one JSON line: whether it is declared, which process holds the lane's lease
+(`held_by`: the declared bridge under sparrowd, another process, none) and each running sparrowd. Each
+takes `--workspace`.
 """
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 _SRC = Path(__file__).resolve().parent
@@ -184,15 +190,127 @@ def declared_bridge(worker: str, workspace) -> bool:
     return bool(loaded) and loaded.get("worker") == worker
 
 
-def main(argv=None, workspace=None, vault=None) -> int:
+SPARROWD_SCRIPT = "sparrowd.py"
+AGENT_BRIDGE_SCRIPT = "sparrow_agent_bridge.py"
+# A declared bridge is sparrowd's own child; the hops allow for an interpreter shim between them.
+ANCESTOR_HOPS = 3
+_ETIME = re.compile(r"^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$")
+
+
+def processes() -> "dict[int, tuple[int, int, str]]":
+    """{pid: (ppid, seconds running, command line)} for every process `ps` lists; {} when it cannot."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,etime=,command="], capture_output=True, text=True,
+                             timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    procs = {}
+    for line in out.splitlines():
+        parts = line.split(None, 3)
+        m = _ETIME.match(parts[2]) if len(parts) == 4 else None
+        if m and parts[0].isdigit() and parts[1].isdigit():
+            d, h, mi, se = (int(x or 0) for x in m.groups())
+            procs[int(parts[0])] = (int(parts[1]), ((d * 24 + h) * 60 + mi) * 60 + se, parts[3])
+    return procs
+
+
+def _argv(command: str) -> "list[str]":
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+
+def _same_file(a: str, b) -> bool:
+    return os.path.realpath(a) == os.path.realpath(str(b))
+
+
+def sparrowd_runs(procs: dict, now=None) -> "list[dict]":
+    """Each running sparrowd: its pid, whether it runs `--agent-bridges`, its checkout, whether that
+    checkout's agent bridge accepts a worker declaration, and whether that code changed after it started."""
+    now = time.time() if now is None else now
+    found = []
+    for pid, (_ppid, age, command) in sorted(procs.items()):
+        argv = _argv(command)
+        script = next((a for a in argv if Path(a).name == SPARROWD_SCRIPT), "")
+        if not script:
+            continue
+        src = Path(script).parent if os.path.isabs(script) else None
+        bridge = src / AGENT_BRIDGE_SCRIPT if src else None
+        try:
+            serves = bool(bridge) and (src / "worker_lane.py").is_file() and WRITTEN_BY in \
+                (src / "worker_lane.py").read_text(encoding="utf-8") and "worker_lane" in bridge.read_text(encoding="utf-8")
+            stale = serves and bridge.stat().st_mtime > now - age
+        except OSError:
+            serves = stale = False
+        found.append({"pid": pid, "agent_bridges": "--agent-bridges" in argv,
+                      "checkout": str(src.parent) if src else "", "serves_workers": serves,
+                      "code_changed_since_start": stale})
+    return found
+
+
+def held_by(pid: int, procs: dict, declaration) -> str:
+    """Who holds a lane's lease: `declared-bridge` (the agent bridge for `declaration`, under a sparrowd
+    running --agent-bridges), `other`, `none` (no holder) or `unknown` (the process is not listed)."""
+    if not pid:
+        return "none"
+    if pid not in procs:
+        return "unknown"
+    argv = _argv(procs[pid][2])
+    mine = len(argv) >= 2 and any(Path(a).name == AGENT_BRIDGE_SCRIPT for a in argv[:-1]) \
+        and _same_file(argv[-1], declaration)
+    ancestor, hops = procs[pid][0], 0
+    while mine and ancestor in procs and hops < ANCESTOR_HOPS:
+        up = _argv(procs[ancestor][2])
+        if any(Path(a).name == SPARROWD_SCRIPT for a in up) and "--agent-bridges" in up:
+            return "declared-bridge"
+        ancestor, hops = procs[ancestor][0], hops + 1
+    return "other"
+
+
+def status(worker: str, workspace, procs=None) -> dict:
+    """What serves `worker`'s agent now; `ok` False with `why` when the worker has no servable identity."""
+    from connections import BridgeLeaseIndeterminate, bridge_pid, worker_identity
+    decl, why = _declaration_for(worker, workspace)
+    if decl is None:
+        return {"worker": worker, "ok": False, "why": why}
+    instance = str((worker_identity(worker, Path(workspace)) or {}).get("instance") or "")
+    procs = processes() if procs is None else procs
+    try:
+        pid, lease = bridge_pid(instance, Path(workspace)), ""
+    except BridgeLeaseIndeterminate as e:
+        pid, lease = 0, str(e)
+    try:
+        declared, unreadable = declared_bridge(worker, workspace), ""
+    except Exception as e:  # noqa: BLE001 - reported as unknown, never as "not declared"
+        declared, unreadable = None, f"{type(e).__name__}: {e}"
+    out = {"worker": worker, "ok": True, "agent": decl["agent"], "instance": instance, "declaration": str(decl["path"]),
+           "declared": declared, "lease_pid": pid, "held_by": "unknown" if lease else held_by(pid, procs, decl["path"]),
+           "sparrowd": sparrowd_runs(procs)}
+    if lease or unreadable:
+        out["why"] = lease or unreadable
+    return out
+
+
+def main(argv=None, workspace=None, vault=None, procs=None) -> int:
     import argparse
+    import json
     p = argparse.ArgumentParser(prog="worker_lane.py", description="A pool worker's agent-bridge declaration.")
-    p.add_argument("action", choices=("declare", "withdraw"))
+    p.add_argument("action", choices=("declare", "withdraw", "status"))
     p.add_argument("--worker", required=True)
+    p.add_argument("--workspace", type=Path, default=None)
     args = p.parse_args(argv)
+    workspace = args.workspace or workspace
     if workspace is None:
         from workspace_default import resolve_workspace
         workspace = resolve_workspace()
+    if args.action == "status":
+        try:
+            out = status(args.worker, workspace, procs)
+        except RecordUnreadable as e:
+            out = {"worker": args.worker, "ok": False, "why": str(e)}
+        print(json.dumps(out, sort_keys=True))
+        return 0 if out["ok"] else 1
     from ag2_sparrow import gateway_credential_sources as sources
     decl, why = _declaration_for(args.worker, workspace)
     if decl is not None and args.action == "declare":

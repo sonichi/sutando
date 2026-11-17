@@ -669,7 +669,7 @@ The worker wiring above (addressee, routing before publish and the re-raise afte
 own-file gates) is one module, `src/worker_lane.py`, which both the lane loader
 (`remote-gateway-bridge.py`) and the agent bridge (`sparrow_agent_bridge.py`) install.
 
-`python3 src/worker_lane.py declare --worker <id>` writes the declaration
+`python3 src/worker_lane.py declare --worker <id>` (each verb takes `--workspace`) writes the declaration
 (`<workspace>/agents/<segment>.bridge/worker.json`, `written_by: worker-lane declare`), where the
 segment is the one the worker row's `agent_mxid` names. The file chooses nothing: the agent bridge
 re-derives its name and env from the segment, as for any declaration, and runs it only when the
@@ -711,7 +711,13 @@ Cutting a worker over:
 2. `python3 scripts/connections.py stop <instance>` stops the lane once. The keeper waits out its
    grace, and the declared bridge takes the lease on its next retry (sparrowd's backoff is at most
    60 s). If it does not, the keeper starts the lane again and logs why.
-3. Check with a live round trip: a message to the worker's agent reaches the worker and its reply
+3. `python3 src/worker_lane.py status --worker <id>` prints one JSON line: `declared`, the lease's
+   holder pid and `held_by`, which is `declared-bridge` only when that pid is the agent bridge for this
+   declaration and a sparrowd running `--agent-bridges` is its parent; `other`, `none` or `unknown`
+   otherwise. `sparrowd` lists each running sparrowd: whether it runs `--agent-bridges`, whether its
+   checkout's agent bridge accepts a worker declaration (`serves_workers`), and whether that code
+   changed after it started (`code_changed_since_start`: restart it).
+4. Check with a live round trip: a message to the worker's agent reaches the worker and its reply
    is posted as that agent.
 
 Undo: `python3 src/worker_lane.py withdraw --worker <id>`; the keeper starts the lane on its next
