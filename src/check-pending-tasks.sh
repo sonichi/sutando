@@ -49,6 +49,15 @@ fi
 TASKS_DIR="$WORKSPACE/tasks"
 RESULTS_DIR="$WORKSPACE/results"
 DELIVERIES_DIR="$WORKSPACE/deliveries"
+# A pool worker on its own folders: its launcher sets SUTANDO_INBOX_KIND empty (a plain inbox) and
+# names them. It owes what its own inbox holds, judged by the same scan as the core's queue.
+OWN_INBOX=""
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ] && [ "${SUTANDO_INBOX_KIND-unset}" = "" ] \
+   && [ -n "${SUTANDO_TASKS_DIR:-}" ] && [ -n "${SUTANDO_RESULTS_DIR:-}" ]; then
+  OWN_INBOX=1
+  TASKS_DIR="$SUTANDO_TASKS_DIR"
+  RESULTS_DIR="$SUTANDO_RESULTS_DIR"
+fi
 
 # An unmarked session is a guest only while a marked core is alive ON THIS HOST
 # to own the queue (a fresh state/cores/<host-label>.alive; the workspace syncs
@@ -182,7 +191,7 @@ UNPROCESSED=""
 UNPROCESSED_NAMES=""
 shopt -s nullglob 2>/dev/null
 
-if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ] && [ -z "$OWN_INBOX" ]; then
   # Worker mode: judge only this instance's own folder, never the core's queue.
   # An unreadable folder (rc 2) must not read as "nothing owed", so the ids are
   # captured first and a non-zero status reports rather than skips.
@@ -219,8 +228,8 @@ $( [ -f "$PAYLOAD" ] && cat "$PAYLOAD" || echo "(payload not found at $PAYLOAD)"
 "
   done
 else
-  # Core mode: the queue is tasks/, minus anything the router already handed
-  # to a worker.
+  # Core mode (and an own-folder worker's inbox): the queue is tasks/, minus
+  # anything the router already handed to a worker.
   for f in "$TASKS_DIR"/*.txt; do
     BASENAME=$(basename "$f")
     TASK_ID="${BASENAME%.txt}"
@@ -252,7 +261,9 @@ $(cat "$f")
   done
 fi
 
-if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
+if [ -n "$OWN_INBOX" ]; then
+  BLOCK_REASON="Unprocessed tasks in $TASKS_DIR/"
+elif [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
   BLOCK_REASON="Unprocessed deliveries in deliveries/$SUTANDO_INSTANCE_ID/"
 else
   BLOCK_REASON="Unprocessed tasks in tasks/"

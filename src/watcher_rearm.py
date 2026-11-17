@@ -29,7 +29,11 @@ from typing import Optional, Tuple
 WORKER_REARM = 'bash "$SUTANDO_WATCHER_CMD" "$SUTANDO_TASKS_DIR" --role session --inbox "$SUTANDO_TASKS_DIR"'
 
 
-def target(repo: str, workspace: str, instance_id: Optional[str]) -> Tuple[str, str]:
+def target(repo: str, workspace: str, instance_id: Optional[str], env=None) -> Tuple[str, str]:
+    env = os.environ if env is None else env
+    # A worker on its own folders (SUTANDO_INBOX_KIND set empty) watches the inbox its launcher named.
+    if instance_id and env.get("SUTANDO_INBOX_KIND") == "" and env.get("SUTANDO_TASKS_DIR"):
+        return env["SUTANDO_TASKS_DIR"], WORKER_REARM
     if instance_id:
         return f"{workspace}/deliveries/{instance_id}", WORKER_REARM
     tasks = f"{workspace}/tasks"
@@ -39,7 +43,7 @@ def target(repo: str, workspace: str, instance_id: Optional[str]) -> Tuple[str, 
 
 def watch_argv(repo: str, workspace: str, instance_id: Optional[str], env=None) -> list:
     env = os.environ if env is None else env
-    inbox, _ = target(repo, workspace, instance_id)
+    inbox, _ = target(repo, workspace, instance_id, env)
     if instance_id:
         cmd = env.get("SUTANDO_WATCHER_CMD") or ""
         if not cmd:
