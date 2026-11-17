@@ -726,6 +726,38 @@ Cutting a worker over:
 Undo: `python3 src/worker_lane.py withdraw --worker <id>`; the keeper starts the lane on its next
 pass, which takes the lease once sparrowd has stopped the bridge.
 
+### A worker on its own folders (`dirs: "own"`)
+
+A worker whose identity row carries `dirs: "own"` keeps its tasks and results in its agent's own folder,
+`<workspace>/agents/<segment>/{tasks,results}` (the folder a claude-local bridge for that agent uses), not
+the workspace's shared `tasks/` and `results/`; `state/` stays shared. `connections.worker_dirs(worker)` is
+the one answer (None for every other worker) and `connections.task_home(task_id)` maps a lane-queued task to
+its folders. Its lane, whether the gateway wrapper's or a declared Sparrow bridge, runs on those folders
+(`worker_lane.lane_dirs`): the folder is the worker's inbox, so no router runs; the pre-publish hook only
+records the task as the worker's (`--attribute-only`), and the worker's stamped proactive files still landing
+in the shared `results/` are moved into its own. Its session reads a plain inbox of task files and answers in
+its own results (`spawn_worker.inbox_env`, `result_publish`). A worker without the field is unchanged.
+
+`python3 src/worker_lane.py migrate-dirs --worker <id>` shows what switching the worker would do (its
+folders, who holds its lane, what is delivered to it, and which tasks and results would move) and writes
+nothing. With `--apply` it switches the worker over:
+1. It finds the declared task-event handler first. A failed lookup, or work delivered with no handler to
+   move it, refuses before anything changes.
+2. It writes the field and creates the folders (a private agent root), and relaunches the worker's lane
+   under the record lock (a wrapper lane is stopped so the lane keeper starts it on the new folders; a
+   declared bridge is waited for until sparrowd has replaced it).
+3. It has the handler empty the worker's `deliveries/<id>/` under the router's locks. A task its own lane
+   queued moves into its tasks folder and its sentinel is archived. A core task the worker never accepted is
+   handed back (attribution first, then the sentinel) and touched so the core's watcher picks it up. One it
+   accepted or answered stays the worker's until `pool_manage.py retire --hand-off` once its session is gone.
+4. It moves into the worker's folders any task its own lane queued that is still in the shared `tasks/`,
+   and the worker's unclaimed live results.
+
+It prints one JSON line and is idempotent: a refusal, or a file that could not be moved, says why, and a
+re-run finishes. It restarts no session: respawn the worker so its session takes the new inbox.
+`--undo --apply` clears the field, relaunches the lane, and returns the worker's live tasks (touched; one
+already answered stays) and results to the shared folders.
+
 ### The core bridge under sparrowd (opt-in)
 
 By default the launchd gateway wrapper launches and supervises the host's core gateway bridge

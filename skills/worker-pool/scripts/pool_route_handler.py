@@ -180,9 +180,28 @@ def attribute_only(workspace, task_id: str, worker: str) -> int:
     return 1
 
 
+def migrate_dirs(workspace, worker: str) -> int:
+    """0 once `worker` (switched to its own folders) holds no owed sentinel but answered ones; prints
+    the outcome as one JSON line. 1 when it has no own folders or the folder cannot be read."""
+    import connections
+    import pool_delivery
+    own = connections.worker_dirs(worker, Path(workspace)) if workspace and worker else None
+    if own is None:
+        print(f"pool_route_handler: --migrate-dirs: worker {worker!r} has no own folders", file=sys.stderr)
+        return 1
+    try:
+        out = pool_delivery.migrate_to_own_dirs(
+            workspace, worker, own[0], lambda tid: connections.task_home(tid, Path(workspace))["worker"] == worker)
+    except (OSError, pr.RosterError, ValueError) as e:
+        print(f"pool_route_handler: --migrate-dirs: {e}", file=sys.stderr)
+        return 1
+    print(json.dumps(out, sort_keys=True))
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(add_help=False)
-    p.add_argument("--task-file", required=True)
+    p.add_argument("--task-file", default=None)
     p.add_argument("--workspace", default=None)
     p.add_argument("--probe", action="store_true")
     # The watcher passes its RESOLVED results dir; the replay gate reads it, so
@@ -197,11 +216,17 @@ def main(argv=None) -> int:
     # A worker's own-dir lane: its folder is the inbox, so the task is only recorded as `--worker`'s.
     p.add_argument("--attribute-only", action="store_true")
     p.add_argument("--worker", default="")
+    # `worker_lane.py migrate-dirs`: move the worker's delivered work into its own tasks folder.
+    p.add_argument("--migrate-dirs", action="store_true")
     for ignored in ("--runtime", "--repo"):
         p.add_argument(ignored, default=None)
     args, _unknown = p.parse_known_args(argv)
 
     ws = args.workspace
+    if args.migrate_dirs:
+        return migrate_dirs(ws, args.worker)
+    if not args.task_file:
+        p.error("--task-file is required")
     if args.attribute_only:
         return attribute_only(ws, Path(args.task_file).stem, args.worker)
     # First, before anything can fail: the receipt is the only proof outside this
