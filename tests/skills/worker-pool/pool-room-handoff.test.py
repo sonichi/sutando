@@ -405,12 +405,19 @@ class WorkedRooms(Base):
                          "failed")
 
 
+def core_of(mine):
+    """The core's own view of the room `mine` is in: one shared member list."""
+    core = FakeActions(set(), me=CORE)
+    core.members = mine.members
+    return core
+
+
 class ReturnRoom(Base):
     def returned(self, mine, room=ROOM, core=None, **kw):
         for key in (ROOM, LEGACY):
             pr.unbind_room(self.ws, key)
         kw.setdefault("bindings", [LEGACY, ROOM])
-        return rh.return_room(W, room, workspace=self.ws, actions=core or FakeActions(set()), server="s.space",
+        return rh.return_room(W, room, workspace=self.ws, actions=core or core_of(mine), server="s.space",
                               core_agent=CORE, as_worker=lambda: mine, sleep=self.sleep,
                               clock=lambda: self.clock[0], wall=lambda: self.wall[0], **kw)
 
@@ -444,7 +451,7 @@ class ReturnRoom(Base):
         for key in (ROOM, LEGACY):
             pr.unbind_room(self.ws, key)
         pr.bind_room(self.ws, ROOM, OTHER)
-        out = rh.return_room(W, ROOM, bindings=[LEGACY, ROOM], workspace=self.ws, actions=FakeActions(set()),
+        out = rh.return_room(W, ROOM, bindings=[LEGACY, ROOM], workspace=self.ws, actions=core_of(mine),
                              server="s.space", core_agent=CORE, as_worker=lambda: mine, wall=lambda: self.wall[0])
         self.assertEqual((out["status"], out["taken"]), ("returned", [ROOM]))
         self.assertEqual((self.bound()[ROOM], self.bound()[LEGACY]), (OTHER, W))
@@ -465,7 +472,7 @@ class ReturnRoom(Base):
         for key in (ROOM, LEGACY):
             pr.unbind_room(self.ws, key)
         with mock.patch.object(pr, "_locked", owner_binds_meanwhile):
-            out = rh.return_room(W, ROOM, bindings=[ROOM], workspace=self.ws, actions=FakeActions(set()),
+            out = rh.return_room(W, ROOM, bindings=[ROOM], workspace=self.ws, actions=core_of(mine),
                                  server="s.space", core_agent=CORE, as_worker=lambda: mine, wall=lambda: self.wall[0])
         self.assertEqual((out["status"], out["taken"]), ("returned", [ROOM]))
         self.assertEqual(self.bound()[ROOM], OTHER)
@@ -476,7 +483,7 @@ class ReturnRoom(Base):
         real = pr.compile_roster
         with mock.patch.object(pr, "compile_roster", side_effect=pr.RosterError("publish failed")):
             first = FakeActions({AGENT, CORE}, me=AGENT)
-            out = rh.return_room(W, ROOM, bindings=[ROOM], workspace=self.ws, actions=FakeActions(set()),
+            out = rh.return_room(W, ROOM, bindings=[ROOM], workspace=self.ws, actions=core_of(first),
                                  server="s.space", core_agent=CORE, as_worker=lambda: first, wall=lambda: self.wall[0])
         self.assertEqual(out["status"], "failed")
         self.assertNotIn("room.leave", [c[0] for c in first.calls], "the worker's agent stays until it is published")
@@ -484,7 +491,7 @@ class ReturnRoom(Base):
         self.assertNotIn(ROOM, json.loads((self.ws / "state" / "roster.json").read_text())["bindings"])
         mine = FakeActions({AGENT, CORE}, me=AGENT)
         with mock.patch.object(pr, "compile_roster", side_effect=real) as compiled:
-            out = rh.return_room(W, ROOM, bindings=[ROOM], workspace=self.ws, actions=FakeActions(set()),
+            out = rh.return_room(W, ROOM, bindings=[ROOM], workspace=self.ws, actions=core_of(mine),
                                  server="s.space", core_agent=CORE, as_worker=lambda: mine, wall=lambda: self.wall[0])
         self.assertEqual((out["status"], out["worker_left"]), ("returned", True))
         self.assertTrue(compiled.called, "the retry recompiles though the binding already matched")
@@ -509,13 +516,70 @@ class ReturnRoom(Base):
         self.assertEqual((out["status"], out["worker_left"]), ("returned", False))
         self.assertIn("stays a member", out["why"])
         self.setUp()
-        mine = FakeActions({AGENT, CORE}, me=AGENT)
+        mine = FakeActions({AGENT, CORE}, me=AGENT, read_error={"is_error": True, "message": "rate limited"})
+        core = core_of(mine)
         reads = iter([{"result": {"members": [{"user_id": AGENT}, {"user_id": CORE}]}},
                       {"is_error": True, "message": "rate limited"}])
-        mine.read = lambda *a: next(reads)
-        out = self.returned(mine)
+        core.read = lambda *a: next(reads)
+        out = self.returned(mine, core=core)
         self.assertEqual((out["status"], out["worker_left"]), ("returned", False))
-        self.assertEqual(self.bound()[ROOM], W)
+        self.assertIn("rate limited", out["why"])
+        self.assertEqual(self.bound()[ROOM], W, "not a rollback: the restored binding stays")
+        self.assertNotIn("room.leave", [c[0] for c in mine.calls])
+
+    def leaves(self, mine):
+        return [c[1] for c in mine.calls if c[0] == "room.leave"]
+
+    def test_a_second_return_after_a_second_hand_off_leaves_under_a_new_operation_id(self):
+        mine = FakeActions({AGENT, OWNER}, me=AGENT)
+        self.assertEqual(self.returned(mine)["worker_left"], True)
+        mine.members |= {AGENT}  # handed off again: the worker's agent is back in the room
+        mine.invited = ""
+        out = self.returned(mine)
+        self.assertEqual((out["status"], out["worker_left"]), ("returned", True))
+        self.assertEqual(self.leaves(mine), [rh.operation_id("return-leave", W, AGENT, ROOM, n) for n in (0, 1)])
+        self.assertNotIn(AGENT, mine.members, "the second leave acted")
+
+    def test_an_uncertain_leave_answer_is_resent_as_the_same_operation(self):
+        mine = FakeActions({AGENT, CORE}, me=AGENT, leave={"is_error": True, "message": "upstream unavailable"})
+        self.returned(mine)
+        mine.ops.clear()
+        mine.leave = {"result": {}}
+        self.assertEqual(self.returned(mine)["worker_left"], True)
+        self.assertEqual(set(self.leaves(mine)), {rh.operation_id("return-leave", W, AGENT, ROOM, 0)})
+
+    def test_a_finished_return_is_recognised_after_a_crash_or_on_a_rerun(self):
+        for crash_at in ("after the leave answer", "after its record", "none"):
+            self.setUp()
+            mine = FakeActions({AGENT, CORE}, me=AGENT)
+            real_record = rh.record_attempt
+
+            def crash(ws, worker, room, verb, n, state, now, _at=crash_at):
+                if verb == "return-leave" and _at == "after the leave answer":
+                    raise KeyboardInterrupt(_at)
+                real_record(ws, worker, room, verb, n, state, now)
+                if verb == "return-leave" and _at == "after its record":
+                    raise KeyboardInterrupt(_at)
+            with mock.patch.object(rh, "record_attempt", crash):
+                try:
+                    self.returned(mine)
+                except KeyboardInterrupt:
+                    pass
+            self.assertNotIn(AGENT, mine.members, crash_at)
+            mine.read_error = {"is_error": True, "message": "not a member"}  # the departed worker cannot read it
+            calls = len(mine.calls)
+            out = self.returned(mine)
+            self.assertEqual((out["status"], out["worker_left"]), ("returned", True), crash_at)
+            self.assertIn("already finished", out["why"])
+            self.assertEqual((self.bound()[ROOM], self.bound()[LEGACY]), (W, W))
+            self.assertEqual([c for c in mine.calls[calls:] if c[0] != "read"], [], "nothing sent again")
+
+    def test_a_failed_worker_read_alone_proves_nothing(self):
+        mine = FakeActions({AGENT}, me=AGENT, read_error={"is_error": True, "message": "forbidden"})
+        core = FakeActions(set(), me=CORE, read_error={"is_error": True, "message": "not a member"})
+        out = self.returned(mine, core=core)
+        self.assertEqual(out["status"], "skipped")
+        self.assertNotIn(ROOM, self.bound())
 
     def test_no_core_id_or_no_agent_does_nothing(self):
         with mock.patch.object(pp, "core_actions", return_value=(FakeActions(set()), {"server": "s.space"})):

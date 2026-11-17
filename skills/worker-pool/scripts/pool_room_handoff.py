@@ -94,7 +94,7 @@ def attempt(ws: Path, worker: str, room: str, verb: str, invite_gone: bool = Fal
     call held for the owner keeps its id, so a resend is the same operation and never a second one."""
     rec = (_attempts(ws, worker).get(room) or {}).get(verb) or {}
     n, state = int(rec.get("n") or 0), rec.get("state")
-    spent = state == "no" or (state == "sent" and (verb == "leave" or invite_gone))
+    spent = state == "no" or (state == "sent" and (verb.endswith("leave") or invite_gone))
     return n + 1 if spent else n
 
 
@@ -352,7 +352,10 @@ def return_room(worker: str, room: str, *, bindings: "Optional[list]" = None, wo
                 vault=None) -> dict:
     """Undo one hand-off: the worker's agent invites the core's agent back, and once the core is joined the
     room is bound to the worker again (each of `bindings`, default the room's id on the core's server) and
-    the worker's agent leaves. `returned`, `waiting`, `skipped` (with why) or `failed`."""
+    the worker's agent leaves. `returned`, `waiting`, `skipped` (with why) or `failed`. Not a rollback: a
+    binding restored before a later step fails stays restored, and the worker's agent stays a member when
+    its leave is refused or the core cannot be confirmed joined first. A rerun finds a finished return from
+    the core's own read (core joined, worker's agent gone)."""
     return _guarded(_return_room, worker, room, bindings=bindings, workspace=workspace, actions=actions,
                     server=server, core_agent=core_agent, as_worker=as_worker, wait_s=wait_s, poll_s=poll_s,
                     sleep=sleep, clock=clock, wall=wall, vault=vault)
@@ -371,10 +374,20 @@ def _return_room(worker, room, *, bindings, workspace, actions, server, core_age
     out = {"worker": worker, "agent": agent, "room": target, "bindings": keys}
     if not core_agent:
         return {**out, "status": "failed", "why": "the core's agent id is not known; nothing was done"}
-    members, why = joined(mine, target)
-    if members is None:
-        return {**out, "status": "skipped", "why": f"the worker's agent cannot read this room ({why}), so it cannot "
-                                                   "invite the core back; the binding stays dropped"}
+    seen, _ = joined(core, target)
+    if seen is not None and core_agent in seen and agent not in seen:
+        taken = [k for k in keys if not pr.bind_room_if_free(ws, k, worker)]
+        return {**out, "status": "returned", "worker_left": True, "taken": taken,
+                "why": "the return had already finished: the core is joined and the worker's agent is not"
+                       + (f"; not rebound, another worker holds {', '.join(taken)}" if taken else "")}
+    if seen is not None and core_agent in seen:
+        members = seen
+    else:
+        members, why = joined(mine, target)
+        if members is None:
+            return {**out, "status": "skipped", "why": f"neither the core nor the worker's agent can read this room "
+                                                       f"({why}), so the core cannot be invited back; the binding "
+                                                       "stays dropped"}
     try:
         _invite_until_joined(ws, mine, worker, core_agent, target, members, wait_s=wait_s, poll_s=poll_s, sleep=sleep,
                              clock=clock, wall=wall, as_worker=lambda: core, verb="return-invite",
@@ -382,7 +395,9 @@ def _return_room(worker, room, *, bindings, workspace, actions, server, core_age
     except _Stop as stop:
         return {**out, "status": stop.status, "why": stop.why, **stop.extra}
     taken = [k for k in keys if not pr.bind_room_if_free(ws, k, worker)]
-    members, why = joined(mine, target)
+    members, why = joined(core, target)
+    if members is None:
+        members, why = joined(mine, target)
     if members is None or core_agent not in members:
         return {**out, "status": "returned", "worker_left": False, "taken": taken,
                 "why": f"the core is back and the room is bound again; the core could not be confirmed joined right "

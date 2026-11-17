@@ -265,6 +265,9 @@ python3 skills/worker-pool/scripts/pool_identity.py return-room <worker> --room 
   agent invites the core's agent back; once the core is joined, each binding (default: the room's id) is
   restored unless another worker now holds it, and the worker's agent leaves. `returned` (with `worker_left`),
   `waiting`, `skipped` (with why) or `failed`.
+  It is not a rollback: a binding restored before a later step fails stays restored, and the worker's agent
+  stays a member when its leave is refused or the core cannot be confirmed joined first. A rerun recognises a
+  finished return from the core's own read (core joined, worker's agent gone).
 
 ### Creating the agent without a pasted token
 
