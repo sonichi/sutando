@@ -282,6 +282,27 @@ class MoveFailures(Base):
         out, why = self.migrate()
         self.assertEqual((why, out["tasks_moved"]), ("", [f"{self.mine}.txt"]))
 
+    def test_a_result_or_proactive_file_that_will_not_move_fails_the_run(self):
+        import errno
+        import undelivered_quarantine
+        (self.ws / "results").mkdir(parents=True)
+        stamped = proactive_filename(1, "ag2space", W)
+        for name in (f"{self.mine}.txt", stamped):
+            (self.ws / "results" / name).write_text("r")
+        with mock.patch.object(undelivered_quarantine, "rename_noreplace", side_effect=PermissionError("denied")):
+            out, why = self.migrate()
+        self.assertIn("2 file(s) could not be moved; re-run", why)
+        self.assertEqual(sorted(f.split(":")[0] for f in out["move_failures"]), sorted([f"{self.mine}.txt", stamped]))
+        undelivered_quarantine._REPORTED.discard("worker-lane:adopt")
+        self.addCleanup(undelivered_quarantine._REPORTED.discard, "worker-lane:adopt")
+        with mock.patch.object(undelivered_quarantine, "rename_noreplace",
+                               side_effect=FileExistsError(errno.ENOTSUP, "no primitive")):
+            out, why = self.migrate()
+        self.assertIn("could not be moved", why)
+        self.assertTrue(all("no no-replace rename" in f for f in out["move_failures"]))
+        out, why = self.migrate()
+        self.assertEqual((why, out["results_moved"], out["proactive_moved"]), ("", [f"{self.mine}.txt"], [stamped]))
+
     def test_undo_reports_a_failed_move_too(self):
         import errno
         import undelivered_quarantine

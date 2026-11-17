@@ -274,6 +274,28 @@ class Adopt(Own):
         with mock.patch.object(C, "bridge_pid", side_effect=C.BridgeLeaseIndeterminate("x", "torn")):
             self.assertFalse(self.holds_lane(W, self.ws))
 
+    def test_a_caller_that_asks_is_told_which_moves_failed(self):
+        import errno
+        import undelivered_quarantine
+        shared, own = self.ws / "results", self.own / "results"
+        shared.mkdir(parents=True, exist_ok=True)
+        stamped, lane = proactive_filename(1, "ag2space", W), f"task-{self.row['instance']}~a1.txt"
+        for name in (stamped, lane):
+            (shared / name).write_text("r")
+        failed = []
+        with mock.patch.object(undelivered_quarantine, "rename_noreplace", side_effect=PermissionError("denied")):
+            self.assertEqual(worker_lane.adopt_stray_proactive(W, shared, own, failed=failed), [])
+            self.assertEqual(worker_lane.adopt_stray_results(W, self.ws, own, failed=failed), [])
+            self.assertEqual(worker_lane.adopt_stray_proactive(W, shared, own), [], "a background pass only skips")
+        self.assertEqual([f.split(":")[0] for f in failed], [stamped, lane])
+        failed = []
+        undelivered_quarantine._REPORTED.discard("worker-lane:adopt")
+        self.addCleanup(undelivered_quarantine._REPORTED.discard, "worker-lane:adopt")
+        with mock.patch.object(undelivered_quarantine, "rename_noreplace",
+                               side_effect=FileExistsError(errno.ENOTSUP, "no primitive")):
+            self.assertEqual(worker_lane.adopt_stray_results(W, self.ws, own, failed=failed), [])
+        self.assertIn("no no-replace rename", failed[0])
+
     def test_the_field_cleared_mid_pass_stops_the_next_move(self):
         shared, own = self.ws / "results", self.own / "results"
         shared.mkdir(parents=True, exist_ok=True)
