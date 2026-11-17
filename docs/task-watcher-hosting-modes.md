@@ -121,15 +121,18 @@ from the worker session's `SUTANDO_TASK_WATCH_MOD=1`, so the pool remedy's re-en
 mode the supervisor never starts the notifier: no task and no nudge is typed into the pane. It polls
 `role-present --ready` as before; once no ready session watcher has held the inbox for
 `SUTANDO_NOTIFIER_ALERT_GRACE` (300 s), it writes an `ALERT` line to `logs/claude-task-notifier.log`
-and alerts the owner once for that episode: a `results/proactive-standby-unwatched-*.txt` (the owner's DM)
-and the opt-in macOS notification, the same pair a channel bridge's wrapper uses for its notices. A ready
-watcher ends the episode with one log line and nothing sent to the owner. The 300 s covers a seat's boot
+and alerts the owner: a `results/proactive-standby-unwatched-*.txt` (the owner's DM) and the opt-in macOS
+notification, the same pair a channel bridge's wrapper uses for its notices. While the episode lasts it
+reminds the owner every `SUTANDO_NOTIFIER_ALERT_REPEAT` (1800 s; 0 turns the reminder off). Each alert names
+the seat ("the core", or "worker" and the first 8 characters of its id) and how many tasks wait in its
+inbox, counted by `src/task_queue.py`; it never carries the inbox path or the tmux session name, which
+only the local log line keeps. A ready watcher ends the episode with one log line and nothing sent to the owner. The 300 s covers a seat's boot
 and restarts: a seat's Mod watcher has been seen ready 51 s after the session started (before
 the launcher trusted the `--add-dir` folder), and a worker relaunched several times took about 2.5 min.
 The Mod's own restart back-off (5 s doubling) passes 300 s only after six early exits in a row. A Codex seat,
 or a Claude seat whose Mod was refused or turned off, keeps the typing standby above. The health check's
 `claude-task-notifier` row on a Mod core is `ok` only while a ready session watcher holds the core's
-inbox.
+inbox; its warning says how many tasks are waiting, with no path.
 
 ### How to check it on a worker, or turn it off
 
@@ -249,7 +252,10 @@ how `tests/watch-tasks-stream-shutdown-leaves-inflight-claim.test.py` interrupts
 - `tests/start-cli-claude-task-notifier.test.py`: the launcher starts the supervisor for the core,
   alert-only when it installed the Mod.
 - `tests/task-notifier-supervisor-alert-only.test.sh`: the alert-only standby types nothing, alerts
-  once per episode after the grace and stands down silently.
+  after the grace, reminds every repeat interval with the waiting count and no path, and stands down
+  silently. Its tmux part prints SKIP where tmux is missing.
+- `tests/task-notifier-supervisor-alert-decision.test.py`: with no tmux, the real supervisor in alert
+  mode alerts and never starts the typing notifier; without the mode it does.
 - `src/agent/claude/task-watch-mod/tests/task-watch.test.ts` (`claude plugin test`, in CI): the Mod's
   spawn, announcement, restart, hand-off and session-end rules, and that a task body is never submitted.
 - `tests/task-watch-mod-launch.test.sh`: the launchers' defaults and opt-outs, version floor and session marker.

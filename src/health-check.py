@@ -10984,13 +10984,23 @@ def _mod_watcher_verdict(name: str, inbox: Path, state_dir: Path, role_present=N
     verdict = role_present("session", str(inbox), ready=True, state_dir=str(state_dir))
     if verdict:
         return {"name": name, "status": "ok",
-                "detail": f"the task-watch Mod's session watcher holds {inbox}; the standby is alert-only"}
+                "detail": "the task-watch Mod's session watcher holds the core's inbox; the standby is alert-only"}
     why = ("the process table could not be read" if verdict is None
-           else "no ready session watcher holds it")
+           else "no ready session watcher holds its inbox")
     return {"name": name, "status": "warn", "mod_watcher_absent": True,
-            "detail": (f"the core's watcher is hosted by the task-watch Mod, but {why} ({inbox}); "
-                       "its tasks are not being picked up, and the alert-only standby types nothing. "
+            "detail": (f"the core's watcher is hosted by the task-watch Mod, but {why}; "
+                       f"{_waiting_phrase(inbox)}, and the alert-only standby types nothing. "
                        "Restarting the core session restarts the Mod's watcher")}
+
+
+def _waiting_phrase(inbox: Path) -> str:
+    """How many tasks wait in the core's inbox, counted by the queue's owner."""
+    import task_queue
+    try:
+        n = len(task_queue.pending_files(inbox.parent))
+    except Exception:  # noqa: BLE001 - an uncounted queue is said so, never read as zero
+        return "an unknown number of tasks are waiting"
+    return "1 task is waiting" if n == 1 else f"{n} tasks are waiting"
 
 
 def _process_alive(pid: int) -> bool:

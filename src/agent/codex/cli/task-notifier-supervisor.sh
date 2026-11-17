@@ -137,9 +137,11 @@ NOTIFIER="${SUTANDO_NOTIFIER_SCRIPT:-$REPO/src/agent/codex/cli/task-notifier.sh}
 GRACE_PERIOD="${SUTANDO_NOTIFIER_GRACE_PERIOD:-45}"
 ROLE_POLL="${SUTANDO_NOTIFIER_ROLE_POLL:-5}"
 # "alert": a Claude seat whose watcher the task-watch Mod hosts. Nothing is typed into the
-# pane; after ALERT_GRACE with no ready session watcher the owner is told once per episode.
+# pane; after ALERT_GRACE with no ready session watcher the owner is told, then reminded every
+# ALERT_REPEAT seconds while the episode lasts (0: no reminder).
 STANDBY_MODE="${SUTANDO_STANDBY_MODE:-type}"
 ALERT_GRACE="${SUTANDO_NOTIFIER_ALERT_GRACE:-300}"
+ALERT_REPEAT="${SUTANDO_NOTIFIER_ALERT_REPEAT:-1800}"
 child_pid=""
 # One-shot latch for the idle-but-dead health alert: raised when it fires, so a
 # persistent stale/absent beat does not re-notify every grace period; lowered
@@ -223,12 +225,34 @@ supervisor_log() {
   return 0
 }
 
+# How many tasks wait in this seat's inbox, counted by the queue's owner; empty when unreadable.
+waiting_count() {
+  [ -n "$TASKS_DIR" ] || return 0
+  "$PY" "$REPO/src/task_queue.py" pending --workspace "$(workspace_dir_for_inbox "$TASKS_DIR")" \
+    --inbox "$TASKS_DIR" 2>/dev/null \
+    | "$PY" -c 'import json, sys; print(len(json.load(sys.stdin)))' 2>/dev/null
+}
+
+# Who the owner's alert names: never a path or a tmux session name, which leave the machine with it.
+seat_label() {
+  if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
+    printf 'worker %s' "${SUTANDO_INSTANCE_ID:0:8}"
+  else
+    printf 'the core'
+  fi
+}
+
 # The owner's alert, through the path a bridge wrapper uses for its own notices: a proactive
 # result (the owner's DM, never a worker's lane) and the opt-in macOS notification.
-unwatched_alert() {
-  local secs="$1" ws msg
-  msg="Sutando: no task watcher has held ${TASKS_DIR:-its inbox} for $((secs / 60)) min, so the session in ${SESSION} is not picking up its tasks, and nothing types them in for it. Restarting that session brings its watcher back."
-  supervisor_log "ALERT: no ready session watcher holds ${TASKS_DIR:-this host} for ${secs}s (alert-only standby; nothing typed); owner alerted"
+unwatched_alert() {  # unwatched_alert <seconds unwatched> <waiting count or empty> [reminder]
+  local secs="$1" n="$2" kind="${3:-}" ws msg waiting
+  case "$n" in
+    '') waiting="an unknown number of tasks are waiting" ;;
+    1) waiting="1 task is waiting" ;;
+    *) waiting="$n tasks are waiting" ;;
+  esac
+  msg="Sutando${kind:+ ($kind)}: $(seat_label) has had no task watcher for $((secs / 60)) min, so it is not picking up its tasks; $waiting, and nothing types them in for it. Restarting that session brings its watcher back."
+  supervisor_log "ALERT${kind:+ ($kind)}: no ready session watcher holds ${TASKS_DIR:-this host} (session ${SESSION}) for ${secs}s, ${n:-unknown} waiting (alert-only standby; nothing typed); owner alerted"
   if [ -n "$TASKS_DIR" ]; then
     ws="$(workspace_dir_for_inbox "$TASKS_DIR")"
     if [ -d "$ws/results" ]; then
@@ -243,7 +267,7 @@ unwatched_alert() {
 # Alert-only standby: never starts the notifier, so neither a task nor a nudge is typed.
 # "unknown" neither opens nor closes an episode; a ready watcher ends it without a word to the owner.
 run_alert_only() {
-  local since="" alerted=0 v now
+  local since="" alerted=0 last=0 v now
   supervisor_log "alert-only standby for ${TASKS_DIR:-this host}: the task-watch Mod hosts this seat's watcher; nothing is typed into the pane"
   while target_alive; do
     v="$(session_role_verdict)"
@@ -257,8 +281,12 @@ run_alert_only() {
         now="$(now_s)"
         [ -n "$since" ] || since="$now"
         if [ "$alerted" = "0" ] && [ $((now - since)) -ge "$ALERT_GRACE" ]; then
-          unwatched_alert $((now - since))
+          unwatched_alert $((now - since)) "$(waiting_count)"
           alerted=1
+          last="$now"
+        elif [ "$alerted" = "1" ] && [ "$ALERT_REPEAT" -gt 0 ] && [ $((now - last)) -ge "$ALERT_REPEAT" ]; then
+          unwatched_alert $((now - since)) "$(waiting_count)" reminder
+          last="$now"
         fi
         ;;
     esac

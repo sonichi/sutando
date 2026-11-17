@@ -204,6 +204,24 @@ class ClaudeTaskNotifierHealthTests(unittest.TestCase):
             self.assertIn("task-watch Mod", result["detail"])
             self.assertNotIn("Monitor", result["detail"])
 
+    def test_a_mod_seat_warning_counts_the_waiting_tasks_and_names_no_path(self):
+        tasks = self.workspace / "tasks"
+        tasks.mkdir()
+        for i in (1, 2, 3):
+            (tasks / f"task-{i}.txt").write_text(f"id: task-{i}\ntask: x\n")
+        (tasks / "task-cron-9.txt").write_text("task: bookkeeping\n")
+        result, _ = self._mod_seat(False)
+        self.assertIn("3 tasks are waiting", result["detail"])
+        for leak in (str(self.workspace), "/tasks", "sutando-core", "/tmp/"):
+            self.assertNotIn(leak, result["detail"])
+        ok, _ = self._mod_seat(True)
+        self.assertNotIn(str(self.workspace), ok["detail"])
+
+    def test_a_mod_seat_warning_says_so_when_the_queue_cannot_be_counted(self):
+        with mock.patch("task_queue.pending_files", side_effect=PermissionError("denied")):
+            result, _ = self._mod_seat(False)
+        self.assertIn("an unknown number of tasks are waiting", result["detail"])
+
     def test_a_typing_seat_is_judged_by_the_supervisor_alone(self):
         self.write_local_core()
         tmux = FakeTmux(panes=[("0", f"bash {shlex.quote(str(SUPERVISOR))}")],
