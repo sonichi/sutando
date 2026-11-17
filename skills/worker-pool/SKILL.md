@@ -232,23 +232,34 @@ python3 skills/worker-pool/scripts/pool_identity.py rotate <worker> --device-flo
 
 ### Handing its rooms to its own agent
 
-Once a worker has its own agent, the rooms bound to it can move from the core's agent to that agent, on the
-owner's word: the worker's agent joins, the core's agent leaves, and the binding is dropped, so the room's work
-reaches the worker's agent directly.
+Once a worker has its own agent, its rooms can move from the core's agent to that agent, on the owner's word.
+In a room bound to the worker the worker's agent joins, the core's agent leaves and the binding is dropped, so
+the room's work reaches the worker's agent directly. In a room it only worked in as the core's agent (a room it
+posted review asks to, say), its agent is invited and the core stays: acting as its own agent, the worker can no
+longer post where only the core is a member.
 
 ```bash
 python3 skills/worker-pool/scripts/pool_identity.py rooms <worker>
 python3 skills/worker-pool/scripts/pool_identity.py hand-room <worker> --room <room> [--wait SECONDS]
+python3 skills/worker-pool/scripts/pool_identity.py worked <worker>
+python3 skills/worker-pool/scripts/pool_identity.py join-room <worker> --room <room> [--wait SECONDS]
 ```
 
 - `rooms` prints the rooms bound to the worker, one per room however many server names its bindings carry.
 - `hand-room` invites the worker's agent as the core's agent, waits up to SECONDS for the room to list it
   joined, confirms it again, has the core leave, and drops every binding naming that room. It prints one JSON
   line: `handed`; `waiting` (invited but not joined, or an invitation or leave held for the owner's approval:
-  run it again); `skipped` (the invitation was refused, for example by a direct chat or the core's power level:
-  the core stays and the binding is kept); `not_bound`; or `failed` (exit 1, the binding kept).
-- The core never leaves a room the worker's agent is not confirmed in. A rerun does not invite a member again,
-  and when the core already left, the worker's own agent confirms it is in the room before the binding goes.
+  run it again); `unknown` (the core's member read failed and nothing shows it has left: run it again);
+  `skipped` (the invitation was refused, for example by a direct chat or the core's power level: the core stays
+  and the binding is kept); `not_bound`; or `failed` (exit 1, the binding kept).
+- The core never leaves a room the worker's agent is not confirmed in. A rerun does not invite a member again.
+  When the core cannot read the room, the binding goes only if the worker's own agent sees itself joined and
+  the core gone; a failed read is never taken as the core having left.
+- `worked` lists the unbound rooms the worker worked in as the core's agent, from records the pool already
+  keeps: the `channel_id` of each task the router attributed to it (`state/attribution`, the newest 500), and the
+  room of each review-ask interaction the correlation log records for those tasks.
+- `join-room` invites the worker's agent to one of them and waits for it: `joined`, `waiting`, `skipped` (with
+  why) or `failed`. The core stays and no binding changes.
 
 ### Creating the agent without a pasted token
 

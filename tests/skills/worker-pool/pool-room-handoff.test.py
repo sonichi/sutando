@@ -8,7 +8,8 @@
   or held invitation, an agent that has not joined, or a members read that fails keeps the core and the
   binding.
 - A second run resumes: no second invitation to a member, and a core that already left is checked
-  through the worker's own agent before the binding is dropped.
+  through the worker's own agent before the binding is dropped: only a read that shows the worker's agent
+  joined and the core gone counts; a failed core read with the core still listed is `unknown`, retryable.
 
 The Actions are an in-memory fake; nothing here reaches a network.
 
@@ -95,6 +96,7 @@ class Base(unittest.TestCase):
 
     def hand(self, core, room=ROOM, *, worker=None, **kw):
         kw.setdefault("as_worker", lambda: worker or FakeActions(set(), me=AGENT, read_error={"is_error": True}))
+        kw.setdefault("core_agent", CORE)
         return rh.hand_room(W, room, workspace=self.ws, actions=core, server="s.space", sleep=self.sleep,
                             clock=lambda: self.clock[0], **kw)
 
@@ -182,6 +184,20 @@ class HandRoom(Base):
         self.assertIn("not a member", out["why"])
         self.assertIn(ROOM, self.bound())
 
+    def test_a_failed_core_read_is_never_taken_as_the_core_having_left(self):
+        limited = {"is_error": True, "message": "rate limited"}
+        for worker_side, core_agent in ((FakeActions({AGENT, CORE, OWNER}, me=AGENT), CORE),
+                                        (FakeActions({AGENT, OWNER}, me=AGENT), ""),
+                                        (FakeActions(set(), me=AGENT, read_error=limited), CORE)):
+            self.setUp()
+            core = FakeActions({CORE, AGENT}, read_error=limited)
+            out = self.hand(core, worker=worker_side, core_agent=core_agent)
+            self.assertEqual(out["status"], "unknown", worker_side.members)
+            self.assertIn("rate limited", out["why"])
+            self.assertIn("Run this again", out["why"])
+            self.assertEqual([c for c in core.calls if c[0] != "read"], [], "no leave was assumed or sent")
+            self.assertEqual((self.bound()[ROOM], self.bound()[LEGACY]), (W, W), "both bindings kept")
+
     def test_a_listed_binding_a_worker_without_an_agent_and_a_transport_failure(self):
         self.assertEqual(self.hand(FakeActions({CORE, AGENT}), LISTED)["status"], "handed")
         self.assertNotIn(LISTED, self.bound())
@@ -198,9 +214,70 @@ class HandRoom(Base):
             out = rh.hand_room(W, ROOM, workspace=self.ws)
         self.assertEqual(out["status"], "handed")
         made.assert_called_once_with(self.ws, vault=None)
+        gone = FakeActions(set(), read_error={"is_error": True, "message": "not a member"})
+        self.setUp()
+        with mock.patch.object(pp, "core_actions", return_value=(gone, {"server": "s.space", "agent_mxid": CORE})):
+            out = rh.hand_room(W, ROOM, workspace=self.ws, as_worker=lambda: FakeActions({AGENT}, me=AGENT))
+        self.assertEqual(out["status"], "handed", "the core's own id comes from its row")
         with mock.patch.object(connections, "connection_credential", return_value=("https://gw", "https://gw|tok")):
             acts = rh.worker_actions(self.row)
         self.assertEqual((acts.gateway, acts.bearer), ("https://gw", "tok"))
+
+
+class WorkedRooms(Base):
+    def task(self, tid, room, *, archived=False, worker=W, header=True):
+        import pool_attribution as pa
+        d = self.ws / "tasks" / ("archive" if archived else "")
+        d.mkdir(parents=True, exist_ok=True)
+        lines = ["id: " + tid, "source: ag2space"] + ([f"channel_id: {room}"] if header and room else [])
+        (d / f"{tid}.txt").write_text("\n".join(lines + ["task: hello"]) + "\n")
+        self.assertTrue(pa.record(self.ws, tid, worker))
+
+    def test_the_rooms_its_tasks_and_their_interactions_came_from_minus_bound_ones(self):
+        import correlation_log
+        self.task("task-1", "!rev:ag2.space")
+        self.task("task-2", "!rev:s.space", archived=True)
+        self.task("task-3", "!ops:s.space", archived=True)
+        self.task("task-4", ROOM)
+        self.task("task-5", "123456789")
+        self.task("task-6", "!theirs:s.space", worker=OTHER)
+        self.task("task-7", "", header=False)
+        (self.ws / "state" / "attribution" / "task-8").write_text(W)
+        correlation_log.record("interaction", {"interaction_id": correlation_log.mint_interaction_id(), "object": "o/r#1", "counterpart": "@x:s.space",
+                                               "counterpart_kind": "agent", "counterpart_scope": "unknown",
+                                               "room_id": "!triage:s.space", "room_kind": "unknown", "task_id": "task-7",
+                                               "channel": "room", "event_id": None}, workspace=self.ws)
+        correlation_log.record("interaction", {"interaction_id": correlation_log.mint_interaction_id(), "object": "o/r#2", "counterpart": "@x:s.space",
+                                               "counterpart_kind": "agent", "counterpart_scope": "unknown",
+                                               "room_id": "!elsewhere:s.space", "room_kind": "unknown",
+                                               "task_id": "task-6", "channel": "room", "event_id": None},
+                               workspace=self.ws)
+        self.assertEqual(rh.worked_rooms(self.ws, W, "s.space"), [
+            {"room": "!ops:s.space", "tasks": 1}, {"room": "!rev:s.space", "tasks": 2},
+            {"room": "!triage:s.space", "tasks": 1}])
+
+    def test_no_attribution_record_means_no_worked_rooms(self):
+        self.assertEqual(rh.worked_rooms(self.ws, W, "s.space"), [])
+
+    def test_join_room_invites_and_waits_and_the_core_stays(self):
+        core = FakeActions({CORE, OWNER}, joins=1)
+        out = rh.join_room(W, "!rev:ag2.space", workspace=self.ws, actions=core, server="s.space", wait_s=10,
+                           poll_s=5, sleep=self.sleep, clock=lambda: self.clock[0])
+        self.assertEqual((out["status"], out["room"]), ("joined", "!rev:s.space"))
+        self.assertNotIn("room.leave", [c[0] for c in core.calls])
+        self.assertEqual(self.bound()[ROOM], W, "no binding changes")
+        out = rh.join_room(W, "!rev:s.space", workspace=self.ws, actions=FakeActions({CORE, AGENT}), server="s.space")
+        self.assertEqual(out["status"], "joined")
+        for core, status in ((FakeActions({CORE}, invite={"is_error": True, "message": "direct chat"}), "skipped"),
+                             (FakeActions({CORE}, joins=99), "waiting"),
+                             (FakeActions(set(), read_error={"is_error": True, "message": "not a member"}), "skipped"),
+                             (FakeActions(set(), read_error=pp.ProvisionError("http 502")), "failed")):
+            out = rh.join_room(W, "!rev:s.space", workspace=self.ws, actions=core, server="s.space",
+                               sleep=self.sleep, clock=lambda: self.clock[0])
+            self.assertEqual(out["status"], status, out)
+        self.row["disabled"] = True
+        self.assertEqual(rh.join_room(W, "!rev:s.space", workspace=self.ws, actions=FakeActions({CORE}))["status"],
+                         "failed")
 
 
 class Cli(Base):
@@ -216,6 +293,20 @@ class Cli(Base):
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(out), {"worker": W, "rooms": [
             {"room": ROOM, "bindings": [LEGACY, ROOM]}, {"room": LISTED, "bindings": [LISTED]}]})
+
+    def test_worked_lists_the_unbound_rooms_it_worked_in(self):
+        with mock.patch.object(pp, "core_lane", return_value={"server": "s.space"}), \
+                mock.patch.object(rh, "worked_rooms", return_value=[{"room": "!rev:s.space", "tasks": 2}]) as worked:
+            rc, out = self.run_cli("worked", W)
+        self.assertEqual((rc, json.loads(out)), (0, {"worker": W, "rooms": [{"room": "!rev:s.space", "tasks": 2}]}))
+        worked.assert_called_once_with(self.ws, W, "s.space")
+
+    def test_join_room_prints_one_line_and_fails_only_on_failed(self):
+        for status, rc in (("joined", 0), ("skipped", 0), ("failed", 1)):
+            with mock.patch.object(rh, "join_room", return_value={"status": status}) as join:
+                self.assertEqual(self.run_cli("join-room", W, "--room", "!rev:s.space"),
+                                 (rc, json.dumps({"status": status}) + "\n"))
+            join.assert_called_once_with(W, "!rev:s.space", workspace=self.ws, wait_s=0.0)
 
     def test_hand_room_prints_one_line_and_fails_only_on_failed(self):
         for status, rc in (("handed", 0), ("waiting", 0), ("failed", 1)):
