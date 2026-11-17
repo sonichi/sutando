@@ -132,12 +132,22 @@ def attributor(worker: str, argv: "list[str]", log):
     return attribute
 
 
+def _holds_lane(worker: str, workspace) -> bool:
+    """Whether this process holds `worker`'s lane lease: only the bridge serving the lane now may adopt."""
+    from connections import BridgeLeaseIndeterminate, bridge_pid, worker_identity
+    instance = str((worker_identity(worker, Path(workspace)) or {}).get("instance") or "")
+    try:
+        return bool(instance) and bridge_pid(instance, Path(workspace)) == os.getpid()
+    except BridgeLeaseIndeterminate:
+        return False
+
+
 def _still_own(worker: str, workspace, own_results) -> bool:
-    """Whether `own_results` is still `worker`'s own results folder: once the field is cleared or moved,
-    an older bridge's adopt pass must not pull anything back into it."""
+    """Whether `own_results` is still `worker`'s own results folder and this process still serves its lane:
+    a switch replaces the bridge (`migrate-dirs` waits for that), so an older one adopts nothing."""
     from connections import worker_dirs
     dirs = worker_dirs(worker, Path(workspace))
-    return bool(dirs) and dirs[1].resolve() == Path(own_results).resolve()
+    return bool(dirs) and dirs[1].resolve() == Path(own_results).resolve() and _holds_lane(worker, workspace)
 
 
 def _adopt(worker: str, shared_results, own_results, names, log, belongs=lambda name: True) -> "list[str]":
