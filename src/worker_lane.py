@@ -115,6 +115,15 @@ def serving(agent_mxid: str, workspace) -> "tuple[str, str, str]":
     return (worker, instance, "") if worker else ("", "", f"{agent_mxid} is no pool worker's own agent")
 
 
+def runtime_identity(worker: str, instance: str, workspace) -> bytes:
+    """What a worker's bridge takes from its row beyond the declaration, as bytes for its supervised
+    revision: a record-only change to any of it is a changed bridge that sparrowd restarts."""
+    from connections import worker_identity
+    row = worker_identity(worker, Path(workspace)) or {}
+    fields = [worker, instance] + [str(row.get(k) or "") for k in ("token_ref", "gateway_url", "server")]
+    return "\0".join(fields).encode("utf-8")
+
+
 def bridge_overlay(workspace, instance: str) -> "dict[str, str]":
     """What a worker's declared bridge runs under beyond its declaration: the lane's dirs and instance."""
     ws = Path(workspace)

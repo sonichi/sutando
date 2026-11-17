@@ -162,7 +162,9 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
         if problem:
             return None, f"{path}: {problem}"
         served = {"worker": worker, "instance": instance}
-    return dict(want, url_vault_key=adapter.url_vault_key(segment), digest=hashlib.sha256(raw).hexdigest(),
+    # A worker's row is part of what runs: a record-only change must be a new revision for sparrowd.
+    runtime = b"\0" + worker_lane.runtime_identity(worker, instance, Path(agents).resolve().parent) if served else b""
+    return dict(want, url_vault_key=adapter.url_vault_key(segment), digest=hashlib.sha256(raw + runtime).hexdigest(),
                 **served), ""
 
 

@@ -332,6 +332,40 @@ class TheAgentBridge(Base):
         self.assertIn("env is not the canonical one", bridge.load(decl, self.agents)[1])
 
 
+class TheSupervisedRevision(Base):
+    def revision(self):
+        spec = importlib.util.spec_from_file_location("sparrowd_wl", ROOT / "src" / "sparrowd.py")
+        sd = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sd)
+        specs, skipped = sd._agent_bridge_specs(self.ws, vault_keys=[])
+        self.assertEqual((len(specs), skipped), (1, []))
+        return specs[0].revision
+
+    def test_a_record_only_replacement_is_a_changed_bridge_and_an_unchanged_row_is_not(self):
+        decl = self.declare()
+        raw = decl.read_bytes()
+        first = self.revision()
+        self.assertEqual(self.revision(), first, "an unchanged row keeps the revision")
+        for fields in ({"worker": "b" * 32}, {"instance": "alpha-fixture-net-replaced"},
+                       {"token_ref": "AG2_REMOTE_TOKEN_REPLACED"}):
+            with self.subTest(fields=fields):
+                good = C.record_path(self.ws).read_text()
+                self.edit_worker_row(**fields)
+                self.assertEqual(decl.read_bytes(), raw, "the declaration is untouched")
+                self.assertNotEqual(self.revision(), first, "sparrowd restarts the bridge on the new mapping")
+                C.record_path(self.ws).write_text(good)
+        self.assertEqual(self.revision(), first)
+
+    def test_a_claude_local_declarations_revision_is_its_bytes_alone(self):
+        import hashlib
+        root = self.agents / SEG
+        cfg = {"ROOT": str(root), "BRIDGE": "sparrowd", "AGENT_ID": WORKER_AGENT, "TOKEN_VAULT_KEY": cli.vault_key(SEG)}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.wire_bridge(cfg), "")
+        decl = cli.bridge_home(root) / cli.DECLARATION
+        self.assertEqual(bridge.load(decl, self.agents)[0]["digest"], hashlib.sha256(decl.read_bytes()).hexdigest())
+
+
 class TheLaneKeeper(Base):
     def keep(self):
         started = []
