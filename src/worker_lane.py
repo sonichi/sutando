@@ -121,20 +121,21 @@ def _holds_lane(worker: str, workspace) -> bool:
         return False
 
 
-def _still_own(worker: str, workspace, own_results) -> bool:
+def _still_own(worker: str, workspace, own_results, lease: bool = True) -> bool:
     """Whether `own_results` is still `worker`'s own results folder and this process still serves its lane:
     a switch replaces the bridge (`migrate-dirs` waits for that), so an older one adopts nothing."""
     from connections import worker_dirs
     dirs = worker_dirs(worker, Path(workspace))
-    return bool(dirs) and dirs[1].resolve() == Path(own_results).resolve() and _holds_lane(worker, workspace)
+    return bool(dirs) and dirs[1].resolve() == Path(own_results).resolve() and (not lease or _holds_lane(worker, workspace))
 
 
-def _adopt(worker: str, shared_results, own_results, names, log, belongs=lambda name: True) -> "list[str]":
+def _adopt(worker: str, shared_results, own_results, names, log, belongs=lambda name: True,
+           lease: bool = True) -> "list[str]":
     import undelivered_quarantine
     moved = []
     for name in names:
         # Re-checked right before each move: the field can be cleared while a pass runs.
-        if not _still_own(worker, Path(shared_results).parent, own_results) or not belongs(name):
+        if not _still_own(worker, Path(shared_results).parent, own_results, lease) or not belongs(name):
             continue
         try:
             Path(own_results).mkdir(parents=True, exist_ok=True)
@@ -159,19 +160,20 @@ def _names(folder, pattern: str) -> "list[str]":
         return []
 
 
-def adopt_stray_proactive(worker: str, shared_results, own_results, log=None) -> "list[str]":
+def adopt_stray_proactive(worker: str, shared_results, own_results, log=None, lease: bool = True) -> "list[str]":
     """Move the proactive files `worker`'s session stamped (`lane_claims_proactive`) from the shared
     results/ into its own; returns the names moved. The move never replaces a file: a name already in its
     folder, or one another consumer took first, is left for a later pass. Without a no-replace rename
-    nothing is moved (a link-then-unlink could delete a file a producer just republished there)."""
+    nothing is moved (a link-then-unlink could delete a file a producer just republished there). `lease`
+    False: a caller that is not the bridge and runs once the old bridge is gone (`migrate-dirs`)."""
     from proactive_routing import lane_claims_proactive
     if not worker:
         return []
     names = [n for n in _names(shared_results, "proactive-*.txt") if lane_claims_proactive(n, worker)]
-    return _adopt(worker, shared_results, own_results, names, log)
+    return _adopt(worker, shared_results, own_results, names, log, lease=lease)
 
 
-def adopt_stray_results(worker: str, workspace, own_results, log=None) -> "list[str]":
+def adopt_stray_results(worker: str, workspace, own_results, log=None, lease: bool = True) -> "list[str]":
     """Move the results of tasks whose home is `worker`'s own folder, `own_results` (`connections.task_home`),
     from the shared results/ into it, as `adopt_stray_proactive` does: a late answer an older session wrote."""
     from connections import task_home
@@ -181,7 +183,7 @@ def adopt_stray_results(worker: str, workspace, own_results, log=None) -> "list[
     def belongs(name: str) -> bool:
         home = task_home(Path(name).stem, ws)
         return home["own"] and home["worker"] == worker and home["results"].resolve() == Path(own_results).resolve()
-    return _adopt(worker, ws / "results", own_results, _names(ws / "results", "task-*.txt"), log, belongs)
+    return _adopt(worker, ws / "results", own_results, _names(ws / "results", "task-*.txt"), log, belongs, lease)
 
 
 # How often an own-dir bridge looks for its worker's proactive files still landing in the shared results/.
