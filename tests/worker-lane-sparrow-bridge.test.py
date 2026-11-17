@@ -542,5 +542,95 @@ class TheLaneKeeper(Base):
         self.assertIsNotNone(C.worker_enabled_identity(W, self.ws))
 
 
+class Status(Base):
+    """`worker_lane.py status`: what serves a worker's agent now, for a caller that cut it over."""
+
+    def bridge_procs(self, decl, *, flag="--agent-bridges", script="/opt/co/src/sparrow_agent_bridge.py"):
+        return {10: (1, 600, f"python3 /opt/co/src/sparrowd.py {flag}".strip()),
+                11: (10, 500, f"python3 {script} {decl}"),
+                12: (1, 50, "python3 /opt/co/src/remote-gateway-bridge.py")}
+
+    def status(self, procs, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = worker_lane.main(["status", "--worker", W, *argv], workspace=self.ws, vault=self.vault, procs=procs)
+        return rc, json.loads(out.getvalue())
+
+    def test_the_declared_bridge_under_sparrowd_holds_the_lease(self):
+        decl = self.declare()
+        procs = self.bridge_procs(decl)
+        with mock.patch.object(C, "bridge_pid", return_value=11):
+            rc, out = self.status(procs)
+        self.assertEqual(rc, 0)
+        self.assertEqual((out["declared"], out["lease_pid"], out["held_by"], out["instance"], out["agent"]),
+                         (True, 11, "declared-bridge", self.row["instance"], WORKER_AGENT))
+        self.assertEqual([(s["pid"], s["agent_bridges"], s["checkout"]) for s in out["sparrowd"]], [(10, True, "/opt/co")])
+
+    def test_any_other_holder_is_other_and_no_holder_is_none(self):
+        decl = self.declare()
+        for procs, pid in ((self.bridge_procs(decl), 12), (self.bridge_procs(decl, flag=""), 11),
+                           (self.bridge_procs(self.ws / "elsewhere.json"), 11),
+                           (self.bridge_procs(decl, script="/opt/co/src/other.py"), 11),
+                           ({11: (99, 1, f"python3 sparrow_agent_bridge.py {decl}")}, 11)):
+            with mock.patch.object(C, "bridge_pid", return_value=pid):
+                self.assertEqual(self.status(procs)[1]["held_by"], "other", procs)
+        with mock.patch.object(C, "bridge_pid", return_value=0):
+            self.assertEqual(self.status({})[1]["held_by"], "none")
+        with mock.patch.object(C, "bridge_pid", return_value=77):
+            self.assertEqual(self.status({})[1]["held_by"], "unknown", "a holder ps does not list")
+
+    def test_an_undeclared_worker_and_an_indeterminate_lease_say_so(self):
+        with mock.patch.object(C, "bridge_pid", side_effect=C.BridgeLeaseIndeterminate("x", "torn lease")):
+            rc, out = self.status({})
+        self.assertEqual((rc, out["declared"], out["held_by"], out["lease_pid"]), (0, False, "unknown", 0))
+        self.assertIn("torn lease", out["why"])
+        with mock.patch.object(worker_lane, "declared_bridge", side_effect=OSError("gone")), \
+                mock.patch.object(C, "bridge_pid", return_value=0):
+            out = self.status({})[1]
+        self.assertEqual((out["declared"], out["why"]), (None, "OSError: gone"))
+
+    def test_a_worker_with_no_identity_is_refused(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = worker_lane.main(["status", "--worker", "b" * 32, "--workspace", str(self.ws)], procs={})
+        self.assertEqual(rc, 1)
+        self.assertIn("has no agent identity row", json.loads(out.getvalue())["why"])
+        with mock.patch.object(worker_lane, "_declaration_for", side_effect=worker_lane.RecordUnreadable("torn")), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(worker_lane.main(["status", "--worker", W], workspace=self.ws, procs={}), 1)
+        self.assertEqual(json.loads(out.getvalue())["why"], "torn")
+
+    def test_sparrowd_runs_says_whether_its_checkout_takes_worker_declarations(self):
+        import tempfile
+        co = Path(tempfile.mkdtemp(dir=self.ws))
+        (co / "src").mkdir()
+        (co / "src" / "sparrowd.py").write_text("")
+        procs = {5: (1, 100, f"python3 {co}/src/sparrowd.py --agent-bridges"), 6: (1, 1, "python3 src/sparrowd.py"),
+                 7: (1, 1, "vim notes.txt"), 8: (1, 1, "sh -c 'unbalanced")}
+        runs = {r["pid"]: r for r in worker_lane.sparrowd_runs(procs, now=10_000.0)}
+        self.assertEqual(sorted(runs), [5, 6])
+        self.assertEqual((runs[5]["serves_workers"], runs[6]["serves_workers"], runs[6]["checkout"]), (False, False, ""))
+        (co / "src" / "worker_lane.py").write_text(f"WRITTEN_BY = {worker_lane.WRITTEN_BY!r}\n")
+        self.assertFalse(worker_lane.sparrowd_runs(procs)[0]["serves_workers"], "no agent bridge beside it")
+        (co / "src" / "sparrow_agent_bridge.py").write_text("import worker_lane\n")
+        os.utime(co / "src" / "sparrow_agent_bridge.py", (9_950.0, 9_950.0))
+        run = worker_lane.sparrowd_runs(procs, now=10_000.0)[0]
+        self.assertEqual((run["serves_workers"], run["code_changed_since_start"], run["checkout"]), (True, True, str(co)))
+        self.assertFalse(worker_lane.sparrowd_runs(procs, now=10_100.0)[0]["code_changed_since_start"])
+
+    def test_processes_reads_ps_and_is_empty_when_it_cannot(self):
+        listing = "  1     0 10-02:03:04 /sbin/launchd\n 42     1    01:05 python3 x.py --a b\n bad line\n"
+        with mock.patch.object(worker_lane.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, listing, "")):
+            self.assertEqual(worker_lane.processes(),
+                             {1: (0, ((10 * 24 + 2) * 60 + 3) * 60 + 4, "/sbin/launchd"), 42: (1, 65, "python3 x.py --a b")})
+        with mock.patch.object(worker_lane.subprocess, "run", side_effect=OSError("no ps")):
+            self.assertEqual(worker_lane.processes(), {})
+        with mock.patch.object(worker_lane, "processes", return_value={}) as ps, \
+                mock.patch.object(C, "bridge_pid", return_value=0):
+            self.assertEqual(worker_lane.status(W, self.ws)["held_by"], "none")
+        ps.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()
