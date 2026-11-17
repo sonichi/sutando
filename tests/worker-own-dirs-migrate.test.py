@@ -83,6 +83,25 @@ class Forward(Base):
         again, why = self.migrate()
         self.assertEqual((why, again["results_moved"], again["proactive_moved"]), ("", [], []))
 
+    def test_a_task_its_lane_queued_before_the_switch_moves_into_its_folder(self):
+        (self.ws / "tasks").mkdir(parents=True)
+        for tid in (self.mine, self.core):
+            (self.ws / "tasks" / f"{tid}.txt").write_text("t")
+        out, why = self.migrate()
+        self.assertEqual((why, out["tasks_moved"]), ("", [f"{self.mine}.txt"]))
+        home = C.task_home(self.mine, self.ws)
+        self.assertTrue((home["tasks"] / f"{self.mine}.txt").is_file())
+        self.assertTrue((self.ws / "tasks" / f"{self.core}.txt").is_file())
+        import stat
+        self.assertEqual(stat.S_IMODE(self.own.stat().st_mode), 0o700)
+
+    def test_a_task_still_held_by_a_delivery_or_an_unreadable_folder_stays(self):
+        self.deliver(self.mine)
+        from delivery import task_dispatch
+        self.assertEqual(worker_lane._queued_for(W, self.ws), [])
+        with mock.patch.object(task_dispatch, "owned_task_ids", side_effect=task_dispatch.WorkerHoldUnreadable("io")):
+            self.assertEqual(worker_lane._queued_for(W, self.ws), [])
+
     def test_a_record_write_refusal_stops_it(self):
         with mock.patch.object(C, "set_worker_dirs", side_effect=C.ConnectionsError("record busy")):
             self.assertEqual(self.migrate()[1], "record busy")

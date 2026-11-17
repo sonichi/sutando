@@ -460,7 +460,7 @@ def _live_txt(folder) -> "list[str]":
 def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=subprocess.run) -> "tuple[dict, str]":
     """Switch `worker` onto its own folders (or back, `undo`); (what was done, '' or why it stopped).
     Idempotent: a re-run picks up whatever an interrupted one left."""
-    from connections import ConnectionsError, set_worker_dirs, task_home, worker_identity, worker_root
+    from connections import ConnectionsError, ensure_worker_dirs, set_worker_dirs, worker_identity, worker_root
     ws = Path(workspace)
     mxid = str((worker_identity(worker, ws) or {}).get("agent_mxid") or "").strip()
     if not mxid:
@@ -489,11 +489,10 @@ def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=s
         if owed:
             return out, (f"{len(owed)} task(s) delivered to {worker} but no task-event handler can move them; "
                          "nothing was switched")
-    for d in (tasks / "archive", results / "archive"):
-        d.mkdir(parents=True, exist_ok=True)
     try:
         set_worker_dirs(worker, True, workspace=ws)
-    except ConnectionsError as e:
+        ensure_worker_dirs(worker, ws)
+    except (ConnectionsError, OSError) as e:
         return out, str(e)
     if handler:
         try:
@@ -507,10 +506,23 @@ def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=s
             out["deliveries"] = json.loads(done.stdout.strip().splitlines()[-1])
         except (ValueError, IndexError):
             out["deliveries"] = done.stdout.strip()[-300:]
-    mine = [n for n in _live_txt(ws / "results") if task_home(Path(n).stem, ws)["worker"] == worker]
-    out["results_moved"] = _move_live(ws / "results", results, mine)
+    out["tasks_moved"] = _move_live(ws / "tasks", tasks, _queued_for(worker, ws))
+    out["results_moved"] = adopt_stray_results(worker, ws, results)
     out["proactive_moved"] = adopt_stray_proactive(worker, ws / "results", results)
     return out, ""
+
+
+def _queued_for(worker: str, ws: Path) -> "list[str]":
+    """Live task files in the shared tasks/ that `worker`'s own lane queued and no delivery holds any
+    longer (one routed to it moved with its sentinel; one still held stays for a re-run)."""
+    from connections import task_home
+    from delivery.task_dispatch import WorkerHoldUnreadable, owned_task_ids
+    try:
+        held = set(owned_task_ids(ws / "deliveries", worker))
+    except WorkerHoldUnreadable:
+        return []
+    return [n for n in _live_txt(ws / "tasks")
+            if Path(n).stem not in held and task_home(Path(n).stem, ws)["worker"] == worker]
 
 
 def main(argv=None, workspace=None, vault=None, procs=None, run=subprocess.run) -> int:

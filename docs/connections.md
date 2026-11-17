@@ -739,8 +739,8 @@ its own results (`spawn_worker.inbox_env`, `result_publish`). A worker without t
 the field (which restarts a declared bridge), has the declared task-event handler empty the worker's
 `deliveries/<id>/` folder under the router's locks (a task its own lane queued moves into its tasks folder
 and its sentinel is archived; any other is handed back to the core and touched so the core's watcher picks
-it up; an answered one keeps its sentinel), and moves the worker's unclaimed live results into its own
-results. It prints one JSON line and is idempotent: a refusal says why and a re-run finishes. It restarts no
+it up; an answered one keeps its sentinel), then moves into its own folders any task its own lane queued
+that is still in the shared `tasks/` and the worker's unclaimed live results. It prints one JSON line and is idempotent: a refusal says why and a re-run finishes. It restarts no
 session: respawn the worker so its session takes the new inbox. `--undo` clears the field and returns the
 worker's live tasks (touched) and results to the shared folders.
 
