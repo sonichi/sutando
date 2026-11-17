@@ -165,6 +165,14 @@ class ConnectorTest(unittest.TestCase):
         self.assertTrue(self.w.result("task-1").startswith("[no-send]"))
         self.assertEqual(self.metrics()[0]["event_type"], "room.joined")
 
+    def test_trigger_of_keeps_registry_playbooks_only(self):
+        for pb in ("room-onboard", "summon", "email"):
+            self.assertEqual(oc.trigger_of({"event_type": "commons.summon", "playbook": pb}),
+                             ("commons.summon", pb))
+        for pb in ("plain-skill", "../evil", "Summon", ""):
+            self.assertEqual(oc.trigger_of({"event_type": "commons.summon", "playbook": pb}),
+                             ("commons.summon", None), pb)
+
     def test_a_summon_is_framed_as_an_event(self):
         self.w.task("task-1", "STUB:TEXT Summoned to page P: review the plan.", event_type="commons.summon")
         self.w.serve()

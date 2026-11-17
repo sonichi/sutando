@@ -201,7 +201,8 @@ def stop_holder(workspace, task: dict, roster=FROM_DISK) -> "str | None":
 
 
 def deliver_one(workspace, recipient: str, task_id: str,
-                _between_sentinel_and_attribution=None, _arbitration_seams=None) -> str:
+                _between_sentinel_and_attribution=None, _arbitration_seams=None, payload=None,
+                renotify=False) -> str:
     """Create one sentinel. Returns 'delivered' | 'already' | 'no-payload'.
 
     Checks BOTH names: a sentinel already renamed to `.accepted` is work in
@@ -211,6 +212,11 @@ def deliver_one(workspace, recipient: str, task_id: str,
     A sentinel names a payload; without one it names nothing, and its recipient
     can only delete it. An ARCHIVED payload is the dangerous case — that is
     finished work, and a sentinel would offer it again.
+
+    `payload` is where the task's bytes are when not yet in `tasks/`: a worker's lane routes its
+    staged copy before publishing it, so the core's watcher never finds that task unrouted.
+    `renotify`: once that task is published, a pending sentinel found is replaced by a fresh one, so a
+    watcher that gave up on it while the payload was not yet there sees it again.
 
     `_between_sentinel_and_attribution` is a test seam: the two writes are not
     crash-atomic, so an existing sentinel is re-attributed on 'already'.
@@ -223,10 +229,13 @@ def deliver_one(workspace, recipient: str, task_id: str,
         if marker != "absent":
             raise ConflictingDelivery(
                 f"{task_id}: {recipient} carries {pd.NON_EXCLUSIVE_MARKER} ({marker}); refusing to deliver into it")
-        if pd.find_in(dfd, task_id) is not None:
+        found = pd.find_in(dfd, task_id)
+        if found is not None:
+            if renotify and found == task_id + pd.PENDING_SUFFIX:
+                _renew_sentinel(dfd, task_id)
             _attribute(workspace, recipient, task_id)
             return "already"
-        if not pd.payload_path(Path(workspace), task_id).is_file():
+        if not (Path(payload) if payload is not None else pd.payload_path(Path(workspace), task_id)).is_file():
             return "no-payload"
         # Re-read under the lock the hand-off takes: a pass holding a roster read
         # before a retirement must not commit new work to the retiring worker.
@@ -245,6 +254,13 @@ def deliver_one(workspace, recipient: str, task_id: str,
     return "delivered"
 
 
+def _renew_sentinel(dfd: int, task_id: str) -> None:
+    """A new inode renamed over the pending name: an event on that name and a fresh ctime and mtime."""
+    tmp = f".{task_id}.renew"
+    os.close(os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o644, dir_fd=dfd))
+    os.replace(tmp, task_id + pd.PENDING_SUFFIX, src_dir_fd=dfd, dst_dir_fd=dfd)
+
+
 def _admits(workspace, recipient: str) -> bool:
     try:
         return pr.admits_deliveries(workspace, recipient)
@@ -258,13 +274,14 @@ def _attribute(workspace, recipient: str, task_id: str) -> None:
         pa.record(workspace, task_id, recipient)
 
 
-def route(workspace, task: dict, roster=FROM_DISK, _between_suffix_checks=None, _arbitration_seams=None) -> dict:
+def route(workspace, task: dict, roster=FROM_DISK, _between_suffix_checks=None, _arbitration_seams=None,
+          payload=None, renotify=False) -> dict:
     """One task through one pass.
 
     An omitted `roster` loads it; an explicit None is an admitted "no roster".
     An absent or unreadable roster REFUSES the pass
     rather than defaulting to the core, which would aim every task at one
-    recipient the moment the file is unwritable.
+    recipient the moment the file is unwritable. `payload`, `renotify`: see `deliver_one`.
     """
     task_id = task.get("id")
     if not task_id:
@@ -301,7 +318,8 @@ def route(workspace, task: dict, roster=FROM_DISK, _between_suffix_checks=None, 
         # "no-payload" stays its own list: folded into `already` a refusal reads as delivered.
         buckets = {"delivered": [], "already": [], "no-payload": [], "fenced": []}
         for t in targets:
-            buckets[deliver_one(workspace, t, task_id, _arbitration_seams=_arbitration_seams)].append(t)
+            buckets[deliver_one(workspace, t, task_id, _arbitration_seams=_arbitration_seams,
+                                payload=payload, renotify=renotify)].append(t)
     return {"task_id": task_id, "version": r.get("version"), "targets": targets,
             "delivered": buckets["delivered"], "already": buckets["already"],
             "skipped": buckets["no-payload"], "fenced": buckets["fenced"],

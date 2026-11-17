@@ -126,9 +126,11 @@ id, for a join `join|<agent mxid>|<room id>`) is passed only as one token of at
 most 256 characters from `[A-Za-z0-9._:@!|=+/-]`, and `"playbook"` only as an id
 matching `[a-z0-9][a-z0-9-]{0,63}`; anything else is dropped. All three are
 trusted pre-body headers. The core runs `skills/<playbook>/SKILL.md` only for an
-allowed playbook (a registry playbook, or a skill whose `manifest.json` sets
-`"playbook": true`), else the registry default for the event (`room.joined` →
-`room-onboard`; `room.mention` → `reply`, today's answer), else handles the task
+allowed playbook (a skill whose `manifest.json` sets `"playbook": true`; a
+registry id needs the same opt-in), else the registry default for the event under
+that rule (`room.joined` → `room-onboard`; `commons.summon` → `summon`;
+`commons.app_request` → `app-request`; `email.received` → `email`; `room.mention` → `reply`, today's answer),
+else handles the task
 as a message that follows its body. An event type with no registry entry has no
 default, so it resolves to none; a playbook string is never trusted to pick a
 skill. An event body may quote member-written text; the agent treats that text as

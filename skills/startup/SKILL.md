@@ -41,6 +41,8 @@ A pool worker is an instance, not the canonical core. It shares the host's works
 
 3. Report what actually happened, never a fixed line: `start` → `worker <instance> ready: watching <inbox>` (plus `+ N cron(s) registered` when step 2.5 registered any) — unless the watcher's first line is `WATCHER_HELD:`, which means a holder this session did not start (the gate's `why=` names it) still owns the inbox: report that line verbatim, claim no readiness, and leave `--force-restart` to the owner's word; `skip` → `worker <instance> already watching <inbox>` (nothing was started); `unknown` → start NOTHING and report the gate's `why=` verbatim. Reporting readiness after an `unknown` is the failure this step exists to prevent: it claims a watcher that does not exist.
 
+4. After boot, answer each `TASK_FILE:` by publishing that task's result file (`$SUTANDO_WORKSPACE_DIR/results/<task id>.txt`) with `"$SUTANDO_PY" "$(dirname "$SUTANDO_WATCHER_CMD")/result_publish.py" <path>` (body on stdin), never only in this terminal: a reply printed here reaches nobody. When you post into a room directly instead, pass the task's `thread_root` header (or `source_message_id` as `reply_to`) so a thread question is answered in its thread.
+
 
 ## What this replaces
 
