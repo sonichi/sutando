@@ -7044,6 +7044,21 @@ def check_sspace_migration(workspace_dir: Optional[Path] = None) -> "dict | None
                        f'"Moving a terminal-run core to {target}"))')}
 
 
+GATEWAY_CORE_HELD_DETAIL = (
+    "sparrowd's core gateway bridge is held: it stood down to another holder of its lease, so this "
+    "install's own bridge is not serving; it starts again once that lease is free (docs/connections.md, "
+    '"The core bridge under sparrowd")')
+
+
+def _sparrowd_core_held() -> bool:
+    """Whether a running sparrowd reports its core gateway bridge held; False when none answers."""
+    try:
+        import sparrow_core_bridge  # noqa: PLC0415
+        return sparrow_core_bridge.core_worker_state(WORKSPACE_DIR) == "held"
+    except Exception:  # noqa: BLE001 - a probe that cannot run reports nothing
+        return False
+
+
 def check_gateway_bridge() -> "dict | None":
     """Health of the gateway bridge (remote-gateway-bridge.py) of the primary connection — the
     process that carries MOBILE-app messages from the cloud gateway down to the
@@ -7062,6 +7077,8 @@ def check_gateway_bridge() -> "dict | None":
     configured = _gateway_configured()
     if not configured:
         return None
+    if _sparrowd_core_held():
+        return {"name": "gateway-bridge", "status": "warn", "detail": GATEWAY_CORE_HELD_DETAIL}
     try:
         # pgrep exits 1 for no-match but 2/3 when broken; probe_pids keeps those
         # apart. The relay name is a compat stub, so it is a real duplicate.

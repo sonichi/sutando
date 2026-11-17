@@ -19,6 +19,12 @@ until that revision changes. A restart is told the previous exit code (SPARROWD_
 bridge's poll stall, and 78, this launcher's own failure (no bridge ran), raise no alert; any other code
 the wrapper's alert, with its deliberate-restart window and cooldown.
 
+sparrowd runs the core only while the opt-in gate is set (`core_gate`, the lib's own check), so removing
+the gate stops a core whichever sparrowd runs it. A held core (it stood down to another holder) is re-armed
+by sparrowd's scan once that lease is free, and reads as not healthy meanwhile (`core_worker_state`). The
+bridge is told sparrowd restarts it (SUTANDO_BRIDGE_RESTART_OWNER) unless its environment already names
+a restart owner.
+
 One supervisor per bridge: a bridge of this checkout already serving the lane is evicted only when it
 is a stray (its parent gone, or this sparrowd); one another live process supervises (an app keepalive,
 the gate-off wrapper) is refused, and the launcher retries with backoff until that supervisor is gone.
@@ -58,6 +64,8 @@ LOG_TAG = "sparrow-core-bridge"
 
 
 CLAIM = "core.json"
+CORE_WORKER = "core-gateway-bridge"
+RESTART_OWNER_ENV = "SUTANDO_BRIDGE_RESTART_OWNER"
 
 
 class CoreUnavailable(Exception):
@@ -148,6 +156,40 @@ def decide(workspace: Path, environ: Mapping[str, str], *,
     if parked:
         return None, "the legacy connection is parked and no named connection is primary"
     return None, "no REMOTE_TASK_TOKEN configured and no named connection is primary"
+
+
+def core_gate(workspace: Path, repo: Path = REPO, run: Callable = subprocess.run) -> bool:
+    """Whether the opt-in gate is set, by the lib's `gateway_core_gate`; a check that cannot run is unset."""
+    try:
+        return run(["bash", str(Path(repo) / "src" / "launchd" / LIB.name), "core-gate", str(workspace)],
+                   capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def lease_free(instance: str, workspace: Path) -> bool:
+    """Whether no process is proven to hold `instance`'s bridge lease; an unprovable lease is not free."""
+    try:
+        return not connections.bridge_pid(instance, workspace)
+    except connections.BridgeLeaseIndeterminate:
+        return False
+
+
+def core_worker_state(workspace: Path, timeout: float = 2.0) -> Optional[str]:
+    """The core worker's state as the running sparrowd reports it (`running`, `held`, ...); None when no
+    sparrowd answers or it supervises no core."""
+    import socket
+    from ag2_sparrow.control_socket import control_socket_path
+    try:
+        path = control_socket_path(Path(workspace) / "state" / "sparrowd")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.settimeout(timeout)
+            c.connect(str(path))
+            c.sendall(b'{"op": "status"}\n')
+            status = json.loads(c.makefile("r").readline())
+        return status["workers"][CORE_WORKER]["state"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 def claim_path(workspace: Path) -> Path:
@@ -348,6 +390,8 @@ def main(argv=None, *, workspace: Optional[Path] = None, environ: Optional[Mappi
     if inst:
         connections.record_supervised_start(inst, pid=os.getpid(), repo=REPO, workspace=ws)
         _lane_log(inst, ws)
+    if not env.get(RESTART_OWNER_ENV):
+        env[RESTART_OWNER_ENV] = "sparrowd"
     execve(sys.executable, argv_exec, env)
     return 0  # reached only with an injected execve
 

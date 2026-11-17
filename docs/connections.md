@@ -751,9 +751,21 @@ itself. A host can move that job to sparrowd. Nothing changes until the opt-in f
   the proactive room.
 - sparrowd restarts the worker when the connection it serves changes: a primary move, the legacy
   row parked or unparked, a rotated token file, or the row's token_ref, gateway URL or agent. Exit 75
-  (the bridge's stand-down) holds it until one of those changes. Any other exit is restarted with
-  backoff (at most 60 s). Each restart raises the wrapper's alert, within the same deliberate-restart
-  window and cooldown, except after a poll stall (rc 69).
+  (the bridge's stand-down) holds it until one of those changes, or until a later scan finds the lease
+  free, which re-arms it. While held, sparrowd's `health` reports unhealthy and health-check's
+  gateway-bridge check warns that this install's bridge is not serving. Any other exit is restarted
+  with backoff (at most 60 s).
+- Each restart raises the wrapper's alert, within the same deliberate-restart window and cooldown.
+  There are two exceptions: a poll stall (rc 69), and a start that failed before any bridge ran
+  (rc 78, for example a named primary with no recorded agent).
+- One supervisor per bridge. A stray bridge of this checkout whose parent is gone is evicted. A
+  bridge that another live process keeps (an app's keepalive, the gate-off wrapper) is refused, and
+  the worker retries until that supervisor is gone.
+- sparrowd reads the gate itself on every scan, so removing the file stops the core in whichever
+  sparrowd runs it, including one that startup's fallback started outside the launchd job.
+- The bridge is told sparrowd restarts it (`SUTANDO_BRIDGE_RESTART_OWNER=sparrowd`) unless its
+  environment already names a restart owner (the plist names `launchd`). Its stall exits stay armed
+  either way.
 - While sparrowd's core serves a named primary, it records that in `state/sparrowd/core.json`.
   The lane keeper then leaves that lane to it, as for a declared bridge: while any process holds the
   lane's lease, and for `DECLARED_BRIDGE_GRACE_S` (180 s) after it first finds nobody holding it.
@@ -770,7 +782,8 @@ Cut-over (on the host, by its owner):
 
 Undo: `rm "$(bash scripts/sutando-config.sh workspace)/state/sparrowd/core.enabled"`, stamp the
 deliberate restart as in step 1, then `launchctl kickstart -k gui/$(id -u)/com.sutando.gateway-bridge`.
-The wrapper stops sparrowd with its bridge and goes back to launching the bridge itself.
+The wrapper stops sparrowd with its bridge and goes back to launching the bridge itself. Any other
+`sparrowd.py --core` drops its core on its next scan (within 30 s).
 
 ## Known servers
 

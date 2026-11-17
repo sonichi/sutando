@@ -117,7 +117,7 @@ class TheWrappersEnvironment(unittest.TestCase):
         self.co = Checkout(Path(self.tmp.name).resolve())
         self.co.env_file.write_text("AG2_REMOTE_TOKEN=legacy-fixture-token\nREMOTE_PROACTIVE_ROOM='!room:alpha-fixture.net'\n")
         self.env = self.co.base_env(AG2_DEVICE_ENV=str(self.co.d / "device.env"), REMOTE_TASK_TOKEN="",
-                                    AG2_REMOTE_TOKEN="")
+                                    AG2_REMOTE_TOKEN="", SUTANDO_BRIDGE_RESTART_OWNER="launchd")  # as the plist
 
     def launched(self, primary: str):
         seen = {}
@@ -297,6 +297,11 @@ class Named(H.Base):
         with mock.patch.object(C, "legacy_parked", return_value=True):
             rc, seen, _ = self.run_main([f"--expect={self.inst}"])
         self.assertEqual((rc, seen["log"], seen["env"]["GATEWAY_INSTANCE"]), (0, self.inst, self.inst))
+        self.assertEqual(seen["env"][core.RESTART_OWNER_ENV], "sparrowd", "the bridge knows something restarts it")
+        self.environ[core.RESTART_OWNER_ENV] = "launchd"
+        with mock.patch.object(C, "legacy_parked", return_value=True):
+            _, seen, _ = self.run_main([f"--expect={self.inst}"])
+        self.assertEqual(seen["env"][core.RESTART_OWNER_ENV], "launchd", "a declared owner is kept")
         rec = json.loads(C.launch_record_path(self.inst, self.ws).read_text())
         self.assertEqual((rec["ok"], rec["lease"], rec["pid"]), (True, "supervised", os.getpid()))
 
@@ -463,7 +468,8 @@ class TheCoreClaim(unittest.TestCase):
         with mock.patch.object(core, "decide", return_value=({"instance": "lane-a"}, "")), \
                 mock.patch.object(core, "write_claim", side_effect=PermissionError("read-only state")), \
                 mock.patch.object(core, "holds_lock", return_value=True), \
-                mock.patch.object(core, "revision", side_effect=["r1", "r2"]), contextlib.redirect_stderr(err):
+                mock.patch.object(core, "revision", side_effect=["r1", "r2"]), \
+                mock.patch.object(core, "core_gate", return_value=True), contextlib.redirect_stderr(err):
             scan = SD.CoreScan(Path("/ws"))
             self.assertEqual([s.revision for s in scan()] + [s.revision for s in scan()], ["r1", "r2"],
                              "a rotation still restarts the core")
@@ -480,9 +486,10 @@ class TheCoreScan(unittest.TestCase):
             if isinstance(a, Exception):
                 raise a
             return a
-        scan = SD.CoreScan()
+        scan = SD.CoreScan(Path("/ws"))
         err = io.StringIO()
-        with mock.patch.object(SD, "core_spec", core_spec), contextlib.redirect_stderr(err):
+        with mock.patch.object(SD, "core_spec", core_spec), mock.patch.object(core, "core_gate", return_value=True), \
+                contextlib.redirect_stderr(err):
             got = [scan() for _ in range(4)]
         self.assertEqual(got, [[spec], [spec], [spec], []])
         self.assertEqual(err.getvalue().count("not rescanned (RuntimeError: record unreadable)"), 1)
@@ -492,12 +499,102 @@ class TheCoreScan(unittest.TestCase):
         spec = SD.WorkerSpec(name=SD.CORE_WORKER, argv=["py"])
         for argv, want in ((["--agent-bridges"], []), (["--agent-bridges", "--core"], [SD.CORE_WORKER])):
             with self.subTest(argv=argv), mock.patch.object(SD, "core_spec", return_value=(spec, "")), \
+                    mock.patch.object(core, "core_gate", return_value=True), \
                     mock.patch.object(SD, "AgentBridgeScan", return_value=lambda: []), \
                     mock.patch.object(SD, "resolve_workspace", return_value=Path("/ws")), \
                     mock.patch.object(SD, "run", return_value=0) as run:
                 self.assertEqual(SD.main(argv), 0)
                 self.assertEqual([s.name for s in run.call_args[0][0]], want)
-                self.assertEqual([s.name for s in run.call_args[1]["rescan"]()], want)
+                self.assertEqual([s.name for s in run.call_args[1]["rescan"]({"workers": {}})], want)
+                self.assertTrue(run.call_args[1]["rescan_status"])
+
+    def scan_with(self, status, free=True, revision="r"):
+        spec = SD.WorkerSpec(name=SD.CORE_WORKER, argv=["py", "launcher", "--expect=lane-a"], revision=revision,
+                             held_healthy=False)
+        with mock.patch.object(SD, "core_spec", return_value=(spec, "")), \
+                mock.patch.object(core, "core_gate", return_value=True), \
+                mock.patch.object(core, "lease_free", return_value=free) as asked, contextlib.redirect_stderr(io.StringIO()):
+            got = self.scan(status)
+        return [s.revision for s in got], asked
+
+    def test_a_held_core_is_re_armed_once_its_lease_is_free_and_then_kept(self):
+        self.scan = SD.CoreScan(Path("/ws"))
+        held = {"workers": {SD.CORE_WORKER: {"state": "held"}}}
+        running = {"workers": {SD.CORE_WORKER: {"state": "running"}}}
+        self.assertEqual(self.scan_with(running)[0], ["r"], "a running core keeps its revision")
+        revs, asked = self.scan_with(held, free=False)
+        self.assertEqual(revs, ["r"], "held while another process holds the lease")
+        asked.assert_called_once_with("lane-a", Path("/ws"))
+        self.assertEqual(self.scan_with(held)[0], ["r:1"], "the lease is free: a new revision restarts it")
+        self.assertEqual(self.scan_with(running)[0], ["r:1"], "kept once it runs, so it is not restarted again")
+        self.assertEqual(self.scan_with(held)[0], ["r:2"])
+        self.assertEqual(self.scan_with(running, revision="s")[0], ["s"], "a connection change starts afresh")
+
+    def test_the_gate_off_means_no_core_and_no_claim(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            core.write_claim(ws, "lane-a")
+            (ws / "state" / "sparrowd" / "sparrowd.lock").write_text(str(os.getpid()))
+            err = io.StringIO()
+            with mock.patch.object(SD, "core_spec", side_effect=AssertionError("not scanned")), \
+                    contextlib.redirect_stderr(err):
+                self.assertEqual(SD.CoreScan(ws)(), [])
+            self.assertFalse(core.claim_path(ws).exists())
+            self.assertIn("not supervised: the core gate is off", err.getvalue())
+            with mock.patch.object(core, "write_claim", side_effect=OSError("ro")), \
+                    mock.patch.object(SD, "core_spec", side_effect=AssertionError("not scanned")):
+                self.assertEqual(SD.CoreScan(ws)(), [], "a claim that cannot be withdrawn still runs no core")
+
+
+class TheGateAndHealth(unittest.TestCase):
+    def test_the_gate_is_the_libs_own_check(self):
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            self.assertFalse(core.core_gate(ws))
+            (ws / "state" / "sparrowd").mkdir(parents=True)
+            (ws / "state" / "sparrowd" / "core.enabled").touch()
+            self.assertTrue(core.core_gate(ws))
+
+        def broken(*a, **k):
+            raise OSError("no bash")
+        self.assertFalse(core.core_gate(Path("/ws"), run=broken))
+
+    def test_a_held_core_reads_as_not_serving_from_sparrowd_and_health_check(self):
+        from ag2_sparrow.control_socket import control_socket_path
+        from ag2_sparrow.sparrowd import ControlServer
+        sup = mock.Mock()
+        sup.status.return_value = {"workers": {SD.CORE_WORKER: {"state": "held", "pid": None, "restarts": 0,
+                                                                "last_exit": 75, "held_healthy": False}}}
+        with tempfile.TemporaryDirectory() as d:
+            ws = Path(d)
+            self.assertIsNone(core.core_worker_state(ws), "no sparrowd answers")
+            path = control_socket_path(ws / "state" / "sparrowd", create=True)
+            ctl = ControlServer(path, sup, lambda: None)
+            ctl.start()
+            self.addCleanup(ctl.close)
+            self.assertEqual(core.core_worker_state(ws), "held")
+            import socket
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+                c.connect(str(path))
+                c.sendall(b'{"op": "health"}\n')
+                self.assertEqual(json.loads(c.makefile("r").readline()), {"ok": True, "healthy": False})
+            hc_spec = importlib.util.spec_from_file_location("health_check_core_held", ROOT / "src" / "health-check.py")
+            HC = importlib.util.module_from_spec(hc_spec)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                hc_spec.loader.exec_module(HC)
+            with mock.patch.object(HC, "WORKSPACE_DIR", ws), mock.patch.object(HC, "_gateway_configured", return_value=True):
+                self.assertEqual(HC.check_gateway_bridge(),
+                                 {"name": "gateway-bridge", "status": "warn", "detail": HC.GATEWAY_CORE_HELD_DETAIL})
+            with mock.patch.object(core, "core_worker_state", side_effect=RuntimeError("x")):
+                self.assertFalse(HC._sparrowd_core_held())
+
+    def test_lease_free_reads_the_lease_and_an_unprovable_one_is_not_free(self):
+        with mock.patch.object(C, "bridge_pid", return_value=0):
+            self.assertTrue(core.lease_free("lane-a", Path("/ws")))
+        with mock.patch.object(C, "bridge_pid", return_value=7):
+            self.assertFalse(core.lease_free("lane-a", Path("/ws")))
+        with mock.patch.object(C, "bridge_pid", side_effect=C.BridgeLeaseIndeterminate("", "?")):
+            self.assertFalse(core.lease_free("lane-a", Path("/ws")))
 
 
 if __name__ == "__main__":

@@ -39,6 +39,7 @@ class WorkerSpec:
     revision: str = ""  # opaque to the shell: a spec that differs under the same name is a restart
     # An exit with one of these codes is held, not restarted, until the spec under its name changes.
     hold_rc: FrozenSet[int] = frozenset()
+    held_healthy: bool = True  # False: a held worker leaves something unserved, so `health` says so
 
 
 # The single-instance lock under the state dir; its holder writes its pid into it.
@@ -246,7 +247,8 @@ class Supervisor:
                 n: {"state": ws.state,
                     "pid": ws.proc.pid if ws.proc and ws.proc.poll() is None else None,
                     "restarts": ws.restarts,
-                    "last_exit": ws.last_exit}
+                    "last_exit": ws.last_exit,
+                    "held_healthy": ws.spec.held_healthy}
                 for n, ws in self._workers.items()},
                 "draining": [ws.spec.name for ws in self._draining if _running(ws)]}
 
@@ -333,7 +335,7 @@ class ControlServer:
                 resp = {"ok": True, **self._sup.status()}
             elif op == "health":
                 st = self._sup.status()["workers"]
-                healthy = all(w["state"] in ("running", "pending", "held")
+                healthy = all(w["state"] in ("running", "pending") or (w["state"] == "held" and w["held_healthy"])
                               for w in st.values()) if st else True
                 resp = {"ok": True, "healthy": healthy}
             elif op == "stop":
@@ -363,14 +365,16 @@ def run(specs: List[WorkerSpec], state_dir: Path,
         backoff_initial_s: float = 1.0,
         rescan: Optional[Callable[[], List[WorkerSpec]]] = None,
         rescan_s: float = 30.0, grace_s: float = 10.0,
-        wait_for_lock: bool = False, lock_poll_s: float = 5.0) -> int:
+        wait_for_lock: bool = False, lock_poll_s: float = 5.0, rescan_status: bool = False) -> int:
     """Daemon entry: lock, supervise, serve control, wait for stop signal.
     With `rescan`, every `rescan_s` the supervised set is synced to what it
     returns: the launcher decides what exists, the shell only follows.
     A rescan that raises is a scan that could not be made, not an empty one:
     the current set is kept, logged once until the scan recovers.
     With `wait_for_lock`, a held lock is waited for (one line when the wait
-    starts, one when it ends) instead of exiting, so a relauncher never loops."""
+    starts, one when it ends) instead of exiting, so a relauncher never loops.
+    With `rescan_status`, `rescan` is handed the supervisor's status, so it can
+    re-arm a held worker by changing its spec."""
     state_dir = Path(state_dir)
     inst = SingleInstance(state_dir / LOCK_NAME)
     acquired = inst.acquire()
@@ -403,7 +407,7 @@ def run(specs: List[WorkerSpec], state_dir: Path,
     unavailable = False
     while not stop_evt.wait(rescan_s if rescan is not None else None):
         try:
-            want = rescan()
+            want = rescan(sup.status()) if rescan_status else rescan()
         except Exception as e:  # a launcher fault must not take the running workers down
             if not unavailable:
                 _log(f"rescan unavailable ({type(e).__name__}: {e}) — keeping the current workers until it recovers")
