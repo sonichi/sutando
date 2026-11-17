@@ -1,6 +1,6 @@
 {
   "app": "Task Board",
-  "summary": "A person adds a task and picks one of their own agents. An agent that is in the room is named in Actor, so the row summons it and it reports Status, Blocker and Result on the row itself; an agent that is not in the room gets the task in its owner's DM, and the board cannot show its progress.",
+  "summary": "A person adds a task and picks one of their own agents. An agent that is in the room is named in Actor, so the row summons it and it reports Status, Blocker and Result on the row itself; an agent that is not in the room gets the task in its owner's DM; the text and the answer stay there, and the board cannot show the task's state yet.",
   "databases": [
     {
       "name": "Task Board — Tasks",
@@ -34,6 +34,6 @@
     "The title column is created by the blank template; read its name from databases.list, never assume it.",
     "Leave summon_policy at owner: only the agent's owner can then summon it, so picking 'my agent' cannot make someone else's agent work.",
     "Status, Blocker and Result are the agent's columns: a change that touches only those does not re-summon it.",
-    "An agent outside this room is asked with artifact.agent.sendTask instead: its owner confirms the text, the task goes to their private DM, and nothing comes back to the board unless the agent writes the row."
+    "An agent outside this room is asked with artifact.agent.sendTask instead: its owner confirms the text, the task goes to their private DM, and nothing comes back to the board unless the agent writes the row. Planned: the room will see that agent's state (working, needs input, done or failed) but never the request text, the DM answer or its outcome line; a result is still only what the agent writes into this room."
   ]
 }

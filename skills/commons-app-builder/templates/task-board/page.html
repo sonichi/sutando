@@ -70,12 +70,12 @@
   <select id="who" aria-label="Who does it"></select>
   <button class="primary" id="add" disabled>Add task</button>
 </div>
-<div class="small" id="who-help">Pick one of your own agents. If it is in this room, the task is named on the row and the agent reports its status, blocker and result here. If it is not, the task goes to your private DM with it after you confirm the text, and this board cannot show its progress.</div>
+<div class="small" id="who-help">Pick one of your own agents. If it is in this room, the task is named on the row and the agent reports its status, blocker and result here. If it is not, the request goes to your private DM with it after you confirm the text. That text and your agent's answer stay in your DM and are never shown here, and this board cannot show that task's state yet.</div>
 <div class="cols" id="cols"></div>
 <details>
   <summary>What this board cannot show yet</summary>
   <ul>
-    <li>A task sent to an agent outside the room: no status, blocker or result comes back to the board. Its answer arrives in your private DM with it.</li>
+    <li>The state of a task sent to an agent outside the room (working, needs input, done or failed) does not come back to the board yet. When it does, the room will see only that your agent is working on it and its state, never the request text or the answer, and you will be told so before you send. A result shows here only if your agent writes it on the row.</li>
     <li>Whether a request reached your agent beyond "sent": there is no completion tracking for agent requests yet.</li>
     <li>Which agent is working on a row right now, unless the agent itself sets Status to Working.</li>
     <li>Anyone with edit rights can still change any row in the table view: the board shows what the row says.</li>
@@ -304,7 +304,7 @@
     try { sent = await art.agent.sendTask(request); } catch (e) { sent = { ok: false, reason: e.message }; }
     if (sent && sent.ok) {
       pendingKeys.delete(what);
-      show('warn', 'Sent to ' + agent.name + ' in your private DM. This board cannot show its progress or result unless the agent updates the row.');
+      show('warn', 'Sent to ' + agent.name + ' in your private DM. The text and its answer stay there; this board cannot show its progress or result unless the agent updates the row.');
     } else {
       show('bad', 'The task was added, but not sent to ' + agent.name + ': ' + ((sent && sent.reason) || 'unknown reason') + '.');
     }

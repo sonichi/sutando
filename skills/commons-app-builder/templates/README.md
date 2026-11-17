@@ -36,6 +36,10 @@ while the viewer has not answered the consent prompt, and ownership shown as `?`
   someone else does, depends on the server's summon rules; test it in a real room before relying
   on it.
 - What an agent finds reaches `research-desk/` only if the agent writes new findings rows itself.
+- Planned, not available yet: the room will see the *state* of a `sendTask` request (working, needs
+  input, done or failed) and whose agent holds it, never the request text, the DM answer or its
+  outcome line. The requester is told so in the confirmation dialog. A result is still only what
+  the agent itself writes into the app's room. `task-board/` already words its notes this way.
 
 ### What they do not enforce
 
