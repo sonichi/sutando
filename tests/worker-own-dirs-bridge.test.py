@@ -263,7 +263,8 @@ class Adopt(Own):
         (shared / stamped).write_text("r")
         with mock.patch.object(worker_lane, "_holds_lane", return_value=False):
             self.assertEqual(worker_lane.adopt_stray_proactive(W, shared, own), [])
-        self.assertTrue((shared / stamped).exists())
+            self.assertTrue((shared / stamped).exists())
+            self.assertEqual(worker_lane.adopt_stray_proactive(W, shared, own, lease=False), [stamped])
 
     def test_holding_the_lane_is_this_process_holding_its_lease(self):
         with mock.patch.object(C, "bridge_pid", return_value=os.getpid()):
