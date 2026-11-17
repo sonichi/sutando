@@ -24,7 +24,10 @@ printf '%s\n' "\$\$ \$*" >> "$dir/launches"
 monitor=default
 prev=""
 for a in "\$@"; do [ "\$prev" = "-m" ] && monitor="\$a"; prev="\$a"; done
-grep -qxF "\$monitor" "$dir/working" && exec bash "$dir/poll-stub.sh" "\$@"
+if grep -qxF "\$monitor" "$dir/working"; then
+  [ "\$monitor" = poll_monitor ] && [ -e "$dir/poll-reports-dir" ] && export FSWATCH_STUB_REPORT_DIR=1
+  exec bash "$dir/poll-stub.sh" "\$@"
+fi
 mode="\$(cat "$dir/default-mode" 2>/dev/null)"
 if [ "\$monitor" = default ] && [ -n "\$mode" ]; then
   seen=""
@@ -154,6 +157,22 @@ wait_exit 100
 [ "$RC" = 1 ] && ! sentinel_stamped f
 check $? "f) a probe from the round before is no proof: exit 1 and no sentinel (rc $RC)"
 
+# --- g) poll_monitor as fswatch ships it: a new entry is reported as the inbox directory ---
+make_case g poll_monitor
+: > "$TMP/g/poll-reports-dir"
+start_watcher g
+printf 'id: task-early\naccess_tier: owner\ntask: swept\n' > "$TMP/g/ws/tasks/task-early.txt"
+wait_for "$TMP/g/out" "TASK_FILE: task-early.txt" 150
+check $? "g) readiness passes when poll_monitor names only the inbox, and the sweep runs"
+sentinel_stamped g
+check $? "g) the sentinel is stamped"
+printf 'id: task-late\naccess_tier: owner\ntask: heard\n' > "$TMP/g/ws/tasks/task-late.txt"
+wait_for "$TMP/g/out" "TASK_FILE: task-late.txt" 60
+check $? "g) a task that arrives as an inbox event is announced within 6 s (catch-up is 600 s)"
+[ "$(grep -c "TASK_FILE: task-late.txt" "$TMP/g/out")" = 1 ]
+check $? "g) and announced once"
+stop_watcher
+
 echo
 echo "$pass passed, $fail failed"
-[ "$fail" = 0 ] || { for c in a b c d e f; do tail -3 "$TMP/$c/err" 2>/dev/null | sed "s/^/  err($c): /"; done; exit 1; }
+[ "$fail" = 0 ] || { for c in a b c d e f g; do tail -3 "$TMP/$c/err" 2>/dev/null | sed "s/^/  err($c): /"; done; exit 1; }

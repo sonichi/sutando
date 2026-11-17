@@ -1287,6 +1287,11 @@ handle_event() {
       [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && prepare_handler_state
       redispatch_held_tasks
       ;;
+    "$TASKS_DIR"|"$TASKS_DIR/"|"$TASKS_DIR_ABS"|"$TASKS_DIR_ABS/")
+      # The inbox changed but its entry is not named (poll_monitor): list it in 2 s, once the
+      # catch-up pass's last-second guard has passed, rather than waiting a whole interval.
+      [ "${CATCHUP_NEXT:-0}" -le $(( SECONDS + 2 )) ] || CATCHUP_NEXT=$(( SECONDS + 2 ))
+      ;;
     *.txt)
       parent="$(dirname "$path")"
       if [ "$parent" = "$TASKS_DIR_ABS" ] && [ -f "$path" ]; then
@@ -1302,6 +1307,12 @@ handle_event() {
 PRE_READY_EVENTS=""
 probe_n=0
 probe_round=0
+# poll_monitor watches only the paths it is given, so a new entry is reported as the inbox
+# directory itself, not as the file (measured on a host without a TCC grant for the inbox).
+inbox_dir_event() {
+  case "$1" in "$TASKS_DIR"|"$TASKS_DIR/"|"$TASKS_DIR_ABS"|"$TASKS_DIR_ABS/") return 0 ;; esac
+  return 1
+}
 # 0: a probe of THIS round came back through fswatch within SUTANDO_WATCHER_READY_TIMEOUT; 1: it did not.
 # An earlier round's probe still in the FIFO proves nothing about the monitor now running.
 readiness_round_trip() {
@@ -1316,6 +1327,11 @@ readiness_round_trip() {
       probe_n=$((probe_n + 1))
       : > "$TASKS_DIR/$tag-$probe_n"
       continue
+    fi
+    # Under poll_monitor the inbox changing, with this round's probe in it, is the round trip.
+    if [ "$FSWATCH_MONITOR" = poll_monitor ] && inbox_dir_event "$path" \
+       && [ -e "$TASKS_DIR/$tag-$probe_n" ]; then
+      rc=0; break
     fi
     case "$path" in
       */"$tag"-*|"$tag"-*) rc=0; break ;;
@@ -1342,8 +1358,8 @@ stop_stalled_fswatch() {
 if [ "$WATCHER_ROLE" = "session" ]; then
   ready=0
   readiness_round_trip && ready=1
-  # A live fswatch whose default monitor reports nothing (a stalled fseventsd): poll_monitor
-  # stats the inbox itself. A monitor the owner named is theirs, and is not second-guessed.
+  # A default monitor that reports nothing (a stalled fseventsd, or an inbox with no TCC grant):
+  # poll_monitor stats the inbox itself. A monitor the owner named is not second-guessed.
   if [ "$ready" -ne 1 ] && [ -z "$FSWATCH_MONITOR" ] && kill -0 "$FSWATCH_PID" 2>/dev/null; then
     echo "watch-tasks-stream: fswatch's default monitor reported nothing from the inbox within ${SUTANDO_WATCHER_READY_TIMEOUT:-10}s; relaunching fswatch with poll_monitor" >&2
     stop_stalled_fswatch
