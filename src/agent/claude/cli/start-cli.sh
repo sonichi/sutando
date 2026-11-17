@@ -388,11 +388,11 @@ resolve_core_target() {
   CORE_WINDOW="${CORE_WINDOW:-0}"
 }
 
-# Standby delivery path: pastes a queued task into the core pane only when the
-# pane is idle-ready and no result exists, so self-arm via Monitor stays primary.
-# Core-only: a pool worker never runs a standby/supervisor pairing (#4477/#4585).
+# The core's standby supervisor. With the task-watch Mod installed it only alerts (never types);
+# otherwise it pastes a queued task into the idle core pane while no session watcher holds the inbox.
 ensure_task_notifier() {
-  local expected_version active_version version_files notifier_py
+  local expected_version active_version version_files notifier_py standby_mode=type
+  [ "${TASK_WATCH_MOD:-}" = "1" ] && standby_mode=alert
   resolve_core_target
   # The launcher-resolved interpreter or nothing: a bare PATH python3 on a Mac
   # without the developer tools is the CLT stub, and the supervisor would run it every second.
@@ -414,7 +414,7 @@ ensure_task_notifier() {
   # operator pin (if one is already set) and nothing computed.
   # The target window is part of the identity: a heal that lands the core on a
   # new index must replace a watcher still aimed at the old one.
-  expected_version="$(cksum "${version_files[@]}" | cksum | awk '{print $1 "-" $2}')-w${CORE_WINDOW:-0}-p${CORE_PANE:-none}-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-y$(printf '%s' "$notifier_py" | cksum | awk '{print $1}')-s$(printf '%s' "${SUTANDO_STOP_INTERRUPT:-}" | cksum | awk '{print $1}')"
+  expected_version="$(cksum "${version_files[@]}" | cksum | awk '{print $1 "-" $2}')-w${CORE_WINDOW:-0}-p${CORE_PANE:-none}-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-y$(printf '%s' "$notifier_py" | cksum | awk '{print $1}')-s$(printf '%s' "${SUTANDO_STOP_INTERRUPT:-}" | cksum | awk '{print $1}')-m${standby_mode}"
   if watcher_session_exists; then
     active_version="$(
       tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \
@@ -432,6 +432,7 @@ ensure_task_notifier() {
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_SCRIPT=$NOTIFIER_SCRIPT")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_STANDBY_MODE=$standby_mode")
   [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
   [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
   [ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")

@@ -113,6 +113,24 @@ the `Monitor`. The Mod checks the same floor itself.
 The worker default covers Claude workers only: `launch-worker-session.sh` hands a Codex worker to
 `launch-codex-worker-session.sh` before `add_task_watch_mod`, so a Codex worker keeps the supervisor's task notifier.
 
+### The standby on a Mod seat is alert-only
+
+A Claude seat whose launcher installed the Mod still gets the supervisor, started with
+`SUTANDO_STANDBY_MODE=alert` (the core launcher from its own Mod decision; `worker-watcher-supervisor.sh`
+from the worker session's `SUTANDO_TASK_WATCH_MOD=1`, so the pool remedy's re-ensure agrees). In that
+mode the supervisor never starts the notifier: no task and no nudge is typed into the pane. It polls
+`role-present --ready` as before; once no ready session watcher has held the inbox for
+`SUTANDO_NOTIFIER_ALERT_GRACE` (300 s), it writes an `ALERT` line to `logs/claude-task-notifier.log`
+and alerts the owner once for that episode: a `results/proactive-standby-unwatched-*.txt` (the owner's DM)
+and the opt-in macOS notification, the same pair a channel bridge's wrapper uses for its notices. A ready
+watcher ends the episode with one log line and nothing sent to the owner. The 300 s covers a seat's boot
+and restarts: a seat's Mod watcher has been seen ready 51 s after the session started (before
+the launcher trusted the `--add-dir` folder), and a worker relaunched several times took about 2.5 min.
+The Mod's own restart back-off (5 s doubling) passes 300 s only after six early exits in a row. A Codex seat,
+or a Claude seat whose Mod was refused or turned off, keeps the typing standby above. The health check's
+`claude-task-notifier` row on a Mod core is `ok` only while a ready session watcher holds the core's
+inbox.
+
 ### How to check it on a worker, or turn it off
 
 1. Confirm the installed Claude Code passes: `bash scripts/task-watch-mod-witness.sh`. It loads the
@@ -228,7 +246,10 @@ how `tests/watch-tasks-stream-shutdown-leaves-inflight-claim.test.py` interrupts
   file in #4627, sharing `tests/fixtures/readiness_window_helpers.py`, so no single file sets the
   CI floor): the readiness window, buffered replay before the sweep, holds and admissions.
 - `tests/watcher-identity.test.py`: the verdicts, their inbox scoping and the ready gate.
-- `tests/start-cli-claude-task-notifier.test.py`: the launcher starts the supervisor for the core.
+- `tests/start-cli-claude-task-notifier.test.py`: the launcher starts the supervisor for the core,
+  alert-only when it installed the Mod.
+- `tests/task-notifier-supervisor-alert-only.test.sh`: the alert-only standby types nothing, alerts
+  once per episode after the grace and stands down silently.
 - `src/agent/claude/task-watch-mod/tests/task-watch.test.ts` (`claude plugin test`, in CI): the Mod's
   spawn, announcement, restart, hand-off and session-end rules, and that a task body is never submitted.
 - `tests/task-watch-mod-launch.test.sh`: the launchers' defaults and opt-outs, version floor and session marker.

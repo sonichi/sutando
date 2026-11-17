@@ -136,6 +136,10 @@ NOTIFIER="${SUTANDO_NOTIFIER_SCRIPT:-$REPO/src/agent/codex/cli/task-notifier.sh}
 # config) to decide -- this script only reads them.
 GRACE_PERIOD="${SUTANDO_NOTIFIER_GRACE_PERIOD:-45}"
 ROLE_POLL="${SUTANDO_NOTIFIER_ROLE_POLL:-5}"
+# "alert": a Claude seat whose watcher the task-watch Mod hosts. Nothing is typed into the
+# pane; after ALERT_GRACE with no ready session watcher the owner is told once per episode.
+STANDBY_MODE="${SUTANDO_STANDBY_MODE:-type}"
+ALERT_GRACE="${SUTANDO_NOTIFIER_ALERT_GRACE:-300}"
 child_pid=""
 # One-shot latch for the idle-but-dead health alert: raised when it fires, so a
 # persistent stale/absent beat does not re-notify every grace period; lowered
@@ -207,9 +211,69 @@ run_notifier_once() {
   return 0
 }
 
+now_s() { date +%s; }
+
+# Appended to the same log the Claude notifier writes, so one file answers "was the inbox covered".
+supervisor_log() {
+  local msg="task-notifier-supervisor: $*" ws
+  printf '%s\n' "$msg" >&2
+  [ -n "$TASKS_DIR" ] || return 0
+  ws="$(workspace_dir_for_inbox "$TASKS_DIR")"
+  [ -d "$ws/logs" ] && printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$msg" >>"$ws/logs/claude-task-notifier.log" 2>/dev/null
+  return 0
+}
+
+# The owner's alert, through the path a bridge wrapper uses for its own notices: a proactive
+# result (the owner's DM, never a worker's lane) and the opt-in macOS notification.
+unwatched_alert() {
+  local secs="$1" ws msg
+  msg="Sutando: no task watcher has held ${TASKS_DIR:-its inbox} for $((secs / 60)) min, so the session in ${SESSION} is not picking up its tasks, and nothing types them in for it. Restarting that session brings its watcher back."
+  supervisor_log "ALERT: no ready session watcher holds ${TASKS_DIR:-this host} for ${secs}s (alert-only standby; nothing typed); owner alerted"
+  if [ -n "$TASKS_DIR" ]; then
+    ws="$(workspace_dir_for_inbox "$TASKS_DIR")"
+    if [ -d "$ws/results" ]; then
+      printf '%s\n' "$msg" | env -u SUTANDO_WORKER_ID "$PY" "$REPO/src/result_publish.py" \
+        "$ws/results/proactive-standby-unwatched-$(now_s)-$$.txt" >/dev/null 2>&1 \
+        || supervisor_log "could not publish the unwatched-inbox alert"
+    fi
+  fi
+  bash "$REPO/src/macos-notify.sh" "$msg" || true
+}
+
+# Alert-only standby: never starts the notifier, so neither a task nor a nudge is typed.
+# "unknown" neither opens nor closes an episode; a ready watcher ends it without a word to the owner.
+run_alert_only() {
+  local since="" alerted=0 v now
+  supervisor_log "alert-only standby for ${TASKS_DIR:-this host}: the task-watch Mod hosts this seat's watcher; nothing is typed into the pane"
+  while target_alive; do
+    v="$(session_role_verdict)"
+    case "$v" in
+      yes)
+        [ "$alerted" = "1" ] && supervisor_log "a session watcher holds ${TASKS_DIR:-this host} again; the alert-only standby stands down"
+        since=""
+        alerted=0
+        ;;
+      no)
+        now="$(now_s)"
+        [ -n "$since" ] || since="$now"
+        if [ "$alerted" = "0" ] && [ $((now - since)) -ge "$ALERT_GRACE" ]; then
+          unwatched_alert $((now - since))
+          alerted=1
+        fi
+        ;;
+    esac
+    sleep "$ROLE_POLL"
+  done
+}
+
 # Sourced by a test to exercise the helpers in isolation: stop here, before the
 # standby loop, so decide_action and its callees can be invoked directly.
 if [ "${SUTANDO_SUPERVISOR_SOURCE_ONLY:-}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
+
+if [ "$STANDBY_MODE" = "alert" ]; then
+  run_alert_only
+  exit 0
+fi
 
 # "unknown" keeps whatever runs: while armed, the notifier stays; in standby,
 # nothing is running to keep, and a host whose ps never answers would otherwise
