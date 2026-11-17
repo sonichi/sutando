@@ -726,7 +726,8 @@ def bind_room_if_free(workspace, room: str, target: str) -> bool:
         if bindings.get(room) is None:
             bindings[room] = wid
             save_bindings(workspace, bindings)
-            compile_roster(workspace, workers, bindings)
+        # Compiled even when the binding was already there: a run that saved and then failed to publish is repaired.
+        compile_roster(workspace, workers, bindings)
         return True
 
 

@@ -470,6 +470,26 @@ class ReturnRoom(Base):
         self.assertEqual((out["status"], out["taken"]), ("returned", [ROOM]))
         self.assertEqual(self.bound()[ROOM], OTHER)
 
+    def test_a_publish_that_failed_after_the_save_is_repaired_by_the_retry(self):
+        for key in (ROOM, LEGACY):
+            pr.unbind_room(self.ws, key)
+        real = pr.compile_roster
+        with mock.patch.object(pr, "compile_roster", side_effect=pr.RosterError("publish failed")):
+            first = FakeActions({AGENT, CORE}, me=AGENT)
+            out = rh.return_room(W, ROOM, bindings=[ROOM], workspace=self.ws, actions=FakeActions(set()),
+                                 server="s.space", core_agent=CORE, as_worker=lambda: first, wall=lambda: self.wall[0])
+        self.assertEqual(out["status"], "failed")
+        self.assertNotIn("room.leave", [c[0] for c in first.calls], "the worker's agent stays until it is published")
+        self.assertEqual(pr.load_bindings(self.ws)[ROOM], W, "the declaration was saved")
+        self.assertNotIn(ROOM, json.loads((self.ws / "state" / "roster.json").read_text())["bindings"])
+        mine = FakeActions({AGENT, CORE}, me=AGENT)
+        with mock.patch.object(pr, "compile_roster", side_effect=real) as compiled:
+            out = rh.return_room(W, ROOM, bindings=[ROOM], workspace=self.ws, actions=FakeActions(set()),
+                                 server="s.space", core_agent=CORE, as_worker=lambda: mine, wall=lambda: self.wall[0])
+        self.assertEqual((out["status"], out["worker_left"]), ("returned", True))
+        self.assertTrue(compiled.called, "the retry recompiles though the binding already matched")
+        self.assertEqual(json.loads((self.ws / "state" / "roster.json").read_text())["bindings"][ROOM], W)
+
     def test_bind_room_if_free_decides_under_the_lock(self):
         pr.unbind_room(self.ws, ROOM)
         self.assertTrue(pr.bind_room_if_free(self.ws, ROOM, W))
