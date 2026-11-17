@@ -370,7 +370,8 @@ if [ "${SUTANDO_STOP_HOOK_WATCHER_GATE:-1}" != "0" ]; then
       [ "$COVERAGE_ERR" != /dev/null ] && rm -f "$COVERAGE_ERR"
       case "$COVERAGE_N" in ''|*[!0-9]*) COVERAGE_N="" ;; esac
       if [ -n "$COVERAGE_N" ] && [ "$COVERAGE_N" -le "$COVERAGE_FAIL_OPEN_AFTER" ]; then
-        SUTANDO_HOOK_REASON="No ready session-role watcher holds $COVERAGE_INBOX: nothing announces deliveries while it is missing. Re-arm it before ending the turn (unwatched turn end $COVERAGE_N of $COVERAGE_FAIL_OPEN_AFTER, then this gate fails open): via the Monitor tool, $COVERAGE_REARM" \
+        COVERAGE_MOD_NOTE="$("$PYBIN" "$REPO_DIR/src/watcher_rearm.py" mod-note --repo "$REPO_DIR" --workspace "$WORKSPACE" 2>/dev/null)" || COVERAGE_MOD_NOTE=""
+        SUTANDO_HOOK_REASON="No ready session-role watcher holds $COVERAGE_INBOX: nothing announces deliveries while it is missing. Re-arm it before ending the turn (unwatched turn end $COVERAGE_N of $COVERAGE_FAIL_OPEN_AFTER, then this gate fails open): ${COVERAGE_MOD_NOTE}via the Monitor tool, $COVERAGE_REARM" \
           "$PYBIN" -c 'import json,os,sys; sys.stdout.write(json.dumps({"decision":"block","reason":os.environ["SUTANDO_HOOK_REASON"]}, separators=(",", ":")))'
         exit 0
       fi
