@@ -116,6 +116,9 @@
     const until = Date.now() + 120000;
     for (;;) {
       const r = await call();
+      // agent.list() answers [] until the viewer allows the page, which a first write asks for:
+      // once a write lands, read the agents again so a first-time viewer can pick one.
+      if (r.ok && !agents.length) refreshAgents();
       if (r.ok || !/waiting for the viewer|rate limit|too many/i.test(r.reason || '') || Date.now() > until) return r;
       hint('Allow this page to edit data in this room, and it will save.');
       await new Promise((ok) => setTimeout(ok, 1500));
@@ -127,12 +130,16 @@
   let titleProp = null, statusOpts = [], busy = false, snapshot = null, generation = 0;
 
   // ---- your own agents. userId is present only when the agent is a member of this room.
-  let agents = [];
+  let agents = [], agentsShown = false;
   const fillAgents = async () => {
     // agent.list() answers an array, or {ok: false, reason} when it cannot: never assume an array.
     let got = [];
     try { got = art.agent ? await art.agent.list() : []; } catch (e) { got = []; }
-    agents = Array.isArray(got) ? got : [];
+    const next = Array.isArray(got) ? got : [];
+    const same = next.length === agents.length && next.every((a, i) => a.id === agents[i].id);
+    agents = next;
+    if (same && agentsShown) return;
+    agentsShown = true;
     const sel = $('who');
     const want = sel.value;
     sel.textContent = '';
@@ -147,6 +154,10 @@
     });
     sel.value = agents.some((a) => a.id === want) ? want : '';
   };
+  // Re-read on demand: after the first allowed write, and whenever the picker is opened.
+  const refreshAgents = () => fillAgents();
+  // A DM ask that was not sent, per row: retried with the SAME key, so it never asks twice.
+  const unsent = new Map();          // rowId -> {agent, text, key, reason}
 
   // A person cell holds account ids; members() and personId() name it once the viewer allows.
   const nameOf = async (cell, members) => {
@@ -229,6 +240,19 @@
           b.onclick = () => setStatus(row, o.name);
           actions.appendChild(b);
         });
+        const miss = unsent.get(row.id);
+        if (miss) {
+          const note = document.createElement('div');
+          note.className = 'meta blocked';
+          note.textContent = 'Not sent to ' + miss.agent.name + ': ' + miss.reason;
+          li.appendChild(note);
+          const again = document.createElement('button');
+          again.type = 'button';
+          again.textContent = 'Send to ' + miss.agent.name + ' again';
+          again.disabled = busy;
+          again.onclick = () => askInDm(row.id, miss.agent, miss.text);
+          actions.appendChild(again);
+        }
         li.appendChild(actions);
         ul.appendChild(li);
       });
@@ -271,8 +295,33 @@
   db.onChange(id, render);                 // subscribe, then read: no edit is missed between them
   try { await render(await db.read(id)); } catch (e) { $('sub').textContent = ''; show('bad', e.message); }
   await fillAgents();
+  $('who').addEventListener('focus', refreshAgents);
+  $('who').addEventListener('pointerdown', refreshAgents);
 
-  const pendingKeys = new Map();
+  // An agent outside the room: ask it in your private DM, after you confirm the text. A failure
+  // keeps the row's key, and the row offers "Send again" with it, so nothing is asked twice.
+  const askInDm = async (rowId, agent, text) => {
+    if (busy) return;
+    const prior = unsent.get(rowId);
+    const key = prior ? prior.key : ('task-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e6).toString(36));
+    const request = { agentId: agent.id, text: 'Task from the Task Board app: ' + text.slice(0, 500)
+      + '\nIf you can, set its Status, Blocker and Result on its row in the Task Board table so the room can see them.', key, actionId: 'task' };
+    if (rowId && /^d[a-z0-9]{1,24}$/.test(id)) request.row = { database: id, rowId };
+    busy = true;
+    let sent;
+    try { sent = await art.agent.sendTask(request); } catch (e) { sent = { ok: false, reason: e.message }; }
+    busy = false;
+    if (sent && sent.ok === true) {
+      unsent.delete(rowId);
+      if (snapshot) await render(snapshot);
+      show('warn', 'Sent to ' + agent.name + ' in your private DM. The text and its answer stay there; this board cannot show its progress or result unless the agent updates the row.');
+      return;
+    }
+    unsent.set(rowId, { agent, text, key, reason: (sent && sent.reason) || 'unknown reason' });
+    if (snapshot) await render(snapshot);
+    show('bad', 'The task was added, but not sent to ' + agent.name + ': ' + ((sent && sent.reason) || 'unknown reason') + '. Use "Send to ' + agent.name + ' again" on its row.');
+  };
+
   $('add').onclick = async () => {
     if (busy) return;
     const text = $('title').value.trim();
@@ -296,21 +345,7 @@
     if (!r.ok) { show('bad', r.reason || 'The task was not saved.'); return; }
     if ($('title').value.trim() === text) $('title').value = '';
     if (!agent || agent.userId) return;
-    // An agent outside the room: ask it in your private DM, after you confirm the text.
-    const what = 'row:' + r.rowId;
-    const key = pendingKeys.get(what) || ('task-' + Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e6).toString(36));
-    pendingKeys.set(what, key);
-    const request = { agentId: agent.id, text: 'Task from the Task Board app: ' + text.slice(0, 500)
-      + '\nIf you can, set its Status, Blocker and Result on its row in the Task Board table so the room can see them.', key, actionId: 'task' };
-    if (r.rowId && /^d[a-z0-9]{1,24}$/.test(id)) request.row = { database: id, rowId: r.rowId };
-    let sent;
-    try { sent = await art.agent.sendTask(request); } catch (e) { sent = { ok: false, reason: e.message }; }
-    if (sent && sent.ok) {
-      pendingKeys.delete(what);
-      show('warn', 'Sent to ' + agent.name + ' in your private DM. The text and its answer stay there; this board cannot show its progress or result unless the agent updates the row.');
-    } else {
-      show('bad', 'The task was added, but not sent to ' + agent.name + ': ' + ((sent && sent.reason) || 'unknown reason') + '.');
-    }
+    await askInDm(r.rowId, agent, text);
   };
   $('title').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('add').click(); });
 })();

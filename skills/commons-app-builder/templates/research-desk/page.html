@@ -141,6 +141,9 @@
     const until = Date.now() + 120000;
     for (;;) {
       const r = await call();
+      // agent.list() answers [] until the viewer allows the page, which a first write asks for:
+      // once a write lands, read the agents again so a first-time viewer can pick one.
+      if (r.ok && !agents.length) refreshAgents();
       if (r.ok || !/waiting for the viewer|rate limit|too many/i.test(r.reason || '') || Date.now() > until) return r;
       hint('Allow this page to edit data in this room, and it will save.');
       await new Promise((ok) => setTimeout(ok, 1500));
@@ -164,13 +167,18 @@
   };
 
   // ---- your agents: artifact.agent.list answers [] until the viewer allows the page.
-  let agents = [];
+  let agents = [], agentsShown = false;
+  const ASK_HELP = $('ask-help').textContent;
   const pendingKeys = new Map();     // what -> key: a retry after an unknown outcome reuses its key
   const fillAgents = async () => {
     // agent.list() answers an array, or {ok: false, reason} when it cannot: never assume an array.
     let got = [];
     try { got = art.agent ? await art.agent.list() : []; } catch (e) { got = []; }
-    agents = Array.isArray(got) ? got : [];
+    const next = Array.isArray(got) ? got : [];
+    const same = next.length === agents.length && next.every((a, i) => a.id === agents[i].id);
+    agents = next;
+    if (same && agentsShown) return false;
+    agentsShown = true;
     const sel = $('agent');
     const want = sel.value;
     sel.textContent = '';
@@ -181,9 +189,12 @@
     });
     sel.value = agents.some((a) => a.id === want) ? want : (agents[0] ? agents[0].id : '');
     $('ask-topic-go').disabled = !agents.length || !art.agent;
-    if (!agents.length) $('ask-help').textContent = 'You have no agent of your own here yet, or this page has not been allowed. '
+    $('ask-help').textContent = agents.length ? ASK_HELP : 'You have no agent of your own here yet, or this page has not been allowed. '
       + 'Asking your agent sends the request to its private DM with you after you confirm the exact text; its progress does not come back to this page yet.';
+    return true;
   };
+  // Re-read on demand: after the first allowed write, and whenever the picker is opened.
+  const refreshAgents = async () => { if (await fillAgents() && snapshot) await render(snapshot); };
   const askAgent = async (what, text, row) => {
     const agentId = $('agent').value;
     if (!agentId || !art.agent) { show('warn', 'Choose one of your own agents first.'); return; }
@@ -378,13 +389,18 @@
   const decide = async (row, verdict) => {
     if (busy || !reviewsId || !reviewTitle) return;
     busy = true;
+    let stateLag = '';
     let r = { ok: false, reason: '' };
     try {
       const values = { Finding: row.id, Verdict: verdict };
       values[reviewTitle] = String((titleProp && row.cells[titleProp]) || row.id).slice(0, 200);
       r = await save(() => db.createRow(reviewsId, values));
       // Keep the table's State column in step for the board view. The page itself trusts Reviews.
-      if (r.ok) await save(() => db.write(id, row.id, 'State', verdict));
+      if (r.ok) {
+        const st = await save(() => db.write(id, row.id, 'State', verdict));
+        if (!st.ok) stateLag = 'Your decision is saved, but the State column the table and board views show was not updated: '
+          + (st.reason || 'the write was refused') + '. The table may still say Proposed.';
+      }
     } catch (e) {
       r = { ok: false, reason: e.message || 'The decision was not saved.' };
     } finally {
@@ -392,6 +408,7 @@
       if (snapshot) await render(snapshot);
     }
     if (!r.ok) show('bad', r.reason || 'The decision was not saved.');
+    else if (stateLag) show('warn', stateLag);
   };
 
   if (reviewsId) {
@@ -405,6 +422,8 @@
   try { await render(await db.read(id)); } catch (e) { $('sub').textContent = ''; show('bad', e.message); }
   await fillAgents();
   if (snapshot) await render(snapshot);    // the per-row "Ask my agent" buttons follow the list
+  $('agent').addEventListener('focus', refreshAgents);
+  $('agent').addEventListener('pointerdown', refreshAgents);
 
   $('ask-topic-go').onclick = async () => {
     const topic = $('ask-topic').value.trim();

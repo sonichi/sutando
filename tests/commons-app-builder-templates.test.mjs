@@ -1623,8 +1623,13 @@ const fakeMulti = (opts = {}) => {
       on: () => () => {},
       pages: { list: async () => [], read: async () => null },
       agent: {
-        list: async () => opts.agents || [],
-        sendTask: async (req) => { calls.push(['sendTask', req]); return opts.sendAnswer || { ok: true, eventId: 'tabc' }; },
+        // agents may be a function of the calls so far: [] until the page is allowed, then the list.
+        list: async () => (typeof opts.agents === 'function' ? opts.agents(calls) : (opts.agents || [])),
+        sendTask: async (req) => {
+          calls.push(['sendTask', req]);
+          if (Array.isArray(opts.sendAnswer)) return opts.sendAnswer.length ? opts.sendAnswer.shift() : { ok: true, eventId: 'tabc' };
+          return opts.sendAnswer || { ok: true, eventId: 'tabc' };
+        },
       },
       db: {
         list: async () => Object.entries(dbs).map(([id, d]) => ({ id, name: d.name })),
@@ -1895,6 +1900,112 @@ for (const tpl of ['research-desk', 'task-board']) {
   check(`${tpl}/agent-list-refusal-is-not-an-array`, () => {
     assert.equal(unhandled.length, before, unhandled.slice(before).join('; '));
     assert.match(r.text(), tpl === 'research-desk' ? /No findings yet/ : /No tasks yet/);
+  });
+}
+
+/* ===== core review of 901bb356: agents after consent, retry, unchecked State write, mutants ===== */
+// agent.list() answers [] until the page is allowed; the first allowed write is what allows it.
+const afterFirstWrite = (calls) => (calls.some((c) => c[0] === 'createRow' || c[0] === 'write') ? AGENTS : []);
+{
+  const b = fakeMulti({ dbs: boardDbs(), primary: 'd1', agents: afterFirstWrite });
+  const r = await run('task-board', { bridge: b });
+  const before = r.byId.get('who').options.length;
+  r.byId.get('title').value = 'First task';
+  r.byId.get('add').click();
+  await settle(40);
+  check('task-board/agents-reread-after-first-allowed-write', () => {
+    assert.equal(before, 1);
+    assert.deepEqual(r.byId.get('who').options.map((o) => o.value), ['', AGENTS[0].id, AGENTS[1].id]);
+  });
+}
+{
+  let open = false;
+  const b = fakeMulti({ dbs: boardDbs(), primary: 'd1', agents: () => (open ? AGENTS : []) });
+  const r = await run('task-board', { bridge: b });
+  open = true;
+  r.byId.get('who').dispatch('focus');
+  await settle(20);
+  check('task-board/agents-reread-when-picker-opens', () =>
+    assert.equal(r.byId.get('who').options.length, 3));
+}
+{
+  const b = fakeMulti({ dbs: deskDbs(), primary: 'd1', agents: afterFirstWrite });
+  const r = await run('research-desk', { bridge: b });
+  const before = r.byId.get('ask-topic-go').disabled;
+  r.byId.get('claim').value = 'A claim';
+  r.byId.get('source').value = 'https://c.example';
+  r.byId.get('add').click();
+  await settle(40);
+  check('research-desk/agents-reread-after-first-allowed-write', () => {
+    assert.equal(before, true);
+    assert.equal(r.byId.get('ask-topic-go').disabled, false);
+    assert.equal(r.byId.get('agent').options.length, 2);
+  });
+}
+{
+  let open = false;
+  const b = fakeMulti({ dbs: deskDbs(), primary: 'd1', agents: () => (open ? AGENTS : []) });
+  const r = await run('research-desk', { bridge: b });
+  open = true;
+  r.byId.get('agent').dispatch('pointerdown');
+  await settle(20);
+  check('research-desk/agents-reread-when-picker-opens', () =>
+    assert.equal(r.byId.get('ask-topic-go').disabled, false));
+}
+// A failed DM ask is retried from its row with the SAME key, and adds no second row.
+{
+  const b = fakeMulti({ dbs: boardDbs(), primary: 'd1', agents: AGENTS,
+    sendAnswer: [{ ok: false, reason: 'declined' }, { ok: true, eventId: 't2' }] });
+  const r = await run('task-board', { bridge: b });
+  r.byId.get('title').value = 'Renew the domain';
+  r.byId.get('who').value = AGENTS[1].id;
+  r.byId.get('add').click();
+  await settle(40);
+  check('task-board/refused-ask-is-reported-not-sent', () => {
+    assert.match(r.text(), /not sent to Home Agent: declined/);
+    assert.ok(!/Sent to Home Agent in your private DM/.test(r.text()), r.text());
+  });
+  // The board shows the row from the next snapshot; the fake's onChange is driven by hand.
+  b.fire('d1', { id: 'd1', name: 'Task Board — Tasks', props: TASK_PROPS,
+    rows: [{ id: 'r1', cells: { Task: 'Renew the domain', Status: 'Requested' } }] });
+  await settle(20);
+  const again = r.byId.get('cols').buttons().find((x) => /Send to Home Agent again/.test(x.textContent));
+  check('task-board/failed-ask-offers-retry-on-its-row', () => assert.ok(again, r.text()));
+  if (again) { again.click(); await settle(40); }
+  check('task-board/retry-reuses-the-key-and-adds-no-row', () => {
+    const sends = b.calls.filter((c) => c[0] === 'sendTask').map((c) => c[1]);
+    assert.equal(sends.length, 2);
+    assert.equal(sends[0].key, sends[1].key);
+    assert.deepEqual(plain(sends[1].row), { database: 'd1', rowId: 'r1' });
+    assert.equal(b.calls.filter((c) => c[0] === 'createRow').length, 1);
+    assert.match(r.text(), /Sent to Home Agent in your private DM/);
+    assert.ok(!r.byId.get('cols').buttons().some((x) => /again/.test(x.textContent)));
+  });
+}
+{
+  const b = fakeMulti({ dbs: boardDbs(), primary: 'd1', agents: AGENTS,
+    writeAnswers: [{ ok: false, reason: 'no edit rights' }] });
+  const r = await run('task-board', { bridge: b });
+  r.byId.get('title').value = 'Not saved';
+  r.byId.get('who').value = AGENTS[1].id;
+  r.byId.get('add').click();
+  await settle(40);
+  check('task-board/no-ask-when-the-row-was-not-saved', () => {
+    assert.ok(!b.calls.some((c) => c[0] === 'sendTask'), JSON.stringify(b.calls));
+    assert.match(r.text(), /no edit rights/);
+  });
+}
+// research desk: the review lands but the State write is refused: say so.
+{
+  const findings = [{ id: 'r1', cells: { Finding: 'Claim S', Source: 'https://s.example' } }];
+  const b = fakeMulti({ dbs: deskDbs(findings), primary: 'd1', agents: AGENTS,
+    writeAnswers: [{ ok: true }, { ok: false, reason: 'no edit rights on Findings' }] });
+  const r = await run('research-desk', { bridge: b });
+  r.byId.get('list').children[0].buttons().find((x) => x.textContent === 'Accept').click();
+  await settle(40);
+  check('research-desk/refused-state-write-is-reported', () => {
+    assert.equal(b.calls[1][0], 'write');
+    assert.match(r.text(), /State column[\s\S]*was not updated: no edit rights on Findings/);
   });
 }
 
