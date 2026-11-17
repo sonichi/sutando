@@ -709,6 +709,28 @@ def worker_plugin_dirs(workspace, worker_id: str, warn=None, skipped=None) -> li
     return out
 
 
+def bind_room_if_free(workspace, room: str, target: str) -> bool:
+    """Bind `room` to `target` only when it is unbound or already `target`'s, decided under the roster lock
+    so an owner's binding made meanwhile is never overwritten; True when it is `target`'s afterwards."""
+    with _locked(workspace):
+        raw = _load_existing_roster_strict(workspace)
+        if raw is None:
+            raise RosterError("no roster; nothing to bind to")
+        workers = dict(raw.get("workers") or {})
+        wid = resolve_label(raw, target)
+        if wid == CORE or wid not in workers:
+            raise RosterError(f"binding {room!r} names {target!r}, which is not a worker")
+        bindings = dict(load_bindings(workspace))
+        if bindings.get(room) not in (None, wid, [wid]):
+            return False
+        if bindings.get(room) is None:
+            bindings[room] = wid
+            save_bindings(workspace, bindings)
+        # Compiled even when the binding was already there: a run that saved and then failed to publish is repaired.
+        compile_roster(workspace, workers, bindings)
+        return True
+
+
 def unbind_room(workspace, room: str) -> dict:
     """Drop a room's binding; its tasks go to the core again. Absent is not an
     error: an unpin of an unbound room is the state the owner asked for."""

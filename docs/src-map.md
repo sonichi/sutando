@@ -252,6 +252,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`slack_result_delivery.py`** — Slack reply-leg delivery state, bound to the shared outbox (Slack strangler).
 - **`sparrow-claude-local.py`** — Sutando's entry for `ag2-sparrow-claude-local`: the package CLI with the workspace injected.
 - **`sparrow_agent_bridge.py`** — One agent's gateway bridge under sparrowd, from the declaration its claude-local or codex-local install wrote.
+- **`sparrow_core_bridge.py`** — The host's core gateway bridge as sparrowd runs it (`src/sparrowd.py --core`).
 - **`sparrowd.py`** — sparrowd launcher — the adapter edge that names concrete workers.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
@@ -444,6 +445,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`channel-bridge-wrapper.sh`** — launchd entry point shared by Slack, Discord, and Telegram bridges.
 - **`credential-proxy-wrapper.sh`** — Wrapper for launchd-managed credential-proxy.
 - **`evict-own-bridge.sh`** — Evict a pre-existing BARE channel bridge that belongs to THIS checkout, before the launchd wrapper starts its own supervised child.
+- **`gateway-bridge-lib.sh`** — The legacy gateway bridge's launch policy, one copy for both launchers: sourced by the launchd wrapper, run as `gateway-bridge-lib.sh env|alert|core-gate` by its other callers.
 - **`gateway-bridge-wrapper.sh`** — Wrapper for the launchd-managed gateway bridge (src/remote-gateway-bridge.py).
 
 ## `src/observability/`
