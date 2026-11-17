@@ -54,6 +54,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 - task-orphan-check: a task's age is how long it has waited in this inbox (its `local_time:` header), not since the sender sent it, so messages held at the broker while the app was closed are answered on relaunch instead of archived as orphans. Only a `local_time:` above `task:` counts, so a body line cannot make a fresh task from an older writer look orphaned. ([#5929])
 
 ## Changed
+- Task watcher: on a Claude seat whose watcher the task-watch Mod hosts, the standby supervisor no longer types tasks or nudges into the pane; after 5 min with no ready session watcher it logs and alerts the owner once per episode, and stands down silently when one returns. Codex seats and seats without the Mod keep the typing standby. ([#6592])
 
 <!-- refactor(), perf(), docs() changes visible to operators go here -->
 - Claude core: the task-watch Mod now hosts the core session's task watcher by default, so it no longer dies when a `Monitor` reaches its 30-minute cap. `SUTANDO_TASK_WATCH_MOD_CORE=0` keeps the `Monitor` watcher. A Claude Code below the Mod's floor, or a Mod that never reports a ready watcher, still falls back to the `Monitor`. Codex cores are unchanged; pool workers already default to the Mod ([#6450]).
