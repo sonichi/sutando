@@ -238,6 +238,36 @@ class Adopt(Own):
         self.assertEqual(worker_lane.adopt_stray_results("", self.ws, own), [])
         self.assertEqual(worker_lane.adopt_stray_proactive("", shared, own), [])
 
+    def test_nothing_is_pulled_back_once_the_folder_is_no_longer_its_own(self):
+        shared, own = self.ws / "results", self.own / "results"
+        shared.mkdir(parents=True, exist_ok=True)
+        lane = f"task-{self.row['instance']}~a1.txt"
+        stamped = proactive_filename(1, "ag2space", W)
+        for name in (lane, stamped):
+            (shared / name).write_text("r")
+        C.set_worker_dirs(W, False, workspace=self.ws)
+        self.assertEqual(worker_lane.adopt_stray_results(W, self.ws, own), [])
+        self.assertEqual(worker_lane.adopt_stray_proactive(W, shared, own), [])
+        C.set_worker_dirs(W, True, workspace=self.ws)
+        self.assertEqual(worker_lane.adopt_stray_results(W, self.ws, self.ws / "elsewhere"), [])
+        self.assertEqual(sorted(p.name for p in shared.glob("*.txt")), sorted([lane, stamped]))
+
+    def test_the_field_cleared_mid_pass_stops_the_next_move(self):
+        shared, own = self.ws / "results", self.own / "results"
+        shared.mkdir(parents=True, exist_ok=True)
+        a, b = proactive_filename(1, "ag2space", W), proactive_filename(2, "ag2space", W)
+        for name in (a, b):
+            (shared / name).write_text("r")
+        import undelivered_quarantine
+        real = undelivered_quarantine.rename_noreplace
+
+        def then_undo(src, dst, log=None):
+            real(src, dst, log)
+            C.set_worker_dirs(W, False, workspace=self.ws)
+        with mock.patch.object(undelivered_quarantine, "rename_noreplace", then_undo):
+            self.assertEqual(worker_lane.adopt_stray_proactive(W, shared, own), [a])
+        self.assertTrue((shared / b).exists())
+
     def test_the_loop_logs_each_move_and_stops(self):
         shared, own = self.ws / "results", self.own / "results"
         shared.mkdir(parents=True, exist_ok=True)
