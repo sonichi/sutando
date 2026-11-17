@@ -78,6 +78,7 @@ for label, snippet in [
     ("double-quoted", 'const help = "art.agent.sendTask( is how";'),
     ("template", "const help = `art.room.post(${1})`;"),
     ("regex", "const re = /room.post\\(/;"),
+    ("regex-with-slash-in-class", "const re = /[/]room.post\\(/;"),
 ]:
     page = SEND_BTN.replace("await art.ready;", "await art.ready; " + snippet + "\n")
     check(f"fake-send-not-silenced-by-{label}", "no-fake-send" in rules(cp.check(page), "warnings"))
@@ -87,6 +88,7 @@ for label, snippet in [
     ("after-division", "const half = 4 / 2; await art.room.post({text: 'a/b'});"),
     ("after-escaped-quote", "const q = 'it\\'s'; await art.agent.sendTask({agentId: 'x', text: q, key: 'k'});"),
     ("after-regex-with-quote", "const re = /'/g; await art.room.post({text: 'x'.replace(re, '')});"),
+    ("after-unterminated-slash", "const x = (1\n/ 2); const y = [/\n]; await art.room.post({text: 'x'});"),
 ]:
     page = SEND_BTN.replace("await art.ready;", "await art.ready; " + snippet + "\n")
     check(f"real-send-counts-{label}", "no-fake-send" not in rules(cp.check(page), "warnings"))

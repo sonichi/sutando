@@ -42,6 +42,8 @@ _REGEX_BEFORE = set("(,=:[!&|?{};+-*%<>~^")
 def _script_code(src: str) -> str:
     """The pages' script bodies with comments, string literals and regex literals blanked.
 
+    Block comments are already gone (_strip_comments); this removes // comments and literals.
+
     Used where a rule asks "does the page CALL x?": a commented-out call, or the call's name in a
     string or a regex, must not count. Template literals are blanked whole, ${} included.
     """
@@ -53,11 +55,6 @@ def _script_code(src: str) -> str:
             if body.startswith("//", i):
                 j = body.find("\n", i)
                 i = n if j < 0 else j
-                continue
-            if body.startswith("/*", i):
-                j = body.find("*/", i + 2)
-                i = n if j < 0 else j + 2
-                out.append(" ")
                 continue
             word = re.search(r"([A-Za-z_$][\w$]*)\s*$", body[max(0, i - 12):i])
             regex_ok = c == "/" and (prev == "" or prev in _REGEX_BEFORE
