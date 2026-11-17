@@ -129,7 +129,10 @@
   // ---- your own agents. userId is present only when the agent is a member of this room.
   let agents = [];
   const fillAgents = async () => {
-    try { agents = (art.agent && await art.agent.list()) || []; } catch (e) { agents = []; }
+    // agent.list() answers an array, or {ok: false, reason} when it cannot: never assume an array.
+    let got = [];
+    try { got = art.agent ? await art.agent.list() : []; } catch (e) { got = []; }
+    agents = Array.isArray(got) ? got : [];
     const sel = $('who');
     const want = sel.value;
     sel.textContent = '';

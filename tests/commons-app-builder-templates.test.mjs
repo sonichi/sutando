@@ -1866,6 +1866,18 @@ const boardDbs = (rows = []) => ({ d1: { id: 'd1', name: 'Task Board — Tasks',
   check('task-board/database-removed-error', () => assert.match(r.text(), /was removed from this room/));
 }
 
+for (const tpl of ['research-desk', 'task-board']) {
+  const dbsFor = tpl === 'research-desk' ? deskDbs() : boardDbs();
+  const b = fakeMulti({ dbs: dbsFor, primary: 'd1', agents: { ok: false, reason: 'page permission required' } });
+  const before = unhandled.length;
+  const r = await run(tpl, { bridge: b });
+  await settle(10);
+  check(`${tpl}/agent-list-refusal-is-not-an-array`, () => {
+    assert.equal(unhandled.length, before, unhandled.slice(before).join('; '));
+    assert.match(r.text(), tpl === 'research-desk' ? /No findings yet/ : /No tasks yet/);
+  });
+}
+
 if (unhandled.length) {
   failures.push(`a page threw and left its promise unhandled (so a control may be stuck): ${[...new Set(unhandled)].join('; ')}`);
 }

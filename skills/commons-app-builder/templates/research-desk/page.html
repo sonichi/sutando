@@ -166,7 +166,10 @@
   let agents = [];
   const pendingKeys = new Map();     // what -> key: a retry after an unknown outcome reuses its key
   const fillAgents = async () => {
-    try { agents = (art.agent && await art.agent.list()) || []; } catch (e) { agents = []; }
+    // agent.list() answers an array, or {ok: false, reason} when it cannot: never assume an array.
+    let got = [];
+    try { got = art.agent ? await art.agent.list() : []; } catch (e) { got = []; }
+    agents = Array.isArray(got) ? got : [];
     const sel = $('agent');
     const want = sel.value;
     sel.textContent = '';
