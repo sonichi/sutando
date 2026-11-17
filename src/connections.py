@@ -2188,9 +2188,14 @@ WORKER_DIRS_OWN = "own"
 WORKER_AGENTS_DIR = "agents"
 
 
+def worker_agents_dir(workspace: Optional[Path] = None) -> Path:
+    """`<workspace>/agents`: the folder every agent's own root and declaration lives under."""
+    return _workspace(workspace) / WORKER_AGENTS_DIR
+
+
 def worker_root(agent_mxid: str, workspace: Optional[Path] = None) -> Path:
     """`<workspace>/agents/<segment of agent_mxid>`: the agent's own folder; ValueError on an empty id."""
-    return _workspace(workspace) / WORKER_AGENTS_DIR / _agent_identity().root_segment(agent_mxid)
+    return worker_agents_dir(workspace) / _agent_identity().root_segment(agent_mxid)
 
 
 def _row_dirs(row: Optional[Mapping[str, object]], workspace: Optional[Path]) -> "Optional[tuple[Path, Path]]":

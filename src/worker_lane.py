@@ -196,7 +196,8 @@ def _install_own(ns: dict, worker: str, argv, *, workspace, results_dir, log, wh
 
 def lane_dirs(workspace, instance: str) -> "tuple[Path, Path, bool]":
     """(tasks dir, results dir, own) a lane `instance` runs on: its worker's own folders when that worker
-    has them (`connections.worker_dirs`), else the workspace's shared tasks/ and results/."""
+    has them (`connections.worker_dirs`), else the workspace's shared tasks/ and results/. Paths are
+    lexical under `workspace` as given; resolve both sides before comparing with a recorded realpath."""
     from connections import lane_worker, worker_dirs
     ws = Path(workspace)
     own = worker_dirs(lane_worker(instance, ws), ws) if instance else None
@@ -264,7 +265,7 @@ def _declaration_for(worker: str, workspace) -> "tuple[dict | None, str]":
     from connections import WORKER_RE, worker_identity, worker_root
     if not WORKER_RE.match(worker or ""):
         return None, f"{worker!r} is not a worker id"
-    mxid = str((worker_identity(worker, Path(workspace)) or {}).get("agent_mxid") or "")
+    mxid = str((worker_identity(worker, Path(workspace)) or {}).get("agent_mxid") or "").strip()
     if not mxid:
         return None, f"worker {worker} has no agent identity row"
     from ag2_sparrow import connect_bridge as adapter
@@ -279,10 +280,11 @@ def declared_bridge(worker: str, workspace) -> bool:
     """Whether `worker`'s agent has a declaration the agent bridge runs as that worker: the one check the
     lane keeper asks before starting the worker's lane. Raises when the record or the file cannot be read."""
     import sparrow_agent_bridge
+    from connections import worker_agents_dir
     decl, _why = _declaration_for(worker, workspace)
     if decl is None:
         return False
-    loaded, _why = sparrow_agent_bridge.load(decl["path"], Path(workspace) / "agents")
+    loaded, _why = sparrow_agent_bridge.load(decl["path"], worker_agents_dir(Path(workspace)))
     return bool(loaded) and loaded.get("worker") == worker
 
 

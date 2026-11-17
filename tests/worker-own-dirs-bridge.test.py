@@ -64,6 +64,34 @@ class LaneDirs(Own):
         self.assertEqual(worker_lane.lane_dirs(self.ws, self.row["instance"]), shared)
 
 
+class TheDeclaredBridgesDirs(Own):
+    def run_bridge(self):
+        import workspace_default
+        from ag2_sparrow import _dirs
+        decl, seen = self.declare(), []
+        real = _dirs.set_dirs
+        with mock.patch.object(_dirs, "set_dirs", side_effect=lambda **kw: (seen.append(kw), real(**kw))), \
+                mock.patch.object(workspace_default, "resolve_workspace", return_value=self.ws):
+            rc = bridge.main([str(decl)], workspace=self.ws, get_key=lambda k: self.fail(k), vault=self.vault,
+                             run=lambda *a, **k: self.fail("the bare package ran"), run_path=lambda path, run_name: None)
+        self.assertEqual(rc, 0)
+        return seen[0]
+
+    def test_the_merged_dirs_it_runs_with_are_the_own_folders(self):
+        self.assertEqual(self.run_bridge(), {"task_dir": str(self.own / "tasks"), "result_dir": str(self.own / "results"),
+                                             "state_dir": str(self.ws / "state")})
+
+    def test_a_shared_dir_worker_runs_on_the_shared_folders(self):
+        C.set_worker_dirs(W, False, workspace=self.ws)
+        self.assertEqual(self.run_bridge()["task_dir"], str(self.ws / "tasks"))
+
+    def test_the_declaration_strips_the_rows_agent(self):
+        self.edit_worker_row(agent_mxid=f" {S.WORKER_AGENT} ")
+        decl, why = worker_lane._declaration_for(W, self.ws)
+        self.assertEqual((decl["agent"], why), (S.WORKER_AGENT, ""))
+        self.assertEqual(C.worker_agents_dir(self.ws), self.agents)
+
+
 class InstallOwn(Own):
     def install(self, handler=True):
         if handler:

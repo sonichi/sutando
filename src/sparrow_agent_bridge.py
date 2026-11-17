@@ -49,6 +49,7 @@ from ag2_sparrow.adapters.claude_code.shape import LOCAL as CLAUDE_LOCAL  # noqa
 from ag2_sparrow.bounded_file_read import read_regular  # noqa: E402
 from ag2_sparrow.adapters.codex.connect_cli import COMMAND as CODEX_LOCAL_COMMAND  # noqa: E402
 import worker_lane  # noqa: E402
+from connections import worker_agents_dir  # noqa: E402
 
 WRITTEN_BY = f"{CLAUDE_LOCAL.command} install"
 WRITERS = (WRITTEN_BY, f"{CODEX_LOCAL_COMMAND} install", worker_lane.WRITTEN_BY)
@@ -199,7 +200,7 @@ def declarations(workspace: Path, vault_keys, held=None) -> "tuple[list, list]":
     directory declares nothing; one that cannot be listed, or a home that cannot be entered, raises
     ScanUnavailable. A declaration file that cannot be read is a skip whose worker name is appended to
     `held`: its state is unknown, so the caller keeps whatever runs under that name."""
-    agents, found, skipped = Path(workspace) / "agents", [], []
+    agents, found, skipped = worker_agents_dir(Path(workspace)), [], []
     names = set(vault_keys)
     try:
         homes = sorted(p for p in agents.iterdir() if p.name.endswith(SUFFIX))
@@ -258,7 +259,7 @@ def endpoint(decl: dict, token: str, get_key) -> "tuple[str, str]":
 def preflight(workspace, get_key, vault=None) -> int:
     """One line per declared agent bridge: whether it can start (its token in the vault, and its gateway in
     the token or under its URL key). 1 when any cannot. No value is printed."""
-    agents, bad = Path(workspace) / "agents", []
+    agents, bad = worker_agents_dir(Path(workspace)), []
     try:
         homes = sorted(p for p in agents.iterdir() if p.name.endswith(SUFFIX))
     except (FileNotFoundError, NotADirectoryError):
@@ -314,7 +315,7 @@ def main(argv=None, workspace=None, get_key=None, run=runpy.run_module, vault=No
     if args[0] == "--preflight":
         return preflight(workspace, get_key, vault)
     try:
-        decl, why = load(Path(args[0]), Path(workspace) / "agents")
+        decl, why = load(Path(args[0]), worker_agents_dir(Path(workspace)))
     except ScanUnavailable as e:
         decl, why = None, str(e)
     if decl is None:
