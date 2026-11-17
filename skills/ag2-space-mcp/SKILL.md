@@ -1,6 +1,6 @@
 ---
 name: ag2-space-mcp
-description: Connect this Sutando install to AG2 Space's hosted MCP as its own agent, without the desktop app, and know which room and Commons work runs there today (messages, replies and summons, reading comments back, PDFs, publishing a page, media, Commons pages, databases and folders, the Commons capability list). Use when the agent must act in an AG2 Space room and no `ag2-space` MCP server is registered, or when deciding whether a Commons task can go through MCP.
+description: Connect this Sutando install to AG2 Space's hosted MCP as its own agent, without the desktop app, and know which room and Commons work runs there today (messages, replies and summons, reading comments back, PDFs, publishing a page, media, Commons pages, databases and folders, the Commons capability list). Use when the agent must act in an AG2 Space room and no `ag2-space` MCP server is registered, or when deciding whether a Commons task can go through MCP. Also holds the flow for scheduling an owner-requested reminder or timed job through the platform scheduler.
 ---
 
 # AG2 Space MCP
@@ -108,17 +108,21 @@ or a local timer.
 6. A one-off `@at` time needs an explicit offset. A recurring local time needs the owner's IANA
    timezone. Never assume the pod clock is the owner's timezone.
 7. Do not promise update, pause, run-now, recall or history unless the live catalog offers them.
-8. If scheduling is disabled, unavailable, refused, or its approval is pending, denied, declined, expired or revoked (the states `approval.inspect` returns), tell the owner the timed
-   work was not set up. Do not switch routes to get around an approval. A native timed-task tool
-   is an alternative only when trusted host instructions say it is platform-backed.
+8. If scheduling is disabled, unavailable or refused, or its approval is denied, expired or
+   revoked (states `approval.inspect` returns), tell the owner the timed work was not set up.
+   A pending approval is step 3, not a failure. Do not switch routes to get around an approval.
+   A native timed-task tool is an alternative only when trusted host instructions say it is
+   platform-backed.
 9. A cloud Spacer never creates local timed jobs. An unavailable platform is not a reason to keep
    it awake with local scheduling.
 
 Sutando's own startup, maintenance, heartbeat, backend and proactive-loop scheduling stays native.
 Only timed work the owner asks for goes to the platform.
-Engine-run jobs the owner opted into (morning check-in, `room-readme-upkeep`, `commons-feed-runner`)
-stay native. A timed request by voice, Telegram, Discord or local chat has no room to schedule in,
-so it stays on the native path.
+A starter job the owner switches on in `crons.json` is a Sutando feature, not a reminder, and stays
+native. A request with no s.space origin room (Telegram, Discord, local chat, or voice not docked
+in a room) has nowhere to schedule, so it stays native. A voice request made while docked in a
+room counts as made in that room. A to-do item stays on Reminders or the vault; a message or job
+delivered at a set time goes to the platform.
 
 ## Troubleshooting
 

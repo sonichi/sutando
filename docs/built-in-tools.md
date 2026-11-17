@@ -197,7 +197,7 @@ python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py add "Call Bob
 python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py add "Fix bug" "2026-03-17" --owner-asked  # with due date
 python3 $CLAUDE_CONFIG_DIR/skills/macos-tools/scripts/reminders.py complete "Call Bob" --owner-asked  # mark done
 ```
-Use for "add a reminder", "what's on my todo list", "remind me to...", "mark X as done".
+Use for "add a reminder", "what's on my todo list", "remind me to...", "mark X as done". A message or job delivered at a set time in an s.space room or DM goes to the platform scheduler instead (see `CLAUDE.md`).
 
 **macOS GUI control** — click, type, scroll, press keys in any Mac app via `macos-use` MCP skill. Works in non-interactive mode (which is how the proactive loop runs), unlike Claude's built-in computer-use. Accessibility-tree based — no screenshots leave the machine.
 

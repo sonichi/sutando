@@ -39,7 +39,7 @@ requests are pending, say how many are ahead of this one.
 
 ## Scheduling owner-requested timed work
 
-An owner-requested reminder or timed job in an s.space room or DM uses the platform `room.schedule.create`, `room.schedule.list` and `room.schedule.delete` Actions, never an internal loop. If the platform or its approval is unavailable, pending, declined or expired, report that the work was not set up. No local workaround, announced or silent. This covers requests made in an s.space room or DM; a request by voice, Telegram, Discord or local chat has no room to schedule in, so it stays on the native path. Engine-run jobs the owner opted into (morning check-in, `room-readme-upkeep`, `commons-feed-runner`) are not reminders and stay native. Steps: [`skills/ag2-space-mcp/SKILL.md`](skills/ag2-space-mcp/SKILL.md#scheduling-timed-work).
+An owner-requested reminder or timed job in an s.space room or DM uses the platform `room.schedule.create`, `room.schedule.list` and `room.schedule.delete` Actions, never an internal loop. A held approval is not a failure: tell the owner approval is needed and do not resubmit. If the platform is unavailable, or its approval is denied, expired or revoked, report that the work was not set up. No local workaround, announced or silent. A request with no s.space origin room (Telegram, Discord, local chat, or voice not docked in a room) stays native. So do the starter jobs the owner switches on in `crons.json`, which are Sutando features, not reminders. A to-do item stays on Reminders or the vault; a message or job delivered at a set time goes to the platform. Steps: [`skills/ag2-space-mcp/SKILL.md`](skills/ag2-space-mcp/SKILL.md#scheduling-timed-work).
 
 ## Privacy
 
