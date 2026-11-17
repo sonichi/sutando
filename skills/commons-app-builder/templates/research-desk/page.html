@@ -158,7 +158,8 @@
     if (!members) return null;
     try {
       const pid = await art.personId(cell);
-      return pid ? (members.get(pid) || { id: pid, name: 'A former member', kind: 'human' }) : null;
+      // Someone no longer in the room cannot be shown to be a person: their review is not counted.
+      return pid ? (members.get(pid) || { id: pid, name: 'A former member', kind: 'unknown' }) : null;
     } catch (e) { return null; }
   };
 
@@ -204,7 +205,8 @@
 
   let titleProp = null, reviewTitle = null, busy = false, snapshot = null, reviews = null, generation = 0;
 
-  // The latest review per finding, from a PERSON only: an agent's review is shown, never counted.
+  // Per finding: the latest decision by a PERSON (it alone sets the state) and the latest review
+  // of any kind (shown). A later agent review is displayed but never replaces a person's decision.
   const verdicts = async (members) => {
     const out = new Map();
     if (!reviews) return out;
@@ -212,7 +214,11 @@
       const f = r.cells.Finding;
       if (!f || !r.cells.Verdict) continue;
       const who = await personOf(r.cells['Created by'], members);
-      out.set(f, { verdict: r.cells.Verdict, who, note: r.cells.Note || '' });
+      const review = { verdict: r.cells.Verdict, who, note: r.cells.Note || '' };
+      const entry = out.get(f) || { human: null, last: null };
+      entry.last = review;
+      if (who && who.kind === 'human') entry.human = review;
+      out.set(f, entry);
     }
     return out;
   };
@@ -234,7 +240,7 @@
     if (!members) show('warn', 'Allow the page to see who is who, and authors and reviewers will fill in.');
     const state = (row) => {
       const d = decided.get(row.id);
-      return d && d.who && d.who.kind === 'human' ? d.verdict : 'Proposed';
+      return d && d.human ? d.human.verdict : 'Proposed';
     };
     const accepted = snap.rows.filter((r) => state(r) === 'Accepted');
     $('sub').textContent = snap.rows.length + (snap.rows.length === 1 ? ' finding' : ' findings')
@@ -279,9 +285,12 @@
       const by = row.author;
       meta('Proposed by ' + (by ? by.name + (by.kind === 'agent' ? ' (agent)' : '') : '?'), true);
       const d = decided.get(row.id);
-      if (d) meta((d.verdict === 'Accepted' ? 'Accepted' : 'Rejected') + ' by '
-        + (d.who ? d.who.name + (d.who.kind === 'agent' ? ' (agent: not counted until a person decides)' : '') : '?')
-        + (d.note ? ' — ' + d.note : ''), true);
+      const said = (v) => (v.verdict === 'Accepted' ? 'Accepted' : 'Rejected') + ' by '
+        + (v.who ? v.who.name : '?') + (v.note ? ' — ' + v.note : '');
+      if (d && d.human) meta(said(d.human), true);
+      if (d && d.last && d.last !== d.human) meta('Later review, not counted: ' + said(d.last)
+        + (d.last.who && d.last.who.kind === 'agent' ? ' (agent)' : '')
+        + (d.human ? '' : '. A person has not decided yet.'), true);
 
       const actions = document.createElement('div');
       actions.className = 'row';
@@ -346,7 +355,7 @@
         const d = decided.get(r.id);
         const w = document.createElement('div');
         w.className = 'meta';
-        w.textContent = 'Accepted by ' + (d && d.who ? d.who.name : '?');
+        w.textContent = 'Accepted by ' + (d && d.human && d.human.who ? d.human.who.name : '?');
         li.appendChild(w);
         ul.appendChild(li);
       });

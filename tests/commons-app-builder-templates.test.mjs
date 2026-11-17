@@ -1714,7 +1714,7 @@ const AGENTS = [
   check('research-desk/agent-review-does-not-accept', () => {
     const li = r.byId.get('list').children[0];
     assert.match(li.textContent, /Claim A[\s\S]*Proposed/);
-    assert.match(li.textContent, /not counted until a person decides/);
+    assert.match(li.textContent, /not counted: Accepted by Desk Agent \(agent\)\. A person has not decided yet/);
     assert.match(li.textContent, /Proposed by Desk Agent \(agent\)/);
   });
   check('research-desk/person-review-accepts', () => {
@@ -1788,6 +1788,26 @@ const AGENTS = [
   b.fire('d1', null);
   await settle();
   check('research-desk/database-removed-error', () => assert.match(r.text(), /was removed from this room/));
+}
+
+// sonichi-dot P2: a later agent review must not revoke a person's decision; and the controls.
+for (const [label, order, expect] of [
+  ['human-then-agent-stays-accepted', ['@me:x', '@desk.agent:x'], 'Accepted'],
+  ['agent-then-human-is-accepted', ['@desk.agent:x', '@me:x'], 'Accepted'],
+  ['departed-reviewer-is-not-counted', ['@gone:x'], 'Proposed'],
+]) {
+  const verdict = (by, i) => ({ id: 'v' + i, cells: { Review: 'X', Finding: 'r1',
+    Verdict: by === '@desk.agent:x' ? 'Rejected' : 'Accepted', 'Created by': [by] } });
+  const b = fakeMulti({ dbs: deskDbs([{ id: 'r1', cells: { Finding: 'Claim X', Topic: 'T', Source: 'https://x.example' } }],
+    order.map(verdict)), primary: 'd1', accounts: { '@me:x': 'u1', '@desk.agent:x': 'u2', '@gone:x': 'u9' } });
+  const r = await run('research-desk', { bridge: b });
+  check(`research-desk/${label}`, () => {
+    const li = r.byId.get('list').children[0];
+    assert.match(li.textContent, new RegExp('Claim X[\\s\\S]*' + expect));
+    const rep = r.byId.get('report').textContent;
+    if (expect === 'Accepted') assert.match(rep, /Claim X[\s\S]*Accepted by Tester/);
+    else assert.match(rep, /Nothing accepted yet/);
+  });
 }
 
 const TASK_PROPS = [
