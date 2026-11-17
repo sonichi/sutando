@@ -103,9 +103,11 @@ A worker-picker button may be sent as `"picker_command"` plus optional
 string; the bridge writes it as JSON either way. Both are written as trusted
 pre-body headers, so a reader that stops at `task:` sees them and a body copy
 is never one. The task goes to the core, never to a worker bound to the room.
-Only the `add` button remains: the pool no longer applies `pin` or `unpin`, so a
-room is bound to a worker with `pool_roster.py bind`, and a converted worker
-(one on its own task folders) is never routed to at all.
+Only the `add` button remains: the pool no longer applies `pin` or `unpin`. A
+room is bound to a worker on the shared folders with
+`pool_manage.py bind <room id> <worker>` and released with
+`pool_manage.py unbind <room id>`; a converted worker (one on its own task
+folders) is never routed to, so `bind` refuses it.
 
 An s.space broker may additionally send `"session_scope": "room"`. The
 bridge writes only that exact value as a trusted pre-body header; missing,
