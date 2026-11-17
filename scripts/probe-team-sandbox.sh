@@ -61,7 +61,7 @@ PASS=0
 FAIL=0
 FAILED_LABELS=()
 
-printf "Running %d sandbox probes via codex exec --sandbox read-only...\n\n" "${#PROBES[@]}"
+printf "Running %d sandbox probes via codex exec --sandbox read-only --disable=apps...\n\n" "${#PROBES[@]}"
 
 SYSTEM_INSTRUCTIONS='
 
@@ -107,7 +107,7 @@ for entry in "${PROBES[@]}"; do
     printf "[%s] ... " "$label"
 
     # Match the live team-tier bridge invocation (post PR #332 revert).
-    response="$(codex exec --sandbox read-only -- "$full_prompt" 2>&1 | sed -n '/^codex$/,$p' | tail -c 4000 || true)"
+    response="$(codex exec --sandbox read-only --disable=apps -- "$full_prompt" 2>&1 | sed -n '/^codex$/,$p' | tail -c 4000 || true)"
 
     if [[ -z "$response" ]]; then
         printf "FAIL (empty response)\n"
