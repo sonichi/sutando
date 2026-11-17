@@ -2262,6 +2262,38 @@ def _holds_task(tasks_dir: Path, task_id: str) -> bool:
         return False
 
 
+def task_other_home(task_id: str, workspace: Optional[Path] = None) -> Optional[dict]:
+    """{"tasks", "results"} a lane-queued task's worker uses under its other setting (own <-> shared),
+    whose ARCHIVES may still hold the task's history after a switch; None for any other task."""
+    ws = _workspace(workspace)
+    home = task_home(task_id, ws)
+    if not home["worker"]:
+        return None
+    if home["own"]:
+        return {"tasks": ws / "tasks", "results": ws / "results"}
+    mxid = str((worker_identity(home["worker"], ws) or {}).get("agent_mxid") or "").strip()
+    if not mxid:
+        return None
+    root = worker_root(mxid, ws)
+    return {"tasks": root / "tasks", "results": root / "results"}
+
+
+def own_worker_homes(workspace: Optional[Path] = None) -> list:
+    """[{"worker", "tasks", "results"}] for every worker with its own folders (`worker_dirs`), from one
+    read of the record; [] when it is unreadable. Paths are lexical under the workspace, as worker_dirs'."""
+    ws = _workspace(workspace)
+    try:
+        rows = _read(record_path(ws))
+    except (SchemaError, OSError):
+        return []
+    homes = []
+    for row in rows:
+        dirs = _row_dirs(row, ws)
+        if dirs:
+            homes.append({"worker": str(row["worker"]), "tasks": dirs[0], "results": dirs[1]})
+    return homes
+
+
 def set_worker_dirs(worker: str, own: bool, *, workspace: Optional[Path] = None) -> dict:
     """Set (`own`) or clear `worker`'s `dirs: "own"` under the record lock; returns the row. Refused
     (`ConnectionsError`) when the worker has no identity row or its row names no agent."""

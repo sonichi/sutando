@@ -221,6 +221,17 @@ class TheHandlerStep(Base):
         self.assertEqual((self.own / "tasks" / f"{self.mine}.txt").read_text(), "already here")
         self.assertTrue((self.ws / "tasks" / f"{self.mine}.txt").is_file())
 
+    def test_without_a_no_replace_rename_a_delivered_own_task_fails_the_run(self):
+        import errno
+        import undelivered_quarantine
+        self.deliver(self.mine)
+        with mock.patch.object(undelivered_quarantine, "rename_noreplace",
+                               side_effect=FileExistsError(errno.ENOTSUP, "no primitive")):
+            self.assertEqual(self.handle()[0], 1)
+        self.assertTrue((self.ws / "tasks" / f"{self.mine}.txt").is_file())
+        self.assertTrue((pd.deliveries_dir(self.ws, W) / f"{self.mine}.txt").is_file(), "the sentinel stays")
+        self.assertEqual(self.handle(), (0, {"kept": {}, "moved": [self.mine], "returned": []}))
+
     def test_an_own_lane_task_already_answered_and_archived_only_archives_its_sentinel(self):
         self.deliver(self.mine)
         (self.ws / "tasks" / f"{self.mine}.txt").unlink()
