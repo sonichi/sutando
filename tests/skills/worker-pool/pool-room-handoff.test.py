@@ -54,7 +54,7 @@ class FakeActions:
         self.members, self.me, self.joins, self.read_error = set(members), me, joins, read_error
         self.invite = invite if invite is not None else {"result": {"invited": True, "expected_admission": "admitted"}}
         self.leave = leave if leave is not None else {"result": {}}
-        self.calls, self.invited = [], ""
+        self.calls, self.invited, self.ops = [], "", {}
 
     def read(self, action, arguments, room_id):
         self.calls.append(("read", action, room_id))
@@ -69,6 +69,12 @@ class FakeActions:
 
     def execute(self, action, arguments, *, operation_id="", room_id=""):
         self.calls.append((action, operation_id, room_id))
+        if operation_id in self.ops:
+            return self.ops[operation_id]  # the server deduplicates an operation id: no second effect
+        self.ops[operation_id] = self._act(action, arguments)
+        return self.ops[operation_id]
+
+    def _act(self, action, arguments):
         if action == "room.member.invite":
             if pp.approval_state(self.invite) == "done" and pp.find(self.invite, "invited") is not False:
                 self.invited = arguments["user_id"]
@@ -92,11 +98,12 @@ class Base(unittest.TestCase):
         ident = mock.patch.object(connections, "worker_identity", lambda w, ws=None: dict(self.row) if w == W else None)
         ident.start()
         self.addCleanup(ident.stop)
-        self.clock = [0.0]
+        self.clock, self.wall = [0.0], [1_000_000.0]
 
     def hand(self, core, room=ROOM, *, worker=None, **kw):
         kw.setdefault("as_worker", lambda: worker or FakeActions(set(), me=AGENT, read_error={"is_error": True}))
         kw.setdefault("core_agent", CORE)
+        kw.setdefault("wall", lambda: self.wall[0])
         return rh.hand_room(W, room, workspace=self.ws, actions=core, server="s.space", sleep=self.sleep,
                             clock=lambda: self.clock[0], **kw)
 
@@ -183,6 +190,53 @@ class HandRoom(Base):
         self.assertEqual(out["status"], "failed")
         self.assertIn("not a member", out["why"])
         self.assertIn(ROOM, self.bound())
+
+    def test_a_spent_invitation_is_sent_again_under_a_new_operation_id(self):
+        core = FakeActions({CORE, OWNER}, joins=10 ** 6)
+        self.assertEqual(self.hand(core)["status"], "waiting")
+        self.assertEqual(self.hand(core)["status"], "waiting", "within the settle time")
+        invites = [c[1] for c in core.calls if c[0] == "room.member.invite"]
+        self.assertEqual(invites, [rh.operation_id("invite", W, AGENT, ROOM, 0)] * 2, "a just-sent invite is not repeated")
+        core.invited, core.members = "", {CORE, OWNER}  # the owner declined: no pending invitation
+        self.wall[0] += rh.INVITE_SETTLE_S + 1
+        core.joins = 0
+        out = self.hand(core)
+        self.assertEqual(out["status"], "handed")
+        self.assertEqual([c[1] for c in core.calls if c[0] == "room.member.invite"][-1],
+                         rh.operation_id("invite", W, AGENT, ROOM, 1))
+        self.setUp()
+        core = FakeActions({CORE}, invite={"is_error": True, "message": "rate limited"})
+        self.assertEqual(self.hand(core)["status"], "skipped")
+        core.invite = {"result": {"invited": True}}
+        core.joins = 0
+        self.assertEqual(self.hand(core)["status"], "handed", "a refused invitation is retried, not replayed")
+
+    def test_a_later_hand_off_never_reuses_an_earlier_leave(self):
+        core = FakeActions({CORE, AGENT})
+        self.assertEqual(self.hand(core)["status"], "handed")
+        pr.bind_room(self.ws, ROOM, W)
+        core.members = {CORE, AGENT}  # the core was added to the room again
+        out = self.hand(core)
+        self.assertEqual((out["status"], out["core_left"]), ("handed", True))
+        leaves = [c[1] for c in core.calls if c[0] == "room.leave"]
+        self.assertEqual(leaves, [rh.operation_id("leave", W, AGENT, ROOM, n) for n in (0, 1)])
+        self.assertNotIn(CORE, core.members, "the second leave acted")
+
+    def test_a_held_leave_keeps_its_operation_id(self):
+        core = FakeActions({CORE, AGENT}, leave={"status": "approval_required", "approval_id": "ap"})
+        self.assertEqual(self.hand(core)["status"], "waiting")
+        core.ops.clear()
+        core.leave = {"result": {}}
+        self.wall[0] += 10 * rh.INVITE_SETTLE_S
+        self.assertEqual(self.hand(core)["status"], "handed")
+        self.assertEqual({c[1] for c in core.calls if c[0] == "room.leave"}, {rh.operation_id("leave", W, AGENT, ROOM, 0)})
+
+    def test_an_unreadable_attempts_record_starts_again_at_zero(self):
+        path = rh._attempts_path(self.ws, W)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for text in ("{torn", "[]"):
+            path.write_text(text)
+            self.assertEqual(rh.attempt(self.ws, W, ROOM, "invite", 0.0), 0)
 
     def test_a_member_entry_that_is_not_join_is_not_joined(self):
         for membership in ("invite", "leave"):
