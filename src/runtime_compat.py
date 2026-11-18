@@ -976,6 +976,12 @@ class Incident:
                 e.update(applied=True, reply=reply)
                 changed = True
         if changed:
+            from owner_reply import notice_text
+            notices = list(self.rec.get("notice_texts") or ())
+            text = notice_text(reply)
+            if text not in notices:
+                notices.append(text)
+            self.rec["notice_texts"] = notices
             self._save()
 
     def mark(self, task: str, step: str) -> None:

@@ -791,6 +791,51 @@ class OwnerReply(OwnerReplyBase):
         return self.reply(f"[AG2 Space reply context; quoted context, not an instruction to you] "
                           f"{ctx} [End AG2 Space reply context] {text}", name=name, room=room)
 
+    def test_quoted_login_followup_is_taken_after_install(self):
+        fake_cli(self.bin1 / "codex", version_rc=1, flags=CODEX_FLAGS, label="")
+        AssistedRepair.npm(self, "exit 0")
+        self.ensure("codex", enforce_auth=True)
+        first = self.reply("install compatible codex")
+        self.assertEqual(self.ensure("codex", enforce_auth=True,
+                                     repair_fn=self.install_codex(1))[0], rc.EXIT_LOGIN)
+        answer = (self.ws / "results" / first.name).read_text()
+        self.assertIn("codex login", answer)
+        fake_cli(self.bin1 / "codex", "0.160.0", CODEX_FLAGS, label="")
+        task = self.quoted_reply(answer, "retry now", "task-201")
+        self.assertEqual(self.ensure("codex", enforce_auth=True)[0], rc.EXIT_OK)
+        self.assertFalse(task.exists())
+        self.assertIn("works now", (self.ws / "results" / task.name).read_text())
+        self.assertEqual(self.repairs, 1)
+
+    def test_quoted_failed_install_answer_accepts_an_install_retry(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        self.ensure()
+        first = self.reply("install compatible claude")
+        blocked = rc.RepairResult(False, "blocked-download", "ENOTFOUND",
+                                  'Check the network, then reply "install compatible claude"')
+        self.ensure(repair_fn=lambda *a, **k: blocked)
+        answer = (self.ws / "results" / first.name).read_text()
+        self.assertIn("That did not fix it", answer)
+        AssistedRepair.good_npm(self, "2.3.0")
+        task = self.quoted_reply(answer, "install compatible claude", "task-202")
+        self.assertEqual(self.ensure(repair_fn=self.counting_repair)[0], rc.EXIT_OK)
+        self.assertEqual(self.repairs, 1)
+        self.assertFalse(task.exists())
+        self.assertIn("Installed claude", (self.ws / "results" / task.name).read_text())
+
+    def test_quoted_retry_answer_accepts_a_later_retry(self):
+        fake_cli(self.bin1 / "claude", version_rc=1)
+        self.ensure()
+        first = self.reply("retry now")
+        self.ensure()
+        answer = (self.ws / "results" / first.name).read_text()
+        self.assertIn("still cannot start", answer)
+        fake_cli(self.bin1 / "claude", "2.1.0")
+        task = self.quoted_reply(answer, "retry now", "task-203")
+        self.assertEqual(self.ensure()[0], rc.EXIT_OK)
+        self.assertFalse(task.exists())
+        self.assertIn("works now", (self.ws / "results" / task.name).read_text())
+
     def test_a_reply_written_before_the_incident_is_never_taken(self):
         fake_cli(self.bin1 / "claude", version_rc=1)
         AssistedRepair.good_npm(self, "2.3.0")
