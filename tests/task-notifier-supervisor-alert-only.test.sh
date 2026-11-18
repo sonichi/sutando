@@ -42,6 +42,12 @@ leaked="$(env | cut -d= -f1 | grep -E '^SUTANDO_WORKSPACE|^SUTANDO_INSTANCE|TOKE
 
 # ---- Part 1: the episode rules, on a fake clock --------------------------------------------
 # Each line of $VERDICTS is one poll; the clock advances ROLE_POLL per sleep.
+# The outage record, on the fake clock: what src/standby_alert_once.py observe/end keep on disk.
+stub_episodes() {
+  : > "$WORK/episode"
+  episode_observe() { [ -s "$WORK/episode" ] || echo "$1" > "$WORK/episode"; cat "$WORK/episode"; }
+  episode_end() { : > "$WORK/episode"; }
+}
 unit() {  # unit <verdict per poll...>; prints the alerts and log lines it saw
   local verdicts="$WORK/verdicts" clock="$WORK/clock" alerts="$WORK/alerts" logs="$WORK/logs.txt"
   printf '%s\n' "$@" > "$verdicts"; echo 0 > "$clock"; : > "$alerts"; : > "$logs"
@@ -57,8 +63,9 @@ unit() {  # unit <verdict per poll...>; prints the alerts and log lines it saw
     session_role_verdict() { head -n 1 "$verdicts"; tail -n +2 "$verdicts" > "$verdicts.n"; mv "$verdicts.n" "$verdicts"; }
     now_s() { cat "$clock"; }
     sleep() { echo $(( $(cat "$clock") + ${1%.*} )) > "$clock"; }
-    unwatched_alert() { echo "alert at $(now_s) after $1${2:+ $2}" >> "$alerts"; }
+    unwatched_alert() { echo "alert at $(now_s) after $1${3:+ $3 $4}" >> "$alerts"; }
     supervisor_log() { echo "$*" >> "$logs"; }
+    stub_episodes
     run_alert_only
   ) 2> "$WORK/unit.err"
 }
@@ -78,8 +85,8 @@ UNIT_POLL=60 unit $(nos 67)
 check "(1d) by default a long outage gets that one alert and nothing after it" "$r" "$(cat "$WORK/alerts")"
 # shellcheck disable=SC2046
 UNIT_POLL=60 UNIT_REPEAT=1800 unit $(nos 67)
-[ "$(printf '%s\n' "alert at 300 after 300" "alert at 2100 after 2100 reminder" "alert at 3900 after 3900 reminder")" = "$(cat "$WORK/alerts")" ] && r=0 || r=1
-check "(1r) an opted-in repeat reminds every interval" "$r" "$(cat "$WORK/alerts")"
+[ "$(printf '%s\n' "alert at 300 after 300" "alert at 2100 after 2100 reminder 1" "alert at 3900 after 3900 reminder 2")" = "$(cat "$WORK/alerts")" ] && r=0 || r=1
+check "(1r) an opted-in repeat reminds every interval, each reminder its own slot" "$r" "$(cat "$WORK/alerts")"
 # Reminded every 600 s, then a watcher returns at 2400: the reminder due at 2700 is not sent
 # (a new episode's grace runs to 2760), and the stand-down is a log line only.
 # shellcheck disable=SC2046
@@ -144,7 +151,7 @@ printf '{"workers": {"%s": {"state": "idle"}, "retired-one": {"state": "retired"
 printf 'x\n' > "$WORK/unit/deliveries/$W1/task-7.txt"
 printf 'id: task-8\ntask: s\n' > "$WORK/scratch/tasks/task-8.txt"
 alert_text() {  # alert_text <inbox> <instance id or empty> [seconds] [kind]; the published alert, the notification, the log
-  local out="$WORK/text"; rm -rf "$out"; mkdir -p "$out"
+  local out="$WORK/text"; rm -rf "$out" "$WORK/unit/state/standby-alert"; mkdir -p "$out"
   (
     SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_TASKS_DIR="$1" SUTANDO_TMUX_SESSION=secret-session-name \
       SUTANDO_INSTANCE_ID="$2" SUTANDO_WORKSPACE_DIR="$WORK/unit"
@@ -153,7 +160,7 @@ alert_text() {  # alert_text <inbox> <instance id or empty> [seconds] [kind]; th
     source "$SUPERVISOR"
     bash() { if [ "$1" = "$REPO/src/macos-notify.sh" ]; then printf '%s\n' "$2" > "$out/notify"; else command bash "$@"; fi; }
     supervisor_log() { echo "$*" >> "$out/log"; }
-    unwatched_alert "${3:-600}" "${4:-}"
+    unwatched_alert "${3:-600}" 1000 ${4:+"$4" 1}
   )
   cat "$WORK"/unit/results/proactive-standby-unwatched-*.txt "$WORK"/scratch/results/proactive-* > "$out/proactive" 2>/dev/null
   rm -f "$WORK"/unit/results/proactive-standby-unwatched-*.txt "$WORK"/scratch/results/proactive-*
@@ -187,52 +194,43 @@ alert_text "$WORK/unit/tasks" "" 60
 grep -q "no task watcher for 1 min," "$WORK/text/proactive" && r=0 || r=1
 check "(12) ...and 60 s reads '1 min'" "$r" "$(cat "$WORK/text/proactive" 2>/dev/null)"
 
-# Two messages in the same second each keep their own result file.
-rm -f "$WORK"/unit/results/proactive-standby-unwatched-*.txt
-(
-  SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_TASKS_DIR="$WORK/unit/tasks" SUTANDO_WORKSPACE_DIR="$WORK/unit"
-  export SUTANDO_SUPERVISOR_SOURCE_ONLY SUTANDO_TASKS_DIR SUTANDO_WORKSPACE_DIR
-  # shellcheck source=/dev/null
-  source "$SUPERVISOR"
-  bash() { if [ "$1" = "$REPO/src/macos-notify.sh" ]; then :; else command bash "$@"; fi; }
-  supervisor_log() { :; }
-  now_s() { echo 1000; }
-  unwatched_alert 600
-  unwatched_alert 600 reminder
-)
-# shellcheck disable=SC2012
-[ "$(ls "$WORK"/unit/results/ | grep -c '^proactive-standby-unwatched-1000-.*\.txt$')" = 2 ] \
-  && grep -l "^Sutando: the core" "$WORK"/unit/results/proactive-standby-unwatched-*.txt >/dev/null \
-  && grep -l "(reminder)" "$WORK"/unit/results/proactive-standby-unwatched-*.txt >/dev/null && r=0 || r=1
-check "(20) two messages in one second keep separate result files" "$r" "$(ls "$WORK/unit/results")"
-rm -f "$WORK"/unit/results/proactive-standby-unwatched-*.txt
+# The message names: one fixed name per message of an episode, so a retry reuses it.
+names="$(SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_NOTIFIER_SCRIPT="$WORK/never-run.sh" SUTANDO_TASKS_DIR="$WORK/unit/tasks" \
+  SUTANDO_WORKSPACE_DIR="$WORK/unit" bash -c 'source "$1"; for a in "1000" "1000" "1000 2" "2000"; do set -- $a
+  alert_once stem --inbox "$TASKS_DIR" --episode "$1" ${2:+--slot "$2"}; done' _ "$SUPERVISOR" 2>/dev/null)"
+n1="$(sed -n 1p <<<"$names")"; n2="$(sed -n 2p <<<"$names")"; n3="$(sed -n 3p <<<"$names")"; n4="$(sed -n 4p <<<"$names")"
+[ "$n1" = "$n2" ] && [ "$n3" = "$n1-r2" ] && [ "$n4" != "$n1" ] && [[ "$n1" =~ ^proactive-standby-unwatched-[0-9a-f]{12}-1000$ ]] \
+  && ! grep -q "$WORK" <<<"$names" && r=0 || r=1
+check "(20) each message of an outage has one fixed name (a reminder its slot), with no path in it" "$r" "$names"
 
-# result_publish's exit code decides: 1 or 2 (nothing written) is a failure to retry; 3 (renamed,
-# directory sync unconfirmed) counts as sent, since a retry could duplicate the DM; so does 0.
-# inbox_seat also runs through $PY (seat_inbox.py), so only result_publish.py's call is stubbed.
+# The publish gate's answer decides: 0 published, 3 published but unsynced and 4 already published
+# are sent; 1 (not published), a usage error or a kill are failures to retry.
+# inbox_seat also runs through $PY (seat_inbox.py), so only the publish call is stubbed.
 PUBPY="$WORK/pub-py"
-printf '#!/bin/bash\ncase "$*" in *result_publish.py*) [ -n "${PUB_RC_FILE:-}" ] && echo x >> "$PUB_RC_FILE"; [ "$PUB_RC" = 0 ] && exec python3 "$@"; cat >/dev/null; exit "$PUB_RC" ;; *) exec python3 "$@" ;; esac\n' > "$PUBPY"
+printf '#!/bin/bash\ncase "$*" in *standby_alert_once.py\\ publish*) cat >/dev/null; exit "$PUB_RC" ;; *) exec python3 "$@" ;; esac\n' > "$PUBPY"
 chmod +x "$PUBPY"
-publish_rc() {  # publish_rc <result_publish exit> [workspace]: unwatched_alert's own status
+publish_rc() {  # publish_rc <publish exit>: unwatched_alert's own status
   (
-    SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_TASKS_DIR="$WORK/unit/tasks" SUTANDO_WORKSPACE_DIR="${2:-$WORK/unit}" \
+    SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_TASKS_DIR="$WORK/unit/tasks" SUTANDO_WORKSPACE_DIR="$WORK/unit" \
       SUTANDO_NOTIFIER_PY="$PUBPY" PUB_RC="$1"
     export SUTANDO_SUPERVISOR_SOURCE_ONLY SUTANDO_TASKS_DIR SUTANDO_WORKSPACE_DIR SUTANDO_NOTIFIER_PY PUB_RC
     # shellcheck source=/dev/null
     source "$SUPERVISOR"
     bash() { if [ "$1" = "$REPO/src/macos-notify.sh" ]; then :; else command bash "$@"; fi; }
     supervisor_log() { echo "$*" >> "$WORK/pub.log"; }
-    unwatched_alert 600
+    unwatched_alert 600 1000
   )
   printf '%s' "$?"
 }
 : > "$WORK/pub.log"
-[ "$(publish_rc 0)" = 0 ] && [ "$(publish_rc 3)" = 0 ] && [ "$(publish_rc 1)" = 1 ] && [ "$(publish_rc 2)" = 1 ] && r=0 || r=1
-check "(22) published (0) or renamed-but-unsynced (3) counts as sent; 1 and 2 are failures to retry" "$r" "$(cat "$WORK/pub.log")"
-grep -q "directory sync failed; not resent" "$WORK/pub.log" && r=0 || r=1
-check "(22) ...and an unsynced publish is logged as such" "$r" "$(cat "$WORK/pub.log")"
-mkdir -p "$WORK/nores/state"; cp "$WORK/unit/state/roster.json" "$WORK/nores/state/"; mkdir -p "$WORK/nores/tasks"
-rm -f "$WORK"/unit/results/proactive-standby-unwatched-*.txt
+r=0
+for c in 0:0 3:0 4:0 1:1 2:1 137:1; do [ "$(publish_rc "${c%:*}")" = "${c#*:}" ] || { r=1; echo "    exit ${c%:*} read wrong"; }; done
+check "(22) published (0), unsynced (3) or already published (4) is sent; 1, 2 or a kill (137) is retried" "$r" "$(cat "$WORK/pub.log")"
+grep -q "directory sync failed; not resent" "$WORK/pub.log" && grep -q "was already published; not resent" "$WORK/pub.log" \
+  && grep -q "retried under the same name" "$WORK/pub.log" && r=0 || r=1
+check "(22) ...and each is logged as such" "$r" "$(cat "$WORK/pub.log")"
+rm -rf "$WORK/unit/state/standby-alert"
+mkdir -p "$WORK/nores/state" "$WORK/nores/tasks"; cp "$WORK/unit/state/roster.json" "$WORK/nores/state/"
 (
   SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_TASKS_DIR="$WORK/nores/tasks" SUTANDO_WORKSPACE_DIR="$WORK/nores"
   export SUTANDO_SUPERVISOR_SOURCE_ONLY SUTANDO_TASKS_DIR SUTANDO_WORKSPACE_DIR
@@ -240,23 +238,54 @@ rm -f "$WORK"/unit/results/proactive-standby-unwatched-*.txt
   source "$SUPERVISOR"
   bash() { if [ "$1" = "$REPO/src/macos-notify.sh" ]; then :; else command bash "$@"; fi; }
   supervisor_log() { :; }
-  unwatched_alert 600
+  unwatched_alert 600 1000
 )
 [ "$?" = 1 ] && r=0 || r=1; check "(22) ...and a seat with no results folder is a failure to retry, not a silent success" "$r"
 
-# End to end with the real unwatched_alert: the publisher fails twice, then works. The DM is
-# retried on the next polls and lands once; the macOS notification fires once, on the first try;
-# a returning watcher ends the outage, and the next outage notifies again, once.
-e2e() {
-  local verdicts="$WORK/everdicts" clock="$WORK/eclock"
-  printf '%s\n' "$@" > "$verdicts"; echo 0 > "$clock"; : > "$WORK/enotify"; : > "$WORK/epub"
-  rm -f "$WORK"/unit/results/proactive-standby-unwatched-*.txt
+# End to end: the real supervisor functions and the real publish gate on a fake clock. PUB_MODE
+# makes the publisher's first call fail in one way, later calls work:
+#   fail       exits 1 before writing anything        pre        killed (137) before its rename
+#   post       killed (137) right after its rename    post-archive / post-quarantine
+#              ...after the bridge already moved it into results/archive/ or results/undelivered/
+KILLPUB="$WORK/killpub.py"
+cat > "$KILLPUB" <<PYEOF
+import os, sys, time
+from pathlib import Path
+sys.path.insert(0, "$REPO/src")
+mode = os.environ["PUB_MODE"]
+real = os.replace
+def replace(src, dst):
+    if mode == "pre":
+        os._exit(137)
+    real(src, dst)
+    dst = Path(dst)
+    if mode == "post-archive":
+        month = dst.parent / "archive" / time.strftime("%Y-%m")
+        month.mkdir(parents=True, exist_ok=True)
+        real(dst, month / dst.name)
+    elif mode == "post-quarantine":
+        q = dst.parent / "undelivered"
+        q.mkdir(parents=True, exist_ok=True)
+        real(dst, q / (dst.stem + "-1700000000.txt"))
+    os._exit(137)
+os.replace = replace
+import standby_alert_once
+sys.exit(standby_alert_once.main(sys.argv[1:]))
+PYEOF
+MODEPY="$WORK/mode-py"
+printf '#!/bin/bash\ncase "$*" in *standby_alert_once.py\\ publish*)\n  echo x >> "$PUB_CALLS"\n  if [ "$(wc -l < "$PUB_CALLS")" -eq 1 ] && [ -n "$PUB_MODE" ]; then\n    [ "$PUB_MODE" = fail ] && { cat >/dev/null; exit 1; }\n    shift; exec python3 "$KILLPUB" "$@"\n  fi ;;\nesac\nexec python3 "$@"\n' > "$MODEPY"
+chmod +x "$MODEPY"
+real_run() {  # real_run <tag> <clock start> <verdict per poll...>: one supervisor process on the shared fixture
+  local tag="$1" verdicts="$WORK/$1.verdicts" clock="$WORK/$1.clock"; shift
+  echo "$1" > "$clock"; shift
+  printf '%s\n' "$@" > "$verdicts"
   (
     SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_TASKS_DIR="$WORK/unit/tasks" SUTANDO_WORKSPACE_DIR="$WORK/unit" \
       SUTANDO_NOTIFIER_ROLE_POLL=5 SUTANDO_NOTIFIER_ALERT_GRACE=300 SUTANDO_NOTIFIER_SCRIPT="$WORK/never-run.sh" \
-      SUTANDO_NOTIFIER_PY="$PUBPY" PUB_RC_FILE="$WORK/epub"
+      SUTANDO_NOTIFIER_PY="$MODEPY" PUB_CALLS="$WORK/$tag.calls" KILLPUB="$KILLPUB" PUB_MODE="${PUB_MODE:-}"
     export SUTANDO_SUPERVISOR_SOURCE_ONLY SUTANDO_TASKS_DIR SUTANDO_WORKSPACE_DIR SUTANDO_NOTIFIER_ROLE_POLL \
-      SUTANDO_NOTIFIER_ALERT_GRACE SUTANDO_NOTIFIER_SCRIPT SUTANDO_NOTIFIER_PY PUB_RC_FILE
+      SUTANDO_NOTIFIER_ALERT_GRACE SUTANDO_NOTIFIER_SCRIPT SUTANDO_NOTIFIER_PY PUB_CALLS KILLPUB PUB_MODE
+    : > "$PUB_CALLS"
     # shellcheck source=/dev/null
     source "$SUPERVISOR"
     target_alive() { [ -s "$verdicts" ]; }
@@ -264,37 +293,61 @@ e2e() {
     now_s() { cat "$clock"; }
     sleep() { echo $(( $(cat "$clock") + ${1%.*} )) > "$clock"; }
     supervisor_log() { :; }
-    bash() { if [ "$1" = "$REPO/src/macos-notify.sh" ]; then echo "$(now_s)" >> "$WORK/enotify"; else command bash "$@"; fi; }
-    # The publisher fails its first two calls of each outage (counted in $WORK/epub), then works.
-    export PUB_RC=1
-    unwatched_alert_real="$(declare -f unwatched_alert)"
-    eval "${unwatched_alert_real/unwatched_alert/real_unwatched_alert}"
-    unwatched_alert() {
-      local calls; calls="$(wc -l < "$WORK/epub" | tr -d ' ')"
-      if [ $((calls % 10)) -ge 2 ]; then PUB_RC=0; else PUB_RC=1; fi
-      real_unwatched_alert "$@"
-    }
+    bash() { if [ "$1" = "$REPO/src/macos-notify.sh" ]; then echo "$tag $(now_s)" >> "$WORK/notify.log"; else command bash "$@"; fi; }
     run_alert_only
   )
 }
-# Outage 1: polls at 0..345 s; a watcher returns; outage 2 starts its grace afresh.
-# The publisher's call count is padded to 10 between outages so each outage starts with two failures.
+fresh() { rm -rf "$WORK/unit/state/standby-alert" "$WORK/unit/results" "$WORK/notify.log"; mkdir -p "$WORK/unit/results"; : > "$WORK/notify.log"; }
+copies() { find "$WORK/unit/results" -name 'proactive-standby-unwatched-*.txt' | wc -l | tr -d ' '; }
+live() { find "$WORK/unit/results" -maxdepth 1 -name 'proactive-standby-unwatched-*.txt' | wc -l | tr -d ' '; }
+notes() { wc -l < "$WORK/notify.log" | tr -d ' '; }
+
+fresh
 # shellcheck disable=SC2046
-e2e $(nos 70) yes
-attempts1="$(wc -l < "$WORK/epub" | tr -d ' ')"
-# shellcheck disable=SC2012
-dms1="$(ls "$WORK"/unit/results/ | grep -c '^proactive-standby-unwatched-')"
-notes1="$(tr '\n' ' ' < "$WORK/enotify")"
-[ "$attempts1" = 3 ] && [ "$dms1" = 1 ] && [ "$notes1" = "300 " ] && r=0 || r=1
-check "(28) a DM that fails twice is retried on the next polls and lands once; macOS is notified once, on the first try" "$r" \
-  "attempts $attempts1, DMs $dms1, notifications at: $notes1"
+PUB_MODE=fail real_run a 0 $(nos 70)
+[ "$(wc -l < "$WORK/a.calls" | tr -d ' ')" = 2 ] && [ "$(copies)" = 1 ] && [ "$(notes)" = 1 ] && r=0 || r=1
+check "(28) a DM that was not published is retried under the same name and lands once; macOS is notified once" "$r" \
+  "calls $(wc -l < "$WORK/a.calls"), copies $(copies), notifications $(notes)"
 # shellcheck disable=SC2046
-e2e $(nos 70) yes yes $(nos 70)
-# shellcheck disable=SC2012
-dms2="$(ls "$WORK"/unit/results/ | grep -c '^proactive-standby-unwatched-')"
-notes2="$(wc -l < "$WORK/enotify" | tr -d ' ')"
-[ "$dms2" = 2 ] && [ "$notes2" = 2 ] && r=0 || r=1
-check "(28) ...a returning watcher ends the outage, and the next one is notified again, once" "$r" "DMs $dms2, notifications $notes2"
+real_run a 400 yes yes $(nos 70)
+[ "$(copies)" = 2 ] && [ "$(notes)" = 2 ] && r=0 || r=1
+check "(28) ...a returning watcher ends the outage, and the next one is alerted and notified again, once" "$r" "copies $(copies), notifications $(notes)"
+
+for mode in post post-archive post-quarantine; do
+  fresh
+  # shellcheck disable=SC2046
+  PUB_MODE=$mode real_run a 0 $(nos 70)
+  [ "$(wc -l < "$WORK/a.calls" | tr -d ' ')" = 2 ] && [ "$(copies)" = 1 ] && [ "$(notes)" = 1 ] && r=0 || r=1
+  check "(30) a publisher killed after its rename ($mode): the retry finds that copy, so exactly one alert exists" "$r" \
+    "calls $(wc -l < "$WORK/a.calls"), copies $(copies), live $(live), notifications $(notes)"
+done
+[ "$(live)" = 0 ] && r=0 || r=1; check "(30) ...and no live copy is added beside one the bridge already took" "$r" "live $(live)"
+fresh
+# shellcheck disable=SC2046
+PUB_MODE=pre real_run a 0 $(nos 70)
+[ "$(wc -l < "$WORK/a.calls" | tr -d ' ')" = 2 ] && [ "$(live)" = 1 ] && [ "$(notes)" = 1 ] && r=0 || r=1
+check "(31) a publisher killed before its rename wrote nothing, so the retry publishes it" "$r" \
+  "calls $(wc -l < "$WORK/a.calls"), live $(live), notifications $(notes)"
+
+# A supervisor restarted mid-outage: the outage and its alert are found, so nothing is resent.
+fresh
+# shellcheck disable=SC2046
+real_run a 0 $(nos 70)
+# shellcheck disable=SC2046
+real_run b 360 $(nos 70)
+[ "$(copies)" = 1 ] && [ "$(notes)" = 1 ] && [ "$(wc -l < "$WORK/b.calls" | tr -d ' ')" = 1 ] && r=0 || r=1
+check "(32) a supervisor restarted mid-outage finds the outage and its alert, and publishes and notifies nothing" "$r" \
+  "copies $(copies), notifications $(notes), restarted publish calls $(wc -l < "$WORK/b.calls")"
+# Two supervisors of one inbox at once: one alert, one notification.
+fresh
+# shellcheck disable=SC2046
+real_run c 0 $(nos 70) &
+# shellcheck disable=SC2046
+real_run d 0 $(nos 70) &
+wait
+[ "$(copies)" = 1 ] && [ "$(notes)" = 1 ] && r=0 || r=1
+check "(33) two supervisors of one inbox at once publish one alert and notify once" "$r" "copies $(copies), notifications $(notes)"
+fresh
 
 # run_alert_only with a stubbed send: a failed first alert does not latch "alerted", so the very
 # next poll retries it, rather than waiting a full ALERT_REPEAT (or forever, with reminders off).
@@ -313,6 +366,7 @@ retry_unit() {  # retry_unit <verdict per poll...>; prints each unwatched_alert 
     now_s() { cat "$clock"; }
     sleep() { echo $(( $(cat "$clock") + ${1%.*} )) > "$clock"; }
     supervisor_log() { :; }
+    stub_episodes
     unwatched_alert() {
       echo x >> "$WORK/rcalls"
       local n; n="$(wc -l < "$WORK/rcalls" | tr -d ' ')"
@@ -345,8 +399,9 @@ fail_unit() {  # fail_unit <verdict per poll...>
     now_s() { cat "$clock"; }
     sleep() { echo $(( $(cat "$clock") + ${1%.*} )) > "$clock"; }
     supervisor_log() { :; }
+    stub_episodes
     unwatched_alert() {
-      local kind="${2:-alert}" t; t="$(now_s)"
+      local kind="${3:-alert}" t; t="$(now_s)"
       if [[ " ${FAIL_KINDS:-} " == *" $kind "* ]] && [ "$t" -lt "${FAIL_UNTIL:-999999}" ]; then
         echo "$t $kind failed" >> "$alerts"; return 1
       fi
@@ -366,9 +421,9 @@ check "(24) a send that keeps failing is retried at once, then backed off to eve
 # shellcheck disable=SC2046
 UNIT_POLL=60 UNIT_REPEAT=600 FAIL_KINDS=reminder FAIL_UNTIL=1500 fail_unit $(nos 50)
 dup="$(cut -d' ' -f1 "$WORK/falerts" | uniq -d)"
-[ "$(grep ' sent$' "$WORK/falerts" | tr '\n' ';')" = "300 alert sent;1560 reminder sent;2160 reminder sent;2760 reminder sent;" ] \
+[ "$(grep ' sent$' "$WORK/falerts" | tr '\n' ';')" = "300 alert sent;1560 reminder sent;2100 reminder sent;2700 reminder sent;" ] \
   && grep -q "^900 reminder failed" "$WORK/falerts" && [ -z "$dup" ] && r=0 || r=1
-check "(25) a failing opted-in reminder is retried, one attempt per poll, then keeps its interval" "$r" "$(tr '\n' ';' < "$WORK/falerts")"
+check "(25) a failing opted-in reminder is retried, one attempt per poll, then keeps its schedule" "$r" "$(tr '\n' ';' < "$WORK/falerts")"
 
 # The back-off itself: 1, 2, 4 ... capped at 300 s, and still 300 s after hours of failures (no overflow).
 waits="$(SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_NOTIFIER_SCRIPT="$WORK/never-run.sh" bash -c \

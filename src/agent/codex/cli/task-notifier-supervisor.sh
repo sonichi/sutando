@@ -145,8 +145,6 @@ child_pid=""
 # persistent stale/absent beat does not re-notify every grace period; lowered
 # again the moment the decision is anything but alert (the session recovered).
 alerted=0
-alert_seq=0
-alert_notified=0
 
 # yes / no / unknown -- unknown (ps snapshot unavailable) is deliberately
 # never read as "no": every caller below fails toward keeping whatever
@@ -254,13 +252,21 @@ duration_phrase() {  # duration_phrase <seconds>
   if [ "$1" -lt 60 ]; then printf 'under a minute'; else printf '%s min' "$(($1 / 60))"; fi
 }
 
+# The outage's durable record and the one-alert-per-message gate live in src/standby_alert_once.py,
+# shared by every supervisor of this inbox and kept across a restart.
+alert_once() { "$PY" "$REPO/src/standby_alert_once.py" "$@" --workspace "$(seat_workspace)"; }
+episode_observe() {  # episode_observe <now>: the outage's start, opening one if none is live
+  local ep
+  ep="$(alert_once observe --inbox "$TASKS_DIR" --now "$1" --stale "$ALERT_GRACE" 2>/dev/null)"
+  case "$ep" in ''|*[!0-9]*) printf '%s' "$1" ;; *) printf '%s' "$ep" ;; esac
+}
+episode_end() { alert_once end --inbox "$TASKS_DIR" >/dev/null 2>&1 || true; }
+
 # The owner's alert: a proactive result (the owner's DM, never a worker's lane) and the opt-in macOS
 # notification. An inbox that is no registered seat gets only the local log line, never a page.
-unwatched_alert() {  # unwatched_alert <seconds unwatched> [reminder]
-  # Returns 1 only when the DM was certainly not published, so the caller retries; result_publish's
-  # exit 3 (renamed, directory sync unconfirmed) counts as sent, as a retry could duplicate it.
-  local secs="$1" kind="${2:-}" ws msg seat label rc=1
-  alert_seq=$((alert_seq + 1))  # two messages in one second must not share a result file
+unwatched_alert() {  # unwatched_alert <seconds unwatched> <episode start> [reminder <slot>]
+  # Succeeds once the DM is published, by this call or an earlier one; fails only when it is not.
+  local secs="$1" episode="$2" kind="${3:-}" slot="${4:-}" msg seat label stem rc=1
   seat="$(inbox_seat)"
   label="$(printf '%s' "$seat" | cut -f3)"
   if [ "$seat" = none ] || [ -z "$label" ]; then
@@ -268,22 +274,19 @@ unwatched_alert() {  # unwatched_alert <seconds unwatched> [reminder]
     return 0
   fi
   msg="Sutando${kind:+ ($kind)}: $label has had no task watcher for $(duration_phrase "$secs"), so it is not picking up its tasks, and nothing types them in for it. Restarting that session brings its watcher back."
-  supervisor_log "ALERT${kind:+ ($kind)}: no ready session watcher holds ${TASKS_DIR} (session ${SESSION}) for ${secs}s (alert-only standby; nothing typed); alerting the owner"
-  ws="$(seat_workspace)"
-  if [ -d "$ws/results" ]; then
-    printf '%s\n' "$msg" | env -u SUTANDO_WORKER_ID "$PY" "$REPO/src/result_publish.py" \
-      "$ws/results/proactive-standby-unwatched-$(now_s)-$$-${alert_seq}.txt" >/dev/null 2>&1
-    rc=$?
-    case "$rc" in
-      0) ;;
-      3) supervisor_log "the unwatched-inbox alert was published, but its directory sync failed; not resent" ;;
-      *) supervisor_log "could not publish the unwatched-inbox alert (exit $rc); it will be retried" ;;
-    esac
-  else
-    supervisor_log "no results folder at the seat's workspace; the unwatched-inbox alert will be retried"
-  fi
-  if [ "$alert_notified" = "0" ]; then
-    alert_notified=1
+  stem="$(alert_once stem --inbox "$TASKS_DIR" --episode "$episode" ${slot:+--slot "$slot"} 2>/dev/null)"
+  [ -n "$stem" ] || { supervisor_log "could not name the unwatched-inbox alert; it will be retried"; return 1; }
+  supervisor_log "ALERT${kind:+ ($kind)}: no ready session watcher holds ${TASKS_DIR} (session ${SESSION}) for ${secs}s (alert-only standby; nothing typed); alerting the owner as $stem"
+  printf '%s\n' "$msg" | env -u SUTANDO_WORKER_ID "$PY" "$REPO/src/standby_alert_once.py" publish \
+    --stem "$stem" --workspace "$(seat_workspace)" >/dev/null 2>&1
+  rc=$?
+  case "$rc" in
+    0) ;;
+    4) supervisor_log "the unwatched-inbox alert $stem was already published; not resent"; return 0 ;;
+    3) supervisor_log "the unwatched-inbox alert $stem was published, but its directory sync failed; not resent" ;;
+    *) supervisor_log "could not publish the unwatched-inbox alert $stem (exit $rc); it will be retried under the same name" ;;
+  esac
+  if [ -z "$kind" ] && alert_once claim-notify --inbox "$TASKS_DIR" --episode "$episode" >/dev/null 2>&1; then
     bash "$REPO/src/macos-notify.sh" "$msg" || true
   fi
   [ "$rc" = 0 ] || [ "$rc" = 3 ]
@@ -298,18 +301,21 @@ retry_wait() {  # retry_wait <consecutive failures>: 1 s doubling, capped at 300
 
 # Alert-only standby: never starts the notifier, so neither a task nor a nudge is typed.
 # "unknown" neither opens nor closes an episode; a ready watcher ends it without a word to the owner.
-# A send that was certainly not published latches nothing and is retried after a bounded back-off.
+# A send that was not published latches nothing and is retried after a bounded back-off.
 run_alert_only() {
-  local since="" alerted=0 last=0 v now fail_alert=0 fail_rem=0 hold_alert=0 hold_rem=0
+  local since="" alerted=0 slot=0 due v now fail_alert=0 fail_rem=0 hold_alert=0 hold_rem=0 ended=0
   supervisor_log "alert-only standby for ${TASKS_DIR:-this host}: the task-watch Mod hosts this seat's watcher; nothing is typed into the pane"
   while target_alive; do
     v="$(session_role_verdict)"
     case "$v" in
       yes)
         [ "$alerted" = "1" ] && supervisor_log "a session watcher holds ${TASKS_DIR:-this host} again; the alert-only standby stands down"
+        # The first ready verdict also ends an outage a predecessor left open.
+        { [ -n "$since" ] || [ "$ended" = 0 ]; } && episode_end
+        ended=1
         since=""
         alerted=0
-        alert_notified=0
+        slot=0
         fail_alert=0
         fail_rem=0
         hold_alert=0
@@ -317,24 +323,26 @@ run_alert_only() {
         ;;
       no)
         now="$(now_s)"
-        [ -n "$since" ] || since="$now"
+        since="$(episode_observe "$now")"
         if [ "$alerted" = "0" ]; then
           if [ $((now - since)) -ge "$ALERT_GRACE" ] && [ "$now" -ge "$hold_alert" ]; then
-            if unwatched_alert $((now - since)); then
+            if unwatched_alert $((now - since)) "$since"; then
               alerted=1
-              last="$now"
             else
               fail_alert=$((fail_alert + 1))
               hold_alert=$((now + $(retry_wait "$fail_alert")))
             fi
           fi
-        elif [ "$ALERT_REPEAT" -gt 0 ] && [ $((now - last)) -ge "$ALERT_REPEAT" ] && [ "$now" -ge "$hold_rem" ]; then
-          if unwatched_alert $((now - since)) reminder; then
-            last="$now"
-            fail_rem=0
-          else
-            fail_rem=$((fail_rem + 1))
-            hold_rem=$((now + $(retry_wait "$fail_rem")))
+        elif [ "$ALERT_REPEAT" -gt 0 ]; then
+          due=$(((now - since - ALERT_GRACE) / ALERT_REPEAT))
+          if [ "$due" -gt "$slot" ] && [ "$now" -ge "$hold_rem" ]; then
+            if unwatched_alert $((now - since)) "$since" reminder "$due"; then
+              slot="$due"
+              fail_rem=0
+            else
+              fail_rem=$((fail_rem + 1))
+              hold_rem=$((now + $(retry_wait "$fail_rem")))
+            fi
           fi
         fi
         ;;

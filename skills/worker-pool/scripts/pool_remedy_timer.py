@@ -22,6 +22,7 @@ from contextlib import contextmanager
 import hashlib
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -38,6 +39,8 @@ LABEL = "com.sutando.pool-remedy"
 DEFAULT_INTERVAL_S = 300
 # Kept in the job's environment: a worker the sweep relaunches must keep the launcher's Stop setting.
 STOP_INTERRUPT = "SUTANDO_STOP_INTERRUPT"
+# Alert settings an earlier install saved in the job; no longer read from it, so they are removed.
+RETIRED_ENV = ("SUTANDO_NOTIFIER_ALERT_GRACE", "SUTANDO_NOTIFIER_ALERT_REPEAT", "SUTANDO_NOTIFIER_ALERT_PILEUP")
 _HERE = Path(__file__).resolve().parent
 
 
@@ -254,6 +257,82 @@ def install(workspace, repo, *, interval_s: int = DEFAULT_INTERVAL_S, python=Non
     return {"plist": str(dest), "label": job["Label"], "interval_s": job["StartInterval"],
             "log": job["StandardOutPath"], "loaded": is_loaded(workspace, runner),
             "legacy_migrated": bool(migrate)}
+
+
+def _loaded_retired_keys(target, runner=None) -> "list | None":
+    """The retired keys the loaded job's environment carries; None when the job is not loaded."""
+    r = _launchctl(["print", target], runner)
+    if r.returncode != 0:
+        return None
+    text = r.stdout or ""
+    return [k for k in RETIRED_ENV if re.search(rf"(?m)^\s*{k}\s*=>", text)]
+
+
+def _migrate_one(label, dest: Path, runner=None, *, sleep=time.sleep, in_job=False) -> "dict | None":
+    """Drop the retired keys from one timer: its plist (every other entry kept) and, when the
+    loaded job still carries them, a reload. A failed reload restores the plist and the job."""
+    target = f"gui/{os.getuid()}/{label}"
+    old_bytes = dest.read_bytes() if dest.exists() else None
+    job = plistlib.loads(old_bytes) if old_bytes is not None else None
+    env = job.get("EnvironmentVariables") if isinstance(job, dict) else None
+    in_plist = [k for k in RETIRED_ENV if isinstance(env, dict) and k in env]
+    in_loaded = _loaded_retired_keys(target, runner)
+    if not in_plist and not in_loaded:
+        return None
+    if old_bytes is None:
+        return {"label": label, "migrated": False, "why": "the loaded job has no plist to reload from"}
+    out = {"label": label, "plist": str(dest), "removed": sorted(set(in_plist) | set(in_loaded or ()))}
+    if in_plist:
+        job["EnvironmentVariables"] = {k: v for k, v in env.items() if k not in RETIRED_ENV}
+        tmp = dest.with_name(dest.name + ".tmp")
+        with open(tmp, "wb") as fh:
+            plistlib.dump(job, fh)
+        os.replace(tmp, dest)
+    if in_loaded is None:
+        return {**out, "migrated": True, "reloaded": False}
+    if in_job:
+        # Booting out the job this process runs in would end it before the bootstrap.
+        return {**out, "migrated": True, "reloaded": False, "why": "reload deferred: running inside this job"}
+    try:
+        _bootout(target, runner, sleep=sleep)
+        r = _launchctl(["bootstrap", f"gui/{os.getuid()}", str(dest)], runner)
+        if r.returncode != 0:
+            raise RuntimeError(f"launchctl bootstrap failed rc={r.returncode}: {(r.stderr or r.stdout or '').strip()}")
+    except (RuntimeError, OSError) as e:
+        errors = []
+        try:
+            tmp = dest.with_name(dest.name + ".tmp")
+            tmp.write_bytes(old_bytes)
+            os.replace(tmp, dest)
+        except OSError as restore_error:
+            errors.append(str(restore_error))
+        if not _is_loaded(target, runner):
+            restored = _launchctl(["bootstrap", f"gui/{os.getuid()}", str(dest)], runner)
+            if restored.returncode != 0:
+                errors.append(f"could not restore {target}: {(restored.stderr or restored.stdout or '').strip()}")
+        return {**out, "migrated": False, "why": str(e) + (f"; rollback failed: {'; '.join(errors)}" if errors else "")}
+    return {**out, "migrated": True, "reloaded": True}
+
+
+def migrate_retired_env(workspace, *, launch_agents: Path | None = None, runner=None,
+                        sleep=time.sleep, environ=None) -> list:
+    """One-time upgrade: remove the retired alert settings from this workspace's timer and from a
+    legacy timer bound to it. A no-op once neither the plists nor the loaded jobs carry them.
+    The caller holds `timer_lock`."""
+    environ = os.environ if environ is None else environ
+    targets = [(label_for(workspace), plist_path(workspace, launch_agents))]
+    legacy = legacy_status(launch_agents=launch_agents, runner=runner)
+    if legacy.get("workspace") and Path(legacy["workspace"]).resolve() == Path(workspace).resolve():
+        targets.append((LABEL, legacy_plist_path(launch_agents)))
+    done = []
+    for label, dest in targets:
+        try:
+            r = _migrate_one(label, dest, runner, sleep=sleep, in_job=environ.get("XPC_SERVICE_NAME") == label)
+        except (OSError, ValueError, plistlib.InvalidFileException) as e:
+            r = {"label": label, "migrated": False, "why": f"plist unreadable: {e}"}
+        if r is not None:
+            done.append(r)
+    return done
 
 
 def uninstall(workspace, *, launch_agents: Path | None = None, runner=None,

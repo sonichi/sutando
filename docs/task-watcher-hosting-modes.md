@@ -128,12 +128,18 @@ and alerts the owner: a `results/proactive-standby-unwatched-*.txt` (the owner's
 notification, the same pair a channel bridge's wrapper uses for its notices. That is the one alert of
 the outage: there is no timed reminder (`SUTANDO_NOTIFIER_ALERT_REPEAT` defaults to 0; a positive value
 opts into a reminder every that many seconds). Both settings take whole seconds, the grace 1 to 86400 and
-the repeat 0 to 86400; any other value is ignored with one log line and the default used. A DM that was
-certainly not published (`src/result_publish.py` exits 1 or 2, or the seat's workspace has no `results/`)
-is retried on the next poll, then backed off (doubling to every 300 s); exit 3, renamed but the directory
-sync unconfirmed, counts as sent, since a retry under a new name could duplicate it. The macOS notification
-fires once per outage, on the first attempt, never on a retry. The outage lives in the supervisor's memory,
-so a supervisor restarted mid-outage sends one more alert after its grace. Each alert names
+the repeat 0 to 86400; any other value is ignored with one log line and the default used. The alert
+is published once per outage by `src/standby_alert_once.py`. The outage is a record under
+`<workspace>/state/standby-alert/`, one per inbox, refreshed by each poll that finds no watcher and
+shared by every supervisor of that inbox, so a supervisor restarted mid-outage, or a second one,
+joins it rather than starting another; one nobody refreshed for longer than the grace is over. Each
+message of an outage has one fixed result name (the inbox's hash and the outage's start, a reminder
+also its slot), and it is published, under a lock on that name, only if no copy exists live, in any
+`results/archive/` layout or in `results/undelivered/`. A publisher killed after its rename, or a
+retry by any supervisor, therefore finds the copy and sends nothing more; one killed or failing
+before the rename wrote nothing, and the retry publishes under the same name, on the next poll,
+then backed off (doubling to every 300 s). The macOS notification is claimed once per outage, by
+the first attempt, never by a retry. Each alert names
 the seat, judged from the inbox by `src/seat_inbox.py` ("the core" for `<workspace>/tasks`, "worker" and the
 first 8 characters of its id for a rostered worker's `deliveries/<id>` or own tasks folder), and how long it has
 been unwatched ("under a minute" below 60 s); it never carries the inbox path or the tmux session name, which only the local log
@@ -144,7 +150,10 @@ the launcher trusted the `--add-dir` folder), and a worker relaunched several ti
 The Mod's own restart back-off (5 s doubling) passes 300 s only after six early exits in a row. A Codex seat,
 or a Claude seat whose Mod was refused or turned off, keeps the typing standby above. Every launcher sets the mode explicitly (the Codex core pins `type`) and folds it into the supervisor's
 identity, and passes `SUTANDO_NOTIFIER_ALERT_GRACE` / `SUTANDO_NOTIFIER_ALERT_REPEAT` always (empty means the
-supervisor's default), so a value left in the tmux server's global environment never reaches a supervisor. The health check's
+supervisor's default), so a value left in the tmux server's global environment never reaches a supervisor. A
+worker-pool remedy timer that an earlier install left carrying these settings (or a pile-up threshold) in its
+job loses them on the next worker spawn (`pool_remedy_timer.migrate_retired_env`): the plist is rewritten with
+every other entry kept and the loaded job reloaded, or both restored if the reload fails. The health check's
 `claude-task-notifier` row on a Mod core is `ok` only while a ready session watcher holds the core's
 inbox; its warning says how many tasks are waiting, with no path.
 
@@ -266,8 +275,11 @@ how `tests/watch-tasks-stream-shutdown-leaves-inflight-claim.test.py` interrupts
 - `tests/task-notifier-supervisor-alert-only.test.sh`: the alert-only standby types nothing, alerts
   once per outage after the grace with no path, retries a DM that was not published (macOS notified
   once), validates its settings, reminds only when opted in, and stands down silently. Its tmux part
-  prints SKIP where tmux is missing. `scripts/mutation-check-standby-alert.sh` re-runs
-  it against named mutants of the supervisor and fails if any survives.
+  prints SKIP where tmux is missing. `tests/standby-alert-once.test.py` pins the one-alert gate
+  (names, every archive layout, racing publishers, the outage record, the notification claim), and
+  `tests/skills/worker-pool/pool-remedy-timer-retired-env.test.py` the timer migration.
+  `scripts/mutation-check-standby-alert.sh` re-runs these against named mutants and fails if any
+  survives.
 - `tests/task-notifier-supervisor-alert-decision.test.py`: with no tmux, the real supervisor in alert
   mode alerts and never starts the typing notifier; an unregistered inbox is logged and never
   pages the owner; without the mode the notifier starts.

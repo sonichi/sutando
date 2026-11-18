@@ -256,6 +256,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`sparrow_agent_bridge.py`** — One agent's gateway bridge under sparrowd, from the declaration its claude-local or codex-local install wrote.
 - **`sparrow_core_bridge.py`** — The host's core gateway bridge as sparrowd runs it (`src/sparrowd.py --core`).
 - **`sparrowd.py`** — sparrowd launcher — the adapter edge that names concrete workers.
+- **`standby_alert_once.py`** — At most one owner alert per outage of a seat's task watcher, however often it is retried.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
 - **`station_stamp.py`** — The desktop's station stamp: what the running core's sutando-station server was started with.
