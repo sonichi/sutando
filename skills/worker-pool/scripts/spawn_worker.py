@@ -314,9 +314,6 @@ def ensure_remedy_timer(workspace, repo, *, runner=None,
         return {"ensured": False, "why": "launchd is macOS-only"}
     try:
         with prt.timer_lock(launch_agents):
-            for m in prt.migrate_retired_env(workspace, launch_agents=launch_agents, runner=runner):
-                if not m.get("migrated"):
-                    print(f"spawn_worker: retired alert settings left on {m['label']}: {m.get('why')}", file=sys.stderr)
             st = prt.status(workspace, launch_agents=launch_agents, runner=runner)
             if st.get("installed"):
                 if (st.get("error") or not st.get("repo") or not st.get("workspace")
