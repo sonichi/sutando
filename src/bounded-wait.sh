@@ -1,5 +1,5 @@
 #!/bin/bash
-# The watcher's one bounded child run. run_bounded <timeout_s> [<timeout_flag>] -- cmd...: cmd runs as a direct
+# Shared bounded child run. run_bounded <timeout_s> [<timeout_flag>] -- cmd...: cmd runs as a direct
 # child bounded to N whole seconds, then TERM, then KILL, by jobspec never by pid; its status; flag only if the bound fired.
 run_bounded() {
   local limit="$1" timeout_flag="" pid

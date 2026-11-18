@@ -6,6 +6,11 @@ Temporary state follows TMPDIR; no task consumer or external service is used.
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import json
 import os
@@ -55,7 +60,7 @@ class TaskIdempotencyTests(unittest.TestCase):
             path.mkdir(parents=True)
         self.socket = self.base / "rt.sock"
         self.env = {
-            **os.environ,
+            **isolated_child_env(),
             "PYTHONDONTWRITEBYTECODE": "1",
             "SUTANDO_TEST_MODE": "1",
             "SUTANDO_PACKAGED": "",

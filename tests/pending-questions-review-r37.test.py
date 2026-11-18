@@ -12,6 +12,12 @@
 
 Run: python3 tests/pending-questions-review-r37.test.py
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib.util
 import io

@@ -33,6 +33,11 @@ import urllib.error
 from urllib.parse import quote
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 _SRC = REPO / "src" / "remote-gateway-bridge.py"
 AGENT = "@agent:example.org"
@@ -74,7 +79,7 @@ class Harness:
         self.logs: list[str] = []
         self.refuse_thread_400 = refuse_thread_400
 
-        def fake_req(method, path, payload=None, timeout=None):
+        def fake_req(method, path, payload=None, timeout=None, **_kw):
             self.calls.append((method, path, payload))
             if path == "/v1/agents":
                 return {"agents": [{"id": AGENT, "owner": "@o:example.org",

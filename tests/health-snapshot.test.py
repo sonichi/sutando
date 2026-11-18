@@ -54,9 +54,11 @@ class Workspace:
         self.json(f"state/{name}", {"state": state, "detail": "", "prompt": None, "kind": kind,
                                     "session": session}, age)
 
-    def worker(self, state="live", label=None):
-        self.json("state/roster.json", {"version": 1, "workers": {WID: {"state": state, "label": label or WID}},
-                                        "bindings": {}})
+    def worker(self, state="live", label=None, display_label=None):
+        row = {"state": state, "label": label or WID}
+        if display_label:
+            row["display_label"] = display_label
+        self.json("state/roster.json", {"version": 1, "workers": {WID: row}, "bindings": {}})
 
 
 class Base(unittest.TestCase):
@@ -353,6 +355,12 @@ class Workers(Base):
         self.ws.supervisor("logged-out", session=f"sutando-worker-x{WID}",
                            name=f"core-supervisor.sutando-worker-x{WID}.json")
         self.assertEqual(self.snap(agent="workers")["agents"][0]["condition"], "unknown")
+
+    def test_display_label_is_the_name_shown(self):
+        self.ws.worker(label="worker", display_label="blue-engineer")
+        self.assertEqual(self.snap(agent="workers")["agents"][0]["label"], "blue-engineer")
+        self.ws.worker(display_label="blue-product")
+        self.assertEqual(self.snap(agent="workers")["agents"][0]["label"], "blue-product")
 
     def test_raw_id_label_reads_as_no_label(self):
         self.ws.worker()

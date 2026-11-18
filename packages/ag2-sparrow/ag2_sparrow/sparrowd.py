@@ -19,7 +19,9 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, FrozenSet, List, Optional
+
+from .control_socket import control_socket_path
 
 
 def _log(msg: str) -> None:
@@ -34,6 +36,17 @@ class WorkerSpec:
     argv: List[str]
     cwd: Optional[str] = None
     env: Optional[Dict[str, str]] = None
+    revision: str = ""  # opaque to the shell: a spec that differs under the same name is a restart
+    # An exit with one of these codes is held, not restarted, until the spec under its name changes.
+    hold_rc: FrozenSet[int] = frozenset()
+    held_healthy: bool = True  # False: a held worker leaves something unserved, so `health` says so
+
+
+# The single-instance lock under the state dir; its holder writes its pid into it.
+LOCK_NAME = "sparrowd.lock"
+
+# The previous run's exit code, given to a restarted worker; absent on a first start.
+LAST_RC_ENV = "SPARROWD_LAST_RC"
 
 
 @dataclass
@@ -43,7 +56,15 @@ class _WorkerState:
     restarts: int = 0
     started_at: float = 0.0
     last_exit: Optional[int] = None
-    state: str = "pending"  # pending | running | backoff | stopped
+    state: str = "pending"  # pending | running | backoff | held | stopped
+    stop: threading.Event = field(default_factory=threading.Event)
+    stop_at: float = 0.0  # when this one worker was told to stop (sync); 0 until then
+    # every older process for this name still alive: never two processes for one name
+    after: List["_WorkerState"] = field(default_factory=list)
+
+
+def _running(ws: _WorkerState) -> bool:
+    return ws.proc is not None and ws.proc.poll() is None
 
 
 class SingleInstance:
@@ -84,63 +105,129 @@ class Supervisor:
 
     def __init__(self, specs: List[WorkerSpec], *,
                  backoff_initial_s: float = 1.0, backoff_max_s: float = 60.0,
+                 remove_grace_s: float = 10.0,
                  sleep: Optional[Callable[[float], None]] = None,
                  clock: Callable[[], float] = time.monotonic):
         self._workers = {s.name: _WorkerState(spec=s) for s in specs}
         self._backoff_initial = backoff_initial_s
         self._backoff_max = backoff_max_s
+        self._remove_grace = remove_grace_s
         self._sleep = sleep
         self._clock = clock
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._threads: List[threading.Thread] = []
+        # Removed by sync but not yet exited: still owned, so stop() reaps them too.
+        self._draining: List[_WorkerState] = []
 
-    def _pause(self, seconds: float) -> None:
+    def _pause(self, ws: _WorkerState, seconds: float) -> None:
         """Backoff wait: stop-interruptible by default; an injected sleep
         (tests) is honored but stop is still checked around it."""
         if self._sleep is not None:
-            if not self._stop.is_set():
+            if not ws.stop.is_set():
                 self._sleep(seconds)
             return
-        self._stop.wait(seconds)
+        ws.stop.wait(seconds)
+
+    def _start_thread(self, ws: _WorkerState) -> None:
+        t = threading.Thread(target=self._run_worker, args=(ws,),
+                             name=f"sup:{ws.spec.name}", daemon=True)
+        t.start()
+        self._threads.append(t)
 
     def start(self) -> None:
-        for name in self._workers:
-            t = threading.Thread(target=self._run_worker, args=(name,),
-                                 name=f"sup:{name}", daemon=True)
-            t.start()
-            self._threads.append(t)
+        for ws in list(self._workers.values()):
+            self._start_thread(ws)
 
-    def _spawn(self, ws: _WorkerState) -> None:
-        ws.proc = subprocess.Popen(
-            ws.spec.argv, cwd=ws.spec.cwd,
-            env={**os.environ, **(ws.spec.env or {})})
+    def sync(self, specs: List[WorkerSpec]) -> "tuple[list, list]":
+        """Make the supervised set equal `specs`: a new name is started, a name
+        no longer listed is stopped (SIGTERM, SIGKILL past the grace) and stays
+        owned until it has exited, a name whose spec changed is both: its
+        replacement starts once every older process for the name has exited (a
+        replacement that never started is dropped). Returns (added names,
+        removed names); a changed name is in both."""
+        want = {s.name: s for s in specs}
+        with self._lock:
+            removed = [self._workers.pop(n) for n in list(self._workers)
+                       if n not in want or self._workers[n].spec != want[n]]
+            added = [self._workers.setdefault(n, _WorkerState(spec=s))
+                     for n, s in want.items() if n not in self._workers]
+            self._draining = [ws for ws in self._draining + removed if _running(ws)]
+            for ws in added:
+                ws.after = [d for d in self._draining if d.spec.name == ws.spec.name]
+            for ws in removed:
+                ws.stop.set()
+                ws.stop_at = self._clock()
+                if ws.proc is not None and ws.proc.poll() is None:
+                    try:
+                        ws.proc.send_signal(signal.SIGTERM)
+                    except OSError:  # pragma: no cover - died between poll and signal
+                        pass
+        for ws in removed:
+            _log(f"worker {ws.spec.name}: {'changed — restarting' if ws.spec.name in want else 'removed — stopping'}")
+        changed = {ws.spec.name for ws in removed}
+        for ws in added:
+            if ws.spec.name not in changed:
+                _log(f"worker {ws.spec.name}: added")
+            if not self._stop.is_set():
+                self._start_thread(ws)
+        return [ws.spec.name for ws in added], [ws.spec.name for ws in removed]
+
+    def _wait(self, ws: _WorkerState) -> int:
+        """The worker's exit code; a worker removed by sync that outlives
+        the grace is killed here, on its own thread."""
+        while True:
+            try:
+                return ws.proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                if ws.stop_at and self._clock() - ws.stop_at > self._remove_grace:
+                    _log(f"pid {ws.proc.pid}: did not exit in {self._remove_grace}s — SIGKILL")
+                    ws.proc.kill()
+
+    def _spawn(self, ws: _WorkerState, last_rc: Optional[int] = None) -> None:
+        env = {**os.environ, **(ws.spec.env or {})}
+        env.pop(LAST_RC_ENV, None)
+        if last_rc is not None:
+            env[LAST_RC_ENV] = str(last_rc)
+        ws.proc = subprocess.Popen(ws.spec.argv, cwd=ws.spec.cwd, env=env)
         ws.started_at = self._clock()
         ws.state = "running"
         _log(f"worker {ws.spec.name}: started pid {ws.proc.pid}")
 
-    def _run_worker(self, name: str) -> None:
-        ws = self._workers[name]
+    def _run_worker(self, ws: _WorkerState) -> None:
+        name = ws.spec.name
         backoff = self._backoff_initial
-        while not self._stop.is_set():
+        last_rc: Optional[int] = None
+        while any(_running(old) for old in ws.after) and not ws.stop.wait(0.05):
+            pass
+        while not ws.stop.is_set():
             spawn_err = None
             with self._lock:
+                # sync stops a worker under this lock: a stop set here is seen
+                # before the spawn, a spawn before the stop leaves a pid to signal.
+                if ws.stop.is_set():
+                    break
                 try:
-                    self._spawn(ws)
+                    self._spawn(ws, last_rc)
                 except OSError as e:
                     ws.state = "backoff"
                     ws.last_exit = None
                     spawn_err = e
             if spawn_err is not None:
                 _log(f"worker {name}: spawn failed ({spawn_err}) — backoff {backoff:.1f}s")
-                self._pause(backoff)
+                self._pause(ws, backoff)
                 backoff = min(backoff * 2, self._backoff_max)
                 continue
-            rc = ws.proc.wait()
+            rc = self._wait(ws)
+            last_rc = rc
             with self._lock:
                 ws.last_exit = rc
-                if self._stop.is_set():
+                if ws.stop.is_set():
                     ws.state = "stopped"
+                    return
+                if rc in ws.spec.hold_rc:
+                    ws.state = "held"
+                    _log(f"worker {name}: exited rc={rc} — held until its spec changes")
                     return
                 # A long-lived run earns a reset; only rapid crash loops climb.
                 if self._clock() - ws.started_at > 30:
@@ -149,7 +236,7 @@ class Supervisor:
                 ws.state = "backoff"
             _log(f"worker {name}: exited rc={rc} — restart in {backoff:.1f}s "
                  f"(restart #{ws.restarts})")
-            self._pause(backoff)
+            self._pause(ws, backoff)
             backoff = min(backoff * 2, self._backoff_max)
         with self._lock:
             ws.state = "stopped"
@@ -160,14 +247,21 @@ class Supervisor:
                 n: {"state": ws.state,
                     "pid": ws.proc.pid if ws.proc and ws.proc.poll() is None else None,
                     "restarts": ws.restarts,
-                    "last_exit": ws.last_exit}
-                for n, ws in self._workers.items()}}
+                    "last_exit": ws.last_exit,
+                    "held_healthy": ws.spec.held_healthy}
+                for n, ws in self._workers.items()},
+                "draining": [ws.spec.name for ws in self._draining if _running(ws)]}
 
     def stop(self, grace_s: float = 10.0) -> None:
+        """Every owned process is reaped before this returns: the supervised
+        workers and the ones a sync removed that have not exited yet."""
         self._stop.set()
         with self._lock:
-            procs = [ws.proc for ws in self._workers.values()
-                     if ws.proc and ws.proc.poll() is None]
+            for ws in self._workers.values():
+                ws.stop.set()
+            procs = [ws.proc for ws in list(self._workers.values()) + self._draining
+                     if _running(ws)]
+            self._draining = []
         for p in procs:
             try:
                 p.send_signal(signal.SIGTERM)
@@ -181,6 +275,7 @@ class Supervisor:
             except subprocess.TimeoutExpired:
                 _log(f"pid {p.pid}: did not exit in {grace_s}s — SIGKILL")
                 p.kill()
+                p.wait()
         _log("all workers stopped")
 
 
@@ -240,7 +335,7 @@ class ControlServer:
                 resp = {"ok": True, **self._sup.status()}
             elif op == "health":
                 st = self._sup.status()["workers"]
-                healthy = all(w["state"] in ("running", "pending")
+                healthy = all(w["state"] in ("running", "pending") or (w["state"] == "held" and w["held_healthy"])
                               for w in st.values()) if st else True
                 resp = {"ok": True, "healthy": healthy}
             elif op == "stop":
@@ -267,24 +362,64 @@ class ControlServer:
 
 
 def run(specs: List[WorkerSpec], state_dir: Path,
-        backoff_initial_s: float = 1.0) -> int:
-    """Daemon entry: lock, supervise, serve control, wait for stop signal."""
+        backoff_initial_s: float = 1.0,
+        rescan: Optional[Callable[[], List[WorkerSpec]]] = None,
+        rescan_s: float = 30.0, grace_s: float = 10.0,
+        wait_for_lock: bool = False, lock_poll_s: float = 5.0, rescan_status: bool = False) -> int:
+    """Daemon entry: lock, supervise, serve control, wait for stop signal.
+    With `rescan`, every `rescan_s` the supervised set is synced to what it
+    returns: the launcher decides what exists, the shell only follows.
+    A rescan that raises is a scan that could not be made, not an empty one:
+    the current set is kept, logged once until the scan recovers.
+    With `wait_for_lock`, a held lock is waited for (one line when the wait
+    starts, one when it ends) instead of exiting, so a relauncher never loops.
+    With `rescan_status`, `rescan` is handed the supervisor's status, so it can
+    re-arm a held worker by changing its spec."""
     state_dir = Path(state_dir)
-    inst = SingleInstance(state_dir / "sparrowd.lock")
-    if not inst.acquire():
+    inst = SingleInstance(state_dir / LOCK_NAME)
+    acquired = inst.acquire()
+    if not acquired and not wait_for_lock:
         _log("another sparrowd holds the lock — exiting cleanly")
         return 0
     stop_evt = threading.Event()
-    sup = Supervisor(specs, backoff_initial_s=backoff_initial_s)
-    ctl = ControlServer(state_dir / "sparrowd.sock", sup, stop_evt.set)
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop_evt.set())
+    if not acquired:
+        _log("another sparrowd holds the lock — waiting for it")
+        while not inst.acquire():
+            if stop_evt.wait(lock_poll_s):
+                _log("stopped while waiting for the lock")
+                return 0
+        _log("lock acquired")
+    sup = Supervisor(specs, backoff_initial_s=backoff_initial_s, remove_grace_s=grace_s)
     _log(f"starting {len(specs)} worker(s): {', '.join(s.name for s in specs)}")
-    ctl.start()
+    ctl: Optional[ControlServer] = None
+    try:
+        ctl = ControlServer(control_socket_path(state_dir, create=True), sup, stop_evt.set)
+        ctl.start()
+    except OSError as e:
+        # Exiting here is a relaunch loop under any supervisor; the workers run, signals still stop us.
+        _log(f"control socket unavailable ({e}) — supervising without it; stop with SIGTERM")
+        if ctl is not None:
+            ctl.close()
+        ctl = None
     sup.start()
-    stop_evt.wait()
+    unavailable = False
+    while not stop_evt.wait(rescan_s if rescan is not None else None):
+        try:
+            want = rescan(sup.status()) if rescan_status else rescan()
+        except Exception as e:  # a launcher fault must not take the running workers down
+            if not unavailable:
+                _log(f"rescan unavailable ({type(e).__name__}: {e}) — keeping the current workers until it recovers")
+            unavailable = True
+            continue
+        if unavailable:
+            _log("rescan recovered")
+        unavailable = False
+        sup.sync(want)
     _log("shutdown requested")
-    sup.stop()
-    ctl.close()
+    sup.stop(grace_s)
+    if ctl is not None:
+        ctl.close()
     inst.release()
     return 0

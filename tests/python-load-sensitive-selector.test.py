@@ -85,7 +85,7 @@ def main() -> int:
         untagged = td / "untagged.txt"
         untagged.write_text("tests/sb.test.py\n")
         r = select("serial", untagged, disc)
-        if r.returncode != 3 or f"leg {SERIAL}: the selector emitted no serial suites" not in r.stderr:
+        if r.returncode != 3 or "serial leg: the selector emitted no serial suites" not in r.stderr:
             fails.append(f"an empty serial leg did not fail with its reason: rc={r.returncode} err={r.stderr.strip()!r}")
         badtag = td / "badtag.txt"
         badtag.write_text("tests/sb.test.py later\n")

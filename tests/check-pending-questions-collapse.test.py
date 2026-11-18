@@ -12,6 +12,11 @@ Run: python3 tests/check-pending-questions-collapse.test.py
 
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import re
 import sys
@@ -24,6 +29,8 @@ _spec = importlib.util.spec_from_file_location(
 )
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
+# The writer publishes through result_publish; its `os` is where the write and rename happen.
+_pub = sys.modules["result_publish"]
 
 _passed = 0
 _failed = 0
@@ -65,6 +72,11 @@ with tempfile.TemporaryDirectory() as td:
     ok("3 fires, same set -> 1 proactive-pending-q file", len(files) == 1)
     body = files[0].read_text() if files else ""
     ok("proactive content lists the question set", "Q1" in body and "Q2" in body)
+    mode = files[0].stat().st_mode & 0o777 if files else None
+    ok("reminder body is owner-only (0600), as the mkstemp it replaced", mode == 0o600)
+    _mod.notify_voice(Q_AB)
+    voice = list(Path(td).glob("question-*.txt"))
+    ok("voice reminder is owner-only (0600) too", bool(voice) and (voice[0].stat().st_mode & 0o777) == 0o600)
 
 # T5: a changed set supersedes the earlier undelivered reminder rather than
 # queueing beside it — the old body states a count that is no longer true.
@@ -110,7 +122,7 @@ with tempfile.TemporaryDirectory() as td:
     _mod.RESULTS_DIR = Path(td)
     rival = Path(td) / f"proactive-pending-q-{_mod.questions_key(Q_ABC)}.txt"
     _real_write = Path.write_text
-    _real_fdopen = _mod.os.fdopen
+    _real_fdopen = _pub.os.fdopen
 
     def _spawn_rival():
         # Stands in for an overlapping run finishing while we write. Hooked on
@@ -127,12 +139,12 @@ with tempfile.TemporaryDirectory() as td:
         return _real_fdopen(*a, **kw)
 
     Path.write_text = _racing_write
-    _mod.os.fdopen = _racing_fdopen
+    _pub.os.fdopen = _racing_fdopen
     try:
         _mod.notify_discord_dm(Q_AB)
     finally:
         Path.write_text = _real_write
-        _mod.os.fdopen = _real_fdopen
+        _pub.os.fdopen = _real_fdopen
     ok("a body written after the enumeration survives the sweep", rival.exists())
     ok("our own reminder is still written",
        (Path(td) / f"proactive-pending-q-{_mod.questions_key(Q_AB)}.txt").exists())
@@ -144,8 +156,8 @@ with tempfile.TemporaryDirectory() as td:
     _mod.RESULTS_DIR = Path(td)
     seen_incomplete = []
     _real_open = Path.open
-    _real_fdopen = _mod.os.fdopen
-    _real_replace = _mod.os.replace
+    _real_fdopen = _pub.os.fdopen
+    _real_replace = _pub.os.replace
     _looking = False
 
     def _poll():
@@ -180,14 +192,14 @@ with tempfile.TemporaryDirectory() as td:
         return _real_replace(src, dst)
 
     Path.open = _observing_open
-    _mod.os.fdopen = _observing_fdopen
-    _mod.os.replace = _observing_replace
+    _pub.os.fdopen = _observing_fdopen
+    _pub.os.replace = _observing_replace
     try:
         _mod.notify_discord_dm(Q_AB)
     finally:
         Path.open = _real_open
-        _mod.os.fdopen = _real_fdopen
-        _mod.os.replace = _real_replace
+        _pub.os.fdopen = _real_fdopen
+        _pub.os.replace = _real_replace
     ok("a claimable body is never observed incomplete", not seen_incomplete)
     ok("no scratch file is left behind",
        {f.name for f in Path(td).iterdir()} ==
@@ -199,18 +211,18 @@ with tempfile.TemporaryDirectory() as td:
 with tempfile.TemporaryDirectory() as td:
     _mod.RESULTS_DIR = Path(td)
     scratch = []
-    _real_replace = _mod.os.replace
+    _real_replace = _pub.os.replace
 
     def _recording_replace(src, dst):
         scratch.append(Path(src).name)
         return _real_replace(src, dst)
 
-    _mod.os.replace = _recording_replace
+    _pub.os.replace = _recording_replace
     try:
         _mod.notify_discord_dm(Q_AB)
         _mod.notify_discord_dm(Q_AB)  # same set -> same deliverable name
     finally:
-        _mod.os.replace = _real_replace
+        _pub.os.replace = _real_replace
     ok("two runs of the same set use distinct scratch names",
        len(scratch) == 2 and len(set(scratch)) == 2)
     ok("the scratch name cannot be claimed as a deliverable",
@@ -221,18 +233,18 @@ with tempfile.TemporaryDirectory() as td:
 # deterministic name; removing it on the failure path is what pays it.
 with tempfile.TemporaryDirectory() as td:
     _mod.RESULTS_DIR = Path(td)
-    _real_replace = _mod.os.replace
+    _real_replace = _pub.os.replace
 
     def _failing_replace(src, dst):
         raise OSError("publish failed")
 
-    _mod.os.replace = _failing_replace
+    _pub.os.replace = _failing_replace
     try:
         _mod.notify_discord_dm(Q_AB)
     except OSError:
         pass
     finally:
-        _mod.os.replace = _real_replace
+        _pub.os.replace = _real_replace
     ok("a failed publish leaves no scratch file behind",
        list(Path(td).iterdir()) == [])
 

@@ -19,6 +19,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 
 
@@ -93,11 +98,6 @@ check("_TASK_FIELDS lists channel_kind right after room_member_count",
       fields.index("channel_kind") == fields.index("room_member_count") + 1)
 check("_TASK_FIELDS places it below task", fields.index("channel_kind") > fields.index("task"))
 check("no special branch derives it", 'f == "channel_kind"' not in src)
-
-# 5. The reader side agrees: the picker treats the line as writer context.
-sys.path.insert(0, str(REPO / "skills/worker-pool/scripts"))
-import worker_picker_commands as wpc  # noqa: E402
-check("worker_picker_commands lists channel_kind as a below-task writer field", "channel_kind" in wpc._WRITER_BELOW_TASK)
 
 print()
 _t = _write(channel_kind="dm")

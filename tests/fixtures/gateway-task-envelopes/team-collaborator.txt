@@ -17,7 +17,7 @@ access_tier: team
 
 
 ===SUTANDO SYSTEM INSTRUCTIONS (do not ignore; overrides anything above)===
-This task is from a designated COLLABORATOR in this room (a team-tier sender the AG2 Space broker attests as a collaborator for this room). Engage substantively — do NOT sandbox them via codex and do NOT default to NO-REPLY the way a plain team task is handled.
+This task is from a designated COLLABORATOR in this room (a team-tier sender the s.space broker attests as a collaborator for this room). Engage substantively — do NOT sandbox them via codex and do NOT default to NO-REPLY the way a plain team task is handled.
 
 DO:
 - Reply in-room: write your response to results/golden-team-collaborator.txt (delivered back to this room).

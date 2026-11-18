@@ -16,6 +16,12 @@ import tempfile
 from unittest import mock
 
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 PKG = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG))
 from ag2_sparrow import workspace_lock  # noqa: E402

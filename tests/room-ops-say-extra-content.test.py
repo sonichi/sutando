@@ -12,6 +12,11 @@ import sys
 import unittest
 from unittest import mock
 
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 _ROOM_OPS = pathlib.Path(__file__).resolve().parents[1] / "skills" / "agent-room-ops"
 sys.path.insert(0, str(_ROOM_OPS))
 
@@ -24,14 +29,9 @@ HS = "@agent:hs"
 
 class ExtraContentTests(unittest.TestCase):
     def setUp(self):
-        self._env = dict(os.environ)
-        os.environ["RELAY_URL"] = "https://r"
-        os.environ.pop("SUTANDO_WORKER_SEAT", None)
-        os.environ.pop("SUTANDO_WORKER_ID", None)
-
-    def tearDown(self):
-        os.environ.clear()
-        os.environ.update(self._env)
+        env = mock.patch.dict(os.environ, hermetic_env(RELAY_URL="https://r"), clear=True)
+        env.start()
+        self.addCleanup(env.stop)
 
     def _post(self, **kwargs):
         cap = {}
@@ -106,14 +106,9 @@ class WrapperShapedExtraContentTests(unittest.TestCase):
     posted a summon as plain prose: the gateway dropped the unknown keys silently."""
 
     def setUp(self):
-        self._env = dict(os.environ)
-        os.environ["RELAY_URL"] = "https://r"
-        os.environ.pop("SUTANDO_WORKER_SEAT", None)
-        os.environ.pop("SUTANDO_WORKER_ID", None)
-
-    def tearDown(self):
-        os.environ.clear()
-        os.environ.update(self._env)
+        env = mock.patch.dict(os.environ, hermetic_env(RELAY_URL="https://r"), clear=True)
+        env.start()
+        self.addCleanup(env.stop)
 
     def _cli(self, extra):
         out, sent = io.StringIO(), []

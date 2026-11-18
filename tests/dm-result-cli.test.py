@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """CLI boundary tests for src/dm-result.py."""
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
 import io
@@ -22,7 +27,7 @@ spec.loader.exec_module(dm)
 
 def run_help(flag: str) -> subprocess.CompletedProcess:
     with tempfile.TemporaryDirectory() as td:
-        env = dict(os.environ)
+        env = isolated_child_env()
         env["CLAUDE_CONFIG_DIR"] = td
         env["DISCORD_BOT_TOKEN"] = ""
         env["SUTANDO_DM_OWNER_ID"] = ""

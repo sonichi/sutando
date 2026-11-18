@@ -19,10 +19,10 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-TMUX = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+TMUX = shutil.which("tmux") or shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
 PGREP_STUB = ('[ "$*" = "-ax claude" ] || exit 0\n'
               '[ -s "$HOME/claude.pid" ] && echo "$(cat "$HOME/claude.pid") claude"\n')
-CLAUDE_STUB = 'echo $$ > "$HOME/claude.pid"\nsleep 120\n'
+CLAUDE_STUB = '[ "$1" = --version ] && exit 0\necho $$ > "$HOME/claude.pid"\nsleep 120\n'
 
 
 class Harness:
@@ -36,8 +36,8 @@ class Harness:
         # Only the worker's own launcher, not the whole skill: this harness
         # tests the launch mechanics, not worker-pool's own behavior.
         (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True)
-        shutil.copy2(REPO / "skills/worker-pool/scripts/launch-worker-session.sh",
-                    root / "skills/worker-pool/scripts/launch-worker-session.sh")
+        for name in ("launch-worker-session.sh", "worker-mcp-credential.sh"):
+            shutil.copy2(REPO / "skills/worker-pool/scripts" / name, root / "skills/worker-pool/scripts" / name)
         self.root = root
         ws = self.td / "ws"
         (ws / "state").mkdir(parents=True)
@@ -60,7 +60,9 @@ class Harness:
         self.sock = self.td / "t.sock"
         self.env = {"PATH": f"{bind}:{Path(TMUX).parent}:/usr/bin:/bin:/usr/sbin",
                     "HOME": str(self.td / "home"), "SUTANDO_TMUX_SOCKET": str(self.sock),
-                    "SUTANDO_TEST_MODE": "1"}
+                    "SUTANDO_TEST_MODE": "1",
+                    # The stub claude never answers --version; the Mod has its own launch tests.
+                    "SUTANDO_TASK_WATCH_MOD_CORE": "0"}
 
     def tm(self, *a):
         return subprocess.run([TMUX, "-S", str(self.sock), *a], capture_output=True, text=True)
@@ -121,6 +123,55 @@ class CoreLaunchStartsSupervisedNotifier(unittest.TestCase):
         self.assertEqual(created_before, self.h.watcher_created(),
                          "an idempotent re-run replaced the watcher session")
 
+    def test_turning_the_stop_interrupt_on_and_back_off_replaces_the_watcher(self):
+        for wanted in ("1", ""):
+            created_before = self.h.watcher_created()
+            time.sleep(1.1)   # session_created has 1 s resolution
+            run = self.h.launch(extra_env={"SUTANDO_STOP_INTERRUPT": wanted} if wanted else None)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            _, _, env = self.h.watcher()
+            self.assertNotEqual(created_before, self.h.watcher_created(), f"switch {wanted!r}: a new watcher")
+            self.assertEqual("SUTANDO_STOP_INTERRUPT=1" in env, wanted == "1", "and it carries the switch, or not")
+
+    def test_a_stale_server_global_switch_never_reaches_a_watcher_launched_without_it(self):
+        self.h.tm("set-environment", "-g", "SUTANDO_STOP_INTERRUPT", "1")
+        self.h.tm("kill-session", "-t", "=sutando-core-watcher")
+        run = self.h.launch()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        out = self.h.td / "effective.env"
+        self.h.tm("new-window", "-d", "-t", "=sutando-core-watcher", f"printenv SUTANDO_STOP_INTERRUPT > {out}; echo done >> {out}")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and "done" not in (out.read_text() if out.exists() else ""):
+            time.sleep(0.1)
+        self.assertEqual(out.read_text().splitlines()[0], "", "the session's explicit empty value wins over the global 1")
+
+    def test_the_alert_knobs_are_always_set_so_a_server_global_value_never_reaches_the_watcher(self):
+        self.h.tm("set-environment", "-g", "SUTANDO_NOTIFIER_ALERT_GRACE", "7")
+        self.h.tm("set-environment", "-g", "SUTANDO_NOTIFIER_ALERT_REPEAT", "0")
+        self.h.tm("set-environment", "-g", "SUTANDO_NOTIFIER_ALERT_PILEUP", "9")
+        self.h.tm("kill-session", "-t", "=sutando-core-watcher")
+        run = self.h.launch()
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        _, _, env = self.h.watcher()
+        lines = env.splitlines()
+        self.assertIn("SUTANDO_NOTIFIER_ALERT_GRACE=", lines)
+        self.assertIn("SUTANDO_NOTIFIER_ALERT_REPEAT=", lines)
+        self.assertIn("SUTANDO_NOTIFIER_ALERT_PILEUP=", lines)
+
+    def test_custom_alert_knobs_reach_the_watcher_and_a_change_replaces_it(self):
+        created_before = self.h.watcher_created()
+        time.sleep(1.1)   # session_created has 1 s resolution
+        run = self.h.launch(extra_env={"SUTANDO_NOTIFIER_ALERT_GRACE": "60", "SUTANDO_NOTIFIER_ALERT_REPEAT": "0",
+                                       "SUTANDO_NOTIFIER_ALERT_PILEUP": "5"})
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        lines = self.h.watcher()[2].splitlines()
+        self.assertIn("SUTANDO_NOTIFIER_ALERT_GRACE=60", lines)
+        self.assertIn("SUTANDO_NOTIFIER_ALERT_REPEAT=0", lines)
+        self.assertIn("SUTANDO_NOTIFIER_ALERT_PILEUP=5", lines)
+        version = next(l for l in lines if l.startswith("SUTANDO_NOTIFIER_VERSION="))
+        self.assertTrue(version.endswith("-a60-r0-u5"), f"every alert knob is in the identity: {version}")
+        self.assertNotEqual(created_before, self.h.watcher_created(), "a changed knob replaces the supervisor")
+
     def test_restart_tears_the_watcher_down_with_the_core(self):
         created_before = self.h.watcher_created()
         time.sleep(1.1)
@@ -134,6 +185,34 @@ class CoreLaunchStartsSupervisedNotifier(unittest.TestCase):
                             "restart kept the old watcher session alive")
         sessions = self.h.tm("list-sessions", "-F", "#{session_name}").stdout.split()
         self.assertEqual(sessions.count("sutando-core-watcher"), 1)
+
+
+class CoreStandbyModeFollowsTheTaskWatchMod(unittest.TestCase):
+    """With the task-watch Mod installed the core's supervisor is alert-only (never types);
+    without it the typing standby stays; switching the Mod replaces the supervisor."""
+
+    def setUp(self):
+        # A claude that passes the Mod's version floor, so the launcher installs the Mod.
+        self.h = Harness(claude_body='[ "$1" = --version ] && { echo 99.0.0; exit 0; }\n'
+                                     'echo $$ > "$HOME/claude.pid"\nsleep 120\n')
+
+    def tearDown(self):
+        self.h.close()
+
+    def mode(self):
+        _, _, env = self.h.watcher()
+        return [l for l in env.splitlines() if l.startswith("SUTANDO_STANDBY_MODE=")]
+
+    def test_mod_on_gives_the_alert_only_standby_and_mod_off_the_typing_one(self):
+        run = self.h.launch(extra_env={"SUTANDO_TASK_WATCH_MOD_CORE": "1"})
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(self.mode(), ["SUTANDO_STANDBY_MODE=alert"], run.stderr)
+        created_before = self.h.watcher_created()
+        time.sleep(1.1)   # session_created has 1 s resolution
+        run = self.h.launch(extra_env={"SUTANDO_TASK_WATCH_MOD_CORE": "0"})
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertEqual(self.mode(), ["SUTANDO_STANDBY_MODE=type"])
+        self.assertNotEqual(created_before, self.h.watcher_created(), "switching the Mod replaces the supervisor")
 
 
 class LauncherForwardsOnlyAGenuinePin(unittest.TestCase):

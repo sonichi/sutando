@@ -1,0 +1,30 @@
+{
+  "action": "opened",
+  "number": 7,
+  "pull_request": {
+    "number": 7,
+    "state": "open",
+    "merged": false,
+    "title": "x",
+    "user": {
+      "login": "alice"
+    },
+    "head": {
+      "sha": "a1b2c3d4e5f6",
+      "ref": "feat"
+    },
+    "base": {
+      "ref": "main"
+    }
+  },
+  "repository": {
+    "full_name": "acme/widgets",
+    "name": "widgets",
+    "owner": {
+      "login": "acme"
+    }
+  },
+  "sender": {
+    "login": "alice"
+  }
+}

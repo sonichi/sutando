@@ -73,9 +73,11 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "tests" / "fixtures"))
+sys.path.insert(0, str(REPO / "tests"))
 sys.path.insert(0, str(REPO / "skills" / "worker-pool" / "scripts"))
 sys.path.insert(0, str(REPO / "src"))
 from clean_watcher_env import clean_env  # noqa: E402
+from _helpers.process_group import bind_to_test, popen_bound, unbind  # noqa: E402
 
 import pool_attribution as pa  # noqa: E402
 
@@ -223,6 +225,7 @@ class Watcher:
             ["bash", "src/watch-tasks-stream.sh", inbox, "--role", self.role, "--inbox", inbox],
             cwd=str(REPO), env=env, stdout=self.out.open("w"), stderr=self.err.open("w"),
             start_new_session=True)
+        bind_to_test(self.proc.pid)
         if self.role == "session":
             # A session watcher proves readiness by seeing its own probe file come
             # back through fswatch; the stub replays the feed, so echo the probes.
@@ -265,6 +268,7 @@ class Watcher:
             self.proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             pass
+        unbind(self.proc.pid)
 
 
 def claimed(w: Workspace, name: str) -> bool:
@@ -429,7 +433,7 @@ def arm_recycled_pid() -> None:
     print("\narm e1: the left-behind claim names a pid that was recycled by another process")
     w = Workspace()
     task = seed_delivered(w, "task-e.txt")
-    holder = subprocess.Popen(["sleep", "100000"])       # a live pid that is NOT the owner
+    holder = popen_bound(["sleep", "100000"])       # a live pid that is NOT the owner
     (w.claims / "task-e.txt").write_text(
         f"{holder.pid}\nsome-dead-watcher\n{task}\nfallback\nSat Jan  1 00:00:00 2000\n")
     w2 = Watcher(w)
@@ -447,7 +451,7 @@ def arm_live_owner_preserved() -> None:
     print("\narm e2: the claim names a live pid WITH its true start time — a live owner, left alone")
     w = Workspace()
     task = seed_delivered(w, "task-f.txt")
-    holder = subprocess.Popen(["sleep", "100000"])
+    holder = popen_bound(["sleep", "100000"])
     claim = w.claims / "task-f.txt"
     claim.write_text(f"{holder.pid}\nsome-live-watcher\n{task}\nfallback\n{proc_start(holder.pid)}\n")
     before = claim.read_text()
@@ -572,7 +576,7 @@ def arm_legacy_four_line_claim() -> None:
     print("\narm e6: a four-line claim from the previous writer is read by pid alone")
     w = Workspace()
     task = seed_delivered(w, "task-l.txt")
-    holder = subprocess.Popen(["sleep", "100000"])
+    holder = popen_bound(["sleep", "100000"])
     claim = w.claims / "task-l.txt"
     claim.write_text(f"{holder.pid}\nsome-live-watcher\n{task}\nfallback\n")
     w2 = Watcher(w)

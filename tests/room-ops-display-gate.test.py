@@ -12,6 +12,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
 
 _SKILL = Path(__file__).resolve().parents[1] / "skills" / "agent-room-ops"
 sys.path.insert(0, str(_SKILL))
@@ -22,19 +28,16 @@ _spec.loader.exec_module(display)
 
 class DisplayGateBinds(unittest.TestCase):
     def setUp(self):
-        self._env = dict(os.environ)
-        os.environ.update({"MATRIX_HS_URL": "http://hs.test",
-                           "MATRIX_AS_TOKEN": "t", "AGENT_MXID": "@a:test"})
+        env = mock.patch.dict(os.environ, hermetic_env(**{"MATRIX_HS_URL": "http://hs.test",
+                           "MATRIX_AS_TOKEN": "t", "AGENT_MXID": "@a:test"}), clear=True)
+        env.start()
+        self.addCleanup(env.stop)
         self._gate_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._gate_dir.cleanup)
         self._req_calls = []
         self._real_req = display._req
         display._req = lambda *a, **k: (self._req_calls.append(a), (200, {}))[1]
         self.addCleanup(setattr, display, "_req", self._real_req)
-
-    def tearDown(self):
-        os.environ.clear()
-        os.environ.update(self._env)
 
     def _gate(self, doc):
         p = Path(self._gate_dir.name) / "gate.json"
@@ -83,17 +86,14 @@ class DisplayBranches(unittest.TestCase):
     """The rest of main() plus _req itself, so the whole module is exercised."""
 
     def setUp(self):
-        self._env = dict(os.environ)
-        os.environ.update({"MATRIX_HS_URL": "http://hs.test",
+        env = mock.patch.dict(os.environ, hermetic_env(**{"MATRIX_HS_URL": "http://hs.test",
                            "MATRIX_AS_TOKEN": "t", "AGENT_MXID": "@a:test",
-                           "ROOM_OPS_GATE": "/nonexistent-display-gate.json"})
+                           "ROOM_OPS_GATE": "/nonexistent-display-gate.json"}), clear=True)
+        env.start()
+        self.addCleanup(env.stop)
         self._real_req = display._req
         self.addCleanup(setattr, display, "_req", self._real_req)
         display._req = lambda *a, **k: (200, {})
-
-    def tearDown(self):
-        os.environ.clear()
-        os.environ.update(self._env)
 
     def test_missing_env_is_usage_error(self):
         os.environ["MATRIX_AS_TOKEN"] = ""

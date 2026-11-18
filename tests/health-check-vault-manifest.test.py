@@ -15,6 +15,11 @@ this case fails; that is the point.
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import hashlib
 import importlib.util
 import json

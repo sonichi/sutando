@@ -11,6 +11,12 @@ the proactive file; the cooldown just never consulted it.
 
 Every assertion below FAILS on the pre-fix module (it takes no argument and ignores content).
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import sys
 import time

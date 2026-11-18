@@ -1,6 +1,11 @@
 """Exercise skill-link diagnostics with real Windows directory junctions."""
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import stat
@@ -51,7 +56,7 @@ class SkillJunctions(unittest.TestCase):
         link = self.dst / name
         self.assertTrue(link.parent.resolve().is_relative_to(self.root))
         self.assertTrue(target.resolve().is_relative_to(self.root))
-        env = dict(os.environ, SUTANDO_TEST_JUNCTION_LINK=str(link), SUTANDO_TEST_JUNCTION_TARGET=str(target))
+        env = isolated_child_env(SUTANDO_TEST_JUNCTION_LINK=str(link), SUTANDO_TEST_JUNCTION_TARGET=str(target))
         subprocess.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
              "New-Item -ItemType Junction -Path $env:SUTANDO_TEST_JUNCTION_LINK "

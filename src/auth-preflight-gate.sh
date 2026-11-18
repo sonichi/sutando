@@ -60,14 +60,14 @@ echo "  before services launch (half-up core is worse than a loud stop; #2396)."
 echo "  Remedy: $_remedy" >&2
 echo "" >&2
 
-osascript -e "display notification \"CLI login required — startup aborted. $( printf '%s' "$_remedy" | head -c 120 )\" with title \"Sutando\"" 2>/dev/null
+bash "$REPO/src/macos-notify.sh" "CLI login required — startup aborted. $( printf '%s' "$_remedy" | head -c 120 )" || true
 
 _ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)"
 _host="$(bash "$REPO/scripts/sutando-config.sh" host-label 2>/dev/null)"
 if [ -n "$_ws" ] && [ -n "$_host" ]; then
   # ask-owner records the question (room database, else the workspace outbox) and
   # queues the owner's DM itself; it exits 0 after any failure and prints why.
-  python3 "$REPO/scripts/ask-owner.py" "BOOT ABORTED — CLI login required ($_host)" \
+  python3 "$REPO/scripts/ask-owner.py" "Startup stopped on $_host: the CLI needs a login. Log in now? (remedy in the details)" \
     --context "auth-preflight-gate stopped startup before services launched. Remedy: $_remedy" \
     --urgency durable --workspace "$_ws" \
     || echo "  auth-preflight-gate: the pending question could not be recorded (reason above)." >&2

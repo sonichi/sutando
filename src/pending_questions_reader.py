@@ -13,18 +13,36 @@ what the adapter holds locally, lists or counts is the adapter's to say. `waitin
 `resolve` are the thin views every core reader uses; a read never reconciles (`reconcile_pass`
 does, on demand; the two are the adapter's separate entry points). Never read any file for this.
 
+`gather_recent` / `count_recent` are for pollers (the web client's 3 s task poll, the dashboard's
+15 s reload): each fresh gather opens a socket to the room, so a poller reuses one no older than
+POLL_REUSE_SEC, concurrent callers share one in-flight read, and a `resolve` or `reconcile_pass`
+through this module drops what it held. One-shot readers keep calling `gather`.
+
 `resolve` closes through the adapter; with no adapter, or an adapter that raises, it returns
 (False, why) and records nothing — the caller keeps the answer it holds (agent-api files the
 answer task before it asks for the close).
 
+`clicks` returns the owner's decision-card clicks after the adapter closed each clicked question's
+row: [{ask_id, action_id, label, consequence, actionable, token, stale, deferred, handed_before,
+closed, close_message, ...}]; only an `actionable` one is a decision, handed to this caller alone
+until its lease runs out unacked (then re-offered once to the next caller with a new token; after
+that it is listed as `needs_attention`, never offered again). A `chose` can therefore arrive twice:
+the caller re-checks current state before acting.
+`ack` with that token settles it once acted on; a superseded token is refused. With no adapter, or one without them, both refuse and change nothing.
+
 CLI, for shell readers: `python3 src/pending_questions_reader.py list [--json] | count | summary`
 (`summary` is the count and where the questions live, never their text); and the
-one write a core caller makes through the same contract, `resolve <ask-id> [--answered]`
-(Resolved, or Answered), which is `resolve` above and nothing else. `--store-adapter <path>`
+writes a core caller makes through the same contract: `resolve <ask-id> [--answered]`
+(Resolved, or Answered), which is `resolve` above and nothing else; `clicks [--json]`, run on a
+`hitl_click: true` task (`--due` is the probe, exit 0 when a pass is owed; its only write is the
+lease credit each pass earns, that
+health-check's `decision-card-clicks` warn uses so a deferred or expired click is retried); and
+`ack <ask-id> --token <token>` once the core has acted on a choice `clicks` handed it. `--store-adapter <path>`
 injects an adapter file in place of the declared one.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import sys
@@ -146,6 +164,49 @@ def gather(workspace, adapter=None) -> dict:
     return g
 
 
+# How long a poller reuses a gather; a question filed by another process shows up within it.
+POLL_REUSE_SEC = 60.0
+_RECENT: dict = {}
+_RECENT_LOCKS: dict = {}
+_FORGOTTEN: dict = {}
+_RECENT_GUARD = threading.Lock()
+_now = time.monotonic
+
+
+def _recent_key(workspace, resolved: Resolved) -> tuple:
+    return str(Path(workspace).resolve()), str(resolved.reason)
+
+
+def gather_recent(workspace, adapter=None, max_age: float = POLL_REUSE_SEC) -> dict:
+    """`gather`, reused while no older than `max_age` seconds; callers that arrive during a read
+    wait for it instead of starting their own."""
+    r = resolve_adapter(adapter)
+    key = _recent_key(workspace, r)
+    with _RECENT_GUARD:
+        lock = _RECENT_LOCKS.setdefault(key, threading.Lock())
+    with lock:
+        with _RECENT_GUARD:
+            generation = _FORGOTTEN.get(key[0], 0)
+            hit = _RECENT.get(key)
+        if hit is not None and 0 <= _now() - hit[0] < max_age:
+            return copy.deepcopy(hit[1])
+        started = _now()
+        g = gather(workspace, r)
+        with _RECENT_GUARD:
+            if _FORGOTTEN.get(key[0], 0) == generation:  # a write during the read makes it stale
+                _RECENT[key] = (started, g)
+        return copy.deepcopy(g)
+
+
+def forget_recent(workspace) -> None:
+    """Drop every reused gather of `workspace`: a write through this module has changed the rows."""
+    ws = str(Path(workspace).resolve())
+    with _RECENT_GUARD:
+        _FORGOTTEN[ws] = _FORGOTTEN.get(ws, 0) + 1
+        for key in [k for k in _RECENT if k[0] == ws]:
+            del _RECENT[key]
+
+
 def waiting(workspace, adapter=None) -> list:
     return gather(workspace, adapter)["waiting"]
 
@@ -153,7 +214,15 @@ def waiting(workspace, adapter=None) -> list:
 def count(workspace, adapter=None) -> dict:
     """{"open": n | None, "done": n | None, "pending_close": n, "unavailable", "reason"}; None is
     unknown, never 0."""
-    g = gather(workspace, adapter)
+    return _count_of(gather(workspace, adapter))
+
+
+def count_recent(workspace, adapter=None, max_age: float = POLL_REUSE_SEC) -> dict:
+    """`count` over `gather_recent`, for pollers."""
+    return _count_of(gather_recent(workspace, adapter, max_age))
+
+
+def _count_of(g: dict) -> dict:
     return {"open": None if g["unavailable"] else len(g["waiting"]), "done": g["done"],
             "pending_close": len(g["pending_close"]), "unavailable": g["unavailable"], "reason": g["reason"]}
 
@@ -167,6 +236,8 @@ def reconcile_pass(workspace, adapter=None) -> dict:
         return mod.reconcile_pass(Path(workspace))
     except Exception as e:  # noqa: BLE001
         return {"flushed": [], "moved": [], "closed": [], "errors": [f"adapter failed: {type(e).__name__}: {e}"]}
+    finally:
+        forget_recent(workspace)
 
 
 def reconcile_then_gather(workspace, adapter=None) -> dict:
@@ -189,6 +260,63 @@ def resolve(workspace, ask_id: str, status: str, adapter=None) -> tuple:
         return mod.resolve(Path(workspace), ask_id, status)
     except Exception as e:  # noqa: BLE001
         return False, f"not closed: adapter failed ({type(e).__name__}: {e}); nothing records the close"
+    finally:
+        forget_recent(workspace)
+
+
+def clicks(workspace, adapter=None) -> tuple:
+    """(choices, None), or (None, why) when there is no adapter or it cannot take the clicks."""
+    mod, why = _adapter(adapter)
+    if mod is None or not hasattr(mod, "clicks"):
+        return None, f"no store: {why}" if mod is None else f"adapter {why} takes no card clicks"
+    try:
+        return mod.clicks(Path(workspace)), None
+    except Exception as e:  # noqa: BLE001
+        return None, f"adapter failed ({type(e).__name__}: {e})"
+
+
+def due_clicks(workspace, adapter=None) -> tuple:
+    """(ask ids a clicks pass would act on now, None), or (None, why). Read-only."""
+    mod, why = _adapter(adapter)
+    if mod is None or not hasattr(mod, "due_clicks"):
+        return None, f"no store: {why}" if mod is None else f"adapter {why} takes no card clicks"
+    try:
+        return mod.due_clicks(Path(workspace)), None
+    except Exception as e:  # noqa: BLE001
+        return None, f"adapter failed ({type(e).__name__}: {e})"
+
+
+def ack(workspace, ask_id: str, token: str, adapter=None) -> tuple:
+    """(done, message): the core acted on that question's choice; the adapter's `ack_click`."""
+    mod, why = _adapter(adapter)
+    if mod is None or not hasattr(mod, "ack_click"):
+        return False, f"not acknowledged: {why if mod is None else f'adapter {why} takes no acks'}"
+    try:
+        return mod.ack_click(Path(workspace), ask_id, token)
+    except Exception as e:  # noqa: BLE001
+        return False, f"not acknowledged: adapter failed ({type(e).__name__}: {e})"
+
+
+def click_line(c: dict) -> str:
+    """Only an actionable click reads as `chose`, with its exact action id and consequence."""
+    q = " ".join(c["question"].split())[:120]
+    what = f"{c['action_id']} {c['label']!r}" + (f" -> {c['consequence']}" if c.get("consequence") else "")
+    if c.get("retired"):
+        return f"- [{c['ask_id']}] settled meanwhile — not a decision ({what}) — {q}"
+    if c.get("stale"):
+        return f"- [{c['ask_id']}] already answered — not a decision (a late click on {what}) — {q}"
+    if c.get("actionable"):
+        again = " (re-offered: the consumer it was handed to never acked)" if c.get("reoffered") else ""
+        return f"- [{c['ask_id']}] chose {what}{again} — {q} — ack with --token {c['token']}"
+    if c.get("needs_attention"):
+        return (f"- [{c['ask_id']}] NEEDS ATTENTION — handed out twice, never acknowledged ({what}); not "
+                f"a new decision: check whether it was acted on, then ack with --token {c['token']} or "
+                f"resolve the question — {q}")
+    if c.get("deferred"):
+        return (f"- [{c['ask_id']}] deferred — the room cannot confirm the owner has not answered "
+                f"otherwise; not a decision yet ({what}); retried next pass — {q}")
+    return (f"- [{c['ask_id']}] handed out earlier, awaiting ack — not a new decision ({what}); "
+            f"re-offered if no ack comes within the lease — {q}")
 
 
 def _norm_title(text: str) -> str:
@@ -228,11 +356,15 @@ def unknown_line(g: dict) -> str:
 def main(argv=None) -> int:
     import argparse  # noqa: PLC0415
     ap = argparse.ArgumentParser(description="List or count the owner's pending questions (read-only), "
-                                 "or resolve one through the declared store.")
-    ap.add_argument("command", choices=("list", "count", "summary", "resolve"))
-    ap.add_argument("ask_id", nargs="?", default=None, help="resolve: the question's ask id")
+                                 "or resolve one, or take card clicks, through the declared store.")
+    ap.add_argument("command", choices=("list", "count", "summary", "resolve", "clicks", "ack"))
+    ap.add_argument("ask_id", nargs="?", default=None, help="resolve / ack: the question's ask id")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--answered", action="store_true", help="resolve: mark it Answered, not Resolved")
+    ap.add_argument("--token", default=None, help="ack: the token `clicks` printed with the choice")
+    ap.add_argument("--due", action="store_true",
+                    help="clicks: only say whether a pass is owed (exit 0 when it is, 1 when not); "
+                         "its only write is crediting this pass to each handed lease")
     ap.add_argument("--workspace", type=Path, default=None)
     ap.add_argument("--store-adapter", default=None, help="an adapter file in place of the declared one")
     # intermixed: an optional positional after `--workspace` is otherwise swallowed on 3.12
@@ -241,9 +373,35 @@ def main(argv=None) -> int:
         from workspace_default import resolve_workspace  # noqa: PLC0415 — heavy loader
         args.workspace = resolve_workspace(migrate=False)
     store = declared(DECLARATION, args.workspace, override=args.store_adapter)  # the CLI is an edge
+    if args.command in ("resolve", "ack") and not args.ask_id:
+        ap.error(f"{args.command} needs an ask id")
+    if args.command == "ack":
+        if not args.token:
+            ap.error("ack needs the --token `clicks` printed with the choice")
+        ok, msg = ack(args.workspace, args.ask_id, args.token, store)
+        print(msg)
+        return 0 if ok else 1
+    if args.command == "clicks" and args.due:
+        due, why = due_clicks(args.workspace, store)
+        if due is None:
+            print(f"clicks: not read — {why}")
+            return 1
+        print(f"{len(due)} decision-card click(s) owe a pass" + (f": {', '.join(due)}" if due else ""))
+        return 0 if due else 1
+    if args.command == "clicks":
+        done, why = clicks(args.workspace, store)
+        if done is None:
+            print(f"clicks: not read — {why}")
+            return 1
+        if args.json:
+            print(json.dumps(done, ensure_ascii=False, indent=1))
+        elif not done:
+            print("no question-card clicks waiting")
+        for c in [] if args.json else done:
+            print(click_line(c))
+            print(f"    {c['close_message']}")
+        return 0
     if args.command == "resolve":
-        if not args.ask_id:
-            ap.error("resolve needs an ask id")
         ok, msg = resolve(args.workspace, args.ask_id, "Answered" if args.answered else "Resolved", store)
         print(msg)
         return 0 if ok else 1

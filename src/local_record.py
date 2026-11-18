@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from result_publish import publish_text
+
 # One path segment: no separator, no whitespace or control character, no leading dot.
 NAME_RE = re.compile(r"^(?!\.)[^\s/\\\x00-\x1f\x7f]{1,200}$")
 
@@ -43,18 +45,8 @@ def iso(now: Optional[float] = None) -> str:
 
 
 def write_text_whole(path: Path, text: str) -> Path:
-    """Appear whole in one rename; a crash mid-write leaves nothing half-written."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.stem}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.replace(tmp, path)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
-    return path
+    """Appear whole in one rename; a crash mid-write leaves nothing half-written. Owner-only (0600)."""
+    return publish_text(path, text, mode=0o600)
 
 
 def write_whole(path: Path, record: dict) -> Path:

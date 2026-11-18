@@ -12,6 +12,12 @@ request on stdin. Two desktop-install failures are pinned here:
 
 No real room is touched: the capability is a fake that records what it was handed.
 """
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib
 import io
@@ -78,6 +84,12 @@ FAKE_CLIENT = textwrap.dedent('''
         def row_body(self, db, row):
             return ""
 
+        async def put_database(self, writes):
+            self.database.update(writes)
+
+        async def put_row_body(self, db, row, body):
+            pass
+
         async def settle(self, sec):
             return None
 
@@ -99,7 +111,7 @@ class ServeProcess(unittest.TestCase):
         (self.scripts / "room_collab_client.py").write_text(FAKE_CLIENT)
         self.seen = self.tmp / "seen.json"
         self.config = self.tmp / "claude-config"
-        self.env = {k: v for k, v in os.environ.items()
+        self.env = {k: v for k, v in isolated_child_env().items()
                     if k not in CRED_VARS and k not in ("AG2_DEVICE_ENV", "CLAUDE_HOME")}
         self.env.update({"FAKE_SEEN": str(self.seen), "CLAUDE_CONFIG_DIR": str(self.config)})
 
@@ -109,12 +121,28 @@ class ServeProcess(unittest.TestCase):
         path.chmod(0o600)
         return path
 
-    def serve(self, req=ROWS, **env):
-        argv = [sys.executable, str(ADAPTER), "serve", "--room", ROOM, "--user-id", AGENT,
+    def serve(self, req=ROWS, room=ROOM, **env):
+        argv = [sys.executable, str(ADAPTER), "serve", "--room", room, "--user-id", AGENT,
                 "--skill-scripts", str(self.scripts)]
         p = subprocess.run(argv, input=json.dumps(req), capture_output=True, text=True, timeout=60,
                            env={**self.env, **env}, cwd=str(self.tmp))
         return json.loads(p.stdout.strip().splitlines()[-1]), p
+
+    def test_post_write_link_uses_room_app_not_relay(self):
+        req = {**ROWS, "op": "add_row", "row": "ask1", "cells": {}, "body": "Question"}
+        for server, origin in (("s.space", "https://chat.s.space"),
+                               ("ag2.space", "https://chat.ag2.space"),
+                               ("dev.s.space", "https://dev-chat.s.space"),
+                               ("unknown.example", None)):
+            with self.subTest(server=server):
+                reply, p = self.serve(req, room=f"!room:{server}",
+                                      REMOTE_TASK_URL="https://relay.test.invalid/relay",
+                                      REMOTE_TASK_TOKEN="fixture-token")
+                self.assertTrue(reply["ok"], p.stderr)
+                self.assertTrue(reply["result"]["created"])
+                expected = f"{origin}/home/!room%3A{server}?surface=database&page=pendingq" if origin else None
+                self.assertEqual(reply["result"]["link"], expected)
+                self.assertEqual(self.opened()["url"], "https://relay.test.invalid/relay")
 
     def opened(self) -> dict:
         return json.loads(self.seen.read_text())
@@ -187,7 +215,7 @@ class InProcess(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="pq-inproc-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.config = self.tmp / "claude-config"
-        base = {k: v for k, v in os.environ.items()
+        base = {k: v for k, v in isolated_child_env().items()
                 if k not in CRED_VARS and k not in ("AG2_DEVICE_ENV", "CLAUDE_HOME")}
         base["CLAUDE_CONFIG_DIR"] = str(self.config)
         patcher = mock.patch.dict(os.environ, base, clear=True)

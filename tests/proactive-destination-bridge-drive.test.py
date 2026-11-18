@@ -9,6 +9,12 @@ gate saw and decided for each seeded file.
 Single-pass technique per proactive-dm-failure-keeps-file-behaviour: the
 sleep at the end of each loop is patched to raise a sentinel.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import asyncio
 import importlib.util
 import os

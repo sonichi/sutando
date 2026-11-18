@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Regression tests for recreated proactive-result delivery IDs."""
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os

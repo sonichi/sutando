@@ -154,7 +154,9 @@ class Gate(unittest.TestCase):
         gh = FakeGitHub(["src/a.py"],
                         fail={"pulls/7": _R(rc=1, err="gh: Server Error (HTTP 502)")})
         rc, err = self._run(gh)
-        self.assertEqual(rc, 8)
+        self.assertEqual(rc, 9)
+        self.assertIn("couldn't check code owners", err)
+        self.assertNotIn("REFUSED: code-owner rule", err)
         self.assertEqual(gh.mentions, [])
         self.assertIn("HTTP 502", err)
 
@@ -162,7 +164,9 @@ class Gate(unittest.TestCase):
         gh = FakeGitHub(["src/a.py"],
                         fail={"contents/": _R(rc=1, err="gh: Forbidden (HTTP 403)")})
         rc, err = self._run(gh)
-        self.assertEqual(rc, 8)
+        self.assertEqual(rc, 9)
+        self.assertIn("couldn't check code owners", err)
+        self.assertNotIn("REFUSED: code-owner rule", err)
         self.assertIn("HTTP 403", err)
 
     def test_a_short_file_list_is_refused(self):
@@ -175,20 +179,26 @@ class Gate(unittest.TestCase):
                 return res
         short = Short(["src/a.py"], codeowners={".github/CODEOWNERS": "* @alice-gh\n"})
         rc, err = self._run(short)
-        self.assertEqual(rc, 8)
+        self.assertEqual(rc, 9)
+        self.assertIn("couldn't check code owners", err)
+        self.assertNotIn("REFUSED: code-owner rule", err)
         self.assertIn("1 of 3000", err)
 
     def test_gh_failing_to_run_is_refused(self):
         def boom(argv, **kw):
             raise OSError("no gh on PATH")
         rc, err = self._run(boom)
-        self.assertEqual(rc, 8)
+        self.assertEqual(rc, 9)
+        self.assertIn("couldn't check code owners", err)
+        self.assertNotIn("REFUSED: code-owner rule", err)
         self.assertIn("no gh on PATH", err)
 
     def test_an_unparseable_PR_reply_is_refused(self):
         gh = FakeGitHub(["src/a.py"], fail={"pulls/7": _R(out="not tsv\n")})
         rc, err = self._run(gh)
-        self.assertEqual(rc, 8)
+        self.assertEqual(rc, 9)
+        self.assertIn("couldn't check code owners", err)
+        self.assertNotIn("REFUSED: code-owner rule", err)
         self.assertIn("unreadable PR facts", err)
 
     def test_an_unowned_file_needs_no_owner(self):

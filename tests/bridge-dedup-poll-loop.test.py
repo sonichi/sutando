@@ -11,6 +11,11 @@ the loop's own sleep to raise, so exactly one pass runs.
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import atexit
 import contextlib
 import importlib.util

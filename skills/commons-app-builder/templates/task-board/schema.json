@@ -1,0 +1,39 @@
+{
+  "app": "Task Board",
+  "summary": "A person adds a task and picks one of their own agents. An agent that is in the room is named in Actor, so the row summons it and it reports Status, Blocker and Result on the row itself; an agent that is not in the room gets the task in its owner's DM; the text and the answer stay there, and the board cannot show the task's state yet.",
+  "databases": [
+    {
+      "name": "Task Board — Tasks",
+      "template": "blank",
+      "role": "primary",
+      "props": [
+        {
+          "name": "Status",
+          "type": "status",
+          "options": [
+            { "name": "Requested", "group": "todo" },
+            { "name": "Working", "group": "doing" },
+            { "name": "Blocked", "group": "doing" },
+            { "name": "Done", "group": "done" }
+          ]
+        },
+        { "name": "Blocker", "type": "text", "filled_by": "agent", "note": "What the task waits on. The agent writes it and sets Status to Blocked." },
+        { "name": "Result", "type": "text", "filled_by": "agent", "note": "What was done, or a link to it. Room-visible: never anything private." },
+        { "name": "Actor", "type": "person", "note": "The agent that does the task. A row naming an agent summons it when someone else changes the row, under the database's summon policy." },
+        { "name": "Created by", "type": "created_by" }
+      ],
+      "views": [
+        { "layout": "table", "name": "All tasks" },
+        { "layout": "board", "name": "By status", "groupBy": "Status" }
+      ],
+      "summon_policy": "owner"
+    }
+  ],
+  "agent_hook": "summon-on-row",
+  "notes": [
+    "The title column is created by the blank template; read its name from databases.list, never assume it.",
+    "Leave summon_policy at owner: only the agent's owner can then summon it, so picking 'my agent' cannot make someone else's agent work.",
+    "Status, Blocker and Result are the agent's columns: a change that touches only those does not re-summon it.",
+    "An agent outside this room is asked with artifact.agent.sendTask instead: its owner confirms the text, the task goes to their private DM, and nothing comes back to the board unless the agent writes the row. Planned: the room will see that agent's state (working, needs input, done or failed) but never the request text, the DM answer or its outcome line; a result is still only what the agent writes into this room."
+  ]
+}

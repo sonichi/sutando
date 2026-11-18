@@ -14,6 +14,11 @@ Run: python3 tests/notify-sh-dm-delegation.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import os
 import shutil
 import stat
@@ -63,7 +68,7 @@ with tempfile.TemporaryDirectory() as td:
     for f in ("curl", "osascript"):
         (shims / f).chmod((shims / f).stat().st_mode | stat.S_IEXEC)
 
-    env = dict(os.environ)
+    env = isolated_child_env()
     env["PATH"] = f"{shims}:{env['PATH']}"
     message = "gate check: it's done — 100% (`quotes` & $vars survive)"
     proc = subprocess.run(

@@ -11,6 +11,12 @@ of successful events. The fix only treats it as a live warning when no
 
 Run: python3 tests/health-check-bridge-log-content.test.py
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import sys

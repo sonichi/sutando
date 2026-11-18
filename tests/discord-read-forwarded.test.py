@@ -15,6 +15,12 @@ the only record of a live AMA failure (a 1,602-char session transcript plus the
 reporter's own words). They were nearly deleted on the strength of that blank
 output.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import pathlib
 import sys

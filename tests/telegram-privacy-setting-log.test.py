@@ -11,6 +11,12 @@ lie, both of which would misdirect the person reading it at 2am:
   * implying the flag determines a given group's reach, when an ADMIN bot receives
     everything regardless — i.e. exactly after the remediation this line prompts.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import os
 import pathlib

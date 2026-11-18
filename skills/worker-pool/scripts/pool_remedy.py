@@ -107,7 +107,8 @@ def resume(workspace, repo, *, runner=None, spawn=None) -> dict:
         dead = [w for w, o in obs.items()
                 if w in stopped and o.session_alive is False and not o.paused]
         restarted = {w: recover(workspace, repo, w, runner=runner, spawn=spawn) for w in dead}
-        _reset_ladders(workspace, forget=restarted)
+        _reset_ladders(workspace, forget=[
+            w for w, out in restarted.items() if out["outcome"] != SUSPENDED])
     return {"was_suspended": was, "restarted": restarted}
 
 
@@ -203,14 +204,15 @@ def _last_run(workspace, worker_id) -> dict:
     return runs[-1] if runs else {}
 
 
-def close_dead_runs(workspace, worker_id, closed: list | None = None) -> list:
-    """The ladder established death, so every run still open is over. Left open,
-    the next probe reads the newest of them as the worker's live run.
+def close_dead_runs(workspace, worker_id, closed: list | None = None,
+                    end_reason: str = "crashed") -> list:
+    """The ladder established death (or the owner killed it: "killed"), so every run still
+    open is over. Left open, the next probe reads the newest of them as the worker's live run.
     `closed` is appended in place, so a caller sees the partial list if a write fails."""
     closed = [] if closed is None else closed
     for run in wi.incarnations(workspace, worker_id):
         if run.get("ended_at") is None:
-            wi.end_incarnation(workspace, worker_id, run["incarnation_id"], "crashed")
+            wi.end_incarnation(workspace, worker_id, run["incarnation_id"], end_reason)
             closed.append(run["incarnation_id"])
     return closed
 
@@ -218,6 +220,8 @@ def close_dead_runs(workspace, worker_id, closed: list | None = None) -> list:
 def recover(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
     """Recover one worker. Never raises for an expected refusal: the caller is a
     timer with nobody watching, so every outcome is a value it can record."""
+    if suspension(workspace):
+        return {"worker_id": worker_id, "outcome": SUSPENDED}
     spawn = spawn or sw.spawn
     if sup.is_paused(workspace, worker_id):
         return {"worker_id": worker_id, "outcome": PAUSED}
@@ -246,6 +250,11 @@ def recover(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
         if not sessions:
             return {"worker_id": worker_id, "outcome": NO_SESSION}
         session = sessions[-1]
+        if last.get("session_id"):
+            session = next((s for s in sessions if s.get("session_id") == last["session_id"]), None)
+            if session is None:
+                return {"worker_id": worker_id, "outcome": NO_SESSION,
+                        "why": f"recorded incarnation session {last['session_id']!r} is not in this worker's lineage"}
         kw = {"resume": session["session_id"], "runtime": "claude", "socket": socket,
               "cwd": (session.get("transcript") or {}).get("cwd") or str(repo)}
     if runner is not None:
@@ -263,12 +272,14 @@ def recover(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
     closed: list = []
     try:
         close_dead_runs(workspace, worker_id, closed)
+        pd.reconcile_interrupted(workspace, worker_id)
         out = spawn(workspace, repo, **kw)
     except (sw.SpawnRefused, sw.SpawnRetained, OSError) as e:
         return {"worker_id": worker_id, "outcome": FAILED, "why": str(e),
                 "closed_runs": closed}
     return {"worker_id": worker_id, "outcome": RECOVERED, "closed_runs": closed,
-            "session_id": out.get("runtime_session_id")}
+            "session_id": out.get("runtime_session_id"),
+            **({"plugin_dirs_skipped": out["plugin_dirs_skipped"]} if out.get("plugin_dirs_skipped") else {})}
 
 
 SUPERVISOR_SCRIPT = "skills/worker-pool/scripts/worker-watcher-supervisor.sh"
@@ -295,14 +306,10 @@ def ensure_supervisor(workspace, repo, worker_id, *, runner=None) -> dict:
            "SUTANDO_INSTANCE_ID": worker_id,
            "SUTANDO_WORKER_ID": worker_id,
            "SUTANDO_WORKER_RUNTIME": runtime,
-           "SUTANDO_TASKS_DIR": str(pd.deliveries_dir(workspace, worker_id)),
            "SUTANDO_TMUX_SESSION": wi.tmux_session_name(worker_id),
-           "SUTANDO_INBOX_KIND": "deliveries",
-           "SUTANDO_WORKSPACE_DIR": str(workspace),
-           "SUTANDO_RESULTS_DIR": str(pd.results_dir(workspace)),
            # The timer's env carries none of the spawner's; the standby watcher needs
            # the resolver or it announces nothing for a delivery inbox.
-           "SUTANDO_INBOX_RESOLVER": str(Path(repo) / "skills" / "worker-pool" / "scripts" / "resolve-inbox-entry"),
+           **sw.inbox_env(workspace, worker_id, Path(repo) / "skills" / "worker-pool" / "scripts"),
            "SUTANDO_POOL_DELIVERY_SCRIPT": str(Path(repo) / "skills" / "worker-pool" / "scripts" / "pool_delivery.py")}
     if runtime == "codex":
         env["SUTANDO_TASK_EVENT_HANDLER"] = ""
@@ -390,6 +397,51 @@ def ensure_input_watches(workspace, repo, observations: dict, *, runner=None) ->
             for w, o in observations.items() if o.get("session_alive") is True}
 
 
+def retry_limit(workspace, repo, worker_id, *, runner=None):
+    """Route the recovery task and wake its limited worker through the guarded sender."""
+    if (sup.is_paused(workspace, worker_id)
+            or worker_id not in sup.supervised_workers(workspace)
+            or sup.work_outstanding(workspace, worker_id) is not True):
+        return {"worker_id": worker_id, "outcome": "no-work-or-paused"}
+    run = runner or subprocess.run
+    socket, session = sup._open_tmux(workspace, worker_id)
+    row = (sw.pr.load_roster(workspace) or {}).get("workers", {}).get(worker_id, {})
+    runtime = row.get("runtime") or "claude"
+    if not socket or runtime != "claude":
+        return {"worker_id": worker_id, "outcome": "unsupported-or-no-session"}
+    try:
+        capture = run(["tmux", "-S", str(socket), "capture-pane", "-e", "-p", "-J", "-t", session],
+                      capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return {"worker_id": worker_id, "outcome": "capture-failed"}
+    if (capture.returncode != 0
+            or sup.classify_pane_text(capture.stdout, runtime) != ps.PANE_LIMIT
+            or sup.pane_gate.pending_text(capture.stdout, sup.pane_gate.CLAUDE) != ""):
+        return {"worker_id": worker_id, "outcome": "pane-changed-or-pending"}
+    ask = _sibling("pool_ask")
+    try:
+        delivery = ask.ask(workspace, worker_id,
+            "The usage-limit recovery probe is due. Re-arm your session-role task watcher "
+            "using the normal worker bootstrap, then process your outstanding deliveries. "
+            "Do not run core startup or core schedules. If still usage-limited, leave the "
+            "deliveries pending; supervision will back off. Reply [no-send] when re-armed.",
+            allow_handoff=False)  # the pane prompt below names the routed payload
+    except (OSError, ValueError) as exc:
+        return {"worker_id": worker_id, "outcome": "delivery-failed", "why": str(exc)}
+    task_id = delivery["task_id"]
+    if sup.is_paused(workspace, worker_id) or suspension(workspace):
+        return {"worker_id": worker_id, "outcome": "rearm-queued", "task_id": task_id}
+    prompt = f"Read {delivery.get('task_file') or pd.payload_path(Path(workspace), task_id)} and complete that routed recovery task."
+    try:
+        sent = sup.pane_gate.deliver(prompt, session, runtime, socket_path=str(socket),
+            refuse_if_pending=True, require_limit=True, runner=run,
+            script=Path(repo) / "scripts/tmux-send-line.sh")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"worker_id": worker_id, "outcome": "wake-failed", "task_id": task_id, "why": str(exc)}
+    return {"worker_id": worker_id, "outcome": "rearm-sent" if sent.code == 0 else "wake-refused",
+            "task_id": task_id, "send_code": sent.code}
+
+
 def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
     """Act on a tick's decisions. `recover` resumes the session; `rearm_watcher`
     ensures the inbox's supervisor, whose standby arms once no session watcher
@@ -409,11 +461,14 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
         if decision == ps.RECOVER:
             done[worker_id] = recover(workspace, repo, worker_id,
                                       runner=runner, spawn=spawn)
-        elif decision in (ps.CARD_CAUSE, ps.CARD_FROZEN, ps.CARD_LOGIN, ps.CARD_HUMAN):
-            if decision == ps.CARD_HUMAN and sup.is_paused(workspace, worker_id):
+        elif decision in (ps.CARD_CAUSE, ps.CARD_FROZEN, ps.CARD_LOGIN, ps.CARD_HUMAN,
+                          ps.CARD_UNDELIVERED):
+            if decision in (ps.CARD_HUMAN, ps.CARD_UNDELIVERED) and sup.is_paused(workspace, worker_id):
                 continue
             cards[worker_id] = wc.raise_card(workspace, worker_id, decision,
                                              runner=runner or subprocess.run)
+        elif decision == ps.RETRY_LIMIT:
+            rearms[worker_id] = retry_limit(workspace, repo, worker_id, runner=runner)
         elif decision == ps.REARM_WATCHER:
             rearms[worker_id] = ensure_supervisor(workspace, repo, worker_id,
                                                   runner=runner)
@@ -424,7 +479,7 @@ def apply(workspace, repo, decisions: dict, *, runner=None, spawn=None) -> dict:
             "escalations": sorted(w for w, d in decisions.items() if d == ps.ESCALATE)}
 
 
-def main(argv=None) -> int:
+def main(argv=None, *, runner=None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--workspace", required=True)
     p.add_argument("--repo", required=True)
@@ -457,7 +512,7 @@ def main(argv=None) -> int:
         print(json.dumps({"suspended": suspend(a.workspace, a.suspend)}))
         return 0
     with pool_lock(a.workspace):
-        return _sweep(a)
+        return _sweep(a, runner)
 
 
 def _repair_human_cards(workspace, tick) -> None:
@@ -486,7 +541,7 @@ def _repair_human_cards(workspace, tick) -> None:
             tick["decisions"][w] = ps.CARD_HUMAN
 
 
-def _sweep(a) -> int:
+def _sweep(a, runner=None) -> int:
     try:
         resumed = resume(a.workspace, a.repo) if a.resume else None
         held = suspension(a.workspace)
@@ -527,7 +582,10 @@ def _sweep(a) -> int:
                  if o.get("session_alive") is True and w not in tick.get("wedged", [])}
         now_asks = {w: ps.WEDGE_CARDS.get(k) for w, k in tick.get("wedge_kinds", {}).items()}
         acted["cards_closed"] = wc.resolve_cleared(
-            a.workspace, clear, wedges=now_asks, observations=tick["observations"], recovered=recovered)
+            a.workspace, clear, wedges=now_asks, observations=tick["observations"], recovered=recovered,
+            runner=runner)
+    if tick.get("sentinels_deferred"):
+        acted["sentinels_deferred"] = tick["sentinels_deferred"]
     print(json.dumps({"decisions": tick["decisions"], "auth_expired": tick["auth_expired"],
                       **acted}, indent=2, sort_keys=True))
     outcomes = list(acted["recoveries"].values()) + list(((resumed or {}).get("restarted") or {}).values())

@@ -41,6 +41,12 @@ import unittest
 # MODULE level (this runs on import of the test file, ahead of the first _load),
 # so no code path — import-time resolution included — can reach the host Keychain.
 # --------------------------------------------------------------------------- #
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 _VAULT_STORE: dict[str, str] = {}   # var -> value; a missing var raises KeyError
 _VAULT_CALLS: list[str] = []        # every var the shadow was asked for
 

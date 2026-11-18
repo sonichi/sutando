@@ -5,6 +5,11 @@ Covers: absent file → None; todo rows → warn naming them; all-satisfied → 
 unreadable → warn (never raises).
 """
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import sys

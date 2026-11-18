@@ -35,7 +35,7 @@ sets `MORNING_BRIEFING_CALENDAR_SOURCE=macos` once. Step 1 below still runs on e
 
 **A missing connector is one line of text, never a card.** If `composio_find` reports the owner's
 calendar or mail app `connected: false`, say so in the briefing ("Google Calendar isn't connected;
-connect it in AG2 Space") and move on. The briefing is not an owner request: never post a connect
+connect it in s.space") and move on. The briefing is not an owner request: never post a connect
 card or start a `connect-apps` wait from it.
 
 **Step 1 — Base data (canonical; runs on EVERY host, including hosts that skipped Step 0):**
@@ -46,6 +46,13 @@ python3 src/morning-briefing.py
 ```
 
 `src/morning-briefing.py` is the single source of truth for core briefing data: weather (Open-Meteo), the calendar cache (or macOS Calendar + Reminders, opt-in only), overnight Discord DMs, pending questions, and system health. It writes output to `results/proactive-<ts>.txt` and sends a Discord DM directly. Review its output before composing the full briefing — do NOT re-fetch those sources manually.
+
+**Weather location:** If the base briefing asks which city or town to use, keep that question in
+the delivered briefing and omit weather until the owner answers. Do not infer a location from
+timezone or use a default city. When the owner answers, resolve their city to coordinates
+(clarify ambiguous place names) and save `WEATHER_LAT` and `WEATHER_LON` in the existing
+`env` stanza of `sutando.config.local.json`, preserving other settings. Subsequent briefings
+use those saved coordinates.
 
 **Then augment with the following if configured (skip if not available):**
 

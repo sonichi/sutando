@@ -2,6 +2,11 @@
 """Task engagement through the real daemon, CLI and private Unix socket."""
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import hashlib
 import json
 import os
@@ -46,7 +51,7 @@ class TaskEngagementTests(unittest.TestCase):
         for path in (self.tasks, self.results, self.ws / "state", self.other):
             path.mkdir(parents=True)
         self.env = {
-            **os.environ,
+            **isolated_child_env(),
             "PYTHONDONTWRITEBYTECODE": "1",
             "SUTANDO_TEST_MODE": "1",
             "SUTANDO_TELEMETRY": "0",

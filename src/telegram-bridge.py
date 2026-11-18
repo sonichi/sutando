@@ -43,6 +43,7 @@ except Exception:  # pragma: no cover — bridge must keep running
     def _push_vision_image(path: str, source: str = "telegram") -> bool:  # type: ignore
         return False
 from task_priority import default_priority_for_source  # noqa: E402
+from ingress_identity import provider_task_id, already_admitted  # noqa: E402
 from optional_script import run_optional_script as _run_optional_script_shared  # noqa: E402
 from proactive_recovery import (claim_for_delivery, recover_orphan_sending_files,  # noqa: E402
                                 release_claim)
@@ -666,7 +667,11 @@ def poll_progress(pending_replies: dict) -> None:
         try:
             created = int(task_id.split("-")[1]) / 1000.0
         except (ValueError, IndexError):
-            created = now
+            task_file = find_task_file(TASKS_DIR, task_id)
+            try:
+                created = task_file.stat().st_mtime if task_file else now
+            except OSError:
+                created = now
         if progress_stream.should_post_placeholder(now - created):
             text = _render_progress_text(now - created, task_id)
             resp = api("sendMessage", chat_id=chat_id, text=text)
@@ -835,6 +840,12 @@ def main():  # pragma: no cover
                     print(f"  Dropped message from non-allowed @{username}")
                     continue
 
+                task_id = provider_task_id(f"tg{chat_id}", str(msg["message_id"]))
+                if already_admitted(
+                        task_id, TASKS_DIR, RESULTS_DIR,
+                        lambda tid: local_task_protocol.find_archived_task(TASKS_DIR, tid) is not None):
+                    continue
+
                 # Record owner activity for status-aware-pivot
                 write_owner_activity("telegram", text, channel_id=chat_id)
 
@@ -923,8 +934,6 @@ def main():  # pragma: no cover
                         parent_line = f"parent_message_id: {_rep_mid}\n"
 
                 # Write as task (same format as voice bridge)
-                ts = int(time.time() * 1000)
-                task_id = f"task-{ts}"
                 task_file = TASKS_DIR / f"{task_id}.txt"
                 priority = default_priority_for_source("telegram", "owner")
 

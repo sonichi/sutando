@@ -5,6 +5,12 @@ Fixtures are built against the REAL health-check limit rather than a mocked one,
 because the thing under test is the delegation. A stubbed limit would pass with a
 private copy of 25,000 hardcoded — the exact defect the guard refuses to have.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib.util
 import io

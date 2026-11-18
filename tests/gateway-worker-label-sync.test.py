@@ -12,6 +12,11 @@ import unittest
 from unittest import mock
 
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 PACKAGE_TEST = REPO / "packages/ag2-sparrow/tests/test_worker_profile_labels.py"
 WRAPPER = REPO / "src/remote-gateway-bridge.py"

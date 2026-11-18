@@ -9,6 +9,12 @@ import tempfile
 import urllib.error
 from pathlib import Path
 
+sys.path.append(str(Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ag2_sparrow import event_channel as ec          # noqa: E402
 from ag2_sparrow.event_inbox import EventInbox        # noqa: E402
@@ -93,7 +99,7 @@ def test_channel_consumes_to_inbox():
     inbox = EventInbox(_tmpdb())
     body = ('id: 7\ndata: {"event_id":"$e7","type":"message.created","room_id":"!r:hs"}\n\n'
             ': keepalive\n\n'
-            'id: 8\ndata: {"event_id":"$e8","type":"artifact.updated","room_id":"!r:hs"}\n\n')
+            'id: 8\ndata: {"event_id":"$e8","type":"reaction.added","room_id":"!r:hs"}\n\n')
     ch, retry = _run_once(inbox, _sse_resp(body))
     check(retry is True, "channel: normal EOF is retryable (reconnect)")
     check(inbox.durable_cursor() == 8, "channel: cursor advanced via sticky id (7→8)")

@@ -5,6 +5,12 @@ The golden below pins the EXACT bytes `health-check --emit-task` produced
 before the adoption — the acceptance bar for step 3 is byte-identical output
 with the hand-rolled serialization deleted.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import sys

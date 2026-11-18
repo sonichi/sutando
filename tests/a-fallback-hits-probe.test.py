@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """The dual_read fallback counter is Design A's deletion release gate; the
 probe must warn on any hit, stay green on zero/absent, fail soft on garbage."""
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import sys

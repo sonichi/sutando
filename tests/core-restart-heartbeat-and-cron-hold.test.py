@@ -11,6 +11,11 @@ Run: python3 tests/core-restart-heartbeat-and-cron-hold.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import io
 import json
@@ -48,8 +53,8 @@ class ClaudeLauncherEnsuresHeartbeat(unittest.TestCase):
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
         shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
         (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True)
-        shutil.copy2(REPO / "skills/worker-pool/scripts/launch-worker-session.sh",
-                     root / "skills/worker-pool/scripts/launch-worker-session.sh")
+        for name in ("launch-worker-session.sh", "worker-mcp-credential.sh"):
+            shutil.copy2(REPO / "skills/worker-pool/scripts" / name, root / "skills/worker-pool/scripts" / name)
         self.calls = self.td / "heartbeat-calls"
         (root / "src" / "core_heartbeat.py").write_text(
             "import sys\n"
@@ -81,7 +86,9 @@ class ClaudeLauncherEnsuresHeartbeat(unittest.TestCase):
         self.sock = self.td / "t.sock"
         self.env = {"PATH": f"{bind}:{Path(TMUX).parent}:/usr/bin:/bin:/usr/sbin",
                     "HOME": str(self.td / "home"), "SUTANDO_TMUX_SOCKET": str(self.sock),
-                    "SUTANDO_TEST_MODE": "1", "SUTANDO_RESTART_GRACE_S": "2"}
+                    "SUTANDO_TEST_MODE": "1", "SUTANDO_RESTART_GRACE_S": "2",
+                    # The stub claude never answers --version; the Mod has its own launch tests.
+                    "SUTANDO_TASK_WATCH_MOD_CORE": "0"}
 
     def tearDown(self):
         subprocess.run([TMUX, "-S", str(self.sock), "kill-server"], capture_output=True)

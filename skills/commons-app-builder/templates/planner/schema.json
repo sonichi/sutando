@@ -1,0 +1,42 @@
+{
+  "app": "Planner",
+  "summary": "Dated items in a week view: seven day columns on a wide screen, one scrolling list of days on a phone.",
+  "databases": [
+    {
+      "name": "Planner — Items",
+      "template": "blank",
+      "role": "primary",
+      "props": [
+        { "name": "Day", "type": "date" },
+        {
+          "name": "Slot",
+          "type": "select",
+          "options": [{ "name": "Morning" }, { "name": "Afternoon" }, { "name": "Evening" }]
+        },
+        {
+          "name": "State",
+          "type": "status",
+          "options": [
+            { "name": "Planned", "group": "todo" },
+            { "name": "Done", "group": "done" },
+            { "name": "Dropped", "group": "done" }
+          ]
+        },
+        { "name": "Who", "type": "person" },
+        { "name": "Created by", "type": "created_by" }
+      ],
+      "views": [
+        { "layout": "table", "name": "All items" },
+        { "layout": "calendar", "name": "Calendar", "dateBy": "Day" },
+        { "layout": "board", "name": "By day part", "groupBy": "Slot" }
+      ],
+      "summon_policy": "owner"
+    }
+  ],
+  "agent_hook": "none",
+  "notes": [
+    "Day is a real date (YYYY-MM-DD), never free text, so the calendar view and the week maths work.",
+    "The week shown is per viewer and lives in location.hash, not in a database: two people can read different weeks.",
+    "An item with no Day is listed under Unscheduled rather than hidden."
+  ]
+}

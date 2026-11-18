@@ -23,8 +23,10 @@ cleanup.
 
 CLI, for bash callers with only an interpreter path:
 
-    task_dispatch.py has-result <results_dir> <filename>                 # exit 0/1
+    task_dispatch.py has-result <results_dir> <filename> [--task-file P]  # exit 0/1
+    task_dispatch.py wake-turn <tasks_dir> <filename>                  # exit 0 = a woken task's new turn
     task_dispatch.py find-ready <results_dir> <filename>                 # prints path, exit 0/1
+    task_dispatch.py head-abandoned <results_dir> <filename> <payload>  # exit 0 = drop the queue head
     task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir D]
     task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir D]
     task_dispatch.py inflight-mark <inflight_dir> <filename> <incarnation>
@@ -54,9 +56,14 @@ answering about an archived body while reading an untouched live placeholder ins
 """
 from __future__ import annotations
 
+import json
 import os
+import re
+import stat
+import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Iterator
 
@@ -64,7 +71,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # lint-workspac
 
 from delivery.readiness import read_ready_result  # noqa: E402
 
-from local_task_protocol import index_result_candidates, iter_result_candidates  # noqa: E402
+from local_task_protocol import (index_result_candidates, iter_result_candidates,  # noqa: E402
+                                 parse_task_headers)
 
 from task_priority import parse_priority_from_file, sort_tasks_by_priority  # noqa: E402
 
@@ -133,13 +141,81 @@ def find_ready_result_for_filename(results_dir: "Path | str", filename: str, *,
     return find_ready_result(results_dir, _task_id_for_filename(filename), reader=reader)
 
 
-def has_ready_result(results_dir: "Path | str", filename: str) -> bool:
+def head_abandoned(results_dir: "Path | str", filename: str, payload: "Path | str") -> bool:
+    """True iff a queued or submitted task can never resolve: no ready result and its payload is gone.
+
+    A task archived without a result findable here (never answered, or answered and its
+    result removed by another consumer) would otherwise hold a notifier's queue head, or
+    its in-flight wait, forever, blocking every task behind it.
+    """
+    return not Path(payload).exists() and not has_ready_result(results_dir, filename)
+
+
+def has_ready_result(results_dir: "Path | str", filename: str, *,
+                     task_file: "Path | str | None" = None) -> bool:
     """True iff task file `filename` has a ready result, live or in any archive layout.
 
     An empty or whitespace-only file — live or archived — is not a delivery and
-    does not stop the search; `find_ready_result` walks past it.
+    does not stop the search; `find_ready_result` walks past it. With `task_file` a wake
+    turn, a result older than that file answered an earlier turn of the same id, not this one.
     """
-    return find_ready_result_for_filename(results_dir, filename) is not None
+    return find_ready_result_for_filename(results_dir, filename, reader=_turn_reader(task_file)) is not None
+
+
+def _turn_reader(task_file):
+    """`read_ready_result`, or for a wake turn one that refuses a result older than its task file."""
+    since = _mtime(task_file) if task_file is not None and is_wake_turn(task_file) else None
+    if since is None:
+        return read_ready_result
+
+    def reader(path):
+        written = _mtime(path)
+        return None if written is not None and written < since else read_ready_result(path)
+    return reader
+
+
+def unanswered_in_inbox(tasks_dir: "Path | str", results_dir: "Path | str", *,
+                        workspace: "Path | str | None" = None) -> "list[tuple[str, Path]]":
+    """(task id, task file) for each task file directly in a plain inbox `tasks_dir` (a worker's own
+    folder) with no ready result in `results_dir` (`has_ready_result`, wake-turn aware); a claimed name
+    counts under its task's id, once. The one rule for what such an inbox still owes. With `workspace`,
+    a result archived in the task's other home before a switch also answers it (`task_lookup`)."""
+    from task_archive import task_id_from_filename
+    tasks_dir = Path(tasks_dir)
+    try:
+        files = sorted(p for p in tasks_dir.glob("task-*.txt") if p.is_file())
+    except OSError:
+        return []
+    owed, seen = [], set()
+    for f in files:
+        task_id = task_id_from_filename(f.name)
+        if not task_id or task_id in seen:
+            continue
+        seen.add(task_id)
+        if has_ready_result(results_dir, f"{task_id}.txt", task_file=f):
+            continue
+        if workspace is not None:
+            import task_lookup
+            if task_lookup.find_other_archived_ready_result(workspace, task_id, reader=_turn_reader(f)):
+                continue
+        owed.append((task_id, f))
+    return owed
+
+
+def is_wake_turn(task_file: "Path | str") -> bool:
+    """A queued file a woken task was written to: a new turn of an id an earlier result answered."""
+    try:
+        text = Path(task_file).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return bool(parse_task_headers(text).headers.get("wake_episode"))
+
+
+def _mtime(path) -> "float | None":
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
 
 
 def ready_result_filenames(results_dir: "Path | str", filenames, *,
@@ -162,6 +238,7 @@ def ready_result_filenames(results_dir: "Path | str", filenames, *,
 
 
 _WORKER_HOLD_SUFFIXES = (".txt", ".accepted", ".claimed")
+WORKER_HOLD_SUFFIXES = _WORKER_HOLD_SUFFIXES  # the public spelling, for callers outside this module
 
 
 class WorkerHoldUnreadable(OSError):
@@ -199,6 +276,32 @@ def worker_holds(deliveries_dir: "Path | str", filename: str) -> bool:
             except OSError as exc:
                 raise WorkerHoldUnreadable(f"cannot stat under {d}: {exc}") from exc
             return True
+    return False
+
+
+def worker_committed(workspace: "Path | str", filename: str) -> bool:
+    """True iff a worker's folder holds this task AND `state/attribution/<id>` names that worker: the
+    router's delivery finished. A sentinel alone may be a router that died before attributing it."""
+    if not worker_holds(Path(workspace) / "deliveries", filename):
+        return False
+    task_id = _task_id_for_filename(filename)
+    try:
+        worker = (Path(workspace) / "state" / "attribution" / task_id).read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return False
+    except (OSError, UnicodeDecodeError) as exc:
+        raise WorkerHoldUnreadable(f"cannot read the attribution of {task_id}: {exc}") from exc
+    if not worker or "/" in worker or worker in (".", ".."):
+        return False
+    deliveries = Path(workspace) / "deliveries" / worker
+    for suffix in _WORKER_HOLD_SUFFIXES:
+        try:
+            os.lstat(deliveries / f"{task_id}{suffix}")
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise WorkerHoldUnreadable(f"cannot stat under {deliveries}: {exc}") from exc
+        return True
     return False
 
 
@@ -247,13 +350,14 @@ def pending_candidates(
     step handed back.
     """
     claims = Path(claims_dir) if claims_dir else None
-    for task in sort_tasks_by_priority(Path(tasks_dir).glob("*.txt")):
-        if not task.is_file():
-            continue
+    tasks = [t for t in sort_tasks_by_priority(Path(tasks_dir).glob("*.txt"))
+             if t.is_file() and t.name and "/" not in t.name and ".." not in t.name]
+    # One listing per result layout for the whole queue; a per-task glob of the flat archive
+    # costs (tasks x archive size) and dominated every polling caller's CPU.
+    ready = ready_result_filenames(results_dir, [t.name for t in tasks])
+    for task in tasks:
         name = task.name
-        if not name or "/" in name or ".." in name:
-            continue
-        if has_ready_result(results_dir, name):
+        if name in ready:
             continue
         if claims is not None and (claims / name).is_file():
             continue
@@ -288,7 +392,7 @@ def _inflight_path(inflight_dir: "Path | str", filename: str) -> Path:
     return Path(inflight_dir) / filename
 
 
-def mark_inflight(inflight_dir: "Path | str", filename: str, incarnation: str) -> None:
+def mark_inflight(inflight_dir: "Path | str", filename: str, incarnation: str, prompt_digest: str = "") -> None:
     """Record that `filename`'s prompt was submitted to the core incarnation `incarnation`.
 
     Terminal history is a lossy record of what was submitted: the prompt scrolls
@@ -299,6 +403,8 @@ def mark_inflight(inflight_dir: "Path | str", filename: str, incarnation: str) -
     incarnation = incarnation.strip()
     if not incarnation:
         raise ValueError("an in-flight marker needs the core incarnation; empty would read as live forever")
+    if prompt_digest and not re.fullmatch(r"[0-9a-f]{64}", prompt_digest):
+        raise ValueError("invalid prompt digest")
     path = _inflight_path(inflight_dir, filename)
     path.parent.mkdir(parents=True, exist_ok=True)
     # A private temp file per writer: two notifiers marking at once must not
@@ -307,6 +413,8 @@ def mark_inflight(inflight_dir: "Path | str", filename: str, incarnation: str) -
     try:
         with os.fdopen(fd, "w") as fh:
             fh.write(incarnation + "\n")
+            if prompt_digest:
+                fh.write(prompt_digest + "\n")
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
@@ -321,9 +429,8 @@ def inflight_is_live(inflight_dir: "Path | str", filename: str, incarnation: str
     any marker live: not knowing which core is running is not evidence the
     prompt was never submitted.
 
-    Liveness is judged on the FIRST line only. `mark_partial_paste` writes a
-    second line (the leftover composer text) after the same incarnation; a
-    plain `mark_inflight` record never has one, so this is backward compatible.
+    Liveness uses only the first line; a second line can hold a partial paste
+    or an accepted-prompt digest without changing incarnation matching.
     """
     path = _inflight_path(inflight_dir, filename)
     try:
@@ -393,15 +500,20 @@ def partial_paste_leftover(partial_dir: "Path | str", filename: str, incarnation
 
 
 _USAGE = (
-    "usage: task_dispatch.py has-result <results_dir> <filename>\n"
+    "usage: task_dispatch.py has-result <results_dir> <filename> [--task-file P]\n"
+    "       task_dispatch.py wake-turn <tasks_dir> <filename>   # exit 0 a wake turn / 1 not\n"
     "       task_dispatch.py find-ready <results_dir> <filename>\n"
-    "       task_dispatch.py sort-by-priority <tasks_dir>   # every *.txt, no result/claim/delivery filtering\n"
+    "       task_dispatch.py head-abandoned <results_dir> <filename> <payload>   # exit 0 drop / 1 keep\n"
+    "       task_dispatch.py sort-by-priority <tasks_dir> [--resolve-inbox WORKSPACE HELPER [--resolution-cache DIR]]\n"
+    "       task_dispatch.py reuse-inbox-resolution <cache_dir> <entry>   # exit 5 if changed or uncached\n"
     "       task_dispatch.py priority-tier <task_file>   # prints urgent|normal|low, the file's own header\n"
     "       task_dispatch.py pending-candidates <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py next-pending <tasks_dir> <results_dir> [--claims-dir DIR] [--deliveries-dir DIR]\n"
     "       task_dispatch.py worker-holds <deliveries_dir> <filename>   # exit 0 held / 1 not / 2 cannot decide\n"
+    "       task_dispatch.py worker-committed <workspace> <filename>   # held AND attributed: exit 0 / 1 not / 2 cannot decide\n"
     "       task_dispatch.py announced-entry <tasks_dir> <announced> [--resolved <payload_dir>]   # prints key<TAB>payload; exit 1 refused\n"
     "       task_dispatch.py owned-by <deliveries_dir> <recipient>   # one id per line; exit 2 cannot decide\n"
+    "       task_dispatch.py unanswered-in <tasks_dir> <results_dir> [--workspace W]   # a plain inbox: id<TAB>task file per line\n"
     "       task_dispatch.py inflight-mark <inflight_dir> <filename> <incarnation>\n"
     "       task_dispatch.py inflight-live <inflight_dir> <filename> <incarnation>   # exit 0/1\n"
     "       task_dispatch.py inflight-clear <inflight_dir> <filename>\n"
@@ -427,14 +539,98 @@ def _parse_dir_options(rest: list[str]) -> dict:
     return opts
 
 
+_INBOX_PRIORITY_LIMIT = 32
+_INBOX_PRIORITY_SECONDS = 10
+
+
+def _resolution_identity(path: Path):
+    try:
+        st = path.lstat()
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        return [st.st_dev, st.st_ino, st.st_size, st.st_mode, st.st_mtime_ns, st.st_ctime_ns]
+    except OSError:
+        return None
+
+
+def _reuse_inbox_resolution(cache_dir: str, entry: str) -> int:
+    cache = Path(cache_dir) / Path(entry).name
+    try:
+        record = json.loads(cache.read_text())
+        cache.unlink()
+        if record["entry"] != _resolution_identity(Path(entry)) or record["entry"] is None:
+            return 5
+        if record["rc"] == 0:
+            if record["payload"] is None or record["payload"] != _resolution_identity(
+                    Path(record["stdout"].removesuffix("\n"))):
+                return 5
+        sys.stdout.write(record["stdout"])
+        sys.stderr.write(record["stderr"])
+        return record["rc"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return 5
+
+
+def _inbox_priority(entry: Path, workspace: str, helper: str, budget: int,
+                    cache_dir: "Path | None" = None) -> str:
+    """Use the dispatch resolver's bounds and validation without admitting the entry."""
+    identity = _resolution_identity(entry)
+    try:
+        resolved = subprocess.run(
+            ["bash", helper, str(entry), workspace, str(budget)],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return "normal"
+    if cache_dir is not None:
+        payload = Path(resolved.stdout.removesuffix("\n")) if resolved.returncode == 0 else None
+        record = {"entry": identity, "rc": resolved.returncode,
+                  "stdout": resolved.stdout, "stderr": resolved.stderr,
+                  "payload": _resolution_identity(payload) if payload is not None else None}
+        (cache_dir / entry.name).write_text(json.dumps(record))
+    if resolved.returncode:
+        return "normal"
+    return parse_priority_from_file(Path(resolved.stdout.removesuffix("\n")))
+
+
+def _inbox_priorities(entries: list[Path], workspace: str, helper: str,
+                      cache_dir: "Path | None" = None) -> dict[Path, str]:
+    """Resolve only the oldest prefix; unexamined entries retain normal/FIFO order."""
+    ordered = sort_tasks_by_priority(entries, priority_reader=lambda _: "normal")
+    deadline = time.monotonic() + _INBOX_PRIORITY_SECONDS
+    priorities = {}
+    for entry in ordered[:_INBOX_PRIORITY_LIMIT]:
+        # Reserve whole seconds for run_bounded; its TERM/KILL grace is at most
+        # one extra second plus polling overhead for the last lookup.
+        remaining = int(deadline - time.monotonic())
+        if remaining < 1:
+            break
+        priorities[entry] = _inbox_priority(entry, workspace, helper, remaining, cache_dir)
+    return priorities
+
+
 def _main(argv: list[str]) -> int:
+    if len(argv) == 3 and argv[0] == "reuse-inbox-resolution":
+        return _reuse_inbox_resolution(argv[1], argv[2])
     # A pure sort, no eligibility filtering -- the caller still decides
     # whether a file is eligible; this only changes the offered order.
     if argv and argv[0] == "sort-by-priority":
-        if len(argv) != 2:
+        cache_dir = None
+        if len(argv) == 7 and argv[5] == "--resolution-cache" and argv[6]:
+            cache_dir = Path(argv[6])
+            argv = argv[:5]
+        if len(argv) != 2 and not (len(argv) == 5 and argv[2] == "--resolve-inbox"
+                                  and argv[3] and argv[4]):
             print(_USAGE, file=sys.stderr)
             return 2
-        names = [p.name for p in sort_tasks_by_priority(Path(argv[1]).glob("*.txt"))]
+        reader = parse_priority_from_file
+        entries = list(Path(argv[1]).glob("*.txt"))
+        if len(argv) == 5 and os.environ.get("SUTANDO_INBOX_RESOLVER"):
+            priorities = _inbox_priorities(entries, argv[3], argv[4], cache_dir)
+            reader = lambda entry: priorities.get(entry, "normal")
+        names = [p.name for p in sort_tasks_by_priority(
+            entries, priority_reader=reader,
+        )]
         for name in names:
             print(name)
         return 0 if names else 1
@@ -449,10 +645,20 @@ def _main(argv: list[str]) -> int:
         return 2
     cmd, first, second, rest = argv[0], argv[1], argv[2], argv[3:]
     if cmd == "has-result":
+        if rest and (len(rest) != 2 or rest[0] != "--task-file"):
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return 0 if has_ready_result(first, second, task_file=rest[1] if rest else None) else 1
+    if cmd == "wake-turn":
         if rest:
             print(_USAGE, file=sys.stderr)
             return 2
-        return 0 if has_ready_result(first, second) else 1
+        return 0 if is_wake_turn(Path(first) / second) else 1
+    if cmd == "head-abandoned":
+        if len(rest) != 1:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        return 0 if head_abandoned(first, second, rest[0]) else 1
     if cmd == "find-ready":
         if rest:
             print(_USAGE, file=sys.stderr)
@@ -515,6 +721,13 @@ def _main(argv: list[str]) -> int:
         for task_id in ids:
             print(task_id)
         return 0
+    if cmd == "unanswered-in":
+        if rest and (len(rest) != 2 or rest[0] != "--workspace"):
+            print(_USAGE, file=sys.stderr)
+            return 2
+        for task_id, task_file in unanswered_in_inbox(first, second, workspace=rest[1] if rest else None):
+            print(f"{task_id}\t{task_file}")
+        return 0
     if cmd == "announced-entry":
         if rest and (len(rest) != 2 or rest[0] != "--resolved" or not rest[1]):
             print(_USAGE, file=sys.stderr)
@@ -524,6 +737,15 @@ def _main(argv: list[str]) -> int:
             return 1
         print(f"{entry[0]}\t{entry[1]}")
         return 0
+    if cmd == "worker-committed":
+        if rest:
+            print(_USAGE, file=sys.stderr)
+            return 2
+        try:
+            return 0 if worker_committed(first, second) else 1
+        except WorkerHoldUnreadable as exc:
+            print(f"task_dispatch.py: worker-committed: {exc}", file=sys.stderr)
+            return 2
     if cmd == "worker-holds":
         if rest:
             print(_USAGE, file=sys.stderr)

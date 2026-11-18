@@ -1,9 +1,9 @@
 #!/bin/bash
-# Install / uninstall / check the launchd-supervised ag2.space gateway-bridge.
+# Install / uninstall / check the launchd-supervised gateway-bridge.
 #
 # Role: keeps src/remote-gateway-bridge.py alive with automatic restart on
 # crash/kill (KeepAlive) + RunAtLoad so it comes back after login/reboot. The
-# bridge carries ag2.space MOBILE-app messages from the cloud gateway to the
+# bridge carries MOBILE-app messages from the homeserver's cloud gateway to the
 # local core; before this job it was a single unmonitored process that, on
 # 2026-07-10, was found dead for 3 days with mobile messages stranded in the
 # cloud. Health-check reports it down (PR #2067); this job recovers it.

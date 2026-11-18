@@ -11,6 +11,12 @@ bucket only; (4) the Questions UI shows the outage beside the rows it holds loca
 marker write that would fail never makes a reachable room read as unavailable; (6) the manifest
 field is in the canonical schema, the linter validates it, the collab URL is declared config.
 No real room: the fake capability and in-process store of the room-db suite."""
+
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import datetime as _dt
 import importlib
 import importlib.util
@@ -37,7 +43,7 @@ compat = importlib.import_module("pending_questions_compat")
 local_record = importlib.import_module("local_record")
 ADAPTER = Path(adapter.__file__)
 SKILL = REPO / "skills" / "pending-questions"
-ENV = {k: v for k, v in os.environ.items()
+ENV = {k: v for k, v in isolated_child_env().items()
        if k not in ("SUTANDO_INSTANCE_ID", "SUTANDO_WORKSPACE_DIR", "SUTANDO_TASKS_DIR", "PENDING_QUESTIONS_ROOM")}
 
 

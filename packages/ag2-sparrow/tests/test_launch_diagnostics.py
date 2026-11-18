@@ -15,6 +15,12 @@ import sys
 import tempfile
 
 
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 def _load(state_dir, supervised):
     os.environ["AGENT_CONNECT_STATE_DIR"] = str(state_dir)
     os.environ.setdefault("REMOTE_TASK_URL", "https://gw.example/relay")

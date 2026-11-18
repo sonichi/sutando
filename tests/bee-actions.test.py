@@ -15,6 +15,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ
+
+# bee_actions resolves GATEWAY_*/RELAY_* before the fixture's REMOTE_TASK_TOKEN: none may survive.
+isolate_os_environ()
+
 _SCRIPT = (Path(__file__).resolve().parent.parent
            / "skills" / "bee-actions" / "scripts" / "bee_actions.py")
 
@@ -176,7 +181,7 @@ class TestBeeActions(unittest.TestCase):
         e.update(env or {})
         buf = io.StringIO()
         with patch.object(sys, "argv", ["bee_actions.py", *argv]), \
-             patch.dict(os.environ, e), \
+             patch.dict(os.environ, hermetic_env(**e), clear=True), \
              patch.object(self.mod, "_room_state_path",
                           lambda: Path(self.tmpdir.name) / "bee-room.json"), \
              patch.object(sys, "stdout", buf):
@@ -192,6 +197,18 @@ class TestBeeActions(unittest.TestCase):
         self.assertEqual(c["auth"], "Bearer tok-gw")
         self.assertEqual(c["body"], {"op": "message", "room_id": "!bee:ag2.space",
                                      "body": "hello from sutando"})
+
+    def test_outer_gateway_selectors_never_reach_a_room_request(self):
+        outer = {"GATEWAY_TOKEN": "hermetic-sentinel-gateway", "RELAY_TOKEN": "hermetic-sentinel-relay",
+                 "GATEWAY_URL": f"{self.base}/hermetic-sentinel", "RELAY_URL": f"{self.base}/hermetic-sentinel"}
+        for verb in (("post-room", "hi"), ("register-room", "--invite", "@owner:ag2.space")):
+            with self.subTest(verb=verb[0]), patch.dict(os.environ, outer):
+                _Server.calls = []
+                rc, _out = self._run_room(*verb, env={"BEE_ROOM_ID": "!bee:ag2.space"})
+                self.assertEqual(rc, 0)
+                self.assertTrue(_Server.calls)
+                self.assertEqual({c["auth"] for c in _Server.calls}, {"Bearer tok-gw"})
+                self.assertFalse([c for c in _Server.calls if "hermetic-sentinel" in c["path"]])
 
     def test_post_room_auto_registers_dm_room_when_owner_known(self):
         # No room anywhere + BEE_ROOM_OWNER set -> op:create with the owner

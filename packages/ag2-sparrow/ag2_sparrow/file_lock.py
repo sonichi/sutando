@@ -37,6 +37,17 @@ def lock_fd(fd: int, *, blocking: bool = True) -> None:
             time.sleep(0.05)
 
 
+def try_lock_fd(fd: int) -> bool:
+    """Take the exclusive lock without waiting: True when acquired, False when another holder has it."""
+    try:
+        lock_fd(fd, blocking=False)
+        return True
+    except OSError as exc:
+        if isinstance(exc, BlockingIOError) or exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+            return False
+        raise
+
+
 def unlock_fd(fd: int) -> None:
     if fcntl is not None:
         fcntl.flock(fd, fcntl.LOCK_UN)

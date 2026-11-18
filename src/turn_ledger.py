@@ -105,6 +105,7 @@ from workspace_default import resolve_workspace, status_read_path, write_status 
 __all__ = [
     "LEDGER_NAME", "STOP_NAME", "ledger_path", "record_send", "record_no_send",
     "last_action_after", "delivery_after", "last_stop_ts", "mark_stop", "stop_gate",
+    "no_send_this_turn",
     "ROOM_ACTIONS_NAME", "room_actions_path",
 ]
 
@@ -499,6 +500,16 @@ def stop_gate(workspace: Path | str | None = None, session: str | None = None,
     return reason
 
 
+def no_send_this_turn(workspace: Path | str | None = None, session: str | None = None) -> bool:
+    """Whether this session recorded a no-send since its previous turn ended."""
+    session = _resolve_session(session)
+    ws = _workspace(workspace)
+    since = last_stop_ts(ws, session)
+    return since is not None and any(
+        e.get("kind") == "no-send" and _entry_matches_session(e, session) and float(e["ts"]) > since
+        for e in read_entries(ws))
+
+
 def _refusal(ws: Path, session: str | None) -> str | None:
     """`stop_gate`'s decision alone; it writes nothing."""
     # An absent ledger means nothing was ever sent, which is what this gate
@@ -528,7 +539,7 @@ def _refusal(ws: Path, session: str | None) -> str | None:
 def main(argv: list[str]) -> int:
     """`stop-gate [--commit]` (exit 1 + reason on stdout when the turn must not
     end; only `--commit` records the stop, so a hand run changes nothing),
-    `send KIND TARGET`, `no-send REASON`. `--workspace` pins the directory for a
+    `send KIND TARGET`, `no-send REASON`, `no-send-this-turn` (exit 0 yes, 1 no). `--workspace` pins the directory for a
     caller that already resolved it. `--session ID` overrides the session used
     to scope the reminder/boundary/ledger checks — mainly for tests simulating
     more than one session; ordinary callers need not pass it, since every
@@ -557,6 +568,8 @@ def main(argv: list[str]) -> int:
             print(reason)
             return 1
         return 0
+    if cmd == "no-send-this-turn":
+        return 0 if no_send_this_turn(ws, session) else 1
     if cmd == "send" and len(args) >= 3:
         record_send(args[1], args[2], ws, session)
         return 0
@@ -564,7 +577,7 @@ def main(argv: list[str]) -> int:
         record_no_send(" ".join(args[1:]), ws, session)
         return 0
     print(f"usage: {Path(__file__).name} [--workspace DIR] [--session ID] "
-          "turn-start | stop-gate [--commit] | send KIND TARGET | no-send REASON",
+          "turn-start | stop-gate [--commit] | send KIND TARGET | no-send REASON | no-send-this-turn",
           file=sys.stderr)
     return 2
 

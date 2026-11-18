@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cli_wedge
 import gateway_serving
 import pool_suspension
+import roster_membership
 import runtime_observation
 from util_paths import _host_label
 from workspace_default import resolve_workspace, status_read_path
@@ -49,7 +50,7 @@ GATEWAY_STALE_S = 180.0
 
 # Pane-derived claims a later completed model request disproves; every other reason stands.
 PANE_SUPERSEDABLE = frozenset({"needs-login", "login", "quota-limit", "out-of-credits", "session-limit",
-                               "api-error", "network-error"})
+                               "usage-limit", "api-error", "network-error"})
 
 # Observation phases with no model request in flight.
 RETRY_DISPROVING_PHASES = frozenset({"idle", "waiting", "failed"})
@@ -182,12 +183,17 @@ def _wedge_source(ws: Path, now: float) -> dict:
 
 def _has_result(ws: Path, tid: str) -> bool:
     """A result file is the task's last write, so its presence ends the task. Archivers move it
-    within seconds, flat or into a month folder: archive/[<YYYY-MM>/]<id>[-<ts>].txt."""
-    results = ws / "results"
+    within seconds, flat or into a month folder: archive/[<YYYY-MM>/]<id>[-<ts>].txt. A lane's result
+    archived before its worker switched folders is found in the other home's archives (`task_lookup`)."""
+    import task_lookup
+    from connections import task_home
+    results = task_home(tid, ws)["results"]
     if (results / f"{tid}.txt").exists():
         return True
     name = re.compile(re.escape(tid) + r"(?:-\d+)?\.txt")
-    return any(name.fullmatch(f.name) for f in (results / "archive").rglob(f"{tid}*.txt"))
+    if any(name.fullmatch(f.name) for f in (results / "archive").rglob(f"{tid}*.txt")):
+        return True
+    return task_lookup.find_other_archived_result(ws, tid) is not None
 
 
 def _activity_by_agent(ws: Path, now: float, worker_ids) -> dict:
@@ -338,10 +344,11 @@ def _workers(ws: Path):
         return []
     out = []
     for wid, row in sorted(rows.items()):
-        row = row if isinstance(row, dict) else {}
-        if row.get("state") == "retired":
+        if not roster_membership.is_member(row):
             continue
-        label = row.get("label")
+        row = row if isinstance(row, dict) else {}
+        # The name people see: the display label the pool applies, else the base label.
+        label = row.get("display_label") or row.get("label")
         out.append((wid, label if isinstance(label, str) and label != wid else None, row.get("state")))
     return out
 

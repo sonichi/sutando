@@ -2,9 +2,10 @@
 # One sender for lines typed into a core pane: session check, current-prompt
 # read, queued-input policy, literal send + Enter. tmux is a PATH shim.
 set -u
-HERE="$(cd "$(dirname "$0")/.." && pwd)"; T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+HERE="$(cd "$(dirname "$0")/.." && pwd)"; export TMUX_FAKE_UNWRAP="$HERE/tests/lib/tmux-fake-unwrap.sh"; T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin"; cat > "$T/bin/tmux" <<'SH'
 #!/usr/bin/env bash
+. "$TMUX_FAKE_UNWRAP"
 printf '%s\n' "$*" >> "$TMUX_LOG"
 case " $* " in *" has-session "*) [ -n "${TMUX_NO_SESSION:-}" ] && exit 1;; *" capture-pane "*) printf '%b' "${TMUX_PANE_TEXT:-────\n❯ \n────\n}";; esac
 exit 0
@@ -18,6 +19,7 @@ run(){ : > "$TMUX_LOG"; rm -f "$TMUX_LOG.n"; PATH="$T/bin:$PATH" $SEND "$@" > "$
 # --- shim leg (always runs): policy and failure paths through the PATH shim, which the resolver finds first
 cat > "$T/bin/tmux" <<'SH'
 #!/usr/bin/env bash
+. "$TMUX_FAKE_UNWRAP"
 printf '%s\n' "$*" >> "$TMUX_LOG"
 case " $* " in
   *" has-session "*) [ -n "${TMUX_NO_SESSION:-}" ] && exit 1;;
@@ -30,12 +32,17 @@ case " $* " in
     if [ "$n" -ge 2 ] && [ -n "${TMUX_PANE_TEXT_AFTER+x}" ]; then printf '%b' "$TMUX_PANE_TEXT_AFTER"
     else printf '%b' "${TMUX_PANE_TEXT:-────\n❯ \n────\n}"; fi ;;
   *" display-message "*) printf '%s\n' "${TMUX_PANE_WIDTH:-80}";;
-  *" send-keys "*) [ -n "${TMUX_SEND_DELAY:-}" ] && sleep "$TMUX_SEND_DELAY";;
+  *" send-keys "*" -l "*) [ -n "${TMUX_HANG_LITERAL:-}" ] && exec sleep 60;;
+  *" send-keys "*" Enter ") [ -n "${TMUX_HANG_ENTER:-}" ] && exec sleep 60;;
 esac
+case " $* " in *" send-keys "*) [ -n "${TMUX_SEND_DELAY:-}" ] && sleep "$TMUX_SEND_DELAY";; esac
 exit 0
 SH
 chmod +x "$T/bin/tmux"
 rc=$(run probe hello --socket "$T/s.sock"); [ "$rc" = 0 ] && grep -q -- "send-keys -t probe -l hello" "$TMUX_LOG" && grep -q -- "send-keys -t probe Enter" "$TMUX_LOG" && ok "S1 shim: clear prompt → literal line then Enter" || fail "S1" "rc=$rc $(cat "$TMUX_LOG")"
+# A claimed send that times out may have applied: its 125 reaches the caller, never a plain 1.
+rc=$(TMUX_HANG_LITERAL=1 run probe hello --socket "$T/u1.sock"); [ "$rc" = 125 ] && ! grep -q -- "send-keys -t probe Enter" "$TMUX_LOG" && ok "S11 uncertain literal → 125, no Enter" || fail "S11" "rc=$rc $(cat "$T/err")"
+rc=$(TMUX_HANG_ENTER=1 run probe hello --socket "$T/u2.sock"); [ "$rc" = 125 ] && ok "S12 uncertain Enter → 125" || fail "S12" "rc=$rc $(cat "$T/err")"
 rc=$(TMUX_PANE_TEXT='❯ half typed\n' run probe x --socket "$T/s.sock" --refuse-if-pending); [ "$rc" = 5 ] && ! grep -q send-keys "$TMUX_LOG" && ok "S2 shim: pending text → 5, nothing sent" || fail "S2" "rc=$rc"
 rc=$(TMUX_PANE_TEXT='❯ watcher\n' run probe watcher --socket "$T/s.sock" --skip-if-queued watcher); [ "$rc" = 6 ] && ! grep -q send-keys "$TMUX_LOG" && ok "S3 shim: queued word → 6" || fail "S3" "rc=$rc"
 rc=$(TMUX_NO_SESSION=1 run probe x --socket "$T/s.sock"); [ "$rc" = 3 ] && ok "S4 shim: no session → 3" || fail "S4" "rc=$rc"
@@ -70,7 +77,8 @@ cat > "$T/bin/sleep" <<'SH'
 printf 'sleep %s\n' "$*" >> "$TMUX_LOG"
 SH
 chmod +x "$T/bin/sleep"
-seq(){ grep -E '^sleep |send-keys' "$TMUX_LOG" | sed -E 's/^-S [^ ]+ //' | tr '\n' '|'; }
+# Exclude bounded-wait's polls so the log measures the sender's Enter delay.
+seq(){ grep -E '^sleep |send-keys' "$TMUX_LOG" | grep -Ev '^sleep 0\.(01|02|04|05)$' | sed -E 's/^-S [^ ]+ //' | tr '\n' '|'; }
 rc=$(TMUX_PANE_TEXT_AFTER='› hello\n' run probe hello --socket "$T/s.sock" --runtime codex); SEQ="$(seq)"
 [ "$rc" = 0 ] && [ "$SEQ" = "send-keys -t probe -l hello|sleep 0.25|send-keys -t probe Enter|" ] && ok "C7 codex: literal line, sleep 0.25, then Enter (an Enter inside Codex's 120ms paste-burst window reads as a newline)" || fail "C7 codex enter delay" "rc=$rc seq=$SEQ"
 
@@ -147,8 +155,9 @@ if command -v tmux >/dev/null 2>&1 && [ "$(command -v tmux)" != "$T/bin/tmux" ];
     rm -f "$T/trig" "$T/rc"
     tmux -S "$SOCKW" new-session -d -s probe "printf '\033[1m\xe2\x80\xba\033[0m \033[2mAsk Codex to do anything\033[0m'; while [ ! -f $T/trig ]; do sleep 0.02; done; printf '$1'; sleep 30"
     ( bash "$HERE/scripts/tmux-send-line.sh" probe hello --socket "$SOCKW" --runtime codex --refuse-if-pending > "$T/out" 2> "$T/err"; echo $? > "$T/rc" ) &
-    local sp=$! i; STAGED=0
-    for i in $(seq 1 250); do
+    local sp=$! end=$((SECONDS + 30)); STAGED=0
+    # A wall-clock bound: on a loaded runner the bounded, locked send can take seconds to stage.
+    while [ "$SECONDS" -lt "$end" ]; do
       tmux -S "$SOCKW" capture-pane -p -t probe 2>/dev/null | grep -q hello && { STAGED=1; break; }
       sleep 0.02
     done

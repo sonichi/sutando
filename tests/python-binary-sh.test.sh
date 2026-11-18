@@ -329,10 +329,11 @@ fi
 # instead of reading it. The block is lifted out of start_gateway_lanes() in
 # src/startup-runtime.sh at test time (moved out of startup.sh's inline body
 # so it can also run standalone via scripts/restart-gateway-lanes.sh) rather
-# than copied here, so the test cannot drift from the source it pins.
-gw_block=$(awk '/for _gw_var in /{f=1} f{print} f&&/^[[:space:]]*done[[:space:]]*$/{exit}' "$REPO/src/startup-runtime.sh")
+# than copied here, so the test cannot drift from the source it pins. The block
+# runs from its marker comment to the `fi` closing its `[ -n "$PY" ]` guard.
+gw_block=$(awk '/# Named gateways \(multi-gateway\)/,/^    fi$/' "$REPO/src/startup-runtime.sh")
 if [ -z "$gw_block" ]; then
-  bad "named-gateway loop is extractable from startup-runtime.sh" "no 'for _gw_var in' block found"
+  bad "named-gateway block is extractable from startup-runtime.sh" "no '# Named gateways (multi-gateway)' block found"
 else
   gw_out=$(env -i PATH="/usr/bin:/bin" AG2_REMOTE_TOKEN_DEV=tok-dev \
     bash -c 'PY=""; REPO="'"$REPO"'"; LOGS_DIR="$(mktemp -d)"

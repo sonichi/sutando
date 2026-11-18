@@ -7,6 +7,12 @@ the warn to restore `PreCompact -> session-handoff.sh`. These tests pin the
 repair, and pin that it stays keyed on a structured field rather than on the
 warn's prose.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os

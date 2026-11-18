@@ -23,8 +23,8 @@ supplies the results directory.
 from __future__ import annotations
 
 import ctypes
-import ctypes.util
 import errno
+import hashlib
 import os
 import re
 import sys
@@ -65,7 +65,7 @@ def report_once(key: str, log: Log, line: str) -> None:
 
 def _probe_rename() -> "tuple[str, Optional[Callable[[bytes, bytes], int]]]":
     try:
-        libc = ctypes.CDLL(ctypes.util.find_library("c") or None, use_errno=True)
+        libc = ctypes.CDLL(None, use_errno=True)  # find_library("c") spawns ldconfig on Linux
     except OSError:  # pragma: no cover - no libc to speak of
         return "none", None
     if sys.platform == "darwin" and hasattr(libc, "renamex_np"):  # pragma: no cover - Linux CI
@@ -170,10 +170,22 @@ def place(src: Path, results_dir: Path, stem: str,
                     (quarantine_name(stem, n + i) for i in range(_PLACE_TRIES)), move)
 
 
+def _stem(item_id: str) -> str:
+    """A bare task id names `task-<id>`; a task or proactive stem names itself."""
+    item_id = str(item_id)
+    return item_id if item_id.startswith(("task-", "proactive-")) else f"task-{item_id}"
+
+
 def canonical_result(results_dir: Path, task_id: str) -> Path:
     """The drain's live name for one task's result."""
-    stem = f"task-{task_id}" if not str(task_id).startswith("task-") else str(task_id)
-    return Path(results_dir) / f"{stem}.txt"
+    return Path(results_dir) / f"{_stem(task_id)}.txt"
+
+
+def sha256_of(path: Path) -> Optional[str]:
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
 def find_quarantined(results_dir: Path, task_id: str) -> list[Path]:
@@ -185,7 +197,7 @@ def find_quarantined(results_dir: Path, task_id: str) -> list[Path]:
     d = quarantine_dir(results_dir)
     if not d.is_dir():
         return []
-    stem = f"task-{task_id}" if not str(task_id).startswith("task-") else str(task_id)
+    stem = _stem(task_id)
     out = []
     for p in d.glob("*.txt"):
         m = _QUARANTINED.match(p.name)
@@ -206,14 +218,19 @@ class RestoreOutcome(str, Enum):
     NO_SAFE_MOVE = "no-safe-move"
 
 
-def restore(results_dir: Path, task_id: str) -> "tuple[RestoreOutcome, Optional[Path]]":
+def restore(results_dir: Path, task_id: str,
+            body_sha256: Optional[str] = None) -> "tuple[RestoreOutcome, Optional[Path]]":
     """Guarantee (out of the quarantine): the NEWEST quarantined body is
     installed at the drain's canonical name, or it stays quarantined and the
     outcome says why. A live result is never overwritten (a newer reply waiting
     to go is the one the user should get), and the body never loses its last
     name: nothing a producer can retake is unlinked.
     """
+    if body_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", body_sha256):
+        raise ValueError("body_sha256 must be a 64-character hex digest; an empty one would match any copy")
     found = find_quarantined(results_dir, task_id)
+    if body_sha256:
+        found = [p for p in found if sha256_of(p) == body_sha256]  # one generation, never another
     if not found:
         return RestoreOutcome.NOTHING_QUARANTINED, None
     target = canonical_result(results_dir, task_id)

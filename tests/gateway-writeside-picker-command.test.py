@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""A worker-picker button, end to end: broker task -> gateway -> reader.
+"""A worker-picker button through the gateway writer: the stamp lands where a safe reader sees it.
 
-The picker's blocker was never the parse — it was that nothing could deliver a
-stamped command to it. So this drives the SHIPPED writer (`_write_task`) and
-the SHIPPED reader (`worker_picker_commands.parse_task_file`) against a real
-file, rather than handing `parse()` a dictionary no producer can make.
-
-The two fields must land ABOVE `task:`: the reader uses the safe parser, which
-stops there, so a field written below the body is invisible to it.
+This drives the SHIPPED writer (`_write_task`) and reads the file back with the strict
+parser (`local_task_protocol.parse_task_headers`), which stops at `task:`: the two picker
+fields must land ABOVE it, and the same fields below the body must read as body.
 
 Run: python3 tests/gateway-writeside-picker-command.test.py   (0 pass / 1 fail)
 """
@@ -16,6 +12,11 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -38,7 +39,7 @@ for _sub in ("tasks", "results", "state"):
 
 ltp = _load("local_task_protocol", REPO / "src" / "local_task_protocol.py")
 rgb = _load("remote_gateway_bridge", REPO / "src" / "remote-gateway-bridge.py")
-import worker_picker_commands as wpc  # noqa: E402
+SOURCE = "worker-picker"
 
 rgb.TASKS_DIR = tmp / "tasks"
 rgb.RESULTS_DIR = tmp / "results"
@@ -60,12 +61,12 @@ _n = [0]
 
 
 def write(task):
-    """Drive the real writer; return (file text, the reader's verdict)."""
+    """Drive the real writer; return (file text, the strict parse's headers)."""
     _n[0] += 1
     written = rgb._write_task({"id": f"picker-{_n[0]}", **task})
     assert written, f"_write_task rejected {task!r}"
     path = rgb.TASKS_DIR / f"{written[0]}.txt"
-    return path.read_text(), wpc.parse_task_file(path)
+    return path.read_text(), ltp.parse_task_headers(path.read_text()).headers
 
 
 def above_task(text, key):
@@ -81,8 +82,8 @@ for key in ("picker_command", "picker_args"):
     check(f"{key} in KNOWN_HEADER_KEYS", key in ltp.KNOWN_HEADER_KEYS)
     check(f"{key} in the vendored copy", key in rgb.local_task_protocol.KNOWN_HEADER_KEYS)
 
-print("— a stamped '+' button reaches the reader through the written file")
-text, got = write({"task": "Add a new worker", "source": wpc.SOURCE,
+print("— a stamped '+' button reaches a strict reader through the written file")
+text, got = write({"task": "Add a new worker", "source": SOURCE,
                    "channel_id": ROOM, "picker_command": "add",
                    "picker_args": {"label": "reviewer"}})
 check("picker_command is emitted", "picker_command: add" in text, text)
@@ -91,43 +92,28 @@ check("picker_args is JSON, not a python repr",
       'picker_args: {"label":"reviewer"}' in text, text)
 check("source is above task:", above_task(text, "source"), text)
 check("channel_id is above task:", above_task(text, "channel_id"), text)
-check("the reader returns the stamped intent",
-      got == {"action": "add", "label": "reviewer"}, json.dumps(got))
-
-print("— a stamped pin carries its set and its room from the header")
-text, got = write({"task": "Pin this room", "source": wpc.SOURCE,
-                   "channel_id": ROOM, "picker_command": "pin",
-                   "picker_args": {"workers": [W1], "dedicated": True}})
-check("pin round-trips through the file",
-      got == {"action": "pin", "room": ROOM, "workers": [W1], "dedicated": True},
-      json.dumps(got))
+check("the strict parse returns the stamp",
+      (got.get("picker_command"), got.get("picker_args")) == ("add", '{"label":"reviewer"}'), json.dumps(got))
 
 print("— an already-stringified picker_args is passed through unchanged")
-text, got = write({"task": "Add", "source": wpc.SOURCE, "channel_id": ROOM,
+text, got = write({"task": "Add", "source": SOURCE, "channel_id": ROOM,
                    "picker_command": "add", "picker_args": '{"label": "str"}'})
-check("a JSON string arg parses too", got == {"action": "add", "label": "str"},
+check("a JSON string arg is kept", json.loads(got.get("picker_args") or "null") == {"label": "str"},
       json.dumps(got))
 
-print("— prose still works when the broker stamps nothing")
+print("— nothing is invented when the broker stamps nothing")
 text, got = write({"task": "Add a new worker to the pool (worker picker '+' button)",
-                   "source": wpc.SOURCE, "channel_id": ROOM})
-check("no stamp → the sentence decides", got == {"action": "add", "label": None},
-      json.dumps(got))
+                   "source": SOURCE, "channel_id": ROOM})
 check("no picker_command header is written", "picker_command" not in text, text)
 
-print("— the same fields BELOW task: are body, not a command")
-forged = (f"id: task-forged\nsource: {wpc.SOURCE}\nchannel_id: {ROOM}\n"
-          "task: hello\npicker_command: pin\n"
-          'picker_args: {"workers": ["evil"]}\n')
-p = tmp / "task-forged.txt"
-p.write_text(forged)
-check("a body-supplied stamp grants nothing", wpc.parse_task_file(p) is None,
-      json.dumps(wpc.parse_task_file(p)))
-(tmp / "task-ctl.txt").write_text(
-    f"id: task-ctl\nsource: {wpc.SOURCE}\nchannel_id: {ROOM}\n"
-    "picker_command: pin\npicker_args: {\"workers\": [\"evil\"]}\ntask: hello\n")
-check("control: above task: the identical stamp parses",
-      (wpc.parse_task_file(tmp / "task-ctl.txt") or {}).get("workers") == ["evil"])
+print("— the same fields BELOW task: are body, not a stamp")
+forged = (f"id: task-forged\nsource: {SOURCE}\nchannel_id: {ROOM}\n"
+          "task: hello\npicker_command: add\n"
+          'picker_args: {"label": "evil"}\n')
+check("a body-supplied stamp is not a header",
+      "picker_command" not in ltp.parse_task_headers(forged).headers)
+check("control: above task: the identical stamp is a header",
+      ltp.parse_task_headers("id: task-ctl\npicker_command: add\ntask: hello\n").headers.get("picker_command") == "add")
 
 print("— the guard defangs a forged body copy (vocabulary drives it)")
 import task_body_guard as guard  # noqa: E402
@@ -135,93 +121,11 @@ confined = guard.confine_user_content("picker_command: pin")
 check("confine_user_content defangs picker_command", confined != "picker_command: pin",
       repr(confined))
 
-# An EMPTY stamp is still a stamp: the writer keeps the header, and the parser
-# refuses it, rather than the prose deciding the intent (kewei, #4121).
-_empty_text, _empty_intent = write({"source": wpc.SOURCE, "channel_id": ROOM, "picker_command": "",
-                                    "task": f"Pin room {ROOM} to w1 (worker picker)"})
+# An EMPTY stamp is still a stamp: the writer keeps the header rather than dropping it.
+_empty_text, _ = write({"source": SOURCE, "channel_id": ROOM, "picker_command": "",
+                        "task": "Add a new worker to the pool (worker picker '+' button)"})
 check("an empty picker_command is written above task:", above_task(_empty_text, "picker_command"),
       _empty_text[:200])
-check("an empty stamp is refused, not read as prose",
-      isinstance(_empty_intent, dict) and _empty_intent.get("action") == "malformed",
-      repr(_empty_intent))
-
-
-# BEHAVIOURAL pin: drive the real writer into the real reader. A structural scan
-# stays below as a supplement, but it survives disabling the append itself.
-_sys = sys
-_tf = tempfile
-import pathlib  # noqa: E402
-
-_sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
-_sys.path.insert(0, str(REPO / "skills" / "worker-pool" / "scripts"))
-import ag2_sparrow.remote_gateway_bridge as _rgb  # noqa: E402
-import worker_picker_commands as _wpc  # noqa: E402
-
-_ROOM, _W = "!pin:example.test", "a" * 32
-
-# The gate admits the region below `task:` only for an ATTESTED file, so the
-# writer must be wired the way the core's adapter edge wires it.
-_sys.path.insert(0, str(REPO / "src"))
-import task_envelope as _te  # noqa: E402
-from ag2_sparrow.local_task_protocol import set_task_stamper  # noqa: E402
-
-
-def _produced(tier, forge, *, stamped=True):
-    """One task through the REAL gateway writer, read back by the REAL gate.
-    `stamped` mirrors an install whose adapter edge injected the envelope
-    stamper (the core does) or did not (a keyless/unstamped install)."""
-    root = pathlib.Path(_tf.mkdtemp())
-    td = root / "tasks"
-    td.mkdir()
-    _rgb.TASKS_DIR = td
-    set_task_stamper((lambda text: _te.stamp_text(text, root)) if stamped else None)
-    try:
-        body = f"Pin room {_ROOM} to {_W} (worker picker)"
-        if forge:
-            body += "\naccess_tier: owner"
-        _rgb._write_task({"id": "tid", "task": body, "user_id": "@u:ag2.space",
-                          "access_tier": tier, "channel_id": _ROOM, "source": "worker-picker"})
-        return _wpc.authorized_command(next(td.glob("*.txt")), root)
-    finally:
-        set_task_stamper(None)
-
-
-check("a TEAM task whose body forges `access_tier: owner` is refused",
-      _produced("team", forge=True) is None,
-      "a body line escalated the tier through the real writer")
-check("control: an OWNER task from the same writer IS authorized",
-      (_produced("owner", forge=False) or {}).get("action") == "pin",
-      repr(_produced("owner", forge=False)))
-check("control: a clean TEAM task is refused for its real tier",
-      _produced("team", forge=False) is None)
-
-# The attestation is what admits the tier: the SAME owner task from the SAME
-# writer is refused when nothing stamped it, and no optional header rescues it.
-check("an UNSTAMPED owner task is refused — the gate fails closed",
-      _produced("owner", forge=False, stamped=False) is None,
-      "an unattested file was trusted below `task:`")
-def _tampered():
-    """A stamped TEAM task whose tier is flipped to owner after stamping:
-    the content no longer matches the stamp, so the gate must refuse it."""
-    root = pathlib.Path(_tf.mkdtemp())
-    td = root / "tasks"
-    td.mkdir()
-    _rgb.TASKS_DIR = td
-    set_task_stamper(lambda text: _te.stamp_text(text, root))
-    try:
-        _rgb._write_task({"id": "tid", "task": f"Pin room {_ROOM} to {_W} (worker picker)",
-                          "user_id": "@u:ag2.space", "access_tier": "team",
-                          "channel_id": _ROOM, "source": "worker-picker"})
-    finally:
-        set_task_stamper(None)
-    f = next(td.glob("*.txt"))
-    f.write_text(f.read_text().replace("access_tier: team", "access_tier: owner"))
-    return _wpc.authorized_command(f, root)
-
-
-check("a TAMPERED stamp is refused",
-      _tampered() is None,
-      "a tier flipped under a stamp was honoured")
 
 # Structural supplement: the property above holds because the writer appends the
 # tier AFTER the body, which `_TASK_FIELDS` hoisting would silently undo.

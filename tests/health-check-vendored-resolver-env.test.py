@@ -5,6 +5,12 @@ Non-executing: a subprocess is failure isolation, not a security boundary, so a
 checked-out copy must never be imported. Fail-honest: an unmeasurable copy reads
 `unknown`, never as one of the clean ones.
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import tempfile
 import unittest

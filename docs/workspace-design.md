@@ -19,6 +19,8 @@ Through 2026-05-18 a workspace-vs-repo bug class surfaced ~28 sites across Pytho
 
 That's it. Two top-level spaces. Sync is configured per-sub-path inside Workspace, not by having a separate "synced" container.
 
+**One deliberate exception, for locks only.** `src/holder_lock.py` (and its bundled copy in `ag2-sparrow`) keeps its lock files in a host-local, per-uid, never-synced runtime directory: `<home of the effective uid>/.local/state/ag2-sparrow/locks/<hash of the work root directory's device and inode>/`. It is outside both spaces on purpose: a lock must resolve to one place for every launch context of a user and must never be synced or mirrored. It holds only `lock`, `holder` and `waiting.<pid>` files, and it is not a third state container for anything else.
+
 ## Quick decision: which space?
 
 When adding code that reads or writes a file, ask: **does it ship with every install (same on every clone)?**

@@ -15,6 +15,12 @@ not a read-side refactor.
 
 Run: python3 tests/discord-task-source-invariance.test.py
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import sys
 from pathlib import Path

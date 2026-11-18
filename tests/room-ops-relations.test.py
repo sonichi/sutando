@@ -19,6 +19,11 @@ import sys
 import unittest
 from unittest import mock
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 _ROOM_OPS = pathlib.Path(__file__).resolve().parents[1] / "skills" / "agent-room-ops"
 sys.path.insert(0, str(_ROOM_OPS))
 import mention as mn, relations as rl, room_ops, say as sy  # noqa: E401,E402

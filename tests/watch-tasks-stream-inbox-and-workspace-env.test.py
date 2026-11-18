@@ -24,6 +24,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -48,11 +50,11 @@ def _run_watcher(root: Path, env: dict, ready, inbox: str, timeout: float = 8.0)
     """Run the watcher until `ready()` or the deadline. It is a process GROUP
     (bash, fswatch, a sleep loop); killing the leader alone leaves children.
     `inbox` is the --inbox tag: the same directory the env resolves to."""
-    p = subprocess.Popen(
+    p = popen_bound(
         ["bash", str(root / "src" / "watch-tasks-stream.sh"),
          "--role", "standby", "--inbox", inbox],
         cwd=str(root), env=env,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
         deadline = time.time() + timeout

@@ -7,6 +7,12 @@ by construction, however far the trunk moved).
 
 Run: python3 tests/live-tree-drift-reference.test.py
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import subprocess
 import sys

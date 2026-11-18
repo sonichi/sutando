@@ -268,6 +268,135 @@ if '"remedy_timer"' in body:
 else:
     fail("spawn() does not report the timer outcome")
 
+# --- the Stop setting rides the job, so a relaunched worker keeps it ---------
+STOP = "SUTANDO_STOP_INTERRUPT"
+
+
+def with_stop(value, fn):
+    """Run fn with the launcher's Stop setting as `value` (None: unset)."""
+    saved = os.environ.pop(STOP, None)
+    try:
+        if value is not None:
+            os.environ[STOP] = value
+        return fn()
+    finally:
+        os.environ.pop(STOP, None)
+        if saved is not None:
+            os.environ[STOP] = saved
+
+
+def saved_stop(la):
+    plist = next(la.glob("com.sutando.pool-remedy.*.plist"))
+    with open(plist, "rb") as fh:
+        return (plistlib.load(fh).get("EnvironmentVariables") or {}).get(STOP)
+
+
+def host(installed_with):
+    """A host whose timer was installed (and loaded) with `installed_with` as the setting."""
+    tmp = tempfile.mkdtemp()
+    la = Path(tmp) / "LaunchAgents"
+    la.mkdir()
+    lc = Launchctl()
+    with_stop(installed_with, lambda: sw.prt.install(tmp, str(REPO), launch_agents=la, runner=lc,
+                                                     sleep=lambda *_: None))
+    return tmp, la, lc
+
+
+def ensure(tmp, la, lc, spawner):
+    lc.argv.clear()
+    return with_stop(spawner, lambda: sw.ensure_remedy_timer(tmp, str(REPO), runner=lc, launch_agents=la))
+
+
+if HAVE_HELPER:
+    for installed_with, spawner, want_saved, want_reinstall, what in (
+            ("1", "1", "1", False, "default on: saved, and left alone"),
+            ("0", "0", "0", False, "opt-out \"0\": saved, and left alone"),
+            (None, "1", "1", True, "a timer from before the setting is reinstalled once with it"),
+            ("1", "0", "0", True, "a changed setting reinstalls with the new value"),
+            ("1", None, "1", False, "a spawner without the setting keeps the saved value"),
+            ("0", None, "0", False, "a spawner without the setting keeps a saved opt-out"),
+            (None, None, None, False, "from source, with no setting anywhere: unchanged")):
+        tmp, la, lc = host(installed_with)
+        out = ensure(tmp, la, lc, spawner)
+        reinstalled = bool(lc.ran("bootstrap"))
+        if saved_stop(la) == want_saved and reinstalled == want_reinstall:
+            ok(what)
+        else:
+            fail(f"{what}: saved {saved_stop(la)!r}, reinstalled {reinstalled}: {out}")
+        again = ensure(tmp, la, lc, spawner)
+        if again.get("why") == "already installed" and not lc.ran("bootstrap"):
+            ok(f"{what}: the next spawn leaves it alone (no reinstall loop)")
+        else:
+            fail(f"{what}: reinstalled again on the next spawn: {again}")
+    tmp, la, lc = host("0")
+    with_stop(None, lambda: sw.prt.install(tmp, str(REPO), launch_agents=la, runner=lc, sleep=lambda *_: None))
+    if saved_stop(la) == "0":
+        ok("an explicit install without the setting keeps the saved opt-out")
+    else:
+        fail(f"an explicit install wiped the saved opt-out: {saved_stop(la)!r}")
+    job = with_stop("", lambda: sw.prt.render(tmp, REPO))
+    if STOP not in job["EnvironmentVariables"]:
+        ok("an empty setting is unset, not saved")
+    else:
+        fail(f"an empty setting was saved: {job['EnvironmentVariables']}")
+
+# --- the worker standby's alert settings ride the job too ---------------------
+KNOBS = ("SUTANDO_NOTIFIER_ALERT_GRACE", "SUTANDO_NOTIFIER_ALERT_REPEAT", "SUTANDO_NOTIFIER_ALERT_PILEUP")
+
+
+def with_knobs(values, fn):
+    """Run fn with the alert settings as `values` (a dict; the rest unset)."""
+    saved = {k: os.environ.pop(k) for k in KNOBS if k in os.environ}
+    try:
+        os.environ.update(values)
+        return fn()
+    finally:
+        for k in KNOBS:
+            os.environ.pop(k, None)
+        os.environ.update(saved)
+
+
+def saved_knobs(la):
+    plist = next(la.glob("com.sutando.pool-remedy.*.plist"))
+    with open(plist, "rb") as fh:
+        env = plistlib.load(fh).get("EnvironmentVariables") or {}
+    return {k: env[k] for k in KNOBS if k in env}
+
+
+if HAVE_HELPER:
+    custom = {"SUTANDO_NOTIFIER_ALERT_GRACE": "60", "SUTANDO_NOTIFIER_ALERT_PILEUP": "0"}
+    for installed_with, spawner, want_saved, want_reinstall, what in (
+            (custom, custom, custom, False, "alert settings: saved, and left alone"),
+            ({}, custom, custom, True, "a timer without the alert settings is reinstalled once with them"),
+            (custom, {"SUTANDO_NOTIFIER_ALERT_PILEUP": "5"}, {**custom, "SUTANDO_NOTIFIER_ALERT_PILEUP": "5"}, True,
+             "a changed alert setting reinstalls with the new value and keeps the others"),
+            (custom, {}, custom, False, "a spawner without the alert settings keeps the saved ones")):
+        tmp = tempfile.mkdtemp()
+        la = Path(tmp) / "LaunchAgents"
+        la.mkdir()
+        lc = Launchctl()
+        with_knobs(installed_with, lambda: sw.prt.install(tmp, str(REPO), launch_agents=la, runner=lc,
+                                                          sleep=lambda *_: None))
+        lc.argv.clear()
+        out = with_knobs(spawner, lambda: sw.ensure_remedy_timer(tmp, str(REPO), runner=lc, launch_agents=la))
+        reinstalled = bool(lc.ran("bootstrap"))
+        if saved_knobs(la) == want_saved and reinstalled == want_reinstall:
+            ok(what)
+        else:
+            fail(f"{what}: saved {saved_knobs(la)!r}, reinstalled {reinstalled}: {out}")
+        lc.argv.clear()
+        again = with_knobs(spawner, lambda: sw.ensure_remedy_timer(tmp, str(REPO), runner=lc, launch_agents=la))
+        if again.get("why") == "already installed" and not lc.ran("bootstrap"):
+            ok(f"{what}: the next spawn leaves it alone (no reinstall loop)")
+        else:
+            fail(f"{what}: reinstalled again on the next spawn: {again}")
+    job = with_knobs({"SUTANDO_NOTIFIER_ALERT_GRACE": ""}, lambda: sw.prt.render(tempfile.mkdtemp(), REPO,
+                     alert_knobs=sw.prt.alert_knob_settings()))
+    if not any(k in job["EnvironmentVariables"] for k in KNOBS):
+        ok("an empty alert setting is unset, not saved")
+    else:
+        fail(f"an empty alert setting was saved: {job['EnvironmentVariables']}")
+
 if fails:
     print(f"pool-remedy-timer-ensured-on-spawn: {fails} failure(s)")
     sys.exit(1)

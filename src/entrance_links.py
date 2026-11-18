@@ -14,11 +14,17 @@ import hashlib
 import json
 import os
 import secrets
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
 from file_lock import lock_fd, unlock_fd
+
+_PKG_ROOT = str(Path(__file__).resolve().parent.parent / "packages" / "ag2-sparrow")  # lint-workspace-resolution: allow-repo-root — locates the CODE package
+if _PKG_ROOT not in sys.path:
+    sys.path.append(_PKG_ROOT)
+from ag2_sparrow import agent_identity  # noqa: E402
 
 LINKS_FILE = "entrance-links.json"
 
@@ -88,18 +94,16 @@ def credential_fingerprint(token: str) -> str:
     return "sha256:" + hashlib.sha256(token.encode()).hexdigest()[:16]
 
 
-def _enrolled_stand_id(state_dir: str | Path) -> "str | None":
-    try:
-        rec = json.loads((Path(state_dir) / "auth" / "ag2space.json").read_text())
-        return (rec.get("agent_id") or "").strip() or None
-    except (OSError, ValueError):
-        return None
+def enrolled_stand_id(state_dir: str | Path, environ=None) -> "str | None":
+    """The Stand this install is: the agent the gateway's own records name, None when they are
+    absent or disagree (agent_identity.host_enrolled)."""
+    return agent_identity.host_enrolled(state_dir, environ) or None
 
 
 def require_resolved_identity(state_dir: str | Path) -> str:
     """Identity mutations fail closed: an unresolved (placeholder) identity
     may read and diagnose but never create or change a binding."""
-    sid = _enrolled_stand_id(state_dir)
+    sid = enrolled_stand_id(state_dir)
     if not sid:
         raise PermissionError(
             "identity not resolved (no enrolled record) — binding mutations "

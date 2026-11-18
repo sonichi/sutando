@@ -7,6 +7,11 @@ Run: python3 tests/health-check-claude-task-notifier.test.py
 """
 from __future__ import annotations
 
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os
@@ -30,13 +35,16 @@ CODEX_NOTIFIER = REPO / "src" / "agent" / "codex" / "cli" / "task-notifier.sh"
 
 class FakeTmux:
     def __init__(self, *, core_exists: bool = True, panes=None,
-                 notifier_script: "str | None" = None, core_runtime: "str | None" = "claude") -> None:
+                 notifier_script: "str | None" = None, core_runtime: "str | None" = "claude",
+                 standby_mode: "str | None" = None) -> None:
         self.core_exists = core_exists
         self.panes = panes
         # What `show-environment` reports for SUTANDO_NOTIFIER_SCRIPT (None = unset).
         self.notifier_script = notifier_script
         # What the core session records as SUTANDO_CORE_RUNTIME (None = unset).
         self.core_runtime = core_runtime
+        # What the supervisor session records as SUTANDO_STANDBY_MODE (None = unset).
+        self.standby_mode = standby_mode
         self.calls = []
 
     @staticmethod
@@ -58,6 +66,10 @@ class FakeTmux:
             if self.core_runtime is None:
                 return self._result(args, 1, "-SUTANDO_CORE_RUNTIME\n")
             return self._result(args, 0, f"SUTANDO_CORE_RUNTIME={self.core_runtime}\n")
+        if args and args[0] == "show-environment" and args[-1] == "SUTANDO_STANDBY_MODE":
+            if self.standby_mode is None:
+                return self._result(args, 1, "-SUTANDO_STANDBY_MODE\n")
+            return self._result(args, 0, f"SUTANDO_STANDBY_MODE={self.standby_mode}\n")
         if args and args[0] == "show-environment":
             if self.notifier_script is None:
                 return self._result(args, 1, "-SUTANDO_NOTIFIER_SCRIPT\n")
@@ -163,6 +175,73 @@ class ClaudeTaskNotifierHealthTests(unittest.TestCase):
             result = hc.check_claude_task_notifier()
         self.assertEqual(result["status"], "ok", result)
         self.assertIn("sutando-core-watcher", result["detail"])
+
+    def _mod_seat(self, verdict):
+        self.write_local_core()
+        tmux = FakeTmux(panes=[("0", f"bash {shlex.quote(str(SUPERVISOR))}")],
+                        notifier_script=str(CLAUDE_NOTIFIER), standby_mode="alert")
+        asked = []
+
+        def role_present(role, inbox, **kw):
+            asked.append((role, inbox, kw))
+            return verdict
+        with mock.patch.object(hc, "_run_tmux", side_effect=tmux), \
+             mock.patch.object(hc.watcher_identity, "role_present", side_effect=role_present):
+            return hc.check_claude_task_notifier(), asked
+
+    def test_a_mod_seat_with_a_ready_session_watcher_is_ok(self):
+        result, asked = self._mod_seat(True)
+        self.assertEqual(result["status"], "ok", result)
+        self.assertIn("alert-only", result["detail"])
+        self.assertEqual(asked, [("session", str(self.workspace / "tasks"),
+                                  {"ready": True, "state_dir": str(self.state)})])
+
+    def test_a_mod_seat_without_a_ready_session_watcher_warns_without_monitor_advice(self):
+        for verdict in (False, None):
+            result, _ = self._mod_seat(verdict)
+            self.assertEqual(result["status"], "warn", (verdict, result))
+            self.assertTrue(result.get("mod_watcher_absent"))
+            self.assertIn("task-watch Mod", result["detail"])
+            self.assertNotIn("Monitor", result["detail"])
+
+    def test_a_mod_seat_warning_counts_the_waiting_tasks_and_names_no_path(self):
+        tasks = self.workspace / "tasks"
+        tasks.mkdir()
+        for i in (1, 2, 3):
+            (tasks / f"task-{i}.txt").write_text(f"id: task-{i}\ntask: x\n")
+        (tasks / "task-cron-9.txt").write_text("task: bookkeeping\n")
+        result, _ = self._mod_seat(False)
+        self.assertIn("3 tasks are waiting", result["detail"])
+        for leak in (str(self.workspace), "/tasks", "sutando-core", "/tmp/"):
+            self.assertNotIn(leak, result["detail"])
+        ok, _ = self._mod_seat(True)
+        self.assertNotIn(str(self.workspace), ok["detail"])
+
+    def test_a_mod_seat_warning_says_so_when_the_queue_cannot_be_counted(self):
+        with mock.patch("task_queue.pending_files", side_effect=PermissionError("denied")):
+            result, _ = self._mod_seat(False)
+        self.assertIn("an unknown number of tasks are waiting", result["detail"])
+
+    def test_a_typing_seat_is_judged_by_the_supervisor_alone(self):
+        self.write_local_core()
+        tmux = FakeTmux(panes=[("0", f"bash {shlex.quote(str(SUPERVISOR))}")],
+                        notifier_script=str(CLAUDE_NOTIFIER), standby_mode="type")
+        with mock.patch.object(hc, "_run_tmux", side_effect=tmux), \
+             mock.patch.object(hc.watcher_identity, "role_present", side_effect=AssertionError("asked")):
+            result = hc.check_claude_task_notifier()
+        self.assertEqual(result["status"], "ok", result)
+
+    def test_fix_leaves_a_mod_seat_missing_its_watcher_alone(self):
+        self.write_local_core()
+        tmux = FakeTmux(panes=[("0", f"bash {shlex.quote(str(SUPERVISOR))}")],
+                        notifier_script=str(CLAUDE_NOTIFIER), standby_mode="alert")
+        with mock.patch.object(hc, "_run_tmux", side_effect=tmux), \
+             mock.patch.object(hc.session_runtime, "read", return_value="claude"), \
+             mock.patch.object(hc.watcher_identity, "role_present", return_value=False), \
+             mock.patch.object(hc.subprocess, "run", side_effect=AssertionError("launcher ran")):
+            out = hc.fix_claude_task_notifier()
+        self.assertIn("not repaired", out)
+        self.assertIn("session's own", out)
 
     def test_fix_repairs_a_missing_watcher_through_the_launcher_and_preserves_the_core(self):
         """P1-23: the standby notifier went missing and nothing under --fix brought it

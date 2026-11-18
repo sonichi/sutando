@@ -6,6 +6,12 @@ Two HONEST, separate tri-state signals (qingyun CR #2680): `ag2space_app_running
 probe of the Station gateway). Neither collapses an unknown to a False.
 Run: python3 tests/runtime-health-ag2space-station.test.py  (exit 0 pass / 1 fail)
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import importlib.util
 import json
 import os

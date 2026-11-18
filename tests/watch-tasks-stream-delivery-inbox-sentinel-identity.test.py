@@ -21,6 +21,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.process_group import popen_bound  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 WID = "d2571c90f75e4907af9f145b01b71c1f"
@@ -61,10 +63,10 @@ def sentinel_for(ws, instance=None):
 
 
 def start(inbox, ws, outf, errf, instance=None, beat=None):
-    return subprocess.Popen(
+    return popen_bound(
         ["bash", "src/watch-tasks-stream.sh", str(inbox), "--role", "standby", "--inbox", str(inbox)],
         cwd=str(REPO), env=base_env(ws, instance, beat), stdout=outf, stderr=errf,
-        text=True, start_new_session=True)
+        text=True)
 
 
 def stop(p):

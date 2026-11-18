@@ -10,6 +10,12 @@ private `process.env.TWILIO_*` reader beside the shared env-then-vault resolver
 
 Run: python3 tests/twilio-setup.test.py
 """
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import contextlib
 import importlib.util
 import io

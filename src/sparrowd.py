@@ -4,7 +4,18 @@
 The package shell (ag2_sparrow.sparrowd) is deliberately blind to what it
 supervises; THIS file owns the worker list and resolved paths, so the core
 never imports or locates a repo-specific loop.
+
+The agent bridges a claude-local install declares under `<workspace>/agents`
+are rescanned every `--rescan-s`: a declaration written later is picked up, a
+removed one has its worker stopped, an edited one has it restarted. `--agent-bridges` supervises only those, for
+a host whose gateway bridge another supervisor already runs (the launchd
+wrapper starts this mode beside the bridge).
+
+`--core` also supervises the host's core gateway bridge (`sparrow_core_bridge`), rescanned the same way:
+it is restarted when the connection it serves changes, held after its stand-down (exit 75), and absent
+while there is nothing to run.
 """
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -86,19 +97,166 @@ def _skill_worker_specs() -> "tuple[list, list[str]]":
     return specs, skipped
 
 
+AGENT_BRIDGE = _SRC / "sparrow_agent_bridge.py"
+
+
+def _agent_bridge_specs(workspace=None, vault_keys=None, held=None) -> "tuple[list, list[str]]":
+    """One worker per agent bridge a claude-local install declared under <workspace>/agents; each skipped
+    declaration is one reason, never run. A vault manifest or agents directory that cannot be read is
+    `sparrow_agent_bridge.ScanUnavailable`: the caller keeps what it runs, nothing is read as absent. The
+    worker names whose declaration file alone could not be read are appended to `held`."""
+    import sparrow_agent_bridge as agent_bridge
+    if vault_keys is None:
+        from vault_intercept import list_vault_keys
+        try:
+            vault_keys = list_vault_keys()
+        except Exception as exc:
+            raise agent_bridge.ScanUnavailable(f"vault manifest unreadable ({type(exc).__name__}: {exc})") from exc
+    found, skipped = agent_bridge.declarations(workspace or resolve_workspace(), vault_keys, held)
+    specs = []
+    for path, decl in found:     # names derive from distinct segments: never two alike
+        specs.append(WorkerSpec(name=decl["name"], argv=[sys.executable, str(AGENT_BRIDGE), str(path)],
+                                cwd=str(REPO), revision=decl["digest"]))
+    return specs, skipped
+
+
+def _ere_literal(text: str) -> str:
+    return re.sub(r"([\\.^$|?*+()\[\]{}])", r"\\\1", text)
+
+
+def supervision_marker(spec) -> str:
+    """The pgrep pattern for a worker's process: an agent bridge by the wrapper and its own declaration
+    path ending the command line (an editor or a backup of the file is not a bridge), any other worker by
+    its script's name."""
+    if len(spec.argv) > 2 and Path(spec.argv[1]).name == AGENT_BRIDGE.name:
+        return f"(^|[/ ]){_ere_literal(AGENT_BRIDGE.name)} {_ere_literal(spec.argv[-1])}$"
+    return Path(spec.argv[-1]).name
+
+
+def _static_specs() -> "tuple[list, list[str]]":
+    """The workers read once, at start: the skill loops (the gateway bridge is `--core`'s)."""
+    return _skill_worker_specs()
+
+
+CORE_LAUNCHER = _SRC / "sparrow_core_bridge.py"
+from sparrow_core_bridge import CORE_WORKER  # noqa: E402
+
+
+def core_spec(workspace=None, environ=None) -> "tuple[WorkerSpec | None, str]":
+    """The core gateway bridge's worker, or (None, why there is none), with the claim the lane keeper
+    reads updated to match. Raises when the connections cannot be read: an unknown core, not an absent one."""
+    import sparrow_core_bridge as core
+    ws = workspace or resolve_workspace()
+    decision, why = core.decide(ws, os.environ if environ is None else environ, cached=True)
+    try:
+        if core.holds_lock(ws, os.getpid()):  # a sparrowd still waiting for the lock supervises nothing
+            core.write_claim(ws, None if decision is None else str(decision["instance"]))
+    except OSError as e:  # the keeper then just starts the lane; the core still follows its connections
+        print(f"sparrowd: core claim not written ({type(e).__name__}: {e})", file=sys.stderr)
+    if decision is None:
+        return None, why
+    return WorkerSpec(name=CORE_WORKER, argv=[sys.executable, str(CORE_LAUNCHER), f"--expect={decision['instance']}"],
+                      cwd=str(REPO), revision=core.revision(decision, ws), hold_rc=core.HOLD_RC,
+                      held_healthy=False), ""
+
+
+class CoreScan:
+    """The core worker as of each pass: [] while the opt-in gate is off or there is nothing to run, its
+    last spec kept while the connections cannot be read. A core held after a stand-down is re-armed (its
+    revision bumped, and kept until the connections change) once its lease is free. A reason is printed
+    when it first appears, not every pass."""
+
+    def __init__(self, workspace=None):
+        self._workspace = workspace
+        self._last: list = []
+        self._said = ""
+        self._base = ""
+        self._rearm = 0
+
+    def _say(self, why: str) -> None:
+        if why and why != self._said:
+            print(f"sparrowd: core gateway bridge — {why}", file=sys.stderr)
+        self._said = why
+
+    def __call__(self, status=None) -> list:
+        import sparrow_core_bridge as core
+        ws = self._workspace or resolve_workspace()
+        if not core.core_gate(ws):
+            try:
+                if core.holds_lock(ws, os.getpid()):
+                    core.write_claim(ws, None)
+            except OSError:
+                pass
+            self._say("not supervised: the core gate is off")
+            self._last = []
+            return []
+        try:
+            spec, why = core_spec(ws)
+        except Exception as e:  # noqa: BLE001 - an unreadable scan keeps the running core
+            self._say(f"not rescanned ({type(e).__name__}: {e}); keeping the current one")
+            return list(self._last)
+        self._say(why and f"not supervised: {why}")
+        if spec is not None:
+            spec = self._rearmed(spec, status, ws)
+        self._last = [spec] if spec else []
+        return list(self._last)
+
+    def _rearmed(self, spec, status, ws):
+        import dataclasses
+        import sparrow_core_bridge as core
+        if spec.revision != self._base:
+            self._base, self._rearm = spec.revision, 0
+        held = ((status or {}).get("workers") or {}).get(CORE_WORKER, {}).get("state") == "held"
+        if held and core.lease_free(spec.argv[-1].split("=", 1)[1], ws):
+            self._rearm += 1
+            self._say("re-armed: it stood down to another holder, and that lease is now free")
+        return dataclasses.replace(spec, revision=f"{self._base}:{self._rearm}") if self._rearm else spec
+
+
 def worker_specs() -> list:
-    specs = [
-        WorkerSpec(
-            name="remote-gateway-bridge",
-            argv=[sys.executable, str(REPO / "src" / "remote-gateway-bridge.py")],
-            cwd=str(REPO),
-        ),
-    ]
-    skill_specs, skipped = _skill_worker_specs()
-    specs.extend(skill_specs)
+    import sparrow_agent_bridge as agent_bridge
+    specs, skipped = _static_specs()
+    try:
+        agent_specs, agent_skipped = _agent_bridge_specs()
+    except agent_bridge.ScanUnavailable as e:
+        agent_specs, agent_skipped = [], [f"agent bridges not scanned: {e}"]
+    specs.extend(agent_specs)
+    skipped.extend(agent_skipped)
     for why in skipped:
         print(f"sparrowd: not supervised — {why}", file=sys.stderr)
     return specs
+
+
+class AgentBridgeScan:
+    """The agent-bridge workers as of each pass. A reason is printed when it first
+    appears, not every pass; a declaration another process already runs (its
+    marker live outside this daemon) is skipped the same way, so a declaration
+    never runs twice. A name this scan already returned is never re-checked:
+    its live process is this daemon's own worker. A declaration file that alone
+    cannot be read keeps its worker as it was. A scan that cannot be made
+    raises `ScanUnavailable` through to the supervisor, which keeps its set."""
+
+    def __init__(self, workspace=None):
+        self._workspace = workspace
+        self._reported: set = set()
+        self._supervised: dict = {}
+
+    def __call__(self) -> list:
+        held: list = []
+        specs, skipped = _agent_bridge_specs(self._workspace, held=held)
+        kept = [self._supervised[name] for name in held if name in self._supervised]
+        for spec in specs:
+            owned = None if spec.name in self._supervised else external_supervisor(supervision_marker(spec))
+            if owned:
+                skipped.append(f"{spec.argv[-1]}: already supervised outside sparrowd: {owned}")
+            else:
+                kept.append(spec)
+        for why in skipped:
+            if why not in self._reported:
+                print(f"sparrowd: not supervised — {why}", file=sys.stderr)
+        self._reported = set(skipped)
+        self._supervised = {spec.name: spec for spec in kept}
+        return kept
 
 
 def external_supervisor(marker: str) -> "str | None":
@@ -121,17 +279,42 @@ def external_supervisor(marker: str) -> "str | None":
     return "; ".join(lines)
 
 
-def main() -> int:
-    for spec in worker_specs():
-        owned = external_supervisor(Path(spec.argv[-1]).name)
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="supervise Sparrow's resident loops")
+    ap.add_argument("--agent-bridges", action="store_true",
+                    help="supervise only the agent bridges declared under <workspace>/agents (the host's "
+                         "gateway bridge and the skill loops run elsewhere)")
+    ap.add_argument("--core", action="store_true",
+                    help="also supervise the host's core gateway bridge (src/sparrow_core_bridge.py)")
+    ap.add_argument("--rescan-s", type=float, default=30.0, metavar="S",
+                    help="seconds between scans of <workspace>/agents for added or removed declarations")
+    return ap.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    static, skipped = ([], []) if args.agent_bridges else _static_specs()
+    for why in skipped:
+        print(f"sparrowd: not supervised — {why}", file=sys.stderr)
+    for spec in static:
+        owned = external_supervisor(supervision_marker(spec))
         if owned:
             print(f"sparrowd: refusing to start — {spec.name} already "
                   f"supervised outside sparrowd: {owned}. Stop that "
                   f"supervisor (e.g. the app's gateway-keepalive) first.",
                   file=sys.stderr)
             return 2
+    import sparrow_agent_bridge as agent_bridge
+    scan = AgentBridgeScan()
+    core = CoreScan() if args.core else (lambda status=None: [])
+    try:
+        agents = scan()
+    except agent_bridge.ScanUnavailable as e:  # picked up on the first pass that can be made
+        print(f"sparrowd: agent bridges not scanned yet — {e}", file=sys.stderr)
+        agents = []
     state_dir = resolve_workspace() / "state" / "sparrowd"
-    return run(worker_specs(), state_dir)
+    return run(static + core() + agents, state_dir, rescan=lambda status=None: static + core(status) + scan(),
+               rescan_s=args.rescan_s, wait_for_lock=args.agent_bridges, rescan_status=True)
 
 
 if __name__ == "__main__":  # pragma: no cover

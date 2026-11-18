@@ -84,6 +84,64 @@ class Position(Base):
         self.assertFalse([f for f in (self.ws / "state").iterdir() if ".tmp" in f.name], "atomic write, no temp left")
 
 
+class ReadyResults(Base):
+    def test_open_work_survives_missing_blank_and_unrelated_results(self):
+        self.task("task-open")
+        self.assertEqual(tq.position(self.ws, "task-open"), {"depth": 1, "position": 1})
+        results = self.ws / "results"
+        archive = results / "archive"
+        archive.mkdir(parents=True)
+        for name in ("task-other.txt", "task-open-1-other.txt"):
+            (archive / name).write_text("another task's answer\n")
+        for body in ("", " \n\t"):
+            with self.subTest(body=body):
+                (results / "task-open.txt").write_text(body)
+                (archive / "task-open-123.txt").write_text(body)
+                self.assertEqual(tq.position(self.ws, "task-open"), {"depth": 1, "position": 1})
+                self.assertEqual(tq.waiting(self.ws, "task-absent"), 1)
+
+    def test_completion_filter_preserves_priority_fifo_and_file_bytes(self):
+        self.task("task-done", priority="urgent", age=0)
+        self.task("task-b", age=2); self.task("task-a", age=1)
+        self.task("task-urgent", priority="urgent", age=3)
+        self.task("task-low", priority="low", age=0)
+        (self.ws / "results").mkdir()
+        (self.ws / "results" / "task-done.txt").write_text("done\n")
+        before = {p: p.read_bytes() for p in self.ws.rglob("*.txt")}
+        expected = ["task-urgent", "task-a", "task-b", "task-low"]
+        self.assertEqual([p.stem for p in tq.pending_files(self.ws)], expected)
+        self.assertEqual([t["id"] for t in tq.pending(self.ws)], expected)
+        self.assertEqual(tq.position(self.ws, "task-done"), {"depth": 4, "position": 0})
+        self.assertEqual(tq.waiting(self.ws, "task-urgent"), 3)
+        snap = json.loads(tq.write_snapshot(self.ws).read_text())
+        self.assertEqual((snap["depth"], [t["id"] for t in snap["pending"]]), (4, expected))
+        self.assertEqual({p: p.read_bytes() for p in self.ws.rglob("*.txt")}, before)
+
+    def test_results_are_scoped_to_the_given_workspace(self):
+        self.task("task-shared")
+        other = self.ws / "other"
+        (other / "tasks").mkdir(parents=True)
+        (other / "results").mkdir()
+        (other / "tasks" / "task-shared.txt").write_text("task: another workspace\n")
+        (other / "results" / "task-shared.txt").write_text("done elsewhere\n")
+        with unittest.mock.patch.object(tq, "resolve_workspace", return_value=other):
+            self.assertEqual([t["id"] for t in tq.pending(self.ws)], ["task-shared"])
+            self.assertEqual(tq.pending(other), [])
+
+    def test_only_canonical_filenames_are_matched_not_headers_or_other_suffixes(self):
+        task = self.task("task-file")
+        task.write_text("id: task-header\ntask: do it\n")
+        legacy = self.ws / "tasks" / "task-legacy.accepted"
+        legacy.write_text("task: still admitted by the core\n")
+        (self.ws / "results").mkdir()
+        for name in ("task-header.txt", "task-legacy.accepted.txt"):
+            (self.ws / "results" / name).write_text("unrelated answer\n")
+        self.assertEqual(set(tq.pending_files(self.ws)), {task, legacy})
+        (self.ws / "results" / "task-file.txt").write_text("done\n")
+        self.assertEqual(tq.pending_files(self.ws), [legacy])
+        self.assertEqual(tq.pending(self.ws, self.ws / "tasks"), [])
+
+
 class Cli(Base):
     def run_main(self, *argv):
         out, err = io.StringIO(), io.StringIO()

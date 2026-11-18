@@ -9,9 +9,15 @@ success on a well-tested file.
 from __future__ import annotations
 
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
+
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -24,12 +30,10 @@ def _mod():
     return m
 
 
-XML = """<?xml version="1.0" ?>
-<coverage><packages><package><classes>
-  <class filename="health-check.py"/>
-  <class filename="task_priority.py"/>
-</classes></package></packages></coverage>
-"""
+REPORT = json.dumps({"files": {
+    "src/health-check.py": {"executed_lines": [1], "missing_lines": []},
+    "src/task_priority.py": {"executed_lines": [], "missing_lines": [1]},
+}})
 
 
 class UnmeasuredFiles(unittest.TestCase):
@@ -41,14 +45,23 @@ class UnmeasuredFiles(unittest.TestCase):
         # passed the gate without a single one of its lines being examined.
         out = self.m.unmeasured(
             ["src/health-check.py", "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py"],
-            {"health-check.py", "task_priority.py"}, [])
+            {"src/health-check.py", "src/task_priority.py"}, [])
         self.assertEqual(out, ["packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py"])
 
     def test_a_measured_file_is_not_reported(self):
-        # coverage.xml filenames are relative to a <source> root, so the match
-        # is by suffix — `src/health-check.py` vs `health-check.py`.
         self.assertEqual(
-            self.m.unmeasured(["src/health-check.py"], {"health-check.py"}, []), [])
+            self.m.unmeasured(["src/health-check.py"], {"src/health-check.py"}, []), [])
+
+    def test_same_relative_name_under_another_root_is_unmeasured(self):
+        self.assertEqual(self.m.unmeasured(
+            ["src/nested/shared.py", "scripts/nested/shared.py", "outside/nested/shared.py"],
+            {"src/nested/shared.py"}, []),
+            ["scripts/nested/shared.py", "outside/nested/shared.py"])
+
+    def test_a_root_file_cannot_vouch_for_a_nested_file(self):
+        self.assertEqual(self.m.unmeasured(
+            ["shared.py", "outside/shared.py"], {"shared.py"}, []),
+            ["outside/shared.py"])
 
     def test_a_deliberately_omitted_file_is_not_reported(self):
         # tests/ is in `[run] omit` on purpose; reporting it every run would
@@ -90,18 +103,40 @@ class MeasuredFilesParsing(unittest.TestCase):
 
     def test_filenames_are_read_from_the_report(self):
         with tempfile.TemporaryDirectory() as td:
-            p = Path(td) / "coverage.xml"
-            p.write_text(XML)
+            p = Path(td) / "coverage.json"
+            p.write_text(REPORT)
             self.assertEqual(self.m.measured_files(p),
-                             {"health-check.py", "task_priority.py"})
+                             {"src/health-check.py", "src/task_priority.py"})
+
+    def test_zero_hit_files_remain_measured_under_their_own_paths(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "coverage.json"
+            p.write_text(REPORT)
+            self.assertEqual(self.m.unmeasured(
+                ["src/task_priority.py", "outside/task_priority.py"],
+                self.m.measured_files(p), []), ["outside/task_priority.py"])
+
+    def test_native_report_paths_match_gits_forward_slashes(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "coverage.json"
+            p.write_text(json.dumps({"files": {str(Path("src") / "a.py"): {}}}))
+            self.assertEqual(self.m.measured_files(p), {"src/a.py"})
+
+    def test_an_invalid_report_shape_yields_no_measured_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "coverage.json"
+            for report in [None, [], {}, {"files": None}, {"files": ["src/a.py"]}]:
+                with self.subTest(report=report):
+                    p.write_text(json.dumps(report))
+                    self.assertEqual(self.m.measured_files(p), set())
 
     def test_an_unreadable_report_yields_an_empty_set_not_an_exception(self):
         # Fail-open: the gate's verdict must never depend on this helper.
         with tempfile.TemporaryDirectory() as td:
-            bad = Path(td) / "coverage.xml"
-            bad.write_text("not xml at all")
+            bad = Path(td) / "coverage.json"
+            bad.write_text("not json at all")
             self.assertEqual(self.m.measured_files(bad), set())
-            self.assertEqual(self.m.measured_files(Path(td) / "absent.xml"), set())
+            self.assertEqual(self.m.measured_files(Path(td) / "absent.json"), set())
 
 
 class MalformedConfig(unittest.TestCase):
@@ -129,8 +164,8 @@ class ChangedFilesComeFromGit(unittest.TestCase):
         import subprocess
         r = td / "repo"
         r.mkdir()
-        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
-               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e"}
+        env = hermetic_env(**{"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e"})
         run = lambda *a: subprocess.run(["git", "-C", str(r), *a],  # noqa: E731
                                         check=True, capture_output=True, env=env)
         subprocess.run(["git", "init", "-q", "-b", "base", str(r)],
@@ -185,17 +220,17 @@ class CommandLine(unittest.TestCase):
         import io
         import os
         with tempfile.TemporaryDirectory() as td:
-            xml = Path(td) / "coverage.xml"
-            xml.write_text(XML)
+            report = Path(td) / "coverage.json"
+            report.write_text(REPORT)
             rc_file = Path(td) / ".coveragerc"
             rc_file.write_text("[run]\nomit =\n    tests/*\n")
             self.m.changed_py = lambda base: ["packages/x/bridge.py", "tests/a.test.py",
                                               "src/health-check.py"]
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                rc = self.m.main(["prog", "origin/main", str(xml), "--rcfile", str(rc_file)])
+                rc = self.m.main(["prog", "origin/main", str(report), "--rcfile", str(rc_file)])
         self.assertEqual(rc, 0)
-        # tests/ omitted on purpose; health-check.py is in the report by suffix.
+        # Tests are omitted on purpose; the source file has an exact report key.
         self.assertEqual(out.getvalue().split(), ["packages/x/bridge.py"])
         self.assertNotIn("tests/a.test.py", out.getvalue())
 

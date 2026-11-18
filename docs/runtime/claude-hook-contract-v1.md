@@ -97,7 +97,7 @@ be folded into one `approval_required` flag.
 
 Three tiers (registry `visibility` field):
 
-- **product** — events intended for AG2 Space surfaces. **Currently: none.**
+- **product** — events intended for s.space surfaces. **Currently: none.**
   Promoting a kind to product tier requires an explicit redaction review, not
   a registry edit alone.
 - **diagnostic** — local collector/sink only. Everything today.

@@ -11,6 +11,14 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
+
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
+from _helpers.hermetic_env import hermetic_env
 
 REPO = Path(__file__).resolve().parent.parent
 SUITE = REPO / "tests" / "pending-questions-send.test.py"
@@ -54,7 +62,8 @@ def _imports_gateway(node):
 
 def _load_suite():
     """Execute the suite's module (its isolation block runs; no test runs)."""
-    saved = dict(os.environ)
+    saved = mock.patch.dict(os.environ)
+    saved.start()
     spec = importlib.util.spec_from_file_location("pq_send_suite_under_pin", SUITE)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -70,8 +79,7 @@ class Hermetic(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        os.environ.clear()
-        os.environ.update(cls.saved_env)
+        cls.saved_env.stop()
         sys.modules.pop("pq_send_suite_under_pin", None)
 
     def test_effective_environment_is_contained_and_exact(self):
@@ -156,7 +164,7 @@ class Hermetic(unittest.TestCase):
         sentinel = Path(tempfile.mkdtemp(prefix="pq-send-sentinel-")) / "sentinel.txt"
         sentinel.write_text("do not touch me")
         r = subprocess.run([_sys.executable, str(SUITE), "-v", "-k", "real_gateway"],
-                           env={**os.environ, **poison, "PQ_SEND_PROBE": "1", "PQ_SEND_PROBE_OUT": str(sentinel)},
+                           env=hermetic_env(**poison, PQ_SEND_PROBE="1", PQ_SEND_PROBE_OUT=str(sentinel)),
                            capture_output=True, text=True, timeout=300)
         self.assertEqual(sentinel.read_text(), "do not touch me", "the child wrote to an inherited path")
         self.assertEqual(r.returncode, 0, r.stderr[-2000:])

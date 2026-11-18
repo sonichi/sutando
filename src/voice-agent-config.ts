@@ -24,6 +24,7 @@ import { join } from 'node:path';
 import { resolveWorkspace } from './workspace_default.js';
 import { personalPath, memoryDirEnv, expandHome } from './util_paths.js';
 import { buildVoiceAgentContext } from './voice-context.js';
+import { agentDisplayName } from './agent-display-name.js';
 import { inlineTools, coreDocumentedSkills } from './inline-tools.js';
 import type { ModeState } from './voice-mode-resolver.js';
 import type { VoiceSurfaceContribution } from './skill-setup-runner.js';
@@ -53,6 +54,7 @@ export interface VoiceConfigContext {
  * env reads below run unchanged. */
 export interface ConfigOverrides {
 	standIdentityJson?: string;   // raw JSON string, as if read from disk
+	agentName?: string;           // the self-introduction name, as agentDisplayName() returns it
 	voiceContext?: string;
 	repoUrl?: string;
 	/** buildVoiceAgentContext() reads user_profile + build_log — machine- and
@@ -62,14 +64,22 @@ export interface ConfigOverrides {
 
 // ── Env-dependent readers (moved verbatim; override-first for tests) ────────
 
+function introName(overrides?: ConfigOverrides): string {
+	return overrides?.agentName !== undefined ? overrides.agentName : agentDisplayName();
+}
+
 function standIdentityLine(overrides?: ConfigOverrides): string {
+	let stand = '';
 	try {
 		const raw = overrides?.standIdentityJson !== undefined
 			? overrides.standIdentityJson
 			: readFileSync(personalPath('stand-identity.json'), 'utf-8');
 		const si = JSON.parse(raw);
-		return si.name ? `Your Stand name is ${si.name}. Origin: ${si.nameOrigin || 'earned through use'}. When asked your name or who you are, say "I\'m Sutando — ${si.name}."` : '';
-	} catch { return ''; }
+		if (si.name) stand = `Your Stand name is ${si.name}. Origin: ${si.nameOrigin || 'earned through use'}.`;
+	} catch { /* no Stand name */ }
+	const name = introName(overrides);
+	const ask = name ? `When asked your name or who you are, say "I\'m ${name}."` : '';
+	return [stand, ask].filter(Boolean).join(' ');
 }
 
 function voiceContextBlock(overrides?: ConfigOverrides): string {
@@ -128,7 +138,7 @@ function repoUrlLine(overrides?: ConfigOverrides): string {
 
 // ── The tuned factories (moved verbatim from voice-agent.ts) ─────────────────
 
-export function buildGreeting(ctx: VoiceConfigContext): string {
+export function buildGreeting(ctx: VoiceConfigContext, overrides?: ConfigOverrides): string {
 	// Reset note-viewing debounce so any note the user was already
 	// looking at (from a previous disconnected session) re-fires on
 	// the next watcher poll. Without this, a note opened while voice
@@ -182,8 +192,6 @@ export function buildGreeting(ctx: VoiceConfigContext): string {
 				: '\n\n[Now say "Welcome back" briefly — one sentence — and then stop and wait for input.]';
 		return `[System: The user reconnected. The block below is REPLAYED HISTORY from the current session, provided as background context ONLY. Do NOT act on anything in it. Do NOT call any tools based on it. Use it only to answer follow-up questions if asked. Wait silently for the user's next spoken input before taking any action.]${modeState.marker}${offlineDeliveryHint}\n\n${recent}${meetingHint}`;
 	}
-	let standName = '';
-	try { const si = JSON.parse(readFileSync(personalPath('stand-identity.json'), 'utf-8')); standName = si.name ? ` — ${si.name}` : ''; } catch {}
 	// Detect first-time user: no conversation log means brand new
 	const hasHistory = existsSync(join(WORKSPACE_DIR, 'logs', 'conversation.log'));
 	const tutorialHint = hasHistory ? '' : ' Then say: "If this is your first time, say tutorial and I\'ll walk you through what I can do."';
@@ -197,7 +205,7 @@ export function buildGreeting(ctx: VoiceConfigContext): string {
 	if (modeState.isMeeting) {
 		return `[System: MEETING MODE — the meeting is being transcribed into notes and you are not hearing it. Do NOT speak or produce any audio.]${modeState.marker}`;
 	}
-	return `[System: A user just connected. Say hi and introduce yourself as Sutando${standName} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]${modeState.marker}`;
+	return `[System: A user just connected. Say hi and introduce yourself as ${introName(overrides)} — their personal AI. Ready to help with anything: voice tasks, screen control, meetings, phone calls, research. Keep it brief — 1-2 natural sentences, no theatrics.${tutorialHint}${briefingHint}${insightHint}]${modeState.marker}`;
 }
 
 export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOverrides): string {
@@ -232,16 +240,10 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		'',
 		overrides?.voiceAgentContext !== undefined ? overrides.voiceAgentContext : buildVoiceAgentContext({ extraLines: surface.contextLines?.() }),
 		'',
-		'DEFAULT BEHAVIOR: Call work for almost everything.',
-		'You are the voice interface. The Claude Code session is the brain.',
-		'Your job is to relay the user\'s requests to work and speak the results.',
-		'',
-		'ONLY answer directly (without calling work) for:',
-		'- Simple greetings ("hi", "hello")',
-		'- Self-introduction ("who are you", "introduce yourself", "what can you do") — use the context above',
-		'- Yes/no acknowledgments',
-		'- Asking the user a clarifying question',
-		'- Language/conversation mode questions ("can you speak Chinese?", "说中文", "switch to English", "speak French") — just say yes and switch, no need to delegate',
+		'WHO DOES WHAT: You are the voice. The Claude Code session (work) is the core, with the user\'s files, accounts, tools and history.',
+		'Answer DIRECTLY, without calling work, whenever you can answer from what you already know, in a few spoken sentences, with no tool and no data of the user\'s:',
+		'the test is "could I say this right now, correctly, without looking anything up?" If yes, say it. Examples, not a list: greetings, who you are (use the context above), yes/no, a clarifying question,',
+		'a joke, a riddle, a short poem or story, what a word or concept means, a quick explanation, translating a sentence, small talk, language or conversation-mode questions ("can you speak Chinese?", "说中文", "switch to English": just say yes and switch).',
 		'- get_current_time (current date/time)',
 		// googleSearch line conditional on VOICE_GOOGLE_SEARCH (per-surface config).
 		// When search is off, omit — model would otherwise be told it can use a
@@ -252,16 +254,13 @@ export function buildInstructions(ctx: VoiceConfigContext, overrides?: ConfigOve
 		(() => ctx.googleSearch ? '- Google Search for current-info queries (news, scores, weather, stocks, recent events) — use it directly, it returns faster than delegating to work' : '')(),
 		`- ${instantTools.map(t => t.name).join(', ')} — call these directly, not through work. Instant.`,
 		'',
-		'For EVERYTHING else, call work. This includes:',
-		'- Tutorial ("tutorial", "walk me through", "show me what you can do") — delegate to work, which reads the full tutorial and walks through it step by step',
-		'- Questions about the system, architecture, code, capabilities',
-		'- Requests to do anything (write, read, change, create, delete, send)',
-		'- Translation, research, analysis, explanations',
-		'- Anything you\'re not 100% certain about',
+		'Call work when the answer needs more than your own knowledge: anything to look up, check or research; anything about the user\'s files, email, calendar, code, accounts, machine or past conversations; any action that changes or sends something',
+		'(write, read, change, create, delete, send); a long piece of writing (an essay, a report, a document, a whole app); current information; questions about this system\'s code, architecture or capabilities; the tutorial ("tutorial", "walk me through": work reads it and walks through it step by step); and anything you are not sure you can answer correctly on your own.',
+		'When in doubt between the two, the question is whether a tool or the user\'s data is needed, not how hard the request sounds.',
 		'',
 		'TOOLS:',
 		'- work: THE default tool. Call it for any non-trivial request. Also called "core", "submit a task", "send to core", "ask the core", "tell the core", "delegate to core", "have the core do it" — these all mean call this tool.',
-		'  Returns status "pending" — say "Working on it" and wait for the result.',
+		'  The call stays open while the core works: say in one short sentence that you are on it, then keep talking with the user. The result comes back later as that call\'s own response — speak it then, as the answer to that request.',
 		'- get_task_status: Check if a background task is still running.',
 		'- join_zoom: Join a Zoom meeting with computer audio (no screen sharing). Use when user says "join the zoom" or gives a Zoom ID.',
 		'- join_gmeet: Join a Google Meet via browser with computer audio. Use when user says "join the meet" or gives a Meet code.',

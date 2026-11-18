@@ -3,8 +3,9 @@
 take them, and where a given task stands in that order.
 
 `pending(workspace)` lists <workspace>/tasks/task-*.txt minus the core's own bookkeeping files
-(task-cron-*, task-bench-*, task-workstream-*, task-project-grouping-*), sorted the way the
-consumer sorts (task_priority: urgent → normal → low, then oldest first). `position(workspace, id)`
+(task-cron-*, task-bench-*, task-workstream-*, task-project-grouping-*) and canonical tasks with
+ready results, sorted like the consumer (task_priority: urgent → normal → low, then oldest first).
+`position(workspace, id)`
 is {depth, position}: how many are pending and this task's 1-based rank (0 when it is not pending).
 `write_snapshot(workspace)` publishes the same list to <workspace>/state/task-queue.json — the
 fresh queue for readers (voice's get_core_status, the desktop). core-status.json stays its own
@@ -16,8 +17,9 @@ zero, and `write_snapshot` then leaves the previous snapshot in place rather tha
 
 CLI (every command takes --workspace; --task-file derives it from the file's own tasks/ dir;
 --inbox names the announcing watcher's directory when it is not tasks/, a pool worker's delivery
-folder, and the count is then what waits THERE, never the core's queue):
-  task_queue.py pending [--inbox D]              the list, JSON
+folder, and the count is then what waits THERE, never the core's queue; --results names where that
+inbox's answers land when it is not <workspace>/results, a worker with its own folders):
+  task_queue.py pending [--inbox D] [--results R]  the list, JSON
   task_queue.py position --task-file P [--inbox D]  {depth, position}, JSON
   task_queue.py waiting --task-file P [--inbox D]   how many OTHER tasks are pending, a bare integer,
                                                  and (without --inbox) the snapshot is refreshed
@@ -71,8 +73,10 @@ def _source(path: Path) -> str | None:
     return None
 
 
-def pending_files(workspace: Path | None = None, inbox: Path | str | None = None) -> list[Path]:
-    """The pending task files in consumption order; `pending` describes each. Raises like `pending`."""
+def pending_files(workspace: Path | None = None, inbox: Path | str | None = None,
+                  results: Path | str | None = None) -> list[Path]:
+    """The pending task files in consumption order; `pending` describes each. Raises like `pending`.
+    `results` is where this inbox's answers land when that is not <workspace>/results."""
     ws = workspace or resolve_workspace()
     tasks_dir = Path(inbox) if inbox else ws / "tasks"
     try:
@@ -80,16 +84,16 @@ def pending_files(workspace: Path | None = None, inbox: Path | str | None = None
     except (FileNotFoundError, NotADirectoryError):
         return []
     if inbox:
-        # A sentinel is never retired on a live host: an entry is pending only while its task
-        # has no ready result, resolved for the whole inbox at once (listed, not globbed per entry).
-        from delivery.task_dispatch import ready_result_filenames
         paths = [p for p in paths if p.name.endswith(".txt")]
-        ready = ready_result_filenames(ws / "results", [p.name for p in paths])
-        paths = [p for p in paths if p.name not in ready]
+    from delivery.task_dispatch import ready_result_filenames
+    # Only canonical filenames participate in completion lookup; other core entries stay admitted.
+    ready = ready_result_filenames(Path(results) if results else ws / "results", [p.name for p in paths if p.name.endswith(".txt")])
+    paths = [p for p in paths if p.name not in ready]
     return sort_tasks_by_priority(paths)
 
 
-def pending(workspace: Path | None = None, inbox: Path | str | None = None) -> list[dict]:
+def pending(workspace: Path | None = None, inbox: Path | str | None = None,
+            results: Path | str | None = None) -> list[dict]:
     """[{id, source, priority, since}] in consumption order. A missing tasks/ dir is an empty queue;
     one that exists but cannot be read raises (PermissionError and the rest), never reads as empty.
 
@@ -97,7 +101,7 @@ def pending(workspace: Path | None = None, inbox: Path | str | None = None) -> l
     a pool worker's delivery folder, whose entries are sentinels (a name and nothing else). The
     queue is what waits in THAT inbox; without it, the core's tasks/ is the queue."""
     out = []
-    for p in pending_files(workspace, inbox):
+    for p in pending_files(workspace, inbox, results):
         try:
             since = int(p.stat().st_mtime)
         except OSError:
@@ -106,19 +110,21 @@ def pending(workspace: Path | None = None, inbox: Path | str | None = None) -> l
     return out
 
 
-def position(workspace: Path | None, task_id: str, inbox: Path | str | None = None) -> dict:
+def position(workspace: Path | None, task_id: str, inbox: Path | str | None = None,
+             results: Path | str | None = None) -> dict:
     """{depth, position}: position is 1-based in consumption order, 0 when the task is not pending.
     Raises like `pending` when tasks/ cannot be read: there is no depth to report then."""
-    queue = pending(workspace, inbox)
+    queue = pending(workspace, inbox, results)
     ids = [t["id"] for t in queue]
     return {"depth": len(queue), "position": ids.index(task_id) + 1 if task_id in ids else 0}
 
 
-def waiting(workspace: Path | None, task_id: str, inbox: Path | str | None = None) -> int:
+def waiting(workspace: Path | None, task_id: str, inbox: Path | str | None = None,
+            results: Path | str | None = None) -> int:
     """How many other tasks are pending besides this one: the QUEUE line's number, counted in the
     announcing inbox. Raises like `pending` when it cannot be read: the line is then not printed
     rather than printed as 0."""
-    pos = position(workspace, task_id, inbox)
+    pos = position(workspace, task_id, inbox, results)
     return pos["depth"] - (1 if pos["position"] else 0)
 
 
@@ -151,6 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("cmd", choices=("pending", "position", "waiting", "snapshot"))
     ap.add_argument("--task-file"); ap.add_argument("--task-id"); ap.add_argument("--workspace")
     ap.add_argument("--inbox", help="the announcing watcher's directory when it is not <workspace>/tasks")
+    ap.add_argument("--results", help="where that inbox's answers land when it is not <workspace>/results")
     try:
         a = ap.parse_args(argv)
         ws = _workspace_of(a.task_file, a.workspace)
@@ -161,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
         if inbox and ws is not None and Path(inbox).resolve() == (ws / "tasks").resolve():
             inbox = None
         if a.cmd == "pending":
-            print(json.dumps(pending(ws, inbox)))
+            print(json.dumps(pending(ws, inbox, a.results or None)))
         elif a.cmd == "snapshot":
             written = write_snapshot(ws)
             if written is not None:
@@ -169,9 +176,9 @@ def main(argv: list[str] | None = None) -> int:
         elif not tid:
             return 0
         elif a.cmd == "position":
-            print(json.dumps(position(ws, tid, inbox)))
+            print(json.dumps(position(ws, tid, inbox, a.results or None)))
         else:
-            n = waiting(ws, tid, inbox)
+            n = waiting(ws, tid, inbox, a.results or None)
             # The snapshot is the core's queue; a worker inbox's count never overwrites it.
             if not inbox:
                 write_snapshot(ws)

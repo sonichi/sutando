@@ -81,9 +81,10 @@ for line in sys.stdin:
         turn_id = str(uuid.uuid4())
         text = next((i.get("text", "") for i in p.get("input", []) if i.get("type") == "text"), "")
         tp = THREADS[tid]["params"]
-        # The echo names the thread's settings, so a test can pin sandbox and lifetime.
+        # The echo names the thread's settings, so a test can pin sandbox and lifetime; the cwd is the
+        # turn's own when the turn carries one (the turn/start override), else the thread's.
         reply = "STUB echo: " + (text.strip().split("\n")[0][:80]) + " [sandbox=%s ephemeral=%s cwd=%s]" % (
-            tp.get("sandbox"), tp.get("ephemeral"), tp.get("cwd"))
+            tp.get("sandbox"), tp.get("ephemeral"), p.get("cwd", tp.get("cwd")))
         if "[[empty]]" in text:
             reply = "" if not THREADS[tid].get("emptied") else "STUB second try"
             THREADS[tid]["emptied"] = True

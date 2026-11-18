@@ -23,7 +23,7 @@ import activity_rows
 import task_queue
 from workspace_default import status_path
 
-_USAGE = frozenset({"turn-rejected", "session-limit", "fable-limit-unfocused"})
+_USAGE = frozenset({"turn-rejected", "session-limit", "usage-limit", "fable-limit-unfocused"})
 _SIGN_IN = frozenset({"login"})
 
 
@@ -45,11 +45,13 @@ def card_line(queued: int) -> str:
     return f"{queued} queued task(s) are waiting behind this; each was told it is on hold."
 
 
-def queued_count(workspace: Path) -> int:
+def queued_count(workspace: Path) -> Optional[int]:
+    """Pending tasks in the core's queue; None when tasks/ exists but cannot be read.
+    A missing tasks/ is an empty queue (task_queue's rule); an unreadable one is no count."""
     try:
         return len(task_queue.pending_files(workspace))
     except OSError:
-        return 0
+        return None
 
 
 def ledger_path(workspace: Path) -> Path:

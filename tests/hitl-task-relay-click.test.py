@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """remote-gateway-bridge: a card click on the TASK relay is applied to the HITL
-store and consumed; ordinary messages and unconfigured hosts stay on the task path."""
+store and consumed; ordinary messages, and clicks while the owner is unknown, stay on the task path."""
+import contextlib
 import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
+from unittest import mock
 from pathlib import Path
+from unittest.mock import patch
+
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
 
 REPO = Path(__file__).resolve().parent.parent
 TMP = Path(tempfile.mkdtemp(prefix="hitl-relay-click-"))
@@ -27,12 +36,29 @@ OWNER = "@owner:ag2.space"
 class TaskRelayClickTests(unittest.TestCase):
     def setUp(self):
         os.environ["SPARROW_HA_OWNER"] = OWNER
+        rgb._HITL_OWNER.update(mxid="", at=0.0, bad_at=None)
         self.mgr = HitlManager(HitlStore(default_store(TMP)))
         self.req = self.mgr.create(HumanRequirement(
             kind="permission", runtime="claude", message="Claude wants to run Bash: ls",
             guard=f"hook:{os.urandom(4).hex()}", device={"id": "core-1", "name": "core-1"},
             actions=[Action(id="allow", kind="allow_once", label="Allow"),
                      Action(id="deny", kind="reject_once", label="Deny")]))
+
+    def _on_disk(self):
+        """The requirement as a fresh manager reads it from the store file."""
+        return HitlManager(HitlStore(default_store(TMP))).get(self.req.id)
+
+    @contextlib.contextmanager
+    def _registry(self, owner):
+        """A gateway whose /v1/agents row for this agent names `owner`; yields the reads."""
+        reads = []
+
+        def req(method, path, *a, **k):
+            reads.append(path)
+            return {"agents": [{"id": "@me:ag2.space", "owner": owner}]}
+        with mock.patch.object(rgb, "_req", req), \
+                mock.patch.object(rgb, "_reenroll_identity", lambda: "@me:ag2.space"):
+            yield reads
 
     def _task(self, **kw):
         t = {"id": f"task-{os.urandom(5).hex()}", "channel_id": "!dm:ag2.space",
@@ -60,6 +86,67 @@ class TaskRelayClickTests(unittest.TestCase):
         self.assertTrue(rgb._handle_hitl_action(t))
         self.assertEqual(self.mgr.get(self.req.id).chosen_action, "allow")
 
+    def test_task_tier_refusal_is_reported_without_applying_the_click(self):
+        for tier in ("team", "guest"):
+            with self.subTest(tier=tier):
+                t = self._task(access_tier=tier, hitl_action={
+                    "hitl_id": self.req.id, "expected_revision": self.req.revision,
+                    "action_id": "allow", "guard": self.req.guard})
+                out = rgb._handle_hitl_action(t)
+                self.assertTrue(str(out).startswith("refused:"), out)
+                self.assertIsNone(self.mgr.get(self.req.id).chosen_action)
+                self.assertTrue(rgb._hitl_control_body(out).startswith(
+                    "That click did not apply"))
+
+    def test_missing_and_owner_tier_allow_owner_clicks(self):
+        missing = self._task(hitl_action={
+            "hitl_id": self.req.id, "expected_revision": self.req.revision,
+            "action_id": "allow", "guard": self.req.guard})
+        self.assertEqual(rgb._handle_hitl_action(missing), "applied")
+        self.assertEqual(self.mgr.get(self.req.id).chosen_action, "allow")
+
+        req = self.mgr.create(HumanRequirement(
+            kind="permission", runtime="claude", message="Approve this action",
+            guard=f"hook:{os.urandom(4).hex()}",
+            actions=[Action(id="allow", kind="allow_once", label="Allow")]))
+        owner_tier = self._task(access_tier="owner", hitl_action={
+            "hitl_id": req.id, "expected_revision": req.revision,
+            "action_id": "allow", "guard": req.guard})
+        self.assertEqual(rgb._handle_hitl_action(owner_tier), "applied")
+        self.assertEqual(self.mgr.get(req.id).chosen_action, "allow")
+
+    def test_local_tier_cap_refuses_a_claimed_owner_task(self):
+        with patch.object(rgb, "_load_tier_map", return_value={OWNER: "team"}):
+            t = self._task(access_tier="owner", hitl_action={
+                "hitl_id": self.req.id, "expected_revision": self.req.revision,
+                "action_id": "allow", "guard": self.req.guard})
+            out = rgb._handle_hitl_action(t)
+        self.assertTrue(str(out).startswith("refused:"), out)
+        self.assertIsNone(self.mgr.get(self.req.id).chosen_action)
+
+    def test_event_click_checks_the_attested_tier(self):
+        handler = rgb._hitl_reply_handler(OWNER, log=lambda *_: None)
+        self.assertIsNotNone(handler)
+        for n, tier in enumerate(("team", "guest")):
+            with self.subTest(tier=tier):
+                handler.offer({
+                    "type": "message.created", "event_id": f"$tiered{n}", "actor_id": OWNER,
+                    "access_tier": tier,
+                    "content": {"space.ag2.hitl.action": {
+                        "hitl_id": self.req.id, "expected_revision": self.req.revision,
+                        "action_id": "allow", "guard": self.req.guard}},
+                })
+                self.assertEqual(handler.last_outcome, "refused")
+                self.assertIsNone(self.mgr.get(self.req.id).chosen_action)
+
+    def test_capped_owner_typed_label_stays_a_message(self):
+        self.mgr.record_projection(self.req.id, self.req.revision, "$card-capped")
+        with patch.object(rgb, "_load_tier_map", return_value={OWNER: "team"}):
+            out = rgb._handle_hitl_action(self._task(
+                access_tier="owner", reply_to_event="$card-capped", task="Allow"))
+        self.assertIs(out, False)
+        self.assertIsNone(self.mgr.get(self.req.id).chosen_action)
+
     def test_reply_to_the_card_with_a_label_is_applied(self):
         self.mgr.record_projection(self.req.id, self.req.revision, "$card")
         self.assertTrue(rgb._handle_hitl_action(self._task(reply_to_event="$card", task="Deny")))
@@ -69,12 +156,290 @@ class TaskRelayClickTests(unittest.TestCase):
         self.assertFalse(rgb._handle_hitl_action(self._task(task="Allow")))
         self.assertIsNone(self.mgr.get(self.req.id).chosen_action)
 
-    def test_no_owner_configured_leaves_the_click_as_a_task(self):
+    def test_no_owner_anywhere_leaves_the_click_as_a_task_and_says_so(self):
         os.environ.pop("SPARROW_HA_OWNER", None)
-        t = self._task(hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
-                                    "action_id": "allow", "guard": self.req.guard})
-        self.assertFalse(rgb._handle_hitl_action(t))
-        self.assertIsNone(self.mgr.get(self.req.id).chosen_action)
+        logs = []
+
+        def offline(*a, **k):
+            raise OSError("gateway unreachable")
+        with mock.patch.object(rgb, "_req", offline), mock.patch.object(rgb, "_log", logs.append):
+            t = self._task(hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
+                                        "action_id": "allow", "guard": self.req.guard})
+            self.assertIs(rgb._handle_hitl_action(t), False)
+        self.assertIsNone(self._on_disk().chosen_action)
+        self.assertTrue(any("hitl: card click ignored, owner unknown" in m for m in logs), logs)
+
+    def test_registry_with_no_owner_row_fails_closed_too(self):
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        logs = []
+        with self._registry(""), mock.patch.object(rgb, "_log", logs.append):
+            t = self._task(hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
+                                        "action_id": "allow", "guard": self.req.guard})
+            self.assertIs(rgb._handle_hitl_action(t), False)
+        self.assertIsNone(self._on_disk().chosen_action)
+        self.assertTrue(any("owner unknown" in m for m in logs), logs)
+
+    def test_an_ordinary_reply_with_no_owner_logs_nothing(self):
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        logs = []
+        with self._registry(""), mock.patch.object(rgb, "_log", logs.append):
+            self.assertIs(rgb._handle_hitl_action(self._task(reply_to_event="$not-a-card", task="hi")), False)
+        self.assertFalse(any("owner unknown" in m for m in logs), logs)
+
+    def test_unset_variable_uses_the_registry_owner(self):
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        with self._registry(OWNER) as reads:
+            t = self._task(hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
+                                        "action_id": "allow", "guard": self.req.guard})
+            self.assertEqual(rgb._handle_hitl_action(t), "applied")
+            self.assertEqual(self._on_disk().chosen_action, "allow", "the store file records the click")
+            rgb._handle_hitl_action(self._task(task="Allow"))
+            rgb._handle_hitl_action(self._task(hitl_action=dict(t["hitl_action"])))
+        self.assertEqual(len(reads), 1, "the registry is read once within the TTL")
+
+    def test_unset_variable_owner_label_reply_to_the_card_is_applied(self):
+        """The desktop shape: no SPARROW_HA_OWNER, and the owner answers by replying to the card."""
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        self.mgr.record_projection(self.req.id, self.req.revision, "$card-desktop")
+        with self._registry(OWNER):
+            out = rgb._handle_hitl_action(self._task(access_tier="owner", reply_to_event="$card-desktop",
+                                                     task="Allow"))
+        self.assertEqual(out, "applied")
+        self.assertEqual(self._on_disk().chosen_action, "allow")
+
+    def test_unset_variable_non_owner_identical_reply_is_not_applied(self):
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        self.mgr.record_projection(self.req.id, self.req.revision, "$card-desktop-other")
+        with self._registry(OWNER):
+            out = rgb._handle_hitl_action(self._task(user_id="@someone-else:ag2.space", access_tier="owner",
+                                                     reply_to_event="$card-desktop-other", task="Allow"))
+        self.assertIs(out, False, "a non-owner's typed label stays a message")
+        self.assertIsNone(self._on_disk().chosen_action)
+
+    def test_registry_owner_on_another_homeserver_is_never_the_owner(self):
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        with self._registry("@owner:elsewhere.example"):
+            click = self._task(user_id="@owner:elsewhere.example",
+                               hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
+                                            "action_id": "allow", "guard": self.req.guard})
+            self.assertIs(rgb._handle_hitl_action(click), False)
+        self.assertIsNone(self._on_disk().chosen_action)
+
+    def test_event_channel_claimant_acts_on_the_owner_it_claimed_with(self):
+        """A refresh between claims() and offer() must not re-judge the owner's own click."""
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        claimant = rgb._HitlClicks(rgb._hitl_reply_handler("", log=lambda m: None), log=lambda m: None)
+        e = {"type": "message.created", "event_id": "$claimed", "room_id": "!dm:ag2.space", "actor_id": OWNER,
+             "content": {"space.ag2.hitl.action": {"hitl_id": self.req.id, "expected_revision": self.req.revision,
+                                                   "action_id": "allow", "guard": self.req.guard}}}
+        with self._registry(OWNER):
+            self.assertTrue(claimant.claims(e))
+        with mock.patch.object(rgb, "_hitl_owner", lambda: ""):
+            claimant.offer(e)
+        self.assertEqual(self._on_disk().chosen_action, "allow")
+
+    def test_registry_owner_does_not_let_a_non_owner_resolve(self):
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        with self._registry(OWNER):
+            click = self._task(user_id="@someone-else:ag2.space",
+                               hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
+                                            "action_id": "allow", "guard": self.req.guard})
+            self.assertEqual(rgb._handle_hitl_action(click), "ignored")
+        self.assertIsNone(self._on_disk().chosen_action)
+
+    def test_explicit_variable_wins_over_the_registry(self):
+        os.environ["SPARROW_HA_OWNER"] = "@configured:ag2.space"
+        with self._registry(OWNER) as reads:
+            t = self._task(hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
+                                        "action_id": "allow", "guard": self.req.guard})
+            self.assertEqual(rgb._handle_hitl_action(t), "ignored", "the registry owner is not the configured one")
+            t2 = self._task(user_id="@configured:ag2.space", hitl_action=dict(t["hitl_action"]))
+            self.assertEqual(rgb._handle_hitl_action(t2), "applied")
+        self.assertEqual(reads, [], "an explicit owner never reads the registry")
+
+    def test_event_channel_claimant_uses_the_registry_owner(self):
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        claimant = rgb._HitlClicks(rgb._hitl_reply_handler("", log=lambda m: None), log=lambda m: None)
+
+        def ev(actor):
+            return {"type": "message.created", "event_id": f"$e{os.urandom(3).hex()}", "room_id": "!dm:ag2.space",
+                    "actor_id": actor, "content": {"space.ag2.hitl.action": {
+                        "hitl_id": self.req.id, "expected_revision": self.req.revision,
+                        "action_id": "allow", "guard": self.req.guard}}}
+        logs = []
+        claimant._log = logs.append
+        with self._registry(""), mock.patch.object(rgb, "_log", logs.append):
+            self.assertFalse(claimant.claims(ev(OWNER)), "unknown owner: not claimed")
+        self.assertTrue(any("owner unknown" in m for m in logs), logs)
+        rgb._HITL_OWNER.update(mxid="", at=0.0, bad_at=None)
+        with self._registry(OWNER):
+            self.assertTrue(claimant.claims(ev("@someone-else:ag2.space")))
+            claimant.offer(ev("@someone-else:ag2.space"))
+            self.assertIsNone(self._on_disk().chosen_action, "a non-owner never resolves")
+            e = ev(OWNER)
+            self.assertTrue(claimant.claims(e))
+            claimant.offer(e)
+        self.assertEqual(self._on_disk().chosen_action, "allow")
+
+    # -- owner lookup cost and freshness ------------------------------------------
+
+    def _new_req(self):
+        req = self.mgr.create(HumanRequirement(
+            kind="permission", runtime="claude", message="Claude wants to run Bash: ls",
+            guard=f"hook:{os.urandom(4).hex()}", device={"id": "core-1", "name": "core-1"},
+            actions=[Action(id="allow", kind="allow_once", label="Allow"),
+                     Action(id="deny", kind="reject_once", label="Deny")]))
+        return req
+
+    def _click(self, req, actor=OWNER):
+        return self._task(user_id=actor, hitl_action={
+            "hitl_id": req.id, "expected_revision": req.revision, "action_id": "allow", "guard": req.guard})
+
+    @contextlib.contextmanager
+    def _live_registry(self, state, now):
+        """A registry whose owner (state["owner"]) or outage (state["offline"]) can change
+        mid-test, read on a fake clock `now[0]`; yields the reads."""
+        reads = []
+
+        def req(method, path, *a, **k):
+            reads.append(path)
+            if state.get("offline"):
+                raise OSError("gateway unreachable")
+            return {"agents": [{"id": "@me:ag2.space", "owner": state["owner"]}]}
+        with mock.patch.object(rgb, "_req", req), \
+                mock.patch.object(rgb, "_reenroll_identity", lambda: "@me:ag2.space"), \
+                mock.patch.object(rgb, "_hitl_owner_clock", lambda: now[0]), \
+                mock.patch.object(rgb, "_log", lambda m: None):
+            yield reads
+
+    def test_an_ordinary_reply_never_reads_the_registry(self):
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        now = [1000.0]
+        with self._live_registry({"owner": ""}, now) as reads:
+            for _ in range(5):
+                self.assertIs(rgb._handle_hitl_action(self._task(reply_to_event="$not-a-card", task="hi")), False)
+        self.assertEqual(reads, [], "only a recognised click looks the owner up")
+
+    def test_a_failing_lookup_is_retried_only_after_the_backoff(self):
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        now = [1000.0]
+        state = {"offline": True, "owner": OWNER}
+        with self._live_registry(state, now) as reads:
+            for _ in range(3):
+                self.assertIs(rgb._handle_hitl_action(self._click(self.req)), False)
+            self.assertEqual(len(reads), 1, "a failed read is not retried on every click")
+            state["offline"] = False
+            now[0] += rgb.HITL_OWNER_RETRY_S + 1
+            self.assertEqual(rgb._handle_hitl_action(self._click(self.req)), "applied")
+            self.assertEqual(len(reads), 2)
+        self.assertEqual(self._on_disk().chosen_action, "allow")
+
+    def test_a_former_owner_loses_click_power_after_the_ttl(self):
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        now = [1000.0]
+        state = {"owner": OWNER}
+        new_owner = "@new-owner:ag2.space"
+        with self._live_registry(state, now) as reads:
+            self.assertEqual(rgb._handle_hitl_action(self._click(self.req)), "applied")
+            state["owner"] = new_owner  # the agent is re-linked
+            now[0] += rgb.HITL_OWNER_TTL_S - 1
+            within = self._new_req()
+            self.assertEqual(rgb._handle_hitl_action(self._click(within)), "applied", "cached inside the TTL")
+            now[0] += 2
+            after = self._new_req()
+            self.assertEqual(rgb._handle_hitl_action(self._click(after)), "ignored", "old owner refused after the TTL")
+            self.assertIsNone(self.mgr.get(after.id).chosen_action)
+            self.assertEqual(rgb._handle_hitl_action(self._click(after, actor=new_owner)), "applied")
+        self.assertEqual(len(reads), 2)
+
+    def test_a_failed_refresh_after_the_ttl_fails_closed(self):
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        now = [1000.0]
+        state = {"owner": OWNER}
+        with self._live_registry(state, now):
+            self.assertEqual(rgb._handle_hitl_action(self._click(self.req)), "applied")
+            state["offline"] = True
+            now[0] += rgb.HITL_OWNER_TTL_S + 1
+            later = self._new_req()
+            self.assertIs(rgb._handle_hitl_action(self._click(later)), False, "an expired owner is not reused")
+        self.assertIsNone(self.mgr.get(later.id).chosen_action)
+
+    def test_a_concurrent_refresh_never_lets_a_delayed_read_clobber_a_fresher_one(self):
+        """Two callers refresh past the TTL at the same time: a registry read that
+        started first but answers last must not re-authorize a former owner over
+        one a faster, later-started read already committed."""
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        OLD, NEW = OWNER, "@new-owner:ag2.space"
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def req(method, path, *a, **k):
+            idx = len(calls)
+            calls.append(idx)
+            if idx == 0:
+                entered.set()
+                self.assertTrue(release.wait(timeout=5), "test setup: never released")
+                return {"agents": [{"id": "@me:ag2.space", "owner": OLD}]}
+            return {"agents": [{"id": "@me:ag2.space", "owner": NEW}]}
+
+        results = {}
+        b_done = threading.Event()
+
+        def call_a():
+            results["a"] = rgb._hitl_owner()
+
+        def call_b():
+            results["b"] = rgb._hitl_owner()
+            b_done.set()
+
+        with mock.patch.object(rgb, "_req", req), \
+                mock.patch.object(rgb, "_reenroll_identity", lambda: "@me:ag2.space"), \
+                mock.patch.object(rgb, "_log", lambda m: None):
+            ta = threading.Thread(target=call_a)
+            ta.start()
+            self.assertTrue(entered.wait(timeout=5), "the first read never started")
+            tb = threading.Thread(target=call_b)
+            tb.start()
+            self.assertFalse(b_done.wait(timeout=0.3),
+                              "a second refresh completed while the first was still in flight")
+            release.set()
+            ta.join(timeout=5)
+            tb.join(timeout=5)
+
+        self.assertEqual(len(calls), 1, "only one registry read happens across the race window")
+        self.assertEqual(results["a"], OLD)
+        self.assertEqual(results["b"], OLD, "the second caller reuses the first's fresh result, not a stale re-read")
+        self.assertEqual(rgb._HITL_OWNER["mxid"], OLD)
+
+        # The cache this produced is genuinely fresh: a click from NEW alone must not
+        # resolve until a real re-read happens (it was never the committed owner).
+        click = self._click(self._new_req(), actor=NEW)
+        self.assertEqual(rgb._handle_hitl_action(click), "ignored")
+
+    def test_registry_owner_never_matches_a_row_keyed_by_the_same_empty_string(self):
+        """A missing local identity (_reenroll_identity() == "") must not match a
+        malformed registry row whose own id also reads as ""."""
+        reads = []
+
+        def req(method, path, *a, **k):
+            reads.append(path)
+            return {"agents": [{"id": "", "owner": "@other:ag2.space"}]}
+
+        with mock.patch.object(rgb, "_req", req), mock.patch.object(rgb, "_reenroll_identity", lambda: ""):
+            self.assertEqual(rgb._registry_owner(), ("", ""))
+        self.assertEqual(reads, [], "no local identity to match: never even asks the registry")
+
+    def test_no_hitl_store_on_this_host_leaves_the_click_a_task(self):
+        with mock.patch.object(rgb, "_hitl_reply_handler", lambda *a, **k: None):
+            self.assertIs(rgb._handle_hitl_action(self._click(self.req)), False)
+        real = rgb._hitl_reply_handler
+        with mock.patch.object(rgb, "_hitl_reply_handler",
+                               side_effect=[real("", log=lambda m: None), None]):
+            self.assertIs(rgb._handle_hitl_action(self._click(self.req)), False,
+                          "the store went away after the click was recognised")
+        self.assertIsNone(self._on_disk().chosen_action)
+
 
     def test_redelivered_click_is_consumed_without_a_second_apply(self):
         t = self._task(hitl_action={"hitl_id": self.req.id, "expected_revision": self.req.revision,
@@ -150,6 +515,88 @@ class TaskRelayClickTests(unittest.TestCase):
         self.assertEqual(rgb._handle_hitl_action(t), "applied")
         rgb._queue_review_control_result(t)
         self.assertEqual(json.loads(rgb._control_result_path(t["id"]).read_text())["body"], "[no-send]")
+
+
+class _NoThread:
+    def __init__(self, *a, **k):
+        pass
+
+    def start(self):
+        pass
+
+
+class EventChannelWiringTests(unittest.TestCase):
+    """_maybe_start_event_channel: which claimants sit ahead of taskify, and when cards are posted."""
+
+    def setUp(self):
+        self._env = {k: os.environ.get(k) for k in
+                     ("SPARROW_EVENTS", "SPARROW_HA_OWNER", "SPARROW_HA_ROOM", "SPARROW_OBSERVE_REACT")}
+        os.environ["SPARROW_EVENTS"] = "1"
+        os.environ.pop("SPARROW_OBSERVE_REACT", None)
+        rgb._STATE.mkdir(parents=True, exist_ok=True)  # the event inbox db lives there
+
+    def tearDown(self):
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        rgb._EVENT_CHANNEL = None
+
+    def _wire(self):
+        from ag2_sparrow import event_consumer, human_action
+        grabbed, posters = {}, []
+
+        class Consumer:
+            def __init__(self, inbox, handler, **kw):
+                grabbed["handler"] = handler
+
+        class Poster:
+            def __init__(self, store, url, headers, room, **kw):
+                posters.append(room)
+        with mock.patch("threading.Thread", _NoThread), \
+                mock.patch.object(event_consumer, "EventConsumer", Consumer), \
+                mock.patch.object(human_action, "CardPoster", Poster), \
+                mock.patch.object(rgb, "_log", lambda m: None):
+            rgb._maybe_start_event_channel()
+        return grabbed["handler"], posters
+
+    def _chain(self, handler):
+        from ag2_sparrow.human_action import HandlerChain
+        self.assertIsInstance(handler, HandlerChain)
+        return handler._handlers
+
+    def test_set_owner_and_room_wires_decisions_then_hitl_then_taskify_and_posts_cards(self):
+        from ag2_sparrow.event_consumer import TaskifyHandler
+        from ag2_sparrow.human_action import DecisionHandler
+        os.environ["SPARROW_HA_OWNER"] = OWNER
+        os.environ["SPARROW_HA_ROOM"] = "!cards:ag2.space"
+        handler, posters = self._wire()
+        chain = self._chain(handler)
+        self.assertEqual([type(h) for h in chain],
+                         [DecisionHandler, rgb._ClaudeLocalClicks, rgb._HitlClicks, TaskifyHandler])
+        self.assertEqual(chain[0]._owner, OWNER, "decisions are judged against the configured owner")
+        self.assertEqual(chain[1].owner, OWNER, "claude-local clicks keep the configured owner")
+        self.assertEqual(rgb._hitl_owner(), OWNER, "the HITL claimant resolves the same owner")
+        self.assertEqual(posters, ["!cards:ag2.space"])
+
+    def test_set_owner_without_a_room_posts_no_cards(self):
+        from ag2_sparrow.human_action import DecisionHandler
+        os.environ["SPARROW_HA_OWNER"] = OWNER
+        os.environ.pop("SPARROW_HA_ROOM", None)
+        handler, posters = self._wire()
+        self.assertIsInstance(self._chain(handler)[0], DecisionHandler)
+        self.assertEqual(posters, [])
+
+    def test_unset_owner_wires_only_the_hitl_claimants(self):
+        from ag2_sparrow.event_consumer import TaskifyHandler
+        os.environ.pop("SPARROW_HA_OWNER", None)
+        os.environ["SPARROW_HA_ROOM"] = "!cards:ag2.space"
+        handler, posters = self._wire()
+        chain = self._chain(handler)
+        self.assertEqual([type(h) for h in chain], [rgb._ClaudeLocalClicks, rgb._HitlClicks, TaskifyHandler])
+        self.assertIsNone(chain[0].owner, "claude-local clicks read the owner at each click")
+        self.assertEqual(posters, [], "no owner, no decision cards")
 
 
 if __name__ == "__main__":

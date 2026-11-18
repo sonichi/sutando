@@ -28,6 +28,11 @@ LIVE_FILE="$WORK/live"
 case "\$3" in
   has-session) name="\$5"; name="\${name#=}"; grep -qx "\$name" "\$LIVE_FILE" 2>/dev/null; exit \$? ;;
   new-session) printf '%s\n' "\$@" >> "$WORK/new-session.log"; exit 0 ;;
+  show-environment)
+    # The worker's own session answers from workerenv, its supervisor from supenv; one variable each.
+    f="$WORK/supenv"; [ "\$5" = "=sutando-worker-w-abc123" ] && f="$WORK/workerenv"
+    grep -E "^-?\$6(=|\$)" "\$f" 2>/dev/null; exit 0 ;;
+  kill-session) echo "\$5" >> "$WORK/kill.log"; exit 0 ;;
 esac
 exit 0
 EOF
@@ -71,6 +76,7 @@ grep -q "started sutando-worker-w-abc123-watcher" "$WORK/c.out" && r=0 || r=1; c
 
 # (d) supervisor already up: nothing more is started.
 printf '%s\n' "sutando-worker-w-abc123" "sutando-worker-w-abc123-watcher" > "$WORK/live"
+printf '%s\n' "SUTANDO_STOP_INTERRUPT=" "SUTANDO_STANDBY_MODE=type" "SUTANDO_STANDBY_ALERT_KNOBS=//" > "$WORK/supenv"
 bash "$ENSURE" >"$WORK/d.out" 2>"$WORK/d.err"; rc=$?
 check "(d) supervisor already up -> exit 0" "$rc"
 grep -q "already running" "$WORK/d.out" && r=0 || r=1; check "(d) ...saying so" "$r"
@@ -98,6 +104,90 @@ kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null; sleep 0.5
 bash "$ENSURE" >"$WORK/f2.out" 2>"$WORK/f2.err"; rc=$?
 check "(f) ...and once the holder is gone the same ensure starts one" "$rc" "$(cat "$WORK/f2.err")"
 [ "$(grep -c '^new-session$' "$WORK/new-session.log" 2>/dev/null)" = 1 ] && r=0 || r=1; check "(f) ...exactly one new-session" "$r"
+
+# (g) the Stop interrupt switch reaches the worker's watcher, and a change replaces a running one.
+rm -f "$WORK/new-session.log" "$WORK/kill.log"
+printf '%s\n' "sutando-worker-w-abc123" "sutando-worker-w-abc123-watcher" > "$WORK/live"
+printf '%s\n' "-SUTANDO_STOP_INTERRUPT" "SUTANDO_STANDBY_MODE=type" "SUTANDO_STANDBY_ALERT_KNOBS=//" > "$WORK/supenv"
+SUTANDO_STOP_INTERRUPT=1 bash "$ENSURE" >"$WORK/g.out" 2>"$WORK/g.err"; rc=$?
+check "(g) switch turned on while running -> exit 0" "$rc" "$(cat "$WORK/g.err")"
+grep -qx "=sutando-worker-w-abc123-watcher" "$WORK/kill.log" 2>/dev/null && r=0 || r=1; check "(g) ...the old watcher is replaced" "$r"
+grep -qx "SUTANDO_STOP_INTERRUPT=1" "$WORK/new-session.log" 2>/dev/null && r=0 || r=1; check "(g) ...and the new one carries the switch" "$r"
+rm -f "$WORK/new-session.log" "$WORK/kill.log"
+printf '%s\n' "SUTANDO_STOP_INTERRUPT=1" "SUTANDO_STANDBY_MODE=type" "SUTANDO_STANDBY_ALERT_KNOBS=//" > "$WORK/supenv"
+SUTANDO_STOP_INTERRUPT=1 bash "$ENSURE" >"$WORK/g2.out" 2>"$WORK/g2.err"
+grep -q "already running" "$WORK/g2.out" && [ ! -e "$WORK/kill.log" ] && r=0 || r=1; check "(g) the same switch -> left running" "$r"
+bash "$ENSURE" >"$WORK/g3.out" 2>"$WORK/g3.err"
+[ -e "$WORK/kill.log" ] && r=0 || r=1; check "(g) switch unset (rollback) -> replaced" "$r"
+grep -qx "SUTANDO_STOP_INTERRUPT=" "$WORK/new-session.log" && r=0 || r=1; check "(g) ...with an explicit empty value, never the server's global" "$r"
+rm -f "$WORK/kill.log"; printf "%s\n" "-SUTANDO_STOP_INTERRUPT" "SUTANDO_STANDBY_MODE=type" "SUTANDO_STANDBY_ALERT_KNOBS=//" > "$WORK/supenv"
+bash "$ENSURE" >"$WORK/g4.out" 2>"$WORK/g4.err"
+[ -e "$WORK/kill.log" ] && r=0 || r=1; check "(g) a watcher the session never set it for is replaced" "$r"
+rm -f "$WORK/supenv"
+
+# (h) the standby mode follows the worker session's task-watch Mod marker: a Claude worker with
+# the Mod gets the alert-only standby; without it, or on Codex, the typing standby; a change replaces.
+mode_of_start() {  # mode_of_start <workerenv line> [runtime] -> the SUTANDO_STANDBY_MODE the new supervisor carries
+  rm -f "$WORK/new-session.log" "$WORK/kill.log" "$WORK/supenv"
+  echo "sutando-worker-w-abc123" > "$WORK/live"
+  printf '%s\n' "$1" > "$WORK/workerenv"
+  SUTANDO_WORKER_RUNTIME="${2:-claude}" bash "$ENSURE" >/dev/null 2>&1
+  grep '^SUTANDO_STANDBY_MODE=' "$WORK/new-session.log" 2>/dev/null
+}
+[ "$(mode_of_start SUTANDO_TASK_WATCH_MOD=1)" = "SUTANDO_STANDBY_MODE=alert" ] && r=0 || r=1
+check "(h) Claude worker with the Mod -> alert-only standby" "$r" "$(mode_of_start SUTANDO_TASK_WATCH_MOD=1)"
+[ "$(mode_of_start SUTANDO_TASK_WATCH_MOD=)" = "SUTANDO_STANDBY_MODE=type" ] && r=0 || r=1; check "(h) Claude worker, Mod refused (empty marker) -> typing standby" "$r"
+[ "$(mode_of_start -SUTANDO_TASK_WATCH_MOD)" = "SUTANDO_STANDBY_MODE=type" ] && r=0 || r=1; check "(h) Claude worker, no marker -> typing standby" "$r"
+[ "$(mode_of_start SUTANDO_TASK_WATCH_MOD=1 codex)" = "SUTANDO_STANDBY_MODE=type" ] && r=0 || r=1; check "(h) Codex worker, even with the marker -> typing standby" "$r"
+grep -qx "SUTANDO_NOTIFIER_SCRIPT=$REPO/src/agent/codex/cli/task-notifier.sh" "$WORK/new-session.log" && r=0 || r=1; check "(h) ...on the Codex notifier" "$r"
+rm -f "$WORK/new-session.log" "$WORK/kill.log"
+printf '%s\n' "sutando-worker-w-abc123" "sutando-worker-w-abc123-watcher" > "$WORK/live"
+printf '%s\n' "SUTANDO_TASK_WATCH_MOD=1" > "$WORK/workerenv"
+printf '%s\n' "SUTANDO_STOP_INTERRUPT=" "SUTANDO_STANDBY_MODE=type" "SUTANDO_STANDBY_ALERT_KNOBS=//" > "$WORK/supenv"
+bash "$ENSURE" >"$WORK/h.out" 2>&1
+[ -e "$WORK/kill.log" ] && grep -qx "SUTANDO_STANDBY_MODE=alert" "$WORK/new-session.log" && r=0 || r=1
+check "(h) a typing supervisor on a Mod worker is replaced by an alert-only one" "$r" "$(cat "$WORK/h.out")"
+rm -f "$WORK/new-session.log" "$WORK/kill.log"
+printf '%s\n' "SUTANDO_STOP_INTERRUPT=" "SUTANDO_STANDBY_MODE=alert" "SUTANDO_STANDBY_ALERT_KNOBS=//" > "$WORK/supenv"
+bash "$ENSURE" >"$WORK/h2.out" 2>&1
+grep -q "already running" "$WORK/h2.out" && [ ! -e "$WORK/kill.log" ] && r=0 || r=1; check "(h) ...and an alert-only one is left running" "$r"
+rm -f "$WORK/supenv" "$WORK/workerenv"
+
+# (i) the alert-only knobs are always set on the supervisor (empty: the supervisor's default, never the
+# server's global), a custom value (REPEAT=0 included) reaches it, and a change replaces it.
+rm -f "$WORK/new-session.log" "$WORK/kill.log" "$WORK/supenv"
+echo "sutando-worker-w-abc123" > "$WORK/live"
+bash "$ENSURE" >/dev/null 2>&1
+grep -qx "SUTANDO_NOTIFIER_ALERT_GRACE=" "$WORK/new-session.log" && grep -qx "SUTANDO_NOTIFIER_ALERT_REPEAT=" "$WORK/new-session.log" \
+  && grep -qx "SUTANDO_NOTIFIER_ALERT_PILEUP=" "$WORK/new-session.log" && r=0 || r=1
+check "(i) unset knobs are passed empty, so a server-global value never reaches the supervisor" "$r"
+rm -f "$WORK/new-session.log"
+SUTANDO_NOTIFIER_ALERT_GRACE=60 SUTANDO_NOTIFIER_ALERT_REPEAT=0 bash "$ENSURE" >/dev/null 2>&1
+grep -qx "SUTANDO_NOTIFIER_ALERT_GRACE=60" "$WORK/new-session.log" && grep -qx "SUTANDO_NOTIFIER_ALERT_REPEAT=0" "$WORK/new-session.log" && r=0 || r=1
+check "(i) custom knobs, REPEAT=0 included, reach the supervisor" "$r"
+rm -f "$WORK/new-session.log" "$WORK/kill.log"
+printf '%s\n' "sutando-worker-w-abc123" "sutando-worker-w-abc123-watcher" > "$WORK/live"
+printf '%s\n' "SUTANDO_STOP_INTERRUPT=" "SUTANDO_STANDBY_MODE=type" "SUTANDO_STANDBY_ALERT_KNOBS=//" > "$WORK/supenv"
+SUTANDO_NOTIFIER_ALERT_REPEAT=0 bash "$ENSURE" >"$WORK/i.out" 2>&1
+[ -e "$WORK/kill.log" ] && grep -qx "SUTANDO_NOTIFIER_ALERT_REPEAT=0" "$WORK/new-session.log" && r=0 || r=1
+check "(i) a changed knob replaces a running supervisor" "$r" "$(cat "$WORK/i.out")"
+rm -f "$WORK/new-session.log" "$WORK/kill.log"
+printf '%s\n' "SUTANDO_STOP_INTERRUPT=" "SUTANDO_STANDBY_MODE=type" "SUTANDO_STANDBY_ALERT_KNOBS=/0/" > "$WORK/supenv"
+SUTANDO_NOTIFIER_ALERT_REPEAT=0 bash "$ENSURE" >"$WORK/i2.out" 2>&1
+grep -q "already running" "$WORK/i2.out" && [ ! -e "$WORK/kill.log" ] && r=0 || r=1; check "(i) ...and the same knobs leave it running" "$r"
+rm -f "$WORK/supenv"
+# (j) the pile-up threshold: forwarded, in the supervisor's identity, so a change replaces it.
+rm -f "$WORK/new-session.log" "$WORK/kill.log"
+printf '%s\n' "SUTANDO_STOP_INTERRUPT=" "SUTANDO_STANDBY_MODE=type" "SUTANDO_STANDBY_ALERT_KNOBS=//" > "$WORK/supenv"
+SUTANDO_NOTIFIER_ALERT_PILEUP=5 bash "$ENSURE" >"$WORK/j.out" 2>&1
+[ -e "$WORK/kill.log" ] && grep -qx "SUTANDO_NOTIFIER_ALERT_PILEUP=5" "$WORK/new-session.log" \
+  && grep -qx "SUTANDO_STANDBY_ALERT_KNOBS=//5" "$WORK/new-session.log" && r=0 || r=1
+check "(j) a changed pile-up threshold reaches the supervisor and replaces a running one" "$r" "$(cat "$WORK/j.out")"
+rm -f "$WORK/new-session.log" "$WORK/kill.log"
+printf '%s\n' "SUTANDO_STOP_INTERRUPT=" "SUTANDO_STANDBY_MODE=type" "SUTANDO_STANDBY_ALERT_KNOBS=//5" > "$WORK/supenv"
+SUTANDO_NOTIFIER_ALERT_PILEUP=5 bash "$ENSURE" >"$WORK/j2.out" 2>&1
+grep -q "already running" "$WORK/j2.out" && [ ! -e "$WORK/kill.log" ] && r=0 || r=1; check "(j) ...and the same threshold leaves it running" "$r"
+rm -f "$WORK/supenv"
 
 if [ "$fail" = 0 ]; then echo "  ok  one supervisor per worker inbox, idempotent"; else echo "  FAILED"; fi
 exit "$fail"

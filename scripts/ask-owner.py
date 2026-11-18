@@ -12,6 +12,9 @@ The ask belongs to the store adapter an installed skill declares, resolved here 
 installed roots (src/skill_roots.py; --store-adapter overrides): with --task-file it routes
 the question to that task's own conversation, records it as a row of the owner's room
 database, holds it in the workspace outbox while the room is unreachable, and reminds.
+With --default and/or --option, a question bound for AG2 Space is asked as a decision card
+(one button per choice) instead of text; the owner's click comes back as a `hitl_click: true`
+task, and `python3 src/pending_questions_reader.py clicks` hands it to the core.
 Always exits 0 after a non-empty question: every failure is printed, never raised. With
 --unless-open, a question whose title matches one the store holds open is reported
 (`already open: [<id>]`) and not filed again, so a carried list can be filed without doubling rows.
@@ -30,7 +33,8 @@ REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allo
 sys.path.insert(0, str(REPO / "src"))
 import pending_questions_reader as reader  # noqa: E402
 from local_record import RecordDir, iso, new_name, write_text_whole
-from proactive_routing import proactive_filename
+from proactive_routing import proactive_filename, proactive_worker
+from result_publish import worker_published_path
 from result_markers import neutralize_markers
 from skill_roots import declared
 from util_paths import host_label
@@ -45,30 +49,54 @@ def _option(text: str):
     return label.strip(), consequence.strip()
 
 
+def _asker(name: str, ws: Path):
+    try:
+        import connections  # noqa: PLC0415 — heavy loader
+        return connections.proactive_author_agent(name, ws)
+    except Exception:  # noqa: BLE001 — a missing asker never blocks the ask
+        return None
+
+
+def _speaker(name, ws: Path) -> str:
+    try:
+        import connections  # noqa: PLC0415 — heavy loader
+        return connections.proactive_author_phrase(name, host_label(), ws)
+    except Exception:  # noqa: BLE001 — an unreadable name never blocks the ask
+        return f"a worker on {host_label()}" if proactive_worker(name or "") else f"the {host_label()} core"
+
+
 def ask_without_store(question: str, context, ws: Path, why: str) -> list:
     """Core's part alone: the DM through the proactive path, then one generic local record.
     Returns the report lines; nothing raises past here."""
     from workspace_default import status_path  # noqa: PLC0415 — heavy loader
     name = new_name("ask")
     title = " ".join(neutralize_markers(question).split())[:120]
-    body = f"[dm-only]\nQuestion for you from the {host_label()} core — it needs your word:\n\n" \
+    lines = [f"recorded: NO STORE — {why}; nothing lists, counts, closes or reminds this question"]
+    queued, send_error, asker, target = None, None, None, None
+    try:
+        target = worker_published_path(ws / "results" / proactive_filename(name, None), workspace=ws)
+    except Exception as e:  # noqa: BLE001 — reported below; the record still says it was asked
+        send_error = f"{type(e).__name__}: {e}"
+    speaker = neutralize_markers(_speaker(target.name if target else None, ws))
+    body = f"[dm-only]\nQuestion for you from {speaker} — it needs your word:\n\n" \
            f"{neutralize_markers(question).strip()}\n"
     if context and context.strip():
         body += f"\n{neutralize_markers(context).strip()}\n"
     body += "\nReply here.\n"
-    lines = [f"recorded: NO STORE — {why}; nothing lists, counts, closes or reminds this question"]
-    queued, send_error = None, None
-    try:
-        queued = write_text_whole(ws / "results" / proactive_filename(name, None), body)  # a drain claims it on sight
-        lines.append(f"sent: queued owner-dm (last-active bridge) via results/{queued.name} "
-                     "(a bridge drain delivers it; nothing re-raises it without the skill)")
-    except Exception as e:  # noqa: BLE001 — the record below still says it was asked
-        send_error = f"{type(e).__name__}: {e}"
+    if target is not None:
+        try:
+            asker = _asker(target.name, ws)
+            queued = write_text_whole(target, body)  # a drain claims it on sight
+            lines.append(f"sent: queued owner-dm (last-active bridge) via results/{queued.name} "
+                         "(a bridge drain delivers it; nothing re-raises it without the skill)")
+        except Exception as e:  # noqa: BLE001 — the record below still says it was asked
+            send_error = f"{type(e).__name__}: {e}"
+    if queued is None:
         lines.append(f"sent: FAILED — {send_error} (ask by hand)")
     try:
         p = RecordDir(status_path(RECORDS, ws)).write(name, {
             "id": name, "title": title, "body": body, "created": iso(),
-            "queued": queued.name if queued else None, "error": send_error})
+            "queued": queued.name if queued else None, "error": send_error, "asked_by": asker})
         lines.append(f"record: {p}")
     except Exception as e:  # noqa: BLE001
         lines.append(f"record: FAILED — {type(e).__name__}: {e} (NOT recorded anywhere; ask by hand)")

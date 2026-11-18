@@ -19,6 +19,12 @@ DNS policy) to leak into the shared module. This module is strictly pure:
     prints diagnostics, refreshes tokens, sends HTTP, mutates globals,
     or decides agent identity.
 
+It also holds the masking contract: the secret registry (an object the caller
+owns), the renderings a secret can take, and what a log line, a status field
+or a gateway-supplied value may carry (code_field, version_field, redact_text,
+safe_status, describe, scrub_exception). It is the only implementation: a
+consumer holds one registry for its sinks and calls these, never a copy.
+
 Consumers own those as runtime adapters and feed plain values in.
 
 Promotion contract: when a THIRD consumer appears (CLI/MCP/external), this
@@ -27,9 +33,16 @@ convert to a dependency with this API unchanged.
 """
 from __future__ import annotations
 
+import errno as _errno
+import math
+import os.path
 import re
+import socket
+import threading
+import unicodedata
+import urllib.parse
 from dataclasses import dataclass, field
-from typing import Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 # Canonical alias precedence (earlier wins). GATEWAY_* primary; RELAY_* and
 # REMOTE_TASK_* transition aliases; AG2_* legacy.
@@ -114,3 +127,619 @@ def normalize_credentials(raw_token_value: str,
     base = normalize_gateway_url(explicit_url or url_from_token or fallback_url)
     return GatewayCredentials(base_url=base, token=token,
                               source=source if token else "none")
+
+
+# Masking, still pure: a SecretRegistry is an object its caller owns and fills with plain values;
+# nothing here reads a credential source, keeps process-wide state, or writes anywhere.
+
+WITHHELD = "<withheld>"
+WITHHELD_TEXT = "<text withheld: it may contain a credential>"
+REDACTED_URL = "<unparseable gateway URL>"
+REDACTED_TEXT = "<text withheld: it may contain the gateway URL>"
+BARE_SECRET_MIN = 8  # a bare URL piece shorter than this would withhold ordinary words
+_CODE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+
+def fold(text: str) -> str:
+    """The form secrets are matched in: case-folded. A token is case-sensitive as a credential,
+    but an echo of it in another case still reveals it."""
+    return str(text).casefold()
+
+
+def _utf8(s: str) -> "tuple[bytes, ...]":
+    try:
+        return (s.encode("utf-8", "surrogateescape"),)  # a non-UTF-8 environment byte, as its byte
+    except UnicodeEncodeError:
+        # A lone high surrogate: as its UTF-8 bytes, and escaped.
+        return s.encode("utf-8", "surrogatepass"), s.encode("utf-8", "backslashreplace")
+
+
+def forms(secret: str) -> "set[str]":
+    """The ways a secret can be rendered in diagnostic text: raw, escaped as repr and
+    unicode_escape render it, and percent-encoded or -decoded. Total over any str."""
+    out = set()
+    for s in {secret, urllib.parse.unquote(secret), urllib.parse.unquote_plus(secret)}:
+        out |= {s, repr(s)[1:-1], s.encode("unicode_escape").decode("ascii"),
+                ascii(s)[1:-1], s.encode("ascii", "backslashreplace").decode("ascii")}
+        out |= {quote(raw, safe=safe) for raw in _utf8(s) for quote in (urllib.parse.quote, urllib.parse.quote_plus)
+                for safe in ("", "/=&?#:@")}
+    return {f for f in out if f}
+
+
+def _views(text: str) -> "set[str]":
+    """`text` as matched: raw, percent-decoded, systemd-unescaped and with its quotes off, so no
+    quoting or escaping in the rendered line decides whether a secret in it is seen."""
+    texts = {text, urllib.parse.unquote(text), urllib.parse.unquote_plus(text)}
+    texts |= {systemd_unescape(t) for t in tuple(texts)}
+    return {fold(v) for t in texts for v in (t, _unquoted(t))}
+
+
+_SYSTEMD_ESCAPE_RE = re.compile(r"\\(x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8}|[0-7]{3}|.)", re.S)
+_SYSTEMD_SIMPLE = {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v", "s": " "}
+
+
+def _unescape_one(m: "re.Match[str]") -> str:
+    e = m.group(1)
+    try:
+        if len(e) > 1 and e[0] in "xuU":
+            return chr(int(e[1:], 16))
+        if len(e) == 3:
+            return chr(int(e, 8))
+    except (ValueError, OverflowError):
+        return m.group(0)
+    return _SYSTEMD_SIMPLE.get(e, e)
+
+
+def systemd_unescape(text: str) -> str:
+    """`text` with the C-style escapes systemd decodes in a unit value (\\xNN, \\NNN, \\uNNNN,
+    \\UNNNNNNNN, \\s and the single-letter ones) decoded. Total over any str."""
+    return _SYSTEMD_ESCAPE_RE.sub(_unescape_one, str(text))
+
+
+def _unquoted(text: str) -> str:
+    return text.replace('"', "").replace("'", "")
+
+
+def systemd_words(text: str) -> "list[str]":
+    """`text` split into words as systemd splits an Environment= value: space, tab, CR or LF
+    outside quotes, quotes anywhere in a word removed, escapes decoded. An unclosed quote runs to
+    the end."""
+    words, cur, quote, started, i = [], [], "", False, 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            cur.append(text[i:i + 2])
+            started, i = True, i + 2
+            continue
+        if quote:
+            if ch == quote:
+                quote = ""
+            else:
+                cur.append(ch)
+        elif ch in "\"'":
+            quote, started = ch, True
+        elif ch in " \t\r\n":
+            if started:
+                words.append("".join(cur))
+            cur, started = [], False
+        else:
+            cur.append(ch)
+            started = True
+        i += 1
+    if started:
+        words.append("".join(cur))
+    return [systemd_unescape(w) for w in words]
+
+
+class SecretRegistry:
+    """The secrets one process holds, each with every rendering of it, case-folded. A token is
+    opaque and matched at any length; a bare URL piece passes min_len=BARE_SECRET_MIN."""
+
+    def __init__(self) -> None:
+        self._secrets: "dict[str, frozenset[str]]" = {}
+        self._lock = threading.Lock()
+
+    def register(self, value: Any, min_len: int = 1) -> None:
+        if not isinstance(value, str) or not value or len(value) < min_len:
+            return
+        rendered = frozenset(fold(f) for f in forms(value))
+        with self._lock:
+            self._secrets[value] = rendered
+
+    def register_gateway_url(self, url: str) -> None:
+        """Every credential part of a gateway URL: each delimited part at any length, and the bare
+        userinfo, username, password, query values and fragment when long enough alone."""
+        url = str(url or "")
+        for part in secret_parts(url):
+            self.register(part)
+        userinfo, query, fragment = _split_by_hand(url)
+        username, _, password = userinfo.partition(":")
+        for value in (userinfo, username, password, fragment,
+                      *(pair.partition("=")[2] for pair in re.split(r"[&;]", query))):
+            self.register(value, min_len=BARE_SECRET_MIN)
+
+    def _rendered(self) -> "list[frozenset[str]]":
+        with self._lock:
+            return list(self._secrets.values())
+
+    def contains(self, text: str) -> bool:
+        """Whether any registered secret survives in `text`, in any rendering and letter case."""
+        views = _views(str(text))
+        return any(f in v for fs in self._rendered() for f in fs for v in views)
+
+    def holds_or_is_piece(self, value: str) -> bool:
+        """Whether `value` holds a registered secret or is itself a piece of one."""
+        token = fold(value)
+        return self.contains(value) or any(token in f for fs in self._rendered() for f in fs)
+
+    def scrub(self, text: str) -> str:
+        """`text`, or WITHHELD_TEXT when a registered secret survives in it."""
+        return WITHHELD_TEXT if self.contains(text) else str(text)
+
+
+def redact_url(value: str) -> str:
+    """Scheme, host, port and path of a gateway URL: userinfo, query and fragment dropped. Fails
+    closed: REDACTED_URL when it does not parse as one."""
+    try:
+        p = urllib.parse.urlsplit(str(value))
+        if not p.scheme or not p.hostname:
+            return REDACTED_URL
+        host = f"[{p.hostname}]" if ":" in p.hostname else p.hostname
+        if p.port:
+            host = f"{host}:{p.port}"
+        return urllib.parse.urlunsplit((p.scheme, host, p.path, "", ""))
+    except Exception:  # noqa: BLE001 - redaction must never raise
+        return REDACTED_URL
+
+
+def _split_by_hand(url: str) -> "tuple[str, str, str]":
+    before, _, fragment = url.partition("#")
+    _, _, query = before.partition("?")
+    userinfo = before.partition("://")[2].partition("/")[0].rpartition("@")[0]
+    return userinfo, query, fragment
+
+
+def secret_parts(url: str) -> "list[str]":
+    """Each part of the URL that may carry a credential, with the delimiter the URL itself puts
+    before it, so a part of any length is matched where URL text renders it. Split by hand as
+    well as by urlsplit, which drops tab, CR and LF from the parts it returns."""
+    splits = [_split_by_hand(url)]
+    try:
+        p = urllib.parse.urlsplit(url)
+        splits.append((p.netloc.rpartition("@")[0], p.query, p.fragment))
+    except Exception:  # noqa: BLE001 - the hand split stands alone
+        pass
+    parts = []
+    for userinfo, query, fragment in splits:
+        if userinfo:
+            parts.append(userinfo + "@")
+            if ":" in userinfo:
+                parts.append(":" + userinfo.partition(":")[2] + "@")
+        if query:
+            parts.append("?" + query)
+            for pair in re.split(r"[&;]", query):
+                key, eq, value = pair.partition("=")
+                parts += [pair, "=" + value] if eq else ["?" + pair, "&" + pair, ";" + pair]
+        if fragment:
+            parts.append("#" + fragment)
+    return [p for p in dict.fromkeys(parts) if p not in ("=", "?", "&", ";", "#", "@", ":@")]
+
+
+def _url_form_re(form: str) -> "re.Pattern[str]":
+    """`form` with its scheme and host matched in any case, and the rest exactly."""
+    scheme, sep, rest = form.partition("://")
+    if not sep:
+        return re.compile(re.escape(form))
+    authority, slash, tail = rest.partition("/")
+    userinfo, at, host = authority.rpartition("@")
+    return re.compile(f"(?i:{re.escape(scheme + sep)})" + re.escape(userinfo + at)
+                      + f"(?i:{re.escape(host)})" + re.escape(slash + tail))
+
+
+def redact_text(text: str, gateway_url: str) -> str:
+    """Diagnostic text with the full gateway URL replaced by its redacted form. Fails closed:
+    REDACTED_TEXT when any credential-bearing part of the URL survives in any rendering."""
+    text, url = str(text), str(gateway_url or "")
+    if not url:
+        return text
+    for form in sorted(forms(url), key=len, reverse=True):
+        text = _url_form_re(form).sub(lambda _m: redact_url(url), text)
+    views = _views(text)
+    for part in secret_parts(url):
+        if any(fold(form) in view for form in forms(part) for view in views):
+            return REDACTED_TEXT
+    return text
+
+
+def code_field(value: Any, registry: "SecretRegistry | None" = None, gateway_url: str = "") -> "str | None":
+    """A gateway-supplied value usable as a structured field (an error name, an approval code):
+    a short token of letters, digits and `_.-` that occurs in no form of the gateway URL, holds
+    no registered secret and is no piece of one, in any letter case. None otherwise."""
+    if not isinstance(value, str) or not _CODE_RE.fullmatch(value):
+        return None
+    url = str(gateway_url or "")
+    url_forms = {url, urllib.parse.unquote(url), urllib.parse.unquote(urllib.parse.unquote(url))}
+    if any(fold(value) in fold(form) for form in url_forms if form):
+        return None
+    return None if registry is not None and registry.holds_or_is_piece(value) else value
+
+
+def safe_status(value: Any, net: Callable[[str], str], registry: "SecretRegistry | None" = None) -> Any:
+    """`value` with every string value, at any depth, passed through `net` and then `registry`'s
+    scrub; keys through `net` only, so a short token cannot turn the payload's own structure into
+    withheld keys. Finite numbers, booleans and None pass. Anything else is withheld, never str()-ed."""
+    if value is None or isinstance(value, (bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else WITHHELD
+    if isinstance(value, str):
+        return registry.scrub(net(value)) if registry is not None else net(value)
+    if isinstance(value, dict):
+        return {net(k) if isinstance(k, str) else WITHHELD: safe_status(v, net, registry)
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [safe_status(v, net, registry) for v in value]
+    return WITHHELD
+
+
+# PEP 440's version pattern (packaging.version.VERSION_PATTERN), matched whole.
+_PEP440_RE = re.compile(r"""
+    v?(?:(?:[0-9]+)!)?[0-9]+(?:\.[0-9]+)*
+    (?:[-_.]?(?:a|b|c|rc|alpha|beta|pre|preview)[-_.]?[0-9]*)?
+    (?:-[0-9]+|[-_.]?(?:post|rev|r)[-_.]?[0-9]*)?
+    (?:[-_.]?dev[-_.]?[0-9]*)?
+    (?:\+[a-z0-9]+(?:[-_.][a-z0-9]+)*)?
+""", re.VERBOSE | re.IGNORECASE)
+
+
+def version_field(value: Any, registry: "SecretRegistry | None" = None) -> "str | None":
+    """A gateway-supplied version usable as a structured field: a PEP 440 version of at most
+    64 characters that holds no registered secret. None otherwise."""
+    if not isinstance(value, str) or len(value) > 64 or not _PEP440_RE.fullmatch(value):
+        return None
+    return None if registry is not None and registry.contains(value) else value
+
+
+def revision_field(value: Any, registry: "SecretRegistry | None" = None, gateway_url: str = "") -> "str | None":
+    """A gateway-supplied setup revision as a structured field: an integer (never a bool) is its
+    decimal text, and the text must pass code_field. None otherwise. The heartbeat hint and the
+    setup cache both spell a revision through this, so an integer served on one side matches the other."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    return code_field(value, registry, gateway_url)
+
+
+_EAI = {v: k for k, v in vars(socket).items() if k.startswith("EAI_") and isinstance(v, int)}
+
+
+def _errno_name(exc: BaseException) -> str:
+    code = getattr(exc, "errno", None) if isinstance(exc, OSError) else None
+    if not isinstance(code, int):
+        return ""
+    # A resolver error carries an EAI_* code, not an errno.
+    return _EAI.get(code, "") if isinstance(exc, socket.gaierror) else _errno.errorcode.get(code, "")
+
+
+# Marks the classes scrub_exception makes; only they may name the gateway they contacted.
+_SCRUBBED = object()
+
+
+def scrub_exception(exc: BaseException, gateway_url: str) -> BaseException:
+    """`exc`, raised by a call that received the gateway URL, as an exception of a subclass of
+    its own type (so every `except` and attribute read still works) whose text is only
+    `<type> contacting <redacted gateway>`, plus the HTTP status when it has one. Nothing the
+    original text held, in any encoding, can reach a log or a status file through it."""
+    base = type(exc)
+    # The original is never reachable from it: no __context__ (set when raised in a handler).
+    safe = type(base.__name__, (base,), {
+        "__str__": lambda self: self.__dict__.get("_scrubbed", base.__name__),
+        "__repr__": lambda self: f"{base.__name__}({self.__dict__.get('_scrubbed', '')!r})",
+        "__context__": property(lambda self: None, lambda self, value: None),
+        "_scrubbed_mark": _SCRUBBED, "__module__": base.__module__, "__qualname__": base.__qualname__})
+    code = exc.__dict__.get("code")
+    text = f"{base.__name__} contacting {redact_url(gateway_url)}"
+    if isinstance(code, int):
+        text += f" (HTTP {code})"
+    out = safe.__new__(safe)
+    # Objects (an HTTPError's body and headers) and numbers stay; text and bytes never do.
+    out.__dict__.update({k: (text if isinstance(v, str) else b"" if isinstance(v, (bytes, bytearray))
+                             else scrub_exception(v, gateway_url) if isinstance(v, BaseException) else v)
+                         for k, v in exc.__dict__.items()})
+    if isinstance(exc, OSError):
+        out.errno = exc.errno
+    out.__dict__["_scrubbed"] = text
+    out.__dict__["_gateway"] = redact_url(gateway_url)
+    out.args = (text,)
+    out.__traceback__ = exc.__traceback__
+    return out
+
+
+def describe(exc: BaseException, registry: "SecretRegistry | None" = None) -> str:
+    """`<Type>[(<reason type>/<ERRNO>)][ <ERRNO>][[<key>]][ contacting <redacted gateway>][ (HTTP <n>)]
+    [ at <file>:<line>]`. Never the exception's own text: a KeyError's key only when the failing
+    code wrote it as a string literal, the gateway only for an exception scrub_exception made (through
+    `registry`'s scrub), a location only as the innermost frame's file name and line."""
+    fields = getattr(exc, "__dict__", {})
+    out = type(exc).__name__
+    reason = fields.get("reason")
+    if isinstance(reason, BaseException):
+        name = _errno_name(reason)
+        out += f"({type(reason).__name__}{'/' + name if name else ''})"
+    elif _errno_name(exc):
+        out += f" {_errno_name(exc)}"
+    tb = exc.__traceback__
+    while tb is not None and tb.tb_next is not None:
+        tb = tb.tb_next
+    if isinstance(exc, KeyError) and len(exc.args) == 1 and isinstance(exc.args[0], str) \
+            and tb is not None and exc.args[0] in tb.tb_frame.f_code.co_consts:
+        out += f"[{exc.args[0]!r}]"
+    gateway = fields.get("_gateway") if type(exc).__dict__.get("_scrubbed_mark") is _SCRUBBED else None
+    if isinstance(gateway, str):
+        out += f" contacting {registry.scrub(gateway) if registry is not None else gateway}"
+    status = fields.get("code")
+    if isinstance(status, int) and not isinstance(status, bool):
+        out += f" (HTTP {status})"
+    if tb is not None:
+        out += f" at {os.path.basename(tb.tb_frame.f_code.co_filename)}:{tb.tb_lineno}"
+    return out
+
+
+# A name holding any stem names a credential (over-withholding AUTHOR, KEYBOARD and SIGNAL is the
+# accepted price); "pw" and "pat" are too common inside words (path), so count as a segment or suffix.
+CREDENTIAL_STEMS = ("pass", "pwd", "secret", "token", "key", "auth", "cred", "bearer", "jwt", "session",
+                    "cookie", "priv", "sig", "otp", "apikey")
+SEGMENT_STEMS = ("pw", "pat")
+_NAME_WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
+_SEGMENT_HEADS = frozenset(s[0] for s in SEGMENT_STEMS)
+_WORD_RUN_RE = re.compile(r"\w*")
+
+
+def credential_name(name: str) -> bool:
+    """Whether `name` (a key, flag or header) names a credential: lowercased, with everything but
+    letters and digits removed, it contains a CREDENTIAL_STEMS stem, or ends in or has a SEGMENT_STEMS segment."""
+    text = unicodedata.normalize("NFKC", str(name))
+    folded = re.sub(r"[^a-z0-9]", "", text.lower())
+    segments = {w.lower() for w in _NAME_WORD_RE.findall(text)}
+    return any(stem in folded for stem in CREDENTIAL_STEMS) or folded.endswith(SEGMENT_STEMS) \
+        or bool(segments.intersection(SEGMENT_STEMS))
+
+
+# `KEY=value`, `KEY = value` and `export KEY=value`, as parse_env_text reads them.
+_ASSIGNMENT_LINE_RE = re.compile(r"^(\s*)(export\s+)?([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(.*)$")
+ENVIRONMENT_WITHHELD = "Environment=<withheld>"
+# A directive naming the environment in any letter case, or one holding a backslash (an escape
+# systemd might decode) or a character outside printable ASCII, is in doubt and withheld.
+_ENVIRONMENT_DOUBT_RE = re.compile(r"environment|\\|[^\x20-\x7e]", re.IGNORECASE)
+
+
+def mask_assignment(key: str, value: str, registry: "SecretRegistry | None" = None) -> str:
+    """The value of `key=value` as it may be shown: withheld for a credential-named key, an
+    onboarding string or one holding a registered secret; a URL by its redacted form."""
+    url, _secret = parse_onboarding_token(value)
+    if credential_name(key) or url or (registry is not None and registry.contains(value)):
+        return WITHHELD
+    if "://" in value:
+        return redact_url(value)
+    return value
+
+
+def _is_comment(line: str) -> bool:
+    return line.lstrip().startswith(("#", ";"))
+
+
+# A line break other than the LF that ends a physical line: CR, NUL and every one str.splitlines knows.
+_INLINE_BREAK_RE = re.compile(r"[\r\x00\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
+
+
+def physical_lines(text: str) -> "list[str]":
+    """`text` split after each LF only (a CRLF stays whole), as systemd reads a unit; unlike
+    str.splitlines, no other line break ends a line, so none splits a value from its key."""
+    return re.findall(r"[^\n]*\n|[^\n]+", text)
+
+
+def sets_environment(line: str) -> bool:
+    """Whether a unit line could set, load, unset or pass the environment (Environment=,
+    EnvironmentFile=, UnsetEnvironment=, PassEnvironment=, in any spelling): the directive of each
+    piece any line break starts, comment markers off, is judged undecoded and in doubt counts."""
+    return any(_ENVIRONMENT_DOUBT_RE.search(piece.lstrip().lstrip("#;").partition("=")[0])
+               for piece in _INLINE_BREAK_RE.split(line.rstrip("\r\n")))
+
+
+def _groups(text: str) -> "list[list[str]]":
+    """Physical lines grouped by continuation, never fewer than systemd joins: any trailing
+    backslash continues (comment lines too), and a comment inside a continuation does not end it."""
+    groups, current = [], []
+    for line in physical_lines(text):
+        body = line.rstrip("\r\n")
+        current.append(line)
+        if body.endswith("\\") or (_is_comment(body) and len(current) > 1):
+            continue
+        groups.append(current)
+        current = []
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _join(group: "list[str]") -> str:
+    kept = [line.rstrip("\r\n") for i, line in enumerate(group) if i == 0 or not _is_comment(line)]
+    return " ".join(p[:-1] if p.endswith("\\") and i < len(kept) - 1 else p for i, p in enumerate(kept))
+
+
+_SHAPE_VALUE = r"(\"[^\"]*\"?|'[^']*'?|[^\s\"';&|,\]\)}]+)"
+_VALUE_RE = re.compile(r"\s*" + _SHAPE_VALUE)
+_FLAG_VALUE_RE = re.compile(r"(?:=|,\s*|\s+)" + _SHAPE_VALUE)
+# Locators only, never a verdict: every `=` or `:` not starting `://`, and every flag's dashes.
+_SEPARATOR_RE = re.compile(r"=|:(?!//)")
+_FLAG_RE = re.compile(r"(?<![\w.-])-{1,2}(?=[^\s=-])")
+_FLAG_WIDE_RE = re.compile(r"[^\s=]+")
+_FLAG_NAME_RE = re.compile(r"[^\s=,\"']*")
+_HEADER_RE = re.compile(r"(?i)\bauthorization\s*:\s*(?:[A-Za-z]+\s+)?" + _SHAPE_VALUE
+                        + r"?|\bbearer\s+" + _SHAPE_VALUE)
+
+
+def _quoted_name(view: str, close: int) -> str:
+    """The text inside the quote that closes at `close`, back to its unescaped opening quote."""
+    q, k = view[close], close - 1
+    while k >= 0:
+        if view[k] == q:
+            b = k
+            while b > 0 and view[b - 1] == "\\":
+                b -= 1
+            if (k - b) % 2 == 0:
+                break
+        k -= 1
+    return view[k + 1:close]
+
+
+def _shell_word(view: str, i: int) -> "tuple[str, int]":
+    """The word a shell reads from `i`, quotes removed, up to an ASCII blank or `=`, and where it
+    ends."""
+    word = []
+    while i < len(view) and view[i] not in " \t\n=":
+        q = view[i]
+        if q in "\"'":
+            i += 1
+            while i < len(view) and view[i] != q:
+                if q == '"' and view[i] == "\\" and i + 1 < len(view):
+                    i += 1
+                word.append(view[i])
+                i += 1
+            i += 1
+        else:
+            word.append(view[i])
+            i += 1
+    return "".join(word), min(i, len(view))
+
+
+def _name_positions(view: str) -> "list[tuple[bool, str]]":
+    """Every name position in `view`: whether credential_name accepts any candidate name, and the
+    value that follows. Before each separator the candidates are every suffix of the line back to
+    its start (and the quoted key); for each flag, the run to a blank or `=` and the shell word."""
+    out, line, heads = [], -1, False
+    for m in _SEPARATOR_RE.finditer(view):
+        j = m.start()
+        start = max(view.rfind("\n", 0, j), view.rfind("\r", 0, j)) + 1
+        if start != line:
+            line, scanned, heads = start, start + 1, False
+        # A suffix judges differently from the whole span only by a SEGMENT_STEMS word at its start.
+        for i in range(scanned, j):
+            if not heads and unicodedata.normalize("NFKC", view[i]).lower()[:1] in _SEGMENT_HEADS:
+                heads = credential_name(view[i:_WORD_RUN_RE.match(view, i).end()])
+        scanned = max(scanned, j)
+        k = j
+        while k > start and view[k - 1].isspace():
+            k -= 1
+        quoted = k > start and view[k - 1] in "\"'" and credential_name(_quoted_name(view, k - 1))
+        v = _VALUE_RE.match(view, m.end())
+        out.append((heads or quoted or credential_name(view[start:j]), v.group(1) if v else ""))
+    for m in _FLAG_RE.finditer(view):
+        wide = _FLAG_WIDE_RE.match(view, m.end()).group(0)
+        name = _FLAG_NAME_RE.match(wide).group(0)
+        v = _FLAG_VALUE_RE.match(view, m.end() + len(name))
+        out.append((credential_name(wide) or credential_name(name), v.group(1) if v else ""))
+        opened = m.start() > 0 and view[m.start() - 1] in "\"'"
+        word, end = _shell_word(view, m.start() - opened)
+        word = word.lstrip("-")
+        if word != name:
+            v = _FLAG_VALUE_RE.match(view, end)
+            out.append((credential_name(word), v.group(1) if v else ""))
+    return out
+
+
+def _shape_views(text: str) -> "set[str]":
+    return {v for t in (text, systemd_unescape(text)) for v in (t, _unquoted(t))}
+
+
+def credential_shapes(text: str) -> "list[str]":
+    """The value of every credential shape in `text` ('' for one with no value): a name position
+    with a candidate name credential_name accepts (the only name verdict), and, only adding to
+    that, an Authorization: header or a Bearer value."""
+    found = []
+    for view in _shape_views(str(text)):
+        found += [value for named, value in _name_positions(view) if named]
+        found += [m.group(1) or m.group(2) or "" for m in _HEADER_RE.finditer(view)]
+    return found
+
+
+def credential_shaped(text: str) -> bool:
+    """Whether `text` carries a credential by its shape, whatever the registry holds."""
+    return bool(credential_shapes(text))
+
+
+def _register_value(registry: "SecretRegistry", value: str, min_len: int) -> None:
+    """`value` as written, systemd-unescaped and with its quotes off, each registered."""
+    forms_ = {value, systemd_unescape(value), value.strip("'\""), _unquoted(systemd_unescape(value))}
+    try:
+        forms_.add(value.encode("latin-1", "backslashreplace").decode("unicode_escape"))
+    except (UnicodeError, ValueError):
+        pass
+    for form in forms_:
+        registry.register(form, min_len=min_len)
+
+
+def register_assignments(registry: "SecretRegistry", *texts: str) -> None:
+    """Every value the texts assign, registered before any of them is shown: a credential-named
+    key's at any length, each value on an environment line (split as systemd splits it, and as
+    written) at BARE_SECRET_MIN, and every credential shape's value at BARE_SECRET_MIN unless it is
+    a plain path, so the same value under a neutral key or on another line is withheld too."""
+    for text in texts:
+        for group in _groups(text):
+            joined = _join(group)
+            if any(sets_environment(line) for line in group):
+                rest = joined.partition("=")[2]
+                words = systemd_words(rest) + re.split(r"[\s\"']+", rest)
+            else:
+                m = _ASSIGNMENT_LINE_RE.match(joined)
+                credential = m and credential_name(m.group(3))
+                words = [f"{m.group(3)}={parse_env_value(m.group(5))}"] if credential else []
+            for word in words:
+                key, eq, value = word.partition("=")
+                if eq:
+                    named = credential_name(systemd_unescape(key))
+                    _register_value(registry, value, 1 if named else BARE_SECRET_MIN)
+            for value in credential_shapes(joined):
+                if not value.strip("'\"").startswith("/"):
+                    _register_value(registry, value, BARE_SECRET_MIN)
+
+
+def _mask_line(body: str, registry: "SecretRegistry | None") -> str:
+    """One rendered line: an assignment shows only its key when its value holds a credential shape
+    or a registered secret; any other line holding either, or a line break inside it, is withheld
+    whole, so no renderer that breaks the line there shows an unmasked piece."""
+    if _INLINE_BREAK_RE.search(body):
+        return WITHHELD_TEXT
+    held = registry is not None and registry.contains(body)
+    m = _ASSIGNMENT_LINE_RE.match(body)
+    if m and not (registry is not None and registry.contains(m.group(3))):
+        indent, export, key, sep, raw = m.groups()
+        value = WITHHELD if credential_shaped(raw) or held else mask_assignment(key, parse_env_value(raw), registry)
+        return f"{indent}{export or ''}{key}{sep}{value}"
+    return WITHHELD_TEXT if held or credential_shaped(body) else body
+
+
+def mask_env_assignments(text: str, registry: "SecretRegistry | None" = None) -> str:
+    """A unit file, drop-in, .env or script as it may be shown (an install diff). A continued group
+    with any line that sets_environment prints as ENVIRONMENT_WITHHELD alone: no key, value or
+    path. Any other `KEY=value` is masked by mask_assignment, and any other line holding a
+    registered secret is withheld whole; a changed group prints as one line."""
+    out = []
+    for group in _groups(text):
+        end = "\n" if group[-1].endswith("\n") else ""
+        if any(sets_environment(line) for line in group):
+            out.append(ENVIRONMENT_WITHHELD + end)
+            continue
+        joined = _join(group)
+        masked = _mask_line(joined, registry)
+        comments = [line.rstrip("\r\n") for line in group[1:] if _is_comment(line)]
+        if masked == joined and all(_mask_line(c, registry) == c for c in comments):
+            out.append("".join(group))
+        else:
+            out.append(masked + end)
+    return "".join(out)
+
+
+def parse_env_value(raw):
+    """A credential value as every reader sees it: whitespace and surrounding quotes off (the
+    one definition, so the environment cannot disagree with a file about a quoted line)."""
+    return raw.strip().strip("'\"") if raw else raw

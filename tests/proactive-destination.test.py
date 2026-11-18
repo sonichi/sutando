@@ -6,6 +6,12 @@ glob and the claim-rename cycle, or a destined file silently re-enters
 the race this feature exists to end.
 
 Run: python3 tests/proactive-destination.test.py"""
+
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 # ruff: noqa: E402 — imports follow the sys.path insert below
 import fnmatch
 import json

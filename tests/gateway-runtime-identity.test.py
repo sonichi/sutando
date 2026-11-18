@@ -14,6 +14,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 failures: list[str] = []
 
@@ -26,7 +31,7 @@ def check(cond, label):
 
 os.environ.setdefault("SUTANDO_TEST_MODE", "1")
 os.environ["REMOTE_TASK_URL"] = "http://127.0.0.1:1"
-os.environ["REMOTE_TASK_TOKEN"] = "t"
+os.environ["REMOTE_TASK_TOKEN"] = "runtime-identity-test-token"  # a token is withheld wherever it appears
 
 # ── loader injection survives the exec; sha matches the real checkout ──────
 spec = importlib.util.spec_from_file_location(
@@ -70,6 +75,12 @@ check(m.RUNTIME_IDENTITY.get("module_sha256") == _hl.sha256(
       "canonical-module digest recorded pre-exec equals disk")
 check(str(m.RUNTIME_IDENTITY.get("entrypoint", "")).endswith(
     "src/remote-gateway-bridge.py"), "entrypoint names the canonical loader")
+
+# A recovery command the bridge logs names the workspace through its resolver, not its path.
+_cmd = m._requeue_command(m.RESULTS_DIR / ".outbox-x", "item~1")
+check(m.RESULTS_DIR.parent == m.WS
+      and _cmd.startswith('python3 src/outbox_cli.py --root "$(bash scripts/sutando-config.sh workspace)"/results/')
+      and str(m.WS) not in _cmd, f"loader names the workspace resolver in logged commands: {_cmd}")
 
 # ── the status payload carries the runtime block ───────────────────────────
 with tempfile.TemporaryDirectory() as td:

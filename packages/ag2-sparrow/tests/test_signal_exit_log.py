@@ -14,6 +14,12 @@ import sys
 import tempfile
 import time
 
+sys.path.append(str(pathlib.Path(__file__).resolve().parents[3] / "tests"))
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ  # noqa: E402
+
+# Before anything below reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 _CHILD = '''
@@ -30,12 +36,11 @@ while True:
 def _run_and_signal(sig):
     with tempfile.TemporaryDirectory() as d:
         base = pathlib.Path(d)
-        env = {**os.environ,
-               "AGENT_CONNECT_TASK_DIR": str(base / "tasks"),
+        env = hermetic_env(**{"AGENT_CONNECT_TASK_DIR": str(base / "tasks"),
                "AGENT_CONNECT_RESULT_DIR": str(base / "results"),
                "AGENT_CONNECT_STATE_DIR": str(base / "state"),
                "REMOTE_TASK_URL": "https://gw.example/relay",
-               "REMOTE_TASK_TOKEN": "dummy-secret"}
+               "REMOTE_TASK_TOKEN": "dummy-secret"})
         env.pop("SUTANDO_SUPERVISED", None)
         child = subprocess.Popen([sys.executable, "-c", _CHILD % str(PKG_ROOT)], env=env,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

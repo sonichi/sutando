@@ -35,6 +35,7 @@ const {
 const {
 	createRoomBinding, roomOrigin, roomOriginFromTaskHeader, sessionRoomNotice, roomContextLines, voiceRoomTaskGuidance, DM_ONLY_DELIVERY_NOTE, ORIGIN_CHANNEL,
 	setVoiceRoomVerifier, requestVoiceRoomVerdict, readVoiceRoomVerdict, voiceRoomCheckKey, VOICE_ROOM_CHECK_DIR, VOICE_ROOM_VERDICT_TTL_S,
+	createCurrentRoomTool, CURRENT_ROOM_PROMPT_RULE, CURRENT_ROOM_TURN_CHECK_RULE,
 } = await plugin('room-binding.ts');
 const { handleSessionContextFrame } = await plugin('tools.ts');
 
@@ -758,6 +759,54 @@ describe('what the core is handed for a room: the origin, its header keys and th
 		assert.deepEqual(await pending, { change: 'none', room: null });
 		assert.equal(bridge.getVoiceSessionOrigin(), null);
 		setVoiceRoomVerifier(null);
+	});
+});
+
+// The model hears the room only in a notice injected at each change; a notice can be missed or
+// outweighed by older context, so "which room are you in" must be answered from the binding.
+describe('current_room — where the session is docked, read from the binding when asked', () => {
+	const OTHER = '!other:ag2.space';
+	const roomFrame = (id: string | null, name?: string) => ({ type: 'session.context', version: 1, room_id: id, room_name: name ?? null, surface: id ? 'room' : 'dm' });
+
+	it('names the bound room, follows each move, and is not docked in the DM or after the client leaves', async () => {
+		setVoiceRoomVerifier(async (room: string) => verdictFor(room, room === VERIFIED || room === OTHER));
+		const local = createRoomBinding({ set: () => {} });
+		const tool = createCurrentRoomTool(() => local.current());
+		const ask = () => tool.execute({}, {} as never);
+		assert.equal(tool.name, 'current_room');
+		assert.equal(tool.execution, 'inline');
+		assert.deepEqual(await ask(), { docked: false, room: null }, 'no frame yet: the DM');
+		await local.bind(roomFrame(VERIFIED, 'Ops'));
+		assert.deepEqual(await ask(), { docked: true, room: 'Ops' });
+		await local.bind(roomFrame(OTHER, 'Design'));
+		assert.deepEqual(await ask(), { docked: true, room: 'Design' }, 'the room opened last, never the one before it');
+		await local.bind(roomFrame(null));
+		assert.deepEqual(await ask(), { docked: false, room: null });
+		await local.bind(roomFrame(VERIFIED, 'Ops'));
+		local.release();
+		assert.deepEqual(await ask(), { docked: false, room: null }, 'a released binding names no room');
+		setVoiceRoomVerifier(null);
+	});
+
+	it('a refused room is not where the session is; an unnamed room is named by its id', async () => {
+		setVoiceRoomVerifier(vouchForVerifiedOnly);
+		const local = createRoomBinding({ set: () => {} });
+		const tool = createCurrentRoomTool(() => local.current());
+		await local.bind(roomFrame(FORGED, 'Somewhere'));
+		assert.deepEqual(await tool.execute({}, {} as never), { docked: false, room: null });
+		await local.bind(roomFrame(VERIFIED));
+		assert.deepEqual(await tool.execute({}, {} as never), { docked: true, room: VERIFIED });
+		setVoiceRoomVerifier(null);
+	});
+
+	it('the prompt rule sends every where-are-you question to the tool, and the turn check keeps it off the core', () => {
+		assert.match(CURRENT_ROOM_PROMPT_RULE, /^- WHERE YOU ARE: /);
+		assert.match(CURRENT_ROOM_PROMPT_RULE, /current_room, every time/);
+		assert.match(CURRENT_ROOM_PROMPT_RULE, /never from memory, an earlier notice/);
+		assert.match(CURRENT_ROOM_PROMPT_RULE, /not docked .*their DM/i);
+		assert.match(CURRENT_ROOM_TURN_CHECK_RULE, /^- none: /);
+		assert.match(CURRENT_ROOM_TURN_CHECK_RULE, /current_room/);
+		assert.match(CURRENT_ROOM_TURN_CHECK_RULE, /never work/);
 	});
 });
 }
