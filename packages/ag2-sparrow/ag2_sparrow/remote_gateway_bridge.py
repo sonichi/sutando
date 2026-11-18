@@ -2822,7 +2822,7 @@ _TASK_FIELDS = ("id", "timestamp", "session_scope",
                 # causes: the core answers [no-send] and lets its Stop hook do the work.
                 "hitl_click",
                 # Which worker-picker button was pressed. Above "task" for the same
-                # reason: worker_picker_commands reads it with the safe parser.
+                # reason: the host reads it with the safe parser.
                 "picker_command", "picker_args",
                 # Also above "task": these carry the picker's authorization, and a
                 # task-last reader cannot see a field written below the body.

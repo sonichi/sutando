@@ -667,14 +667,14 @@ class TestTheShippedStartupNamesTheInbox(Base):
         """Not "the line mentions the variable" — the shipped COMMAND has to
         name the inbox, read by the same parser the ownership check uses."""
         skill = (REPO / "skills" / "startup" / "SKILL.md").read_text(encoding="utf-8")
-        line = next(ln for ln in skill.splitlines()
-                    if "watch-tasks-stream.sh" in ln and "On `start` only" in ln)
-        m = re.search(r"`command:\s*'([^']+)'`", line)
-        self.assertIsNotNone(m, f"no quoted `command:` in the startup step: {line[:120]}")
-        # The shell's own tokenisation is the argv vector that command becomes.
-        cmd = m.group(1)
-        self.assertNotEqual(
-            wb._target_from_argv(cmd, 4242, argv_vector=lambda pid: shlex.split(cmd)), "",
+        # Found by the watcher command itself, not by the step's prose.
+        m = re.search(r"`command:\s*'([^']*\$SUTANDO_WATCHER_CMD[^']*)'`", skill)
+        self.assertIsNotNone(m, "no quoted worker watcher `command:` in the startup skill")
+        # Expand the launcher's variables the way the shell would, then parse that argv.
+        cmd = (m.group(1).replace('"$SUTANDO_WATCHER_CMD"', "/repo/src/watch-tasks-stream.sh")
+               .replace('"$SUTANDO_TASKS_DIR"', self.inbox))
+        self.assertEqual(
+            wb._target_from_argv(cmd, 4242, argv_vector=lambda pid: shlex.split(cmd)), self.inbox,
             "the shipped worker startup names no inbox in the watcher command, so "
             "decide() reads `unknown` forever and the worker never starts one")
 

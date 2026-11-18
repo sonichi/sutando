@@ -82,6 +82,26 @@ class Counts(unittest.TestCase):
         (self.inbox / "task-mine.txt").rename(self.inbox / "task-mine.accepted")
         self.assertEqual(tq.pending(self.ws, self.inbox), [])
 
+    def test_an_own_folder_inbox_is_answered_in_its_own_results(self):
+        # A worker on its own folders: task bodies in its tasks/, answers in its results/, neither
+        # under the shared workspace. An answer there is not waiting; one only in shared results/ is.
+        own = self.ws / "own"
+        (own / "tasks").mkdir(parents=True); (own / "results").mkdir()
+        for tid in ("task-o1", "task-o2", "task-o3"):
+            _task(own / "tasks" / f"{tid}.txt", tid)
+            (own / "results" / f"{tid}.txt").write_text("done\n")
+        self.assertEqual(tq.pending(self.ws, own / "tasks", results=own / "results"), [])
+        self.assertEqual(len(tq.pending(self.ws, own / "tasks")), 3, "without --results the shared results/ is read")
+        (own / "results" / "task-o3.txt").unlink()
+        self.assertEqual([t["id"] for t in tq.pending(self.ws, own / "tasks", results=own / "results")], ["task-o3"])
+        self.assertEqual(tq.waiting(self.ws, "task-o3", inbox=own / "tasks", results=own / "results"), 0)
+        rc, out = self._cli("pending", "--workspace", str(self.ws), "--inbox", str(own / "tasks"),
+                            "--results", str(own / "results"))
+        self.assertEqual((rc, [t["id"] for t in json.loads(out)]), (0, ["task-o3"]))
+        task_file = str(own / "tasks" / "task-o1.txt")
+        self.assertEqual(self._cli("waiting", "--task-file", task_file, "--workspace", str(self.ws),
+                                   "--inbox", str(own / "tasks"), "--results", str(own / "results")), (0, "1"))
+
     def _cli(self, *argv: str) -> tuple[int, str]:
         # In-process: the entry point's own branches are what run (and what is measured).
         import contextlib

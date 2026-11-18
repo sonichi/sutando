@@ -46,6 +46,8 @@ coverage.py's JSON report. JSON retains repository-relative paths, so a reported
 `src/nested/shared.py` cannot hide an unmeasured `scripts/nested/shared.py` or
 `outside/nested/shared.py`. Discovered files with zero executed lines remain in
 the report and count as measured. XML is still used for the diff-coverage check.
+The job log and Markdown advisory preserve spaces and literal shell metacharacters
+in each emitted path; filenames are never expanded as shell patterns.
 If JSON generation fails, the gate reports that this diagnostic is unavailable
 and preserves the diff-coverage verdict without reading an older JSON report.
 To run the diagnostic directly, generate `python3 -m coverage json --quiet`, then

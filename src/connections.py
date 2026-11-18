@@ -2188,9 +2188,14 @@ WORKER_DIRS_OWN = "own"
 WORKER_AGENTS_DIR = "agents"
 
 
+def worker_agents_dir(workspace: Optional[Path] = None) -> Path:
+    """`<workspace>/agents`: the folder every agent's own root and declaration lives under."""
+    return _workspace(workspace) / WORKER_AGENTS_DIR
+
+
 def worker_root(agent_mxid: str, workspace: Optional[Path] = None) -> Path:
     """`<workspace>/agents/<segment of agent_mxid>`: the agent's own folder; ValueError on an empty id."""
-    return _workspace(workspace) / WORKER_AGENTS_DIR / _agent_identity().root_segment(agent_mxid)
+    return worker_agents_dir(workspace) / _agent_identity().root_segment(agent_mxid)
 
 
 def _row_dirs(row: Optional[Mapping[str, object]], workspace: Optional[Path]) -> "Optional[tuple[Path, Path]]":
@@ -2205,6 +2210,22 @@ def worker_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tupl
     """(tasks dir, results dir) of `worker` when its identity row names an agent and `dirs: "own"`;
     None otherwise (the worker uses the workspace's shared tasks/ and results/), or when unreadable."""
     return _row_dirs(worker_identity(worker, workspace), workspace) if worker else None
+
+
+def ensure_worker_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":
+    """`worker_dirs`, created: the agent root 0o700 (another local account reads none of its tasks), then
+    tasks/ and results/ with their archive/ beneath it. None for a worker without own folders."""
+    dirs = worker_dirs(worker, workspace)
+    if dirs is None:
+        return None
+    root = dirs[0].parent
+    root.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(root, 0o700)
+    os.chmod(root, 0o700)
+    for d in dirs:
+        (d / "archive").mkdir(parents=True, exist_ok=True)
+    return dirs
 
 
 def task_home(task_id: str, workspace: Optional[Path] = None) -> dict:
@@ -2241,13 +2262,51 @@ def _holds_task(tasks_dir: Path, task_id: str) -> bool:
         return False
 
 
+def task_other_home(task_id: str, workspace: Optional[Path] = None) -> Optional[dict]:
+    """{"tasks", "results"} a lane-queued task's worker uses under its other setting (own <-> shared),
+    whose ARCHIVES may still hold the task's history after a switch; None for any other task."""
+    ws = _workspace(workspace)
+    home = task_home(task_id, ws)
+    if not home["worker"]:
+        return None
+    if home["own"]:
+        return {"tasks": ws / "tasks", "results": ws / "results"}
+    mxid = str((worker_identity(home["worker"], ws) or {}).get("agent_mxid") or "").strip()
+    if not mxid:
+        return None
+    root = worker_root(mxid, ws)
+    return {"tasks": root / "tasks", "results": root / "results"}
+
+
+def own_worker_homes(workspace: Optional[Path] = None) -> list:
+    """[{"worker", "tasks", "results"}] for every worker with its own folders (`worker_dirs`), from one
+    read of the record; [] when it is unreadable. Paths are lexical under the workspace, as worker_dirs'."""
+    ws = _workspace(workspace)
+    try:
+        rows = _read(record_path(ws))
+    except (SchemaError, OSError):
+        return []
+    homes = []
+    for row in rows:
+        dirs = _row_dirs(row, ws)
+        if dirs:
+            homes.append({"worker": str(row["worker"]), "tasks": dirs[0], "results": dirs[1]})
+    return homes
+
+
 def set_worker_dirs(worker: str, own: bool, *, workspace: Optional[Path] = None) -> dict:
     """Set (`own`) or clear `worker`'s `dirs: "own"` under the record lock; returns the row. Refused
     (`ConnectionsError`) when the worker has no identity row or its row names no agent."""
     with _transaction(workspace) as record:
         row = next((r for r in record["rows"] if r.get("worker") == worker), None)
-        if row is None or not str(row.get("agent_mxid") or "").strip():
+        mxid = str((row or {}).get("agent_mxid") or "").strip()
+        if not mxid:
             raise ConnectionsError(f"worker {worker} has no agent identity row")
+        # One agent folder is one inbox: two lanes, each with its own lease, must not poll it.
+        twins = [r["worker"] for r in record["rows"] if r.get("worker") and r is not row
+                 and str(r.get("agent_mxid") or "").strip() == mxid]
+        if own and twins:
+            raise ConnectionsError(f"worker {twins[0]}'s row also names agent {mxid}: its own folder would be shared")
         if own:
             row[WORKER_DIRS_KEY] = WORKER_DIRS_OWN
         else:

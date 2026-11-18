@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import task_event_handler_config_path  # noqa: E402
+import roster_membership  # noqa: E402
 
 WORKER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 CORE = "core"
@@ -210,8 +211,7 @@ def unknown_targets(roster: dict, targets) -> list:
     """Targets absent from the roster, or retired in it. The router sends such a
     task to the core rather than substituting another reachable recipient."""
     workers = roster.get("workers") or {}
-    known = {w for w, row in workers.items()
-             if not (isinstance(row, dict) and row.get("state") == "retired")} | {CORE}
+    known = roster_membership.members(workers) | {CORE}
     return [t for t in targets if t not in known]
 
 
@@ -502,7 +502,7 @@ def apply_profile_label_overrides(workspace, labels: dict, config_version: int,
                 pending.append(wid)
         changed = False
         for wid, row in workers.items():
-            if row["state"] == "retired":
+            if not roster_membership.is_member(row):
                 continue
             wanted = labels.get(wid)
             if wanted is None:
@@ -575,8 +575,7 @@ def admits_deliveries(workspace, worker_id: str) -> bool:
         return True
     if worker_id in (raw.get("removed") or []):
         return False
-    row = (raw.get("workers") or {}).get(worker_id)
-    return not (isinstance(row, dict) and row.get("state") == "retired")
+    return roster_membership.is_member((raw.get("workers") or {}).get(worker_id))
 
 
 def set_worker_state(workspace, target: str, state: str, *, unbind: bool = False,
