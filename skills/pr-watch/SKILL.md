@@ -71,7 +71,8 @@ checkout changes branch or updates. Re-run it after updating this skill.
 
 Loading the mod is the owner's one step: **enable hot reload of the mods folder in the
 session's terminal** (one click), or start the session with `claude --plugin-dir <mods-dir>/pr-watch`.
-Never enable it for them.
+Never enable it for them. For a pool worker, the other owner-approved way is to record it on that
+worker when the owner says so: `pool_manage.py plugins <worker> add <mods-dir>/pr-watch` (worker-pool skill).
 
 Other commands:
 
@@ -109,6 +110,7 @@ The skill's settings are declared, with their defaults, in the `config` block of
 | `PR_WATCH_TRACKER_TITLE` | `PR watch` | the tracker page's title |
 | `PR_WATCH_COMMONS_SCRIPT` | `skills/room-commons/scripts/room_commons.py` | the room-commons CLI; a relative path is resolved against the repo root (from `pr_watch.py`'s own location, never the cwd) |
 | `PR_WATCH_TRACKER_PUBLISH` | empty, meaning `cli` | `cli`: `track` publishes through the room-commons CLI and hands the page back only when that fails; `session`: `track` always hands the page back for the session to publish with its own room tools (see Tracker) |
+| `PR_WATCH_ROUTE_CMD` | empty: every event goes to this session | a command line (split like a shell, run without one) the runner asks, per event, whether another session should have it (see Handing events off) |
 
 Each is read most specific first: **CLI flag > env var > manifest `config` > `config.json`
 `settings`**, and an empty value at any layer counts as unset. Set a host's value without editing
@@ -120,7 +122,7 @@ python3 $S config get                                      # every key, its valu
 ```
 
 Because the manifest layer ranks above `config.json`, `config set` only takes effect for a key whose
-manifest default is empty (`PR_WATCH_TRACKER_ROOM`, `PR_WATCH_TRACKER_PUBLISH`); for the others it says the manifest still wins,
+manifest default is empty (`PR_WATCH_TRACKER_ROOM`, `PR_WATCH_TRACKER_PUBLISH`, `PR_WATCH_ROUTE_CMD`); for the others it says the manifest still wins,
 and the override is an env var. `config set` signals a running runner, which re-sends the template.
 
 The default `PR_WATCH_PROMPT` tells the agent to re-review at the new head, review what is
@@ -134,6 +136,29 @@ arrives, it sends the bare event lines).
 that is the real workspace; from a fresh clone with no `workspace` symlink it is
 `<clone>/workspace`, which no running agent reads. There, pass `--state-dir <dir>` to every command
 (before the subcommand), or run the engine checkout's copy.
+
+## Handing events off
+
+One runner watches for the whole host, but the session that should act on an event may be another
+one, e.g. the session that pushed the PR. With `PR_WATCH_ROUTE_CMD` set, the runner runs that
+command for each event line, before printing it. The value is split like a shell line (quote any
+path with a space) and run as argv with no shell and a 30 s timeout, in the runner's own
+environment, with `--event "<the PR_EVENT line>" --repo O/R --number N --head <full head sha>
+--authors <the watch's authors, comma-separated> --cache-dir <state dir>/route` appended. If its
+last stdout line is `handed <recipient>` and it exits 0, the event is not sent to this session; the
+mod logs `PR_WATCH_NOTE handed to <recipient>: <line>` instead. Anything else (`local`, a non-zero
+exit, a timeout, a command that cannot start) keeps today's behaviour: the event comes here, so
+none is lost. A command that times out after it already handed the event off means both sessions
+get it: the failure is a duplicate, never a loss. The same line within 60 s gets the first answer
+again without re-running the command. The tracker row is updated either way.
+
+The worker-pool skill provides one (`pool_pr_route.py`, see its SKILL.md) for workers on this
+host. Turn it on with an absolute, quoted path, since the runner copy runs outside the checkout:
+
+```bash
+python3 $S config set PR_WATCH_ROUTE_CMD \
+  "$(python3 -c 'import shlex, sys; print(shlex.join(sys.argv[1:]))' python3 "<checkout>/skills/worker-pool/scripts/pool_pr_route.py")"
+```
 
 ## Tracker
 

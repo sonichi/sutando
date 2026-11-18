@@ -8,8 +8,11 @@ esac
 REPO="$(cd "$self_dir/../../.." && pwd)"
 cd "$REPO"
 
+# A worker on its own folders (SUTANDO_INBOX_KIND set empty) reads a plain inbox, with no resolver.
+RESOLVER_REQUIRED=SUTANDO_INBOX_RESOLVER
+[ "${SUTANDO_INBOX_KIND-unset}" = "" ] && RESOLVER_REQUIRED=
 for required in SUTANDO_INSTANCE_ID SUTANDO_TMUX_SESSION SUTANDO_TASKS_DIR \
-                SUTANDO_WORKSPACE_DIR SUTANDO_RESULTS_DIR SUTANDO_INBOX_RESOLVER \
+                SUTANDO_WORKSPACE_DIR SUTANDO_RESULTS_DIR $RESOLVER_REQUIRED \
                 SUTANDO_POOL_DELIVERY_SCRIPT; do
   if [ -z "${!required:-}" ]; then
     echo "launch-codex-worker-session: $required is required" >&2
@@ -50,6 +53,7 @@ for forwarded in SUTANDO_INSTANCE_ID SUTANDO_WORKER_ID SUTANDO_TASKS_DIR SUTANDO
                  SUTANDO_DEFAULT_WORKSPACE; do
   [ -n "${!forwarded:-}" ] && ENV_ARGS+=(-e "$forwarded=${!forwarded}")
 done
+[ -z "$RESOLVER_REQUIRED" ] && ENV_ARGS+=(-e SUTANDO_INBOX_KIND= -e SUTANDO_INBOX_RESOLVER=)
 [ -n "${CODEX_HOME:-}" ] && ENV_ARGS+=(-e "CODEX_HOME=$CODEX_HOME")
 if [ -n "$SUTANDO_CODEX_HOME_ENV" ]; then
   ENV_ARGS+=(-e "$SUTANDO_CODEX_HOME_ENV=$SUTANDO_CODEX_HOME_VALUE")

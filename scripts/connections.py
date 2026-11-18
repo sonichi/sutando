@@ -47,6 +47,8 @@
   launch INSTANCE --repo DIR --logs-dir DIR [--env-only]
                                start one bridge from the launch plan (--env-only: from the
                                AG2_REMOTE_TOKEN_<INST> variable alone, when the record is unreadable)
+  stop INSTANCE                stop the process holding that bridge's lease, once; the row is unchanged
+                               (the lane keeper starts it again unless a declared bridge serves it)
   start INSTANCE --repo DIR --logs-dir DIR
                                launch unless a bridge already holds the lease; exit 1 naming the
                                reason when it did not start
@@ -70,6 +72,8 @@
                                connection the main descriptor does not serve, and remove stale ones;
                                a successful launch and park/disconnect/remove keep them current.
                                Exit 1 with no readable main descriptor (nothing touched)
+  bridge-pid [INSTANCE]        the pid proven to hold that bridge's lease ('' = the legacy bridge);
+                               nothing when none runs; exit 3 when the lease proves neither
 
 Each verb parses, calls one unit and prints; policy lives in the module.
 """
@@ -267,6 +271,12 @@ def cmd_launch(args) -> int:
     return 0
 
 
+def cmd_stop(args) -> int:
+    pid = connections.stop_bridge(args.instance, workspace=args.workspace)
+    print(f"stopped {args.instance or '(legacy)'} (pid {pid})" if pid else f"{args.instance or '(legacy)'} was not running")
+    return 0
+
+
 def cmd_start(args) -> int:
     record = connections.start(args.instance, repo=args.repo, logs_dir=args.logs_dir, workspace=args.workspace)
     if not record.get("ok"):
@@ -314,6 +324,19 @@ def cmd_primary(args) -> int:
     if inst is None:
         return 2
     print(inst)
+    return 0
+
+
+def cmd_bridge_pid(args) -> int:
+    """Print the pid proven to hold the instance's bridge lease; nothing when none runs, exit 3 when
+    the lease proves neither (`connections.bridge_pid`). A caller may signal only a printed pid."""
+    try:
+        pid = connections.bridge_pid(args.instance, args.workspace)
+    except connections.BridgeLeaseIndeterminate as e:
+        print(f"connections: {e}", file=sys.stderr)
+        return 3
+    if pid:
+        print(pid)
     return 0
 
 
@@ -409,6 +432,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(fn=cmd_known_servers)
     s = sub.add_parser("launch"); _launch_args(s); s.add_argument("--env-only", action="store_true")
     s.set_defaults(fn=cmd_launch)
+    s = sub.add_parser("stop"); s.add_argument("instance"); s.set_defaults(fn=cmd_stop)
     s = sub.add_parser("start"); _launch_args(s); s.set_defaults(fn=cmd_start)
     s = sub.add_parser("reconnect"); _launch_args(s); s.set_defaults(fn=cmd_reconnect)
     s = sub.add_parser("update-token"); s.add_argument("instance")
@@ -432,6 +456,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("sync-mcp-lanes"); s.add_argument("--json", action="store_true")
     s.add_argument("--descriptor", type=Path, default=None, help="the main MCP descriptor (default: discovered)")
     s.set_defaults(fn=cmd_sync_mcp_lanes)
+    s = sub.add_parser("bridge-pid"); s.add_argument("instance", nargs="?", default="")
+    s.set_defaults(fn=cmd_bridge_pid)
     return p
 
 

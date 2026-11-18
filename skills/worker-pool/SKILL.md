@@ -18,8 +18,8 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `rename_worker.py` — change a worker's base routing alias after creation: `python3 skills/worker-pool/scripts/rename_worker.py --worker <id-or-label> --label "<new alias>" [--workspace W]`. The id and its tmux session name stay.
 - `apply_profile_label_overrides.py` — apply an s.space profile's complete worker display-label map from JSON stdin with `--workspace W --profile-mxid M --config-version N`.
 - `worker_bootstrap.py` — a worker session's first-turn decision (worker vs core mode) from its env.
-- `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write. `set_worker_state` / `remove_worker` are its writers for a worker's lifecycle.
-- `pool_manage.py` — stop, retire, re-enable or remove a worker (below).
+- `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write. `set_worker_state` / `remove_worker` are its writers for a worker's lifecycle; `set_worker_plugin_dirs` writes a row's `plugin_dirs`.
+- `pool_manage.py` — stop, retire, re-enable, remove or reseat a worker, record its extra Claude plugin dirs, and bind or unbind a room (below).
 - `pool_identity.py` — give a worker an s.space agent of its own, show it, rotate its token or remove it (below).
 - `pool_provision.py` — the local half of creating that agent without a pasted token: claim secret, redeem, retire (below).
 - `provision_e2e.py` — check that whole flow against one server, with a scan for leaked secrets (below).
@@ -28,6 +28,8 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `pool_route_handler.py` — the core watcher's task-event handler (`SUTANDO_TASK_EVENT_HANDLER`): declines unbound work, delivers bound work as sentinels.
 - `pool_delivery.py` — a recipient's own folder: sentinels in, accept, release, done flags, and the owner's `hand_off_to_core`.
 - `pool_ask.py` — ask another instance a question through the front door (below).
+- `pool_handoff.py` — `pool_ask` over s.space to a worker with its own agent, behind a flag (below).
+- `pool_pr_route.py` — pr-watch's `PR_WATCH_ROUTE_CMD`: hands an event about our own PR to the worker driving it (below).
 - `pool_sessions.py` — read-only: which worker tmux sessions a viewer could attach, and the exact-match argv for each. Adds no state and nothing in the pool calls it; it exists for the desktop app's terminal picker. It deliberately does not describe the core, whose socket resolution belongs to the app.
 
 ```bash
@@ -36,7 +38,7 @@ python3 skills/worker-pool/scripts/pool_sessions.py list --workspace "$WS" [--ro
 
 Suites live at `tests/skills/worker-pool/`.
 
-## Managing workers: stop, retire, enable, remove
+## Managing workers: stop, retire, enable, remove, plugins
 
 Killing a worker's tmux session does not stop it: the remedy timer's next sweep
 (every 5 minutes) sees a dead session and resumes it on the same conversation.
@@ -52,6 +54,10 @@ python3 skills/worker-pool/scripts/pool_manage.py stop   <worker id or label> [-
 python3 skills/worker-pool/scripts/pool_manage.py retire <worker> [--unbind] [--hand-off]
 python3 skills/worker-pool/scripts/pool_manage.py enable <worker> [--no-start]
 python3 skills/worker-pool/scripts/pool_manage.py remove <worker> [--hand-off]
+python3 skills/worker-pool/scripts/pool_manage.py plugins <worker> add|remove <dir>
+python3 skills/worker-pool/scripts/pool_manage.py plugins <worker> list
+python3 skills/worker-pool/scripts/pool_manage.py bind   <room id> <worker id or label>
+python3 skills/worker-pool/scripts/pool_manage.py unbind <room id>
 ```
 
 - `stop` writes the worker's pause (`pool_supervise.set_paused`) under the remedy
@@ -84,6 +90,21 @@ python3 skills/worker-pool/scripts/pool_manage.py remove <worker> [--hand-off]
   its id in the roster's `removed` list so late deliveries stay fenced. Its
   records under `state/workers/<id>/` and its `deliveries/<id>/` folder stay as
   history.
+- `plugins` records an extra Claude Code plugin dir on one Claude worker's roster
+  row (`plugin_dirs`, absolute real paths). Every start of that worker (spawn,
+  recovery, `enable`, `reseat`) passes each with `--plugin-dir`; the core and
+  other workers are unaffected. `add` refuses a dir without a readable
+  `.claude-plugin/plugin.json` naming the plugin. A launch loads each recorded
+  path exactly as recorded and skips one that is missing, no longer a plugin, or
+  redirected (its real path is no longer the recorded path, e.g. a symlink swap);
+  the start's JSON result lists those under `plugin_dirs_skipped`, and
+  `plugins list` shows each dir's state (`ok`, `missing`, `not a plugin`,
+  `redirected`). Approving a dir approves a path, not its contents: what is
+  inside an approved dir can still change after it is recorded. This is the
+  owner's opt-in: record a plugin only on the owner's explicit word for that
+  worker, never on your own. The command does not check who calls it, like the
+  other verbs here; the owner's word is the only gate. It applies at the
+  worker's next start; `reseat` applies it now.
 
 ## Codex CLI workers
 
@@ -138,7 +159,7 @@ creates that agent in AG2 Space, and its access token becomes a connection row n
 - It answers only what is addressed to that agent.
 - It hands every task it queues to the worker (`requested_worker`).
 - It posts only the proactive files its worker's session writes (`proactive-<ts>.by-<worker>.txt`,
-  stamped by `result_publish.py` while the identity is enabled), into its own agent's owner DM;
+  stamped by `result_publish.py` while the identity is enabled; `ask-owner.py` text asks too; not one bound for Discord, Slack or Telegram), into its own agent's owner DM;
   nothing the core's session wrote. A worker with no identity, or a disabled one, still publishes
   unstamped notes that a core lane sends.
 - It never becomes primary, and owns no unaddressed message or owner card.
@@ -167,6 +188,14 @@ row already runs as (`worker_identity_shared`). It also refuses an agent whose o
 connection already serves (`worker_owner_mismatch`), so a worker never runs as another person's agent. The token goes into the secret vault. It never goes into a file and is
 never printed. `rotate` accepts a new token only for the same agent. A worker's lane is launched naming its worker. If
 the launch and the record disagree, or neither can say, the lane refuses to start rather than run as the core's.
+The lane routes each task it queues itself (`pool_route_handler.py --from-lane --payload`) before publishing it, so
+the task is its worker's when it reaches `tasks/` and the core's watcher, which never routes a held task, leaves it;
+see `docs/connections.md`, "In a pool worker's session".
+
+A worker with its own agent can be switched onto its own task and result folders
+(`python3 src/worker_lane.py migrate-dirs --worker <id>` previews, `--apply` does it, `--undo --apply` switches back; then respawn it): its lane
+queues straight into `<workspace>/agents/<segment>/tasks`, nothing is routed through `deliveries/<id>/`, and
+its session answers in that folder's `results/`; see `docs/connections.md`, "A worker on its own folders".
 
 `pool_manage.py retire` also removes the worker's agent identity: its lane, its row and its vault secret. The agent
 itself stays on its server until the owner deletes it there.
@@ -207,6 +236,45 @@ python3 skills/worker-pool/scripts/pool_identity.py rotate <worker> --device-flo
   restarts (`pool_manage.py reseat <worker>`): its `s-space` tools decide at start whom they act as. A seat that owes
   work is left running and the JSON line says `"seat": "deferred"`; run the reseat once it is done. A seat whose
   `s-space` calls fail with "descriptor changed during the call" is this case: its identity changed; reseat it.
+
+### Handing its rooms to its own agent
+
+Once a worker has its own agent, its rooms can move from the core's agent to that agent, on the owner's word.
+In a room bound to the worker the worker's agent joins, the core's agent leaves and the binding is dropped, so
+the room's work reaches the worker's agent directly. In a room it only worked in as the core's agent (a room it
+posted review asks to, say), its agent is invited and the core stays: acting as its own agent, the worker can no
+longer post where only the core is a member.
+
+```bash
+python3 skills/worker-pool/scripts/pool_identity.py rooms <worker>
+python3 skills/worker-pool/scripts/pool_identity.py hand-room <worker> --room <room> [--wait SECONDS]
+python3 skills/worker-pool/scripts/pool_identity.py worked <worker>
+python3 skills/worker-pool/scripts/pool_identity.py join-room <worker> --room <room> [--wait SECONDS]
+python3 skills/worker-pool/scripts/pool_identity.py return-room <worker> --room <room> [--binding KEY ...] [--wait SECONDS]
+```
+
+- `rooms` prints the rooms bound to the worker, one per room however many server names its bindings carry.
+- `hand-room` invites the worker's agent as the core's agent, waits up to SECONDS for the room to list it
+  joined, confirms it again, has the core leave, and drops every binding naming that room. It prints one JSON
+  line: `handed`; `waiting` (invited but not joined, or an invitation or leave held for the owner's approval:
+  run it again); `unknown` (the core's member read failed and nothing shows it has left: run it again);
+  `skipped` (the invitation was refused, for example by a direct chat or the core's power level: the core stays
+  and the binding is kept); `not_bound`; or `failed` (exit 1, the binding kept).
+- The core never leaves a room the worker's agent is not confirmed in. A rerun does not invite a member again.
+  When the core cannot read the room, the binding goes only if the worker's own agent sees itself joined and
+  the core gone; a failed read is never taken as the core having left.
+- `worked` lists the unbound rooms the worker worked in as the core's agent, from records the pool already
+  keeps: the `channel_id` of each task the router attributed to it (`state/attribution`, the newest 500), and the
+  room of each review-ask interaction the correlation log records for those tasks.
+- `join-room` invites the worker's agent to one of them and waits for it: `joined`, `waiting`, `skipped` (with
+  why) or `failed`. The core stays and no binding changes.
+- `return-room <worker> --room <room> [--binding KEY ...] [--wait SECONDS]` undoes a hand-off: the worker's
+  agent invites the core's agent back; once the core is joined, each binding (default: the room's id) is
+  restored unless another worker now holds it, and the worker's agent leaves. `returned` (with `worker_left`),
+  `waiting`, `skipped` (with why) or `failed`.
+  It is not a rollback: a binding restored before a later step fails stays restored, and the worker's agent
+  stays a member when its leave is refused or the core cannot be confirmed joined first. A rerun recognises a
+  finished return from the core's own read (core joined, worker's agent gone).
 
 ### Creating the agent without a pasted token
 
@@ -266,8 +334,9 @@ what a run creates on the server.
 ## Binding a room to an existing worker
 
 `pool_roster.py:bind_room(workspace, room, target)` pins one room to one
-already-registered worker (by id or unique label) — the picker's "pin" action
-and `pool_roster.py bind` both go through it. **It does not call
+already-registered worker (by id or unique label) — `pool_manage.py bind <room> <worker>`
+goes through it, and `pool_manage.py unbind <room>` through `unbind_room` (the picker's pin
+and unpin buttons are no longer applied; `bind` refuses a worker on its own folders). **It does not call
 `publish_task_event_handler()`.** `register_worker()` (and therefore
 `create_worker.py`) does, on every call, because a registration that leaves
 the core watcher without its route handler is a pool the launcher cannot
@@ -368,6 +437,72 @@ python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|
   never be relayed as your own: the tier must say where the question came from, not who ran
   the script.
 - Refused, never guessed: an unknown name, a name shared by recipients, and asking yourself.
+
+### PR events to the worker that drives the PR
+
+Every worker pushes as the same GitHub login, so the one pr-watch runner on a host cannot tell
+whose PR an event is. `pool_pr_route.py` is its route command. It hands an event off only when all
+of these hold, and prints `local` (the watcher keeps the event) otherwise:
+
+- The event is about our own PR: not a `review_requested` or `review_dismissed`, not a
+  `reason=reviewed` update; and the PR's author is one of the watch's authors and its head branch
+  is in the base repository. Author, head repository and the PR's last 100 commits (older ones are
+  not read) come from one GitHub call per head, cached.
+- The newest commit whose trailer block carries a valid `Sutando-Task:` names a task this host
+  assigned to a worker (`state/attribution/<task id>`). Newest wins, so a stacked or promoted PR
+  goes to whoever made its last commit.
+- That worker is not the watching session (`$SUTANDO_INSTANCE_ID`, else the core) and its session
+  is alive (`pool_ask --who`).
+- The `pool_ask` (only the event line, plus: read the PR, act on it, tell the owner only if it
+  needs them) was delivered: a sentinel in the worker's folder, or, over s.space, a confirmed post.
+  An unconfirmed post is not sent again.
+
+Then it prints `handed <worker id>`. A PR driven from another host stays with the watcher here.
+On, on the host running the pr-watch runner, from the checkout:
+
+```bash
+python3 skills/pr-watch/scripts/pr_watch.py config set PR_WATCH_ROUTE_CMD \
+  "$(python3 -c 'import shlex, sys; print(shlex.join(sys.argv[1:]))' python3 "$PWD/skills/worker-pool/scripts/pool_pr_route.py")"
+```
+
+### Over s.space, to a worker with its own agent (flag, off by default)
+
+With `WORKER_POOL_SSPACE_HANDOFF` on (manifest `config`, `CLI > env > manifest`), an ask **from the
+core**, at team tier, to a worker whose own identity row is enabled (`src/connections.py`) is one
+ordinary message instead of a task file: the core's agent mentions the worker's agent in
+`WORKER_POOL_HANDOFF_ROOM` (the owner-only consult room, or a room both are in) through the room CLI
+at `WORKER_POOL_HANDOFF_ROOM_CLI` (the consult skill's `mention` verb). The message carries the
+ask's task id in plain words, so a person can match the two; nothing parses it. `pool_ask` returns
+at once with `status` (`sent`, or `unconfirmed` when the post's outcome is unclear; that one is
+never sent again), `via: room`, `event_id`, `task_id` and `to`. It does not wait or read the room.
+`--wait` cannot be honoured there: the ask is still posted, the JSON says `"reply": null,
+"wait_honoured": false`, and the exit is 2. A refused post also exits 2.
+
+Each posted ask is one line of `state/pool-handoff-asks.jsonl` (task id, worker, the asked agent,
+room, event id, status, time, a question excerpt). `pool_ask.py --workspace WS --asked [--json]`
+lists the last 7 days' asks that no core task has answered from the asked agent: a reply is a task
+the gateway wrote with `reply_to_event` = the ask's event and `user_id` = that agent. A reply from
+anyone else is listed under the ask as `other_replies`, never counted as its answer.
+
+Kept on the folder path: a worker with no, a disabled or a parked identity; a worker's own ask;
+a relayed ask (`--relayed-from`, so its tier is kept); an ask with `--parent-task`; and the
+limit-recovery probe, whose pane prompt names the routed payload. A worker with an identity that
+the flag cannot address (no room, CLI, agent id or core lane on its server) is refused, never
+quietly sent through the folder.
+
+**The reply.** The worker's lane delivers the hand-off like any message to its agent, and the
+worker answers it as an ordinary result: a reply in that message's thread. The core's gateway
+delivers that reply to the core as a new task, threaded to the hand-off message
+(`reply_to_event`). That task is the result path; the core handles it like any other task, at the
+replying sender's own tier in that room. The hand-off grants a reply nothing; `--asked` is where to
+check that the asked worker's agent, and not someone else in the room, answered.
+
+**Authority.** A hand-off is a message from the core's agent, at the tier the room gives that
+agent; nothing here grants more. No rule tiers the owner's other agents as owner: in s.space the
+room's access setting decides. Give the core's agent **Team** with Agent Native **Collaborator
+access** in the hand-off room; that matches a folder ask (`access_tier: team` +
+`collaborator: true`). Plain Team lands on the sandboxed read-only path, and Owner access would
+raise hand-offs above what `pool_ask` gives today. Owner-tier work cannot be delegated either way.
 
 Not yet: the reply is read from `results/` by the asker, not delivered into the
 asker's inbox (`reply_to_instance` is recorded for that later leg), and a worker

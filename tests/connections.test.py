@@ -1192,6 +1192,76 @@ class ImportFromChannelFile(ChannelFileBase):
         self.assertFalse(C.record_path(self.ws).exists())
 
 
+class ImportSplitUrlAndToken(ChannelFileBase):
+    """The gateway address and the secret as two variables, REMOTE_TASK_URL + a bare REMOTE_TASK_TOKEN,
+    import as the one legacy row the combined `url|secret` form gives; half a pair imports nothing."""
+
+    URL, SECRET = "https://chat.alpha-fixture.net", "secret-alpha"
+
+    def assert_one_legacy_row(self, created):
+        self.assertEqual([(r["instance"], r["token_ref"], r["primary"], r["server"], r["gateway_url"])
+                          for r in created],
+                         [("", "REMOTE_TASK_TOKEN", True, "alpha-fixture.net", "https://chat.alpha-fixture.net")])
+        self.assertEqual(self.vault.store, {"REMOTE_TASK_TOKEN": TOKEN_A}, "the vault holds the joined url|secret")
+
+    def test_split_pair_in_the_channel_file_imports_the_legacy_row(self):
+        path = self.write_relay_env(f"AGENT_ID=agent-1\nREMOTE_TASK_PROVIDER=ag2space\n"
+                                    f"REMOTE_TASK_TOKEN={self.SECRET}\nREMOTE_TASK_URL={self.URL}/")
+        before = path.read_bytes()
+        self.assertEqual(C.primary_token_from_channel_file({}), TOKEN_A)
+        self.assert_one_legacy_row(C.import_from_env({}, workspace=self.ws, vault=self.vault))
+        self.assertEqual(path.read_bytes(), before, "the channel file is never rewritten")
+        self.assertNotIn(self.SECRET, C.record_path(self.ws).read_text(), "the secret goes to the vault only")
+        self.assertEqual(C.import_from_env({}, workspace=self.ws, vault=self.vault), [], "once")
+
+    def test_legacy_url_spelling_in_the_file_counts_too(self):
+        self.write_relay_env(f"AG2_REMOTE_TOKEN={self.SECRET}\nAG2_REMOTE_URL={self.URL}")
+        self.assert_one_legacy_row(C.import_from_env({}, workspace=self.ws, vault=self.vault))
+
+    def test_split_pair_in_the_environment_imports_the_legacy_row(self):
+        env = {"REMOTE_TASK_TOKEN": self.SECRET, "REMOTE_TASK_URL": self.URL}
+        self.assert_one_legacy_row(C.import_from_env(env, workspace=self.ws, vault=self.vault))
+
+    def test_an_environment_url_pairs_with_the_file_secret_as_the_bridge_pairs_them(self):
+        self.write_relay_env(f"REMOTE_TASK_TOKEN={self.SECRET}\nREMOTE_TASK_URL=https://relay.beta-fixture.net:8443")
+        self.assert_one_legacy_row(C.import_from_env({"REMOTE_TASK_URL": self.URL}, workspace=self.ws,
+                                                     vault=self.vault))
+
+    def test_combined_form_is_unchanged_beside_a_url(self):
+        env = {"REMOTE_TASK_TOKEN": TOKEN_A, "REMOTE_TASK_URL": "https://relay.beta-fixture.net:8443"}
+        self.assert_one_legacy_row(C.import_from_env(env, workspace=self.ws, vault=self.vault))
+        self.assertEqual(C.legacy_relay_token(TOKEN_A, ""), TOKEN_A)
+
+    def test_half_a_pair_imports_nothing(self):
+        for env in ({"REMOTE_TASK_TOKEN": self.SECRET}, {"REMOTE_TASK_URL": self.URL},
+                    {"REMOTE_TASK_TOKEN": "  ", "REMOTE_TASK_URL": self.URL}):
+            with self.subTest(env=sorted(env)):
+                self.assertEqual(C.import_from_env(env, workspace=self.ws, vault=self.vault), [])
+        for text in (f"REMOTE_TASK_TOKEN={self.SECRET}", f"REMOTE_TASK_URL={self.URL}",
+                     f"REMOTE_TASK_TOKEN=\nREMOTE_TASK_URL={self.URL}"):
+            with self.subTest(file=text.split("=")[0]):
+                self.write_relay_env(text)
+                self.assertEqual(C.primary_token_from_channel_file({}), "")
+                self.assertEqual(C.import_from_env({}, workspace=self.ws, vault=self.vault), [])
+        self.assertFalse(C.record_path(self.ws).exists())
+        self.assertEqual(self.vault.store, {})
+
+    def test_an_environment_secret_never_borrows_the_file_url(self):
+        self.write_relay_env(f"REMOTE_TASK_URL={self.URL}")
+        self.assertEqual(C.import_from_env({"REMOTE_TASK_TOKEN": self.SECRET}, workspace=self.ws, vault=self.vault), [])
+
+    def test_a_url_that_is_no_gateway_url_is_refused(self):
+        for url in ("ws://chat.alpha-fixture.net", "chat.alpha-fixture.net", "ftp://chat.alpha-fixture.net",
+                    "https://u:p@chat.alpha-fixture.net", "https://chat.alpha-fixture.net/x|y"):
+            with self.subTest(url=url):
+                env = {"REMOTE_TASK_TOKEN": self.SECRET, "REMOTE_TASK_URL": url}
+                self.assertEqual(C.import_from_env(env, workspace=self.ws, vault=self.vault), [])
+                self.write_relay_env(f"REMOTE_TASK_TOKEN={self.SECRET}\nREMOTE_TASK_URL={url}")
+                self.assertEqual(C.import_from_env({}, workspace=self.ws, vault=self.vault), [])
+        self.assertFalse(C.record_path(self.ws).exists())
+        self.assertEqual(self.vault.store, {})
+
+
 class AddAdoptsLaunchKeys(ChannelFileBase):
     """A launch key the desktop host wrote but no row holds: an add of its server must adopt it under
     the instance the host's launcher runs (the key's own suffix), never start a second bridge."""
@@ -2121,6 +2191,48 @@ class OwnerScopedListing(Base):
                          {"": "@sutando:alpha-fixture.net", "beta": "@b:beta-fixture.net"})
         self.assertEqual(C.learn_missing_identities(self.ws, environ=environ, vault=self.vault,
                                                     fetch=lambda *a: self.fail("probed a known row")), [])
+
+    def test_a_legacy_row_with_a_bare_secret_learns_its_agent_through_its_own_gateway(self):
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        for environ, vaulted in (({"REMOTE_TASK_TOKEN": "secret-alpha"}, TOKEN_A), ({}, "secret-alpha")):
+            with self.subTest(environ=sorted(environ)):
+                self.vault.store["REMOTE_TASK_TOKEN"] = vaulted
+                with C._transaction(self.ws) as rec:
+                    rec["rows"][0].pop("agent_mxid", None)
+                    rec["rows"][0].pop("owner_mxid", None)
+                seen = []
+
+                def fetch(url, token, address=None):
+                    seen.append(token)
+                    return self.FLEET(url, token)
+                learned = C.learn_missing_identities(self.ws, environ=environ, vault=self.vault, fetch=fetch,
+                                                     whoami=whoami_says("@sutando:alpha-fixture.net"))
+                self.assertEqual(learned, [""])
+                self.assertEqual(seen, [TOKEN_A], "the bare secret was joined to the row's own gateway")
+                self.assertEqual(self.rows()[0]["agent_mxid"], "@sutando:alpha-fixture.net")
+                self.assertEqual(C.connection_credential(self.rows()[0], environ, vault=self.vault),
+                                 ("https://chat.alpha-fixture.net", TOKEN_A))
+
+    def test_a_combined_token_is_handed_over_unchanged(self):
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        row = self.rows()[0]
+        self.assertEqual(C.connection_credential(row, {"REMOTE_TASK_TOKEN": TOKEN_A}, vault=self.vault),
+                         ("https://chat.alpha-fixture.net", TOKEN_A))
+        self.assertEqual(C.row_token(row, TOKEN_A), TOKEN_A)
+
+    def test_a_bare_secret_beside_a_row_gateway_that_is_no_gateway_url_learns_nothing(self):
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        self.vault.store["REMOTE_TASK_TOKEN"] = "secret-alpha"
+        with C._transaction(self.ws) as rec:
+            rec["rows"][0]["gateway_url"] = "https://u:p@chat.alpha-fixture.net"
+        self.assertEqual(C.row_token(self.rows()[0], "secret-alpha"), "")
+        for environ in ({"REMOTE_TASK_TOKEN": "secret-alpha"}, {}):
+            self.assertEqual(C.learn_missing_identities(self.ws, environ=environ, vault=self.vault,
+                                                        fetch=lambda *a: self.fail("probed")), [])
+            with self.assertRaises(C.NoConnectionForRoom) as cm:
+                C.connection_credential(self.rows()[0], environ, vault=self.vault)
+            self.assertNotIn("secret-alpha", str(cm.exception))
+        self.assertIsNone(self.rows()[0].get("agent_mxid"))
 
     def test_a_row_without_a_token_or_a_disabled_one_is_left_alone(self):
         C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)

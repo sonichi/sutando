@@ -83,6 +83,15 @@ class PluginShape(unittest.TestCase):
         self.assertEqual(mod, task_io.NON_OWNER_NOTE)
         self.assertNotIn("adapters/hatch", REGISTER.read_text())
 
+    def test_pinned_audience_rule_is_the_shared_owners_and_in_every_frame(self):
+        src = REGISTER.read_text()
+        mod = re.search(r"^const AUDIENCE_RULE = `(.*)`$", src, re.M).group(1)
+        self.assertEqual(mod, task_io.AUDIENCE_RULE)
+        frames = re.findall(r"`\[s\.space task \$\{rid\}; sender tier[^`]*`", src)
+        self.assertEqual(len(frames), 2, frames)
+        for frame in frames:
+            self.assertTrue(frame.endswith(r"\n${AUDIENCE_RULE}\n`"), frame)
+
 
 class VerifierMirrorsSparrow(unittest.TestCase):
     """VERIFY_PY must answer exactly what src/task_envelope.verify_text and

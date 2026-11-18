@@ -391,6 +391,17 @@ class LaneStart(Base):
         env = C.launch_env(C.plan_entry("alpha-fixture-net", {}, workspace=self.ws), {}, vault=self.vault)
         self.assertEqual(env.get("SUTANDO_LANE_WORKER"), "")
 
+    def test_a_start_from_a_sessions_shell_passes_none_of_that_session_on(self):
+        import spawn_worker
+        worker_env = spawn_worker.plan(self.ws, ROOT, worker_id=W)["env"]
+        missing = sorted(set(worker_env) - C.SESSION_ENV)
+        self.assertEqual(missing, [], "a key a worker's session carries is not in SESSION_ENV")
+        shell = {**worker_env, "SUTANDO_INSTANCE_ID": "other", "AG2_MCP_WORKER_CREDENTIAL": "x",
+                 "PATH": "/usr/bin", "SUTANDO_BRIDGE_LOCK": "1"}
+        env = C.launch_env(C.plan_entry(WORKER_INST, {}, workspace=self.ws), shell, vault=self.vault)
+        self.assertEqual(sorted(k for k in env if k in C.SESSION_ENV), [])
+        self.assertEqual((env["PATH"], env["SUTANDO_BRIDGE_LOCK"], env["SUTANDO_LANE_WORKER"]), ("/usr/bin", "1", W))
+
     def test_an_unreadable_record_keeps_a_worker_lane_a_worker_and_says_so(self):
         for how in ("corrupt", "wrong-shape", "permission", "missing"):
             with self.subTest(how), self.spoiled(how):
