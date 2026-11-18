@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""say and mention refuse a room argument that is not a room id or alias, before sending."""
+"""say, mention, send, react and unreact refuse a room argument that is not a room id or alias, before sending."""
 import contextlib
 import importlib.util
 import io
@@ -53,6 +53,13 @@ class RoomArgTests(unittest.TestCase):
             self.assertEqual(run(["react", "$event:test.invalid", "!room:test.invalid", "--key", "+1"])[0], 1)
         send.assert_not_called()
         react.assert_not_called()
+
+    def test_unreact_with_a_swapped_room_never_sends(self):
+        with patch.object(cli._react, "unreact") as unreact:
+            rc, res = run(["unreact", "$event:test.invalid", "!room:test.invalid", "--key", "+1"])
+        self.assertEqual(rc, 1)
+        self.assertIs(res["ok"], False)
+        unreact.assert_not_called()
 
     def test_only_room_ids_and_aliases_pass(self):
         for value in ("@peer:test.invalid", "ok", "$event:test.invalid", "", "room"):
