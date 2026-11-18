@@ -560,6 +560,17 @@ Pass `--no-service` to skip all of this; the keepawake task then keeps Sparrow
 running alone. Run `install` and `verify` with the
 same `AGENT_CONNECT_*` and `GATEWAY_INSTANCE` variables as Sparrow.
 
+A task poll the relay holds past the read timeout is not a success: its status
+write says the poll timed out, `connected` is `false`, and `last_ok_ts` stays
+at the last answer, so health-check reports it as transient within the grace.
+Five such polls in
+a row while other requests to the relay still answer mark a stuck relay session
+(`stuck_poll: true`, `consecutive_poll_timeouts`, `stuck_since`). Where a
+restart owner is declared (`SUTANDO_BRIDGE_RESTART_OWNER`, set by the launchd
+plist), Sparrow then exits 69 so it is relaunched, at most once every 10
+minutes; with none declared it keeps polling and reports the stuck session.
+Claimed tasks are on disk before that exit and reload on the next start.
+
 Sparrow rewrites `state/gateway-status.json` every poll. `verify` fails its
 `sparrow` check when that file is missing, not connected, older than 3
 minutes, or dated more than 5 seconds in the future (a timestamp that is not a bounded
@@ -839,6 +850,14 @@ no interpreter to run it, and the zipapp would need its path in the hook's
 config, which `install` does not write. `verify` reports such a setup as
 `cannot import ag2_sparrow`. Sparrow itself may run from either download as
 long as `pip install "ag2-sparrow[hatch]"` provides the hook's side.
+
+## OpenClaw agents (`ag2-sparrow[openclaw]`)
+
+`ag2-sparrow-openclaw` hosts an OpenClaw agent: for each task Sparrow queues it wakes `openclaw acp`
+over the Agent Client Protocol, resumes that room's Session, and OpenClaw answers with
+`ag2-sparrow-openclaw reply <result_file>` or `no-reply`. `install` and `verify` work as
+`ag2-sparrow-codex-local`'s do. See
+[`ag2_sparrow/adapters/openclaw/README.md`](ag2_sparrow/adapters/openclaw/README.md).
 
 ## Optional: room-event subscription (0.3.0)
 

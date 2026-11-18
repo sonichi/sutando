@@ -558,8 +558,9 @@ def _task_context(workspace, task_id: str) -> "tuple[str | None, list[str]]":
     """(goal, people) for an owner-tier task, from its file via the shared lookup; (None, []) for any
     other task, which is never sent."""
     try:
-        from local_task_protocol import find_archived_task, parse_task_headers_lenient
-        path = find_archived_task(Path(workspace) / "tasks", task_id)
+        from local_task_protocol import parse_task_headers_lenient
+        from task_lookup import find_task
+        path = find_task(workspace, task_id)
         if path is None:
             return None, []
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -677,7 +678,8 @@ def _ts(value, default: "float | None" = None) -> "float | None":
 
 def _finished(workspace, task_id: str) -> bool:
     """The task has its result (results/<id>.txt) or a done summary in the summaries log's tail."""
-    if (Path(workspace) / "results" / f"{task_id}.txt").exists():
+    from connections import task_home
+    if (task_home(task_id, Path(workspace))["results"] / f"{task_id}.txt").exists():
         return True
     try:
         with open(Path(workspace) / "state" / "agent-activity.summaries.jsonl", "rb") as f:

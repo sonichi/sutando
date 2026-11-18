@@ -10,6 +10,9 @@
 #   deliberate window -> restart happens but no alert / no proactive result file
 #   no token      -> wrapper exits 0 at once (no child); startup-runtime's idle-job
 #                    kickstart owns that case, and a live idle PID would read as running
+#   SIGTERM/SIGHUP to the wrapper -> logged, child stopped, wrapper exits 128+signo (never 0)
+#   core gate set -> no bridge, no eviction, no token check, no marker or alert: sparrowd runs
+#                    `--core --agent-bridges`, is relaunched when killed, and TERM ends it with the wrapper
 #
 # Run: bash tests/gateway-bridge-wrapper-self-heal.test.sh
 set -uo pipefail
@@ -33,7 +36,7 @@ EOS
   echo "import sys; sys.exit($code)" > "$d/src/remote-gateway-bridge.py"
   # the agent-bridge supervisor the wrapper keeps beside the bridge (its own suite pins it)
   printf 'import time\nwhile True: time.sleep(0.2)\n' > "$d/src/sparrowd.py"
-  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_labels.py" "$d/src/"
+  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$REPO/src/launchd/gateway-bridge-lib.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_labels.py" "$d/src/"
   # the wrapper calls the literal `python3`; shim it to the resolved interpreter
   printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"
   printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
@@ -99,7 +102,7 @@ EOS
   # each child records the token it was launched with, then exits 0 (relaunch path)
   printf 'import os,sys\nopen("%s/seen.log","a").write(os.environ.get("REMOTE_TASK_TOKEN","<unset>")+"\\n")\nsys.exit(0)\n' "$d" > "$d/src/remote-gateway-bridge.py"
   printf 'import time\nwhile True: time.sleep(0.2)\n' > "$d/src/sparrowd.py"
-  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_labels.py" "$d/src/"
+  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$REPO/src/launchd/gateway-bridge-lib.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_labels.py" "$d/src/"
   printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"; printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
   chmod +x "$d/shims/python3" "$d/shims/osascript"
   ( cd "$d"; env -u REMOTE_TASK_TOKEN -u AG2_REMOTE_TOKEN PATH="$d/shims:$PATH" SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY=1 \
@@ -130,7 +133,7 @@ EOS
   printf 'import os,sys\nsys.exit(0 if sys.argv[1:] == ["legacy-parked"] and os.path.exists("%s/parked") else 1)\n' "$d" > "$d/scripts/connections.py"
   printf 'import time\nopen("%s/launched.log","a").write("x\\n")\nwhile True: time.sleep(0.2)\n' "$d" > "$d/src/remote-gateway-bridge.py"
   printf 'import time\nwhile True: time.sleep(0.2)\n' > "$d/src/sparrowd.py"
-  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_labels.py" "$d/src/"
+  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$REPO/src/launchd/gateway-bridge-lib.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_labels.py" "$d/src/"
   printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"; printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
   chmod +x "$d/shims/python3" "$d/shims/osascript"
   touch "$d/parked"
@@ -153,6 +156,82 @@ echo "parked legacy -> alive=$p_alive launched-while-parked=$p_early agents=$p_a
 [ "$p_agents" -eq 1 ] || { echo "FAIL: the agent-bridge supervisor was not kept up while parked"; fail=1; }
 [ "$p_resumed" -eq 1 ] || { echo "FAIL: the bridge did not launch after the row was unparked"; fail=1; }
 [ "$p_alerts" -eq 0 ] || { echo "FAIL: parking raised an owner alert"; fail=1; }
+
+# A signal the wrapper did not get from launchctl must not end it with rc 0: the plist's
+# KeepAlive is crash-only, so a clean exit leaves the job down with no line in the log.
+# Prints: <wrapper-rc> <signal-lines> <bridge-alive-after>
+signal_case() {
+  local sig="$1" d; d=$(mktemp -d); mkdir -p "$d/src/launchd" "$d/scripts" "$d/ws/state/channel-bridge-supervisor" "$d/ws/results" "$d/shims"
+  cat > "$d/scripts/sutando-config.sh" <<EOS
+#!/bin/bash
+case "\${1:-}" in workspace) echo "$d/ws" ;; *) echo "$d/none.env" ;; esac
+EOS
+  chmod +x "$d/scripts/sutando-config.sh"
+  printf 'import os,time\nopen("%s/bridge.pid","w").write(str(os.getpid()))\nwhile True: time.sleep(0.2)\n' "$d" > "$d/src/remote-gateway-bridge.py"
+  printf 'import time\nwhile True: time.sleep(0.2)\n' > "$d/src/sparrowd.py"
+  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$REPO/src/launchd/gateway-bridge-lib.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_labels.py" "$d/src/"
+  printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"; printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
+  chmod +x "$d/shims/python3" "$d/shims/osascript"
+  ( cd "$d" || exit 1; env -u AG2_REMOTE_TOKEN PATH="$d/shims:$PATH" REMOTE_TASK_TOKEN=t SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY=1 \
+      bash src/launchd/gateway-bridge-wrapper.sh > o.log 2>&1 & p=$!
+    for _ in $(seq 1 30); do [ -s bridge.pid ] && break; sleep 0.2; done
+    kill "-$sig" $p 2>/dev/null; wait $p; echo $? > rc.txt )
+  local bpid alive=0; bpid="$(cat "$d/bridge.pid" 2>/dev/null)"
+  sleep 0.3; [ -n "$bpid" ] && kill -0 "$bpid" 2>/dev/null && { alive=1; kill "$bpid" 2>/dev/null; }
+  echo "$(cat "$d/rc.txt") $(grep -c "received SIG$sig" "$d/o.log") $alive"
+  rm -rf "$d"
+}
+for sig in TERM HUP; do
+  read -r s_rc s_lines s_alive <<<"$(signal_case $sig)"
+  want=$(( 128 + $(kill -l $sig) ))
+  echo "SIG$sig to wrapper -> rc=$s_rc log-lines=$s_lines bridge-alive=$s_alive (want rc=$want, lines>0, alive=0)"
+  [ "$s_rc" = "$want" ] || { echo "FAIL: SIG$sig ended the wrapper with rc $s_rc; launchd does not restart a clean exit"; fail=1; }
+  [ "$s_lines" -gt 0 ] || { echo "FAIL: SIG$sig ended the wrapper without saying so in its log"; fail=1; }
+  [ "$s_alive" -eq 0 ] || { echo "FAIL: the bridge outlived its wrapper after SIG$sig"; fail=1; }
+done
+
+# With <workspace>/state/sparrowd/core.enabled the wrapper launches no bridge of its own: it keeps
+# sparrowd --core --agent-bridges alive (relaunched when killed) and tends the lanes, even with no token.
+# Prints: <bridge-launched> <sparrowd-starts> <argv-ok> <evictions> <marker> <alerts> <wrapper-rc> <sparrowd-alive-after>
+core_case() {
+  local d; d=$(mktemp -d); mkdir -p "$d/src/launchd" "$d/scripts" "$d/ws/state/channel-bridge-supervisor" "$d/ws/state/sparrowd" "$d/ws/results" "$d/shims"
+  cat > "$d/scripts/sutando-config.sh" <<EOS
+#!/bin/bash
+case "\${1:-}" in workspace) echo "$d/ws" ;; *) echo "$d/none.env" ;; esac
+EOS
+  chmod +x "$d/scripts/sutando-config.sh"
+  touch "$d/ws/state/sparrowd/core.enabled"
+  date +%s > "$d/ws/state/channel-bridge-supervisor/gateway.started"
+  printf 'open("%s/bridge.log","a").write("x\\n")\n' "$d" > "$d/src/remote-gateway-bridge.py"
+  printf 'import os,sys,time\nopen("%s/sparrowd.log","a").write("%%d %%s\\n" %% (os.getpid(), " ".join(sys.argv[1:])))\nwhile True: time.sleep(0.2)\n' "$d" > "$d/src/sparrowd.py"
+  printf 'evict_own_bridge() { echo x >> "%s/evict.log"; }\n' "$d" > "$d/src/launchd/evict-own-bridge.sh"
+  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$REPO/src/launchd/gateway-bridge-lib.sh" "$d/src/launchd/"; cp "$REPO/src/result_publish.py" "$REPO/src/result_labels.py" "$d/src/"
+  printf '#!/bin/bash\nexec "%s" "$@"\n' "$PY" > "$d/shims/python3"; printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
+  chmod +x "$d/shims/python3" "$d/shims/osascript"
+  ( cd "$d" || exit 1; env -u AG2_REMOTE_TOKEN PATH="$d/shims:$PATH" REMOTE_TASK_TOKEN= SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY=1 \
+      bash src/launchd/gateway-bridge-wrapper.sh > o.log 2>&1 & p=$!
+    for _ in $(seq 1 30); do [ -s sparrowd.log ] && break; sleep 0.2; done
+    kill -9 "$(head -1 sparrowd.log | cut -d' ' -f1)" 2>/dev/null
+    for _ in $(seq 1 40); do [ "$(wc -l < sparrowd.log)" -ge 2 ] && break; sleep 0.2; done
+    kill -TERM $p 2>/dev/null; wait $p; echo $? > rc.txt )
+  local last alive=0; last="$(tail -1 "$d/sparrowd.log" | cut -d' ' -f1)"
+  sleep 0.3; [ -n "$last" ] && kill -0 "$last" 2>/dev/null && { alive=1; kill "$last" 2>/dev/null; }
+  local argv_ok=1; grep -qv " --core --agent-bridges$" "$d/sparrowd.log" && argv_ok=0
+  echo "$([ -f "$d/bridge.log" ] && echo 1 || echo 0) $(wc -l < "$d/sparrowd.log" | tr -d ' ') $argv_ok" \
+       "$([ -f "$d/evict.log" ] && echo 1 || echo 0) $([ -f "$d/ws/state/channel-bridge-supervisor/gateway.started" ] && echo 1 || echo 0)" \
+       "$(ls "$d/ws/results" | wc -l | tr -d ' ') $(cat "$d/rc.txt") $alive"
+  rm -rf "$d"
+}
+read -r c_bridge c_starts c_argv c_evict c_marker c_alerts c_rc c_alive <<<"$(core_case)"
+echo "core gate -> bridge=$c_bridge sparrowd-starts=$c_starts argv-ok=$c_argv evicted=$c_evict marker=$c_marker alerts=$c_alerts rc=$c_rc sparrowd-alive=$c_alive (want 0 >=2 1 0 0 0 143 0)"
+[ "$c_bridge" -eq 0 ] || { echo "FAIL: the wrapper launched its own bridge under the core gate"; fail=1; }
+[ "$c_starts" -ge 2 ] || { echo "FAIL: a killed sparrowd was not relaunched under the core gate"; fail=1; }
+[ "$c_argv" -eq 1 ] || { echo "FAIL: sparrowd was not started as --core --agent-bridges"; fail=1; }
+[ "$c_evict" -eq 0 ] || { echo "FAIL: the wrapper evicted under the core gate (sparrowd's launcher does)"; fail=1; }
+[ "$c_marker" -eq 0 ] || { echo "FAIL: the started marker was kept under the core gate"; fail=1; }
+[ "$c_alerts" -eq 0 ] || { echo "FAIL: the wrapper alerted under the core gate"; fail=1; }
+[ "$c_rc" = 143 ] || { echo "FAIL: SIGTERM ended the core-gate wrapper with rc $c_rc"; fail=1; }
+[ "$c_alive" -eq 0 ] || { echo "FAIL: sparrowd outlived the core-gate wrapper"; fail=1; }
 
 [ "$fail" -eq 0 ] && echo "PASS"
 exit $fail

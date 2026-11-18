@@ -8,6 +8,7 @@
     "src"
   ],
   "exclude": [
-    "skills/pr-watch/mod/**"
+    "skills/pr-watch/mod/**",
+    "src/agent/claude/task-watch-mod/**"
   ]
 }
