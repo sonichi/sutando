@@ -164,7 +164,7 @@ class ConnectorTest(unittest.TestCase):
 
     def test_a_collaborator_may_not_touch_files(self):
         self.w.task("task-1", "STUB:EDIT go", tier="team", collaborator=True)
-        self.w.serve()
+        self.w.serve(1, "--allow-non-owner")
         perms = [r for r in self.w.records() if "permission" in r]
         self.assertEqual([p["allowed"] for p in perms], [False, False])
         prompt = next(r["text"] for r in self.w.records() if r.get("method") == "session/prompt")
@@ -207,9 +207,9 @@ class ConnectorTest(unittest.TestCase):
 
     def test_each_non_owner_task_gets_a_throwaway_session_in_read_only_mode(self):
         self.w.task("task-1", "STUB:TEXT one", tier="team", collaborator=True)
-        self.w.serve()
+        self.w.serve(1, "--allow-non-owner")
         self.w.task("task-2", "STUB:TEXT two", tier="team", collaborator=True)
-        self.w.serve()
+        self.w.serve(1, "--allow-non-owner")
         methods = self.w.methods()
         self.assertNotIn("session/load", methods)
         self.assertEqual([m for m in methods if m.startswith("session/")],
@@ -228,7 +228,7 @@ class ConnectorTest(unittest.TestCase):
                     p.unlink(missing_ok=True)
                 (self.w.home / marker).write_text("")
                 self.w.task("task-1", "STUB:TEXT hi", tier="team", collaborator=True)
-                self.w.serve()
+                self.w.serve(1, "--allow-non-owner")
                 (self.w.home / marker).unlink()
                 said = self.w.result("task-1")
                 self.assertIn("Antigravity did not take this: it answers non-owners only in a read-only session mode", said)
@@ -238,7 +238,7 @@ class ConnectorTest(unittest.TestCase):
                 self.assertEqual(self.w.metrics()[-1]["status"], "refused")
         self.w.task("task-2", "say hi", tier="team", collaborator=True, event_type="room.joined")
         (self.w.home / "no-modes").write_text("")
-        self.w.serve()
+        self.w.serve(1, "--allow-non-owner")
         self.assertTrue(self.w.result("task-2").startswith("[no-send]"))
 
     def test_the_owner_turn_keeps_its_home_directory_and_room_session(self):
@@ -262,6 +262,21 @@ class ConnectorTest(unittest.TestCase):
         for modes in (None, {}, {"availableModes": [{"id": "default"}, {"id": "auto"}]}, {"availableModes": "plan"},
                       {"availableModes": [{"name": "plan"}]}):
             self.assertIsNone(pick(modes), modes)
+
+    def test_only_the_owner_is_served_unless_non_owners_are_opted_in(self):
+        self.w.task("task-1", "STUB:TEXT hi", tier="team", collaborator=True)
+        self.w.serve()
+        self.assertEqual(self.w.result("task-1"), task_io.NON_OWNER_REFUSED)
+        self.assertEqual(self.w.records(), [])
+        self.w.task("task-2", "STUB:TEXT hi")
+        self.w.serve()
+        self.assertEqual(self.w.result("task-2"), "hello from agy-stub\n")
+        self.w.task("task-3", "STUB:TEXT hi", tier="team", collaborator=True, channel="!b:s.space")
+        self.w.task("task-4", "STUB:TEXT hi", channel="!c:s.space")
+        os.utime(self.w.root / "tasks" / "task-4.txt", (2e9, 2e9))
+        self.w.serve(2, "--allow-non-owner")
+        self.assertEqual((self.w.result("task-3"), self.w.result("task-4")), ("hello from agy-stub\n",) * 2)
+        self.assertEqual([m["status"] for m in self.w.metrics()], ["refused", "completed", "completed", "completed"])
 
     def test_a_guest_is_refused_without_waking_agy(self):
         self.w.task("task-1", "STUB:TEXT hi", tier="guest")

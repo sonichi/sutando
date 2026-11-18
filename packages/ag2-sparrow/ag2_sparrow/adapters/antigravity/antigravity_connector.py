@@ -11,7 +11,8 @@ with every delivery marker neutralised. A final message of exactly NO_REPLY post
 turn failed gets a line saying so; an event that failed posts nothing.
 
 Sessions, the permission policy and the framing are acp_host's: the owner may read or edit under the working
-directory, no command is ever granted, and tier admission is task_io.admission's. A non-owner turn runs
+directory, no command is ever granted, and only the owner is served unless --allow-non-owner, which admits
+attested collaborators and other non-owners alike (task_io.admission decides the tier). A non-owner turn runs
 isolated: a fresh temporary directory per task holds its working directory and its own agy home
 (`--gemini-dir`, with deny-all permission rules and no global context), its Session is new and never stored,
 and it is refused unless agy offers a read-only (plan) session mode and accepts it. Stdlib only.
@@ -157,7 +158,8 @@ class Connector:
         result_file = os.path.join(self.args.results, name)
         headers, message, operator_lines = parse_task(path)
         tier = admission(headers, self.args.allow_non_owner)
-        if tier is None:
+        # A non-owner turn runs on the owner's agy sign-in, so collaborators need the opt-in too.
+        if tier is None or (tier != "owner" and not self.args.allow_non_owner):
             log("refused (non-owner) ->", task_id, headers["access_tier"])
             publish(result_file, NON_OWNER_REFUSED)
             return {"task": task_id, "status": "refused", "tier": headers["access_tier"]}
@@ -224,7 +226,8 @@ def build_parser():
     ap.add_argument("--session-store", default=None,
                     help="the sessions.json to resume from and record to (default: <work>/state/sessions.json)")
     ap.add_argument("--allow-non-owner", action="store_true",
-                    help="serve non-owner senders without collaborator access too (no file operations granted)")
+                    help="serve non-owner senders, attested collaborators included, on the owner's agy sign-in "
+                         "(no file operations granted; default: the owner only)")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=0.2)
