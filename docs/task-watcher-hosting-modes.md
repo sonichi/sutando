@@ -266,7 +266,7 @@ how `tests/watch-tasks-stream-shutdown-leaves-inflight-claim.test.py` interrupts
 - `tests/task-notifier-supervisor-alert-only.test.sh`: the alert-only standby types nothing, alerts
   once per outage after the grace with no path, retries a DM that was not published (macOS notified
   once), validates its settings, reminds only when opted in, and stands down silently. Its tmux part
-  prints SKIP where tmux is missing. `tests/task-notifier-supervisor-alert-only.mutations.sh` re-runs
+  prints SKIP where tmux is missing. `scripts/mutation-check-standby-alert.sh` re-runs
   it against named mutants of the supervisor and fails if any survives.
 - `tests/task-notifier-supervisor-alert-decision.test.py`: with no tmux, the real supervisor in alert
   mode alerts and never starts the typing notifier; an unregistered inbox is logged and never
