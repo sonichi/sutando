@@ -210,6 +210,98 @@ def test_a_failed_poll_still_reports_reconnecting():
         print("PASS test_a_failed_poll_still_reports_reconnecting")
 
 
+def _sleeps(m, stubs, passes=8):
+    """main() for `passes` failed passes; the pauses it slept, in order."""
+    slept = []
+
+    def sleep(s):
+        slept.append(s)
+        if len(slept) >= passes:
+            raise _Stop()
+    with patch.multiple(m, **stubs), patch.object(m.atexit, "register"), \
+            patch.object(m.time, "sleep", side_effect=sleep):
+        try:
+            m.main()
+        except _Stop:
+            pass
+    return slept
+
+
+def test_a_step_failing_after_every_good_poll_keeps_the_base_pause():
+    # #6542: the poll answers every pass, then the ledger step raises. Each pass used to
+    # double the pause, 1, 2, 4 ... 60 s, so every later poll waited a minute.
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        stubs = _main_stubs(m, lambda method, path, *a, **k: {"tasks": []})
+
+        def ledger_fails(_inflight):
+            raise RuntimeError("ledger write failed")
+        stubs["_reconcile_ledger"] = ledger_fails
+        slept = _sleeps(m, stubs)
+        assert slept == [1] * 8, slept
+        rec = json.loads(m.GATEWAY_STATUS_FILE.read_text())
+        assert rec["backoff_s"] == 1 and rec["connected"] is True, rec
+        print("PASS test_a_step_failing_after_every_good_poll_keeps_the_base_pause")
+
+
+def test_a_post_poll_network_or_http_error_keeps_the_base_pause_too():
+    import urllib.error
+    for exc in (urllib.error.URLError("ack refused"),
+                urllib.error.HTTPError("/v1/tasks/ack", 502, "bad gateway", {}, None)):
+        with tempfile.TemporaryDirectory() as d:
+            m = _load(pathlib.Path(d))
+            stubs = _main_stubs(m, lambda method, path, *a, **k: {"tasks": []})
+
+            def turn_close_fails(_inflight, exc=exc):
+                raise exc
+            stubs["_retry_turn_closes"] = turn_close_fails
+            slept = _sleeps(m, stubs, passes=5)
+            assert slept == [1] * 5, (type(exc).__name__, slept)
+    print("PASS test_a_post_poll_network_or_http_error_keeps_the_base_pause_too")
+
+
+def test_a_failing_poll_still_backs_off_to_its_cap():
+    import urllib.error
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+
+        def poll_503(method, path, *a, **k):
+            raise urllib.error.HTTPError(path, 503, "unavailable", {}, None)
+        slept = _sleeps(m, _main_stubs(m, poll_503))
+        assert slept == [1, 2, 4, 8, 16, 32, 60, 60], slept
+        print("PASS test_a_failing_poll_still_backs_off_to_its_cap")
+
+
+def test_the_first_good_poll_after_an_outage_starts_the_pause_over():
+    # Polls fail three times, then answer while a later step fails: back to the base at once.
+    import urllib.error
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        calls = {"n": 0}
+
+        def poll(method, path, *a, **k):
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                raise urllib.error.HTTPError(path, 503, "unavailable", {}, None)
+            return {"tasks": []}
+        stubs = _main_stubs(m, poll)
+
+        def ledger_fails(_inflight):
+            raise RuntimeError("ledger write failed")
+        stubs["_reconcile_ledger"] = ledger_fails
+        slept = _sleeps(m, stubs, passes=6)
+        assert slept == [1, 2, 4, 1, 1, 1], slept
+        print("PASS test_the_first_good_poll_after_an_outage_starts_the_pause_over")
+
+
+def test_pass_backoff():
+    m = _load(pathlib.Path(tempfile.mkdtemp()))
+    assert m._pass_backoff(16, True) == (1, 1)
+    assert m._pass_backoff(16, False) == (16, 32)
+    assert m._pass_backoff(60, False) == (60, 60)
+    print("PASS test_pass_backoff")
+
+
 if __name__ == "__main__":
     test_connected_then_reconnecting_preserves_last_ok()
     test_connected_without_a_poll_preserves_absent_evidence()
@@ -221,4 +313,9 @@ if __name__ == "__main__":
     test_emitted_gateway_field_carries_no_secret()
     test_a_post_poll_failure_keeps_connected_true()
     test_a_failed_poll_still_reports_reconnecting()
+    test_a_step_failing_after_every_good_poll_keeps_the_base_pause()
+    test_a_post_poll_network_or_http_error_keeps_the_base_pause_too()
+    test_a_failing_poll_still_backs_off_to_its_cap()
+    test_the_first_good_poll_after_an_outage_starts_the_pause_over()
+    test_pass_backoff()
     print("ALL PASS")
