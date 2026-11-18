@@ -6260,6 +6260,18 @@ def check_quota_model_fallback(fresh_sec: int = 1800) -> dict:
                                "no Claude traffic through the proxy since; stale, not alerting")
             return check
         passed = reset_passed(at_tier) if at_tier else None
+        # A lower fallback tier held by a window that has not reset outlives the top one.
+        held = sorted(((ws.get("tier"), w) for w, ws in windows.items()
+                       if w not in at_tier and isinstance(ws, dict) and ws.get("tier") in (2, 3)
+                       and not reset_passed([w])), reverse=True)
+        if passed and held:
+            lower, window = held[0]
+            check["status"] = "warn"
+            check["detail"] = (
+                f"model fallback tier {tier}'s window reset at {passed} has passed, but the {window} window "
+                f"still holds tier {lower} until it resets ({fb.get('reason')}); the proxy recomputes it "
+                "on the next Claude request (skills/quota-tracker/SKILL.md → Model fallback).")
+            return check
         if passed:
             check["detail"] = f"model fallback tier {tier} recorded ({fb.get('reason')}) but its window reset at {passed} has passed — cleared"
             return check

@@ -146,6 +146,34 @@ class TestQuotaModelFallback(unittest.TestCase):
         c = self.hc.check_quota_model_fallback()
         self.assertEqual(c["status"], "warn", c)
 
+    def test_a_lower_tier_still_held_is_not_cleared_by_the_top_tier_s_reset(self):
+        # The 5h window that set tier 3 reset a minute ago; the 7d window still holds tier 2.
+        fb = self._tier(3)
+        fb["windows"] = {"5h": {"tier": 3, "reset": str(int(self.now - 60))},
+                         "7d": {"tier": 2, "reset": str(int(self.now + 86400))}}
+        self._write(fallback=fb)
+        c = self.hc.check_quota_model_fallback()
+        self.assertEqual(c["status"], "warn", c)
+        self.assertNotIn("cleared", c["detail"])
+        self.assertIn("7d window still holds tier 2", c["detail"])
+
+    def test_every_fallback_window_reset_is_cleared(self):
+        fb = self._tier(3)
+        fb["windows"] = {"5h": {"tier": 3, "reset": str(int(self.now - 60))},
+                         "7d": {"tier": 2, "reset": str(int(self.now - 30))}}
+        self._write(fallback=fb)
+        c = self.hc.check_quota_model_fallback()
+        self.assertEqual(c["status"], "ok", c)
+        self.assertIn("cleared", c["detail"])
+
+    def test_a_lower_tier_window_with_no_readable_reset_counts_as_held(self):
+        fb = self._tier(3)
+        fb["windows"] = {"5h": {"tier": 3, "reset": str(int(self.now - 60))},
+                         "7d": {"tier": 2, "reset": "soon"}}
+        self._write(fallback=fb)
+        c = self.hc.check_quota_model_fallback()
+        self.assertEqual(c["status"], "warn", c)
+
     def test_low_priority_only_downgrade_stays_ok_but_is_named(self):
         self._write(fallback=self._tier(1, low_priority_tier=2, reason="primary (5h 10%, 7d 61%)"))
         c = self.hc.check_quota_model_fallback()
