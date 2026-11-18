@@ -85,10 +85,15 @@ def neutralize(text: str) -> str:
 
 
 def ordered_options(default_action: Optional[str], options) -> list:
-    """(label, consequence) pairs with Approve first; Approve carries the default."""
+    """(label, consequence) pairs with Approve first; Approve carries the default.
+
+    An option named like the default is the same choice as Approve: it lends Approve its
+    consequence and is not shown again."""
     opts = [(str(a).strip(), str(b).strip()) for a, b in options or () if str(a).strip()]
-    approve = [o for o in opts if o[0].lower() == APPROVE.lower()]
-    rest = [o for o in opts if o[0].lower() != APPROVE.lower()]
+    default = (default_action or "").strip().lower()
+    same = [o for o in opts if o[0].lower() == APPROVE.lower() or (default and o[0].lower() == default)]
+    rest = [o for o in opts if o not in same]
+    approve = [o for o in same if o[0].lower() == APPROVE.lower()] or same
     if approve:
         lead = (APPROVE, approve[0][1] or (default_action or "").strip())
     else:
@@ -108,6 +113,7 @@ class Question:
     reason: Optional[str] = None
     options: tuple = ()
     priority: str = "Medium"
+    asked_by: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {**asdict(self), "options": [list(o) for o in self.options]}
@@ -116,7 +122,8 @@ class Question:
     def from_dict(cls, d: dict) -> "Question":
         return cls(str(d["ask_id"]), str(d["question"]), d.get("context"), float(d.get("asked_at") or 0),
                    d.get("default_action"), d.get("reason"),
-                   tuple(tuple(o) for o in d.get("options") or ()), d.get("priority") or "Medium")
+                   tuple(tuple(o) for o in d.get("options") or ()), d.get("priority") or "Medium",
+                   d.get("asked_by") or None)
 
 
 # ---- the room database ---------------------------------------------------------
@@ -138,6 +145,7 @@ DB_SCHEMA = {
                      _opt("low", "Low", "gray")]},
         {"id": "ask_id", "name": "Ask id", "type": "text"},
         {"id": "host", "name": "Host", "type": "text"},
+        {"id": "asked_by", "name": "Asked by", "type": "text"},
         {"id": "recovery", "name": "Recovery", "type": "text"},
         {"id": "closed", "name": "Closed", "type": "text"},
     ],
@@ -338,17 +346,20 @@ class RoomDbStore:
     def where(self, ask_id: str) -> str:
         return f"{DB_SCHEMA['name']} database in {self.label}, row {self._rid(ask_id)}"
 
-    def insert_raw(self, ask_id: str, title: str, body: str, priority: str = "Medium") -> dict:
+    def insert_raw(self, ask_id: str, title: str, body: str, priority: str = "Medium",
+                   asked_by: Optional[str] = None) -> dict:
         cells = {"name": one_line_title(title), "status": _option_id("status", "Open"),
                  "priority": _option_id("priority", priority), "ask_id": ask_id}
         if self.host:
             cells["host"] = self.host
+        if asked_by:
+            cells["asked_by"] = asked_by
         res = self.client.add_row(DB_SCHEMA, self._rid(ask_id), cells, body) or {}
         self.last_link = res.get("link")
         return res
 
     def insert(self, q: Question, sent_line: str) -> dict:
-        return self.insert_raw(q.ask_id, q.question, question_body(q, sent_line), q.priority)
+        return self.insert_raw(q.ask_id, q.question, question_body(q, sent_line), q.priority, q.asked_by)
 
     def redeliver(self, q: Question, sent_line: str) -> None:
         """Rewrite this row's body with a new delivery record, in one body write under `lock`."""

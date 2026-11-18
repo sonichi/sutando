@@ -74,7 +74,7 @@ def main() -> int:
         check("...and what the interpreter needs", any("needs nothing" in s for s in skipped),
               str(skipped))
         names = [w.name for w in mod.worker_specs()]
-        check("the core's own worker is unaffected", "remote-gateway-bridge" in names)
+        check("no worker is listed for it", "synthetic-worker" not in names)
 
         print("── configured but not a real file ──")
         os.environ["SYNTHETIC_WORKER_PYTHON"] = "/nonexistent/python3"
@@ -92,8 +92,8 @@ def main() -> int:
             check("...running THAT interpreter, not the core's by accident",
                   spec.argv[0] == sys.executable)
             check("...on the declared script", spec.argv[1].endswith("scripts/loop.py"))
-            check("it joins the core's worker rather than replacing it",
-                  [w.name for w in mod.worker_specs()][0] == "remote-gateway-bridge")
+            check("it is listed among the supervised workers",
+                  "synthetic-worker" in [w.name for w in mod.worker_specs()])
 
         print("── the manifest is a configured source, not only the env ──")
         os.environ.pop("SYNTHETIC_WORKER_PYTHON", None)

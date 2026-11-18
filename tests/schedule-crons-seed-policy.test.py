@@ -23,7 +23,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SKILL = REPO / "skills" / "schedule-crons"
-OPT_IN = {"morning-briefing", "example-digest"}
+OPT_IN = {"morning-briefing", "example-digest", "own-pr-shepherd"}
 FIXTURES = REPO / "tests" / "fixtures" / "schedule-crons"
 PRE_OPT_IN = FIXTURES / "crons.example.pre-opt-in.json"
 OLDEST = FIXTURES / "crons.example.2b45993b.json"
