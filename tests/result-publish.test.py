@@ -153,37 +153,43 @@ class PublisherContract(unittest.TestCase):
 
 class RelativePathAnchoring(unittest.TestCase):
     """A relative "results/..." is anchored to the workspace, never to the process's cwd — the
-    session's cwd is the repo, so a path resolved against it lands where no reader looks."""
+    session's cwd is the repo, so a path resolved against it lands where no reader looks.
+    Run against src and the vendored ag2-sparrow copy: the bridge imports the latter."""
+
+    MODULES = (result_publish, _load_vendored())
 
     def test_a_relative_path_resolves_against_the_given_workspace(self):
-        with tempfile.TemporaryDirectory() as td:
-            ws = (Path(td) / "ws").resolve()
-            cwd = os.getcwd()
-            try:
-                os.chdir(td)  # a repo-root-shaped cwd that is NOT the workspace
-                self.assertEqual(
-                    result_publish.worker_published_path(Path("results") / "task-1.txt", {}, ws),
-                    ws / "results" / "task-1.txt")
-            finally:
-                os.chdir(cwd)
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                ws = (Path(td) / "ws").resolve()
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)  # a repo-root-shaped cwd that is NOT the workspace
+                    self.assertEqual(
+                        mod.worker_published_path(Path("results") / "task-1.txt", {}, ws),
+                        ws / "results" / "task-1.txt")
+                finally:
+                    os.chdir(cwd)
 
     def test_a_relative_path_with_no_workspace_given_resolves_the_real_one(self):
-        with tempfile.TemporaryDirectory() as td:
-            ws = (Path(td) / "ws").resolve()
-            cwd = os.getcwd()
-            try:
-                os.chdir(td)
-                with mock.patch("workspace_default.resolve_workspace", return_value=ws):
-                    self.assertEqual(
-                        result_publish.worker_published_path(Path("results") / "task-1.txt"),
-                        ws / "results" / "task-1.txt")
-            finally:
-                os.chdir(cwd)
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                ws = (Path(td) / "ws").resolve()
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)
+                    with mock.patch("workspace_default.resolve_workspace", return_value=ws):
+                        self.assertEqual(
+                            mod.worker_published_path(Path("results") / "task-1.txt"),
+                            ws / "results" / "task-1.txt")
+                finally:
+                    os.chdir(cwd)
 
     def test_an_absolute_path_is_unaffected(self):
-        with tempfile.TemporaryDirectory() as td:
-            target = Path(td) / "results" / "task-1.txt"
-            self.assertEqual(result_publish.worker_published_path(target, {}, Path(td) / "unused"), target)
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                target = Path(td) / "results" / "task-1.txt"
+                self.assertEqual(mod.worker_published_path(target, {}, Path(td) / "unused"), target)
 
 
 class PublisherFailurePaths(unittest.TestCase):
