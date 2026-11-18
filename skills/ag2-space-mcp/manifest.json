@@ -4,7 +4,7 @@
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
-  "description": "Connect a Sutando install to the hosted AG2 Space MCP as its own agent, without the desktop app: registers an http entry whose headersHelper is ag2-sparrow-mcp, which mints a short-lived token per connect from the core's channel credential.",
+  "description": "Connect a Sutando install to the hosted s.space MCP as its own agent, without the desktop app: registers an http entry whose headersHelper is ag2-sparrow-mcp, which mints a short-lived token per connect from the core's channel credential.",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
   }

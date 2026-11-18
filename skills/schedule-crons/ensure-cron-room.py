@@ -163,7 +163,7 @@ def main():
         print(f"ensure-cron-room: {e} — skipping, no rooms created.")
         return 0
     if not (url and secret):
-        print("ensure-cron-room: not connected to AG2 Space (no gateway token) — skipping, no rooms created.")
+        print("ensure-cron-room: not connected to s.space (no gateway token) — skipping, no rooms created.")
         return 0
 
     data = json.load(open(a.crons_file))

@@ -411,7 +411,7 @@ def register_ask(ws: Path, draft_id: str, title: str, device: str) -> str:
 
     # turn_on_action (the helper's default): the click reaches the core as a task, so the Stop hook runs at once
     return create_choice(
-        f"I hit what looks like a Sutando/AG2 Space defect: {title}. File it to the team?",
+        f"I hit what looks like a Sutando/s.space defect: {title}. File it to the team?",
         ASK_ACTIONS, draft_id, {"draft_id": draft_id, "title": title},
         runtime=HITL_RUNTIME, title="File a bug report?",
         device={"id": f"{HITL_RUNTIME}:{draft_id}", "name": device}, manager=hitl_manager(ws),

@@ -450,7 +450,7 @@ describe('navigate_ui exposure — declared only where a client can answer it', 
 		const rule = lines.findIndex(l => l.startsWith('- NAVIGATION: '));
 		assert.ok(lines[rule - 1].startsWith('- For SIMPLE actions') && lines[rule + 1].startsWith('- WHERE YOU ARE: ') && lines[rule + 2].startsWith('- For IN-PLACE EDITS'), 'where the rules have always sat');
 		assert.ok(lines.some(l => l.startsWith('- navigate_ui: ') && l.endsWith('. Instant.')), 'listed with the instant tools');
-		assert.ok(lines.some(l => l.startsWith('- current_room: The AG2 Space room this voice session is docked in right now') && l.endsWith('. Instant.')));
+		assert.ok(lines.some(l => l.startsWith('- current_room: The s.space room this voice session is docked in right now') && l.endsWith('. Instant.')));
 		assert.ok(lines.some(l => l.includes(', navigate_ui, current_room — call these directly')), 'and in the joined names line');
 	});
 

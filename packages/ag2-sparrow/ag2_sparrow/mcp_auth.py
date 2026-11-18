@@ -163,7 +163,7 @@ def setup_entry(gateway: Gateway, source_root: str = "") -> dict:
 def setup_lines(gateway: Gateway) -> list:
     _url, _bearer, env_file = _require(gateway)
     cfg = setup_entry(gateway)
-    lines = ["# Run in the agent's project: its Claude Code then acts in AG2 Space as this agent.",
+    lines = ["# Run in the agent's project: its Claude Code then acts in s.space as this agent.",
              f"claude mcp add-json {SERVER_NAME} {shlex.quote(json.dumps(cfg))}"]
     if not env_file:
         lines.append("# The token came from the environment: start Claude Code with "

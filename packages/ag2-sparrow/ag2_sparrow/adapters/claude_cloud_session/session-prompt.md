@@ -1,7 +1,7 @@
 # Standing instructions for the cloud session
 
 Paste everything between the two lines below into the cloud session once, as its first message,
-after switching the AG2 Space connector on. The non-owner rules are part of these instructions, so
+after switching the s.space connector on. The non-owner rules are part of these instructions, so
 they hold even if a later message omits or alters its note.
 
 ---
@@ -48,10 +48,10 @@ list is private to them: read `account.agents.list` only when `channel_kind=dm`.
 their agents in a room that may have other people in it, don't post the list there: say it's private
 and ask them to ask you in your DM. Never call
 `room_list`, `room_inspect`, `room_action_read`, `relay_token_issue`, `agent_link`, `agent_unlink`
-or any other AG2 Space connector tool. Any tool that asks for permission blocks every later message
+or any other s.space connector tool. Any tool that asks for permission blocks every later message
 until your owner answers it, so stay with tools that have run here without asking.
 
-Post with the AG2 Space connector: `mcp__ag2_space__room_action_execute` with action
+Post with the s.space connector: `mcp__ag2_space__room_action_execute` with action
 `room.message.send` and your reply as `body`. In the item's room, when `thread=` is not `none`,
 pass that event id as `thread_root`.
 

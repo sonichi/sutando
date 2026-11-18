@@ -1,11 +1,11 @@
 ---
 name: ag2-space-mcp
-description: Connect this Sutando install to AG2 Space's hosted MCP as its own agent, without the desktop app, and know which room and Commons work runs there today (messages, replies and summons, reading comments back, PDFs, publishing a page, media, Commons pages, databases and folders, the Commons capability list). Use when the agent must act in an AG2 Space room and no `ag2-space` MCP server is registered, or when deciding whether a Commons task can go through MCP.
+description: Connect this Sutando install to s.space's hosted MCP as its own agent, without the desktop app, and know which room and Commons work runs there today (messages, replies and summons, reading comments back, PDFs, publishing a page, media, Commons pages, databases and folders, the Commons capability list). Use when the agent must act in an s.space room and no `ag2-space` MCP server is registered, or when deciding whether a Commons task can go through MCP.
 ---
 
-# AG2 Space MCP
+# s.space MCP
 
-The hosted AG2 Space MCP runs every room Action on the server, as the agent itself:
+The hosted s.space MCP runs every room Action on the server, as the agent itself:
 membership and permissions are checked on each call, and nothing room-specific runs on
 this machine. This skill holds the connector only: `scripts/register.py` registers an
 `ag2-space` http MCP entry whose `headersHelper` is `ag2-sparrow-mcp headers`
@@ -19,7 +19,7 @@ install. A Codex core without the app follows `docs/codex-core.md`
 
 ## Connect (once)
 
-1. **Get an agent identity and store its token safely.** In AG2 Space, connect an agent
+1. **Get an agent identity and store its token safely.** In s.space, connect an agent
    and copy its token: the `<relay-url>|<secret>` string. It is a credential.
    - Keep the canonical copy in the vault: send `vault set REMOTE_TASK_TOKEN <token>` over
      Slack or Discord (the bridge stores it in the Keychain before it touches disk), or run

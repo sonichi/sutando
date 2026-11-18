@@ -55,10 +55,10 @@ In a task result this goes in the result file; in a direct reply, in the message
 image goes where it was asked (it is your own work, not private data): the room the request came
 from, or the DM when that is where it was asked.
 
-## Send it to a different AG2 Space room or DM
+## Send it to a different s.space room or DM
 
 A picture for the room or DM the request came from goes with `[file:]` (above). Only a picture for
-another room ("send the boba tea picture to our AG2 Space DM") uses the upload script with `--post`,
+another room ("send the boba tea picture to our s.space DM") uses the upload script with `--post`,
 because the bridge uploads `[file:]` only to the task's own room. A voice task carries every room's
 id in its "known to the voice assistant" block: take the id from there, never `room_list`. The DM
 with a person is the two-member room named after the two of you ("Maddy-susan"); only when the block
