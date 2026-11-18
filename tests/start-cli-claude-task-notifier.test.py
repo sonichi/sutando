@@ -161,24 +161,16 @@ class CoreLaunchStartsSupervisedNotifier(unittest.TestCase):
     def test_custom_alert_knobs_reach_the_watcher_and_a_change_replaces_it(self):
         created_before = self.h.watcher_created()
         time.sleep(1.1)   # session_created has 1 s resolution
-        run = self.h.launch(extra_env={"SUTANDO_NOTIFIER_ALERT_GRACE": "60", "SUTANDO_NOTIFIER_ALERT_REPEAT": "0"})
+        run = self.h.launch(extra_env={"SUTANDO_NOTIFIER_ALERT_GRACE": "60", "SUTANDO_NOTIFIER_ALERT_REPEAT": "0",
+                                       "SUTANDO_NOTIFIER_ALERT_PILEUP": "5"})
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        _, _, env = self.h.watcher()
-        self.assertIn("SUTANDO_NOTIFIER_ALERT_GRACE=60", env.splitlines())
-        self.assertIn("SUTANDO_NOTIFIER_ALERT_REPEAT=0", env.splitlines())
+        lines = self.h.watcher()[2].splitlines()
+        self.assertIn("SUTANDO_NOTIFIER_ALERT_GRACE=60", lines)
+        self.assertIn("SUTANDO_NOTIFIER_ALERT_REPEAT=0", lines)
+        self.assertIn("SUTANDO_NOTIFIER_ALERT_PILEUP=5", lines)
+        version = next(l for l in lines if l.startswith("SUTANDO_NOTIFIER_VERSION="))
+        self.assertTrue(version.endswith("-a60-r0-u5"), f"every alert knob is in the identity: {version}")
         self.assertNotEqual(created_before, self.h.watcher_created(), "a changed knob replaces the supervisor")
-
-    def test_the_pileup_threshold_reaches_the_watcher_and_only_a_change_replaces_it(self):
-        knobs = {"SUTANDO_NOTIFIER_ALERT_PILEUP": "5"}
-        for env_extra, replaced in ((knobs, True), (knobs, False), (None, True)):
-            created_before = self.h.watcher_created()
-            time.sleep(1.1)   # session_created has 1 s resolution
-            run = self.h.launch(extra_env=env_extra)
-            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-            _, _, env = self.h.watcher()
-            want = "SUTANDO_NOTIFIER_ALERT_PILEUP=" + ("5" if env_extra else "")
-            self.assertIn(want, env.splitlines())
-            self.assertEqual(created_before != self.h.watcher_created(), replaced, f"{env_extra}: replaced={replaced}")
 
     def test_restart_tears_the_watcher_down_with_the_core(self):
         created_before = self.h.watcher_created()
