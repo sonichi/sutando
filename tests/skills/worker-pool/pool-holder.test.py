@@ -11,7 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parents[3]
 spec = importlib.util.spec_from_file_location("pool_holder", REPO / "src" / "pool_holder.py")
 ph = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ph)
