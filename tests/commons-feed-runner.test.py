@@ -498,6 +498,19 @@ for name, run, at in (("at the slot's end", in_slot, slot_start + every_ms),
     except fr.Refused:
         refused = True
     check(f"a run {name} is not current", refused)
+
+# The stated bound: `current` is checked before sending, so a key is deduped only while it is
+# among the backend's newest RUN_KEY_HISTORY. A model of that history, keyed by real slot keys.
+check("the run-key history the docs state is 16", fr.RUN_KEY_HISTORY == 16
+      and "(16 per grant)" in skill and "only while the key is among those 16" in skill
+      and "never writes again" not in (fr.current.__doc__ or ""))
+paused = fr.slot_key("g", EVERY, NOW)
+fr.current(in_slot, NOW)  # passes before the request is paused
+for newer, deduped in ((fr.RUN_KEY_HISTORY - 1, True), (fr.RUN_KEY_HISTORY, False)):
+    history = [paused] + [fr.slot_key("g", EVERY, NOW + i * every_ms) for i in range(1, newer + 1)]
+    kept = history[-fr.RUN_KEY_HISTORY:]
+    check(f"a paused run with {newer} newer runs is {'still' if deduped else 'no longer'} deduped",
+          len(set(history)) == newer + 1 and (paused in kept) is deduped)
 with tempfile.TemporaryDirectory() as tmp:
     for name, until, code_want in (("current", 2 ** 62, 0), ("past", 1, 1)):
         path = Path(tmp) / f"{name}.json"

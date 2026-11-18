@@ -37,8 +37,10 @@ The slot key is C3's (`notes/c3-durable-dispatch-contract`): `cron:<grant_id>:<s
 slot taken from the grant's cadence, never from the time the run starts. Catch-up is `latest`:
 a runner that was down for several slots runs the current one only. Every retry of a slot
 carries the same key. The backend remembers its most recent run keys (16 per grant) and writes
-none of them twice; a run is written only while its slot is current (step 3's `current`
-check), so it is always among those it remembers.
+none of them twice. Step 3's `current` check sends a run only while its slot is current. That is
+a best-effort check before sending, not a fence where the write is accepted: a request paused
+after the check can arrive once 16 newer runs have pushed its key out, and then write again.
+Deduplication holds only while the key is among those 16.
 
 ## One fire
 

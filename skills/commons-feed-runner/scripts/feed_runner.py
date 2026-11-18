@@ -101,11 +101,16 @@ def slot_until(every_minutes: int, now_ms: int) -> int:
     return now_ms // every_ms * every_ms + every_ms
 
 
+# The backend dedupes a grant's run keys only while one is among its newest RUN_KEY_HISTORY.
+# A request paused past `current` can arrive after its key left that history and write again.
+RUN_KEY_HISTORY = 16
+
+
 def slot_key(grant_id: str, every_minutes: int, now_ms: int) -> str:
     """C3's slot key for the grant's schedule: cron:<trigger>:<slot_ts>, the trigger being the
     grant. Derived from the schedule, never from when the run happens to start, so every retry
-    of one slot carries the same key, which the backend writes once within its bounded run-key
-    history. Catch-up is `latest`: a runner that was down for several slots runs only the
+    of one slot carries the same key, which the backend dedupes while it is among the last
+    RUN_KEY_HISTORY keys. Catch-up is `latest`: a runner that was down for several slots runs only the
     current one."""
     every_ms = every_minutes * 60_000
     return f"cron:{grant_id}:{now_ms // every_ms * every_ms}"
@@ -341,9 +346,8 @@ def failure(run: dict, reply) -> dict:
 
 
 def current(run: dict, now_ms: int) -> dict:
-    """{"current": True} while the run's slot has not ended, else Refused. The backend keeps
-    a bounded history of run keys, so a run written only within its own slot is always among
-    the newest it remembers: a late retry of a past slot never writes again."""
+    """{"current": True} while the run's slot has not ended, else Refused: a best-effort check
+    before sending, not a fence where the write is accepted (see RUN_KEY_HISTORY)."""
     until = run.get("slot_until")
     if isinstance(until, bool) or not isinstance(until, int):
         raise Refused("the run has no slot_until; plan it again with due")
