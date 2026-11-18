@@ -184,10 +184,10 @@ class FileAttachTests(unittest.TestCase):
         fd, fpath = tempfile.mkstemp(prefix="sutando-attach-test-", suffix=".txt", dir="/tmp")
         os.write(fd, b"x"); os.close(fd)
         self.addCleanup(lambda: os.path.exists(fpath) and os.unlink(fpath))
-        with patch.object(self.mod.os.path, "getsize", side_effect=OSError("boom")):
+        with patch.object(self.mod.os, "fstat", side_effect=OSError(13, "boom")):
             ok, reason = self.mod._upload_attachment("!r:s", fpath)
-        self.assertFalse(ok); self.assertIn("stat failed", reason)
-        with patch("builtins.open", side_effect=OSError("denied")):
+        self.assertFalse(ok); self.assertIn("read failed", reason)
+        with patch.object(self.mod.os, "open", side_effect=OSError(13, "denied")):
             ok, reason = self.mod._upload_attachment("!r:s", fpath)
         self.assertFalse(ok); self.assertIn("read failed", reason)
 

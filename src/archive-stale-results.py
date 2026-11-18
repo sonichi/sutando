@@ -8,7 +8,8 @@ reason about long-dead files they weren't around to consume.
 Retention policy: by default, any `.txt` directly under `results/` whose
 mtime is older than $RETENTION_HOURS (default 24) gets moved under a
 date-stamped archive subdirectory. Files inside existing `archive-*`
-subdirectories are never touched.
+subdirectories are never touched. Each pool worker with its own folders
+(`connections.own_worker_homes`) has its own results/ swept the same way.
 
 Usage:
     python3 src/archive-stale-results.py
@@ -119,20 +120,36 @@ def paths_held_open(paths: "list[Path]") -> "set[Path]":
     return open_now
 
 
+def own_results_dirs() -> "list[tuple[str, Path]]":
+    """(worker, results dir) of each pool worker with its own folders; [] without the record."""
+    from connections import own_worker_homes
+    return [(h["worker"], h["results"]) for h in own_worker_homes(WORKSPACE)]
+
+
 def main() -> int:
     if not RESULTS.is_dir():
         print("  [retention] results/ missing — nothing to do")
-        return 0
+        rc = 0
+    else:
+        rc = sweep(RESULTS)
+    for worker, results in own_results_dirs():
+        if results.is_dir():
+            print(f"  [retention] worker {worker}'s own results/:")
+            rc |= sweep(results)
+    return rc
 
+
+def sweep(results: Path) -> int:
+    """Archive the stale `.txt` files directly under `results`; 1 on any move error."""
     cutoff = time.time() - RETENTION_HOURS * 3600
     archive_name = datetime.now().strftime("archive-%Y-%m-%d")
-    archive_dir = RESULTS / archive_name
+    archive_dir = results / archive_name
 
     moved = 0
     errors = 0
     skipped_open = 0
     candidates: "list[Path]" = []
-    for f in RESULTS.iterdir():
+    for f in results.iterdir():
         if not f.is_file():
             continue
         if f.suffix != ".txt":

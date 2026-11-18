@@ -76,7 +76,7 @@
    ],
    "status": "canonical",
    "canonical_for": "built-in capability catalog",
-   "last_verified": "2026-11-08"
+   "last_verified": "2026-11-17"
   },
   "docs/census/d1-identity-census.md": {
    "title": "D1 identity/state census — Discord / AG2 Space / Slack",
@@ -135,7 +135,7 @@
    ],
    "status": "active",
    "canonical_for": "the state/connections.json record, preview-then-confirm add, primary and state semantics, and the startup launch plan for multi-gateway bridges",
-   "last_verified": "2026-11-09"
+   "last_verified": "2026-11-16"
   },
   "docs/delivery-protocol.md": {
    "title": "The file delivery protocol as a formal state machine",
@@ -267,7 +267,7 @@
    ],
    "status": "canonical",
    "canonical_for": "remote gateway wire protocol",
-   "last_verified": "2026-11-13"
+   "last_verified": "2026-11-16"
   },
   "docs/runtime-dependencies.md": {
    "title": "External runtime dependencies",
@@ -360,7 +360,7 @@
    ],
    "status": "canonical",
    "canonical_for": "test coverage policy",
-   "last_verified": "2026-11-02"
+   "last_verified": "2026-11-17"
   },
   "docs/tutorial-delivery.md": {
    "title": "Tutorial delivery",
@@ -494,7 +494,7 @@
    ],
    "status": "canonical",
    "canonical_for": "why each proactive-loop step exists: the measurement, the incident and the reasoning the skill file no longer carries",
-   "last_verified": "2026-11-11"
+   "last_verified": "2026-11-17"
   },
   "docs/recovery-issue-metrics.md": {
    "title": "Recovery issue metrics",
@@ -514,7 +514,7 @@
    ],
    "status": "draft",
    "canonical_for": "the v1 worker pool: durable worker identities and run history, zero-byte delivery sentinels under deliveries/<recipient>/ with the payload immutable in tasks/, the router as the core watcher's task-event handler over an owner-declared, core-compiled roster (unknown targets go to the core; liveness never routes), residue-based recovery, and the Phase 1 / Phase 2 split",
-   "last_verified": "2026-11-06"
+   "last_verified": "2026-11-15"
   },
   "docs/worker-pool-design-notes.md": {
    "title": "Worker pool — design notes",
@@ -533,8 +533,8 @@
     "maintainers"
    ],
    "status": "canonical",
-   "canonical_for": "how one inbox keeps exactly one announcer: the session watcher and the supervisor's standby, the tag and verdicts, readiness, the handoff contract, the opt-in task-watch Mod",
-   "last_verified": "2026-11-06"
+   "canonical_for": "how one inbox keeps exactly one announcer: the session watcher and the supervisor's standby, the tag and verdicts, readiness, the handoff contract, the task-watch Mod (default for pool workers, opt-in for the core) and the alert-only standby on a Mod seat",
+   "last_verified": "2026-11-17"
   },
   "docs/learning-window.md": {
    "title": "Retained learning windows",

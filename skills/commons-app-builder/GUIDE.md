@@ -55,6 +55,9 @@ the whole call.
 | `room.post({text, key?})` | Posts `text` in the page's own room as the viewer, after they confirm it. Resolves to `{posted: true, eventId}` or `{posted: false, reason}`. |
 | `emit(name, data)` / `on(name, fn)` | One-shot events, at most 20 a second. Only viewers online at that moment see them. |
 | `pages.list()` / `pages.read(kind)` | Read-only access to the room's pages. |
+| `agent.list()` | Resolves to the viewer's own agents, `[{id, name, kind, userId?}]` (see "Asking an agent from an app"). |
+| `agent.sendTask({agentId, text, key, actionId?, row?})` | Asks one of the viewer's own agents, after the viewer confirms. Resolves to `{ok: true, eventId}` or `{ok: false, reason}`. |
+| `room.post({text, key?})` | Posts in this room as the viewer, after they confirm; `<@id>` mentions a joined member. Resolves to `{posted: true, eventId}` or `{posted: false, reason}`. |
 | `now()`, `clock` | Estimated server time (`NaN` until the first sample). |
 
 The bridge allows 30 writes and 20 reads a minute per page, one watch per database, and 20,000
@@ -267,6 +270,53 @@ Choose one when the app needs an agent's work:
 - **A button that asks the viewer's own agent.** For "what does *my* agent make of this?".
   Nothing is stored on the row and nobody else's agent is involved. It has its own section
   below.
+
+### Asking an agent from an app
+
+A page can ask an agent for work in three ways. Each has its own permission; pick by who should
+do the work and who should see the ask.
+
+**1. `artifact.agent.sendTask` asks the viewer's own agent.** Use it for "my agent, do this for
+me" buttons.
+
+- `artifact.agent.list()` resolves to the viewer's own agents as `[{id, name, kind, userId?}]`.
+  `id` is the per-room id to pass back; `userId` is present only when the agent is in this room.
+  It resolves to `[]` until the viewer allows the page (the same "access to room data" question as
+  data writes).
+- `artifact.agent.sendTask({agentId, text, key, actionId?, row?})`:
+  - `agentId` is an `id` from `agent.list()`. `text` is the whole ask; it is shown to the viewer
+    exactly. `key` matches `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` and names this request: sending the
+    same `key` again never asks twice.
+  - Optional data the agent reads, never instructions: `actionId` (`[A-Za-z0-9._-]{1,64}`, which
+    button asked) and `row: {database, rowId}` (the row it is about).
+- The host shows the viewer the exact text and the agent's name, and nothing is sent unless they
+  confirm. Only agents the viewer owns are offered. The task goes to the agent's private DM with
+  the viewer; nothing is posted in this room. The server also limits accepted requests (10 a
+  minute per person and agent) and refuses an agent that is not the viewer's.
+- It resolves to `{ok: true, eventId}`, a dispatch receipt, or `{ok: false, reason}`. Reasons
+  include `declined`, `page permission required`, `agent not owned or unavailable`,
+  `too many agent requests`, `another request is in progress` and `request outcome unknown`
+  (retry with the same `key`).
+
+**2. `artifact.room.post` asks an agent in the room, as the viewer.** Use it when the ask should
+be seen by the room, or the agent is not the viewer's.
+
+- `artifact.room.post({text, key?})`: write `<@id>` in `text` to mention a joined member, with
+  `id` from `artifact.members()`. At most 20 mentions; `@room`-style group mentions are refused.
+- The viewer confirms the exact message, and it is posted as them. The mentioned agent answers by
+  its own policy (its mention gate and its owner's rules); the page gets no answer of its own.
+- It resolves to `{posted: true, eventId}` or `{posted: false, reason}`. Reasons include
+  `declined`, `mention is not a joined member`, `a page cannot mention a group` and
+  `too many room posts` (10 a minute).
+
+**3. A row change summons an agent.** That is "Summon on a row" above: the agent's work is
+triggered by data, under the database's summon policy, with no dialog. Use it for workflows where
+the row itself is the request.
+
+**What a page does not get back today.** None of the three returns the agent's progress, its
+completion or its result to the page. `eventId` only says the request was sent. Use a row the
+agent updates (a `Status` and an `Outcome` column, as above) when the page must show the outcome,
+and read it with `db.onChange`.
 
 What's safe:
 
@@ -553,11 +603,14 @@ Request: "Build a Commons app: sign-ups for Saturday's cleanup, morning or after
 
 ## Starter templates
 
-`templates/` holds five working apps to start from, each a `page.html` with its
+`templates/` holds seven working apps to start from, each a `page.html` with its
 `schema.json`: a **tracker** (status, owner, due date, and an agent on a row), a **poll**
 (one row per vote, ownership through `created_by`), a **planner** (dated items in a week
 view), a **review list** (a verdict per item, and a button that asks the viewer's own agent
-about one) and a **two-player turn game** (append-only moves, the turn from the move count).
+about one), a **two-player turn game** (append-only moves, the turn from the move count), a
+**research desk** (sourced findings that stay proposed until a person accepts them, a report,
+and "ask my agent") and a **task board** (a person hands a task to their own agent, which
+reports on the row).
 `templates/README.md` says which to pick and how to create one. Copy and adapt rather than
 starting from an empty file, then still follow steps 2, 6 and 7 for the app you ship.
 
