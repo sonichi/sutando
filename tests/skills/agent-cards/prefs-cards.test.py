@@ -573,7 +573,8 @@ class SaveErrors(Base):
         rc, out = self.click(event, card, 'Turn off "The agent is added to a room" for all agents', acct)
         self.assertEqual((rc, out["status"]), (0, "unknown"))
         self.assertNotIn("Not saved", out["outcome"])
-        self.assertIn("couldn't confirm whether it saved (OSError)", out["outcome"])
+        self.assertIn("couldn't confirm whether it saved (the connection to", out["outcome"])
+        self.assertNotIn("OSError", out["outcome"])
         again = self.poster.card()
         self.assertEqual((again["note"], again["note_tone"]), (out["outcome"], "warn"))
         self.assertIsNotNone(cards.issued_cards.live(self.ws, out["event_id"]), "the card still works")
@@ -607,7 +608,55 @@ class SaveErrors(Base):
         rc, out = self.click(event, card, 'Turn off "The agent is added to a room" for all agents', acct)
         self.assertEqual((rc, out["status"]), (0, "unknown"))
         self.assertNotIn("Not saved", out["outcome"])
-        self.assertIn("couldn't confirm whether it saved (TimeoutError)", out["outcome"])
+        self.assertIn("couldn't confirm whether it saved (it timed out)", out["outcome"])
+        self.assertNotIn("TimeoutError", out["outcome"])
+        self.assertNotIn("UPSTREAM_UNAVAILABLE", out["outcome"])
+
+    # Answers to a set that are not a refusal: the outcome is unknown, so the card reads back.
+    AMBIGUOUS = {
+        "outcome_unknown": {"is_error": True, "code": "ACTION_OUTCOME_UNKNOWN"},
+        "upstream_unavailable": {"is_error": True, "code": "UPSTREAM_UNAVAILABLE"},
+        "a_code_this_build_does_not_know": {"is_error": True, "code": "SOMETHING_NEW"},
+        "success_without_a_document": {"status": "ok"},
+        "not_a_dict": "ok",
+    }
+
+    def test_an_answer_that_is_not_a_refusal_reads_back_and_never_says_not_saved(self):
+        for name, answer in self.AMBIGUOUS.items():
+            with self.subTest(answer=name):
+                acct = FakeAccount(triggers_doc(revision=3))
+                event, card = self.show("triggers", acct)
+
+                def applied_then_ambiguous(action, arguments, *, operation_id, task_id="", answer=answer):
+                    acct.sets.append((action, arguments, operation_id, task_id))
+                    acct.doc = triggers_doc(revision=4)
+                    return answer
+                acct.execute = applied_then_ambiguous
+                reads_before = len(acct.reads)
+                rc, out = self.click(event, card, 'Turn off "The agent is added to a room" for all agents',
+                                     acct)
+                self.assertEqual((rc, out["status"]), (0, "unknown"))
+                self.assertNotIn("Not saved", out["outcome"])
+                self.assertIn("shows what is set now", out["outcome"])
+                self.assertEqual(len(acct.reads) - reads_before, 2, "the click's read, then a read-back")
+                self.assertIn("r4=", json.dumps(self.poster.card()), "the redraw carries the fresh revision")
+                for raw in ("answered", "agent.triggers", "ACTION_OUTCOME", "UPSTREAM", "UNREADABLE",
+                            "SOMETHING_NEW"):
+                    self.assertNotIn(raw, out["outcome"])
+
+    def test_a_definite_refusal_says_not_saved_in_plain_words_without_reading_back(self):
+        for code in ("FORBIDDEN", "INVALID_INPUT", "NOT_FOUND", "RATE_LIMITED", "UNAUTHORIZED"):
+            with self.subTest(code=code):
+                acct = FakeAccount(triggers_doc(), set_answer={"is_error": True, "code": code, "details": {}})
+                event, card = self.show("triggers", acct)
+                reads_before = len(acct.reads)
+                rc, out = self.click(event, card, 'Turn off "The agent is added to a room" for all agents',
+                                     acct)
+                self.assertEqual((rc, out["status"]), (0, "not_saved"))
+                self.assertTrue(out["outcome"].startswith("Not saved: "), out["outcome"])
+                self.assertEqual(len(acct.reads) - reads_before, 1, "no read-back after a refusal")
+                self.assertNotIn(code, out["outcome"])
+                self.assertNotIn("answered", out["outcome"])
 
     def test_a_conflict_whose_re_read_fails_still_posts_the_card(self):
         acct = FakeAccount(triggers_doc(), set_answer={"is_error": True, "code": "CONFLICT", "details": {}})

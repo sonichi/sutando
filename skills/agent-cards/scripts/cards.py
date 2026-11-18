@@ -370,17 +370,32 @@ def prefs_doc(action: str, answer: object) -> dict:
     return doc
 
 
-def _why(e: PrefsError) -> str:
+# Answers the server gives before applying anything. Any other answer to a write (an unknown
+# outcome, an upstream outage, one this code cannot read) may have been applied.
+REFUSALS = frozenset({"CONFLICT", "FORBIDDEN", "INVALID_INPUT", "NOT_FOUND", "RATE_LIMITED",
+                      "UNAUTHORIZED"})
+
+
+def refused(e: Exception) -> bool:
+    """Whether `e` is a definite refusal: the server said no, so nothing was applied."""
+    return isinstance(e, PrefsError) and e.code in REFUSALS
+
+
+def _why(e: Exception) -> str:
+    """What went wrong, in plain words: never an exception class, an Action id or a raw code."""
+    server = dotspace.SUCCESSOR_SERVER
+    if not isinstance(e, PrefsError):
+        return "it timed out" if isinstance(e, TimeoutError) else f"the connection to {server} dropped"
     reason = str(e.details.get("reason") or "")
     if e.code == "NOT_FOUND":
-        return f"your {dotspace.SUCCESSOR_SERVER} server does not offer these settings yet"
+        return f"your {server} server does not offer these settings yet"
     if e.code == "FORBIDDEN" and reason:
-        return f"{dotspace.SUCCESSOR_SERVER} did not let me change them ({reason}); ask me again in our DM"
-    return f"{e} ({reason})" if reason else str(e)
-
-
-def _save_error(e: Exception) -> str:
-    return _why(e) if isinstance(e, PrefsError) else f"I couldn't reach {dotspace.SUCCESSOR_SERVER} ({type(e).__name__})"
+        return f"{server} did not let me change them ({reason}); ask me again in our DM"
+    if e.code == "RATE_LIMITED":
+        return f"{server} asked me to wait a moment; try again shortly"
+    if e.code in REFUSALS:
+        return f"{server} didn't accept it ({reason})" if reason else f"{server} didn't accept it"
+    return f"{server}'s answer couldn't be read"
 
 
 def _known_names(ws: Path) -> dict:
@@ -585,24 +600,24 @@ def _prefs_reply(ws: Path, said: ac.Reply, headers: dict, lane: str, account, ex
             doc = prefs_doc(pc.SET[kind], account.execute(pc.SET[kind], step.arguments, task_id=task_id,
                                                           operation_id=f"{task_id}:{kind}-set"))
         except Exception as e:  # noqa: BLE001 — any failed save is said on a card that still works
-            view, status = pc.View(edit=view.edit, outcome=f"Not saved: {_save_error(e)}.", tone="warn"), "not_saved"
-            if not isinstance(e, PrefsError):
-                # The server may have applied it before the answer was lost: show what is set now.
+            view, status = pc.View(edit=view.edit, outcome=f"Not saved: {_why(e)}.", tone="warn"), "not_saved"
+            if not refused(e):
+                # Not a refusal: the server may have applied it. Show what is set now.
                 try:
                     doc = prefs_doc(pc.GET[kind], account.read(pc.GET[kind]))
                 except Exception as again:  # noqa: BLE001 — the card as it was, with why
-                    view.outcome = (f"I couldn't confirm whether it saved ({type(e).__name__}), and I couldn't "
-                                    f"read them again ({_save_error(again)}). Show this card again to check.")
+                    view.outcome = (f"I couldn't confirm whether it saved ({_why(e)}), and I couldn't "
+                                    f"read them again ({_why(again)}). Show this card again to check.")
                 else:
                     names = pc.names_for(doc, _known_names(ws))
-                    view = pc.View(edit=view.edit, outcome=f"I couldn't confirm whether it saved ({type(e).__name__}); "
+                    view = pc.View(edit=view.edit, outcome=f"I couldn't confirm whether it saved ({_why(e)}); "
                                    "this card shows what is set now.", tone="warn")
                 status = "unknown"
             elif e.code == "CONFLICT":
                 try:
                     doc = prefs_doc(pc.GET[kind], account.read(pc.GET[kind]))
                 except Exception as again:  # noqa: BLE001 — the card as it was, with why
-                    view.outcome = f"Not saved: they changed since this card, and I couldn't read them again ({_save_error(again)})."
+                    view.outcome = f"Not saved: they changed since this card, and I couldn't read them again ({_why(again)})."
                 else:
                     view, status = pc.View(edit=view.edit, outcome=pc.OUT_OF_DATE, tone="warn"), "conflict"
                     names = pc.names_for(doc, _known_names(ws))
