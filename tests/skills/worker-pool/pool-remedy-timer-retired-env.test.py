@@ -18,6 +18,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / "skills" / "worker-pool" / "scripts"
@@ -177,6 +178,33 @@ class Migration(unittest.TestCase):
         self.assertEqual(dest.read_bytes(), before)
         self.assertIn("SUTANDO_NOTIFIER_ALERT_GRACE", self.loaded_env(t.label_for(self.ws)))
         self.assertNotIn("bootstrap", self.lc.verbs())
+
+    def test_a_failed_rollback_is_reported_not_hidden(self):
+        dest = self.old_timer()
+        self.lc.fail_bootstrap = 2
+        with mock.patch.object(Path, "write_bytes", side_effect=OSError("read-only file system")):
+            out = self.migrate()
+        self.assertEqual([m["migrated"] for m in out], [False])
+        why = out[0]["why"]
+        self.assertIn("rollback failed", why)
+        self.assertIn("read-only file system", why)
+        self.assertIn("could not restore", why)
+        self.assertTrue(dest.exists())
+
+    def test_an_unreadable_plist_is_reported_and_left_as_it_is(self):
+        dest = t.plist_path(self.ws, self.la)
+        dest.write_bytes(b"not a plist")
+        out = self.migrate()
+        self.assertEqual([m["migrated"] for m in out], [False])
+        self.assertIn("plist unreadable", out[0]["why"])
+        self.assertEqual(dest.read_bytes(), b"not a plist")
+
+    def test_a_loaded_job_whose_plist_is_gone_is_reported_not_guessed(self):
+        dest = self.old_timer()
+        dest.unlink()
+        out = self.migrate()
+        self.assertEqual([(m["migrated"], m["why"]) for m in out], [(False, "the loaded job has no plist to reload from")])
+        self.assertEqual(self.lc.verbs(), [], "nothing is booted out without a plist to bring it back")
 
     def test_inside_its_own_job_the_plist_is_cleaned_and_the_reload_left_to_the_next_pass(self):
         dest = self.old_timer()

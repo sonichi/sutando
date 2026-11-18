@@ -192,5 +192,38 @@ class Episodes(Base):
         self.assertEqual(left, [f"{m.inbox_key(self.inbox)}.lock"])
 
 
+class CommandLine(Base):
+    """The supervisor calls these commands; each one is the function above, with its output."""
+
+    def run_cli(self, *argv, stdin=""):
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(stdin)), mock.patch.object(sys, "stdout", out):
+            rc = m.main([argv[0], "--workspace", str(self.ws), *argv[1:]])
+        return rc, out.getvalue().strip()
+
+    def test_each_command_answers_as_the_supervisor_reads_it(self):
+        inbox = str(self.inbox)
+        self.assertEqual(self.run_cli("observe", "--inbox", inbox, "--now", "1000"), (0, "1000"))
+        self.assertEqual(self.run_cli("observe", "--inbox", inbox, "--now", "1100", "--stale", "300"), (0, "1000"))
+        self.assertEqual(self.run_cli("stem", "--inbox", inbox, "--episode", "1000"), (0, self.stem))
+        self.assertEqual(self.run_cli("stem", "--inbox", inbox, "--episode", "1000", "--slot", "3"), (0, self.stem + "-r3"))
+        self.assertEqual(self.run_cli("publish", "--stem", self.stem, stdin=BODY)[0], m.PUBLISHED)
+        self.assertEqual(self.run_cli("publish", "--stem", self.stem, stdin=BODY)[0], m.ALREADY)
+        self.assertEqual(self.copies(), [f"{self.stem}.txt"])
+        self.assertEqual(self.run_cli("claim-notify", "--inbox", inbox, "--episode", "1000")[0], 0)
+        self.assertEqual(self.run_cli("claim-notify", "--inbox", inbox, "--episode", "1000")[0], 1)
+        self.assertEqual(self.run_cli("end", "--inbox", inbox), (0, ""))
+        self.assertEqual(self.run_cli("observe", "--inbox", inbox, "--now", "1200"), (0, "1200"))
+
+    def test_a_missing_argument_is_a_usage_error(self):
+        for argv in (("observe", "--now", "1"), ("observe", "--inbox", str(self.inbox)),
+                     ("stem", "--inbox", str(self.inbox)), ("claim-notify", "--inbox", str(self.inbox)),
+                     ("publish",)):
+            with self.subTest(argv=argv), mock.patch.object(sys, "stderr", io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    self.run_cli(*argv)
+                self.assertEqual(caught.exception.code, 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
