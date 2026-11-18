@@ -67,8 +67,10 @@ def check(src: str) -> dict:
         if re.search(r"\b(?:display|visibility|opacity)\s*:", m.group(1)):
             add(warnings, "hover-only", "a :hover rule changes display/visibility/opacity: controls must not be hover-only")
             break
-    if re.search(r">\s*(?:Send|Notify|Email|DM|Message)\b[^<]{0,40}</button>", code, re.I):
-        add(warnings, "no-fake-send", "a button claims to send or notify: a page cannot message anyone")
+    sends = re.search(r"\broom\s*\.\s*post\s*\(|\bsendTask\s*\(|\bsendToMyAgent\s*\(", code)
+    if not sends and re.search(r">\s*(?:Send|Notify|Email|DM|Message)\b[^<]{0,40}</button>", code, re.I):
+        add(warnings, "no-fake-send", "a button claims to send or notify, but the page never calls "
+            "artifact.room.post or artifact.agent.sendTask: a page messages no one otherwise")
     return {"ok": not errors, "errors": errors, "warnings": warnings}
 
 

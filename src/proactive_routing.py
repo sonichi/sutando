@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 
@@ -125,9 +126,14 @@ def proactive_worker(name) -> "str | None":
     return m.group(1) if m else None
 
 
+# The bridge a worker's own lane runs on; a name destined for any other bridge is that bridge's.
+WORKER_LANE_CHANNEL = "ag2space"
+
+
 def stamp_worker(name, worker: str) -> str:
     """`name` as `worker`'s session publishes it: a proactive name gains the `.by-<worker>` tag
-    unless it carries one; a task result, or a name published by the core ("" worker), is unchanged."""
+    unless it carries one; a task result, a name published by the core ("" worker), and a name
+    destined for a bridge other than the worker lane's own are unchanged, so that bridge delivers it."""
     base = Path(name).name
     if not worker or not base.startswith("proactive-") or not base.endswith(".txt") \
             or proactive_worker(base) is not None:
@@ -135,6 +141,8 @@ def stamp_worker(name, worker: str) -> str:
     if not _WORKER_ID_RE.match(worker):
         raise ValueError(f"not a worker id: {worker!r}")
     dest = proactive_destination(base)
+    if dest not in (None, WORKER_LANE_CHANNEL):
+        return base
     head = base[: -len(f".to-{dest}.txt")] if dest else base[: -len(".txt")]
     return f"{head}.by-{worker}" + (f".to-{dest}.txt" if dest else ".txt")
 
@@ -163,10 +171,48 @@ def about_task_filename(task_id: str, ts, channel: "str | None" = None, worker: 
 PROACTIVE_OUTBOX_DIRNAME = ".outbox-ag2space-proactive"
 
 
-def proactive_item_id(stem: str, body: str) -> str:
-    """One outbox item per file name and body: a new body under a delivered name is a new send.
-    The room and thread are left out, since they are re-resolved on every pass."""
-    return f"{stem}~{hashlib.sha256(body.encode('utf-8')).hexdigest()[:16]}"
+def resolve_attachment_path(path: str) -> str:
+    """The file an attach marker names, as an uploader opens it: `~` expanded, links resolved."""
+    return os.path.realpath(os.path.expanduser(path.strip()))
+
+
+def read_attachment(path: str, admit, max_bytes: int) -> "tuple[str, bytes | None, str]":
+    """(resolved path, its bytes, "") for a regular file `admit` allows, of at most `max_bytes`,
+    read through one descriptor proven to be the admitted file; (resolved path, None, reason) else."""
+    try:  # pragma: no cover - imported here so a routing-only caller needs no reader
+        from .bounded_file_read import read_regular_bytes
+    except ImportError:  # pragma: no cover - flat src/ import path
+        from bounded_file_read import read_regular_bytes
+    resolved = resolve_attachment_path(path)
+    if admit is None or not admit(resolved):
+        return resolved, None, "path not allowlisted"
+
+    def same_file(info) -> str:
+        try:
+            ok = os.path.samestat(info, os.stat(resolved)) and admit(resolved)
+        except OSError:
+            ok = False
+        return "" if ok else "changed after its check"
+    data, reason = read_regular_bytes(resolved, max_bytes, follow=False, verify=same_file)
+    return (resolved, data, "") if data is not None else (resolved, None, reason or "not found")
+
+
+def attachment_identity(path: str, admit=None, max_bytes: int = 0) -> str:
+    """`<resolved path> <size> <sha256>` of what read_attachment would send, or the path and
+    why it would refuse: a changed file under the same path is a different attachment."""
+    resolved, data, reason = read_attachment(path, admit, max_bytes)
+    if data is None:
+        return f"{resolved} {reason}"
+    return f"{resolved} {len(data)} {hashlib.sha256(data).hexdigest()}"
+
+
+def proactive_item_id(stem: str, body: str, attachments=(), admit=None, max_bytes: int = 0) -> str:
+    """One outbox item per file name, body and attachments: a new body or a changed attachment
+    under a delivered name is a new send. The room and thread are re-resolved on every pass.
+    Only files `admit` allows, up to `max_bytes`, are read: the uploader's own gate."""
+    key = body if not attachments else "\0".join(
+        [body, *(attachment_identity(a, admit, max_bytes) for a in attachments)])
+    return f"{stem}~{hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]}"
 
 
 def about_task(name) -> "str | None":

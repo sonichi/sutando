@@ -126,17 +126,61 @@ def _helpers():
     return local_task_protocol, result_markers, task_archive, workspace_default
 
 
-def worker_published_path(path: str | Path, environ=None) -> Path:
+def worker_published_path(path: str | Path, environ=None, workspace=None) -> Path:
     """Where this session publishes `path`: a proactive file from a pool worker's session that acts as
     its own agent carries the worker's stamp (`connections.session_proactive_name`), so only that
     worker's lane delivers it. The core's session, a worker acting through the core, a copy of this
-    module without the engine's `connections`, and every task result publish under the name given."""
+    module without the engine's `connections`, and every task result publish under the name given.
+
+    A relative `path` is anchored to the workspace, never to the process's cwd: the session's cwd
+    is the repo, so a bare "results/..." would otherwise resolve wherever the caller happened to be
+    and land where no reader looks."""
     path = Path(path)
+    if not path.is_absolute():
+        if workspace is not None:
+            ws = Path(workspace)
+        else:
+            try:
+                from . import workspace_default
+            except ImportError:
+                import workspace_default
+            ws = workspace_default.resolve_workspace(migrate=False)
+        path = (ws / path).resolve()
     try:
         import connections
     except ImportError:
         return path
-    return path.with_name(connections.session_proactive_name(path.name, environ))
+    named = path.with_name(connections.session_proactive_name(path.name, environ, workspace))
+    return _own_results_path(connections, named, environ, workspace)
+
+
+def _own_results_path(connections, path: Path, environ, workspace) -> Path:
+    """Where `path`, aimed at the shared results/ or the session's worker's own, is published. A task's
+    result goes to its task's current home (`connections.task_home`): a late answer to work handed back to
+    the core lands where the core reads it. A proactive file goes to the session's worker's own results/
+    when that worker's lane delivers it (`lane_claims_proactive`); any other target is unchanged."""
+    from proactive_routing import lane_claims_proactive
+    worker = connections.session_worker(environ)
+    own = connections.worker_dirs(worker, workspace) if worker else None
+    shared = connections.record_path(workspace).parent.parent / "results"
+    if path.parent.resolve() not in {d.resolve() for d in [shared] + ([own[1]] if own else [])}:
+        return path
+    if path.name.startswith("proactive-"):
+        dest = own[1] if own and lane_claims_proactive(path.name, worker) else shared
+    elif path.name.startswith("task-") and path.suffix == ".txt":
+        dest = connections.task_home(path.stem, workspace)["results"]
+    else:
+        dest = own[1] if own else path.parent
+    return path if dest.resolve() == path.parent.resolve() else dest / path.name
+
+
+def _task_home(task_id: str, workspace: Path) -> dict:
+    """The task's folders (`connections.task_home`); the shared ones in a copy without the engine's `connections`."""
+    try:
+        import connections
+    except ImportError:
+        return {"tasks": workspace / "tasks", "results": workspace / "results"}
+    return connections.task_home(task_id, workspace)
 
 
 def _unrouted_cron_task(path: str | Path) -> str | None:
@@ -153,9 +197,10 @@ def _unrouted_cron_task(path: str | Path) -> str | None:
         return None
     try:
         workspace = wsd.resolve_workspace(migrate=False).resolve()
-        if target.parent != workspace / "results":
+        home = _task_home(task_id, workspace)
+        if target.parent not in (workspace / "results", home["results"].resolve()):
             return None
-        tasks_dir = workspace / "tasks"
+        tasks_dir = home["tasks"]
         task_file = (archive.find_task_file(tasks_dir, task_id)
                      or protocol.find_archived_task(tasks_dir, task_id))
         if task_file is None:
@@ -276,7 +321,10 @@ def main(argv: list[str]) -> int:
     if stamped.name != Path(path).name:
         print(f"result_publish: publishing {Path(path).name} as {stamped.name}: a pool worker's "
               "proactive file carries its worker's stamp, so its own lane delivers it", file=sys.stderr)
-        path = str(stamped)
+    if stamped.parent != Path(path).parent:
+        print(f"result_publish: publishing into {stamped.parent}: the results folder of its task's home or of "
+              "this pool worker, whose lane delivers it", file=sys.stderr)
+    path = str(stamped)
     text = sys.stdin.read()
     reason = None if allow else undeliverable_reason(path, text)
     if reason:

@@ -278,7 +278,8 @@ def recover(workspace, repo, worker_id, *, runner=None, spawn=None) -> dict:
         return {"worker_id": worker_id, "outcome": FAILED, "why": str(e),
                 "closed_runs": closed}
     return {"worker_id": worker_id, "outcome": RECOVERED, "closed_runs": closed,
-            "session_id": out.get("runtime_session_id")}
+            "session_id": out.get("runtime_session_id"),
+            **({"plugin_dirs_skipped": out["plugin_dirs_skipped"]} if out.get("plugin_dirs_skipped") else {})}
 
 
 SUPERVISOR_SCRIPT = "skills/worker-pool/scripts/worker-watcher-supervisor.sh"
@@ -305,14 +306,10 @@ def ensure_supervisor(workspace, repo, worker_id, *, runner=None) -> dict:
            "SUTANDO_INSTANCE_ID": worker_id,
            "SUTANDO_WORKER_ID": worker_id,
            "SUTANDO_WORKER_RUNTIME": runtime,
-           "SUTANDO_TASKS_DIR": str(pd.deliveries_dir(workspace, worker_id)),
            "SUTANDO_TMUX_SESSION": wi.tmux_session_name(worker_id),
-           "SUTANDO_INBOX_KIND": "deliveries",
-           "SUTANDO_WORKSPACE_DIR": str(workspace),
-           "SUTANDO_RESULTS_DIR": str(pd.results_dir(workspace)),
            # The timer's env carries none of the spawner's; the standby watcher needs
            # the resolver or it announces nothing for a delivery inbox.
-           "SUTANDO_INBOX_RESOLVER": str(Path(repo) / "skills" / "worker-pool" / "scripts" / "resolve-inbox-entry"),
+           **sw.inbox_env(workspace, worker_id, Path(repo) / "skills" / "worker-pool" / "scripts"),
            "SUTANDO_POOL_DELIVERY_SCRIPT": str(Path(repo) / "skills" / "worker-pool" / "scripts" / "pool_delivery.py")}
     if runtime == "codex":
         env["SUTANDO_TASK_EVENT_HANDLER"] = ""
@@ -427,13 +424,14 @@ def retry_limit(workspace, repo, worker_id, *, runner=None):
             "The usage-limit recovery probe is due. Re-arm your session-role task watcher "
             "using the normal worker bootstrap, then process your outstanding deliveries. "
             "Do not run core startup or core schedules. If still usage-limited, leave the "
-            "deliveries pending; supervision will back off. Reply [no-send] when re-armed.")
+            "deliveries pending; supervision will back off. Reply [no-send] when re-armed.",
+            allow_handoff=False)  # the pane prompt below names the routed payload
     except (OSError, ValueError) as exc:
         return {"worker_id": worker_id, "outcome": "delivery-failed", "why": str(exc)}
     task_id = delivery["task_id"]
     if sup.is_paused(workspace, worker_id) or suspension(workspace):
         return {"worker_id": worker_id, "outcome": "rearm-queued", "task_id": task_id}
-    prompt = f"Read {pd.payload_path(Path(workspace), task_id)} and complete that routed recovery task."
+    prompt = f"Read {delivery.get('task_file') or pd.payload_path(Path(workspace), task_id)} and complete that routed recovery task."
     try:
         sent = sup.pane_gate.deliver(prompt, session, runtime, socket_path=str(socket),
             refuse_if_pending=True, require_limit=True, runner=run,

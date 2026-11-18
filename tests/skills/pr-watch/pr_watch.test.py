@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import signal
 import stat
 import subprocess
@@ -1646,6 +1647,124 @@ class Tracker(_Tmp):
         self.assertEqual(rc, 0)
         self.assertTrue(out.startswith("PR_WATCH_NOTE tracker publish skipped: no room-commons script"), out)
         self.assertIn("acme/widgets#7", self.data()["rows"])
+
+
+ROUTE_SCRIPT = r"""
+import json, os, sys, time
+with open(os.environ["ROUTE_LOG"], "a") as fh:
+    fh.write(json.dumps(sys.argv[1:]) + "\n")
+mode = os.environ.get("ROUTE_MODE", "handed")
+if mode == "sleep":
+    time.sleep(30)
+if mode == "fail":
+    print("handed someone")
+    sys.exit(3)
+print("thinking...")
+print("handed w-1" if mode == "handed" else "local")
+"""
+
+
+class RouteCmd(_Tmp):
+    """PR_WATCH_ROUTE_CMD: an event the command hands off is noted, not sent; anything else stays here."""
+
+    LINE = "PR_EVENT acme/widgets#7 review_submitted by=bob state=changes_requested author=alice head=0badc0de"
+
+    def setUp(self):
+        super().setUp()
+        self.st = pw.State(self.state)
+        self.st.ensure()
+        script = self.tmp / "route.py"
+        script.write_text(ROUTE_SCRIPT)
+        self.route_log = self.tmp / "route.log"
+        os.environ["ROUTE_LOG"] = str(self.route_log)
+        os.environ["PR_WATCH_ROUTE_CMD"] = shlex.join([sys.executable, str(script)])
+        self.payload = fixture("pull_request_review.submitted")
+        self.cli("add", "--repo", "acme/widgets", "--author", "alice", "--author", "bob")
+        self.runner = pw.Runner(self.st)
+
+    def deliver(self, line=None):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.runner.deliver(line or self.LINE, self.payload)
+        return out.getvalue().splitlines()
+
+    def runs(self):
+        return [json.loads(l) for l in self.route_log.read_text().splitlines()] if self.route_log.exists() else []
+
+    def test_a_handed_event_is_noted_not_sent_and_the_command_gets_the_event(self):
+        self.assertEqual(self.deliver(), [f"PR_WATCH_NOTE handed to w-1: {self.LINE}"])
+        self.assertEqual(self.runs(), [["--event", self.LINE, "--repo", "acme/widgets", "--number", "7",
+                                        "--head", "0badc0de9999", "--authors", "alice,bob",
+                                        "--cache-dir", str(self.state / "route")]])
+
+    def test_a_command_whose_path_has_a_space_runs_when_quoted(self):
+        spaced = self.tmp / "Application Support"
+        spaced.mkdir()
+        script = spaced / "route.py"
+        script.write_text(ROUTE_SCRIPT)
+        os.environ["PR_WATCH_ROUTE_CMD"] = shlex.join([sys.executable, str(script)])
+        self.assertEqual(self.deliver(), [f"PR_WATCH_NOTE handed to w-1: {self.LINE}"])
+
+    def test_a_repeat_within_the_window_is_dropped_without_rerunning(self):
+        self.deliver()
+        self.assertEqual(self.deliver(), [])
+        self.assertEqual(len(self.runs()), 1)
+
+    def test_local_keeps_the_event_here_and_a_repeat_is_still_sent(self):
+        os.environ["ROUTE_MODE"] = "local"
+        self.assertEqual(self.deliver(), [self.LINE])
+        self.assertEqual(self.deliver(), [self.LINE], "the mod dedupes it, as before")
+        self.assertEqual(len(self.runs()), 1)
+
+    def test_a_failing_command_keeps_the_event_here(self):
+        os.environ["ROUTE_MODE"] = "fail"
+        self.assertEqual(self.deliver(), ["PR_WATCH_NOTE route command exited 3; kept the event here", self.LINE])
+
+    def test_a_timeout_keeps_the_event_here(self):
+        os.environ["ROUTE_MODE"] = "sleep"
+        with mock.patch.object(pw, "ROUTE_TIMEOUT_S", 0.5):
+            t0 = time.monotonic()
+            lines = self.deliver()
+        self.assertLess(time.monotonic() - t0, 10)
+        self.assertEqual(lines, ["PR_WATCH_NOTE route command timed out; kept the event here", self.LINE])
+
+    def test_unset_is_todays_behaviour(self):
+        del os.environ["PR_WATCH_ROUTE_CMD"]
+        self.assertEqual(self.deliver(), [self.LINE])
+        self.assertEqual(self.runs(), [])
+
+    def test_the_config_json_layer_turns_it_on(self):
+        cmd = os.environ.pop("PR_WATCH_ROUTE_CMD")
+        self.assertEqual(self.cli("config", "set", "PR_WATCH_ROUTE_CMD", cmd)[0], 0)
+        self.assertEqual(self.deliver(), [f"PR_WATCH_NOTE handed to w-1: {self.LINE}"])
+
+    def test_an_unsplittable_or_missing_command_keeps_the_event_here(self):
+        os.environ["PR_WATCH_ROUTE_CMD"] = "'unterminated"
+        lines = self.deliver()
+        self.assertEqual(lines[-1], self.LINE)
+        self.assertIn("is not a command line", lines[0])
+        os.environ["PR_WATCH_ROUTE_CMD"] = str(self.tmp / "no-such-command")
+        lines = self.deliver(self.LINE + "x")
+        self.assertEqual(lines[-1], self.LINE + "x")
+        self.assertIn("route command did not start", lines[0])
+
+    def test_forward_once_routes_each_emitted_event_and_still_updates_the_row(self):
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        gh = bin_dir / "gh"
+        gh.write_text(FWD_GH)
+        gh.chmod(gh.stat().st_mode | stat.S_IXUSR)
+        os.environ.update({"PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                           "FAKE_GH_LOG": str(self.tmp / "gh.log"),
+                           "FAKE_GH_HOOKFILE": str(self.tmp / "hooks.txt"),
+                           "FAKE_GH_EMIT": str(FIXTURES / "pull_request.opened.json")})
+        self.cli("add", "--repo", "acme/widgets", "--author", "alice")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.runner.forward_once("acme/widgets")
+        line = "PR_EVENT acme/widgets#7 opened author=alice head=a1b2c3d4 merged=false reason=author"
+        self.assertEqual(out.getvalue().splitlines(), [f"PR_WATCH_NOTE handed to w-1: {line}"])
+        self.assertIn("acme/widgets#7", json.loads(self.st.tracker.read_text())["rows"])
 
 
 if __name__ == "__main__":

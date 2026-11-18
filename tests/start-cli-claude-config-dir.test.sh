@@ -52,6 +52,8 @@ setup_sandbox() {
   BIN_STUB="$SANDBOX/bin"
   export HOME="$SANDBOX/home"
   export SUTANDO_WORKSPACE="$SANDBOX/workspace"
+  # The tmux stub runs only a bare `claude`; the Mod's absolute-path launch has its own tests.
+  export SUTANDO_TASK_WATCH_MOD_CORE=0
   # Prevent ambient CLAUDE_CONFIG_DIR (from the test runner's own session) from
   # leaking into the spawned process and breaking the "not set" assertion.
   unset CLAUDE_CONFIG_DIR
@@ -183,7 +185,7 @@ EOF
 
 cleanup_sandbox() {
   [ -n "${SANDBOX:-}" ] && rm -rf "$SANDBOX" || true
-  unset SANDBOX REPO_FAKE ENV_DUMP BIN_STUB HOME SUTANDO_WORKSPACE
+  unset SANDBOX REPO_FAKE ENV_DUMP BIN_STUB HOME SUTANDO_WORKSPACE SUTANDO_TASK_WATCH_MOD_CORE
 }
 
 REAL_REPO="$(cd "$(dirname "$0")/.." && pwd)"
