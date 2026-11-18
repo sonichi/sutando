@@ -17,7 +17,7 @@
     "SUTANDO_TASK_ROUTING_REQUIREMENT": "./scripts/routing_requirement.py"
   },
   "permissions": {
-    "network": false,
+    "network": true,
     "filesystem": "read-write",
     "secrets": "none"
   }
