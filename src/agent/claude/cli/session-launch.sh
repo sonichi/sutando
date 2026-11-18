@@ -279,6 +279,32 @@ claude_cwd_has_pending_stop_hook() {
     "$SUTANDO_CLAUDE_WORKING_DIR/.claude/settings.json" "$SUTANDO_CLAUDE_WORKING_DIR/.claude/settings.local.json"
 }
 
+# The guard hooks build-core-settings.mjs always registers, without obs or telemetry, built
+# without node; tests pin it equal to the builder's output for the same arguments.
+claude_guard_settings_json() {
+  local stop_hook="$1" ask gmail gdocs pim shtrap stale out
+  _cgs_shq() { local s=$1 q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
+  _cgs_cmd() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '{"type":"command","command":"%s"}' "$s"; }
+  ask="$(_cgs_cmd "python3 $(_cgs_shq "$REPO/hooks/skip-ask-user-question.py")")"
+  gmail="$(_cgs_cmd "python3 $(_cgs_shq "$REPO/hooks/gmail-write-guard.py")")"
+  gdocs="$(_cgs_cmd "python3 $(_cgs_shq "$REPO/hooks/gdocs-write-guard.py") --repo $(_cgs_shq "$REPO")")"
+  pim="$(_cgs_cmd "python3 $(_cgs_shq "$REPO/hooks/native-pim-guard.py")")"
+  shtrap="$(_cgs_cmd "python3 $(_cgs_shq "$REPO/hooks/shell-trap-guard.py") --repo $(_cgs_shq "$REPO")")"
+  stale="$(_cgs_cmd "python3 $(_cgs_shq "$REPO/hooks/stale-head-post-guard.py")")"
+  out='{"hooks":{"PreToolUse":['
+  out+='{"matcher":"AskUserQuestion","hooks":['"$ask"']},'
+  out+='{"matcher":"mcp__.*[Gg][Mm][Aa][Ii][Ll].*","hooks":['"$gmail"']},'
+  out+='{"matcher":"mcp__.*__composio_exec","hooks":['"$gdocs"']},'
+  out+='{"matcher":"Bash|Write|Edit|MultiEdit|NotebookEdit","hooks":['"$pim"']},'
+  out+='{"matcher":"Bash","hooks":['"$shtrap"']},'
+  out+='{"matcher":"Bash","hooks":['"$stale"']}],'
+  out+='"PostToolUse":[{"matcher":"mcp__.*__composio_exec","hooks":['"$gdocs"']}]'
+  if [ -n "$stop_hook" ]; then
+    out+=',"Stop":[{"hooks":['"$(_cgs_cmd "bash $(_cgs_shq "$stop_hook")")"']}]'
+  fi
+  printf '%s}}' "$out"
+}
+
 # One `--settings` flag carries every hook a headless session needs (multiple
 # --settings flags are undocumented/last-wins, so compose into a single JSON):
 #  * AskUserQuestion guard — ALWAYS registered. No interactive user can answer
@@ -302,27 +328,37 @@ resolve_claude_settings_args() {
     SETTINGS_ARGS+=(--append-system-prompt "This session's working folder is not the Sutando checkout, so the checkout's CLAUDE.md was not loaded. Read $REPO/CLAUDE.md now and follow it for every task. Answer each TASK_FILE through \"\${SUTANDO_PY:-python3}\" '$REPO/src/result_publish.py' (body on stdin; its path argument is the task's result file, named after the task id in the workspace's results folder; workspace: \$SUTANDO_WORKSPACE_DIR, else the output of bash '$REPO/scripts/sutando-config.sh' workspace), never only in this terminal.")
   fi
   if ! command -v node > /dev/null 2>&1; then
-    echo "session hooks: node unavailable — cannot safely build --settings JSON; AskUserQuestion guard + obs disabled this session" >&2
+    SETTINGS_ARGS+=(--settings "$(claude_guard_settings_json "$_stop_hook")")
+    echo "session hooks: node unavailable — only the session guards are registered; obs and skill telemetry disabled this session" >&2
     return 0
   fi
   OBS_JSON=""
   if [ -z "$OBS_ENDPOINT" ]; then
     echo "obs hooks: not registered (no export endpoint — set SUTANDO_OBS_ENDPOINT to enable capture)"
   else
-    OBS_JSON="$(node "$REPO/src/observability/claude/hooks/build-hook-settings.mjs" "$REPO/src/observability/claude/hooks/obs-hook.sh")"
-    if [ -n "$OBS_JSON" ]; then
+    local _rc=0
+    OBS_JSON="$(node "$REPO/src/observability/claude/hooks/build-hook-settings.mjs" "$REPO/src/observability/claude/hooks/obs-hook.sh")" || _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+      OBS_JSON=""
+      echo "obs hooks: settings builder failed (exit $_rc) — launch continues without obs capture" >&2
+    elif [ -n "$OBS_JSON" ]; then
       echo "obs hooks: → $OBS_ENDPOINT/ingest/claude-code-hooks (collector)"
     else
       echo "obs hooks: settings build failed — capture disabled this session" >&2
     fi
   fi
-  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py" "$REPO/hooks/shell-trap-guard.py" "$REPO/hooks/stale-head-post-guard.py" "$_stop_hook")"
-  if [ -n "$CLAUDE_SETTINGS_JSON" ]; then
+  local _core_rc=0
+  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py" "$REPO/hooks/shell-trap-guard.py" "$REPO/hooks/stale-head-post-guard.py" "$_stop_hook")" || _core_rc=$?
+  if [ "$_core_rc" -ne 0 ]; then
+    SETTINGS_ARGS+=(--settings "$(claude_guard_settings_json "$_stop_hook")")
+    echo "session hooks: settings builder failed (exit $_core_rc) — launch continues with only the session guards registered" >&2
+  elif [ -n "$CLAUDE_SETTINGS_JSON" ]; then
     SETTINGS_ARGS+=(--settings "$CLAUDE_SETTINGS_JSON")
     echo "session hooks: AskUserQuestion guard registered (PreToolUse deny — a headless session can't answer it)"
     if [ -n "$_stop_hook" ]; then echo "session hooks: Stop hook registered (cwd is outside the checkout)"; fi
   else
-    echo "session hooks: settings build failed — AskUserQuestion guard NOT registered this session" >&2
+    SETTINGS_ARGS+=(--settings "$(claude_guard_settings_json "$_stop_hook")")
+    echo "session hooks: settings builder printed nothing — launch continues with only the session guards registered" >&2
   fi
 }
 
