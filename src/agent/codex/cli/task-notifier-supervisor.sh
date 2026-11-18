@@ -137,16 +137,21 @@ NOTIFIER="${SUTANDO_NOTIFIER_SCRIPT:-$REPO/src/agent/codex/cli/task-notifier.sh}
 GRACE_PERIOD="${SUTANDO_NOTIFIER_GRACE_PERIOD:-45}"
 ROLE_POLL="${SUTANDO_NOTIFIER_ROLE_POLL:-5}"
 # "alert": a Claude seat whose watcher the task-watch Mod hosts. Nothing is typed into the
-# pane; after ALERT_GRACE with no ready session watcher the owner is told, then reminded every
-# ALERT_REPEAT seconds while the episode lasts (0: no reminder).
+# pane; after ALERT_GRACE with no ready session watcher the owner is told once. The one follow-up
+# is when ALERT_PILEUP or more tasks wait (0: none); ALERT_REPEAT > 0 opts into timed reminders,
+# which stop once that follow-up (the episode's last message) is sent.
 STANDBY_MODE="${SUTANDO_STANDBY_MODE:-type}"
 ALERT_GRACE="${SUTANDO_NOTIFIER_ALERT_GRACE:-300}"
-ALERT_REPEAT="${SUTANDO_NOTIFIER_ALERT_REPEAT:-1800}"
+ALERT_REPEAT="${SUTANDO_NOTIFIER_ALERT_REPEAT:-0}"
+ALERT_PILEUP="${SUTANDO_NOTIFIER_ALERT_PILEUP:-3}"
+case "$ALERT_REPEAT" in *[!0-9]*) ALERT_REPEAT=0 ;; esac
+case "$ALERT_PILEUP" in *[!0-9]*) ALERT_PILEUP=3 ;; esac
 child_pid=""
 # One-shot latch for the idle-but-dead health alert: raised when it fires, so a
 # persistent stale/absent beat does not re-notify every grace period; lowered
 # again the moment the decision is anything but alert (the session recovered).
 alerted=0
+alert_seq=0
 
 # yes / no / unknown -- unknown (ps snapshot unavailable) is deliberately
 # never read as "no": every caller below fails toward keeping whatever
@@ -227,9 +232,12 @@ supervisor_log() {
 
 # How many tasks wait in this seat's inbox, counted by the queue's owner; empty when unreadable.
 waiting_count() {
+  local res=()
   [ -n "$TASKS_DIR" ] || return 0
+  # A worker on its own folders answers in its own results: answered there is not waiting.
+  [ -z "${SUTANDO_RESULTS_DIR:-}" ] || res=(--results "$SUTANDO_RESULTS_DIR")
   "$PY" "$REPO/src/task_queue.py" pending --workspace "$(workspace_dir_for_inbox "$TASKS_DIR")" \
-    --inbox "$TASKS_DIR" 2>/dev/null \
+    --inbox "$TASKS_DIR" ${res[@]+"${res[@]}"} 2>/dev/null \
     | "$PY" -c 'import json, sys; print(len(json.load(sys.stdin)))' 2>/dev/null
 }
 
@@ -251,8 +259,10 @@ duration_phrase() {  # duration_phrase <seconds>
 
 # The owner's alert: a proactive result (the owner's DM, never a worker's lane) and the opt-in macOS
 # notification. An inbox that is no registered seat gets only the local log line, never a page.
-unwatched_alert() {  # unwatched_alert <seconds unwatched> <waiting count or empty> [reminder]
-  local secs="$1" n="$2" kind="${3:-}" ws msg waiting seat label
+unwatched_alert() {  # unwatched_alert <seconds unwatched> <waiting count or empty> [reminder|pileup]
+  # Returns 1 when the owner's DM could not be published: the caller retries rather than latch.
+  local secs="$1" n="$2" kind="${3:-}" ws msg waiting seat label published=0
+  alert_seq=$((alert_seq + 1))  # two messages in one second must not share a result file
   seat="$(inbox_seat)"
   label="$(printf '%s' "$seat" | cut -f3)"
   if [ "$seat" = none ] || [ -z "$label" ]; then
@@ -264,21 +274,45 @@ unwatched_alert() {  # unwatched_alert <seconds unwatched> <waiting count or emp
     1) waiting="1 task is waiting" ;;
     *) waiting="$n tasks are waiting" ;;
   esac
-  msg="Sutando${kind:+ ($kind)}: $label has had no task watcher for $(duration_phrase "$secs"), so it is not picking up its tasks; $waiting, and nothing types them in for it. Restarting that session brings its watcher back."
+  if [ "$kind" = pileup ]; then
+    msg="Sutando: $waiting for $label, which still has no task watcher, so nothing is picking them up. Restarting that session brings its watcher back. This is the last message about it until the watcher returns."
+  else
+    msg="Sutando${kind:+ ($kind)}: $label has had no task watcher for $(duration_phrase "$secs"), so it is not picking up its tasks; $waiting, and nothing types them in for it. Restarting that session brings its watcher back."
+  fi
   supervisor_log "ALERT${kind:+ ($kind)}: no ready session watcher holds ${TASKS_DIR} (session ${SESSION}) for ${secs}s, ${n:-unknown} waiting (alert-only standby; nothing typed); owner alerted"
   ws="$(seat_workspace)"
   if [ -d "$ws/results" ]; then
-    printf '%s\n' "$msg" | env -u SUTANDO_WORKER_ID "$PY" "$REPO/src/result_publish.py" \
-      "$ws/results/proactive-standby-unwatched-$(now_s)-$$.txt" >/dev/null 2>&1 \
-      || supervisor_log "could not publish the unwatched-inbox alert"
+    if printf '%s\n' "$msg" | env -u SUTANDO_WORKER_ID "$PY" "$REPO/src/result_publish.py" \
+      "$ws/results/proactive-standby-unwatched-$(now_s)-$$-${alert_seq}.txt" >/dev/null 2>&1; then
+      published=1
+    else
+      supervisor_log "could not publish the unwatched-inbox alert"
+    fi
   fi
   bash "$REPO/src/macos-notify.sh" "$msg" || true
+  [ "$published" = "1" ] && return 0
+  return 1
+}
+
+pileup_reached() {  # pileup_reached <waiting count or empty>; a threshold of 0 is gated by the caller
+  [ -n "$1" ] && [ "$1" -ge "$ALERT_PILEUP" ]
+}
+
+retry_wait() {  # retry_wait <consecutive failures>: 1 s doubling, capped at 300 s
+  local w=1 i=1
+  while [ "$i" -lt "$1" ] && [ "$w" -lt 300 ]; do w=$((w * 2)); i=$((i + 1)); done
+  [ "$w" -gt 300 ] && w=300
+  printf '%s' "$w"
 }
 
 # Alert-only standby: never starts the notifier, so neither a task nor a nudge is typed.
 # "unknown" neither opens nor closes an episode; a ready watcher ends it without a word to the owner.
+# An episode sends one alert, plus one pile-up message unless the alert already reported the pile-up.
+# One attempt per poll; the pile-up message is final, so no opted-in reminder follows it. A failed
+# send latches nothing and is retried after its own back-off, which delays no other message.
 run_alert_only() {
-  local since="" alerted=0 last=0 v now
+  local since="" alerted=0 piled=0 final=0 last=0 v now n tried
+  local fail_alert=0 fail_pile=0 fail_rem=0 hold_alert=0 hold_pile=0 hold_rem=0
   supervisor_log "alert-only standby for ${TASKS_DIR:-this host}: the task-watch Mod hosts this seat's watcher; nothing is typed into the pane"
   while target_alive; do
     v="$(session_role_verdict)"
@@ -287,17 +321,55 @@ run_alert_only() {
         [ "$alerted" = "1" ] && supervisor_log "a session watcher holds ${TASKS_DIR:-this host} again; the alert-only standby stands down"
         since=""
         alerted=0
+        piled=0
+        final=0
+        fail_alert=0
+        fail_pile=0
+        fail_rem=0
+        hold_alert=0
+        hold_pile=0
+        hold_rem=0
         ;;
       no)
         now="$(now_s)"
         [ -n "$since" ] || since="$now"
-        if [ "$alerted" = "0" ] && [ $((now - since)) -ge "$ALERT_GRACE" ]; then
-          unwatched_alert $((now - since)) "$(waiting_count)"
-          alerted=1
-          last="$now"
-        elif [ "$alerted" = "1" ] && [ "$ALERT_REPEAT" -gt 0 ] && [ $((now - last)) -ge "$ALERT_REPEAT" ]; then
-          unwatched_alert $((now - since)) "$(waiting_count)" reminder
-          last="$now"
+        if [ "$alerted" = "0" ]; then
+          if [ $((now - since)) -ge "$ALERT_GRACE" ] && [ "$now" -ge "$hold_alert" ]; then
+            n="$(waiting_count)"
+            if unwatched_alert $((now - since)) "$n"; then
+              alerted=1
+              last="$now"
+              pileup_reached "$n" && piled=1
+            else
+              fail_alert=$((fail_alert + 1))
+              hold_alert=$((now + $(retry_wait "$fail_alert")))
+            fi
+          fi
+        else
+          tried=0
+          if [ "$piled" = "0" ] && [ "$ALERT_PILEUP" -gt 0 ] && [ "$now" -ge "$hold_pile" ]; then
+            n="$(waiting_count)"
+            if pileup_reached "$n"; then
+              tried=1
+              if unwatched_alert $((now - since)) "$n" pileup; then
+                piled=1
+                final=1
+              else
+                fail_pile=$((fail_pile + 1))
+                hold_pile=$((now + $(retry_wait "$fail_pile")))
+              fi
+            fi
+          fi
+          if [ "$tried" = "0" ] && [ "$final" = "0" ] && [ "$ALERT_REPEAT" -gt 0 ] \
+             && [ $((now - last)) -ge "$ALERT_REPEAT" ] && [ "$now" -ge "$hold_rem" ]; then
+            if unwatched_alert $((now - since)) "$(waiting_count)" reminder; then
+              last="$now"
+              fail_rem=0
+            else
+              fail_rem=$((fail_rem + 1))
+              hold_rem=$((now + $(retry_wait "$fail_rem")))
+            fi
+          fi
         fi
         ;;
     esac

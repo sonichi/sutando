@@ -2,8 +2,9 @@
 # task-notifier-supervisor.sh with SUTANDO_STANDBY_MODE=alert (a Claude seat whose watcher the
 # task-watch Mod hosts): the notifier never runs, so nothing is typed into the pane; after the
 # alert grace with no ready session watcher the owner is alerted (a log line and a proactive
-# result naming the seat and the waiting count, never a path), then reminded every repeat
-# interval; a ready watcher ends the episode with no owner alert. Without the mode the same
+# result naming the seat and the waiting count, never a path), once per episode: no timed reminder
+# unless one is opted into, and one follow-up only when the waiting count reaches the pile-up
+# threshold; a ready watcher ends the episode with no owner alert. Without the mode the same
 # supervisor arms the typing notifier, as before.
 #
 # Part 1 sources the supervisor and drives run_alert_only on a fake clock and a scripted verdict,
@@ -40,15 +41,17 @@ leaked="$(env | cut -d= -f1 | grep -E '^SUTANDO_WORKSPACE|^SUTANDO_INSTANCE|TOKE
 
 # ---- Part 1: the episode rules, on a fake clock --------------------------------------------
 # Each line of $VERDICTS is one poll; the clock advances ROLE_POLL per sleep.
+# UNIT_COUNTS="<from s>:<n> ..." scripts the waiting count on the fake clock (else the real inbox).
 unit() {  # unit <verdict per poll...>; prints the alerts and log lines it saw
   local verdicts="$WORK/verdicts" clock="$WORK/clock" alerts="$WORK/alerts" logs="$WORK/logs.txt"
-  printf '%s\n' "$@" > "$verdicts"; echo 0 > "$clock"; : > "$alerts"; : > "$logs"
+  printf '%s\n' "$@" > "$verdicts"; echo 0 > "$clock"; : > "$alerts"; : > "$logs"; : > "$WORK/count-calls"
   (
     SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_TASKS_DIR="$WORK/unit/tasks" \
       SUTANDO_NOTIFIER_ROLE_POLL="${UNIT_POLL:-5}" SUTANDO_NOTIFIER_ALERT_GRACE=300 \
-      SUTANDO_NOTIFIER_ALERT_REPEAT="${UNIT_REPEAT:-1800}" SUTANDO_NOTIFIER_SCRIPT="$WORK/never-run.sh"
+      SUTANDO_NOTIFIER_ALERT_REPEAT="${UNIT_REPEAT:-}" SUTANDO_NOTIFIER_ALERT_PILEUP="${UNIT_PILEUP:-}" \
+      SUTANDO_NOTIFIER_SCRIPT="$WORK/never-run.sh"
     export SUTANDO_SUPERVISOR_SOURCE_ONLY SUTANDO_TASKS_DIR SUTANDO_NOTIFIER_ROLE_POLL \
-      SUTANDO_NOTIFIER_ALERT_GRACE SUTANDO_NOTIFIER_ALERT_REPEAT SUTANDO_NOTIFIER_SCRIPT
+      SUTANDO_NOTIFIER_ALERT_GRACE SUTANDO_NOTIFIER_ALERT_REPEAT SUTANDO_NOTIFIER_ALERT_PILEUP SUTANDO_NOTIFIER_SCRIPT
     # shellcheck source=/dev/null
     source "$SUPERVISOR"
     n=0
@@ -58,6 +61,9 @@ unit() {  # unit <verdict per poll...>; prints the alerts and log lines it saw
     sleep() { echo $(( $(cat "$clock") + ${1%.*} )) > "$clock"; }
     unwatched_alert() { echo "alert at $(now_s) after $1 waiting $2${3:+ $3}" >> "$alerts"; }
     supervisor_log() { echo "$*" >> "$logs"; }
+    if [ -n "${UNIT_COUNTS:-}" ]; then
+      waiting_count() { local t c n=""; t="$(now_s)"; echo x >> "$WORK/count-calls"; for c in $UNIT_COUNTS; do [ "${c%%:*}" -le "$t" ] && n="${c#*:}"; done; echo "$n"; }
+    fi
     run_alert_only
   )
 }
@@ -73,12 +79,12 @@ unit $(nos 70)
 [ "$(wc -l < "$WORK/alerts" | tr -d ' ')" = 1 ] && r=0 || r=1; check "(1) one alert inside the repeat interval" "$r" "$(cat "$WORK/alerts")"
 grep -qx "alert at 300 after 300 waiting 2" "$WORK/alerts" && r=0 || r=1; check "(1) ...raised once the grace has passed, not before, with the waiting count" "$r" "$(cat "$WORK/alerts")"
 
-# 67 polls of 60 s = 4020 s: the alert at 300, reminders at 2100 and 3900.
+# 67 polls of 60 s = 4020 s, a reminder opted into: the alert at 300, reminders at 2100 and 3900.
 # shellcheck disable=SC2046
-UNIT_POLL=60 unit $(nos 67)
+UNIT_POLL=60 UNIT_REPEAT=1800 unit $(nos 67)
 [ "$(printf '%s\n' "alert at 300 after 300 waiting 2" "alert at 2100 after 2100 waiting 2 reminder" \
       "alert at 3900 after 3900 waiting 2 reminder")" = "$(cat "$WORK/alerts")" ] && r=0 || r=1
-check "(1r) a long episode is reminded every repeat interval, with the count" "$r" "$(cat "$WORK/alerts")"
+check "(1r) an opted-in repeat reminds every interval, with the count" "$r" "$(cat "$WORK/alerts")"
 # shellcheck disable=SC2046
 UNIT_POLL=60 UNIT_REPEAT=0 unit $(nos 67)
 [ "$(wc -l < "$WORK/alerts" | tr -d ' ')" = 1 ] && r=0 || r=1; check "(1r) ...and a repeat of 0 sends no reminder" "$r" "$(cat "$WORK/alerts")"
@@ -88,6 +94,57 @@ UNIT_POLL=60 UNIT_REPEAT=0 unit $(nos 67)
 UNIT_POLL=60 UNIT_REPEAT=600 unit $(nos 40) yes $(nos 5)
 [ "$(wc -l < "$WORK/alerts" | tr -d ' ')" = 4 ] && grep -c 'stands down' "$WORK/logs.txt" | grep -qx 1 && r=0 || r=1
 check "(1r) ...a returning watcher stops the reminders silently" "$r" "$(cat "$WORK/alerts" "$WORK/logs.txt")"
+
+# The default: over 4020 s with 2 waiting (under the pile-up threshold of 3), only the first alert.
+# shellcheck disable=SC2046
+UNIT_POLL=60 unit $(nos 67)
+[ "$(cat "$WORK/alerts")" = "alert at 300 after 300 waiting 2" ] && r=0 || r=1
+check "(13) by default a long episode under the pile-up threshold gets no second message" "$r" "$(cat "$WORK/alerts")"
+# The count reaches 3 at 1000 s: one pile-up follow-up at the next poll, then nothing, even at 9 waiting.
+# shellcheck disable=SC2046
+UNIT_POLL=60 UNIT_COUNTS="0:1 1000:3 2000:9" unit $(nos 67)
+[ "$(printf '%s\n' "alert at 300 after 300 waiting 1" "alert at 1020 after 1020 waiting 3 pileup")" = "$(cat "$WORK/alerts")" ] && r=0 || r=1
+check "(14) reaching the threshold sends exactly one follow-up, and nothing after it" "$r" "$(cat "$WORK/alerts")"
+# shellcheck disable=SC2046
+UNIT_POLL=60 UNIT_COUNTS="0:2 1000:3" UNIT_PILEUP=5 unit $(nos 67)
+[ "$(wc -l < "$WORK/alerts" | tr -d ' ')" = 1 ] && r=0 || r=1
+check "(14) ...the threshold is the knob's value (5), not a fixed 3" "$r" "$(cat "$WORK/alerts")"
+# shellcheck disable=SC2046
+UNIT_POLL=60 UNIT_COUNTS="0:4" unit $(nos 67)
+[ "$(cat "$WORK/alerts")" = "alert at 300 after 300 waiting 4" ] && r=0 || r=1
+check "(15) a first alert that already counts the pile-up is the only message" "$r" "$(cat "$WORK/alerts")"
+# shellcheck disable=SC2046
+UNIT_POLL=60 UNIT_COUNTS="0:1 1000:20" UNIT_PILEUP=0 unit $(nos 67)
+[ "$(wc -l < "$WORK/alerts" | tr -d ' ')" = 1 ] && r=0 || r=1
+check "(16) a pile-up threshold of 0 sends no follow-up" "$r" "$(cat "$WORK/alerts")"
+[ "$(wc -l < "$WORK/count-calls" | tr -d ' ')" = 1 ] && r=0 || r=1
+check "(16) ...and counts the inbox once, for the alert, not on every poll" "$r" "$(wc -l < "$WORK/count-calls")"
+# shellcheck disable=SC2046
+UNIT_POLL=60 UNIT_COUNTS="0: 1000:20" UNIT_PILEUP=0 unit $(nos 67)
+[ "$(cat "$WORK/alerts")" = "alert at 300 after 300 waiting " ] && r=0 || r=1
+check "(16) ...even when the first alert could not count the inbox" "$r" "$(cat "$WORK/alerts")"
+# shellcheck disable=SC2046
+UNIT_POLL=60 UNIT_COUNTS="0:1 600:3 1500:1 3600:3" unit $(nos 20) yes $(nos 40)
+[ "$(printf '%s\n' "alert at 300 after 300 waiting 1" "alert at 600 after 600 waiting 3 pileup" \
+      "alert at 1560 after 300 waiting 1" "alert at 3600 after 2340 waiting 3 pileup")" = "$(cat "$WORK/alerts")" ] && r=0 || r=1
+check "(17) a new episode after the watcher returns alerts again, with its own one follow-up" "$r" "$(cat "$WORK/alerts")"
+
+# Opted-in reminders with the pile-up: the reminder and the follow-up fall due on the same poll at 900;
+# only the follow-up goes out, and as the episode's last message no reminder follows it.
+# shellcheck disable=SC2046
+UNIT_POLL=60 UNIT_REPEAT=600 UNIT_COUNTS="0:1 900:3" unit $(nos 67)
+[ "$(printf '%s\n' "alert at 300 after 300 waiting 1" "alert at 900 after 900 waiting 3 pileup")" = "$(cat "$WORK/alerts")" ] && r=0 || r=1
+check "(19) a reminder due on the pile-up's poll is not sent, nor any after the follow-up" "$r" "$(cat "$WORK/alerts")"
+# shellcheck disable=SC2046
+UNIT_POLL=60 UNIT_REPEAT=600 UNIT_COUNTS="0:1 1500:3" unit $(nos 67)
+[ "$(printf '%s\n' "alert at 300 after 300 waiting 1" "alert at 900 after 900 waiting 1 reminder" \
+      "alert at 1500 after 1500 waiting 3 pileup")" = "$(cat "$WORK/alerts")" ] && r=0 || r=1
+check "(19) ...reminders run until the follow-up, then stop" "$r" "$(cat "$WORK/alerts")"
+# shellcheck disable=SC2046
+UNIT_POLL=60 UNIT_REPEAT=1800 UNIT_COUNTS="0:4" unit $(nos 67)
+[ "$(printf '%s\n' "alert at 300 after 300 waiting 4" "alert at 2100 after 2100 waiting 4 reminder" \
+      "alert at 3900 after 3900 waiting 4 reminder")" = "$(cat "$WORK/alerts")" ] && r=0 || r=1
+check "(19) ...a first alert that counted the pile-up promised nothing, so opted-in reminders continue" "$r" "$(cat "$WORK/alerts")"
 
 # 59 polls of "no" end at 290 s: no alert inside the grace.
 # shellcheck disable=SC2046
@@ -126,7 +183,7 @@ alert_text() {  # alert_text <inbox> <instance id or empty> [seconds]; the publi
     source "$SUPERVISOR"
     bash() { if [ "$1" = "$REPO/src/macos-notify.sh" ]; then printf '%s\n' "$2" > "$out/notify"; else command bash "$@"; fi; }
     supervisor_log() { echo "$*" >> "$out/log"; }
-    unwatched_alert "${3:-600}" "$(waiting_count)"
+    unwatched_alert "${3:-600}" "$(waiting_count)" "${4:-}"
   )
   cat "$WORK"/unit/results/proactive-standby-unwatched-*.txt "$WORK"/scratch/results/proactive-* > "$out/proactive" 2>/dev/null
   rm -f "$WORK"/unit/results/proactive-standby-unwatched-*.txt "$WORK"/scratch/results/proactive-*
@@ -157,6 +214,160 @@ check "(12) a sub-minute duration reads 'under a minute', not '0 min'" "$r" "$(c
 alert_text "$WORK/unit/tasks" "" 60
 grep -q "no task watcher for 1 min," "$WORK/text/proactive" && r=0 || r=1
 check "(12) ...and 60 s reads '1 min'" "$r" "$(cat "$WORK/text/proactive" 2>/dev/null)"
+
+alert_text "$WORK/unit/tasks" "" 600 pileup
+for f in proactive notify; do
+  grep -q "^Sutando: 2 tasks are waiting for the core, which still has no task watcher" "$WORK/text/$f" \
+    && grep -q "This is the last message about it until the watcher returns." "$WORK/text/$f" \
+    && ! grep -qE "$WORK|/unit/tasks|secret-session-name" "$WORK/text/$f" && r=0 || r=1
+  check "(18) the $f pile-up follow-up names the seat and count, says it is the last, and has no path" "$r" "$(cat "$WORK/text/$f" 2>/dev/null)"
+done
+alert_text "$WORK/unit/deliveries/$W1" "" 600 pileup
+grep -q "^Sutando: 1 task is waiting for worker 01234567, which" "$WORK/text/proactive" && r=0 || r=1
+check "(18) ...and a worker's follow-up names it by its short id" "$r" "$(cat "$WORK/text/proactive" 2>/dev/null)"
+
+# Two messages in the same second each keep their own result file.
+rm -f "$WORK"/unit/results/proactive-standby-unwatched-*.txt
+(
+  SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_TASKS_DIR="$WORK/unit/tasks" SUTANDO_WORKSPACE_DIR="$WORK/unit"
+  export SUTANDO_SUPERVISOR_SOURCE_ONLY SUTANDO_TASKS_DIR SUTANDO_WORKSPACE_DIR
+  # shellcheck source=/dev/null
+  source "$SUPERVISOR"
+  bash() { if [ "$1" = "$REPO/src/macos-notify.sh" ]; then :; else command bash "$@"; fi; }
+  supervisor_log() { :; }
+  now_s() { echo 1000; }
+  unwatched_alert 600 3 pileup
+  unwatched_alert 600 3 reminder
+)
+# shellcheck disable=SC2012
+[ "$(ls "$WORK"/unit/results/ | grep -c '^proactive-standby-unwatched-1000-.*\.txt$')" = 2 ] \
+  && grep -l "last message" "$WORK"/unit/results/proactive-standby-unwatched-*.txt >/dev/null \
+  && grep -l "(reminder)" "$WORK"/unit/results/proactive-standby-unwatched-*.txt >/dev/null && r=0 || r=1
+check "(20) two messages in one second keep separate result files" "$r" "$(ls "$WORK/unit/results")"
+rm -f "$WORK"/unit/results/proactive-standby-unwatched-*.txt
+
+# A worker on its own folders: its tasks and answers sit outside the shared workspace.
+OWN="$WORK/unit/agents/own-worker"; mkdir -p "$OWN/tasks" "$OWN/results"
+for i in 1 2 3; do printf 'id: task-o%s\ntask: o\n' "$i" > "$OWN/tasks/task-o$i.txt"; printf 'done\n' > "$OWN/results/task-o$i.txt"; done
+own_count() {  # own_count <results dir or empty>
+  (
+    SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_TASKS_DIR="$OWN/tasks" SUTANDO_WORKSPACE_DIR="$WORK/unit" SUTANDO_RESULTS_DIR="$1"
+    export SUTANDO_SUPERVISOR_SOURCE_ONLY SUTANDO_TASKS_DIR SUTANDO_WORKSPACE_DIR SUTANDO_RESULTS_DIR
+    # shellcheck source=/dev/null
+    source "$SUPERVISOR"
+    waiting_count
+  )
+}
+[ "$(own_count "$OWN/results")" = 0 ] && [ "$(own_count "")" = 3 ] && r=0 || r=1
+check "(21) an own-folder worker's answered tasks are not counted as waiting" "$r" "with: $(own_count "$OWN/results") without: $(own_count "")"
+rm "$OWN/results/task-o3.txt"
+[ "$(own_count "$OWN/results")" = 1 ] && r=0 || r=1; check "(21) ...and its unanswered one is" "$r" "$(own_count "$OWN/results")"
+
+# A publish that fails: unwatched_alert reports it (return 1), not a silent success.
+# inbox_seat also runs through $PY (seat_inbox.py), so only result_publish.py's call is made to fail.
+FAILPY="$WORK/fail-py"
+printf '#!/bin/bash\ncase "$*" in *result_publish.py*) exit 1 ;; *) exec python3 "$@" ;; esac\n' > "$FAILPY"
+chmod +x "$FAILPY"
+(
+  SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_TASKS_DIR="$WORK/unit/tasks" SUTANDO_WORKSPACE_DIR="$WORK/unit" \
+    SUTANDO_NOTIFIER_PY="$FAILPY"
+  export SUTANDO_SUPERVISOR_SOURCE_ONLY SUTANDO_TASKS_DIR SUTANDO_WORKSPACE_DIR SUTANDO_NOTIFIER_PY
+  # shellcheck source=/dev/null
+  source "$SUPERVISOR"
+  bash() { if [ "$1" = "$REPO/src/macos-notify.sh" ]; then :; else command bash "$@"; fi; }
+  supervisor_log() { :; }
+  unwatched_alert 600 2
+)
+[ "$?" = 1 ] && r=0 || r=1; check "(22) unwatched_alert reports a failed publish instead of succeeding silently" "$r" "$?"
+rm -f "$WORK"/unit/results/proactive-standby-unwatched-*.txt
+
+# run_alert_only: a failed first alert does not latch "alerted", so the very next poll retries it,
+# rather than waiting a full ALERT_REPEAT (or forever, with reminders off by default).
+retry_unit() {  # retry_unit <verdict per poll...>; prints each unwatched_alert attempt, succeeding from the 3rd
+  local verdicts="$WORK/rverdicts" clock="$WORK/rclock" alerts="$WORK/ralerts"
+  printf '%s\n' "$@" > "$verdicts"; echo 0 > "$clock"; : > "$alerts"; : > "$WORK/rcalls"
+  (
+    SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_TASKS_DIR="$WORK/unit/tasks" SUTANDO_NOTIFIER_ROLE_POLL=5 \
+      SUTANDO_NOTIFIER_ALERT_GRACE=300 SUTANDO_NOTIFIER_SCRIPT="$WORK/never-run.sh"
+    export SUTANDO_SUPERVISOR_SOURCE_ONLY SUTANDO_TASKS_DIR SUTANDO_NOTIFIER_ROLE_POLL \
+      SUTANDO_NOTIFIER_ALERT_GRACE SUTANDO_NOTIFIER_SCRIPT
+    # shellcheck source=/dev/null
+    source "$SUPERVISOR"
+    target_alive() { [ -s "$verdicts" ]; }
+    session_role_verdict() { head -n 1 "$verdicts"; tail -n +2 "$verdicts" > "$verdicts.n"; mv "$verdicts.n" "$verdicts"; }
+    now_s() { cat "$clock"; }
+    sleep() { echo $(( $(cat "$clock") + ${1%.*} )) > "$clock"; }
+    waiting_count() { echo 1; }
+    supervisor_log() { :; }
+    unwatched_alert() {
+      echo x >> "$WORK/rcalls"
+      local n; n="$(wc -l < "$WORK/rcalls" | tr -d ' ')"
+      echo "attempt $n at $(now_s)" >> "$alerts"
+      [ "$n" -ge 3 ]
+    }
+    run_alert_only
+  )
+}
+# shellcheck disable=SC2046
+retry_unit $(nos 70)
+[ "$(printf '%s\n' "attempt 1 at 300" "attempt 2 at 305" "attempt 3 at 310")" = "$(cat "$WORK/ralerts")" ] && r=0 || r=1
+check "(23) a failed alert is retried on the very next poll, not latched or delayed" "$r" "$(cat "$WORK/ralerts")"
+
+# fail_unit: like unit, but the stubbed send fails for the kinds in FAIL_KINDS ("alert" is the first
+# alert) until FAIL_UNTIL; every attempt is logged with its outcome. Counts come from UNIT_COUNTS.
+fail_unit() {  # fail_unit <verdict per poll...>
+  local verdicts="$WORK/fverdicts" clock="$WORK/fclock" alerts="$WORK/falerts"
+  printf '%s\n' "$@" > "$verdicts"; echo 0 > "$clock"; : > "$alerts"
+  (
+    SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_TASKS_DIR="$WORK/unit/tasks" SUTANDO_NOTIFIER_ROLE_POLL="${UNIT_POLL:-5}" \
+      SUTANDO_NOTIFIER_ALERT_GRACE=300 SUTANDO_NOTIFIER_ALERT_REPEAT="${UNIT_REPEAT:-}" \
+      SUTANDO_NOTIFIER_SCRIPT="$WORK/never-run.sh"
+    export SUTANDO_SUPERVISOR_SOURCE_ONLY SUTANDO_TASKS_DIR SUTANDO_NOTIFIER_ROLE_POLL \
+      SUTANDO_NOTIFIER_ALERT_GRACE SUTANDO_NOTIFIER_ALERT_REPEAT SUTANDO_NOTIFIER_SCRIPT
+    # shellcheck source=/dev/null
+    source "$SUPERVISOR"
+    target_alive() { [ -s "$verdicts" ]; }
+    session_role_verdict() { head -n 1 "$verdicts"; tail -n +2 "$verdicts" > "$verdicts.n"; mv "$verdicts.n" "$verdicts"; }
+    now_s() { cat "$clock"; }
+    sleep() { echo $(( $(cat "$clock") + ${1%.*} )) > "$clock"; }
+    supervisor_log() { :; }
+    waiting_count() { local t c n=""; t="$(now_s)"; for c in ${UNIT_COUNTS:-0:1}; do [ "${c%%:*}" -le "$t" ] && n="${c#*:}"; done; echo "$n"; }
+    unwatched_alert() {
+      local kind="${3:-alert}" t; t="$(now_s)"
+      if [[ " ${FAIL_KINDS:-} " == *" $kind "* ]] && [ "$t" -lt "${FAIL_UNTIL:-999999}" ]; then
+        echo "$t $kind failed" >> "$alerts"; return 1
+      fi
+      echo "$t $kind sent" >> "$alerts"
+    }
+    run_alert_only
+  )
+}
+# An hour of 5 s polls with every send failing: retried at once, then backed off to every 300 s.
+# shellcheck disable=SC2046
+FAIL_KINDS=alert fail_unit $(nos 720)
+tries="$(wc -l < "$WORK/falerts" | tr -d ' ')"
+gap="$(tail -n 2 "$WORK/falerts" | cut -d' ' -f1 | tr '\n' ' ' | awk '{print $2 - $1}')"
+[ "$(sed -n 2p "$WORK/falerts" | cut -d' ' -f1)" = 305 ] && [ "$tries" -le 25 ] && [ "$gap" -ge 300 ] && [ "$gap" -le 305 ] && r=0 || r=1
+check "(24) a send that keeps failing is retried at once, then backed off to every 300 s, never every poll" "$r" "tries $tries, last gap $gap"
+# shellcheck disable=SC2046
+UNIT_POLL=60 UNIT_REPEAT=600 UNIT_COUNTS="0:1 400:3" FAIL_KINDS=pileup FAIL_UNTIL=2000 fail_unit $(nos 67)
+dup="$(cut -d' ' -f1 "$WORK/falerts" | uniq -d)"
+grep -q " reminder sent" "$WORK/falerts" && grep -q "^[0-9]* pileup sent" "$WORK/falerts" \
+  && [ -z "$(awk '$2=="pileup" && $3=="sent"{p=1; next} p' "$WORK/falerts")" ] && [ -z "$dup" ] && r=0 || r=1
+check "(25) a failing pile-up is retried without blocking reminders, one attempt per poll, and once sent ends them" "$r" "$(tr '\n' ';' < "$WORK/falerts")"
+# The final flag belongs to an episode: after the watcher returns, opted-in reminders resume.
+# shellcheck disable=SC2046
+UNIT_POLL=60 UNIT_REPEAT=600 UNIT_COUNTS="0:1 600:3 1500:1" unit $(nos 20) yes $(nos 30)
+[ "$(printf '%s\n' "alert at 300 after 300 waiting 1" "alert at 600 after 600 waiting 3 pileup" \
+      "alert at 1560 after 300 waiting 1" "alert at 2160 after 900 waiting 1 reminder" \
+      "alert at 2760 after 1500 waiting 1 reminder")" = "$(cat "$WORK/alerts")" ] && r=0 || r=1
+check "(26) a new episode after a final pile-up gets its opted-in reminders again" "$r" "$(cat "$WORK/alerts")"
+
+# The back-off itself: 1, 2, 4 ... capped at 300 s, and still 300 s after hours of failures (no overflow).
+waits="$(SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_NOTIFIER_SCRIPT="$WORK/never-run.sh" bash -c \
+  'source "$1"; for f in 1 2 3 9 10 100 1000; do printf "%s " "$(retry_wait "$f")"; done' _ "$SUPERVISOR")"
+[ "$waits" = "1 2 4 256 300 300 300 " ] && r=0 || r=1
+check "(27) the retry back-off doubles from 1 s and stays capped at 300 s however long it fails" "$r" "$waits"
 
 # ---- Part 2: the real supervisor in tmux ---------------------------------------------------
 if ! command -v tmux >/dev/null 2>&1; then
@@ -195,12 +406,19 @@ else
     && ! grep -q "$A" "$A"/results/proactive-standby-unwatched-*.txt && r=0 || r=1
   check "(6) ...naming the core, its waiting count and that nothing is typed, and no path" "$r" "$(cat "$A"/results/proactive-* 2>/dev/null)"
   [ ! -e "$A/notifier.marker" ] && r=0 || r=1; check "(6) ...and the typing notifier never ran" "$r" "$(cat "$A/notifier.marker" 2>/dev/null)"
+  for i in 1 2 3; do printf 'id: task-p%s\ntask: p\n' "$i" > "$A/tasks/task-p$i.txt"; done
+  wait_grep "ALERT (pileup)" "$LOG" 150 && r=0 || r=1; check "(6p) three tasks piling up send the follow-up" "$r" "$(tail -3 "$LOG")"
+  sleep 3
+  # shellcheck disable=SC2012
+  [ "$(ls "$A/results" | grep -c '^proactive-standby-unwatched-.*\.txt$')" = 2 ] && [ "$(grep -c 'ALERT' "$LOG")" = 2 ] \
+    && grep -l "^Sutando: 3 tasks are waiting for the core" "$A"/results/proactive-standby-unwatched-*.txt >/dev/null 2>&1 && r=0 || r=1
+  check "(6p) ...once, counted from the real inbox" "$r" "$(ls "$A/results"; cat "$LOG")"
   tmux -S "$SOCK" new-session -d -s session-watcher -c "$REPO" \
     "env -u SUTANDO_INSTANCE_ID -u SUTANDO_WORKSPACE_DIR SUTANDO_TMUX_SOCKET=$SOCK SUTANDO_TMUX_SESSION=target \
        SUTANDO_WATCHER_READY_TIMEOUT=60 bash $WATCHER $A/tasks --role session --inbox $A/tasks > $A/watcher.out 2>&1"
   wait_grep "stands down" "$LOG" 300 && r=0 || r=1; check "(7) a ready session watcher ends the episode" "$r" "$(tail -3 "$LOG")"
   # shellcheck disable=SC2012
-  [ "$(ls "$A/results" | grep -c '^proactive-')" = 1 ] && r=0 || r=1; check "(7) ...without a word to the owner" "$r"
+  [ "$(ls "$A/results" | grep -c '^proactive-')" = 2 ] && r=0 || r=1; check "(7) ...without a word to the owner" "$r"
   [ ! -e "$A/notifier.marker" ] && r=0 || r=1; check "(7) ...and still nothing typed" "$r"
   tmux -S "$SOCK" kill-session -t sup-mod >/dev/null 2>&1
   tmux -S "$SOCK" kill-session -t session-watcher >/dev/null 2>&1
@@ -214,5 +432,5 @@ else
   check "(8) ...and raises no unwatched-inbox alert" "$r"
 fi
 
-if [ "$fail" = 0 ]; then echo "  ok  alert-only standby types nothing and alerts, then reminds, per episode"; else echo "  FAILED"; fi
+if [ "$fail" = 0 ]; then echo "  ok  alert-only standby types nothing, alerts once per episode and follows up once on a pile-up"; else echo "  FAILED"; fi
 exit "$fail"
