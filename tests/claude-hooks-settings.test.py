@@ -231,5 +231,162 @@ with tempfile.TemporaryDirectory() as tmp:
                              project_dir=proj) == [],
               "nor when a project_dir is supplied and the expansion would resolve")
 
+    # ── a copy left by an OLDER install tree that still exists is re-pointed, not kept ──
+    # Its script exists, so prune_dead keeps it; without re-pointing it fires from the old tree.
+    old_tree = tmp / "old app" / "engine" / "sutando"
+    new_tree = tmp / "new app" / "engine" / "sutando"
+    for tree in (old_tree, new_tree):
+        (tree / "src").mkdir(parents=True)
+        (tree / "src" / "watcher-rearm-session-hint.sh").write_text("#!/bin/bash\n")
+    old_cmd = f'bash "{old_tree}/src/watcher-rearm-session-hint.sh"'
+    new_cmd = f'bash "{new_tree}/src/watcher-rearm-session-hint.sh"'
+    custom = f'bash -x "{old_tree}/src/watcher-rearm-session-hint.sh"'
+    moved = tmp / "moved" / ".claude" / "settings.json"
+    moved.parent.mkdir(parents=True)
+    moved.write_text(json.dumps({"hooks": {"SessionStart": [
+        entry(old_cmd, matcher="compact|resume"), entry(custom, matcher=""),
+        entry("echo not-sutando", matcher="")]}}))
+    status, removed = chs.install(moved, event="SessionStart", command=new_cmd, matcher="compact|resume")
+    got = json.loads(moved.read_text())["hooks"]["SessionStart"]
+    cmds = [h["command"] for e in got for h in e["hooks"]]
+    check(status == "re-pointed" and removed == [], "an older tree's copy reports re-pointed", status)
+    check(got[0] == entry(new_cmd, matcher="compact|resume"),
+          "the copy is rewritten in place to this checkout, matcher kept", json.dumps(got))
+    check(old_cmd not in cmds and cmds.count(new_cmd) == 1, "no entry still runs the older tree's script")
+    check(custom in cmds, "an operator variant of the same script (extra flag) is not ours and stays")
+    check("echo not-sutando" in cmds, "a foreign non-Sutando hook stays")
+    status, _ = chs.install(moved, event="SessionStart", command=new_cmd, matcher="compact|resume")
+    check(status == "already installed", "a hook already on this checkout is skipped", status)
+
+    # A copy beside an already-correct entry is dropped rather than doubled.
+    both = tmp / "both" / ".claude" / "settings.json"
+    both.parent.mkdir(parents=True)
+    both.write_text(json.dumps({"hooks": {"SessionStart": [entry(new_cmd), entry(old_cmd)]}}))
+    status, _ = chs.install(both, event="SessionStart", command=new_cmd, matcher="compact")
+    cmds = [h["command"] for e in json.loads(both.read_text())["hooks"]["SessionStart"] for h in e["hooks"]]
+    check(status == "re-pointed" and cmds == [new_cmd], "a copy beside the correct entry is dropped", str(cmds))
+    odd = {"hooks": {"SessionStart": ["not-a-dict", entry(old_cmd), entry(new_cmd)]}}
+    changed = chs.repoint_other_checkouts(odd, "SessionStart", new_cmd, "compact")
+    check(changed == [old_cmd] and odd["hooks"]["SessionStart"] == ["not-a-dict", entry(new_cmd)],
+          "a copy BEFORE the correct entry is rewritten once, a non-dict entry kept", json.dumps(odd))
+
+    # A copy under another matcher is not ours: re-pointing it would drop or change a trigger.
+    def run_rows(rows, requested):
+        path = tmp / f"matcher-{len(list(tmp.glob('matcher-*')))}" / ".claude" / "settings.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"hooks": {"SessionStart": [entry(c, matcher=m) for c, m in rows]}}))
+        status, _ = chs.install(path, event="SessionStart", command=new_cmd, matcher=requested)
+        got = json.loads(path.read_text())["hooks"]["SessionStart"]
+        return status, sorted((h["command"], e["matcher"]) for e in got for h in e["hooks"])
+
+    status, got = run_rows([(old_cmd, "compact"), (new_cmd, "resume")], "resume")
+    check(got == sorted([(old_cmd, "compact"), (new_cmd, "resume")]),
+          "old@compact + new@resume, requesting resume: the resume trigger is kept", f"{status} {got}")
+    status, got = run_rows([(new_cmd, "resume"), (old_cmd, "compact")], "resume")
+    check(got == sorted([(new_cmd, "resume"), (old_cmd, "compact")]),
+          "new@resume + old@compact, requesting resume: the compact trigger is kept", f"{status} {got}")
+    status, got = run_rows([(old_cmd, "compact")], "compact|resume")
+    check(status == "installed" and (new_cmd, "compact|resume") in got,
+          "old@compact, requesting compact|resume: the requested matcher is applied", f"{status} {got}")
+
+    # The exact command under another matcher does not count as installed for the requested one.
+    status, got = run_rows([(new_cmd, "compact")], "compact|resume")
+    check(status == "installed" and got == sorted([(new_cmd, "compact"), (new_cmd, "compact|resume")]),
+          "new@compact, requesting compact|resume: added alongside, compact entry kept", f"{status} {got}")
+    path = tmp / "matcher-rerun" / ".claude" / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"hooks": {"SessionStart": [entry(new_cmd, matcher="compact")]}}))
+    for _ in range(2):
+        status, _ = chs.install(path, event="SessionStart", command=new_cmd, matcher="compact|resume")
+    rows = sorted((h["command"], e["matcher"]) for e in json.loads(path.read_text())["hooks"]["SessionStart"]
+                  for h in e["hooks"])
+    check(status == "already installed" and rows == sorted([(new_cmd, "compact"), (new_cmd, "compact|resume")]),
+          "rerun with compact|resume is idempotent", f"{status} {rows}")
+    no_matcher = {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": new_cmd}]}]}}
+    path = tmp / "matcher-absent" / ".claude" / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(no_matcher))
+    status, _ = chs.install(path, event="SessionStart", command=new_cmd, matcher="")
+    check(status == "already installed", "an entry with no matcher key counts as the empty matcher", status)
+
+    check(not chs.is_other_checkout_copy(f'bash "{tmp}/elsewhere/watcher-rearm-session-hint.sh"', new_cmd),
+          "a same-named script outside a src/, scripts/ or skills/ tail is not a checkout copy")
+
+    # The real installer, end to end, on the reported hook.
+    work2 = tmp / "work2"
+    (work2 / ".claude").mkdir(parents=True)
+    stale = f'bash "{old_tree}/src/watcher-rearm-session-hint.sh"'
+    (work2 / ".claude" / "settings.json").write_text(json.dumps({"hooks": {
+        "SessionStart": [entry(stale, matcher="compact|resume")]}}))
+    r = subprocess.run(["bash", str(REPO / "scripts" / "install-watcher-rearm-hook.sh")], capture_output=True,
+                       text=True, env=dict(os.environ, SUTANDO_CLAUDE_WORKING_DIR=str(work2)), timeout=30)
+    cmds = [h["command"] for e in json.loads((work2 / ".claude" / "settings.json").read_text())["hooks"]["SessionStart"]
+            for h in e["hooks"]]
+    check(r.returncode == 0 and cmds == [f'bash "{REPO}/src/watcher-rearm-session-hint.sh"']
+          and "(re-pointed)" in r.stdout, "install-watcher-rearm-hook.sh re-points an older tree's entry",
+          r.stdout + r.stderr + str(cmds))
+
+    # An older checkout's copy before the current entry must not replace it: the current
+    # hook owns its timeout and async settings, in whichever order the two sit.
+    older = tmp / "older" / "src" / "personal-claude-compact-hint.sh"
+    older.parent.mkdir(parents=True, exist_ok=True)
+    older.write_text("#!/bin/bash\n")
+    older_cmd = f'bash "{older}"'
+    check(chs.is_other_checkout_copy(older_cmd, live_cmd), "fixture: the older tree's entry is a copy")
+
+    def rich(cmd, timeout, matcher="compact", **extra):
+        return {"matcher": matcher,
+                "hooks": [dict({"type": "command", "command": cmd, "timeout": timeout}, **extra)]}
+
+    CURRENT = dict(timeout=600, **{"async": True, "statusMessage": "keep me"})
+    for label, order in (
+            ("older first", lambda: [rich(older_cmd, 1), rich(live_cmd, **CURRENT)]),
+            ("current first", lambda: [rich(live_cmd, **CURRENT), rich(older_cmd, 1)])):
+        s = {"hooks": {"SessionStart": order()}}
+        chs.repoint_other_checkouts(s, "SessionStart", live_cmd, matcher="compact")
+        hooks = [h for e in s["hooks"]["SessionStart"] for h in (e.get("hooks") or [])]
+        check(len(hooks) == 1 and hooks[0].get("command") == live_cmd,
+              f"{label}: one current entry survives", str(hooks))
+        check(len(hooks) == 1 and hooks[0].get("timeout") == 600,
+              f"{label}: the current entry's timeout survives", str(hooks))
+        check(len(hooks) == 1 and hooks[0].get("async") is True
+              and hooks[0].get("statusMessage") == "keep me",
+              f"{label}: the current entry's async metadata survives", str(hooks))
+
+    # Two older copies and no current entry: the first in file order is the one re-pointed,
+    # so the entry keeps its position; the rest are dropped as duplicates.
+    older2 = tmp / "older2" / "src" / "personal-claude-compact-hint.sh"
+    older2.parent.mkdir(parents=True, exist_ok=True)
+    older2.write_text("#!/bin/bash\n")
+    s = {"hooks": {"SessionStart": [rich(older_cmd, 1), rich(f'bash "{older2}"', 2)]}}
+    chs.repoint_other_checkouts(s, "SessionStart", live_cmd, matcher="compact")
+    hooks = [h for e in s["hooks"]["SessionStart"] for h in (e.get("hooks") or [])]
+    check(len(hooks) == 1 and hooks[0].get("command") == live_cmd and hooks[0].get("timeout") == 1,
+          "two older copies, no current: the first in file order is re-pointed", str(hooks))
+
+    # A current entry under another matcher is not ours to touch.
+    s = {"hooks": {"SessionStart": [rich(older_cmd, 1), rich(live_cmd, 600, matcher="resume")]}}
+    chs.repoint_other_checkouts(s, "SessionStart", live_cmd, matcher="compact")
+    kept = s["hooks"]["SessionStart"]
+    check(any(e.get("matcher") == "resume" and e["hooks"][0].get("timeout") == 600 for e in kept),
+          "a current entry under another matcher is left untouched", str(kept))
+
+    # A non-dict entry and a non-dict hook are carried through untouched.
+    s = {"hooks": {"SessionStart": ["not-an-entry", {"matcher": "compact", "hooks": ["not-a-hook"]},
+                                    rich(older_cmd, 1)]}}
+    chs.repoint_other_checkouts(s, "SessionStart", live_cmd, matcher="compact")
+    kept = s["hooks"]["SessionStart"]
+    check("not-an-entry" in kept and any(e.get("hooks") == ["not-a-hook"] for e in kept if isinstance(e, dict)),
+          "a non-dict entry and a non-dict hook survive the migration", str(kept))
+
+    # Idempotence: a second pass over the settled settings changes nothing.
+    s = {"hooks": {"SessionStart": [rich(older_cmd, 1), rich(live_cmd, **CURRENT)]}}
+    chs.repoint_other_checkouts(s, "SessionStart", live_cmd, matcher="compact")
+    once = json.dumps(s, sort_keys=True)
+    again = chs.repoint_other_checkouts(s, "SessionStart", live_cmd, matcher="compact")
+    check(again == [] and json.dumps(s, sort_keys=True) == once,
+          "running the migration twice changes nothing", once)
+
+
 print(f"\n{_pass} passed, {_fail} failed")
 sys.exit(1 if _fail else 0)

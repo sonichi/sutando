@@ -250,7 +250,9 @@ def _result_state(workspace: Path, task_id: str) -> "str | None":
     """"ready" when the task has a deliverable result (the shared readiness walk, live or archived,
     a wake turn's own only), "pending" when one of its turn exists but is not ready yet (blank,
     being written, or unreadable), None when it has none."""
-    results, task_file = workspace / "results", workspace / "tasks" / f"{task_id}.txt"
+    from connections import task_home
+    home = task_home(task_id, workspace)
+    results, task_file = home["results"], home["tasks"] / f"{task_id}.txt"
     if has_ready_result(results, f"{task_id}.txt", task_file=task_file):
         return "ready"
     since = _mtime(task_file) if is_wake_turn(task_file) else None
@@ -303,7 +305,9 @@ def rule(workspace: Path, rec: dict, now: float,
         return None                         # an answer may be on its way: never ruled a stop yet
     if _result_state(workspace, rec["control"]) != "ready" and not late:
         return None
-    if not late and _held_elsewhere(workspace, workspace / "tasks", target):
+    from connections import task_home
+    own = task_home(target, workspace)["own"]
+    if not late and (own or _held_elsewhere(workspace, workspace / "tasks", target)):
         return None                         # a pool worker may still answer it
     reason = "stopped" if not late else "stopped; the stop was not answered within the hour"
     ActivityStore(workspace).apply(LifecycleTransition(target, "CANCELLED", reason=reason))

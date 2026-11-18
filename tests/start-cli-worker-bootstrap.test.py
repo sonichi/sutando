@@ -36,7 +36,7 @@ TMUX = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
 # the stub reports the launched stub's own pid, and the real ps shows its argv.
 PGREP_STUB = ('[ "$*" = "-ax claude" ] || exit 0\n'
               '[ -s "$HOME/claude.pid" ] && echo "$(cat "$HOME/claude.pid") claude"\n')
-CLAUDE_STUB = 'echo $$ > "$HOME/claude.pid"\nenv > "$HOME/claude.env"\nsleep 120\n'
+CLAUDE_STUB = '[ "$1" = --version ] && exit 0\necho $$ > "$HOME/claude.pid"\nenv > "$HOME/claude.env"\nsleep 120\n'
 
 
 def _boot(extra_env: dict, server_env: "dict | None" = None, pgrep_stub: str = PGREP_STUB,
@@ -69,10 +69,9 @@ def _boot(extra_env: dict, server_env: "dict | None" = None, pgrep_stub: str = P
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
         shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
         (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True)
-        shutil.copy2(
-            REPO / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
-            root / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
-        )
+        for name in ("launch-worker-session.sh", "worker-mcp-credential.sh"):
+            shutil.copy2(REPO / "skills" / "worker-pool" / "scripts" / name,
+                         root / "skills" / "worker-pool" / "scripts" / name)
         delivery_script = root / "skills" / "worker-pool" / "scripts" / "pool_delivery.py"
         delivery_script.write_text("# Readable pool writer fixture for launcher preflight.\n")
         ws = td / "ws"

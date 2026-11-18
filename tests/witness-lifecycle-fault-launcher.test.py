@@ -243,7 +243,7 @@ class Launcher(unittest.TestCase):
         fake = types.SimpleNamespace(_IMPL=impl, RUNTIME_IDENTITY={"build_sha": "abc", "module_sha256": "d"},
                                      _req=lambda *a, **k: {}, _ATTEMPTS=gw._ATTEMPTS,
                                      VOICE_ROOM_VERIFIER=types.SimpleNamespace(start=lambda: ran.append("verifier")),
-                                     main=lambda: ran.append("main"))
+                                     run=lambda: ran.append("run"))
         sentinel = Path(tempfile.mkdtemp()) / "held"
         argv = ["--fault", "stall", "--kind", "result", "--task", "task-x", "--lease", "*", "--generation", "2",
                 "--report", str(self.report), "--sentinel", str(sentinel)]
@@ -258,7 +258,7 @@ class Launcher(unittest.TestCase):
         self.assertEqual(first["module_sha256"], launcher._sha256(impl))
         self.assertEqual((first["rule"]["report"], first["rule"]["sentinel"], first["rule"]["generation"]),
                          (str(self.report), str(sentinel), 2))
-        self.assertEqual(ran, ["verifier", "main"], "the bridge's own start follows")
+        self.assertEqual(ran, ["verifier", "run"], "the bridge's own start follows")
         self.assertIsNot(fake._req, None)
         at_exit.call_args[0][0]()
         self.assertEqual(self.events()[-1]["event"], "FAIL: the rule never matched")
