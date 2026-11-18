@@ -576,12 +576,12 @@ class Launcher(unittest.TestCase):
             self.assertEqual(rescan(), [], "removed by uninstall: gone on the next pass")
         self.assertEqual(err.getvalue(), "")
 
-    def test_full_mode_keeps_the_gateway_bridge_first_and_rescans_only_the_declarations(self):
+    def test_full_mode_runs_no_gateway_bridge_and_rescans_only_the_declarations(self):
         self.declare()
         specs, _, rescan, rescan_s, _ = self.main([])
         self.assertEqual(rescan_s, 30.0)
         names = [s.name for s in specs]
-        self.assertEqual((names[0], names.count(cli.worker_name(SEG))), ("remote-gateway-bridge", 1))
+        self.assertEqual(names, [cli.worker_name(SEG)], "the gateway bridge is --core's worker")
         with contextlib.redirect_stderr(io.StringIO()):
             again = [s.name for s in rescan()]
         self.assertEqual(again, names, "the static workers are listed on every pass, so never dropped")
@@ -753,13 +753,15 @@ class Launcher(unittest.TestCase):
         self.assertEqual(specs, [])
         self.assertIn("sparrowd: not supervised — loop-x: no interpreter configured", err.getvalue())
 
-    def test_full_mode_still_refuses_a_gateway_bridge_supervised_elsewhere(self):
+    def test_full_mode_still_refuses_a_static_worker_supervised_elsewhere(self):
         err = io.StringIO()
-        with mock.patch.object(self.sd, "external_supervisor", side_effect=lambda m: "pid 7 (1 bash wrapper)"), \
+        loop = self.sd.WorkerSpec(name="loop-x", argv=["py", "/x/skills/x/loop.py"])
+        with mock.patch.object(self.sd, "_static_specs", return_value=([loop], [])), \
+                mock.patch.object(self.sd, "external_supervisor", side_effect=lambda m: "pid 7 (1 bash wrapper)"), \
                 mock.patch.object(self.sd, "run", return_value=0) as run_, contextlib.redirect_stderr(err):
             self.assertEqual(self.sd.main([]), 2)
         run_.assert_not_called()
-        self.assertIn("refusing to start — remote-gateway-bridge already supervised outside sparrowd", err.getvalue())
+        self.assertIn("refusing to start — loop-x already supervised outside sparrowd", err.getvalue())
 
 
 if __name__ == "__main__":

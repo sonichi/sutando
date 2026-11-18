@@ -19,7 +19,8 @@ workspace wiring:
      runpy via the deprecated remote-relay-bridge name, and the mock-gateway
      test harness (which loads the file several times under different env and
      mutates module attributes) — sees exactly the same module-level API and
-     import-time env parsing as the pre-switch monolith.
+     import-time env parsing as the pre-switch monolith. A pool worker's declared
+     Sparrow bridge (`sparrow_agent_bridge.py`) runs this file too, as its lane.
 
 Revert: restore this file's previous revision from git (the pre-switch
 monolith is the parent commit of the one introducing this shim). No other
@@ -47,6 +48,7 @@ from proactive_routing import (BRIDGE_CHANNELS, body_target_channel,  # noqa: E4
                                lane_claims_proactive, proactive_destination,
                                should_claim_proactive)
 from workspace_default import resolve_workspace  # noqa: E402
+import worker_lane  # noqa: E402
 from util_paths import claude_home_path, shared_personal_path  # noqa: E402
 from voice_room_membership import (CHECK_DIR_NAME, VERDICT_TTL_S,  # noqa: E402
                                    RoomMembershipVerifier, members_from_room_op)
@@ -55,7 +57,9 @@ WS = resolve_workspace()
 
 from ag2_sparrow._dirs import set_dirs  # noqa: E402
 
-set_dirs(task_dir=WS / "tasks", result_dir=WS / "results", state_dir=WS / "state")
+# A converted worker's lane runs on that worker's own tasks/ and results/; every other lane on the shared ones.
+_TASK_DIR, _RESULT_DIR, _OWN_DIRS = worker_lane.lane_dirs(WS, (os.environ.get("GATEWAY_INSTANCE") or "").strip())
+set_dirs(task_dir=_TASK_DIR, result_dir=_RESULT_DIR, state_dir=WS / "state")
 
 from task_envelope import stamp_text  # noqa: E402  (adapter-edge stamper)
 from ag2_sparrow.local_task_protocol import set_task_stamper  # noqa: E402
@@ -111,6 +115,9 @@ def _sutando_apply_worker_label_overrides(labels: dict, config_version: int,
 # An install without worker-pool has no callback and makes no profile read.
 _SUTANDO_WORKER_LABEL_APPLIER = (_sutando_apply_worker_label_overrides
                                  if _WORKER_LABEL_SCRIPT.is_file() else None)
+
+# Logged recovery commands name the workspace through its resolver, never its absolute path.
+_SUTANDO_WORKSPACE_RESOLVER = "bash scripts/sutando-config.sh workspace"
 
 # Runtime self-report, injected BEFORE the exec (anything after it is
 # unreachable when the exec'd source's own __main__ guard fires; see #3285).
@@ -504,25 +511,23 @@ def _lane_worker() -> str:
     return worker
 
 
-def _worker_lane_claim_gate(worker: str):
-    """A worker's own lane shares results/ with the core's lanes: it claims only the proactive files
-    its worker's session stamped (`lane_claims_proactive`), which it posts as the worker's agent."""
-    return lambda path: lane_claims_proactive(path.name, worker)
+def _lane_route_argv() -> "list[str]":
+    return worker_lane.route_argv(WS, RESULTS_DIR)  # noqa: F821
+
+
+def _lane_router(worker: str, argv: "list[str]"):
+    return worker_lane.router(worker, argv, lambda line: _log(line))  # noqa: F821
 
 
 def _install_worker_lane(worker: str) -> None:
-    """This lane runs as `worker`'s own agent: every task it queues is addressed to that worker,
-    and the only proactive files it claims and owns are the ones that worker's session wrote."""
-    global TASK_ADDRESSEE, PROACTIVE_CLAIM_GATE, PROACTIVE_OWN_FILE
-    TASK_ADDRESSEE = lambda: worker  # noqa: E731
-    PROACTIVE_CLAIM_GATE = PROACTIVE_OWN_FILE = _worker_lane_claim_gate(worker)
+    """This lane runs as `worker`'s own agent: the shared worker wiring, in this module's namespace."""
+    worker_lane.install(globals(), worker, workspace=WS, results_dir=RESULTS_DIR,  # noqa: F821
+                        log=lambda line: _log(line), who=f"lane {GATEWAY_INSTANCE}", own=_OWN_DIRS)  # noqa: F821
 
 
 # Read once: a lane's row names its worker for the life of the process (a change relaunches it).
 _LANE_WORKER = _lane_worker() if GATEWAY_INSTANCE else ""  # noqa: F821
 if _LANE_WORKER:
-    _log(f"lane {GATEWAY_INSTANCE} runs as worker {_LANE_WORKER}'s own agent: its tasks go to that worker, "  # noqa: F821
-         "and it posts only the proactive files that worker's session writes")
     _install_worker_lane(_LANE_WORKER)
 STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
                    and not gateway_credential_sources.is_seat(os.environ) else None)  # noqa: F821
@@ -530,4 +535,4 @@ STAND_DOWN_GATE = (_legacy_stand_down if not GATEWAY_INSTANCE  # noqa: F821
 if _RUN_MAIN:  # pragma: no cover — script-entry tail; the subprocess suite drives it
     __name__ = "__main__"
     VOICE_ROOM_VERIFIER.start()
-    main()  # noqa: F821  (defined by the exec above)
+    run()  # noqa: F821  (defined by the exec above)

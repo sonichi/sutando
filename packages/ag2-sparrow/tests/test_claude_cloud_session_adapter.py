@@ -33,6 +33,7 @@ SID = "session_01TESTSESSION"
 PROMPT_MD = PKG_ROOT / "ag2_sparrow" / "adapters" / "claude_cloud_session" / "session-prompt.md"
 ROUTINE_MD = PKG_ROOT / "ag2_sparrow" / "adapters" / "claude_routine" / "routine-prompt.md"
 NOTE = cc.NON_OWNER_NOTE
+AUDIENCE = "audience: " + cc.AUDIENCE_RULE
 SPAN_RE = re.compile(r"<(UNTRUSTED_TASK_[0-9a-f]{8})>\n(.*)\n</\1>", re.S)
 ENV = {"PATH": "/usr/bin:/bin", "HOME": "/home/owner", "USER": "owner", "LANG": "en_US.UTF-8",
        "SUTANDO_WORKSPACE": "/secret/ws", "ANTHROPIC_API_KEY": "sk-should-not-pass", "TERM": "xterm"}
@@ -177,11 +178,12 @@ class PayloadTest(unittest.TestCase):
     def test_owner_text_is_reminder_then_routing_then_span(self):
         room, text = self.text(thread="$root1")
         self.assertEqual(room, "!room:ag2.space")
-        reminder, first, rest = text.split("\n", 2)
+        reminder, first, audience, rest = text.split("\n", 3)
         self.assertEqual(reminder, sa.REMINDER)
         self.assertTrue(reminder.startswith("[sparrow task]"))
         self.assertEqual(first, "room=!room:ag2.space thread=$root1 tier=owner collaborator=false task_id=task-1 "
                                 "channel_kind=unknown")
+        self.assertEqual(audience, AUDIENCE)
         self.assertEqual(SPAN_RE.fullmatch(rest).group(2), "hello there")
 
     def test_non_owner_gets_the_note_and_guardrail_lines_follow_the_span(self):
@@ -275,6 +277,13 @@ class PayloadTest(unittest.TestCase):
         self.assertIn("or any other AG2 Space connector tool", forbidden)
         self.assertIn("Claude Code's own tools (shell, files, web, subagents, skills)", prompt)
 
+    def test_session_prompt_keeps_the_agent_list_to_the_owners_dm(self):
+        prompt = PROMPT_MD.read_text(encoding="utf-8")
+        start = prompt.index("you may also call `mcp__ag2_space__space_action_read`")
+        rule = " ".join(prompt[start:prompt.index("Never call", start)].split())
+        self.assertIn("read `account.agents.list` only when `channel_kind=dm`", rule)
+        self.assertIn("don't post the list there: say it's private and ask them to ask you in your DM", rule)
+
     def test_session_prompt_pins_the_message_count(self):
         prompt = PROMPT_MD.read_text(encoding="utf-8")
         rule = prompt[prompt.index("Message count per task_id, exactly:"):prompt.index("End your turn")]
@@ -308,8 +317,9 @@ class QueueLoopTest(unittest.TestCase):
             (call,) = fake.calls()
             self.assertEqual(call["argv"], [str(fake.path), "-p", "--cloud", SID, "--output-format", "json"])
             self.assertNotIn("SECRET-MARKER", " ".join(call["argv"]))
-            reminder, first, rest = text_of(call).split("\n", 2)
+            reminder, first, audience, rest = text_of(call).split("\n", 3)
             self.assertEqual(reminder, sa.REMINDER)
+            self.assertEqual(audience, AUDIENCE)
             self.assertEqual(first, "room=!room:ag2.space thread=$t1 tier=owner collaborator=false task_id=task-a "
                                     "channel_kind=unknown")
             self.assertEqual(SPAN_RE.fullmatch(rest).group(2), "hello SECRET-MARKER")

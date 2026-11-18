@@ -213,5 +213,45 @@ esac
 rm -f "$WS/results/archive/$OTHER-1789600001.txt" "$WS/deliveries/$WORKER/$PROBE.txt" "$WS/tasks/$PROBE.txt"
 record_delivery
 
+# 11. A WORKER ON ITS OWN FOLDERS (SUTANDO_INBOX_KIND set empty, its own tasks/ and results/ named):
+#     it owes what its own inbox holds, never the core's queue, and its own results clear it.
+OWN="$WS/agents/own-agent"
+mkdir -p "$OWN/tasks" "$OWN/results"
+printf 'id: %s\ntask: core work\n' "$PROBE-core" > "$WS/tasks/$PROBE-core.txt"
+own_hook() {
+  SUTANDO_INSTANCE_ID="$WORKER" SUTANDO_INBOX_KIND= SUTANDO_TASKS_DIR="$OWN/tasks" \
+    SUTANDO_RESULTS_DIR="$OWN/results" bash "$HOOK" 2>&1
+}
+record_delivery
+OUT="$(own_hook)"
+case "$OUT" in
+  '{}') ok "an own-folder worker is not blocked by the core's queue" ;;
+  *) bad "an own-folder worker is not blocked by the core's queue" "got: ${OUT:0:160}" ;;
+esac
+printf 'id: %s\ntask: own work\n' "$PROBE-own" > "$OWN/tasks/$PROBE-own.txt"
+record_delivery
+OUT="$(own_hook)"
+case "$OUT" in
+  *'"decision":"block"'*"Unprocessed tasks in $OWN/tasks/"*"$PROBE-own.txt"*) ok "an own-folder worker is blocked on its own inbox" ;;
+  *) bad "an own-folder worker is blocked on its own inbox" "got: ${OUT:0:200}" ;;
+esac
+printf 'done\n' > "$OWN/results/$PROBE-own.txt"
+record_delivery
+OUT="$(own_hook)"
+case "$OUT" in
+  '{}') ok "an own-folder worker's block clears with a result in its own results/" ;;
+  *) bad "an own-folder worker's block clears with a result in its own results/" "got: ${OUT:0:160}" ;;
+esac
+rm -f "$OWN/results/$PROBE-own.txt"
+record_delivery
+OUT="$(SUTANDO_INSTANCE_ID="$WORKER" SUTANDO_INBOX_KIND=deliveries SUTANDO_TASKS_DIR="$OWN/tasks" \
+  SUTANDO_RESULTS_DIR="$OWN/results" bash "$HOOK" 2>&1)"
+case "$OUT" in
+  '{}') ok "a deliveries worker still judges only its deliveries folder" ;;
+  *) bad "a deliveries worker still judges only its deliveries folder" "got: ${OUT:0:160}" ;;
+esac
+rm -rf "$OWN" "$WS/tasks/$PROBE-core.txt"
+record_delivery
+
 if [ "$FAILED" -eq 0 ]; then echo "PASS"; else echo "FAIL"; fi
 exit "$FAILED"

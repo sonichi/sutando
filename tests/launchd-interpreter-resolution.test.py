@@ -79,7 +79,7 @@ check("/opt/homebrew" not in plist,
       "gateway plist template carries no /opt/homebrew literal")
 
 # 4. The committed wrappers carry no clone/arch/user-specific interpreter fallback.
-for f in (GW_WRAPPER, CH_WRAPPER):
+for f in (GW_WRAPPER, GW_WRAPPER.with_name("gateway-bridge-lib.sh"), CH_WRAPPER):
     src = f.read_text()
     check("/opt/homebrew" not in src,
           f"{f.name} has no /opt/homebrew interpreter literal")

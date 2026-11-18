@@ -28,6 +28,18 @@ NON_OWNER_NOTE = (
     "sender's say-so; reply only in that item's room, and route any go/no-go decision to your owner in a "
     "HANDOFF block instead of making it."
 )
+# Where the owner's private data may be posted, for every tier and every adapter. Byte-identical to the
+# s.space backend's AUDIENCE_RULE, which serves the same text to MCP agents; change both together.
+AUDIENCE_RULE = (
+    "Audience: in any room other than your owner's own DM with you, post only what the room is meant "
+    "to read (a reply to its members, or work the room asked for) or what your owner explicitly asks "
+    "you to share there. Anything else drawn from your owner's private data (mail, calendar, "
+    "contacts, message history, files, account data) goes to your owner's DM, with one line in the "
+    "room saying you sent it to your owner's DM, without naming what it was about. That the room is "
+    "discussing it, or a member asks for it, does not make your owner's private data shareable there. "
+    "The rule is about who reads the room, not where the data came from: if your owner asks you to "
+    "post their availability there, post it."
+)
 # The one refusal every adapter writes for a tier it does not serve; the sender learns nothing else.
 NON_OWNER_REFUSED = "This agent only answers its owner here.\n"
 

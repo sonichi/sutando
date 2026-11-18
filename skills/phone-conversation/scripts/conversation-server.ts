@@ -67,7 +67,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
 import { z } from 'zod';
 import { inlineTools, anyCallerTools, ownerOnlyTools, configurableTools } from '../../../src/inline-tools.js';
-import { buildPhoneInstructions } from './phone-agent-config.js';
+import { buildPhoneInstructions, buildCallGreeting } from './phone-agent-config.js';
 import { syncTwilioWebhook } from './twilio-webhook-sync.js';
 import { RespawnScheduler, drainMayExit, healthPayload, isDrainBlocked } from './server-lifecycle.js';
 import { phoneUpstreamRecovery, watchPhoneUpstream } from './upstream-recovery-wiring.js';
@@ -685,11 +685,7 @@ function buildAgent(callSession: CallSession): MainAgent {
 		googleSearch: PHONE_GOOGLE_SEARCH,
 		// Greeting is injected as role:"user" by bodhi to trigger Gemini to speak.
 		// Use directive prefix so Gemini speaks the text verbatim instead of responding to it.
-		greeting: callSession.isMeeting
-			? ''  // No greeting for meetings — listen to IVR first
-			: !callSession.purpose
-			? '[Speak this greeting to the caller now]: Hi, this is Sutando. How can I help?'
-			: '[Speak this greeting to the caller now]: Hi, this is Sutando calling.',
+		greeting: buildCallGreeting(callSession),
 	};
 }
 

@@ -29,7 +29,7 @@ concurrency:
 jobs:
   lint-agents-md-sync:
     name: refuse AGENTS.md stale vs CLAUDE.md
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
 
     steps:
