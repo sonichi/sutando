@@ -10963,7 +10963,44 @@ def check_claude_task_notifier() -> dict:
                 "detail": "fresh local Claude heartbeat, but its live tmux session could not be verified"}
     supervisor = REPO_DIR / "src" / "agent" / "codex" / "cli" / "task-notifier-supervisor.sh"
     notifier = REPO_DIR / "src" / "agent" / "claude" / "cli" / "task-notifier.sh"
-    return _probe_task_notifier(target, name=name, expected=supervisor, script=notifier)
+    probe = _probe_task_notifier(target, name=name, expected=supervisor, script=notifier)
+    if probe["status"] != "ok" or _claude_standby_mode(target) != "alert":
+        return probe
+    return _mod_watcher_verdict(name, WORKSPACE_DIR / "tasks", WORKSPACE_DIR / "state")
+
+
+def _claude_standby_mode(target: dict) -> str:
+    """The launcher's choice for the core's supervisor: "alert" when the task-watch Mod hosts its watcher."""
+    env = _run_tmux(target["socket"], "show-environment", "-t", f"={target['session']}-watcher",
+                    "SUTANDO_STANDBY_MODE")
+    if env is None or env.returncode != 0:
+        return ""
+    return env.stdout.strip().partition("=")[2]
+
+
+def _mod_watcher_verdict(name: str, inbox: Path, state_dir: Path, role_present=None) -> dict:
+    """A Mod-hosted seat is covered only by a ready session watcher: its standby never types."""
+    role_present = role_present or watcher_identity.role_present
+    verdict = role_present("session", str(inbox), ready=True, state_dir=str(state_dir))
+    if verdict:
+        return {"name": name, "status": "ok",
+                "detail": "the task-watch Mod's session watcher holds the core's inbox; the standby is alert-only"}
+    why = ("the process table could not be read" if verdict is None
+           else "no ready session watcher holds its inbox")
+    return {"name": name, "status": "warn", "mod_watcher_absent": True,
+            "detail": (f"the core's watcher is hosted by the task-watch Mod, but {why}; "
+                       f"{_waiting_phrase(inbox)}, and the alert-only standby types nothing. "
+                       "Restarting the core session restarts the Mod's watcher")}
+
+
+def _waiting_phrase(inbox: Path) -> str:
+    """How many tasks wait in the core's inbox, counted by the queue's owner."""
+    import task_queue
+    try:
+        n = len(task_queue.pending_files(inbox.parent))
+    except Exception:  # noqa: BLE001 - an uncounted queue is said so, never read as zero
+        return "an unknown number of tasks are waiting"
+    return "1 task is waiting" if n == 1 else f"{n} tasks are waiting"
 
 
 def _process_alive(pid: int) -> bool:
@@ -11002,8 +11039,11 @@ def fix_claude_task_notifier() -> str:
     core_pid = heartbeat.get("pid")
     if not isinstance(core_pid, int) or isinstance(core_pid, bool) or not _process_alive(core_pid):
         return f"not repaired — the heartbeat's core process (pid {core_pid}) is not running"
-    if check_claude_task_notifier()["status"] == "ok":
+    current = check_claude_task_notifier()
+    if current["status"] == "ok":
         return "already healthy"
+    if current.get("mod_watcher_absent"):
+        return "not repaired — the supervisor is healthy; the missing watcher is the core session's own"
     launcher = REPO_DIR / "src" / "agent" / "start-cli.sh"
     if not launcher.is_file():
         return "not repaired — canonical launcher is missing"

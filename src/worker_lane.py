@@ -26,11 +26,17 @@ take it, the lane keeper does not start the worker's lane (`declared_bridge`, co
 Run as a script: `declare --worker <w>` writes the declaration sparrowd runs that worker's agent bridge
 from (`<workspace>/agents/<segment>.bridge/worker.json`), `withdraw --worker <w>` removes it, and
 `status --worker <w>` prints one JSON line: whether it is declared, which process holds the lane's lease
-(`held_by`: the declared bridge under sparrowd, another process, none) and each running sparrowd. Each
-takes `--workspace`.
+(`held_by`: the declared bridge under sparrowd, another process, none) and each running sparrowd.
+`migrate-dirs --worker <w>` shows what a switch would do; with `--apply` it switches the worker onto its
+own folders: it creates them, sets `dirs: "own"`,
+has the declared handler empty the worker's deliveries folder (its own lane's tasks move into its tasks
+folder, the core's are handed back) and moves its unclaimed live results; `--undo` switches it back and
+returns its live tasks and results to the shared folders. Both are idempotent. Each takes `--workspace`.
 """
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import re
 import subprocess
@@ -53,18 +59,34 @@ class RecordUnreadable(Exception):
     """The connection record could not be read: whether an agent is a worker's is unknown."""
 
 
-def route_argv(workspace, results_dir) -> "list[str]":
-    """The core's declared task-event handler (the pool router) as run from a worker's bridge, short of
-    the task's own paths; [] when none is declared (the core's watcher routes the bridge's tasks)."""
+def handler_lookup(workspace) -> "tuple[str, str]":
+    """(the core's declared task-event handler, ''); ('', '') when provably none is declared (no pin, no
+    config file); ('', why) when the lookup failed or a declared one is unusable."""
     from util_paths import task_event_handler_config_path
     cfg = task_event_handler_config_path(Path(workspace) / "state")
     try:
         out = subprocess.run(["bash", "-c", 'source "$1" && task_event_handler "$2"', "lane-route",
                               str(HANDLER_LOOKUP), str(cfg)], capture_output=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        return []
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return "", f"the task-event handler lookup failed ({e!r})"
     handler = os.fsdecode(out.stdout.removesuffix(b"\n"))
-    if out.returncode != 0 or not handler:
+    if out.returncode == 0 and handler:
+        return handler, ""
+    if os.environ.get("SUTANDO_TASK_EVENT_HANDLER") or cfg.exists():
+        return "", f"a task-event handler is declared but unusable (lookup exit {out.returncode})"
+    return "", ""
+
+
+def declared_handler(workspace) -> str:
+    """The core's declared task-event handler (the pool router); "" when none is declared or usable."""
+    return handler_lookup(workspace)[0]
+
+
+def route_argv(workspace, results_dir) -> "list[str]":
+    """The core's declared task-event handler (the pool router) as run from a worker's bridge, short of
+    the task's own paths; [] when none is declared (the core's watcher routes the bridge's tasks)."""
+    handler = declared_handler(workspace)
+    if not handler:
         return []
     return [handler, "--workspace", str(workspace), "--results-dir", str(results_dir), "--from-lane"]
 
@@ -465,18 +487,249 @@ def status(worker: str, workspace, procs=None) -> dict:
     return out
 
 
-def main(argv=None, workspace=None, vault=None, procs=None) -> int:
+# The declared handler empties the worker's deliveries folder under the router's locks.
+MIGRATE_TIMEOUT_S = 120
+
+
+def _move_live(src_dir, dst_dir, names, failed: "list[str]") -> "list[str]":
+    """Move each of `names` from `src_dir` to `dst_dir` without replacing a file; returns those moved. A
+    name taken at the destination, or already gone, is left; any other failure is added to `failed`."""
+    import undelivered_quarantine
+    moved = []
+    for name in names:
+        try:
+            Path(dst_dir).mkdir(parents=True, exist_ok=True)
+            undelivered_quarantine.rename_noreplace(Path(src_dir) / name, Path(dst_dir) / name)
+        except FileExistsError as e:
+            if undelivered_quarantine.no_primitive(e):
+                failed.append(f"{name}: no no-replace rename on this platform")
+            continue
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            failed.append(f"{name}: {type(e).__name__}: {e}")
+            continue
+        moved.append(name)
+    return moved
+
+
+def _failed(out: dict, failed: "list[str]") -> str:
+    if not failed:
+        return ""
+    out["move_failures"] = failed
+    return f"{len(failed)} file(s) could not be moved; re-run to finish"
+
+
+def _live_txt(folder) -> "list[str]":
+    try:
+        return sorted(p.name for p in Path(folder).glob("*.txt") if p.is_file())
+    except OSError:
+        return []
+
+
+# How long migrate-dirs waits for sparrowd to replace a declared bridge (its rescan plus restart backoff).
+RELAUNCH_WAIT_S = 180.0
+
+
+def relaunch_lane(worker: str, workspace, kill=None, procs=None, wait_s: "float | None" = None,
+                  sleep=None, clock=None, switch=None) -> "tuple[str, str]":
+    """Make the process serving `worker`'s lane pick up its folders anew; (what happens, '' or why not).
+    A declared bridge is restarted by sparrowd (the field is in its revision): this waits until its old
+    process no longer holds the lease. Any other holder is stopped, and the lane keeper starts it again.
+    `switch` (the field change) runs first under the record lock, which the keeper's starts take, so a
+    stopped lane cannot be started again before the field it must start on is written."""
+    from connections import _records_lock
+    with _records_lock(Path(workspace)):
+        if switch is not None:
+            switch()
+        kind, pid, why = _stop_unless_declared(worker, workspace, kill, procs)
+    if why or kind != "declared":
+        return kind, why
+    return _await_replacement(worker, workspace, pid, wait_s, sleep or time.sleep, clock or time.monotonic)
+
+
+def _stop_unless_declared(worker: str, workspace, kill, procs) -> "tuple[str, int, str]":
+    from connections import BridgeLeaseIndeterminate, BridgeStillRunning, _stop_row, bridge_pid, worker_identity
+    ws = Path(workspace)
+    row = worker_identity(worker, ws) or {}
+    instance = str(row.get("instance") or "")
+    try:
+        pid = bridge_pid(instance, ws) if instance else 0
+    except BridgeLeaseIndeterminate as e:
+        return "", 0, f"whether the lane runs cannot be told ({e}); re-run"
+    if not pid:
+        return "not-running", 0, ""
+    decl, _why = _declaration_for(worker, ws)
+    if decl and held_by(pid, processes() if procs is None else procs, decl["path"]) == "declared-bridge":
+        return "declared", pid, ""
+    try:
+        _stop_row(row, ws, kill)
+    except (BridgeStillRunning, BridgeLeaseIndeterminate) as e:
+        return "", pid, f"lane {instance} did not stop ({e}); re-run"
+    return f"stopped pid {pid}; the lane keeper starts it again", pid, ""
+
+
+def _await_replacement(worker: str, workspace, pid: int, wait_s, sleep, clock) -> "tuple[str, str]":
+    from connections import BridgeLeaseIndeterminate, bridge_pid, worker_identity
+    ws = Path(workspace)
+    instance = str((worker_identity(worker, ws) or {}).get("instance") or "")
+    deadline = clock() + (RELAUNCH_WAIT_S if wait_s is None else wait_s)
+    while True:
+        try:
+            now_pid = bridge_pid(instance, ws)
+        except BridgeLeaseIndeterminate:
+            now_pid = pid
+        if now_pid != pid:
+            return "restarted-by-sparrowd", ""
+        if clock() >= deadline:
+            return "", (f"pending: sparrowd has not replaced the declared bridge (pid {pid}) yet; nothing was "
+                        "moved, re-run once it has")
+        sleep(1.0)
+
+
+def migrate_dirs(worker: str, workspace, undo: bool = False, handler=None, run=subprocess.run,
+                 kill=None, procs=None) -> "tuple[dict, str]":
+    """Switch `worker` onto its own folders (or back, `undo`); (what was done, '' or why it stopped).
+    Idempotent: a re-run picks up whatever an interrupted one left."""
+    from connections import ConnectionsError, ensure_worker_dirs, set_worker_dirs, worker_identity, worker_root
+    ws = Path(workspace)
+    mxid = str((worker_identity(worker, ws) or {}).get("agent_mxid") or "").strip()
+    if not mxid:
+        return {"worker": worker}, f"worker {worker} has no agent identity row"
+    root = worker_root(mxid, ws)
+    tasks, results = root / "tasks", root / "results"
+    out = {"worker": worker, "tasks": str(tasks), "results": str(results), "undo": undo, "respawn_needed": True}
+    if undo:
+        out["lane"], why = relaunch_lane(worker, ws, kill, procs,
+                                         switch=lambda: set_worker_dirs(worker, False, workspace=ws))
+        if why:
+            return out, why
+        from delivery.task_dispatch import has_ready_result
+        failed: "list[str]" = []
+        moved = _move_live(tasks, ws / "tasks", [n for n in _live_txt(tasks) if not has_ready_result(results, n)],
+                           failed)
+        for name in moved:
+            with contextlib.suppress(OSError):
+                os.utime(ws / "tasks" / name)  # the core's watcher picks it up again
+        out.update(tasks_returned=moved, results_returned=_move_live(results, ws / "results", _live_txt(results), failed))
+        return out, _failed(out, failed)
+    # Nothing is committed until it is known who can move the worker's delivered work.
+    handler, problem = handler_lookup(ws) if handler is None else (handler, "")
+    if problem:
+        return out, f"{problem}; nothing was switched, re-run once it is fixed"
+    if not handler:
+        from delivery.task_dispatch import WorkerHoldUnreadable, owned_task_ids
+        try:
+            owed = owned_task_ids(ws / "deliveries", worker)
+        except WorkerHoldUnreadable as e:
+            return out, f"{e}; nothing was switched"
+        if owed:
+            return out, (f"{len(owed)} task(s) delivered to {worker} but no task-event handler can move them; "
+                         "nothing was switched")
+    def switch():
+        set_worker_dirs(worker, True, workspace=ws)
+        ensure_worker_dirs(worker, ws)
+    try:
+        out["lane"], why = relaunch_lane(worker, ws, kill, procs, switch=switch)
+    except (ConnectionsError, OSError) as e:
+        return out, str(e)
+    if why:
+        return out, why
+    if handler:
+        try:
+            done = run([handler, "--workspace", str(ws), "--migrate-dirs", "--worker", worker],
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=MIGRATE_TIMEOUT_S)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return out, f"the declared handler did not run ({e!r}); re-run to finish"
+        if done.returncode != 0:
+            return out, f"the declared handler refused (exit {done.returncode}: {done.stderr.strip()[-300:]}); re-run to finish"
+        try:
+            out["deliveries"] = json.loads(done.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            out["deliveries"] = done.stdout.strip()[-300:]
+    failed: "list[str]" = []
+    out["tasks_moved"] = _move_live(ws / "tasks", tasks, _queued_for(worker, ws), failed)
+    out["results_moved"] = adopt_stray_results(worker, ws, results, lease=False, failed=failed)
+    out["proactive_moved"] = adopt_stray_proactive(worker, ws / "results", results, lease=False, failed=failed)
+    return out, _failed(out, failed)
+
+
+def preview_migrate(worker: str, workspace, undo: bool = False, procs=None) -> "tuple[dict, str]":
+    """What `migrate_dirs` would do, writing nothing: the folders, the lane's holder and the files it would
+    move; ('', why) parts as `migrate_dirs` reports a refusal it can already see."""
+    from connections import BridgeLeaseIndeterminate, bridge_pid, task_home, worker_dirs, worker_identity, worker_root
+    from delivery.task_dispatch import WorkerHoldUnreadable, owned_task_ids
+    from proactive_routing import lane_claims_proactive
+    ws = Path(workspace)
+    row = worker_identity(worker, ws) or {}
+    mxid = str(row.get("agent_mxid") or "").strip()
+    if not mxid:
+        return {"worker": worker, "applied": False}, f"worker {worker} has no agent identity row"
+    root = worker_root(mxid, ws)
+    tasks, results = root / "tasks", root / "results"
+    out = {"worker": worker, "tasks": str(tasks), "results": str(results), "undo": undo, "applied": False,
+           "own_now": worker_dirs(worker, ws) is not None}
+    try:
+        pid = bridge_pid(str(row.get("instance") or ""), ws) if row.get("instance") else 0
+    except BridgeLeaseIndeterminate:
+        pid = -1
+    decl, _why = _declaration_for(worker, ws)
+    out["lane"] = ("unknown" if pid < 0 else "not-running" if not pid else
+                   held_by(pid, processes() if procs is None else procs, decl["path"]) if decl else "other")
+    if undo:
+        out.update(would_return_tasks=_live_txt(tasks), would_return_results=_live_txt(results))
+        return out, ""
+    handler, problem = handler_lookup(ws)
+    out["handler"] = handler or ""
+    try:
+        out["delivered"] = owned_task_ids(ws / "deliveries", worker)
+    except WorkerHoldUnreadable as e:
+        return out, str(e)
+    out["would_move_tasks"] = _queued_for(worker, ws)
+    out["would_move_results"] = [n for n in _live_txt(ws / "results") if
+                                 (task_home(Path(n).stem, ws)["worker"] == worker if n.startswith("task-")
+                                  else n.startswith("proactive-") and lane_claims_proactive(n, worker))]
+    if problem:
+        return out, f"{problem}; nothing would be switched"
+    if not handler and out["delivered"]:
+        return out, f"{len(out['delivered'])} task(s) delivered to {worker} but no task-event handler can move them"
+    return out, ""
+
+
+def _queued_for(worker: str, ws: Path) -> "list[str]":
+    """Live task files in the shared tasks/ that `worker`'s own lane queued and no delivery holds any
+    longer (one routed to it moved with its sentinel; one still held stays for a re-run)."""
+    from connections import task_home
+    from delivery.task_dispatch import WorkerHoldUnreadable, owned_task_ids
+    try:
+        held = set(owned_task_ids(ws / "deliveries", worker))
+    except WorkerHoldUnreadable:
+        return []
+    return [n for n in _live_txt(ws / "tasks")
+            if Path(n).stem not in held and task_home(Path(n).stem, ws)["worker"] == worker]
+
+
+def main(argv=None, workspace=None, vault=None, procs=None, run=subprocess.run) -> int:
     import argparse
-    import json
     p = argparse.ArgumentParser(prog="worker_lane.py", description="A pool worker's agent-bridge declaration.")
-    p.add_argument("action", choices=("declare", "withdraw", "status"))
+    p.add_argument("action", choices=("declare", "withdraw", "status", "migrate-dirs"))
     p.add_argument("--worker", required=True)
     p.add_argument("--workspace", type=Path, default=None)
+    p.add_argument("--undo", action="store_true", help="migrate-dirs: back onto the shared folders")
+    p.add_argument("--apply", action="store_true", help="migrate-dirs: do it (without, only show what it would do)")
     args = p.parse_args(argv)
     workspace = args.workspace or workspace
     if workspace is None:
         from workspace_default import resolve_workspace
         workspace = resolve_workspace()
+    if args.action == "migrate-dirs":
+        if args.apply:
+            out, why = migrate_dirs(args.worker, workspace, args.undo, run=run, procs=procs)
+            out["applied"] = True
+        else:
+            out, why = preview_migrate(args.worker, workspace, args.undo, procs=procs)
+        print(json.dumps(dict(out, ok=not why, **({"why": why} if why else {})), sort_keys=True))
+        return 1 if why else 0
     if args.action == "status":
         try:
             out = status(args.worker, workspace, procs)

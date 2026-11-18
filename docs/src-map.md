@@ -217,6 +217,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`result_publish.py`** — One publisher for every `results/` body: staged beside the target, fsynced, renamed whole.
 - **`result_ready.py`** — Alias of `delivery.readiness` (phase-1a restructure); one transition window.
 - **`result_router.py`** — Alias of `delivery.router` (phase-1a restructure); one transition window.
+- **`roster_membership.py`** — Which workers a pool roster counts as members: each key of its `workers` mapping whose row is not `state: "retired"` (a row that is not a mapping is a member).
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`runtime_observation.py`** — Runtime observations: one leased record per seat, written by whatever observes that seat's CLI.
 - **`safe_number.py`** — One reader for a number from untrusted JSON (a ledger, a record, a payload).
@@ -224,6 +225,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
 - **`screen-capture-server.py`** — Screen capture HTTP server — runs in a terminal (has Screen Recording permission on macOS; needs no special setup on Windows).
 - **`scroll-wheel.swift`** — scroll-wheel.swift — Send OS-level scroll wheel events to Chrome
+- **`seat_inbox.py`** — Which seat an inbox belongs to, judged from the inbox itself and the workspace's records.
 - **`secret_compare.py`** — Constant-time equality for a presented credential string against an expected one.
 - **`secret_scanner.py`** — Library-based secret detection for inbound bridge messages.
 - **`self_opened_gate.py`** — Attribution for a terminal dialog Sutando opened itself, and the one rule that may dismiss it.

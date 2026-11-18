@@ -195,6 +195,9 @@
     return Number.isFinite(t) ? t : Date.now();
   };
   const waiting = new Map();         // rowId -> {agent, at, key}
+  const stillWaiting = (row, wait) => row && row.cells.Status === 'Requested'
+    && Array.isArray(row.cells.Actor) && row.cells.Actor.length === 1
+    && row.cells.Actor[0] === wait.agent.userId;
   // A DM ask that was not sent, per row: retried with the SAME key, so it never asks twice.
   const unsent = new Map();          // rowId -> {agent, text, key, reason}
 
@@ -320,6 +323,9 @@
   const render = async (snap) => {
     const gen = ++generation;
     snapshot = snap;
+    for (const [rowId, wait] of waiting) {
+      if (!stillWaiting(snap && snap.rows.find((row) => row.id === rowId), wait)) waiting.delete(rowId);
+    }
     if (!snap) { clearNotes(); $('cols').textContent = ''; $('sub').textContent = ''; show('bad', 'The Task Board database was removed from this room.'); $('add').disabled = true; return; }
     let members = null;
     try { members = new Map((await art.members()).map((m) => [m.id, m])); } catch (e) { members = null; }
@@ -387,6 +393,8 @@
   // 'declined' a new key asks again.
   const tellInRoom = async (row, wait) => {
     if (busy) return;
+    row = snapshot && snapshot.rows.find((current) => current.id === row.id);
+    if (!row || waiting.get(row.id) !== wait || !stillWaiting(row, wait)) return;
     const title = String((titleProp && row.cells[titleProp]) || 'this task').slice(0, 200);
     const text = '<@' + wait.agent.id + '> please take "' + title + '" on the Task Board (row ' + row.id
       + '). Set its Status, Blocker and Result on the row as you work.';

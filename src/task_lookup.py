@@ -49,6 +49,12 @@ def find_other_archived_ready_result(workspace, task_id: str, *, reader=read_rea
                  if reader(p) is not None), None)
 
 
+def find_other_archived_result(workspace, task_id: str) -> Optional[Path]:
+    """Any existing result in the other home's archives only, ready or not."""
+    other = task_other_home(task_id, Path(workspace))
+    return next(ltp.iter_result_candidates(other["results"], task_id, include_live=False), None) if other else None
+
+
 def find_other_archived_task(workspace, task_id: str) -> Optional[Path]:
     """The task's file in the other home's archives only, for a caller that already searched the home."""
     other = task_other_home(task_id, Path(workspace))

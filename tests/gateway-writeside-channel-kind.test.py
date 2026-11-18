@@ -99,11 +99,6 @@ check("_TASK_FIELDS lists channel_kind right after room_member_count",
 check("_TASK_FIELDS places it below task", fields.index("channel_kind") > fields.index("task"))
 check("no special branch derives it", 'f == "channel_kind"' not in src)
 
-# 5. The reader side agrees: the picker treats the line as writer context.
-sys.path.insert(0, str(REPO / "skills/worker-pool/scripts"))
-import worker_picker_commands as wpc  # noqa: E402
-check("worker_picker_commands lists channel_kind as a below-task writer field", "channel_kind" in wpc._WRITER_BELOW_TASK)
-
 print()
 _t = _write(channel_kind="dm")
 check("the writer declares task_layout: mid above task:",

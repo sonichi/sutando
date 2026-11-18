@@ -148,6 +148,8 @@ ALLOWLIST = {
     # core_lineage never resolves the workspace — lineage_dir(workspace, host)
     # takes the root from the heartbeat, which owns the resolution.
     "src/core_lineage.py",
+    # roster_membership's "state" is a roster row's field name, not a path; it reads no file.
+    "src/roster_membership.py",
     # task_lookup never resolves the workspace: it takes it from its caller and the
     # folders from connections.task_home ("tasks"/"results" are that dict's keys).
     "src/task_lookup.py",

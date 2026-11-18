@@ -2227,6 +2227,33 @@ for (const tpl of ['task-board', 'research-desk']) {
   });
 }
 
+for (const actor of [[], ['@other:x']]) {
+  let t = Date.parse('2026-11-11T12:00:00Z');
+  const b = fakeMulti({ dbs: boardDbs(), primary: 'd1', agents: AGENTS, now: () => t });
+  const r = await run('task-board', { bridge: b });
+  r.byId.get('title').value = 'Check assignment';
+  r.byId.get('who').value = AGENTS[0].id;
+  r.byId.get('add').click();
+  await settle(40);
+  const snap = (Actor) => ({ id: 'd1', name: 'Task Board — Tasks', props: TASK_PROPS,
+    rows: [{ id: 'r1', cells: { Task: 'Check assignment', Status: 'Requested', Actor } }] });
+  t += 61000;
+  b.fire('d1', snap([AGENTS[0].userId]));
+  await settle(20);
+  const stale = r.byId.get('cols').buttons().find((x) => /Tell Desk Agent/.test(x.textContent));
+  b.fire('d1', snap(actor));
+  stale.click();
+  await settle(30);
+  check(`task-board/actor-${actor.length ? 'reassigned' : 'cleared'}-invalidates-reminder`, () => {
+    assert.ok(!/has not picked this up yet/.test(r.text()), r.text());
+    assert.ok(!b.calls.some((c) => c[0] === 'roomPost'));
+  });
+  b.fire('d1', snap([AGENTS[0].userId]));
+  await settle(20);
+  check(`task-board/actor-${actor.length ? 'reassigned' : 'cleared'}-does-not-revive-old-reminder`, () =>
+    assert.ok(!/has not picked this up yet/.test(r.text()), r.text()));
+}
+
 if (unhandled.length) {
   failures.push(`a page threw and left its promise unhandled (so a control may be stuck): ${[...new Set(unhandled)].join('; ')}`);
 }

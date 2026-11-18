@@ -34,7 +34,6 @@ import activity_bus  # noqa: E402
 import local_task_protocol as ltp  # noqa: E402
 
 import pool_roster as pr  # noqa: E402
-import worker_picker_commands as wpc  # noqa: E402
 
 import pool_router as rt  # noqa: E402
 import pool_advertise as pa
@@ -82,8 +81,8 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     admitted the task: reloaded, a binding removed in between sends the task
     to the core under an exit code that says a worker has it.
     """
-    # A picker command edits the bindings; routing it BY a binding would hand
-    # a bound room's unpin to the worker it unpins. The core is the controller.
+    # A picker button is the core's to answer; routing it BY a binding would hand
+    # it to the worker bound to the room it was pressed in.
 
     # Two writer generations: the lane-authority writer stamps wire_source,
     # the older one stamps source itself. Either mark means the same command.
@@ -139,30 +138,6 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     return 0, targets, roster
 
 
-def apply_picker(workspace, task_file, results_dir=None) -> "dict | None":
-    """A pin is live the moment it arrives: applied and published here, at the
-    edge, so the bridge ships the new binding without waiting for another
-    task. Runs on the probe as well: the watcher probes once and, on DECLINE,
-    hands the task straight to the core, so the probe is the only call a
-    picker task gets -- EXCEPT across a restart, where the startup sweep
-    re-probes every retained task, so the replay gate is what makes that safe.
-    Idempotent; a failure is reported, never fatal."""
-    try:
-        cmd = wpc.authorized_command(task_file, workspace)
-        out = wpc.apply(workspace, cmd, task_id=Path(task_file).stem,
-                        results_dir=results_dir) if cmd else None
-    except (pr.RosterError, OSError, ValueError) as e:
-        print(f"pool_route_handler: picker command not applied: {e}", file=sys.stderr)
-        return None
-    if out and out.get("action") == "skipped":
-        print(f"pool_route_handler: picker command for {out['room']} not replayed: "
-              f"{out['reason']}", file=sys.stderr)
-    elif out:
-        print(f"pool_route_handler: applied {out['action']} for {out['room']} "
-              f"(roster v{out['roster_version']}, advertisement written)", file=sys.stderr)
-    return out
-
-
 def attribute_only(workspace, task_id: str, worker: str) -> int:
     """0 once `task_id` is recorded as `worker`'s (now or before); 1 when it is not a worker id or another
     worker holds the record."""
@@ -180,13 +155,31 @@ def attribute_only(workspace, task_id: str, worker: str) -> int:
     return 1
 
 
+def migrate_dirs(workspace, worker: str) -> int:
+    """0 once `worker` (switched to its own folders) holds no owed sentinel but answered ones; prints
+    the outcome as one JSON line. 1 when it has no own folders or the folder cannot be read."""
+    import connections
+    import pool_delivery
+    own = connections.worker_dirs(worker, Path(workspace)) if workspace and worker else None
+    if own is None:
+        print(f"pool_route_handler: --migrate-dirs: worker {worker!r} has no own folders", file=sys.stderr)
+        return 1
+    try:
+        out = pool_delivery.migrate_to_own_dirs(
+            workspace, worker, own[0], lambda tid: connections.task_home(tid, Path(workspace))["worker"] == worker)
+    except (OSError, pr.RosterError, ValueError) as e:
+        print(f"pool_route_handler: --migrate-dirs: {e}", file=sys.stderr)
+        return 1
+    print(json.dumps(out, sort_keys=True))
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(add_help=False)
-    p.add_argument("--task-file", required=True)
+    p.add_argument("--task-file", default=None)
     p.add_argument("--workspace", default=None)
     p.add_argument("--probe", action="store_true")
-    # The watcher passes its RESOLVED results dir; the replay gate reads it, so
-    # it is a real argument here rather than one parsed and thrown away.
+    # The watcher and a lane still pass their results dir; nothing here reads it.
     p.add_argument("--results-dir", default=None)
     # A worker's own lane routing the task it queued: the same decision, but not the watcher's receipt.
     p.add_argument("--from-lane", action="store_true")
@@ -197,11 +190,17 @@ def main(argv=None) -> int:
     # A worker's own-dir lane: its folder is the inbox, so the task is only recorded as `--worker`'s.
     p.add_argument("--attribute-only", action="store_true")
     p.add_argument("--worker", default="")
+    # `worker_lane.py migrate-dirs`: move the worker's delivered work into its own tasks folder.
+    p.add_argument("--migrate-dirs", action="store_true")
     for ignored in ("--runtime", "--repo"):
         p.add_argument(ignored, default=None)
     args, _unknown = p.parse_known_args(argv)
 
     ws = args.workspace
+    if args.migrate_dirs:
+        return migrate_dirs(ws, args.worker)
+    if not args.task_file:
+        p.error("--task-file is required")
     if args.attribute_only:
         return attribute_only(ws, Path(args.task_file).stem, args.worker)
     # First, before anything can fail: the receipt is the only proof outside this
@@ -217,9 +216,6 @@ def main(argv=None) -> int:
         # an escape here routes a BOUND task to the unrestricted live core.
         print(f"pool_route_handler: advertisement not ensured: {e!r}", file=sys.stderr)
     task = read_task(args.task_file, args.payload)
-    # A picker command is the core's to apply, from the published file, never a lane's.
-    if PICKER_WIRE in (task.get("wire_source"), task.get("source")) and not (args.payload or args.renotify):
-        apply_picker(ws, args.task_file, args.results_dir)
     code, targets, roster = classify(ws, task)
     stem = Path(args.task_file).stem
     if code == 0 and task["id"] != stem:
