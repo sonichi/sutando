@@ -1211,6 +1211,24 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertIn("-e SUTANDO_STANDBY_MODE=type", watcher[0])
         self.assertNotIn("SUTANDO_STANDBY_MODE=alert", watcher[0])
 
+    def test_the_alert_only_knobs_are_inert_on_the_codex_standby(self):
+        # A Codex core is pinned to "type", which never reads the alert knobs (pile-up included):
+        # they are neither forwarded nor in the identity, so setting them replaces nothing.
+        knobs = {"SUTANDO_NOTIFIER_ALERT_PILEUP": "5", "SUTANDO_NOTIFIER_ALERT_REPEAT": "60",
+                 "SUTANDO_NOTIFIER_ALERT_GRACE": "7"}
+        result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "codex", **knobs})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        watcher = [l for l in self._tmux_calls().splitlines() if "new-session -d -s sutando-core-watcher" in l]
+        self.assertEqual(len(watcher), 1, self._tmux_calls())
+        self.assertIn("-e SUTANDO_STANDBY_MODE=type", watcher[0])
+        self.assertNotIn("SUTANDO_NOTIFIER_ALERT_", watcher[0])
+        self.log.unlink()
+        result = self.run_launcher(env_extra={
+            "TMUX_ACTIVE_RUNTIME": "codex", "TMUX_WATCHER_EXISTS": "1",
+            "TMUX_ACTIVE_NOTIFIER_VERSION": self._notifier_version(), **knobs})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("kill-session -t =sutando-core-watcher", self._tmux_calls())
+
     def test_a_watcher_from_before_the_mode_was_pinned_is_replaced(self):
         result = self.run_launcher(env_extra={
             "TMUX_ACTIVE_RUNTIME": "codex", "TMUX_WATCHER_EXISTS": "1",
