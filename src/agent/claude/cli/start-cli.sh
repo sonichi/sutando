@@ -65,6 +65,8 @@ NOTIFIER_SUPERVISOR="$REPO/src/agent/codex/cli/task-notifier-supervisor.sh"
 NOTIFIER_SCRIPT="$REPO/src/agent/claude/cli/task-notifier.sh"
 SURFACE_ARGS=(--remote-control "Sutando" --chrome)
 add_skill_claude_plugins
+# On unless SUTANDO_TASK_WATCH_MOD_CORE=0; the version floor and mod-ready keep the Monitor fallback.
+add_task_watch_mod "${SUTANDO_TASK_WATCH_MOD_CORE:-1}"
 # `/startup` is the CANONICAL CORE's ceremony: orphan recovery, session crons,
 # a gate any watcher satisfies. One arg — the skill reads it as $ARGUMENTS.
 BOOT_PROMPT="/startup"
@@ -127,6 +129,9 @@ restore_shutdown_sentinel() {
 }
 export SUTANDO_CORE_RUNTIME=claude
 ENV_ARGS=(-e SUTANDO_CORE_RUNTIME=claude -e SUTANDO_CORE_SESSION=1)
+# Always set, empty included, so a stale tmux server value cannot switch the watcher path.
+export SUTANDO_TASK_WATCH_MOD="$TASK_WATCH_MOD"
+ENV_ARGS+=(-e "SUTANDO_TASK_WATCH_MOD=$TASK_WATCH_MOD")
 [ -n "${SUTANDO_TMUX_SOCKET:-}" ] && ENV_ARGS+=(-e "SUTANDO_TMUX_SOCKET=$SUTANDO_TMUX_SOCKET")
 [ -n "${SUTANDO_TMUX_SESSION:-}" ] && ENV_ARGS+=(-e "SUTANDO_TMUX_SESSION=$SUTANDO_TMUX_SESSION")
 # Forward the embedder-provided default workspace into the core session for the
@@ -161,9 +166,14 @@ if [ "${1:-}" = "--print-core-env" ]; then
   exit 0
 fi
 
-# Registers the PERSONAL_CLAUDE.md compaction-reinject hook. Below the probe
-# exit: --print-core-env is a pure read and must not write settings.
+# Below the probe exit: --print-core-env is a pure read and must not write settings.
+repair_claude_hook_paths
+# Registers the PERSONAL_CLAUDE.md compaction-reinject hook.
 install_claude_personal_hook
+
+# Restore owned hooks before spawning; unattended launches omit the transcript archiver.
+SUTANDO_HOOKS_OMIT_TRANSCRIPT_ARCHIVE=1 bash "$REPO/src/install-claude-hooks.sh" \
+  || echo "start-cli: claude hooks install failed (rc=$?) — owned hooks may be absent this session" >&2
 
 # Optional working-directory override for the core `claude` process.
 #   - Unset (upstream default): no override — the core launches from $REPO (the
@@ -256,32 +266,40 @@ if [ -n "$RESTART_REQUESTED" ] && sutando_restart_guard_refuses "$CALLER_CORE_SE
   log_restart_attempt "$SUTANDO_RESTART_GUARD_REASON"
   exit 1
 fi
+_old_core_pids=""
+restart_core_alive() {
+  { claude_named_tmux_session_exists || claude_named_process_running; } && return 0
+  for _p in $_old_core_pids; do kill -0 "$_p" 2>/dev/null && return 0; done
+  return 1
+}
 if [ -n "$RESTART_REQUESTED" ]; then
   log_restart_attempt "begin (session=$(claude_named_tmux_session_exists && echo up || echo none) core=$(claude_named_process_running && echo up || echo none))"
   if claude_named_tmux_session_exists || claude_named_process_running; then
     echo "Killing existing $SESSION session..."
+    # Snapshot first: a resumed core is found through its pane, gone once the session is.
+    _old_core_pids="$(claude_named_pids)"
     tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
     tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
-    claude_named_pids | while read -r pid; do
-      [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    for pid in $_old_core_pids $(claude_named_pids); do
+      kill "$pid" 2>/dev/null || true
     done
     # The kill is already issued, so this wait can only be bounded, never
     # abandoned: a SessionEnd handoff takes longer than a few seconds.
     GRACE_S="${SUTANDO_RESTART_GRACE_S:-90}"
     _ticks=$(( GRACE_S * 5 ))
-    while [ "$_ticks" -gt 0 ] && { claude_named_tmux_session_exists || claude_named_process_running; }; do
+    while [ "$_ticks" -gt 0 ] && restart_core_alive; do
       sleep 0.2; _ticks=$(( _ticks - 1 ))
     done
-    if claude_named_tmux_session_exists || claude_named_process_running; then
+    if restart_core_alive; then
       if [ -n "$FORCE_RESTART" ]; then
         # force-restart: the core is wedged; escalate to SIGKILL, then poll ~3s.
         echo "  core still alive ${GRACE_S}s after SIGTERM — force-restart escalating to SIGKILL" >&2
         tmux -S "$TMUX_SOCKET" kill-session -t "$SESSION" 2>/dev/null || true
-        claude_named_pids | while read -r pid; do
-          [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
+        for pid in $_old_core_pids $(claude_named_pids); do
+          kill -9 "$pid" 2>/dev/null || true
         done
         for _ in $(seq 1 15); do
-          claude_named_tmux_session_exists || claude_named_process_running || break
+          restart_core_alive || break
           sleep 0.2
         done
       else
@@ -296,7 +314,7 @@ if [ -n "$RESTART_REQUESTED" ]; then
     fi
     # After force escalation, still alive → hard abort rather than stack a second
     # core on a survivor (double task-consumer) or exit-0 a half-torn-down state.
-    if claude_named_tmux_session_exists || claude_named_process_running; then
+    if restart_core_alive; then
       echo "  ⚠ $SESSION core did not die after SIGKILL — aborting force-restart." >&2
       echo "    Investigate the stuck pid; rerun once it's gone." >&2
       log_restart_attempt "abort: core survived SIGKILL"
@@ -370,11 +388,11 @@ resolve_core_target() {
   CORE_WINDOW="${CORE_WINDOW:-0}"
 }
 
-# Standby delivery path: pastes a queued task into the core pane only when the
-# pane is idle-ready and no result exists, so self-arm via Monitor stays primary.
-# Core-only: a pool worker never runs a standby/supervisor pairing (#4477/#4585).
+# The core's standby supervisor. With the task-watch Mod installed it only alerts (never types);
+# otherwise it pastes a queued task into the idle core pane while no session watcher holds the inbox.
 ensure_task_notifier() {
-  local expected_version active_version version_files notifier_py
+  local expected_version active_version version_files notifier_py standby_mode=type
+  [ "${TASK_WATCH_MOD:-}" = "1" ] && standby_mode=alert
   resolve_core_target
   # The launcher-resolved interpreter or nothing: a bare PATH python3 on a Mac
   # without the developer tools is the CLT stub, and the supervisor would run it every second.
@@ -396,7 +414,7 @@ ensure_task_notifier() {
   # operator pin (if one is already set) and nothing computed.
   # The target window is part of the identity: a heal that lands the core on a
   # new index must replace a watcher still aimed at the old one.
-  expected_version="$(cksum "${version_files[@]}" | cksum | awk '{print $1 "-" $2}')-w${CORE_WINDOW:-0}-p${CORE_PANE:-none}-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-y$(printf '%s' "$notifier_py" | cksum | awk '{print $1}')-s$(printf '%s' "${SUTANDO_STOP_INTERRUPT:-}" | cksum | awk '{print $1}')"
+  expected_version="$(cksum "${version_files[@]}" | cksum | awk '{print $1 "-" $2}')-w${CORE_WINDOW:-0}-p${CORE_PANE:-none}-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-y$(printf '%s' "$notifier_py" | cksum | awk '{print $1}')-s$(printf '%s' "${SUTANDO_STOP_INTERRUPT:-}" | cksum | awk '{print $1}')-m${standby_mode}-a${SUTANDO_NOTIFIER_ALERT_GRACE:-}-r${SUTANDO_NOTIFIER_ALERT_REPEAT:-}-u${SUTANDO_NOTIFIER_ALERT_PILEUP:-}"
   if watcher_session_exists; then
     active_version="$(
       tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \
@@ -414,6 +432,7 @@ ensure_task_notifier() {
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_SCRIPT=$NOTIFIER_SCRIPT")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_STANDBY_MODE=$standby_mode")
   [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
   [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
   [ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
@@ -423,6 +442,10 @@ ensure_task_notifier() {
   # runs, same forwarding pattern as every other var above.
   [ -n "${SUTANDO_NOTIFIER_GRACE_PERIOD:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_GRACE_PERIOD=$SUTANDO_NOTIFIER_GRACE_PERIOD")
   [ -n "${SUTANDO_NOTIFIER_ROLE_POLL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_ROLE_POLL=$SUTANDO_NOTIFIER_ROLE_POLL")
+  # The alert-only knobs, always set (empty means the supervisor's default) and in the version.
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_ALERT_GRACE=${SUTANDO_NOTIFIER_ALERT_GRACE:-}")
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_ALERT_REPEAT=${SUTANDO_NOTIFIER_ALERT_REPEAT:-}")
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_ALERT_PILEUP=${SUTANDO_NOTIFIER_ALERT_PILEUP:-}")
   # A required Team handler must reach the watcher, or its refusal (rc 4) is never seen.
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   # The stop handler reads it in the watcher's environment; it is in the version, so a change restarts it.
@@ -559,7 +582,12 @@ fi
 # provider limit is held until the reset or a backoff; any other death launches as before.
 if [ -n "$PY" ] && [ -f "$REPO/src/core_limit_hold.py" ]; then
   _hold_rc=0
-  _hold_line="$("$PY" "$REPO/src/core_limit_hold.py" gate --cwd "$(pwd -P)" --switch-entry "$REPO/scripts/switch-model.sh" 2>/dev/null)" || _hold_rc=$?
+  # The desktop host's card presenter, when this checkout runs under one; the gate names no host file.
+  _card_args=()
+  _app_dir="$(sutando_desktop_app_support "$REPO")"
+  [ -n "$_app_dir" ] && [ -f "$_app_dir/engine/local-card.py" ] && _card_args=(--card-entry "$_app_dir/engine/local-card.py")
+  _hold_line="$("$PY" "$REPO/src/core_limit_hold.py" gate --cwd "$(pwd -P)" --switch-entry "$REPO/scripts/switch-model.sh" \
+    ${_card_args[@]+"${_card_args[@]}"} 2>/dev/null)" || _hold_rc=$?
   if [ "$_hold_rc" = 75 ]; then
     echo "  ⏸ $SESSION not launched — ${_hold_line:-core paused: provider limit}" >&2
     [ -n "$RESTART_REQUESTED" ] && log_restart_attempt "held: ${_hold_line:-provider limit}"
@@ -586,7 +614,7 @@ if claude_named_tmux_session_exists; then
     tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
     exit 127
   fi
-  CORE_CMD=(claude --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
+  CORE_CMD=("${CLAUDE_BIN:-claude}" --name "$SESSION" ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"} --dangerously-skip-permissions --add-dir "$HOME" \
     ${SETTINGS_ARGS[@]+"${SETTINGS_ARGS[@]}"} ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} -- "$BOOT_PROMPT")
   # -P -F prints the index the window ACTUALLY landed on: when index 0 is
   # occupied (e.g. a sibling drifted there) the fallback creates the core at a

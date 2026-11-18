@@ -48,6 +48,24 @@ sed \
   -e 's/@@SUTANDO_PERSONAL_DOC@@/PERSONAL_CLAUDE.md/g' \
   "$src" > "$tmp"
 
+# A `<!-- codex-variant: NAME -->` ... `<!-- /codex-variant -->` block in CLAUDE.md is
+# Claude-only text: AGENTS.md gets scripts/agents-md/NAME.md verbatim in its place.
+variant_out="$(mktemp)"
+trap 'rm -f "$tmp" "$variant_out"' EXIT
+awk -v dir="$REPO_ROOT/scripts/agents-md" '
+  /^<!-- codex-variant: [a-z0-9-]+ -->$/ {
+    name = $3; f = dir "/" name ".md"; n = 0
+    while ((getline line < f) > 0) { print line; n++ }
+    close(f)
+    if (n == 0) { print "agents-md-sync: missing or empty " f > "/dev/stderr"; exit 2 }
+    skip = 1; next
+  }
+  /^<!-- \/codex-variant -->$/ { if (!skip) { print "agents-md-sync: unopened codex-variant end" > "/dev/stderr"; exit 2 }; skip = 0; next }
+  !skip { print }
+  END { if (skip) { print "agents-md-sync: unclosed codex-variant block" > "/dev/stderr"; exit 2 } }
+' "$tmp" > "$variant_out"
+mv "$variant_out" "$tmp"
+
 # Regression guard: verify expected markers are present in output.
 for marker in 'Codex' 'AGENTS.md'; do
   grep -qF "$marker" "$tmp" || {

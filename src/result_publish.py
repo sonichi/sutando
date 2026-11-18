@@ -11,8 +11,10 @@ only what to say and where. The staged name starts with a dot and ends in
 `.tmp`, so no drain's `*.txt` glob can match it, and it is unique per call so
 two publishers of one name never rename each other's bytes. Shell writers use
 the CLI: `python3 src/result_publish.py <path>` with the body on stdin.
-`--title`/`--outcome` publish the result's Activity labels first, bound to this body
+`--title`/`--outcome`/`--parent` publish the result's Activity labels first, bound to this body
 (`result_labels`); a `[no-send]` reason is the outcome when none is given.
+Publishing a task's live `results/` body clears that task's delegation marker
+(`task_delegation`), best effort: the hand-off it recorded has ended.
 
 The CLI refuses a `source: cron` task's result that names no destination and
 carries no skip marker: no bridge routes it, a `[channel:]` redirect included, so it would be archived unsent.
@@ -79,7 +81,28 @@ def publish_staged(tmp: str | Path, path: str | Path) -> Path:
             os.fsync(dfd)
         finally:
             os.close(dfd)
+    _clear_delegation(target)
     return target
+
+
+def _clear_delegation(target: Path) -> None:
+    """Drop the task's delegation marker once its live result exists; never fails the publish."""
+    if target.parent.name != "results":
+        return
+    if not target.name.endswith(".txt"):
+        return
+    # The exact id: a claim/assignment suffix is also legal inside a real id, so none is stripped.
+    task_id = target.name[:-len(".txt")]
+    try:
+        try:
+            from . import local_task_protocol, task_delegation
+        except ImportError:
+            import local_task_protocol
+            import task_delegation
+        if local_task_protocol.valid_archive_lookup_id(task_id):
+            task_delegation.clear(target.parent.parent, task_id)
+    except Exception:  # noqa: BLE001 — a stale marker only expires later; the result already stands
+        pass
 
 
 def publish_text(path: str | Path, text: str, mode: int = 0o666) -> Path:
@@ -103,6 +126,63 @@ def _helpers():
     return local_task_protocol, result_markers, task_archive, workspace_default
 
 
+def worker_published_path(path: str | Path, environ=None, workspace=None) -> Path:
+    """Where this session publishes `path`: a proactive file from a pool worker's session that acts as
+    its own agent carries the worker's stamp (`connections.session_proactive_name`), so only that
+    worker's lane delivers it. The core's session, a worker acting through the core, a copy of this
+    module without the engine's `connections`, and every task result publish under the name given.
+
+    A relative `path` is anchored to the workspace, never to the process's cwd: the session's cwd
+    is the repo, so a bare "results/..." would otherwise resolve wherever the caller happened to be
+    and land where no reader looks."""
+    path = Path(path)
+    if not path.is_absolute():
+        if workspace is not None:
+            ws = Path(workspace)
+        else:
+            try:
+                from . import workspace_default
+            except ImportError:
+                import workspace_default
+            ws = workspace_default.resolve_workspace(migrate=False)
+        path = (ws / path).resolve()
+    try:
+        import connections
+    except ImportError:
+        return path
+    named = path.with_name(connections.session_proactive_name(path.name, environ, workspace))
+    return _own_results_path(connections, named, environ, workspace)
+
+
+def _own_results_path(connections, path: Path, environ, workspace) -> Path:
+    """Where `path`, aimed at the shared results/ or the session's worker's own, is published. A task's
+    result goes to its task's current home (`connections.task_home`): a late answer to work handed back to
+    the core lands where the core reads it. A proactive file goes to the session's worker's own results/
+    when that worker's lane delivers it (`lane_claims_proactive`); any other target is unchanged."""
+    from proactive_routing import lane_claims_proactive
+    worker = connections.session_worker(environ)
+    own = connections.worker_dirs(worker, workspace) if worker else None
+    shared = connections.record_path(workspace).parent.parent / "results"
+    if path.parent.resolve() not in {d.resolve() for d in [shared] + ([own[1]] if own else [])}:
+        return path
+    if path.name.startswith("proactive-"):
+        dest = own[1] if own and lane_claims_proactive(path.name, worker) else shared
+    elif path.name.startswith("task-") and path.suffix == ".txt":
+        dest = connections.task_home(path.stem, workspace)["results"]
+    else:
+        dest = own[1] if own else path.parent
+    return path if dest.resolve() == path.parent.resolve() else dest / path.name
+
+
+def _task_home(task_id: str, workspace: Path) -> dict:
+    """The task's folders (`connections.task_home`); the shared ones in a copy without the engine's `connections`."""
+    try:
+        import connections
+    except ImportError:
+        return {"tasks": workspace / "tasks", "results": workspace / "results"}
+    return connections.task_home(task_id, workspace)
+
+
 def _unrouted_cron_task(path: str | Path) -> str | None:
     """The task id when `path` is the live result of a `source: cron` task naming no destination.
 
@@ -117,9 +197,10 @@ def _unrouted_cron_task(path: str | Path) -> str | None:
         return None
     try:
         workspace = wsd.resolve_workspace(migrate=False).resolve()
-        if target.parent != workspace / "results":
+        home = _task_home(task_id, workspace)
+        if target.parent not in (workspace / "results", home["results"].resolve()):
             return None
-        tasks_dir = workspace / "tasks"
+        tasks_dir = home["tasks"]
         task_file = (archive.find_task_file(tasks_dir, task_id)
                      or protocol.find_archived_task(tasks_dir, task_id))
         if task_file is None:
@@ -192,11 +273,11 @@ def _no_send_reason(text: str) -> str:
     return text[at + len("[no-send]"):] if at >= 0 else ""
 
 
-def result_labels_for(text: str, title=None, outcome=None) -> "tuple[dict, list]":
-    """(labels, notes) for a body: each flag fitted to its limit, with a note when cut; a
-    `[no-send]` body with no --outcome takes its reason as the outcome."""
+def result_labels_for(text: str, title=None, outcome=None, parent=None) -> "tuple[dict, list]":
+    """(labels, notes) for a body: each flag fitted to its limit, with a note when cut or not a
+    task id; a `[no-send]` body with no --outcome takes its reason as the outcome."""
     labels_mod = _labels_module()
-    labels, notes = labels_mod.check(title, outcome)
+    labels, notes = labels_mod.check(title, outcome, parent)
     if "outcome" not in labels and not labels_mod.clean(outcome):
         reason = labels_mod.fit(_no_send_reason(text), labels_mod.OUTCOME_MAX)
         if reason:
@@ -204,18 +285,19 @@ def result_labels_for(text: str, title=None, outcome=None) -> "tuple[dict, list]
     return labels, notes
 
 
-_USAGE = ("usage: result_publish.py [--allow-undeliverable] [--title TEXT] [--outcome TEXT] <path>"
+_USAGE = ("usage: result_publish.py [--allow-undeliverable] [--title TEXT] [--outcome TEXT]"
+          " [--parent TASK_ID] <path>"
           "   (body on stdin)")
 
 
 def _parse(args: list[str]):
-    """(path, allow, title, outcome), or None for a malformed command line."""
+    """(path, allow, title, outcome, parent), or None for a malformed command line."""
     allow, flags, paths = False, {}, []
     it = iter(args)
     for a in it:
         if a == "--allow-undeliverable":
             allow = True
-        elif a in ("--title", "--outcome"):
+        elif a in ("--title", "--outcome", "--parent"):
             value = next(it, None)
             if value is None or a in flags:
                 return None
@@ -226,7 +308,7 @@ def _parse(args: list[str]):
             paths.append(a)
     if len(paths) != 1:
         return None
-    return paths[0], allow, flags.get("--title"), flags.get("--outcome")
+    return paths[0], allow, flags.get("--title"), flags.get("--outcome"), flags.get("--parent")
 
 
 def main(argv: list[str]) -> int:
@@ -234,7 +316,15 @@ def main(argv: list[str]) -> int:
     if parsed is None:
         print(_USAGE, file=sys.stderr)
         return 2
-    path, allow, title, outcome = parsed
+    path, allow, title, outcome, parent = parsed
+    stamped = worker_published_path(path)
+    if stamped.name != Path(path).name:
+        print(f"result_publish: publishing {Path(path).name} as {stamped.name}: a pool worker's "
+              "proactive file carries its worker's stamp, so its own lane delivers it", file=sys.stderr)
+    if stamped.parent != Path(path).parent:
+        print(f"result_publish: publishing into {stamped.parent}: the results folder of its task's home or of "
+              "this pool worker, whose lane delivers it", file=sys.stderr)
+    path = str(stamped)
     text = sys.stdin.read()
     reason = None if allow else undeliverable_reason(path, text)
     if reason:
@@ -255,18 +345,18 @@ def main(argv: list[str]) -> int:
         labels_mod = _labels_module()
     except ImportError:
         # Labels are optional: a copy without its label writer still publishes the result.
-        if title is not None or outcome is not None:
+        if title is not None or outcome is not None or parent is not None:
             print("result_publish: warning: no result_labels module; published without "
-                  "--title/--outcome", file=sys.stderr)
+                  "--title/--outcome/--parent", file=sys.stderr)
         publish_text(path, text)
         return 0
-    labels, notes = result_labels_for(text, title, outcome)
+    labels, notes = result_labels_for(text, title, outcome, parent)
     for note in notes:
         print(f"result_publish: warning: {note}", file=sys.stderr)
     try:
         labels_mod.write(Path(path), labels, text)
     except Exception as exc:  # noqa: BLE001 — labels are optional; the result never waits on them
-        print(f"result_publish: warning: published without --title/--outcome: {exc}",
+        print(f"result_publish: warning: published without --title/--outcome/--parent: {exc}",
               file=sys.stderr)
     publish_text(path, text)
     return 0

@@ -24,9 +24,9 @@ list (feature-list.json: ten steps for every core; a step naming a `runtime` sho
 core, `--core auto` asks the engine's config resolver, unknown omits such steps).
 `--list` renders from another list instead, a file or an https URL (the backend's served list,
 once it exists); a list that cannot be read or does not validate is reported on stderr and the
-skill's own file is used. Nothing is fetched unless --list names a URL. `--name auto` uses this
-agent's Matrix profile displayname, else a name made from its mxid's localpart, else "Sutando";
-it never fails.
+skill's own file is used. Nothing is fetched unless --list names a URL. `--name auto` uses the
+name every self-introduction uses (src/agent_display_name.py: the agent's s.space display name
+first, never a persona name); it never fails.
 
 Each screenshot in the list is an asset reference. Before writing the page, `publish` uploads each
 screenshot's full-resolution `hd_file` to the room's media (room.media.upload, unposted, with an
@@ -101,6 +101,8 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "src"))
+import agent_display_name  # noqa: E402
+from agent_display_name import FALLBACK_NAME, MXID, agent_mxid, localpart_name  # noqa: E402,F401
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import tour_page  # noqa: E402,F401
@@ -111,7 +113,6 @@ from tour_page import (  # noqa: E402,F401  (the page lives in tour_page; these 
 )
 
 SUMMON_CONTEXT = "A short tour of s.space, with one thing to try in each part."
-PROFILE_TIMEOUT = 5
 CREATE_ACTION = "room.commons.pages.create"
 SECRET_NAME = re.compile(r"TOKEN|SECRET|PASSWORD|KEY", re.I)
 SECRET_SHAPE = re.compile(r"(\bBearer\s+)\S+|\bhttps?://\S+\|\S+", re.I)
@@ -127,8 +128,6 @@ ARGV_FROM_FILE = ("import json, os, runpy, sys\n"
 CALL_BYTES = 1_048_576  # what one call may carry: well above the page cap, so a page is one replace
 USER_AGENT = "sutando-tutorial/1"
 LIST_TIMEOUT = 10
-FALLBACK_NAME = "Sutando"
-MXID = re.compile(r"^@([^:\s]+):([A-Za-z0-9.\-]+(?::\d+)?)$")
 ROOM_ID = re.compile(r"^![A-Za-z0-9._=/+\-]+:[A-Za-z0-9.\-]+(?::\d+)?$")
 ID_MAX = 255
 ROLES_MAX = 500
@@ -201,41 +200,7 @@ def commons_env(script: Path, environ: Optional[Mapping[str, str]] = None,
     return env
 
 
-def localpart_name(mxid: str) -> str:
-    """A readable name from an mxid's localpart: `@chi-air-blue.agent:x` -> `Chi Air Blue`."""
-    m = MXID.match(mxid or "")
-    local = re.sub(r"\.agent$", "", m.group(1)) if m else ""
-    words = [w for w in re.split(r"[-._=/]+", local) if w]
-    return " ".join(w[:1].upper() + w[1:] for w in words)[:NAME_MAX]
-
-
-def _https_get(url: str) -> bytes:
-    # The homeserver's edge refuses urllib's default User-Agent with a 403.
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=PROFILE_TIMEOUT) as resp:
-        return resp.read(65536)
-
-
-def profile_name(mxid: str, fetch: Optional[Callable[[str], bytes]] = None) -> str:
-    """The mxid's Matrix profile displayname from its homeserver; '' on any failure."""
-    m = MXID.match(mxid or "")
-    if not m:
-        return ""
-    fetch = fetch or _https_get
-    server = m.group(2)
-    base = f"https://{server}"
-    with contextlib.suppress(Exception):
-        known = json.loads(fetch(f"https://{server}/.well-known/matrix/client"))
-        url = str(known["m.homeserver"]["base_url"])
-        if url.startswith("https://"):
-            base = url
-    try:
-        got = json.loads(fetch(f"{base.rstrip('/')}/_matrix/client/v3/profile/"
-                               f"{urllib.parse.quote(mxid, safe='')}/displayname"))
-    except Exception:  # noqa: BLE001
-        return ""
-    name = got.get("displayname") if isinstance(got, dict) else None
-    return " ".join(name.split())[:NAME_MAX] if isinstance(name, str) else ""
+_https_get = agent_display_name.https_get
 
 
 def room_agent_mxid(room: Optional[str]) -> Optional[str]:
@@ -245,30 +210,13 @@ def room_agent_mxid(room: Optional[str]) -> Optional[str]:
     return routed(room)
 
 
-def agent_mxid(environ: Optional[Mapping[str, str]] = None) -> str:
-    """This agent's mxid: $AGENT_MXID, else the AG2 Space channel env file the room tooling
-    resolves, else the launcher-named device file or channels/ag2space/.env read directly (a file
-    that holds the identity but no usable token); '' when none names one."""
-    from channel_credentials import channel_value
-    from channel_token import token_from_env_file
-    from util_paths import claude_home_path
-    env = os.environ if environ is None else environ
-    found = channel_value("AGENT_MXID", env)
-    if found:
-        return found
-    files = [Path(p) for p in ((env.get("AG2_DEVICE_ENV") or "").strip(),) if p]
-    with contextlib.suppress(Exception):
-        files.append(claude_home_path("channels") / "ag2space" / ".env")
-    return next((v for v in (token_from_env_file("AGENT_MXID", f) for f in files if f.is_file()) if v), "")
-
-
 def resolve_name(name: str, mxid: Optional[str] = None,
                  fetch: Optional[Callable[[str], bytes]] = None) -> str:
-    """`name` itself, or for `auto`: the profile displayname, else the localpart, else Sutando."""
+    """`name` itself, or for `auto` the name agent_display_name.resolve gives this agent."""
     if name != "auto":
         return name
     mxid = mxid if mxid is not None else agent_mxid()  # callers that resolved the identity pass it
-    return profile_name(mxid, fetch) or localpart_name(mxid) or FALLBACK_NAME
+    return agent_display_name.resolve(mxid or "", fetch=fetch or _https_get)[0]
 
 
 def chunks(text: str, limit: int = 0) -> List[str]:

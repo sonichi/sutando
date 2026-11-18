@@ -162,7 +162,8 @@ def _is_discord_channel_id(value: str) -> bool:
 from result_markers import parse_markers, has_skip_action  # noqa: E402
 import mention_gate  # noqa: E402  — owner @-mention ingestion gate (skills/mention-gate)
 from policy.guardrail import engage_rulebook, DISCORD_PROVENANCE  # noqa: E402
-from policy.egress.result import guard_result_for_tier, resolve_route_tier  # noqa: E402
+from policy.egress.result import (attachment_notice_name, guard_proactive_for_destination,  # noqa: E402
+                                  guard_result_for_tier, resolve_route_tier)
 
 from delivery.readiness import read_ready_result  # noqa: E402
 from result_publish import publish_text  # noqa: E402
@@ -929,6 +930,18 @@ def load_tier_map() -> dict:
         return tier_map if isinstance(tier_map, dict) else {}
     except Exception:
         return {}
+
+
+def _redirect_destination_tier(channel, owner_dm_id) -> str:
+    """The audience tier of a `[channel:]` redirect target: the owner's DM is owner, another DM is
+    its recipient's tierMap tier, and anything else (or an unmapped recipient) is guest."""
+    if getattr(channel, "id", None) == owner_dm_id:
+        return "owner"
+    recipient = getattr(channel, "recipient", None)
+    if recipient is None:
+        return "guest"
+    tier = load_tier_map().get(str(getattr(recipient, "id", "")))
+    return local_task_protocol.canonical_access_tier(tier) if tier else "guest"
 
 
 def ensure_tier_map_seeded() -> bool:
@@ -5678,6 +5691,13 @@ async def poll_proactive():
                                     flush=True,
                                 )
                             if _target_ch is not None and hasattr(_target_ch, 'send'):
+                                _dest_tier = _redirect_destination_tier(_target_ch, dm.id)
+                                _safe, _withheld = guard_proactive_for_destination(
+                                    text, str(_target_id), str(dm.id), _dest_tier, REPO)
+                                if _withheld:
+                                    print(f"  [team-guard] withheld proactive {f.name} for "
+                                          f"{_target_id} (tier={_dest_tier}): {_withheld}", flush=True)
+                                    _redirect_text, files = _safe, []
                                 try:
                                     if _redirect_text:
                                         await asyncio.to_thread(
@@ -5709,7 +5729,8 @@ async def poll_proactive():
                                         elif _outcome == _ATTACH_REFUSED:
                                             # Authorization denial, not absence: silence
                                             # here reads as a successful attach.
-                                            await _target_ch.send(f"(file not allowed: {fpath})")
+                                            await _target_ch.send(
+                                                f"(file not allowed: {attachment_notice_name(fpath, _dest_tier)})")
                                             print(
                                                 f"  [proactive channel-redirect] REJECTED file "
                                                 f"(not in allowlist): {fpath}",
@@ -6052,6 +6073,13 @@ async def poll_dm_fallback():
                             # File markers (parity with poll_results 2761-2784).
                             text_only = clean_body  # _parsed_fb.body already stripped
                             file_list = [a.value for a in _parsed_fb.actions if a.kind == "attach"]
+                            _fb_tier = _redirect_destination_tier(target_channel, None)
+                            _fb_safe, _fb_withheld = guard_proactive_for_destination(
+                                _peek, str(target_channel_id), None, _fb_tier, REPO)
+                            if _fb_withheld:
+                                print(f"  [team-guard] withheld {f.name} for {target_channel_id} "
+                                      f"(tier={_fb_tier}): {_fb_withheld}", flush=True)
+                                text_only, file_list = _fb_safe, []
                             if text_only:
                                 for chunk in _chunk_for_discord(text_only):
                                     await target_channel.send(chunk)
@@ -6083,7 +6111,8 @@ async def poll_dm_fallback():
                                     print("  [dm-fallback channel-redirect] file marker with "
                                           "EMPTY path — malformed, surfaced", flush=True)
                                 elif _outcome == _ATTACH_REFUSED:
-                                    await target_channel.send(f"(file not allowed: {fpath})")
+                                    await target_channel.send("(file not allowed: "
+                                        f"{attachment_notice_name(fpath, _fb_tier)})")
                                     print(f"  [dm-fallback channel-redirect] REJECTED file (not in allowlist): {fpath}", flush=True)
                             print(f"  [dm-fallback channel-redirect] sent {f.name} to channel {target_channel_id}", flush=True)
                             _task_file = TASKS_DIR / f"{_task_id}.txt"

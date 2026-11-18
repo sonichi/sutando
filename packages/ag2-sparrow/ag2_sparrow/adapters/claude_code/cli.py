@@ -103,6 +103,36 @@ def mint_session_id() -> str:
     return str(uuid.uuid4())
 
 
+def resume_session_arg(args) -> str:
+    """--resume-session as recorded: the id lower-cased, '' when not given."""
+    return (getattr(args, "resume_session", None) or "").strip().lower()
+
+
+def resume_problem(claude_config_dir: str, session_id: str, kept: str = "") -> str:
+    """'' when `session_id` is an existing conversation the session can resume, else why not: a
+    well-formed id, its transcript in the config dir's projects tree, and no other process holding it
+    open (`kept`, the job's own recorded id, is the connector's session and is stopped by install)."""
+    if not SESSION_ID_RE.match(session_id):
+        return f"--resume-session {session_id!r} is not a Claude Code session id (a lower-case UUID)"
+    home = hold.claude_home(claude_config_dir)
+    if not hold.transcript_exists(claude_config_dir, session_id):
+        return (f"no conversation {session_id} under {os.path.join(home, 'projects')} (no {session_id}.jsonl in any "
+                "project folder); pass the --claude-config-dir that conversation was made in")
+    pid = None if session_id == kept else hold.live_session_pid(claude_config_dir, session_id)
+    if pid:
+        return (f"conversation {session_id} is open in a running Claude Code process (pid {pid}); exit it first, "
+                "so the two never write the same transcript")
+    return ""
+
+
+def kept_session_id(local: Shape) -> str:
+    """The session id the job's current config records, '' when there is none to read."""
+    try:
+        return cm.read_config(config_path(local)).get("SESSION_ID", "") if config_path(local).is_file() else ""
+    except (OSError, ValueError):
+        return ""
+
+
 # ── the agent and its bridge: connect_bridge's, as one owner ─────────────────
 
 def bridge_fix(cfg: dict, bridge: Shape = BRIDGE) -> str:
@@ -174,9 +204,31 @@ RECORDED = (("CLAUDE", "claude", str), ("PLUGIN_DIR", "plugin_dir", lambda v: v 
             (inbox.ALLOW_COLLABORATOR, "allow_collaborator", lambda v: v == "1"))
 
 
+# Install and connect ran, but a kept session id stayed instead of --resume-session's.
+EXIT_RESUME_NOT_APPLIED = 79
+_UNAPPLIED: list = []      # (requested id, kept id, stop command), reset per top-level command
+
+
+def resume_outcome(rc: int) -> int:
+    """`rc`, or EXIT_RESUME_NOT_APPLIED once everything else succeeded: decided only after the agent
+    lock is released, so the job and its bridge stay as installed."""
+    if rc != 0 or not _UNAPPLIED:
+        return rc
+    resume, kept, stop_cmd = _UNAPPLIED[-1]
+    print(f"error: --resume-session {resume} was not applied: the old session is not proven gone, so the agent runs "
+          f"under its kept session id {kept} (installed and running); stop the job ({stop_cmd}), then install "
+          "again", file=sys.stderr)
+    return EXIT_RESUME_NOT_APPLIED
+
+
 def install(args) -> int:
+    _UNAPPLIED.clear()
+    return resume_outcome(_install(args))
+
+
+def _install(args) -> int:
     if getattr(args, "token_stdin", False):
-        return cb.install_token_stdin(args, LOCAL, lambda: connect_preflight(args, login=False), install, COMMAND,
+        return cb.install_token_stdin(args, LOCAL, lambda: connect_preflight(args, login=False), _install, COMMAND,
                                       work=None, inbox=None, bridge_state_dir=None)
     problem = cb.recorded_install_args(args, LOCAL, RECORDED)
     if problem:
@@ -236,23 +288,39 @@ def install(args) -> int:
               "TOKEN_ENV_FILE": where["token_file"],
               "TOKEN_VAULT_KEY": vault_key(segment) if mode not in (UNIT, EXTERNAL) and not where["token_file"] else "",
               "BRIDGE_STATE_DIR": str(state), "TMUX": tmux}
+    resume = resume_session_arg(args)
+    problem = resume_problem(values["CLAUDE_CONFIG_DIR"], resume, kept_session_id(local)) if resume else ""
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+
+    def live_server() -> "int | None":
+        """The recorded tmux server's pid while it is not proven gone, else None."""
+        gen = records.load_supervisor(root).get("generation")
+        return gen["server_pid"] if gen and task_io.verify_lineage(gen["server_pid"], gen["server_start"]) is not False \
+            else None
 
     def revise(old: dict, values: dict) -> dict:
         """The session id: kept from the old config; minted when there is none; rotated by
-        --new-session only once the old generation is proven gone (the job stopped, the root free
-        and the recorded server dead), else kept, and the command says so."""
+        --new-session, or replaced by --resume-session's, only once the old generation is proven gone
+        (the job stopped, the root free and the recorded server dead), else kept, and the command says so."""
         kept = (old or {}).get("SESSION_ID") or ""
         if kept and not SESSION_ID_RE.match(kept):
             print(f"the recorded session id {kept!r} is malformed (the launcher refuses it): minting a new one")
             kept = ""
-        if kept and args.new_session:
-            rec = records.load_supervisor(root)
-            gen = rec.get("generation")
-            if gen and task_io.verify_lineage(gen["server_pid"], gen["server_start"]) is not False:
-                print(f"kept the session id {kept}: the old session (tmux server pid {gen['server_pid']}) is not proven gone")
+        if kept and (args.new_session or resume) and kept != resume:
+            server = live_server()
+            if server:
+                print(f"kept the session id {kept}: the old session (tmux server pid {server}) is not proven gone")
+                if resume:
+                    _UNAPPLIED.append((resume, kept, cm.stop_command(local)))
             else:
                 kept = ""
-                print("rotating the session id: the old generation is proven gone")
+                if not resume:
+                    print("rotating the session id: the old generation is proven gone")
+        if not kept and resume:
+            kept = resume
+            print(f"resuming the existing conversation {resume}")
         session_id = kept or mint_session_id()
         return dict(values, SESSION_ID=session_id)
     def installed() -> int:
@@ -304,14 +372,17 @@ def connect_preflight(args, login: bool = True) -> str:
     config_dir_ = str(Path(args.claude_config_dir).expanduser().resolve()) if args.claude_config_dir else ""
     login_cfg = {"CLAUDE": os.path.abspath(claude), "CLAUDE_CONFIG_DIR": config_dir_}
     local = cm.agent_job(LOCAL, args.agent)[0] or LOCAL     # redeem_into_seat checked the id and the job
+    resume = resume_session_arg(args)
     return (version_problem(claude) or resolve_tmux(args, local)[1] or launcher.socket_problem(config_dir(local))
-            or (auth_problem(login_cfg) if login else "") or hmac_settings(args)[2])
+            or (auth_problem(login_cfg) if login else "") or hmac_settings(args)[2]
+            or (resume_problem(config_dir_, resume, kept_session_id(local)) if resume else ""))
 
 
 def connect(args) -> int:
     """Preflight, redeem the code into the agent's seat beside its root (connect_bridge's), then install
     exactly as `install` does with the seat's .env as the token env file, all inside the agent's fence."""
-    return cb.fenced(args.agent, lambda: _connect(args))
+    _UNAPPLIED.clear()
+    return resume_outcome(cb.fenced(args.agent, lambda: _connect(args)))
 
 
 def _connect(args) -> int:
@@ -324,7 +395,7 @@ def _connect(args) -> int:
 
     def installed() -> int:
         print(cm.served_setup_line(SETUP_VENDOR))
-        return install(argparse.Namespace(**session, work=None, inbox=None, token_env_file=seat["seat_env"],
+        return _install(argparse.Namespace(**session, work=None, inbox=None, token_env_file=seat["seat_env"],
                                           bridge_state_dir=None, root_identity=seat["root_id"]))
     return cb.finish_connect(seat, installed, COMMAND, cb.session_flags(args))
 
@@ -626,8 +697,12 @@ def session_options(p) -> None:
     p.add_argument("--permission-mode", default="bypassPermissions",
                    help="the session's --permission-mode; bypassPermissions (default) suits an unattended "
                         "session, a narrower mode makes a prompting tool stall the queue")
-    p.add_argument("--new-session", action="store_true", help="rotate the session id, only once the old session "
-                   "is proven gone (quiescent); else the old id is kept and said so")
+    ses = p.add_mutually_exclusive_group()
+    ses.add_argument("--new-session", action="store_true", help="rotate the session id, only once the old session "
+                     "is proven gone (quiescent); else the old id is kept and said so")
+    ses.add_argument("--resume-session", metavar="UUID", help="host this existing Claude Code conversation (its "
+                     "transcript must be under the config dir's projects/, and no other process may have it open) "
+                     "instead of a new one; replaces a kept id only once the old session is proven gone")
     p.add_argument("--claude", default="claude", help="the claude executable (default: claude on PATH)")
     p.add_argument("--tmux", help="the tmux executable, 3.2 or newer, recorded for every later command (default: the "
                    "recorded one, else PATH, the desktop app's engine/bin, %s)" % ", ".join(launcher.TMUX_DIRS))

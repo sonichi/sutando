@@ -805,7 +805,8 @@ class EdgeTest(unittest.TestCase):
 
         with mock.patch.object(gs.urllib.request, "urlopen", urlopen):
             self.assertEqual(gs._https_get("https://example.test/x"), b'{"displayname": "X"}')
-        self.assertEqual(seen, {"ua": gs.USER_AGENT, "timeout": gs.PROFILE_TIMEOUT, "n": 65536})
+        self.assertEqual(seen, {"ua": gs.agent_display_name.USER_AGENT,
+                                "timeout": gs.agent_display_name.PROFILE_TIMEOUT, "n": 65536})
 
     def test_marker_whose_rooms_is_not_a_map_reads_empty(self):
         with tempfile.TemporaryDirectory() as tmp:

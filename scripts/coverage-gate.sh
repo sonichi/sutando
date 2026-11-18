@@ -238,26 +238,30 @@ else
     verdict="❌ **Diff coverage BELOW the ${FAIL_UNDER}% bar** — uncovered changed lines listed below. Whole-tree (informational): **${total}%**."
 fi
 
-# diff-cover reports only on files IN coverage.xml, so a changed file outside
-# `[run] source` is neither covered nor uncovered — the gate passes without
-# having looked at it. Report, never fail: this names the silence, it does not
-# move the bar.
+# JSON retains each file's source root; XML class filenames can alias paths.
+# This diagnostic is advisory and must not change diff-cover's verdict.
 report="diff-cover.md"
-if unmeasured="$(python3 scripts/coverage_unmeasured.py "$BASE" coverage.xml)" \
+if ! python3 -m coverage json --quiet -o coverage.json; then
+    echo "coverage-gate: unmeasured-file diagnostic unavailable (JSON report failed)." >&2
+elif unmeasured="$(python3 scripts/coverage_unmeasured.py "$BASE" coverage.json)" \
    && [ -n "$unmeasured" ]; then
     echo
-    echo "coverage-gate: NOT MEASURED — changed, but absent from coverage.xml:"
-    printf '  %s\n' $unmeasured
+    echo "coverage-gate: NOT MEASURED — changed, but absent from coverage.json:"
+    while IFS= read -r path; do
+        printf '  %s\n' "$path"
+    done <<< "$unmeasured"
     echo "coverage-gate: their changed lines are outside the bar, not inside and clean."
     {
         cat diff-cover.md
         echo
         echo "### ⚠️ Not measured"
         echo
-        echo "Changed, but absent from \`coverage.xml\` — outside \`[run] source\` in"
-        echo "\`.coveragerc\`, so **diff-cover never examined these lines**:"
+        echo "Changed, but absent from \`coverage.json\` — coverage did not include"
+        echo "these files in its report, so **their changed lines were not examined**:"
         echo
-        printf -- '-   `%s`\n' $unmeasured
+        while IFS= read -r path; do
+            printf -- '-   `%s`\n' "$path"
+        done <<< "$unmeasured"
     } > coverage-gate-report.md
     report="coverage-gate-report.md"
 fi

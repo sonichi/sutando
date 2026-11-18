@@ -151,6 +151,95 @@ class PublisherContract(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
 
 
+class RelativePathAnchoring(unittest.TestCase):
+    """A relative "results/..." is anchored to the workspace, never to the process's cwd — the
+    session's cwd is the repo, so a path resolved against it lands where no reader looks.
+    Run against src and the vendored ag2-sparrow copy: the bridge imports the latter."""
+
+    MODULES = (result_publish, _load_vendored())
+
+    def test_a_relative_path_resolves_against_the_given_workspace(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                ws = (Path(td) / "ws").resolve()
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)  # a repo-root-shaped cwd that is NOT the workspace
+                    self.assertEqual(
+                        mod.worker_published_path(Path("results") / "task-1.txt", {}, ws),
+                        ws / "results" / "task-1.txt")
+                finally:
+                    os.chdir(cwd)
+
+    def test_a_relative_path_with_no_workspace_given_resolves_the_real_one(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                ws = (Path(td) / "ws").resolve()
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)
+                    with mock.patch("workspace_default.resolve_workspace", return_value=ws):
+                        self.assertEqual(
+                            mod.worker_published_path(Path("results") / "task-1.txt"),
+                            ws / "results" / "task-1.txt")
+                finally:
+                    os.chdir(cwd)
+
+    def test_an_absolute_path_is_unaffected(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                target = Path(td) / "results" / "task-1.txt"
+                self.assertEqual(mod.worker_published_path(target, {}, Path(td) / "unused"), target)
+
+    def test_a_relative_path_raises_rather_than_falling_back_to_cwd(self):
+        # No silent "resolver failed, use the current directory" path: a caller that cannot learn
+        # the workspace must not guess at one by falling back to wherever the process happens to be.
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)
+                    with mock.patch("workspace_default.resolve_workspace",
+                                     side_effect=RuntimeError("no workspace")):
+                        with self.assertRaises(RuntimeError):
+                            mod.worker_published_path(Path("results") / "task-1.txt")
+                    self.assertEqual(list(Path(td).rglob("*.txt")), [], "nothing was written anywhere")
+                finally:
+                    os.chdir(cwd)
+
+    def test_a_resolver_failure_escapes_nowhere_even_without_connections(self):
+        # Without `connections`, nothing downstream can catch a fallback here; isolates the guard.
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)
+                    with mock.patch("workspace_default.resolve_workspace",
+                                     side_effect=RuntimeError("no workspace")), \
+                            mock.patch.dict(sys.modules, {"connections": None}):
+                        with self.assertRaises(RuntimeError):
+                            mod.worker_published_path(Path("results") / "proactive-note.txt")
+                    self.assertEqual(list(Path(td).rglob("*.txt")), [], "nothing was written anywhere")
+                finally:
+                    os.chdir(cwd)
+
+    def test_cli_with_a_relative_path_and_a_failed_resolver_writes_nothing_and_exits_nonzero(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)
+                    with mock.patch("workspace_default.resolve_workspace",
+                                     side_effect=RuntimeError("no workspace")), \
+                            mock.patch.object(mod.sys, "stdin", io.StringIO("x")), \
+                            mock.patch.object(mod.sys, "stderr", io.StringIO()):
+                        with self.assertRaises(RuntimeError):
+                            mod.main(["result_publish.py", "results/task-1.txt"])
+                    self.assertEqual(list(Path(td).rglob("*.txt")), [], "nothing was written anywhere")
+                finally:
+                    os.chdir(cwd)
+
+
 class PublisherFailurePaths(unittest.TestCase):
     """Run against src and the vendored ag2-sparrow copy: the bridge imports the latter."""
 
@@ -182,6 +271,83 @@ class PublisherFailurePaths(unittest.TestCase):
                 with mock.patch.object(mod.sys, "stderr", io.StringIO()):
                     self.assertEqual(mod.main(["result_publish.py"]), 2)
                     self.assertEqual(mod.main(["result_publish.py", "--help"]), 2)
+
+
+class PublishClearsDelegation(unittest.TestCase):
+    """A published live result ends its task's background hand-off (src/task_delegation.py)."""
+
+    def setUp(self):
+        import task_delegation
+        self.td = task_delegation
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ws = Path(self._tmp.name)
+        self.tid = "task-chat-1792841385408"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_publishing_the_result_clears_its_marker_only(self):
+        mine, other = self.td.mark(self.ws, self.tid, 60), self.td.mark(self.ws, "task-other-1", 60)
+        result_publish.publish_text(self.ws / "results" / f"{self.tid}.txt", "done")
+        self.assertFalse(mine.exists())
+        self.assertTrue(other.exists())
+
+    def test_a_staged_publish_clears_it_too(self):
+        marker = self.td.mark(self.ws, self.tid, 60)
+        target = self.ws / "results" / f"{self.tid}.txt"
+        result_publish.publish_staged(result_publish.stage_text(target, "done"), target)
+        self.assertFalse(marker.exists())
+
+    def test_a_literal_suffix_in_the_id_clears_that_exact_marker(self):
+        for suffix in (".claimed-b", ".assigned-b"):
+            with self.subTest(suffix):
+                base, literal = self.td.mark(self.ws, "task-a", 60), self.td.mark(self.ws, f"task-a{suffix}", 60)
+                result_publish.publish_text(self.ws / "results" / f"task-a{suffix}.txt", "done")
+                self.assertTrue(base.exists(), "the base task's marker was cleared")
+                self.assertFalse(literal.exists(), "the published task's marker survived")
+                self.td.clear(self.ws, "task-a")
+
+    def test_an_invalid_id_clears_nothing(self):
+        with mock.patch.object(self.td, "clear") as clear:
+            result_publish.publish_text(self.ws / "results" / "..txt", "x")
+            result_publish.publish_text(self.ws / "results" / "task-a.md", "x")
+        clear.assert_not_called()
+
+    def test_a_file_outside_live_results_clears_nothing(self):
+        marker = self.td.mark(self.ws, self.tid, 60)
+        result_publish.publish_text(self.ws / "results" / "archive" / f"{self.tid}.txt", "done")
+        result_publish.publish_text(self.ws / "state" / f"{self.tid}.txt", "x")
+        self.assertTrue(marker.exists())
+
+    def test_a_failed_clear_still_publishes(self):
+        self.td.mark(self.ws, self.tid, 60)
+        target = self.ws / "results" / f"{self.tid}.txt"
+        with mock.patch.object(self.td, "clear", side_effect=OSError("busy")):
+            result_publish.publish_text(target, "done")
+        self.assertEqual(target.read_text(), "done")
+
+    def test_vendored_copy_skips_a_non_txt_name_and_never_fails_on_a_clear_error(self):
+        # In the ag2-sparrow bundle task_delegation is not vendored, so the clear is a no-op there.
+        vendored = _load_vendored()
+        marker = self.td.mark(self.ws, self.tid, 60)
+        md = self.ws / "results" / f"{self.tid}.md"
+        vendored.publish_text(md, "x")
+        self.assertEqual(md.read_text(), "x")
+        self.assertTrue(marker.exists())
+        target = self.ws / "results" / f"{self.tid}.txt"
+        with mock.patch.dict(sys.modules, {"task_delegation": None, "ag2_sparrow.task_delegation": None}):
+            vendored.publish_text(target, "done")
+        self.assertEqual(target.read_text(), "done")
+        self.assertTrue(marker.exists())
+        vendored.publish_text(target, "done")  # importable here (src/ is on sys.path): it clears
+        self.assertFalse(marker.exists())
+
+    def test_the_cli_clears_it(self):
+        marker = self.td.mark(self.ws, self.tid, 60)
+        subprocess.run([sys.executable, str(REPO / "src" / "result_publish.py"),
+                        str(self.ws / "results" / f"{self.tid}.txt")],
+                       input="[no-send] done", text=True, capture_output=True, check=True)
+        self.assertFalse(marker.exists())
 
 
 class ConcurrencyDrill(unittest.TestCase):
@@ -234,7 +400,7 @@ WRITERS = {
     "skills/schedule-crons/scripts/codex-scheduler.py": "from result_publish import publish_text",
     "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py": "from .result_publish import",
     "src/notify.sh": "result_publish.py",
-    "src/launchd/gateway-bridge-wrapper.sh": "result_publish.py",
+    "src/launchd/gateway-bridge-lib.sh": "result_publish.py",
     "src/launchd/channel-bridge-wrapper.sh": "result_publish.py",
     "src/voice-agent.ts": "publishResultFile(`proactive-voice-${c.category}-",
     "src/live-agent-runtime.ts": "publishResultFile(`proactive-voice-stuck-",

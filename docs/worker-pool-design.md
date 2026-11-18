@@ -695,6 +695,17 @@ clear field rather than beside a live predecessor. What remains is dead state �
 `state/pool/affinity.json`, `assignments.json` and their siblings — which Stage 1
 neither reads nor migrates; removing it is a separate cleanup.
 
+### s.space hand-off for a worker with its own agent (flag)
+
+Behind `WORKER_POOL_SSPACE_HANDOFF` (worker-pool manifest `config`, off by default), `pool_ask`
+from the core at team tier to a worker whose identity row is enabled skips the task file and the
+router. The core's agent posts one ordinary message to the worker's agent in the configured
+hand-off room, records the ask, and returns at once; the worker's threaded reply reaches the core as a
+new task, and `pool_ask --asked` lists the recorded asks the asked agent has not answered.
+Relayed asks, parent-held asks, a worker's own ask and the usage-limit recovery probe (which
+names its routed payload) stay on the folder. A hand-off carries the tier the room gives the core's
+agent, so owner-tier work is not delegated this way. Use and authority: `skills/worker-pool/SKILL.md`.
+
 ### Migration
 
 Both intakes coexist for a release or two. The rule that must hold: **a task is delivered exactly once.** The Task Bridge stamps which intake owns a task at admission, and the old path skips anything stamped for the new one. Removing the old path is its own change, after a release with no dual-path incidents.
@@ -719,3 +730,33 @@ Each of these is out of scope for v1, and none is an oversight.
 5. Identity persistence versus context restoration — resuming is not remembering.
 6. How a steering message reaches the in-flight task it steers.
 7. Per-worker schedule durability, and suppression on pause.
+
+### Usage-limit recovery requests
+
+A live pane classified as `limit` with outstanding deliveries uses a separate
+persisted wait, instead of the watcher-loss or human-card ladder. A printed reset
+time (including its named timezone) sets the first due time, parsed once per
+banner: an unchanged banner keeps that deadline across midnight, and a yearless
+date more than half a year past names the next year. A time without a date names
+its next occurrence, rolling to tomorrow if it is not in the future; an explicit
+`today` or dated past reset stays past. Month/day dates accept an optional comma.
+Unreadable or absent reset text uses a 15-minute probe interval. A due tick requests one fresh turn
+through `pool_ask` and the normal recipient routing path, asking the worker to
+re-arm its session watcher and process its existing inbox. For Claude, a fresh limit capture and empty composer permit a wake-up line
+through the existing guarded line sender, pointing at that routed payload.
+Under its lock, the sender rechecks both the empty composer and that the pane
+still waits on the limit alone (`--require-limit`: no running turn, no other
+dialog); refusals consume an attempt
+and retain the queued task. The worker is never restarted for this action.
+
+Still-limited observations back off for 15, 30, 60 and 120 minutes, with at most
+four delivery requests before escalation. The attempt count survives supervisor
+restarts and every non-limit observation except an idle pane: a recovery
+submission can show a spinner before the same refusal returns, so only a turn
+that finished without a limit starts a new episode. Paused workers and workers without outstanding work receive no request.
+
+The standalone notifier deliberately holds limit refusals. The bounded recovery
+action supplies the wake-up through the guarded sender instead of waiting for
+that notifier. A successful send proves submission, not that the provider accepted
+the turn; continued limit observations use the same backoff. Non-Claude workers
+are currently refused by the recovery action.

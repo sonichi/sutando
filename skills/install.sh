@@ -103,10 +103,18 @@ echo "Installed. Skills available in any Claude Code session."
 # Codex scans $CODEX_HOME/skills and follows symlinks; its bundled skills sit in .system/
 # and same-named entries already there are left alone (link_skills never replaces one).
 if [ "$(bash "$CONFIG" core-runtime 2>/dev/null || true)" = "codex" ]; then
-  CODEX_TARGET="$(bash "$CONFIG" codex-home-path skills)"
+  # src/codex_home.py alone resolves, checks and creates the Codex home.
+  # shellcheck source=../src/agent/codex/codex-home.sh
+  . "$REPO/src/agent/codex/codex-home.sh"
+  sutando_codex_home_prepare "$REPO" "$PY" || true
   echo ""
-  echo "Codex core runtime — linking into $CODEX_TARGET"
-  link_skills "$CODEX_TARGET"
-  echo ""
-  echo "Installed. Skills available in the next Codex session."
+  if [ -n "$SUTANDO_CODEX_HOME" ] \
+      && CODEX_TARGET="$(sutando_codex_home_child "$REPO" "$PY" "$SUTANDO_CODEX_HOME" skills)"; then
+    echo "Codex core runtime — linking into $CODEX_TARGET"
+    link_skills "$CODEX_TARGET"
+    echo ""
+    echo "Installed. Skills available in the next Codex session."
+  else
+    echo "Codex core runtime — the Codex home or its skills folder was refused; no skills linked there"
+  fi
 fi
