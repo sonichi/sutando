@@ -2351,9 +2351,10 @@ def task_home(task_id: str, workspace: Optional[Path] = None) -> dict:
         rows = record["rows"]
     except (SchemaError, OSError):
         return home
+    row = None
     if home["lane"]:
         row = next((r for r in rows if home["lane"] in [r["instance"]] + alias_instances(r)), None)
-    else:
+    if row is None:
         row = next((r for r in rows if (dirs := _storage_dirs(record, r.get("worker", ""), ws))
                     and _holds_task(dirs[0], task_id)), None)
     home["worker"] = str((row or {}).get("worker") or "")

@@ -190,6 +190,27 @@ class MultipleIdentityStorage(Base):
         self.assertEqual(C.worker_storage_root(W, self.ws), self.own_root())
         self.assertEqual(C.task_home(f"task-{beta['instance']}~abc", self.ws)["tasks"], expected[0])
 
+    def test_removed_lane_tasks_still_resolve_in_the_workers_storage(self):
+        alpha, beta = self.identities()
+        tasks, results = C.ensure_worker_dirs(W, self.ws)
+        task_id = f"task-{alpha['instance']}~abc"
+        task = tasks / f"{task_id}.txt"
+        task.write_text("pending")
+        result = results / f"{task_id}.txt"
+        result.write_text("finished")
+        with C._transaction(self.ws) as record:
+            record["rows"] = [r for r in record["rows"] if r["instance"] != alpha["instance"]]
+        for location in (task, tasks / f"{task_id}.claimed-core-1.txt", tasks / "archive" / task.name):
+            if task != location:
+                task.rename(location)
+                task = location
+            with self.subTest(location=location.name):
+                home = C.task_home(task_id, self.ws)
+                self.assertEqual(home, {"lane": alpha["instance"], "worker": W, "tasks": tasks,
+                                        "results": results, "own": True})
+                self.assertEqual((home["results"] / result.name).read_text(), "finished")
+        self.assertFalse(C.task_home(f"task-{alpha['instance']}~missing", self.ws)["own"])
+
     def test_one_toggle_controls_every_identity_and_preserves_other_home(self):
         alpha, beta = self.identities()
         C.set_worker_dirs(W, True, workspace=self.ws)
