@@ -162,7 +162,7 @@ resolve_claude_config_dir_and_seed() {
     if [ -n "$PY" ] && "$PY" -c 'import sys' > /dev/null 2>&1; then
       # No override: claude starts in this checkout, which a git repo makes Claude Code ask
       # about (2026-10-22: a PR checkout's core restarted into that prompt and sat there).
-      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-$(cd "$REPO" && pwd -P)}" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" "$PY" - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
+      _ccd="$_ccd" _cwd="${SUTANDO_CLAUDE_WORKING_DIR:-$(cd "$REPO" && pwd -P)}" _home="$(cd "$HOME" 2>/dev/null && pwd -P)" _accept_bypass="${SUTANDO_ACCEPT_BYPASS_PERMISSIONS:-}" "$PY" - <<'PY' || echo "  ⚠ onboarding-seed skipped (non-fatal)"
 import json, os
 ccd = os.environ["_ccd"]
 target = os.path.join(ccd, ".claude.json")
@@ -203,24 +203,20 @@ if (cfg.get("fullscreenUpsellSeenCount") or 0) < 3:
     cfg["fullscreenUpsellSeenCount"] = 3
     changed = True
     upsell_seeded = True
-# Trust-seed for the dir claude starts in. Claude Code keys the
-# folder-trust dialog on projects[<abs cwd>].hasTrustDialogAccepted; a fresh
-# scoped config lacks it, so a detached session would hang on the prompt.
-# Only pre-trust the one dir the caller explicitly chose, or else the launcher's
-# own checkout (physical path, as getcwd() reports it).
-cwd = os.environ.get("_cwd") or ""
-trusted_dir = None
-if cwd:
+# A detached session cannot answer a trust prompt: trust only its start dir and the
+# --add-dir home folder, by physical path (what getcwd() reports).
+trusted_dirs = []
+for d in dict.fromkeys(x for x in (os.environ.get("_cwd"), os.environ.get("_home")) if x):
     projects = cfg.get("projects")
     if not isinstance(projects, dict):
         projects = cfg["projects"] = {}
-    entry = projects.get(cwd)
+    entry = projects.get(d)
     if not isinstance(entry, dict):
-        entry = projects[cwd] = {}
+        entry = projects[d] = {}
     if entry.get("hasTrustDialogAccepted") is not True:
         entry["hasTrustDialogAccepted"] = True
         changed = True
-        trusted_dir = cwd
+        trusted_dirs.append(d)
 # Dangerous-mode seed (env-gated, detached-only). A session launched with
 # --dangerously-skip-permissions shows a "Bypass Permissions mode / Yes, I
 # accept" prompt on first run in a fresh scoped config, which that flag does
@@ -251,8 +247,8 @@ if changed:
     print("  ✓ onboarding-seed: hasCompletedOnboarding set in .claude.json")
     if chrome_seeded:
         print("  ✓ chrome-seed: hasCompletedClaudeInChromeOnboarding set in .claude.json")
-    if trusted_dir:
-        print("  ✓ trust-seed: hasTrustDialogAccepted set for %s" % trusted_dir)
+    for d in trusted_dirs:
+        print("  ✓ trust-seed: hasTrustDialogAccepted set for %s" % d)
     if upsell_seeded:
         print("  ✓ upsell-seed: fullscreenUpsellSeenCount set in .claude.json")
 PY
@@ -266,40 +262,103 @@ PY
   fi
 }
 
+# 0 when the session's cwd is a folder other than this checkout.
+claude_session_outside_checkout() {
+  [ -n "${SUTANDO_CLAUDE_WORKING_DIR:-}" ] || return 1
+  local _repo_real _wd_real
+  _repo_real="$(cd "$REPO" 2>/dev/null && pwd -P)" || return 1
+  _wd_real="$(cd "$SUTANDO_CLAUDE_WORKING_DIR" 2>/dev/null && pwd -P)" || return 0
+  [ "$_wd_real" != "$_repo_real" ]
+}
+
+# 0 when the working dir's project settings hold a Stop hook running THIS checkout's
+# check-pending-tasks.sh (start-cli.sh installs it there); another clone's copy does not count.
+claude_cwd_has_pending_stop_hook() {
+  command -v node > /dev/null 2>&1 || return 1
+  node "$REPO/src/agent/claude/cli/project-has-stop-hook.mjs" "$SUTANDO_CLAUDE_WORKING_DIR" "$REPO/src/check-pending-tasks.sh" \
+    "$SUTANDO_CLAUDE_WORKING_DIR/.claude/settings.json" "$SUTANDO_CLAUDE_WORKING_DIR/.claude/settings.local.json"
+}
+
+# The guard hooks build-core-settings.mjs always registers, without obs or telemetry, built
+# without node; tests pin it equal to the builder's output for the same arguments.
+claude_guard_settings_json() {
+  local stop_hook="$1" ask gmail gdocs pim shtrap stale out
+  _cgs_shq() { local s=$1 q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
+  _cgs_cmd() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '{"type":"command","command":"%s"}' "$s"; }
+  ask="$(_cgs_cmd "python3 $(_cgs_shq "$REPO/hooks/skip-ask-user-question.py")")"
+  gmail="$(_cgs_cmd "python3 $(_cgs_shq "$REPO/hooks/gmail-write-guard.py")")"
+  gdocs="$(_cgs_cmd "python3 $(_cgs_shq "$REPO/hooks/gdocs-write-guard.py") --repo $(_cgs_shq "$REPO")")"
+  pim="$(_cgs_cmd "python3 $(_cgs_shq "$REPO/hooks/native-pim-guard.py")")"
+  shtrap="$(_cgs_cmd "python3 $(_cgs_shq "$REPO/hooks/shell-trap-guard.py") --repo $(_cgs_shq "$REPO")")"
+  stale="$(_cgs_cmd "python3 $(_cgs_shq "$REPO/hooks/stale-head-post-guard.py")")"
+  out='{"hooks":{"PreToolUse":['
+  out+='{"matcher":"AskUserQuestion","hooks":['"$ask"']},'
+  out+='{"matcher":"mcp__.*[Gg][Mm][Aa][Ii][Ll].*","hooks":['"$gmail"']},'
+  out+='{"matcher":"mcp__.*__composio_exec","hooks":['"$gdocs"']},'
+  out+='{"matcher":"Bash|Write|Edit|MultiEdit|NotebookEdit","hooks":['"$pim"']},'
+  out+='{"matcher":"Bash","hooks":['"$shtrap"']},'
+  out+='{"matcher":"Bash","hooks":['"$stale"']}],'
+  out+='"PostToolUse":[{"matcher":"mcp__.*__composio_exec","hooks":['"$gdocs"']}]'
+  if [ -n "$stop_hook" ]; then
+    out+=',"Stop":[{"hooks":['"$(_cgs_cmd "bash $(_cgs_shq "$stop_hook")")"']}]'
+  fi
+  printf '%s}}' "$out"
+}
+
 # One `--settings` flag carries every hook a headless session needs (multiple
 # --settings flags are undocumented/last-wins, so compose into a single JSON):
 #  * AskUserQuestion guard — ALWAYS registered. No interactive user can answer
 #    it, so a PreToolUse `deny` short-circuits the call instead of hanging.
 #  * obs collector hooks — added to the SAME JSON only when an export
 #    endpoint is set ($SUTANDO_OBS_ENDPOINT).
+#  * outside the checkout (SUTANDO_CLAUDE_WORKING_DIR not the repo): the Stop
+#    hook unless that folder's project settings hold it, plus an
+#    --append-system-prompt naming the repo's CLAUDE.md, which never loads there.
 # Built by node helpers, not shell string interpolation (a $REPO with a space
-# or a `"` broke hand-rolled interpolation in the past). Reads REPO. Sets
-# SETTINGS_ARGS and exports SUTANDO_OBS_ENDPOINT.
+# or a `"` broke hand-rolled interpolation in the past). Reads REPO and the
+# working dir resolve_claude_cwd_args canonicalized. Sets SETTINGS_ARGS and
+# exports SUTANDO_OBS_ENDPOINT.
 resolve_claude_settings_args() {
   OBS_ENDPOINT="${SUTANDO_OBS_ENDPOINT:-}"
   export SUTANDO_OBS_ENDPOINT="$OBS_ENDPOINT"
   SETTINGS_ARGS=()
+  local _stop_hook=""
+  if claude_session_outside_checkout; then
+    claude_cwd_has_pending_stop_hook || _stop_hook="$REPO/src/check-pending-tasks.sh"
+    SETTINGS_ARGS+=(--append-system-prompt "This session's working folder is not the Sutando checkout, so the checkout's CLAUDE.md was not loaded. Read $REPO/CLAUDE.md now and follow it for every task. Answer each TASK_FILE through \"\${SUTANDO_PY:-python3}\" '$REPO/src/result_publish.py' (body on stdin; its path argument is the task's result file, named after the task id in the workspace's results folder; workspace: \$SUTANDO_WORKSPACE_DIR, else the output of bash '$REPO/scripts/sutando-config.sh' workspace), never only in this terminal.")
+  fi
   if ! command -v node > /dev/null 2>&1; then
-    echo "session hooks: node unavailable — cannot safely build --settings JSON; AskUserQuestion guard + obs disabled this session" >&2
+    SETTINGS_ARGS+=(--settings "$(claude_guard_settings_json "$_stop_hook")")
+    echo "session hooks: node unavailable — only the session guards are registered; obs and skill telemetry disabled this session" >&2
     return 0
   fi
   OBS_JSON=""
   if [ -z "$OBS_ENDPOINT" ]; then
     echo "obs hooks: not registered (no export endpoint — set SUTANDO_OBS_ENDPOINT to enable capture)"
   else
-    OBS_JSON="$(node "$REPO/src/observability/claude/hooks/build-hook-settings.mjs" "$REPO/src/observability/claude/hooks/obs-hook.sh")"
-    if [ -n "$OBS_JSON" ]; then
+    local _rc=0
+    OBS_JSON="$(node "$REPO/src/observability/claude/hooks/build-hook-settings.mjs" "$REPO/src/observability/claude/hooks/obs-hook.sh")" || _rc=$?
+    if [ "$_rc" -ne 0 ]; then
+      OBS_JSON=""
+      echo "obs hooks: settings builder failed (exit $_rc) — launch continues without obs capture" >&2
+    elif [ -n "$OBS_JSON" ]; then
       echo "obs hooks: → $OBS_ENDPOINT/ingest/claude-code-hooks (collector)"
     else
       echo "obs hooks: settings build failed — capture disabled this session" >&2
     fi
   fi
-  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py" "$REPO/hooks/shell-trap-guard.py" "$REPO/hooks/stale-head-post-guard.py")"
-  if [ -n "$CLAUDE_SETTINGS_JSON" ]; then
-    SETTINGS_ARGS=(--settings "$CLAUDE_SETTINGS_JSON")
+  local _core_rc=0
+  CLAUDE_SETTINGS_JSON="$(node "$REPO/src/agent/claude/cli/build-core-settings.mjs" "$REPO/hooks/skip-ask-user-question.py" "$OBS_JSON" "$REPO/hooks/skill-usage-telemetry.py" "$REPO/hooks/gmail-write-guard.py" "$REPO/hooks/gdocs-write-guard.py" "$REPO/hooks/native-pim-guard.py" "$REPO/hooks/shell-trap-guard.py" "$REPO/hooks/stale-head-post-guard.py" "$_stop_hook")" || _core_rc=$?
+  if [ "$_core_rc" -ne 0 ]; then
+    SETTINGS_ARGS+=(--settings "$(claude_guard_settings_json "$_stop_hook")")
+    echo "session hooks: settings builder failed (exit $_core_rc) — launch continues with only the session guards registered" >&2
+  elif [ -n "$CLAUDE_SETTINGS_JSON" ]; then
+    SETTINGS_ARGS+=(--settings "$CLAUDE_SETTINGS_JSON")
     echo "session hooks: AskUserQuestion guard registered (PreToolUse deny — a headless session can't answer it)"
+    if [ -n "$_stop_hook" ]; then echo "session hooks: Stop hook registered (cwd is outside the checkout)"; fi
   else
-    echo "session hooks: settings build failed — AskUserQuestion guard NOT registered this session" >&2
+    SETTINGS_ARGS+=(--settings "$(claude_guard_settings_json "$_stop_hook")")
+    echo "session hooks: settings builder printed nothing — launch continues with only the session guards registered" >&2
   fi
 }
 

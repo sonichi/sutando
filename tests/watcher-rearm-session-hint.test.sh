@@ -32,7 +32,7 @@ HINT="$BUNDLE/src/watcher-rearm-session-hint.sh"
 run_hint() {  # $1 verdict, rest: env assignments naming who the session is
   local v="$1"; shift
   (cd / && echo '{"hook_event_name":"SessionStart","source":"compact"}' \
-    | env -u SUTANDO_CORE_SESSION -u SUTANDO_INSTANCE_ID STUB_VERDICT="$v" "$@" bash "$HINT")
+    | env -u SUTANDO_CORE_SESSION -u SUTANDO_INSTANCE_ID -u SUTANDO_TASK_WATCH_MOD STUB_VERDICT="$v" "$@" bash "$HINT")
 }
 field() { "$PY" -c 'import json,sys; d=json.load(sys.stdin)["hookSpecificOutput"]; print(d[sys.argv[1]])' "$1" 2>/dev/null; }
 
@@ -47,6 +47,15 @@ case "$CTX" in
 esac
 case "$CTX" in *"timeout_ms: 1800000"*) ok "names the Monitor timeout" ;; *) bad "names the Monitor timeout" "ctx: ${CTX:0:400}" ;; esac
 grep -qx "role-present session --inbox $WS/tasks --ready $WS/state" "$ARGV_LOG" && ok "asks for a READY session-role holder of its own inbox" || bad "asks for a READY session-role holder of its own inbox" "argv: $(cat "$ARGV_LOG")"
+
+case "$CTX" in *"task-watch Mod"*) bad "without the Mod the hint says nothing of it" "ctx: ${CTX:0:400}" ;; *) ok "without the Mod the hint says nothing of it" ;; esac
+
+echo "core session under the task-watch Mod:"
+CTX="$(run_hint no SUTANDO_CORE_SESSION=1 SUTANDO_TASK_WATCH_MOD=1 | field additionalContext)"
+case "$CTX" in
+  *"the task-watch Mod restarts the watcher on its own, so run python3 \"$BUNDLE/src/watcher_rearm.py\" mod-ready --repo \"$BUNDLE\" --workspace \"$WS\" and only if it prints no, start one via the Monitor tool, command: bash \"$BUNDLE/src/watch-tasks-stream.sh\""*) ok "defers to the Mod and names the Monitor only as the mod-ready-no fallback" ;;
+  *) bad "defers to the Mod and names the Monitor only as the mod-ready-no fallback" "ctx: ${CTX:0:500}" ;;
+esac
 
 echo "nothing is injected unless the inbox is proven unwatched:"
 OUT="$(run_hint yes SUTANDO_CORE_SESSION=1)"; [ -z "$OUT" ] && ok "watched inbox: silent" || bad "watched inbox: silent" "got: ${OUT:0:200}"

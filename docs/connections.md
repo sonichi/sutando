@@ -589,6 +589,21 @@ answers before the rule above:
   and the core's session all fall through to the rule above. The core never acts as a worker's
   agent.
 
+A worker's lane delivers each task it queues to its worker itself, before the core can see it. The
+lane stages the task file, runs the core's declared task-event handler (the pool router, from
+`state/task-event-handler.json`) on the staged copy with `--from-lane --payload <staged>`, and only
+then publishes it to `tasks/`. The router writes the delivery sentinel and the attribution in
+`deliveries/<worker>/` under its own locks, so the task is already held when it appears, and the
+core's watcher never routes or announces a task a worker holds. Once the task is published, the lane
+runs the router again with `--renotify`, which replaces a still-pending sentinel, so a worker's
+watcher that gave up on the bare pointer (a slow or killed router, or a lane that died and the task
+was served again) is told. The payload stays in `tasks/`, where the worker's resolver,
+`task_disposition.py`, archiving and the bridges read it. A worker off the roster or retired, a
+picker command, a router that fails or takes longer than 10 s, or no handler declared: nothing is
+held, the task is published as before and the core's watcher routes it. A lane started from inside a
+session (`connections.py start` from a worker's shell) carries none of that session's variables
+(`connections.SESSION_ENV`), so it runs as the lane keeper's launch would.
+
 A worker's row has no channel env file: its token is in the vault alone, so
 `channel-env.sh <its lane>` exits 1 saying so, and room clients resolve it by room.
 
@@ -646,6 +661,162 @@ the reseat to run once it is done.
 lane that queued it (`task-<instance>~…`). Each row of `state/agent-activity.jsonl` for such a
 task carries it as `agent`.
 
+### A worker's agent as a declared Sparrow bridge
+
+A worker's own agent can run as a Sparrow agent bridge that sparrowd supervises
+(`src/sparrowd.py --agent-bridges`) instead of as a lane the gateway wrapper's lane loop starts.
+The worker wiring above (addressee, routing before publish and the re-raise after it, the claim and
+own-file gates) is one module, `src/worker_lane.py`, which both the lane loader
+(`remote-gateway-bridge.py`) and the agent bridge (`sparrow_agent_bridge.py`) install.
+
+`python3 src/worker_lane.py declare --worker <id>` (each verb takes `--workspace`) writes the declaration
+(`<workspace>/agents/<segment>.bridge/worker.json`, `written_by: worker-lane declare`), where the
+segment is the one the worker row's `agent_mxid` names. The file chooses nothing: the agent bridge
+re-derives its name and env from the segment, as for any declaration, and runs it only when the
+connection record names its `AGENT_MXID` as exactly one worker's own agent, held by the core's
+owner, neither disabled nor parked (`connections.worker_serving_agent`). The worker and its lane
+instance come from that row. Such a bridge runs the lane's own loader, `remote-gateway-bridge.py`,
+on the workspace's `tasks/`, `results/` and `state/` with the lane's identity env
+(`connections.lane_identity_env`: `GATEWAY_INSTANCE`, the lane's worker, its `not_before`). It
+therefore carries every host gate the lane does (intake dedupe and backlog, the room and thread
+check, dispatch and ack vetoes, the lane-server check, status, the send roots) and the worker
+wiring, from the one place that sets them. Its revision covers the declaration and what it takes
+from the row, so a record-only change restarts it. It names no
+vault key: its token is the row's own, read where the lane reads it (`connection_credential`, by the
+row's `token_ref`), so no copy of the relay token is stored. A record that cannot be read keeps a
+running bridge as it is; any other mismatch skips the declaration with its reason.
+
+While a valid declaration exists (`worker_lane.declared_bridge`, the agent bridge's own check), the
+lane keeper (`keep_lanes_up`) leaves the worker's lane down while the declared bridge holds the
+lane's lease, and for up to `DECLARED_BRIDGE_GRACE_S` (180 s) after it first finds nobody holding it.
+Past that, it starts the lane and says so, so a bridge that is not supervised, cannot read its
+token or keeps crashing never leaves the worker's agent silent. The row stays enabled, so
+`worker_enabled_identity` still answers it: the worker's session stamps its proactive files and its
+MCP proxy acts as the worker's agent. A check that cannot be made starts the lane as before.
+`declare` refuses a worker whose row token cannot be read.
+`withdraw --worker <id>` removes the declaration: sparrowd stops the bridge on its next scan and
+the keeper starts the lane on its next pass.
+
+One bridge serves a worker's agent at a time because both run under the same lease: the gateway
+bridge's poller lock for its instance (`state/locks/gateway-bridge.<instance>.lock`). A second
+bridge for that instance exits 75 at start while the first holds it, and sparrowd restarts a
+declared bridge with backoff (at most 60 s) whatever its exit code. `connections.py stop`, `park`
+and `disconnect` stop whichever process holds that lease, the declared bridge included.
+
+Cutting a worker over:
+
+1. `python3 src/worker_lane.py declare --worker <id>`. sparrowd (run with `--agent-bridges`) picks it up
+   on its next scan; its bridge finds the running lane holding the lease and exits 75, and sparrowd
+   keeps retrying.
+2. `python3 scripts/connections.py stop <instance>` stops the lane once. The keeper waits out its
+   grace, and the declared bridge takes the lease on its next retry (sparrowd's backoff is at most
+   60 s). If it does not, the keeper starts the lane again and logs why.
+3. `python3 src/worker_lane.py status --worker <id>` prints one JSON line: `declared`, the lease's
+   holder pid and `held_by`, which is `declared-bridge` only when that pid is the agent bridge for this
+   declaration and a sparrowd running `--agent-bridges` is its parent; `other`, `none` or `unknown`
+   otherwise. `sparrowd` lists each running sparrowd: whether it runs `--agent-bridges`, whether its
+   checkout's agent bridge accepts a worker declaration (`serves_workers`: its
+   `ACCEPTS_WORKER_DECLARATIONS = 1` line), and whether the code it loaded (the agent bridge,
+   `worker_lane.py`, `connect_bridge.py`) changed after it started (`code_changed_since_start`: restart
+   it). Paths are matched against the raw command line, never split into words, so a checkout or
+   workspace under a folder with a space is read correctly.
+4. Check with a live round trip: a message to the worker's agent reaches the worker and its reply
+   is posted as that agent.
+
+Undo: `python3 src/worker_lane.py withdraw --worker <id>`; the keeper starts the lane on its next
+pass, which takes the lease once sparrowd has stopped the bridge.
+
+### A worker on its own folders (`dirs: "own"`)
+
+A worker whose identity row carries `dirs: "own"` keeps its tasks and results in its agent's own folder,
+`<workspace>/agents/<segment>/{tasks,results}` (the folder a claude-local bridge for that agent uses), not
+the workspace's shared `tasks/` and `results/`; `state/` stays shared. `connections.worker_dirs(worker)` is
+the one answer (None for every other worker) and `connections.task_home(task_id)` maps a lane-queued task to
+its folders. Its lane, whether the gateway wrapper's or a declared Sparrow bridge, runs on those folders
+(`worker_lane.lane_dirs`): the folder is the worker's inbox, so no router runs; the pre-publish hook only
+records the task as the worker's (`--attribute-only`), and the worker's stamped proactive files still landing
+in the shared `results/` are moved into its own. Its session reads a plain inbox of task files and answers in
+its own results (`spawn_worker.inbox_env`, `result_publish`). A worker without the field is unchanged.
+
+`python3 src/worker_lane.py migrate-dirs --worker <id>` shows what switching the worker would do (its
+folders, who holds its lane, what is delivered to it, and which tasks and results would move) and writes
+nothing. With `--apply` it switches the worker over:
+1. It finds the declared task-event handler first. A failed lookup, or work delivered with no handler to
+   move it, refuses before anything changes.
+2. It writes the field and creates the folders (a private agent root), and relaunches the worker's lane
+   under the record lock (a wrapper lane is stopped so the lane keeper starts it on the new folders; a
+   declared bridge is waited for until sparrowd has replaced it).
+3. It has the handler empty the worker's `deliveries/<id>/` under the router's locks. A task its own lane
+   queued moves into its tasks folder and its sentinel is archived. A core task the worker never accepted is
+   handed back (attribution first, then the sentinel) and touched so the core's watcher picks it up. One it
+   accepted or answered stays the worker's until `pool_manage.py retire --hand-off` once its session is gone.
+4. It moves into the worker's folders any task its own lane queued that is still in the shared `tasks/`,
+   and the worker's unclaimed live results.
+
+It prints one JSON line and is idempotent: a refusal, or a file that could not be moved, says why, and a
+re-run finishes. It restarts no session: respawn the worker so its session takes the new inbox.
+`--undo --apply` clears the field, relaunches the lane, and returns the worker's live tasks (touched; one
+already answered stays) and results to the shared folders.
+
+### The core bridge under sparrowd (opt-in)
+
+By default the launchd gateway wrapper launches and supervises the host's core gateway bridge
+itself. A host can move that job to sparrowd. Nothing changes until the opt-in file
+`<workspace>/state/sparrowd/core.enabled` exists. The wrapper checks for it when it starts, and
+`src/startup-runtime.sh` checks for it before its bare launch. When the file is there:
+
+- The wrapper launches no bridge, runs no token check and does no eviction. It keeps
+  `src/sparrowd.py --core --agent-bridges` alive (relaunching it `SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY`
+  after it exits) and still runs the lane keeper. Startup's bare launch starts that same sparrowd. A
+  second sparrowd waits on the first one's lock.
+- sparrowd's `core-gateway-bridge` worker (`src/sparrow_core_bridge.py`) picks the bridge the wrapper
+  would run. That is the legacy one while its row is unparked and it has a token. Otherwise it is the
+  named primary lane. Otherwise there is none (with no token and no named primary, the worker is
+  simply absent and sparrowd says why once).
+- The legacy bridge gets the wrapper's own environment (`src/launchd/gateway-bridge-lib.sh`, which
+  the wrapper sources), with the proactive room emptied once a named row holds the primary. A named
+  primary gets its lane's `launch_env`, logs to `logs/remote-gateway-bridge.<instance>.log` and
+  writes its launch record.
+- The worker evicts a stray bridge of this checkout first, then execs `src/remote-gateway-bridge.py`
+  in place. The process carries the same argv and command line as the wrapper's child, so `pgrep`,
+  health-check and the eviction helper find it as before. It keeps the owner DM, the device env and
+  the proactive room.
+- sparrowd restarts the worker when the connection it serves changes: a primary move, the legacy
+  row parked or unparked, a rotated token file, or the row's token_ref, gateway URL or agent. Exit 75
+  (the bridge's stand-down) holds it until one of those changes, or until a later scan finds the lease
+  free, which re-arms it. While held, sparrowd's `health` reports unhealthy and health-check's
+  gateway-bridge check warns that this install's bridge is not serving. Any other exit is restarted
+  with backoff (at most 60 s).
+- Each restart raises the wrapper's alert, within the same deliberate-restart window and cooldown.
+  There are two exceptions: a poll stall (rc 69), and a start that failed before any bridge ran
+  (rc 78, for example a named primary with no recorded agent).
+- One supervisor per bridge. A stray bridge of this checkout whose parent is gone is evicted. A
+  bridge that another live process keeps (an app's keepalive, the gate-off wrapper) is refused, and
+  the worker retries until that supervisor is gone.
+- sparrowd reads the gate itself on every scan, so removing the file stops the core in whichever
+  sparrowd runs it, including one that startup's fallback started outside the launchd job.
+- The bridge is told sparrowd restarts it (`SUTANDO_BRIDGE_RESTART_OWNER=sparrowd`) unless its
+  environment already names a restart owner (the plist names `launchd`). Its stall exits stay armed
+  either way.
+- While sparrowd's core serves a named primary, it records that in `state/sparrowd/core.json`.
+  The lane keeper then leaves that lane to it, as for a declared bridge: while any process holds the
+  lane's lease, and for `DECLARED_BRIDGE_GRACE_S` (180 s) after it first finds nobody holding it.
+
+Cut-over (on the host, by its owner):
+
+1. `date +%s > "$(bash scripts/sutando-config.sh workspace)/state/channel-bridge-supervisor/deliberate-restart"`
+   so that the restart raises no alert.
+2. `mkdir -p "$(bash scripts/sutando-config.sh workspace)/state/sparrowd" && touch "$(bash scripts/sutando-config.sh workspace)/state/sparrowd/core.enabled"`.
+3. `launchctl kickstart -k gui/$(id -u)/com.sutando.gateway-bridge`. The gateway log then shows
+   `core gate set: sparrowd runs the gateway bridge`, sparrowd's `worker core-gateway-bridge: started`,
+   and the bridge's own `acquired workspace poller lock`.
+4. Check with a live round trip: a message in, the reply delivered.
+
+Undo: `rm "$(bash scripts/sutando-config.sh workspace)/state/sparrowd/core.enabled"`, stamp the
+deliberate restart as in step 1, then `launchctl kickstart -k gui/$(id -u)/com.sutando.gateway-bridge`.
+The wrapper stops sparrowd with its bridge and goes back to launching the bridge itself. Any other
+`sparrowd.py --core` drops its core on its next scan (within 30 s).
+
 ## Known servers
 
 `known_servers()` is the Add picker's offer: every DotSpace the resolver registers
@@ -660,7 +831,7 @@ not here.
 
 ## Surfaces
 
-- CLI: `scripts/connections.py list | known-servers | add | set-primary | promote | park | park-legacy | unpark | legacy-parked | remove | disconnect | reconnect | update-token | launch | start | import-env | launch-plan | primary | enabled`. `enabled` prints each row a bridge serves (neither disabled nor parked) and exits 1 when there is none: what "is a gateway configured here" asks (health-check, runtime-health, the voice navigation tool). `promote INSTANCE --repo DIR --logs-dir DIR [--park]`, `park INSTANCE`, `park-legacy` and `unpark INSTANCE --repo DIR --logs-dir DIR` (`''` names the legacy row); `legacy-parked` exits 0 when the legacy row is parked, else 1. `update-token INSTANCE -` reads the new code from stdin, which keeps it out of the process list (`ps` shows every argument); a literal code in its place is for scripts. `set-primary` prints "reconnect it" when the new primary's bridge is running.
+- CLI: `scripts/connections.py list | known-servers | add | set-primary | promote | park | park-legacy | unpark | legacy-parked | remove | disconnect | reconnect | update-token | launch | start | import-env | launch-plan | primary | enabled | bridge-pid`. `bridge-pid [INSTANCE]` prints the pid `bridge_pid` proves holds that bridge's lease, nothing when none runs, and exits 3 when the lease proves neither; the launchd wrapper passes it to `evict_own_bridge` so a straggler holding the lease is evicted even when `ps` cannot show its identity. `enabled` prints each row a bridge serves (neither disabled nor parked) and exits 1 when there is none: what "is a gateway configured here" asks (health-check, runtime-health, the voice navigation tool). `promote INSTANCE --repo DIR --logs-dir DIR [--park]`, `park INSTANCE`, `park-legacy` and `unpark INSTANCE --repo DIR --logs-dir DIR` (`''` names the legacy row); `legacy-parked` exits 0 when the legacy row is parked, else 1. `update-token INSTANCE -` reads the new code from stdin, which keeps it out of the process list (`ps` shows every argument); a literal code in its place is for scripts. `set-primary` prints "reconnect it" when the new primary's bridge is running.
 - Runtime API (Unix socket, JSON-RPC): `connection.list` (`{connections, capabilities}`, as over HTTP), `connection.known_servers`, `connection.add` (`{token}` previews; `{token, confirm: true, expected_server}` saves and starts the bridge), `connection.remove`, `connection.set_primary`, `connection.promote` (`{instance, park?}`), `connection.park` and `connection.unpark` (`{instance}`, `""` for the legacy row; promote answers `{connection, previous, kept, stopped_pid, launch, changed, relaunch_needed}`, park `{connection, stopped_pid}`, unpark `{connection, launch}`), `connection.park_legacy` (`{primary, parked, stopped}`), `connection.disconnect`, `connection.reconnect`, `connection.update_token` (`{instance, token}`). Every refusal by code (the table above) is `CONFLICT`, the same class the HTTP 409 carries.
 - HTTP (`src/agent-api.py` on `127.0.0.1:7843`, the web client's transport; routes dispatch to the same units):
 

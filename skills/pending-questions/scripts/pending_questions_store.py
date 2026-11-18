@@ -85,10 +85,15 @@ def neutralize(text: str) -> str:
 
 
 def ordered_options(default_action: Optional[str], options) -> list:
-    """(label, consequence) pairs with Approve first; Approve carries the default."""
+    """(label, consequence) pairs with Approve first; Approve carries the default.
+
+    An option named like the default is the same choice as Approve: it lends Approve its
+    consequence and is not shown again."""
     opts = [(str(a).strip(), str(b).strip()) for a, b in options or () if str(a).strip()]
-    approve = [o for o in opts if o[0].lower() == APPROVE.lower()]
-    rest = [o for o in opts if o[0].lower() != APPROVE.lower()]
+    default = (default_action or "").strip().lower()
+    same = [o for o in opts if o[0].lower() == APPROVE.lower() or (default and o[0].lower() == default)]
+    rest = [o for o in opts if o not in same]
+    approve = [o for o in same if o[0].lower() == APPROVE.lower()] or same
     if approve:
         lead = (APPROVE, approve[0][1] or (default_action or "").strip())
     else:

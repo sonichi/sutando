@@ -86,7 +86,9 @@ class ClaudeLauncherEnsuresHeartbeat(unittest.TestCase):
         self.sock = self.td / "t.sock"
         self.env = {"PATH": f"{bind}:{Path(TMUX).parent}:/usr/bin:/bin:/usr/sbin",
                     "HOME": str(self.td / "home"), "SUTANDO_TMUX_SOCKET": str(self.sock),
-                    "SUTANDO_TEST_MODE": "1", "SUTANDO_RESTART_GRACE_S": "2"}
+                    "SUTANDO_TEST_MODE": "1", "SUTANDO_RESTART_GRACE_S": "2",
+                    # The stub claude never answers --version; the Mod has its own launch tests.
+                    "SUTANDO_TASK_WATCH_MOD_CORE": "0"}
 
     def tearDown(self):
         subprocess.run([TMUX, "-S", str(self.sock), "kill-server"], capture_output=True)
