@@ -540,10 +540,14 @@ def _certified_nodes(tree, bindings: set) -> set:
                 # A break leaves after any prefix of an iteration and skips orelse.
                 return arms + ([([], tgt + carried)] if _breaks(node.body) else [])
             visit_expr(node.subject)
-            cases = [(c.body, tuple(n for p in ast.walk(c.pattern)
-                                    for n in (getattr(p, "name", None), getattr(p, "rest", None)) if n))
-                     for c in node.cases]
-            return cases if _match_is_exhaustive(node) else cases + [([], ())]
+            cases, guard_writes = [], set()
+            for c in node.cases:
+                # A failed guard keeps its writes for later cases and the no-match path.
+                guard_writes.update(_assigned_in([c.guard]) if c.guard is not None else ())
+                captures = tuple(n for p in ast.walk(c.pattern)
+                                 for n in (getattr(p, "name", None), getattr(p, "rest", None)) if n)
+                cases.append((c.body, captures + tuple(guard_writes)))
+            return cases if _match_is_exhaustive(node) else cases + [([], tuple(guard_writes))]
 
         def branch_merge(node):
             # Alternatives cannot both execute: certification survives only where EVERY
@@ -1048,6 +1052,22 @@ class HandlerAndLoopTargetInvalidation(unittest.TestCase):
             with self.subTest(binding=binding):
                 self.assertEqual(self._run_real(source), 'raw' if binding == 'd' else 'd:task-x@gw')
                 self.assertEqual(self._d(source), {('probe.py', 'mint'): 1} if binding == 'd' else {})
+
+    @unittest.skipUnless(_MATCH_NODES, "match statements need Python 3.10+")
+    def test_match_guard_writes_invalidate_only_their_binding(self):
+        for binding in ('d', 'e'):
+            for suffix in ('', ' and False'):
+                for fallback in ('', "        case _:\n            pass\n"):
+                    source = ("from ag2_sparrow.identity import delivery_id, TaskId\n"
+                              "def mint():\n    d = delivery_id(TaskId('task-x'), 'gw')\n"
+                              f"    match 1:\n        case _ if ({binding} := 'raw'){suffix}:\n"
+                              "            return {'delivery_id': d}\n" + fallback
+                              + "    return {'delivery_id': d}\n")
+                    with self.subTest(binding=binding, suffix=suffix, fallback=fallback):
+                        self.assertEqual(self._run_real(source),
+                                         'raw' if binding == 'd' else 'd:task-x@gw')
+                        self.assertEqual(self._d(source),
+                                         {('probe.py', 'mint'): 2} if binding == 'd' else {})
 
     def test_a_break_that_skips_the_loop_else_keeps_the_raw_value_counted(self):
         for exit_ in ('break', 'pass'):
