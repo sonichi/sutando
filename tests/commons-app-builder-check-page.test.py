@@ -54,6 +54,21 @@ for rule, bad in [
     got = cp.check(bad)
     check(f"error-{rule}", not got["ok"] and rule in rules(got, "errors"))
 
+for label, snippet in [
+    ("line-comment", "// {call}\n"),
+    ("block-comment", "/* {call} */"),
+    ("single-quoted", "const hint = '{call}';"),
+    ("double-quoted", 'const hint = "{call}";'),
+    ("template", "const hint = `{call}`;"),
+    ("regex", "const hint = /{call}/;"),
+]:
+    for rule, statement, bucket in [
+        ("await-ready", "await art.ready;", "errors"),
+        ("live-updates", "db.onChange(id, () => {});", "warnings"),
+    ]:
+        page = GOOD.replace(statement, snippet.replace("{call}", statement))
+        check(f"{rule}-not-silenced-by-{label}", rule in rules(cp.check(page), bucket))
+
 for rule, warn in [
     ("live-updates", GOOD.replace("db.onChange(id, () => {});", "")),
     ("storage", GOOD.replace("await art.ready;", "await art.ready; localStorage.x = 1;")),
@@ -100,6 +115,13 @@ for label, snippet in [
 check("commented-fetch-ignored", cp.check(GOOD.replace("await art.ready;", "await art.ready; /* fetch(x) */"))["ok"])
 check("db-only-page-needs-no-ready",
       cp.check(GOOD.replace("await art.ready;", "").replace("art.me.name", "'x'"))["ok"])
+check("runtime-mentioned-only-in-string-needs-no-ready",
+      cp.check(GOOD.replace("await art.ready;", "").replace("art.me.name", "'art.me.name'"))["ok"])
+no_database = GOOD.replace("db.onChange(id, () => {});", "").replace(
+    "await db.read(id);", "const hint = 'db.read(id)';").replace(
+    "const r = await db.createRow(id, {Name: art.me.name});", "const r = {ok: true};")
+check("database-mentioned-only-in-string-needs-no-subscription",
+      "live-updates" not in rules(cp.check(no_database), "warnings"))
 check("body-size-warns", "body-size" in rules(cp.check(GOOD + " " * cp.MAX_BODY_BYTES), "warnings"))
 
 with tempfile.TemporaryDirectory() as tmp:
