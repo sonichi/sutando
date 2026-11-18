@@ -148,6 +148,7 @@ class CoreLaunchStartsSupervisedNotifier(unittest.TestCase):
     def test_the_alert_knobs_are_always_set_so_a_server_global_value_never_reaches_the_watcher(self):
         self.h.tm("set-environment", "-g", "SUTANDO_NOTIFIER_ALERT_GRACE", "7")
         self.h.tm("set-environment", "-g", "SUTANDO_NOTIFIER_ALERT_REPEAT", "0")
+        self.h.tm("set-environment", "-g", "SUTANDO_NOTIFIER_ALERT_PILEUP", "9")
         self.h.tm("kill-session", "-t", "=sutando-core-watcher")
         run = self.h.launch()
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
@@ -155,15 +156,20 @@ class CoreLaunchStartsSupervisedNotifier(unittest.TestCase):
         lines = env.splitlines()
         self.assertIn("SUTANDO_NOTIFIER_ALERT_GRACE=", lines)
         self.assertIn("SUTANDO_NOTIFIER_ALERT_REPEAT=", lines)
+        self.assertIn("SUTANDO_NOTIFIER_ALERT_PILEUP=", lines)
 
     def test_custom_alert_knobs_reach_the_watcher_and_a_change_replaces_it(self):
         created_before = self.h.watcher_created()
         time.sleep(1.1)   # session_created has 1 s resolution
-        run = self.h.launch(extra_env={"SUTANDO_NOTIFIER_ALERT_GRACE": "60", "SUTANDO_NOTIFIER_ALERT_REPEAT": "0"})
+        run = self.h.launch(extra_env={"SUTANDO_NOTIFIER_ALERT_GRACE": "60", "SUTANDO_NOTIFIER_ALERT_REPEAT": "0",
+                                       "SUTANDO_NOTIFIER_ALERT_PILEUP": "5"})
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        _, _, env = self.h.watcher()
-        self.assertIn("SUTANDO_NOTIFIER_ALERT_GRACE=60", env.splitlines())
-        self.assertIn("SUTANDO_NOTIFIER_ALERT_REPEAT=0", env.splitlines())
+        lines = self.h.watcher()[2].splitlines()
+        self.assertIn("SUTANDO_NOTIFIER_ALERT_GRACE=60", lines)
+        self.assertIn("SUTANDO_NOTIFIER_ALERT_REPEAT=0", lines)
+        self.assertIn("SUTANDO_NOTIFIER_ALERT_PILEUP=5", lines)
+        version = next(l for l in lines if l.startswith("SUTANDO_NOTIFIER_VERSION="))
+        self.assertTrue(version.endswith("-a60-r0-u5"), f"every alert knob is in the identity: {version}")
         self.assertNotEqual(created_before, self.h.watcher_created(), "a changed knob replaces the supervisor")
 
     def test_restart_tears_the_watcher_down_with_the_core(self):
