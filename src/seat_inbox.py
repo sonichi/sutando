@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import roster_membership  # noqa: E402
 
 NONE = {"seat": "", "worker": "", "label": ""}
 
@@ -34,8 +35,7 @@ def _rostered(workspace: Path) -> set:
         return set()
     if not isinstance(rows, dict):
         return set()
-    return {wid for wid, row in rows.items()
-            if isinstance(wid, str) and not (isinstance(row, dict) and row.get("state") == "retired")}
+    return roster_membership.members(rows)
 
 
 def _worker(wid: str) -> dict:
