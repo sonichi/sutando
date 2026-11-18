@@ -341,7 +341,7 @@ ensure_task_notifier() {
   expected_version="$(
     cksum "${version_files[@]}" \
       | cksum | awk '{print $1 "-" $2}'
-  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-s$(printf '%s' "${SUTANDO_STOP_INTERRUPT:-}" | cksum | awk '{print $1}')"
+  )-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-s$(printf '%s' "${SUTANDO_STOP_INTERRUPT:-}" | cksum | awk '{print $1}')-mtype"
   if session_exists "$WATCHER_SESSION"; then
     active_version="$(
       tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \
@@ -355,6 +355,8 @@ ensure_task_notifier() {
   fi
   NOTIFIER_ENV_ARGS=(-e "SUTANDO_TMUX_SOCKET=$TMUX_SOCKET" -e "SUTANDO_TMUX_SESSION=$SESSION")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_VERSION=$expected_version")
+  # A Codex core always types; pinned so a stale or global "alert" in the tmux server never reaches it.
+  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_STANDBY_MODE=type")
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   # The stop handler reads it in the watcher's environment; it is in the version, so a change restarts it.
   # Always set, empty included: an omitted one inherits whatever the tmux server's global env holds.

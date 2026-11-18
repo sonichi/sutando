@@ -27,7 +27,7 @@ concurrency:
 jobs:
   lint-host-label:
     name: refuse raw hostname-slug recipe in agent docs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
 
     steps:

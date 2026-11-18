@@ -35,7 +35,10 @@
   button { min-width: 44px; cursor: pointer; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
   button[disabled] { opacity: .55; cursor: not-allowed; }
-  .add { display: grid; gap: 8px; margin-bottom: 14px; }
+  /* A grid track is as wide as its widest content by default: a select with a long option, or
+     a long unbroken value, would push the page wider than a phone. */
+  .add { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; margin-bottom: 14px; }
+  .add > * { min-width: 0; max-width: 100%; }
   .week { display: grid; gap: 10px; }
   .day { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; min-width: 0; }
   .day.now { background: var(--today); border-color: var(--accent); }

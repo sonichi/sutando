@@ -2160,5 +2160,49 @@ class TestLiveIdleSeatUnderAPinnedBanner(unittest.TestCase):
         self.assertEqual((st[0], st[3]), ("blocked-human", "usage-limit"))
 
 
+class TestUsageLimitContinuingShortly(unittest.TestCase):
+    """Near the reset the CLI's usage-limit footer reads "Usage limit reached · limit resets <t>" over
+    "Continuing shortly · Esc to cancel". The captured tail often holds only the second row, which
+    read as an unknown prompt: a held seat was carded as "awaiting user: unknown" instead of as its
+    usage limit. The panes are synthetic, reduced from a real capture."""
+
+    FULL = "  Usage limit reached · limit resets 3pm\n  Continuing shortly · Esc to cancel\n"
+    ROW_ONLY = {
+        "status line, empty composer":
+            "  Agent: request failed\n  ❯\n  Continuing shortly · Esc to cancel\n",
+        "status line, no composer":
+            "  Agent: request failed\n  Continuing shortly · Esc to cancel\n",
+    }
+
+    def test_the_full_footer_is_the_usage_limit(self):
+        self.assertEqual(classify(self.FULL)[0], "usage-limit")
+        self.assertEqual(compose_state(self.FULL, "idle", True)[:2],
+                         ("blocked-human", "awaiting user: usage-limit"))
+
+    def test_the_continuing_row_alone_is_the_usage_limit_not_an_unknown_prompt(self):
+        for name, pane in self.ROW_ONLY.items():
+            with self.subTest(name):
+                self.assertEqual(classify(pane)[0], "usage-limit")
+                self.assertEqual(compose_state(pane, "idle", True)[1], "awaiting user: usage-limit")
+
+    def test_the_footer_under_a_session_limit_stays_that_screen(self):
+        pane = "  You've hit your session limit · resets 3pm\n  Continuing shortly · Esc to cancel\n"
+        self.assertEqual(classify(pane)[0], "session-limit")
+
+    def test_the_earlier_phase_of_the_same_footer_reads_the_same(self):
+        for row in ("Continuing automatically at 3pm · Esc to cancel",
+                    "Continuing automatically shortly · Esc to cancel"):
+            with self.subTest(row):
+                self.assertEqual(classify(f"  Agent: idle\n  {row}\n")[0], "usage-limit")
+
+    def test_only_the_cancellable_row_is_the_limit(self):
+        """A "Continuing shortly" row that asks for Enter is not the footer and keeps its own reading."""
+        pane = "  Something new\n  Continuing shortly · Press Enter to retry now\n"
+        self.assertNotEqual(classify(pane)[0], "usage-limit")
+
+    def test_a_real_dialog_under_the_footer_is_that_dialog(self):
+        self.assertEqual(classify(self.FULL + _LOGIN_MENU)[0], "login")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -550,7 +550,12 @@ start_gateway_lanes() {
     # SUTANDO_SUPERVISED=1 marks the launch as supervised (stdout persisted by
     # the redirect below); the bridge stamps launched_via into gateway-status
     # and skips its own bare-launch file log. See remote_gateway_bridge._log.
-    if [ -n "$PY" ] && "$PY" "$REPO/scripts/connections.py" legacy-parked > /dev/null 2>&1; then
+    _gw_ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || _gw_ws=""
+    if [ -n "$PY" ] && bash "$REPO/src/launchd/gateway-bridge-lib.sh" core-gate "$_gw_ws" 2>/dev/null; then
+      # The core gate: sparrowd runs the bridge; a second sparrowd waits on the first one's lock.
+      "$PY" "$REPO/src/sparrowd.py" --core --agent-bridges >> "$LOGS_DIR/remote-gateway-bridge.log" 2>&1 &
+      echo "  ✓ gateway bridge (sparrowd core — waits if one already runs)"
+    elif [ -n "$PY" ] && "$PY" "$REPO/scripts/connections.py" legacy-parked > /dev/null 2>&1; then
       echo "  ⊘ gateway bridge (legacy) parked by a primary move — scripts/connections.py unpark '' to resume"
     elif [ -n "$PY" ]; then
       # Once a named row holds the primary, the legacy bridge is a secondary: it must not

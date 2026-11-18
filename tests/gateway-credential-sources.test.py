@@ -2045,7 +2045,9 @@ return env
 READER_WRITES = {("bridge_environ", "env.update(decl['env'], REMOTE_PROACTIVE_ROOM='')"),
                  ("bridge_environ", "env.update(_sources.bridge_carried_config(host, read_regular))"),
                  ("bridge_environ", "env.update(token_env)"),
-                 ("main", "os.environ.clear()"), ("main", "os.environ.update(environ)")}
+                 ("main", "os.environ.clear()"), ("main", "os.environ.update(environ)"),
+                 # A pool worker's lane dirs and instance (worker_lane.bridge_overlay): no credential.
+                 ("main", "os.environ.update(overlay)")}
 MAPPING_WRITES = {"update", "setdefault", "__setitem__", "__delitem__", "pop", "popitem", "clear", "putenv", "unsetenv",
                   "__ior__", "__or__", "__ror__"}
 # Every reach of a process environment in the reader, by (function, the expression holding it).
