@@ -255,9 +255,9 @@ def run_suite(workspace: Path, suite: Dict[str, Any], repeat: int,
     rows: List[Dict[str, Any]] = []
     started_at = utc_now()
     for repetition in range(1, repeat + 1):
-        for case in suite["cases"]:
-            task_id = "task-bench-{}-{}-{}".format(
-                run_id, _safe_id(case["id"]), repetition)
+        for case_index, case in enumerate(suite["cases"], 1):
+            task_id = "task-bench-{}-{}-{}-{}".format(
+                run_id, case_index, _safe_id(case["id"]), repetition)
             submitted = time.perf_counter()
             _submit(workspace / "tasks", task_id, case["prompt"])
             response, result_path, wait_ms = _wait_for_result(
