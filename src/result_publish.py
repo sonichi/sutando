@@ -130,8 +130,22 @@ def worker_published_path(path: str | Path, environ=None, workspace=None) -> Pat
     """Where this session publishes `path`: a proactive file from a pool worker's session that acts as
     its own agent carries the worker's stamp (`connections.session_proactive_name`), so only that
     worker's lane delivers it. The core's session, a worker acting through the core, a copy of this
-    module without the engine's `connections`, and every task result publish under the name given."""
+    module without the engine's `connections`, and every task result publish under the name given.
+
+    A relative `path` is anchored to the workspace, never to the process's cwd: the session's cwd
+    is the repo, so a bare "results/..." would otherwise resolve wherever the caller happened to be
+    and land where no reader looks."""
     path = Path(path)
+    if not path.is_absolute():
+        if workspace is not None:
+            ws = Path(workspace)
+        else:
+            try:
+                from . import workspace_default
+            except ImportError:
+                import workspace_default
+            ws = workspace_default.resolve_workspace(migrate=False)
+        path = (ws / path).resolve()
     try:
         import connections
     except ImportError:
