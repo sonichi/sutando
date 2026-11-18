@@ -281,6 +281,28 @@ class Consumers(_Hermetic):
             self.assertTrue(plan[1]["REMOTE_TASK_TOKEN"].endswith(tok))
         self._each_tier(check)
 
+    def test_health_repair_preserves_pair_for_child_discovery(self):
+        discovery = _load("repair_child_discovery", REPO / "packages" / "ag2-sparrow" /
+                          "ag2_sparrow" / "gateway_credential_sources.py")
+        for source in ("repo-split", "active-lane-split", "repo-combined"):
+            with self.subTest(source=source):
+                self.setUp()
+                active = {}
+                if source == "active-lane-split":
+                    active = {"REMOTE_TASK_URL": self.URL,
+                              "REMOTE_TASK_TOKEN": "fake-repair-secret"}
+                else:
+                    raw = (f"{self.URL}|fake-repair-secret" if source == "repo-combined"
+                           else "fake-repair-secret")
+                    self.write_repo_env(f"REMOTE_TASK_URL={self.URL}\nREMOTE_TASK_TOKEN={raw}\n")
+                with mock.patch.object(rc, "active_lane_credentials", return_value=active), \
+                        mock.patch.object(self.hc, "_bridge_interpreter", return_value="python3"):
+                    plan = self.hc._bridge_launch_plan("gateway-bridge")
+                self.assertIsNotNone(plan)
+                child = discovery.discover(plan[1])
+                self.assertEqual((child.url, child.token), (self.URL, "fake-repair-secret"))
+                self.assertFalse(child.fatal)
+
     def test_cron_notify(self):
         def check(tok):
             self.assertEqual(self.cron._load_gateway(), (self.URL, tok))

@@ -4297,12 +4297,13 @@ def _bridge_launch_plan(name: str) -> "tuple[str, dict] | None":
         # channels/ag2space/.env before launching it.
         gw_env = _load_channel_env("ag2space")
         # startup.sh sources the channel env over the inherited one, so it wins here too.
-        token = _relay_creds(channel=gw_env,
-                             environ=collections.ChainMap(gw_env, os.environ)).raw
-        if not token:
+        creds = _relay_creds(channel=gw_env,
+                             environ=collections.ChainMap(gw_env, os.environ))
+        if not creds.raw:
             return None
         child_env.update(gw_env)
-        child_env["REMOTE_TASK_TOKEN"] = token
+        child_env["REMOTE_TASK_TOKEN"] = creds.raw
+        child_env["REMOTE_TASK_URL"] = creds.base_url
         # Marks the launch supervised so the bridge stamps launched_via and
         # skips its own bare-launch file log (see remote_gateway_bridge._log).
         child_env["SUTANDO_SUPERVISED"] = "1"
