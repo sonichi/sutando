@@ -47,6 +47,12 @@ class RoomArgTests(unittest.TestCase):
         self.assertIsNotNone(cli._room_arg_problem("!room id:test.invalid"))
         self.assertIsNotNone(cli._room_arg_problem(None))
 
+    def test_a_room_alias_reaches_say(self):
+        with patch.object(cli._say, "say", return_value={"ok": True}) as say:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cli._main(["say", "#team:test.invalid", "hi"])
+        self.assertEqual(say.call_args.args[1], "#team:test.invalid")
+
     def test_room_ids_and_aliases_pass(self):
         for room in ("!room:test.invalid", "#team:test.invalid"):
             self.assertIsNone(cli._room_arg_problem(room))
