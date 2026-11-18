@@ -50,9 +50,12 @@ on a revoked Slack token, and each had been restarted ~23,600 times.
 ## Impact
 
 - **No results delivered from 06:59:37 to 07:57 PST.** Delivery then trickled:
-  5 results between 07:57 and 08:40, against 8–14 an hour overnight. It
-  recovered at 08:54, with 11 results by 08:56. Up to 8 owner and s.space
-  tasks were queued without replies at the worst point.
+  8 results from 07:57 to 08:40 (3 at 07:57, then 5 more by 08:40), against
+  7–13 an hour overnight. It recovered at 08:54, with 10 results by 08:56. Up
+  to 8 owner and s.space tasks were queued without replies at the worst point.
+  Counts here and in the timeline are from the core's archived result records:
+  one per room task, so a late duplicate or a suppressed second copy of a
+  result is not counted again.
 - **The live core** (same session, so conversation history is intact) could
   not reach the API from ~07:30 until 07:47. From 08:23 to ~08:40 it failed
   again with `502`/`408` retries. In between it was very slow: it had to
@@ -70,7 +73,7 @@ on a revoked Slack token, and each had been restarted ~23,600 times.
 | --- | --- |
 | 00:02 | Core account hits its weekly limit. Someone runs `/login` in the core to a different organization. Claude Code warns "can't use thinking from another organization." |
 | 00:20–01:03 | Separate overload episode (Chrome, iOS Simulator, Docker VM, load peaking ~538). The proxy exits on startup with "No OAuth token found in macOS keychain" until its 7th launchd run listens at 01:03:31. |
-| 01:05–06:59 | Degraded but working: 8–14 results/hour. The proxy logs a steady stream of Keychain-read failures (pass-through engaged) and `ECONNRESET` all night. Load ~80–95. |
+| 01:05–06:59 | Degraded but working: 7–13 results/hour. The proxy logs a steady stream of Keychain-read failures (pass-through engaged) and `ECONNRESET` all night. Load ~80–95. |
 | 06:59:37 | Last result delivered. |
 | 07:02:11 | Pool worker starts `for i in $(seq 1 30); do node -e "for(;;){}" & done`, runs its test 6×, then `pkill -f "for(;;){}"`. The pkill matches nothing; the follow-up `pgrep … \| wc -l` prints `0`. |
 | ~07:30 | Load 290–340. Core shows `502 Bad Gateway · Retrying`; proxy logs `read ECONNRESET` / `write EPIPE`. |
@@ -85,8 +88,8 @@ on a revoked Slack token, and each had been restarted ~23,600 times.
 | 08:23 | Core shows `API error · Retrying` again. Proxy logs Keychain pass-through, `write EPIPE`, `read ECONNRESET`. |
 | 08:25 | An empty probe through the proxy gets no answer in 30 s, while the API answers directly in 0.1 s. `taskpolicy -B` lifts background throttling on the proxy pid; probes still time out. |
 | 08:26 | Load back at 273; the proxy is runnable but gets ~0% CPU. Found 8 orphaned `zsh` shells (ppid 1, 20 h old) from a review session's flaky-test rerun loop at 22–45% CPU each, plus `task-notifier.sh` spinning at ~67%. Chrome (41 runnable), a WebKit page, the Dropbox GPU helper, the iOS Simulator and the Docker VM make up the rest. |
-| 08:28–08:40 | Load 110–180. Core alternates between `408`/`502` retries and progress. A probe takes 18 s to return a 401. One result at 08:29, four at 08:40. |
-| by 08:59 | Leaked shells gone, iOS Simulator and Docker quit. 1-minute load briefly reads ~18. 11 results delivered 08:54–08:56. Chrome and Dropbox still running. |
+| 08:28–08:40 | Load 110–180. Core alternates between `408`/`502` retries and progress. A probe takes 18 s to return a 401. One result at 08:29, three at 08:40. A fourth result file at 08:40 is a late duplicate of an earlier pool result, not a delivery. |
+| by 08:59 | Leaked shells gone, iOS Simulator and Docker quit. 1-minute load briefly reads ~18. 10 results delivered 08:54–08:56. An eleventh result file there is a suppressed second copy for one of those tasks. Chrome and Dropbox still running. |
 | 08:59:38 | Same worker starts `under_load.py` in the background with `BUSY=220 RUNS=10`. |
 | 09:01–09:03 | Load back to ~250. Two launchd jobs found crash-looping: `ai.openclaw.gateway` and `com.clawdbot.gateway`, each restarting every few seconds on a Slack `invalid_auth` (~23,600 runs each). |
 | 09:03:27 | Worker starts a second run, `BUSY=220 RUNS=20` (WebKit + run-smokes). |
