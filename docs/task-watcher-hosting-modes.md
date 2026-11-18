@@ -136,7 +136,9 @@ the owner is never paged for it. A ready watcher ends the episode with one log l
 and restarts: a seat's Mod watcher has been seen ready 51 s after the session started (before
 the launcher trusted the `--add-dir` folder), and a worker relaunched several times took about 2.5 min.
 The Mod's own restart back-off (5 s doubling) passes 300 s only after six early exits in a row. A Codex seat,
-or a Claude seat whose Mod was refused or turned off, keeps the typing standby above. The health check's
+or a Claude seat whose Mod was refused or turned off, keeps the typing standby above. Every launcher sets the mode explicitly (the Codex core pins `type`) and folds it into the supervisor's
+identity, and passes `SUTANDO_NOTIFIER_ALERT_GRACE` / `SUTANDO_NOTIFIER_ALERT_REPEAT` always (empty means the
+supervisor's default), so a value left in the tmux server's global environment never reaches a supervisor. The health check's
 `claude-task-notifier` row on a Mod core is `ok` only while a ready session watcher holds the core's
 inbox; its warning says how many tasks are waiting, with no path.
 

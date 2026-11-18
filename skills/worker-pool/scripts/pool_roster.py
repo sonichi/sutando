@@ -502,7 +502,7 @@ def apply_profile_label_overrides(workspace, labels: dict, config_version: int,
                 pending.append(wid)
         changed = False
         for wid, row in workers.items():
-            if row["state"] == "retired":
+            if not roster_membership.is_member(row):
                 continue
             wanted = labels.get(wid)
             if wanted is None:
@@ -575,8 +575,7 @@ def admits_deliveries(workspace, worker_id: str) -> bool:
         return True
     if worker_id in (raw.get("removed") or []):
         return False
-    row = (raw.get("workers") or {}).get(worker_id)
-    return not (isinstance(row, dict) and row.get("state") == "retired")
+    return roster_membership.is_member((raw.get("workers") or {}).get(worker_id))
 
 
 def set_worker_state(workspace, target: str, state: str, *, unbind: bool = False,

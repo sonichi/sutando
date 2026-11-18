@@ -67,6 +67,15 @@ class DelegationTests(unittest.TestCase):
         self.assertEqual(got, ["real"])
         rule.assert_called_once_with(roster["workers"])
 
+    def test_pool_roster_admits_deliveries_takes_membership_from_the_rule(self):
+        inverted = lambda row: isinstance(row, dict) and row.get("state") == "retired"
+        with mock.patch.object(roster_membership, "is_member", side_effect=inverted) as rule:
+            self.assertTrue(pool_roster.admits_deliveries(self.ws, "gone"))
+            self.assertFalse(pool_roster.admits_deliveries(self.ws, "real"))
+        rule.assert_any_call({"state": "retired"})
+        self.assertFalse(pool_roster.admits_deliveries(self.ws, "gone"))
+        self.assertTrue(pool_roster.admits_deliveries(self.ws, "unknown"))
+
     def test_health_snapshot_workers_take_membership_from_the_rule(self):
         with mock.patch.object(roster_membership, "is_member", side_effect=lambda row: row.get("state") == "retired"):
             got = health_snapshot._workers(self.ws)

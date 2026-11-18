@@ -382,7 +382,7 @@ exit 0
                 return
             time.sleep(0.01)
         self.fail(f"heartbeat stub pid {pid} did not exit")
-    def _notifier_version(self, handler="", stop=""):
+    def _notifier_version(self, handler="", stop="", mode="-mtype"):
         first = subprocess.check_output([
             "cksum",
             str(self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"),
@@ -400,7 +400,7 @@ exit 0
             check=True, text=False).stdout.decode().split()[0]
         stop_cksum = subprocess.run(["cksum"], input=stop.encode(), capture_output=True,
                                     check=True, text=False).stdout.decode().split()[0]
-        return f"{checksum[0]}-{checksum[1]}-h{handler_cksum}-s{stop_cksum}"
+        return f"{checksum[0]}-{checksum[1]}-h{handler_cksum}-s{stop_cksum}{mode}"
 
     def run_launcher(self, *args, env_extra=None, launcher="src/agent/start-cli.sh"):
         env = dict(os.environ)
@@ -1202,6 +1202,22 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         calls = self._tmux_calls()
         self.assertNotIn("kill-session -t =sutando-core-watcher", calls)
         self.assertNotIn("new-session -d -s sutando-core-watcher", calls)
+
+    def test_a_stale_global_alert_mode_never_reaches_the_codex_standby(self):
+        result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "codex", "SUTANDO_STANDBY_MODE": "alert"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        watcher = [l for l in self._tmux_calls().splitlines() if "new-session -d -s sutando-core-watcher" in l]
+        self.assertEqual(len(watcher), 1, self._tmux_calls())
+        self.assertIn("-e SUTANDO_STANDBY_MODE=type", watcher[0])
+        self.assertNotIn("SUTANDO_STANDBY_MODE=alert", watcher[0])
+
+    def test_a_watcher_from_before_the_mode_was_pinned_is_replaced(self):
+        result = self.run_launcher(env_extra={
+            "TMUX_ACTIVE_RUNTIME": "codex", "TMUX_WATCHER_EXISTS": "1",
+            "TMUX_ACTIVE_NOTIFIER_VERSION": self._notifier_version(mode="")})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("kill-session -t =sutando-core-watcher", self._tmux_calls())
+        self.assertIn("-e SUTANDO_STANDBY_MODE=type", self._tmux_calls())
 
     def test_turning_the_stop_interrupt_on_or_off_replaces_the_watcher(self):
         for running, wanted in (("", "1"), ("1", ""), ("1", "1")):
