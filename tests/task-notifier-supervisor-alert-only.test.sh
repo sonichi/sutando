@@ -2,10 +2,11 @@
 # task-notifier-supervisor.sh with SUTANDO_STANDBY_MODE=alert (a Claude seat whose watcher the
 # task-watch Mod hosts): the notifier never runs, so nothing is typed into the pane; after the
 # alert grace with no ready session watcher the owner is alerted (a log line, a proactive result
-# naming the seat, never a path, and the opt-in macOS notification), once per outage: no timed
-# reminder unless one is opted into. A DM that was certainly not published is retried with a
-# bounded back-off; the macOS notification fires once per outage. A ready watcher ends the outage
-# with no owner alert. Without the mode the same supervisor arms the typing notifier, as before.
+# naming the seat, never a path, and the opt-in macOS notification), once per outage the supervisor
+# observes: no timed reminder unless one is opted into. Only a DM that was certainly not published is
+# retried, with a bounded back-off, so a retry never duplicates one; a restart mid-outage adds one
+# alert. A ready watcher ends the outage with no owner alert. Without the mode the same supervisor
+# arms the typing notifier, as before.
 #
 # Part 1 sources the supervisor and drives run_alert_only on a fake clock and a scripted verdict,
 # and the real alert text. Part 2 (tmux only; SKIP printed otherwise) runs the real supervisor in
@@ -128,6 +129,11 @@ for c in ":|300 0 0" "600:900|600 900 0" "abc:abc|300 0 2" "$BIG:$BIG|300 0 2" "
   [ "$got" = "$want" ] || { r=1; echo "    settings ${pair}: got '$got', want '$want'"; }
 done
 check "(29) GRACE/REPEAT accept whole seconds in range (leading zeros decimal), else the default with one warning each" "$r"
+# The retired pile-up setting, which an earlier install could save, is read by nothing.
+pile="$(SUTANDO_SUPERVISOR_SOURCE_ONLY=1 SUTANDO_NOTIFIER_SCRIPT="$WORK/never-run.sh" SUTANDO_NOTIFIER_ALERT_PILEUP=5 \
+  bash -c 'source "$1"; printf "%s %s" "$ALERT_GRACE" "$ALERT_REPEAT"' _ "$SUPERVISOR" 2>/dev/null)"
+[ "$pile" = "300 0" ] && r=0 || r=1
+check "(29) ...and a saved pile-up setting changes neither (no reminder, the default grace)" "$r" "$pile"
 # shellcheck disable=SC2046
 UNIT_GRACE=abc unit $(nos 70)
 [ "$(cat "$WORK/alerts")" = "alert at 300 after 300" ] && ! grep -q "expression expected" "$WORK/unit.err" && r=0 || r=1
@@ -477,5 +483,5 @@ else
   check "(8) ...and raises no unwatched-inbox alert" "$r"
 fi
 
-if [ "$fail" = 0 ]; then echo "  ok  alert-only standby types nothing, alerts once per outage and retries a DM that did not publish"; else echo "  FAILED"; fi
+if [ "$fail" = 0 ]; then echo "  ok  alert-only standby types nothing, alerts once per observed outage and retries only a DM that did not publish"; else echo "  FAILED"; fi
 exit "$fail"

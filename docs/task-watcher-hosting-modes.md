@@ -125,8 +125,8 @@ mode the supervisor never starts the notifier: no task and no nudge is typed int
 `role-present --ready` as before; once no ready session watcher has held the inbox for
 `SUTANDO_NOTIFIER_ALERT_GRACE` (300 s), it writes an `ALERT` line to `logs/claude-task-notifier.log`
 and alerts the owner: a `results/proactive-standby-unwatched-*.txt` (the owner's DM) and the opt-in macOS
-notification, the same pair a channel bridge's wrapper uses for its notices. That is the one alert of
-the outage: there is no timed reminder (`SUTANDO_NOTIFIER_ALERT_REPEAT` defaults to 0; a positive value
+notification, the same pair a channel bridge's wrapper uses for its notices. A supervisor sends that
+alert once for each outage it observes: there is no timed reminder (`SUTANDO_NOTIFIER_ALERT_REPEAT` defaults to 0; a positive value
 opts into a reminder every that many seconds). Both settings take whole seconds, the grace 1 to 86400 and
 the repeat 0 to 86400; any other value is ignored with one log line and the default used. A DM that was
 certainly not published (`src/result_publish.py` exits 1 or 2, which by its contract means nothing was
@@ -134,9 +134,10 @@ written, or the seat's workspace has no `results/`) is retried on the next poll,
 to every 300 s). Every other outcome counts as sent and is never retried: 0; 3, renamed but the directory
 sync unconfirmed; and any other exit, a kill included, which is logged as an unknown outcome. A retry
 there could duplicate the DM, so the rare publisher killed before its rename costs that one alert instead.
-The macOS notification fires once per outage, on the first attempt, never on a retry. The outage lives in
-the supervisor's memory, so a supervisor restarted mid-outage sends exactly one more alert, after its own
-grace; that is accepted. Each alert names
+A retry therefore never duplicates a DM. The macOS notification fires once for each outage a supervisor
+observes, on its first attempt, never on a retry. The outage lives only in the supervisor's memory, so a
+supervisor restarted mid-outage observes it afresh: if the outage outlasts the new supervisor's grace, it
+sends one more alert and notification. That is accepted. Each alert names
 the seat, judged from the inbox by `src/seat_inbox.py` ("the core" for `<workspace>/tasks`, "worker" and the
 first 8 characters of its id for a rostered worker's `deliveries/<id>` or own tasks folder), and how long it has
 been unwatched ("under a minute" below 60 s); it never carries the inbox path or the tmux session name, which only the local log
@@ -145,9 +146,12 @@ the owner is never paged for it. A ready watcher ends the outage with one log li
 and restarts: a seat's Mod watcher has been seen ready 51 s after the session started (before
 the launcher trusted the `--add-dir` folder), and a worker relaunched several times took about 2.5 min.
 The Mod's own restart back-off (5 s doubling) passes 300 s only after six early exits in a row. A Codex seat,
-or a Claude seat whose Mod was refused or turned off, keeps the typing standby above. Every launcher sets the mode explicitly (the Codex core pins `type`) and folds it into the supervisor's
-identity, and passes `SUTANDO_NOTIFIER_ALERT_GRACE` / `SUTANDO_NOTIFIER_ALERT_REPEAT` always (empty means the
-supervisor's default), so a value left in the tmux server's global environment never reaches a supervisor. A host
+or a Claude seat whose Mod was refused or turned off, keeps the typing standby above. Every launcher sets the
+mode explicitly and folds it into the supervisor's identity. The Claude core launcher and the worker-pool ensure
+also pass `SUTANDO_NOTIFIER_ALERT_GRACE` / `SUTANDO_NOTIFIER_ALERT_REPEAT` always (empty means the supervisor's
+default) and fold them into that identity, so a value left in the tmux server's global environment never reaches
+a supervisor. The Codex core pins `type`, whose standby never reads the alert settings, so its launcher passes
+neither and leaves them out of its identity. A host
 whose worker-pool remedy timer was installed while it saved these settings (an earlier release) keeps them
 in the timer's job: the sweep passes them to each worker's supervisor ensure, so GRACE and REPEAT stay in
 force there as owner settings, validated like any other value, and the pile-up setting saved beside them is
@@ -272,11 +276,15 @@ how `tests/watch-tasks-stream-shutdown-leaves-inflight-claim.test.py` interrupts
 - `tests/watcher-identity.test.py`: the verdicts, their inbox scoping and the ready gate.
 - `tests/start-cli-claude-task-notifier.test.py`: the launcher starts the supervisor for the core,
   alert-only when it installed the Mod.
-- `tests/task-notifier-supervisor-alert-only.test.sh`: the alert-only standby types nothing, alerts
-  once per outage after the grace with no path, retries a DM that was not published (macOS notified
-  once), validates its settings, reminds only when opted in, and stands down silently. Its tmux part
-  prints SKIP where tmux is missing. `scripts/mutation-check-standby-alert.sh` re-runs
-  it against named mutants of the supervisor and fails if any survives.
+- `tests/task-notifier-supervisor-alert-only.test.sh`: the alert-only standby types nothing, alerts once
+  per outage it observes, after the grace and with no path, retries only a DM that was not published
+  (macOS notified once), adds one alert after a restart mid-outage, validates its settings and ignores the
+  retired pile-up setting, reminds only when opted in, and stands down silently. Its tmux part prints
+  SKIP where tmux is missing. `tests/skills/worker-pool/pool-remedy-timer-old-alert-settings.test.py`:
+  a timer an earlier install left with alert settings keeps GRACE and REPEAT in force, the pile-up
+  setting reaches no supervisor, nothing migrates them, and an explicit reinstall removes them.
+  `scripts/mutation-check-standby-alert.sh` re-runs these against named mutants and fails if any
+  survives.
 - `tests/task-notifier-supervisor-alert-decision.test.py`: with no tmux, the real supervisor in alert
   mode alerts and never starts the typing notifier; an unregistered inbox is logged and never
   pages the owner; without the mode the notifier starts.

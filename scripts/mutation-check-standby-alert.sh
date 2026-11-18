@@ -7,15 +7,22 @@ set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MIRROR="$(mktemp -d "${TMPDIR:-/tmp}/sut-alert-mut.XXXXXX")"
 trap 'rm -rf "$MIRROR"' EXIT
-mkdir -p "$MIRROR/tests" "$MIRROR/packages/ag2-sparrow"
+mkdir -p "$MIRROR/tests/skills/worker-pool" "$MIRROR/packages/ag2-sparrow" "$MIRROR/skills"
 cp -R "$REPO/src" "$REPO/scripts" "$MIRROR/"
+cp -R "$REPO/skills/worker-pool" "$REPO/skills/task-workstream-grouping" "$REPO/skills/schedule-crons" "$MIRROR/skills/"
 cp -R "$REPO/tests/_helpers" "$MIRROR/tests/"
-cp "$REPO/tests/task-notifier-supervisor-alert-only.test.sh" "$REPO/tests/result-publish.test.py" "$MIRROR/tests/"
+cp "$REPO/tests/task-notifier-supervisor-alert-only.test.sh" "$REPO/tests/result-publish.test.py" \
+   "$REPO/tests/codex-core-launcher.test.py" "$MIRROR/tests/"
+cp "$REPO/tests/skills/worker-pool/pool-remedy-timer-old-alert-settings.test.py" "$MIRROR/tests/skills/worker-pool/"
 cp -R "$REPO/packages/ag2-sparrow/ag2_sparrow" "$MIRROR/packages/ag2-sparrow/"
 SUP="src/agent/codex/cli/task-notifier-supervisor.sh"
 PUB="src/result_publish.py"
+CODEX="src/agent/codex/cli/start-cli.sh"
+ENSURE="skills/worker-pool/scripts/worker-watcher-supervisor.sh"
 ALERT=(env SUT_ALERT_TEST_SKIP_TMUX=1 bash tests/task-notifier-supervisor-alert-only.test.sh)
 PUBT=(python3 tests/result-publish.test.py PublisherFailurePaths)
+OLDT=(python3 tests/skills/worker-pool/pool-remedy-timer-old-alert-settings.test.py)
+CODEXT=(python3 tests/codex-core-launcher.test.py CodexCoreLauncherTests.test_the_alert_only_knobs_are_inert_on_the_codex_standby)
 bad=0
 
 run_in_mirror() { (cd "$MIRROR" && "$@") >"$MIRROR/.out" 2>&1; }
@@ -40,7 +47,7 @@ open(p, "w").write(s.replace(o, os.environ["NEW"]))' "$file"; then
 }
 
 echo "alert-only standby mutation check:"
-run_in_mirror "${ALERT[@]}" && run_in_mirror "${PUBT[@]}" \
+run_in_mirror "${ALERT[@]}" && run_in_mirror "${PUBT[@]}" && run_in_mirror "${OLDT[@]}" && run_in_mirror "${CODEXT[@]}" \
   || { echo "  baseline FAILED in the mirror; nothing to measure"; cat "$MIRROR/.out"; exit 1; }
 
 # The retry: only a DM that was certainly not published (exit 1 or 2, or no results/) is retried,
@@ -77,6 +84,18 @@ mutant filename-shared "$SUP" '-$$-${alert_seq}.txt"' '-$$.txt"' "${ALERT[@]}"
 mutant publish-no-unconfirmed-error "$PUB" '            raise PublishedUnconfirmed(exc.errno, f"published {target}, but syncing its directory failed: {exc}") from exc' '            raise' "${PUBT[@]}"
 mutant publish-unconfirmed-not-exit3 "$PUB" '        return EXIT_PUBLISHED_UNCONFIRMED' '        raise' "${PUBT[@]}"
 mutant publish-any-oserror-is-exit3 "$PUB" '    except PublishedUnconfirmed as exc:' '    except OSError as exc:' "${PUBT[@]}"
+
+# The retired pile-up setting is read by nothing; the Codex standby takes no alert setting at all;
+# settings an earlier timer install saved stay in force until a reinstall writes the job without them.
+mutant pileup-as-repeat-default "$SUP" 'ALERT_REPEAT="$(alert_setting SUTANDO_NOTIFIER_ALERT_REPEAT 0 0 86400)"' 'ALERT_REPEAT="$(alert_setting SUTANDO_NOTIFIER_ALERT_REPEAT "${SUTANDO_NOTIFIER_ALERT_PILEUP:-0}" 0 86400)"' "${ALERT[@]}"
+mutant pileup-as-grace-default "$SUP" 'ALERT_GRACE="$(alert_setting SUTANDO_NOTIFIER_ALERT_GRACE 300 1 86400)"' 'ALERT_GRACE="$(alert_setting SUTANDO_NOTIFIER_ALERT_GRACE "${SUTANDO_NOTIFIER_ALERT_PILEUP:-300}" 1 86400)"' "${ALERT[@]}"
+mutant pileup-forwarded-by-worker-ensure "$ENSURE" 'SUTANDO_NOTIFIER_GRACE_PERIOD SUTANDO_NOTIFIER_ROLE_POLL; do' 'SUTANDO_NOTIFIER_GRACE_PERIOD SUTANDO_NOTIFIER_ROLE_POLL SUTANDO_NOTIFIER_ALERT_PILEUP; do' "${OLDT[@]}"
+mutant saved-settings-dropped-by-worker-ensure "$ENSURE" '-e "SUTANDO_NOTIFIER_ALERT_REPEAT=${SUTANDO_NOTIFIER_ALERT_REPEAT:-}"' '-e "SUTANDO_NOTIFIER_ALERT_REPEAT="' "${OLDT[@]}"
+mutant spawn-rewrites-the-timer skills/worker-pool/scripts/spawn_worker.py '            if st.get("loaded") and (want is None or st.get("stop_interrupt") == want):' '            if False:' "${OLDT[@]}"
+mutant reinstall-saves-alert-settings skills/worker-pool/scripts/pool_remedy_timer.py '"EnvironmentVariables": {"PATH": path, **({STOP_INTERRUPT: stop_interrupt} if stop_interrupt else {})},' '"EnvironmentVariables": {"PATH": path, **({STOP_INTERRUPT: stop_interrupt} if stop_interrupt else {}), **{k: v for k, v in os.environ.items() if k.startswith("SUTANDO_NOTIFIER_ALERT_")}},' "${OLDT[@]}"
+mutant codex-forwards-alert-settings "$CODEX" '  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_STANDBY_MODE=type")' '  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_STANDBY_MODE=type" -e "SUTANDO_NOTIFIER_ALERT_REPEAT=${SUTANDO_NOTIFIER_ALERT_REPEAT:-}")' "${CODEXT[@]}"
+mutant codex-identity-has-alert-settings "$CODEX" '-mtype"' '-mtype-r${SUTANDO_NOTIFIER_ALERT_REPEAT:-}"' "${CODEXT[@]}"
+mutant publish-cli-exit3-lost "$PUB" '        return EXIT_PUBLISHED_UNCONFIRMED' '        return 1' "${PUBT[@]}"
 
 if [ "$bad" = 0 ]; then echo "  ok  every mutant killed"; else echo "  FAILED: a mutant survived or no longer applies"; fi
 exit "$bad"

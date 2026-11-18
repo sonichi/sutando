@@ -305,6 +305,34 @@ class PublisherFailurePaths(unittest.TestCase):
             self.assertNotIn(r.returncode, (0, 3), r.stderr)
             self.assertFalse(missing.exists())
 
+    def test_the_cli_entrypoint_exits_3_on_a_directory_sync_failure_after_the_rename(self):
+        # The script run as a process, as the standby supervisor runs it: only the directory fsync
+        # is made to fail, inside that process, so the exit code is the entrypoint's own.
+        inject = (
+            "import os, runpy, stat, sys\n"
+            "real = os.fsync\n"
+            "def fsync(fd):\n"
+            "    if stat.S_ISDIR(os.fstat(fd).st_mode):\n"
+            "        raise OSError(5, 'directory sync failed')\n"
+            "    return real(fd)\n"
+            "os.fsync = fsync\n"
+            "sys.argv = [sys.argv[1], sys.argv[2]]\n"
+            "runpy.run_path(sys.argv[0], run_name='__main__')\n")
+        with tempfile.TemporaryDirectory() as td:
+            target = Path(td) / "results" / "proactive-1.txt"
+            target.parent.mkdir()
+            r = subprocess.run([sys.executable, "-c", inject, str(REPO / "src" / "result_publish.py"), str(target)],
+                               input=BODY, capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 3, r.stderr)
+            self.assertEqual(target.read_text(encoding="utf-8"), BODY, "the body was published")
+            self.assertIn("syncing its directory failed", r.stderr)
+            target.unlink()
+            # The same entrypoint without the fault exits 0: the 3 is the fault's, not the harness's.
+            r = subprocess.run([sys.executable, "-c", inject.replace("raise OSError(5, 'directory sync failed')", "pass"),
+                                str(REPO / "src" / "result_publish.py"), str(target)],
+                               input=BODY, capture_output=True, text=True, timeout=60)
+            self.assertEqual((r.returncode, target.read_text(encoding="utf-8")), (0, BODY), r.stderr)
+
     def test_main_publishes_stdin_and_refuses_a_flag_or_no_path(self):
         for mod in self.MODULES:
             with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
