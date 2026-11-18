@@ -8,6 +8,8 @@ Run: python3 tests/skills/inbox-feed/inbox_feed.test.py
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -646,6 +648,41 @@ class CliCursorsAdvanceTest(unittest.TestCase):
             )
             saved = json.loads(ib.cursors_path(ws).read_text())
             self.assertEqual(saved["github"], "seed")  # unchanged, not advanced
+
+
+class StalledSourceTest(unittest.TestCase):
+    """One item that keeps failing holds only its own source's cursor: the others advance."""
+
+    def _advance(self, ws, source, fetched, confirmed, value):
+        out = io.StringIO()
+        (ws / f"{source}-fetched.json").write_text(json.dumps(fetched))
+        (ws / "confirmed.json").write_text(json.dumps(confirmed))
+        args = ["--workspace", str(ws), "cursors", "advance", "--source", source, "--value", value,
+                "--fetched-file", str(ws / f"{source}-fetched.json"),
+                "--confirmed-file", str(ws / "confirmed.json"), "--live"]
+        with contextlib.redirect_stdout(out):
+            ib.main(args)
+        return json.loads(out.getvalue())
+
+    def test_a_stalled_github_item_does_not_hold_gmail_and_is_fetched_again_next_poll(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            for source, seed in (("github", "2026-11-16T11:00:00Z"), ("gmail", "g-seed")):
+                ib.main(["--workspace", str(ws), "cursors", "set", "--source", source, "--value", seed, "--live"])
+            stuck = ib.map_github({**GITHUB_REVIEW_REQUEST_FIXTURE, "number": 1,
+                                   "updated_at": "2026-11-16T12:00:00Z"}, "review_requested", ib.DEFAULT_RULES)
+            mail = ib.map_gmail(GMAIL_UNREAD_FIXTURE, "unread", ib.DEFAULT_RULES)
+            confirmed = [mail]  # one confirmed list for every source; the GitHub item failed
+            for poll in range(2):
+                with self.subTest(poll=poll):
+                    gh = self._advance(ws, "github", [stuck], confirmed, stuck["updated_at"])
+                    gm = self._advance(ws, "gmail", [mail], confirmed, "g-new")
+                    self.assertEqual((gh["advanced"], gh["value"]), (False, "2026-11-16T11:00:00Z"))
+                    self.assertEqual((gm["advanced"], gm["value"]), (True, "g-new"))
+                    saved = json.loads(ib.cursors_path(ws).read_text())
+                    self.assertEqual(saved, {"github": "2026-11-16T11:00:00Z", "gmail": "g-new"})
+                    self.assertGreater(stuck["updated_at"], saved["github"])  # next fetch returns it
+                    self.assertEqual(ib.dedupe_new([stuck], ib.record_sent({}, confirmed)), [stuck])
 
 
 class HelperEdgeCasesTest(unittest.TestCase):

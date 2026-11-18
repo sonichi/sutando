@@ -145,6 +145,16 @@ Both default to a dry run — nothing is sent to the Inbox room unless you say `
    exactly where it was, on purpose, so the next poll's own fetch still returns the
    unconfirmed item(s). `cursors set` still exists for seeding a cursor's first value
    or manual recovery — **the poll loop itself must never call `set` to advance.**
+   **An item that keeps failing** holds only its own source's cursor. Each scheduled
+   poll fetches that source's window again and retries the item; items already sent
+   are not resent (`dedupe`), and newer items from the same source still arrive,
+   since the fetch is `updated:>cursor`. Other sources keep their own cursors and are
+   not held. The owner sees every other item; the stuck one is simply missing from
+   the Inbox, and nothing in the Inbox flags it. The only signal is `cursors advance`
+   answering `"advanced": false` for that source on every run, and the re-fetched
+   window grows until the item sends. If that persists, tell the owner which item is
+   stuck, rather than calling `cursors set` to skip it without their word.
+
    Finally, append every confirmed item to the local digest log:
 
    ```bash
