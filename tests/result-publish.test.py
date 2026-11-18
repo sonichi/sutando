@@ -191,6 +191,38 @@ class RelativePathAnchoring(unittest.TestCase):
                 target = Path(td) / "results" / "task-1.txt"
                 self.assertEqual(mod.worker_published_path(target, {}, Path(td) / "unused"), target)
 
+    def test_a_relative_path_raises_rather_than_falling_back_to_cwd(self):
+        # No silent "resolver failed, use the current directory" path: a caller that cannot learn
+        # the workspace must not guess at one by falling back to wherever the process happens to be.
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)
+                    with mock.patch("workspace_default.resolve_workspace",
+                                     side_effect=RuntimeError("no workspace")):
+                        with self.assertRaises(RuntimeError):
+                            mod.worker_published_path(Path("results") / "task-1.txt")
+                    self.assertEqual(list(Path(td).rglob("*.txt")), [], "nothing was written anywhere")
+                finally:
+                    os.chdir(cwd)
+
+    def test_cli_with_a_relative_path_and_a_failed_resolver_writes_nothing_and_exits_nonzero(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)
+                    with mock.patch("workspace_default.resolve_workspace",
+                                     side_effect=RuntimeError("no workspace")), \
+                            mock.patch.object(mod.sys, "stdin", io.StringIO("x")), \
+                            mock.patch.object(mod.sys, "stderr", io.StringIO()):
+                        with self.assertRaises(RuntimeError):
+                            mod.main(["result_publish.py", "results/task-1.txt"])
+                    self.assertEqual(list(Path(td).rglob("*.txt")), [], "nothing was written anywhere")
+                finally:
+                    os.chdir(cwd)
+
 
 class PublisherFailurePaths(unittest.TestCase):
     """Run against src and the vendored ag2-sparrow copy: the bridge imports the latter."""
