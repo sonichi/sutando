@@ -143,17 +143,22 @@ def envelope(verdict: str, environ=None, key_seen=None) -> dict:
     return {"verdict": verdict, "mode": hmac_policy.mode(cfg), "submit": submit, "reason": reason, "retry": retry}
 
 
-def admit(root, task_id, allow: bool, allow_collab: bool = False) -> "tuple[str | None, dict, str]":
+def admit(root, task_id, allow: bool, allow_collab: bool = False,
+          text_sha256: "str | None" = None) -> "tuple[str | None, dict, str]":
     """(admission, headers, why refused) for tasks/<task_id>.txt through the shared task_io.admission. A
     file with no access_tier header is malformed (Sparrow's bridge always writes one). As the relay loop
     does, an attested collaborator is served only under --allow-collaborator, which --allow-non-owner
-    does not imply; any other non-owner only under --allow-non-owner."""
-    path = os.path.join(root, "tasks", task_id + ".txt")
-    with open(path, encoding="utf-8", errors="replace") as f:
-        raw = task_io.attested_headers(f.read()).headers
-    if "access_tier" not in raw:
+    does not imply; any other non-owner only under --allow-non-owner. With `text_sha256` (the hash of the
+    text the Mod verified), a file that no longer has that text is parked: it is verified again, never admitted."""
+    with open(os.path.join(root, "tasks", task_id + ".txt"), "rb") as f:
+        raw = f.read().decode("utf-8", errors="replace")
+    # The Mod hashes the text as it read it; parsing then sees it as a text-mode read would.
+    if text_sha256 is not None and hashlib.sha256(raw.encode("utf-8")).hexdigest() != text_sha256:
+        raise Parked("%s changed after its envelope was verified; verified again" % task_id)
+    text = raw.replace("\r\n", "\n").replace("\r", "\n")
+    if "access_tier" not in task_io.attested_headers(text).headers:
         return None, {}, "malformed: no access_tier header"
-    headers, _, _ = task_io.parse_task(path)
+    headers, _, _ = task_io.parse_task_text(text)
     kind = task_io.admission(headers, allow)
     flag = "--allow-collaborator" if kind == "collaborator" else "--allow-non-owner"
     if kind == "collaborator" and not allow_collab:
@@ -310,7 +315,7 @@ def _repair_settled(lc, task_id) -> None:
         lc.reconcile_settled(task_id)
 
 
-def claim(root, task_id) -> dict:
+def claim(root, task_id, text_sha256: "str | None" = None) -> dict:
     lc = _lifecycle(root)
     terminal, lost = False, ""
     with _claims_step(root, lc, task_id, "claim"):
@@ -318,7 +323,7 @@ def claim(root, task_id) -> dict:
         generation = _generation(root)
         verdict, state = lc.decide(task_id)
         if verdict == "call":
-            kind, headers, why = admit(root, task_id, allow_non_owner(), allow_collaborator())
+            kind, headers, why = admit(root, task_id, allow_non_owner(), allow_collaborator(), text_sha256)
             if kind is None:
                 outcome = lc.complete_without_call(task_id, task_io.NON_OWNER_REFUSED, why)
                 raise Refused("%s not admitted (%s); the owner-only refusal is %s" % (task_id, why, outcome))
@@ -580,7 +585,7 @@ def main(args) -> int:
         root = _root(args)
         verb = args.verb
         if verb == "claim":
-            out = claim(root, args.task_id)
+            out = claim(root, args.task_id, args.task_sha256)
         elif verb == "interrupt":
             out = interrupt(root, args.task_id, args.detail)
         elif verb == "authorize":
@@ -632,6 +637,7 @@ def add_parser(sub) -> None:
     p.add_argument("--root", help="the work root (default: AG2_SPARROW_ROOT, else the cwd's parent)")
     v = p.add_subparsers(dest="verb", required=True)
     c = v.add_parser("claim"); c.add_argument("task_id")
+    c.add_argument("--task-sha256", help="the hash of the task text the Mod verified; a file changed since is parked")
     n = v.add_parser("interrupt"); n.add_argument("task_id"); n.add_argument("--detail", default="")
     a = v.add_parser("authorize"); a.add_argument("task_id"); a.add_argument("attempt", type=int)
     a.add_argument("--text-hash", required=True)
