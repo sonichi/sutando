@@ -207,6 +207,22 @@ class RelativePathAnchoring(unittest.TestCase):
                 finally:
                     os.chdir(cwd)
 
+    def test_a_resolver_failure_escapes_nowhere_even_without_connections(self):
+        # Without `connections`, nothing downstream can catch a fallback here; isolates the guard.
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)
+                    with mock.patch("workspace_default.resolve_workspace",
+                                     side_effect=RuntimeError("no workspace")), \
+                            mock.patch.dict(sys.modules, {"connections": None}):
+                        with self.assertRaises(RuntimeError):
+                            mod.worker_published_path(Path("results") / "proactive-note.txt")
+                    self.assertEqual(list(Path(td).rglob("*.txt")), [], "nothing was written anywhere")
+                finally:
+                    os.chdir(cwd)
+
     def test_cli_with_a_relative_path_and_a_failed_resolver_writes_nothing_and_exits_nonzero(self):
         for mod in self.MODULES:
             with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
