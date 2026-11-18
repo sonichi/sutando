@@ -534,7 +534,7 @@
    ],
    "status": "canonical",
    "canonical_for": "how one inbox keeps exactly one announcer: the session watcher and the supervisor's standby, the tag and verdicts, readiness, the handoff contract, the task-watch Mod (default for pool workers, opt-in for the core) and the alert-only standby on a Mod seat",
-   "last_verified": "2026-11-17"
+   "last_verified": "2026-11-18"
   },
   "docs/learning-window.md": {
    "title": "Retained learning windows",

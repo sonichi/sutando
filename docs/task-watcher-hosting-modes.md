@@ -126,28 +126,25 @@ mode the supervisor never starts the notifier: no task and no nudge is typed int
 `SUTANDO_NOTIFIER_ALERT_GRACE` (300 s), it writes an `ALERT` line to `logs/claude-task-notifier.log`
 and alerts the owner: a `results/proactive-standby-unwatched-*.txt` (the owner's DM) and the opt-in macOS
 notification, the same pair a channel bridge's wrapper uses for its notices. That is the one alert of
-the episode: there is no timed reminder (`SUTANDO_NOTIFIER_ALERT_REPEAT` defaults to 0; a positive value
-opts back into a reminder every that many seconds). The only follow-up is one message once
-`SUTANDO_NOTIFIER_ALERT_PILEUP` (3; 0 turns it off) or more tasks are waiting for the seat, saying how many and
-that nothing more will be sent until the watcher returns; it is skipped when the first alert already counted
-that many. That follow-up is final: an opted-in reminder never follows it, and at most one message is
-attempted per poll. A message whose DM could not be published is not counted as sent: it is retried on the
-next poll, then backed off (doubling to every 300 s), each message on its own schedule. The episode lives in
-the supervisor's memory, so a supervisor restarted mid-outage sends one more alert after its grace. Each alert names
+the outage: there is no timed reminder (`SUTANDO_NOTIFIER_ALERT_REPEAT` defaults to 0; a positive value
+opts into a reminder every that many seconds). Both settings take whole seconds, the grace 1 to 86400 and
+the repeat 0 to 86400; any other value is ignored with one log line and the default used. A DM that was
+certainly not published (`src/result_publish.py` exits 1 or 2, or the seat's workspace has no `results/`)
+is retried on the next poll, then backed off (doubling to every 300 s); exit 3, renamed but the directory
+sync unconfirmed, counts as sent, since a retry under a new name could duplicate it. The macOS notification
+fires once per outage, on the first attempt, never on a retry. The outage lives in the supervisor's memory,
+so a supervisor restarted mid-outage sends one more alert after its grace. Each alert names
 the seat, judged from the inbox by `src/seat_inbox.py` ("the core" for `<workspace>/tasks`, "worker" and the
-first 8 characters of its id for a rostered worker's `deliveries/<id>` or own tasks folder), how long it has
-been unwatched ("under a minute" below 60 s) and how many tasks wait in its inbox, counted by
-`src/task_queue.py` (a worker on its own folders is checked against its own results folder); it never carries the inbox path or the tmux session name, which only the local log
+first 8 characters of its id for a rostered worker's `deliveries/<id>` or own tasks folder), and how long it has
+been unwatched ("under a minute" below 60 s); it never carries the inbox path or the tmux session name, which only the local log
 line keeps. An inbox that is no registered seat (a scratch or test inbox) gets the local `ALERT` line only:
-the owner is never paged for it. A ready watcher ends the episode with one log line and nothing sent to the owner. The 300 s covers a seat's boot
+the owner is never paged for it. A ready watcher ends the outage with one log line and nothing sent to the owner. The 300 s covers a seat's boot
 and restarts: a seat's Mod watcher has been seen ready 51 s after the session started (before
 the launcher trusted the `--add-dir` folder), and a worker relaunched several times took about 2.5 min.
 The Mod's own restart back-off (5 s doubling) passes 300 s only after six early exits in a row. A Codex seat,
 or a Claude seat whose Mod was refused or turned off, keeps the typing standby above. Every launcher sets the mode explicitly (the Codex core pins `type`) and folds it into the supervisor's
-identity, and passes `SUTANDO_NOTIFIER_ALERT_GRACE` / `SUTANDO_NOTIFIER_ALERT_REPEAT` / `SUTANDO_NOTIFIER_ALERT_PILEUP`
-always and in that identity (empty means the
-supervisor's default), so a value left in the tmux server's global environment never reaches a supervisor. The worker-pool remedy timer saves the alert settings in its job's environment, as it does the Stop
-setting, so the periodic re-ensure keeps a worker's overrides instead of restarting it at the defaults. The health check's
+identity, and passes `SUTANDO_NOTIFIER_ALERT_GRACE` / `SUTANDO_NOTIFIER_ALERT_REPEAT` always (empty means the
+supervisor's default), so a value left in the tmux server's global environment never reaches a supervisor. The health check's
 `claude-task-notifier` row on a Mod core is `ok` only while a ready session watcher holds the core's
 inbox; its warning says how many tasks are waiting, with no path.
 
@@ -267,8 +264,10 @@ how `tests/watch-tasks-stream-shutdown-leaves-inflight-claim.test.py` interrupts
 - `tests/start-cli-claude-task-notifier.test.py`: the launcher starts the supervisor for the core,
   alert-only when it installed the Mod.
 - `tests/task-notifier-supervisor-alert-only.test.sh`: the alert-only standby types nothing, alerts
-  after the grace, reminds every repeat interval with the waiting count and no path, and stands down
-  silently. Its tmux part prints SKIP where tmux is missing.
+  once per outage after the grace with no path, retries a DM that was not published (macOS notified
+  once), validates its settings, reminds only when opted in, and stands down silently. Its tmux part
+  prints SKIP where tmux is missing. `tests/task-notifier-supervisor-alert-only.mutations.sh` re-runs
+  it against named mutants of the supervisor and fails if any survives.
 - `tests/task-notifier-supervisor-alert-decision.test.py`: with no tmux, the real supervisor in alert
   mode alerts and never starts the typing notifier; an unregistered inbox is logged and never
   pages the owner; without the mode the notifier starts.
