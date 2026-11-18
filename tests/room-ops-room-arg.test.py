@@ -9,6 +9,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.hermetic_env import isolate_os_environ  # noqa: E402
+
+isolate_os_environ()
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "skills/agent-room-ops"))
 spec = importlib.util.spec_from_file_location("room_ops_room_arg_test", ROOT / "skills/agent-room-ops/room_ops.py")
