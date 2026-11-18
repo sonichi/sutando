@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cli_wedge
 import gateway_serving
 import pool_suspension
+import roster_membership
 import runtime_observation
 from util_paths import _host_label
 from workspace_default import resolve_workspace, status_read_path
@@ -343,9 +344,9 @@ def _workers(ws: Path):
         return []
     out = []
     for wid, row in sorted(rows.items()):
-        row = row if isinstance(row, dict) else {}
-        if row.get("state") == "retired":
+        if not roster_membership.is_member(row):
             continue
+        row = row if isinstance(row, dict) else {}
         # The name people see: the display label the pool applies, else the base label.
         label = row.get("display_label") or row.get("label")
         out.append((wid, label if isinstance(label, str) and label != wid else None, row.get("state")))
