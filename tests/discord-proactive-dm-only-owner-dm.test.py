@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Discord: a proactive result goes to the owner's DM; [dm-only] keeps it there over a [channel:].
 
-Drives the real `poll_proactive` coroutine with a fake client (the owner's DM and a shared
+Drives one pass of the real `poll_proactive` coroutine with a fake client (the owner's DM and a shared
 channel) and records the channel every text is delivered to. No network.
 
   a) a plain proactive body                          -> delivered to the owner DM
@@ -47,6 +47,10 @@ def _stub_discord():
     m.__file__ = str(sib)
     exec(compile(sib.read_text(), str(sib), "exec"), m.__dict__)
     m._install_discord_stub()
+
+
+class _Stop(BaseException):
+    """Raised by the patched sleep to end poll_proactive after one pass."""
 
 
 class _Channel:
@@ -99,13 +103,16 @@ try:
         before = len(delivered)
         (results / name).write_text(body)
 
-        async def one_pass():
-            try:
-                await asyncio.wait_for(bridge.poll_proactive(), timeout=2.0)
-            except (asyncio.TimeoutError, Exception):
-                pass
+        async def _stop(_seconds=0):
+            raise _Stop()
 
-        asyncio.run(one_pass())
+        real_sleep, asyncio.sleep = asyncio.sleep, _stop
+        try:
+            asyncio.run(bridge.poll_proactive())  # the loop's end-of-pass sleep ends it
+        except _Stop:
+            pass
+        finally:
+            asyncio.sleep = real_sleep
         return delivered[before:]
 
     got = deliver("proactive-dc-plain.txt", "a plain owner update\n")

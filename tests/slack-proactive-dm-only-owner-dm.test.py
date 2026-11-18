@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Slack: a proactive result goes to the owner's DM; [dm-only] keeps it there over a [channel:].
 
-Drives the real `result_watcher` loop and the real `_send_reply`, with a fake Slack client that
+Drives one pass of the real `result_watcher` loop and the real `_send_reply`, with a fake Slack client that
 records where every message is posted. No network.
 
   a) a plain proactive body                         -> posted in the owner DM
@@ -20,7 +20,6 @@ import json
 import os
 import sys
 import tempfile
-import threading
 import time
 import types
 from pathlib import Path
@@ -87,13 +86,21 @@ def _load_bridge():
     return mod
 
 
-def _settle(predicate, timeout=6.0, interval=0.1):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if predicate():
-            return True
-        time.sleep(interval)
-    return predicate()
+class _Stop(BaseException):
+    """Raised by the patched sleep to end result_watcher after one pass."""
+
+
+def _one_pass(bridge) -> None:
+    def _stop(_seconds=0):
+        raise _Stop()
+
+    real_sleep, time.sleep = time.sleep, _stop
+    try:
+        bridge.result_watcher()
+    except _Stop:
+        pass
+    finally:
+        time.sleep = real_sleep
 
 
 def main() -> int:
@@ -104,12 +111,11 @@ def main() -> int:
                                   "tofuOwner": "owner-1"}))
     bridge.ACCESS_FILE = access
     posts = bridge.app.client.posts
-    threading.Thread(target=bridge.result_watcher, daemon=True).start()
 
     def deliver(name: str, body: str) -> list:
         before = len(posts)
         (results / name).write_text(body)
-        _settle(lambda: not (results / name).exists() and len(posts) > before)
+        _one_pass(bridge)
         return [p.get("channel") for p in posts[before:]]
 
     got = deliver("proactive-slack-plain.txt", "a plain owner update\n")
