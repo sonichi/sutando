@@ -517,6 +517,44 @@ class TheLaneKeeper(Base):
         self.assertFalse(worker_lane.declared_bridge(W, self.ws))
         self.assertEqual(self.keep(now=5001.0), [lane], "withdrawn: the lane at once")
 
+    def test_work_delivered_before_the_cut_over_still_reaches_the_worker(self):
+        """Stopping the lane touches no delivery: the worker reads its own folder, and the declared bridge
+        hands new tasks to the same handler with the same arguments. The handler here is a recording stub,
+        not the pool router: this shows what it receives, not that a worker replied."""
+        from _helpers import bridge_lease
+        sys.path.insert(0, str(ROOT / "skills" / "worker-pool" / "scripts"))
+        import pool_delivery
+        lane, task = self.row["instance"], "task-1800000000000"
+        folder = pool_delivery.deliveries_dir(self.ws, W)
+        folder.mkdir(parents=True)
+        (folder / pool_delivery.sentinel_names(task)[0]).write_text("")
+        self.declare()
+        holder = bridge_lease.start(self.ws, lane, wait=True)
+        self.children.append(holder)
+        self.assertEqual(C.stop_bridge(lane, workspace=self.ws), holder.pid)
+        self.children.remove(holder)
+        bridge_lease.stop(holder)
+        self.assertEqual([p.name for p in pool_delivery.pending(self.ws, W)], [f"{task}.txt"])
+        handler = self.declare_handler()
+        log = self.ws / "handler.log"
+        handler.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{log}"\nexit 0\n')
+        renotify = []
+        for _ in ("lane", "declared bridge"):
+            ns = {}
+            worker_lane.install(ns, W, workspace=self.ws, results_dir=self.ws / "results", log=lambda m: None,
+                                who="x")
+            renotify.append(ns["TASK_PRE_PUBLISH"]("task-2", self.ws / "staged", self.ws / "tasks" / "task-2.txt"))
+        self.assertTrue(all(callable(r) for r in renotify), "the handler ran and accepted the task from both")
+        seen = log.read_text().splitlines()
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[0], seen[1])
+        handler.write_text("#!/bin/sh\nexit 1\n")
+        ns = {}
+        worker_lane.install(ns, W, workspace=self.ws, results_dir=self.ws / "results", log=lambda m: None, who="x")
+        self.assertIsNone(ns["TASK_PRE_PUBLISH"]("task-3", self.ws / "staged", self.ws / "tasks" / "task-3.txt"),
+                          "a handler that refuses is seen as not delivered")
+        self.assertTrue(seen[0].startswith(f"--workspace {self.ws} --results-dir {self.ws / 'results'} --from-lane"))
+
     def test_an_invalid_or_unanswerable_declaration_keeps_the_lane(self):
         lane = self.row["instance"]
         decl = self.declare()
@@ -540,6 +578,135 @@ class TheLaneKeeper(Base):
             stop.assert_called_once_with(lane, workspace=self.ws)
             self.assertEqual(out.getvalue().strip(), said)
         self.assertIsNotNone(C.worker_enabled_identity(W, self.ws))
+
+
+class Status(Base):
+    """`worker_lane.py status`: what serves a worker's agent now, for a caller that cut it over."""
+
+    def bridge_procs(self, decl, *, flag="--agent-bridges", script="/opt/co/src/sparrow_agent_bridge.py"):
+        return {10: (1, 600, f"python3 /opt/co/src/sparrowd.py {flag}".strip()),
+                11: (10, 500, f"python3 {script} {decl}"),
+                12: (1, 50, "python3 /opt/co/src/remote-gateway-bridge.py")}
+
+    def status(self, procs, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = worker_lane.main(["status", "--worker", W, *argv], workspace=self.ws, vault=self.vault, procs=procs)
+        return rc, json.loads(out.getvalue())
+
+    def test_the_declared_bridge_under_sparrowd_holds_the_lease(self):
+        decl = self.declare()
+        co = self.checkout("opt-co")
+        procs = {k: (pp, age, cmd.replace("/opt/co", str(co))) for k, (pp, age, cmd) in self.bridge_procs(decl).items()}
+        with mock.patch.object(C, "bridge_pid", return_value=11):
+            rc, out = self.status(procs)
+        self.assertEqual(rc, 0)
+        self.assertEqual((out["declared"], out["lease_pid"], out["held_by"], out["instance"], out["agent"]),
+                         (True, 11, "declared-bridge", self.row["instance"], WORKER_AGENT))
+        self.assertEqual([(s["pid"], s["agent_bridges"], s["checkout"]) for s in out["sparrowd"]], [(10, True, str(co))])
+
+    def test_any_other_holder_is_other_and_no_holder_is_none(self):
+        decl = self.declare()
+        for procs, pid in ((self.bridge_procs(decl), 12), (self.bridge_procs(decl, flag=""), 11),
+                           (self.bridge_procs(self.ws / "elsewhere.json"), 11),
+                           (self.bridge_procs(decl, script="/opt/co/src/other.py"), 11),
+                           ({11: (99, 1, f"python3 sparrow_agent_bridge.py {decl}")}, 11)):
+            with mock.patch.object(C, "bridge_pid", return_value=pid):
+                self.assertEqual(self.status(procs)[1]["held_by"], "other", procs)
+        with mock.patch.object(C, "bridge_pid", return_value=0):
+            self.assertEqual(self.status({})[1]["held_by"], "none")
+        with mock.patch.object(C, "bridge_pid", return_value=77):
+            self.assertEqual(self.status({})[1]["held_by"], "unknown", "a holder ps does not list")
+
+    def test_an_undeclared_worker_and_an_indeterminate_lease_say_so(self):
+        with mock.patch.object(C, "bridge_pid", side_effect=C.BridgeLeaseIndeterminate("x", "torn lease")):
+            rc, out = self.status({})
+        self.assertEqual((rc, out["declared"], out["held_by"], out["lease_pid"]), (0, False, "unknown", 0))
+        self.assertIn("torn lease", out["why"])
+        with mock.patch.object(worker_lane, "declared_bridge", side_effect=OSError("gone")), \
+                mock.patch.object(C, "bridge_pid", return_value=0):
+            out = self.status({})[1]
+        self.assertEqual((out["declared"], out["why"]), (None, "OSError: gone"))
+
+    def test_a_worker_with_no_identity_is_refused(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = worker_lane.main(["status", "--worker", "b" * 32, "--workspace", str(self.ws)], procs={})
+        self.assertEqual(rc, 1)
+        self.assertIn("has no agent identity row", json.loads(out.getvalue())["why"])
+        with mock.patch.object(worker_lane, "_declaration_for", side_effect=worker_lane.RecordUnreadable("torn")), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(worker_lane.main(["status", "--worker", W], workspace=self.ws, procs={}), 1)
+        self.assertEqual(json.loads(out.getvalue())["why"], "torn")
+
+    def checkout(self, name):
+        co = self.ws / name / "engine"
+        (co / "src").mkdir(parents=True)
+        (co / "src" / "sparrowd.py").write_text("")
+        return co
+
+    def test_sparrowd_runs_says_whether_its_checkout_takes_worker_declarations(self):
+        for root in ("opt-co", "Library/Application Support/Desk App"):
+            co = self.checkout(root)
+            procs = {5: (1, 100, f"python3 {co}/src/sparrowd.py --agent-bridges"),
+                     6: (1, 1, "python3 src/sparrowd.py"), 7: (1, 1, "vim notes.txt"),
+                     8: (1, 1, f"python3 {co}/src/sparrowd.py.bak --agent-bridges")}
+            runs = {r["pid"]: r for r in worker_lane.sparrowd_runs(procs, now=10_000.0)}
+            self.assertEqual(sorted(runs), [5, 6], root)
+            self.assertEqual((runs[5]["checkout"], runs[5]["agent_bridges"], runs[5]["serves_workers"]),
+                             (str(co), True, False), root)
+            self.assertEqual((runs[6]["checkout"], runs[6]["agent_bridges"], runs[6]["serves_workers"]), ("", False, False))
+            (co / "src" / "sparrow_agent_bridge.py").write_text("WRITTEN_BY = 'x'\nimport worker_lane\n")
+            self.assertFalse(worker_lane.sparrowd_runs(procs)[0]["serves_workers"], "no capability line")
+            (co / "src" / "sparrow_agent_bridge.py").write_text("ACCEPTS_WORKER_DECLARATIONS = 1\n")
+            os.utime(co / "src" / "sparrow_agent_bridge.py", (9_000.0, 9_000.0))
+            run = worker_lane.sparrowd_runs(procs, now=10_000.0)[0]
+            self.assertEqual((run["serves_workers"], run["code_changed_since_start"]), (True, False), root)
+            for rel in worker_lane.LOADED_CODE[1:]:
+                f = co.joinpath(*rel)
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text("")
+                os.utime(f, (9_950.0, 9_950.0))
+                self.assertTrue(worker_lane.sparrowd_runs(procs, now=10_000.0)[0]["code_changed_since_start"], rel)
+                os.utime(f, (9_000.0, 9_000.0))
+
+    def test_the_capability_line_is_this_checkouts_own(self):
+        self.assertEqual(bridge.ACCEPTS_WORKER_DECLARATIONS, 1)
+        text = (ROOT / "src" / "sparrow_agent_bridge.py").read_text()
+        self.assertIsNotNone(worker_lane.CAPABILITY.search(text))
+
+    def test_a_declared_bridge_under_a_spaced_path_is_recognised(self):
+        spaced = self.ws / "Library" / "Application Support" / "Desk App"
+        decl = spaced / "workspace" / "agents" / "seg.bridge" / "worker.json"
+        decl.parent.mkdir(parents=True)
+        decl.write_text("{}")
+        co = self.checkout("Library/Application Support/Desk App/x")
+        procs = {10: (1, 600, f"/usr/bin/python3 {co}/src/sparrowd.py --agent-bridges"),
+                 11: (10, 500, f"/usr/bin/python3 {co}/src/sparrow_agent_bridge.py {decl}"),
+                 12: (10, 500, f"/usr/bin/python3 {co}/src/sparrow_agent_bridge.py {decl}.old"),
+                 13: (10, 500, f"/usr/bin/python3 {co}/src/other.py {decl}"),
+                 14: (1, 500, f"/usr/bin/python3 {co}/src/sparrow_agent_bridge.py {decl}")}
+        self.assertEqual(worker_lane.held_by(11, procs, decl), "declared-bridge")
+        link = self.ws / "link to ws"
+        link.symlink_to(spaced / "workspace")
+        self.assertEqual(worker_lane.held_by(11, procs, link / "agents" / "seg.bridge" / "worker.json"),
+                         "declared-bridge", "the realpath form matches too")
+        for pid in (12, 13, 14):
+            self.assertEqual(worker_lane.held_by(pid, procs, decl), "other", pid)
+        self.assertEqual(worker_lane.sparrowd_runs(procs)[0]["checkout"], str(co))
+
+    def test_processes_reads_ps_and_is_empty_when_it_cannot(self):
+        listing = "  1     0 10-02:03:04 /sbin/launchd\n 42     1    01:05 python3 x.py --a b\n bad line\n"
+        with mock.patch.object(worker_lane.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, listing, "")):
+            self.assertEqual(worker_lane.processes(),
+                             {1: (0, ((10 * 24 + 2) * 60 + 3) * 60 + 4, "/sbin/launchd"), 42: (1, 65, "python3 x.py --a b")})
+        with mock.patch.object(worker_lane.subprocess, "run", side_effect=OSError("no ps")):
+            self.assertEqual(worker_lane.processes(), {})
+        with mock.patch.object(worker_lane, "processes", return_value={}) as ps, \
+                mock.patch.object(C, "bridge_pid", return_value=0):
+            self.assertEqual(worker_lane.status(W, self.ws)["held_by"], "none")
+        ps.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -8,15 +8,16 @@ produce two notifications for one pending task; it is named under "Known issues 
 issue that closes it. This page is the design as it stands on `main` after #4477, #4585 and #4602;
 the behaviour is pinned by the tests named at the end.
 
-## The two hosting modes
+## The hosting modes
 
 | mode | who runs the watcher | how tasks reach the agent | when it is used |
 |---|---|---|---|
-| **session watcher** | the agent's own CLI session, through the `Monitor` tool: `bash src/watch-tasks-stream.sh --role session --inbox <inbox>` | the tool delivers each `TASK_FILE: <name>` line straight into the session | the normal state of a live core |
+| **session watcher, Mod-hosted** (default on Claude seats) | the task-watch Mod inside the agent's Claude session runs `watch-tasks-stream.sh --role session --inbox <inbox>` and restarts it ([below](#the-session-watcher-hosted-by-the-task-watch-mod-claude-seats)) | the Mod submits each `TASK_FILE: <name>` line (with its `QUEUE:` line) to the session as a message | whenever the launcher installed the Mod and `watcher_rearm.py mod-ready` prints `yes` |
+| **session watcher, `Monitor`** (fallback) | the agent's own CLI session, through the `Monitor` tool: `bash src/watch-tasks-stream.sh --role session --inbox <inbox>` | the tool delivers each `TASK_FILE: <name>` line straight into the session | a Claude seat without the Mod, or whose Mod refused, never loaded or gave up (`mod-ready` prints `no`) |
 | **standby** (external) | `task-notifier-supervisor.sh`, running in the tmux session `<core>-watcher`, starts `task-notifier.sh`, which runs the same watcher script untagged as its child | the notifier types one instruction line into the core's tmux pane: `Sutando task ready: <file>. Read <tasks>/<file>, follow CLAUDE.md, complete the task, and write the result to <results>/<file>.` | whenever no session watcher covers the inbox: before `/startup` finishes, after a session watcher dies, when the core cannot run `Monitor` |
 
 The watcher script decides everything about a task (routing through the task-event handler, priority,
-dedupe, holds); the notifier only executes what the watcher announces (#4561). So the two modes differ
+dedupe, holds); the notifier only executes what the watcher announces (#4561). So the modes differ
 in how an announcement reaches the agent, never in what is announced.
 
 ## The tag, and why it matters
@@ -100,18 +101,46 @@ same session watcher can instead be run by a Claude Code Mod, `src/agent/claude/
   only when `watcher_rearm.py mod-ready` prints `yes`: the marker is `1` AND a ready session watcher
   holds the inbox (waiting up to 30 s for the Mod's to come up). A Mod that refused (old engine),
   never loaded or gave up therefore leaves `no`, and the session starts the `Monitor` as before. The
-  compaction/resume hint fires on an unwatched inbox whatever the marker. The launcher gates the
-  version on the same absolute `claude` path the session runs (the one the tmux pane's `PATH`
-  resolves). Codex seats and Claude seats without the Mod keep the `Monitor` path unchanged.
+  compaction/resume hint and the Stop hook fire on an unwatched inbox whatever the marker; under the
+  marker they say the Mod restarts the watcher and ask for a `Monitor` only if `mod-ready` prints `no`.
+  The launcher gates the version on the same absolute `claude` path the session runs (the one the tmux
+  pane's `PATH` resolves). Claude seats without the Mod keep the `Monitor` path unchanged; Codex seats
+  have no `Monitor` and are fed by the supervisor's task notifier.
 
-The switch is per launcher. Pool workers have the Mod by default: `SUTANDO_TASK_WATCH_MOD_WORKER=0`
-in the environment of a worker spawn opts that worker out. The core is off by default and opts in with
-`SUTANDO_TASK_WATCH_MOD_CORE=1`. Either way the launcher installs
+The switch is per launcher, and both launchers install the Mod by default. `SUTANDO_TASK_WATCH_MOD_CORE=0`
+in the core launcher's environment keeps the core on the `Monitor`; `SUTANDO_TASK_WATCH_MOD_WORKER=0`
+in the environment of a worker spawn opts that worker out. Either way the launcher installs
 the Mod only when `claude --version` is at least `MIN_CLAUDE_VERSION` in
 `src/agent/claude/task-watch-mod/hooks/version.ts`; below it, it logs one line and the session keeps
 the `Monitor`. The Mod checks the same floor itself.
 The worker default covers Claude workers only: `launch-worker-session.sh` hands a Codex worker to
 `launch-codex-worker-session.sh` before `add_task_watch_mod`, so a Codex worker keeps the supervisor's task notifier.
+
+### The standby on a Mod seat is alert-only
+
+A Claude seat whose launcher installed the Mod still gets the supervisor, started with
+`SUTANDO_STANDBY_MODE=alert` (the core launcher from its own Mod decision; `worker-watcher-supervisor.sh`
+from the worker session's `SUTANDO_TASK_WATCH_MOD=1`, so the pool remedy's re-ensure agrees). In that
+mode the supervisor never starts the notifier: no task and no nudge is typed into the pane. It polls
+`role-present --ready` as before; once no ready session watcher has held the inbox for
+`SUTANDO_NOTIFIER_ALERT_GRACE` (300 s), it writes an `ALERT` line to `logs/claude-task-notifier.log`
+and alerts the owner: a `results/proactive-standby-unwatched-*.txt` (the owner's DM) and the opt-in macOS
+notification, the same pair a channel bridge's wrapper uses for its notices. While the episode lasts it
+reminds the owner every `SUTANDO_NOTIFIER_ALERT_REPEAT` (1800 s; 0 turns the reminder off). Each alert names
+the seat, judged from the inbox by `src/seat_inbox.py` ("the core" for `<workspace>/tasks`, "worker" and the
+first 8 characters of its id for a rostered worker's `deliveries/<id>` or own tasks folder), how long it has
+been unwatched ("under a minute" below 60 s) and how many tasks wait in its inbox, counted by
+`src/task_queue.py`; it never carries the inbox path or the tmux session name, which only the local log
+line keeps. An inbox that is no registered seat (a scratch or test inbox) gets the local `ALERT` line only:
+the owner is never paged for it. A ready watcher ends the episode with one log line and nothing sent to the owner. The 300 s covers a seat's boot
+and restarts: a seat's Mod watcher has been seen ready 51 s after the session started (before
+the launcher trusted the `--add-dir` folder), and a worker relaunched several times took about 2.5 min.
+The Mod's own restart back-off (5 s doubling) passes 300 s only after six early exits in a row. A Codex seat,
+or a Claude seat whose Mod was refused or turned off, keeps the typing standby above. Every launcher sets the mode explicitly (the Codex core pins `type`) and folds it into the supervisor's
+identity, and passes `SUTANDO_NOTIFIER_ALERT_GRACE` / `SUTANDO_NOTIFIER_ALERT_REPEAT` always (empty means the
+supervisor's default), so a value left in the tmux server's global environment never reaches a supervisor. The health check's
+`claude-task-notifier` row on a Mod core is `ok` only while a ready session watcher holds the core's
+inbox; its warning says how many tasks are waiting, with no path.
 
 ### How to check it on a worker, or turn it off
 
@@ -177,12 +206,10 @@ The worker default covers Claude workers only: `launch-worker-session.sh` hands 
   by the standby rather than deaf. What the standby announces reaches the worker's pane only once the
   notifier accepts a resolver-backed (absolute-path) announcement for a delivery inbox (#4635); until
   then a supervised worker inbox is heard only by its own session watcher.
-- **`Monitor` expiry, on some builds.** The skills pass `persistent: true`; a build whose `Monitor`
-  exposes that argument keeps the watcher for the session. A build without it caps `timeout_ms` at
-  30 minutes and ends the watcher at each expiry unless the session re-arms it, with the supervisor's
-  standby covering the gap after 45 s. Measured on a bundled non-git install (engine `3ab5e26da`,
-  2026-09-21) and on the Pro host's core the same day; builds that expose `persistent` are not
-  affected: #4524.
+- **`Monitor` expiry.** `Monitor` has no `persistent` option: it caps `timeout_ms` at 30 minutes and
+  ends the watcher at each expiry unless the session re-arms it, with the supervisor's standby
+  covering the gap after 45 s. The Mod-hosted watcher has no such expiry. Measured on a bundled
+  non-git install (engine `3ab5e26da`, 2026-09-21) and on the Pro host's core the same day: #4524.
 - **An early exit, and `exit code 144`.** A notice that the session watcher exited before
   its `timeout_ms` is the same instruction as the expiry notice: re-arm first, investigate second;
   the inbox is unwatched until the supervisor's 45 s grace re-arms the standby. On macOS Claude Code
@@ -228,7 +255,15 @@ how `tests/watch-tasks-stream-shutdown-leaves-inflight-claim.test.py` interrupts
   file in #4627, sharing `tests/fixtures/readiness_window_helpers.py`, so no single file sets the
   CI floor): the readiness window, buffered replay before the sweep, holds and admissions.
 - `tests/watcher-identity.test.py`: the verdicts, their inbox scoping and the ready gate.
-- `tests/start-cli-claude-task-notifier.test.py`: the launcher starts the supervisor for the core.
+- `tests/start-cli-claude-task-notifier.test.py`: the launcher starts the supervisor for the core,
+  alert-only when it installed the Mod.
+- `tests/task-notifier-supervisor-alert-only.test.sh`: the alert-only standby types nothing, alerts
+  after the grace, reminds every repeat interval with the waiting count and no path, and stands down
+  silently. Its tmux part prints SKIP where tmux is missing.
+- `tests/task-notifier-supervisor-alert-decision.test.py`: with no tmux, the real supervisor in alert
+  mode alerts and never starts the typing notifier; an unregistered inbox is logged and never
+  pages the owner; without the mode the notifier starts.
+- `tests/seat-inbox.test.py`: which inboxes are a registered seat, and the label each gets.
 - `src/agent/claude/task-watch-mod/tests/task-watch.test.ts` (`claude plugin test`, in CI): the Mod's
   spawn, announcement, restart, hand-off and session-end rules, and that a task body is never submitted.
 - `tests/task-watch-mod-launch.test.sh`: the launchers' defaults and opt-outs, version floor and session marker.

@@ -228,6 +228,32 @@ def resolve_runtime(repo, runtime=None, runner=_run) -> str:
     return runtime
 
 
+def inbox_env(workspace, worker_id: str, scripts=None) -> dict:
+    """The inbox half of a worker session's env, the one rule its spawn and its remedy share. A worker
+    with its own folders (`connections.worker_dirs`) reads a plain inbox of task files and answers in its
+    own results; any other reads sentinels from its deliveries folder through the resolver."""
+    import connections
+    scripts = Path(scripts or _SCRIPTS)
+    own = connections.worker_dirs(worker_id, Path(workspace))
+    if own:
+        # Set empty, not left out: a value inherited from the caller would make the inbox a sentinel one.
+        return {"SUTANDO_TASKS_DIR": str(own[0]), "SUTANDO_RESULTS_DIR": str(own[1]),
+                "SUTANDO_INBOX_KIND": "", "SUTANDO_INBOX_RESOLVER": "", "SUTANDO_WORKSPACE_DIR": str(workspace)}
+    return {"SUTANDO_TASKS_DIR": str(pd.deliveries_dir(workspace, worker_id)),
+            # The inbox holds sentinels, not task bodies. The reader is TOLD
+            # that here; inferring it from the path is the reader deciding.
+            "SUTANDO_INBOX_KIND": "deliveries",
+            # The watcher infers the workspace from its inbox; a delivery
+            # folder would put state/ and results/ under deliveries/.
+            "SUTANDO_WORKSPACE_DIR": str(workspace),
+            # Named, not derived: every runtime writes its answers where the
+            # bridges drain them, which is the workspace's own results/.
+            "SUTANDO_RESULTS_DIR": str(pd.results_dir(workspace)),
+            # REQUIRED: the inbox above holds sentinels, so without a resolver
+            # the watcher hands over the zero-byte one.
+            "SUTANDO_INBOX_RESOLVER": str(scripts / "resolve-inbox-entry")}
+
+
 def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
          socket=None, label: str = "", worker_id=None) -> dict:
     """What a spawn would create. Pure — no side effects, so it is reviewable
@@ -256,24 +282,12 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
                 # stamps the same bare id, so both paths name one worker.
                 "SUTANDO_WORKER_ID": worker_id,
                 "SUTANDO_WORKER_RUNTIME": runtime,
-                "SUTANDO_TASKS_DIR": delivery_dir,
-                # The inbox holds sentinels, not task bodies. The reader is TOLD
-                # that here; inferring it from the path is the reader deciding.
-                "SUTANDO_INBOX_KIND": "deliveries",
-                # The watcher infers the workspace from its inbox; a delivery
-                # folder would put state/ and results/ under deliveries/.
-                "SUTANDO_WORKSPACE_DIR": str(workspace),
-                # Named, not derived: every runtime writes its answers where the
-                # bridges drain them, which is the workspace's own results/.
-                "SUTANDO_RESULTS_DIR": str(pd.results_dir(workspace)),
+                **inbox_env(workspace, worker_id),
                 "SUTANDO_CLAUDE_WORKING_DIR": str(cwd or repo),
                 "SUTANDO_CODEX_WORKING_DIR": str(cwd or repo),
                 # The worker's own gate, named by the skill that owns it: the
                 # core's `/startup --worker` runs what it is handed, not a path.
                 "SUTANDO_WORKER_BOOTSTRAP": str(_SCRIPTS / "worker_bootstrap.py"),
-                # Same rule, and REQUIRED here: the inbox above holds sentinels,
-                # so without a resolver the watcher hands over the zero-byte one.
-                "SUTANDO_INBOX_RESOLVER": str(_SCRIPTS / "resolve-inbox-entry"),
                 # A core exports this; the launcher reads the INHERITED value
                 # to decide it was invoked from inside one. A worker is not.
                 "SUTANDO_CORE_SESSION": "",

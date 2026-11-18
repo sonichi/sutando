@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import task_event_handler_config_path  # noqa: E402
+import roster_membership  # noqa: E402
 
 WORKER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 CORE = "core"
@@ -210,8 +211,7 @@ def unknown_targets(roster: dict, targets) -> list:
     """Targets absent from the roster, or retired in it. The router sends such a
     task to the core rather than substituting another reachable recipient."""
     workers = roster.get("workers") or {}
-    known = {w for w, row in workers.items()
-             if not (isinstance(row, dict) and row.get("state") == "retired")} | {CORE}
+    known = roster_membership.members(workers) | {CORE}
     return [t for t in targets if t not in known]
 
 
@@ -502,7 +502,7 @@ def apply_profile_label_overrides(workspace, labels: dict, config_version: int,
                 pending.append(wid)
         changed = False
         for wid, row in workers.items():
-            if row["state"] == "retired":
+            if not roster_membership.is_member(row):
                 continue
             wanted = labels.get(wid)
             if wanted is None:
@@ -575,8 +575,7 @@ def admits_deliveries(workspace, worker_id: str) -> bool:
         return True
     if worker_id in (raw.get("removed") or []):
         return False
-    row = (raw.get("workers") or {}).get(worker_id)
-    return not (isinstance(row, dict) and row.get("state") == "retired")
+    return roster_membership.is_member((raw.get("workers") or {}).get(worker_id))
 
 
 def set_worker_state(workspace, target: str, state: str, *, unbind: bool = False,
@@ -707,6 +706,28 @@ def worker_plugin_dirs(workspace, worker_id: str, warn=None, skipped=None) -> li
         if skipped is not None:
             skipped.append({"dir": d, "state": state})
     return out
+
+
+def bind_room_if_free(workspace, room: str, target: str) -> bool:
+    """Bind `room` to `target` only when it is unbound or already `target`'s, decided under the roster lock
+    so an owner's binding made meanwhile is never overwritten; True when it is `target`'s afterwards."""
+    with _locked(workspace):
+        raw = _load_existing_roster_strict(workspace)
+        if raw is None:
+            raise RosterError("no roster; nothing to bind to")
+        workers = dict(raw.get("workers") or {})
+        wid = resolve_label(raw, target)
+        if wid == CORE or wid not in workers:
+            raise RosterError(f"binding {room!r} names {target!r}, which is not a worker")
+        bindings = dict(load_bindings(workspace))
+        if bindings.get(room) not in (None, wid, [wid]):
+            return False
+        if bindings.get(room) is None:
+            bindings[room] = wid
+            save_bindings(workspace, bindings)
+        # Compiled even when the binding was already there: a run that saved and then failed to publish is repaired.
+        compile_roster(workspace, workers, bindings)
+        return True
 
 
 def unbind_room(workspace, room: str) -> dict:

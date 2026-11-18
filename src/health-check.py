@@ -3315,6 +3315,7 @@ _SERVICE_SOURCES = (
     # wrapper that `exec`s is gone from the table, so its payload's row covers it.
     ("src/launchd/channel-bridge-wrapper.sh", "channel-bridge-wrapper.sh"),
     ("src/launchd/gateway-bridge-wrapper.sh", "gateway-bridge-wrapper.sh"),
+    ("src/launchd/gateway-bridge-lib.sh", "gateway-bridge-wrapper.sh"),
     ("src/Sutando/", "Sutando.app/Contents/MacOS/Sutando"),
 )
 
@@ -7043,6 +7044,21 @@ def check_sspace_migration(workspace_dir: Optional[Path] = None) -> "dict | None
                        f'"Moving a terminal-run core to {target}"))')}
 
 
+GATEWAY_CORE_HELD_DETAIL = (
+    "sparrowd's core gateway bridge is held: it stood down to another holder of its lease, so this "
+    "install's own bridge is not serving; it starts again once that lease is free (docs/connections.md, "
+    '"The core bridge under sparrowd")')
+
+
+def _sparrowd_core_held() -> bool:
+    """Whether a running sparrowd reports its core gateway bridge held; False when none answers."""
+    try:
+        import sparrow_core_bridge  # noqa: PLC0415
+        return sparrow_core_bridge.core_worker_state(WORKSPACE_DIR) == "held"
+    except Exception:  # noqa: BLE001 - a probe that cannot run reports nothing
+        return False
+
+
 def check_gateway_bridge() -> "dict | None":
     """Health of the gateway bridge (remote-gateway-bridge.py) of the primary connection — the
     process that carries MOBILE-app messages from the cloud gateway down to the
@@ -7061,6 +7077,8 @@ def check_gateway_bridge() -> "dict | None":
     configured = _gateway_configured()
     if not configured:
         return None
+    if _sparrowd_core_held():
+        return {"name": "gateway-bridge", "status": "warn", "detail": GATEWAY_CORE_HELD_DETAIL}
     try:
         # pgrep exits 1 for no-match but 2/3 when broken; probe_pids keeps those
         # apart. The relay name is a compat stub, so it is a real duplicate.
@@ -7229,7 +7247,7 @@ def _gateway_lane_label(lane: str, rows: "list[dict] | None" = None) -> str:
 GATEWAY_STATUS_MAX_AGE_S = 180.0
 # Mirrors POLL_TIMEOUT_GRACE_S in ag2_sparrow/remote_gateway_bridge.py — the same
 # env read, so a host that retunes POLL_WAIT moves both together.
-GATEWAY_TRANSIENT_OUTAGE_S = 3 * (float(os.environ.get("REMOTE_TASK_POLL_WAIT") or 25) + 10)
+GATEWAY_TRANSIENT_OUTAGE_S = 3 * (max(float(os.environ.get("REMOTE_TASK_POLL_WAIT") or 25), 35) + 25)
 
 
 def _gateway_last_ok_age_h(path: "Path | None" = None,
@@ -10945,7 +10963,44 @@ def check_claude_task_notifier() -> dict:
                 "detail": "fresh local Claude heartbeat, but its live tmux session could not be verified"}
     supervisor = REPO_DIR / "src" / "agent" / "codex" / "cli" / "task-notifier-supervisor.sh"
     notifier = REPO_DIR / "src" / "agent" / "claude" / "cli" / "task-notifier.sh"
-    return _probe_task_notifier(target, name=name, expected=supervisor, script=notifier)
+    probe = _probe_task_notifier(target, name=name, expected=supervisor, script=notifier)
+    if probe["status"] != "ok" or _claude_standby_mode(target) != "alert":
+        return probe
+    return _mod_watcher_verdict(name, WORKSPACE_DIR / "tasks", WORKSPACE_DIR / "state")
+
+
+def _claude_standby_mode(target: dict) -> str:
+    """The launcher's choice for the core's supervisor: "alert" when the task-watch Mod hosts its watcher."""
+    env = _run_tmux(target["socket"], "show-environment", "-t", f"={target['session']}-watcher",
+                    "SUTANDO_STANDBY_MODE")
+    if env is None or env.returncode != 0:
+        return ""
+    return env.stdout.strip().partition("=")[2]
+
+
+def _mod_watcher_verdict(name: str, inbox: Path, state_dir: Path, role_present=None) -> dict:
+    """A Mod-hosted seat is covered only by a ready session watcher: its standby never types."""
+    role_present = role_present or watcher_identity.role_present
+    verdict = role_present("session", str(inbox), ready=True, state_dir=str(state_dir))
+    if verdict:
+        return {"name": name, "status": "ok",
+                "detail": "the task-watch Mod's session watcher holds the core's inbox; the standby is alert-only"}
+    why = ("the process table could not be read" if verdict is None
+           else "no ready session watcher holds its inbox")
+    return {"name": name, "status": "warn", "mod_watcher_absent": True,
+            "detail": (f"the core's watcher is hosted by the task-watch Mod, but {why}; "
+                       f"{_waiting_phrase(inbox)}, and the alert-only standby types nothing. "
+                       "Restarting the core session restarts the Mod's watcher")}
+
+
+def _waiting_phrase(inbox: Path) -> str:
+    """How many tasks wait in the core's inbox, counted by the queue's owner."""
+    import task_queue
+    try:
+        n = len(task_queue.pending_files(inbox.parent))
+    except Exception:  # noqa: BLE001 - an uncounted queue is said so, never read as zero
+        return "an unknown number of tasks are waiting"
+    return "1 task is waiting" if n == 1 else f"{n} tasks are waiting"
 
 
 def _process_alive(pid: int) -> bool:
@@ -10984,8 +11039,11 @@ def fix_claude_task_notifier() -> str:
     core_pid = heartbeat.get("pid")
     if not isinstance(core_pid, int) or isinstance(core_pid, bool) or not _process_alive(core_pid):
         return f"not repaired — the heartbeat's core process (pid {core_pid}) is not running"
-    if check_claude_task_notifier()["status"] == "ok":
+    current = check_claude_task_notifier()
+    if current["status"] == "ok":
         return "already healthy"
+    if current.get("mod_watcher_absent"):
+        return "not repaired — the supervisor is healthy; the missing watcher is the core session's own"
     launcher = REPO_DIR / "src" / "agent" / "start-cli.sh"
     if not launcher.is_file():
         return "not repaired — canonical launcher is missing"
