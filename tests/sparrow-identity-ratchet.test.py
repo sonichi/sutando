@@ -72,7 +72,7 @@ TASK_MINT_PIN = {
 # Pre-canonical delivery_id sites, pinned per (file, function) like
 # TASK_MINT_PIN. A whole-file exemption here would hide a new constructor.
 DELIVERY_ID_LEGACY_SITES = {
-    ("slack-bridge.py", "result_watcher"): 5,
+    ("slack-bridge.py", "result_watcher"): 6,
     ("slack_proactive_receipts.py", "_receipt_path"): 2,
     ("slack_proactive_receipts.py", "mark_delivered"): 3,
     ("slack_proactive_receipts.py", "was_delivered"): 2,
