@@ -1,19 +1,24 @@
 {
   "name": "worker-pool",
-  "version": "1.0.0",
+  "enabled": true,
+  "access_tier": "owner",
+  "version": "0.1.0",
   "owner": "github:sonichi/sutando",
   "license": "MIT",
   "stability": "experimental",
-  "description": "Optional worker-pool routing prerequisite. SUTANDO_TASK_ROUTING_REQUIREMENT declares a probe receiving the workspace path: exit 0 permits unrouted intake; any other status refuses it. Handler resolution remains the live task-event-handler.json declaration.",
+  "description": "Pool workers the core delegates to. No tools; manifest present to DECLARE config per this convention: WORKER_POOL_SSPACE_HANDOFF (off by default) sends pool_ask from the core to a worker that has its own enabled agent identity as one message in a room both agents are in instead of through deliveries/<worker>/; the worker's threaded reply arrives as a new task. The routing prerequisite refuses unrouted intake when bindings require a handler.",
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  },
+  "config": {
+    "WORKER_POOL_SSPACE_HANDOFF": "0",
+    "WORKER_POOL_HANDOFF_ROOM": "",
+    "WORKER_POOL_HANDOFF_ROOM_CLI": "",
+    "SUTANDO_TASK_ROUTING_REQUIREMENT": "./scripts/routing_requirement.py"
+  },
   "permissions": {
     "network": false,
     "filesystem": "read-write",
     "secrets": "none"
-  },
-  "config": {
-    "SUTANDO_TASK_ROUTING_REQUIREMENT": "./scripts/routing_requirement.py"
-  },
-  "provenance": {
-    "source_repo": "https://github.com/sonichi/sutando"
   }
 }

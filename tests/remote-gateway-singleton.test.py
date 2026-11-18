@@ -156,7 +156,7 @@ class SingletonGlueTest(unittest.TestCase):
 
     def test_pass_bound_covers_a_full_pass_with_margin(self):
         # Data pin: the bound is twice one pass, and it exceeds the stale window.
-        one_pass = rgb.POLL_WAIT + 10 + rgb._POLL_BACKOFF_MAX_S + 2 * rgb._REQ_TIMEOUT_S
+        one_pass = rgb.POLL_READ_TIMEOUT_S + rgb._POLL_BACKOFF_MAX_S + 2 * rgb._REQ_TIMEOUT_S
         self.assertEqual(rgb._LOCK_PASS_MAX_S, 2 * one_pass)
         self.assertGreater(rgb._LOCK_PASS_MAX_S, rgb._LOCK_STALE_S)
 
@@ -441,6 +441,53 @@ class SingletonGlueTest(unittest.TestCase):
             rgb._exit_on_signal(signal.SIGINT, None)
         self.assertEqual(ctx.exception.code, 0)
         self.assertIn("received SIGINT — exiting", out.getvalue())
+
+
+class BoundedExitTest(unittest.TestCase):
+    """run() is the process entry: a code main() returns becomes a bounded exit.
+    The real-process cases live in packages/ag2-sparrow/tests/test_lock_heartbeat_thread.py."""
+
+    def _patched(self, **attrs):
+        saved = {k: getattr(rgb, k) for k in attrs}
+        for k, v in attrs.items():
+            setattr(rgb, k, v)
+        self.addCleanup(lambda: [setattr(rgb, k, v) for k, v in saved.items()])
+
+    def test_run_exits_bounded_with_the_code_main_returns(self):
+        exits = []
+        self._patched(main=lambda: rgb.LOCK_LOST_EXIT_CODE, _exit_bounded=exits.append)
+        rgb.run()
+        self.assertEqual(exits, [70])
+
+    def test_run_does_not_exit_when_main_returns_nothing(self):
+        exits = []
+        self._patched(main=lambda: None, _exit_bounded=exits.append)
+        rgb.run()
+        self.assertEqual(exits, [])
+
+    def test_the_deadline_is_armed_before_any_output_and_does_no_io(self):
+        order = []
+
+        class Timer:
+            def __init__(self, interval, fn, args=()):
+                self.interval, self.fn, self.args, self.daemon = interval, fn, args, False
+
+            def start(self):
+                order.append(("armed", self.interval, self.fn, self.args, self.daemon))
+        self._patched(_log=lambda m: order.append(("log", m)))
+        real_timer = rgb.threading.Timer
+        rgb.threading.Timer = Timer
+        self.addCleanup(setattr, rgb.threading, "Timer", real_timer)
+        with self.assertRaises(SystemExit) as ctx:
+            rgb._exit_bounded(70)
+        self.assertEqual(ctx.exception.code, 70)
+        self.assertEqual(order[0], ("armed", rgb._EXIT_HOOKS_BOUND_S, os._exit, (70,), True),
+                         "the deadline calls os._exit itself: no write or flush can block it")
+        self.assertEqual(order[1][0], "log")
+
+    def test_the_package_entry_is_run(self):
+        import ag2_sparrow.__main__ as entry
+        self.assertIs(entry.run, rgb.run)
 
 
 if __name__ == "__main__":

@@ -169,7 +169,7 @@ class TestCredential(Base):
     def test_no_room_uses_the_primary_token(self):
         self.record(THREE)
         env = {"REMOTE_TASK_TOKEN": LEGACY + "|legacy-secret", "AG2_REMOTE_TOKEN_S_SPACE": "bare-s"}
-        self.assertEqual(self.cred(None, env), (S_SPACE, "bare-s"))
+        self.assertEqual(self.cred(None, env), (S_SPACE, S_SPACE + "|bare-s"), "a bare secret joins its row's gateway")
 
     def test_a_token_for_another_gateway_is_skipped(self):
         self.record(THREE)
@@ -187,7 +187,7 @@ class TestCredential(Base):
         rows = [dict(r) for r in THREE]
         rows[2]["launch_keys"] = ["AG2_REMOTE_TOKEN_DEV"]
         self.record(rows)
-        self.assertEqual(self.cred("!a:dev.s.space", {"AG2_REMOTE_TOKEN_DEV": "alias"}), (DEV_S_SPACE, "alias"))
+        self.assertEqual(self.cred("!a:dev.s.space", {"AG2_REMOTE_TOKEN_DEV": "alias"}), (DEV_S_SPACE, DEV_S_SPACE + "|alias"))
 
     def test_no_token_is_refused_by_connection_name(self):
         self.record(THREE)

@@ -40,7 +40,7 @@ run_hook() {  # $1 verdict, rest: extra env assignments
   local v="$1"; shift
   ledger_ok
   # The core is the launcher's marked session; a worker case passes its id on top.
-  (cd "$BUNDLE" && env -u CLAUDE_CODE_SESSION_ID -u SUTANDO_INSTANCE_ID -u SUTANDO_AGENT_ID -u AGENT_MXID -u AGENT_ID SUTANDO_CORE_SESSION=1 STUB_VERDICT="$v" "$@" bash "$HOOK" 2>"$BUNDLE/err")
+  (cd "$BUNDLE" && env -u CLAUDE_CODE_SESSION_ID -u SUTANDO_TASK_WATCH_MOD -u SUTANDO_INSTANCE_ID -u SUTANDO_AGENT_ID -u AGENT_MXID -u AGENT_ID SUTANDO_CORE_SESSION=1 STUB_VERDICT="$v" "$@" bash "$HOOK" 2>"$BUNDLE/err")
 }
 counter_path() {  # the production module names the file, under the same env the hook saw
   (cd "$BUNDLE" && env -u SUTANDO_INSTANCE_ID -u SUTANDO_AGENT_ID -u AGENT_MXID -u AGENT_ID "$@" "$PY" src/stop_hook_unwatched.py path --state "$WS/state")
@@ -69,6 +69,10 @@ esac
 CORE_REARM="$(printf '%s' "$OUT" | "$PY" -c 'import json,re,sys; r=json.load(sys.stdin)["reason"]; m=re.search(r"bash \"(/[^\"]*)/src/watch-tasks-stream\.sh\" --role session --inbox", r); print(m.group(1) if m else "")' 2>/dev/null)"
 [ -n "$CORE_REARM" ] && [ -f "$CORE_REARM/src/watch-tasks-stream.sh" ] && ok "the core's re-arm names the watcher by an absolute path that exists (a foreign cwd still finds it)" || bad "the core's re-arm names the watcher by an absolute path that exists" "reason tail: ${OUT: -260}"
 case "$OUT" in
+  *"task-watch Mod"*) bad "without the Mod the reason says nothing of it" "got: ${OUT:0:300}" ;;
+  *) ok "without the Mod the reason says nothing of it" ;;
+esac
+case "$OUT" in
   *"3 of 3"*) ok "the reason counts the attempt against the cap" ;;
   *) bad "the reason counts the attempt against the cap" "got: ${OUT:0:200}" ;;
 esac
@@ -78,6 +82,16 @@ OUT="$(run_hook no)"
 grep -q "unwatched at 4 consecutive turn ends; failing open" "$BUNDLE/err" && ok "...and says so on stderr" || bad "...and says so on stderr" "stderr: $(cat "$BUNDLE/err")"
 OUT="$(run_hook yes)"
 [ "$OUT" = "{}" ] && [ ! -e "$CORE_COUNT" ] && ok "a watched inbox clears the counter, so the next loss blocks again" || bad "a watched inbox clears the counter, so the next loss blocks again" "out=${OUT:0:80} counter=$(cat "$CORE_COUNT" 2>/dev/null)"
+
+echo "under the task-watch Mod, the reason defers to the Mod and asks for a Monitor only on mod-ready no:"
+OUT="$(run_hook no SUTANDO_TASK_WATCH_MOD=1)"
+MOD_OK="$(printf '%s' "$OUT" | "$PY" -c '
+import json,re,sys
+r=json.load(sys.stdin)["reason"]
+m=re.search(r"the task-watch Mod restarts the watcher on its own, so run python3 \"(/[^\"]*)/src/watcher_rearm\.py\" mod-ready --repo \"\1\" --workspace \"[^\"]+/workspace\" and only if it prints no, start one via the Monitor tool, bash \"\1/src/watch-tasks-stream\.sh\" --role session", r)
+print("yes" if m else "")' 2>/dev/null)"
+[ "$MOD_OK" = yes ] && ok "the Mod reason names mod-ready, then the Monitor fallback" || bad "the Mod reason names mod-ready, then the Monitor fallback" "got: ${OUT:0:500}"
+run_hook yes >/dev/null
 OUT="$(run_hook no)"
 case "$OUT" in *'"decision":"block"'*) ok "...it does" ;; *) bad "...it does" "got: ${OUT:0:120}" ;; esac
 rm -f "$CORE_COUNT"
