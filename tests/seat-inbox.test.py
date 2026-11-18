@@ -74,6 +74,29 @@ class SeatInboxTests(unittest.TestCase):
         self.assertEqual(self.seat(self.ws / "deliveries" / W)["seat"], "")
         self.assertEqual(self.seat(self.ws / "tasks")["seat"], "core")
 
+    def test_a_roster_whose_workers_is_not_a_map_registers_no_worker(self):
+        (self.ws / "state" / "roster.json").write_text(json.dumps({"workers": [W]}))
+        self.assertEqual(self.seat(self.ws / "deliveries" / W), seat_inbox.NONE)
+
+    def test_no_inbox_or_no_workspace_is_no_seat(self):
+        self.assertEqual(seat_inbox.seat("", self.ws), seat_inbox.NONE)
+        self.assertEqual(seat_inbox.seat(self.ws / "tasks", None), seat_inbox.NONE)
+
+    def test_an_unreadable_connections_record_registers_no_own_folder(self):
+        own = self.ws / "agents" / "own" / "tasks"
+        own.mkdir(parents=True)
+        with mock.patch("connections.own_worker_homes", side_effect=OSError("unreadable")):
+            self.assertEqual(seat_inbox.seat(own, self.ws), seat_inbox.NONE)
+            self.assertEqual(seat_inbox.seat(self.ws / "deliveries" / W, self.ws)["seat"], "worker")
+
+    def test_cli_without_a_workspace_uses_the_resolved_one(self):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf), mock.patch("workspace_default.resolve_workspace", return_value=self.ws):
+            seat_inbox.main(["seat", "--inbox", str(self.ws / "tasks")])
+        self.assertEqual(buf.getvalue().strip(), "core\t\tthe core")
+
     def test_cli_prints_tab_separated_or_none(self):
         import io
         from contextlib import redirect_stdout
