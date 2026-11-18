@@ -22,6 +22,10 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 _spec = importlib.util.spec_from_file_location("rc_suite", REPO / "tests" / "runtime-compat.test.py")
 suite = importlib.util.module_from_spec(_spec)

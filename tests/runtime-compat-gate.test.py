@@ -20,6 +20,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ()
+
 REPO = Path(__file__).resolve().parent.parent
 CLAUDE_FLAGS = ("--name --dangerously-skip-permissions --add-dir --settings --remote-control "
                 "--chrome --plugin-dir --resume --session-id")
@@ -229,7 +233,7 @@ chmod +x "$PREFIX/bin/claude"
                "SUTANDO_RUNTIME_WAIT_S": "0", "SUTANDO_TMUX_SOCKET": str(tmp / "sock"),
                "SUTANDO_SKIP_AUTH_PREFLIGHT": "1", "CLAUDE_CONFIG_DIR": str(tmp / "cfg"),
                "SUTANDO_RUNTIME_REPAIR_CONSENT": "1",
-               "SUTANDO_TASK_WATCH_MOD_CORE": "1" if mod else ""}
+               "SUTANDO_TASK_WATCH_MOD_CORE": "1" if mod else "0"}
         r = subprocess.run(["bash", str(launcher_copy(tmp) / "src/agent/claude/cli/start-cli.sh")],
                            env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL,
                            timeout=180)
