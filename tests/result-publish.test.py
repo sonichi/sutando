@@ -151,6 +151,95 @@ class PublisherContract(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
 
 
+class RelativePathAnchoring(unittest.TestCase):
+    """A relative "results/..." is anchored to the workspace, never to the process's cwd — the
+    session's cwd is the repo, so a path resolved against it lands where no reader looks.
+    Run against src and the vendored ag2-sparrow copy: the bridge imports the latter."""
+
+    MODULES = (result_publish, _load_vendored())
+
+    def test_a_relative_path_resolves_against_the_given_workspace(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                ws = (Path(td) / "ws").resolve()
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)  # a repo-root-shaped cwd that is NOT the workspace
+                    self.assertEqual(
+                        mod.worker_published_path(Path("results") / "task-1.txt", {}, ws),
+                        ws / "results" / "task-1.txt")
+                finally:
+                    os.chdir(cwd)
+
+    def test_a_relative_path_with_no_workspace_given_resolves_the_real_one(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                ws = (Path(td) / "ws").resolve()
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)
+                    with mock.patch("workspace_default.resolve_workspace", return_value=ws):
+                        self.assertEqual(
+                            mod.worker_published_path(Path("results") / "task-1.txt"),
+                            ws / "results" / "task-1.txt")
+                finally:
+                    os.chdir(cwd)
+
+    def test_an_absolute_path_is_unaffected(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                target = Path(td) / "results" / "task-1.txt"
+                self.assertEqual(mod.worker_published_path(target, {}, Path(td) / "unused"), target)
+
+    def test_a_relative_path_raises_rather_than_falling_back_to_cwd(self):
+        # No silent "resolver failed, use the current directory" path: a caller that cannot learn
+        # the workspace must not guess at one by falling back to wherever the process happens to be.
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)
+                    with mock.patch("workspace_default.resolve_workspace",
+                                     side_effect=RuntimeError("no workspace")):
+                        with self.assertRaises(RuntimeError):
+                            mod.worker_published_path(Path("results") / "task-1.txt")
+                    self.assertEqual(list(Path(td).rglob("*.txt")), [], "nothing was written anywhere")
+                finally:
+                    os.chdir(cwd)
+
+    def test_a_resolver_failure_escapes_nowhere_even_without_connections(self):
+        # Without `connections`, nothing downstream can catch a fallback here; isolates the guard.
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)
+                    with mock.patch("workspace_default.resolve_workspace",
+                                     side_effect=RuntimeError("no workspace")), \
+                            mock.patch.dict(sys.modules, {"connections": None}):
+                        with self.assertRaises(RuntimeError):
+                            mod.worker_published_path(Path("results") / "proactive-note.txt")
+                    self.assertEqual(list(Path(td).rglob("*.txt")), [], "nothing was written anywhere")
+                finally:
+                    os.chdir(cwd)
+
+    def test_cli_with_a_relative_path_and_a_failed_resolver_writes_nothing_and_exits_nonzero(self):
+        for mod in self.MODULES:
+            with self.subTest(mod=mod.__file__), tempfile.TemporaryDirectory() as td:
+                cwd = os.getcwd()
+                try:
+                    os.chdir(td)
+                    with mock.patch("workspace_default.resolve_workspace",
+                                     side_effect=RuntimeError("no workspace")), \
+                            mock.patch.object(mod.sys, "stdin", io.StringIO("x")), \
+                            mock.patch.object(mod.sys, "stderr", io.StringIO()):
+                        with self.assertRaises(RuntimeError):
+                            mod.main(["result_publish.py", "results/task-1.txt"])
+                    self.assertEqual(list(Path(td).rglob("*.txt")), [], "nothing was written anywhere")
+                finally:
+                    os.chdir(cwd)
+
+
 class PublisherFailurePaths(unittest.TestCase):
     """Run against src and the vendored ag2-sparrow copy: the bridge imports the latter."""
 
@@ -311,7 +400,7 @@ WRITERS = {
     "skills/schedule-crons/scripts/codex-scheduler.py": "from result_publish import publish_text",
     "packages/ag2-sparrow/ag2_sparrow/remote_gateway_bridge.py": "from .result_publish import",
     "src/notify.sh": "result_publish.py",
-    "src/launchd/gateway-bridge-wrapper.sh": "result_publish.py",
+    "src/launchd/gateway-bridge-lib.sh": "result_publish.py",
     "src/launchd/channel-bridge-wrapper.sh": "result_publish.py",
     "src/voice-agent.ts": "publishResultFile(`proactive-voice-${c.category}-",
     "src/live-agent-runtime.ts": "publishResultFile(`proactive-voice-stuck-",

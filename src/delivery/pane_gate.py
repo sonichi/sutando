@@ -90,8 +90,10 @@ def state_is_unsafe(state: str) -> bool:
 # ---- Claude Code pane text. core-input-watch.py imports these three; edit here only.
 FABLE_TEXT = re.compile(r"reached your Fable limit|included Fable usage for this week", re.I)
 CLAUDE_IDLE = re.compile(r"⏵⏵\s*bypass permissions on|←\s*for agents\b", re.I)
-# The CLI's wait-for-the-reset banner ("Usage limit reached · …", "Continuing automatically at …").
-LIMIT_WAIT = re.compile(r"Continuing automatically at\b|\b(?:session|usage|weekly) limit reached\b", re.I)
+# The CLI's wait-for-the-reset banner ("Usage limit reached · …", "Continuing automatically at …"); near
+# the reset its second row reads "Continuing shortly · Esc to cancel", often captured without the first.
+LIMIT_WAIT = re.compile(r"Continuing automatically (?:at\b|shortly\b)|Continuing shortly\s*·\s*Esc to cancel"
+                        r"|\b(?:session|usage|weekly) limit reached\b", re.I)
 # A completed turn ("✻ Cooked for 1s · done 12:32 PM"); the spinner reuses the glyph and must not match.
 TURN_DONE = re.compile(
     r"^\s*✻\s+[A-Za-z]+(?:\s+for\s+(?P<dur>\d+[hms](?:\s+\d+[hms])*))?(?:\s*·\s*done\b.*)?\s*$")

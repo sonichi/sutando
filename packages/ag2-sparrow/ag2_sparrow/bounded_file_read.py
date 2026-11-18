@@ -1,4 +1,4 @@
-"""Read a small regular file's text without ever blocking: the one reader for credential files.
+"""Read a small regular file without ever blocking: the one reader for credential files and attachments.
 
 A FIFO, device or directory named where a credential file is expected is refused before any read
 (opened non-blocking, then fstat), and a file over the size bound is refused too, so startup can
@@ -13,7 +13,7 @@ from __future__ import annotations
 import errno
 import os
 import stat
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 MAX_BYTES = 1 << 20
 _ABSENT = (errno.ENOENT, errno.ENOTDIR)
@@ -30,6 +30,20 @@ def read_regular(path: str, limit: int = MAX_BYTES, dir_fd: Optional[int] = None
     not exist; (None, reason) when it exists but was refused: not a regular file, a symlink with
     `follow=False`, over `limit` bytes, unreadable or not UTF-8. `private` also refuses a symlink,
     a file another user owns, and any group or other permission bit."""
+    data, reason = read_regular_bytes(path, limit, dir_fd, follow, private)
+    if data is None:
+        return None, reason
+    try:
+        return data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n"), ""
+    except UnicodeDecodeError:
+        return None, "not UTF-8"
+
+
+def read_regular_bytes(path: str, limit: int = MAX_BYTES, dir_fd: Optional[int] = None,
+                       follow: bool = True, private: bool = False,
+                       verify: Optional[Callable[[os.stat_result], str]] = None) -> Tuple[Optional[bytes], str]:
+    """read_regular's bytes, undecoded. `verify` judges the opened file's fstat before any read;
+    a non-empty reason it returns refuses the file."""
     private = private and os.name == "posix"  # elsewhere st_mode and st_uid carry no ownership to check
     flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
     if not follow or private:
@@ -54,24 +68,30 @@ def read_regular(path: str, limit: int = MAX_BYTES, dir_fd: Optional[int] = None
             return None, f"owned by uid {info.st_uid}, not this user"
         if private and info.st_mode & 0o077:
             return None, f"mode {stat.S_IMODE(info.st_mode):04o}; a private credential file must be 0600"
-        if info.st_size > limit:
-            return None, f"over {limit} bytes"
-        chunks, size = [], 0
-        while size <= limit:
-            chunk = os.read(fd, limit + 1 - size)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            size += len(chunk)
-        if size > limit:
-            return None, f"over {limit} bytes"  # grew past the bound after the fstat
-        return b"".join(chunks).decode("utf-8").replace("\r\n", "\n").replace("\r", "\n"), ""
-    except UnicodeDecodeError:
-        return None, "not UTF-8"
+        refused = verify(info) if verify is not None else ""
+        if refused:
+            return None, refused
+        return read_fd_bytes(fd, limit, info)
     except OSError as e:
         return None, f"unreadable ({errno.errorcode.get(e.errno, 'error')})"
     finally:
         os.close(fd)
+
+
+def read_fd_bytes(fd: int, limit: int, info: Optional[os.stat_result] = None) -> Tuple[Optional[bytes], str]:
+    """At most `limit` bytes of an open regular file; refused when it is, or grows, over `limit`."""
+    if (info if info is not None else os.fstat(fd)).st_size > limit:
+        return None, f"over {limit} bytes"
+    chunks, size = [], 0
+    while size <= limit:
+        chunk = os.read(fd, limit + 1 - size)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    if size > limit:
+        return None, f"over {limit} bytes"  # grew past the bound after the fstat
+    return b"".join(chunks), ""
 
 
 def read_private(path: str, limit: int = MAX_BYTES) -> Tuple[Optional[str], str]:

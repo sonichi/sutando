@@ -18,6 +18,9 @@
 # agent bridges declared under <workspace>/agents on this install; that child does its own scanning.
 #
 # Killing the wrapper by hand brings it back in about 10 s; use launchctl bootout to stop it for good.
+#
+# With <workspace>/state/sparrowd/core.enabled it launches no bridge: that sparrowd runs `--core` and
+# owns the core bridge (docs/connections.md, "The core bridge under sparrowd").
 
 set -euo pipefail
 
@@ -34,63 +37,21 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
-# Resolve + load the ag2space channel .env (holds REMOTE_TASK_TOKEN). Honor
-# $CLAUDE_CONFIG_DIR if the plist exports it (claude-sutando installs); the
-# config helper falls back to ~/.claude otherwise.
-# What the process environment (the plist, or a caller) provided, kept apart from
-# what the .env provides, so a re-read can drop a removed .env token without
-# dropping an environment-provided one.
-_ENV_REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-}"; _ENV_AG2_REMOTE_TOKEN="${AG2_REMOTE_TOKEN:-}"
-_ENV_REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-}"; _ENV_AG2_REMOTE_TIER="${AG2_REMOTE_TIER:-}"
-# `.env` first (policy, shell-form credentials), then the file the shared resolver
-# names as holding the token, unless the process environment supplied one.
-_load_channel_env() {
-    local dot="" tok=""
-    dot="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path channels/ag2space/.env 2>/dev/null)" || dot=""
-    [ -n "$dot" ] && [ -f "$dot" ] && { set -a; . "$dot"; set +a; }
-    if [ -z "${_ENV_REMOTE_TASK_TOKEN}${_ENV_AG2_REMOTE_TOKEN}" ]; then
-        tok="$(bash "$REPO/scripts/channel-env.sh" ag2space 2>/dev/null)" || tok=""
-        [ -n "$tok" ] && [ -f "$tok" ] && [ "$tok" != "$dot" ] && { set -a; . "$tok"; set +a; }
-    fi
-    # The bridge re-reads the file holding the token on an auth rejection, to pick up a rotated one.
-    local held="$dot"; [ -n "$tok" ] && [ -f "$tok" ] && held="$tok"
-    [ -n "$held" ] && [ -f "$held" ] && export REMOTE_TASK_TOKEN_FILE="$held"
-    # Only the shared rule's "blank" verdict (rc 3) drops it; an unrunnable check keeps it.
-    local v rc
-    for v in REMOTE_TASK_TOKEN AG2_REMOTE_TOKEN; do
-        rc=0
-        printf '%s' "${!v:-}" | python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from channel_token import clean_relay_token as c; sys.exit(0 if c(sys.stdin.read()) else 3)' "$REPO/src" 2>/dev/null || rc=$?
-        [ "$rc" -ne 3 ] || eval "$v="
-    done
-    return 0
-}
-_load_channel_env
-
-# Map legacy AG2_REMOTE_* → REMOTE_TASK_* (the names the bridge reads).
-# Default tier is "owner" for the personal-agent model (PR #2018, 2026-07-08): a
-# user's own gateway authenticates with their own owner bearer and the broker
-# owner-scopes every pull, so its tasks are the owner's own. This MUST match
-# src/startup.sh's inline launch and the bridge's own default — otherwise the
-# launchd path would sandbox the owner's own mobile messages as team-tier
-# (read-only). A shared / multi-user gateway sets REMOTE_TASK_TIER=team in the
-# channel .env explicitly, which this honors.
-REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
-REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
-# AG2 Space tags inbound image/file markers `ag2space-media`; the provider-
-# neutral bridge defaults to `remote-media`, so without this the marker never
-# matches and media URLs land unresolved in task bodies (owner-reported
-# 2026-07-25; fixed on main in startup.sh's launch block). launchd jobs never
-# see startup.sh's exports, so this AG2-specific launch site must default it
-# too. Explicit REMOTE_MEDIA_MARKER from the channel .env still wins.
-REMOTE_MEDIA_MARKER="${REMOTE_MEDIA_MARKER:-ag2space-media}"
-export REMOTE_TASK_TOKEN REMOTE_TASK_TIER REMOTE_MEDIA_MARKER
+# Resolve + load the ag2space channel .env (holds REMOTE_TASK_TOKEN) and map the legacy names
+# (gateway-bridge-lib.sh, shared with src/sparrow_core_bridge.py). Honors $CLAUDE_CONFIG_DIR.
+# shellcheck source=gateway-bridge-lib.sh
+. "$REPO/src/launchd/gateway-bridge-lib.sh"
+gateway_legacy_env
+# Core gate set: sparrowd decides, evicts and launches the bridge; no token check or eviction here.
+CORE_GATE=""
+gateway_core_gate "$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)" && CORE_GATE=1
 
 # If there's still no token, the bridge would FATAL-exit and KeepAlive would
 # crash-loop. Exit 0 quietly instead — the install path only loads this job when
 # a token is configured, so reaching here means the token was removed after
 # install; don't hammer the system, just stop cleanly (launchd honors the clean
 # exit under our KeepAlive.SuccessfulExit=false policy).
-if [ -z "$REMOTE_TASK_TOKEN" ]; then
+if [ -z "$CORE_GATE" ] && [ -z "$REMOTE_TASK_TOKEN" ]; then
     # Exit 0 into an idle job on purpose: startup-runtime's "loaded but idle"
     # branch kickstarts it once a token exists, and an idle PID would read as running.
     echo "[gateway-bridge-wrapper] no REMOTE_TASK_TOKEN configured — nothing to run; exiting cleanly." >&2
@@ -100,12 +61,27 @@ fi
 # Evict an already-running gateway bridge that belongs to THIS checkout: it has no
 # single-instance lock, so a straggler would double-poll and double-process.
 _EVICT_HELPER="$REPO/src/launchd/evict-own-bridge.sh"
-if [ -f "$_EVICT_HELPER" ]; then
+if [ -z "$CORE_GATE" ] && [ -f "$_EVICT_HELPER" ]; then
   # shellcheck source=evict-own-bridge.sh
   . "$_EVICT_HELPER"
+  # A straggler whose identity ps cannot show is still ours when it holds this bridge's lease;
+  # skipping it would leave our own child deferring to it (rc 75) and the job unsupervised.
+  _EVICT_PROVEN=""
+  if _EVICT_WS="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" && [ -n "$_EVICT_WS" ]; then
+    _EVICT_PROVEN="$(python3 "$REPO/scripts/connections.py" --workspace "$_EVICT_WS" bridge-pid \
+      "${GATEWAY_INSTANCE:-}" 2>/dev/null || true)"
+  fi
   # Same script path serves every gateway instance in this checkout, so scope by
   # GATEWAY_INSTANCE too — unset here means the primary/prod gateway.
-  evict_own_bridge "remote-gateway" "$REPO" "GATEWAY_INSTANCE" "${GATEWAY_INSTANCE:-}"
+  _EVICT_RC=0
+  EVICT_PROVEN_PID="$_EVICT_PROVEN" EVICT_WAIT_S="${SUTANDO_GATEWAY_EVICT_WAIT_S:-15}" \
+    evict_own_bridge "remote-gateway" "$REPO" "GATEWAY_INSTANCE" "${GATEWAY_INSTANCE:-}" || _EVICT_RC=$?
+  # A child beside a surviving straggler would stand down (rc 75) and end the job; exit
+  # non-zero instead so launchd (KeepAlive SuccessfulExit=false) retries the eviction.
+  if [ "$_EVICT_RC" -ne 0 ]; then
+    echo "[gateway-bridge-wrapper] eviction did not complete (rc $_EVICT_RC); not launching, exiting non-zero so launchd retries" >&2
+    exit "$_EVICT_RC"
+  fi
   sleep 0.3
 fi
 
@@ -122,33 +98,19 @@ fi
 STATE_DIR="$WORKSPACE/state/channel-bridge-supervisor"
 mkdir -p "$STATE_DIR" "$WORKSPACE/results" 2>/dev/null || true
 MARKER="$STATE_DIR/gateway.started"
-DELIBERATE="$STATE_DIR/deliberate-restart"
-DELIBERATE_WINDOW_S="${SUTANDO_BRIDGE_DELIBERATE_WINDOW_S:-180}"
-ALERT_STAMP="$STATE_DIR/gateway.last-alert"
-ALERT_COOLDOWN_S="${SUTANDO_BRIDGE_ALERT_COOLDOWN_S:-600}"
 RESTART_DELAY="${SUTANDO_GATEWAY_BRIDGE_RESTART_DELAY:-10}"
-_age() { local t; t="$(cat "$1" 2>/dev/null || echo 0)"; echo $(( $(date +%s) - ${t:-0} )); }
-emit_restart_alert() {
-  NOW="$(date +%s)"
-  echo "[gateway-bridge-wrapper] previous process exited; automatically restarting" >&2
-  if [ -f "$DELIBERATE" ] && [ "$(_age "$DELIBERATE")" -lt "$DELIBERATE_WINDOW_S" ]; then
-    echo "[gateway-bridge-wrapper] exit within a deliberate restart window; no alert" >&2
-    return 0
-  fi
-  if [ -f "$ALERT_STAMP" ] && [ "$(_age "$ALERT_STAMP")" -lt "$ALERT_COOLDOWN_S" ]; then
-    echo "[gateway-bridge-wrapper] alert cooldown active; not repeating" >&2
-    return 0
-  fi
-  echo "$NOW" > "$ALERT_STAMP"
-  printf '%s\n' "⚠️ The gateway bridge exited and was automatically restarted." \
-    | python3 "$REPO/src/result_publish.py" "$WORKSPACE/results/proactive-gateway-bridge-restarted-$NOW.txt"
-  bash "$REPO/src/macos-notify.sh" "The gateway bridge exited and was automatically restarted." || true
-}
-if [ -f "$MARKER" ]; then emit_restart_alert; fi
-date +%s > "$MARKER"
+emit_restart_alert() { gateway_restart_alert; }
+if [ -n "$CORE_GATE" ]; then
+  rm -f "$MARKER"  # the core bridge's restarts are sparrowd's to report
+else
+  if [ -f "$MARKER" ]; then emit_restart_alert; fi
+  date +%s > "$MARKER"
+fi
 CHILD_PID=''
 STOPPING=0
 AGENTS_SUPERVISOR="$REPO/src/sparrowd.py"
+AGENTS_ARGS=(--agent-bridges)
+[ -z "$CORE_GATE" ] || AGENTS_ARGS=(--core --agent-bridges)
 AGENTS_PID=''
 AGENTS_NEXT_START=0
 POLL_S=1
@@ -166,9 +128,25 @@ tend_agents_supervisor() {
     AGENTS_NEXT_START=$(( $(date +%s) + RESTART_DELAY ))
   fi
   [ "$(date +%s)" -ge "$AGENTS_NEXT_START" ] || return 0
-  python3 "$AGENTS_SUPERVISOR" --agent-bridges &
+  python3 "$AGENTS_SUPERVISOR" "${AGENTS_ARGS[@]}" &
   AGENTS_PID=$!
-  echo "[gateway-bridge-wrapper] agent-bridge supervisor started (pid $AGENTS_PID)" >&2
+  echo "[gateway-bridge-wrapper] agent-bridge supervisor started (pid $AGENTS_PID, ${AGENTS_ARGS[*]})" >&2
+}
+# Named lanes (connections.py launch-plan) have no supervisor of their own: one keep-lanes pass every
+# LANES_EVERY_S, never two at once. Each pass starts lanes under the connections lock and backs off.
+LANES_EVERY_S="${SUTANDO_GATEWAY_LANES_EVERY_S:-30}"
+LANES_PID=''
+LANES_NEXT=0
+tend_lanes() {
+  if [ -n "$LANES_PID" ]; then
+    kill -0 "$LANES_PID" 2>/dev/null && return 0
+    wait "$LANES_PID" 2>/dev/null || true
+    LANES_PID=''
+  fi
+  [ "$(date +%s)" -ge "$LANES_NEXT" ] || return 0
+  LANES_NEXT=$(( $(date +%s) + LANES_EVERY_S ))
+  python3 "$REPO/scripts/connections.py" keep-lanes --repo "$REPO" --logs-dir "$WORKSPACE/logs" &
+  LANES_PID=$!
 }
 stop_agents_supervisor() {
   [ -n "$AGENTS_PID" ] || return 0
@@ -186,15 +164,22 @@ stop_wrapper() {
 trap 'stop_wrapper TERM' TERM
 trap 'stop_wrapper INT' INT
 trap 'stop_wrapper HUP' HUP
+if [ -n "$CORE_GATE" ]; then
+  echo "[gateway-bridge-wrapper] core gate set: sparrowd runs the gateway bridge; this wrapper launches none" >&2
+fi
+while [ "$STOPPING" = 0 ] && [ -n "$CORE_GATE" ]; do
+  tend_agents_supervisor
+  tend_lanes
+  sleep "$POLL_S" &
+  CHILD_PID=$!
+  set +e
+  wait "$CHILD_PID"
+  set -e
+  CHILD_PID=''
+done
 while [ "$STOPPING" = 0 ]; do
-  # A rotated or removed .env token must reach the next child: reset to the
-  # environment-provided values, re-read the .env, redo the legacy mapping.
-  REMOTE_TASK_TOKEN="$_ENV_REMOTE_TASK_TOKEN"; AG2_REMOTE_TOKEN="$_ENV_AG2_REMOTE_TOKEN"
-  REMOTE_TASK_TIER="$_ENV_REMOTE_TASK_TIER"; AG2_REMOTE_TIER="$_ENV_AG2_REMOTE_TIER"
-  _load_channel_env
-  REMOTE_TASK_TOKEN="${REMOTE_TASK_TOKEN:-${AG2_REMOTE_TOKEN:-}}"
-  REMOTE_TASK_TIER="${REMOTE_TASK_TIER:-${AG2_REMOTE_TIER:-owner}}"
-  export REMOTE_TASK_TOKEN REMOTE_TASK_TIER
+  # A rotated or removed .env token must reach the next child: re-read from the environment-provided values.
+  gateway_legacy_env
   if [ -z "$REMOTE_TASK_TOKEN" ]; then
     echo "[gateway-bridge-wrapper] token removed — nothing to relaunch; exiting cleanly." >&2
     stop_agents_supervisor
@@ -202,6 +187,7 @@ while [ "$STOPPING" = 0 ]; do
     exit 0
   fi
   tend_agents_supervisor
+  tend_lanes
   # A primary move parked the legacy row: launch nothing, keep tending the agent bridges, and
   # resume on its own once the row is unparked.
   if python3 "$REPO/scripts/connections.py" legacy-parked >/dev/null 2>&1; then
@@ -231,6 +217,7 @@ while [ "$STOPPING" = 0 ]; do
   # supervisor must be tended while the bridge runs.
   while kill -0 "$CHILD_PID" 2>/dev/null && [ "$STOPPING" = 0 ]; do
     tend_agents_supervisor
+    tend_lanes
     sleep "$POLL_S"
   done
   set +e

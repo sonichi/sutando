@@ -441,5 +441,5 @@ launch (`switch-model.sh --offline`) and lifts the hold; "retry now" lifts it as
 then starts the core. A hold binds only the Claude account it was seen under: after signing in to
 another account, the next restart launches the core at once. Signing in with `/login` in the running
 core's terminal resumes it in place: once the pane sits idle with nothing run since "Login successful",
-the core supervisor types `/startup` once, which re-arms the task watcher and crons. For engineers: `python3 src/core_limit_hold.py status` prints the hold and
+the core supervisor types `/startup` once, which re-arms the task watcher (unless the task-watch Mod already runs it) and crons. For engineers: `python3 src/core_limit_hold.py status` prints the hold and
 `... clear` lifts it.

@@ -58,6 +58,9 @@ class Grammar(unittest.TestCase):
         self.assertEqual(pr.stamp_worker(f"proactive-5.by-{W}.txt", W), f"proactive-5.by-{W}.txt")
         self.assertEqual(pr.stamp_worker(f"proactive-5.by-{OTHER}.txt", W), f"proactive-5.by-{OTHER}.txt")
         self.assertEqual(pr.stamp_worker("task-5.txt", W), "task-5.txt")
+        for bridge in ("discord", "slack", "telegram"):
+            self.assertEqual(pr.stamp_worker(f"proactive-5.to-{bridge}.txt", W), f"proactive-5.to-{bridge}.txt",
+                             "another bridge's file stays that bridge's")
         self.assertEqual(pr.stamp_worker("proactive-5.txt", ""), "proactive-5.txt")
         self.assertEqual(pr.stamp_worker("/x/results/proactive-5.txt", W), f"proactive-5.by-{W}.txt")
 

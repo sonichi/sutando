@@ -23,7 +23,7 @@ concurrency:
 jobs:
   lint-src-map:
     name: refuse docs/src-map.md stale vs src/
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
 
     steps:
