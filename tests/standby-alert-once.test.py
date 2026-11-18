@@ -157,7 +157,7 @@ class Episodes(Base):
 
     def test_a_damaged_record_starts_a_new_outage(self):
         m.observe(self.ws, self.inbox, 1000, 300)
-        (self.ws / m.STATE_DIR / f"{m.inbox_key(self.inbox)}.json").write_text("{not json")
+        (m._state(self.ws) / f"{m.inbox_key(self.inbox)}.json").write_text("{not json")
         self.assertEqual(m.observe(self.ws, self.inbox, 1100, 300), 1100)
 
     def test_inboxes_are_independent(self):
@@ -188,7 +188,7 @@ class Episodes(Base):
         m.observe(self.ws, self.inbox, 1000, 300)
         m.publish(self.ws, self.stem, BODY)
         m.end(self.ws, self.inbox)
-        left = sorted(p.name for p in (self.ws / m.STATE_DIR).iterdir())
+        left = sorted(p.name for p in (m._state(self.ws)).iterdir())
         self.assertEqual(left, [f"{m.inbox_key(self.inbox)}.lock"])
 
 

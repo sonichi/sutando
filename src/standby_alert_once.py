@@ -39,8 +39,8 @@ import undelivered_quarantine
 from delivery.task_dispatch import find_ready_result
 from file_lock import locked_file
 from result_publish import PublishedUnconfirmed, publish_text
+from workspace_default import status_path
 
-STATE_DIR = Path("state") / "standby-alert"
 PUBLISHED, ALREADY, UNCONFIRMED, FAILED = 0, 4, 3, 1
 
 
@@ -55,7 +55,7 @@ def stem(inbox, episode: int, slot: "int | None" = None) -> str:
 
 
 def _state(workspace) -> Path:
-    return Path(workspace) / STATE_DIR
+    return status_path("standby-alert", Path(workspace))
 
 
 def observe(workspace, inbox, now: int, stale_after: int) -> int:
