@@ -73,9 +73,9 @@ with tempfile.TemporaryDirectory() as tmp:
     )
 
     binp.mkdir()
-    # `claude` resolves on PATH but cannot be executed -> a REAL failed exec (126),
-    # which is the only way to reach the restore path under errexit.
-    _exe(binp / "claude", "#!/bin/sh\nexit 0\n", 0o000)
+    # The selected absolute path passes executable discovery, but its missing interpreter
+    # forces a real exec failure after the sentinel is cleared.
+    _exe(binp / "claude", f"#!{tmp}/missing-interpreter\n")
     # No core is running in the sandbox; without this the launcher finds the host's
     # real core and exits early, never reaching the branch under test.
     _exe(binp / "pgrep", "#!/bin/sh\nexit 1\n")
@@ -111,10 +111,10 @@ with tempfile.TemporaryDirectory() as tmp:
     elif sentinel.read_text() != "stopped-on-purpose\n":
         failures.append(f"sentinel restored with wrong content: {sentinel.read_text()!r}")
 
-    if proc.returncode in (0, 1):
+    if proc.returncode not in (126, 127):
         failures.append(
             f"exit status {proc.returncode} does not carry the failed exec's own status "
-            f"(expected 126 for a non-executable target); a hardcoded `exit 1` hides which "
+            f"(expected 126 or 127 for a missing interpreter); a hardcoded `exit 1` hides which "
             f"launch failure occurred")
 
     if "failed to exec" not in proc.stderr:
