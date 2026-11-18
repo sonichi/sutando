@@ -2,14 +2,14 @@
 """A successful spawn starts the worker's own beat, watching the tmux pane's
 pid (the agent process itself, with the core's launch command) — not the
 launcher's own pid, and not by parentage: see docs in pool_beat.py and the
-live proof in tests/worker-writes-its-beat.test.sh for why parentage cannot
+live proof in tests/skills/worker-pool/worker-writes-its-beat.test.sh for why parentage cannot
 work for anything this skill spawns from inside a running session.
 
 tmux is injected here too, same as spawn-worker-launcher.test.py: these never
 touch a real socket or a real pool_beat.py process. What's under test is the
 WIRING — spawn() reads the pane pid and hands it to start_worker_beat with the
 right worker id — not pool_beat.py's own mechanics (covered by
-tests/pool-beat-watch-pid.test.py) or Popen's (nothing meaningful to fake).
+tests/skills/worker-pool/pool-beat-watch-pid.test.py) or Popen's (nothing meaningful to fake).
 """
 from __future__ import annotations
 
