@@ -78,6 +78,7 @@ import ssl
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1058,6 +1059,8 @@ def _validate_row(row: object, index: int) -> dict:
             raise SchemaError(f"connections.json: row {index} worker is not a pool worker id")
         if row["primary"] or not row["instance"]:
             raise SchemaError(f"connections.json: row {index} is a worker's identity, so it is a named, non-primary row")
+    if WORKER_DIRS_KEY in row and (row[WORKER_DIRS_KEY] != WORKER_DIRS_OWN or "worker" not in row):
+        raise SchemaError(f"connections.json: row {index} {WORKER_DIRS_KEY} is {WORKER_DIRS_OWN!r} on a worker's row only")
     return row
 
 
@@ -1100,7 +1103,16 @@ def _validate(payload: object) -> dict:
     pending = payload.get(RELAUNCH_KEY, {})
     if not isinstance(pending, dict) or not all(isinstance(k, str) and type(v) is int for k, v in pending.items()):
         raise SchemaError(f"connections.json: '{RELAUNCH_KEY}' is not a map of instance to pid")
-    return {"rows": rows, REMOVED_KEY: sorted(set(removed)), LEGACY_PARKED_KEY: parked, RELAUNCH_KEY: dict(pending)}
+    storage = payload.get("worker_storage", {})
+    if not isinstance(storage, dict):
+        raise SchemaError("connections.json: worker_storage is not a map")
+    for worker, home in storage.items():
+        if (not isinstance(worker, str) or not WORKER_RE.fullmatch(worker) or not isinstance(home, dict)
+                or not isinstance(home.get("agent_mxid"), str) or not home["agent_mxid"].strip()
+                or type(home.get("own")) is not bool):
+            raise SchemaError("connections.json: invalid worker_storage entry")
+    return {"rows": rows, REMOVED_KEY: sorted(set(removed)), LEGACY_PARKED_KEY: parked,
+            RELAUNCH_KEY: dict(pending), "worker_storage": _worker_storage(rows, storage)}
 
 
 def _read_record(path: Path) -> dict:
@@ -1156,6 +1168,9 @@ def _write(path: Path, record: dict) -> None:
                if any(r["primary"] and r["instance"] == k for r in record["rows"])}
     if pending:
         payload[RELAUNCH_KEY] = pending
+    storage = _worker_storage(record["rows"], record.get("worker_storage", {}))
+    if storage:
+        payload["worker_storage"] = storage
     _validate(payload)
     _atomic_json(path, payload)
 
@@ -1810,10 +1825,17 @@ def _channel_dir_tokens(channel_dir: Optional[str]) -> list:
         return []
 
 
+def row_token(row: Mapping[str, object], token: str) -> str:
+    """`token` as the `url|secret` a row's credential is: a combined one as it is, a bare secret joined
+    to the row's own gateway_url (`legacy_relay_token`); '' when that gateway is no gateway URL."""
+    return legacy_relay_token(token, str(row.get("gateway_url") or ""))
+
+
 def connection_credential(row: Mapping[str, object], environ: Optional[Mapping[str, str]] = None, *,
                           vault=None) -> "tuple[str, str]":
     """(gateway_url, token) for one row: the first token among its env var, its launch keys, its
-    channel env file and its vault key whose embedded gateway (if any) is the row's own host."""
+    channel env file and its vault key whose embedded gateway (if any) is the row's own host. The
+    token is always `url|secret`: a bare secret is joined to the row's gateway (`row_token`)."""
     environ = os.environ if environ is None else environ
     ref, instance = str(row["token_ref"]), str(row["instance"])
     refs = [ref] + [str(k) for k in row.get("launch_keys") or []]
@@ -1825,8 +1847,8 @@ def connection_credential(row: Mapping[str, object], environ: Optional[Mapping[s
     host = host_of_url(str(row["gateway_url"]))
 
     def own(tok) -> str:
-        tok = (tok or "").strip()
-        return tok if tok and (not gateway_url_of(tok) or host_of_url(gateway_url_of(tok)) == host) else ""
+        tok = row_token(row, tok)
+        return tok if tok and host_of_url(gateway_url_of(tok)) == host else ""
     tok = next((own(t) for t in candidates if own(t)), "")
     if not tok:
         try:
@@ -2242,6 +2264,179 @@ def require_no_worker_identity(worker: str, server: str, workspace: Optional[Pat
                                    f"({row.get('agent_mxid') or row['instance']}); rotate or retire it instead")
 
 
+# Legacy rows carry `dirs: "own"`; worker_storage pins one home across identity changes.
+WORKER_DIRS_KEY = "dirs"
+WORKER_DIRS_OWN = "own"
+WORKER_AGENTS_DIR = "agents"
+
+
+def worker_agents_dir(workspace: Optional[Path] = None) -> Path:
+    """`<workspace>/agents`: the folder every agent's own root and declaration lives under."""
+    return _workspace(workspace) / WORKER_AGENTS_DIR
+
+
+def worker_root(agent_mxid: str, workspace: Optional[Path] = None) -> Path:
+    """`<workspace>/agents/<segment of agent_mxid>`: the agent's own folder; ValueError on an empty id."""
+    return worker_agents_dir(workspace) / _agent_identity().root_segment(agent_mxid)
+
+
+def _worker_storage(rows: list, saved: Mapping) -> dict:
+    """Keep each worker's first storage anchor, including when its original identity is removed."""
+    storage = {worker: dict(home) for worker, home in saved.items()}
+    workers = dict.fromkeys(r["worker"] for r in rows if r.get("worker"))
+    for worker in workers:
+        mine = [r for r in rows if r.get("worker") == worker and str(r.get("agent_mxid") or "").strip()]
+        if worker in storage or not mine:
+            continue
+        row = next((r for r in mine if r.get(WORKER_DIRS_KEY) == WORKER_DIRS_OWN), mine[0])
+        storage[worker] = {"agent_mxid": str(row["agent_mxid"]).strip(),
+                           "own": row.get(WORKER_DIRS_KEY) == WORKER_DIRS_OWN}
+    return storage
+
+
+def _storage_dirs(record: Mapping, worker: str, workspace: Optional[Path], *,
+                  include_shared: bool = False) -> "Optional[tuple[Path, Path]]":
+    if not worker or not any(r.get("worker") == worker for r in record["rows"]):
+        return None
+    home = record.get("worker_storage", {}).get(worker)
+    if not home or not (home["own"] or include_shared):
+        return None
+    root = worker_root(home["agent_mxid"], workspace)
+    return root / "tasks", root / "results"
+
+
+def worker_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":
+    """The worker's stable task/results folders, shared by all its identities; None for shared storage."""
+    try:
+        record = _read_record(record_path(workspace))
+    except (SchemaError, OSError):
+        return None
+    return _storage_dirs(record, worker, workspace)
+
+
+def worker_storage_root(worker: str, workspace: Optional[Path] = None) -> Optional[Path]:
+    """The stable worker storage root, including while the worker uses shared folders."""
+    try:
+        record = _read_record(record_path(workspace))
+    except (SchemaError, OSError):
+        return None
+    dirs = _storage_dirs(record, worker, workspace, include_shared=True)
+    return dirs[0].parent if dirs else None
+
+
+def ensure_worker_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":
+    """`worker_dirs`, created: the agent root 0o700 (another local account reads none of its tasks), then
+    tasks/ and results/ with their archive/ beneath it. None for a worker without own folders."""
+    dirs = worker_dirs(worker, workspace)
+    if dirs is None:
+        return None
+    root = dirs[0].parent
+    root.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(root, 0o700)
+    os.chmod(root, 0o700)
+    for d in dirs:
+        (d / "archive").mkdir(parents=True, exist_ok=True)
+    return dirs
+
+
+def task_home(task_id: str, workspace: Optional[Path] = None) -> dict:
+    """Where `task_id` lives: {"lane", "worker", "tasks", "results", "own"}. A task an own-dir worker's
+    lane queued (`task_lane`) is in that worker's dirs, as is any other id whose task file (live or
+    archived) is in an own-dir worker's tasks folder; else, or on an unreadable record, the shared ones."""
+    ws = _workspace(workspace)
+    home = {"lane": task_lane(task_id), "worker": "", "tasks": ws / "tasks", "results": ws / "results", "own": False}
+    try:
+        record = _read_record(record_path(ws))
+        rows = record["rows"]
+    except (SchemaError, OSError):
+        return home
+    if home["lane"]:
+        row = next((r for r in rows if home["lane"] in [r["instance"]] + alias_instances(r)), None)
+    else:
+        row = next((r for r in rows if (dirs := _storage_dirs(record, r.get("worker", ""), ws))
+                    and _holds_task(dirs[0], task_id)), None)
+    home["worker"] = str((row or {}).get("worker") or "")
+    dirs = _storage_dirs(record, home["worker"], ws)
+    if dirs:
+        home.update(tasks=dirs[0], results=dirs[1], own=True)
+    return home
+
+
+def _holds_task(tasks_dir: Path, task_id: str) -> bool:
+    """Whether `tasks_dir` holds `task_id`'s task file: live under any claimed or assigned name, or archived."""
+    import local_task_protocol
+    import task_archive
+    if not local_task_protocol.valid_archive_lookup_id(task_id):
+        return False
+    try:
+        return (task_archive.find_task_file(tasks_dir, task_id) or
+                local_task_protocol.find_archived_task(tasks_dir, task_id)) is not None
+    except (OSError, ValueError):
+        return False
+
+
+def task_other_home(task_id: str, workspace: Optional[Path] = None) -> Optional[dict]:
+    """{"tasks", "results"} a lane-queued task's worker uses under its other setting (own <-> shared),
+    whose ARCHIVES may still hold the task's history after a switch; None for any other task."""
+    ws = _workspace(workspace)
+    home = task_home(task_id, ws)
+    if not home["worker"]:
+        return None
+    if home["own"]:
+        return {"tasks": ws / "tasks", "results": ws / "results"}
+    try:
+        record = _read_record(record_path(ws))
+    except (SchemaError, OSError):
+        return None
+    dirs = _storage_dirs(record, home["worker"], ws, include_shared=True)
+    return {"tasks": dirs[0], "results": dirs[1]} if dirs else None
+
+
+def own_worker_homes(workspace: Optional[Path] = None) -> list:
+    """[{"worker", "tasks", "results"}] for every worker with its own folders (`worker_dirs`), from one
+    read of the record; [] when it is unreadable. Paths are lexical under the workspace, as worker_dirs'."""
+    ws = _workspace(workspace)
+    try:
+        record = _read_record(record_path(ws))
+    except (SchemaError, OSError):
+        return []
+    homes = []
+    for worker in dict.fromkeys(r["worker"] for r in record["rows"] if r.get("worker")):
+        dirs = _storage_dirs(record, worker, ws)
+        if dirs:
+            homes.append({"worker": worker, "tasks": dirs[0], "results": dirs[1]})
+    return homes
+
+
+def set_worker_dirs(worker: str, own: bool, *, workspace: Optional[Path] = None) -> dict:
+    """Set (`own`) or clear `worker`'s `dirs: "own"` under the record lock; returns the row. Refused
+    (`ConnectionsError`) when the worker has no identity row or its row names no agent."""
+    with _transaction(workspace) as record:
+        row = next((r for r in record["rows"] if r.get("worker") == worker
+                    and str(r.get("agent_mxid") or "").strip()), None)
+        mxid = str((row or {}).get("agent_mxid") or "").strip()
+        if not mxid:
+            raise ConnectionsError(f"worker {worker} has no agent identity row")
+        storage = _worker_storage(record["rows"], record.get("worker_storage", {}))
+        anchor = storage[worker]["agent_mxid"]
+        twins = [r["worker"] for r in record["rows"] if r.get("worker") and r["worker"] != worker
+                 and (str(r.get("agent_mxid") or "").strip() == anchor
+                      or storage.get(r["worker"], {}).get("agent_mxid") == anchor)]
+        if own and twins:
+            raise ConnectionsError(f"worker {twins[0]}'s row also names agent {anchor}: its own folder would be shared")
+        storage[worker]["own"] = bool(own)
+        record["worker_storage"] = storage
+        for identity in record["rows"]:
+            if identity.get("worker") != worker:
+                continue
+            if own:
+                identity[WORKER_DIRS_KEY] = WORKER_DIRS_OWN
+            else:
+                identity.pop(WORKER_DIRS_KEY, None)
+        return dict(row)
+
+
 # A worker's seat names its worker here (the pool launchers export it); the core's names none.
 SESSION_WORKER_ENV = "SUTANDO_WORKER_ID"
 
@@ -2308,35 +2503,9 @@ def worker_enabled_identity(worker: str, workspace: Optional[Path] = None, *,
 
 
 def worker_home_identity(worker: str, workspace: Optional[Path] = None) -> Optional[dict]:
-    """The serving identity that speaks for `worker` where nothing names a server (its proactive notes):
-    its only one; with several, the one on the primary connection's server; None when none is there."""
-    own = [r for r in worker_identities(worker, workspace) if _serving(r)]
-    if len(own) <= 1:
-        return own[0] if own else None
-    primary = primary_row(workspace)
-    servers = _row_servers(primary) if primary else set()
-    return next((r for r in own if _row_servers(r) & servers), None)
-
-
-def is_worker_note_lane(instance: str, worker: str, room_id: str = "", workspace: Optional[Path] = None) -> bool:
-    """Whether the lane `instance` delivers a note `worker`'s session stamped: one naming a room goes from
-    the worker's serving identity on that room's server when it has one; any other from its home lane
-    (`is_worker_home_lane`)."""
-    server = server_of_room(room_id or "")
-    row = worker_identity(worker, workspace, server=server) if server else None
-    if row is not None and _serving(row):
-        return instance in [str(row["instance"])] + alias_instances(row)
-    return is_worker_home_lane(instance, worker, workspace)
-
-
-def is_worker_home_lane(instance: str, worker: str, workspace: Optional[Path] = None) -> bool:
-    """Whether the lane `instance` may deliver the notes `worker`'s session stamps: always while no other
-    lane of that worker serves; with several, only its home identity's (`worker_home_identity`), and
-    none of them when that is unknown."""
-    if len([r for r in worker_identities(worker, workspace) if _serving(r)]) <= 1:
-        return True
-    home = worker_home_identity(worker, workspace)
-    return home is not None and instance in [str(home["instance"])] + alias_instances(home)
+    """The worker's serving identity on the primary connection; no other lane is a fallback."""
+    from worker_lane import primary_identity
+    return primary_identity(worker, workspace)
 
 
 def session_proactive_name(name, environ: Optional[Mapping[str, str]] = None,
@@ -2405,6 +2574,50 @@ def mcp_seat_server(workspace: Optional[Path] = None, environ: Optional[Mapping[
                                  + ("its relay, mint host and lane name several servers" if found else
                                     "neither its relay nor its mint host nor its lane names a server"))
     return found.pop()
+
+
+def proactive_author_agent(name, workspace: Optional[Path] = None) -> Optional[str]:
+    """The agent a proactive file named `name` is posted as when a worker's session stamped it
+    (`session_proactive_name`): that worker's own identity's `agent_mxid`; None for an unstamped name."""
+    from proactive_routing import proactive_worker
+    worker = proactive_worker(name)
+    row = worker_identity(worker, workspace) if worker else None
+    return str((row or {}).get("agent_mxid") or "").strip() or None
+
+
+# Lower-case Cyrillic and Greek letters that render like Latin ones, folded before the core check.
+_CONFUSABLES = str.maketrans("аеорсухікмтвнгјѕοεαρκτνιυ", "aeopcyxikmtbhrjsoeapktviu")
+AUTHOR_PHRASE_MAX = 64
+
+
+def _reads_as_core(phrase: str, host: str) -> bool:
+    def fold(text):
+        return unicodedata.normalize("NFKC", text).casefold().translate(_CONFUSABLES)
+    folded = re.sub(r"[\W_]+$", "", fold(phrase))
+    return bool(re.search(r"(^|[\W_])core$", folded)) or fold(f"the {host} core") in fold(phrase)
+
+
+def proactive_author_phrase(name, host: str, workspace: Optional[Path] = None) -> str:
+    """Who a proactive file named `name` speaks as, for its text: "the <host> core" for an unstamped
+    name; for a worker's stamped one, "<name> (a worker on <host>)" with its own agent's display name,
+    else its roster label, else just "a worker on <host>". The name is stripped of format characters
+    and bounded; one that reads as the core (ends with "core", or holds the core's phrase) is dropped."""
+    from proactive_routing import proactive_worker
+    worker = proactive_worker(name)
+    if not worker:
+        return f"the {host} core"
+    label = str((worker_identity(worker, workspace) or {}).get("agent_display_name") or "").strip()
+    if not label:
+        rows = _read_json(_workspace(workspace) / "state" / "roster.json").get("workers")
+        row = rows.get(worker) if isinstance(rows, dict) else None
+        row = row if isinstance(row, dict) else {}
+        label = str(row.get("display_label") or row.get("label") or "").strip()
+        label = "" if label == worker else label
+    label = " ".join("".join(ch for ch in label if unicodedata.category(ch) != "Cf").split())
+    if len(label) > AUTHOR_PHRASE_MAX:
+        label = label[:AUTHOR_PHRASE_MAX - 1].rstrip() + "…"
+    fallback = f"a worker on {host}"
+    return fallback if not label or _reads_as_core(label, host) else f"{label} ({fallback})"
 
 
 def worker_mcp_credential(worker: str, *, workspace: Optional[Path] = None,
@@ -2514,12 +2727,37 @@ def lane_worker_at_start(instance: str, environ: Optional[Mapping[str, str]] = N
     if said is not None and said != recorded:
         raise LaneIdentityUnknown(f"the launch names worker {said or '<core>'} but the row names "
                                   f"{recorded or '<core>'}")
-    if recorded:
-        owners = {r.get("owner_mxid") for r in _core_rows(rows) if r.get("owner_mxid")}
-        if not row.get("owner_mxid") or row.get("owner_mxid") not in owners:
-            raise LaneIdentityUnknown(f"worker {recorded}'s agent is held by {row.get('owner_mxid') or 'no owner'}, "
-                                      "not the core's owner")
+    problem = _worker_owner_problem(row, rows) if recorded else None
+    if problem:
+        raise LaneIdentityUnknown(problem)
     return recorded, None
+
+
+def _worker_owner_problem(row: dict, rows: list) -> Optional[str]:
+    """Why the worker row `row` must not be served as its worker's agent: one no core row's owner holds."""
+    owners = {r.get("owner_mxid") for r in _core_rows(rows) if r.get("owner_mxid")}
+    if not row.get("owner_mxid") or row.get("owner_mxid") not in owners:
+        return f"worker {row.get('worker')}'s agent is held by {row.get('owner_mxid') or 'no owner'}, not the core's owner"
+    return None
+
+
+def worker_serving_agent(agent_mxid: str, workspace: Optional[Path] = None) -> "tuple[str, str, Optional[str]]":
+    """(worker, its row's instance, None) when the record names `agent_mxid` exactly as one pool worker's own
+    agent; ("", "", None) when no worker row names it; ("", "", why) when one does but must not be served
+    (two rows, an owner no core row has, disabled or parked). Raises on an unreadable record."""
+    rows = _read(record_path(workspace))
+    named = [r for r in rows if r.get("worker") and r.get("agent_mxid") == agent_mxid]
+    if not named:
+        return "", "", None
+    if len(named) > 1:
+        return "", "", f"{len(named)} worker rows name agent {agent_mxid}"
+    row = named[0]
+    problem = _worker_owner_problem(row, rows)
+    if not problem and (row.get("disabled") or row.get("parked")):
+        problem = f"worker {row['worker']}'s row is {'disabled' if row.get('disabled') else 'parked'}"
+    if not problem and not row.get("instance"):
+        problem = f"worker {row['worker']}'s row names no lane instance"
+    return ("", "", problem) if problem else (str(row["worker"]), str(row["instance"]), None)
 
 
 def lane_worker(instance: str, workspace: Optional[Path] = None) -> str:
@@ -2616,17 +2854,49 @@ def env_token_vars(environ: Mapping[str, str]) -> list:
     return out
 
 
+def legacy_relay_token(token: str, url: str) -> str:
+    """The legacy row's `url|secret`: a combined `token` as it is, a bare secret joined to `url` (the
+    gateway the bridge pairs it with); '' when either is missing or `url` is no gateway URL."""
+    token = (token or "").strip()
+    if gateway_url_of(token):
+        return token
+    url = (url or "").strip()
+    if not token or not url:
+        return ""
+    import channel_token  # noqa: F401 - puts the shared credential contract on the path
+    from gateway_credential_sources import contract, gateway_url_problem
+    if gateway_url_problem(url):
+        return ""
+    creds = contract.normalize_credentials(token, explicit_url=url)
+    joined = f"{creds.base_url}|{creds.token}"
+    return joined if gateway_url_of(joined) else ""
+
+
+def _env_gateway_url(environ: Mapping[str, str]) -> str:
+    """REMOTE_TASK_URL (legacy AG2_REMOTE_URL) as the bridge reads it from its environment; '' when unset."""
+    import channel_token  # noqa: F401 - puts the shared credential contract on the path
+    from gateway_credential_sources import URL_KEYS, first_env
+    return first_env(environ, URL_KEYS)[0]
+
+
 def primary_token_from_channel_file(environ: Mapping[str, str]) -> str:
     """The relay token (`url|secret`) the AG2 Space channel env file holds under either relay
-    spelling, read through the resolver `scripts/channel-env.sh` uses; '' when the environment
-    names one itself, when no file resolves, or when the file holds none."""
+    spelling, read through the resolver `scripts/channel-env.sh` uses; a bare secret is joined to
+    the gateway URL the bridge would pair it with (the environment's, else that file's). '' when
+    the environment names a token itself, when no file resolves, or when the file holds none."""
     try:
         from channel_credentials import channel_credentials
         from channel_token import RELAY_TOKEN_VARS
-        found = channel_credentials(RELAY_TOKEN_VARS, environ)
+        from gateway_credential_sources import URL_KEYS
+        if any(environ.get(v) for v in RELAY_TOKEN_VARS):
+            return ""
+        # Token and URL in one read, so both come from the same file; only a token in the env gates it.
+        found = channel_credentials(RELAY_TOKEN_VARS + URL_KEYS, {})
+        token = next((found[var].strip() for var in RELAY_TOKEN_VARS if found.get(var)), "")
+        file_url = next((found[var].strip() for var in URL_KEYS if found.get(var)), "")
+        return legacy_relay_token(token, _env_gateway_url(environ) or file_url)
     except Exception:  # noqa: BLE001 - no channel home or an unreadable file is simply no token
         return ""
-    return next((found[var].strip() for var in RELAY_TOKEN_VARS if found.get(var)), "")
 
 
 def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
@@ -2636,6 +2906,7 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
     The REMOTE_TASK_TOKEN row comes from the environment, else from the channel env file the
     connect flow writes (`primary_token_from_channel_file`): a desktop install signs in after
     the engine started, so the token reaches the file but never this process's environment.
+    A bare REMOTE_TASK_TOKEN counts beside a REMOTE_TASK_URL, joined as `legacy_relay_token`.
     Env rows are unverified: the resolver's server when it knows the host, else the host. The
     REMOTE_TASK_TOKEN row (the legacy unsuffixed bridge) becomes primary when the install has none.
     A named env row becomes primary only when it is then the record's sole row, with no primary,
@@ -2649,7 +2920,9 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
     """
     environ = os.environ if environ is None else environ
     candidates = []
-    primary_token = environ.get(PRIMARY_TOKEN_REF, "").strip() or primary_token_from_channel_file(environ)
+    env_token = environ.get(PRIMARY_TOKEN_REF, "").strip()
+    primary_token = (legacy_relay_token(env_token, _env_gateway_url(environ)) if env_token
+                     else primary_token_from_channel_file(environ))
     if gateway_url_of(primary_token):
         candidates.append(("", PRIMARY_TOKEN_REF, primary_token))
     for inst, var in env_token_vars(environ):
@@ -2976,18 +3249,24 @@ def _token_file(entry: Mapping[str, str], environ: Mapping[str, str]) -> str:
     return str(path) if path.is_file() else ""
 
 
+def lane_token_file(entry: Mapping[str, str], environ: Optional[Mapping[str, str]] = None) -> str:
+    """The file a plan entry's bridge re-reads its token from (REMOTE_TASK_TOKEN_FILE); "" when none."""
+    return _token_file(entry, os.environ if environ is None else environ)
+
+
 def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]] = None, *,
                vault=None) -> dict:
     """The bridge's environment for one plan entry: the token from the env var of its token_ref,
     else the vault; no gateway URL beside the token; the proactive room only for the primary.
     A named entry runs as its row's own agent (`NoIdentity` when the row has none), never one the
-    environment inherited, and without the legacy device env file."""
+    environment inherited, and without the legacy device env file. Nothing of the calling session
+    (`SESSION_ENV`) is passed on, so a start from a worker's shell runs as the lane keeper's would."""
     environ = os.environ if environ is None else environ
     ref = str(entry["token_ref"])
     token = (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
     if not token:
         raise NoToken(f"no token under {ref}")
-    env = dict(environ)
+    env = {k: v for k, v in environ.items() if k not in SESSION_ENV}
     if entry["instance"]:
         mxid = str(entry.get("agent_mxid") or "").strip()
         if not server_of_mxid(mxid):
@@ -2996,21 +3275,42 @@ def launch_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]]
         env = _agent_identity().launch_environ(env, mxid)
         env.pop(DEVICE_ENV_VAR, None)
     env.update({
-        "SUTANDO_SUPERVISED": "1",
-        "GATEWAY_INSTANCE": str(entry["instance"]),
         "REMOTE_TASK_TOKEN": token,
         "REMOTE_TASK_URL": "",
         "REMOTE_TASK_TOKEN_FILE": _token_file(entry, environ),
-        "REMOTE_TASK_CHANNEL_DIR": str(entry["channel_dir"]),
-        "REMOTE_PROACTIVE_ROOM": environ.get("REMOTE_PROACTIVE_ROOM", "") if entry.get("primary") else "",
-        NOT_BEFORE_ENV: str(entry["not_before"]) if isinstance(entry.get("not_before"), int) else "",
-        LANE_WORKER_ENV: str(entry.get("worker") or ""),
+        **lane_identity_env(entry, environ),
     })
     return env
 
 
+def lane_identity_env(entry: Mapping[str, object], environ: Optional[Mapping[str, str]] = None) -> dict:
+    """What a plan entry's bridge runs as, short of its token: the same for its lane and for a declared
+    bridge serving that lane's worker (`worker_lane.bridge_overlay`)."""
+    environ = os.environ if environ is None else environ
+    return {
+        "SUTANDO_SUPERVISED": "1",
+        "GATEWAY_INSTANCE": str(entry["instance"]),
+        "REMOTE_TASK_CHANNEL_DIR": str(entry["channel_dir"]),
+        "REMOTE_PROACTIVE_ROOM": environ.get("REMOTE_PROACTIVE_ROOM", "") if entry.get("primary") else "",
+        NOT_BEFORE_ENV: str(entry["not_before"]) if isinstance(entry.get("not_before"), int) else "",
+        LANE_WORKER_ENV: str(entry.get("worker") or ""),
+    }
+
+
 # The bridge's intake reads its row's `not_before` here; empty when the row has none.
 NOT_BEFORE_ENV = "SUTANDO_INTAKE_NOT_BEFORE"
+# What a core's or pool worker's session carries about itself: a bridge started from inside one is
+# the host's, so none of it is passed on (the lane keeper's launches never had it).
+SESSION_ENV = frozenset((
+    "SUTANDO_INSTANCE_ID", "SUTANDO_WORKER_ID", "SUTANDO_WORKER_RUNTIME", "SUTANDO_WORKER_SEAT",
+    "SUTANDO_CORE_ID", "SUTANDO_CORE_POOL_SIZE", "SUTANDO_CORE_SESSION", "SUTANDO_CORE_RUNTIME",
+    "SUTANDO_TMUX_SOCKET", "SUTANDO_TMUX_SESSION", "SUTANDO_TASKS_DIR", "SUTANDO_RESULTS_DIR",
+    "SUTANDO_WORKSPACE_DIR", "SUTANDO_INBOX_KIND", "SUTANDO_INBOX_RESOLVER", "SUTANDO_INBOX_RESOLVER_TIMEOUT",
+    "SUTANDO_CLAUDE_WORKING_DIR", "SUTANDO_CODEX_WORKING_DIR", "SUTANDO_WORKER_BOOTSTRAP",
+    "SUTANDO_POOL_DELIVERY_SCRIPT", "SUTANDO_WORKER_PLUGIN_DIRS", "SUTANDO_WATCHER_CMD", "SUTANDO_WATCHER_BEAT",
+    "SUTANDO_TASK_WATCH_MOD", "SUTANDO_TASK_WATCH_MOD_WORKER", "SUTANDO_TASK_EVENT_HANDLER",
+    "SUTANDO_CLAUDE_SESSION_ID", "SUTANDO_CLAUDE_RESUME", "AG2_MCP_WORKER_CREDENTIAL",
+))
 # The worker a lane runs as (a row's `worker`), empty for a core lane: the lane's start check.
 LANE_WORKER_ENV = "SUTANDO_LANE_WORKER"
 
@@ -3073,7 +3373,7 @@ def _learn_missing_identity(instance: str, environ: Mapping[str, str], workspace
 
     def token_of(r):
         ref = str(r["token_ref"])
-        return (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref)
+        return row_token(r, (environ.get(ref) or "").strip() or _vault_get(_vault(vault), ref))
     _learn_row_identity(row, token_of, workspace, fetch=fetch, getaddrinfo=getaddrinfo)
 
 
@@ -3138,6 +3438,12 @@ def _record_launch(instance: str, workspace: Optional[Path], **fields) -> dict:
             record["last_repo"] = prev.get("repo") or prev.get("last_repo")
     _atomic_json(launch_record_path(instance, workspace), record)
     return record
+
+
+def record_supervised_start(instance: str, *, pid: int, repo: Path, workspace: Optional[Path] = None) -> dict:
+    """The launch record of a lane another supervisor starts in place (sparrowd's core), so its status
+    reads the start and not an earlier failed one; its lease is proven later, by the lease itself."""
+    return _record_launch(instance, workspace, ok=True, pid=pid, lease="supervised", repo=str(Path(repo).resolve()))
 
 
 def _launch_record(instance: str, workspace: Optional[Path]) -> dict:
@@ -3522,7 +3828,8 @@ def _keep_lane(inst: str, state: dict, now: float, say: Callable[[str], None], *
                environ: Mapping[str, str], workspace: Optional[Path], vault, spawn, python: Optional[str]) -> None:
     """`keep_lanes_up` for one lane, under the record lock."""
     with _records_lock(workspace):
-        if inst not in {e["instance"] for e in launch_plan(environ, workspace=workspace)}:
+        entry = next((e for e in launch_plan(environ, workspace=workspace) if e["instance"] == inst), None)
+        if entry is None:
             state.pop(inst, None)  # disconnected, parked or removed since the plan was read
             return
         row = _row_named(inst, workspace) or {}
@@ -3530,6 +3837,14 @@ def _keep_lane(inst: str, state: dict, now: float, say: Callable[[str], None], *
             state.pop(inst, None)
             return
         due = state.get(inst) or {}
+        declared = _declared_bridge_serves(entry, workspace)
+        owner = "its declared bridge" if declared else "sparrowd's core" if _core_serves(entry, workspace) else ""
+        if owner:
+            since = due.get("declared_unheld_since") if isinstance(due, dict) else None
+            since = since if isinstance(since, (int, float)) and not isinstance(since, bool) else now
+            if now - since < DECLARED_BRIDGE_GRACE_S:
+                state[inst] = {"declared_unheld_since": since}  # its supervisor's turn to take the lease
+                return
         try:
             if float(due.get("next_try") or 0) > now:
                 return
@@ -3541,12 +3856,47 @@ def _keep_lane(inst: str, state: dict, now: float, say: Callable[[str], None], *
         except ConnectionsError as e:
             reason = _launch_record(inst, workspace).get("reason") if isinstance(e, LaunchFailed) else None
             state[inst] = _lane_retry(due, now)
+            if owner:  # the grace is one window: a failed fallback start backs off, never waits again
+                state[inst]["declared_unheld_since"] = since
             say(f"lane {inst} is down and did not start ({reason or _error_reason(e)}); "
                 f"next try in {state[inst]['next_try'] - now:.0f}s")
             return
         state.pop(inst, None)
-        if rec.get("lease") == "held":
+        if rec.get("lease") == "held" and owner:
+            say(f"lane {inst}: {owner} took no lease in {DECLARED_BRIDGE_GRACE_S:.0f}s; "
+                f"started the lane instead (pid {rec.get('pid')})")
+        elif rec.get("lease") == "held":
             say(f"lane {inst} was down; started it (pid {rec.get('pid')})")
+
+
+# How long a lane another supervisor serves (a worker's declared bridge, sparrowd's core) stays down with
+# no lease holder before the keeper starts the lane anyway: past sparrowd's longest restart backoff and its rescan.
+DECLARED_BRIDGE_GRACE_S = 180.0
+
+
+def _declared_bridge_serves(entry: Mapping[str, object], workspace: Optional[Path]) -> bool:
+    """Whether a worker lane's agent runs as a valid declared Sparrow bridge instead (`worker_lane`);
+    a check that cannot be made answers False, and the bridge lease still keeps one poller."""
+    if not entry.get("worker"):
+        return False
+    try:
+        import worker_lane
+        return worker_lane.declared_bridge(str(entry["worker"]), _workspace(workspace),
+                                           instance=str(entry["instance"]))
+    except Exception:  # noqa: BLE001 - an unanswerable check never keeps a lane down
+        return False
+
+
+def _core_serves(entry: Mapping[str, object], workspace: Optional[Path]) -> bool:
+    """Whether a live sparrowd supervises this primary lane as its core (`sparrow_core_bridge.claims`); a
+    check that cannot be made answers False, and the bridge lease still keeps one poller."""
+    if not entry.get("primary"):
+        return False
+    try:
+        import sparrow_core_bridge
+        return sparrow_core_bridge.claims(str(entry["instance"]), _workspace(workspace))
+    except Exception:  # noqa: BLE001 - an unanswerable check never keeps a lane down
+        return False
 
 
 def keep_lanes_up(*, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,

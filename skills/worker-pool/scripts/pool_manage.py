@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manage the pool's workers: list, stop, retire, enable, remove.
+"""Manage the pool's workers: list, stop, retire, enable, remove, reseat, plugins, bind, unbind.
 
 The owner's (or the agent's, on the owner's behalf) one supported way to take a
 worker out of service and bring it back. Each verb goes through the writer that
@@ -19,6 +19,14 @@ already owns its fact, so the remedy, the sweep and the router honour it:
     remove  drop a retired worker's roster row; its records stay on disk.
     reseat  restart a running seat that owes nothing, so its tools pick up an
             agent identity added after it started; one that owes work is left.
+    bind    bind a room to a worker on the shared folders (pool_roster.bind_room), so the
+            router delivers that room's tasks to it; a worker on its own folders is refused,
+            since the router never delivers to one.
+    unbind  drop a room's binding (pool_roster.unbind_room): its tasks go to the core.
+    plugins record or drop an extra Claude Code plugin dir (a folder holding
+            .claude-plugin/plugin.json) that every launch and reseat of this worker
+            loads with --plugin-dir. The owner's opt-in: run it only on their word.
+            It takes effect at the next start; `reseat` applies it now.
 
     python3 pool_manage.py [--workspace WS] [--repo REPO] list [--json]
     python3 pool_manage.py [--workspace WS] stop   <worker id or label> [--force]
@@ -26,6 +34,10 @@ already owns its fact, so the remedy, the sweep and the router honour it:
     python3 pool_manage.py [--workspace WS] [--repo REPO] enable <worker> [--no-start]
     python3 pool_manage.py [--workspace WS] remove <worker> [--hand-off]
     python3 pool_manage.py [--workspace WS] [--repo REPO] reseat <worker>
+    python3 pool_manage.py [--workspace WS] plugins <worker> add|remove <dir>
+    python3 pool_manage.py [--workspace WS] plugins <worker> list
+    python3 pool_manage.py [--workspace WS] bind <room id> <worker id or label>
+    python3 pool_manage.py [--workspace WS] unbind <room id>
 
 Every verb prints one JSON line. Exit 0 done, 1 failed, 2 refused.
 """
@@ -251,6 +263,22 @@ def reseat(workspace, repo, target, *, runner=subprocess.run, spawn=None) -> dic
             "start": {"result": restarted["result"], "detail": restarted["detail"]}}
 
 
+def plugins(workspace, target, op: str, path: str = "") -> dict:
+    """The worker's recorded plugin dirs after `op`; a dir that is not a Claude plugin is refused."""
+    wid, row = _worker(workspace, target)
+    base = {"worker_id": wid, "action": "plugins", "op": op}
+    if op == "list":
+        dirs = pr.recorded_plugin_dirs(workspace, wid)
+        return {**base, "result": "listed", "plugin_dirs": dirs,
+                "states": {d: pr.plugin_dir_state(d) for d in dirs}}
+    if not path:
+        raise Refused(f"plugins {op} needs a directory")
+    _, dirs, roster = pr.set_worker_plugin_dirs(workspace, wid, **{op: path})
+    result = ("added" if op == "add" else "removed") if roster is not None else "unchanged"
+    return {**base, "result": result, "plugin_dirs": dirs,
+            "applies": "at this worker's next start; pool_manage.py reseat applies it now"}
+
+
 def remove(workspace, target, *, hand_off=False, runner=subprocess.run) -> dict:
     """A retired worker is already fenced, so its owed set cannot grow while this runs."""
     wid, row = _worker(workspace, target)
@@ -287,6 +315,25 @@ def listing(workspace, *, runner=subprocess.run) -> list:
     return rows
 
 
+def bind(workspace, room: str, target: str) -> dict:
+    """Bind `room` to the worker `target` names; refused for a worker on its own folders."""
+    import connections
+    roster = pr.load_roster(workspace) or {}
+    wid = pr.resolve_label(roster, target) if roster else target
+    if connections.worker_dirs(wid, Path(workspace)) is not None:
+        raise Refused(f"worker {wid} keeps its own folders: the router never delivers to it, so a room "
+                      "is not bound to it (the core asks it with pool_ask)")
+    # The checked id, not the label: a rename in between must not bind another worker.
+    out = pr.bind_room(workspace, room, wid)
+    return {"action": "bind", "room": room, "worker": wid, "result": "bound",
+            "roster_version": out.get("version")}
+
+
+def unbind(workspace, room: str) -> dict:
+    out = pr.unbind_room(workspace, room)
+    return {"action": "unbind", "room": room, "result": "unbound", "roster_version": out.get("version")}
+
+
 def main(argv=None, *, runner=subprocess.run) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--workspace", default=None)
@@ -310,6 +357,15 @@ def main(argv=None, *, runner=subprocess.run) -> int:
         if name == "enable":
             sp.add_argument("--no-start", action="store_true",
                             help="lift the stop/retire without starting a session now")
+    bd = sub.add_parser("bind")
+    bd.add_argument("room")
+    bd.add_argument("worker")
+    ub = sub.add_parser("unbind")
+    ub.add_argument("room")
+    pl = sub.add_parser("plugins")
+    pl.add_argument("worker")
+    pl.add_argument("op", choices=("add", "remove", "list"))
+    pl.add_argument("dir", nargs="?", default="")
     a = p.parse_args(argv)
     ws = Path(a.workspace) if a.workspace else resolve_workspace()
     try:
@@ -331,6 +387,12 @@ def main(argv=None, *, runner=subprocess.run) -> int:
                          runner=None if runner is subprocess.run else runner)
         elif a.cmd == "reseat":
             out = reseat(ws, a.repo, a.worker, runner=runner)
+        elif a.cmd == "plugins":
+            out = plugins(ws, a.worker, a.op, a.dir)
+        elif a.cmd == "bind":
+            out = bind(ws, a.room, a.worker)
+        elif a.cmd == "unbind":
+            out = unbind(ws, a.room)
         else:
             out = remove(ws, a.worker, hand_off=a.hand_off, runner=runner)
     except (Refused, pr.RosterError, wi.IdentityError, ValueError) as e:
@@ -338,7 +400,7 @@ def main(argv=None, *, runner=subprocess.run) -> int:
                           "result": "refused", "why": str(e)}, sort_keys=True))
         return 2
     except (rem.PoolBusy, OSError) as e:
-        out = {"worker": a.worker, "action": a.cmd, "result": "failed", "why": str(e)}
+        out = {"worker": getattr(a, "worker", None), "action": a.cmd, "result": "failed", "why": str(e)}
     print(json.dumps(out, sort_keys=True))
     return 1 if out.get("result") == "failed" else 0
 

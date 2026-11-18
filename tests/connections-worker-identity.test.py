@@ -39,6 +39,7 @@ H = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(H)  # fakes the resolver, as that suite does
 C = H.C
 sys.path.insert(0, str(ROOT / "skills" / "worker-pool" / "scripts"))
+import worker_lane
 import local_task_protocol as ltp  # noqa: E402
 import pool_router as rt  # noqa: E402
 
@@ -391,6 +392,17 @@ class LaneStart(Base):
         env = C.launch_env(C.plan_entry("alpha-fixture-net", {}, workspace=self.ws), {}, vault=self.vault)
         self.assertEqual(env.get("SUTANDO_LANE_WORKER"), "")
 
+    def test_a_start_from_a_sessions_shell_passes_none_of_that_session_on(self):
+        import spawn_worker
+        worker_env = spawn_worker.plan(self.ws, ROOT, worker_id=W)["env"]
+        missing = sorted(set(worker_env) - C.SESSION_ENV)
+        self.assertEqual(missing, [], "a key a worker's session carries is not in SESSION_ENV")
+        shell = {**worker_env, "SUTANDO_INSTANCE_ID": "other", "AG2_MCP_WORKER_CREDENTIAL": "x",
+                 "PATH": "/usr/bin", "SUTANDO_BRIDGE_LOCK": "1"}
+        env = C.launch_env(C.plan_entry(WORKER_INST, {}, workspace=self.ws), shell, vault=self.vault)
+        self.assertEqual(sorted(k for k in env if k in C.SESSION_ENV), [])
+        self.assertEqual((env["PATH"], env["SUTANDO_BRIDGE_LOCK"], env["SUTANDO_LANE_WORKER"]), ("/usr/bin", "1", W))
+
     def test_an_unreadable_record_keeps_a_worker_lane_a_worker_and_says_so(self):
         for how in ("corrupt", "wrong-shape", "permission", "missing"):
             with self.subTest(how), self.spoiled(how):
@@ -621,20 +633,21 @@ class TwoServers(Base):
 
     def test_proactive_notes_go_from_the_primarys_server_only(self):
         self.assertEqual(C.worker_home_identity(W, self.ws)["instance"], self.alpha["instance"])
-        self.assertTrue(C.is_worker_home_lane(self.alpha["instance"], W, self.ws))
-        self.assertFalse(C.is_worker_home_lane(self.beta["instance"], W, self.ws))
+        self.assertTrue(worker_lane.is_worker_home_lane(self.alpha["instance"], W, self.ws))
+        self.assertFalse(worker_lane.is_worker_home_lane(self.beta["instance"], W, self.ws))
         name = C.session_proactive_name("proactive-1.txt", self.env, self.ws)
         self.assertEqual(name, f"proactive-1.by-{W}.txt")
 
     def test_a_note_with_no_server_to_send_from_is_refused_by_name(self):
         with unittest.mock.patch.object(C, "primary_row", lambda ws=None: None):
             self.assertIsNone(C.worker_home_identity(W, self.ws))
-            self.assertFalse(C.is_worker_home_lane(self.alpha["instance"], W, self.ws))
+            self.assertFalse(worker_lane.is_worker_home_lane(self.alpha["instance"], W, self.ws))
             with self.assertRaises(C.AmbiguousWorkerIdentity):
                 C.session_proactive_name("proactive-1.txt", self.env, self.ws)
         C.disconnect(self.alpha["instance"], workspace=self.ws, kill=lambda *a: None)
-        self.assertEqual(C.worker_home_identity(W, self.ws)["instance"], self.beta["instance"],
-                         "one serving identity left: it speaks")
+        self.assertIsNone(C.worker_home_identity(W, self.ws), "a non-primary identity is not a fallback")
+        with self.assertRaises(C.AmbiguousWorkerIdentity):
+            C.session_proactive_name("proactive-1.txt", self.env, self.ws)
 
     def test_a_second_agent_on_the_same_server_is_still_refused(self):
         with self.assertRaises(C.WorkerIdentityExists) as e:
@@ -873,12 +886,12 @@ class TwoServers(Base):
 
     def test_a_note_naming_a_room_goes_from_that_rooms_server(self):
         a, b = self.alpha["instance"], self.beta["instance"]
-        self.assertEqual((C.is_worker_note_lane(a, W, BETA_ROOM, self.ws), C.is_worker_note_lane(b, W, BETA_ROOM, self.ws)),
+        self.assertEqual((worker_lane.is_worker_note_lane(a, W, BETA_ROOM, self.ws), worker_lane.is_worker_note_lane(b, W, BETA_ROOM, self.ws)),
                          (False, True))
-        self.assertEqual((C.is_worker_note_lane(a, W, ALPHA_ROOM, self.ws), C.is_worker_note_lane(b, W, ALPHA_ROOM, self.ws)),
+        self.assertEqual((worker_lane.is_worker_note_lane(a, W, ALPHA_ROOM, self.ws), worker_lane.is_worker_note_lane(b, W, ALPHA_ROOM, self.ws)),
                          (True, False))
         for room in ("", "!r:gamma-fixture.net"):
-            self.assertEqual((C.is_worker_note_lane(a, W, room, self.ws), C.is_worker_note_lane(b, W, room, self.ws)),
+            self.assertEqual((worker_lane.is_worker_note_lane(a, W, room, self.ws), worker_lane.is_worker_note_lane(b, W, room, self.ws)),
                              (True, False), f"{room!r}: no identity there, so the home lane")
 
     def test_the_bridges_worker_gate_picks_one_lane_per_note(self):
@@ -898,7 +911,7 @@ class TwoServers(Base):
             claimants = []
             for lane in (self.alpha["instance"], self.beta["instance"]):
                 rgb.GATEWAY_INSTANCE = lane
-                if rgb._worker_lane_claim_gate(W)(path):
+                if worker_lane.claim_gate(W, instance=lane, workspace=self.ws, route=rgb._proactive_route)(path):
                     claimants.append(lane)
             self.assertEqual(claimants, [owner], key)
 

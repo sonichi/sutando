@@ -1,5 +1,5 @@
-/* Renders each starter template in a real browser at 390x844 with hostile content — a long
- * unbroken Outcome, option name or player name — and fails if the page scrolls sideways.
+/* Renders each starter template in a real browser at 360 and 390 px wide with hostile content — a
+ * long unbroken Outcome, option name or player name — and fails if the page scrolls sideways.
  *
  * GUIDE.md's phone-width rule is a layout property: the CSS-text checks in the Python suite
  * cannot see it, which is how a 1049px-wide tracker passed review once. This needs a browser,
@@ -21,7 +21,8 @@ import { dirname, join } from 'node:path';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const TPL = join(ROOT, 'skills', 'commons-app-builder', 'templates');
-const WIDTH = 390;
+// 360 is the narrowest phone still common; 390 is the usual one.
+const WIDTHS = [360, 390];
 const HEIGHT = 844;
 
 const CANDIDATES = [
@@ -47,6 +48,9 @@ if (!browser) {
 const LONG = 'x'.repeat(150);
 const LONG_NAME = 'Pat ' + 'o'.repeat(120);
 const LONG_TITLE = 'Investigate ' + 'y'.repeat(120);
+// A select is as wide as its longest option, and a grid column as wide as its widest child: an
+// option name someone typed with spaces in it must not widen the add form past the screen.
+const LONG_OPTION = 'Waiting on a long answer from the other team ' + 'z'.repeat(40);
 
 const FIXTURES = {
   tracker: {
@@ -55,7 +59,8 @@ const FIXTURES = {
       { id: 't', name: 'Item', type: 'title' },
       { id: 's', name: 'Status', type: 'status', options: [
         { name: 'Requested', group: 'todo' }, { name: 'Working', group: 'doing' },
-        { name: 'Done', group: 'done' }, { name: 'Blocked', group: 'doing' }] },
+        { name: 'Done', group: 'done' }, { name: 'Blocked', group: 'doing' },
+        { name: LONG_OPTION, group: 'doing' }] },
       { id: 'o', name: 'Owner', type: 'person' },
       { id: 'd', name: 'Due', type: 'date' },
       { id: 'n', name: 'Notes', type: 'text' },
@@ -63,7 +68,8 @@ const FIXTURES = {
       { id: 'a', name: 'Actor', type: 'person' },
       { id: 'b', name: 'Created by', type: 'created_by' },
     ],
-    rows: [{ id: 'r1', cells: { Item: LONG_TITLE, Status: 'Requested', Outcome: LONG, Due: '2026-12-01' } }],
+    rows: [{ id: 'r1', cells: { Item: LONG_TITLE, Status: 'Requested', Outcome: LONG, Due: '2026-12-01' } },
+           { id: 'r2', cells: { Item: 'Short', Status: LONG_OPTION } }],
   },
   poll: {
     db: 'Poll — Votes',
@@ -80,7 +86,7 @@ const FIXTURES = {
     props: [
       { id: 't', name: 'Item', type: 'title' },
       { id: 'd', name: 'Day', type: 'date' },
-      { id: 's', name: 'Slot', type: 'select', options: [{ name: 'Morning' }, { name: 'Evening' }] },
+      { id: 's', name: 'Slot', type: 'select', options: [{ name: 'Morning' }, { name: 'Evening' }, { name: LONG_OPTION }] },
       { id: 'e', name: 'State', type: 'status', options: [{ name: 'Planned', group: 'todo' }, { name: 'Done', group: 'done' }] },
       { id: 'w', name: 'Who', type: 'person' },
       { id: 'b', name: 'Created by', type: 'created_by' },
@@ -100,6 +106,43 @@ const FIXTURES = {
     rows: [{ id: 'm1', cells: { Game: 1, Seat: 'X', Row: 1, Col: 1 } }],
     state: { 'seat.X': { id: 'u1', name: LONG_NAME }, 'seat.O': { id: 'u2', name: LONG_NAME } },
   },
+  // Two databases and the viewer's own agents: a long unbroken source link, a long agent name.
+  'research-desk': {
+    db: 'Research Desk — Findings',
+    props: [
+      { id: 't', name: 'Finding', type: 'title' },
+      { id: 'p', name: 'Topic', type: 'text' },
+      { id: 's', name: 'Source', type: 'url' },
+      { id: 'b', name: 'Basis', type: 'text' },
+      { id: 'c', name: 'Change', type: 'text' },
+      { id: 'st', name: 'State', type: 'status', options: [{ name: 'Proposed', group: 'todo' }, { name: 'Accepted', group: 'done' }] },
+      { id: 'cb', name: 'Created by', type: 'created_by' },
+    ],
+    rows: [{ id: 'r1', cells: { Finding: LONG_TITLE, Topic: LONG_OPTION, Source: 'https://example.org/' + LONG, Basis: LONG, Change: LONG, 'Created by': ['@me:x'] } }],
+    extra: { d2: { name: 'Research Desk — Reviews', props: [
+      { id: 't', name: 'Review', type: 'title' }, { id: 'f', name: 'Finding', type: 'text' },
+      { id: 'v', name: 'Verdict', type: 'select', options: [{ name: 'Accepted' }, { name: 'Rejected' }] },
+      { id: 'cb', name: 'Created by', type: 'created_by' }],
+      rows: [{ id: 'v1', cells: { Review: 'x', Finding: 'r1', Verdict: 'Accepted', 'Created by': ['@me:x'] } }] } },
+    members: [{ id: 'u1', name: LONG_NAME, avatar: null, kind: 'human' }],
+    agents: [{ id: 'u' + 'a'.repeat(64), name: LONG_NAME, kind: 'agent' }],
+  },
+  'task-board': {
+    db: 'Task Board — Tasks',
+    props: [
+      { id: 't', name: 'Task', type: 'title' },
+      { id: 's', name: 'Status', type: 'status', options: [
+        { name: 'Requested', group: 'todo' }, { name: 'Working', group: 'doing' },
+        { name: 'Blocked', group: 'doing' }, { name: LONG_OPTION, group: 'done' }] },
+      { id: 'b', name: 'Blocker', type: 'text' },
+      { id: 'r', name: 'Result', type: 'text' },
+      { id: 'a', name: 'Actor', type: 'person' },
+      { id: 'cb', name: 'Created by', type: 'created_by' },
+    ],
+    rows: [{ id: 'r1', cells: { Task: LONG_TITLE, Status: 'Blocked', Blocker: LONG, Result: LONG, Actor: ['@me:x'] } }],
+    members: [{ id: 'u1', name: LONG_NAME, avatar: null, kind: 'human' }],
+    agents: [{ id: 'u' + 'a'.repeat(64), name: LONG_NAME, kind: 'agent', userId: '@x:y' }],
+  },
 };
 
 const harness = (f) => `
@@ -109,27 +152,30 @@ window.artifact = (() => {
   const props = ${JSON.stringify(f.props)};
   const state = new Map(Object.entries(${JSON.stringify(f.state || {})}));
   const snap = () => ({ id: 'd1', name: ${JSON.stringify(f.db)}, props, rows });
+  const extra = ${JSON.stringify(f.extra || {})};
   return {
     ready: Promise.resolve(),
     me: { id: 'u1', name: 'Tester', kind: 'human' },
     app: { id: 'a1', name: 'T', database: 'd1' },
     now: () => Date.parse('2026-11-11T12:00:00Z'),
-    members: async () => [],
+    members: async () => ${JSON.stringify(f.members || [])},
     personId: async (c) => (c && c[0] === '@me:x' ? 'u1' : null),
     state: { get: async (k) => state.get(k), set: async () => ({ ok: true }),
              delete: async () => ({ ok: true }), keys: async () => [...state.keys()],
              all: async () => ({}), on: () => () => {} },
     emit: () => {}, on: () => () => {},
     pages: { list: async () => [], read: async () => null },
-    db: { list: async () => [{ id: 'd1', name: ${JSON.stringify(f.db)} }],
-          read: async () => snap(), write: async () => ({ ok: true }),
+    agent: { list: async () => ${JSON.stringify(f.agents || [])}, sendTask: async () => ({ ok: true, eventId: 't1' }) },
+    db: { list: async () => [{ id: 'd1', name: ${JSON.stringify(f.db)} }].concat(
+            Object.entries(extra).map(([id, d]) => ({ id, name: d.name }))),
+          read: async (id) => (extra[id] ? Object.assign({ id }, extra[id]) : snap()), write: async () => ({ ok: true }),
           createRow: async () => ({ ok: true, rowId: 'r9' }), onChange: () => () => {} },
   };
 })();
 </script>`;
 
 // The measurement rides out in the host's <title>, which --dump-dom prints: no CDP client needed.
-const hostPage = (src) => `<!doctype html><html><head><title>pending</title></head>
+const hostPage = (src, WIDTH) => `<!doctype html><html><head><title>pending</title></head>
 <body style="margin:0">
 <iframe id="f" src="${src}" style="width:${WIDTH}px;height:${HEIGHT}px;border:0"></iframe>
 <script>
@@ -161,14 +207,14 @@ const dir = mkdtempSync(join(tmpdir(), 'tpl-layout-'));
 let passed = 0;
 const failures = [];
 
-for (const [name, fixture] of Object.entries(FIXTURES)) {
+for (const WIDTH of WIDTHS) for (const [name, fixture] of Object.entries(FIXTURES)) {
   const page = readFileSync(join(TPL, name, 'page.html'), 'utf8');
   // The harness must define window.artifact BEFORE the page's own script runs.
   const wired = page.replace('<script>', `${harness(fixture)}\n<script>`);
   const inner = join(dir, `${name}.html`);
-  const host = join(dir, `${name}-host.html`);
+  const host = join(dir, `${name}-${WIDTH}-host.html`);
   writeFileSync(inner, wired, 'utf8');
-  writeFileSync(host, hostPage(`${name}.html`), 'utf8');
+  writeFileSync(host, hostPage(`${name}.html`, WIDTH), 'utf8');
   // A failed LAUNCH is retried once (seen locally, 1 in ~15 runs); a layout assertion is not.
   const launch = () => execFileSync(browser, [
     '--headless=new', '--disable-gpu', '--no-sandbox', '--no-first-run',
@@ -179,13 +225,13 @@ for (const [name, fixture] of Object.entries(FIXTURES)) {
   try {
     try { dom = launch(); } catch { dom = launch(); }
   } catch (e) {
-    failures.push(`${name}: browser failed twice: ${String(e.message).split('\n')[0]}`);
+    failures.push(`${name} at ${WIDTH}px: browser failed twice: ${String(e.message).split('\n')[0]}`);
     continue;
   }
   const err = /<title>ERR ([^<]*)/.exec(dom);
-  if (err) { failures.push(`${name}: could not read the frame: ${err[1]}`); continue; }
+  if (err) { failures.push(`${name} at ${WIDTH}px: could not read the frame: ${err[1]}`); continue; }
   const m = /MEASURED (\d+) (\d+) (\d+) \| ([^<]*)/.exec(dom);
-  if (!m) { failures.push(`${name}: no measurement in the rendered DOM`); continue; }
+  if (!m) { failures.push(`${name} at ${WIDTH}px: no measurement in the rendered DOM`); continue; }
   const [scrollW, innerW, bodyW] = m.slice(1, 4).map(Number);
   const widest = (m[4] || '').trim();
   try {
@@ -196,11 +242,11 @@ for (const [name, fixture] of Object.entries(FIXTURES)) {
     );
     passed += 1;
   } catch (e) {
-    failures.push(`${name}: ${e.message}`);
+    failures.push(`${name} at ${WIDTH}px: ${e.message}`);
   }
 }
 
 console.log(failures.length
   ? `FAIL templates layout: ${failures.length} failed\n  ${failures.join('\n  ')}`
-  : `all passed — templates layout: ${passed} templates rendered at ${WIDTH}x${HEIGHT} with long unbroken content, no sideways scroll`);
+  : `all passed — templates layout: ${passed} renders (${Object.keys(FIXTURES).length} templates at ${WIDTHS.join(' and ')} px wide) with long unbroken content, no sideways scroll`);
 process.exit(failures.length ? 1 : 0);

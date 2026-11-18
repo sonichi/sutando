@@ -62,8 +62,22 @@ for v in SUTANDO_WORKSPACE_DIR SUTANDO_RESULTS_DIR SUTANDO_INBOX_KIND \
      && [ "$v" = SUTANDO_TASK_EVENT_HANDLER ]; then continue; fi
   if [ -n "${!v:-}" ]; then ENV_ARGS+=(-e "$v=${!v}"); fi
 done
+# A worker on its own folders reads a plain inbox: its empty kind and resolver are forwarded empty.
+[ "${SUTANDO_INBOX_KIND-unset}" = "" ] && ENV_ARGS+=(-e SUTANDO_INBOX_KIND= -e SUTANDO_INBOX_RESOLVER=)
 # Always set, empty included: an omitted one inherits whatever the tmux server's global env holds.
 ENV_ARGS+=(-e "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}")
+# A Claude worker whose session carries the task-watch Mod marker gets the alert-only standby.
+STANDBY_MODE=type
+if [ "${SUTANDO_WORKER_RUNTIME:-claude}" = "claude" ] \
+   && [ "$(tmux -S "$SOCK" show-environment -t "=$WORKER_SESSION" SUTANDO_TASK_WATCH_MOD 2>/dev/null)" = "SUTANDO_TASK_WATCH_MOD=1" ]; then
+  STANDBY_MODE=alert
+fi
+ENV_ARGS+=(-e "SUTANDO_STANDBY_MODE=$STANDBY_MODE")
+# The alert-only knobs, always set (empty means the supervisor's default); a change replaces the supervisor.
+ALERT_KNOBS="${SUTANDO_NOTIFIER_ALERT_GRACE:-}/${SUTANDO_NOTIFIER_ALERT_REPEAT:-}/${SUTANDO_NOTIFIER_ALERT_PILEUP:-}"
+ENV_ARGS+=(-e "SUTANDO_NOTIFIER_ALERT_GRACE=${SUTANDO_NOTIFIER_ALERT_GRACE:-}" \
+  -e "SUTANDO_NOTIFIER_ALERT_REPEAT=${SUTANDO_NOTIFIER_ALERT_REPEAT:-}" \
+  -e "SUTANDO_NOTIFIER_ALERT_PILEUP=${SUTANDO_NOTIFIER_ALERT_PILEUP:-}" -e "SUTANDO_STANDBY_ALERT_KNOBS=$ALERT_KNOBS")
 CMD=(tmux -S "$SOCK" new-session -d -s "$SUP_SESSION" "${ENV_ARGS[@]}" bash "$SUPERVISOR")
 
 if [ "${1:-}" = "--print-command" ]; then
@@ -74,12 +88,16 @@ if tmux -S "$SOCK" has-session -t "=$SUP_SESSION" 2>/dev/null; then
   # The stop handler reads the switch in this watcher's environment: a change replaces it.
   # Only an exact session value counts: one the session never set may come from the server's global env.
   have="$(tmux -S "$SOCK" show-environment -t "=$SUP_SESSION" SUTANDO_STOP_INTERRUPT 2>/dev/null)"
-  if [ "$have" = "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}" ]; then
+  have_mode="$(tmux -S "$SOCK" show-environment -t "=$SUP_SESSION" SUTANDO_STANDBY_MODE 2>/dev/null)"
+  have_knobs="$(tmux -S "$SOCK" show-environment -t "=$SUP_SESSION" SUTANDO_STANDBY_ALERT_KNOBS 2>/dev/null)"
+  if [ "$have" = "SUTANDO_STOP_INTERRUPT=${SUTANDO_STOP_INTERRUPT:-}" ] \
+     && [ "$have_mode" = "SUTANDO_STANDBY_MODE=$STANDBY_MODE" ] \
+     && [ "$have_knobs" = "SUTANDO_STANDBY_ALERT_KNOBS=$ALERT_KNOBS" ]; then
     echo "worker-watcher-supervisor: $SUP_SESSION already running"
     exit 0
   fi
   tmux -S "$SOCK" kill-session -t "=$SUP_SESSION" 2>/dev/null || true
-  echo "worker-watcher-supervisor: $SUP_SESSION restarted: the Stop interrupt switch changed"
+  echo "worker-watcher-supervisor: $SUP_SESSION restarted: the Stop interrupt switch, the standby mode or its alert settings changed"
 fi
 if ! tmux -S "$SOCK" has-session -t "=$WORKER_SESSION" 2>/dev/null; then
   echo "worker-watcher-supervisor: worker session $WORKER_SESSION is not running; nothing to supervise" >&2

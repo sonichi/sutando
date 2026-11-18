@@ -24,7 +24,7 @@ concurrency:
 jobs:
   lint-claude-home-path:
     name: refuse new inline CLAUDE_CONFIG_DIR fallback
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
 
     steps:

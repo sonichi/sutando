@@ -18,7 +18,7 @@ PY="$(require_python "$REPO" "run the gateway wrapper env-resolution test")" || 
 run_case() {  # $1=.env body  $2=relay-client.env body  $3=optional NAME=value passed in the process env
   d=$(mktemp -d); mkdir -p "$d/src/launchd" "$d/scripts" "$d/home/channels/ag2space" \
       "$d/ws/state/channel-bridge-supervisor" "$d/ws/results" "$d/shims"
-  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$d/src/launchd/"
+  cp "$REPO/src/launchd/gateway-bridge-wrapper.sh" "$REPO/src/launchd/gateway-bridge-lib.sh" "$d/src/launchd/"
   cp "$REPO/scripts/channel-env.sh" "$REPO/scripts/python-binary.sh" "$d/scripts/"
   # the resolver plus the modules it imports — a real resolution, not a stub
   cp "$REPO/src/channel_env_resolve.py" "$REPO/src/channel_env_containment.py" \

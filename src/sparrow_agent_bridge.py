@@ -8,6 +8,12 @@ key, the token variable and the exact env (three dirs plus `AGENT_MXID`, whose i
 segment) are each compared; any difference skips the declaration with one reason line. A seat's declaration
 (one `connect` wired) names no vault key: its env is the adapter's launch_env over the seat .env beside the
 root, whose token file must be the seat's own, and its bridge runs with exactly that, never a vault token.
+A pool worker's declaration (`worker_lane.py declare`) is run only when the connection record names its
+`AGENT_MXID` as one worker's own agent (`worker_lane.serving`); that worker and its lane instance come from
+the record, never the file, and the bridge runs the lane's own loader (`remote-gateway-bridge.py`) under
+the lane's dirs and identity env (`worker_lane.bridge_overlay`), so every host gate and the worker wiring
+are the lane's. It names no vault key: its token is the worker row's own, read as the lane reads it
+(`worker_lane.credential`).
 
 `declarations(workspace, vault_keys)` lists the valid ones whose vault key exists. What a declaration's
 own bytes can be (not UTF-8, not JSON, too deep, too large, not a regular file) skips that one entry with a
@@ -42,10 +48,15 @@ from ag2_sparrow import connect_bridge as adapter  # noqa: E402
 from ag2_sparrow.adapters.claude_code.shape import LOCAL as CLAUDE_LOCAL  # noqa: E402
 from ag2_sparrow.bounded_file_read import read_regular  # noqa: E402
 from ag2_sparrow.adapters.codex.connect_cli import COMMAND as CODEX_LOCAL_COMMAND  # noqa: E402
+import worker_lane  # noqa: E402
+from connections import worker_agents_dir  # noqa: E402
 
 WRITTEN_BY = f"{CLAUDE_LOCAL.command} install"
-WRITERS = (WRITTEN_BY, f"{CODEX_LOCAL_COMMAND} install")
+WRITERS = (WRITTEN_BY, f"{CODEX_LOCAL_COMMAND} install", worker_lane.WRITTEN_BY)
+# worker_lane.status reads this line from a checkout to tell whether its sparrowd can run a worker declaration.
+ACCEPTS_WORKER_DECLARATIONS = 1
 BRIDGE_MODULE = "ag2_sparrow.remote_gateway_bridge"
+LANE_LOADER = _SRC / "remote-gateway-bridge.py"
 SUFFIX = ".bridge"
 MAX_DECLARATION_BYTES = _sources.MAX_DECLARATION_BYTES
 # Never inherited from sparrowd: the host's token files, its agent identity and its owner DM (and its
@@ -124,12 +135,16 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
         return None, f"{path}: AGENT_MXID {mxid!r} is not the agent the segment {segment} names"
     root = str(Path(agents).resolve() / segment)
     seat = _sources.is_seat(env)
-    if not seat and decl["written_by"] != WRITTEN_BY:
+    if seat and decl["written_by"] == worker_lane.WRITTEN_BY:
+        return None, f"{path}: {worker_lane.WRITTEN_BY} declares no seat's bridge"
+    if not seat and decl["written_by"] not in (WRITTEN_BY, worker_lane.WRITTEN_BY):
         return None, f"{path}: {decl['written_by']} declares only a seat's bridge"
     want_env, problem = seat_env(root, mxid) if seat else (adapter.bridge_env(root, mxid), "")
     if problem:
         return None, f"{path}: {problem}"
-    want = {"name": adapter.worker_name(segment), "token_vault_key": "" if seat else adapter.vault_key(segment),
+    by_worker = decl["written_by"] == worker_lane.WRITTEN_BY
+    want = {"name": adapter.worker_name(segment),
+            "token_vault_key": "" if seat or by_worker else adapter.vault_key(segment),
             **_sources.bridge_declaration_fields(), "module": BRIDGE_MODULE, "env": want_env}
     for key in [k for k in want if k != "env"]:
         if decl.get(key) != want[key]:
@@ -143,7 +158,19 @@ def load(path: Path, agents: Path) -> "tuple[dict | None, str]":
         same = False
     if not same:
         return None, f"{path}: env is not the canonical one for {segment}"
-    return dict(want, url_vault_key=adapter.url_vault_key(segment), digest=hashlib.sha256(raw).hexdigest()), ""
+    served = {}
+    if by_worker:
+        try:
+            worker, instance, problem = worker_lane.serving(mxid, Path(agents).resolve().parent)
+        except worker_lane.RecordUnreadable as e:
+            raise DeclarationUnreadable(f"{path}: {e}") from e
+        if problem:
+            return None, f"{path}: {problem}"
+        served = {"worker": worker, "instance": instance}
+    # A worker's row is part of what runs: a record-only change must be a new revision for sparrowd.
+    runtime = b"\0" + worker_lane.runtime_identity(worker, instance, Path(agents).resolve().parent) if served else b""
+    return dict(want, url_vault_key=adapter.url_vault_key(segment), digest=hashlib.sha256(raw + runtime).hexdigest(),
+                **served), ""
 
 
 def bridge_environ(decl: dict, token: str, base=None, url: str = "") -> dict:
@@ -175,7 +202,7 @@ def declarations(workspace: Path, vault_keys, held=None) -> "tuple[list, list]":
     directory declares nothing; one that cannot be listed, or a home that cannot be entered, raises
     ScanUnavailable. A declaration file that cannot be read is a skip whose worker name is appended to
     `held`: its state is unknown, so the caller keeps whatever runs under that name."""
-    agents, found, skipped = Path(workspace) / "agents", [], []
+    agents, found, skipped = worker_agents_dir(Path(workspace)), [], []
     names = set(vault_keys)
     try:
         homes = sorted(p for p in agents.iterdir() if p.name.endswith(SUFFIX))
@@ -193,7 +220,7 @@ def declarations(workspace: Path, vault_keys, held=None) -> "tuple[list, list]":
             decl, why = None, str(e)
             if held is not None:
                 held.append(adapter.worker_name(home.name[:-len(SUFFIX)]))
-        if decl is not None and not is_seat(decl) and decl["token_vault_key"] not in names:
+        if decl is not None and decl["token_vault_key"] and decl["token_vault_key"] not in names:
             decl, why = None, f"{path}: the vault has no {decl['token_vault_key']}; vault set it to the agent's relay token"
         if decl is None:
             skipped.append(why)
@@ -231,10 +258,10 @@ def endpoint(decl: dict, token: str, get_key) -> "tuple[str, str]":
     return ("", f"{key} {problem}") if problem else (url, "")
 
 
-def preflight(workspace, get_key) -> int:
+def preflight(workspace, get_key, vault=None) -> int:
     """One line per declared agent bridge: whether it can start (its token in the vault, and its gateway in
     the token or under its URL key). 1 when any cannot. No value is printed."""
-    agents, bad = Path(workspace) / "agents", []
+    agents, bad = worker_agents_dir(Path(workspace)), []
     try:
         homes = sorted(p for p in agents.iterdir() if p.name.endswith(SUFFIX))
     except (FileNotFoundError, NotADirectoryError):
@@ -253,7 +280,12 @@ def preflight(workspace, get_key) -> int:
         if decl is not None and is_seat(decl):
             print(f"ok: {decl['name']} (gateway from its seat's token file)")
             continue
-        if decl is not None:
+        if decl is not None and decl.get("worker"):
+            why = worker_lane.credential(decl["worker"], workspace, None, vault, instance=decl["instance"])[1]
+            if not why:
+                print(f"ok: {decl['name']} (worker {decl['worker']}'s token, from its connection row)")
+                continue
+        if decl is not None and not decl.get("worker"):
             try:
                 token = get_key(decl["token_vault_key"])
             except KeyError:
@@ -264,13 +296,14 @@ def preflight(workspace, get_key) -> int:
                     where = "its token" if not url else decl["url_vault_key"]
                     print(f"ok: {decl['name']} (gateway from {where})")
                     continue
+        if decl is not None:
             why = f"{decl['name']}: {why}"
         bad.append(why)
         print(f"WILL NOT START: {why}")
     return 1 if bad else 0
 
 
-def main(argv=None, workspace=None, get_key=None, run=runpy.run_module) -> int:
+def main(argv=None, workspace=None, get_key=None, run=runpy.run_module, vault=None, run_path=runpy.run_path) -> int:
     args = sys.argv[1:] if argv is None else argv
     if len(args) != 1:
         print("usage: sparrow_agent_bridge.py <workspace>/agents/<agent>.bridge/worker.json | --preflight",
@@ -282,16 +315,21 @@ def main(argv=None, workspace=None, get_key=None, run=runpy.run_module) -> int:
     if get_key is None and args[0] == "--preflight":
         from vault_intercept import get_vault_key as get_key
     if args[0] == "--preflight":
-        return preflight(workspace, get_key)
+        return preflight(workspace, get_key, vault)
     try:
-        decl, why = load(Path(args[0]), Path(workspace) / "agents")
+        decl, why = load(Path(args[0]), worker_agents_dir(Path(workspace)))
     except ScanUnavailable as e:
         decl, why = None, str(e)
     if decl is None:
         print(f"sparrow-agent-bridge: not starting: {why}", file=sys.stderr)
         return 2
     token, url = "", ""
-    if not is_seat(decl):
+    if decl.get("worker"):
+        token, problem = worker_lane.credential(decl["worker"], workspace, None, vault, instance=decl["instance"])
+        if problem:
+            print(f"sparrow-agent-bridge: not starting: {problem}", file=sys.stderr)
+            return 1
+    elif not is_seat(decl):
         if get_key is None:
             from vault_intercept import get_vault_key as get_key
         try:
@@ -304,15 +342,33 @@ def main(argv=None, workspace=None, get_key=None, run=runpy.run_module) -> int:
             print(f"sparrow-agent-bridge: not starting: {problem}", file=sys.stderr)
             return 1
     environ = bridge_environ(decl, token, url=url)
+    worker = decl.get("worker")
+    try:
+        # A worker's bridge runs as its lane: dirs and lane env derived from the record, never the file.
+        overlay = worker_lane.bridge_overlay(workspace, decl["instance"]) if worker else {}
+    except worker_lane.NotServable as e:
+        print(f"sparrow-agent-bridge: not starting: {e}", file=sys.stderr)
+        return 1
+    dirs = dict(decl["env"], **overlay)
     os.environ.clear()
     os.environ.update(environ)
+    os.environ.update(overlay)
     from ag2_sparrow._dirs import set_dirs
     from ag2_sparrow.local_task_protocol import set_task_stamper
     from task_envelope import stamp_text
-    set_dirs(task_dir=decl["env"]["AGENT_CONNECT_TASK_DIR"], result_dir=decl["env"]["AGENT_CONNECT_RESULT_DIR"],
-             state_dir=decl["env"]["AGENT_CONNECT_STATE_DIR"])
+    set_dirs(task_dir=dirs["AGENT_CONNECT_TASK_DIR"], result_dir=dirs["AGENT_CONNECT_RESULT_DIR"],
+             state_dir=dirs["AGENT_CONNECT_STATE_DIR"])
     set_task_stamper(stamp_text)
-    run(BRIDGE_MODULE, run_name="__main__", alter_sys=True)
+    if not worker:
+        run(BRIDGE_MODULE, run_name="__main__", alter_sys=True)
+        return 0
+    from workspace_default import resolve_workspace
+    if Path(resolve_workspace()).resolve() != Path(workspace).resolve():
+        print(f"sparrow-agent-bridge: not starting: the lane loader resolves another workspace than {workspace}",
+              file=sys.stderr)
+        return 1
+    # The lane's own loader: every host gate and the worker wiring come from the one place that sets them.
+    run_path(str(LANE_LOADER), run_name="__main__")
     return 0
 
 

@@ -81,6 +81,11 @@ use `equals`, `contains`, `regex`, and `max_chars` assertions:
 }
 ```
 
+Case IDs remain unchanged in saved results and comparisons. Task filenames
+include the run ID, case position, a filename-safe case label, and repetition,
+so distinct IDs such as `a/b` and `a b` cannot share a task or consume each
+other's results even though their filename-safe labels are identical.
+
 Exact assertions are deliberately the first scoring layer. Subjective quality,
 tool traces, filesystem fixtures, and automatic checkout/startup management
 can be added without changing the persisted run schema.

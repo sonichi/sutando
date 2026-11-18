@@ -31,12 +31,14 @@ lower-precedence candidate.
 | `REMOTE_TASK_POLL_WAIT` | no | `25` | Long-poll seconds requested per `/v1/tasks` call. |
 | `REMOTE_TASK_ON_TASK` | no | — | Wake command run once per newly queued task file. Split with `shlex` and run without a shell, the file path appended as the last argument; `SPARROW_TASK_ID` and `SPARROW_TASK_FILE` are set and every relay credential is removed from its environment. Sparrow does not wait for it, kill it, or retry it; a non-zero exit or a start failure is logged once. |
 | `REMOTE_TASK_POLL_STALL_EXIT_S` | no | `600` | Seconds without a completed poll after which a live-but-stalled bridge stops its outbound worker, waits for any send it has in flight to finish (without polling meanwhile), and exits with code `69` so its restart owner relaunches it (`0` disables). Measured on the monotonic clock, so time the host spends asleep never counts, and re-anchored when an auth wait on a human ends, so a re-link never counts either. The launchd wrapper relaunches on `69` without an owner alert. |
-| `SUTANDO_BRIDGE_RESTART_OWNER` | no | — | Name of whatever relaunches the bridge on exit (the launchd plist sets `launchd`). Unset, the stall is logged and written to `gateway-status.json` but the process keeps retrying, because a bare `&` lane has nothing to bring it back. |
+| `SUTANDO_BRIDGE_RESTART_OWNER` | no | — | Name of whatever relaunches the bridge on exit (the launchd plist sets `launchd`). Unset, the stall is logged and written to `gateway-status.json` but the process keeps retrying, because a bare `&` lane has nothing to bring it back. The stuck-relay-poll exit (five task polls held past the read timeout while other requests answer, at most once per 10 minutes) is armed by the same declaration. |
 | `REMOTE_TASK_TIER` | no | `owner` | Local access tier stamped on every inbound task; `owner` for the personal-agent model, set `team`/`guest` for a shared gateway (see Security); `other` is accepted as the legacy spelling of `guest`. |
 | `REMOTE_PROACTIVE_ROOM` *(.env too)* | no | — | The SYSTEM destination only. Owner-directed `results/proactive-*.txt` nudges and runtime prompt cards go to the gateway's `owner_dm_room` for this agent (`GET /v1/agents`), a reading kept identity-bound on disk (`state/owner-routing.json`) across restarts and outages and never replaced by an answer without one. A room is adopted as the owner DM only when `/v1/room` `{"op": "members"}` lists no one but the agent and its owner, re-checked on every refresh; a room with anyone else clears the reading, and an unreadable member list never adopts a new room. Only a record marked `"private": true` is loaded; one saved before this check, including a migrated legacy record, is not. With no reading they are HELD (file left in place, retried every 30 s, logged), never sent here. Unset → read from this instance's `channels/<dir>/.env`. A file naming its own room (`[channel: !room]`) never needs it; the drain runs whether or not it is set. |
 | `REMOTE_TASK_LIFECYCLE_V2` | no | off | `1` turns on the task lifecycle calls below (lease generation, per-task beats, cancel, ledger reconcile). |
 | `REMOTE_TASK_TURN_CONTEXT` | no | off | `1`, with `REMOTE_TASK_LIFECYCLE_V2`, writes each attempt's turn file and gates its result on the turn's room actions. |
 | `REMOTE_ALERT_ROOM` | no | none (gateway alert disabled) | Explicit owner-only room id for core-independent health alerts sent by the launchd fallback. Never inferred from last activity because that room may be shared. |
+
+**Exit codes a supervisor acts on:** `75` means another live bridge holds this workspace's poller lock, so stand down. `69` is the poll-stall exit above. `70` means this bridge lost its poller lock to a successor after a stale takeover; relaunch it, and the relaunch either stands down (`75`) or takes the lock. `0` is a signal stop. Once the bridge has decided to exit `70`, a hung exit hook cannot hold it open: it is force-exited with the same code after 30 s.
 
 **Use the split form** (`REMOTE_TASK_URL` + `REMOTE_TASK_TOKEN`) — it's the recommended way to configure the bridge.
 
@@ -96,15 +98,16 @@ not become approvals. The same parser handles private-result review decisions.
 Owner identity, the target card and its current revision/guard remain required;
 an unthreaded Yes does not approve an arbitrary pending prompt.
 
-A worker-picker button may be sent as `"picker_command"` (`add` | `pin` |
-`unpin`) plus optional `"picker_args"` — a JSON object, either inline or
-already serialized as a string; the bridge writes it as JSON either way. Both
-are written as trusted pre-body headers, because `worker_picker_commands.py`
-reads them with the parser that stops at `task:`. A command the reader cannot
-honour — an unknown verb, args that are not an object, or arguments that do not
-fit the verb — is refused by name rather than resolved from the sentence, and
-the room always comes from `channel_id`, never from `picker_args`. A broker
-that sends no `picker_command` keeps the prose fallback.
+A worker-picker button may be sent as `"picker_command"` plus optional
+`"picker_args"` — a JSON object, either inline or already serialized as a
+string; the bridge writes it as JSON either way. Both are written as trusted
+pre-body headers, so a reader that stops at `task:` sees them and a body copy
+is never one. The task goes to the core, never to a worker bound to the room.
+Only the `add` button remains: the pool no longer applies `pin` or `unpin`. A
+room is bound to a worker on the shared folders with
+`pool_manage.py bind <room id> <worker>` and released with
+`pool_manage.py unbind <room id>`; a converted worker (one on its own task
+folders) is never routed to, so `bind` refuses it.
 
 An s.space broker may additionally send `"session_scope": "room"`. The
 bridge writes only that exact value as a trusted pre-body header; missing,
@@ -126,9 +129,11 @@ id, for a join `join|<agent mxid>|<room id>`) is passed only as one token of at
 most 256 characters from `[A-Za-z0-9._:@!|=+/-]`, and `"playbook"` only as an id
 matching `[a-z0-9][a-z0-9-]{0,63}`; anything else is dropped. All three are
 trusted pre-body headers. The core runs `skills/<playbook>/SKILL.md` only for an
-allowed playbook (a registry playbook, or a skill whose `manifest.json` sets
-`"playbook": true`), else the registry default for the event (`room.joined` →
-`room-onboard`; `room.mention` → `reply`, today's answer), else handles the task
+allowed playbook (a skill whose `manifest.json` sets `"playbook": true`; a
+registry id needs the same opt-in), else the registry default for the event under
+that rule (`room.joined` → `room-onboard`; `commons.summon` → `summon`;
+`commons.app_request` → `app-request`; `email.received` → `email`; `room.mention` → `reply`, today's answer),
+else handles the task
 as a message that follows its body. An event type with no registry entry has no
 default, so it resolves to none; a playbook string is never trusted to pick a
 skill. An event body may quote member-written text; the agent treats that text as
@@ -914,6 +919,13 @@ so:
   and kept live where health-check sees it). Its failure notice, refused by the same room, is
   sent once to the owner DM instead; if the DM refuses it too, it is recorded as sent and not
   repeated. Any other 403 still raises to the caller's backoff.
+- **A private review DM whose room refuses the sender** (a non-owner result the guard
+  withheld) gets the same `ROOM_REFUSAL_ATTEMPTS` sends, 2 s doubling apart. Then the cached
+  review room is no longer trusted and the same review is sent once to a new private room,
+  which later reviews use; the result stays withheld (no room post) and is settled. If the new
+  room refuses too, the review is logged as `DROPPED` (not delivered to the owner) with the
+  path of its record, kept in `state/withheld-team-results/`. Any other 403 keeps the result
+  for the next pass, as before.
 - **A message about a task** is named `proactive-about-<task id>--<ts>.txt`
   (`proactive_routing.about_task_filename`). In the task's own room it posts in the task's
   thread: an ask already in a thread keeps that thread's root, a top-level ask is rooted at

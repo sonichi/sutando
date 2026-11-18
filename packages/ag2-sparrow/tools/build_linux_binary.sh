@@ -12,7 +12,7 @@ if ! command -v objdump >/dev/null; then
 fi
 python3 -m pip install --quiet --disable-pip-version-check pyinstaller==6.22.3
 
-printf 'from ag2_sparrow.remote_gateway_bridge import main\nmain()\n' > "$WORK/ag2-sparrow.py"
+printf 'from ag2_sparrow.remote_gateway_bridge import run\nrun()\n' > "$WORK/ag2-sparrow.py"
 python3 -m PyInstaller --onefile --name ag2-sparrow --paths "$PKG" \
   --collect-submodules ag2_sparrow --distpath "$WORK/dist" --workpath "$WORK/build" \
   --specpath "$WORK" --log-level WARN "$WORK/ag2-sparrow.py"

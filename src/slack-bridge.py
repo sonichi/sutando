@@ -99,7 +99,8 @@ from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import fresh_reask_id, plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 from policy.egress.unfurl import should_unfurl  # noqa: E402
-from policy.egress.result import guard_result_for_tier, resolve_route_tier  # noqa: E402
+from policy.egress.result import (attachment_notice_name, guard_proactive_for_destination,  # noqa: E402
+                                  guard_result_for_tier, redirect_destination, resolve_route_tier)
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
@@ -599,6 +600,22 @@ def _guard_reply(task_id: str, target, reply_text: str) -> str:
     if withheld:
         print(f"  [team-guard] withheld result for {task_id} (tier={tier}): {withheld}", flush=True)
     return safe
+
+
+def _slack_destination_tier(channel: str) -> str:
+    """The audience tier of a proactive redirect target: a DM is its peer's tierMap tier,
+    anything else (or an unreadable DM) is "other", the bridge's fail-closed default."""
+    if not channel.startswith("D"):
+        return "other"
+    try:
+        info = app.client.conversations_info(channel=channel)["channel"]
+        peer = info.get("user") if info.get("is_im") else None
+    except Exception as e:
+        print(f"  [team-guard] could not read DM {channel} ({e}); guarding as other", flush=True)
+        return "other"
+    if not peer:
+        return "other"
+    return resolve_access_tier(peer, load_tier_map(), _ensure_tier_map_seeded())
 
 
 def _pop_pending_reply(task_id: str):
@@ -1674,7 +1691,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
             try:
                 app.client.chat_postMessage(
                     channel=channel,
-                    text=f"(file access denied: {fpath})",
+                    text=f"(file access denied: {attachment_notice_name(fpath, access_tier)})",
                     **({"thread_ts": thread_ts} if thread_ts else {}),
                 )
                 _parts_visible += 1
@@ -1689,7 +1706,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
             try:
                 app.client.chat_postMessage(
                     channel=channel,
-                    text=f"(file not found: {fpath})",
+                    text=f"(file not found: {attachment_notice_name(fpath, access_tier)})",
                     **({"thread_ts": thread_ts} if thread_ts else {}),
                 )
                 _parts_visible += 1
@@ -1932,9 +1949,19 @@ def result_watcher():
                         try:
                             resp = app.client.conversations_open(users=owner_id)
                             dm_channel = resp["channel"]["id"]
-                            if _send_reply(dm_channel, None, text, access_tier="owner"):
+                            dest = redirect_destination(text) or dm_channel
+                            tier = "owner" if dest == dm_channel else _slack_destination_tier(dest)
+                            safe, withheld = guard_proactive_for_destination(text, dest, dm_channel, tier, REPO)
+                            if withheld:
+                                print(f"  [team-guard] withheld proactive {delivery_id} for {dest} (tier={tier}): {withheld}", flush=True)
+                                sent = _send_reply(dest, None, safe, access_tier=tier)
+                            else:
+                                sent = _send_reply(dm_channel, None, text, access_tier=tier)
+                            if sent:
                                 mark_proactive_delivered(STATE_DIR, delivery_id)
-                                print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
+                                # Log where _send_reply posted: a [channel:] body never reaches the owner's DM.
+                                print(f"  [proactive] sent to {owner_id if dest == dm_channel else dest}: "
+                                      f"{parse_markers(safe).body[:80]}", flush=True)
                                 claim.unlink(missing_ok=True)
                             else:
                                 # Slack refused WITHOUT raising, which is the ordinary
