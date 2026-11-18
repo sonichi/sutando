@@ -477,12 +477,12 @@ with tempfile.TemporaryDirectory() as tmp:
                              capture_output=True, text=True)
     check("the opid command refuses arguments with no run key", bad_cli.returncode == 1)
 skill = (_ROOT / "skills" / "commons-feed-runner" / "SKILL.md").read_text()
-check("the skill sends both calls with opid's id",
+check("doc pin: the skill sends both calls with opid's id",
       skill.count("feed_runner.py opid write.json") == 1
       and skill.count("feed_runner.py opid fail.json") == 1
       and "the run key + `:fail`" not in skill)
 
-# A run writes only within its own slot, so its key is always among the backend's newest.
+# `current` refuses a run whose slot has passed: a check before sending, not a fence.
 every_ms = EVERY * 60_000
 slot_start = NOW // every_ms * every_ms
 check("due gives each run the end of its slot", fr.slot_until(EVERY, NOW) == slot_start + every_ms
@@ -499,9 +499,9 @@ for name, run, at in (("at the slot's end", in_slot, slot_start + every_ms),
         refused = True
     check(f"a run {name} is not current", refused)
 
-# The stated bound: `current` is checked before sending, so a key is deduped only while it is
-# among the backend's newest RUN_KEY_HISTORY. A model of that history, keyed by real slot keys.
-check("the run-key history the docs state is 16", fr.RUN_KEY_HISTORY == 16
+# Doc pins and a model, not behaviour: they pin the stated 16 and model the backend's run memory
+# with list slicing, so no change to feed_runner.py fails them.
+check("doc pin: the run-key history the docs state is 16", fr.RUN_KEY_HISTORY == 16
       and "(16 per grant)" in skill and "only while the key is among those 16" in skill
       and "never writes again" not in (fr.current.__doc__ or ""))
 paused = fr.slot_key("g", EVERY, NOW)
@@ -509,7 +509,7 @@ fr.current(in_slot, NOW)  # passes before the request is paused
 for newer, deduped in ((fr.RUN_KEY_HISTORY - 1, True), (fr.RUN_KEY_HISTORY, False)):
     history = [paused] + [fr.slot_key("g", EVERY, NOW + i * every_ms) for i in range(1, newer + 1)]
     kept = history[-fr.RUN_KEY_HISTORY:]
-    check(f"a paused run with {newer} newer runs is {'still' if deduped else 'no longer'} deduped",
+    check(f"model: a paused run with {newer} newer runs is {'still' if deduped else 'no longer'} deduped",
           len(set(history)) == newer + 1 and (paused in kept) is deduped)
 with tempfile.TemporaryDirectory() as tmp:
     for name, until, code_want in (("current", 2 ** 62, 0), ("past", 1, 1)):
@@ -519,7 +519,7 @@ with tempfile.TemporaryDirectory() as tmp:
         with contextlib.redirect_stdout(out):
             code = fr.main(["feed_runner.py", "current", str(path)])
         check(f"the current command exits {code_want} for a {name} slot", code == code_want)
-check("the skill checks the slot before writing, and qualifies the run-key history",
+check("doc pin: the skill checks the slot before writing, and qualifies the run-key history",
       skill.count("feed_runner.py current run.json") == 1 and "16 per grant" in skill
       and "writes the run key once" not in skill)
 
