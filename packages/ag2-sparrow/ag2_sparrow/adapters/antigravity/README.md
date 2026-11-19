@@ -55,13 +55,15 @@ final message is the only answer path.
 
 ## Tiers and permissions
 
-The owner and an attested collaborator are served; any other non-owner is refused with one line unless
-`--allow-non-owner`.
+Only the owner is served by default. Every other sender, an attested collaborator included, is refused
+with one line unless `--allow-non-owner`, which admits them all. A non-owner's turn runs on the owner's agy
+sign-in (the Google account and quota in the Keychain), and a turn whose tool call is denied can end with
+no reply.
 
 **The owner's turns** resume the room's Session in the working directory, with agy's own home
 (`~/.gemini`: its settings, rules and context).
 
-**A non-owner's turn** (an attested collaborator, or anyone `--allow-non-owner` admits) runs isolated:
+**A non-owner's turn** (anyone `--allow-non-owner` admits, collaborators included) runs isolated:
 
 - a fresh temporary directory per task holds the Session's working directory and a separate agy home,
   passed as `agy acp --gemini-dir <dir>`; that home has only a `settings.json` whose permission rules deny
