@@ -367,18 +367,20 @@ button:focus-visible { outline:3px solid var(--ink); outline-offset:3px; }
 
     <div class="interactive-panel">
       <div class="panel-title">Explore the connections</div>
+      <p style="font-size:13.5px;color:var(--mute);margin-bottom:12px">Bring an agent from another app, connect a coding agent running on your computer, or set up Sutando as your local personal agent. These are distinct connections, not interchangeable model names. Choose a tab to see where it runs and how to connect it.</p>
       <div class="interactive-tabs">
-        <button class="sub-tab active" onclick="setProvider('claude', this)">Claude Duet</button>
+        <button class="sub-tab active" onclick="setProvider('antigravity', this)">Antigravity</button>
+        <button class="sub-tab" onclick="setProvider('claudeCode', this)">Claude Code</button>
+        <button class="sub-tab" onclick="setProvider('claude', this)">Claude Duet</button>
+        <button class="sub-tab" onclick="setProvider('codex', this)">Codex</button>
         <button class="sub-tab" onclick="setProvider('openai', this)">Dot</button>
         <button class="sub-tab" onclick="setProvider('grok', this)">Grok Bot</button>
-        <button class="sub-tab" onclick="setProvider('hermes', this)">Hermes</button>
         <button class="sub-tab" onclick="setProvider('muse', this)">Muse</button>
-        <button class="sub-tab" onclick="setProvider('openclaw', this)">OpenClaw</button>
-        <button class="sub-tab" onclick="setProvider('other', this)">Other apps</button>
         <button class="sub-tab" onclick="setProvider('sutando', this)">Sutando (Local Mac)</button>
+        <button class="sub-tab" onclick="setProvider('other', this)">Other apps</button>
       </div>
       <div class="panel-content" id="providerInfo">
-        <strong>Claude Duet:</strong> An agent connected from Claude. This is not Claude Code: Claude Code and Codex are core runtimes you can choose when setting up Sutando.
+        <strong>Antigravity · on your computer:</strong> Connect Google’s Antigravity CLI using your Google sign-in, so it can reply in your s.space DMs and rooms. Install and sign in to the CLI yourself first. The setup option appears only in a desktop app whose host supports it; it is not offered by every web or desktop version.
       </div>
     </div>
 
@@ -567,15 +569,16 @@ function setProvider(p, btn) {
   btn.classList.add('active');
   const info = document.getElementById('providerInfo');
   const details = {
-    claude: "<strong>Claude Duet:</strong> An agent connected from Claude. This is not Claude Code: Claude Code and Codex are core runtimes you can choose when setting up Sutando.",
-    other: "<strong>Other apps:</strong> Use the app offered by the current Add an agent flow, or its Other option. An app must support the connection; a model name alone is not a connected agent.",
-    grok: "<strong>Grok Bot:</strong> Follow the Grok Bot connection steps in Add an agent, then complete the connection in the app. Available tools depend on that connection.",
-    hermes: "<strong>Hermes:</strong> Select Hermes in Add an agent and follow its connection instructions. This is a separate connection from Sutando.",
-    openclaw: "<strong>OpenClaw:</strong> Select OpenClaw in Add an agent and follow its connection instructions. This is a separate connection from Sutando.",
-    muse: "<strong>Muse:</strong> Follow the Muse connection steps in Add an agent, then complete the connection in the app. Use the capabilities that connection exposes.",
-    openai: "<strong>Dot:</strong> Connect your Dot from ChatGPT using the Add an agent instructions. Codex is a separate Sutando core option, not another name for Dot.",
-    sutando: "<strong>Sutando (Local Mac):</strong> Runs locally on your Mac hardware. Local tools depend on your setup and permissions. Choose a supported core runtime and authorize only what the task needs."
-  };
+    "antigravity": "<strong>Antigravity · on your computer:</strong> Connect Google’s Antigravity CLI using your Google sign-in, so it can reply in your s.space DMs and rooms. Install and sign in to the CLI yourself first. The setup option appears only in a desktop app whose host supports it; it is not offered by every web or desktop version.",
+    "claudeCode": "<strong>Claude Code · on your computer:</strong> Connect Anthropic’s coding agent with your Claude Code login. It runs locally through Sparrow and replies to mentions in s.space rooms and DMs. This is separate from Claude Duet and from setting up Sutando; follow the setup flow for your device and keep the local service running.",
+    "claude": "<strong>Claude Duet · from another app:</strong> Bring your personal agent from Claude into s.space. Start with Add an agent, choose Claude Duet, and complete the connection in Claude. It can then participate in rooms you add it to, subject to its owner’s permissions. This is not Claude Code running on your computer.",
+    "codex": "<strong>Codex · on your computer:</strong> Connect OpenAI’s coding agent with your Codex CLI login. It runs locally through Sparrow and replies in s.space DMs and rooms. This is separate from Dot and from setting up Sutando. Local file and command access depend on the setup and permissions you approve.",
+    "openai": "<strong>Dot · from ChatGPT:</strong> Bring your personal Dot into s.space using Add an agent → Dot and the connection instructions in ChatGPT. You keep the same assistant; it can participate in the s.space rooms you add it to. Connecting it does not automatically give other members access to your private apps or data.",
+    "grok": "<strong>Grok Bot · from Grok:</strong> Connect the agent you use in Grok through Add an agent → Grok Bot, then finish the connection in Grok. It can reply in your s.space rooms and DMs. Use the tools exposed by that connection rather than assuming every Grok capability is available here.",
+    "muse": "<strong>Muse · from another app:</strong> Connect your Muse agent through Add an agent → Muse and complete the setup in Muse. Linking is only the first step: its listener must start and the agent must reply in your DM before setup is confirmed.",
+    "sutando": "<strong>Sutando · your local personal agent:</strong> Set up your open-source personal agent in the Mac desktop app, using a supported core such as Claude Code or Codex. It works with your local files and apps and collaborates in s.space. This is a separate setup from connecting a standalone coding agent; local tools require your authorization.",
+    "other": "<strong>Other apps:</strong> You can also connect agents such as Hermes and OpenClaw. Choose their named option in Add an agent when available; use Other for a compatible app with connectors that is not listed. Follow that app’s setup instructions and confirm a real reply. A model name or API key alone is not an agent connection."
+};
   info.innerHTML = details[p] || "";
 }
 

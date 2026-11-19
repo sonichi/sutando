@@ -82,6 +82,11 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
   d.querySelector('#step-0 .btn-nav.primary').click();
   result.focusedHeading = d.activeElement === d.querySelector('#step-1 h2');
   result.activeStep = d.querySelector('.tour-card.active').id;
+  result.providers = [...d.querySelectorAll('#step-0 .sub-tab')].map(button => {
+    button.click();
+    return { label: button.textContent, text: d.getElementById('providerInfo').textContent,
+      active: button.classList.contains('active') };
+  });
   result.errors = errors;
   console.log(JSON.stringify(result));
   dom.window.close();
@@ -94,6 +99,17 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
                                     capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         out = json.loads(result.stdout)
+        self.assertEqual([p["label"] for p in out["providers"]], [
+            "Antigravity", "Claude Code", "Claude Duet", "Codex", "Dot",
+            "Grok Bot", "Muse", "Sutando (Local Mac)", "Other apps"])
+        for provider in out["providers"]:
+            self.assertTrue(provider["active"])
+            self.assertTrue(provider["text"].strip())
+        providers = {p["label"]: p["text"] for p in out["providers"]}
+        self.assertIn("host supports it", providers["Antigravity"])
+        self.assertIn("separate from Claude Duet", providers["Claude Code"])
+        self.assertIn("separate from Dot", providers["Codex"])
+        self.assertIn("Hermes and OpenClaw", providers["Other apps"])
         self.assertEqual(out["errors"], [])
         self.assertEqual(out["copies"], 1)
         self.assertTrue(out["prompt"].strip())
