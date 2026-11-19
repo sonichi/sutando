@@ -222,7 +222,7 @@ class Specs(Base):
                 mock.patch.dict(sys.modules, {"vault_intercept": fake_vault}), \
                 contextlib.redirect_stderr(io.StringIO()):
             names = [s.name for s in self.sd.worker_specs()]
-            self.assertEqual((names[0], names.count(cli.worker_name(SEG))), ("remote-gateway-bridge", 1))
+            self.assertEqual(names, [cli.worker_name(SEG)])
             seen = []
             with mock.patch.object(self.sd, "external_supervisor", side_effect=lambda m: seen.append(m)), \
                     mock.patch.object(self.sd, "run", return_value=0) as run:
@@ -245,7 +245,7 @@ class Specs(Base):
             err = io.StringIO()
             with mock.patch.object(self.sd, "resolve_workspace", return_value=self.ws), contextlib.redirect_stderr(err):
                 names = [s.name for s in self.sd.worker_specs()]
-        self.assertEqual(names, ["remote-gateway-bridge"], "the static workers still run")
+        self.assertEqual(names, [], "the static workers still run (none configured here)")
         self.assertIn("not supervised — agent bridges not scanned: vault manifest unreadable", err.getvalue())
 
     def test_what_a_declarations_own_bytes_can_do_is_a_skip_never_unavailable_never_an_exception(self):

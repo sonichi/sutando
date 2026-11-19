@@ -174,6 +174,18 @@ class QueueQuestion(unittest.TestCase):
         self.assertEqual([(a.id, a.label) for a in req.actions], [("option-0", "8080"), ("option-1", "Hold")])
         self.assertNotIn("Approve", req.message)
 
+    def test_an_option_named_like_the_default_is_approve_not_a_second_button(self):
+        ws = _ws("ag2space")
+        m = _manager(ws)
+        out = _ask("Admit it?", workspace=ws, host="h", default_action="Yes, admit it",
+                   options=[("Yes, admit it", "approve the gate now"), ("No", "leave it closed")],
+                   manager=m)
+        req = m.get(out["card"])
+        self.assertEqual([(a.id, a.label) for a in req.actions], [("approve", "Approve"), ("option-1", "No")])
+        self.assertEqual(ask.card_choices("Yes, admit it", [("Yes, admit it", "approve the gate now"),
+                                                            ("No", "leave it closed")]),
+                         [("Approve", "approve the gate now"), ("No", "leave it closed")])
+
     def test_no_options_and_no_default_stays_plain_text(self):
         ws = _ws("ag2space")
         out = _ask("What next?", workspace=ws, host="h", manager=_manager(ws))

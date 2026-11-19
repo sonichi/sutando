@@ -47,7 +47,7 @@ RECORD_CAP = 500
 RECENT_COMMITS = 30
 DEFAULT_MIN_QUOTA = 500
 ASK_CLASSES = {"needs_reviewer", "changes_addressed"}
-HEAD_KEYED = {"conflicting", "behind"}  # the base moves these, so the same content can need them again
+HEAD_KEYED = {"conflicting", "behind", "ci_red"}  # the base moves these, so the same content can need them again
 
 # Primary class first: the first applicable one decides `next`.
 NEXT = {
