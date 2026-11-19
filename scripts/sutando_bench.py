@@ -88,14 +88,18 @@ def _validate_expectation(expected: Any, prefix: str) -> None:
             raise ValueError(f"{prefix}: expect.{field} must be a string")
     if "contains" in expected:
         value = expected["contains"]
-        if not isinstance(value, str) and not (
-                isinstance(value, list) and value and all(isinstance(item, str) for item in value)):
-            raise ValueError(f"{prefix}: expect.contains must be a string or a non-empty list of strings")
+        if not ((isinstance(value, str) and value) or (
+                isinstance(value, list) and value
+                and all(isinstance(item, str) and item for item in value))):
+            raise ValueError(f"{prefix}: expect.contains must be a non-empty string "
+                             "or a non-empty list of non-empty strings")
     if "max_chars" in expected:
         maximum = expected["max_chars"]
         if type(maximum) is not int or maximum < 0:
             raise ValueError(f"{prefix}: expect.max_chars must be a non-negative integer")
     if "regex" in expected:
+        if not expected["regex"]:
+            raise ValueError(f"{prefix}: expect.regex must be a non-empty string")
         try:
             re.compile(expected["regex"], re.IGNORECASE | re.MULTILINE)
         except (re.error, OverflowError, RecursionError) as exc:

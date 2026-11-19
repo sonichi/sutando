@@ -151,7 +151,10 @@ class BenchTests(unittest.TestCase):
             ({"equals": 1}, "equals"), ({"equals": None}, "equals"),
             ({"contains": []}, "contains"), ({"contains": 1}, "contains"),
             ({"contains": ["right", False]}, "contains"),
+            ({"contains": ""}, "contains"), ({"contains": [""]}, "contains"),
+            ({"contains": ["right", ""]}, "contains"),
             ({"regex": 1}, "regex"), ({"regex": "["}, "regex"),
+            ({"regex": ""}, "regex"),
             ({"regex": "a{99999999999999999999}"}, "regex"),
             ({"regex": "(" * 2000 + ")" * 2000}, "regex"),
             ({"max_chars": -1}, "max_chars"), ({"max_chars": True}, "max_chars"),
@@ -169,7 +172,8 @@ class BenchTests(unittest.TestCase):
     def test_valid_assertions_retain_grading_semantics(self):
         expectations = [({}, True), ({"equals": ""}, False), ({"equals": "Paris"}, True),
                         ({"contains": "PARIS"}, True), ({"contains": ["p", "ris"]}, True),
-                        ({"regex": "^paris$"}, True), ({"regex": ""}, True),
+                        ({"regex": "^paris$"}, True), ({"regex": ".*"}, True),
+                        ({"contains": " "}, False), ({"regex": " "}, False),
                         ({"max_chars": 0}, False),
                         ({"equals": "Paris", "contains": ["Par", "is"],
                           "regex": "par.*", "max_chars": 5}, True)]
@@ -185,18 +189,30 @@ class BenchTests(unittest.TestCase):
                     self.assertEqual(bench.score_response("Paris", loaded["cases"][0]["expect"])[0], passed)
             self.assertEqual(bench.load_suite(bench.DEFAULT_SUITE)["name"], "smoke")
 
+    def test_explicit_empty_response_expectations_remain_valid(self):
+        for expected in [{"equals": ""}, {"regex": "^$"}, {"max_chars": 0}]:
+            with self.subTest(expect=expected):
+                bench.validate_suite({"schema": 1, "name": "empty response", "cases": [
+                    {"id": "one", "prompt": "p", "expect": expected}]})
+                self.assertTrue(bench.score_response("", expected)[0])
+                self.assertFalse(bench.score_response("WRONG", expected)[0])
+
     def test_run_suite_rejects_invalid_later_case_before_submission(self):
-        suite = {"schema": 1, "name": "validation", "cases": [
-            {"id": "first", "prompt": "p"},
-            {"id": "second", "prompt": "p", "expect": {"regex": "["}}]}
-        with tempfile.TemporaryDirectory() as td:
-            ws = workspace(Path(td))
-            with self.assertRaisesRegex(ValueError, "case 2.*regex"):
-                bench.run_suite(ws, suite, 1, 0.01, 0.001, "validation")
-            self.assertEqual(list((ws / "tasks").iterdir()), [])
+        for expected in [{"regex": "["}, {"regex": ""}, {"contains": ""},
+                         {"contains": [""]}, {"contains": ["right", ""]}]:
+            with self.subTest(expect=expected), tempfile.TemporaryDirectory() as td:
+                suite = {"schema": 1, "name": "validation", "cases": [
+                    {"id": "first", "prompt": "p"},
+                    {"id": "second", "prompt": "p", "expect": expected}]}
+                ws = workspace(Path(td))
+                with self.assertRaisesRegex(ValueError, "case 2.*" + next(iter(expected))):
+                    bench.run_suite(ws, suite, 1, 0.01, 0.001, "validation")
+                self.assertEqual(list((ws / "tasks").iterdir()), [])
 
     def test_main_rejects_bad_grading_before_probe_or_dispatch(self):
-        for expected in [{"equal": "RIGHT"}, {"regex": "["}, {"max_chars": -1}]:
+        for expected in [{"equal": "RIGHT"}, {"regex": "["}, {"max_chars": -1},
+                         {"regex": ""}, {"contains": ""}, {"contains": [""]},
+                         {"contains": ["right", ""]}]:
             with self.subTest(expect=expected), tempfile.TemporaryDirectory() as td:
                 root = Path(td)
                 ws = workspace(root / "ws")
