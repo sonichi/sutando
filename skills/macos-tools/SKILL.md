@@ -57,13 +57,20 @@ only for an owner who asked for the local app, and an empty result from it is no
 python3 "$SKILL_DIR/scripts/calendar-reader.py" 7 --owner-asked          # next 7 days, JSON
 python3 "$SKILL_DIR/scripts/calendar-reader.py" 1 text --owner-asked     # today, plain text
 ```
-To add an event to the local Calendar (same consent; times are local `YYYY-MM-DD HH:MM`):
+To add an event to the local Calendar (times are local `YYYY-MM-DD HH:MM`):
 ```bash
 python3 "$SKILL_DIR/scripts/calendar-writer.py" add "Dentist" "2026-03-17 14:00" "2026-03-17 15:00" \
-    [--calendar Work] [--notes "Room 4"] --owner-asked
+    [--calendar Work] [--notes "Room 4"] [--key dentist-0317] --owner-asked
 ```
-It reads the event back by uid and prints `"created": true` (exit 0) only when the read-back matches;
-never tell the owner an event was added on any other outcome. Use it instead of raw `osascript`.
+- A write needs `--owner-asked` on that run, for an event the owner asked for in this conversation. The
+  host opt-in and `SUTANDO_ALLOW_NATIVE_PIM=1` allow reads only.
+- Inside a core session it also needs to know whose task is running: with no task binding, or one it
+  cannot read, it exits 2 ("consent could not be verified"). Tell the owner; do not work around it.
+- With several writable calendars and no `--calendar` it adds nothing and lists them: ask the owner.
+- It echoes the request, then reads the event back by uid; only exit 0 with JSON means it is there
+  (`created`, or `already_exists` for a repeat). Never tell the owner an event was added otherwise.
+- Retrying the same command is safe: the event carries a `[sutando-key:…]` line in its notes and is not
+  added twice. Use it instead of raw `osascript`.
 
 Both scripts exit 1 on an error. A timeout usually means a macOS prompt asking to let the app control
 Calendar is still waiting on the owner's screen: relay the message (click Allow, or System Settings →
