@@ -81,6 +81,31 @@ use `equals`, `contains`, `regex`, and `max_chars` assertions:
 }
 ```
 
+The suite must be an object with integer `schema: 1`, a nonempty string `name`,
+and a nonempty `cases` list. Each case is an object with a unique nonempty
+string `id` and a nonempty string `prompt`; whitespace-only values are rejected.
+Optional metadata fields remain available.
+
+`expect` may be omitted or `{}` to require a nonempty response. When supplied,
+it must be an object containing only these assertions; all specified checks
+must pass:
+
+| Assertion | Value | Check |
+| --- | --- | --- |
+| `equals` | String, including empty | Exact match after stripping response whitespace |
+| `contains` | String or nonempty list of strings | Every string occurs, ignoring case |
+| `regex` | Valid Python regex string | Search with ignore-case and multiline flags |
+| `max_chars` | Nonnegative integer, including zero | Stripped response length is at most this value |
+
+The controller validates every case before probing the runtime or submitting
+any task. Unknown assertion names, invalid values, malformed JSON and unreadable
+suite files exit 2 with a diagnostic; fix the indicated field and retry. Direct
+`run_suite` callers receive `ValueError` before task submission. Text assertions
+are no longer implicitly converted from numbers or other types, and
+`max_chars` no longer accepts strings, floats or booleans: use the types above.
+Valid grading and saved-run schemas are unchanged. Validation checks regex
+compilation, not execution time; suites remain trusted input.
+
 Case IDs remain unchanged in saved results and comparisons. Task filenames
 include the run ID, case position, a filename-safe case label, and repetition,
 so distinct IDs such as `a/b` and `a b` cannot share a task or consume each

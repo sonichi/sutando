@@ -122,6 +122,119 @@ class BenchTests(unittest.TestCase):
         self.assertTrue(bench.score_response("anything", {})[0])
         self.assertFalse(bench.score_response("", {})[0])
 
+    def test_load_suite_rejects_malformed_case_shapes(self):
+        valid = {"schema": 1, "name": "validation", "cases": [{"id": "one", "prompt": "p"}]}
+        invalid = [
+            ([], "suite"),
+            (dict(valid, schema=True), "schema"),
+            (dict(valid, name=42), "name"),
+            (dict(valid, name="  "), "name"),
+            (dict(valid, cases=None), "cases"),
+        ]
+        for field, value in [("id", []), ("id", 1), ("id", " "),
+                             ("prompt", []), ("prompt", False), ("prompt", "\n")]:
+            case = dict(valid["cases"][0], **{field: value})
+            invalid.append((dict(valid, cases=[case]), field))
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "suite.json"
+            for data, field in invalid:
+                with self.subTest(data=data):
+                    path.write_text(json.dumps(data))
+                    with self.assertRaisesRegex(ValueError, field):
+                        bench.load_suite(path)
+
+    def test_load_suite_rejects_malformed_assertions(self):
+        invalid = [
+            (None, "expect"), ([], "expect"), ("equals", "expect"),
+            ({"equal": "RIGHT"}, "equal"),
+            ({"equals": "RIGHT", "typo": "ignored"}, "typo"),
+            ({"equals": 1}, "equals"), ({"equals": None}, "equals"),
+            ({"contains": []}, "contains"), ({"contains": 1}, "contains"),
+            ({"contains": ["right", False]}, "contains"),
+            ({"regex": 1}, "regex"), ({"regex": "["}, "regex"),
+            ({"regex": "a{99999999999999999999}"}, "regex"),
+            ({"regex": "(" * 2000 + ")" * 2000}, "regex"),
+            ({"max_chars": -1}, "max_chars"), ({"max_chars": True}, "max_chars"),
+            ({"max_chars": 2.5}, "max_chars"), ({"max_chars": "20"}, "max_chars"),
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "suite.json"
+            for expected, field in invalid:
+                with self.subTest(expect=expected):
+                    path.write_text(json.dumps({"schema": 1, "name": "validation", "cases": [
+                        {"id": "one", "prompt": "p", "expect": expected}]}))
+                    with self.assertRaisesRegex(ValueError, "case 1.*" + field):
+                        bench.load_suite(path)
+
+    def test_valid_assertions_retain_grading_semantics(self):
+        expectations = [({}, True), ({"equals": ""}, False), ({"equals": "Paris"}, True),
+                        ({"contains": "PARIS"}, True), ({"contains": ["p", "ris"]}, True),
+                        ({"regex": "^paris$"}, True), ({"regex": ""}, True),
+                        ({"max_chars": 0}, False),
+                        ({"equals": "Paris", "contains": ["Par", "is"],
+                          "regex": "par.*", "max_chars": 5}, True)]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "suite.json"
+            for expected, passed in expectations:
+                with self.subTest(expect=expected):
+                    data = {"schema": 1, "name": "validation", "cases": [
+                        {"id": "one", "prompt": "p", "expect": expected}]}
+                    path.write_text(json.dumps(data))
+                    loaded = bench.load_suite(path)
+                    self.assertEqual(loaded, data)
+                    self.assertEqual(bench.score_response("Paris", loaded["cases"][0]["expect"])[0], passed)
+            self.assertEqual(bench.load_suite(bench.DEFAULT_SUITE)["name"], "smoke")
+
+    def test_run_suite_rejects_invalid_later_case_before_submission(self):
+        suite = {"schema": 1, "name": "validation", "cases": [
+            {"id": "first", "prompt": "p"},
+            {"id": "second", "prompt": "p", "expect": {"regex": "["}}]}
+        with tempfile.TemporaryDirectory() as td:
+            ws = workspace(Path(td))
+            with self.assertRaisesRegex(ValueError, "case 2.*regex"):
+                bench.run_suite(ws, suite, 1, 0.01, 0.001, "validation")
+            self.assertEqual(list((ws / "tasks").iterdir()), [])
+
+    def test_main_rejects_bad_grading_before_probe_or_dispatch(self):
+        for expected in [{"equal": "RIGHT"}, {"regex": "["}, {"max_chars": -1}]:
+            with self.subTest(expect=expected), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                ws = workspace(root / "ws")
+                suite = root / "suite.json"
+                suite.write_text(json.dumps({"schema": 1, "name": "validation", "cases": [
+                    {"id": "first", "prompt": "first"},
+                    {"id": "second", "prompt": "second", "expect": expected}]}))
+                stderr = io.StringIO()
+                with Responder(ws, {"first": "WRONG", "second": "WRONG"}), \
+                        mock.patch.object(bench, "probe_runtime", return_value=runtime_snapshot(ws)) as probe, \
+                        contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+                    rc = bench.main(["run", "--workspace", str(ws), "--suite", str(suite),
+                                     "--output", str(root / "output"), "--timeout", "0.1", "--poll", "0.001"])
+                self.assertEqual(rc, 2)
+                self.assertIn("case 2", stderr.getvalue())
+                self.assertIn("fix the suite", stderr.getvalue())
+                probe.assert_not_called()
+                self.assertEqual(list((ws / "tasks").iterdir()), [])
+                self.assertFalse((root / "output").exists())
+
+    def test_main_reports_unreadable_or_invalid_suite_as_input_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = workspace(root / "ws")
+            suite = root / "suite.json"
+            for body in [None, "{", "null"]:
+                with self.subTest(body=body):
+                    if body is not None:
+                        suite.write_text(body)
+                    stderr = io.StringIO()
+                    with mock.patch.object(bench, "probe_runtime") as probe, \
+                            contextlib.redirect_stderr(stderr):
+                        rc = bench.main(["run", "--workspace", str(ws), "--suite", str(suite)])
+                    self.assertEqual(rc, 2)
+                    self.assertIn("invalid suite", stderr.getvalue())
+                    self.assertIn("fix the suite", stderr.getvalue())
+                    probe.assert_not_called()
+
     def test_diagnostics_and_ids(self):
         with tempfile.TemporaryDirectory() as td:
             ws = workspace(Path(td))
