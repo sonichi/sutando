@@ -143,6 +143,32 @@ class ProactiveRouteCheckTest(unittest.TestCase):
         self.assertEqual(verdict["status"], "warn")
         self.assertIn("fallback grace window", verdict["detail"])
 
+    def test_gateway_fallback_sentence_is_conditioned_and_names_untagged(self) -> None:
+        """Pins the exact gateway-fallback sentence: it must stay conditioned
+        on an eligible gateway bridge being configured (not an unconditional
+        claim), and must say it claims a stopped bridge's UNTAGGED file —
+        `fallback_claims_name` excludes a `.to-<other channel>` tag, so it is
+        not every file."""
+        self._activity("discord", age_s=7200)
+        verdict = hc.check_proactive_route(
+            [{"name": "discord-bridge", "status": "ok", "detail": "running"}])
+        self.assertIn(
+            "where an eligible gateway bridge is configured, it claims a "
+            "stopped bridge's untagged file after its own grace window",
+            verdict["detail"])
+
+    def test_non_bridge_default_case_keeps_the_lone_bridge_exception_note(self) -> None:
+        """Pins the lone-bridge exception note in the non-bridge/default
+        case's detail string, so dropping it (collapsing to the
+        recorded-activity wording) fails this test."""
+        self._activity("voice")
+        verdict = hc.check_proactive_route(
+            [{"name": "discord-bridge", "status": "ok", "detail": "running"}])
+        self.assertIn(
+            "with no bridge-channel activity recorded, a lone configured "
+            "bridge still claims its own file regardless of this default",
+            verdict["detail"])
+
     def test_age_unknown_when_ts_is_missing(self) -> None:
         (self.ws / "state" / "last-owner-activity.json").write_text(
             json.dumps({"channel": "discord"}))  # no `ts` field at all

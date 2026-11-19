@@ -9272,7 +9272,8 @@ def check_proactive_route(checks: "list[dict] | None" = None) -> dict:
     bridge alone claims, exclusivity included. Only with no bridge-channel
     activity recorded does a lone configured bridge claim its own file
     regardless of this default; an eligible gateway bridge, where one is
-    configured, separately claims a stopped bridge's file after its own grace window.
+    configured, separately claims a stopped bridge's untagged file after its
+    own grace window.
     So a quiet outbox on another bridge usually just reads this default, not
     a stall, but this row names the default LAYER, never the one bridge
     that will certainly deliver it. ``warn`` only when the routed bridge's
@@ -9308,8 +9309,8 @@ def check_proactive_route(checks: "list[dict] | None" = None) -> dict:
                           "of this default")
     detail = (f"routed to {channel} ({why}, state/last-owner-activity.json "
               f"field '{route['field']}'){caveat}{exception_note}; where an eligible "
-              f"gateway bridge is configured, it claims a stopped bridge's file after "
-              f"its own grace window")
+              f"gateway bridge is configured, it claims a stopped bridge's untagged "
+              f"file after its own grace window")
     row_name = _PROACTIVE_BRIDGE_ROWS.get(channel)
     row = next((c for c in (checks or []) if c.get("name") == row_name), None)
     if row is None:
