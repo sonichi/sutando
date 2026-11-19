@@ -211,6 +211,14 @@ class TestCalendarReader(_Base, unittest.TestCase):
         self.assertIn("calendar-reader.py 1", error)
         self.assertNotIn("click Allow", error)
 
+    def test_timeout_then_a_denied_probe_is_a_denial_not_a_timeout(self):
+        code = self._timed_out(lambda cmd: _done(cmd, stderr=DENIED, rc=1))
+        self.assertEqual(code, self.mod.consent.EXIT_DENIED)
+        self.assertIn("not asking again", self.err.getvalue())
+        self.assertNotIn("click Allow", self.out.getvalue() + self.err.getvalue())
+        self.assertTrue((self.state / "calendar-automation-denied").exists(),
+                        "a denial seen by the probe is persisted like one seen by the read")
+
     def test_timeout_in_text_format_also_exits_nonzero(self):
         def responder(cmd):
             if cmd[0] == "osascript":

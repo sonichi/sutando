@@ -29,23 +29,29 @@ PROBE_TIMEOUT = 5
 PROBE = 'tell application "Calendar" to count of calendars'
 
 
-def _calendar_answers() -> bool:
+def _probe_calendar():
     """A trivial query after a timed-out read: tells a slow read from an app that is not answering."""
     try:
-        probe = subprocess.run(["osascript", "-e", PROBE], capture_output=True, text=True,
-                               timeout=PROBE_TIMEOUT)
+        return subprocess.run(["osascript", "-e", PROBE], capture_output=True, text=True,
+                              timeout=PROBE_TIMEOUT)
     except (subprocess.TimeoutExpired, OSError):
-        return False
-    return probe.returncode == 0
+        return None
 
 
-def _timeout_error(days: int) -> str:
+def _timeout_result(days: int) -> dict:
+    probe = _probe_calendar()
+    if probe is not None and probe.returncode != 0 and consent.is_denied(probe.stderr.strip()):
+        consent.record_denial("Calendar")
+        return {"error": consent.denial_message("Calendar"), "denied": True,
+                "events": [], "count": 0}
     shorter = (f"A shorter window is also faster: `calendar-reader.py 1` reads today only "
                f"(this run asked for {days} days).")
-    if _calendar_answers():
-        return (f"Calendar: the read of {days} days took longer than {READ_TIMEOUT}s, though "
-                f"Calendar itself answers. {shorter}")
-    return f"{consent.timeout_message('Calendar')} {shorter}"
+    if probe is not None and probe.returncode == 0:
+        error = (f"Calendar: the read of {days} days took longer than {READ_TIMEOUT}s, though "
+                 f"Calendar itself answers. {shorter}")
+    else:
+        error = f"{consent.timeout_message('Calendar')} {shorter}"
+    return {"error": error, "timed_out": True, "events": [], "count": 0}
 
 
 def read_events(days: int = 7) -> dict:
@@ -92,7 +98,7 @@ end tell
             capture_output=True, text=True, timeout=READ_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        return {"error": _timeout_error(days), "timed_out": True, "events": [], "count": 0}
+        return _timeout_result(days)
     except OSError as e:
         return {"error": f"Calendar: could not run osascript ({e})", "events": [], "count": 0}
 
