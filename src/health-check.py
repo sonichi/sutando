@@ -7184,51 +7184,70 @@ def check_gateway_bridge() -> "dict | None":
 OWNER_DM_STALE_MIN_AGE_S = 1800.0
 
 
-def check_owner_dm_routing_stale(min_age_sec: float = OWNER_DM_STALE_MIN_AGE_S) -> "dict | None":
-    """WARN when the owner's last recorded ag2.space activity names a room that still
-    differs from the one proactive messages route to, sustained past `min_age_sec`.
-
-    `refresh_routing()` (remote_gateway_bridge.py) treats the gateway's `owner_dm_room`
-    as authoritative by design (#3995) and never adopts a room from local observation —
-    reversing that caused the flapping #4284 fixed. This probe changes no routing; it only
-    surfaces a divergence nothing else self-heals (#5072): a stale `owner_dm_room` on the
-    gateway has no owner/agent Action to redesignate it, so proactive messages can be stuck
-    on an old DM indefinitely.
-
-    Heuristic, not proof: `last-owner-activity.json` records wherever the owner last spoke,
-    a shared room included, so a stray ping there can look identical to a moved DM. None
-    when no gateway connection is configured, or either file is absent.
-    """
+def check_owner_dm_routing_stale(min_age_sec: float = OWNER_DM_STALE_MIN_AGE_S,
+                                  now: "float | None" = None) -> "dict | None":
+    """WARN once the owner/gateway DM-room mismatch has itself persisted past
+    `min_age_sec` — not how recently the owner spoke, which refreshes every message."""
     name = "owner-dm-routing-stale"
     if not _gateway_configured():
         return None
     import owner_room_access  # noqa: PLC0415
     routing = owner_room_access.owner_routing(WORKSPACE_DIR)
     current_dm = owner_room_access.owner_dm(routing)
+    state_file = WORKSPACE_DIR / "state" / "owner-dm-routing-stale.json"
+
+    def _clear_divergence():
+        try:
+            state_file.unlink()
+        except OSError:
+            pass
+
     if not current_dm:
+        _clear_divergence()
         return {"name": name, "status": "ok", "detail": "no owner DM routing reading yet"}
     try:
         activity = json.loads(status_read_path("last-owner-activity.json", WORKSPACE_DIR)
                               .read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        _clear_divergence()
         return {"name": name, "status": "ok", "detail": "no owner activity recorded yet"}
     if not isinstance(activity, dict) or activity.get("channel") != "ag2space":
+        _clear_divergence()
         return {"name": name, "status": "ok", "detail": "owner's last recorded activity is not on ag2space"}
     last_room = str(activity.get("channel_id") or "").strip()
     if not last_room or last_room == current_dm:
+        _clear_divergence()
         return {"name": name, "status": "ok", "detail": "owner's last-active room matches proactive routing"}
-    ts = _gateway_num(activity.get("ts"), nonneg=True) or 0.0
-    age = max(0.0, time.time() - ts) if ts else 0.0
+
+    now = time.time() if now is None else now
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    first_seen = _gateway_num(state.get("first_seen"), nonneg=True)
+    # A new or changed pair starts its own clock; the same pair keeps the one already running.
+    if state.get("last_room") != last_room or state.get("current_dm") != current_dm or not first_seen:
+        first_seen = now
+        try:
+            state_file.parent.mkdir(parents=True, exist_ok=True)
+            state_file.write_text(json.dumps(
+                {"last_room": last_room, "current_dm": current_dm, "first_seen": first_seen}),
+                encoding="utf-8")
+        except OSError:
+            pass
+    age = max(0.0, now - first_seen)
     if age < min_age_sec:
         return {"name": name, "status": "ok",
-                "detail": f"owner active in {last_room} {int(age)}s ago, within the "
-                          f"{int(min_age_sec)}s settle window — not yet sustained"}
+                "detail": f"routing mismatch ({last_room} vs {current_dm}) is {int(age)}s old, within "
+                          f"the {int(min_age_sec)}s settle window — not yet sustained"}
     return {
         "name": name,
         "status": "warn",
-        "detail": (f"owner's last {_gateway_where()} message ({int(age // 60)}m ago) came from "
-                   f"{last_room}, but proactive messages still route to {current_dm} — the gateway's owner_dm_room "
-                   "may be stuck stale (#5072), and no agent/owner Action exists yet to redesignate "
+        "detail": (f"owner's last {_gateway_where()} messages (for {int(age // 60)}m) still come from "
+                   f"{last_room}, but proactive messages keep routing to {current_dm} — the gateway's "
+                   "owner_dm_room may be stuck stale, and no agent/owner Action exists yet to redesignate "
                    "it; this signal is heuristic, a shared-room message reads the same as a moved DM"),
     }
 

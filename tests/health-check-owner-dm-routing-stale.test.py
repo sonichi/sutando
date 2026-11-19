@@ -101,14 +101,54 @@ class TestOwnerDmRoutingStale(unittest.TestCase):
             self.assertIn("settle window", r["detail"])
 
     def test_sustained_divergence_warns_and_names_both_rooms(self):
+        """The divergence itself, not the activity file's single ts, drives the
+        clock: two passes straddling min_age_sec with the mismatch held constant."""
         with tempfile.TemporaryDirectory() as td:
             self._routing(td, "!old:x")
-            self._activity(td, "ag2space", "!new:x", age_s=3600)
-            r = self._run(td, min_age_sec=1800)
-            self.assertEqual(r["status"], "warn", r)
-            self.assertIn("!new:x", r["detail"])
-            self.assertIn("!old:x", r["detail"])
-            self.assertIn("#5072", r["detail"])
+            self._activity(td, "ag2space", "!new:x", age_s=0)
+            first = self._run(td, min_age_sec=1800, now=1_000_000.0)
+            self.assertEqual(first["status"], "ok", first)
+            later = self._run(td, min_age_sec=1800, now=1_000_000.0 + 1800)
+            self.assertEqual(later["status"], "warn", later)
+            # Assert roles, not mere presence: swapping the two room labels must fail this.
+            self.assertIn("from !new:x", later["detail"])
+            self.assertIn("routing to !old:x", later["detail"])
+            self.assertNotIn("from !old:x", later["detail"])
+            self.assertNotIn("routing to !new:x", later["detail"])
+
+    def test_repeated_new_room_messages_eventually_warn(self):
+        """Reviewer repro: the owner keeps actively messaging in the moved-to room,
+        refreshing last-owner-activity.json's ts on every message, while the gateway's
+        cached DM stays on the old room throughout. Age-of-last-message alone would
+        stay under the settle window forever; age-of-divergence must not."""
+        with tempfile.TemporaryDirectory() as td:
+            self._routing(td, "!old:x")
+            start = 2_000_000.0
+            last = None
+            # A message every 5 minutes for 2 hours — always "fresh" by ts, never
+            # by divergence age once the settle window (30 min) is crossed.
+            for minute in range(0, 121, 5):
+                t = start + minute * 60
+                self._activity(td, "ag2space", "!new:x", age_s=0, ts=t)
+                last = self._run(td, min_age_sec=1800, now=t)
+            self.assertEqual(last["status"], "warn", last)
+            self.assertIn("from !new:x", last["detail"])
+            self.assertIn("routing to !old:x", last["detail"])
+
+    def test_cleared_mismatch_resets_the_clock(self):
+        """Once the rooms match again, a later divergence (even to the same pair)
+        starts a fresh clock instead of inheriting the old first_seen."""
+        with tempfile.TemporaryDirectory() as td:
+            self._routing(td, "!old:x")
+            self._activity(td, "ag2space", "!new:x", age_s=0)
+            self._run(td, min_age_sec=1800, now=5_000_000.0)
+            self._activity(td, "ag2space", "!old:x", age_s=0)
+            cleared = self._run(td, min_age_sec=1800, now=5_000_000.0 + 10)
+            self.assertEqual(cleared["status"], "ok", cleared)
+            self._activity(td, "ag2space", "!new:x", age_s=0)
+            reobserved = self._run(td, min_age_sec=1800, now=5_000_000.0 + 20)
+            self.assertEqual(reobserved["status"], "ok", reobserved)
+            self.assertIn("settle window", reobserved["detail"])
 
     def test_missing_ts_does_not_crash_and_does_not_warn(self):
         """No parsable ts means age cannot be measured as sustained; treat as
