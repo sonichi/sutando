@@ -8,7 +8,8 @@ it raises a macOS permission prompt; without it the script refuses, exit 2):
   python3 calendar-reader.py 1 --owner-asked        # today only
   python3 calendar-reader.py 30 text --owner-asked  # next 30 days, plain text
 
-Output: JSON with events sorted by start time. A macOS denial (-1743) exits 3.
+Output: JSON with events sorted by start time. A macOS denial (-1743) exits 3;
+any other error (a timeout included) exits 1 with the cause in ``error``.
 """
 
 import sys
@@ -23,9 +24,36 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import native_pim_consent as consent  # noqa: E402
 
 
+READ_TIMEOUT = 30
+PROBE_TIMEOUT = 5
+PROBE = 'tell application "Calendar" to count of calendars'
+
+
+def _calendar_answers() -> bool:
+    """A trivial query after a timed-out read: tells a slow read from an app that is not answering."""
+    try:
+        probe = subprocess.run(["osascript", "-e", PROBE], capture_output=True, text=True,
+                               timeout=PROBE_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return probe.returncode == 0
+
+
+def _timeout_error(days: int) -> str:
+    shorter = (f"A shorter window is also faster: `calendar-reader.py 1` reads today only "
+               f"(this run asked for {days} days).")
+    if _calendar_answers():
+        return (f"Calendar: the read of {days} days took longer than {READ_TIMEOUT}s, though "
+                f"Calendar itself answers. {shorter}")
+    return f"{consent.timeout_message('Calendar')} {shorter}"
+
+
 def read_events(days: int = 7) -> dict:
-    # Ensure Calendar.app is running (AppleScript fails with -600 if not)
-    subprocess.run(["open", "-ga", "Calendar"], capture_output=True, timeout=5)
+    # Calendar must be running (-600 otherwise); a failed launch surfaces in the read below.
+    try:
+        subprocess.run(["open", "-ga", "Calendar"], capture_output=True, timeout=5)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
     time.sleep(1)
     script = f"""
 tell application "Calendar"
@@ -61,10 +89,12 @@ end tell
     try:
         result = subprocess.run(
             ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=READ_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        return {"error": "Calendar read timed out", "events": [], "count": 0}
+        return {"error": _timeout_error(days), "timed_out": True, "events": [], "count": 0}
+    except OSError as e:
+        return {"error": f"Calendar: could not run osascript ({e})", "events": [], "count": 0}
 
     if result.returncode != 0:
         err = result.stderr.strip()
@@ -140,6 +170,8 @@ def main(argv=None) -> None:
         print(format_for_humans(data))
     else:
         print(json.dumps(data, indent=2))
+    if data.get("error"):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -34,7 +34,7 @@ those, and `status` is how you read the state.
 ## When to Use
 
 - **Screen**: "What's on my screen?", "help me with this", "describe what I'm looking at"
-- **Calendar**: "What's on my schedule?", "do I have meetings today?"
+- **Calendar**: "What's on my schedule?", "do I have meetings today?", "add it to my Mac calendar"
 - **Reminders**: "Add a reminder", "what's on my todo list?", "mark X as done"
 - **Contacts**: "What's Bob's email?", "find contact for..."
 - **Email**: "Send an email to...", "draft a message to..."
@@ -57,6 +57,17 @@ only for an owner who asked for the local app, and an empty result from it is no
 python3 "$SKILL_DIR/scripts/calendar-reader.py" 7 --owner-asked          # next 7 days, JSON
 python3 "$SKILL_DIR/scripts/calendar-reader.py" 1 text --owner-asked     # today, plain text
 ```
+To add an event to the local Calendar (same consent; times are local `YYYY-MM-DD HH:MM`):
+```bash
+python3 "$SKILL_DIR/scripts/calendar-writer.py" add "Dentist" "2026-03-17 14:00" "2026-03-17 15:00" \
+    [--calendar Work] [--notes "Room 4"] --owner-asked
+```
+It reads the event back by uid and prints `"created": true` (exit 0) only when the read-back matches;
+never tell the owner an event was added on any other outcome. Use it instead of raw `osascript`.
+
+Both scripts exit 1 on an error. A timeout usually means a macOS prompt asking to let the app control
+Calendar is still waiting on the owner's screen: relay the message (click Allow, or System Settings →
+Privacy & Security → Automation) and stop until they answer; do not loop on retries.
 
 ### Reminders
 ```bash

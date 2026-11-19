@@ -175,8 +175,60 @@ class TestCalendarReader(_Base, unittest.TestCase):
             code = self._run(["calendar-reader.py", "--owner-asked"],
                              lambda cmd: _done(cmd, stderr="execution error: boom (-600)", rc=1)
                              if cmd[0] == "osascript" else _done(cmd))
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 1, "an error result is a failed run")
         self.assertIn('"error": "execution error: boom (-600)"', self.out.getvalue())
+
+    def _timed_out(self, probe):
+        """The read sleeps past its timeout; ``probe`` answers the follow-up `count of calendars`."""
+        def responder(cmd):
+            if cmd[0] != "osascript":
+                return _done(cmd)
+            if cmd[2] == self.mod.PROBE:
+                return probe(cmd)
+            raise subprocess.TimeoutExpired(cmd, self.mod.READ_TIMEOUT)
+        with _no_consent_env():
+            return self._run(["calendar-reader.py", "7", "--owner-asked"], responder)
+
+    def _hang(self, cmd):
+        raise subprocess.TimeoutExpired(cmd, self.mod.PROBE_TIMEOUT)
+
+    def test_timeout_with_no_answer_names_the_pending_prompt_and_exits_nonzero(self):
+        code = self._timed_out(self._hang)
+        self.assertEqual(code, 1)
+        data = json.loads(self.out.getvalue())
+        self.assertTrue(data["timed_out"])
+        self.assertIn("click Allow", data["error"])
+        self.assertIn("Privacy & Security → Automation", data["error"])
+        self.assertIn("calendar-reader.py 1", data["error"])
+        self.assertFalse((self.state / "calendar-automation-denied").exists(),
+                         "a timeout is not a denial: the next run may ask again")
+
+    def test_timeout_while_calendar_answers_is_a_slow_read_not_a_prompt(self):
+        code = self._timed_out(lambda cmd: _done(cmd, stdout="4\n"))
+        self.assertEqual(code, 1)
+        error = json.loads(self.out.getvalue())["error"]
+        self.assertIn("took longer than 30s", error)
+        self.assertIn("calendar-reader.py 1", error)
+        self.assertNotIn("click Allow", error)
+
+    def test_timeout_in_text_format_also_exits_nonzero(self):
+        def responder(cmd):
+            if cmd[0] == "osascript":
+                raise subprocess.TimeoutExpired(cmd, 30)
+            return _done(cmd)
+        with _no_consent_env():
+            code = self._run(self.argv_ok, responder)
+        self.assertEqual(code, 1)
+        self.assertIn("click Allow", self.out.getvalue())
+
+    def test_a_hung_or_missing_open_does_not_raise(self):
+        for exc in (subprocess.TimeoutExpired(["open"], 5), FileNotFoundError("open")):
+            def responder(cmd, exc=exc):
+                if cmd[0] == "open":
+                    raise exc
+                return _done(cmd, stdout=self.ok_stdout)
+            with _no_consent_env():
+                self.assertEqual(self._run(self.argv_ok, responder), 0, exc)
 
 
 class TestReminders(_Base, unittest.TestCase):
