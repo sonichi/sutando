@@ -174,10 +174,8 @@ class RenderTest(unittest.TestCase):
         self.assertIn("finale.hidden = n !== ids.length", gs.tour_page.SCRIPT)
         self.assertIn(html.escape(gs.tour_page.FINALE_PROMPT), page)
 
-    def test_named_navigation_and_touch_targets(self):
+    def test_touch_target_css_data_pins(self):
         page = gs.render_page("Example")
-        self.assertIn("title.textContent = titles[i]", page)
-        self.assertIn("b.append(number, title)", page)
         self.assertIn("button { min-height:44px", page)
         self.assertIn("grid-template-columns:repeat(2,minmax(0,1fr))", page)
 
@@ -456,6 +454,7 @@ const mark = (i) => { const b = d.querySelectorAll('input[data-done]')[i]; b.che
     out.focused = d.activeElement && d.activeElement.id;
   }
   if (scenario === 'showall') {
+    out.navLabels = Array.from(d.querySelectorAll('.dot'), b => b.textContent);
     const all = d.getElementById('all');
     out.labelBefore = all.textContent;
     all.click();
@@ -548,6 +547,9 @@ class PageBehaviourTest(unittest.TestCase):
 
     def test_show_all_keeps_one_label_and_dots_scroll_and_focus(self):
         out = self.run_page("showall")
+        self.assertEqual(len(out["navLabels"]), len(gs.sections_for("claude")))
+        for label, section in zip(out["navLabels"], gs.sections_for("claude")):
+            self.assertIn(html.unescape(section.title), label)
         self.assertEqual((out["labelBefore"], out["labelAfter"], out["pressed"]), ("Show all", "Show all", "true"))
         self.assertEqual(out["mode"], "all")
         self.assertEqual(out["scrolled"], ["s-teamwork", "smooth"])
