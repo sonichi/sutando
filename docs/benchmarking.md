@@ -104,7 +104,11 @@ suite files exit 2 with a diagnostic; fix the indicated field and retry. Direct
 are no longer implicitly converted from numbers or other types, and
 `max_chars` no longer accepts strings, floats or booleans: use the types above.
 Empty `contains` strings/list items and empty `regex` patterns are rejected;
-use `equals: ""` or `regex: "^$"` when an empty response is the intended answer.
+use `equals: ""` or `max_chars: 0` when an empty or whitespace-only response is
+the intended answer. To require zero characters, use `regex: "\\A\\Z"` in JSON.
+Regexes search the untrimmed response with multiline matching, so `^$` also
+matches an empty line in a nonempty response, such as `"WRONG\n"` or
+`"WRONG\n\nMORE"`; it does not require an empty response.
 Valid grading and saved-run schemas are unchanged. Validation checks regex
 compilation, not execution time: backtracking on an agent response can stall
 scoring, so suites remain trusted input. Permissive patterns such as `.*` are

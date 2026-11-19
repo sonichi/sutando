@@ -190,12 +190,26 @@ class BenchTests(unittest.TestCase):
             self.assertEqual(bench.load_suite(bench.DEFAULT_SUITE)["name"], "smoke")
 
     def test_explicit_empty_response_expectations_remain_valid(self):
-        for expected in [{"equals": ""}, {"regex": "^$"}, {"max_chars": 0}]:
+        for expected in [{"equals": ""}, {"regex": r"\A\Z"}, {"max_chars": 0}]:
             with self.subTest(expect=expected):
                 bench.validate_suite({"schema": 1, "name": "empty response", "cases": [
                     {"id": "one", "prompt": "p", "expect": expected}]})
                 self.assertTrue(bench.score_response("", expected)[0])
-                self.assertFalse(bench.score_response("WRONG", expected)[0])
+                for response in ["WRONG", "WRONG\n", "WRONG\n\nMORE", "\nWRONG", "WRONG\r\n"]:
+                    with self.subTest(response=response):
+                        self.assertFalse(bench.score_response(response, expected)[0])
+
+    def test_empty_response_checks_preserve_whitespace_semantics(self):
+        for response in [" ", "\t", "\n", "\r\n", "\n\n", " \n\t"]:
+            for expected, passed in [({"equals": ""}, True), ({"max_chars": 0}, True),
+                                     ({"regex": r"\A\Z"}, False)]:
+                with self.subTest(response=response, expect=expected):
+                    self.assertEqual(bench.score_response(response, expected)[0], passed)
+
+    def test_regex_line_anchors_keep_multiline_semantics(self):
+        for response in ["WRONG\n", "WRONG\n\nMORE", "\nWRONG"]:
+            with self.subTest(response=response):
+                self.assertTrue(bench.score_response(response, {"regex": "^$"})[0])
 
     def test_run_suite_rejects_invalid_later_case_before_submission(self):
         for expected in [{"regex": "["}, {"regex": ""}, {"contains": ""},
