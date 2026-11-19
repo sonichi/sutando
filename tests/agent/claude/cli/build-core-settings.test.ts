@@ -290,4 +290,23 @@ describe('build-core-settings.mjs', () => {
 		const matchers = o.hooks.PreToolUse.map((b: any) => b.matcher);
 		assert.deepEqual(matchers, ['AskUserQuestion', 'mcp__.*[Gg][Mm][Aa][Ii][Ll].*']);
 	});
+
+	it('registers the pending-tasks Stop hook when its path is supplied', () => {
+		const hook = "/x y/src/check-pending-tasks.sh";
+		const o = JSON.parse(
+			execFileSync('node', [CORE_BUILDER, GUARD, '', '', '', '', '', '', '', hook], { encoding: 'utf8' }),
+		);
+		assert.equal(o.hooks.Stop.length, 1);
+		assert.equal(o.hooks.Stop[0].hooks.length, 1);
+		assert.match(o.hooks.Stop[0].hooks[0].command as string, /^bash '/);
+		assert.equal(shellParsedPath(o.hooks.Stop[0].hooks[0].command), hook);
+		assert.equal(o.hooks.PreToolUse[0].matcher, 'AskUserQuestion');
+	});
+
+	it('omitting the pending-tasks Stop hook path registers no Stop hook', () => {
+		const o = JSON.parse(
+			execFileSync('node', [CORE_BUILDER, GUARD, '', '', '', '', '', '', '', ''], { encoding: 'utf8' }),
+		);
+		assert.equal(o.hooks.Stop, undefined);
+	});
 });

@@ -64,6 +64,10 @@ for rule, warn in [
     got = cp.check(warn)
     check(f"warning-{rule}", got["ok"] and rule in rules(got, "warnings"))
 
+for call in ("artifact.room.post({text: 'hi'})", "artifact.agent.sendTask({agentId: a, text: 'hi', key: 'k1'})"):
+    page = GOOD.replace("Sign me up</button>", "Send to everyone</button>").replace(
+        "await art.ready;", f"await art.ready; await {call};")
+    check(f"send-button-with-real-send-{call.split('(')[0]}", "no-fake-send" not in rules(cp.check(page), "warnings"))
 check("own-confirm-function-allowed", cp.check(GOOD.replace("await art.ready;", "await art.ready; function confirm(x) {}"))["ok"])
 check("commented-fetch-ignored", cp.check(GOOD.replace("await art.ready;", "await art.ready; /* fetch(x) */"))["ok"])
 check("db-only-page-needs-no-ready",

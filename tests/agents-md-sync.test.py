@@ -52,7 +52,15 @@ check(
     and "refresh-skill.sh` does not update Codex" in AGENTS,
 )
 
-DELEGATION_DOC = (REPO / "docs" / "subagent-delegation.md").read_text()
+check(
+    "the watcher paragraph diverges: Claude leads with the task-watch Mod, Codex keeps the Monitor text",
+    "Otherwise use the `Monitor` tool" in CLAUDE
+    and "Otherwise use the `Monitor` tool" not in AGENTS
+    and "codex-variant" not in AGENTS
+    and (REPO / "scripts" / "agents-md" / "watcher.md").read_text() in AGENTS,
+)
+
+DELEGATION_DOC =(REPO / "docs" / "subagent-delegation.md").read_text()
 check(
     "delegation doc names each runtime's mechanism",
     "run_in_background: true" in DELEGATION_DOC and "`spawn_agent`" in DELEGATION_DOC,

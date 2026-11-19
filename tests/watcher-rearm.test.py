@@ -92,8 +92,23 @@ try:
     with redirect_stdout(out):
         rc = wr.main(["session-start", "--repo", "/R", "--workspace", "/W"])
     os.environ.pop("SUTANDO_TASK_WATCH_MOD", None)
-    check("a Mod-marked session with an unwatched inbox is still asked for a Monitor",
-          rc == 0 and "Re-arm it NOW" in out.getvalue(), out.getvalue())
+    text = json.loads(out.getvalue() or "{}").get("hookSpecificOutput", {}).get("additionalContext", "")
+    check("a Mod-marked session with an unwatched inbox is told the Mod restarts it, and a Monitor only on mod-ready no",
+          rc == 0 and "Re-arm it NOW" in text
+          and 'the task-watch Mod restarts the watcher on its own, so run python3 "/R/src/watcher_rearm.py" mod-ready --repo "/R" --workspace "/W" and only if it prints no, start one via the Monitor tool, command: bash "/R/src/watch-tasks-stream.sh"' in text
+          and "does not survive a resume" not in text, text)
+    check("without the Mod the hint says nothing of it", "task-watch Mod" not in wr.session_start_context("/R", "/W", None, env={})["hookSpecificOutput"]["additionalContext"])
+    check("mod_note is empty without the marker", wr.mod_note("/R", "/W", env={}) == "" and wr.mod_note("/R", "/W", env={"SUTANDO_TASK_WATCH_MOD": "0"}) == "")
+    out = io.StringIO()
+    os.environ["SUTANDO_TASK_WATCH_MOD"] = "1"
+    with redirect_stdout(out):
+        rc = wr.main(["mod-note", "--repo", "/R", "--workspace", "/W"])
+    os.environ.pop("SUTANDO_TASK_WATCH_MOD", None)
+    check("main mod-note prints the Mod lead-in", rc == 0 and out.getvalue() == wr.mod_note("/R", "/W", env={"SUTANDO_TASK_WATCH_MOD": "1"}), out.getvalue())
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = wr.main(["mod-note", "--repo", "/R", "--workspace", "/W"])
+    check("main mod-note prints nothing without the Mod", rc == 0 and out.getvalue() == "", out.getvalue())
 
     # mod-ready: yes only on the marker AND a ready session watcher; a refused or absent Mod is no.
     naps = []

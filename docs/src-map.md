@@ -38,7 +38,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`auth_preflight.py`** — auth_preflight.py — probe whether a CLAUDE_CONFIG_DIR can boot the claude CLI authenticated (OK vs LOGIN_REQUIRED + exact remedy), before a restart terminates the session that could still fix it.
 - **`body_file.py`** — Bounded read of a CLI `--body-file` argument — the single owner of that policy.
 - **`bounded-wait.sh`** — Shared bounded child run.
-- **`bounded_file_read.py`** — Read a small regular file's text without ever blocking: the one reader for credential files.
+- **`bounded_file_read.py`** — Read a small regular file without ever blocking: the one reader for credential files and attachments.
 - **`bridge_engine.py`** — Whether each running channel bridge runs from this core's engine checkout.
 - **`browser-tools.ts`** — Browser & screen tools — Chrome tab control, scrolling, screenshots, and vision descriptions.
 - **`browser.mjs`** — Sutando browser automation — lightweight Playwright wrapper.
@@ -51,6 +51,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`channel_env_resolve.py`** — Pick the channel env file a caller should source for `channels/<source>`.
 - **`channel_token.py`** — Shared token-resolution policy for the channel bridges.
 - **`chat-ui.ts`** — Sutando Chat UI — clean full-page chat experience.
+- **`chat_bridges.py`** — The chat-app bridges (Telegram, Discord, Slack): which are skipped on this host, set up, and running.
 - **`chat_redaction.py`** — The chat-body redaction CHAIN, owned in one place.
 - **`chat_secret_filter.py`** — Fail-closed secret redaction for persisted inbound chat content.
 - **`check-pending-questions.py`** — Thin entry for the pending-questions reminder: hands argv to the `remind` of the adapter an installed skill declares (`--store-adapter <path>` overrides), resolved here across the installed roots (src/skill_roots.py) and injected into src/pending_questions_reader.py.
@@ -216,6 +217,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`result_publish.py`** — One publisher for every `results/` body: staged beside the target, fsynced, renamed whole.
 - **`result_ready.py`** — Alias of `delivery.readiness` (phase-1a restructure); one transition window.
 - **`result_router.py`** — Alias of `delivery.router` (phase-1a restructure); one transition window.
+- **`roster_membership.py`** — Which workers a pool roster counts as members: each key of its `workers` mapping whose row is not `state: "retired"` (a row that is not a mapping is a member).
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
 - **`runtime_observation.py`** — Runtime observations: one leased record per seat, written by whatever observes that seat's CLI.
 - **`safe_number.py`** — One reader for a number from untrusted JSON (a ledger, a record, a payload).
@@ -223,6 +225,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`schedule-crons-session-hint.sh`** — SessionStart hook — reminds the core agent to run /startup at the start of every session (including post-compaction restarts).
 - **`screen-capture-server.py`** — Screen capture HTTP server — runs in a terminal (has Screen Recording permission on macOS; needs no special setup on Windows).
 - **`scroll-wheel.swift`** — scroll-wheel.swift — Send OS-level scroll wheel events to Chrome
+- **`seat_inbox.py`** — Which seat an inbox belongs to, judged from the inbox itself and the workspace's records.
 - **`secret_compare.py`** — Constant-time equality for a presented credential string against an expected one.
 - **`secret_scanner.py`** — Library-based secret detection for inbound bridge messages.
 - **`self_opened_gate.py`** — Attribution for a terminal dialog Sutando opened itself, and the one rule that may dismiss it.
@@ -251,6 +254,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`slack_result_delivery.py`** — Slack reply-leg delivery state, bound to the shared outbox (Slack strangler).
 - **`sparrow-claude-local.py`** — Sutando's entry for `ag2-sparrow-claude-local`: the package CLI with the workspace injected.
 - **`sparrow_agent_bridge.py`** — One agent's gateway bridge under sparrowd, from the declaration its claude-local or codex-local install wrote.
+- **`sparrow_core_bridge.py`** — The host's core gateway bridge as sparrowd runs it (`src/sparrowd.py --core`).
 - **`sparrowd.py`** — sparrowd launcher — the adapter edge that names concrete workers.
 - **`startup-runtime.sh`** — Runtime/credential decisions shared by startup and behavior-level tests.
 - **`startup.sh`** — Sutando startup — starts available services + the selected core CLI.
@@ -275,6 +279,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`task_envelope.ts`** — task_envelope.ts — TypeScript mirror of src/task_envelope.py's stamping half, for the TS task writers (voice delegation seam, context-drop, wearable).
 - **`task_envelope_census.py`** — Soak census for HMAC task envelopes: the read-only measurement behind the "writer census reaches zero" gate.
 - **`task_lifecycle.py`** — Task execution lifecycle for an adapter that serves one work dir and calls a provider per task.
+- **`task_lookup.py`** — Find a task's file or result by id wherever it lives: its current home first (`connections.task_home`), then only the ARCHIVES of the folders its worker used before switching between own and shared ones (`connections.task_other_home`).
 - **`task_priority.py`** — Task priority taxonomy + readers.
 - **`task_queue.py`** — The pending task queue, in one place: which task files are waiting, in the order the core will take them, and where a given task stands in that order.
 - **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
@@ -333,6 +338,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`wedge_probes.py`** — Watcher and standby wedge signatures for the shared wedge detector: pure probes that publish nothing.
 - **`work-request-check.ts`** — The relay agent's text-model decisions.
 - **`worker_auth_state.py`** — Is a Claude CLI pane still signed out?
+- **`worker_lane.py`** — A pool worker's own agent served by a gateway bridge: the wiring every bridge entry point installs.
 - **`workspace_default.py`** — Canonical workspace-directory resolution for Sutando services.
 - **`workspace_default.ts`** — Canonical workspace-directory resolution for Sutando TS services.
 - **`workspace_layout.py`** — Spawn-time guard for the `<repo>/workspace` wiring: heals recoverable breaks to the durable symlink; a real directory HOLDING data is never touched.
@@ -370,6 +376,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 ## `src/agent/claude/cli/`
 
 - **`build-core-settings.mjs`** — Build the Claude Code `--settings` JSON for the Sutando core session.
+- **`project-has-stop-hook.mjs`** — Exit 0 when a settings file's hooks.Stop runs `bash <script>` for the same file as <script>, else 1.
 - **`session-launch.sh`** — src/agent/claude/cli/session-launch.sh — shared claude-CLI session launch mechanics, sourced by the core's own launcher and by a pool worker's own launcher (a separate script, outside core/src/).
 - **`start-cli.sh`** — src/agent/claude/cli/start-cli.sh — canonical launch script for the sutando-core tmux session.
 - **`sutando-shell-setup.sh`** — sutando-shell-setup — configure the `claude-sutando` shell alias.
@@ -440,6 +447,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`channel-bridge-wrapper.sh`** — launchd entry point shared by Slack, Discord, and Telegram bridges.
 - **`credential-proxy-wrapper.sh`** — Wrapper for launchd-managed credential-proxy.
 - **`evict-own-bridge.sh`** — Evict a pre-existing BARE channel bridge that belongs to THIS checkout, before the launchd wrapper starts its own supervised child.
+- **`gateway-bridge-lib.sh`** — The legacy gateway bridge's launch policy, one copy for both launchers: sourced by the launchd wrapper, run as `gateway-bridge-lib.sh env|alert|core-gate` by its other callers.
 - **`gateway-bridge-wrapper.sh`** — Wrapper for the launchd-managed gateway bridge (src/remote-gateway-bridge.py).
 
 ## `src/observability/`

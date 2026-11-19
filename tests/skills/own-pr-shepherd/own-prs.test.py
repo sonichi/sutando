@@ -230,9 +230,9 @@ class Record(unittest.TestCase):
     def test_the_mark_is_the_last_non_merge_commit_except_for_base_classes(self):
         p = merged_base()
         self.assertEqual(op.content_commit(p)["oid"], "c1")
-        for cls in ("needs_reviewer", "changes_addressed", "approved", "ci_red"):
+        for cls in ("needs_reviewer", "changes_addressed", "approved"):
             self.assertEqual(op.acted_sha(p, cls), "c1", cls)
-        for cls in ("conflicting", "behind"):
+        for cls in ("conflicting", "behind", "ci_red"):
             self.assertEqual(op.acted_sha(p, cls), HEAD, "the base moving again needs another merge")
         only_merges = pr(recent=[commit(HEAD, merge=True)])
         self.assertEqual(op.content_commit(only_merges)["oid"], HEAD, "falls back to the head")
@@ -476,6 +476,17 @@ class ListCli(unittest.TestCase):
         op.record(self.state, "o/r#1", "behind", HEAD)
         _rc, out = self.run_list(self.search([merged_base(1, requests=1, mss="BEHIND")]))
         self.assertIn("acted=yes", out)
+
+    def test_ci_red_after_a_base_merge_is_due_again(self):
+        red = {"__typename": "CheckRun", "name": "lint", "conclusion": "FAILURE"}
+        # The failure was triaged on the owner's commit c1; a base merge then brings in a new one.
+        op.record(self.state, "o/r#1", "ci_red", "c1")
+        _rc, out = self.run_list(self.search([merged_base(1, requests=1, rollup="FAILURE", contexts=[red])]))
+        self.assertIn("class=ci_red next=triage-ci acted=no", out, "a base merge can bring a new failure")
+        self.assertIn("due=1", out.splitlines()[-1])
+        op.record(self.state, "o/r#1", "ci_red", HEAD)
+        _rc, out = self.run_list(self.search([merged_base(1, requests=1, rollup="FAILURE", contexts=[red])]))
+        self.assertIn("acted=yes", out, "triaged once per head")
 
     def test_the_shared_ledger_marks_an_ask_as_acted(self):
         ledger = Path(self.tmp.name) / "review-asks.jsonl"
