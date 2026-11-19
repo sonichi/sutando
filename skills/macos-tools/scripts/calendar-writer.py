@@ -50,7 +50,7 @@ on stamp(dt)
 end stamp
 """
 
-# Every value arrives as argv: nothing the caller supplies is part of the script text.
+# Every value arrives as argv, and the event is made in one step: no later step can half-fail.
 ADD_SCRIPT = """
 on run argv
     set theTitle to item 1 of argv
@@ -64,9 +64,16 @@ on run argv
         else
             set targetCal to first calendar whose name is calName
         end if
-        set newEvent to make new event at end of events of targetCal with properties {summary:theTitle, start date:startDate, end date:endDate}
-        if theNotes is not "" then set description of newEvent to theNotes
-        return (uid of newEvent) & "|||" & (name of targetCal)
+        if theNotes is "" then
+            set newEvent to make new event at end of events of targetCal with properties {summary:theTitle, start date:startDate, end date:endDate}
+        else
+            set newEvent to make new event at end of events of targetCal with properties {summary:theTitle, start date:startDate, end date:endDate, description:theNotes}
+        end if
+        try
+            return (uid of newEvent) & "|||" & (name of targetCal)
+        on error errMsg
+            return "|||" & errMsg
+        end try
     end tell
 end run
 """ + HANDLERS
@@ -93,6 +100,10 @@ class WriteError(Exception):
     pass
 
 
+class WriteTimeout(WriteError):
+    pass
+
+
 def parse_when(text: str) -> datetime:
     for fmt in DATE_FORMATS:
         try:
@@ -110,15 +121,23 @@ def stamp(dt: datetime) -> str:
     return "-".join(date_args(dt))
 
 
+def may_exist(uid: str = "", calendar: str = "") -> str:
+    """The retry warning for any failure at or after the create step."""
+    where = f" (uid {uid}, calendar {calendar!r})" if uid else ""
+    return f" The event may have been created{where}: check Calendar before retrying."
+
+
 def run_script(script: str, args: list[str], unconfirmed: str = "") -> str:
     """Run one AppleScript with argv; stdout without its newline, WriteError on any failure."""
     try:
         result = subprocess.run(["osascript", "-e", script, *args],
                                 capture_output=True, text=True, timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
-        raise WriteError(f"{consent.timeout_message(APP)}{unconfirmed}")
+        raise WriteTimeout(consent.timeout_message(APP))
     except OSError as e:
         raise WriteError(f"could not run osascript ({e})")
+    if unconfirmed and consent.is_denied(result.stderr):
+        print(f"Error:{unconfirmed}", file=sys.stderr)
     consent.exit_if_denied(APP, result.stderr)
     if result.returncode != 0:
         raise WriteError(result.stderr.strip() or "AppleScript error")
@@ -133,29 +152,31 @@ def add_event(title: str, start: datetime, end: datetime, calendar: str = "", no
         pass
     time.sleep(1)
 
-    created = run_script(
-        ADD_SCRIPT, [title, *date_args(start), *date_args(end), calendar, notes],
-        unconfirmed=" The event was not confirmed: check the calendar before adding it again.")
-    uid, sep, cal_name = created.partition(SEP)
-    if not sep or not uid.strip():
-        raise WriteError(f"Calendar did not return an event id (got {created!r}); the event is not confirmed")
-    uid = uid.strip()
-
-    unverified = (f" The event was created (uid {uid}, calendar {cal_name!r}) but could not be "
-                  f"read back: check it in Calendar before adding it again.")
+    args = [title, *date_args(start), *date_args(end), calendar, notes]
     try:
-        read = run_script(READ_BACK_SCRIPT, [uid, cal_name])
+        created = run_script(ADD_SCRIPT, args)
+    except WriteTimeout as e:
+        # A timeout leaves the create step undecided; an AppleScript error means nothing was made.
+        raise WriteError(f"{e}{may_exist()}")
+    uid, _, cal_name = created.partition(SEP)
+    uid = uid.strip()
+    if not uid:
+        raise WriteError(f"Calendar did not return an event id (got {created!r}).{may_exist()}")
+
+    unverified = may_exist(uid, cal_name)
+    try:
+        read = run_script(READ_BACK_SCRIPT, [uid, cal_name], unconfirmed=unverified)
     except WriteError as e:
-        raise WriteError(f"{e}{unverified}")
+        raise WriteError(f"read-back failed: {e}{unverified}")
     parts = read.split(SEP, 2)
     if len(parts) < 3:
         raise WriteError(f"the new event was not found on read-back.{unverified}")
     got_start, got_end, got_title = parts
     if (got_start, got_end, got_title.strip()) != (stamp(start), stamp(end), title.strip()):
         raise WriteError(
-            f"read-back does not match the request (uid {uid}, calendar {cal_name!r}): asked "
-            f"{title!r} {stamp(start)} to {stamp(end)}, Calendar has {got_title!r} {got_start} "
-            f"to {got_end}. Check the event in Calendar.")
+            f"read-back does not match the request: asked {title!r} {stamp(start)} to "
+            f"{stamp(end)}, Calendar has {got_title!r} {got_start} to {got_end}. The event exists "
+            f"(uid {uid}, calendar {cal_name!r}): check Calendar before retrying.")
     return {"created": True, "uid": uid, "calendar": cal_name, "title": title,
             "start": start.isoformat(timespec="minutes"), "end": end.isoformat(timespec="minutes")}
 

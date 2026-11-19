@@ -14,7 +14,8 @@ Every other reader delegates here: the macos-tools scripts import it, the
 Bash hook (``hooks/native-pim-guard.py``) imports it for the marker names, the
 host opt-in and the bound task's tier, the morning briefing imports it, and the
 voice ``call_contact`` tool runs the ``check`` / ``report-error`` subcommands
-(JSON on stdout). Inside an agent session (``CLAUDECODE=1``) the consent counts
+(JSON on stdout). Inside an agent session, Claude or Codex core (``SUTANDO_CORE_SESSION=1``
+from either launcher, or ``CLAUDECODE=1``), the consent counts
 only on the owner's own task: when ``state/bindings/active-execution.json`` names
 the running task and its file resolves to a non-owner tier, every form of consent
 is refused. A cron or a terminal run has no bound task.
@@ -32,6 +33,7 @@ from pathlib import Path
 
 FLAG = "--owner-asked"
 ENV = "SUTANDO_ALLOW_NATIVE_PIM"
+SESSION_ENVS = ("SUTANDO_CORE_SESSION", "CLAUDECODE")
 EXIT_NO_CONSENT = 2
 EXIT_DENIED = 3
 CONSENT_MARKER = "native-pim-consent"
@@ -89,8 +91,12 @@ def strip_flag(argv: list[str]) -> list[str]:
 
 
 def in_agent_session() -> bool:
-    """A subprocess of the core agent session, where the task binding is about us."""
-    return os.environ.get("CLAUDECODE", "") == "1"
+    """A subprocess of the core agent session, where the task binding is about us.
+
+    Either core: both launchers export ``SUTANDO_CORE_SESSION=1`` into the session, and
+    a Claude session sets ``CLAUDECODE=1`` on its own even when started another way.
+    """
+    return any(os.environ.get(name, "") == "1" for name in SESSION_ENVS)
 
 
 def bound_task_tier(state: Path | None = None) -> str | None:

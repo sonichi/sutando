@@ -40,8 +40,19 @@ def _done(cmd, stdout="", stderr="", rc=0):
 
 
 def _no_consent_env():
-    env = {k: v for k, v in os.environ.items() if k not in ("SUTANDO_ALLOW_NATIVE_PIM", "CLAUDECODE")}
-    return patch.dict(os.environ, env, clear=True)
+    return patch.dict(os.environ, _bare_env(), clear=True)
+
+
+def _bare_env():
+    drop = ("SUTANDO_ALLOW_NATIVE_PIM", "CLAUDECODE", "SUTANDO_CORE_SESSION", "SUTANDO_CORE_RUNTIME")
+    return {k: v for k, v in os.environ.items() if k not in drop}
+
+
+# What each launcher puts in the core session; the Codex one never sets CLAUDECODE.
+CORE_ENVS = {
+    "codex": {"SUTANDO_CORE_SESSION": "1", "SUTANDO_CORE_RUNTIME": "codex"},
+    "claude": {"SUTANDO_CORE_SESSION": "1", "SUTANDO_CORE_RUNTIME": "claude", "CLAUDECODE": "1"},
+}
 
 
 class TestCalendarWriter(unittest.TestCase):
@@ -60,11 +71,11 @@ class TestCalendarWriter(unittest.TestCase):
         self._state_patch.stop()
         self._tmp.cleanup()
 
-    def _run(self, argv, responder):
+    def _run(self, argv, responder, env=None):
         def fake_run(cmd, **kwargs):
             self.calls.append(cmd)
             return responder(cmd)
-        with _no_consent_env(), patch.object(self.mod.subprocess, "run", side_effect=fake_run), \
+        with patch.dict(os.environ, {**_bare_env(), **(env or {})}, clear=True), patch.object(self.mod.subprocess, "run", side_effect=fake_run), \
              patch("time.sleep"), \
              contextlib.redirect_stderr(self.err), contextlib.redirect_stdout(self.out):
             try:
@@ -94,16 +105,32 @@ class TestCalendarWriter(unittest.TestCase):
         self.assertIn("--owner-asked", self.err.getvalue())
         self.assertIn("composio_find", self.err.getvalue())
 
-    def test_flag_is_refused_on_a_team_task(self):
+    def _bind(self, tier):
         ws = self.state.parent
-        (ws / "state" / "bindings").mkdir(parents=True)
-        (ws / "tasks").mkdir()
+        (ws / "state" / "bindings").mkdir(parents=True, exist_ok=True)
+        (ws / "tasks").mkdir(exist_ok=True)
         (ws / "state" / "bindings" / "active-execution.json").write_text(json.dumps({"task_id": "t1"}))
-        (ws / "tasks" / "t1.txt").write_text("source: discord\naccess_tier: team\ntask: x\n")
-        with patch.object(self.mod.consent, "in_agent_session", return_value=True):
-            code = self._run(ADD + ["--owner-asked"], self._calendar(""))
-        self.assertEqual(code, self.mod.consent.EXIT_NO_CONSENT)
-        self.assertEqual(self.calls, [])
+        (ws / "tasks" / "t1.txt").write_text(f"source: discord\naccess_tier: {tier}\ntask: x\n")
+
+    def test_team_task_is_refused_before_any_subprocess_on_both_cores(self):
+        """The real launcher env, nothing mocked in the consent module: Codex has no CLAUDECODE."""
+        self._bind("team")
+        for core, env in CORE_ENVS.items():
+            for consent_env in ({}, {"SUTANDO_ALLOW_NATIVE_PIM": "1"}):
+                self.calls, self.err = [], io.StringIO()
+                code = self._run(ADD + ["--owner-asked"], self._calendar(""), env={**env, **consent_env})
+                self.assertEqual(code, self.mod.consent.EXIT_NO_CONSENT, (core, consent_env))
+                self.assertEqual(self.calls, [], f"{core}: no open/osascript on a team task")
+                self.assertIn("not the owner's", self.err.getvalue())
+
+    def test_owner_task_runs_on_both_cores(self):
+        self._bind("owner")
+        for core, env in CORE_ENVS.items():
+            self.calls, self.out = [], io.StringIO()
+            code = self._run(ADD + ["--owner-asked"],
+                             self._calendar(f"{START}|||{END}|||Dentist\n"), env=env)
+            self.assertEqual(code, 0, core)
+            self.assertEqual(len(self._osascripts()), 2, core)
 
     def test_stored_denial_is_final_without_any_subprocess(self):
         (self.state / "calendar-automation-denied").write_text("earlier")
@@ -138,6 +165,48 @@ class TestCalendarWriter(unittest.TestCase):
             for value in (title, notes, cal, "2026"):
                 self.assertNotIn(value, script)
         self.assertNotIn("--owner-asked", add)
+
+    def test_notes_are_set_in_the_create_call_not_in_a_second_step(self):
+        make = [ln for ln in self.mod.ADD_SCRIPT.splitlines() if "make new event" in ln]
+        self.assertEqual(len(make), 2, "one create with notes, one without")
+        self.assertIn("description:theNotes", make[1])
+        self.assertNotIn("description", make[0])
+        self.assertNotIn("set description", self.mod.ADD_SCRIPT, "no write after the event exists")
+
+    # ── retry safety: any failure at or after the create step says the event may exist ──
+    def test_failure_after_creation_reports_that_the_event_may_exist(self):
+        cases = {
+            "uid unreadable after create": (self._calendar("", created="|||Can’t get uid of event.\n"),
+                                            "The event may have been created: check Calendar before retrying."),
+            "read-back AppleScript error": (
+                self._calendar(lambda cmd: _done(cmd, stderr="execution error: boom (-10000)", rc=1)),
+                "The event may have been created (uid UID-1, calendar 'Home'): check Calendar before retrying."),
+            "read-back finds nothing": (
+                self._calendar("\n"),
+                "The event may have been created (uid UID-1, calendar 'Home'): check Calendar before retrying."),
+            "read-back mismatch": (
+                self._calendar(f"{START}|||{END}|||Other\n"),
+                "The event exists (uid UID-1, calendar 'Home'): check Calendar before retrying."),
+        }
+        for label, (responder, expected) in cases.items():
+            self.out, self.err = io.StringIO(), io.StringIO()
+            code = self._run(ADD + ["--notes", "Room 4", "--owner-asked"], responder)
+            self.assertEqual(code, 1, label)
+            self.assertIn(expected, self.err.getvalue(), label)
+            self.assertEqual(self.out.getvalue(), "", label)
+
+    def test_denial_on_read_back_still_names_the_created_event(self):
+        code = self._run(ADD + ["--owner-asked"],
+                         self._calendar(lambda cmd: _done(cmd, stderr=DENIED, rc=1)))
+        self.assertEqual(code, self.mod.consent.EXIT_DENIED)
+        self.assertIn("may have been created (uid UID-1", self.err.getvalue())
+
+    def test_failure_before_creation_does_not_claim_an_event(self):
+        code = self._run(ADD + ["--calendar", "Nope", "--owner-asked"],
+                         lambda cmd: _done(cmd, stderr="execution error: no such calendar (-1719)", rc=1)
+                         if cmd[0] == "osascript" else _done(cmd))
+        self.assertEqual(code, 1)
+        self.assertNotIn("may have been created", self.err.getvalue())
 
     # ── read-back ──
     def test_success_is_reported_only_after_a_matching_read_back(self):
@@ -181,7 +250,7 @@ class TestCalendarWriter(unittest.TestCase):
         msg = self.err.getvalue()
         self.assertIn("click Allow", msg)
         self.assertIn("Privacy & Security → Automation", msg)
-        self.assertIn("check the calendar before adding it again", msg)
+        self.assertIn("The event may have been created: check Calendar before retrying.", msg)
         self.assertFalse((self.state / "calendar-automation-denied").exists())
 
     def test_read_back_timeout_says_the_event_exists_but_is_unverified(self):
@@ -189,7 +258,7 @@ class TestCalendarWriter(unittest.TestCase):
             raise subprocess.TimeoutExpired(cmd, self.mod.TIMEOUT)
         code = self._run(ADD + ["--owner-asked"], self._calendar(hang))
         self.assertEqual(code, 1)
-        self.assertIn("was created (uid UID-1", self.err.getvalue())
+        self.assertIn("may have been created (uid UID-1", self.err.getvalue())
         self.assertEqual(self.out.getvalue(), "")
 
     def test_applescript_error_and_a_hung_open_are_reported_not_raised(self):

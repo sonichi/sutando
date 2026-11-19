@@ -288,7 +288,8 @@ of consent is ignored and the command is denied with a reason saying so. Without
 binding — a chat session, a cron, a binding the core did not write — the consent is
 self-attested and a task's injected text saying "the owner asked" is not
 distinguishable from the owner asking. Do not rely on this hook as access control.
-The scripts apply the same tier inside an agent session (`CLAUDECODE=1`): on a
+The scripts apply the same tier inside an agent session on either core
+(`SUTANDO_CORE_SESSION=1`, exported by the Claude and the Codex launcher, or `CLAUDECODE=1`): on a
 non-owner task `--owner-asked`, the env var and the marker are all refused (exit 2),
 so the script gate does not accept what the hook would deny. A cron such as the
 morning briefing is not the core's bound task and is not tier-checked.

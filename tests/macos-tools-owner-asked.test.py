@@ -49,6 +49,16 @@ def _no_consent_env():
     return patch.dict(os.environ, env, clear=True)
 
 
+CODEX_LAUNCHER_ENV = {"SUTANDO_CORE_SESSION": "1", "SUTANDO_CORE_RUNTIME": "codex"}
+SESSION_KEYS = ("CLAUDECODE", "SUTANDO_CORE_SESSION", "SUTANDO_CORE_RUNTIME", "SUTANDO_ALLOW_NATIVE_PIM")
+
+
+def _codex_core_env(**extra):
+    """What the Codex launcher puts in the core session: no CLAUDECODE anywhere."""
+    env = {k: v for k, v in os.environ.items() if k not in SESSION_KEYS}
+    return patch.dict(os.environ, {**env, **CODEX_LAUNCHER_ENV, **extra}, clear=True)
+
+
 class _Base:  # mixin: the per-script classes below are the TestCases
     script = ""
     app = ""
@@ -107,6 +117,24 @@ class _Base:  # mixin: the per-script classes below are the TestCases
         self.assertEqual(code, self.mod.consent.EXIT_NO_CONSENT)
         self.assertEqual(self.calls, [], "no osascript on another person's task")
         self.assertIn("not the owner's", self.err.getvalue())
+
+    def test_flag_is_refused_on_a_team_task_under_the_codex_launcher(self):
+        ws = self.state.parent
+        (ws / "state" / "bindings").mkdir(parents=True, exist_ok=True)
+        (ws / "tasks").mkdir(exist_ok=True)
+        (ws / "state" / "bindings" / "active-execution.json").write_text(json.dumps({"task_id": "t1"}))
+        (ws / "tasks" / "t1.txt").write_text("source: discord\naccess_tier: team\ntask: x\n")
+        for extra in ({}, {"SUTANDO_ALLOW_NATIVE_PIM": "1"}):
+            self.calls = []
+            with _codex_core_env(**extra):
+                code = self._run(self.argv_ok, lambda cmd: _done(cmd, stdout=self.ok_stdout))
+            self.assertEqual(code, self.mod.consent.EXIT_NO_CONSENT, extra)
+            self.assertEqual(self.calls, [], "no open/osascript on another person's task")
+        self.assertIn("not the owner's", self.err.getvalue())
+        (ws / "tasks" / "t1.txt").write_text("source: discord\naccess_tier: owner\ntask: x\n")
+        with _codex_core_env():
+            code = self._run(self.argv_ok, lambda cmd: _done(cmd, stdout=self.ok_stdout))
+        self.assertEqual(code, 0, "the owner's own task still runs under Codex")
 
     def test_flag_runs_the_applescript_path(self):
         with _no_consent_env():
@@ -456,6 +484,19 @@ class TestConsentHelper(unittest.TestCase):
             self.assertEqual(self._require(["x.py", "list"])[0], self.c.EXIT_NO_CONSENT,
                              "the persisted marker does not count on a team task")
 
+    def test_codex_launcher_env_is_an_agent_session_too(self):
+        self._bind("team")
+        with _codex_core_env():
+            self.assertTrue(self.c.in_agent_session())
+            self.assertTrue(self.c.not_owner_task())
+            self.assertEqual(self._require(["x.py", "list", "--owner-asked"])[0], self.c.EXIT_NO_CONSENT)
+        self.c.grant()
+        with _codex_core_env(SUTANDO_ALLOW_NATIVE_PIM="1"):
+            self.assertEqual(self._require(["x.py", "list"])[0], self.c.EXIT_NO_CONSENT,
+                             "env consent and the marker do not count on a team task under Codex")
+        with _codex_core_env(SUTANDO_CORE_SESSION="0"):
+            self.assertFalse(self.c.in_agent_session(), "a worker that cleared the flag is not the core")
+
     def test_guest_and_unreadable_tiers_are_refused_like_team(self):
         for tier in ("guest", "other", "not-a-tier"):
             self._bind(tier)
@@ -482,7 +523,7 @@ class TestConsentHelper(unittest.TestCase):
     def test_outside_the_agent_session_the_binding_is_not_ours(self):
         """A cron (the morning briefing) is not the core's bound task: the tier does not apply."""
         self._bind("team")
-        env = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "SUTANDO_ALLOW_NATIVE_PIM")}
+        env = {k: v for k, v in os.environ.items() if k not in SESSION_KEYS}
         with patch.dict(os.environ, env, clear=True):
             self.assertFalse(self.c.in_agent_session())
             self.assertFalse(self.c.not_owner_task())
