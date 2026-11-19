@@ -117,9 +117,8 @@ class ProactiveRouteCheckTest(unittest.TestCase):
         self.assertNotIn("other bridges do not claim", verdict["detail"])
 
     def test_stopped_bridge_wording_names_the_gateway_fallback(self) -> None:
-        # The blanket "other bridges never claim" wording was too strong
-        # once the routed bridge is stopped: the gateway's grace window
-        # may still deliver it (#6484 review).
+        # A stopped routed bridge may still be delivered via the gateway's
+        # grace-window fallback — exclusivity wording must not say otherwise.
         self._activity("telegram")
         verdict = hc.check_proactive_route(
             [{"name": "telegram-bridge", "status": "down", "detail": "not running"}])
