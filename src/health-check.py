@@ -7182,6 +7182,8 @@ def check_gateway_bridge() -> "dict | None":
 
 
 OWNER_DM_STALE_MIN_AGE_S = 1800.0
+# Grace for float/JSON round-trip imprecision only — not a real clock-skew budget.
+OWNER_DM_CLOCK_SKEW_TOLERANCE_S = 5.0
 
 
 def check_owner_dm_routing_stale(min_age_sec: float = OWNER_DM_STALE_MIN_AGE_S,
@@ -7189,11 +7191,6 @@ def check_owner_dm_routing_stale(min_age_sec: float = OWNER_DM_STALE_MIN_AGE_S,
     """WARN once the owner/gateway DM-room mismatch has itself persisted past
     `min_age_sec` — not how recently the owner spoke, which refreshes every message."""
     name = "owner-dm-routing-stale"
-    if not _gateway_configured():
-        return None
-    import owner_room_access  # noqa: PLC0415
-    routing = owner_room_access.owner_routing(WORKSPACE_DIR)
-    current_dm = owner_room_access.owner_dm(routing)
     state_file = WORKSPACE_DIR / "state" / "owner-dm-routing-stale.json"
 
     def _clear_divergence():
@@ -7201,6 +7198,15 @@ def check_owner_dm_routing_stale(min_age_sec: float = OWNER_DM_STALE_MIN_AGE_S,
             state_file.unlink()
         except OSError:
             pass
+
+    if not _gateway_configured():
+        # Not-configured is unobservable, same as every "ok" case below — clear
+        # the clock so it can't resume a stale duration once reconfigured.
+        _clear_divergence()
+        return None
+    import owner_room_access  # noqa: PLC0415
+    routing = owner_room_access.owner_routing(WORKSPACE_DIR)
+    current_dm = owner_room_access.owner_dm(routing)
 
     if not current_dm:
         _clear_divergence()
@@ -7227,6 +7233,10 @@ def check_owner_dm_routing_stale(min_age_sec: float = OWNER_DM_STALE_MIN_AGE_S,
     if not isinstance(state, dict):
         state = {}
     first_seen = _gateway_num(state.get("first_seen"), nonneg=True)
+    # A first_seen beyond now (clock skew, a tampered/corrupted file) can never age — discard it.
+    if first_seen is not None and first_seen > now + OWNER_DM_CLOCK_SKEW_TOLERANCE_S:
+        first_seen = None
+    measured = True
     # A new or changed pair starts its own clock; the same pair keeps the one already running.
     if state.get("last_room") != last_room or state.get("current_dm") != current_dm or not first_seen:
         first_seen = now
@@ -7239,10 +7249,19 @@ def check_owner_dm_routing_stale(min_age_sec: float = OWNER_DM_STALE_MIN_AGE_S,
                 json.dump({"last_room": last_room, "current_dm": current_dm, "first_seen": first_seen}, out)
             os.replace(tmp, state_file)
         except OSError:
-            pass
+            measured = False
         finally:
             if tmp is not None:
                 tmp.unlink(missing_ok=True)
+    if not measured:
+        # Nothing was persisted, so first_seen is only in memory — reporting its
+        # age would lie ("0s old") forever. Say the divergence is real but unmeasured.
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (f"routing mismatch ({last_room} vs {current_dm}) is real, but its duration "
+                       "could not be measured — the clock file could not be written"),
+        }
     age = max(0.0, now - first_seen)
     if age < min_age_sec:
         return {"name": name, "status": "ok",

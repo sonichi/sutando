@@ -179,18 +179,83 @@ class TestOwnerDmRoutingStale(unittest.TestCase):
             later = self._run(td, min_age_sec=1800, now=3_000_000.0 + 1800)
             self.assertEqual(later["status"], "warn", later)
 
-    def test_state_write_failure_is_tolerated(self):
+    def test_state_write_failure_does_not_crash_but_does_not_claim_ok(self):
         """If persisting the divergence clock fails (e.g. disk full, a
-        read-only state dir), the probe must not crash — it silently
-        continues without the persisted clock, the same error-tolerance
-        pattern as other optional-state writes in this file."""
+        read-only state dir), the probe must not crash, but it also must not
+        report the mismatch as a freshly-started, unsustained "ok" — nothing
+        was persisted, so no duration claim is honest."""
         with tempfile.TemporaryDirectory() as td:
             self._routing(td, "!old:x")
             self._activity(td, "ag2space", "!new:x", age_s=0)
             with mock.patch("os.replace", side_effect=OSError("disk full")):
                 r = self._run(td, min_age_sec=1800, now=4_000_000.0)
-            self.assertEqual(r["status"], "ok", r)
-            self.assertIn("settle window", r["detail"])
+            self.assertEqual(r["status"], "warn", r)
+            self.assertIn("could not be measured", r["detail"])
+            self.assertIn("!old:x", r["detail"])
+            self.assertIn("!new:x", r["detail"])
+
+    def test_write_failure_across_two_hours_never_reports_plain_ok(self):
+        """Reviewer repro: on a workspace where the clock file can never be
+        written, the SAME mismatch checked two hours apart must not read as
+        "ok" / "not yet sustained" on either call — each recomputed first_seen
+        = now in memory only, so neither call can honestly claim freshness."""
+        with tempfile.TemporaryDirectory() as td:
+            self._routing(td, "!old:x")
+            self._activity(td, "ag2space", "!new:x", age_s=0)
+            with mock.patch("os.replace", side_effect=OSError("read-only workspace")):
+                first = self._run(td, min_age_sec=1800, now=6_000_000.0)
+                later = self._run(td, min_age_sec=1800, now=6_000_000.0 + 2 * 3600)
+            self.assertEqual(first["status"], "warn", first)
+            self.assertNotIn("settle window", first["detail"])
+            self.assertEqual(later["status"], "warn", later)
+            self.assertNotIn("settle window", later["detail"])
+
+    def test_future_dated_first_seen_is_discarded_not_stuck(self):
+        """A first_seen bogusly in the future (clock skew, a tampered state
+        file) must not pin `age` at ~0 forever — the probe resets the clock to
+        now instead of trusting an impossible value, and recovers from there."""
+        with tempfile.TemporaryDirectory() as td:
+            self._routing(td, "!old:x")
+            self._activity(td, "ag2space", "!new:x", age_s=0)
+            state = Path(td) / "state"
+            state.mkdir(parents=True, exist_ok=True)
+            now0 = 7_000_000.0
+            (state / "owner-dm-routing-stale.json").write_text(json.dumps({
+                "last_room": "!old:x", "current_dm": "!new:x", "first_seen": now0 + 3600,
+            }))
+            first = self._run(td, min_age_sec=1800, now=now0)
+            self.assertEqual(first["status"], "ok", first)
+            self.assertIn("settle window", first["detail"])
+            # The reset clock must have been persisted — a later call measures
+            # real elapsed time from the reset point, not another future value.
+            later = self._run(td, min_age_sec=1800, now=now0 + 1800)
+            self.assertEqual(later["status"], "warn", later)
+
+    def test_gateway_reconfigured_starts_a_fresh_clock(self):
+        """Policy (item 3): "not configured" clears the divergence clock, the
+        same as every other early "ok" return — a gap must not let an old,
+        already-sustained duration resume and warn immediately on return."""
+        with tempfile.TemporaryDirectory() as td:
+            self._routing(td, "!old:x")
+            self._activity(td, "ag2space", "!new:x", age_s=0)
+            now0 = 8_000_000.0
+            with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
+                 mock.patch.object(hc, "_gateway_configured", return_value=True):
+                hc.check_owner_dm_routing_stale(min_age_sec=1800, now=now0)  # starts the clock
+                sustained = hc.check_owner_dm_routing_stale(min_age_sec=1800, now=now0 + 1800)
+            self.assertEqual(sustained["status"], "warn", sustained)
+            state_file = Path(td) / "state" / "owner-dm-routing-stale.json"
+            self.assertTrue(state_file.is_file())
+            with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
+                 mock.patch.object(hc, "_gateway_configured", return_value=False):
+                during_gap = hc.check_owner_dm_routing_stale(min_age_sec=1800, now=now0 + 1900)
+            self.assertIsNone(during_gap)
+            self.assertFalse(state_file.is_file(), "gap must clear the stale clock, not leave it")
+            with mock.patch.object(hc, "WORKSPACE_DIR", Path(td)), \
+                 mock.patch.object(hc, "_gateway_configured", return_value=True):
+                resumed = hc.check_owner_dm_routing_stale(min_age_sec=1800, now=now0 + 1901)
+            self.assertEqual(resumed["status"], "ok", resumed)
+            self.assertIn("settle window", resumed["detail"])
 
     def test_unreadable_activity_file_is_ok_not_a_crash(self):
         with tempfile.TemporaryDirectory() as td:
