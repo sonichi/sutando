@@ -10,6 +10,13 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
   to try per part, and summons the owner to it. A marker under `<workspace>/state/tutorial/` keeps it to one page per room, so
   a re-link or reinstall refreshes the page instead of adding another.
 
+## Product overview
+
+[`getting-started.html`](getting-started.html) is a standalone four-part overview, adapted from
+the interactive review draft. Its topic selectors are simulations: they do not connect accounts,
+change access, start calls or schedule work. Copy falls back to selecting the prompt when the
+clipboard is unavailable. It complements, rather than replaces, the per-owner ten-step tour.
+
 ## Using the guide
 
 The labelled step navigator lets readers jump directly to a topic instead of guessing a number.

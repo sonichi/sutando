@@ -10,6 +10,8 @@ Machine-readable ownership and lifecycle metadata lives in
 
 ## Start here
 
+- [Interactive s.space overview](getting-started.html) — download/open the HTML in a browser to explore agents, teamwork, calls and Commons.
+
 - [Configure a workspace](workspace-config.md) — defaults, overrides, and
   resolver APIs.
 - [Run Codex as the core](codex-core.md) — core selection, setup, and rollback.
