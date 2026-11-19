@@ -28,14 +28,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from local_task_protocol import valid_broker_id, valid_local_task_id  # noqa: E402
+from workspace_default import resolve_workspace  # noqa: E402
 
 RELATIVE = Path("state") / "bindings" / "active-execution.json"
 SUFFIX = ".txt"
 USAGE = "usage: execution_binding.py bind|unbind <workspace> <task filename> | clear <workspace>"
 
 
-def path(workspace) -> Path:
-    return Path(workspace) / RELATIVE
+def path(workspace=None) -> Path:
+    """The record under ``workspace``, or under the resolved workspace when none is given."""
+    return Path(workspace or resolve_workspace(migrate=False)) / RELATIVE
 
 
 def task_id(filename: str) -> str:

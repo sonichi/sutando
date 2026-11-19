@@ -315,6 +315,12 @@ class ExecutionBindingModuleTest(unittest.TestCase):
         with patch.object(self.mod, "clear", side_effect=OSError("read-only")):
             self.assertEqual(self.mod.main(["clear", str(self.ws)]), 1)
 
+    def test_path_defaults_to_the_resolved_workspace(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(self.ws)}):
+            self.assertEqual(self.mod.path().resolve(),
+                             (self.ws / "state" / "bindings" / "active-execution.json").resolve())
+
     def test_cli(self):
         self.assertEqual(self.mod.main(["bind", str(self.ws), "task-1.txt"]), 0)
         self.assertEqual(self.mod.main(["unbind", str(self.ws), "task-1.txt"]), 0)
