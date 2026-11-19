@@ -9264,11 +9264,17 @@ def _route_age_text(age_s: "float | None") -> str:
 
 
 def check_proactive_route(checks: "list[dict] | None" = None) -> dict:
-    """Which bridge untagged proactive messages are routed to now, and why.
-
-    Only that bridge claims them, so a quiet outbox on any other bridge is the
-    routing, not a stall. ``warn`` only when the routed bridge's own row in
-    ``checks`` is not ok; a bridge with no row is reported, not judged.
+    """Which bridge activity-routing DEFAULTS untagged proactive messages to
+    now, and why — the ``proactive_route`` policy layer, not a guarantee of
+    the final claim. The real per-file decision
+    (``proactive_routing.claims_unless_routed_elsewhere``) also lets a lone
+    configured bridge claim its own file regardless of this default, and the
+    gateway bridge claims a stopped bridge's file after its own grace window
+    — so a quiet outbox on another bridge usually just reads this default,
+    not a stall, but this row names the default LAYER, never the one bridge
+    that will certainly deliver it. ``warn`` only when the routed bridge's
+    own row in ``checks`` is not ok; a bridge with no row is reported, not
+    judged.
     """
     name = "proactive-route"
     try:
@@ -9280,13 +9286,17 @@ def check_proactive_route(checks: "list[dict] | None" = None) -> dict:
     channel = route["channel"]
     if route["reason"] == "last-activity":
         why = f"last owner activity was on {channel}, {_route_age_text(route['age_s'])}"
+        caveat = ""
     elif route["reason"] == "non-bridge":
         why = (f"last owner activity was on {route['value']} "
                f"({_route_age_text(route['age_s'])}), which delivers no DMs: default")
+        caveat = " — default-routing policy, not a final claim"
     else:
         why = f"default: owner activity record {route['reason']}"
+        caveat = " — default-routing policy, not a final claim"
     detail = (f"routed to {channel} ({why}, state/last-owner-activity.json "
-              f"field '{route['field']}'); other bridges do not claim untagged proactive messages")
+              f"field '{route['field']}'){caveat}; a lone configured bridge still claims its "
+              f"own file, and the gateway claims a stopped bridge's file after its grace window")
     row_name = _PROACTIVE_BRIDGE_ROWS.get(channel)
     row = next((c for c in (checks or []) if c.get("name") == row_name), None)
     if row is None:
@@ -9295,7 +9305,8 @@ def check_proactive_route(checks: "list[dict] | None" = None) -> dict:
     if row.get("status") != "ok":
         return {"name": name, "status": "warn",
                 "detail": (f"{detail}; but {row_name} is {row.get('status')}: "
-                           "proactive messages may not be delivered until it recovers")}
+                           "delivery may be delayed until it recovers, or the gateway's "
+                           "fallback grace window claims it instead")}
     return {"name": name, "status": "ok", "detail": detail}
 
 

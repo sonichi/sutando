@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
-"""`check_proactive_route`: health-check names the bridge proactive messages
-are routed to, so a quiet outbox on another bridge reads as routing, not a
-stall (#5076), and warns only when the routed bridge itself is unhealthy."""
+"""`check_proactive_route`: health-check names the bridge activity-routing
+DEFAULTS proactive messages to, so a quiet outbox on another bridge usually
+reads as routing, not a stall (#5076), and warns only when the routed
+bridge itself is unhealthy.
+
+The row reports the `proactive_routing.proactive_route` default-policy
+LAYER only — it must not read as the final claim decision, because the real
+per-file claim (`claims_unless_routed_elsewhere`) lets a lone configured
+bridge claim its own file regardless of this default, and the gateway
+bridge claims a stopped bridge's file after its own grace window (#6484
+review: a fresh single-bridge install must not be misdiagnosed)."""
 
 from __future__ import annotations
 
@@ -11,14 +19,18 @@ from _helpers.hermetic_env import isolate_os_environ
 isolate_os_environ()
 
 import importlib.util
-import inspect
 import json
+import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+
+from proactive_routing import claims_unless_routed_elsewhere  # noqa: E402
 
 spec = importlib.util.spec_from_file_location(
     "health_check", REPO / "src" / "health-check.py"
@@ -84,12 +96,93 @@ class ProactiveRouteCheckTest(unittest.TestCase):
         self.assertIn("last owner activity was on voice", verdict["detail"])
         self.assertIn("routed to discord", verdict["detail"])
 
-    def test_probe_is_registered_after_the_bridge_rows(self) -> None:
-        src = inspect.getsource(hc.run_all_checks)
-        self.assertTrue("checks.append(check_proactive_route(checks))" in src,
-                        "check_proactive_route() is never appended to `checks`")
-        self.assertLess(src.index("check_gateway_bridge()"),
-                        src.index("check_proactive_route(checks)"))
+    def test_single_bridge_no_record_does_not_overclaim_exclusivity(self) -> None:
+        """#6484 review: a fresh Slack-only install with no activity record.
+
+        `proactive_route` names discord as the DEFAULT, but the real
+        per-file decision (`claims_unless_routed_elsewhere`, what
+        slack-bridge.py actually calls) lets the one configured bridge
+        claim it anyway — the row must not say otherwise.
+        """
+        state = self.ws / "state" / "last-owner-activity.json"
+        self.assertFalse(state.exists())
+        self.assertTrue(claims_unless_routed_elsewhere(
+            "proactive-1.txt", state, "slack", other_bridges_configured=False))
+        verdict = hc.check_proactive_route(
+            [{"name": "slack-bridge", "status": "ok", "detail": "running"}])
+        self.assertEqual(verdict["status"], "ok")
+        self.assertIn("routed to discord", verdict["detail"])
+        self.assertIn("default-routing policy, not a final claim", verdict["detail"])
+        self.assertIn("lone configured bridge", verdict["detail"])
+        self.assertNotIn("other bridges do not claim", verdict["detail"])
+
+    def test_stopped_bridge_wording_names_the_gateway_fallback(self) -> None:
+        # The blanket "other bridges never claim" wording was too strong
+        # once the routed bridge is stopped: the gateway's grace window
+        # may still deliver it (#6484 review).
+        self._activity("telegram")
+        verdict = hc.check_proactive_route(
+            [{"name": "telegram-bridge", "status": "down", "detail": "not running"}])
+        self.assertEqual(verdict["status"], "warn")
+        self.assertIn("fallback grace window", verdict["detail"])
+
+    def test_age_unknown_when_ts_is_missing(self) -> None:
+        (self.ws / "state" / "last-owner-activity.json").write_text(
+            json.dumps({"channel": "discord"}))  # no `ts` field at all
+        verdict = hc.check_proactive_route([])
+        self.assertIn("last owner activity was on discord, age unknown", verdict["detail"])
+
+    def test_day_old_activity_is_formatted_in_days(self) -> None:
+        self._activity("telegram", age_s=2 * 86400)
+        verdict = hc.check_proactive_route(
+            [{"name": "telegram-bridge", "status": "ok", "detail": "running"}])
+        self.assertIn("last owner activity was on telegram, 2.0d ago", verdict["detail"])
+
+    def test_import_error_warns_without_crashing(self) -> None:
+        with mock.patch.dict(sys.modules, {"proactive_routing": None}):
+            verdict = hc.check_proactive_route([])
+        self.assertEqual(verdict["status"], "warn")
+        self.assertIn("could not load proactive_routing", verdict["detail"])
+
+    def test_probe_runs_after_the_bridge_rows_in_the_full_pipeline(self) -> None:
+        """Behavioral: drive the real `run_all_checks()` end to end and
+        assert on the actual returned row order — not source text (#6484
+        review: a source-text-only registration test falls short of the
+        repo's behavioral-test rule). No bridge is configured in the
+        hermetic test environment, so anchor on the other proactive rows
+        that `check_proactive_route` is deliberately appended after, per
+        the real call order in `run_all_checks`."""
+        saved_repo = hc.REPO_DIR
+        repo_dir = self.ws / "repo"
+        (repo_dir / "src").mkdir(parents=True)
+        (self.ws / "logs").mkdir(exist_ok=True)
+        hc.REPO_DIR = repo_dir
+        try:
+            checks = hc.run_all_checks()
+        finally:
+            hc.REPO_DIR = saved_repo
+        names = [c.get("name") for c in checks]
+        self.assertIn("proactive-route", names)
+        self.assertIn("stranded-destined-proactive", names)
+        self.assertIn("stale-proactive-backlog", names)
+        self.assertIn("task-watcher", names)
+        self.assertLess(names.index("stranded-destined-proactive"), names.index("proactive-route"))
+        self.assertLess(names.index("stale-proactive-backlog"), names.index("proactive-route"))
+        self.assertLess(names.index("proactive-route"), names.index("task-watcher"))
+
+
+class RouteAgeTextTest(unittest.TestCase):
+    """Direct branch coverage for `_route_age_text` (#6484 review: the
+    unknown-age and day-age branches were untested)."""
+
+    def test_none_and_negative_are_age_unknown(self) -> None:
+        self.assertEqual(hc._route_age_text(None), "age unknown")
+        self.assertEqual(hc._route_age_text(-5), "age unknown")
+
+    def test_minutes_hours_and_days_format(self) -> None:
+        self.assertEqual(hc._route_age_text(120), "2m ago")
+        self.assertEqual(hc._route_age_text(7200), "2.0h ago")
+        self.assertEqual(hc._route_age_text(2 * 86400), "2.0d ago")
 
 
 if __name__ == "__main__":
