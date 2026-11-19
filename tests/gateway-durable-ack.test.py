@@ -765,5 +765,24 @@ class DurableAck(unittest.TestCase):
             self.assertIn(f"{step} ", timed[0])
 
 
+    def test_an_invalid_wire_id_is_not_posted_and_says_why(self):
+        mod = self.mod
+        lines, logs = self._logs()
+        with logs, patch.object(mod, "_valid_tid", return_value=False):
+            self.assertFalse(mod._post_task_ack("task-badid"))
+        self.assertEqual(self._acks(), [])
+        self.assertTrue(any("task ack for task-badid: its wire id is not valid" in m for m in lines), lines)
+        self.assertEqual(mod._ACK_MISS.get(mod._broker_tid("task-badid")), "its wire id is not valid")
+
+    def test_the_ack_miss_record_stays_bounded(self):
+        mod = self.mod
+        with patch.object(mod, "_ACK_MISS_MAX", 2):
+            mod._ACK_MISS.clear()
+            mod._ack_missed("task-m1", "a")
+            mod._ack_missed("task-m2", "b")
+            mod._ack_missed("task-m3", "c")
+            self.assertEqual(list(mod._ACK_MISS.values()), ["c"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
