@@ -92,13 +92,15 @@ messages or state events.
 ## Scheduling timed work
 
 When the owner asks, in a room or DM, for work to run later or on a recurring cadence, use the
-platform scheduler. Do not use an internal loop, `CronCreate`, `crons.json`, crontab, an OS job
-or a local timer, except as step 8 allows.
+platform scheduler. Do not use an internal loop, `CronCreate`, crontab, an OS job or a local
+timer for it, except as step 8 allows. Two cases are not covered by this rule and stay local:
+starter jobs in `crons.json` and asks from outside s.space (see below).
 
 1. Discover and describe `room.schedule.create`, `room.schedule.list` and `room.schedule.delete`.
 2. Create and delete go through `room.action.execute`; list goes through `room.action.read`.
    All run in the originating room. List and delete only see schedules this agent created there.
-   Pass a short `title` (at most 60 characters) that names the job.
+   If `room.schedule.create` describes a `title` argument, pass a short one (at most 60
+   characters) that names the job.
 3. Create and delete need the owner's approval. Status `approval_required` with a null result
    means the change is **held, not created**. Tell the owner approval is needed and follow
    `next_action` with `approval.inspect` or `operation.inspect`.
@@ -124,7 +126,7 @@ Two cases always stay on the host's own scheduler: starter jobs the owner switch
 local chat, or voice not docked in a room). Voice docked in a room counts as that room.
 Sutando's own proactive loop, startup, heartbeat, maintenance and backend jobs never use the
 platform scheduler. Only timed work the owner asks for goes to the platform; it is never an
-internal job, even if it repeats. A to-do item stays on Reminders or the vault; a message or job
+internal job, even if it repeats. A to-do item stays on Reminders or the Obsidian vault; a message or job
 delivered at a set time goes to the platform.
 
 ## Troubleshooting
