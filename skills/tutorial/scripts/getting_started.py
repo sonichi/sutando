@@ -826,7 +826,7 @@ def _recover(commons: Commons, marker: Path, rooms: Dict[str, dict], owner: Opti
     result = {"ok": True, "action": "resumed", "resumed": True, "kind": journal["kind"], "summoned": False,
               "revision": journal.get("revision"), "media": sorted(journal.get("media") or {}),
               **{k: journal.get(k) for k in ("name", "core", "audience", "agent")}}
-    if creating and owner:  # a creation finishing: the owner was never summoned to it
+    if creating and owner:  # a creation finishing, with a summon asked for: none was sent
         try:
             commons.run("summon", commons.room, owner, "--context", SUMMON_CONTEXT, "--page-title", PAGE_TITLE,
                         kind=journal["kind"])
@@ -838,7 +838,7 @@ def _recover(commons: Commons, marker: Path, rooms: Dict[str, dict], owner: Opti
 
 def recover(commons: Commons, marker: Path, owner: Optional[str] = None) -> Optional[dict]:
     """`publish`'s first step on its own: finish or stand aside from a run cut short in this room.
-    Needs nothing of a request but the room and the owner to summon."""
+    Needs nothing of a request but the room, and the owner only when a summon was asked for."""
     with _locked(marker):
         return _recover(commons, marker, load_marker(marker), owner)
 
@@ -855,7 +855,7 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
     slots = tour_page.prompt_slots(features)
     with _locked(marker):
         rooms = load_marker(marker)
-        settled = _recover(commons, marker, rooms, owner)
+        settled = _recover(commons, marker, rooms, owner if summon else None)
         if settled:
             return settled
         known = rooms.get(commons.room, {})
@@ -985,8 +985,8 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
         note = rooms.get(commons.room, {}).get("interrupted") or {}
         if note.get("undo") and note["undo"] != "undone":
             result["landed"] = note["page"]  # the page as left: a write landed on it and stayed
-    # Summoned once, when this page is created; a creation finished by a later run summons there.
-    if owner and (summon or action == "created"):
+    # The page never opens itself for the owner: a summon is sent only when asked for.
+    if owner and summon:
         try:
             commons.run("summon", commons.room, owner, "--context", SUMMON_CONTEXT,
                         "--page-title", PAGE_TITLE, kind=kind)
@@ -1150,7 +1150,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="the agent's own name; auto (default): its Matrix profile name, else its mxid's "
                         "localpart")
     u.add_argument("--agent-mxid", help="with --name auto: this agent's mxid")
-    u.add_argument("--owner", help="the owner's mxid; summoned to the page when it is created")
+    u.add_argument("--owner", help="the owner's mxid; summoned to the page only with --summon")
     u.add_argument("--core", choices=CORES + ("auto",), default="auto",
                    help="the Sutando core (default auto: what the engine resolves); a step naming a "
                         "runtime shows only on that core, unknown leaves such steps out")
@@ -1158,7 +1158,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="dm: the owner's DM; room: any other room, where the page says \"your agent\" "
                         "(default: the audience recorded for the room, else dm)")
     _personal_args(u)
-    u.add_argument("--summon", action="store_true", help="summon the owner on a refresh too")
+    u.add_argument("--summon", action="store_true", help="summon the owner to the page (opens it for them); never done otherwise")
     u.add_argument("--no-upload", action="store_true",
                    help="upload no screenshot to the room's media: an asset the room has no recorded "
                         "media for is inlined from its fallback file")
@@ -1229,7 +1229,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         # A run cut short in this room is settled first, before this run's name, list, prompts or
         # media are even looked at; settling it is then this run's whole work.
-        result = recover(commons, marker, args.owner)
+        result = recover(commons, marker, args.owner if args.summon else None)
     except (PublishError, ValueError) as exc:
         print(json.dumps({"ok": False, "reason": redact(str(exc), env)}))
         return 4

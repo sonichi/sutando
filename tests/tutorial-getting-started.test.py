@@ -909,8 +909,9 @@ class MainTest(unittest.TestCase):
         got = json.loads(out)
         self.assertEqual(got.pop("upload"), NO_MEDIA_SUPPORT)
         self.assertEqual(got, {"ok": True, "action": "created", "kind": "html-p1",
-                               "summoned": True, "name": "Blue", "list": "file",
+                               "summoned": False, "name": "Blue", "list": "file",
                                "revision": gs.tour_page.FEATURES.revision, "media": []})
+        self.assertNotIn("summon", [c[0] for c in self.room_state()["calls"]])  # the page never opens itself
         with mock.patch.object(gs, "detect_core", return_value="codex"):
             code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Blue",
                                      "--room-commons", str(self.stub), "--agent-mxid", "@kai.agent:example.test")
@@ -1021,8 +1022,8 @@ class MainTest(unittest.TestCase):
             code, out, _ = self.main("publish", "--room-commons", str(self.stub))
         self.assertEqual(code, 0)
         result = json.loads(out)
-        self.assertEqual((result["action"], result["summoned"], result["name"]), ("created", True, "Kai"))
-        self.assertIn(["summon", result["kind"], "@owner:example.test"], self.room_state()["calls"])
+        self.assertEqual((result["action"], result["summoned"], result["name"]), ("created", False, "Kai"))
+        self.assertNotIn("summon", [c[0] for c in self.room_state()["calls"]])
         self.assertIn("Picked for: Founder, Sales", self.room_state()["pages"][result["kind"]])
 
     def test_command_line_overrides_the_inputs_file(self):
@@ -1356,10 +1357,10 @@ class PublishTest(unittest.TestCase):
     def ops(self):
         return [c for c in self.room()["calls"] if c[0] == "create"]
 
-    def test_first_run_creates_writes_and_summons(self):
+    def test_first_run_creates_and_writes_without_summoning(self):
         out = self.publish(owner="@chi:ag2.space")
         self.assertEqual(out.pop("upload"), NO_MEDIA_SUPPORT)
-        self.assertEqual(out, {"ok": True, "action": "created", "kind": "html-p1", "summoned": True,
+        self.assertEqual(out, {"ok": True, "action": "created", "kind": "html-p1", "summoned": False,
                                "revision": gs.tour_page.FEATURES.revision, "media": []})
         room = self.room()
         self.assertEqual(room["pages"], {"html-p1": self.page()})
@@ -1369,12 +1370,16 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(gs.read_marker(parts[0]), (self.ME, gs.tour_page.FEATURES.revision))
         self.assertTrue(gs.page_digest_ok(self.page()))  # the tag's digest covers the whole page
         self.assertEqual([c[0] for c in room["calls"]],
-                         ["pages", "create", "read", "read"] + ["append", "read"] * (len(parts) - 1) + ["summon"])
+                         ["pages", "create", "read", "read"] + ["append", "read"] * (len(parts) - 1))
         appended = [c for c in room["calls"] if c[0] == "append"]
         self.assertTrue(all(c[2] <= gs.CHUNK_BYTES for c in appended))
-        self.assertEqual(room["calls"][-1], ["summon", "html-p1", "@chi:ag2.space"])
         entry = gs.load_marker(self.marker)[self.ROOM]
         self.assertEqual((entry["kind"], entry["state"]), ("html-p1", "complete"))
+
+    def test_first_run_summons_only_when_asked(self):
+        out = self.publish(owner="@chi:ag2.space", summon=True)
+        self.assertEqual((out["action"], out["summoned"]), ("created", True))
+        self.assertEqual(self.room()["calls"][-1], ["summon", "html-p1", "@chi:ag2.space"])
 
     def test_second_run_is_idempotent(self):
         self.publish(owner="@chi:ag2.space")
@@ -1426,7 +1431,7 @@ class PublishTest(unittest.TestCase):
         os.environ["STUB_REEXEC"] = "1"
         try:
             out = self.publish(owner="@chi:ag2.space")
-            self.assertEqual((out["action"], out["summoned"]), ("created", True))
+            self.assertEqual((out["action"], out["summoned"]), ("created", False))
             self.assertEqual(self.room()["pages"], {"html-p1": self.page()})
             self.assertEqual(self.publish(name="Kai")["action"], "updated")  # a whole-page replace, re-run too
             self.assertEqual(self.room()["pages"], {"html-p1": self.page("Kai")})
@@ -1475,7 +1480,7 @@ class PublishTest(unittest.TestCase):
             self.publish(owner="@chi:ag2.space")
         entry = gs.load_marker(self.marker)[self.ROOM]
         self.assertEqual(entry["state"], "creating")
-        out = self.publish(owner="@chi:ag2.space")
+        out = self.publish(owner="@chi:ag2.space", summon=True)
         # the landed page carries this agent's tag, so the rerun finishes it without a second create
         self.assertEqual((out["action"], out["kind"], out["summoned"]), ("resumed", "html-p1", True))
         self.assertEqual(self.door.ops, [entry["operation_id"]])
@@ -1560,7 +1565,7 @@ class PublishTest(unittest.TestCase):
             with self.assertRaisesRegex(gs.PublishError, "could not record html-p1"):
                 self.publish()
         out = self.publish(owner="@chi:ag2.space")
-        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("resumed", "html-p1", True))
+        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("resumed", "html-p1", False))
         self.assertEqual(list(self.room()["pages"]), ["html-p1"])
 
     def test_lost_marker_recovers_the_page_by_its_ownership_marker(self):
@@ -1568,8 +1573,8 @@ class PublishTest(unittest.TestCase):
         self.marker.unlink()
         out = self.publish(owner="@chi:ag2.space")
         self.assertEqual((out["action"], out["kind"], out.get("adopted")), ("unchanged", "html-p1", True))
-        self.assertFalse(out["summoned"])  # adopting is not a first creation: no second card
-        self.assertEqual([c[0] for c in self.room()["calls"]].count("summon"), 1)
+        self.assertFalse(out["summoned"])
+        self.assertEqual([c[0] for c in self.room()["calls"]].count("summon"), 0)
         self.assertEqual(list(self.room()["pages"]), ["html-p1"])
         self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["state"], "complete")
 
@@ -1578,7 +1583,7 @@ class PublishTest(unittest.TestCase):
         self.marker.unlink()
         out = self.publish(owner="@chi:ag2.space", summon=True)
         self.assertEqual((out.get("adopted"), out["summoned"]), (True, True))
-        self.assertEqual([c[0] for c in self.room()["calls"]].count("summon"), 2)
+        self.assertEqual([c[0] for c in self.room()["calls"]].count("summon"), 1)
 
     def test_failed_append_stays_pending_and_the_next_run_finishes_it(self):
         os.environ["STUB_FAIL"] = "append"
@@ -1589,7 +1594,7 @@ class PublishTest(unittest.TestCase):
         self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["state"], "pending")
         os.environ.pop("STUB_FAIL")
         out = self.publish(owner="@chi:ag2.space")
-        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("resumed", "html-p1", True))
+        self.assertEqual((out["action"], out["kind"], out["summoned"]), ("resumed", "html-p1", False))
         self.assertEqual(self.room()["pages"], {"html-p1": self.page()})
         self.assertEqual(len(self.door.ops), 1)
 
@@ -1626,7 +1631,7 @@ class PublishTest(unittest.TestCase):
 
     def test_failed_summon_still_reports_the_page(self):
         os.environ["STUB_FAIL"] = "summon"
-        out = self.publish(owner="@chi:ag2.space")
+        out = self.publish(owner="@chi:ag2.space", summon=True)
         self.assertEqual((out["action"], out["summoned"]), ("created", False))
         self.assertIn("summon", out["summon_error"])
         self.assertEqual(gs.load_marker(self.marker)[self.ROOM]["kind"], "html-p1")

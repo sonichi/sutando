@@ -7,7 +7,7 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
   waiting for the user to try each step.
 - **s.space mode.** Right after the first-contact greeting in the owner's DM, the skill creates
   one "Getting started" HTML page (Room Commons) in that DM, a short s.space tour with one thing
-  to try per part, and summons the owner to it. A marker under `<workspace>/state/tutorial/` keeps it to one page per room, so
+  to try per part. It summons the owner only when asked, so the page never opens by itself. A marker under `<workspace>/state/tutorial/` keeps it to one page per room, so
   a re-link or reinstall refreshes the page instead of adding another.
 
 ## What the page is built from

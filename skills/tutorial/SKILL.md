@@ -1,6 +1,6 @@
 ---
 name: tutorial
-description: "Show a new owner what to try first. Voice: on \"tutorial\", \"walk me through\" or \"show me what you can do\", walk the workspace tutorial one short section at a time. s.space: on an owner DM message with a line `/tutorial` (the setup app ends the first-contact message with one), after the greeting, create (or refresh) one \"Getting started\" HTML page there, a short s.space tour with one thing to try per part, and summon the owner to it."
+description: "Show a new owner what to try first. Voice: on \"tutorial\", \"walk me through\" or \"show me what you can do\", walk the workspace tutorial one short section at a time. s.space: on an owner DM message with a line `/tutorial` (the setup app ends the first-contact message with one), after the greeting, create (or refresh) one \"Getting started\" HTML page there, a short s.space tour with one thing to try per part. It does not open the page for the owner."
 user-invocable: true
 ---
 
@@ -63,7 +63,7 @@ not retry the page in the same turn.
    Manager" line under the heading. Without `--roles`, the saved inputs' `roles` are used (step 3).
    Otherwise leave both out. A missing, bad or partly bad file never fails the run: each slot without a usable prompt
    keeps the generic one.
-3. Create or refresh the page and summon the owner to it:
+3. Create or refresh the page:
 
    ```bash
    python3 skills/tutorial/scripts/getting_started.py publish \
@@ -97,11 +97,9 @@ not retry the page in the same turn.
    - `kind`: the page's `html-<id>`;
    - `name`: the name it used.
 
-   On `created` it summons the owner, so the card in the DM is the one line that
-   carries the page: post no other message about it. On `updated` / `unchanged` it summons no one,
-   including when it adopts a page it found by its ownership marker. The one exception is
-   finishing a page an earlier run created but did not complete. `--summon` forces a summon, e.g.
-   when the owner asks for the tutorial again.
+   It summons no one, so the page never opens by itself: it waits in the DM's Commons for the
+   owner to open. Pass `--summon` only when the owner asks to be taken to the page; that summon
+   opens it for them.
 4. Exit 3 (room-commons not installed) or 4 (a room-commons call failed): leave the greeting as is
    and say nothing about the page unless the owner asks. A failure that is a Sutando or s.space
    defect goes to `report-feedback`.
