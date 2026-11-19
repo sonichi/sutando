@@ -9267,11 +9267,14 @@ def check_proactive_route(checks: "list[dict] | None" = None) -> dict:
     """Which bridge activity-routing DEFAULTS untagged proactive messages to
     now, and why — the ``proactive_route`` policy layer, not a guarantee of
     the final claim. The real per-file decision
-    (``proactive_routing.claims_unless_routed_elsewhere``) also lets a lone
-    configured bridge claim its own file regardless of this default, and the
-    gateway bridge claims a stopped bridge's file after its own grace window
-    — so a quiet outbox on another bridge usually just reads this default,
-    not a stall, but this row names the default LAYER, never the one bridge
+    (``proactive_routing.claims_unless_routed_elsewhere``) keys on a
+    RECORDED bridge-channel activity first: once one is recorded, that
+    bridge alone claims, exclusivity included. Only with no bridge-channel
+    activity recorded does a lone configured bridge claim its own file
+    regardless of this default; an eligible gateway bridge, where one is
+    configured, separately claims a stopped bridge's file after its own grace window.
+    So a quiet outbox on another bridge usually just reads this default, not
+    a stall, but this row names the default LAYER, never the one bridge
     that will certainly deliver it. ``warn`` only when the routed bridge's
     own row in ``checks`` is not ok; a bridge with no row is reported, not
     judged.
@@ -9287,16 +9290,26 @@ def check_proactive_route(checks: "list[dict] | None" = None) -> dict:
     if route["reason"] == "last-activity":
         why = f"last owner activity was on {channel}, {_route_age_text(route['age_s'])}"
         caveat = ""
+        # A recorded bridge-channel activity routes exclusively to it, so the
+        # lone-bridge exception below does not apply once one is recorded.
+        exception_note = ""
     elif route["reason"] == "non-bridge":
         why = (f"last owner activity was on {route['value']} "
                f"({_route_age_text(route['age_s'])}), which delivers no DMs: default")
         caveat = " — default-routing policy, not a final claim"
+        exception_note = ("; with no bridge-channel activity recorded, a lone "
+                          "configured bridge still claims its own file regardless "
+                          "of this default")
     else:
         why = f"default: owner activity record {route['reason']}"
         caveat = " — default-routing policy, not a final claim"
+        exception_note = ("; with no bridge-channel activity recorded, a lone "
+                          "configured bridge still claims its own file regardless "
+                          "of this default")
     detail = (f"routed to {channel} ({why}, state/last-owner-activity.json "
-              f"field '{route['field']}'){caveat}; a lone configured bridge still claims its "
-              f"own file, and the gateway claims a stopped bridge's file after its grace window")
+              f"field '{route['field']}'){caveat}{exception_note}; where an eligible "
+              f"gateway bridge is configured, it claims a stopped bridge's file after "
+              f"its own grace window")
     row_name = _PROACTIVE_BRIDGE_ROWS.get(channel)
     row = next((c for c in (checks or []) if c.get("name") == row_name), None)
     if row is None:
@@ -9305,8 +9318,8 @@ def check_proactive_route(checks: "list[dict] | None" = None) -> dict:
     if row.get("status") != "ok":
         return {"name": name, "status": "warn",
                 "detail": (f"{detail}; but {row_name} is {row.get('status')}: "
-                           "delivery may be delayed until it recovers, or the gateway's "
-                           "fallback grace window claims it instead")}
+                           "delivery may be delayed until it recovers, or an eligible "
+                           "gateway bridge's fallback grace window claims it instead")}
     return {"name": name, "status": "ok", "detail": detail}
 
 

@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """`check_proactive_route`: health-check names the bridge activity-routing
 DEFAULTS proactive messages to, so a quiet outbox on another bridge usually
-reads as routing, not a stall (#5076), and warns only when the routed
-bridge itself is unhealthy.
+reads as routing, not a stall, and warns only when the routed bridge
+itself is unhealthy.
 
 The row reports the `proactive_routing.proactive_route` default-policy
-LAYER only — it must not read as the final claim decision, because the real
-per-file claim (`claims_unless_routed_elsewhere`) lets a lone configured
-bridge claim its own file regardless of this default, and the gateway
-bridge claims a stopped bridge's file after its own grace window (#6484
-review: a fresh single-bridge install must not be misdiagnosed)."""
+LAYER only — it must not read as the final claim decision. The real
+per-file claim (`claims_unless_routed_elsewhere`) keys on a recorded
+bridge-channel activity first, which claims exclusively; only with no such
+record does a lone configured bridge claim its own file regardless of the
+default, and, where one is configured, an eligible gateway bridge
+separately claims a stopped bridge's file after its own grace window."""
 
 from __future__ import annotations
 
@@ -97,7 +98,7 @@ class ProactiveRouteCheckTest(unittest.TestCase):
         self.assertIn("routed to discord", verdict["detail"])
 
     def test_single_bridge_no_record_does_not_overclaim_exclusivity(self) -> None:
-        """#6484 review: a fresh Slack-only install with no activity record.
+        """A fresh Slack-only install with no activity record.
 
         `proactive_route` names discord as the DEFAULT, but the real
         per-file decision (`claims_unless_routed_elsewhere`, what
@@ -115,6 +116,23 @@ class ProactiveRouteCheckTest(unittest.TestCase):
         self.assertIn("default-routing policy, not a final claim", verdict["detail"])
         self.assertIn("lone configured bridge", verdict["detail"])
         self.assertNotIn("other bridges do not claim", verdict["detail"])
+
+    def test_recorded_other_bridge_does_not_extend_the_lone_bridge_exception(self) -> None:
+        """A single-bridge (Slack) install whose activity record names a
+        DIFFERENT bridge channel (Discord): the lone-bridge exception does
+        not apply once a bridge channel is recorded, so the real claim
+        decision stays False for Slack and the row's wording must not
+        suggest Slack claims the file regardless.
+        """
+        self._activity("discord")
+        state = self.ws / "state" / "last-owner-activity.json"
+        self.assertFalse(claims_unless_routed_elsewhere(
+            "proactive-1.txt", state, "slack", other_bridges_configured=False))
+        verdict = hc.check_proactive_route(
+            [{"name": "slack-bridge", "status": "ok", "detail": "running"}])
+        self.assertEqual(verdict["status"], "ok")
+        self.assertIn("routed to discord", verdict["detail"])
+        self.assertNotIn("lone configured bridge", verdict["detail"])
 
     def test_stopped_bridge_wording_names_the_gateway_fallback(self) -> None:
         # A stopped routed bridge may still be delivered via the gateway's
@@ -145,12 +163,10 @@ class ProactiveRouteCheckTest(unittest.TestCase):
 
     def test_probe_runs_after_the_bridge_rows_in_the_full_pipeline(self) -> None:
         """Behavioral: drive the real `run_all_checks()` end to end and
-        assert on the actual returned row order — not source text (#6484
-        review: a source-text-only registration test falls short of the
-        repo's behavioral-test rule). No bridge is configured in the
-        hermetic test environment, so anchor on the other proactive rows
-        that `check_proactive_route` is deliberately appended after, per
-        the real call order in `run_all_checks`."""
+        assert on the actual returned row order, not source text. No bridge
+        is configured in the hermetic test environment, so anchor on the
+        other proactive rows that `check_proactive_route` is deliberately
+        appended after, per the real call order in `run_all_checks`."""
         saved_repo = hc.REPO_DIR
         repo_dir = self.ws / "repo"
         (repo_dir / "src").mkdir(parents=True)
@@ -171,8 +187,8 @@ class ProactiveRouteCheckTest(unittest.TestCase):
 
 
 class RouteAgeTextTest(unittest.TestCase):
-    """Direct branch coverage for `_route_age_text` (#6484 review: the
-    unknown-age and day-age branches were untested)."""
+    """Direct branch coverage for `_route_age_text`'s unknown-age and
+    day-age formatting branches."""
 
     def test_none_and_negative_are_age_unknown(self) -> None:
         self.assertEqual(hc._route_age_text(None), "age unknown")
