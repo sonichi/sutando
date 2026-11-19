@@ -174,6 +174,13 @@ class RenderTest(unittest.TestCase):
         self.assertIn("finale.hidden = n !== ids.length", gs.tour_page.SCRIPT)
         self.assertIn(html.escape(gs.tour_page.FINALE_PROMPT), page)
 
+    def test_named_navigation_and_touch_targets(self):
+        page = gs.render_page("Example")
+        self.assertIn("title.textContent = titles[i]", page)
+        self.assertIn("b.append(number, title)", page)
+        self.assertIn("button { min-height:44px", page)
+        self.assertIn("grid-template-columns:repeat(2,minmax(0,1fr))", page)
+
     def test_step_title_replaces_step_numbers(self):
         page = gs.render_page("Blue", "codex")
         self.assertNotRegex(page, r"Step \d+ of \d+")

@@ -10,6 +10,18 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
   to try per part, and summons the owner to it. A marker under `<workspace>/state/tutorial/` keeps it to one page per room, so
   a re-link or reinstall refreshes the page instead of adding another.
 
+## Using the guide
+
+The labelled step navigator lets readers jump directly to a topic instead of guessing a number.
+Use Back and Next for the guided path, Show all for a reference view, and Copy for an example
+prompt. Completion is per viewer when the Commons runtime supplies a viewer identity; otherwise
+it uses browser-local storage, falling back to memory when storage is unavailable.
+
+The layout uses the s.space orange, yellow and pink gradient pairs with ink/offwhite surfaces.
+Avantt SemiBold and Haas Recast are named in the font stack, with system-font fallbacks; no
+licensed font binaries are bundled. Controls have 44-pixel minimum touch targets, the topic grid
+wraps on narrow screens, and reduced-motion and dark-mode preferences are respected.
+
 ## What the page is built from
 
 - **The feature list.** The steps come from `skills/tutorial/feature-list.json` (one step per
@@ -71,7 +83,11 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
   run that skips, keeps an edited page or stops on the page's size uploads nothing. Every page
   variant stays under 300 KB.
 
-Last verified: 2026-10-31, against `tests/tutorial-feature-list.test.py` and
+Navigation and responsive polish verified 2026-11-19 in Chromium at 1280, 390 and 320 pixels,
+including light/dark mode, Show all, step navigation, copying and completion after reload.
+Existing screenshot assets were not recaptured in that pass.
+
+Earlier publishing verification: 2026-10-31, against `tests/tutorial-feature-list.test.py` and
 `tests/tutorial-getting-started.test.py`. The screenshot upload and the HTML-surface rendering of
 `mxc://` media were verified live in a VM on 2026-10-30/31: a page published to a test account's
 DM uploaded all 13 assets and rendered in the desktop app 0.8.2, in Safari on the web, in dark
