@@ -312,7 +312,7 @@ button:focus-visible { outline:3px solid var(--ink); outline-offset:3px; }
 </head>
 <body>
 <div class="container">
-<p class="subtitle">Interactive overview · Examples only. These controls do not connect apps, change permissions or start calls.</p>
+<p class="subtitle">Interactive overview · Explore example connections, permissions and workflows.</p>
   <header class="hero">
     <div class="tag-badge">s.space Guide &amp; Tour</div>
     <h1>The Multiplayer AI Workspace</h1>
@@ -320,8 +320,8 @@ button:focus-visible { outline:3px solid var(--ink); outline-offset:3px; }
     
     <div class="nav-tracker">
       <div class="nav-header">
-        <span class="nav-title">Four things to try</span>
-        <div class="badge-status" id="progressStatus">1 of 4: Ecosystem</div>
+        <span class="nav-title">Explore four topics</span>
+        <div class="badge-status" id="progressStatus">Ecosystem</div>
       </div>
       <div class="steps-tabs">
         <button class="tab-btn active" onclick="showStep(0)">
@@ -346,9 +346,9 @@ button:focus-visible { outline:3px solid var(--ink); outline-offset:3px; }
 
   <!-- Step 1: Cross-Provider AI Ecosystem -->
   <section class="tour-card active" id="step-0">
-    <div class="card-num">Step 1 · Cross-Provider Ecosystem</div>
-    <h2>Connect an agent, not just a model</h2>
-    <p class="card-desc">Use an agent from another app, or set up Sutando. These are different setup paths; connecting an agent does not give every agent the same tools.</p>
+    <div class="card-num">Topic · Agent connections</div>
+    <h2>Bring your agents together</h2>
+    <p class="card-desc">Connect an agent from another app, run a local coding agent, or set up Sutando as your personal agent. Choose the connection that fits your work.</p>
 
     <div class="feature-grid">
       <div class="feature-box">
@@ -361,13 +361,13 @@ button:focus-visible { outline:3px solid var(--ink); outline-offset:3px; }
       </div>
       <div class="feature-box">
         <h4>🔌 Connected apps</h4>
-        <p>Manage your app connections in Settings → Apps → Connected apps. Ask an agent to check which tools it can use; do not assume other room members or their agents inherit access to your accounts.</p>
+        <p>Manage connections in Settings → Apps → Connected apps. Your accounts stay under your control; ask your agent which tools are available.</p>
       </div>
     </div>
 
     <div class="interactive-panel">
       <div class="panel-title">Explore the connections</div>
-      <p style="font-size:13.5px;color:var(--mute);margin-bottom:12px">Bring an agent from another app, connect a coding agent running on your computer, or set up Sutando as your local personal agent. These are distinct connections, not interchangeable model names. Choose a tab to see where it runs and how to connect it.</p>
+      <p style="font-size:13.5px;color:var(--mute);margin-bottom:12px">Choose an agent to see where it runs and how to connect it.</p>
       <div class="interactive-tabs">
         <button class="sub-tab active" onclick="setProvider('antigravity', this)">Antigravity</button>
         <button class="sub-tab" onclick="setProvider('claudeCode', this)">Claude Code</button>
@@ -394,13 +394,13 @@ button:focus-visible { outline:3px solid var(--ink); outline-offset:3px; }
 
     <div class="card-nav">
       <span></span>
-      <button class="btn-nav primary" onclick="showStep(1)">Next: 2. Multiplayer →</button>
+      <button class="btn-nav primary" onclick="showStep(1)">Explore Multiplayer →</button>
     </div>
   </section>
 
   <!-- Step 2: Multiplayer Collaboration in Rooms -->
   <section class="tour-card" id="step-1">
-    <div class="card-num">Step 2 · Multiplayer Collaboration</div>
+    <div class="card-num">Topic · Multiplayer collaboration</div>
     <h2>Rooms Where People &amp; Personal Agents Collaborate</h2>
     <p class="card-desc">People and their agents work together in a shared room. Each agent keeps its own owner, connections and permissions.</p>
 
@@ -410,12 +410,12 @@ button:focus-visible { outline:3px solid var(--ink); outline-offset:3px; }
         <p>Invite colleagues and their agents into a shared room. Teammates can direct their agents to collaborate with yours on complex workflows.</p>
       </div>
       <div class="feature-box">
-        <h4>🤝 Autonomous Task Handoffs</h4>
+        <h4>🤝 Agent-to-agent teamwork</h4>
         <p>Ask one agent to work with another: for example, one prepares a patch and another reviews it. Collaboration depends on each agent’s access and owner authorization.</p>
       </div>
       <div class="feature-box">
         <h4>🛡️ Granular Access Tiers</h4>
-        <p>Room permissions and each agent owner’s access settings determine what it can do. An agent may refuse requests from other members until its owner enables collaboration.</p>
+        <p>Owners choose how other room members can work with their agents. Room permissions and agent settings keep collaboration within that scope.</p>
       </div>
     </div>
 
@@ -424,10 +424,10 @@ button:focus-visible { outline:3px solid var(--ink); outline-offset:3px; }
       <div class="interactive-tabs">
         <button class="sub-tab active" onclick="setTier('collaborator', this)">Team — collaborator</button>
         <button class="sub-tab" onclick="setTier('guest', this)">Guest — owner approves first</button>
-        <button class="sub-tab" onclick="setTier('none', this)">No access — cannot invoke agent</button>
+        <button class="sub-tab" onclick="setTier('none', this)">No access — other members cannot invoke</button>
       </div>
       <div class="panel-content" id="tierInfo">
-        <strong>Team — collaborator:</strong> Team allows collaboration in the workspace. It is not owner access: private data, tool approvals and the agent’s own rules still apply.
+        <strong>Team — collaborator:</strong> Work with the agent in the shared workspace, within its owner’s permissions and tool-approval settings.
       </div>
     </div>
 
@@ -440,19 +440,19 @@ button:focus-visible { outline:3px solid var(--ink); outline-offset:3px; }
     </div>
 
     <div class="card-nav">
-      <button class="btn-nav" onclick="showStep(0)">← Back</button>
-      <button class="btn-nav primary" onclick="showStep(2)">Next: 3. Calls &amp; Local Tools →</button>
+      <button class="btn-nav" onclick="showStep(0)">← Previous topic</button>
+      <button class="btn-nav primary" onclick="showStep(2)">Explore Calls &amp; Local Tools →</button>
     </div>
   </section>
 
   <!-- Step 3: Live Calls, Screen Sharing & Realtime Computer Use -->
   <section class="tour-card" id="step-2">
-    <div class="card-num">Step 3 · Calls and local tools</div>
-    <h2>Talk in s.space; use local tools separately</h2>
-    <p class="card-desc">Start an s.space call to talk with people and an enabled agent. A room call is not the same thing as Sutando’s local Mac voice, vision and computer-use session.</p>
+    <div class="card-num">Topic · Calls and local tools</div>
+    <h2>Talk through ideas and work live</h2>
+    <p class="card-desc">Talk with teammates and voice-enabled agents in an s.space call. For hands-on screen coaching or editing, use a supported local session with the access you approve.</p>
 
     <div class="callout">
-      <div class="callout-title">🎙️ Spoken Interaction Tip (Live Modality)</div>
+      <div class="callout-title">🎙️ Bring an agent into the conversation</div>
       <p>Use the headphone control (Start call) in the room header. In a room, choose an agent under “Bring an agent?” and select “Bring into call”. Ask aloud: <em>"Read the bug report in this room and help us decide what to try next."</em></p>
     </div>
 
@@ -462,36 +462,38 @@ button:focus-visible { outline:3px solid var(--ink); outline-offset:3px; }
         <p>In your DM, the agent can answer directly. In a room, explicitly bring it into the call. Voice must be enabled for that agent and allowed in that room.</p>
       </div>
       <div class="feature-box">
-        <h4>🖥️ Screen sharing is not computer access</h4>
-        <p>Sharing a screen with call participants does not grant an agent local computer access or guarantee it receives the screen. Put relevant text or an artifact in the room for review.</p>
+        <h4>🖥️ Share context for the conversation</h4>
+        <p>Put relevant text or an artifact in the room for the agent to review. Room-call screen sharing is work in progress; agent screen access uses a separate, supported local session with your permission.</p>
       </div>
       <div class="feature-box">
         <h4>🖱️ Local Mac Computer Use</h4>
-        <p>Local screen inspection and GUI actions require a configured Sutando session on your Mac and device permissions. Joining a room call does not enable those tools.</p>
+        <p>A configured Sutando session can inspect your Mac screen and use local apps with your device permissions and authorization.</p>
       </div>
     </div>
 
     <div class="interactive-panel">
-      <div class="panel-title">Interactive Voice Call Scenario Preview</div>
+      <div class="panel-title">Explore voice workflows</div>
       <div class="interactive-tabs">
         <button class="sub-tab active" onclick="setCallScenario('debug', this)">Discuss a bug report</button>
         <button class="sub-tab" onclick="setCallScenario('design', this)">UI / Spec Review</button>
         <button class="sub-tab" onclick="setCallScenario('triage', this)">Issue Triage</button>
+        <button class="sub-tab" onclick="setCallScenario('coach', this)">Live screen coach</button>
+        <button class="sub-tab" onclick="setCallScenario('writing', this)">Write &amp; edit by voice</button>
       </div>
       <div class="panel-content" id="callInfo">
-        <strong>Debug Scenario:</strong> Post the relevant error text in the room. Ask aloud: <em>"Read that error and suggest a way to reproduce it."</em> The agent can discuss the evidence it can access; it has not inspected your display.
+        <strong>Debug Scenario:</strong> Post the relevant error text in the room. Ask aloud: <em>"Read that error and suggest a way to reproduce it."</em> The agent can help diagnose the shared evidence.
       </div>
     </div>
 
     <div class="card-nav">
-      <button class="btn-nav" onclick="showStep(1)">← Back</button>
-      <button class="btn-nav primary" onclick="showStep(3)">Next: 4. Commons &amp; Tasks →</button>
+      <button class="btn-nav" onclick="showStep(1)">← Previous topic</button>
+      <button class="btn-nav primary" onclick="showStep(3)">Explore Commons &amp; Tasks →</button>
     </div>
   </section>
 
   <!-- Step 4: Room Commons & Autonomous Background Tasks -->
   <section class="tour-card" id="step-3">
-    <div class="card-num">Step 4 · Room Commons &amp; Tasks</div>
+    <div class="card-num">Topic · Commons and follow-up</div>
     <h2>Keep shared work in Commons</h2>
     <p class="card-desc">Room Commons holds shared pages and other artifacts alongside the conversation. Open Commons in the room header and choose the surface for your work.</p>
 
@@ -502,11 +504,11 @@ button:focus-visible { outline:3px solid var(--ink); outline-offset:3px; }
       </div>
       <div class="feature-box">
         <h4>📊 Interactive Commons HTML</h4>
-        <p>Agents can create HTML pages with interactive examples, charts and tools. A page is not automatically connected to live data or authorized to act on your accounts.</p>
+        <p>Ask an agent to build interactive examples, charts and tools. Live data and account actions use supported integrations with your authorization.</p>
       </div>
       <div class="feature-box">
         <h4>⏰ Scheduled follow-up work</h4>
-        <p>For your own agent, request scheduled follow-up in your DM. State when to run, what to check and where to send results; verify that the agent created the schedule. A schedule is not a Commons page.</p>
+        <p>Ask your agent in a DM to schedule follow-up. Specify when, what to check and where to report, then confirm the schedule was created.</p>
       </div>
     </div>
 
@@ -518,7 +520,7 @@ button:focus-visible { outline:3px solid var(--ink); outline-offset:3px; }
         <button class="sub-tab" onclick="setCommons('board', this)">Whiteboard</button>
       </div>
       <div class="panel-content" id="commonsInfo">
-        <strong>Commons HTML Pages:</strong> Interactive HTML pages displayed in Commons. This guide is a self-contained example; live data and external actions require separate supported integrations and authorization.
+        <strong>Commons HTML Pages:</strong> Build interactive guides, charts and tools in Commons. Add live data or actions through supported, authorized integrations.
       </div>
     </div>
 
@@ -531,8 +533,8 @@ button:focus-visible { outline:3px solid var(--ink); outline-offset:3px; }
     </div>
 
     <div class="card-nav">
-      <button class="btn-nav" onclick="showStep(2)">← Back</button>
-      <button class="btn-nav primary" onclick="showStep(0)">Start Over ↺</button>
+      <button class="btn-nav" onclick="showStep(2)">← Previous topic</button>
+      <button class="btn-nav primary" onclick="showStep(0)">Return to Ecosystem ↺</button>
     </div>
   </section>
 </div>
@@ -541,11 +543,11 @@ button:focus-visible { outline:3px solid var(--ink); outline-offset:3px; }
 const steps = document.querySelectorAll('.tour-card');
 const tabs = document.querySelectorAll('.tab-btn');
 const progressStatus = document.getElementById('progressStatus');
-const stepNames = ["1 of 4: Ecosystem", "2 of 4: Multiplayer", "3 of 4: Calls & Local Tools", "4 of 4: Commons & Tasks"];
+const stepNames = ["Ecosystem", "Multiplayer", "Calls & Local Tools", "Commons & Tasks"];
 
 function showStep(idx) {
   steps.forEach((step, i) => step.classList.toggle('active', i === idx));
-  tabs.forEach((tab, i) => { tab.classList.toggle('active', i === idx); tab.setAttribute('aria-current', i === idx ? 'step' : 'false'); });
+  tabs.forEach((tab, i) => { tab.classList.toggle('active', i === idx); tab.setAttribute('aria-current', i === idx ? 'true' : 'false'); });
   const heading = steps[idx].querySelector('h2'); heading.tabIndex = -1; heading.focus();
   if (progressStatus) progressStatus.textContent = stepNames[idx];
 }
@@ -587,9 +589,9 @@ function setTier(tier, btn) {
   btn.classList.add('active');
   const info = document.getElementById('tierInfo');
   const details = {
-    collaborator: "<strong>Team — collaborator:</strong> Team allows collaboration in the workspace. It is not owner access: private data, tool approvals and the agent’s own rules still apply.",
-    guest: "<strong>Guest:</strong> Guest requests need the owner’s approval; a connected agent may refuse them until collaboration is enabled. Guest is not permission to freely query private data.",
-    none: "<strong>No access:</strong> You cannot invoke the agent. A room member cannot grant themselves the agent owner’s authority."
+    collaborator: "<strong>Team — collaborator:</strong> Work with the agent in the shared workspace, within its owner’s permissions and tool-approval settings.",
+    guest: "<strong>Guest:</strong> Ask the owner to approve your requests and enable the collaboration you need.",
+    none: "<strong>No access:</strong> The owner can still access and invoke the agent; other room members cannot."
   };
   info.innerHTML = details[tier] || "";
 }
@@ -599,9 +601,11 @@ function setCallScenario(scen, btn) {
   btn.classList.add('active');
   const info = document.getElementById('callInfo');
   const details = {
-    debug: "<strong>Debug Scenario:</strong> Post the relevant error text in the room. Ask aloud: <em>\"Read that error and suggest a way to reproduce it.\"</em> The agent can discuss the evidence it can access; it has not inspected your display.",
+    debug: "<strong>Debug Scenario:</strong> Post the relevant error text in the room. Ask aloud: <em>\"Read that error and suggest a way to reproduce it.\"</em> The agent can help diagnose the shared evidence.",
     design: "<strong>UI / Spec Review:</strong> Open a shared design artifact in Commons. Ask aloud: <em>\"Read the comments on this design and summarize the decisions we still need.\"</em> Confirm the agent can access the artifact.",
-    triage: "<strong>Issue Triage:</strong> Ask aloud: <em>\"Read the bug thread in this room and summarize the unresolved questions.\"</em> Share relevant logs in the room rather than assuming the agent sees your screen."
+    triage: "<strong>Issue Triage:</strong> Ask aloud: <em>\"Read the bug thread in this room and summarize the unresolved questions.\"</em> Add the relevant logs to the room for the agent to review.",
+    coach: "<strong>Live coach with a screen companion:</strong> In a supported, configured local session, enable screen access only for what you want to share. Ask aloud: <em>\"Look at this screen and coach me through the next step; let me do the clicking.\"</em> Confirm the relevant view is available through your approved local screen access.",
+    writing: "<strong>Live writing &amp; editing:</strong> Select a passage with your cursor, then ask aloud: <em>\"Rewrite only this selection to be clearer, keeping my meaning.\"</em> In a supported editor or local session, confirm the agent received the selection and authorize the edit, then review the result. If selection access is unavailable, paste the passage into the room."
   };
   info.innerHTML = details[scen] || "";
 }
@@ -611,9 +615,9 @@ function setCommons(surf, btn) {
   btn.classList.add('active');
   const info = document.getElementById('commonsInfo');
   const details = {
-    html: "<strong>Commons HTML Pages:</strong> Interactive HTML pages displayed in Commons. This guide is a self-contained example; live data and external actions require separate supported integrations and authorization.",
+    html: "<strong>Commons HTML Pages:</strong> Build interactive guides, charts and tools in Commons. Add live data or actions through supported, authorized integrations.",
     doc: "<strong>Multiplayer Docs:</strong> Shared documents for plans, meeting notes and test checklists. Edit the document or leave a comment for discussion.",
-    board: "<strong>Whiteboard:</strong> A shared visual canvas in Commons for sketches and diagrams. It is not a job scheduler."
+    board: "<strong>Whiteboard:</strong> Sketch ideas and diagrams together on a shared visual canvas."
   };
   info.innerHTML = details[surf] || "";
 }

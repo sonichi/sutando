@@ -16,7 +16,7 @@ class OverviewTest(unittest.TestCase):
         # Emitted copy and demo boundaries are intentional data pins.
         page = PAGE.read_text()
         self.assertEqual(re.findall(r'id="step-(\d)"', page), ["0", "1", "2", "3"])
-        self.assertIn("do not connect apps, change permissions or start calls", page)
+        self.assertIn("Explore example connections, permissions and workflows", page)
         self.assertNotIn("Spacer", page)
         self.assertNotRegex(page, r'<script[^>]+src=|@font-face|fetch\(')
 
@@ -31,7 +31,8 @@ class OverviewTest(unittest.TestCase):
         page = PAGE.read_text()
         for expected in ("Hermes", "OpenClaw", "Grok Bot", "Team — collaborator",
                          "Guest — owner approves first", "Bring into call",
-                         "A schedule is not a Commons page", "setCommons('board'"):
+                         "Room-call screen sharing is work in progress",
+                         "confirm the schedule was created", "setCommons('board'"):
             self.assertIn(expected, page)
         for obsolete in ("Gemini (Google)", "Anthropic Code / Duet",
                          "setCommons('cron'", "logs on my screen", "Share any window"):
@@ -87,6 +88,17 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
     return { label: button.textContent, text: d.getElementById('providerInfo').textContent,
       active: button.classList.contains('active') };
   });
+  result.topics = [...d.querySelectorAll('.tab-btn')].map(button => {
+    button.click();
+    return { label: button.textContent.trim(), status: d.getElementById('progressStatus').textContent,
+      focused: d.activeElement === d.querySelector('.tour-card.active h2') };
+  });
+  result.tiers = [...d.querySelectorAll('#step-1 .sub-tab')].map(button => {
+    button.click(); return d.getElementById('tierInfo').textContent;
+  });
+  result.scenarios = [...d.querySelectorAll('#step-2 .sub-tab')].map(button => {
+    button.click(); return { label: button.textContent, text: d.getElementById('callInfo').textContent };
+  });
   result.errors = errors;
   console.log(JSON.stringify(result));
   dom.window.close();
@@ -110,6 +122,16 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
         self.assertIn("separate from Claude Duet", providers["Claude Code"])
         self.assertIn("separate from Dot", providers["Codex"])
         self.assertIn("Hermes and OpenClaw", providers["Other apps"])
+        self.assertEqual([t["status"] for t in out["topics"]],
+                         ["Ecosystem", "Multiplayer", "Calls & Local Tools", "Commons & Tasks"])
+        self.assertTrue(all(t["focused"] for t in out["topics"]))
+        self.assertIn("owner can still access and invoke", out["tiers"][2])
+        self.assertIn("other room members cannot", out["tiers"][2])
+        scenarios = {s["label"]: s["text"] for s in out["scenarios"]}
+        self.assertIn("supported, configured local session", scenarios["Live screen coach"])
+        self.assertIn("approved local screen access", scenarios["Live screen coach"])
+        self.assertIn("authorize the edit", scenarios["Write & edit by voice"])
+        self.assertIn("paste the passage", scenarios["Write & edit by voice"])
         self.assertEqual(out["errors"], [])
         self.assertEqual(out["copies"], 1)
         self.assertTrue(out["prompt"].strip())
