@@ -636,10 +636,11 @@ class RoundAccountingTest(unittest.TestCase):
 
     def test_a_round_whose_ledger_did_not_commit_names_every_task(self):
         loop = self._run([self._task(1), self._task(2)], commit=False)
-        self.assertIn("acks withheld for 2 task(s): the in-flight set or ack ledger did not commit",
-                      loop.logs)
-        flagged = [m.split()[1] for m in loop.logs if "was not acked" in m]
-        self.assertEqual(flagged, ["task-r1", "task-r2"])
+        withheld = "acks withheld for 1 task(s): the in-flight set or ack ledger did not commit"
+        self.assertEqual(loop.logs.count(withheld), 2, "each task's ack commits on its own")
+        flagged = [m for m in loop.logs if "was not acked" in m]
+        self.assertEqual([m.split()[1] for m in flagged], ["task-r1", "task-r2"])
+        self.assertTrue(all("its ack was withheld" in m for m in flagged), flagged)
 
     def test_dropped_tasks_are_settled_and_an_ack_first_task_without_a_fate_is_named(self):
         relay = {"id": "ask-5f3c9e0a1b2c", "task": "calendar?", "ack_first": True}

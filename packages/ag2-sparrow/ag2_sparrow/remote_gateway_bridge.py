@@ -2319,6 +2319,24 @@ STOP_INTERRUPT = False
 INTAKE_DEFER = "\0intake-defer"
 _INTAKE_MODE: dict = {"defer": False, "deadline": None}
 _INTAKE_ROUND_WAIT_S = 6.0
+# An intake slower than this logs how long each step from "served" to "queued" took.
+INTAKE_SLOW_LOG_S = 2.0
+_INTAKE_LAPS = threading.local()
+
+
+def _intake_lap(step: str) -> None:
+    laps = getattr(_INTAKE_LAPS, "laps", None)
+    if laps is not None:
+        laps.append((step, time.monotonic()))
+
+
+def _log_intake_time(key: str, laps: list) -> None:
+    end = time.monotonic()
+    if end - laps[0][1] < INTAKE_SLOW_LOG_S:
+        return
+    steps = [f"{name} {t - prev:.1f}s" for (_, prev), (name, t) in zip(laps, laps[1:])]
+    steps.append(f"rest {end - laps[-1][1]:.1f}s")
+    _log(f"intake of {key} took {end - laps[0][1]:.1f}s: {', '.join(steps)}")
 
 
 class _IntakeDeferred(Exception):
@@ -3831,6 +3849,18 @@ ACK_DROP_RETRY_S = 0.5
 ACK_RETRY_BUDGET_S = 10.0
 
 
+# Why each task's last ack did not land, for the round's settle line; bounded, diagnostic only.
+_ACK_MISS: "dict[str, str]" = {}
+_ACK_MISS_MAX = 512
+
+
+def _ack_missed(tid: str, why: str) -> bool:
+    if len(_ACK_MISS) >= _ACK_MISS_MAX:
+        _ACK_MISS.clear()
+    _ACK_MISS[_broker_tid(tid)] = why
+    return False
+
+
 def _connection_dropped(e: BaseException) -> bool:
     """The peer closed or reset the connection: the request may never have been read."""
     reason = e.reason if isinstance(e, urllib.error.URLError) else e
@@ -3851,9 +3881,13 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
     # Validate the WIRE id (post-conversion): a named instance's LOCAL id may
     # legitimately exceed the 64-char wire bound (review P1 #1) — refusing on
     if not _valid_tid(_broker_tid(tid)):
-        return False
+        _log_backoff((tid, "ack-invalid-id"), f"task ack for {tid}: its wire id is not valid — not posted")
+        return _ack_missed(tid, "its wire id is not valid")
     if _ack_disabled_until and time.time() < _ack_disabled_until:
-        return False  # gateway recently 404'd /ack — retry after the cooldown
+        left = int(_ack_disabled_until - time.time())
+        _log_backoff((tid, "ack-cooldown"), f"task ack for {tid}: skipped — /ack is in its "
+                     f"unsupported-endpoint cooldown for {left}s more")
+        return _ack_missed(tid, "skipped in the /ack cooldown")
     claim = None
     try:
         wire_tid = _broker_tid(tid)
@@ -3863,11 +3897,11 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
             if claim == "elsewhere":
                 _forget_pending_ack(tid, lease_id)
                 _log(f"task ack for {tid}: its attempt no longer holds this serve — not posted")
-                return False
+                return _ack_missed(tid, "its attempt no longer holds this serve")
             if claim is None:
                 _log_backoff((tid, "ack-unclaimed"), f"task ack for {tid}: not claimed on disk "
                              "— the pending ack is kept and retried")
-                return False
+                return _ack_missed(tid, "not claimed on disk")
         body = {"id": wire_tid}
         if lease_id:
             body["lease_id"] = lease_id
@@ -3886,7 +3920,7 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
             if dropped is not None:
                 dropped.append((tid, durable, lease_id))
                 _log(f"task ack for {tid} lost to a dropped connection ({diagnostics.describe(e)}) — set aside for retry")
-                return False
+                return _ack_missed(tid, "lost to a dropped connection")
             # A dropped link loses the ack; one prompt retry lands it inside the delivery lease.
             time.sleep(ACK_DROP_RETRY_S)
             doc = _req("POST", f"/v1/tasks/{safe_tid}/ack", body, timeout=_ACK_TIMEOUT_S, **bound)
@@ -3896,17 +3930,18 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
             if recorded == "unrecorded":
                 _log_backoff((tid, "ack-unrecorded"), f"task ack for {tid}: accepted, but its generation "
                              "could not be recorded — the pending ack is kept and retried")
-                return False
+                return _ack_missed(tid, "accepted, but its generation could not be recorded")
             if _ack_unlanded(wire_tid, lease_id):
                 _log_backoff((tid, "ack-unlanded"), f"task ack for {tid}: accepted, but its generation has "
                              "no run here yet — the pending ack is kept and retried")
-                return False
+                return _ack_missed(tid, "accepted, but its generation has no run here yet")
         _forget_pending_ack(tid, lease_id)
+        _ACK_MISS.pop(wire_tid, None)
         return True
     except urllib.error.HTTPError as e:
         raw = _http_error_body(e) if e.code in (404, 409) else ""
         if _ack_fenced(tid, claim, raw, published=True):
-            return False
+            return _ack_missed(tid, f"fenced (HTTP {e.code})")
         if e.code in (404, 405):
             # A 404/405 is ambiguous. The pre-/ack broker returns a bare no-route
             # 404/405 → the endpoint is UNSUPPORTED: back off (cooldown) and retry
@@ -3915,24 +3950,24 @@ def _post_task_ack(tid: str, durable: bool = False, lease_id: "str | None" = Non
                 if claim is not None and not _ack_settled(wire_tid, claim):
                     _log_backoff((tid, "ack-unsettled"), f"task ack for {tid}: not leased, but its "
                                  "ack wait could not be ended on disk — the pending ack is kept")
-                    return False
+                    return _ack_missed(tid, "not leased, and its ack wait could not be ended on disk")
                 if "stale lease generation" in reason:
                     _log(f"task ack for {tid} named a superseded lease generation "
                          "— the broker re-serves it; not retrying")
                 _forget_pending_ack(tid, lease_id)  # terminal: the lease is gone for good
-                return False   # per-task lease gone — keep acking the rest
+                return _ack_missed(tid, "not leased")   # per-task lease gone — keep acking the rest
             _ack_disabled_until = time.time() + ACK_UNSUPPORTED_COOLDOWN
             _log(f"gateway does not support task ack — retrying in "
                  f"{ACK_UNSUPPORTED_COOLDOWN}s")
-            return False
+            return _ack_missed(tid, f"HTTP {e.code}: /ack unsupported")
         if e.code in (401, 403):
             raise
         _log(f"task ack failed for {tid}: HTTP {e.code} — gateway may redeliver")
-        return False
+        return _ack_missed(tid, f"HTTP {e.code}")
     except _NETWORK_ERRORS as e:
         # The ack may have landed: its claim stays open, and the retry reuses its operation id.
         _log(f"task ack network error for {tid}: {diagnostics.describe(e)} — gateway may redeliver")
-        return False
+        return _ack_missed(tid, "network error")
 
 
 # Times each waiting line recurred in this process, for `_log_backoff`.
@@ -6441,6 +6476,7 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         # Decided before any local shortcut: running a wake without its answer, or closing it as a
         # redelivery, would lose the answer.
         served = _serve_attempt(broker_tid, tid, task, hold)
+        _intake_lap("attempt")
         if served is None:
             return None
         tid, woken, held = served
@@ -6471,6 +6507,7 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         _log(f"dedup: {tid} already handled — not re-queued")
         return tid, durable
     duplicate = _task_intake_veto(task)
+    _intake_lap("intake gate")
     if duplicate:
         durable = _settle_as_handled(tid)
         _log(f"{duplicate} ({tid})")
@@ -6525,6 +6562,7 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
             # Resolve an inbound media marker to a local file the core can read.
             _media_refs: list = []
             _fetched = _maybe_fetch_media(_raw_task, _media_refs)
+            _intake_lap("media")
             # Intercept `vault set KEY VALUE` before ordinary redaction, owner-tier only.
             # Every path below intercepts-and-stores or falls through to a redactor — never neither.
             _cleaned = task.get(RESERVE_CLEANED)
@@ -6668,11 +6706,14 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
         return None
     if hold:
         return _hold_staged(tid, tmp, task_text, task, sender_tier)
+    _intake_lap("staged")
     if not _publish_task(tid, tmp, dest):  # atomic publish: never a partial file
         tmp.unlink(missing_ok=True)
         return None
+    _intake_lap("published")
     _mark_published(tid)
     _on_published(tid, dest, task_text, task, sender_tier)
+    _intake_lap("queued")
     return tid, True
 
 
@@ -7764,8 +7805,10 @@ def _retry_dropped_acks(dropped: list, received_at: float, fates: dict) -> None:
 def _settle_round(fates: dict) -> None:
     """Every served task ends the round acked, staged, consumed or dropped with a reason."""
     for key, fate in fates.items():
+        why = _ACK_MISS.pop(key, None)
         if fate is None:
-            _log(f"served {key} was not acked, staged, consumed or dropped this round "
+            why = f"its ack {why}" if why else "no ack was posted for it (its intake did not finish)"
+            _log(f"served {key} was not acked, staged, consumed or dropped this round: {why} "
                  "— the broker re-serves it when its lease expires")
 
 
@@ -7814,7 +7857,12 @@ def _take_served_task(task: dict, inflight: "set[str]", pending_ack: list,
 
 
 def _queue_served(task: dict, inflight: "set[str]", pending_ack: list, fates: "dict | None") -> bool:
-    written = _write_task(task)
+    _INTAKE_LAPS.laps = [("served", time.monotonic())]
+    try:
+        written = _write_task(task)
+    finally:
+        laps, _INTAKE_LAPS.laps = _INTAKE_LAPS.laps, None
+        _log_intake_time(_served_key(task), laps)
     if not written:
         _set_fate(fates, task, "dropped")       # _write_task logged why
         return False
@@ -7834,6 +7882,8 @@ def _commit_round_acks(pending_ack: list, inflight: "set[str]", dropped: list, f
     if pending_ack and not committed:
         _log(f"acks withheld for {len(pending_ack)} task(s): the in-flight set or "
              "ack ledger did not commit")
+    for tid, _durable, _lease in () if committed else pending_ack:
+        _ack_missed(tid, "was withheld: the in-flight set or ack ledger did not commit")
     for tid, durable, lease in pending_ack if committed else ():
         if _post_task_ack(tid, durable, lease, dropped=dropped):
             fates[_broker_tid(tid)] = "acked"
@@ -7841,19 +7891,22 @@ def _commit_round_acks(pending_ack: list, inflight: "set[str]", dropped: list, f
 
 def _take_served_round(tasks: list, inflight: "set[str]", pending_ack: list, fates: dict,
                        dropped: list) -> bool:
-    """Take and ack every non-`ack_first` task. One whose intake gate would wait on another
-    lane is taken after every sibling's ack, so the wait delays no one else's lease."""
+    """Take and ack every non-`ack_first` task, each as soon as its own durable write lands, so a
+    slow sibling's intake never holds an ack past its lease. One whose intake gate would wait on
+    another lane is taken after every sibling's ack, so the wait delays no one else's lease."""
     added = False
     deferred: list = []
     _INTAKE_MODE["defer"] = True
     try:
         for task in tasks:
             if task.get("ack_first") is not True:
-                added |= _isolated(task, _take_served_task, task, inflight, pending_ack,
+                task_ack: list = []
+                added |= _isolated(task, _take_served_task, task, inflight, task_ack,
                                    fates, deferred, fates=fates)
+                pending_ack.extend(task_ack)
+                _commit_round_acks(task_ack, inflight, dropped, fates)
     finally:
         _INTAKE_MODE["defer"] = False
-    _commit_round_acks(pending_ack, inflight, dropped, fates)
     if deferred:
         _INTAKE_MODE["deadline"] = time.monotonic() + _INTAKE_ROUND_WAIT_S
         try:
