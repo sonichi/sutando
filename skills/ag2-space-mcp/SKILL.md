@@ -112,9 +112,9 @@ or a local timer, except as step 8 allows.
 8. If the platform scheduler is not available (scheduling turned off, the schedule Actions
    missing from the catalog, or the service unreachable), a host with its own scheduler may run
    the job locally, as a last resort only. Tell the owner it runs locally, not on the platform.
-   If the platform refuses the request, or its approval is pending, declined or expired, do not
-   set it up locally: tell the owner the timed work was not set up. Do not switch routes to get
-   around an approval. A native timed-task tool is an alternative only when trusted host
+   If the platform refuses the request, or its approval is declined or expired, do not set it
+   up locally: tell the owner the timed work was not set up. A pending approval is held (step 3).
+   Do not switch routes to get around an approval, whether it is pending, declined or expired. A native timed-task tool is an alternative only when trusted host
    instructions say it is platform-backed.
 9. A cloud Spacer must not create local timed jobs. An unavailable platform means the timed work
    cannot be set up, not permission to keep it awake with local scheduling.
