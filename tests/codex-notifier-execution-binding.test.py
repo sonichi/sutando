@@ -97,7 +97,7 @@ class CodexNotifierBindingTest(unittest.TestCase):
         env.update({
             "NOTIFIER_PY": sys.executable, "BINDING_PY": str(BINDING_PY), "WRITER": str(WRITER),
             "DISPATCH_PY": str(REPO / "src" / "delivery" / "task_dispatch.py"),
-            "WORKSPACE_DIR": str(self.ws), "TASKS_DIR": str(self.ws / "tasks"),
+            "WORKSPACE_DIR": str(self.ws), "BINDING_FILE": str(self.binding), "TASKS_DIR": str(self.ws / "tasks"),
             "RESULTS_DIR": str(self.ws / "results"), "INFLIGHT_DIR": str(self.ws / "state" / "inflight"),
             "YIELDED_DIR": str(self.ws / "state" / "yielded"), "CONTEXT_DIR": str(self.ws / "state" / "context"),
             "PAYLOAD_DIR": str(self.ws / "payload"), "queue_dir": str(self.ws / "queue"),
@@ -122,6 +122,22 @@ class CodexNotifierBindingTest(unittest.TestCase):
         self.assertEqual(self._native_calls(), [], "no open/osascript for a Team task")
         self.assertIn("not the owner's", (self.ws / "writer.err").read_text())
         self.assertEqual((self.ws / "writer.out").read_text(), "")
+
+    def test_voice_ask_named_task_binds_and_is_dispatched(self):
+        for name, tier in (("ask-mvckxfcz-yayd0qry.txt", "team"), ("sc-ask-0a1b2c.txt", "owner")):
+            self._task(name, tier)
+            (self.ws / "prompt.txt").unlink(missing_ok=True)
+            r = self._bash(f'submit_task "{name}" 2')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn(name, (self.ws / "prompt.txt").read_text(), "dispatch is not blocked")
+            self.assertEqual(json.loads((self.ws / "binding-at-delivery.json").read_text())["task_id"],
+                             name[:-4])
+            refused = (self.ws / "writer.rc").read_text() == str(EXIT_NO_CONSENT)
+            self.assertEqual(refused, tier == "team", name)
+            self.assertNotIn("could not bind", (self.ws / "notifier.log").read_text()
+                             if (self.ws / "notifier.log").exists() else "")
+            self._bash(f'finish_responsive_task "{name}" completed')
+            self.assertFalse(self.binding.exists())
 
     def test_dispatched_owner_task_passes_the_gate(self):
         self._task("task-own1.txt", "owner")
@@ -171,28 +187,44 @@ class CodexNotifierBindingTest(unittest.TestCase):
             f"runpy.run_path({str(BINDING_PY)!r}, run_name='__main__')\n")
         return str(broken)
 
-    def test_failed_bind_does_not_dispatch_and_removes_the_earlier_owner_binding(self):
+    def _assert_dispatched_unbound_and_refused(self, r):
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((self.ws / "prompt.txt").exists(), "one failed bind does not stop the core's dispatch")
+        self.assertFalse((self.ws / "binding-at-delivery.json").exists(),
+                         "the earlier owner's record is gone before the prompt is typed")
+        self.assertFalse(self.binding.exists())
+        self.assertEqual((self.ws / "writer.rc").read_text(), str(EXIT_NO_CONSENT))
+        self.assertIn("consent could not be verified", (self.ws / "writer.err").read_text())
+        self.assertEqual(self._native_calls(), [], "no open/osascript for the Team task")
+        self.assertIn("dispatching unbound", (self.ws / "notifier.log").read_text())
+
+    def test_failed_bind_with_the_stale_record_cleared_dispatches_and_the_writer_refuses(self):
         broken = self._owner_binding_then_failing_bind()
+        self._assert_dispatched_unbound_and_refused(
+            self._bash('submit_task "task-team3.txt" 2', BINDING_PY=broken))
+
+    def test_missing_binding_module_dispatches_and_leaves_no_stale_record(self):
+        """An install without src/execution_binding.py (a fixture repo, a half-applied update)."""
+        self._owner_binding_then_failing_bind()
+        gone = str(Path(self.tmp.name) / "no-such" / "execution_binding.py")
+        self._assert_dispatched_unbound_and_refused(
+            self._bash('submit_task "task-team3.txt" 2', BINDING_PY=gone))
+        r = self._bash('finish_responsive_task "task-team3.txt" completed', BINDING_PY=gone)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr, "", "finishing without the module is quiet")
+
+    def test_bind_fails_and_the_record_cannot_be_removed_defers_the_task(self):
+        self._task("task-team3.txt", "team")
+        (self.binding / "in-the-way").mkdir(parents=True)
         for mode, rc in (("2", 0), ("0", 1)):
-            r = self._bash(f'submit_task "task-team3.txt" {mode}', BINDING_PY=broken)
+            r = self._bash(f'submit_task "task-team3.txt" {mode}')
             self.assertEqual(r.returncode, rc, (mode, r.stderr))
             self.assertFalse((self.ws / "prompt.txt").exists(), "the task was not dispatched")
             self.assertFalse((self.ws / "writer.rc").exists())
-            self.assertFalse(self.binding.exists(), "the earlier owner's record does not survive")
         log = (self.ws / "notifier.log").read_text()
+        self.assertIn("nor remove the earlier task binding", log)
         self.assertIn("deferring task-team3.txt: could not bind it as the running task", log)
         self.assertIn("refusing --event task-team3.txt: could not bind it", log)
-        self.assertEqual(self._native_calls(), [])
-
-    def test_record_that_can_be_neither_written_nor_removed_still_blocks_the_dispatch(self):
-        self._task("task-team3.txt", "team")
-        (self.binding / "in-the-way").mkdir(parents=True)
-        r = self._bash('submit_task "task-team3.txt" 2')
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertFalse((self.ws / "prompt.txt").exists(), "the task was not dispatched")
-        log = (self.ws / "notifier.log").read_text()
-        self.assertIn("could not remove the earlier task binding either", log)
-        self.assertIn("deferring task-team3.txt", log)
 
     def test_refused_delivery_unbinds_the_attempt(self):
         self._task("task-own3.txt", "owner")
@@ -229,10 +261,22 @@ class ExecutionBindingModuleTest(unittest.TestCase):
         self.assertEqual([p.name for p in target.parent.iterdir()], ["active-execution.json"], "no temp left")
 
     def test_only_a_plain_task_filename_is_accepted(self):
-        for bad in ("", "../task-1.txt", "tasks/task-1.txt", "task-1", "notes.txt", "task-..txt", "task-a b.txt"):
+        for bad in ("", "../task-1.txt", "tasks/task-1.txt", "task-1", "task-a b.txt", "..txt", ".txt",
+                    ".hidden.txt", "task-a~~1.txt", "x" * 80 + ".txt", None):
             self.assertRaises(ValueError, self.mod.task_id, bad)
             self.assertEqual(self.mod.main(["bind", str(self.ws), bad]), 1, bad)
         self.assertFalse(self.mod.path(self.ws).exists())
+
+    def test_every_id_form_the_pipeline_delivers_can_bind(self):
+        """The grammar is src/local_task_protocol.py's, not a second regex."""
+        import local_task_protocol as proto
+        for stem in ("task-1783000000000", "task-chat-1783", "ask-mvckxfcz-yayd0qry", "sc-ask-0a1b2c",
+                     "reco-skill-7", "task-s_dspace~task-e171273c7a9452bfe7", "task-1783~~2"):
+            self.assertTrue(proto.valid_local_task_id(stem) or proto.valid_broker_id(stem), stem)
+            self.assertEqual(self.mod.main(["bind", str(self.ws), stem + ".txt"]), 0, stem)
+            self.assertEqual(json.loads(self.mod.path(self.ws).read_text())["task_id"], stem)
+            self.assertEqual(self.mod.main(["unbind", str(self.ws), stem + ".txt"]), 0)
+            self.assertFalse(self.mod.path(self.ws).exists(), stem)
 
     def test_unbind_keeps_a_newer_or_unreadable_record(self):
         self.assertFalse(self.mod.unbind(self.ws, "task-1.txt"), "nothing bound")

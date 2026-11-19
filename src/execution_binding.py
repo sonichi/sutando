@@ -21,14 +21,16 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from local_task_protocol import valid_broker_id, valid_local_task_id  # noqa: E402
+
 RELATIVE = Path("state") / "bindings" / "active-execution.json"
-_TASK_FILE = re.compile(r"(task-[A-Za-z0-9_.~-]+)\.txt")
+SUFFIX = ".txt"
 USAGE = "usage: execution_binding.py bind|unbind <workspace> <task filename> | clear <workspace>"
 
 
@@ -37,11 +39,13 @@ def path(workspace) -> Path:
 
 
 def task_id(filename: str) -> str:
-    """The id a task file's name carries; ValueError for anything that is not one plain name."""
-    m = _TASK_FILE.fullmatch(filename or "")
-    if not m or ".." in filename:
+    """The id a task file's name carries, by the pipeline's own id grammar (``task-…``, a named
+    instance's id, a later run, or a broker id such as ``ask-<hex>``); ValueError otherwise."""
+    name = filename if isinstance(filename, str) else ""
+    stem = name[:-len(SUFFIX)] if name.endswith(SUFFIX) else ""
+    if not (valid_local_task_id(stem) or valid_broker_id(stem)) or stem.startswith("."):
         raise ValueError(f"not a task filename: {filename!r}")
-    return m.group(1)
+    return stem
 
 
 def bind(workspace, filename: str) -> Path:

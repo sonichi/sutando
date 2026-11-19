@@ -208,7 +208,8 @@ class SchedulerTests(unittest.TestCase):
             write(idle_record() if runtime is None else runtime, ws)
             script = Path(os.environ.get("PICKUP_TEST_NOTIFIER", REPO/"src/agent/codex/cli/task-notifier.sh")).read_text()
             names = ["has_result", "task_payload", "log_notifier", "queue_head", "submit_task",
-                     "pickup_event", "finish_responsive_task", "reconcile_finished_pickups", "process_responsive_queue", "process_announced_queue"]
+                     "pickup_event", "finish_responsive_task", "reconcile_finished_pickups", "process_responsive_queue", "process_announced_queue",
+                     "bind_execution", "unbind_execution"]
             functions = []
             for name in names:
                 match = re.search(rf"^{name}\(\) \{{.*?^\}}", script, re.M|re.S)
@@ -237,6 +238,8 @@ deliver_prompt() {
                    "PAYLOAD_DIR":str(ws/"payload"), "CONTEXT_DIR":str(ws/"context"),
                    "INFLIGHT_DIR":str(paths(ws)[0]), "YIELDED_DIR":str(paths(ws)[1]),
                    "PICKUP_PY":str(REPO/"src/delivery/codex_pickup.py"),
+                   "BINDING_PY":str(REPO/"src/execution_binding.py"),
+                   "BINDING_FILE":str(ws/"state/bindings/active-execution.json"),
                    "DISPATCH_PY":str(REPO/"src/delivery/task_dispatch.py"), "NOTIFIER_PY":sys.executable,
                    "RESPONSIVE":"1", "SESSION":"core", "TMUX_SOCKET":str(ws/"socket"),
                    "COMPLETION_TIMEOUT":"120", "POLL_INTERVAL":".01", "workstream_context_file":"",
