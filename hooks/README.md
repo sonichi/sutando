@@ -291,9 +291,11 @@ distinguishable from the owner asking. Do not rely on this hook as access contro
 The scripts apply the same tier inside an agent session on either core
 (`SUTANDO_CORE_SESSION=1`, exported by the Claude and the Codex launcher, or `CLAUDECODE=1`): on a
 non-owner task `--owner-asked`, the env var and the marker are all refused (exit 2),
-so the script gate does not accept what the hook would deny. The Codex task notifier writes the
-binding for each task it dispatches (`src/execution_binding.py`, the record's one writer), from the
-task file's own name. `calendar-writer.py` goes further and refuses inside a core session when no
+so the script gate does not accept what the hook would deny. The binding is written through `src/execution_binding.py`, the
+record's one writer, from the task file's own name: by the Codex task notifier for each task it
+dispatches, and on a Claude core by the agent-activity hook when the session first touches a task
+file (removed when its result is written). It is one record: with overlapping tasks it names the
+one picked up last. `calendar-writer.py` goes further and refuses inside a core session when no
 readable binding exists. A cron such as the
 morning briefing is not the core's bound task and is not tier-checked.
 
