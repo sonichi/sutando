@@ -220,8 +220,10 @@ class TestOwnerDmRoutingStale(unittest.TestCase):
             state = Path(td) / "state"
             state.mkdir(parents=True, exist_ok=True)
             now0 = 7_000_000.0
+            # Same pair the probe computes, so it hits the clock-continuation
+            # branch instead of resetting the clock for a "new" pair.
             (state / "owner-dm-routing-stale.json").write_text(json.dumps({
-                "last_room": "!old:x", "current_dm": "!new:x", "first_seen": now0 + 3600,
+                "last_room": "!new:x", "current_dm": "!old:x", "first_seen": now0 + 3600,
             }))
             first = self._run(td, min_age_sec=1800, now=now0)
             self.assertEqual(first["status"], "ok", first)
