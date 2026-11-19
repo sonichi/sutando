@@ -52,11 +52,11 @@ OLD_SECTIONS = [
             (("room-header-commons.jpg", "The Commons button at the right of the room header"), ("commons-surfaces.jpg", "Commons: Doc, Whiteboard, HTML, PDF, Figma, Sheet and Database"))),
     Section("agents", "Connect other agents",
             "Bring agents from the apps you already use into your rooms.",
-            "Press + at the top of the room list and choose Agent. In Add an agent, pick Use an agent from another app and Continue. Under Which agent?, pick the app you already use: Dot (by OpenAI, in ChatGPT), Grokbot (in Grok), Muse (by Meta), Duet (in Claude), or Other for Gemini and more. Then connect it inside that app and sign in.",
+            "Open Add an agent from the room list. Choose an agent from another app, such as Claude Duet, Dot, Grok Bot, Hermes, Muse or OpenClaw, or use Other for a compatible app. Follow that app’s connection instructions. Claude Code and Codex are separate local-agent options, not other names for Duet and Dot.",
             images=(("room-list-add.jpg", "The + menu at the top of the room list, with Agent"),
                     ("add-agent-dialog.jpg", "Add an agent, with Use an agent from another app"), ("which-agent.jpg", "Which agent? Dot, Grok Bot, Muse or Other"))),
     Section("teamwork", "Teamwork",
-            "@-mention any agent in a room to hand it work; it replies in the thread.",
+            "@-mention an agent in a room to ask for help. Its owner’s access settings determine whether it can take your request; Team enables collaboration, while Guest requests need owner approval.",
             "In a room with another agent, type @ in the message box, pick {name} from the Mentions list, and ask:",
             "Research the three best note-taking apps for a small team, then ask another agent in this room to review your answer.", "room",
             (("mention-list.jpg", "Typing @ in the message box opens the Mentions list"),)),
@@ -101,6 +101,7 @@ MXC_OF = {name: f"mxc://ag2.example/{i:02d}{name.replace('-', '')}" for i, name 
 # The rendered content each shipped revision was cut with. A change to a rendered field fails
 # test_a_rendered_change_needs_a_revision_bump until `revision` is bumped and its key added here.
 RENDERED_AT = {
+    "tutorial.2026-11-19.2": "fca47cc35df1e0a5a0eaf9a7dfd65cb8bedf6b3998b6e10b3d6db4ae50f950d8",
     "tutorial.2026-11-19.1": "b241929d5d588687c1005c7a39b758bf1772fd74511f7dcdf44cccf08230a561",
     "tutorial.2026-10-23.1": "3b15c27a9160728fa8c3bd1da5693cdd5ec81d16064ada057888b7781dec32d8",
     "tutorial.2026-10-30.1": "feaeabb8abeb90bb7a4a2281ffbe192c34790451801894534722b2418895e640",

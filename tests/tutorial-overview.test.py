@@ -25,6 +25,16 @@ class OverviewTest(unittest.TestCase):
                       "try { await navigator.clipboard.writeText(text)"):
             self.assertIn(value, page)
 
+    def test_content_boundaries(self):
+        page = PAGE.read_text()
+        for expected in ("Hermes", "OpenClaw", "Grok Bot", "Team — collaborator",
+                         "Guest — owner approves first", "Bring into call",
+                         "A schedule is not a Commons page", "setCommons('board'"):
+            self.assertIn(expected, page)
+        for obsolete in ("Gemini (Google)", "Anthropic Code / Duet",
+                         "setCommons('cron'", "logs on my screen", "Share any window"):
+            self.assertNotIn(obsolete, page)
+
     def test_scripts_parse(self):
         node = shutil.which("node")
         if not node:

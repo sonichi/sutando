@@ -139,7 +139,7 @@ class RenderTest(unittest.TestCase):
             self.assertNotIn("Import your Claude Code history", page)
             self.assertNotIn("Import my Claude Code history", page)
             self.assertNotIn('id="s-import"', page)
-            self.assertNotIn("Claude Code", page)
+            self.assertIn("separate local-agent options", page)
         self.assertFalse(hasattr(gs, "IMPORT_PROMPT"))
 
     def test_unknown_core_value_is_refused(self):
@@ -192,7 +192,7 @@ class RenderTest(unittest.TestCase):
 
     def test_reviewed_wording(self):
         by = {s.id: s for s in gs.sections_for("claude")}
-        self.assertIn("Dot (by OpenAI, in ChatGPT), Grokbot (in Grok), Muse (by Meta), Duet (in Claude), or Other for Gemini and more", by["agents"].how)
+        self.assertIn("Claude Duet, Dot, Grok Bot, Hermes, Muse or OpenClaw", by["agents"].how)
         self.assertIn("Mention &amp; Keywords", by["activity"].how)
         self.assertIn("Activity tab", by["activity"].how)
         self.assertNotIn("import", by)
@@ -226,10 +226,10 @@ class RenderTest(unittest.TestCase):
             self.assertNotRegex(text, r"micro|\bmic\b|push to talk")
         self.assertNotIn("02-microphone", " ".join(shot.file for s in gs.SECTIONS for shot in s.images))
 
-    def test_codex_and_claude_code_are_not_offered_as_addable_agents(self):
+    def test_local_agents_are_distinguished_from_external_apps(self):
         agents = [s for s in gs.SECTIONS if s.title == "Connect other agents"][0]
-        self.assertNotIn("Codex", agents.what + agents.how)
-        self.assertNotIn("Claude Code", agents.what + agents.how)  # Claude the app is one "Other" pick
+        self.assertIn("Claude Code and Codex are separate local-agent options", agents.how)
+        self.assertIn("not other names for Duet and Dot", agents.how)
 
     def test_render_is_deterministic_and_depends_only_on_name_and_core(self):
         self.assertEqual(gs.render_page("Kai"), gs.render_page("  Kai "))

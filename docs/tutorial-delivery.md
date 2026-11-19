@@ -17,7 +17,7 @@ the interactive review draft. Its topic selectors are simulations: they do not c
 change access, start calls or schedule work. Copy falls back to selecting the prompt when the
 clipboard is unavailable. It complements, rather than replaces, the per-owner ten-step tour.
 
-## Using the guide
+## Using the ten-step owner tour
 
 The labelled step navigator lets readers jump directly to a topic instead of guessing a number.
 Use Back and Next for the guided path, Show all for a reference view, and Copy for an example
@@ -90,7 +90,7 @@ wraps on narrow screens, and reduced-motion and dark-mode preferences are respec
   run that skips, keeps an edited page or stops on the page's size uploads nothing. Every page
   variant stays under 300 KB.
 
-Navigation and responsive polish verified 2026-11-19 in Chromium at 1280, 390 and 320 pixels,
+Last verified: navigation and responsive polish, 2026-11-19 in Chromium at 1280, 390 and 320 pixels,
 including light/dark mode, Show all, step navigation, copying and completion after reload.
 Existing screenshot assets were not recaptured in that pass.
 
