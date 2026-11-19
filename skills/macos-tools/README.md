@@ -18,11 +18,12 @@ ln -s /path/to/sutando/skills/macos-tools "$CLAUDE_CONFIG_DIR/skills/macos-tools
 
 ## What's included
 
-5 scripts:
+6 scripts:
 - `contacts.py` — contacts
 - `screen-capture.sh` — screen capture
 - `reminders.py` — reminders
 - `calendar-reader.py` — calendar reader
+- `calendar-writer.py` — adds a calendar event and reads it back
 - `email-sender.py` — email sender
 
 Calendar, Reminders and Contacts run only with `--owner-asked` (the owner asked for the local app) or

@@ -55,6 +55,8 @@ WORKSTREAM_CONTEXT_SCRIPT="$REPO/skills/task-workstream-grouping/scripts/workstr
 PANE_GATE_PY="$REPO/src/delivery/pane_gate.py"
 DISPATCH_PY="$REPO/src/delivery/task_dispatch.py"
 PICKUP_PY="$REPO/src/delivery/codex_pickup.py"
+BINDING_PY="$REPO/src/execution_binding.py"
+BINDING_FILE="$WORKSPACE_DIR/state/bindings/active-execution.json"
 INFLIGHT_DIR="$WORKSPACE_DIR/state/codex-notifier-inflight"
 YIELDED_DIR="$WORKSPACE_DIR/state/codex-notifier-yielded"
 CONTEXT_DIR="$WORKSPACE_DIR/state/codex-notifier-context"
@@ -415,6 +417,23 @@ deliver_prompt() {
   done
 }
 
+# Owner-only gates in the session read whose task runs from this record, never from the prompt.
+# Fails only when an earlier task's record survives: unbound, owner-only gates see no task and refuse.
+bind_execution() {
+  [ -f "$BINDING_PY" ] && "$NOTIFIER_PY" "$BINDING_PY" bind "$WORKSPACE_DIR" "$1" && return 0
+  rm -f "$BINDING_FILE" 2>/dev/null || true
+  if [ -e "$BINDING_FILE" ] || [ -L "$BINDING_FILE" ]; then
+    log_notifier "could not bind $1 as the running task, nor remove the earlier task binding"
+    return 1
+  fi
+  log_notifier "could not bind $1 as the running task; dispatching unbound, owner-only gates will refuse it"
+}
+
+unbind_execution() {
+  [ -f "$BINDING_PY" ] || return 0
+  "$NOTIFIER_PY" "$BINDING_PY" unbind "$WORKSPACE_DIR" "$1" || true
+}
+
 # What the prompt tells the session to read: the payload a resolver-backed
 # announcement named, else the inbox entry itself (the core's tasks/ case).
 task_payload() {
@@ -473,11 +492,22 @@ submit_task() {
     log_notifier "refusing --event $filename: could not record worker ownership"
     return 1
   fi
+  if [ -z "${WORKER_INSTANCE:-}" ] && ! bind_execution "$filename"; then
+    clear_workstream_context
+    if [ "$wait_for_result" = 0 ]; then
+      log_notifier "refusing --event $filename: could not bind it as the running task"
+      return 1
+    fi
+    log_notifier "deferring $filename: could not bind it as the running task; will retry on the next idle cycle"
+    return 0
+  fi
   TRACK_INFLIGHT=0
   [ "$wait_for_result" != 2 ] || TRACK_INFLIGHT=1
   deliver_prompt "$filename" "$prompt" || delivery_rc=$?
   TRACK_INFLIGHT=0
   if [ "$delivery_rc" != 0 ]; then
+    # Nothing recorded as submitted: this attempt's binding names a task that is not running.
+    [ -n "${WORKER_INSTANCE:-}" ] || [ -e "$INFLIGHT_DIR/$filename" ] || unbind_execution "$filename"
     [ "$wait_for_result" != 2 ] || pickup_event send_failed "$filename" "$delivery_rc"
     clear_workstream_context
     if [ "$delivery_rc" = 125 ]; then
@@ -643,6 +673,7 @@ queue_head() {
 
 finish_responsive_task() {
   local filename="$1" event="$2"
+  unbind_execution "$filename"
   if [ "$event" = completed ]; then mark_worker_stage "$filename" done; else mark_worker_stage "$filename" abandon; fi
   "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$INFLIGHT_DIR" "$filename" || return 1
   "$NOTIFIER_PY" "$DISPATCH_PY" inflight-clear "$YIELDED_DIR" "$filename" || return 1

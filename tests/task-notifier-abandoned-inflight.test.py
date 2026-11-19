@@ -37,7 +37,8 @@ NOTIFIERS = {
     "codex": dict(script=REPO / "src" / "agent" / "codex" / "cli" / "task-notifier.sh",
                   log="task-notifier.log",
                   shipped=["submit_task", "has_result", "task_payload", "queue_head",
-                           "process_announced_queue", "log_notifier"],
+                           "process_announced_queue", "log_notifier", "bind_execution",
+                           "unbind_execution"],
                   stubs='wait_for_core_idle() { return 0; }\nmark_worker_stage() { return 0; }\n'
                         'workstream_context_file=""\nprepare_workstream_context() { return 0; }\n'
                         'clear_workstream_context() { return 0; }\n'),
@@ -91,6 +92,8 @@ class InflightAbandonment(unittest.TestCase):
                "NOTIFIER_PY": sys.executable, "DISPATCH_PY": str(DISPATCH),
                "RESULTS_DIR": str(results), "TASKS_DIR": str(tasks), "WORKSPACE_DIR": str(root),
                "PAYLOAD_DIR": str(payload), "INFLIGHT_DIR": str(root / "inflight"),
+               "BINDING_PY": str(REPO / "src" / "execution_binding.py"),
+               "BINDING_FILE": str(root / "state" / "bindings" / "active-execution.json"),
                "TMUX_SOCKET": str(root / "sock"), "SESSION": "core", "POLL_INTERVAL": "0.1",
                "COMPLETION_TIMEOUT": str(completion_timeout or self.COMPLETION_TIMEOUT)}
         start = time.time()

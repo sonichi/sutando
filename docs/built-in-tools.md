@@ -35,6 +35,15 @@ prefix are strings you write: they keep you from acting on your own initiative, 
 who asked, and on a non-owner task the hook and the scripts both refuse them (`hooks/README.md`). Once the owner denied
 the permission (`-1743`, stored in `state/<app>-automation-denied`), never re-prompt: say so and stop. An empty macOS Calendar is not an answer for an owner who uses
 Google Calendar — say you couldn't read their calendar instead.
+When the owner asked for the local Calendar app, read with `skills/macos-tools/scripts/calendar-reader.py`
+and add an event with `calendar-writer.py add "<title>" "<YYYY-MM-DD HH:MM>" "<YYYY-MM-DD HH:MM>"
+[--calendar NAME] [--notes TEXT] [--key KEY] --owner-asked`. A write needs `--owner-asked` on that run
+(the host opt-in and the env var allow reads only) and, inside a core session, a task binding that
+resolves to the owner. It reads the event back and exits 0 only when it matches; after any failure
+check Calendar before retrying (a repeat of the same command normally reports `already_exists`, which
+is a safeguard, not a guarantee). Never improvise raw `osascript` for a local event. Both scripts exit non-zero on an error; a timeout usually means a macOS "allow to
+control Calendar" prompt is waiting on the owner's screen: pass the message on and stop, do not retry
+in a loop.
 ```bash
 gws calendar +agenda --today            # fallback: today's events (table format by default)
 gws calendar +agenda --week              # this week

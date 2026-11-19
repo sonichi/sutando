@@ -459,6 +459,23 @@ def stop_rulings(ws: Path) -> None:
         stop_interrupt.sweep(ws, log=note)
 
 
+def bind_execution(ws: Path, task_id: str, running: bool = True) -> None:
+    """Name (or stop naming) the session's task in the record owner-only gates read. Fails open,
+    but a failed bind never leaves an earlier task's record standing."""
+    try:
+        import execution_binding
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        (execution_binding.bind if running else execution_binding.unbind)(ws, f"{task_id}.txt")
+    except Exception:  # noqa: BLE001
+        if running:
+            try:
+                execution_binding.clear(ws)
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
     """Process one hook payload; returns the (kind, line) rows it emitted."""
     # The pane stamp moves first: the fenced key reads only the stamp, so a turn that ended or began
@@ -481,6 +498,7 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
             tid = processing_task_id(cmd, p["ws"])
             if tid:
                 bind(p, tid, sid)
+                bind_execution(p["ws"], tid)
                 return out  # the processing row itself is the agent's; no working row for writing it
             if "activity.py" in cmd:
                 return out
@@ -498,6 +516,7 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
             task, room = found
             line = pickup_line(task)
             bind(p, tid, sid)
+            bind_execution(p["ws"], tid)
             emit("processing", line, task, room, p["ws"], run)
             out.append(("processing", line))
         if out:
@@ -537,6 +556,7 @@ def handle(payload: dict, p: dict, run=subprocess.run) -> list[tuple[str, str]]:
                 # A dedup pointer answered this message under another one: say so, and name it.
                 text = "consolidated" if into is not None else done_text(blob)
                 emit("done", text, task, room, p["ws"], run, into=into or None)
+                bind_execution(p["ws"], tid, running=False)
                 out.append(("done", text))
     elif event == "Stop":
         tp = payload.get("transcript_path")

@@ -146,6 +146,8 @@ ALLOWED = [
     "open -a 'Google Chrome'",
     "open ./notes/calendar-plan.md",
     "python3 skills/macos-tools/scripts/calendar-reader.py 1 text --owner-asked",
+    'python3 skills/macos-tools/scripts/calendar-writer.py add "Dentist" "2026-03-17 14:00" '
+    '"2026-03-17 15:00" --calendar Work --owner-asked',
     "grep -rn Calendar docs/",
     "echo 'tell application \"Calendar\"'",
     "shortcuts list",
