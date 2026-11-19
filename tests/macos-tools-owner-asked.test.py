@@ -221,6 +221,16 @@ class TestCalendarReader(_Base, unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("click Allow", self.out.getvalue())
 
+    def test_a_missing_osascript_is_an_error_result_not_a_traceback(self):
+        def responder(cmd):
+            if cmd[0] == "osascript":
+                raise FileNotFoundError("osascript")
+            return _done(cmd)
+        with _no_consent_env():
+            code = self._run(["calendar-reader.py", "--owner-asked"], responder)
+        self.assertEqual(code, 1)
+        self.assertIn("could not run osascript", json.loads(self.out.getvalue())["error"])
+
     def test_a_hung_or_missing_open_does_not_raise(self):
         for exc in (subprocess.TimeoutExpired(["open"], 5), FileNotFoundError("open")):
             def responder(cmd, exc=exc):
