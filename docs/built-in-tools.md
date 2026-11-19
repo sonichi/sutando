@@ -39,9 +39,9 @@ When the owner asked for the local Calendar app, read with `skills/macos-tools/s
 and add an event with `calendar-writer.py add "<title>" "<YYYY-MM-DD HH:MM>" "<YYYY-MM-DD HH:MM>"
 [--calendar NAME] [--notes TEXT] [--key KEY] --owner-asked`. A write needs `--owner-asked` on that run
 (the host opt-in and the env var allow reads only) and, inside a core session, a task binding that
-resolves to the owner. It reads the event back and exits 0 only when it matches, and a repeat of the
-same command reports `already_exists` instead of adding a copy, so never improvise raw `osascript` for
-a local event. Both scripts exit non-zero on an error; a timeout usually means a macOS "allow to
+resolves to the owner. It reads the event back and exits 0 only when it matches; after any failure
+check Calendar before retrying (a repeat of the same command normally reports `already_exists`, which
+is a safeguard, not a guarantee). Never improvise raw `osascript` for a local event. Both scripts exit non-zero on an error; a timeout usually means a macOS "allow to
 control Calendar" prompt is waiting on the owner's screen: pass the message on and stop, do not retry
 in a loop.
 ```bash

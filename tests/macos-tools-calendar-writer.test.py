@@ -19,6 +19,8 @@ All subprocess calls are mocked — no real osascript runs here, and every marke
 lands in a per-test temp dir, never the real workspace.
 """
 import contextlib
+import fcntl
+import hashlib
 import importlib.util
 import io
 import json
@@ -296,6 +298,63 @@ class TestCalendarWriter(unittest.TestCase):
         self.assertIn("read-back does not match", self.err.getvalue())
         self.assertEqual(self.out.getvalue(), "")
 
+    def test_a_second_run_for_the_same_key_is_refused_while_the_first_holds_the_lock(self):
+        lock = self.state / "calendar-writer-locks" / (hashlib.sha256(b"k1").hexdigest()[:32] + ".lock")
+        lock.parent.mkdir()
+        with open(lock, "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            code = self._run(ADD + ["--key", "k1", "--owner-asked"], self._calendar())
+            self.assertEqual(code, 1)
+            self.assertEqual(self._osascripts(), [], "neither the lookup nor the create ran")
+            self.assertIn("another run is adding this same event", self.err.getvalue())
+            self.assertIn(RETRY_HINT, self.err.getvalue())
+            self.assertEqual(self._run(ADD + ["--key", "k2", "--owner-asked"], self._calendar()), 0,
+                             "another key is not held up")
+        self.assertEqual(self._run(ADD + ["--key", "k1", "--owner-asked"], self._calendar()), 0,
+                         "released once the first run ends")
+
+    def test_lock_is_held_across_the_lookup_and_create_and_released_after(self):
+        lock = self.state / "calendar-writer-locks" / (hashlib.sha256(b"k1").hexdigest()[:32] + ".lock")
+        seen = {}
+
+        def busy(path):
+            with open(path, "w") as probe:
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    return True
+            return False
+
+        def created(cmd):
+            seen["during_add"] = busy(lock)
+            return _done(cmd, stdout="CREATED|||UID-1|||Home\n")
+        self.assertEqual(self._run(ADD + ["--key", "k1", "--owner-asked"], self._calendar(created=created)), 0)
+        self.assertTrue(seen["during_add"])
+        self.assertFalse(busy(lock))
+
+    def test_lock_falls_back_to_the_temp_dir_and_an_unusable_one_adds_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(self.mod.tempfile, "gettempdir", return_value=tmp), \
+             patch.object(self.mod.consent, "state_dir", side_effect=ImportError("no resolver")):
+            with self.mod.key_lock("k1"):
+                self.assertEqual(len(os.listdir(tmp)), 1)
+        with patch.object(self.mod.tempfile, "gettempdir", return_value="/nonexistent/dir"), \
+             patch.object(self.mod.consent, "state_dir", side_effect=ImportError("no resolver")):
+            with self.assertRaises(self.mod.WriteError) as ctx:
+                with self.mod.key_lock("k1"):
+                    pass
+        self.assertIn("nothing was added", str(ctx.exception))
+
+    def test_a_lookup_error_is_an_error_not_a_missing_duplicate(self):
+        script = self.mod.ADD_SCRIPT
+        lookup = script[script.index("whose start date is startDate"):script.index("make new event")]
+        self.assertNotIn("try", lookup, "an event that cannot be read stops the run before the create step")
+        code = self._run(ADD + ["--owner-asked"], self._calendar(
+            created=lambda cmd: _done(cmd, stderr="execution error: Can’t get description of event 2. (-1728)", rc=1)))
+        self.assertEqual(code, 1)
+        self.assertEqual(len(self._osascripts()), 1, "no read-back: nothing was created")
+        self.assertIn("-1728", self.err.getvalue())
+        self.assertEqual(self.out.getvalue(), "")
+
     def test_bad_key_is_refused_before_any_subprocess(self):
         for key in ("has space", "a/b", "x" * 65, "]"):
             self.assertEqual(self._run(ADD + ["--key", key, "--owner-asked"], self._calendar()), 1, key)
@@ -370,7 +429,7 @@ class TestCalendarWriter(unittest.TestCase):
             code = self._run(ADD + ["--notes", "Room 4", "--owner-asked"], responder)
             self.assertEqual(code, 1, label)
             self.assertIn(expected, self.err.getvalue(), label)
-            self.assertIn("does not add a second copy", self.err.getvalue(), label)
+            self.assertNotIn("second copy", self.err.getvalue(), "no promise that a retry cannot duplicate")
             self.assertEqual(self.out.getvalue(), "", label)
 
     def test_denial_on_read_back_still_names_the_created_event(self):

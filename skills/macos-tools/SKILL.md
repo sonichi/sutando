@@ -69,8 +69,9 @@ python3 "$SKILL_DIR/scripts/calendar-writer.py" add "Dentist" "2026-03-17 14:00"
 - With several writable calendars and no `--calendar` it adds nothing and lists them: ask the owner.
 - It echoes the request, then reads the event back by uid; only exit 0 with JSON means it is there
   (`created`, or `already_exists` for a repeat). Never tell the owner an event was added otherwise.
-- Retrying the same command is safe: the event carries a `[sutando-key:…]` line in its notes and is not
-  added twice. Use it instead of raw `osascript`.
+- After any failure, check Calendar (or tell the owner to) before retrying. The event carries a
+  `[sutando-key:…]` line in its notes, so a repeat of the same command normally reports
+  `already_exists`, but that is a safeguard, not a guarantee. Use it instead of raw `osascript`.
 
 Both scripts exit 1 on an error. A timeout usually means a macOS prompt asking to let the app control
 Calendar is still waiting on the owner's screen: relay the message (click Allow, or System Settings →

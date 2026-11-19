@@ -417,9 +417,12 @@ deliver_prompt() {
 }
 
 # Owner-only gates in the session read whose task runs from this record, never from the prompt.
+# A failed bind must not leave an earlier task's record: the caller does not dispatch.
 bind_execution() {
-  "$NOTIFIER_PY" "$BINDING_PY" bind "$WORKSPACE_DIR" "$1" \
-    || log_notifier "could not bind $1 as the running task; owner-only gates will refuse it"
+  "$NOTIFIER_PY" "$BINDING_PY" bind "$WORKSPACE_DIR" "$1" && return 0
+  "$NOTIFIER_PY" "$BINDING_PY" clear "$WORKSPACE_DIR" \
+    || log_notifier "could not remove the earlier task binding either"
+  return 1
 }
 
 unbind_execution() {
@@ -484,12 +487,22 @@ submit_task() {
     log_notifier "refusing --event $filename: could not record worker ownership"
     return 1
   fi
-  [ -n "${WORKER_INSTANCE:-}" ] || bind_execution "$filename"
+  if [ -z "${WORKER_INSTANCE:-}" ] && ! bind_execution "$filename"; then
+    clear_workstream_context
+    if [ "$wait_for_result" = 0 ]; then
+      log_notifier "refusing --event $filename: could not bind it as the running task"
+      return 1
+    fi
+    log_notifier "deferring $filename: could not bind it as the running task; will retry on the next idle cycle"
+    return 0
+  fi
   TRACK_INFLIGHT=0
   [ "$wait_for_result" != 2 ] || TRACK_INFLIGHT=1
   deliver_prompt "$filename" "$prompt" || delivery_rc=$?
   TRACK_INFLIGHT=0
   if [ "$delivery_rc" != 0 ]; then
+    # Nothing recorded as submitted: this attempt's binding names a task that is not running.
+    [ -n "${WORKER_INSTANCE:-}" ] || [ -e "$INFLIGHT_DIR/$filename" ] || unbind_execution "$filename"
     [ "$wait_for_result" != 2 ] || pickup_event send_failed "$filename" "$delivery_rc"
     clear_workstream_context
     if [ "$delivery_rc" = 125 ]; then

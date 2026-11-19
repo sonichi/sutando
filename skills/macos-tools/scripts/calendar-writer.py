@@ -16,9 +16,11 @@ Times are local, ``YYYY-MM-DD HH:MM`` (or ``T`` between). Without ``--calendar``
 event goes to the only writable calendar; with several, the script lists them and
 adds nothing. The request is echoed on stderr before anything is written.
 
-Retries are safe: the event carries a key (``--key``, else derived from title, times
-and calendar) as a ``[sutando-key:…]`` line in its notes, and an event with that key
-at that start time is reported as ``already_exists`` instead of added again.
+The event carries a key (``--key``, else derived from title, times and calendar) as
+a ``[sutando-key:…]`` line in its notes. An event found with that key at that start
+time is reported as ``already_exists`` instead of added again, and runs for one key
+on this host take turns through a lock file. That lowers the chance of a duplicate;
+it is not a guarantee, so after any failure check Calendar before retrying.
 
 The event is read back by uid: JSON on stdout and exit 0 only when title, times and
 calendar match the request. A macOS denial (-1743) exits 3; every other failure
@@ -26,11 +28,14 @@ exits 1 with the cause on stderr.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -75,7 +80,7 @@ on stamp(dt)
 end stamp
 """
 
-# Every value arrives as argv; the key check and the one create step share a single run.
+# Every value arrives as argv. A lookup error is not caught: it must not read as "no duplicate".
 ADD_SCRIPT = """
 on run argv
     set theTitle to item 1 of argv
@@ -100,9 +105,10 @@ on run argv
         end if
         set targetCal to item 1 of candidates
         repeat with ev in (events of targetCal whose start date is startDate)
-            try
-                if (description of ev) contains theMarker then return "EXISTS|||" & (uid of ev) & "|||" & (name of targetCal)
-            end try
+            set theNotes to description of ev
+            if theNotes is not missing value then
+                if theNotes contains theMarker then return "EXISTS|||" & (uid of ev) & "|||" & (name of targetCal)
+            end if
         end repeat
         set newEvent to make new event at end of events of targetCal with properties {summary:theTitle, start date:startDate, end date:endDate, description:theBody}
         try
@@ -174,13 +180,36 @@ def marker(key: str) -> str:
 def may_exist(uid: str = "", calendar: str = "") -> str:
     """The retry warning for any failure at or after the create step."""
     where = f" (uid {uid}, calendar {calendar!r})" if uid else ""
-    return (f" The event may have been created{where}: check Calendar before retrying. "
-            f"Running the same command again does not add a second copy.")
+    return f" The event may have been created{where}: check Calendar before retrying."
 
 
 def osascript_command(script: str, args: list[str]) -> list[str]:
     # `--` ends osascript's own options: without it a value such as "-e …" runs as script text.
     return ["osascript", "-e", script, "--", *args]
+
+
+@contextlib.contextmanager
+def key_lock(key: str):
+    """One lookup-and-create at a time per key on this host; WriteError while another run holds it."""
+    name = f"{hashlib.sha256(key.encode()).hexdigest()[:32]}.lock"
+    try:
+        folder = consent.state_dir() / "calendar-writer-locks"
+        folder.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        folder = Path(tempfile.gettempdir())
+    try:
+        handle = open(folder / name, "w")
+    except OSError as e:
+        raise WriteError(f"could not take the lock for this event ({e}); nothing was added")
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise WriteError("another run is adding this same event right now; nothing was added by "
+                             "this one: check Calendar before retrying.")
+        yield
+    finally:
+        handle.close()
 
 
 def run_script(script: str, args: list[str], unconfirmed: str = "") -> str:
@@ -217,7 +246,8 @@ def add_event(title: str, start: datetime, end: datetime, calendar: str = "", no
 
     args = [title, *date_args(start), *date_args(end), calendar, body, marker(key)]
     try:
-        answer = run_script(ADD_SCRIPT, args)
+        with key_lock(key):
+            answer = run_script(ADD_SCRIPT, args)
     except WriteTimeout as e:
         # A timeout leaves the create step undecided; an AppleScript error means nothing was made.
         raise WriteError(f"{e}{may_exist()}")
@@ -251,8 +281,7 @@ def add_event(title: str, start: datetime, end: datetime, calendar: str = "", no
         raise WriteError(
             f"read-back does not match the request: asked {title!r} {stamp(start)} to "
             f"{stamp(end)} in {asked_cal!r}, Calendar has {got_title!r} {got_start} to {got_end} "
-            f"in {got_cal!r}. The event exists (uid {uid}): check Calendar before retrying; "
-            f"running the same command again does not add a second copy.")
+            f"in {got_cal!r}. The event exists (uid {uid}): check Calendar before retrying.")
     return {"created": not existed, "already_exists": existed, "uid": uid, "calendar": got_cal,
             "title": title, "start": start.isoformat(timespec="minutes"),
             "end": end.isoformat(timespec="minutes"), "key": key}

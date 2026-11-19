@@ -10,8 +10,12 @@ file's name, which the notifier claimed; it is never taken from prompt text.
 
 CLI, for bash callers with only an interpreter path:
 
-    execution_binding.py bind <workspace> <task filename>
+    execution_binding.py bind <workspace> <task filename>     # on failure no record is left behind
     execution_binding.py unbind <workspace> <task filename>   # only while it still names that task
+    execution_binding.py clear <workspace>                    # whatever it names
+
+A failed ``bind`` must not leave an earlier task's record standing: a reader cannot
+tell that it belongs to another task. The CLI removes it, and exits 1 either way.
 """
 from __future__ import annotations
 
@@ -25,7 +29,7 @@ from pathlib import Path
 
 RELATIVE = Path("state") / "bindings" / "active-execution.json"
 _TASK_FILE = re.compile(r"(task-[A-Za-z0-9_.~-]+)\.txt")
-USAGE = "usage: execution_binding.py bind|unbind <workspace> <task filename>"
+USAGE = "usage: execution_binding.py bind|unbind <workspace> <task filename> | clear <workspace>"
 
 
 def path(workspace) -> Path:
@@ -70,8 +74,20 @@ def unbind(workspace, filename: str) -> bool:
     return True
 
 
+def clear(workspace) -> None:
+    """Remove the record whatever it names; OSError when it exists and cannot be removed."""
+    path(workspace).unlink(missing_ok=True)
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["clear"] and len(argv) == 2:
+        try:
+            clear(argv[1])
+        except OSError as e:
+            print(f"execution_binding: {e}", file=sys.stderr)
+            return 1
+        return 0
     if len(argv) != 3 or argv[0] not in ("bind", "unbind"):
         print(USAGE, file=sys.stderr)
         return 2
@@ -79,6 +95,11 @@ def main(argv=None) -> int:
         (bind if argv[0] == "bind" else unbind)(argv[1], argv[2])
     except (ValueError, OSError) as e:
         print(f"execution_binding: {e}", file=sys.stderr)
+        if argv[0] == "bind":
+            try:
+                clear(argv[1])
+            except OSError as stale:
+                print(f"execution_binding: the earlier record could not be removed: {stale}", file=sys.stderr)
         return 1
     return 0
 
