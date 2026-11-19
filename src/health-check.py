@@ -7230,13 +7230,19 @@ def check_owner_dm_routing_stale(min_age_sec: float = OWNER_DM_STALE_MIN_AGE_S,
     # A new or changed pair starts its own clock; the same pair keeps the one already running.
     if state.get("last_room") != last_room or state.get("current_dm") != current_dm or not first_seen:
         first_seen = now
+        tmp = None
         try:
             state_file.parent.mkdir(parents=True, exist_ok=True)
-            state_file.write_text(json.dumps(
-                {"last_room": last_room, "current_dm": current_dm, "first_seen": first_seen}),
-                encoding="utf-8")
+            with tempfile.NamedTemporaryFile(mode="w", dir=state_file.parent,
+                                             prefix=".owner-dm-routing-stale-", delete=False) as out:
+                tmp = Path(out.name)
+                json.dump({"last_room": last_room, "current_dm": current_dm, "first_seen": first_seen}, out)
+            os.replace(tmp, state_file)
         except OSError:
             pass
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
     age = max(0.0, now - first_seen)
     if age < min_age_sec:
         return {"name": name, "status": "ok",

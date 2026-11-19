@@ -150,9 +150,10 @@ class TestOwnerDmRoutingStale(unittest.TestCase):
             self.assertEqual(reobserved["status"], "ok", reobserved)
             self.assertIn("settle window", reobserved["detail"])
 
-    def test_missing_ts_does_not_crash_and_does_not_warn(self):
-        """No parsable ts means age cannot be measured as sustained; treat as
-        not-yet-sustained rather than raising or false-warning."""
+    def test_activity_without_ts_field_does_not_crash(self):
+        """The divergence clock lives in owner-dm-routing-stale.json's own
+        first_seen, not in last-owner-activity.json's ts (that field is never
+        read here); an activity record missing ts entirely must not crash."""
         with tempfile.TemporaryDirectory() as td:
             self._routing(td, "!old:x")
             state = Path(td) / "state"
@@ -160,6 +161,36 @@ class TestOwnerDmRoutingStale(unittest.TestCase):
                 {"channel": "ag2space", "channel_id": "!new:x"}))
             r = self._run(td, min_age_sec=1800)
             self.assertEqual(r["status"], "ok", r)
+
+    def test_malformed_state_file_is_treated_as_empty(self):
+        """A state file holding valid JSON that isn't an object (e.g. a bare
+        list) must not crash the probe; it is treated the same as no state,
+        starting a fresh first_seen clock rather than reusing or crashing on
+        the non-dict value."""
+        with tempfile.TemporaryDirectory() as td:
+            self._routing(td, "!old:x")
+            self._activity(td, "ag2space", "!new:x", age_s=0)
+            state = Path(td) / "state"
+            state.mkdir(parents=True, exist_ok=True)
+            (state / "owner-dm-routing-stale.json").write_text(json.dumps([1]))
+            first = self._run(td, min_age_sec=1800, now=3_000_000.0)
+            self.assertEqual(first["status"], "ok", first)
+            self.assertIn("settle window", first["detail"])
+            later = self._run(td, min_age_sec=1800, now=3_000_000.0 + 1800)
+            self.assertEqual(later["status"], "warn", later)
+
+    def test_state_write_failure_is_tolerated(self):
+        """If persisting the divergence clock fails (e.g. disk full, a
+        read-only state dir), the probe must not crash — it silently
+        continues without the persisted clock, the same error-tolerance
+        pattern as other optional-state writes in this file."""
+        with tempfile.TemporaryDirectory() as td:
+            self._routing(td, "!old:x")
+            self._activity(td, "ag2space", "!new:x", age_s=0)
+            with mock.patch("os.replace", side_effect=OSError("disk full")):
+                r = self._run(td, min_age_sec=1800, now=4_000_000.0)
+            self.assertEqual(r["status"], "ok", r)
+            self.assertIn("settle window", r["detail"])
 
     def test_unreadable_activity_file_is_ok_not_a_crash(self):
         with tempfile.TemporaryDirectory() as td:
