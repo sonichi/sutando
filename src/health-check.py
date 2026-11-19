@@ -7226,8 +7226,8 @@ def check_owner_dm_routing_stale(min_age_sec: float = OWNER_DM_STALE_MIN_AGE_S) 
     return {
         "name": name,
         "status": "warn",
-        "detail": (f"owner's last ag2.space message ({int(age // 60)}m ago) came from {last_room}, "
-                   f"but proactive messages still route to {current_dm} — the gateway's owner_dm_room "
+        "detail": (f"owner's last {_gateway_where()} message ({int(age // 60)}m ago) came from "
+                   f"{last_room}, but proactive messages still route to {current_dm} — the gateway's owner_dm_room "
                    "may be stuck stale (#5072), and no agent/owner Action exists yet to redesignate "
                    "it; this signal is heuristic, a shared-room message reads the same as a moved DM"),
     }
