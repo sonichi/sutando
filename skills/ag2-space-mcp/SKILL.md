@@ -91,13 +91,14 @@ messages or state events.
 
 ## Scheduling timed work
 
-When the owner asks for work in a room or DM to run later or on a recurring cadence, use the
-platform scheduler. It is never an internal loop, `CronCreate`, `crons.json`, crontab, an OS job
-or a local timer.
+When the owner asks, in a room or DM, for work to run later or on a recurring cadence, use the
+platform scheduler. Do not use an internal loop, `CronCreate`, `crons.json`, crontab, an OS job
+or a local timer, except as step 8 allows.
 
 1. Discover and describe `room.schedule.create`, `room.schedule.list` and `room.schedule.delete`.
 2. Create and delete go through `room.action.execute`; list goes through `room.action.read`.
    All run in the originating room. List and delete only see schedules this agent created there.
+   Pass a short `title` (at most 60 characters) that names the job.
 3. Create and delete need the owner's approval. Status `approval_required` with a null result
    means the change is **held, not created**. Tell the owner approval is needed and follow
    `next_action` with `approval.inspect` or `operation.inspect`.
@@ -108,21 +109,22 @@ or a local timer.
 6. A one-off `@at` time needs an explicit offset. A recurring local time needs the owner's IANA
    timezone. Never assume the pod clock is the owner's timezone.
 7. Do not promise update, pause, run-now, recall or history unless the live catalog offers them.
-8. If scheduling is disabled, unavailable or refused, or its approval is denied, expired or
-   revoked (states `approval.inspect` returns), tell the owner the timed work was not set up.
-   A pending approval is step 3, not a failure. Do not switch routes to get around an approval.
-   A native timed-task tool is an alternative only when trusted host instructions say it is
-   platform-backed.
-9. A cloud Spacer never creates local timed jobs. An unavailable platform is not a reason to keep
-   it awake with local scheduling.
+8. If the platform scheduler is not available (scheduling turned off, the schedule Actions
+   missing from the catalog, or the service unreachable), a host with its own scheduler may run
+   the job locally, as a last resort only. Tell the owner it runs locally, not on the platform.
+   If the platform refuses the request, or its approval is pending, declined or expired, do not
+   set it up locally: tell the owner the timed work was not set up. Do not switch routes to get
+   around an approval. A native timed-task tool is an alternative only when trusted host
+   instructions say it is platform-backed.
+9. A cloud Spacer must not create local timed jobs. An unavailable platform means the timed work
+   cannot be set up, not permission to keep it awake with local scheduling.
 
-Sutando's own startup, maintenance, heartbeat, backend and proactive-loop scheduling stays native.
-Only timed work the owner asks for goes to the platform.
-A starter job the owner switches on in `crons.json` is a Sutando feature, not a reminder, and stays
-native. A request with no s.space origin room (Telegram, Discord, local chat, or voice not docked
-in a room) has nowhere to schedule, so it stays native on a host with its own scheduler. A cloud Spacer has
-none: it reports the work was not set up. A voice request made while docked in a
-room counts as made in that room. A to-do item stays on Reminders or the vault; a message or job
+Two cases always stay on the host's own scheduler: starter jobs the owner switches on in
+`crons.json`, and requests that did not come from an s.space room or DM (Telegram, Discord,
+local chat, or voice not docked in a room). Voice docked in a room counts as that room.
+Sutando's own proactive loop, startup, heartbeat, maintenance and backend jobs never use the
+platform scheduler. Only timed work the owner asks for goes to the platform; it is never an
+internal job, even if it repeats. A to-do item stays on Reminders or the vault; a message or job
 delivered at a set time goes to the platform.
 
 ## Troubleshooting
