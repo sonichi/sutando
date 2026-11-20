@@ -34,3 +34,13 @@ workspace_dir_for_inbox() {
   abs="$(canonical_tasks_dir "$1")" || abs="$1"
   printf '%s\n' "${SUTANDO_WORKSPACE_DIR:-$(dirname "$abs")}"
 }
+
+# True when $1 IS its workspace's canonical core inbox (<ws>/tasks by realpath) —
+# the ONE check every instance-id-clearing caller shares (watcher + notifier).
+inbox_is_canonical_core_tasks_dir() {
+  local tasks_dir="$1" abs ws canon_core
+  abs="$(canonical_tasks_dir "$tasks_dir")" || abs="$tasks_dir"
+  ws="$(workspace_dir_for_inbox "$tasks_dir")"
+  canon_core="$(canonical_tasks_dir "$ws/tasks")" || canon_core="$ws/tasks"
+  [ "$abs" = "$canon_core" ]
+}
