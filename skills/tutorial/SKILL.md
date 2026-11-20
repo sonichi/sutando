@@ -186,8 +186,8 @@ thing to try, in the list's order:
 1. Your DM: what the owner asks for themselves comes back in the DM, never in a room.
 2. Rooms.
 3. Commons.
-4. Connect other agents: Dot, Grokbot, Muse, Duet. Claude Code and Codex are Sutando cores chosen at
-   setup, not agents you add.
+4. Connect other agents: Claude Duet, Dot, Grok Bot, Hermes, Muse and OpenClaw, plus Other.
+   Claude Code and Codex have separate local-agent setup paths; they are also Sutando core options.
 5. Teamwork.
 6. Calls & voice: the headphone icon in the room header only.
 7. Connect your apps: Settings → Integrations.

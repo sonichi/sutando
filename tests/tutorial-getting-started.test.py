@@ -139,7 +139,7 @@ class RenderTest(unittest.TestCase):
             self.assertNotIn("Import your Claude Code history", page)
             self.assertNotIn("Import my Claude Code history", page)
             self.assertNotIn('id="s-import"', page)
-            self.assertNotIn("Claude Code", page)
+            self.assertIn("separate local-agent options", page)
         self.assertFalse(hasattr(gs, "IMPORT_PROMPT"))
 
     def test_unknown_core_value_is_refused(self):
@@ -174,6 +174,11 @@ class RenderTest(unittest.TestCase):
         self.assertIn("finale.hidden = n !== ids.length", gs.tour_page.SCRIPT)
         self.assertIn(html.escape(gs.tour_page.FINALE_PROMPT), page)
 
+    def test_touch_target_css_data_pins(self):
+        page = gs.render_page("Example")
+        self.assertIn("button { min-height:44px", page)
+        self.assertIn("grid-template-columns:repeat(2,minmax(0,1fr))", page)
+
     def test_step_title_replaces_step_numbers(self):
         page = gs.render_page("Blue", "codex")
         self.assertNotRegex(page, r"Step \d+ of \d+")
@@ -185,13 +190,24 @@ class RenderTest(unittest.TestCase):
 
     def test_reviewed_wording(self):
         by = {s.id: s for s in gs.sections_for("claude")}
-        self.assertIn("Dot (by OpenAI, in ChatGPT), Grokbot (in Grok), Muse (by Meta), Duet (in Claude), or Other for Gemini and more", by["agents"].how)
+        self.assertIn("Claude Duet, Dot, Grok Bot, Hermes, Muse or OpenClaw", by["agents"].how)
         self.assertIn("Mention &amp; Keywords", by["activity"].how)
         self.assertIn("Activity tab", by["activity"].how)
         self.assertNotIn("import", by)
         self.assertIn("headphone icon in the room header", by["calls"].how)
         self.assertIn("Bring an agent?", by["calls"].how)
         self.assertIn("+ at the top of the room list", by["rooms"].how)
+
+    def test_latest_commons_copy_is_rendered_in_ten_step_tour(self):
+        # These are intentional emitted-copy pins, not source-code assertions.
+        page = gs.render_page("Example", "claude")
+        for phrase in ("Antigravity", "availability depends on the host",
+                       "owner can still access and invoke", "other room members cannot",
+                       "Room-call screen sharing is work in progress",
+                       "supported, configured local session", "authorize the edit",
+                       "confirm the agent received the selection", "paste the passage"):
+            self.assertIn(phrase, page)
+        self.assertEqual(len(gs.sections_for("claude")), 10)
 
     def test_second_review_wording(self):
         by = {s.id: s for s in gs.sections_for("claude")}
@@ -219,10 +235,10 @@ class RenderTest(unittest.TestCase):
             self.assertNotRegex(text, r"micro|\bmic\b|push to talk")
         self.assertNotIn("02-microphone", " ".join(shot.file for s in gs.SECTIONS for shot in s.images))
 
-    def test_codex_and_claude_code_are_not_offered_as_addable_agents(self):
+    def test_local_agents_are_distinguished_from_external_apps(self):
         agents = [s for s in gs.SECTIONS if s.title == "Connect other agents"][0]
-        self.assertNotIn("Codex", agents.what + agents.how)
-        self.assertNotIn("Claude Code", agents.what + agents.how)  # Claude the app is one "Other" pick
+        self.assertIn("Claude Code and Codex are separate local-agent options", agents.how)
+        self.assertIn("not other names for Duet and Dot", agents.how)
 
     def test_render_is_deterministic_and_depends_only_on_name_and_core(self):
         self.assertEqual(gs.render_page("Kai"), gs.render_page("  Kai "))
@@ -412,7 +428,7 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
     if (scenario === 'nome') w.artifact = runtime(null, () => ['rooms']);
     if (scenario === 'slow') w.artifact = { ready: new Promise(() => {}), me: null, state: { get: () => undefined, set: () => {}, on: () => {} } };
     if (scenario === 'advance') w.artifact = runtime({ id: 'u7' }, () => []);
-    if (scenario === 'finale') w.artifact = runtime({ id: 'u8' }, () => ['dm', 'rooms', 'commons', 'agents', 'teamwork', 'calls', 'apps', 'activity', 'mobile']);
+    if (scenario === 'finale') w.artifact = runtime({ id: 'u8' }, () => ['dm', 'rooms', 'commons', 'agents', 'teamwork', 'calls', 'apps', 'activity', 'phone']);
     if (scenario === 'copy-ok') Object.defineProperty(w.navigator, 'clipboard', { value: { writeText: () => Promise.resolve() } });
     if (scenario === 'copy-fail') {
       Object.defineProperty(w.navigator, 'clipboard', { value: { writeText: () => Promise.reject(new Error('denied')) } });
@@ -449,6 +465,7 @@ const mark = (i) => { const b = d.querySelectorAll('input[data-done]')[i]; b.che
     out.focused = d.activeElement && d.activeElement.id;
   }
   if (scenario === 'showall') {
+    out.navLabels = Array.from(d.querySelectorAll('.dot'), b => b.textContent);
     const all = d.getElementById('all');
     out.labelBefore = all.textContent;
     all.click();
@@ -541,6 +558,9 @@ class PageBehaviourTest(unittest.TestCase):
 
     def test_show_all_keeps_one_label_and_dots_scroll_and_focus(self):
         out = self.run_page("showall")
+        self.assertEqual(len(out["navLabels"]), len(gs.sections_for("claude")))
+        for label, section in zip(out["navLabels"], gs.sections_for("claude")):
+            self.assertIn(html.unescape(section.title), label)
         self.assertEqual((out["labelBefore"], out["labelAfter"], out["pressed"]), ("Show all", "Show all", "true"))
         self.assertEqual(out["mode"], "all")
         self.assertEqual(out["scrolled"], ["s-teamwork", "smooth"])
