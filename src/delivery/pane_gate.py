@@ -193,7 +193,8 @@ def is_usage_limit(kind: Optional[str], text: Optional[str]) -> bool:
 
 # A dialog that holds the input shows how to answer it: a caret on a numbered row or a key hint.
 AWAIT_HINT = re.compile(
-    r"Esc to cancel|Enter to confirm|Enter to select|to navigate|Press Enter|Paste code|to accept"
+    r"Esc to cancel|Enter to confirm|Enter to select|to navigate|Press Enter|Paste code"
+    r"|\b(?:tab|enter|space)\s+to\s+accept"
     r"|Continuing automatically|❯\s*\d+\.", re.I)
 # A turn's spinner ("✳ Moonwalking… (15s · …)") or completion line: transcript above, live dialog
 # below. Not "esc to interrupt": the busy footer carries it, under any live dialog.
