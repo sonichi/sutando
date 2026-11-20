@@ -13,6 +13,8 @@ isolate_os_environ()
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
 from ag2_sparrow import relay_loop, task_io  # noqa: E402
+from ag2_sparrow.adapters.antigravity import (  # noqa: E402
+    antigravity_connector)
 from ag2_sparrow.adapters.codex import (  # noqa: E402
     codex_connector)
 from ag2_sparrow.adapters.hatch import (  # noqa: E402
@@ -62,6 +64,14 @@ class AudienceRuleTest(unittest.TestCase):
                 prompt = openclaw_connector.wake_prompt(
                     "task-1", dict(headers, channel_id="!r:x"), "hi", [], "/w/results/task-1.txt",
                     "ag2-sparrow-openclaw reply")
+                self.assertEqual(prompt.count(RULE), 1)
+                self.assertLess(prompt.index(RULE), prompt.index("\n<TASK_BODY_"))
+
+    def test_the_antigravity_prompt_carries_the_rule_for_every_tier(self):
+        for headers in TIERS:
+            with self.subTest(tier=headers["access_tier"]):
+                prompt = antigravity_connector.wake_prompt(
+                    "task-1", dict(headers, channel_id="!r:x"), "hi", [], "/w")
                 self.assertEqual(prompt.count(RULE), 1)
                 self.assertLess(prompt.index(RULE), prompt.index("\n<TASK_BODY_"))
 
