@@ -198,6 +198,17 @@ class RenderTest(unittest.TestCase):
         self.assertIn("Bring an agent?", by["calls"].how)
         self.assertIn("+ at the top of the room list", by["rooms"].how)
 
+    def test_latest_commons_copy_is_rendered_in_ten_step_tour(self):
+        # These are intentional emitted-copy pins, not source-code assertions.
+        page = gs.render_page("Example", "claude")
+        for phrase in ("Antigravity", "availability depends on the host",
+                       "owner can still access and invoke", "other room members cannot",
+                       "Room-call screen sharing is work in progress",
+                       "supported, configured local session", "authorize the edit",
+                       "confirm the agent received the selection", "paste the passage"):
+            self.assertIn(phrase, page)
+        self.assertEqual(len(gs.sections_for("claude")), 10)
+
     def test_second_review_wording(self):
         by = {s.id: s for s in gs.sections_for("claude")}
         self.assertIn("Docs, HTML pages, PDFs, Figma files, whiteboards, sheets and databases", by["commons"].what)

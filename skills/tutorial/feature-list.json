@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision": "tutorial.2026-11-19.2",
+  "revision": "tutorial.2026-11-20.1",
   "steps": [
     {
       "id": "dm",
@@ -74,7 +74,7 @@
       "title": "Connect other agents",
       "body": [
         "Bring agents from the apps you already use into your rooms.",
-        "Open Add an agent from the room list. Choose an agent from another app, such as Claude Duet, Dot, Grok Bot, Hermes, Muse or OpenClaw, or use Other for a compatible app. Follow that app’s connection instructions. Claude Code and Codex are separate local-agent options, not other names for Duet and Dot."
+        "Open Add an agent from the room list. Choose an agent from another app, such as Claude Duet, Dot, Grok Bot, Hermes, Muse or OpenClaw, or use Other for a compatible app. Follow that app’s connection instructions. Claude Code and Codex are separate local-agent options, not other names for Duet and Dot. Antigravity is another local option in a supported desktop app; install and sign in to its CLI first. Its availability depends on the host."
       ],
       "surface": "room",
       "screenshot": [
@@ -103,7 +103,7 @@
       "id": "teamwork",
       "title": "Teamwork",
       "body": [
-        "@-mention an agent in a room to ask for help. Its owner’s access settings determine whether it can take your request; Team enables collaboration, while Guest requests need owner approval.",
+        "@-mention an agent in a room to ask for help. Its owner’s access settings determine whether it can take your request; Team enables collaboration, while Guest requests need owner approval. With No access, the owner can still access and invoke the agent; other room members cannot. Tool approvals and owner permissions still apply.",
         "In a room with another agent, type @ in the message box, pick {name} from the Mentions list, and ask:"
       ],
       "surface": "room",
@@ -122,8 +122,8 @@
       "id": "calls",
       "title": "Calls &amp; voice",
       "body": [
-        "Talk live with {name} in your DM, or with people in any room.",
-        "Press the headphone icon in the room header (Start call). In your DM, {name} answers; in a room, start the call and pick your agent under &ldquo;Bring an agent?&rdquo;."
+        "Talk live with {name} in your DM, or with people in a room. Agent voice must be enabled and allowed in that room. Room-call screen sharing is work in progress; screen coaching and local editing use a separate supported session with your permission.",
+        "Press the headphone icon in the room header (Start call). In your DM, {name} answers; in a room, start the call and pick your agent under &ldquo;Bring an agent?&rdquo;. Select &ldquo;Bring into call&rdquo; to invite it. For live screen coaching in a supported, configured local session, approve only the screen access you want to share and ask: &ldquo;Coach me through the next step; let me do the clicking.&rdquo; For voice editing, select a passage in a supported editor or local session, confirm the agent received the selection, and authorize the edit: &ldquo;Rewrite only this selection to be clearer, keeping my meaning.&rdquo; Review the result. If selection access is unavailable, paste the passage into the room."
       ],
       "surface": "room",
       "screenshot": [
