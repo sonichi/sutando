@@ -5487,8 +5487,9 @@ def _sender_tier_and_collaborator(task: dict) -> "tuple[str, bool]":
     broker-attestation decision for a task, so task-write routing, vault handling and
     owner-activity recording can never read it differently from each other. A sender asking
     for team (`requested_access_tier: team`) whose broker attestation did not promote it is
-    logged once here — distinct from a plain guest message — since that gap (wire access_tier
-    still `guest`, collaborator not `True`) is exactly what a not-yet-landed cross-homeserver
+    logged here — distinct from a plain guest message — on every call this function gets for
+    that task (so a held-then-served task logs twice), since that gap (wire access_tier still
+    `guest`, collaborator not `True`) is exactly what a not-yet-landed cross-homeserver
     collaborator attestation looks like, and this is the only place that otherwise swallows it."""
     attested, broker_collaborator = local_task_protocol.broker_attested_tier(
         task.get("access_tier"), task.get("requested_access_tier"), task.get("collaborator"))

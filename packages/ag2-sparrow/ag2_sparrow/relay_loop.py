@@ -274,8 +274,8 @@ class RelayLoop:
 
     def refusal(self, name, headers, seen):
         """None when classify() serves the task; otherwise the refusal is finished and its step result
-        returned: True when published, False when parked (#5878: a Team sender pending attestation
-        gets the retry/backoff budget first, instead of an immediate, final refusal)."""
+        returned: True when published, False when parked (a Team sender pending attestation gets
+        the retry/backoff budget first, instead of an immediate, final refusal)."""
         kind = self.classify(headers)
         if kind == "refused-collaborator":
             log("refused (collaborator, --allow-collaborator not set) ->", name[:-4])
