@@ -66,7 +66,11 @@ def interval(reminders: int) -> float:
 
 
 def due(req: HumanRequirement, projection: Dict, now: float) -> Optional[str]:
-    """REMINDER, RECOVERY, or None. Only once the card exists and is current."""
+    """RECOVERY or None, for one card once it exists and is current.
+
+    Reminders are a seat's, not a card's: `plan()` times them from the latest alert
+    across the seat's open cards, so this answers only whether a recovery is owed.
+    `now` stays in the signature for the callers that pass it."""
     if req.kind not in REMIND_KINDS or not projection.get("event_id"):
         return None
     if projection.get("revision", 0) < req.revision:
@@ -75,12 +79,6 @@ def due(req: HumanRequirement, projection: Dict, now: float) -> Optional[str]:
         # Only a card this module scheduled owes a recovery; a pre-upgrade ledger has no notified_at.
         owed = projection.get("notified_at") and not projection.get("recovered")
         return RECOVERY if owed else None
-    if req.status in TERMINAL_STATUSES or not reminds(req):
-        return None
-    # A card projected before this ledger key existed counts from its creation.
-    last = projection.get("notified_at") or req.created_at
-    if now - last >= interval(int(projection.get("reminders") or 0)):
-        return REMINDER
     return None
 
 
