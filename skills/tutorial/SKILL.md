@@ -180,7 +180,10 @@ each room's entry.
 `getting_started.py plan --room <room>` shows what `publish` would do; `render --name <name>`
 prints the HTML. Both `render` and `publish` take `--list <path-or-url>` (below).
 
-**What the page says.** A short, interactive s.space tour (`scripts/tour_page.py`) rendered
+**What the page says.** The page opens on four explorable topics: Ecosystem, Multiplayer,
+Calls & Local Tools, and Commons & Tasks. The bundled overview is shared with the standalone
+HTML guide; its examples are demonstrations, not live controls. **Try it step by step** opens
+the personalized checklist, a short interactive s.space tour (`scripts/tour_page.py`) rendered
 from the skill's feature list, `feature-list.json`. Each step is one line on what it is and one
 thing to try, in the list's order:
 1. Your DM: what the owner asks for themselves comes back in the DM, never in a room.
@@ -188,9 +191,10 @@ thing to try, in the list's order:
 3. Commons.
 4. Connect other agents: Claude Duet, Dot, Grok Bot, Hermes, Muse and OpenClaw, plus Other.
    Claude Code and Codex have separate local-agent setup paths; they are also Sutando core options.
+   Antigravity is a local option on supported desktop hosts.
 5. Teamwork.
 6. Calls & voice: the headphone icon in the room header only.
-7. Connect your apps: Settings → Integrations.
+7. Connect your apps: Settings → Apps → Connected apps.
 8. Activity & notices.
 9. Get the mobile app.
 10. Mobile: pair the phone from the account menu.
@@ -238,7 +242,7 @@ so one validated format can serve both:
 - `title` and both `body` parts are plain text: no `<` or `>` (write entities such as `&rarr;`),
   and `{name}` is the only placeholder (a literal brace is `{{` or `}}`); all three render the
   same way. A list, file or URL, is at most 1 MiB.
-- `revision`: `tutorial.YYYY-MM-DD.N`. Any change to a rendered field bumps it; two revisions
+- `revision`: `tutorial.YYYY-MM-DD.N`. Any change to a rendered field or the overview bumps it; two revisions
   order by date, then N. `watches` and `reviewed_at` are release metadata: the page never shows
   them, so changing them needs no bump and rebuilds no page. `content_key` hashes the rendered
   fields, and the tutorial tests pin it per revision in `RENDERED_AT`, so a rendered change
@@ -295,7 +299,7 @@ list has at most 24 steps (`STEPS_MAX`, refused by `parse_list`), a rendered pag
 fallback file inline it once each), and the tests hold each fallback file to 60 KB (500 KB in all)
 and each `hd_file` to a PNG under the 25 MiB `room.media.upload` takes, so publishing a page
 publicly stays well under the 413 that an image-heavy page met (#5318). With every capture
-uploaded the page is text plus the inlined app icon and QR code (about 55 KB; under 40 KB when every asset,
+uploaded the page is text plus the inlined app icon and QR code (about 86 KB; under 70 KB when every asset,
 the icon too, is mapped). Room media does not load on a public copy of a page (`page-publish`), so
 a copy meant for the public is rendered without `--media` and published with `--no-upload`.
 
@@ -318,7 +322,7 @@ page's, while every fallback file stays under the caps above.
 - An inline SVG icon per step, in ink on a brand gradient tile, and a top border in that
   gradient's outer shade; steps cycle orange, yellow, pastel pink. The hero carries a solid
   brand-orange oval behind the title.
-- The tour opens on one step, with the step's title, numbered dots, Back and Next, a "Show all"
+- The checklist opens on one step, with the step's title, numbered dots, Back and Next, a "Show all"
   toggle and the arrow keys. In Show all, a dot scrolls to its step.
 - "Mark done" moves to the next step that is not done (in step mode only) and fills the progress
   bar.
@@ -328,7 +332,7 @@ page's, while every fallback file stays under the caps above.
 - Copy outcomes are announced in a live status region. Animations stop under
   `prefers-reduced-motion`. Without scripts, every step shows.
 
-**Size.** With every screenshot inlined (no upload) the page is about 250 KB (capped at 300 KB), over the 196,608
+**Size.** With every screenshot inlined (no upload) the page is about 280 KB (capped at 300 KB), over the 196,608
 bytes Room Commons takes in one write. The first piece goes in the create's own body; the rest are appended in pieces
 of at most 120,000 bytes (`CHUNK_BYTES`). Arguments reach `room_commons.py` as JSON in a 0600 file,
 never argv, so Linux's 131,072-byte cap on one argument does not apply. A refresh is one `replace` when the old and new

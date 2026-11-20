@@ -6,16 +6,16 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
   `notes/first-time-tutorial.md` and deliver it one brief, voice-friendly section at a time,
   waiting for the user to try each step.
 - **s.space mode.** Right after the first-contact greeting in the owner's DM, the skill creates
-  one "Getting started" HTML page (Room Commons) in that DM, a short s.space tour with one thing
-  to try per part, and summons the owner to it. A marker under `<workspace>/state/tutorial/` keeps it to one page per room, so
+  one "Getting started" HTML page (Room Commons) in that DM, a four-topic overview with an optional step-by-step checklist, and summons the owner to it. A marker under `<workspace>/state/tutorial/` keeps it to one page per room, so
   a re-link or reinstall refreshes the page instead of adding another.
 
 ## Product overview
 
-[`getting-started.html`](getting-started.html) is a standalone four-part overview, adapted from
+[`getting-started.html`](../skills/tutorial/assets/getting-started.html) is the bundled four-part overview.
+The same source opens by default in the DM page and works standalone in a browser. It was adapted from
 the interactive review draft. Its topic selectors are simulations: they do not connect accounts,
 change access, start calls or schedule work. Copy falls back to selecting the prompt when the
-clipboard is unavailable. It complements, rather than replaces, the per-owner ten-step tour.
+clipboard is unavailable. Open **Try it step by step** below the overview for the per-owner ten-step tour.
 
 ## Using the ten-step owner tour
 
