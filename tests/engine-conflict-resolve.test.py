@@ -461,7 +461,7 @@ class TestProposalDelivery(unittest.TestCase):
             "    return (%d, {})" % (str(self.record), status))
         (d / "_gateway.py").write_text(
             "import json\n"
-            "def gateway():\n"
+            "def gateway(room_id=None):\n"
             "    return ('http://stub.local', {'Authorization': 'Bearer x'})\n"
             "def http_json(method, url, headers, payload):\n"
             "    %s\n" % body)

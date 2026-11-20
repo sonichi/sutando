@@ -17,14 +17,13 @@ caps this file and refuses date stamps in it).
 
 ## On activation
 1. `/schedule-crons` — registers the session crons and stamps them.
-2. Task watcher via the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"'`
+2. Task watcher. If `python3 src/watcher_rearm.py mod-ready --repo "$PWD" --workspace "$(bash scripts/sutando-config.sh workspace)"`
+   prints `yes`, the task-watch Mod runs it: start nothing. Else start it via the `Monitor` tool: `command: 'bash src/watch-tasks-stream.sh --role session --inbox "$(bash scripts/sutando-config.sh workspace)/tasks"'`
    (substitute `$SUTANDO_TASKS_DIR` for the inbox when it is set — the same tag step 9's re-arm uses), `timeout_ms: 1800000`,
    `description: 'Streaming task watcher'`. Each `TASK_FILE: <name>` line is one task to Read and process.
-   Re-arm it on the expiry notice and on any notice that it exited early (on macOS Claude Code reports a
-   SIGTERM death as `exit code 144`); the inbox is unwatched until the standby's grace elapses.
-   `Monitor` has no `persistent` option: it kills the command at `timeout_ms` (30 min is the maximum) and
-   sends one expiry notice. On that notice, re-arm the watcher the same way (a start on a watched inbox
-   exits 0); until you do, the external standby announces tasks through the pane after a 45 s grace.
+   `Monitor` has no `persistent` option: it kills the command at `timeout_ms` (30 min at most) and sends one
+   expiry notice. Re-arm the same way on that notice or on an early-exit notice (macOS reports a SIGTERM
+   death as `exit code 144`); a start on a watched inbox exits 0.
    Windows has no `Monitor` tool: `src/startup.ps1` owns `src/task-dispatcher.ps1`; do not start another watcher.
 3. If `CronList` already shows a `main-loop` / `/proactive-loop` job, run the per-pass body directly —
    never add a second loop driver.
@@ -62,10 +61,10 @@ caps this file and refuses date stamps in it).
    (1 = a task got no result, so idle does not run).
 1.5. **Connect waits.** `python3 skills/connect-apps/scripts/connectors.py rearm` restarts the waiter of
    any pending connector wait that lost it; idempotent, and a failure never blocks the pass.
-2. **Questions.** Nothing surfaces on a pass: a question reaches the owner once, when asked
-   (`scripts/ask-owner.py`); `src/check-pending-questions.py --notify` reminds only when he asks,
-   flagless it files what the outbox holds, sends nothing. `src/pending_questions_reader.py list`
-   only when he asks or you are blocked on an answer.
+2. **Questions.** A question reaches the owner once, when asked (`scripts/ask-owner.py`). Flagless,
+   `src/check-pending-questions.py` files the outbox and sends a stored card's one-time pointer, no
+   reminders; `--notify` reminds only when he asks. `src/pending_questions_reader.py list` only when
+   he asks or you are blocked on an answer.
 3. **Health.** `python3 src/health-check.py`; fix with `--fix` what it can. A warn is a pointer into the
    record: before investigating, `grep -in "<entity from the warn TEXT>" "$H/current-track.md"` and `pending_questions_reader.py list --json | grep -i "<entity>"`
    with `H="$WORKSPACE/hosts/$(bash scripts/sutando-config.sh host-label)"`; a zero means try another
@@ -93,12 +92,12 @@ caps this file and refuses date stamps in it).
    The held set is edited only through
    `python3 skills/proactive-loop/scripts/idle-held.py --state "$WORKSPACE/state/idle-streak.json" --remove <id> --reason "<why>" --add <id>:<gate> --note <owner/repo#n>`
    (no whole-list interface; a removal needs a reason); audit notes with `--audit-notes "$PWD"` and
-   retire merged items. Compute: `idle-held.py … | idle-surface-hash.py --state …` → `post <hash>` or
-   `quiet <hash>`. On `post`: send ONE FYI line to the owner's primary channel, THEN re-run the same
-   pipe with `--write` on `idle-held.py` AND `--commit` on `idle-surface-hash.py` — each flag belongs
-   to its own side, and `--commit` alone leaves added holds, removal reasons and notes unpersisted, so
-   the next pass re-posts the stale hold. Never commit before the send; never build the list from
-   recall.
+   retire merged items. Pipe `idle-held.py … | idle-surface-hash.py --state …` for `post|quiet <hash>`.
+   On `post`, resolve with `python3 src/owner_channel.py --workspace "$WORKSPACE"`.
+   On `refuse`, neither send nor commit. On `allow`, send ONE FYI there, THEN repeat the pipe
+   with `--write` on `idle-held.py` AND `--commit` on `idle-surface-hash.py`.
+   Both are required: `--commit` alone loses edits and repeats stale holds. Never commit before
+   sending or build the held list from recall.
    `quiet` + owner active in the last ~30 min → still drop a one-line activity signal.
 6.7. **Failure closure.** Every reported failure ends with the mechanism that prevents its recurrence,
    linked, or the sentence "no mechanism exists, because X". A filed lesson is not a third option.
@@ -117,7 +116,8 @@ caps this file and refuses date stamps in it).
 9. **Watcher.** Ask for this inbox, never host-wide (on a pool host a worker's watcher satisfies any
    "is a watcher running" probe): `python3 src/watcher_identity.py role-present session --inbox "$WORKSPACE/tasks" --ready "$WORKSPACE/state"`
    (substitute `$SUTANDO_TASKS_DIR` for the inbox on an instance whose tasks dir isn't `<workspace>/tasks/`).
-   `no` → run the launcher: `Monitor` `bash src/watch-tasks-stream.sh --role session --inbox "$WORKSPACE/tasks"`
+   `no` → if step 2's check prints `yes`, the Mod restarted it: change nothing. Else run the
+   launcher: `Monitor` `bash src/watch-tasks-stream.sh --role session --inbox "$WORKSPACE/tasks"`
    (same substitution), `description: 'Streaming task watcher'`. The watcher checks its own inbox at startup:
    if a session watcher already covers it, the new one exits 0 naming the holder, so a start is never a
    duplicate; over a standby it proceeds and the supervisor stands the standby down. `yes` or `unknown` →

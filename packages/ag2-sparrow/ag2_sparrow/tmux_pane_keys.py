@@ -26,10 +26,11 @@ SESSION_ID_RE = re.compile(r"^\$\d+$")
 TITLE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
-def argv(socket, target, *keys, tmux="tmux"):
+def argv(socket, target, *keys, tmux="tmux", expected_pid=None):
     """The guarded send; the script takes this interpreter explicitly, never a repo helper."""
+    expected = [] if expected_pid is None else ["--expected-pid", str(int(expected_pid))]
     return ["bash", str(SCRIPT), "--tmux", str(tmux), "--python", sys.executable, "-S", str(socket),
-            "-t", target, "--", *keys]
+            "-t", target, *expected, "--", *keys]
 
 
 def fence_argv(socket, target_pane, predicate_format, action_cmd, tmux="tmux"):
@@ -37,6 +38,13 @@ def fence_argv(socket, target_pane, predicate_format, action_cmd, tmux="tmux"):
     with its own ORPHAN and runs it through the ticket claim, so a false predicate sends nothing."""
     return ["bash", str(SCRIPT), "--tmux", str(tmux), "--python", sys.executable, "-S", str(socket),
             "-t", target_pane, "--fence", predicate_format, action_cmd]
+
+
+def fence_keys_argv(socket, target_pane, predicate_format, *keys, tmux="tmux"):
+    """The guarded fenced send: the script sends `keys` to target_pane only while predicate_format
+    holds for it, in one server command; a false predicate sends nothing."""
+    return ["bash", str(SCRIPT), "--tmux", str(tmux), "--python", sys.executable, "-S", str(socket),
+            "-t", target_pane, "--fence-keys", predicate_format, "--", *keys]
 
 
 def tmux_quote(value):
@@ -89,7 +97,26 @@ def prepare_guard(socket):
             shutil.rmtree(prepared)
     if not (guard / "mutex").is_file():
         raise ValueError("legacy fence requires explicit recovery")
+    refresh_guard(socket)
     return guard / "mutex"
+
+
+def refresh_guard(socket):
+    """Touch the guard's regular files so macOS's nightly tmp_cleaner (files untouched for 3
+    days) never removes them: a lost mutex blocks every send, a lost `uncertain` lifts a fence.
+    Never creates, clears or replaces anything; returns how many files were touched."""
+    try:
+        entries = [p for p in guard_path(socket).iterdir() if p.is_file() and not p.is_symlink()]
+    except OSError:
+        return 0
+    touched = 0
+    for p in entries:
+        try:
+            os.utime(p)
+            touched += 1
+        except OSError:
+            pass
+    return touched
 
 
 def _pending_ticket(guard):

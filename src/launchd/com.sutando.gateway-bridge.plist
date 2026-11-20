@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Sutando — ag2.space gateway-bridge launchd job (template).
+  Sutando — gateway-bridge launchd job (template).
 
-  Role: keeps src/remote-gateway-bridge.py alive. That bridge carries ag2.space
-  MOBILE-app messages from the cloud gateway (chat.ag2.space/relay) down to the
+  Role: keeps src/remote-gateway-bridge.py alive. That bridge carries
+  MOBILE-app messages from the homeserver's cloud gateway (its /relay) down to the
   local core, and pushes results back up. Without supervision it's a single
   unmonitored process: on 2026-07-10 it was found DEAD since Jul 7 (it stopped
   after a run of gateway 502s and nothing restarted it), so mobile messages

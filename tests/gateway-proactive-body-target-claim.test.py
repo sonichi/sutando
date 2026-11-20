@@ -78,7 +78,7 @@ def run(body: str, last_active: str, passes: int = 2):
     mod = load(ws, cfg)
     posts: list[dict] = []
 
-    def fake_req(method, path, payload=None, timeout=None):
+    def fake_req(method, path, payload=None, timeout=None, **_kw):
         if path == "/v1/agents":
             return {"agents": [{"id": AGENT, "owner": "@o:example.org",
                                 "owner_dm_room": OWNER_DM}]}

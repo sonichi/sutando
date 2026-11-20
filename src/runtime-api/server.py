@@ -57,7 +57,8 @@ from dispatcher import RuntimeDispatcher  # noqa: E402
 from agents_view import AgentsView  # noqa: E402
 
 from delivery.readiness import read_ready_result  # noqa: E402
-from identity_view import IdentityView  # noqa: E402
+from identity_source import (build_identity_view,  # noqa: E402
+                             host_label as _host_label)
 
 from tasks_view import TasksView  # noqa: E402
 from runtime_view import RuntimeView  # noqa: E402
@@ -78,34 +79,6 @@ def _state_dir() -> Path:
 
 def _log(msg: str) -> None:
     print(f"[runtime-api] {msg}", flush=True)
-
-
-def _channels_dir() -> str | None:
-    """Channel access configs via the canonical resolver (util_paths); None
-    if unresolvable — the identity surface then simply omits channel data."""
-    try:
-        sys.path.insert(0, str(_HERE.parent))
-        from util_paths import claude_home_path  # noqa: PLC0415
-        return str(claude_home_path("channels"))
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _host_label() -> str | None:
-    """This host's per-host label (matches the cores heartbeat basename).
-    SUTANDO_HOST_LABEL wins, else the canonical resolver script; best-effort."""
-    env = os.environ.get("SUTANDO_HOST_LABEL")
-    if env:
-        return env
-    try:
-        import subprocess  # noqa: PLC0415
-        out = subprocess.run(
-            ["bash", str(_HERE.parent.parent / "scripts" / "sutando-config.sh"),
-             "host-label"],
-            capture_output=True, text=True, timeout=10)
-        return out.stdout.strip() or None
-    except Exception:  # noqa: BLE001
-        return None
 
 
 def resolve_actor_id(state_dir) -> str:
@@ -143,10 +116,8 @@ class RuntimeServer:
         self.dispatcher = RuntimeDispatcher(
             self.store, self.ha, self.actor_id,
             agents_view=AgentsView(state_dir) if state_dir else None,
-            identity_view=(IdentityView(state_dir, self.actor_id,
-                                        channels_dir=_channels_dir(),
-                                        host_label=host_label,
-                                        instance=instance_id())
+            identity_view=(build_identity_view(state_dir, self.actor_id,
+                                               host_label)
                            if state_dir else None),
             tasks_view=(TasksView(Path(state_dir).parent / "tasks",
                                   Path(state_dir).parent / "results",

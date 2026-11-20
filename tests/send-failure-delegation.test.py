@@ -14,10 +14,15 @@ The source scan is TOKEN-SPECIFIC — it flags inline status comparisons, not th
 words "transient" or "retry" — so renaming cannot satisfy it.
 """
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+from _helpers.hermetic_env import hermetic_env, isolate_os_environ
+# Before anything below reads the environment: the park probe imports the gateway bridge.
+isolate_os_environ()
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
@@ -94,10 +99,36 @@ class TestSparrowDelegation(unittest.TestCase):
         self.assertNotIn("should_retry", body)
 
     def test_sparrow_parks_to_the_repo_wide_quarantine(self):
-        # results/undelivered/ is what health-check's probe scans; an archive/
-        # subdir is a park with no reader (review blocker, 2026-08-16).
-        self.assertIn('UNDELIVERABLE_RESULTS_DIR = RESULTS_DIR / "undelivered"',
-                      SPARROW)
+        # results/undelivered/ is what health-check's probe scans; an archive/ subdir has no reader.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = subprocess.run(
+                [sys.executable, "-c", _PARK_PROBE], capture_output=True, text=True, timeout=120,
+                env=hermetic_env(tmp, PYTHONPATH=str(REPO / "packages" / "ag2-sparrow"),
+                                 AGENT_CONNECT_RESULT_DIR=str(Path(tmp) / "results"),
+                                 AGENT_CONNECT_TASK_DIR=str(Path(tmp) / "tasks"),
+                                 AGENT_CONNECT_STATE_DIR=str(Path(tmp) / "state"),
+                                 REMOTE_PROACTIVE_ROOM="", AGENT_MXID="@a:ag2.space"))
+            self.assertEqual(out.returncode, 0, out.stderr)
+            results = Path(tmp) / "results"
+            self.assertEqual(out.stdout.strip(), "parked")
+            (parked,) = (results / "undelivered").glob("proactive-park-*.txt")
+            self.assertIn("body", parked.read_text())
+            self.assertFalse(list(results.glob("proactive-park*.txt")), "nothing left queued")
+
+
+# A proactive file whose send times out, through the bridge's real drain: the outbox parks it.
+_PARK_PROBE = """
+import time
+from ag2_sparrow import remote_gateway_bridge as gb
+gb.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+(gb.RESULTS_DIR / "proactive-park.txt").write_text("[channel: !room:ag2.space]\\nbody\\n")
+def slow(*a, **k):
+    raise TimeoutError("no answer")
+gb._req, gb._log, gb.PROACTIVE_ROOM, gb.PROACTIVE_CLAIM_GATE = slow, lambda *a: None, "", None
+gb._ROUTING.update(owner_dm="", loaded=True, next=time.time() + 3600)
+gb._post_proactive()
+print("parked" if list((gb.RESULTS_DIR / "undelivered").glob("proactive-park-*.txt")) else "not parked")
+"""
 
 
 class TestReleaseClaimActuallyReturnsTheBody(unittest.TestCase):

@@ -1,15 +1,15 @@
 ---
 name: ag2space-voice
-description: "AG2 Space voice surface — binds the room the AG2 Space client announces to the voice session's origin, so work delegated by voice in a room is answered in that room, and moves the client by voice (navigate_ui)."
-when_to_use: "Loaded automatically at voice-agent startup as a manifest skill. Not slash-invoked. Only an AG2 Space client sends the frames it handles; on any other install it stays idle."
+description: "s.space voice surface — binds the room the s.space client announces to the voice session's origin, so work delegated by voice in a room is answered in that room, and moves the client by voice (navigate_ui)."
+when_to_use: "Loaded automatically at voice-agent startup as a manifest skill. Not slash-invoked. Only an s.space client sends the frames it handles; on any other install it stays idle."
 ---
 
-# AG2 Space voice
+# s.space voice
 
-Optional plugin for installs that talk to an AG2 Space client (desktop app or webapp).
+Optional plugin for installs that talk to an s.space client (desktop app or webapp).
 The host engine carries a product-neutral *voice session origin* (`VoiceSessionOrigin`,
 `src/task-bridge.ts`) and offers client frames to skills (`setup(ctx)`, see
-[`skills/MANIFEST.md`](../MANIFEST.md)). This skill owns everything AG2 Space specific on
+[`skills/MANIFEST.md`](../MANIFEST.md)). This skill owns everything s.space specific on
 top of that. Remove the directory and the engine boots, types and tests unchanged.
 
 ## Wire contract (client side: webapp `features/room/voice/`)

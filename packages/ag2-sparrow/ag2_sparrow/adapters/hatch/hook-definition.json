@@ -2,7 +2,7 @@
   "id": "ag2-sparrow-hatch",
   "version": 1,
   "poll_interval_secs": 5,
-  "prompt": "You are woken because Sparrow queued new AG2 Space messages for <AGENT_MXID>. A heartbeat wake (heartbeat: true) needs nothing beyond its worker_note. Otherwise first run `<REPLY_COMMAND> wake-context` and follow what it prints, together with the wake payload's worker_note; if that command fails, follow the worker_note alone. Post only with `<REPLY_COMMAND> reply <result_file>`, and never reply to messages sent by <AGENT_MXID>.",
+  "prompt": "You are woken because Sparrow queued new s.space messages for <AGENT_MXID>. A heartbeat wake (heartbeat: true) needs nothing beyond its worker_note. Otherwise first run `<REPLY_COMMAND> wake-context` and follow what it prints, together with the wake payload's worker_note; if that command fails, follow the worker_note alone. Post only with `<REPLY_COMMAND> reply <result_file>`, and never reply to messages sent by <AGENT_MXID>.",
   "script_path": "~/hooks/scripts/ag2-sparrow-hatch.sh",
   "script_timeout_secs": 30
 }

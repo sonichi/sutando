@@ -82,9 +82,27 @@ def bash_read(cid):
     return {"tool_name": "Bash", "tool_input": {"command": f"curl .../channels/{cid}/messages?limit=5"}}
 
 
+def provider_task(filename, channel_id):
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, filename)
+    Path(path).write_text(f"id: {Path(filename).stem}\nchannel_id: {channel_id}\n")
+    return path
+
+
 # 1) serve PUBLIC_CH (via Read tool) -> read a private-guild channel => DENY
 run(read_task(PUBLIC_CH)[0])
 assert is_deny(run(bash_read(PRIVATE_CH))), "serve public-ch reading a private-guild channel MUST be denied"
+
+for filename in ("task-dc900~123456.txt", "task-a%40b~%24ev.txt"):
+    tp = provider_task(filename, PUBLIC_CH)
+    (STATE_DIR / "active-serving-channel.json").unlink(missing_ok=True)
+    run({"tool_name": "Read", "tool_input": {"file_path": tp}})
+    assert is_deny(run(bash_read(PRIVATE_CH))), \
+        f"Read of {filename} must set the serving channel before the private read"
+    (STATE_DIR / "active-serving-channel.json").unlink(missing_ok=True)
+    run({"tool_name": "Bash", "tool_input": {"command": f"cat {tp}"}})
+    assert is_deny(run(bash_read(PRIVATE_CH))), \
+        f"cat of {filename} must set the serving channel before the private read"
 
 # 2) serve PUBLIC_CH -> read another public channel => ALLOW
 assert not is_deny(run(bash_read(OTHER_PUB_CH))), "serve public-ch reading a public channel must be allowed"

@@ -22,7 +22,7 @@ if str(_PKG) not in sys.path:
     sys.path.insert(0, str(_PKG))
 
 from ag2_sparrow.delivery_core import (  # noqa: E402
-    BackendCapabilities, ClaimToken, DeliveryCore, DeliveryOutcome, DeliveryReceipt,
+    BackendCapabilities, ClaimToken, Defer, DeliveryCore, DeliveryOutcome, DeliveryReceipt,
     DesignAClaimBackend, DrainStatus, ProviderCapabilities,
     ProviderIndeterminate, ProviderPermanentRefused, ProviderRefused, RetryPolicy,
     idempotency_key)
@@ -226,6 +226,39 @@ class ContractCase(unittest.TestCase):
                                    msg="non-declaring backend must raise, "
                                        "never silently no-op"):
                 self.backend.force_release(ITEM)
+
+    def test_a_deferring_revalidation_neither_sends_nor_withdraws(self):
+        """A `Defer` answer releases the claim unsent with no attempt; the next pass sends."""
+        self.backend.publish(ITEM, b"x")
+        p = _Recorder([DeliveryOutcome.CONFIRMED])
+        answers = [Defer("cannot check yet"), None]
+        core = DeliveryCore(self.backend, p, worker="w1", revalidate=lambda *_a: answers.pop(0))
+        r = core.deliver_one(ITEM, b"x")
+        self.assertIs(r.status, DrainStatus.DEFERRED)
+        self.assertIsNone(r.outcome)
+        self.assertEqual(r.detail, "cannot check yet")
+        self.assertEqual(p.deliver_calls, [], "no provider call on a deferral")
+        self.assertFalse(self.backend.is_terminal(ITEM), "never parked")
+        self.assertEqual(self.backend.attempts(ITEM), 0, "no attempt counted")
+        r = core.deliver_one(ITEM, b"x")
+        self.assertIs(r.outcome, DeliveryOutcome.CONFIRMED)
+        self.assertEqual(len(p.deliver_calls), 1)
+
+    def test_release_by_a_stale_token_changes_nothing(self):
+        self.backend.publish(ITEM, b"x")
+        t = self.backend.claim(ITEM, "w1")
+        self.assertTrue(self.backend.release(t))
+        self.assertFalse(self.backend.release(t), "an already-released token owns nothing")
+        t2 = self.backend.claim(ITEM, "w2")
+        self.assertIsNotNone(t2, "released means claimable again")
+        self.assertFalse(self.backend.release(t), "nor may it release a successor's claim")
+        self.assertIsNone(self.backend.claim(ITEM, "w3"), "the successor still owns it")
+        self.assertTrue(self.backend.release(t2))
+        t3 = self.backend.claim(ITEM, "w1")
+        self.assertIsNotNone(t3)
+        self.assertNotEqual(t3.incarnation, t.incarnation)
+        self.assertFalse(self.backend.release(t), "the same worker's earlier incarnation owns nothing")
+        self.assertIsNone(self.backend.claim(ITEM, "w4"), "w1's live incarnation still owns it")
 
 
 class SharedRootResendEpoch(unittest.TestCase):

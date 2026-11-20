@@ -109,6 +109,38 @@ class ReplyHandlerTests(unittest.TestCase):
         self.assertEqual((req.status, req.chosen_action), ("in_progress", "allow"))
         self.assertFalse(list(actions_dir(self.ws).glob("*.json")))  # a hook action needs no driver
 
+    def test_authorization_refusal_leaves_the_requirement_pending(self):
+        handler = HitlReplyHandler(
+            self.mgr, OWNER, workspace=self.ws,
+            authorize=lambda ev: "the click is not at owner tier",
+            log=self.logs.append)
+        handler.offer(event(reply_for(self.req, "allow")))
+        self.assertEqual(handler.last_outcome, "refused")
+        self.assertEqual(handler.last_reason, "the click is not at owner tier")
+        self.assertEqual(self.mgr.get(self.req.id).status, "pending")
+
+    def test_room_and_sender_are_bound_to_the_event_envelope(self):
+        req = self.mgr.create(HumanRequirement(
+            kind="permission", runtime="claude", message="Approve this action",
+            guard="hook:room", room="!allowed:x",
+            actions=[Action(id="allow", kind="allow_once", label="Allow")]))
+        payload = reply_for(req, "allow")
+        payload.update(room="!allowed:x", sender="@payload:x")
+        wrong_room = event(payload)
+        wrong_room.update(room_id="!other:x")
+        self.h.offer(wrong_room)
+        self.assertEqual(self.mgr.get(req.id).status, "pending")
+        self.assertEqual(self.h.last_outcome, "rejected")
+
+        seen = []
+        apply = self.mgr.apply_action
+        self.mgr.apply_action = lambda reply: (seen.append(reply), apply(reply))[1]
+        right_room = event(payload, eid="$right")
+        right_room.update(room_id="!allowed:x")
+        self.h.offer(right_room)
+        self.assertEqual(self.mgr.get(req.id).chosen_action, "allow")
+        self.assertEqual((seen[0].room, seen[0].sender), ("!allowed:x", OWNER))
+
     def test_non_owner_is_claimed_but_changes_nothing(self):
         out = self.h.offer(event(reply_for(self.req, "allow"), actor="@stranger:ag2.space"))
         self.assertEqual(out, ["$e1"])
@@ -245,6 +277,12 @@ class ReplyHandlerTests(unittest.TestCase):
                 "> <@agent:ag2.space> Claude wants permission\n> Bash command\n\nDeny")
         self.assertEqual(self.h.offer_task(self._task(reply_to_event="$card", task=text)), "applied")
         self.assertEqual(self.mgr.get(self.req.id).chosen_action, "deny")
+
+    def test_task_event_carries_the_task_access_tier(self):
+        self.assertEqual(self.h.task_to_event(self._task(
+            access_tier="guest", hitl_action=reply_for(self.req, "allow")))["access_tier"], "guest")
+        self.assertNotIn("access_tier", self.h.task_to_event(
+            self._task(hitl_action=reply_for(self.req, "allow"))))
 
     def test_a_quoted_action_without_an_unquoted_answer_stays_a_message(self):
         self.mgr.record_projection(self.req.id, self.req.revision, "$card")

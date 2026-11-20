@@ -8,15 +8,16 @@ produce two notifications for one pending task; it is named under "Known issues 
 issue that closes it. This page is the design as it stands on `main` after #4477, #4585 and #4602;
 the behaviour is pinned by the tests named at the end.
 
-## The two hosting modes
+## The hosting modes
 
 | mode | who runs the watcher | how tasks reach the agent | when it is used |
 |---|---|---|---|
-| **session watcher** | the agent's own CLI session, through the `Monitor` tool: `bash src/watch-tasks-stream.sh --role session --inbox <inbox>` | the tool delivers each `TASK_FILE: <name>` line straight into the session | the normal state of a live core |
+| **session watcher, Mod-hosted** (default on Claude seats) | the task-watch Mod inside the agent's Claude session runs `watch-tasks-stream.sh --role session --inbox <inbox>` and restarts it ([below](#the-session-watcher-hosted-by-the-task-watch-mod-claude-seats)) | the Mod submits each `TASK_FILE: <name>` line (with its `QUEUE:` line) to the session as a message | whenever the launcher installed the Mod and `watcher_rearm.py mod-ready` prints `yes` |
+| **session watcher, `Monitor`** (fallback) | the agent's own CLI session, through the `Monitor` tool: `bash src/watch-tasks-stream.sh --role session --inbox <inbox>` | the tool delivers each `TASK_FILE: <name>` line straight into the session | a Claude seat without the Mod, or whose Mod refused, never loaded or gave up (`mod-ready` prints `no`) |
 | **standby** (external) | `task-notifier-supervisor.sh`, running in the tmux session `<core>-watcher`, starts `task-notifier.sh`, which runs the same watcher script untagged as its child | the notifier types one instruction line into the core's tmux pane: `Sutando task ready: <file>. Read <tasks>/<file>, follow CLAUDE.md, complete the task, and write the result to <results>/<file>.` | whenever no session watcher covers the inbox: before `/startup` finishes, after a session watcher dies, when the core cannot run `Monitor` |
 
 The watcher script decides everything about a task (routing through the task-event handler, priority,
-dedupe, holds); the notifier only executes what the watcher announces (#4561). So the two modes differ
+dedupe, holds); the notifier only executes what the watcher announces (#4561). So the modes differ
 in how an announcement reaches the agent, never in what is announced.
 
 ## The tag, and why it matters
@@ -74,6 +75,107 @@ Measured on the Pro host on 2026-09-22 (the #4585 witness, live core, no restart
 notifier typing nothing; after the session watcher was killed, the standby was re-armed in 51 s under
 the same supervisor pid; the second handoff took 12 s.
 
+## The session watcher hosted by the task-watch Mod (Claude seats)
+
+A `Monitor` ends at its 30-minute timeout and the session has to re-arm it. On a Claude seat the
+same session watcher can instead be run by a Claude Code Mod, `src/agent/claude/task-watch-mod/`:
+
+- At `session.start` it asks `watcher_rearm.py watch-argv` for the command (the same inbox the Stop
+  hook checks; a worker's `SUTANDO_WATCHER_CMD`), asks `watcher_identity.py role-present session
+  --inbox <inbox>`, and spawns the unchanged `watch-tasks-stream.sh <inbox> --role session --inbox
+  <inbox>` only on `no` or `unknown`. The script keeps priority order, the queue count, the standby
+  hand-off and its own holder check.
+- Each `TASK_FILE: <name>` line, with the `QUEUE:` line that follows it, is submitted with
+  `$.prompt.submit`, so the session gets the text a `Monitor` notification carries. Nothing else is
+  ever submitted: only a plain file name (or an absolute path ending in one) passes, the Mod never
+  reads a task file, and the session still reads the task's headers (`access_tier`, sender, HMAC) from
+  the file itself. While a turn runs, announcements wait and arrive together when it ends.
+- An exit 0 is a hand-off (the inbox is held, or the watcher was told to stop): the Mod polls
+  `role-present` every 30 s and starts again once no session watcher holds the inbox. Any other early
+  exit restarts after 5 s, doubling to 5 min; after 8 in a row it stops and logs, and the Stop hook's
+  unwatched-inbox gate then asks the session for a `Monitor` watcher. Exit 64 (bad arguments) is not
+  retried.
+- The session's end (not `/clear`, not a resume) kills the one child the Mod spawned, nothing else.
+- The launcher sets `SUTANDO_TASK_WATCH_MOD=1` in the session only when it installed the Mod, and
+  sets it empty otherwise. `CLAUDE.md`, `/startup` and `/schedule-crons` skip their `Monitor` step
+  only when `watcher_rearm.py mod-ready` prints `yes`: the marker is `1` AND a ready session watcher
+  holds the inbox (waiting up to 30 s for the Mod's to come up). A Mod that refused (old engine),
+  never loaded or gave up therefore leaves `no`, and the session starts the `Monitor` as before. The
+  compaction/resume hint and the Stop hook fire on an unwatched inbox whatever the marker; under the
+  marker they say the Mod restarts the watcher and ask for a `Monitor` only if `mod-ready` prints `no`.
+  The launcher gates the version on the same absolute `claude` path the session runs (the one the tmux
+  pane's `PATH` resolves). Claude seats without the Mod keep the `Monitor` path unchanged; Codex seats
+  have no `Monitor` and are fed by the supervisor's task notifier.
+
+The switch is per launcher, and both launchers install the Mod by default. `SUTANDO_TASK_WATCH_MOD_CORE=0`
+in the core launcher's environment keeps the core on the `Monitor`; `SUTANDO_TASK_WATCH_MOD_WORKER=0`
+in the environment of a worker spawn opts that worker out. Either way the launcher installs
+the Mod only when `claude --version` is at least `MIN_CLAUDE_VERSION` in
+`src/agent/claude/task-watch-mod/hooks/version.ts`; below it, it logs one line and the session keeps
+the `Monitor`. The Mod checks the same floor itself.
+The worker default covers Claude workers only: `launch-worker-session.sh` hands a Codex worker to
+`launch-codex-worker-session.sh` before `add_task_watch_mod`, so a Codex worker keeps the supervisor's task notifier.
+
+### The standby on a Mod seat is alert-only
+
+A Claude seat whose launcher installed the Mod still gets the supervisor, started with
+`SUTANDO_STANDBY_MODE=alert` (the core launcher from its own Mod decision; `worker-watcher-supervisor.sh`
+from the worker session's `SUTANDO_TASK_WATCH_MOD=1`, so the pool remedy's re-ensure agrees). In that
+mode the supervisor never starts the notifier: no task and no nudge is typed into the pane. It polls
+`role-present --ready` as before; once no ready session watcher has held the inbox for
+`SUTANDO_NOTIFIER_ALERT_GRACE` (300 s), it writes an `ALERT` line to `logs/claude-task-notifier.log`
+and alerts the owner: a `results/proactive-standby-unwatched-*.txt` (the owner's DM) and the opt-in macOS
+notification, the same pair a channel bridge's wrapper uses for its notices. A supervisor sends that
+alert once for each outage it observes: there is no timed reminder (`SUTANDO_NOTIFIER_ALERT_REPEAT` defaults to 0; a positive value
+opts into a reminder every that many seconds). Both settings take whole seconds, the grace 1 to 86400 and
+the repeat 0 to 86400; any other value is ignored with one log line and the default used. A DM that was
+certainly not published (`src/result_publish.py` exits 1 or 2, which by its contract means nothing was
+written, or the seat's workspace has no `results/`) is retried on the next poll, then backed off (doubling
+to every 300 s). Every other outcome counts as sent and is never retried: 0; 3, renamed but the directory
+sync unconfirmed; and any other exit, a kill included, which is logged as an unknown outcome. A retry
+there could duplicate the DM, so the rare publisher killed before its rename costs that one alert instead.
+A retry therefore never duplicates a DM. The macOS notification fires once for each outage a supervisor
+observes, on its first attempt, never on a retry. The outage lives only in the supervisor's memory, so a
+supervisor restarted mid-outage observes it afresh: if the outage outlasts the new supervisor's grace, it
+sends one more alert and notification. That is accepted. Each alert names
+the seat, judged from the inbox by `src/seat_inbox.py` ("the core" for `<workspace>/tasks`, "worker" and the
+first 8 characters of its id for a rostered worker's `deliveries/<id>` or own tasks folder), and how long it has
+been unwatched ("under a minute" below 60 s); it never carries the inbox path or the tmux session name, which only the local log
+line keeps. An inbox that is no registered seat (a scratch or test inbox) gets the local `ALERT` line only:
+the owner is never paged for it. A ready watcher ends the outage with one log line and nothing sent to the owner. The 300 s covers a seat's boot
+and restarts: a seat's Mod watcher has been seen ready 51 s after the session started (before
+the launcher trusted the `--add-dir` folder), and a worker relaunched several times took about 2.5 min.
+The Mod's own restart back-off (5 s doubling) passes 300 s only after six early exits in a row. A Codex seat,
+or a Claude seat whose Mod was refused or turned off, keeps the typing standby above. Every launcher sets the
+mode explicitly and folds it into the supervisor's identity. The Claude core launcher and the worker-pool ensure
+also pass `SUTANDO_NOTIFIER_ALERT_GRACE` / `SUTANDO_NOTIFIER_ALERT_REPEAT` always (empty means the supervisor's
+default) and fold them into that identity, so a value left in the tmux server's global environment never reaches
+a supervisor. The Codex core pins `type`, whose standby never reads the alert settings, so its launcher passes
+neither and leaves them out of its identity. A host
+whose worker-pool remedy timer was installed while it saved these settings (an earlier release) keeps them
+in the timer's job: the sweep passes them to each worker's supervisor ensure, so GRACE and REPEAT stay in
+force there as owner settings, validated like any other value, and the pile-up setting saved beside them is
+read by nothing. Any reinstall of the timer writes its job without them: an explicit
+`python3 skills/worker-pool/scripts/pool_remedy_timer.py install --workspace <workspace> --repo <repo>`, which is
+how to clear them, or a spawn that reinstalls it because the Stop setting changed. The health check's
+`claude-task-notifier` row on a Mod core is `ok` only while a ready session watcher holds the core's
+inbox; its warning says how many tasks are waiting, with no path.
+
+### How to check it on a worker, or turn it off
+
+1. Confirm the installed Claude Code passes: `bash scripts/task-watch-mod-witness.sh`. It loads the
+   Mod into a headless `claude -p --input-format stream-json` session on a temp workspace, drops one
+   task whose body carries instructions, and checks that the gate sees a ready session watcher, that a
+   turn starts with exactly `TASK_FILE: <name>`, and that the session's end stops the watcher. Run it
+   again after every Claude Code upgrade, and before raising `MIN_CLAUDE_VERSION`.
+2. Spawn a worker as usual (`python3 skills/worker-pool/scripts/spawn_worker.py --workspace <ws>`);
+   it gets the Mod when its Claude Code is at or above the floor. The core is untouched.
+3. Check the worker: `python3 src/watcher_identity.py role-present session --inbox <ws>/deliveries/<id>
+   --ready <ws>/state` answers `yes`, the watcher's parent is the worker's `claude` process (not a
+   `Monitor` shell), and a test task to that worker starts a turn from "The task-watch plugin".
+4. To go back to the `Monitor`, spawn the worker again with `SUTANDO_TASK_WATCH_MOD_WORKER=0` in the
+   spawner's environment.
+
 ## What each party may do
 
 - The **session** (the agent) starts its session watcher at boot and re-arms it when the loop finds
@@ -123,12 +225,10 @@ the same supervisor pid; the second handoff took 12 s.
   by the standby rather than deaf. What the standby announces reaches the worker's pane only once the
   notifier accepts a resolver-backed (absolute-path) announcement for a delivery inbox (#4635); until
   then a supervised worker inbox is heard only by its own session watcher.
-- **`Monitor` expiry, on some builds.** The skills pass `persistent: true`; a build whose `Monitor`
-  exposes that argument keeps the watcher for the session. A build without it caps `timeout_ms` at
-  30 minutes and ends the watcher at each expiry unless the session re-arms it, with the supervisor's
-  standby covering the gap after 45 s. Measured on a bundled non-git install (engine `3ab5e26da`,
-  2026-09-21) and on the Pro host's core the same day; builds that expose `persistent` are not
-  affected: #4524.
+- **`Monitor` expiry.** `Monitor` has no `persistent` option: it caps `timeout_ms` at 30 minutes and
+  ends the watcher at each expiry unless the session re-arms it, with the supervisor's standby
+  covering the gap after 45 s. The Mod-hosted watcher has no such expiry. Measured on a bundled
+  non-git install (engine `3ab5e26da`, 2026-09-21) and on the Pro host's core the same day: #4524.
 - **An early exit, and `exit code 144`.** A notice that the session watcher exited before
   its `timeout_ms` is the same instruction as the expiry notice: re-arm first, investigate second;
   the inbox is unwatched until the supervisor's 45 s grace re-arms the standby. On macOS Claude Code
@@ -138,6 +238,15 @@ the same supervisor pid; the second handoff took 12 s.
   session as "144, no stderr"; `cleanup()` now signals the process group only when the watcher leads
   it. The watcher also relaunches a dead fswatch (backoff 1-16 s, `SUTANDO_FSWATCH_RESTART_MAX`) and
   exits 1, saying so, only when fswatch will not stay up.
+- **A live fswatch that reports nothing** (a stalled fseventsd, 2026-10-17: pointers landed in every
+  seat inbox for hours and none was announced) is covered by the catch-up pass: every
+  `SUTANDO_WATCHER_CATCHUP_SECONDS` (30 s; empty, non-numeric or 0 reads as 30), whether or not events
+  arrived meanwhile, the watcher lists the inbox for entries whose ctime (so a pointer renamed into the
+  inbox with an old mtime counts) falls after the previous pass and before the last second,
+  and feeds each one through the same dispatch as an fswatch event. Each entry is examined by one pass,
+  so an inbox full of answered pointers costs the startup sweep once and the catch-up passes nothing.
+  Already-dispatched and already-answered entries are refused by the same dedupe the event path uses.
+  A dead fswatch is the relaunch budget's case, above, not this one.
 - **Watchers started before the tag was required** (`SUTANDO_WATCHER_CMD <inbox>` on hosts whose
   worker boot skill predated the tagged form) keep running and read as `untagged` holders until
   their session restarts; a new untagged start is refused. The rule (owner, 2026-09-22): every start
@@ -165,4 +274,22 @@ how `tests/watch-tasks-stream-shutdown-leaves-inflight-claim.test.py` interrupts
   file in #4627, sharing `tests/fixtures/readiness_window_helpers.py`, so no single file sets the
   CI floor): the readiness window, buffered replay before the sweep, holds and admissions.
 - `tests/watcher-identity.test.py`: the verdicts, their inbox scoping and the ready gate.
-- `tests/start-cli-claude-task-notifier.test.py`: the launcher starts the supervisor for the core.
+- `tests/start-cli-claude-task-notifier.test.py`: the launcher starts the supervisor for the core,
+  alert-only when it installed the Mod.
+- `tests/task-notifier-supervisor-alert-only.test.sh`: the alert-only standby types nothing, alerts once
+  per outage it observes, after the grace and with no path, retries only a DM that was not published
+  (macOS notified once), adds one alert after a restart mid-outage, validates its settings and ignores the
+  retired pile-up setting, reminds only when opted in, and stands down silently. Its tmux part prints
+  SKIP where tmux is missing. `tests/skills/worker-pool/pool-remedy-timer-old-alert-settings.test.py`:
+  a timer an earlier install left with alert settings keeps GRACE and REPEAT in force, the pile-up
+  setting reaches no supervisor, nothing migrates them, and an explicit reinstall removes them.
+  `scripts/mutation-check-standby-alert.sh` re-runs these against named mutants and fails if any
+  survives.
+- `tests/task-notifier-supervisor-alert-decision.test.py`: with no tmux, the real supervisor in alert
+  mode alerts and never starts the typing notifier; an unregistered inbox is logged and never
+  pages the owner; without the mode the notifier starts.
+- `tests/seat-inbox.test.py`: which inboxes are a registered seat, and the label each gets.
+- `src/agent/claude/task-watch-mod/tests/task-watch.test.ts` (`claude plugin test`, in CI): the Mod's
+  spawn, announcement, restart, hand-off and session-end rules, and that a task body is never submitted.
+- `tests/task-watch-mod-launch.test.sh`: the launchers' defaults and opt-outs, version floor and session marker.
+- `scripts/task-watch-mod-witness.sh` (local, needs a logged-in `claude`): the Mod in a real headless session.

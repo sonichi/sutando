@@ -85,7 +85,8 @@ class StandaloneImportInProcess(unittest.TestCase):
         mod = _load_without_core()
         declared = json.loads(MANIFEST.read_text())["config"]["AG2_CLOUD_ORIGIN"]
         self.assertEqual((mod.CLOUD_FALLBACK, mod.CLOUD), (declared, declared))
-        self.assertEqual(mod._cloud_fallback(), declared)
+        with mock.patch.dict(sys.modules, {"dotspace": None}):
+            self.assertEqual(mod._cloud_fallback(), declared)
 
     def test_main_skips_cleanly_when_no_cloud_origin_is_known(self):
         import contextlib

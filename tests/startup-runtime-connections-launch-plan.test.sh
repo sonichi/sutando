@@ -32,7 +32,9 @@ case "$script" in
       launch) [ "$2" = notoken ] && { echo "connections: no token under AG2_REMOTE_TOKEN_NOTOKEN" >&2; exit 1; }
               printf 'REMOTE_TASK_TOKEN=%s\n' "${REMOTE_TASK_TOKEN-<unset>}" > "$FAKE_OUT/$2.env";;
       primary) [ -n "${FAKE_PRIMARY+x}" ] || exit 2; printf '%s\n' "$FAKE_PRIMARY";;
+      legacy-parked) [ "${FAKE_PARKED:-0}" = 1 ] || exit 1;;
     esac;;
+  */src/sparrowd.py) echo "sparrowd $*" >> "$FAKE_OUT/calls";;
   */remote-gateway-bridge.py) printf 'GATEWAY_INSTANCE=%s\nREMOTE_PROACTIVE_ROOM=%s\n' "${GATEWAY_INSTANCE-<unset>}" "${REMOTE_PROACTIVE_ROOM-<unset>}" > "$FAKE_OUT/primary.env";;
 esac
 EOF
@@ -78,6 +80,33 @@ out="$(run_lanes FAKE_PRIMARY=s-space)"
 out="$(run_lanes FAKE_PRIMARY=)"
 [ "$(sed -n 's/^REMOTE_PROACTIVE_ROOM=//p' "$OUT/primary.env")" = "!owner:prod.example" ] \
   && ok "an explicit legacy primary keeps the room" || bad "legacy room with legacy primary: $(cat "$OUT/primary.env")"
+
+echo "== a primary move parked the legacy row: it is not launched, the named lanes are =="
+rm -f "$OUT"/*.env "$OUT/calls"
+out="$(run_lanes FAKE_PARKED=1 FAKE_PRIMARY=s-space)"
+sleep 1
+[ ! -f "$OUT/primary.env" ] && ok "a parked legacy row is not launched" || bad "parked legacy launched: $(cat "$OUT/primary.env")"
+case "$out" in *"gateway bridge (legacy) parked"*) ok "the skip is reported";; *) bad "no parked line: $out";; esac
+grep -q "^connections launch s-space " "$OUT/calls" && ok "the named lanes still launch" || bad "no s-space launch: $(cat "$OUT/calls")"
+
+echo "== the core gate: sparrowd runs the core bridge, the legacy bridge is not bare-launched =="
+rm -f "$OUT"/*.env "$OUT/calls"
+mkdir -p "$REPO/src/launchd" "$BOX/nowhere/workspace/state/sparrowd"
+cp "$REPO_UNDER_TEST/src/launchd/gateway-bridge-lib.sh" "$REPO/src/launchd/"
+touch "$BOX/nowhere/workspace/state/sparrowd/core.enabled"
+out="$(run_lanes)"
+sleep 1
+[ ! -f "$OUT/primary.env" ] && ok "no bare legacy bridge under the gate" || bad "bare bridge launched: $(cat "$OUT/primary.env")"
+grep -q "^sparrowd --core --agent-bridges$" "$OUT/calls" && ok "sparrowd is started as --core --agent-bridges" \
+  || bad "no sparrowd start: $(cat "$OUT/calls")"
+case "$out" in *"gateway bridge (sparrowd core"*) ok "the sparrowd start is reported";; *) bad "no sparrowd line: $out";; esac
+grep -q "^connections launch dev " "$OUT/calls" && ok "the named lanes still launch" || bad "no dev launch: $(cat "$OUT/calls")"
+rm -f "$BOX/nowhere/workspace/state/sparrowd/core.enabled"
+rm -f "$OUT"/*.env "$OUT/calls"
+out="$(run_lanes)"
+sleep 1
+[ -f "$OUT/primary.env" ] && ! grep -q "^sparrowd " "$OUT/calls" && ok "gate removed: the bare bridge again, no sparrowd" \
+  || bad "after the gate: $(cat "$OUT/calls")"
 
 echo "== a room absent from the shell (the desktop's device env holds it) stays UNSET, never empty =="
 run_lanes_noroom() {

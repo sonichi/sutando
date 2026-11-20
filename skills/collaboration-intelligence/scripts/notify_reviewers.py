@@ -31,6 +31,12 @@ Roster: <workspace>/hosts/<host-label>/data/collaboration-intelligence/reviewer-
            "room": "!triage:ag2.space", "allowlisted": true, "gh": "john-the-dev"}}
 `allowlisted` is evidence, not hope: true (a mention has triggered this
 Stand), false (it bounced), null/absent (never observed — send, then record).
+
+In a pool worker's session whose worker has its own enabled agent, the ask is
+posted as that agent, in a room it and the reviewer's agent are both members of
+(--room if given, else the recorded room, else any room the worker's agent has
+joined). No such room refuses that reviewer (exit 5); it never falls back to the
+core's agent. Anywhere else the core's agent posts, as before.
 """
 from __future__ import annotations
 
@@ -400,6 +406,9 @@ def codeowner_violations(files, author: str, logins, rules) -> "list[tuple[str, 
     return bad
 
 
+CHECK_FAILED = "code-owner check FAILED"
+
+
 def codeowner_gate(message: str, targets, roster) -> "tuple[bool, list[str]]":
     """(ok, lines) — every PR named in `message` must have, among `targets`, a
     non-author code owner of each owned changed file. No CODEOWNERS = no rule."""
@@ -411,8 +420,7 @@ def codeowner_gate(message: str, targets, roster) -> "tuple[bool, list[str]]":
             facts = pr_facts(repo, num)
             found = fetch_codeowners(repo, facts["base"])
         except CodeownerCheckError as exc:
-            return False, [f"code-owner check FAILED for {repo}#{num}: {exc} — "
-                           "refusing rather than sending unchecked"]
+            return False, [f"{CHECK_FAILED} for {repo}#{num}: {exc}"]
         if found is None:
             continue
         path, text = found
@@ -427,6 +435,42 @@ def codeowner_gate(message: str, targets, roster) -> "tuple[bool, list[str]]":
     return ok, lines
 
 
+def _room_ops_json(*args: str) -> "tuple[dict | None, str]":
+    """(payload, '') from one room_ops call whose own verdict is ok, else (None, why unread)."""
+    argv = [_PY, str(_REPO / "skills" / "agent-room-ops" / "room_ops.py"), *args]
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    except Exception as exc:                     # noqa: BLE001 - probe must not raise
+        return None, f"unverified ({type(exc).__name__})"
+    if p.returncode != 0:
+        return None, f"unverified ({args[0]} rc={p.returncode})"
+    try:
+        payload = json.loads(p.stdout)
+    except ValueError:
+        return None, f"unverified (unparseable {args[0]})"
+    # A non-object payload has no .get — the same shape the refusal-reason fix
+    # guards downstream. An unusable roster is UNVERIFIED, never an absence.
+    if not isinstance(payload, dict):
+        return None, f"unverified (non-object {args[0]} payload)"
+    # `ok` is the instrument's own verdict. Only a true one licenses reading the
+    # list as fact; without it an empty list is a failure, not an empty room.
+    if payload.get("ok") is not True:
+        return None, f"unverified (room_ops ok={payload.get('ok')!r})"
+    return payload, ""
+
+
+def room_members(room: str) -> "tuple[set | None, str]":
+    """(member ids, reason) as this session's agent reads `room`; None when unread, never empty."""
+    payload, why = _room_ops_json("members", room)
+    if payload is None:
+        return None, why
+    members = payload.get("members")
+    if not isinstance(members, list):
+        return None, "unverified (members not a list)"
+    ids = {m.get("user_id") for m in members if isinstance(m, dict)}
+    return ids, f"{len(ids)} members"
+
+
 def stand_present_in_room(target: dict) -> "tuple[bool, str]":
     """Is this stand actually a member of the room we are about to mention it in?
 
@@ -436,31 +480,57 @@ def stand_present_in_room(target: dict) -> "tuple[bool, str]":
     from a delivered mention. Returns (present, reason); an UNVERIFIABLE roster is
     not treated as absent — we refuse to send only on a positive absence.
     """
-    argv = [_PY, str(_REPO / "skills" / "agent-room-ops" / "room_ops.py"),
-            "members", target["room"]]
+    ids, why = room_members(target["room"])
+    if ids is None:
+        return True, why
+    return target["stand"] in ids, why
+
+
+def acting_worker() -> "tuple[str, str]":
+    """(worker, its agent id) when this is a pool worker's session acting as its own agent, else ("", "").
+
+    Whether it does is `connections.worker_enabled_identity`'s answer; a copy with no src/ has no workers."""
     try:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
-    except Exception as exc:                     # noqa: BLE001 - probe must not raise
-        return True, f"unverified ({type(exc).__name__})"
-    if p.returncode != 0:
-        return True, f"unverified (members rc={p.returncode})"
+        import connections
+    except ImportError:
+        return "", ""
+    worker = connections.session_worker()
+    row = connections.worker_enabled_identity(worker) if worker else None
+    return (worker, str(row.get("agent_mxid") or "").strip()) if row else ("", "")
+
+
+def routes_as_worker(room: str, worker: str) -> bool:
+    """Would room_ops, run from this session, act in `room` as `worker`'s own agent?"""
+    import connections
     try:
-        payload = json.loads(p.stdout)
-    except ValueError:
-        return True, "unverified (unparseable members)"
-    # A non-object payload has no .get — the same shape the refusal-reason fix
-    # guards downstream. An unusable roster is UNVERIFIED, never an absence.
-    if not isinstance(payload, dict):
-        return True, "unverified (non-object members payload)"
-    # `ok` is the instrument's own verdict. Only a true one licenses reading the
-    # list as fact; without it an empty list is a failure, not an empty room.
-    if payload.get("ok") is not True:
-        return True, f"unverified (room_ops ok={payload.get('ok')!r})"
-    members = payload.get("members")
-    if not isinstance(members, list):
-        return True, "unverified (members not a list)"
-    ids = {m.get("user_id") for m in members if isinstance(m, dict)}
-    return target["stand"] in ids, f"{len(ids)} members"
+        row = connections.connection_for_room(room)
+    except connections.ConnectionsError:
+        return False
+    return bool(row) and row.get("worker") == worker
+
+
+def worker_joined_rooms() -> "tuple[list, str]":
+    """(rooms, '') this session's agent has joined; ([], why) when the list cannot be read."""
+    payload, why = _room_ops_json("rooms")
+    if payload is None:
+        return [], why
+    rooms = payload.get("rooms")
+    return [r for r in rooms if isinstance(r, str) and r] if isinstance(rooms, list) else [], ""
+
+
+def worker_room_for(target: dict, worker: str, agent: str, candidates) -> "tuple[str | None, str]":
+    """(room, '') where both `worker`'s own agent and the target's agent are members and a post goes as
+    the worker; (None, why) when no candidate is one. Unread membership never counts as present."""
+    if not agent:
+        return None, "this worker's own agent has no recorded id, so no room can be confirmed to hold it"
+    for room in candidates:
+        if not routes_as_worker(room, worker):
+            continue
+        ids, _why = room_members(room)
+        if ids is not None and agent in ids and target["stand"] in ids:
+            return room, ""
+    return None, ("no room is shared by this worker's agent and the reviewer's agent; add one to a room "
+                  "the other is in, or pass --room for a room both are in")
 
 
 def command_for(target: dict, message: str) -> "list[str]":
@@ -470,11 +540,15 @@ def command_for(target: dict, message: str) -> "list[str]":
     human = target.get("human")
     if isinstance(human, str) and human and human not in body:
         body = f"{body} (cc {human})"
-    return [_PY, str(_REPO / "skills" / "agent-room-ops" / "room_ops.py"),
+    argv = [_PY, str(_REPO / "skills" / "agent-room-ops" / "room_ops.py"),
             "mention", target["stand"], body, target["room"]]
+    # Appended, so argv[4] stays the body the interaction id is added to.
+    return argv + ["--agent", target["agent"]] if target.get("agent") else argv
 
 
 _PR_URL = re.compile("github[.]com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/([0-9]+)")
+# OWNER/NAME as GitHub spells them: one slash, no leading/trailing hyphen in the owner.
+_REPO_SLUG = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[A-Za-z0-9._-]+$")
 
 # `owner/repo#12` and a bare `#12`. Two digits minimum is a DELIBERATE trade, not
 # an oversight: `#7` is a real PR and passes silently, but `#1` is usually prose.
@@ -505,7 +579,7 @@ def ledger_path() -> Path:
     return Path(resolve_workspace()) / "state" / "review-asks.jsonl"
 
 
-def record_asks(message: str, reviewer: str, no_codeowner: str = "") -> int:
+def record_asks(message: str, reviewer: str, no_codeowner: str = "", interaction_id: str = "") -> int:
     """Log a room ask so pr-unattended can see it. GitHub's timeline records only
     review_requested events, and the owner's rule is to ask in the room and never
     via GitHub — so without this every correctly-routed PR reads NOBODY_EVER_ASKED."""
@@ -521,10 +595,41 @@ def record_asks(message: str, reviewer: str, no_codeowner: str = "") -> int:
                    "ts": ts, "channel": "room"}
             if no_codeowner:
                 row["no_codeowner"] = no_codeowner
+            if interaction_id:
+                row["interaction_id"] = interaction_id
             fh.write(json.dumps(row) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
     return len(refs)
+
+
+def _correlation():
+    """The correlation writer, or None where the engine's src/ is not beside this script."""
+    try:
+        import correlation_log
+    except ImportError:
+        return None
+    return correlation_log
+
+
+def with_interaction_id(message: str, interaction_id: str) -> str:
+    """The ask as sent: the id on its own last line, so the reviewer's answer can cite it."""
+    return f"{message}\n\nInteraction-Id: {interaction_id}"
+
+
+def record_interactions(message: str, target: dict, interaction_id: str, task_id: str, event_id: str) -> int:
+    """One correlation record per PR the ask names; the count written."""
+    n, log = 0, _correlation()
+    if log is None:
+        return 0
+    for repo, num in sorted({(m.group(1), int(m.group(2))) for m in _PR_URL.finditer(message)}):
+        if log.record("interaction", {
+                "interaction_id": interaction_id, "object": f"{repo}#{num}", "counterpart": target["stand"],
+                "counterpart_kind": "agent", "counterpart_scope": "unknown", "room_id": target.get("room"),
+                "room_kind": "unknown", "task_id": task_id or None, "channel": "room", "event_id": event_id or None},
+                path=ledger_path().with_name(log.LOG_NAME)):
+            n += 1
+    return n
 
 
 def _actor_map(roster) -> dict:
@@ -666,6 +771,9 @@ def main() -> int:
                     help="deliberately re-ask the SAME reviewers after 30min")
     ap.add_argument("--no-codeowner", dest="no_codeowner", metavar="REASON", default="",
                     help="deliberately ask without a non-author CODEOWNER; requires a reason")
+    ap.add_argument("--task", default="",
+                    help="the task this ask is for (its `id:` header); recorded with the ask's interaction id. "
+                         "Pass it whenever the ask is for a task: nothing infers the link")
     ap.add_argument("--kind", choices=("ask", "notice"), default="ask",
                     help="ask (default) requests review; notice tells reviewers "
                          "something about a PR without asking for anything")
@@ -673,7 +781,22 @@ def main() -> int:
                     help="room the conversation is actually in. When given, a reviewer whose "
                          "Stand is not a member THERE is REFUSED rather than silently notified "
                          "in their recorded room — correctly addressed, wrong venue.")
+    ap.add_argument("--repo", metavar="OWNER/NAME", default=None,
+                    help="repo whose access to check when the message names no PR URL "
+                         "(a patch reviewed before it is a PR); must be OWNER/NAME, and a "
+                         "probe GitHub cannot answer REFUSES rather than sends")
+    ap.add_argument("--no-repo", dest="no_repo", metavar="REASON", default="",
+                    help="deliberately send an ask that is about no repository")
     a = ap.parse_args()
+    if a.repo is not None and not _REPO_SLUG.fullmatch(a.repo):
+        print(f"REFUSED: --repo {a.repo!r} is not OWNER/NAME (one slash, GitHub-legal "
+              "segments) — a repo GitHub cannot find checks nobody.", file=sys.stderr)
+        return 7
+    if a.task:
+        log = _correlation()
+        if log is not None and not log.is_task_id(a.task):
+            print(f"REFUSED: --task {a.task!r} is not a task id (the task file's `id:` header).", file=sys.stderr)
+            return 7
     a.message = resolve_body(a.message, a.body_file)
     names = [n.strip() for n in a.reviewers.split(",") if n.strip()]
     targets, refusal_rc = resolve(names, load_roster())
@@ -683,15 +806,13 @@ def main() -> int:
     # ask the repo named in the message rather than trusting a cached tier.
     if a.kind == "ask" and targets:
         refs = _PR_URL.findall(a.message or "")
-        if not refs:
-            # Every other refusal path here prints; the one case that cannot be
-            # checked must not be the one case that is silent.
+        repo = refs[0][0] if refs else a.repo
+        if not repo and not (a.send and not a.no_repo):
             print("gate capability NOT CHECKED: the message names no "
                   "github.com/<owner>/<repo>/pull/<n> URL, so there is no repo to "
                   "ask about — an unchecked send is not a checked one",
                   file=sys.stderr)
-        if refs:
-            repo = refs[0][0]
+        if repo:
             roster_now = load_roster()
             kept = []
             for t in targets:
@@ -708,6 +829,15 @@ def main() -> int:
                           f"required approvals", file=sys.stderr)
                     refusal_rc = max(refusal_rc, 7)
                     continue
+                if can is None and not refs:
+                    # A typed repo whose probe cannot answer may itself be wrong; a URL's
+                    # repo was read from a real PR, so only the flag refuses here.
+                    print(f"REFUSED: --repo {repo}: gate capability {why_cap} for "
+                          f"'{t['name']}' ({login}) — a probe that cannot answer checks "
+                          "nobody. Fix the repo name, or drop --repo and pass "
+                          "--no-repo '<reason>'.",
+                          file=sys.stderr)
+                    return 7
                 if can is None:
                     print(f"{t['name']}: gate capability {why_cap} on {repo} — "
                           f"sending, but this is not a confirmation it can approve",
@@ -722,11 +852,38 @@ def main() -> int:
                   "read the PR as never asked. Refused reference(s), and the form that works: "
                   + "; ".join(f"{tok} -> {fix}" for tok, fix in loose), file=sys.stderr)
             return 7
+        # A patch shared before it is a PR still lives in a repo the reviewer may not see.
+        if not _PR_URL.findall(a.message or "") and not a.repo and not a.no_repo:
+            print("REFUSED: pass --repo OWNER/NAME so each reviewer's access is checked, "
+                  "or --no-repo '<reason>' if this ask concerns no repository.",
+                  file=sys.stderr)
+            return 7
     # Gates judge only who a send would reach: a target dropped after them
     # could be the one code owner, leaving the rest asked without one.
     failures = unlogged = 0
     reachable = []
+    worker, worker_agent = acting_worker() if targets else ("", "")
+    joined = None
     for t in targets:
+        if worker:
+            if a.room:
+                candidates = [a.room]
+            else:
+                if joined is None:
+                    joined, why = worker_joined_rooms()
+                    if why:
+                        print("this worker's joined rooms could not be listed; "
+                              "checking the recorded room only", file=sys.stderr)
+                candidates = list(dict.fromkeys([t["room"], *joined]))
+            room, why = worker_room_for(t, worker, worker_agent, candidates)
+            if room is None:
+                print(f"{t['name']}: NO SHARED ROOM — {why}. Not sending: this session acts as "
+                      "its worker's own agent and never falls back to the core's.", file=sys.stderr)
+                refusal_rc = max(refusal_rc, 5)
+                continue
+            print(f"{t['name']}: asking as this worker's own agent", file=sys.stderr)
+            reachable.append({**t, "room": room, "agent": worker_agent})
+            continue
         if a.room and t["room"] != a.room:
             # Not an error: the pair is valid, but the Stand does not live in
             # THIS room, and sending would relocate the thread and report ok.
@@ -793,6 +950,13 @@ def main() -> int:
             print(f"code-owner rule overridden: {a.no_codeowner}", file=sys.stderr)
         else:
             owned, lines = codeowner_gate(a.message, targets, load_roster())
+            if not owned and lines and lines[0].startswith(CHECK_FAILED):
+                # Failing closed is right; reading it as a roster problem is not.
+                print("NOT SENT: couldn't check code owners (the lookup failed), so nothing was "
+                      "refused and the roster is not at fault. Retry the ask.", file=sys.stderr)
+                for line in lines:
+                    print(line, file=sys.stderr)
+                return 9
             if not owned:
                 print("REFUSED: code-owner rule — where the base branch has CODEOWNERS, "
                       "an ask must include a non-author code owner.", file=sys.stderr)
@@ -802,7 +966,13 @@ def main() -> int:
                       "--no-codeowner '<reason>'.", file=sys.stderr)
                 return 8
     for t in targets:
+        log = _correlation()
+        ix = log.mint_interaction_id() if a.kind == "ask" and log is not None else ""
         argv = command_for(t, a.message)
+        if ix:
+            argv[4] = with_interaction_id(argv[4], ix)
+            if not a.task:
+                print("note: no --task, so this ask's interaction record names no task.", file=sys.stderr)
         if not a.send:
             print("PLAN:", " ".join(argv))
             continue
@@ -841,7 +1011,9 @@ def main() -> int:
             # The ask already happened; a lost ledger write makes pr-unattended
             # report NOBODY_EVER_ASKED for someone who was asked. Loud, not fatal.
             try:
-                n_logged = record_asks(a.message, t["name"], a.no_codeowner) if a.kind == "ask" else 0
+                n_logged = record_asks(a.message, t["name"], a.no_codeowner, ix) if a.kind == "ask" else 0
+                if ix:
+                    record_interactions(a.message, t, ix, a.task, event)
             except OSError as e:
                 unlogged += 1
                 print(f"  WARNING: the ask to {t['name']} SUCCEEDED but was NOT recorded "

@@ -1,23 +1,12 @@
 #!/usr/bin/env python3
-"""Tests that get_weather() names the location when it falls back to the default.
-
-`get_weather()` hardcodes San Francisco (37.77, -122.42) and overrides it only
-from WEATHER_LAT/WEATHER_LON. On any install that has not set those, the
-briefing stated San Francisco's conditions as the owner's own weather, in the
-same words it uses when the coordinates ARE the owner's — the configured and
-unconfigured renderings were byte-identical, so nothing in the output could
-distinguish them.
-
-The fallback now names itself. A configured install is unaffected.
-
-No real network runs here.
-"""
+"""Weather requires a valid owner-selected location; no real network calls."""
 import contextlib
 import importlib.util
 import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -70,28 +59,58 @@ class TestWeatherLocation(unittest.TestCase):
         clean = {k: v for k, v in os.environ.items()
                  if k not in ("WEATHER_LAT", "WEATHER_LON", "WEATHER_UNIT")}
         clean.update(env)
-        with patch.dict(os.environ, clean, clear=True):
+        with patch.dict(os.environ, clean, clear=True), \
+                patch("sutando_config.load_config", return_value={}):
             return self.mod.get_weather()
 
-    def test_unconfigured_names_the_default_location(self):
-        """The owner must be able to tell this is not their weather."""
-        w = self._weather({})
-        self.assertIn("San Francisco", w)
-        # The reading itself is still reported.
-        self.assertIn("59", w)
-        self.assertIn("high of 73", w)
+    def test_missing_or_invalid_location_skips_network(self):
+        for cfg in ({}, {"WEATHER_LAT": "33"}, {"WEATHER_LON": "10"},
+                    {"WEATHER_LAT": "bad", "WEATHER_LON": "10"},
+                    {"WEATHER_LAT": "91", "WEATHER_LON": "10"},
+                    {"WEATHER_LAT": "0", "WEATHER_LON": "181"},
+                    {"WEATHER_LAT": "nan", "WEATHER_LON": "10"},
+                    {"WEATHER_LAT": "0", "WEATHER_LON": "inf"}):
+            with self.subTest(cfg=cfg):
+                self.captured.clear()
+                self.assertIsNone(self._weather(cfg))
+                self.assertEqual(self.captured, {})
 
-    def test_spoken_string_carries_no_env_var_remedy(self):
-        """This sentence is spoken aloud (module header: "voice speaks it").
+    def test_zero_coordinates_are_valid(self):
+        self.assertIn("59", self._weather({"WEATHER_LAT": "0", "WEATHER_LON": "0"}))
+        self.assertIn("latitude=0.0&longitude=0.0", self.captured["url"])
 
-        A voice user would hear "set weather underscore lat slash weather
-        underscore lon" mid-forecast. The label belongs in speech; the remedy
-        belongs in the log line, so keep the variable names out of the string.
-        """
-        w = self._weather({})
-        self.assertNotIn("WEATHER_LAT", w)
-        self.assertNotIn("WEATHER_LON", w)
-        self.assertNotIn("_", w)
+    def test_unknown_location_asks_in_narrative(self):
+        narrative = self.mod.synthesize(None, [], [], [], [], [],
+                                        weather_location_known=False)
+        self.assertIn("What city or town should I use for your weather forecast?", narrative)
+        self.assertNotIn("San Francisco", narrative)
+        self.assertNotIn("Everything looks clean", narrative)
+
+    def test_network_failure_does_not_ask_for_known_location(self):
+        narrative = self.mod.synthesize(None, [], [], [], [], [],
+                                        weather_location_known=True)
+        self.assertNotIn("What city", narrative)
+
+    def test_main_writes_location_question_without_weather_request(self):
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            root = Path(directory)
+            stack.enter_context(patch.object(self.mod, "RESULTS_DIR", root / "results"))
+            stack.enter_context(patch.object(self.mod, "STATE_DIR", root / "state"))
+            stack.enter_context(patch("sutando_config.config_get", return_value=None))
+            stack.enter_context(patch("telemetry.feature_used"))
+            network = stack.enter_context(patch.object(self.mod, "urlopen"))
+            for name in ("get_calendar_events", "get_reminders", "get_overnight_discord",
+                         "get_pending_questions", "get_health_issues"):
+                stack.enter_context(patch.object(self.mod, name, return_value=[]))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            self.mod.main()
+            results = list((root / "results").glob("*.txt"))
+            self.assertEqual(len(results), 1)
+            body = results[0].read_text()
+            self.assertTrue(body.startswith("[dm-only]"))
+            self.assertIn("What city or town should I use for your weather forecast?", body)
+            self.assertIn("Your calendar is clear today", body)
+            network.assert_not_called()
 
     def test_configured_is_not_annotated(self):
         """A owner-set location is theirs; adding a caveat would be noise."""
@@ -135,8 +154,10 @@ class TestWeatherUnit(unittest.TestCase):
     def _weather(self, env):
         clean = {k: v for k, v in os.environ.items()
                  if k not in ("WEATHER_LAT", "WEATHER_LON", "WEATHER_UNIT")}
+        clean.update({"WEATHER_LAT": "33.45", "WEATHER_LON": "-112.07"})
         clean.update(env)
-        with patch.dict(os.environ, clean, clear=True):
+        with patch.dict(os.environ, clean, clear=True), \
+                patch("sutando_config.load_config", return_value={}):
             return self.mod.get_weather()
 
     def test_default_stays_fahrenheit(self):
@@ -235,14 +256,14 @@ class DiagnosticAtTheCallSite(unittest.TestCase):
         out = self._weather_block_output({"WEATHER_LAT": "33.4255",
                                           "WEATHER_LON": "-111.9400"})
         self.assertIn("weather: 70", out, "the block under test did not run")
-        self.assertNotIn("default location", out)
+        self.assertNotIn("location unknown", out)
 
-    def test_unconfigured_still_prints_it(self):
+    def test_unconfigured_prints_location_unknown(self):
         # The positive control: without it, the assertion above passes for a
         # line that was simply never reached.
         out = self._weather_block_output({})
         self.assertIn("weather: 70", out)
-        self.assertIn("default location", out)
+        self.assertIn("location unknown", out)
 
 
 if __name__ == "__main__":

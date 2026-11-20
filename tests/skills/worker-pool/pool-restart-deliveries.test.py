@@ -11,8 +11,9 @@ import subprocess
 import sys
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, nullcontext
 from pathlib import Path
+from unittest import mock
 
 
 def load_fixture():
@@ -131,11 +132,17 @@ class RestartDeliveries(unittest.TestCase):
 
     def recover(self, mode):
         args = ["--restart", self.wid] if mode == "restart" else ["--" + mode]
+        tick_context = nullcontext()
         if mode == "sweep":
-            now = time.time()
+            # A stopped writer leaves a fresh beat; advance observation past its stale window.
+            now = time.time() + rem.sup.pb.STALE_AFTER_S + 10
+            real_tick = rem.sup.tick
+            tick_context = mock.patch.object(
+                rem.sup, "tick", side_effect=lambda workspace, _now, **kw: real_tick(workspace, now, **kw))
             rem.sup.save_state(self.ws, rem.ps.SupervisionState(last_sample_at=now - 1, workers={
                 self.wid: rem.ps.WorkerEvidence(first_detected_at=now - 100, consecutive=1)}))
-        out = self.h.call_main(rem, args, f"restart-deliveries/{mode}.json")
+        with tick_context:
+            out = self.h.call_main(rem, args, f"restart-deliveries/{mode}.json")
         if mode == "restart":
             self.assertEqual(out["result"], "restarted")
         else:

@@ -66,9 +66,10 @@ def test_write_task_publishes_atomically_and_completely():
         assert len(tier_at) == 1
         tail = lines[tier_at[0] + 1:]
         assert any(ln.startswith("===SKILL INSTRUCTIONS") for ln in tail)
-        # Completeness: the block's final line (the result path) is the file tail —
+        # Completeness: the block's final line (the result step) is the file tail —
         # a truncated write cannot produce it.
-        assert lines[-1].endswith(f"results/{tid}.txt")
+        assert f"results/{tid}.txt;" in lines[-1]
+        assert lines[-1].endswith("Every task ends with a result.")
         assert "id: task-1784500000000" in body
         assert "source: ag2space" in body
         print("PASS test_write_task_publishes_atomically_and_completely")
@@ -209,18 +210,6 @@ def test_a_present_but_unusable_picker_stamp_is_written_as_refused():
                 f"a present-{label} stamp must be written as the refused stamp, got: "
                 f"{[l for l in text.splitlines() if l.startswith('picker_command')]}")
 
-        # And the reader agrees: the refused stamp is not an action.
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "wpc", pathlib.Path(__file__).resolve().parents[3] / "skills/worker-pool/scripts/worker_picker_commands.py")
-        if spec and spec.loader and spec.origin and pathlib.Path(spec.origin).exists():
-            sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / "src"))
-            wpc = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(wpc)
-            refused = wpc.parse({"source": "worker-picker", "channel_id": "!r:x",
-                                 "picker_command": ""}, sentence)
-            assert refused is None or refused.get("action") != "add", (
-                f"the refused stamp still produced an action: {refused}")
         print("PASS test_a_present_but_unusable_picker_stamp_is_written_as_refused")
 
 
@@ -231,7 +220,7 @@ def test_picker_args_present_but_invalid_is_preserved_as_a_refusing_stamp():
     docs/remote-gateway-protocol.md refuses: args that are not an object are
     refused by name, never resolved from the sentence.
 
-    The reader half is NOT asserted here: worker_picker_commands.py does not
+    The reader half is NOT asserted here: the host reader does not
     exist at this head or on main, so a reader assertion would be a block that
     silently skips and reads as proof. The writer is what this PR owns.
     """

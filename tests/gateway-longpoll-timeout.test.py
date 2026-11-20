@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Long-poll timeout grace preserves retry timing without inventing poll evidence."""
+"""Long-poll timeout grace preserves retry timing without inventing poll evidence.
+
+A held poll inside the grace is the documented empty poll, so it neither backs off
+nor logs an outage; it is still not a success, so it leaves `last_ok_ts` alone and
+its status write says the poll timed out (#5678).
+"""
 from __future__ import annotations
 
 import re
@@ -225,11 +230,12 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
             self.assertEqual(loop.clock.slept, [1])
 
     def test_confirmed_poll_retains_evidence_through_the_inclusive_grace_boundary(self):
+        # last_ok_ts survives the grace; a timed-out poll itself never reads as serving.
         with _StatusLoop(_GW) as loop:
             ok = int(loop.clock.time()) + 1
             loop.run([(1, self.EMPTY), self.timeout(), self.timeout(_GW.POLL_TIMEOUT_GRACE_S - 1)])
             self.assertEqual([r["last_ok_ts"] for r in loop.records], [None, ok, ok, ok])
-            self.assertEqual(loop.serving, [False, True, True, True])
+            self.assertEqual(loop.serving, [False, True, False, False])
             self.assertEqual(loop.clock.slept, [])
             self.assertFalse(any("poll network error" in m for m in loop.logs))
 
@@ -252,7 +258,7 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
             task_ok = empty_ok + _GW.POLL_TIMEOUT_GRACE_S + 4
             self.assertEqual([r["last_ok_ts"] for r in loop.records],
                              [None, None, empty_ok, empty_ok, empty_ok, task_ok, task_ok])
-            self.assertEqual(loop.serving, [False, False, True, True, False, True, True])
+            self.assertEqual(loop.serving, [False, False, True, False, False, True, False])
             self.assertEqual(loop.clock.slept, [1])
             self.assertEqual(len(loop.acks), 1)
             ack = loop.acks[0]
@@ -277,7 +283,8 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
                          + [self.timeout()] * 7)
                 records = loop.records[1 + len(prefix):]
                 self.assertEqual([r["last_ok_ts"] for r in records], [ok] * 10)
-                self.assertEqual(loop.serving[1 + len(prefix):], [False, True] + [False] * 8)
+                # The round failed after a good poll: still connected, with the error recorded.
+                self.assertEqual(loop.serving[1 + len(prefix):], [True] + [False] * 9)
                 self.assertIn("unexpected:", records[0]["error"])
                 self.assertTrue(any("FileExistsError" in m for m in loop.logs))
                 self.assertEqual(loop.clock.slept, [1, 1, 2, 4, 8, 16, 32, 60, 60])
@@ -290,12 +297,12 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
             replace = _GW.os.replace
             failed = []
 
-            def fail_once(src, dst):
+            def fail_once(src, dst, *a, **k):
                 if dst == _GW.GATEWAY_STATUS_FILE and not failed:
                     if json.loads(src.read_text())["last_ok_ts"] is not None:
                         failed.append(True)
                         raise OSError("status unavailable")
-                replace(src, dst)
+                replace(src, dst, *a, **k)
 
             with patch.object(_GW.os, "replace", side_effect=fail_once):
                 loop.run([(1, {"tasks": [self.TASK]}), self.timeout(),
@@ -303,7 +310,7 @@ class GatewayStatusEvidenceTest(unittest.TestCase):
             self.assertEqual(failed, [True])
             self.assertEqual([r["last_ok_ts"] for r in loop.records],
                              [None, 1_000_001, 1_000_001, 1_000_001])
-            self.assertEqual(loop.serving, [False, False, True, False])
+            self.assertEqual(loop.serving, [False, True, False, False])
             self.assertEqual(loop.acks, [])
 
     def test_http_and_auth_failures_preserve_evidence_and_existing_handling(self):
@@ -339,7 +346,7 @@ class LongPollTimeoutTest(unittest.TestCase):
 
     # ── the policy on its own ────────────────────────────────────────────
     def test_the_grace_covers_at_least_one_whole_poll_window(self):
-        self.assertGreaterEqual(self.gw.POLL_TIMEOUT_GRACE_S, self.gw.POLL_WAIT + 10)
+        self.assertGreaterEqual(self.gw.POLL_TIMEOUT_GRACE_S, self.gw.POLL_READ_TIMEOUT_S)
 
     def test_benign_from_zero_up_to_and_including_the_boundary(self):
         g = self.gw.POLL_TIMEOUT_GRACE_S
@@ -359,8 +366,11 @@ class LongPollTimeoutTest(unittest.TestCase):
         self.assertEqual(loop.clock.slept, [], "a benign empty poll must not back off")
         self.assertNotIn("poll network error",
                          " ".join(loop.logs), "and must not log an outage")
-        self.assertIn((False, {"poll_ok_ts": None}), loop.status,
-                      "startup grace alone does not establish connectivity")
+        self.assertNotIn(True, [c for c, _ in loop.status],
+                         "startup grace alone does not establish connectivity")
+        self.assertIsNone(loop.status[-1][1].get("poll_ok_ts"), "a timeout stamped poll evidence")
+        self.assertIn("timed out", str(loop.status[-1][1].get("error")),
+                      "the iteration completes and says the poll timed out")
 
     def test_a_timeout_past_the_grace_takes_the_outage_path(self):
         grace = self.gw.POLL_TIMEOUT_GRACE_S
@@ -720,19 +730,16 @@ class RoundAccountingTest(unittest.TestCase):
             def __exit__(self, *a):
                 return False
 
-            def read(self):
+            def read(self, amt=None):
                 return b""
 
         with _Loop(self.gw) as loop, patch.dict(self.gw._LOG_COUNTS, clear=True):
             real_req = loop._saved["_req"]
             self.gw._req = lambda method, path, *a, **k: (
                 real_req(method, path, *a, **k) if path.startswith("/v1/tasks?") else {})
-            saved_open = urllib.request.urlopen
-            urllib.request.urlopen = lambda *a, **k: _Resp()
-            try:
+            # The opener every request uses, with or without a deadline.
+            with patch.object(urllib.request.OpenerDirector, "open", new=lambda *a, **k: _Resp()):
                 loop.run()
-            finally:
-                urllib.request.urlopen = saved_open
         lines = [m for m in loop.logs if m.startswith("poll anomaly #")]
         self.assertEqual(len(lines), 1)
         self.assertIn("status=200, content-length=0, cf-ray=8f00aa11bb22cc33-SJC", lines[0])
@@ -742,7 +749,7 @@ class RoundAccountingTest(unittest.TestCase):
         with _Loop(self.gw, poll_raises=TimeoutError("The read operation timed out"),
                    advance=1.0) as loop:
             loop.run()
-        self.assertTrue(any(m.startswith("poll read timed out after 35s inside the")
+        self.assertTrue(any(m.startswith(f"poll read timed out after {self.gw.POLL_READ_TIMEOUT_S}s inside the")
                             for m in loop.logs))
 
 
@@ -882,12 +889,136 @@ class SlowDripTest(unittest.TestCase):
         clock = _Clock()
         with patch.object(self.gw, "time", clock), \
                 patch.object(self.gw, "TOKEN", "secret"), patch.object(self.gw, "URL", "http://relay.invalid"), \
-                patch.object(urllib.request, "urlopen", new=lambda *a, **k: self._drip(clock)()):
+                patch.object(urllib.request.OpenerDirector, "open", new=lambda *a, **k: self._drip(clock)()):
             start = clock.now
             with self.assertRaises(TimeoutError):
                 self.gw._req("POST", "/v1/tasks/task-1/ack", {"id": "task-1"}, timeout=10,
                              deadline=start + 5)
             self.assertLessEqual(clock.now - start, 5 + 1, "one drip past the deadline at most")
+
+    def _short(self, clock, body, sent, ends_at=None):
+        """A response whose body stops after `sent` bytes of `body` (Content-Length says all of it):
+        a read blocked until `ends_at` (the deadline's socket shutdown), or a peer that hung up."""
+        class _Resp:
+            status = 200
+            headers = {"Content-Length": str(len(body))}
+
+            def __init__(self):
+                self.left, self.length, self.sent = body, len(body), 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, amt=None):
+                if self.sent >= sent:
+                    if ends_at is not None:
+                        clock.now = ends_at      # blocked in the read until the cut
+                    return b""
+                out, self.left = self.left[:1], self.left[1:]
+                self.sent, self.length = self.sent + 1, self.length - 1
+                return out
+        return _Resp
+
+    def test_a_body_the_deadline_cuts_short_is_a_timeout_not_an_answer(self):
+        import urllib.request
+        clock = _Clock()
+        start, body = clock.now, b'{"tasks": []}' + b" " * 40
+        with patch.object(self.gw, "time", clock), \
+                patch.object(self.gw, "TOKEN", "secret"), patch.object(self.gw, "URL", "http://relay.invalid"), \
+                patch.object(urllib.request.OpenerDirector, "open",
+                             new=lambda *a, **k: self._short(clock, body, 13, ends_at=start + 5)()):
+            with self.assertRaises(TimeoutError, msg="the cut body passed for a whole {'tasks': []}"):
+                self.gw._req("GET", "/v1/tasks?wait=0", timeout=10, deadline=start + 5)
+
+    def test_a_peer_that_hangs_up_short_of_its_content_length_is_incomplete(self):
+        import http.client
+        import urllib.request
+        clock = _Clock()
+        body = b'{"tasks": []}' + b" " * 40
+        with patch.object(self.gw, "time", clock), \
+                patch.object(self.gw, "TOKEN", "secret"), patch.object(self.gw, "URL", "http://relay.invalid"), \
+                patch.object(urllib.request.OpenerDirector, "open", new=lambda *a, **k: self._short(clock, body, 13)()):
+            with self.assertRaises(http.client.IncompleteRead):
+                self.gw._req("GET", "/v1/tasks?wait=0", timeout=10, deadline=clock.now + 5)
+
+    def test_control_a_whole_body_still_parses(self):
+        import urllib.request
+        clock = _Clock()
+        body = b'{"tasks": []}'
+        with patch.object(self.gw, "time", clock), \
+                patch.object(self.gw, "TOKEN", "secret"), patch.object(self.gw, "URL", "http://relay.invalid"), \
+                patch.object(urllib.request.OpenerDirector, "open",
+                             new=lambda *a, **k: self._short(clock, body, len(body))()):
+            self.assertEqual(self.gw._req("GET", "/v1/tasks?wait=0", timeout=10, deadline=clock.now + 5),
+                             {"tasks": []})
+
+    def test_a_dripping_poll_ends_at_its_budget_and_reads_as_an_empty_poll(self):
+        # #5968: urllib's timeout bounds each read, so a long poll whose body drips stayed open.
+        import urllib.request
+        with _Loop(self.gw) as loop:
+            real = loop._saved["_req"]
+            self.gw._req = lambda m, p, payload=None, **kw: (
+                real(m, p, payload, **kw) if p.startswith("/v1/tasks?wait=") else {})
+            drip = self._drip(loop.clock, body=b'{"tasks": []}' + b" " * 10_000)
+            start = loop.clock.now
+            with patch.object(urllib.request.OpenerDirector, "open", new=lambda *a, **k: drip()):
+                loop.run()
+        budget = self.gw.POLL_READ_TIMEOUT_S
+        self.assertLessEqual(loop.clock.now - start, budget + 1, "the whole poll is bounded by its budget")
+        self.assertTrue(any(f"poll read timed out after {budget}s" in m for m in loop.logs), loop.logs)
+
+    def test_the_poll_deadline_outlasts_the_server_hold(self):
+        # Shorter than the hold, every idle poll is cut, and past the grace that reads as an outage.
+        seen = []
+        with _Loop(self.gw) as loop:
+            poll = self.gw._req
+
+            def _req(method, path, payload=None, **kw):
+                if path.startswith("/v1/tasks?wait="):
+                    seen.append((loop.clock.now, kw.get("deadline")))
+                return poll(method, path, payload, **kw)
+            self.gw._req = _req
+            loop.run()
+        self.assertTrue(seen, "the loop made no poll")
+        for start, deadline in seen:
+            self.assertIsNotNone(deadline, "the poll carries no deadline")
+            self.assertGreaterEqual(deadline - start, self.gw.POLL_READ_TIMEOUT_S)
+
+    def test_a_body_that_ends_empty_past_its_deadline_is_a_timeout(self):
+        # No Content-Length to catch the cut: only the clock says the body is not whole.
+        import urllib.request
+        clock = _Clock()
+        start = clock.now
+
+        class _Resp:
+            status = 200
+            headers = {}
+            length = None
+
+            def __init__(self):
+                self.left = [b'{"tasks": []}']
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read1(self, amt=None):
+                if self.left:
+                    return self.left.pop(0)
+                clock.now = start + 6        # blocked in the read until the deadline's cut
+                return b""
+            read = read1
+
+        with patch.object(self.gw, "time", clock), \
+                patch.object(self.gw, "TOKEN", "secret"), patch.object(self.gw, "URL", "http://relay.invalid"), \
+                patch.object(urllib.request.OpenerDirector, "open", new=lambda *a, **k: _Resp()):
+            with self.assertRaises(TimeoutError, msg="the cut body passed for a whole {'tasks': []}"):
+                self.gw._req("GET", "/v1/tasks?wait=0", timeout=10, deadline=start + 5)
 
     def test_the_budgeted_retry_gives_up_at_the_budget(self):
         import urllib.request
@@ -898,7 +1029,7 @@ class SlowDripTest(unittest.TestCase):
         with patch.object(self.gw, "time", clock), patch.object(self.gw, "_log", new=logs.append), \
                 patch.object(self.gw, "TOKEN", "secret"), patch.object(self.gw, "URL", "http://relay.invalid"), \
                 patch.object(self.gw, "_forget_pending_ack", new=lambda *a, **k: None), \
-                patch.object(urllib.request, "urlopen", new=lambda *a, **k: self._drip(clock)()):
+                patch.object(urllib.request.OpenerDirector, "open", new=lambda *a, **k: self._drip(clock)()):
             self.gw._retry_dropped_acks([("task-1", True, "lease-1")], received, fates)
         self.assertLessEqual(clock.now - received, self.gw.ACK_RETRY_BUDGET_S + 1)
         self.assertIsNone(fates["task-1"], "a retry that ran out of budget is not acked")
@@ -1033,6 +1164,40 @@ class DroppedConnectionTest(unittest.TestCase):
         self.assertEqual(recovered, ["poll recovered after 1 failures, 4s"],
                          "only the poll that answered ends the outage")
 
+    def _slept_through_first_poll(self, asleep_s: float):
+        """The first poll is cut by a dropped connection after `asleep_s` of host sleep: wall
+        time moves by it, monotonic time does not, as on a sleeping Mac."""
+        import http.client
+        outcomes = [http.client.RemoteDisconnected("gone"), None]
+        with _Loop(self.gw, poll_raises=outcomes, advance=35.0) as loop:
+            loop._alive = [True, True, False]
+            clock, poll, asleep = loop.clock, self.gw._req, [asleep_s]
+            clock.monotonic = lambda: clock.now - (asleep_s - asleep[0])
+
+            def sleeps_once(method, path, *a, **k):
+                if path.startswith("/v1/tasks?") and asleep[0]:
+                    clock.now += asleep[0]
+                    asleep[0] = 0.0
+                return poll(method, path, *a, **k)
+            self.gw._req = sleeps_once
+            loop.run()
+        return loop.logs
+
+    def test_a_gap_the_host_slept_through_names_its_awake_seconds(self):
+        logs = self._slept_through_first_poll(833.0)
+        errors = [m for m in logs if m.startswith("poll network error")]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("868s since last successful poll, 35s of it awake —", errors[0],
+                      "the 14-min gap of #5510 is 35s of polling and 833s of sleep")
+        recovered = [m for m in logs if m.startswith("poll recovered")]
+        self.assertEqual(recovered, ["poll recovered after 1 failures, 904s, 71s of it awake"])
+
+    def test_control_an_awake_gap_reads_as_before(self):
+        logs = self._slept_through_first_poll(0.0)
+        errors = [m for m in logs if m.startswith("poll network error")]
+        self.assertIn("1 consecutive, 35s since last successful poll — backing off", errors[0])
+        self.assertIn("poll recovered after 1 failures, 71s", logs)
+
     def test_a_reset_while_reading_the_body_is_a_network_error(self):
         import urllib.request
 
@@ -1043,7 +1208,7 @@ class DroppedConnectionTest(unittest.TestCase):
             def __exit__(self, *a):
                 return False
 
-            def read(self):
+            def read(self, amt=None):
                 raise ConnectionResetError(54, "Connection reset by peer")
 
         with _Loop(self.gw) as loop:
@@ -1056,12 +1221,8 @@ class DroppedConnectionTest(unittest.TestCase):
                 return real_req(method, path, *a, **k)
 
             self.gw._req = _req
-            saved_open = urllib.request.urlopen
-            urllib.request.urlopen = lambda *a, **k: _Resp()
-            try:
+            with patch.object(urllib.request.OpenerDirector, "open", new=lambda *a, **k: _Resp()):
                 loop.run()
-            finally:
-                urllib.request.urlopen = saved_open
         self._assert_network_path(loop, "ConnectionResetError")
 
     def test_an_ack_cut_off_mid_flight_reports_a_network_error_not_a_crash(self):

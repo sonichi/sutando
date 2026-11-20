@@ -43,6 +43,7 @@ import { fileURLToPath } from 'node:url';
 import {
 	createAgentStateProvider,
 	createIsolatedIdleRestore,
+	createVerifierHooks,
 	credentialSourceLabel,
 	mapUpstream,
 	publishCapabilitiesMarker,
@@ -427,6 +428,106 @@ describe('createIsolatedIdleRestore — Z3 fence', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Unit: verification-role (?verify=1) hooks
+// ---------------------------------------------------------------------------
+
+describe('createVerifierHooks — ?verify=1 attach and close', () => {
+	function harness(sessionState: string, frame: AgentStateV1) {
+		const calls: string[] = [];
+		const logs: string[] = [];
+		const hooks = createVerifierHooks({
+			emitImmediate: () => { calls.push('emit'); return frame; },
+			sessionState: () => sessionState,
+			wake: () => { calls.push('wake'); },
+			armIdleRestore: () => { calls.push('arm'); },
+			log: (m) => { logs.push(m); },
+		});
+		return { hooks, calls, logs };
+	}
+	const terminal: ProtocolFailure = { upstream: 'failed', reason: 'auth-invalid', category: 'auth' };
+
+	it('sends the current frame at once and wakes a parked idle upstream', () => {
+		const { hooks, calls } = harness('UPSTREAM_LOST', makeProvider({ sessionState: 'UPSTREAM_LOST' }).build());
+		hooks.onVerifierConnected();
+		assert.deepEqual(calls, ['emit', 'arm', 'wake']);
+	});
+
+	it('never redials a fatal backoff or a terminal failure: the frame already says why', () => {
+		for (const frame of [
+			makeProvider({ sessionState: 'UPSTREAM_LOST', terminal }).build(),
+			makeProvider({ sessionState: 'UPSTREAM_LOST', backoffUntil: 2_000_000 }).build(),
+		]) {
+			const { hooks, calls } = harness('UPSTREAM_LOST', frame);
+			hooks.onVerifierConnected();
+			assert.deepEqual(calls, ['emit', 'arm'], frame.upstream);
+		}
+	});
+
+	it('leaves a live or dialing upstream alone', () => {
+		for (const state of ['ACTIVE', 'CONNECTING', 'RECONNECTING']) {
+			const { hooks, calls } = harness(state, makeProvider({ sessionState: state }).build());
+			hooks.onVerifierConnected();
+			assert.deepEqual(calls, ['emit', 'arm'], state);
+		}
+	});
+
+	it('redials only UPSTREAM_LOST: CLOSED and CREATED read idle but cannot be recovered', () => {
+		for (const state of ['CLOSED', 'CREATED']) {
+			const frame = makeProvider({ sessionState: state }).build();
+			assert.equal(frame.upstream, 'idle');
+			const { hooks, calls } = harness(state, frame);
+			hooks.onVerifierConnected();
+			assert.deepEqual(calls, ['emit', 'arm'], state);
+		}
+	});
+
+	it('verifier close arms the idle restore', () => {
+		const { hooks, calls } = harness('ACTIVE', makeProvider({ sessionState: 'ACTIVE' }).build());
+		hooks.onVerifierDisconnected();
+		assert.deepEqual(calls, ['arm']);
+	});
+
+	it('a woken upstream parks again after the verifier leaves, unless a real client connects', async () => {
+		let toreDown = 0;
+		const restore = createIsolatedIdleRestore({ delayMs: 30, clientAttached: () => false, teardown: () => { toreDown++; } });
+		const hooks = createVerifierHooks({
+			emitImmediate: () => makeProvider({ sessionState: 'UPSTREAM_LOST' }).build(),
+			sessionState: () => 'UPSTREAM_LOST',
+			wake: () => {},
+			armIdleRestore: () => restore.arm(),
+			log: () => {},
+		});
+		hooks.onVerifierConnected();
+		hooks.onVerifierDisconnected();
+		assert.equal(restore.pending(), true);
+		await delay(80);
+		assert.equal(toreDown, 1, 'no real client followed: the restore parks the upstream');
+
+		hooks.onVerifierConnected();
+		hooks.onVerifierDisconnected();
+		restore.fence(); // voice-agent's real-connect wrapper
+		await delay(80);
+		assert.equal(toreDown, 1, 'a real connect keeps the upstream the verifier woke');
+	});
+
+	it('logs a failing step instead of throwing: bodhi calls these hooks unguarded', () => {
+		const logs: string[] = [];
+		const hooks = createVerifierHooks({
+			emitImmediate: () => { throw new Error('emit boom'); },
+			sessionState: () => 'UPSTREAM_LOST',
+			wake: () => {},
+			armIdleRestore: () => { throw new Error('arm boom'); },
+			log: (m) => { logs.push(m); },
+		});
+		assert.doesNotThrow(() => hooks.onVerifierConnected());
+		assert.doesNotThrow(() => hooks.onVerifierDisconnected());
+		assert.equal(logs.length, 2);
+		assert.match(logs[0], /emit boom/);
+		assert.match(logs[1], /arm boom/);
+	});
+});
+
+// ---------------------------------------------------------------------------
 // Integration: spawned voice-agent — frames + lifecycle file
 // ---------------------------------------------------------------------------
 
@@ -696,6 +797,42 @@ describe('agent.state emission (integration, spawned agent)', () => {
 			assert.equal(marker.lockId, lock.lockId, 'marker.lockId = lock acquisition token');
 		} finally {
 			client.close();
+		}
+	});
+
+	// bodhi runs only the verifier hooks for ?verify=1, so the verifier's first frame must come from
+	// them, and a failure on record must reach it instead of a redial.
+	it('?verify=1 gets the current frame at once; a terminal failure is reported, not redialed', async () => {
+		const ws = makeWorkspace('verify');
+		const port = await freePort();
+		const trigger = join(ws, 'close-trigger');
+		const agent = spawnAgent(ws, port, await freePort(), {
+			SUTANDO_TEST_UPSTREAM_CLOSE: `${trigger}|1011|You exceeded your current quota, please check your plan and billing details.`,
+		});
+		// The injected close goes after the startup dial settles, so no transition frame can follow
+		// the verifier's attach: any frame it gets is the immediate one.
+		await waitFor(
+			() => /\[Startup\] (session\.start\(\) succeeded|session parked)/.test(agent.stdout() + agent.stderr()),
+			90_000,
+			'startup dial settled',
+		);
+		writeFileSync(trigger, '1');
+		await waitFor(() => {
+			try { return JSON.parse(readFileSync(voiceLifecyclePath(ws), 'utf-8')).category === 'quota'; } catch { return false; }
+		}, 15_000, 'lifecycle failed/quota before the verifier attaches');
+
+		const verifier = new WebSocket(`ws://127.0.0.1:${port}/?verify=1`);
+		const frames = collectFrames(verifier);
+		try {
+			await waitFor(() => frames.length >= 1, 10_000, 'immediate agent.state frame to the verifier');
+			assertValidV1(frames[0], 'verifier frame');
+			assert.equal(frames[0].upstream, 'failed', 'the check sees the failure instead of timing out');
+			assert.equal(frames[0].reason, 'quota-exceeded');
+			assert.equal(frames[0].clientAttached, false, 'a verifier never counts as the attached client');
+			await delay(1500);
+			assert.doesNotMatch(agent.stdout() + agent.stderr(), /recoverUpstream\(human-retry\)/, 'no redial under a terminal failure');
+		} finally {
+			verifier.close();
 		}
 	});
 

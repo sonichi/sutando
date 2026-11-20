@@ -28,7 +28,7 @@ from ...task_io import (LockRefused, acquire_lock, clear_attributed_pidfile, exi
 
 SESSION_RE = re.compile(r"session_[A-Za-z0-9]+")
 ROOM_RE = re.compile(r"![^\s:]+:\S+")
-REMINDER = ("[sparrow task] Follow your standing AG2 Space instructions for this message: one answer, "
+REMINDER = ("[sparrow task] Follow your standing s.space instructions for this message: one answer, "
             "to exactly one place they name (plus only the one DM pointer line when they say so), "
             "then end with posted/not posted <task_id>.")
 LABEL = "claude cloud session"

@@ -57,6 +57,9 @@ only for an owner who asked for the local app, and an empty result from it is no
 python3 "$SKILL_DIR/scripts/calendar-reader.py" 7 --owner-asked          # next 7 days, JSON
 python3 "$SKILL_DIR/scripts/calendar-reader.py" 1 text --owner-asked     # today, plain text
 ```
+It exits 1 on an error. A timeout usually means a macOS prompt asking to let the app control Calendar is
+still waiting on the owner's screen: relay the message (click Allow, or System Settings → Privacy &
+Security → Automation) and stop until they answer; do not loop on retries.
 
 ### Reminders
 ```bash

@@ -13,7 +13,8 @@ Retry policy (normative):
   claim that finds the mark with no recorded receipt parks it OUTCOME_UNKNOWN
   instead of sending again, and one that finds a receipt settles it CONFIRMED;
 - an optional `revalidate` hook is asked right before the send; a reason
-  withdraws the item (parked, never sent).
+  withdraws the item (parked, never sent), and a `Defer` reason releases it
+  unsent with no attempt recorded, for a later pass.
 
 Delivered evidence is written only AFTER the send returns (evidence is
 risk control, not proof — invariant 8)."""
@@ -22,8 +23,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from .contract import (ClaimBackend, DeliveryAttempt, DeliveryOutcome, DeliveryProvider,
-                       DrainResult, DrainStatus, ProviderIndeterminate,
+from .contract import (ClaimBackend, Defer, DeliveryAttempt, DeliveryOutcome, DeliveryProvider,
+                       DrainResult, DrainStatus, ProviderBoundedRefused, ProviderIndeterminate,
                        ProviderRefused, ProviderPermanentRefused, RecoverReport)
 
 
@@ -105,8 +106,10 @@ class DeliveryCore:
         except ProviderIndeterminate as exc:
             return DeliveryOutcome.OUTCOME_UNKNOWN, None, None, False, str(exc)
         except ProviderRefused as exc:
+            spent = (isinstance(exc, ProviderBoundedRefused)
+                     and self.backend.attempts(item_id) + 1 >= exc.attempts)
             return (DeliveryOutcome.NOT_DELIVERED, None, None,
-                    isinstance(exc, ProviderPermanentRefused), str(exc))
+                    spent or isinstance(exc, ProviderPermanentRefused), str(exc))
 
     def _reconcile(self, item_id: str, payload: bytes, key: str):
         """Resolve a prior ambiguity, or None when reconciliation resolved
@@ -156,6 +159,9 @@ class DeliveryCore:
                                    outcome=DeliveryOutcome.OUTCOME_UNKNOWN,
                                    detail="an earlier send was interrupted before its outcome")
         veto = self.revalidate(item_id, payload) if self.revalidate is not None else None
+        if isinstance(veto, Defer):
+            self.backend.release(token)
+            return DrainResult(status=DrainStatus.DEFERRED, detail=str(veto))
         if veto:
             self._complete(token, DeliveryOutcome.NOT_DELIVERED,
                            terminal_reason=f"{WITHDRAWN}:{veto}")

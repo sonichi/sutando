@@ -86,7 +86,7 @@ class SpawnRetained(SpawnRefused):
 
 
 def _run(argv, **kw):
-    return subprocess.run(argv, capture_output=True, text=True, **kw)
+    return subprocess.run(argv, **{"capture_output": True, "text": True, **kw})
 
 
 def per_instance_sentinel_supported(repo, runner=_run) -> bool:
@@ -130,7 +130,9 @@ def session_probe(name: str, socket=None, runner=_run) -> tuple:
     """
     socket = socket or default_socket()
     try:
-        r = runner(["tmux", "-S", socket, "has-session", "-t", f"={name}"])
+        # Captured whatever the runner: absence is read from stderr, so a bare runner reads "unknown".
+        r = runner(["tmux", "-S", socket, "has-session", "-t", f"={name}"],
+                   capture_output=True, text=True)
     except Exception as e:                                   # noqa: BLE001
         return "unknown", f"tmux could not be run: {e}"
     rc = getattr(r, "returncode", None)
@@ -148,6 +150,58 @@ def session_probe(name: str, socket=None, runner=_run) -> tuple:
 def session_state(name: str, socket=None, runner=_run) -> str:
     """"exists" | "absent" | "unknown", from `session_probe`."""
     return session_probe(name, socket, runner)[0]
+
+
+def pane_pid(name: str, socket=None, runner=_run) -> int | None:
+    """The pid of the process tmux is running in this session's one pane.
+
+    The launchers exec the CLI entry point: native Claude, or the standard
+    Codex npm wrapper whose lifetime follows its native child. Isolated tmux
+    fixtures verify both lifecycles; custom wrappers that outlive their child
+    are not covered. `None`
+    when the session or its pane cannot be read; a caller treats that as
+    "no beat this time" rather than failing the whole spawn over it.
+    """
+    try:
+        r = runner(["tmux", "-S", socket or default_socket(), "list-panes",
+                    "-t", name, "-F", "#{pane_pid}"])
+    except Exception:                                        # noqa: BLE001
+        return None
+    out = ((getattr(r, "stdout", None) or "").strip().splitlines() or [""])[0]
+    return int(out) if out.isdigit() else None
+
+
+def start_worker_beat(workspace, worker_id: str, watch_pid: int, *,
+                      repo=None, popen=subprocess.Popen) -> bool:
+    """Fire-and-forget `state/workers/<id>.alive`, watching the CLI entry point pid by
+    signal rather than by parentage.
+
+    Why not `--parent-pid`: nothing this module can spawn is born (and STAYS)
+    a direct OS child of the tmux pane's process — the pid `popen` returns
+    here is a child of THIS process, spawn_worker.py, which exits once the
+    caller's CLI invocation is done; the beat writer is then reparented to
+    PID 1 within moments. `--watch-pid` doesn't care: it asks about
+    `watch_pid` by signal, not about its own ancestry, so that reparenting is
+    harmless — proven live in tests/skills/worker-pool/worker-writes-its-beat.test.sh (spawned
+    the same detached way, SIGKILL of the watched pid, beat writer exits
+    within ~2s; SIGKILL of the beat writer alone leaves the watched pid
+    untouched).
+
+    Never raises: a beat that fails to start is a `state: live, beat: absent`
+    worker, which the roster's own three-state design already tolerates —
+    not a reason to roll back an otherwise-successful spawn.
+    """
+    script = Path(repo or _REPO) / "skills" / "worker-pool" / "scripts" / "pool_beat.py"
+    if not script.is_file():
+        return False
+    try:
+        popen([sys.executable, str(script), "--workspace", str(workspace),
+              "--kind", "worker", "--id", worker_id, "--watch-pid", str(watch_pid)],
+             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+             start_new_session=True)
+    except OSError:
+        return False
+    return True
 
 
 def session_exists(name: str, socket=None, runner=_run) -> bool:
@@ -174,6 +228,32 @@ def resolve_runtime(repo, runtime=None, runner=_run) -> str:
     return runtime
 
 
+def inbox_env(workspace, worker_id: str, scripts=None) -> dict:
+    """The inbox half of a worker session's env, the one rule its spawn and its remedy share. A worker
+    with its own folders (`connections.worker_dirs`) reads a plain inbox of task files and answers in its
+    own results; any other reads sentinels from its deliveries folder through the resolver."""
+    import connections
+    scripts = Path(scripts or _SCRIPTS)
+    own = connections.worker_dirs(worker_id, Path(workspace))
+    if own:
+        # Set empty, not left out: a value inherited from the caller would make the inbox a sentinel one.
+        return {"SUTANDO_TASKS_DIR": str(own[0]), "SUTANDO_RESULTS_DIR": str(own[1]),
+                "SUTANDO_INBOX_KIND": "", "SUTANDO_INBOX_RESOLVER": "", "SUTANDO_WORKSPACE_DIR": str(workspace)}
+    return {"SUTANDO_TASKS_DIR": str(pd.deliveries_dir(workspace, worker_id)),
+            # The inbox holds sentinels, not task bodies. The reader is TOLD
+            # that here; inferring it from the path is the reader deciding.
+            "SUTANDO_INBOX_KIND": "deliveries",
+            # The watcher infers the workspace from its inbox; a delivery
+            # folder would put state/ and results/ under deliveries/.
+            "SUTANDO_WORKSPACE_DIR": str(workspace),
+            # Named, not derived: every runtime writes its answers where the
+            # bridges drain them, which is the workspace's own results/.
+            "SUTANDO_RESULTS_DIR": str(pd.results_dir(workspace)),
+            # REQUIRED: the inbox above holds sentinels, so without a resolver
+            # the watcher hands over the zero-byte one.
+            "SUTANDO_INBOX_RESOLVER": str(scripts / "resolve-inbox-entry")}
+
+
 def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
          socket=None, label: str = "", worker_id=None) -> dict:
     """What a spawn would create. Pure — no side effects, so it is reviewable
@@ -181,7 +261,12 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
     socket = socket or default_socket()
     worker_id = worker_id or wi.new_worker_id()
     delivery_dir = str(pd.deliveries_dir(workspace, worker_id))
+    skipped: list = []
+    plugin_dirs = pr.worker_plugin_dirs(workspace, worker_id, skipped=skipped,
+                                        warn=lambda m: print(m, file=sys.stderr))
     return {
+        # Recorded dirs this start leaves out, so the start's result shows what is missing.
+        "plugin_dirs_skipped": skipped,
         "worker_id": worker_id,
         "label": label or worker_id,
         "runtime": runtime,
@@ -197,30 +282,21 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
                 # stamps the same bare id, so both paths name one worker.
                 "SUTANDO_WORKER_ID": worker_id,
                 "SUTANDO_WORKER_RUNTIME": runtime,
-                "SUTANDO_TASKS_DIR": delivery_dir,
-                # The inbox holds sentinels, not task bodies. The reader is TOLD
-                # that here; inferring it from the path is the reader deciding.
-                "SUTANDO_INBOX_KIND": "deliveries",
-                # The watcher infers the workspace from its inbox; a delivery
-                # folder would put state/ and results/ under deliveries/.
-                "SUTANDO_WORKSPACE_DIR": str(workspace),
-                # Named, not derived: every runtime writes its answers where the
-                # bridges drain them, which is the workspace's own results/.
-                "SUTANDO_RESULTS_DIR": str(pd.results_dir(workspace)),
+                **inbox_env(workspace, worker_id),
                 "SUTANDO_CLAUDE_WORKING_DIR": str(cwd or repo),
                 "SUTANDO_CODEX_WORKING_DIR": str(cwd or repo),
                 # The worker's own gate, named by the skill that owns it: the
                 # core's `/startup --worker` runs what it is handed, not a path.
                 "SUTANDO_WORKER_BOOTSTRAP": str(_SCRIPTS / "worker_bootstrap.py"),
-                # Same rule, and REQUIRED here: the inbox above holds sentinels,
-                # so without a resolver the watcher hands over the zero-byte one.
-                "SUTANDO_INBOX_RESOLVER": str(_SCRIPTS / "resolve-inbox-entry"),
                 # A core exports this; the launcher reads the INHERITED value
                 # to decide it was invoked from inside one. A worker is not.
                 "SUTANDO_CORE_SESSION": "",
                 # The done-flag writer, so a finished delivery can reach
                 # `finished` instead of being re-reported on every boot.
-                "SUTANDO_POOL_DELIVERY_SCRIPT": str(_SCRIPTS / "pool_delivery.py")},
+                "SUTANDO_POOL_DELIVERY_SCRIPT": str(_SCRIPTS / "pool_delivery.py"),
+                # The owner's per-worker plugin opt-in (pool_manage.py plugins), one per line;
+                # always set, so a value inherited from the caller never loads into this worker.
+                "SUTANDO_WORKER_PLUGIN_DIRS": "\n".join(plugin_dirs)},
     }
 
 
@@ -290,7 +366,8 @@ def ensure_remedy_timer(workspace, repo, *, runner=None,
                 return {"ensured": False, "conflict": True, "plist": legacy["plist"],
                         "why": "legacy timer is installed but not loaded; "
                                "run an explicit install to migrate it"}
-            if st.get("loaded"):
+            want = prt.stop_interrupt_setting()
+            if st.get("loaded") and (want is None or st.get("stop_interrupt") == want):
                 return {"ensured": False, "why": "already installed",
                         "plist": st["plist"], "label": st["label"]}
 
@@ -417,9 +494,16 @@ def spawn(workspace, repo, *, runtime=None, cwd: str = "",
             shutil.rmtree(p["delivery_dir"], ignore_errors=True)
         raise SpawnRefused(f"the runtime launcher failed: {why}")
 
+    # Best-effort: a beat that fails to start is `state: live, beat: absent`,
+    # which the roster's own three-state design already tolerates.
+    beat_started = False
+    watch_pid = pane_pid(name, socket, runner)
+    if watch_pid is not None:
+        beat_started = start_worker_beat(workspace, rec["worker_id"], watch_pid, repo=repo)
+
     remedy = ensure_remedy_timer(workspace, repo, runner=runner)
     return {**p, **rec, "runtime_session_id": session_id, "started": True,
-            "remedy_timer": remedy}
+            "beat_started": beat_started, "remedy_timer": remedy}
 
 
 def main(argv=None) -> int:

@@ -86,9 +86,12 @@ class TasksView:
 
     # ── task.submit ─────────────────────────────────────────────────────────
     def submit(self, task_text: str, priority: str = "normal") -> dict:
+        return self._publish(task_text, priority)
+
+    def _publish(self, task_text: str, priority: str, control: "str | None" = None) -> dict:
         text = self._validated_submission(task_text, priority)
         task_id = f"{TASK_PREFIX}{uuid.uuid4().hex[:12]}"
-        content = self._submission_text(task_id, text, priority)
+        content = self._submission_text(task_id, text, priority, control)
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
         tmp = self.tasks_dir / f".{task_id}.tmp"
         tmp.write_text(content)
@@ -153,7 +156,7 @@ class TasksView:
             raise ValueError("priority must be urgent|normal|low")
         return text
 
-    def _submission_text(self, task_id: str, text: str, priority: str) -> str:
+    def _submission_text(self, task_id: str, text: str, priority: str, control: "str | None" = None) -> str:
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         content = (f"id: {task_id}\n"
                    f"timestamp: {stamp}\n"
@@ -164,6 +167,8 @@ class TasksView:
                    f"priority: {priority}\n"
                    + (f"instance_id: {_one_line(self.instance)}\n"
                       if self.instance else "")
+                   # Only task.cancel writes it: no submitted text can, being below `task:`.
+                   + (f"interaction_type: {control}\n" if control else "")
                    + f"task: {text}\n")
         # HMAC envelope (#3014 writer census): stamp at this writer's edge,
         # fail-open so a stamping error costs the stamp, never the submit.
@@ -407,7 +412,7 @@ class TasksView:
         if st == "done":
             return {"taskId": task_id, "state": "done", "cancelled": False,
                     "note": "already completed — nothing to cancel"}
-        sub = self.submit(f"CANCEL_INSTRUCTION: stop processing {task_id}", priority="urgent")
+        sub = self._publish(f"CANCEL_INSTRUCTION: stop processing {task_id}", "urgent", control="task_cancel")
         return {"taskId": task_id, "state": st, "cancelled": "requested",
                 "cancelTaskId": sub["taskId"]}
 

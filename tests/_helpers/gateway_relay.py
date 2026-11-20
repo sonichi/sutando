@@ -35,7 +35,8 @@ class Relay:
     and so is any ack of a task in `lease_ended` (an acknowledged lease the broker ended),
     whose state stays as it was. Results get a 503 while `refusing`. With `token` set, a
     request with any other bearer is refused with `auth_code`; `on_result`, given the
-    payload, may answer a result itself (a status and a body), or return None."""
+    payload, may answer a result itself (a status and a body), or return None; `on_post`, given
+    the path and payload, may answer any POST the same way, ahead of every other rule."""
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -54,6 +55,8 @@ class Relay:
         self.token = ""
         self.auth_code = 401
         self.on_result = None
+        self.on_post = None
+        self.post_paths: "list[tuple[str, dict]]" = []
         self.posted: "list[tuple[dict, str]]" = []     # every result POST and its bearer
         relay = self
 
@@ -115,8 +118,9 @@ class Relay:
                     return
                 code, doc = 200, {"ok": True, "delivery_readable": True}
                 with relay.lock:
-                    answer = None
-                    if self.path == "/v1/results" and relay.on_result:
+                    relay.post_paths.append((self.path, payload))
+                    answer = relay.on_post(self.path, payload) if relay.on_post else None
+                    if answer is None and self.path == "/v1/results" and relay.on_result:
                         answer = relay.on_result(payload)
                     if answer is not None:
                         code, doc = answer

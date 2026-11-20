@@ -9,6 +9,7 @@ then writes the go byte. A failed publish, attach or go write reaps the shim: no
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import signal
@@ -19,7 +20,7 @@ from pathlib import Path
 
 from ... import connect_common as cm, task_io
 from . import inbox
-from .shape import LOCAL
+from .shape import LOCAL, resolve_plugin_dir
 
 GO = b"g"
 NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -58,21 +59,64 @@ def set_title(token: str, out=None) -> None:
     out.flush()
 
 
+def claude_home(config_dir: str) -> str:
+    """CLAUDE_CONFIG_DIR as the session runs it: the recorded one, else the CLI's default."""
+    return config_dir or os.path.join(os.path.expanduser("~"), ".claude")
+
+
+def transcript_path(config_dir: str, session_id: str) -> str:
+    """The session's transcript under any project folder of the config dir's projects tree, else ''.
+    `claude --resume <id>` finds it from any working directory, so the pane's own cwd needs no copy."""
+    base = os.path.join(claude_home(config_dir), "projects")
+    try:
+        projects = sorted(os.listdir(base))
+    except OSError:
+        return ""
+    return next((p for p in (os.path.join(base, d, session_id + ".jsonl") for d in projects) if os.path.isfile(p)), "")
+
+
 def transcript_exists(config_dir: str, session_id: str) -> bool:
     """Whether the session's transcript already lives under CLAUDE_CONFIG_DIR's projects tree."""
-    base = os.path.join(config_dir or os.path.join(os.path.expanduser("~"), ".claude"), "projects")
+    return bool(transcript_path(config_dir, session_id))
+
+
+def live_session_pid(config_dir: str, session_id: str) -> "int | None":
+    """The pid of a running Claude Code process that has `session_id` open, from the CLI's own
+    `sessions/<pid>.json` registry; None when none is recorded live."""
+    base = os.path.join(claude_home(config_dir), "sessions")
     try:
-        projects = os.listdir(base)
+        names = os.listdir(base)
     except OSError:
+        return None
+    for name in names:
+        if not re.match(r"^\d+\.json$", name):
+            continue
+        try:
+            with open(os.path.join(base, name), encoding="utf-8") as f:
+                rec = json.load(f)
+        except (OSError, ValueError):
+            continue
+        pid = rec.get("pid") if isinstance(rec, dict) else None
+        if rec and rec.get("sessionId") == session_id and isinstance(pid, int) and pid > 0 and _alive(pid):
+            return pid
+    return None
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
         return False
-    return any(os.path.isfile(os.path.join(base, p, session_id + ".jsonl")) for p in projects)
+    except PermissionError:
+        return True
+    return True
 
 
 def claude_argv(cfg: dict, session_id: str) -> list:
     """`claude --plugin-dir … --permission-mode … --resume|--session-id <id>`: resume when the
     transcript exists under the session's config dir, else start it under that id."""
     flag = "--resume" if transcript_exists(cfg.get("CLAUDE_CONFIG_DIR", ""), session_id) else "--session-id"
-    return [cfg["CLAUDE"], "--plugin-dir", cfg["PLUGIN_DIR"], "--permission-mode",
+    return [cfg["CLAUDE"], "--plugin-dir", str(resolve_plugin_dir(cfg["PLUGIN_DIR"])[0]), "--permission-mode",
             cfg.get("PERMISSION_MODE") or "bypassPermissions", flag, session_id]
 
 

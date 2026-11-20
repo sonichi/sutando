@@ -72,7 +72,7 @@ PAYLOAD = [{"sender": "@a:x", "ts": 300, "body": "newest", "event_id": "$3"},
            {"sender": "@a:x", "ts": 200, "body": "middle", "event_id": "$2"},
            {"sender": "@a:x", "ts": 100, "body": "oldest", "event_id": "$1"}]
 
-rr.gateway = lambda: ("https://gw.test", {})
+rr.gateway = lambda *_a: ("https://gw.test", {})
 rr.http_request = lambda *a, **k: (200, __import__("json").dumps({"messages": PAYLOAD}).encode(), {})
 # gate is DEFAULT-DENY when a dict is passed (see _gateway.gate_allows);
 # `None` would load the host's real gate, so grant explicitly.

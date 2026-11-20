@@ -79,10 +79,9 @@ def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB,
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
         shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
         (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True)
-        shutil.copy2(
-            REPO / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
-            root / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
-        )
+        for name in ("launch-worker-session.sh", "worker-mcp-credential.sh"):
+            shutil.copy2(REPO / "skills" / "worker-pool" / "scripts" / name,
+                         root / "skills" / "worker-pool" / "scripts" / name)
         delivery_script = root / "skills" / "worker-pool" / "scripts" / "pool_delivery.py"
         delivery_script.write_text("# Readable pool writer fixture for launcher preflight.\n")
         ws = td / "workspace"; (ws / "state").mkdir(parents=True)
@@ -97,7 +96,7 @@ def _launch_argv(extra_env: dict, pgrep_stub: str = PGREP_STUB,
         (ws / "state" / "core-supervisor-relay-loop.pid").write_text(str(os.getpid()))
         bind = td / "bin"; bind.mkdir(); (td / "home").mkdir()
         sock = td / "t.sock"
-        for stub, body in (("claude", 'echo $$ > "$HOME/claude.pid"\nsleep 300\n'), ("pgrep", pgrep_stub),
+        for stub, body in (("claude", '[ "$1" = --version ] && exit 0\necho $$ > "$HOME/claude.pid"\nsleep 300\n'), ("pgrep", pgrep_stub),
                            ("lsof", "exit 1\n"), ("launchctl", "exit 1\n")):
             (bind / stub).write_text("#!/bin/bash\n" + body); (bind / stub).chmod(0o755)
         tm = lambda *a: subprocess.run([tmux, "-S", str(sock), *a], capture_output=True, text=True)
@@ -271,10 +270,9 @@ def _worker_env(extra_env: dict, td: Path) -> list[str]:
         shutil.copytree(REPO / "src", root / "src", symlinks=True)
         shutil.copytree(REPO / "scripts", root / "scripts", symlinks=True)
     (root / "skills" / "worker-pool" / "scripts").mkdir(parents=True, exist_ok=True)
-    shutil.copy2(
-        REPO / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
-        root / "skills" / "worker-pool" / "scripts" / "launch-worker-session.sh",
-    )
+    for name in ("launch-worker-session.sh", "worker-mcp-credential.sh"):
+        shutil.copy2(REPO / "skills" / "worker-pool" / "scripts" / name,
+                     root / "skills" / "worker-pool" / "scripts" / name)
     ws = td / "ws"; ws.mkdir(exist_ok=True)
     (root / "scripts" / "sutando-config.sh").write_text('#!/bin/bash\ncase "$1" in workspace) echo "%s";; python-bin) echo python3;; *) echo "";; esac\n' % ws)
     stub = td / "bin"; stub.mkdir(exist_ok=True)

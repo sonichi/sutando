@@ -277,6 +277,24 @@ def _copy_rule(n, imp: Imports) -> bool:
     return False
 
 
+HISTORICAL_FIXTURE = "tests/fixtures/old_main/tutorial_cf87f324/getting_started.py"
+HISTORICAL_REASON = (
+    "cf87f324's getting_started.py, byte for byte: the deployed writer the tutorial's rollout fence is "
+    "measured against (tests/tutorial-deployed-fence.test.py pins its SHA-256 and runs it as its own "
+    "process). Its findings are evidence of what is deployed, so they can't be fixed in place.")
+# Preserves the deployed parent's state as evidence: only these exact nodes, as (line, column, source text),
+# only in that one file; the same token anywhere else is reported.
+HISTORICAL = {HISTORICAL_FIXTURE: frozenset({
+    (103, 15, "importlib.util.spec_from_file_location('_tutorial_room_commons', script)"),
+    (105, 8, "spec.loader.exec_module(mod)"),
+    (119, 12, "dict(os.environ)"),
+    (122, 15, "importlib.util.spec_from_file_location('room_commons', script)"),
+    (124, 8, "spec.loader.exec_module(rc)"),
+    (136, 4, "from channel_credentials import channel_credentials"),
+    (181, 4, "from channel_credentials import channel_value"),
+    (375, 19, "subprocess.run(argv, capture_output=True, text=True, timeout=120, env=self.env)")})}
+
+
 @functools.lru_cache(maxsize=None)
 def _in_scope(source: str) -> "bool | None":
     """Whether the code, not its comments or docstrings, names a gateway reference; None if unparseable."""
@@ -289,8 +307,18 @@ def _in_scope(source: str) -> "bool | None":
     return bool(REFERENCE.search(code_text(tree)))
 
 
-def violations(source: str, name: str = "<sample>") -> "list[str]":
+def violations(source: str, name: str = "<sample>", permitted: "frozenset | None" = None) -> "list[str]":
     """Each inheritance site in one file's source, as 'name:line: rule'."""
+    allowed = HISTORICAL.get(name, frozenset()) if permitted is None else permitted
+    at = {}
+    for line, col, text in allowed:
+        at.setdefault((line, col), set()).add(text)
+
+    def historical(n) -> bool:
+        # Position first, so ast.unparse runs only on the few nodes at a permitted (line, column).
+        texts = at.get((getattr(n, "lineno", None), getattr(n, "col_offset", None))) if at else None
+        return bool(texts) and ast.unparse(n) in texts
+
     scope = _in_scope(source)
     if scope is None:
         return [f"{name}:0: unparseable"]
@@ -429,7 +457,8 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
 
     nodes = list(ast.walk(tree))
     module_iso = sorted(n.lineno for n in nodes if isolates(n) and enclosing_def(n) is None)
-    runs = sorted((n for n in nodes if runs_code(n) and not covered(n)), key=lambda n: n.lineno)
+    runs = sorted((n for n in nodes if runs_code(n) and not covered(n) and not historical(n)),
+                  key=lambda n: n.lineno)
     out = []
     if runs and not module_iso:
         out.append((runs[0].lineno, "unisolated"))
@@ -443,6 +472,8 @@ def violations(source: str, name: str = "<sample>") -> "list[str]":
             and _name(n.func) in ISOLATORS and not isolator_call(n)]
     for n in nodes:
         rule = None
+        if historical(n):
+            continue
         if _copy_rule(n, imp):
             rule = "copy"
         elif isinstance(n, ast.Call) and imp.spawn(n):
@@ -855,6 +886,31 @@ class SelfTest(unittest.TestCase):
 
 
 class Tree(unittest.TestCase):
+    def test_the_historical_fixture_is_scanned_and_only_its_exact_nodes_are_permitted(self):
+        fixture = REPO / HISTORICAL_FIXTURE
+        self.assertIn(fixture, scanned_files())
+        self.assertTrue(HISTORICAL_REASON)
+        text = fixture.read_text()
+        self.assertEqual(violations(text, HISTORICAL_FIXTURE), [])
+        # The same tokens anywhere else are findings, as is any one of them left unpermitted.
+        elsewhere = "tests/fixtures/old_main/planted.py"
+        self.assertEqual(violations(text, elsewhere), [f"{elsewhere}:103: unisolated", f"{elsewhere}:119: copy"])
+        for token in HISTORICAL[HISTORICAL_FIXTURE]:
+            self.assertTrue(violations(text, HISTORICAL_FIXTURE, HISTORICAL[HISTORICAL_FIXTURE] - {token}), token)
+        # A second violation on a permitted line, another node at a permitted position, and the
+        # permitted text at another column or line are all still reported.
+        lines = text.split("\n")
+        for line, extra, rule in ((119, "; leak = os.environ.copy()", "copy"),
+                                  (119, "; leak = dict(os.environ)", "copy"),
+                                  (103, "; subprocess.run(['true'])", "unisolated")):
+            planted = lines[:line - 1] + [lines[line - 1] + extra] + lines[line:]
+            self.assertEqual(violations("\n".join(planted), HISTORICAL_FIXTURE),
+                             [f"{HISTORICAL_FIXTURE}:{line}: {rule}"], extra)
+        swapped = lines[:118] + [lines[118].replace("dict(os.environ)", "os.environ.copy()")] + lines[119:]
+        self.assertEqual(violations("\n".join(swapped), HISTORICAL_FIXTURE), [f"{HISTORICAL_FIXTURE}:119: copy"])
+        moved = text + "\n\ndef planted():\n    return dict(os.environ)\n"
+        self.assertEqual(violations(moved, HISTORICAL_FIXTURE), [f"{HISTORICAL_FIXTURE}:{len(lines) + 3}: copy"])
+
     def test_no_test_reaching_gateway_credentials_inherits_the_outer_environment(self):
         files = scanned_files()
         self.assertGreater(len(files), 100, "the scan found almost no files: the roots moved")

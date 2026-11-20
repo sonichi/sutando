@@ -385,6 +385,8 @@ def parse_markers(text: str, skip_after_channel: bool = False) -> ParseResult:
 _TASK_CHANNEL_RE = re.compile(r"^(?:channel_id|chat_id):\s*(\S+)\s*$", re.MULTILINE)
 _TASK_SOURCE_RE = re.compile(r"^source:\s*(\S+)\s*$", re.MULTILINE)
 _TASK_USER_RE = re.compile(r"^user_id:\s*(\S+)\s*$", re.MULTILINE)
+_TASK_ROOM_RE = re.compile(r"^source_room_id:\s*(\S+)\s*$", re.MULTILINE)
+_TASK_ASKED_BY_RE = re.compile(r"^asked_by:\s*(\S+)\s*$", re.MULTILINE)
 
 
 def task_channel_id(task_text: str | None) -> str | None:
@@ -432,6 +434,20 @@ def dedup_cross_channel_target(deduped_channel_id, holder_task_text: str | None,
                                   asking_source, task_source(holder_task_text)):
         return holder_channel or task_source(holder_task_text)
     return None
+
+
+def dedup_same_relay_asker(asking_task_text: str | None, holder_task_text: str | None) -> bool:
+    """Whether two tasks without a channel name the same room and the same asker, all present.
+
+    A relay ask carries no `channel_id`, and its `user_id` is the account it runs for, not
+    who asked, so a fold between two of them can be verified only through `source_room_id`
+    and `asked_by`. A missing field on either side verifies nothing.
+    """
+    if task_channel_id(asking_task_text) or task_channel_id(holder_task_text):
+        return False
+    fields = [(rx.search(asking_task_text or ""), rx.search(holder_task_text or ""))
+              for rx in (_TASK_ROOM_RE, _TASK_ASKED_BY_RE)]
+    return all(a and h and a.group(1) == h.group(1) for a, h in fields)
 
 
 def task_user_id(task_text: str | None) -> str | None:
@@ -564,7 +580,7 @@ def render_skill_prelude(
             f"message, reconstruct the room thread — `python3 "
             f"skills/agent-room-ops/room_ops.py read {_chan_q} --limit 30` (if it "
             f"reports no gateway configured, load the channel env first: `set -a; . "
-            f"\"$(bash scripts/channel-env.sh {_cdir_q})\"; set +a`) — and read it "
+            f"\"$(bash scripts/channel-env.sh {_cdir_q} --room {_chan_q})\"; set +a`) — and read it "
             "back (everyone's messages including your own prior replies) until this "
             "message stands on its own, then answer from the reconstructed thread, "
             "NOT from memory. Do this every time; do NOT skip it because the message "
@@ -574,7 +590,8 @@ def render_skill_prelude(
         _step += 1
         # No notify step here: the broker's delivery status already shows
         # pickup and working, so no notify message is sent.
-    _skill.append(f"{_step}. Process and write the result to results/{tid}.txt")
+    _skill.append(f"{_step}. Process and write the result to results/{tid}.txt; to end it with "
+                  "no reply, write `[no-send]` as the result. Every task ends with a result.")
     return _skill
 
 

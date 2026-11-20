@@ -27,6 +27,9 @@ command -v tmux >/dev/null 2>&1 || { echo "SKIP: tmux not available"; exit 0; }
 
 fail=0
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/sut-sup-gate.XXXXXX")"
+# Each fixture inbox's parent is its workspace, as in CI: an inherited workspace would put these watchers'
+# sentinels in the host's live state dir and take the running core's readiness away.
+unset SUTANDO_WORKSPACE_DIR
 SOCK="$WORK/tmux.sock"
 
 STUB="$WORK/stub-notifier.sh"
@@ -63,7 +66,7 @@ start_target() { tmux -S "$SOCK" new-session -d -s target -c "$REPO" "sleep 600"
 start_supervisor() {
   local tasks_dir="$1" marker="$2" grace="$3" role_poll="$4" extra_path="${5:-}"
   tmux -S "$SOCK" new-session -d -s supervisor -c "$REPO" \
-    "env -u SUTANDO_INSTANCE_ID PATH=${extra_path:+$extra_path:}\$PATH \
+    "env -u SUTANDO_INSTANCE_ID -u SUTANDO_WORKSPACE_DIR PATH=${extra_path:+$extra_path:}\$PATH \
        SUTANDO_TMUX_SOCKET=$SOCK SUTANDO_TMUX_SESSION=target \
        SUTANDO_TASKS_DIR=$tasks_dir SUTANDO_NOTIFIER_SCRIPT=$STUB \
        SUTANDO_STUB_MARKER=$marker SUTANDO_NOTIFIER_GRACE_PERIOD=$grace \
@@ -74,7 +77,7 @@ start_supervisor() {
 start_internal_watcher() {  # start_internal_watcher <tasks_dir> <name> [<PATH prefix>]
   local tasks_dir="$1" name="$2" extra_path="${3:-}"
   tmux -S "$SOCK" new-session -d -s "$name" -c "$REPO" \
-    "env -u SUTANDO_INSTANCE_ID PATH=${extra_path:+$extra_path:}\$PATH \
+    "env -u SUTANDO_INSTANCE_ID -u SUTANDO_WORKSPACE_DIR PATH=${extra_path:+$extra_path:}\$PATH \
        SUTANDO_TMUX_SOCKET=$SOCK SUTANDO_TMUX_SESSION=target SUTANDO_WATCHER_READY_TIMEOUT=60 \
        bash $WATCHER $tasks_dir --role session --inbox $tasks_dir > $WORK/$name.log 2>&1"
 }

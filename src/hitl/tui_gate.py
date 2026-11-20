@@ -21,15 +21,44 @@ SEMANTIC_GATES = frozenset({"permission", "selection", "press-enter", "login"})
 _NEVER_ONE_CLICK = re.compile(r"trust the files|Do you trust|Bypass Permissions|Yes, I accept|"
                               r"Fable limit|usage credits|hit your (?:session|usage|weekly) limit", re.I)
 _OPTION = re.compile(r"^\s*(❯)?\s*(\d+)\.\s+(.*\S)\s*$")
-_FRAME = re.compile(r"^[\s─━│┃┌┐└┘╭╮╰╯├┤┬┴┼═║╔╗╚╝]*$")
+_FRAME = re.compile(r"^[\s─━│┃┌┐└┘╭╮╰╯├┤┬┴┼═║╔╗╚╝╌╍┄┅┈┉]*$")
+_EDGE = frozenset("─━═╭┌╔")  # a rule or a box top: where a dialog starts
 _HINT = re.compile(r"Esc to cancel|Enter to (confirm|select)|↑/↓|shift\+tab|Tab to", re.I)
+_FOOTER = re.compile(r"^⏵|←\s*for agents|esc to interrupt|\? for shortcuts", re.I)
 _YES = re.compile(r"^\s*yes\b", re.I)
 _NO = re.compile(r"^\s*no\b", re.I)
 
 
 def guard_for(session: str, prompt: Optional[str], state: str) -> str:
-    """The episode key: same session + same dialog text = same requirement."""
-    return hashlib.sha256(f"{session}\n{prompt or state}".encode()).hexdigest()[:16]
+    """The episode key: same session + same dialog = same requirement."""
+    episode = dialog_identity(prompt) or prompt or state
+    return hashlib.sha256(f"{session}\n{episode}".encode()).hexdigest()[:16]
+
+
+def dialog_identity(prompt: Optional[str]) -> Optional[str]:
+    """The live dialog's own text, from the rule or box top above it (an edit's inner diff box
+    counts) to its last option, caret and borders dropped. Live = a caret block with only hints
+    and footer below it; anything else returns None and the whole prompt keys the guard."""
+    blocks = option_blocks(prompt)
+    live = next((b for b in reversed(blocks) if b[2] is not None), None)
+    if live is None:
+        return None
+    start, labels, _ = live
+    lines = (prompt or "").splitlines()
+    end = [i for i in range(start, len(lines)) if _OPTION.match(lines[i])][len(labels) - 1]
+    for line in lines[end + 1:]:
+        s = line.strip()
+        if s and not (_FRAME.match(s) or _HINT.search(s) or _FOOTER.search(s)):
+            return None  # a gate below the list: the list is not what it asks
+    body: List[str] = []
+    for line in reversed(lines[:start]):
+        s = line.strip()
+        if _OPTION.match(line) or s.startswith("✓") or s[:1] in _EDGE:
+            break  # the dialog's top edge, or an older dialog above it
+        s = s.strip("│┃║ ")
+        if s and not _HINT.search(s):
+            body.append(s)
+    return "\n".join(body[::-1] + labels)
 
 
 # A usage limit is one episode per seat however its screen repaints (banner, menu, refused
@@ -63,6 +92,19 @@ def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None) 
     return (f"It continues when the limit resets. To unblock it sooner, {where} and run "
             "/usage-credits to use extra credits, /login to switch to another account, "
             "or /model to switch to a model with usage left.")
+
+
+def sign_in_copy(runtime: Optional[str] = None) -> Tuple[str, str, str]:
+    """(title, message, button label) for a signed-out seat, in its own runtime's words."""
+    if runtime in (None, "claude"):
+        return ("Claude needs you to sign in again",
+                "Your Claude session has expired. Sign in again to continue.", "Sign in to Claude")
+    if runtime == "codex":
+        return ("Codex needs you to sign in again",
+                "Your Codex session has expired. Run `codex login` in its terminal to continue.",
+                "Sign in to Codex")
+    return ("Agent needs you to sign in again",
+            "The agent's sign-in has expired. Sign in again to continue.", "Sign in")
 
 
 def option_blocks(prompt: Optional[str]) -> List[Tuple[int, List[str], Optional[int]]]:
@@ -145,15 +187,16 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
             or (gate is not None and gate not in SEMANTIC_GATES and state != "logged-out")):
         pass  # keeps the blocked card: never a one-click answer on a trust/spend gate or a limit
     elif gate == "login" or state == "logged-out":
-        kind, title = "auth", "Claude needs you to sign in again"
-        message = "Your Claude session has expired. Sign in again to continue."
-        actions = [Action(id="authenticate", kind="authenticate", label="Sign in to Claude")]
+        kind = "auth"
+        title, message, label = sign_in_copy(runtime)
+        actions = [Action(id="authenticate", kind="authenticate", label=label)]
     elif gate == "press-enter":
         kind, title = "confirmation", "Agent needs your confirmation"
         message = question(prompt, detail)
         actions = [Action(id="continue", kind="continue", label="Continue")]
-    elif options:
+    elif options and caret is not None:
         # Kind follows the OPTIONS: classify() names a Yes/No dialog `selection`.
+        # No caret means keys_for can never answer it, so a button would only go stale.
         yes = next((i for i, o in enumerate(options) if _YES.match(o)), None)
         no = next((i for i, o in enumerate(options) if _NO.match(o)), None)
         message = question(prompt, detail)
