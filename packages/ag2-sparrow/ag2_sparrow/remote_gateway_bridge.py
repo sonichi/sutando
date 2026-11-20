@@ -10851,6 +10851,15 @@ _LOCK_STALE_S = _WS_STALE_SECONDS
 _LOCK_LOST = threading.Event()
 _LOCK_HB_MUTEX = threading.Lock()
 _POLL_BACKOFF_MAX_S = 60
+
+
+def _pass_backoff(backoff: float, polled_ok: bool) -> "tuple[float, float]":
+    """(this pause, the next backoff) after a pass fails. A failure after the pass's poll was
+    answered is not the relay refusing polls (#6542): it pauses the base second and leaves the
+    poll's backoff at its base, so a step that fails every pass cannot hold each poll 60 s apart."""
+    if polled_ok:
+        return 1, 1
+    return backoff, min(backoff * 2, _POLL_BACKOFF_MAX_S)
 # Typical worst case for one pass (a queued retry backlog can exceed it): the
 # long poll at its timeout, the largest backoff and two requests, doubled.
 _LOCK_PASS_MAX_S = 2 * (POLL_READ_TIMEOUT_S + _POLL_BACKOFF_MAX_S + 2 * _REQ_TIMEOUT_S)
@@ -11533,9 +11542,10 @@ def main() -> int | None:
                     continue
                 _emit_gateway_status(False, error=f"auth rejected HTTP {e.code}", poll_ok_ts=last_poll_ok)
                 sys.exit(f"FATAL: gateway auth rejected (HTTP {e.code}) — check REMOTE_TASK_TOKEN.")
-            _log(f"poll HTTP {e.code} — backing off {backoff}s")
-            _emit_gateway_status(polled_ok, error=f"HTTP {e.code}", backoff_s=backoff, poll_ok_ts=last_poll_ok)
-            time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
+            pause, backoff = _pass_backoff(backoff, polled_ok)
+            _log(f"poll HTTP {e.code} — backing off {pause}s")
+            _emit_gateway_status(polled_ok, error=f"HTTP {e.code}", backoff_s=pause, poll_ok_ts=last_poll_ok)
+            time.sleep(pause)
         except _PollAnomaly:
             # Every anomaly is counted in its line; the log itself thins out a run of them.
             _log_backoff(("poll-anomaly",), f"{_POLL_ANOMALY_LINE} — backing off {backoff}s")
@@ -11544,18 +11554,20 @@ def main() -> int | None:
             time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
         except _NETWORK_ERRORS as e:
             poll_failures += 1
+            pause, backoff = _pass_backoff(backoff, polled_ok)
             _log(f"poll network error: {diagnostics.describe(e)} — {poll_failures} consecutive, "
                  f"{int(time.time() - poll_grace_since)}s since last successful poll"
                  f"{_awake_note(time.time() - poll_grace_since, time.monotonic() - poll_ok_awake)} — "
-                 f"backing off {backoff}s")
-            _emit_gateway_status(polled_ok, error=f"network: {diagnostics.describe(e)}", backoff_s=backoff,
+                 f"backing off {pause}s")
+            _emit_gateway_status(polled_ok, error=f"network: {diagnostics.describe(e)}", backoff_s=pause,
                                  poll_ok_ts=last_poll_ok)
-            time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
+            time.sleep(pause)
         except Exception as e:  # noqa: BLE001 — keep the loop alive
-            _log(f"unexpected: {diagnostics.describe(e)} — backing off {backoff}s")
-            _emit_gateway_status(polled_ok, error=f"unexpected: {diagnostics.describe(e)}", backoff_s=backoff,
+            pause, backoff = _pass_backoff(backoff, polled_ok)
+            _log(f"unexpected: {diagnostics.describe(e)} — backing off {pause}s")
+            _emit_gateway_status(polled_ok, error=f"unexpected: {diagnostics.describe(e)}", backoff_s=pause,
                                  poll_ok_ts=last_poll_ok)
-            time.sleep(backoff); backoff = min(backoff * 2, _POLL_BACKOFF_MAX_S)
+            time.sleep(pause)
 
 
 def run() -> None:
