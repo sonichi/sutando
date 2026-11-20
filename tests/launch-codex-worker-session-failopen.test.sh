@@ -101,6 +101,18 @@ worker_ok "$SEAT"; check $? "no node: the worker session is up and the superviso
 grep -q "no node; no observer" "$TMP/err"; check $? "no node: the launcher says so"
 mv "$TMP/node.off" "$TMP/bin/node"
 
+# --- 5. codex is not signed in: the error names the home it checked and how to sign in ---
+mv "$TMP/bin/codex" "$TMP/codex.ok"
+printf '#!/bin/sh\n[ "$1 $2" = "login status" ] && exit 1\nexit 0\n' > "$TMP/bin/codex"; chmod +x "$TMP/bin/codex"
+launch "$SEAT" CODEX_HOME="$TMP/my codex"; rc=$?
+[ "$rc" = 1 ]; check $? "not signed in: the launcher exits 1"
+[ ! -f "$TMP/sessions/sutando-worker-$SEAT" ]; check $? "not signed in: no worker session was created"
+grep -qF "Codex is not authenticated in $TMP/my codex (Sutando's Codex home)" "$TMP/err"
+check $? "not signed in: the error names the Codex home it checked"
+grep -qF "Sign in with: CODEX_HOME=\"$TMP/my codex\" codex login" "$TMP/err"
+check $? "not signed in: the error gives the sign-in command for that home"
+mv "$TMP/codex.ok" "$TMP/bin/codex"
+
 echo "---"
 if [ "$fail" -gt 0 ]; then echo "FAILED — $fail of $((pass+fail)) checks"; exit 1; fi
 echo "PASS — $pass checks green"
