@@ -14,6 +14,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -861,6 +862,21 @@ class TestBindingIsDurable(WorldCase):
         self.assertIn("malformed", self.w.m(self.e, final=True)["reason"])
         self.assertEqual(pending_ids(self.w.ws[SELF]), [C1])
 
+    def test_a_malformed_binding_no_longer_pins_waiting_answers_to_a_dead_row(self):
+        # It can never close, so it holds nothing: the agent's next unbound message is offered and closes it.
+        policy._claim_file(policy._key_path(self.w.ws[SELF], "bound", self.e), {"cid": C1, "disposition": "answer"})
+        e2 = self.sib("Correction: it is up now.")
+        got = policy.waiting_answers(self.w.tr[SELF], ROOM, self.w.ws[SELF])[C1]
+        self.assertEqual(got, {"event_id": e2, "text": "Correction: it is up now."})
+        self.assertTrue(self.w.m(e2, final=True)["matched"])
+        self.assertEqual(pending_ids(self.w.ws[SELF]), [])
+
+    def test_closable_binding_is_the_one_well_formed_rule(self):
+        self.assertTrue(policy._closable_binding({"cid": C1, "payload": {}, "record": {}}))
+        for bad in ({"cid": C1}, {"payload": {}, "record": "x"}, {"payload": [], "record": {}}, None, "x"):
+            with self.subTest(bad=bad):
+                self.assertFalse(policy._closable_binding(bad))
+
     def test_an_unwritable_binding_closes_nothing(self):
         with mock.patch.object(policy, "_claim_file", side_effect=OSError("read-only")):
             self.assertIn("could not be bound", self.w.m(self.e, final=True)["reason"])
@@ -954,6 +970,73 @@ class TestExpiryAndPending(WorldCase):
         self.assertEqual(pending_ids(self.w.ws[SELF]), [C1])  # hidden, not deleted
         self.assertTrue(policy._record_path(self.w.ws[SELF], "nudged", C1).exists())
         self.assertTrue(policy._root_claim(self.w.ws[SELF], TID).exists())
+
+    def _expired_nudged_and_done(self, binding=None):
+        self.w.ask(SELF, SIB, cid=C1, now=lambda: time.time() - 8 * 86400)
+        if binding is not None:
+            policy._claim_file(policy._key_path(self.w.ws[SELF], "bound", "$answer"), binding)
+        policy.mark_nudged(self.w.ws[SELF], C1)
+        (self.w.ws[SELF] / "results" / f"{TID}.txt").write_text("done")
+        return policy.pending(self.w.ws[SELF], 600)
+
+    def test_a_malformed_answer_binding_does_not_keep_an_expired_consult_listed(self):
+        # --final refuses a malformed binding, so it can never close: it held the row forever.
+        self.assertEqual(self._expired_nudged_and_done({"cid": C1, "disposition": "answer"}), [])
+        self.assertEqual(pending_ids(self.w.ws[SELF]), [C1], "hidden, never deleted")
+
+    def test_control_a_well_formed_answer_binding_still_keeps_it_listed(self):
+        rows = self._expired_nudged_and_done({"cid": C1, "disposition": "answer",
+                                              "payload": {"reply_text": "yes"}, "record": {"cid": C1}})
+        self.assertEqual([r["cid"] for r in rows], [C1])
+
+    def test_a_dotted_named_instance_id_with_a_live_task_is_still_seen(self):
+        # The listing shortcut only answers for ids without a `.`; this one takes the full lookup.
+        tid = "task-dev~ask.5"
+        ws = self.w.ws[SELF]
+        (ws / "tasks" / f"{tid}.txt").write_text(f"id: {tid}\nsource: ag2space\ntask: x\n")
+        policy._claim_file(policy._root_claim(ws, tid), {"cid": C2})
+        self.assertEqual([(r["task_id"], r.get("claim_only")) for r in policy.pending(ws, 600)],
+                         [(tid, True)])
+
+    def _dead_consults(self, n=20):
+        """`n` expired, nudged consults whose tasks are gone: none may be listed."""
+        ws, old = self.w.ws[SELF], time.time() - 9 * 86400
+        for i in range(n):
+            cid, tid = f"{i:016x}", f"task-{1700000000000 + i}"
+            policy._write_record(policy._record_path(ws, "pending", cid),
+                                 {"cid": cid, "task_id": tid, "asked_at": old, "ask_event": f"$a{i}"})
+            policy._write_record(policy._record_path(ws, "nudged", cid), {"cid": cid, "asked_at": old})
+            policy._claim_file(policy._root_claim(ws, tid), {"cid": cid})
+        return ws
+
+    def _pending_counting_lookups(self, ws):
+        import task_archive
+        with mock.patch.object(task_archive, "find_task_file", wraps=task_archive.find_task_file) as lookup:
+            rows = policy.pending(ws, 600)
+        return rows, lookup.call_count
+
+    def test_dead_tasks_cost_no_task_file_lookup(self):
+        rows, lookups = self._pending_counting_lookups(self._dead_consults())
+        self.assertEqual(rows, [])
+        self.assertEqual(lookups, 0, "a dead task is answered from one listing of tasks/")
+
+    def test_a_missing_tasks_dir_is_an_empty_listing(self):
+        ws = self._dead_consults()
+        shutil.rmtree(ws / "tasks")
+        self.assertEqual(self._pending_counting_lookups(ws), ([], 0))
+
+    def test_an_unreadable_tasks_dir_takes_the_full_lookup_with_the_same_answer(self):
+        ws = self._dead_consults(3)
+        real = os.listdir
+
+        def listdir(path="."):
+            if Path(path) == ws / "tasks":
+                raise PermissionError(13, "Permission denied", str(path))
+            return real(path)
+        with mock.patch.object(policy.os, "listdir", side_effect=listdir):
+            rows, lookups = self._pending_counting_lookups(ws)
+        self.assertEqual(rows, [])
+        self.assertGreater(lookups, 0, "an unreadable inbox is never read as an empty one")
 
     def test_overdue_consults_are_due_a_nudge_once(self):
         self.w.ask(SELF, SIB, cid=C1, now=lambda: time.time() - 700)
