@@ -15,6 +15,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -213,6 +214,455 @@ with mock.patch.object(rem.sup, "is_paused", return_value=True), \
         mock.patch.object(rem.wc, "raise_card", side_effect=lambda *a, **k: raised.append(a) or {}):
     rem.apply(ws_p, str(REPO), {WID: ps.CARD_UNDELIVERED}, runner=Tmux(IDLE))
 check("a seat paused after the sweep is not carded", raised, [])
+
+# --- the owner clears the fence from the card (#6303) -------------------------------------
+from hitl.schema import ActionReply, STATUS_EXPIRED, STATUS_RESOLVED  # noqa: E402
+
+
+def fenced_card(name):
+    sock = tmp / f"{name}.sock"
+    tpk.prepare_guard(sock)
+    (tpk.guard_path(sock) / "mutex").unlink()
+    ws = pool(sock)
+    out, t, req = card(ws, IDLE)
+    return sock, ws, req, HitlManager(HitlStore(ws / "state" / "hitl" / "requirements"))
+
+
+def press(m, req, action_id):
+    m.apply_action(ActionReply(hitl_id=req.id, expected_revision=req.revision, action_id=action_id,
+                               guard=req.guard))
+
+
+class Runner(Tmux):
+    """An idle pane, and a recovery that exits `rc` instead of running."""
+
+    def __init__(self, rc=0):
+        super().__init__(IDLE)
+        self.rc = rc
+
+    def __call__(self, argv, **kw):
+        if "recover-episode" in argv:
+            self.calls.append(list(argv))
+            return type("Done", (), {"returncode": self.rc, "stdout": "", "stderr": ""})()
+        return super().__call__(argv, **kw)
+
+    def recoveries(self):
+        return [c for c in self.calls if "recover-episode" in c]
+
+
+def _real_with_idle_pane():
+    """The real recovery, and an idle pane for the card raised after it refuses."""
+    def run(argv, **kw):
+        if "recover-episode" in argv:
+            return subprocess.run(argv, **kw)
+        return Tmux(IDLE)(argv, **kw)
+    return run
+
+
+def offered_again(m, why):
+    """The one active card after a press that settled nothing: it still has the button, and says why."""
+    active = m.active()
+    return (len(active), wc.FENCE_ACTION in [a.id for a in active[0].actions] if active else None,
+            why in active[0].message if active else None)
+
+
+def recover_script(*args):
+    return subprocess.run([sys.executable, str(REPO / "src" / "tmux_pane_keys.py"), *args],
+                          capture_output=True, text=True, timeout=30)
+
+
+def claimed_ticket(sock, name):
+    """A send that claimed its ticket and never reported: the fence stands for this one."""
+    tpk.prepare_guard(sock)
+    d = tmp / f"tmux-pane-keys.{name}"
+    d.mkdir()
+    tpk.begin_guard(sock, d / "ticket")
+    (d / "ticket").rename(d / "ticket.claimed")
+    return d / "ticket"
+
+
+sock, ws_f, req, m = fenced_card("fence-press")
+check("the fence card offers Clear the send fence", [a.id for a in req.actions][:1], [wc.FENCE_ACTION])
+check("and keeps the terminal recovery line", f"tmux_pane_keys.py recover {sock}" in req.message, True)
+check("it stays a core-blocked card, so reminders keep running", req.kind, "core-blocked")
+check("it records the fence it was raised for", (req.subject or {}).get("fence_episode"), tpk.fence_episode(sock))
+r = Runner()
+check("unpressed, nothing is cleared", (wc.drive_fence_clears(ws_f, runner=r, manager=m), r.recoveries()), ({}, []))
+press(m, req, wc.FENCE_ACTION)
+check("pressed on an uncertain fence, the real recovery runs and reports cleared",
+      wc.drive_fence_clears(ws_f, manager=m), {req.id: "cleared"})
+check("the fence then reads clear", tpk.fence_status(sock), "clear")
+check("and the card is resolved", m.get(req.id).status, STATUS_RESOLVED)
+
+sock, ws_f, req, m = fenced_card("fence-busy")
+press(m, req, wc.FENCE_ACTION)
+r = Runner()
+with mock.patch.object(wc.tmux_pane_keys, "fence_status", return_value="busy"):
+    out_busy = wc.drive_fence_clears(ws_f, runner=r, manager=m)
+check("a send in flight at press time is refused and no recovery runs",
+      (out_busy, r.recoveries()), ({req.id: "refused"}, []))
+check("and that card expires", m.get(req.id).status, STATUS_EXPIRED)
+check("but the owner is offered the button again", offered_again(m, "a send was in flight"), (1, True, True))
+
+sock, ws_f, req, m = fenced_card("fence-cleared-meanwhile")
+press(m, req, wc.FENCE_ACTION)
+r = Runner()
+with mock.patch.object(wc.tmux_pane_keys, "fence_status", return_value="clear"):
+    out_clear = wc.drive_fence_clears(ws_f, runner=r, manager=m)
+check("a fence already clear only closes the card", (out_clear, r.recoveries()), ({req.id: "already-clear"}, []))
+
+# An old approval never settles a newer send (the real guard, no fake recovery).
+sock, ws_f, req, m = fenced_card("fence-a-then-b")
+press(m, req, wc.FENCE_ACTION)
+check("fence A is recovered by other means", recover_script("recover", str(sock)).returncode, 0)
+ticket_b = claimed_ticket(sock, "b")
+check("a new interrupted send B stands", tpk.fence_status(sock), "uncertain")
+check("the old approval is refused for B", wc.drive_fence_clears(ws_f, runner=_real_with_idle_pane(), manager=m),
+      {req.id: "changed"})
+check("B's pending record survives", (tpk.guard_path(sock) / "pending.json").exists(), True)
+check("B's fence still stands", tpk.fence_status(sock), "uncertain")
+check("the new card is for B", (m.active()[0].subject or {}).get("fence_episode"), str(ticket_b))
+check("and says this is a newer send", offered_again(m, "newer interrupted send"), (1, True, True))
+
+# The compare is under the recovery lock: a fence that changes after the status probe is refused there too.
+sock_c = tmp / "fence-probe-race.sock"
+ticket_c = claimed_ticket(sock_c, "c")
+got = recover_script("recover-episode", str(sock_c), "/some/other/ticket")
+check("recover-episode for another fence exits FENCE_CHANGED", got.returncode, tpk.FENCE_CHANGED)
+check("and clears nothing", tpk.fence_episode(sock_c), str(ticket_c))
+check("recover-episode with no fence named refuses too", recover_script("recover-episode", str(sock_c)).returncode,
+      tpk.FENCE_CHANGED)
+check("for the fence it names, it clears", recover_script("recover-episode", str(sock_c), str(ticket_c)).returncode, 0)
+check("and the fence reads clear", tpk.fence_status(sock_c), "clear")
+
+# A failed recovery leaves the owner a live card, and the retry works.
+sock, ws_f, req, m = fenced_card("fence-recovery-fails")
+press(m, req, wc.FENCE_ACTION)
+check("a recovery that fails reports failed", wc.drive_fence_clears(ws_f, runner=Runner(rc=125), manager=m),
+      {req.id: "failed"})
+check("that card expires", m.get(req.id).status, STATUS_EXPIRED)
+check("the fence is still there", tpk.fence_status(sock), "uncertain")
+check("and the owner has a live card, saying it failed", offered_again(m, "recovery itself failed"), (1, True, True))
+retry = m.active()[0]
+press(m, retry, wc.FENCE_ACTION)
+check("pressing that card on the next sweep clears the fence", wc.drive_fence_clears(ws_f, manager=m),
+      {retry.id: "cleared"})
+check("and the fence reads clear", tpk.fence_status(sock), "clear")
+
+# The pane cannot be read when the replacement is due: the debt stays until a card exists.
+class UnreadPane(Runner):
+    def __call__(self, argv, **kw):
+        if "capture-pane" in argv:
+            return type("Done", (), {"returncode": 1, "stdout": "", "stderr": ""})()
+        return super().__call__(argv, **kw)
+
+
+sock, ws_f, req, m = fenced_card("fence-pane-unread")
+press(m, req, wc.FENCE_ACTION)
+check("a failed recovery with an unread pane reports failed",
+      wc.drive_fence_clears(ws_f, runner=UnreadPane(rc=125), manager=m), {req.id: "failed"})
+check("no replacement exists, so the old card is kept", [c.id for c in m.active()], [req.id])
+check("and the fence still stands", tpk.fence_status(sock), "uncertain")
+r = UnreadPane(rc=0)
+check("still unread: still owed, and that press runs no second recovery",
+      (wc.drive_fence_clears(ws_f, runner=r, manager=m), r.recoveries(), [c.id for c in m.active()]),
+      ({req.id: "failed"}, [], [req.id]))
+r = Runner(rc=0)
+check("the pane reads again: the replacement is raised, with no recovery",
+      (wc.drive_fence_clears(ws_f, runner=r, manager=m), r.recoveries()), ({req.id: "failed"}, []))
+check("the old card is closed", m.get(req.id).status, STATUS_EXPIRED)
+check("and the owner has a live card, saying it failed", offered_again(m, "recovery itself failed"), (1, True, True))
+retry = m.active()[0]
+press(m, retry, wc.FENCE_ACTION)
+check("pressing it clears the fence", wc.drive_fence_clears(ws_f, manager=m), {retry.id: "cleared"})
+check("and the fence reads clear", tpk.fence_status(sock), "clear")
+
+# The successor could not be saved, or the swap stopped halfway: the debt survives, and one card results.
+sock, ws_f, req, m = fenced_card("fence-store-fails")
+press(m, req, wc.FENCE_ACTION)
+with mock.patch.object(m, "create", side_effect=OSError("no space")):
+    out_store = wc.drive_fence_clears(ws_f, runner=Runner(rc=125), manager=m)
+check("a successor that cannot be saved still reports failed", out_store, {req.id: "failed"})
+check("and the old card is kept", [c.id for c in m.active()], [req.id])
+check("and the fence stands", tpk.fence_status(sock), "uncertain")
+r = Runner(rc=0)
+with mock.patch.object(m, "expire", side_effect=OSError("stopped")):
+    check("the next sweep saves it, with no second recovery",
+          (wc.drive_fence_clears(ws_f, runner=r, manager=m), r.recoveries()), ({req.id: "failed"}, []))
+successors = [c for c in m.active() if c.id != req.id]
+check("the swap stopped halfway: exactly one successor exists", len(successors), 1)
+r = Runner(rc=0)
+check("the sweep after that only finishes the swap",
+      (wc.drive_fence_clears(ws_f, runner=r, manager=m), r.recoveries()), ({req.id: "failed"}, []))
+check("the old card is closed, and no second successor appeared",
+      (m.get(req.id).status, [c.id for c in m.active()]), (STATUS_EXPIRED, [successors[0].id]))
+press(m, successors[0], wc.FENCE_ACTION)
+check("pressing the successor clears the fence", wc.drive_fence_clears(ws_f, manager=m), {successors[0].id: "cleared"})
+check("and the fence reads clear", tpk.fence_status(sock), "clear")
+
+# A marker-only fence keeps its identity through housekeeping, and a later marker is another fence.
+sock_m = tmp / "fence-marker-only.sock"
+tpk.prepare_guard(sock_m)
+(tpk.guard_path(sock_m) / "uncertain").touch()
+marker = tpk.fence_episode(sock_m)
+tpk.refresh_guard(sock_m)
+check("refresh_guard leaves the fence's identity alone", tpk.fence_episode(sock_m), marker)
+check("recovery naming it clears it", recover_script("recover-episode", str(sock_m), marker).returncode, 0)
+check("the marker-only fence reads clear", tpk.fence_status(sock_m), "clear")
+(tpk.guard_path(sock_m) / "uncertain").touch()
+check("a later marker is another fence", recover_script("recover-episode", str(sock_m), marker).returncode,
+      tpk.FENCE_CHANGED)
+check("and it stands", tpk.fence_status(sock_m), "uncertain")
+
+
+# Every unreadable shape: a refused approval repairs nothing, and the right one recovers it.
+def no_mutex(g):
+    tpk.prepare_guard(Path(str(g).removesuffix(".pane-keys-lock")))
+    (g / "mutex").unlink()
+
+
+def mutex_directory(g):
+    (g / "mutex").mkdir(parents=True)
+
+
+def dangling(g):
+    g.symlink_to(g.with_name(g.name + ".gone"))
+
+
+def plain_file(g):
+    g.write_text("x")
+
+
+def link_to_a_file(g):
+    g.with_name(g.name + ".f").write_text("x")
+    g.symlink_to(g.with_name(g.name + ".f"))
+
+
+def corrupt_pending(g):
+    tpk.prepare_guard(Path(str(g).removesuffix(".pane-keys-lock")))
+    (g / "pending.json").write_text("{")
+
+
+def oversized_pending(g):
+    tpk.prepare_guard(Path(str(g).removesuffix(".pane-keys-lock")))
+    (g / "pending.json").write_text("x" * 5000)
+
+
+def shape_of(g):
+    return g.is_symlink(), g.is_dir(), (g / "mutex").is_file(), (g / "mutex").is_dir()
+
+
+for make in (no_mutex, mutex_directory, dangling, plain_file, link_to_a_file, corrupt_pending, oversized_pending):
+    n = make.__name__
+    sock_s, guard_s = tmp / f"shape-{n}.sock", tpk.guard_path(tmp / f"shape-{n}.sock")
+    make(guard_s)
+    check(f"{n}: the fence stands", tpk.fence_status(sock_s), "uncertain")
+    ep, shape = tpk.fence_episode(sock_s), shape_of(guard_s)
+    check(f"{n}: another episode is refused", recover_script("recover-episode", str(sock_s), "other").returncode,
+          tpk.FENCE_CHANGED)
+    check(f"{n}: nothing was repaired", (tpk.fence_status(sock_s), shape_of(guard_s), tpk.fence_episode(sock_s)),
+          ("uncertain", shape, ep))
+    check(f"{n}: its own episode recovers", recover_script("recover-episode", str(sock_s), ep).returncode, 0)
+    check(f"{n}: and it reads clear", tpk.fence_status(sock_s), "clear")
+
+# Two missing-mutex fences are different fences.
+sock_a = tmp / "fence-missing-twice.sock"
+no_mutex(tpk.guard_path(sock_a))
+ep_a = tpk.fence_episode(sock_a)
+check("missing-mutex A is recovered by other means", recover_script("recover", str(sock_a)).returncode, 0)
+(tpk.guard_path(sock_a) / "mutex").unlink()
+check("A's approval is refused for B", recover_script("recover-episode", str(sock_a), ep_a).returncode,
+      tpk.FENCE_CHANGED)
+check("and B is not repaired", (tpk.guard_path(sock_a) / "mutex").exists(), False)
+sock_n = tmp / "fence-no-guard.sock"
+check("with no guard there is no fence to approve", recover_script("recover-episode", str(sock_n), "x").returncode,
+      tpk.FENCE_CHANGED)
+check("and none is created", os.path.lexists(tpk.guard_path(sock_n)), False)
+
+
+def sender_rc(s):
+    """A real second process trying to enter the guard, as a sender does."""
+    code = ("import sys, tmux_pane_keys as t; s = sys.argv[1]; "
+            "m = t.prepare_guard(s).open('ab'); sys.exit(t.acquire_guard(s, m.fileno()))")
+    return subprocess.run([sys.executable, "-c", code, str(s)], cwd=REPO / "src", capture_output=True, timeout=30).returncode
+
+
+# The moment a repair's mutex becomes visible, a sender is already turned away.
+real_link, real_replace = os.link, os.replace
+for make in (no_mutex, mutex_directory, dangling, plain_file, link_to_a_file):
+    n = make.__name__
+    sock_r, guard_r = tmp / f"race-{n}.sock", tpk.guard_path(tmp / f"race-{n}.sock")
+    make(guard_r)
+    ep, seen = tpk.fence_episode(sock_r), []
+
+    def watching(real):
+        def call(*a, **kw):
+            done = real(*a, **kw)
+            if not seen and (guard_r / "mutex").is_file():
+                seen.append(sender_rc(sock_r))
+            return done
+        return call
+
+    with mock.patch.object(os, "link", watching(real_link)), mock.patch.object(os, "replace", watching(real_replace)):
+        got = tpk.recover_guard(sock_r, ep)
+    check(f"{n}: a sender arriving as the mutex appears is turned away", seen, [tpk.BUSY])
+    check(f"{n}: and the approved fence is settled", (got, tpk.fence_status(sock_r)), (0, "clear"))
+    check(f"{n}: and a later sender gets in", sender_rc(sock_r), 0)
+
+sock_l = tmp / "race-rival-repair.sock"
+no_mutex(tpk.guard_path(sock_l))
+ep_l = tpk.fence_episode(sock_l)
+
+
+def rival(src, dst):
+    Path(dst).touch()
+    return real_link(src, dst)
+
+
+with mock.patch.object(os, "link", rival):
+    check("a rival repair that gets there first leaves this one busy", tpk.recover_guard(sock_l, ep_l), tpk.BUSY)
+check("and no scratch mutex is left behind", list(tpk.guard_path(sock_l).glob(".mutex-*")), [])
+
+def rival_recovery_rc(s, episode):
+    """A real second recovery, in its own process."""
+    code = "import sys, tmux_pane_keys as t; sys.exit(t.recover_guard(sys.argv[1], sys.argv[2]))"
+    return subprocess.run([sys.executable, "-c", code, str(s), episode], cwd=REPO / "src", capture_output=True,
+                          timeout=30).returncode
+
+
+# A recovery about to publish a new guard: a rival is refused, and cannot put a send behind it.
+for make in (dangling, plain_file, link_to_a_file):
+    n = make.__name__
+    sock_p, guard_p = tmp / f"publish-{n}.sock", tpk.guard_path(tmp / f"publish-{n}.sock")
+    make(guard_p)
+    ep, rivals = tpk.fence_episode(sock_p), []
+
+    def rival_then_publish(src, dst):
+        if not rivals:
+            rivals.append(rival_recovery_rc(sock_p, ep))
+        return real_replace(src, dst)
+
+    with mock.patch.object(os, "replace", rival_then_publish):
+        got = tpk.recover_guard(sock_p, ep)
+    check(f"{n}: a rival repair just before publication is refused", rivals, [tpk.BUSY])
+    check(f"{n}: and this one settles its own fence", (got, tpk.fence_status(sock_p)), (0, "clear"))
+
+    # The rival finishes first, and a send is interrupted behind it, before this recovery takes the repair lock.
+    sock_q, guard_q = tmp / f"late-{n}.sock", tpk.guard_path(tmp / f"late-{n}.sock")
+    make(guard_q)
+    ep, late, real_lock = tpk.fence_episode(sock_q), [], tpk._lock_fd
+
+    def rival_then_lock(fd):
+        if not late:
+            late.append((rival_recovery_rc(sock_q, ep), claimed_ticket(sock_q, f"late-{n}")))
+        return real_lock(fd)
+
+    with mock.patch.object(tpk, "_lock_fd", rival_then_lock):
+        got = tpk.recover_guard(sock_q, ep)
+    check(f"{n}: the rival's recovery went through", late[0][0], 0)
+    check(f"{n}: the stale approval is refused", got, tpk.FENCE_CHANGED)
+    check(f"{n}: and the newer send's record survives",
+          (tpk.fence_episode(sock_q), tpk.fence_status(sock_q)), (str(late[0][1]), "uncertain"))
+
+# A guard that was absent is never overwritten: a sender may have just created it.
+sock_v, guard_v = tmp / "absent-guard.sock", tpk.guard_path(tmp / "absent-guard.sock")
+made_v = []
+
+
+def sender_creates_guard(src, dst):
+    if not made_v:
+        made_v.append(claimed_ticket(sock_v, "absent-b"))
+    return real_link(src, dst)
+
+
+with mock.patch.object(os, "link", sender_creates_guard):
+    got = tpk.recover_guard(sock_v)
+check("a guard created during the repair leaves this one busy", got, tpk.BUSY)
+check("and that send's record survives", tpk.fence_episode(sock_v), str(made_v[0]))
+check("and only that sender's guard directory remains",
+      [x.name for x in tmp.glob(guard_v.name + ".*")], [guard_v.resolve().name])
+check("an absent guard is otherwise built", tpk.recover_guard(tmp / "absent-plain.sock"), 0)
+check("and reads clear", tpk.fence_status(tmp / "absent-plain.sock"), "clear")
+
+sock_u = tmp / "repair-lock-held.sock"
+plain_file(tpk.guard_path(sock_u))
+with open(f"{sock_u}.pane-keys-repair", "ab") as repair_holder:
+    tpk._lock_fd(repair_holder.fileno())
+    check("a repair already running leaves this one busy", tpk.recover_guard(sock_u), tpk.BUSY)
+check("and the guard is untouched", tpk.guard_path(sock_u).is_file(), True)
+
+# Recovery's exits in this process, through the command line that reports them.
+def main_rc(*argv):
+    with mock.patch.object(sys, "argv", ["tmux_pane_keys.py", *argv]), contextlib.redirect_stderr(io.StringIO()) as err:
+        return tpk._main(), err.getvalue()
+
+
+sock_x = tmp / "main-no-guard.sock"
+check("no guard names no fence", tpk.fence_episode(sock_x), "no-guard")
+got, msg = main_rc("recover-episode", str(sock_x), "x")
+check("a refusal says nothing was cleared", (got, "nothing was cleared" in msg), (tpk.FENCE_CHANGED, True))
+check("an approval naming no fence is refused", main_rc("recover-episode", str(sock_x))[0], tpk.FENCE_CHANGED)
+
+sock_t = tmp / "main-ticket.sock"
+ticket_t = claimed_ticket(sock_t, "main-t")
+check("another ticket is refused under the lock", main_rc("recover-episode", str(sock_t), "other")[0], tpk.FENCE_CHANGED)
+check("and the ticket's record survives", tpk.fence_episode(sock_t), str(ticket_t))
+check("its own ticket clears", main_rc("recover-episode", str(sock_t), str(ticket_t))[0], 0)
+
+sock_h = tmp / "main-held.sock"
+with tpk.prepare_guard(sock_h).open("ab") as holder:
+    tpk._lock_fd(holder.fileno())
+    got, msg = main_rc("recover", str(sock_h))
+check("recovery refuses a live holder", (got, "busy" in msg), (tpk.BUSY, True))
+check("plain recover works once it is free", main_rc("recover", str(sock_h))[0], 0)
+
+sock_d = tmp / "main-dangling-mutex.sock"
+tpk.prepare_guard(sock_d)
+(tpk.guard_path(sock_d) / "mutex").unlink()
+(tpk.guard_path(sock_d) / "mutex").symlink_to(tmp / "main-mutex-gone")
+ep_d = tpk.fence_episode(sock_d)
+check("a dangling mutex link is another episode's to repair", main_rc("recover-episode", str(sock_d), "other")[0],
+      tpk.FENCE_CHANGED)
+check("its own episode repairs it", (main_rc("recover-episode", str(sock_d), ep_d)[0], tpk.fence_status(sock_d)), (0, "clear"))
+
+sock_e, guard_e = tmp / "main-repair-fails.sock", tpk.guard_path(tmp / "main-repair-fails.sock")
+plain_file(guard_e)
+with mock.patch.object(os, "link", side_effect=OSError("no links here")):
+    got, msg = main_rc("recover", str(sock_e))
+check("a repair that fails reports recovery is still required", (got, "recovery required" in msg), (tpk.UNCERTAIN, True))
+check("and leaves the guard and no scratch directory",
+      (guard_e.is_file(), [x.name for x in tmp.glob(guard_e.name + ".*")]), (True, []))
+
+
+class RecoveryWontRun(Runner):
+    def __call__(self, argv, **kw):
+        if "recover-episode" in argv:
+            raise OSError("cannot start")
+        return super().__call__(argv, **kw)
+
+
+sock, ws_f, req, m = fenced_card("fence-cannot-run")
+press(m, req, wc.FENCE_ACTION)
+check("a recovery that cannot start reports failed", wc.drive_fence_clears(ws_f, runner=RecoveryWontRun(), manager=m),
+      {req.id: "failed"})
+check("and the owner has a live card", offered_again(m, "recovery itself failed"), (1, True, True))
+
+sock, ws_f, req, m = fenced_card("fence-no-episode")
+press(m, req, wc.FENCE_ACTION)
+wc._note(m, req.id, fence_episode=None)
+r = Runner()
+check("a card naming no fence runs no recovery", (wc.drive_fence_clears(ws_f, runner=r, manager=m), r.recoveries()),
+      ({req.id: "changed"}, []))
+
+sock, ws_f, req, m = fenced_card("fence-pane-moved-on")
+press(m, req, wc.FENCE_ACTION)
+r = Runner(rc=125)
+r.pane = "compiling the world\n"
+check("the pane is no longer idle: reported as failed", wc.drive_fence_clears(ws_f, runner=r, manager=m), {req.id: "failed"})
+check("and no card is owed for a seat that has moved on", (m.get(req.id).status, m.active()), (STATUS_EXPIRED, []))
+
+out, _, req = card(pool(tmp / "unfenced.sock"), IDLE)
+check("a card with no fence offers no clear button", wc.FENCE_ACTION in [a.id for a in req.actions], False)
 
 print(f"\n{'ALL PASS' if not fails else str(len(fails)) + ' FAILURE(S)'} — undelivered work escalates")
 for f in fails:
