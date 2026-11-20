@@ -163,15 +163,16 @@ def _orientation(entries):
 
     None is a real answer: `2026-09-06` against `2026-09-06T08:00:00Z` says nothing
     about their order, and guessing archives whichever live entry the guess misses.
+    The ends and every adjacent pair that can be compared each cast one vote, and the
+    majority decides; a tie is None. Letting the first deciding pair stand alone let one
+    dated section rewritten in place near the top of an oldest-first file archive its
+    newest entry.
     """
     keys = [k for k in (_stamp_key(e.splitlines()[0]) for e in entries) if k]
     if len(keys) < 2:
         return None
-    for a, b in ((keys[0], keys[-1]), *zip(keys, keys[1:])):
-        c = _cmp_stamps(a, b)
-        if c:
-            return c > 0
-    return None
+    tally = sum(_cmp_stamps(a, b) for a, b in ((keys[0], keys[-1]), *zip(keys, keys[1:])))
+    return tally > 0 if tally else None
 
 
 def plan(text: str, keep_bytes: int, pin=PIN_DEFAULT) -> RotateResult:
