@@ -12,7 +12,7 @@ process.env.SUTANDO_TEST_MODE = '1';
 for (const d of ['tasks', 'results', 'state']) mkdirSync(join(TMP, d), { recursive: true });
 after(() => rmSync(TMP, { recursive: true, force: true }));
 
-const { createSessionEndPipeline, createCallEndReporter, sessionEndTask, worthATask, SESSION_END_MAX_CHARS } = await import('../src/voice-session-end.js');
+const { createSessionEndPipeline, createCallEndReporter, sessionEndTask, worthATask, SESSION_END_MAX_CHARS, callEndInstruction, DEFAULT_CALL_END_INSTRUCTION } = await import('../src/voice-session-end.js');
 const { submitVoiceSessionEndTask } = await import('../src/task-bridge.js');
 
 const item = (role: string, content: string, timestamp = 0) => ({ role, content, timestamp }) as never;
@@ -87,6 +87,34 @@ describe('the session-end task', () => {
 		assert.equal(readdirSync(join(TMP, 'tasks')).filter((f) => f.endsWith('.txt')).length, 1);
 	});
 
+	const fixture = () => ({ sessionId: 's1', reason: 'client_disconnect', startedAt: Date.UTC(2026, 9, 10, 18, 0), endedAt: Date.UTC(2026, 9, 10, 18, 12),
+		durationMs: 12 * 60_000, turnCount: 4, toolCallCount: 1,
+		items: [item('user', 'check PR 5308'), item('tool_call', '{}'), item('assistant', 'It is merged.')] });
+	const facts = 'VOICE_SESSION_ENDED: the voice session s1 ended (client_disconnect). ' +
+		'2026-10-10T18:00:00.000Z to 2026-10-10T18:12:00.000Z, about 12 min, 4 turns, 1 tool calls. ';
+
+	it('the default instruction is today\'s text, byte for byte', () => {
+		const today = 'If the user asked for, or agreed to, something that was not finished on the call (a follow-up: something to look up, ' +
+			'send, write, remind them of, or do later), do it now, or schedule it if it has a time, and reply with what you did. ' +
+			'Keep any durable fact from the call (a preference, a commitment, a follow-up) in memory. ' +
+			'If the call leaves nothing to do, answer with [no-send].';
+		assert.equal(DEFAULT_CALL_END_INSTRUCTION, today);
+		assert.equal(sessionEndTask(fixture()).summary, `${facts}Read the spoken lines below. ${today}`);
+	});
+
+	it('a host instruction replaces only the instruction', () => {
+		const { summary, transcript } = sessionEndTask(fixture(), 'List them.');
+		assert.equal(summary, `${facts}Read the spoken lines below. List them.`);
+		assert.equal(transcript, sessionEndTask(fixture()).transcript);
+		assert.equal(transcript, 'user: check PR 5308\nassistant: It is merged.');
+	});
+
+	it('callEndInstruction: the host\'s variable when set, today\'s text when unset or blank', () => {
+		assert.equal(callEndInstruction({}), DEFAULT_CALL_END_INSTRUCTION);
+		assert.equal(callEndInstruction({ SUTANDO_VOICE_CALL_END_INSTRUCTION: '  ' }), DEFAULT_CALL_END_INSTRUCTION);
+		assert.equal(callEndInstruction({ SUTANDO_VOICE_CALL_END_INSTRUCTION: ' do Y ' }), 'do Y');
+	});
+
 	it('a long session keeps its end', () => {
 		const long = Array.from({ length: 400 }, (_, i) => item(i % 2 ? 'assistant' : 'user', `line ${i} ${'x'.repeat(80)}`));
 		const { transcript } = sessionEndTask({ sessionId: 's', reason: 'r', startedAt: 0, endedAt: 1, durationMs: 1, turnCount: 1, toolCallCount: 0, items: long });
@@ -103,6 +131,7 @@ describe('the session-end task', () => {
 		assert.match(src, /onClientDisconnected: \(\) => \{\n\t\t\tcallEnd\.clientDisconnected\(\);/);
 		assert.match(src, /subscribe\('turn\.end', \(\) => callEnd\.collect\(\)\);/);
 		assert.match(src, /beforeConversationClear = \(\) => callEnd\.collect\(\);/);
+		assert.match(src, /sessionEndTask\(ended, callEndInstruction\(\)\)/);
 		assert.match(src, /await submitVoiceSessionEndTask\(summary, transcript\);/);
 	});
 });
