@@ -235,7 +235,8 @@ class AdapterLifecycleTest(unittest.TestCase):
             self.assertTrue(started.exists(), "the provider child started")
             os.kill(holder_lock.read_holder(str(work)).record["pid"], signal.SIGKILL)
             adapter.wait(10)
-            while time.monotonic() < deadline + 5 and not calls.exists():
+            # open() creates the file before its write lands: wait for the record, not the file.
+            while time.monotonic() < deadline + 5 and not (calls.exists() and calls.read_text().endswith("\n")):
                 time.sleep(0.02)
             self.assertEqual(calls.read_text(), "call\n", "the orphaned provider child finished its one turn")
             self.assertEqual(claim(work, "task-c")["phase"], "CALLING")
