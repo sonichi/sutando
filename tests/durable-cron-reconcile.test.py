@@ -90,6 +90,14 @@ class DurableCronReconcileTest(unittest.TestCase):
                 {"sync-workspace": 555, "digest": 555},
             )
 
+    def test_worker_and_monitor_ownership_is_preserved(self):
+        self.assertFalse(reconcile_launchd.launchd_eligible({
+            'name': 'worker', 'owner': 'worker-id', 'cron': '* * * * *', 'prompt': 'x',
+        }))
+        self.assertFalse(reconcile_launchd.launchd_eligible({
+            'name': 'monitor', 'monitor': {'command': 'x'}, 'cron': '* * * * *',
+        }))
+
     def test_second_run_is_idempotent(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
