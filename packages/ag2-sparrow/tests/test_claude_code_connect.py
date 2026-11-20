@@ -728,6 +728,12 @@ class ConnectCode(UndoSeams, AgentRootBase):
         self.addCleanup(task_io.release_lock, owner)
         return owner
 
+    def test_a_root_connect_holds_names_its_connector_not_a_launcher(self):
+        self.held_root()
+        line = cm.holder_line(str(self.root))
+        self.assertEqual(line, f"held by connector pid {os.getpid()}")
+        self.assertNotIn("launcher pid", line)
+
     def test_write_seat_held_refuses_a_fifo_token_within_a_bound_and_no_writer(self):
         owner, token = self.held_root(), self.seat() / "token"
         token.unlink()
