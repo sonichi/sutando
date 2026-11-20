@@ -2,7 +2,7 @@
 """A proactive result's `[file:]` attachment reaches the room, never silently dropped.
 
   a) text + [file:] to the owner DM  -> one message POST, then one media upload to the DM
-  b) [channel: room] + [file:]       -> the upload goes to the named room
+  b) [channel: room] + [file:]       -> a non-owner room gets the notice, nothing uploaded
   c) a file outside the allowlist     -> the text is delivered, nothing uploaded, the refusal logged
   d) [file:] alone                    -> "(file attached)" is sent, not handed back as empty forever
   e) a second pass over a delivered item never uploads again
@@ -10,7 +10,7 @@
   g) attachment-only, then a different attachment-only file under the same name -> both uploaded
   h) the same path whose bytes changed -> a new send and upload
   i) a redirect whose body the destination guard withholds -> the notice, no upload, file name only
-  j) a clean redirect whose file is refused -> the refusal names only the file name
+  j) a clean redirect carrying a refused file -> the notice, nothing uploaded, file name only
   k) an item with no attachments keeps its pre-change id
   l) a `~/` path whose bytes changed is a new send, fingerprinted as the uploader resolves it
   m) a FIFO outside the allowlist never stalls the drain: the text is sent, nothing uploaded
@@ -119,7 +119,8 @@ def main() -> int:
         check(media[0][1].get("filename") == "report.csv", f"a) filename sent, got {media[0][1].get('filename')}")
 
     messages, media, _ = drain(f"[channel: {ROOM}]\nfor the room\n[file: {CSV}]\n")
-    check(len(media) == 1 and _room_of(media[0][0]) == ROOM, f"b) uploaded to the named room, got {media}")
+    check(media == [] and [m.get("body") for m in messages] == [gb.team_result_guard.TEAM_LEAK_RESULT],
+          f"b) a non-owner room gets the notice and no upload, got {messages} {media}")
 
     messages, media, logs = drain(f"private?\n[file: {OUTSIDE}]\n")
     check(len(messages) == 1, f"c) the text still delivered, got {messages}")
@@ -171,10 +172,10 @@ def main() -> int:
 
     messages, media, logs = drain(f"[channel: {ROOM}]\nfor the room\n[file: {OUTSIDE}]\n",
                                   name="proactive-j.txt")
-    refused = [line for line in logs if "attachment NOT sent" in line]
-    check(len(messages) == 1 and media == [], f"j) text sent, nothing uploaded, got {messages} {media}")
-    check(len(refused) == 1 and OUTSIDE.name in refused[0] and str(OUTSIDE.parent) not in refused[0],
-          f"j) a guest room's refusal names only the file name, got {refused}")
+    withheld = [line for line in logs if "attachment(s) withheld" in line]
+    check(len(messages) == 1 and media == [], f"j) the notice sent, nothing uploaded, got {messages} {media}")
+    check(len(withheld) == 1 and OUTSIDE.name in withheld[0] and str(OUTSIDE.parent) not in withheld[0],
+          f"j) a guest room's withhold names only the file name, got {withheld}")
 
     # l) HOME is the allowlisted dir, so `~/tilde.csv` is uploadable and lives there.
     tilde = _ISO / "result" / "tilde.csv"
