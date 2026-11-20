@@ -35,6 +35,7 @@ NEEDED = (
     "src/agent/restart-guard.sh",
     "src/agent/core-runtime-record.sh",
     "src/agent/core-window.sh",
+    "src/agent/core-workspace-log.sh",
     "src/agent/launch-path.sh",
     "src/core_runtime_record.py",
     "src/result_publish.py",
