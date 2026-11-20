@@ -235,7 +235,7 @@ class AdapterLifecycleTest(unittest.TestCase):
             self.assertTrue(started.exists(), "the provider child started")
             os.kill(holder_lock.read_holder(str(work)).record["pid"], signal.SIGKILL)
             adapter.wait(10)
-            while time.monotonic() < deadline + 5 and not calls.exists():
+            while time.monotonic() < deadline + 5 and (not calls.exists() or not calls.read_text()):
                 time.sleep(0.02)
             self.assertEqual(calls.read_text(), "call\n", "the orphaned provider child finished its one turn")
             self.assertEqual(claim(work, "task-c")["phase"], "CALLING")
