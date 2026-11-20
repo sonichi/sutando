@@ -42,6 +42,9 @@ export function sessionEndTask(s: EndedSession): { summary: string; transcript: 
 		`If the user asked for, or agreed to, something that was not finished on the call (a follow-up: something to look up, ` +
 		`send, write, remind them of, or do later), do it now, or schedule it if it has a time, and reply with what you did. ` +
 		`Keep any durable fact from the call (a preference, a commitment, a follow-up) in memory. ` +
+		`If the call shows the voice agent handled something badly (a misunderstanding, a dropped request, something slow or wrong), ` +
+		`or raises a decision only the user can make, record it with python3 scripts/ask-owner.py "<question>" --context "<why / options>", not as a message; ` +
+		`an improvement with no decision attached is a short note in your reply. ` +
 		`If the call leaves nothing to do, answer with [no-send].`;
 	let transcript = s.items
 		.filter((i) => (i.role === 'user' || i.role === 'assistant') && i.content?.trim())

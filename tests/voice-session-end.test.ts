@@ -76,9 +76,11 @@ describe('the session-end task', () => {
 		const { summary, transcript } = sessionEndTask(s);
 		assert.match(summary, /^VOICE_SESSION_ENDED: the voice session s1 ended \(client_disconnect\)\. 2026-10-10T18:00:00\.000Z to 2026-10-10T18:12:00\.000Z, about 12 min, 4 turns, 1 tool calls\./);
 		assert.match(summary, /not finished on the call \(a follow-up: .*\), do it now, or schedule it if it has a time, and reply with what you did\./);
+		assert.match(summary, /If the call shows the voice agent handled something badly \(a misunderstanding, a dropped request, something slow or wrong\), or raises a decision only the user can make, record it with python3 scripts\/ask-owner\.py "<question>" --context "<why \/ options>", not as a message; an improvement with no decision attached is a short note in your reply\./);
 		assert.match(summary, /If the call leaves nothing to do, answer with \[no-send\]\./);
 		assert.equal(transcript, 'user: check PR 5308\nassistant: It is merged.');
 		const id = await submitVoiceSessionEndTask(summary, transcript);
+		assert.match(id, /^task-voice-end-\d+$/, 'the result watcher routes a session-end result by this prefix');
 		const body = readFileSync(join(TMP, 'tasks', `${id}.txt`), 'utf-8');
 		assert.match(body, /^source: voice$/m);
 		assert.match(body, /^priority: low$/m);
