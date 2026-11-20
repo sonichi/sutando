@@ -50,7 +50,8 @@ export async function resolveVoiceEndpoint(
 	for (const ep of candidates) {
 		let ok: boolean;
 		try {
-			ok = await withTimeout(opts.probe(ep.url), timeoutMs);
+			const probeUrl = ep.tier === 'relay' || ep.tier === 'cloud' ? ep.url : voiceProbeUrl(ep.url);
+			ok = await withTimeout(opts.probe(probeUrl), timeoutMs);
 		} catch {
 			ok = false;
 		}
@@ -65,6 +66,16 @@ export async function resolveVoiceEndpoint(
 		if (ok) return ep;
 	}
 	return null;
+}
+
+function voiceProbeUrl(value: string): string {
+	try {
+		const url = new URL(value);
+		url.searchParams.set('probe', '1');
+		return url.toString();
+	} catch {
+		return value;
+	}
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {

@@ -41,6 +41,7 @@ import {
 import { releaseOnExitUnlessFatal, resolveLockPython } from '../src/voice-lock.js';
 
 const REPO_ROOT = join(fileURLToPath(new URL('.', import.meta.url)), '..');
+const API_TOKEN = 'voice-agent-crash-only-owner-token';
 
 // ---------------------------------------------------------------------------
 // Unit: crash record + exit classification
@@ -204,6 +205,7 @@ function spawnAgent(
 		...process.env,
 		SUTANDO_WORKSPACE: ws,
 		GEMINI_VOICE_API_KEY: FAKE_KEY,
+		SUTANDO_API_TOKEN: API_TOKEN,
 		PORT: String(port),
 		VISION_CONTROL_PORT: String(visionPort),
 		...extraEnv,
