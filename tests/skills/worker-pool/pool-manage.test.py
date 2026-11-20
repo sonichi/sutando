@@ -740,5 +740,97 @@ class EdgeOwed(OwedBase):
         self.assertTrue(pattr.revoke(self.ws, "task-a", WID))
 
 
+class LastWorkerTeardown(Base):
+    """Removing the last worker leaves no pool hook behind; removing any other keeps them."""
+
+    def handler_cfg(self):
+        return self.ws / "state" / "task-event-handler.json"
+
+    def remove(self, wid):
+        self.assertEqual(self.main("retire", wid)[1]["result"], "retired")
+        withdraw = mock.patch.object(pm, "withdraw_remedy_timer", return_value={"removed": True})
+        with withdraw as w:
+            rc, out = self.main("remove", wid)
+        self.assertEqual((rc, out["result"]), (0, "removed"))
+        return out, w
+
+    def test_the_last_removal_withdraws_the_handler_and_the_timer(self):
+        self.assertTrue(self.handler_cfg().is_file())
+        out, w = self.remove(WID)
+        self.assertTrue(self.handler_cfg().is_file())
+        self.assertNotIn("remedy_timer", out)
+        w.assert_not_called()
+        out, w = self.remove(OTHER)
+        self.assertFalse(self.handler_cfg().exists())
+        self.assertEqual(out["remedy_timer"], {"removed": True})
+        w.assert_called_once_with(self.ws)
+
+    def test_a_handler_this_skill_did_not_declare_is_left_in_place(self):
+        foreign = json.dumps({"handler": "/opt/other/handler.py"})
+        self.remove(WID)
+        self.handler_cfg().write_text(foreign)
+        self.remove(OTHER)
+        self.assertEqual(self.handler_cfg().read_text(), foreign)
+
+    def test_a_worker_registered_after_the_last_removal_republishes_the_handler(self):
+        self.remove(WID)
+        self.remove(OTHER)
+        pr.register_worker(self.ws, WID, "back", runtime="claude")
+        self.assertTrue(self.handler_cfg().is_file())
+
+
+class WithdrawRemedyTimer(Base):
+    def setUp(self):
+        super().setUp()
+        self.agents = self.ws.parent / "LaunchAgents"
+        self.agents.mkdir()
+        self.plist = pm.prt.plist_path(self.ws, self.agents)
+        self.plist.write_bytes(b"<plist/>")
+        self.launchctl = []
+
+    def runner(self, argv, **kw):
+        self.launchctl.append(argv)
+        return subprocess.CompletedProcess(argv, 1, "", "not loaded")
+
+    def withdraw(self):
+        with mock.patch.object(pm.sys, "platform", "darwin"):
+            return pm.withdraw_remedy_timer(self.ws, launch_agents=self.agents, runner=self.runner)
+
+    def empty_the_pool(self):
+        for wid in (WID, OTHER):
+            pr.set_worker_state(self.ws, wid, "retired")
+            pr.remove_worker(self.ws, wid)
+
+    def test_an_empty_pool_uninstalls_its_timer(self):
+        self.empty_the_pool()
+        out = self.withdraw()
+        self.assertTrue(out["removed"], out)
+        self.assertFalse(self.plist.exists())
+
+    def test_a_pool_with_workers_keeps_its_timer(self):
+        out = self.withdraw()
+        self.assertFalse(out["removed"])
+        self.assertTrue(self.plist.exists())
+
+    def test_an_unreadable_roster_keeps_its_timer(self):
+        self.empty_the_pool()
+        pr.roster_path(self.ws).write_text("{not json")
+        self.assertFalse(self.withdraw()["removed"])
+        self.assertTrue(self.plist.exists())
+
+    def test_an_uninstall_failure_is_reported_not_raised(self):
+        self.empty_the_pool()
+        with mock.patch.object(pm.prt, "uninstall", side_effect=RuntimeError("bootout failed")):
+            out = self.withdraw()
+        self.assertEqual(out, {"removed": False, "why": "RuntimeError: bootout failed"})
+
+    def test_off_macos_nothing_is_touched(self):
+        with mock.patch.object(pm.sys, "platform", "linux"):
+            out = pm.withdraw_remedy_timer(self.ws, launch_agents=self.agents, runner=self.runner)
+        self.assertFalse(out["removed"])
+        self.assertTrue(self.plist.exists())
+        self.assertEqual(self.launchctl, [])
+
+
 if __name__ == "__main__":
     unittest.main()
