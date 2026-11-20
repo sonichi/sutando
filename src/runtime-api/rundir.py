@@ -3,12 +3,12 @@ by the daemon (server.py), the CLI (src/runtime-cli/sutando-runtime.py) and
 the shell descriptor (scripts/sutando-config.sh, which execs this module).
 
 Review blocker: both sides had duplicated an invented macOS-only fallback
-(`~/Library/Application Support/space.ag2.app/run`), which (a) meant two
-copies of a path policy that could drift and (b) silently made the runtime
-Mac-only. Resolution order:
+(the desktop data folder's `run`), which (a) meant two copies of a path
+policy that could drift and (b) silently made the runtime Mac-only.
+Resolution order:
 
   1. SUTANDO_RUN_DIR              — explicit override, always wins
-  2. darwin: ~/Library/Application Support/space.ag2.app/run
+  2. darwin: <desktop data root>/run, the root from `desktop_data_root.py`
      (the Desktop-supervised runtime root on macOS)
   3. $XDG_RUNTIME_DIR/sutando     — the Linux/systemd per-user run dir
   4. ~/.sutando/run               — last-resort portable fallback
@@ -40,6 +40,8 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 from instance_key import (DEFAULT_INSTANCE, TRUNC, bound,  # noqa: E402
                           instance_key)
+sys.path.insert(0, str(_HERE.parent))  # src/
+from desktop_data_root import desktop_data_root  # noqa: E402
 
 DEFAULT_ACTOR = "local-agent"
 
@@ -56,8 +58,7 @@ def run_dir() -> Path:
     if env:
         return Path(env)
     if sys.platform == "darwin":
-        return (Path.home() / "Library" / "Application Support"
-                / "space.ag2.app" / "run")
+        return desktop_data_root() / "run"
     xdg = os.environ.get("XDG_RUNTIME_DIR")
     if xdg:
         return Path(xdg) / "sutando"
