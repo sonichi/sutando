@@ -11,11 +11,16 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
 
 ## Product overview
 
-[`getting-started.html`](../skills/tutorial/assets/getting-started.html) is the bundled four-part overview.
-The same source opens by default in the DM page and works standalone in a browser. It was adapted from
-the interactive review draft. Its topic selectors are simulations: they do not connect accounts,
-change access, start calls or schedule work. Copy falls back to selecting the prompt when the
-clipboard is unavailable. Open **Try it step by step** below the overview for the per-owner ten-step tour.
+The owner DM opens on four shared topics plus **Sutando Guides**. The general explanations stay stable;
+each shared topic has one example to try. When the current room, owner and agent match the saved
+setup record, the banner uses the agent's display name and supported selections such as Designer or
+Product Manager pick vetted examples. Missing or unrecognized setup details keep the overview
+generic. Nothing reads account connections, room history or private files to build the page.
+
+The [standalone four-topic guide](../skills/tutorial/assets/getting-started.html) remains generic.
+Topic selectors are demonstrations: they do not connect accounts, change access, start calls or
+schedule work. Copy falls back to selecting the prompt when the clipboard is unavailable. Open
+**Try it step by step** for the original personalized ten-step checklist.
 
 ## Using the ten-step owner tour
 

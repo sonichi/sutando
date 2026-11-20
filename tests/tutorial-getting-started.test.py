@@ -159,7 +159,7 @@ class RenderTest(unittest.TestCase):
     def test_dm_step_comes_first_and_says_personal_answers_stay_in_the_dm(self):
         dm = gs.SECTIONS[0]
         self.assertEqual((dm.id, dm.title, dm.where), ("dm", "Your DM", "dm"))
-        self.assertIn("never in a room", dm.what)
+        self.assertIn("unless you explicitly ask to share it", dm.what)
         self.assertEqual(dm.prompt, "What can you do for me today?")
 
     def test_every_prompt_says_where_to_paste_it(self):
@@ -225,7 +225,7 @@ class RenderTest(unittest.TestCase):
         self.assertIn("Ask your agent anything", room)
         self.assertNotIn("Blue", re.sub(r'src="data:[^"]*"', "", room))
         dm = gs.render_page("Blue", "claude", "dm")
-        self.assertIn("<h1>Getting started with Blue</h1>", dm)
+        self.assertIn("<h1>Get started with <span>your agent</span> in s.space</h1>", dm)
         self.assertEqual(gs.render_page("Blue", "claude"), dm)
         with self.assertRaises(ValueError):
             gs.render_page("Blue", "claude", "everyone")
@@ -335,9 +335,10 @@ class InteractiveTest(unittest.TestCase):
             self.assertFalse('role="img"' in tag and 'aria-hidden="true"' in tag, tag)
         self.assertNotIn('role="img"', self.page)
 
-    def test_an_svg_per_section_and_a_hero(self):
+    def test_an_svg_per_section_and_one_overview_banner(self):
         self.assertEqual(self.page.count('<div class="icon" aria-hidden="true"><svg'), 10)
-        self.assertIn('class="hero-art"', self.page)
+        self.assertEqual(self.page.count("<h1>"), 1)
+        self.assertIn('class="brand-mark"', self.page)
         for core in gs.CORES:
             self.assertEqual(set(gs.tour_page.ICONS), {s.id for s in gs.sections_for(core)})
 
@@ -345,10 +346,15 @@ class InteractiveTest(unittest.TestCase):
         for core in gs.CORES:
             page = gs.render_page("Blue", core)
             bare = re.sub(r'src="data:image/(?:jpeg|png);base64,[A-Za-z0-9+/=]+"', 'src=""', page)
-            # The phone step's App Store anchor is the one outbound URL: a link, never a resource.
-            store = re.findall(r'<a href="([^"]*)"', bare)
-            self.assertEqual(store, ["https://apps.apple.com/us/app/s-space/id6788541784"])
-            bare = bare.replace(f'href="{store[0]}"', 'href=""')
+            links = re.findall(r'<a href="([^"]*)"', bare)
+            self.assertEqual({link for link in links if not link.startswith("#")}, {
+                "https://s.space/docs/how-it-works", "https://s.space/docs/terminal",
+                "https://s.space/docs/tour#6-calls-and-voice",
+                "https://s.space/docs/other-agents#how-they-differ-from-sutando",
+                "https://apps.apple.com/us/app/s-space/id6788541784",
+            })
+            for link in links:
+                bare = bare.replace(f'href="{link}"', 'href=""')
             self.assertNotRegex(bare, r"(?i)\b(?:https?:)?//[a-z0-9]")
             self.assertNotRegex(bare, r"(?i)<(?:link|iframe|object|embed)\b|url\(")
             self.assertEqual(re.findall(r'\bsrc="([^"]*)"', bare), [""] * bare.count("<img "))
@@ -911,7 +917,7 @@ class MainTest(unittest.TestCase):
         with mock.patch.object(gs, "_https_get", side_effect=OSError("offline")):
             code, out, _ = self.main("render", "--name", "auto", "--agent-mxid", "@kai-blue.agent:example.test")
         self.assertEqual(code, 0)
-        self.assertIn("<h1>Getting started with Kai Blue</h1>", out)
+        self.assertIn("Your DM with Kai Blue", out)
 
     def test_bad_name_exits_2(self):
         code, _, err = self.main("render", "--name", " ")
@@ -1001,7 +1007,7 @@ class MainTest(unittest.TestCase):
         self.assertEqual((code, json.loads(out)["action"], json.loads(out)["name"]), (0, "created", "Alpha"))
         self.assertEqual(resolver.call_count, 1)
         page = self.room_state()["pages"]["html-p1"]
-        self.assertIn("<h1>Getting started with Alpha</h1>", page)
+        self.assertIn("Your DM with Alpha", page)
         self.assertEqual(gs.read_marker(page)[0], "@alpha.agent:example.test")
 
     def test_a_malformed_identity_is_refused_before_any_commons_call(self):
@@ -1044,7 +1050,10 @@ class MainTest(unittest.TestCase):
         result = json.loads(out)
         self.assertEqual((result["action"], result["summoned"], result["name"]), ("created", True, "Kai"))
         self.assertIn(["summon", result["kind"], "@owner:example.test"], self.room_state()["calls"])
-        self.assertIn("Picked for: Founder, Sales", self.room_state()["pages"][result["kind"]])
+        page = self.room_state()["pages"][result["kind"]]
+        self.assertIn("Picked for: Founder, Sales", page)
+        self.assertIn("Get started with <span>Kai</span> in s.space", page)
+        self.assertIn("Examples for team project.", page)
 
     def test_command_line_overrides_the_inputs_file(self):
         self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test", "roles": "Founder"})
@@ -1055,6 +1064,17 @@ class MainTest(unittest.TestCase):
         page = self.room_state()["pages"][json.loads(out)["kind"]]
         self.assertIn("Picked for: Sales", page)
         self.assertNotIn("Founder", page.split("Picked for:", 1)[1][:80])
+
+    def test_mismatched_setup_identity_does_not_use_implicit_roles(self):
+        self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test",
+                          "agent_mxid": "@kai.agent:example.test", "roles": "Founder"})
+        code, out, _ = self.main("publish", "--name", "Blue", "--core", "codex",
+                                 "--owner", "@other:example.test", "--room-commons", str(self.stub))
+        self.assertEqual(code, 0)
+        page = self.room_state()["pages"][json.loads(out)["kind"]]
+        self.assertNotIn("Picked for:", page)
+        self.assertNotIn("Examples for team project.", page)
+        self.assertIn("Get started with <span>your agent</span> in s.space", page)
 
     def test_owner_and_roles_stay_in_the_inputs_room(self):
         self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test", "roles": "Founder"})

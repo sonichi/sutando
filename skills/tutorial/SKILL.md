@@ -1,6 +1,6 @@
 ---
 name: tutorial
-description: "Show a new owner what to try first. Voice: on \"tutorial\", \"walk me through\" or \"show me what you can do\", walk the workspace tutorial one short section at a time. s.space: on an owner DM message with a line `/tutorial` (the setup app ends the first-contact message with one), after the greeting, create (or refresh) one \"Getting started\" HTML page there, a short s.space tour with one thing to try per part, and summon the owner to it."
+description: "Show a new owner what to try first. Voice: on \"tutorial\", \"walk me through\" or \"show me what you can do\", walk the workspace tutorial one short section at a time. s.space: on an owner DM message with a line `/tutorial` (the setup app ends the first-contact message with one), after the greeting, create (or refresh) one \"Getting started\" HTML page there, the s.space overview and optional step-by-step checklist, and summon the owner to it."
 user-invocable: true
 ---
 
@@ -180,9 +180,12 @@ each room's entry.
 `getting_started.py plan --room <room>` shows what `publish` would do; `render --name <name>`
 prints the HTML. Both `render` and `publish` take `--list <path-or-url>` (below).
 
-**What the page says.** The page opens on four explorable topics: Ecosystem, Multiplayer,
-Calls & Local Tools, and Commons & Tasks. The bundled overview is shared with the standalone
-HTML guide; its examples are demonstrations, not live controls. **Try it step by step** opens
+**What the page says.** The owner DM opens on five explorable topics: Ecosystem, Multiplayer,
+Calls & Local Tools, Commons & Tasks, and Sutando Guides. In the saved setup DM only, when the
+room, owner and agent identities all match, the banner uses the agent's name and recognized role
+choices select preset examples. The renderer does not read account data or infer enabled capabilities.
+The standalone guide and room-audience overview remain generic; its examples are demonstrations,
+not live controls. **Try it step by step** opens
 the personalized checklist, a short interactive s.space tour (`scripts/tour_page.py`) rendered
 from the skill's feature list, `feature-list.json`. Each step is one line on what it is and one
 thing to try, in the list's order:
@@ -299,7 +302,7 @@ list has at most 24 steps (`STEPS_MAX`, refused by `parse_list`), a rendered pag
 fallback file inline it once each), and the tests hold each fallback file to 60 KB (500 KB in all)
 and each `hd_file` to a PNG under the 25 MiB `room.media.upload` takes, so publishing a page
 publicly stays well under the 413 that an image-heavy page met (#5318). With every capture
-uploaded the page is text plus the inlined app icon and QR code (about 86 KB; under 70 KB when every asset,
+uploaded the page is text plus the inlined app icon and QR code (about 92 KB; under 77 KB when every asset,
 the icon too, is mapped). Room media does not load on a public copy of a page (`page-publish`), so
 a copy meant for the public is rendered without `--media` and published with `--no-upload`.
 
@@ -317,8 +320,8 @@ Each list entry names its own assets (crop, result image, optional animation) as
 page's, while every fallback file stays under the caps above.
 
 **How the page behaves.**
-- It is one self-contained HTML document that loads nothing external; its one outbound URL is the
-  phone step's App Store anchor.
+- It is one self-contained HTML document that loads nothing external; the Sutando docs and App Store links are ordinary
+  links that load only when followed.
 - An inline SVG icon per step, in ink on a brand gradient tile, and a top border in that
   gradient's outer shade; steps cycle orange, yellow, pastel pink. The hero carries a solid
   brand-orange oval behind the title.
@@ -332,7 +335,7 @@ page's, while every fallback file stays under the caps above.
 - Copy outcomes are announced in a live status region. Animations stop under
   `prefers-reduced-motion`. Without scripts, every step shows.
 
-**Size.** With every screenshot inlined (no upload) the page is about 280 KB (capped at 300 KB), over the 196,608
+**Size.** With every screenshot inlined (no upload) the page is about 286 KB (capped at 300 KB), over the 196,608
 bytes Room Commons takes in one write. The first piece goes in the create's own body; the rest are appended in pieces
 of at most 120,000 bytes (`CHUNK_BYTES`). Arguments reach `room_commons.py` as JSON in a 0600 file,
 never argv, so Linux's 131,072-byte cap on one argument does not apply. A refresh is one `replace` when the old and new
