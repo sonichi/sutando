@@ -2,9 +2,11 @@
 // Run: npx tsx --test --test-force-exit tests/voice-session-end.test.ts
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { parse as parseDotenv } from 'dotenv';
 
 const TMP = mkdtempSync(join(tmpdir(), 'session-end-'));
 process.env.SUTANDO_WORKSPACE = TMP;
@@ -113,6 +115,24 @@ describe('the session-end task', () => {
 		assert.equal(callEndInstruction({}), DEFAULT_CALL_END_INSTRUCTION);
 		assert.equal(callEndInstruction({ SUTANDO_VOICE_CALL_END_INSTRUCTION: '  ' }), DEFAULT_CALL_END_INSTRUCTION);
 		assert.equal(callEndInstruction({ SUTANDO_VOICE_CALL_END_INSTRUCTION: ' do Y ' }), 'do Y');
+	});
+
+	it('.env.example\'s line, uncommented, reads the same in startup\'s bash source and in voice-agent\'s dotenv', () => {
+		// startup-runtime.sh runs `set -a; source .env` under set -e: an unquoted space or apostrophe aborts startup.
+		const example = readFileSync(join(import.meta.dirname, '..', '.env.example'), 'utf-8');
+		const line = example.split('\n').find((l) => l.startsWith('# SUTANDO_VOICE_CALL_END_INSTRUCTION='));
+		assert.ok(line, '.env.example documents the variable as a commented example');
+		const file = join(TMP, 'call-end-example.env');
+		const text = `A=1\n${line.slice(2)}\nB=after\n`;
+		writeFileSync(file, text);
+		const r = spawnSync('bash', ['-c', 'set -e; set -a; source "$1"; set +a; printf "%s|%s" "$SUTANDO_VOICE_CALL_END_INSTRUCTION" "$B"', '_', file], {
+			encoding: 'utf-8', env: { PATH: process.env.PATH ?? '/usr/bin:/bin' },
+		});
+		assert.equal(r.status, 0, `bash could not source the uncommented line: ${r.stderr}`);
+		const parsed = parseDotenv(text);
+		assert.match(parsed.SUTANDO_VOICE_CALL_END_INSTRUCTION, /\[no-send\]/);
+		assert.equal(r.stdout, `${parsed.SUTANDO_VOICE_CALL_END_INSTRUCTION}|after`);
+		assert.equal(parsed.B, 'after');
 	});
 
 	it('a long session keeps its end', () => {
