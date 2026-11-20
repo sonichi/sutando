@@ -7,8 +7,8 @@ Drives one real `poll_proactive` pass with a recording provider and channels:
   b) the same body with no redirect                  -> the owner DM, unchanged
   c) a DM whose recipient is owner-tier              -> unchanged
   d) a DM whose recipient is team                    -> guarded
-  e) clean prose + a refused attachment to a guild   -> prose sent, notice names no path
-  f) a sendable attachment to a guild                -> still uploaded (positive control)
+  e) clean prose + an attachment to a guild         -> only the marker notice, no path
+  f) a sendable attachment to a guild                -> not uploaded; to an owner-tier DM -> uploaded
 """
 from __future__ import annotations
 
@@ -190,6 +190,7 @@ def _fallback(body, classify=None):
 
 def main() -> int:
     from policy.egress.result import TEAM_LEAK_RESULT as NOTICE
+    from policy.egress.result import TEAM_LEAK_RESULT_MARKER as MARKER_NOTICE
     leak = "copy failed: [Errno 2] No such file: /Users/someone/private/plan.md"
 
     posts = _one(f"[channel: {GUILD}]\n{leak}\n")
@@ -204,16 +205,18 @@ def main() -> int:
     refused = lambda p: (db._ATTACH_REFUSED, p)  # noqa: E731
     posts = _one(f"[channel: {GUILD}]\nweekly summary\n[attach: /Users/someone/private/report.png]\n",
                  classify=refused)
-    texts = [t for _c, t in posts]
-    check("e) clean prose is delivered to the guild", (GUILD, "weekly summary") in posts, repr(posts))
-    check("e) the refusal notice names no local path",
-          any("report.png" in t for t in texts) and not any("/Users/" in t for t in texts), repr(posts))
+    check("e) a guild gets only the marker notice for a body carrying [file:]",
+          posts == [(GUILD, MARKER_NOTICE)], repr(posts))
 
     sendable = lambda p: (db._ATTACH_SEND, p)  # noqa: E731
     chart = Path(tempfile.mkdtemp(prefix="proactive-destguard-file-")) / "chart.png"
     chart.write_bytes(b"png")
     posts = _one(f"[channel: {GUILD}]\nchart\n[attach: {chart}]\n", classify=sendable)
-    check("f) an allowlisted attachment is still uploaded", (GUILD, "<file>") in posts, repr(posts))
+    check("f) an allowlisted attachment is not uploaded to a guild", posts == [(GUILD, MARKER_NOTICE)],
+          repr(posts))
+    posts = _one(f"[channel: {OWNER_PEER_DM}]\nchart\n[attach: {chart}]\n", classify=sendable)
+    check("f) an allowlisted attachment is still uploaded to an owner-tier DM",
+          (OWNER_PEER_DM, "<file>") in posts, repr(posts))
 
     posts = _fallback(f"[channel: {GUILD}]\n{leak}\n")
     check("g) dm-fallback: a guild channel gets only the standard notice",
@@ -223,10 +226,8 @@ def main() -> int:
           posts == [(OWNER_PEER_DM, leak)], repr(posts))
     posts = _fallback(f"[channel: {GUILD}]\nweekly summary\n[attach: /Users/someone/private/report.png]\n",
                       classify=refused)
-    texts = [t for _c, t in posts]
-    check("g) dm-fallback: clean prose is delivered and its refusal notice names no path",
-          (GUILD, "weekly summary") in posts and any("report.png" in t for t in texts)
-          and not any("/Users/" in t for t in texts), repr(posts))
+    check("g) dm-fallback: a guild gets only the marker notice for a body carrying [file:]",
+          posts == [(GUILD, MARKER_NOTICE)], repr(posts))
 
     src = (REPO / "src" / "discord-bridge.py").read_text()
     check("the bridge delegates to the shared guard and notice policy",
