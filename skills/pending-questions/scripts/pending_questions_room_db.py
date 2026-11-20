@@ -166,32 +166,32 @@ def reconcile_pass(workspace: Path, environ=None, manager=None) -> dict:
     ws = Path(workspace)
     store, where = room_store(ws, environ)
     if store is None:
-        return {"flushed": [], "closed": [], "moved": [], "errors": [f"room database: not used ({where})"]}
+        return {"flushed": [], "closed": [], "moved": [], "retired": [], "errors": [f"room database: not used ({where})"]}
     try:
         out = reconcile_pending(store, ws, host_label())
     except Exception as e:  # noqa: BLE001
-        return {"flushed": [], "closed": [], "moved": [], "errors": [f"{type(e).__name__}: {e}"]}
+        return {"flushed": [], "closed": [], "moved": [], "retired": [], "errors": [f"{type(e).__name__}: {e}"]}
     out["retired"] = []
     try:
-        out["retired"] = _retire_closed_cards(ws, store, manager)
+        _retire_closed_cards(ws, store, manager, out["retired"])
     except Exception as e:  # noqa: BLE001
         out["errors"].append(f"decision cards: {type(e).__name__}: {e}")
     return out
 
 
-def _retire_closed_cards(ws: Path, store, manager=None) -> list:
-    """Retire each unclicked card whose row was closed without `resolve` (in the database, in chat);
-    a clicked card is left to `clicks`, which settles it stale."""
+def _retire_closed_cards(ws: Path, store, manager, gone: list) -> None:
+    """Retire each unclicked card whose row was closed without `resolve` (in the database), appending
+    to `gone` as it goes; a clicked card is left to `clicks`, which settles it stale."""
     from hitl.schema import STATUS_PENDING  # noqa: PLC0415
     manager = manager or cards.manager_for(ws)
-    gone = []
-    for req in manager.active():
+    live = [r for r in manager.active() if r.runtime == cards.CARD_RUNTIME and r.status == STATUS_PENDING]
+    if not live:
+        return
+    status = {e["ask_id"]: e["status"] for e in store.entries()}  # one room read, before any cancel
+    for req in live:
         ask_id = (req.subject or {}).get("ask_id") or req.guard
-        if req.runtime == cards.CARD_RUNTIME and req.status == STATUS_PENDING and ask_id \
-                and store.status_of(ask_id) in TERMINAL:
-            manager.cancel(req.id)
+        if ask_id and status.get(ask_id) in TERMINAL and cards.cancel_if_pending(manager, req.id):
             gone.append(req.id)
-    return gone
 
 
 def gather(workspace: Path, environ=None) -> dict:

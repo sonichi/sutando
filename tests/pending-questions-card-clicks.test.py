@@ -356,8 +356,8 @@ class TokenAndOutage(_Room):
 
 
 class ClosedElsewhere(_Room):
-    """A row the owner closes without the asking agent's `resolve` (in the room database, in chat
-    with this agent) still retires its unclicked card on the next reconcile, on every device."""
+    """A row the owner closes in the room database, without the asking agent's `resolve`, still
+    retires its unclicked card on the next reconcile, on every device."""
 
     def test_reconcile_retires_the_card_of_a_row_closed_in_the_database(self):
         TokenAndOutage._owner_sets(self, "answered")
@@ -379,6 +379,72 @@ class ClosedElsewhere(_Room):
         self.assertEqual(self.m.get(self.card).status, STATUS_IN_PROGRESS)
         [c] = self.run_clicks()
         self.assertEqual((c["stale"], c["actionable"]), (True, False))
+
+    def test_a_click_between_the_pending_read_and_the_cancel_is_kept(self):
+        """The owner clicks after this pass saw the card pending (on its next room read)."""
+        TokenAndOutage._owner_sets(self, "resolved")
+        cls, real_active, armed, fired = type(self.store), self.m.active, [], []
+
+        def active():
+            armed.append(1)
+            return real_active()
+
+        def wrap(real):
+            def read(store, *a):
+                if armed and not fired:
+                    fired.append(1)
+                    click(self.m, self.card, "approve")
+                return real(store, *a)
+            return read
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(self.m, "active", side_effect=active))
+            for n in ("entries", "status_of"):
+                stack.enter_context(mock.patch.object(cls, n, autospec=True, side_effect=wrap(getattr(cls, n))))
+            out = room_db.reconcile_pass(self.ws, manager=self.m)
+        self.assertEqual(fired, [1])
+        self.assertEqual(self.m.get(self.card).status, STATUS_IN_PROGRESS)
+        self.assertEqual(out["retired"], [])
+        buf = io.StringIO()  # the reader CLI the hitl_click handler runs
+        with contextlib.redirect_stdout(buf):
+            rc = reader.main(["clicks", "--json", "--workspace", str(self.ws), "--store-adapter", ADAPTER])
+        self.assertEqual(rc, 0, buf.getvalue())
+        [c] = json.loads(buf.getvalue())
+        self.assertEqual((c["hitl_id"], c["stale"], c["actionable"]), (self.card, True, False))
+
+    def test_one_room_read_whatever_the_card_count(self):
+        second = room_db.ask_owner("Ship it?", urgency="durable", workspace=self.ws, host=RDBT.HOST,
+                                   store=self.store)["ask_id"]
+        card2 = make_card(self.m, second, question="Ship it?")
+        for a in (self.ask_id, second):
+            self.store.client.set_cells(room_db.DB_SCHEMA, self.store._rid(a), {"status": "answered"})
+        cls = type(self.store)
+        with mock.patch.object(cls, "entries", autospec=True, side_effect=cls.entries) as entries, \
+                mock.patch.object(cls, "status_of", autospec=True, side_effect=cls.status_of) as status_of:
+            room_db._retire_closed_cards(self.ws, room_db.room_store(self.ws)[0], self.m, gone := [])
+        self.assertEqual((entries.call_count, status_of.call_count), (1, 0))
+        self.assertEqual(sorted(gone), sorted([self.card, card2]))
+
+    def test_the_report_carries_retired_on_every_path(self):
+        with mock.patch.object(room_db, "room_store", return_value=(None, "no capability")):
+            self.assertEqual(room_db.reconcile_pass(self.ws)["retired"], [])
+        with mock.patch.object(room_db, "reconcile_pending", side_effect=OSError("down")):
+            self.assertEqual(room_db.reconcile_pass(self.ws)["retired"], [])
+        second = room_db.ask_owner("Ship it?", urgency="durable", workspace=self.ws, host=RDBT.HOST,
+                                   store=self.store)["ask_id"]
+        make_card(self.m, second, question="Ship it?")
+        for a in (self.ask_id, second):
+            self.store.client.set_cells(room_db.DB_SCHEMA, self.store._rid(a), {"status": "answered"})
+        real, calls = self.m.cancel, []
+
+        def cancel_once(req_id):
+            if calls:
+                raise OSError("store full")
+            calls.append(req_id)
+            return real(req_id)
+        with mock.patch.object(self.m, "cancel", side_effect=cancel_once):
+            out = room_db.reconcile_pass(self.ws, manager=self.m)
+        self.assertEqual(out["retired"], calls)
+        self.assertTrue(any("store full" in e for e in out["errors"]), out["errors"])
 
 
 def _health_check():
