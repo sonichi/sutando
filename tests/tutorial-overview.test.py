@@ -4,11 +4,16 @@ from pathlib import Path
 import json
 import re
 import shutil
+import sys
 import subprocess
 import tempfile
 import unittest
 
-PAGE = Path(__file__).resolve().parent.parent / "docs" / "getting-started.html"
+PAGE = Path(__file__).resolve().parent.parent / "skills" / "tutorial" / "assets" / "getting-started.html"
+
+
+sys.path.insert(0, str(PAGE.parent.parent / "scripts"))
+import tour_page
 
 
 class OverviewTest(unittest.TestCase):
@@ -52,6 +57,17 @@ class OverviewTest(unittest.TestCase):
 
 class OverviewBehaviourTest(unittest.TestCase):
     def test_denied_clipboard_selects_prompt_and_next_focuses_heading(self):
+        self.check_behaviour(PAGE)
+
+    def test_published_page_opens_overview_and_preserves_checklist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rendered = Path(tmp) / "tutorial.html"
+            page = tour_page.render_page("Test Agent", agent="@test:example.test")
+            self.assertTrue(tour_page.page_digest_ok(page))
+            rendered.write_text(page)
+            self.check_behaviour(rendered, embedded=True)
+
+    def check_behaviour(self, page, embedded=False):
         node = shutil.which("node")
         if not node or subprocess.run([node, "-e", "require('jsdom')"],
                                       capture_output=True).returncode:
@@ -99,6 +115,27 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
   result.scenarios = [...d.querySelectorAll('#step-2 .sub-tab')].map(button => {
     button.click(); return { label: button.textContent, text: d.getElementById('callInfo').textContent };
   });
+  const checklist = d.querySelector('#tutorial-checklist');
+  if (checklist) {
+    const summary = checklist.querySelector('summary');
+    result.startsClosed = !checklist.open;
+    result.label = summary.textContent;
+    result.overviewFirst = Boolean(d.querySelector('#overview').compareDocumentPosition(checklist) & 4);
+    summary.click();
+    result.opens = checklist.open;
+    result.stepCount = checklist.querySelectorAll('section.sec').length;
+    result.personalized = checklist.querySelector('h1').textContent;
+    const first = checklist.querySelector('input[data-done]');
+    for (let i = 0; first.disabled && i < 100; i++) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    first.click();
+    result.done = first.checked;
+    result.saved = JSON.parse(dom.window.localStorage.getItem('gs-done'));
+    summary.click();
+    summary.click();
+    result.doneAfterReopen = first.checked;
+  }
   result.errors = errors;
   console.log(JSON.stringify(result));
   dom.window.close();
@@ -107,7 +144,7 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "overview.cjs"
             target.write_text(harness)
-            result = subprocess.run([node, str(target), str(PAGE)],
+            result = subprocess.run([node, str(target), str(page)],
                                     capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         out = json.loads(result.stdout)
@@ -132,6 +169,16 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
         self.assertIn("approved local screen access", scenarios["Live screen coach"])
         self.assertIn("authorize the edit", scenarios["Write & edit by voice"])
         self.assertIn("paste the passage", scenarios["Write & edit by voice"])
+        if embedded:
+            self.assertTrue(out["overviewFirst"])
+            self.assertTrue(out["startsClosed"])
+            self.assertEqual(out["label"], "Try it step by step")
+            self.assertTrue(out["opens"])
+            self.assertEqual(out["stepCount"], 10)
+            self.assertIn("Test Agent", out["personalized"])
+            self.assertTrue(out["done"])
+            self.assertEqual(out["saved"], ["dm"])
+            self.assertTrue(out["doneAfterReopen"])
         self.assertEqual(out["errors"], [])
         self.assertEqual(out["copies"], 1)
         self.assertTrue(out["prompt"].strip())

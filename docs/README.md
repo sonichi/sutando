@@ -10,7 +10,7 @@ Machine-readable ownership and lifecycle metadata lives in
 
 ## Start here
 
-- [Interactive s.space overview](getting-started.html) — download/open the HTML in a browser to explore agents, teamwork, calls and Commons.
+- [Interactive s.space overview](../skills/tutorial/assets/getting-started.html) — download/open the HTML in a browser to explore agents, teamwork, calls and Commons.
 
 - [Configure a workspace](workspace-config.md) — defaults, overrides, and
   resolver APIs.

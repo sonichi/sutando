@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>s.space Superpowers · Getting Started Guide</title>
 <style>
-:root {
+#overview {
   --display: "Avantt", "Avantt SemiBold", "Avenir Next", sans-serif;
   --sans: "Haas Recast", "Haas Recast Dense", "Avenir Next", sans-serif;
   --bg: #f4f4f4;
@@ -21,7 +21,7 @@
   --shadow: 0 1px 3px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.06);
 }
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
+  :root:not([data-theme="light"]) #overview {
     --bg: #0e0e0f;
     --card: #19191b;
     --ink: #f1efec;
@@ -35,7 +35,7 @@
     --shadow: 0 1px 3px rgba(0,0,0,0.2), 0 8px 24px rgba(0,0,0,0.3);
   }
 }
-:root[data-theme="dark"] {
+:root[data-theme="dark"] #overview {
   --bg: #0e0e0f;
   --card: #19191b;
   --ink: #f1efec;
@@ -48,7 +48,7 @@
   --greenbg: #132a1e;
   --shadow: 0 1px 3px rgba(0,0,0,0.2), 0 8px 24px rgba(0,0,0,0.3);
 }
-:root[data-theme="light"] {
+:root[data-theme="light"] #overview {
   --bg: #f4f4f4;
   --card: #ffffff;
   --ink: #1c1b1c;
@@ -61,8 +61,8 @@
   --greenbg: #e8f5ec;
   --shadow: 0 1px 3px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.06);
 }
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body {
+#overview * { box-sizing: border-box; margin: 0; padding: 0; }
+#overview {
   margin: 0;
   background: var(--bg);
   color: var(--ink);
@@ -70,8 +70,8 @@ body {
   -webkit-font-smoothing: antialiased;
   padding: 24px 16px 64px;
 }
-.container { max-width: 880px; margin: 0 auto; }
-.hero {
+#overview .container { max-width: 880px; margin: 0 auto; }
+#overview .overview-hero {
   background: var(--card);
   border: 1px solid var(--line);
   border-radius: 14px;
@@ -79,7 +79,7 @@ body {
   box-shadow: var(--shadow);
   margin-bottom: 20px;
 }
-.tag-badge {
+#overview .tag-badge {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -93,23 +93,23 @@ body {
   letter-spacing: 0.05em;
   margin-bottom: 12px;
 }
-h1 { font-size: 26px; font-weight: 700; line-height: 1.25; margin-bottom: 8px; }
-.subtitle { color: var(--mute); font-size: 15px; line-height: 1.5; margin-bottom: 20px; }
-.nav-tracker {
+#overview h1 { font-size: 26px; font-weight: 700; line-height: 1.25; margin-bottom: 8px; }
+#overview .subtitle { color: var(--mute); font-size: 15px; line-height: 1.5; margin-bottom: 20px; }
+#overview .nav-tracker {
   background: var(--soft);
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 12px;
 }
-.nav-header {
+#overview .nav-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   margin-bottom: 10px;
   padding: 0 2px;
 }
-.nav-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--mute); }
-.badge-status {
+#overview .nav-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--mute); }
+#overview .badge-status {
   font-size: 12px;
   font-weight: 600;
   color: var(--acc);
@@ -117,13 +117,13 @@ h1 { font-size: 26px; font-weight: 700; line-height: 1.25; margin-bottom: 8px; }
   padding: 2px 8px;
   border-radius: 6px;
 }
-.steps-tabs {
+#overview .steps-tabs {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 8px;
   width: 100%;
 }
-.tab-btn {
+#overview .tab-btn {
   background: var(--card);
   border: 1px solid var(--line);
   color: var(--mute);
@@ -139,14 +139,14 @@ h1 { font-size: 26px; font-weight: 700; line-height: 1.25; margin-bottom: 8px; }
   gap: 8px;
   text-align: left;
 }
-.tab-btn:hover { color: var(--ink); border-color: var(--acc); }
-.tab-btn.active {
+#overview .tab-btn:hover { color: var(--ink); border-color: var(--acc); }
+#overview .tab-btn.active {
   background: var(--card);
   color: var(--acc);
   border-color: var(--acc);
   box-shadow: 0 0 0 1px var(--acc);
 }
-.tab-num {
+#overview .tab-num {
   width: 20px;
   height: 20px;
   border-radius: 50%;
@@ -159,14 +159,14 @@ h1 { font-size: 26px; font-weight: 700; line-height: 1.25; margin-bottom: 8px; }
   font-weight: 700;
   flex-shrink: 0;
 }
-.tab-btn.active .tab-num {
+#overview .tab-btn.active .tab-num {
   background: var(--acc);
   color: #fff;
 }
 @media (max-width: 640px) {
-  .steps-tabs { grid-template-columns: repeat(2, 1fr); }
+  #overview .steps-tabs { grid-template-columns: repeat(2, 1fr); }
 }
-.tour-card {
+#overview .tour-card {
   display: none;
   background: var(--card);
   border: 1px solid var(--line);
@@ -175,8 +175,8 @@ h1 { font-size: 26px; font-weight: 700; line-height: 1.25; margin-bottom: 8px; }
   box-shadow: var(--shadow);
   margin-top: 18px;
 }
-.tour-card.active { display: block; }
-.card-num {
+#overview .tour-card.active { display: block; }
+#overview .card-num {
   font-size: 12px;
   font-weight: 700;
   color: var(--acc);
@@ -184,21 +184,21 @@ h1 { font-size: 26px; font-weight: 700; line-height: 1.25; margin-bottom: 8px; }
   letter-spacing: 0.08em;
   margin-bottom: 4px;
 }
-h2 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
-.card-desc { color: var(--mute); font-size: 14.5px; margin-bottom: 20px; }
-.feature-grid {
+#overview h2 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
+#overview .card-desc { color: var(--mute); font-size: 14.5px; margin-bottom: 20px; }
+#overview .feature-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
   gap: 12px;
   margin-bottom: 20px;
 }
-.feature-box {
+#overview .feature-box {
   background: var(--soft);
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 16px;
 }
-.feature-box h4 {
+#overview .feature-box h4 {
   font-size: 14px;
   font-weight: 700;
   margin-bottom: 6px;
@@ -206,26 +206,26 @@ h2 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
   align-items: center;
   gap: 6px;
 }
-.feature-box p { font-size: 13.5px; color: var(--mute); line-height: 1.45; }
-.callout {
+#overview .feature-box p { font-size: 13.5px; color: var(--mute); line-height: 1.45; }
+#overview .callout {
   background: var(--accbg);
   border-left: 4px solid var(--acc);
   border-radius: 8px;
   padding: 14px 16px;
   margin-bottom: 18px;
 }
-.callout-title { font-weight: 700; font-size: 14px; color: var(--acc); margin-bottom: 4px; }
-.callout p { font-size: 13.5px; color: var(--ink); margin: 0; }
-.interactive-panel {
+#overview .callout-title { font-weight: 700; font-size: 14px; color: var(--acc); margin-bottom: 4px; }
+#overview .callout p { font-size: 13.5px; color: var(--ink); margin: 0; }
+#overview .interactive-panel {
   background: var(--soft);
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 16px;
   margin-bottom: 18px;
 }
-.panel-title { font-weight: 700; font-size: 13.5px; margin-bottom: 10px; }
-.interactive-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
-.sub-tab {
+#overview .panel-title { font-weight: 700; font-size: 13.5px; margin-bottom: 10px; }
+#overview .interactive-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+#overview .sub-tab {
   background: var(--card);
   border: 1px solid var(--line);
   color: var(--mute);
@@ -236,9 +236,9 @@ h2 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
   font-weight: 600;
   cursor: pointer;
 }
-.sub-tab:hover { color: var(--ink); }
-.sub-tab.active { background: var(--acc); color: #fff; border-color: var(--acc); }
-.panel-content {
+#overview .sub-tab:hover { color: var(--ink); }
+#overview .sub-tab.active { background: var(--acc); color: #fff; border-color: var(--acc); }
+#overview .panel-content {
   background: var(--card);
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -246,7 +246,7 @@ h2 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
   font-size: 13.5px;
   line-height: 1.5;
 }
-.prompt-box {
+#overview .prompt-box {
   background: var(--soft);
   border: 1px dashed var(--line);
   border-radius: 10px;
@@ -257,9 +257,9 @@ h2 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
   gap: 12px;
   margin-bottom: 20px;
 }
-.prompt-meta { font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--mute); margin-bottom: 2px; }
-.prompt-text { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; color: var(--ink); }
-.btn-copy {
+#overview .prompt-meta { font-size: 11px; font-weight: 700; text-transform: uppercase; color: var(--mute); margin-bottom: 2px; }
+#overview .prompt-text { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; color: var(--ink); }
+#overview .btn-copy {
   background: var(--acc);
   color: #fff;
   border: none;
@@ -272,15 +272,15 @@ h2 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
   flex-shrink: 0;
   transition: opacity 0.15s;
 }
-.btn-copy:hover { opacity: 0.9; }
-.card-nav {
+#overview .btn-copy:hover { opacity: 0.9; }
+#overview .card-nav {
   display: flex;
   justify-content: space-between;
   align-items: center;
   padding-top: 18px;
   border-top: 1px solid var(--line);
 }
-.btn-nav {
+#overview .btn-nav {
   background: var(--card);
   border: 1px solid var(--line);
   color: var(--ink);
@@ -291,29 +291,30 @@ h2 { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
   font-weight: 600;
   cursor: pointer;
 }
-.btn-nav:hover { background: var(--soft); }
-.btn-nav.primary {
+#overview .btn-nav:hover { background: var(--soft); }
+#overview .btn-nav.primary {
   background: var(--acc);
   color: #fff;
   border-color: var(--acc);
 }
-.btn-nav.primary:hover { opacity: 0.95; }
-h1,h2 { font-family:var(--display); font-weight:600; }
-.hero { border-radius:26px; border-top:4px solid #f26a21; background:radial-gradient(ellipse at 110% -10%,#f9a75c 0,transparent 45%),var(--card); }
-.tour-card { border-radius:22px; }
-button { min-height:44px; }
-button:focus-visible { outline:3px solid var(--ink); outline-offset:3px; }
-.feature-grid { grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr)); }
-.prompt-text { overflow-wrap:anywhere; }
-@media(max-width:440px) { .prompt-box { flex-wrap:wrap; } .hero,.tour-card { padding:22px 18px; } }
-@media(prefers-reduced-motion:reduce) { * { transition:none!important; } }
-@media print { .tour-card { display:block; } .card-nav { display:none; } }
+#overview .btn-nav.primary:hover { opacity: 0.95; }
+#overview h1, #overview h2 { font-family:var(--display); font-weight:600; }
+#overview .overview-hero { border-radius:26px; border-top:4px solid #f26a21; background:radial-gradient(ellipse at 110% -10%,#f9a75c 0,transparent 45%),var(--card); }
+#overview .tour-card { border-radius:22px; }
+#overview button { min-height:44px; max-width:100%; white-space:normal; overflow-wrap:anywhere; }
+#overview button:focus-visible { outline:3px solid var(--ink); outline-offset:3px; }
+#overview .feature-grid { grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr)); }
+#overview .prompt-text { overflow-wrap:anywhere; }
+@media(max-width:440px) { #overview .prompt-box, #overview .card-nav { flex-wrap:wrap; gap:8px; } #overview .overview-hero, #overview .tour-card { padding:22px 18px; } }
+@media(prefers-reduced-motion:reduce) { #overview * { transition:none!important; } }
+@media print { #overview .tour-card { display:block; } #overview .card-nav { display:none; } }
 </style>
 </head>
-<body>
+<body style="margin:0">
+<div id="overview">
 <div class="container">
 <p class="subtitle">Interactive overview · Explore example connections, permissions and workflows.</p>
-  <header class="hero">
+  <header class="overview-hero">
     <div class="tag-badge">s.space Guide &amp; Tour</div>
     <h1>The Multiplayer AI Workspace</h1>
     <p class="subtitle">Connect agents across providers, collaborate with teammates in multiplayer rooms, talk in live calls, and build durable artifacts in Room Commons.</p>
@@ -622,5 +623,7 @@ function setCommons(surf, btn) {
   info.innerHTML = details[surf] || "";
 }
 </script>
-<noscript><style>.tour-card{display:block}</style><p>This overview works as a reference without JavaScript. Select an example prompt to copy it.</p></noscript></body>
+<noscript><style>#overview .tour-card{display:block}</style><p>This overview works as a reference without JavaScript. Select an example prompt to copy it.</p></noscript>
+</div>
+</body>
 </html>

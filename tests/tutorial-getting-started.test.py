@@ -121,7 +121,8 @@ def parse(page):
 
 def steps(page):
     """The step headings, without the closing card's (which comes first in the markup)."""
-    heads = parse(page).headings
+    checklist = page.split('<details id="tutorial-checklist">', 1)[-1]
+    heads = parse(checklist).headings
     assert heads[0] == FINALE, heads[0]
     return heads[1:]
 
@@ -402,7 +403,7 @@ class InteractiveTest(unittest.TestCase):
         if not node:
             self.skipTest("node not installed")
         bodies = re.findall(r"<script>(.*?)</script>", self.page, re.S)
-        self.assertEqual(len(bodies), 3)
+        self.assertEqual(len(bodies), 4)
         for body in bodies:
             with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
                 fh.write(body)
