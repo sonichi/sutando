@@ -242,6 +242,13 @@ class MalformedActionError(Exception):
     pass
 
 
+def device_id(req: HumanRequirement) -> str:
+    """The id of the device a requirement was raised on, "" when it names none.
+    One definition: the seat a reminder is planned for and the card a create
+    dedupes against must agree on which device is which."""
+    return str((req.device or {}).get("id") or "")
+
+
 def validate_action(req: HumanRequirement, reply: ActionReply) -> Action:
     """The three-layer stale gate. Returns the matched Action or raises.
 
