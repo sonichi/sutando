@@ -414,6 +414,20 @@ class WorkerIdentityShared(Refusal):
     CODE = "worker_identity_shared"
 
 
+class WorkerIdentityExists(Refusal):
+    """A worker holds at most one identity per server: a second agent there is refused, while an
+    identity on another server stands beside it."""
+
+    CODE = "worker_identity_exists"
+
+
+class AmbiguousWorkerIdentity(Refusal):
+    """A worker holds identities on more than one server and the caller named no server to choose by:
+    refused rather than guessed, so no server is ever acted on with another server's token."""
+
+    CODE = "worker_identity_ambiguous"
+
+
 class InvalidToken(ConnectionsError):
     pass
 
@@ -493,6 +507,20 @@ def host_of_url(url: str) -> str:
         return (urllib.parse.urlsplit(url or "").hostname or "").lower()
     except ValueError:
         return ""
+
+
+def origin_of_url(url: str) -> str:
+    """`scheme://host:port` of an http(s) URL, the port made explicit (443, 80) so a default and a stated
+    one agree; '' for any other scheme or port 0. Two URLs name the same endpoint only when these are equal."""
+    try:
+        u = urllib.parse.urlsplit(url or "")
+        scheme, host, port = u.scheme.lower(), (u.hostname or "").lower(), u.port
+    except ValueError:
+        return ""
+    if scheme not in ("https", "http"):
+        return ""
+    port = {"https": 443, "http": 80}[scheme] if port is None else port
+    return f"{scheme}://{host}:{port}" if host and port else ""
 
 
 def worker_instance_for(server: str, worker: str) -> str:
@@ -1075,7 +1103,16 @@ def _validate(payload: object) -> dict:
     pending = payload.get(RELAUNCH_KEY, {})
     if not isinstance(pending, dict) or not all(isinstance(k, str) and type(v) is int for k, v in pending.items()):
         raise SchemaError(f"connections.json: '{RELAUNCH_KEY}' is not a map of instance to pid")
-    return {"rows": rows, REMOVED_KEY: sorted(set(removed)), LEGACY_PARKED_KEY: parked, RELAUNCH_KEY: dict(pending)}
+    storage = payload.get("worker_storage", {})
+    if not isinstance(storage, dict):
+        raise SchemaError("connections.json: worker_storage is not a map")
+    for worker, home in storage.items():
+        if (not isinstance(worker, str) or not WORKER_RE.fullmatch(worker) or not isinstance(home, dict)
+                or not isinstance(home.get("agent_mxid"), str) or not home["agent_mxid"].strip()
+                or type(home.get("own")) is not bool):
+            raise SchemaError("connections.json: invalid worker_storage entry")
+    return {"rows": rows, REMOVED_KEY: sorted(set(removed)), LEGACY_PARKED_KEY: parked,
+            RELAUNCH_KEY: dict(pending), "worker_storage": _worker_storage(rows, storage)}
 
 
 def _read_record(path: Path) -> dict:
@@ -1131,6 +1168,9 @@ def _write(path: Path, record: dict) -> None:
                if any(r["primary"] and r["instance"] == k for r in record["rows"])}
     if pending:
         payload[RELAUNCH_KEY] = pending
+    storage = _worker_storage(record["rows"], record.get("worker_storage", {}))
+    if storage:
+        payload["worker_storage"] = storage
     _validate(payload)
     _atomic_json(path, payload)
 
@@ -1328,6 +1368,10 @@ def add_connection(token: str, *, added_by: str, expected_server: str, instance:
             retired = None
             if existing is None and worker:
                 _check_worker_identity(rows, seen, worker)
+            elif worker and seen.get("verified") and existing.get("agent_mxid") \
+                    and seen.get("agent_mxid") != existing.get("agent_mxid"):
+                raise WorkerIdentityExists(f"worker {worker} already has an agent of its own on {existing['server']} "
+                                           f"({existing['agent_mxid']}); rotate or retire it instead")
             if existing is not None and not worker and _readopts_legacy(existing, seen, token, vault, environ):
                 mine, theirs = existing.get("agent_mxid"), seen.get("agent_mxid")
                 if mine and theirs != mine:
@@ -1644,6 +1688,11 @@ def event_owner_lanes(task: Mapping[str, object], workspace: Optional[Path] = No
 
 class NoConnectionForRoom(ConnectionsError):
     """A room-scoped operation has no usable connection; never answered with another server's."""
+
+
+class WorkerRoomAmbiguous(AmbiguousWorkerIdentity, NoConnectionForRoom):
+    """A room operation with no room, from a worker with an agent on several servers: no server to act on.
+    Every handler of NoConnectionForRoom refuses it as such."""
 
 
 def server_of_room(room_id: str) -> str:
@@ -2173,16 +2222,49 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
 WORKER_TOKEN_SOURCES = {"paste": "owner", "agent_link": "agent_link"}
 
 
-def worker_identity(worker: str, workspace: Optional[Path] = None) -> Optional[dict]:
-    """`worker`'s own identity row as stored, read only; None when it has none or the record is unreadable."""
+def worker_identities(worker: str, workspace: Optional[Path] = None) -> list:
+    """Every identity row `worker` holds, one per server, read only; [] when it has none or the record
+    is unreadable."""
     try:
         rows = _read(record_path(workspace))
     except (SchemaError, OSError):
-        return None
-    return next((dict(r) for r in rows if r.get("worker") == worker), None)
+        return []
+    return [dict(r) for r in rows if worker and r.get("worker") == worker]
 
 
-# A worker row's `dirs: "own"`: its tasks and results live in its agent's own folder, not the shared ones.
+def _pick_identity(worker: str, rows: list, server: Optional[str]) -> Optional[dict]:
+    """The row of `rows` on `server`; with no server, the only one. AmbiguousWorkerIdentity when the
+    worker holds several and no server was named."""
+    if server:
+        server = server.strip().lower()
+        return next((r for r in rows if server in _row_servers(r)), None)
+    if len(rows) > 1:
+        have = ", ".join(sorted(str(r["server"]) for r in rows))
+        raise AmbiguousWorkerIdentity(f"worker {worker} has an agent on several servers ({have}); name the "
+                                      "server to act on")
+    return rows[0] if rows else None
+
+
+def worker_identity(worker: str, workspace: Optional[Path] = None, *,
+                    server: Optional[str] = None) -> Optional[dict]:
+    """`worker`'s own identity row on `server`, read only; with no server, its only one. None when it has
+    none there (or the record is unreadable); AmbiguousWorkerIdentity when it holds several and no
+    server was named."""
+    return _pick_identity(worker, worker_identities(worker, workspace), server)
+
+
+def require_no_worker_identity(worker: str, server: str, workspace: Optional[Path] = None) -> None:
+    """The one check that `worker` may gain an agent on `server`: WorkerIdentityExists when it already
+    holds one there. An identity on another server is no bar."""
+    if not server:
+        raise ConnectionsError(f"no server to check worker {worker}'s identity on")
+    row = worker_identity(worker, workspace, server=server)
+    if row is not None:
+        raise WorkerIdentityExists(f"worker {worker} already has an agent of its own on {server} "
+                                   f"({row.get('agent_mxid') or row['instance']}); rotate or retire it instead")
+
+
+# Legacy rows carry `dirs: "own"`; worker_storage pins one home across identity changes.
 WORKER_DIRS_KEY = "dirs"
 WORKER_DIRS_OWN = "own"
 WORKER_AGENTS_DIR = "agents"
@@ -2198,18 +2280,48 @@ def worker_root(agent_mxid: str, workspace: Optional[Path] = None) -> Path:
     return worker_agents_dir(workspace) / _agent_identity().root_segment(agent_mxid)
 
 
-def _row_dirs(row: Optional[Mapping[str, object]], workspace: Optional[Path]) -> "Optional[tuple[Path, Path]]":
-    mxid = str((row or {}).get("agent_mxid") or "").strip()
-    if not row or not row.get("worker") or row.get(WORKER_DIRS_KEY) != WORKER_DIRS_OWN or not mxid:
+def _worker_storage(rows: list, saved: Mapping) -> dict:
+    """Keep each worker's first storage anchor, including when its original identity is removed."""
+    storage = {worker: dict(home) for worker, home in saved.items()}
+    workers = dict.fromkeys(r["worker"] for r in rows if r.get("worker"))
+    for worker in workers:
+        mine = [r for r in rows if r.get("worker") == worker and str(r.get("agent_mxid") or "").strip()]
+        if worker in storage or not mine:
+            continue
+        row = next((r for r in mine if r.get(WORKER_DIRS_KEY) == WORKER_DIRS_OWN), mine[0])
+        storage[worker] = {"agent_mxid": str(row["agent_mxid"]).strip(),
+                           "own": row.get(WORKER_DIRS_KEY) == WORKER_DIRS_OWN}
+    return storage
+
+
+def _storage_dirs(record: Mapping, worker: str, workspace: Optional[Path], *,
+                  include_shared: bool = False) -> "Optional[tuple[Path, Path]]":
+    if not worker or not any(r.get("worker") == worker for r in record["rows"]):
         return None
-    root = worker_root(mxid, workspace)
+    home = record.get("worker_storage", {}).get(worker)
+    if not home or not (home["own"] or include_shared):
+        return None
+    root = worker_root(home["agent_mxid"], workspace)
     return root / "tasks", root / "results"
 
 
 def worker_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":
-    """(tasks dir, results dir) of `worker` when its identity row names an agent and `dirs: "own"`;
-    None otherwise (the worker uses the workspace's shared tasks/ and results/), or when unreadable."""
-    return _row_dirs(worker_identity(worker, workspace), workspace) if worker else None
+    """The worker's stable task/results folders, shared by all its identities; None for shared storage."""
+    try:
+        record = _read_record(record_path(workspace))
+    except (SchemaError, OSError):
+        return None
+    return _storage_dirs(record, worker, workspace)
+
+
+def worker_storage_root(worker: str, workspace: Optional[Path] = None) -> Optional[Path]:
+    """The stable worker storage root, including while the worker uses shared folders."""
+    try:
+        record = _read_record(record_path(workspace))
+    except (SchemaError, OSError):
+        return None
+    dirs = _storage_dirs(record, worker, workspace, include_shared=True)
+    return dirs[0].parent if dirs else None
 
 
 def ensure_worker_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":
@@ -2235,15 +2347,18 @@ def task_home(task_id: str, workspace: Optional[Path] = None) -> dict:
     ws = _workspace(workspace)
     home = {"lane": task_lane(task_id), "worker": "", "tasks": ws / "tasks", "results": ws / "results", "own": False}
     try:
-        rows = _read(record_path(ws))
+        record = _read_record(record_path(ws))
+        rows = record["rows"]
     except (SchemaError, OSError):
         return home
+    row = None
     if home["lane"]:
         row = next((r for r in rows if home["lane"] in [r["instance"]] + alias_instances(r)), None)
-    else:
-        row = next((r for r in rows if _row_dirs(r, ws) and _holds_task(_row_dirs(r, ws)[0], task_id)), None)
+    if row is None:
+        row = next((r for r in rows if (dirs := _storage_dirs(record, r.get("worker", ""), ws))
+                    and _holds_task(dirs[0], task_id)), None)
     home["worker"] = str((row or {}).get("worker") or "")
-    dirs = _row_dirs(row, ws)
+    dirs = _storage_dirs(record, home["worker"], ws)
     if dirs:
         home.update(tasks=dirs[0], results=dirs[1], own=True)
     return home
@@ -2271,11 +2386,12 @@ def task_other_home(task_id: str, workspace: Optional[Path] = None) -> Optional[
         return None
     if home["own"]:
         return {"tasks": ws / "tasks", "results": ws / "results"}
-    mxid = str((worker_identity(home["worker"], ws) or {}).get("agent_mxid") or "").strip()
-    if not mxid:
+    try:
+        record = _read_record(record_path(ws))
+    except (SchemaError, OSError):
         return None
-    root = worker_root(mxid, ws)
-    return {"tasks": root / "tasks", "results": root / "results"}
+    dirs = _storage_dirs(record, home["worker"], ws, include_shared=True)
+    return {"tasks": dirs[0], "results": dirs[1]} if dirs else None
 
 
 def own_worker_homes(workspace: Optional[Path] = None) -> list:
@@ -2283,14 +2399,14 @@ def own_worker_homes(workspace: Optional[Path] = None) -> list:
     read of the record; [] when it is unreadable. Paths are lexical under the workspace, as worker_dirs'."""
     ws = _workspace(workspace)
     try:
-        rows = _read(record_path(ws))
+        record = _read_record(record_path(ws))
     except (SchemaError, OSError):
         return []
     homes = []
-    for row in rows:
-        dirs = _row_dirs(row, ws)
+    for worker in dict.fromkeys(r["worker"] for r in record["rows"] if r.get("worker")):
+        dirs = _storage_dirs(record, worker, ws)
         if dirs:
-            homes.append({"worker": str(row["worker"]), "tasks": dirs[0], "results": dirs[1]})
+            homes.append({"worker": worker, "tasks": dirs[0], "results": dirs[1]})
     return homes
 
 
@@ -2298,19 +2414,27 @@ def set_worker_dirs(worker: str, own: bool, *, workspace: Optional[Path] = None)
     """Set (`own`) or clear `worker`'s `dirs: "own"` under the record lock; returns the row. Refused
     (`ConnectionsError`) when the worker has no identity row or its row names no agent."""
     with _transaction(workspace) as record:
-        row = next((r for r in record["rows"] if r.get("worker") == worker), None)
+        row = next((r for r in record["rows"] if r.get("worker") == worker
+                    and str(r.get("agent_mxid") or "").strip()), None)
         mxid = str((row or {}).get("agent_mxid") or "").strip()
         if not mxid:
             raise ConnectionsError(f"worker {worker} has no agent identity row")
-        # One agent folder is one inbox: two lanes, each with its own lease, must not poll it.
-        twins = [r["worker"] for r in record["rows"] if r.get("worker") and r is not row
-                 and str(r.get("agent_mxid") or "").strip() == mxid]
+        storage = _worker_storage(record["rows"], record.get("worker_storage", {}))
+        anchor = storage[worker]["agent_mxid"]
+        twins = [r["worker"] for r in record["rows"] if r.get("worker") and r["worker"] != worker
+                 and (str(r.get("agent_mxid") or "").strip() == anchor
+                      or storage.get(r["worker"], {}).get("agent_mxid") == anchor)]
         if own and twins:
-            raise ConnectionsError(f"worker {twins[0]}'s row also names agent {mxid}: its own folder would be shared")
-        if own:
-            row[WORKER_DIRS_KEY] = WORKER_DIRS_OWN
-        else:
-            row.pop(WORKER_DIRS_KEY, None)
+            raise ConnectionsError(f"worker {twins[0]}'s row also names agent {anchor}: its own folder would be shared")
+        storage[worker]["own"] = bool(own)
+        record["worker_storage"] = storage
+        for identity in record["rows"]:
+            if identity.get("worker") != worker:
+                continue
+            if own:
+                identity[WORKER_DIRS_KEY] = WORKER_DIRS_OWN
+            else:
+                identity.pop(WORKER_DIRS_KEY, None)
         return dict(row)
 
 
@@ -2328,12 +2452,16 @@ def session_worker(environ: Optional[Mapping[str, str]] = None) -> str:
 def acting_identity(rows: list, room_id: Optional[str], worker: str,
                     workspace: Optional[Path] = None) -> Optional[dict]:
     """`worker`'s own identity row when its session acts through it in `room_id`, else None (the
-    core's rows): its enabled row on the room's server; with no room, its only enabled row. A room
+    core's rows): its enabled row on the room's server; with no room, its only enabled row
+    (WorkerRoomAmbiguous when it has one on several servers: no room names a server). A room
     local state says is the core's stays the core's: one where a core lane, and not the worker's,
     has a task open (that task is answered as the core's agent), or a core lane's own owner DM."""
     own = [r for r in rows if worker and r.get("worker") == worker and not r.get("disabled")]
     if not room_id:
-        return own[0] if len(own) == 1 else None
+        if len(own) > 1:
+            raise WorkerRoomAmbiguous(f"worker {worker} has an agent on several servers; a room operation "
+                                      "with no room names none of them")
+        return own[0] if own else None
     server = server_of_room(room_id)
     mine = next((r for r in own if server in _row_servers(r)), None) if server else next(
         (r for r in own if _lane_holds_room(r, room_id, workspace)), None)
@@ -2354,7 +2482,8 @@ class NoWorkerCredential(ConnectionsError):
         self.reason, self.detail = reason, detail
 
 
-WORKER_CREDENTIAL_REASONS = ("no_worker", "no_token")
+WORKER_CREDENTIAL_REASONS = ("no_worker", "no_token", "ambiguous_server", "descriptor_missing",
+                             "descriptor_unresolved")
 # Why a worker acts through the core's agent instead of one of its own (`worker_mcp_credential`'s `reason`).
 WORKER_ACTS_AS_CORE_REASONS = ("no_identity", "disabled")
 # The worker seat's s-space MCP proxy runs this argv to learn whose credential to mint with (see
@@ -2362,23 +2491,90 @@ WORKER_ACTS_AS_CORE_REASONS = ("no_identity", "disabled")
 MCP_WORKER_CREDENTIAL_ENV = "AG2_MCP_WORKER_CREDENTIAL"
 
 
-def worker_enabled_identity(worker: str, workspace: Optional[Path] = None) -> Optional[dict]:
-    """`worker`'s own identity row while a lane serves it (neither disabled nor parked), else None. The one
-    test of whether a worker acts as its own agent: its proactive notes are stamped for its lane and its
-    seat's MCP proxy mints with its token exactly when this answers a row; otherwise it acts as the core."""
-    row = worker_identity(worker, workspace)
-    return row if row is not None and not row.get("disabled") and not row.get("parked") else None
+def _serving(row: Mapping[str, object]) -> bool:
+    return not row.get("disabled") and not row.get("parked")
+
+
+def worker_enabled_identity(worker: str, workspace: Optional[Path] = None, *,
+                            server: Optional[str] = None) -> Optional[dict]:
+    """`worker`'s own identity row on `server` while a lane serves it (neither disabled nor parked), else
+    None; with no server, its only serving one (AmbiguousWorkerIdentity when several serve). The one test
+    of whether a worker acts as its own agent there; otherwise it acts as the core."""
+    return _pick_identity(worker, [r for r in worker_identities(worker, workspace) if _serving(r)], server)
+
+
+def worker_home_identity(worker: str, workspace: Optional[Path] = None) -> Optional[dict]:
+    """The worker's serving identity on the primary connection; no other lane is a fallback."""
+    from worker_lane import primary_identity
+    return primary_identity(worker, workspace)
 
 
 def session_proactive_name(name, environ: Optional[Mapping[str, str]] = None,
                            workspace: Optional[Path] = None) -> str:
     """The name this session publishes a proactive file under (`proactive_routing.stamp_worker`): stamped
     with its worker when the session is a pool worker's that acts as its own agent
-    (`worker_enabled_identity`), so that worker's lane claims it; unchanged for the core's session and
-    for a worker acting through the core's agent, whose notes a core lane sends as before."""
+    (`worker_home_identity`), so that worker's home lane claims it; unchanged for the core's session and
+    for a worker acting through the core's agent, whose notes a core lane sends as before, and for every
+    name the stamp leaves alone (a task result). AmbiguousWorkerIdentity for a proactive note when the
+    worker serves on several servers and none is the primary's."""
     from proactive_routing import stamp_worker
     worker = session_worker(environ)
-    return stamp_worker(name, worker) if worker and worker_enabled_identity(worker, workspace) else Path(name).name
+    if not worker or stamp_worker(name, worker) == Path(name).name:
+        return Path(name).name
+    if worker_home_identity(worker, workspace) is not None:
+        return stamp_worker(name, worker)
+    if any(_serving(r) for r in worker_identities(worker, workspace)):
+        raise AmbiguousWorkerIdentity(f"worker {worker} has an agent on several servers and none on the primary "
+                                      "connection's; its note names no server to be sent from")
+    return Path(name).name
+
+
+MCP_DESCRIPTOR_ENV = "AG2_MCP_DESCRIPTOR"
+
+
+def mcp_seat_server(workspace: Optional[Path] = None, environ: Optional[Mapping[str, str]] = None) -> str:
+    """The server the seat's agent MCP descriptor mints on: the one its proxy reads (`MCP_DESCRIPTOR_ENV`,
+    which the proxy keeps for this resolver, wherever it lives), else the workspace's. Taken from the
+    descriptor alone, never from which row is primary now (set_primary rewrites no descriptor): its own
+    agent's server; for a descriptor naming no agent, the server whose row's gateway is exactly the
+    descriptor's own relay or mint endpoint (host and port, a default port as stated), or the row its
+    lane names outright. "" when there is no descriptor at all.
+    NoWorkerCredential `descriptor_missing` when the variable names a descriptor that cannot be read (a
+    seat told to use one is never resolved by another), and `descriptor_unresolved` when a descriptor is
+    present but names no server by these, or names two."""
+    environ = os.environ if environ is None else environ
+    named = str(environ.get(MCP_DESCRIPTOR_ENV) or "")
+    path = Path(named) if named else mcp_descriptor_path(workspace)
+    if not named and not path.is_file():
+        return ""
+    try:
+        desc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        if named:
+            raise NoWorkerCredential("descriptor_missing", f"{MCP_DESCRIPTOR_ENV} names a descriptor that "
+                                     "cannot be read") from None
+        raise NoWorkerCredential("descriptor_unresolved", "the seat's MCP descriptor cannot be read") from None
+    if not isinstance(desc, dict):
+        raise NoWorkerCredential("descriptor_unresolved", "the seat's MCP descriptor is not an object")
+    own = server_of_mxid(str(desc.get("agent_id") or ""))
+    if own:
+        return own.lower()
+    try:
+        rows = _read(record_path(workspace))
+    except (OSError, SchemaError):
+        rows = []
+    # The exact endpoint, port included: a look-alike host or another port on the same host is not the row's.
+    origins = {origin_of_url(str(desc.get(k) or "")) for k in ("relay", "mint_url")} - {""}
+    by_host = {str(r["server"]).lower() for r in rows if origin_of_url(str(r.get("gateway_url") or "")) in origins}
+    lane = str(desc.get("lane") or "")
+    by_lane = {str(r["server"]).lower() for r in _core_rows(rows) if lane and lane != "primary"
+               and r["instance"] == lane}
+    found = by_host | by_lane
+    if len(found) != 1:
+        raise NoWorkerCredential("descriptor_unresolved", "the seat's MCP descriptor names no agent and "
+                                 + ("its relay, mint host and lane name several servers" if found else
+                                    "neither its relay nor its mint host nor its lane names a server"))
+    return found.pop()
 
 
 def proactive_author_agent(name, workspace: Optional[Path] = None) -> Optional[str]:
@@ -2426,20 +2622,30 @@ def proactive_author_phrase(name, host: str, workspace: Optional[Path] = None) -
 
 
 def worker_mcp_credential(worker: str, *, workspace: Optional[Path] = None,
-                          environ: Optional[Mapping[str, str]] = None, vault=None) -> dict:
+                          environ: Optional[Mapping[str, str]] = None, vault=None,
+                          server: Optional[str] = None) -> dict:
     """Whose credential a worker session's MCP proxy mints with. A worker that acts as its own agent
     (`worker_enabled_identity`) answers `acts_as: "worker"` with its row and token, resolved as every room
     client resolves one (`connection_credential`: the vault's, by its `token_ref`):
     `{worker, acts_as, lane, server, agent_id, relay, bearer}`, `bearer` the secret half. A worker with no
     identity, or a disabled or parked one, answers `{worker, acts_as: "core", reason}`: it acts through the
-    core's agent, as its notes do. Refused with NoWorkerCredential for no worker or for an enabled identity
-    with no token; the core's rows are never read here, so the core's credential is never answered."""
+    core's agent, as its notes do. The identity is the one on `server`, else on the server the seat's MCP
+    descriptor mints on (`mcp_seat_server`: the proxy's own) when known, so a token is never minted on
+    another server's.
+    Refused with NoWorkerCredential for no worker, for an enabled identity with no token, and
+    (`ambiguous_server`) for several identities and no server to pick by; the core's is never answered."""
     if not worker or not WORKER_RE.match(worker):
         raise NoWorkerCredential("no_worker", "this session names no pool worker")
-    row = worker_enabled_identity(worker, workspace)
+    mine = worker_identities(worker, workspace)
+    own = [r for r in mine if _serving(r)]
+    server = (server or (mcp_seat_server(workspace, environ) if own else "")).strip().lower()
+    if not server and len(own) > 1:
+        raise NoWorkerCredential("ambiguous_server", f"worker {worker} has an agent on several servers and the "
+                                 "seat's MCP descriptor names no server to pick one by")
+    row = _pick_identity(worker, own, server)
     if row is None:
-        reason = "disabled" if worker_identity(worker, workspace) is not None else "no_identity"
-        return {"worker": worker, "acts_as": "core", "reason": reason}
+        held = _pick_identity(worker, mine, server) if server else next(iter(mine), None)
+        return {"worker": worker, "acts_as": "core", "reason": "disabled" if held is not None else "no_identity"}
     try:
         gateway_url, token = connection_credential(row, environ, vault=vault)
     except NoConnectionForRoom as e:
@@ -2452,12 +2658,14 @@ def worker_mcp_credential(worker: str, *, workspace: Optional[Path] = None,
 
 
 def mcp_worker_credential_argv(worker: str, repo: Path, python: str = "",
-                               workspace: Optional[Path] = None) -> list:
+                               workspace: Optional[Path] = None, server: str = "") -> list:
     """The argv a worker seat's MCP proxy runs for `worker_mcp_credential` (`MCP_WORKER_CREDENTIAL_ENV`
     carries it JSON-encoded): the seat's own interpreter when the launcher resolved one, else python3, and
-    the workspace named outright, since the proxy runs it with a scrubbed environment."""
+    the workspace named outright, since the proxy runs it with a scrubbed environment; `server` pins the
+    identity a seat whose proxy mints on one server uses."""
     return [python or "python3", str(Path(repo) / "scripts" / "connections.py"), "--workspace",
-            str(_workspace(workspace)), "worker-mcp-credential", "--worker", worker]
+            str(_workspace(workspace)), "worker-mcp-credential", "--worker", worker] + \
+        (["--server", server] if server else [])
 
 
 def worker_lane_named(name: str, workspace: Optional[Path] = None) -> bool:
@@ -2575,15 +2783,39 @@ def add_worker_identity(worker: str, token: str, *, expected_server: str, source
                           worker=worker, **add_kw)
 
 
-def retire_worker_identity(worker: str, *, workspace: Optional[Path] = None, vault=None,
-                           kill=None) -> Optional[dict]:
-    """Take `worker`'s own identity down for good: stop its lane, drop its row, its vault secret and its
-    launch record (`remove_connection`). None when it has none. The agent itself stays on its server
-    until the owner deletes it, or a re-issued token voids this one."""
-    row = worker_identity(worker, workspace)
+def remove_worker_identity(worker: str, *, server: Optional[str] = None, workspace: Optional[Path] = None,
+                           vault=None, kill=None) -> Optional[dict]:
+    """Take `worker`'s identity on `server` (with none named, its only one) down for good: stop its lane,
+    drop its row, its vault secret and its launch record (`remove_connection`). None when it has none
+    there. The agent itself stays on its server until the owner deletes it, or a re-issued token voids it."""
+    row = worker_identity(worker, workspace, server=server)
     if row is None:
         return None
     return remove_connection(str(row["instance"]), workspace=workspace, vault=vault, kill=kill)
+
+
+class PartialWorkerRetire(ConnectionsError):
+    """`retire_worker_identity` removed some of a worker's identities and failed on another: `removed`
+    lists the rows taken down, `cause` the failure; the rest stand and a retry takes them."""
+
+    def __init__(self, removed: list, cause: Exception):
+        names = ", ".join(str(r["instance"]) for r in removed) or "none"
+        super().__init__(f"removed {names} before failing: {type(cause).__name__}: {cause}")
+        self.removed, self.cause = removed, cause
+
+
+def retire_worker_identity(worker: str, *, workspace: Optional[Path] = None, vault=None, kill=None) -> list:
+    """Take every identity `worker` holds down (`remove_connection` each, one per server): what a retired
+    worker leaves. [] when it has none; PartialWorkerRetire, naming what went, when one fails after another."""
+    removed: list = []
+    for r in worker_identities(worker, workspace):
+        try:
+            removed.append(remove_connection(str(r["instance"]), workspace=workspace, vault=vault, kill=kill))
+        except ConnectionsError as e:
+            if not removed:
+                raise
+            raise PartialWorkerRetire(removed, e) from e
+    return removed
 
 
 def disconnect(instance: str, *, workspace: Optional[Path] = None, kill=None) -> dict:
@@ -3650,7 +3882,8 @@ def _declared_bridge_serves(entry: Mapping[str, object], workspace: Optional[Pat
         return False
     try:
         import worker_lane
-        return worker_lane.declared_bridge(str(entry["worker"]), _workspace(workspace))
+        return worker_lane.declared_bridge(str(entry["worker"]), _workspace(workspace),
+                                           instance=str(entry["instance"]))
     except Exception:  # noqa: BLE001 - an unanswerable check never keeps a lane down
         return False
 

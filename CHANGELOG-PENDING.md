@@ -25,7 +25,10 @@ Format: `- Brief description of what changed. ([#NNN])`
 
 ## Fixed
 
+- Workers with identities on several connections share one stable task/result folder. Only the primary connection’s worker lane adopts shared results; room-addressed notes use the matching server’s lane. Changing the primary leaves the inbox in place. ([#6384])
+
 <!-- fix() PRs go here -->
+- connections: a pool worker seat's MCP descriptor with no agent names a server only by its relay or mint endpoint's exact scheme, host and port, so a look-alike host, another port on the same host, plain HTTP against an HTTPS row, port 0 or a non-HTTP(S) scheme is refused, not resolved. ([#6449])
 - Task watcher: every dispatch decision after the task-handler probe now logs one line naming the probe's exit code and the outcome (announced, handled, or held with the live watcher that holds the claim), so a task that is neither announced nor run is never silent. Each catch-up pass also re-dispatches a task still in the inbox a pass later that this watcher never admitted and that is neither held nor answered, so a drop with no known cause heals within two passes.
 - ag2-sparrow: a proactive message's `[file:]`/`[send:]`/`[attach:]` attachment is uploaded to the room the message went to, after the message is delivered; a refused file is logged by name, and a message that is only an attachment sends "(file attached)" instead of waiting forever. A re-published message whose attachment changed (another file, or new bytes under the same path) is a new send. A redirected message whose body the destination guard withholds uploads none of its files, and a non-owner room's logs name only the file name. (#4193)
 - ag2-sparrow: the `ag2-sparrow-outbox` recovery command logged for a quarantined result names its `--root` and `--results-dir` through the workspace resolver (`$HOME` without one) and quotes its ids, so the log carries no home path and a workspace path with a space no longer splits the command. ([#6447])

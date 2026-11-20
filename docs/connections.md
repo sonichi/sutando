@@ -607,10 +607,23 @@ session (`connections.py start` from a worker's shell) carries none of that sess
 A worker's row has no channel env file: its token is in the vault alone, so
 `channel-env.sh <its lane>` exits 1 saying so, and room clients resolve it by room.
 
-Whether a worker acts as its own agent at all is one test, `connections.worker_enabled_identity`:
-its row exists and is neither disabled nor parked, so a lane serves it. A worker with no row, or a
-disabled or parked one, acts through the core's agent in everything below, as every worker did
-before it had an identity.
+Whether a worker acts as its own agent on a server is one test, `connections.worker_enabled_identity`
+(`server=`): its row on that server exists and is neither disabled nor parked, so a lane serves it. A
+worker with no row there, or a disabled or parked one, acts through the core's agent in everything
+below, as every worker did before it had an identity.
+
+A worker holds at most one identity per server, so it can have one on each homeserver the core is
+connected to (`require_no_worker_identity` is the one check, on the server of the `--lane` it is
+added through). Every reader picks the one for the server it acts on: a room's server for room
+operations; for the seat's MCP tools, `--server`, else the server of the descriptor the seat's proxy
+reads (`mcp_seat_server`). That server comes from the descriptor alone, never from which row is
+primary now: its agent's server, or, for a descriptor naming no agent, the server whose row's gateway
+is the descriptor's own relay or mint host, or the row its lane names outright. A descriptor that names
+no one server by these is refused (`descriptor_unresolved`), and so is one that `AG2_MCP_DESCRIPTOR`
+names but that cannot be read (`descriptor_missing`): the workspace's descriptor never stands in for
+it. Where nothing names a server (a room operation with no room, an MCP seat with no descriptor) it
+refuses by name (`WorkerRoomAmbiguous`, `ambiguous_server`) instead of guessing.
+`retire_worker_identity` removes them all.
 
 A proactive file such a worker's session writes is the worker's lane's to deliver. The session
 publishes it through `result_publish.py`, which stamps the name
@@ -618,7 +631,9 @@ publishes it through `result_publish.py`, which stamps the name
 `proactive_routing.stamp_worker`); a session that writes the file by hand uses the same name. A
 worker acting through the core publishes the name unchanged, and a core lane sends it as before.
 The one claim rule is `proactive_routing.lane_claims_proactive(name, lane_worker)`: a stamped file
-is claimed only by the lane running as that worker, which posts it as the worker's agent into that
+is claimed only by the lane running as that worker (with an identity on several servers, by one of
+them, `connections.is_worker_note_lane`: the lane on the server of the room the note names, else
+its home lane, the identity on the primary's server; a note with no home is refused at publish), which posts it as the worker's agent into that
 agent's own owner DM; a core lane and every other bridge (Discord, Slack, Telegram, their
 fallbacks) refuse it, and a worker's lane claims nothing unstamped. The gateway's drain asks its
 host (`PROACTIVE_OWN_FILE`) whether an owner-directed file is the lane's own, so a worker's lane
@@ -728,14 +743,23 @@ pass, which takes the lease once sparrowd has stopped the bridge.
 
 ### A worker on its own folders (`dirs: "own"`)
 
-A worker whose identity row carries `dirs: "own"` keeps its tasks and results in its agent's own folder,
+A worker has one task/result folder across all its connection identities. The connection record's
+`worker_storage` map pins that worker's existing agent-root path and own/shared setting; changing the
+primary connection, rotating an identity, or removing the original identity does not move its inbox.
+Older records derive the anchor from the existing own-folder row (otherwise the first identity), and
+the next locked record write preserves it. `dirs: "own"` remains on rows for compatibility.
+
+A worker configured with its own folders keeps its tasks and results in its anchored folder,
 `<workspace>/agents/<segment>/{tasks,results}` (the folder a claude-local bridge for that agent uses), not
 the workspace's shared `tasks/` and `results/`; `state/` stays shared. `connections.worker_dirs(worker)` is
 the one answer (None for every other worker) and `connections.task_home(task_id)` maps a lane-queued task to
 its folders. Its lane, whether the gateway wrapper's or a declared Sparrow bridge, runs on those folders
 (`worker_lane.lane_dirs`): the folder is the worker's inbox, so no router runs; the pre-publish hook only
 records the task as the worker's (`--attribute-only`), and the worker's stamped proactive files still landing
-in the shared `results/` are moved into its own. Its session reads a plain inbox of task files and answers in
+in the shared `results/` are moved into its own. Only the worker lane on the current primary connection
+may adopt shared files, and it must hold that lane's lease. All serving lanes read the same worker folder:
+room-addressed proactive notes are claimed by the lane on the room's server, and unaddressed notes by
+the primary. A primary change changes adoption and unaddressed routing, not the storage location. Its session reads a plain inbox of task files and answers in
 its own results (`spawn_worker.inbox_env`, `result_publish`). A worker without the field is unchanged.
 
 `python3 src/worker_lane.py migrate-dirs --worker <id>` shows what switching the worker would do (its
@@ -743,7 +767,7 @@ folders, who holds its lane, what is delivered to it, and which tasks and result
 nothing. With `--apply` it switches the worker over:
 1. It finds the declared task-event handler first. A failed lookup, or work delivered with no handler to
    move it, refuses before anything changes.
-2. It writes the field and creates the folders (a private agent root), and relaunches the worker's lane
+2. It writes the field and creates the folders (a private agent root), and relaunches every worker lane
    under the record lock (a wrapper lane is stopped so the lane keeper starts it on the new folders; a
    declared bridge is waited for until sparrowd has replaced it).
 3. It has the handler empty the worker's `deliveries/<id>/` under the router's locks. A task its own lane
