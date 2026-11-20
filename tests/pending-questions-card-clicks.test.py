@@ -355,6 +355,32 @@ class TokenAndOutage(_Room):
         self.assertTrue(c["actionable"])
 
 
+class ClosedElsewhere(_Room):
+    """A row the owner closes without the asking agent's `resolve` (in the room database, in chat
+    with this agent) still retires its unclicked card on the next reconcile, on every device."""
+
+    def test_reconcile_retires_the_card_of_a_row_closed_in_the_database(self):
+        TokenAndOutage._owner_sets(self, "answered")
+        self.assertEqual(self.m.get(self.card).status, "pending")
+        out = room_db.reconcile_pass(self.ws)
+        self.assertEqual(out["errors"], [])
+        self.assertEqual(self.m.get(self.card).status, STATUS_CANCELLED)
+        self.assertEqual(out.get("retired"), [self.card])
+
+    def test_reconcile_leaves_the_card_of_an_open_row(self):
+        out = room_db.reconcile_pass(self.ws)
+        self.assertEqual(self.m.get(self.card).status, "pending")
+        self.assertEqual(out.get("retired"), [])
+
+    def test_reconcile_leaves_a_clicked_card_to_the_click_path(self):
+        click(self.m, self.card, "approve")
+        TokenAndOutage._owner_sets(self, "resolved")
+        room_db.reconcile_pass(self.ws)
+        self.assertEqual(self.m.get(self.card).status, STATUS_IN_PROGRESS)
+        [c] = self.run_clicks()
+        self.assertEqual((c["stale"], c["actionable"]), (True, False))
+
+
 def _health_check():
     spec = importlib.util.spec_from_file_location("hc_for_card_clicks", REPO / "src" / "health-check.py")
     mod = importlib.util.module_from_spec(spec)

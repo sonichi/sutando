@@ -17,8 +17,9 @@ its held entry; a held entry with no row waits (not yet in the room), or is done
 locally; a local close naming neither is `pending_close`. `unavailable: True` and `done: None`
 when the room cannot be read — never a zero. `reconcile_pass(workspace)` is the explicit pass
 (outbox replay, local closes, stale marks, the transitional legacy ingest, the history
-backfill); `ask_owner` queues and holds its new question before room work, then reconciles after
-its row is confirmed, and writes no row when
+backfill, retiring the unclicked card of a row closed without `resolve`); `ask_owner` queues
+and holds its new question before room work, then reconciles after its row is confirmed, and
+writes no row when
 the outbox could not hold the question; a confirmed row commits the history marker BEFORE
 its outbox entry is deleted, and keeps the entry when that commit fails. `resolve` closes
 the row (committing the history marker first when the row is in view and the marker is not;
@@ -159,17 +160,38 @@ def _held_snapshot(ws: Path) -> tuple:
     return {e["ask_id"] for e in HeldRecords(ws).entries()}, {it["ask_id"]: it for it in outbox_items(ws)}
 
 
-def reconcile_pass(workspace: Path, environ=None) -> dict:
-    """The explicit pass: {"flushed", "closed", "moved", "errors"}; without a store, one error."""
+def reconcile_pass(workspace: Path, environ=None, manager=None) -> dict:
+    """The explicit pass: {"flushed", "closed", "moved", "retired", "errors"}; without a store, one error."""
     from util_paths import host_label
     ws = Path(workspace)
     store, where = room_store(ws, environ)
     if store is None:
         return {"flushed": [], "closed": [], "moved": [], "errors": [f"room database: not used ({where})"]}
     try:
-        return reconcile_pending(store, ws, host_label())
+        out = reconcile_pending(store, ws, host_label())
     except Exception as e:  # noqa: BLE001
         return {"flushed": [], "closed": [], "moved": [], "errors": [f"{type(e).__name__}: {e}"]}
+    out["retired"] = []
+    try:
+        out["retired"] = _retire_closed_cards(ws, store, manager)
+    except Exception as e:  # noqa: BLE001
+        out["errors"].append(f"decision cards: {type(e).__name__}: {e}")
+    return out
+
+
+def _retire_closed_cards(ws: Path, store, manager=None) -> list:
+    """Retire each unclicked card whose row was closed without `resolve` (in the database, in chat);
+    a clicked card is left to `clicks`, which settles it stale."""
+    from hitl.schema import STATUS_PENDING  # noqa: PLC0415
+    manager = manager or cards.manager_for(ws)
+    gone = []
+    for req in manager.active():
+        ask_id = (req.subject or {}).get("ask_id") or req.guard
+        if req.runtime == cards.CARD_RUNTIME and req.status == STATUS_PENDING and ask_id \
+                and store.status_of(ask_id) in TERMINAL:
+            manager.cancel(req.id)
+            gone.append(req.id)
+    return gone
 
 
 def gather(workspace: Path, environ=None) -> dict:
