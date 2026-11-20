@@ -24,7 +24,7 @@ from __future__ import annotations
 import re
 import sys
 from dataclasses import dataclass
-from typing import Iterable, Tuple
+from typing import Callable, Iterable, Iterator, List, Tuple
 
 
 SLACK_TOKEN_PATTERN = re.compile(
@@ -34,19 +34,48 @@ PRIVATE_KEY_PATTERN = re.compile(
     r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"
 )
 
-_FALLBACK_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
-    ("AWS Access Key", re.compile(r"AKIA[A-Z0-9]{16}")),
-    ("GitHub Token", re.compile(r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}")),
+Span = Tuple[int, int, str]
+Finder = Callable[[str], Iterator[Tuple[int, int]]]
+
+
+def _all_matches(pattern: re.Pattern) -> Finder:
+    def find(text: str) -> Iterator[Tuple[int, int]]:
+        for m in pattern.finditer(text):
+            yield m.start(), m.end()
+    return find
+
+
+def _once_per_run(start: str, run_end: str, pattern: str) -> Finder:
+    """pattern.finditer for a pattern whose every start inside one run (up to run_end) fails
+    alike: tried at the run's first start only, so matching stays linear in the text."""
+    start_re, run_end_re, pattern_re = re.compile(start), re.compile(run_end), re.compile(pattern)
+
+    def find(text: str) -> Iterator[Tuple[int, int]]:
+        pos = 0
+        while (s := start_re.search(text, pos)) is not None:
+            m = pattern_re.match(text, s.start())
+            if m:
+                yield m.start(), m.end()
+                pos = m.end()
+            else:
+                stop = run_end_re.search(text, s.end())
+                pos = stop.start() if stop else len(text)
+    return find
+
+
+_FALLBACK_PATTERNS: Tuple[Tuple[str, Finder], ...] = (
+    ("AWS Access Key", _all_matches(re.compile(r"AKIA[A-Z0-9]{16}"))),
+    ("GitHub Token", _all_matches(re.compile(r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}"))),
     # Google/Gemini API keys. This repo's own load-bearing GEMINI_API_KEY has
     # this shape, so without it an owner could paste the key into a room and
     # have it persisted to the task file and owner-activity state despite the
     # documented "tokens, keys" redaction guarantee. The 35-char tail makes it
     # high-precision: prose mentioning "AIza" cannot reach the length.
-    ("Google API Key", re.compile(r"AIza[0-9A-Za-z_-]{35}")),
+    ("Google API Key", _all_matches(re.compile(r"AIza[0-9A-Za-z_-]{35}"))),
     # Fine-grained PATs (2022+) use a distinct prefix + longer body — the
     # legacy ghp_/gho_/… pattern above never matches them (review P1).
-    ("GitHub Fine-Grained PAT", re.compile(r"github_pat_[A-Za-z0-9_]{36,}")),
-    ("Matrix Access Token", re.compile(r"syt_[A-Za-z0-9_-]{20,}")),
+    ("GitHub Fine-Grained PAT", _all_matches(re.compile(r"github_pat_[A-Za-z0-9_]{36,}"))),
+    ("Matrix Access Token", _all_matches(re.compile(r"syt_[A-Za-z0-9_-]{20,}"))),
     # Onboarding tokens are `<url><sep><secret>`, and the separator is accepted
     # in BOTH forms by the parser that consumes them (`_SEPARATOR_RE` in
     # remote_gateway_bridge: `\||%7[Cc]`) — the desktop connect flow writes the
@@ -55,18 +84,21 @@ _FALLBACK_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
     # this module exists to prevent (review blocker). The lookahead stops the
     # URL run from swallowing the encoded separator, mirroring the parser's
     # first-separator-wins `search()`.
-    ("Remote Task Token", re.compile(
-        r"https?://(?:(?!%7[Cc])[^\s|])+(?:\||%7[Cc])[A-Za-z0-9_+/=-]{20,}"
+    ("Remote Task Token", _once_per_run(
+        r"https?://", r"[\s|]|%7[Cc]",
+        r"https?://(?:(?!%7[Cc])[^\s|])+(?:\||%7[Cc])[A-Za-z0-9_+/=-]{20,}",
     )),
-    ("JSON Web Token", re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")),
-    ("Slack Token", SLACK_TOKEN_PATTERN),
-    ("OpenAI Token", re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{32,}")),
-    ("Stripe Access Key", re.compile(r"sk_(?:live|test)_[A-Za-z0-9]{24,}")),
-    ("Discord Bot Token", re.compile(
-        r"[MNO][A-Za-z\d_-]{23,}\.[A-Za-z\d_-]{6,}\.[A-Za-z\d_-]{27,}"
+    ("JSON Web Token", _once_per_run(
+        r"eyJ", r"[^A-Za-z0-9_-]", r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
     )),
-    ("Telegram Bot Token", re.compile(r"\d{8,10}:[A-Za-z0-9_-]{35}")),
-    ("Private Key", PRIVATE_KEY_PATTERN),
+    ("Slack Token", _all_matches(SLACK_TOKEN_PATTERN)),
+    ("OpenAI Token", _all_matches(re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{32,}"))),
+    ("Stripe Access Key", _all_matches(re.compile(r"sk_(?:live|test)_[A-Za-z0-9]{24,}"))),
+    ("Discord Bot Token", _once_per_run(
+        r"[MNO]", r"[^A-Za-z\d_-]", r"[MNO][A-Za-z\d_-]{23,}\.[A-Za-z\d_-]{6,}\.[A-Za-z\d_-]{27,}",
+    )),
+    ("Telegram Bot Token", _all_matches(re.compile(r"\d{8,10}:[A-Za-z0-9_-]{35}"))),
+    ("Private Key", _all_matches(PRIVATE_KEY_PATTERN)),
 )
 _ENTROPY_TYPES = {"Base64 High Entropy String", "Hex High Entropy String"}
 _TOKENISH_RUN = re.compile(r"[A-Za-z0-9_+/=-]{20,}")
@@ -82,28 +114,67 @@ class ChatSecretFilterResult:
         return bool(self.secret_types)
 
 
-def _replace_patterns(text: str) -> tuple[str, set[str]]:
-    redacted = text
-    found: set[str] = set()
-    for secret_type, pattern in _FALLBACK_PATTERNS:
-        redacted, count = pattern.subn(f"[REDACTED-{secret_type}]", redacted)
-        if count:
-            found.add(secret_type)
-    return redacted, found
+def _detector_spans(text: str) -> tuple[List[Span], set[str]]:
+    spans: List[Span] = []
+    for secret_type, find in _FALLBACK_PATTERNS:
+        spans += [(start, end, secret_type) for start, end in find(text)]
+    return spans, {span[2] for span in spans}
 
 
-def _redact_unhandled_hit_lines(text: str, redacted: str, hits: Iterable[object]) -> str:
-    """Redact a whole line when detection found a secret but no full-span
-    pattern changed it. Losing the line is safer than persisting a partial hit."""
-    source_lines = text.split("\n")
-    output_lines = redacted.split("\n")
+def _line_bounds(text: str) -> List[Tuple[int, int]]:
+    bounds, start = [], 0
+    for line in text.split("\n"):
+        bounds.append((start, start + len(line)))
+        start += len(line) + 1
+    return bounds
+
+
+def _covered(text: str, line: Tuple[int, int], value: str, spans: List[Span]) -> bool:
+    """Whether the hit's detected value occurs on its line and every occurrence lies in a span."""
+    i = text.find(value, *line) if value else -1
+    if i == -1:
+        return False
+    while i != -1:
+        if not any(s <= i and i + len(value) <= e for s, e, _ in spans):
+            return False
+        i = text.find(value, i + 1, line[1])
+    return True
+
+
+def _hit_spans(text: str, hits: Iterable[object], spans: List[Span]) -> List[Span]:
+    """A span for each detector hit no full-secret span covers: its whole line, or for a private
+    key its line through the END marker line (end of text when unterminated)."""
+    bounds = _line_bounds(text)
+    out: List[Span] = []
     for hit in hits:
         idx = int(getattr(hit, "line_number", 0)) - 1
-        if 0 <= idx < len(source_lines) and idx < len(output_lines):
-            if output_lines[idx] == source_lines[idx]:
-                secret_type = str(getattr(hit, "secret_type", "Secret"))
-                output_lines[idx] = f"[REDACTED-{secret_type}]"
-    return "\n".join(output_lines)
+        if not 0 <= idx < len(bounds):
+            continue
+        secret_type = str(getattr(hit, "secret_type", "Secret"))
+        start, end = bounds[idx]
+        if secret_type == "Private Key":
+            end = next((e for s, e in bounds[idx:]
+                        if "-----END " in text[s:e] and "PRIVATE KEY-----" in text[s:e]), len(text))
+        elif _covered(text, bounds[idx], str(getattr(hit, "secret_value", "") or ""), spans):
+            continue
+        out.append((start, end, secret_type))
+    return out
+
+
+def _apply_spans(text: str, spans: Iterable[Span]) -> str:
+    """Every span of the original text replaced at once; overlapping spans become one placeholder."""
+    merged: List[List] = []
+    for start, end, secret_type in sorted(spans, key=lambda span: (span[0], -span[1])):
+        if merged and start < merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end, secret_type])
+    parts, pos = [], 0
+    for start, end, secret_type in merged:
+        parts += [text[pos:start], f"[REDACTED-{secret_type}]"]
+        pos = end
+    parts.append(text[pos:])
+    return "".join(parts)
 
 
 def _actionable_hits(text: str, hits: Iterable[object]) -> list[object]:
@@ -143,7 +214,7 @@ def filter_chat_secrets(text: str) -> ChatSecretFilterResult:
     if not text:
         return ChatSecretFilterResult(text=text, secret_types=())
 
-    redacted, found = _replace_patterns(text)
+    spans, found = _detector_spans(text)
     try:
         from secret_scanner import scan_and_redact
     except ImportError as e:
@@ -151,30 +222,17 @@ def filter_chat_secrets(text: str) -> ChatSecretFilterResult:
         # any deeper ImportError = broken install (surface it).
         if not (isinstance(e, ModuleNotFoundError) and e.name == "secret_scanner"):
             _warn_scanner_broken(e)
-        return ChatSecretFilterResult(text=redacted, secret_types=tuple(sorted(found)))
+        return ChatSecretFilterResult(text=_apply_spans(text, spans), secret_types=tuple(sorted(found)))
     try:
-        hits, library_redacted = scan_and_redact(text)
-        hits = _actionable_hits(text, hits)
-        # Recompute when the library changed a line for an entropy-only false
-        # positive that we just discarded; otherwise ordinary prose would stay
-        # redacted even though no actionable hit remains.
-        if not hits:
-            library_redacted = text
-        # Generic detection does not store unnamed values; make the placeholder
-        # truthful instead of inheriting the scanner's vault-oriented wording.
-        library_redacted = library_redacted.replace(
-            "[STORED-IN-KEYCHAIN-", "[REDACTED-"
-        )
-        library_redacted = _redact_unhandled_hit_lines(text, library_redacted, hits)
-        redacted, fallback_found = _replace_patterns(library_redacted)
-        found.update(fallback_found)
+        hits = _actionable_hits(text, scan_and_redact(text)[0])
+        spans = spans + _hit_spans(text, hits, spans)
         found.update(str(hit.secret_type) for hit in hits)
     except Exception:
         # Missing optional dependency or detector failure: keep the curated
         # fallback result and never crash the bridge.
         pass
 
-    return ChatSecretFilterResult(text=redacted, secret_types=tuple(sorted(found)))
+    return ChatSecretFilterResult(text=_apply_spans(text, spans), secret_types=tuple(sorted(found)))
 
 
 def secret_handling_instruction(surface: str, secret_types: Iterable[str]) -> str:
