@@ -772,6 +772,12 @@ class LastWorkerTeardown(Base):
         self.remove(OTHER)
         self.assertEqual(self.handler_cfg().read_text(), foreign)
 
+    def test_an_unreadable_handler_config_is_left_in_place(self):
+        self.remove(WID)
+        self.handler_cfg().write_text("{not json")
+        self.remove(OTHER)
+        self.assertEqual(self.handler_cfg().read_text(), "{not json")
+
     def test_a_worker_registered_after_the_last_removal_republishes_the_handler(self):
         self.remove(WID)
         self.remove(OTHER)
