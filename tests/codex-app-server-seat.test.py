@@ -746,6 +746,11 @@ class Worker(SeatCase):
             self.task(f"{task_id}.txt", body)
         (self.inbox / f"{task_id}.txt").touch()
 
+    def archived(self, task_id: str):
+        (self.tasks / "archive").mkdir(exist_ok=True)
+        (self.tasks / "archive" / f"{task_id}.txt").write_text("task: do it\n")
+        (self.inbox / f"{task_id}.txt").touch()
+
     def worker_seat(self, stage=None, **kw):
         decl = self.declaration(inbox=self.inbox, payloads=self.tasks, stage=stage or self.pool_stage())
         return self.make(decl, **kw)
@@ -789,10 +794,10 @@ class Worker(SeatCase):
         self.assertEqual([name for name, _ in s.pending()],
                          ["task-u.txt", "task-b.txt", "task-a.txt", "task-acc.txt"])
 
-    def test_an_answered_delivery_is_marked_done_without_a_turn_and_a_gone_payload_is_withdrawn(self):
+    def test_an_answered_delivery_is_marked_done_without_a_turn_and_an_archived_payload_is_withdrawn(self):
         self.deliver("task-answered")
         (self.results / "task-answered.txt").write_text("answered by the core\n")
-        self.deliver("task-gone", payload=False)
+        self.archived("task-gone")
         pool_delivery.mark_done(self.ws, "w1", "task-gone", published=False)
         s = self.worker_seat()
         s.ensure_server()
@@ -906,35 +911,42 @@ class Worker(SeatCase):
         self.assertEqual(len(self.done_calls()), 2)
         self.assertEqual(len(self.sent("turn/start")), 1)
 
-    def test_a_payload_that_appears_while_an_abandon_waits_to_be_recorded_again_is_run_not_withdrawn(self):
-        # A sentinel can precede its payload. Recording a failed `abandon` again, with the real pool
-        # hook, withdrew the sentinel after the payload had landed: no turn started.
+    def test_a_delivery_whose_payload_is_only_missing_is_kept_and_run_when_the_payload_lands(self):
+        # A sentinel can precede its payload: withdrawing on "missing" orphaned a payload that landed
+        # after the scan (with the real pool hook, no turn started).
         os.environ["SUTANDO_POOL_DELIVERY_SCRIPT"] = str(POOL / "pool_delivery.py")
         self.deliver("task-late", payload=False)
+        pool_delivery.mark_done(self.ws, "w1", "task-late", published=False)
         s = self.worker_seat(retry_s=30)
         s.ensure_server()
-        real, asked = s.stage, []
-
-        def stage(filename, stage_name):
-            asked.append((filename, stage_name))
-            if stage_name == "abandon" and asked.count((filename, stage_name)) == 1:
-                return "stage abandon exited 1"
-            return real(filename, stage_name)
-
-        with mock.patch.object(s, "stage", side_effect=stage):
+        with mock.patch.object(s, "stage", wraps=s.stage) as stage:
             self.assertIsNone(s.step(), "no payload yet: nothing to run")
-            self.assertEqual(asked, [("task-late.txt", "abandon")])
-            self.assertIn(("task-late.txt", "abandon"), s.unsettled)
+            self.assertEqual([c.args for c in stage.call_args_list if c.args[1] == "abandon"], [])
+            self.assertTrue((self.inbox / "task-late.txt").exists(), "the sentinel is kept")
+            self.assertTrue(pool_delivery.pending_flag(self.ws, "w1", "task-late").exists(), "and its hold")
             self.task("task-late.txt", "task: do it\n")
-            self.now[0] += 31
             self.assertEqual(s.step(), "done")
-        self.assertEqual(asked.count(("task-late.txt", "abandon")), 1, "the abandon was not asked again")
-        self.assertNotIn(("task-late.txt", "abandon"), s.unsettled)
+            self.assertEqual([c.args for c in stage.call_args_list if c.args[1] == "abandon"], [])
         self.assertEqual(len(self.sent("turn/start")), 1, "the delivery was run")
         self.assertTrue(pool_delivery.is_done_flag(pool_delivery.done_flag(self.ws, "w1", "task-late")))
 
-    def test_an_abandon_that_failed_is_recorded_again_while_the_delivery_is_still_spent(self):
-        self.deliver("task-gone", payload=False)
+    def test_a_failed_abandon_is_not_made_again_once_the_payload_is_back_from_the_archive(self):
+        self.archived("task-back")
+        Path(str(self.stage_log) + ".fail").touch()
+        s = self.worker_seat(stage=[sys.executable, str(self.hook)], retry_s=30)
+        s.ensure_server()
+        self.assertIsNone(s.step())
+        self.assertIn(("task-back.txt", "abandon"), s.unsettled)
+        os.unlink(str(self.stage_log) + ".fail")
+        os.replace(self.tasks / "archive" / "task-back.txt", self.tasks / "task-back.txt")
+        self.now[0] += 31
+        self.assertEqual(s.step(), "done")
+        self.assertEqual(self.stage_log.read_text().count("--stage abandon"), 1, "the abandon was not asked again")
+        self.assertNotIn(("task-back.txt", "abandon"), s.unsettled)
+        self.assertEqual(len(self.sent("turn/start")), 1)
+
+    def test_an_abandon_that_failed_is_recorded_again_while_the_payload_stays_archived(self):
+        self.archived("task-gone")
         Path(str(self.stage_log) + ".fail").touch()
         s = self.worker_seat(stage=[sys.executable, str(self.hook)], retry_s=30)
         self.assertIsNone(s.step())
@@ -949,7 +961,7 @@ class Worker(SeatCase):
 
     def test_a_failing_done_or_abandon_hook_is_logged_not_fatal(self):
         self.deliver("task-1")
-        self.deliver("task-gone", payload=False)
+        self.archived("task-gone")
         s = self.worker_seat(stage=[sys.executable, str(self.hook)])
         s.ensure_server()
         self.assertEqual(s.step(), "done")

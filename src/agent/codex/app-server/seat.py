@@ -40,7 +40,7 @@ for _p in (str(REPO / "src"), str(Path(__file__).resolve().parent)):
 import supervised_host  # noqa: E402
 from delivery.task_dispatch import (has_ready_result, owned_task_ids,  # noqa: E402
                                     pending_candidates)
-from task_disposition import ANSWERED, PENDING, SPENT, task_dispositions  # noqa: E402
+from task_disposition import ANSWERED, ARCHIVED, PENDING, task_dispositions  # noqa: E402
 from task_priority import sort_tasks_by_priority  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
@@ -349,7 +349,7 @@ class Seat:
         return "" if r.returncode == 0 else f"stage {stage} exited {r.returncode}"
 
     def settle(self, filename: str, stage: str) -> None:
-        """Record `done` (a result is published) or `abandon` (no payload, no result). Only a stage
+        """Record `done` (a result is published) or `abandon` (payload archived, no result). Only a stage
         call that succeeded is remembered; a failed one is made again after `retry_s`, at most
         SETTLE_ATTEMPTS times in a run, and the task itself is never run again for it."""
         key = (filename, stage)
@@ -401,8 +401,10 @@ class Seat:
                 owed.append(Path(self.host.task_path(filename)))
             elif state == ANSWERED:
                 self.settle(filename, "done")
-            elif state in SPENT:
+            elif state == ARCHIVED:
                 self.settle(filename, "abandon")
+            # A payload that is only missing may still be on its way (the sentinel can precede it):
+            # the delivery is kept, and withdrawn only on the evidence of an archived payload.
         return [(p.name, p) for p in sort_tasks_by_priority(owed)]
 
     # ---- per-task records: what happened to a turn that ended without a result ----
