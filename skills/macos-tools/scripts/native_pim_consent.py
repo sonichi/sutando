@@ -174,6 +174,17 @@ def denial_message(app: str) -> str:
     )
 
 
+def timeout_message(app: str) -> str:
+    """An unanswered macOS Automation prompt shows up as a timeout, not as -1743."""
+    return (
+        f"{app}: the local macOS {app} app did not answer in time. Most likely a macOS prompt "
+        f"asking to let this app control {app} is waiting on the owner's screen: ask the owner "
+        f"to click Allow, then run this again. If there is no prompt, the owner checks System "
+        f"Settings → Privacy & Security → Automation and turns {app} on for the app running the "
+        f"agent."
+    )
+
+
 def record_denial(app: str, state: Path | None = None) -> Path:
     """Persist the macOS denial so no later run re-asks; unwritable state is not an error."""
     marker = denial_marker(app, state)
