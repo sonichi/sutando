@@ -307,12 +307,26 @@ def withdraw_remedy_timer(workspace, *, launch_agents=None, runner=None) -> dict
         return {"removed": False, "why": "launchd is macOS-only"}
     try:
         with prt.timer_lock(launch_agents):
-            # Re-read under the lock a spawn ensures its timer under: a worker that joined keeps it.
-            if (pr.load_roster(workspace) or {"workers": True}).get("workers"):
+            # A spawn ensures the timer under this lock after its run is open but before its row
+            # exists, so an open unrostered run counts as a worker here.
+            roster = pr.load_roster(workspace)
+            if roster is None or roster.get("workers"):
                 return {"removed": False, "why": "the pool has workers again, or its roster cannot be read"}
+            starting = _unrostered_live_runs(workspace, roster)
+            if starting:
+                return {"removed": False, "why": f"worker(s) still starting: {', '.join(starting)}"}
             return prt.uninstall(workspace, launch_agents=launch_agents, runner=runner)
     except Exception as e:
         return {"removed": False, "why": f"{type(e).__name__}: {e}"}
+
+
+def _unrostered_live_runs(workspace, roster) -> list:
+    """Worker records with an open run that the roster neither lists nor has removed."""
+    d = Path(workspace) / "state" / "workers"
+    known = set(roster.get("workers") or {}) | set(roster.get("removed") or [])
+    return sorted(p.name for p in (d.iterdir() if d.is_dir() else ())
+                  if p.is_dir() and wi.WORKER_ID_RE.match(p.name) and p.name not in known
+                  and wi.current(workspace, p.name).get("incarnation_id"))
 
 
 def listing(workspace, *, runner=subprocess.run) -> list:

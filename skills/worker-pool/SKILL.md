@@ -92,8 +92,10 @@ python3 skills/worker-pool/scripts/pool_manage.py unbind <room id>
   history. Removing the last worker also withdraws the pool's task-event
   handler (`state/task-event-handler.json`, only when it names this skill's
   handler) and, on macOS, uninstalls this workspace's remedy timer, unless a
-  worker joined in the meantime; the JSON line reports the timer under
-  `remedy_timer`. The next worker created publishes both again.
+  worker joined in the meantime or one is still being created (an open run under
+  `state/workers/` with no roster row); the JSON line reports the timer under
+  `remedy_timer`. The next `create_worker` publishes both again: its spawn
+  ensures the timer and its registration publishes the handler.
 - `plugins` records an extra Claude Code plugin dir on one Claude worker's roster
   row (`plugin_dirs`, absolute real paths). Every start of that worker (spawn,
   recovery, `enable`, `reseat`) passes each with `--plugin-dir`; the core and

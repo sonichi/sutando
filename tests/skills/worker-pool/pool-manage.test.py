@@ -824,6 +824,34 @@ class WithdrawRemedyTimer(Base):
         self.assertFalse(self.withdraw()["removed"])
         self.assertTrue(self.plist.exists())
 
+    def test_a_worker_spawned_but_not_yet_rostered_keeps_the_timer(self):
+        # create_worker: spawn() opens the run and ensures the timer, then registers the row.
+        # A remove of the last old worker that withdraws in between must leave the timer.
+        starting = "c" * 32
+        wi.create_worker(self.ws, runtime="claude", tmux_socket=self.sock, worker_id=starting,
+                         cwd=str(REPO))
+        self.empty_the_pool()
+        out = self.withdraw()
+        self.assertFalse(out["removed"], out)
+        self.assertIn(starting, out["why"])
+        self.assertTrue(self.plist.exists())
+        pr.register_worker(self.ws, starting, "new", runtime="claude")
+        self.assertTrue(self.plist.exists())
+
+    def test_a_spawn_that_ended_its_run_no_longer_holds_the_timer(self):
+        starting = "c" * 32
+        rec = wi.create_worker(self.ws, runtime="claude", tmux_socket=self.sock,
+                               worker_id=starting, cwd=str(REPO))
+        wi.end_incarnation(self.ws, starting, rec["incarnation_id"], "crashed")
+        self.empty_the_pool()
+        self.assertTrue(self.withdraw()["removed"])
+        self.assertFalse(self.plist.exists())
+
+    def test_removed_workers_open_runs_do_not_hold_the_timer(self):
+        self.empty_the_pool()
+        self.assertTrue(wi.current(self.ws, WID).get("incarnation_id"))
+        self.assertTrue(self.withdraw()["removed"])
+
     def test_an_uninstall_failure_is_reported_not_raised(self):
         self.empty_the_pool()
         with mock.patch.object(pm.prt, "uninstall", side_effect=RuntimeError("bootout failed")):
