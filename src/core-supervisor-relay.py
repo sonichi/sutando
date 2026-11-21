@@ -374,12 +374,15 @@ def _save_last_hash(state_file, h):
 
 
 def run_cycle(signal, state_file, *, macos=True, source="", channel="", dry_run=False,
-              outcome=None):
+              outcome=None, alert_target=None):
     """One escalation cycle. Returns the message emitted, or None if suppressed.
-    `outcome`, when given, receives "undelivered": the reason nothing landed, or None."""
+    `outcome`, when given, receives "undelivered": the reason nothing landed, or None.
+    `alert_target` (source, channel) replaces the target for a hard blocker only."""
     escalate, new_hash = should_escalate(signal, _load_last_hash(state_file))
     if not escalate:
         return None
+    if alert_target and signal.get("state") in HARD_ESCALATE:
+        source, channel = alert_target
     msg = compose_message(signal, surface=source)
     if dry_run:
         return msg
@@ -516,6 +519,29 @@ def resolve_active_target(activity_path):
     return "", ""
 
 
+def resolve_owner_dm_target(activity_path, source=""):
+    """(source, owner DM room) for a blocked-on-you alert, or None when no owner DM is known.
+    A blocker is for the owner alone, so it never follows the last-active shared room.
+    ("", "") when the DM is known but not the core's to post in: macOS-only."""
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from owner_room_access import owner_routing, owner_dm  # noqa: PLC0415
+        dm = owner_dm(owner_routing(Path(activity_path).resolve().parent.parent))
+    except Exception as exc:  # routing is best-effort; never block the alert
+        print(f"core-supervisor-relay: owner DM unreadable ({exc})", file=sys.stderr)
+        return None
+    if not dm.startswith("!"):
+        return None
+    src = "ag2space" if source in ("", "discord", "slack", "telegram") else source
+    if not _is_deliverable(src, dm):
+        return None
+    # A refused DM is still the only place for a blocker: silence, not the shared room.
+    if not _core_may_speak(activity_path, dm):
+        return "", ""
+    return src, dm
+
+
 def _core_may_speak(activity_path, channel) -> bool:
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -571,8 +597,13 @@ def main(argv=None):
 
     # Explicit --notify-* wins; else auto-resolve the owner's active channel.
     source, channel = a.notify_source, a.notify_channel
+    alert_target = None
     if not (source and channel) and a.active_from:
         source, channel = resolve_active_target(a.active_from)
+        alert_target = resolve_owner_dm_target(a.active_from, source)
+        if alert_target is None:
+            print("core-supervisor-relay: no owner DM known; blocker alert follows the "
+                  "last-active channel", file=sys.stderr)
     if source and channel and _delivery_route(source, channel) is None:
         fallback = "macOS disabled, nothing to escalate to" if not macos \
             else "escalating by macOS notification only"
@@ -596,7 +627,8 @@ def main(argv=None):
             print(line)
     outcome = {}
     msg = run_cycle(signal, a.state_file, macos=macos,
-                    source=source, channel=channel, dry_run=a.dry_run, outcome=outcome)
+                    source=source, channel=channel, dry_run=a.dry_run, outcome=outcome,
+                    alert_target=alert_target)
     if msg and outcome.get("undelivered"):
         if _should_log_undelivered(a.state_file, outcome.get("hash")):
             print(f"not delivered: {outcome['undelivered']} (will retry): {msg}")

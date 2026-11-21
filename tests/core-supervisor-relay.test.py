@@ -841,6 +841,129 @@ class TestResolveActiveTarget(unittest.TestCase):
 
 
 
+class TestBlockerAlertGoesToOwnerDm(unittest.TestCase):
+    """A blocked-on-you alert goes to the owner's own DM, never the last-active shared room."""
+
+    ROOM, DM = "!shared:ag2.space", "!dm:ag2.space"
+
+    def _ws(self, td, dm=True, owner_dm=None):
+        st = os.path.join(td, "state")
+        os.makedirs(st, exist_ok=True)
+        act = os.path.join(st, "last-owner-activity.json")
+        with open(act, "w") as f:
+            json.dump({"channel": "ag2space", "channel_id": self.ROOM}, f)
+        if dm:
+            with open(os.path.join(st, "owner-routing.json"), "w") as f:
+                json.dump({"owner_dm": owner_dm or self.DM, "private": True}, f)
+        sig = os.path.join(st, "core-supervisor.json")
+        return act, sig
+
+    def _run(self, td, state, dm=True, owner_dm=None):
+        act, sig = self._ws(td, dm, owner_dm)
+        with open(sig, "w") as f:
+            json.dump({"state": state, "prompt": "p", "kind": "x"}, f)
+        sent = []
+        with patch.object(_mod, "_channel_notify",
+                          lambda m, s, c, extra=None: sent.append((s, c)) or True):
+            _mod.main(["--signal", sig, "--active-from", act, "--no-macos", "--no-seats",
+                       "--state-file", os.path.join(td, "st")])
+        return sent
+
+    def test_blocker_goes_to_owner_dm(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(self._run(td, "blocked-human"), [("ag2space", self.DM)])
+
+    def test_no_owner_dm_keeps_last_active_room(self):
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(self._run(td, "blocked-human", dm=False), [("ag2space", self.ROOM)])
+
+    def test_an_owner_dm_with_no_route_keeps_last_active_room(self):
+        # A room id naming no server has no gateway route: the blocker must not be
+        # addressed to it, and the alert still goes out.
+        with tempfile.TemporaryDirectory() as td:
+            self.assertEqual(self._run(td, "blocked-human", owner_dm="!nodomain"),
+                             [("ag2space", self.ROOM)])
+
+    def test_unreadable_owner_routing_still_delivers_the_blocker(self):
+        # Routing is best-effort: a lookup that raises must not swallow the alert,
+        # and the operator is told why the owner DM was not used.
+        import owner_room_access
+
+        def unreadable(_workspace):
+            raise RuntimeError("routing store unavailable")
+
+        with tempfile.TemporaryDirectory() as td:
+            err = io.StringIO()
+            with patch.object(owner_room_access, "owner_routing", unreadable), \
+                    contextlib.redirect_stderr(err):
+                sent = self._run(td, "blocked-human")
+            self.assertEqual(sent, [("ag2space", self.ROOM)])
+            self.assertIn("owner DM unreadable", err.getvalue())
+            self.assertIn("routing store unavailable", err.getvalue())
+
+    WID = "39041ce6a4444e28bf94859ec2426270"
+
+    def _bind(self, td, room, liveness):
+        """Bind `room` to a worker: "alive", "dead", "unknown" (no sentinel) or "malformed"."""
+        st = os.path.join(td, "state")
+        os.makedirs(st, exist_ok=True)
+        with open(os.path.join(st, "bindings.json"), "w") as f:
+            f.write("{not json" if liveness == "malformed"
+                    else json.dumps({"bindings": {room: self.WID}}))
+        pid = {"alive": os.getpid(), "dead": 2**22 - 7}.get(liveness)
+        if pid is not None:
+            with open(os.path.join(st, f"watch-tasks-stream-{self.WID}.pid"), "w") as f:
+                f.write(f"{pid}\n")
+
+    def _refused(self, liveness, owner_dm=None):
+        with tempfile.TemporaryDirectory() as td:
+            self._bind(td, owner_dm or self.DM, liveness)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                sent = self._run(td, "blocked-human", owner_dm=owner_dm)
+            return sent, err.getvalue()
+
+    def test_owner_dm_bound_to_an_alive_worker_gets_nothing(self):
+        sent, err = self._refused("alive")
+        self.assertEqual(sent, [])
+        self.assertIn(f"not posting to {self.DM}", err)
+
+    def test_owner_dm_bound_to_a_worker_of_unknown_liveness_gets_nothing(self):
+        sent, err = self._refused("unknown")
+        self.assertEqual(sent, [])
+        self.assertIn("UNKNOWN", err)
+
+    def test_malformed_bindings_send_nothing(self):
+        sent, err = self._refused("malformed")
+        self.assertEqual(sent, [])
+        self.assertIn("bindings unreadable", err)
+
+    def test_refused_room_that_is_both_last_active_and_owner_dm_gets_nothing(self):
+        for liveness in ("alive", "unknown", "malformed"):
+            with self.subTest(liveness=liveness):
+                self.assertEqual(self._refused(liveness, owner_dm=self.ROOM)[0], [])
+
+    def test_bindings_that_leave_the_owner_dm_free_still_deliver(self):
+        # Positive controls: another room bound, and the DM bound to a dead worker.
+        for room, liveness in ((self.ROOM, "alive"), (self.DM, "dead")):
+            with self.subTest(room=room, liveness=liveness), \
+                    tempfile.TemporaryDirectory() as td:
+                self._bind(td, room, liveness)
+                self.assertEqual(self._run(td, "blocked-human"), [("ag2space", self.DM)])
+
+    def test_soft_notice_keeps_last_active_room(self):
+        with tempfile.TemporaryDirectory() as td:
+            act, sig = self._ws(td)
+            with open(sig, "w") as f:
+                json.dump({"state": "healthy", "auto_answered": {"kind": "fable-limit", "at": 1}}, f)
+            sent = []
+            with patch.object(_mod, "_channel_notify",
+                              lambda m, s, c, extra=None: sent.append((s, c)) or True):
+                _mod.main(["--signal", sig, "--active-from", act, "--no-macos", "--no-seats",
+                           "--state-file", os.path.join(td, "st")])
+            self.assertEqual(sent, [("ag2space", self.ROOM)])
+
+
 class TestChannelEnvContainmentDelegation(unittest.TestCase):
     """The probe (_is_deliverable) must call the shared
     src/channel_env_containment.py function, not carry its own copy of the
