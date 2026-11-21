@@ -1074,6 +1074,82 @@ class WatcherChild(SeatCase):
         w.p.kill()
         w.p.wait()
 
+    def announcing(self, wake):
+        """A watcher that announces a task once `<tmp>/announce-<task file>` exists."""
+        box = Path(self.tmp.name)
+        return seat_mod.Watcher(str(self.tasks), wake, script=self.script(
+            f'while :; do for f in "{box}"/announce-*; do [ -e "$f" ] || continue; '
+            'echo "TASK_FILE: ${f##*/announce-}"; rm -f "$f"; done; sleep 0.05; done\n'))
+
+    def announce(self, s, name: str):
+        (Path(self.tmp.name) / f"announce-{name}").touch()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and name not in s.watcher.announced:
+            time.sleep(0.02)
+        self.assertIn(name, s.watcher.announced)
+
+    def test_the_core_runs_a_task_only_once_the_watcher_announces_it(self):
+        # The task file lands a moment before the pool's router gives it to a worker. Read straight
+        # from the inbox, the core ran it and so did the worker: two answers to one message.
+        s = self.make()
+        s.ensure_server()
+        s.watcher = self.announcing(s.wake)
+        s.watcher.ensure()
+        self.addCleanup(s.watcher.stop)
+        self.task("task-bound.txt")
+        self.task("task-core.txt")
+        self.assertIsNone(s.step(), "neither is the core's yet")
+        self.assertEqual(self.sent("turn/start"), [])
+        # The router gives the first to its worker; the watcher announces only the second.
+        held = self.ws / "deliveries" / "w1"
+        held.mkdir(parents=True)
+        (held / "task-bound.txt").touch()
+        self.announce(s, "task-core.txt")
+        self.assertEqual(s.step(), "done")
+        self.assertIsNone(s.step())
+        self.assertEqual(len(self.sent("turn/start")), 1)
+        self.assertTrue(task_dispatch.has_ready_result(self.results, "task-core.txt"))
+        self.assertFalse(task_dispatch.has_ready_result(self.results, "task-bound.txt"))
+
+    def test_an_announcement_naming_a_path_is_kept_by_its_file_name(self):
+        s = self.make()
+        s.watcher = self.announcing(s.wake)
+        s.watcher.ensure()
+        self.addCleanup(s.watcher.stop)
+        self.task("task-1.txt")
+        (Path(self.tmp.name) / "announce-task-1.txt").touch()
+        self.assertTrue(s.wake.wait(10))
+        self.assertEqual([name for name, _ in s.pending()], ["task-1.txt"])
+        # A task that has left the inbox is forgotten with it.
+        (self.tasks / "task-1.txt").unlink()
+        self.assertEqual(s.pending(), [])
+        self.assertEqual(s.watcher.announced, set())
+        w = seat_mod.Watcher(str(self.tasks), threading.Event(), script=self.script(
+            'echo "TASK_FILE: /some/where/task-9.txt"\nexec sleep 300\n'))
+        w.ensure()
+        self.addCleanup(w.stop)
+        self.assertTrue(w.wake.wait(10))
+        self.assertEqual(w.announced, {"task-9.txt"})
+
+    def test_with_no_watcher_a_declared_handler_holds_the_cores_tasks_and_none_declared_does_not(self):
+        s = self.make()
+        s.ensure_server()
+        self.task("task-1.txt")
+        declared = self.ws / "state" / "task-event-handler.json"
+        declared.parent.mkdir(parents=True, exist_ok=True)
+        declared.write_text('{"handler": "/abs/pool_route_handler.py"}')
+        self.assertIsNone(s.step())
+        self.assertIsNone(s.step())
+        self.assertEqual(self.out.getvalue().count("pending task(s) held"), 1, "said once")
+        self.assertEqual(self.sent("turn/start"), [])
+        # A watcher that has exited is no watcher.
+        s.watcher = seat_mod.Watcher(str(self.tasks), s.wake, script=self.script("exit 0\n"))
+        s.watcher.ensure()
+        s.watcher.p.wait(10)
+        self.assertIsNone(s.step())
+        declared.unlink()
+        self.assertEqual(s.step(), "done", "nothing to route: every pending task is the core's")
+
     def test_serve_keeps_the_watcher_running_and_picks_up_a_task_it_announces(self):
         s = self.make(poll_s=30)
         # The task arrives once the seat is idle and is announced once it is there: fixed delays
@@ -1137,6 +1213,9 @@ class CommandLine(SeatCase):
 
             def ensure(self):
                 made.append("ensure")
+
+            def alive(self):
+                return False
 
             def stop(self):
                 made.append("stop")
