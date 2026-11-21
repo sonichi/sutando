@@ -150,10 +150,14 @@ def stop_sessions(workspace, worker_id, *, runner=subprocess.run) -> dict:
     return out
 
 
-def _take_down(workspace, wid, runner) -> dict:
+def _take_down(workspace, wid, runner, *, unless_owed=None) -> dict:
     """Pause, kill, close the run. The pause lands under the remedy's lock first, so a
-    sweep in flight cannot restart what is being stopped."""
+    sweep in flight cannot restart what is being stopped. `unless_owed` (a reseat's) is asked
+    again under that lock: work it names leaves the seat running, returned under `owed`."""
     with rem.pool_lock(workspace, STOP_LOCK_WAIT_S):
+        owed = unless_owed() if unless_owed else []
+        if owed:
+            return {"sessions": {}, "closed_runs": [], "down": False, "owed": owed}
         sup.set_paused(workspace, wid, True)
         sessions = stop_sessions(workspace, wid, runner=runner)
         down = all(v != "unknown" for v in sessions.values())
@@ -267,11 +271,12 @@ def reseat(workspace, repo, target, *, runner=subprocess.run, spawn=None) -> dic
         return {**base, "result": "skipped", "why": "no seat running; its next start applies the change"}
     _not_self(wid, False)
     owed = _owes(workspace, wid)
-    if owed:
+    t = None if owed else _take_down(workspace, wid, runner, unless_owed=lambda: _owes(workspace, wid))
+    if owed or t.get("owed"):
+        owed = owed or t["owed"]
         return {**base, "result": "deferred", "owed": owed,
                 "why": f"it owes {len(owed)} task(s), so its seat was left running as before; once they are "
                        f"done, run: pool_manage.py reseat {wid}"}
-    t = _take_down(workspace, wid, runner)
     if not t["down"]:
         return {**base, "result": "failed", "sessions": t["sessions"],
                 "why": "tmux could not confirm the seat gone; the worker is stopped: run pool_manage.py enable"}

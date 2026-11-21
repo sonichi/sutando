@@ -10,6 +10,7 @@ Run: python3 tests/skills/worker-pool/worker-model.test.py
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import io
 import json
@@ -175,7 +176,7 @@ class SetModel(Base):
 
     def assert_deferred(self, owed):
         rc, out = self.main("set-model", WID, "sonnet")
-        self.assertEqual((rc, out["result"], out["apply"]["result"], out["apply"]["owed"]),
+        self.assertEqual((rc, out["result"], out["apply"]["result"], out["apply"].get("owed")),
                          (0, "recorded", "deferred", owed))
         self.assertEqual(self.row()["model"], "sonnet")
         self.assertEqual((self.tmux.killed(), self.started), ([], []))
@@ -211,6 +212,19 @@ class SetModel(Base):
         self.assertIn("cannot tell what", out["apply"]["why"])
         self.assertEqual(self.row()["model"], "sonnet")
         self.assertEqual((self.tmux.killed(), self.started), ([], []))
+
+    def test_a_task_arriving_while_the_restart_waits_for_the_pool_lock_keeps_it_running(self):
+        tasks, _ = self.own_folders()
+        real_lock = rem.pool_lock
+
+        @contextlib.contextmanager
+        def lock_then_arrival(*a, **kw):
+            with real_lock(*a, **kw):
+                (tasks / "task-z.txt").write_text("id: task-z\ntask: hi\n")
+                yield
+        with mock.patch.object(rem, "pool_lock", lock_then_arrival):
+            self.assert_deferred(["task-z"])
+        self.assertFalse(pm.sup.is_paused(self.ws, WID))
 
     def test_a_shared_delivery_kept_after_a_move_to_its_own_folders_keeps_it_running(self):
         for d in ("tasks", "results"):
