@@ -270,6 +270,25 @@ test('a submit still pending because a main turn began is not a timeout: it is n
   expect(h.trail.some((l) => l.endsWith('submit #1 ok'))).toBe(true)
 })
 
+test('session end releases a send that waits behind a main turn: nothing stays pending and nothing is sent again', async () => {
+  const h = setup({ submitDelays: [Infinity] })
+  await h.clock.advance(0)
+  h.children[0].out('TASK_FILE: task-1.txt\nQUEUE: 0 pending after this\n')
+  await h.clock.advance(1_000)
+  h.w.turnStart()
+  await h.clock.advance(60_000)
+  let over = false
+  void h.w.flush().then(() => { over = true })
+  await h.clock.advance(0)
+  expect(over).toBe(false)
+  h.w.end('prompt_input_exit')
+  await h.clock.advance(0)
+  expect(over).toBe(true)
+  await h.clock.advance(600_000)
+  expect(h.attempts.length).toBe(1)
+  expect(h.logs.some((l) => l.includes('did not start within'))).toBe(false)
+})
+
 test('a task body with instructions is never inlined: only the file name and queue count are submitted', async () => {
   const h = setup()
   await h.clock.advance(0)

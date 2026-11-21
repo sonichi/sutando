@@ -188,6 +188,8 @@ export class TaskWatch {
   end(reason: string): void {
     if (reason === 'clear' || reason === 'resume') return
     this.stopped = true
+    // A send waiting for the main turn to end is released, so no promise outlives the watch.
+    for (const wake of this.idleWaiters.splice(0)) wake()
     const child = this.child
     this.child = null
     if (child) detach(child.return(undefined))
@@ -240,8 +242,9 @@ export class TaskWatch {
           if (result || this.stopped || (!this.turnRunning && this.mainTurns === turnsBefore)) break
           this.note(`submit #${id} still pending behind a main turn; not a timeout`)
           if (this.turnRunning) result = await Promise.race([settled, new Promise<null>((wake) => { this.idleWaiters.push(() => wake(null)) })])
-          if (result) break
+          if (result || this.stopped) break
         }
+        if (!result && this.stopped) return
         if (result && result.error === null) {
           timeouts = 0
           this.note(`submit #${id} ok`)
