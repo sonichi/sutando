@@ -55,15 +55,25 @@ final message is the only answer path.
 
 ## Tiers and permissions
 
-Only the owner is served by default. Every other sender, an attested collaborator included, is refused
-with one line unless `--allow-non-owner`, which admits them all. A non-owner's turn runs on the owner's agy
-sign-in (the Google account and quota in the Keychain), and a turn whose tool call is denied can end with
-no reply.
+As Sutando does, a guest, a plain team sender (wire `guest` without the broker's `collaborator: true`)
+and any unknown tier are answered, in the isolated read-only turn below; no flag is needed. A wire `team`
+without the collaborator stamp is treated as a guest too, so it fails closed to that turn. An attested
+collaborator is refused with one line unless `--allow-non-owner`, and is then served the same isolated way.
+A non-owner's turn runs on the owner's agy sign-in (the Google account and quota in the Keychain), and a
+turn whose tool call is denied can end with no reply.
+
+The gateway writes a Sutando tier block into every non-owner task (`team_guardrail.py`). It tells a core to
+write `results/<task>.txt` and, for a guest, to delegate to `codex exec`; agy can do neither, and its final
+message is what Sparrow posts. So the adapter says those steps as "your final message" and "this turn is
+already the read-only sandbox", and keeps the scope, the DO / DO NOT lists, the trust boundary and the
+hand-off to the owner verbatim (`tier_block_lines`). The final reply is scanned by the shared bridge
+(`_guarded_result_body`) for every tier but the owner, as for any adapter.
 
 **The owner's turns** resume the room's Session in the working directory, with agy's own home
 (`~/.gemini`: its settings, rules and context).
 
-**A non-owner's turn** (anyone `--allow-non-owner` admits, collaborators included) runs isolated:
+**A non-owner's turn** (a guest, plain team, an unknown tier, or a collaborator under
+`--allow-non-owner`) runs isolated:
 
 - a fresh temporary directory per task holds the Session's working directory and a separate agy home,
   passed as `agy acp --gemini-dir <dir>`; that home has only a `settings.json` whose permission rules deny

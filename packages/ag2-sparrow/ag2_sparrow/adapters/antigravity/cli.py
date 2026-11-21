@@ -299,7 +299,8 @@ def verify(args, factory=gc.AcpClient) -> int:
     store = cfg.get("SESSION_STORE") or str(Path(cm.work_root(cfg)) / "state" / gc.SESSIONS_NAME)
     print(f"INFO sessions: {store} (the owner's resumed per room, never retired; a non-owner's turn is a "
           "throwaway session)")
-    print(f"INFO non-owner: {'served (--allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '1' else 'refused, collaborators included (owner only)'}; "
+    print(f"INFO non-owner: guests and plain team served; collaborators "
+          f"{'served (--allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '1' else 'refused'}; "
           "each turn in its own temporary directory and agy home, deny-all rules, read-only (plan) mode, "
           "no file operations")
     if cb.bridge_mode(cfg) != EXTERNAL:
@@ -336,8 +337,8 @@ def session_options(p) -> None:
     p.add_argument("--session-store", help="the sessions.json to resume from and record to (default: the work "
                    "root's state/sessions.json)")
     p.add_argument("--allow-non-owner", action="store_true",
-                   help="serve non-owner senders, attested collaborators included, on the owner's agy sign-in "
-                   "(no file operations granted; default: the owner only)")
+                   help="also serve attested collaborators, isolated and read-only like a guest (guests and "
+                   "plain team are always served so; every turn runs on the owner's agy sign-in)")
 
 
 def main(argv=None) -> int:

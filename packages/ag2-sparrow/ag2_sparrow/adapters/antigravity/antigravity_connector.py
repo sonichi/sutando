@@ -11,11 +11,14 @@ with every delivery marker neutralised. A final message of exactly NO_REPLY post
 turn failed gets a line saying so; an event that failed posts nothing.
 
 Sessions, the permission policy and the framing are acp_host's: the owner may read or edit under the working
-directory, no command is ever granted, and only the owner is served unless --allow-non-owner, which admits
-attested collaborators and other non-owners alike (task_io.admission decides the tier). A non-owner turn runs
-isolated: a fresh temporary directory per task holds its working directory and its own agy home
-(`--gemini-dir`, with deny-all permission rules and no global context), its Session is new and never stored,
-and it is refused unless agy offers a read-only (plan) session mode and accepts it. Stdlib only.
+directory, no command is ever granted. task_io.admission decides the tier. As Sutando answers every non-owner
+in a read-only sandbox, a guest, plain team and any unknown tier are always served, isolated; an attested
+collaborator is served only under --allow-non-owner, isolated too. A non-owner turn runs isolated: a fresh
+temporary directory per task holds its working directory and its own agy home (`--gemini-dir`, with deny-all
+permission rules and no global context), its Session is new and never stored,
+and it is refused unless agy offers a read-only (plan) session mode and accepts it. The gateway's Sutando tier
+block is written for a core that writes results/<task>.txt and can run `codex exec`; `tier_block_lines` says
+those steps as this Session can follow them and keeps every rule. Stdlib only.
 """
 from __future__ import annotations
 
@@ -23,6 +26,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -34,6 +38,7 @@ from ... import acp_host, held_start, result_labels, result_publish
 from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore, quoted, trigger_of  # noqa: F401
 from ...acp_client import AcpClient as _SharedClient
 from ...relay_loop import count_arg
+from ...team_guardrail import SANDBOXED_DELEGATION_CODEX
 from ...task_io import (NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock, admission, exit_code,
                         exit_on_sigterm, holder_consumer, load_done, make_dirs, parse_task, record_done,
                         release_lock, root_path, stop_requested)
@@ -94,9 +99,62 @@ def guest_turn(args):
         shutil.rmtree(base, ignore_errors=True)
 
 
+_RESULT = r"results/[^\s()`'\"]+\.txt"
+NO_RESULT_FILE = "there is no results file to write"
+# The tier block's result steps (team_guardrail.py), each said as this Session answers: by its final message.
+TIER_REWRITES = tuple((re.compile(a), b) for a, b in (
+    (r"^Write only the user-facing result to %s\.$" % _RESULT,
+     "Your final message in this turn is the user-facing result, and only that: it is what Sparrow posts (%s)."
+     % NO_RESULT_FILE),
+    (r"^Write only the sandboxed agent's safe user-facing answer to %s\.$" % _RESULT,
+     "Your final message in this turn is the safe user-facing answer, and only that: it is what Sparrow posts "
+     "(%s)." % NO_RESULT_FILE),
+    (r"write your response to %s \(delivered back to this (\w+)\)" % _RESULT,
+     "make your response your final message (Sparrow delivers it back to this \\1; %s)" % NO_RESULT_FILE),
+    (r"write exactly \[no-send\] to %s" % _RESULT, "make your final message exactly %s" % NO_REPLY),
+    (r"Write that DM as your result to %s\." % _RESULT, "Make that DM your final message."),
+))
+RESULT_RE = re.compile(_RESULT)
+TIER_BLOCK_HEADER = "===SUTANDO SYSTEM INSTRUCTIONS"
+TIER_BLOCK_END = "===END SUTANDO SYSTEM INSTRUCTIONS"
+# What replaces the guest block's Codex delegation: this turn is the read-only sandbox it asks for.
+ISOLATED_NOT_CODEX = (
+    "There is no Codex here to delegate to, and none is needed: this turn already runs isolated and read-only "
+    "(agy's plan mode, a fresh temporary home and working directory, no file, command, web or MCP tool "
+    "granted), never in the owner's core. Answer here directly. If the task needs something this turn cannot "
+    "read, say so and decline: never describe an artifact you could not read.")
+
+
+def tier_block_lines(operator_lines):
+    """The bridge-written lines with the Sutando tier block said as this Session can follow it. The block tells
+    a core to write results/<task>.txt and, for a guest, to run `codex exec`; agy can do neither (told to write
+    the file it asks to, is refused, and ends its turn with no text), and its final message is what Sparrow
+    posts. So each result step says "your final message" instead, the Codex paragraph says this turn is the
+    read-only sandbox, and any other line of the block naming a results file or `codex exec` is dropped. Every
+    other line (the scope, the DO / DO NOT lists, the trust boundary, the hand-off to the owner) is kept
+    verbatim, and so is every line outside a SUTANDO SYSTEM INSTRUCTIONS block."""
+    out, in_block = [], False
+    for line in operator_lines:
+        if line.startswith(TIER_BLOCK_HEADER):
+            in_block = True
+        elif line.startswith(TIER_BLOCK_END):
+            in_block = False
+        elif in_block:
+            if line.strip() == SANDBOXED_DELEGATION_CODEX:
+                out.append(ISOLATED_NOT_CODEX)
+                continue
+            for pattern, said in TIER_REWRITES:
+                line = pattern.sub(said, line)
+            if RESULT_RE.search(line) or "codex exec" in line:
+                continue
+        out.append(line)
+    return out
+
+
 def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_NOTE):
     event, _ = trigger_of(headers)
-    out = acp_host.task_framing(task_id, headers, message, operator_lines, "post in your final message", note)
+    out = acp_host.task_framing(task_id, headers, message, tier_block_lines(operator_lines),
+                                "post in your final message", note)
     out.append("Answer through Sparrow, exactly once for this task: your final message in this turn is what Sparrow "
                "posts%s. Write it as the post itself, with no preamble about tools or steps. To post nothing (an "
                "acknowledgement, thanks or FYI that needs no answer, or an event whose body asks for no post), make "
@@ -157,9 +215,11 @@ class Connector:
         path = os.path.join(self.args.inbox, name)
         result_file = os.path.join(self.args.results, name)
         headers, message, operator_lines = parse_task(path)
-        tier = admission(headers, self.args.allow_non_owner)
-        # A non-owner turn runs on the owner's agy sign-in, so collaborators need the opt-in too.
-        if tier is None or (tier != "owner" and not self.args.allow_non_owner):
+        # Sutando answers a guest, plain team (wire guest without the collaborator stamp) and an unknown tier
+        # (parse_task makes it guest) in a read-only sandbox; here that is guest_turn, so they need no opt-in.
+        # A wire `team` without the stamp is a guest here too: it fails closed to the isolated turn.
+        tier = admission(headers, allow_non_owner=True)
+        if tier is None or (tier == "collaborator" and not self.args.allow_non_owner):
             log("refused (non-owner) ->", task_id, headers["access_tier"])
             publish(result_file, NON_OWNER_REFUSED)
             return {"task": task_id, "status": "refused", "tier": headers["access_tier"]}
@@ -226,8 +286,8 @@ def build_parser():
     ap.add_argument("--session-store", default=None,
                     help="the sessions.json to resume from and record to (default: <work>/state/sessions.json)")
     ap.add_argument("--allow-non-owner", action="store_true",
-                    help="serve non-owner senders, attested collaborators included, on the owner's agy sign-in "
-                         "(no file operations granted; default: the owner only)")
+                    help="also serve attested collaborators, isolated and read-only like a guest (guests and "
+                         "plain team are always served so; every turn runs on the owner's agy sign-in)")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=0.2)
