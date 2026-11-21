@@ -2212,8 +2212,7 @@ def _row_dirs(row: Optional[Mapping[str, object]], workspace: Optional[Path]) ->
 def worker_dirs(worker: str, workspace: Optional[Path] = None, *,
                 strict: bool = False) -> "Optional[tuple[Path, Path]]":
     """(tasks dir, results dir) of `worker` when its identity row names an agent and `dirs: "own"`;
-    None otherwise (the worker uses the workspace's shared tasks/ and results/), or when unreadable
-    unless `strict`, which raises then: a caller that must not mistake unknown for shared."""
+    None otherwise (the shared tasks/ and results/), or when unreadable unless `strict`, which raises."""
     return _row_dirs(worker_identity(worker, workspace, strict=strict), workspace) if worker else None
 
 
