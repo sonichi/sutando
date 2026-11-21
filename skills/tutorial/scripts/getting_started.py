@@ -869,19 +869,21 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             # page is compared as a DM's but never rewritten under that guess.
             audience = known.get("audience") if known.get("audience") in AUDIENCES else "dm"
             unplaced = if_newer and bool(known) and known.get("audience") not in AUDIENCES and commons.room != dm_room
-        reuse_inputs = audience == "dm" and (not dm_room or commons.room != dm_room or private_setup)
+        native_dm = audience == "dm" and commons.room == dm_room
+        reuse_inputs = audience == "dm" and (not native_dm or private_setup)
         if if_newer and reuse_inputs and not clean_prompts(prompts, slots):
             # No one is in the loop to pass the owner's prompts again: keep the page's own.
             prompts = rooms.get(commons.room, {}).get("prompts")
         if if_newer and reuse_inputs and not role_labels(roles):
             roles = rooms.get(commons.room, {}).get("roles")
         prompts = clean_prompts(prompts, slots) if audience == "dm" else {}
-        if audience != "dm":
-            roles = None
+        if audience != "dm" or (native_dm and not private_setup):
+            prompts, roles = {}, None
         # A refresh of a room whose record is current writes nothing, so it uploads nothing either.
         current = (if_newer and known.get("state") == "complete" and bool(known.get("revision"))
                    and not newer(features.revision, known["revision"]))
-        no_upload = "--no-upload" if not upload else "record current" if current else None
+        no_upload = ("--no-upload" if not upload else "compact owner guide" if native_dm
+                     else "record current" if current else None)
         recorded, explicit = known.get("media"), media
 
         def render(skip: Optional[str]) -> tuple:
@@ -890,7 +892,7 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             shown = clean_media(record, features)
             return record, report, shown, render_page(
                 name, core, audience, agent, prompts, roles, features, shown,
-                private_setup=private_setup and audience == "dm" and commons.room == dm_room)
+                private_setup=private_setup and native_dm, native_dm=native_dm)
 
         # Until a page is about to be written it is rendered from the media already recorded or
         # given: a run that skips, keeps the page or stops on its size uploads nothing.

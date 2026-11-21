@@ -1,9 +1,12 @@
 """Presentation for the private Sutando onboarding overview."""
+import base64
 import html
 import re
 from pathlib import Path
 
 PARTS = Path(__file__).resolve().parent.parent / "assets" / "dm-overview.html"  # lint-workspace-resolution: allow-repo-root
+GUIDE = PARTS.with_name("dm-guide.html")
+SLOT = re.compile(r"{{([A-Z_]+)}}")
 TOPICS = ("Ecosystem", "Multiplayer", "Calls & Local Tools", "Commons & Tasks", "Sutando Guides")
 EXAMPLES = {
     "team project": (
@@ -69,7 +72,7 @@ def overview(style, body, name, roles):
     header = (
         '<header class="overview-hero"><div class="hero-copy">'
         '<p class="guide-label"><span class="brand-mark" aria-hidden="true">S</span> Getting started</p>'
-        f'<h1>Get started with <span>{name}</span> in s.space</h1>'
+        f'{_heading(name)}'
         '<p class="subtitle">Set up the agents you use, bring them into rooms and calls, '
         'and keep shared work in Commons.</p>'
         f'{hint}</div><div class="guide-nav"><nav class="steps-tabs" aria-label="Guide topics">'
@@ -100,3 +103,43 @@ def overview(style, body, name, roles):
     for key in ("coach", "writing"):
         rest = re.sub(rf"^    {key}: .*?\n", "", rest, flags=re.M)
     return style + skin, prefix + header + rest
+
+
+def _heading(name):
+    heading = GUIDE.read_text(encoding="utf-8").split("<h1>", 1)[1].split("</h1>", 1)[0]
+    return "<h1>" + heading.replace("{{AGENT_NAME}}", name) + "</h1>"
+
+
+def render_guide(head, marker, name, roles, prompts):
+    context = next((ROLE_CONTEXT[r.casefold()] for r in roles if r.casefold() in ROLE_CONTEXT), None)
+    cases = EXAMPLES[context] if context else (
+        "Help me connect another agent and test its first reply.",
+        "Help me summarize the decisions from a project room. Ask me which room I mean if needed.",
+        "Help me set up a voice conversation for a kickoff, if my agent and devices support it.",
+        "Help me draft a Commons page for kickoff decisions, owners and open questions. Ask where it belongs.",
+    )
+    hints = ""
+    if roles:
+        hints = f'<p class="preview-note">Picked for: {html.escape(", ".join(roles))}</p>'
+    if context:
+        hints += f'<p class="preview-note">Examples for {html.escape(context)}.</p>'
+    quick = {
+        "DM": "What can you do for me today?",
+        "COMMONS": "Help me make a team offsite plan in Commons. Ask me which room to use before sharing it.",
+        "TEAMWORK": "Research three note-taking apps for a small team, then ask another agent to review your answer if permitted.",
+        "APPS": "Connect my Google Calendar.",
+    }
+    finale = prompts.get("finale")
+    slots = {
+        "PAGE_HEAD": head,
+        "OWNER_MARKER": marker,
+        "AGENT_NAME": name,
+        "SETUP_CONTEXT": hints,
+        "APP_STORE_QR": base64.b64encode(GUIDE.with_name("dm-app-store-qr.png").read_bytes()).decode("ascii"),
+        "FINALE_CONTROL": (f'<button type="button" class="btn-nav primary guide-ask" '
+                           f'data-draft="{html.escape(finale)}" hidden>Ask for a first task</button>' if finale else ""),
+        **{f"TOPIC_{label}": html.escape(prompt)
+           for label, prompt in zip(("CONNECT", "TEAM", "CALL", "COMMONS"), cases)},
+        **{f"DRAFT_{label}": html.escape(prompts.get(label.lower(), fallback)) for label, fallback in quick.items()},
+    }
+    return SLOT.sub(lambda match: slots[match[1]], GUIDE.read_text(encoding="utf-8"))

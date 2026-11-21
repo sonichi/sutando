@@ -509,7 +509,7 @@ class SizeTest(unittest.TestCase):
         over = {f: n for f, n in files.items() if n > ASSET_CAP}
         self.assertEqual(over, {})
         hd = set(tp.hd_files(tp.FEATURES).values())
-        on_disk = {p.name for p in tp.ASSETS.iterdir() if p.suffix in (".jpg", ".png")}
+        on_disk = {p.name for p in tp.ASSETS.iterdir() if p.suffix in (".jpg", ".png") and p.name != "dm-app-store-qr.png"}
         self.assertEqual(used | hd, on_disk)  # every asset file is a fallback or an upload, none stray
         self.assertFalse(used & hd)
 

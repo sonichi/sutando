@@ -243,7 +243,7 @@ class AllRoomsTest(_Rooms):
         self.assertNotIn("audience", self.entries()[ROOMS[0]])
         self.assertEqual(got[ROOMS[1]]["action"], "updated")
         self.assertEqual((self.page(ROOMS[1]), self.entries()[ROOMS[1]]["audience"]),
-                         (tp.render_page("Blue", "codex", "dm", ME), "dm"))
+                         (tp.render_page("Blue", "codex", "dm", ME, native_dm=True), "dm"))
 
 
 if __name__ == "__main__":

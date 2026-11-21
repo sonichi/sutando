@@ -6,28 +6,29 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
   `notes/first-time-tutorial.md` and deliver it one brief, voice-friendly section at a time,
   waiting for the user to try each step.
 - **s.space mode.** Right after the first-contact greeting in the owner's DM, the skill creates
-  one "Getting started" HTML page (Room Commons) in that DM, a four-topic overview with an optional step-by-step checklist, and summons the owner to it. A marker under `<workspace>/state/tutorial/` keeps it to one page per room, so
+  one "Getting started" HTML page (Room Commons) in that DM, with an optional checklist,
+  and summons the owner to it. A marker under `<workspace>/state/tutorial/` keeps it to one page per room, so
   a re-link or reinstall refreshes the page instead of adding another.
 
 ## Product overview
 
-The owner DM opens on four shared topics plus **Sutando Guides**. The general explanations stay stable;
-each shared topic has one example to try. When the current room, owner and agent match the saved
-setup record, the banner uses the agent's display name and supported selections such as Designer or
-Product Manager pick vetted examples. Missing or unrecognized setup details keep the overview
-generic. Nothing reads account connections, room history or private files to build the page.
+The onboarding DM opens on four shared topics plus **Sutando Guides**. Each suggested action
+opens a draft the reader can edit. **Choose my agent** lists their own agents in a supported
+Commons client; **Review & send** hands the edited text to the host, which shows a separate
+confirmation. Only confirming in the host sends the message. The guide never connects apps,
+starts calls, schedules work, or submits drafts by itself. The App Store link and QR are real
+install affordances. Phone sign-in and pairing are one checklist step.
 
-The [standalone four-topic guide](../skills/tutorial/assets/getting-started.html) remains generic.
-Topic selectors are demonstrations: they do not connect accounts, change access, start calls or
-schedule work. Copy falls back to selecting the prompt when the clipboard is unavailable. Open
-**Try it step by step** for the original personalized ten-step checklist.
+The banner and examples use the agent display name and recognized onboarding roles only when the
+published room, owner and agent match the saved setup record. Validated explicit draft overrides
+stay in that destination; a mismatch renders a generic guide without recalled roles or prompts.
+No account connection, room-history or file lookup is added. A client without the supported
+bridge can read the guide, but does not show inoperative messaging buttons.
 
-## Using the ten-step owner tour
-
-The labelled step navigator lets readers jump directly to a topic instead of guessing a number.
-Use Back and Next for the guided path, Show all for a reference view, and Copy for an example
-prompt. Completion is per viewer when the Commons runtime supplies a viewer identity; otherwise
-it uses browser-local storage, falling back to memory when storage is unavailable.
+The onboarding checklist uses per-viewer Commons progress when the runtime provides it, otherwise
+local storage or memory. Completion from the former install or pairing row counts for the
+combined mobile row. The [standalone four-topic guide](../skills/tutorial/assets/getting-started.html)
+and the separate explicit reference flow retain their own checklist and controls.
 
 The layout uses the s.space orange, yellow and pink gradient pairs with ink/offwhite surfaces.
 Avantt SemiBold and Haas Recast are named in the font stack, with system-font fallbacks; no
@@ -38,7 +39,9 @@ wraps on narrow screens, and reduced-motion and dark-mode preferences are respec
 
 - **The feature list.** The steps come from `skills/tutorial/feature-list.json` (one step per
   feature: title, two body parts, where to try it, a paste prompt, screenshots, the release that
-  added it, and optionally the repo paths it `watches`). A watched path that changes in a release
+  added it, and optionally the repo paths it `watches`). This list describes the reference tour;
+  the compact onboarding layout deliberately keeps its nine approved goals and the App Store QR.
+  A watched path that changes in a release
   without a revision bump or a matching `reviewed_at` makes the release audit warn
   (`docs/release-process.md` §4.2). `--list <file|https URL>` swaps the list; nothing is fetched by default, only https
   is fetched (redirects included), a list is at most 1 MiB and 24 steps, and a list that does not
@@ -87,7 +90,8 @@ wraps on narrow screens, and reduced-motion and dark-mode preferences are respec
   Room Commons call, and refuses to run without one: the page's ownership tag is how a later run
   finds it. A revision-only bump of the list rewrites the page once (its tag records the revision)
   and the next `--if-newer` is a no-op.
-- **Screenshots.** Each screenshot is a Room Commons asset reference: `publish` uploads its
+- **Screenshots.** The compact onboarding guide inlines only the App Store QR. In the reference
+  tour, each screenshot is a Room Commons asset reference: `publish` uploads its
   full-resolution `hd_file` to the room's media (`room.media.upload`, an operation id per room and
   file hash, never in an encrypted room), records `{asset: {mxc, sha256}}` and re-uploads only a
   changed file; the page points at that `mxc://` (or one from `--media`) and inlines the bundled
@@ -95,9 +99,10 @@ wraps on narrow screens, and reduced-motion and dark-mode preferences are respec
   run that skips, keeps an edited page or stops on the page's size uploads nothing. Every page
   variant stays under 300 KB.
 
-Last verified: navigation and responsive polish, 2026-11-19 in Chromium at 1280, 390 and 320 pixels,
-including light/dark mode, Show all, step navigation, copying and completion after reload.
-Existing screenshot assets were not recaptured in that pass.
+Last verified: the interactive onboarding flow is covered by an offline mock of recipient discovery, editing,
+confirmation and failure. A live send, pairing, and existing install refresh are not verified
+here. Earlier reference-flow browser checks covered navigation and progress at 1280, 390 and
+320 pixels in light and dark mode.
 
 Earlier publishing verification: 2026-10-31, against `tests/tutorial-feature-list.test.py` and
 `tests/tutorial-getting-started.test.py`. The screenshot upload and the HTML-surface rendering of

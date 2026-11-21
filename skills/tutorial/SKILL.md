@@ -55,7 +55,8 @@ not retry the page in the same turn.
    `dm`, `commons`, `teamwork`, `apps`, `finale`. Write 4–5 of them.
    - Each is first person, practical, one line, at most 200 characters, with no links or markup.
    - Each must run on a fresh install: only the `apps` slot may assume a connected app.
-   - The slot decides where the prompt is pasted (your DM or a room), not the wording.
+   - The onboarding guide opens each prompt as an editable private agent draft. A prompt about
+     a room should ask which room to use and leave sharing to a later confirmation.
 
    Pass the file as `--prompts <file>`, and pass the `I picked:` payload verbatim as
    `--roles "Founder, Product Manager."` (the whole line, `I picked:` included, works too). Do not

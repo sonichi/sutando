@@ -54,7 +54,7 @@ class OverviewTest(unittest.TestCase):
         self.assertNotIn("main design tradeoff", fallback)
         unknown = tour_page.render_page("A&B", roles="<script>bad()</script>", private_setup=True)
         self.assertNotIn("bad()", unknown)
-        self.assertIn("Talk through this idea with me", unknown)
+        self.assertIn("Help me set up a voice conversation for a kickoff", unknown)
         room = tour_page.render_page("A&B", audience="room", roles="Designer",
                                     prompts={"dm": "Private agenda"}, private_setup=True)
         for text in ("A&amp;B", "Designer", "Private agenda", 'id="step-4"'):
@@ -76,10 +76,10 @@ class OverviewBehaviourTest(unittest.TestCase):
     def test_denied_clipboard_selects_prompt_and_next_focuses_heading(self):
         self.check_behaviour(PAGE)
 
-    def test_published_page_opens_overview_and_preserves_checklist(self):
+    def test_reference_page_opens_overview_and_preserves_checklist(self):
         with tempfile.TemporaryDirectory() as tmp:
             rendered = Path(tmp) / "tutorial.html"
-            page = tour_page.render_page("Test Agent", agent="@test:example.test", private_setup=True)
+            page = tour_page.render_page("Test Agent", agent="@test:example.test")
             self.assertTrue(tour_page.page_digest_ok(page))
             rendered.write_text(page)
             self.check_behaviour(rendered, embedded=True)
@@ -156,7 +156,8 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
   if (checklist) {
     result.names = [...d.querySelectorAll('.tab-btn')].map(x => x.lastElementChild.textContent);
     d.querySelector('.tab-btn:last-child').click();
-    d.querySelector('#step-4 [onclick^="setGuide(3"]').click();
+    [...d.querySelectorAll('#step-4 button[onclick]')]
+      .find(button => button.getAttribute('onclick').startsWith('setGuide(3')).click();
     result.guidePrompt = d.querySelector('#sutando-example').textContent;
   }
   result.errors = errors;
@@ -206,7 +207,7 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
             self.assertEqual(out["label"], "Try it step by step")
             self.assertTrue(out["opens"])
             self.assertEqual(out["stepCount"], 10)
-            self.assertEqual(out["personalized"], "Get started with Test Agent in s.space")
+            self.assertEqual(out["personalized"], "Get started with your agent in s.space")
             self.assertTrue(out["done"])
             self.assertEqual(out["saved"], ["dm"])
             self.assertTrue(out["doneAfterReopen"])

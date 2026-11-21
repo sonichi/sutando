@@ -787,7 +787,7 @@ class AssetTest(unittest.TestCase):
         used = {shot.file for s in tp.sections_for("claude") for shot in s.images}
         files = {name: (tp.ASSETS / name).stat().st_size for name in used}  # the inlined fallbacks
         hd = {shot.hd for s in tp.sections_for("claude") for shot in s.images if shot.hd}
-        on_disk = {p.name for p in tp.ASSETS.iterdir() if p.suffix in (".jpg", ".png")}
+        on_disk = {p.name for p in tp.ASSETS.iterdir() if p.suffix in (".jpg", ".png") and p.name != "dm-app-store-qr.png"}
         self.assertEqual(used | hd, on_disk)
         self.assertTrue(all(size <= 60_000 for size in files.values()), files)
         self.assertLessEqual(sum(files.values()), 500_000)
@@ -1056,8 +1056,9 @@ class MainTest(unittest.TestCase):
         self.assertIn("Examples for team project.", page)
 
     def test_command_line_overrides_the_inputs_file(self):
-        self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test", "roles": "Founder"})
-        code, out, _ = self.main("publish", "--name", "Blue", "--core", "codex", "--owner", "@other:example.test",
+        self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test", "roles": "Founder",
+                          "agent_mxid": "@kai.agent:example.test"})
+        code, out, _ = self.main("publish", "--name", "Blue", "--core", "codex", "--owner", "@owner:example.test",
                                  "--roles", "Sales", "--room-commons", str(self.stub),
                                  "--agent-mxid", "@kai.agent:example.test")
         self.assertEqual(code, 0)
@@ -1075,6 +1076,35 @@ class MainTest(unittest.TestCase):
         self.assertNotIn("Picked for:", page)
         self.assertNotIn("Examples for team project.", page)
         self.assertIn("Get started with <span>your agent</span> in s.space", page)
+
+    def test_refresh_on_owner_mismatch_does_not_reuse_private_content(self):
+        self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test",
+                          "agent_mxid": "@kai.agent:example.test", "roles": "Founder"})
+        previous = self.tmp / "previous.json"
+        feature_data = json.loads(gs.LIST_PATH.read_text())
+        previous.write_text(json.dumps({**feature_data, "revision": "tutorial.2026-11-20.3"}))
+        prompts = self.tmp / "prompts.json"
+        prompts.write_text(json.dumps({"dm": "Write my fictional private agenda."}))
+        common = ("publish", "--name", "Example Test Agent", "--core", "codex",
+                  "--room-commons", str(self.stub))
+        code, out, _ = self.main(*common, "--list", str(previous), "--prompts", str(prompts))
+        self.assertEqual(code, 0)
+        kind = json.loads(out)["kind"]
+        page = self.room_state()["pages"][kind]
+        self.assertIn("Example Test Agent", page)
+        self.assertIn("Picked for: Founder", page)
+        self.assertIn("Write my fictional private agenda.", page)
+        newer_list = self.tmp / "newer.json"
+        newer_list.write_text(json.dumps({**feature_data, "revision": "tutorial.2026-12-01.1"}))
+        code, out, _ = self.main(*common, "--owner", "@other:example.test", "--if-newer",
+                                 "--list", str(newer_list))
+        result = json.loads(out)
+        self.assertEqual((code, result["kind"], result["action"]), (0, kind, "updated"))
+        page = self.room_state()["pages"][kind]
+        for private in ("Example Test Agent", "Picked for: Founder", "Write my fictional private agenda."):
+            self.assertNotIn(private, page)
+        self.assertIn('id="guide-draft"', page)
+        self.assertTrue(gs.page_digest_ok(page))
 
     def test_owner_and_roles_stay_in_the_inputs_room(self):
         self.save_inputs({"room": self.ROOM, "owner": "@owner:example.test", "roles": "Founder"})

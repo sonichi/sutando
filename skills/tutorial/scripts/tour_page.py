@@ -868,7 +868,7 @@ def read_marker(text: str) -> Optional[Tuple[str, Optional[str]]]:
 def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: Optional[str] = None,
                 prompts: object = None, roles: object = None,
                 features: Optional[FeatureList] = None, media: object = None,
-                *, private_setup: bool = False) -> str:
+                *, private_setup: bool = False, native_dm: bool = False) -> str:
     """The whole page as one HTML string; depends on nothing but its arguments: the agent's name,
     core, audience, mxid (the ownership marker, which also records the list's revision), per-slot
     prompts (`clean_prompts`), the owner's onboarding roles, the feature list (the skill's own by
@@ -885,6 +885,13 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
     if audience not in AUDIENCES:
         raise ValueError(f"audience must be one of {', '.join(AUDIENCES)}, got {audience!r}")
     who = html.escape(clean_name(name)) if audience == "dm" else "your agent"
+    marker = owner_marker(agent, features.revision, DIGEST_SLOT) if agent else ""
+    if audience == "dm" and (native_dm or private_setup):
+        from personalized_overview import render_guide
+
+        page = render_guide(PAGE_HEAD, marker, who if private_setup else "your agent",
+                            labels if private_setup else (), prompts if private_setup else {})
+        return _finish_page(page, agent)
     lead = ("One room for people and their agents. "
             + (f"A quick tour with your personal native agent, {who}. Try one thing in each part."
                if audience == "dm" else "A quick tour. Try one thing in each part."))
@@ -902,7 +909,7 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
         checklist_header = picked
     page = (
         f"{PAGE_HEAD}"
-        f"{owner_marker(agent, features.revision, DIGEST_SLOT) if agent else ''}"
+        f"{marker}"
         f"<title>{PAGE_TITLE}</title>{HEAD_SCRIPT}{STYLE % {'darkvars': DARK}}{overview_style}</head><body>"
         "<main id=\"tour\" data-mode=\"step\">"
         f"{overview_body}"
@@ -922,6 +929,10 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
         f"{_finale(who, prompts)}{body}<div id=\"status\" class=\"sr-only\" role=\"status\" aria-live=\"polite\"></div></details>"
         f"{PAGE_TAIL}"
     )
+    return _finish_page(page, agent)
+
+
+def _finish_page(page: str, agent: Optional[str]) -> str:
     if agent:  # the tag's digest covers the whole page with the digest itself blanked
         page = page.replace(f'data-digest="{DIGEST_SLOT}"',
                             f'data-digest="{hashlib.sha256(page.encode("utf-8")).hexdigest()}"', 1)
