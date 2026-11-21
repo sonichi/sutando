@@ -22,7 +22,6 @@ A route that does not go through this module has no gate.
 """
 from __future__ import annotations
 
-import hmac
 import ipaddress
 import os
 import secrets
@@ -31,6 +30,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+from secret_compare import secret_equal
 from workspace_default import status_read_path
 
 LOCAL_API_TOKEN_NAME = "agent-api.token"
@@ -184,9 +184,7 @@ def bearer_matches(authorization: str, expected: str) -> bool:
     presented = (authorization or "").strip()
     if presented.lower().startswith("bearer "):
         presented = presented[7:].strip()
-    if not expected or not presented:
-        return False
-    return hmac.compare_digest(presented.encode("utf-8", "replace"), expected.encode("utf-8", "replace"))
+    return secret_equal(presented, expected)
 
 
 def bearer_request_allowed(origin, host, authorization, *, expected_token: str,

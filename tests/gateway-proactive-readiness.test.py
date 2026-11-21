@@ -37,7 +37,8 @@ from ag2_sparrow import result_ready  # noqa: E402
 
 ROOM = "!ReadyRoomAbCdEf:ag2.space"
 HEAD = f"[channel: {ROOM}]\n" + "H" * 200 + "\n"
-TAIL = "B" * 2575 + "\n"
+# Not hex: a redirected proactive is secret-scanned, and a bare hex run reads as a token.
+TAIL = "Q" * 2575 + "\n"
 FAILS: list[str] = []
 
 
@@ -100,7 +101,7 @@ def main() -> int:
     if f.exists():
         os.utime(f, (f.stat().st_atime, f.stat().st_mtime - 5))
     posts = drain(tmp)
-    check(len(posts) == 1 and posts[0].endswith("B" * 2575), f"b) the settled file posts whole, got {[len(p) for p in posts]}")
+    check(len(posts) == 1 and posts[0].endswith("Q" * 2575), f"b) the settled file posts whole, got {[len(p) for p in posts]}")
     check(not f.exists(), "b) and is retired after delivery")
 
     # c) Addressed at the peek, truncated before the claim: hand back, never post.

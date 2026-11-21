@@ -17,7 +17,7 @@ import uuid
 from pathlib import Path
 
 from . import local_task_protocol, result_disposal, task_priority
-from .task_io import (NON_OWNER_REFUSED, admission, is_collaborator, load_done, non_owner_note,  # noqa: F401
+from .task_io import (AUDIENCE_RULE, NON_OWNER_REFUSED, admission, is_collaborator, load_done, non_owner_note,  # noqa: F401
                       parse_task, record_done, stop_requested, stoppable_sleep, write_atomic)
 
 TEXT_MAX = 65536
@@ -39,8 +39,9 @@ def _field(value):
 
 
 def build_payload(task_id, headers, message, operator_lines=(), note=None, text_max=TEXT_MAX, extra=()):
-    """First line: the attested routing fields, then any `extra` (key, value) pairs. Then, for a
-    non-owner tier, the note; then the untrusted body between nonce markers; then the bridge-written
+    """First line: the attested routing fields, then any `extra` (key, value) pairs, then ui_origin
+    when the task carries one. Then, for a
+    non-owner tier, the note; then the audience rule; then the untrusted body between nonce markers; then the bridge-written
     lines, outside them. Only the body is cut to fit `text_max`, so the markers and lines survive."""
     tier = headers.get("access_tier") or "guest"
     collaborator = is_collaborator(headers)
@@ -48,9 +49,13 @@ def build_payload(task_id, headers, message, operator_lines=(), note=None, text_
     thread = _field(headers.get("thread_root")) or "none"
     fields = "room=%s thread=%s tier=%s collaborator=%s task_id=%s" % (
         room, thread, tier, "true" if collaborator else "false", _field(task_id))
+    ui_origin = _field(headers.get("ui_origin"))
+    if ui_origin:
+        extra = [*extra, ("ui_origin", ui_origin)]
     head = fields + "".join(" %s=%s" % (k, _field(v)) for k, v in extra) + "\n"
     if tier != "owner":
         head += "note: %s\n" % (note if note is not None else non_owner_note())
+    head += "audience: %s\n" % AUDIENCE_RULE
     tag = "UNTRUSTED_TASK_" + uuid.uuid4().hex[:8]
     opening, closing = "<%s>\n" % tag, "\n</%s>" % tag
     tail = closing + ("\n" + "\n".join(operator_lines) if operator_lines else "")
@@ -262,13 +267,22 @@ class RelayLoop:
             return "refused-collaborator"
         return kind or "refused"
 
+    def pending_attestation(self, headers):
+        """True for a Team sender not (yet) attested as a collaborator, unlike a guest or other
+        non-owner tier, which has no reason to expect that flag to follow."""
+        return headers.get("access_tier") == "team" and not is_collaborator(headers)
+
     def refusal(self, name, headers, seen):
         """None when classify() serves the task; otherwise the refusal is finished and its step result
-        returned: True when published, False when parked."""
+        returned: True when published, False when parked (a Team sender pending attestation gets
+        the retry/backoff budget first, instead of an immediate, final refusal)."""
         kind = self.classify(headers)
         if kind == "refused-collaborator":
             log("refused (collaborator, --allow-collaborator not set) ->", name[:-4])
         elif kind == "refused":
+            if self.pending_attestation(headers) and self.schedule_retry(
+                name[:-4], "collaborator attestation pending", at_least=0.0):
+                return False
             log("refused (non-owner, --allow-non-owner not set) ->", name[:-4], headers.get("access_tier") or "guest")
         else:
             return None

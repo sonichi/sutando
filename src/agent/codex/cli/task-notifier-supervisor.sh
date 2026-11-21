@@ -142,11 +142,17 @@ NOTIFIER="${SUTANDO_NOTIFIER_SCRIPT:-$REPO/src/agent/codex/cli/task-notifier.sh}
 # config) to decide -- this script only reads them.
 GRACE_PERIOD="${SUTANDO_NOTIFIER_GRACE_PERIOD:-45}"
 ROLE_POLL="${SUTANDO_NOTIFIER_ROLE_POLL:-5}"
+# "alert": a Claude seat whose watcher the task-watch Mod hosts. Nothing is typed into the
+# pane; after ALERT_GRACE with no ready session watcher the owner is told once per outage;
+# ALERT_REPEAT > 0 opts into a reminder that often. Both are validated below supervisor_log.
+STANDBY_MODE="${SUTANDO_STANDBY_MODE:-type}"
 child_pid=""
 # One-shot latch for the idle-but-dead health alert: raised when it fires, so a
 # persistent stale/absent beat does not re-notify every grace period; lowered
 # again the moment the decision is anything but alert (the session recovered).
 alerted=0
+alert_seq=0
+alert_notified=0
 
 # yes / no / unknown -- unknown (ps snapshot unavailable) is deliberately
 # never read as "no": every caller below fails toward keeping whatever
@@ -313,12 +319,147 @@ run_notifier_once() {
   return 0
 }
 
+now_s() { date +%s; }
+
+# Appended to the same log the Claude notifier writes, so one file answers "was the inbox covered".
+supervisor_log() {
+  local msg="task-notifier-supervisor: $*" ws
+  printf '%s\n' "$msg" >&2
+  [ -n "$TASKS_DIR" ] || return 0
+  ws="$(workspace_dir_for_inbox "$TASKS_DIR")"
+  [ -d "$ws/logs" ] && printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$msg" >>"$ws/logs/claude-task-notifier.log" 2>/dev/null
+  return 0
+}
+
+alert_setting() {  # alert_setting <name> <default> <min> <max>: whole seconds in range, else the default
+  local v="${!1:-}"
+  [ -n "$v" ] || { printf '%s' "$2"; return; }
+  if [[ "$v" =~ ^[0-9]{1,6}$ ]] && [ $((10#$v)) -ge "$3" ] && [ $((10#$v)) -le "$4" ]; then
+    printf '%s' "$((10#$v))"
+    return
+  fi
+  supervisor_log "ignoring $1=${v:0:40}: not a whole number of seconds from $3 to $4; using $2"
+  printf '%s' "$2"
+}
+ALERT_GRACE="$(alert_setting SUTANDO_NOTIFIER_ALERT_GRACE 300 1 86400)"
+ALERT_REPEAT="$(alert_setting SUTANDO_NOTIFIER_ALERT_REPEAT 0 0 86400)"
+
+# The workspace whose seats count: the same one this seat's beat file is resolved against.
+seat_workspace() { printf '%s' "${SUTANDO_WORKSPACE_DIR:-$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)}"; }
+
+# "<seat>\t<worker>\t<label>" for a registered seat inbox (judged from the inbox, never from
+# SUTANDO_INSTANCE_ID), else "none": no path or session name, as the label leaves the machine.
+inbox_seat() {
+  local ws
+  ws="$(seat_workspace)"
+  { [ -n "$TASKS_DIR" ] && [ -n "$ws" ]; } || { echo none; return; }
+  "$PY" "$REPO/src/seat_inbox.py" seat --inbox "$TASKS_DIR" --workspace "$ws" 2>/dev/null || echo none
+}
+
+duration_phrase() {  # duration_phrase <seconds>
+  if [ "$1" -lt 60 ]; then printf 'under a minute'; else printf '%s min' "$(($1 / 60))"; fi
+}
+
+# The owner's alert: a proactive result (the owner's DM, never a worker's lane) and the opt-in macOS
+# notification. An inbox that is no registered seat gets only the local log line, never a page.
+unwatched_alert() {  # unwatched_alert <seconds unwatched> [reminder]
+  # Returns 1 only when nothing was published (result_publish exit 1 or 2, or no results folder), so
+  # the caller retries; any other outcome counts as sent, since a retry could duplicate the DM.
+  local secs="$1" kind="${2:-}" ws msg seat label rc=1
+  alert_seq=$((alert_seq + 1))  # two messages in one second must not share a result file
+  seat="$(inbox_seat)"
+  label="$(printf '%s' "$seat" | cut -f3)"
+  if [ "$seat" = none ] || [ -z "$label" ]; then
+    supervisor_log "ALERT${kind:+ ($kind)}: no ready session watcher holds ${TASKS_DIR:-this host} (session ${SESSION}) for ${secs}s (alert-only standby; nothing typed); not a registered seat inbox, owner not paged"
+    return 0
+  fi
+  msg="Sutando${kind:+ ($kind)}: $label has had no task watcher for $(duration_phrase "$secs"), so it is not picking up its tasks, and nothing types them in for it. Restarting that session brings its watcher back."
+  supervisor_log "ALERT${kind:+ ($kind)}: no ready session watcher holds ${TASKS_DIR} (session ${SESSION}) for ${secs}s (alert-only standby; nothing typed); alerting the owner"
+  ws="$(seat_workspace)"
+  if [ -d "$ws/results" ]; then
+    printf '%s\n' "$msg" | env -u SUTANDO_WORKER_ID "$PY" "$REPO/src/result_publish.py" \
+      "$ws/results/proactive-standby-unwatched-$(now_s)-$$-${alert_seq}.txt" >/dev/null 2>&1
+    rc=$?
+    case "$rc" in
+      0) ;;
+      1|2) supervisor_log "could not publish the unwatched-inbox alert (exit $rc, nothing written); it will be retried" ;;
+      3) supervisor_log "the unwatched-inbox alert was published, but its directory sync failed; not resent" ;;
+      *) supervisor_log "the unwatched-inbox alert's publisher ended with exit $rc, outcome unknown; counted as sent, not resent" ;;
+    esac
+  else
+    supervisor_log "no results folder at the seat's workspace; the unwatched-inbox alert will be retried"
+  fi
+  if [ "$alert_notified" = "0" ]; then
+    alert_notified=1
+    bash "$REPO/src/macos-notify.sh" "$msg" || true
+  fi
+  [ "$rc" != 1 ] && [ "$rc" != 2 ]
+}
+
+retry_wait() {  # retry_wait <consecutive failures>: 1 s doubling, capped at 300 s
+  local w=1 i=1
+  while [ "$i" -lt "$1" ] && [ "$w" -lt 300 ]; do w=$((w * 2)); i=$((i + 1)); done
+  [ "$w" -gt 300 ] && w=300
+  printf '%s' "$w"
+}
+
+# Alert-only standby: never starts the notifier, so neither a task nor a nudge is typed.
+# "unknown" neither opens nor closes an episode; a ready watcher ends it without a word to the owner.
+# A send that was certainly not published latches nothing and is retried after a bounded back-off.
+run_alert_only() {
+  local since="" alerted=0 last=0 v now fail_alert=0 fail_rem=0 hold_alert=0 hold_rem=0
+  supervisor_log "alert-only standby for ${TASKS_DIR:-this host}: the task-watch Mod hosts this seat's watcher; nothing is typed into the pane"
+  while target_alive; do
+    v="$(session_role_verdict)"
+    case "$v" in
+      yes)
+        [ "$alerted" = "1" ] && supervisor_log "a session watcher holds ${TASKS_DIR:-this host} again; the alert-only standby stands down"
+        since=""
+        alerted=0
+        alert_notified=0
+        fail_alert=0
+        fail_rem=0
+        hold_alert=0
+        hold_rem=0
+        ;;
+      no)
+        now="$(now_s)"
+        [ -n "$since" ] || since="$now"
+        if [ "$alerted" = "0" ]; then
+          if [ $((now - since)) -ge "$ALERT_GRACE" ] && [ "$now" -ge "$hold_alert" ]; then
+            if unwatched_alert $((now - since)); then
+              alerted=1
+              last="$now"
+            else
+              fail_alert=$((fail_alert + 1))
+              hold_alert=$((now + $(retry_wait "$fail_alert")))
+            fi
+          fi
+        elif [ "$ALERT_REPEAT" -gt 0 ] && [ $((now - last)) -ge "$ALERT_REPEAT" ] && [ "$now" -ge "$hold_rem" ]; then
+          if unwatched_alert $((now - since)) reminder; then
+            last="$now"
+            fail_rem=0
+          else
+            fail_rem=$((fail_rem + 1))
+            hold_rem=$((now + $(retry_wait "$fail_rem")))
+          fi
+        fi
+        ;;
+    esac
+    sleep "$ROLE_POLL"
+  done
+}
+
 # Sourced by a test to exercise the helpers in isolation: stop here, before the
 # standby loop, so decide_action and its callees can be invoked directly.
 if [ "${SUTANDO_SUPERVISOR_SOURCE_ONLY:-}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
 
 target_alive || exit 0
 await_slot || exit 0
+if [ "$STANDBY_MODE" = "alert" ]; then
+  run_alert_only
+  exit 0
+fi
 
 # "unknown" keeps whatever runs: while armed, the notifier stays; in standby,
 # nothing is running to keep, and a host whose ps never answers would otherwise

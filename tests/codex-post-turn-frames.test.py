@@ -103,12 +103,12 @@ def runner_for(frame):
     return run
 
 
-kind, _ = sup.observe_pane(ws, wid, "codex", runner=runner_for(FRAMES["post-turn idle"]))
+kind, _, _ = sup.observe_pane(ws, wid, "codex", runner=runner_for(FRAMES["post-turn idle"]))
 check("the supervisor captures with -e", "-e" in seen[-1], True)
 check("an idle pane reads idle", kind, ps.PANE_IDLE)
 frames_dir = ws / "state" / "pane-frames" / session
 check("an idle pane is not saved", frames_dir.exists(), False)
-kind, _ = sup.observe_pane(ws, wid, "codex", runner=runner_for(FRAMES["retry banner"]))
+kind, _, _ = sup.observe_pane(ws, wid, "codex", runner=runner_for(FRAMES["retry banner"]))
 check("a retry banner reads abnormal", kind, ps.PANE_ABNORMAL)
 saved = sorted(frames_dir.glob("*-abnormal.txt"))
 check("the abnormal frame is saved", len(saved), 1)

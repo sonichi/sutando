@@ -385,6 +385,46 @@ class IsThisHostRouting(Base):
         alarm = sup.routing_status(self.ws)["alarm"] or ""
         self.assertIn("task-xyz", alarm)
 
+    def test_a_task_the_workers_own_lane_delivered_is_not_unrouted(self):
+        # A worker's lane routes its tasks itself and writes no receipt; the core never routes them.
+        import time
+        wid = self._bind()
+        now = time.time()
+        sup.prr.record(self.ws, mode="run", task_id="task-core", now=now - 60)
+        self._archived_task(now, task_id="task-lane")
+        sup.pa.record(self.ws, "task-lane", wid)
+        self.assertIsNone(sup.routing_status(self.ws)["alarm"])
+        self._archived_task(now + 1, task_id="task-xyz")
+        self.assertIn("task-xyz", sup.routing_status(self.ws)["alarm"] or "", "an unattributed task still is")
+
+    def test_with_no_receipt_lane_delivered_tasks_are_routing_evidence(self):
+        # A host whose bound rooms are all served by worker lanes never writes a receipt.
+        wid = self._bind()
+        self._archived_task(1000.0, task_id="task-lane")
+        sup.pa.record(self.ws, "task-lane", wid)
+        self.assertIsNone(sup.routing_status(self.ws)["alarm"])
+
+    def test_with_no_receipt_an_unattributed_task_beside_lane_ones_is_the_alarm(self):
+        wid = self._bind()
+        self._archived_task(1000.0, task_id="task-lane")
+        sup.pa.record(self.ws, "task-lane", wid)
+        self._archived_task(999.0, task_id="task-xyz")
+        alarm = sup.routing_status(self.ws)["alarm"] or ""
+        self.assertIn("task-xyz", alarm)
+        self.assertIn("processed it unrouted", alarm)
+
+    def test_with_no_receipt_and_only_unattributed_tasks_the_handler_was_never_consulted(self):
+        self._bind()
+        self._archived_task(1000.0, task_id="task-xyz")
+        self.assertIn("never been consulted", sup.routing_status(self.ws)["alarm"] or "")
+
+    def test_an_attribution_that_cannot_be_read_counts_as_unrouted(self):
+        self._bind()
+        sup.prr.record(self.ws, mode="run", task_id="task-abc", now=1000.0)
+        self._archived_task(1003.0, task_id="task-xyz")
+        with patch.object(sup.pa, "worker_for_task", side_effect=OSError(5, "Input/output error")):
+            self.assertIn("task-xyz", sup.routing_status(self.ws)["alarm"] or "")
+
     def test_bound_rooms_but_a_handler_never_consulted_is_the_alarm(self):
         self._bind()
         self._archived_task(1000.0)
@@ -479,7 +519,8 @@ class TheCommandLine(Base):
         self.assertEqual(set(json.loads(out)),
                          {"decisions", "observations", "resumed", "not_supervised", "routing",
                           "wedged", "wedge_kinds", "auth_expired", "sentinels_retired",
-                          "sentinel_retire_errors", "delivery_blocks", "notifier_stalls"})
+                          "sentinel_retire_errors", "sentinels_deferred",
+                          "delivery_blocks", "notifier_stalls", "limit_waits"})
 
     def test_a_resume_sample_says_so(self):
         make_worker(self.ws)

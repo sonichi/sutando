@@ -1,0 +1,902 @@
+{
+ "base": "sonichi/sutando fix/commons-app-builder-followups @ 28aad4668e2d4a0c0a2e68409400ea2cba8d8c79",
+ "cases": {
+  "good": {
+   "thread_root": "$threadRoot1:s.space",
+   "parse": {
+    "v": 1,
+    "request_id": "18181818-3434-4565-8787-909090909090",
+    "mode": "build",
+    "description": "a sign-up sheet for Saturday's cleanup",
+    "room_id": "!abcDEF123:s.space",
+    "page": "html-k3m9x2qa",
+    "database": null,
+    "template": "poll",
+    "app_id": null
+   },
+   "plan_exit": 0,
+   "plan": [
+    {
+     "action": "commons.app_guide",
+     "read": true,
+     "target_kind": "account",
+     "arguments": {}
+    },
+    {
+     "action": "room.members.list",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {},
+     "expect_member": "@owner:s.space"
+    },
+    {
+     "action": "room.commons.pages.list",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {},
+     "expect_page": "html-k3m9x2qa"
+    },
+    {
+     "action": "room.commons.pages.read",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa"
+     },
+     "expect_empty": true
+    },
+    {
+     "action": "room.commons.pages.create",
+     "room_id": "!abcDEF123:s.space",
+     "answers": "$db",
+     "arguments": {
+      "kind": "db",
+      "title": "Poll — Votes",
+      "template": "blank"
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-4-045b621f"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "skip_if_present": "Choice",
+     "arguments": {
+      "database": "$db",
+      "op": "prop_add",
+      "property": {
+       "name": "Choice",
+       "type": "select",
+       "options": [
+        {
+         "name": "Option A"
+        },
+        {
+         "name": "Option B"
+        },
+        {
+         "name": "Option C"
+        }
+       ]
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-5-cd536eab"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "skip_if_present": "Comment",
+     "arguments": {
+      "database": "$db",
+      "op": "prop_add",
+      "property": {
+       "name": "Comment",
+       "type": "text"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-6-ddf5f11e"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "skip_if_present": "Created by",
+     "arguments": {
+      "database": "$db",
+      "op": "prop_add",
+      "property": {
+       "name": "Created by",
+       "type": "created_by"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-7-8a939467"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "database": "$db",
+      "op": "view_add",
+      "view_settings": {
+       "layout": "table",
+       "name": "All votes"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-8-a28f6cc5"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "database": "$db",
+      "op": "view_add",
+      "view_settings": {
+       "layout": "board",
+       "name": "By choice",
+       "groupBy": "Choice"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-9-d3cde303"
+    },
+    {
+     "action": "room.commons.pages.read",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa"
+     },
+     "expect_empty": true
+    },
+    {
+     "action": "room.commons.pages.replace",
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa",
+      "mode": "whole",
+      "new_text": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Poll</title>\n<style>\n  :root {\n    color-scheme: light dark;\n    --bg: #fbfbfd; --card: #fff; --ink: #16161a; --dim: #5d5d6b;\n    --line: #e3e3ea; --accent: #2f5bea; --warn: #8a5a00; --bad: #b3261e; --bar: #d8def8;\n  }\n  @media (prefers-color-scheme: dark) {\n    :root {\n      --bg: #111115; --card: #1a1a20; --ink: #f2f2f5; --dim: #a6a6b4;\n      --line: #2c2c36; --accent: #7d9bff; --warn: #ffcf70; --bad: #ff8a80; --bar: #26314f;\n    }\n  }\n  * { box-sizing: border-box; }\n  body {\n    margin: 0; padding: 12px; background: var(--bg); color: var(--ink);\n    font: 16px/1.45 system-ui, -apple-system, \"Segoe UI\", sans-serif;\n  }\n  h1 { font-size: 19px; margin: 0 0 2px; }\n  .sub { color: var(--dim); font-size: 13px; margin-bottom: 12px; overflow-wrap: anywhere; }\n  .note { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); margin-bottom: 10px; font-size: 14px; }\n  .note.bad { border-color: var(--bad); color: var(--bad); }\n  .note.warn { border-color: var(--warn); color: var(--warn); }\n  .choices { display: grid; gap: 10px; margin-bottom: 16px; min-width: 0; }\n  button {\n    font: inherit; color: inherit; min-height: 44px; border-radius: 10px;\n    border: 1px solid var(--line); background: var(--card); padding: 10px 12px; cursor: pointer; text-align: left;\n  }\n  button[disabled] { opacity: .55; cursor: not-allowed; }\n  button.chosen { border-color: var(--accent); border-width: 2px; font-weight: 600; }\n  /* Option names and voter names are other people's text: wrap rather than widen the page. */\n  button, .res, .resTop, .resTop span { overflow-wrap: anywhere; min-width: 0; }\n  .results { display: grid; gap: 8px; list-style: none; margin: 0 0 14px; padding: 0; }\n  .res { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-width: 0; }\n  .resTop { display: flex; justify-content: space-between; gap: 8px; font-size: 14px; }\n  .track { margin-top: 6px; height: 8px; border-radius: 999px; background: var(--bar); overflow: hidden; }\n  .fill { height: 100%; background: var(--accent); }\n  .you { font-size: 12px; color: var(--dim); margin-left: 6px; }\n  input {\n    font: inherit; color: inherit; min-height: 44px; width: 100%; border-radius: 10px;\n    border: 1px solid var(--line); background: var(--card); padding: 0 12px;\n  }\n  .commentRow { display: grid; gap: 8px; min-width: 0; }\n  @media (min-width: 640px) {\n    .choices { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }\n    .commentRow { grid-template-columns: 1fr auto; }\n  }\n</style>\n</head>\n<body>\n<h1>Poll</h1>\n<div class=\"sub\" id=\"sub\">Loading…</div>\n<div id=\"notes\"></div>\n<ul class=\"results\" id=\"results\"></ul>\n<div class=\"choices\" id=\"choices\"></div>\n<div class=\"commentRow\">\n  <input id=\"comment\" placeholder=\"Add a comment (optional)\" aria-label=\"Comment\" autocomplete=\"off\">\n  <button type=\"button\" id=\"saveComment\" hidden>Save comment</button>\n</div>\n<script>\n(async () => {\n  const art = window.artifact;\n  const db = art && art.db;\n  const $ = (id) => document.getElementById(id);\n  const notes = $('notes');\n  const show = (cls, text) => {\n    const el = document.createElement('div');\n    el.className = 'note ' + cls;\n    el.textContent = text;\n    notes.appendChild(el);\n  };\n  const clearNotes = () => { notes.textContent = ''; };\n  let hintShown = false;\n  const hint = (text) => { if (!hintShown) { hintShown = true; show('warn', text); } };\n\n  if (!db) {\n    $('sub').textContent = 'Preview';\n    show('warn', 'Open this page in s.space to vote: this is a preview with no data.');\n    return;\n  }\n  await art.ready;\n\n  const byName = (list, name) => (list.find((d) => d.name === name) || {}).id;\n  let dbs = [];\n  try { dbs = await db.list(); } catch (e) { show('bad', e.message); return; }\n  const id = (art.app && art.app.database) || byName(dbs, 'Poll — Votes');\n  if (!id) { $('sub').textContent = ''; show('bad', 'The \"Poll — Votes\" database is missing from this room.'); return; }\n\n  const save = async (call) => {\n    const until = Date.now() + 120000;\n    for (;;) {\n      const r = await call();\n      if (r.ok || !/waiting for the viewer|rate limit|too many/i.test(r.reason || '') || Date.now() > until) return r;\n      hint('Allow this page to edit data in this room, and your vote will save.');\n      await new Promise((ok) => setTimeout(ok, 1500));\n    }\n  };\n\n  let titleProp = null, myRow = null, consentKnown = true, busy = false, snapshot = null;\n\n  // A voter's identity for counting. The created_by cell is account ids, stamped by the server,\n  // so one vote per person can be counted without the viewer's consent (personId needs it).\n  const voterKey = (cell) => (Array.isArray(cell) ? cell.join(',') : cell == null ? '' : String(cell));\n\n  // One vote per voter: their last row wins. Snapshot order is the rows' insertion order.\n  const counted = (rows) => {\n    const latest = new Map();\n    rows.forEach((r) => { latest.set(voterKey(r.cells['Created by']) || 'row:' + r.id, r); });\n    return [...latest.values()];\n  };\n\n  // Who wrote each vote. personId rejects until the viewer allows the page, and then the page\n  // cannot tell its own vote from anyone else's: it shows \"?\" rather than claiming none.\n  // Resolved into locals and returned: renders overlap (each awaits personId row by row), so\n  // writing shared state here would let a slower, older render overwrite a newer one.\n  const findMine = async (snap) => {\n    let mine = null;\n    // The LAST of the viewer's rows, so \"your vote\" is the one the tally counts.\n    for (const row of snap.rows) {\n      try {\n        const who = await art.personId(row.cells['Created by']);\n        if (who && art.me && who === art.me.id) mine = row;\n      } catch (e) { return { myRow: null, consentKnown: false }; }\n    }\n    return { myRow: mine, consentKnown: true };\n  };\n  let generation = 0;\n\n  // One place that writes the comment, to ONE row fixed when it was submitted. Each retry checks\n  // that row still exists rather than re-resolving \"my vote\": a newer vote arriving in between\n  // must not receive (and overwrite with) this older text, and a deleted one is reported.\n  const writeComment = (text, rowId) =>\n    save(async () => {\n      if (!rowId || (snapshot && !snapshot.rows.some((row) => row.id === rowId))) {\n        return { ok: false, reason: 'your vote is no longer in this room' };\n      }\n      return db.write(id, rowId, 'Comment', text);\n    });\n\n  // Shown once the viewer has a vote, so a comment refused after the vote saved can be retried\n  // without casting the vote again.\n  const refreshSaveComment = () => {\n    const btn = $('saveComment');\n    const typed = $('comment').value.trim();\n    const saved = (myRow && myRow.cells.Comment) || '';\n    btn.hidden = !(consentKnown && myRow);\n    btn.disabled = busy || !typed || typed === saved;\n  };\n\n  const lockChoices = () => {\n    [...$('choices').children].forEach((el) => { el.disabled = true; });\n  };\n  const unlockChoices = () => {\n    [...$('choices').children].forEach((el) => { el.disabled = false; });\n  };\n\n  const draw = (snap) => {\n    clearNotes();\n    hintShown = false;\n    titleProp = (snap.props.find((p) => p.type === 'title') || {}).name;\n    const choice = snap.props.find((p) => p.name === 'Choice');\n    const options = (choice && choice.options) || [];\n    if (!options.length) {\n      // Clear first: a stale tally and buttons for removed options must not stay votable.\n      $('results').textContent = '';\n      $('choices').textContent = '';\n      $('sub').textContent = '';\n      show('bad', 'The Choice column has no options yet, so there is nothing to vote on.');\n      return;\n    }\n\n    // One row per vote, one vote per voter: repeat rows from one person count once.\n    // Null prototype: `tally['__proto__'] = 0` on a plain object sets the prototype instead of\n    // an own property, so votes for an option named that would vanish from the count.\n    const tally = Object.create(null);\n    options.forEach((o) => { tally[o.name] = 0; });\n    const votes = counted(snap.rows);\n    let total = 0;\n    votes.forEach((r) => {\n      const c = r.cells.Choice;\n      if (typeof c === 'string' && c in tally) { tally[c] += 1; total += 1; }\n    });\n    const ignored = snap.rows.length - votes.length;\n\n    $('sub').textContent = total + (total === 1 ? ' vote' : ' votes') +\n      (consentKnown ? (myRow ? '  ·  you voted ' + myRow.cells.Choice : '  ·  you have not voted') : '  ·  your vote: ?');\n    if (!consentKnown) show('warn', 'Allow the page to see who is who, and it will show your own vote and let you change it.');\n    if (ignored > 0) show('warn', ignored + (ignored === 1 ? ' extra row' : ' extra rows') + ' from someone who already voted are not counted.');\n\n    const res = $('results');\n    res.textContent = '';\n    if (!total) {\n      const li = document.createElement('li');\n      li.className = 'res';\n      li.textContent = 'No votes yet. Pick an option below to be first.';\n      res.appendChild(li);\n    } else {\n      options.forEach((o) => {\n        const n = tally[o.name];\n        const li = document.createElement('li');\n        li.className = 'res';\n        const top = document.createElement('div');\n        top.className = 'resTop';\n        const left = document.createElement('span');\n        left.textContent = o.name;\n        if (consentKnown && myRow && myRow.cells.Choice === o.name) {\n          const you = document.createElement('span');\n          you.className = 'you';\n          you.textContent = '(yours)';\n          left.appendChild(you);\n        }\n        const right = document.createElement('span');\n        right.textContent = n + '  ·  ' + Math.round((n / total) * 100) + '%';\n        top.appendChild(left); top.appendChild(right);\n        const track = document.createElement('div');\n        track.className = 'track';\n        const fill = document.createElement('div');\n        fill.className = 'fill';\n        fill.style.width = Math.round((n / total) * 100) + '%';\n        track.appendChild(fill);\n        li.appendChild(top); li.appendChild(track);\n        res.appendChild(li);\n      });\n    }\n\n    refreshSaveComment();\n    const box = $('choices');\n    box.textContent = '';\n    options.forEach((o) => {\n      const b = document.createElement('button');\n      b.type = 'button';\n      b.textContent = (consentKnown && myRow && myRow.cells.Choice === o.name) ? o.name + ' — your vote' : o.name;\n      if (consentKnown && myRow && myRow.cells.Choice === o.name) b.className = 'chosen';\n      b.disabled = busy || (consentKnown && myRow && myRow.cells.Choice === o.name);\n      b.setAttribute('aria-label', 'Vote for ' + o.name);\n      b.onclick = async () => {\n        if (busy) return;                                  // one vote in flight at a time\n        busy = true;\n        lockChoices();\n        const comment = $('comment').value.trim();\n        let r = { ok: false, reason: '' };\n        let commentResult = null;\n        // The row the Choice write actually edited, recorded inside that write. Reading myRow\n        // after the await would pick up whatever a re-render put there meanwhile.\n        let votedRowId = null;\n        // try/finally: anything thrown in here must still clear busy and redraw, or every\n        // control stays disabled for good.\n        try {\n          // Ownership is resolved inside the retried call: consent granted mid-retry turns this\n          // from a second row into an edit of the voter's own.\n          r = await save(async () => {\n            if (snapshot) {\n              const who = await findMine(snapshot);\n              myRow = who.myRow;\n              consentKnown = who.consentKnown;\n            }\n            if (myRow) {\n              votedRowId = myRow.id;\n              return db.write(id, votedRowId, 'Choice', o.name);\n            }\n            votedRowId = null;\n            const values = { Choice: o.name };\n            if (titleProp) values[titleProp] = (art.me && art.me.name) || 'Vote';\n            if (comment) values.Comment = comment;\n            return db.createRow(id, values);\n          });\n          // The comment is its own write with its own retry, so retrying it never rewrites\n          // Choice, and a refusal is reported instead of being dropped. The row is re-resolved\n          // on every attempt: it can be deleted between the refusal and the retry, and reading\n          // a remembered id would throw.\n          // A new vote carried the comment in its createRow; an edited one writes it separately,\n          // to the row that write used. If that row is gone by now, writeComment reports it.\n          if (r.ok && comment && votedRowId) commentResult = await writeComment(comment, votedRowId);\n        } catch (e) {\n          // A throw after the vote saved belongs to the comment: record it, or the success\n          // branch below would clear the box and the comment would vanish without a word.\n          if (!r.ok) r = { ok: false, reason: e.message || 'Your vote was not saved.' };\n          else if (comment) commentResult = { ok: false, reason: e.message || 'refused' };\n        } finally {\n          busy = false;\n          // Re-draw from the current snapshot: a watch update during the write replaced the\n          // buttons, and re-enabling the detached ones would leave the live set stuck disabled.\n          if (snapshot) await render(snapshot);\n          else unlockChoices();\n        }\n        if (!r.ok) show('bad', r.reason || 'Your vote was not saved.');\n        else if (commentResult && !commentResult.ok) {\n          show('warn', 'Your vote was saved, but the comment was not: ' +\n            (commentResult.reason || 'refused') + '. Your text is still in the box.');\n        } else if (comment && $('comment').value.trim() === comment) $('comment').value = '';\n      };\n      box.appendChild(b);\n    });\n  };\n\n  const render = async (snap) => {\n    const gen = ++generation;                          // a newer render supersedes this one\n    snapshot = snap;\n    if (!snap) { clearNotes(); $('results').textContent = ''; $('choices').textContent = ''; $('sub').textContent = ''; show('bad', 'The Poll database was removed from this room.'); return; }\n    const who = await findMine(snap);\n    if (gen !== generation) return;                    // superseded while resolving ownership\n    myRow = who.myRow;\n    consentKnown = who.consentKnown;\n    draw(snap);\n  };\n\n  db.onChange(id, render);\n  try { await render(await db.read(id)); } catch (e) { $('sub').textContent = ''; show('bad', e.message); }\n\n  $('comment').addEventListener('input', refreshSaveComment);\n  $('saveComment').onclick = async () => {\n    if (busy) return;\n    const text = $('comment').value.trim();\n    if (!text) return;\n    const target = myRow ? myRow.id : null;          // fixed now; a retry never moves it\n    busy = true;\n    refreshSaveComment();\n    let res = { ok: false, reason: '' };\n    try {\n      res = await writeComment(text, target);\n    } catch (e) {\n      res = { ok: false, reason: e.message || 'The comment was not saved.' };\n    } finally {\n      busy = false;\n      if (snapshot) await render(snapshot);\n      else refreshSaveComment();\n    }\n    if (!res.ok) show('bad', 'The comment was not saved: ' + (res.reason || 'refused') + '. Your text is still in the box.');\n    else if ($('comment').value.trim() === text) { $('comment').value = ''; refreshSaveComment(); }\n  };\n})();\n</script>\n</body>\n</html>\n"
+     },
+     "expect_replaced_empty": true,
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-11-6f3c2201"
+    },
+    {
+     "action": "room.commons.pages.read",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa"
+     },
+     "expect_bytes": 15615
+    },
+    {
+     "action": "room.commons.apps.create",
+     "room_id": "!abcDEF123:s.space",
+     "answers": "$app",
+     "arguments": {
+      "name": "Poll",
+      "database": "$db",
+      "page": "html-k3m9x2qa"
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-13-a5e01e3a"
+    }
+   ],
+   "reply_exit": 0,
+   "reply": "Built it.\n\n```commons-app-build\n{\"v\":1,\"request_id\":\"18181818-3434-4565-8787-909090909090\",\"status\":\"done\",\"reason\":\"\",\"page\":\"html-k3m9x2qa\",\"database\":\"d7k2m9x1\",\"app_id\":\"a1b2c3d4\"}\n```\n"
+  },
+  "malformed": {
+   "thread_root": "not-an-event",
+   "parse": {
+    "v": 1,
+    "request_id": "18181818-3434-4565-8787-909090909090",
+    "mode": "build",
+    "description": "a sign-up sheet for Saturday's cleanup",
+    "room_id": "!abcDEF123:s.space",
+    "page": "html-k3m9x2qa",
+    "database": null,
+    "template": "poll",
+    "app_id": null
+   },
+   "plan_exit": 0,
+   "plan": [
+    {
+     "action": "commons.app_guide",
+     "read": true,
+     "target_kind": "account",
+     "arguments": {}
+    },
+    {
+     "action": "room.members.list",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {},
+     "expect_member": "@owner:s.space"
+    },
+    {
+     "action": "room.commons.pages.list",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {},
+     "expect_page": "html-k3m9x2qa"
+    },
+    {
+     "action": "room.commons.pages.read",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa"
+     },
+     "expect_empty": true
+    },
+    {
+     "action": "room.commons.pages.create",
+     "room_id": "!abcDEF123:s.space",
+     "answers": "$db",
+     "arguments": {
+      "kind": "db",
+      "title": "Poll — Votes",
+      "template": "blank"
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-4-045b621f"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "skip_if_present": "Choice",
+     "arguments": {
+      "database": "$db",
+      "op": "prop_add",
+      "property": {
+       "name": "Choice",
+       "type": "select",
+       "options": [
+        {
+         "name": "Option A"
+        },
+        {
+         "name": "Option B"
+        },
+        {
+         "name": "Option C"
+        }
+       ]
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-5-cd536eab"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "skip_if_present": "Comment",
+     "arguments": {
+      "database": "$db",
+      "op": "prop_add",
+      "property": {
+       "name": "Comment",
+       "type": "text"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-6-ddf5f11e"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "skip_if_present": "Created by",
+     "arguments": {
+      "database": "$db",
+      "op": "prop_add",
+      "property": {
+       "name": "Created by",
+       "type": "created_by"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-7-8a939467"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "database": "$db",
+      "op": "view_add",
+      "view_settings": {
+       "layout": "table",
+       "name": "All votes"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-8-a28f6cc5"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "database": "$db",
+      "op": "view_add",
+      "view_settings": {
+       "layout": "board",
+       "name": "By choice",
+       "groupBy": "Choice"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-9-d3cde303"
+    },
+    {
+     "action": "room.commons.pages.read",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa"
+     },
+     "expect_empty": true
+    },
+    {
+     "action": "room.commons.pages.replace",
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa",
+      "mode": "whole",
+      "new_text": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Poll</title>\n<style>\n  :root {\n    color-scheme: light dark;\n    --bg: #fbfbfd; --card: #fff; --ink: #16161a; --dim: #5d5d6b;\n    --line: #e3e3ea; --accent: #2f5bea; --warn: #8a5a00; --bad: #b3261e; --bar: #d8def8;\n  }\n  @media (prefers-color-scheme: dark) {\n    :root {\n      --bg: #111115; --card: #1a1a20; --ink: #f2f2f5; --dim: #a6a6b4;\n      --line: #2c2c36; --accent: #7d9bff; --warn: #ffcf70; --bad: #ff8a80; --bar: #26314f;\n    }\n  }\n  * { box-sizing: border-box; }\n  body {\n    margin: 0; padding: 12px; background: var(--bg); color: var(--ink);\n    font: 16px/1.45 system-ui, -apple-system, \"Segoe UI\", sans-serif;\n  }\n  h1 { font-size: 19px; margin: 0 0 2px; }\n  .sub { color: var(--dim); font-size: 13px; margin-bottom: 12px; overflow-wrap: anywhere; }\n  .note { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); margin-bottom: 10px; font-size: 14px; }\n  .note.bad { border-color: var(--bad); color: var(--bad); }\n  .note.warn { border-color: var(--warn); color: var(--warn); }\n  .choices { display: grid; gap: 10px; margin-bottom: 16px; min-width: 0; }\n  button {\n    font: inherit; color: inherit; min-height: 44px; border-radius: 10px;\n    border: 1px solid var(--line); background: var(--card); padding: 10px 12px; cursor: pointer; text-align: left;\n  }\n  button[disabled] { opacity: .55; cursor: not-allowed; }\n  button.chosen { border-color: var(--accent); border-width: 2px; font-weight: 600; }\n  /* Option names and voter names are other people's text: wrap rather than widen the page. */\n  button, .res, .resTop, .resTop span { overflow-wrap: anywhere; min-width: 0; }\n  .results { display: grid; gap: 8px; list-style: none; margin: 0 0 14px; padding: 0; }\n  .res { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-width: 0; }\n  .resTop { display: flex; justify-content: space-between; gap: 8px; font-size: 14px; }\n  .track { margin-top: 6px; height: 8px; border-radius: 999px; background: var(--bar); overflow: hidden; }\n  .fill { height: 100%; background: var(--accent); }\n  .you { font-size: 12px; color: var(--dim); margin-left: 6px; }\n  input {\n    font: inherit; color: inherit; min-height: 44px; width: 100%; border-radius: 10px;\n    border: 1px solid var(--line); background: var(--card); padding: 0 12px;\n  }\n  .commentRow { display: grid; gap: 8px; min-width: 0; }\n  @media (min-width: 640px) {\n    .choices { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }\n    .commentRow { grid-template-columns: 1fr auto; }\n  }\n</style>\n</head>\n<body>\n<h1>Poll</h1>\n<div class=\"sub\" id=\"sub\">Loading…</div>\n<div id=\"notes\"></div>\n<ul class=\"results\" id=\"results\"></ul>\n<div class=\"choices\" id=\"choices\"></div>\n<div class=\"commentRow\">\n  <input id=\"comment\" placeholder=\"Add a comment (optional)\" aria-label=\"Comment\" autocomplete=\"off\">\n  <button type=\"button\" id=\"saveComment\" hidden>Save comment</button>\n</div>\n<script>\n(async () => {\n  const art = window.artifact;\n  const db = art && art.db;\n  const $ = (id) => document.getElementById(id);\n  const notes = $('notes');\n  const show = (cls, text) => {\n    const el = document.createElement('div');\n    el.className = 'note ' + cls;\n    el.textContent = text;\n    notes.appendChild(el);\n  };\n  const clearNotes = () => { notes.textContent = ''; };\n  let hintShown = false;\n  const hint = (text) => { if (!hintShown) { hintShown = true; show('warn', text); } };\n\n  if (!db) {\n    $('sub').textContent = 'Preview';\n    show('warn', 'Open this page in s.space to vote: this is a preview with no data.');\n    return;\n  }\n  await art.ready;\n\n  const byName = (list, name) => (list.find((d) => d.name === name) || {}).id;\n  let dbs = [];\n  try { dbs = await db.list(); } catch (e) { show('bad', e.message); return; }\n  const id = (art.app && art.app.database) || byName(dbs, 'Poll — Votes');\n  if (!id) { $('sub').textContent = ''; show('bad', 'The \"Poll — Votes\" database is missing from this room.'); return; }\n\n  const save = async (call) => {\n    const until = Date.now() + 120000;\n    for (;;) {\n      const r = await call();\n      if (r.ok || !/waiting for the viewer|rate limit|too many/i.test(r.reason || '') || Date.now() > until) return r;\n      hint('Allow this page to edit data in this room, and your vote will save.');\n      await new Promise((ok) => setTimeout(ok, 1500));\n    }\n  };\n\n  let titleProp = null, myRow = null, consentKnown = true, busy = false, snapshot = null;\n\n  // A voter's identity for counting. The created_by cell is account ids, stamped by the server,\n  // so one vote per person can be counted without the viewer's consent (personId needs it).\n  const voterKey = (cell) => (Array.isArray(cell) ? cell.join(',') : cell == null ? '' : String(cell));\n\n  // One vote per voter: their last row wins. Snapshot order is the rows' insertion order.\n  const counted = (rows) => {\n    const latest = new Map();\n    rows.forEach((r) => { latest.set(voterKey(r.cells['Created by']) || 'row:' + r.id, r); });\n    return [...latest.values()];\n  };\n\n  // Who wrote each vote. personId rejects until the viewer allows the page, and then the page\n  // cannot tell its own vote from anyone else's: it shows \"?\" rather than claiming none.\n  // Resolved into locals and returned: renders overlap (each awaits personId row by row), so\n  // writing shared state here would let a slower, older render overwrite a newer one.\n  const findMine = async (snap) => {\n    let mine = null;\n    // The LAST of the viewer's rows, so \"your vote\" is the one the tally counts.\n    for (const row of snap.rows) {\n      try {\n        const who = await art.personId(row.cells['Created by']);\n        if (who && art.me && who === art.me.id) mine = row;\n      } catch (e) { return { myRow: null, consentKnown: false }; }\n    }\n    return { myRow: mine, consentKnown: true };\n  };\n  let generation = 0;\n\n  // One place that writes the comment, to ONE row fixed when it was submitted. Each retry checks\n  // that row still exists rather than re-resolving \"my vote\": a newer vote arriving in between\n  // must not receive (and overwrite with) this older text, and a deleted one is reported.\n  const writeComment = (text, rowId) =>\n    save(async () => {\n      if (!rowId || (snapshot && !snapshot.rows.some((row) => row.id === rowId))) {\n        return { ok: false, reason: 'your vote is no longer in this room' };\n      }\n      return db.write(id, rowId, 'Comment', text);\n    });\n\n  // Shown once the viewer has a vote, so a comment refused after the vote saved can be retried\n  // without casting the vote again.\n  const refreshSaveComment = () => {\n    const btn = $('saveComment');\n    const typed = $('comment').value.trim();\n    const saved = (myRow && myRow.cells.Comment) || '';\n    btn.hidden = !(consentKnown && myRow);\n    btn.disabled = busy || !typed || typed === saved;\n  };\n\n  const lockChoices = () => {\n    [...$('choices').children].forEach((el) => { el.disabled = true; });\n  };\n  const unlockChoices = () => {\n    [...$('choices').children].forEach((el) => { el.disabled = false; });\n  };\n\n  const draw = (snap) => {\n    clearNotes();\n    hintShown = false;\n    titleProp = (snap.props.find((p) => p.type === 'title') || {}).name;\n    const choice = snap.props.find((p) => p.name === 'Choice');\n    const options = (choice && choice.options) || [];\n    if (!options.length) {\n      // Clear first: a stale tally and buttons for removed options must not stay votable.\n      $('results').textContent = '';\n      $('choices').textContent = '';\n      $('sub').textContent = '';\n      show('bad', 'The Choice column has no options yet, so there is nothing to vote on.');\n      return;\n    }\n\n    // One row per vote, one vote per voter: repeat rows from one person count once.\n    // Null prototype: `tally['__proto__'] = 0` on a plain object sets the prototype instead of\n    // an own property, so votes for an option named that would vanish from the count.\n    const tally = Object.create(null);\n    options.forEach((o) => { tally[o.name] = 0; });\n    const votes = counted(snap.rows);\n    let total = 0;\n    votes.forEach((r) => {\n      const c = r.cells.Choice;\n      if (typeof c === 'string' && c in tally) { tally[c] += 1; total += 1; }\n    });\n    const ignored = snap.rows.length - votes.length;\n\n    $('sub').textContent = total + (total === 1 ? ' vote' : ' votes') +\n      (consentKnown ? (myRow ? '  ·  you voted ' + myRow.cells.Choice : '  ·  you have not voted') : '  ·  your vote: ?');\n    if (!consentKnown) show('warn', 'Allow the page to see who is who, and it will show your own vote and let you change it.');\n    if (ignored > 0) show('warn', ignored + (ignored === 1 ? ' extra row' : ' extra rows') + ' from someone who already voted are not counted.');\n\n    const res = $('results');\n    res.textContent = '';\n    if (!total) {\n      const li = document.createElement('li');\n      li.className = 'res';\n      li.textContent = 'No votes yet. Pick an option below to be first.';\n      res.appendChild(li);\n    } else {\n      options.forEach((o) => {\n        const n = tally[o.name];\n        const li = document.createElement('li');\n        li.className = 'res';\n        const top = document.createElement('div');\n        top.className = 'resTop';\n        const left = document.createElement('span');\n        left.textContent = o.name;\n        if (consentKnown && myRow && myRow.cells.Choice === o.name) {\n          const you = document.createElement('span');\n          you.className = 'you';\n          you.textContent = '(yours)';\n          left.appendChild(you);\n        }\n        const right = document.createElement('span');\n        right.textContent = n + '  ·  ' + Math.round((n / total) * 100) + '%';\n        top.appendChild(left); top.appendChild(right);\n        const track = document.createElement('div');\n        track.className = 'track';\n        const fill = document.createElement('div');\n        fill.className = 'fill';\n        fill.style.width = Math.round((n / total) * 100) + '%';\n        track.appendChild(fill);\n        li.appendChild(top); li.appendChild(track);\n        res.appendChild(li);\n      });\n    }\n\n    refreshSaveComment();\n    const box = $('choices');\n    box.textContent = '';\n    options.forEach((o) => {\n      const b = document.createElement('button');\n      b.type = 'button';\n      b.textContent = (consentKnown && myRow && myRow.cells.Choice === o.name) ? o.name + ' — your vote' : o.name;\n      if (consentKnown && myRow && myRow.cells.Choice === o.name) b.className = 'chosen';\n      b.disabled = busy || (consentKnown && myRow && myRow.cells.Choice === o.name);\n      b.setAttribute('aria-label', 'Vote for ' + o.name);\n      b.onclick = async () => {\n        if (busy) return;                                  // one vote in flight at a time\n        busy = true;\n        lockChoices();\n        const comment = $('comment').value.trim();\n        let r = { ok: false, reason: '' };\n        let commentResult = null;\n        // The row the Choice write actually edited, recorded inside that write. Reading myRow\n        // after the await would pick up whatever a re-render put there meanwhile.\n        let votedRowId = null;\n        // try/finally: anything thrown in here must still clear busy and redraw, or every\n        // control stays disabled for good.\n        try {\n          // Ownership is resolved inside the retried call: consent granted mid-retry turns this\n          // from a second row into an edit of the voter's own.\n          r = await save(async () => {\n            if (snapshot) {\n              const who = await findMine(snapshot);\n              myRow = who.myRow;\n              consentKnown = who.consentKnown;\n            }\n            if (myRow) {\n              votedRowId = myRow.id;\n              return db.write(id, votedRowId, 'Choice', o.name);\n            }\n            votedRowId = null;\n            const values = { Choice: o.name };\n            if (titleProp) values[titleProp] = (art.me && art.me.name) || 'Vote';\n            if (comment) values.Comment = comment;\n            return db.createRow(id, values);\n          });\n          // The comment is its own write with its own retry, so retrying it never rewrites\n          // Choice, and a refusal is reported instead of being dropped. The row is re-resolved\n          // on every attempt: it can be deleted between the refusal and the retry, and reading\n          // a remembered id would throw.\n          // A new vote carried the comment in its createRow; an edited one writes it separately,\n          // to the row that write used. If that row is gone by now, writeComment reports it.\n          if (r.ok && comment && votedRowId) commentResult = await writeComment(comment, votedRowId);\n        } catch (e) {\n          // A throw after the vote saved belongs to the comment: record it, or the success\n          // branch below would clear the box and the comment would vanish without a word.\n          if (!r.ok) r = { ok: false, reason: e.message || 'Your vote was not saved.' };\n          else if (comment) commentResult = { ok: false, reason: e.message || 'refused' };\n        } finally {\n          busy = false;\n          // Re-draw from the current snapshot: a watch update during the write replaced the\n          // buttons, and re-enabling the detached ones would leave the live set stuck disabled.\n          if (snapshot) await render(snapshot);\n          else unlockChoices();\n        }\n        if (!r.ok) show('bad', r.reason || 'Your vote was not saved.');\n        else if (commentResult && !commentResult.ok) {\n          show('warn', 'Your vote was saved, but the comment was not: ' +\n            (commentResult.reason || 'refused') + '. Your text is still in the box.');\n        } else if (comment && $('comment').value.trim() === comment) $('comment').value = '';\n      };\n      box.appendChild(b);\n    });\n  };\n\n  const render = async (snap) => {\n    const gen = ++generation;                          // a newer render supersedes this one\n    snapshot = snap;\n    if (!snap) { clearNotes(); $('results').textContent = ''; $('choices').textContent = ''; $('sub').textContent = ''; show('bad', 'The Poll database was removed from this room.'); return; }\n    const who = await findMine(snap);\n    if (gen !== generation) return;                    // superseded while resolving ownership\n    myRow = who.myRow;\n    consentKnown = who.consentKnown;\n    draw(snap);\n  };\n\n  db.onChange(id, render);\n  try { await render(await db.read(id)); } catch (e) { $('sub').textContent = ''; show('bad', e.message); }\n\n  $('comment').addEventListener('input', refreshSaveComment);\n  $('saveComment').onclick = async () => {\n    if (busy) return;\n    const text = $('comment').value.trim();\n    if (!text) return;\n    const target = myRow ? myRow.id : null;          // fixed now; a retry never moves it\n    busy = true;\n    refreshSaveComment();\n    let res = { ok: false, reason: '' };\n    try {\n      res = await writeComment(text, target);\n    } catch (e) {\n      res = { ok: false, reason: e.message || 'The comment was not saved.' };\n    } finally {\n      busy = false;\n      if (snapshot) await render(snapshot);\n      else refreshSaveComment();\n    }\n    if (!res.ok) show('bad', 'The comment was not saved: ' + (res.reason || 'refused') + '. Your text is still in the box.');\n    else if ($('comment').value.trim() === text) { $('comment').value = ''; refreshSaveComment(); }\n  };\n})();\n</script>\n</body>\n</html>\n"
+     },
+     "expect_replaced_empty": true,
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-11-6f3c2201"
+    },
+    {
+     "action": "room.commons.pages.read",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa"
+     },
+     "expect_bytes": 15615
+    },
+    {
+     "action": "room.commons.apps.create",
+     "room_id": "!abcDEF123:s.space",
+     "answers": "$app",
+     "arguments": {
+      "name": "Poll",
+      "database": "$db",
+      "page": "html-k3m9x2qa"
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-13-a5e01e3a"
+    }
+   ],
+   "reply_exit": 0,
+   "reply": "Built it.\n\n```commons-app-build\n{\"v\":1,\"request_id\":\"18181818-3434-4565-8787-909090909090\",\"status\":\"done\",\"reason\":\"\",\"page\":\"html-k3m9x2qa\",\"database\":\"d7k2m9x1\",\"app_id\":\"a1b2c3d4\"}\n```\n"
+  },
+  "number": {
+   "thread_root": 123,
+   "parse": {
+    "v": 1,
+    "request_id": "18181818-3434-4565-8787-909090909090",
+    "mode": "build",
+    "description": "a sign-up sheet for Saturday's cleanup",
+    "room_id": "!abcDEF123:s.space",
+    "page": "html-k3m9x2qa",
+    "database": null,
+    "template": "poll",
+    "app_id": null
+   },
+   "plan_exit": 0,
+   "plan": [
+    {
+     "action": "commons.app_guide",
+     "read": true,
+     "target_kind": "account",
+     "arguments": {}
+    },
+    {
+     "action": "room.members.list",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {},
+     "expect_member": "@owner:s.space"
+    },
+    {
+     "action": "room.commons.pages.list",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {},
+     "expect_page": "html-k3m9x2qa"
+    },
+    {
+     "action": "room.commons.pages.read",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa"
+     },
+     "expect_empty": true
+    },
+    {
+     "action": "room.commons.pages.create",
+     "room_id": "!abcDEF123:s.space",
+     "answers": "$db",
+     "arguments": {
+      "kind": "db",
+      "title": "Poll — Votes",
+      "template": "blank"
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-4-045b621f"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "skip_if_present": "Choice",
+     "arguments": {
+      "database": "$db",
+      "op": "prop_add",
+      "property": {
+       "name": "Choice",
+       "type": "select",
+       "options": [
+        {
+         "name": "Option A"
+        },
+        {
+         "name": "Option B"
+        },
+        {
+         "name": "Option C"
+        }
+       ]
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-5-cd536eab"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "skip_if_present": "Comment",
+     "arguments": {
+      "database": "$db",
+      "op": "prop_add",
+      "property": {
+       "name": "Comment",
+       "type": "text"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-6-ddf5f11e"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "skip_if_present": "Created by",
+     "arguments": {
+      "database": "$db",
+      "op": "prop_add",
+      "property": {
+       "name": "Created by",
+       "type": "created_by"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-7-8a939467"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "database": "$db",
+      "op": "view_add",
+      "view_settings": {
+       "layout": "table",
+       "name": "All votes"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-8-a28f6cc5"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "database": "$db",
+      "op": "view_add",
+      "view_settings": {
+       "layout": "board",
+       "name": "By choice",
+       "groupBy": "Choice"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-9-d3cde303"
+    },
+    {
+     "action": "room.commons.pages.read",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa"
+     },
+     "expect_empty": true
+    },
+    {
+     "action": "room.commons.pages.replace",
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa",
+      "mode": "whole",
+      "new_text": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Poll</title>\n<style>\n  :root {\n    color-scheme: light dark;\n    --bg: #fbfbfd; --card: #fff; --ink: #16161a; --dim: #5d5d6b;\n    --line: #e3e3ea; --accent: #2f5bea; --warn: #8a5a00; --bad: #b3261e; --bar: #d8def8;\n  }\n  @media (prefers-color-scheme: dark) {\n    :root {\n      --bg: #111115; --card: #1a1a20; --ink: #f2f2f5; --dim: #a6a6b4;\n      --line: #2c2c36; --accent: #7d9bff; --warn: #ffcf70; --bad: #ff8a80; --bar: #26314f;\n    }\n  }\n  * { box-sizing: border-box; }\n  body {\n    margin: 0; padding: 12px; background: var(--bg); color: var(--ink);\n    font: 16px/1.45 system-ui, -apple-system, \"Segoe UI\", sans-serif;\n  }\n  h1 { font-size: 19px; margin: 0 0 2px; }\n  .sub { color: var(--dim); font-size: 13px; margin-bottom: 12px; overflow-wrap: anywhere; }\n  .note { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); margin-bottom: 10px; font-size: 14px; }\n  .note.bad { border-color: var(--bad); color: var(--bad); }\n  .note.warn { border-color: var(--warn); color: var(--warn); }\n  .choices { display: grid; gap: 10px; margin-bottom: 16px; min-width: 0; }\n  button {\n    font: inherit; color: inherit; min-height: 44px; border-radius: 10px;\n    border: 1px solid var(--line); background: var(--card); padding: 10px 12px; cursor: pointer; text-align: left;\n  }\n  button[disabled] { opacity: .55; cursor: not-allowed; }\n  button.chosen { border-color: var(--accent); border-width: 2px; font-weight: 600; }\n  /* Option names and voter names are other people's text: wrap rather than widen the page. */\n  button, .res, .resTop, .resTop span { overflow-wrap: anywhere; min-width: 0; }\n  .results { display: grid; gap: 8px; list-style: none; margin: 0 0 14px; padding: 0; }\n  .res { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-width: 0; }\n  .resTop { display: flex; justify-content: space-between; gap: 8px; font-size: 14px; }\n  .track { margin-top: 6px; height: 8px; border-radius: 999px; background: var(--bar); overflow: hidden; }\n  .fill { height: 100%; background: var(--accent); }\n  .you { font-size: 12px; color: var(--dim); margin-left: 6px; }\n  input {\n    font: inherit; color: inherit; min-height: 44px; width: 100%; border-radius: 10px;\n    border: 1px solid var(--line); background: var(--card); padding: 0 12px;\n  }\n  .commentRow { display: grid; gap: 8px; min-width: 0; }\n  @media (min-width: 640px) {\n    .choices { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }\n    .commentRow { grid-template-columns: 1fr auto; }\n  }\n</style>\n</head>\n<body>\n<h1>Poll</h1>\n<div class=\"sub\" id=\"sub\">Loading…</div>\n<div id=\"notes\"></div>\n<ul class=\"results\" id=\"results\"></ul>\n<div class=\"choices\" id=\"choices\"></div>\n<div class=\"commentRow\">\n  <input id=\"comment\" placeholder=\"Add a comment (optional)\" aria-label=\"Comment\" autocomplete=\"off\">\n  <button type=\"button\" id=\"saveComment\" hidden>Save comment</button>\n</div>\n<script>\n(async () => {\n  const art = window.artifact;\n  const db = art && art.db;\n  const $ = (id) => document.getElementById(id);\n  const notes = $('notes');\n  const show = (cls, text) => {\n    const el = document.createElement('div');\n    el.className = 'note ' + cls;\n    el.textContent = text;\n    notes.appendChild(el);\n  };\n  const clearNotes = () => { notes.textContent = ''; };\n  let hintShown = false;\n  const hint = (text) => { if (!hintShown) { hintShown = true; show('warn', text); } };\n\n  if (!db) {\n    $('sub').textContent = 'Preview';\n    show('warn', 'Open this page in s.space to vote: this is a preview with no data.');\n    return;\n  }\n  await art.ready;\n\n  const byName = (list, name) => (list.find((d) => d.name === name) || {}).id;\n  let dbs = [];\n  try { dbs = await db.list(); } catch (e) { show('bad', e.message); return; }\n  const id = (art.app && art.app.database) || byName(dbs, 'Poll — Votes');\n  if (!id) { $('sub').textContent = ''; show('bad', 'The \"Poll — Votes\" database is missing from this room.'); return; }\n\n  const save = async (call) => {\n    const until = Date.now() + 120000;\n    for (;;) {\n      const r = await call();\n      if (r.ok || !/waiting for the viewer|rate limit|too many/i.test(r.reason || '') || Date.now() > until) return r;\n      hint('Allow this page to edit data in this room, and your vote will save.');\n      await new Promise((ok) => setTimeout(ok, 1500));\n    }\n  };\n\n  let titleProp = null, myRow = null, consentKnown = true, busy = false, snapshot = null;\n\n  // A voter's identity for counting. The created_by cell is account ids, stamped by the server,\n  // so one vote per person can be counted without the viewer's consent (personId needs it).\n  const voterKey = (cell) => (Array.isArray(cell) ? cell.join(',') : cell == null ? '' : String(cell));\n\n  // One vote per voter: their last row wins. Snapshot order is the rows' insertion order.\n  const counted = (rows) => {\n    const latest = new Map();\n    rows.forEach((r) => { latest.set(voterKey(r.cells['Created by']) || 'row:' + r.id, r); });\n    return [...latest.values()];\n  };\n\n  // Who wrote each vote. personId rejects until the viewer allows the page, and then the page\n  // cannot tell its own vote from anyone else's: it shows \"?\" rather than claiming none.\n  // Resolved into locals and returned: renders overlap (each awaits personId row by row), so\n  // writing shared state here would let a slower, older render overwrite a newer one.\n  const findMine = async (snap) => {\n    let mine = null;\n    // The LAST of the viewer's rows, so \"your vote\" is the one the tally counts.\n    for (const row of snap.rows) {\n      try {\n        const who = await art.personId(row.cells['Created by']);\n        if (who && art.me && who === art.me.id) mine = row;\n      } catch (e) { return { myRow: null, consentKnown: false }; }\n    }\n    return { myRow: mine, consentKnown: true };\n  };\n  let generation = 0;\n\n  // One place that writes the comment, to ONE row fixed when it was submitted. Each retry checks\n  // that row still exists rather than re-resolving \"my vote\": a newer vote arriving in between\n  // must not receive (and overwrite with) this older text, and a deleted one is reported.\n  const writeComment = (text, rowId) =>\n    save(async () => {\n      if (!rowId || (snapshot && !snapshot.rows.some((row) => row.id === rowId))) {\n        return { ok: false, reason: 'your vote is no longer in this room' };\n      }\n      return db.write(id, rowId, 'Comment', text);\n    });\n\n  // Shown once the viewer has a vote, so a comment refused after the vote saved can be retried\n  // without casting the vote again.\n  const refreshSaveComment = () => {\n    const btn = $('saveComment');\n    const typed = $('comment').value.trim();\n    const saved = (myRow && myRow.cells.Comment) || '';\n    btn.hidden = !(consentKnown && myRow);\n    btn.disabled = busy || !typed || typed === saved;\n  };\n\n  const lockChoices = () => {\n    [...$('choices').children].forEach((el) => { el.disabled = true; });\n  };\n  const unlockChoices = () => {\n    [...$('choices').children].forEach((el) => { el.disabled = false; });\n  };\n\n  const draw = (snap) => {\n    clearNotes();\n    hintShown = false;\n    titleProp = (snap.props.find((p) => p.type === 'title') || {}).name;\n    const choice = snap.props.find((p) => p.name === 'Choice');\n    const options = (choice && choice.options) || [];\n    if (!options.length) {\n      // Clear first: a stale tally and buttons for removed options must not stay votable.\n      $('results').textContent = '';\n      $('choices').textContent = '';\n      $('sub').textContent = '';\n      show('bad', 'The Choice column has no options yet, so there is nothing to vote on.');\n      return;\n    }\n\n    // One row per vote, one vote per voter: repeat rows from one person count once.\n    // Null prototype: `tally['__proto__'] = 0` on a plain object sets the prototype instead of\n    // an own property, so votes for an option named that would vanish from the count.\n    const tally = Object.create(null);\n    options.forEach((o) => { tally[o.name] = 0; });\n    const votes = counted(snap.rows);\n    let total = 0;\n    votes.forEach((r) => {\n      const c = r.cells.Choice;\n      if (typeof c === 'string' && c in tally) { tally[c] += 1; total += 1; }\n    });\n    const ignored = snap.rows.length - votes.length;\n\n    $('sub').textContent = total + (total === 1 ? ' vote' : ' votes') +\n      (consentKnown ? (myRow ? '  ·  you voted ' + myRow.cells.Choice : '  ·  you have not voted') : '  ·  your vote: ?');\n    if (!consentKnown) show('warn', 'Allow the page to see who is who, and it will show your own vote and let you change it.');\n    if (ignored > 0) show('warn', ignored + (ignored === 1 ? ' extra row' : ' extra rows') + ' from someone who already voted are not counted.');\n\n    const res = $('results');\n    res.textContent = '';\n    if (!total) {\n      const li = document.createElement('li');\n      li.className = 'res';\n      li.textContent = 'No votes yet. Pick an option below to be first.';\n      res.appendChild(li);\n    } else {\n      options.forEach((o) => {\n        const n = tally[o.name];\n        const li = document.createElement('li');\n        li.className = 'res';\n        const top = document.createElement('div');\n        top.className = 'resTop';\n        const left = document.createElement('span');\n        left.textContent = o.name;\n        if (consentKnown && myRow && myRow.cells.Choice === o.name) {\n          const you = document.createElement('span');\n          you.className = 'you';\n          you.textContent = '(yours)';\n          left.appendChild(you);\n        }\n        const right = document.createElement('span');\n        right.textContent = n + '  ·  ' + Math.round((n / total) * 100) + '%';\n        top.appendChild(left); top.appendChild(right);\n        const track = document.createElement('div');\n        track.className = 'track';\n        const fill = document.createElement('div');\n        fill.className = 'fill';\n        fill.style.width = Math.round((n / total) * 100) + '%';\n        track.appendChild(fill);\n        li.appendChild(top); li.appendChild(track);\n        res.appendChild(li);\n      });\n    }\n\n    refreshSaveComment();\n    const box = $('choices');\n    box.textContent = '';\n    options.forEach((o) => {\n      const b = document.createElement('button');\n      b.type = 'button';\n      b.textContent = (consentKnown && myRow && myRow.cells.Choice === o.name) ? o.name + ' — your vote' : o.name;\n      if (consentKnown && myRow && myRow.cells.Choice === o.name) b.className = 'chosen';\n      b.disabled = busy || (consentKnown && myRow && myRow.cells.Choice === o.name);\n      b.setAttribute('aria-label', 'Vote for ' + o.name);\n      b.onclick = async () => {\n        if (busy) return;                                  // one vote in flight at a time\n        busy = true;\n        lockChoices();\n        const comment = $('comment').value.trim();\n        let r = { ok: false, reason: '' };\n        let commentResult = null;\n        // The row the Choice write actually edited, recorded inside that write. Reading myRow\n        // after the await would pick up whatever a re-render put there meanwhile.\n        let votedRowId = null;\n        // try/finally: anything thrown in here must still clear busy and redraw, or every\n        // control stays disabled for good.\n        try {\n          // Ownership is resolved inside the retried call: consent granted mid-retry turns this\n          // from a second row into an edit of the voter's own.\n          r = await save(async () => {\n            if (snapshot) {\n              const who = await findMine(snapshot);\n              myRow = who.myRow;\n              consentKnown = who.consentKnown;\n            }\n            if (myRow) {\n              votedRowId = myRow.id;\n              return db.write(id, votedRowId, 'Choice', o.name);\n            }\n            votedRowId = null;\n            const values = { Choice: o.name };\n            if (titleProp) values[titleProp] = (art.me && art.me.name) || 'Vote';\n            if (comment) values.Comment = comment;\n            return db.createRow(id, values);\n          });\n          // The comment is its own write with its own retry, so retrying it never rewrites\n          // Choice, and a refusal is reported instead of being dropped. The row is re-resolved\n          // on every attempt: it can be deleted between the refusal and the retry, and reading\n          // a remembered id would throw.\n          // A new vote carried the comment in its createRow; an edited one writes it separately,\n          // to the row that write used. If that row is gone by now, writeComment reports it.\n          if (r.ok && comment && votedRowId) commentResult = await writeComment(comment, votedRowId);\n        } catch (e) {\n          // A throw after the vote saved belongs to the comment: record it, or the success\n          // branch below would clear the box and the comment would vanish without a word.\n          if (!r.ok) r = { ok: false, reason: e.message || 'Your vote was not saved.' };\n          else if (comment) commentResult = { ok: false, reason: e.message || 'refused' };\n        } finally {\n          busy = false;\n          // Re-draw from the current snapshot: a watch update during the write replaced the\n          // buttons, and re-enabling the detached ones would leave the live set stuck disabled.\n          if (snapshot) await render(snapshot);\n          else unlockChoices();\n        }\n        if (!r.ok) show('bad', r.reason || 'Your vote was not saved.');\n        else if (commentResult && !commentResult.ok) {\n          show('warn', 'Your vote was saved, but the comment was not: ' +\n            (commentResult.reason || 'refused') + '. Your text is still in the box.');\n        } else if (comment && $('comment').value.trim() === comment) $('comment').value = '';\n      };\n      box.appendChild(b);\n    });\n  };\n\n  const render = async (snap) => {\n    const gen = ++generation;                          // a newer render supersedes this one\n    snapshot = snap;\n    if (!snap) { clearNotes(); $('results').textContent = ''; $('choices').textContent = ''; $('sub').textContent = ''; show('bad', 'The Poll database was removed from this room.'); return; }\n    const who = await findMine(snap);\n    if (gen !== generation) return;                    // superseded while resolving ownership\n    myRow = who.myRow;\n    consentKnown = who.consentKnown;\n    draw(snap);\n  };\n\n  db.onChange(id, render);\n  try { await render(await db.read(id)); } catch (e) { $('sub').textContent = ''; show('bad', e.message); }\n\n  $('comment').addEventListener('input', refreshSaveComment);\n  $('saveComment').onclick = async () => {\n    if (busy) return;\n    const text = $('comment').value.trim();\n    if (!text) return;\n    const target = myRow ? myRow.id : null;          // fixed now; a retry never moves it\n    busy = true;\n    refreshSaveComment();\n    let res = { ok: false, reason: '' };\n    try {\n      res = await writeComment(text, target);\n    } catch (e) {\n      res = { ok: false, reason: e.message || 'The comment was not saved.' };\n    } finally {\n      busy = false;\n      if (snapshot) await render(snapshot);\n      else refreshSaveComment();\n    }\n    if (!res.ok) show('bad', 'The comment was not saved: ' + (res.reason || 'refused') + '. Your text is still in the box.');\n    else if ($('comment').value.trim() === text) { $('comment').value = ''; refreshSaveComment(); }\n  };\n})();\n</script>\n</body>\n</html>\n"
+     },
+     "expect_replaced_empty": true,
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-11-6f3c2201"
+    },
+    {
+     "action": "room.commons.pages.read",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa"
+     },
+     "expect_bytes": 15615
+    },
+    {
+     "action": "room.commons.apps.create",
+     "room_id": "!abcDEF123:s.space",
+     "answers": "$app",
+     "arguments": {
+      "name": "Poll",
+      "database": "$db",
+      "page": "html-k3m9x2qa"
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-13-a5e01e3a"
+    }
+   ],
+   "reply_exit": 0,
+   "reply": "Built it.\n\n```commons-app-build\n{\"v\":1,\"request_id\":\"18181818-3434-4565-8787-909090909090\",\"status\":\"done\",\"reason\":\"\",\"page\":\"html-k3m9x2qa\",\"database\":\"d7k2m9x1\",\"app_id\":\"a1b2c3d4\"}\n```\n"
+  },
+  "list": {
+   "thread_root": [
+    "$a"
+   ],
+   "parse": {
+    "v": 1,
+    "request_id": "18181818-3434-4565-8787-909090909090",
+    "mode": "build",
+    "description": "a sign-up sheet for Saturday's cleanup",
+    "room_id": "!abcDEF123:s.space",
+    "page": "html-k3m9x2qa",
+    "database": null,
+    "template": "poll",
+    "app_id": null
+   },
+   "plan_exit": 0,
+   "plan": [
+    {
+     "action": "commons.app_guide",
+     "read": true,
+     "target_kind": "account",
+     "arguments": {}
+    },
+    {
+     "action": "room.members.list",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {},
+     "expect_member": "@owner:s.space"
+    },
+    {
+     "action": "room.commons.pages.list",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {},
+     "expect_page": "html-k3m9x2qa"
+    },
+    {
+     "action": "room.commons.pages.read",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa"
+     },
+     "expect_empty": true
+    },
+    {
+     "action": "room.commons.pages.create",
+     "room_id": "!abcDEF123:s.space",
+     "answers": "$db",
+     "arguments": {
+      "kind": "db",
+      "title": "Poll — Votes",
+      "template": "blank"
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-4-045b621f"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "skip_if_present": "Choice",
+     "arguments": {
+      "database": "$db",
+      "op": "prop_add",
+      "property": {
+       "name": "Choice",
+       "type": "select",
+       "options": [
+        {
+         "name": "Option A"
+        },
+        {
+         "name": "Option B"
+        },
+        {
+         "name": "Option C"
+        }
+       ]
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-5-cd536eab"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "skip_if_present": "Comment",
+     "arguments": {
+      "database": "$db",
+      "op": "prop_add",
+      "property": {
+       "name": "Comment",
+       "type": "text"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-6-ddf5f11e"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "skip_if_present": "Created by",
+     "arguments": {
+      "database": "$db",
+      "op": "prop_add",
+      "property": {
+       "name": "Created by",
+       "type": "created_by"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-7-8a939467"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "database": "$db",
+      "op": "view_add",
+      "view_settings": {
+       "layout": "table",
+       "name": "All votes"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-8-a28f6cc5"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "database": "$db",
+      "op": "view_add",
+      "view_settings": {
+       "layout": "board",
+       "name": "By choice",
+       "groupBy": "Choice"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-9-d3cde303"
+    },
+    {
+     "action": "room.commons.pages.read",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa"
+     },
+     "expect_empty": true
+    },
+    {
+     "action": "room.commons.pages.replace",
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa",
+      "mode": "whole",
+      "new_text": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Poll</title>\n<style>\n  :root {\n    color-scheme: light dark;\n    --bg: #fbfbfd; --card: #fff; --ink: #16161a; --dim: #5d5d6b;\n    --line: #e3e3ea; --accent: #2f5bea; --warn: #8a5a00; --bad: #b3261e; --bar: #d8def8;\n  }\n  @media (prefers-color-scheme: dark) {\n    :root {\n      --bg: #111115; --card: #1a1a20; --ink: #f2f2f5; --dim: #a6a6b4;\n      --line: #2c2c36; --accent: #7d9bff; --warn: #ffcf70; --bad: #ff8a80; --bar: #26314f;\n    }\n  }\n  * { box-sizing: border-box; }\n  body {\n    margin: 0; padding: 12px; background: var(--bg); color: var(--ink);\n    font: 16px/1.45 system-ui, -apple-system, \"Segoe UI\", sans-serif;\n  }\n  h1 { font-size: 19px; margin: 0 0 2px; }\n  .sub { color: var(--dim); font-size: 13px; margin-bottom: 12px; overflow-wrap: anywhere; }\n  .note { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); margin-bottom: 10px; font-size: 14px; }\n  .note.bad { border-color: var(--bad); color: var(--bad); }\n  .note.warn { border-color: var(--warn); color: var(--warn); }\n  .choices { display: grid; gap: 10px; margin-bottom: 16px; min-width: 0; }\n  button {\n    font: inherit; color: inherit; min-height: 44px; border-radius: 10px;\n    border: 1px solid var(--line); background: var(--card); padding: 10px 12px; cursor: pointer; text-align: left;\n  }\n  button[disabled] { opacity: .55; cursor: not-allowed; }\n  button.chosen { border-color: var(--accent); border-width: 2px; font-weight: 600; }\n  /* Option names and voter names are other people's text: wrap rather than widen the page. */\n  button, .res, .resTop, .resTop span { overflow-wrap: anywhere; min-width: 0; }\n  .results { display: grid; gap: 8px; list-style: none; margin: 0 0 14px; padding: 0; }\n  .res { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-width: 0; }\n  .resTop { display: flex; justify-content: space-between; gap: 8px; font-size: 14px; }\n  .track { margin-top: 6px; height: 8px; border-radius: 999px; background: var(--bar); overflow: hidden; }\n  .fill { height: 100%; background: var(--accent); }\n  .you { font-size: 12px; color: var(--dim); margin-left: 6px; }\n  input {\n    font: inherit; color: inherit; min-height: 44px; width: 100%; border-radius: 10px;\n    border: 1px solid var(--line); background: var(--card); padding: 0 12px;\n  }\n  .commentRow { display: grid; gap: 8px; min-width: 0; }\n  @media (min-width: 640px) {\n    .choices { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }\n    .commentRow { grid-template-columns: 1fr auto; }\n  }\n</style>\n</head>\n<body>\n<h1>Poll</h1>\n<div class=\"sub\" id=\"sub\">Loading…</div>\n<div id=\"notes\"></div>\n<ul class=\"results\" id=\"results\"></ul>\n<div class=\"choices\" id=\"choices\"></div>\n<div class=\"commentRow\">\n  <input id=\"comment\" placeholder=\"Add a comment (optional)\" aria-label=\"Comment\" autocomplete=\"off\">\n  <button type=\"button\" id=\"saveComment\" hidden>Save comment</button>\n</div>\n<script>\n(async () => {\n  const art = window.artifact;\n  const db = art && art.db;\n  const $ = (id) => document.getElementById(id);\n  const notes = $('notes');\n  const show = (cls, text) => {\n    const el = document.createElement('div');\n    el.className = 'note ' + cls;\n    el.textContent = text;\n    notes.appendChild(el);\n  };\n  const clearNotes = () => { notes.textContent = ''; };\n  let hintShown = false;\n  const hint = (text) => { if (!hintShown) { hintShown = true; show('warn', text); } };\n\n  if (!db) {\n    $('sub').textContent = 'Preview';\n    show('warn', 'Open this page in s.space to vote: this is a preview with no data.');\n    return;\n  }\n  await art.ready;\n\n  const byName = (list, name) => (list.find((d) => d.name === name) || {}).id;\n  let dbs = [];\n  try { dbs = await db.list(); } catch (e) { show('bad', e.message); return; }\n  const id = (art.app && art.app.database) || byName(dbs, 'Poll — Votes');\n  if (!id) { $('sub').textContent = ''; show('bad', 'The \"Poll — Votes\" database is missing from this room.'); return; }\n\n  const save = async (call) => {\n    const until = Date.now() + 120000;\n    for (;;) {\n      const r = await call();\n      if (r.ok || !/waiting for the viewer|rate limit|too many/i.test(r.reason || '') || Date.now() > until) return r;\n      hint('Allow this page to edit data in this room, and your vote will save.');\n      await new Promise((ok) => setTimeout(ok, 1500));\n    }\n  };\n\n  let titleProp = null, myRow = null, consentKnown = true, busy = false, snapshot = null;\n\n  // A voter's identity for counting. The created_by cell is account ids, stamped by the server,\n  // so one vote per person can be counted without the viewer's consent (personId needs it).\n  const voterKey = (cell) => (Array.isArray(cell) ? cell.join(',') : cell == null ? '' : String(cell));\n\n  // One vote per voter: their last row wins. Snapshot order is the rows' insertion order.\n  const counted = (rows) => {\n    const latest = new Map();\n    rows.forEach((r) => { latest.set(voterKey(r.cells['Created by']) || 'row:' + r.id, r); });\n    return [...latest.values()];\n  };\n\n  // Who wrote each vote. personId rejects until the viewer allows the page, and then the page\n  // cannot tell its own vote from anyone else's: it shows \"?\" rather than claiming none.\n  // Resolved into locals and returned: renders overlap (each awaits personId row by row), so\n  // writing shared state here would let a slower, older render overwrite a newer one.\n  const findMine = async (snap) => {\n    let mine = null;\n    // The LAST of the viewer's rows, so \"your vote\" is the one the tally counts.\n    for (const row of snap.rows) {\n      try {\n        const who = await art.personId(row.cells['Created by']);\n        if (who && art.me && who === art.me.id) mine = row;\n      } catch (e) { return { myRow: null, consentKnown: false }; }\n    }\n    return { myRow: mine, consentKnown: true };\n  };\n  let generation = 0;\n\n  // One place that writes the comment, to ONE row fixed when it was submitted. Each retry checks\n  // that row still exists rather than re-resolving \"my vote\": a newer vote arriving in between\n  // must not receive (and overwrite with) this older text, and a deleted one is reported.\n  const writeComment = (text, rowId) =>\n    save(async () => {\n      if (!rowId || (snapshot && !snapshot.rows.some((row) => row.id === rowId))) {\n        return { ok: false, reason: 'your vote is no longer in this room' };\n      }\n      return db.write(id, rowId, 'Comment', text);\n    });\n\n  // Shown once the viewer has a vote, so a comment refused after the vote saved can be retried\n  // without casting the vote again.\n  const refreshSaveComment = () => {\n    const btn = $('saveComment');\n    const typed = $('comment').value.trim();\n    const saved = (myRow && myRow.cells.Comment) || '';\n    btn.hidden = !(consentKnown && myRow);\n    btn.disabled = busy || !typed || typed === saved;\n  };\n\n  const lockChoices = () => {\n    [...$('choices').children].forEach((el) => { el.disabled = true; });\n  };\n  const unlockChoices = () => {\n    [...$('choices').children].forEach((el) => { el.disabled = false; });\n  };\n\n  const draw = (snap) => {\n    clearNotes();\n    hintShown = false;\n    titleProp = (snap.props.find((p) => p.type === 'title') || {}).name;\n    const choice = snap.props.find((p) => p.name === 'Choice');\n    const options = (choice && choice.options) || [];\n    if (!options.length) {\n      // Clear first: a stale tally and buttons for removed options must not stay votable.\n      $('results').textContent = '';\n      $('choices').textContent = '';\n      $('sub').textContent = '';\n      show('bad', 'The Choice column has no options yet, so there is nothing to vote on.');\n      return;\n    }\n\n    // One row per vote, one vote per voter: repeat rows from one person count once.\n    // Null prototype: `tally['__proto__'] = 0` on a plain object sets the prototype instead of\n    // an own property, so votes for an option named that would vanish from the count.\n    const tally = Object.create(null);\n    options.forEach((o) => { tally[o.name] = 0; });\n    const votes = counted(snap.rows);\n    let total = 0;\n    votes.forEach((r) => {\n      const c = r.cells.Choice;\n      if (typeof c === 'string' && c in tally) { tally[c] += 1; total += 1; }\n    });\n    const ignored = snap.rows.length - votes.length;\n\n    $('sub').textContent = total + (total === 1 ? ' vote' : ' votes') +\n      (consentKnown ? (myRow ? '  ·  you voted ' + myRow.cells.Choice : '  ·  you have not voted') : '  ·  your vote: ?');\n    if (!consentKnown) show('warn', 'Allow the page to see who is who, and it will show your own vote and let you change it.');\n    if (ignored > 0) show('warn', ignored + (ignored === 1 ? ' extra row' : ' extra rows') + ' from someone who already voted are not counted.');\n\n    const res = $('results');\n    res.textContent = '';\n    if (!total) {\n      const li = document.createElement('li');\n      li.className = 'res';\n      li.textContent = 'No votes yet. Pick an option below to be first.';\n      res.appendChild(li);\n    } else {\n      options.forEach((o) => {\n        const n = tally[o.name];\n        const li = document.createElement('li');\n        li.className = 'res';\n        const top = document.createElement('div');\n        top.className = 'resTop';\n        const left = document.createElement('span');\n        left.textContent = o.name;\n        if (consentKnown && myRow && myRow.cells.Choice === o.name) {\n          const you = document.createElement('span');\n          you.className = 'you';\n          you.textContent = '(yours)';\n          left.appendChild(you);\n        }\n        const right = document.createElement('span');\n        right.textContent = n + '  ·  ' + Math.round((n / total) * 100) + '%';\n        top.appendChild(left); top.appendChild(right);\n        const track = document.createElement('div');\n        track.className = 'track';\n        const fill = document.createElement('div');\n        fill.className = 'fill';\n        fill.style.width = Math.round((n / total) * 100) + '%';\n        track.appendChild(fill);\n        li.appendChild(top); li.appendChild(track);\n        res.appendChild(li);\n      });\n    }\n\n    refreshSaveComment();\n    const box = $('choices');\n    box.textContent = '';\n    options.forEach((o) => {\n      const b = document.createElement('button');\n      b.type = 'button';\n      b.textContent = (consentKnown && myRow && myRow.cells.Choice === o.name) ? o.name + ' — your vote' : o.name;\n      if (consentKnown && myRow && myRow.cells.Choice === o.name) b.className = 'chosen';\n      b.disabled = busy || (consentKnown && myRow && myRow.cells.Choice === o.name);\n      b.setAttribute('aria-label', 'Vote for ' + o.name);\n      b.onclick = async () => {\n        if (busy) return;                                  // one vote in flight at a time\n        busy = true;\n        lockChoices();\n        const comment = $('comment').value.trim();\n        let r = { ok: false, reason: '' };\n        let commentResult = null;\n        // The row the Choice write actually edited, recorded inside that write. Reading myRow\n        // after the await would pick up whatever a re-render put there meanwhile.\n        let votedRowId = null;\n        // try/finally: anything thrown in here must still clear busy and redraw, or every\n        // control stays disabled for good.\n        try {\n          // Ownership is resolved inside the retried call: consent granted mid-retry turns this\n          // from a second row into an edit of the voter's own.\n          r = await save(async () => {\n            if (snapshot) {\n              const who = await findMine(snapshot);\n              myRow = who.myRow;\n              consentKnown = who.consentKnown;\n            }\n            if (myRow) {\n              votedRowId = myRow.id;\n              return db.write(id, votedRowId, 'Choice', o.name);\n            }\n            votedRowId = null;\n            const values = { Choice: o.name };\n            if (titleProp) values[titleProp] = (art.me && art.me.name) || 'Vote';\n            if (comment) values.Comment = comment;\n            return db.createRow(id, values);\n          });\n          // The comment is its own write with its own retry, so retrying it never rewrites\n          // Choice, and a refusal is reported instead of being dropped. The row is re-resolved\n          // on every attempt: it can be deleted between the refusal and the retry, and reading\n          // a remembered id would throw.\n          // A new vote carried the comment in its createRow; an edited one writes it separately,\n          // to the row that write used. If that row is gone by now, writeComment reports it.\n          if (r.ok && comment && votedRowId) commentResult = await writeComment(comment, votedRowId);\n        } catch (e) {\n          // A throw after the vote saved belongs to the comment: record it, or the success\n          // branch below would clear the box and the comment would vanish without a word.\n          if (!r.ok) r = { ok: false, reason: e.message || 'Your vote was not saved.' };\n          else if (comment) commentResult = { ok: false, reason: e.message || 'refused' };\n        } finally {\n          busy = false;\n          // Re-draw from the current snapshot: a watch update during the write replaced the\n          // buttons, and re-enabling the detached ones would leave the live set stuck disabled.\n          if (snapshot) await render(snapshot);\n          else unlockChoices();\n        }\n        if (!r.ok) show('bad', r.reason || 'Your vote was not saved.');\n        else if (commentResult && !commentResult.ok) {\n          show('warn', 'Your vote was saved, but the comment was not: ' +\n            (commentResult.reason || 'refused') + '. Your text is still in the box.');\n        } else if (comment && $('comment').value.trim() === comment) $('comment').value = '';\n      };\n      box.appendChild(b);\n    });\n  };\n\n  const render = async (snap) => {\n    const gen = ++generation;                          // a newer render supersedes this one\n    snapshot = snap;\n    if (!snap) { clearNotes(); $('results').textContent = ''; $('choices').textContent = ''; $('sub').textContent = ''; show('bad', 'The Poll database was removed from this room.'); return; }\n    const who = await findMine(snap);\n    if (gen !== generation) return;                    // superseded while resolving ownership\n    myRow = who.myRow;\n    consentKnown = who.consentKnown;\n    draw(snap);\n  };\n\n  db.onChange(id, render);\n  try { await render(await db.read(id)); } catch (e) { $('sub').textContent = ''; show('bad', e.message); }\n\n  $('comment').addEventListener('input', refreshSaveComment);\n  $('saveComment').onclick = async () => {\n    if (busy) return;\n    const text = $('comment').value.trim();\n    if (!text) return;\n    const target = myRow ? myRow.id : null;          // fixed now; a retry never moves it\n    busy = true;\n    refreshSaveComment();\n    let res = { ok: false, reason: '' };\n    try {\n      res = await writeComment(text, target);\n    } catch (e) {\n      res = { ok: false, reason: e.message || 'The comment was not saved.' };\n    } finally {\n      busy = false;\n      if (snapshot) await render(snapshot);\n      else refreshSaveComment();\n    }\n    if (!res.ok) show('bad', 'The comment was not saved: ' + (res.reason || 'refused') + '. Your text is still in the box.');\n    else if ($('comment').value.trim() === text) { $('comment').value = ''; refreshSaveComment(); }\n  };\n})();\n</script>\n</body>\n</html>\n"
+     },
+     "expect_replaced_empty": true,
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-11-6f3c2201"
+    },
+    {
+     "action": "room.commons.pages.read",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa"
+     },
+     "expect_bytes": 15615
+    },
+    {
+     "action": "room.commons.apps.create",
+     "room_id": "!abcDEF123:s.space",
+     "answers": "$app",
+     "arguments": {
+      "name": "Poll",
+      "database": "$db",
+      "page": "html-k3m9x2qa"
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-13-a5e01e3a"
+    }
+   ],
+   "reply_exit": 0,
+   "reply": "Built it.\n\n```commons-app-build\n{\"v\":1,\"request_id\":\"18181818-3434-4565-8787-909090909090\",\"status\":\"done\",\"reason\":\"\",\"page\":\"html-k3m9x2qa\",\"database\":\"d7k2m9x1\",\"app_id\":\"a1b2c3d4\"}\n```\n"
+  },
+  "missing": {
+   "thread_root": null,
+   "parse": {
+    "v": 1,
+    "request_id": "18181818-3434-4565-8787-909090909090",
+    "mode": "build",
+    "description": "a sign-up sheet for Saturday's cleanup",
+    "room_id": "!abcDEF123:s.space",
+    "page": "html-k3m9x2qa",
+    "database": null,
+    "template": "poll",
+    "app_id": null
+   },
+   "plan_exit": 0,
+   "plan": [
+    {
+     "action": "commons.app_guide",
+     "read": true,
+     "target_kind": "account",
+     "arguments": {}
+    },
+    {
+     "action": "room.members.list",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {},
+     "expect_member": "@owner:s.space"
+    },
+    {
+     "action": "room.commons.pages.list",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {},
+     "expect_page": "html-k3m9x2qa"
+    },
+    {
+     "action": "room.commons.pages.read",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa"
+     },
+     "expect_empty": true
+    },
+    {
+     "action": "room.commons.pages.create",
+     "room_id": "!abcDEF123:s.space",
+     "answers": "$db",
+     "arguments": {
+      "kind": "db",
+      "title": "Poll — Votes",
+      "template": "blank"
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-4-045b621f"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "skip_if_present": "Choice",
+     "arguments": {
+      "database": "$db",
+      "op": "prop_add",
+      "property": {
+       "name": "Choice",
+       "type": "select",
+       "options": [
+        {
+         "name": "Option A"
+        },
+        {
+         "name": "Option B"
+        },
+        {
+         "name": "Option C"
+        }
+       ]
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-5-cd536eab"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "skip_if_present": "Comment",
+     "arguments": {
+      "database": "$db",
+      "op": "prop_add",
+      "property": {
+       "name": "Comment",
+       "type": "text"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-6-ddf5f11e"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "skip_if_present": "Created by",
+     "arguments": {
+      "database": "$db",
+      "op": "prop_add",
+      "property": {
+       "name": "Created by",
+       "type": "created_by"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-7-8a939467"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "database": "$db",
+      "op": "view_add",
+      "view_settings": {
+       "layout": "table",
+       "name": "All votes"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-8-a28f6cc5"
+    },
+    {
+     "action": "room.commons.databases.mutate",
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "database": "$db",
+      "op": "view_add",
+      "view_settings": {
+       "layout": "board",
+       "name": "By choice",
+       "groupBy": "Choice"
+      }
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-9-d3cde303"
+    },
+    {
+     "action": "room.commons.pages.read",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa"
+     },
+     "expect_empty": true
+    },
+    {
+     "action": "room.commons.pages.replace",
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa",
+      "mode": "whole",
+      "new_text": "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Poll</title>\n<style>\n  :root {\n    color-scheme: light dark;\n    --bg: #fbfbfd; --card: #fff; --ink: #16161a; --dim: #5d5d6b;\n    --line: #e3e3ea; --accent: #2f5bea; --warn: #8a5a00; --bad: #b3261e; --bar: #d8def8;\n  }\n  @media (prefers-color-scheme: dark) {\n    :root {\n      --bg: #111115; --card: #1a1a20; --ink: #f2f2f5; --dim: #a6a6b4;\n      --line: #2c2c36; --accent: #7d9bff; --warn: #ffcf70; --bad: #ff8a80; --bar: #26314f;\n    }\n  }\n  * { box-sizing: border-box; }\n  body {\n    margin: 0; padding: 12px; background: var(--bg); color: var(--ink);\n    font: 16px/1.45 system-ui, -apple-system, \"Segoe UI\", sans-serif;\n  }\n  h1 { font-size: 19px; margin: 0 0 2px; }\n  .sub { color: var(--dim); font-size: 13px; margin-bottom: 12px; overflow-wrap: anywhere; }\n  .note { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); margin-bottom: 10px; font-size: 14px; }\n  .note.bad { border-color: var(--bad); color: var(--bad); }\n  .note.warn { border-color: var(--warn); color: var(--warn); }\n  .choices { display: grid; gap: 10px; margin-bottom: 16px; min-width: 0; }\n  button {\n    font: inherit; color: inherit; min-height: 44px; border-radius: 10px;\n    border: 1px solid var(--line); background: var(--card); padding: 10px 12px; cursor: pointer; text-align: left;\n  }\n  button[disabled] { opacity: .55; cursor: not-allowed; }\n  button.chosen { border-color: var(--accent); border-width: 2px; font-weight: 600; }\n  /* Option names and voter names are other people's text: wrap rather than widen the page. */\n  button, .res, .resTop, .resTop span { overflow-wrap: anywhere; min-width: 0; }\n  .results { display: grid; gap: 8px; list-style: none; margin: 0 0 14px; padding: 0; }\n  .res { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-width: 0; }\n  .resTop { display: flex; justify-content: space-between; gap: 8px; font-size: 14px; }\n  .track { margin-top: 6px; height: 8px; border-radius: 999px; background: var(--bar); overflow: hidden; }\n  .fill { height: 100%; background: var(--accent); }\n  .you { font-size: 12px; color: var(--dim); margin-left: 6px; }\n  input {\n    font: inherit; color: inherit; min-height: 44px; width: 100%; border-radius: 10px;\n    border: 1px solid var(--line); background: var(--card); padding: 0 12px;\n  }\n  .commentRow { display: grid; gap: 8px; min-width: 0; }\n  @media (min-width: 640px) {\n    .choices { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }\n    .commentRow { grid-template-columns: 1fr auto; }\n  }\n</style>\n</head>\n<body>\n<h1>Poll</h1>\n<div class=\"sub\" id=\"sub\">Loading…</div>\n<div id=\"notes\"></div>\n<ul class=\"results\" id=\"results\"></ul>\n<div class=\"choices\" id=\"choices\"></div>\n<div class=\"commentRow\">\n  <input id=\"comment\" placeholder=\"Add a comment (optional)\" aria-label=\"Comment\" autocomplete=\"off\">\n  <button type=\"button\" id=\"saveComment\" hidden>Save comment</button>\n</div>\n<script>\n(async () => {\n  const art = window.artifact;\n  const db = art && art.db;\n  const $ = (id) => document.getElementById(id);\n  const notes = $('notes');\n  const show = (cls, text) => {\n    const el = document.createElement('div');\n    el.className = 'note ' + cls;\n    el.textContent = text;\n    notes.appendChild(el);\n  };\n  const clearNotes = () => { notes.textContent = ''; };\n  let hintShown = false;\n  const hint = (text) => { if (!hintShown) { hintShown = true; show('warn', text); } };\n\n  if (!db) {\n    $('sub').textContent = 'Preview';\n    show('warn', 'Open this page in s.space to vote: this is a preview with no data.');\n    return;\n  }\n  await art.ready;\n\n  const byName = (list, name) => (list.find((d) => d.name === name) || {}).id;\n  let dbs = [];\n  try { dbs = await db.list(); } catch (e) { show('bad', e.message); return; }\n  const id = (art.app && art.app.database) || byName(dbs, 'Poll — Votes');\n  if (!id) { $('sub').textContent = ''; show('bad', 'The \"Poll — Votes\" database is missing from this room.'); return; }\n\n  const save = async (call) => {\n    const until = Date.now() + 120000;\n    for (;;) {\n      const r = await call();\n      if (r.ok || !/waiting for the viewer|rate limit|too many/i.test(r.reason || '') || Date.now() > until) return r;\n      hint('Allow this page to edit data in this room, and your vote will save.');\n      await new Promise((ok) => setTimeout(ok, 1500));\n    }\n  };\n\n  let titleProp = null, myRow = null, consentKnown = true, busy = false, snapshot = null;\n\n  // A voter's identity for counting. The created_by cell is account ids, stamped by the server,\n  // so one vote per person can be counted without the viewer's consent (personId needs it).\n  const voterKey = (cell) => (Array.isArray(cell) ? cell.join(',') : cell == null ? '' : String(cell));\n\n  // One vote per voter: their last row wins. Snapshot order is the rows' insertion order.\n  const counted = (rows) => {\n    const latest = new Map();\n    rows.forEach((r) => { latest.set(voterKey(r.cells['Created by']) || 'row:' + r.id, r); });\n    return [...latest.values()];\n  };\n\n  // Who wrote each vote. personId rejects until the viewer allows the page, and then the page\n  // cannot tell its own vote from anyone else's: it shows \"?\" rather than claiming none.\n  // Resolved into locals and returned: renders overlap (each awaits personId row by row), so\n  // writing shared state here would let a slower, older render overwrite a newer one.\n  const findMine = async (snap) => {\n    let mine = null;\n    // The LAST of the viewer's rows, so \"your vote\" is the one the tally counts.\n    for (const row of snap.rows) {\n      try {\n        const who = await art.personId(row.cells['Created by']);\n        if (who && art.me && who === art.me.id) mine = row;\n      } catch (e) { return { myRow: null, consentKnown: false }; }\n    }\n    return { myRow: mine, consentKnown: true };\n  };\n  let generation = 0;\n\n  // One place that writes the comment, to ONE row fixed when it was submitted. Each retry checks\n  // that row still exists rather than re-resolving \"my vote\": a newer vote arriving in between\n  // must not receive (and overwrite with) this older text, and a deleted one is reported.\n  const writeComment = (text, rowId) =>\n    save(async () => {\n      if (!rowId || (snapshot && !snapshot.rows.some((row) => row.id === rowId))) {\n        return { ok: false, reason: 'your vote is no longer in this room' };\n      }\n      return db.write(id, rowId, 'Comment', text);\n    });\n\n  // Shown once the viewer has a vote, so a comment refused after the vote saved can be retried\n  // without casting the vote again.\n  const refreshSaveComment = () => {\n    const btn = $('saveComment');\n    const typed = $('comment').value.trim();\n    const saved = (myRow && myRow.cells.Comment) || '';\n    btn.hidden = !(consentKnown && myRow);\n    btn.disabled = busy || !typed || typed === saved;\n  };\n\n  const lockChoices = () => {\n    [...$('choices').children].forEach((el) => { el.disabled = true; });\n  };\n  const unlockChoices = () => {\n    [...$('choices').children].forEach((el) => { el.disabled = false; });\n  };\n\n  const draw = (snap) => {\n    clearNotes();\n    hintShown = false;\n    titleProp = (snap.props.find((p) => p.type === 'title') || {}).name;\n    const choice = snap.props.find((p) => p.name === 'Choice');\n    const options = (choice && choice.options) || [];\n    if (!options.length) {\n      // Clear first: a stale tally and buttons for removed options must not stay votable.\n      $('results').textContent = '';\n      $('choices').textContent = '';\n      $('sub').textContent = '';\n      show('bad', 'The Choice column has no options yet, so there is nothing to vote on.');\n      return;\n    }\n\n    // One row per vote, one vote per voter: repeat rows from one person count once.\n    // Null prototype: `tally['__proto__'] = 0` on a plain object sets the prototype instead of\n    // an own property, so votes for an option named that would vanish from the count.\n    const tally = Object.create(null);\n    options.forEach((o) => { tally[o.name] = 0; });\n    const votes = counted(snap.rows);\n    let total = 0;\n    votes.forEach((r) => {\n      const c = r.cells.Choice;\n      if (typeof c === 'string' && c in tally) { tally[c] += 1; total += 1; }\n    });\n    const ignored = snap.rows.length - votes.length;\n\n    $('sub').textContent = total + (total === 1 ? ' vote' : ' votes') +\n      (consentKnown ? (myRow ? '  ·  you voted ' + myRow.cells.Choice : '  ·  you have not voted') : '  ·  your vote: ?');\n    if (!consentKnown) show('warn', 'Allow the page to see who is who, and it will show your own vote and let you change it.');\n    if (ignored > 0) show('warn', ignored + (ignored === 1 ? ' extra row' : ' extra rows') + ' from someone who already voted are not counted.');\n\n    const res = $('results');\n    res.textContent = '';\n    if (!total) {\n      const li = document.createElement('li');\n      li.className = 'res';\n      li.textContent = 'No votes yet. Pick an option below to be first.';\n      res.appendChild(li);\n    } else {\n      options.forEach((o) => {\n        const n = tally[o.name];\n        const li = document.createElement('li');\n        li.className = 'res';\n        const top = document.createElement('div');\n        top.className = 'resTop';\n        const left = document.createElement('span');\n        left.textContent = o.name;\n        if (consentKnown && myRow && myRow.cells.Choice === o.name) {\n          const you = document.createElement('span');\n          you.className = 'you';\n          you.textContent = '(yours)';\n          left.appendChild(you);\n        }\n        const right = document.createElement('span');\n        right.textContent = n + '  ·  ' + Math.round((n / total) * 100) + '%';\n        top.appendChild(left); top.appendChild(right);\n        const track = document.createElement('div');\n        track.className = 'track';\n        const fill = document.createElement('div');\n        fill.className = 'fill';\n        fill.style.width = Math.round((n / total) * 100) + '%';\n        track.appendChild(fill);\n        li.appendChild(top); li.appendChild(track);\n        res.appendChild(li);\n      });\n    }\n\n    refreshSaveComment();\n    const box = $('choices');\n    box.textContent = '';\n    options.forEach((o) => {\n      const b = document.createElement('button');\n      b.type = 'button';\n      b.textContent = (consentKnown && myRow && myRow.cells.Choice === o.name) ? o.name + ' — your vote' : o.name;\n      if (consentKnown && myRow && myRow.cells.Choice === o.name) b.className = 'chosen';\n      b.disabled = busy || (consentKnown && myRow && myRow.cells.Choice === o.name);\n      b.setAttribute('aria-label', 'Vote for ' + o.name);\n      b.onclick = async () => {\n        if (busy) return;                                  // one vote in flight at a time\n        busy = true;\n        lockChoices();\n        const comment = $('comment').value.trim();\n        let r = { ok: false, reason: '' };\n        let commentResult = null;\n        // The row the Choice write actually edited, recorded inside that write. Reading myRow\n        // after the await would pick up whatever a re-render put there meanwhile.\n        let votedRowId = null;\n        // try/finally: anything thrown in here must still clear busy and redraw, or every\n        // control stays disabled for good.\n        try {\n          // Ownership is resolved inside the retried call: consent granted mid-retry turns this\n          // from a second row into an edit of the voter's own.\n          r = await save(async () => {\n            if (snapshot) {\n              const who = await findMine(snapshot);\n              myRow = who.myRow;\n              consentKnown = who.consentKnown;\n            }\n            if (myRow) {\n              votedRowId = myRow.id;\n              return db.write(id, votedRowId, 'Choice', o.name);\n            }\n            votedRowId = null;\n            const values = { Choice: o.name };\n            if (titleProp) values[titleProp] = (art.me && art.me.name) || 'Vote';\n            if (comment) values.Comment = comment;\n            return db.createRow(id, values);\n          });\n          // The comment is its own write with its own retry, so retrying it never rewrites\n          // Choice, and a refusal is reported instead of being dropped. The row is re-resolved\n          // on every attempt: it can be deleted between the refusal and the retry, and reading\n          // a remembered id would throw.\n          // A new vote carried the comment in its createRow; an edited one writes it separately,\n          // to the row that write used. If that row is gone by now, writeComment reports it.\n          if (r.ok && comment && votedRowId) commentResult = await writeComment(comment, votedRowId);\n        } catch (e) {\n          // A throw after the vote saved belongs to the comment: record it, or the success\n          // branch below would clear the box and the comment would vanish without a word.\n          if (!r.ok) r = { ok: false, reason: e.message || 'Your vote was not saved.' };\n          else if (comment) commentResult = { ok: false, reason: e.message || 'refused' };\n        } finally {\n          busy = false;\n          // Re-draw from the current snapshot: a watch update during the write replaced the\n          // buttons, and re-enabling the detached ones would leave the live set stuck disabled.\n          if (snapshot) await render(snapshot);\n          else unlockChoices();\n        }\n        if (!r.ok) show('bad', r.reason || 'Your vote was not saved.');\n        else if (commentResult && !commentResult.ok) {\n          show('warn', 'Your vote was saved, but the comment was not: ' +\n            (commentResult.reason || 'refused') + '. Your text is still in the box.');\n        } else if (comment && $('comment').value.trim() === comment) $('comment').value = '';\n      };\n      box.appendChild(b);\n    });\n  };\n\n  const render = async (snap) => {\n    const gen = ++generation;                          // a newer render supersedes this one\n    snapshot = snap;\n    if (!snap) { clearNotes(); $('results').textContent = ''; $('choices').textContent = ''; $('sub').textContent = ''; show('bad', 'The Poll database was removed from this room.'); return; }\n    const who = await findMine(snap);\n    if (gen !== generation) return;                    // superseded while resolving ownership\n    myRow = who.myRow;\n    consentKnown = who.consentKnown;\n    draw(snap);\n  };\n\n  db.onChange(id, render);\n  try { await render(await db.read(id)); } catch (e) { $('sub').textContent = ''; show('bad', e.message); }\n\n  $('comment').addEventListener('input', refreshSaveComment);\n  $('saveComment').onclick = async () => {\n    if (busy) return;\n    const text = $('comment').value.trim();\n    if (!text) return;\n    const target = myRow ? myRow.id : null;          // fixed now; a retry never moves it\n    busy = true;\n    refreshSaveComment();\n    let res = { ok: false, reason: '' };\n    try {\n      res = await writeComment(text, target);\n    } catch (e) {\n      res = { ok: false, reason: e.message || 'The comment was not saved.' };\n    } finally {\n      busy = false;\n      if (snapshot) await render(snapshot);\n      else refreshSaveComment();\n    }\n    if (!res.ok) show('bad', 'The comment was not saved: ' + (res.reason || 'refused') + '. Your text is still in the box.');\n    else if ($('comment').value.trim() === text) { $('comment').value = ''; refreshSaveComment(); }\n  };\n})();\n</script>\n</body>\n</html>\n"
+     },
+     "expect_replaced_empty": true,
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-11-6f3c2201"
+    },
+    {
+     "action": "room.commons.pages.read",
+     "read": true,
+     "room_id": "!abcDEF123:s.space",
+     "arguments": {
+      "kind": "html-k3m9x2qa"
+     },
+     "expect_bytes": 15615
+    },
+    {
+     "action": "room.commons.apps.create",
+     "room_id": "!abcDEF123:s.space",
+     "answers": "$app",
+     "arguments": {
+      "name": "Poll",
+      "database": "$db",
+      "page": "html-k3m9x2qa"
+     },
+     "operation_id": "cab-18181818-3434-4565-8787-909090909090-13-a5e01e3a"
+    }
+   ],
+   "reply_exit": 0,
+   "reply": "Built it.\n\n```commons-app-build\n{\"v\":1,\"request_id\":\"18181818-3434-4565-8787-909090909090\",\"status\":\"done\",\"reason\":\"\",\"page\":\"html-k3m9x2qa\",\"database\":\"d7k2m9x1\",\"app_id\":\"a1b2c3d4\"}\n```\n"
+  }
+ }
+}

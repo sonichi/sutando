@@ -477,6 +477,73 @@ class TestDrive(unittest.TestCase):
         self.assertEqual(M.drive_escalations(None, "s", PERM, "blocked-human", lambda k: True), [])
 
 
+class TestSequentialPrompts(unittest.TestCase):
+    """#5544: a write the core asks about again after a card's Yes went in must get its own
+    card; deduping onto the answered card left the owner a stale card and the terminal."""
+
+    RUNNING = "✻ Writing… (2s · ↓ 120 tokens · esc to interrupt)\n"
+
+    def _run(self, panes, on_tick):
+        from unittest.mock import patch
+
+        class _Done(Exception):
+            pass
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "working"}
+        m, sent, tick = _mgr(), [], {"n": 0}
+
+        def sleep(_s):
+            on_tick(m, tick["n"])
+            tick["n"] += 1
+            if tick["n"] >= len(panes):
+                raise _Done()
+        out = os.path.join(tempfile.mkdtemp(), "state", "core-supervisor.json")
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out,
+                "--stable", "2", "--interval", "0", "--no-auto-answer"]
+        with patch.object(M, "capture_styled", lambda s, sess: panes[min(tick["n"], len(panes) - 1)]), \
+                patch.object(M, "_load_runtime_health", lambda: _RH()), \
+                patch.object(M, "gateway_alive", lambda *a: True), \
+                patch.object(M, "session_runtime", lambda *a: "claude"), \
+                patch.object(M, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(M, "_hitl_manager", lambda out_path: m), \
+                patch.object(M, "send_keys", lambda sock, sess, k: sent.append(k) or True), \
+                patch.object(M, "notice_queued", lambda *a, **k: None), \
+                patch.object(M.core_gate_notice, "queued_count", lambda ws: 0), \
+                patch.object(M.core_gate_notice, "end_outage", lambda ws: None), \
+                patch.object(M.time, "sleep", sleep), \
+                patch.object(sys, "argv", argv):
+            with self.assertRaises(_Done):
+                M.main()
+        return m, sent
+
+    def test_the_same_prompt_asked_again_after_a_driven_yes_gets_a_new_card(self):
+        def click(m, n):
+            if n == 1:  # the card exists after the second (debounced) tick
+                _click(m, m.active()[0], "allow")
+        # card, click driven, the core runs one tick, then asks the identical question again
+        panes = [PERM, PERM, PERM, self.RUNNING, PERM, PERM]
+        m, sent = self._run(panes, click)
+        cards = sorted(m.store.all(), key=lambda r: r.created_at)
+        self.assertEqual(sent, ["Enter"])
+        self.assertEqual(len(cards), 2, [(c.id, c.status) for c in cards])
+        self.assertEqual(cards[0].status, STATUS_RESOLVED)
+        self.assertEqual(cards[1].status, "pending")
+        self.assertEqual([a.label for a in cards[1].actions], ["No", "Yes", "Open terminal"])
+
+    def test_a_driven_card_whose_dialog_is_still_up_is_not_resolved(self):
+        def click(m, n):
+            if n == 1:
+                _click(m, m.active()[0], "allow")
+        m, sent = self._run([PERM, PERM, PERM, PERM], click)
+        cards = m.store.all()
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0].status, "in_progress")
+
+
 class TestPartialSend(unittest.TestCase):
     """Reviewer P1: a key sequence that half-lands must never read as driven, and
     must never be finished later against a caret nobody can place."""

@@ -353,7 +353,8 @@ which the poll is ≤1 s. The installed shape is the interactive one.
 ## Launch: `ag2-sparrow-claude-local`
 
 ```bash
-ag2-sparrow-claude-local connect --base <url> --agent <@agent:server>   # asks for the code; or, by hand:
+ag2-sparrow-claude-local install --agent <@agent:server> --token-stdin   # paste the relay token when asked
+ag2-sparrow-claude-local connect --base <url> --agent <@agent:server>   # or with a code; or, by hand:
 ag2-sparrow-claude-local install \
   --claude-config-dir <dir> \
   [--token-env-file <the agent's .env>] [--work <work>]
@@ -368,6 +369,22 @@ ag2-sparrow-claude-local list            # each job installed here, its agent, s
 The session loads the ag2space-inbox plugin this package ships;
 `--plugin-dir <dir>` on `install` or `connect` loads another copy instead (a
 working tree under edit, say).
+
+**Install with a pasted token.** `install --agent <the agent's Matrix ID> --token-stdin` asks for the
+agent's relay token without echoing it (on a terminal), or reads one line from stdin when it is piped. It
+takes the bare `<relay_url>|<secret>` token or a `REMOTE_TASK_TOKEN=…` / `AG2_REMOTE_TOKEN='…'` line (quotes
+and `export ` stripped); anything else, or a relay that is not https (plain http only on a loopback host, for tests), is
+refused with nothing written. Before anything is written, the relay's `GET /v1/whoami` (5 s timeout) must name exactly
+`--agent` for the token: a token for another agent (both ids named), a rejected token (401/403), an answer
+naming no agent, a redirect (never followed with the token), or no answer at all is refused and nothing
+is written. An agent id from the relay is shown only when it is a plain Matrix ID holding no part of the token. The
+token goes to the same seat `connect` writes for that agent (`<root>.bridge/channels/ag2space/`, mode 600,
+through a temp file and a rename; a seat file that is a link, a FIFO or anything but a regular file is
+refused, never followed), so a later switch to the other adapter reuses it. Every refusal that needs no
+token comes before it is read: the other adapter already serving the agent (with its `uninstall --agent`
+command), this agent's job still running (stop it first), and `--token-env-file`, `--work` or `--inbox`
+given too. Install then runs as with `--token-env-file <that seat's .env>`. The token is never on a
+command line, so no shell history, `ps` or `set -x` trace holds it.
 
 **Connect with a code.** On a host with no core, the two steps s.space shows
 are the agent's whole setup:
@@ -585,6 +602,30 @@ stays the pane's. The session runs `claude --plugin-dir … --permission-mode �
 `--session-id <id>`: `install` mints the id, a reinstall keeps it, and
 `install --new-session` rotates it only once the old generation is proven
 gone (quiescent; otherwise the old id stays and the command says so).
+
+**Resuming a conversation you already have.** `install` or `connect` with
+`--resume-session <uuid>` hosts an existing Claude Code conversation instead
+of a new one: the id is recorded as the session id and the pane starts
+`claude --resume <uuid>`. Its transcript must exist as `<uuid>.jsonl` in some
+project folder of the config dir's `projects/` (pass the `--claude-config-dir`
+it was made in), and no running Claude Code process may have it open (the CLI's
+own `sessions/` registry); otherwise nothing is changed and, for `connect`, the
+code is not spent. Claude Code finds a transcript by id from any working
+directory, so nothing is copied or linked: the conversation keeps growing in
+its own file, and new turns record the pane's `<work>/tasks` as their cwd. A
+kept id is replaced under the same rule as `--new-session`; when it cannot be
+(the old session is not proven gone), the agent is installed and running under
+the kept id, its bridge included, and the command exits **79** with a line
+naming the stop to run before installing again. Find the id with
+`/status` in that conversation, or as the file name under `projects/`.
+A host that gives the agent a config dir of its own places a copy (a clone,
+never a link to the owner's file) at
+`<claude-config-dir>/projects/<any folder>/<uuid>.jsonl` before install, and
+passes `--claude-config-dir <claude-config-dir> --resume-session <uuid>`; only
+that config dir is searched. Exit 0: the conversation is the session; 79: the
+agent runs under its earlier session id instead (nothing torn down); 2: refused
+before anything changed (bad id, no transcript, or the conversation open in a
+running Claude Code process).
 
 **Folder trust and startup dialogs.** Before it creates a session the launcher
 records Claude Code's own trust for exactly `<work>/tasks` (never a parent):

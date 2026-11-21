@@ -145,7 +145,7 @@ class Publish(unittest.TestCase):
         with patch.object(self.rl, 'write', side_effect=OSError('read-only')):
             code, err = self.run_cli('Done.', '--title', 'Add two')
         self.assertEqual(code, 0)
-        self.assertIn('published without --title/--outcome: read-only', err)
+        self.assertIn('published without --title/--outcome/--parent: read-only', err)
         self.assertEqual(self.result.read_text(), 'Done.')
 
     def test_the_label_writer_is_found_inside_or_outside_a_package(self):

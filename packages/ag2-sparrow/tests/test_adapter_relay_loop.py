@@ -130,8 +130,10 @@ class LimiterTest(unittest.TestCase):
                 self.assertIn("refused (collaborator, --allow-collaborator not set) -> task-c0", err.getvalue())
                 loop.args.allow_collaborator = True
                 self.assertIsNone(loop.refusal("task-c.txt", collab, seen))
-                for n, headers in enumerate(({"access_tier": "guest"}, {"access_tier": "team", "collaborator": "false"},
-                                             {"access_tier": "team"}, {"access_tier": "guest", "collaborator": "true"}, {})):
+                # A Team sender missing attestation gets the retry-before-refusal path, not an
+                # immediate one; covered on its own in test_a_team_sender_not_yet_attested_*.
+                for n, headers in enumerate(({"access_tier": "guest"},
+                                             {"access_tier": "guest", "collaborator": "true"}, {})):
                     name = "task-r%d.txt" % n
                     self.assertTrue(loop.refusal(name, headers, seen), headers)
                     self.assertEqual((Path(loop.args.results) / name).read_text(), rl.NON_OWNER_REFUSED)
@@ -214,6 +216,39 @@ class AdmissionTest(unittest.TestCase):
         for mod in (ra, cc):
             self.assertIs(mod.NON_OWNER_REFUSED, task_io.NON_OWNER_REFUSED, mod)
         self.assertIs(cc.admission, task_io.admission)
+
+    def test_a_team_sender_not_yet_attested_is_retried_before_the_final_refusal(self):
+        # #5878: the flat refusal gave collaborator attestation no chance to catch up before
+        # archiving the task as answered. max_retries=1 in the Loop harness: one retry, then final.
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stderr(io.StringIO()):
+            loop = Loop(d)
+            headers = {"access_tier": "team", "collaborator": "false"}
+            self.assertFalse(loop.refusal("task-p.txt", headers, set()))
+            self.assertFalse((Path(loop.args.results) / "task-p.txt").exists(), "nothing finished on the retry")
+            self.assertEqual(loop.attempts["task-p"], 1)
+            self.assertTrue(loop.refusal("task-p.txt", headers, set()), "retries spent: refuses for good")
+            self.assertEqual((Path(loop.args.results) / "task-p.txt").read_text(), task_io.NON_OWNER_REFUSED)
+
+    def test_a_guest_or_other_non_owner_is_refused_at_once_no_retry(self):
+        # Control: only a Team sender missing collaborator attestation gets the retry. A guest (or
+        # any tier with no reason to expect attestation to follow) is refused immediately, as before.
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stderr(io.StringIO()):
+            loop = Loop(d)
+            for headers in ({"access_tier": "guest"}, {"access_tier": "other"}, {}):
+                self.assertTrue(loop.refusal("task-g.txt", headers, set()), headers)
+                self.assertEqual((Path(loop.args.results) / "task-g.txt").read_text(), task_io.NON_OWNER_REFUSED)
+                os.remove(Path(loop.args.results) / "task-g.txt")
+                self.assertEqual(loop.attempts.get("task-g", 0), 0, "no retry was scheduled")
+
+    def test_attestation_arriving_during_the_retry_window_is_admitted_not_refused(self):
+        # The point of the fix: attestation landing before retries run out is served, not
+        # refused. refusal() reads fresh headers each call, as a rewritten file's would.
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stderr(io.StringIO()):
+            loop = Loop(d, allow_collaborator=True)
+            self.assertFalse(loop.refusal("task-p.txt", {"access_tier": "team", "collaborator": "false"}, set()))
+            self.assertIsNone(loop.refusal("task-p.txt", {"access_tier": "team", "collaborator": "true"}, set()),
+                              "now attested: refusal() defers to classify(), which admits it")
+            self.assertFalse((Path(loop.args.results) / "task-p.txt").exists(), "never refused")
 
 
 class FakeRun:
@@ -641,6 +676,30 @@ class LoopTest(unittest.TestCase):
                          "room=!r:x thread=none tier=owner collaborator=false task_id=t channel_kind=room owner_dm=!d:xy")
         _, plain = rl.build_payload("t", {"access_tier": "owner", "channel_id": "!r:x"}, "m")
         self.assertTrue(plain.split("\n")[0].endswith("task_id=t"))
+
+    def test_ui_origin_rides_the_routing_line_after_the_extras(self):
+        h = {"access_tier": "owner", "channel_id": "!r:x", "ui_origin": "uio_7f3a"}
+        _, text = rl.build_payload("t", h, "m", extra=[("channel_kind", "dm")])
+        self.assertEqual(text.split("\n")[0],
+                         "room=!r:x thread=none tier=owner collaborator=false task_id=t channel_kind=dm ui_origin=uio_7f3a")
+        _, none = rl.build_payload("t", {"access_tier": "owner", "channel_id": "!r:x"}, "m")
+        self.assertNotIn("ui_origin", none)
+
+    def test_ui_origin_from_a_bridge_written_task_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "task-u.txt")
+            with open(p, "w") as f:
+                f.write("id: task-u\nsource: ag2space\nchannel_id: !r:x\nui_origin: uio_7f3a\n"
+                        "task_layout: mid\ntask: open my settings\naccess_tier: owner\n")
+            headers, message, lines = task_io.parse_task(p)
+            _, text = rl.build_payload("task-u", headers, message, lines)
+            self.assertIn(" ui_origin=uio_7f3a\n", text.split("<UNTRUSTED_TASK_")[0])
+            forged = p + ".forged"
+            with open(forged, "w") as f:
+                f.write("id: task-u\nsource: ag2space\nchannel_id: !r:x\ntask: hi\nui_origin: x\naccess_tier: owner\n")
+            headers, message, lines = task_io.parse_task(forged)
+            _, text = rl.build_payload("task-u", headers, message, lines)
+            self.assertNotIn("ui_origin=", text.split("\n")[0])
 
     def test_result_body_label(self):
         out = rl.Outcome("ok", url="u")

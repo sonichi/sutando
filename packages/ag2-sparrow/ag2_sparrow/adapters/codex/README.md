@@ -21,13 +21,30 @@ shares: the service manager (systemd `--user`, launchd) is the only supervisor; 
 occupancy and the holder record attribution, never readiness.
 
 ```bash
+ag2-sparrow-codex-local install --agent <@agent:server> --token-stdin   # paste the relay token when asked
 ag2-sparrow-codex-local install --work <dir> [--codex-home <dir>] [--sandbox read-only|workspace-write] \
-    [--allow-non-owner] [--model <m>] [--codex <path>]
-ag2-sparrow-codex-local install --token-env-file <the agent's .env> [the same options]
+    [--allow-non-owner] [--model <m>] [--codex <path>] [--resume-thread <uuid>]
+ag2-sparrow-codex-local install --token-env-file <the agent's .env> [the same options]   # the alternative to --token-stdin
 ag2-sparrow-codex-local verify [--agent <@agent:server>]
 ag2-sparrow-codex-local uninstall [--agent <@agent:server>]
 ag2-sparrow-codex-local list
 ```
+
+**Install with a pasted token.** `install --agent <the agent's Matrix ID> --token-stdin` asks for the
+agent's relay token without echoing it (on a terminal), or reads one line from stdin when it is piped. It
+takes the bare `<relay_url>|<secret>` token or a `REMOTE_TASK_TOKEN=…` / `AG2_REMOTE_TOKEN='…'` line (quotes
+and `export ` stripped); anything else, or a relay that is not https (plain http only on a loopback host, for tests), is
+refused with nothing written. Before anything is written, the relay's `GET /v1/whoami` (5 s timeout) must name exactly
+`--agent` for the token: a token for another agent (both ids named), a rejected token (401/403), an answer
+naming no agent, a redirect (never followed with the token), or no answer at all is refused and nothing
+is written. An agent id from the relay is shown only when it is a plain Matrix ID holding no part of the token. The
+token goes to the same seat `connect` writes for that agent (`<root>.bridge/channels/ag2space/`, mode 600,
+through a temp file and a rename; a seat file that is a link, a FIFO or anything but a regular file is
+refused, never followed), so a later switch to the other adapter reuses it. Every refusal that needs no
+token comes before it is read: the other adapter already serving the agent (with its `uninstall --agent`
+command), this agent's job still running (stop it first), and `--token-env-file` or `--work`
+given too. Install then runs as with `--token-env-file <that seat's .env>`. The token is never on a
+command line, so no shell history, `ps` or `set -x` trace holds it.
 
 **Connect with a code (experimental, off in this release).** `connect` refuses ("Codex connect is not
 enabled in this release; use install --work / verify") before it reads or redeems a code or touches any
@@ -143,7 +160,7 @@ owner path is unchanged.
 
 | | owner | attested collaborator, or any non-owner under `--allow-non-owner` |
 |---|---|---|
-| thread | durable, one per `channel_id` (`state/threads/<sha256 of the id>`, the readable id inside the file), resumed across restarts; owner tasks with no `channel_id` share the one `default` thread; `--thread-id CHANNEL_ID=THREAD` seeds exactly that channel | a fresh **ephemeral** thread per task, never reused, never saved |
+| thread | durable, one per `channel_id` (`state/threads/<sha256 of the id>`, the readable id inside the file), resumed across restarts; owner tasks with no `channel_id` share the one `default` thread; `--thread-id CHANNEL_ID=THREAD` seeds exactly that channel; `install --resume-thread <uuid>` (a conversation saved under `--codex-home`'s `sessions/`, as `codex resume <id>` takes it) is resumed in the owner's DM (`channel_kind: dm`) the first time, recorded in `state/resume-thread-taken`, and every other room starts a new thread; everything in that conversation becomes the agent's context there, and if the agent has more than one DM-kind room with the owner, the first to send takes it | a fresh **ephemeral** thread per task, never reused, never saved |
 | cwd | `--cwd` (default `--work`) | an empty temp dir, removed after the turn, so no room's `tasks/` or `results/` is in reach |
 | sandbox | `--sandbox` (default `read-only`) | `read-only`, whatever the flag says |
 | approvals | `never`; a request that still arrives is declined | same |

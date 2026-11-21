@@ -33,6 +33,7 @@ TOKEN = "sk-ant-oat01-FAKE-TEST-TOKEN-do-not-log"
 TRIGGER = "trig_01TESTTRIGGER"
 PROMPT_MD = PKG_ROOT / "ag2_sparrow" / "adapters" / "claude_routine" / "routine-prompt.md"
 NOTE = cc.NON_OWNER_NOTE
+AUDIENCE = "audience: " + cc.AUDIENCE_RULE
 SPAN_RE = re.compile(r"<(UNTRUSTED_TASK_[0-9a-f]{8})>\n(.*)\n</\1>", re.S)
 
 
@@ -175,17 +176,19 @@ class PayloadTest(unittest.TestCase):
     def test_owner_has_routing_line_and_body_and_no_note(self):
         room, text = self.payload(thread="$root1")
         self.assertEqual(room, "!room:ag2.space")
-        first, rest = text.split("\n", 1)
+        first, audience, rest = text.split("\n", 2)
         self.assertEqual(first, "room=!room:ag2.space thread=$root1 tier=owner collaborator=false task_id=task-1")
+        self.assertEqual(audience, AUDIENCE)
         m = SPAN_RE.fullmatch(rest)
         self.assertIsNotNone(m, text)
         self.assertEqual(m.group(2), "hello there")
 
     def test_team_collaborator_gets_the_note(self):
         _, text = self.payload(tier="team", collaborator=True)
-        first, second, rest = text.split("\n", 2)
+        first, second, audience, rest = text.split("\n", 3)
         self.assertEqual(first, "room=!room:ag2.space thread=none tier=team collaborator=true task_id=task-1")
         self.assertEqual(second, "note: " + NOTE)
+        self.assertEqual(audience, AUDIENCE)
         self.assertEqual(SPAN_RE.fullmatch(rest).group(2), "hello there")
 
     def test_guest_and_unknown_tiers_get_the_note_and_never_collaborator(self):
@@ -249,6 +252,12 @@ class PayloadTest(unittest.TestCase):
         self.assertTrue(m.group(2).endswith("[truncated]"))
         self.assertEqual(text[m.end():], "\nop")
 
+    def test_routine_prompt_gates_the_ui_tools_to_owner(self):
+        prompt = " ".join(PROMPT_MD.read_text(encoding="utf-8").split())
+        self.assertIn("Only when `tier=owner`, to open something there, pass it exactly as given as the "
+                      "`ui_origin` argument of ui_describe, then ui_request and ui_result; for any other tier, "
+                      "never call those tools.", prompt)
+
     def test_routine_prompt_carries_the_note_verbatim(self):
         prompt = PROMPT_MD.read_text(encoding="utf-8")
         self.assertIn(NOTE, prompt)
@@ -267,8 +276,9 @@ class FireLoopTest(unittest.TestCase):
             self.assertEqual(req["headers"]["authorization"], "Bearer " + TOKEN)
             self.assertEqual(req["headers"]["anthropic-version"], "2023-06-01")
             self.assertEqual(req["headers"]["content-type"], "application/json")
-            first, rest = req["body"]["text"].split("\n", 1)
+            first, audience, rest = req["body"]["text"].split("\n", 2)
             self.assertEqual(first, "room=!room:ag2.space thread=none tier=owner collaborator=false task_id=task-a")
+            self.assertEqual(audience, AUDIENCE)
             self.assertEqual(SPAN_RE.fullmatch(rest).group(2), "hello")
             self.assertEqual(list(req["body"]), ["text"])
             self.assertNotIn(TOKEN, log)

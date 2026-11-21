@@ -17,7 +17,9 @@ from outbox import DeliveryOutcome as ReceiptOutcome
 from outbox_adapter import DeliveryReceipt, classify_response
 
 WORKER = "slack-results"
-PARK_AT_ATTEMPTS = 5
+# A refusal is retried with backoff for the outbox's wall-clock window, not a bare
+# attempt count: the watcher polls every second, so 5 attempts lasted ~5 s.
+RETRY_SCHEDULE = outbox.RetrySchedule()
 
 # chat.postMessage's receipt IS the message `ts` — excluded from the adapter's
 # default keys (elsewhere a send time), but in Slack it is the message id.
@@ -32,7 +34,7 @@ def result_backend(results_dir: Path) -> DesignAClaimBackend:
     root = Path(results_dir) / ".outbox-slack-results"
     b = _BACKENDS.get(root)
     if b is None:
-        b = _BACKENDS[root] = DesignAClaimBackend(root)
+        b = _BACKENDS[root] = DesignAClaimBackend(root, retry_schedule=RETRY_SCHEDULE)
     return b
 
 
@@ -52,7 +54,8 @@ def is_parked(results_dir: Path, task_id: str) -> bool:
 
 def claim_for_send(results_dir: Path, task_id: str) -> Optional[ClaimToken]:
     """Publish (one-slot, idempotent) then claim. None = someone else holds
-    it or it just completed — the caller skips this pass, never re-sends."""
+    it, it just completed, or a refused reply is still backing off (an
+    exhausted window parks it) — the caller skips this pass, never re-sends."""
     b = result_backend(results_dir)
     st = outbox.item_status(b.root, task_id)
     if st == "DELIVERED" or st == "PARKED":
@@ -70,12 +73,11 @@ def confirm(results_dir: Path, token: ClaimToken, destination: str) -> bool:
 
 
 def failed(results_dir: Path, token: ClaimToken) -> bool:
-    """NOT_DELIVERED: re-readied for the next pass (Slack's refusal semantics
-    were always retry); parks at the attempt cap so an unsendable reply cannot
-    retry forever (duplicate-generator rule)."""
+    """NOT_DELIVERED: re-readied after a backoff (Slack's refusal semantics
+    were always retry); parks once RETRY_SCHEDULE's window has closed with its
+    minimum failures, so an unsendable reply cannot retry forever."""
     return result_backend(results_dir).complete(
-        token, DeliveryOutcome.NOT_DELIVERED,
-        park_at_attempts=PARK_AT_ATTEMPTS)
+        token, DeliveryOutcome.NOT_DELIVERED)
 
 
 def unknown(results_dir: Path, token: ClaimToken) -> bool:

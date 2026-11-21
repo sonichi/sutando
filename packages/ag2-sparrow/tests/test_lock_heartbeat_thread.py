@@ -58,8 +58,17 @@ def fake_req(method, path, *a, **k):
     return {"tasks": []} if path.startswith("/v1/tasks?") else {}
 
 
+if os.environ.get("PROBE_HANG_RELEASE"):
+    def hung_release(*a, **k):
+        if os.environ.get("PROBE_FILL_OUTPUT"):
+            # Output nobody reads: the writer blocks on the full pipe holding stdout's lock.
+            import threading
+            threading.Thread(target=lambda: print("x" * 65536 * 4, flush=True), daemon=True).start()
+            time.sleep(1)
+        time.sleep(600)  # a release that never returns: the exit hook the lost-lock exit runs last
+    m._ws_release = hung_release
 m._req = fake_req
-m.main()
+m.run()
 '''
 
 
@@ -74,7 +83,7 @@ def _load(base):
     return importlib.reload(mod)
 
 
-def _spawn(base, pass_max, warmup=0):
+def _spawn(base, pass_max, warmup=0, hang_release=False, fill_output=False):
     for sub in ("tasks", "results", "state"):
         (base / sub).mkdir()
     started, gate = base / "started", base / "gate"
@@ -85,7 +94,9 @@ def _spawn(base, pass_max, warmup=0):
            "REMOTE_TASK_TOKEN": "dummy-secret",
            "SUTANDO_SUPERVISED": "1",
            "PROBE_STARTED": str(started), "PROBE_GATE": str(gate),
-           "PROBE_PASS_MAX": str(pass_max), "PROBE_WARMUP": str(warmup)})
+           "PROBE_PASS_MAX": str(pass_max), "PROBE_WARMUP": str(warmup),
+           "PROBE_HANG_RELEASE": "1" if hang_release else "",
+           "PROBE_FILL_OUTPUT": "1" if fill_output else ""})
     env.pop("SUTANDO_BRIDGE_LOCK", None)
     child = subprocess.Popen([sys.executable, "-c", _CHILD % (str(PKG_ROOT), str(SRC_DIR), STALE_S)],
                              env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -146,7 +157,7 @@ def test_a_hung_loop_pass_lets_a_successor_reap_the_holder():
             gate.write_text("open")
             child.wait(15)
             out = child.stdout.read()
-            assert child.returncode == 0, (child.returncode, out)
+            assert child.returncode == 70, (child.returncode, out)
             assert "singleton: main loop has made no progress" in out, out
             assert "singleton: lost workspace poller lock" in out, out
             lock = m2._LOCK_WS / "state" / "locks" / f"{m2._LOCK_ROLE}.lock"
@@ -187,23 +198,30 @@ def test_a_late_long_pass_is_covered_by_the_loop_stamp():
         print("PASS test_a_late_long_pass_is_covered_by_the_loop_stamp")
 
 
+def _lose_lock(base, hang_release=False, fill_output=False):
+    """Spawn a holder, hand its lock to this pid, and let its blocked pass end."""
+    child, gate = _spawn(base, pass_max=STALE_S * 4, hang_release=hang_release,
+                         fill_output=fill_output)
+    m2 = _load(base)
+    lock = m2._LOCK_WS / "state" / "locks" / f"{m2._LOCK_ROLE}.lock"
+    holder = json.loads(lock.read_text())
+    holder["pid"] = os.getpid()
+    lock.write_text(json.dumps(holder))
+    time.sleep(STALE_S)
+    gate.write_text("open")
+    return child, gate, m2, lock
+
+
 def test_a_lost_lock_still_stops_the_poller():
     """The dual-poll guard is unchanged: once another process owns the lock,
-    the holder logs the loss and leaves main() on its next pass."""
+    the holder logs the loss and exits on its next pass, with a code a
+    supervisor restarts on (0 reads as a deliberate stop, 75 as a stand-down)."""
     with tempfile.TemporaryDirectory() as d:
-        base = pathlib.Path(d)
-        child, gate = _spawn(base, pass_max=STALE_S * 4)
-        m2 = _load(base)
-        lock = m2._LOCK_WS / "state" / "locks" / f"{m2._LOCK_ROLE}.lock"
+        child, gate, m2, lock = _lose_lock(pathlib.Path(d))
         try:
-            holder = json.loads(lock.read_text())
-            holder["pid"] = os.getpid()
-            lock.write_text(json.dumps(holder))
-            time.sleep(STALE_S)
-            gate.write_text("open")
             child.wait(15)
             out = child.stdout.read()
-            assert child.returncode == 0, (child.returncode, out)
+            assert child.returncode == m2.LOCK_LOST_EXIT_CODE == 70, (child.returncode, out)
             assert "singleton: lost workspace poller lock" in out, out
             assert json.loads(lock.read_text())["pid"] == os.getpid(), \
                 "the old holder overwrote the new owner's lock"
@@ -213,9 +231,56 @@ def test_a_lost_lock_still_stops_the_poller():
         print("PASS test_a_lost_lock_still_stops_the_poller")
 
 
+def test_a_hung_exit_hook_cannot_keep_a_lost_holder_alive():
+    """The lost-lock exit runs exit hooks that wait without a bound; one that
+    never returns still ends the process, with the same code, within the bound."""
+    with tempfile.TemporaryDirectory() as d:
+        t0 = time.monotonic()
+        child, gate, m2, lock = _lose_lock(pathlib.Path(d), hang_release=True)
+        try:
+            try:
+                child.wait(m2._EXIT_HOOKS_BOUND_S + 15)
+            except subprocess.TimeoutExpired:
+                raise AssertionError(f"the holder was still alive {time.monotonic() - t0:.0f}s "
+                                     "after losing its lock: a hung exit hook kept it open")
+            out = child.stdout.read()
+            assert child.returncode == 70, (child.returncode, out)
+            assert "singleton: lost workspace poller lock" in out, out
+            assert "forced after 30s if an exit hook or shutdown hangs" in out, out
+            assert json.loads(lock.read_text())["pid"] == os.getpid(), \
+                "the old holder overwrote the new owner's lock"
+        finally:
+            _stop(child, gate)
+            m2._ws_release(m2._LOCK_ROLE, m2._LOCK_WS)
+        print("PASS test_a_hung_exit_hook_cannot_keep_a_lost_holder_alive")
+
+
+def test_a_full_output_pipe_cannot_block_the_forced_exit():
+    """The same hung exit, with the supervisor no longer reading the bridge's
+    output: the deadline still ends the process, because it writes nothing."""
+    with tempfile.TemporaryDirectory() as d:
+        child, gate, m2, lock = _lose_lock(pathlib.Path(d), hang_release=True, fill_output=True)
+        t0 = time.monotonic()
+        try:
+            try:
+                child.wait(m2._EXIT_HOOKS_BOUND_S + 2)  # stdout stays unread until it exits
+            except subprocess.TimeoutExpired:
+                raise AssertionError(f"the holder was still alive {time.monotonic() - t0:.1f}s after "
+                                     "losing its lock: the forced exit blocked on a full output pipe")
+            assert child.returncode == 70, child.returncode
+            assert json.loads(lock.read_text())["pid"] == os.getpid(), \
+                "the old holder overwrote the new owner's lock"
+        finally:
+            _stop(child, gate)
+            m2._ws_release(m2._LOCK_ROLE, m2._LOCK_WS)
+        print("PASS test_a_full_output_pipe_cannot_block_the_forced_exit")
+
+
 if __name__ == "__main__":
     test_a_long_loop_pass_does_not_let_a_successor_reap_the_holder()
     test_a_hung_loop_pass_lets_a_successor_reap_the_holder()
     test_a_late_long_pass_is_covered_by_the_loop_stamp()
     test_a_lost_lock_still_stops_the_poller()
+    test_a_hung_exit_hook_cannot_keep_a_lost_holder_alive()
+    test_a_full_output_pipe_cannot_block_the_forced_exit()
     print("all ok")
