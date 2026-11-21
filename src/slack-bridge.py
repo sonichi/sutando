@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Slack bridge for Sutando — receives DMs + @mentions via Socket Mode, writes to
+Slack bridge for Sutando — receives DMs, @mentions and replies in threads the
+bot started or was @-mentioned in via Socket Mode, writes to
 tasks/, sends replies from results/. Works alongside the voice / discord /
 telegram bridges. Runs as a background daemon.
 
@@ -98,7 +99,8 @@ from delivery.readiness import read_ready_result  # noqa: E402
 from dedup_recovery import fresh_reask_id, plan_dedup_recovery, report_disposition  # noqa: E402
 from message_chunking import chunk_message  # noqa: E402  (Result Router S3 — shared fence-aware chunker)
 from policy.egress.unfurl import should_unfurl  # noqa: E402
-from policy.egress.result import guard_result_for_tier, resolve_route_tier  # noqa: E402
+from policy.egress.result import (attachment_notice_name, guard_proactive_for_destination,  # noqa: E402
+                                  guard_result_for_tier, redirect_destination, resolve_route_tier)
 import local_task_protocol  # noqa: E402
 from task_body_guard import confine_user_content  # noqa: E402
 from util_paths import channel_access_path, claude_home_path, write_private_text  # noqa: E402
@@ -119,6 +121,7 @@ from slack_owner import resolve_proactive_owner_id  # noqa: E402
 from slack_proactive_receipts import mark_delivered as mark_proactive_delivered  # noqa: E402
 from slack_proactive_receipts import was_delivered as proactive_was_delivered  # noqa: E402
 import slack_result_delivery as _srd  # noqa: E402  (reply leg binds the shared outbox; needs _PKG_ROOT above)
+from slack_bot_threads import BotThreadRecord, is_addressed_thread_reply  # noqa: E402
 
 try:
     from slack_bolt import App
@@ -503,6 +506,8 @@ def tofu_onboard(user_id: str, username: str | None) -> set:
 # restarted bridge still needs the original channel + thread timestamp to route
 # a late result. Discord already persists the equivalent map for this reason.
 PENDING_REPLIES_FILE = STATE_DIR / "slack-pending-replies.json"
+# Human-rooted channel threads where the bot was @-mentioned; a plain reply there is addressed to it.
+BOT_THREADS = BotThreadRecord(STATE_DIR / "slack-bot-threads.json")
 
 
 def _atomic_write_pending_replies(data: dict) -> None:
@@ -595,6 +600,22 @@ def _guard_reply(task_id: str, target, reply_text: str) -> str:
     if withheld:
         print(f"  [team-guard] withheld result for {task_id} (tier={tier}): {withheld}", flush=True)
     return safe
+
+
+def _slack_destination_tier(channel: str) -> str:
+    """The audience tier of a proactive redirect target: a DM is its peer's tierMap tier,
+    anything else (or an unreadable DM) is "other", the bridge's fail-closed default."""
+    if not channel.startswith("D"):
+        return "other"
+    try:
+        info = app.client.conversations_info(channel=channel)["channel"]
+        peer = info.get("user") if info.get("is_im") else None
+    except Exception as e:
+        print(f"  [team-guard] could not read DM {channel} ({e}); guarding as other", flush=True)
+        return "other"
+    if not peer:
+        return "other"
+    return resolve_access_tier(peer, load_tier_map(), _ensure_tier_map_seeded())
 
 
 def _pop_pending_reply(task_id: str):
@@ -1036,7 +1057,8 @@ def _slack_context_note(event: dict) -> tuple[str, set[str]]:
         return _slack_context_unavailable_note(), set()
 
 
-def _write_task(event: dict, prefix: str, text: str, username: str | None) -> str | None:
+def _write_task(event: dict, prefix: str, text: str, username: str | None,
+                ack_not_allowed: bool = True) -> str | None:
     """Write a task file from a Slack event. Returns task_id or None if skipped."""
     user_id = event.get("user")
     if not user_id:
@@ -1087,12 +1109,12 @@ def _write_task(event: dict, prefix: str, text: str, username: str | None) -> st
         # Keep _TOFU_ENROLLMENT_CODE valid for the process lifetime (do NOT clear
         # it) so the gate stays armed if access.json is deleted externally later
         # (#899), instead of falling through to an unguarded tofu_onboard().
-    # Every _write_task call is a DM (handle_message) or an @mention
-    # (handle_mention), so a non-allowlisted sender here DID address the bot —
-    # ack them (rate-limited) before the fail-closed drop so it isn't silent.
+    # A DM or @mention DID address the bot, so ack (rate-limited) before the
+    # drop; a plain thread reply may be meant for the other humans there.
     if user_id not in allowed:
         print(f"  Dropped message from non-allowed user {user_id}", flush=True)
-        _ack_not_allowlisted(event, user_id)
+        if ack_not_allowed:
+            _ack_not_allowlisted(event, user_id)
         return None
 
     # Download any attached files BEFORE writing the task, so the task body
@@ -1461,19 +1483,71 @@ def handle_mention(event, say):
     text = re.sub(r"^<@[A-Z0-9]+>\s*", "", raw).strip()
     text, recovered = _resolve_mention_text(event, text)
     prefix = "Slack mention (recovered prior message)" if recovered else "Slack mention"
-    _write_task(event, prefix, text, username)
+    if _write_task(event, prefix, text, username):
+        _note_mention_thread(event)
+
+
+_bot_user_id_cache: list[str] = []
+_BOT_ID_RETRY_S = 30.0
+_bot_id_retry_at = [0.0]
+
+
+def _bot_user_id() -> str | None:
+    """This bot's Slack user id (auth.test), cached once known; None on failure.
+
+    A failure is remembered for _BOT_ID_RETRY_S so an outage costs one call, not one per reply.
+    """
+    if _bot_user_id_cache:
+        return _bot_user_id_cache[0]
+    if time.monotonic() < _bot_id_retry_at[0]:
+        return None
+    try:
+        uid = app.client.auth_test().get("user_id")
+    except Exception as e:
+        _bot_id_retry_at[0] = time.monotonic() + _BOT_ID_RETRY_S
+        print(f"  [thread-reply] auth.test failed: {e}", flush=True)
+        return None
+    if uid:
+        _bot_user_id_cache.append(uid)
+    return uid or None
+
+
+def _note_mention_thread(event: dict) -> None:
+    """Record the channel thread an accepted @mention sits in; never raises."""
+    try:
+        channel = event.get("channel") or ""
+        root = event.get("thread_ts") or event.get("ts")
+        if channel and not channel.startswith("D") and root:
+            BOT_THREADS.record(channel, str(root))
+    except Exception as e:
+        print(f"  [bot-threads] record failed: {e}", flush=True)
+
+
+def _handle_channel_thread_reply(event: dict) -> str | None:
+    """A plain reply in a bot-rooted or bot-@-mentioned thread → task, gated like a mention."""
+    thread_ts = event.get("thread_ts")
+    if not thread_ts or thread_ts == event.get("ts"):
+        return None
+    if not is_addressed_thread_reply(
+        event, _bot_user_id(),
+        BOT_THREADS.contains(event.get("channel", ""), str(thread_ts)),
+    ):
+        return None
+    user_id = event.get("user")
+    username = _resolve_username(user_id) if user_id else None
+    text = (event.get("text") or "").strip()
+    return _write_task(event, "Slack thread reply", text, username, ack_not_allowed=False)
 
 
 @app.event("message")
 def handle_message(event, say):
-    """DM → task file. Channel messages are handled via app_mention only."""
+    """DM → task file; a channel reply in a bot thread → task (mentions use app_mention)."""
     # Ignore bot messages, edited messages, and channel-history backfills.
     if event.get("subtype") in ("bot_message", "message_changed", "message_deleted"):
         return
-    # Only handle direct messages (channel_type=im). Channel @mentions arrive
-    # via the separate app_mention event above, so handling them here would
-    # double-fire.
+    # Channel @mentions arrive via app_mention; handling them here would double-fire.
     if event.get("channel_type") != "im":
+        _handle_channel_thread_reply(event)
         return
     user_id = event.get("user")
     if not user_id:
@@ -1617,7 +1691,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
             try:
                 app.client.chat_postMessage(
                     channel=channel,
-                    text=f"(file access denied: {fpath})",
+                    text=f"(file access denied: {attachment_notice_name(fpath, access_tier)})",
                     **({"thread_ts": thread_ts} if thread_ts else {}),
                 )
                 _parts_visible += 1
@@ -1632,7 +1706,7 @@ def _send_reply(channel: str, thread_ts: str | None, text: str, task_id: str | N
             try:
                 app.client.chat_postMessage(
                     channel=channel,
-                    text=f"(file not found: {fpath})",
+                    text=f"(file not found: {attachment_notice_name(fpath, access_tier)})",
                     **({"thread_ts": thread_ts} if thread_ts else {}),
                 )
                 _parts_visible += 1
@@ -1875,9 +1949,19 @@ def result_watcher():
                         try:
                             resp = app.client.conversations_open(users=owner_id)
                             dm_channel = resp["channel"]["id"]
-                            if _send_reply(dm_channel, None, text, access_tier="owner"):
+                            dest = redirect_destination(text) or dm_channel
+                            tier = "owner" if dest == dm_channel else _slack_destination_tier(dest)
+                            safe, withheld = guard_proactive_for_destination(text, dest, dm_channel, tier, REPO)
+                            if withheld:
+                                print(f"  [team-guard] withheld proactive {delivery_id} for {dest} (tier={tier}): {withheld}", flush=True)
+                                sent = _send_reply(dest, None, safe, access_tier=tier)
+                            else:
+                                sent = _send_reply(dm_channel, None, text, access_tier=tier)
+                            if sent:
                                 mark_proactive_delivered(STATE_DIR, delivery_id)
-                                print(f"  [proactive] sent to {owner_id}: {text[:80]}", flush=True)
+                                # Log where _send_reply posted: a [channel:] body never reaches the owner's DM.
+                                print(f"  [proactive] sent to {owner_id if dest == dm_channel else dest}: "
+                                      f"{parse_markers(safe).body[:80]}", flush=True)
                                 claim.unlink(missing_ok=True)
                             else:
                                 # Slack refused WITHOUT raising, which is the ordinary
@@ -1928,7 +2012,8 @@ def _no_events_hint_thread():
             "  Most common cause: Event Subscriptions is disabled in your app config.\n"
             "  Fix: https://api.slack.com/apps → your app → Event Subscriptions →\n"
             "    1. Toggle 'Enable Events' to ON\n"
-            "    2. Under 'Subscribe to bot events' add: message.im, app_mention\n"
+            "    2. Under 'Subscribe to bot events' add: message.im, app_mention,\n"
+            "       message.channels, message.groups (thread replies)\n"
             "    3. Save Changes (if greyed, see docs/slack-bridge.md install gotchas)\n"
             "    4. Reinstall app if Slack prompts a yellow banner\n"
             "  Then send a DM to your bot — TOFU will auto-onboard you as owner.",

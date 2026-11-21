@@ -25,11 +25,34 @@ sys.path.insert(1, str(Path(__file__).resolve().parents[3] / "src"))
 
 import pool_advertise as pa  # noqa: E402
 
+import connections  # noqa: E402
 import pool_roster as pr  # noqa: E402
 
 W1 = "a3f91c2d4e5b6a7c8d9e0f1a2b3c4d5e"
 W2 = "b4e02d3c5f6a7b8c9d0e1f2a3b4c5d6e"
 W3 = "c5f13e4d6a7b8c9d0e1f2a3b4c5d6e7f"
+
+AGENT_MXID = "@a3f91c2d4e5b6a7c8d9e0f1a2b3c4d5e.agent:fixture.net"
+# A value that would be alarming to find anywhere in an advertised payload.
+SENSITIVE_TOKEN_REF = "AG2_REMOTE_TOKEN_FIXTURE_SHOULD_NOT_LEAK"
+
+
+def _write_identity(ws: Path, wid: str, *, agent_mxid=None, token_ref=None, disabled=False,
+                    parked=False) -> None:
+    """A minimal worker identity row written straight to connections.json —
+    the same field `pool_identity.py show` and `report()` both read."""
+    row = {"server": "fixture.net", "instance": f"{wid[:8]}-agent", "gateway_url": "https://fixture.net",
+           "token_ref": token_ref or f"AG2_REMOTE_TOKEN_FIXTURE_{wid[:8].upper()}", "primary": False,
+           "added_by": "agent_link", "added_at": "2026-01-01T00:00:00Z", "verified": True,
+           "server_source": "identity", "worker": wid, "disabled": disabled}
+    if agent_mxid is not None:
+        row["agent_mxid"] = agent_mxid
+    if parked:
+        row["parked"] = True
+    path = connections.record_path(ws)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"schema_version": connections.SCHEMA_VERSION, "connections": [row],
+                                "removed_env": [], "legacy_parked": False, "relaunch_pending": {}}))
 
 
 class Base(unittest.TestCase):
@@ -87,6 +110,99 @@ class TestNamesComeFromTheProfilePatch(Base):
         self.assertNotIn(W2, pa.profile_workers(r))
         snap = pa.snapshot(r, now=1)
         self.assertNotIn(W2, snap["live_cores"] + snap["dead_cores"])
+
+
+class TestWorkerAgentMxidRidesTheReport(Base):
+    """`report()` is the body `_workers_body` actually sends to POST
+    /v1/workers (remote_gateway_bridge.py) — the one place the broker reads
+    agent_mxid back out of. Never profile_workers(): that channel feeds PUT
+    /v1/agents/<me>/profile, which the broker does not consult for this."""
+
+    def _worker(self, rep, wid):
+        return next(w for w in rep["workers"] if w["id"] == wid)
+
+    def test_a_worker_with_its_own_agent_carries_its_mxid_in_the_report(self):
+        r = self.roster({W1: {"state": "live", "label": "one"}})
+        _write_identity(self.ws, W1, agent_mxid=AGENT_MXID)
+        rep = pa.report(r, workspace=self.ws)
+        self.assertEqual(self._worker(rep, W1)["agent_mxid"], AGENT_MXID)
+
+    def test_a_worker_with_no_identity_row_omits_the_field_entirely(self):
+        r = self.roster({W1: {"state": "live", "label": "one"}})
+        rep = pa.report(r, workspace=self.ws)
+        self.assertNotIn("agent_mxid", self._worker(rep, W1))
+
+    def test_an_identity_row_with_no_mxid_also_omits_the_field(self):
+        r = self.roster({W1: {"state": "live", "label": "one"}})
+        _write_identity(self.ws, W1, agent_mxid=None)
+        rep = pa.report(r, workspace=self.ws)
+        self.assertNotIn("agent_mxid", self._worker(rep, W1))
+
+    def test_a_disabled_identity_row_is_never_advertised(self):
+        # connections.worker_identity has no disabled filter; report() must use
+        # worker_enabled_identity so a disabled row never rides the report.
+        r = self.roster({W1: {"state": "live", "label": "one"}})
+        _write_identity(self.ws, W1, agent_mxid=AGENT_MXID, disabled=True)
+        rep = pa.report(r, workspace=self.ws)
+        self.assertNotIn("agent_mxid", self._worker(rep, W1))
+
+    def test_a_parked_identity_row_is_never_advertised(self):
+        # A parked row stays in the record but no lane serves it, so the worker acts as the core.
+        r = self.roster({W1: {"state": "live", "label": "one"}})
+        _write_identity(self.ws, W1, agent_mxid=AGENT_MXID, parked=True)
+        self.assertTrue(connections.worker_identity(W1, self.ws).get("parked"))
+        rep = pa.report(r, workspace=self.ws)
+        self.assertNotIn("agent_mxid", self._worker(rep, W1))
+
+    def test_without_a_workspace_argument_the_field_never_appears(self):
+        # Backward compatibility: every pre-existing caller passed no workspace
+        # (often a synthetic roster naming no real install) and must see no change.
+        r = self.roster({W1: {"state": "live", "label": "one"}})
+        _write_identity(self.ws, W1, agent_mxid=AGENT_MXID)
+        rep = pa.report(r)
+        self.assertNotIn("agent_mxid", self._worker(rep, W1))
+
+    def test_profile_workers_never_carries_it_the_wrong_channel(self):
+        r = self.roster({W1: {"state": "live", "label": "one"}})
+        _write_identity(self.ws, W1, agent_mxid=AGENT_MXID)
+        self.assertNotIn("agent_mxid", pa.profile_workers(r)[W1])
+
+    def test_advertisement_end_to_end_carries_the_mxid_in_report_only(self):
+        self.roster({W1: {"state": "live", "label": "one"}})
+        _write_identity(self.ws, W1, agent_mxid=AGENT_MXID)
+        ad = pa.advertisement(self.ws, now=1)
+        self.assertEqual(self._worker(ad["report"], W1)["agent_mxid"], AGENT_MXID)
+        self.assertNotIn("agent_mxid", ad["profile_patch"]["workers"][W1])
+
+    def test_the_file_the_bridge_sends_carries_it(self):
+        # remote_gateway_bridge._workers_body prefers ad["report"] whenever its
+        # "workers" is a list, which it always is — so this is the real wire body.
+        self.roster({W1: {"state": "live", "label": "one"}})
+        _write_identity(self.ws, W1, agent_mxid=AGENT_MXID)
+        path = pa.write_advertisement(self.ws, now=1)
+        got = json.loads(path.read_text())
+        self.assertEqual(self._worker(got["report"], W1)["agent_mxid"], AGENT_MXID)
+
+
+class TestNoTokenOrTokenRefEverRidesAlong(Base):
+    def test_the_report_never_carries_the_token_ref_value(self):
+        r = self.roster({W1: {"state": "live", "label": "one"}})
+        _write_identity(self.ws, W1, agent_mxid=AGENT_MXID, token_ref=SENSITIVE_TOKEN_REF)
+        rep = pa.report(r, workspace=self.ws)
+        self.assertNotIn(SENSITIVE_TOKEN_REF, json.dumps(rep))
+        self.assertNotIn("token_ref", json.dumps(rep))
+
+    def test_the_full_advertisement_never_carries_it_either(self):
+        self.roster({W1: {"state": "live", "label": "one"}})
+        _write_identity(self.ws, W1, agent_mxid=AGENT_MXID, token_ref=SENSITIVE_TOKEN_REF)
+        ad = pa.advertisement(self.ws, now=1)
+        self.assertNotIn(SENSITIVE_TOKEN_REF, json.dumps(ad))
+
+    def test_a_worker_with_no_mxid_still_leaks_nothing(self):
+        r = self.roster({W1: {"state": "live", "label": "one"}})
+        _write_identity(self.ws, W1, agent_mxid=None, token_ref=SENSITIVE_TOKEN_REF)
+        rep = pa.report(r, workspace=self.ws)
+        self.assertNotIn(SENSITIVE_TOKEN_REF, json.dumps(rep))
 
 
 class TestTheTwoBodiesAgree(Base):

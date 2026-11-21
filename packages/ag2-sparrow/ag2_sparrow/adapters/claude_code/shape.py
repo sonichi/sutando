@@ -28,6 +28,10 @@ def session_launcher(root, rec: dict) -> "int | None":
     return launcher["pid"] if task_io.verify_lineage(launcher["pid"], launcher.get("start")) is True else None
 
 
+SESSION_NAME = "claude-local"
+SOCKET_NAME = "claude-local.sock"
+SUPERVISOR_LOCK = "claude-local.supervisor.lock"
+LAUNCHER_LOCK = "claude-local.launcher.lock"
 LOCAL = Shape(name="claude-local", command="ag2-sparrow-claude-local",
               description="a Claude Code session in a tmux pane as an s.space agent", cli="Claude Code CLI",
               min_version=(2, 1, 287), version_anchor=r"\(Claude Code\)",
@@ -39,15 +43,12 @@ LOCAL = Shape(name="claude-local", command="ag2-sparrow-claude-local",
                            "BRIDGE_STATE_DIR", "TMUX"),
               env_keep=("PATH", "HOME", "USER", "TERM", "ANTHROPIC_BASE_URL"), kept="the Claude login",
               kill_mode="process", stop_timeout_s=180, run_args=("run", "--launchd"), keep_alive_on_success=False,
-              manager_timeout_s=240, holder_launcher=session_launcher)
+              manager_timeout_s=240, holder_launcher=session_launcher,
+              run_files=(SUPERVISOR_LOCK, LAUNCHER_LOCK, records.PROGRESS_ALARM), hand_verb="attach")
 # The agent's own gateway bridge, when install runs it.
 BRIDGE = bridge_shape(LOCAL)
 # The marker the plugin reads at session.start: with it, the watch arms itself, no model turn.
 AUTOARM_VAR = "AG2_AUTOARM"
-SESSION_NAME = "claude-local"
-SOCKET_NAME = "claude-local.sock"
-SUPERVISOR_LOCK = "claude-local.supervisor.lock"
-LAUNCHER_LOCK = "claude-local.launcher.lock"
 MIN_TMUX = (3, 2)
 SOCKET_PATH_MAX = 100
 PLUGIN = Path(__file__).resolve().with_name("ag2space-inbox")      # package data, shipped in the wheel

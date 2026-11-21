@@ -1,16 +1,23 @@
 """A result's Activity labels: the `<name>.meta.json` side file beside `<name>.txt` in results/.
 
-`{"title": ..., "outcome": ...}` — the title says what the task is (imperative, at most
-TITLE_MAX characters), the outcome what came of it (past tense, asked at most OUTCOME_ASK,
-accepted up to OUTCOME_MAX). Both are one line with no control characters. The writer publishes
+`{"title": ..., "outcome": ..., "parent_task_id": ...}` — the title says what the task is
+(imperative, at most TITLE_MAX characters), the outcome what came of it (past tense, asked at most
+OUTCOME_ASK, accepted up to OUTCOME_MAX). Both are one line with no control characters. The parent
+is the id of the agent's earlier task this one continues, so Activity groups them. The writer publishes
 the side file before the result, so the bridge that reads the result finds its labels; a bridge
 without this module ignores them.
+
+Labels belong to one result body: the side file carries the SHA-256 of the bytes it was written for,
+and a reader given another body's digest gets none. So two publishers of one name can lose labels
+but never swap them, and no writer deletes a side file: one that matches no body is inert.
 """
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
+import re
 import tempfile
 import time
 import unicodedata
@@ -21,7 +28,11 @@ OUTCOME_MAX = 150
 # What agents are asked for; OUTCOME_MAX is the hard limit, with headroom above it.
 OUTCOME_ASK = 120
 SUFFIX = ".meta.json"
+DIGEST_KEY = "result_sha256"
 LIMITS = {"title": TITLE_MAX, "outcome": OUTCOME_MAX}
+PARENT_KEY = "parent_task_id"
+# The task ids the server accepts as a parent; anything else is refused there.
+PARENT_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 # Far above two bounded labels: a larger file is not one this writer made.
 _READ_MAX = 4096
 
@@ -63,9 +74,15 @@ def fit(value, limit: int) -> str:
     return text[:cut].rstrip() + "…"
 
 
-def check(title=None, outcome=None) -> "tuple[dict, list]":
+def parent(value) -> str:
+    """`value` when it is a task id the server could accept as a parent, else ""."""
+    text = value.strip() if isinstance(value, str) else ""
+    return text if PARENT_RE.fullmatch(text) else ""
+
+
+def check(title=None, outcome=None, parent_id=None) -> "tuple[dict, list]":
     """(labels, notes): each label cleaned and fitted to its limit, empty ones left out; a note
-    for each one that was cut."""
+    for each one that was cut, and for a parent that is not a task id."""
     labels, notes = {}, []
     for key, value in (("title", title), ("outcome", outcome)):
         text = fit(value, LIMITS[key])
@@ -73,20 +90,34 @@ def check(title=None, outcome=None) -> "tuple[dict, list]":
             notes.append(f"--{key} was over {LIMITS[key]} characters and was cut to fit")
         if text:
             labels[key] = text
+    if parent(parent_id):
+        labels[PARENT_KEY] = parent(parent_id)
+    elif clean(parent_id):
+        notes.append("--parent is not a task id and was left out")
     return labels, notes
 
 
-def write(result_file: Path, labels: dict) -> "Path | None":
-    """Atomically publish `labels` beside `result_file`. With none, remove any side file left
-    there, so a retried result never carries an earlier attempt's labels; then None."""
+def digest(body: str) -> str:
+    """The SHA-256 of `body` as a text-mode UTF-8 writer publishes it, newlines translated to the
+    platform's line ending: the bytes a reader of the result file hashes."""
+    return hashlib.sha256(body.replace("\n", os.linesep).encode("utf-8")).hexdigest()
+
+
+def write(result_file: Path, labels: dict, body: str) -> "Path | None":
+    """Atomically publish `labels` beside `result_file`, bound to `body`; None when there are none.
+    The results directory is made if missing, as publishing the result would."""
+    parent_id = parent(labels.get(PARENT_KEY))
     labels = {k: clean(labels.get(k)) for k in LIMITS if clean(labels.get(k))}
-    target = side_path(result_file)
+    if parent_id:
+        labels[PARENT_KEY] = parent_id
     if not labels:
-        target.unlink(missing_ok=True)
         return None
+    labels[DIGEST_KEY] = digest(body)
+    target = side_path(result_file)
+    target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp")
     try:
-        os.fchmod(fd, 0o600)
+        # mkstemp already made it 0600 where modes apply; os.fchmod is missing on older Windows.
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(labels, fh, ensure_ascii=False)
             fh.flush()
@@ -112,8 +143,9 @@ def archive(results_dir: Path, stem: str, archive_dir: Path) -> None:
         pass
 
 
-def read(path: Path) -> dict:
-    """The labels at a side file, each cleaned and fitted to its limit; {} when absent or unreadable."""
+def read(path: Path, result_digest: "str | None") -> dict:
+    """The labels at a side file for the result whose bytes hash to `result_digest`, each cleaned
+    and fitted to its limit; {} when absent, unreadable, or written for another body."""
     try:
         with open(path, "rb") as fh:
             raw = fh.read(_READ_MAX + 1)
@@ -125,6 +157,9 @@ def read(path: Path) -> dict:
         doc = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         return {}
-    if not isinstance(doc, dict):
+    if not isinstance(doc, dict) or not result_digest or doc.get(DIGEST_KEY) != result_digest:
         return {}
-    return {k: fit(doc.get(k), limit) for k, limit in LIMITS.items() if clean(doc.get(k))}
+    labels = {k: fit(doc.get(k), limit) for k, limit in LIMITS.items() if clean(doc.get(k))}
+    if parent(doc.get(PARENT_KEY)):
+        labels[PARENT_KEY] = parent(doc.get(PARENT_KEY))
+    return labels

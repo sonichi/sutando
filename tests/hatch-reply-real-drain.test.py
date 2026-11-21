@@ -222,8 +222,9 @@ class ReplyThroughTheRealDrain(unittest.TestCase):
     def test_labels_ride_a_dm_only_result(self):
         # A core writes a marked result itself; the hatch reply refuses markers.
         self.start()
-        self.side().write_text('{"title": "Add two and two"}')
-        (self.results / f'{self.tid}.txt').write_text('[dm-only]\n4\n')
+        result, body = self.results / f'{self.tid}.txt', '[dm-only]\n4\n'
+        gw.result_labels.write(result, {'title': 'Add two and two'}, body)
+        result.write_text(body)
         gw._post_ready_results({self.tid})
         self.assertEqual([(c['dm_only'], c.get('title')) for c in self.server.calls],
                          [(True, 'Add two and two')])

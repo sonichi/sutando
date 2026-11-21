@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""A pool worker that acts as its own agent asks the owner as itself.
+
+- In a worker session (SUTANDO_WORKER_ID) whose own identity is enabled, ask-owner's text ask is
+  queued under the name `result_publish.worker_published_path` gives it (`.by-<worker>`), so that
+  worker's own lane delivers it; the store adapter and the no-store path both do.
+- The core's session, and a worker with no identity or a disabled one, queue unstamped names.
+- An ask bound for Discord, Slack or Telegram keeps its bare name, so that bridge delivers it.
+- The question records who asked (the worker's agent id when stamped) in the outbox and the row.
+- A decision card stays on the core's path: no asker, no stamped text beside it or in its fallback.
+- The identity is read from the workspace passed in, not the default one.
+- A worker's own-agent ask names the worker as "<name> (a worker on <host>)" (its agent's display
+  name, else its roster label), else just "a worker on <host>"; the name is bounded, stripped of
+  format characters, and dropped if it reads as the core. The core's ask reads exactly as before.
+Temp workspaces and fakes only; nothing here reads the live workspace or a real token.
+"""
+from _helpers.hermetic_env import isolate_os_environ
+
+isolate_os_environ(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER="1")
+
+import contextlib
+import importlib.util
+import io
+import json
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+REPO = Path(__file__).resolve().parent.parent
+for p in (REPO / "src", REPO / "skills" / "pending-questions" / "scripts"):
+    if str(p) not in sys.path:
+        sys.path.insert(0, str(p))
+
+import connections as C
+import pending_questions_ask as pqa
+import pending_questions_room_db as room_db
+import pending_questions_store as pqs
+import proactive_routing as pr
+import result_publish
+
+W = "7c700e11" + "0" * 24
+AGENT = "@helper:alpha-fixture.test"
+HOST = "test-host"
+
+_spec = importlib.util.spec_from_file_location("ask_owner_cli", REPO / "scripts" / "ask-owner.py")
+ask_owner_cli = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(ask_owner_cli)
+
+
+class FakeDb:
+    """A DbClient over a dict: rows keep the cells and body they were born with."""
+
+    def __init__(self):
+        self.data = {}
+
+    def add_row(self, schema, row, cells, body):
+        self.data[row] = {"cells": dict(cells), "body": body}
+        return {"created": True}
+
+    def row(self, schema, row):
+        return self.data.get(row)
+
+    def rows(self, schema):
+        return [{"row": k, **v} for k, v in self.data.items()]
+
+    def set_cells(self, schema, row, cells):
+        self.data[row]["cells"].update(cells)
+
+    def set_body(self, schema, row, body):
+        self.data[row]["body"] = body
+
+    def guarded(self, schema, row, cells, expect):
+        self.data[row]["cells"].update(cells)
+        return {"ok": True}
+
+
+class _Ws(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ask-owner-worker-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ws = self.tmp / "workspace"
+        for d in ("results", "state", f"hosts/{HOST}"):
+            (self.ws / d).mkdir(parents=True)
+        for patcher in (mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.tmp / "config"),
+                                                     "SUTANDO_HOST_LABEL": HOST}),
+                        mock.patch("workspace_default.resolve_workspace", return_value=self.ws)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        os.environ.pop("SUTANDO_WORKER_ID", None)
+        self.record(own=True)
+
+    def record(self, own=True, **extra):
+        base = {"gateway_url": "https://chat.alpha-fixture.test/relay", "primary": False, "added_by": "owner",
+                "added_at": "2026-10-01T00:00:00Z", "verified": True, "server_source": "identity",
+                "server": "alpha-fixture.test"}
+        rows = [{**base, "instance": "alpha", "token_ref": C.token_ref_for("alpha"), "primary": True,
+                 "agent_mxid": "@core:alpha-fixture.test"}]
+        if own:
+            inst = C.worker_instance_for("alpha-fixture.test", W)
+            rows.append({**base, "instance": inst, "token_ref": C.token_ref_for(inst), "worker": W,
+                         "agent_mxid": AGENT, **extra})
+        C.record_path(self.ws).write_text(json.dumps({"schema_version": C.SCHEMA_VERSION, "connections": rows}))
+
+    def as_worker(self, worker=W):
+        return mock.patch.dict(os.environ, {"SUTANDO_WORKER_ID": worker} if worker else {})
+
+    def task(self, headers):
+        (self.ws / "tasks").mkdir(exist_ok=True)
+        f = self.ws / "tasks" / "task-1.txt"
+        f.write_text(headers + "task: x\n")
+        return str(f)
+
+    def empty_default_workspace(self):
+        empty = self.tmp / "default-workspace"
+        (empty / "state").mkdir(parents=True)
+        return mock.patch("workspace_default.resolve_workspace", return_value=empty)
+
+    def proactive(self):
+        return sorted(p.name for p in (self.ws / "results").glob("proactive-*"))
+
+    def outbox_questions(self):
+        return [json.loads(p.read_text())["question"]
+                for p in (self.ws / "state" / "pending-questions-outbox").glob("*.json")]
+
+
+class StoreAdapterAsk(_Ws):
+    def ask(self, store=None, **kw):
+        return room_db.ask_owner("Merge #12 now?", urgency="durable", workspace=self.ws, host=HOST,
+                                 store=store, **kw)
+
+    def test_a_worker_with_its_own_enabled_identity_asks_stamped_and_the_row_names_its_agent(self):
+        db = FakeDb()
+        store = pqs.RoomDbStore(db, lock=self.ws / "state" / "pq-db.lock", host=HOST)
+        with self.as_worker():
+            out = self.ask(store=store)
+        [name] = self.proactive()
+        self.assertEqual(pr.proactive_worker(name), W, name)
+        self.assertEqual(out["proactive_file"], name)
+        self.assertTrue(pr.lane_claims_proactive(name, W))
+        self.assertFalse(pr.lane_claims_proactive(name), "no core lane sends it")
+        [row] = db.data.values()
+        self.assertEqual(row["cells"].get("asked_by"), AGENT)
+        self.assertIn(name, row["body"], "the row's delivery record names the stamped file")
+
+    def test_the_outbox_holds_who_asked_and_replays_it_into_the_row(self):
+        with self.as_worker():
+            self.ask(store=None)
+        [q] = self.outbox_questions()
+        self.assertEqual(q["asked_by"], AGENT)
+        cells = []
+        fake = FakeDb()
+        fake.add_row = lambda schema, row, c, body: cells.append(c) or {"created": True}
+        pqs.RoomDbStore(fake, lock=self.ws / "state" / "l", host=HOST).insert(pqs.Question.from_dict(q), "x")
+        self.assertEqual(cells[0]["asked_by"], AGENT)
+
+    def test_the_cores_session_asks_unstamped_and_names_no_asker(self):
+        db = FakeDb()
+        out = self.ask(store=pqs.RoomDbStore(db, lock=self.ws / "state" / "pq-db.lock", host=HOST))
+        [name] = self.proactive()
+        self.assertIsNone(pr.proactive_worker(name))
+        self.assertEqual(out["question"]["asked_by"], None)
+        self.assertNotIn("asked_by", next(iter(db.data.values()))["cells"])
+
+    def test_a_worker_with_no_identity_or_a_disabled_one_asks_unstamped(self):
+        for label, kw in (("none", {"own": False}), ("disabled", {"disabled": True}), ("parked", {"parked": True})):
+            with self.subTest(label):
+                for p in (self.ws / "results").glob("*"):
+                    p.unlink()
+                self.record(**kw)
+                with self.as_worker():
+                    out = self.ask()
+                [name] = self.proactive()
+                self.assertIsNone(pr.proactive_worker(name), name)
+                self.assertIsNone(out["question"]["asked_by"])
+
+    def test_the_stamp_comes_from_result_publishs_helper(self):
+        calls = []
+
+        def fake(path, environ=None, workspace=None):
+            calls.append((Path(path).name, workspace))
+            return Path(path).with_name("proactive-from-helper.txt")
+
+        with mock.patch.object(result_publish, "worker_published_path", fake):
+            out = self.ask()
+        self.assertEqual(self.proactive(), ["proactive-from-helper.txt"])
+        self.assertEqual(out["proactive_file"], "proactive-from-helper.txt")
+        self.assertTrue(calls and all(ws == self.ws for _, ws in calls), calls)
+
+    def test_an_asker_that_cannot_be_read_never_blocks_the_ask(self):
+        with self.as_worker(), mock.patch.object(C, "proactive_author_agent", side_effect=OSError("unreadable")):
+            out = self.ask()
+        [name] = self.proactive()
+        self.assertEqual((pr.proactive_worker(name), out["question"]["asked_by"]), (W, None))
+
+    def test_an_ask_bound_for_another_bridge_keeps_its_bare_name_for_that_bridge(self):
+        cases = {
+            "discord": ("access_tier: owner\nsource: discord\nchannel_id: 123456789012345678\n"
+                        "channel_name: DM\nguild_name: DM\n", "[channel: 123456789012345678]"),
+            "slack": ("access_tier: owner\nsource: slack\nchannel_id: D0123456789\n", "[channel: D0123456789]"),
+            "telegram": ("access_tier: owner\nsource: telegram\nchat_id: 42\n", "[dm-only]"),
+            "discord [dm-only]": ("access_tier: owner\nsource: discord\nchannel_id: 123456789012345678\n"
+                                  "channel_name: general\nguild_name: G\n", "[dm-only]"),
+        }
+        for label, (headers, lead) in cases.items():
+            with self.subTest(label):
+                for f in (self.ws / "results").glob("*"):
+                    f.unlink()
+                with self.as_worker():
+                    out = self.ask(task_file=self.task(headers))
+                [name] = self.proactive()
+                bridge = label.split()[0]
+                self.assertEqual((pr.proactive_destination(name), pr.proactive_worker(name)), (bridge, None), name)
+                self.assertEqual((self.ws / "results" / name).read_text().splitlines()[0], lead)
+                self.assertTrue(pr.lane_claims_proactive(name), "the named bridge claims it")
+                self.assertFalse(pr.lane_claims_proactive(name, W), "the worker's lane does not")
+                self.assertIsNone(out["question"]["asked_by"])
+
+    def test_an_ask_bound_for_ag2space_is_the_worker_lanes(self):
+        headers = "access_tier: owner\nsource: ag2space\nchannel_id: !dm:alpha-fixture.test\nchannel_kind: dm\n"
+        with self.as_worker():
+            out = self.ask(task_file=self.task(headers))
+        [name] = self.proactive()
+        self.assertEqual((pr.proactive_destination(name), pr.proactive_worker(name)), ("ag2space", W), name)
+        self.assertEqual(out["question"]["asked_by"], AGENT)
+
+    def test_the_identity_is_read_from_the_workspace_passed_not_the_default(self):
+        with self.as_worker(), self.empty_default_workspace():
+            out = self.ask()
+        [name] = self.proactive()
+        self.assertEqual((pr.proactive_worker(name), out["question"]["asked_by"]), (W, AGENT))
+
+    def test_a_decision_card_stays_the_cores_with_no_asker_and_no_stamped_text_beside_it(self):
+        (self.ws / "state" / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space"}))
+        from hitl.manager import HitlManager, HitlStore
+        manager = HitlManager(HitlStore(self.ws / "state" / "hitl" / "requirements"))
+        with self.as_worker():
+            out = pqa.queue_question("Merge it?", workspace=self.ws, host=HOST, default_action="merge",
+                                     options=[("Hold", "wait")], manager=manager)
+            self.assertEqual(pqa.create_card(out), pqa.CARD_STORED)
+        self.assertEqual(self.proactive(), [], "the card is the ask; no text is queued")
+        self.assertIsNone(out["question"]["asked_by"], "the card is the core's")
+        [q] = self.outbox_questions()
+        self.assertIsNone(q["asked_by"])
+
+    def test_a_card_that_cannot_be_stored_falls_back_to_the_cores_text(self):
+        (self.ws / "state" / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space"}))
+        manager = mock.Mock()
+        manager.create.side_effect = OSError("store refused")
+        manager.get.return_value = None
+        with self.as_worker():
+            out = pqa.queue_question("Merge it?", workspace=self.ws, host=HOST, default_action="merge",
+                                     options=[("Hold", "wait")], manager=manager)
+            self.assertEqual(pqa.create_card(out), pqa.CARD_NOT_STORED)
+        [name] = self.proactive()
+        self.assertIsNone(pr.proactive_worker(name), "a core card's fallback text is the core's")
+        self.assertIsNone(out["question"]["asked_by"])
+
+
+class NoStoreAsk(_Ws):
+    def run_cli(self):
+        err, outp = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(outp), \
+                mock.patch.object(ask_owner_cli, "declared", return_value=None):
+            rc = ask_owner_cli.main(["Ship it?", "--workspace", str(self.ws), "--urgency", "durable"])
+        self.assertEqual(rc, 0, err.getvalue())
+        [rec] = [json.loads(p.read_text()) for p in (self.ws / "state").rglob("ask-*.json")] or [None]
+        return self.proactive(), rec
+
+    def test_a_worker_with_its_own_identity_queues_stamped_and_records_its_agent(self):
+        with self.as_worker():
+            names, rec = self.run_cli()
+        self.assertEqual([pr.proactive_worker(n) for n in names], [W])
+        self.assertEqual((rec["queued"], rec["asked_by"]), (names[0], AGENT))
+
+    def test_the_stamp_comes_from_result_publishs_helper(self):
+        self.assertIs(ask_owner_cli.worker_published_path, result_publish.worker_published_path)
+        fake = mock.Mock(side_effect=lambda path, workspace=None: Path(path).with_name("proactive-from-helper.txt"))
+        with mock.patch.object(ask_owner_cli, "worker_published_path", fake):
+            names, rec = self.run_cli()
+        self.assertEqual((names, rec["queued"]), (["proactive-from-helper.txt"], "proactive-from-helper.txt"))
+        self.assertEqual(fake.call_args.kwargs["workspace"], self.ws)
+
+    def test_an_asker_that_cannot_be_read_never_blocks_the_ask(self):
+        with self.as_worker(), mock.patch.object(C, "proactive_author_agent", side_effect=OSError("unreadable")):
+            names, rec = self.run_cli()
+        self.assertEqual(([pr.proactive_worker(n) for n in names], rec["asked_by"]), ([W], None))
+
+    def test_the_identity_is_read_from_the_workspace_passed_not_the_default(self):
+        with self.as_worker(), self.empty_default_workspace():
+            names, rec = self.run_cli()
+        self.assertEqual(([pr.proactive_worker(n) for n in names], rec["asked_by"]), ([W], AGENT))
+
+    def test_the_core_and_a_worker_without_an_enabled_identity_queue_unstamped(self):
+        for label, kw, worker in (("core", {}, ""), ("none", {"own": False}, W), ("disabled", {"disabled": True}, W)):
+            with self.subTest(label):
+                shutil.rmtree(self.ws / "results")
+                (self.ws / "results").mkdir()
+                shutil.rmtree(self.ws / "state" / "ask-owner", ignore_errors=True)
+                self.record(**kw)
+                with self.as_worker(worker):
+                    if not worker:
+                        os.environ.pop("SUTANDO_WORKER_ID", None)
+                    names, rec = self.run_cli()
+                self.assertEqual([pr.proactive_worker(n) for n in names], [None])
+                self.assertIsNone(rec["asked_by"])
+
+
+class AskerWording(_Ws):
+    CORE_LEAD = f"Question for you from the {HOST} core — it needs your word:"
+
+    def store_body(self):
+        room_db.ask_owner("Merge #12 now?", urgency="durable", workspace=self.ws, host=HOST, store=None)
+        [name] = self.proactive()
+        return (self.ws / "results" / name).read_text()
+
+    def no_store_body(self):
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(ask_owner_cli, "declared", return_value=None):
+            ask_owner_cli.main(["Ship it?", "--workspace", str(self.ws), "--urgency", "durable"])
+        [name] = self.proactive()
+        return (self.ws / "results" / name).read_text()
+
+    def bodies(self):
+        out = {}
+        for label, fn in (("store", self.store_body), ("no store", self.no_store_body)):
+            for f in (self.ws / "results").glob("*"):
+                f.unlink()
+            out[label] = fn()
+        return out
+
+    def roster(self, label):
+        (self.ws / "state" / "roster.json").write_text(json.dumps({"version": 1, "workers": {
+            W: {"state": "live", "label": label}}}))
+
+    def test_the_cores_ask_reads_exactly_as_before(self):
+        bodies = self.bodies()
+        self.assertEqual(bodies["no store"],
+                         f"[dm-only]\n{self.CORE_LEAD}\n\nShip it?\n\nReply here.\n")
+        self.assertEqual(bodies["store"].splitlines()[:4],
+                         ["[dm-only]", self.CORE_LEAD, "", "Merge #12 now?"])
+
+    def test_a_worker_acting_through_the_core_still_reads_as_the_core(self):
+        self.record(disabled=True, agent_display_name="Helper")
+        with self.as_worker():
+            bodies = self.bodies()
+        for label, body in bodies.items():
+            self.assertEqual(body.splitlines()[1], self.CORE_LEAD, label)
+
+    def test_a_worker_with_its_own_agent_names_itself_not_the_core(self):
+        cases = (("display name", {"agent_display_name": "Helper"}, "Docs bee", f"Helper (a worker on {HOST})"),
+                 ("roster label", {}, "Docs bee", f"Docs bee (a worker on {HOST})"),
+                 ("neither", {}, None, f"a worker on {HOST}"))
+        for label, extra, roster_label, who in cases:
+            with self.subTest(label):
+                self.record(**extra)
+                (self.ws / "state" / "roster.json").unlink(missing_ok=True)
+                if roster_label:
+                    self.roster(roster_label)
+                with self.as_worker():
+                    bodies = self.bodies()
+                for path, body in bodies.items():
+                    self.assertEqual(body.splitlines()[1], f"Question for you from {who} — it needs your word:",
+                                     (path, body))
+                    self.assertNotIn("core", body, path)
+
+    def phrase(self, display=None, roster=None):
+        self.record(**({"agent_display_name": display} if display is not None else {}))
+        (self.ws / "state" / "roster.json").unlink(missing_ok=True)
+        if roster is not None:
+            (self.ws / "state" / "roster.json").write_text(json.dumps({"version": 1, "workers": {W: roster}}))
+        return C.proactive_author_phrase(pr.stamp_worker("proactive-1.txt", W), HOST, self.ws)
+
+    def test_a_worker_name_that_reads_as_the_core_falls_back(self):
+        fallback = f"a worker on {HOST}"
+        for name in (f"the {HOST} core", f"THE {HOST.upper()} CORE", f"the {HOST} \u0441\u043er\u0435",
+                     "Backup core.", "c\u03bfre", "Backup \uff43\uff4f\uff52\uff45", f"From the {HOST} core, kindly"):
+            with self.subTest(name):
+                self.assertEqual(self.phrase(display=name), fallback)
+                self.assertEqual(self.phrase(roster={"label": name}), fallback)
+        for name in ("Encore", "Score keeper", "Core helper"):
+            with self.subTest(name):
+                self.assertEqual(self.phrase(display=name), f"{name} (a worker on {HOST})")
+
+    def test_the_core_lookalike_never_reaches_either_body(self):
+        self.record(agent_display_name=f"THE {HOST.upper()} CORE")
+        with self.as_worker():
+            bodies = self.bodies()
+        for path, body in bodies.items():
+            self.assertEqual(body.splitlines()[1], f"Question for you from a worker on {HOST} — it needs your word:",
+                             path)
+
+    def test_a_worker_name_never_stands_alone_so_no_probe_reads_as_the_core(self):
+        for name in ("\u03f2ore", "c\u0585re", "\u1d04ore", f"{HOST} core (main)", "core team", "c0re",
+                     f"the {HOST} core"):
+            with self.subTest(name):
+                self.record(agent_display_name=name)
+                with self.as_worker():
+                    bodies = self.bodies()
+                for path, body in bodies.items():
+                    lead = body.splitlines()[1]
+                    self.assertNotEqual(lead, self.CORE_LEAD, path)
+                    self.assertIn(f"a worker on {HOST}", lead, path)
+                    self.assertTrue(lead.endswith(" — it needs your word:"), lead)
+                    if name != f"the {HOST} core":
+                        self.assertIn(f"(a worker on {HOST}) — it needs your word:", lead, path)
+
+    def test_the_roster_order_display_label_first_and_never_the_bare_id(self):
+        self.assertEqual(self.phrase(roster={"label": "Base", "display_label": "Shown"}), f"Shown (a worker on {HOST})")
+        self.assertEqual(self.phrase(roster={"label": W}), f"a worker on {HOST}")
+        self.assertEqual(self.phrase(roster={"display_label": W, "label": "Base"}), f"a worker on {HOST}")
+
+    def test_the_name_is_bounded_and_stripped_of_format_characters(self):
+        cap = C.AUTHOR_PHRASE_MAX
+        self.assertEqual(cap, 64)
+        tail = f" (a worker on {HOST})"
+        self.assertEqual(self.phrase(display="x" * 200), "x" * (cap - 1) + "…" + tail)
+        self.assertEqual(self.phrase(display="y" * cap), "y" * cap + tail)
+        self.assertEqual(self.phrase(display="He\u202elp\u200ber\u2066\ufeff"), "Helper" + tail)
+        self.assertEqual(self.phrase(display="\u200b\u202e"), f"a worker on {HOST}")
+        self.assertEqual(self.phrase(display=f"the {HOST} co\u200bre"), f"a worker on {HOST}")
+
+    def test_an_unreadable_speaker_falls_back_without_blocking_the_ask(self):
+        self.record(agent_display_name="Helper")
+        with mock.patch.object(C, "proactive_author_phrase", side_effect=OSError("unreadable")):
+            for worker, who in ((W, f"a worker on {HOST}"), ("", f"the {HOST} core")):
+                with self.subTest(worker or "core"), self.as_worker(worker):
+                    if not worker:
+                        os.environ.pop("SUTANDO_WORKER_ID", None)
+                    for path, body in self.bodies().items():
+                        self.assertEqual(body.splitlines()[1],
+                                         f"Question for you from {who} — it needs your word:", path)
+
+    def test_a_name_that_cannot_be_worked_out_still_records_the_cores_question(self):
+        boom = OSError("no name")
+        with mock.patch.object(ask_owner_cli, "worker_published_path", side_effect=boom), \
+                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()) as outp, \
+                mock.patch.object(ask_owner_cli, "declared", return_value=None):
+            ask_owner_cli.main(["Ship it?", "--workspace", str(self.ws), "--urgency", "durable"])
+        self.assertEqual(self.proactive(), [])
+        self.assertIn("sent: FAILED — OSError: no name", outp.getvalue())
+        [rec] = [json.loads(p.read_text()) for p in (self.ws / "state").rglob("ask-*.json")]
+        self.assertEqual((rec["error"], rec["body"].splitlines()[1]), ("OSError: no name", self.CORE_LEAD))
+        with mock.patch.object(pqa, "published_name", side_effect=boom), self.as_worker():
+            out = room_db.ask_owner("Merge #12 now?", urgency="durable", workspace=self.ws, host=HOST, store=None)
+        self.assertEqual((self.proactive(), out["proactive_file"], out["send_error"]), ([], None, "OSError: no name"))
+        [q] = self.outbox_questions()
+        self.assertEqual(q["question"], "Merge #12 now?", "the question is still held")
+
+    def test_a_decision_cards_text_fallback_stays_the_cores(self):
+        self.record(agent_display_name="Helper")
+        (self.ws / "state" / "last-owner-activity.json").write_text(json.dumps({"channel": "ag2space"}))
+        manager = mock.Mock()
+        manager.create.side_effect = OSError("store refused")
+        manager.get.return_value = None
+        with self.as_worker():
+            out = pqa.queue_question("Merge it?", workspace=self.ws, host=HOST, default_action="merge",
+                                     options=[("Hold", "wait")], manager=manager)
+            pqa.create_card(out)
+        [name] = self.proactive()
+        self.assertEqual((self.ws / "results" / name).read_text().splitlines()[1], self.CORE_LEAD)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=1)

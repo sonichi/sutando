@@ -32,7 +32,7 @@ EOS
   chmod +x "$d/scripts/sutando-config.sh"
   printf 'import sys\nopen("%s/launches", "a").write("x\\n")\nsys.exit(%s)\n' "$d" "$1" > "$d/src/discord-bridge.py"
   cp "$REPO/src/launchd/channel-bridge-wrapper.sh" "$d/src/launchd/"
-  cp "$REPO/src/result_publish.py" "$d/src/"
+  cp "$REPO/src/result_publish.py" "$REPO/src/result_labels.py" "$d/src/"
   printf '#!/bin/bash\nexit 0\n' > "$d/shims/osascript"
   printf '#!/bin/bash\necho "$*" >> "%s/sleeps"\nexec /bin/sleep "$@"\n' "$d" > "$d/shims/sleep"
   chmod +x "$d/shims/osascript" "$d/shims/sleep"
