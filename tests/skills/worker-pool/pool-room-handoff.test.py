@@ -201,6 +201,32 @@ class HandRoom(Base):
     def invite_ids(self, core):
         return [int(c[1].rsplit("-", 1)[1]) for c in core.calls if c[0] == "room.member.invite"]
 
+    def test_an_open_attempt_records_why_it_is_open(self):
+        cases = (
+            ({"is_error": True, "status": "approval_required", "approval_id": "ap-1"},
+             {"why": "held"}),
+            ({"is_error": True, "code": "rate_limited", "details": {"retry_after_s": 42}},
+             {"why": "refused", "code": "rate_limited", "retry_after_s": 42.0}),
+            ({"is_error": True, "message": "upstream unavailable"}, {"why": "refused"}),
+        )
+        for invite, want in cases:
+            self.setUp()
+            self.hand(FakeActions({CORE, OWNER}, invite=invite))
+            rec = rh._attempts(self.ws, W)[f"{rh._local(ROOM)}:s.space"]["invite"]
+            self.assertEqual(rec["state"], "open", invite)
+            self.assertEqual({k: rec[k] for k in ("why", "code", "retry_after_s") if k in rec}, want, invite)
+            self.assertEqual(rh.attempt(self.ws, W, f"{rh._local(ROOM)}:s.space", "invite"), 0,
+                             "still open: the same operation is sent again")
+
+    def test_a_sent_or_refused_attempt_records_no_open_reason(self):
+        for invite, state in (({"result": {"invited": True, "expected_admission": "admitted"}}, "sent"),
+                              ({"result": {"invited": False}}, "no")):
+            self.setUp()
+            self.hand(FakeActions({CORE, OWNER}, invite=invite, joins=99), wait_s=0.0)
+            rec = rh._attempts(self.ws, W)[f"{rh._local(ROOM)}:s.space"]["invite"]
+            self.assertEqual(rec["state"], state)
+            self.assertFalse({"why", "code", "retry_after_s"} & set(rec), rec)
+
     def test_a_sent_invitation_moves_on_only_once_the_agent_no_longer_holds_it(self):
         core = FakeActions({CORE, OWNER}, joins=10 ** 6)
         worker_side = FakeActions(set(), me=AGENT)
@@ -554,10 +580,10 @@ class ReturnRoom(Base):
             mine = FakeActions({AGENT, CORE}, me=AGENT)
             real_record = rh.record_attempt
 
-            def crash(ws, worker, room, verb, n, state, now, _at=crash_at):
+            def crash(ws, worker, room, verb, n, state, now, detail=None, _at=crash_at):
                 if verb == "return-leave" and _at == "after the leave answer":
                     raise KeyboardInterrupt(_at)
-                real_record(ws, worker, room, verb, n, state, now)
+                real_record(ws, worker, room, verb, n, state, now, detail)
                 if verb == "return-leave" and _at == "after its record":
                     raise KeyboardInterrupt(_at)
             with mock.patch.object(rh, "record_attempt", crash):
