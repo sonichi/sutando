@@ -97,7 +97,8 @@ class FeatureList(NamedTuple):
 FINALE_PROMPT = "Help me plan my week."
 PROMPT_MAX = 200
 BAD_PROMPT = re.compile(r"[\r\n<>]|://|\bwww\.|\b[a-z0-9-]+\.(?:com|net|org|io|ai|dev|app|co|space|edu|gov)\b", re.I)
-PICKED_PREFIX = re.compile(r"^\s*I\s+picked\s*:\s*", re.I)
+# Both first-contact forms: "I want to use <product> for A, B." (current) and "I picked: A, B." (older).
+PICKED_PREFIX = re.compile(r"^\s*(?:I\s+picked\s*:|I\s+want\s+to\s+use\s+\S[^,\r\n]{0,38}?\s+for\b)\s*", re.I)
 ROLE_SLUG = re.compile(r"[a-z0-9][a-z0-9_-]*")
 ROLE_TEXT = re.compile(r"[\w &'.-]{1,40}")
 ROLES_MAX = 6
@@ -465,7 +466,8 @@ def clean_prompts(raw: object, slots: Optional[Tuple[str, ...]] = None) -> Dict[
 
 
 def role_labels(roles: object) -> List[str]:
-    """Display labels from the first-contact "I picked: ..." payload, as given: a comma-separated
+    """Display labels from the first-contact roles sentence, as given ("I want to use <product> for
+    ..." or the older "I picked: ..."): a comma-separated
     string (or a list) of persona labels, or slugs when the client had no labels. A slug such as
     `product-manager` reads `Product Manager`; a label keeps its own words. Junk is dropped."""
     if isinstance(roles, str):

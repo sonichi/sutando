@@ -326,6 +326,52 @@ class Dispatch(unittest.TestCase):
         self.assertIs(manifest.get("playbook"), True)
 
 
+
+SETUP_MESSAGE = ("Hi, I am Dana Reyes. I am all set up and saying hello.\n"
+                 "I want to use s.space for Founder, Product Manager.\n"
+                 "Give me a quick tour.\n"
+                 "/tutorial")
+
+
+class TutorialTrigger(unittest.TestCase):
+    """The owner's DM message with a `/tutorial` line runs the tutorial playbook, and nothing else does."""
+
+    def test_the_setup_message_is_tagged(self):
+        self.assertTrue(at.tutorial_requested(SETUP_MESSAGE))
+        self.assertEqual(at.owner_dm_playbook(SETUP_MESSAGE, "owner", "dm"), "tutorial")
+
+    def test_tutorial_alone_and_with_spaces_is_tagged(self):
+        for body in ("/tutorial", "  /tutorial  ", "Hi.\r\n/tutorial\r\n", "/tutorial\nthanks"):
+            self.assertEqual(at.owner_dm_playbook(body, "owner", "dm"), "tutorial", body)
+
+    def test_a_quoted_or_mid_sentence_tutorial_is_not(self):
+        for body in ("please run /tutorial for me", "> /tutorial", '"/tutorial"', "`/tutorial`",
+                     "/tutorial please", "/tutorials", "/Tutorial", "tutorial", "", None, 7):
+            self.assertIsNone(at.owner_dm_playbook(body, "owner", "dm"), repr(body))
+
+    def test_only_the_owner_in_a_dm_qualifies(self):
+        for tier, kind in (("team", "dm"), ("guest", "dm"), ("owner", "room"), ("owner", ""),
+                           ("owner", None), ("", "dm"), (None, None)):
+            self.assertIsNone(at.owner_dm_playbook(SETUP_MESSAGE, tier, kind), (tier, kind))
+
+    def test_a_tagged_task_resolves_to_the_shipped_tutorial_playbook(self):
+        # The contract end to end: the header the bridge writes passes the bridge's sanitizer, survives
+        # the strict header parser above task:, and resolves to skills/tutorial/SKILL.md.
+        tag = at.owner_dm_playbook(SETUP_MESSAGE, "owner", "dm")
+        self.assertEqual(at.playbook_value(tag), "tutorial")
+        text = f"id: task-1\nchannel_id: !dm:example.org\nplaybook: {tag}\ntask: Hi\naccess_tier: owner\n"
+        self.assertEqual(ltp.parse_task_headers(text).headers.get("playbook"), "tutorial")
+        self.assertEqual(at.resolve_playbook("", tag, REPO / "skills"),
+                         REPO / "skills" / "tutorial" / "SKILL.md")
+        manifest = json.loads((REPO / "skills" / "tutorial" / "manifest.json").read_text())
+        self.assertIs(manifest.get("playbook"), True)
+
+    def test_the_cli_resolves_the_tutorial_playbook(self):
+        out = subprocess.run([sys.executable, str(REPO / "src" / "agent_triggers.py"), "resolve",
+                              "--playbook", "tutorial"], capture_output=True, text=True, check=True)
+        self.assertEqual(out.stdout.strip(), str(REPO / "skills" / "tutorial" / "SKILL.md"))
+
+
 if __name__ == "__main__":
     ok = True
     for copy in (SRC_COPY, VENDORED_COPY):

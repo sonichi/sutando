@@ -303,7 +303,7 @@ If a `Monitor` watcher stops, start it again the same way; a start on a watched 
 
 ## Tutorial
 
-On "tutorial"/"walk me through": read `notes/first-time-tutorial.md`, deliver section-by-section as brief voice-friendly steps; details: [`docs/tutorial-delivery.md`](docs/tutorial-delivery.md).
+In an s.space owner DM, "tutorial" or `/tutorial` means the Getting started page, not a chat tour. By voice: `notes/first-time-tutorial.md`, step by step ([how](docs/tutorial-delivery.md)).
 
 ## Vault — secure secret storage
 

@@ -6501,6 +6501,12 @@ def _write_task(task: dict, hold: bool = False, run: "str | None" = None,
     # One shared helper decides this — see _sender_tier_and_collaborator — so this
     # write and every other tier read (vault, owner-activity) can never disagree.
     sender_tier, collaborator_enabled = _sender_tier_and_collaborator(task)
+    # Tagged from the raw body, before it is folded to one line; the field loop writes it above task:.
+    # A playbook the broker already named is kept.
+    if not task.get("playbook"):
+        _asked = agent_triggers.owner_dm_playbook(task.get("task"), sender_tier, task.get("channel_kind"))
+        if _asked:
+            task = {**task, "playbook": _asked}
     lines = []
     # Which instance took delivery (shared-room fan-out: each Sutando writes its own
     # task file). Emitted just after id: below; KNOWN_HEADER_KEYS defangs a forged body copy.

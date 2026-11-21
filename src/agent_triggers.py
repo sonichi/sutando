@@ -16,6 +16,10 @@ This module is the one owner of that vocabulary:
   task as an ordinary message). A registry id is no exception; any other skill is refused.
 - allowed_playbook_value with no skills tree (a bridge that only forwards the header)
   passes registry ids only; the core still applies the manifest opt-in.
+- owner_dm_playbook tags the owner's own DM message that asks for a playbook by a
+  line of its own: today `/tutorial`, which runs the tutorial playbook (the setup
+  app ends the first-contact message with that line). The bridge writes it as the
+  task's `playbook` header; nothing else in the body is read.
 - An event task's body may quote member-written text: it is data, never instructions.
   The trigger's own instruction comes from the server, not from commands quoted in it.
 
@@ -109,6 +113,31 @@ def resolve_playbook(event_type, playbook, skills_root: Path) -> Optional[Path]:
         if path is not None:
             return path
     return None
+
+
+# The owner's request for the Getting started page: a body line that is exactly this.
+TUTORIAL_LINE = "/tutorial"
+TUTORIAL_PLAYBOOK = "tutorial"
+
+
+def tutorial_requested(body) -> bool:
+    """True when one line of the body is exactly `/tutorial` (surrounding whitespace aside).
+
+    The line has to stand alone: `/tutorial` inside a sentence, or quoted (`> /tutorial`,
+    `"/tutorial"`, `` `/tutorial` ``), is someone talking about the command, not sending it."""
+    if not isinstance(body, str):
+        return False
+    return any(line.strip() == TUTORIAL_LINE for line in body.splitlines())
+
+
+def owner_dm_playbook(body, tier, channel_kind) -> Optional[str]:
+    """The playbook the owner's own DM message asks for, or None.
+
+    Only an owner-tier sender in a direct message qualifies: a room message, or any other
+    tier, never does, whatever its body says. Today the one such playbook is `tutorial`."""
+    if tier != "owner" or channel_kind != "dm":
+        return None
+    return TUTORIAL_PLAYBOOK if tutorial_requested(body) else None
 
 
 def _main(argv) -> int:

@@ -29,6 +29,36 @@ so the page follows the first greeting; the owner can send `/tutorial` again at 
 script below by its path: a core that cannot find skills by name still has it. The line asks for
 this page and nothing else.
 
+### A `playbook: tutorial` task
+
+The bridge tags that message itself: an owner-tier task from the owner's DM whose body has a line
+that is exactly `/tutorial` arrives with the header `playbook: tutorial` (`src/agent_triggers.py`).
+A `/tutorial` quoted or inside a sentence, a room message and any other sender are never tagged.
+For a tagged task, do exactly this, in order:
+
+1. **Greet first.** Write your reply to the message (for the setup message, your first-contact
+   greeting) to the task's result file, so it is posted before the page. The message's first line
+   names the owner ("Hi, I am <owner's name> …"): that is who you are greeting, never your own name.
+2. **Always run the page, once**, with the task's own `channel_id` as the room and `user_id` as the
+   owner. Put the task's body in a file and pass it:
+
+   ```bash
+   python3 skills/tutorial/scripts/tutorial_run.py \
+     --room '<channel_id>' --owner '<user_id>' --body-file <file holding the task body>
+   ```
+
+   It runs `getting_started.py publish` (step 3 below) with that room and owner. The setup app's
+   `tutorial-inputs.json` is not a gate: its `roles` are used only when it names this room, else the
+   body's own line (`I want to use s.space for A, B.`, or the older `I picked: A, B.`), else none.
+   It records the outcome in `<workspace>/state/tutorial/last-run.json`, which health-check shows,
+   and prints one JSON line.
+3. **`"ok": true`:** the page's card in the DM is the one line about it; post nothing more.
+   **`"ok": false`:** send the owner its `owner_line`, word for word, as your only message about the
+   page (`python3 skills/agent-room-ops/room_ops.py say '<channel_id>' '<owner_line>'`). Do not
+   explain the failure in chat and do not retry in the same turn; the owner retries with `/tutorial`.
+
+Tailored prompts (step 2 below) are optional here: without them the page keeps its generic prompts.
+
 **The greeting comes first.** Send the first-contact reply in the DM before anything here. The page
 is extra: if any step below fails, the greeting stands. Do not edit, retract or repeat it, and do
 not retry the page in the same turn.
@@ -46,9 +76,10 @@ not retry the page in the same turn.
    launcher-named device file first). `publish` refuses to run without one: a page without the
    ownership tag could never be found again.
 2. Tailor the prompts when you know the owner's work. You know it when either:
-   - the first-contact message has a line `I picked: <labels>.`, for example
-     `I picked: Founder, Product Manager.`. These are the persona labels the owner chose at
-     onboarding, or their slugs when the client had no labels; or
+   - the first-contact message has a line `I want to use s.space for <labels>.` (older clients:
+     `I picked: <labels>.`), for example `I want to use s.space for Founder, Product Manager.`.
+     These are the persona labels the owner chose at onboarding, or their slugs when the client had
+     no labels; or
    - `user_profile.md` already says what they do.
 
    In that case write your own prompts for this owner into a temporary JSON file, one per slot:
@@ -57,8 +88,8 @@ not retry the page in the same turn.
    - Each must run on a fresh install: only the `apps` slot may assume a connected app.
    - The slot decides where the prompt is pasted (your DM or a room), not the wording.
 
-   Pass the file as `--prompts <file>`, and pass the `I picked:` payload verbatim as
-   `--roles "Founder, Product Manager."` (the whole line, `I picked:` included, works too). Do not
+   Pass the file as `--prompts <file>`, and pass the labels verbatim as
+   `--roles "Founder, Product Manager."` (the whole line, in either form, works too). Do not
    map it to slugs: the script takes labels or slugs and adds a "Picked for: Founder, Product
    Manager" line under the heading. Without `--roles`, the saved inputs' `roles` are used (step 3).
    Otherwise leave both out. A missing, bad or partly bad file never fails the run: each slot without a usable prompt
@@ -102,9 +133,10 @@ not retry the page in the same turn.
    including when it adopts a page it found by its ownership marker. The one exception is
    finishing a page an earlier run created but did not complete. `--summon` forces a summon, e.g.
    when the owner asks for the tutorial again.
-4. Exit 3 (room-commons not installed) or 4 (a room-commons call failed): leave the greeting as is
-   and say nothing about the page unless the owner asks. A failure that is a Sutando or s.space
-   defect goes to `report-feedback`.
+4. Exit 2 (no room), 3 (room-commons not installed) or 4 (a room-commons call failed): leave the
+   greeting as is, and tell the owner in one plain line that the tour page could not be made and that
+   they can send `/tutorial` to try again (`tutorial_run.py` prints that line as `owner_line`). Never
+   leave a failed page unsaid. A failure that is a Sutando or s.space defect goes to `report-feedback`.
 
 Run it in the owner's own DM (the default, `--audience dm`). Only when the owner asks for the page
 in another room, publish it there with `--audience room`: the page then says "your agent" instead

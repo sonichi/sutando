@@ -220,6 +220,86 @@ def test_result_with_no_source_message_posts_top_level():
         print("PASS test_result_with_no_source_message_posts_top_level")
 
 
+
+OWNER = "@o:example.org"
+SETUP_MESSAGE = ("Hi, I am Dana Reyes. I am all set up and saying hello.\n"
+                 "I want to use s.space for Founder, Product Manager.\n"
+                 "Give me a quick tour.\n"
+                 "/tutorial")
+
+
+def _dm_task(tid, **extra):
+    t = {
+        "id": tid,
+        "source": "ag2space",
+        "interaction_type": "message",
+        "channel_id": OWNER_DM,
+        "source_room_id": OWNER_DM,
+        "source_message_id": "$m1",
+        "room_name": "DM",
+        "user_id": OWNER,
+        "access_tier": "owner",
+        "room_members": f"{OWNER},{AGENT}",
+        "room_member_count": "2",
+        "channel_kind": "dm",
+        "timestamp": "2026-11-21T00:00:00Z",
+        "task": SETUP_MESSAGE,
+    }
+    t.update(extra)
+    return t
+
+
+def test_owner_dm_tutorial_line_is_tagged_above_task():
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        for i, body in enumerate((SETUP_MESSAGE, "/tutorial", "Hi.\n  /tutorial  ")):
+            text = _written(m, _dm_task(f"task-178600000080{i}", task=body))
+            assert _strict(m, text).get("playbook") == "tutorial", (body, text)
+            lines = text.splitlines()
+            task_at = next(i for i, ln in enumerate(lines) if ln.startswith("task: "))
+            pb_at = next(i for i, ln in enumerate(lines) if ln.startswith("playbook: "))
+            assert pb_at < task_at, "playbook must sit above task: so the strict parser reads it"
+        print("PASS test_owner_dm_tutorial_line_is_tagged_above_task")
+
+
+def test_tutorial_tag_needs_the_owner_a_dm_and_a_line_of_its_own():
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        cases = (
+            {"task": "can you run /tutorial for me?"},
+            {"task": "Hi\n> /tutorial"},
+            {"task": 'Hi\n"/tutorial"'},
+            {"task": "/tutorial please"},
+            {"channel_kind": "room", "channel_id": ROOM},
+            {"access_tier": "team", "user_id": "@mate:example.org"},
+            {"access_tier": "guest", "user_id": "@visitor:example.org"},
+        )
+        for i, extra in enumerate(cases):
+            text = _written(m, _dm_task(f"task-178600000081{i}", **extra))
+            assert not any(ln.startswith("playbook:") for ln in text.splitlines()), (extra, text)
+        print("PASS test_tutorial_tag_needs_the_owner_a_dm_and_a_line_of_its_own")
+
+
+def test_a_broker_named_playbook_is_not_replaced():
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        text = _written(m, _dm_task("task-1786000000820", playbook="room-onboard"))
+        assert _strict(m, text).get("playbook") == "room-onboard", text
+        print("PASS test_a_broker_named_playbook_is_not_replaced")
+
+
+def test_the_tagged_task_keeps_its_body():
+    with tempfile.TemporaryDirectory() as d:
+        m = _load(pathlib.Path(d))
+        text = _written(m, _dm_task("task-1786000000830"))
+        body = m.local_task_protocol.parse_task_headers(text).body
+        # The writer folds the message onto the one task: line, so the core never sees `/tutorial` as a
+        # line of its own: that is why the tag is decided here, from the raw body, and not by the core.
+        assert "I want to use s.space for Founder, Product Manager." in body, body
+        assert body.splitlines()[0].rstrip().endswith("Give me a quick tour. /tutorial"), body
+        print("PASS test_the_tagged_task_keeps_its_body")
+
+
 if __name__ == "__main__":
     test_trigger_headers_pass_through_above_task()
     test_malformed_event_type_is_dropped_not_passed()
@@ -228,4 +308,8 @@ if __name__ == "__main__":
     test_interaction_whitelist_is_single_sourced()
     test_old_relay_system_event_without_event_type_is_readable()
     test_result_with_no_source_message_posts_top_level()
+    test_owner_dm_tutorial_line_is_tagged_above_task()
+    test_tutorial_tag_needs_the_owner_a_dm_and_a_line_of_its_own()
+    test_a_broker_named_playbook_is_not_replaced()
+    test_the_tagged_task_keeps_its_body()
     print("ALL PASS test_agent_trigger")

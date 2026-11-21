@@ -1079,7 +1079,7 @@ def _workspace() -> Path:
 def _personal_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--prompts", type=Path, help="JSON object of tailored prompts by slot ("
                         + ", ".join(PROMPT_SLOTS) + "); bad or missing entries keep the default")
-    parser.add_argument("--roles", default="", help="the first-contact \"I picked: ...\" payload as given, "
+    parser.add_argument("--roles", default="", help="the first-contact roles sentence as given (\"I want to use <product> for ...\" or \"I picked: ...\"), "
                         "e.g. \"Founder, Product Manager.\" (labels, or slugs)")
     parser.add_argument("--media", type=Path, metavar="PATH",
                         help="JSON object {asset name: \"mxc://...\"}: the room media to point those "

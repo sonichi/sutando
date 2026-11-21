@@ -1686,6 +1686,29 @@ def check_decision_card_clicks(workspace_dir: Optional[Path] = None) -> "dict | 
                        "`hitl_click: true` task (CLAUDE.md, Pending decisions)")}
 
 
+def check_tutorial_last_run(workspace_dir: Optional[Path] = None) -> "dict | None":
+    """The tutorial playbook's last Getting started page run (skills/tutorial/scripts/tutorial_run.py
+    writes state/tutorial/last-run.json): WARN naming the failed step, ok when it published, None
+    before any run. A missing page is never silent."""
+    ws = Path(workspace_dir) if workspace_dir else WORKSPACE_DIR
+    try:
+        rec = json.loads((ws / "state" / "tutorial" / "last-run.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict):
+        return None
+    outcome = str(rec.get("outcome") or "unknown")
+    when = str(rec.get("at") or "?")
+    if outcome == "ok":
+        return {"name": "tutorial-page", "status": "ok",
+                "detail": f"last Getting started page run published it ({rec.get('action') or 'ok'}) at {when}"}
+    reason = str(rec.get("reason") or "")[:200]
+    return {"name": "tutorial-page", "status": "warn",
+            "detail": (f"the last Getting started page run failed at {when}: {outcome}"
+                       + (f" ({reason})" if reason else "")
+                       + " — the owner was told to send /tutorial to retry; see skills/tutorial/SKILL.md")}
+
+
 def check_connections_primary(workspace_dir: Optional[Path] = None) -> "dict | None":
     """WARN when the connections record has rows but no primary, or a primary whose bridge has no
     proactive room yet; otherwise say so when the legacy row is not primary. None when all is plain."""
@@ -13543,6 +13566,10 @@ def run_all_checks() -> list[dict]:
     _no_primary = check_connections_primary()
     if _no_primary:
         checks.append(_no_primary)
+
+    _tutorial = check_tutorial_last_run()
+    if _tutorial:
+        checks.append(_tutorial)
 
     _mem_index = check_memory_index_integrity()
     if _mem_index:
