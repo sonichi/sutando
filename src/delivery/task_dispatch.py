@@ -174,17 +174,37 @@ def _turn_reader(task_file):
     return reader
 
 
+def _strict_task_files(tasks_dir: Path) -> "list[Path]":
+    """The inbox's task files from one listing, raising OSError where it or a file's stat fails."""
+    import fnmatch
+    files = []
+    for name in sorted(os.listdir(tasks_dir)):
+        if not fnmatch.fnmatchcase(name, "task-*.txt"):
+            continue
+        try:
+            if stat.S_ISREG(os.stat(tasks_dir / name).st_mode):
+                files.append(tasks_dir / name)
+        except FileNotFoundError:
+            continue
+    return files
+
+
 def unanswered_in_inbox(tasks_dir: "Path | str", results_dir: "Path | str", *,
-                        workspace: "Path | str | None" = None) -> "list[tuple[str, Path]]":
+                        workspace: "Path | str | None" = None, strict: bool = False) -> "list[tuple[str, Path]]":
     """(task id, task file) for each task file directly in a plain inbox `tasks_dir` (a worker's own
     folder) with no ready result in `results_dir` (`has_ready_result`, wake-turn aware); a claimed name
     counts under its task's id, once. The one rule for what such an inbox still owes. With `workspace`,
-    a result archived in the task's other home before a switch also answers it (`task_lookup`)."""
+    a result archived in the task's other home before a switch also answers it (`task_lookup`).
+    An inbox that cannot be listed owes nothing listed; `strict` raises OSError instead. A result that
+    cannot be read leaves its task owed either way."""
     from task_archive import task_id_from_filename
     tasks_dir = Path(tasks_dir)
     try:
-        files = sorted(p for p in tasks_dir.glob("task-*.txt") if p.is_file())
+        files = _strict_task_files(tasks_dir) if strict else sorted(
+            p for p in tasks_dir.glob("task-*.txt") if p.is_file())
     except OSError:
+        if strict:
+            raise
         return []
     owed, seen = [], set()
     for f in files:

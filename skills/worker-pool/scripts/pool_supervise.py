@@ -165,9 +165,7 @@ def owed_task_ids(workspace, worker_id, *, strict: bool = False) -> list[str]:
     own = connections.worker_dirs(worker_id, Path(workspace), strict=strict)
     if own is None:
         return sentinel_ids(workspace, worker_id)[0]
-    if strict:
-        os.listdir(own[0])
-    return [task_id for task_id, _f in td.unanswered_in_inbox(*own, workspace=Path(workspace))]
+    return [task_id for task_id, _f in td.unanswered_in_inbox(*own, workspace=Path(workspace), strict=strict)]
 
 
 def work_outstanding(workspace, worker_id) -> bool | None:

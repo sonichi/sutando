@@ -218,6 +218,18 @@ class SetModel(Base):
         connections.record_path(self.ws).write_text("{not json")
         self.assert_refused_and_kept()
 
+    def test_a_task_file_that_cannot_be_read_after_the_listing_is_recorded_not_restarted(self):
+        tasks, _ = self.own_folders()
+        (tasks / "task-y.txt").write_text("id: task-y\ntask: hi\n")
+        real_stat = os.stat
+
+        def stat(path, *a, **kw):
+            if Path(path) == tasks / "task-y.txt":
+                raise PermissionError(path)
+            return real_stat(path, *a, **kw)
+        with mock.patch.object(os, "stat", stat):
+            self.assert_refused_and_kept()
+
     def test_an_own_inbox_that_cannot_be_read_is_recorded_not_restarted(self):
         tasks, _ = self.own_folders()
         (tasks / "task-y.txt").write_text("id: task-y\ntask: hi\n")
