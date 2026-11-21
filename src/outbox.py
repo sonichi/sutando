@@ -1113,6 +1113,52 @@ def read_item(root: Path, item_id: str) -> Optional[dict]:
     return _read_item(Path(root), item_id)
 
 
+FIRST_ATTEMPTS_DIR = ".first-attempts"
+
+
+def _first_attempt_path(root: Path, item_id: str) -> Path:
+    return Path(root) / FIRST_ATTEMPTS_DIR / f"{_safe_key(item_id)}.json"
+
+
+def _read_first_attempt(p: Path) -> Optional[float]:
+    at = json.loads(p.read_text(encoding="utf-8")).get("at")
+    if type(at) not in (int, float) or not math.isfinite(at):
+        raise ValueError("first-attempt stamp is not a time")
+    return float(at)
+
+
+def note_first_attempt(root: Path, item_id: str, now: Optional[float] = None) -> Optional[float]:
+    """When a send of `item_id` was first attempted: stamped once, before its item may even exist
+    (publish refuses a record it did not write), so a restart keeps it. None when unreadable."""
+    p = _first_attempt_path(root, item_id)
+    try:
+        return _read_first_attempt(p)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, AttributeError):
+        return None
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(f".{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps({"item_id": item_id, "at": time.time() if now is None else now}),
+                       encoding="utf-8")
+        try:
+            os.link(tmp, p)                     # create-if-absent: the first writer's stamp stands
+        except FileExistsError:
+            pass
+        finally:
+            tmp.unlink(missing_ok=True)
+        return _read_first_attempt(p)
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def forget_first_attempt(root: Path, item_id: str) -> None:
+    """Drop `item_id`'s first-attempt stamp once its result is settled."""
+    with contextlib.suppress(OSError):
+        _first_attempt_path(root, item_id).unlink(missing_ok=True)
+
+
 def effective_item_id(root: Path, item_id: str, no_send: bool) -> str:
     """The item a result for `item_id` is delivered under: a suppressed close for an item already
     delivered rides its own record."""
