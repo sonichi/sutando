@@ -215,9 +215,8 @@ class Connector:
         path = os.path.join(self.args.inbox, name)
         result_file = os.path.join(self.args.results, name)
         headers, message, operator_lines = parse_task(path)
-        # Sutando answers a guest, plain team (wire guest without the collaborator stamp) and an unknown tier
-        # (parse_task makes it guest) in a read-only sandbox; here that is guest_turn, so they need no opt-in.
-        # A wire `team` without the stamp is a guest here too: it fails closed to the isolated turn.
+        # As Sutando, a guest, plain team or unknown tier is served read-only (guest_turn) with no opt-in; a wire
+        # `team` without the collaborator stamp is a guest too (fail closed).
         tier = admission(headers, allow_non_owner=True)
         if tier is None or (tier == "collaborator" and not self.args.allow_non_owner):
             log("refused (non-owner) ->", task_id, headers["access_tier"])
