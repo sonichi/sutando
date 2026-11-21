@@ -11,6 +11,7 @@ command line, a file of its own).
 """
 from __future__ import annotations
 
+import collections
 import contextlib
 import dataclasses
 import json
@@ -292,18 +293,24 @@ def task_framing(task_id, headers, message, operator_lines, post_with, note=NON_
 # ── one turn ─────────────────────────────────────────────────────────────────
 
 class Turn:
-    """Collects the agent's message text and the permission decisions of one prompt."""
+    """Collects the agent's message text and the permission decisions of one prompt, and counts its
+    `session/update`s by type (`updates`), so a turn that ends with no text shows what it did instead."""
 
     def __init__(self):
         self.live = False
         self.chunks = []
         self.decisions = []
+        self.updates = collections.Counter()
         self.lock = threading.Lock()
 
     def on_update(self, params):
         update = params.get("update") if isinstance(params.get("update"), dict) else {}
-        if not self.live or update.get("sessionUpdate") != "agent_message_chunk":
+        if not self.live:
             return  # before the prompt, a session/load replays history: never this turn's answer
+        with self.lock:
+            self.updates[str(update.get("sessionUpdate"))[:60]] += 1
+        if update.get("sessionUpdate") != "agent_message_chunk":
+            return
         content = update.get("content")
         if isinstance(content, dict) and content.get("type") == "text":
             with self.lock:

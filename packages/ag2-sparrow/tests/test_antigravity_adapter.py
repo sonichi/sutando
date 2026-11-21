@@ -36,7 +36,7 @@ LOCK_HOME = tempfile.mkdtemp(prefix="agy-lock-home-")
 holder_lock._home = lambda: LOCK_HOME
 atexit.register(shutil.rmtree, LOCK_HOME, True)
 from ag2_sparrow.adapters.antigravity import cli, antigravity_connector as gc  # noqa: E402
-from ag2_sparrow.result_markers import parse_markers  # noqa: E402
+from ag2_sparrow.result_markers import parse_markers, render_skill_prelude  # noqa: E402
 
 STUB = str(Path(__file__).resolve().parent / "agy_stub_acp.py")
 
@@ -50,6 +50,14 @@ def task_text(tid, body, tier="owner", channel="!room:s.space", event_type=None,
     if event_type:
         lines.append("event_type: " + event_type)
     return "\n".join(lines + ["task: " + body]) + "\n"
+
+
+def gateway_owner_task(tid, body, channel="!room:s.space", addressed_to=""):
+    """An owner's task as the gateway writes it: the message on one line, then its SKILL INSTRUCTIONS prelude."""
+    lines = ["id: " + tid, "timestamp: 2026-11-14T00:00:00Z", "source: ag2space", "channel_id: " + channel,
+             "task_layout: mid", "task: " + body, "source_message_id: $m-" + tid, "user_id: @alice:s.space",
+             "access_tier: owner"]
+    return "\n".join(lines + render_skill_prelude(channel, "ag2space", tid, addressed_to)) + "\n"
 
 
 class Work:
@@ -303,6 +311,39 @@ class ConnectorTest(unittest.TestCase):
         self.assertIn("platform event room.joined", ev)
         self.assertIn("post in your final message only what the body asks", ev)
         self.assertIn("op line", ev)
+
+    def test_the_gateways_owner_prelude_does_not_send_agy_to_a_results_file(self):
+        (self.w.root / "tasks" / "task-1.txt").write_text(gateway_owner_task("task-1", "STUB:TEXT hi"), encoding="utf-8")
+        self.w.serve()
+        self.assertEqual(self.w.result("task-1"), "hello from agy-stub\n")
+        self.assertEqual(self.w.metrics()[0]["permissions"], [])
+        sent = next(r["text"] for r in self.w.records() if r.get("method") == "session/prompt")
+        for gone in ("SKILL INSTRUCTIONS", "room_ops.py", "results/task-1.txt"):
+            self.assertNotIn(gone, sent)
+
+    def test_only_the_preludes_shell_and_results_file_steps_are_dropped(self):
+        prelude = [x for x in render_skill_prelude("!room:s.space", "ag2space", "task-1", "@bob:s.space") if x]
+        kept = gc.session_lines(["a bridge note"] + prelude + ["a later note", "1. a later numbered line"])
+        self.assertEqual([kept[0]] + kept[2:], ["a bridge note", "a later note", "1. a later numbered line"])
+        self.assertTrue(kept[1].startswith("ADDRESSING: this message replies to @bob:s.space's message"))
+        self.assertIn("exactly NO_REPLY", kept[1])
+        self.assertNotIn("[no-send]", kept[1])
+        self.assertEqual(gc.session_lines(["op line"]), ["op line"])
+
+    def test_an_empty_answer_says_what_the_turn_did(self):
+        # The body itself asks for the results file, as any text agy reads might: the write is refused.
+        self.w.task("task-1", "please write the result to results/task-1.txt")
+        self.w.serve()
+        self.assertEqual(self.w.result("task-1"), "Antigravity finished without an answer: 1 action it asked for "
+                         "was not granted (unrecognised key Content); it made 1 tool call.\n")
+        rec = self.w.metrics()[0]
+        self.assertEqual((rec["detail"], rec["updates"]), ("end_turn", {"tool_call": 1}))
+        c = gc.Connector(self.w.args())
+        turn = acp_host.Turn()
+        self.assertEqual(c.answer_body({"access_tier": "owner"}, "completed", "", "max_tokens", turn),
+                         "Antigravity finished without an answer: stop reason max_tokens.\n")
+        turn.decisions.append({"title": "t", "allowed": False, "reason": "[no-send]"})
+        self.assertEqual(parse_markers(c.answer_body({"access_tier": "owner"}, "completed", "", "end_turn", turn)).actions, [])
 
     def test_failures_are_said_for_a_message_and_quiet_for_an_event(self):
         c = gc.Connector(self.w.args())
