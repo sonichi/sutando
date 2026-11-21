@@ -61,6 +61,8 @@ export const HEADER_KEYS: readonly string[] = [
 	'owner_mentioned',
 	'asked_by',
 	'task_layout',
+	'session_page',
+	'session_ctx',
 	'hook',
 	'summon',
 	'local_time',
