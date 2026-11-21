@@ -263,7 +263,8 @@ else
   # normal, low, then oldest first). Everything else keeps glob order. No
   # interpreter, a failed helper, or an answer that is not the same number of
   # files: glob order, as before.
-  QUEUE_FILES=("$TASKS_DIR"/*.txt)
+  QUEUE_FILES=()
+  for f in "$TASKS_DIR"/*.txt; do QUEUE_FILES+=("$f"); done
   if [ "${#QUEUE_FILES[@]}" -gt 1 ] && [ -n "$PYBIN" ]; then
     OWNER_FIRST=()
     while IFS= read -r -d '' f; do
