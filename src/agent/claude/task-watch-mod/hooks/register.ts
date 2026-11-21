@@ -18,6 +18,10 @@ export const SUBMIT_TIMEOUT_MS = 30_000
 /** How long after a submit resolves a main turn may take to start before the submit counts as not delivered. */
 export const TURN_START_WAIT_MS = 15_000
 const RESEND_MAX_MS = 60_000
+// task_disposition.py is asked about each held task right before a submit: this long per answer, this many at once.
+const DISPOSITION_TIMEOUT_MS = 10_000
+const DISPOSITION_AT_ONCE = 4
+const DISPOSITIONS = ['pending', 'claimed', 'answered', 'archived', 'missing']
 // The engine's own refusal after the person pressed Stop, as a `{ drop }` reason. Claude Code 2.1.322 words
 // it "the session was stopped and nobody has sent input since"; its types say "a Stop stands".
 const STOP_DROP_RE = /\bstop/i
@@ -76,6 +80,26 @@ export function backoffMs(failures: number): number {
   return Math.min(BACKOFF_BASE_MS * 2 ** Math.max(0, failures - 1), BACKOFF_MAX_MS)
 }
 
+/** The names of the tasks a message announces, in order, each once. */
+export function taskNames(text: string): string[] {
+  const names = text.split('\n').map((l) => TASK_RE.exec(l)?.[1]).filter((n): n is string => n !== undefined)
+  return [...new Set(names)]
+}
+
+/**
+ * `text` without the tasks in `handled`: unchanged when it names none of them, null when nothing is left.
+ * Otherwise its QUEUE lines are written again, because the watcher counted tasks that are now done: each
+ * task left gets the number of other tasks left in this message, and no line at 0, as the watcher prints it.
+ */
+export function withoutHandled(text: string, handled: ReadonlySet<string>): string | null {
+  const tasks = text.split('\n').filter((l) => TASK_RE.test(l))
+  const kept = tasks.filter((l) => !handled.has(TASK_RE.exec(l)?.[1] ?? ''))
+  if (kept.length === tasks.length) return text
+  if (!kept.length) return null
+  const others = kept.length - 1
+  return kept.map((l) => (others ? `${l}\nQUEUE: ${others} pending after this` : l)).join('\n')
+}
+
 /**
  * The watcher's stdout turned into the text a Monitor notification carries: each TASK_FILE line, with the
  * QUEUE line that follows it. Every other line is returned to the caller to log and is never submitted.
@@ -132,8 +156,8 @@ export type Child = { next: () => Promise<IteratorResult<Piece, End>>; return: (
 
 /** What the watch needs from the engine; register() builds it from `$`, the tests from fakes. */
 export type Host = {
-  /** A command's stdout when it exits 0, else null. */
-  run: (argv: string[]) => Promise<string | null>
+  /** A command's stdout when it exits 0, else null; `timeoutMs` shortens the 20 s it is given. */
+  run: (argv: string[], timeoutMs?: number) => Promise<string | null>
   spawn: (argv: string[], cwd: string) => Child
   sleep: (ms: number) => Promise<void>
   now: () => Promise<number>
@@ -173,6 +197,9 @@ export class TaskWatch {
   private shown = 0
   private unstarted = 0
   private trail: string | null = null
+  private py: string | null = null
+  private ws: string | null = null
+  private checkBroken = false
   private notes: string[] = []
   private noting = false
   constructor(private host: Host, private repo: string, private submitTimeoutMs = SUBMIT_TIMEOUT_MS, private turnStartWaitMs = TURN_START_WAIT_MS) {}
@@ -215,8 +242,8 @@ export class TaskWatch {
   }
 
   /** While a Stop stands, or submits start no turn: the status line with the count, and one toast per wait. */
-  private showWaiting(): void {
-    const n = this.paused || this.unstarted > 0 ? this.ann.count() : 0
+  private showWaiting(inFlight = 0): void {
+    const n = this.paused || this.unstarted > 0 ? this.ann.count() + inFlight : 0
     if (!n || n === this.shown) return
     this.shown = n
     const line = `${n} task${n === 1 ? '' : 's'} waiting — type anything to resume`
@@ -234,6 +261,65 @@ export class TaskWatch {
     this.shown = 0
     this.toasted = false
     this.host.status(undefined)
+  }
+
+  /** Nothing was left to submit: with nothing else held either, the wait is over and its status line goes. */
+  private nothingLeft(): void {
+    this.note('nothing left to announce: every held task was already handled; no submit')
+    if (this.ann.count()) {
+      this.showWaiting()
+      return
+    }
+    this.unstarted = 0
+    if (!this.shown) return
+    this.shown = 0
+    this.toasted = false
+    this.host.status(undefined)
+  }
+
+  /**
+   * What is left of `text` once the tasks that are no longer pending are taken out. Asked right before each
+   * submit, not when the watcher announces: a task that arrives mid-turn is pending then, and the Stop hook
+   * has usually handed it to the model, which answered it, before the turn ends. src/task_disposition.py owns
+   * the answer; this never looks for a result itself. Any word but `pending` (answered, archived, claimed,
+   * missing) means there is nothing to announce. A check that fails, times out or prints anything else keeps
+   * its task, which is announced as before; once a whole round of checks fails the rest are not asked.
+   */
+  private async stillPending(text: string): Promise<string | null> {
+    const py = this.py
+    const ws = this.ws
+    if (!py || !ws) return text
+    const names = taskNames(text)
+    const handled = new Set<string>()
+    let failed = 0
+    for (let i = 0; i < names.length; i += DISPOSITION_AT_ONCE) {
+      const round = names.slice(i, i + DISPOSITION_AT_ONCE)
+      const words = await Promise.all(round.map(async (name) => {
+        try {
+          return ((await this.host.run([py, `${this.repo}/src/task_disposition.py`, '--workspace', ws, '--', name], DISPOSITION_TIMEOUT_MS)) ?? '').trim()
+        } catch {
+          return ''
+        }
+      }))
+      let roundFailed = 0
+      words.forEach((word, at) => {
+        if (!DISPOSITIONS.includes(word)) {
+          roundFailed++
+          this.note(`task_disposition gave no answer for ${round[at]}; announced anyway`)
+        } else if (word !== 'pending') {
+          handled.add(round[at])
+          this.note(`not announced: ${round[at]} is ${word}`)
+        }
+      })
+      failed += roundFailed
+      if (roundFailed === round.length && i + DISPOSITION_AT_ONCE < names.length) {
+        this.note(`task_disposition is not answering; the other ${names.length - i - round.length} task(s) are announced unchecked`)
+        break
+      }
+    }
+    if (failed && !this.checkBroken) await this.host.log(`could not check ${failed} task(s) with task_disposition.py; announcing them anyway`)
+    this.checkBroken = failed > 0
+    return withoutHandled(text, handled)
   }
 
   /** Sends what waited for the turn to end; a hook must not await it, a submit can take its whole timeout. */
@@ -308,14 +394,30 @@ export class TaskWatch {
    * as delivery, so an engine that words its turns differently costs one repeat per announcement, not a loop.
    *
    * None of that runs while a Stop stands (stopStands): the loop ends, and whatever it holds goes back unsent.
+   *
+   * Everything taken from the buffer goes through stillPending first, so a first send, a resend and what a
+   * Stop held are all checked at the moment they would be submitted.
    */
   private async drain(): Promise<void> {
     this.sending = true
     let timeouts = 0
     try {
       while (!this.stopped && !this.turnRunning && !this.paused) {
-        const text = this.ann.take()
-        if (!text) return
+        const held = this.ann.take()
+        if (!held) return
+        const text = await this.stillPending(held)
+        if (this.stopped) return
+        if (text === null) {
+          this.nothingLeft()
+          continue
+        }
+        if (this.turnRunning || this.paused) {
+          // A main turn began, or a Stop landed, during the check: back in front, checked again at the next flush.
+          this.ann.unshift(text)
+          this.showWaiting()
+          continue
+        }
+        if (text !== held) this.showWaiting(taskNames(text).length)
         const id = ++this.submits
         let timedOut = false
         let landedLate = false
@@ -419,6 +521,8 @@ export class TaskWatch {
     const ws = (await this.host.run(['bash', config, 'workspace']))?.trim()
     if (!ws) return 'no workspace resolved'
     this.trail = `${ws.replace(/\/+$/, '')}/${TRAIL_FILE}`
+    this.py = py
+    this.ws = ws
     const raw = await this.host.run([py, `${this.repo}/src/watcher_rearm.py`, 'watch-argv', '--repo', this.repo, '--workspace', ws])
     const argv = (raw ?? '').split('\n').filter((l) => l.length > 0)
     const at = argv.indexOf('--inbox')
@@ -534,9 +638,9 @@ function hostOf($: EngineInterface): Host {
     }
   }
   return {
-    run: async (argv) => {
+    run: async (argv, timeoutMs = 20_000) => {
       try {
-        const r = await $.process.run(argv, { timeoutMs: 20_000 })
+        const r = await $.process.run(argv, { timeoutMs })
         return r.exitCode === 0 ? String(r.stdout ?? '') : null
       } catch {
         return null
