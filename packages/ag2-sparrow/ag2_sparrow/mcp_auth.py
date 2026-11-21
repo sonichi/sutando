@@ -193,9 +193,6 @@ def acp_entry(gateway: Gateway) -> dict:
             "headers": [{"name": "Authorization", "value": f"Bearer {mint(mint_url, bearer)}"}]}
 
 
-_PROXY_TOKEN_KEYS = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
-
-
 def stdio_descriptor(gateway: Gateway) -> dict:
     """The non-secret descriptor the desktop's stdio `ag2-mcp-proxy` reads (AG2_MCP_DESCRIPTOR): the discovered
     mint and MCP URLs, the agent's own token file, whose `REMOTE_TASK_TOKEN=` line the proxy mints from, and
@@ -207,12 +204,12 @@ def stdio_descriptor(gateway: Gateway) -> dict:
         text = Path(env_file).read_text(encoding="utf-8")
     except OSError as exc:
         raise McpAuthError(f"the token file is unreadable ({type(exc).__name__})")
-    # The proxy reads `KEY=value` lines only (no `export `); a seat's raw token file has none.
-    keys = [k for k in _PROXY_TOKEN_KEYS if any(line.strip().startswith(k + "=") for line in text.splitlines())]
-    if not keys:
+    from .gateway_credential_sources import plain_token_key
+    key = plain_token_key(text)   # a seat's raw token file has none
+    if not key:
         raise McpAuthError("the token file has no REMOTE_TASK_TOKEN= line the stdio proxy reads (a seat's raw token file?)")
     mint_url, mcp_url = discover(url, bearer)
-    return {"version": 1, "lane": "primary", "env_file": env_file, "env_key": keys[0], "mint_url": mint_url,
+    return {"version": 1, "lane": "primary", "env_file": env_file, "env_key": key, "mint_url": mint_url,
             "mcp_url": mcp_url, "relay": url.rstrip("/"),
             "bearer_digest": hashlib.sha256(bearer.strip().encode("utf-8")).hexdigest()}
 

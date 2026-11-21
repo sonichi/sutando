@@ -557,6 +557,16 @@ def token_file_pairs(text: str) -> "list[tuple[str, str]]":
     return pairs
 
 
+def plain_token_key(text: str) -> str:
+    """The token key a reader that takes only plain `KEY=value` lines (no `export `, as the desktop's stdio MCP
+    proxy) finds in a token file's text: the first of TOKEN_KEYS assigned a value that way, else ""."""
+    for key in TOKEN_KEYS:
+        if any(line.strip().startswith(key + "=") and line.strip()[len(key) + 1:].strip(" '\"")
+               for line in text.splitlines()):
+            return key
+    return ""
+
+
 def token_file_url(text: str) -> str:
     """The REMOTE_TASK_URL (legacy AG2_REMOTE_URL) of a split-layout token file's text, or ""."""
     return first(_assignments(text, URL_KEYS), URL_KEYS)[0]
