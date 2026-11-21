@@ -182,6 +182,22 @@
   };
   // Re-read on demand: after the first allowed write, and whenever the picker is opened.
   const refreshAgents = () => fillAgents();
+  // A row handed to an agent in the room, per row: if the agent has not changed the row after
+  // PICKUP_MS, the row says so and offers a confirmed mention in the room. The row summons the
+  // agent only when it listens for row assignments; a mention reaches it either way.
+  // Per tab: a page's rows carry no created time, so only rows this viewer added here, since
+  // this page was opened, are watched; a reload or another member does not see the line.
+  const PICKUP_MS = 60000;
+  // artifact.now() is the estimated server time and is NaN until the host's first sample (or
+  // for as long as the host cannot sample): fall back to this device's clock whenever it is.
+  const clock = () => {
+    const t = typeof art.now === 'function' ? art.now() : NaN;
+    return Number.isFinite(t) ? t : Date.now();
+  };
+  const waiting = new Map();         // rowId -> {agent, at, key}
+  const stillWaiting = (row, wait) => row && row.cells.Status === 'Requested'
+    && Array.isArray(row.cells.Actor) && row.cells.Actor.length === 1
+    && row.cells.Actor[0] === wait.agent.userId;
   // A DM ask that was not sent, per row: retried with the SAME key, so it never asks twice.
   const unsent = new Map();          // rowId -> {agent, text, key, reason}
 
@@ -266,6 +282,23 @@
           b.onclick = () => setStatus(row, o.name);
           actions.appendChild(b);
         });
+        const wait = waiting.get(row.id);
+        if (wait && st !== (names[0] || 'Requested')) waiting.delete(row.id);
+        else if (wait && clock() - wait.at >= PICKUP_MS) {
+          const note = document.createElement('div');
+          note.className = 'meta blocked';
+          note.textContent = wait.agent.name + ' has not picked this up yet. It starts on a row only if it '
+            + 'listens for row assignments (its owner turns that on in its setup). You can tell it in the room.';
+          li.appendChild(note);
+          if (art.room && typeof art.room.post === 'function') {
+            const tell = document.createElement('button');
+            tell.type = 'button';
+            tell.textContent = 'Tell ' + wait.agent.name + ' in the room';
+            tell.disabled = busy;
+            tell.onclick = () => tellInRoom(row, wait);
+            actions.appendChild(tell);
+          }
+        }
         const miss = unsent.get(row.id);
         if (miss) {
           const note = document.createElement('div');
@@ -290,6 +323,9 @@
   const render = async (snap) => {
     const gen = ++generation;
     snapshot = snap;
+    for (const [rowId, wait] of waiting) {
+      if (!stillWaiting(snap && snap.rows.find((row) => row.id === rowId), wait)) waiting.delete(rowId);
+    }
     if (!snap) { clearNotes(); $('cols').textContent = ''; $('sub').textContent = ''; show('bad', 'The Task Board database was removed from this room.'); $('add').disabled = true; return; }
     let members = null;
     try { members = new Map((await art.members()).map((m) => [m.id, m])); } catch (e) { members = null; }
@@ -352,6 +388,32 @@
     show('bad', 'The task was added, but not sent to ' + agent.name + ': ' + ((sent && sent.reason) || 'unknown reason') + '. Use "Send to ' + agent.name + ' again" on its row.');
   };
 
+  // A confirmed mention, posted as the viewer: every agent channel delivers a mention. Only an
+  // unknown outcome keeps its key (a repeated key never posts twice); after a refusal such as
+  // 'declined' a new key asks again.
+  const tellInRoom = async (row, wait) => {
+    if (busy) return;
+    row = snapshot && snapshot.rows.find((current) => current.id === row.id);
+    if (!row || waiting.get(row.id) !== wait || !stillWaiting(row, wait)) return;
+    const title = String((titleProp && row.cells[titleProp]) || 'this task').slice(0, 200);
+    const text = '<@' + wait.agent.id + '> please take "' + title + '" on the Task Board (row ' + row.id
+      + '). Set its Status, Blocker and Result on the row as you work.';
+    busy = true;
+    let r;
+    try { r = await art.room.post({ text, key: wait.key }); } catch (e) { r = { posted: false, reason: e.message }; }
+    busy = false;
+    const reason = (r && r.reason) || '';
+    if (r && r.posted === true) {
+      waiting.delete(row.id);
+      if (snapshot) await render(snapshot);
+      show('warn', 'Posted in the room for ' + wait.agent.name + '. It answers by its own rules; the row shows what it does.');
+      return;
+    }
+    if (!/outcome unknown|timed out/i.test(reason)) wait.key = 'tell-' + clock().toString(36) + '-' + Math.floor(Math.random() * 1e6).toString(36);
+    if (snapshot) await render(snapshot);
+    show('bad', 'Not posted: ' + (reason || 'unknown reason') + '.');
+  };
+
   $('add').onclick = async () => {
     if (busy) return;
     const text = $('title').value.trim();
@@ -374,6 +436,10 @@
     }
     if (!r.ok) { show('bad', r.reason || 'The task was not saved.'); return; }
     if ($('title').value.trim() === text) $('title').value = '';
+    if (agent && agent.userId && r.rowId) {
+      waiting.set(r.rowId, { agent, at: clock(), key: 'tell-' + clock().toString(36) + '-' + Math.floor(Math.random() * 1e6).toString(36) });
+      setTimeout(() => { if (snapshot) render(snapshot); }, PICKUP_MS + 500);
+    }
     if (!agent || agent.userId) return;
     await askInDm(r.rowId, agent, text);
   };
