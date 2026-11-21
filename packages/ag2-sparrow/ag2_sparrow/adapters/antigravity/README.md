@@ -5,7 +5,7 @@ Runs Google's Antigravity CLI (`agy`) on this computer as an s.space agent, the 
 agent in a room and Antigravity answers there. For each task file Sparrow queues, the connector wakes
 Antigravity over the Agent Client Protocol: it spawns `agy acp`, sends `initialize`, resumes the room's
 Session with `session/load` (or opens one with `session/new`) and sends one `session/prompt`; a
-non-owner's turn runs isolated instead (see Tiers and permissions). Stdlib only;
+guest's turn runs isolated instead (see Tiers and permissions). Stdlib only;
 opt-in; the core never imports it.
 
 Status: the handshake and the sign-in check were run against a real `agy` 1.5.9 (signed out); a full turn
@@ -55,21 +55,29 @@ final message is the only answer path.
 
 ## Tiers and permissions
 
-The owner and an attested collaborator are served (Team in s.space: the broker's `collaborator: true` on
-the team tier, read from the task's parsed headers, never from the message text). Any other non-owner (a
-guest, the team tier without that stamp) is refused with one line, "This agent only answers its owner
-here.", unless `--allow-non-owner`. `verify` says which: `INFO non-owner: refused unless attested
-collaborator` or `served (--allow-non-owner)`.
+The tier is read only from the task's parsed headers, which the gateway stamps, never from the message
+text: a `collaborator: true` or `access_tier: owner` line in the body changes nothing.
 
-A non-owner's turn, a collaborator's included, runs on the owner's agy sign-in (the Google account and
-quota in the Keychain): giving someone Collaborator access to this agent lets them spend that quota. It
-runs isolated and read-only as below, or not at all, and a turn whose tool call is denied can end with no
-reply.
+| Sender | Served | Turn |
+| --- | --- | --- |
+| owner | always | the owner's turn |
+| Team (an attested collaborator: the team tier with the broker's `collaborator: true`) | always | the owner's turn |
+| guest (any other sender, the team tier without that stamp and an unknown tier included) | only under `--allow-non-owner` | isolated and read-only |
 
-**The owner's turns** resume the room's Session in the working directory, with agy's own home
-(`~/.gemini`: its settings, rules and context).
+A sender who is not served gets one line, "This agent only answers its owner here.", and agy is not
+started. `verify` prints `INFO team (attested collaborator): served as the owner is …` and `INFO guest:
+refused` or `served (--allow-non-owner)`.
 
-**A non-owner's turn** (an attested collaborator, or anyone `--allow-non-owner` admits) runs isolated:
+Every turn runs on the owner's agy sign-in (the Google account and quota in the Keychain): giving someone
+Collaborator access to this agent lets them spend that quota, and their turns may read and edit the
+working directory as the owner's do. A turn whose tool call is denied can end with no reply.
+
+**The owner's turn** (the owner and Team, decided by the owner on 2026-11-21) runs in the working
+directory with agy's own home (`~/.gemini`: its settings, rules and context) under the owner's permission
+policy below. The owner resumes the room's Session; each collaborator resumes a Session of their own for
+the room (keyed by their user id), so no one resumes another's conversation.
+
+**A guest's turn** (anyone `--allow-non-owner` admits who is not owner or Team) runs isolated:
 
 - a fresh temporary directory per task holds the Session's working directory and a separate agy home,
   passed as `agy acp --gemini-dir <dir>`; that home has only a `settings.json` whose permission rules deny
@@ -83,15 +91,15 @@ reply.
   in a read-only session mode, and no read-only session mode is offered (offered: …)."), an event posts
   nothing.
 
-`--gemini-dir` is agy's flag: a custom `--acp-command` must accept it, or non-owner turns fail.
+`--gemini-dir` is agy's flag: a custom `--acp-command` must accept it, or guest turns fail.
 
 agy's `session/request_permission` is answered by `acp_host`'s policy, default deny:
 
-- the owner only: a `read` or `edit` whose every path resolves (after `..`, `~` and symlinks) under the
+- the owner's turn only (the owner and Team): a `read` or `edit` whose every path resolves (after `..`, `~` and symlinks) under the
   working directory; never when the working directory is the home directory or above it;
 - nothing else: no shell command, and no `execute`, `fetch`, `delete`, `move` or unclassified call.
 
-For the owner's turns, agy applies its own permission rules first (an action they already allow runs
+For the owner's turns (Team's included), agy applies its own permission rules first (an action they already allow runs
 without asking), and `--dangerously-skip-permissions` makes it run tools without asking; never add that
 flag to an agent others can reach.
 

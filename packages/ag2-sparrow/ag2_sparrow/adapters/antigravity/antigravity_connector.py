@@ -11,12 +11,13 @@ with every delivery marker neutralised. A final message of exactly NO_REPLY post
 turn failed gets a line saying so; an event that failed posts nothing.
 
 Sessions, the permission policy and the framing are acp_host's: the owner may read or edit under the working
-directory, no command is ever granted, and the owner and an attested collaborator are served; any other
-non-owner is refused unless --allow-non-owner (task_io.admission decides the tier). A non-owner turn, a
-collaborator's included, runs on the owner's agy sign-in and so runs isolated: a fresh temporary directory
-per task holds its working directory and its own agy home (`--gemini-dir`, with deny-all permission rules and
-no global context), its Session is new and never stored, and it is refused unless agy offers a read-only
-(plan) session mode and accepts it. Stdlib only.
+directory, no command is ever granted. task_io.admission decides the tier. The owner and an attested
+collaborator (Team in s.space) are served, both in the same turn: the working directory, agy's own home, the
+owner's permission policy, a Session of their own resumed per room. Any other sender (a guest) is refused
+unless --allow-non-owner, and is then served isolated: a fresh temporary directory per task holds its working
+directory and its own agy home (`--gemini-dir`, with deny-all permission rules and no global context), its
+Session is new and never stored, and it is refused unless agy offers a read-only (plan) session mode and
+accepts it. Every turn runs on the owner's agy sign-in. Stdlib only.
 """
 from __future__ import annotations
 
@@ -96,6 +97,7 @@ def guest_turn(args):
 
 
 def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_NOTE):
+    """The turn's prompt. `cwd` is the working directory the turn may read and edit, None for an isolated turn."""
     event, _ = trigger_of(headers)
     out = acp_host.task_framing(task_id, headers, message, operator_lines, "post in your final message", note)
     out.append("Answer through Sparrow, exactly once for this task: your final message in this turn is what Sparrow "
@@ -104,8 +106,7 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
                "your final message exactly %s and nothing else."
                % (" as the reply" if event in (None, MESSAGE_EVENT) else "", NO_REPLY))
     out.append("No shell command is granted in this session. %s"
-               % ("You may read and edit files under %s." % cwd if headers.get("access_tier") == "owner"
-                  else "You may not read or change files."))
+               % ("You may read and edit files under %s." % cwd if cwd else "You may not read or change files."))
     return "\n\n".join(out)
 
 
@@ -120,7 +121,8 @@ class Connector:
 
     def run_turn(self, task_id, headers, prompt, owner):
         """(status, text, detail, turn): status is completed | cancelled | timeout | gone | failed | refused.
-        The owner's turn resumes the room's Session in the working directory; any other runs `guest_turn`."""
+        With `owner` (the owner's or an attested collaborator's turn) it resumes the sender's Session for the room
+        in the working directory, under the owner's policy; any other runs `guest_turn`."""
         if owner:
             cwd = self.args.cwd
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
@@ -159,12 +161,16 @@ class Connector:
         result_file = os.path.join(self.args.results, name)
         headers, message, operator_lines = parse_task(path)
         tier = admission(headers, self.args.allow_non_owner)
-        # Every tier but the owner's runs on the owner's agy sign-in, so it runs in `guest_turn` or not at all.
         if tier is None:
             log("refused (non-owner) ->", task_id, headers["access_tier"])
             publish(result_file, NON_OWNER_REFUSED)
             return {"task": task_id, "status": "refused", "tier": headers["access_tier"]}
-        prompt = wake_prompt(task_id, headers, message, operator_lines, self.args.cwd, self.note)
+        # Team (an attested collaborator) gets the owner's turn and policy; from here `tier` names the turn, and
+        # headers["access_tier"] still names the sender. Any other admitted sender gets `guest_turn`.
+        if tier == "collaborator":
+            tier = "owner"
+        prompt = wake_prompt(task_id, headers, message, operator_lines, self.args.cwd if tier == "owner" else None,
+                             self.note)
         event, _ = trigger_of(headers)
         log("wake ->", task_id, headers["access_tier"], event or "message")
         t0 = time.time()
@@ -227,8 +233,8 @@ def build_parser():
     ap.add_argument("--session-store", default=None,
                     help="the sessions.json to resume from and record to (default: <work>/state/sessions.json)")
     ap.add_argument("--allow-non-owner", action="store_true",
-                    help="serve non-owner senders without collaborator access too, on the owner's agy sign-in "
-                         "(isolated and read-only, as an attested collaborator always is; default: refused)")
+                    help="serve senders without collaborator access (guests) too, on the owner's agy sign-in, "
+                         "isolated and read-only (default: refused; an attested collaborator is always served)")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=0.2)

@@ -297,9 +297,12 @@ def verify(args, factory=gc.AcpClient) -> int:
     for key in ("INBOX_DIR", "RESULTS_DIR"):
         cm.check(results, Path(cfg[key]).is_dir(), key.lower().replace("_dir", ""), cfg[key])
     store = cfg.get("SESSION_STORE") or str(Path(cm.work_root(cfg)) / "state" / gc.SESSIONS_NAME)
-    print(f"INFO sessions: {store} (the owner's resumed per room, never retired; a non-owner's turn is a "
-          "throwaway session)")
-    print(f"INFO non-owner: {'served (--allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '1' else 'refused unless attested collaborator'}; "
+    print(f"INFO sessions: {store} (the owner's and each collaborator's resumed per room, never retired; a "
+          "guest's turn is a throwaway session)")
+    print("INFO team (attested collaborator): served as the owner is, on the owner's agy account: the working "
+          "directory, agy's own home, the owner's permission policy (read or edit under the working directory, "
+          "no command)")
+    print(f"INFO guest: {'served (--allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '1' else 'refused'}; "
           "each turn served on the owner's agy account, in its own temporary directory and agy home, deny-all "
           "rules, read-only (plan) mode, no file operations")
     if cb.bridge_mode(cfg) != EXTERNAL:
@@ -336,8 +339,8 @@ def session_options(p) -> None:
     p.add_argument("--session-store", help="the sessions.json to resume from and record to (default: the work "
                    "root's state/sessions.json)")
     p.add_argument("--allow-non-owner", action="store_true",
-                   help="serve non-owner senders without collaborator access too, on the owner's agy sign-in "
-                   "(isolated and read-only, as an attested collaborator always is; default: refused)")
+                   help="serve senders without collaborator access (guests) too, on the owner's agy sign-in, "
+                   "isolated and read-only (default: refused; an attested collaborator is always served)")
 
 
 def main(argv=None) -> int:
