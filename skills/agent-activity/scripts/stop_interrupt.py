@@ -9,6 +9,10 @@ the turn is on the stopped task alone and the pane is mid-turn or showing a dial
 unreadable or unrecorded sends nothing. The key is fenced on the same turn id, so a turn that
 ended meanwhile gets no key.
 One Escape per task, ever; each decision is logged to stderr and as an owner row.
+A stop for a task the server already closed as terminal sends no Escape: that close is almost
+always the task's own answer landing (a reply posted in its thread) while the turn finishes, and an
+Escape there costs more than it saves, since Claude Code takes it as the person's Stop and refuses
+every plugin prompt until someone types. The control task is still read when the turn ends.
 
 The stop is then ruled, from a durable record this skill's hook re-checks at every turn end: once
 the core has answered the control task, a stopped task with no result is CANCELLED, one with a
@@ -46,6 +50,11 @@ from tmux_pane_keys import fence_keys_argv
 from workspace_default import resolve_workspace
 
 ESC_PROMPT = re.compile(r"esc to interrupt", re.I)
+# The reason the bridge writes into the control task when the broker answered `task_already_terminal`:
+# remote_gateway_bridge._closed_why, carried by task_attempts.cancel_task_text's "(<reason>)". The task
+# file has no structured field for it; this is the exact text those two write.
+SERVER_CLOSED = re.compile(r"^task: CANCEL_INSTRUCTION: stop processing \S+ if still in flight "
+                           r"\(closed on the server \(task_already_terminal[,)]", re.M)
 CONFIRM_POLL_S = 2.0
 CONFIRM_MAX_S = 3600.0
 MARKER_DIR = ("state", "stop-interrupts")
@@ -98,6 +107,11 @@ def _expire(manager, reqs: list) -> int:
         except Exception:
             pass
     return n
+
+
+def server_closed(control_text: str | None) -> bool:
+    """The stop is the bridge's for a task the broker already closed as terminal (not cancelled)."""
+    return bool(control_text) and bool(SERVER_CLOSED.search(control_text))
 
 
 def decide(target: str, *, turn, pane_text: str | None, held_elsewhere: bool = False,
@@ -194,7 +208,7 @@ def _socket(run: Callable) -> str | None:
 
 def interrupt(target: str, *, workspace: Path, tasks_dir: Path, run: Callable = _run,
               log: Callable[[str], None] = lambda m: print(m, file=sys.stderr),
-              now: float | None = None) -> bool:
+              now: float | None = None, closed_on_server: bool = False) -> bool:
     """Decide, send at most one fenced Escape, and log the decision. True when Escape was sent."""
     now = time.time() if now is None else now
     sock = _socket(run)
@@ -202,7 +216,9 @@ def interrupt(target: str, *, workspace: Path, tasks_dir: Path, run: Callable = 
         log(f"stop-interrupt: {target}: no tmux socket resolved; left the turn to finish")
         return False
     finished = ("it already has its result, or one being written"
-                if _result_state(workspace, target) is not None else None)
+                if _result_state(workspace, target) is not None
+                else "the server already closed it (task_already_terminal); the turn is finishing its answer"
+                if closed_on_server else None)
     held = _held_elsewhere(workspace, tasks_dir, target)
     pane = _pane_target(sock, run) if not (finished or held) else None
     pid = _pane_turn(sock, pane, run) if pane else None
@@ -358,11 +374,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workspace")
     ap.add_argument("--control-file", required=True, help="the CANCEL_INSTRUCTION task: its answer rules the stop")
     ap.add_argument("--work", action="store_true", help="the detached half: interrupt, then rule")
+    ap.add_argument("--server-closed", action="store_true",
+                    help="set by the first half: the stop is for a task the server already closed as terminal")
     a = ap.parse_args(argv)
     workspace = Path(a.workspace) if a.workspace else resolve_workspace()
     if a.work:
         try:
-            interrupt(a.target, workspace=workspace, tasks_dir=Path(a.tasks_dir))
+            interrupt(a.target, workspace=workspace, tasks_dir=Path(a.tasks_dir), closed_on_server=a.server_closed)
         except Exception as e:              # advisory: a Stop still completes cooperatively
             print(f"stop-interrupt: {a.target}: skipped ({e})", file=sys.stderr)
         confirm(a.target, workspace=workspace)
@@ -371,7 +389,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     control = Path(a.control_file)
     try:
-        trusted = trusted_cancel_target(control.read_text(encoding="utf-8", errors="replace"), control.name)
+        text = control.read_text(encoding="utf-8", errors="replace")
+        trusted = trusted_cancel_target(text, control.name)
     except OSError as e:
         print(f"stop-interrupt: {a.target}: not taken ({e})", file=sys.stderr)
         return 1
@@ -379,7 +398,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"stop-interrupt: {a.target}: not taken (not a stop from a trusted source)", file=sys.stderr)
         return 1
     open_ruling(workspace, a.target, control.stem)
-    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), *(argv or sys.argv[1:]), "--work",
+    # Read here, from the file just trusted: the core may archive it before the detached half runs.
+    closed = ["--server-closed"] if server_closed(text) else []
+    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), *(argv or sys.argv[1:]), "--work", *closed,
                       "--workspace", str(workspace)], start_new_session=True, stdin=subprocess.DEVNULL)
     return 0
 

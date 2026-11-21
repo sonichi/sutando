@@ -809,5 +809,64 @@ class StopHooks(unittest.TestCase):
             self.assertFalse([c for c in calls if "CANCELLED" in c], "nothing is cancelled before the stop is ruled")
 
 
+class ServerClosedStop(Base):
+    """A stop the bridge issues because the broker closed the task as terminal (its own answer landed
+    while the turn finished) sends no Escape: Claude Code would take it as the person's Stop and hold
+    every plugin prompt until someone types (18:46:21Z incident: 3 h, 7 tasks held)."""
+
+    CTL = "task-ctl-1795286780672-19a2df-s_dspace"
+
+    def ctl(self, reason):
+        # Written exactly as the bridge writes it: task_attempts.cancel_task_text(_closed_why(error)).
+        sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+        from ag2_sparrow import task_attempts
+        f = self.tasks / f"{self.CTL}.txt"
+        f.write_text(task_attempts.cancel_task_text(TARGET, self.CTL, "2026-11-21T18:46:20Z", reason))
+        return f
+
+    def take(self, ctl):
+        with mock.patch.object(si.subprocess, "Popen") as popen:
+            rc = si.main([TARGET, "--tasks-dir", str(self.tasks), "--workspace", str(self.ws), "--control-file", str(ctl)])
+        self.assertEqual(rc, 0)
+        return popen.call_args[0][0]
+
+    def work(self, argv, tmux):
+        real = si.interrupt
+        fake = lambda *a, **k: real(*a, run=tmux, log=self.logs.append, **k)
+        with mock.patch.object(si, "interrupt", side_effect=fake) as intr, mock.patch.object(si, "confirm"):
+            self.assertEqual(si.main(argv[2:]), 0)
+        self.assertEqual(intr.call_count, 1)
+
+    def test_a_task_already_terminal_stop_mid_turn_sends_no_escape(self):
+        self.turn()
+        for why in ("closed on the server (task_already_terminal)",
+                    "closed on the server (task_already_terminal, completed)"):
+            argv = self.take(self.ctl(why))
+            self.assertIn("--server-closed", argv, why)
+            tmux = FakeTmux()
+            self.work(argv, tmux)
+            self.assertEqual(tmux.escapes(), [], "no Escape, so the engine never enters its Stop")
+        tmux = FakeTmux()
+        self.assertFalse(si.interrupt(TARGET, workspace=self.ws, tasks_dir=self.tasks, run=tmux,
+                                      log=self.logs.append, closed_on_server=True))
+        self.assertEqual(tmux.escapes(), [])
+        self.assertIn("left the turn to finish (the server already closed it (task_already_terminal)", self.logs[-1])
+        self.assertTrue((self.ws / "state" / "stop-interrupts" / f"{TARGET}.ruling.json").exists(),
+                        "the stop is still ruled when the control task is answered")
+
+    def test_a_real_cancel_still_escapes_a_turn_on_the_task(self):
+        self.turn()
+        for why in ("closed on the server (task_not_found)", "no turn activity for 30 min"):
+            argv = self.take(self.ctl(why))
+            self.assertNotIn("--server-closed", argv, why)
+        tmux = FakeTmux()
+        self.work(argv, tmux)
+        self.assertEqual(len(tmux.escapes()), 1, "a cancel as today: one fenced Escape")
+        # The broker's task_cancelled and the app's or voice's stops carry no close reason.
+        for text in (f"task: CANCEL_INSTRUCTION: stop processing {TARGET} if still in flight. If already completed, no-op.",
+                     "", None, "note: (closed on the server (task_already_terminal)) quoted in a body\n"):
+            self.assertFalse(si.server_closed(text), text)
+
+
 if __name__ == "__main__":
     unittest.main()

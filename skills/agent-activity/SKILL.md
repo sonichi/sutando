@@ -83,7 +83,7 @@ skill hook. The hook never depends on the agent remembering anything:
   (`@sutando_turn`), cleared by that turn's own `Stop`.
 - **Stop interrupt** (`SUTANDO_STOP_INTERRUPT=1`, off by default). The skill's `on_stop_requested`
   handler (`scripts/stop_interrupt.py`) takes each Stop the watcher reads. It sends one Escape, fenced
-  on the pane's turn, only when that turn is on the stopped task alone (mid-turn or on a dialog); a turn on no task never gets one. It then rules the stop from
+  on the pane's turn, only when that turn is on the stopped task alone (mid-turn or on a dialog); a turn on no task never gets one. A stop the bridge issues because the broker closed the task as `task_already_terminal` (its answer landed while the turn finished) never gets one either: Claude Code takes the Escape as the person's Stop and holds every plugin prompt until someone types. It then rules the stop from
   `state/stop-interrupts/<task>.ruling.json`, which the hook re-checks at every turn end: no result once
   the control task is answered, CANCELLED; a ready result, left to delivery; one being written, wait; unanswered for an hour,
   CANCELLED. A stop for a task a pool worker holds is routed to that worker's inbox (`pool_router.stop_holder`), so the worker's own watcher runs this. Off, the handler declines and the watcher cancels the task at once.
