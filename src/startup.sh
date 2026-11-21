@@ -792,6 +792,8 @@ start_credential_proxy() {
     _PROXY_SCRIPT="$REPO/skills/quota-tracker/scripts/credential-proxy.ts"
     [ -f "$_PROXY_SCRIPT" ] || _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
   fi
+  # The child inherits the CLAUDE_CONFIG_DIR exported above (the core's own, from
+  # resolve_claude_config_dir), so it hashes to the same keychain item as the core.
   run_node_service credential-proxy "$_PROXY_SCRIPT" > /tmp/credential-proxy.log 2>&1 &
   sleep 1
   if lsof -i :7846 > /dev/null 2>&1; then

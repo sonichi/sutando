@@ -27,6 +27,8 @@ async function startProxy(seen: Array<[Record<string, string>, string | undefine
 	const upstreamPort = await listen(createHttpServer((req, res) => upstreamHandler(req, res)));
 	const deps: Partial<ProxyDeps> = {
 		readCredCandidates: () => [{ service: 'svc', oauth: { accessToken: 'tok', expiresAt: NOW + 3600_000 } }],
+		scopedService: null, // a plain install: not the runner's own CLAUDE_CONFIG_DIR
+		configDir: '',
 		writeCred: () => true,
 		refreshAccessToken: async () => null,
 		request: httpRequest as unknown as typeof httpsRequest,

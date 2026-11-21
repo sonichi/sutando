@@ -43,7 +43,8 @@ const REJECTION_SNIPPET_BYTES = 2048;
 // item (`Claude Code-credentials-<sha256(config-dir)[0..8]>`), while vanilla
 // Claude Code uses `Claude Code-credentials`. Prefer the scoped item so an
 // interactive `/login` in the Sutando core is the token the proxy injects, then
-// fall back to the vanilla item for older/global installs. When the chosen token
+// use the vanilla item ONLY when no config dir is set: it is the machine's shared
+// login, never a stand-in for a scoped identity (see ownCandidates). When the chosen token
 // is at/near expiry, use its refreshToken to mint a fresh one and write it back
 // to the SAME keychain item. Endpoint + client_id verified from the Claude Code
 // binary (v2.1.170 strings).
@@ -148,11 +149,26 @@ export function keychainServiceCandidates(configDir = process.env.CLAUDE_CONFIG_
 	return [...new Set(services)];
 }
 
+// `security` stderr is piped, not inherited (a missing item wrote a line per
+// request); any OTHER failure, e.g. a locked keychain, is logged once per change.
+const keychainReadErrors = new Map<string, string>();
 function readKeychainSecret(service: string): string {
-	return execFileSync('security', ['find-generic-password', '-s', service, '-w'], {
-		encoding: 'utf-8',
-		timeout: 5000,
-	});
+	try {
+		const out = execFileSync('security', ['find-generic-password', '-s', service, '-w'], {
+			encoding: 'utf-8',
+			timeout: 5000,
+			stdio: ['ignore', 'pipe', 'pipe'],
+		});
+		keychainReadErrors.delete(service);
+		return out;
+	} catch (e) {
+		const detail = String((e as { stderr?: unknown }).stderr || (e as Error).message).trim().split('\n')[0];
+		if (!/could not be found/.test(detail) && keychainReadErrors.get(service) !== detail) {
+			keychainReadErrors.set(service, detail);
+			console.error(`${ts()} [Proxy] keychain read of '${service}' failed: ${redactForLog(detail)}`);
+		}
+		throw e;
+	}
 }
 
 // Read the full cred object from one keychain service (not just accessToken).
@@ -189,10 +205,8 @@ export function readCred(
 	return readCredCandidates(services, readSecret)[0] ?? null;
 }
 
-// Pure: pick the credential to serve. First candidate whose token is usable
-// wins (scoped-first preference preserved); if none is usable, fall back to
-// the first present so degraded handling (pass-through / fail-fast) sees it.
-// A dead scoped item must not eclipse a fresh /login in the default item.
+// Pure: first candidate whose token is usable; if none, the first present, so
+// degraded handling (pass-through / fail-fast) sees it. Callers pass ownCandidates.
 export function selectCred(
 	candidates: StoredClaudeOAuth[],
 	now: number,
@@ -204,6 +218,56 @@ export function selectCred(
 	return candidates[0] ?? null;
 }
 
+// Pure: the items this proxy may inject or refresh. With a config dir set that is
+// ONLY its scoped item; the shared default item serves installs with no config dir.
+export function ownCandidates(
+	candidates: StoredClaudeOAuth[],
+	scopedService: string | null,
+): StoredClaudeOAuth[] {
+	return scopedService ? candidates.filter((c) => c.service === scopedService) : candidates;
+}
+
+// Pure: the log lines for a keychain selection — service names and config dir only.
+export function describeKeychainSelection(
+	service: string | null,
+	scopedService: string | null,
+	configDir: string,
+): { info: string; warning: string | null } {
+	const origin = !service ? ''
+		: scopedService ? ` (scoped to CLAUDE_CONFIG_DIR=${configDir})`
+		: ' (shared default item; no CLAUDE_CONFIG_DIR set)';
+	return {
+		info: `keychain service selected: ${service ? `'${service}'` : 'none'}${origin}`,
+		warning: scopedService && !service
+			? `WARNING: no keychain item '${scopedService}' for CLAUDE_CONFIG_DIR=${configDir}. The shared ` +
+				`'${DEFAULT_KEYCHAIN_SERVICE}' item is not used in its place (it may be another account). ` +
+				'Requests that carry their own credential are forwarded untouched; others get a 401. ' +
+				'If this proxy serves a Sutando core, its CLAUDE_CONFIG_DIR must be the core\'s ' +
+				'(reinstall: bash src/install-credential-proxy-launchd.sh), or run /login in the core.'
+			: null,
+	};
+}
+
+// Pure: the once-per-state warning for a scoped token that cannot be made usable.
+export function scopedTokenUnusableWarning(verdict: 'expired' | 'rejected', scopedService: string): string {
+	return `WARNING: the token in keychain item '${scopedService}' is ${verdict} and could not be refreshed. ` +
+		`The shared '${DEFAULT_KEYCHAIN_SERVICE}' item is not used in its place. Requests that carry their own ` +
+		'credential are forwarded untouched; others get a 401. Run /login in the core to restore injection.';
+}
+
+// 401 body for a proxy with a config dir and no login stored under it.
+export function authMissingBody(scopedService: string, configDir: string): string {
+	return JSON.stringify({
+		type: 'error',
+		error: {
+			type: 'authentication_error',
+			message:
+				`sutando credential-proxy: no login is stored for CLAUDE_CONFIG_DIR=${configDir} (keychain item ` +
+				`'${scopedService}') and the request carried no credential. Run /login in Claude Code under that config dir.`,
+		},
+	});
+}
+
 // Atomically write the cred back to the keychain. Returns true ONLY after a
 // read-back confirms the new accessToken landed — the rotation-lockout guard:
 // if we consumed a (rotating) refresh token we MUST be sure its replacement
@@ -211,7 +275,7 @@ export function selectCred(
 function keychainAccount(service: string): string | null {
 	try {
 		const meta = execFileSync('security', ['find-generic-password', '-s', service], {
-			encoding: 'utf-8', timeout: 5000,
+			encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
 		});
 		const m = meta.match(/"acct"<blob>="([^"]*)"/);
 		return m ? m[1] : null;
@@ -452,6 +516,11 @@ export interface ProxyDeps {
 	// supervised/unsupervised default without process-env/import-order
 	// tricks; production always gets the env-derived value below.
 	giveUpAfter: number;
+	// The keychain item scoped to this proxy's CLAUDE_CONFIG_DIR, or null when
+	// no config dir is set (then the default item is the right one, not a fallback).
+	scopedService: string | null;
+	// That config dir, for the selection log lines only.
+	configDir: string;
 }
 
 export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
@@ -468,6 +537,8 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		idleTimeoutMs: UPSTREAM_IDLE_TIMEOUT_MS,
 		exitProcess: (code) => process.exit(code),
 		giveUpAfter: REFRESH_GIVE_UP_AFTER,
+		scopedService: scopedKeychainService(process.env.CLAUDE_CONFIG_DIR),
+		configDir: (process.env.CLAUDE_CONFIG_DIR ?? '').trim(),
 		...overrides,
 	};
 	const upstreamPort = deps.upstreamUrl.port ? Number(deps.upstreamUrl.port) : 443;
@@ -513,12 +584,34 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		return refreshInFlight;
 	}
 
+	// The service in use is logged at start and on change, never per request.
+	let announced: string | null = null;
+	function pick(): StoredClaudeOAuth | null {
+		const own = ownCandidates(deps.readCredCandidates(), deps.scopedService);
+		const stored = selectCred(own, deps.now(), rejectedToken);
+		const key = stored?.service ?? '';
+		if (key !== announced) {
+			announced = key;
+			const { info, warning } = describeKeychainSelection(stored?.service ?? null, deps.scopedService, deps.configDir);
+			console.log(`${ts()} [Proxy] ${info}`);
+			if (warning) console.error(`${ts()} [Proxy] ${warning}`);
+		}
+		return stored;
+	}
+
+	// One warning per state while the scoped token is unusable; reset once it is ok.
+	let unusable: string | null = null;
+	function noteScopedToken(verdict: 'ok' | 'expired' | 'rejected'): void {
+		if (verdict === 'ok') { unusable = null; return; }
+		if (!deps.scopedService || unusable === verdict) return;
+		unusable = verdict;
+		console.error(`${ts()} [Proxy] ${scopedTokenUnusableWarning(verdict, deps.scopedService)}`);
+	}
+
 	// Re-read the keychain (every call — no cache, so /login lands within one
 	// request) and refresh first when at/near expiry or upstream-rejected.
-	// selectCred scans ALL candidate items: a fresh /login in the default item
-	// must be found even while a dead scoped item exists.
 	async function resolveCredential(): Promise<StoredClaudeOAuth | null> {
-		const stored = selectCred(deps.readCredCandidates(), deps.now(), rejectedToken);
+		const stored = pick();
 		if (!stored) return null;
 		const { service, oauth: cred } = stored;
 		const nearExpiry =
@@ -530,7 +623,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		if (shouldAttemptRefresh(needsRefresh, deps.now(), nextRefreshAllowedAt)) {
 			if (nearExpiry) console.log(`${ts()} [Proxy] stored token at/near expiry — attempting refresh`);
 			await runSingleFlightRefresh(service, cred);
-			return selectCred(deps.readCredCandidates(), deps.now(), rejectedToken) ?? stored;
+			return pick() ?? stored;
 		}
 		return stored;
 	}
@@ -539,7 +632,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 	// backoff window allows) → rebuild → retry once. Null = give up loud.
 	async function recoverAfter401(failedToken: string): Promise<string | null> {
 		rejectedToken = failedToken;
-		const stored = selectCred(deps.readCredCandidates(), deps.now(), rejectedToken);
+		const stored = selectCred(ownCandidates(deps.readCredCandidates(), deps.scopedService), deps.now(), rejectedToken);
 		console.log(`${ts()} [Proxy] keychain re-read after 401: ${stored ? 'credential present' : 'no credential'}`);
 		if (!stored) return null;
 		if (
@@ -550,7 +643,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		}
 		if (stored.oauth.refreshToken && shouldAttemptRefresh(true, deps.now(), nextRefreshAllowedAt)) {
 			await runSingleFlightRefresh(stored.service, stored.oauth);
-			const after = selectCred(deps.readCredCandidates(), deps.now(), rejectedToken);
+			const after = selectCred(ownCandidates(deps.readCredCandidates(), deps.scopedService), deps.now(), rejectedToken);
 			if (
 				after &&
 				after.oauth.accessToken !== failedToken &&
@@ -562,7 +655,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		return null;
 	}
 
-	return createServer((req, res) => {
+	const server = createServer((req, res) => {
 		const chunks: Buffer[] = [];
 		req.on('data', (c) => chunks.push(c));
 		req.on('end', async () => {
@@ -583,19 +676,28 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 
 			// Read token fresh from keychain each request, refreshing it first if it
 			// is at/near expiry (self-refresh covers headless nodes).
+			// Kept so a scoped token that cannot be recovered hands back to it, never to the shared item.
+			const clientAuthorization = headers['authorization'];
 			const stored = await resolveCredential();
 			// The token this proxy injected, if any — non-null means WE authored the
 			// request's auth and own the 401-recovery duty for it.
 			let injectedToken: string | null = null;
 			if (!stored) {
+				if (!hasClientAuth && deps.scopedService) {
+					res.writeHead(401, { 'content-type': 'application/json' });
+					res.end(authMissingBody(deps.scopedService, deps.configDir));
+					return;
+				}
 				if (!hasClientAuth) {
 					res.writeHead(502);
 					res.end('No OAuth token in keychain');
 					return;
 				}
-				console.log(`${ts()} [Proxy] no keychain credential — passing client credential through`);
+				// With a config dir set, pick() already warned once; no line per request.
+				if (!deps.scopedService) console.log(`${ts()} [Proxy] no keychain credential — passing client credential through`);
 			} else {
 				const verdict = classifyCredential(stored.oauth, deps.now(), rejectedToken);
+				noteScopedToken(verdict);
 				if (verdict === 'ok') {
 					// Inject OAuth token for auth requests
 					if (headers['authorization']) {
@@ -606,7 +708,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 				} else if (hasClientAuth) {
 					// Never inject a known-dead token over a client credential that may
 					// be fresher (the /login case) — pass it through untouched.
-					console.log(`${ts()} [Proxy] stored token ${verdict}, refresh unavailable — pass-through engaged (client credential forwarded untouched)`);
+					if (!deps.scopedService) console.log(`${ts()} [Proxy] stored token ${verdict}, refresh unavailable — pass-through engaged (client credential forwarded untouched)`);
 				} else {
 					console.error(`${ts()} [Proxy] stored token ${verdict}, refresh unavailable, no client credential — failing fast (401)`);
 					deps.recordCredentialState('exhausted', `stored token ${verdict}, refresh unavailable`);
@@ -656,8 +758,20 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 									forward(1);
 									return;
 								}
-								console.error(`${ts()} [Proxy] credential recovery failed — forwarding the upstream 401 (re-auth with /login)`);
 								deps.recordCredentialState('exhausted', 'post-401 recovery failed (reload + refresh)');
+								if (
+									deps.scopedService && typeof clientAuthorization === 'string' &&
+									clientAuthorization !== `Bearer ${injectedToken}`
+								) {
+									// The scoped token is dead and its own item cannot replace it:
+									// the client's credential goes up once, the shared item never.
+									noteScopedToken('rejected');
+									headers['authorization'] = clientAuthorization;
+									injectedToken = null;
+									forward(1);
+									return;
+								}
+								console.error(`${ts()} [Proxy] credential recovery failed — forwarding the upstream 401 (re-auth with /login)`);
 								const h = { ...upRes.headers };
 								delete h['content-length'];
 								delete h['transfer-encoding'];
@@ -733,6 +847,9 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 			forward(0);
 		});
 	});
+	// Name the selected service once at start, before the first request.
+	server.on('listening', () => { try { pick(); } catch { /* best effort */ } });
+	return server;
 }
 
 // Back-compat sync reader (startup probe only — does not refresh).
