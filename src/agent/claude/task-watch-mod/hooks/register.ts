@@ -143,22 +143,30 @@ export class TaskWatch {
   private sending = false
   private sent: Promise<void> = Promise.resolve()
   private submits = 0
+  private mainTurns = 0
+  private idleWaiters: (() => void)[] = []
   private trail: string | null = null
   private notes: string[] = []
   private noting = false
   constructor(private host: Host, private repo: string, private submitTimeoutMs = SUBMIT_TIMEOUT_MS) {}
 
-  turnStart(): void {
+  // turn.start and turn.complete also fire for each subagent's loop, with its `agentId`; only the main
+  // loop's (no `agentId`) say whether the session is idle, so a subagent's are ignored in all three calls.
+  turnStart(agentId?: string): void {
+    if (agentId !== undefined) return
     this.turnRunning = true
+    this.mainTurns++
   }
 
-  turnIdle(): void {
+  turnIdle(agentId?: string): void {
+    if (agentId !== undefined) return
     this.turnRunning = false
+    for (const wake of this.idleWaiters.splice(0)) wake()
   }
 
   /** Sends what waited for the turn to end; a hook must not await it, a submit can take its whole timeout. */
-  flush(): Promise<void> {
-    return this.deliver()
+  flush(agentId?: string): Promise<void> {
+    return agentId === undefined ? this.deliver() : Promise.resolve()
   }
 
   /** One line of the delivery trail, written in order and never awaited: a slow disk cannot hold a delivery. */
@@ -196,6 +204,9 @@ export class TaskWatch {
    * within the timeout, keeps its text: it goes back to the front after a wait and is sent again. A timed-out
    * submit that settles during that wait did deliver, and is not sent again; one that settles later than that
    * delivers its text a second time, which is the price of never losing one.
+   *
+   * Submits are only issued while no main turn runs, and the timeout only counts idle time: the engine holds
+   * a submitted prompt until the session is idle, so one overtaken by a main turn is waiting, not stuck.
    */
   private async drain(): Promise<void> {
     this.sending = true
@@ -222,7 +233,15 @@ export class TaskWatch {
             return { error }
           },
         )
-        const result = await Promise.race([settled, this.host.sleep(this.submitTimeoutMs).then(() => null)])
+        let result: { error: string | null } | null = null
+        for (;;) {
+          const turnsBefore = this.mainTurns
+          result = await Promise.race([settled, this.host.sleep(this.submitTimeoutMs).then(() => null)])
+          if (result || this.stopped || (!this.turnRunning && this.mainTurns === turnsBefore)) break
+          this.note(`submit #${id} still pending behind a main turn; not a timeout`)
+          if (this.turnRunning) result = await Promise.race([settled, new Promise<null>((wake) => { this.idleWaiters.push(() => wake(null)) })])
+          if (result) break
+        }
         if (result && result.error === null) {
           timeouts = 0
           this.note(`submit #${id} ok`)
@@ -428,16 +447,16 @@ export const register: Register = (on) => {
   })
 
   on('turn.start', async ($, e, next) => {
-    watch?.turnStart()
+    watch?.turnStart(e.agentId)
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
     // Cleared before next(e): if anything beneath throws, held announcements must not wait forever.
-    watch?.turnIdle()
+    watch?.turnIdle(e.agentId)
     const done = await next(e)
     // Not awaited: this hook must return even when the submit it starts never settles.
-    if (watch) detach(watch.flush())
+    if (watch) detach(watch.flush(e.agentId))
     return done
   })
 

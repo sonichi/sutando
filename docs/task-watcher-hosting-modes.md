@@ -95,6 +95,9 @@ same session watcher can instead be run by a Claude Code Mod, `src/agent/claude/
   One submit is in flight at a time and nothing waits on it: the Mod keeps reading the watcher, and a
   completed turn is not held. A timed-out submit that settles during the wait is not sent again; one
   that settles later delivers its announcement twice, the price of never losing one.
+  Submits are only issued while no main turn runs, and the 30 s count only idle time: a submit
+  overtaken by a main turn is waiting for the session to be idle, not stuck. A subagent's
+  `turn.start` / `turn.complete` (they carry `agentId`) never change what the Mod takes as idle.
 - The Mod keeps a delivery trail in `<workspace>/logs/task-watch-mod.log`: each watcher start and
   end, each announcement and stderr line the watcher printed, and each submit's start and outcome
   (`ok`, `failed`, `timeout`, settled late). The watcher itself appends one line per start to

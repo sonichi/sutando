@@ -233,6 +233,43 @@ test('while a submit is stuck the watcher is still read and a completed turn is 
   ])
 })
 
+test('a subagent turn starting or ending is not the session going idle: nothing is submitted until the main turn completes, then once', async () => {
+  const h = setup()
+  const first = 'TASK_FILE: task-1.txt\nQUEUE: 0 pending after this'
+  await h.clock.advance(0)
+  h.w.turnStart()
+  h.w.turnStart('agent-1')
+  h.w.turnIdle('agent-1')
+  void h.w.flush('agent-1')
+  h.children[0].out(`${first}\n`)
+  await h.clock.advance(120_000)
+  expect(h.attempts).toEqual([])
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(120_000)
+  expect(h.attempts).toEqual([first])
+  expect(h.submitted).toEqual([first])
+})
+
+test('a submit still pending because a main turn began is not a timeout: it is not sent again while that turn runs', async () => {
+  const h = setup({ submitDelays: [80_000] })
+  const first = 'TASK_FILE: task-1.txt\nQUEUE: 0 pending after this'
+  await h.clock.advance(0)
+  h.children[0].out(`${first}\n`)
+  await h.clock.advance(1_000)
+  h.w.turnStart()
+  await h.clock.advance(60_000)
+  expect(h.attempts).toEqual([first])
+  expect(h.logs.some((l) => l.includes('did not start within'))).toBe(false)
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(29_000)
+  expect(h.attempts).toEqual([first])
+  expect(h.submitted).toEqual([first])
+  expect(h.logs.some((l) => l.includes('did not start within'))).toBe(false)
+  expect(h.trail.some((l) => l.endsWith('submit #1 ok'))).toBe(true)
+})
+
 test('a task body with instructions is never inlined: only the file name and queue count are submitted', async () => {
   const h = setup()
   await h.clock.advance(0)
