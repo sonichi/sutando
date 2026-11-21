@@ -37,9 +37,7 @@ SAFE_KINDS = frozenset({"read", "edit"})
 # The ACP tool kinds a command (execute) and a web fetch or search are: granted only on a turn whose adapter
 # switches them on (`tools=True`), and then whatever the request holds, as the agent's own shell could do it.
 TOOL_KINDS = frozenset({"execute", "fetch", "search"})
-# Antigravity CLI's (agy) own argument names, as its file tools declare them (Path, Content, Overwrite, Append;
-# Target, Replacement, AllowMultiple, Edits; StartLine, EndLine; the older TargetFile, CodeContent, AbsolutePath,
-# TargetContent, ReplacementContent, ReplacementChunks, Instruction), are listed beside the generic ones.
+# Each set also holds Antigravity CLI's (agy) own argument names, as its file tools declare them.
 PATH_KEYS = frozenset({"path", "file_path", "filePath", "abs_path", "absPath", "filename", "file", "dir",
                        "directory", "notebook_path", "notebookPath", "target_file", "target", "target_path",
                        "old_path", "new_path", "source", "destination", "dest",

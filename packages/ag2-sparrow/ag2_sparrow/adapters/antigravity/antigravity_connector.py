@@ -49,10 +49,8 @@ NOT_SIGNED_IN = ("Antigravity is not signed in on this computer (%s): run `agy` 
                  "or run `agy acp --login`")
 
 
-# The attested sender tiers whose turns may run commands and fetch or search the web, as local Claude Code and
-# Codex agents do for their owner (owner decision, 2026-11-21). Team (an attested collaborator) is left out on
-# purpose, even on the owner's turn: adding it is the owner's decision. Read from headers["access_tier"], which
-# names the sender, never from which turn runs.
+# Sender tiers (headers["access_tier"]) whose turns may run commands and use the web (owner decision 2026-11-21).
+# Team is left out on purpose, even on the owner's turn: adding it is the owner's decision.
 SHELL_AND_WEB_TIERS = frozenset({"owner"})
 READ_ONLY_MODES = frozenset({"plan", "read-only", "readonly", "read_only"})
 GUEST_PREFIX = "ag2-sparrow-antigravity-guest-"
