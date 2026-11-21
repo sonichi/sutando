@@ -14,8 +14,9 @@ sentence, in either form ("I want to use <product> for A, B." or the older "I pi
 none. The owner's name never appears on the page: publish uses the agent's own (`--name auto`).
 
 Every run records its outcome in <workspace>/state/tutorial/last-run.json (health-check reads it) and
-prints one JSON line. On anything but success that line carries `owner_line`, the one plain sentence
-the agent sends the owner in place of saying nothing. Exit 0 when the page was published, else 1.
+prints one JSON line. Whenever the owner would otherwise hear nothing (a failed publish, or a page whose
+card did not reach them) that line carries `owner_line`, the one plain sentence the agent sends. Recording
+is best-effort: a status file that cannot be written never hides that line. Exit 0 when a page exists.
 """
 from __future__ import annotations
 
@@ -37,6 +38,9 @@ import dotspace  # noqa: E402  (the product's name, as the setup app writes it)
 
 PUBLISH_SCRIPT = HERE / "getting_started.py"
 OWNER_LINE = "I couldn't make your Getting started page just now. Send /tutorial to try again."
+# The page exists but its card did not reach the owner, so nothing in the DM points at it.
+CARD_LINE = ("Your Getting started page is ready in this room's Commons, but I couldn't send you its card. "
+             "Send /tutorial to get it.")
 
 # getting_started.py's exit codes (its main): what went wrong, in words a health row can carry.
 OUTCOMES = {
@@ -148,6 +152,9 @@ def run(room: str, owner: str, body: str, workspace: Path,
     reason = result.get("reason") if isinstance(result.get("reason"), str) else ""
     if code != 0 and not reason:
         reason = (err or "").strip().splitlines()[-1] if (err or "").strip() else f"exit {code}"
+    if code == 0 and result.get("summon_error"):
+        # Published, but the summon that carries the page to the owner failed: not a silent success.
+        outcome, reason = "page-made-card-not-sent", str(result["summon_error"])
     record: Dict[str, object] = {
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now if now is not None else time.time())),
         "room": room,
@@ -161,10 +168,16 @@ def run(room: str, owner: str, body: str, workspace: Path,
     for key in ("action", "kind"):
         if isinstance(result.get(key), str):
             record[key] = result[key]
-    write_record(workspace, record)
-    shown = {"ok": code == 0, **record}
+    shown: Dict[str, object] = {"ok": code == 0, **record}
+    try:
+        write_record(workspace, record)
+    except OSError as exc:
+        # The owner's notice and the run's verdict never depend on the status file.
+        shown["record_error"] = f"{type(exc).__name__}: {exc}"[:REASON_MAX]
     if code != 0:
         shown["owner_line"] = OWNER_LINE
+    elif outcome == "page-made-card-not-sent":
+        shown["owner_line"] = CARD_LINE
     return shown
 
 

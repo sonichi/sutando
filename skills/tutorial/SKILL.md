@@ -52,10 +52,11 @@ For a tagged task, do exactly this, in order:
    body's own line (`I want to use s.space for A, B.`, or the older `I picked: A, B.`), else none.
    It records the outcome in `<workspace>/state/tutorial/last-run.json`, which health-check shows,
    and prints one JSON line.
-3. **`"ok": true`:** the page's card in the DM is the one line about it; post nothing more.
-   **`"ok": false`:** send the owner its `owner_line`, word for word, as your only message about the
-   page (`python3 skills/agent-room-ops/room_ops.py say '<channel_id>' '<owner_line>'`). Do not
-   explain the failure in chat and do not retry in the same turn; the owner retries with `/tutorial`.
+3. **The line has an `owner_line`** (the publish failed, or the page was made but its card did not
+   reach the owner): send it word for word as your only message about the page
+   (`python3 skills/agent-room-ops/room_ops.py say '<channel_id>' '<owner_line>'`). Do not explain the
+   failure in chat and do not retry in the same turn; the owner retries with `/tutorial`.
+   **No `owner_line`:** the page's card in the DM is the one line about it; post nothing more.
 
 Tailored prompts (step 2 below) are optional here: without them the page keeps its generic prompts.
 

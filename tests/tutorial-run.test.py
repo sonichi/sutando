@@ -219,18 +219,41 @@ class EdgePaths(_Run):
         self.assertEqual(shown["outcome"], "publish-did-not-finish")
         self.assertIn("TimeoutExpired", shown["reason"])
 
-    def test_a_record_that_cannot_be_written_leaves_no_temp_file(self):
+    def _refusing_record_writes(self):
         real = tr.os.replace
 
         def refuse(*_a, **_k):
             raise OSError("read-only")
 
         tr.os.replace = refuse
+        self.addCleanup(setattr, tr.os, "replace", real)
+
+    def test_a_record_that_cannot_be_written_leaves_no_temp_file_and_no_false_failure(self):
+        self._refusing_record_writes()
+        shown = tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.fake_publish(0, {"action": "created"}))
+        self.assertTrue(shown["ok"], "a published page is not reported failed because recording failed")
+        self.assertNotIn("owner_line", shown)
+        self.assertIn("read-only", shown["record_error"])
+        self.assertEqual(list(tr.record_path(self.ws).parent.glob(".last-run.*")), [])
+
+    def test_a_failed_publish_still_hands_the_retry_notice_when_recording_fails(self):
+        import contextlib
+        import io
+        self._refusing_record_writes()
+        real = tr._workspace
+        tr._workspace = lambda: self.ws
+        out = io.StringIO()
         try:
-            with self.assertRaises(OSError):
-                tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.fake_publish(0, {"action": "created"}))
+            with contextlib.redirect_stdout(out):
+                rc = tr.main(["--room", ROOM, "--owner", OWNER, "--body", SETUP_BODY, "--publish-script",
+                              str(self.fake_publish(3, {"ok": False, "reason": "room-commons not installed"}))])
         finally:
-            tr.os.replace = real
+            tr._workspace = real
+        shown = json.loads(out.getvalue())
+        self.assertEqual(rc, 1)
+        self.assertEqual(shown["owner_line"], tr.OWNER_LINE)
+        self.assertEqual(shown["outcome"], "room-commons-not-installed")
+        self.assertIn("record_error", shown)
         self.assertEqual(list(tr.record_path(self.ws).parent.glob(".last-run.*")), [])
 
     def test_the_cli_reads_the_body_file_and_survives_a_missing_one(self):
@@ -252,6 +275,44 @@ class EdgePaths(_Run):
     def test_the_workspace_comes_from_the_shared_resolver(self):
         import workspace_default
         self.assertEqual(tr._workspace(), workspace_default.resolve_workspace())
+
+
+class CardNotSent(_Run):
+    def test_a_created_page_whose_card_failed_is_not_a_silent_success(self):
+        out = {"ok": True, "action": "created", "kind": "html-3", "summoned": False,
+               "summon_error": "summon refused: 502"}
+        shown = tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.fake_publish(0, out))
+        self.assertTrue(shown["ok"], "the page exists")
+        self.assertEqual(shown["owner_line"], tr.CARD_LINE)
+        self.assertIn("/tutorial", shown["owner_line"])
+        rec = self.record()
+        self.assertEqual((rec["outcome"], rec["reason"], rec["kind"]),
+                         ("page-made-card-not-sent", "summon refused: 502", "html-3"))
+        row = HC.check_tutorial_last_run(self.ws)
+        self.assertEqual(row["status"], "warn")
+        self.assertIn("card did not reach the owner", row["detail"])
+
+    def test_an_ordinary_refresh_that_does_not_summon_says_nothing(self):
+        out = {"ok": True, "action": "updated", "kind": "html-3", "summoned": False}
+        shown = tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.fake_publish(0, out))
+        self.assertTrue(shown["ok"])
+        self.assertNotIn("owner_line", shown)
+        self.assertEqual(self.record()["outcome"], "ok")
+
+    def test_the_cli_exits_zero_when_the_page_exists_without_its_card(self):
+        import contextlib
+        import io
+        real = tr._workspace
+        tr._workspace = lambda: self.ws
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = tr.main(["--room", ROOM, "--owner", OWNER, "--body", SETUP_BODY, "--publish-script",
+                              str(self.fake_publish(0, {"action": "created", "summon_error": "x"}))])
+        finally:
+            tr._workspace = real
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out.getvalue())["owner_line"], tr.CARD_LINE)
 
 
 class HealthRow(_Run):

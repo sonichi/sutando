@@ -1699,6 +1699,9 @@ def check_tutorial_last_run(workspace_dir: Optional[Path] = None) -> "dict | Non
         return None
     outcome = str(rec.get("outcome") or "unknown")
     when = str(rec.get("at") or "?")
+    if outcome == "page-made-card-not-sent":
+        return {"name": "tutorial-page", "status": "warn",
+                "detail": f"the Getting started page was made at {when} but its card did not reach the owner"}
     if outcome == "ok":
         return {"name": "tutorial-page", "status": "ok",
                 "detail": f"last Getting started page run published it ({rec.get('action') or 'ok'}) at {when}"}
