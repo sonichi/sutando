@@ -55,15 +55,21 @@ final message is the only answer path.
 
 ## Tiers and permissions
 
-Only the owner is served by default. Every other sender, an attested collaborator included, is refused
-with one line unless `--allow-non-owner`, which admits them all. A non-owner's turn runs on the owner's agy
-sign-in (the Google account and quota in the Keychain), and a turn whose tool call is denied can end with
-no reply.
+The owner and an attested collaborator are served (Team in s.space: the broker's `collaborator: true` on
+the team tier, read from the task's parsed headers, never from the message text). Any other non-owner (a
+guest, the team tier without that stamp) is refused with one line, "This agent only answers its owner
+here.", unless `--allow-non-owner`. `verify` says which: `INFO non-owner: refused unless attested
+collaborator` or `served (--allow-non-owner)`.
+
+A non-owner's turn, a collaborator's included, runs on the owner's agy sign-in (the Google account and
+quota in the Keychain): giving someone Collaborator access to this agent lets them spend that quota. It
+runs isolated and read-only as below, or not at all, and a turn whose tool call is denied can end with no
+reply.
 
 **The owner's turns** resume the room's Session in the working directory, with agy's own home
 (`~/.gemini`: its settings, rules and context).
 
-**A non-owner's turn** (anyone `--allow-non-owner` admits, collaborators included) runs isolated:
+**A non-owner's turn** (an attested collaborator, or anyone `--allow-non-owner` admits) runs isolated:
 
 - a fresh temporary directory per task holds the Session's working directory and a separate agy home,
   passed as `agy acp --gemini-dir <dir>`; that home has only a `settings.json` whose permission rules deny
@@ -73,7 +79,9 @@ no reply.
 - a new Session for every task, never resumed and never recorded in the session store;
 - the Session is put in a read-only mode with `session/set_mode` (`plan`, or a mode named `read-only`),
   picked from the `modes` that `session/new` returns. If agy offers no such mode, or refuses it, the turn
-  is not run: a message gets a line saying so, an event posts nothing.
+  is not run: a message gets a line saying so ("Antigravity did not take this: it answers non-owners only
+  in a read-only session mode, and no read-only session mode is offered (offered: …)."), an event posts
+  nothing.
 
 `--gemini-dir` is agy's flag: a custom `--acp-command` must accept it, or non-owner turns fail.
 
