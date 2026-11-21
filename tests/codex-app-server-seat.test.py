@@ -161,6 +161,8 @@ for line in sys.stdin:
             for i, name in enumerate(SERVER_REQUESTS):
                 out({"id": "srv-%d" % i, "method": name, "params": {"threadId": thread}})
     elif method == "turn/interrupt":
+        if os.path.exists(os.path.join(D, "die-on-interrupt")):
+            os._exit(8)
         out({"id": rid, "result": {}})
         if state["turn"] and not os.path.exists(os.path.join(D, "deaf")):
             finish("interrupted")
@@ -169,11 +171,21 @@ for line in sys.stdin:
 '''
 
 STAGE_HOOK = r'''
-import os, sys
+import os, subprocess, sys
 log = os.environ["STAGE_LOG"]
+args = " ".join(sys.argv[1:])
 with open(log, "a") as f:
-    f.write(" ".join(sys.argv[1:]) + "\n")
-sys.exit(1 if os.path.exists(log + ".fail") else 0)
+    f.write(args + "\n")
+if os.path.exists(log + ".fail"):
+    sys.exit(1)
+if args.endswith("--stage done"):
+    if os.path.exists(log + ".fail-done"):
+        sys.exit(1)
+    if os.path.exists(log + ".fail-done-once"):
+        os.unlink(log + ".fail-done-once")
+        sys.exit(1)
+real = os.environ.get("STAGE_REAL")
+sys.exit(subprocess.run([sys.executable, real, *sys.argv[1:]], stdout=subprocess.DEVNULL).returncode if real else 0)
 '''
 
 
@@ -201,7 +213,7 @@ class SeatCase(unittest.TestCase):
         env = mock.patch.dict(os.environ, {"FAKE_DIR": str(self.fake_dir), "STAGE_LOG": str(self.stage_log)})
         env.start()
         self.addCleanup(env.stop)
-        for name in ("SUTANDO_POOL_DELIVERY_SCRIPT", "FAKE_PROBE"):
+        for name in ("SUTANDO_POOL_DELIVERY_SCRIPT", "FAKE_PROBE", "STAGE_REAL"):
             os.environ.pop(name, None)
         self.out = io.StringIO()
         capture = contextlib.redirect_stdout(self.out)
@@ -519,12 +531,72 @@ class StopAndTimeout(SeatCase):
         self.assertFalse(task_dispatch.has_ready_result(self.results, "task-1.txt"))
         self.assertIn("task-1.txt", list(task_dispatch.pending_candidates(self.tasks, self.results)))
         self.assertEqual(json.loads(s.record_file("task-1.txt").read_text())["outcome"], "stopped")
-        self.assertIn("interrupted by Stop", self.out.getvalue())
+        self.assertIn("stopped by Stop", self.out.getvalue())
         self.assertEqual(s.step(), "done", "the next task runs")
         self.assertIn("task-2.txt", self.prompts()[1])
         self.now[0] += 10 ** 6
         self.assertIsNone(s.step(), "a stopped task is never started again by the seat")
         self.assertEqual(len(self.sent("turn/start")), 2)
+
+    def test_a_child_that_dies_on_the_interrupt_does_not_get_the_stopped_task_again(self):
+        self.task("task-1.txt")
+        self.plan("hang", "result")
+        (self.fake_dir / "die-on-interrupt").touch()
+        s = self.make()
+        s.ensure_server()
+        self.when_turn_starts(lambda: self.ruling("task-1"))
+        self.assertEqual(s.step(), "stopped")
+        self.assertEqual(len(self.sent("turn/interrupt")), 1)
+        self.assertEqual(len(self.sent("turn/start")), 1, "the Stop outlives the child: no second turn")
+        self.assertFalse(task_dispatch.has_ready_result(self.results, "task-1.txt"))
+        self.assertEqual(list(task_dispatch.pending_candidates(self.tasks, self.results)), ["task-1.txt"])
+        self.assertEqual(json.loads(s.record_file("task-1.txt").read_text())["outcome"], "stopped")
+        self.assertIsNone(s.step())
+
+    def test_a_child_that_dies_mid_turn_with_a_stop_open_is_one_dispatch_and_no_retry(self):
+        self.task("task-1.txt")
+        self.plan("die", "result")
+        s = self.make()
+        s.ensure_server()
+        request = seat_mod.Rpc.request
+
+        def stop_opens_as_the_turn_is_dispatched(rpc, method, params=None, timeout=120):
+            result = request(rpc, method, params, timeout)
+            if method == "turn/start":
+                self.ruling("task-1")
+            return result
+
+        with mock.patch.object(seat_mod.Rpc, "request", stop_opens_as_the_turn_is_dispatched):
+            self.assertEqual(s.step(), "stopped")
+        self.assertEqual(len(self.sent("turn/start")), 1, "exactly one dispatch")
+        self.assertEqual(len([r for r in self.sent() if "argv" in r]), 1, "no app-server was started for a retry")
+        self.assertFalse(task_dispatch.has_ready_result(self.results, "task-1.txt"))
+        self.assertEqual(list(task_dispatch.pending_candidates(self.tasks, self.results)), ["task-1.txt"])
+        self.assertEqual(json.loads(s.record_file("task-1.txt").read_text())["outcome"], "stopped")
+
+    def test_a_stop_that_arrives_during_the_restart_backoff_cancels_the_retry(self):
+        self.task("task-1.txt")
+        self.plan("die", "result")
+        s = self.make(backoff_s=0.01)
+        s.ensure_server()
+        with mock.patch.object(seat_mod.time, "sleep", side_effect=lambda _s: self.ruling("task-1")) as backoff:
+            self.assertEqual(s.step(), "stopped")
+        backoff.assert_called_once_with(0.01)
+        self.assertEqual(len(self.sent("turn/start")), 1, "no retry turn once a Stop is open")
+        self.assertEqual(self.sent("turn/interrupt"), [], "there is no turn left to interrupt")
+        self.assertFalse(task_dispatch.has_ready_result(self.results, "task-1.txt"))
+        self.assertEqual(list(task_dispatch.pending_candidates(self.tasks, self.results)), ["task-1.txt"])
+        self.assertEqual(json.loads(s.record_file("task-1.txt").read_text())["outcome"], "stopped")
+        self.assertIn("not started again", self.out.getvalue())
+
+    def test_a_stop_seen_once_stays_seen_after_its_ruling_record_is_gone(self):
+        s = self.make()
+        self.assertFalse(s.stop_requested("task-1.txt"))
+        ruling = self.ruling("task-1")
+        self.assertTrue(s.stop_requested("task-1.txt"))
+        ruling.unlink()
+        self.assertTrue(s.stop_requested("task-1.txt"), "ruled meanwhile: still no new turn in this run")
+        self.assertFalse(s.stop_requested("task-2.txt"))
 
     def test_a_task_stopped_before_its_turn_is_not_started(self):
         self.task("task-1.txt")
@@ -744,6 +816,66 @@ class Worker(SeatCase):
         self.now[0] += 31
         self.assertEqual(s.step(), "done")
 
+    def hooked_pool_stage(self):
+        """The recording hook in front of the real pool writer, so a `done` can fail and then land."""
+        os.environ["STAGE_REAL"] = str(POOL / "pool_delivery.py")
+        os.environ["SUTANDO_POOL_DELIVERY_SCRIPT"] = str(POOL / "pool_delivery.py")
+        return [sys.executable, str(self.hook), "--workspace", str(self.ws), "--recipient", "w1", "mark-done"]
+
+    def done_calls(self):
+        return [ln for ln in self.stage_log.read_text().splitlines() if ln.endswith("--stage done")]
+
+    def test_a_done_stage_that_failed_once_is_recorded_again_without_running_the_task_again(self):
+        self.deliver("task-1")
+        Path(str(self.stage_log) + ".fail-done-once").touch()
+        s = self.worker_seat(stage=self.hooked_pool_stage(), retry_s=30)
+        s.ensure_server()
+        self.assertEqual(s.step(), "done")
+        self.assertEqual(len(self.done_calls()), 1)
+        self.assertTrue((self.inbox / "task-1.txt").exists(), "not recorded yet: the sentinel is still owed")
+        self.assertTrue(pool_delivery.pending_flag(self.ws, "w1", "task-1").exists())
+        self.assertIsNone(s.step())
+        self.assertEqual(len(self.done_calls()), 1, "not hammered: the retry waits its delay")
+        self.now[0] += 31
+        self.assertIsNone(s.step())
+        self.assertEqual(len(self.done_calls()), 2, "the failed stage call is made again")
+        self.assertTrue(pool_delivery.is_done_flag(pool_delivery.done_flag(self.ws, "w1", "task-1")))
+        self.assertFalse((self.inbox / "task-1.txt").exists(), "the sentinel is retired once done is recorded")
+        self.assertEqual(len(self.sent("turn/start")), 1, "the task itself ran once")
+        self.now[0] += 1000
+        self.assertIsNone(s.step())
+        self.assertEqual(len(self.done_calls()), 2, "a recorded settlement is not repeated")
+        self.assertIn("will record it again in 30s", self.out.getvalue())
+
+    def test_a_done_stage_that_keeps_failing_is_retried_a_bounded_number_of_times_and_said_plainly(self):
+        self.deliver("task-1")
+        Path(str(self.stage_log) + ".fail-done").touch()
+        s = self.worker_seat(stage=self.hooked_pool_stage(), retry_s=30)
+        s.ensure_server()
+        self.assertEqual(s.step(), "done")
+        for _ in range(12):
+            self.now[0] += 31
+            self.assertIsNone(s.step())
+        self.assertEqual(len(self.done_calls()), seat_mod.SETTLE_ATTEMPTS)
+        self.assertEqual(len(self.sent("turn/start")), 1, "the task is never run again")
+        log = self.out.getvalue()
+        self.assertEqual(log.count("could not record done for it"), 1)
+        self.assertIn(f"after {seat_mod.SETTLE_ATTEMPTS} tries", log)
+        self.assertTrue((self.inbox / "task-1.txt").exists())
+
+    def test_a_plain_inbox_worker_also_records_a_failed_done_again(self):
+        own = self.ws / "own-inbox"
+        own.mkdir()
+        self.task("task-1.txt", folder=own)
+        Path(str(self.stage_log) + ".fail-done-once").touch()
+        s = self.make(self.declaration(inbox=own, stage=[sys.executable, str(self.hook)]), retry_s=30)
+        s.ensure_server()
+        self.assertEqual(s.step(), "done")
+        self.now[0] += 31
+        self.assertIsNone(s.step())
+        self.assertEqual(len(self.done_calls()), 2)
+        self.assertEqual(len(self.sent("turn/start")), 1)
+
     def test_a_failing_done_or_abandon_hook_is_logged_not_fatal(self):
         self.deliver("task-1")
         self.deliver("task-gone", payload=False)
@@ -754,6 +886,7 @@ class Worker(SeatCase):
         Path(str(self.stage_log) + ".fail").touch()
         s.staged.clear()
         s.settle("task-1.txt", "done")
+        s.settle("task-1.txt", "done")
         s.settle("task-gone.txt", "abandon")
         self.assertIn("stage done exited 1", self.out.getvalue())
         self.assertIn("stage abandon exited 1", self.out.getvalue())
@@ -762,6 +895,7 @@ class Worker(SeatCase):
             os.unlink(str(self.stage_log) + ".fail")
             os.environ["SUTANDO_POOL_DELIVERY_SCRIPT"] = "/nonexistent/pool_delivery.py"
             s.staged.clear()
+            s.unsettled.clear()
             with mock.patch.object(s.host, "stage", return_value=""):
                 s.settle("task-1.txt", "done")
         self.assertIn("could not prune spent delivery sentinels", self.out.getvalue())
