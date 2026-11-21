@@ -254,8 +254,45 @@ $(cat "$f")
   fi
 else
   # Core mode: the queue is tasks/, minus anything the router already handed
-  # to a worker.
-  for f in "$TASKS_DIR"/*.txt; do
+  # to a worker. The owner's own messages are listed first: glob order put every
+  # task-cron-* file, and any other name that sorts earlier, ahead of them, so the
+  # core read its cron and team backlog before the person. Order only: which tasks
+  # are listed is decided in the loop, as before. An owner's own message is owner
+  # tier, from a channel a person types or speaks into, not sent by an agent, read
+  # from headers a body cannot forge; among them task_priority's order (urgent,
+  # normal, low, then oldest first). Everything else keeps glob order. No
+  # interpreter, a failed helper, or an answer that is not the same number of
+  # files: glob order, as before.
+  QUEUE_FILES=("$TASKS_DIR"/*.txt)
+  if [ "${#QUEUE_FILES[@]}" -gt 1 ] && [ -n "$PYBIN" ]; then
+    OWNER_FIRST=()
+    while IFS= read -r -d '' f; do
+      OWNER_FIRST+=("$f")
+    done < <(SUTANDO_SRC="$REPO_DIR/src" SUTANDO_WS="$WORKSPACE" "$PYBIN" -c 'import os, sys
+from pathlib import Path
+sys.path.insert(0, os.environ["SUTANDO_SRC"])
+from local_task_protocol import canonical_access_tier
+from task_envelope import attested_task_headers
+from task_priority import sort_tasks_by_priority
+HUMAN = {"ag2space", "discord", "telegram", "slack", "voice", "phone", "chat"}
+ws = Path(os.environ["SUTANDO_WS"])
+def own(p):
+    try:
+        if p.stat().st_size > 262144:
+            return False
+        h = attested_task_headers(p.read_text(encoding="utf-8", errors="replace"), ws).headers
+    except Exception:
+        return False
+    return (canonical_access_tier(h.get("access_tier")) == "owner"
+            and (h.get("source") or "").strip().lower() in HUMAN
+            and ".agent:" not in (h.get("user_id") or ""))
+paths = [Path(a) for a in sys.argv[1:]]
+first = [p for p in paths if own(p)]
+rest = [p for p in paths if p not in first]
+sys.stdout.write("".join(str(p) + "\0" for p in sort_tasks_by_priority(first) + rest))' "${QUEUE_FILES[@]}" 2>/dev/null)
+    [ "${#OWNER_FIRST[@]}" -eq "${#QUEUE_FILES[@]}" ] && QUEUE_FILES=("${OWNER_FIRST[@]}")
+  fi
+  for f in ${QUEUE_FILES[@]+"${QUEUE_FILES[@]}"}; do
     BASENAME=$(basename "$f")
     TASK_ID="${BASENAME%.txt}"
     held_elsewhere "$TASK_ID" "$f" && continue
