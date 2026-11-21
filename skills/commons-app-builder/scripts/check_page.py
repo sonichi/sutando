@@ -34,10 +34,76 @@ def _strip_comments(src: str) -> str:
     return re.sub(r"/\*.*?\*/", "", src, flags=re.S)
 
 
+_SCRIPT = re.compile(r"<script\b[^>]*>(.*?)</script>", re.S | re.I)
+# After one of these (or at the start), a "/" opens a regex literal rather than dividing.
+_REGEX_BEFORE = set("(,=:[!&|?{};+-*%<>~^")
+# ...and after these words. A ")" closing an if/while/for/with condition also starts a statement,
+# so a "/" after it opens a regex too; any other ")" ends an expression, and "/" divides.
+_REGEX_AFTER_WORDS = {"return", "typeof", "in", "of", "case", "else", "do", "throw", "void",
+                      "delete", "instanceof", "new", "await", "yield"}
+_CONTROL_WORDS = {"if", "while", "for", "with"}
+
+
+def _script_code(src: str) -> str:
+    """The pages' script bodies with comments, string literals and regex literals blanked.
+
+    Block comments are already gone (_strip_comments); this removes // comments and literals.
+
+    Used where a rule asks "does the page CALL x?": a commented-out call, or the call's name in a
+    string or a regex, must not count. Template literals are blanked whole, ${} included.
+    """
+    out: List[str] = []
+    for body in _SCRIPT.findall(_strip_comments(src)):
+        i, n, prev = 0, len(body), ""
+        parens: List[bool] = []    # one entry per open "(": does it hold a control condition?
+        while i < n:
+            c = body[i]
+            if body.startswith("//", i):
+                j = body.find("\n", i)
+                i = n if j < 0 else j
+                continue
+            word = re.search(r"([A-Za-z_$][\w$]*)\s*$", body[max(0, i - 12):i])
+            regex_ok = c == "/" and (prev == "" or prev in _REGEX_BEFORE
+                                     or (word is not None and word.group(1) in _REGEX_AFTER_WORDS))
+            if c in "'\"`" or regex_ok:
+                j, in_class = i + 1, False
+                while j < n:
+                    d = body[j]
+                    if d == "\\":
+                        j += 2
+                        continue
+                    if regex_ok:
+                        if d == "[":
+                            in_class = True
+                        elif d == "]":
+                            in_class = False
+                        elif d == "/" and not in_class:
+                            break
+                        elif d == "\n":
+                            break
+                    elif d == c:
+                        break
+                    j += 1
+                out.append('""')
+                i, prev = j + 1, '"'
+                continue
+            out.append(c)
+            if c == "(":
+                parens.append(word is not None and word.group(1) in _CONTROL_WORDS)
+            if c == ")" and parens and parens.pop():
+                prev = ";"                 # the condition is over: a statement starts here
+            elif not c.isspace():
+                prev = c
+            i += 1
+        out.append("\n")
+    return "".join(out)
+
+
 def check(src: str) -> dict:
     errors: List[dict] = []
     warnings: List[dict] = []
     code = _strip_comments(src)
+    script_code = _script_code(src)
 
     def add(bucket: List[dict], rule: str, message: str) -> None:
         bucket.append({"rule": rule, "message": message})
@@ -51,13 +117,13 @@ def check(src: str) -> dict:
         add(errors, "viewport", "no <meta name=viewport content=width=device-width>: phones render it zoomed out")
     if not re.search(r"prefers-color-scheme:\s*dark|color-scheme:\s*[^;]*dark", code):
         add(errors, "dark-mode", "no dark-mode styles (color-scheme or prefers-color-scheme: dark)")
-    uses_runtime = re.search(r"\.me\b|\bstate\.(?:get|set|keys|all|on)\b|personId\s*\(|members\s*\(", code)
+    uses_runtime = re.search(r"\.me\b|\bstate\.(?:get|set|keys|all|on)\b|personId\s*\(|members\s*\(", script_code)
     writes = re.search(r"\.(?:write|createRow)\s*\(", code) is not None
-    if uses_runtime and not re.search(r"artifact\s*\.\s*ready|\.ready\b", code):
+    if uses_runtime and not re.search(r"artifact\s*\.\s*ready|\.ready\b", script_code):
         add(errors, "await-ready", "artifact.ready is never awaited before reading me or state")
     if writes and not re.search(r"waiting for the viewer", code, re.I):
         add(errors, "consent-retry", "writes never retry on 'waiting for the viewer': the first click is lost")
-    if re.search(r"\.(?:read|write|createRow)\s*\(", code) and "onChange" not in code:
+    if re.search(r"\.(?:read|write|createRow)\s*\(", script_code) and "onChange" not in script_code:
         add(warnings, "live-updates", "reads without db.onChange: other viewers' edits will not appear")
     if re.search(r"\b(?:local|session)Storage\b", code):
         add(warnings, "storage", "localStorage throws in the sandbox: wrap it in try or use artifact.state")
@@ -67,7 +133,7 @@ def check(src: str) -> dict:
         if re.search(r"\b(?:display|visibility|opacity)\s*:", m.group(1)):
             add(warnings, "hover-only", "a :hover rule changes display/visibility/opacity: controls must not be hover-only")
             break
-    sends = re.search(r"\broom\s*\.\s*post\s*\(|\bsendTask\s*\(|\bsendToMyAgent\s*\(", code)
+    sends = re.search(r"\broom\s*\.\s*post\s*\(|\bsendTask\s*\(|\bsendToMyAgent\s*\(", script_code)
     if not sends and re.search(r">\s*(?:Send|Notify|Email|DM|Message)\b[^<]{0,40}</button>", code, re.I):
         add(warnings, "no-fake-send", "a button claims to send or notify, but the page never calls "
             "artifact.room.post or artifact.agent.sendTask: a page messages no one otherwise")
