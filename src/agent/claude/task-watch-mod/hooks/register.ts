@@ -25,14 +25,18 @@ const DISPOSITION_AT_ONCE = 4
 const DISPOSITIONS = ['pending', 'claimed', 'answered', 'archived', 'missing']
 // Mid-turn, each task's access_tier is read with the repo's own header parser: one line per path, empty when unreadable.
 const TIER_TIMEOUT_MS = 5_000
+// Gateway tasks put their headers after `task:`; only the envelope-verified reader may read those.
 const TIER_PY = [
   'import sys',
+  'from pathlib import Path',
   'sys.path.insert(0, sys.argv[1])',
-  'from local_task_protocol import canonical_access_tier, parse_task_headers',
-  'for p in sys.argv[2:]:',
+  'from local_task_protocol import canonical_access_tier',
+  'from task_envelope import attested_task_headers',
+  'ws = Path(sys.argv[2])',
+  'for p in sys.argv[3:]:',
   '    try:',
   "        with open(p, encoding='utf-8', errors='replace') as f:",
-  "            print(canonical_access_tier(parse_task_headers(f.read(262144)).headers.get('access_tier')))",
+  "            print(canonical_access_tier(attested_task_headers(f.read(), ws).headers.get('access_tier')))",
   '    except Exception:',
   "        print('')",
 ].join('\n')
@@ -398,7 +402,7 @@ export class TaskWatch {
     let back: string | null = held
     try {
       const paths = fresh.map((n) => (n.startsWith('/') ? n : `${inbox}/${n}`))
-      const owners = ownerTasks(fresh, await this.host.run([py, '-I', '-c', TIER_PY, `${this.repo}/src`, ...paths], TIER_TIMEOUT_MS))
+      const owners = ownerTasks(fresh, (this.ws ? await this.host.run([py, '-I', '-c', TIER_PY, `${this.repo}/src`, this.ws, ...paths], TIER_TIMEOUT_MS) : null))
       for (const n of fresh) {
         if (owners.includes(n)) continue
         this.idleOnly.add(n)

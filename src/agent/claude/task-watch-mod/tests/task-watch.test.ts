@@ -97,7 +97,8 @@ function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: n
       if (argv[2] === 'watch-argv') return WATCH_ARGV.join('\n') + '\n'
       if (argv[2] === 'role-present') return `${held.length ? held.shift() : 'no'}\n`
       if (argv[1] === '-I' && argv[2] === '-c' && argv[4] === '/repo/src') {
-        const paths = argv.slice(5)
+        expect(argv[5]).toBe('/ws')
+        const paths = argv.slice(6)
         tierAsks.push(paths)
         return opts.tierFails ? null : paths.map((p) => `${opts.tiers?.[p] ?? 'owner'}\n`).join('')
       }
