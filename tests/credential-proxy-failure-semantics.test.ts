@@ -59,6 +59,8 @@ async function startUpstream(): Promise<number> {
 
 async function startProxy(upstreamPort: number, extra: Partial<ProxyDeps> = {}): Promise<number> {
 	return listen(createProxyServer({
+		scopedService: null, // a plain install: not the runner's own CLAUDE_CONFIG_DIR
+		configDir: '',
 		readCredCandidates: () =>
 			[keychain, ...extraKeychainItems]
 				.filter((k): k is NonNullable<Stored> => k !== null)
@@ -233,39 +235,51 @@ test('expired token + x-api-key request → passes through (the client credentia
 	assert.equal(upstreamHits[0].apiKey, 'sk-ant-user-key');
 });
 
-test('dead scoped item does not eclipse a fresh default-item /login (candidate fallback on read)', async () => {
-	// /login from a vanilla terminal writes the DEFAULT item; the scoped item
-	// still holds a dead cred whose refresh 400s.
+// With a config dir set the proxy injects ONLY its scoped item. These two cases
+// used to pin the opposite (a dead scoped item recovered on the default item's
+// token); that put the core on the machine's shared login for good.
+test('config dir set: a dead scoped item is NOT replaced by the default item — the client credential passes through', async () => {
 	keychain = { service: 'scoped', oauth: { accessToken: 'dead-scoped-token-aaaaaaaaaa', refreshToken: 'rt', expiresAt: now - 1000 } };
 	extraKeychainItems = [{ service: 'default', oauth: { accessToken: 'fresh-default-login-token-bb', expiresAt: now + HOUR } }];
+	refreshResult = null;
+	upstreamHandler = (_req, res) => respond(res, 200, '{}');
+	const proxyPort = await startProxy(await startUpstream(), { scopedService: 'scoped', configDir: '/core' });
+
+	const r = await call(proxyPort, { authorization: 'Bearer client-token' });
+	assert.equal(r.status, 200);
+	assert.equal(upstreamHits[0].auth, 'Bearer client-token');
+	assert.equal(refreshCalls, 1, 'the refresh is attempted within the scoped item');
+});
+
+test('config dir set: upstream 401 on the scoped token never recovers on the default item', async () => {
+	keychain = { service: 'scoped', oauth: { accessToken: 'revoked-scoped-token-aaaaaaa', expiresAt: now + HOUR } };
+	extraKeychainItems = [{ service: 'default', oauth: { accessToken: 'fresh-default-login-token-bb', expiresAt: now + HOUR } }];
+	upstreamHandler = (req, res) => {
+		if (req.headers['authorization'] === 'Bearer client-token') { respond(res, 200, '{"own":true}'); return; }
+		respond(res, 401, '{"error":{"type":"authentication_error","message":"OAuth access token has expired"}}');
+	};
+	const proxyPort = await startProxy(await startUpstream(), { scopedService: 'scoped', configDir: '/core' });
+
+	for (let i = 0; i < 2; i++) {
+		const r = await call(proxyPort, { authorization: 'Bearer client-token' });
+		assert.equal(r.status, 200);
+	}
+	assert.deepEqual(upstreamHits.map((h) => h.auth), [
+		'Bearer revoked-scoped-token-aaaaaaa', 'Bearer client-token', 'Bearer client-token',
+	]);
+});
+
+test('no config dir: a dead first item still falls to a usable later item (plain-install behaviour kept)', async () => {
+	keychain = { service: 'a', oauth: { accessToken: 'dead-first-token-aaaaaaaaaaa', refreshToken: 'rt', expiresAt: now - 1000 } };
+	extraKeychainItems = [{ service: 'b', oauth: { accessToken: 'fresh-second-item-token-bbbb', expiresAt: now + HOUR } }];
 	refreshResult = null;
 	upstreamHandler = (_req, res) => respond(res, 200, '{}');
 	const proxyPort = await startProxy(await startUpstream());
 
 	const r = await call(proxyPort, { authorization: 'Bearer client-token' });
 	assert.equal(r.status, 200);
-	assert.equal(upstreamHits[0].auth, 'Bearer fresh-default-login-token-bb');
+	assert.equal(upstreamHits[0].auth, 'Bearer fresh-second-item-token-bbbb');
 	assert.equal(refreshCalls, 0, 'a usable candidate needs no OAuth-endpoint call');
-});
-
-test('upstream 401 on scoped token → recovery finds a fresh token in the default item → retry succeeds', async () => {
-	keychain = { service: 'scoped', oauth: { accessToken: 'revoked-scoped-token-aaaaaaa', expiresAt: now + HOUR } };
-	upstreamHandler = (req, res) => {
-		if (req.headers['authorization'] === 'Bearer revoked-scoped-token-aaaaaaa') {
-			// /login (vanilla terminal) lands in the DEFAULT item mid-incident.
-			extraKeychainItems = [{ service: 'default', oauth: { accessToken: 'fresh-default-login-token-bb', expiresAt: now + HOUR } }];
-			respond(res, 401, '{"error":{"type":"authentication_error","message":"OAuth access token has expired"}}');
-			return;
-		}
-		respond(res, 200, '{"recovered":true}');
-	};
-	const proxyPort = await startProxy(await startUpstream());
-
-	const r = await call(proxyPort, { authorization: 'Bearer client-token' });
-	assert.equal(r.status, 200);
-	assert.equal(upstreamHits.length, 2);
-	assert.equal(upstreamHits[1].auth, 'Bearer fresh-default-login-token-bb');
-	assert.equal(refreshCalls, 0);
 });
 
 // --- selectCred: pure candidate-selection policy ---------------------------

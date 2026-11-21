@@ -64,13 +64,8 @@ _load_python_helper() {
     _PY_HELPER_LOADED=1
 }
 
-# The CLAUDE_CONFIG_DIR the CORE runs with, resolved the way startup.sh and
-# start-cli.sh resolve it (src/claude_config_dir.sh -> sutando-config.sh
-# claude-sutando-config-dir). NOT claude-home-path: that reads the installer's own
-# environment and defaults to ~/.claude, so an install or is-current run from a
-# shell without the variable pinned the machine's shared login for the proxy
-# while the core signed in under its own config dir. The proxy hashes this value
-# to pick its keychain item, so it must be the core's.
+# The CORE's CLAUDE_CONFIG_DIR, resolved as startup.sh does. Not claude-home-path: that
+# reads the installing shell and defaults to ~/.claude, a different keychain login.
 core_config_dir() {
     local _dir _rc=0
     # shellcheck source=claude_config_dir.sh
@@ -138,9 +133,8 @@ case "$cmd" in
             echo "ERROR: template not found: $TEMPLATE" >&2
             exit 1
         fi
-        # Baked in because launchd inherits no shell env; an empty value would
-        # install a proxy that silently reads the vanilla keychain item, and the
-        # installer's own environment may name a different login than the core's.
+        # Baked in because launchd inherits no shell env; empty or the installing
+        # shell's value would make the proxy read a different login than the core's.
         CLAUDE_CFG="$(core_config_dir)" || CLAUDE_CFG=""
         [ -n "$CLAUDE_CFG" ] || { echo "ERROR: could not resolve the core's Claude config directory" >&2; exit 1; }
         # Validate the target the WRAPPER will actually use. In bundled mode the

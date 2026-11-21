@@ -30,6 +30,8 @@ async function startProxy(): Promise<number> {
 	const upstreamPort = await listen(createHttpServer((req, res) => upstreamHandler(req, res)));
 	const deps: Partial<ProxyDeps> = {
 		readCredCandidates: () => [{ service: 'svc', oauth: { accessToken: 'tok', expiresAt: NOW + 3600_000 } }],
+		scopedService: null, // a plain install: not the runner's own CLAUDE_CONFIG_DIR
+		configDir: '',
 		writeCred: () => true,
 		refreshAccessToken: async () => null,
 		request: httpRequest as unknown as typeof httpsRequest,
@@ -108,6 +110,8 @@ test('a recorder that throws does not break forwarding', async () => {
 	const upstreamPort = await listen(createHttpServer((req, res) => upstreamHandler(req, res)));
 	const port = await listen(createProxyServer({
 		readCredCandidates: () => [{ service: 'svc', oauth: { accessToken: 'tok', expiresAt: NOW + 3600_000 } }],
+		scopedService: null, // a plain install: not the runner's own CLAUDE_CONFIG_DIR
+		configDir: '',
 		writeCred: () => true,
 		refreshAccessToken: async () => null,
 		request: httpRequest as unknown as typeof httpsRequest,
