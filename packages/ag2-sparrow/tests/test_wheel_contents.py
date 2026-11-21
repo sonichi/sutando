@@ -25,7 +25,8 @@ isolate_os_environ()
 PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC = PKG_ROOT / "ag2_sparrow"
 # Non-Python files the code reads at run time (package-data in pyproject.toml).
-DATA_FILES = ("ag2_sparrow/tmux-pane-keys.sh",
+DATA_FILES = ("ag2_sparrow/identity/vectors.json",
+              "ag2_sparrow/tmux-pane-keys.sh",
               "ag2_sparrow/bounded-wait.sh",
               "ag2_sparrow/adapters/hatch/ag2-sparrow-hatch.sh",
               "ag2_sparrow/adapters/hatch/hook-definition.json",
@@ -86,6 +87,9 @@ def main():
         print(f"PASS wheel+sdist ship all {len(expected)} packages: {', '.join(expected)}")
 
         _run([py, "-m", "pip", "install", "--quiet", "--no-deps", "--no-index", str(whl)])
+        _run([py, "-I", "-c",
+              "from ag2_sparrow.identity import ingress_task_id; "
+              "assert ingress_task_id('inst7', '9f3ab2').value == 'task-inst7~9f3ab2'"], cwd=d)
         (d / "import-home").mkdir()
         env = hermetic_env(d / "import-home", AGENT_CONNECT_STATE_DIR=str(d / "state"), PYTHONPATH="")
         # Run from the temp dir so the source tree cannot shadow the installed copy.

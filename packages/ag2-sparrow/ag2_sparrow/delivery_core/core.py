@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from ..identity import legacy_idempotency_key
 from .contract import (ClaimBackend, Defer, DeliveryAttempt, DeliveryOutcome, DeliveryProvider,
                        DrainResult, DrainStatus, ProviderBoundedRefused, ProviderIndeterminate,
                        ProviderRefused, ProviderPermanentRefused, RecoverReport)
@@ -51,7 +52,7 @@ def idempotency_key(item_id: str, resend_epoch: int = 0) -> str:
     """Stable per logical side effect; NEVER derived from claim material.
     resend_epoch changes on a DELIBERATE operator re-send, and when backend A's
     `replace_refused` swaps a new payload in for a refused one."""
-    return f"{item_id}#{resend_epoch}"
+    return legacy_idempotency_key(item_id, resend_epoch).value
 
 
 def _resend_epoch(backend, item_id: str) -> int:
@@ -132,7 +133,10 @@ class DeliveryCore:
         return _read_receipt(resolved)
 
     def deliver_one(self, item_id: str, payload: bytes) -> DrainResult:
-        """Claim -> deliver -> classify -> complete, with retry accounting."""
+        """Derive -> claim -> deliver -> classify -> complete, with retries."""
+        # Derive BEFORE claiming: a key that cannot be derived must not leave
+        # this worker holding an item no drain will ever deliver.
+        key = idempotency_key(item_id)
         token = self.backend.claim(item_id, self.worker)
         if token is None:
             # No provider call either way, so nothing external is ambiguous.
