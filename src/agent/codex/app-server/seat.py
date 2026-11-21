@@ -43,7 +43,6 @@ from delivery.task_dispatch import (has_ready_result, owned_task_ids,  # noqa: E
 from task_disposition import ANSWERED, ARCHIVED, PENDING, task_dispositions  # noqa: E402
 from task_priority import sort_tasks_by_priority  # noqa: E402
 
-from util_paths import task_event_handler_config_path  # noqa: E402
 from workspace_default import resolve_workspace  # noqa: E402
 
 CLIENT = {"name": "sutando-codex-seat", "title": "Sutando Codex seat", "version": "1"}
@@ -193,20 +192,14 @@ class Watcher:
     """The standby task watcher the notifier runs beside a Codex seat today, kept as a child.
 
     It is the engine's own `watch-tasks-stream.sh`: it writes the task lifecycle rows and offers each
-    Stop to the skills' stop handlers, which is what opens a Stop ruling. It also gives each task to
-    the core's task-event handler first (the pool's router, a required Team handler), and a
-    `TASK_FILE:` line is its word that the task is the core's: the core seat runs only those
-    ([announced]). What is pending is still read from disk, so a task announced once is never lost.
+    Stop to the skills' stop handlers, which is what opens a Stop ruling. Its `TASK_FILE:` lines only
+    wake the seat; what is pending is always read from disk, so a dead watcher never loses a task.
     """
 
     def __init__(self, inbox: str, wake: threading.Event, script: Path = WATCHER, restart_s: float = 30.0):
         self.inbox, self.wake, self.script, self.restart_s = inbox, wake, script, restart_s
         self.p: Optional[subprocess.Popen] = None
         self.started_at = 0.0
-        self.announced: set = set()
-
-    def alive(self) -> bool:
-        return self.p is not None and self.p.poll() is None
 
     def ensure(self) -> None:
         if self.p is not None and self.p.poll() is None:
@@ -229,8 +222,6 @@ class Watcher:
     def _reader(self, p: subprocess.Popen) -> None:
         for line in p.stdout:
             if line.startswith("TASK_FILE: "):
-                # A basename, or an absolute path when the inbox is resolved.
-                self.announced.add(os.path.basename(line[len("TASK_FILE: "):].strip()))
                 self.wake.set()
 
     def stop(self) -> None:
@@ -268,8 +259,6 @@ class Seat:
         self.failures = 0
         self.stopping = False
         self.wake = threading.Event()
-        self.watcher: Optional["Watcher"] = None
-        self.held_logged = False
         self.deferred: dict = {}
         self.staged: set = set()
         self.unsettled: dict = {}
@@ -398,9 +387,8 @@ class Seat:
             if self.worker:
                 names = pending_candidates(inbox, results)
             else:
-                names = self.announced_to_core(list(pending_candidates(
-                    inbox, results, claims_dir=self.workspace.joinpath(*CLAIMS_DIR),
-                    deliveries_dir=self.workspace / "deliveries")))
+                names = pending_candidates(inbox, results, claims_dir=self.workspace.joinpath(*CLAIMS_DIR),
+                                           deliveries_dir=self.workspace / "deliveries")
             return [(n, inbox / n) for n in names]
         owed = []
         ids = owned_task_ids(inbox.parent, inbox.name)
@@ -418,30 +406,6 @@ class Seat:
             # A payload that is only missing may still be on its way (the sentinel can precede it):
             # the delivery is kept, and withdrawn only on the evidence of an archived payload.
         return [(p.name, p) for p in sort_tasks_by_priority(owed)]
-
-    def announced_to_core(self, names: List[str]) -> List[str]:
-        """The pending tasks that are the core's to run.
-
-        The watcher gives each task to the task-event handler before the core: the pool's router
-        hands a bound room's task to its worker a moment after the task file lands, and a required
-        handler must keep its task from the core altogether. A task file with no claim and no worker
-        sentinel yet is therefore not the core's until the watcher announces it. Read straight from
-        the inbox, such a task was run by the core and by its worker both (seen live, 2026-11-21).
-
-        With no watcher running, a workspace that declares a handler gives the core nothing; one
-        that declares none has nothing to route, and every pending task is the core's.
-        """
-        watcher = self.watcher
-        if watcher is not None and watcher.alive():
-            watcher.announced.intersection_update({p.name for p in Path(self.host.inbox).glob("*.txt")})
-            return [n for n in names if n in watcher.announced]
-        if not task_event_handler_config_path(self.workspace / "state").exists():
-            return names
-        if names and not self.held_logged:
-            self.held_logged = True
-            log(f"{len(names)} pending task(s) held: a task-event handler is declared and no watcher is "
-                "running to route them first")
-        return []
 
     # ---- per-task records: what happened to a turn that ended without a result ----
 
@@ -691,7 +655,6 @@ class Seat:
         log(f"seat {self.seat} ({mode}) on codex app-server; inbox {self.host.inbox}; this panel is a read-only log")
         try:
             self.ensure_server()
-            self.watcher = watcher
             while not self.stopping:
                 if watcher is not None:
                     watcher.ensure()
