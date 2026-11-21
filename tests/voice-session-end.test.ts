@@ -82,6 +82,14 @@ describe('the session-end task', () => {
 		const body = readFileSync(join(TMP, 'tasks', `${id}.txt`), 'utf-8');
 		assert.match(body, /^source: voice$/m);
 		assert.match(body, /^priority: low$/m);
+		// The call-end lifecycle wrote it, not the owner: every header line above task:, as
+		// tests/task-watch-owner.test.py's call-end fixture has them.
+		const head = body.slice(0, body.indexOf('\ntask: ')).split('\n')
+			.filter((l) => !/^(id|timestamp|local_time|envelope_hmac): /.test(l))
+			.map((l) => l.replace(/^user_id: .+$/, 'user_id: *'));
+		assert.deepEqual(head, ['source: voice', 'interaction_type: system_event', 'media_form: live_stream',
+			'channel_id: local-voice', 'user_id: *', 'access_tier: owner', 'priority: low']);
+		assert.doesNotMatch(body, /realtime_audio/);
 		assert.match(body, /^task: VOICE_SESSION_ENDED:/m);
 		assert.match(body, /--- the session's spoken lines[^\n]*---\n[\s\S]*user: check PR 5308/);
 		assert.equal(readdirSync(join(TMP, 'tasks')).filter((f) => f.endsWith('.txt')).length, 1);
