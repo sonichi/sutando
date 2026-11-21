@@ -201,7 +201,7 @@ RECORDED = (("CLAUDE", "claude", str), ("PLUGIN_DIR", "plugin_dir", lambda v: v 
             ("HMAC_KEY_FILE", "hmac_key_file", str), ("PERMISSION_MODE", "permission_mode", str), ("TMUX", "tmux", str),
             ("HMAC_STRICT", "no_hmac_strict", lambda v: v == hmac_policy.OPT_OUT),
             (inbox.ALLOW_NON_OWNER, "allow_non_owner", lambda v: v == "1"),
-            (inbox.ALLOW_COLLABORATOR, "no_allow_collaborator", lambda v: v == "0"))
+            (inbox.ALLOW_COLLABORATOR, "collaborator", lambda v: "0" if v == "0" else ""))
 
 
 # Install and connect ran, but a kept session id stayed instead of --resume-session's.
@@ -284,7 +284,7 @@ def _install(args) -> int:
               "HMAC_KEY_FILE": key_file, "HMAC_STRICT": "1" if strict else hmac_policy.OPT_OUT if args.no_hmac_strict else "",
               "PERMISSION_MODE": args.permission_mode, "SESSION_ID": "", "HITL_STORE": str(card.store_root(state)),
               inbox.ALLOW_NON_OWNER: "1" if args.allow_non_owner else "",
-              inbox.ALLOW_COLLABORATOR: "0" if args.no_allow_collaborator else "1", "AGENT_ID": agent_id, "BRIDGE": mode,
+              inbox.ALLOW_COLLABORATOR: "0" if args.collaborator == "0" else "1", "AGENT_ID": agent_id, "BRIDGE": mode,
               "TOKEN_ENV_FILE": where["token_file"],
               "TOKEN_VAULT_KEY": vault_key(segment) if mode not in (UNIT, EXTERNAL) and not where["token_file"] else "",
               "BRIDGE_STATE_DIR": str(state), "TMUX": tmux}
@@ -693,11 +693,11 @@ def session_options(p) -> None:
                    "owner's session, so they always get the owner-only refusal. An attested collaborator is not "
                    "covered by it: see --no-allow-collaborator")
     co = p.add_mutually_exclusive_group()
-    co.add_argument("--allow-collaborator", action="store_true", help="submit attested collaborators' (Team) tasks "
+    co.add_argument("--allow-collaborator", dest="collaborator", action="store_const", const="1", help="submit attested collaborators' (Team) tasks "
                     "into this session with the non-owner note (the default; kept so older install lines still work). "
                     "The session holds the owner's history, tools and credentials with permission prompts off; the "
                     "note and the gateway's delivery guard are the bounds")
-    co.add_argument("--no-allow-collaborator", action="store_true", help="refuse attested collaborators' tasks with "
+    co.add_argument("--no-allow-collaborator", dest="collaborator", action="store_const", const="0", help="refuse attested collaborators' tasks with "
                     "the owner-only line instead of submitting them")
     p.add_argument("--permission-mode", default="bypassPermissions",
                    help="the session's --permission-mode; bypassPermissions (default) suits an unattended "
