@@ -93,7 +93,7 @@ class ConnectInstall(ConnectBase):
         self.assertEqual((cfg["CLAUDE"], cfg["PLUGIN_DIR"], cfg["INBOX_DIR"], cfg["RESULTS_DIR"], cfg["ROOT"]),
                          (str(self.claude), str(self.plugin), str(self.inbox), str(self.results), str(self.work)))
         self.assertEqual((cfg["PERMISSION_MODE"], cfg["HMAC_STRICT"], cfg["ALLOW_NON_OWNER"], cfg["ALLOW_COLLABORATOR"]),
-                         ("bypassPermissions", "1", "", ""), "a key file alone is strict; non-owner and collaborator tasks are off")
+                         ("bypassPermissions", "1", "", "1"), "a key file alone is strict; collaborators on, other non-owners off")
         self.assertTrue(cli.SESSION_ID_RE.match(cfg["SESSION_ID"]), "install mints the session id")
         self.assertEqual(cfg["HITL_STORE"], str(cli.hitl_store_root()), "the bridge's claude-local root is persisted")
         self.assertTrue(self.inbox.is_dir() and self.results.is_dir())
@@ -1189,25 +1189,28 @@ class ConnectStrict(ConnectBase):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             self.install("--hmac-strict", "--no-hmac-strict")
 
-    def test_allow_collaborator_is_persisted_off_by_default_independent_of_allow_non_owner_and_shown_by_verify(self):
+    def test_collaborators_are_on_by_default_opted_out_by_no_allow_collaborator_and_shown_by_verify(self):
         runner = self.runner()
-        self.assertEqual(self.install_with(runner, False, "--allow-non-owner")[0], 0)
-        self.assertEqual(cli.read_config(cli.config_path())["ALLOW_COLLABORATOR"], "", "--allow-non-owner does not imply it")
-        self.assertIn("INFO collaborator tasks: refused (--allow-collaborator off)", self.main("verify")[1])
-        self.assertFalse(inbox.allow_collaborator())
-        self.assertEqual(self.install_with(runner, False, "--allow-collaborator")[0], 0)
+        self.assertEqual(self.install_with(runner)[0], 0)
         cfg = cli.read_config(cli.config_path())
         self.assertEqual((cfg["ALLOW_COLLABORATOR"], cfg["ALLOW_NON_OWNER"]), ("1", ""))
-        self.assertIn("INFO collaborator tasks: submitted into this session with the non-owner note (--allow-collaborator)",
-                      self.main("verify")[1])
+        self.assertIn("INFO collaborator tasks: submitted into this session with the non-owner note (the default; "
+                      "--no-allow-collaborator opts out)", self.main("verify")[1])
         self.assertTrue(inbox.allow_collaborator())
-        self.assertFalse(inbox.allow_non_owner())
         self.assertTrue(inbox.allow_collaborator({inbox.CONFIG_DIR_VAR: str(cli.config_dir())}), "the pane's config dir")
         self.assertFalse(inbox.allow_collaborator({inbox.CONFIG_DIR_VAR: str(self.home / "none")}), "unreadable reads as off")
+        self.assertEqual(self.install_with(runner, False, "--no-allow-collaborator")[0], 0)
+        self.assertEqual(cli.read_config(cli.config_path())["ALLOW_COLLABORATOR"], "0")
+        self.assertIn("INFO collaborator tasks: refused (--no-allow-collaborator)", self.main("verify")[1])
+        self.assertFalse(inbox.allow_collaborator())
+        self.assertEqual(self.install_with(runner, False, "--allow-collaborator")[0], 0)
+        self.assertEqual(cli.read_config(cli.config_path())["ALLOW_COLLABORATOR"], "1", "the older flag still works")
+        self.assertTrue(inbox.allow_collaborator())
         path = cli.config_path()
-        path.write_text("".join(l for l in path.read_text().splitlines(True) if not l.startswith("ALLOW_COLLABORATOR=")))
-        self.assertFalse(inbox.allow_collaborator(), "a config written before the flag existed keeps refusing")
-        self.assertIn("INFO collaborator tasks: refused (--allow-collaborator off)", self.main("verify")[1])
+        for written in ("", None):
+            lines = [l for l in path.read_text().splitlines(True) if not l.startswith("ALLOW_COLLABORATOR=")]
+            path.write_text("".join(lines + ([] if written is None else ["ALLOW_COLLABORATOR=\n"])))
+            self.assertTrue(inbox.allow_collaborator(), "an older install's empty or absent value serves them now")
 
     def test_allow_non_owner_is_persisted_off_by_default_and_shown_by_verify(self):
         runner = self.runner()
@@ -1217,7 +1220,7 @@ class ConnectStrict(ConnectBase):
         self.assertFalse(inbox.allow_non_owner())
         self.assertEqual(self.install_with(runner, False, "--allow-non-owner")[0], 0)
         self.assertEqual(cli.read_config(cli.config_path())["ALLOW_NON_OWNER"], "1")
-        self.assertIn("INFO non-owner tasks: submitted with the non-owner note (--allow-non-owner)", self.main("verify")[1])
+        self.assertIn("INFO non-owner tasks: refused: a restricted turn must be isolated and read-only", self.main("verify")[1])
         self.assertTrue(inbox.allow_non_owner())
         self.assertTrue(inbox.allow_non_owner({inbox.CONFIG_DIR_VAR: str(cli.config_dir())}), "the pane's config dir")
         self.assertFalse(inbox.allow_non_owner({inbox.CONFIG_DIR_VAR: str(self.home / "none")}), "unreadable reads as off")
@@ -1643,8 +1646,8 @@ class ConnectOccupancy(ConnectBase):
 
 
 class CollaboratorAdmission(ConnectBase):
-    """--allow-collaborator through the real inbox verbs: refused by default and under --allow-non-owner
-    alone, claimed with its admission when set; plain team and guest stay with --allow-non-owner."""
+    """Collaborators through the real inbox verbs: claimed by default, refused under --no-allow-collaborator;
+    plain team and guest are always refused."""
 
     def setUp(self):
         super().setUp()
@@ -1663,8 +1666,8 @@ class CollaboratorAdmission(ConnectBase):
         (self.inbox / (task_id + ".txt")).write_text("id: %s\n%saccess_tier: %s\ntask: hi\n" % (task_id, extra, tier))
         return task_id
 
-    def test_a_collaborator_is_refused_by_default_and_under_allow_non_owner_alone_naming_allow_collaborator(self):
-        for i, over in enumerate(({}, {"ALLOW_NON_OWNER": "1"})):
+    def test_a_collaborator_is_refused_under_no_allow_collaborator_whatever_allow_non_owner_says(self):
+        for i, over in enumerate(({"ALLOW_COLLABORATOR": "0"}, {"ALLOW_COLLABORATOR": "0", "ALLOW_NON_OWNER": "1"})):
             self.configure(**over)
             t = self.task("task-c%d" % i, "team", "collaborator: true\n")
             rc, out = self.verb("claim", t)
@@ -1674,8 +1677,8 @@ class CollaboratorAdmission(ConnectBase):
         self.assertEqual((rc, out.get("answered"), out.get("interrupted")), (0, True, False), out)
         self.assertEqual((self.results / "task-ci.txt").read_text(), task_io.NON_OWNER_REFUSED, "interrupt refuses it too")
 
-    def test_allow_collaborator_claims_a_collaborator_with_its_admission_and_still_refuses_team_and_guest(self):
-        self.configure(ALLOW_COLLABORATOR="1")
+    def test_by_default_a_collaborator_is_claimed_with_its_admission_and_team_and_guest_are_refused(self):
+        self.configure()
         t = self.task("task-c", "team", "collaborator: true\n")
         rc, out = self.verb("claim", t)
         self.assertEqual((rc, out.get("admission"), out.get("access_tier"), out.get("collaborator")),
