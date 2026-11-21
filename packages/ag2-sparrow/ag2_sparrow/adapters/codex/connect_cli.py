@@ -14,7 +14,9 @@ on SIGTERM; a root another session holds is exit 75, which the manager does not 
 `--work`, the root is the agent's own and install also wires its bridge (connect_bridge's, as claude-local's).
 `connect --base --agent --code` checks the machine, redeems AG2 Space's one-time code into the agent's seat, then
 runs install with that seat; it is off in this release and refuses unless `--experimental-connect` is given. The relay token stays in its env or seat file and the Codex login in
-CODEX_HOME: neither is copied. Stdlib only.
+CODEX_HOME: neither is copied. `supervised --host <declaration>` runs the connector in the foreground under a
+host that owns the bridge and the folders (supervised_host): no unit, no bridge, no host-supervisor refusal.
+Stdlib only.
 """
 from __future__ import annotations
 
@@ -26,7 +28,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ... import _dirs, connect_bridge as cb, connect_common as cm, task_io
+from ... import _dirs, connect_bridge as cb, connect_common as cm, supervised_host, task_io
 from ...connect_bridge import EXTERNAL, UNIT
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, RUN_TIMEOUT_S, Shape, _v
 from . import codex_connector
@@ -381,6 +383,31 @@ def uninstall(args) -> int:
     return cm.uninstall(local, before_free=lambda cfg: cb.unwire_bridge(cfg, COMMAND, bridge), token_file=cb.kept_token)
 
 
+def supervised_argv(args, codex: str, host: str) -> list:
+    """The connector under a host's supervision: its declaration, the exact codex the version check passed, its
+    own stdio app-server; tiers come from each task's attested headers, so there is no --allow-non-owner."""
+    argv = ["--supervised-by", host, "--codex", codex, "--server", "stdio", "--sandbox", args.sandbox]
+    return argv + (["--model", args.model] if args.model else [])
+
+
+def supervised(args, serve=None) -> int:
+    """Run the connector in the foreground for a host that owns the bridge, the identity, the folders and the
+    restarts. It writes no config or unit and starts no bridge, so a host supervisor beside it is expected."""
+    try:
+        host = supervised_host.load(args.host)
+    except supervised_host.DeclarationError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    codex = os.path.abspath(shutil.which(args.codex) or args.codex)
+    problem = version_problem(codex)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    if args.codex_home:
+        os.environ["CODEX_HOME"] = str(Path(args.codex_home).expanduser().resolve())
+    return (serve or codex_connector.main)(supervised_argv(args, codex, host.path))
+
+
 def list_cmd(_args) -> int:
     return cm.list_jobs(LOCAL)
 
@@ -449,6 +476,15 @@ def main(argv=None) -> int:
     agent_option(sub.add_parser("verify", help="check every part")).set_defaults(func=verify)
     agent_option(sub.add_parser("uninstall", help="stop the job, then remove what install wrote (config last)")
                  ).set_defaults(func=uninstall)
+    s = sub.add_parser("supervised", help="run the connector in the foreground under a host that owns the bridge "
+                       "and the folders, as its host declaration names them (off unless a host starts it)")
+    s.add_argument("--host", required=True, help="the host declaration (JSON, schema %s)" % supervised_host.SCHEMA)
+    s.add_argument("--codex", default="codex", help="the codex executable (default: codex on PATH)")
+    s.add_argument("--codex-home", help="CODEX_HOME holding the login the connector uses (default: the CLI's own)")
+    s.add_argument("--sandbox", choices=SANDBOXES, default="read-only",
+                   help="the owner threads' sandbox (default read-only; non-owner turns are always read-only)")
+    s.add_argument("--model", help="the model for every turn (default: the connector's)")
+    s.set_defaults(func=supervised)
     sub.add_parser("list", help="each job installed here: its agent, the manager's state, its work root and the "
                    "selector that names it").set_defaults(func=list_cmd)
     args = ap.parse_args(argv)

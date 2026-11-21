@@ -14,6 +14,10 @@ an attested collaborator, or any non-owner under --allow-non-owner, runs on its 
 ephemeral thread, read-only, with the shared NON_OWNER_NOTE in the prompt, and is
 refused by --push; every other non-owner gets NON_OWNER_REFUSED as its result. The
 tier is never taken from message text.
+
+`--supervised-by <host declaration>` (off by default) runs under a host that owns the bridge:
+tasks come from the host's inbox, results are published into the host's results, and the host's
+stage hook records each claim (ag2_sparrow.supervised_host).
 """
 import argparse
 import hashlib
@@ -28,7 +32,7 @@ import threading
 import time
 import uuid
 
-from ... import held_start
+from ... import held_start, supervised_host
 from ...relay_loop import count_arg
 from ...task_io import (AUDIENCE_RULE, DONE_KEEP, NON_OWNER_NOTE, NON_OWNER_REFUSED, LockRefused, acquire_lock,  # noqa: F401
                         admission, attested_headers, exit_on_sigterm, holder_consumer, load_done, make_dirs,
@@ -44,6 +48,8 @@ NO_REPLY = "[no reply] Codex completed the turn without a message."
 # whose liveness fences the root; the connector waits this long for that record, then refuses.
 HELD_WAIT_S = held_start.WAIT_S
 RESUME_MARKER = "resume-thread-taken"   # under state/: the --resume-thread id already carried over
+SUPERVISED_ADAPTER = "codex-supervised"   # the holder label on a supervised connector's state dir
+STAGE_RETRY_S = 30                        # a task whose pending stage the host refused is offered again after this
 
 
 def log(*a):
@@ -178,6 +184,27 @@ class Connector:
         self.live = {}            # channel key -> owner thread id open on the current server
         self.scratch_cwd = None
         self.declined = []
+        self.host = getattr(args, "host", None)   # a supervised_host.Host under --supervised-by, else None
+        self.deferred = {}                         # task id -> time before which it is not offered again
+
+    def task_path(self, name):
+        return self.host.task_path(name) if self.host else os.path.join(self.args.inbox, name)
+
+    def publish(self, name, text):
+        """The result body for `name`, published whole; returns the time it was published."""
+        if self.host:
+            self.host.publish(name, text)
+            return time.time()
+        return write_atomic(os.path.join(self.args.results, name), text)
+
+    def stage(self, task_id, stage):
+        """'' when the host recorded the stage (always, unsupervised), else why not; logged either way."""
+        if not self.host:
+            return ""
+        problem = self.host.stage(task_id, stage)
+        if problem:
+            log("host stage", stage, "for", task_id, "failed:", problem)
+        return problem
 
     def handle_server_request(self, m):
         """No human is attached, so approvals are declined (the turn continues)."""
@@ -403,7 +430,8 @@ class Connector:
     def pending_tasks(self, seen):
         names = [n for n in os.listdir(self.args.inbox)
                  if n.startswith("task-") and n.endswith(".txt") and n[:-4] not in seen
-                 and not os.path.exists(os.path.join(self.args.results, n))]
+                 and not os.path.exists(os.path.join(self.args.results, n))
+                 and self.deferred.get(n[:-4], 0) <= time.time()]
         names.sort(key=lambda n: (os.stat(os.path.join(self.args.inbox, n)).st_mtime, n))
         return names
 
@@ -430,15 +458,23 @@ class Connector:
                 continue
             name = names[0]
             task_id = name[:-4]
+            path = self.task_path(name)
+            if self.host and not os.path.isfile(path):
+                log("no payload for", name, "at", path, "; skipped")
+                seen.add(task_id)
+                continue
+            if self.stage(task_id, "pending"):
+                self.deferred[task_id] = time.time() + STAGE_RETRY_S
+                continue
             seen.add(task_id)
-            path = os.path.join(self.args.inbox, name)
             t_mtime = os.stat(path).st_mtime
             t_seen = time.time()
             headers, message, operator_lines = parse_task(path)
             if admission(headers, self.args.allow_non_owner) is None:
                 log("refused (non-owner, --allow-non-owner not set) ->", task_id, headers["access_tier"])
-                write_atomic(os.path.join(self.args.results, name), NON_OWNER_REFUSED)
+                self.publish(name, NON_OWNER_REFUSED)
                 record_done(done_path, task_id)
+                self.stage(task_id, "done")
                 done += 1
                 idle_since = time.time()
                 continue
@@ -448,8 +484,9 @@ class Connector:
             status, text, err = self.run_task(headers, prompt)
             t_done = time.time()
             out = self.result_body(status, text, err)
-            t_result = write_atomic(os.path.join(self.args.results, name), out.rstrip("\n") + "\n")
+            t_result = self.publish(name, out.rstrip("\n") + "\n")
             record_done(done_path, task_id)
+            self.stage(task_id, "done")
             rec = {"task": task_id, "status": status, "chars": len(out), "tier": headers["access_tier"],
                    "detect_s": round(t_seen - t_mtime, 3), "turn_s": round(t_done - t_sent, 3),
                    "file_to_file_s": round(t_result - t_mtime, 3), "thread": self.last_thread,
@@ -512,6 +549,9 @@ def build_parser():
                          "collaborator claim the broker did not attest), each on its own ephemeral read-only "
                          "thread. Off by default: they are refused with a plain line. An attested collaborator "
                          "never needs it: it always gets that ephemeral read-only thread.")
+    ap.add_argument("--supervised-by", default=None, metavar="HOST_JSON",
+                    help="run under the host this declaration names (supervised_host): the host's inbox, results, "
+                         "publish contract and stage hook, no lock on any work root, no bridge; off by default")
     ap.add_argument("--thread-id", default=None, metavar="CHANNEL_ID=THREAD",
                     help="resume THREAD for exactly this owner channel when it has no saved thread yet")
     ap.add_argument("--resume-thread", default=None, metavar="THREAD",
@@ -535,6 +575,8 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.push:
         return push(*args.push)
+    if args.supervised_by:
+        return serve_supervised(args)
     if not args.work:
         build_parser().error("--work is required unless --push is given")
     cwd_given = args.cwd
@@ -560,6 +602,36 @@ def main(argv=None):
     except LockRefused as e:
         sys.stderr.write(e.line + "\n")
         return e.code
+    finally:
+        release_lock(owner)
+
+
+SUPERVISED_EXCLUSIVE = ("work", "held", "root_fd", "allow_non_owner")
+
+
+def serve_supervised(args):
+    """Under a host that owns the bridge, the folders and the claim record: the host's declaration names
+    them, and the only lock taken is this connector's own state dir, so one connector serves one inbox."""
+    clash = [k for k in SUPERVISED_EXCLUSIVE if getattr(args, k) not in (None, False)]
+    if clash:
+        build_parser().error("--supervised-by cannot be combined with --%s" % clash[0].replace("_", "-"))
+    try:
+        args.host = supervised_host.load(args.supervised_by)
+    except supervised_host.DeclarationError as e:
+        sys.stderr.write("refusing to start: %s\n" % e)
+        return 2
+    exit_on_sigterm()
+    try:
+        owner = acquire_lock(args.host.state, SUPERVISED_ADAPTER)
+    except LockRefused as e:
+        sys.stderr.write(e.line + "\n")
+        return e.code
+    try:
+        os.makedirs(os.path.join(args.host.state, "threads"), exist_ok=True)
+        args.work = args.host.state
+        args.inbox, args.results, args.state = args.host.inbox, args.host.results, args.host.state
+        args.cwd = os.path.abspath(args.cwd) if args.cwd else (args.host.cwd or args.host.state)
+        return exit_code(serve_locked(args))
     finally:
         release_lock(owner)
 
