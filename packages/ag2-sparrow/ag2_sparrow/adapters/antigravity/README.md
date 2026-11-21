@@ -60,11 +60,13 @@ a signed-in agy told to write that file asked to, was refused and ended its turn
 without an answer"). So the prelude's steps are not passed to agy; only its ADDRESSING step is, with
 `NO_REPLY` in place of `[no-send]`.
 
-When a message's turn completes with no text, the line posted says what the turn did instead: the
-permission requests refused (with the policy's reason), the tool calls it made, a stop reason other than
-`end_turn`. Each task's record in `state/metrics.jsonl` carries `detail` (the stop reason), `permissions`
-(each request and why it was allowed or refused), `updates` (the turn's `session/update`s counted by type)
-and `answer_chars`.
+When a message's turn completes with no text, the line posted says what the turn did instead, in fixed
+words and counts only: the refused permission requests by kind (file change, file read, command, web
+fetch, other), the tool calls it made, and a stop reason other than `end_turn` (`max_tokens` or
+`max_turn_requests`, else "other"). No text from agy's request reaches the room: the policy's reasons quote
+it (a key, a kind, a path), so they are kept locally. Each task's record in `state/metrics.jsonl` carries
+`detail` (the stop reason), `permissions` (each request's title, category and why it was allowed or
+refused), `updates` (the turn's `session/update`s counted by type) and `answer_chars`.
 
 ## Tiers and permissions
 

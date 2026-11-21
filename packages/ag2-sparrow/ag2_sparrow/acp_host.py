@@ -170,6 +170,22 @@ def under(root, raw):
     return p is not None and (p == r or p.startswith(r.rstrip(os.sep) + os.sep))
 
 
+ACTION_CATEGORIES = {"read": "file read", "edit": "file change", "delete": "file change", "move": "file change",
+                     "fetch": "web fetch"}
+
+
+def action_category(params):
+    """A fixed name for what a permission request asks to do ("command", "file read", "file change", "web fetch"
+    or "other"), from the request's kind and whether it carries a command. Never any text the agent wrote, so it
+    may be shown in a room."""
+    tool_call = params.get("toolCall") if isinstance(params.get("toolCall"), dict) else {}
+    raw = tool_call.get("rawInput")
+    if tool_call.get("kind") == "execute" or (isinstance(raw, dict) and "command" in raw):
+        return "command"
+    kind = tool_call.get("kind")
+    return ACTION_CATEGORIES.get(kind, "other") if isinstance(kind, str) else "other"
+
+
 def decide_permission(params, owner, cwd, command_ok=None, own_file=None, command_refused="no command is granted",
                       command_granted="", own_file_reason=""):
     """(allowed, reason, result). Default deny. Granted: a command `command_ok(command)` accepts (rawInput holding
@@ -359,7 +375,8 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
     def on_permission(params):
         ok, why, result = decide(params)
         title = (params.get("toolCall") or {}).get("title") if isinstance(params.get("toolCall"), dict) else None
-        turn.decisions.append({"title": str(title or "")[:120], "allowed": ok, "reason": why})
+        turn.decisions.append({"title": str(title or "")[:120], "allowed": ok, "reason": why,
+                               "category": action_category(params)})
         return result
 
     try:

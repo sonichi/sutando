@@ -122,22 +122,28 @@ def session_lines(operator_lines):
     return out
 
 
+CATEGORY_ORDER = ("file change", "file read", "command", "web fetch", "other")
+SAID_STOPS = frozenset({"max_tokens", "max_turn_requests"})
+
+
 def no_answer_why(detail, turn):
-    """What a completed turn with no text did instead, for the line posted in its place: the permission
-    requests refused (with the policy's reasons), its tool calls, and a stop reason other than end_turn."""
+    """What a completed turn with no text did instead, for the line posted in the room in its place. It is
+    built only from fixed words and counts: the refused permission requests by `acp_host.action_category`,
+    the tool calls, and a stop reason from SAID_STOPS (any other but end_turn reads "other"). The policy's
+    reasons quote the agent's own request (a key, a kind, a path), so they stay in metrics.jsonl."""
     if turn is None:
         return ""
     why = []
-    refused = [d["reason"] for d in turn.decisions if not d["allowed"]]
-    if refused:
-        why.append("%d action%s it asked for %s not granted (%s)" % (
-            len(refused), "" if len(refused) == 1 else "s", "was" if len(refused) == 1 else "were",
-            "; ".join(sorted(set(refused)))[:300]))
+    refused = [d.get("category") for d in turn.decisions if not d.get("allowed")]
+    for category in CATEGORY_ORDER:
+        n = sum(1 for c in refused if (c if c in CATEGORY_ORDER else "other") == category)
+        if n:
+            why.append("%d %s%s %s not granted" % (n, category, "" if n == 1 else "s", "was" if n == 1 else "were"))
     calls = turn.updates.get("tool_call", 0)
     if calls:
         why.append("it made %d tool call%s" % (calls, "" if calls == 1 else "s"))
     if detail and detail != "end_turn":
-        why.append("stop reason %s" % detail)
+        why.append("stop reason %s" % (detail if detail in SAID_STOPS else "other"))
     return "; ".join(why)
 
 
