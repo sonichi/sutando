@@ -384,7 +384,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 ## `src/agent/claude/task-watch-mod/hooks/`
 
-- **`register.ts`** — The task-watch Mod: runs the session's task watcher and starts a turn with each task it announces.
+- **`register.ts`** — The task-watch Mod: runs the session's task watcher, starts a turn with each task it announces, and names owner tasks that arrive mid-turn after the next tool result.
 - **`version.ts`** — The oldest Claude Code this Mod is verified on; the launchers read this line too.
 
 ## `src/agent/codex/`
