@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One Codex seat (the core, or a pool worker) served over `codex app-server` instead of a TUI.
 
-The seat owns one `codex app-server --listen stdio://` child and one durable thread, and runs one
+The seat owns one `codex -c … app-server --listen stdio://` child and one durable thread, and runs one
 turn per pending task with the prompt the tmux notifier types today. The Sutando contract is
 unchanged: the agent writes `results/<task file>` itself, and `turn/completed` only means the
 turn is over. Its stdout is the terminal panel: one line per task, turn, command and tool call.
@@ -111,9 +111,9 @@ def task_prompt(filename: str, payload, results_dir, worker: str = "", context_f
 class Rpc:
     """JSON-RPC 2.0 over a child's stdio, one JSON object per line."""
 
-    def __init__(self, argv: List[str], env: Optional[dict] = None):
+    def __init__(self, argv: List[str], env: Optional[dict] = None, cwd: Optional[str] = None):
         self.p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env,
-                                  text=True, bufsize=1)
+                                  text=True, bufsize=1, cwd=cwd)
         self.events: "queue.Queue" = queue.Queue()
         self.pending: dict = {}
         self.lock = threading.Lock()
@@ -245,7 +245,9 @@ class Seat:
                  turn_timeout: float = 0.0, interrupt_grace: float = 30.0,
                  context: Optional[Callable[[str], str]] = None, clock: Callable[[], float] = time.time):
         self.host, self.workspace, self.seat, self.worker = host, Path(workspace), seat, worker
-        self.argv = [codex, "app-server", *[a for c in (config or []) for a in ("-c", c)],
+        # `-c` before the subcommand: the desktop app counts a core alive only when the program
+        # it reads up to the first flag is `codex`, and `codex app-server -c` reads as `codex app-server`.
+        self.argv = [codex, *[a for c in (config or []) for a in ("-c", c)], "app-server",
                      "--listen", "stdio://"]
         self.model, self.sandbox, self.instructions = model, sandbox, instructions
         self.poll_s, self.retry_s, self.hold_s, self.max_attempts = poll_s, retry_s, hold_s, max_attempts
@@ -279,7 +281,7 @@ class Seat:
         return p
 
     def start_server(self) -> None:
-        self.rpc = Rpc(self.argv)
+        self.rpc = Rpc(self.argv, cwd=self.cwd)  # from an unreadable cwd it drops every -c
         self.thread_id = None
         init = self.rpc.request("initialize", {"clientInfo": CLIENT, "capabilities": {"experimentalApi": True}})
         self.rpc.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
@@ -742,7 +744,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     r.add_argument("--model", default="")
     r.add_argument("--sandbox", default=SANDBOX)
     r.add_argument("--instructions", default="", help="standing developer instructions for the thread")
-    r.add_argument("-c", "--config", action="append", default=[], help="passed to `codex app-server -c`")
+    r.add_argument("-c", "--config", action="append", default=[], help="passed to codex as `-c`, before `app-server`")
     r.add_argument("--watcher", action="store_true", help="run the standby task watcher as a child")
     r.add_argument("--once", action="store_true", help="exit once no task is eligible")
     r.add_argument("--log", default="", help="also append the panel's lines to this file")

@@ -476,7 +476,7 @@ By default the Codex core and each Codex pool worker are a Codex TUI in tmux, an
 types every task into it. With `SUTANDO_CODEX_APP_SERVER=1` in the launcher's environment the
 same tmux session holds a seat process instead (`src/agent/codex/app-server/seat.py`). The seat:
 
-- owns one `codex app-server --listen stdio://` child and one durable thread. The thread id is
+- owns one `codex -c … app-server --listen stdio://` child and one durable thread. The thread id is
   kept in `<workspace>/state/codex-seat/<tmux session>/thread`, and a restart resumes it.
 - runs one turn per pending task, in the dispatch order of `src/delivery/task_dispatch.py`,
   with the prompt the notifier types today. The agent still writes `results/<task file>`

@@ -76,7 +76,7 @@ def write_result(prompt):
         f.write("done by the fake\n")
 
 
-rec({"argv": sys.argv[1:], "pid": os.getpid()})
+rec({"argv": sys.argv[1:], "pid": os.getpid(), "cwd": os.getcwd()})
 if os.path.exists(os.path.join(D, "exit-at-start")):
     sys.exit(3)
 sys.stdout.write("this line is not JSON\n[1]\n")
@@ -284,12 +284,34 @@ class SeatCase(unittest.TestCase):
 
 
 class HandshakeAndThread(SeatCase):
+    def test_the_app_server_argv_is_codex_then_every_c_pair_then_the_subcommand(self):
+        # The desktop's liveness check reads the program up to the first flag; it must read `codex`.
+        s = self.make()
+        self.assertEqual(s.argv, [str(self.fake), "-c", 'web_search="live"', "-c",
+                                  "check_for_update_on_startup=false", "app-server", "--listen", "stdio://"])
+        bare = seat_mod.Seat(s.host, self.ws, "bare", codex="codex")
+        self.assertEqual(bare.argv, ["codex", "app-server", "--listen", "stdio://"])
+        before_first_flag = " ".join(s.argv).split(" -")[0]
+        self.assertEqual(os.path.basename(before_first_flag), os.path.basename(str(self.fake)))
+
+    def test_the_app_server_runs_in_the_seat_folder_not_the_one_the_seat_was_started_from(self):
+        elsewhere = Path(self.tmp.name) / "elsewhere"  # stands in for an unreadable launch folder
+        elsewhere.mkdir()
+        here = os.getcwd()
+        os.chdir(elsewhere)
+        self.addCleanup(os.chdir, here)
+        s = self.make()
+        s.ensure_server()
+        self.assertEqual(os.path.realpath(self.sent()[0]["cwd"]), os.path.realpath(s.cwd))
+        self.assertEqual(os.path.realpath(s.cwd), os.path.realpath(self.ws), "the declaration's cwd")
+        self.assertNotEqual(os.path.realpath(self.sent()[0]["cwd"]), os.path.realpath(elsewhere))
+
     def test_handshake_then_one_durable_thread_started_with_the_tui_launch_settings(self):
         s = self.make(model="gpt-test", instructions="You are a worker.")
         s.ensure_server()
         argv = self.sent()[0]["argv"]
-        self.assertEqual(argv, ["app-server", "-c", 'web_search="live"', "-c",
-                                "check_for_update_on_startup=false", "--listen", "stdio://"])
+        self.assertEqual(argv, ["-c", 'web_search="live"', "-c", "check_for_update_on_startup=false",
+                                "app-server", "--listen", "stdio://"])
         init = self.sent("initialize")[0]["params"]
         self.assertEqual(init["clientInfo"]["name"], "sutando-codex-seat")
         self.assertEqual(init["capabilities"], {"experimentalApi": True})
@@ -1038,7 +1060,7 @@ class CommandLine(SeatCase):
         self.assertEqual(rc, 0)
         self.assertEqual(handlers.call_count, 3)
         self.assertTrue(task_dispatch.has_ready_result(self.results, "task-1.txt"))
-        self.assertEqual(self.sent()[0]["argv"], ["app-server", "-c", 'web_search="live"', "--listen", "stdio://"])
+        self.assertEqual(self.sent()[0]["argv"], ["-c", 'web_search="live"', "app-server", "--listen", "stdio://"])
         self.assertEqual(self.sent("thread/start")[0]["params"]["model"], "gpt-test")
         self.assertIn("seat sutando-core (core) on codex app-server", log_file.read_text())
         seat_mod.LOG_FILE = str(self.ws / "state")
