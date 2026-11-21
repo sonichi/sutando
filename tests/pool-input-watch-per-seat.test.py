@@ -99,7 +99,7 @@ class EnsurePerSeat(unittest.TestCase):
         self.assertIn(f"--socket={SOCK}", words)
         self.assertIn(f"--session={NAME}", words)
         self.assertIn(f"--out={self.ws}/state/core-supervisor.{NAME}.json", words)
-        self.assertIn(f"--seat=worker comm ({WID})", words)
+        self.assertIn("--seat=comm", words)  # the display name; the id rides in --session
 
     def test_idempotent_by_its_tmux_session(self):
         t = Tmux({NAME, NAME + "-input"})
@@ -139,10 +139,10 @@ class SeatOnTheCard(unittest.TestCase):
                            "Pick one:\n❯ 1. Stop and wait\n  2. Switch\n", NAME, seat="worker comm")
         self.assertEqual(req.device, {"id": NAME, "name": "worker comm"})
         self.assertTrue(req.title.startswith("worker comm · "), req.title)
-        self.assertIn(NAME, req.message)
+        self.assertNotIn(NAME, req.message + req.title, "the session id is for routing, not reading")
         self.assertEqual((req.subject or {}).get("seat"), "worker comm")
         jump = [a for a in req.actions if a.kind == "open_terminal"]
-        self.assertEqual([a.label for a in jump], [f"Open terminal ({NAME})"])
+        self.assertEqual([a.label for a in jump], ["Open terminal"])
 
     def test_without_a_seat_the_core_card_is_unchanged(self):
         req = ciw.escalate(self.manager(), "blocked-human", "d", "selection", "Pick one:", "sutando-core")

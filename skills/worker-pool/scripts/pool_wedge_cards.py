@@ -57,7 +57,8 @@ def manager_for(workspace):
 def seat_label(workspace, worker_id) -> str:
     row = sup.supervised_workers(workspace).get(worker_id) or {}
     label = sup.pr.display_label(row, worker_id)
-    return f"worker {label}" if label == worker_id else f"worker {label} ({worker_id})"
+    # The id is for routing (device.id, the session); the owner reads only the name.
+    return "a worker" if label == worker_id else label
 
 
 def worker_runtime(workspace, worker_id) -> str | None:
@@ -138,8 +139,9 @@ def live_owed_tasks(workspace, worker_id) -> list[str]:
 
 
 def _jump(session):
+    """The session rides in device.id, where the terminal jump reads it; the label stays plain."""
     from hitl.schema import Action
-    return Action(id="open_terminal", kind="open_terminal", label=f"Open terminal ({session})")
+    return Action(id="open_terminal", kind="open_terminal", label="Open terminal")
 
 
 def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=proxy_routed,
@@ -173,13 +175,13 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
         # The seat monitor's card for this limit shares the guard, so one card serves both.
         subject.update(episode=tui_gate.LIMIT_EPISODE, remind=False)
         req = choice_request(
-            (f"{seat} (tmux session {session}) owes work and has hit its usage limit. "
+            (f"{seat} owes work and has hit its usage limit. "
              + tui_gate.limit_unblock(session, runtime)),
             [_jump(session)], tui_gate.limit_guard(session), subject, runtime=runtime,
             title=f"{seat} · usage limit", device=device, kind="core-blocked", turn_on_action=False)
     elif which == ps.CARD_HUMAN:
         req = choice_request(
-            (f"{seat} (tmux session {session}) owes work and is waiting at a gate "
+            (f"{seat} owes work and is waiting at a gate "
              "or usage limit. Open its terminal to review the decision."),
             [_jump(session)], f"{SOURCE}:{session}:human", subject, runtime=runtime,
             title=f"{seat} · needs your decision", device=device, kind="core-blocked",
@@ -194,7 +196,7 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
             # Owed only by sentinels whose task is archived or gone: nothing to deliver.
             return {"worker_id": worker_id, "outcome": "cleared", "pane": "no-live-task"}
         cause = sup.delivery_block(socket)
-        body = [f"{seat} (tmux session {session}) owes work, its watcher is running, and its pane "
+        body = [f"{seat} owes work, its watcher is running, and its pane "
                 f"has read idle at the prompt for over {int(ps.UNDELIVERED_AFTER_S // 60)} minutes: "
                 "its task appears not to have been delivered."]
         if cause == "pane-key-fence":
@@ -214,7 +216,7 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
         if pane != ps.PANE_WORKING:
             return {"worker_id": worker_id, "outcome": "cleared", "pane": pane}
         req = choice_request(
-            (f"{seat} (tmux session {session}) owes work and its screen has not changed "
+            (f"{seat} owes work and its screen has not changed "
              "across supervision ticks. Send Escape interrupts the turn; it is typed only "
              "if you press it, and only if the screen is still the same frozen frame."),
             [Action(id=ESCAPE_ACTION, kind="confirmation", label="Send Escape"), _jump(session)],
@@ -230,9 +232,9 @@ def raise_card(workspace, worker_id, which, *, runner=subprocess.run, routed=pro
             abn.retrying or any(n in _PROXY_CAUSES for n in abn.names))
         cause = ", ".join(abn.names)
         if which == ps.CARD_LOGIN:
-            body = [f"{seat} (tmux session {session}) is logged out and its pane shows:"]
+            body = [f"{seat} is logged out and its pane shows:"]
         else:
-            body = [f"{seat} (tmux session {session}) owes work and its pane shows:"]
+            body = [f"{seat} owes work and its pane shows:"]
         body += [f"  {ln}" for ln in lines] + ["", f"Cause: {cause}."]
         if via_proxy:
             body += ["", "This seat is routed through the credential proxy. Restarting the proxy "

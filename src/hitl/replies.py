@@ -27,7 +27,8 @@ except ImportError:
     from local_task_protocol import reply_action_text     # the repo's src/ on sys.path
 
 from .manager import HitlManager
-from .schema import Action, ActionReply, HumanRequirement, MalformedActionError, StaleRequirementError, STATUS_IN_PROGRESS
+from .schema import (Action, ActionReply, HumanRequirement, MalformedActionError, StaleRequirementError,
+                     STATUS_IN_PROGRESS, STATUS_PENDING)
 
 REPLY_FIELD = "space.ag2.hitl.action"
 EVENT_TYPE = "message.created"
@@ -167,6 +168,10 @@ class HitlReplyHandler:
         self.last_outcome = "applied"
         note = ""
         req = self._manager.get(reply.hitl_id)
+        if req is not None and req.status == STATUS_PENDING:
+            # Held for Confirm (or sent Back): the card asked again; nothing runs yet.
+            self._log(f"hitl: {reply.hitl_id} -> {action.id} by {actor} (held: the card asks to confirm)")
+            return claimed
         if req is not None and getattr(req, "turn_on_action", False):
             self.last_turn = True
             note = "; a turn follows"

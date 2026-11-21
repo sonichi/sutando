@@ -77,7 +77,8 @@ class ProjectorTests(unittest.TestCase):
         self.assertEqual(wire["status"], "pending")
         self.assertEqual(wire["revision"], 1)
         self.assertIn("Sutando needs your attention", first["body"])
-        self.assertIn("Qingyun's Air", first["body"])
+        self.assertNotIn("Qingyun's Air", first["body"], "the card names the seat; the body is one line")
+        self.assertNotIn("\n", first["body"])
 
         self.mgr.resolve(req.id)
         project(self.mgr, self.send, ROOM)
@@ -202,14 +203,24 @@ class ProjectorTests(unittest.TestCase):
 
 
 class FallbackWhereTests(unittest.TestCase):
-    def test_the_plain_text_says_which_machine_when_the_host_is_known(self):
+    def test_a_choice_card_without_the_card_still_names_its_replies_and_row(self):
+        from hitl.projector import fallback_body
+        req = make_req(kind="choice", title="", message="Merge cinny #3285?\n\nCI is green.",
+                       subject={"row_link": "https://row.test.invalid/1"},
+                       actions=[Action(id="approve", kind="confirmation", label="Approve"),
+                                Action(id="option-1", kind="confirmation", label="Hold")])
+        self.assertEqual(fallback_body(req), "Sutando needs a decision — Merge cinny #3285?\n"
+                                             "Reply with: Approve · Hold\n"
+                                             "Or set its Status on the row: https://row.test.invalid/1")
+
+    def test_the_plain_text_is_one_line_without_machine_names(self):
         import hitl.schema as SCHEMA
         from hitl.projector import fallback_body
         with mock.patch.object(SCHEMA, "device_host", return_value="Chis-MacBook-Pro"):
-            self.assertIn("(on Chis-MacBook-Pro · Qingyun's Air)", fallback_body(make_req()))
-        with mock.patch.object(SCHEMA, "device_host", return_value=""):
-            self.assertIn("(on Qingyun's Air)", fallback_body(make_req()))
-            self.assertNotIn("(on ", fallback_body(make_req(device=None)))
+            body = fallback_body(make_req(message="Claude Code needs to sign in again\n\nmore detail"))
+        self.assertEqual(body, "⚠ Sutando needs your attention — Claude Code needs to sign in again")
+        for leak in ("Chis-MacBook-Pro", "Qingyun's Air", "(on "):
+            self.assertNotIn(leak, body)
 
 
 class ArchiveTests(unittest.TestCase):
@@ -227,9 +238,11 @@ class ArchiveTests(unittest.TestCase):
     def live(self):
         return sorted(p.stem for p in self.root.glob("hitl_*.json"))
 
-    def settled(self, kind="choice"):
+    def settled(self, kind="choice", reminded=False):
         req = self.mgr.create(make_req(kind=kind))
         project(self.mgr, self.send, ROOM)
+        if reminded:
+            self.mgr.record_notice(req.id, {"reminders": 1})
         self.mgr.resolve(req.id)
         project(self.mgr, self.send, ROOM)
         return req
@@ -241,8 +254,15 @@ class ArchiveTests(unittest.TestCase):
         self.assertTrue((self.mgr.store.archive_root / f"{req.id}.json").exists())
         self.assertEqual(self.mgr.store.archive_root, self.root.with_name("requirements-archive"))
 
-    def test_a_card_whose_recovery_was_sent_is_archived(self):
+    def test_a_card_never_reminded_is_archived_with_no_recovery_message(self):
         req = self.settled(kind="auth")
+        self.assertEqual([p["op"] for p in self.send.sent], ["message", "edit"], "the card, then its edit; no notice")
+        pending_ids(self.mgr)
+        self.assertEqual(self.live(), [])
+        self.assertTrue((self.mgr.store.archive_root / f"{req.id}.json").exists())
+
+    def test_a_card_whose_recovery_was_sent_is_archived(self):
+        req = self.settled(kind="auth", reminded=True)
         self.assertTrue(self.mgr.store.projection(req.id).get("recovered"))
         pending_ids(self.mgr)
         self.assertEqual(self.live(), [])
@@ -274,6 +294,7 @@ class ArchiveTests(unittest.TestCase):
     def test_resolved_with_recovery_owed_stays(self):
         req = self.mgr.create(make_req(kind="auth"))
         project(self.mgr, self.send, ROOM)
+        self.mgr.record_notice(req.id, {"reminders": 1})
         self.mgr.resolve(req.id)
         refuse_notices = lambda payload: (  # noqa: E731
             self.send(payload) if WIRE_FIELD in payload["extra_content"] else {"ok": False})
@@ -470,6 +491,7 @@ class ArchiveTests(unittest.TestCase):
     def test_archive_if_settled_refuses_an_owed_recovery(self):
         req = self.mgr.create(make_req(kind="auth"))
         project(self.mgr, self.send, ROOM)
+        self.mgr.record_notice(req.id, {"reminders": 1})
         self.mgr.resolve(req.id)
         self.mgr.record_projection(req.id, self.mgr.get(req.id).revision, None)
         self.assertFalse(self.mgr.needs_projection(req.id))
@@ -492,6 +514,8 @@ class ArchiveTests(unittest.TestCase):
         a = self.mgr.create(make_req(kind="core-blocked", guard="ga"))
         b = self.mgr.create(make_req(kind="core-blocked", guard="gb"))
         project(self.mgr, self.send, ROOM)
+        for r in (a, b):
+            self.mgr.record_notice(r.id, {"reminders": 1})
         self.mgr.resolve(a.id)
         project(self.mgr, self.send, ROOM)
         self.assertFalse(self.mgr.needs_projection(a.id))

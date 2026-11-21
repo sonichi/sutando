@@ -206,6 +206,8 @@ class HumanActionAdapter:
             return  # a late or duplicate answer changes nothing
         with self.manager.store.locked():
             cur = self.manager.get(action_id)
+            if cur is not None and cur.status == "pending":
+                return  # held for Confirm on the card: not an answer yet
             if cur is not None and not cur.terminal:
                 cur.decided_by = resolved_by
                 self.manager.store.save(cur)

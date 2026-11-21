@@ -188,7 +188,7 @@ _CARD_SURFACE = re.compile(r"ag2[.-]?space")
 
 def _card_projected(signal: dict, surface: str) -> bool:
     """True only when the owner's surface shows the HITL card AND tui_gate gives it option
-    buttons; a trust/bypass/limit dialog or an unparseable prompt keeps the button-less card."""
+    buttons; a trust/bypass/Fable dialog or an unparseable prompt keeps the button-less card."""
     if not surface or not _CARD_SURFACE.search(surface):
         return False
     try:
