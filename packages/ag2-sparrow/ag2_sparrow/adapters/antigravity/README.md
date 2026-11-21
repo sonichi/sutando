@@ -48,10 +48,25 @@ but only `agy acp` is supported here.
 The turn's final message is what Sparrow posts: as the reply in the message's thread for a message
 (`event_type` `room.mention` or absent), or as the post an event's body asks for (`room.joined`,
 `commons.summon`, any other well-formed type). A final message of exactly `NO_REPLY` posts nothing.
-The text is posted with every delivery marker (attachment, redirect, skip, thread) neutralised. When a
+The owner's text keeps its delivery markers, as a Claude Code or Codex result does: a first line
+`[channel: !room:server]` posts in that room, `[thread]` answers in a thread of its own, and
+`[file: <path>]` attaches a file, but only a regular file under the working directory (rewritten to its
+absolute path; any other is neutralised and said not attached). Anyone else's text is posted with every
+delivery marker (attachment, redirect, skip, thread) neutralised, so a non-owner cannot make the agent post
+in another room or attach a file. When a
 turn fails, a message gets a line saying why (timeout, Antigravity stopped, not signed in) with any
 partial text; an event posts nothing. No shell command is granted, so no reply command is either: the
 final message is the only answer path.
+
+## What people send
+
+The files the bridge downloaded for the message (its attested `attachments:` header) go with the turn:
+each PNG, JPEG, GIF or WebP of at most 5 MB (known by its first bytes) as an ACP image block in the
+prompt, when agy declares `promptCapabilities.image` (agy 1.5.13 does). On the owner's turn each file is
+also copied, read-only (0400 in a 0500 folder of the turn's own, removed after it), and the folder is
+passed as `additionalDirectories` when agy declares it; the policy grants reads there and refuses every
+change. Only that task's files are copied, never the bridge's media folder. A non-owner's isolated turn gets
+the images only: no folder, and its deny-all rules stay.
 
 ## Tiers and permissions
 

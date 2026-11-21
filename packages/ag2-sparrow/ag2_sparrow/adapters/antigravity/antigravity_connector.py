@@ -6,9 +6,14 @@ the command, `initialize`, resume the task's Session with `session/load` (else `
 `session/prompt` and wait for it to stop.
 
 `<dir>/tasks/task-*.txt` in, `<dir>/results/<task>.txt` out. The turn's final message is the answer: no
-reply command is granted (no shell command is), and the agent's own text is posted
-with every delivery marker neutralised. A final message of exactly NO_REPLY posts nothing. A message whose
-turn failed gets a line saying so; an event that failed posts nothing.
+reply command is granted (no shell command is). The owner's text keeps its delivery markers, as a Claude Code
+or Codex result does ([channel:], [thread], [file:] for a file under the working directory only); anyone
+else's is posted with every delivery marker neutralised. A final message of exactly NO_REPLY posts nothing. A
+message whose turn failed gets a line saying so; an event that failed posts nothing.
+
+The task's own attachments (acp_host.task_media) go with the turn: images as prompt image blocks, for every
+served tier; on the owner's turn also a read-only copy of each file in a folder of the turn's own, which the
+policy lets agy read and never change. An isolated turn gets no folder.
 
 Sessions, the permission policy and the framing are acp_host's: the owner may read or edit under the working
 directory, no command is ever granted, and only the owner is served unless --allow-non-owner, which admits
@@ -46,6 +51,11 @@ RETRY_S = 60.0
 STDERR_NAME = "agy-acp.stderr"
 NOT_SIGNED_IN = ("Antigravity is not signed in on this computer (%s): run `agy` once in a terminal and sign in, "
                  "or run `agy acp --login`")
+
+
+OWNER_MARKERS = ("Your final message may use Sparrow's delivery markers: [file: /absolute/path] on a line of its "
+                 "own attaches that file (only a file under %s is sent); a first line [channel: !room:server] posts "
+                 "the message in that room instead; a first line [thread] answers in a thread of its own.")
 
 
 READ_ONLY_MODES = frozenset({"plan", "read-only", "readonly", "read_only"})
@@ -105,6 +115,8 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
     out.append("No shell command is granted in this session. %s"
                % ("You may read and edit files under %s." % cwd if headers.get("access_tier") == "owner"
                   else "You may not read or change files."))
+    if headers.get("access_tier") == "owner":
+        out.append(OWNER_MARKERS % cwd)
     return "\n\n".join(out)
 
 
@@ -122,16 +134,20 @@ class Connector:
         The owner's turn resumes the room's Session in the working directory; any other runs `guest_turn`."""
         if owner:
             cwd = self.args.cwd
-            return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
-                                       lambda params: acp_host.decide_permission(params, True, cwd), self.store,
-                                       STDERR_NAME, NOT_SIGNED_IN, log)
-        with guest_turn(self.args) as isolated:
+            with acp_host.task_media(headers, readable=True) as media:
+                read_only = (media.folder,) if media.folder else ()
+                return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
+                                           lambda params: acp_host.decide_permission(params, True, cwd,
+                                                                                      read_only=read_only),
+                                           self.store, STDERR_NAME, NOT_SIGNED_IN, log, media=media)
+        with guest_turn(self.args) as isolated, acp_host.task_media(headers, readable=False) as media:
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
                                        lambda params: acp_host.decide_permission(params, False, isolated.cwd),
-                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=isolated)
+                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=isolated, media=media)
 
     def answer_body(self, headers, status, text, detail):
-        """What Sparrow posts: the turn's own text, quoted so no delivery marker in it acts; NO_REPLY or a
+        """What Sparrow posts: the turn's own text, the owner's with its markers acting (`acp_host.owner_text`),
+        anyone else's quoted so no delivery marker in it acts; NO_REPLY or a
         failed event posts nothing; a failed message gets a line saying why, quoted too (the detail is the
         agent's own error text)."""
         said = (text or "").strip()
@@ -140,6 +156,8 @@ class Connector:
             if said == NO_REPLY:
                 return "[no-send] %s chose not to post\n" % self.name
             if said:
+                if headers.get("access_tier") == "owner":
+                    return acp_host.owner_text(said, self.args.cwd) + "\n"
                 return quoted(said) + "\n"
             return ("%s finished without an answer.\n" % self.name if message
                     else "[no-send] %s handled the event without posting\n" % self.name)

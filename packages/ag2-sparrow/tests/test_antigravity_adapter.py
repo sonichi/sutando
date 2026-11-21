@@ -41,7 +41,8 @@ from ag2_sparrow.result_markers import parse_markers  # noqa: E402
 STUB = str(Path(__file__).resolve().parent / "agy_stub_acp.py")
 
 
-def task_text(tid, body, tier="owner", channel="!room:s.space", event_type=None, collaborator=False):
+def task_text(tid, body, tier="owner", channel="!room:s.space", event_type=None, collaborator=False,
+              attachments=None):
     lines = ["id: " + tid, "timestamp: 2026-11-14T00:00:00Z", "source: ag2space", "channel_id: " + channel,
              "source_room_id: " + channel, "source_message_id: $m-" + tid, "user_id: @alice:s.space",
              "sender_name: Alice", "access_tier: " + tier]
@@ -49,6 +50,8 @@ def task_text(tid, body, tier="owner", channel="!room:s.space", event_type=None,
         lines.append("collaborator: true")
     if event_type:
         lines.append("event_type: " + event_type)
+    if attachments:
+        lines.append("attachments: " + json.dumps(attachments))
     return "\n".join(lines + ["task: " + body]) + "\n"
 
 
@@ -336,6 +339,160 @@ class ConnectorTest(unittest.TestCase):
         self.assertIsNone(self.w.result("task-1"))
         self.w.serve()
         self.assertEqual(self.w.result("task-1"), "hello from agy-stub\n")
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 64
+PDF = b"%PDF-1.4 a report"
+
+
+class MediaAndMarkersTest(unittest.TestCase):
+    """Gaps 5 and 6 of the parity audit: what people send reaches agy, and the owner's markers act."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.w = Work(self.tmp.name)
+        self.media = Path(self.tmp.name) / "bridge-state" / "remote-media"   # outside the working directory
+        self.media.mkdir(parents=True)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def sent(self, tid, verb="STUB:MEDIA", files=(("photo.png", "image/png", PNG), ("report.pdf", "application/pdf",
+                                                                                      PDF)), **kw):
+        refs, body = [], [verb]
+        for name, mime, data in files:
+            p = self.media / ("%s-x1" % name)
+            p.write_bytes(data)
+            refs.append({"locator": str(p), "mime": mime, "filename": name, "size": len(data)})
+            body.append("[%s attached: %s]" % ("Photo" if mime.startswith("image/") else "File", p))
+        self.w.task(tid, " ".join(body), attachments=refs, **kw)
+        return refs
+
+    def prompt_rec(self):
+        return next(r for r in self.w.records() if r.get("method") == "session/prompt")
+
+    def session_dirs(self):
+        return [r["params"].get("additionalDirectories") for r in self.w.records()
+                if r.get("method") in ("session/new", "session/load")]
+
+    def test_owner_image_goes_as_an_image_block_and_files_are_readable_never_writable(self):
+        refs = self.sent("task-1")
+        self.w.serve()
+        blocks = self.prompt_rec()["blocks"]
+        self.assertEqual([b["type"] for b in blocks], ["text", "image", "text"])
+        self.assertEqual(blocks[1], {"type": "image", "mimeType": "image/png", "data": len(
+            __import__("base64").b64encode(PNG))})
+        (dirs,) = self.session_dirs()
+        self.assertEqual(len(dirs), 1)
+        folder = dirs[0]
+        self.assertTrue(os.path.basename(folder).startswith(acp_host.MEDIA_PREFIX), folder)
+        self.assertFalse(folder.startswith(str(self.w.cwd)))
+        reads = {r["read"]: r["bytes"] for r in self.w.records() if "read" in r}
+        self.assertEqual(reads[os.path.join(folder, "photo.png")], len(PNG))
+        self.assertEqual(reads[os.path.join(folder, "report.pdf")], len(PDF))
+        for ref in refs:   # the bridge's own copy, and its folder of every task's media, stay unreadable
+            self.assertIsNone(reads[ref["locator"]])
+        writes = [r for r in self.w.records() if r.get("permission", "").startswith("WriteFile")]
+        self.assertEqual([w["allowed"] for w in writes], [False])
+        self.assertEqual([r["ok"] for r in self.w.records() if "os_write" in r], [False], "the copy is 0400 too")
+        reasons = [d["reason"] for d in self.w.metrics()[0]["permissions"]]
+        self.assertIn("a read of the task's own attachments", reasons)
+        self.assertIn("the task's attachments are read-only", reasons)
+        self.assertFalse(os.path.exists(folder), "the turn's folder is removed")
+        self.assertIn("read-only copy at %s" % os.path.join(folder, "report.pdf"), self.prompt_rec()["text"])
+        self.assertEqual(self.w.result("task-1"), "saw 4 attachment(s)\n")
+
+    def test_without_the_capabilities_no_image_block_and_no_additional_directory(self):
+        (self.w.home / "no-media-caps").write_text("")
+        self.sent("task-1")
+        self.w.serve()
+        self.assertEqual([b["type"] for b in self.prompt_rec()["blocks"]], ["text", "text"])
+        self.assertEqual(self.session_dirs(), [None])
+        self.assertNotIn("shown to you as an image", self.prompt_rec()["text"])
+
+    def test_a_team_sender_on_the_owners_turn_gets_the_folder(self):
+        # #6645 runs an attested collaborator's task as the owner's turn (run_turn(owner=True)); the media rule
+        # follows the turn, so Team gets the same read-only folder there.
+        self.sent("task-1", tier="team", collaborator=True)
+        a = self.w.args()
+        headers, message, ops = task_io.parse_task(str(self.w.root / "tasks" / "task-1.txt"))
+        with contextlib.redirect_stderr(io.StringIO()):
+            status, text, _, turn = gc.Connector(a).run_turn("task-1", headers, "STUB:MEDIA " + message, True)
+        self.assertEqual(status, "completed")
+        (dirs,) = self.session_dirs()
+        self.assertTrue(dirs and os.path.basename(dirs[0]).startswith(acp_host.MEDIA_PREFIX))
+        self.assertIn("a read of the task's own attachments", [d["reason"] for d in turn.decisions])
+
+    def test_an_isolated_turn_gets_its_images_but_no_file_access(self):
+        self.sent("task-1", tier="team", collaborator=True)
+        self.sent("task-2", tier="guest", channel="!b:s.space")
+        os.utime(self.w.root / "tasks" / "task-2.txt", (2e9, 2e9))
+        self.w.serve(2, "--allow-non-owner")
+        prompts = [r for r in self.w.records() if r.get("method") == "session/prompt"]
+        self.assertEqual(len(prompts), 2)
+        for p in prompts:
+            self.assertEqual([b["type"] for b in p["blocks"]], ["text", "image", "text"])
+            self.assertIn("not readable in this session", p["text"])
+            self.assertNotIn("read-only copy at", p["text"])
+        self.assertEqual(self.session_dirs(), [None, None])
+        reads = [r for r in self.w.records() if "read" in r]
+        self.assertTrue(reads)
+        self.assertTrue(all(r["bytes"] is None for r in reads))
+        self.assertFalse([r for r in self.w.records() if r.get("permission") and r["allowed"]])
+
+    def test_only_a_known_image_of_bounded_size_is_an_image_block(self):
+        self.sent("task-1", files=(("fake.png", "image/png", b"not a png"),
+                                   ("big.png", "image/png", PNG + b"\0" * acp_host.MAX_IMAGE_BYTES),
+                                   ("gif.png", "image/png", b"GIF89a" + b"\0" * 16)))
+        headers, _, _ = task_io.parse_task(str(self.w.root / "tasks" / "task-1.txt"))
+        with acp_host.task_media(headers, readable=True) as media:
+            self.assertEqual([(i["_name"], i["mimeType"]) for i in media.images], [("gif.png", "image/gif")])
+            self.assertEqual([f[0] for f in media.files], ["fake.png", "big.png", "gif.png"])
+            self.assertEqual(stat_mode(media.folder), 0o500)
+            self.assertTrue(all(stat_mode(f[3]) == 0o400 for f in media.files))
+        with acp_host.task_media({"attachments": json.dumps([{"locator": "relative/x.png"}])}, True) as media:
+            self.assertEqual(media.files, ())
+
+    def test_the_owners_channel_marker_acts(self):
+        self.w.task("task-1", "STUB:CHANNEL go")
+        self.w.serve()
+        acts = parse_markers(self.w.result("task-1")).actions
+        self.assertEqual([(a.kind, a.value) for a in acts], [("redirect", "!other:s.space")])
+        self.assertIn("[channel: !room:server]", self.prompt_rec()["text"])
+
+    def test_a_team_or_guest_marker_is_neutralised(self):
+        self.w.task("task-1", "STUB:CHANNEL go", tier="team", collaborator=True)
+        self.w.task("task-2", "STUB:ATTACH go", tier="guest", channel="!b:s.space")
+        os.utime(self.w.root / "tasks" / "task-2.txt", (2e9, 2e9))
+        (self.w.cwd / "out.txt").write_text("made")
+        self.w.serve(2, "--allow-non-owner")
+        for tid in ("task-1", "task-2"):
+            self.assertEqual(parse_markers(self.w.result(tid)).actions, [], tid)
+        prompt = self.prompt_rec()["text"]
+        self.assertNotIn("[channel: !room:server]", prompt)
+
+    def test_the_owner_attaches_only_files_under_the_working_directory(self):
+        (self.w.cwd / "out.txt").write_text("made")
+        self.w.task("task-1", "STUB:ATTACH go")
+        self.w.serve()
+        said = self.w.result("task-1")
+        acts = parse_markers(said).actions
+        self.assertEqual([(a.kind, a.value) for a in acts],
+                         [("attach", os.path.realpath(self.w.cwd / "out.txt"))])
+        self.assertIn("not attached: only a file under the working directory is sent", said)
+
+    def test_owner_text_refuses_links_out_missing_files_and_leaves_code_alone(self):
+        cwd = str(self.w.cwd)
+        os.symlink("/etc/passwd", os.path.join(cwd, "link"))
+        for text in ("[file: link]", "[file: nope.txt]", "[file: ../work/state]", "[file: ]"):
+            self.assertEqual(parse_markers(acp_host.owner_text(text, cwd)).actions, [], text)
+        shown = "`[file: /etc/passwd]` and\n```\n[file: /etc/passwd]\n```"
+        self.assertEqual(acp_host.owner_text(shown, cwd), shown)
+        self.assertEqual(acp_host.owner_text("[no-send]", cwd), "[no-send]")
+
+
+def stat_mode(path):
+    return os.stat(path).st_mode & 0o777
 
 
 class EntryTest(unittest.TestCase):
