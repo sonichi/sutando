@@ -130,6 +130,8 @@ fi
 # A watcher on <ws>/deliveries/<id> must not infer the workspace from its
 # inbox; whoever named that inbox names the workspace too (tasks-dir-resolve.sh).
 WORKSPACE_DIR="$(workspace_dir_for_inbox "$TASKS_DIR")"
+# Each start is also on disk: stderr belongs to whoever hosts this watcher, and is gone with it.
+{ mkdir -p "$WORKSPACE_DIR/logs" && printf '%s watch-tasks-stream: started role=%s inbox=%s (watcher pid %s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$WATCHER_ROLE" "$TASKS_DIR_ABS" "$$" >> "$WORKSPACE_DIR/logs/watch-tasks-stream.log"; } 2>/dev/null || true
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 
 # An inherited worker identity (instance id + its routing vars) is cleared, not trusted,
