@@ -371,6 +371,21 @@ def publish_task_event_handler(workspace):
     return cfg
 
 
+def unpublish_task_event_handler(workspace) -> bool:
+    """Withdraw this skill's handler declaration. A config naming any other handler, or one
+    that cannot be read, is left in place: it is not this skill's to remove."""
+    handler = str(Path(__file__).resolve().parent / "pool_route_handler.py")
+    cfg = task_event_handler_config_path(Path(workspace) / "state")
+    try:
+        declared = json.loads(cfg.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(declared, dict) or declared.get("handler") != handler:
+        return False
+    cfg.unlink(missing_ok=True)
+    return True
+
+
 def register_worker(workspace, worker_id: str, label: str, room=None, runtime=None) -> dict:
     """Add a worker to the roster and, if given, bind its room — the one
     production writer for this transaction.
@@ -605,7 +620,8 @@ def set_worker_state(workspace, target: str, state: str, *, unbind: bool = False
 
 def remove_worker(workspace, target: str) -> "tuple[str, dict, dict]":
     """Drop a retired worker's row from the roster. Its identity records and
-    delivery folder stay on disk as history. Returns (worker id, row, roster)."""
+    delivery folder stay on disk as history; the last row gone withdraws the
+    task-event handler. Returns (worker id, row, roster)."""
     with _locked(workspace):
         _, workers, wid = _locked_worker(workspace, target)
         row = workers[wid]
@@ -617,7 +633,11 @@ def remove_worker(workspace, target: str) -> "tuple[str, dict, dict]":
         del workers[wid]
         # The tombstone keeps the retirement fence after the row is gone.
         tombstones = set((_load_existing_roster_strict(workspace) or {}).get("removed") or [])
-        return wid, row, compile_roster(workspace, workers, bindings, removed=tombstones | {wid})
+        roster = compile_roster(workspace, workers, bindings, removed=tombstones | {wid})
+        # Under the same lock a registration publishes under, so a worker joining now keeps it.
+        if not workers:
+            unpublish_task_event_handler(workspace)
+        return wid, row, roster
 
 
 PLUGIN_OK, PLUGIN_MISSING, PLUGIN_INVALID, PLUGIN_REDIRECTED = (

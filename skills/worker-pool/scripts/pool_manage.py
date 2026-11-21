@@ -57,6 +57,7 @@ for _p in (str(_HERE), str(_REPO / "src")):
         sys.path.insert(0, _p)
 
 import pool_remedy as rem  # noqa: E402
+import pool_remedy_timer as prt  # noqa: E402
 
 from workspace_default import resolve_workspace  # noqa: E402
 
@@ -291,9 +292,41 @@ def remove(workspace, target, *, hand_off=False, runner=subprocess.run) -> dict:
         return {"worker_id": wid, "action": "remove", "result": "failed", "sessions": t["sessions"],
                 "why": "tmux could not confirm every session gone; the row was kept"}
     moved = pd.hand_off_to_core(Path(workspace), wid) if hand_off else {"handed_off": []}
-    pr.remove_worker(workspace, wid)
-    return {"worker_id": wid, "action": "remove", "result": "removed", "sessions": t["sessions"],
-            "label": pr.display_label(row, wid), "handed_off": moved["handed_off"]}
+    _, _, roster = pr.remove_worker(workspace, wid)
+    out = {"worker_id": wid, "action": "remove", "result": "removed", "sessions": t["sessions"],
+           "label": pr.display_label(row, wid), "handed_off": moved["handed_off"]}
+    if not roster.get("workers"):
+        out["remedy_timer"] = withdraw_remedy_timer(workspace)
+    return out
+
+
+def withdraw_remedy_timer(workspace, *, launch_agents=None, runner=None) -> dict:
+    """An empty pool's timer has nothing to resume. Never raises: the worker is already gone,
+    and a timer left behind must not make the removal read as failed."""
+    if sys.platform != "darwin":
+        return {"removed": False, "why": "launchd is macOS-only"}
+    try:
+        with prt.timer_lock(launch_agents):
+            # A spawn ensures the timer under this lock after its run is open but before its row
+            # exists, so an open unrostered run counts as a worker here.
+            roster = pr.load_roster(workspace)
+            if roster is None or roster.get("workers"):
+                return {"removed": False, "why": "the pool has workers again, or its roster cannot be read"}
+            starting = _unrostered_live_runs(workspace, roster)
+            if starting:
+                return {"removed": False, "why": f"worker(s) still starting: {', '.join(starting)}"}
+            return prt.uninstall(workspace, launch_agents=launch_agents, runner=runner)
+    except Exception as e:
+        return {"removed": False, "why": f"{type(e).__name__}: {e}"}
+
+
+def _unrostered_live_runs(workspace, roster) -> list:
+    """Worker records with an open run that the roster neither lists nor has removed."""
+    d = Path(workspace) / "state" / "workers"
+    known = set(roster.get("workers") or {}) | set(roster.get("removed") or [])
+    return sorted(p.name for p in (d.iterdir() if d.is_dir() else ())
+                  if p.is_dir() and wi.WORKER_ID_RE.match(p.name) and p.name not in known
+                  and wi.current(workspace, p.name).get("incarnation_id"))
 
 
 def listing(workspace, *, runner=subprocess.run) -> list:
