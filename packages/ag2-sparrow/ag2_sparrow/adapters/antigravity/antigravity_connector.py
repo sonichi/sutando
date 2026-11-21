@@ -8,7 +8,9 @@ the command, `initialize`, resume the task's Session with `session/load` (else `
 `<dir>/tasks/task-*.txt` in, `<dir>/results/<task>.txt` out. The turn's final message is the answer: no
 reply command is granted (no shell command is), and the agent's own text is posted
 with every delivery marker neutralised. A final message of exactly NO_REPLY posts nothing. A message whose
-turn failed gets a line saying so; an event that failed posts nothing.
+turn failed gets a line saying so; an event that failed posts nothing. The gateway's SKILL INSTRUCTIONS
+prelude (run a room-read command, write results/<task>.txt) is for a core with a shell: its steps are not
+passed on (`session_lines`). A turn that ends with no text says what it did instead (`no_answer_why`).
 
 Sessions, the permission policy and the framing are acp_host's: the owner may read or edit under the working
 directory, no command is ever granted, and only the owner is served unless --allow-non-owner, which admits
@@ -23,6 +25,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -94,9 +97,60 @@ def guest_turn(args):
         shutil.rmtree(base, ignore_errors=True)
 
 
+PRELUDE_HEADER = "===SKILL INSTRUCTIONS"
+PRELUDE_STEP_RE = re.compile(r"\d+\. ")
+PRELUDE_KEPT = "ADDRESSING:"
+
+
+def session_lines(operator_lines):
+    """The bridge-written lines this Session can follow. The gateway's SKILL INSTRUCTIONS prelude tells a core
+    to run a room-read command and to write results/<task>.txt; neither is granted here, and agy, told to
+    write that file, asks to, is refused and ends its turn with no text. So the prelude's header and numbered
+    steps are dropped; only its ADDRESSING step is kept, its `[no-send]` said as this adapter's NO_REPLY.
+    Every line outside the prelude is kept."""
+    out, in_prelude = [], False
+    for line in operator_lines:
+        if line.startswith(PRELUDE_HEADER):
+            in_prelude = True
+            continue
+        step = PRELUDE_STEP_RE.match(line) if in_prelude else None
+        if step is None:
+            in_prelude = False
+            out.append(line)
+        elif line[step.end():].startswith(PRELUDE_KEPT):
+            out.append(line[step.end():].replace("[no-send]", "a final message of exactly %s" % NO_REPLY))
+    return out
+
+
+CATEGORY_ORDER = ("file change", "file read", "command", "web fetch", "other")
+SAID_STOPS = frozenset({"max_tokens", "max_turn_requests"})
+
+
+def no_answer_why(detail, turn):
+    """What a completed turn with no text did instead, for the line posted in the room in its place. It is
+    built only from fixed words and counts: the refused permission requests by `acp_host.action_category`,
+    the tool calls, and a stop reason from SAID_STOPS (any other but end_turn reads "other"). The policy's
+    reasons quote the agent's own request (a key, a kind, a path), so they stay in metrics.jsonl."""
+    if turn is None:
+        return ""
+    why = []
+    refused = [d.get("category") for d in turn.decisions if not d.get("allowed")]
+    for category in CATEGORY_ORDER:
+        n = sum(1 for c in refused if (c if c in CATEGORY_ORDER else "other") == category)
+        if n:
+            why.append("%d %s%s %s not granted" % (n, category, "" if n == 1 else "s", "was" if n == 1 else "were"))
+    calls = turn.updates.get("tool_call", 0)
+    if calls:
+        why.append("it made %d tool call%s" % (calls, "" if calls == 1 else "s"))
+    if detail and detail != "end_turn":
+        why.append("stop reason %s" % (detail if detail in SAID_STOPS else "other"))
+    return "; ".join(why)
+
+
 def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_NOTE):
     event, _ = trigger_of(headers)
-    out = acp_host.task_framing(task_id, headers, message, operator_lines, "post in your final message", note)
+    out = acp_host.task_framing(task_id, headers, message, session_lines(operator_lines),
+                                "post in your final message", note)
     out.append("Answer through Sparrow, exactly once for this task: your final message in this turn is what Sparrow "
                "posts%s. Write it as the post itself, with no preamble about tools or steps. To post nothing (an "
                "acknowledgement, thanks or FYI that needs no answer, or an event whose body asks for no post), make "
@@ -130,10 +184,11 @@ class Connector:
                                        lambda params: acp_host.decide_permission(params, False, isolated.cwd),
                                        self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=isolated)
 
-    def answer_body(self, headers, status, text, detail):
+    def answer_body(self, headers, status, text, detail, turn=None):
         """What Sparrow posts: the turn's own text, quoted so no delivery marker in it acts; NO_REPLY or a
         failed event posts nothing; a failed message gets a line saying why, quoted too (the detail is the
-        agent's own error text)."""
+        agent's own error text). A message whose turn completed with no text gets a line saying so and, with
+        `turn`, what the turn did instead."""
         said = (text or "").strip()
         message = acp_host.is_message(headers)
         if status == "completed":
@@ -141,8 +196,10 @@ class Connector:
                 return "[no-send] %s chose not to post\n" % self.name
             if said:
                 return quoted(said) + "\n"
-            return ("%s finished without an answer.\n" % self.name if message
-                    else "[no-send] %s handled the event without posting\n" % self.name)
+            if not message:
+                return "[no-send] %s handled the event without posting\n" % self.name
+            why = no_answer_why(detail, turn)
+            return quoted("%s finished without an answer%s" % (self.name, ": %s." % why if why else ".")) + "\n"
         if not message:
             return "[no-send] %s handled the event without posting" % self.name + quoted(
                 " (%s: %s)" % (status, detail[:120])) + "\n"
@@ -168,10 +225,10 @@ class Connector:
         log("wake ->", task_id, headers["access_tier"], event or "message")
         t0 = time.time()
         status, text, detail, turn = self.run_turn(task_id, headers, prompt, tier == "owner")
-        publish(result_file, self.answer_body(headers, status, text, detail))
+        publish(result_file, self.answer_body(headers, status, text, detail, turn))
         return {"task": task_id, "status": status, "detail": detail[:200], "event_type": event,
                 "tier": headers["access_tier"], "isolated": tier != "owner", "turn_s": round(time.time() - t0, 3),
-                "permissions": turn.decisions}
+                "permissions": turn.decisions, "updates": dict(turn.updates), "answer_chars": len(text or "")}
 
     def pending_tasks(self, seen):
         now = time.time()
