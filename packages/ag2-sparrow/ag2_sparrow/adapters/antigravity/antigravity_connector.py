@@ -331,15 +331,15 @@ def build_parser():
     ap.add_argument("--root-fd", type=int, default=None, help="with --held: the held root's directory descriptor")
     ap.add_argument("--acp-command", default=None, help="the ACP agent's command line (default: agy acp)")
     ap.add_argument("--cwd", default=None, help="the Session working directory (default: the current directory)")
+    ap.add_argument("--token-env-file", default=None,
+                    help="the agent's own token .env (its bridge's): owner and team turns get the ag2-space MCP "
+                         "tools as this agent, minted from it per turn (default: no MCP tools)")
+    ap.add_argument("--agent-id", default=None, help="the agent's Matrix ID, to check a seat .env against")
     ap.add_argument("--session-store", default=None,
                     help="the sessions.json to resume from and record to (default: <work>/state/sessions.json)")
     ap.add_argument("--allow-non-owner", action="store_true",
                     help="serve non-owner senders, attested collaborators included, on the owner's agy sign-in "
                          "(no file operations granted; default: the owner only)")
-    ap.add_argument("--token-env-file", default=None,
-                    help="the agent's own token .env (its bridge's): owner and team turns get the ag2-space MCP tools as this "
-                         "agent, minted from it per turn (default: no MCP tools)")
-    ap.add_argument("--agent-id", default=None, help="the agent's Matrix ID, to check a seat .env against")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=0.2)
