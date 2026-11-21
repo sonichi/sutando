@@ -36,7 +36,12 @@ Each grant runs on its own cadence: a fire finds the grants that are due and run
 The slot key is C3's (`notes/c3-durable-dispatch-contract`): `cron:<grant_id>:<slot_ts>`, the
 slot taken from the grant's cadence, never from the time the run starts. Catch-up is `latest`:
 a runner that was down for several slots runs the current one only. Every retry of a slot
-carries the same key, and the backend writes a key once.
+carries the same key. The backend remembers its most recent run keys (16 per grant) and writes
+none of them twice (`feeds.write` only; a repeated `feeds.fail` records the latest error again).
+The 16 is the backend's room-commons `RUN_MEMORY`; the feed Actions are on its dev branch only. Step 3's `current` check sends a run only while its slot is current. That is
+a best-effort check before sending, not a fence where the write is accepted: a request paused
+after the check can arrive once 16 newer runs have pushed its key out, and then write again.
+Deduplication holds only while the key is among those 16.
 
 ## One fire
 
@@ -60,18 +65,24 @@ Work in a fresh temporary directory; `$S` is `skills/commons-feed-runner/scripts
       means the slot was handled: go to the next run.
    2. `composio_exec` with `run.connector.toolkit`, `run.connector.action` and
       `run.connector.arguments`, exactly. Save the whole reply to `connector.json`.
-   3. `python3 $S/feed_runner.py rows run.json connector.json > write.json`. Exit 1 means the
+   3. `python3 $S/feed_runner.py current run.json`. Exit 1 means the run's slot has passed: close
+      the task `no_action` with the outcome "A newer slot refreshes the feed", and go on to the
+      next run. Run this check again right before each call in steps 3 and 4.
+      `python3 $S/feed_runner.py rows run.json connector.json > write.json`. Exit 1 means the
       run cannot write. When step 0 said `report_failures: true`, report why, so the app shows an error instead of old rows looking fresh:
       `python3 $S/feed_runner.py fail run.json connector.json > fail.json`, then
       `room.action.execute` `room.commons.feeds.fail` with the arguments in `fail.json` (a
       closed code, never the connector's text), the task's `task_id` and
-      `execution_generation`, and `operation_id` = the run key + `:fail`. Close the task
+      `execution_generation`, and `operation_id` from `python3 $S/feed_runner.py opid fail.json`.
+      Close the task
       `failed` with the outcome "The feed refresh could not read its source". For
       `connector_not_connected`, also tell the owner in your DM with them, once a day at most,
       that their account needs connecting. Then go on to the next run.
    4. `room.action.execute` `room.commons.feeds.write` in `run.room_id` with the arguments in
-      `write.json`, `task_id` and `execution_generation` from step 1, and `operation_id` =
-      the run key. Save the whole reply, success or refusal, to `result.json`.
+      `write.json`, `task_id` and `execution_generation` from step 1, and `operation_id` from
+      `python3 $S/feed_runner.py opid write.json` (the run key plus a hash of the rows: a retry
+      that re-ran the connector and got other rows is a new operation; within the backend's
+      run-key history it still writes the slot only once). Save the whole reply, success or refusal, to `result.json`.
    5. `python3 $S/feed_runner.py outcome result.json`. Close the task with its `task_status` and
       `outcome` (`room.task.update`). `wait` means the backend's schedule is ahead of yours;
       `stop` means the grant was revoked, paused or expired: there is nothing to do but close.

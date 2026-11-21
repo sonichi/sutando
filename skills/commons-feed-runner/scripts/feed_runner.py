@@ -10,6 +10,8 @@ judgment. It never calls anything itself and holds no state.
   rows    <run.json> <composio.json>    the feeds.write arguments for one run
   outcome <write.json>                  done, wait (retry_after_s), stop or fail
   fail    <run.json> <connector.json>   the feeds.fail arguments for a run that could not write
+  opid    <write.json | fail.json>      the operation_id to send those arguments with
+  current <run.json>                    whether the run's slot is still the current one
   capable <describe.json>               whether this backend takes room.commons.feeds.fail
 
 Each JSON file is a tool's whole reply as it came back, wrapper included. The backend holds
@@ -19,6 +21,7 @@ for what the grant does not cover.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import re
 import sys
@@ -92,11 +95,23 @@ def _ms(value) -> int | None:
     return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
+def slot_until(every_minutes: int, now_ms: int) -> int:
+    """When the current slot of this cadence ends (epoch ms)."""
+    every_ms = every_minutes * 60_000
+    return now_ms // every_ms * every_ms + every_ms
+
+
+# The backend dedupes a grant's run keys only while one is among its newest RUN_KEY_HISTORY.
+# A request paused past `current` can arrive after its key left that history and write again.
+RUN_KEY_HISTORY = 16
+
+
 def slot_key(grant_id: str, every_minutes: int, now_ms: int) -> str:
     """C3's slot key for the grant's schedule: cron:<trigger>:<slot_ts>, the trigger being the
     grant. Derived from the schedule, never from when the run happens to start, so every retry
-    of one slot carries the same key and the backend writes it once. Catch-up is `latest`: a
-    runner that was down for several slots runs only the current one."""
+    of one slot carries the same key, which the backend dedupes while it is among the last
+    RUN_KEY_HISTORY keys. Catch-up is `latest`: a runner that was down for several slots runs only the
+    current one."""
     every_ms = every_minutes * 60_000
     return f"cron:{grant_id}:{now_ms // every_ms * every_ms}"
 
@@ -163,6 +178,7 @@ def due(me: str, replies: list, now_ms: int) -> dict:
                 skipped.append({"room_id": room, "grant_id": gid, "why": str(exc)})
                 continue
             runs.append({"room_id": room, "grant_id": gid, "run_key": key, "kind": kind,
+                         "slot_until": slot_until(every, now_ms),
                          "fields": list(grant.get("fields") or []),
                          "max_rows": grant["max_rows"], "connector": call,
                          "task": {"idempotency_key": key, "source_kind": "proactive_cron",
@@ -329,6 +345,34 @@ def failure(run: dict, reply) -> dict:
     return {"grant_id": run["grant_id"], "run_key": run["run_key"], "code": code}
 
 
+def current(run: dict, now_ms: int) -> dict:
+    """{"current": True} while the run's slot has not ended, else Refused: a best-effort check
+    before sending, not a fence where the write is accepted (see RUN_KEY_HISTORY)."""
+    until = run.get("slot_until")
+    if isinstance(until, bool) or not isinstance(until, int):
+        raise Refused("the run has no slot_until; plan it again with due")
+    if now_ms >= until:
+        raise Refused("the run's slot has passed; the next slot refreshes the feed")
+    return {"current": True}
+
+
+def operation_id(arguments: dict) -> dict:
+    """The run key plus a hash of the rows (or failure code) sent: the backend binds an id to its
+    first arguments, so other rows need another id. Hashed exactly as sent, in the read's order."""
+    run_key = arguments.get("run_key")
+    if not isinstance(run_key, str) or not run_key:
+        raise Refused("the arguments have no run_key")
+    if "rows" in arguments:
+        part, payload = "rows", arguments["rows"]
+    elif "code" in arguments:
+        part, payload = "fail", arguments["code"]
+    else:
+        raise Refused("the arguments are neither a write (rows) nor a failure (code)")
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    digest = hashlib.sha256(canonical.encode()).hexdigest()[:16]
+    return {"operation_id": f"{run_key}:{part}:{digest}"}
+
+
 def capable(reply) -> dict:
     """Whether the backend offers this agent room.commons.feeds.fail, from room.actions.describe's
     reply (an unknown Action answers a refusal). A backend from before it still takes writes:
@@ -393,7 +437,8 @@ def _read(path: str):
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2 or argv[1] not in ("due", "rows", "outcome", "fail", "capable"):
+    if len(argv) < 2 or argv[1] not in ("due", "rows", "outcome", "fail", "opid", "current",
+                                        "capable"):
         print(__doc__.strip(), file=sys.stderr)
         return 2
     now_ms = int(datetime.datetime.now(UTC).timestamp() * 1000)
@@ -409,6 +454,10 @@ def main(argv: list[str]) -> int:
             answer = outcome(_read(argv[2]))
         elif argv[1] == "fail" and len(argv) == 4:
             answer = failure(_read(argv[2]), _read(argv[3]))
+        elif argv[1] == "opid" and len(argv) == 3:
+            answer = operation_id(_read(argv[2]))
+        elif argv[1] == "current" and len(argv) == 3:
+            answer = current(_read(argv[2]), now_ms)
         elif argv[1] == "capable" and len(argv) == 3:
             answer = capable(_read(argv[2]))
         else:
