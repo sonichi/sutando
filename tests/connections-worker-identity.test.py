@@ -890,30 +890,40 @@ class TwoServers(Base):
                          (False, True))
         self.assertEqual((worker_lane.is_worker_note_lane(a, W, ALPHA_ROOM, self.ws), worker_lane.is_worker_note_lane(b, W, ALPHA_ROOM, self.ws)),
                          (True, False))
-        for room in ("", "!r:gamma-fixture.net"):
-            self.assertEqual((worker_lane.is_worker_note_lane(a, W, room, self.ws), worker_lane.is_worker_note_lane(b, W, room, self.ws)),
-                             (True, False), f"{room!r}: no identity there, so the home lane")
+        self.assertEqual((worker_lane.is_worker_note_lane(a, W, "", self.ws), worker_lane.is_worker_note_lane(b, W, "", self.ws)),
+                         (True, False), "a note naming no room goes from the home lane")
+        self.assertEqual((worker_lane.is_worker_note_lane(a, W, "!r:gamma-fixture.net", self.ws),
+                          worker_lane.is_worker_note_lane(b, W, "!r:gamma-fixture.net", self.ws)),
+                         (False, False), "no identity on the room's server: unclaimed, never the home lane")
+        with unittest.mock.patch.object(C, "_stop_row", lambda row, ws, kill: 0):
+            C.disconnect(b, workspace=self.ws, kill=lambda *a: None)
+        self.assertEqual((worker_lane.is_worker_note_lane(a, W, BETA_ROOM, self.ws), worker_lane.is_worker_note_lane(b, W, BETA_ROOM, self.ws)),
+                         (False, False), "the room's server's identity is disabled: unclaimed, never the home lane")
+        self.assertEqual(worker_lane.is_worker_note_lane(a, W, "", self.ws), True)
 
     def test_the_bridges_worker_gate_picks_one_lane_per_note(self):
-        """Through the gateway bridge's own claim gate: each note has exactly one claiming lane."""
+        """Through the gate the gateway bridge installs as each lane: each note has at most one claiming lane."""
         rgb = _load_shim()
-        saved = {k: getattr(rgb, k) for k in ("WS", "GATEWAY_INSTANCE")}
+        saved = {k: getattr(rgb, k) for k in ("WS", "GATEWAY_INSTANCE", "_OWN_DIRS", "PROACTIVE_CLAIM_GATE",
+                                              "PROACTIVE_OWN_FILE", "TASK_ADDRESSEE", "TASK_PRE_PUBLISH", "_log")}
         self.addCleanup(lambda: [setattr(rgb, k, v) for k, v in saved.items()])
-        rgb.WS = self.ws
+        # Shared folders: the gate is the same either way, and no adopt thread is started.
+        rgb.WS, rgb._OWN_DIRS, rgb._log = self.ws, False, lambda *a: None
         results = self.ws / "results"
         results.mkdir(exist_ok=True)
-        notes = {"room-beta": (f"[channel: {BETA_ROOM}]\nfor beta\n", self.beta["instance"]),
-                 "room-alpha": (f"[channel: {ALPHA_ROOM}]\nfor alpha\n", self.alpha["instance"]),
-                 "unaddressed": ("hello owner\n", self.alpha["instance"])}
-        for i, (key, (body, owner)) in enumerate(notes.items()):
+        gates = {}
+        for lane in (self.alpha["instance"], self.beta["instance"]):
+            rgb.GATEWAY_INSTANCE = lane
+            rgb._install_worker_lane(W)
+            gates[lane] = rgb.PROACTIVE_CLAIM_GATE
+        notes = {"room-beta": (f"[channel: {BETA_ROOM}]\nfor beta\n", [self.beta["instance"]]),
+                 "room-alpha": (f"[channel: {ALPHA_ROOM}]\nfor alpha\n", [self.alpha["instance"]]),
+                 "room-gamma": ("[channel: !r:gamma-fixture.net]\nfor gamma\n", []),
+                 "unaddressed": ("hello owner\n", [self.alpha["instance"]])}
+        for i, (key, (body, owners)) in enumerate(notes.items()):
             path = results / f"proactive-{i}.by-{W}.txt"
             path.write_text(body)
-            claimants = []
-            for lane in (self.alpha["instance"], self.beta["instance"]):
-                rgb.GATEWAY_INSTANCE = lane
-                if worker_lane.claim_gate(W, instance=lane, workspace=self.ws, route=rgb._proactive_route)(path):
-                    claimants.append(lane)
-            self.assertEqual(claimants, [owner], key)
+            self.assertEqual([lane for lane, gate in gates.items() if gate(path)], owners, key)
 
     def test_a_partial_retire_names_what_it_removed(self):
         real = C.remove_connection

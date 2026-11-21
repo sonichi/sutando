@@ -249,13 +249,14 @@ def is_worker_home_lane(instance: str, worker: str, workspace=None) -> bool:
 
 
 def is_worker_note_lane(instance: str, worker: str, room_id: str = "", workspace=None) -> bool:
-    """Room-addressed notes use that server's identity; other notes use the home lane."""
+    """Room-addressed notes use only that server's serving identity, so with none they stay unclaimed;
+    notes naming no server use the home lane."""
     from connections import server_of_room, worker_identity, _serving, alias_instances
     server = server_of_room(room_id or "")
-    row = worker_identity(worker, workspace, server=server) if server else None
-    if row is not None and _serving(row):
-        return instance in [str(row["instance"])] + alias_instances(row)
-    return is_worker_home_lane(instance, worker, workspace)
+    if not server:
+        return is_worker_home_lane(instance, worker, workspace)
+    row = worker_identity(worker, workspace, server=server)
+    return row is not None and _serving(row) and instance in [str(row["instance"])] + alias_instances(row)
 
 
 def claim_gate(worker: str, *, instance: str = "", workspace=None, route=None):

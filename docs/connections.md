@@ -632,8 +632,9 @@ publishes it through `result_publish.py`, which stamps the name
 worker acting through the core publishes the name unchanged, and a core lane sends it as before.
 The one claim rule is `proactive_routing.lane_claims_proactive(name, lane_worker)`: a stamped file
 is claimed only by the lane running as that worker (with an identity on several servers, by one of
-them, `connections.is_worker_note_lane`: the lane on the server of the room the note names, else
-its home lane, the identity on the primary's server; a note with no home is refused at publish), which posts it as the worker's agent into that
+them, `worker_lane.is_worker_note_lane`: the lane serving the worker on the server of the room the note
+names, and none when no identity serves there; a note naming no room goes from its home lane, the
+identity on the primary's server; a note with no home is refused at publish), which posts it as the worker's agent into that
 agent's own owner DM; a core lane and every other bridge (Discord, Slack, Telegram, their
 fallbacks) refuse it, and a worker's lane claims nothing unstamped. The gateway's drain asks its
 host (`PROACTIVE_OWN_FILE`) whether an owner-directed file is the lane's own, so a worker's lane
