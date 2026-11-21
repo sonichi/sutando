@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manage the pool's workers: list, stop, retire, enable, remove, reseat, plugins, bind, unbind.
+"""Manage the pool's workers: list, stop, retire, enable, remove, reseat, plugins, set-model, bind, unbind.
 
 The owner's (or the agent's, on the owner's behalf) one supported way to take a
 worker out of service and bring it back. Each verb goes through the writer that
@@ -17,8 +17,9 @@ already owns its fact, so the remedy, the sweep and the router honour it:
             and vault secret (connections.retire_worker_identity).
     enable  lift both, then the owner restart (pool_remedy.restart).
     remove  drop a retired worker's roster row; its records stay on disk.
-    reseat  restart a running seat that owes nothing, so its tools pick up an
-            agent identity added after it started; one that owes work is left.
+    reseat  restart a running seat that owes nothing, so what a seat decides at start
+            (its agent identity, plugin dirs, model) is decided again; one that owes
+            work is left.
     bind    bind a room to a worker on the shared folders (pool_roster.bind_room), so the
             router delivers that room's tasks to it; a worker on its own folders is refused,
             since the router never delivers to one.
@@ -27,6 +28,11 @@ already owns its fact, so the remedy, the sweep and the router honour it:
             .claude-plugin/plugin.json) that every launch and reseat of this worker
             loads with --plugin-dir. The owner's opt-in: run it only on their word.
             It takes effect at the next start; `reseat` applies it now.
+    set-model record the --model this worker launches with (`--clear` drops it, back to
+            the pool default WORKER_POOL_DEFAULT_MODEL), then reseat its running seat so
+            it applies now; a seat that owes work keeps its model until its next start.
+            It never sends /model: /model rewrites the shared settings.json default even
+            in a session started with --model, which changes every unpinned session.
 
     python3 pool_manage.py [--workspace WS] [--repo REPO] list [--json]
     python3 pool_manage.py [--workspace WS] stop   <worker id or label> [--force]
@@ -36,6 +42,7 @@ already owns its fact, so the remedy, the sweep and the router honour it:
     python3 pool_manage.py [--workspace WS] [--repo REPO] reseat <worker>
     python3 pool_manage.py [--workspace WS] plugins <worker> add|remove <dir>
     python3 pool_manage.py [--workspace WS] plugins <worker> list
+    python3 pool_manage.py [--workspace WS] [--repo REPO] set-model <worker> <model> | --clear
     python3 pool_manage.py [--workspace WS] bind <room id> <worker id or label>
     python3 pool_manage.py [--workspace WS] unbind <room id>
 
@@ -44,6 +51,7 @@ Every verb prints one JSON line. Exit 0 done, 1 failed, 2 refused.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import subprocess
@@ -102,6 +110,18 @@ def _outstanding(workspace, wid) -> list:
     return sorted(t for t, _ in _owed_residue(workspace, wid))
 
 
+def _owes(workspace, wid) -> list:
+    """Every task the worker owes, its own inbox's and any shared sentinel it kept from before a move to
+    its own folders; `_outstanding` lists only shared ones. Refused when unreadable, never read as none."""
+    import connections
+    try:
+        own = sup.owed_task_ids(workspace, wid, strict=True)
+        return sorted(set(own) | set(sup.sentinel_ids(workspace, wid)[0]))
+    except (OSError, ValueError, connections.ConnectionsError):
+        raise Refused(f"cannot tell what {wid} still owes (its folders, deliveries, inbox or results "
+                      "unreadable)") from None
+
+
 def _owed_residue(workspace, wid):
     for p in pd.accepted(Path(workspace), wid) + pd.pending(Path(workspace), wid):
         task_id = pd.parse_sentinel(p.name)[0]
@@ -131,12 +151,24 @@ def stop_sessions(workspace, worker_id, *, runner=subprocess.run) -> dict:
     return out
 
 
-def _take_down(workspace, wid, runner) -> dict:
+def _take_down(workspace, wid, runner, *, unless_owed=None) -> dict:
     """Pause, kill, close the run. The pause lands under the remedy's lock first, so a
-    sweep in flight cannot restart what is being stopped."""
-    with rem.pool_lock(workspace, STOP_LOCK_WAIT_S):
+    sweep in flight cannot restart what is being stopped. `unless_owed` is asked again with the
+    worker's deliveries folder locked too, the lock every delivery to it takes, and that lock is
+    held until the seat is killed: work it names leaves the seat running, returned under `owed`."""
+    with rem.pool_lock(workspace, STOP_LOCK_WAIT_S), contextlib.ExitStack() as fence:
+        if unless_owed:
+            try:
+                fence.enter_context(pd.arbitration(workspace, wid))
+            except OSError as e:
+                raise Refused(f"cannot lock {wid}'s deliveries folder ({e.strerror or e}); "
+                              "its seat was left running") from None
+            owed = unless_owed()
+            if owed:
+                return {"sessions": {}, "closed_runs": [], "down": False, "owed": owed}
         sup.set_paused(workspace, wid, True)
         sessions = stop_sessions(workspace, wid, runner=runner)
+        fence.close()
         down = all(v != "unknown" for v in sessions.values())
         # A seat tmux could not confirm gone keeps its run open, so supervision still sees it.
         closed = rem.close_dead_runs(workspace, wid, end_reason="killed") if down else []
@@ -146,12 +178,16 @@ def _take_down(workspace, wid, runner) -> dict:
 def stop(workspace, target, *, force=False, runner=subprocess.run) -> dict:
     wid, _ = _worker(workspace, target)
     _not_self(wid, force)
-    owed = _outstanding(workspace, wid)
-    if owed and not force:
+    def refuse(owed):
         raise Refused(f"{wid} still owes {len(owed)} task(s): {', '.join(owed)}; "
                       "pass --force to stop it anyway (they wait for enable), "
                       "or retire --hand-off to give them to the core")
-    t = _take_down(workspace, wid, runner)
+    owed = _outstanding(workspace, wid)
+    if owed and not force:
+        refuse(owed)
+    t = _take_down(workspace, wid, runner, unless_owed=None if force else lambda: _outstanding(workspace, wid))
+    if t.get("owed"):
+        refuse(t["owed"])
     return {"worker_id": wid, "action": "stop", "result": "stopped" if t["down"] else "failed",
             "paused": True, "sessions": t["sessions"], "closed_runs": t["closed_runs"],
             "owed_kept": owed,
@@ -236,23 +272,24 @@ def enable(workspace, repo, target, *, start=True, runner=None, spawn=None) -> d
 
 
 def reseat(workspace, repo, target, *, runner=subprocess.run, spawn=None) -> dict:
-    """Restart `target`'s running seat so its s-space tools re-decide whom they act as: they decide once,
-    at start, and a seat started before the worker had its own agent keeps acting as the core's."""
+    """Restart `target`'s running seat, resuming its conversation, so what a seat decides once at start
+    is decided again: whom its s-space tools act as, its plugin dirs, its --model."""
     wid, row = _worker(workspace, target)
     base = {"worker_id": wid, "action": "reseat"}
     if row.get("state") == "retired" or sup.is_paused(workspace, wid):
-        return {**base, "result": "skipped", "why": "stopped or retired; it starts as its new identity when enabled"}
+        return {**base, "result": "skipped", "why": "stopped or retired; it starts with the change when enabled"}
     socket = sup.run_socket(workspace, wid)
     seat = wi.tmux_session_name(wid)
     if socket is None or sw.session_state(seat, socket, runner=runner) != "exists":
-        return {**base, "result": "skipped", "why": "no seat running; it starts as its new identity"}
+        return {**base, "result": "skipped", "why": "no seat running; its next start applies the change"}
     _not_self(wid, False)
-    owed = _outstanding(workspace, wid)
-    if owed:
+    owed = _owes(workspace, wid)
+    t = None if owed else _take_down(workspace, wid, runner, unless_owed=lambda: _owes(workspace, wid))
+    if owed or t.get("owed"):
+        owed = owed or t["owed"]
         return {**base, "result": "deferred", "owed": owed,
                 "why": f"it owes {len(owed)} task(s), so its seat was left running as before; once they are "
                        f"done, run: pool_manage.py reseat {wid}"}
-    t = _take_down(workspace, wid, runner)
     if not t["down"]:
         return {**base, "result": "failed", "sessions": t["sessions"],
                 "why": "tmux could not confirm the seat gone; the worker is stopped: run pool_manage.py enable"}
@@ -276,6 +313,41 @@ def plugins(workspace, target, op: str, path: str = "") -> dict:
     result = ("added" if op == "add" else "removed") if roster is not None else "unchanged"
     return {**base, "result": result, "plugin_dirs": dirs,
             "applies": "at this worker's next start; pool_manage.py reseat applies it now"}
+
+
+def set_model(workspace, repo, target, model=None, *, runner=subprocess.run, spawn=None) -> dict:
+    """Record `target`'s model (None drops it) and reseat its running seat with the new --model.
+    Only that worker's row and seat change; the shared settings.json default is never touched.
+    A worker on its own folders is not restarted: its own lane writes its inbox under no lock the
+    restart can hold, so a task could start and be killed. Its next start applies the model."""
+    import connections
+    wid, before, roster = pr.set_worker_model(workspace, target, model)
+    out = {"worker_id": wid, "action": "set-model", "recorded": model, "previous": before,
+           "model": pr.worker_model(workspace, wid)}
+    try:
+        own = connections.worker_dirs(wid, Path(workspace), strict=True) is not None
+    except (OSError, ValueError, connections.ConnectionsError):
+        own = None
+    if roster is None:
+        why = ("already recorded; a seat started before that takes it on pool_manage.py reseat" if own is False
+               else "already recorded; its next start applies the model, since a restart here is unfenced")
+        return {**out, "result": "unchanged", "why": why}
+    try:
+        if own is None:
+            raise ValueError("folders record unreadable")
+        if own:
+            applied = {"result": "next-start", "why": "it runs on its own folders, whose deliveries no lock "
+                       "fences, so its seat was not restarted; its next start applies the model"}
+        else:
+            applied = reseat(workspace, repo, wid, runner=runner, spawn=spawn)
+    except (OSError, ValueError, connections.ConnectionsError):
+        applied = {"result": "refused", "why": f"cannot tell what {wid} still owes (its folders record "
+                   "unreadable); its seat was left running"}
+    except Refused as e:
+        applied = {"result": "refused", "why": str(e)}
+    out["apply"] = {k: v for k, v in applied.items() if k not in ("worker_id", "action")}
+    out["result"] = {"reseated": "applied", "failed": "failed"}.get(applied["result"], "recorded")
+    return out
 
 
 def remove(workspace, target, *, hand_off=False, runner=subprocess.run) -> dict:
@@ -365,6 +437,10 @@ def main(argv=None, *, runner=subprocess.run) -> int:
     pl.add_argument("worker")
     pl.add_argument("op", choices=("add", "remove", "list"))
     pl.add_argument("dir", nargs="?", default="")
+    sm = sub.add_parser("set-model")
+    sm.add_argument("worker")
+    sm.add_argument("model", nargs="?", default=None)
+    sm.add_argument("--clear", action="store_true", help="drop the recorded model: back to the pool default")
     a = p.parse_args(argv)
     ws = Path(a.workspace) if a.workspace else resolve_workspace()
     try:
@@ -388,6 +464,10 @@ def main(argv=None, *, runner=subprocess.run) -> int:
             out = reseat(ws, a.repo, a.worker, runner=runner)
         elif a.cmd == "plugins":
             out = plugins(ws, a.worker, a.op, a.dir)
+        elif a.cmd == "set-model":
+            if a.clear == (a.model is not None):
+                raise Refused("set-model takes a model or --clear, not both or neither")
+            out = set_model(ws, a.repo, a.worker, None if a.clear else a.model, runner=runner)
         elif a.cmd == "bind":
             out = bind(ws, a.room, a.worker)
         elif a.cmd == "unbind":

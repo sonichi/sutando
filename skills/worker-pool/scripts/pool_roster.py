@@ -32,7 +32,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 
 from workspace_default import resolve_workspace  # noqa: E402
 from util_paths import task_event_handler_config_path  # noqa: E402
+import claude_model_name  # noqa: E402
 import roster_membership  # noqa: E402
+import skill_config  # noqa: E402
 
 WORKER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 CORE = "core"
@@ -45,6 +47,8 @@ PROFILE_WORKER_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 RESERVED_DISPLAY_ID_RE = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
 # The file Claude Code reads to recognise a --plugin-dir as a plugin.
 CLAUDE_PLUGIN_MANIFEST = Path(".claude-plugin") / "plugin.json"
+POOL_MANIFEST = Path(__file__).resolve().parents[1] / "manifest.json"
+DEFAULT_MODEL_KEY = "WORKER_POOL_DEFAULT_MODEL"
 
 
 class RosterError(Exception):
@@ -258,6 +262,8 @@ def validate_workers(workers) -> None:
             if not isinstance(dirs, list) or not all(
                     isinstance(d, str) and os.path.isabs(d) and "\n" not in d for d in dirs):
                 raise RosterError(f"worker {wid!r} plugin_dirs must be a list of absolute paths")
+        if "model" in row and not claude_model_name.is_valid(row["model"]):
+            raise RosterError(f"worker {wid!r} model {row['model']!r} is not a Claude model alias or claude-* id")
 
 
 def _validate_display_label(label, worker_id: str) -> str:
@@ -391,7 +397,7 @@ def register_worker(workspace, worker_id: str, label: str, room=None, runtime=No
         publish_task_event_handler(workspace)
         previous = workers.get(worker_id) or {}
         workers[worker_id] = {"state": "live", "label": label or worker_id}
-        for kept in ("display_label", "plugin_dirs"):
+        for kept in ("display_label", "plugin_dirs", "model"):
             if isinstance(previous, dict) and kept in previous:
                 workers[worker_id][kept] = previous[kept]
         if runtime:
@@ -706,6 +712,50 @@ def worker_plugin_dirs(workspace, worker_id: str, warn=None, skipped=None) -> li
         if skipped is not None:
             skipped.append({"dir": d, "state": state})
     return out
+
+
+def set_worker_model(workspace, target: str, model) -> "tuple[str, str | None, dict | None]":
+    """Record `model` on a worker's row, or drop it with None, under the roster lock. Returns
+    (worker id, model before, roster), roster None on a no-op. Claude workers only."""
+    with _locked(workspace):
+        _, workers, wid = _locked_worker(workspace, target)
+        row = workers[wid]
+        before = row.get("model")
+        if model is not None:
+            if row.get("runtime") not in (None, "claude"):
+                raise RosterError(f"worker {wid} runs {row.get('runtime')!r}; a model pin is Claude-only")
+            if not claude_model_name.is_valid(model):
+                raise RosterError(f"{model!r} is not a Claude model alias or claude-* id")
+        if model == before:
+            return wid, before, None
+        if model is None:
+            row.pop("model", None)
+        else:
+            row["model"] = model
+        return wid, before, compile_roster(workspace, workers, load_bindings(workspace))
+
+
+def recorded_model(workspace, worker_id: str) -> "str | None":
+    row = ((load_roster(workspace) or {}).get("workers") or {}).get(worker_id)
+    model = row.get("model") if isinstance(row, dict) else None
+    return model if isinstance(model, str) else None
+
+
+def default_model(warn=None) -> "str | None":
+    """The pool's default for a worker with no recorded model: the manifest's value, never the env, since a
+    worker starts from the core, a shell or the recovery timer, whose envs differ. set-model changes one."""
+    model = skill_config.config_value(DEFAULT_MODEL_KEY, POOL_MANIFEST, environ={})
+    if claude_model_name.is_valid(model):
+        return model
+    if warn:
+        warn(f"{DEFAULT_MODEL_KEY}={model!r} in the worker-pool manifest is not a Claude model name; "
+             "launching with no --model")
+    return None
+
+
+def worker_model(workspace, worker_id: str, warn=None) -> "str | None":
+    """The model a launch of `worker_id` passes as --model: its recorded one, else the pool default."""
+    return recorded_model(workspace, worker_id) or default_model(warn)
 
 
 def bind_room_if_free(workspace, room: str, target: str) -> bool:

@@ -264,12 +264,15 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
     skipped: list = []
     plugin_dirs = pr.worker_plugin_dirs(workspace, worker_id, skipped=skipped,
                                         warn=lambda m: print(m, file=sys.stderr))
+    model = pr.worker_model(workspace, worker_id, warn=lambda m: print(m, file=sys.stderr)) \
+        if runtime == "claude" else None
     return {
         # Recorded dirs this start leaves out, so the start's result shows what is missing.
         "plugin_dirs_skipped": skipped,
         "worker_id": worker_id,
         "label": label or worker_id,
         "runtime": runtime,
+        "model": model,
         "cwd": str(cwd or repo),
         "delivery_dir": delivery_dir,
         "tmux": {"socket": socket, "session_name": wi.tmux_session_name(worker_id)},
@@ -296,7 +299,10 @@ def plan(workspace, repo, *, runtime: str = "claude", cwd: str = "",
                 "SUTANDO_POOL_DELIVERY_SCRIPT": str(_SCRIPTS / "pool_delivery.py"),
                 # The owner's per-worker plugin opt-in (pool_manage.py plugins), one per line;
                 # always set, so a value inherited from the caller never loads into this worker.
-                "SUTANDO_WORKER_PLUGIN_DIRS": "\n".join(plugin_dirs)},
+                "SUTANDO_WORKER_PLUGIN_DIRS": "\n".join(plugin_dirs),
+                # This worker's own --model, so the CLI never falls back to the shared
+                # settings.json model, which any session's /model rewrites.
+                "SUTANDO_WORKER_MODEL": model or ""},
     }
 
 

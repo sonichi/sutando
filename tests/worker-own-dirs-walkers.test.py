@@ -202,6 +202,42 @@ class UnansweredInInbox(Base):
         with mock.patch.object(Path, "glob", side_effect=OSError):
             self.assertEqual(task_dispatch.unanswered_in_inbox(self.own / "tasks", self.own / "results"), [])
 
+    def test_strict_lists_the_same_tasks_and_raises_where_the_default_lists_nothing(self):
+        from delivery import task_dispatch
+        tasks, results = self.own / "tasks", self.own / "results"
+        for t in ("task-a", "task-b"):
+            (tasks / f"{t}.txt").write_text(f"id: {t}\ntask: x\n")
+        (results / "task-b.txt").write_text("done\n")
+        (tasks / "task-c.txt").mkdir()
+        (tasks / "notes.txt").write_text("not a task\n")
+        ids = lambda **kw: [t for t, _f in task_dispatch.unanswered_in_inbox(tasks, results, **kw)]
+        self.assertEqual((ids(), ids(strict=True)), (["task-a"], ["task-a"]))
+        with self.assertRaises(OSError):
+            task_dispatch.unanswered_in_inbox(self.ws / "missing", results, strict=True)
+        real_stat = os.stat
+
+        def stat_fails_on_a(path, *a, **kw):
+            if Path(path).name == "task-a.txt":
+                raise PermissionError(path)
+            return real_stat(path, *a, **kw)
+        # The listing succeeds; the file's own stat then fails.
+        with mock.patch.object(task_dispatch.os, "stat", stat_fails_on_a), self.assertRaises(PermissionError):
+            task_dispatch.unanswered_in_inbox(tasks, results, strict=True)
+
+    def test_strict_never_takes_an_unreadable_wake_turn_as_answered(self):
+        from delivery import task_dispatch
+        tasks, results = self.own / "tasks", self.own / "results"
+        (results / "task-w.txt").write_text("earlier turn\n")
+        old = time.time() - 600
+        os.utime(results / "task-w.txt", (old, old))
+        (tasks / "task-w.txt").write_text("id: task-w\nwake_episode: 2\ntask: x\n")
+        self.assertEqual([t for t, _f in task_dispatch.unanswered_in_inbox(tasks, results, strict=True)], ["task-w"])
+        (tasks / "task-w.txt").chmod(0)
+        self.addCleanup((tasks / "task-w.txt").chmod, 0o600)
+        self.assertEqual(task_dispatch.unanswered_in_inbox(tasks, results), [])
+        with self.assertRaises(PermissionError):
+            task_dispatch.unanswered_in_inbox(tasks, results, strict=True)
+
 
 class CompletionArchivedInTheFormerSharedFolder(Base):
     """After a switch, a task in the own inbox answered and archived under the shared results/ is not owed."""

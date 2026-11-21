@@ -2173,11 +2173,14 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
 WORKER_TOKEN_SOURCES = {"paste": "owner", "agent_link": "agent_link"}
 
 
-def worker_identity(worker: str, workspace: Optional[Path] = None) -> Optional[dict]:
-    """`worker`'s own identity row as stored, read only; None when it has none or the record is unreadable."""
+def worker_identity(worker: str, workspace: Optional[Path] = None, *, strict: bool = False) -> Optional[dict]:
+    """`worker`'s own identity row as stored, read only; None when it has none or the record is unreadable,
+    which `strict` raises instead (SchemaError or OSError)."""
     try:
         rows = _read(record_path(workspace))
     except (SchemaError, OSError):
+        if strict:
+            raise
         return None
     return next((dict(r) for r in rows if r.get("worker") == worker), None)
 
@@ -2206,10 +2209,11 @@ def _row_dirs(row: Optional[Mapping[str, object]], workspace: Optional[Path]) ->
     return root / "tasks", root / "results"
 
 
-def worker_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":
+def worker_dirs(worker: str, workspace: Optional[Path] = None, *,
+                strict: bool = False) -> "Optional[tuple[Path, Path]]":
     """(tasks dir, results dir) of `worker` when its identity row names an agent and `dirs: "own"`;
-    None otherwise (the worker uses the workspace's shared tasks/ and results/), or when unreadable."""
-    return _row_dirs(worker_identity(worker, workspace), workspace) if worker else None
+    None otherwise (the shared tasks/ and results/), or when unreadable unless `strict`, which raises."""
+    return _row_dirs(worker_identity(worker, workspace, strict=strict), workspace) if worker else None
 
 
 def ensure_worker_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":
@@ -3076,7 +3080,8 @@ SESSION_ENV = frozenset((
     "SUTANDO_TMUX_SOCKET", "SUTANDO_TMUX_SESSION", "SUTANDO_TASKS_DIR", "SUTANDO_RESULTS_DIR",
     "SUTANDO_WORKSPACE_DIR", "SUTANDO_INBOX_KIND", "SUTANDO_INBOX_RESOLVER", "SUTANDO_INBOX_RESOLVER_TIMEOUT",
     "SUTANDO_CLAUDE_WORKING_DIR", "SUTANDO_CODEX_WORKING_DIR", "SUTANDO_WORKER_BOOTSTRAP",
-    "SUTANDO_POOL_DELIVERY_SCRIPT", "SUTANDO_WORKER_PLUGIN_DIRS", "SUTANDO_WATCHER_CMD", "SUTANDO_WATCHER_BEAT",
+    "SUTANDO_POOL_DELIVERY_SCRIPT", "SUTANDO_WORKER_PLUGIN_DIRS", "SUTANDO_WORKER_MODEL",
+    "SUTANDO_WATCHER_CMD", "SUTANDO_WATCHER_BEAT",
     "SUTANDO_TASK_WATCH_MOD", "SUTANDO_TASK_WATCH_MOD_WORKER", "SUTANDO_TASK_EVENT_HANDLER",
     "SUTANDO_CLAUDE_SESSION_ID", "SUTANDO_CLAUDE_RESUME", "AG2_MCP_WORKER_CREDENTIAL",
 ))

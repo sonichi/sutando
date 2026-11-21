@@ -73,6 +73,8 @@ while IFS= read -r _plugin_dir; do
   if [ -n "$_plugin_dir" ]; then SURFACE_ARGS+=(--plugin-dir "$_plugin_dir"); fi
 done <<< "${SUTANDO_WORKER_PLUGIN_DIRS:-}"
 unset _plugin_dir
+# This worker's model (pool_manage.py set-model, else the pool default), as plan() resolved it.
+if [ -n "${SUTANDO_WORKER_MODEL:-}" ]; then SURFACE_ARGS+=(--model "$SUTANDO_WORKER_MODEL"); fi
 if [ "${1:-}" = "--print-surface-args" ]; then
   printf '%s\n' ${SURFACE_ARGS[@]+"${SURFACE_ARGS[@]}"}
   exit 0

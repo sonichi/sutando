@@ -86,7 +86,7 @@ rm -f "$T/state/model-switch.json"; : > "$T/tmux.log"
 rc=$(SUTANDO_CORE_RUNTIME=bogus run opus); [ "$rc" = 4 ] && [ ! -e "$T/state/model-switch.json" ] && ! grep -q send-keys "$T/tmux.log" && grep -q "unrecognized\|could not be resolved" "$T/err" \
   && ok "20 unrecognized runtime: exit 4, no record, nothing sent" || fail "20 bogus runtime" "rc=$rc $(cat "$T/err")"
 mkdir -p "$T/fakerepo/scripts"; printf '#!/bin/sh\ncase "$1" in core-runtime) exit 1;; *) exec bash "%s/scripts/sutando-config.sh" "$@";; esac\n' "$HERE" > "$T/fakerepo/scripts/sutando-config.sh"; chmod +x "$T/fakerepo/scripts/sutando-config.sh"
-ln -sfn "$HERE/skills" "$T/fakerepo/skills"
+ln -sfn "$HERE/skills" "$T/fakerepo/skills"; ln -sfn "$HERE/src" "$T/fakerepo/src"
 rc=$(bash "$T/fakerepo/skills/model-switch/scripts/switch-model.sh" opus --state-dir "$T/state" --brain "$T/cfg" > "$T/out" 2> "$T/err"; echo $?)
 [ "$rc" = 4 ] && [ ! -e "$T/state/model-switch.json" ] && grep -q "could not be resolved" "$T/err" && ok "21 resolver exits nonzero: exit 4, no record" || fail "21 resolver failure" "rc=$rc $(cat "$T/err")"
 

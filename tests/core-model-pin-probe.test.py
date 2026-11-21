@@ -458,6 +458,51 @@ class InterpretPinNoTmuxNeeded(unittest.TestCase):
             finally:
                 tm("kill-server")
 
+    def test_a_session_marked_not_core_may_pin_its_own_model(self):
+        """A pool worker launches with its own --model and SUTANDO_CORE_SESSION set empty; the
+        probe must not read it as a pinned core. The same session unmarked is the control."""
+        tmux = shutil.which("tmux", path="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+        if not tmux:
+            self.fail("tmux unavailable — cannot exercise the argv scan")
+
+        def probe(*marker):
+            with tempfile.TemporaryDirectory() as td:
+                sock = os.path.join(td, "s.sock")
+                stub = os.path.join(td, "claude")
+                Path(stub).write_text("#!/bin/bash\nsleep 120\n")
+                os.chmod(stub, 0o755)
+
+                def tm(*a):
+                    return subprocess.run([tmux, "-S", sock, *a], capture_output=True, text=True, timeout=15)
+                try:
+                    tm("new-session", "-d", "-s", "sutando-core", "-e", "SUTANDO_CORE_SESSION=1",
+                       f"{stub} --name sutando-core")
+                    tm("new-session", "-d", "-s", "sutando-worker-x", *marker,
+                       f"{stub} --name sutando-worker-x --model opus")
+                    pane = tm("list-panes", "-t", "=sutando-worker-x", "-F", "#{pane_pid}").stdout.strip()
+                    if "--model" not in subprocess.run(["ps", "-o", "args=", "-p", pane],
+                                                       capture_output=True, text=True).stdout:
+                        self.fail("fixture did not stage a pinned worker argv")
+                    old = os.environ.get("SUTANDO_TMUX_SOCKET")
+                    os.environ["SUTANDO_TMUX_SOCKET"] = sock
+                    try:
+                        return self.hc.check_core_model_pin()
+                    finally:
+                        if old is None:
+                            os.environ.pop("SUTANDO_TMUX_SOCKET", None)
+                        else:
+                            os.environ["SUTANDO_TMUX_SOCKET"] = old
+                finally:
+                    tm("kill-server")
+
+        with mock.patch.object(self.hc, "_settings_model_pins", lambda *a, **k: []):
+            marked = probe("-e", "SUTANDO_CORE_SESSION=")
+            unmarked = probe()
+        self.assertEqual(marked["status"], "ok", marked)
+        self.assertNotIn("LIVE core", marked["detail"])
+        self.assertEqual(unmarked["status"], "warn", unmarked)
+        self.assertIn("LIVE core", unmarked["detail"])
+
     def test_name_is_stable(self):
         for pins in ([], [("core", "opus")]):
             self.assertEqual(
