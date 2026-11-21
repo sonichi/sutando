@@ -26,6 +26,7 @@ const DISPOSITIONS = ['pending', 'claimed', 'answered', 'archived', 'missing']
 // Mid-turn, each task's access_tier is read with the repo's own header parser: one line per path, empty when unreadable.
 const TIER_TIMEOUT_MS = 5_000
 // Gateway tasks put their headers after `task:`; only the envelope-verified reader may read those.
+// Prints `owner` only for the human owner: a scheduled job or another agent waits for the turn's end.
 const TIER_PY = [
   'import sys',
   'from pathlib import Path',
@@ -36,7 +37,11 @@ const TIER_PY = [
   'for p in sys.argv[3:]:',
   '    try:',
   "        with open(p, encoding='utf-8', errors='replace') as f:",
-  "            print(canonical_access_tier(attested_task_headers(f.read(), ws).headers.get('access_tier')))",
+  "            h = attested_task_headers(f.read(), ws).headers",
+  "        sender = (h.get('user_id') or '').strip()",
+  "        machine = (h.get('source') or '').strip() == 'cron' or sender == 'cron-runner' or '.agent:' in sender",
+  "        tier = canonical_access_tier(h.get('access_tier'))",
+  "        print('' if machine and tier == 'owner' else tier)",
   '    except Exception:',
   "        print('')",
 ].join('\n')
