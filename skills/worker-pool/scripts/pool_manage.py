@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Manage the pool's workers: list, stop, retire, enable, remove, reseat, plugins, bind, unbind.
+"""Manage the pool's workers: list, stop, retire, enable, remove, reseat, plugins, set-model, bind, unbind.
 
 The owner's (or the agent's, on the owner's behalf) one supported way to take a
 worker out of service and bring it back. Each verb goes through the writer that
@@ -17,8 +17,9 @@ already owns its fact, so the remedy, the sweep and the router honour it:
             and vault secret (connections.retire_worker_identity).
     enable  lift both, then the owner restart (pool_remedy.restart).
     remove  drop a retired worker's roster row; its records stay on disk.
-    reseat  restart a running seat that owes nothing, so its tools pick up an
-            agent identity added after it started; one that owes work is left.
+    reseat  restart a running seat that owes nothing, so what a seat decides at start
+            (its agent identity, plugin dirs, model) is decided again; one that owes
+            work is left.
     bind    bind a room to a worker on the shared folders (pool_roster.bind_room), so the
             router delivers that room's tasks to it; a worker on its own folders is refused,
             since the router never delivers to one.
@@ -27,6 +28,11 @@ already owns its fact, so the remedy, the sweep and the router honour it:
             .claude-plugin/plugin.json) that every launch and reseat of this worker
             loads with --plugin-dir. The owner's opt-in: run it only on their word.
             It takes effect at the next start; `reseat` applies it now.
+    set-model record the --model this worker launches with (`--clear` drops it, back to
+            the pool default WORKER_POOL_DEFAULT_MODEL), then reseat its running seat so
+            it applies now; a seat that owes work keeps its model until its next start.
+            It never sends /model: /model rewrites the shared settings.json default even
+            in a session started with --model, which changes every unpinned session.
 
     python3 pool_manage.py [--workspace WS] [--repo REPO] list [--json]
     python3 pool_manage.py [--workspace WS] stop   <worker id or label> [--force]
@@ -36,6 +42,7 @@ already owns its fact, so the remedy, the sweep and the router honour it:
     python3 pool_manage.py [--workspace WS] [--repo REPO] reseat <worker>
     python3 pool_manage.py [--workspace WS] plugins <worker> add|remove <dir>
     python3 pool_manage.py [--workspace WS] plugins <worker> list
+    python3 pool_manage.py [--workspace WS] [--repo REPO] set-model <worker> <model> | --clear
     python3 pool_manage.py [--workspace WS] bind <room id> <worker id or label>
     python3 pool_manage.py [--workspace WS] unbind <room id>
 
@@ -236,16 +243,16 @@ def enable(workspace, repo, target, *, start=True, runner=None, spawn=None) -> d
 
 
 def reseat(workspace, repo, target, *, runner=subprocess.run, spawn=None) -> dict:
-    """Restart `target`'s running seat so its s-space tools re-decide whom they act as: they decide once,
-    at start, and a seat started before the worker had its own agent keeps acting as the core's."""
+    """Restart `target`'s running seat, resuming its conversation, so what a seat decides once at start
+    is decided again: whom its s-space tools act as, its plugin dirs, its --model."""
     wid, row = _worker(workspace, target)
     base = {"worker_id": wid, "action": "reseat"}
     if row.get("state") == "retired" or sup.is_paused(workspace, wid):
-        return {**base, "result": "skipped", "why": "stopped or retired; it starts as its new identity when enabled"}
+        return {**base, "result": "skipped", "why": "stopped or retired; it starts with the change when enabled"}
     socket = sup.run_socket(workspace, wid)
     seat = wi.tmux_session_name(wid)
     if socket is None or sw.session_state(seat, socket, runner=runner) != "exists":
-        return {**base, "result": "skipped", "why": "no seat running; it starts as its new identity"}
+        return {**base, "result": "skipped", "why": "no seat running; its next start applies the change"}
     _not_self(wid, False)
     owed = _outstanding(workspace, wid)
     if owed:
@@ -276,6 +283,24 @@ def plugins(workspace, target, op: str, path: str = "") -> dict:
     result = ("added" if op == "add" else "removed") if roster is not None else "unchanged"
     return {**base, "result": result, "plugin_dirs": dirs,
             "applies": "at this worker's next start; pool_manage.py reseat applies it now"}
+
+
+def set_model(workspace, repo, target, model=None, *, runner=subprocess.run, spawn=None) -> dict:
+    """Record `target`'s model (None drops it) and reseat its running seat with the new --model.
+    Only that worker's row and seat change; the shared settings.json default is never touched."""
+    wid, before, roster = pr.set_worker_model(workspace, target, model)
+    out = {"worker_id": wid, "action": "set-model", "recorded": model, "previous": before,
+           "model": pr.worker_model(workspace, wid)}
+    if roster is None:
+        return {**out, "result": "unchanged",
+                "why": "already recorded; a seat started before that takes it on pool_manage.py reseat"}
+    try:
+        applied = reseat(workspace, repo, wid, runner=runner, spawn=spawn)
+    except Refused as e:
+        applied = {"result": "refused", "why": str(e)}
+    out["apply"] = {k: v for k, v in applied.items() if k not in ("worker_id", "action")}
+    out["result"] = {"reseated": "applied", "failed": "failed"}.get(applied["result"], "recorded")
+    return out
 
 
 def remove(workspace, target, *, hand_off=False, runner=subprocess.run) -> dict:
@@ -365,6 +390,10 @@ def main(argv=None, *, runner=subprocess.run) -> int:
     pl.add_argument("worker")
     pl.add_argument("op", choices=("add", "remove", "list"))
     pl.add_argument("dir", nargs="?", default="")
+    sm = sub.add_parser("set-model")
+    sm.add_argument("worker")
+    sm.add_argument("model", nargs="?", default=None)
+    sm.add_argument("--clear", action="store_true", help="drop the recorded model: back to the pool default")
     a = p.parse_args(argv)
     ws = Path(a.workspace) if a.workspace else resolve_workspace()
     try:
@@ -388,6 +417,10 @@ def main(argv=None, *, runner=subprocess.run) -> int:
             out = reseat(ws, a.repo, a.worker, runner=runner)
         elif a.cmd == "plugins":
             out = plugins(ws, a.worker, a.op, a.dir)
+        elif a.cmd == "set-model":
+            if a.clear == (a.model is not None):
+                raise Refused("set-model takes a model or --clear, not both or neither")
+            out = set_model(ws, a.repo, a.worker, None if a.clear else a.model, runner=runner)
         elif a.cmd == "bind":
             out = bind(ws, a.room, a.worker)
         elif a.cmd == "unbind":

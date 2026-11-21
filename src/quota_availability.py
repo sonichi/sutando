@@ -244,9 +244,9 @@ def read_quota_record(workspace, now: Optional[float] = None) -> Optional[QuotaR
 @dataclass(frozen=True)
 class SeatEnv:
     """What the running seat carries. `observed` False means its environment could
-    not be read: unknown, never a bypass. `base_url`, `config_dir` and `model` are
-    the process's ANTHROPIC_BASE_URL, CLAUDE_CONFIG_DIR and ANTHROPIC_MODEL (None
-    when absent)."""
+    not be read: unknown, never a bypass. `base_url` and `config_dir` are the
+    process's ANTHROPIC_BASE_URL and CLAUDE_CONFIG_DIR; `model` is its `--model`,
+    else its ANTHROPIC_MODEL, the CLI's own order (None when absent)."""
     observed: bool
     base_url: Optional[str]
     config_dir: Optional[str] = None
@@ -282,6 +282,19 @@ def _env_pairs(argv: str) -> dict:
         elif key is not None and tok:
             env[key] += " " + tok
     return env
+
+
+def _argv_model(proc: str) -> Optional[str]:
+    """The `--model` in a `ps eww` line's argv: it ends at `--` or at the first env pair."""
+    toks = proc.split()
+    for i, tok in enumerate(toks):
+        if tok == "--" or _ENV_PAIR.match(tok):
+            return None
+        if tok == "--model":
+            return toks[i + 1] if i + 1 < len(toks) else None
+        if tok.startswith("--model="):
+            return tok.split("=", 1)[1]
+    return None
 
 
 def seat_env_base_url(socket_path: Optional[str], session: str,
@@ -339,7 +352,8 @@ def seat_env_base_url(socket_path: Optional[str], session: str,
         return SeatEnv(False, None)
     if config_dir is not None and not Path(config_dir).is_dir():
         return SeatEnv(False, None)
-    return SeatEnv(True, base_url, config_dir, _norm_model(env.get("ANTHROPIC_MODEL")))
+    return SeatEnv(True, base_url, config_dir,
+                   _norm_model(_argv_model(matches[0]) or env.get("ANTHROPIC_MODEL")))
 
 
 # ---- whose model the record speaks for ------------------------------------
@@ -354,7 +368,7 @@ def _norm_model(value) -> Optional[str]:
 
 
 def seat_model(env: SeatEnv, workspace) -> Optional[str]:
-    """The model the seat is running: its own ANTHROPIC_MODEL, else its config
+    """The model the seat is running: its own --model or ANTHROPIC_MODEL, else its config
     dir's `settings.json` (what a bare `claude` in that seat resolves), else
     `state/model-switch.json`. None when none says."""
     if env.model:

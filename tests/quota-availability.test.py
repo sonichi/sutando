@@ -266,6 +266,22 @@ class TestSeatEnvBaseUrl(unittest.TestCase):
         ps = lambda pid: _R(0, f"claude --name {SEAT} ANTHROPIC_BASE_URL={PROXY} ANTHROPIC_MODEL=claude-sonnet-5[1m]")  # noqa: E731
         self.assertEqual(qa.seat_env_base_url("/tmp/t.sock", SEAT, tm, ps).model, "claude-sonnet-5")
 
+    def test_the_seats_launch_model_flag_outranks_its_anthropic_model(self):
+        """A pool worker runs on its own --model, as the CLI ranks it, not on its env or settings."""
+        for flag in ("--model claude-opus-5[1m]", "--model=claude-opus-5"):
+            tm, ps = _seat(PROXY, extra_argv=f"--plugin-dir /p {flag}")
+            line = ps("6648").stdout + " ANTHROPIC_MODEL=claude-sonnet-5"
+            env = qa.seat_env_base_url("/tmp/t.sock", SEAT, tm, lambda pid: _R(0, line))
+            self.assertEqual(env.model, "claude-opus-5", flag)
+
+    def test_a_model_flag_after_the_argv_is_not_the_seats(self):
+        """`--` ends the flags (the boot prompt follows it) and the env pairs follow the argv."""
+        for argv in ("-- /startup --model opus", ""):
+            tm, ps = _seat(PROXY, extra_argv=argv)
+            line = ps("6648").stdout + " NOTE=see --model opus"
+            env = qa.seat_env_base_url("/tmp/t.sock", SEAT, tm, lambda pid: _R(0, line))
+            self.assertIsNone(env.model, argv)
+
     def test_a_seat_without_the_variable_is_observed_and_unrouted(self):
         tm, ps = _seat(base_url=None)
         env = qa.seat_env_base_url("/tmp/t.sock", SEAT, tm, ps)

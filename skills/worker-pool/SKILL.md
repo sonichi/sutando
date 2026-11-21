@@ -18,8 +18,8 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `rename_worker.py` — change a worker's base routing alias after creation: `python3 skills/worker-pool/scripts/rename_worker.py --worker <id-or-label> --label "<new alias>" [--workspace W]`. The id and its tmux session name stay.
 - `apply_profile_label_overrides.py` — apply an s.space profile's complete worker display-label map from JSON stdin with `--workspace W --profile-mxid M --config-version N`.
 - `worker_bootstrap.py` — a worker session's first-turn decision (worker vs core mode) from its env.
-- `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write. `set_worker_state` / `remove_worker` are its writers for a worker's lifecycle; `set_worker_plugin_dirs` writes a row's `plugin_dirs`.
-- `pool_manage.py` — stop, retire, re-enable, remove or reseat a worker, record its extra Claude plugin dirs, and bind or unbind a room (below).
+- `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write. `set_worker_state` / `remove_worker` are its writers for a worker's lifecycle; `set_worker_plugin_dirs` writes a row's `plugin_dirs`, `set_worker_model` its `model`.
+- `pool_manage.py` — stop, retire, re-enable, remove or reseat a worker, record its extra Claude plugin dirs or its model, and bind or unbind a room (below).
 - `pool_identity.py` — give a worker an s.space agent of its own, show it, rotate its token or remove it (below).
 - `pool_provision.py` — the local half of creating that agent without a pasted token: claim secret, redeem, retire (below).
 - `provision_e2e.py` — check that whole flow against one server, with a scan for leaked secrets (below).
@@ -38,7 +38,7 @@ python3 skills/worker-pool/scripts/pool_sessions.py list --workspace "$WS" [--ro
 
 Suites live at `tests/skills/worker-pool/`.
 
-## Managing workers: stop, retire, enable, remove, plugins
+## Managing workers: stop, retire, enable, remove, plugins, set-model
 
 Killing a worker's tmux session does not stop it: the remedy timer's next sweep
 (every 5 minutes) sees a dead session and resumes it on the same conversation.
@@ -56,6 +56,7 @@ python3 skills/worker-pool/scripts/pool_manage.py enable <worker> [--no-start]
 python3 skills/worker-pool/scripts/pool_manage.py remove <worker> [--hand-off]
 python3 skills/worker-pool/scripts/pool_manage.py plugins <worker> add|remove <dir>
 python3 skills/worker-pool/scripts/pool_manage.py plugins <worker> list
+python3 skills/worker-pool/scripts/pool_manage.py set-model <worker> <model> | --clear
 python3 skills/worker-pool/scripts/pool_manage.py bind   <room id> <worker id or label>
 python3 skills/worker-pool/scripts/pool_manage.py unbind <room id>
 ```
@@ -105,6 +106,18 @@ python3 skills/worker-pool/scripts/pool_manage.py unbind <room id>
   worker, never on your own. The command does not check who calls it, like the
   other verbs here; the owner's word is the only gate. It applies at the
   worker's next start; `reseat` applies it now.
+- `set-model` records the model one Claude worker launches with (`model` on its
+  roster row: an alias such as `opus`, `sonnet[1m]`, or a `claude-*` id); `--clear`
+  drops it. Every start of a Claude worker passes `--model`: its recorded model,
+  else the pool default `WORKER_POOL_DEFAULT_MODEL` (manifest `config`, `opus`;
+  `CLI > env > manifest`). A recorded change is applied by `reseat`: a running seat
+  that owes nothing restarts on the same conversation with the new `--model`
+  (`"result": "applied"`); one that owes work, or no running seat, keeps it for its
+  next start (`"result": "recorded"`, the reason under `apply`). It never types
+  `/model` into a pane: `/model` saves its pick as the shared `settings.json`
+  default even in a session started with `--model`, which moves the core's next
+  start and every unpinned session with it. For the same reason, do not type
+  `/model` in a worker's terminal; use `set-model`. Codex workers are refused.
 
 ## Codex CLI workers
 
