@@ -1,0 +1,14 @@
+{
+  "name": "agent-cards",
+  "version": "1.0.0",
+  "owner": "github:sonichi/sutando",
+  "license": "MIT",
+  "stability": "experimental",
+  "description": "The owner's \"show my ...\" agent panel cards. No tools: manifest present to DECLARE config per skills/MANIFEST.md.",
+  "config": {
+    "AGENT_CARDS_PREFS_OFFER": "false"
+  },
+  "provenance": {
+    "source_repo": "https://github.com/sonichi/sutando"
+  }
+}
