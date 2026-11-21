@@ -282,6 +282,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`task_lookup.py`** — Find a task's file or result by id wherever it lives: its current home first (`connections.task_home`), then only the ARCHIVES of the folders its worker used before switching between own and shared ones (`connections.task_other_home`).
 - **`task_priority.py`** — Task priority taxonomy + readers.
 - **`task_queue.py`** — The pending task queue, in one place: which task files are waiting, in the order the core will take them, and where a given task stands in that order.
+- **`task_watch_owner.py`** — Which tasks the task-watch Mod may name to a running turn: the human owner's, from a person's channel.
 - **`task_workstreams.py`** — Durable inferred-workstream index and archive-backed task history.
 - **`tasks-dir-resolve.sh`** — Shared TASKS_DIR resolution — sourceable so watch-tasks-stream.sh and task-notifier-supervisor.sh can never resolve a different inbox for the same instance.
 - **`team_guardrail.py`** — Alias of `policy.guardrail` (phase-1a restructure); one transition window.
@@ -384,7 +385,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 ## `src/agent/claude/task-watch-mod/hooks/`
 
-- **`register.ts`** — The task-watch Mod: runs the session's task watcher and starts a turn with each task it announces.
+- **`register.ts`** — The task-watch Mod: runs the session's task watcher, starts a turn with each task it announces, and names owner tasks that arrive mid-turn after the next tool result.
 - **`version.ts`** — The oldest Claude Code this Mod is verified on; the launchers read this line too.
 
 ## `src/agent/codex/`

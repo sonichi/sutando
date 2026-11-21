@@ -414,7 +414,7 @@ ensure_task_notifier() {
   # operator pin (if one is already set) and nothing computed.
   # The target window is part of the identity: a heal that lands the core on a
   # new index must replace a watcher still aimed at the old one.
-  expected_version="$(cksum "${version_files[@]}" | cksum | awk '{print $1 "-" $2}')-w${CORE_WINDOW:-0}-p${CORE_PANE:-none}-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-y$(printf '%s' "$notifier_py" | cksum | awk '{print $1}')-s$(printf '%s' "${SUTANDO_STOP_INTERRUPT:-}" | cksum | awk '{print $1}')-m${standby_mode}-a${SUTANDO_NOTIFIER_ALERT_GRACE:-}-r${SUTANDO_NOTIFIER_ALERT_REPEAT:-}-u${SUTANDO_NOTIFIER_ALERT_PILEUP:-}"
+  expected_version="$(cksum "${version_files[@]}" | cksum | awk '{print $1 "-" $2}')-w${CORE_WINDOW:-0}-p${CORE_PANE:-none}-h$(printf '%s' "${SUTANDO_TASK_EVENT_HANDLER:-}" | cksum | awk '{print $1}')-y$(printf '%s' "$notifier_py" | cksum | awk '{print $1}')-s$(printf '%s' "${SUTANDO_STOP_INTERRUPT:-}" | cksum | awk '{print $1}')-m${standby_mode}-a${SUTANDO_NOTIFIER_ALERT_GRACE:-}-r${SUTANDO_NOTIFIER_ALERT_REPEAT:-}"
   if watcher_session_exists; then
     active_version="$(
       tmux -S "$TMUX_SOCKET" show-environment -t "=$WATCHER_SESSION" \
@@ -445,7 +445,6 @@ ensure_task_notifier() {
   # The alert-only knobs, always set (empty means the supervisor's default) and in the version.
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_ALERT_GRACE=${SUTANDO_NOTIFIER_ALERT_GRACE:-}")
   NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_ALERT_REPEAT=${SUTANDO_NOTIFIER_ALERT_REPEAT:-}")
-  NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_ALERT_PILEUP=${SUTANDO_NOTIFIER_ALERT_PILEUP:-}")
   # A required Team handler must reach the watcher, or its refusal (rc 4) is never seen.
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   # The stop handler reads it in the watcher's environment; it is in the version, so a change restarts it.

@@ -4,6 +4,12 @@ Re-create all session cron jobs for Sutando. Run this on startup or after a sess
 
 **Usage**: `/schedule-crons`
 
+> **Scope.** This skill schedules Sutando's own startup, maintenance, heartbeat, backend and
+> proactive jobs, and they stay native, as do starter jobs the owner switches on in `crons.json`. A reminder or timed job an
+> owner asks for in an s.space room or DM goes to the platform scheduler instead
+> ([`skills/ag2-space-mcp/SKILL.md`](../ag2-space-mcp/SKILL.md#scheduling-timed-work)); add one
+> here only in the last-resort case that skill describes. This does not disable cron, and starter jobs are not migrated automatically.
+
 ## How It Works
 
 Jobs are defined per host in `<workspace>/hosts/<hostname>/crons.json` — **per-host, synced + backed up via the vault** (carried as part of the `hosts/*/` per-host subtree (#1717), which is hostname-qualified so it never collapses across hosts; see [`docs/workspace-hosts-convention.md`](../../docs/workspace-hosts-convention.md) and [`docs/workspace-per-host-paths.md`](../../docs/workspace-per-host-paths.md)). `<hostname>` is `bash scripts/sutando-config.sh host-label` — the canonical per-host label (`$SUTANDO_HOST_LABEL` > scutil `LocalHostName` > short `hostname`), matching the sync layer's host slug. (Do NOT use a bare `hostname | sed 's/\..*//'`: a DHCP lease can drift the hostname (e.g. Comcast → `Chis-MBP`) and split per-host paths from the stable label; #1745.) A template is in `crons.example.json` (in this skill dir, version-controlled). Step 1 seeds a missing per-host file with `python3 skills/schedule-crons/scripts/seed_crons.py`, which writes the template's starter set: every entry except those marked `"opt_in": true`. Do not `cp` the whole template: its opt-in entries start only on the owner's word. `crons.example.history.json` holds a digest of every entry the template has ever shipped, which the seeder uses to tell a shipped sample from an owner's job; a change to an entry of `crons.example.json` appends the new entry's digest there (`tests/schedule-crons-seed-policy.test.py` enforces it and computes it).
