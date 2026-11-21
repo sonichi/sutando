@@ -50,9 +50,8 @@ from tmux_pane_keys import fence_keys_argv
 from workspace_default import resolve_workspace
 
 ESC_PROMPT = re.compile(r"esc to interrupt", re.I)
-# The reason the bridge writes into the control task when the broker answered `task_already_terminal`:
-# remote_gateway_bridge._closed_why, carried by task_attempts.cancel_task_text's "(<reason>)". The task
-# file has no structured field for it; this is the exact text those two write.
+# The exact text the bridge writes for a `task_already_terminal` close (no structured field carries it):
+# remote_gateway_bridge._closed_why, inside task_attempts.cancel_task_text's "(<reason>)".
 SERVER_CLOSED = re.compile(r"^task: CANCEL_INSTRUCTION: stop processing \S+ if still in flight "
                            r"\(closed on the server \(task_already_terminal[,)]", re.M)
 CONFIRM_POLL_S = 2.0
