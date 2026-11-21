@@ -867,15 +867,19 @@ def read_marker(text: str) -> Optional[Tuple[str, Optional[str]]]:
 
 def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: Optional[str] = None,
                 prompts: object = None, roles: object = None,
-                features: Optional[FeatureList] = None, media: object = None) -> str:
+                features: Optional[FeatureList] = None, media: object = None,
+                *, private_setup: bool = False) -> str:
     """The whole page as one HTML string; depends on nothing but its arguments: the agent's name,
     core, audience, mxid (the ownership marker, which also records the list's revision), per-slot
     prompts (`clean_prompts`), the owner's onboarding roles, the feature list (the skill's own by
     default) and the room's media map (`clean_media`; an asset it does not map is inlined). In a
-    room other than the owner's DM the agent is "your agent"."""
+    room other than the owner's DM the agent is "your agent". The overview uses saved setup
+    context only when the publisher verified the setup room, owner and agent."""
     features = features or FEATURES
     prompts = clean_prompts(prompts, prompt_slots(features))
     media = clean_media(media, features)
+    if audience != "dm":
+        prompts, roles = {}, None
     labels = role_labels(roles)
     picked = (f'<p class="roles">Picked for: {html.escape(", ".join(labels))}</p>' if labels else "")
     if audience not in AUDIENCES:
@@ -887,6 +891,15 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
     secs = sections_for(core, features)
     body = "".join(_section(s, i, who, prompts, media) for i, s in enumerate(secs))
     overview_style, overview_body = overview_parts()
+    checklist_header = (f'<header class="hero">{HERO}<div><h1>Getting started with {who}</h1>'
+                        f'<p class="lead">{lead}</p>{picked}</div></header>')
+    if audience == "dm":
+        from personalized_overview import overview
+
+        display = who if private_setup else "your agent"
+        overview_style, overview_body = overview(overview_style, overview_body, display,
+                                                 labels if private_setup else ())
+        checklist_header = picked
     page = (
         f"{PAGE_HEAD}"
         f"{owner_marker(agent, features.revision, DIGEST_SLOT) if agent else ''}"
@@ -894,8 +907,7 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
         "<main id=\"tour\" data-mode=\"step\">"
         f"{overview_body}"
         '<details id="tutorial-checklist"><summary>Try it step by step</summary>'
-        f"<header class=\"hero\">{HERO}<div><h1>Getting started with {who}</h1>"
-        f"<p class=\"lead\">{lead}</p>{picked}</div></header>"
+        f"{checklist_header}"
         "<div class=\"progress\"><div class=\"progress-label\" id=\"progress-label\" aria-hidden=\"true\">"
         f"0 of {len(secs)} done</div>"
         f"<div class=\"bar\" id=\"progress-bar\" role=\"progressbar\" aria-label=\"Tour progress\" "

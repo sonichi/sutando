@@ -848,7 +848,7 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             agent: Optional[str] = None, prompts: object = None, roles: object = None,
             features: Optional[FeatureList] = None, if_newer: bool = False,
             media: object = None, dm_room: Optional[str] = None, had_entry: bool = False,
-            aliases: Iterable[str] = (), upload: bool = True) -> dict:
+            aliases: Iterable[str] = (), upload: bool = True, private_setup: bool = False) -> dict:
     """`audience` None means the room's recorded one; a refresh skips a page it can't place, and
     never creates one: only an explicit publish does. `had_entry`: the room had one before recovery."""
     features = features or tour_page.FEATURES
@@ -869,12 +869,15 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             # page is compared as a DM's but never rewritten under that guess.
             audience = known.get("audience") if known.get("audience") in AUDIENCES else "dm"
             unplaced = if_newer and bool(known) and known.get("audience") not in AUDIENCES and commons.room != dm_room
-        if if_newer and not clean_prompts(prompts, slots):
+        reuse_inputs = audience == "dm" and (not dm_room or commons.room != dm_room or private_setup)
+        if if_newer and reuse_inputs and not clean_prompts(prompts, slots):
             # No one is in the loop to pass the owner's prompts again: keep the page's own.
             prompts = rooms.get(commons.room, {}).get("prompts")
-        if if_newer and not role_labels(roles):
+        if if_newer and reuse_inputs and not role_labels(roles):
             roles = rooms.get(commons.room, {}).get("roles")
-        prompts = clean_prompts(prompts, slots)
+        prompts = clean_prompts(prompts, slots) if audience == "dm" else {}
+        if audience != "dm":
+            roles = None
         # A refresh of a room whose record is current writes nothing, so it uploads nothing either.
         current = (if_newer and known.get("state") == "complete" and bool(known.get("revision"))
                    and not newer(features.revision, known["revision"]))
@@ -885,7 +888,9 @@ def publish(commons: Commons, marker: Path, name: str, owner: Optional[str] = No
             """(record, upload report, media shown, page); uploads only when `skip` is None."""
             record, report = upload_media(commons, features, recorded, explicit, skip)
             shown = clean_media(record, features)
-            return record, report, shown, render_page(name, core, audience, agent, prompts, roles, features, shown)
+            return record, report, shown, render_page(
+                name, core, audience, agent, prompts, roles, features, shown,
+                private_setup=private_setup and audience == "dm" and commons.room == dm_room)
 
         # Until a page is about to be written it is rendered from the media already recorded or
         # given: a run that skips, keeps the page or stops on its size uploads nothing.
@@ -1175,6 +1180,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "publish" and args.all_rooms:
         return publish_all_rooms(args, raw)
     if args.command == "publish":
+        explicit_roles = args.roles
         inputs = load_inputs(inputs_path(_workspace()))
         args = with_inputs(args, inputs)
         if not args.room:
@@ -1224,6 +1230,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(json.dumps({"ok": False, "reason": f"the agent identity {agent[:80]!r} is not an mxid "
                                                  "(@localpart:server); nothing was published"}))
         return 4
+    private_setup = bool(args.owner and args.room == inputs.get("room")
+                         and args.owner == inputs.get("owner") and agent == inputs.get("agent_mxid"))
+    roles = args.roles if private_setup else explicit_roles
     commons, marker = Commons(script, args.room, env), marker_path(_workspace())
     had_entry = args.room in load_marker(marker)
     try:
@@ -1245,8 +1254,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         try:
             result = publish(commons, marker, name, args.owner, args.summon,
                              detect_core() if args.core == "auto" else args.core, args.audience,
-                             agent, prompts, args.roles, features, args.if_newer, media, inputs.get("room"),
-                             had_entry, aliases=aliases, upload=not args.no_upload)
+                             agent, prompts, roles, features, args.if_newer, media, inputs.get("room"),
+                             had_entry, aliases=aliases, upload=not args.no_upload,
+                             private_setup=private_setup)
         except (PublishError, ValueError) as exc:
             print(json.dumps({"ok": False, "reason": redact(str(exc), env)}))
             return 4

@@ -38,7 +38,7 @@ Section = tp.Section
 APP_STORE = "https://apps.apple.com/us/app/s-space/id6788541784"
 OLD_SECTIONS = [
     Section("dm", "Your DM",
-            "Your DM with {name} is where you ask for things for yourself. What you ask for yourself (research, mail, calendar) comes back in your DM, never in a room.",
+            "Your DM with {name} is where you ask for things for yourself. What you ask for yourself (research, mail, calendar) comes back in your DM unless you explicitly ask to share it.",
             "Open {name} under Your agents at the top of the sidebar and ask:",
             "What can you do for me today?", "dm"),
     Section("rooms", "Rooms",
@@ -103,6 +103,7 @@ MXC_OF = {name: f"mxc://ag2.example/{i:02d}{name.replace('-', '')}" for i, name 
 RENDERED_AT = {
     "tutorial.2026-11-20.1": "034bb9e136f1cfb0135ed1ec39feb9f7d2c2cab69f8a17c3a13dedc6e556b789",
     "tutorial.2026-11-20.2": "034bb9e136f1cfb0135ed1ec39feb9f7d2c2cab69f8a17c3a13dedc6e556b789",
+    "tutorial.2026-11-20.3": "a694cb0ee8d513a9986383c5377f8bbd9c2ea272b80e2d52701be7003ae136ca",
     "tutorial.2026-11-19.2": "fca47cc35df1e0a5a0eaf9a7dfd65cb8bedf6b3998b6e10b3d6db4ae50f950d8",
     "tutorial.2026-11-19.1": "b241929d5d588687c1005c7a39b758bf1772fd74511f7dcdf44cccf08230a561",
     "tutorial.2026-10-23.1": "3b15c27a9160728fa8c3bd1da5693cdd5ec81d16064ada057888b7781dec32d8",
@@ -262,7 +263,8 @@ class ListTest(unittest.TestCase):
         self.refuse(with_step(link={"href": app, "text": "<i>x</i>"}), "link text")
         self.refuse(with_step(link=app), "link")
         page = tp.render_page("Blue", "claude")
-        self.assertEqual(page.count('<a href='), 1)
+        checklist = page.split('<details id="tutorial-checklist">', 1)[1]
+        self.assertEqual(checklist.count('<a href='), 1)
         self.assertIn(f'<a href="{app}" target="_blank" rel="noopener noreferrer">Open in the App Store</a>', page)
         self.assertIn('<figcaption>S</figcaption>', page)
 
@@ -380,7 +382,7 @@ class ListTest(unittest.TestCase):
         self.assertIsNone(tp.revision_key("tutorial.2026-10-23"))
         self.assertIsNone(tp.revision_key(None))
         self.assertTrue(tp.newer("tutorial.2026-10-23.10", "tutorial.2026-10-23.9"))
-        self.assertTrue(tp.newer("tutorial.2026-11-20.3", "tutorial.2026-10-23.9"))
+        self.assertTrue(tp.newer("tutorial.2026-11-20.4", "tutorial.2026-10-23.9"))
         self.assertTrue(tp.newer("tutorial.2026-10-23.1", None))  # a page from before lists had one
         self.assertFalse(tp.newer("tutorial.2026-10-23.1", "tutorial.2026-10-23.1"))
         self.assertFalse(tp.newer("tutorial.2026-10-23.1", "tutorial.2026-10-23.2"))
@@ -462,7 +464,7 @@ class MediaTest(unittest.TestCase):
             page = tp.render_page("Blue", core, "dm", "@kai.agent:example.test", media=MXC_OF)
             self.assertNotIn("data:image", page)
             self.assertEqual(page.count('<img src="mxc://'), 15)
-            self.assertLess(len(page.encode("utf-8")), 70_000, core)
+            self.assertLess(len(page.encode("utf-8")), 77_000, core)
 
     def test_without_media_the_page_is_the_fallback_page(self):
         self.assertEqual(tp.render_page("Blue", "claude", media={}), tp.render_page("Blue", "claude"))
@@ -487,9 +489,9 @@ class MarkerTest(unittest.TestCase):
         page = tp.render_page("Blue", "codex", "dm", self.ME)
         self.assertEqual(tp.read_marker(page), (self.ME, tp.FEATURES.revision))
         self.assertIsNone(tp.read_marker(tp.render_page("Blue", "codex")))
-        other = tp.FeatureList("tutorial.2026-11-20.3", tp.FEATURES.steps)
+        other = tp.FeatureList("tutorial.2026-11-20.4", tp.FEATURES.steps)
         self.assertEqual(tp.read_marker(tp.render_page("Blue", "codex", "dm", self.ME, features=other))[1],
-                         "tutorial.2026-11-20.3")
+                         "tutorial.2026-11-20.4")
 
     def test_ownership_reads_both_marker_forms(self):
         page = {"kind": "html-g", "title": "Getting started", "by": self.ME}
@@ -598,7 +600,7 @@ class _Cli(unittest.TestCase):
 
 class ListOverrideTest(_Cli):
     def test_render_from_a_list_file(self):
-        other = self.write_list("tutorial.2026-11-20.3")
+        other = self.write_list("tutorial.2026-11-20.4")
         code, out, err = self.main("render", "--name", "Blue", "--core", "codex", "--list", str(other))
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(out, tp.render_page("Blue", "codex", features=tp.load_list(other)))
@@ -647,7 +649,7 @@ class ListOverrideTest(_Cli):
                 mock.patch.object(gs, "list_opener", side_effect=AssertionError("network")) as opener:
             code, out, _ = self.main("render", "--name", "Blue", "--core", "codex")
             self.assertEqual((code, out), (0, tp.render_page("Blue", "codex")))
-            other = self.write_list("tutorial.2026-11-20.3")
+            other = self.write_list("tutorial.2026-11-20.4")
             code, _, _ = self.main("render", "--name", "Blue", "--list", str(other))
             self.assertEqual(code, 0)
             code, _, _ = self.publish()
@@ -656,7 +658,7 @@ class ListOverrideTest(_Cli):
         opener.assert_not_called()
 
     def test_a_served_list_replaces_the_file(self):
-        served = json.dumps(good_list(revision="tutorial.2026-11-20.3", kind="tutorial", etag="x")).encode()
+        served = json.dumps(good_list(revision="tutorial.2026-11-20.4", kind="tutorial", etag="x")).encode()
         seen = {}
 
         @contextlib.contextmanager
@@ -676,7 +678,7 @@ class ListOverrideTest(_Cli):
         self.assertEqual((code, json.loads(out)["list"]), (0, "https://api.example.test:8443/setup-copy"))
 
     def test_a_redirect_is_followed_only_to_https(self):
-        served = json.dumps(good_list(revision="tutorial.2026-11-20.3")).encode()
+        served = json.dumps(good_list(revision="tutorial.2026-11-20.4")).encode()
         routes = {"https://trusted.example/list": (302, "http://127.0.0.1:8080/cleartext-list"),
                   "http://127.0.0.1:8080/cleartext-list": (200, served),
                   "https://trusted.example/ftp": (302, "ftp://files.example/list"),
@@ -693,7 +695,7 @@ class ListOverrideTest(_Cli):
             self.assertNotIn("secret", str(caught.exception))
         transport = FakeTransport(routes)
         self.assertEqual(gs.fetch_list("https://trusted.example/moved", gs.list_opener(transport)).revision,
-                         "tutorial.2026-11-20.3")
+                         "tutorial.2026-11-20.4")
         self.assertEqual(transport.seen, ["https://trusted.example/moved", "https://cdn.example/list?sig=s"])
         # Through the CLI the refusal falls back to the file; the note shows no userinfo or query.
         with mock.patch.object(gs, "list_opener", lambda *h: urllib.request.build_opener(
@@ -762,7 +764,7 @@ class ListOverrideTest(_Cli):
         self.assertEqual((code, out), (0, tp.render_page("Blue")))
 
     def test_prompts_for_a_slot_only_the_served_list_has_are_used_and_kept(self):
-        data = good_list(revision="tutorial.2026-11-20.3")
+        data = good_list(revision="tutorial.2026-11-20.4")
         data["steps"].insert(1, {"id": "marketplace", "title": "Marketplace", "surface": "dm",
                                  "body": ["Cloud tools for {name}.", "Ask {name}:"], "screenshot": None,
                                  "since_release": "2026-11-01", "paste": "Install the Notion tool."})
@@ -783,27 +785,27 @@ class ListOverrideTest(_Cli):
         self.assertIn("Show me the Marketplace.", self.page_text())
 
     def test_publish_reports_which_list_it_used(self):
-        other = self.write_list("tutorial.2026-11-20.3")
+        other = self.write_list("tutorial.2026-11-20.4")
         code, out, _ = self.publish("--list", str(other))
         got = json.loads(out)
         self.assertEqual((code, got["action"], got["list"], got["revision"]),
-                         (0, "created", str(other), "tutorial.2026-11-20.3"))
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.3"))
+                         (0, "created", str(other), "tutorial.2026-11-20.4"))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
         entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
-        self.assertEqual((entry["state"], entry["revision"]), ("complete", "tutorial.2026-11-20.3"))
+        self.assertEqual((entry["state"], entry["revision"]), ("complete", "tutorial.2026-11-20.4"))
 
 
 class IfNewerTest(_Cli):
     def test_a_newer_list_rebuilds_the_page_in_place(self):
         code, out, _ = self.publish()
         self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
-        newer = self.write_list("tutorial.2026-11-20.3")
+        newer = self.write_list("tutorial.2026-11-20.4")
         code, out, _ = self.publish("--if-newer", "--list", str(newer))
         got = json.loads(out)
         self.assertEqual((code, got["action"], got["kind"], got["summoned"]), (0, "updated", "html-p1", False))
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.3"))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
         self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["revision"],
-                         "tutorial.2026-11-20.3")
+                         "tutorial.2026-11-20.4")
 
     def test_a_current_page_is_left_alone_even_when_the_text_would_differ(self):
         self.publish()
@@ -820,7 +822,7 @@ class IfNewerTest(_Cli):
         code, out, _ = self.main("publish", "--room", self.ROOM, "--name", "Kai", "--core", "codex",
                                  "--room-commons", str(self.stub), "--agent-mxid", self.ME)
         self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
-        self.assertIn("Getting started with Kai", self.page_text())
+        self.assertIn("Your DM with Kai", self.page_text())
 
     def test_a_page_from_before_lists_had_a_revision_is_rebuilt(self):
         self.publish()
@@ -839,7 +841,7 @@ class IfNewerTest(_Cli):
         self.publish("--prompts", str(prompts), "--roles", "Founder")
         entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
         self.assertEqual(entry["prompts"], {"dm": "Draft my weekly update.", "finale": "Plan my sprint."})
-        newer = self.write_list("tutorial.2026-11-20.3")
+        newer = self.write_list("tutorial.2026-11-20.4")
         code, out, _ = self.publish("--if-newer", "--list", str(newer), "--roles", "Founder")
         self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
         page = self.page_text()
@@ -855,11 +857,11 @@ class IfNewerTest(_Cli):
     def test_the_refresh_keeps_the_roles_line_without_being_told_again(self):
         self.publish("--roles", "I picked: Founder, Sales.")
         self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["roles"], "Founder, Sales")
-        newer = self.write_list("tutorial.2026-11-20.3")
+        newer = self.write_list("tutorial.2026-11-20.4")
         code, out, _ = self.publish("--if-newer", "--list", str(newer))
         self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
         self.assertIn('<p class="roles">Picked for: Founder, Sales</p>', self.page_text())
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.3"))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
         code, out, _ = self.publish("--if-newer", "--list", str(self.write_list("tutorial.2026-11-21.1")),
                                     "--roles", "Engineer")  # roles given again win
         self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
@@ -876,7 +878,7 @@ class IfNewerTest(_Cli):
         mine, theirs = db["pages"]["html-p1"], db["pages"]["html-p1"].replace("</main>", "<p>Our notes.</p></main>")
         db["pages"]["html-p1"] = theirs
         (self.tmp / "room.json").write_text(json.dumps(db))
-        newer = self.write_list("tutorial.2026-11-20.3")
+        newer = self.write_list("tutorial.2026-11-20.4")
         for extra in (("--if-newer", "--list", str(newer)), ("--name", "Kai")):
             code, out, err = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
                                        "--room-commons", str(self.stub), "--agent-mxid", self.ME, *extra)
@@ -891,7 +893,7 @@ class IfNewerTest(_Cli):
         (self.tmp / "room.json").write_text(json.dumps(db))
         code, out, err = self.publish("--if-newer", "--list", str(newer))
         self.assertEqual((code, json.loads(out)["action"], err), (0, "updated", ""))
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.3"))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
 
     def test_a_same_or_older_revision_pass_never_blesses_an_owner_edit(self):
         self.publish()
@@ -906,7 +908,7 @@ class IfNewerTest(_Cli):
             self.assertEqual((code, json.loads(out)["action"]), (0, "kept"), extra)
             self.assertIn("edited", err)
             self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["hash"], written)
-        code, out, _ = self.publish("--if-newer", "--list", str(self.write_list("tutorial.2026-11-20.3")))
+        code, out, _ = self.publish("--if-newer", "--list", str(self.write_list("tutorial.2026-11-20.4")))
         self.assertEqual((code, json.loads(out)["action"]), (0, "kept"))
         self.assertEqual(self.page_text(), theirs)  # the edit survives the next revision
 
@@ -971,7 +973,7 @@ class IfNewerTest(_Cli):
     def test_a_rewrite_cut_short_is_finished_by_the_next_run_at_the_exact_target(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-20.3")
+        newer = self.write_list("tutorial.2026-11-20.4")
         target = tp.render_page("Blue", "codex", "dm", self.ME, {"dm": "Draft my update."}, "Founder",
                                 tp.load_list(newer))
         self.assertEqual(len(gs.chunks(target)), 3)  # the default-size page: one replace, two appends
@@ -998,7 +1000,7 @@ class IfNewerTest(_Cli):
                 else:
                     self.assertEqual((code, got["action"], got["resumed"], got["summoned"], got["name"],
                                       got["revision"], got["list"]),
-                                     (0, "resumed", True, False, "Blue", "tutorial.2026-11-20.3", "journal"))
+                                     (0, "resumed", True, False, "Blue", "tutorial.2026-11-20.4", "journal"))
                     self.assertIn("were not applied", err)
                 self.assertEqual(self.page_text(), target)
                 entry = self.entry()
@@ -1011,7 +1013,7 @@ class IfNewerTest(_Cli):
     def test_an_edit_made_while_a_rewrite_was_cut_short_is_kept_at_every_boundary(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-20.3")
+        newer = self.write_list("tutorial.2026-11-20.4")
         for at in self.BOUNDARIES:
             with self.subTest(at=at):
                 mine, target, left = self.fail_at(at, newer, prompts)
@@ -1114,7 +1116,7 @@ class IfNewerTest(_Cli):
         that one write, which is the window the piecewise path cannot close."""
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        self.newer = self.write_list("tutorial.2026-11-20.3")
+        self.newer = self.write_list("tutorial.2026-11-20.4")
         for hook, mode in (("read:1", "append"), ("read:1", "inplace"), ("read:2", "inplace"), ("read:2", "append")):
             with self.subTest(hook=hook, mode=mode):
                 mine, target, theirs, calls, code, out, err = self.edited_run(f"{hook}:{mode}", self.newer, prompts)
@@ -1133,7 +1135,7 @@ class IfNewerTest(_Cli):
         prompts, media = self.tmp / "p.json", self.tmp / "all.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
         media.write_text(json.dumps(MXC_OF))  # every screenshot mapped: the page is text, under 40 KB
-        newer = self.newer = self.write_list("tutorial.2026-11-20.3")
+        newer = self.newer = self.write_list("tutorial.2026-11-20.4")
         for hook, mode in (("read:1", "append"), ("read:2", "append"), ("read:2", "inplace")):
             with self.subTest(hook=hook, mode=mode):
                 mine, target, theirs, calls, code, out, err = self.edited_run(f"{hook}:{mode}", newer, prompts,
@@ -1165,7 +1167,7 @@ class IfNewerTest(_Cli):
     def test_an_edit_after_any_write_is_taken_back_or_stops_the_run_by_hash(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        self.newer = self.write_list("tutorial.2026-11-20.3")
+        self.newer = self.write_list("tutorial.2026-11-20.4")
         for hook, call in (("replace:1", 1), ("append:1", 2)):
             for mode in ("append", "inplace"):
                 with self.subTest(hook=hook, mode=mode):
@@ -1173,7 +1175,7 @@ class IfNewerTest(_Cli):
                     self.expect_edit(mine, target, theirs, calls, code, out, call, gs.rewrite_steps(mine, target, whole=False))
 
     def test_a_second_failure_mid_resume_on_a_three_piece_page_still_ends_at_the_target(self):
-        data = good_list(revision="tutorial.2026-11-20.3")
+        data = good_list(revision="tutorial.2026-11-20.4")
         smallest = min(tp.ASSETS.glob("*.jpg"), key=lambda p: p.stat().st_size).name
         data["steps"].append({"id": "extra", "title": "Extra", "surface": "dm", "since_release": "2026-11-01",
                               "body": ["One more step for {name}.", "Ask {name}:"],
@@ -1224,7 +1226,7 @@ class IfNewerTest(_Cli):
     def test_a_retry_finishes_the_recorded_target_whatever_this_run_asks_for(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-20.3")
+        newer = self.write_list("tutorial.2026-11-20.4")
         other = self.write_list("tutorial.2026-12-01.1", name="other.json")
         media = self.tmp / "media.json"
         media.write_text(json.dumps({"room-list-add": MXC_OF["room-list-add"]}))
@@ -1251,7 +1253,7 @@ class IfNewerTest(_Cli):
                 got = json.loads(out)
                 self.assertEqual((code, got["action"], got["resumed"], got["summoned"], got["name"], got["core"],
                                   got["agent"], got["revision"], got["media"], got["list"]),
-                                 (0, "resumed", True, False, "Blue", "codex", self.ME, "tutorial.2026-11-20.3", [],
+                                 (0, "resumed", True, False, "Blue", "codex", self.ME, "tutorial.2026-11-20.4", [],
                                   "journal"))
                 self.assertIn("were not applied", err)
                 self.assertEqual(self.page_text(), target)
@@ -1260,7 +1262,7 @@ class IfNewerTest(_Cli):
                 self.assertEqual((entry["state"], entry["hash"], entry["prompts"], entry["roles"], entry["revision"],
                                   entry.get("media")),
                                  ("complete", gs.content_hash(target), {"dm": "Draft my update."}, "Founder",
-                                  "tutorial.2026-11-20.3", None))
+                                  "tutorial.2026-11-20.4", None))
                 self.assertFalse(set(entry) & set(gs.JOURNAL_KEYS))
                 code, out, err = self.publish("--if-newer", "--list", str(newer))  # the target is current
                 self.assertEqual((code, json.loads(out)["action"], err), (0, "unchanged", ""))
@@ -1272,12 +1274,12 @@ class IfNewerTest(_Cli):
         code, out, _ = self.main("publish", "--room", self.ROOM, "--room-commons", str(self.stub),
                                  *[a for a in argv if a != "--if-newer"])
         self.assertEqual((code, json.loads(out)["action"], json.loads(out)["summoned"]), (0, "updated", True))
-        self.assertIn("Getting started with Kai", self.page_text())
+        self.assertIn("Your DM with Kai", self.page_text())
 
     def test_recovery_runs_before_this_runs_inputs_are_rendered(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-20.3")
+        newer = self.write_list("tutorial.2026-11-20.4")
         heavy = self.tmp / "heavy.json"
         heavy.write_text(json.dumps(many_steps(tp.STEPS_MAX, shots=3)))  # valid, over the page cap once rendered
         target = self.cut_short(newer, prompts)
@@ -1292,7 +1294,7 @@ class IfNewerTest(_Cli):
     def test_an_updating_entry_whose_target_does_not_hash_is_refused(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-20.3")
+        newer = self.write_list("tutorial.2026-11-20.4")
         target = self.cut_short(newer, prompts)
         self.record(target=target.replace("Draft my update.", "Something else."))
         code, out, _ = self.publish("--if-newer", "--list", str(newer))
@@ -1303,11 +1305,11 @@ class IfNewerTest(_Cli):
 
     def test_a_revision_only_bump_rewrites_once_then_is_a_no_op(self):
         self.publish()
-        bumped = self.write_list("tutorial.2026-11-20.3")  # the same steps, a newer revision
+        bumped = self.write_list("tutorial.2026-11-20.4")  # the same steps, a newer revision
         code, out, _ = self.publish("--if-newer", "--list", str(bumped))
         self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.3"))
-        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["revision"], "tutorial.2026-11-20.3")
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
+        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["revision"], "tutorial.2026-11-20.4")
         page = self.page_text()
         calls = len(json.loads((self.tmp / "room.json").read_text())["calls"])
         code, out, _ = self.publish("--if-newer", "--list", str(bumped))
@@ -1319,7 +1321,7 @@ class IfNewerTest(_Cli):
         calls = len(json.loads((self.tmp / "room.json").read_text())["calls"])
         code, out, _ = self.publish("--if-newer", "--list", str(bumped))
         self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))
-        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["revision"], "tutorial.2026-11-20.3")
+        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["revision"], "tutorial.2026-11-20.4")
         writes = [c for c in json.loads((self.tmp / "room.json").read_text())["calls"][calls:] if c[0] not in ("read", "pages")]
         self.assertEqual(writes, [])
 
@@ -1361,10 +1363,10 @@ class IfNewerTest(_Cli):
         code, out, _ = self.publish()  # untouched: ours again, and rewrites go through the journal
         got = json.loads(out)
         self.assertEqual((code, got["action"], got.get("adopted"), got["summoned"]), (0, "unchanged", True, False))
-        newer = self.write_list("tutorial.2026-11-20.3")
+        newer = self.write_list("tutorial.2026-11-20.4")
         code, out, _ = self.publish("--if-newer", "--list", str(newer))
         self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.3"))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
         # Edited after the marker was lost: adopted as found, never rewritten.
         db = json.loads((self.tmp / "room.json").read_text())
         theirs = db["pages"]["html-p1"].replace("</main>", "<p>OWNER NOTES</p></main>")
@@ -1381,12 +1383,12 @@ class IfNewerTest(_Cli):
             self.assertEqual(self.writes_since(n), [])
         entry = self.entry()
         self.assertEqual((entry["foreign"], entry["hash"], entry["revision"]),
-                         (True, gs.content_hash(theirs), "tutorial.2026-11-20.3"))
+                         (True, gs.content_hash(theirs), "tutorial.2026-11-20.4"))
 
     def test_recovery_needs_nothing_of_this_runs_request(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-20.3")
+        newer = self.write_list("tutorial.2026-11-20.4")
         # An invalid name: recovered first; the name is refused on the run that would use it.
         target = self.cut_short(newer, prompts)
         code, out, err = self.publish("--name", " ")
@@ -1426,10 +1428,10 @@ class IfNewerTest(_Cli):
         mine = self.page_text()
         self.assertGreater(len(mine.encode()), 131_072)  # over Linux's cap on one exec argument
         n = self.calls()
-        newer = self.write_list("tutorial.2026-11-20.3")
+        newer = self.write_list("tutorial.2026-11-20.4")
         code, out, err = self.publish("--if-newer", "--list", str(newer))  # setUp holds every exec to that cap
         self.assertEqual((code, json.loads(out)["action"], err), (0, "updated", ""))
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.3"))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
         writes = self.writes_since(n)
         self.assertEqual([w[0] for w in writes], ["replace"])
         self.assertEqual(writes[0][2], len(mine.encode()))  # one replace whose needle is the whole page
@@ -1437,7 +1439,7 @@ class IfNewerTest(_Cli):
     def test_a_page_no_call_can_hold_is_refused_and_left_as_is(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        self.newer = self.write_list("tutorial.2026-11-20.3")
+        self.newer = self.write_list("tutorial.2026-11-20.4")
         for budget in (self.SMALL, (70_000, 140_000)):
             with self.subTest(budget=budget):
                 mine, target, theirs, calls, code, out, err = self.edited_run(
@@ -1457,7 +1459,7 @@ class IfNewerTest(_Cli):
         first write, read:3 the read-back after it."""
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        self.newer = self.write_list("tutorial.2026-11-20.3")
+        self.newer = self.write_list("tutorial.2026-11-20.4")
         for budget in (self.SMALL, self.SPLIT):
             for hook in ("read:2", "read:3"):
                 with self.subTest(budget=budget, hook=hook):
@@ -1479,7 +1481,7 @@ class IfNewerTest(_Cli):
     def test_an_owner_prepend_while_a_cut_short_rewrite_resumes_stays_at_the_front(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-20.3")
+        newer = self.write_list("tutorial.2026-11-20.4")
         for hook in ("read:1", "read:2"):
             with self.subTest(hook=hook):
                 (self.tmp / "room.json").unlink(missing_ok=True)
@@ -1513,7 +1515,7 @@ class IfNewerTest(_Cli):
     def test_a_replace_that_cannot_be_taken_back_is_reported_as_landed(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        self.newer = self.write_list("tutorial.2026-11-20.3")
+        self.newer = self.write_list("tutorial.2026-11-20.4")
         real = gs.fits_call
         # The undo's call (the shorter first piece back to the whole old page) does not fit this host.
         fits = mock.patch.object(gs, "fits_call", lambda a, b, env=None: real(a, b, env) and len(a) >= len(b))
@@ -1568,7 +1570,7 @@ class IfNewerTest(_Cli):
         got = json.loads(out)
         self.assertEqual((code, got["action"], got.get("adopted")), (0, "updated", True))
         self.assertTrue(tp.page_digest_ok(self.page_text()))
-        self.assertIn("Getting started with Blue", self.page_text())
+        self.assertIn("Get started with <span>your agent</span> in s.space", self.page_text())
         self.assertIsNone(self.entry().get("foreign"))
         code, out, _ = self.publish("--if-newer")
         self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))
@@ -1624,9 +1626,9 @@ class IfNewerTest(_Cli):
         commons = gs.Commons(self.stub, self.ROOM, actions=lambda: self.door)
         out = gs.publish(commons, marker, "Blue", core="codex", agent=self.ME)
         self.assertEqual(out["revision"], tp.FEATURES.revision)
-        other = tp.FeatureList("tutorial.2026-11-20.3", tp.FEATURES.steps)
+        other = tp.FeatureList("tutorial.2026-11-20.4", tp.FEATURES.steps)
         out = gs.publish(commons, marker, "Blue", core="codex", agent=self.ME, features=other, if_newer=True)
-        self.assertEqual((out["action"], out["revision"]), ("updated", "tutorial.2026-11-20.3"))
+        self.assertEqual((out["action"], out["revision"]), ("updated", "tutorial.2026-11-20.4"))
         out = gs.publish(commons, marker, "Kai", core="codex", agent=self.ME, features=other, if_newer=True)
         self.assertEqual(out["action"], "unchanged")
 
@@ -1683,8 +1685,8 @@ class UploadTest(_Cli):
         # The text page (under 40 KB, as test_a_fully_mapped_page_shrinks_to_text pins) plus the
         # inlined app icon, about 18 KB of base64.
         icon = sum(len(base64.b64encode((tp.ASSETS / f).read_bytes())) for f in ("app-icon.png", "app-store-qr.png"))
-        self.assertLess(len(page.encode("utf-8")) - icon, 70_000)
-        self.assertLess(len(page.encode("utf-8")), 90_000)
+        self.assertLess(len(page.encode("utf-8")) - icon, 77_000)
+        self.assertLess(len(page.encode("utf-8")), 97_000)
         self.assertEqual(page.count('<img src="mxc://'), 13)
         self.assertNotIn("data:image/jpeg", page)
         self.assertEqual(page.count('<img src="data:image/png;base64,'), 2)  # the app icon and QR stay inline
