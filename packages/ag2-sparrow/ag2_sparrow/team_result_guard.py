@@ -40,11 +40,13 @@ try:  # pragma: no cover - the packaged twin exercises the relative imports
     from .local_task_protocol import canonical_access_tier, find_archived_task, parse_task_headers
     from .task_archive import find_task_file
     from .file_lock import lock_fd, unlock_fd
+    from .public_digest import configured_sources, gh_fetch, verified_public_digests
 except ImportError:
     from result_markers import parse_markers  # monorepo src/ on sys.path
     from local_task_protocol import canonical_access_tier, find_archived_task, parse_task_headers
     from task_archive import find_task_file
     from file_lock import lock_fd, unlock_fd
+    from policy.egress.public_digest import configured_sources, gh_fetch, verified_public_digests
 
 TEAM_LEAK_RESULT = (
     "I completed the Team task, but the response was withheld because it may "
@@ -288,7 +290,8 @@ def attach_markers_confined(body: str, attach_roots) -> bool:
 def scan_team_result(body: str, repo: Path, secret_filter=None,
                      scan_sensitive_data: bool = True,
                      allow_attach: bool = False,
-                     attach_roots=()) -> str:
+                     attach_roots=(), digest_sources=None,
+                     digest_fetch=gh_fetch) -> str:
     """Return `body` unchanged, or raise TeamResultLeakError if it must be withheld."""
     kinds = {action.kind for action in parse_markers(body or "").actions}
     # dm-only only suppresses a redirect the guard already withholds, and a
@@ -312,6 +315,12 @@ def scan_team_result(body: str, repo: Path, secret_filter=None,
     filter_chat_secrets = secret_filter or load_team_result_scanner(repo)
     try:
         result = filter_chat_secrets(body)
+        if result.detected:
+            sources = (configured_sources(repo) if digest_sources is None
+                       else digest_sources)
+            public = verified_public_digests(body, sources, digest_fetch)
+            if public:
+                result = filter_chat_secrets(body, public_digests=public)
     except Exception as exc:
         raise RuntimeError("Team result secret scan failed") from exc
     if result.detected:
