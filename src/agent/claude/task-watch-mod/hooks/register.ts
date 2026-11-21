@@ -244,7 +244,6 @@ export class TaskWatch {
           this.note(`submit #${id} is not sent again: it was delivered late`)
           continue
         }
-        timedOut = false
         this.ann.unshift(text)
       }
     } finally {
