@@ -8,11 +8,15 @@ from _helpers.hermetic_env import isolate_os_environ
 # Before anything reads the environment: no outer credential selector survives.
 isolate_os_environ()
 
+import contextlib
+import io
+import json
 import importlib.util
 import os
 import pathlib
 import tempfile
 import unittest
+from unittest.mock import patch
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
@@ -40,6 +44,45 @@ class SendBodyFile(unittest.TestCase):
             p = pathlib.Path(td) / "b.txt"
             p.write_text(HAZARD + "\n", encoding="utf-8")
             self.assertEqual(db._send_cli_body(["--body-file", str(p)]), HAZARD)
+
+    def test_addressed_reviewer_body_reaches_discord_and_honors_post_gate(self):
+        from channels.discord.client import DiscordRestClient
+        body = "<@123456789> Re-review https://github.com/example/project/pull/1: routing fixed."
+        with tempfile.TemporaryDirectory() as td:
+            path = pathlib.Path(td) / "review.txt"
+            path.write_text(body + "\n", encoding="utf-8")
+            for refusal in (None, "posting refused"):
+                with self.subTest(refusal=refusal):
+                    posted, validated = [], []
+
+                    def transport(req, timeout):
+                        posted.append((req.full_url, json.loads(req.data)))
+                        return 200, {"id": "receipt-123"}
+
+                    def validator(channel, payload):
+                        validated.append((channel, payload))
+                        return refusal
+
+                    client = DiscordRestClient("test-token", transport=transport,
+                                               validator=validator)
+                    output = io.StringIO()
+                    with patch.object(db, "_rest_client", return_value=client), contextlib.redirect_stdout(output):
+                        reply_to, argv = db._parse_send_argv(["--body-file", str(path)])
+                        if refusal:
+                            with self.assertRaises(SystemExit) as caught:
+                                db._send_via_rest("987654321", db._send_cli_body(argv), reply_to)
+                            self.assertEqual(caught.exception.code, 1)
+                        else:
+                            db._send_via_rest("987654321", db._send_cli_body(argv), reply_to)
+                    self.assertEqual(validated, [("987654321", {"content": body})])
+                    if refusal:
+                        self.assertEqual(posted, [])
+                        self.assertNotIn("message_id receipt-123", output.getvalue())
+                    else:
+                        self.assertEqual(len(posted), 1)
+                        self.assertTrue(posted[0][0].endswith("/channels/987654321/messages"))
+                        self.assertEqual(posted[0][1]["content"], body)
+                        self.assertIn("message_id receipt-123", output.getvalue())
 
     def test_default_path_is_unchanged(self):
         self.assertEqual(db._send_cli_body(["hello", "world"]), "hello world")
