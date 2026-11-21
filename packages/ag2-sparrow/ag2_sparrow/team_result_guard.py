@@ -1318,11 +1318,14 @@ def guard_proactive_for_destination(body: str, destination, owner_destination, d
     (notice, reason) to send `destination` the withheld notice instead.
 
     A body the adapter routed to a destination other than the owner's conversation (None means
-    the owner's) is read by that audience, so the text it shows is guarded at `destination_tier`;
-    its markers stay the owner's to issue.
+    the owner's) is read by that audience, so the text it shows is guarded at `destination_tier`.
+    A proactive body carries no task tier, so a guarded destination takes no `[file:]` from it.
     """
     if destination is None or destination == owner_destination:
         return body, None
+    if (is_guarded_tier(destination_tier)
+            and any(a.kind == "attach" for a in parse_markers(body or "").actions)):
+        return TEAM_LEAK_RESULT_MARKER, "result delivery control marker"
     safe, reason = guard_result_for_tier(parse_markers(body or "").body, destination_tier, repo,
                                          secret_filter, scan_sensitive_data, honor_suppressions=False)
     return (body, None) if reason is None else (safe, reason)

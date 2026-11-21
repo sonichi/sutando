@@ -206,13 +206,13 @@ def main() -> int:
 
     missing = "/nonexistent-4971/report.png"
     calls, case_log = deliver("proactive-redirect-4971.txt",
-                              f"[channel: D0OTHERDM1]\nhello other DM\n[attach: {missing}]\n")
+                              f"[channel: D0OWNERALT]\nhello other DM\n[attach: {missing}]\n")
     check("the proactive file was delivered", len(calls) >= 2, f"{len(calls)} post(s)")
 
     channels = {c.get("channel") for c in calls}
     texts = [c.get("text", "") for c in calls]
     check("every post goes to the redirect target, none to the owner's DM",
-          channels == {"D0OTHERDM1"}, f"posted to {sorted(map(str, channels))}")
+          channels == {"D0OWNERALT"}, f"posted to {sorted(map(str, channels))}")
     check("the body arrives without the redirect marker",
           "hello other DM" in texts and not any("[channel:" in t for t in texts), repr(texts))
     check("the attach marker is acted on, not shown",
@@ -220,11 +220,12 @@ def main() -> int:
 
     sent = [line for line in case_log if "[proactive] sent to" in line]
     check("the delivery log names the redirect target",
-          len(sent) == 1 and "sent to D0OTHERDM1" in sent[0], repr(sent))
+          len(sent) == 1 and "sent to D0OWNERALT" in sent[0], repr(sent))
     check("the delivery log shows the parsed body, not the raw markers",
           len(sent) == 1 and "[channel:" not in sent[0], repr(sent))
 
     from policy.egress.result import TEAM_LEAK_RESULT as NOTICE
+    from policy.egress.result import TEAM_LEAK_RESULT_MARKER as MARKER_NOTICE
 
     leak = "copy failed: [Errno 2] No such file: /Users/someone/private/plan.md"
     posts, case_log = deliver("proactive-leak-other.txt", f"[channel: D0STRANGER]\n{leak}\n")
@@ -258,17 +259,19 @@ def main() -> int:
     try:
         posts, _ = deliver("proactive-notice-other.txt",
                            f"[channel: D0STRANGER]\nweekly summary\n[attach: {private}]\n[attach: {missing}]\n")
-        texts = [p.get("text", "") for p in posts]
-        check("a redirected body's denied / missing notices name no local path",
-              "(file access denied: report.png)" in texts and "(file not found: missing.png)" in texts
-              and not any(str(private.parent) in t or "/Users/" in t for t in texts), repr(texts))
+        check("a non-owner destination gets only the marker notice for a body carrying [file:]",
+              [(p.get("channel"), p.get("text")) for p in posts] == [("D0STRANGER", MARKER_NOTICE)]
+              and not uploads, repr((posts, uploads)))
         posts, _ = deliver("proactive-notice-owner.txt", f"weekly summary\n[attach: {missing}]\n")
         check("the owner DM still gets the full path in its notice",
               f"(file not found: {missing})" in [p.get("text") for p in posts], repr(posts))
         public = str(private.parent / "public.png")
         deliver("proactive-notice-public.txt", f"[channel: D0STRANGER]\nchart\n[attach: {public}]\n")
-        check("an allowlisted attachment to a non-owner destination is still uploaded",
-              ("D0STRANGER", public) in uploads, repr(uploads))
+        check("an allowlisted attachment to a non-owner destination is not uploaded",
+              not uploads, repr(uploads))
+        deliver("proactive-notice-owner-alt.txt", f"[channel: D0OWNERALT]\nchart\n[attach: {public}]\n")
+        check("an allowlisted attachment to an owner-tier destination is still uploaded",
+              ("D0OWNERALT", public) in uploads, repr(uploads))
     finally:
         bridge._is_path_sendable, bridge._send_file = real_sendable, real_send_file
 

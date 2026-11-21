@@ -75,8 +75,18 @@ def main() -> int:
           run("[dm-only]\n" + body, "other") == ("[dm-only]\n" + body, None))
 
     clean = "[channel: D-OTHER]\nhello\n[attach: /Users/someone/report.png]"
-    check("a clean redirected body keeps its own markers (attach is the transport's to authorize)",
-          run(clean, "other") == (clean, None), repr(run(clean, "other")))
+    for tier in ("other", "team", "guest", None, ""):
+        check(f"a redirected [file:] to a guarded destination is withheld (tier={tier!r})",
+              run(clean, tier) == (guard.TEAM_LEAK_RESULT_MARKER, "result delivery control marker"),
+              repr(run(clean, tier)))
+    check("a redirected [file:] to an owner-tier destination keeps its markers",
+          run(clean, "owner") == (clean, None), repr(run(clean, "owner")))
+    check("the owner DM keeps its [file:] markers",
+          run(clean.replace("D-OTHER", OWNER_DM), "other") == (clean.replace("D-OTHER", OWNER_DM), None))
+    check("[dm-only] cancels the redirect, so a [file:] stays the owner's",
+          run("[dm-only]\n" + clean, "other") == ("[dm-only]\n" + clean, None))
+    check("a clean redirected body with no [file:] is delivered as written",
+          run("[channel: D-OTHER]\nhello", "other") == ("[channel: D-OTHER]\nhello", None))
     safe, reason = run("[channel: D-OTHER]\ntoken inside", "team", scan=_leaky)
     check("a secret in a redirected body is withheld", reason is not None and safe == guard.TEAM_LEAK_RESULT)
     check("the secret scan is not applied to the owner DM",

@@ -86,6 +86,7 @@ try:
     class Ch:
         id = TARGET
         name = "target"
+        recipient = types.SimpleNamespace(id=TARGET)
 
         async def send(self, *a, **k):
             sends.append((a, k))
