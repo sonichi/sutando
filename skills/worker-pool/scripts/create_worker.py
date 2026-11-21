@@ -128,12 +128,14 @@ def report(made: dict, roster: dict, room, orphans: list) -> str:
     # Read through .get: spawn()'s contract is these keys, but a partial
     # report beats a KeyError when a caller upstream reshapes its extras.
     tmux = made.get("tmux") or {}
+    session = (sw.attach_command(tmux["socket"], tmux["session_name"])
+               if tmux.get("socket") and tmux.get("session_name") else "unknown")
     lines = [
         f"worker {made['worker_id']}",
         f"  label     {made.get('label') or made['worker_id']}",
         f"  folder    {made.get('cwd', '?')}",
         f"  delivery  {made.get('delivery_dir', '?')}",
-        f"  session   tmux -S {tmux.get('socket', '?')} attach -t {tmux.get('session_name', '?')}",
+        f"  session   {session}",
         f"  roster    v{roster['version']} ({len(roster['workers'])} worker(s))",
     ]
     lines.append(f"  room      {room}" if room else
