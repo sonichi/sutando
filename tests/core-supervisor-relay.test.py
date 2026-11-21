@@ -77,6 +77,10 @@ _FABLE_REFUSED_AUTO = dict(_IDLE, seat="Pro-fast",
 _PRESS_ENTER_AUTO = dict(_RUNNING, auto_answered={"kind": "press-enter", "key": "Enter", "at": 1.0})
 
 
+def _details(sig):
+    return " | ".join(_mod.compose_details(sig))
+
+
 @contextlib.contextmanager
 def _backend(value):
     """Pin what the core's recorded backend looks like. Stubbed rather than written to
@@ -178,7 +182,9 @@ class TestComposeMessage(unittest.TestCase):
     def test_a_refused_turn_switch_names_the_worker_and_the_switch(self):
         self.assertTrue(should_escalate(_FABLE_REFUSED_AUTO, None)[0])
         msg = compose_message(dict(_FABLE_REFUSED_AUTO, seat="sutando-worker-d2571c90"))
-        self.assertIn("worker sutando-worker-d2571c90", msg)
+        self.assertIn("A worker had a turn refused", msg, "a session name is not a name")
+        self.assertNotIn("sutando-worker-d2571c90", msg)
+        self.assertIn("Pro-fast had a turn refused", compose_message(dict(_FABLE_REFUSED_AUTO, seat="Pro-fast")))
         self.assertIn("/model opus", msg)
         self.assertNotIn("Agent needs you", msg)
         self.assertIn("the core", compose_message({k: v for k, v in _FABLE_REFUSED_AUTO.items() if k != "seat"}))
@@ -204,15 +210,16 @@ class TestComposeMessage(unittest.TestCase):
                      "kind": "fable-limit-unfocused"}
         self.assertTrue(should_escalate(unfocused, None)[0])
         msg = compose_message(unfocused)
-        self.assertIn("Agent needs you", msg)
+        self.assertIn("needs you", msg)
         self.assertIn("will not press Enter", msg)
         self.assertNotIn("/login", msg)
 
     def test_includes_detail_and_prompt_excerpt(self):
         m = compose_message(_LOGIN)
         self.assertIn("awaiting user: login", m)
-        self.assertIn("Login", m)  # first prompt line
-        self.assertIn("resolve", m)
+        self.assertIn(": " + _LOGIN["prompt"].strip().splitlines()[0][:110], m, "what is asked stays visible")
+        self.assertIn("terminal: " + _LOGIN["prompt"].strip().splitlines()[0], _details(_LOGIN))
+        self.assertIn("can't sign it in", m)
 
     def test_login_pane_excerpt_is_the_prompt_not_the_chrome(self):
         # The pane's first non-empty line is a box rule and the next an OAuth URL fragment; the
@@ -221,7 +228,7 @@ class TestComposeMessage(unittest.TestCase):
                 "https://claude.ai/oauth/authorize?code=true&code_challenge=ncifI5jOgzI138TpX&state=uv\n"
                 "Browser didn't open? Use the url below to sign in:\n"
                 "Paste code here if prompted >\n")
-        m = compose_message(dict(_LOGIN, prompt=pane))
+        m = _details(dict(_LOGIN, prompt=pane))
         self.assertIn("Use the url below to sign in", m)
         for noise in ("╭", "───", "https://", "code_challenge"):
             self.assertNotIn(noise, m)
@@ -230,7 +237,7 @@ class TestComposeMessage(unittest.TestCase):
         # The notice is the owner's only channel: a missing filter module must not drop it.
         pane = "╭─ rule ─╮\nBrowser didn't open? Use the url below to sign in:\n"
         with patch.dict(sys.modules, {"prompt_excerpt": None}):
-            m = compose_message(dict(_LOGIN, prompt=pane))
+            m = _details(dict(_LOGIN, prompt=pane))
         self.assertIn("╭─ rule ─╮", m)  # the old first-non-empty line, degraded but delivered
 
     def test_the_filter_is_found_from_the_relays_own_directory(self):
@@ -240,7 +247,7 @@ class TestComposeMessage(unittest.TestCase):
         try:
             sys.path[:] = [p for p in sys.path if os.path.abspath(p) != os.path.abspath(src_dir)]
             sys.modules.pop("prompt_excerpt", None)
-            m = compose_message(dict(_LOGIN, prompt="╭─ rule ─╮\nUse the url below to sign in:\n"))
+            m = _details(dict(_LOGIN, prompt="╭─ rule ─╮\nUse the url below to sign in:\n"))
         finally:
             sys.path[:] = saved
         self.assertIn("Use the url below to sign in", m)
@@ -248,18 +255,18 @@ class TestComposeMessage(unittest.TestCase):
     def test_handles_no_prompt(self):
         m = compose_message(_LOGGED_OUT)
         self.assertIn("not authenticated", m)
-        self.assertTrue(m.endswith("resolve this."))
+        self.assertTrue(m.endswith("A chat reply can't sign it in."))
 
     # Login-class states (sonichi#2397): the remedy is a GUI /login on the host —
     # "reply here or open the app" prescribes actions that cannot clear them.
     def test_logged_out_names_gui_login_remedy(self):
         m = compose_message(_LOGGED_OUT)
-        self.assertIn("GUI /login", m)
+        self.assertIn("has to be signed in again", m)
         self.assertNotIn("reply here or open the app", m)
 
     def test_login_prompt_names_gui_login_remedy(self):
         m = compose_message(_LOGIN)
-        self.assertIn("GUI /login", m)
+        self.assertIn("has to be signed in again", m)
         self.assertNotIn("reply here or open the app", m)
 
     def test_session_limit_escalates(self):
@@ -296,19 +303,20 @@ class TestComposeMessage(unittest.TestCase):
     def test_turn_rejected_says_every_turn_is_refused_and_names_the_line(self):
         m = compose_message(_REFUSED)
         self.assertIn("refuses every turn", m)
-        self.assertIn("out of usage credits", m)
+        self.assertIn("out of usage credits", _details(_REFUSED))
         # A credit line gets the limit remedy, never the login one.
         self.assertIn("/usage-credits", m)
         self.assertIn("not a login problem", m)
-        self.assertNotIn("GUI /login", m)
+        self.assertNotIn("has to be signed in again", m)
         self.assertNotIn("restart.sh", m)
 
     def test_turn_rejected_login_line_names_gui_login_remedy(self):
         sig = dict(_REFUSED, prompt="OAuth access token has expired · Please run /login")
         m = compose_message(sig)
         self.assertIn("refuses every turn", m)
-        self.assertIn("OAuth access token has expired", m)
-        self.assertIn("GUI /login", m)
+        self.assertIn("OAuth access token has expired", _details(sig))
+        self.assertIn("OAuth access token has expired", m, "what is asked stays visible")
+        self.assertIn("has to be signed in again", m)
         self.assertNotIn("usage limit", m)
 
     def test_turn_rejected_unknown_line_falls_back_to_the_terminal(self):
@@ -316,7 +324,7 @@ class TestComposeMessage(unittest.TestCase):
         with _no_backend():
             m = compose_message(sig)
         self.assertIn("refuses every turn", m)
-        self.assertIn("where the core is running", m)
+        self.assertIn("in its terminal on", m)
 
     _PICKER = "Select model\n  1. Opus\n❯ 2. Sonnet\n  3. Haiku\n  Enter to confirm · Esc to cancel"
     _YESNO = "Allow Bash(rm -rf build)?\n❯ 1. Yes\n  2. No\n  Esc to cancel"
@@ -330,7 +338,7 @@ class TestComposeMessage(unittest.TestCase):
             with _no_backend():
                 m = compose_message(sig, surface="ag2space")
             self.assertIn("choice card in our DM", m, kind)
-            self.assertLess(m.index("choice card"), m.index("where the core is running"), kind)
+            self.assertLess(m.index("choice card"), m.index("in its terminal on"), kind)
             self.assertIn("A typed chat reply can't answer it", m)
         sig = {"state": "blocked-human", "detail": "awaiting user: unknown", "prompt": "??", "kind": "unknown"}
         with _no_backend():
@@ -344,7 +352,7 @@ class TestComposeMessage(unittest.TestCase):
             with _no_backend():
                 m = compose_message({**base, "prompt": self._PICKER}, surface=surface)
             self.assertNotIn("choice card", m, surface or "macos-only")
-            self.assertIn("answer it where the core is running", m, surface or "macos-only")
+            self.assertIn("answer it in its terminal on", m, surface or "macos-only")
         never = ("Do you trust the files in this folder?\n❯ 1. Yes, proceed\n  2. No, exit",
                  "Bypass Permissions mode\n❯ 1. Yes, I accept\n  2. No",
                  "You've hit your weekly limit\n❯ 1. Switch to Opus and continue\n  2. Stop")
@@ -352,7 +360,7 @@ class TestComposeMessage(unittest.TestCase):
             with _no_backend():
                 m = compose_message({**base, "prompt": prompt}, surface="ag2space")
             self.assertNotIn("choice card", m, prompt.splitlines()[0])
-            self.assertIn("answer it where the core is running", m)
+            self.assertIn("answer it in its terminal on", m)
         with _no_backend():
             m = compose_message({**base, "prompt": "pick one"}, surface="ag2space")
         self.assertNotIn("choice card", m, "no numbered options: no buttons")
@@ -367,7 +375,7 @@ class TestComposeMessage(unittest.TestCase):
         with _no_backend(), patch.dict(sys.modules, {"hitl": None, "hitl.tui_gate": None}):
             m = compose_message(sig, surface="ag2space")
         self.assertNotIn("choice card", m)
-        self.assertIn("answer it where the core is running", m)
+        self.assertIn("answer it in its terminal on", m)
         # Run as a script, src/ is not on sys.path yet: the lookup puts it there itself.
         src = os.path.dirname(os.path.abspath(_SRC))
         with patch.object(sys, "path", [p for p in sys.path if os.path.abspath(p) != src]):
@@ -391,12 +399,12 @@ class TestComposeMessage(unittest.TestCase):
             m = compose_message(sig)
         # FALLBACK shape: with no derivable backend (embedded core, unreadable .alive)
         # the remedy must still not invent a transport name.
-        self.assertIn("where the core is running", m)
+        self.assertIn("in its terminal on", m)
         self.assertNotIn("tmux", m)
         self.assertNotIn("sutando-core", m)
         self.assertNotIn("reply here", m)
         self.assertNotIn("open the app to resolve", m)
-        self.assertNotIn("GUI /login", m)
+        self.assertNotIn("has to be signed in again", m)
 
     def test_blocked_human_names_the_DERIVED_terminal(self):
         """When the running core recorded its socket, name it — a generic 'where the
@@ -404,11 +412,11 @@ class TestComposeMessage(unittest.TestCase):
         sig = {"state": "blocked-human", "detail": "awaiting user: selection",
                "prompt": "pick one", "kind": "selection"}
         with _backend({"socket": "/tmp/probe-tmux.sock"}):
-            m = compose_message(sig)
-        self.assertIn("/tmp/probe-tmux.sock", m)
+            m, d = compose_message(sig), _details(sig)
+        self.assertIn("open its terminal: tmux -S /tmp/probe-tmux.sock attach -t sutando-core", d)
+        self.assertNotIn("/tmp/probe-tmux.sock", m, "the command is a detail, not the notice")
         self.assertIn("terminal", m)
-        self.assertNotIn("where the core is running", m,
-                         "the derived form must REPLACE the vague one, not append to it")
+        self.assertEqual(m.count("in its terminal on"), 1)
 
     def test_derivation_failure_is_fail_open_not_fatal(self):
         """A helper that raises must degrade to the generic remedy, never crash the
@@ -417,7 +425,7 @@ class TestComposeMessage(unittest.TestCase):
                "prompt": "pick one", "kind": "selection"}
         with _backend_raises():
             m = compose_message(sig)
-        self.assertIn("where the core is running", m)
+        self.assertIn("in its terminal on", m)
 
     def test_truncates_long_prompt(self):
         """The prompt echo is bounded, the remedy is not, and the bound must hold
@@ -437,7 +445,58 @@ class TestComposeMessage(unittest.TestCase):
     def test_kind_appended_when_not_in_detail(self):
         sig = {"state": "blocked-human", "detail": "the core is waiting",
                "prompt": "pick one", "kind": "selection"}
-        self.assertIn("(selection)", compose_message(sig))
+        self.assertNotIn("(selection)", compose_message(sig), "a gate code is a detail")
+        self.assertIn("state: blocked-human · gate: selection", _details(sig))
+
+
+class TestNoticeReadsPlainly(unittest.TestCase):
+    """The notice names who and why; codes, terminal lines, commands and keys are details."""
+
+    KEY = "sk-ant-api03-" + "a1B2" * 8
+    SIGNALS = (_LOGIN, _LOGGED_OUT, _HUNG, _REFUSED,
+               {"state": "blocked-human", "detail": "awaiting user: selection", "prompt": "pick one",
+                "kind": "selection", "seat": "Reviewer (7c700e11a8d9)"})
+
+    def test_no_notice_carries_a_command_a_socket_an_issue_number_or_a_key(self):
+        for sig in self.SIGNALS:
+            sig = dict(sig, prompt=f"{sig.get('prompt') or ''}\nAuthorization: Bearer {self.KEY}")
+            with _backend({"socket": "/tmp/sutando-tmux.sock"}):
+                m, d = compose_message(sig), _details(sig)
+            for leak in ("tmux", "/tmp/sutando-tmux.sock", "sonichi#", "attach -t", self.KEY, "sk-ant", "7c700e11"):
+                self.assertNotIn(leak, m, sig.get("state"))
+            self.assertNotIn(self.KEY, d)
+            self.assertIn("open its terminal: tmux -S /tmp/sutando-tmux.sock attach -t", d)
+
+    def test_the_detail_loses_its_internal_tokens_and_the_question_stays_visible(self):
+        sig = {"state": "blocked-human", "detail": "awaiting user in sutando-core (7c700e11a8d9)",
+               "kind": "selection", "prompt": "╭────╮\nWhich branch should I merge?\n❯ 1. main\n"}
+        with _no_backend():
+            m = compose_message(sig)
+        self.assertIn("needs you — Awaiting user: Which branch should I merge?", m)
+        for leak in ("sutando-core", "7c700e11a8d9", "╭"):
+            self.assertNotIn(leak, m)
+        with patch.dict(sys.modules, {"owner_text": None}):
+            self.assertEqual(_mod._plain("x y"), "x y")
+
+    def test_a_worker_is_named_by_its_label_and_the_core_by_its_display_name(self):
+        self.assertTrue(compose_message(self.SIGNALS[-1]).startswith("⚠️ Reviewer needs you — "))
+        import agent_local_name
+        with patch.object(agent_local_name, "local_name", return_value="Blue Fox"):
+            self.assertTrue(compose_message(_LOGIN).startswith("⚠️ Blue Fox needs you — "))
+        with patch.object(agent_local_name, "local_name", side_effect=RuntimeError("no records")):
+            self.assertTrue(compose_message(_LOGIN).startswith("⚠️ Your agent needs you — "))
+
+    def test_the_login_details_keep_the_proxy_pointer_and_the_alert_carries_them(self):
+        with _no_backend():
+            d = _mod.compose_details(_LOGIN)
+            tag = _mod.alert_content(_LOGIN)[_mod.ALERT_FIELD]
+        self.assertTrue(any("sonichi#4326" in line for line in d))
+        self.assertFalse(any(line.startswith("open its terminal") for line in d), "no backend, no command")
+        self.assertEqual(tag["details"], d)
+        with patch.dict(sys.modules, {"owner_text": None}):
+            self.assertEqual(_mod.compose_details(_LOGIN), d)
+            self.assertIn("needs you", compose_message(_LOGIN))
+        self.assertEqual(_mod.compose_details({"state": "hung"}), ["state: hung"])
 
 
 class TestRunCycleAndCli(unittest.TestCase):
@@ -521,7 +580,7 @@ class TestRunCycleAndCli(unittest.TestCase):
                     self.assertEqual(main(["--signal", sig, "--state-file", state]), 0)
                     self.assertEqual(main(["--signal", sig, "--state-file", state]), 0)
             self.assertEqual(len(sent), 1, "debounced like any blocker")
-            self.assertIn("Agent needs you", sent[0])
+            self.assertIn("needs you", sent[0])
             self.assertIn("restarting the engine rewrites the file", sent[0])
 
     def test_cli_signal_that_cannot_be_opened_escalates(self):
@@ -980,7 +1039,7 @@ class TestBackendRecordContract(unittest.TestCase):
         os.environ["SUTANDO_HOST_LABEL"] = "SessHost"
         self._write_alive("SessHost")
         with self._workspace():
-            msg = compose_message(_HUNG)
+            msg = _details(_HUNG)
         self.assertIn("attach -t sutando-core", msg)
         self.assertNotRegex(msg, r"attach(?! -t)")
 
@@ -990,9 +1049,9 @@ class TestBackendRecordContract(unittest.TestCase):
         os.environ["SUTANDO_HOST_LABEL"] = "SessHost"
         self._write_alive("SessHost", session="sutando-core-watcher")
         with self._workspace():
-            msg = compose_message(_HUNG)
+            msg = _details(_HUNG)
         self.assertIn("attach -t sutando-core-watcher", msg)
-        self.assertNotIn("attach -t sutando-core`", msg)
+        self.assertFalse(msg.endswith("attach -t sutando-core"))
 
     def test_env_session_overrides_the_default_when_unrecorded(self):
         """Same env/default contract the launchers use, so a custom-session host
@@ -1002,7 +1061,7 @@ class TestBackendRecordContract(unittest.TestCase):
         try:
             self._write_alive("SessHost")
             with self._workspace():
-                msg = compose_message(_HUNG)
+                msg = _details(_HUNG)
         finally:
             os.environ.pop("SUTANDO_TMUX_SESSION", None)
         self.assertIn("attach -t my-core", msg)
@@ -1072,13 +1131,14 @@ class TestTargetIsRunnable(unittest.TestCase):
     def test_the_message_gives_a_command_not_a_path(self):
         """A bare socket path is not something the owner can act on."""
         with _backend({"socket": "/tmp/sutando-tmux.sock"}):
-            msg = compose_message(_HUNG)
+            msg, note = _details(_HUNG), compose_message(_HUNG)
         self.assertIn("tmux -S /tmp/sutando-tmux.sock attach", msg)
+        self.assertNotIn("tmux", note)
 
     def test_no_backend_still_degrades_to_generic_phrasing(self):
         with _no_backend():
             msg = compose_message(_HUNG)
-        self.assertIn("where the core is running", msg)
+        self.assertIn("in its terminal on", msg)
         self.assertNotIn("tmux -S", msg)
 
 
@@ -1115,8 +1175,8 @@ class TestSeatNotices(unittest.TestCase):
             second = self._run()
         finally:
             _mod._macos_notify = orig
-        self.assertIn("worker Pro-fast", first)
-        self.assertNotIn("worker Pro-fast", second)
+        self.assertIn("Pro-fast had a turn refused", first)
+        self.assertNotIn("Pro-fast", second)
         self.assertTrue(os.path.exists(self.state + ".sutando-worker-ab"))
 
     def test_a_failed_switch_retyped_each_cooldown_is_one_notice_per_episode(self):

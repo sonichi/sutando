@@ -58,7 +58,7 @@ class TestRequirement(unittest.TestCase):
         self.assertEqual(r.message, "Dangerous rm operation on a possibly-empty path Do you want to proceed?")
         self.assertEqual(r.subject["option_for_action"], {"deny": 2, "allow": 0})
         self.assertEqual(r.subject["source"], G.SOURCE)
-        self.assertEqual(r.device, {"id": "s", "name": "s"})
+        self.assertEqual(r.device, {"id": "s", "name": "Your agent"})
 
     def test_the_producer_leaves_the_host_to_the_wire(self):
         # One policy, in schema.wire_device: every producer (this gate, driver events,

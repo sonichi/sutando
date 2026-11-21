@@ -178,7 +178,7 @@ class RenotifyTests(unittest.TestCase):
         self.assertEqual(len([p for p in sent if p["op"] == "edit"]), 58)
         self.assertEqual(len(messages), 1, [m["body"] for m in messages])
         self.assertEqual(messages[0]["body"],
-                         "✓ Cleared — worker pro-dev · blocked-human; Sutando has continued its work.")
+                         "✓ No longer blocked — worker pro-dev can continue; Sutando has continued its work.")
         notice = messages[0]["extra_content"][NOTICE_FIELD]
         self.assertEqual((notice["notice"], sorted(notice["ids"])), ("recovery", sorted(ids)))
         self.assertEqual(notice["device"], "sutando-worker-pro-dev")  # the seat's device id
@@ -214,7 +214,7 @@ class RenotifyTests(unittest.TestCase):
             self.mgr.resolve(i)
         bodies = sorted(p["body"] for p in self.drive() if p["op"] == "message")
         self.assertEqual(bodies, sorted(
-            f"✓ Cleared — worker {s} · blocked-human; Sutando has continued its work." for s in seats))
+            f"✓ No longer blocked — worker {s} can continue; Sutando has continued its work." for s in seats))
 
     def test_a_seat_still_blocked_owes_no_recovery_yet(self):
         old, new = self._seat_cards("pro-dev", 2)
@@ -223,7 +223,7 @@ class RenotifyTests(unittest.TestCase):
         self.mgr.resolve(new)
         sent = self.drive()
         self.assertEqual([p["op"] for p in sent], ["edit", "message"])
-        self.assertIn("✓ Cleared — worker pro-dev", sent[1]["body"])
+        self.assertIn("✓ No longer blocked — worker pro-dev can continue", sent[1]["body"])
 
     def test_many_open_cards_for_one_seat_share_one_reminder_clock(self):
         self._seat_cards("pro-dev", 20, step=3 * MIN)

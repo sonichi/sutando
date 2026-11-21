@@ -17,6 +17,7 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from owner_text import FOLDED, card_text
 from workspace_default import resolve_workspace
 
 from .manager import HitlManager
@@ -27,6 +28,8 @@ from .schema import (
 )
 
 SCHEMA = "space.ag2.hitl.runtime_event.v1"
+# What a person calls each runtime; any other is "Your agent", never its code.
+RUNTIME_NAMES = {"claude": "Claude", "codex": "Codex"}
 JUMP_ACTION_ID = "open_terminal"
 
 
@@ -47,30 +50,33 @@ def _actions_for(ev: Dict) -> List[Action]:
             # the option kind itself (allow_once / reject_once) and reads the choice.
             out.append(Action(id=oid, kind=str(o.get("kind") or "tui_select"), label=label))
     # The floor: every TUI-sourced requirement can be finished in the terminal.
-    out.append(Action(id=JUMP_ACTION_ID, kind="open_terminal", label=f"Open terminal ({ev.get('session', '?')})"))
+    out.append(Action(id=JUMP_ACTION_ID, kind="open_terminal", label="Open terminal"))
     return out
 
 
 def _requirement_for(ev: Dict) -> HumanRequirement:
     session = str(ev.get("session") or "?")
     runtime = str(ev.get("runtime") or "unknown")
-    prompt = ev.get("prompt") or {
-        "auth": f"{runtime} needs to sign in again",
-        "permission": f"{runtime} is asking permission to run a tool",
-        "confirmation": f"{runtime} is waiting for your confirmation",
-        "choice": f"{runtime} is asking you a question",
-    }.get(ev.get("kind"), f"{runtime} is waiting on something in its terminal")
+    who = RUNTIME_NAMES.get(runtime, "Your agent")
+    own = str(ev.get("prompt") or "")
+    prompt = own or {
+        "auth": f"{who} needs to sign in again",
+        "permission": f"{who} is asking permission to run a tool",
+        "confirmation": f"{who} is waiting for your confirmation",
+        "choice": f"{who} is asking you a question",
+    }.get(ev.get("kind"), f"{who} is waiting on something in its terminal")
     # The session keys dedup, the jump and (with its socket) the driver's action
     # file on a click; the host label is added at the wire (schema.wire_device).
-    device = {"id": session, "name": session, "socket": str(ev.get("socket") or "")}
+    device = {"id": session, "name": who, "socket": str(ev.get("socket") or "")}
     return HumanRequirement(
         kind=str(ev.get("kind") or "unknown"),
         runtime=runtime,
-        message=f"{prompt} — session {session}",
+        # The event's own prompt is the ask itself: kept whole, unfolded; the session is on `device`.
+        message=card_text(own) if own else card_text(prompt, [f"Session: {session}"]),
         guard=str(ev.get("guard") or ""),
-        subject=dict(ev.get("subject") or {}) if isinstance(ev.get("subject"), dict) else {},
+        subject={**(ev.get("subject") if isinstance(ev.get("subject"), dict) else {}), **({} if own else {FOLDED: True})},
         device=device,
-        title=f"{runtime} · {session}",
+        title=f"{who} needs you",
         actions=_actions_for(ev),
     )
 

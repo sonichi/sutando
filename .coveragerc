@@ -42,6 +42,7 @@ omit =
     packages/ag2-sparrow/ag2_sparrow/file_lock.py
     packages/ag2-sparrow/ag2_sparrow/workspace_lock.py
     packages/ag2-sparrow/ag2_sparrow/chat_secret_filter.py
+    packages/ag2-sparrow/ag2_sparrow/owner_text.py
     packages/ag2-sparrow/ag2_sparrow/team_result_guard.py
     packages/ag2-sparrow/ag2_sparrow/team_guardrail.py
     packages/ag2-sparrow/ag2_sparrow/vault_set_grammar.py

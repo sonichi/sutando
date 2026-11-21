@@ -37,9 +37,12 @@ class TestMessage(unittest.TestCase):
     def test_it_names_the_gate_and_quotes_the_terminal(self):
         b = M.escalation_message("blocked-human", "awaiting user: selection",
                                  "selection", "Pick one:\n> a\n  b")
-        self.assertIn("cannot continue without you", b)
-        self.assertIn("selection", b)
-        self.assertIn("Pick one:", b)
+        head, _, details = b.partition("\n\n")
+        self.assertEqual(head, "Your agent is waiting on a question in its terminal and cannot "
+                               "continue until you answer.")
+        self.assertIn("gate: selection", details)
+        self.assertIn("Pick one:", details)
+        self.assertNotIn("Pick one:", head)
 
     def test_an_unknown_gate_is_not_rendered_as_a_gate_name(self):
         """`unknown` is the classifier saying it could not tell, so `Gate:
@@ -83,7 +86,7 @@ class TestMessage(unittest.TestCase):
         card is the only thing that reaches the owner: fail noisy, never silent."""
         b = M.escalation_message("blocked-human", "d", "unknown",
                                  "──────── x ────────\nhttps://example.test/a?b=1\n")
-        self.assertIn("What the terminal is showing", b)
+        self.assertIn("What its terminal shows:", b)
         self.assertIn("https://example.test/a?b=1", b)
 
     def test_blank_lines_and_long_unbroken_tokens_are_dropped(self):
