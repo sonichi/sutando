@@ -39,6 +39,14 @@ sys.path.insert(0, str(REPO / "src"))
 
 from ag2_sparrow import remote_gateway_bridge as B  # noqa: E402
 from hitl import manager as hm, schema as hs  # noqa: E402
+from _helpers.proactive_lane import known_owner, registry_reply  # noqa: E402
+
+
+def owner_known(test):
+    """The agent's identity and its registry owner for `test`, on the owner DM's homeserver."""
+    ctx = known_owner(B, "@lane-agent:example.invalid")
+    ctx.__enter__()
+    test.addCleanup(ctx.__exit__, None, None, None)
 
 
 class ProjectHitl(unittest.TestCase):
@@ -52,7 +60,9 @@ class ProjectHitl(unittest.TestCase):
         B._ROUTING.update(owner_dm="!room:example.invalid", loaded=True, next=B.time.time() + 3600)
         self.answer = {"ok": True, "event_id": "$card"}
         B._req = lambda method, path, payload=None, timeout=None: (
-            self.calls.append((method, path, payload)) or self.answer)
+            registry_reply(B, method, path, payload, B._ROUTING["owner_dm"])
+            or self.calls.append((method, path, payload)) or self.answer)
+        owner_known(self)
         self.manager = hm.HitlManager(hm.HitlStore(hm.default_store(self.ws)))
         B._hitl_backoff_reset()  # module-level state: one test's backoff must not leak
 
@@ -179,7 +189,10 @@ class OneRefusedCard(unittest.TestCase):
             kind="choice", runtime="claude", message=f"card {g}", guard=g,
             actions=[hs.Action(id="ok", kind="answer", label="OK")])).id for g in ("g1", "g2"))
         self.bad, self.good = ids  # the refused card sorts first: it is scanned before the other
-        B._req = self._send
+        B._req = lambda method, path, payload=None, timeout=None: (
+            registry_reply(B, method, path, payload, B._ROUTING["owner_dm"])
+            or self._send(method, path, payload, timeout))
+        owner_known(self)
         B._hitl_backoff_reset()
 
     def tearDown(self):
@@ -310,6 +323,53 @@ class LoneRefusedCard(OneRefusedCard):
 
     test_the_next_card_still_projects_in_the_same_pass = None
     test_the_refused_card_stops_after_the_bound_and_is_said_once = None
+
+
+class OwnerDmCheckedAtSend(unittest.TestCase):
+    """A card for the owner DM is held, unsent and uncharged, when the DM has gained a member since
+    the last routing refresh or its members cannot be read; it goes out once it is private (#5795)."""
+
+    setUp_projection, tearDown, _requirement = ProjectHitl.setUp, ProjectHitl.tearDown, ProjectHitl._requirement
+
+    def setUp(self):
+        self.setUp_projection()
+        self.roster, self.reads = None, []  # roster None: the gateway's own answer, the agent and its owner
+        inner = B._req
+
+        def req(method, path, payload=None, timeout=None):
+            if (payload or {}).get("op") == "members":
+                self.reads.append(payload["room_id"])
+                if self.roster == "unreadable":
+                    raise OSError("members read timed out")
+                if self.roster is not None:
+                    return {"members": [{"user_id": u} for u in self.roster]}
+            return inner(method, path, payload, timeout)
+        B._req = req
+
+    def test_a_member_who_joined_since_the_refresh_gets_no_card(self):
+        req = self._requirement()
+        self.roster = [B._reenroll_identity(), B._hitl_owner(), "@intruder:example.invalid"]
+        self.assertEqual(B._project_hitl(log=lambda *a: None), 0)
+        self.assertEqual(self.calls, [], "nothing is posted into a room someone else is in")
+        self.assertTrue(self.manager.needs_projection(req.id), "held: nothing recorded")
+        self.assertNotIn("refusals", self.manager.store.projection(req.id), "and nothing charged")
+        self.assertEqual(B._ROUTING["next"], 0.0, "the routing refresh is made due")
+
+    def test_an_unreadable_member_list_holds_and_a_private_dm_then_gets_the_card(self):
+        req = self._requirement()
+        self.roster = "unreadable"
+        self.assertEqual(B._project_hitl(log=lambda *a: None), 0)
+        self.assertEqual(self.calls, [], "fail closed")
+        B._hitl_backoff_reset()
+        self.roster = None
+        self.assertEqual(B._project_hitl(log=lambda *a: None), 1)
+        self.assertEqual([p["extra_content"][hs.WIRE_FIELD]["id"] for _, _, p in self.calls], [req.id])
+
+    def test_one_members_read_per_pass_whatever_the_cards(self):
+        for guard in ("g1", "g2", "g3"):
+            self._requirement(guard=guard)
+        self.assertEqual(B._project_hitl(log=lambda *a: None), 3)
+        self.assertEqual(self.reads, ["!room:example.invalid"])
 
 
 if __name__ == "__main__":

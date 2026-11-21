@@ -82,6 +82,8 @@ def run(body: str, last_active: str, passes: int = 2):
         if path == "/v1/agents":
             return {"agents": [{"id": AGENT, "owner": "@o:example.org",
                                 "owner_dm_room": OWNER_DM}]}
+        if path == "/v1/room" and (payload or {}).get("op") == "members":
+            return {"members": [{"user_id": AGENT}, {"user_id": "@o:example.org"}]}
         if path == "/v1/room" and (payload or {}).get("op") == "message":
             posts.append(payload)
         return {"ok": True, "event_id": "$evt"}
