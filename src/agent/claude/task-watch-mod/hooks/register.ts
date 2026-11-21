@@ -13,6 +13,12 @@ const BACKOFF_MAX_MS = 300_000
 const HEALTHY_RUN_MS = 600_000
 const MAX_EARLY_EXITS = 8
 const RETRY_SUBMIT_MS = 5_000
+/** How long one submit may stay unsettled before its announcement is taken back and sent again. */
+export const SUBMIT_TIMEOUT_MS = 30_000
+// The delivery trail, under the workspace: what the watcher said, what was submitted, and how each submit ended.
+const TRAIL_FILE = 'logs/task-watch-mod.log'
+const TRAIL_LINE_MAX = 2_000
+const APPEND_SH = 'f="$1"; shift; mkdir -p "$(dirname "$f")" && for l in "$@"; do printf \'%s %s\\n\' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$l"; done >> "$f"'
 // watch-tasks-stream.sh exits 0 when it hands off (the inbox is held, or it was told to stop) and 64 on a usage refusal.
 const EXIT_HANDOFF = 0
 const EXIT_USAGE = 64
@@ -117,6 +123,8 @@ export type Host = {
   sleep: (ms: number) => Promise<void>
   now: () => Promise<number>
   submit: (text: string) => Promise<void>
+  /** Appends the lines, each with the time, to a file; best-effort, never rejects. */
+  record: (file: string, lines: string[]) => Promise<void>
   log: (text: string, debug?: boolean) => Promise<void>
 }
 
@@ -132,41 +140,136 @@ export class TaskWatch {
   private child: Child | null = null
   private openToken = 0
   private ann = new Announcements()
-  constructor(private host: Host, private repo: string) {}
+  private sending = false
+  private sent: Promise<void> = Promise.resolve()
+  private submits = 0
+  private mainTurns = 0
+  private idleWaiters: (() => void)[] = []
+  private trail: string | null = null
+  private notes: string[] = []
+  private noting = false
+  constructor(private host: Host, private repo: string, private submitTimeoutMs = SUBMIT_TIMEOUT_MS) {}
 
-  turnStart(): void {
+  // turn.start and turn.complete also fire for each subagent's loop, with its `agentId`; only the main
+  // loop's (no `agentId`) say whether the session is idle, so a subagent's are ignored in all three calls.
+  turnStart(agentId?: string): void {
+    if (agentId !== undefined) return
     this.turnRunning = true
+    this.mainTurns++
   }
 
-  turnIdle(): void {
+  turnIdle(agentId?: string): void {
+    if (agentId !== undefined) return
     this.turnRunning = false
+    for (const wake of this.idleWaiters.splice(0)) wake()
   }
 
-  /** Sends what waited for the turn to end. */
-  flush(): Promise<void> {
-    return this.deliver()
+  /** Sends what waited for the turn to end; a hook must not await it, a submit can take its whole timeout. */
+  flush(agentId?: string): Promise<void> {
+    return agentId === undefined ? this.deliver() : Promise.resolve()
+  }
+
+  /** One line of the delivery trail, written in order and never awaited: a slow disk cannot hold a delivery. */
+  private note(line: string): void {
+    if (!this.trail) return
+    this.notes.push(line.replace(/[\u0000-\u001f\u007f]+/g, ' ').slice(0, TRAIL_LINE_MAX))
+    if (this.noting) return
+    this.noting = true
+    detach((async () => {
+      try {
+        while (this.notes.length && this.trail) await this.host.record(this.trail, this.notes.splice(0))
+      } finally {
+        this.noting = false
+      }
+    })())
   }
 
   /** Kills the child this watch spawned, and nothing else; after /clear or a resume the process still owes its inbox a watcher. */
   end(reason: string): void {
     if (reason === 'clear' || reason === 'resume') return
     this.stopped = true
+    // A send waiting for the main turn to end is released, so no promise outlives the watch.
+    for (const wake of this.idleWaiters.splice(0)) wake()
     const child = this.child
     this.child = null
     if (child) detach(child.return(undefined))
   }
 
-  private async deliver(): Promise<void> {
-    if (this.turnRunning) return
-    const text = this.ann.take()
-    if (!text) return
+  /** Starts sending what is ready, unless a send is already under way; resolves when that send is over. */
+  private deliver(): Promise<void> {
+    if (!this.sending) this.sent = this.drain()
+    return this.sent
+  }
+
+  /**
+   * Submits what is ready, one message at a time, in order. A submit that throws, or that has not settled
+   * within the timeout, keeps its text: it goes back to the front after a wait and is sent again. A timed-out
+   * submit that settles during that wait did deliver, and is not sent again; one that settles later than that
+   * delivers its text a second time, which is the price of never losing one.
+   *
+   * Submits are only issued while no main turn runs, and the timeout only counts idle time: the engine holds
+   * a submitted prompt until the session is idle, so one overtaken by a main turn is waiting, not stuck.
+   */
+  private async drain(): Promise<void> {
+    this.sending = true
+    let timeouts = 0
     try {
-      await this.host.submit(text)
-    } catch (err) {
-      this.ann.unshift(text)
-      await this.host.log(`could not start a turn (${err instanceof Error ? err.message : String(err)}); retrying`)
-      await this.host.sleep(RETRY_SUBMIT_MS)
-      if (!this.stopped) await this.deliver()
+      while (!this.stopped && !this.turnRunning) {
+        const text = this.ann.take()
+        if (!text) return
+        const id = ++this.submits
+        let timedOut = false
+        let landedLate = false
+        this.note(`submit #${id} start: ${text.replace(/\n/g, ' | ')}`)
+        const settled = (async () => this.host.submit(text))().then(
+          () => {
+            if (timedOut) {
+              landedLate = true
+              this.note(`submit #${id} settled after its timeout: delivered late`)
+            }
+            return { error: null as string | null }
+          },
+          (err) => {
+            const error = err instanceof Error ? err.message : String(err)
+            if (timedOut) this.note(`submit #${id} failed after its timeout (${error})`)
+            return { error }
+          },
+        )
+        let result: { error: string | null } | null = null
+        for (;;) {
+          const turnsBefore = this.mainTurns
+          result = await Promise.race([settled, this.host.sleep(this.submitTimeoutMs).then(() => null)])
+          if (result || this.stopped || (!this.turnRunning && this.mainTurns === turnsBefore)) break
+          this.note(`submit #${id} still pending behind a main turn; not a timeout`)
+          if (this.turnRunning) result = await Promise.race([settled, new Promise<null>((wake) => { this.idleWaiters.push(() => wake(null)) })])
+          if (result || this.stopped) break
+        }
+        if (!result && this.stopped) return
+        if (result && result.error === null) {
+          timeouts = 0
+          this.note(`submit #${id} ok`)
+          continue
+        }
+        let wait = RETRY_SUBMIT_MS
+        if (result) {
+          this.note(`submit #${id} failed (${result.error}); kept, retrying in ${wait / 1000}s`)
+          await this.host.log(`could not start a turn (${result.error}); retrying`)
+        } else {
+          timedOut = true
+          wait = backoffMs(++timeouts)
+          this.note(`submit #${id} timeout after ${this.submitTimeoutMs}ms; kept, retrying in ${wait / 1000}s`)
+          await this.host.log(`a turn did not start within ${this.submitTimeoutMs / 1000}s (submit #${id}); retrying in ${wait / 1000}s`)
+        }
+        await this.host.sleep(wait)
+        if (landedLate) {
+          timeouts = 0
+          this.note(`submit #${id} is not sent again: it was delivered late`)
+          continue
+        }
+        this.ann.unshift(text)
+      }
+    } finally {
+      this.sending = false
     }
   }
 
@@ -177,6 +280,7 @@ export class TaskWatch {
     if (!py) return 'no Python interpreter resolved'
     const ws = (await this.host.run(['bash', config, 'workspace']))?.trim()
     if (!ws) return 'no workspace resolved'
+    this.trail = `${ws.replace(/\/+$/, '')}/${TRAIL_FILE}`
     const raw = await this.host.run([py, `${this.repo}/src/watcher_rearm.py`, 'watch-argv', '--repo', this.repo, '--workspace', ws])
     const argv = (raw ?? '').split('\n').filter((l) => l.length > 0)
     const at = argv.indexOf('--inbox')
@@ -210,28 +314,32 @@ export class TaskWatch {
       for (;;) {
         const r = await child.next()
         if (r.done) {
+          this.note(`watcher ended (${r.value?.signal ?? `exit ${r.value?.code}`})`)
           if (lastErr) await this.host.log(`watcher said: ${lastErr}`, true)
           return (r.value ?? { code: null, signal: null }) as End
         }
         if (r.value.stream !== 'stdout') {
           lastErr = r.value.text.trim().split('\n').pop() ?? lastErr
+          for (const said of r.value.text.split('\n')) if (said.trim()) this.note(`watcher stderr: ${said.trim()}`)
           continue
         }
         const taken = takeLines(buffer + r.value.text)
         buffer = taken.rest
         for (const line of taken.lines) {
           const kind = this.ann.feed(line)
+          if (kind !== 'other') this.note(`watcher announced: ${line}`)
           if (kind === 'task') this.scheduleClose()
           else if (kind === 'other' && line.trim()) await this.host.log(line, !line.startsWith('WATCHER_HELD:'))
         }
-        await this.deliver()
+        // Not awaited: a submit that does not settle must not stop this loop reading the watcher.
+        detach(this.deliver())
       }
     } catch (err) {
       return { code: null, signal: `spawn failed: ${err instanceof Error ? err.message : String(err)}` }
     } finally {
       if (this.child === child) this.child = null
       this.ann.close()
-      await this.deliver()
+      detach(this.deliver())
     }
   }
 
@@ -257,6 +365,7 @@ export class TaskWatch {
       if (this.stopped) return
       const startedAt = await this.host.now()
       await this.host.log(`watching ${plan.inbox}`, true)
+      this.note(`watcher starting on ${plan.inbox}`)
       const end = await this.once(plan)
       if (this.stopped) return
       if (end.code === EXIT_USAGE) return void (await this.host.log(`the watcher refused its arguments (exit ${EXIT_USAGE}); not restarting`))
@@ -298,6 +407,13 @@ function hostOf($: EngineInterface): Host {
     sleep: (ms) => $.clock.sleep(ms),
     now: () => $.clock.now(),
     submit: async (text) => { await $.prompt.submit({ text }) },
+    record: async (file, lines) => {
+      try {
+        await $.process.run(['bash', '-c', APPEND_SH, 'bash', file, ...lines], { timeoutMs: 10_000 })
+      } catch {
+        // The trail is best-effort: a line that cannot be written must not stop the watcher.
+      }
+    },
     log,
   }
 }
@@ -334,15 +450,16 @@ export const register: Register = (on) => {
   })
 
   on('turn.start', async ($, e, next) => {
-    watch?.turnStart()
+    watch?.turnStart(e.agentId)
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
     // Cleared before next(e): if anything beneath throws, held announcements must not wait forever.
-    watch?.turnIdle()
+    watch?.turnIdle(e.agentId)
     const done = await next(e)
-    await watch?.flush()
+    // Not awaited: this hook must return even when the submit it starts never settles.
+    if (watch) detach(watch.flush(e.agentId))
     return done
   })
 
