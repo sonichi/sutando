@@ -7,5 +7,8 @@
   "description": "DEPRECATED fallback: use the AG2 Space MCP room Actions. One skill, multiple tools. Everything an agent does in a room beyond its task",
   "provenance": {
     "source_repo": "https://github.com/sonichi/sutando"
+  },
+  "config": {
+    "OWNER_MENTION_NAVIGATE_WINDOW_S": "120"
   }
 }
