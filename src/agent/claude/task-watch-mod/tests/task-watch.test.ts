@@ -820,13 +820,13 @@ test('a tier helper that fails names nothing mid-turn: every task keeps the turn
 
 test('the tool.call glue: the line is added to the context; a deny, no line or a throw returns the result untouched', async () => {
   const ok = { result: 'out', text: 'out', ref: 3, context: ['earlier'] } as const
-  expect(await withTaskContext(ok, async () => 'tasks')).toEqual({ ...ok, context: ['earlier', 'tasks'] })
-  expect(await withTaskContext({ result: 'out' }, async () => 'tasks')).toEqual({ result: 'out', context: ['tasks'] })
+  expect(await withTaskContext(ok, async () => 'new-work')).toEqual({ ...ok, context: ['earlier', 'new-work'] })
+  expect(await withTaskContext({ result: 'out' }, async () => 'new-work')).toEqual({ result: 'out', context: ['new-work'] })
   expect(await withTaskContext(ok, async () => null)).toBe(ok)
   expect(await withTaskContext(ok, async () => { throw new Error('boom') })).toBe(ok)
   let asked = false
   const denied = { deny: 'no' }
-  expect(await withTaskContext(denied, async () => { asked = true; return 'tasks' })).toBe(denied)
+  expect(await withTaskContext(denied, async () => { asked = true; return 'new-work' })).toBe(denied)
   expect(asked).toBe(false)
 })
 
