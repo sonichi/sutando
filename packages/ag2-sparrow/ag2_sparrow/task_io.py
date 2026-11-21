@@ -13,6 +13,7 @@ import stat
 import sys
 import threading
 import time
+from typing import NamedTuple, Optional
 
 from . import holder_lock, local_task_protocol
 
@@ -59,13 +60,69 @@ def is_collaborator(headers):
     return headers.get("access_tier") == "team" and headers.get("collaborator") == "true"
 
 
-def admission(headers, allow_non_owner=False):
-    """'owner' | 'collaborator' | 'non_owner' (served only under --allow-non-owner) | None (refused)."""
+OWNER, COLLABORATOR, RESTRICTED, REFUSED = "owner", "collaborator", "restricted", "refused"
+ALLOW_NON_OWNER_FLAG, ALLOW_COLLABORATOR_FLAG = "--allow-non-owner", "--allow-collaborator"
+
+
+class Capabilities(NamedTuple):
+    """What a served turn may use; adapters map these onto their own mechanics and never re-decide a tier.
+
+    workspace: "owner" (the owner's working directory) or "isolated" (a fresh empty one, removed after).
+    writes: the owner's sandbox and file edits; False is read-only.
+    integrations: the owner's tools, connectors, credentials, environment and network.
+    session: "durable" (the room's kept thread or session) or "ephemeral" (never kept or resumed).
+    framing: "owner", or "non_owner" (NON_OWNER_NOTE frames the turn).
+    delivery_guard: the gateway's guard on what a non-owner turn may deliver.
+    owner_dm: may continue the owner's own DM conversation.
+    """
+    workspace: str
+    writes: bool
+    integrations: bool
+    session: str
+    framing: str
+    delivery_guard: bool
+    owner_dm: bool
+
+
+OWNER_CAPABILITIES = Capabilities(workspace="owner", writes=True, integrations=True, session="durable",
+                                  framing="owner", delivery_guard=False, owner_dm=True)
+# An owner-capability trust boundary, not isolation: the cautious prompt and the delivery guard are the bounds.
+COLLABORATOR_CAPABILITIES = OWNER_CAPABILITIES._replace(framing="non_owner", delivery_guard=True, owner_dm=False)
+RESTRICTED_CAPABILITIES = Capabilities(workspace="isolated", writes=False, integrations=False, session="ephemeral",
+                                       framing="non_owner", delivery_guard=True, owner_dm=False)
+TURN_CAPABILITIES = {OWNER: OWNER_CAPABILITIES, COLLABORATOR: COLLABORATOR_CAPABILITIES,
+                     RESTRICTED: RESTRICTED_CAPABILITIES, REFUSED: None}
+
+
+class TurnPolicy(NamedTuple):
+    """kind: owner | collaborator | restricted | refused; capabilities: None exactly when refused;
+    unlock: for a refused turn, the flag that would serve it."""
+    kind: str
+    capabilities: Optional[Capabilities]
+    unlock: str = ""
+
+    @property
+    def served(self):
+        return self.kind != REFUSED
+
+
+def turn_policy(headers, allow_non_owner=False, allow_collaborator=True):
+    """The one tier decision every adapter takes, from the attested headers only: the owner; an attested
+    collaborator (Team + collaborator: true) unless the adapter withholds them; any other non-owner,
+    restricted, under allow_non_owner; else refused."""
     if headers.get("access_tier") == "owner":
-        return "owner"
-    if is_collaborator(headers):
-        return "collaborator"
-    return "non_owner" if allow_non_owner else None
+        kind, unlock = OWNER, ""
+    elif is_collaborator(headers):
+        kind, unlock = (COLLABORATOR, "") if allow_collaborator else (REFUSED, ALLOW_COLLABORATOR_FLAG)
+    else:
+        kind, unlock = (RESTRICTED, "") if allow_non_owner else (REFUSED, ALLOW_NON_OWNER_FLAG)
+    return TurnPolicy(kind, TURN_CAPABILITIES[kind], unlock)
+
+
+def admission(headers, allow_non_owner=False):
+    """turn_policy in its older words, for adapters not yet moved: 'owner' | 'collaborator' | 'non_owner' | None."""
+    kind = turn_policy(headers, allow_non_owner).kind
+    return {OWNER: "owner", COLLABORATOR: "collaborator", RESTRICTED: "non_owner"}.get(kind)
 
 
 def non_owner_note():

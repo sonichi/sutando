@@ -17,8 +17,9 @@ import uuid
 from pathlib import Path
 
 from . import local_task_protocol, result_disposal, task_priority
-from .task_io import (AUDIENCE_RULE, NON_OWNER_REFUSED, admission, is_collaborator, load_done, non_owner_note,  # noqa: F401
-                      parse_task, record_done, stop_requested, stoppable_sleep, write_atomic)
+from .task_io import (ALLOW_COLLABORATOR_FLAG, AUDIENCE_RULE, NON_OWNER_REFUSED, is_collaborator,  # noqa: F401
+                      load_done, non_owner_note, parse_task, record_done, stop_requested, stoppable_sleep, turn_policy,
+                      write_atomic)
 
 TEXT_MAX = 65536
 TRUNCATED = "\n[truncated]"
@@ -259,13 +260,13 @@ class RelayLoop:
             seen.add(name[:-4])
             return None
 
+    def policy(self, headers):
+        """task_io.turn_policy under both allow flags: refusal(), lane() and each step read this, never the tier."""
+        return turn_policy(headers, self.args.allow_non_owner, self.args.allow_collaborator)
+
     def classify(self, headers):
-        """The one admission decision, from task_io.admission and both allow flags: owner | non_owner |
-        collaborator (served), or refused-collaborator | refused. refusal() and lane() both read it."""
-        kind = admission(headers, self.args.allow_non_owner)
-        if kind == "collaborator" and not self.args.allow_collaborator:
-            return "refused-collaborator"
-        return kind or "refused"
+        """The policy's kind: owner | collaborator | restricted | refused."""
+        return self.policy(headers).kind
 
     def pending_attestation(self, headers):
         """True for a Team sender not (yet) attested as a collaborator, unlike a guest or other
@@ -273,19 +274,19 @@ class RelayLoop:
         return headers.get("access_tier") == "team" and not is_collaborator(headers)
 
     def refusal(self, name, headers, seen):
-        """None when classify() serves the task; otherwise the refusal is finished and its step result
+        """None when the policy serves the task; otherwise the refusal is finished and its step result
         returned: True when published, False when parked (a Team sender pending attestation gets
         the retry/backoff budget first, instead of an immediate, final refusal)."""
-        kind = self.classify(headers)
-        if kind == "refused-collaborator":
+        policy = self.policy(headers)
+        if policy.served:
+            return None
+        if policy.unlock == ALLOW_COLLABORATOR_FLAG:
             log("refused (collaborator, --allow-collaborator not set) ->", name[:-4])
-        elif kind == "refused":
+        else:
             if self.pending_attestation(headers) and self.schedule_retry(
                 name[:-4], "collaborator attestation pending", at_least=0.0):
                 return False
             log("refused (non-owner, --allow-non-owner not set) ->", name[:-4], headers.get("access_tier") or "guest")
-        else:
-            return None
         return self.finish(name, NON_OWNER_REFUSED, seen)
 
     def schedule_retry(self, task_id, detail, at_least=0.0):
@@ -311,16 +312,17 @@ class RelayLoop:
         return False
 
     def lane(self, name):
-        """Which gate applies, from classify(): `refuse` (none: the step refuses it at once), `collaborator`
-        (its own cap) or `provider` (the hold and the cap). Read once per task; a gone file is the step's."""
+        """Which gate applies, from the policy: `refuse` (none: the step refuses it at once), `isolated` (a
+        restricted turn, run locally under its own cap) or `provider` (the hold and the cap). Read once per task;
+        a gone file is the step's."""
         if name not in self.lanes:
             try:
                 headers, _, _ = parse_task(os.path.join(self.args.inbox, name))
             except OSError:
                 return "provider"
-            kind = self.classify(headers)
-            self.lanes[name] = ("refuse" if kind.startswith("refused") else
-                                "collaborator" if kind == "collaborator" else "provider")
+            policy = self.policy(headers)
+            self.lanes[name] = ("refuse" if not policy.served else
+                                "isolated" if policy.capabilities.workspace == "isolated" else "provider")
         return self.lanes[name]
 
     def first_seen(self, name, now):
@@ -338,7 +340,7 @@ class RelayLoop:
     def lane_wait(self, lane):
         if lane == "refuse":
             return 0.0
-        return self.collab_limiter.wait_seconds() if lane == "collaborator" else self.provider_wait()
+        return self.collab_limiter.wait_seconds() if lane == "isolated" else self.provider_wait()
 
     def provider_wait(self):
         """Seconds until the provider may be called: its hold first, then its sliding-hour cap."""
@@ -361,7 +363,7 @@ class RelayLoop:
         waits = {}
         for n in ready:
             lane = self.lane(n)
-            if lane == "collaborator" and self.too_old(n):
+            if lane == "isolated" and self.too_old(n):
                 lane = "refuse"      # the step answers it with the line, no turn: it waits on no cap
             if lane not in waits:
                 waits[lane] = self.lane_wait(lane)
