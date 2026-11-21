@@ -907,10 +907,8 @@ class Worker(SeatCase):
         self.assertEqual(len(self.sent("turn/start")), 1)
 
     def test_a_payload_that_appears_while_an_abandon_waits_to_be_recorded_again_is_run_not_withdrawn(self):
-        # The sentinel can be written before its payload (the watcher documents it). The seat sees a
-        # delivery with no payload, the `abandon` for it fails, and the payload lands during the wait.
-        # With the real pool hook, recording the abandon again withdrew the sentinel and no turn started
-        # (sonichi-dot on #6646 and #6651).
+        # A sentinel can precede its payload. Recording a failed `abandon` again, with the real pool
+        # hook, withdrew the sentinel after the payload had landed: no turn started.
         os.environ["SUTANDO_POOL_DELIVERY_SCRIPT"] = str(POOL / "pool_delivery.py")
         self.deliver("task-late", payload=False)
         s = self.worker_seat(retry_s=30)
@@ -1066,9 +1064,8 @@ class WatcherChild(SeatCase):
 
     def test_serve_keeps_the_watcher_running_and_picks_up_a_task_it_announces(self):
         s = self.make(poll_s=30)
-        # The task arrives only once the seat is idle, and the watcher announces it only once it is
-        # there: on a fixed delay a slow app-server start let the first step find the task (no idle
-        # line), or let the announcement come before the task (nothing to wake for until the poll).
+        # The task arrives once the seat is idle and is announced once it is there: fixed delays
+        # raced a slow app-server start.
         there = self.ws / "task-late.there"
         stub = self.script(f'while [ ! -e "{there}" ]; do sleep 0.05; done\n'
                            'echo "TASK_FILE: task-late.txt"\nexec sleep 300\n')
