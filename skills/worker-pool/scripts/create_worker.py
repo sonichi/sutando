@@ -11,7 +11,12 @@ written: two worker records on disk, one in the roster.
 So this composes; it decides nothing. The roster stays the core's artifact and
 the binding stays the owner's declaration.
 
-Run: python3 skills/worker-pool/scripts/create_worker.py --folder <dir> --label "<name>" [--room <id>]
+Once the worker runs, it also starts the worker's own s.space identity
+(pool_identity_request.py): the owner gets an approval link, and the wait runs in the
+background. `--no-identity`, or WORKER_POOL_IDENTITY_ON_CREATE=0, skips it; a step that
+cannot start is reported and the worker answers through the core.
+
+Run: python3 skills/worker-pool/scripts/create_worker.py --folder <dir> --label "<name>" [--room <id>] [--no-identity]
 """
 from __future__ import annotations
 
@@ -31,6 +36,7 @@ for _p in (str(_SCRIPTS), str(_REPO / "src")):
         sys.path.insert(0, _p)
 
 import pool_advertise as pa  # noqa: E402
+import pool_identity_request as pir  # noqa: E402
 import pool_roster as pr  # noqa: E402
 
 import spawn_worker as sw  # noqa: E402
@@ -124,7 +130,7 @@ def compile_with(workspace, worker_id: str, label: str, room, runtime=None) -> d
     return pr.register_worker(workspace, worker_id, label, room, runtime=runtime)
 
 
-def report(made: dict, roster: dict, room, orphans: list) -> str:
+def report(made: dict, roster: dict, room, orphans: list, identity=None) -> str:
     # Read through .get: spawn()'s contract is these keys, but a partial
     # report beats a KeyError when a caller upstream reshapes its extras.
     tmux = made.get("tmux") or {}
@@ -139,12 +145,28 @@ def report(made: dict, roster: dict, room, orphans: list) -> str:
     lines.append(f"  room      {room}" if room else
                  "  room      none — bind one with --room, or it receives only "
                  "work addressed to it by id")
+    if identity is not None:
+        lines.append(f"  identity  {pir.describe(identity)}")
     if orphans:
         lines.append("")
         lines.append(f"NOTE: {len(orphans)} worker record(s) not in the roster, "
                      "so nothing routes to them:")
         lines.extend(f"  {o}" for o in orphans)
     return "\n".join(lines)
+
+
+def identity_wanted(a) -> bool:
+    return not a.no_identity and pir.on_by_default()
+
+
+def start_identity(workspace, made: dict, a) -> dict:
+    """The worker's own identity step, after it is registered and running; never raises."""
+    if a.no_identity:
+        return {"status": "off", "why": "--no-identity"}
+    if not pir.on_by_default():
+        return {"status": "off", "why": f"{pir.FLAG} is off"}
+    return pir.request(Path(workspace), made["worker_id"], a.label or "", repo=Path(a.repo),
+                       wait_s=a.identity_wait)
 
 
 def main(argv=None) -> int:
@@ -158,6 +180,10 @@ def main(argv=None) -> int:
     ap.add_argument("--repo", default=str(_REPO))
     ap.add_argument("--socket", default="")
     ap.add_argument("--new", action="store_true", help="fresh session (the default)")
+    ap.add_argument("--no-identity", action="store_true",
+                    help="do not start the worker's own s.space identity; it answers through the core")
+    ap.add_argument("--identity-wait", type=float, default=pir.DEFAULT_WAIT_S,
+                    help=argparse.SUPPRESS)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
@@ -181,6 +207,7 @@ def main(argv=None) -> int:
         plan = sw.plan(workspace, a.repo, runtime=runtime,
                        cwd=a.folder, socket=a.socket or None, label=a.label)
         plan["would_bind"] = a.room
+        plan["would_request_identity"] = identity_wanted(a)
         plan["unrostered_records"] = unrostered(workspace, existing_workers(workspace))
         print(json.dumps(plan, indent=2))
         return 0
@@ -220,11 +247,13 @@ def main(argv=None) -> int:
         print(f"create-worker: WARNING: worker {made['worker_id']} is routable, but "
               f"unattended recovery is unavailable: {remedy.get('why', 'timer failure')}",
               file=sys.stderr)
+    identity = start_identity(workspace, made, a)
     if a.json:
         print(json.dumps({**made, "roster_version": roster["version"],
-                          "room": a.room, "unrostered_records": orphans}, indent=2))
+                          "room": a.room, "unrostered_records": orphans,
+                          "identity": identity, "identity_line": pir.describe(identity)}, indent=2))
     else:
-        print(report(made, roster, a.room, orphans))
+        print(report(made, roster, a.room, orphans, identity))
     return 0
 
 
