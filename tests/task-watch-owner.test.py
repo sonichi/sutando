@@ -2,11 +2,14 @@
 """task_watch_owner: only the human owner's tasks, from headers a body cannot forge, may interrupt a turn."""
 from __future__ import annotations
 
+import contextlib
+import io
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
@@ -89,6 +92,57 @@ class Cli(unittest.TestCase):
                  str(own), str(team), str(Path(d) / "gone.txt"), str(big)],
                 capture_output=True, text=True, timeout=30, check=True).stdout
             self.assertEqual(out, "owner\n\n\n\n")
+
+
+class Verdict(unittest.TestCase):
+    # In-process: the CLI test above runs a child interpreter, which the coverage run does not measure.
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.ws = self.dir / "ws"
+        self.ws.mkdir()
+        load_or_create_key(self.ws)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def task(self, name, text):
+        path = self.dir / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def run_main(self, argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = two.main(argv)
+        return code, out.getvalue()
+
+    def test_signed_owner_task_is_owner(self):
+        self.assertEqual(two._verdict(self.task("task-1.txt", stamp_text(gateway(), self.ws)), self.ws), "owner")
+
+    def test_team_task_is_empty(self):
+        team = self.task("task-2.txt", stamp_text(gateway(tier="team"), self.ws))
+        self.assertEqual(two._verdict(team, self.ws), "")
+
+    def test_file_over_the_size_cap_is_empty_without_being_read(self):
+        own = self.task("task-3.txt", stamp_text(gateway(), self.ws))
+        with mock.patch.object(two, "MAX_BYTES", own.stat().st_size - 1):
+            self.assertEqual(two._verdict(own, self.ws), "")
+        with mock.patch.object(two, "MAX_BYTES", own.stat().st_size):
+            self.assertEqual(two._verdict(own, self.ws), "owner", "the cap is inclusive")
+
+    def test_missing_file_is_empty(self):
+        self.assertEqual(two._verdict(self.dir / "gone.txt", self.ws), "")
+
+    def test_main_prints_one_verdict_line_per_path_in_order(self):
+        own = self.task("task-1.txt", stamp_text(gateway(), self.ws))
+        team = self.task("task-2.txt", stamp_text(gateway(tier="team"), self.ws))
+        code, out = self.run_main(["--workspace", str(self.ws), str(own), str(team), str(self.dir / "gone.txt")])
+        self.assertEqual(code, 0)
+        self.assertEqual(out, "owner\n\n\n")
+
+    def test_main_without_paths_prints_nothing(self):
+        self.assertEqual(self.run_main(["--workspace", str(self.ws)]), (0, ""))
 
 
 if __name__ == "__main__":
