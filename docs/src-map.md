@@ -392,6 +392,11 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 - **`codex-home.sh`** — Shell adapter for src/codex_home.py, the one owner of the Codex core's home: resolve it, check it, create it only when permitted.
 
+## `src/agent/codex/app-server/`
+
+- **`seat-launch.sh`** — Launcher half of the Codex app-server seat (SUTANDO_CODEX_APP_SERVER=1).
+- **`seat.py`** — One Codex seat (the core, or a pool worker) served over `codex app-server` instead of a TUI.
+
 ## `src/agent/codex/cli/`
 
 - **`codex-observer.mjs`** — Read-only observer of the Codex core: publishes its runtime observation record from the rollout file the core's process holds open.

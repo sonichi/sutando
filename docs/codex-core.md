@@ -470,6 +470,60 @@ and started a second core beside the desktop's, both reading one task inbox. A
 switch aimed at any other socket is not the desktop's core, so it leaves the
 desktop's `coreRuntime` unchanged.
 
+## Running on `codex app-server` (experimental, off by default)
+
+By default the Codex core and each Codex pool worker are a Codex TUI in tmux, and a notifier
+types every task into it. With `SUTANDO_CODEX_APP_SERVER=1` in the launcher's environment the
+same tmux session holds a seat process instead (`src/agent/codex/app-server/seat.py`). The seat:
+
+- owns one `codex app-server --listen stdio://` child and one durable thread. The thread id is
+  kept in `<workspace>/state/codex-seat/<tmux session>/thread`, and a restart resumes it.
+- runs one turn per pending task, in the dispatch order of `src/delivery/task_dispatch.py`,
+  with the prompt the notifier types today. The agent still writes `results/<task file>`
+  itself. A turn that ends without that file is logged and recorded under the seat's state
+  dir; the task stays pending and is tried again after 30 s, then every 15 min.
+- declines every approval and elicitation request, as `--ask-for-approval never` does.
+- sends `turn/interrupt` when a Stop ruling opens for the task its turn is on
+  (`state/stop-interrupts/<task id>.ruling.json`, written by the agent-activity skill when
+  `SUTANDO_STOP_INTERRUPT=1`). A stopped task is not started again by the seat.
+- restarts a dead app-server once, resumes the thread and retries the task once. A second
+  failure in a row ends the seat with the task still pending.
+- for a worker, records the pool stage `pending` before a task's turn and `done` only after
+  its result exists, through `pool_delivery.py mark-done`, as the notifier does.
+
+The seat reads its folders from a host declaration (`host.json` beside the thread file) in the
+`ag2-sparrow.supervised-host/1` schema of `packages/ag2-sparrow/ag2_sparrow/supervised_host.py`.
+No notifier session (`<session>-watcher`) and no observer session (`<session>-observer`) is
+started for a seat; the seat runs the standby task watcher as its own child
+(`SUTANDO_SEAT_WATCHER=0` leaves it out, and the seat then only polls).
+
+The terminal panel shows the seat's log: one line per task, turn, command and tool call. The
+same lines go to `<workspace>/logs/codex-seat.log` (a worker: `codex-seat-<session>.log`).
+
+Not supported under the flag yet:
+
+- Typing into the panel, and Codex slash commands. The panel is read-only.
+- Status and cards read from the pane: the runtime observation record, the core monitor's
+  prompt classification, limit and sign-in cards, pool wedge detection.
+- Switching the model without a restart.
+- Delivering a task into a running turn (`turn/steer`). Tasks wait for the turn to end.
+
+The launch settings are carried over: `danger-full-access`, approvals `never`, the model, the
+working directory, and every `-c` override of the TUI launch, the worker's s-space MCP entry
+included. `--search` becomes `-c web_search="live"`. `--add-dir` and the bootstrap `READY`
+prompt have no counterpart; a worker's boot prompt becomes the thread's developer
+instructions. None of this has been run against a real Codex login yet.
+
+To turn it on, set `SUTANDO_CODEX_APP_SERVER=1` and restart from outside the core:
+
+```bash
+SUTANDO_CODEX_APP_SERVER=1 bash src/agent/start-cli.sh --restart
+```
+
+To turn it off, run the same restart without the variable; the seat's window is replaced by
+the TUI and the notifier and observer sessions come back. A pool worker picks the flag up
+when it is spawned, from the environment of the process that spawns it.
+
 ## Rollback
 
 Set `core.runtime` back to `claude` (or remove the local override) and run:
