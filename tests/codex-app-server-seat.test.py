@@ -906,6 +906,49 @@ class Worker(SeatCase):
         self.assertEqual(len(self.done_calls()), 2)
         self.assertEqual(len(self.sent("turn/start")), 1)
 
+    def test_a_payload_that_appears_while_an_abandon_waits_to_be_recorded_again_is_run_not_withdrawn(self):
+        # The sentinel can be written before its payload (the watcher documents it). The seat sees a
+        # delivery with no payload, the `abandon` for it fails, and the payload lands during the wait.
+        # With the real pool hook, recording the abandon again withdrew the sentinel and no turn started
+        # (sonichi-dot on #6646 and #6651).
+        os.environ["SUTANDO_POOL_DELIVERY_SCRIPT"] = str(POOL / "pool_delivery.py")
+        self.deliver("task-late", payload=False)
+        s = self.worker_seat(retry_s=30)
+        s.ensure_server()
+        real, asked = s.stage, []
+
+        def stage(filename, stage_name):
+            asked.append((filename, stage_name))
+            if stage_name == "abandon" and asked.count((filename, stage_name)) == 1:
+                return "stage abandon exited 1"
+            return real(filename, stage_name)
+
+        with mock.patch.object(s, "stage", side_effect=stage):
+            self.assertIsNone(s.step(), "no payload yet: nothing to run")
+            self.assertEqual(asked, [("task-late.txt", "abandon")])
+            self.assertIn(("task-late.txt", "abandon"), s.unsettled)
+            self.task("task-late.txt", "task: do it\n")
+            self.now[0] += 31
+            self.assertEqual(s.step(), "done")
+        self.assertEqual(asked.count(("task-late.txt", "abandon")), 1, "the abandon was not asked again")
+        self.assertNotIn(("task-late.txt", "abandon"), s.unsettled)
+        self.assertEqual(len(self.sent("turn/start")), 1, "the delivery was run")
+        self.assertTrue(pool_delivery.is_done_flag(pool_delivery.done_flag(self.ws, "w1", "task-late")))
+
+    def test_an_abandon_that_failed_is_recorded_again_while_the_delivery_is_still_spent(self):
+        self.deliver("task-gone", payload=False)
+        Path(str(self.stage_log) + ".fail").touch()
+        s = self.worker_seat(stage=[sys.executable, str(self.hook)], retry_s=30)
+        self.assertIsNone(s.step())
+        os.unlink(str(self.stage_log) + ".fail")
+        self.assertIsNone(s.step(), "not before the retry is due")
+        self.assertEqual(self.stage_log.read_text().count("--stage abandon"), 1)
+        self.now[0] += 31
+        self.assertIsNone(s.step())
+        self.assertEqual(self.stage_log.read_text().count("--stage abandon"), 2)
+        self.assertNotIn(("task-gone.txt", "abandon"), s.unsettled)
+        self.assertIn(("task-gone.txt", "abandon"), s.staged)
+
     def test_a_failing_done_or_abandon_hook_is_logged_not_fatal(self):
         self.deliver("task-1")
         self.deliver("task-gone", payload=False)
@@ -1023,13 +1066,22 @@ class WatcherChild(SeatCase):
 
     def test_serve_keeps_the_watcher_running_and_picks_up_a_task_it_announces(self):
         s = self.make(poll_s=30)
-        stub = self.script('sleep 0.5\necho "TASK_FILE: task-late.txt"\nexec sleep 300\n')
+        # The task arrives only once the seat is idle, and the watcher announces it only once it is
+        # there: on a fixed delay a slow app-server start let the first step find the task (no idle
+        # line), or let the announcement come before the task (nothing to wake for until the poll).
+        there = self.ws / "task-late.there"
+        stub = self.script(f'while [ ! -e "{there}" ]; do sleep 0.05; done\n'
+                           'echo "TASK_FILE: task-late.txt"\nexec sleep 300\n')
         w = seat_mod.Watcher(str(self.tasks), s.wake, script=stub)
 
         def arrive():
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and "idle: waiting for tasks" not in self.out.getvalue():
+                time.sleep(0.02)
             self.task("task-late.txt")
+            there.touch()
 
-        threading.Timer(0.2, arrive).start()
+        threading.Thread(target=arrive).start()
         stopper = threading.Thread(target=lambda: (self.wait_for_result("task-late.txt"), s.request_stop()))
         stopper.start()
         self.assertEqual(s.serve(watcher=w), 0)

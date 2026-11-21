@@ -395,6 +395,9 @@ class Seat:
         for task_id, state in task_dispositions(self.workspace, ids).items():
             filename = f"{task_id}.txt"
             if state == PENDING:
+                # A payload that became visible after an `abandon` could not be recorded: the delivery is
+                # owed again, and the retry kept for it must not withdraw it.
+                self.unsettled.pop((filename, "abandon"), None)
                 owed.append(Path(self.host.task_path(filename)))
             elif state == ANSWERED:
                 self.settle(filename, "done")
@@ -621,7 +624,10 @@ class Seat:
     def step(self) -> Optional[str]:
         """Run the first eligible pending task; None when nothing is eligible right now."""
         for filename, stage in list(self.unsettled):
-            self.settle(filename, stage)
+            # `abandon` is asked again only by pending(), which reads the delivery's state first: its
+            # payload can become visible while the retry waits, and the task is then owed, not spent.
+            if stage != "abandon":
+                self.settle(filename, stage)
         for filename, payload in self.pending():
             if self.eligible(filename, payload):
                 self.idle_logged = False
