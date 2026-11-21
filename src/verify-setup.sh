@@ -31,15 +31,21 @@ fi
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CORE_RUNTIME="$(bash "$REPO/scripts/sutando-config.sh" core-runtime 2>/dev/null || echo claude)"
-if command -v "$CORE_RUNTIME" &>/dev/null; then
-  if [ "$CORE_RUNTIME" = "codex" ] && ! codex login status >/dev/null 2>&1; then
-    fail "Codex CLI is not authenticated (run: codex login)"
-  else
-    pass "$CORE_RUNTIME core CLI"
-  fi
+if [ -r "$REPO/src/agent/runtime-compat-gate.sh" ]; then
+  # shellcheck source=agent/runtime-compat-gate.sh
+  . "$REPO/src/agent/runtime-compat-gate.sh"
 else
-  fail "$CORE_RUNTIME core CLI not found"
+  sutando_core_cli_path() { command -v "$2" || return 3; }
 fi
+_cli_rc=0
+_auth_args=()
+[ "$CORE_RUNTIME" = "codex" ] && _auth_args=(--enforce-auth)
+CORE_CLI="$(sutando_core_cli_path "$REPO" "$CORE_RUNTIME" ${_auth_args[@]+"${_auth_args[@]}"} 2>/dev/null)" || _cli_rc=$?
+case "$_cli_rc" in
+  0) pass "$CORE_RUNTIME core CLI ($CORE_CLI)" ;;
+  4) fail "Codex CLI is not authenticated (run: codex login)" ;;
+  *) fail "$CORE_RUNTIME core CLI not found or unusable (run: python3 src/runtime_compat.py doctor)" ;;
+esac
 
 if command -v fswatch &>/dev/null; then
   pass "fswatch"

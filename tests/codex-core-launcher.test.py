@@ -10,9 +10,14 @@ import sys
 import tempfile
 import time
 import unittest
-import pty
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers.hermetic_env import isolate_os_environ, isolated_child_env  # noqa: E402
+
+isolate_os_environ()
+
+import pty  # noqa: E402
+
 from _helpers.process_group import popen_bound  # noqa: E402
 from _helpers.old_python import pre_311_python  # noqa: E402
 
@@ -101,6 +106,16 @@ exit 0
 '''
 
 
+# Answers the compat gate's probes the way a real codex-cli does.
+CODEX_STUB = """#!/bin/bash
+case "${1:-}" in
+  --version) echo "codex-cli 0.160.1" ;;
+  --help) echo "--cd --add-dir --sandbox --ask-for-approval --search --no-alt-screen --config --model" ;;
+esac
+exit 0
+"""
+
+
 class CodexCoreLauncherTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -119,6 +134,14 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/codex-observer.mjs",
             "src/agent/start-cli.sh",
             "src/agent/restart-guard.sh",
+            "src/agent/runtime-compat-gate.sh",
+            "src/runtime_compat.py",
+            "src/auth_preflight.py",
+            "src/owner_reply.py",
+            "src/local_record.py",
+            "src/policy/__init__.py",
+            "src/policy/egress/__init__.py",
+            "src/policy/egress/result.py",
             "src/agent/tmux-socket-guard.sh",
             "src/agent/core-runtime-record.sh",
             "src/agent/core-window.sh",
@@ -194,7 +217,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "pathlib.Path(os.environ['SCHEDULER_LOG']).write_text(' '.join(sys.argv[1:]))\n"
         )
         workspace = self.root / "workspace"
-        self._sutando_env = {k: v for k, v in os.environ.items() if k.startswith("SUTANDO_")}
+        self._sutando_env = {k: v for k, v in isolated_child_env().items() if k.startswith("SUTANDO_")}
         for key in self._sutando_env:
             os.environ.pop(key)
         os.environ["SUTANDO_WORKSPACE_DIR"] = str(workspace)
@@ -208,7 +231,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             }],
         }))
         started = subprocess.check_output(["ps", "-o", "lstart=", "-p", str(os.getpid())],
-                                          env={**os.environ, "LC_ALL": "C", "TZ": "UTC"}, text=True)
+                                          env=isolated_child_env(LC_ALL="C", TZ="UTC"), text=True)
         now = time.time()
         record = dict(schema=1, observer="codex-observer", observer_version="test", observer_id="test",
                       observer_started_at=now, seat="core", session="sutando-core", claude_session_id=None,
@@ -218,7 +241,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
         subprocess.run([sys.executable, str(self.root / "src/runtime_observation.py"), "write",
                         "--workspace", str(workspace)], input=json.dumps(record), text=True, check=True)
         self.bin.mkdir()
-        self._write_exe("codex", '#!/bin/bash\n[ "${1:-}" = login ] && exit 0\nexit 0\n')
+        self._write_exe("codex", CODEX_STUB)
         self._write_exe("fswatch", '#!/bin/bash\nexit 0\n')
         # Nothing listens on the agent API port; the fake API only records its start.
         self._write_exe("lsof", '#!/bin/bash\nexit 1\n')
@@ -403,7 +426,7 @@ exit 0
         return f"{checksum[0]}-{checksum[1]}-h{handler_cksum}-s{stop_cksum}{mode}"
 
     def run_launcher(self, *args, env_extra=None, launcher="src/agent/start-cli.sh"):
-        env = dict(os.environ)
+        env = isolated_child_env()
         env.pop("SUTANDO_SELF_DEVELOPMENT_ENABLED", None)
         # A suite run from inside a core would otherwise inherit the marker
         # and hit the in-session restart guard instead of the path under test.
@@ -417,6 +440,9 @@ exit 0
             env["FAKE_CORE_PANE_PID"] = str(self.pane_pid)
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
+            "SUTANDO_RUNTIME_SYSTEM_DIRS": "",
+            "SUTANDO_RUNTIME_WAIT_S": "0",
+            "SUTANDO_RUNTIMES_DIR": str(Path(self.tmp.name) / "runtimes"),
             "TMUX_LOG": str(self.log),
             "TMUX_STATE": str(Path(self.tmp.name) / "tmux-killed"),
             "HOME": str(Path(self.tmp.name) / "home"),
@@ -443,7 +469,7 @@ exit 0
         return result
 
     def run_launcher_with_tty(self, *args, env_extra=None):
-        env = dict(os.environ)
+        env = isolated_child_env()
         env.pop("SUTANDO_SELF_DEVELOPMENT_ENABLED", None)
         # A suite run from inside a core would otherwise inherit the marker
         # and hit the in-session restart guard instead of the path under test.
@@ -455,6 +481,9 @@ exit 0
         env.pop("SUTANDO_APP_SUPPORT", None)
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
+            "SUTANDO_RUNTIME_SYSTEM_DIRS": "",
+            "SUTANDO_RUNTIME_WAIT_S": "0",
+            "SUTANDO_RUNTIMES_DIR": str(Path(self.tmp.name) / "runtimes"),
             "TMUX_LOG": str(self.log),
             "TMUX_STATE": str(Path(self.tmp.name) / "tmux-killed"),
             "HOME": str(Path(self.tmp.name) / "home"),
@@ -529,7 +558,8 @@ exit 0
         marker = tmp / "codex-ran"
         for key in ("install", "local"):
             exe = dirs[key] / "codex"
-            exe.write_text(f'#!/bin/bash\nprintf "%s\\n%s\\n" {key} "$PATH" > "{marker}"\nexit 1\n')
+            auth_probe = f'  login) printf "%s\\n%s\\n" {key} "$PATH" > "{marker}"; exit 1 ;;\n'
+            exe.write_text(CODEX_STUB.replace("esac\nexit 0", auth_probe + "esac\nexit 0"))
             exe.chmod(0o755)
         (self.bin / "codex").unlink()
         env = {"CODEX_INSTALL_BIN": str(dirs["install"])}
@@ -875,7 +905,8 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
     def test_a_real_codex_with_the_refused_missing_home_stops_the_launch_writing_nothing(self):
         """Real Codex 0.164 exits 1 from `login status` when CODEX_HOME does not exist."""
         home = self._owner_linked_to_missing_app_home()
-        self._write_exe("codex", '#!/bin/bash\n[ -d "${CODEX_HOME:-}" ] || exit 1\nexit 0\n')
+        self._write_exe("codex", CODEX_STUB.replace(
+            "esac\nexit 0", '  login) [ -d "${CODEX_HOME:-}" ] || exit 1 ;;\nesac\nexit 0'))
         result = self.run_launcher(env_extra={"SUTANDO_CODEX_WORKING_DIR": str(self.root)})
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("not authenticated", result.stderr)
@@ -1260,12 +1291,166 @@ if [ "${1:-}" = print ]; then [ -f "$LAUNCHCTL_STATE" ]; else exit 0; fi
         self.assertIn("sutando-core already running (codex)", result.stdout)
 
     def test_auth_failure_stops_before_tmux_launch(self):
-        self._write_exe("codex", '#!/bin/bash\nexit 1\n')
+        self._write_exe("codex", CODEX_STUB.replace("esac\nexit 0", "  login) exit 1 ;;\nesac\nexit 0"))
         result = self.run_launcher()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not authenticated", result.stderr)
         calls = self._tmux_calls()
         self.assertNotIn("new-session", calls)
+
+    def test_off_tty_broken_cli_asks_the_owner_then_their_reply_repairs_and_launches(self):
+        self._write_exe("codex", "#!/bin/bash\nexit 1\n")
+        ws = self.root / "workspace"
+        self._write_exe("npm", """#!/bin/bash
+PREFIX=""
+while [ $# -gt 0 ]; do [ "$1" = --prefix ] && PREFIX="$2"; shift; done
+mkdir -p "$PREFIX/bin"
+cp "$CODEX_GOOD" "$PREFIX/bin/codex"
+""")
+        (ws / "state").mkdir(parents=True, exist_ok=True)
+        (ws / "state" / "owner-routing.json").write_text('{"owner_dm": "!dm:x"}')
+        first = self.run_launcher()
+        self.assertEqual(first.returncode, 3, first.stderr)
+        self.assertNotIn("new-session -d -s sutando-core ", self._tmux_calls())
+        self.assertEqual(self.run_launcher().returncode, 3)
+        notices = sorted((ws / "results").glob("proactive-runtime-compat-codex-*.txt"))
+        self.assertEqual(len(notices), 1, "one DM per incident, however often the launch is retried")
+        self.assertIn('Reply "install compatible codex"', notices[0].read_text())
+        good = Path(self.tmp.name) / "codex-good"
+        good.write_text(CODEX_STUB)
+        good.chmod(0o755)
+        reply = ws / "tasks" / "task-900.txt"
+        reply.parent.mkdir(parents=True, exist_ok=True)
+        reply.write_text("source: ag2space\nchannel_id: !dm:x\naccess_tier: owner\n"
+                         "task: install compatible codex\n")
+        done = self.run_launcher(env_extra={"CODEX_GOOD": str(good)})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        managed = Path(self.tmp.name) / "runtimes" / "bin" / "codex"
+        self.assertIn(f"{managed} -C", self._tmux_calls())
+        self.assertIn("Installed codex 0.160.1", (ws / "results" / "task-900.txt").read_text())
+        self.assertFalse(reply.exists())
+        self.assertEqual(len(list((ws / "tasks" / "archive").rglob("task-900.txt"))), 1)
+        again = self.run_launcher(env_extra={"CODEX_GOOD": str(good)})
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(len(sorted((ws / "results").glob("proactive-runtime-compat-codex-*.txt"))), 1)
+
+    def test_app_surface_broken_codex_stops_at_once_without_a_dm(self):
+        self._write_exe("codex", "#!/bin/bash\nexit 1\n")
+        ran = Path(self.tmp.name) / "npm-ran"
+        self._write_exe("npm", f'#!/bin/bash\ntouch "{ran}"\nexit 1\n')
+        start = time.monotonic()
+        r = self.run_launcher(env_extra={"SUTANDO_RUNTIME_CONSENT_SURFACE": "app",
+                                         "SUTANDO_RUNTIME_WAIT_S": "600"})
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertLess(time.monotonic() - start, 60)
+        self.assertNotIn("waiting up to", r.stderr)
+        self.assertNotIn("new-session -d -s sutando-core ", self._tmux_calls())
+        ws = self.root / "workspace"
+        self.assertEqual(sorted((ws / "results").glob("proactive-runtime-compat-codex-*.txt")), [])
+        self.assertFalse(ran.exists())
+
+    def test_app_surface_login_timeout_does_not_request_a_session(self):
+        hanging = CODEX_STUB.replace("esac\nexit 0", "  login) exec /bin/sleep 30 ;;\nesac\nexit 0")
+        self._write_exe("codex", hanging)
+        result = self.run_launcher(env_extra={"SUTANDO_RUNTIME_CONSENT_SURFACE": "app",
+                                              "SUTANDO_RUNTIME_WAIT_S": "600"})
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertIn("login status failed", result.stderr)
+        self.assertNotIn("new-session", self._tmux_calls())
+        self.assertNotIn("new-window", self._tmux_calls())
+
+    def _owner_reply_installs(self, installed_stub):
+        """Broken codex, one launch to open the incident, then the owner's install reply."""
+        self._write_exe("codex", "#!/bin/bash\nexit 1\n")
+        ws = self.root / "workspace"
+        self._write_exe("npm", """#!/bin/bash
+PREFIX=""
+while [ $# -gt 0 ]; do [ "$1" = --prefix ] && PREFIX="$2"; shift; done
+mkdir -p "$PREFIX/bin"
+cp "$CODEX_GOOD" "$PREFIX/bin/codex"
+""")
+        (ws / "state").mkdir(parents=True, exist_ok=True)
+        (ws / "state" / "owner-routing.json").write_text('{"owner_dm": "!dm:x"}')
+        self.assertEqual(self.run_launcher().returncode, 3)
+        good = Path(self.tmp.name) / "codex-good"
+        good.write_text(installed_stub)
+        good.chmod(0o755)
+        reply = ws / "tasks" / "task-901.txt"
+        reply.parent.mkdir(parents=True, exist_ok=True)
+        reply.write_text("source: ag2space\nchannel_id: !dm:x\naccess_tier: owner\n"
+                         "task: install compatible codex\n")
+        result = self.run_launcher(env_extra={"CODEX_GOOD": str(good)})
+        return result, (ws / "results" / "task-901.txt").read_text()
+
+    def test_owner_install_reply_on_a_logged_out_codex_answers_with_the_login_step(self):
+        logged_out = CODEX_STUB.replace("esac\nexit 0", "  login) exit 1 ;;\nesac\nexit 0")
+        result, answer = self._owner_reply_installs(logged_out)
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertNotIn("new-session -d -s sutando-core ", self._tmux_calls())
+        self.assertIn("Installed codex 0.160.1", answer)
+        self.assertIn("codex login", answer)
+        self.assertIn('"retry now"', answer)
+        self.assertNotIn("starting", answer)
+
+    def test_owner_install_reply_on_a_logged_in_codex_answers_that_it_starts(self):
+        result, answer = self._owner_reply_installs(CODEX_STUB)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        managed = Path(self.tmp.name) / "runtimes" / "bin" / "codex"
+        self.assertIn(f"{managed} -C", self._tmux_calls())
+        self.assertIn("Installed codex 0.160.1", answer)
+        self.assertIn("The core is starting.", answer)
+
+    def test_no_codex_anywhere_with_consent_installs_and_launches(self):
+        (self.bin / "codex").unlink()
+        good = Path(self.tmp.name) / "codex-good"
+        good.write_text(CODEX_STUB)
+        good.chmod(0o755)
+        self._write_exe("npm", """#!/bin/bash
+PREFIX=""
+while [ $# -gt 0 ]; do [ "$1" = --prefix ] && PREFIX="$2"; shift; done
+mkdir -p "$PREFIX/bin"
+cp "$CODEX_GOOD" "$PREFIX/bin/codex"
+""")
+        result = self.run_launcher(env_extra={"CODEX_GOOD": str(good),
+                                              "SUTANDO_RUNTIME_REPAIR_CONSENT": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("repair succeeded", result.stderr)
+        managed = Path(self.tmp.name) / "runtimes" / "bin" / "codex"
+        self.assertIn(f"{managed} -C", self._tmux_calls())
+
+    def test_working_managed_codex_off_path_is_found_and_launched(self):
+        (self.bin / "codex").unlink()
+        managed = Path(self.tmp.name) / "runtimes" / "bin" / "codex"
+        managed.parent.mkdir(parents=True)
+        managed.write_text(CODEX_STUB)
+        managed.chmod(0o755)
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("not installed", result.stderr)
+        self.assertIn(f"{managed} -C", self._tmux_calls())
+
+    def test_heals_the_core_window_with_the_managed_codex_off_path(self):
+        (self.bin / "codex").unlink()
+        managed = Path(self.tmp.name) / "runtimes" / "bin" / "codex"
+        managed.parent.mkdir(parents=True)
+        managed.write_text(CODEX_STUB)
+        managed.chmod(0o755)
+        result = self.run_launcher(env_extra={"TMUX_ACTIVE_RUNTIME": "codex", "FAKE_NO_CORE_WINDOW": "1"})
+        self.assertIn("healing core window", result.stderr)
+        calls = self._tmux_calls()
+        self.assertIn(f"-c {self.root} {managed} -C", calls)
+        self.assertNotIn("new-session -d -s sutando-core ", calls + " ")
+
+    def test_two_codex_on_path_the_too_old_first_is_skipped_for_the_second(self):
+        self._write_exe("codex", CODEX_STUB.replace("0.160.1", "0.30.0"))
+        second = Path(self.tmp.name) / "bin2" / "codex"
+        second.parent.mkdir()
+        second.write_text(CODEX_STUB)
+        second.chmod(0o755)
+        result = self.run_launcher(env_extra={"PATH": f"{self.bin}:{second.parent}:/usr/bin:/bin"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"using {second} (0.160.1)", result.stderr)
+        self.assertIn(f"{second} -C", self._tmux_calls())
 
     def test_notifier_supervisor_restarts_after_child_exit(self):
         count = Path(self.tmp.name) / "notifier-count"
@@ -1285,7 +1470,7 @@ mv "$tmp" "$SUPERVISOR_COUNT"
 exit 23
 ''')
         notifier.chmod(0o755)
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core",
                    SUTANDO_NOTIFIER_SCRIPT=str(notifier),
@@ -1337,7 +1522,7 @@ fi
 sleep 60
 ''')
         notifier.chmod(0o755)
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core",
                    SUTANDO_NOTIFIER_SCRIPT=str(notifier),
@@ -1373,7 +1558,7 @@ sleep 60
         notifier = self.bin / "notifier-under-test"
         notifier.write_text(f'#!/bin/bash\ntouch "{count}"\n')
         notifier.chmod(0o755)
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core",
                    SUTANDO_NOTIFIER_SCRIPT=str(notifier))
@@ -1411,9 +1596,7 @@ if [ "${1:-}" = capture-pane ]; then
 fi
 exit 0
 ''')
-        env = dict(
-            os.environ,
-            PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
             SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
             SUTANDO_TASKS_DIR=str(tasks),
@@ -1452,7 +1635,7 @@ exit 0
 
     def test_notifier_submits_literal_safe_prompt(self):
         # The one-event mode tests the adapter without starting fswatch.
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         # This stub reports the core session alive for notifier calls.
         self._write_exe("tmux", '''#!/bin/bash
@@ -1472,7 +1655,7 @@ exit 0
         self.assertIn("send-keys -t =sutando-core:0 C-m", calls)
 
     def test_notifier_leaves_copy_mode_and_logs_before_each_submit(self):
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         # The core pane reports a mode (an owner scrolled it), as copy mode does.
         self._write_exe("tmux", '''#!/bin/bash
@@ -1493,7 +1676,7 @@ exit 0
         self.assertIn("submitting task-123.txt: C-m (attempt 1)", result.stderr)
 
     def test_notifier_does_not_retry_a_claimed_hung_send(self):
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core",
                    HANG_MARK=str(Path(self.tmp.name) / "hung-once"))
         # The ticket was claimed before the timeout, so subsequent attempts must not reach tmux.
@@ -1518,7 +1701,7 @@ exit 0
 
     def _failed_send(self, key, managed=False, claimed=False):
         stage = Path(self.tmp.name) / "staged"
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core",
                    STAGE=str(stage), FAIL_KEY=key, SUTANDO_NOTIFIER_POLL_INTERVAL="0.02",
                    SUTANDO_NOTIFIER_SUBMIT_CONFIRM_TIMEOUT="1", SUTANDO_NOTIFIER_SUBMIT_RETRIES="1")
@@ -1604,7 +1787,7 @@ fi
         (workspace / "results").mkdir(exist_ok=True)
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
         (workspace / "results" / "task-done.txt").write_text("already complete\n")
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
@@ -1620,7 +1803,7 @@ fi
         archive.mkdir(parents=True)
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
         (archive / "task-done.txt").write_text("already delivered\n")
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
@@ -1645,7 +1828,7 @@ printf '%s\\n' "$*" >> "$TMUX_LOG"
 [ "$3" = has-session ] && exit 0
 exit 0
 ''')
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
@@ -1669,7 +1852,7 @@ printf '%s\\n' "$*" >> "$TMUX_LOG"
 [ "$3" = has-session ] && exit 0
 exit 0
 ''')
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
@@ -1685,7 +1868,7 @@ exit 0
         archive.mkdir(parents=True)
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
         (archive / "task-done-1784690000.txt").write_text("already delivered\n")
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
@@ -1701,7 +1884,7 @@ exit 0
         archive.mkdir(parents=True)
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
         (archive / "task-done.txt").write_text("already delivered\n")
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
@@ -1717,7 +1900,7 @@ exit 0
         archive.mkdir(parents=True)
         (workspace / "tasks" / "task-done.txt").write_text("task: done\n")
         (archive / "task-done-1784690000.txt").write_text("already delivered\n")
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core")
         script = self.root / "src/agent/codex/cli/task-notifier.sh"
         result = subprocess.run(["/bin/bash", str(script), "--event", "task-done.txt"],
@@ -1805,9 +1988,7 @@ if [ "${1:-}" = send-keys ]; then
 fi
 exit 0
 ''')
-        env = dict(
-            os.environ,
-            PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
             TMUX_LOG=str(self.log),
             CONTEXT_CAPTURE=str(capture),
             CONTEXT_PATH=str(context_path),
@@ -1878,9 +2059,7 @@ if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
 fi
 exit 0
 ''')
-        env = dict(
-            os.environ,
-            PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
             TMUX_LOG=str(self.log),
             SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
@@ -1954,9 +2133,7 @@ for _a in "$@"; do
 done
 exit 0
 ''')
-        env = dict(
-            os.environ,
-            PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
             TMUX_LOG=str(self.log),
             CALL_COUNT=str(count),
             PANE_BUF=str(buf),
@@ -2040,7 +2217,7 @@ if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
 fi
 exit 0
 ''')
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
                    STAGE=str(Path(self.tmp.name) / "staged"),
                    SUBMIT_COUNT=str(count), SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core", SUTANDO_TASKS_DIR=str(tasks),
@@ -2104,7 +2281,7 @@ if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
 fi
 exit 0
 ''')
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log),
                    EARLY_SUBMIT=str(early), BUSY_MARKER=str(busy),
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
                    SUTANDO_TMUX_SESSION="sutando-core", SUTANDO_TASKS_DIR=str(tasks),
@@ -2160,9 +2337,7 @@ if [ "${1:-}" = send-keys ] && [ "${*: -1}" = C-m ]; then
 fi
 exit 0
 ''')
-        env = dict(
-            os.environ,
-            PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
             TMUX_LOG=str(self.log),
             SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
@@ -2210,9 +2385,7 @@ if [ "${1:-}" = capture-pane ]; then
 fi
 exit 0
 ''')
-        env = dict(
-            os.environ,
-            PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
             TMUX_LOG=str(self.log),
             SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
@@ -2278,9 +2451,7 @@ if [ "${1:-}" = capture-pane ]; then
 fi
 exit 0
 ''')
-        env = dict(
-            os.environ,
-            PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
             TMUX_LOG=str(self.log),
             SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
@@ -2350,9 +2521,7 @@ if [ "${1:-}" = capture-pane ]; then
 fi
 exit 0
 ''')
-        env = dict(
-            os.environ,
-            PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
             TMUX_LOG=str(self.log),
             SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
@@ -2404,9 +2573,7 @@ if [ "${1:-}" = has-session ]; then exit 0; fi
 if [ "${1:-}" = capture-pane ]; then exit 0; fi
 exit 0
 ''')
-        env = dict(
-            os.environ,
-            PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
             TMUX_LOG=str(self.log),
             SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
@@ -2460,9 +2627,7 @@ if [ "${{1:-}}" = send-keys ] && [ "${{*: -1}}" = C-m ]; then
 fi
 exit 0
 ''')
-        env = dict(
-            os.environ,
-            PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
             TMUX_LOG=str(self.log),
             SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
             SUTANDO_TMUX_SESSION="sutando-core",
@@ -2583,8 +2748,7 @@ if [ "${{1:-}}" = send-keys ]; then
 fi
 exit 0
 ''')
-        env = dict(
-            os.environ, PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log), CLEARED=str(cleared),
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin", TMUX_LOG=str(self.log), CLEARED=str(cleared),
             SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"), SUTANDO_TMUX_SESSION="sutando-core",
             SUTANDO_TASKS_DIR=str(tasks), SUTANDO_RESULTS_DIR=str(results),
             SUTANDO_NOTIFIER_POLL_INTERVAL="0.02", SUTANDO_NOTIFIER_CORE_READY_TIMEOUT="2",
@@ -2629,7 +2793,7 @@ exit 0
             "with open(os.environ['WRITER_LOG'], 'a') as f: f.write(' '.join(sys.argv[1:]) + '\\n')\n"
             "sys.exit(9)\n"
         )
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
                    WRITER_LOG=str(writer_log),
                    SUTANDO_INSTANCE_ID="worker-3",
                    SUTANDO_POOL_DELIVERY_SCRIPT=str(writer),
@@ -2661,7 +2825,7 @@ exit 0
         (results / "task-owner.txt").write_text("done\n")
         sentinel = inbox / "task-owner.accepted"
         sentinel.touch()
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
                    SUTANDO_INSTANCE_ID="worker-3",
                    SUTANDO_POOL_DELIVERY_SCRIPT=str(
                        REAL_REPO / "skills/worker-pool/scripts/pool_delivery.py"),
@@ -2692,7 +2856,7 @@ exit 0
             "import sys\n"
             "sys.exit(9 if 'prune-spent' in sys.argv else 0)\n"
         )
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
                    SUTANDO_INSTANCE_ID="worker-3",
                    SUTANDO_POOL_DELIVERY_SCRIPT=str(writer),
                    SUTANDO_WORKSPACE_DIR=str(workspace),
@@ -2753,7 +2917,7 @@ exit 0
         ]
         for name, hostile, expected_tries, expected_label in cases:
             with self.subTest(case=name, hostile=hostile):
-                env = dict(os.environ)
+                env = isolated_child_env()
                 env.pop("SUTANDO_CORE_SESSION_WAIT_S", None)
                 if hostile is not None:
                     env["SUTANDO_CORE_SESSION_WAIT_S"] = hostile
@@ -2886,7 +3050,7 @@ printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = has-session ] && exit 0
 exit 0
 ''')
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
                    TMUX_LOG=str(self.log),
                    SUTANDO_INSTANCE_ID="worker-3",
                    SUTANDO_POOL_DELIVERY_SCRIPT=str(writer),
@@ -2912,7 +3076,7 @@ exit 0
         tasks = workspace / "tasks"
         tasks.mkdir(exist_ok=True)
         (tasks / "task-owner.txt").write_text("task: deliver me\n")
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
                    TMUX_LOG=str(self.log),
                    SUTANDO_TASKS_DIR=str(tasks),
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
@@ -2940,7 +3104,7 @@ printf '%s\n' "$*" >> "$TMUX_LOG"
 [ "${1:-}" = capture-pane ] && { printf '› my unsent draft\n← for agents\n'; exit 0; }
 exit 0
 ''')
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
                    TMUX_LOG=str(self.log),
                    SUTANDO_TASKS_DIR=str(tasks),
                    SUTANDO_TMUX_SOCKET=str(Path(self.tmp.name) / "test.sock"),
@@ -3017,7 +3181,7 @@ case "${1:-}" in
 esac
 exit 0
 ''')
-        env = dict(os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+        env = isolated_child_env(PATH=f"{self.bin}:/usr/bin:/bin",
                    EVENT_LOG=str(event_log), FIRST_FAILURE=str(first_failure),
                    PANE_BUF=str(pane_buf),
                    SUTANDO_INSTANCE_ID="worker-3",
@@ -3065,7 +3229,8 @@ class CoreWindowRestartTests(unittest.TestCase):
         (self.case.bin / "tmux").symlink_to(REAL_TMUX)
         # A core that stays up like the real CLI; `login status` still succeeds.
         codex = self.case.bin / "codex"
-        codex.write_text('#!/bin/bash\n[ "${1:-}" = login ] && exit 0\nexec sleep 300\n')
+        codex.write_text(CODEX_STUB.replace(' ;;', '; exit 0 ;;').replace(
+            "esac\nexit 0", "  login) exit 0 ;;\nesac\nexec sleep 300"))
         codex.chmod(0o755)
 
     def tmux(self, *args):

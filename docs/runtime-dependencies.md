@@ -40,6 +40,11 @@ services launch. It does not check platform or tool versions:
 The agent CLI is the one dependency nothing can work around: **Sutando is a
 harness around Claude Code or Codex.**
 
+The runtime launcher checks that CLI's version and flags before it replaces a
+core, and stops with the fix when the CLI cannot run. Check it yourself with
+`python3 src/runtime_compat.py doctor`. Every state and its fix are in the
+[core CLI repair matrix](runtime-compat-repair-matrix.md).
+
 ## Required per feature
 
 None of these block startup. Each one's absence disables its own surface and
