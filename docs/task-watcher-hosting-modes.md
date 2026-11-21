@@ -98,6 +98,12 @@ same session watcher can instead be run by a Claude Code Mod, `src/agent/claude/
   Submits are only issued while no main turn runs, and the 30 s count only idle time: a submit
   overtaken by a main turn is waiting for the session to be idle, not stuck. A subagent's
   `turn.start` / `turn.complete` (they carry `agentId`) never change what the Mod takes as idle.
+- A submit that resolves is not yet a delivery: after an interrupt Claude Code answers a submit and
+  starts no turn. The announcement is dropped only once a main `turn.start` follows whose text holds
+  it (or is empty). If the engine refuses the prompt (`{ drop }`), or no main turn starts within 15 s,
+  it is sent again, waiting 5 s doubling to 60 s, for as long as it takes. A main turn with other
+  text (the person typed first) confirms nothing: the announcement is sent once more, and a second
+  such turn is taken as delivery. A turn that starts after a resend went out delivers twice.
 - The Mod keeps a delivery trail in `<workspace>/logs/task-watch-mod.log`: each watcher start and
   end, each announcement and stderr line the watcher printed, and each submit's start and outcome
   (`ok`, `failed`, `timeout`, settled late). The watcher itself appends one line per start to

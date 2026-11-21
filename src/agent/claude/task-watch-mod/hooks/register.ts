@@ -15,6 +15,9 @@ const MAX_EARLY_EXITS = 8
 const RETRY_SUBMIT_MS = 5_000
 /** How long one submit may stay unsettled before its announcement is taken back and sent again. */
 export const SUBMIT_TIMEOUT_MS = 30_000
+/** How long after a submit resolves a main turn may take to start before the submit counts as not delivered. */
+export const TURN_START_WAIT_MS = 15_000
+const RESEND_MAX_MS = 60_000
 // The delivery trail, under the workspace: what the watcher said, what was submitted, and how each submit ended.
 const TRAIL_FILE = 'logs/task-watch-mod.log'
 const TRAIL_LINE_MAX = 2_000
@@ -122,7 +125,8 @@ export type Host = {
   spawn: (argv: string[], cwd: string) => Child
   sleep: (ms: number) => Promise<void>
   now: () => Promise<number>
-  submit: (text: string) => Promise<void>
+  /** Resolves once the engine answered: with the engine's reason when the prompt did not enter, else nothing. */
+  submit: (text: string) => Promise<string | null | void>
   /** Appends the lines, each with the time, to a file; best-effort, never rejects. */
   record: (file: string, lines: string[]) => Promise<void>
   log: (text: string, debug?: boolean) => Promise<void>
@@ -145,17 +149,22 @@ export class TaskWatch {
   private submits = 0
   private mainTurns = 0
   private idleWaiters: (() => void)[] = []
+  private starts: string[] = []
+  private startWaiters: (() => void)[] = []
+  private doubted: string | null = null
   private trail: string | null = null
   private notes: string[] = []
   private noting = false
-  constructor(private host: Host, private repo: string, private submitTimeoutMs = SUBMIT_TIMEOUT_MS) {}
+  constructor(private host: Host, private repo: string, private submitTimeoutMs = SUBMIT_TIMEOUT_MS, private turnStartWaitMs = TURN_START_WAIT_MS) {}
 
   // turn.start and turn.complete also fire for each subagent's loop, with its `agentId`; only the main
   // loop's (no `agentId`) say whether the session is idle, so a subagent's are ignored in all three calls.
-  turnStart(agentId?: string): void {
+  turnStart(agentId?: string, text = ''): void {
     if (agentId !== undefined) return
     this.turnRunning = true
     this.mainTurns++
+    this.starts.push(text)
+    for (const wake of this.startWaiters.splice(0)) wake()
   }
 
   turnIdle(agentId?: string): void {
@@ -189,7 +198,7 @@ export class TaskWatch {
     if (reason === 'clear' || reason === 'resume') return
     this.stopped = true
     // A send waiting for the main turn to end is released, so no promise outlives the watch.
-    for (const wake of this.idleWaiters.splice(0)) wake()
+    for (const wake of [...this.idleWaiters.splice(0), ...this.startWaiters.splice(0)]) wake()
     const child = this.child
     this.child = null
     if (child) detach(child.return(undefined))
@@ -201,6 +210,23 @@ export class TaskWatch {
     return this.sent
   }
 
+  /** Of the main turns started since the last submit was issued: one with this text, only others, or none. */
+  private startSeen(text: string): 'ours' | 'other' | 'none' {
+    if (this.starts.some((t) => t === '' || t.includes(text))) return 'ours'
+    return this.starts.length ? 'other' : 'none'
+  }
+
+  /** Waits, up to the confirm window, for a main turn to start after a submit resolved. */
+  private async turnStarted(text: string): Promise<'ours' | 'other' | 'none'> {
+    const expired = this.host.sleep(this.turnStartWaitMs).then(() => true)
+    for (;;) {
+      const seen = this.startSeen(text)
+      if (seen !== 'none' || this.stopped) return seen
+      const woke = new Promise<boolean>((wake) => { this.startWaiters.push(() => wake(false)) })
+      if (await Promise.race([expired, woke])) return this.startSeen(text)
+    }
+  }
+
   /**
    * Submits what is ready, one message at a time, in order. A submit that throws, or that has not settled
    * within the timeout, keeps its text: it goes back to the front after a wait and is sent again. A timed-out
@@ -209,10 +235,18 @@ export class TaskWatch {
    *
    * Submits are only issued while no main turn runs, and the timeout only counts idle time: the engine holds
    * a submitted prompt until the session is idle, so one overtaken by a main turn is waiting, not stuck.
+   *
+   * A submit that resolves is not yet a delivery: after an interrupt the engine answers a submit and starts
+   * no turn. The text is dropped only once a main turn starts with it (its `turn.start` text holds the
+   * submitted text, or is empty). Refused by the engine, or with no main turn in the window, it goes back and
+   * is sent again, waiting 5 s doubling to 60 s, for as long as it takes. A main turn with other text (the
+   * person typed first) confirms nothing: the text is sent once more, and a second such turn is then taken
+   * as delivery, so an engine that words its turns differently costs one repeat per announcement, not a loop.
    */
   private async drain(): Promise<void> {
     this.sending = true
     let timeouts = 0
+    let unstarted = 0
     try {
       while (!this.stopped && !this.turnRunning) {
         const text = this.ann.take()
@@ -220,22 +254,24 @@ export class TaskWatch {
         const id = ++this.submits
         let timedOut = false
         let landedLate = false
+        this.starts = []
         this.note(`submit #${id} start: ${text.replace(/\n/g, ' | ')}`)
         const settled = (async () => this.host.submit(text))().then(
-          () => {
-            if (timedOut) {
+          (drop) => {
+            const dropped = typeof drop === 'string' ? drop : null
+            if (timedOut && dropped === null) {
               landedLate = true
               this.note(`submit #${id} settled after its timeout: delivered late`)
             }
-            return { error: null as string | null }
+            return { error: null as string | null, dropped }
           },
           (err) => {
             const error = err instanceof Error ? err.message : String(err)
             if (timedOut) this.note(`submit #${id} failed after its timeout (${error})`)
-            return { error }
+            return { error, dropped: null as string | null }
           },
         )
-        let result: { error: string | null } | null = null
+        let result: { error: string | null; dropped: string | null } | null = null
         for (;;) {
           const turnsBefore = this.mainTurns
           result = await Promise.race([settled, this.host.sleep(this.submitTimeoutMs).then(() => null)])
@@ -247,7 +283,35 @@ export class TaskWatch {
         if (!result && this.stopped) return
         if (result && result.error === null) {
           timeouts = 0
-          this.note(`submit #${id} ok`)
+          let why = `the engine did not take it (${result.dropped})`
+          if (result.dropped === null) {
+            this.note(`submit #${id} ok`)
+            const seen = await this.turnStarted(text)
+            if (this.stopped) return
+            if (seen === 'ours' || (seen === 'other' && this.doubted === text)) {
+              unstarted = 0
+              this.doubted = null
+              this.note(seen === 'ours' ? `submit #${id} confirmed: a main turn started with it` : `submit #${id} taken as delivered: a second main turn started with other text`)
+              continue
+            }
+            if (seen === 'other') {
+              this.doubted = text
+              this.note(`submit #${id} resolved but the main turn that started has other text (${this.starts.map((t) => t.length).join(',')} chars); sending once more`)
+              this.ann.unshift(text)
+              continue
+            }
+            why = 'submit resolved but no turn started'
+          }
+          const again = Math.min(backoffMs(++unstarted), RESEND_MAX_MS)
+          this.note(`submit #${id}: ${why}; resending in ${again / 1000}s`)
+          await this.host.log(`${why}; resending in ${again / 1000}s`)
+          await this.host.sleep(again)
+          if (result.dropped === null && this.startSeen(text) === 'ours') {
+            unstarted = 0
+            this.note(`submit #${id} confirmed late: a main turn started with it; not sent again`)
+            continue
+          }
+          this.ann.unshift(text)
           continue
         }
         let wait = RETRY_SUBMIT_MS
@@ -406,7 +470,10 @@ function hostOf($: EngineInterface): Host {
     spawn: (argv, cwd) => $.process.spawn({ argv, cwd }) as unknown as Child,
     sleep: (ms) => $.clock.sleep(ms),
     now: () => $.clock.now(),
-    submit: async (text) => { await $.prompt.submit({ text }) },
+    submit: async (text) => {
+      const entered = await $.prompt.submit({ text })
+      return typeof entered?.drop === 'string' ? entered.drop : null
+    },
     record: async (file, lines) => {
       try {
         await $.process.run(['bash', '-c', APPEND_SH, 'bash', file, ...lines], { timeoutMs: 10_000 })
@@ -450,7 +517,7 @@ export const register: Register = (on) => {
   })
 
   on('turn.start', async ($, e, next) => {
-    watch?.turnStart(e.agentId)
+    watch?.turnStart(e.agentId, typeof e.text === 'string' ? e.text : '')
     return next(e)
   })
 
