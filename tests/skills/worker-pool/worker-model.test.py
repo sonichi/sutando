@@ -188,13 +188,16 @@ class SetModel(Base):
         self.assert_deferred(["task-x"])
 
     def own_folders(self):
-        own = (self.tmp / "own" / "tasks", self.tmp / "own" / "results")
+        """Record WID's identity on its own folders (`dirs: "own"`), as connections.json stores it."""
+        path = connections.record_path(self.ws)
+        path.write_text(json.dumps({"schema_version": 1, "connections": [
+            {"server": "srv.example", "instance": "srv-example-w1", "gateway_url": "https://chat.srv.example",
+             "token_ref": "AG2_REMOTE_TOKEN_SRV_EXAMPLE_W1", "primary": False, "added_by": "owner",
+             "added_at": "2026-11-16T00:00:00Z", "verified": True, "server_source": "gateway",
+             "worker": WID, "agent_mxid": "@w1-agent:srv.example", "dirs": "own"}]}))
+        own = connections.worker_dirs(WID, self.ws, strict=True)
         for d in own:
-            d.mkdir(parents=True)
-        real = connections.worker_dirs
-        p = mock.patch.object(connections, "worker_dirs", lambda w, ws=None: own if w == WID else real(w, ws))
-        p.start()
-        self.addCleanup(p.stop)
+            d.mkdir(parents=True, exist_ok=True)
         return own
 
     def test_a_seat_on_its_own_folders_that_owes_its_inbox_keeps_running(self):
@@ -202,16 +205,25 @@ class SetModel(Base):
         (tasks / "task-y.txt").write_text("id: task-y\ntask: hi\n")
         self.assert_deferred(["task-y"])
 
-    def test_an_own_inbox_that_cannot_be_read_is_recorded_not_restarted(self):
-        tasks, _ = self.own_folders()
-        (tasks / "task-y.txt").write_text("id: task-y\ntask: hi\n")
-        tasks.chmod(0)
-        self.addCleanup(tasks.chmod, 0o700)
+    def assert_refused_and_kept(self):
         rc, out = self.main("set-model", WID, "sonnet")
         self.assertEqual((rc, out["result"], out["apply"]["result"]), (0, "recorded", "refused"))
         self.assertIn("cannot tell what", out["apply"]["why"])
         self.assertEqual(self.row()["model"], "sonnet")
         self.assertEqual((self.tmux.killed(), self.started), ([], []))
+
+    def test_an_unreadable_folders_record_is_never_read_as_the_shared_folders(self):
+        tasks, _ = self.own_folders()
+        (tasks / "task-y.txt").write_text("id: task-y\ntask: hi\n")
+        connections.record_path(self.ws).write_text("{not json")
+        self.assert_refused_and_kept()
+
+    def test_an_own_inbox_that_cannot_be_read_is_recorded_not_restarted(self):
+        tasks, _ = self.own_folders()
+        (tasks / "task-y.txt").write_text("id: task-y\ntask: hi\n")
+        tasks.chmod(0)
+        self.addCleanup(tasks.chmod, 0o700)
+        self.assert_refused_and_kept()
 
     def test_no_running_seat_is_recorded_for_its_next_start(self):
         self.tmux.alive.clear()

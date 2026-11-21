@@ -2173,11 +2173,14 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
 WORKER_TOKEN_SOURCES = {"paste": "owner", "agent_link": "agent_link"}
 
 
-def worker_identity(worker: str, workspace: Optional[Path] = None) -> Optional[dict]:
-    """`worker`'s own identity row as stored, read only; None when it has none or the record is unreadable."""
+def worker_identity(worker: str, workspace: Optional[Path] = None, *, strict: bool = False) -> Optional[dict]:
+    """`worker`'s own identity row as stored, read only; None when it has none or the record is unreadable,
+    which `strict` raises instead (SchemaError or OSError)."""
     try:
         rows = _read(record_path(workspace))
     except (SchemaError, OSError):
+        if strict:
+            raise
         return None
     return next((dict(r) for r in rows if r.get("worker") == worker), None)
 
@@ -2206,10 +2209,12 @@ def _row_dirs(row: Optional[Mapping[str, object]], workspace: Optional[Path]) ->
     return root / "tasks", root / "results"
 
 
-def worker_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":
+def worker_dirs(worker: str, workspace: Optional[Path] = None, *,
+                strict: bool = False) -> "Optional[tuple[Path, Path]]":
     """(tasks dir, results dir) of `worker` when its identity row names an agent and `dirs: "own"`;
-    None otherwise (the worker uses the workspace's shared tasks/ and results/), or when unreadable."""
-    return _row_dirs(worker_identity(worker, workspace), workspace) if worker else None
+    None otherwise (the worker uses the workspace's shared tasks/ and results/), or when unreadable
+    unless `strict`, which raises then: a caller that must not mistake unknown for shared."""
+    return _row_dirs(worker_identity(worker, workspace, strict=strict), workspace) if worker else None
 
 
 def ensure_worker_dirs(worker: str, workspace: Optional[Path] = None) -> "Optional[tuple[Path, Path]]":

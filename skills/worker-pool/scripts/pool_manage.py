@@ -110,17 +110,14 @@ def _outstanding(workspace, wid) -> list:
 
 
 def _owes(workspace, wid) -> list:
-    """Every task the worker owes, its own inbox's too (pool_supervise.owed_task_ids); `_outstanding` lists
-    only the shared sentinels a hand-off can move. Refused when unreadable, never read as owing nothing."""
+    """Every task the worker owes, its own inbox's too; `_outstanding` lists only the shared sentinels a
+    hand-off can move. Refused when any of it is unreadable, never read as owing nothing."""
     import connections
-    own = connections.worker_dirs(wid, Path(workspace))
     try:
-        if own is not None:
-            # The own-inbox reader lists an inbox it cannot open as owing nothing.
-            os.listdir(own[0])
-        return sorted(sup.owed_task_ids(workspace, wid))
-    except (OSError, ValueError):
-        raise Refused(f"cannot tell what {wid} still owes (deliveries, inbox or results unreadable)") from None
+        return sorted(sup.owed_task_ids(workspace, wid, strict=True))
+    except (OSError, ValueError, connections.ConnectionsError):
+        raise Refused(f"cannot tell what {wid} still owes (its folders, deliveries, inbox or results "
+                      "unreadable)") from None
 
 
 def _owed_residue(workspace, wid):

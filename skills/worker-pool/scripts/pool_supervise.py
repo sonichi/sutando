@@ -156,13 +156,17 @@ def sentinel_ids(workspace, worker_id) -> tuple[list[str], set[str]]:
     return owed, spent
 
 
-def owed_task_ids(workspace, worker_id) -> list[str]:
+def owed_task_ids(workspace, worker_id, *, strict: bool = False) -> list[str]:
     """What this worker owes: its own inbox's unanswered tasks (`task_dispatch.unanswered_in_inbox`) when it
-    has its own folders (`connections.worker_dirs`), else its owed sentinels."""
+    has its own folders (`connections.worker_dirs`), else its owed sentinels. `strict` raises (OSError,
+    connections.ConnectionsError) when its folders' record or its own inbox cannot be read, where the
+    default reads either as owing nothing."""
     import connections
-    own = connections.worker_dirs(worker_id, Path(workspace))
+    own = connections.worker_dirs(worker_id, Path(workspace), strict=strict)
     if own is None:
         return sentinel_ids(workspace, worker_id)[0]
+    if strict:
+        os.listdir(own[0])
     return [task_id for task_id, _f in td.unanswered_in_inbox(*own, workspace=Path(workspace))]
 
 
