@@ -37,17 +37,13 @@ SAFE_KINDS = frozenset({"read", "edit"})
 # The ACP tool kinds a command (execute) and a web fetch or search are: granted only on a turn whose adapter
 # switches them on (`tools=True`), and then whatever the request holds, as the agent's own shell could do it.
 TOOL_KINDS = frozenset({"execute", "fetch", "search"})
-# Each set also holds Antigravity CLI's (agy) own argument names, as its file tools declare them.
 PATH_KEYS = frozenset({"path", "file_path", "filePath", "abs_path", "absPath", "filename", "file", "dir",
                        "directory", "notebook_path", "notebookPath", "target_file", "target", "target_path",
-                       "old_path", "new_path", "source", "destination", "dest",
-                       "Path", "TargetFile", "AbsolutePath"})
+                       "old_path", "new_path", "source", "destination", "dest"})
 DATA_KEYS = frozenset({"content", "contents", "text", "old_string", "new_string", "oldText", "newText", "old_str",
                        "new_str", "replace_all", "replaceAll", "offset", "limit", "line", "start_line", "end_line",
-                       "encoding",
-                       "Content", "Overwrite", "Append", "Target", "Replacement", "AllowMultiple", "StartLine",
-                       "EndLine", "CodeContent", "TargetContent", "ReplacementContent", "Instruction"})
-NESTED_KEYS = frozenset({"edits", "Edits", "ReplacementChunks"})
+                       "encoding"})
+NESTED_KEYS = frozenset({"edits"})
 COMPLETED_STOPS = ("end_turn", "max_tokens", "max_turn_requests")
 
 
@@ -105,9 +101,12 @@ def _option(options, kinds):
     return None
 
 
-def request_paths(tool_call):
+def request_paths(tool_call, extra_keys=None):
     """(every path the request names, '') or ([], why): locations and every path key at any depth of rawInput; a
-    key that is neither a known path nor known plain data, or a nested value under one, refuses the request."""
+    key that is neither a known path nor known plain data, or a nested value under one, refuses the request.
+    `extra_keys` (path, data, nested key sets) adds an adapter's own argument names to the known ones."""
+    more_path, more_data, more_nested = extra_keys or (frozenset(),) * 3
+    path_keys, data_keys, nested_keys = PATH_KEYS | more_path, DATA_KEYS | more_data, NESTED_KEYS | more_nested
     paths = []
     for loc in tool_call.get("locations") or []:
         if not (isinstance(loc, dict) and isinstance(loc.get("path"), str) and loc["path"].strip()):
@@ -122,14 +121,14 @@ def request_paths(tool_call):
     while stack:
         node = stack.pop()
         for key, value in node.items():
-            if key in PATH_KEYS:
+            if key in path_keys:
                 if not (isinstance(value, str) and value.strip()):
                     return [], "%s is not a path" % key
                 paths.append(value)
-            elif key in DATA_KEYS:
+            elif key in data_keys:
                 if isinstance(value, (dict, list)):
                     return [], "%s carries a nested value" % key
-            elif key in NESTED_KEYS and isinstance(value, list) and all(isinstance(v, dict) for v in value):
+            elif key in nested_keys and isinstance(value, list) and all(isinstance(v, dict) for v in value):
                 stack.extend(value)
             else:
                 return [], "unrecognised key %s" % key
@@ -177,12 +176,13 @@ def under(root, raw):
 
 
 def decide_permission(params, owner, cwd, command_ok=None, own_file=None, command_refused="no command is granted",
-                      command_granted="", own_file_reason="", tools=False):
+                      command_granted="", own_file_reason="", tools=False, extra_keys=None):
     """(allowed, reason, result). Default deny. Granted: with `tools`, any command and any execute, fetch or
     search call (the adapter decides per turn which tiers get it); a command `command_ok(command)` accepts
     (rawInput holding only that command); a read or edit of files `own_file(path)` accepts, for any tier; and,
     for the owner only, a read or edit whose every path, nested ones included, resolves under the working
-    directory. Every other command, execute, fetch, search, delete or move is refused."""
+    directory (`extra_keys` as `request_paths` takes it). Every other command, execute, fetch, search, delete or
+    move is refused."""
     tool_call = params.get("toolCall") if isinstance(params.get("toolCall"), dict) else {}
     options = params.get("options") or []
     allow, reject = _option(options, ALLOW_KINDS), _option(options, REJECT_KINDS)
@@ -200,7 +200,7 @@ def decide_permission(params, owner, cwd, command_ok=None, own_file=None, comman
     elif kind not in SAFE_KINDS:
         verdict = (False, "%s operations are never granted" % (kind or "unclassified"))
     else:
-        paths, problem = request_paths(tool_call)
+        paths, problem = request_paths(tool_call, extra_keys)
         if problem:
             verdict = (False, problem)
         elif not paths:

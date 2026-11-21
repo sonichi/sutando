@@ -218,6 +218,20 @@ class ConnectorTest(unittest.TestCase):
         self.assertEqual(len(perms), 7)
         self.assertEqual(set(perms.values()), {False})
 
+    def test_the_shared_policy_is_unchanged_for_other_acp_adapters(self):
+        """agy's argument names and the command/web grant are the Antigravity adapter's: acp_host's default (what
+        OpenClaw calls) still refuses agy's keys and every execute, fetch or search call."""
+        opts = [{"optionId": "a", "kind": "allow_once"}, {"optionId": "r", "kind": "reject_once"}]
+        inside = str(self.w.cwd / "notes.txt")
+
+        def decide(tc, **kw):
+            return acp_host.decide_permission({"toolCall": tc, "options": opts}, True, str(self.w.cwd), **kw)[:2]
+        write = {"kind": "edit", "rawInput": {"Content": "x", "Path": inside}}
+        self.assertEqual(decide(write), (False, "unrecognised key Content"))
+        self.assertEqual(decide(write, extra_keys=gc.AGY_KEYS), (True, "under the working directory"))
+        for kind in ("execute", "fetch", "search"):
+            self.assertFalse(decide({"kind": kind, "rawInput": {"Url": "https://example.com/"}})[0], kind)
+
     def test_a_collaborator_may_not_touch_files(self):
         self.w.task("task-1", "STUB:EDIT go", tier="team", collaborator=True)
         self.w.serve(1, "--allow-non-owner")

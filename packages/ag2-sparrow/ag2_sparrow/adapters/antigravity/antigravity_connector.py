@@ -52,6 +52,11 @@ NOT_SIGNED_IN = ("Antigravity is not signed in on this computer (%s): run `agy` 
 # Sender tiers (headers["access_tier"]) whose turns may run commands and use the web (owner decision 2026-11-21).
 # Team is left out on purpose, even on the owner's turn: adding it is the owner's decision.
 SHELL_AND_WEB_TIERS = frozenset({"owner"})
+# agy's own file-tool argument names (path, plain data, nested edits), as its tool schemas declare them.
+AGY_KEYS = (frozenset({"Path", "TargetFile", "AbsolutePath"}),
+            frozenset({"Content", "Overwrite", "Append", "Target", "Replacement", "AllowMultiple", "StartLine",
+                       "EndLine", "CodeContent", "TargetContent", "ReplacementContent", "Instruction"}),
+            frozenset({"Edits", "ReplacementChunks"}))
 READ_ONLY_MODES = frozenset({"plan", "read-only", "readonly", "read_only"})
 GUEST_PREFIX = "ag2-sparrow-antigravity-guest-"
 GUEST_REFUSED = "it answers non-owners only in a read-only session mode, and %s"
@@ -130,12 +135,14 @@ class Connector:
         if owner:
             cwd, tools = self.args.cwd, headers.get("access_tier") in SHELL_AND_WEB_TIERS
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
-                                       lambda params: acp_host.decide_permission(params, True, cwd, tools=tools),
+                                       lambda params: acp_host.decide_permission(params, True, cwd, tools=tools,
+                                                                                  extra_keys=AGY_KEYS),
                                        self.store,
                                        STDERR_NAME, NOT_SIGNED_IN, log)
         with guest_turn(self.args) as isolated:
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
-                                       lambda params: acp_host.decide_permission(params, False, isolated.cwd),
+                                       lambda params: acp_host.decide_permission(params, False, isolated.cwd,
+                                                                                  extra_keys=AGY_KEYS),
                                        self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=isolated)
 
     def answer_body(self, headers, status, text, detail):
