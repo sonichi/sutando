@@ -225,9 +225,8 @@ def decide_permission(params, owner, cwd, command_ok=None, own_file=None, comman
     return False, verdict[1] if not verdict[0] else "the agent offered no option that allows it", refused
 
 
-# Where an ACP agent may name the MCP tool a permission request is for: (server key, tool key) pairs, on the
-# toolCall itself or in its `_meta`. ACP's ToolCall has no such field, so these are assumed until a real agy
-# request is measured; a request naming neither pair is no MCP call to this policy and falls to the rules above.
+# (server key, tool key) pairs naming a request's MCP tool, on the toolCall or in its `_meta`: assumed (ACP
+# defines none) until a real agy request is measured.
 MCP_IDENTITY_KEYS = (("serverName", "toolName"), ("mcpServer", "mcpTool"))
 _IDENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 

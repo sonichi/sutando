@@ -55,12 +55,8 @@ GUEST_REFUSED = "it answers non-owners only in a read-only session mode, and %s"
 # agy evaluates Deny > Ask > Allow, and deny rules apply in every mode.
 GUEST_SETTINGS = {"agentMode": "plan", "permissions": {"allow": [], "ask": [], "deny": [
     "read_file(*)", "write_file(*)", "read_url(*)", "execute_url(*)", "download_url(*)", "command(*)", "mcp(*)"]}}
-# AG2 Space tools: an owner's or a team member's Session (never a guest's; owners' decision, 2026-11-21) gets
-# the AG2 Space MCP server, as the agent itself, when agy's `initialize` declares HTTP MCP and the install
-# names the agent's token file (`sspace_entry`: the `ag2-sparrow-mcp acp` exchange, run per turn). The policy
-# grants that server's `mcp_auth.OWNER_TOOLS`, by the server and tool name the request carries, to those
-# turns only; a team turn stays isolated, so it gets no file, command or fetch grant. A guest gets none: no
-# server, `mcp(*)` denied, every MCP request refused.
+# The tiers whose turns get the AG2 Space MCP server as this agent (owners' rule, 2026-11-21); a guest
+# gets none, keeps `mcp(*)` denied and has every MCP request refused.
 SSPACE_TIERS = frozenset({"owner", "team"})
 
 

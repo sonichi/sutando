@@ -34,9 +34,8 @@ HTTP_TIMEOUT_S = 3
 USER_AGENT = "sutando-gateway-client/1.0"
 SERVER_NAME = "ag2-space"
 _LOOPBACK = {"localhost", "127.0.0.1", "::1"}
-# The AG2 Space MCP tools an owner's turn may call through a client whose permission policy asks per tool
-# (the Antigravity adapter): rooms, Room Commons Actions and room tasks. Never granted: linking or unlinking
-# an agent, setup steps, relay-token issuance, event subscriptions, Space-level execution and the ui.* tools.
+# The tools a per-tool permission policy (the Antigravity adapter's) grants: rooms, Commons Actions, tasks.
+# Never: agent link/unlink, setup steps, relay-token issuance, events, Space-level execution, ui.*.
 OWNER_TOOLS = frozenset({
     "ag2.whoami", "room.list", "room.inspect", "room.actions.search", "room.actions.describe",
     "room.action.read", "room.action.execute", "room.action.execute_safe", "room.task.list",
