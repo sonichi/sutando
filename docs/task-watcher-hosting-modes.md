@@ -90,6 +90,32 @@ same session watcher can instead be run by a Claude Code Mod, `src/agent/claude/
   ever submitted: only a plain file name (or an absolute path ending in one) passes, the Mod never
   reads a task file, and the session still reads the task's headers (`access_tier`, sender, HMAC) from
   the file itself. While a turn runs, announcements wait and arrive together when it ends.
+- A submit that throws, or that has not settled within 30 s, keeps its announcement: it goes back to
+  the front and is sent again (after 5 s for a throw; after 5 s doubling to 5 min for a timeout).
+  One submit is in flight at a time and nothing waits on it: the Mod keeps reading the watcher, and a
+  completed turn is not held. A timed-out submit that settles during the wait is not sent again; one
+  that settles later delivers its announcement twice, the price of never losing one.
+  Submits are only issued while no main turn runs, and the 30 s count only idle time: a submit
+  overtaken by a main turn is waiting for the session to be idle, not stuck. A subagent's
+  `turn.start` / `turn.complete` (they carry `agentId`) never change what the Mod takes as idle.
+- A submit that resolves is not yet a delivery: after an interrupt Claude Code answers a submit and
+  starts no turn. The announcement is dropped only once a main `turn.start` follows whose text holds
+  it (or is empty). If the engine refuses the prompt (`{ drop }`), or no main turn starts within 15 s,
+  it is sent again, waiting 5 s doubling to 60 s, for as long as it takes. A main turn with other
+  text (the person typed first) confirms nothing: the announcement is sent once more, and a second
+  such turn is taken as delivery. A turn that starts after a resend went out delivers twice.
+- **A core interrupted at its terminal waits for the person by design; the wait is shown.** After
+  Esc or Ctrl+C Claude Code refuses plugin input until the person sends input (a Stop stands), and a
+  submit answers `{ drop }`. The Mod then submits nothing and resends nothing: announcements are held
+  in order, the status line under the prompt reads `N tasks waiting — type anything to resume`, and
+  one toast is shown per wait. The person's next main turn ends the hold, and what was held is
+  submitted once, in order, when that turn ends. The same status line is shown while submits resolve
+  but start no turn (those are still resent). `session.stop` is not hooked: the Mod's floor
+  (`MIN_CLAUDE_VERSION`) is below the engine that has the event, and naming it there stops the Mod loading.
+- The Mod keeps a delivery trail in `<workspace>/logs/task-watch-mod.log`: each watcher start and
+  end, each announcement and stderr line the watcher printed, and each submit's start and outcome
+  (`ok`, `failed`, `timeout`, settled late). The watcher itself appends one line per start to
+  `<workspace>/logs/watch-tasks-stream.log`. Neither file is rotated.
 - An exit 0 is a hand-off (the inbox is held, or the watcher was told to stop): the Mod polls
   `role-present` every 30 s and starts again once no session watcher holds the inbox. Any other early
   exit restarts after 5 s, doubling to 5 min; after 8 in a row it stops and logs, and the Stop hook's
@@ -290,6 +316,7 @@ how `tests/watch-tasks-stream-shutdown-leaves-inflight-claim.test.py` interrupts
   pages the owner; without the mode the notifier starts.
 - `tests/seat-inbox.test.py`: which inboxes are a registered seat, and the label each gets.
 - `src/agent/claude/task-watch-mod/tests/task-watch.test.ts` (`claude plugin test`, in CI): the Mod's
-  spawn, announcement, restart, hand-off and session-end rules, and that a task body is never submitted.
+  spawn, announcement, restart, hand-off and session-end rules, that a task body is never submitted,
+  and that a submit which never settles is timed out and sent again.
 - `tests/task-watch-mod-launch.test.sh`: the launchers' defaults and opt-outs, version floor and session marker.
 - `scripts/task-watch-mod-witness.sh` (local, needs a logged-in `claude`): the Mod in a real headless session.

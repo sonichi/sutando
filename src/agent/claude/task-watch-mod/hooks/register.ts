@@ -13,6 +13,18 @@ const BACKOFF_MAX_MS = 300_000
 const HEALTHY_RUN_MS = 600_000
 const MAX_EARLY_EXITS = 8
 const RETRY_SUBMIT_MS = 5_000
+/** How long one submit may stay unsettled before its announcement is taken back and sent again. */
+export const SUBMIT_TIMEOUT_MS = 30_000
+/** How long after a submit resolves a main turn may take to start before the submit counts as not delivered. */
+export const TURN_START_WAIT_MS = 15_000
+const RESEND_MAX_MS = 60_000
+// The engine's own refusal after the person pressed Stop, as a `{ drop }` reason. Claude Code 2.1.322 words
+// it "the session was stopped and nobody has sent input since"; its types say "a Stop stands".
+const STOP_DROP_RE = /\bstop/i
+// The delivery trail, under the workspace: what the watcher said, what was submitted, and how each submit ended.
+const TRAIL_FILE = 'logs/task-watch-mod.log'
+const TRAIL_LINE_MAX = 2_000
+const APPEND_SH = 'f="$1"; shift; mkdir -p "$(dirname "$f")" && for l in "$@"; do printf \'%s %s\\n\' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$l"; done >> "$f"'
 // watch-tasks-stream.sh exits 0 when it hands off (the inbox is held, or it was told to stop) and 64 on a usage refusal.
 const EXIT_HANDOFF = 0
 const EXIT_USAGE = 64
@@ -102,6 +114,15 @@ export class Announcements {
   unshift(text: string): void {
     this.ready.unshift(text)
   }
+  /** Takes back the text `unshift` put at the front, if it is still there. */
+  shift(text: string): void {
+    if (this.ready[0] === text) this.ready.shift()
+  }
+  /** How many tasks are held: every TASK_FILE line not yet taken. */
+  count(): number {
+    const held = this.ready.reduce((n, text) => n + text.split('\n').filter((l) => TASK_RE.test(l)).length, 0)
+    return held + (this.open !== null ? 1 : 0)
+  }
 }
 
 type Plan = { argv: string[]; inbox: string; py: string }
@@ -116,8 +137,15 @@ export type Host = {
   spawn: (argv: string[], cwd: string) => Child
   sleep: (ms: number) => Promise<void>
   now: () => Promise<number>
-  submit: (text: string) => Promise<void>
+  /** Resolves once the engine answered: with the engine's reason when the prompt did not enter, else nothing. */
+  submit: (text: string) => Promise<string | null | void>
+  /** Appends the lines, each with the time, to a file; best-effort, never rejects. */
+  record: (file: string, lines: string[]) => Promise<void>
   log: (text: string, debug?: boolean) => Promise<void>
+  /** The Mod's one status line under the prompt; undefined removes it. Never throws. */
+  status: (text: string | undefined) => void
+  /** A toast under the Mod's name. Never throws. */
+  toast: (text: string) => void
 }
 
 // A promise left running rejects when the module unloads under it; that is the expected end, not an error.
@@ -132,41 +160,254 @@ export class TaskWatch {
   private child: Child | null = null
   private openToken = 0
   private ann = new Announcements()
-  constructor(private host: Host, private repo: string) {}
+  private sending = false
+  private sent: Promise<void> = Promise.resolve()
+  private submits = 0
+  private mainTurns = 0
+  private idleWaiters: (() => void)[] = []
+  private starts: string[] = []
+  private startWaiters: (() => void)[] = []
+  private doubted: string | null = null
+  private paused = false
+  private toasted = false
+  private shown = 0
+  private unstarted = 0
+  private trail: string | null = null
+  private notes: string[] = []
+  private noting = false
+  constructor(private host: Host, private repo: string, private submitTimeoutMs = SUBMIT_TIMEOUT_MS, private turnStartWaitMs = TURN_START_WAIT_MS) {}
 
-  turnStart(): void {
+  // turn.start and turn.complete also fire for each subagent's loop, with its `agentId`; only the main
+  // loop's (no `agentId`) say whether the session is idle, so a subagent's are ignored in all three calls.
+  turnStart(agentId?: string, text = ''): void {
+    if (agentId !== undefined) return
+    if (this.paused) {
+      // Nothing is submitted while a Stop stands, so this main turn is the person's own input: the Stop is over.
+      this.paused = false
+      this.shown = 0
+      this.unstarted = 0
+      this.host.status(undefined)
+      this.note(`the person sent input: the Stop is over; ${this.ann.count()} held task(s) go out when this turn ends`)
+    }
     this.turnRunning = true
+    this.mainTurns++
+    this.starts.push(text)
+    for (const wake of this.startWaiters.splice(0)) wake()
   }
 
-  turnIdle(): void {
+  turnIdle(agentId?: string): void {
+    if (agentId !== undefined) return
     this.turnRunning = false
+    for (const wake of this.idleWaiters.splice(0)) wake()
   }
 
-  /** Sends what waited for the turn to end. */
-  flush(): Promise<void> {
-    return this.deliver()
+  /**
+   * The person pressed Stop (the `session.stop` event, or a submit the engine refused for it). By the engine's
+   * design no plugin input enters until the person sends input, so nothing is submitted or resent meanwhile:
+   * announcements are held in order, and the wait is shown. The next main turn.start ends it.
+   */
+  stopStands(why: string): void {
+    if (this.paused || this.stopped) return
+    this.paused = true
+    this.toasted = false
+    this.note(`a Stop stands (${why}): holding announcements, no submit until the person sends input`)
+    this.showWaiting()
+  }
+
+  /** While a Stop stands, or submits start no turn: the status line with the count, and one toast per wait. */
+  private showWaiting(): void {
+    const n = this.paused || this.unstarted > 0 ? this.ann.count() : 0
+    if (!n || n === this.shown) return
+    this.shown = n
+    const line = `${n} task${n === 1 ? '' : 's'} waiting — type anything to resume`
+    this.host.status(line)
+    this.note(`${n} waiting, shown on the status line`)
+    if (this.toasted) return
+    this.toasted = true
+    this.host.toast(line)
+  }
+
+  /** Submits start turns again: the wait is over and its status line goes. */
+  private started(): void {
+    this.unstarted = 0
+    if (this.paused || !this.shown) return
+    this.shown = 0
+    this.toasted = false
+    this.host.status(undefined)
+  }
+
+  /** Sends what waited for the turn to end; a hook must not await it, a submit can take its whole timeout. */
+  flush(agentId?: string): Promise<void> {
+    return agentId === undefined ? this.deliver() : Promise.resolve()
+  }
+
+  /** One line of the delivery trail, written in order and never awaited: a slow disk cannot hold a delivery. */
+  private note(line: string): void {
+    if (!this.trail) return
+    this.notes.push(line.replace(/[\u0000-\u001f\u007f]+/g, ' ').slice(0, TRAIL_LINE_MAX))
+    if (this.noting) return
+    this.noting = true
+    detach((async () => {
+      try {
+        while (this.notes.length && this.trail) await this.host.record(this.trail, this.notes.splice(0))
+      } finally {
+        this.noting = false
+      }
+    })())
   }
 
   /** Kills the child this watch spawned, and nothing else; after /clear or a resume the process still owes its inbox a watcher. */
   end(reason: string): void {
     if (reason === 'clear' || reason === 'resume') return
     this.stopped = true
+    if (this.shown) this.host.status(undefined)
+    // A send waiting for the main turn to end is released, so no promise outlives the watch.
+    for (const wake of [...this.idleWaiters.splice(0), ...this.startWaiters.splice(0)]) wake()
     const child = this.child
     this.child = null
     if (child) detach(child.return(undefined))
   }
 
-  private async deliver(): Promise<void> {
-    if (this.turnRunning) return
-    const text = this.ann.take()
-    if (!text) return
+  /** Starts sending what is ready, unless a send is already under way; resolves when that send is over. */
+  private deliver(): Promise<void> {
+    if (!this.sending) this.sent = this.drain()
+    return this.sent
+  }
+
+  /** Of the main turns started since the last submit was issued: one with this text, only others, or none. */
+  private startSeen(text: string): 'ours' | 'other' | 'none' {
+    if (this.starts.some((t) => t === '' || t.includes(text))) return 'ours'
+    return this.starts.length ? 'other' : 'none'
+  }
+
+  /** Waits, up to the confirm window, for a main turn to start after a submit resolved. */
+  private async turnStarted(text: string): Promise<'ours' | 'other' | 'none'> {
+    const expired = this.host.sleep(this.turnStartWaitMs).then(() => true)
+    for (;;) {
+      const seen = this.startSeen(text)
+      if (seen !== 'none' || this.stopped) return seen
+      const woke = new Promise<boolean>((wake) => { this.startWaiters.push(() => wake(false)) })
+      if (await Promise.race([expired, woke])) return this.startSeen(text)
+    }
+  }
+
+  /**
+   * Submits what is ready, one message at a time, in order. A submit that throws, or that has not settled
+   * within the timeout, keeps its text: it goes back to the front after a wait and is sent again. A timed-out
+   * submit that settles during that wait did deliver, and is not sent again; one that settles later than that
+   * delivers its text a second time, which is the price of never losing one.
+   *
+   * Submits are only issued while no main turn runs, and the timeout only counts idle time: the engine holds
+   * a submitted prompt until the session is idle, so one overtaken by a main turn is waiting, not stuck.
+   *
+   * A submit that resolves is not yet a delivery: after an interrupt the engine answers a submit and starts
+   * no turn. The text is dropped only once a main turn starts with it (its `turn.start` text holds the
+   * submitted text, or is empty). Refused by the engine, or with no main turn in the window, it goes back and
+   * is sent again, waiting 5 s doubling to 60 s, for as long as it takes. A main turn with other text (the
+   * person typed first) confirms nothing: the text is sent once more, and a second such turn is then taken
+   * as delivery, so an engine that words its turns differently costs one repeat per announcement, not a loop.
+   *
+   * None of that runs while a Stop stands (stopStands): the loop ends, and whatever it holds goes back unsent.
+   */
+  private async drain(): Promise<void> {
+    this.sending = true
+    let timeouts = 0
     try {
-      await this.host.submit(text)
-    } catch (err) {
-      this.ann.unshift(text)
-      await this.host.log(`could not start a turn (${err instanceof Error ? err.message : String(err)}); retrying`)
-      await this.host.sleep(RETRY_SUBMIT_MS)
-      if (!this.stopped) await this.deliver()
+      while (!this.stopped && !this.turnRunning && !this.paused) {
+        const text = this.ann.take()
+        if (!text) return
+        const id = ++this.submits
+        let timedOut = false
+        let landedLate = false
+        this.starts = []
+        this.note(`submit #${id} start: ${text.replace(/\n/g, ' | ')}`)
+        const settled = (async () => this.host.submit(text))().then(
+          (drop) => {
+            const dropped = typeof drop === 'string' ? drop : null
+            if (timedOut && dropped === null) {
+              landedLate = true
+              this.note(`submit #${id} settled after its timeout: delivered late`)
+            }
+            return { error: null as string | null, dropped }
+          },
+          (err) => {
+            const error = err instanceof Error ? err.message : String(err)
+            if (timedOut) this.note(`submit #${id} failed after its timeout (${error})`)
+            return { error, dropped: null as string | null }
+          },
+        )
+        let result: { error: string | null; dropped: string | null } | null = null
+        for (;;) {
+          const turnsBefore = this.mainTurns
+          result = await Promise.race([settled, this.host.sleep(this.submitTimeoutMs).then(() => null)])
+          if (result || this.stopped || (!this.turnRunning && this.mainTurns === turnsBefore)) break
+          this.note(`submit #${id} still pending behind a main turn; not a timeout`)
+          if (this.turnRunning) result = await Promise.race([settled, new Promise<null>((wake) => { this.idleWaiters.push(() => wake(null)) })])
+          if (result || this.stopped) break
+        }
+        if (!result && this.stopped) return
+        if (result && result.error === null) {
+          timeouts = 0
+          let why = `the engine did not take it (${result.dropped})`
+          if (result.dropped !== null && STOP_DROP_RE.test(result.dropped)) this.stopStands(`the engine refused submit #${id}: ${result.dropped}`)
+          if (result.dropped === null) {
+            this.note(`submit #${id} ok`)
+            const seen = await this.turnStarted(text)
+            if (this.stopped) return
+            if (seen === 'ours' || (seen === 'other' && this.doubted === text)) {
+              this.started()
+              this.doubted = null
+              this.note(seen === 'ours' ? `submit #${id} confirmed: a main turn started with it` : `submit #${id} taken as delivered: a second main turn started with other text`)
+              continue
+            }
+            if (seen === 'other') {
+              this.doubted = text
+              this.note(`submit #${id} resolved but the main turn that started has other text (${this.starts.map((t) => t.length).join(',')} chars); sending once more`)
+              this.ann.unshift(text)
+              continue
+            }
+            why = 'submit resolved but no turn started'
+          }
+          if (this.paused) {
+            this.note(`submit #${id} did not start a turn; held, not resent`)
+            this.ann.unshift(text)
+            this.showWaiting()
+            continue
+          }
+          const again = Math.min(backoffMs(++this.unstarted), RESEND_MAX_MS)
+          this.note(`submit #${id}: ${why}; resending in ${again / 1000}s`)
+          await this.host.log(`${why}; resending in ${again / 1000}s`)
+          // Back in the buffer for the wait, so it is counted on the status line; in front, so order holds.
+          this.ann.unshift(text)
+          this.showWaiting()
+          await this.host.sleep(again)
+          if (result.dropped === null && this.startSeen(text) === 'ours') {
+            this.ann.shift(text)
+            this.started()
+            this.note(`submit #${id} confirmed late: a main turn started with it; not sent again`)
+          }
+          continue
+        }
+        let wait = RETRY_SUBMIT_MS
+        if (result) {
+          this.note(`submit #${id} failed (${result.error}); kept, retrying in ${wait / 1000}s`)
+          await this.host.log(`could not start a turn (${result.error}); retrying`)
+        } else {
+          timedOut = true
+          wait = backoffMs(++timeouts)
+          this.note(`submit #${id} timeout after ${this.submitTimeoutMs}ms; kept, retrying in ${wait / 1000}s`)
+          await this.host.log(`a turn did not start within ${this.submitTimeoutMs / 1000}s (submit #${id}); retrying in ${wait / 1000}s`)
+        }
+        await this.host.sleep(wait)
+        if (landedLate) {
+          timeouts = 0
+          this.note(`submit #${id} is not sent again: it was delivered late`)
+          continue
+        }
+        this.ann.unshift(text)
+      }
+    } finally {
+      this.sending = false
     }
   }
 
@@ -177,6 +418,7 @@ export class TaskWatch {
     if (!py) return 'no Python interpreter resolved'
     const ws = (await this.host.run(['bash', config, 'workspace']))?.trim()
     if (!ws) return 'no workspace resolved'
+    this.trail = `${ws.replace(/\/+$/, '')}/${TRAIL_FILE}`
     const raw = await this.host.run([py, `${this.repo}/src/watcher_rearm.py`, 'watch-argv', '--repo', this.repo, '--workspace', ws])
     const argv = (raw ?? '').split('\n').filter((l) => l.length > 0)
     const at = argv.indexOf('--inbox')
@@ -210,28 +452,33 @@ export class TaskWatch {
       for (;;) {
         const r = await child.next()
         if (r.done) {
+          this.note(`watcher ended (${r.value?.signal ?? `exit ${r.value?.code}`})`)
           if (lastErr) await this.host.log(`watcher said: ${lastErr}`, true)
           return (r.value ?? { code: null, signal: null }) as End
         }
         if (r.value.stream !== 'stdout') {
           lastErr = r.value.text.trim().split('\n').pop() ?? lastErr
+          for (const said of r.value.text.split('\n')) if (said.trim()) this.note(`watcher stderr: ${said.trim()}`)
           continue
         }
         const taken = takeLines(buffer + r.value.text)
         buffer = taken.rest
         for (const line of taken.lines) {
           const kind = this.ann.feed(line)
+          if (kind !== 'other') this.note(`watcher announced: ${line}`)
+          if (kind !== 'other') this.showWaiting()
           if (kind === 'task') this.scheduleClose()
           else if (kind === 'other' && line.trim()) await this.host.log(line, !line.startsWith('WATCHER_HELD:'))
         }
-        await this.deliver()
+        // Not awaited: a submit that does not settle must not stop this loop reading the watcher.
+        detach(this.deliver())
       }
     } catch (err) {
       return { code: null, signal: `spawn failed: ${err instanceof Error ? err.message : String(err)}` }
     } finally {
       if (this.child === child) this.child = null
       this.ann.close()
-      await this.deliver()
+      detach(this.deliver())
     }
   }
 
@@ -257,6 +504,7 @@ export class TaskWatch {
       if (this.stopped) return
       const startedAt = await this.host.now()
       await this.host.log(`watching ${plan.inbox}`, true)
+      this.note(`watcher starting on ${plan.inbox}`)
       const end = await this.once(plan)
       if (this.stopped) return
       if (end.code === EXIT_USAGE) return void (await this.host.log(`the watcher refused its arguments (exit ${EXIT_USAGE}); not restarting`))
@@ -297,8 +545,32 @@ function hostOf($: EngineInterface): Host {
     spawn: (argv, cwd) => $.process.spawn({ argv, cwd }) as unknown as Child,
     sleep: (ms) => $.clock.sleep(ms),
     now: () => $.clock.now(),
-    submit: async (text) => { await $.prompt.submit({ text }) },
+    submit: async (text) => {
+      const entered = await $.prompt.submit({ text })
+      return typeof entered?.drop === 'string' ? entered.drop : null
+    },
+    record: async (file, lines) => {
+      try {
+        await $.process.run(['bash', '-c', APPEND_SH, 'bash', file, ...lines], { timeoutMs: 10_000 })
+      } catch {
+        // The trail is best-effort: a line that cannot be written must not stop the watcher.
+      }
+    },
     log,
+    status: (text) => {
+      try {
+        $.ui.status(text)
+      } catch {
+        // A status line that cannot be drawn must not stop the watcher.
+      }
+    },
+    toast: (text) => {
+      try {
+        $.ui.toast(text, { timeoutMs: 15_000 })
+      } catch {
+        // Nor a toast.
+      }
+    },
   }
 }
 
@@ -334,17 +606,21 @@ export const register: Register = (on) => {
   })
 
   on('turn.start', async ($, e, next) => {
-    watch?.turnStart()
+    watch?.turnStart(e.agentId, typeof e.text === 'string' ? e.text : '')
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
     // Cleared before next(e): if anything beneath throws, held announcements must not wait forever.
-    watch?.turnIdle()
+    watch?.turnIdle(e.agentId)
     const done = await next(e)
-    await watch?.flush()
+    // Not awaited: this hook must return even when the submit it starts never settles.
+    if (watch) detach(watch.flush(e.agentId))
     return done
   })
+
+  // session.stop is not hooked here: on an engine without that event (2.1.322 has none) naming it stops this
+  // whole module loading. The hold starts from the `{ drop }` a refused submit answers with; see stopStands.
 
   on('session.end', async ($, e, next) => {
     watch?.end(String(e.reason))
