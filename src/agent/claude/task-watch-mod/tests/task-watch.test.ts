@@ -64,8 +64,8 @@ function fakeChild() {
 // submitDelays: how long each submit call takes to settle, in order; Infinity is a call that never settles.
 // The fake engine starts a main turn with each prompt that enters and ends it at once, as an idle session does.
 // silent: it resolves the submit and starts no turn (what Claude Code does after an interrupt).
-// dropSubmits: that many submits resolve as refused (`{ drop }`), the engine's own "did not enter".
-function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: number[]; silent?: boolean; dropSubmits?: number } = {}) {
+// dropSubmits: that many submits resolve as refused (`{ drop }`), the engine's own "did not enter", for dropReason.
+function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: number[]; silent?: boolean; dropSubmits?: number; dropReason?: string } = {}) {
   const clock = fakeClock()
   const submitted: string[] = []
   const attempts: string[] = []
@@ -74,6 +74,8 @@ function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: n
   let drops = opts.dropSubmits ?? 0
   const logs: string[] = []
   const trail: string[] = []
+  const statuses: (string | undefined)[] = []
+  const toasts: string[] = []
   const spawns: string[][] = []
   const runs: string[][] = []
   const children: ReturnType<typeof fakeChild>[] = []
@@ -102,7 +104,7 @@ function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: n
       const delay = delays.shift() ?? 0
       if (delay === Infinity) await new Promise<void>(() => undefined)
       else if (delay > 0) await clock.sleep(delay)
-      if (drops-- > 0) return 'a Stop stands'
+      if (drops-- > 0) return opts.dropReason ?? 'a Stop stands'
       submitted.push(text)
       if (engine.silent) return
       w.turnStart(undefined, text)
@@ -111,10 +113,12 @@ function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: n
     },
     record: async (file, lines) => { for (const l of lines) trail.push(`${file}: ${l}`) },
     log: async (text) => { logs.push(text) },
+    status: (text) => { statuses.push(text) },
+    toast: (text) => { toasts.push(text) },
   }
   const w: TaskWatch = new TaskWatch(host, REPO)
   const done = w.run()
-  return { w, done, clock, engine, submitted, attempts, logs, trail, spawns, runs, children }
+  return { w, done, clock, engine, submitted, attempts, logs, trail, statuses, toasts, spawns, runs, children }
 }
 
 test('pure: version floor, repo root, task lines, line split, backoff', () => {
@@ -310,6 +314,8 @@ test('a submit that resolves with no main turn after it was not delivered: it is
   await h.clock.advance(1 + 5_000)
   expect(h.attempts).toEqual([first, first])
   expect(h.logs.some((l) => l.includes('submit resolved but no turn started; resending'))).toBe(true)
+  expect(h.statuses).toEqual(['1 task waiting — type anything to resume'])
+  expect(h.toasts.length).toBe(1)
   await h.clock.advance(15_000 + 10_000)
   expect(h.attempts).toEqual([first, first, first])
   h.engine.silent = false
@@ -318,6 +324,8 @@ test('a submit that resolves with no main turn after it was not delivered: it is
   await h.clock.advance(3_600_000)
   expect(h.attempts.length).toBe(4)
   expect(h.trail.filter((l) => l.includes('confirmed: a main turn started with it')).length).toBe(1)
+  expect(h.statuses).toEqual(['1 task waiting — type anything to resume', undefined])
+  expect(h.toasts.length).toBe(1)
 })
 
 test('a submit followed by its main turn is delivered: it is not sent again', async () => {
@@ -342,8 +350,8 @@ test('a subagent turn starting after a submit does not confirm it', async () => 
   expect(h.attempts).toEqual([first, first])
 })
 
-test('a submit the engine drops (a Stop stands) did not enter: it is kept and sent again until it does', async () => {
-  const h = setup({ dropSubmits: 2 })
+test('a submit the engine drops for another reason than a Stop did not enter: it is kept and sent again until it does', async () => {
+  const h = setup({ dropSubmits: 2, dropReason: 'a host limit was reached' })
   const first = 'TASK_FILE: task-1.txt\nQUEUE: 0 pending after this'
   await h.clock.advance(0)
   h.children[0].out(`${first}\n`)
@@ -353,7 +361,8 @@ test('a submit the engine drops (a Stop stands) did not enter: it is kept and se
   await h.clock.advance(5_000 + 10_000)
   expect(h.attempts).toEqual([first, first, first])
   expect(h.submitted).toEqual([first])
-  expect(h.logs.some((l) => l.includes('a Stop stands'))).toBe(true)
+  expect(h.logs.some((l) => l.includes('a host limit was reached'))).toBe(true)
+  expect(h.statuses).toEqual(['1 task waiting — type anything to resume', undefined])
   await h.clock.advance(3_600_000)
   expect(h.attempts.length).toBe(3)
 })
@@ -372,6 +381,82 @@ test('a main turn with other text after a submit confirms nothing: the announcem
   await h.clock.advance(2_000)
   expect(h.attempts).toEqual([first, first])
   h.w.turnStart(undefined, 'another question')
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(3_600_000)
+  expect(h.attempts).toEqual([first, first])
+})
+
+test('while a Stop stands nothing is submitted: the wait is shown, one toast per pause, and the person\'s next turn releases it all once, in order', async () => {
+  const h = setup()
+  const first = 'TASK_FILE: task-1.txt\nQUEUE: 0 pending after this'
+  const second = 'TASK_FILE: task-2.txt\nQUEUE: 1 pending after this'
+  await h.clock.advance(0)
+  h.w.stopStands('the person pressed Stop')
+  expect(h.statuses).toEqual([])
+  h.children[0].out(`${first}\n`)
+  await h.clock.advance(60_000)
+  expect(h.statuses).toEqual(['1 task waiting — type anything to resume'])
+  h.children[0].out(`${second}\n`)
+  await h.clock.advance(3_600_000)
+  expect(h.attempts).toEqual([])
+  expect(h.statuses[h.statuses.length - 1]).toBe('2 tasks waiting — type anything to resume')
+  expect(h.toasts).toEqual(['1 task waiting — type anything to resume'])
+  h.w.turnStart('agent-1', 'a subagent is not the person')
+  h.w.turnIdle('agent-1')
+  void h.w.flush('agent-1')
+  await h.clock.advance(60_000)
+  expect(h.attempts).toEqual([])
+  h.w.turnStart(undefined, 'go on')
+  expect(h.statuses[h.statuses.length - 1]).toBe(undefined)
+  await h.clock.advance(5_000)
+  expect(h.attempts).toEqual([])
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(3_600_000)
+  expect(h.attempts).toEqual([`${first}\n${second}`])
+  expect(h.submitted).toEqual([`${first}\n${second}`])
+  expect(h.toasts.length).toBe(1)
+  expect(h.statuses[h.statuses.length - 1]).toBe(undefined)
+  h.w.stopStands('the person pressed Stop')
+  h.children[0].out('TASK_FILE: task-3.txt\nQUEUE: 0 pending after this\n')
+  await h.clock.advance(60_000)
+  expect(h.attempts.length).toBe(1)
+  expect(h.toasts.length).toBe(2)
+})
+
+test('a drop that names a standing Stop pauses the same way with no session.stop event: held, shown, never resent, delivered once after the person\'s turn', async () => {
+  const h = setup({ dropSubmits: 1, dropReason: 'a Stop stands' })
+  const first = 'TASK_FILE: task-1.txt\nQUEUE: 0 pending after this'
+  await h.clock.advance(0)
+  h.children[0].out(`${first}\n`)
+  await h.clock.advance(3_600_000)
+  expect(h.attempts).toEqual([first])
+  expect(h.submitted).toEqual([])
+  expect(h.statuses).toEqual(['1 task waiting — type anything to resume'])
+  expect(h.toasts.length).toBe(1)
+  expect(h.logs.some((l) => l.includes('resending'))).toBe(false)
+  h.w.turnStart(undefined, 'go on')
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(3_600_000)
+  expect(h.attempts).toEqual([first, first])
+  expect(h.submitted).toEqual([first])
+  expect(h.statuses[h.statuses.length - 1]).toBe(undefined)
+})
+
+test('a Stop that lands while a submit waits for its turn holds the text instead of resending it', async () => {
+  const h = setup({ silent: true })
+  const first = 'TASK_FILE: task-1.txt\nQUEUE: 0 pending after this'
+  await h.clock.advance(0)
+  h.children[0].out(`${first}\n`)
+  await h.clock.advance(1_000)
+  h.w.stopStands('the person pressed Stop')
+  await h.clock.advance(3_600_000)
+  expect(h.attempts).toEqual([first])
+  expect(h.statuses[h.statuses.length - 1]).toBe('1 task waiting — type anything to resume')
+  h.engine.silent = false
+  h.w.turnStart(undefined, 'go on')
   h.w.turnIdle()
   void h.w.flush()
   await h.clock.advance(3_600_000)

@@ -104,6 +104,14 @@ same session watcher can instead be run by a Claude Code Mod, `src/agent/claude/
   it is sent again, waiting 5 s doubling to 60 s, for as long as it takes. A main turn with other
   text (the person typed first) confirms nothing: the announcement is sent once more, and a second
   such turn is taken as delivery. A turn that starts after a resend went out delivers twice.
+- **A core interrupted at its terminal waits for the person by design; the wait is shown.** After
+  Esc or Ctrl+C Claude Code refuses plugin input until the person sends input (a Stop stands), and a
+  submit answers `{ drop }`. The Mod then submits nothing and resends nothing: announcements are held
+  in order, the status line under the prompt reads `N tasks waiting — type anything to resume`, and
+  one toast is shown per wait. The person's next main turn ends the hold, and what was held is
+  submitted once, in order, when that turn ends. The same status line is shown while submits resolve
+  but start no turn (those are still resent). `session.stop` is not hooked: the Mod's floor
+  (`MIN_CLAUDE_VERSION`) is below the engine that has the event, and naming it there stops the Mod loading.
 - The Mod keeps a delivery trail in `<workspace>/logs/task-watch-mod.log`: each watcher start and
   end, each announcement and stderr line the watcher printed, and each submit's start and outcome
   (`ok`, `failed`, `timeout`, settled late). The watcher itself appends one line per start to
