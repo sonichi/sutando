@@ -11,6 +11,8 @@ careless default would send it.
   b) [dm-only] with a [channel: room] before, after or far below it -> the owner DM
   c) a [dm-only] message about a task asked in the room   -> the owner DM, no room thread
   d) no owner DM known yet                                -> nothing posted; the file waits
+  e) a plain body, no marker at all                       -> the owner DM: the default itself
+  f) a plain body with no owner DM known                  -> nothing posted; the file waits
 
 Imports the vendored module with an isolated env; never execs the wrapper.
 Run: python3 tests/gateway-dm-only-proactive-never-a-room.test.py
@@ -148,6 +150,17 @@ def main() -> int:
     posts = drain(ws, owner_dm="")
     check(posts == [], f"d) nothing posted without an owner DM, got {rooms(posts)}")
     check((ws / "results" / "proactive-2.txt").exists(), "d) the file waits for the owner DM")
+
+    # e, f) No marker at all: the owner DM is the default, not a consequence of [dm-only].
+    ws = workspace()
+    (ws / "results" / "proactive-3.txt").write_text("a plain owner update\n", encoding="utf-8")
+    posts = drain(ws)
+    check(rooms(posts) == [OWNER_DM], f"e) a plain body -> the owner DM, got {rooms(posts)}")
+    ws = workspace()
+    (ws / "results" / "proactive-4.txt").write_text("a plain owner update\n", encoding="utf-8")
+    posts = drain(ws, owner_dm="")
+    check(posts == [], f"f) a plain body without an owner DM is not posted, got {rooms(posts)}")
+    check((ws / "results" / "proactive-4.txt").exists(), "f) the file waits for the owner DM")
 
     print(f"\n{'FAIL' if FAILS else 'PASS'}: {len(FAILS)} failure(s)")
     return 1 if FAILS else 0
