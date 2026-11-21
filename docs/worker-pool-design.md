@@ -515,13 +515,14 @@ A sentinel is empty, so an assignment carries no roster `version`; the router re
 `pool_roster.set_worker_model` (`pool_manage.py set-model`) and kept across
 re-registration. Every start of a Claude worker (spawn, resume, recovery, `enable`,
 `reseat`) passes `--model`: the row's model, else the pool default
-`WORKER_POOL_DEFAULT_MODEL` (worker-pool manifest `config`, `opus`; CLI > env > manifest).
+`WORKER_POOL_DEFAULT_MODEL` (worker-pool manifest `config`, `opus`; CLI > env > manifest;
+an override that is not a model name falls back to the manifest's).
 A Codex worker carries none. The core and its workers share one Claude config dir, and
 a worker that passed no `--model` would run on that dir's `settings.json` model, which
 any session's `/model` rewrites. `set-model` applies a change by reseating the one
 worker on its own conversation, never by sending `/model`: `/model` saves its pick to
 that shared `settings.json` even in a session started with `--model`. A seat that owes
-work keeps its model until its next start. A `/model` typed by hand in a worker's pane
+work, in the shared deliveries or its own inbox, keeps its model until its next start. A `/model` typed by hand in a worker's pane
 still rewrites the shared default; the core's next start and unpinned sessions follow
 it, while every worker start keeps its own `--model`. Sessions their launcher marks
 not-a-core (`SUTANDO_CORE_SESSION` set empty) are outside the core model-pin check.

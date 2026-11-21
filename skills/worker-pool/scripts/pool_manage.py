@@ -109,6 +109,15 @@ def _outstanding(workspace, wid) -> list:
     return sorted(t for t, _ in _owed_residue(workspace, wid))
 
 
+def _owes(workspace, wid) -> list:
+    """Every task the worker owes, its own inbox's too (pool_supervise.owed_task_ids). `_outstanding`
+    lists only the shared sentinels a hand-off can move, so a worker on its own folders reads idle there."""
+    try:
+        return sorted(sup.owed_task_ids(workspace, wid))
+    except (OSError, ValueError):
+        raise Refused(f"cannot tell what {wid} still owes (deliveries or results unreadable)") from None
+
+
 def _owed_residue(workspace, wid):
     for p in pd.accepted(Path(workspace), wid) + pd.pending(Path(workspace), wid):
         task_id = pd.parse_sentinel(p.name)[0]
@@ -254,7 +263,7 @@ def reseat(workspace, repo, target, *, runner=subprocess.run, spawn=None) -> dic
     if socket is None or sw.session_state(seat, socket, runner=runner) != "exists":
         return {**base, "result": "skipped", "why": "no seat running; its next start applies the change"}
     _not_self(wid, False)
-    owed = _outstanding(workspace, wid)
+    owed = _owes(workspace, wid)
     if owed:
         return {**base, "result": "deferred", "owed": owed,
                 "why": f"it owes {len(owed)} task(s), so its seat was left running as before; once they are "

@@ -742,13 +742,17 @@ def recorded_model(workspace, worker_id: str) -> "str | None":
 
 
 def default_model(environ=None, warn=None) -> "str | None":
-    """The pool's default for a worker with no recorded model (manifest config, env override)."""
+    """The pool's default for a worker with no recorded model (manifest config, env override). An
+    override that is not a model name falls back to the manifest's, so a worker still pins one."""
     model = skill_config.config_value(DEFAULT_MODEL_KEY, POOL_MANIFEST, environ=environ)
     if claude_model_name.is_valid(model):
         return model
-    if model and warn:
-        warn(f"{DEFAULT_MODEL_KEY}={model!r} is not a Claude model name; launching without --model")
-    return None
+    shipped = skill_config.config_value(DEFAULT_MODEL_KEY, POOL_MANIFEST, environ={})
+    shipped = shipped if claude_model_name.is_valid(shipped) else None
+    if warn:
+        warn(f"{DEFAULT_MODEL_KEY}={model!r} is not a Claude model name; launching with "
+             + (f"the manifest's {shipped!r}" if shipped else "no --model"))
+    return shipped
 
 
 def worker_model(workspace, worker_id: str, environ=None, warn=None) -> "str | None":

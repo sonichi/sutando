@@ -110,10 +110,11 @@ python3 skills/worker-pool/scripts/pool_manage.py unbind <room id>
   roster row: an alias such as `opus`, `sonnet[1m]`, or a `claude-*` id); `--clear`
   drops it. Every start of a Claude worker passes `--model`: its recorded model,
   else the pool default `WORKER_POOL_DEFAULT_MODEL` (manifest `config`, `opus`;
-  `CLI > env > manifest`). A recorded change is applied by `reseat`: a running seat
-  that owes nothing restarts on the same conversation with the new `--model`
-  (`"result": "applied"`); one that owes work, or no running seat, keeps it for its
-  next start (`"result": "recorded"`, the reason under `apply`). It never types
+  `CLI > env > manifest`; an override that is not a model name warns and falls back to
+  the manifest's). A recorded change is applied by `reseat`: a running seat that
+  owes nothing (in the shared deliveries or its own inbox) restarts on the same
+  conversation with the new `--model` (`"result": "applied"`); one that owes work,
+  or no running seat, keeps it for its next start (`"result": "recorded"`, the reason under `apply`). It never types
   `/model` into a pane: `/model` saves its pick as the shared `settings.json`
   default even in a session started with `--model`, which moves the core's next
   start and every unpinned session with it. For the same reason, do not type

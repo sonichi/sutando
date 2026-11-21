@@ -36,6 +36,9 @@ def _load(name):
 
 pm = _load("pool_manage")
 rem, pr, wi, sw = pm.rem, pm.pr, pm.wi, pm.sw
+import pool_router as router  # noqa: E402
+sys.path.insert(0, str(REPO / "src"))
+import connections  # noqa: E402
 
 WID, OTHER, CODEX = "a" * 32, "b" * 32, "c" * 32
 SEAT, OTHER_SEAT = wi.tmux_session_name(WID), wi.tmux_session_name(OTHER)
@@ -119,14 +122,15 @@ class Default(Base):
         self.assertEqual(self.plan_model(), ("opus", "opus"))
         self.assertEqual(self.plan_model(wid=None), ("opus", "opus"))
 
-    def test_the_env_overrides_the_manifest_and_a_bad_value_passes_no_model(self):
+    def test_the_env_overrides_the_manifest_and_a_bad_value_falls_back_to_the_manifests(self):
         os.environ[pr.DEFAULT_MODEL_KEY] = "sonnet"
         self.assertEqual(self.plan_model(), ("sonnet", "sonnet"))
-        os.environ[pr.DEFAULT_MODEL_KEY] = "opus; rm -rf /"
-        err = io.StringIO()
-        with redirect_stderr(err):
-            self.assertEqual(self.plan_model(), (None, ""))
-        self.assertIn("not a Claude model name", err.getvalue())
+        for bad in ("opus; rm -rf /", "sonnet[1M]"):
+            os.environ[pr.DEFAULT_MODEL_KEY] = bad
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(self.plan_model(), ("opus", "opus"), bad)
+            self.assertIn("not a Claude model name", err.getvalue())
 
     def test_a_codex_worker_gets_no_model(self):
         self.assertEqual(self.plan_model(CODEX, runtime="codex"), (None, ""))
@@ -164,12 +168,29 @@ class SetModel(Base):
         self.assertEqual((rc, out["result"]), (0, "unchanged"))
         self.assertEqual(len(self.started), n, "an unchanged record must not restart the seat")
 
-    def test_a_seat_that_owes_work_keeps_running_and_takes_the_model_at_its_next_start(self):
-        with mock.patch.object(pm, "_outstanding", return_value=["task-x"]):
-            rc, out = self.main("set-model", WID, "sonnet")
-        self.assertEqual((rc, out["result"], out["apply"]["result"]), (0, "recorded", "deferred"))
+    def assert_deferred(self, owed):
+        rc, out = self.main("set-model", WID, "sonnet")
+        self.assertEqual((rc, out["result"], out["apply"]["result"], out["apply"]["owed"]),
+                         (0, "recorded", "deferred", owed))
         self.assertEqual(self.row()["model"], "sonnet")
         self.assertEqual((self.tmux.killed(), self.started), ([], []))
+
+    def test_a_seat_that_owes_a_routed_delivery_keeps_running_until_its_next_start(self):
+        for d in ("tasks", "results"):
+            (self.ws / d).mkdir()
+        (self.ws / "tasks" / "task-x.txt").write_text("id: task-x\ntask: hi\n")
+        self.assertEqual(router.route(self.ws, {"id": "task-x", "requested_worker": WID})["delivered"], [WID])
+        self.assert_deferred(["task-x"])
+
+    def test_a_seat_on_its_own_folders_that_owes_its_inbox_keeps_running(self):
+        own = (self.tmp / "own" / "tasks", self.tmp / "own" / "results")
+        for d in own:
+            d.mkdir(parents=True)
+        (own[0] / "task-y.txt").write_text("id: task-y\ntask: hi\n")
+        real = connections.worker_dirs
+        with mock.patch.object(connections, "worker_dirs",
+                               lambda w, ws=None: own if w == WID else real(w, ws)):
+            self.assert_deferred(["task-y"])
 
     def test_no_running_seat_is_recorded_for_its_next_start(self):
         self.tmux.alive.clear()
