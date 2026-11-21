@@ -1080,5 +1080,106 @@ class CommandLine(SeatCase):
                                      "stage_command"})
 
 
+class HostDeclaration(unittest.TestCase):
+    """`supervised_host.py` beside the seat: the declaration it refuses and the stage hook it runs."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name))
+        for d in ("inbox", "results", "payloads"):
+            (self.root / d).mkdir()
+        self.sh = seat_mod.supervised_host
+
+    def decl(self, **changes) -> dict:
+        d = {"schema": self.sh.SCHEMA, "inbox": str(self.root / "inbox"), "results": str(self.root / "results"),
+             "state": str(self.root / "state"), "publish": "result_publish"}
+        d.update(changes)
+        return {k: v for k, v in d.items() if v is not ...}
+
+    def load(self, body):
+        path = self.root / "host.json"
+        path.write_bytes(body if isinstance(body, bytes) else json.dumps(body).encode())
+        return self.sh.load(str(path))
+
+    def test_the_seat_reads_the_copy_beside_it_and_not_the_ag2_sparrow_package(self):
+        self.assertEqual(Path(self.sh.__file__).resolve(), SEAT_PY.with_name("supervised_host.py"))
+        self.assertNotIn("ag2_sparrow", SEAT_PY.read_text())
+
+    def test_a_valid_declaration_loads_with_its_optional_keys_and_makes_the_state_dir(self):
+        host = self.load(self.decl(payloads=str(self.root / "payloads"), cwd=str(self.root),
+                                   stage_command=["/abs/py", "hook"]))
+        self.assertEqual((host.inbox, host.results, host.state, host.publish_contract),
+                         (str(self.root / "inbox"), str(self.root / "results"), str(self.root / "state"),
+                          "result_publish"))
+        self.assertEqual((host.payloads, host.cwd, host.stage_command),
+                         (str(self.root / "payloads"), str(self.root), ["/abs/py", "hook"]))
+        self.assertTrue((self.root / "state").is_dir())
+        self.assertEqual(host.task_path("task-1.txt"), str(self.root / "payloads" / "task-1.txt"))
+        plain = self.load(self.decl())
+        self.assertEqual((plain.payloads, plain.cwd, plain.stage_command), (None, None, None))
+        self.assertEqual(plain.task_path("task-1.txt"), str(self.root / "inbox" / "task-1.txt"))
+
+    def test_each_unusable_declaration_is_refused_with_one_line_naming_what_is_wrong(self):
+        cases = [
+            (b"{not json", "is not JSON"),
+            (b"\xff\xfe", "is not JSON"),
+            (b" " * (self.sh.DECLARATION_MAX + 1), "is larger than"),
+            ([1], "must be a JSON object"),
+            (self.decl(extra=1), "unknown key in the host declaration: extra"),
+            (self.decl(results=...), "the host declaration has no results"),
+            (self.decl(schema="something-else/1"), "is not ag2-sparrow.supervised-host/1"),
+            (self.decl(publish="copy"), "publish 'copy' is not one of result_publish"),
+            (self.decl(inbox="relative/inbox"), "inbox must be an absolute path"),
+            (self.decl(results=str(self.root / "absent")), "is not a directory"),
+            (self.decl(state=7), "state must be an absolute path"),
+            (self.decl(payloads="relative"), "payloads must be an absolute path"),
+            (self.decl(cwd=str(self.root / "absent")), "is not a directory"),
+            (self.decl(results=str(self.root / "inbox")), "must be three different directories"),
+            (self.decl(stage_command=["relative-py", "hook"]), "stage_command must be a list"),
+            (self.decl(stage_command=[]), "stage_command must be a list"),
+            (self.decl(stage_command="/abs/py hook"), "stage_command must be a list"),
+        ]
+        for body, why in cases:
+            with self.subTest(why=why, body=str(body)[:60]):
+                with self.assertRaises(self.sh.DeclarationError) as raised:
+                    self.load(body)
+                self.assertIn(why, str(raised.exception))
+        with self.assertRaises(self.sh.DeclarationError) as raised:
+            self.sh.load(str(self.root / "no-such-file.json"))
+        self.assertIn("cannot read the host declaration", str(raised.exception))
+
+    def test_the_stage_hook_is_run_with_the_task_and_stage_and_its_failures_are_said(self):
+        calls = []
+
+        def run(argv, **kw):
+            calls.append((argv, kw["timeout"]))
+            return subprocess.CompletedProcess(argv, self.rc, "", self.err)
+
+        host = self.load(self.decl(stage_command=["/abs/py", "hook"]))
+        self.rc, self.err = 0, ""
+        self.assertEqual(host.stage("task-1", "pending", run=run), "")
+        self.assertEqual(calls, [(["/abs/py", "hook", "--task-id", "task-1", "--stage", "pending"],
+                                  self.sh.STAGE_TIMEOUT_S)])
+        self.rc, self.err = 3, "first line\nlast line\n"
+        self.assertEqual(host.stage("task-1", "done", run=run), "stage done exited 3: last line")
+        self.rc, self.err = 4, ""
+        self.assertEqual(host.stage("task-1", "done", run=run), "stage done exited 4")
+
+        def absent(argv, **kw):
+            raise FileNotFoundError(argv[0])
+
+        self.assertEqual(host.stage("task-1", "done", run=absent), "stage done did not run (FileNotFoundError)")
+        with self.assertRaises(ValueError):
+            host.stage("task-1", "abandon", run=run)
+        self.assertEqual(len(calls), 3)
+
+    def test_a_host_with_no_stage_hook_records_nothing_and_reports_no_problem(self):
+        def never(argv, **kw):
+            raise AssertionError("no hook is declared")
+
+        self.assertEqual(self.load(self.decl()).stage("task-1", "done", run=never), "")
+
+
 if __name__ == "__main__":
     unittest.main()

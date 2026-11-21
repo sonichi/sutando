@@ -495,7 +495,8 @@ same tmux session holds a seat process instead (`src/agent/codex/app-server/seat
   the task again.
 
 The seat reads its folders from a host declaration (`host.json` beside the thread file) in the
-`ag2-sparrow.supervised-host/1` schema of `packages/ag2-sparrow/ag2_sparrow/supervised_host.py`.
+`ag2-sparrow.supervised-host/1` schema, read by `src/agent/codex/app-server/supervised_host.py`
+(a minimal copy of the parser in the parked #6474, to be replaced by that module if it lands).
 No notifier session (`<session>-watcher`) and no observer session (`<session>-observer`) is
 started for a seat; the seat runs the standby task watcher as its own child
 (`SUTANDO_SEAT_WATCHER=0` leaves it out, and the seat then only polls).

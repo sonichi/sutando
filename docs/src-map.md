@@ -396,6 +396,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 
 - **`seat-launch.sh`** — Launcher half of the Codex app-server seat (SUTANDO_CODEX_APP_SERVER=1).
 - **`seat.py`** — One Codex seat (the core, or a pool worker) served over `codex app-server` instead of a TUI.
+- **`supervised_host.py`** — The host declaration a Codex app-server seat is started with: its folders and its stage hook.
 
 ## `src/agent/codex/cli/`
 

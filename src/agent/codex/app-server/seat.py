@@ -6,7 +6,7 @@ turn per pending task with the prompt the tmux notifier types today. The Sutando
 unchanged: the agent writes `results/<task file>` itself, and `turn/completed` only means the
 turn is over. Its stdout is the terminal panel: one line per task, turn, command and tool call.
 
-The seat reads its folders from the host declaration `ag2_sparrow.supervised_host` defines
+The seat reads its folders from the host declaration `supervised_host.py` beside this file reads
 (`schema: ag2-sparrow.supervised-host/1`): `inbox`, optional `payloads` (the inbox then holds
 delivery sentinels naming `<payloads>/<task file>`), `results`, `state`, `stage_command`, `cwd`.
 `publish` is validated and unused: this seat never writes a result, the agent does.
@@ -33,11 +33,11 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 REPO = Path(__file__).resolve().parents[4]  # lint-workspace-resolution: allow-repo-root
-for _p in (str(REPO / "src"), str(REPO / "packages" / "ag2-sparrow")):
+for _p in (str(REPO / "src"), str(Path(__file__).resolve().parent)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from ag2_sparrow import supervised_host  # noqa: E402
+import supervised_host  # noqa: E402
 from delivery.task_dispatch import (has_ready_result, owned_task_ids,  # noqa: E402
                                     pending_candidates)
 from task_disposition import ANSWERED, PENDING, SPENT, task_dispositions  # noqa: E402
