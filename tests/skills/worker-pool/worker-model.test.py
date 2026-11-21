@@ -182,15 +182,31 @@ class SetModel(Base):
         self.assertEqual(router.route(self.ws, {"id": "task-x", "requested_worker": WID})["delivered"], [WID])
         self.assert_deferred(["task-x"])
 
-    def test_a_seat_on_its_own_folders_that_owes_its_inbox_keeps_running(self):
+    def own_folders(self):
         own = (self.tmp / "own" / "tasks", self.tmp / "own" / "results")
         for d in own:
             d.mkdir(parents=True)
-        (own[0] / "task-y.txt").write_text("id: task-y\ntask: hi\n")
         real = connections.worker_dirs
-        with mock.patch.object(connections, "worker_dirs",
-                               lambda w, ws=None: own if w == WID else real(w, ws)):
-            self.assert_deferred(["task-y"])
+        p = mock.patch.object(connections, "worker_dirs", lambda w, ws=None: own if w == WID else real(w, ws))
+        p.start()
+        self.addCleanup(p.stop)
+        return own
+
+    def test_a_seat_on_its_own_folders_that_owes_its_inbox_keeps_running(self):
+        tasks, _ = self.own_folders()
+        (tasks / "task-y.txt").write_text("id: task-y\ntask: hi\n")
+        self.assert_deferred(["task-y"])
+
+    def test_an_own_inbox_that_cannot_be_read_is_recorded_not_restarted(self):
+        tasks, _ = self.own_folders()
+        (tasks / "task-y.txt").write_text("id: task-y\ntask: hi\n")
+        tasks.chmod(0)
+        self.addCleanup(tasks.chmod, 0o700)
+        rc, out = self.main("set-model", WID, "sonnet")
+        self.assertEqual((rc, out["result"], out["apply"]["result"]), (0, "recorded", "refused"))
+        self.assertIn("cannot tell what", out["apply"]["why"])
+        self.assertEqual(self.row()["model"], "sonnet")
+        self.assertEqual((self.tmux.killed(), self.started), ([], []))
 
     def test_no_running_seat_is_recorded_for_its_next_start(self):
         self.tmux.alive.clear()
