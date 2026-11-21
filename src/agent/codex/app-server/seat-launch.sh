@@ -131,7 +131,3 @@ seat_core_overrides() {
   ensure_task_notifier() { seat_end_helper_sessions; }
   ensure_codex_observer() { :; }
 }
-seat_core_launch_overrides() {
-  heal_core_window() { seat_heal_core_window; }
-  start_core_session_and_helpers() { seat_start_core_session_and_helpers; }
-}
