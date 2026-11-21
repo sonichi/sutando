@@ -52,6 +52,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 	'stand',
 	'skills',
 	'notifications',
+	'egress',
 ]);
 
 /**
@@ -70,6 +71,7 @@ const OBJECT_TOP_LEVEL_KEYS = new Set([
 	'bridges',
 	'skills',
 	'notifications',
+	'egress',
 ]);
 
 /**

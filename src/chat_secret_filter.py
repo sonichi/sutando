@@ -138,10 +138,34 @@ def _warn_scanner_broken(exc) -> None:
         _SCANNER_BROKEN_WARNED = True
 
 
-def filter_chat_secrets(text: str) -> ChatSecretFilterResult:
-    """Return text safe for persistence plus detected secret type names."""
+def _digest_masker(public_digests):
+    if not public_digests:
+        return None
+    try:
+        from .public_digest import mask_digests  # packaged sibling (ag2-sparrow)
+    except ImportError:
+        try:
+            from policy.egress.public_digest import mask_digests
+        except ImportError:
+            return None  # fail closed: nothing is masked
+    return mask_digests
+
+
+def filter_chat_secrets(text: str, public_digests=()) -> ChatSecretFilterResult:
+    """Return text safe for persistence plus detected secret type names.
+
+    `public_digests` must come from `verified_public_digests`; only those exact
+    digests are hidden from every detector below, and restored afterwards.
+    """
     if not text:
         return ChatSecretFilterResult(text=text, secret_types=())
+    mask_digests = _digest_masker(public_digests)
+    if mask_digests is not None:
+        masked, restore = mask_digests(text, public_digests)
+        if masked != text:
+            result = filter_chat_secrets(masked)
+            return ChatSecretFilterResult(
+                text=restore(result.text), secret_types=result.secret_types)
 
     redacted, found = _replace_patterns(text)
     try:

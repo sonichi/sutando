@@ -278,6 +278,27 @@
       "type": "string",
       "description": "This instance's `Stand:` commit-trailer value (e.g. \"Echo Act IV Mini\"). Per-clone identity, so it belongs in sutando.config.local.json rather than the tracked default config. Read by scripts/sutando-config.sh stand to tell co-located Sutando instances apart, since both commit under the owner's GH-mapped email so --author cannot separate them."
     },
+    "egress": {
+      "type": "object",
+      "description": "Outgoing-result policy for non-owner deliveries. Read by src/policy/egress/public_digest.py.",
+      "additionalProperties": false,
+      "properties": {
+        "verified_digest_sources": {
+          "type": "array",
+          "default": [],
+          "description": "GitHub check runs whose own output can prove a 64-hex digest public. A held Team result is re-scanned with a digest masked only when the result cites a check-run URL in one of these repositories, that run has this name, was created by GitHub Actions and its output states the digest as `Assessment digest: <digest>` in backticks. Empty (the default) clears nothing.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["repo", "check_name"],
+            "properties": {
+              "repo": {"type": "string", "description": "owner/name"},
+              "check_name": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
     "env": {
       "type": "object",
       "description": "Non-secret config values mirroring the flat env-var namespace (issue #1724). Read by config_get(), which prefers this stanza and falls back to the process environment (deprecated, with a one-time warning); secrets stay in .env / vault. Known keys are listed below; any other string key is allowed.",
