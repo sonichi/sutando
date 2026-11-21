@@ -42,6 +42,7 @@ from delivery.task_dispatch import (has_ready_result, owned_task_ids,  # noqa: E
                                     pending_candidates)
 from task_disposition import ANSWERED, PENDING, SPENT, task_dispositions  # noqa: E402
 from task_priority import sort_tasks_by_priority  # noqa: E402
+
 from workspace_default import resolve_workspace  # noqa: E402
 
 CLIENT = {"name": "sutando-codex-seat", "title": "Sutando Codex seat", "version": "1"}
