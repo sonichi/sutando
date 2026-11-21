@@ -90,6 +90,15 @@ same session watcher can instead be run by a Claude Code Mod, `src/agent/claude/
   ever submitted: only a plain file name (or an absolute path ending in one) passes, the Mod never
   reads a task file, and the session still reads the task's headers (`access_tier`, sender, HMAC) from
   the file itself. While a turn runs, announcements wait and arrive together when it ends.
+- A submit that throws, or that has not settled within 30 s, keeps its announcement: it goes back to
+  the front and is sent again (after 5 s for a throw; after 5 s doubling to 5 min for a timeout).
+  One submit is in flight at a time and nothing waits on it: the Mod keeps reading the watcher, and a
+  completed turn is not held. A timed-out submit that settles during the wait is not sent again; one
+  that settles later delivers its announcement twice, the price of never losing one.
+- The Mod keeps a delivery trail in `<workspace>/logs/task-watch-mod.log`: each watcher start and
+  end, each announcement and stderr line the watcher printed, and each submit's start and outcome
+  (`ok`, `failed`, `timeout`, settled late). The watcher itself appends one line per start to
+  `<workspace>/logs/watch-tasks-stream.log`. Neither file is rotated.
 - An exit 0 is a hand-off (the inbox is held, or the watcher was told to stop): the Mod polls
   `role-present` every 30 s and starts again once no session watcher holds the inbox. Any other early
   exit restarts after 5 s, doubling to 5 min; after 8 in a row it stops and logs, and the Stop hook's
@@ -290,6 +299,7 @@ how `tests/watch-tasks-stream-shutdown-leaves-inflight-claim.test.py` interrupts
   pages the owner; without the mode the notifier starts.
 - `tests/seat-inbox.test.py`: which inboxes are a registered seat, and the label each gets.
 - `src/agent/claude/task-watch-mod/tests/task-watch.test.ts` (`claude plugin test`, in CI): the Mod's
-  spawn, announcement, restart, hand-off and session-end rules, and that a task body is never submitted.
+  spawn, announcement, restart, hand-off and session-end rules, that a task body is never submitted,
+  and that a submit which never settles is timed out and sent again.
 - `tests/task-watch-mod-launch.test.sh`: the launchers' defaults and opt-outs, version floor and session marker.
 - `scripts/task-watch-mod-witness.sh` (local, needs a logged-in `claude`): the Mod in a real headless session.

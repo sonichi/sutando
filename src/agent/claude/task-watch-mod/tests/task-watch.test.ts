@@ -61,10 +61,14 @@ function fakeChild() {
   return { state, child, out: (text: string) => { q.push({ stream: 'stdout', text }); pull() }, end: (code: number | null) => { q.push({ end: { code, signal: null } }); pull() } }
 }
 
-function setup(opts: { held?: string[]; rejectSubmits?: number } = {}) {
+// submitDelays: how long each submit call takes to settle, in order; Infinity is a call that never settles.
+function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: number[] } = {}) {
   const clock = fakeClock()
   const submitted: string[] = []
+  const attempts: string[] = []
+  const delays = [...(opts.submitDelays ?? [])]
   const logs: string[] = []
+  const trail: string[] = []
   const spawns: string[][] = []
   const runs: string[][] = []
   const children: ReturnType<typeof fakeChild>[] = []
@@ -89,13 +93,18 @@ function setup(opts: { held?: string[]; rejectSubmits?: number } = {}) {
     now: async () => clock.now(),
     submit: async (text) => {
       if (rejects-- > 0) throw new Error('busy')
+      attempts.push(text)
+      const delay = delays.shift() ?? 0
+      if (delay === Infinity) await new Promise<void>(() => undefined)
+      else if (delay > 0) await clock.sleep(delay)
       submitted.push(text)
     },
+    record: async (file, lines) => { for (const l of lines) trail.push(`${file}: ${l}`) },
     log: async (text) => { logs.push(text) },
   }
   const w = new TaskWatch(host, REPO)
   const done = w.run()
-  return { w, done, clock, submitted, logs, spawns, runs, children }
+  return { w, done, clock, submitted, attempts, logs, trail, spawns, runs, children }
 }
 
 test('pure: version floor, repo root, task lines, line split, backoff', () => {
@@ -175,6 +184,53 @@ test('a submit the engine refuses is kept and retried, never dropped', async () 
   expect(h.submitted).toEqual([])
   await h.clock.advance(5_000)
   expect(h.submitted).toEqual(['TASK_FILE: task-1.txt\nQUEUE: 3 pending after this'])
+})
+
+test('a submit that never settles times out: its announcement is kept and sent again, and later ones still arrive in order', async () => {
+  const h = setup({ submitDelays: [Infinity] })
+  const first = 'TASK_FILE: task-1.txt\nQUEUE: 1 pending after this'
+  const second = 'TASK_FILE: task-2.txt\nQUEUE: 0 pending after this'
+  await h.clock.advance(0)
+  h.children[0].out(`${first}\n`)
+  await h.clock.advance(0)
+  expect(h.attempts).toEqual([first])
+  expect(h.submitted).toEqual([])
+  await h.clock.advance(30_000 + 5_000)
+  h.children[0].out(`${second}\n`)
+  await h.clock.advance(0)
+  expect(h.attempts).toEqual([first, first, second])
+  expect(h.submitted).toEqual([first, second])
+})
+
+test('while a submit is stuck the watcher is still read and a completed turn is not held; a late delivery is not repeated', async () => {
+  const h = setup({ submitDelays: [32_000] })
+  const first = 'TASK_FILE: task-1.txt\nQUEUE: 1 pending after this'
+  const second = 'TASK_FILE: task-2.txt\nQUEUE: 0 pending after this'
+  await h.clock.advance(0)
+  h.children[0].out(`${first}\n`)
+  await h.clock.advance(1_000)
+  h.children[0].out(`WATCHER_HELD: inbox=/x pid=1 role=session\n${second}\n`)
+  await h.clock.advance(0)
+  expect(h.logs.some((l) => l.startsWith('WATCHER_HELD:'))).toBe(true)
+  let flushed = false
+  void h.w.flush().then(() => { flushed = true })
+  await h.clock.advance(29_000)
+  expect(h.logs.some((l) => l.includes('did not start within 30s'))).toBe(true)
+  expect(flushed).toBe(false)
+  await h.clock.advance(5_000)
+  expect(h.attempts).toEqual([first, second])
+  expect(h.submitted).toEqual([first, second])
+  expect(flushed).toBe(true)
+  expect(h.trail.map((l) => l.replace('/ws/logs/task-watch-mod.log: ', ''))).toEqual([
+    'watcher starting on /ws/deliveries/w1',
+    'watcher announced: TASK_FILE: task-1.txt', 'watcher announced: QUEUE: 1 pending after this',
+    'submit #1 start: TASK_FILE: task-1.txt | QUEUE: 1 pending after this',
+    'watcher announced: TASK_FILE: task-2.txt', 'watcher announced: QUEUE: 0 pending after this',
+    'submit #1 timeout after 30000ms; kept, retrying in 5s',
+    'submit #1 settled after its timeout: delivered late',
+    'submit #1 is not sent again: it was delivered late',
+    'submit #2 start: TASK_FILE: task-2.txt | QUEUE: 0 pending after this', 'submit #2 ok',
+  ])
 })
 
 test('a task body with instructions is never inlined: only the file name and queue count are submitted', async () => {
