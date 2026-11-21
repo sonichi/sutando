@@ -261,6 +261,20 @@ class SetModel(Base):
         self.assertEqual((self.tmux.killed(), self.started), ([], []))
         self.assertEqual(self.plan_model(), ("sonnet", "sonnet"))
 
+    def test_a_repeated_set_model_on_its_own_folders_never_points_at_reseat(self):
+        self.own_folders()
+        self.main("set-model", WID, "sonnet")
+        rc, out = self.main("set-model", WID, "sonnet")
+        self.assertEqual((rc, out["result"]), (0, "unchanged"))
+        self.assertNotIn("reseat", out["why"])
+        self.assertEqual((self.tmux.killed(), self.started), ([], []))
+
+    def test_a_repeated_set_model_on_shared_folders_still_names_reseat(self):
+        self.main("set-model", WID, "sonnet")
+        rc, out = self.main("set-model", WID, "sonnet")
+        self.assertEqual((rc, out["result"]), (0, "unchanged"))
+        self.assertIn("pool_manage.py reseat", out["why"])
+
     def test_set_model_with_an_unreadable_folders_record_restarts_nothing(self):
         self.own_folders()
         connections.record_path(self.ws).write_text("{not json")

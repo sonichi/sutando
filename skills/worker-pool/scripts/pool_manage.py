@@ -324,11 +324,18 @@ def set_model(workspace, repo, target, model=None, *, runner=subprocess.run, spa
     wid, before, roster = pr.set_worker_model(workspace, target, model)
     out = {"worker_id": wid, "action": "set-model", "recorded": model, "previous": before,
            "model": pr.worker_model(workspace, wid)}
-    if roster is None:
-        return {**out, "result": "unchanged",
-                "why": "already recorded; a seat started before that takes it on pool_manage.py reseat"}
     try:
-        if connections.worker_dirs(wid, Path(workspace), strict=True) is not None:
+        own = connections.worker_dirs(wid, Path(workspace), strict=True) is not None
+    except (OSError, ValueError, connections.ConnectionsError):
+        own = None
+    if roster is None:
+        why = ("already recorded; a seat started before that takes it on pool_manage.py reseat" if own is False
+               else "already recorded; its next start applies the model, since a restart here is unfenced")
+        return {**out, "result": "unchanged", "why": why}
+    try:
+        if own is None:
+            raise ValueError("folders record unreadable")
+        if own:
             applied = {"result": "next-start", "why": "it runs on its own folders, whose deliveries no lock "
                        "fences, so its seat was not restarted; its next start applies the model"}
         else:
