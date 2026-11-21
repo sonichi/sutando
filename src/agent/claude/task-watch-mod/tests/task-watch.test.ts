@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { Announcements, TaskWatch, backoffMs, isTaskLine, repoFromPluginRoot, takeLines, taskNames, versionAtLeast, withoutHandled } from '../hooks/register'
+import { Announcements, TaskWatch, backoffMs, isTaskLine, midTurnNotice, ownerTasks, repoFromPluginRoot, takeLines, taskNames, versionAtLeast, withTaskContext, withoutHandled } from '../hooks/register'
 import type { On } from 'claude-code'
 import type { Child, End, Host, Piece } from '../hooks/register'
 import { MIN_CLAUDE_VERSION } from '../hooks/version'
@@ -69,7 +69,8 @@ function fakeChild() {
 // dropSubmits: that many submits resolve as refused (`{ drop }`), the engine's own "did not enter", for dropReason.
 // dispositions: what task_disposition.py prints for a task name (default `pending`); null is a run that fails.
 // The test changes the returned `dispositions` as tasks get answered.
-function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: number[]; silent?: boolean; dropSubmits?: number; dropReason?: string; dispositions?: Record<string, string | null> } = {}) {
+// tiers: the access_tier the tier helper reads for a task path (default `owner`); tierFails: the helper exits non-zero.
+function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: number[]; silent?: boolean; dropSubmits?: number; dropReason?: string; dispositions?: Record<string, string | null>; tiers?: Record<string, string>; tierFails?: boolean } = {}) {
   const clock = fakeClock()
   const submitted: string[] = []
   const attempts: string[] = []
@@ -86,6 +87,7 @@ function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: n
   const held = [...(opts.held ?? [])]
   const dispositions: Record<string, string | null> = { ...(opts.dispositions ?? {}) }
   const checks: string[] = []
+  const tierAsks: string[][] = []
   let rejects = opts.rejectSubmits ?? 0
   const host: Host = {
     run: async (argv) => {
@@ -94,6 +96,11 @@ function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: n
       if (argv[2] === 'workspace') return '/ws\n'
       if (argv[2] === 'watch-argv') return WATCH_ARGV.join('\n') + '\n'
       if (argv[2] === 'role-present') return `${held.length ? held.shift() : 'no'}\n`
+      if (argv[1] === '-I' && argv[2] === '-c' && argv[4] === '/repo/src') {
+        const paths = argv.slice(5)
+        tierAsks.push(paths)
+        return opts.tierFails ? null : paths.map((p) => `${opts.tiers?.[p] ?? 'owner'}\n`).join('')
+      }
       if (argv[1] === '/repo/src/task_disposition.py') {
         const name = argv[argv.length - 1]
         checks.push(name)
@@ -130,7 +137,7 @@ function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: n
   }
   const w: TaskWatch = new TaskWatch(host, REPO)
   const done = w.run()
-  return { w, done, clock, engine, submitted, attempts, logs, trail, statuses, toasts, spawns, runs, children, dispositions, checks }
+  return { w, done, clock, engine, submitted, attempts, logs, trail, statuses, toasts, spawns, runs, children, dispositions, checks, tierAsks }
 }
 
 test('pure: version floor, repo root, task lines, line split, backoff', () => {
@@ -640,6 +647,105 @@ test('a main turn that starts during the check holds the announcement: it is che
   await h.clock.advance(3_600_000)
   expect(h.attempts).toEqual([])
   expect(h.checks).toEqual(['task-1.txt', 'task-1.txt'])
+})
+
+test('pure: only an exact owner tier is mid-turn work; a failed helper or a missing line is not', () => {
+  const names = ['task-1.txt', 'task-2.txt', '/ws/deliveries/w1/task-3.txt', 'task-4.txt']
+  expect(ownerTasks(names, 'owner\nguest\nowner\n')).toEqual(['task-1.txt', '/ws/deliveries/w1/task-3.txt'])
+  expect(ownerTasks(names, '\nteam\nOwner\n owner \n')).toEqual(['task-4.txt'])
+  expect(ownerTasks(names, null)).toEqual([])
+  expect(ownerTasks(names, '')).toEqual([])
+  expect(midTurnNotice(['task-1.txt', 'task-2.txt'])).toBe('New task(s) arrived while you were working (task-watch):\nTASK_FILE: task-1.txt\nTASK_FILE: task-2.txt\n'
+    + 'Read each one. If it is quick, handle it fully now; otherwise say what you will do and when, then resume your current work.')
+})
+
+test('an owner task announced mid-turn reaches the next main tool call once, and is not submitted when the turn ends', async () => {
+  const h = setup()
+  await h.clock.advance(0)
+  // No turn runs: a tool call outside a turn carries nothing, and the task is submitted as before.
+  expect(await h.w.midTurn()).toBe(null)
+  h.w.turnStart()
+  h.children[0].out('TASK_FILE: task-1.txt\nQUEUE: 0 pending after this\n')
+  await h.clock.advance(5_000)
+  expect(await h.w.midTurn()).toBe(midTurnNotice(['task-1.txt']))
+  expect(h.tierAsks).toEqual([['/ws/deliveries/w1/task-1.txt']])
+  expect(h.checks).toEqual(['task-1.txt'])
+  // Later tool calls in the same turn carry nothing: it was named once.
+  expect(await h.w.midTurn()).toBe(null)
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(3_600_000)
+  expect(h.attempts).toEqual([])
+  expect(trailOf(h)).toContain('delivered mid-turn via tool result: task-1.txt')
+})
+
+test('a subagent tool call carries nothing: the task waits for a main tool call or the turn end', async () => {
+  const h = setup()
+  await h.clock.advance(0)
+  h.w.turnStart()
+  h.children[0].out('TASK_FILE: task-1.txt\nQUEUE: 0 pending after this\n')
+  await h.clock.advance(5_000)
+  expect(await h.w.midTurn('agent-7')).toBe(null)
+  expect(h.tierAsks).toEqual([])
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(60_000)
+  expect(h.attempts).toEqual(['TASK_FILE: task-1.txt\nQUEUE: 0 pending after this'])
+})
+
+test('an owner task already answered is not named mid-turn, nor submitted at the turn end', async () => {
+  const h = setup({ dispositions: { 'task-1.txt': 'answered' } })
+  await h.clock.advance(0)
+  h.w.turnStart()
+  h.children[0].out('TASK_FILE: task-1.txt\nQUEUE: 0 pending after this\n')
+  await h.clock.advance(5_000)
+  expect(await h.w.midTurn()).toBe(null)
+  expect(trailOf(h)).toContain('not announced: task-1.txt is answered')
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(3_600_000)
+  expect(h.attempts).toEqual([])
+})
+
+test('only owner tasks are named mid-turn; the rest are asked about once and submitted when the turn ends', async () => {
+  const h = setup({ tiers: { '/ws/deliveries/w1/task-2.txt': 'guest' } })
+  await h.clock.advance(0)
+  h.w.turnStart()
+  h.children[0].out('TASK_FILE: task-1.txt\nTASK_FILE: task-2.txt\nQUEUE: 1 pending after this\n')
+  await h.clock.advance(5_000)
+  expect(await h.w.midTurn()).toBe(midTurnNotice(['task-1.txt']))
+  expect(await h.w.midTurn()).toBe(null)
+  expect(h.tierAsks).toEqual([['/ws/deliveries/w1/task-1.txt', '/ws/deliveries/w1/task-2.txt']])
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(60_000)
+  expect(h.attempts).toEqual(['TASK_FILE: task-2.txt'])
+})
+
+test('a tier helper that fails names nothing mid-turn: every task keeps the turn-end submit', async () => {
+  const h = setup({ tierFails: true })
+  await h.clock.advance(0)
+  h.w.turnStart()
+  h.children[0].out('TASK_FILE: task-1.txt\nQUEUE: 0 pending after this\n')
+  await h.clock.advance(5_000)
+  expect(await h.w.midTurn()).toBe(null)
+  expect(h.checks).toEqual([])
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(60_000)
+  expect(h.attempts).toEqual(['TASK_FILE: task-1.txt\nQUEUE: 0 pending after this'])
+})
+
+test('the tool.call glue: the line is added to the context; a deny, no line or a throw returns the result untouched', async () => {
+  const ok = { result: 'out', text: 'out', ref: 3, context: ['earlier'] } as const
+  expect(await withTaskContext(ok, async () => 'tasks')).toEqual({ ...ok, context: ['earlier', 'tasks'] })
+  expect(await withTaskContext({ result: 'out' }, async () => 'tasks')).toEqual({ result: 'out', context: ['tasks'] })
+  expect(await withTaskContext(ok, async () => null)).toBe(ok)
+  expect(await withTaskContext(ok, async () => { throw new Error('boom') })).toBe(ok)
+  let asked = false
+  const denied = { deny: 'no' }
+  expect(await withTaskContext(denied, async () => { asked = true; return 'tasks' })).toBe(denied)
+  expect(asked).toBe(false)
 })
 
 test('a task body with instructions is never inlined: only the file name and queue count are submitted', async () => {

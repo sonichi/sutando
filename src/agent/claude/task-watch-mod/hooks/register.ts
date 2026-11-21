@@ -1,6 +1,7 @@
-// The task-watch Mod: runs the session's task watcher and starts a turn with each task it announces.
+// The task-watch Mod: runs the session's task watcher, starts a turn with each task it announces, and names owner
+// tasks that arrive mid-turn after the next tool result.
 
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, ToolCallResult } from 'claude-code'
 import { MIN_CLAUDE_VERSION } from './version'
 
 const PLUGIN = 'task-watch'
@@ -22,6 +23,19 @@ const RESEND_MAX_MS = 60_000
 const DISPOSITION_TIMEOUT_MS = 10_000
 const DISPOSITION_AT_ONCE = 4
 const DISPOSITIONS = ['pending', 'claimed', 'answered', 'archived', 'missing']
+// Mid-turn, each task's access_tier is read with the repo's own header parser: one line per path, empty when unreadable.
+const TIER_TIMEOUT_MS = 5_000
+const TIER_PY = [
+  'import sys',
+  'sys.path.insert(0, sys.argv[1])',
+  'from local_task_protocol import canonical_access_tier, parse_task_headers',
+  'for p in sys.argv[2:]:',
+  '    try:',
+  "        with open(p, encoding='utf-8', errors='replace') as f:",
+  "            print(canonical_access_tier(parse_task_headers(f.read(262144)).headers.get('access_tier')))",
+  '    except Exception:',
+  "        print('')",
+].join('\n')
 // The engine's own refusal after the person pressed Stop, as a `{ drop }` reason. Claude Code 2.1.322 words
 // it "the session was stopped and nobody has sent input since"; its types say "a Stop stands".
 const STOP_DROP_RE = /\bstop/i
@@ -98,6 +112,40 @@ export function withoutHandled(text: string, handled: ReadonlySet<string>): stri
   if (!kept.length) return null
   const others = kept.length - 1
   return kept.map((l) => (others ? `${l}\nQUEUE: ${others} pending after this` : l)).join('\n')
+}
+
+/**
+ * Which of `names` are owner tasks, from the tier helper's output (one tier per name, in order). Only an exact
+ * `owner` counts: a missing line, any other word, or a helper that failed (null) leaves the task for the idle path.
+ */
+export function ownerTasks(names: readonly string[], tiers: string | null): string[] {
+  if (tiers === null) return []
+  const lines = tiers.split('\n')
+  return names.filter((_, i) => lines[i]?.trim() === 'owner')
+}
+
+/** The line the model reads after a tool result when owner tasks arrived during its turn. */
+export function midTurnNotice(names: readonly string[]): string {
+  return [
+    'New task(s) arrived while you were working (task-watch):',
+    ...names.map((n) => `TASK_FILE: ${n}`),
+    'Read each one. If it is quick, handle it fully now; otherwise say what you will do and when, then resume your current work.',
+  ].join('\n')
+}
+
+/**
+ * A tool result with `ask`'s line added to its context. A denied call, no line, or anything thrown on the way
+ * returns `result` untouched: the Mod never fails or alters a tool call.
+ */
+export async function withTaskContext<R extends ToolCallResult>(result: R, ask: () => Promise<string | null>): Promise<R> {
+  try {
+    if (result.deny !== undefined) return result
+    const line = await ask()
+    if (!line) return result
+    return { ...result, context: [...(result.context ?? []), line] }
+  } catch {
+    return result
+  }
 }
 
 /**
@@ -199,7 +247,11 @@ export class TaskWatch {
   private trail: string | null = null
   private py: string | null = null
   private ws: string | null = null
+  private inbox: string | null = null
   private checkBroken = false
+  private midBusy = false
+  // Held tasks found not to be owner tasks: they wait for the idle path and are not asked about again mid-turn.
+  private idleOnly = new Set<string>()
   private notes: string[] = []
   private noting = false
   constructor(private host: Host, private repo: string, private submitTimeoutMs = SUBMIT_TIMEOUT_MS, private turnStartWaitMs = TURN_START_WAIT_MS) {}
@@ -320,6 +372,56 @@ export class TaskWatch {
     if (failed && !this.checkBroken) await this.host.log(`could not check ${failed} task(s) with task_disposition.py; announcing them anyway`)
     this.checkBroken = failed > 0
     return withoutHandled(text, handled)
+  }
+
+  /**
+   * The context line for a main-loop tool call while a main turn runs, or null. Held owner tasks still pending
+   * (stillPending) are taken out of the buffer and named once, so the submit at turn end does not send them
+   * again; any other task stays held for that submit. No tool call runs while a Stop stands, and a subagent's
+   * calls (`agentId`) never get one. One check at a time: a concurrent call finds nothing to do.
+   */
+  async midTurn(agentId?: string): Promise<string | null> {
+    if (agentId !== undefined || !this.turnRunning || this.paused || this.stopped || this.midBusy) return null
+    const py = this.py
+    const inbox = this.inbox
+    if (!py || !inbox) return null
+    const held = this.ann.take()
+    if (!held) return null
+    const names = taskNames(held)
+    this.idleOnly = new Set(names.filter((n) => this.idleOnly.has(n)))
+    const fresh = names.filter((n) => !this.idleOnly.has(n))
+    if (!fresh.length) {
+      this.ann.unshift(held)
+      return null
+    }
+    this.midBusy = true
+    let back: string | null = held
+    try {
+      const paths = fresh.map((n) => (n.startsWith('/') ? n : `${inbox}/${n}`))
+      const owners = ownerTasks(fresh, await this.host.run([py, '-I', '-c', TIER_PY, `${this.repo}/src`, ...paths], TIER_TIMEOUT_MS))
+      for (const n of fresh) {
+        if (owners.includes(n)) continue
+        this.idleOnly.add(n)
+        this.note(`kept for the turn's end: ${n} is not an owner task (or its tier could not be read)`)
+      }
+      if (!owners.length) return null
+      const own = new Set(owners)
+      const ownText = withoutHandled(held, new Set(names.filter((n) => !own.has(n))))
+      const pending = ownText === null ? null : await this.stillPending(ownText)
+      back = withoutHandled(held, own)
+      if (pending === null) return null
+      const sent = taskNames(pending)
+      this.note(`delivered mid-turn via tool result: ${sent.join(' ')}`)
+      return midTurnNotice(sent)
+    } finally {
+      if (back !== null) this.ann.unshift(back)
+      this.midBusy = false
+      if (this.shown && !this.ann.count()) {
+        this.shown = 0
+        this.toasted = false
+        this.host.status(undefined)
+      } else if (this.shown) this.showWaiting()
+    }
   }
 
   /** Sends what waited for the turn to end; a hook must not await it, a submit can take its whole timeout. */
@@ -526,8 +628,10 @@ export class TaskWatch {
     const raw = await this.host.run([py, `${this.repo}/src/watcher_rearm.py`, 'watch-argv', '--repo', this.repo, '--workspace', ws])
     const argv = (raw ?? '').split('\n').filter((l) => l.length > 0)
     const at = argv.indexOf('--inbox')
-    if (argv.length < 2 || at < 0 || !argv[at + 1]) return 'watcher_rearm.py named no watcher command'
-    return { argv, inbox: argv[at + 1], py }
+    const inbox = at < 0 ? undefined : argv[at + 1]
+    if (argv.length < 2 || !inbox) return 'watcher_rearm.py named no watcher command'
+    this.inbox = inbox.replace(/\/+$/, '')
+    return { argv, inbox, py }
   }
 
   /** yes, no or unknown: is a session-role watcher (ready or not) already on this inbox? */
@@ -722,6 +826,14 @@ export const register: Register = (on) => {
     if (watch) detach(watch.flush(e.agentId))
     return done
   })
+
+  // A main loop's tool call carries the owner tasks that arrived during its turn; see TaskWatch.midTurn.
+  on('tool.call', async ($, e, next) => {
+    const result = await next(e)
+    const w = watch
+    if (!w || e.agentId !== undefined) return result
+    return withTaskContext(result, () => w.midTurn(e.agentId))
+  }).catch(($, e, next) => next(e)) // A hook that fails or overruns: next replays the tool's own result, untouched.
 
   // session.stop is not hooked here: on an engine without that event (2.1.322 has none) naming it stops this
   // whole module loading. The hold starts from the `{ drop }` a refused submit answers with; see stopStands.
