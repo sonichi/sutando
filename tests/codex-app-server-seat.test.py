@@ -579,9 +579,17 @@ class StopAndTimeout(SeatCase):
         self.plan("die", "result")
         s = self.make(backoff_s=0.01)
         s.ensure_server()
-        with mock.patch.object(seat_mod.time, "sleep", side_effect=lambda _s: self.ruling("task-1")) as backoff:
+        real_sleep = time.sleep
+
+        def sleep(seconds):  # time.sleep is the one module: subprocess's wait polls through it too
+            if seconds == 0.01:
+                self.ruling("task-1")
+            else:
+                real_sleep(seconds)
+
+        with mock.patch.object(seat_mod.time, "sleep", side_effect=sleep) as backoff:
             self.assertEqual(s.step(), "stopped")
-        backoff.assert_called_once_with(0.01)
+        self.assertEqual(backoff.call_args_list.count(mock.call(0.01)), 1, backoff.call_args_list)
         self.assertEqual(len(self.sent("turn/start")), 1, "no retry turn once a Stop is open")
         self.assertEqual(self.sent("turn/interrupt"), [], "there is no turn left to interrupt")
         self.assertFalse(task_dispatch.has_ready_result(self.results, "task-1.txt"))
