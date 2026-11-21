@@ -141,6 +141,27 @@ room 'task-s_dspace~task-own.txt' 1005 owner "$OWNER"
 check "only the real owner message moved" "$(listed)" \
   'task-s_dspace~task-own.txt task-a-forged.txt task-b-notier.txt task-c-machine.txt task-cron-digest-1.txt task-d~task-other-key.txt task-d~task-unsigned.txt task-e-dir.txt'
 
+echo "what a voice session leaves when it ends is not the owner speaking: it keeps its place:"
+fresh
+room 'task-1767280000000.txt' 1001 team '@vidhu:s.space'
+cron 'task-cron-digest-1.txt' 1002
+# The header src/task-bridge.ts writes: buildVoiceTaskHeader for a live request, and what
+# submitVoiceSessionEndTask makes of it (tests/voice-session-end.test.ts pins those lines).
+voice() {  # voice <name> <HHMM> <interaction_type> <priority> <task text>
+  printf 'id: %s\ntimestamp: 2026-01-01T18:00:00.000Z\nlocal_time: 2026-01-01T10:00:00-08:00 America/Los_Angeles\nsource: voice\ninteraction_type: %s\nmedia_form: live_stream\nchannel_id: local-voice\nuser_id: voice-local\naccess_tier: owner\npriority: %s\ntask: %s\n' \
+    "${1%.txt}" "$3" "$4" "$5" > "$WS/tasks/$1"
+  touch -t "20260101$2" "$WS/tasks/$1"
+}
+voice 'task-1767290000000.txt' 1003 system_event low 'VOICE_SESSION_ENDED: the voice session s1 ended (client_disconnect).'
+room 'task-s_dspace~task-own.txt' 1005 owner "$OWNER"
+check "typed owner request first; the call-end task stays behind the earlier team task" "$(listed)" \
+  'task-s_dspace~task-own.txt task-1767280000000.txt task-1767290000000.txt task-cron-digest-1.txt'
+check "...which is where glob order had it" "$(cd "$WS/tasks" && echo *.txt)" \
+  'task-1767280000000.txt task-1767290000000.txt task-cron-digest-1.txt task-s_dspace~task-own.txt'
+voice 'task-1767299000000.txt' 1006 realtime_audio urgent 'check PR 5308'
+check "a request the owner spoke moves first, ahead of the typed one (urgent)" "$(listed)" \
+  'task-1767299000000.txt task-s_dspace~task-own.txt task-1767280000000.txt task-1767290000000.txt task-cron-digest-1.txt'
+
 echo "only the order changes: an answered owner message is still not listed:"
 fresh
 cron 'task-cron-digest-1.txt' 1001
