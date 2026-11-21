@@ -108,6 +108,25 @@ def test_fence_payload_as_written_by_the_production_writer():
         assert json.loads(fence.read_text()) == {"stripes": 64}, fence.read_text()
 
 
+def test_fence_of_the_wrong_SHAPE_refuses_like_a_wrong_count():
+    """Valid JSON that is not an object is corruption, not an absent fence.
+
+    Exercised against src/outbox.py specifically: the vendored ag2_sparrow copy
+    is byte-identical, so a test that imports only that one leaves the SHIPPED
+    module's branch unexecuted.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / ".claim-locks").mkdir()
+        outbox._fence_path(tmp).write_text("[]")
+        outbox._STRIPE_MODE.pop(outbox._root_key(tmp), None)
+        try:
+            outbox._stripe_mode(tmp)
+        except RuntimeError as e:
+            assert "not an object" in str(e), str(e)
+        else:
+            raise AssertionError("a list-shaped fence was accepted")
+
+
 def test_stripe_lock_filename_is_zero_padded_two_digits():
     """stripe-NN.lock — the width is what makes two builds agree on one inode."""
     with tempfile.TemporaryDirectory() as tmp:

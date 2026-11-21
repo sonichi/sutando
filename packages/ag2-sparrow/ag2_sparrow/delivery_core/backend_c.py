@@ -121,6 +121,7 @@ class DesignCClaimBackend:
 
     # Terminal records are JSON (archive/<key>.json), so receipts persist.
     persists_receipt_metadata = True
+    refuses_claims = False
 
     capabilities = BackendCapabilities(supports_force_release=True)
 
