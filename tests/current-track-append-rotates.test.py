@@ -36,8 +36,9 @@ def entry(tag: str, filler: int = 0, stamp: str = "") -> str:
 class AppendRotates(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.head = Path(self.tmp.name) / "current-track.md"
-        self.arch = Path(self.tmp.name) / "current-track-archive.md"
+        self.head = Path(self.tmp.name) / "hosts" / "TestHost" / "current-track.md"
+        self.head.parent.mkdir(parents=True)
+        self.arch = self.head.with_name("current-track-archive.md")
         self.addCleanup(self.tmp.cleanup)
 
     def test_append_under_budget_does_not_rotate(self):
@@ -67,6 +68,21 @@ class AppendRotates(unittest.TestCase):
         both = head + self.arch.read_text()
         for tag in ("oldest", "middle", "newest"):
             self.assertIn(tag, both, tag)
+
+    def test_append_through_alias_rotates_only_the_resolved_anchor(self):
+        self.head.write_text("preamble\n"
+                             + entry("oldest", 1500, "2026-09-01T00:00Z")
+                             + entry("middle", 1500, "2026-09-02T00:00Z"))
+        alias = self.head.parent.parent / "current-track.md"
+        alias.symlink_to(self.head)
+        r = ct.append(alias, entry("newest", 1500, "2026-09-03T00:00Z"), keep_bytes=4096)
+        self.assertIsNotNone(r)
+        self.assertTrue(alias.is_symlink())
+        self.assertIn("oldest", self.arch.read_text())
+        self.assertIn("newest", self.head.read_text())
+        self.assertTrue(ct.lock_path(self.head).exists())
+        self.assertFalse(ct.lock_path(alias).exists())
+        self.assertFalse(alias.with_name("current-track-archive.md").exists())
 
     def test_auto_rotate_false_appends_without_rotating(self):
         self.head.write_text("preamble\n"
