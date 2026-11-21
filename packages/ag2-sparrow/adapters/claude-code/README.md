@@ -191,10 +191,13 @@ with the shared owner-only refusal ("This agent only answers its owner here.")
 as its result, which the bridge delivers to that room. A task file with no
 `access_tier:` header is refused the same way as malformed (Sparrow's bridge
 writes one on every task, in `remote_gateway_bridge._write_task`); the shared
-resolver's "no tier means owner" is not relied on here. `install
---allow-collaborator` (persisted in the config, shown by `verify`, off by default)
-submits an attested collaborator's task (the team tier with the broker's
-`collaborator: true`) into the owner's session: the shared policy gives a
+resolver's "no tier means owner" is not relied on here. By default an attested
+collaborator's task (the team tier with the broker's `collaborator: true`) is
+submitted into the owner's session; `install --no-allow-collaborator` refuses it
+with the owner-only line instead (persisted in the config as
+`ALLOW_COLLABORATOR=0`, shown by `verify`; `--allow-collaborator` is still
+accepted and is the default, and a config from an older install that recorded
+the key empty or not at all serves collaborators too). The shared policy gives a
 collaborator the owner's capabilities, bounded by the non-owner note and the
 gateway's delivery guard. The session holds the owner's history, tools and
 credentials with permission prompts off. A team or guest task without
@@ -830,8 +833,9 @@ mtime delta.
   machine is the owner's path meanwhile.
 - On macOS the launchd user agent stops at logout; on Linux `install` asks
   for linger.
-- With `--allow-collaborator` an attested collaborator's text reaches a session running under
+- Unless installed with `--no-allow-collaborator`, an attested collaborator's text reaches a session running under
   `bypassPermissions` (the default mode): the only guard between that text and
   every tool, file and credential the session can reach is the
-  `NON_OWNER_NOTE` in its frame and the model honouring it. Turn it on only
-  for people you would let type into that session yourself.
+  `NON_OWNER_NOTE` in its frame, the gateway's delivery guard and the model
+  honouring them. Opt out if your collaborators are not people you would let
+  type into that session yourself.

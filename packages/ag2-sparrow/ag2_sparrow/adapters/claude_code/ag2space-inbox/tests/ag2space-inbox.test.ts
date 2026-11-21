@@ -215,7 +215,8 @@ function host(on: any, opts: { verdict?: string; env?: Record<string, string>; r
       }
       if (c && c.phase !== 'PREPARED') return out(1, { refused: `${task}: attempt ${c.attempt} is ${c.phase}` })
       // The CLI's admission (task_io.turn_policy, pinned in Python): no tier is malformed; a collaborator needs
-      // --allow-collaborator; any other non-owner needs an isolated turn this adapter never runs.
+      // the installed flag (on unless --no-allow-collaborator); any other non-owner needs an isolated turn
+      // this adapter never runs.
       const text = files[`/in/${task}.txt`] ?? ''
       const tier = text.match(/^access_tier: (\S+)/m)?.[1]
       const collab = tier === 'team' && text.includes('\ncollaborator: true\n')

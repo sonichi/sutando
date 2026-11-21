@@ -271,10 +271,12 @@ class InboxCli(ConnectBase):
         (self.inbox / (task_id + ".txt")).write_text("id: %s\n%s%stask: hi\n" % (task_id, extra, lines))
         return task_id
 
-    def test_claim_admits_the_owner_and_answers_every_other_non_owner_and_a_tierless_task_with_the_refusal(self):
+    def test_claim_admits_the_owner_and_a_collaborator_and_answers_every_other_tier_and_a_tierless_task_with_the_refusal(self):
         rc, out = self.verb("claim", self.task("task-o"))
         self.assertEqual((rc, out["admission"], out["access_tier"], out["collaborator"]), (0, "owner", "owner", False))
-        refused = {"task-t": ("team", ""), "task-g": ("guest", ""), "task-c": ("team", "collaborator: true\n"),
+        rc, out = self.verb("claim", self.task("task-c", "team", "collaborator: true\n"))
+        self.assertEqual((rc, out["admission"], out["collaborator"]), (0, "collaborator", True), "served by default")
+        refused = {"task-t": ("team", ""), "task-g": ("guest", ""),
                    "task-gc": ("guest", "collaborator: true\n"), "task-n": (None, "")}
         for t, (tier, extra) in refused.items():
             rc, out = self.verb("claim", self.task(t, tier, extra))
@@ -334,7 +336,7 @@ class InboxCli(ConnectBase):
             # The harness answers envelope from its options; the same choice is recorded in the config here.
             self.configure(**{"off": {"HMAC_KEY_FILE": "", "HMAC_STRICT": ""}, "lenient": {"HMAC_STRICT": "0"},
                               "strict": {"HMAC_STRICT": "1"}}.get(sc.get("hmac"), {}),
-                           ALLOW_COLLABORATOR="1" if sc.get("allow_collaborator") else "")
+                           ALLOW_COLLABORATOR="1" if sc.get("allow_collaborator") else "0")
             key = self.home / "task-hmac.key"
             if sc.get("key") == "present":
                 key.write_text("ab" * 32)

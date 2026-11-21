@@ -127,8 +127,11 @@ def allow_non_owner(environ=None) -> bool:
 
 
 def allow_collaborator(environ=None) -> bool:
-    """The installed --allow-collaborator, read as allow_non_owner is; unreadable reads as off."""
-    return _installed_flag(ALLOW_COLLABORATOR, environ)
+    """On unless the install recorded --no-allow-collaborator ("0"); an unreadable config reads as off."""
+    try:
+        return cm.read_config(_installed_config(environ)).get(ALLOW_COLLABORATOR, "") != "0"
+    except (OSError, ValueError):
+        return False
 
 
 def envelope(verdict: str, environ=None, key_seen=None) -> dict:
@@ -146,7 +149,7 @@ def envelope(verdict: str, environ=None, key_seen=None) -> dict:
 def admit(root, task_id, allow: bool, allow_collab: bool = False) -> "tuple[str | None, dict, str]":
     """(admission, headers, why refused) for tasks/<task_id>.txt through the shared task_io.turn_policy. A
     file with no access_tier header is malformed (Sparrow's bridge always writes one). An attested
-    collaborator is served only under --allow-collaborator. Every turn here runs in the owner's session, so
+    collaborator is served unless --no-allow-collaborator. Every turn here runs in the owner's session, so
     a restricted turn, which must be isolated and read-only, is refused whatever --allow-non-owner says."""
     path = os.path.join(root, "tasks", task_id + ".txt")
     with open(path, encoding="utf-8", errors="replace") as f:
