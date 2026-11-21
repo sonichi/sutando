@@ -50,8 +50,8 @@ The turn's final message is what Sparrow posts: as the reply in the message's th
 `commons.summon`, any other well-formed type). A final message of exactly `NO_REPLY` posts nothing.
 The text is posted with every delivery marker (attachment, redirect, skip, thread) neutralised. When a
 turn fails, a message gets a line saying why (timeout, Antigravity stopped, not signed in) with any
-partial text; an event posts nothing. No shell command is granted, so no reply command is either: the
-final message is the only answer path.
+partial text; an event posts nothing. There is no reply command: the final message is the only answer
+path.
 
 ## Tiers and permissions
 
@@ -79,9 +79,25 @@ no reply.
 
 agy's `session/request_permission` is answered by `acp_host`'s policy, default deny:
 
+- the owner's turns only (`SHELL_AND_WEB_TIERS`, owner decision 2026-11-21): any shell command and any
+  `execute`, `fetch` or `search` call, as local Claude Code and Codex agents run commands and use the web
+  for their owner;
 - the owner only: a `read` or `edit` whose every path resolves (after `..`, `~` and symlinks) under the
-  working directory; never when the working directory is the home directory or above it;
-- nothing else: no shell command, and no `execute`, `fetch`, `delete`, `move` or unclassified call.
+  working directory; never when the working directory is the home directory or above it. agy's own
+  argument names (`Path`, `Content`, `Overwrite`, `Append`, `Target`, `Replacement`, `AllowMultiple`,
+  `Edits`, `StartLine`, `EndLine`, and the older `TargetFile`, `CodeContent`, `AbsolutePath`, ...) are
+  recognised; any other key refuses the request;
+- nothing else: no command or web call for a collaborator or a guest, and no `delete`, `move` or
+  unclassified call for anyone.
+
+| Turn | Commands, fetch, search | Read or edit under the working directory | Anything else |
+| --- | --- | --- | --- |
+| owner | granted | granted | refused |
+| Team (an attested collaborator) | refused (granting it is the owner's decision) | as the turn it runs in | refused |
+| guest (isolated) | refused | refused | refused |
+
+Once commands are granted, the working-directory bound on `read` and `edit` is no longer a security
+boundary for the owner's turns: a command can read or write anything the owner's account can.
 
 For the owner's turns, agy applies its own permission rules first (an action they already allow runs
 without asking), and `--dangerously-skip-permissions` makes it run tools without asking; never add that

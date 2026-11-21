@@ -6,8 +6,8 @@ the words it says when a turn fails; everything here is the same for every ACP a
 in agent-connect's `sessions.json` shape, keyed (room, access tier; a collaborator's own per room), and
 never retired; an adapter may instead run a turn `Isolated`: its own command line, directory and
 environment, a throwaway Session and a required session mode. The permission policy is default deny: the
-owner may read or edit under the working directory, and an adapter may add its own exact grants (a
-command line, a file of its own).
+owner may read or edit under the working directory, an adapter may add its own exact grants (a command
+line, a file of its own), and an adapter may switch on, per turn, command execution and web fetch/search.
 """
 from __future__ import annotations
 
@@ -32,15 +32,24 @@ TASK_NAME_RE = re.compile(r"task-[A-Za-z0-9._~-]{1,160}")
 MESSAGE_EVENT = "room.mention"
 # Option kinds the ACP schema defines; option ids are the agent's own and change between releases.
 ALLOW_KINDS, REJECT_KINDS = ("allow_once", "allow_always"), ("reject_once", "reject_always")
-# The ACP tool kinds a read or an edit is; execute, delete, move, fetch and the rest are never granted.
+# The ACP tool kinds a read or an edit is; delete, move and the rest are never granted.
 SAFE_KINDS = frozenset({"read", "edit"})
+# The ACP tool kinds a command (execute) and a web fetch or search are: granted only on a turn whose adapter
+# switches them on (`tools=True`), and then whatever the request holds, as the agent's own shell could do it.
+TOOL_KINDS = frozenset({"execute", "fetch", "search"})
+# Antigravity CLI's (agy) own argument names, as its file tools declare them (Path, Content, Overwrite, Append;
+# Target, Replacement, AllowMultiple, Edits; StartLine, EndLine; the older TargetFile, CodeContent, AbsolutePath,
+# TargetContent, ReplacementContent, ReplacementChunks, Instruction), are listed beside the generic ones.
 PATH_KEYS = frozenset({"path", "file_path", "filePath", "abs_path", "absPath", "filename", "file", "dir",
                        "directory", "notebook_path", "notebookPath", "target_file", "target", "target_path",
-                       "old_path", "new_path", "source", "destination", "dest"})
+                       "old_path", "new_path", "source", "destination", "dest",
+                       "Path", "TargetFile", "AbsolutePath"})
 DATA_KEYS = frozenset({"content", "contents", "text", "old_string", "new_string", "oldText", "newText", "old_str",
                        "new_str", "replace_all", "replaceAll", "offset", "limit", "line", "start_line", "end_line",
-                       "encoding"})
-NESTED_KEYS = frozenset({"edits"})
+                       "encoding",
+                       "Content", "Overwrite", "Append", "Target", "Replacement", "AllowMultiple", "StartLine",
+                       "EndLine", "CodeContent", "TargetContent", "ReplacementContent", "Instruction"})
+NESTED_KEYS = frozenset({"edits", "Edits", "ReplacementChunks"})
 COMPLETED_STOPS = ("end_turn", "max_tokens", "max_turn_requests")
 
 
@@ -170,11 +179,12 @@ def under(root, raw):
 
 
 def decide_permission(params, owner, cwd, command_ok=None, own_file=None, command_refused="no command is granted",
-                      command_granted="", own_file_reason=""):
-    """(allowed, reason, result). Default deny. Granted: a command `command_ok(command)` accepts (rawInput holding
-    only that command); a read or edit of files `own_file(path)` accepts, for any tier; and, for the owner only, a
-    read or edit whose every path, nested ones included, resolves under the working directory. Every other
-    command, execute, fetch, delete or move is refused."""
+                      command_granted="", own_file_reason="", tools=False):
+    """(allowed, reason, result). Default deny. Granted: with `tools`, any command and any execute, fetch or
+    search call (the adapter decides per turn which tiers get it); a command `command_ok(command)` accepts
+    (rawInput holding only that command); a read or edit of files `own_file(path)` accepts, for any tier; and,
+    for the owner only, a read or edit whose every path, nested ones included, resolves under the working
+    directory. Every other command, execute, fetch, search, delete or move is refused."""
     tool_call = params.get("toolCall") if isinstance(params.get("toolCall"), dict) else {}
     options = params.get("options") or []
     allow, reject = _option(options, ALLOW_KINDS), _option(options, REJECT_KINDS)
@@ -182,7 +192,9 @@ def decide_permission(params, owner, cwd, command_ok=None, own_file=None, comman
     kind = tool_call.get("kind")
     raw = tool_call.get("rawInput")
     command = raw.get("command") if isinstance(raw, dict) else None
-    if command is not None or kind == "execute":
+    if tools and (kind in TOOL_KINDS or (command is not None and kind is None)):
+        verdict = (True, "commands, web fetch and search are on for this turn")
+    elif command is not None or kind == "execute":
         if command_ok is not None and isinstance(raw, dict) and set(raw) == {"command"} and command_ok(command):
             verdict = (True, command_granted)
         else:

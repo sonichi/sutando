@@ -5,13 +5,14 @@ Transport: the Agent Client Protocol over the stdio of `agy acp`, through acp_ho
 the command, `initialize`, resume the task's Session with `session/load` (else `session/new`), send one
 `session/prompt` and wait for it to stop.
 
-`<dir>/tasks/task-*.txt` in, `<dir>/results/<task>.txt` out. The turn's final message is the answer: no
-reply command is granted (no shell command is), and the agent's own text is posted
+`<dir>/tasks/task-*.txt` in, `<dir>/results/<task>.txt` out. The turn's final message is the answer (there is
+no reply command), and the agent's own text is posted
 with every delivery marker neutralised. A final message of exactly NO_REPLY posts nothing. A message whose
 turn failed gets a line saying so; an event that failed posts nothing.
 
 Sessions, the permission policy and the framing are acp_host's: the owner may read or edit under the working
-directory, no command is ever granted, and only the owner is served unless --allow-non-owner, which admits
+directory, and the owner's turns may run commands and fetch or search the web (SHELL_AND_WEB_TIERS: the owner
+only; never a collaborator or a guest). Only the owner is served unless --allow-non-owner, which admits
 attested collaborators and other non-owners alike (task_io.admission decides the tier). A non-owner turn runs
 isolated: a fresh temporary directory per task holds its working directory and its own agy home
 (`--gemini-dir`, with deny-all permission rules and no global context), its Session is new and never stored,
@@ -48,6 +49,11 @@ NOT_SIGNED_IN = ("Antigravity is not signed in on this computer (%s): run `agy` 
                  "or run `agy acp --login`")
 
 
+# The attested sender tiers whose turns may run commands and fetch or search the web, as local Claude Code and
+# Codex agents do for their owner (owner decision, 2026-11-21). Team (an attested collaborator) is left out on
+# purpose, even on the owner's turn: adding it is the owner's decision. Read from headers["access_tier"], which
+# names the sender, never from which turn runs.
+SHELL_AND_WEB_TIERS = frozenset({"owner"})
 READ_ONLY_MODES = frozenset({"plan", "read-only", "readonly", "read_only"})
 GUEST_PREFIX = "ag2-sparrow-antigravity-guest-"
 GUEST_REFUSED = "it answers non-owners only in a read-only session mode, and %s"
@@ -102,9 +108,12 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
                "acknowledgement, thanks or FYI that needs no answer, or an event whose body asks for no post), make "
                "your final message exactly %s and nothing else."
                % (" as the reply" if event in (None, MESSAGE_EVENT) else "", NO_REPLY))
-    out.append("No shell command is granted in this session. %s"
-               % ("You may read and edit files under %s." % cwd if headers.get("access_tier") == "owner"
-                  else "You may not read or change files."))
+    if headers.get("access_tier") in SHELL_AND_WEB_TIERS:
+        out.append("You may run shell commands and fetch and search the web. You may read and edit files under %s." % cwd)
+    else:
+        out.append("No shell command is granted in this session. %s"
+                   % ("You may read and edit files under %s." % cwd if headers.get("access_tier") == "owner"
+                      else "You may not read or change files."))
     return "\n\n".join(out)
 
 
@@ -121,9 +130,10 @@ class Connector:
         """(status, text, detail, turn): status is completed | cancelled | timeout | gone | failed | refused.
         The owner's turn resumes the room's Session in the working directory; any other runs `guest_turn`."""
         if owner:
-            cwd = self.args.cwd
+            cwd, tools = self.args.cwd, headers.get("access_tier") in SHELL_AND_WEB_TIERS
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
-                                       lambda params: acp_host.decide_permission(params, True, cwd), self.store,
+                                       lambda params: acp_host.decide_permission(params, True, cwd, tools=tools),
+                                       self.store,
                                        STDERR_NAME, NOT_SIGNED_IN, log)
         with guest_turn(self.args) as isolated:
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
