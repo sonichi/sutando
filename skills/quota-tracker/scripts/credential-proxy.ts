@@ -15,10 +15,18 @@
 import { createServer, type RequestOptions } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, mkdirSync, readFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { writeFileSync, mkdirSync, readFileSync, renameSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { statusPath } from '../../../src/workspace_default.js';
+import { resolveWorkspace, statusPath } from '../../../src/workspace_default.js';
+import { resolveHostLabel } from '../../../src/util_paths.js';
+import {
+	EMPTY_DM_GATE, decideModel, flushHeld, gateLine, initialState, nextFlushAt, nextState, observationFromHeaders,
+	persistedStateChanged, pushSample, requestPriority, rewriteModel, samplesFromHistoryRows, stateChanged, transitionLine,
+	type DmGate, type DmKind, type FallbackConfig, type FallbackState, type Sample,
+} from './quota-fallback-policy.js';
+import { createConfigReader, OVERRIDE_BASENAME, SKILL_MANIFEST_PATH } from './quota-fallback-config.js';
+import { limitState } from './quota-limit-state.js';
 
 const PORT = 7846;
 const UPSTREAM = 'https://api.anthropic.com';
@@ -364,6 +372,10 @@ export interface RejectionRecord {
 	// The proxy serves every seat on a host, so a rejection is attributable only
 	// by what the request carried: the model, the CLI's user-agent, the peer port.
 	model?: string;
+	// The model that actually ran, only when a fallback rewrite changed it.
+	// `model` stays the REQUESTED one: it is the seat's identity, and every
+	// consumer finds its seat by it.
+	effective_model?: string;
 	user_agent?: string;
 	peer_port?: number;
 	// This response's own rate-limit headers ({} when it carried none): the record's
@@ -388,12 +400,12 @@ function isRejectionRecord(x: unknown): x is RejectionRecord {
 }
 
 /** Append one rejection to a (possibly foreign/corrupt) prior ledger, keeping the newest `max`. */
-export interface LastRequest { model: string; at: string }
+export interface LastRequest { model: string; at: string; effective_model?: string }
 
 /** The model that last consumed quota through this proxy, carried across
  *  requests that name none (a non-messages call must not blank the tile). */
-export function withLastRequest(prev: unknown, model: string, at: string): LastRequest | undefined {
-	if (model) return { model, at };
+export function withLastRequest(prev: unknown, model: string, at: string, effectiveModel = ''): LastRequest | undefined {
+	if (model) return effectiveModel && effectiveModel !== model ? { model, at, effective_model: effectiveModel } : { model, at };
 	const old = (prev as { last_request?: unknown } | null)?.last_request;
 	if (old && typeof old === 'object' && typeof (old as LastRequest).model === 'string' && (old as LastRequest).model
 		&& typeof (old as LastRequest).at === 'string') return old as LastRequest;
@@ -406,32 +418,7 @@ export function appendRejection(prev: unknown, rej: RejectionRecord, max: number
 	return list.slice(-max);
 }
 
-export type LimitState = 'allowed' | 'overage' | 'rejected';
-
-/** Same rule as `classify_limit_state` in src/quota_availability.py; both run
- *  tests/fixtures/quota-limit-state.parity.json. `overage` is served, not paused. */
-export function limitState(record: unknown): LimitState {
-	const rec = (record && typeof record === 'object' && !Array.isArray(record)) ? record as Record<string, unknown> : {};
-	const h = (rec.headers && typeof rec.headers === 'object' && !Array.isArray(rec.headers)) ? rec.headers as Record<string, unknown> : {};
-	const prefix = 'anthropic-ratelimit-unified-';
-	const limited = h[`${prefix}status`] === 'rejected' || Object.entries(h).some(([k, v]) => {
-		if (!k.startsWith(prefix) || !k.endsWith('-status')) return false;
-		const w = k.slice(prefix.length, -'-status'.length);
-		return w !== '' && w !== 'overage' && v === 'rejected';
-	});
-	if (!limited) return 'allowed';
-	const overage = h[`${prefix}overage-status`];
-	if (overage !== 'allowed' && overage !== 'allowed_warning') return 'rejected';
-	const checked = typeof rec.last_checked === 'string' ? Date.parse(rec.last_checked) : NaN;
-	const ledger = Array.isArray(rec.recent_rejections) ? rec.recent_rejections : [];
-	for (const r of ledger) {
-		if (!r || typeof r !== 'object' || (r as RejectionRecord).status !== 429) continue;
-		const at = typeof (r as RejectionRecord).ts === 'string' ? Date.parse((r as RejectionRecord).ts) : NaN;
-		// An unordered 429 (either stamp unreadable) is not known to be older.
-		if (Number.isNaN(checked) || Number.isNaN(at) || at >= checked) return 'rejected';
-	}
-	return 'overage';
-}
+export { limitState, type LimitState } from './quota-limit-state.js';
 
 export type CredentialState = 'ok' | 'exhausted';
 
@@ -441,7 +428,8 @@ export interface ProxyDeps {
 	refreshAccessToken: (oauth: ClaudeOAuth) => Promise<ClaudeOAuth | null>;
 	request: typeof httpsRequest;
 	upstreamUrl: URL;
-	updateQuotaState: (headers: Record<string, string>, model?: string) => void;
+	/** `model` is the REQUESTED model (the seat's identity); `effectiveModel` the one sent upstream. */
+	updateQuotaState: (headers: Record<string, string>, model?: string, effectiveModel?: string) => void;
 	recordRejection: (rej: RejectionRecord) => void;
 	recordCredentialState: (state: CredentialState, detail?: string) => void;
 	now: () => number;
@@ -452,6 +440,13 @@ export interface ProxyDeps {
 	// supervised/unsupervised default without process-env/import-order
 	// tricks; production always gets the env-derived value below.
 	giveUpAfter: number;
+	// Model fallback (quota-fallback-policy.ts): config is a reader so an owner
+	// adjustment lands without a restart; state persists in quota-state.json.
+	fallbackConfig: () => FallbackConfig;
+	readFallbackState: () => FallbackState | null;
+	recordFallback: (state: FallbackState) => void;
+	notifyOwner: (line: string) => void;
+	readHistorySamples: (nowMs: number, lookbackSec: number) => Sample[];
 }
 
 export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
@@ -468,9 +463,68 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		idleTimeoutMs: UPSTREAM_IDLE_TIMEOUT_MS,
 		exitProcess: (code) => process.exit(code),
 		giveUpAfter: REFRESH_GIVE_UP_AFTER,
+		fallbackConfig: productionFallbackConfig,
+		readFallbackState,
+		recordFallback,
+		notifyOwner,
+		readHistorySamples,
 		...overrides,
 	};
 	const upstreamPort = deps.upstreamUrl.port ? Number(deps.upstreamUrl.port) : 443;
+
+	// Fallback tier state, seeded from the last persisted record so a proxy
+	// restart keeps its hysteresis; the burn-rate samples seed from the history file.
+	let fallbackState: FallbackState | null = deps.readFallbackState();
+	let samples: Sample[] = [];
+	try { samples = deps.readHistorySamples(deps.now(), deps.fallbackConfig().projection5h.lookbackSec); } catch { samples = []; }
+	let dmGate: DmGate = EMPTY_DM_GATE;
+	let flushTimer: NodeJS.Timeout | null = null;
+
+	// A held line must not wait for the next event: send it when its interval elapses.
+	function scheduleFlush(): void {
+		const intervalMs = deps.fallbackConfig().dmMinIntervalSec * 1000;
+		const due = nextFlushAt(dmGate, intervalMs);
+		if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+		if (due === null) return;
+		flushTimer = setTimeout(() => {
+			flushTimer = null;
+			const r = flushHeld(dmGate, deps.now(), deps.fallbackConfig().dmMinIntervalSec * 1000);
+			dmGate = r.gate;
+			if (r.send) { try { deps.notifyOwner(r.send); } catch { /* best effort */ } }
+			scheduleFlush();
+		}, Math.max(due - deps.now(), 0) + 50);
+		flushTimer.unref?.();
+	}
+
+	function observeQuota(quotaHeaders: Record<string, string>, httpStatus?: number): void {
+		const cfg = deps.fallbackConfig();
+		const nowMs = deps.now();
+		const obs = observationFromHeaders(quotaHeaders, httpStatus);
+		if (obs.u5 !== null) samples = pushSample(samples, { t: nowMs, u5: obs.u5, r5: obs.r5 }, cfg.projection5h.lookbackSec);
+		const prev = fallbackState;
+		const next = nextState(prev, obs, cfg, nowMs, samples);
+		const changed = stateChanged(prev, next);
+		const line = transitionLine(prev, next, cfg);
+		fallbackState = next;
+		if (changed) {
+			console.log(`${ts()} [Fallback] tier ${next.tier} (low-priority ${next.low_priority_tier}): ${next.reason}${next.runtime_switch ? ` runtime_switch→${next.runtime_switch.to}` : ''}`);
+		}
+		// Saving is NOT gated on `changed`: that only dedups the owner's DM. A
+		// same-tier handoff between windows changes which window holds the tier and
+		// when it ends, and the health check reads exactly that from disk (#5275).
+		if (persistedStateChanged(prev, next)) {
+			try { deps.recordFallback(next); } catch { /* best effort */ }
+		}
+		if (line) {
+			const switched = (next.runtime_switch?.to ?? null) !== (prev?.runtime_switch?.to ?? null);
+			const prevTier = prev?.tier ?? 1;
+			const kind: DmKind = switched ? 'runtime' : next.tier > prevTier ? 'escalation' : next.tier === 1 ? 'recovery' : 'lateral';
+			const gated = gateLine(dmGate, kind, line, nowMs, cfg.dmMinIntervalSec * 1000);
+			dmGate = gated.gate;
+			if (gated.send) { try { deps.notifyOwner(gated.send); } catch { /* best effort */ } }
+			else { console.log(`${ts()} [Fallback] DM held (${kind} within ${cfg.dmMinIntervalSec}s): ${line}`); scheduleFlush(); }
+		}
+	}
 
 	// Single-flight guard: at most one refresh in progress, so concurrent requests
 	// never race to consume/rotate the refresh token twice.
@@ -579,6 +633,23 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 			delete headers['keep-alive'];
 			delete headers['transfer-encoding'];
 
+			// Model fallback: rewrite the body's model to the active tier's model.
+			// The priority marker is ours; it never travels upstream.
+			const priority = requestPriority(req.headers);
+			delete headers['x-sutando-priority'];
+			const requested = requestModel(body);
+			const decision = decideModel(requested, fallbackState, deps.fallbackConfig(), priority);
+			let sendBody: Buffer = body;
+			// What went upstream, exactly (the rewrite keeps a variant such as `[1m]`);
+			// "" when nothing was rewritten.
+			let effective = '';
+			if (decision.rewritten) {
+				sendBody = rewriteModel(body, decision.model);
+				effective = requestModel(sendBody);
+				headers['content-length'] = sendBody.length;
+				console.log(`${ts()} [Fallback] ${requested} → ${decision.model} (tier ${fallbackState?.tier ?? 1}${priority === 'low' ? ', low priority' : ''})`);
+			}
+
 			const hasClientAuth = !!headers['authorization'] || !!headers['x-api-key'];
 
 			// Read token fresh from keychain each request, refreshing it first if it
@@ -638,7 +709,10 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 						}
 						if (Object.keys(quotaHeaders).length > 0) {
 							console.log(`${ts()} [Quota]`, quotaHeaders);
-							deps.updateQuotaState(quotaHeaders, requestModel(body));
+							// Stamp the seat by what it ASKED for; a rewrite must not move its quota
+							// or its rejections onto another seat (#5275 review).
+							deps.updateQuotaState(quotaHeaders, requested, effective || undefined);
+							observeQuota(quotaHeaders, upRes.statusCode);
 						}
 
 						if (upRes.statusCode === 401 && injectedToken && attempt === 0) {
@@ -683,12 +757,13 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 							});
 							upRes.on('end', () => {
 								const snippet = redactForLog(Buffer.concat(rejChunks).toString('utf8').slice(0, REJECTION_SNIPPET_BYTES));
-								const model = requestModel(body);
-								console.error(`${ts()} [Proxy] rejected HTTP ${code} on ${req.url} model=${model || '?'} peer=${req.socket.remotePort ?? '?'}: ${snippet}`);
+								const model = requested;
+								console.error(`${ts()} [Proxy] rejected HTTP ${code} on ${req.url} model=${model || '?'}${effective ? ` (served as ${effective})` : ''} peer=${req.socket.remotePort ?? '?'}: ${snippet}`);
 								try {
 									deps.recordRejection({
 										ts: new Date(deps.now()).toISOString(), status: code, path: req.url ?? '', snippet,
-										model, user_agent: String(req.headers['user-agent'] ?? ''), peer_port: req.socket.remotePort,
+										model, ...(effective ? { effective_model: effective } : {}),
+										user_agent: String(req.headers['user-agent'] ?? ''), peer_port: req.socket.remotePort,
 										limit_headers: quotaHeaders,
 									});
 								} catch { /* best effort */ }
@@ -726,7 +801,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 					if (!res.writableEnded) upstream.destroy();
 				});
 
-				upstream.write(body);
+				upstream.write(sendBody);
 				upstream.end();
 			};
 
@@ -771,6 +846,64 @@ function recordRejection(rej: RejectionRecord): void {
 	} catch { /* best effort */ }
 }
 
+/** The owner's per-host override; the same label the shell's fallback-config.py resolves. Resolved once. */
+let overridePath: string | null = null;
+export function productionOverridePath(): string {
+	overridePath ??= join(resolveWorkspace(), 'hosts', resolveHostLabel(), OVERRIDE_BASENAME);
+	return overridePath;
+}
+
+// Lazy: resolving the host label (scutil) and reading the override belong to a
+// running proxy, not to importing this module.
+let fallbackReader: (() => FallbackConfig) | null = null;
+function productionFallbackConfig(): FallbackConfig {
+	fallbackReader ??= createConfigReader({ manifestPath: SKILL_MANIFEST_PATH, overridePath: productionOverridePath(), env: process.env });
+	return fallbackReader();
+}
+
+// The persisted record may predate a field; each window is filled from the
+// initial shape so arithmetic on it never sees undefined.
+function readFallbackState(): FallbackState | null {
+	const f = readQuotaFile().fallback as Partial<FallbackState> | undefined;
+	if (!f || typeof f !== 'object' || typeof f.tier !== 'number' || !f.windows || typeof f.windows !== 'object') return null;
+	const init = initialState(Date.now());
+	return {
+		...init, ...f,
+		windows: {
+			'5h': { ...init.windows['5h'], ...(f.windows['5h'] ?? {}) },
+			'7d': { ...init.windows['7d'], ...(f.windows['7d'] ?? {}) },
+		},
+	} as FallbackState;
+}
+
+function recordFallback(state: FallbackState): void {
+	try {
+		const prev = readQuotaFile();
+		writeQuotaFile({ ...prev, fallback: state });
+	} catch { /* best effort */ }
+}
+
+// One owner-DM line per transition: a proactive result file, published by
+// rename so a drain never claims a half-written body.
+function notifyOwner(line: string): void {
+	const dir = join(resolveWorkspace(), 'results');
+	mkdirSync(dir, { recursive: true });
+	const name = `proactive-quota-fallback-${Date.now()}.txt`;
+	const tmp = join(dir, `.${name}.tmp`);
+	writeFileSync(tmp, `${line}\n`);
+	renameSync(tmp, join(dir, name));
+}
+
+function readHistorySamples(nowMs: number, lookbackSec: number): Sample[] {
+	try {
+		const rows = readFileSync(statusPath('quota-history.jsonl'), 'utf8').split('\n').filter(Boolean)
+			.map((l) => { try { return JSON.parse(l) as unknown; } catch { return null; } });
+		return samplesFromHistoryRows(rows, nowMs, lookbackSec);
+	} catch {
+		return [];
+	}
+}
+
 // Terminal credential health for the desktop app's banner: 'exhausted' means
 // every recovery path (keychain re-read, refresh, retry) failed and only a
 // human /login restores service. Change-only write, so per-request 'ok'
@@ -790,11 +923,11 @@ function recordCredentialState(state: CredentialState, detail = ''): void {
 
 /** The record one header-bearing response writes; it replaces the file. */
 export function quotaStateFromHeaders(
-	prev: Record<string, unknown>, headers: Record<string, string>, model: string, nowIso: string,
+	prev: Record<string, unknown>, headers: Record<string, string>, model: string, nowIso: string, effectiveModel = '',
 ): Record<string, unknown> {
 	// The header write replaces the file, so carry the rejection ledger across it.
 	const prevLedger = prev.recent_rejections;
-	const lastRequest = withLastRequest(prev, model, nowIso);
+	const lastRequest = withLastRequest(prev, model, nowIso, effectiveModel);
 	const state: Record<string, unknown> = {
 		available: true,
 		last_checked: nowIso,
@@ -808,6 +941,7 @@ export function quotaStateFromHeaders(
 			credential_state_detail: prev.credential_state_detail,
 			credential_state_at: prev.credential_state_at,
 		} : {}),
+		...(prev.fallback && typeof prev.fallback === 'object' ? { fallback: prev.fallback } : {}),
 	};
 
 	// Parse specific headers
@@ -831,9 +965,9 @@ export function quotaStateFromHeaders(
 	return state;
 }
 
-function updateQuotaState(headers: Record<string, string>, model = ''): void {
+function updateQuotaState(headers: Record<string, string>, model = '', effectiveModel = ''): void {
 	try {
-		writeQuotaFile(quotaStateFromHeaders(readQuotaFile(), headers, model, new Date().toISOString()));
+		writeQuotaFile(quotaStateFromHeaders(readQuotaFile(), headers, model, new Date().toISOString(), effectiveModel));
 	} catch { /* best effort */ }
 }
 
@@ -853,6 +987,11 @@ if (isMain) {
 		process.exit(1);
 	}
 	console.log(`${ts()} [Proxy] OAuth token loaded from keychain (will re-read on each request)`);
+	const fb = productionFallbackConfig();
+	console.log(`${ts()} [Fallback] ${fb.enabled ? 'on' : 'off'}: 5h level1 ${fb.thresholds['5h'].level1}/level2 ${fb.thresholds['5h'].level2}` +
+		` (projection ${fb.projection5h.enabled ? `on, limit ${fb.projection5h.limit}` : 'off'}), 7d level1 ${fb.thresholds['7d'].level1}/level2 ${fb.thresholds['7d'].level2}` +
+		`, hysteresis ${fb.hysteresis}, → ${fb.level2Model} / ${fb.level3Model}, low-priority ${fb.lowPriorityEnabled ? 'on' : 'off'}`);
+	console.log(`${ts()} [Fallback] owner override: ${productionOverridePath()} (per host — fallback-config.py must resolve the same SUTANDO_HOST_LABEL as this process)`);
 
 	createProxyServer().listen(PORT, '127.0.0.1', () => {
 		console.log(`${ts()} [Proxy] Credential proxy → http://localhost:${PORT}`);
