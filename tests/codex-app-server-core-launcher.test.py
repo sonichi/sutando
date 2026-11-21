@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""The Codex core launcher's SUTANDO_CODEX_APP_SERVER switch, in the fixture of
+tests/codex-core-launcher.test.py: with the flag unset the launcher issues the tmux calls it
+issued before the switch existed; with it set the core session holds the seat and no helper."""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import re
+import shutil
+import sys
+import unittest
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+LAUNCHER = "src/agent/codex/cli/start-cli.sh"
+SEAT_DIR = "src/agent/codex/app-server"
+BEGIN, END = "# >>> codex-app-server-seat", "# <<< codex-app-server-seat"
+
+_spec = importlib.util.spec_from_file_location("codex_core_launcher_fixture", REPO / "tests" / "codex-core-launcher.test.py")
+_fixture = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_fixture)
+
+# A tmux that keeps the core session's state in files: absent, a TUI, a seat, or a session
+# whose core window is gone. Every call is logged as the launcher made it.
+SEAT_TMUX = r'''#!/bin/bash
+printf '%s\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+S="$TMUX_STATE"
+case "${1:-}" in
+  new-session)
+    if [ "${4:-}" = sutando-core ]; then
+      kind=codex
+      for a in "$@"; do case "$a" in */codex-seat) kind=seat ;; esac; done
+      echo "$kind" > "$S.core"
+    fi
+    [ "${4:-}" = sutando-core-watcher ] && touch "$S.watcher"
+    exit 0 ;;
+  new-window) echo seat > "$S.core"; echo 0; exit 0 ;;
+  has-session)
+    [ "${3:-}" = =sutando-core ] && [ -f "$S.core" ] && exit 0
+    [ "${3:-}" = =sutando-core-watcher ] && [ -f "$S.watcher" ] && exit 0
+    exit 1 ;;
+  kill-session)
+    [ "${3:-}" = =sutando-core ] && rm -f "$S.core"
+    [ "${3:-}" = =sutando-core-watcher ] && rm -f "$S.watcher"
+    exit 0 ;;
+  kill-window) rm -f "$S.core"; exit 0 ;;
+  list-panes)
+    [ -f "$S.core" ] || exit 1
+    kind="$(cat "$S.core")"
+    [ "$kind" = gone ] && exit 0
+    cmd=codex
+    [ "$kind" = seat ] && cmd=/engine/src/agent/codex/app-server/codex-seat
+    for a in "$@"; do case "$a" in *'|'*) echo "@0|0|main|$cmd --arg"; exit 0 ;; esac; done
+    echo "@0 0 $cmd --arg"
+    exit 0 ;;
+  list-windows) echo 0; exit 0 ;;
+  show-environment) echo "SUTANDO_CORE_RUNTIME=codex"; exit 0 ;;
+  display-message) echo 123; exit 0 ;;
+esac
+exit 0
+'''
+
+
+def strip_seat_blocks(text: str) -> str:
+    """The launcher as it reads without the switch: every marked block removed, markers included."""
+    out, skip = [], False
+    for line in text.splitlines(keepends=True):
+        if line.strip() == BEGIN:
+            skip = True
+        elif line.strip() == END:
+            skip = False
+        elif not skip:
+            out.append(line)
+    return "".join(out)
+
+
+class Fixture:
+    """One temp engine checkout with the real launcher, built by the core-launcher suite's setUp."""
+
+    def __init__(self, case: unittest.TestCase, seat_tmux: bool = False):
+        self.h = _fixture.CodexCoreLauncherTests("run_launcher")
+        self.h.setUp()
+        case.addCleanup(self.h.tearDown)
+        self.root, self.tmp = self.h.root, Path(self.h.tmp.name)
+        dest = self.root / SEAT_DIR
+        dest.mkdir(parents=True)
+        for name in ("codex-seat", "seat-launch.sh"):
+            shutil.copy2(REPO / SEAT_DIR / name, dest / name)
+        (dest / "seat.py").symlink_to(REPO / SEAT_DIR / "seat.py")
+        self.workspace = self.root / "workspace"
+        self.state = self.tmp / "tmux-killed"
+        if seat_tmux:
+            (self.h.bin / "tmux").write_text(SEAT_TMUX)
+            (self.h.bin / "tmux").chmod(0o755)
+
+    def core(self, kind: str) -> None:
+        Path(f"{self.state}.core").write_text(kind + "\n")
+
+    def run(self, *args, **env):
+        return self.h.run_launcher(*args, env_extra=env, launcher=LAUNCHER)
+
+    def calls(self) -> str:
+        """The tmux calls, made comparable across two fixtures: the temp dir is replaced, and so is
+        the notifier version's file checksum, which covers the fixture's own paths."""
+        calls = self.h._tmux_calls().replace(str(self.tmp), "<TMP>")
+        return re.sub(r"(SUTANDO_NOTIFIER_VERSION=)\d+-\d+-", r"\1<FILES>-", calls)
+
+    def declaration(self) -> Path:
+        return self.workspace / "state" / "codex-seat" / "sutando-core" / "host.json"
+
+
+class FlagOff(unittest.TestCase):
+    """Unset, empty or 0, the launcher's tmux calls are those of the launcher without the switch."""
+
+    def compare(self, *args, **env):
+        current = Fixture(self)
+        before = Fixture(self)
+        launcher = before.root / LAUNCHER
+        stripped = strip_seat_blocks(launcher.read_text())
+        self.assertNotIn("seat", stripped.lower(), "the stripped launcher is the launcher without the switch")
+        launcher.write_text(stripped)
+        self.assertNotEqual((current.root / LAUNCHER).read_text(), stripped)
+        got, want = current.run(*args, **env), before.run(*args, **env)
+        self.assertEqual(got.returncode, 0, got.stderr)
+        self.assertEqual((got.returncode, got.stdout.replace(str(current.tmp), "<TMP>")),
+                         (want.returncode, want.stdout.replace(str(before.tmp), "<TMP>")))
+        self.assertEqual(current.calls(), before.calls())
+        self.assertFalse(current.declaration().exists())
+        return current.calls()
+
+    def test_a_fresh_launch_creates_the_same_sessions_with_the_same_commands(self):
+        calls = self.compare(SUTANDO_CORE_MODEL="gpt-test")
+        self.assertIn("new-session -d -s sutando-core ", calls)
+        self.assertIn("codex -C", calls)
+        self.assertIn("new-session -d -s sutando-core-watcher", calls)
+        self.assertNotIn("codex-seat", calls)
+
+    def test_empty_and_zero_are_off(self):
+        for value in ("", "0"):
+            with self.subTest(value=value):
+                self.assertNotIn("codex-seat", self.compare(SUTANDO_CODEX_APP_SERVER=value))
+
+    def test_a_restart_issues_the_same_calls(self):
+        calls = self.compare("--restart", TMUX_ACTIVE_RUNTIME="codex")
+        self.assertIn("kill-session -t =sutando-core-watcher", calls)
+        self.assertIn("new-session -d -s sutando-core ", calls)
+
+    def test_an_already_running_core_issues_the_same_calls(self):
+        self.assertNotIn("new-session -d -s sutando-core ", self.compare(TMUX_ACTIVE_RUNTIME="codex"))
+
+
+class FlagOn(unittest.TestCase):
+    ON = {"SUTANDO_CODEX_APP_SERVER": "1"}
+
+    def test_a_fresh_launch_starts_the_seat_in_the_core_session_and_no_helper_session(self):
+        f = Fixture(self, seat_tmux=True)
+        result = f.run(SUTANDO_CORE_MODEL="gpt-test", SUTANDO_STOP_INTERRUPT="1", **self.ON)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = f.calls()
+        launch = [ln for ln in calls.splitlines() if ln.startswith("-S <TMP>/tmux.sock new-session")]
+        self.assertEqual(len(launch), 1, calls)
+        line = launch[0]
+        self.assertIn("new-session -d -s sutando-core -e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=codex", line)
+        self.assertRegex(line, r" \S+/src/agent/codex/app-server/codex-seat --host \S+/state/codex-seat/sutando-core/host\.json ")
+        self.assertIn(f"--workspace {f.workspace} --seat sutando-core --codex {f.h.bin}/codex ".replace(str(f.tmp), "<TMP>"), line)
+        self.assertIn('-c web_search="live" -c check_for_update_on_startup=false -c project_doc_max_bytes=131072 '
+                      "--model gpt-test --watcher", line)
+        for env in ("-e SUTANDO_CODEX_APP_SERVER=1", "-e SUTANDO_STANDBY_MODE=type", "-e SUTANDO_STOP_INTERRUPT=1",
+                    "-e SUTANDO_TMUX_SESSION=sutando-core", "-e SUTANDO_CORE_MODEL=gpt-test", "-e CODEX_HOME="):
+            self.assertIn(env, line)
+        self.assertNotIn("READY", calls, "no bootstrap prompt is typed into a seat")
+        self.assertNotIn("--ask-for-approval", line)
+        for helper in ("sutando-core-watcher", "sutando-core-observer"):
+            self.assertNotIn(f"new-session -d -s {helper}", calls)
+        decl = json.loads(f.declaration().read_text())
+        self.assertEqual(decl["schema"], "ag2-sparrow.supervised-host/1")
+        self.assertEqual(decl["inbox"], str(f.workspace / "tasks"))
+        self.assertEqual(decl["results"], str(f.workspace / "results"))
+        self.assertEqual(decl["cwd"], str(f.root.resolve()))
+        self.assertNotIn("payloads", decl)
+        self.assertNotIn("stage_command", decl)
+        self.assertIn("Started sutando-core detached", result.stdout)
+
+    def test_the_watcher_child_can_be_turned_off(self):
+        f = Fixture(self, seat_tmux=True)
+        self.assertEqual(f.run(SUTANDO_SEAT_WATCHER="0", **self.ON).returncode, 0)
+        self.assertNotIn("--watcher", f.calls())
+
+    def test_a_running_seat_is_reused_and_a_notifier_left_by_a_tui_core_is_ended(self):
+        f = Fixture(self, seat_tmux=True)
+        f.core("seat")
+        Path(f"{f.state}.watcher").touch()
+        result = f.run(**self.ON)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = f.calls()
+        self.assertIn("sutando-core already running (codex).", result.stdout)
+        self.assertNotIn("new-session", calls)
+        self.assertNotIn("new-window", calls)
+        self.assertIn("kill-session -t =sutando-core-watcher", calls)
+
+    def test_a_running_tui_core_is_not_taken_over_without_a_restart(self):
+        f = Fixture(self, seat_tmux=True)
+        f.core("codex")
+        result = f.run(**self.ON)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("not the Codex app-server seat", result.stderr)
+        self.assertIn("--restart", result.stderr)
+        self.assertNotIn("new-window", f.calls())
+        self.assertNotIn("new-session", f.calls())
+
+    def test_a_session_that_lost_its_seat_window_is_healed_with_a_seat(self):
+        f = Fixture(self, seat_tmux=True)
+        f.core("gone")
+        result = f.run(**self.ON)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("healing the core window", result.stderr)
+        window = [ln for ln in f.calls().splitlines() if " new-window " in ln]
+        self.assertEqual(len(window), 1)
+        self.assertRegex(window[0], r"-e SUTANDO_CODEX_APP_SERVER=1 .* \S+/codex-seat --host ")
+        self.assertNotIn("new-session", f.calls())
+
+    def test_restart_moves_a_tui_core_onto_the_seat(self):
+        f = Fixture(self, seat_tmux=True)
+        f.core("codex")
+        result = f.run("--restart", **self.ON)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = f.calls()
+        self.assertIn("kill-window -t @0", calls)
+        self.assertLess(calls.index("kill-window -t @0"), calls.index("new-session -d -s sutando-core "))
+        self.assertRegex(calls, r"new-session -d -s sutando-core .*codex-seat --host ")
+
+    def test_restart_with_the_flag_removed_replaces_the_seat_with_the_tui_and_its_helpers(self):
+        f = Fixture(self, seat_tmux=True)
+        self.assertEqual(f.run(**self.ON).returncode, 0)
+        self.assertTrue(f.declaration().exists())
+        f.h.log.unlink()
+        result = f.run("--restart")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = f.calls()
+        self.assertIn("kill-window -t @0", calls)
+        launch = re.findall(r"new-session -d -s sutando-core .*", calls)
+        self.assertEqual(len(launch), 1)
+        self.assertIn(" codex -C ", launch[0])
+        self.assertNotIn("codex-seat", launch[0])
+        self.assertIn("new-session -d -s sutando-core-watcher", calls)
+        self.assertFalse(f.declaration().exists(), "the seat's declaration goes with it")
+
+    def test_restart_of_a_seat_with_the_flag_still_on_starts_a_fresh_seat(self):
+        f = Fixture(self, seat_tmux=True)
+        self.assertEqual(f.run(**self.ON).returncode, 0)
+        f.h.log.unlink()
+        result = f.run("--restart", **self.ON)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("kill-window -t @0", f.calls())
+        self.assertRegex(f.calls(), r"new-session -d -s sutando-core .*codex-seat --host ")
+        self.assertTrue(f.declaration().exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
