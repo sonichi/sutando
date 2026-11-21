@@ -47,9 +47,8 @@ if none is registered and an owner is known (--invite / BEE_ROOM_OWNER), the
 room is auto-registered first: a private room with just the owner invited —
 effectively a DM thread — created via gateway op:create and persisted, so the
 user never has to register by hand. `register-room --room` records a room the
-user picked instead. Gateway creds: with several connections, the one serving the
-room's server (the primary for a new room); otherwise the shared contract
-(GATEWAY_TOKEN > RELAY_TOKEN > REMOTE_TASK_TOKEN > AG2_REMOTE_TOKEN; combined url|secret ok).
+user picked instead. Gateway creds use the room's server connection when configured;
+otherwise src/relay_credentials.py resolves env, channel env, vault, then repo .env.
 
 Output is JSON on stdout (machine-readable for the calling agent); errors exit
 non-zero with a one-line reason on stderr.
@@ -94,25 +93,20 @@ def _cfg(args, attr: str, key: str) -> str:
 
 
 def _gateway_creds(room: "str | None" = None) -> "tuple[str, dict] | None":
-    """(base_url, headers) for the ag2space gateway, or None if unconfigured. With several
-    connections it is the one serving `room`'s server (no room: the primary); RuntimeError
-    when that server has none."""
+    """Gateway coordinates for the room's server (no room: primary), or None if unconfigured."""
     import connections
-    from ag2_gateway_credentials import normalize_credentials, resolve_alias_precedence
+    from ag2_gateway_credentials import normalize_credentials
+    from relay_credentials import resolve_relay_credentials
     try:
         routed = connections.room_credential(room)
     except connections.ConnectionsError as e:
         raise RuntimeError(str(e)) from None
     if routed is not None:
         url, raw = routed
+        creds = normalize_credentials(raw, explicit_url=url,
+                                      source="resolved" if raw else "none")
     else:
-        raw, _ = resolve_alias_precedence(
-            os.environ, ("GATEWAY_TOKEN", "RELAY_TOKEN", "REMOTE_TASK_TOKEN",
-                         "AG2_REMOTE_TOKEN"))
-        url, _ = resolve_alias_precedence(
-            os.environ, ("GATEWAY_URL", "RELAY_URL", "REMOTE_TASK_URL"))
-    creds = normalize_credentials(raw, explicit_url=url,
-                                  source="resolved" if raw else "none")
+        creds = resolve_relay_credentials()
     if not (creds.base_url and creds.token):
         return None
     return creds.base_url, {"Authorization": f"Bearer {creds.token}",

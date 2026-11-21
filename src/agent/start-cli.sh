@@ -16,6 +16,15 @@ unset _self_dir
 . "$REPO/src/agent/launch-path.sh"
 sutando_append_launch_path "$REPO"
 
+# Relay credentials stay with the relay lanes, which load them themselves: every
+# process the core starts inherits its environment, whichever launcher ran it.
+_sutando_withhold_relay_env() {
+  local _n
+  for _n in $(compgen -e); do
+    case "$_n" in AG2_REMOTE_*|REMOTE_TASK_*) unset "$_n" ;; esac
+  done
+}
+
 # Direct restarts (menu bar, health-check recovery, and manual --restart) do
 # not pass through startup.sh. Load the same repo configuration here so policy
 # switches such as SUTANDO_SELF_DEVELOPMENT_ENABLED survive every launch path.
@@ -47,6 +56,7 @@ if [ -f "$REPO/.env" ]; then
   unset _self_dev_was_set _self_dev_ambient
   unset _codex_reset_was_set _codex_reset_ambient
 fi
+_sutando_withhold_relay_env
 
 # `--runtime <name>` names the runtime for THIS launch (leading arg only). A
 # caller that recorded one must not get the core's config substituted for it.
@@ -172,6 +182,15 @@ if [ "$runtime" != "codex" ] && command -v tmux >/dev/null 2>&1; then
   tmux -S "$tmux_socket" kill-session -t "=${session}-observer" 2>/dev/null || true
 fi
 
+# A running tmux server hands new sessions its global environment, which may
+# predate this launch; drop relay keys there too.
+if command -v tmux >/dev/null 2>&1; then
+  for _n in $(tmux -S "$tmux_socket" show-environment -g 2>/dev/null \
+                | awk -F= '$1 ~ /^-?(AG2_REMOTE|REMOTE_TASK)_/ { sub(/^-/, "", $1); print $1 }'); do
+    tmux -S "$tmux_socket" setenv -gu "$_n" 2>/dev/null || true
+  done
+  unset _n
+fi
 # Every launch (startup.sh execs here; so does the desktop) starts the installed skills' launch
 # hooks, detached; src/launch_hooks.py names no skill, and a launch never waits on or fails for one.
 _hook_py="$(bash "$REPO/scripts/sutando-config.sh" python-bin 2>/dev/null)" && "$_hook_py" "$REPO/src/launch_hooks.py" || true

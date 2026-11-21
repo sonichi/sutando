@@ -46,12 +46,14 @@ def _exec_message_send(params: dict) -> dict:
     """Governed room send through the gateway. Fails closed: only a response
     carrying the posted message's event_id counts as delivered (the #2324
     client / #207 broker contract) — a swallowed-send 200 is a failure.
-    Credentials are daemon-resolved from the environment (REMOTE_TASK_URL /
-    REMOTE_TASK_TOKEN, same names the gateway bridge documents); the CLI can
-    never supply them."""
+    Credentials are daemon-resolved through src/relay_credentials.py (env,
+    channel env, vault, repo .env); the CLI can never supply them."""
     import urllib.request
-    url = (os.environ.get("REMOTE_TASK_URL") or "").rstrip("/")
-    token = os.environ.get("REMOTE_TASK_TOKEN") or ""
+    if str(_HERE.parent) not in sys.path:
+        sys.path.insert(0, str(_HERE.parent))
+    from relay_credentials import resolve_relay_credentials
+    creds = resolve_relay_credentials()
+    url, token = creds.base_url, creds.token
     if not url or not token:
         raise RuntimeError("gateway not configured (REMOTE_TASK_URL/REMOTE_TASK_TOKEN)")
     resource = params.get("resource") or {}
