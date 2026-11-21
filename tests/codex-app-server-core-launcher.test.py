@@ -165,7 +165,7 @@ class FlagOn(unittest.TestCase):
         line = launch[0]
         self.assertIn("new-session -d -s sutando-core -e SUTANDO_CORE_SESSION=1 -e SUTANDO_CORE_RUNTIME=codex", line)
         self.assertRegex(line, r" \S+/src/agent/codex/app-server/codex-seat --host \S+/state/codex-seat/sutando-core/host\.json ")
-        self.assertIn(f"--workspace {f.workspace} --seat sutando-core --codex {f.h.bin}/codex ".replace(str(f.tmp), "<TMP>"), line)
+        self.assertIn(f"--workspace {f.workspace.resolve()} --seat sutando-core --codex {f.h.bin}/codex ".replace(str(f.tmp), "<TMP>"), line)
         self.assertIn('-c web_search="live" -c check_for_update_on_startup=false -c project_doc_max_bytes=131072 '
                       "--model gpt-test --watcher", line)
         for env in ("-e SUTANDO_CODEX_APP_SERVER=1", "-e SUTANDO_STANDBY_MODE=type", "-e SUTANDO_STOP_INTERRUPT=1",
@@ -177,8 +177,8 @@ class FlagOn(unittest.TestCase):
             self.assertNotIn(f"new-session -d -s {helper}", calls)
         decl = json.loads(f.declaration().read_text())
         self.assertEqual(decl["schema"], "ag2-sparrow.supervised-host/1")
-        self.assertEqual(decl["inbox"], str(f.workspace / "tasks"))
-        self.assertEqual(decl["results"], str(f.workspace / "results"))
+        self.assertEqual(decl["inbox"], str(f.workspace.resolve() / "tasks"))
+        self.assertEqual(decl["results"], str(f.workspace.resolve() / "results"))
         self.assertEqual(decl["cwd"], str(f.root.resolve()))
         self.assertNotIn("payloads", decl)
         self.assertNotIn("stage_command", decl)
