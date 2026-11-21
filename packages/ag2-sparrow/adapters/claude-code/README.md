@@ -183,7 +183,7 @@ instruction:
 Reply with the ag2space_reply tool (task_id <id>); the reply is published to results/task-<id>.txt for you.
 ```
 
-**Who is served.** Admission is the shared `task_io.admission` over the attested
+**Who is served.** Admission is the shared `task_io.turn_policy` over the attested
 headers, decided by the inbox CLI's `claim` (the Mod renders its answer and
 re-implements no policy). By default only the owner is served: a team or guest
 task, collaborator or not, is never submitted to the session; `claim` answers it
@@ -192,17 +192,16 @@ as its result, which the bridge delivers to that room. A task file with no
 `access_tier:` header is refused the same way as malformed (Sparrow's bridge
 writes one on every task, in `remote_gateway_bridge._write_task`); the shared
 resolver's "no tier means owner" is not relied on here. `install
---allow-non-owner` (persisted in the config, shown by `verify`, off by default)
-submits team and guest tasks without collaborator access as data. `install
---allow-collaborator` (the same: persisted, shown by `verify`, off by default)
+--allow-collaborator` (persisted in the config, shown by `verify`, off by default)
 submits an attested collaborator's task (the team tier with the broker's
-`collaborator: true`), as the relay loop and the routine and cloud-session
-adapters gate it; `--allow-non-owner` does not imply it. Unlike those adapters,
-which answer a collaborator on an isolated read-only turn, this one submits it
-into the owner's session: the session holds the owner's history, tools and
-credentials with permission prompts off, and the note below is the only guard.
-An isolated collaborator turn here is follow-up work. Each submitted non-owner
-task carries the shared
+`collaborator: true`) into the owner's session: the shared policy gives a
+collaborator the owner's capabilities, bounded by the non-owner note and the
+gateway's delivery guard. The session holds the owner's history, tools and
+credentials with permission prompts off. A team or guest task without
+collaborator access gets a restricted turn under the shared policy, which must
+be isolated and read-only; this adapter runs no such turn, so it is refused
+whatever `--allow-non-owner` says (the flag is still persisted, and `verify`
+says it is not honoured). Each submitted non-owner task carries the shared
 `ag2_sparrow.task_io.NON_OWNER_NOTE`, the one policy text every adapter renders
 (pinned in `register.ts`; a CI test holds it byte-identical to the shared owner):
 
@@ -831,9 +830,8 @@ mtime delta.
   machine is the owner's path meanwhile.
 - On macOS the launchd user agent stops at logout; on Linux `install` asks
   for linger.
-- With `--allow-collaborator` an attested collaborator's text, and with
-  `--allow-non-owner` any other team or guest text, reaches a session running under
+- With `--allow-collaborator` an attested collaborator's text reaches a session running under
   `bypassPermissions` (the default mode): the only guard between that text and
   every tool, file and credential the session can reach is the
-  `NON_OWNER_NOTE` in its frame and the model honouring it. Turn either flag
-  on only for people and rooms you would let type into that session yourself.
+  `NON_OWNER_NOTE` in its frame and the model honouring it. Turn it on only
+  for people you would let type into that session yourself.

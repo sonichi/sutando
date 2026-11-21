@@ -245,12 +245,12 @@ class ConnectorTest(unittest.TestCase):
         self.assertEqual(self.w.methods()[:3], ["initialize", "session/load", "session/new"])
         self.assertEqual(self.w.result("task-1"), "text from the stub\n")
 
-    def test_a_collaborator_gets_its_own_session_and_no_file_operations(self):
+    def test_a_collaborator_gets_its_own_session_and_the_owners_file_operations(self):
         self.w.task("task-1", "STUB:OUTSIDE go", tier="team", collaborator=True, user="@bob:s.space")
         self.w.serve()
         recs = self.w.records()
         self.assertIn({"permission": "write", "allowed": False}, recs)
-        self.assertIn({"permission": "write-inside", "allowed": False}, recs)
+        self.assertIn({"permission": "write-inside", "allowed": True}, recs)
         self.assertIn("The sender is not your owner", self.w.prompts()[0]["text"])
         key = json.loads((self.w.root / "state" / "sessions.json").read_text())["sessions"][0]["access_tier"]
         self.assertEqual(key, "collaborator:@bob:s.space")
@@ -261,6 +261,20 @@ class ConnectorTest(unittest.TestCase):
         recs = self.w.records()
         self.assertIn({"permission": "write", "allowed": False}, recs)
         self.assertIn({"permission": "write-inside", "allowed": True}, recs)
+
+    def test_a_restricted_guest_under_allow_non_owner_gets_no_file_operations(self):
+        self.w.task("task-1", "STUB:OUTSIDE go", tier="guest")
+        self.w.serve(allow_non_owner=True)
+        recs = self.w.records()
+        self.assertIn({"permission": "write", "allowed": False}, recs)
+        self.assertIn({"permission": "write-inside", "allowed": False}, recs)
+
+    def test_the_tier_comes_from_the_shared_turn_policy(self):
+        self.w.task("task-1", "STUB:REPLY hi", tier="team", collaborator=True, user="@bob:s.space")
+        with mock.patch.object(oc, "turn_policy", wraps=task_io.turn_policy) as gate:
+            self.w.serve()
+        gate.assert_called_once()
+        self.assertEqual(gate.call_args.args[0]["access_tier"], "team")
 
     def test_a_guest_is_refused_without_waking_openclaw(self):
         self.w.task("task-1", "STUB:REPLY hi", tier="guest")

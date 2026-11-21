@@ -66,7 +66,7 @@ The owner and an attested collaborator are served; any other non-owner is refuse
 
 - any tier: this task's own reply or no-reply line, exactly, and a read or edit of this task's draft file
   (named as written, never through a link placed at its path);
-- the owner only: a `read` or `edit` whose every path, nested ones (`edits[].path`) included, resolves (after
+- the owner and an attested collaborator (the shared `task_io.turn_policy` gives both writes): a `read` or `edit` whose every path, nested ones (`edits[].path`) included, resolves (after
   `..`, `~` and symlinks) under the working directory, with no key the policy does not know; never when the
   working directory is the home directory or above it, such as `/` (install with `--cwd` set to a project
   directory);

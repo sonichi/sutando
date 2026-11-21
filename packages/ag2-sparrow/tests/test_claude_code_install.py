@@ -1217,7 +1217,7 @@ class ConnectStrict(ConnectBase):
         self.assertFalse(inbox.allow_non_owner())
         self.assertEqual(self.install_with(runner, False, "--allow-non-owner")[0], 0)
         self.assertEqual(cli.read_config(cli.config_path())["ALLOW_NON_OWNER"], "1")
-        self.assertIn("INFO non-owner tasks: submitted with the non-owner note (--allow-non-owner)", self.main("verify")[1])
+        self.assertIn("INFO non-owner tasks: refused: a restricted turn must be isolated and read-only", self.main("verify")[1])
         self.assertTrue(inbox.allow_non_owner())
         self.assertTrue(inbox.allow_non_owner({inbox.CONFIG_DIR_VAR: str(cli.config_dir())}), "the pane's config dir")
         self.assertFalse(inbox.allow_non_owner({inbox.CONFIG_DIR_VAR: str(self.home / "none")}), "unreadable reads as off")

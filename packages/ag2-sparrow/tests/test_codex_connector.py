@@ -335,7 +335,7 @@ class TierPolicyTest(unittest.TestCase):
             self.assertFalse(os.path.exists(scratch), "removed after the turn")
             self.assertIn("cwd=%s]" % os.path.abspath(d), run_owner_echo(d))
 
-    def test_a_collaborator_runs_read_only_ephemeral_with_the_note_and_no_owner_thread(self):
+    def test_a_collaborator_gets_the_owners_sandbox_cwd_and_kept_thread_with_the_note(self):
         tid = "task-1792100000003"
         with tempfile.TemporaryDirectory() as d:
             write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True))
@@ -344,9 +344,19 @@ class TierPolicyTest(unittest.TestCase):
             self.assertEqual((spy.call_args.args[1]["access_tier"], spy.call_args.args[1]["collaborator"]),
                              ("team", "true"))
             self.assertEqual(spy.call_args.args[4], cc.NON_OWNER_NOTE)
-            self.assertIn("[sandbox=read-only ephemeral=True cwd=", result(d, tid))
-            self.assertEqual(saved_threads(d), [], "no owner thread is opened or saved")
+            self.assertIn("The sender is not your owner. " + cc.NON_OWNER_NOTE, cc.wrap_untrusted(*spy.call_args.args))
+            self.assertIn("[sandbox=danger-full-access ephemeral=False cwd=%s]" % os.path.abspath(d), result(d, tid))
+            self.assertEqual(saved_threads(d), [cc.channel_key("!room:ag2.space")], "the room's kept thread")
             self.assertNotIn("[dm-only]", result(d, tid))
+
+    def test_a_collaborator_never_continues_the_owners_carried_dm_conversation(self):
+        tid = "task-1792100000005"
+        with tempfile.TemporaryDirectory() as d:
+            write_text(d, tid, gateway_mid_task(tid, "hello", tier="team", collaborator=True).replace(
+                "task_layout: mid", "channel_kind: dm\ntask_layout: mid"))
+            self.assertEqual(run_connector(d, once=1, extra=["--resume-thread", "owner-conv"]), 0)
+            self.assertNotIn("owner-conv", result(d, tid))
+            self.assertFalse((Path(d) / "state" / cc.RESUME_MARKER).exists(), "left for the owner's DM")
 
     def test_mid_layout_team_task_runs_ephemeral(self):
         tid = "task-1792100000002"
@@ -358,13 +368,13 @@ class TierPolicyTest(unittest.TestCase):
 
 
 class AdmissionGateTest(unittest.TestCase):
-    """The serve loop admits through task_io.admission: owner and attested collaborator always;
+    """The serve loop admits through task_io.turn_policy: owner and attested collaborator always;
     any other non-owner only under --allow-non-owner, else NON_OWNER_REFUSED with no thread at all."""
 
     def run_spied(self, work, once, extra=()):
         err = io.StringIO()
         with mock.patch.object(cc.Connector, "open_for", autospec=True, side_effect=cc.Connector.open_for) as opened, \
-                mock.patch.object(cc, "admission", wraps=task_io.admission) as gate, contextlib.redirect_stderr(err):
+                mock.patch.object(cc, "turn_policy", wraps=task_io.turn_policy) as gate, contextlib.redirect_stderr(err):
             self.assertEqual(run_connector(work, once=once, extra=extra), 0)
         return opened, gate, err.getvalue()
 
@@ -415,10 +425,10 @@ class AdmissionGateTest(unittest.TestCase):
             opened, _, err = self.run_spied(d, once=3)
             self.assertEqual(opened.call_count, 2)
             self.assertIn("[sandbox=read-only ephemeral=False cwd=", result(d, "task-chat-o"))
-            self.assertIn("[sandbox=read-only ephemeral=True cwd=", result(d, tid))
+            self.assertIn("[sandbox=read-only ephemeral=False cwd=%s]" % os.path.abspath(d), result(d, tid))
             self.assertEqual(result(d, "task-chat-g"), task_io.NON_OWNER_REFUSED)
             self.assertEqual([m["tier"] for m in metrics(d)], ["owner", "team"], "the refusal is no turn, so no row")
-            self.assertEqual(saved_threads(d), [cc.channel_key("local-chat")])
+            self.assertEqual(sorted(saved_threads(d)), sorted([cc.channel_key("local-chat"), cc.channel_key("!room:ag2.space")]))
             self.assertIn("turn -> task-chat-o", err)
             self.assertIn("turn -> %s" % tid, err)
             self.assertNotIn("turn -> task-chat-g", err)
@@ -578,7 +588,7 @@ class EdgePathTest(unittest.TestCase):
             args.cwd = d
             c = cc.Connector(lambda: rpc, args, note="n")
             c.handshake()
-            c.start_thread(True, False)
+            c.start_thread(task_io.OWNER_CAPABILITIES, False)
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 self.assertFalse(c.start())
@@ -747,8 +757,8 @@ class TurnCwdTest(unittest.TestCase):
             c.rpc, c.thread_id, c.scratch_cwd = Rpc(), "th", "/scratch"
             with mock.patch.object(c, "wait_turn", return_value=("completed", "ok", None)), \
                     mock.patch.object(cc.os, "getcwd", return_value="/now/here"):
-                c.run_turn("hi", None, c.turn_cwd(True))
-                c.run_turn("hi", "m", c.turn_cwd(False))
+                c.run_turn("hi", None, c.turn_cwd(task_io.OWNER_CAPABILITIES))
+                c.run_turn("hi", "m", c.turn_cwd(task_io.RESTRICTED_CAPABILITIES))
         self.assertEqual([(m, p.get("cwd"), p.get("model")) for m, p in calls],
                          [("turn/start", "/now/here", None), ("turn/start", "/scratch", "m")])
 

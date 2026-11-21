@@ -541,8 +541,9 @@ def verify(args) -> int:
     if hmac_policy.legacy_opt_out(cfg):
         print("WARN hmac mode: legacy opt-out (HMAC_STRICT recorded empty by an older install --no-hmac-strict): not "
               "strict; unsigned and unverifiable envelopes are submitted. Reinstall without --no-hmac-strict for strict")
-    print("INFO non-owner tasks: " + ("submitted with the non-owner note (--allow-non-owner)"
-                                      if cfg.get(inbox.ALLOW_NON_OWNER) == "1" else "refused (owner only)"))
+    print("INFO non-owner tasks: " + ("refused: a restricted turn must be isolated and read-only, and this adapter "
+                                      "runs every turn in the owner's session (--allow-non-owner is recorded, not "
+                                      "honoured)" if cfg.get(inbox.ALLOW_NON_OWNER) == "1" else "refused (owner only)"))
     print("INFO collaborator tasks: " + ("submitted into this session with the non-owner note (--allow-collaborator)"
                                          if cfg.get(inbox.ALLOW_COLLABORATOR) == "1" else
                                          "refused (--allow-collaborator off)"))
@@ -686,10 +687,11 @@ def session_options(p) -> None:
                     "--hmac-key-file)")
     hm.add_argument("--no-hmac-strict", action="store_true", help="with --hmac-key-file, also submit unsigned and "
                     "unverifiable envelopes")
-    p.add_argument("--allow-non-owner", action="store_true", help="submit team and guest tasks from senders "
-                   "without collaborator access (guests, and any collaborator claim the broker did not attest) with "
-                   "the non-owner note; off: they get the owner-only refusal and never reach the session. An "
-                   "attested collaborator is not covered by it: see --allow-collaborator")
+    p.add_argument("--allow-non-owner", action="store_true", help="recorded but not honoured here: senders "
+                   "without collaborator access (guests, and any collaborator claim the broker did not attest) get "
+                   "a restricted turn, which must be isolated and read-only, and this adapter only runs turns in the "
+                   "owner's session, so they always get the owner-only refusal. An attested collaborator is not "
+                   "covered by it: see --allow-collaborator")
     p.add_argument("--allow-collaborator", action="store_true", help="submit attested collaborators' (Team) tasks "
                    "into this session with the non-owner note. The session holds the owner's history, tools and "
                    "credentials with permission prompts off; the note is the only guard. Off by default, so they "
