@@ -271,10 +271,12 @@ class InboxCli(ConnectBase):
         (self.inbox / (task_id + ".txt")).write_text("id: %s\n%s%stask: hi\n" % (task_id, extra, lines))
         return task_id
 
-    def test_claim_admits_the_owner_and_answers_every_other_non_owner_and_a_tierless_task_with_the_refusal(self):
+    def test_claim_admits_the_owner_and_a_collaborator_and_answers_every_other_tier_and_a_tierless_task_with_the_refusal(self):
         rc, out = self.verb("claim", self.task("task-o"))
         self.assertEqual((rc, out["admission"], out["access_tier"], out["collaborator"]), (0, "owner", "owner", False))
-        refused = {"task-t": ("team", ""), "task-g": ("guest", ""), "task-c": ("team", "collaborator: true\n"),
+        rc, out = self.verb("claim", self.task("task-c", "team", "collaborator: true\n"))
+        self.assertEqual((rc, out["admission"], out["collaborator"]), (0, "collaborator", True), "served by default")
+        refused = {"task-t": ("team", ""), "task-g": ("guest", ""),
                    "task-gc": ("guest", "collaborator: true\n"), "task-n": (None, "")}
         for t, (tier, extra) in refused.items():
             rc, out = self.verb("claim", self.task(t, tier, extra))
@@ -284,6 +286,14 @@ class InboxCli(ConnectBase):
             rc, out = self.verb("claim", t)
             self.assertEqual((rc, "only ABSENT may be submitted" in out["refused"]), (1, True), "answered once")
         self.assertIn("malformed: no access_tier header", self.verb("claim", self.task("task-n2", None))[1]["refused"])
+
+    def test_claim_takes_its_tier_from_the_shared_turn_policy(self):
+        self.configure(ALLOW_COLLABORATOR="1")
+        with mock.patch.object(task_io, "turn_policy", wraps=task_io.turn_policy) as gate:
+            rc, out = self.verb("claim", self.task("task-c", "team", "collaborator: true\n"))
+        self.assertEqual((rc, out["admission"]), (0, "collaborator"))
+        gate.assert_called_once()
+        self.assertEqual(gate.call_args.args[1:], (False, True), "the installed flags, passed through unchanged")
 
     def resolved(self, out):
         return (out.get("resolved"), out.get("answered"), out.get("interrupted"), out.get("retry"))
@@ -326,7 +336,7 @@ class InboxCli(ConnectBase):
             # The harness answers envelope from its options; the same choice is recorded in the config here.
             self.configure(**{"off": {"HMAC_KEY_FILE": "", "HMAC_STRICT": ""}, "lenient": {"HMAC_STRICT": "0"},
                               "strict": {"HMAC_STRICT": "1"}}.get(sc.get("hmac"), {}),
-                           ALLOW_COLLABORATOR="1" if sc.get("allow_collaborator") else "")
+                           ALLOW_COLLABORATOR="1" if sc.get("allow_collaborator") else "0")
             key = self.home / "task-hmac.key"
             if sc.get("key") == "present":
                 key.write_text("ab" * 32)
@@ -905,12 +915,14 @@ class InboxCli(ConnectBase):
         self.assertEqual(detector.stuck_answers({"stuck": {"a": {"since": "x"}, "b": 3}}), {})
         self.assertEqual(detector.stuck_answers({"stuck": ["a"]}), {})
 
-    def test_with_both_flags_every_non_owner_is_claimed_with_its_admission_and_a_tierless_task_still_refused(self):
+    def test_with_both_flags_a_collaborator_is_claimed_and_a_restricted_or_tierless_task_still_refused(self):
         self.configure(ALLOW_NON_OWNER="1", ALLOW_COLLABORATOR="1")
-        for t, tier, extra, kind in (("task-t", "team", "", "non_owner"), ("task-g", "guest", "", "non_owner"),
-                                     ("task-c", "team", "collaborator: true\n", "collaborator")):
-            rc, out = self.verb("claim", self.task(t, tier, extra))
-            self.assertEqual((rc, out["admission"], out["access_tier"]), (0, kind, tier), t)
+        rc, out = self.verb("claim", self.task("task-c", "team", "collaborator: true\n"))
+        self.assertEqual((rc, out["admission"], out["access_tier"]), (0, "collaborator", "team"))
+        for t, tier in (("task-t", "team"), ("task-g", "guest")):
+            rc, out = self.verb("claim", self.task(t, tier))
+            self.assertEqual((rc, "isolated read-only turn" in out["refused"]), (1, True), t)
+            self.assertEqual((self.results / (t + ".txt")).read_text(), task_io.NON_OWNER_REFUSED, t)
         rc, out = self.verb("claim", self.task("task-n", None))
         self.assertEqual((rc, "malformed" in out["refused"]), (1, True))
         self.assertEqual(self.verb("claim", self.task("task-o"))[1]["admission"], "owner", "owner tasks unchanged")
