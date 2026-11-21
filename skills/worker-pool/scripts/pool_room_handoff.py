@@ -110,12 +110,13 @@ def _attempts_locked(ws: Path, worker: str):
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
-def record_attempt(ws: Path, worker: str, room: str, verb: str, n: int, state: str, now: float) -> None:
-    """Keep one attempt's outcome (`sent`, `no` or `open`); a locked read-modify-write, so records other
-    runs make for other rooms or verbs of the same worker survive."""
+def record_attempt(ws: Path, worker: str, room: str, verb: str, n: int, state: str, now: float,
+                   detail: "Optional[dict]" = None) -> None:
+    """Keep one attempt's outcome (`sent`, `no` or `open`), plus for `open` why it is still open; a locked
+    read-modify-write, so records other runs make for other rooms or verbs of the same worker survive."""
     with _attempts_locked(ws, worker) as path:
         data = _attempts(ws, worker)
-        data.setdefault(room, {})[verb] = {"n": n, "state": state, "at": now}
+        data.setdefault(room, {})[verb] = {"n": n, "state": state, "at": now, **(detail or {})}
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
         try:
             with os.fdopen(fd, "w") as fh:
@@ -124,6 +125,19 @@ def record_attempt(ws: Path, worker: str, room: str, verb: str, n: int, state: s
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise
+
+
+def _open_detail(env, state: str) -> dict:
+    """Why an attempt is still open, for readers that must tell an approval the owner holds from an error:
+    the approval state, the error's short code and a retry-after when the answer carries them."""
+    out = {"why": state}
+    code = pp.error_code(env)
+    if code:
+        out["code"] = code
+    after = pp.find(env, "retry_after_s")
+    if isinstance(after, (int, float)) and not isinstance(after, bool) and after >= 0:
+        out["retry_after_s"] = float(after)
+    return out
 
 
 def invite_held(as_worker, room: str) -> "Optional[bool]":
@@ -189,7 +203,7 @@ def _execute(ws: Path, actions, worker: str, agent: str, target: str, verb: str,
         outcome = "no"
     else:
         outcome = "sent" if state == "done" else "open"
-    record_attempt(ws, worker, target, verb, n, outcome, wall())
+    record_attempt(ws, worker, target, verb, n, outcome, wall(), _open_detail(env, state) if outcome == "open" else None)
     return state, env
 
 

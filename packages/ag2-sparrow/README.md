@@ -859,6 +859,15 @@ over the Agent Client Protocol, resumes that room's Session, and OpenClaw answer
 `ag2-sparrow-codex-local`'s do. See
 [`ag2_sparrow/adapters/openclaw/README.md`](ag2_sparrow/adapters/openclaw/README.md).
 
+## Antigravity agents (`ag2-sparrow[antigravity]`)
+
+`ag2-sparrow-antigravity-local` hosts Google's Antigravity CLI (`agy`) as an agent: for each task Sparrow
+queues it wakes `agy acp` over the Agent Client Protocol, resumes that room's Session (a non-owner's turn
+runs in a throwaway, read-only Session with its own agy home instead), and posts the turn's final message
+(`NO_REPLY` posts nothing). `install` refuses until agy is signed in on the machine;
+`install` and `verify` otherwise work as `ag2-sparrow-codex-local`'s do. See
+[`ag2_sparrow/adapters/antigravity/README.md`](ag2_sparrow/adapters/antigravity/README.md).
+
 ## Optional: room-event subscription (0.3.0)
 
 Off by default. With `SPARROW_EVENTS=1` the client also maintains a persistent

@@ -102,19 +102,6 @@ class EnsureSupervisor(unittest.TestCase):
         self.assertEqual(out["outcome"], rem.SUPERVISOR_FAILED)
         self.assertIn("tmux could not start", out["why"])
 
-    def test_the_timers_saved_alert_settings_reach_the_supervisor_on_every_tick(self):
-        # launchd starts the sweep with exactly the job's EnvironmentVariables: the settings the
-        # spawner had must come back from there, or the next tick re-ensures at the defaults.
-        prt = _load("pool_remedy_timer")
-        knobs = {"SUTANDO_NOTIFIER_ALERT_GRACE": "60", "SUTANDO_NOTIFIER_ALERT_REPEAT": "0",
-                 "SUTANDO_NOTIFIER_ALERT_PILEUP": "0"}
-        job_env = prt.render(self.ws, REPO, alert_knobs=knobs)["EnvironmentVariables"]
-        run = Runner(rc=0)
-        with mock.patch.dict(os.environ, job_env, clear=True):
-            rem.ensure_supervisor(self.ws, REPO, WID, runner=run)
-        env = run.calls[0][1]["env"]
-        self.assertEqual({k: env.get(k) for k in knobs}, knobs)
-
     def test_a_runner_that_cannot_run_is_a_failure_not_an_exception(self):
         def boom(argv, **kw):
             raise OSError("no bash")

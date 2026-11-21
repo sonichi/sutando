@@ -23,6 +23,11 @@ with a destination header, or a proactive result routed to the owner's channel);
 `--allow-undeliverable` publishes anyway. A skip-marked body for such a task is
 published straight into the month's `results/archive/`: the same missing bridge is
 the one that would otherwise retire it, so a live copy stays in `results/` forever.
+
+CLI exit codes: 0 published; 2 refused or misused (nothing written); 3 published, but the
+directory could not be synced afterwards (`PublishedUnconfirmed`), so the body is visible and a
+retry under a new name would duplicate it; any other nonzero (1) failed before the rename, so
+nothing was published.
 """
 from __future__ import annotations
 
@@ -31,10 +36,16 @@ import secrets
 import sys
 from pathlib import Path
 
-__all__ = ["STAGED_SUFFIX", "stage_text", "is_staged_for", "publish_staged", "publish_text",
-           "undeliverable_reason", "retired_path", "result_labels_for", "main"]
+__all__ = ["STAGED_SUFFIX", "PublishedUnconfirmed", "EXIT_PUBLISHED_UNCONFIRMED", "stage_text",
+           "is_staged_for", "publish_staged", "publish_text", "undeliverable_reason", "retired_path",
+           "result_labels_for", "main"]
 
 STAGED_SUFFIX = ".tmp"
+EXIT_PUBLISHED_UNCONFIRMED = 3
+
+
+class PublishedUnconfirmed(OSError):
+    """The rename happened, so the body is published; syncing its directory afterwards failed."""
 
 
 def stage_text(path: str | Path, text: str, mode: int = 0o666) -> Path:
@@ -76,11 +87,14 @@ def publish_staged(tmp: str | Path, path: str | Path) -> Path:
     target = Path(path)
     os.replace(tmp, target)
     if os.name != "nt":
-        dfd = os.open(target.parent, os.O_RDONLY)
         try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+            dfd = os.open(target.parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError as exc:
+            raise PublishedUnconfirmed(exc.errno, f"published {target}, but syncing its directory failed: {exc}") from exc
     _clear_delegation(target)
     return target
 
@@ -312,6 +326,14 @@ def _parse(args: list[str]):
 
 
 def main(argv: list[str]) -> int:
+    try:
+        return _main(argv)
+    except PublishedUnconfirmed as exc:
+        print(f"result_publish: {exc}", file=sys.stderr)
+        return EXIT_PUBLISHED_UNCONFIRMED
+
+
+def _main(argv: list[str]) -> int:
     parsed = _parse(argv[1:])
     if parsed is None:
         print(_USAGE, file=sys.stderr)

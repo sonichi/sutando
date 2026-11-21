@@ -6,9 +6,28 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
   `notes/first-time-tutorial.md` and deliver it one brief, voice-friendly section at a time,
   waiting for the user to try each step.
 - **s.space mode.** Right after the first-contact greeting in the owner's DM, the skill creates
-  one "Getting started" HTML page (Room Commons) in that DM, a short s.space tour with one thing
-  to try per part, and summons the owner to it. A marker under `<workspace>/state/tutorial/` keeps it to one page per room, so
+  one "Getting started" HTML page (Room Commons) in that DM, a four-topic overview with an optional step-by-step checklist, and summons the owner to it. A marker under `<workspace>/state/tutorial/` keeps it to one page per room, so
   a re-link or reinstall refreshes the page instead of adding another.
+
+## Product overview
+
+[`getting-started.html`](../skills/tutorial/assets/getting-started.html) is the bundled four-part overview.
+The same source opens by default in the DM page and works standalone in a browser. It was adapted from
+the interactive review draft. Its topic selectors are simulations: they do not connect accounts,
+change access, start calls or schedule work. Copy falls back to selecting the prompt when the
+clipboard is unavailable. Open **Try it step by step** below the overview for the per-owner ten-step tour.
+
+## Using the ten-step owner tour
+
+The labelled step navigator lets readers jump directly to a topic instead of guessing a number.
+Use Back and Next for the guided path, Show all for a reference view, and Copy for an example
+prompt. Completion is per viewer when the Commons runtime supplies a viewer identity; otherwise
+it uses browser-local storage, falling back to memory when storage is unavailable.
+
+The layout uses the s.space orange, yellow and pink gradient pairs with ink/offwhite surfaces.
+Avantt SemiBold and Haas Recast are named in the font stack, with system-font fallbacks; no
+licensed font binaries are bundled. Controls have 44-pixel minimum touch targets, the topic grid
+wraps on narrow screens, and reduced-motion and dark-mode preferences are respected.
 
 ## What the page is built from
 
@@ -71,7 +90,11 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
   run that skips, keeps an edited page or stops on the page's size uploads nothing. Every page
   variant stays under 300 KB.
 
-Last verified: 2026-10-31, against `tests/tutorial-feature-list.test.py` and
+Last verified: navigation and responsive polish, 2026-11-19 in Chromium at 1280, 390 and 320 pixels,
+including light/dark mode, Show all, step navigation, copying and completion after reload.
+Existing screenshot assets were not recaptured in that pass.
+
+Earlier publishing verification: 2026-10-31, against `tests/tutorial-feature-list.test.py` and
 `tests/tutorial-getting-started.test.py`. The screenshot upload and the HTML-surface rendering of
 `mxc://` media were verified live in a VM on 2026-10-30/31: a page published to a test account's
 DM uploaded all 13 assets and rendered in the desktop app 0.8.2, in Safari on the web, in dark
