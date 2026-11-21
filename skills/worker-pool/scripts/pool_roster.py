@@ -741,23 +741,21 @@ def recorded_model(workspace, worker_id: str) -> "str | None":
     return model if isinstance(model, str) else None
 
 
-def default_model(environ=None, warn=None) -> "str | None":
-    """The pool's default for a worker with no recorded model (manifest config, env override). An
-    override that is not a model name falls back to the manifest's, so a worker still pins one."""
-    model = skill_config.config_value(DEFAULT_MODEL_KEY, POOL_MANIFEST, environ=environ)
+def default_model(warn=None) -> "str | None":
+    """The pool's default for a worker with no recorded model: the manifest's value, never the env, since a
+    worker starts from the core, a shell or the recovery timer, whose envs differ. set-model changes one."""
+    model = skill_config.config_value(DEFAULT_MODEL_KEY, POOL_MANIFEST, environ={})
     if claude_model_name.is_valid(model):
         return model
-    shipped = skill_config.config_value(DEFAULT_MODEL_KEY, POOL_MANIFEST, environ={})
-    shipped = shipped if claude_model_name.is_valid(shipped) else None
     if warn:
-        warn(f"{DEFAULT_MODEL_KEY}={model!r} is not a Claude model name; launching with "
-             + (f"the manifest's {shipped!r}" if shipped else "no --model"))
-    return shipped
+        warn(f"{DEFAULT_MODEL_KEY}={model!r} in the worker-pool manifest is not a Claude model name; "
+             "launching with no --model")
+    return None
 
 
-def worker_model(workspace, worker_id: str, environ=None, warn=None) -> "str | None":
+def worker_model(workspace, worker_id: str, warn=None) -> "str | None":
     """The model a launch of `worker_id` passes as --model: its recorded one, else the pool default."""
-    return recorded_model(workspace, worker_id) or default_model(environ, warn)
+    return recorded_model(workspace, worker_id) or default_model(warn)
 
 
 def bind_room_if_free(workspace, room: str, target: str) -> bool:

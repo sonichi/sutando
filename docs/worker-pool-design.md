@@ -515,8 +515,9 @@ A sentinel is empty, so an assignment carries no roster `version`; the router re
 `pool_roster.set_worker_model` (`pool_manage.py set-model`) and kept across
 re-registration. Every start of a Claude worker (spawn, resume, recovery, `enable`,
 `reseat`) passes `--model`: the row's model, else the pool default
-`WORKER_POOL_DEFAULT_MODEL` (worker-pool manifest `config`, `opus`; CLI > env > manifest;
-an override that is not a model name falls back to the manifest's).
+`WORKER_POOL_DEFAULT_MODEL` (worker-pool manifest `config`, `opus`), read from the manifest
+only: a worker starts from the core, a shell or the recovery timer, whose envs differ, so an
+env value would move its model on recovery.
 A Codex worker carries none. The core and its workers share one Claude config dir, and
 a worker that passed no `--model` would run on that dir's `settings.json` model, which
 any session's `/model` rewrites. `set-model` applies a change by reseating the one

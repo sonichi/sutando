@@ -122,15 +122,20 @@ class Default(Base):
         self.assertEqual(self.plan_model(), ("opus", "opus"))
         self.assertEqual(self.plan_model(wid=None), ("opus", "opus"))
 
-    def test_the_env_overrides_the_manifest_and_a_bad_value_falls_back_to_the_manifests(self):
+    def test_the_env_never_moves_the_default_so_a_recovery_start_agrees_with_the_first(self):
+        # The recovery timer's job carries only PATH and the Stop setting; the core's session may carry more.
         os.environ[pr.DEFAULT_MODEL_KEY] = "sonnet"
-        self.assertEqual(self.plan_model(), ("sonnet", "sonnet"))
-        for bad in ("opus; rm -rf /", "sonnet[1M]"):
-            os.environ[pr.DEFAULT_MODEL_KEY] = bad
-            err = io.StringIO()
-            with redirect_stderr(err):
-                self.assertEqual(self.plan_model(), ("opus", "opus"), bad)
-            self.assertIn("not a Claude model name", err.getvalue())
+        first = self.plan_model()
+        os.environ.pop(pr.DEFAULT_MODEL_KEY)
+        self.assertEqual((first, self.plan_model()), (("opus", "opus"), ("opus", "opus")))
+
+    def test_a_manifest_default_that_is_not_a_model_name_warns(self):
+        bad = self.tmp / "manifest.json"
+        bad.write_text(json.dumps({"name": "worker-pool", "config": {pr.DEFAULT_MODEL_KEY: "sonnet[1M]"}}))
+        err = io.StringIO()
+        with mock.patch.object(pr, "POOL_MANIFEST", bad), redirect_stderr(err):
+            self.assertEqual(self.plan_model(), (None, ""))
+        self.assertIn("not a Claude model name", err.getvalue())
 
     def test_a_codex_worker_gets_no_model(self):
         self.assertEqual(self.plan_model(CODEX, runtime="codex"), (None, ""))
