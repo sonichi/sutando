@@ -168,6 +168,17 @@
    "canonical_for": "the per-agent health snapshot served at GET /health: its sources, how each source's opinion is derived and combined, reasons, and blind spots",
    "last_verified": "2026-10-06"
   },
+  "docs/incidents/2026-11-14-orphaned-busy-loops.md": {
+   "title": "Incident 2026-11-14: orphaned busy-loops starve the credential proxy and stall the core",
+   "audience": [
+    "operators",
+    "contributors",
+    "maintainers"
+   ],
+   "status": "historical",
+   "canonical_for": "post-incident record of the 2026-11-14 orphaned busy-loop outage: cause, impact, resolution, proposed prevention, high-load runbook",
+   "last_verified": "2026-11-14"
+  },
   "docs/design-credential-capability-resolver.md": {
    "title": "Credential resolution by capability, not key (G8)",
    "audience": [
