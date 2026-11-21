@@ -43,7 +43,10 @@ const REJECTION_SNIPPET_BYTES = 2048;
 // item (`Claude Code-credentials-<sha256(config-dir)[0..8]>`), while vanilla
 // Claude Code uses `Claude Code-credentials`. Prefer the scoped item so an
 // interactive `/login` in the Sutando core is the token the proxy injects, then
-// fall back to the vanilla item for older/global installs. When the chosen token
+// fall back to the vanilla item for older/global installs. The vanilla item is
+// the machine's SHARED login (plain `claude`), not necessarily the core's: when
+// the scoped item is missing, a request that carries its own Authorization keeps
+// it (see isSharedFallback). When the chosen token
 // is at/near expiry, use its refreshToken to mint a fresh one and write it back
 // to the SAME keychain item. Endpoint + client_id verified from the Claude Code
 // binary (v2.1.170 strings).
@@ -149,9 +152,12 @@ export function keychainServiceCandidates(configDir = process.env.CLAUDE_CONFIG_
 }
 
 function readKeychainSecret(service: string): string {
+	// stderr piped, not inherited: a missing item made `security` write its
+	// "could not be found" line into the proxy log on every request.
 	return execFileSync('security', ['find-generic-password', '-s', service, '-w'], {
 		encoding: 'utf-8',
 		timeout: 5000,
+		stdio: ['ignore', 'pipe', 'pipe'],
 	});
 }
 
@@ -204,6 +210,47 @@ export function selectCred(
 	return candidates[0] ?? null;
 }
 
+// Pure: did the credential come from the SHARED default item because the item
+// scoped to this proxy's CLAUDE_CONFIG_DIR is absent? That is the signature of a
+// proxy pointed at a config dir nobody signed in under (or a core that has not
+// signed in yet): the shared item is whatever plain `claude` login the machine
+// has, so it must not replace a credential the client brought itself. A scoped
+// item that is present but unusable is NOT this case — see selectCred.
+export function isSharedFallback(
+	stored: StoredClaudeOAuth | null,
+	candidates: StoredClaudeOAuth[],
+	scopedService: string | null,
+): boolean {
+	return !!stored && !!scopedService
+		&& stored.service === DEFAULT_KEYCHAIN_SERVICE
+		&& !candidates.some((c) => c.service === scopedService);
+}
+
+// Pure: the log lines for a keychain selection. Service NAMES and the config
+// dir only — never a token.
+export function describeKeychainSelection(
+	service: string | null,
+	scopedService: string | null,
+	sharedFallback: boolean,
+	configDir: string,
+): { info: string; warning: string | null } {
+	const origin = !service ? ''
+		: service === scopedService ? ` (scoped to CLAUDE_CONFIG_DIR=${configDir})`
+		: !scopedService ? ' (shared default item; no CLAUDE_CONFIG_DIR set)'
+		: ' (shared default item)';
+	return {
+		info: `keychain service selected: ${service ? `'${service}'` : 'none'}${origin}`,
+		warning: sharedFallback
+			? `WARNING: no keychain item '${scopedService}' for CLAUDE_CONFIG_DIR=${configDir} — fell back to the shared ` +
+				`'${DEFAULT_KEYCHAIN_SERVICE}' item, which is the machine's plain \`claude\` login and may be a different ` +
+				'account than the client\'s. Requests that carry their own Authorization are forwarded untouched; ' +
+				'the shared login is injected over none of them. If this proxy serves a Sutando core, its ' +
+				'CLAUDE_CONFIG_DIR must be the core\'s (reinstall: bash src/install-credential-proxy-launchd.sh), ' +
+				'or run /login in the core.'
+			: null,
+	};
+}
+
 // Atomically write the cred back to the keychain. Returns true ONLY after a
 // read-back confirms the new accessToken landed — the rotation-lockout guard:
 // if we consumed a (rotating) refresh token we MUST be sure its replacement
@@ -211,7 +258,7 @@ export function selectCred(
 function keychainAccount(service: string): string | null {
 	try {
 		const meta = execFileSync('security', ['find-generic-password', '-s', service], {
-			encoding: 'utf-8', timeout: 5000,
+			encoding: 'utf-8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
 		});
 		const m = meta.match(/"acct"<blob>="([^"]*)"/);
 		return m ? m[1] : null;
@@ -452,6 +499,11 @@ export interface ProxyDeps {
 	// supervised/unsupervised default without process-env/import-order
 	// tricks; production always gets the env-derived value below.
 	giveUpAfter: number;
+	// The keychain item scoped to this proxy's CLAUDE_CONFIG_DIR, or null when
+	// no config dir is set (then the default item is the right one, not a fallback).
+	scopedService: string | null;
+	// That config dir, for the selection log lines only.
+	configDir: string;
 }
 
 export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
@@ -468,6 +520,8 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		idleTimeoutMs: UPSTREAM_IDLE_TIMEOUT_MS,
 		exitProcess: (code) => process.exit(code),
 		giveUpAfter: REFRESH_GIVE_UP_AFTER,
+		scopedService: scopedKeychainService(process.env.CLAUDE_CONFIG_DIR),
+		configDir: (process.env.CLAUDE_CONFIG_DIR ?? '').trim(),
 		...overrides,
 	};
 	const upstreamPort = deps.upstreamUrl.port ? Number(deps.upstreamUrl.port) : 443;
@@ -513,13 +567,36 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		return refreshInFlight;
 	}
 
+	// Which keychain service is in use is logged at start and whenever it changes
+	// (never per request), with a warning while it is the shared fallback.
+	let announced: string | null = null;
+	function pick(): { stored: StoredClaudeOAuth | null; sharedFallback: boolean } {
+		const candidates = deps.readCredCandidates();
+		const stored = selectCred(candidates, deps.now(), rejectedToken);
+		const sharedFallback = isSharedFallback(stored, candidates, deps.scopedService);
+		const key = `${stored?.service ?? ''}|${sharedFallback}`;
+		if (key !== announced) {
+			announced = key;
+			const { info, warning } = describeKeychainSelection(stored?.service ?? null, deps.scopedService, sharedFallback, deps.configDir);
+			console.log(`${ts()} [Proxy] ${info}`);
+			if (warning) console.error(`${ts()} [Proxy] ${warning}`);
+		}
+		return { stored, sharedFallback };
+	}
+
 	// Re-read the keychain (every call — no cache, so /login lands within one
 	// request) and refresh first when at/near expiry or upstream-rejected.
 	// selectCred scans ALL candidate items: a fresh /login in the default item
 	// must be found even while a dead scoped item exists.
-	async function resolveCredential(): Promise<StoredClaudeOAuth | null> {
-		const stored = selectCred(deps.readCredCandidates(), deps.now(), rejectedToken);
-		if (!stored) return null;
+	async function resolveCredential(
+		hasClientAuth: boolean,
+	): Promise<{ stored: StoredClaudeOAuth | null; sharedFallback: boolean }> {
+		const picked = pick();
+		const { stored } = picked;
+		if (!stored) return picked;
+		// The shared login will not be injected over this client's credential, so
+		// leave its refresh token alone: rotating another login's token buys nothing.
+		if (picked.sharedFallback && hasClientAuth) return picked;
 		const { service, oauth: cred } = stored;
 		const nearExpiry =
 			typeof cred.expiresAt === 'number' &&
@@ -530,9 +607,10 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		if (shouldAttemptRefresh(needsRefresh, deps.now(), nextRefreshAllowedAt)) {
 			if (nearExpiry) console.log(`${ts()} [Proxy] stored token at/near expiry — attempting refresh`);
 			await runSingleFlightRefresh(service, cred);
-			return selectCred(deps.readCredCandidates(), deps.now(), rejectedToken) ?? stored;
+			const after = pick();
+			return after.stored ? after : picked;
 		}
-		return stored;
+		return picked;
 	}
 
 	// Owner's 401 state machine: reload (keychain re-read) → refresh (if the
@@ -562,7 +640,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 		return null;
 	}
 
-	return createServer((req, res) => {
+	const server = createServer((req, res) => {
 		const chunks: Buffer[] = [];
 		req.on('data', (c) => chunks.push(c));
 		req.on('end', async () => {
@@ -583,7 +661,7 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 
 			// Read token fresh from keychain each request, refreshing it first if it
 			// is at/near expiry (self-refresh covers headless nodes).
-			const stored = await resolveCredential();
+			const { stored, sharedFallback } = await resolveCredential(hasClientAuth);
 			// The token this proxy injected, if any — non-null means WE authored the
 			// request's auth and own the 401-recovery duty for it.
 			let injectedToken: string | null = null;
@@ -594,6 +672,11 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 					return;
 				}
 				console.log(`${ts()} [Proxy] no keychain credential — passing client credential through`);
+			} else if (sharedFallback && hasClientAuth) {
+				// The stored credential is the machine's shared login, not one scoped
+				// to this proxy's config dir: the client's own credential goes upstream
+				// untouched (warned once by pick(); quota headers are still recorded).
+				// injectedToken stays null, so a 401 on it is the client's to recover.
 			} else {
 				const verdict = classifyCredential(stored.oauth, deps.now(), rejectedToken);
 				if (verdict === 'ok') {
@@ -733,6 +816,9 @@ export function createProxyServer(overrides: Partial<ProxyDeps> = {}) {
 			forward(0);
 		});
 	});
+	// Name the selected service once at start, before the first request.
+	server.on('listening', () => { try { pick(); } catch { /* best effort */ } });
+	return server;
 }
 
 // Back-compat sync reader (startup probe only — does not refresh).

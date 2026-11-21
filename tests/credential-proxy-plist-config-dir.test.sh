@@ -14,15 +14,20 @@ printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/launchctl"; chmod +x "$TMP/bin/launchct
 # bundled host is the live production credential-proxy.js.
 STAGE="$TMP/repo"; mkdir -p "$STAGE/dist"
 ln -s "$REPO/src" "$STAGE/src"
-ln -s "$REPO/scripts" "$STAGE/scripts"
+# shellcheck source=lib/core-config-dir-stub.sh
+source "$REPO/tests/lib/core-config-dir-stub.sh"
+stage_core_config_scripts "$REPO" "$STAGE"
 INSTALLER="$STAGE/src/install-credential-proxy-launchd.sh"
 DEST="$TMP/home/Library/LaunchAgents/com.sutando.credential-proxy.plist"
 echo "// test artifact" > "$STAGE/dist/credential-proxy.js"
 
 # Bundled mode (SUTANDO_NODE set) so the install completes without a
-# quota-tracker skill dir present. CLAUDE_CONFIG_DIR drives claude-home-path.
-run_install() {  # $1 = config dir handed to the installer
-  env HOME="$TMP/home" PATH="$TMP/bin:$PATH" CLAUDE_CONFIG_DIR="$1" \
+# quota-tracker skill dir present. The pinned dir is the CORE's (the config
+# helper's claude-sutando-config-dir); the installer's own CLAUDE_CONFIG_DIR is a
+# decoy here and must not be what lands in the plist.
+run_install() {  # $1 = the core's config dir
+  env HOME="$TMP/home" PATH="$TMP/bin:$PATH" TEST_CORE_CONFIG_DIR="$1" \
+      CLAUDE_CONFIG_DIR="$TMP/installer-shell-home" \
       SUTANDO_NODE=/usr/bin/env bash "$INSTALLER" install 2>&1
 }
 
@@ -81,18 +86,18 @@ check $? "a config dir containing & still renders a parseable plist"
 check $? "the & path round-trips to the literal value launchd will export"
 
 # --- 3: an unresolvable config dir fails the install, it does not ship empty --
-# A stub scripts/ fails only the bare claude-home-path lookup: shipping an empty
+# A stub scripts/ fails only the claude-sutando-config-dir lookup: shipping an empty
 # value is the silent-wrong-account outcome, so the install must refuse.
 STAGE2="$TMP/repo-noconfig"; mkdir -p "$STAGE2/dist" "$STAGE2/scripts" "$STAGE2/src"
 # Per-file symlinks, not a symlinked dir: the kernel resolves `src/..` through a
 # dir symlink to the real repo, reaching the real scripts/ and skipping the stub.
-for f in install-credential-proxy-launchd.sh workspace_resolve.sh launchd; do
+for f in install-credential-proxy-launchd.sh workspace_resolve.sh claude_config_dir.sh launchd; do
   ln -s "$REPO/src/$f" "$STAGE2/src/$f"
 done
 echo "// test artifact" > "$STAGE2/dist/credential-proxy.js"
 cat > "$STAGE2/scripts/sutando-config.sh" << STUB
 #!/bin/bash
-if [ "\$1" = "claude-home-path" ] && [ \$# -eq 1 ]; then exit 0; fi
+if [ "\$1" = "claude-sutando-config-dir" ]; then exit 1; fi
 exec bash "$REPO/scripts/sutando-config.sh" "\$@"
 STUB
 chmod +x "$STAGE2/scripts/sutando-config.sh"
@@ -104,7 +109,7 @@ rc=$?
 [ "$rc" -ne 0 ]
 check $? "an unresolvable config dir fails the install"
 
-echo "$out" | grep -q "could not resolve canonical Claude config directory"
+echo "$out" | grep -q "could not resolve the core's Claude config directory"
 check $? "the refusal names the reason"
 
 [ ! -f "$DEST" ]

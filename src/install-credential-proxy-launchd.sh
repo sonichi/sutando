@@ -64,15 +64,31 @@ _load_python_helper() {
     _PY_HELPER_LOADED=1
 }
 
+# The CLAUDE_CONFIG_DIR the CORE runs with, resolved the way startup.sh and
+# start-cli.sh resolve it (src/claude_config_dir.sh -> sutando-config.sh
+# claude-sutando-config-dir). NOT claude-home-path: that reads the installer's own
+# environment and defaults to ~/.claude, so an install or is-current run from a
+# shell without the variable pinned the machine's shared login for the proxy
+# while the core signed in under its own config dir. The proxy hashes this value
+# to pick its keychain item, so it must be the core's.
+core_config_dir() {
+    local _dir _rc=0
+    # shellcheck source=claude_config_dir.sh
+    . "$REPO/src/claude_config_dir.sh" || return 1
+    # 2 = the config helper is absent and the caller supplied the dir; still the core's.
+    _dir="$(resolve_claude_config_dir "$REPO" "${0##*/}")" || _rc=$?
+    [ "$_rc" = "0" ] || [ "$_rc" = "2" ] || return 1
+    [ -n "$_dir" ] || return 1
+    printf '%s' "$_dir"
+}
+
 # Render the template to $1 with this checkout's values. ONE renderer, shared with
 # is-current, so the check can never compare fewer fields than the install writes.
 render_plist() {
     local _brew _ccd _py
     _brew="$(resolve_brew_bin)"
-    # The RESOLVED dir, not the raw var: an unset var must pin the default the install
-    # validated, not an empty string.
-    _ccd="$(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1 bash "$REPO/scripts/sutando-config.sh" claude-home-path 2>/dev/null)"
-    [ -n "$_ccd" ] || { echo "ERROR: could not resolve canonical Claude config directory" >&2; return 1; }
+    _ccd="$(core_config_dir 2>/dev/null)"
+    [ -n "$_ccd" ] || { echo "ERROR: could not resolve the core's Claude config directory" >&2; return 1; }
     _load_python_helper || return 1
     _py="$(require_python "$REPO" "render the credential-proxy launchd plist")" || return 1
     "$_py" "$REPO/src/render_plist_template.py" "$TEMPLATE" "$1" \
@@ -122,6 +138,11 @@ case "$cmd" in
             echo "ERROR: template not found: $TEMPLATE" >&2
             exit 1
         fi
+        # Baked in because launchd inherits no shell env; an empty value would
+        # install a proxy that silently reads the vanilla keychain item, and the
+        # installer's own environment may name a different login than the core's.
+        CLAUDE_CFG="$(core_config_dir)" || CLAUDE_CFG=""
+        [ -n "$CLAUDE_CFG" ] || { echo "ERROR: could not resolve the core's Claude config directory" >&2; exit 1; }
         # Validate the target the WRAPPER will actually use. In bundled mode the
         # wrapper execs dist/credential-proxy.js and never reads the TS source
         # (credential-proxy-wrapper.sh), so gating on the TS source there would
@@ -148,7 +169,8 @@ case "$cmd" in
             # so another clone's copy would write quota-state.json where nothing reads it.
             _PROXY_SCRIPT="$REPO/skills/quota-tracker/scripts/credential-proxy.ts"
             if [ ! -f "$_PROXY_SCRIPT" ]; then
-                _PROXY_SCRIPT="$(bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
+                # Under the dir the plist pins: that is the environment the wrapper resolves in.
+                _PROXY_SCRIPT="$(CLAUDE_CONFIG_DIR="$CLAUDE_CFG" bash "$REPO/scripts/sutando-config.sh" claude-home-path skills/quota-tracker/scripts/credential-proxy.ts)"
             fi
             if [ ! -f "$_PROXY_SCRIPT" ]; then
                 echo "ERROR: quota-tracker skill not found at $_PROXY_SCRIPT" >&2
@@ -157,10 +179,6 @@ case "$cmd" in
             fi
         fi
         BREW_BIN="$(resolve_brew_bin)"
-        # Baked in because launchd inherits no shell env; an empty value would
-        # install a proxy that silently reads the vanilla keychain item.
-        CLAUDE_CFG="$(SUTANDO_SUPPRESS_CCD_FALLBACK_BANNER=1 bash "$REPO/scripts/sutando-config.sh" claude-home-path 2>/dev/null)"
-        [ -n "$CLAUDE_CFG" ] || { echo "ERROR: could not resolve canonical Claude config directory" >&2; exit 1; }
         echo "Installing $LABEL"
         echo "  repo:      $REPO"
         echo "  workspace: $WORKSPACE"
