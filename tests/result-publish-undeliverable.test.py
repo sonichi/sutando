@@ -114,6 +114,10 @@ class RefuseUndeliverable(unittest.TestCase):
                 proc, target = self._publish(tid, body)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertFalse(target.exists(), "a live copy nothing would retire")
+                self.assertFalse((self.ws / "tasks" / f"{tid}.txt").exists(),
+                                 "its task file left in tasks/ reads as unanswered")
+                self.assertEqual([p.name for p in (self.ws / "tasks").glob(f"archive/*/{tid}.txt")],
+                                 [f"{tid}.txt"])
                 archived = self._archived(tid)
                 self.assertEqual([p.name for p in archived], [f"{tid}.txt"])
                 self.assertRegex(archived[0].parent.name, r"^\d{4}-\d{2}$")
@@ -128,6 +132,33 @@ class RefuseUndeliverable(unittest.TestCase):
                 self.assertEqual(task_disposition.task_disposition(self.ws, tid),
                                  task_disposition.ANSWERED)
         self.assertEqual([p.name for p in (self.ws / "results").iterdir()], ["archive"])
+
+    def test_a_retired_result_keeps_an_already_archived_task_where_it_is(self):
+        tid = "task-cron-hourly-done"
+        self._task(tid, CRON_TASK, archived=True)
+        proc, _ = self._publish(tid, "[no-send] done\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        self.assertEqual([p.name for p in (self.ws / "tasks" / "archive").iterdir()], [f"{tid}.txt"])
+
+    def test_a_task_file_that_cannot_be_archived_does_not_fail_the_publish(self):
+        tid = "task-cron-hourly-stuck"
+        self._task(tid, CRON_TASK)
+        for mod in MODULES:
+            with self.subTest(mod=mod.__name__), mock.patch.dict("os.environ", {
+                    "SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(self.ws)}), \
+                    mock.patch.object(mod._helpers()[2], "archive_file", return_value=False):
+                self.assertFalse(mod.retire_task_file(self.ws / "results" / f"{tid}.txt"))
+                self.assertTrue((self.ws / "tasks" / f"{tid}.txt").exists())
+
+    def test_a_routed_task_is_never_moved_by_retire_task_file(self):
+        tid = "task-cron-hourly-routed"
+        self._task(tid, ROUTED_TASK)
+        for mod in MODULES:
+            with self.subTest(mod=mod.__name__), mock.patch.dict("os.environ", {
+                    "SUTANDO_TEST_MODE": "1", "SUTANDO_WORKSPACE": str(self.ws)}):
+                self.assertFalse(mod.retire_task_file(self.ws / "results" / f"{tid}.txt"))
+                self.assertTrue((self.ws / "tasks" / f"{tid}.txt").exists())
 
     def test_an_occupied_archive_slot_is_not_overwritten(self):
         tid = "task-cron-hourly-twice"
