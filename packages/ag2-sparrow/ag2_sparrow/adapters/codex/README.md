@@ -155,7 +155,10 @@ threads, cwd and sandbox. The owner and an attested collaborator (Team — the b
 true` on the team tier, from the parsed headers, never the message text) are served. An attested
 collaborator gets the owner's capabilities (an owner-capability trust boundary, not isolation): the
 room's kept thread, `--cwd` and `--sandbox`, framed by the non-owner note, and never the owner's own
-conversation (`--resume-thread`, `--push`). A non-owner without collaborator access (Guest, and any
+conversation (`--resume-thread`, `--push`). A channel whose kept thread is the owner's own (carried over
+by `--resume-thread`, or bound by `--thread-id`) is recorded as such in its thread file
+(`owner-only` on the third line), and a collaborator there gets the channel's separate shared thread
+(`<key>.shared`), across restarts too. A non-owner without collaborator access (Guest, and any
 collaborator claim the broker did not attest) gets "This agent only answers its owner here." as its
 result — no thread started, no turn, the log says `refused (non-owner, --allow-non-owner not set)` —
 unless `--allow-non-owner` is passed, which gives them a restricted turn: the ephemeral read-only

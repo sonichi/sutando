@@ -13,7 +13,9 @@ capabilities. A durable turn (the owner, and an attested collaborator) runs on t
 per channel_id (state/threads/<key>) in the configured cwd and sandbox; a restricted turn (any
 other non-owner, under --allow-non-owner) runs on its own ephemeral thread, read-only, in an
 empty temp dir. Every non-owner turn carries the shared NON_OWNER_NOTE; only the owner continues
-the owner's own conversation (--resume-thread, --push). A refused turn gets NON_OWNER_REFUSED.
+the owner's own conversation (--resume-thread, --push); a collaborator in a channel whose kept thread is
+that conversation, or is bound by --thread-id, gets the channel's separate shared thread. A refused turn
+gets NON_OWNER_REFUSED.
 """
 import argparse
 import hashlib
@@ -43,6 +45,8 @@ NO_REPLY = "[no reply] Codex completed the turn without a message."
 # --held: the launcher that spawned this process holds the work root and attaches it as the consumer
 # whose liveness fences the root; the connector waits this long for that record, then refuses.
 HELD_WAIT_S = held_start.WAIT_S
+OWNER_ONLY = "owner-only"               # third line of a thread file: the owner's own conversation
+SHARED_SUFFIX = ".shared"               # a collaborator's thread in a channel whose kept thread is owner-only
 RESUME_MARKER = "resume-thread-taken"   # under state/: the --resume-thread id already carried over
 
 
@@ -69,6 +73,16 @@ def bound_thread_id(spec, channel_id):
         return None
     channel, thread = spec.split("=", 1)
     return thread if channel == (channel_id or "") else None
+
+
+def saved_thread(path):
+    """(thread id or None, whether it is the owner's own conversation) from a channel's thread file."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return None, False
+    return (lines[0].strip() or None) if lines else None, len(lines) > 2 and lines[2] == OWNER_ONLY
 
 
 class Rpc:
@@ -177,6 +191,7 @@ class Connector:
         self.thread_id = None
         self.last_thread = None   # the thread the current task ran on, for its metrics row
         self.live = {}            # channel key -> owner thread id open on the current server
+        self.owner_only_keys = set()
         self.scratch_cwd = None
         self.declined = []
 
@@ -220,27 +235,40 @@ class Connector:
         once (the marker holds the id taken, so a new id given at a reinstall is taken again)."""
         if not self.args.resume_thread or kind != "dm" or self.args.ephemeral:
             return None
+        return None if self.taken_resume() == self.args.resume_thread else self.args.resume_thread
+
+    def taken_resume(self):
+        """The --resume-thread id already carried over (a thread file written before the owner-only line has none)."""
         try:
             with open(os.path.join(self.args.state, RESUME_MARKER), encoding="utf-8") as f:
-                taken = f.readline().strip()
+                return f.readline().strip()
         except FileNotFoundError:
-            taken = ""
-        return None if taken == self.args.resume_thread else self.args.resume_thread
+            return ""
+
+    def owner_only(self, key, path, channel_id):
+        """A channel whose kept thread is the owner's own conversation: carried over, or bound by --thread-id."""
+        if key in self.owner_only_keys or bound_thread_id(self.args.thread_id, channel_id):
+            return True
+        thread, marked = saved_thread(path)
+        return marked or bool(thread and thread == self.taken_resume())
 
     def open_owner_thread(self, channel_id, kind="", caps=OWNER_CAPABILITIES):
         """The channel's durable thread: in the owner's DM (an owner turn only), the conversation carried over
-        the first time; else resume the saved id when it is still known, else start one."""
+        the first time; else resume the saved id when it is still known, else start one. A collaborator never
+        joins a thread that is the owner's own conversation; it gets the channel's shared thread instead."""
         key = channel_key(channel_id)
+        path = os.path.join(self.args.state, "threads", key)
+        if not caps.owner_dm and self.owner_only(key, path, channel_id):
+            key += SHARED_SUFFIX
+            path = os.path.join(self.args.state, "threads", key)
         carried = self.carried_thread(kind) if caps.owner_dm else None
         if key in self.live and not carried:
             self.thread_id = self.live[key]
             return
-        path = os.path.join(self.args.state, "threads", key)
-        wanted = None
-        if os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                wanted = f.readline().strip() or None
-        wanted = carried or wanted or bound_thread_id(self.args.thread_id, channel_id)
+        wanted, owner_only = saved_thread(path)
+        bound = bound_thread_id(self.args.thread_id, channel_id) if caps.owner_dm else None
+        owner_only = owner_only or bool(carried) or bool(bound and not wanted)
+        wanted = carried or wanted or bound
         if carried:
             # Taken once whatever the resume answers: a failed one is not retried on every task.
             write_atomic(os.path.join(self.args.state, RESUME_MARKER), carried + "\n")
@@ -256,7 +284,10 @@ class Connector:
         else:
             self.start_thread(caps, self.args.ephemeral)
         self.live[key] = self.thread_id
-        write_atomic(path, "%s\n%s\n" % (self.thread_id, (channel_id or "")[:80]))
+        if owner_only:
+            self.owner_only_keys.add(key)
+        write_atomic(path, "%s\n%s\n%s" % (self.thread_id, (channel_id or "")[:80],
+                                           OWNER_ONLY + "\n" if owner_only else ""))
 
     def open_for(self, headers):
         """A durable turn: the channel's kept thread. An ephemeral one: a fresh read-only thread in an

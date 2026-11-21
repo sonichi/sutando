@@ -262,12 +262,14 @@ class ConnectorTest(unittest.TestCase):
         self.assertIn({"permission": "write", "allowed": False}, recs)
         self.assertIn({"permission": "write-inside", "allowed": True}, recs)
 
-    def test_a_restricted_guest_under_allow_non_owner_gets_no_file_operations(self):
-        self.w.task("task-1", "STUB:OUTSIDE go", tier="guest")
-        self.w.serve(allow_non_owner=True)
-        recs = self.w.records()
-        self.assertIn({"permission": "write", "allowed": False}, recs)
-        self.assertIn({"permission": "write-inside", "allowed": False}, recs)
+    def test_a_restricted_turn_is_refused_under_allow_non_owner_without_waking_openclaw(self):
+        for tier in ("guest", "team"):
+            with self.subTest(tier=tier):
+                self.w.task("task-" + tier, "STUB:OUTSIDE go", tier=tier)
+                self.w.serve(allow_non_owner=True)
+                self.assertEqual(self.w.result("task-" + tier), task_io.NON_OWNER_REFUSED)
+        self.assertEqual(self.w.methods(), [], "no ACP process, working directory or Session is used")
+        self.assertFalse((self.w.root / "state" / "sessions.json").exists())
 
     def test_the_tier_comes_from_the_shared_turn_policy(self):
         self.w.task("task-1", "STUB:REPLY hi", tier="team", collaborator=True, user="@bob:s.space")
