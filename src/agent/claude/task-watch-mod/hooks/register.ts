@@ -18,8 +18,9 @@ export const SUBMIT_TIMEOUT_MS = 30_000
 /** How long after a submit resolves a main turn may take to start before the submit counts as not delivered. */
 export const TURN_START_WAIT_MS = 15_000
 const RESEND_MAX_MS = 60_000
-// The engine's own refusal after the person pressed Stop ("a Stop stands"), as a `{ drop }` reason.
-const STOP_DROP_RE = /\bstop\b/i
+// The engine's own refusal after the person pressed Stop, as a `{ drop }` reason. Claude Code 2.1.322 words
+// it "the session was stopped and nobody has sent input since"; its types say "a Stop stands".
+const STOP_DROP_RE = /\bstop/i
 // The delivery trail, under the workspace: what the watcher said, what was submitted, and how each submit ended.
 const TRAIL_FILE = 'logs/task-watch-mod.log'
 const TRAIL_LINE_MAX = 2_000
