@@ -198,6 +198,62 @@ class Outcome(_Run):
         self.assertEqual(json.loads(out.getvalue())["outcome"], "room-commons-not-installed")
 
 
+class EdgePaths(_Run):
+    def test_the_last_json_line_is_read_past_other_output(self):
+        script = self.base / "noisy.py"
+        script.write_text('print("warming up")\nprint("{not json")\nprint(\'{"action": "updated"}\')\n',
+                          encoding="utf-8")
+        self.assertEqual(tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=script)["action"], "updated")
+
+    def test_a_publish_that_raises_is_recorded(self):
+        real = tr.subprocess.run
+
+        def boom(*_a, **_k):
+            raise tr.subprocess.TimeoutExpired(cmd="publish", timeout=600)
+
+        tr.subprocess.run = boom
+        try:
+            shown = tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.fake_publish(0, {}))
+        finally:
+            tr.subprocess.run = real
+        self.assertEqual(shown["outcome"], "publish-did-not-finish")
+        self.assertIn("TimeoutExpired", shown["reason"])
+
+    def test_a_record_that_cannot_be_written_leaves_no_temp_file(self):
+        real = tr.os.replace
+
+        def refuse(*_a, **_k):
+            raise OSError("read-only")
+
+        tr.os.replace = refuse
+        try:
+            with self.assertRaises(OSError):
+                tr.run(ROOM, OWNER, SETUP_BODY, self.ws, script=self.fake_publish(0, {"action": "created"}))
+        finally:
+            tr.os.replace = real
+        self.assertEqual(list(tr.record_path(self.ws).parent.glob(".last-run.*")), [])
+
+    def test_the_cli_reads_the_body_file_and_survives_a_missing_one(self):
+        import contextlib
+        import io
+        body = self.base / "body.txt"
+        body.write_text(SETUP_BODY, encoding="utf-8")
+        real = tr._workspace
+        tr._workspace = lambda: self.ws
+        try:
+            for path, want in ((body, "message"), (self.base / "absent.txt", "none")):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    tr.main(["--room", ROOM, "--owner", OWNER, "--body-file", str(path),
+                             "--publish-script", str(self.fake_publish(0, {"action": "created"}))])
+                self.assertEqual(self.record()["roles_from"], want, path)
+        finally:
+            tr._workspace = real
+
+    def test_the_workspace_comes_from_the_shared_resolver(self):
+        import workspace_default
+        self.assertEqual(tr._workspace(), workspace_default.resolve_workspace())
+
+
 class HealthRow(_Run):
     def test_no_run_yet_is_no_row(self):
         self.assertIsNone(HC.check_tutorial_last_run(self.ws))
@@ -213,6 +269,12 @@ class HealthRow(_Run):
         row = HC.check_tutorial_last_run(self.ws)
         self.assertEqual(row["status"], "warn")
         self.assertIn("room-commons-not-installed", row["detail"])
+
+    def test_a_record_that_is_not_an_object_is_no_row(self):
+        path = tr.record_path(self.ws)
+        path.parent.mkdir(parents=True)
+        path.write_text("[1, 2]")
+        self.assertIsNone(HC.check_tutorial_last_run(self.ws))
 
     def test_the_row_is_wired_into_the_report(self):
         self.assertIn("check_tutorial_last_run()", (REPO / "src" / "health-check.py").read_text())
