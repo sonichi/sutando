@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { Announcements, TaskWatch, backoffMs, isTaskLine, repoFromPluginRoot, takeLines, versionAtLeast } from '../hooks/register'
+import { Announcements, TaskWatch, backoffMs, isTaskLine, repoFromPluginRoot, takeLines, taskNames, versionAtLeast, withoutHandled } from '../hooks/register'
 import type { On } from 'claude-code'
 import type { Child, End, Host, Piece } from '../hooks/register'
 import { MIN_CLAUDE_VERSION } from '../hooks/version'
@@ -67,7 +67,9 @@ function fakeChild() {
 // The fake engine starts a main turn with each prompt that enters and ends it at once, as an idle session does.
 // silent: it resolves the submit and starts no turn (what Claude Code does after an interrupt).
 // dropSubmits: that many submits resolve as refused (`{ drop }`), the engine's own "did not enter", for dropReason.
-function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: number[]; silent?: boolean; dropSubmits?: number; dropReason?: string } = {}) {
+// dispositions: what task_disposition.py prints for a task name (default `pending`); null is a run that fails.
+// The test changes the returned `dispositions` as tasks get answered.
+function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: number[]; silent?: boolean; dropSubmits?: number; dropReason?: string; dispositions?: Record<string, string | null> } = {}) {
   const clock = fakeClock()
   const submitted: string[] = []
   const attempts: string[] = []
@@ -82,6 +84,8 @@ function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: n
   const runs: string[][] = []
   const children: ReturnType<typeof fakeChild>[] = []
   const held = [...(opts.held ?? [])]
+  const dispositions: Record<string, string | null> = { ...(opts.dispositions ?? {}) }
+  const checks: string[] = []
   let rejects = opts.rejectSubmits ?? 0
   const host: Host = {
     run: async (argv) => {
@@ -90,6 +94,12 @@ function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: n
       if (argv[2] === 'workspace') return '/ws\n'
       if (argv[2] === 'watch-argv') return WATCH_ARGV.join('\n') + '\n'
       if (argv[2] === 'role-present') return `${held.length ? held.shift() : 'no'}\n`
+      if (argv[1] === '/repo/src/task_disposition.py') {
+        const name = argv[argv.length - 1]
+        checks.push(name)
+        const word = name in dispositions ? dispositions[name] : 'pending'
+        return word === null ? null : `${word}\n`
+      }
       return null
     },
     spawn: (argv, cwd) => {
@@ -120,7 +130,7 @@ function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: n
   }
   const w: TaskWatch = new TaskWatch(host, REPO)
   const done = w.run()
-  return { w, done, clock, engine, submitted, attempts, logs, trail, statuses, toasts, spawns, runs, children }
+  return { w, done, clock, engine, submitted, attempts, logs, trail, statuses, toasts, spawns, runs, children, dispositions, checks }
 }
 
 test('pure: version floor, repo root, task lines, line split, backoff', () => {
@@ -141,6 +151,13 @@ test('pure: version floor, repo root, task lines, line split, backoff', () => {
   expect(backoffMs(1)).toBe(5_000)
   expect(backoffMs(2)).toBe(10_000)
   expect(backoffMs(20)).toBe(300_000)
+  const batch = 'TASK_FILE: task-1.txt\nQUEUE: 2 pending after this\nTASK_FILE: /in/task-2.txt\nTASK_FILE: task-3.txt\nQUEUE: 1 pending after this'
+  expect(taskNames(`${batch}\nTASK_FILE: task-1.txt`)).toEqual(['task-1.txt', '/in/task-2.txt', 'task-3.txt'])
+  expect(withoutHandled(batch, new Set())).toBe(batch)
+  expect(withoutHandled(batch, new Set(['task-9.txt']))).toBe(batch)
+  expect(withoutHandled(batch, new Set(['/in/task-2.txt']))).toBe('TASK_FILE: task-1.txt\nQUEUE: 1 pending after this\nTASK_FILE: task-3.txt\nQUEUE: 1 pending after this')
+  expect(withoutHandled(batch, new Set(['task-1.txt', '/in/task-2.txt']))).toBe('TASK_FILE: task-3.txt')
+  expect(withoutHandled(batch, new Set(['task-1.txt', '/in/task-2.txt', 'task-3.txt']))).toBe(null)
 })
 
 test('announcements: a QUEUE line joins its TASK_FILE; nothing else is ever sent', () => {
@@ -466,6 +483,165 @@ test('a Stop that lands while a submit waits for its turn holds the text instead
   expect(h.attempts).toEqual([first, first])
 })
 
+const trailOf = (h: { trail: string[] }) => h.trail.map((l) => l.replace('/ws/logs/task-watch-mod.log: ', ''))
+
+test('a task announced mid-turn and answered before the turn ends is not submitted when it ends', async () => {
+  const h = setup()
+  await h.clock.advance(0)
+  h.w.turnStart()
+  h.children[0].out('TASK_FILE: task-1.txt\nQUEUE: 0 pending after this\n')
+  await h.clock.advance(60_000)
+  // Nothing is asked while the turn runs: the task is still pending then.
+  expect(h.checks).toEqual([])
+  // The Stop hook handed it to the model, which answered it.
+  h.dispositions['task-1.txt'] = 'answered'
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(3_600_000)
+  expect(h.attempts).toEqual([])
+  expect(h.checks).toEqual(['task-1.txt'])
+  expect(h.statuses).toEqual([])
+  expect(trailOf(h).slice(-2)).toEqual(['not announced: task-1.txt is answered', 'nothing left to announce: every held task was already handled; no submit'])
+})
+
+test('a task announced mid-turn and still pending when the turn ends is submitted, unchanged', async () => {
+  const h = setup()
+  const first = 'TASK_FILE: task-1.txt\nQUEUE: 2 pending after this'
+  await h.clock.advance(0)
+  h.w.turnStart()
+  h.children[0].out(`${first}\n`)
+  await h.clock.advance(60_000)
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(3_600_000)
+  expect(h.checks).toEqual(['task-1.txt'])
+  expect(h.attempts).toEqual([first])
+  expect(h.submitted).toEqual([first])
+})
+
+test('a mixed batch: only the tasks still pending are submitted, with the QUEUE lines counted again', async () => {
+  const h = setup()
+  await h.clock.advance(0)
+  h.w.turnStart()
+  h.children[0].out('TASK_FILE: task-1.txt\nTASK_FILE: task-2.txt\nQUEUE: 1 pending after this\nTASK_FILE: /ws/deliveries/w1/task-3.txt\nQUEUE: 2 pending after this\n'
+    + 'TASK_FILE: task-4.txt\nQUEUE: 3 pending after this\nTASK_FILE: task-5.txt\nQUEUE: 4 pending after this\n')
+  await h.clock.advance(60_000)
+  h.dispositions['task-1.txt'] = 'answered'
+  h.dispositions['/ws/deliveries/w1/task-3.txt'] = 'archived'
+  h.dispositions['task-4.txt'] = 'claimed'
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(3_600_000)
+  expect(h.attempts).toEqual(['TASK_FILE: task-2.txt\nQUEUE: 1 pending after this\nTASK_FILE: task-5.txt\nQUEUE: 1 pending after this'])
+  expect(h.checks).toEqual(['task-1.txt', 'task-2.txt', '/ws/deliveries/w1/task-3.txt', 'task-4.txt', 'task-5.txt'])
+  // One left: no QUEUE line, as the watcher prints none at 0.
+  h.w.turnStart()
+  h.children[0].out('TASK_FILE: task-6.txt\nQUEUE: 1 pending after this\nTASK_FILE: task-7.txt\nQUEUE: 1 pending after this\n')
+  await h.clock.advance(1_000)
+  h.dispositions['task-7.txt'] = 'missing'
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(3_600_000)
+  expect(h.attempts[1]).toBe('TASK_FILE: task-6.txt')
+  expect(h.attempts.length).toBe(2)
+})
+
+test('every held task already handled: no submit at all, and the waiting status line is cleared', async () => {
+  const h = setup({ silent: true })
+  const both = 'TASK_FILE: task-1.txt\nTASK_FILE: task-2.txt\nQUEUE: 1 pending after this'
+  await h.clock.advance(0)
+  h.children[0].out(`${both}\n`)
+  // The submit resolves and no turn starts: the tasks wait for a resend and are counted on the status line.
+  await h.clock.advance(15_000 + 1_000)
+  expect(h.attempts).toEqual([both])
+  expect(h.statuses).toEqual(['2 tasks waiting — type anything to resume'])
+  // One is answered elsewhere before the resend: the count follows, and only the other is sent again.
+  h.dispositions['task-1.txt'] = 'answered'
+  await h.clock.advance(4_000 + 1_000)
+  expect(h.attempts).toEqual([both, 'TASK_FILE: task-2.txt'])
+  expect(h.statuses).toEqual(['2 tasks waiting — type anything to resume', '1 task waiting — type anything to resume'])
+  // Then the other: the next resend finds nothing left.
+  h.dispositions['task-2.txt'] = 'archived'
+  await h.clock.advance(3_600_000)
+  expect(h.attempts.length).toBe(2)
+  expect(h.statuses).toEqual(['2 tasks waiting — type anything to resume', '1 task waiting — type anything to resume', undefined])
+  expect(h.logs.filter((l) => l.includes('resending')).length).toBe(2)
+})
+
+test('a disposition check that fails never drops a task: it is announced anyway, and the trail says so', async () => {
+  const h = setup({ dispositions: { 'task-1.txt': null, 'task-2.txt': 'not a word', 'task-3.txt': 'answered' } })
+  await h.clock.advance(0)
+  h.w.turnStart()
+  h.children[0].out('TASK_FILE: task-1.txt\nTASK_FILE: task-2.txt\nTASK_FILE: task-3.txt\n')
+  await h.clock.advance(60_000)
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(3_600_000)
+  expect(h.attempts).toEqual(['TASK_FILE: task-1.txt\nQUEUE: 1 pending after this\nTASK_FILE: task-2.txt\nQUEUE: 1 pending after this'])
+  expect(trailOf(h)).toContain('task_disposition gave no answer for task-1.txt; announced anyway')
+  expect(trailOf(h)).toContain('task_disposition gave no answer for task-2.txt; announced anyway')
+  expect(h.logs.filter((l) => l.includes('task_disposition.py')).length).toBe(1)
+  expect(h.runs.find((r) => r[1] === '/repo/src/task_disposition.py')).toEqual(['/py', '/repo/src/task_disposition.py', '--workspace', '/ws', '--', 'task-1.txt'])
+})
+
+test('a helper that answers nothing at all is asked one round, then everything is announced unchecked', async () => {
+  const names = [1, 2, 3, 4, 5, 6].map((n) => `task-${n}.txt`)
+  const h = setup({ dispositions: Object.fromEntries(names.map((n) => [n, null])) })
+  await h.clock.advance(0)
+  h.w.turnStart()
+  h.children[0].out(names.map((n) => `TASK_FILE: ${n}\n`).join(''))
+  await h.clock.advance(60_000)
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(3_600_000)
+  expect(h.checks).toEqual(names.slice(0, 4))
+  expect(h.attempts).toEqual([names.map((n) => `TASK_FILE: ${n}`).join('\n')])
+  expect(trailOf(h)).toContain('task_disposition is not answering; the other 2 task(s) are announced unchecked')
+})
+
+test('tasks held by a standing Stop and answered in the person\'s turn are not submitted after it', async () => {
+  const h = setup({ dropSubmits: 1 })
+  const first = 'TASK_FILE: task-1.txt\nQUEUE: 0 pending after this'
+  await h.clock.advance(0)
+  h.children[0].out(`${first}\n`)
+  await h.clock.advance(60_000)
+  h.children[0].out('TASK_FILE: task-2.txt\nQUEUE: 1 pending after this\n')
+  await h.clock.advance(60_000)
+  expect(h.attempts).toEqual([first])
+  expect(h.statuses[h.statuses.length - 1]).toBe('2 tasks waiting — type anything to resume')
+  // The person types; their turn's Stop hook hands over task-1, and it is answered before the turn ends.
+  h.w.turnStart(undefined, 'go on')
+  h.dispositions['task-1.txt'] = 'answered'
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(3_600_000)
+  expect(h.attempts).toEqual([first, 'TASK_FILE: task-2.txt'])
+  expect(h.submitted).toEqual(['TASK_FILE: task-2.txt'])
+  expect(h.statuses[h.statuses.length - 1]).toBe(undefined)
+})
+
+test('a main turn that starts during the check holds the announcement: it is checked again when that turn ends', async () => {
+  const h = setup()
+  const first = 'TASK_FILE: task-1.txt\nQUEUE: 0 pending after this'
+  await h.clock.advance(0)
+  h.w.turnStart()
+  h.children[0].out(`${first}\n`)
+  await h.clock.advance(1_000)
+  h.w.turnIdle()
+  void h.w.flush()
+  // The person typed before the check came back.
+  h.w.turnStart(undefined, 'a question the person typed')
+  await h.clock.advance(60_000)
+  expect(h.attempts).toEqual([])
+  expect(h.checks).toEqual(['task-1.txt'])
+  h.dispositions['task-1.txt'] = 'answered'
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(3_600_000)
+  expect(h.attempts).toEqual([])
+  expect(h.checks).toEqual(['task-1.txt', 'task-1.txt'])
+})
+
 test('a task body with instructions is never inlined: only the file name and queue count are submitted', async () => {
   const h = setup()
   await h.clock.advance(0)
@@ -474,7 +650,9 @@ test('a task body with instructions is never inlined: only the file name and que
   expect(h.submitted).toEqual(['TASK_FILE: task-evil.txt\nQUEUE: 1 pending after this'])
   expect(h.submitted.join('\n')).not.toContain(INJECTED)
   expect(h.submitted.join('\n')).not.toContain('access_tier')
-  expect(h.runs.some((r) => r.some((a) => a.includes('task-evil')))).toBe(false)
+  // The one command that is given the name is the disposition check, as a single argument after `--`.
+  expect(h.runs.filter((r) => r.some((a) => a.includes('task-evil')))).toEqual([['/py', '/repo/src/task_disposition.py', '--workspace', '/ws', '--', 'task-evil.txt']])
+  expect(h.runs.some((r) => r.some((a) => a.includes(INJECTED)))).toBe(false)
 })
 
 test('a session watcher already on the inbox: nothing is spawned until it is gone', async () => {

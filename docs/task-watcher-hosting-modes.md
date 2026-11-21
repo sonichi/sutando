@@ -90,6 +90,17 @@ same session watcher can instead be run by a Claude Code Mod, `src/agent/claude/
   ever submitted: only a plain file name (or an absolute path ending in one) passes, the Mod never
   reads a task file, and the session still reads the task's headers (`access_tier`, sender, HMAC) from
   the file itself. While a turn runs, announcements wait and arrive together when it ends.
+- **A task already handled is not announced.** Right before each submit (a first send, a resend, and
+  what a turn or a standing Stop held) the Mod asks `src/task_disposition.py` about every task in
+  the message, at most four at a time, 10 s each. Only `pending` is announced; `answered`,
+  `archived`, `claimed` and `missing` are taken out and named in the trail (`not announced: <name>
+  is <word>`). A task that arrives mid-turn is usually handed to the model by the Stop hook and
+  answered before the turn ends, and announcing it again cost a turn. When tasks are taken out, the
+  `QUEUE:` lines of the ones left are written again: each gets the number of other tasks left in that
+  message, and none at 0. With nothing left there is no submit, and the waiting status line is
+  cleared. The Mod never decides this itself: a check that fails, times out or prints anything else
+  keeps its task, which is announced as before (`task_disposition gave no answer for <name>;
+  announced anyway`), and after a whole round of failures the rest are not asked.
 - A submit that throws, or that has not settled within 30 s, keeps its announcement: it goes back to
   the front and is sent again (after 5 s for a throw; after 5 s doubling to 5 min for a timeout).
   One submit is in flight at a time and nothing waits on it: the Mod keeps reading the watcher, and a
