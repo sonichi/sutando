@@ -80,12 +80,11 @@ _KIND_STATUS_LINES = {("auth", STATUS_RESOLVED): "✓ Signed in — Sutando has 
 
 def fallback_body(req: HumanRequirement) -> str:
     """Plain-text rendering for clients that ignore the hitl content field."""
-    device = req.wire_device() or {}
-    name, host = device.get("name", ""), device.get("host", "")
-    where = f" (on {host} · {name})" if host and name else f" (on {host or name})" if (host or name) else ""
+    # No machine name in the body: the seat stays on the wire device, where a client
+    # that wants it can read it, but it is not what the owner decides from.
     lead = _CATEGORY_HEADS.get(category_of(req.kind),
                                _CATEGORY_HEADS[CATEGORY_BLOCKED])
-    head = f"{lead} — {req.message}{where}"
+    head = f"{lead} — {req.message}"
     closer = _KIND_STATUS_LINES.get((req.kind, req.status)) or _STATUS_LINES.get(req.status)
     if closer:
         return f"{head}\n\n{closer}"

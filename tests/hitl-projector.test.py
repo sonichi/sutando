@@ -77,7 +77,9 @@ class ProjectorTests(unittest.TestCase):
         self.assertEqual(wire["status"], "pending")
         self.assertEqual(wire["revision"], 1)
         self.assertIn("Sutando needs your attention", first["body"])
-        self.assertIn("Qingyun's Air", first["body"])
+        # V36: the seat rides the wire device, never the body the owner reads.
+        self.assertNotIn("Qingyun's Air", first["body"])
+        self.assertEqual(wire["device"]["name"], "Qingyun's Air")
 
         self.mgr.resolve(req.id)
         project(self.mgr, self.send, ROOM)
@@ -202,13 +204,17 @@ class ProjectorTests(unittest.TestCase):
 
 
 class FallbackWhereTests(unittest.TestCase):
-    def test_the_plain_text_says_which_machine_when_the_host_is_known(self):
+    def test_the_plain_text_names_no_machine(self):
+        """V36 (owner, 2026-11-06): machine names are log detail, not decision input."""
         import hitl.schema as SCHEMA
         from hitl.projector import fallback_body
         with mock.patch.object(SCHEMA, "device_host", return_value="Chis-MacBook-Pro"):
-            self.assertIn("(on Chis-MacBook-Pro · Qingyun's Air)", fallback_body(make_req()))
+            body = fallback_body(make_req())
+            self.assertNotIn("(on ", body)
+            self.assertNotIn("Chis-MacBook-Pro", body)
+            self.assertNotIn("Qingyun's Air", body)
         with mock.patch.object(SCHEMA, "device_host", return_value=""):
-            self.assertIn("(on Qingyun's Air)", fallback_body(make_req()))
+            self.assertNotIn("(on ", fallback_body(make_req()))
             self.assertNotIn("(on ", fallback_body(make_req(device=None)))
 
 
