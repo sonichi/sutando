@@ -51,6 +51,7 @@ Every verb prints one JSON line. Exit 0 done, 1 failed, 2 refused.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import subprocess
@@ -152,14 +153,22 @@ def stop_sessions(workspace, worker_id, *, runner=subprocess.run) -> dict:
 
 def _take_down(workspace, wid, runner, *, unless_owed=None) -> dict:
     """Pause, kill, close the run. The pause lands under the remedy's lock first, so a
-    sweep in flight cannot restart what is being stopped. `unless_owed` (a reseat's) is asked
-    again under that lock: work it names leaves the seat running, returned under `owed`."""
-    with rem.pool_lock(workspace, STOP_LOCK_WAIT_S):
-        owed = unless_owed() if unless_owed else []
-        if owed:
-            return {"sessions": {}, "closed_runs": [], "down": False, "owed": owed}
+    sweep in flight cannot restart what is being stopped. `unless_owed` is asked again with the
+    worker's deliveries folder locked too, the lock every delivery to it takes, and that lock is
+    held until the seat is killed: work it names leaves the seat running, returned under `owed`."""
+    with rem.pool_lock(workspace, STOP_LOCK_WAIT_S), contextlib.ExitStack() as fence:
+        if unless_owed:
+            try:
+                fence.enter_context(pd.arbitration(workspace, wid))
+            except OSError as e:
+                raise Refused(f"cannot lock {wid}'s deliveries folder ({e.strerror or e}); "
+                              "its seat was left running") from None
+            owed = unless_owed()
+            if owed:
+                return {"sessions": {}, "closed_runs": [], "down": False, "owed": owed}
         sup.set_paused(workspace, wid, True)
         sessions = stop_sessions(workspace, wid, runner=runner)
+        fence.close()
         down = all(v != "unknown" for v in sessions.values())
         # A seat tmux could not confirm gone keeps its run open, so supervision still sees it.
         closed = rem.close_dead_runs(workspace, wid, end_reason="killed") if down else []
@@ -169,12 +178,16 @@ def _take_down(workspace, wid, runner, *, unless_owed=None) -> dict:
 def stop(workspace, target, *, force=False, runner=subprocess.run) -> dict:
     wid, _ = _worker(workspace, target)
     _not_self(wid, force)
-    owed = _outstanding(workspace, wid)
-    if owed and not force:
+    def refuse(owed):
         raise Refused(f"{wid} still owes {len(owed)} task(s): {', '.join(owed)}; "
                       "pass --force to stop it anyway (they wait for enable), "
                       "or retire --hand-off to give them to the core")
-    t = _take_down(workspace, wid, runner)
+    owed = _outstanding(workspace, wid)
+    if owed and not force:
+        refuse(owed)
+    t = _take_down(workspace, wid, runner, unless_owed=None if force else lambda: _outstanding(workspace, wid))
+    if t.get("owed"):
+        refuse(t["owed"])
     return {"worker_id": wid, "action": "stop", "result": "stopped" if t["down"] else "failed",
             "paused": True, "sessions": t["sessions"], "closed_runs": t["closed_runs"],
             "owed_kept": owed,
@@ -304,7 +317,10 @@ def plugins(workspace, target, op: str, path: str = "") -> dict:
 
 def set_model(workspace, repo, target, model=None, *, runner=subprocess.run, spawn=None) -> dict:
     """Record `target`'s model (None drops it) and reseat its running seat with the new --model.
-    Only that worker's row and seat change; the shared settings.json default is never touched."""
+    Only that worker's row and seat change; the shared settings.json default is never touched.
+    A worker on its own folders is not restarted: its own lane writes its inbox under no lock the
+    restart can hold, so a task could start and be killed. Its next start applies the model."""
+    import connections
     wid, before, roster = pr.set_worker_model(workspace, target, model)
     out = {"worker_id": wid, "action": "set-model", "recorded": model, "previous": before,
            "model": pr.worker_model(workspace, wid)}
@@ -312,7 +328,14 @@ def set_model(workspace, repo, target, model=None, *, runner=subprocess.run, spa
         return {**out, "result": "unchanged",
                 "why": "already recorded; a seat started before that takes it on pool_manage.py reseat"}
     try:
-        applied = reseat(workspace, repo, wid, runner=runner, spawn=spawn)
+        if connections.worker_dirs(wid, Path(workspace), strict=True) is not None:
+            applied = {"result": "next-start", "why": "it runs on its own folders, whose deliveries no lock "
+                       "fences, so its seat was not restarted; its next start applies the model"}
+        else:
+            applied = reseat(workspace, repo, wid, runner=runner, spawn=spawn)
+    except (OSError, ValueError, connections.ConnectionsError):
+        applied = {"result": "refused", "why": f"cannot tell what {wid} still owes (its folders record "
+                   "unreadable); its seat was left running"}
     except Refused as e:
         applied = {"result": "refused", "why": str(e)}
     out["apply"] = {k: v for k, v in applied.items() if k not in ("worker_id", "action")}

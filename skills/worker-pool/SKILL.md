@@ -113,9 +113,12 @@ python3 skills/worker-pool/scripts/pool_manage.py unbind <room id>
   default is read from the manifest only, never the env: a worker starts from the
   core, a shell or the recovery timer, whose envs differ, and an env value would
   change its model on recovery. A recorded change is applied by `reseat`: a running seat that
-  owes nothing (in the shared deliveries or its own inbox) restarts on the same
-  conversation with the new `--model` (`"result": "applied"`); one that owes work,
-  or no running seat, keeps it for its next start (`"result": "recorded"`, the reason under `apply`). It never types
+  owes nothing restarts on the same conversation with the new `--model`
+  (`"result": "applied"`). The last owes check and the kill run with the worker's
+  deliveries folder locked, the lock every delivery to it takes, so no task lands in
+  between. One that owes work, a worker on its own folders (its own lane writes its
+  inbox under no such lock), or no running seat keeps it for its next start
+  (`"result": "recorded"`, the reason under `apply`). It never types
   `/model` into a pane: `/model` saves its pick as the shared `settings.json`
   default even in a session started with `--model`, which moves the core's next
   start and every unpinned session with it. For the same reason, do not type

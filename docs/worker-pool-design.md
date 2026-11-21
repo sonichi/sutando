@@ -522,8 +522,14 @@ A Codex worker carries none. The core and its workers share one Claude config di
 a worker that passed no `--model` would run on that dir's `settings.json` model, which
 any session's `/model` rewrites. `set-model` applies a change by reseating the one
 worker on its own conversation, never by sending `/model`: `/model` saves its pick to
-that shared `settings.json` even in a session started with `--model`. A seat that owes
-work, in the shared deliveries or its own inbox, keeps its model until its next start. A `/model` typed by hand in a worker's pane
+that shared `settings.json` even in a session started with `--model`. The reseat makes
+its last owes check and kills the seat while holding that worker's deliveries-folder
+lock (`pool_delivery.arbitration`), which `pool_router.deliver_one` takes for every
+delivery, so no task lands between the check and the kill; `stop` holds it the same way.
+The order is the pool lock, then that one folder lock, and no other lock is taken
+under it. A seat that owes work keeps its model until its next start, and so does a
+worker on its own folders: its own lane writes its inbox under no lock a restart can
+hold. A `/model` typed by hand in a worker's pane
 still rewrites the shared default; the core's next start and unpinned sessions follow
 it, while every worker start keeps its own `--model`. Sessions their launcher marks
 not-a-core (`SUTANDO_CORE_SESSION` set empty) are outside the core model-pin check.

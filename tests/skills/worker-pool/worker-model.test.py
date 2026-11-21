@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -174,19 +175,71 @@ class SetModel(Base):
         self.assertEqual((rc, out["result"]), (0, "unchanged"))
         self.assertEqual(len(self.started), n, "an unchanged record must not restart the seat")
 
-    def assert_deferred(self, owed):
-        rc, out = self.main("set-model", WID, "sonnet")
-        self.assertEqual((rc, out["result"], out["apply"]["result"], out["apply"].get("owed")),
-                         (0, "recorded", "deferred", owed))
-        self.assertEqual(self.row()["model"], "sonnet")
+    def assert_deferred(self, owed, cmd="set-model"):
+        rc, out = self.main(cmd, WID, *(("sonnet",) if cmd == "set-model" else ()))
+        if cmd == "set-model":
+            self.assertEqual((out["result"], self.row()["model"]), ("recorded", "sonnet"))
+            out = out["apply"]
+        self.assertEqual((rc, out["result"], out.get("owed")), (0, "deferred", owed))
         self.assertEqual((self.tmux.killed(), self.started), ([], []))
 
     def test_a_seat_that_owes_a_routed_delivery_keeps_running_until_its_next_start(self):
-        for d in ("tasks", "results"):
-            (self.ws / d).mkdir()
-        (self.ws / "tasks" / "task-x.txt").write_text("id: task-x\ntask: hi\n")
+        self.task("task-x")
         self.assertEqual(router.route(self.ws, {"id": "task-x", "requested_worker": WID})["delivered"], [WID])
         self.assert_deferred(["task-x"])
+
+    def task(self, task_id):
+        for d in ("tasks", "results"):
+            (self.ws / d).mkdir(exist_ok=True)
+        (self.ws / "tasks" / f"{task_id}.txt").write_text(f"id: {task_id}\ntask: hi\n")
+
+    def test_a_task_arriving_while_the_restart_waits_for_the_pool_lock_keeps_it_running(self):
+        self.task("task-z")
+        real_lock = rem.pool_lock
+
+        @contextlib.contextmanager
+        def lock_then_arrival(*a, **kw):
+            with real_lock(*a, **kw):
+                router.route(self.ws, {"id": "task-z", "requested_worker": WID})
+                yield
+        with mock.patch.object(rem, "pool_lock", lock_then_arrival):
+            self.assert_deferred(["task-z"])
+        self.assertFalse(pm.sup.is_paused(self.ws, WID))
+
+    def deliver_in_the_window(self, *args):
+        """Run `args` while another thread routes task-z to WID right after the last owes check (at the
+        pause). Returns (rc, out, the sentinel seen when the seat was killed, the route's result)."""
+        self.task("task-z")
+        seen, routed, threads = {}, {}, []
+        real_pause, real_stop = pm.sup.set_paused, pm.stop_sessions
+
+        def pause(workspace, wid, paused):
+            if paused and not threads:
+                threads.append(threading.Thread(target=lambda: routed.update(
+                    router.route(self.ws, {"id": "task-z", "requested_worker": WID}))))
+                threads[0].start()
+                threads[0].join(2.0)
+            return real_pause(workspace, wid, paused)
+
+        def stop_sessions(workspace, wid, **kw):
+            seen.setdefault("at_kill", pm.pd.find(self.ws, WID, "task-z"))
+            return real_stop(workspace, wid, **kw)
+        with mock.patch.object(pm.sup, "set_paused", pause), mock.patch.object(pm, "stop_sessions", stop_sessions):
+            rc, out = self.main(*args)
+        threads[0].join(10)
+        self.assertFalse(threads[0].is_alive())
+        return rc, out, seen["at_kill"], routed
+
+    def test_a_delivery_after_the_last_check_waits_until_the_seat_is_down(self):
+        rc, out, at_kill, routed = self.deliver_in_the_window("set-model", WID, "sonnet")
+        self.assertIsNone(at_kill, "a task delivered between the owes check and the kill would be killed mid-run")
+        self.assertEqual((rc, out["result"], routed.get("delivered")), (0, "applied", [WID]))
+        self.assertIsNotNone(pm.pd.find(self.ws, WID, "task-z"), "the delivery lands once the lock is released")
+
+    def test_stop_fences_the_same_window(self):
+        rc, out, at_kill, routed = self.deliver_in_the_window("stop", WID)
+        self.assertIsNone(at_kill)
+        self.assertEqual((rc, out["result"], routed.get("delivered")), (0, "stopped", [WID]))
 
     def own_folders(self):
         """Record WID's identity on its own folders (`dirs: "own"`), as connections.json stores it."""
@@ -201,41 +254,40 @@ class SetModel(Base):
             d.mkdir(parents=True, exist_ok=True)
         return own
 
-    def test_a_seat_on_its_own_folders_that_owes_its_inbox_keeps_running(self):
-        tasks, _ = self.own_folders()
-        (tasks / "task-y.txt").write_text("id: task-y\ntask: hi\n")
-        self.assert_deferred(["task-y"])
+    def test_set_model_never_restarts_a_seat_on_its_own_folders(self):
+        self.own_folders()
+        rc, out = self.main("set-model", WID, "sonnet")
+        self.assertEqual((rc, out["result"], out["apply"]["result"]), (0, "recorded", "next-start"))
+        self.assertEqual((self.tmux.killed(), self.started), ([], []))
+        self.assertEqual(self.plan_model(), ("sonnet", "sonnet"))
 
-    def assert_refused_and_kept(self):
+    def test_set_model_with_an_unreadable_folders_record_restarts_nothing(self):
+        self.own_folders()
+        connections.record_path(self.ws).write_text("{not json")
         rc, out = self.main("set-model", WID, "sonnet")
         self.assertEqual((rc, out["result"], out["apply"]["result"]), (0, "recorded", "refused"))
-        self.assertIn("cannot tell what", out["apply"]["why"])
-        self.assertEqual(self.row()["model"], "sonnet")
         self.assertEqual((self.tmux.killed(), self.started), ([], []))
 
-    def test_a_task_arriving_while_the_restart_waits_for_the_pool_lock_keeps_it_running(self):
+    # reseat itself still restarts a worker on its own folders; what it reads as owed:
+    def test_reseat_leaves_running_a_seat_that_owes_its_own_inbox(self):
         tasks, _ = self.own_folders()
-        real_lock = rem.pool_lock
+        (tasks / "task-y.txt").write_text("id: task-y\ntask: hi\n")
+        self.assert_deferred(["task-y"], cmd="reseat")
 
-        @contextlib.contextmanager
-        def lock_then_arrival(*a, **kw):
-            with real_lock(*a, **kw):
-                (tasks / "task-z.txt").write_text("id: task-z\ntask: hi\n")
-                yield
-        with mock.patch.object(rem, "pool_lock", lock_then_arrival):
-            self.assert_deferred(["task-z"])
-        self.assertFalse(pm.sup.is_paused(self.ws, WID))
-
-    def test_a_shared_delivery_kept_after_a_move_to_its_own_folders_keeps_it_running(self):
-        for d in ("tasks", "results"):
-            (self.ws / d).mkdir()
-        (self.ws / "tasks" / "task-x.txt").write_text("id: task-x\ntask: hi\n")
+    def test_reseat_counts_a_shared_delivery_kept_after_a_move_to_own_folders(self):
+        self.task("task-x")
         self.assertEqual(router.route(self.ws, {"id": "task-x", "requested_worker": WID})["delivered"], [WID])
         rem.pd.accept(self.ws / "deliveries" / WID / "task-x.txt")
         self.own_folders()
-        self.assert_deferred(["task-x"])
+        self.assert_deferred(["task-x"], cmd="reseat")
 
-    def test_a_wake_turn_whose_task_cannot_be_read_is_not_taken_as_answered(self):
+    def assert_reseat_refused(self):
+        rc, out = self.main("reseat", WID)
+        self.assertEqual((rc, out["result"]), (2, "refused"))
+        self.assertIn("cannot tell what", out["why"])
+        self.assertEqual((self.tmux.killed(), self.started), ([], []))
+
+    def test_reseat_never_takes_an_unreadable_wake_turn_as_answered(self):
         tasks, results = self.own_folders()
         (results / "task-w.txt").write_text("the earlier turn's answer\n")
         old = os.stat(results / "task-w.txt").st_mtime - 600
@@ -243,15 +295,15 @@ class SetModel(Base):
         (tasks / "task-w.txt").write_text("id: task-w\nwake_episode: 2\ntask: hi\n")
         (tasks / "task-w.txt").chmod(0)
         self.addCleanup((tasks / "task-w.txt").chmod, 0o600)
-        self.assert_refused_and_kept()
+        self.assert_reseat_refused()
 
-    def test_an_unreadable_folders_record_is_never_read_as_the_shared_folders(self):
+    def test_reseat_never_reads_an_unreadable_folders_record_as_the_shared_folders(self):
         tasks, _ = self.own_folders()
         (tasks / "task-y.txt").write_text("id: task-y\ntask: hi\n")
         connections.record_path(self.ws).write_text("{not json")
-        self.assert_refused_and_kept()
+        self.assert_reseat_refused()
 
-    def test_a_task_file_that_cannot_be_read_after_the_listing_is_recorded_not_restarted(self):
+    def test_reseat_refuses_when_a_task_file_cannot_be_read_after_the_listing(self):
         tasks, _ = self.own_folders()
         (tasks / "task-y.txt").write_text("id: task-y\ntask: hi\n")
         real_stat = os.stat
@@ -261,14 +313,14 @@ class SetModel(Base):
                 raise PermissionError(path)
             return real_stat(path, *a, **kw)
         with mock.patch.object(os, "stat", stat):
-            self.assert_refused_and_kept()
+            self.assert_reseat_refused()
 
-    def test_an_own_inbox_that_cannot_be_read_is_recorded_not_restarted(self):
+    def test_reseat_refuses_when_its_own_inbox_cannot_be_read(self):
         tasks, _ = self.own_folders()
         (tasks / "task-y.txt").write_text("id: task-y\ntask: hi\n")
         tasks.chmod(0)
         self.addCleanup(tasks.chmod, 0o700)
-        self.assert_refused_and_kept()
+        self.assert_reseat_refused()
 
     def test_no_running_seat_is_recorded_for_its_next_start(self):
         self.tmux.alive.clear()
