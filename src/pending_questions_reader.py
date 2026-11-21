@@ -231,11 +231,12 @@ def reconcile_pass(workspace, adapter=None) -> dict:
     """The explicit pass: outbox replay, local closes, the legacy ingest; {"errors": [why]} without a store."""
     mod, why = _adapter(adapter)
     if mod is None or not hasattr(mod, "reconcile_pass"):
-        return {"flushed": [], "moved": [], "closed": [], "errors": [f"no store to reconcile with: {why}"]}
+        return {"flushed": [], "moved": [], "closed": [], "retired": [], "errors": [f"no store to reconcile with: {why}"]}
     try:
         return mod.reconcile_pass(Path(workspace))
     except Exception as e:  # noqa: BLE001
-        return {"flushed": [], "moved": [], "closed": [], "errors": [f"adapter failed: {type(e).__name__}: {e}"]}
+        return {"flushed": [], "moved": [], "closed": [], "retired": [],
+                "errors": [f"adapter failed: {type(e).__name__}: {e}"]}
     finally:
         forget_recent(workspace)
 
