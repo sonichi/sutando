@@ -1,0 +1,36 @@
+{
+  "app": "Review list",
+  "summary": "Items to look over, each with a verdict; a viewer can ask their own agent about one item, and the answer comes to their chat with that agent.",
+  "databases": [
+    {
+      "name": "Review — Items",
+      "template": "blank",
+      "role": "primary",
+      "props": [
+        {
+          "name": "Verdict",
+          "type": "status",
+          "options": [
+            { "name": "To review", "group": "todo" },
+            { "name": "Keep", "group": "done" },
+            { "name": "Drop", "group": "done" }
+          ]
+        },
+        { "name": "Notes", "type": "text" },
+        { "name": "Link", "type": "url" },
+        { "name": "Created by", "type": "created_by" }
+      ],
+      "views": [
+        { "layout": "table", "name": "All items" },
+        { "layout": "board", "name": "By verdict", "groupBy": "Verdict" }
+      ],
+      "summon_policy": "owner"
+    }
+  ],
+  "agent_hook": "ask-my-agent",
+  "notes": [
+    "The title column is created by the blank template; read its name from databases.list, never assume it.",
+    "There is no Actor column: nothing on a row summons an agent. The only way this app reaches an agent is the viewer's own tap on 'Ask my agent about this', which the viewer confirms.",
+    "The page never receives the agent's answer. It goes to the viewer's chat with that agent; the viewer sets the Verdict themselves."
+  ]
+}

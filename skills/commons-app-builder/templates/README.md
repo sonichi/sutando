@@ -1,6 +1,6 @@
 # Starter templates
 
-Six complete apps to start from, one directory each: `page.html` (the interface) and
+Seven complete apps to start from, one directory each: `page.html` (the interface) and
 `schema.json` (the databases, their columns and views). They are starting points, not a
 library: copy one, rename the database and columns to the real subject, delete what the
 request does not need, and keep following [GUIDE.md](../GUIDE.md) — the data model, the
@@ -18,6 +18,7 @@ while the viewer has not answered the consent prompt, and ownership shown as `?`
 | [`tracker/`](tracker/) | Work with an owner and a deadline: issues, chores, requests, a review queue. The one to pick when an **agent should do the work** on a row. | One database. `Status` drives a board; `Actor` + the database's summon policy hand a row to an agent, which writes back into `Outcome`. |
 | [`poll/`](poll/) | A decision to take: a vote, a preference, a show of hands, picking a date. | One row per vote, **one vote counted per person**: the tally groups by `created_by` and takes each person's latest row, so repeat rows cannot inflate a count. Results are live. |
 | [`planner/`](planner/) | Anything dated across a week: a rota, a schedule, a meal plan, a trip. | Dated rows plus a day part. Seven columns on a wide screen, one scrolling list of days on a phone. The week on screen is per viewer, in the hash. |
+| [`review-list/`](review-list/) | A list people go through one item at a time, where a reader may want **their own agent's view** on an item: picks to approve, links to vet, drafts to accept. | One database with a `Verdict`. Each row has *Ask my agent about this*: the reader confirms the exact text, their agent answers in their own chat with it, and the reader sets the verdict. No `Actor` column, so nothing on a row summons anyone. See GUIDE.md, "A button that asks the viewer's own agent". |
 | [`turn-game/`](turn-game/) | Two people taking turns: tic-tac-toe as shipped, and the shape for gomoku, checkers or any board game. | Append-only move rows, replayed in insertion order. Both the turn **and each mark** follow the move count, so a row claiming the wrong seat is skipped rather than drawn out of turn. |
 | [`research-desk/`](research-desk/) | Members and their own agents gather material on a question: a reading list, a literature review, due diligence, fact-checking. A finding counts only once a **person accepts it**. | Two databases. Findings carry a source, a basis and what they change, and stay **proposed** until a person accepts or rejects them in Reviews, whose server-stamped `created_by` is the accepter. A report view assembles accepted findings by topic. Each member can **ask their own agent** about a row or a topic. |
 | [`task-board/`](task-board/) | People hand work to their **own agents** and the room follows it: errands, ops requests, a team's to-do list with agents doing items. | One database. A task names its agent in `Actor` when the agent is in the room, so the row summons it and the agent reports `Status`, `Blocker` and `Result` on the row. An agent outside the room is asked in its owner's DM instead. Board columns by status. |
@@ -80,7 +81,7 @@ For something with no obvious shape, read the "Patterns from apps that shipped" 
 
 The s.space panel can ask for one of these by name in a build request (`template`:
 `tracker`, `poll`, `planner` or `turn-game`); see [BUILD_REQUEST.md](../BUILD_REQUEST.md).
-`research-desk` and `task-board` are not offered there yet: an agent copies them by hand.
+`review-list`, `research-desk` and `task-board` are not offered on the panel yet: an agent copies them by hand from this directory.
 `scripts/build_request.py` renames the app, its database and its options and writes the page in
 chunks of at most 20,000 bytes.
 
@@ -89,7 +90,8 @@ chunks of at most 20,000 bytes.
 - `tests/commons-app-builder-templates.test.mjs` runs every page against a fake
   `window.artifact` and checks each control's data path: the exact `createRow` and `write`
   calls, the empty and error states, consent pending, a refused write retrying, and the
-  game's replay, turn order and win detection.
+  game's replay, turn order and win detection, and for `review-list` the request it sends to
+  the viewer's agent (the agent, the text, the key) and what it shows for each refusal.
 - `tests/commons-app-builder-templates.test.py` checks each schema (types, options, groups,
   `created_by` present, no declared title column, views pointing at real columns), that every
   column a page names exists in its schema, and the phone-first CSS contract.
