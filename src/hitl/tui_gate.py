@@ -111,10 +111,18 @@ def option_blocks(prompt: Optional[str]) -> List[Tuple[int, List[str], Optional[
     """Each contiguous run of numbered lines: (start line, labels, caret index)."""
     blocks: List[Tuple[int, List[str], Optional[int]]] = []
     cur: Optional[Tuple[int, List[str], Optional[int]]] = None
+    label_col = 0
     for i, line in enumerate((prompt or "").splitlines()):
         m = _OPTION.match(line)
         if not m:
             if cur is not None and line.strip():
+                # A hard-wrapped label continues its option; ending the block there
+                # dropped every option before the wrap (V42).
+                if len(line) - len(line.lstrip()) >= label_col:
+                    start, labels, caret = cur
+                    labels[-1] = f"{labels[-1]} {line.strip()}"
+                    cur = (start, labels, caret)
+                    continue
                 blocks.append(cur)
                 cur = None
             continue
@@ -124,6 +132,7 @@ def option_blocks(prompt: Optional[str]) -> List[Tuple[int, List[str], Optional[
         if m.group(1):
             caret = len(labels)
         labels.append(m.group(3))
+        label_col = m.start(3)
         cur = (start, labels, caret)
     if cur is not None:
         blocks.append(cur)
@@ -200,7 +209,9 @@ def requirement_for(state: str, gate: Optional[str], prompt: Optional[str],
         yes = next((i for i, o in enumerate(options) if _YES.match(o)), None)
         no = next((i for i, o in enumerate(options) if _NO.match(o)), None)
         message = question(prompt, detail)
-        if yes is not None and no is not None:
+        # Only a true two-option dialog collapses to No/Yes. With a third option the
+        # collapse hid it and renumbered the rest, so the card disagreed with the screen.
+        if yes is not None and no is not None and len(options) == 2:
             kind, title = "permission", "Agent needs your confirmation"
             option_for_action = {"deny": no, "allow": yes}
             actions = [Action(id="deny", kind="reject_once", label="No"),

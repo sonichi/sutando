@@ -49,14 +49,26 @@ class TestParsing(unittest.TestCase):
 
 
 class TestRequirement(unittest.TestCase):
-    def test_a_permission_dialog_is_a_no_yes_card_in_the_owners_words(self):
+    def test_a_three_option_permission_dialog_keeps_all_three(self):
+        """V42 (owner, 2026-11-06): the card's options must match the terminal's. This
+        dialog offers three; the card showed No/Yes, so "don't ask again" had no button
+        at all. Supersedes the earlier no-yes-in-the-owner's-words shape, which is kept
+        below for a dialog that really does offer two."""
         r = req("permission", PERM)
+        self.assertEqual(r.kind, "choice")
+        self.assertEqual(r.title, "Agent needs a decision")
+        self.assertEqual([a.label for a in r.actions],
+                         ["Yes", "Yes, and don't ask again for rm commands", "No",
+                          "Open terminal"])
+        self.assertEqual(r.message, "Dangerous rm operation on a possibly-empty path Do you want to proceed?")
+        self.assertEqual(r.subject["option_for_action"], {"opt1": 0, "opt2": 1, "opt3": 2})
+
+    def test_a_two_option_yes_no_dialog_is_still_a_no_yes_card(self):
+        r = req("permission", "  Proceed?\n  \u276f 1. Yes\n    2. No")
         self.assertEqual(r.kind, "permission")
-        self.assertEqual(r.title, "Agent needs your confirmation")
         self.assertEqual([a.label for a in r.actions], ["No", "Yes", "Open terminal"])
         self.assertEqual([a.kind for a in r.actions], ["reject_once", "allow_once", "open_terminal"])
-        self.assertEqual(r.message, "Dangerous rm operation on a possibly-empty path Do you want to proceed?")
-        self.assertEqual(r.subject["option_for_action"], {"deny": 2, "allow": 0})
+        self.assertEqual(r.subject["option_for_action"], {"deny": 1, "allow": 0})
         self.assertEqual(r.subject["source"], G.SOURCE)
         self.assertEqual(r.device, {"id": "s", "name": "s"})
 
@@ -119,8 +131,10 @@ class TestRequirement(unittest.TestCase):
         """classify() calls a real permission dialog `selection` (its caret row is
         nearest the bottom); the buttons must still be No/Yes. And a gate labelled
         permission whose options are not yes/no is a choice, one button per option."""
-        self.assertEqual(req("selection", PERM).kind, "permission")
-        self.assertEqual([a.label for a in req("selection", PERM).actions], ["No", "Yes", "Open terminal"])
+        self.assertEqual(req("selection", PERM).kind, "choice")
+        self.assertEqual([a.label for a in req("selection", PERM).actions],
+                         ["Yes", "Yes, and don't ask again for rm commands", "No",
+                          "Open terminal"])
         r = req("permission", "  Proceed?\n  ❯ 1. Continue\n    2. Abort")
         self.assertEqual(r.kind, "choice")
         self.assertEqual([a.label for a in r.actions], ["Continue", "Abort", "Open terminal"])
@@ -152,17 +166,29 @@ class TestRequirement(unittest.TestCase):
 
 
 class TestKeys(unittest.TestCase):
-    def test_yes_with_the_caret_already_on_yes_is_just_enter(self):
-        self.assertEqual(G.keys_for(clicked(req("permission", PERM), "allow"), PERM, "blocked-human"),
+    def test_the_option_under_the_caret_is_just_enter(self):
+        self.assertEqual(G.keys_for(clicked(req("permission", PERM), "opt1"), PERM, "blocked-human"),
                          ["Enter"])
 
-    def test_no_walks_the_caret_down_to_no(self):
-        self.assertEqual(G.keys_for(clicked(req("permission", PERM), "deny"), PERM, "blocked-human"),
+    def test_a_lower_option_walks_the_caret_down(self):
+        self.assertEqual(G.keys_for(clicked(req("permission", PERM), "opt3"), PERM, "blocked-human"),
                          ["Down", "Down", "Enter"])
 
-    def test_yes_walks_the_caret_up_when_it_sits_on_no(self):
-        r = clicked(req("permission", PERM_CARET_ON_NO), "allow")
+    def test_the_middle_option_is_now_reachable(self):
+        """V42: "don't ask again" had no button, so no keys could reach it."""
+        self.assertEqual(G.keys_for(clicked(req("permission", PERM), "opt2"), PERM, "blocked-human"),
+                         ["Down", "Enter"])
+
+    def test_an_upper_option_walks_the_caret_up(self):
+        r = clicked(req("permission", PERM_CARET_ON_NO), "opt1")
         self.assertEqual(G.keys_for(r, PERM_CARET_ON_NO, "blocked-human"), ["Up", "Up", "Enter"])
+
+    def test_a_two_option_dialog_still_answers_by_allow_and_deny(self):
+        two = "  Proceed?\n  \u276f 1. Yes\n    2. No"
+        self.assertEqual(G.keys_for(clicked(req("permission", two), "allow"), two, "blocked-human"),
+                         ["Enter"])
+        self.assertEqual(G.keys_for(clicked(req("permission", two), "deny"), two, "blocked-human"),
+                         ["Down", "Enter"])
 
     def test_a_click_against_a_dialog_that_changed_sends_nothing(self):
         """The most important check (owner): the card showed prompt A; by the click
@@ -251,6 +277,48 @@ class TestNoCaretKeepsTheBlockedCard(unittest.TestCase):
     def test_a_dashed_rule_is_frame_not_question(self):
         dashed = "  " + "╌" * 40 + "\n  Do you want to proceed?\n  ❯ 1. Yes\n    2. No"
         self.assertEqual(G.question(dashed, "d"), "Do you want to proceed?")
+
+
+# A long option hard-wraps under its own label; every option must survive (V42).
+WRAPPED = ("  Do you want to proceed?\n"
+           "  \u276f 1. Yes, and allow this command for the rest of\n"
+           "       this session\n"
+           "    2. Yes\n"
+           "    3. No, and tell Claude what to do differently\n"
+           "  Enter to confirm")
+
+
+class TestWrappedOptionLabels(unittest.TestCase):
+    """V42: a wrapped label used to end the option block, so parse_options read only the
+    run after the wrap -- the options before it vanished and the rest were renumbered."""
+
+    def test_every_option_survives_a_wrapped_label(self):
+        labels, caret = G.parse_options(WRAPPED)
+        self.assertEqual(labels, [
+            "Yes, and allow this command for the rest of this session",
+            "Yes",
+            "No, and tell Claude what to do differently",
+        ])
+        self.assertEqual(caret, 0)
+
+    def test_the_card_offers_one_button_per_terminal_option(self):
+        r = req("selection", WRAPPED)
+        self.assertEqual([a.label for a in r.actions], [
+            "Yes, and allow this command for the rest of this session",
+            "Yes",
+            "No, and tell Claude what to do differently",
+            "Open terminal",
+        ])
+
+    def test_a_click_still_answers_the_right_row(self):
+        r = req("selection", WRAPPED)
+        self.assertEqual(G.keys_for(clicked(r, "opt3"), WRAPPED, "blocked-human"),
+                         ["Down", "Down", "Enter"])
+
+    def test_a_stale_dialog_above_is_still_excluded(self):
+        """The control the wrap fix must not break: an answered dialog scrolled above
+        the live one is separated by prose at column 0, which still ends the block."""
+        self.assertEqual(G.parse_options(TWO_DIALOGS), (["Production", "Staging"], 0))
 
 
 if __name__ == "__main__":
