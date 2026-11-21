@@ -267,13 +267,22 @@ class RelayLoop:
             return "refused-collaborator"
         return kind or "refused"
 
+    def pending_attestation(self, headers):
+        """True for a Team sender not (yet) attested as a collaborator, unlike a guest or other
+        non-owner tier, which has no reason to expect that flag to follow."""
+        return headers.get("access_tier") == "team" and not is_collaborator(headers)
+
     def refusal(self, name, headers, seen):
         """None when classify() serves the task; otherwise the refusal is finished and its step result
-        returned: True when published, False when parked."""
+        returned: True when published, False when parked (a Team sender pending attestation gets
+        the retry/backoff budget first, instead of an immediate, final refusal)."""
         kind = self.classify(headers)
         if kind == "refused-collaborator":
             log("refused (collaborator, --allow-collaborator not set) ->", name[:-4])
         elif kind == "refused":
+            if self.pending_attestation(headers) and self.schedule_retry(
+                name[:-4], "collaborator attestation pending", at_least=0.0):
+                return False
             log("refused (non-owner, --allow-non-owner not set) ->", name[:-4], headers.get("access_tier") or "guest")
         else:
             return None
