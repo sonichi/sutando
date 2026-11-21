@@ -916,10 +916,12 @@ class CommandLine(SeatCase):
             def stop(self):
                 made.append("stop")
 
-        with mock.patch.object(seat_mod, "Watcher", StubWatcher), mock.patch.object(seat_mod.signal, "signal"):
-            rc = seat_mod.main(["run", "--host", str(decl), "--workspace", str(self.ws), "--seat", "s",
+        with mock.patch.object(seat_mod, "Watcher", StubWatcher), mock.patch.object(seat_mod.signal, "signal"), \
+                mock.patch.object(seat_mod, "resolve_workspace", return_value=self.ws) as resolved:
+            rc = seat_mod.main(["run", "--host", str(decl), "--seat", "s",
                                 "--codex", str(self.fake), "--watcher", "--once"])
         self.assertEqual(rc, 0)
+        resolved.assert_called_once_with()
         self.assertEqual(made, [str(self.tasks), "ensure", "stop"])
 
     def test_a_bad_declaration_is_refused_before_any_app_server(self):

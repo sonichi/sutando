@@ -42,6 +42,7 @@ from delivery.task_dispatch import (has_ready_result, owned_task_ids,  # noqa: E
                                     pending_candidates)
 from task_disposition import ANSWERED, PENDING, SPENT, task_dispositions  # noqa: E402
 from task_priority import sort_tasks_by_priority  # noqa: E402
+from workspace_default import resolve_workspace  # noqa: E402
 
 CLIENT = {"name": "sutando-codex-seat", "title": "Sutando Codex seat", "version": "1"}
 SANDBOX = "danger-full-access"
@@ -248,6 +249,7 @@ class Seat:
         self.poll_s, self.retry_s, self.hold_s, self.max_attempts = poll_s, retry_s, hold_s, max_attempts
         self.backoff_s, self.turn_timeout, self.interrupt_grace = backoff_s, turn_timeout, interrupt_grace
         self.context, self.clock = context, clock
+        self.cwd = host.cwd or str(self.workspace)
         self.rpc: Optional[Rpc] = None
         self.thread_id: Optional[str] = None
         self.failures = 0
@@ -265,7 +267,7 @@ class Seat:
         return Path(self.host.state) / "thread"
 
     def thread_params(self) -> dict:
-        p = {"cwd": self.host.cwd or os.getcwd(), "approvalPolicy": APPROVAL_POLICY, "sandbox": self.sandbox}
+        p = {"cwd": self.cwd, "approvalPolicy": APPROVAL_POLICY, "sandbox": self.sandbox}
         if self.model:
             p["model"] = self.model
         if self.instructions:
@@ -477,7 +479,7 @@ class Seat:
         """(status, detail) once the turn is over: completed | failed | interrupted | stopped |
         timeout | server-exited | seat-stopping."""
         try:
-            res = self.rpc.request("turn/start", {"threadId": self.thread_id, "cwd": self.host.cwd or os.getcwd(),
+            res = self.rpc.request("turn/start", {"threadId": self.thread_id, "cwd": self.cwd,
                                                   "input": [{"type": "text", "text": prompt}]})
             turn_id = res["turn"]["id"]
         except (RuntimeError, KeyError, TypeError) as e:
@@ -704,7 +706,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     d.add_argument("--stage-command", nargs=argparse.REMAINDER, help="last: the host's stage hook argv")
     r = sub.add_parser("run")
     r.add_argument("--host", required=True, help="the supervised-host declaration")
-    r.add_argument("--workspace", required=True)
+    r.add_argument("--workspace", help="workspace root (default: the resolved workspace)")
     r.add_argument("--seat", required=True, help="the seat's tmux session name")
     r.add_argument("--worker", default="", help="the pool worker id; empty for the core")
     r.add_argument("--codex", default="codex")
@@ -727,7 +729,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     LOG_FILE = a.log
     if LOG_FILE:
         os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
-    seat = Seat(host, a.workspace, a.seat, worker=a.worker, codex=a.codex, config=a.config, model=a.model,
+    workspace = Path(a.workspace) if a.workspace else resolve_workspace()
+    seat = Seat(host, workspace, a.seat, worker=a.worker, codex=a.codex, config=a.config, model=a.model,
                 sandbox=a.sandbox, instructions=a.instructions, context=workstream_context,
                 poll_s=_number("SUTANDO_SEAT_POLL_S", 2.0), retry_s=_number("SUTANDO_SEAT_RETRY_S", 30.0),
                 hold_s=_number("SUTANDO_SEAT_HOLD_S", 900.0), backoff_s=_number("SUTANDO_SEAT_BACKOFF_S", 2.0),
