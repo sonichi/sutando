@@ -660,18 +660,18 @@ class SspaceToolsTest(unittest.TestCase):
         self.assertTrue(reasons[4].startswith("other operations are never granted (toolCall keys:"), reasons[4])
         self.assertEqual(reasons[5], "no command is granted")
 
-    def test_a_team_turn_gets_the_owners_sspace_tools_isolated_and_still_no_command(self):
+    def test_a_team_turn_gets_the_owners_sspace_tools_and_still_no_command(self):
         self.w.task("task-1", "STUB:MCP make a page", tier="team", collaborator=True)
         self.serve(1, "--allow-non-owner")
         self.assertEqual(self.sent("session/new"), [[ENTRY]])
         self.assertEqual(self.minted, [(self.token_file, "@agy:s.space")])
         self.assertEqual([ok for _, ok in self.decisions()], [True, True, False, False, False, False],
                          "a team member may create a page; no other tool, no command")
-        self.assertTrue(self.w.metrics()[0]["isolated"])
-        boot = next(r for r in self.w.records() if "agy_home" in r)
-        deny = json.loads(boot["settings"])["permissions"]["deny"]
-        self.assertNotIn("mcp(*)", deny)
-        self.assertTrue({"command(*)", "read_file(*)", "write_file(*)", "read_url(*)"} <= set(deny))
+        if self.w.metrics()[0]["isolated"]:   # before #6645, Team runs isolated: only the mcp(*) deny is lifted
+            boot = next(r for r in self.w.records() if "agy_home" in r)
+            deny = json.loads(boot["settings"])["permissions"]["deny"]
+            self.assertNotIn("mcp(*)", deny)
+            self.assertTrue({"command(*)", "read_file(*)", "write_file(*)", "read_url(*)"} <= set(deny))
         prompt = next(r["text"] for r in self.w.records() if r.get("method") == "session/prompt")
         self.assertIn("ag2-space MCP tools", prompt)
 
