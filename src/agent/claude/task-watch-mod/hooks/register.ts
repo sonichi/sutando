@@ -23,28 +23,9 @@ const RESEND_MAX_MS = 60_000
 const DISPOSITION_TIMEOUT_MS = 10_000
 const DISPOSITION_AT_ONCE = 4
 const DISPOSITIONS = ['pending', 'claimed', 'answered', 'archived', 'missing']
-// Mid-turn, each task's access_tier is read with the repo's own header parser: one line per path, empty when unreadable.
-const TIER_TIMEOUT_MS = 5_000
-// Gateway tasks put their headers after `task:`; only the envelope-verified reader may read those.
-// Prints `owner` only for the human owner: a scheduled job or another agent waits for the turn's end.
-const TIER_PY = [
-  'import sys',
-  'from pathlib import Path',
-  'sys.path.insert(0, sys.argv[1])',
-  'from local_task_protocol import canonical_access_tier',
-  'from task_envelope import attested_task_headers',
-  'ws = Path(sys.argv[2])',
-  'for p in sys.argv[3:]:',
-  '    try:',
-  "        with open(p, encoding='utf-8', errors='replace') as f:",
-  "            h = attested_task_headers(f.read(), ws).headers",
-  "        sender = (h.get('user_id') or '').strip()",
-  "        machine = (h.get('source') or '').strip() == 'cron' or sender == 'cron-runner' or '.agent:' in sender",
-  "        tier = canonical_access_tier(h.get('access_tier'))",
-  "        print('' if machine and tier == 'owner' else tier)",
-  '    except Exception:',
-  "        print('')",
-].join('\n')
+// Mid-turn, src/task_watch_owner.py decides which held tasks may interrupt; the whole check (that and
+// task_disposition.py) holds one tool result at most this long, else the tasks wait for the turn's end.
+const MID_TURN_BUDGET_MS = 5_000
 // The engine's own refusal after the person pressed Stop, as a `{ drop }` reason. Claude Code 2.1.322 words
 // it "the session was stopped and nobody has sent input since"; its types say "a Stop stands".
 const STOP_DROP_RE = /\bstop/i
@@ -195,6 +176,10 @@ export class Announcements {
   unshift(text: string): void {
     this.ready.unshift(text)
   }
+  /** The names of every task held, ready or open. */
+  names(): string[] {
+    return taskNames([...this.ready, this.open ?? ''].join('\n'))
+  }
   /** Takes back the text `unshift` put at the front, if it is still there. */
   shift(text: string): void {
     if (this.ready[0] === text) this.ready.shift()
@@ -261,6 +246,10 @@ export class TaskWatch {
   private midBusy = false
   // Held tasks found not to be owner tasks: they wait for the idle path and are not asked about again mid-turn.
   private idleOnly = new Set<string>()
+  // Tasks named to a running turn: checked again when it ends, and announced then if still pending.
+  private noticed: string[] = []
+  private turnText = ''
+  private resendWait = false
   private notes: string[] = []
   private noting = false
   constructor(private host: Host, private repo: string, private submitTimeoutMs = SUBMIT_TIMEOUT_MS, private turnStartWaitMs = TURN_START_WAIT_MS) {}
@@ -278,6 +267,7 @@ export class TaskWatch {
       this.note(`the person sent input: the Stop is over; ${this.ann.count()} held task(s) go out when this turn ends`)
     }
     this.turnRunning = true
+    this.turnText = text
     this.mainTurns++
     this.starts.push(text)
     for (const wake of this.startWaiters.splice(0)) wake()
@@ -286,6 +276,7 @@ export class TaskWatch {
   turnIdle(agentId?: string): void {
     if (agentId !== undefined) return
     this.turnRunning = false
+    this.requeueNoticed()
     for (const wake of this.idleWaiters.splice(0)) wake()
   }
 
@@ -384,53 +375,87 @@ export class TaskWatch {
   }
 
   /**
-   * The context line for a main-loop tool call while a main turn runs, or null. Held owner tasks still pending
-   * (stillPending) are taken out of the buffer and named once, so the submit at turn end does not send them
-   * again; any other task stays held for that submit. No tool call runs while a Stop stands, and a subagent's
-   * calls (`agentId`) never get one. One check at a time: a concurrent call finds nothing to do.
+   * The context line for a main-loop tool call while a main turn runs, or null. Held tasks that
+   * task_watch_owner.py calls the human owner's, and that are still pending (stillPending), are named once and
+   * taken out of the buffer; they go into `noticed`, checked again at the turn's end (requeueNoticed). Every
+   * other task stays held for the turn-end submit. Nothing is taken or named when a subagent calls (`agentId`),
+   * a Stop stands, a resend waits, the turn ends or is aborted during the check, or the check outlasts its budget.
    */
-  async midTurn(agentId?: string): Promise<string | null> {
-    if (agentId !== undefined || !this.turnRunning || this.paused || this.stopped || this.midBusy) return null
+  async midTurn(agentId?: string, signal?: AbortSignal): Promise<string | null> {
+    if (agentId !== undefined || !this.turnRunning || this.paused || this.stopped || this.midBusy || this.resendWait) return null
     const py = this.py
+    const ws = this.ws
     const inbox = this.inbox
-    if (!py || !inbox) return null
+    if (!py || !ws || !inbox) return null
     const held = this.ann.take()
     if (!held) return null
     const names = taskNames(held)
     this.idleOnly = new Set(names.filter((n) => this.idleOnly.has(n)))
-    const fresh = names.filter((n) => !this.idleOnly.has(n))
+    // A turn submitted for a task is already about it.
+    const fresh = names.filter((n) => !this.idleOnly.has(n) && !this.turnText.includes(`TASK_FILE: ${n}`))
     if (!fresh.length) {
       this.ann.unshift(held)
       return null
     }
     this.midBusy = true
-    let back: string | null = held
-    try {
+    const turn = this.mainTurns
+    let expired = false
+    const check = (async () => {
       const paths = fresh.map((n) => (n.startsWith('/') ? n : `${inbox}/${n}`))
-      const owners = ownerTasks(fresh, (this.ws ? await this.host.run([py, '-I', '-c', TIER_PY, `${this.repo}/src`, this.ws, ...paths], TIER_TIMEOUT_MS) : null))
-      for (const n of fresh) {
-        if (owners.includes(n)) continue
-        this.idleOnly.add(n)
-        this.note(`kept for the turn's end: ${n} is not an owner task (or its tier could not be read)`)
-      }
-      if (!owners.length) return null
+      const owners = ownerTasks(fresh, await this.host.run([py, `${this.repo}/src/task_watch_owner.py`, '--workspace', ws, '--', ...paths], MID_TURN_BUDGET_MS))
+      if (expired || !owners.length) return { owners, pending: null }
       const own = new Set(owners)
       const ownText = withoutHandled(held, new Set(names.filter((n) => !own.has(n))))
-      const pending = ownText === null ? null : await this.stillPending(ownText)
-      back = withoutHandled(held, own)
-      if (pending === null) return null
-      const sent = taskNames(pending)
-      this.note(`delivered mid-turn via tool result: ${sent.join(' ')}`)
-      return midTurnNotice(sent)
-    } finally {
-      if (back !== null) this.ann.unshift(back)
-      this.midBusy = false
-      if (this.shown && !this.ann.count()) {
-        this.shown = 0
-        this.toasted = false
-        this.host.status(undefined)
-      } else if (this.shown) this.showWaiting()
+      return { owners, pending: ownText === null ? null : await this.stillPending(ownText) }
+    })()
+    detach(check.finally(() => { this.midBusy = false }))
+    const out = await Promise.race([check.catch(() => null), this.host.sleep(MID_TURN_BUDGET_MS).then(() => 'late' as const)])
+    const live = this.turnRunning && this.mainTurns === turn && !this.paused && !this.stopped && !signal?.aborted
+    if (out === null || out === 'late' || !live) {
+      expired = true
+      this.ann.unshift(held)
+      this.note(out === 'late' ? `mid-turn check took over ${MID_TURN_BUDGET_MS / 1000}s; left for the turn's end`
+        : out === null ? 'mid-turn check failed; left for the turn\'s end' : 'the turn ended or was interrupted during the mid-turn check; left for its end')
+      if (!this.turnRunning) detach(this.deliver())
+      this.refreshWaiting()
+      return null
     }
+    for (const n of fresh) {
+      if (out.owners.includes(n)) continue
+      this.idleOnly.add(n)
+      this.note(`kept for the turn's end: ${n} is not the human owner's task (or could not be read)`)
+    }
+    const back = withoutHandled(held, new Set(out.owners))
+    if (back !== null) this.ann.unshift(back)
+    this.refreshWaiting()
+    const sent = out.pending === null ? [] : taskNames(out.pending)
+    if (!sent.length) return null
+    this.noticed.push(...sent)
+    this.note(`delivered mid-turn via tool result: ${sent.join(' ')}`)
+    return midTurnNotice(sent)
+  }
+
+  /** After the buffer changed outside a submit: the waiting status line follows the count, or goes. */
+  private refreshWaiting(): void {
+    if (!this.shown) return
+    if (this.ann.count()) return this.showWaiting()
+    this.shown = 0
+    this.toasted = false
+    this.host.status(undefined)
+  }
+
+  /**
+   * At a main turn's end, tasks named mid-turn go back in front of the buffer, so the flush runs them through
+   * stillPending: one answered, claimed or archived in the turn drops out, one still pending is announced once.
+   */
+  private requeueNoticed(): void {
+    if (!this.noticed.length) return
+    const held = new Set(this.ann.names())
+    const again = [...new Set(this.noticed)].filter((n) => !held.has(n))
+    this.noticed = []
+    if (!again.length) return
+    this.note(`checking again at the turn's end, as named mid-turn: ${again.join(' ')}`)
+    this.ann.unshift(again.map((n) => `TASK_FILE: ${n}`).join('\n'))
   }
 
   /** Sends what waited for the turn to end; a hook must not await it, a submit can take its whole timeout. */
@@ -593,7 +618,13 @@ export class TaskWatch {
           // Back in the buffer for the wait, so it is counted on the status line; in front, so order holds.
           this.ann.unshift(text)
           this.showWaiting()
-          await this.host.sleep(again)
+          // The text is in the buffer only to be counted: midTurn leaves it alone, or it would go out twice.
+          this.resendWait = true
+          try {
+            await this.host.sleep(again)
+          } finally {
+            this.resendWait = false
+          }
           if (result.dropped === null && this.startSeen(text) === 'ours') {
             this.ann.shift(text)
             this.started()
@@ -841,7 +872,7 @@ export const register: Register = (on) => {
     const result = await next(e)
     const w = watch
     if (!w || e.agentId !== undefined) return result
-    return withTaskContext(result, () => w.midTurn(e.agentId))
+    return withTaskContext(result, () => w.midTurn(e.agentId, next.signal))
   }).catch(($, e, next) => next(e)) // A hook that fails or overruns: next replays the tool's own result, untouched.
 
   // session.stop is not hooked here: on an engine without that event (2.1.322 has none) naming it stops this

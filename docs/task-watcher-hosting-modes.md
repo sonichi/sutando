@@ -90,13 +90,19 @@ same session watcher can instead be run by a Claude Code Mod, `src/agent/claude/
   ever submitted: only a plain file name (or an absolute path ending in one) passes, the Mod never
   reads a task file's body, and the session still reads the task's headers (`access_tier`, sender,
   HMAC) from the file itself. While a turn runs, announcements wait and arrive together when it ends.
-- **Owner tasks also reach a running turn, after its next tool call.** On a main-loop `tool.call`
-  (never a subagent's), the Mod reads each held task's `access_tier` with `local_task_protocol`'s
-  header parser, runs the same `task_disposition.py` check, and attaches one line naming the pending
-  `access_tier: owner` tasks to that tool's result as `context`; they are then not submitted again
-  at the turn's end (`delivered mid-turn via tool result: <names>` in the trail). Any other tier, a
-  missing one, or a header that cannot be read keeps the task for the turn-end submit. Delivery waits
-  for the tool call in flight, so a long command or subagent run delays it.
+- **The human owner's tasks also reach a running turn, after its next tool call.** On a main-loop
+  `tool.call` (never a subagent's), `src/task_watch_owner.py` reads each held task through
+  `task_envelope.attested_task_headers` (headers below `task:` count only in a signed gateway task) and
+  answers `owner` only for `access_tier: owner` from a person's channel (`ag2space`, `discord`,
+  `telegram`, `slack`, `voice`, `phone`, `chat`) whose sender is not an agent; cron, health-check,
+  API, connector and other machine tasks keep the turn-end submit. Those still `pending` by
+  `task_disposition.py` are named in one line attached to that tool's result as `context`
+  (`delivered mid-turn via tool result: <names>` in the trail) and leave the buffer. When the turn
+  ends they are checked again: one answered, claimed or archived in the turn drops out, one still
+  pending (deferred) is announced once more. The whole check holds a tool result at most 5 s; past
+  that, or when the turn ends or is interrupted during it, nothing is named and every task waits for
+  the turn's end. A task the turn was submitted for, or one waiting to be resent, is not named.
+  Delivery waits for the tool call in flight, so a long command or subagent run delays it.
 - **A task already handled is not announced.** Right before each submit (a first send, a resend, and
   what a turn or a standing Stop held) the Mod asks `src/task_disposition.py` about every task in
   the message, at most four at a time, 10 s each. Only `pending` is announced; `answered`,

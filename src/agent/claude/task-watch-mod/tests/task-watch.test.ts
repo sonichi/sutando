@@ -69,8 +69,9 @@ function fakeChild() {
 // dropSubmits: that many submits resolve as refused (`{ drop }`), the engine's own "did not enter", for dropReason.
 // dispositions: what task_disposition.py prints for a task name (default `pending`); null is a run that fails.
 // The test changes the returned `dispositions` as tasks get answered.
-// tiers: the access_tier the tier helper reads for a task path (default `owner`); tierFails: the helper exits non-zero.
-function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: number[]; silent?: boolean; dropSubmits?: number; dropReason?: string; dispositions?: Record<string, string | null>; tiers?: Record<string, string>; tierFails?: boolean } = {}) {
+// tiers: what task_watch_owner.py prints for a task path (default `owner`); tierFails: it exits non-zero;
+// tierDelay: it answers after that long.
+function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: number[]; silent?: boolean; dropSubmits?: number; dropReason?: string; dispositions?: Record<string, string | null>; tiers?: Record<string, string>; tierFails?: boolean; tierDelay?: number } = {}) {
   const clock = fakeClock()
   const submitted: string[] = []
   const attempts: string[] = []
@@ -96,10 +97,11 @@ function setup(opts: { held?: string[]; rejectSubmits?: number; submitDelays?: n
       if (argv[2] === 'workspace') return '/ws\n'
       if (argv[2] === 'watch-argv') return WATCH_ARGV.join('\n') + '\n'
       if (argv[2] === 'role-present') return `${held.length ? held.shift() : 'no'}\n`
-      if (argv[1] === '-I' && argv[2] === '-c' && argv[4] === '/repo/src') {
-        expect(argv[5]).toBe('/ws')
-        const paths = argv.slice(6)
+      if (argv[1] === '/repo/src/task_watch_owner.py') {
+        expect(argv.slice(2, 5)).toEqual(['--workspace', '/ws', '--'])
+        const paths = argv.slice(5)
         tierAsks.push(paths)
+        if (opts.tierDelay) await clock.sleep(opts.tierDelay)
         return opts.tierFails ? null : paths.map((p) => `${opts.tiers?.[p] ?? 'owner'}\n`).join('')
       }
       if (argv[1] === '/repo/src/task_disposition.py') {
@@ -660,7 +662,7 @@ test('pure: only an exact owner tier is mid-turn work; a failed helper or a miss
     + 'Read each one. If it is quick, handle it fully now; otherwise say what you will do and when, then resume your current work.')
 })
 
-test('an owner task announced mid-turn reaches the next main tool call once, and is not submitted when the turn ends', async () => {
+test('an owner task announced mid-turn reaches the next main tool call once; answered in the turn, it is not submitted at its end', async () => {
   const h = setup()
   await h.clock.advance(0)
   // No turn runs: a tool call outside a turn carries nothing, and the task is submitted as before.
@@ -673,11 +675,89 @@ test('an owner task announced mid-turn reaches the next main tool call once, and
   expect(h.checks).toEqual(['task-1.txt'])
   // Later tool calls in the same turn carry nothing: it was named once.
   expect(await h.w.midTurn()).toBe(null)
+  expect(h.tierAsks.length).toBe(1)
+  h.dispositions['task-1.txt'] = 'answered'
   h.w.turnIdle()
   void h.w.flush()
   await h.clock.advance(3_600_000)
+  expect(h.checks).toEqual(['task-1.txt', 'task-1.txt'])
   expect(h.attempts).toEqual([])
   expect(trailOf(h)).toContain('delivered mid-turn via tool result: task-1.txt')
+})
+
+test('a task named mid-turn and still pending when the turn ends (deferred) is announced then, exactly once', async () => {
+  const h = setup()
+  await h.clock.advance(0)
+  h.w.turnStart()
+  h.children[0].out('TASK_FILE: task-1.txt\nQUEUE: 0 pending after this\n')
+  await h.clock.advance(5_000)
+  expect(await h.w.midTurn()).toBe(midTurnNotice(['task-1.txt']))
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(3_600_000)
+  expect(h.attempts).toEqual(['TASK_FILE: task-1.txt'])
+  // The turn that announcement started neither names it again nor announces it a third time.
+  h.w.turnStart(undefined, 'TASK_FILE: task-1.txt')
+  expect(await h.w.midTurn()).toBe(null)
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(3_600_000)
+  expect(h.attempts).toEqual(['TASK_FILE: task-1.txt'])
+})
+
+test('a Stop or turn end during the mid-turn check names nothing and loses nothing', async () => {
+  const h = setup({ tierDelay: 1_000 })
+  await h.clock.advance(0)
+  h.w.turnStart()
+  h.children[0].out('TASK_FILE: task-1.txt\nQUEUE: 0 pending after this\n')
+  await h.clock.advance(5_000)
+  const aborted = new AbortController()
+  const named = h.w.midTurn(undefined, aborted.signal)
+  aborted.abort()
+  await h.clock.advance(1_000)
+  expect(await named).toBe(null)
+  expect(trailOf(h)).toContain('the turn ended or was interrupted during the mid-turn check; left for its end')
+  // The turn ends during a second check: the task is still held and goes out from the turn-end flush.
+  const again = h.w.midTurn()
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(1_000)
+  expect(await again).toBe(null)
+  await h.clock.advance(60_000)
+  expect(h.attempts).toEqual(['TASK_FILE: task-1.txt\nQUEUE: 0 pending after this'])
+})
+
+test('a mid-turn check past its 5 s budget returns the tool result untouched and leaves the task for the turn end', async () => {
+  const h = setup({ tierDelay: 20_000 })
+  await h.clock.advance(0)
+  h.w.turnStart()
+  h.children[0].out('TASK_FILE: task-1.txt\nQUEUE: 0 pending after this\n')
+  await h.clock.advance(5_000)
+  const named = h.w.midTurn()
+  await h.clock.advance(5_000)
+  expect(await named).toBe(null)
+  expect(trailOf(h)).toContain("mid-turn check took over 5s; left for the turn's end")
+  // A tool call while the late check still runs does not start a second one.
+  expect(await h.w.midTurn()).toBe(null)
+  expect(h.tierAsks.length).toBe(1)
+  await h.clock.advance(20_000)
+  h.w.turnIdle()
+  void h.w.flush()
+  await h.clock.advance(60_000)
+  expect(h.attempts).toEqual(['TASK_FILE: task-1.txt\nQUEUE: 0 pending after this'])
+})
+
+test('while a resend waits, its text sits in the buffer only to be counted: a tool call does not name it', async () => {
+  const h = setup({ silent: true })
+  const first = 'TASK_FILE: task-1.txt\nQUEUE: 0 pending after this'
+  await h.clock.advance(0)
+  h.children[0].out(`${first}\n`)
+  await h.clock.advance(15_000 + 1_000)
+  expect(h.attempts).toEqual([first])
+  // The person's own turn starts during the resend wait.
+  h.w.turnStart(undefined, 'hello')
+  expect(await h.w.midTurn()).toBe(null)
+  expect(h.tierAsks).toEqual([])
 })
 
 test('a subagent tool call carries nothing: the task waits for a main tool call or the turn end', async () => {
@@ -717,6 +797,7 @@ test('only owner tasks are named mid-turn; the rest are asked about once and sub
   expect(await h.w.midTurn()).toBe(midTurnNotice(['task-1.txt']))
   expect(await h.w.midTurn()).toBe(null)
   expect(h.tierAsks).toEqual([['/ws/deliveries/w1/task-1.txt', '/ws/deliveries/w1/task-2.txt']])
+  h.dispositions['task-1.txt'] = 'answered'
   h.w.turnIdle()
   void h.w.flush()
   await h.clock.advance(60_000)
