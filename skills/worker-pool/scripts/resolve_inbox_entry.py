@@ -23,6 +23,9 @@ import pool_delivery as pd  # noqa: E402
 
 
 NO_PAYLOAD_RC = 3
+# `--batch` proves it was understood by printing this line first; a caller that
+# does not see it falls back to one call per entry.
+BATCH_HEADER = "resolve-inbox-entry batch v1"
 
 
 class NoPayload(ValueError):
@@ -49,6 +52,25 @@ def resolve(entry: str, workspace=None) -> Path:
     raise NoPayload(f"sentinel {task_id} names no payload at {path} ({state})")
 
 
+def _one(entry: str, workspace) -> tuple[int, str, str]:
+    """(rc, payload or "", reason) for one entry, with the single-entry exit codes."""
+    try:
+        return 0, str(resolve(entry, workspace)), ""
+    except NoPayload as e:
+        return NO_PAYLOAD_RC, "", str(e)
+    except (ValueError, pd.NotDelivered) as e:
+        return 1, "", str(e)
+
+
+def batch(entries, workspace, out=sys.stdout) -> None:
+    """One line per entry, `<rc>\t<payload>\t<entry>`, after BATCH_HEADER: the
+    same verdicts as N single calls, for one process instead of N."""
+    print(BATCH_HEADER, file=out)
+    for entry in entries:
+        rc, payload, _reason = _one(entry, workspace)
+        print(f"{rc}\t{payload}\t{entry}", file=out)
+
+
 def main(argv: list[str] | None = None) -> int:
     """`--workspace` is the tree the CALLER is serving, and it wins. The watcher
     treats its own assignment as authoritative, so a resolver that derived one
@@ -62,18 +84,18 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         workspace = args[i + 1].strip() or None
         args = args[:i] + args[i + 2:]
+    if args == ["--batch"]:
+        batch([ln for ln in sys.stdin.read().split("\n") if ln], workspace)
+        return 0
     if len(args) != 1 or not args[0]:
-        print(f"usage: {Path(sys.argv[0]).name} <sentinel-path> [--workspace <dir>]",
+        print(f"usage: {Path(sys.argv[0]).name} <sentinel-path>|--batch [--workspace <dir>]",
               file=sys.stderr)
         return 2
-    try:
-        print(resolve(args[0], workspace))
-    except NoPayload as e:
-        print(f"resolve_inbox_entry: {e}", file=sys.stderr)
-        return NO_PAYLOAD_RC
-    except (ValueError, pd.NotDelivered) as e:
-        print(f"resolve_inbox_entry: {e}", file=sys.stderr)
-        return 1
+    rc, payload, reason = _one(args[0], workspace)
+    if rc:
+        print(f"resolve_inbox_entry: {reason}", file=sys.stderr)
+        return rc
+    print(payload)
     return 0
 
 

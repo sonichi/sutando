@@ -5,6 +5,7 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$REPO/tests/fixtures/clean-watcher-env.sh"
 WATCHER="$REPO/src/watch-tasks-stream.sh"
 fail=0
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/sut-standby-sent.XXXXXX")"

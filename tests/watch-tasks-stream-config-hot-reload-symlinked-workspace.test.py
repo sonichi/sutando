@@ -25,6 +25,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
+from clean_watcher_env import clean_env  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _helpers.process_group import kill_group, popen_bound, unbind  # noqa: E402
@@ -83,7 +85,7 @@ def stop(p):
 
 
 def start_watcher(ws_spelling):
-    env = dict(os.environ)
+    env = clean_env()
     for k in list(env):
         if k.startswith("SUTANDO_"):
             env.pop(k)

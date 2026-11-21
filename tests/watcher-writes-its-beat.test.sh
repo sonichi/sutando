@@ -3,6 +3,8 @@
 # exits — a beat that outlives its writer is the defect #4213 records in the core's.
 set -u
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=fixtures/clean-watcher-env.sh
+. "$REPO/tests/fixtures/clean-watcher-env.sh"
 fails=0
 check() { if eval "$2"; then echo "  ok: $1"; else echo "  FAIL: $1"; fails=$((fails+1)); fi; }
 
