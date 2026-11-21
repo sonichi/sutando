@@ -113,10 +113,22 @@ leave out `mcp(*)` only, so agy asks and the policy decides:
   connector as `--token-env-file`) and a seat's own keys; the relay token stays in that child, and agy receives
   only the short-lived access token, as the server's `Authorization` header. agy's own environment is
   unchanged (the install's allowlist): no relay token, no token file path.
-- **When.** Only when agy's `initialize` declares HTTP MCP (`agentCapabilities.mcpCapabilities.http`), since
-  ACP has no other way to pass the header. agy 1.5.9, measured signed out, declared none: with such an agy the
-  Session gets no server and the log says why. Also none when the install has no token file (`--work` with a
-  bridge you run) or the exchange fails (logged; the turn runs without the tools).
+- **Transport.** HTTP when agy's `initialize` declares it (`agentCapabilities.mcpCapabilities.http`). agy
+  1.5.9 and 1.5.13 declare no `mcpCapabilities` at all, so for them the server is **stdio**: the desktop app's
+  `ag2-mcp-proxy` (`engine/ag2-mcp-proxy.mjs`, the same stdio proxy Claude Code and Codex cores run as their
+  `s-space` server), named at install with `--mcp-proxy-command '<node> <path>/ag2-mcp-proxy.mjs'`. Each turn
+  the connector runs `ag2-sparrow-mcp descriptor` in the same isolated child and writes the proxy's
+  non-secret descriptor (0600, `state/ag2-mcp-descriptor.json`: mint and MCP URLs, the agent's token file and
+  key, the secret's sha256 and the agent id). agy gets `{name: ag2-space, command, args, env:
+  [AG2_MCP_DESCRIPTOR, AG2_MCP_LOG]}`: paths only, exactly what Claude Code's stdio entry carries. The proxy,
+  agy's child, reads the relay token from the token file, mints as the agent, sends the relay token only to
+  the mint and the access token only to the MCP endpoint, and scrubs its own environment.
+- **Token file shape (stdio).** The proxy reads a `REMOTE_TASK_TOKEN=<relay>|<secret>` line, so the stdio
+  path works with an agent `.env` passed as `--token-env-file`. A seat made by `--token-stdin` or `connect`
+  keeps the token as a raw line in a separate file the proxy cannot read: `descriptor` refuses it and the
+  turn runs without the tools (logged).
+- **When none.** No token file (`--work` with a bridge you run), no HTTP and no `--mcp-proxy-command`, or a
+  failed exchange: the turn runs without the tools and the log says why.
 - **Which tools.** agy asks before each MCP call; the policy grants, to owner and team turns only, the
   `ag2-space` server's `ag2.whoami`, `room.list`, `room.inspect`, `room.actions.search`,
   `room.actions.describe`, `room.action.read`, `room.action.execute`, `room.action.execute_safe`,

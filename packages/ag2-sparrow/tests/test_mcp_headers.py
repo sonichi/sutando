@@ -13,6 +13,7 @@ plain http to loopback) is refused before the bearer is sent.
 
 Run: python3 packages/ag2-sparrow/tests/test_mcp_headers.py
 """
+import hashlib
 import http.server
 import io
 import json
@@ -140,6 +141,31 @@ class HeadersTest(unittest.TestCase):
         self.assertNotIn(SECRET, out + err)
         self.assertEqual([p for _, p, _, _ in self.stub.seen],
                          ["/relay/v1/mcp/discovery", "/api/v1/mcp/agent-access-tokens"])
+
+    def test_descriptor_names_the_agents_token_file_for_the_stdio_proxy_and_no_secret(self):
+        d = tempfile.mkdtemp(prefix="mcp-desc-")
+        env_file = os.path.join(d, ".env")
+        with open(env_file, "w") as fh:
+            fh.write(f"AGENT_MXID=@a:s.space\nREMOTE_TASK_TOKEN='{self.stub.relay}|{SECRET}'\n")
+        rc, out, err = _run_main(["descriptor"], (self.stub.relay, SECRET, env_file))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out), {"version": 1, "lane": "primary", "env_file": env_file,
+                                           "env_key": "REMOTE_TASK_TOKEN",
+                                           "mint_url": f"{self.stub.base}/api/v1/mcp/agent-access-tokens",
+                                           "mcp_url": f"{self.stub.base}/mcp", "relay": self.stub.relay,
+                                           "bearer_digest": hashlib.sha256(SECRET.encode()).hexdigest()})
+        self.assertNotIn(SECRET, out + err)
+        self.assertEqual([p for _, p, _, _ in self.stub.seen], ["/relay/v1/mcp/discovery"], "nothing is minted")
+
+    def test_descriptor_refuses_a_token_the_proxy_cannot_read(self):
+        raw = os.path.join(tempfile.mkdtemp(prefix="mcp-desc-"), "token")
+        with open(raw, "w") as fh:
+            fh.write(f"{self.stub.relay}|{SECRET}\n")   # a seat's raw token file
+        for gateway in ((self.stub.relay, SECRET, raw), (self.stub.relay, SECRET, "")):
+            rc, out, err = _run_main(["descriptor"], gateway)
+            self.assertEqual((rc, out), (1, ""), gateway[2])
+            self.assertNotIn(SECRET, err)
+        self.assertEqual(self.stub.seen, [], "the bearer is not sent for a descriptor that cannot work")
 
     def test_owner_tools_are_the_ag2_space_servers_room_tools_only(self):
         ok = mcp_auth.owner_tool_ok

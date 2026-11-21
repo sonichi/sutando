@@ -8,6 +8,7 @@ agent's own room membership and grants.
     ag2-sparrow-mcp headers   # {"Authorization": "Bearer <access token>"}, for headersHelper
     ag2-sparrow-mcp setup     # the `claude mcp add-json` line that wires `headers` in
     ag2-sparrow-mcp acp       # one ACP `McpServer` (http, with that header), for an ACP client
+    ag2-sparrow-mcp descriptor  # the stdio `ag2-mcp-proxy` descriptor naming the agent's token file
 
 `headers` mints on every run and caches nothing: Claude Code runs it at connect and
 again after a 401, so an expired token is replaced without the bearer touching disk.
@@ -17,6 +18,7 @@ again after a 401, so an expired token is replaced without the bearer touching d
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shlex
 import sys
@@ -191,6 +193,30 @@ def acp_entry(gateway: Gateway) -> dict:
             "headers": [{"name": "Authorization", "value": f"Bearer {mint(mint_url, bearer)}"}]}
 
 
+_PROXY_TOKEN_KEYS = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN")
+
+
+def stdio_descriptor(gateway: Gateway) -> dict:
+    """The non-secret descriptor the desktop's stdio `ag2-mcp-proxy` reads (AG2_MCP_DESCRIPTOR): the discovered
+    mint and MCP URLs, the agent's own token file, whose `REMOTE_TASK_TOKEN=` line the proxy mints from, and
+    `bearer_digest`, the sha256 of that secret the proxy checks a plain mint against (as the desktop writes it)."""
+    url, bearer, env_file = _require(gateway)
+    if not env_file:
+        raise McpAuthError("the token came from the environment, not a file the stdio proxy can read")
+    try:
+        text = Path(env_file).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise McpAuthError(f"the token file is unreadable ({type(exc).__name__})")
+    # The proxy reads `KEY=value` lines only (no `export `); a seat's raw token file has none.
+    keys = [k for k in _PROXY_TOKEN_KEYS if any(line.strip().startswith(k + "=") for line in text.splitlines())]
+    if not keys:
+        raise McpAuthError("the token file has no REMOTE_TASK_TOKEN= line the stdio proxy reads (a seat's raw token file?)")
+    mint_url, mcp_url = discover(url, bearer)
+    return {"version": 1, "lane": "primary", "env_file": env_file, "env_key": keys[0], "mint_url": mint_url,
+            "mcp_url": mcp_url, "relay": url.rstrip("/"),
+            "bearer_digest": hashlib.sha256(bearer.strip().encode("utf-8")).hexdigest()}
+
+
 def setup_lines(gateway: Gateway) -> list:
     _url, _bearer, env_file = _require(gateway)
     cfg = setup_entry(gateway)
@@ -204,7 +230,7 @@ def setup_lines(gateway: Gateway) -> list:
 
 def main(argv=None, resolve: Callable[[], Gateway] = resolve_gateway) -> int:
     parser = argparse.ArgumentParser(prog="ag2-sparrow-mcp", description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("headers", "setup", "acp"))
+    parser.add_argument("command", choices=("headers", "setup", "acp", "descriptor"))
     args = parser.parse_args(argv)
     try:
         gateway = resolve()
@@ -212,6 +238,8 @@ def main(argv=None, resolve: Callable[[], Gateway] = resolve_gateway) -> int:
             print(json.dumps(headers(gateway)))
         elif args.command == "acp":
             print(json.dumps(acp_entry(gateway)))
+        elif args.command == "descriptor":
+            print(json.dumps(stdio_descriptor(gateway)))
         else:
             print("\n".join(setup_lines(gateway)))
     except McpAuthError as exc:

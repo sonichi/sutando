@@ -78,12 +78,12 @@ MINT_TIMEOUT_S = 30.0
 MINT_ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "TMPDIR")
 
 
-def mint_argv():
-    """`ag2-sparrow-mcp acp` from this very package (a source tree or the zipapp), isolated (-I) so neither the
-    child's directory nor PYTHONPATH can put another module first."""
+def mint_argv(command="acp"):
+    """`ag2-sparrow-mcp <command>` from this very package (a source tree or the zipapp), isolated (-I) so neither
+    the child's directory nor PYTHONPATH can put another module first."""
     root = str(Path(mcp_auth.__file__).resolve().parents[1])
     code = ("import sys; sys.path.insert(0, %r); from ag2_sparrow.mcp_auth import main; "
-            "raise SystemExit(main(['acp']))" % root)
+            "raise SystemExit(main([%r]))" % (root, command))
     return [sys.executable, "-I", "-c", code]
 
 
@@ -100,14 +100,13 @@ def mint_env(token_env_file, agent_id, environ=None):
     return env, ""
 
 
-def sspace_entry(token_env_file, agent_id, run=subprocess.run):
-    """(the ACP `McpServer` for AG2 Space as this agent, '') or (None, why). The relay token stays in the
-    child; only the short-lived access token it mints comes back, in the entry's Authorization header."""
+def _exchange(command, token_env_file, agent_id, run):
+    """(the JSON object `ag2-sparrow-mcp <command>` printed, '') or (None, why), run as `mint_env` says."""
     env, problem = mint_env(token_env_file, agent_id)
     if problem:
         return None, problem
     try:
-        done = run(mint_argv(), env=env, cwd=os.path.dirname(token_env_file) or "/", capture_output=True,
+        done = run(mint_argv(command), env=env, cwd=os.path.dirname(token_env_file) or "/", capture_output=True,
                    text=True, timeout=MINT_TIMEOUT_S, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as e:
         return None, "the token exchange did not run (%s)" % type(e).__name__
@@ -115,7 +114,19 @@ def sspace_entry(token_env_file, agent_id, run=subprocess.run):
         lines = (done.stderr or "").strip().splitlines()
         return None, (lines[-1][:200] if lines else "the token exchange exited %s" % done.returncode)
     try:
-        entry = json.loads(done.stdout)
+        out = json.loads(done.stdout)
+    except ValueError:
+        out = None
+    return (out, "") if isinstance(out, dict) else (None, "the token exchange printed no JSON object")
+
+
+def sspace_entry(token_env_file, agent_id, run=subprocess.run):
+    """(the ACP HTTP `McpServer` for AG2 Space as this agent, '') or (None, why). The relay token stays in the
+    child; only the short-lived access token it mints comes back, in the entry's Authorization header."""
+    entry, why = _exchange("acp", token_env_file, agent_id, run)
+    if entry is None:
+        return None, why
+    try:
         mcp_auth._safe_url("mcp_url", entry.get("url"))
         ok = (entry.get("type") == "http" and entry.get("name") == mcp_auth.SERVER_NAME
               and isinstance(entry.get("headers"), list)
@@ -124,6 +135,43 @@ def sspace_entry(token_env_file, agent_id, run=subprocess.run):
     except (ValueError, AttributeError, mcp_auth.McpAuthError):
         ok = False
     return (entry, "") if ok else (None, "the token exchange printed no MCP server entry")
+
+
+DESCRIPTOR_NAME = "ag2-mcp-descriptor.json"
+PROXY_LOG_NAME = "ag2-mcp-proxy.log"
+
+
+def stdio_entry(proxy_command, token_env_file, agent_id, state_dir, run=subprocess.run):
+    """(the ACP stdio `McpServer` running the desktop's `ag2-mcp-proxy` as this agent, '') or (None, why). The
+    proxy gets only the path of a non-secret descriptor (written 0600 in `state_dir`) naming the agent's own
+    token file, as Claude Code's `ag2-space` stdio entry does; the relay token never enters agy's environment."""
+    argv = shlex.split(proxy_command or "")
+    if not argv:
+        return None, "no --mcp-proxy-command"
+    desc, why = _exchange("descriptor", token_env_file, agent_id, run)
+    if desc is None:
+        return None, why
+    try:
+        for k in ("mint_url", "mcp_url"):
+            mcp_auth._safe_url(k, desc.get(k))
+        ok = desc.get("version") == 1 and isinstance(desc.get("env_key"), str) and isinstance(desc.get("env_file"), str) \
+            and os.path.realpath(desc["env_file"]) == os.path.realpath(token_env_file)
+    except mcp_auth.McpAuthError:
+        ok = False
+    if not ok:
+        return None, "the token exchange printed no proxy descriptor"
+    if isinstance(agent_id, str) and agent_id.startswith("@") and ":" in agent_id:
+        desc["agent_id"] = agent_id   # who a re-mint must turn out to be
+    state = os.path.abspath(state_dir)
+    path = os.path.join(state, DESCRIPTOR_NAME)
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(desc, f)
+    os.replace(tmp, path)
+    return {"name": mcp_auth.SERVER_NAME, "command": argv[0], "args": argv[1:],
+            "env": [{"name": "AG2_MCP_DESCRIPTOR", "value": path},
+                    {"name": "AG2_MCP_LOG", "value": os.path.join(state, PROXY_LOG_NAME)}]}, ""
 
 
 def declares_http_mcp(init):
@@ -190,26 +238,32 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
 
 
 class Connector:
-    def __init__(self, args, client_factory=AcpClient, note=None, mcp_entry=sspace_entry):
+    def __init__(self, args, client_factory=AcpClient, note=None, mcp_entry=sspace_entry, proxy_entry=stdio_entry):
         self.args = args
         self.client_factory = client_factory
         self.mcp_entry = mcp_entry
+        self.proxy_entry = proxy_entry
         self.note = note if note is not None else NON_OWNER_NOTE
         self.store = SessionStore(args.session_store)
         self.name = NAME
         self.retry_at = {}
 
     def sspace_servers(self, init):
-        """An owner's or team turn's MCP servers: AG2 Space as this agent, when agy declares HTTP MCP and the
-        install named the agent's token file; else none, with the reason logged."""
+        """An owner's or team turn's MCP servers: AG2 Space as this agent, over HTTP when agy declares it, else
+        over stdio through --mcp-proxy-command; none without the agent's token file, with the reason logged."""
         token_file = getattr(self.args, "token_env_file", None)
+        agent_id = getattr(self.args, "agent_id", None) or ""
         if not token_file:
             log("ag2-space MCP tools not offered: no --token-env-file (the agent's own token file)")
             return []
-        if not declares_http_mcp(init):
-            log("ag2-space MCP tools not offered: agy's initialize declares no HTTP MCP transport")
+        if declares_http_mcp(init):
+            entry, why = self.mcp_entry(token_file, agent_id)
+        elif getattr(self.args, "mcp_proxy_command", None):
+            entry, why = self.proxy_entry(self.args.mcp_proxy_command, token_file, agent_id, self.args.state)
+        else:
+            log("ag2-space MCP tools not offered: agy declares no HTTP MCP transport and no --mcp-proxy-command "
+                "is set")
             return []
-        entry, why = self.mcp_entry(token_file, getattr(self.args, "agent_id", None) or "")
         if entry is None:
             log("ag2-space MCP tools not offered:", why)
             return []
@@ -331,6 +385,9 @@ def build_parser():
                     help="the agent's own token .env (its bridge's): owner and team turns get the ag2-space MCP "
                          "tools as this agent, minted from it per turn (default: no MCP tools)")
     ap.add_argument("--agent-id", default=None, help="the agent's Matrix ID, to check a seat .env against")
+    ap.add_argument("--mcp-proxy-command", default=None,
+                    help="the stdio ag2-mcp-proxy command line (node and the desktop app's ag2-mcp-proxy.mjs), "
+                         "for an agy that declares no HTTP MCP (default: none)")
     ap.add_argument("--session-store", default=None,
                     help="the sessions.json to resume from and record to (default: <work>/state/sessions.json)")
     ap.add_argument("--allow-non-owner", action="store_true",

@@ -33,7 +33,7 @@ COMMAND = "ag2-sparrow-antigravity-local"
 ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "TMPDIR", "SHELL")
 REQUIRED_KEYS = ("ACP_COMMAND", "CWD", "INBOX_DIR", "RESULTS_DIR")
 CONFIG_KEYS = ("ACP_COMMAND", "CWD", "SESSION_STORE", "INBOX_DIR", "RESULTS_DIR",
-               "ALLOW_NON_OWNER") + cb.CONFIG_KEYS
+               "ALLOW_NON_OWNER", "MCP_PROXY_COMMAND") + cb.CONFIG_KEYS
 LOCAL = Shape(name=SHAPE, command=COMMAND, description="Antigravity CLI on Sparrow",
               cli="Antigravity CLI", min_version=(0, 0, 0), version_anchor=r"^\d",
               version_note="the ACP wake and the sign-in are checked by verify, not by a version",
@@ -85,6 +85,8 @@ def connector_argv(cfg: dict, root: str, root_fd: int) -> list:
         argv.append("--allow-non-owner")
     if cfg.get("TOKEN_ENV_FILE"):
         argv += ["--token-env-file", cfg["TOKEN_ENV_FILE"], "--agent-id", cfg.get("AGENT_ID", "")]
+    if cfg.get("MCP_PROXY_COMMAND"):
+        argv += ["--mcp-proxy-command", cfg["MCP_PROXY_COMMAND"]]
     return argv
 
 
@@ -146,7 +148,8 @@ def resolve_root(args) -> "tuple[dict, str]":
 
 
 RECORDED = (("ACP_COMMAND", "acp_command", str), ("CWD", "cwd", str),
-            ("SESSION_STORE", "session_store", str), ("ALLOW_NON_OWNER", "allow_non_owner", lambda v: v == "1"))
+            ("SESSION_STORE", "session_store", str), ("ALLOW_NON_OWNER", "allow_non_owner", lambda v: v == "1"),
+            ("MCP_PROXY_COMMAND", "mcp_proxy_command", str))
 
 
 def signed_in_problem(args, acp: str) -> str:
@@ -190,6 +193,7 @@ def install(args) -> int:
               "SESSION_STORE": str(Path(args.session_store).expanduser().resolve()) if args.session_store else "",
               "INBOX_DIR": str(Path(root) / "tasks"), "RESULTS_DIR": str(Path(root) / "results"),
               "ALLOW_NON_OWNER": "1" if args.allow_non_owner else "", "AGENT_ID": where["agent_id"],
+              "MCP_PROXY_COMMAND": getattr(args, "mcp_proxy_command", None) or "",
               "BRIDGE": mode if mode != EXTERNAL else "", "TOKEN_ENV_FILE": where["token_file"], "TOKEN_VAULT_KEY": "",
               "BRIDGE_STATE_DIR": str(cb.bridge_home(root) / "state") if mode != EXTERNAL else ""}
 
@@ -337,6 +341,8 @@ def session_options(p) -> None:
                    "(default: <work root>/workspace)")
     p.add_argument("--session-store", help="the sessions.json to resume from and record to (default: the work "
                    "root's state/sessions.json)")
+    p.add_argument("--mcp-proxy-command", help="the stdio ag2-mcp-proxy command line ('<node> <the desktop app's "
+                   "engine/ag2-mcp-proxy.mjs>'): AG2 Space tools for an agy that declares no HTTP MCP")
     p.add_argument("--allow-non-owner", action="store_true",
                    help="serve non-owner senders, attested collaborators included, on the owner's agy sign-in "
                    "(no file operations granted; default: the owner only)")

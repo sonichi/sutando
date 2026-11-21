@@ -750,5 +750,106 @@ class SspaceToolsTest(unittest.TestCase):
         self.assertNotIn("--token-env-file", " ".join(cli.connector_argv(dict(cfg, TOKEN_ENV_FILE=""), "/w", 7)))
 
 
+PROXY = "/app/node /app/ag2-mcp-proxy.mjs"
+
+
+class SspaceStdioTest(unittest.TestCase):
+    """agy 1.5.13 declares no HTTP MCP: the tools then go over stdio, through the desktop's ag2-mcp-proxy."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.w = Work(self.tmp.name)
+        self.token_file = os.path.join(self.tmp.name, "agent.env")
+        with open(self.token_file, "w") as f:
+            f.write("AGENT_MXID=@agy:s.space\n")
+        os.chmod(self.token_file, 0o600)
+        self.desc = {"version": 1, "lane": "primary", "env_file": self.token_file, "env_key": "REMOTE_TASK_TOKEN",
+                     "mint_url": "https://relay.s.space/api/v1/mcp/agent-access-tokens",
+                     "mcp_url": "https://mcp.s.space/mcp", "relay": "https://relay.s.space"}
+        self.runs = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_child(self, argv, **kw):
+        self.runs.append((argv, kw["env"]))
+        return mock.Mock(returncode=0, stdout=json.dumps(self.desc), stderr="")
+
+    def serve(self, *extra, n=1, proxy=PROXY):
+        a = self.w.args("--token-env-file", self.token_file, "--agent-id", "@agy:s.space",
+                        *(["--mcp-proxy-command", proxy] if proxy else []), *extra)
+        a.once = n
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            gc.Connector(a, mcp_entry=lambda *x: (dict(ENTRY), ""),
+                         proxy_entry=lambda cmd, tf, aid, st: gc.stdio_entry(cmd, tf, aid, st, run=self.run_child)
+                         ).serve()
+        return err.getvalue()
+
+    def sent(self):
+        return [r["params"]["mcpServers"] for r in self.w.records() if r.get("method") == "session/new"]
+
+    def test_an_owner_turn_gets_the_stdio_proxy_with_only_a_descriptor_path(self):
+        self.w.task("task-1", "STUB:MCP make a page")
+        self.serve()
+        [[entry]] = self.sent()
+        state = os.path.abspath(str(self.w.root / "state"))
+        desc_path = os.path.join(state, gc.DESCRIPTOR_NAME)
+        self.assertEqual(entry, {"name": "ag2-space", "command": "/app/node", "args": ["/app/ag2-mcp-proxy.mjs"],
+                                 "env": [{"name": "AG2_MCP_DESCRIPTOR", "value": desc_path},
+                                         {"name": "AG2_MCP_LOG", "value": os.path.join(state, gc.PROXY_LOG_NAME)}]})
+        self.assertEqual(json.loads(Path(desc_path).read_text()), dict(self.desc, agent_id="@agy:s.space"))
+        self.assertEqual(os.stat(desc_path).st_mode & 0o777, 0o600)
+        argv, env = self.runs[0]
+        self.assertIn("main(['descriptor'])", argv[-1])
+        self.assertEqual(env["AG2_DEVICE_ENV"], self.token_file)
+        perms = [(r["permission"], r["allowed"]) for r in self.w.records() if "permission" in r]
+        self.assertEqual([ok for _, ok in perms], [True, True, False, False, False, False])
+
+    def test_http_is_used_when_agy_declares_it_and_stdio_is_not_started(self):
+        (self.w.home / "mcp-http").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.serve()
+        self.assertEqual(self.sent(), [[ENTRY]])
+        self.assertEqual(self.runs, [])
+
+    def test_a_team_turn_gets_the_proxy_and_a_guest_turn_gets_nothing(self):
+        self.w.task("task-1", "STUB:MCP page", tier="team", collaborator=True)
+        self.w.task("task-2", "STUB:MCP page", tier="guest", channel="!b:s.space")
+        os.utime(self.w.root / "tasks" / "task-2.txt", (2e9, 2e9))
+        self.serve("--allow-non-owner", n=2)
+        sent = self.sent()
+        self.assertEqual([e["name"] for e in sent[0]], ["ag2-space"])
+        self.assertEqual(sent[1], [])
+        self.assertEqual(len(self.runs), 1, "nothing is run for the guest")
+        perms = [r["allowed"] for r in self.w.records() if "permission" in r]
+        self.assertEqual(perms, [True, True, False, False, False, False] + [False] * 6)
+
+    def test_no_proxy_command_and_no_http_offers_nothing_and_says_why(self):
+        self.w.task("task-1", "STUB:TEXT hi")
+        err = self.serve(proxy=None)
+        self.assertIn("declares no HTTP MCP transport and no --mcp-proxy-command", err)
+        self.assertEqual(self.sent(), [[]])
+
+    def test_a_descriptor_that_is_not_the_agents_own_token_file_is_refused(self):
+        state = str(self.w.root / "state")
+        for bad in (dict(self.desc, env_file="/other/agent.env"), dict(self.desc, mint_url="http://evil.example/m"),
+                    dict(self.desc, version=2), {k: v for k, v in self.desc.items() if k != "env_key"}):
+            got = gc.stdio_entry(PROXY, self.token_file, "@agy:s.space", state,
+                                 run=lambda argv, **kw: mock.Mock(returncode=0, stdout=json.dumps(bad), stderr=""))
+            self.assertEqual(got, (None, "the token exchange printed no proxy descriptor"), bad)
+        got = gc.stdio_entry(PROXY, self.token_file, "@agy:s.space", state, run=lambda argv, **kw: mock.Mock(
+            returncode=1, stdout="", stderr="ag2-sparrow-mcp: the token file has no REMOTE_TASK_TOKEN= line"))
+        self.assertEqual(got[0], None)
+        self.assertIn("no REMOTE_TASK_TOKEN= line", got[1])
+        self.assertFalse(os.path.exists(os.path.join(state, gc.DESCRIPTOR_NAME)))
+
+    def test_install_records_and_hands_on_the_proxy_command(self):
+        cfg = {"ACP_COMMAND": "agy acp", "CWD": "/c", "TOKEN_ENV_FILE": "/a/agent.env", "AGENT_ID": "@agy:s.space",
+               "MCP_PROXY_COMMAND": PROXY}
+        argv = cli.connector_argv(cfg, "/w", 7)
+        self.assertEqual(argv[argv.index("--mcp-proxy-command") + 1], PROXY)
+        self.assertIn("MCP_PROXY_COMMAND", cli.CONFIG_KEYS)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
