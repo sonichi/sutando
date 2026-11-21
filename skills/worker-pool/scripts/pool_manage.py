@@ -110,11 +110,12 @@ def _outstanding(workspace, wid) -> list:
 
 
 def _owes(workspace, wid) -> list:
-    """Every task the worker owes, its own inbox's too; `_outstanding` lists only the shared sentinels a
-    hand-off can move. Refused when any of it is unreadable, never read as owing nothing."""
+    """Every task the worker owes, its own inbox's and any shared sentinel it kept from before a move to
+    its own folders; `_outstanding` lists only shared ones. Refused when unreadable, never read as none."""
     import connections
     try:
-        return sorted(sup.owed_task_ids(workspace, wid, strict=True))
+        own = sup.owed_task_ids(workspace, wid, strict=True)
+        return sorted(set(own) | set(sup.sentinel_ids(workspace, wid)[0]))
     except (OSError, ValueError, connections.ConnectionsError):
         raise Refused(f"cannot tell what {wid} still owes (its folders, deliveries, inbox or results "
                       "unreadable)") from None

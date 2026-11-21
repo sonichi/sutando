@@ -224,6 +224,20 @@ class UnansweredInInbox(Base):
         with mock.patch.object(task_dispatch.os, "stat", stat_fails_on_a), self.assertRaises(PermissionError):
             task_dispatch.unanswered_in_inbox(tasks, results, strict=True)
 
+    def test_strict_never_takes_an_unreadable_wake_turn_as_answered(self):
+        from delivery import task_dispatch
+        tasks, results = self.own / "tasks", self.own / "results"
+        (results / "task-w.txt").write_text("earlier turn\n")
+        old = time.time() - 600
+        os.utime(results / "task-w.txt", (old, old))
+        (tasks / "task-w.txt").write_text("id: task-w\nwake_episode: 2\ntask: x\n")
+        self.assertEqual([t for t, _f in task_dispatch.unanswered_in_inbox(tasks, results, strict=True)], ["task-w"])
+        (tasks / "task-w.txt").chmod(0)
+        self.addCleanup((tasks / "task-w.txt").chmod, 0o600)
+        self.assertEqual(task_dispatch.unanswered_in_inbox(tasks, results), [])
+        with self.assertRaises(PermissionError):
+            task_dispatch.unanswered_in_inbox(tasks, results, strict=True)
+
 
 class CompletionArchivedInTheFormerSharedFolder(Base):
     """After a switch, a task in the own inbox answered and archived under the shared results/ is not owed."""

@@ -212,6 +212,25 @@ class SetModel(Base):
         self.assertEqual(self.row()["model"], "sonnet")
         self.assertEqual((self.tmux.killed(), self.started), ([], []))
 
+    def test_a_shared_delivery_kept_after_a_move_to_its_own_folders_keeps_it_running(self):
+        for d in ("tasks", "results"):
+            (self.ws / d).mkdir()
+        (self.ws / "tasks" / "task-x.txt").write_text("id: task-x\ntask: hi\n")
+        self.assertEqual(router.route(self.ws, {"id": "task-x", "requested_worker": WID})["delivered"], [WID])
+        rem.pd.accept(self.ws / "deliveries" / WID / "task-x.txt")
+        self.own_folders()
+        self.assert_deferred(["task-x"])
+
+    def test_a_wake_turn_whose_task_cannot_be_read_is_not_taken_as_answered(self):
+        tasks, results = self.own_folders()
+        (results / "task-w.txt").write_text("the earlier turn's answer\n")
+        old = os.stat(results / "task-w.txt").st_mtime - 600
+        os.utime(results / "task-w.txt", (old, old))
+        (tasks / "task-w.txt").write_text("id: task-w\nwake_episode: 2\ntask: hi\n")
+        (tasks / "task-w.txt").chmod(0)
+        self.addCleanup((tasks / "task-w.txt").chmod, 0o600)
+        self.assert_refused_and_kept()
+
     def test_an_unreadable_folders_record_is_never_read_as_the_shared_folders(self):
         tasks, _ = self.own_folders()
         (tasks / "task-y.txt").write_text("id: task-y\ntask: hi\n")

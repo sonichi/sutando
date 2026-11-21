@@ -152,25 +152,33 @@ def head_abandoned(results_dir: "Path | str", filename: str, payload: "Path | st
 
 
 def has_ready_result(results_dir: "Path | str", filename: str, *,
-                     task_file: "Path | str | None" = None) -> bool:
+                     task_file: "Path | str | None" = None, strict: bool = False) -> bool:
     """True iff task file `filename` has a ready result, live or in any archive layout.
 
     An empty or whitespace-only file — live or archived — is not a delivery and
     does not stop the search; `find_ready_result` walks past it. With `task_file` a wake
     turn, a result older than that file answered an earlier turn of the same id, not this one.
+    `strict` is `_turn_reader`'s.
     """
-    return find_ready_result_for_filename(results_dir, filename, reader=_turn_reader(task_file)) is not None
+    return find_ready_result_for_filename(results_dir, filename,
+                                          reader=_turn_reader(task_file, strict=strict)) is not None
 
 
-def _turn_reader(task_file):
-    """`read_ready_result`, or for a wake turn one that refuses a result older than its task file."""
-    since = _mtime(task_file) if task_file is not None and is_wake_turn(task_file) else None
+def _turn_reader(task_file, strict: bool = False):
+    """`read_ready_result`, or for a wake turn one that refuses a result older than its task file. `strict`
+    raises OSError where the task file cannot be read and refuses a result whose age cannot be read."""
+    if task_file is not None and strict:
+        since = os.stat(task_file).st_mtime if is_wake_turn(task_file, strict=True) else None
+    else:
+        since = _mtime(task_file) if task_file is not None and is_wake_turn(task_file) else None
     if since is None:
         return read_ready_result
 
     def reader(path):
         written = _mtime(path)
-        return None if written is not None and written < since else read_ready_result(path)
+        if written is None:
+            return None if strict else read_ready_result(path)
+        return None if written < since else read_ready_result(path)
     return reader
 
 
@@ -211,21 +219,25 @@ def unanswered_in_inbox(tasks_dir: "Path | str", results_dir: "Path | str", *,
         if not task_id or task_id in seen:
             continue
         seen.add(task_id)
-        if has_ready_result(results_dir, f"{task_id}.txt", task_file=f):
+        if has_ready_result(results_dir, f"{task_id}.txt", task_file=f, strict=strict):
             continue
         if workspace is not None:
             import task_lookup
-            if task_lookup.find_other_archived_ready_result(workspace, task_id, reader=_turn_reader(f)):
+            reader = _turn_reader(f, strict=strict)
+            if task_lookup.find_other_archived_ready_result(workspace, task_id, reader=reader):
                 continue
         owed.append((task_id, f))
     return owed
 
 
-def is_wake_turn(task_file: "Path | str") -> bool:
-    """A queued file a woken task was written to: a new turn of an id an earlier result answered."""
+def is_wake_turn(task_file: "Path | str", *, strict: bool = False) -> bool:
+    """A queued file a woken task was written to: a new turn of an id an earlier result answered.
+    An unreadable file is not one, unless `strict`, which raises OSError."""
     try:
         text = Path(task_file).read_text(encoding="utf-8", errors="replace")
     except OSError:
+        if strict:
+            raise
         return False
     return bool(parse_task_headers(text).headers.get("wake_episode"))
 
