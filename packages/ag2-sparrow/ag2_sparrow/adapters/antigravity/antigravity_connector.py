@@ -11,8 +11,8 @@ with every delivery marker neutralised. A final message of exactly NO_REPLY post
 turn failed gets a line saying so; an event that failed posts nothing.
 
 Sessions, the permission policy and the framing are acp_host's: the owner may read or edit under the working
-directory, and the owner's turns may run commands and fetch or search the web (SHELL_AND_WEB_TIERS: the owner
-only; never a collaborator or a guest). Only the owner is served unless --allow-non-owner, which admits
+directory; with --allow-owner-shell-web the owner's turns may also run commands and fetch or search the web
+(SHELL_AND_WEB_TIERS: the owner only; never a collaborator or a guest). Only the owner is served unless --allow-non-owner, which admits
 attested collaborators and other non-owners alike (task_io.admission decides the tier). A non-owner turn runs
 isolated: a fresh temporary directory per task holds its working directory and its own agy home
 (`--gemini-dir`, with deny-all permission rules and no global context), its Session is new and never stored,
@@ -49,7 +49,7 @@ NOT_SIGNED_IN = ("Antigravity is not signed in on this computer (%s): run `agy` 
                  "or run `agy acp --login`")
 
 
-# Sender tiers (headers["access_tier"]) whose turns may run commands and use the web (owner decision 2026-11-21).
+# Sender tiers (headers["access_tier"]) whose turns may run commands and use the web, under --allow-owner-shell-web.
 # Team is left out on purpose, even on the owner's turn: adding it is the owner's decision.
 SHELL_AND_WEB_TIERS = frozenset({"owner"})
 # agy's own file-tool argument names (path, plain data, nested edits), as its tool schemas declare them.
@@ -103,7 +103,12 @@ def guest_turn(args):
         shutil.rmtree(base, ignore_errors=True)
 
 
-def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_NOTE):
+def shell_web_on(args, headers):
+    """This turn may run commands and fetch or search the web: the install opted in, and the sender is the owner."""
+    return bool(getattr(args, "allow_owner_shell_web", False)) and headers.get("access_tier") in SHELL_AND_WEB_TIERS
+
+
+def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_NOTE, shell_web=False):
     event, _ = trigger_of(headers)
     out = acp_host.task_framing(task_id, headers, message, operator_lines, "post in your final message", note)
     out.append("Answer through Sparrow, exactly once for this task: your final message in this turn is what Sparrow "
@@ -111,7 +116,7 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
                "acknowledgement, thanks or FYI that needs no answer, or an event whose body asks for no post), make "
                "your final message exactly %s and nothing else."
                % (" as the reply" if event in (None, MESSAGE_EVENT) else "", NO_REPLY))
-    if headers.get("access_tier") in SHELL_AND_WEB_TIERS:
+    if shell_web:
         out.append("You may run shell commands and fetch and search the web. You may read and edit files under %s." % cwd)
     else:
         out.append("No shell command is granted in this session. %s"
@@ -133,7 +138,7 @@ class Connector:
         """(status, text, detail, turn): status is completed | cancelled | timeout | gone | failed | refused.
         The owner's turn resumes the room's Session in the working directory; any other runs `guest_turn`."""
         if owner:
-            cwd, tools = self.args.cwd, headers.get("access_tier") in SHELL_AND_WEB_TIERS
+            cwd, tools = self.args.cwd, shell_web_on(self.args, headers)
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
                                        lambda params: acp_host.decide_permission(params, True, cwd, tools=tools,
                                                                                   extra_keys=AGY_KEYS),
@@ -178,7 +183,8 @@ class Connector:
             log("refused (non-owner) ->", task_id, headers["access_tier"])
             publish(result_file, NON_OWNER_REFUSED)
             return {"task": task_id, "status": "refused", "tier": headers["access_tier"]}
-        prompt = wake_prompt(task_id, headers, message, operator_lines, self.args.cwd, self.note)
+        prompt = wake_prompt(task_id, headers, message, operator_lines, self.args.cwd, self.note,
+                             shell_web=tier == "owner" and shell_web_on(self.args, headers))
         event, _ = trigger_of(headers)
         log("wake ->", task_id, headers["access_tier"], event or "message")
         t0 = time.time()
@@ -243,6 +249,9 @@ def build_parser():
     ap.add_argument("--allow-non-owner", action="store_true",
                     help="serve non-owner senders, attested collaborators included, on the owner's agy sign-in "
                          "(no file operations granted; default: the owner only)")
+    ap.add_argument("--allow-owner-shell-web", action="store_true",
+                    help="let the owner's turns run shell commands and fetch or search the web (never a "
+                         "collaborator's or a guest's; default: off)")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=0.2)

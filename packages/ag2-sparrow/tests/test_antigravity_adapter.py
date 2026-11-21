@@ -149,11 +149,29 @@ class ConnectorTest(unittest.TestCase):
         self.assertIn("hello", said)
         self.assertEqual(parse_markers(said).actions, [])
 
-    def test_the_owner_may_edit_only_under_the_working_directory_and_run_commands(self):
+    def test_the_owner_may_edit_only_under_the_working_directory_and_no_command_is_granted_by_default(self):
+        """Without --allow-owner-shell-web an install behaves as before the opt-in existed."""
+        self.w.task("task-1", "STUB:EDIT go")
+        self.w.task("task-2", "STUB:SHELL go", channel="!b:s.space")
+        self.w.task("task-3", "STUB:WEB go", channel="!c:s.space")
+        os.utime(self.w.root / "tasks" / "task-2.txt", (2e9, 2e9))
+        os.utime(self.w.root / "tasks" / "task-3.txt", (3e9, 3e9))
+        self.w.serve(3)
+        self.assertEqual(self.permissions(), {"WriteFile notes.txt": True, "WriteFile /etc/stub-outside": False,
+                                              "rm -rf ~ [current working directory]": False, "date": False,
+                                              "Fetch https://example.com/": False,
+                                              "Search the web: news today": False})
+        reasons = [d["reason"] for m in self.w.metrics() for d in m["permissions"]]
+        self.assertEqual(reasons[:3], ["under the working directory", "outside the working directory",
+                                       "no command is granted"])
+        prompt = next(r["text"] for r in self.w.records() if r.get("method") == "session/prompt")
+        self.assertIn("No shell command is granted", prompt)
+
+    def test_with_the_opt_in_the_owner_may_run_commands(self):
         self.w.task("task-1", "STUB:EDIT go")
         self.w.task("task-2", "STUB:SHELL go", channel="!b:s.space")
         os.utime(self.w.root / "tasks" / "task-2.txt", (2e9, 2e9))
-        self.w.serve(2)
+        self.w.serve(2, "--allow-owner-shell-web")
         perms = [r for r in self.w.records() if "permission" in r]
         self.assertEqual(perms, [{"permission": "WriteFile notes.txt", "allowed": True},
                                  {"permission": "WriteFile /etc/stub-outside", "allowed": False},
@@ -165,10 +183,10 @@ class ConnectorTest(unittest.TestCase):
     def permissions(self):
         return {r["permission"]: r["allowed"] for r in self.w.records() if "permission" in r}
 
-    def test_the_owner_may_run_a_command_and_fetch_and_search_the_web(self):
-        """Owner decision 2026-11-21: the owner's agy runs commands and uses the web as local Claude Code does."""
+    def test_with_the_opt_in_the_owner_may_run_a_command_and_fetch_and_search_the_web(self):
+        """--allow-owner-shell-web: the owner's agy runs commands and uses the web as local Claude Code does."""
         self.w.task("task-1", "STUB:WEB go")
-        self.w.serve()
+        self.w.serve(1, "--allow-owner-shell-web")
         self.assertEqual(self.permissions(), {"date": True, "Fetch https://example.com/": True,
                                               "Search the web: news today": True})
         prompt = next(r["text"] for r in self.w.records() if r.get("method") == "session/prompt")
@@ -198,7 +216,7 @@ class ConnectorTest(unittest.TestCase):
         self.assertEqual(gc.SHELL_AND_WEB_TIERS, frozenset({"owner"}))
         headers = {"channel_id": "!t:s.space", "access_tier": "team", "collaborator": "true",
                    "user_id": "@bob:s.space"}
-        conn = gc.Connector(self.w.args())
+        conn = gc.Connector(self.w.args("--allow-owner-shell-web"))
         for tid, body in (("task-1", "STUB:WEB go"), ("task-2", "STUB:AGYWRITE go")):
             with contextlib.redirect_stderr(io.StringIO()):
                 conn.run_turn(tid, headers, body, True)
@@ -206,14 +224,15 @@ class ConnectorTest(unittest.TestCase):
                                               "Search the web: news today": False, "File notes.txt": True,
                                               "Edit notes.txt": True, "File /etc/stub-outside": False,
                                               "File notes.txt (unknown key)": False})
-        prompt = gc.wake_prompt("task-3", headers, "hi", [], str(self.w.cwd))
+        prompt = gc.wake_prompt("task-3", headers, "hi", [], str(self.w.cwd),
+                                shell_web=gc.shell_web_on(conn.args, headers))
         self.assertIn("No shell command is granted", prompt)
 
     def test_a_guest_may_not_run_a_command_fetch_or_write(self):
         self.w.task("task-1", "STUB:WEB go", tier="guest")
         self.w.task("task-2", "STUB:AGYWRITE go", tier="guest", channel="!b:s.space")
         os.utime(self.w.root / "tasks" / "task-2.txt", (2e9, 2e9))
-        self.w.serve(2, "--allow-non-owner")
+        self.w.serve(2, "--allow-non-owner", "--allow-owner-shell-web")
         perms = self.permissions()
         self.assertEqual(len(perms), 7)
         self.assertEqual(set(perms.values()), {False})
@@ -556,7 +575,12 @@ class InstallVerifyTest(unittest.TestCase):
     def test_the_connector_runs_held_with_the_recorded_settings_and_a_narrow_env(self):
         cfg = {"ACP_COMMAND": "%s acp" % self.agy, "CWD": str(self.cwd),
                "SESSION_STORE": "/s.json", "ALLOW_NON_OWNER": "1"}
+        self.assertNotIn("--allow-owner-shell-web", cli.connector_argv(cfg, str(self.work), 7), "off unless recorded")
+        cfg["ALLOW_OWNER_SHELL_WEB"] = "1"
         argv = " ".join(cli.connector_argv(cfg, str(self.work), 7))
+        self.assertIn("--allow-owner-shell-web", argv)
+        self.assertIn("ALLOW_OWNER_SHELL_WEB", cli.CONFIG_KEYS)
+        self.assertIn(("ALLOW_OWNER_SHELL_WEB", "allow_owner_shell_web"), [r[:2] for r in cli.RECORDED])
         for part in ("-m %s" % gc.__name__, "--held --root-fd 7",
                      "--acp-command %s acp" % self.agy, "--session-store /s.json", "--allow-non-owner"):
             self.assertIn(part, argv)

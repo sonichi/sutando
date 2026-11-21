@@ -15,7 +15,7 @@ Status: the handshake and the sign-in check were run against a real `agy` 1.5.9 
 curl -fsSL https://antigravity.google/cli/install.sh | bash      # Google's installer: ~/.local/bin/agy
 agy                                                               # once: sign in with Google
 ag2-sparrow-antigravity-local install --agent <@agent:server> --token-stdin [--cwd <dir>]
-ag2-sparrow-antigravity-local install --work <dir> [--acp-command '<cmd>'] [--allow-non-owner]
+ag2-sparrow-antigravity-local install --work <dir> [--acp-command '<cmd>'] [--allow-non-owner] [--allow-owner-shell-web]
 ag2-sparrow-antigravity-local verify [--agent <@agent:server>] [--no-probe]
 ag2-sparrow-antigravity-local uninstall [--agent <@agent:server>]
 ag2-sparrow-antigravity-local list
@@ -79,9 +79,10 @@ no reply.
 
 agy's `session/request_permission` is answered by `acp_host`'s policy, default deny:
 
-- the owner's turns only (`SHELL_AND_WEB_TIERS`, owner decision 2026-11-21): any shell command and any
-  `execute`, `fetch` or `search` call, as local Claude Code and Codex agents run commands and use the web
-  for their owner;
+- the owner's turns only, and only on an install with `--allow-owner-shell-web` (recorded as
+  `ALLOW_OWNER_SHELL_WEB=1`; off by default, so an existing install does not change on update): any shell
+  command and any `execute`, `fetch` or `search` call, as a local Claude Code agent runs commands and uses
+  the web for its owner. `verify` prints `INFO owner shell and web: on|off`;
 - the owner only: a `read` or `edit` whose every path resolves (after `..`, `~` and symlinks) under the
   working directory; never when the working directory is the home directory or above it. agy's own
   argument names (`Path`, `Content`, `Overwrite`, `Append`, `Target`, `Replacement`, `AllowMultiple`,
@@ -92,11 +93,11 @@ agy's `session/request_permission` is answered by `acp_host`'s policy, default d
 
 | Turn | Commands, fetch, search | Read or edit under the working directory | Anything else |
 | --- | --- | --- | --- |
-| owner | granted | granted | refused |
+| owner | granted with `--allow-owner-shell-web`, else refused | granted | refused |
 | Team (an attested collaborator) | refused (granting it is the owner's decision) | as the turn it runs in | refused |
 | guest (isolated) | refused | refused | refused |
 
-Once commands are granted, the working-directory bound on `read` and `edit` is no longer a security
+With `--allow-owner-shell-web`, the working-directory bound on `read` and `edit` is no longer a security
 boundary for the owner's turns: a command can read or write anything the owner's account can.
 
 For the owner's turns, agy applies its own permission rules first (an action they already allow runs
