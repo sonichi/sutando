@@ -144,11 +144,23 @@ class ProjectorTests(unittest.TestCase):
         req.transition("cancelled")
         self.assertIn("Cancelled", fallback_body(req))
 
-    def test_only_a_cleared_login_reads_signed_in(self):
-        for kind, line in (("auth", "✓ Signed in — Sutando has continued its work."),
-                           ("core-blocked", "✓ Resolved — Sutando has continued its work.")):
-            req = make_req(kind=kind)
-            req.transition("resolved")
+    def test_a_cleared_login_still_reads_signed_in_and_nothing_else_adds_a_line(self):
+        """V44 (owner, 2026-11-06): one status per resolved card. The card goes green
+        on its own, so a resolved card adds no "Resolved" line beside it; a sign-in
+        keeps its own line, which says something the colour does not."""
+        req = make_req(kind="auth")
+        req.transition("resolved")
+        self.assertIn("✓ Signed in — Sutando has continued its work.", fallback_body(req))
+        other = make_req(kind="core-blocked")
+        other.transition("resolved")
+        self.assertNotIn("Resolved", fallback_body(other))
+
+    def test_expired_and_cancelled_still_say_so(self):
+        """Only the resolved line goes: these two are not shown by a colour."""
+        for status, line in (("expired", "— Expired, no longer applicable."),
+                             ("cancelled", "— Cancelled.")):
+            req = make_req(kind="core-blocked")
+            req.transition(status)
             self.assertIn(line, fallback_body(req))
 
     def test_a_decision_does_not_wear_the_blocking_header(self):
