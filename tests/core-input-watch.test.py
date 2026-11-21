@@ -197,6 +197,20 @@ class TestClassify(unittest.TestCase):
                      "press tab to accept · ← for agents")
         self.assertIsNone(classify(idle_hint))
 
+    def test_prose_asking_the_owner_to_accept_is_not_a_gate(self):
+        for words in ("You need to accept the invite in s.space first.",
+                      "Ask the owner to accept the invite, then retry."):
+            for footer in ("", "\n  ⏵⏵ bypass permissions on (shift+tab to cycle)"):
+                pane = ("⏺ Done. I published the page and sent the invite.\n  " + words
+                        + "\n────────\n❯ \n────────" + footer)
+                with self.subTest(words=words, footer=footer):
+                    self.assertIsNone(classify(pane))
+
+    def test_key_hint_to_accept_still_flags(self):
+        for hint in ("Press Tab to accept", "Enter to accept · Esc to cancel"):
+            with self.subTest(hint=hint):
+                self.assertIsNotNone(classify("  Apply the suggested edit?\n  " + hint))
+
     def test_session_limit_flags_as_its_own_kind(self):
         self.assertEqual(classify(_SESSION_LIMIT)[0], "session-limit")
 
