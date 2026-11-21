@@ -545,8 +545,8 @@ def _pid_answers(pid: int) -> "bool | None":
 
 
 def process_gone(pid: int) -> bool:
-    """Whether `pid` has exited, a zombie included; False when that cannot be told. A pid outside
-    `outbox.valid_pid` is gone: no process can own it."""
+    """Whether `pid` has exited, a zombie or one its parent is reaping included; False when that
+    cannot be told. A pid outside `outbox.valid_pid` is gone: no process can own it."""
     if outbox.valid_pid(pid) is None:
         return True
     answers = _pid_answers(pid)
@@ -556,7 +556,8 @@ def process_gone(pid: int) -> bool:
     if not stat:
         # A zombie reaped between the probe and the read leaves no stat; a host without /proc does too.
         return _pid_answers(pid) is False
-    return stat[stat.rfind(b")") + 1:].split()[:1] == [b"Z"]
+    # X: mid-reap, the pid still answers kill(0) until the parent's wait releases it.
+    return stat[stat.rfind(b")") + 1:].split()[:1] in ([b"Z"], [b"X"], [b"x"])
 
 
 def live_lock_holder(holder: "dict | None") -> "int | None":
