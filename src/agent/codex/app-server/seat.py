@@ -54,6 +54,7 @@ CLAIMS_DIR = ("state", "task-event-handler-claims")
 WATCHER = REPO / "src" / "watch-tasks-stream.sh"
 WORKSTREAMS = REPO / "skills" / "task-workstream-grouping" / "scripts" / "workstreams.py"
 STOPPED = "stopped"
+SETTLE_ATTEMPTS = 5
 EXIT_FATAL, EXIT_USAGE, EXIT_LOCKED = 1, 2, 3
 DECLINES = {
     "item/commandExecution/requestApproval": {"decision": "decline"},
@@ -258,6 +259,8 @@ class Seat:
         self.wake = threading.Event()
         self.deferred: dict = {}
         self.staged: set = set()
+        self.unsettled: dict = {}
+        self.stops: set = set()
         self.declined: List[str] = []
         self.idle_logged = False
         self.lock_fd: Optional[int] = None
@@ -344,14 +347,28 @@ class Seat:
         return "" if r.returncode == 0 else f"stage {stage} exited {r.returncode}"
 
     def settle(self, filename: str, stage: str) -> None:
-        """Record `done` (a result is published) or `abandon` (no payload, no result) once per run."""
-        if (filename, stage) in self.staged:
+        """Record `done` (a result is published) or `abandon` (no payload, no result). Only a stage
+        call that succeeded is remembered; a failed one is made again after `retry_s`, at most
+        SETTLE_ATTEMPTS times in a run, and the task itself is never run again for it."""
+        key = (filename, stage)
+        if key in self.staged:
             return
-        self.staged.add((filename, stage))
+        tries, due = self.unsettled.get(key, (0, 0.0))
+        if tries >= SETTLE_ATTEMPTS or due > self.clock():
+            return
         problem = self.stage(filename, stage)
         if problem:
-            log(f"task {filename}: {problem}")
+            tries += 1
+            self.unsettled[key] = (tries, self.clock() + self.retry_s)
+            if tries >= SETTLE_ATTEMPTS:
+                log(f"task {filename}: {problem}; could not record {stage} for it after {tries} tries, not "
+                    "trying again in this run (the task is not run again; its delivery stays as it is)")
+            else:
+                log(f"task {filename}: {problem}; will record it again in {self.retry_s:g}s "
+                    f"(try {tries} of {SETTLE_ATTEMPTS})")
             return
+        self.unsettled.pop(key, None)
+        self.staged.add(key)
         script = os.environ.get("SUTANDO_POOL_DELIVERY_SCRIPT") or ""
         if stage == "done" and self.worker and script:
             try:
@@ -430,9 +447,12 @@ class Seat:
         return self.clock() - float(rec.get("at") or 0) >= wait
 
     def stop_requested(self, filename: str) -> bool:
-        """The engine's Stop for this task is open: `skills/agent-activity`'s ruling record exists."""
+        """The engine's Stop for this task is open: `skills/agent-activity`'s ruling record exists.
+        Latched: a Stop seen once stays seen for this run, whatever happens to the record or the child."""
         task_id = filename[:-4] if filename.endswith(".txt") else filename
-        return self.workspace.joinpath(*STOP_RULING_DIR, f"{task_id}{STOP_RULING_SUFFIX}").is_file()
+        if self.workspace.joinpath(*STOP_RULING_DIR, f"{task_id}{STOP_RULING_SUFFIX}").is_file():
+            self.stops.add(filename)
+        return filename in self.stops
 
     # ---- one task, one turn ----
 
@@ -494,6 +514,8 @@ class Seat:
             except queue.Empty:
                 m = False
             if m is None:
+                if interrupted == STOPPED or self.stop_requested(filename):
+                    return STOPPED, "app-server exited during the stopped turn"
                 return "server-exited", "app-server exited during the turn"
             if m and "id" in m and "method" in m:
                 self.answer_server_request(m)
@@ -559,6 +581,9 @@ class Seat:
         status, detail = "server-exited", ""
         for attempt in (1, 2):
             self.ensure_server()
+            if self.stop_requested(filename):
+                status, detail = STOPPED, "a Stop opened before the turn was dispatched"
+                break
             status, detail = self.run_turn(filename, prompt)
             if status != "server-exited" or has_ready_result(results, filename):
                 break
@@ -578,7 +603,8 @@ class Seat:
             return status
         if status == STOPPED:
             self.write_record(filename, payload, STOPPED, detail)
-            log(f"task {filename}: turn interrupted by Stop after {took}; no result, the task stays pending and is not run again")
+            log(f"task {filename}: stopped by Stop after {took} ({detail or 'turn interrupted'}); no result, "
+                "the task stays pending and is not started again")
             return status
         outcome = "no-result" if status == "completed" else status
         rec = self.write_record(filename, payload, outcome, detail)
@@ -592,6 +618,8 @@ class Seat:
 
     def step(self) -> Optional[str]:
         """Run the first eligible pending task; None when nothing is eligible right now."""
+        for filename, stage in list(self.unsettled):
+            self.settle(filename, stage)
         for filename, payload in self.pending():
             if self.eligible(filename, payload):
                 self.idle_logged = False

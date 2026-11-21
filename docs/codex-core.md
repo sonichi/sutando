@@ -485,11 +485,14 @@ same tmux session holds a seat process instead (`src/agent/codex/app-server/seat
 - declines every approval and elicitation request, as `--ask-for-approval never` does.
 - sends `turn/interrupt` when a Stop ruling opens for the task its turn is on
   (`state/stop-interrupts/<task id>.ruling.json`, written by the agent-activity skill when
-  `SUTANDO_STOP_INTERRUPT=1`). A stopped task is not started again by the seat.
+  `SUTANDO_STOP_INTERRUPT=1`). A stopped task is not started again by the seat, and a Stop
+  seen once also cancels the retry after an app-server failure.
 - restarts a dead app-server once, resumes the thread and retries the task once. A second
   failure in a row ends the seat with the task still pending.
 - for a worker, records the pool stage `pending` before a task's turn and `done` only after
-  its result exists, through `pool_delivery.py mark-done`, as the notifier does.
+  its result exists, through `pool_delivery.py mark-done`, as the notifier does. A `done`
+  that could not be recorded is recorded again after 30 s, up to five times, without running
+  the task again.
 
 The seat reads its folders from a host declaration (`host.json` beside the thread file) in the
 `ag2-sparrow.supervised-host/1` schema of `packages/ag2-sparrow/ag2_sparrow/supervised_host.py`.
