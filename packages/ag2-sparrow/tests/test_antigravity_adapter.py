@@ -715,8 +715,10 @@ class SspaceToolsTest(unittest.TestCase):
         owner = gc.wake_prompt("task-1", {"access_tier": "owner"}, "hi", [], "/w")
         self.assertIn("ag2-space MCP tools", owner)
         self.assertIn("room.action.execute", owner)
-        team = gc.wake_prompt("task-1", {"access_tier": "team"}, "hi", [], "/w")
+        team = gc.wake_prompt("task-1", {"access_tier": "team", "collaborator": "true"}, "hi", [], "/w")
         self.assertIn("ag2-space MCP tools", team)
+        unattested = gc.wake_prompt("task-1", {"access_tier": "team", "collaborator": "false"}, "hi", [], "/w")
+        self.assertNotIn("ag2-space MCP tools", unattested, "Team is an attested collaborator, as #6645 has it")
         guest = gc.wake_prompt("task-1", {"access_tier": "guest"}, "hi", [], "/w")
         self.assertNotIn("MCP", guest)
 

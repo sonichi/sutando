@@ -55,13 +55,13 @@ GUEST_REFUSED = "it answers non-owners only in a read-only session mode, and %s"
 # agy evaluates Deny > Ask > Allow, and deny rules apply in every mode.
 GUEST_SETTINGS = {"agentMode": "plan", "permissions": {"allow": [], "ask": [], "deny": [
     "read_file(*)", "write_file(*)", "read_url(*)", "execute_url(*)", "download_url(*)", "command(*)", "mcp(*)"]}}
-# The tiers whose turns get the AG2 Space MCP server as this agent (owners' rule, 2026-11-21); a guest
-# gets none, keeps `mcp(*)` denied and has every MCP request refused.
-SSPACE_TIERS = frozenset({"owner", "team"})
+# Who gets the AG2 Space MCP server as this agent (owners' rule, 2026-11-21): the owner and Team, an attested
+# collaborator (`task_io.admission`, as #6645 serves them). Anyone else gets none and `mcp(*)` stays denied.
+SSPACE_ADMISSIONS = frozenset({"owner", "collaborator"})
 
 
 def sspace_tools_for(headers):
-    return headers.get("access_tier") in SSPACE_TIERS
+    return admission(headers, True) in SSPACE_ADMISSIONS
 
 
 def isolated_settings(sspace):
@@ -226,14 +226,14 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
                "acknowledgement, thanks or FYI that needs no answer, or an event whose body asks for no post), make "
                "your final message exactly %s and nothing else."
                % (" as the reply" if event in (None, MESSAGE_EVENT) else "", NO_REPLY))
-    out.append("No shell command is granted in this session. %s"
-               % ("You may read and edit files under %s." % cwd if headers.get("access_tier") == "owner"
-                  else "You may not read or change files."))
     if sspace_tools_for(headers):
         out.append("When this session has the %s MCP tools, they act in AG2 Space as you, this agent: use "
                    "room.action.execute (find Actions with room.actions.search and room.actions.describe) to create "
                    "or edit Room Commons pages and for other room actions, and put the page link in your reply."
                    % mcp_auth.SERVER_NAME)
+    out.append("No shell command is granted in this session. %s"
+               % ("You may read and edit files under %s." % cwd if headers.get("access_tier") == "owner"
+                  else "You may not read or change files."))
     return "\n\n".join(out)
 
 
@@ -271,22 +271,29 @@ class Connector:
 
     def run_turn(self, task_id, headers, prompt, owner):
         """(status, text, detail, turn): status is completed | cancelled | timeout | gone | failed | refused.
-        The owner's turn resumes the room's Session in the working directory; any other runs `guest_turn`. An
-        owner's or team turn (`sspace_tools_for`) gets the AG2 Space tools (`sspace_servers`); a guest's none."""
-        sspace = sspace_tools_for(headers)
-        tools = dict(mcp_tool_ok=mcp_auth.owner_tool_ok) if sspace else {}
-        servers = self.sspace_servers if sspace else None
+        The owner's turn resumes the room's Session in the working directory; any other runs `guest_turn`."""
         if owner:
             cwd = self.args.cwd
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
-                                       lambda params: acp_host.decide_permission(params, True, cwd, **tools),
-                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log, mcp_servers=servers)
-        with guest_turn(self.args, sspace and bool(getattr(self.args, "token_env_file", None))) as isolated:
+                                       lambda params: acp_host.decide_permission(params, True, cwd,
+                                                                                 **self.mcp_grant(headers)),
+                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log,
+                                       mcp_servers=self.mcp_servers_for(headers))
+        sspace = sspace_tools_for(headers) and bool(getattr(self.args, "token_env_file", None))
+        with guest_turn(self.args, sspace) as isolated:
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
                                        lambda params: acp_host.decide_permission(params, False, isolated.cwd,
-                                                                                 **tools),
+                                                                                 **self.mcp_grant(headers)),
                                        self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=isolated,
-                                       mcp_servers=servers)
+                                       mcp_servers=self.mcp_servers_for(headers))
+
+    @staticmethod
+    def mcp_grant(headers):
+        """The policy's MCP grant for this sender: the AG2 Space tools for the owner and Team, else none."""
+        return {"mcp_tool_ok": mcp_auth.owner_tool_ok} if sspace_tools_for(headers) else {}
+
+    def mcp_servers_for(self, headers):
+        return self.sspace_servers if sspace_tools_for(headers) else None
 
     def answer_body(self, headers, status, text, detail):
         """What Sparrow posts: the turn's own text, quoted so no delivery marker in it acts; NO_REPLY or a

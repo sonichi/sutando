@@ -99,11 +99,12 @@ global rules are read only from the `--gemini-dir` home.
 
 ## S.space tools (Room Commons pages and room actions)
 
-An owner's or a team member's turn (attested `access_tier` `owner` or `team`; the owners' rule of
-2026-11-21) can create and edit Room Commons pages and run room actions, as the agent itself. Its Session
-gets one MCP server, `ag2-space`, in `session/new` and `session/load`. A team turn stays isolated as above
-(its own temporary agy home and directory, no file, command or fetch grant), and its agy home's deny rules
-leave out `mcp(*)` only, so agy asks and the policy decides:
+The owner's turns and Team's (an attested collaborator: `access_tier: team` with `collaborator: true`, as
+#6645 serves them; the owners' rule of 2026-11-21) can create and edit Room Commons pages and run room
+actions, as the agent itself. Their Session gets one MCP server, `ag2-space`, in `session/new` and
+`session/load`. Until #6645 lands, a Team turn stays isolated as above (its own temporary agy home and
+directory, no file, command or fetch grant), and that home's deny rules leave out `mcp(*)` only, so agy asks
+and the policy decides:
 
 - **Identity.** The server is AG2 Space MCP, authorized as this agent by `ag2-sparrow-mcp acp` (see the
   package README, "Acting in AG2 Space"): the relay token in the agent's own token file is exchanged for a
@@ -142,7 +143,8 @@ leave out `mcp(*)` only, so agy asks and the policy decides:
   measured: a request in another shape is denied, and its reason in `state/metrics.jsonl` lists its key names
   (never values), so it can be mapped.
 
-**Guest turns get no S.space tools**: no MCP server in their Session, `mcp(*)` denied in their agy home, and
+**Guest turns get no S.space tools** (a guest, or a team-tier sender without the attested collaborator flag):
+no MCP server in their Session, `mcp(*)` denied in their agy home, and
 every MCP request refused. Read-only Actions are not offered to guests either: a read can still return another
 room's Commons or tasks to someone the agent's owner never shared them with, so "no mutations" is kept by
 giving no tools at all. A sender with no admitted tier is refused before agy starts, as before.
