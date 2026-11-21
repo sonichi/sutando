@@ -581,5 +581,174 @@ class InstallVerifyTest(unittest.TestCase):
         self.assertEqual(seen["unwired"], cli.COMMAND)
 
 
+ENTRY = {"type": "http", "name": "ag2-space", "url": "https://mcp.s.space/mcp",
+         "headers": [{"name": "Authorization", "value": "Bearer access-abc"}]}
+OPTS = [{"optionId": "a", "kind": "allow_once"}, {"optionId": "r", "kind": "reject_once"}]
+
+
+class SspaceToolsTest(unittest.TestCase):
+    """Owner and team turns get the AG2 Space MCP server as the agent itself; guest turns get none."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.w = Work(self.tmp.name)
+        (self.w.home / "mcp-http").write_text("")
+        self.token_file = os.path.join(self.tmp.name, "agent.env")
+        self.minted = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def mint(self, token_file, agent_id):
+        self.minted.append((token_file, agent_id))
+        return dict(ENTRY), ""
+
+    def serve(self, n=1, *extra, token=True):
+        a = self.w.args(*((["--token-env-file", self.token_file, "--agent-id", "@agy:s.space"] if token else [])
+                          + list(extra)))
+        a.once = n
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            gc.Connector(a, mcp_entry=self.mint).serve()
+        return err.getvalue()
+
+    def sent(self, method):
+        return [r["params"]["mcpServers"] for r in self.w.records() if r.get("method") == method]
+
+    def decisions(self):
+        return [(r["permission"], r["allowed"]) for r in self.w.records() if "permission" in r]
+
+    def test_an_owner_session_carries_the_sspace_mcp_server_on_new_and_on_load(self):
+        self.w.task("task-1", "STUB:TEXT one")
+        self.serve()
+        self.w.task("task-2", "STUB:TEXT two")
+        self.serve()
+        self.assertEqual(self.sent("session/new"), [[ENTRY]])
+        self.assertEqual(self.sent("session/load"), [[ENTRY]])
+        self.assertEqual(self.minted, [(self.token_file, "@agy:s.space")] * 2, "a fresh token each turn")
+        self.assertEqual(self.w.result("task-2"), "hello from agy-stub\n")
+
+    def test_no_server_when_agy_declares_no_http_mcp_or_no_token_file_is_named(self):
+        (self.w.home / "mcp-http").unlink()
+        self.w.task("task-1", "STUB:TEXT hi")
+        err = self.serve()
+        self.assertIn("declares no HTTP MCP transport", err)
+        (self.w.home / "mcp-http").write_text("")
+        self.w.task("task-2", "STUB:TEXT hi", channel="!b:s.space")
+        err = self.serve(token=False)
+        self.assertIn("no --token-env-file", err)
+        self.assertEqual(self.sent("session/new"), [[], []])
+        self.assertEqual(self.minted, [], "nothing is minted for a Session that cannot use it")
+
+    def test_a_failed_exchange_runs_the_turn_without_the_tools(self):
+        self.mint = lambda token_file, agent_id: (None, "ag2-sparrow-mcp: the MCP access-token exchange answered 401")
+        self.w.task("task-1", "STUB:TEXT hi")
+        err = self.serve()
+        self.assertIn("ag2-space MCP tools not offered: ag2-sparrow-mcp: the MCP access-token exchange answered 401", err)
+        self.assertEqual(self.sent("session/new"), [[]])
+        self.assertEqual(self.w.result("task-1"), "hello from agy-stub\n")
+
+    def test_the_owner_may_call_sspace_tools_but_no_other_mcp_tool_and_no_command(self):
+        self.w.task("task-1", "STUB:MCP make a page")
+        self.serve()
+        self.assertEqual(self.decisions(), [("room.action.execute", True), ("room_actions_search", True),
+                                            ("agent.unlink", False), ("room.action.execute", False),
+                                            ("ag2-space room.action.execute", False), ("rm -rf ~", False)])
+        reasons = [d["reason"] for d in self.w.metrics()[0]["permissions"]]
+        self.assertEqual(reasons[:4], ["MCP tool ag2-space/room.action.execute", "MCP tool ag2-space/room_actions_search",
+                                       "MCP tool ag2-space/agent.unlink is not granted",
+                                       "MCP tool other-server/room.action.execute is not granted"])
+        self.assertTrue(reasons[4].startswith("other operations are never granted (toolCall keys:"), reasons[4])
+        self.assertEqual(reasons[5], "no command is granted")
+
+    def test_a_team_turn_gets_the_owners_sspace_tools_isolated_and_still_no_command(self):
+        self.w.task("task-1", "STUB:MCP make a page", tier="team", collaborator=True)
+        self.serve(1, "--allow-non-owner")
+        self.assertEqual(self.sent("session/new"), [[ENTRY]])
+        self.assertEqual(self.minted, [(self.token_file, "@agy:s.space")])
+        self.assertEqual([ok for _, ok in self.decisions()], [True, True, False, False, False, False],
+                         "a team member may create a page; no other tool, no command")
+        self.assertTrue(self.w.metrics()[0]["isolated"])
+        boot = next(r for r in self.w.records() if "agy_home" in r)
+        deny = json.loads(boot["settings"])["permissions"]["deny"]
+        self.assertNotIn("mcp(*)", deny)
+        self.assertTrue({"command(*)", "read_file(*)", "write_file(*)", "read_url(*)"} <= set(deny))
+        prompt = next(r["text"] for r in self.w.records() if r.get("method") == "session/prompt")
+        self.assertIn("ag2-space MCP tools", prompt)
+
+    def test_a_guest_turn_gets_no_sspace_tools_and_no_mutation(self):
+        self.w.task("task-1", "STUB:MCP make a page", tier="guest")
+        self.serve(1, "--allow-non-owner")
+        self.assertEqual(self.sent("session/new"), [[]])
+        self.assertEqual(self.minted, [])
+        self.assertEqual([ok for _, ok in self.decisions()], [False] * 6)
+        self.assertIn("no MCP tool is granted on this turn", self.w.metrics()[0]["permissions"][0]["reason"])
+        boot = next(r for r in self.w.records() if "agy_home" in r)
+        self.assertIn("mcp(*)", json.loads(boot["settings"])["permissions"]["deny"])
+        prompt = next(r["text"] for r in self.w.records() if r.get("method") == "session/prompt")
+        self.assertNotIn("ag2-space MCP tools", prompt)
+
+    def test_the_policy_maps_mcp_calls_by_server_and_tool_never_by_title(self):
+        def decide(tool_call, owner=True):
+            return acp_host.decide_permission({"toolCall": tool_call, "options": OPTS}, owner, str(self.w.cwd),
+                                              mcp_tool_ok=gc.mcp_auth.owner_tool_ok)[0]
+        page = {"title": "x", "kind": "other", "rawInput": {"room_id": "!r:s.space"}}
+        self.assertTrue(decide(dict(page, _meta={"serverName": "ag2-space", "toolName": "room.action.execute"})))
+        self.assertTrue(decide(dict(page, serverName="ag2-space", toolName="room_action_execute")))
+        self.assertTrue(decide(dict(page, _meta={"serverName": "ag2-space", "toolName": "room.action.execute"}),
+                               owner=False), "a team turn, isolated, is granted the tools too")
+        self.assertFalse(acp_host.decide_permission(
+            {"toolCall": dict(page, _meta={"serverName": "ag2-space", "toolName": "room.action.execute"}),
+             "options": OPTS}, False, str(self.w.cwd))[0], "a guest's mutation: no MCP grant passed")
+        for bad in ({"serverName": "ag2-space", "toolName": "relay.token.issue"},
+                    {"serverName": "AG2-space", "toolName": "room.action.execute"},
+                    {"serverName": "ag2-space ", "toolName": "room.action.execute"},
+                    {"serverName": "ag2-space", "toolName": ["room.action.execute"]}):
+            self.assertFalse(decide(dict(page, _meta=bad)), bad)
+        self.assertFalse(decide(dict(page, title="ag2-space/room.action.execute")), "a title is never an identity")
+        self.assertFalse(decide({"title": "t", "kind": "execute", "rawInput": {"command": "ls"},
+                                 "_meta": {"serverName": "ag2-space", "toolName": "ag2.whoami"}}))
+        self.assertFalse(acp_host.decide_permission(
+            {"toolCall": dict(page, _meta={"serverName": "ag2-space", "toolName": "ag2.whoami"}), "options": OPTS},
+            True, str(self.w.cwd))[0], "an adapter that grants no MCP tool grants none")
+
+    def test_the_owner_and_team_prompts_name_the_tools_and_a_guests_does_not(self):
+        owner = gc.wake_prompt("task-1", {"access_tier": "owner"}, "hi", [], "/w")
+        self.assertIn("ag2-space MCP tools", owner)
+        self.assertIn("room.action.execute", owner)
+        team = gc.wake_prompt("task-1", {"access_tier": "team"}, "hi", [], "/w")
+        self.assertIn("ag2-space MCP tools", team)
+        guest = gc.wake_prompt("task-1", {"access_tier": "guest"}, "hi", [], "/w")
+        self.assertNotIn("MCP", guest)
+
+    def test_the_exchange_runs_as_the_agent_from_its_own_token_file_only(self):
+        with open(self.token_file, "w") as f:
+            f.write("AGENT_MXID=@agy:s.space\n")
+        os.chmod(self.token_file, 0o600)
+        seen = {}
+
+        def run(argv, **kw):
+            seen.update(argv=argv, **kw)
+            return mock.Mock(returncode=0, stdout=json.dumps(ENTRY), stderr="")
+        environ = {"PATH": "/usr/bin", "HOME": "/h", "REMOTE_TASK_TOKEN": "leak", "GEMINI_API_KEY": "x"}
+        with mock.patch.dict(os.environ, environ, clear=True):
+            entry, why = gc.sspace_entry(self.token_file, "@agy:s.space", run=run)
+        self.assertEqual((entry, why), (ENTRY, ""))
+        self.assertEqual(seen["env"], {"PATH": "/usr/bin", "HOME": "/h", "AG2_DEVICE_ENV": self.token_file})
+        self.assertEqual(seen["argv"][:2], [sys.executable, "-I"])
+        self.assertIn("main(['acp'])", seen["argv"][-1])
+        for out, rc, err in (("not json", 0, ""), (json.dumps(dict(ENTRY, url="http://evil.example/mcp")), 0, ""),
+                             (json.dumps(dict(ENTRY, name="other")), 0, ""), ("", 1, "x\nag2-sparrow-mcp: 401")):
+            got = gc.sspace_entry(self.token_file, "@agy:s.space",
+                                  run=lambda argv, **kw: mock.Mock(returncode=rc, stdout=out, stderr=err))
+            self.assertIsNone(got[0], out)
+        self.assertEqual(got[1], "ag2-sparrow-mcp: 401")
+
+    def test_install_hands_the_connector_the_agents_token_file(self):
+        cfg = {"ACP_COMMAND": "agy acp", "CWD": "/c", "TOKEN_ENV_FILE": "/a/agent.env", "AGENT_ID": "@agy:s.space"}
+        argv = " ".join(cli.connector_argv(cfg, "/w", 7))
+        self.assertIn("--token-env-file /a/agent.env --agent-id @agy:s.space", argv)
+        self.assertNotIn("--token-env-file", " ".join(cli.connector_argv(dict(cfg, TOKEN_ENV_FILE=""), "/w", 7)))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -7,9 +7,12 @@ agent's own room membership and grants.
 
     ag2-sparrow-mcp headers   # {"Authorization": "Bearer <access token>"}, for headersHelper
     ag2-sparrow-mcp setup     # the `claude mcp add-json` line that wires `headers` in
+    ag2-sparrow-mcp acp       # one ACP `McpServer` (http, with that header), for an ACP client
 
 `headers` mints on every run and caches nothing: Claude Code runs it at connect and
 again after a 401, so an expired token is replaced without the bearer touching disk.
+`acp` is the same discovery and mint, printed as the HTTP `McpServer` an ACP client puts in
+`session/new` (ACP carries headers, not a helper, so the Antigravity adapter runs it per turn).
 """
 from __future__ import annotations
 
@@ -31,6 +34,26 @@ HTTP_TIMEOUT_S = 3
 USER_AGENT = "sutando-gateway-client/1.0"
 SERVER_NAME = "ag2-space"
 _LOOPBACK = {"localhost", "127.0.0.1", "::1"}
+# The AG2 Space MCP tools an owner's turn may call through a client whose permission policy asks per tool
+# (the Antigravity adapter): rooms, Room Commons Actions and room tasks. Never granted: linking or unlinking
+# an agent, setup steps, relay-token issuance, event subscriptions, Space-level execution and the ui.* tools.
+OWNER_TOOLS = frozenset({
+    "ag2.whoami", "room.list", "room.inspect", "room.actions.search", "room.actions.describe",
+    "room.action.read", "room.action.execute", "room.action.execute_safe", "room.task.list",
+    "room.task.create", "room.task.update", "operation.inspect", "approval.inspect", "space.action.read"})
+
+
+def _tool_key(name: str) -> str:
+    # A client may report a dotted MCP tool name with its dots as underscores (room_action_execute).
+    return name.replace("_", ".")
+
+
+_OWNER_TOOL_KEYS = frozenset(_tool_key(t) for t in OWNER_TOOLS)
+
+
+def owner_tool_ok(server: str, tool: str) -> bool:
+    """True for one of OWNER_TOOLS on the server this module names (SERVER_NAME), compared exactly."""
+    return server == SERVER_NAME and _tool_key(tool) in _OWNER_TOOL_KEYS
 
 Gateway = Tuple[str, str, str]  # (relay URL, bearer, the .env file that supplied it or "")
 
@@ -160,6 +183,15 @@ def setup_entry(gateway: Gateway, source_root: str = "") -> dict:
     return {"type": "http", "url": mcp_url, "headersHelper": _helper_command(env_file, source_root)}
 
 
+def acp_entry(gateway: Gateway) -> dict:
+    """The ACP `McpServer` (HttpMcpServer: type, name, url, headers as name/value pairs) for this agent:
+    the discovered MCP URL with a freshly minted access token. The relay token is not in it."""
+    url, bearer, _ = _require(gateway)
+    mint_url, mcp_url = discover(url, bearer)
+    return {"type": "http", "name": SERVER_NAME, "url": mcp_url,
+            "headers": [{"name": "Authorization", "value": f"Bearer {mint(mint_url, bearer)}"}]}
+
+
 def setup_lines(gateway: Gateway) -> list:
     _url, _bearer, env_file = _require(gateway)
     cfg = setup_entry(gateway)
@@ -173,12 +205,14 @@ def setup_lines(gateway: Gateway) -> list:
 
 def main(argv=None, resolve: Callable[[], Gateway] = resolve_gateway) -> int:
     parser = argparse.ArgumentParser(prog="ag2-sparrow-mcp", description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("headers", "setup"))
+    parser.add_argument("command", choices=("headers", "setup", "acp"))
     args = parser.parse_args(argv)
     try:
         gateway = resolve()
         if args.command == "headers":
             print(json.dumps(headers(gateway)))
+        elif args.command == "acp":
+            print(json.dumps(acp_entry(gateway)))
         else:
             print("\n".join(setup_lines(gateway)))
     except McpAuthError as exc:

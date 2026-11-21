@@ -170,11 +170,13 @@ def under(root, raw):
 
 
 def decide_permission(params, owner, cwd, command_ok=None, own_file=None, command_refused="no command is granted",
-                      command_granted="", own_file_reason=""):
+                      command_granted="", own_file_reason="", mcp_tool_ok=None):
     """(allowed, reason, result). Default deny. Granted: a command `command_ok(command)` accepts (rawInput holding
-    only that command); a read or edit of files `own_file(path)` accepts, for any tier; and, for the owner only, a
-    read or edit whose every path, nested ones included, resolves under the working directory. Every other
-    command, execute, fetch, delete or move is refused."""
+    only that command); a read or edit of files `own_file(path)` accepts, for any tier; for the owner only, a
+    read or edit whose every path, nested ones included, resolves under the working directory; and an MCP tool
+    call whose identity (`mcp_tool_identity`: server and tool name, never the title) `mcp_tool_ok(server, tool)`
+    accepts: the adapter passes it only for the tiers it grants MCP tools to. Every other MCP tool, command,
+    execute, fetch, delete or move is refused."""
     tool_call = params.get("toolCall") if isinstance(params.get("toolCall"), dict) else {}
     options = params.get("options") or []
     allow, reject = _option(options, ALLOW_KINDS), _option(options, REJECT_KINDS)
@@ -182,11 +184,19 @@ def decide_permission(params, owner, cwd, command_ok=None, own_file=None, comman
     kind = tool_call.get("kind")
     raw = tool_call.get("rawInput")
     command = raw.get("command") if isinstance(raw, dict) else None
-    if command is not None or kind == "execute":
+    mcp = mcp_tool_identity(tool_call)
+    if command is not None or kind == "execute":   # a command stays a command, whatever tool it names
         if command_ok is not None and isinstance(raw, dict) and set(raw) == {"command"} and command_ok(command):
             verdict = (True, command_granted)
         else:
             verdict = (False, command_refused)
+    elif mcp is not None:
+        if mcp_tool_ok is None:
+            verdict = (False, "no MCP tool is granted on this turn")
+        elif mcp_tool_ok(*mcp):
+            verdict = (True, "MCP tool %s/%s" % mcp)
+        else:
+            verdict = (False, "MCP tool %s/%s is not granted" % mcp)
     elif kind not in SAFE_KINDS:
         verdict = (False, "%s operations are never granted" % (kind or "unclassified"))
     else:
@@ -206,9 +216,38 @@ def decide_permission(params, owner, cwd, command_ok=None, own_file=None, comman
             verdict = (True, "under the working directory")
         else:
             verdict = (False, "outside the working directory")
+    if not verdict[0] and mcp is None and kind not in SAFE_KINDS and command is None and kind != "execute":
+        # What an unrecognised request carried, by key name only, so its tool identity can be mapped later.
+        verdict = (False, "%s (toolCall keys: %s; _meta keys: %s)" % (verdict[1], _key_names(tool_call),
+                                                                     _key_names(tool_call.get("_meta"))))
     if verdict[0] and allow:
         return True, verdict[1], {"outcome": {"outcome": "selected", "optionId": allow}}
     return False, verdict[1] if not verdict[0] else "the agent offered no option that allows it", refused
+
+
+# Where an ACP agent may name the MCP tool a permission request is for: (server key, tool key) pairs, on the
+# toolCall itself or in its `_meta`. ACP's ToolCall has no such field, so these are assumed until a real agy
+# request is measured; a request naming neither pair is no MCP call to this policy and falls to the rules above.
+MCP_IDENTITY_KEYS = (("serverName", "toolName"), ("mcpServer", "mcpTool"))
+_IDENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+
+
+def mcp_tool_identity(tool_call):
+    """(server, tool) when the request names an MCP server and tool in structured fields (`MCP_IDENTITY_KEYS`),
+    both plain identifiers; None otherwise. The title is the agent's free text and never read here."""
+    for holder in (tool_call, tool_call.get("_meta")):
+        if not isinstance(holder, dict):
+            continue
+        for skey, tkey in MCP_IDENTITY_KEYS:
+            server, tool = holder.get(skey), holder.get(tkey)
+            if isinstance(server, str) and isinstance(tool, str) and _IDENT_RE.fullmatch(server) \
+                    and _IDENT_RE.fullmatch(tool):
+                return server, tool
+    return None
+
+
+def _key_names(obj):
+    return ", ".join(sorted(str(k)[:40] for k in obj)[:20]) if isinstance(obj, dict) and obj else "none"
 
 
 # ── the text a connector posts itself ────────────────────────────────────────
@@ -338,12 +377,13 @@ def pick_mode(modes, wanted):
 
 
 def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, stderr_name, not_signed_in, log,
-               isolated=None):
+               isolated=None, mcp_servers=None):
     """One task's turn: spawn `args.acp_argv`, `initialize`, resume the task's Session (else open one), send one
     `session/prompt` and wait for it to stop. `decide(params) -> (allowed, reason, result)` answers each
     permission request. (status, text, detail, turn): status is completed | cancelled | timeout | gone | failed
     | refused; an agent that is not signed in fails with `not_signed_in % its error`. With `isolated`, the turn
-    runs as `Isolated` says, and is refused unless its session mode is offered and set."""
+    runs as `Isolated` says, and is refused unless its session mode is offered and set. `mcp_servers(init)`
+    names the ACP `McpServer`s the Session gets from the `initialize` result (none without it)."""
     turn = Turn()
     cwd = isolated.cwd if isolated else args.cwd
     argv = isolated.argv if isolated else args.acp_argv
@@ -366,10 +406,11 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
         loadable = bool((init.get("agentCapabilities") or {}).get("loadSession"))
         key = session_key(headers, task_id)
         rec = None if isolated else store.get(key)
+        servers = list(mcp_servers(init) or []) if mcp_servers is not None else []
         session_id, turns = None, 0
         if rec and rec.get("cwd") == cwd and loadable:
             try:
-                client.call("session/load", {"sessionId": rec["session_id"], "cwd": cwd, "mcpServers": []},
+                client.call("session/load", {"sessionId": rec["session_id"], "cwd": cwd, "mcpServers": servers},
                             args.turn_timeout)
                 session_id, turns = rec["session_id"], int(rec.get("turns") or 0)
                 log("resumed session", session_id, "for", key)
@@ -378,7 +419,7 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
             except AcpError as e:
                 log("session/load refused, opening a new session:", str(e)[:200])
         if session_id is None:
-            opened = client.call("session/new", {"cwd": cwd, "mcpServers": []}, args.rpc_timeout)
+            opened = client.call("session/new", {"cwd": cwd, "mcpServers": servers}, args.rpc_timeout)
             session_id = opened.get("sessionId")
             if not session_id:
                 return "failed", "", "session/new returned no sessionId", turn

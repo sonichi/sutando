@@ -93,9 +93,26 @@ def prompt(rid, params):
     elif "STUB:SHELL" in text:
         ask(sid, {"title": "rm -rf ~ [current working directory]", "kind": "execute", "locations": []})
         chunk(sid, "tried a command")
+    elif "STUB:MCP" in text:
+        # Assumed shape (no signed-in agy MCP call measured): the MCP server and tool named in `_meta`.
+        for title, meta, raw in MCP_CALLS:
+            kind = "execute" if "command" in raw else "other"
+            ask(sid, dict({"title": title, "kind": kind, "rawInput": raw}, **({"_meta": meta} if meta else {})))
+        chunk(sid, "tried the S.space tools")
     else:
         chunk(sid, "hello from agy-stub")
     send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+
+
+PAGE = {"room_id": "!room:s.space", "action": "commons.page.create", "input": {"title": "Notes"}}
+MCP_CALLS = [
+    ("room.action.execute", {"serverName": "ag2-space", "toolName": "room.action.execute"}, PAGE),
+    ("room_actions_search", {"serverName": "ag2-space", "toolName": "room_actions_search"}, {"query": "page"}),
+    ("agent.unlink", {"serverName": "ag2-space", "toolName": "agent.unlink"}, {}),
+    ("room.action.execute", {"serverName": "other-server", "toolName": "room.action.execute"}, PAGE),
+    ("ag2-space room.action.execute", None, PAGE),
+    ("rm -rf ~", {"serverName": "ag2-space", "toolName": "ag2.whoami"}, {"command": "rm -rf ~"}),
+]
 
 
 GLOBAL_CONTEXT = ("GEMINI.md", "AGENTS.md", "config/GEMINI.md", "config/AGENTS.md")
@@ -134,7 +151,10 @@ def main():
         if method == "initialize":
             send({"jsonrpc": "2.0", "id": rid, "result": {
                 "protocolVersion": 1, "agentInfo": {"name": "Antigravity ACP Server", "version": "1.5.9"},
-                "agentCapabilities": {"loadSession": True, "sessionCapabilities": {"load": {}, "resume": {}}},
+                "agentCapabilities": dict({"loadSession": True, "sessionCapabilities": {"load": {}, "resume": {}}},
+                                          # `mcp-http` under $HOME declares HTTP MCP (assumed: 1.5.9 declared none)
+                                          **({"mcpCapabilities": {"http": True, "sse": False}}
+                                             if os.path.exists(os.path.join(HOME, "mcp-http")) else {})),
                 "authMethods": [{"id": "oauth-personal", "name": "Log in with Google"},
                                 {"id": "oauth-business", "name": "Log in with Gemini Enterprise"},
                                 {"id": "gemini-api-key", "name": "Gemini API key"},

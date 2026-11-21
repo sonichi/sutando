@@ -83,6 +83,8 @@ def connector_argv(cfg: dict, root: str, root_fd: int) -> list:
         argv += ["--session-store", cfg["SESSION_STORE"]]
     if cfg.get("ALLOW_NON_OWNER") == "1":
         argv.append("--allow-non-owner")
+    if cfg.get("TOKEN_ENV_FILE"):
+        argv += ["--token-env-file", cfg["TOKEN_ENV_FILE"], "--agent-id", cfg.get("AGENT_ID", "")]
     return argv
 
 

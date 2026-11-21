@@ -25,12 +25,13 @@ import json
 import os
 import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
 
-from ... import acp_host, held_start, result_labels, result_publish
+from ... import acp_host, held_start, mcp_auth, result_labels, result_publish
 from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore, quoted, trigger_of  # noqa: F401
 from ...acp_client import AcpClient as _SharedClient
 from ...relay_loop import count_arg
@@ -54,6 +55,85 @@ GUEST_REFUSED = "it answers non-owners only in a read-only session mode, and %s"
 # agy evaluates Deny > Ask > Allow, and deny rules apply in every mode.
 GUEST_SETTINGS = {"agentMode": "plan", "permissions": {"allow": [], "ask": [], "deny": [
     "read_file(*)", "write_file(*)", "read_url(*)", "execute_url(*)", "download_url(*)", "command(*)", "mcp(*)"]}}
+# AG2 Space tools: an owner's or a team member's Session (never a guest's; owners' decision, 2026-11-21) gets
+# the AG2 Space MCP server, as the agent itself, when agy's `initialize` declares HTTP MCP and the install
+# names the agent's token file (`sspace_entry`: the `ag2-sparrow-mcp acp` exchange, run per turn). The policy
+# grants that server's `mcp_auth.OWNER_TOOLS`, by the server and tool name the request carries, to those
+# turns only; a team turn stays isolated, so it gets no file, command or fetch grant. A guest gets none: no
+# server, `mcp(*)` denied, every MCP request refused.
+SSPACE_TIERS = frozenset({"owner", "team"})
+
+
+def sspace_tools_for(headers):
+    return headers.get("access_tier") in SSPACE_TIERS
+
+
+def isolated_settings(sspace):
+    """A non-owner turn's agy settings: GUEST_SETTINGS, without the `mcp(*)` deny when the turn has the AG2
+    Space tools (agy applies deny rules before asking, so the policy would never see the request)."""
+    if not sspace:
+        return GUEST_SETTINGS
+    deny = [r for r in GUEST_SETTINGS["permissions"]["deny"] if r != "mcp(*)"]
+    return dict(GUEST_SETTINGS, permissions=dict(GUEST_SETTINGS["permissions"], deny=deny))
+
+
+MINT_TIMEOUT_S = 30.0
+# What the token exchange's child keeps of this process's (already allowlisted) environment.
+MINT_ENV_KEEP = ("PATH", "HOME", "USER", "LANG", "TMPDIR")
+
+
+def mint_argv():
+    """`ag2-sparrow-mcp acp` from this very package (a source tree or the zipapp), isolated (-I) so neither the
+    child's directory nor PYTHONPATH can put another module first."""
+    root = str(Path(mcp_auth.__file__).resolve().parents[1])
+    code = ("import sys; sys.path.insert(0, %r); from ag2_sparrow.mcp_auth import main; "
+            "raise SystemExit(main(['acp']))" % root)
+    return [sys.executable, "-I", "-c", code]
+
+
+def mint_env(token_env_file, agent_id, environ=None):
+    """(the exchange's environment, '') or ({}, why): the agent's own token file as its bridge reads it
+    (`connect_bridge.credential_env`) and MINT_ENV_KEEP, nothing else."""
+    from ... import connect_bridge
+    cred, problem = connect_bridge.credential_env(token_env_file, agent_id)
+    if problem:
+        return {}, problem
+    source = os.environ if environ is None else environ
+    env = {k: source[k] for k in MINT_ENV_KEEP if k in source}
+    env.update(cred)
+    return env, ""
+
+
+def sspace_entry(token_env_file, agent_id, run=subprocess.run):
+    """(the ACP `McpServer` for AG2 Space as this agent, '') or (None, why). The relay token stays in the
+    child; only the short-lived access token it mints comes back, in the entry's Authorization header."""
+    env, problem = mint_env(token_env_file, agent_id)
+    if problem:
+        return None, problem
+    try:
+        done = run(mint_argv(), env=env, cwd=os.path.dirname(token_env_file) or "/", capture_output=True,
+                   text=True, timeout=MINT_TIMEOUT_S, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, "the token exchange did not run (%s)" % type(e).__name__
+    if done.returncode != 0:
+        lines = (done.stderr or "").strip().splitlines()
+        return None, (lines[-1][:200] if lines else "the token exchange exited %s" % done.returncode)
+    try:
+        entry = json.loads(done.stdout)
+        mcp_auth._safe_url("mcp_url", entry.get("url"))
+        ok = (entry.get("type") == "http" and entry.get("name") == mcp_auth.SERVER_NAME
+              and isinstance(entry.get("headers"), list)
+              and all(isinstance(h, dict) and set(h) == {"name", "value"} and all(isinstance(v, str) for v in h.values())
+                      for h in entry["headers"]))
+    except (ValueError, AttributeError, mcp_auth.McpAuthError):
+        ok = False
+    return (entry, "") if ok else (None, "the token exchange printed no MCP server entry")
+
+
+def declares_http_mcp(init):
+    caps = (init.get("agentCapabilities") or {}) if isinstance(init, dict) else {}
+    mcp = caps.get("mcpCapabilities") if isinstance(caps, dict) else None
+    return isinstance(mcp, dict) and mcp.get("http") is True
 
 
 class AcpClient(_SharedClient):
@@ -74,9 +154,9 @@ def publish(result_file, body):
 
 
 @contextlib.contextmanager
-def guest_turn(args):
+def guest_turn(args, sspace=False):
     """An `acp_host.Isolated` for one non-owner task: a new 0700 temporary directory holding the Session's
-    working directory and agy's home (`--gemini-dir`, deny-all settings only), removed after the turn."""
+    working directory and agy's home (`--gemini-dir`, `isolated_settings` only), removed after the turn."""
     base = os.path.realpath(tempfile.mkdtemp(prefix=GUEST_PREFIX))
     try:
         home, cwd = os.path.join(base, "agy"), os.path.join(base, "cwd")
@@ -85,7 +165,7 @@ def guest_turn(args):
         settings = os.path.join(home, "antigravity-cli", "settings.json")
         fd = os.open(settings, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(GUEST_SETTINGS, f)
+            json.dump(isolated_settings(sspace), f)
         yield acp_host.Isolated(argv=list(args.acp_argv) + ["--gemini-dir", home], cwd=cwd,
                                 env=dict(args.child_env),
                                 choose_mode=lambda modes: acp_host.pick_mode(modes, READ_ONLY_MODES),
@@ -105,30 +185,58 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
     out.append("No shell command is granted in this session. %s"
                % ("You may read and edit files under %s." % cwd if headers.get("access_tier") == "owner"
                   else "You may not read or change files."))
+    if sspace_tools_for(headers):
+        out.append("When this session has the %s MCP tools, they act in AG2 Space as you, this agent: use "
+                   "room.action.execute (find Actions with room.actions.search and room.actions.describe) to create "
+                   "or edit Room Commons pages and for other room actions, and put the page link in your reply."
+                   % mcp_auth.SERVER_NAME)
     return "\n\n".join(out)
 
 
 class Connector:
-    def __init__(self, args, client_factory=AcpClient, note=None):
+    def __init__(self, args, client_factory=AcpClient, note=None, mcp_entry=sspace_entry):
         self.args = args
         self.client_factory = client_factory
+        self.mcp_entry = mcp_entry
         self.note = note if note is not None else NON_OWNER_NOTE
         self.store = SessionStore(args.session_store)
         self.name = NAME
         self.retry_at = {}
 
+    def sspace_servers(self, init):
+        """An owner's or team turn's MCP servers: AG2 Space as this agent, when agy declares HTTP MCP and the
+        install named the agent's token file; else none, with the reason logged."""
+        token_file = getattr(self.args, "token_env_file", None)
+        if not token_file:
+            log("ag2-space MCP tools not offered: no --token-env-file (the agent's own token file)")
+            return []
+        if not declares_http_mcp(init):
+            log("ag2-space MCP tools not offered: agy's initialize declares no HTTP MCP transport")
+            return []
+        entry, why = self.mcp_entry(token_file, getattr(self.args, "agent_id", None) or "")
+        if entry is None:
+            log("ag2-space MCP tools not offered:", why)
+            return []
+        return [entry]
+
     def run_turn(self, task_id, headers, prompt, owner):
         """(status, text, detail, turn): status is completed | cancelled | timeout | gone | failed | refused.
-        The owner's turn resumes the room's Session in the working directory; any other runs `guest_turn`."""
+        The owner's turn resumes the room's Session in the working directory; any other runs `guest_turn`. An
+        owner's or team turn (`sspace_tools_for`) gets the AG2 Space tools (`sspace_servers`); a guest's none."""
+        sspace = sspace_tools_for(headers)
+        tools = dict(mcp_tool_ok=mcp_auth.owner_tool_ok) if sspace else {}
+        servers = self.sspace_servers if sspace else None
         if owner:
             cwd = self.args.cwd
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
-                                       lambda params: acp_host.decide_permission(params, True, cwd), self.store,
-                                       STDERR_NAME, NOT_SIGNED_IN, log)
-        with guest_turn(self.args) as isolated:
+                                       lambda params: acp_host.decide_permission(params, True, cwd, **tools),
+                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log, mcp_servers=servers)
+        with guest_turn(self.args, sspace and bool(getattr(self.args, "token_env_file", None))) as isolated:
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
-                                       lambda params: acp_host.decide_permission(params, False, isolated.cwd),
-                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=isolated)
+                                       lambda params: acp_host.decide_permission(params, False, isolated.cwd,
+                                                                                 **tools),
+                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=isolated,
+                                       mcp_servers=servers)
 
     def answer_body(self, headers, status, text, detail):
         """What Sparrow posts: the turn's own text, quoted so no delivery marker in it acts; NO_REPLY or a
@@ -228,6 +336,10 @@ def build_parser():
     ap.add_argument("--allow-non-owner", action="store_true",
                     help="serve non-owner senders, attested collaborators included, on the owner's agy sign-in "
                          "(no file operations granted; default: the owner only)")
+    ap.add_argument("--token-env-file", default=None,
+                    help="the agent's own token .env (its bridge's): owner and team turns get the ag2-space MCP tools as this "
+                         "agent, minted from it per turn (default: no MCP tools)")
+    ap.add_argument("--agent-id", default=None, help="the agent's Matrix ID, to check a seat .env against")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=0.2)

@@ -128,8 +128,27 @@ class HeadersTest(unittest.TestCase):
                           ("POST", "/api/v1/mcp/agent-access-tokens")])
         self.assertTrue(all(a == f"Bearer {SECRET}" for _, _, a, _ in self.stub.seen))
         # Cloudflare answers a request with no User-Agent with a 403 that reads as an auth failure.
+
         self.assertTrue(all(ua for _, _, _, ua in self.stub.seen))
         self.assertNotIn(SECRET, out + err)
+
+    def test_acp_prints_the_agents_http_mcp_server_for_an_acp_session(self):
+        rc, out, err = _run_main(["acp"], (self.stub.relay, SECRET, ""))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out), {"type": "http", "name": "ag2-space", "url": f"{self.stub.base}/mcp",
+                                           "headers": [{"name": "Authorization", "value": f"Bearer {ACCESS}"}]})
+        self.assertNotIn(SECRET, out + err)
+        self.assertEqual([p for _, p, _, _ in self.stub.seen],
+                         ["/relay/v1/mcp/discovery", "/api/v1/mcp/agent-access-tokens"])
+
+    def test_owner_tools_are_the_ag2_space_servers_room_tools_only(self):
+        ok = mcp_auth.owner_tool_ok
+        for tool in ("room.action.execute", "room_action_execute", "room.action.execute_safe", "ag2.whoami"):
+            self.assertTrue(ok("ag2-space", tool), tool)
+        for server, tool in (("ag2-space", "agent.link"), ("ag2-space", "agent.unlink"),
+                             ("ag2-space", "relay.token.issue"), ("ag2-space", "space.action.execute"),
+                             ("ag2-space", "ui.request"), ("other", "room.action.execute")):
+            self.assertFalse(ok(server, tool), (server, tool))
 
     def test_mint_url_that_is_not_tls_is_refused_before_the_bearer_is_sent(self):
         self.stub.discovery = (200, {"mint_url": "http://mint.example/api/v1/mcp/agent-access-tokens",

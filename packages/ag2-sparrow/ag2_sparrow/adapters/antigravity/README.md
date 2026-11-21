@@ -81,7 +81,10 @@ agy's `session/request_permission` is answered by `acp_host`'s policy, default d
 
 - the owner only: a `read` or `edit` whose every path resolves (after `..`, `~` and symlinks) under the
   working directory; never when the working directory is the home directory or above it;
-- nothing else: no shell command, and no `execute`, `fetch`, `delete`, `move` or unclassified call.
+- the owner and team members only: one of the S.space MCP tools below, named by the server and tool the
+  request carries;
+- nothing else: no shell command, no other MCP tool, and no `execute`, `fetch`, `delete`, `move` or
+  unclassified call.
 
 For the owner's turns, agy applies its own permission rules first (an action they already allow runs
 without asking), and `--dangerously-skip-permissions` makes it run tools without asking; never add that
@@ -93,3 +96,41 @@ there, and nothing is written to `~/.gemini`; `initialize` and the -32000 "Authe
 to `session/new` are the same as without it. Not yet measured, because no signed-in agy was available:
 that a signed-in agy finds its sign-in with `--gemini-dir`, which modes `session/new` lists, and that
 global rules are read only from the `--gemini-dir` home.
+
+## S.space tools (Room Commons pages and room actions)
+
+An owner's or a team member's turn (attested `access_tier` `owner` or `team`; the owners' rule of
+2026-11-21) can create and edit Room Commons pages and run room actions, as the agent itself. Its Session
+gets one MCP server, `ag2-space`, in `session/new` and `session/load`. A team turn stays isolated as above
+(its own temporary agy home and directory, no file, command or fetch grant), and its agy home's deny rules
+leave out `mcp(*)` only, so agy asks and the policy decides:
+
+- **Identity.** The server is AG2 Space MCP, authorized as this agent by `ag2-sparrow-mcp acp` (see the
+  package README, "Acting in AG2 Space"): the relay token in the agent's own token file is exchanged for a
+  15-minute MCP access token for this agent, and every Action runs under the agent's own room membership and
+  grants. Never the owner's sign-in and never another agent's. The exchange runs in a child process per
+  turn, with only `AG2_DEVICE_ENV` (the token file `install` recorded as `TOKEN_ENV_FILE`, passed to the
+  connector as `--token-env-file`) and a seat's own keys; the relay token stays in that child, and agy receives
+  only the short-lived access token, as the server's `Authorization` header. agy's own environment is
+  unchanged (the install's allowlist): no relay token, no token file path.
+- **When.** Only when agy's `initialize` declares HTTP MCP (`agentCapabilities.mcpCapabilities.http`), since
+  ACP has no other way to pass the header. agy 1.5.9, measured signed out, declared none: with such an agy the
+  Session gets no server and the log says why. Also none when the install has no token file (`--work` with a
+  bridge you run) or the exchange fails (logged; the turn runs without the tools).
+- **Which tools.** agy asks before each MCP call; the policy grants, to owner and team turns only, the
+  `ag2-space` server's `ag2.whoami`, `room.list`, `room.inspect`, `room.actions.search`,
+  `room.actions.describe`, `room.action.read`, `room.action.execute`, `room.action.execute_safe`,
+  `room.task.list`, `room.task.create`, `room.task.update`, `operation.inspect`, `approval.inspect` and
+  `space.action.read` (`mcp_auth.OWNER_TOOLS`; a name reported with `_` for `.` matches too). Never granted:
+  `agent.link`, `agent.unlink`, `agent.setup.steps`, `relay.token.issue`, event subscriptions,
+  `space.action.execute` and `ui.*`, any other server's tool, and any request that carries a command.
+- **By identity, never by text.** The request is matched by the MCP server and tool name it carries in
+  structured fields (`serverName`/`toolName` or `mcpServer`/`mcpTool`, on the tool call or in its `_meta`;
+  `acp_host.MCP_IDENTITY_KEYS`), compared exactly; the title is never read. Which fields agy uses has not been
+  measured: a request in another shape is denied, and its reason in `state/metrics.jsonl` lists its key names
+  (never values), so it can be mapped.
+
+**Guest turns get no S.space tools**: no MCP server in their Session, `mcp(*)` denied in their agy home, and
+every MCP request refused. Read-only Actions are not offered to guests either: a read can still return another
+room's Commons or tasks to someone the agent's owner never shared them with, so "no mutations" is kept by
+giving no tools at all. A sender with no admitted tier is refused before agy starts, as before.
