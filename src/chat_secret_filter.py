@@ -60,11 +60,8 @@ _FALLBACK_PATTERNS: Tuple[Tuple[str, re.Pattern], ...] = (
     )),
     ("JSON Web Token", re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")),
     ("Slack Token", SLACK_TOKEN_PATTERN),
-    # Require that no letter or digit precedes `sk-`: task ids such as
-    # `task-ctl-1795286780672-19a2df-s_dspace` contain "ta*sk-*ctl…" and were
-    # redacted as keys. `_`, `-`, quotes, `=`, `:`, whitespace and start of
-    # text still count as a boundary, so `OPENAI_KEY_sk-…` stays redacted
-    # (`\b` would miss that one, since `_` is a word character).
+    # No letter/digit before `sk-`, so "task-ctl-…" is not a key; `_`/`-` still
+    # count as a boundary (`OPENAI_KEY_sk-…` stays redacted, which `\b` misses).
     ("OpenAI Token", re.compile(r"(?<![A-Za-z0-9])sk-(?:proj-)?[A-Za-z0-9_-]{32,}")),
     ("Stripe Access Key", re.compile(r"sk_(?:live|test)_[A-Za-z0-9]{24,}")),
     ("Discord Bot Token", re.compile(
