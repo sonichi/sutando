@@ -129,6 +129,54 @@ class EnsurePerSeat(unittest.TestCase):
             self.assertIsNotNone(re.search(p, core), f"control: {p} must still match the core's own")
 
 
+class RetryInjected(unittest.TestCase):
+    def test_the_seats_watcher_carries_the_pools_restart_for_this_worker(self):
+        ws = Path(tempfile.mkdtemp(prefix="pool-retry-"))
+        cmd = rem.input_watch_command(ws, REPO, WID, SOCK, "worker comm")
+        watch = shlex.split(cmd[-1].split(" & ", 1)[0])
+        [flag] = [a for a in watch if a.startswith("--retry-cmd=")]
+        retry = shlex.split(flag.split("=", 1)[1])
+        self.assertTrue(retry[1].endswith("skills/worker-pool/scripts/pool_manage.py"), retry)
+        self.assertEqual(retry[-2:], ["retry", WID])
+        self.assertEqual(retry[retry.index("--workspace") + 1], str(ws))
+
+
+class RetryVerb(unittest.TestCase):
+    """pool_manage retry: the owner's "retry now" restarts a live limited seat; a stopped one is left."""
+
+    def setUp(self):
+        from unittest import mock
+        self.pm = _load("pool_manage", SCRIPTS / "pool_manage.py")
+        self.calls = []
+        self.patches = [
+            mock.patch.object(self.pm, "_worker", lambda ws, t: (WID, {"state": "active"})),
+            mock.patch.object(self.pm.sup, "run_socket", lambda ws, w: SOCK),
+            mock.patch.object(self.pm.sup, "set_paused", lambda ws, w, v: self.calls.append(("paused", v))),
+            mock.patch.object(self.pm.sw, "session_state", lambda *a, **k: "exists"),
+            mock.patch.object(self.pm, "_take_down", lambda ws, w, r: self.calls.append("down") or
+                              {"down": True, "sessions": {}, "closed_runs": []}),
+            mock.patch.object(self.pm.rem, "restart", lambda ws, repo, w, **k: self.calls.append("restart") or
+                              {"result": "restarted", "detail": {}}),
+        ]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_a_live_seat_is_taken_down_unpaused_and_restarted(self):
+        from unittest import mock
+        with mock.patch.object(self.pm.sup, "is_paused", lambda ws, w: False):
+            out = self.pm.retry("ws", REPO, WID)
+        self.assertEqual(out["result"], "restarted")
+        self.assertEqual(self.calls, ["down", ("paused", False), "restart"])
+
+    def test_a_stopped_worker_is_not_restarted(self):
+        from unittest import mock
+        with mock.patch.object(self.pm.sup, "is_paused", lambda ws, w: True):
+            out = self.pm.retry("ws", REPO, WID)
+        self.assertEqual(out["result"], "failed")
+        self.assertEqual(self.calls, [])
+
+
 class SeatOnTheCard(unittest.TestCase):
     def manager(self):
         from hitl.manager import HitlManager, HitlStore

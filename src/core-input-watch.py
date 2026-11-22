@@ -81,6 +81,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -962,25 +963,30 @@ def drive_escalations(manager, session, prompt, state, send):
 _REPO = _Path(__file__).resolve().parent.parent
 
 
-def limit_reply_step(workspace, settled, seen, pane, runtime, now=None, repo=_REPO):
-    """While the live core stands at a provider-limit screen, hold it and act on the owner's bare
-    "switch to <model>" / "retry now" replies (core_limit_hold). Once its pane shows the core idle
-    or working again, a hold that screen caused is lifted. `settled` and `seen` are (state, kind,
-    prompt) after and before the debounce. Returns the ids of the replies acted on."""
+def limit_reply_step(workspace, settled, seen, pane, runtime, now=None, repo=_REPO,
+                     seat=None, label=None, retry_cmd=None):
+    """While a live seat stands at a provider-limit screen, hold it and act on the owner's bare
+    "switch to <model>" / "retry now" replies (core_limit_hold). Once its pane shows it idle or
+    working again, a hold that screen caused is lifted. `settled` and `seen` are (state, kind,
+    prompt) after and before the debounce. The core's seat is `seat` None; a worker seat (its tmux
+    session) acts only with the `retry_cmd` argv its pool injected. Returns the reply ids acted on."""
     if runtime not in (None, "claude"):
         return []  # the hold, its replies and the model aliases are Claude Code's
+    if seat and not retry_cmd:
+        return []
+    relaunch = ({"command": list(retry_cmd)} if seat else
+                {"launcher": str(repo / "src" / "agent" / "start-cli.sh"),
+                 "switch": str(repo / "scripts" / "switch-model.sh")})
     try:
         state, kind, prompt = settled
         if state == "blocked-human" and is_usage_limit(kind, prompt):
-            if core_limit_hold.hold_while_wedged(workspace, prompt, now) is None:
+            if core_limit_hold.hold_while_wedged(workspace, prompt, now, seat=seat, seat_label=label) is None:
                 return []
-            return core_limit_hold.handle_owner_actions(workspace, now, relaunch={
-                "launcher": str(repo / "src" / "agent" / "start-cli.sh"),
-                "switch": str(repo / "scripts" / "switch-model.sh")})
+            return core_limit_hold.handle_owner_actions(workspace, now, relaunch=relaunch, seat=seat)
         seen_state, seen_kind, seen_prompt = seen
         if pane and pane.strip() and not (seen_state == "blocked-human" and is_usage_limit(seen_kind, seen_prompt)) \
                 and ((_is_idle_ready(pane, runtime) and refused_turn(pane) is None) or cli_wedge.frame_working(pane)):
-            core_limit_hold.release_pane_hold(workspace, now)
+            core_limit_hold.release_pane_hold(workspace, now, seat=seat)
     except Exception as exc:  # noqa: BLE001 — never let the hold take down the monitor
         print(f"limit reply step failed: {exc}", file=_sys.stderr)
     return []
@@ -1022,6 +1028,9 @@ def main():
     ap.add_argument("--seat", default="",
                     help="who this pane is, named on every card it raises (default: none)")
     ap.add_argument("--helper-receipt-dir", help="publish an external-helper startup receipt")
+    ap.add_argument("--retry-cmd", default="",
+                    help="a worker seat's restart, as one shell-quoted argv its pool injects; with it "
+                         "the owner's \"retry now\" reply to the seat's limit pause restarts that seat")
     a = ap.parse_args()
     if a.helper_receipt_dir:
         from external_core_helpers import publish
@@ -1101,10 +1110,11 @@ def main():
             state, detail, prompt, kind = "running", "processing (sign-in check settling)", None, None
         if state != "blocked-known":
             answered_prompt = None
-        # Only the core's own seat reads its inbox; a passive monitor acts on nothing.
-        if not a.seat and a.auto_answer:
+        # A passive monitor acts on nothing; a worker seat acts only with its pool's restart.
+        if a.auto_answer:
             limit_reply_step(workspace, (state, kind, prompt), (seen_state, seen_kind, seen_prompt),
-                             pane, runtime)
+                             pane, runtime, seat=a.session if a.seat else None, label=a.seat or None,
+                             retry_cmd=shlex.split(a.retry_cmd) if a.retry_cmd else None)
 
         # The actor: only a settled, allowlisted gate is typed at, once per instance.
         key = answer_step(state, kind, prompt, answered_prompt, a.auto_answer)

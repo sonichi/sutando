@@ -944,10 +944,10 @@ class OwnerActionCrash(unittest.TestCase):
             raise Crash()
         real_record = clh._write_hold
 
-        def record_crashing(ws, hold):
+        def record_crashing(ws, hold, seat=None):
             if hold.get("actions"):
                 raise Crash()
-            return real_record(ws, hold)
+            return real_record(ws, hold, seat)
         patch = {"answer": mock.patch.object(local_record, "write_text_whole", side_effect=write_crashing),
                  "clear": mock.patch.object(clh, "clear", side_effect=clear_crashing),
                  "record": mock.patch.object(clh, "_write_hold", side_effect=record_crashing)}[point]
@@ -990,10 +990,10 @@ class OwnerActionCrash(unittest.TestCase):
         owner_task(self.ws / "tasks", "task-9", "retry now")
         real_mark = clh._mark
 
-        def mark_crashing(ws, task, step):
+        def mark_crashing(ws, task, step, seat=None):
             if step == "answered":
                 raise Crash()
-            return real_mark(ws, task, step)
+            return real_mark(ws, task, step, seat)
         with mock.patch.object(clh, "_mark", side_effect=mark_crashing), self.assertRaises(Crash):
             clh.handle_owner_actions(self.ws, self.now + 60, switch_cmd=None)
         month = self.ws / "results" / "archive" / "2026-10"
