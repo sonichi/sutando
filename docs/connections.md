@@ -674,15 +674,27 @@ sync-mcp-lanes`) writes, for each enabled core row the main descriptor does not 
 server's DotSpace); a row with no token or no such endpoints is skipped by reason, and so is a
 token holding `'` or a line break (`unquotable_token`), since the env readers only strip the outer
 quotes. Every other `conn-*` file is removed, and so is any `.conn-*.tmp` a crashed write left.
-Without a readable main descriptor nothing is touched. `drop_mcp_lane` takes the same lanes lock as
-the sync, so a sync that read a row before it was disabled cannot write its lane back.
+The main descriptor is found from an explicit path, then `AG2_MCP_DESCRIPTOR`, then any descriptor
+the Claude Code MCP config names, then any the Codex `config.toml` names under
+`[mcp_servers.<name>.env]` (`CODEX_HOME`, else the codex `core_config_dirs` entry), then
+`state/ag2-mcp.json`. Without a readable main descriptor nothing is touched. `drop_mcp_lane` takes
+the same lanes lock as the sync, so a sync that read a row before it was disabled cannot write its
+lane back.
 
-A successful `launch` (so startup, add, reconnect, unpark, promote and update-token) runs the sync;
-`disconnect`, `park`, `park-legacy` and `remove` drop that row's lane at once. The env file is a
-copy of a secret that may live in the Keychain, kept in `state/` (never in the channel dir, where
-`connection_credential` would read it ahead of the vault). The vault sync carries nothing under
-`state/` unless `vault.sync.include` names it, and the shipped `vault.sync.exclude` carves
-`state/ag2-mcp.d/` out even then.
+A successful `launch` (startup, add, reconnect, a named row's unpark, update-token) runs the sync;
+`promote` (and its rollbacks), the legacy promotion and `unpark` also sync after their committed
+record write, since no launch follows them. `disconnect`, `park`, `park-legacy` and `remove` drop
+that row's lane at once.
+
+The env file is a copy of the row's token wherever `connection_credential` found it, the Keychain
+included: a row whose secret lives only in the vault still gets a lane, through this copy. The proxy
+reads a lane's bearer only from the `env_file` its descriptor names; its vault path
+(`env_file: '(vault)'`) is built in memory for a pool worker's own seat and switches extra lanes off,
+so a lane descriptor cannot point at the vault yet. The copy is kept in `state/` (never in the
+channel dir, where `connection_credential` would read it ahead of the vault). The vault sync carries
+nothing under `state/` unless `vault.sync.include` names it, and the shipped `vault.sync.exclude`
+carves `state/ag2-mcp.d/` out even then.
+
 ### A worker's agent as a declared Sparrow bridge
 
 A worker's own agent can run as a Sparrow agent bridge that sparrowd supervises

@@ -102,6 +102,7 @@ class Base(unittest.TestCase):
         kw.setdefault("vault", self.vault)
         kw.setdefault("descriptor", self.main)
         kw.setdefault("mcp_config", self.ws / "no-config.json")
+        kw.setdefault("codex_config", self.ws / "no-codex" / "config.toml")
         kw.setdefault("space_of", space_of)
         return C.sync_mcp_lanes(self.ws, **kw)
 
@@ -344,6 +345,43 @@ class MainDescriptor(Base):
         with unittest.mock.patch.dict("os.environ", {"CLAUDE_CONFIG_DIR": str(home)}):
             self.assertTrue(self.sync(descriptor=None, mcp_config=None)["ok"])
 
+    def test_a_codex_core_finds_it_through_its_config_toml(self):
+        self.record([S_SPACE, DEV_S])
+        toml = self.ws / "codex-home" / "config.toml"
+        toml.parent.mkdir()
+        toml.write_text('[mcp_servers.other]\ncommand = "x"\n\n[mcp_servers.s-space]\ncommand = "/n/node"\n'
+                        f'args = ["/e/ag2-mcp-proxy.mjs"]\n\n[mcp_servers.s-space.env]\nAG2_MCP_DESCRIPTOR = "{self.main}"\n')
+        out = self.sync(descriptor=None, codex_config=toml)
+        self.assertEqual((out["ok"], out["written"]), (True, ["dev-s-space"]))
+        self.assertEqual(self.lane("dev-s-space")["mint_url"], "https://dev-chat.s.space" + MINT_PATH)
+
+    def test_the_default_codex_config_is_codex_home_s(self):
+        self.record([S_SPACE, DEV_S])
+        home = self.ws / "codex-home"
+        home.mkdir()
+        (home / "config.toml").write_text(f'[mcp_servers.s-space.env]\nAG2_MCP_DESCRIPTOR = "{self.main}"\n')
+        self.assertTrue(self.sync(descriptor=None, codex_config=None, environ={"CODEX_HOME": str(home)})["ok"])
+        self.assertEqual(C._codex_config_path({"CODEX_HOME": str(home)}), home / "config.toml")
+
+    def test_without_codex_home_the_configured_codex_dir_is_read(self):
+        import sutando_config
+        with unittest.mock.patch.object(sutando_config, "find_core_config_dir",
+                                        return_value={"value": str(self.ws / "cfg-codex")}):
+            self.assertEqual(C._codex_config_path({}), self.ws / "cfg-codex" / "config.toml")
+        with unittest.mock.patch.object(sutando_config, "find_core_config_dir", side_effect=ValueError("bad")):
+            self.assertIsNone(C._codex_config_path({}))
+        self.record([S_SPACE, DEV_S])
+        with unittest.mock.patch.object(sutando_config, "find_core_config_dir", return_value=None):
+            self.assertIsNone(C._codex_config_path({}))
+            self.assertEqual(self.sync(descriptor=None, codex_config=None)["reason"], "no_main_descriptor")
+
+    def test_an_unreadable_codex_config_names_nothing(self):
+        self.record([S_SPACE, DEV_S])
+        toml = self.ws / "config.toml"
+        toml.write_text("this is [not valid toml")
+        self.assertEqual(self.sync(descriptor=None, codex_config=toml)["reason"], "no_main_descriptor")
+        self.assertEqual(self.names(), [])
+
     def test_an_unsupported_descriptor_is_none(self):
         self.record([S_SPACE, DEV_S])
         self.main = self.write_main(version=2)
@@ -378,7 +416,8 @@ class LifecycleReconcile(Base):
         return unittest.mock.patch.object(
             C, "sync_mcp_lanes",
             lambda ws, **kw: real(ws, environ={}, vault=self.vault, descriptor=self.main,
-                                  mcp_config=self.ws / "no-config.json", space_of=space_of))
+                                  mcp_config=self.ws / "no-config.json", space_of=space_of,
+                                  codex_config=self.ws / "no-codex.toml"))
 
     def test_promote_with_park_drops_the_parked_owners_lane(self):
         self.record([dict(DEV_S, primary=True), dict(S_SPACE, primary=False), LEGACY])
@@ -498,7 +537,7 @@ class NoSecretLeaks(Base):
 
         def sync(ws, **kw):
             return real(ws, environ={}, vault=self.vault, mcp_config=self.ws / "no-config.json", space_of=space_of,
-                        descriptor=kw.get("descriptor"))
+                        descriptor=kw.get("descriptor"), codex_config=self.ws / "no-codex.toml")
         with unittest.mock.patch.object(cli.connections, "sync_mcp_lanes", sync), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = cli.main(["--workspace", str(self.ws), *argv])

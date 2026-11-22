@@ -4156,6 +4156,24 @@ def mcp_descriptor_path(workspace: Optional[Path], mcp_config: Optional[Path] = 
     MCP config (`mcp_config`, default `<claude home>/.claude.json`) names inside the workspace, else
     `state/ag2-mcp.json`. A descriptor outside the workspace is the desktop host's and never chosen."""
     ws = _workspace(workspace).resolve()
+    for named in _claude_config_descriptors(mcp_config):
+        if named.resolve().is_relative_to(ws):
+            return named
+    return ws / "state" / MCP_DESCRIPTOR_NAME
+
+
+def _named_descriptors(servers) -> "list[Path]":
+    """The `AG2_MCP_DESCRIPTOR` each MCP server entry's `env` names, in entry order."""
+    out = []
+    for entry in servers.values() if isinstance(servers, dict) else []:
+        named = (entry.get("env") or {}).get("AG2_MCP_DESCRIPTOR") if isinstance(entry, dict) else None
+        if isinstance(named, str) and named:
+            out.append(Path(named))
+    return out
+
+
+def _claude_config_descriptors(mcp_config: Optional[Path]) -> "list[Path]":
+    """Descriptors the Claude Code MCP config (`mcp_config`, default `<claude home>/.claude.json`) names."""
     if mcp_config is None:
         from util_paths import claude_home_path
         mcp_config = claude_home_path(".claude.json")
@@ -4163,11 +4181,37 @@ def mcp_descriptor_path(workspace: Optional[Path], mcp_config: Optional[Path] = 
         servers = json.loads(Path(mcp_config).read_text(encoding="utf-8")).get("mcpServers") or {}
     except (OSError, ValueError, AttributeError):
         servers = {}
-    for entry in servers.values() if isinstance(servers, dict) else []:
-        named = (entry.get("env") or {}).get("AG2_MCP_DESCRIPTOR") if isinstance(entry, dict) else None
-        if isinstance(named, str) and named and Path(named).resolve().is_relative_to(ws):
-            return Path(named)
-    return ws / "state" / MCP_DESCRIPTOR_NAME
+    return _named_descriptors(servers)
+
+
+def _codex_config_path(environ: Mapping[str, str]) -> Optional[Path]:
+    """`config.toml` of the Codex home: `CODEX_HOME`, else the codex `core_config_dirs` entry."""
+    home = (environ.get("CODEX_HOME") or "").strip()
+    if not home:
+        try:
+            from sutando_config import find_core_config_dir
+            home = str((find_core_config_dir(type_="codex") or {}).get("value") or "").strip()
+        except Exception:  # noqa: BLE001 - an unreadable config only means no Codex home to read
+            home = ""
+    return Path(home).expanduser() / "config.toml" if home else None
+
+
+def _codex_config_descriptors(codex_config: Optional[Path]) -> "list[Path]":
+    """Descriptors Codex's `config.toml` names under `[mcp_servers.<name>.env]`."""
+    if codex_config is None:
+        return []
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+        try:
+            import tomli as tomllib
+        except ModuleNotFoundError:
+            import toml_fallback as tomllib
+    try:
+        servers = tomllib.loads(Path(codex_config).read_text(encoding="utf-8")).get("mcp_servers") or {}
+    except (OSError, ValueError, AttributeError):
+        servers = {}
+    return _named_descriptors(servers)
 
 
 def repoint_mcp_descriptor(path: Path, *, legacy: str, code: str, agent_mxid: str,
@@ -4230,24 +4274,16 @@ def mcp_lanes_dir(workspace: Optional[Path] = None, environ: Optional[Mapping[st
 
 
 def _main_mcp_descriptor(workspace: Optional[Path], environ: Mapping[str, str], mcp_config: Optional[Path],
-                         descriptor: Optional[Path]) -> Optional[dict]:
+                         descriptor: Optional[Path], codex_config: Optional[Path] = None) -> Optional[dict]:
     """The primary lane's descriptor, read only: `descriptor`, else `AG2_MCP_DESCRIPTOR`, else any
-    descriptor the Claude Code MCP config names (the desktop's lives outside the workspace), else
-    `state/ag2-mcp.json`. None when none is a readable version-1 descriptor."""
+    descriptor the Claude Code MCP config names, else any the Codex `config.toml` names (the desktop's
+    lives outside the workspace), else `state/ag2-mcp.json`. None when none is a readable version-1
+    descriptor."""
     paths = [descriptor] if descriptor is not None else []
     if (environ.get("AG2_MCP_DESCRIPTOR") or "").strip():
         paths.append(Path(environ["AG2_MCP_DESCRIPTOR"].strip()))
-    if mcp_config is None:
-        from util_paths import claude_home_path
-        mcp_config = claude_home_path(".claude.json")
-    try:
-        servers = json.loads(Path(mcp_config).read_text(encoding="utf-8")).get("mcpServers") or {}
-    except (OSError, ValueError, AttributeError):
-        servers = {}
-    for entry in servers.values() if isinstance(servers, dict) else []:
-        named = (entry.get("env") or {}).get("AG2_MCP_DESCRIPTOR") if isinstance(entry, dict) else None
-        if isinstance(named, str) and named:
-            paths.append(Path(named))
+    paths += _claude_config_descriptors(mcp_config)
+    paths += _codex_config_descriptors(_codex_config_path(environ) if codex_config is None else codex_config)
     paths.append(_workspace(workspace) / "state" / MCP_DESCRIPTOR_NAME)
     for path in paths:
         try:
@@ -4333,7 +4369,8 @@ def drop_mcp_lane(instance: str, workspace: Optional[Path] = None,
 
 
 def sync_mcp_lanes(workspace: Optional[Path] = None, *, environ: Optional[Mapping[str, str]] = None, vault=None,
-                   mcp_config: Optional[Path] = None, descriptor: Optional[Path] = None, space_of=None) -> dict:
+                   mcp_config: Optional[Path] = None, descriptor: Optional[Path] = None, space_of=None,
+                   codex_config: Optional[Path] = None) -> dict:
     """Write `conn-<instance>.json` (and a 0600 `conn-<instance>.env` holding the row's bearer under its
     `token_ref`) in `mcp_lanes_dir` for each enabled core row the main descriptor does not already
     serve, and remove every other `conn-*` file there. Without a readable main descriptor nothing is
@@ -4341,7 +4378,7 @@ def sync_mcp_lanes(workspace: Optional[Path] = None, *, environ: Optional[Mappin
     environ = os.environ if environ is None else environ
     lanes = mcp_lanes_dir(workspace, environ)
     out = {"ok": True, "lanes_dir": str(lanes), "written": [], "unchanged": [], "removed": [], "skipped": {}}
-    main = _main_mcp_descriptor(workspace, environ, mcp_config, descriptor)
+    main = _main_mcp_descriptor(workspace, environ, mcp_config, descriptor, codex_config)
     if main is None:
         out.update(ok=False, reason="no_main_descriptor")
         return out
