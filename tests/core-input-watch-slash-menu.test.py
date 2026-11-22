@@ -92,6 +92,15 @@ class TestWhatStillCounts(unittest.TestCase):
                 self.assertEqual(got[0], kind)
                 self.assertIn(hint, got[1])
 
+    def test_known_gap_accept_hint_indented_under_menu_row_is_not_flagged(self):
+        # A real dialog drawn this way would be missed; this pins it so a change is noticed.
+        row = "plus optional rule tweaks\n"
+        line = " " * 41 + "Press Enter to accept the change"
+        pane = MENU.replace(row, row + line + "\n", 1)
+        self.assertIn(line, pane)
+        self.assertIn("❯ /mod", pane)
+        self.assertIsNone(_mod.classify(pane))
+
     def test_a_novel_prompt_with_no_menu_still_classifies_unknown(self):
         pane = ("⏺ Done.\n"
                 "Overwrite the existing config file?\n"
