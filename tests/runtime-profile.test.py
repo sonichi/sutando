@@ -345,6 +345,14 @@ class Gather(unittest.TestCase):
         self.sign_in("u-1")
         self.assertIsNone(rp.read(self.ws, self.now + 7)["plan"]["usage_pct"], "switching back starts over")
 
+    def test_an_unreadable_or_unwritable_account_record_starts_over(self):
+        self.write("runtime-profile-account.json", "{ not json")
+        self.assertIsNone(rp.read(self.ws, self.now + 1)["plan"]["usage_pct"])
+        self.assertEqual(json.loads((self.ws / "state" / rp.ACCOUNT_RECORD).read_text())["account"], self.digest)
+        (self.ws / "state" / rp.ACCOUNT_RECORD).unlink()
+        with mock.patch.object(rp, "write_status", side_effect=OSError("read-only")):
+            self.assertIsNone(rp.read(self.ws, self.now + 1)["plan"]["usage_pct"])
+
     def test_an_unknown_account_has_no_usage(self):
         (self.cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {"planDisplayName": "Claude Max"}}))
         plan = rp.read(self.ws, self.now + 1)["plan"]
