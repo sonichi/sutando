@@ -38,6 +38,7 @@ LOCK_HOME = tempfile.mkdtemp(prefix="agy-lock-home-")
 holder_lock._home = lambda: LOCK_HOME
 atexit.register(shutil.rmtree, LOCK_HOME, True)
 from ag2_sparrow.adapters.antigravity import cli, antigravity_connector as gc  # noqa: E402
+from ag2_sparrow import connector_cards  # noqa: E402
 from ag2_sparrow.result_markers import parse_markers, render_skill_prelude  # noqa: E402
 from ag2_sparrow.team_guardrail import AG2SPACE_GUEST_SCOPE, SHARED_TRUST_BOUNDARY, TEAM_GUARDRAIL  # noqa: E402
 
@@ -132,6 +133,511 @@ class ConnectorTest(unittest.TestCase):
                          ["initialize", "session/new", "session/prompt"])
         init = next(r for r in self.w.records() if r.get("method") == "initialize")
         self.assertEqual(init["params"]["clientInfo"]["name"], "ag2-sparrow-antigravity")
+
+    # ── the model card ───────────────────────────────────────────────────────
+
+    DM = "!dm:s.space"
+
+    def dm_task(self, tid, body, reply_to="", click="", tier="owner", kind="dm", channel=None, collaborator=False):
+        lines = ["id: " + tid, "timestamp: 2026-11-14T00:00:00Z", "source: ag2space",
+                 "channel_id: " + (channel or self.DM), "channel_kind: " + kind, "source_message_id: $m-" + tid,
+                 "user_id: @alice:s.space", "access_tier: " + tier] + (["collaborator: true"] if collaborator else [])
+        if reply_to:
+            lines.append("reply_to_event: " + reply_to)
+        if click:
+            lines.append("card_click: " + json.dumps({"card_id": "model-switch", "action": click}))
+        (self.w.root / "tasks" / (tid + ".txt")).write_text("\n".join(lines + ["task: " + body]) + "\n", encoding="utf-8")
+
+    def bridge_state(self):
+        return Path(str(self.w.root) + ".bridge") / "state"
+
+    def post_queued(self, event="$card1"):
+        """What the bridge does: post each queued card, and say which event it became."""
+        sent = []
+        connector_cards.Poster(self.bridge_state(), lambda p: sent.append(p) or {"ok": True, "event_id": event},
+                               log=lambda line: None).sweep()
+        return sent
+
+    def set_model_calls(self):
+        return [r["params"] for r in self.w.records() if r.get("method") == "session/set_model"]
+
+    def test_a_turn_remembers_the_models_agy_offers_and_changes_nothing_until_one_is_picked(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        state = json.loads((self.w.root / "state" / "model.json").read_text())
+        self.assertEqual((state["current"], [m["id"] for m in state["available"]]),
+                         ("gemini-3.8-flash-medium", ["gemini-3.8-flash-medium", "claude-opus-4-6-thinking"]))
+        self.assertEqual((self.set_model_calls(), self.w.metrics()[0]["model"]), ([], "gemini-3.8-flash-medium"))
+
+    def test_the_owners_tap_on_the_model_card_switches_the_next_turn_and_a_new_card_says_so(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        self.dm_task("task-2", "/model")
+        self.w.serve()
+        self.assertEqual(self.w.result("task-2"), "[no-send] the model card answers\n")
+        self.assertEqual(self.w.methods().count("session/prompt"), 1, "/model never reaches agy")
+        (sent,) = self.post_queued()
+        card = sent["extra_content"]["space.ag2.card"]
+        self.assertEqual((sent["room_id"], card["text"], [b["label"] for b in card["buttons"]]),
+                         (self.DM, "Now using Gemini 3.8 Flash.", ["Gemini 3.8 Flash", "Claude Opus 4.6"]))
+        # The menu carries the time it stops acting: three days, as long as its record is kept.
+        left_s = card["expires_at"] / 1000 - gc.time.time()
+        self.assertTrue(3 * 86400 - 60 < left_s <= 3 * 86400, left_s)
+        said = card["buttons"][1]["reply"]
+        self.dm_task("task-3", said, reply_to="$card1", click=said)
+        self.w.serve()
+        self.assertEqual(self.w.result("task-3"), "[no-send] the model card answers\n")
+        self.assertEqual(json.loads((self.w.root / "state" / "model.json").read_text())["wanted"],
+                         "claude-opus-4-6-thinking")
+        (coming,) = self.post_queued("$card2")
+        waiting = coming["extra_content"]["space.ag2.card"]
+        self.assertEqual((waiting["state"], "buttons" in waiting), ("info", False))
+        self.assertIn("Switching to Claude Opus 4.6 on your next message", waiting["text"])
+        self.assertEqual(self.w.methods().count("session/prompt"), 1, "the tap never reaches agy either")
+        # The next turn, in any room, switches; the owner is then told in the DM the pick was made in.
+        self.w.task("task-4", "STUB:TEXT again")
+        self.w.serve()
+        (call,) = self.set_model_calls()
+        self.assertEqual(call["modelId"], "claude-opus-4-6-thinking")
+        self.assertEqual((self.w.metrics()[-1]["model"], self.w.metrics()[-1]["model_switch"]),
+                         ("claude-opus-4-6-thinking", "switched"))
+        (told,) = self.post_queued("$card3")
+        done = told["extra_content"]["space.ag2.card"]
+        self.assertEqual((told["room_id"], done["state"], done["text"]),
+                         (self.DM, "done", "Switched. I'm now using Claude Opus 4.6."))
+        self.w.task("task-4b", "STUB:TEXT once more")
+        self.w.serve()
+        self.assertEqual(self.post_queued(), [], "told once")
+        self.assertNotIn("model_switch", self.w.metrics()[-1])
+        # The menu is still on the owner's screen after the cards that answered it, and its buttons
+        # still act: the cards saying what a pick came to are not the menu, and do not retire it.
+        self.assertEqual((waiting["id"], done["id"], card["id"]), (gc.MODEL_NOTE, gc.MODEL_NOTE, gc.MODEL_CARD))
+        again = card["buttons"][0]["reply"]
+        self.dm_task("task-5", again, reply_to="$card1", click=again)
+        self.w.serve()
+        self.assertEqual((self.w.result("task-5"), self.w.metrics()[-1]["card"]),
+                         ("[no-send] the model card answers\n", "model-picked"))
+        self.assertEqual(json.loads((self.w.root / "state" / "model.json").read_text())["wanted"], "gemini-3.8-flash-medium")
+        (back,) = self.post_queued("$card4")
+        self.assertIn("Switching to Gemini 3.8 Flash on your next message", back["extra_content"]["space.ag2.card"]["text"])
+        # A newer menu does retire the older one.
+        self.dm_task("task-6", "/model")
+        self.w.serve()
+        self.post_queued("$card5")
+        self.dm_task("task-7", again, reply_to="$card1", click=again)
+        self.w.serve()
+        # A tap on a card that no longer acts says so and shows the current one; nothing is switched.
+        self.assertEqual((self.w.result("task-7").strip(), self.w.metrics()[-1]["card"]),
+                         (gc.quoted(gc.MODEL_EXPIRED).strip(), "model-card-expired"))
+        (fresh,) = self.post_queued("$card6")
+        self.assertEqual((fresh["extra_content"]["space.ag2.card"]["id"], len(fresh["extra_content"]["space.ag2.card"]["buttons"])),
+                         (gc.MODEL_CARD, 2))
+        self.assertEqual(json.loads((self.w.root / "state" / "model.json").read_text())["wanted"], "gemini-3.8-flash-medium")
+        # The fresh card acts; with the bridge down the words say how to get one; another sender's tap
+        # on an old card is refused as before and gets no card.
+        self.dm_task("task-8", said, reply_to="$card6", click=said)
+        self.w.serve()
+        self.assertEqual(self.w.metrics()[-1]["card"], "model-picked")
+        self.post_queued("$card7")
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("bridge down")):
+            self.dm_task("task-9", again, reply_to="$card1", click=again)
+            self.w.serve()
+        self.assertEqual(self.w.result("task-9").strip(), gc.quoted(gc.MODEL_EXPIRED_NO_CARD).strip())
+        self.dm_task("task-10", again, reply_to="$card1", click=again, tier="team", collaborator=True)
+        self.w.serve()
+        self.assertEqual((self.post_queued(), self.w.metrics()[-1]["card"]), ([], "card-refused"))
+
+    def test_a_collaborators_turn_neither_applies_nor_settles_the_owners_pick(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        self.dm_task("task-2", "/model")
+        self.w.serve()
+        (sent,) = self.post_queued()
+        said = sent["extra_content"]["space.ag2.card"]["buttons"][1]["reply"]
+        self.dm_task("task-3", said, reply_to="$card1", click=said)
+        self.w.serve()
+        self.post_queued("$card2")
+        # A collaborator writes first, in a room: their turn runs on what agy had, and nothing is told.
+        self.dm_task("task-4", "STUB:TEXT from a collaborator", tier="team", collaborator=True, kind="room",
+                     channel="!room:s.space")
+        self.w.serve()
+        self.assertEqual((self.set_model_calls(), self.post_queued(), "model_switch" in self.w.metrics()[-1]),
+                         ([], [], False))
+        state = json.loads((self.w.root / "state" / "model.json").read_text())
+        self.assertEqual((state["wanted"], state.get("told")), ("claude-opus-4-6-thinking", ""), "the pick still waits")
+        # The owner's next message is the one that switches, and the one that is told.
+        self.w.task("task-5", "STUB:TEXT the owner again")
+        self.w.serve()
+        self.assertEqual([c["modelId"] for c in self.set_model_calls()], ["claude-opus-4-6-thinking"])
+        (told,) = self.post_queued("$card3")
+        self.assertEqual(told["extra_content"]["space.ag2.card"]["text"], "Switched. I'm now using Claude Opus 4.6.")
+
+    def test_picking_the_model_already_in_use_says_so_at_once_and_nothing_is_switched_or_confirmed(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        self.dm_task("task-2", "/model")
+        self.w.serve()
+        (sent,) = self.post_queued()
+        said = sent["extra_content"]["space.ag2.card"]["buttons"][0]["reply"]
+        self.dm_task("task-3", said, reply_to="$card1", click=said)
+        self.w.serve()
+        (same,) = self.post_queued("$card2")
+        card = same["extra_content"]["space.ag2.card"]
+        self.assertEqual((card["state"], card["text"], "buttons" in card, self.w.metrics()[-1]["card"]),
+                         ("done", "I'm already using Gemini 3.8 Flash. Nothing changed.", False, "model-same"))
+        self.assertFalse(json.loads((self.w.root / "state" / "model.json").read_text()).get("wanted"))
+        self.w.task("task-4", "STUB:TEXT again")
+        self.w.serve()
+        self.assertEqual((self.set_model_calls(), self.post_queued()), ([], []))
+        self.assertNotIn("model_switch", self.w.metrics()[-1])
+
+    def test_a_model_id_a_card_reply_cannot_carry_still_has_a_button_that_picks_it(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        state = self.w.root / "state" / "model.json"
+        kept = json.loads(state.read_text())
+        odd = [{"id": "models/gemini-pro", "name": "Gemini Pro"}, {"id": "vendor:model [beta]", "name": "Beta"}]
+        state.write_text(json.dumps(dict(kept, available=kept["available"] + odd)))
+        self.dm_task("task-2", "/model")
+        self.w.serve()
+        self.assertEqual(self.w.result("task-2"), "[no-send] the model card answers\n")
+        (sent,) = self.post_queued()
+        buttons = sent["extra_content"]["space.ag2.card"]["buttons"]
+        self.assertEqual([b["label"] for b in buttons[-2:]], ["Gemini Pro", "Beta"])
+        self.assertTrue(all(b["command"].split(":")[-1].startswith("id.") for b in buttons[-2:]), buttons[-2:])
+        said = buttons[-2]["reply"]
+        self.dm_task("task-3", said, reply_to="$card1", click=said)
+        self.w.serve()
+        self.assertEqual((json.loads(state.read_text())["wanted"], self.w.metrics()[-1]["card"]),
+                         ("models/gemini-pro", "model-picked"))
+        self.assertEqual(gc.model_verb("gemini-3.8-flash-high"), "gemini-3.8-flash-high")
+        # An id shaped like a digest is digested itself, so it can never stand for another model.
+        forged = gc.model_verb("models/gemini-pro")
+        self.assertTrue(forged.startswith("id.") and gc.model_verb(forged) != forged)
+        state.write_text(json.dumps(dict(kept, wanted="", available=kept["available"] + odd[:1] + [{"id": forged, "name": "Twin"}])))
+        self.dm_task("task-4", "/model")
+        self.w.serve()
+        again = self.post_queued("$card2")[-1]
+        verbs = [b["command"].split(":")[-1] for b in again["extra_content"]["space.ag2.card"]["buttons"]]
+        self.assertEqual(len(set(verbs)), len(verbs), "every button names one model")
+        # Two models that did come to one verb pick nothing.
+        with mock.patch.object(gc, "model_verb", return_value="same"):
+            self.dm_task("task-5", "/model")
+            self.w.serve()
+            (twins,) = self.post_queued("$card3")
+            said = twins["extra_content"]["space.ag2.card"]["buttons"][0]["reply"]
+            self.dm_task("task-6", said, reply_to="$card3", click=said)
+            self.w.serve()
+        self.assertIn("not one I can use now", self.w.result("task-6"))
+        self.assertEqual(json.loads(state.read_text())["wanted"], "")
+
+    def test_a_menu_that_cannot_be_built_is_answered_in_words_once_and_never_retried(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        with mock.patch.object(gc.Connector, "model_card", side_effect=connector_cards._core()[0].CardError("bad label")):
+            self.dm_task("task-2", "/model")
+            self.w.serve()
+        self.assertIn("could not post the model card", self.w.result("task-2"))
+        self.assertEqual((self.w.metrics()[-1]["card"], self.post_queued()), ("model-card", []))
+        self.assertIn("task-2", (self.w.root / "state" / "done").read_text(), "answered, so not served again")
+
+    def test_an_outcome_that_could_not_be_queued_is_told_after_the_next_turn_and_the_model_in_use_is_kept(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        self.dm_task("task-2", "/model")
+        self.w.serve()
+        (sent,) = self.post_queued()
+        said = sent["extra_content"]["space.ag2.card"]["buttons"][1]["reply"]
+        self.dm_task("task-3", said, reply_to="$card1", click=said)
+        self.w.serve()
+        self.post_queued("$card2")
+        state = self.w.root / "state" / "model.json"
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
+            self.w.task("task-4", "STUB:TEXT again")
+            self.w.serve()
+        owed = json.loads(state.read_text())
+        self.assertEqual((self.w.metrics()[-1]["model_switch"], owed["untold"][0]["picked"], owed["current"]),
+                         ("untold", "claude-opus-4-6-thinking", "claude-opus-4-6-thinking"))
+        self.w.task("task-5", "STUB:TEXT once more")
+        self.w.serve()
+        (told,) = self.post_queued("$card3")
+        self.assertEqual(told["extra_content"]["space.ag2.card"]["text"], "Switched. I'm now using Claude Opus 4.6.")
+        kept = json.loads(state.read_text())
+        self.assertEqual((kept["told"], kept["current"], kept["untold"]),
+                         ("claude-opus-4-6-thinking", "claude-opus-4-6-thinking", []))
+
+    def test_a_menu_asked_for_in_the_turn_that_settles_a_pick_comes_after_the_outcome_and_still_acts(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        self.dm_task("task-2", "/model")
+        self.w.serve()
+        (sent,) = self.post_queued()
+        said = sent["extra_content"]["space.ag2.card"]["buttons"][1]["reply"]
+        self.dm_task("task-3", said, reply_to="$card1", click=said)
+        self.w.serve()
+        self.post_queued("$card2")
+        # The first turn after the pick is itself an ask for the menu.
+        self.dm_task("task-4", "STUB:ASKMODEL can you change model")
+        self.w.serve()
+        outcome, menu = [p["extra_content"]["space.ag2.card"] for p in self.post_queued("$card3")]
+        self.assertEqual((outcome["state"], menu["state"], "buttons" in menu), ("done", "pending", True))
+        self.assertEqual(menu["text"], "Now using Claude Opus 4.6.")
+        back = menu["buttons"][0]["reply"]
+        self.dm_task("task-5", back, reply_to="$card3", click=back)
+        self.w.serve()
+        self.assertEqual((self.w.result("task-5"), self.w.metrics()[-1]["card"]),
+                         ("[no-send] the model card answers\n", "model-picked"))
+
+    def test_a_pick_repeated_before_any_turn_applied_it_is_still_coming_and_in_use_only_once_a_turn_ran_on_it(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+
+        def tap_opus(n, event):
+            self.dm_task("task-ask%d" % n, "/model")
+            self.w.serve()
+            (sent,) = self.post_queued(event)
+            said = sent["extra_content"]["space.ag2.card"]["buttons"][1]["reply"]
+            self.dm_task("task-tap%d" % n, said, reply_to=event, click=said)
+            self.w.serve()
+            (answer,) = self.post_queued(event + "a")
+            return answer["extra_content"]["space.ag2.card"], self.w.metrics()[-1]["card"]
+
+        first, outcome = tap_opus(1, "$c1")
+        self.assertEqual((first["state"], outcome), ("info", "model-picked"))
+        again, outcome = tap_opus(2, "$c2")
+        self.assertEqual((again["state"], outcome), ("info", "model-pending"), "no turn has run on it yet")
+        self.assertIn("Switching to Claude Opus 4.6 on your next message", again["text"])
+        self.assertEqual(self.set_model_calls(), [])
+        self.w.task("task-5", "STUB:TEXT again")
+        self.w.serve()
+        (told,) = self.post_queued("$c3")
+        self.assertEqual(told["extra_content"]["space.ag2.card"]["text"], "Switched. I'm now using Claude Opus 4.6.")
+        used, outcome = tap_opus(3, "$c4")
+        self.assertEqual((used["text"], outcome), ("I'm already using Claude Opus 4.6. Nothing changed.", "model-same"))
+
+    def test_a_tap_that_is_not_the_owners_on_a_card_this_agent_posted_in_its_dm_changes_nothing(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        said = "Use Claude Opus 4.6"
+        self.dm_task("task-2", said, reply_to="$never-posted", click=said)
+        self.w.serve()
+        # The owner's own tap on a card this agent does not keep (an earlier install's, say) is told it
+        # expired and shown the current card; it still picks nothing.
+        self.assertEqual(self.w.result("task-2").strip(), gc.quoted(gc.MODEL_EXPIRED).strip())
+        self.post_queued("$fresh")
+        self.dm_task("task-3", "/model")
+        self.w.serve()
+        self.post_queued()
+        # Outside the owner's DM, or from anyone else, a tap is refused and no card is shown.
+        for tid, over in {"task-4": dict(kind="room"), "task-8": dict(tier="team", collaborator=True)}.items():
+            self.dm_task(tid, said, **dict(dict(reply_to="$card1", click=said), **over))
+            self.w.serve()
+            self.assertIn("couldn't match that button", self.w.result(tid), tid)
+            self.assertEqual(self.post_queued(), [], tid)
+        # The owner's tap in another DM, or in reply to another event: expired, with a fresh card there.
+        for tid, over, room in (("task-5", dict(channel="!other:s.space"), "!other:s.space"),
+                                ("task-6", dict(reply_to="$other"), self.DM)):
+            self.dm_task(tid, said, **dict(dict(reply_to="$card1", click=said), **over))
+            self.w.serve()
+            self.assertEqual(self.w.result(tid).strip(), gc.quoted(gc.MODEL_EXPIRED).strip(), tid)
+            (fresh,) = self.post_queued("$f-" + tid)
+            self.assertEqual(fresh["room_id"], room, tid)
+        self.dm_task("task-7", said, reply_to="$f-task-6")
+        self.w.serve()
+        self.assertIn("didn't arrive as a tap", self.w.result("task-7"))
+        self.assertNotIn("wanted", json.loads((self.w.root / "state" / "model.json").read_text()))
+        self.assertEqual(self.w.methods().count("session/prompt"), 1, "no refused tap reached agy")
+
+    def test_model_is_a_card_only_for_the_owner_in_their_dm_and_only_once_models_are_known(self):
+        self.dm_task("task-1", "/model")
+        self.w.serve()
+        self.assertIn("don't know my models yet", self.w.result("task-1"))
+        (self.w.home / "models").write_text("")
+        self.dm_task("task-2", "STUB:TEXT hi")
+        self.w.serve()
+        self.dm_task("task-3", "/model", kind="room")
+        self.w.serve()
+        self.assertEqual(self.post_queued(), [], "in a shared room /model is ordinary words for agy")
+        self.assertEqual(self.w.methods().count("session/prompt"), 2)
+
+    def test_a_refusal_whose_card_could_not_be_queued_is_delivered_later_and_the_switch_is_not_tried_again(self):
+        (self.w.home / "models").write_text("")
+        (self.w.home / "set-model-fails").write_text("")
+        state = self.w.root / "state" / "model.json"
+        state.write_text(json.dumps({"wanted": "claude-opus-4-6-thinking", "asked_in": self.DM,
+                                     "available": [{"id": "claude-opus-4-6-thinking", "name": "Claude Opus 4.6"},
+                                                   {"id": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash"}]}))
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
+            self.w.task("task-1", "STUB:TEXT hi")
+            self.w.serve()
+            settled = json.loads(state.read_text())
+            self.assertEqual((self.w.metrics()[-1]["model_switch"], settled["wanted"], len(self.set_model_calls())),
+                             ("untold", "", 1), "the refused pick is dropped at once")
+            self.w.task("task-2", "STUB:TEXT again")
+            self.w.serve()
+            self.assertEqual((self.w.metrics()[-1]["model_switch"], len(self.set_model_calls())), ("untold", 1),
+                             "only the telling is owed: the model is not asked for again")
+        self.w.task("task-3", "STUB:TEXT once more")
+        self.w.serve()
+        (told,) = self.post_queued()
+        self.assertEqual((told["room_id"], told["extra_content"]["space.ag2.card"]["state"], self.w.metrics()[-1]["model_switch"]),
+                         (self.DM, "error", "not-switched"))
+        self.assertEqual((len(self.set_model_calls()), json.loads(state.read_text())["untold"]), (1, []))
+        self.w.task("task-4", "STUB:TEXT last")
+        self.w.serve()
+        self.assertEqual((self.post_queued(), "model_switch" in self.w.metrics()[-1]), ([], False), "told once")
+
+    def test_two_picks_across_one_outage_are_each_settled_once_and_told_in_order_afterwards(self):
+        (self.w.home / "models").write_text("")
+        state = self.w.root / "state" / "model.json"
+        models = [{"id": "claude-opus-4-6-thinking", "name": "Claude Opus 4.6"},
+                  {"id": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash"}, {"id": "no-such-model", "name": "Ghost"}]
+        state.write_text(json.dumps({"wanted": "claude-opus-4-6-thinking", "asked_in": self.DM, "available": models}))
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
+            self.w.task("task-1", "STUB:TEXT hi")
+            self.w.serve()                                  # pick A takes; its notice cannot be queued
+            self.assertEqual(self.w.metrics()[-1]["model_switch"], "untold")
+            kept = json.loads(state.read_text())
+            state.write_text(json.dumps(dict(kept, wanted="no-such-model", told="")))     # pick B, during the outage
+            (self.w.home / "set-model-fails").write_text("")
+            self.w.task("task-2", "STUB:TEXT again")
+            self.w.serve()                                  # B is refused: settled now, though A's notice is still owed
+            settled = json.loads(state.read_text())
+            self.assertEqual((settled["wanted"], [o["picked"] for o in settled["untold"]]),
+                             ("", ["claude-opus-4-6-thinking", "no-such-model"]))
+            calls = len(self.set_model_calls())
+            self.w.task("task-3", "STUB:TEXT third")
+            self.w.serve()
+            self.assertEqual(len(self.set_model_calls()), calls, "the refused pick is not asked for again")
+        self.w.task("task-4", "STUB:TEXT fourth")
+        self.w.serve()
+        first, second = [p["extra_content"]["space.ag2.card"] for p in self.post_queued()]
+        self.assertEqual((first["state"], second["state"]), ("done", "error"), "told oldest first")
+        self.assertIn("Claude Opus 4.6", first["text"])
+        self.assertIn("could not switch to no-such-model", second["text"])
+        self.assertEqual(json.loads(state.read_text())["untold"], [])
+        # A notice that can never be drawn is dropped; the list is bounded.
+        state.write_text(json.dumps(dict(json.loads(state.read_text()),
+                                         untold=[{"picked": "a", "ran": "b", "room": self.DM}] * 3)))
+        with mock.patch.object(gc.Connector, "model_card", side_effect=ValueError("bad label")):
+            self.w.task("task-5", "STUB:TEXT fifth")
+            self.w.serve()
+        self.assertEqual(json.loads(state.read_text())["untold"], [])
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
+            state.write_text(json.dumps(dict(json.loads(state.read_text()),
+                                             untold=[{"picked": "a", "ran": "b", "room": self.DM}] * 9)))
+            self.w.task("task-6", "STUB:TEXT sixth")
+            self.w.serve()
+        self.assertEqual(len(json.loads(state.read_text())["untold"]), gc.UNTOLD_KEEP)
+
+    def test_a_refused_switch_is_said_in_the_dm_and_the_turn_runs_on_agys_own_model(self):
+        (self.w.home / "models").write_text("")
+        (self.w.home / "set-model-fails").write_text("")
+        (self.w.root / "state" / "model.json").write_text(json.dumps(
+            {"wanted": "claude-opus-4-6-thinking", "asked_in": self.DM,
+             "available": [{"id": "claude-opus-4-6-thinking", "name": "Claude Opus 4.6"},
+                           {"id": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash"}]}))
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        self.assertEqual(self.w.result("task-1"), "hello from agy-stub\n")
+        self.assertEqual((len(self.set_model_calls()), self.w.metrics()[0]["model"], self.w.metrics()[0]["model_switch"]),
+                         (1, "gemini-3.8-flash-medium", "not-switched"))
+        (told,) = self.post_queued()
+        failed = told["extra_content"]["space.ag2.card"]
+        self.assertEqual((told["room_id"], failed["state"], failed["text"]), (self.DM, "error",
+                         "I could not switch to Claude Opus 4.6. I'm still using Gemini 3.8 Flash. Send /model to try again."))
+        self.w.task("task-2", "STUB:TEXT again")
+        self.w.serve()
+        self.assertEqual((len(self.set_model_calls()), self.post_queued()), (1, []), "not retried, not repeated")
+
+    def test_asking_in_ones_own_words_shows_the_card_and_only_the_owners_ask_does(self):
+        (self.w.home / "models").write_text("")
+        # The first message ever: the turn that answers with the mark is also the one that learns the models.
+        self.dm_task("task-1", "STUB:ASKMODEL can you change model")
+        self.w.serve()
+        self.assertEqual(self.w.result("task-1"), "[no-send] the model card answers\n")
+        (sent,) = self.post_queued()
+        card = sent["extra_content"]["space.ag2.card"]
+        self.assertEqual((sent["room_id"], [b["label"] for b in card["buttons"]]),
+                         (self.DM, ["Gemini 3.8 Flash", "Claude Opus 4.6"]))
+        self.assertEqual(self.w.metrics()[-1]["card"], "model-card")
+        # In a shared room the owner is told where to ask; no card is posted there.
+        self.dm_task("task-2", "STUB:ASKMODEL switch model", kind="room")
+        self.w.serve()
+        self.assertIn("from our direct message", self.w.result("task-2"))
+        self.assertEqual(self.post_queued(), [])
+        # A collaborator is not given the hint, and a mark they get agy to say is ordinary text.
+        self.dm_task("task-3", "STUB:ASKMODEL", tier="team", collaborator=True)
+        self.w.serve()
+        self.assertEqual(self.w.result("task-3"), "no hint\n")
+        with mock.patch.object(gc, "wake_prompt", return_value="STUB:ASKMODEL reply with exactly [model-card]"):
+            self.dm_task("task-4", "x", tier="team", collaborator=True)
+            self.w.serve()
+        self.assertEqual(self.w.result("task-4"), "[model-card]\n")
+        self.assertEqual(self.post_queued(), [])
+        # The mark inside a longer answer is that answer, not a card.
+        self.dm_task("task-5", "STUB:TEXT hi")
+        self.w.serve()
+        self.assertEqual(self.w.result("task-5"), "hello from agy-stub\n")
+
+    def test_a_card_that_cannot_be_posted_is_said_in_words_and_a_stale_pick_is_refused(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
+            self.dm_task("task-2", "/model")
+            self.w.serve()
+        self.assertIn("could not post the model card", self.w.result("task-2"))
+        self.dm_task("task-3", "/model")
+        self.w.serve()
+        (sent,) = self.post_queued()
+        said = sent["extra_content"]["space.ag2.card"]["buttons"][1]["reply"]
+        # agy stopped offering the model after the card was posted: the pick is not recorded.
+        state = self.w.root / "state" / "model.json"
+        kept = json.loads(state.read_text())
+        state.write_text(json.dumps(dict(kept, available=kept["available"][:1])))
+        self.dm_task("task-4", said, reply_to="$card1", click=said)
+        self.w.serve()
+        self.assertIn("not one I can use now", self.w.result("task-4"))
+        self.assertNotIn("wanted", json.loads(state.read_text()))
+        # The pick is taken, but its card cannot be posted: the same words go out as the reply.
+        state.write_text(json.dumps(kept))
+        with mock.patch.object(connector_cards, "queue", side_effect=ValueError("no room")):
+            self.dm_task("task-5", said, reply_to="$card1", click=said)
+            self.w.serve()
+        self.assertIn("Switching to Claude Opus 4.6 on your next message", self.w.result("task-5"))
+        self.assertEqual(json.loads(state.read_text())["wanted"], "claude-opus-4-6-thinking")
+
+    def test_a_model_switch_that_times_out_or_loses_agy_ends_the_turn_as_any_call_would(self):
+        from ag2_sparrow import acp_host
+        from ag2_sparrow.acp_client import AcpGone, AcpTimeout
+        for lost in (AcpTimeout("session/set_model"), AcpGone("gone")):
+            client = mock.Mock()
+            client.call.side_effect = lost
+            with self.assertRaises(type(lost)):
+                acp_host.use_model(client, "s1", "m2", {"currentModelId": "m1"}, None, 1, lambda *a: None)
+        quiet = mock.Mock()
+        self.assertEqual(acp_host.use_model(quiet, "s1", "m1", {"currentModelId": "m1"}, None, 1, None), "m1")
+        self.assertEqual(acp_host.use_model(quiet, "s1", None, "not-a-mapping", None, 1, None), "")
+        quiet.call.assert_not_called()
+
+    def test_a_turn_that_never_opened_a_session_tells_nothing_and_the_pick_waits(self):
+        (self.w.root / "state" / "model.json").write_text(json.dumps({"wanted": "x", "asked_in": self.DM}))
+        (self.w.home / "signed-in").unlink()
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        self.assertEqual(self.post_queued(), [])
+        self.assertEqual(json.loads((self.w.root / "state" / "model.json").read_text())["wanted"], "x")
 
     def test_signed_in_while_sign_in_methods_are_listed_needs_no_authenticate(self):
         self.w.task("task-1", "STUB:TEXT hi")
