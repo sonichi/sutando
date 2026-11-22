@@ -672,23 +672,32 @@ def resolve_dotenv(repo_root: Optional[Path] = None,
     return primary
 
 
-def desktop_runtime_selection_path(repo_root: Optional[Path] = None) -> Optional[Path]:
-    """The AG2 Space desktop's ``runtime.json``, when this engine is hosted by one.
+def desktop_app_support(repo_root: Optional[Path] = None) -> Optional[Path]:
+    """The AG2 Space desktop's app-support directory, when this engine is hosted by one.
 
-    The desktop owns that file. Its directory is ``$SUTANDO_APP_SUPPORT``, which the
-    desktop exports to engine processes, or the parent of the bundled engine tree
-    (``<app-support>/engine/<checkout>``) for jobs started without that environment.
+    ``$SUTANDO_APP_SUPPORT``, which the desktop exports to engine processes, or the
+    parent of the bundled engine tree (``<app-support>/engine/<checkout>``) for jobs
+    started without that environment; None outside a desktop install.
     """
     app_support = os.environ.get("SUTANDO_APP_SUPPORT", "").strip()
     if app_support:
-        return Path(app_support) / "runtime.json"
+        return Path(app_support)
     root = repo_root or _find_repo_root()
     if root is None:
         return None
     root = Path(root).resolve()
     if root.parent.name != "engine":
         return None
-    return root.parent.parent / "runtime.json"
+    return root.parent.parent
+
+
+def desktop_runtime_selection_path(repo_root: Optional[Path] = None) -> Optional[Path]:
+    """The AG2 Space desktop's ``runtime.json``, when this engine is hosted by one.
+
+    The desktop owns that file; it lives in ``desktop_app_support``.
+    """
+    app_support = desktop_app_support(repo_root)
+    return app_support / "runtime.json" if app_support is not None else None
 
 
 def _desktop_selected_runtime(repo_root: Optional[Path]) -> str:

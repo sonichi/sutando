@@ -141,6 +141,13 @@ session, outcome) and edits the card in place. `add_account` and `switch_account
 until the confirmed, re-authenticated sign-in flow exists; a worker seat's card never runs
 `switch_model`, `restart_core` or `switch_runtime`.
 
+Restart core runs detached from the monitor. On a desktop install (`$SUTANDO_APP_SUPPORT`, or a
+checkout under the app's `engine/` directory) it runs the app's `sutando-ctl.sh restart-core`,
+installed beside the checkout, which re-runs the app's own launcher: for Claude it replaces only
+the core window, so the gateway keeps its session. Elsewhere, or when that script is missing, it
+runs `src/agent/start-cli.sh --restart`. The audit line's `via` says which ran: `ctl`,
+`start-cli` or `start-cli-fallback`. Switch runtime always runs `start-cli.sh --runtime`.
+
 **One card per incident.** After an action the card stays open with its outcome ("Switched the
 core to Opus 5.5; checking that it is working again."). It closes, with "It is working again."
 and "✓ Done.", only once the session is seen unblocked. Still blocked a minute after a done

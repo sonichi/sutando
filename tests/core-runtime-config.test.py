@@ -120,6 +120,17 @@ class CoreRuntimeConfigTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 sutando_config.persist_desktop_runtime_selection("codex", self.repo, check=True)
 
+    def test_desktop_app_support_is_the_exported_dir_else_the_bundled_trees_parent(self):
+        """One rule for every engine consumer of the desktop's directory (runtime.json, its ctl)."""
+        repo = self.repo / "app" / "engine" / "sutando"
+        repo.mkdir(parents=True)
+        self.assertEqual(sutando_config.desktop_app_support(repo), (self.repo / "app").resolve())
+        self.assertIsNone(sutando_config.desktop_app_support(self.repo), "not a bundled engine tree")
+        with patch.dict(os.environ, {"SUTANDO_APP_SUPPORT": str(self.repo / "elsewhere")}):
+            self.assertEqual(sutando_config.desktop_app_support(self.repo), self.repo / "elsewhere")
+            self.assertEqual(sutando_config.desktop_runtime_selection_path(self.repo),
+                             self.repo / "elsewhere" / "runtime.json")
+
     def test_no_selection_path_outside_a_checkout(self):
         with patch.object(sutando_config, "_find_repo_root", return_value=None):
             self.assertIsNone(sutando_config.desktop_runtime_selection_path())

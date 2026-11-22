@@ -146,11 +146,15 @@ class Base(unittest.TestCase):
         self.spawned = Spawned()  # a detached restart is recorded, never started, in tests
         self.spawn = mock.patch.object(RA, "spawn_detached", self.spawned)
         self.spawn.start()
+        # Not a desktop install unless a test says so, wherever this checkout lives.
+        self.desktop = mock.patch.object(RA.sutando_config, "desktop_app_support", return_value=None)
+        self.desktop.start()
 
     def tearDown(self):
         self.which.stop()
         self.launch.stop()
         self.spawn.stop()
+        self.desktop.stop()
         self.tmp.cleanup()
 
     def answer(self, outcome, rc=None, reason=None, i=-1):
@@ -1256,7 +1260,10 @@ class NothingPrintedLeaks(Base):
                     self.assertNotIn("/Users/someone", text)
                 [line] = self.audit()
                 keys = sorted(self.AUDIT_KEYS + ["path"]) if seat else self.AUDIT_KEYS
-                self.assertEqual(sorted(line), keys, "the tap audit holds ids, outcomes and the retry's path only")
+                if aid == "restart_core":
+                    keys = sorted(keys + ["via"])
+                self.assertEqual(sorted(line), keys,
+                                 "the tap audit holds ids, outcomes, the retry's path and the restart's command only")
 
 
 class HandOffRechecks(Base):
@@ -1500,6 +1507,65 @@ class PausedCardWaitsForItsVerdict(Base):
         self.assertIn(RA.WORKING_AGAIN, self.mgr.get(req.id).message)
         RA.hold_card_step(self.mgr, self.ws, CORE, "claude")
         self.assertTrue(self.mgr.get(req.id).terminal)
+
+
+class DesktopRestart(Base):
+    """On a desktop install restart_core goes through the app's sutando-ctl.sh restart-core, which
+    re-runs the app's launcher and keeps the gateway's session; elsewhere it stays start-cli."""
+
+    def _desktop(self, ctl=True):
+        app = self.ws / "app"
+        repo = app / "engine" / "sutando"
+        repo.mkdir(parents=True)
+        if ctl:
+            (app / "engine" / "sutando-ctl.sh").write_text("#!/bin/bash\n")
+        self.desktop.stop()
+        self.desktop = mock.patch.object(RA.sutando_config, "desktop_app_support", return_value=app)
+        self.desktop.start()
+        repo_patch = mock.patch.object(RA, "REPO", repo)
+        repo_patch.start()
+        self.addCleanup(repo_patch.stop)
+        return app, repo
+
+    def _restart(self):
+        req = self.card(kind="unknown", prompt=UNKNOWN)
+        self.click(req, "restart_core")
+        [receipt] = self.run_pending(Run())
+        return receipt
+
+    def test_a_desktop_install_restarts_the_core_through_the_apps_ctl(self):
+        app, repo = self._desktop()
+        receipt = self._restart()
+        self.assertEqual(self.spawned.command(), ["bash", str(app / "engine" / "sutando-ctl.sh"), "restart-core"])
+        _, kw = self.spawned.calls[-1]
+        self.assertEqual(kw["env"]["SUTANDO_APP_SUPPORT"], str(app))
+        self.assertEqual((kw["env"]["SUTANDO_TMUX_SOCKET"], kw["env"]["SUTANDO_TMUX_SESSION"]), (SOCK, CORE))
+        self.assertTrue(kw["start_new_session"], "still detached from the monitor")
+        self.assertTrue(self.spawned.gate(), "still gated on the tap's claim")
+        self.assertEqual(receipt["outcome"], "done")
+        self.assertNotIn("via", receipt.get("recovery") or {}, "the receipt is unchanged")
+        self.assertEqual(self.audit()[-1]["via"], RA.VIA_CTL)
+
+    def test_elsewhere_the_core_restarts_through_start_cli(self):
+        self._restart()
+        self.assertEqual(self.spawned.command(), ["bash", str(SRC / "agent" / "start-cli.sh"), "--restart"])
+        self.assertEqual(self.audit()[-1]["via"], RA.VIA_START_CLI)
+
+    def test_a_desktop_install_without_its_ctl_falls_back_to_start_cli_and_says_so(self):
+        _, repo = self._desktop(ctl=False)
+        receipt = self._restart()
+        self.assertEqual(self.spawned.command(), ["bash", str(repo / "src" / "agent" / "start-cli.sh"), "--restart"])
+        self.assertEqual(receipt["outcome"], "done")
+        self.assertEqual(self.audit()[-1]["via"], RA.VIA_FALLBACK)
+
+    def test_a_runtime_switch_on_a_desktop_install_stays_start_cli(self):
+        _, repo = self._desktop()
+        req = self.card(runtime="codex")
+        self.click(req, "switch_runtime:claude")
+        self.run_pending(Run())
+        self.assertEqual(self.spawned.command(),
+                         ["bash", str(repo / "src" / "agent" / "start-cli.sh"), "--runtime", "claude", "--restart"])
+        self.assertNotIn("via", self.audit()[-1])
 
 
 class WireReceipt(unittest.TestCase):

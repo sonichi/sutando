@@ -15,8 +15,10 @@ a click supplies is an id the card itself offered:
                         if still blocked after VERIFY_S; else a refused turn gets `continue` once idle
     switch_model:<m>    scripts/switch-model.sh <m> --confirm on that session (alias from the list)
     switch_runtime:<r>  core only: src/agent/start-cli.sh --runtime <r> --restart, detached
-    restart_core        core only: src/agent/start-cli.sh --restart, detached (detached_action): it
-                        closes the tmux session this monitor runs in, so it never runs as its child
+    restart_core        core only, detached (detached_action): on a desktop install the app's
+                        sutando-ctl.sh restart-core (its own launcher), else src/agent/start-cli.sh
+                        --restart; it closes the tmux session or window this monitor's core runs in,
+                        so it never runs as its child
     escape_prompt       one Escape key into the pane
     buy_credits, add_account, switch_account:<id>
                         never run here: each needs a confirmed, re-authenticated step (P1)
@@ -52,6 +54,7 @@ from workspace_default import status_read_path
 import detached_action
 import recovery_gate
 import runtime_models
+import sutando_config
 
 REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 HOLD_SOURCE = "core-hold"
@@ -318,9 +321,10 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
         if target.seat:
             why = "That acts on the core, not on this worker; nothing was done."
             return "refused", why, why, {}
-        argv = ["bash", str(REPO / "src" / "agent" / "start-cli.sh"), "--restart"]
         if verb == recovery.SWITCH_RUNTIME:
-            argv[2:2] = ["--runtime", arg]
+            argv, via = ["bash", str(REPO / "src" / "agent" / "start-cli.sh"), "--runtime", arg, "--restart"], None
+        else:
+            argv, via = _restart_core_argv(env)
         # The launcher's --restart closes the tmux session this monitor runs in: it runs detached,
         # and the monitor that comes back with the core reads its outcome (verify_step).
         key = _detached_key(req)
@@ -333,7 +337,7 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
             return ("done", None, f"Switching the core to {arg}; checking that it is working again.",
                     {"state": "starting", "runtime": arg, VERIFY_FIELD: check})
         return ("done", None, "Restarting the core; checking that it is working again.",
-                {"state": "starting", VERIFY_FIELD: check})
+                {"state": "starting", VERIFY_FIELD: check, VIA_FIELD: via})
     if verb == recovery.REFRESH_OPTIONS:
         # The owner asked: the pane's own menu is read again, and a core idle at its limit has its
         # model picker opened, read and closed once; the card is replaced with what the screen shows.
@@ -361,6 +365,25 @@ FALLBACK_LINE = "Still blocked; restarting this worker. Checking that it is work
 NEW_CARD = "If it is still blocked, a new card follows with what you can do now."
 #: How the detached restarts are started: replaced in tests, never run for real there.
 spawn_detached = subprocess.Popen
+#: Which command restart_core ran, kept on its audit line only (the receipt is unchanged).
+VIA_FIELD = "via"
+VIA_CTL, VIA_START_CLI, VIA_FALLBACK = "ctl", "start-cli", "start-cli-fallback"
+#: The desktop app's control script, installed beside the engine checkout it drives.
+DESKTOP_CTL = "sutando-ctl.sh"
+
+
+def _restart_core_argv(env: Dict):
+    """(argv, via) for restart_core. On a desktop install the app's restart-core re-runs its own
+    launcher and keeps the gateway's session; start-cli --restart would kill that whole session."""
+    start_cli = ["bash", str(REPO / "src" / "agent" / "start-cli.sh"), "--restart"]
+    app_support = sutando_config.desktop_app_support(REPO)
+    if app_support is None:
+        return start_cli, VIA_START_CLI
+    ctl = REPO.parent / DESKTOP_CTL
+    if not ctl.is_file():
+        return start_cli, VIA_FALLBACK
+    env["SUTANDO_APP_SUPPORT"] = str(app_support)
+    return ["bash", str(ctl), "restart-core"], VIA_CTL
 
 
 def _detached_key(req) -> str:
@@ -692,12 +715,15 @@ def _settle(manager, target: Target, data: Dict, req, outcome: str, reason, line
     incident = incident_for(req) if req is not None else ""
     fields = dict(fields)
     check = fields.pop(VERIFY_FIELD, None)
+    via = fields.pop(VIA_FIELD, None)
     body = recovery.receipt(hitl_id, incident, aid, outcome, reason, now, fields)
     recovery.write_receipt(target.workspace, body)
     entry = {"at": int(now), "hitl_id": hitl_id, "action_id": aid, "outcome": outcome,
              "sender": str(data.get("sender") or ""), "session": target.session, "seat": target.seat or ""}
     if fields.get(PATH_FIELD):
         entry[PATH_FIELD] = fields[PATH_FIELD]
+    if via:
+        entry[VIA_FIELD] = via
     audit(target.workspace, entry)
     if outcome == "done" and req is not None and not target.seat:
         check = dict(check or {}, **_resume_check(target.workspace, req))
