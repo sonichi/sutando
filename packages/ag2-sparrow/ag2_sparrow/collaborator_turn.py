@@ -1,5 +1,6 @@
 """One isolated local Claude Code turn for a restricted sender (task_io.turn_policy's restricted kind): no
-owner session, no connector, no history, nothing to read. The CLI's login (CLAUDE_CONFIG_DIR) is all it inherits.
+owner session, no connector, no history; the only files it can read are the ones the sender attached to this
+task (stage_own_attachments). The CLI's login (CLAUDE_CONFIG_DIR) is all it inherits.
 
 Package level so both Claude adapters share it without importing one another. Stdlib only.
 """
@@ -7,9 +8,11 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 
+from .local_task_protocol import parse_attachments
 from .result_markers import neutralize_markers, parse_markers
 from .team_guardrail import SANDBOXED_DELEGATION_CODEX
 
@@ -21,9 +24,12 @@ TURN_ARGV = ("-p", "--safe-mode", "--restricted", "--strict-mcp-config", "--no-s
              "--tools", "Read,Grep,Glob", "--output-format", "json")
 # The turn has no standing instructions: this line is all it knows about where its text goes.
 REMINDER = ("[sparrow restricted task] One message from a sender who is not your owner follows; answer it "
-            "on your owner's behalf. This turn is isolated: no connectors, no files, no memory of earlier "
-            "messages. Write only the reply text; the bridge delivers it to the sender's room for you.")
+            "on your owner's behalf. This turn is isolated: no connectors, only the files attached to this "
+            "message (copied into your working directory), no memory of earlier messages. Write only the reply text; the bridge delivers it to the sender's room for you.")
 _BRACKET_RE = re.compile(r"\[(?=\S)")
+# The bridge's own cap on a fetched attachment (remote_gateway_bridge.MAX_MEDIA_BYTES), read the same way.
+MAX_MEDIA_BYTES = int(os.environ.get("REMOTE_MEDIA_MAX_BYTES") or str(25 * 1024 * 1024))
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]")
 # The one marker a reply may keep: posting nothing is always safe.
 _SKIP_RE = re.compile(r"^\[no-send\]$", re.IGNORECASE)
 
@@ -60,15 +66,77 @@ def _stdout(proc):
     return out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
 
 
+def _under(path, root):
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
+
+
+def stage_own_attachments(headers, dest_dir, media_root, max_bytes=None):
+    """Copy this task's own attachments into dest_dir, the isolated turn's empty cwd; return [(locator, copy)].
+
+    `headers` are the task's attested headers (task_io.parse_task); only the files its `attachments:` header
+    lists are candidates, so another task's file in the same folder is never one. A locator is copied only
+    when it is an absolute path to a regular file (not a symlink) whose real path lies under the real
+    `media_root` (the bridge's remote-media folder) and is at most `max_bytes` (MAX_MEDIA_BYTES); any other
+    is skipped, never raised. The folder itself is never handed to the turn: only these copies are."""
+    limit = MAX_MEDIA_BYTES if max_bytes is None else max_bytes
+    root = os.path.realpath(media_root) if media_root else ""
+    if not root or not os.path.isdir(root):
+        return []
+    staged, seen = [], set()
+    for ref in parse_attachments(headers):
+        loc = ref.locator
+        if not os.path.isabs(loc) or loc in seen or not _under(os.path.realpath(loc), root):
+            continue
+        try:
+            fd = os.open(loc, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            continue        # a symlink (O_NOFOLLOW), a missing or unreadable file
+        try:
+            st, real = os.fstat(fd), os.stat(os.path.realpath(loc))
+            # The opened file must be the one the containment check resolved, regular, and within the cap.
+            if (st.st_dev, st.st_ino) != (real.st_dev, real.st_ino) or not stat.S_ISREG(st.st_mode) \
+                    or st.st_size > limit:
+                continue
+            with os.fdopen(os.dup(fd), "rb") as src:
+                data = src.read(limit + 1)
+        finally:
+            os.close(fd)
+        if len(data) > limit:
+            continue
+        name = "%d-%s" % (len(staged) + 1, _SAFE_NAME_RE.sub("_", os.path.basename(loc)) or "attachment")
+        copy = os.path.join(dest_dir, name)
+        with open(copy, "xb") as f:
+            f.write(data)
+        seen.add(loc)
+        staged.append((loc, copy))
+    return staged
+
+
+def with_staged_paths(text, staged):
+    """`text` with each staged locator replaced by its copy's path, so the turn reads the copy."""
+    for loc, copy in staged:
+        text = text.replace(loc, copy)
+    return text
+
+
 def run_collaborator_turn(claude, text, env, timeout=120.0, run=subprocess.run, mkdtemp=tempfile.mkdtemp,
-                          allow_skip=False):
+                          allow_skip=False, prepare=None):
     """The text on stdin, in a fresh empty directory removed afterwards; the JSON `result`, made inert, is the reply.
-    With `allow_skip`, a reply that is exactly `[no-send]` stays that marker (the sender gets no post)."""
+    With `allow_skip`, a reply that is exactly `[no-send]` stays that marker (the sender gets no post).
+    `prepare(cwd, text) -> text` runs in that directory first (stage_own_attachments + with_staged_paths)."""
     try:
         cwd = mkdtemp(prefix="collaborator-turn-")
     except OSError as e:
         return Turn("failed", detail=type(e).__name__)
     try:
+        if prepare is not None:
+            try:
+                text = prepare(cwd, text)
+            except OSError as e:
+                return Turn("failed", detail="attachments: %s" % type(e).__name__)
         proc = run([claude] + list(TURN_ARGV), input=REMINDER + "\n" + text, env=env, cwd=cwd,
                    capture_output=True, text=True, timeout=timeout, shell=False)
     except (subprocess.TimeoutExpired, OSError) as e:

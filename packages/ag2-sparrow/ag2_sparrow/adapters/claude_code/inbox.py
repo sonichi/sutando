@@ -19,7 +19,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from ... import connect_common as cm, task_io, task_lifecycle as lifecycle
+from ... import connect_bridge as cb, connect_common as cm, task_io, task_lifecycle as lifecycle
 from ... import claude_local_records as records, collaborator_turn as isolated, relay_loop
 from . import hmac_policy
 from .shape import LOCAL
@@ -170,13 +170,18 @@ def admit(root, task_id, allow: bool, allow_collab: bool = False) -> "tuple[str 
     return policy.kind, headers, ""
 
 
-def isolated_prompt(root, task_id) -> str:
-    """What the isolated turn reads: the routine and cloud-session adapters' payload (attested routing fields,
-    the non-owner note, the untrusted body between nonce markers), with the gateway's tier block said as this
-    turn can follow it (collaborator_turn.isolated_lines)."""
+def isolated_prompt(root, task_id) -> "tuple[str, dict]":
+    """(text, attested headers) of the isolated turn: the routine and cloud-session adapters' payload (attested
+    routing fields, the non-owner note, the untrusted body between nonce markers), with the gateway's tier
+    block said as this turn can follow it (collaborator_turn.isolated_lines)."""
     headers, message, operator_lines = task_io.parse_task(os.path.join(root, "tasks", task_id + ".txt"))
     return relay_loop.build_payload(task_id, headers, message, isolated.isolated_lines(operator_lines),
-                                    task_io.NON_OWNER_NOTE)[1]
+                                    task_io.NON_OWNER_NOTE)[1], headers
+
+
+def media_root(cfg) -> Path:
+    """The remote-media folder of the bridge feeding this root (its state dir's, as the bridge writes it)."""
+    return cb.bridge_state(cfg) / "remote-media"
 
 
 def isolated_answer(root, task_id, environ=None, run=None) -> "tuple[str, str]":
@@ -196,8 +201,13 @@ def isolated_answer(root, task_id, environ=None, run=None) -> "tuple[str, str]":
         if limiter.wait_seconds() > 0:
             return ISOLATED_FAILED, "isolated turns are at their hourly cap (%d)" % ISOLATED_PER_HOUR
         limiter.record(task_id)
-        turn = isolated.run_collaborator_turn(claude, isolated_prompt(root, task_id), env, ISOLATED_TIMEOUT_S,
-                                              run=run or subprocess.run, allow_skip=True)
+        text, headers = isolated_prompt(root, task_id)
+        media = str(media_root(cfg))
+
+        def own_attachments(cwd, text):
+            return isolated.with_staged_paths(text, isolated.stage_own_attachments(headers, cwd, media))
+        turn = isolated.run_collaborator_turn(claude, text, env, ISOLATED_TIMEOUT_S, run=run or subprocess.run,
+                                              allow_skip=True, prepare=own_attachments)
     except Exception as e:      # the claim is CALLING: it must end in an answer, never a crash
         return ISOLATED_FAILED, "%s: %s" % (type(e).__name__, e)
     return (turn.text + "\n", "answered") if turn.kind == "ok" else (ISOLATED_FAILED, turn.detail)

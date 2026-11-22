@@ -214,7 +214,12 @@ removed afterwards, on the agent's own login (the recorded `CLAUDE_CONFIG_DIR`,
 else the session's) with only `PATH`, `HOME`, `USER`, `LANG` and
 `CLAUDE_CONFIG_DIR` in its environment, 120 s at most, at most 10 an hour. It
 loads none of the owner's MCP servers, plugins, hooks, `CLAUDE.md` or settings
-files, and nothing of the session's history. Its prompt is the routine
+files, and nothing of the session's history. The only files it can read are
+the ones the sender attached to this task: each `attachments:` locator that is
+a regular file (not a symlink) under the bridge's `state/remote-media`, at most
+25 MB, is copied into its directory and the prompt names the copy
+(`collaborator_turn.stage_own_attachments`); the folder itself is never given
+to it. Its prompt is the routine
 adapters' payload (the non-owner note, the body between untrusted markers), with
 the gateway's Sutando tier block said as that turn can follow it (its reply
 text is the result, not `results/<task>.txt`; it is the read-only sandbox, so

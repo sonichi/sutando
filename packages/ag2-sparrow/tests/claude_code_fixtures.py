@@ -1000,8 +1000,9 @@ ISOLATED_STUB = r"""import json, os, sys
 rec = os.path.join(%(dir)r, "isolated-runs.jsonl")
 text = sys.stdin.read()
 with open(rec, "a") as f:
-    f.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(), "listing": os.listdir("."), "env": dict(os.environ),
-                        "stdin": text}) + "\n")
+    f.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(), "listing": sorted(os.listdir(".")),
+                        "files": {n: open(n, "rb").read().decode("latin-1") for n in os.listdir(".")},
+                        "env": dict(os.environ), "stdin": text}) + "\n")
 try:
     reply = open(os.path.join(%(dir)r, "isolated-reply")).read()
 except OSError:
