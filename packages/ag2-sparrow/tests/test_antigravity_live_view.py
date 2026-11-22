@@ -36,6 +36,31 @@ class Steps(unittest.TestCase):
         self.assertEqual(step({"rawInput": {"command": ["git", "status"]}}), ("ran", "git status"))
 
 
+class ControlCharacters(unittest.TestCase):
+    """Every agy line goes through live_view.Writer, so an escape sequence in agy's words or a tool's title
+    reaches the log as spaces: it cannot recolour, retitle or move the cursor of the viewer's terminal."""
+
+    def test_an_escape_sequence_in_agys_text_or_a_tool_title_is_neutralized(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(live_view.path_of(d))
+            turn = acp_host.Turn()
+            turn.live, turn.view = True, live_view.Writer(path)
+            esc = "\x1b[31mred\x1b]0;pwned\x07\x1b[2J"
+            turn.on_update({"update": {"sessionUpdate": "agent_message_chunk",
+                                       "content": {"type": "text", "text": "hi " + esc + " there\n"}}})
+            turn.on_update({"update": {"sessionUpdate": "tool_call", "kind": "execute", "title": "t",
+                                       "rawInput": {"command": "echo " + esc}}})
+            turn.on_update({"update": {"sessionUpdate": "tool_call", "kind": "other", "title": "Tool " + esc}})
+            turn.on_update({"update": {"sessionUpdate": "tool_call_update", "status": "failed", "title": esc}})
+            turn.view.step("refused", "command: " + esc, "reason " + esc)
+            raw = path.read_bytes()
+            for byte in (b"\x1b", b"\x07"):
+                self.assertNotIn(byte, raw)
+            self.assertIn(b"red", raw)
+            self.assertEqual(len(raw.splitlines()), 5)
+            self.assertEqual(turn.text, "hi " + esc + " there\n", "the reply itself is untouched")
+
+
 class AgyTurn(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
