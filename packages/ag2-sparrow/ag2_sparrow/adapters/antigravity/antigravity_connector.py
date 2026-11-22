@@ -200,11 +200,15 @@ def model_verb(model_id: str) -> str:
     """What a model's button carries. A card reply takes a short plain token, and an id may hold a
     slash, a colon or a space ("models/gemini-pro"): such an id travels as a digest of itself."""
     agent_card, _ = connector_cards._core()
+    digest = "id." + hashlib.sha256(model_id.encode("utf-8")).hexdigest()[:24]
+    # An id that itself starts "id." is digested too, so no id can be another id's digest.
+    if model_id.startswith("id."):
+        return digest
     try:
         agent_card.reply("model", "agent", model_id)
         return model_id
     except ValueError:
-        return "id." + hashlib.sha256(model_id.encode("utf-8")).hexdigest()[:24]
+        return digest
 
 
 class Connector:
@@ -291,7 +295,9 @@ class Connector:
         state, outcome = self.model_state(), ""
         if verdict.verdict == agent_card.COMMAND and verdict.command.kind == "model":
             verb = verdict.command.verb
-            picked = next((m["id"] for m in state.get("available") or [] if model_verb(m["id"]) == verb), verb)
+            named = {m["id"] for m in state.get("available") or [] if model_verb(m["id"]) == verb}
+            # One model per button: a verb that names none, or more than one, picks nothing.
+            picked = named.pop() if len(named) == 1 else ""
             if picked not in [m["id"] for m in state.get("available") or []]:
                 publish(result_file, quoted("That model is not one I can use now. Send /model for the current list.") + "\n")
                 outcome = "model-unknown"
@@ -355,19 +361,28 @@ class Connector:
 
     def tell_model_outcome(self, turn) -> str:
         """Once per pick, after the first owner turn that opened a Session: say in the DM the pick was
-        made in whether the switch happened. A switch agy refused is dropped, so it is not retried on
-        every turn; '' when there was nothing to tell."""
+        made in whether the switch happened. The model state is settled at once (a switch agy refused
+        is dropped, never asked for again); an outcome whose card could not be queued is kept apart
+        and delivered after a later turn. '' when there was nothing to tell."""
         state = self.model_state()
+        owed = state.get("untold") if isinstance(state.get("untold"), dict) else None
+        if owed:
+            card = self.model_card(state, picked=str(owed.get("picked") or ""), ran=str(owed.get("ran") or ""))
+            if not self.post_card(owed.get("room"), card):
+                return "untold"
+            self.save_model_state(untold=None)
+            return "switched" if owed.get("picked") == owed.get("ran") else "not-switched"
         wanted = str(state.get("wanted") or "")
         if not wanted or state.get("told") == wanted or not turn.live:
             return ""
-        switched = turn.model == wanted
-        # Told only once the card is queued: one that could not be is tried again after the next turn.
-        if not self.post_card(state.get("asked_in"), self.model_card(state, picked=wanted, ran=turn.model)):
-            return "untold"
+        switched, ran = turn.model == wanted, turn.model or ""
+        queued = self.post_card(state.get("asked_in"), self.model_card(state, picked=wanted, ran=ran))
         # The model the turn ran on is the one in use, whatever a resumed Session reports of itself.
-        self.save_model_state(told=wanted, current=turn.model or state.get("current") or "",
+        self.save_model_state(told=wanted, current=ran or state.get("current") or "",
+                              untold=None if queued else {"picked": wanted, "ran": ran, "room": state.get("asked_in")},
                               **({} if switched else {"wanted": ""}))
+        if not queued:
+            return "untold"
         return "switched" if switched else "not-switched"
 
     def run_turn(self, task_id, headers, prompt, owner):
