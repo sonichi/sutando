@@ -8,6 +8,7 @@ and for ag2-sparrow's claude-local adapter (bundled verbatim; the package drift 
     python3 claude_model_switch.py model-pattern        # the names that may be typed, as an ERE
     python3 claude_model_switch.py accept <model>       # Claude Code's line for a switch to it, as an ERE
     python3 claude_model_switch.py count <model>        # how many such lines the screen on stdin holds
+    python3 claude_model_switch.py confirm-text         # the text of Claude Code's confirm dialog
 """
 from __future__ import annotations
 
@@ -59,13 +60,13 @@ def model_accepted(model: str) -> "re.Pattern":
     return re.compile(accept_pattern(model), re.I | re.M)
 
 
-def accepted_count(model: str, shown, context: bool = False) -> int:
-    """How many of Claude Code's lines on screen are a switch to `model`: its family and version. With
-    `context`, its context variant too: a line for the ordinary model is not one for its [1m] variant,
-    nor the other way round, and a [1m] switch whose line does not say so stays unconfirmed."""
+def accepted_count(model: str, shown) -> int:
+    """How many of Claude Code's lines on screen are a switch to exactly `model`: its family, its
+    version and its context variant. A line for the ordinary model is not one for its [1m] variant, nor
+    the other way round; a [1m] switch whose line does not say so stays unconfirmed."""
     wants_1m, pattern = model.endswith("[1m]"), model_accepted(model)
     return sum(1 for line in (shown or "").splitlines()
-               if pattern.search(line) and (not context or bool(re.search(r"1m", line, re.I)) == wants_1m))
+               if pattern.search(line) and bool(re.search(r"1m", line, re.I)) == wants_1m)
 
 
 def main(argv) -> int:
@@ -75,10 +76,13 @@ def main(argv) -> int:
     if argv[:1] == ["accept"] and len(argv) == 2 and MODEL_RE.match(argv[1]):
         print(accept_pattern(argv[1]))
         return 0
+    if argv == ["confirm-text"]:
+        print(MODEL_CONFIRM)
+        return 0
     if argv[:1] == ["count"] and len(argv) == 2 and MODEL_RE.match(argv[1]):
         print(accepted_count(argv[1], sys.stdin.read()))
         return 0
-    print("usage: claude_model_switch.py model-pattern | accept <model> | count <model>", file=sys.stderr)
+    print("usage: claude_model_switch.py model-pattern | accept <model> | count <model> | confirm-text", file=sys.stderr)
     return 2
 
 

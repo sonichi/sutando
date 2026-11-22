@@ -637,7 +637,7 @@ class Launcher:
         if draft:
             return False, "refused: the session's input box holds unsent text; nothing sent"
         shown = self.tm.capture(gen["pane_id"]) or ""
-        before, other, asked = accepted_count(model, shown, True), shown.count(MODEL_SET), shown.count(MODEL_CONFIRM)
+        before, other, asked = accepted_count(model, shown), shown.count(MODEL_SET), shown.count(MODEL_CONFIRM)
 
         def keys(*names):
             pred = tmux_pane_keys.predicate(gen["nonce"], gen["pane_pid"], gen["session_id"], gen["session_created"],
@@ -651,10 +651,10 @@ class Launcher:
         rc = keys("/model", "Space", model, "Enter")
         if rc != 0:
             return False, self.unsent(gen, title, rc, "/model") or "the session ended before /model; nothing switched"
-        answered, deadline = False, time.monotonic() + wait_s
+        answered, deadline, text = False, time.monotonic() + wait_s, shown
         while time.monotonic() < deadline:
             text = self.tm.capture(gen["pane_id"]) or ""
-            if accepted_count(model, text, True) > before:
+            if accepted_count(model, text) > before:
                 self.log("model: switched to %s" % model)
                 with contextlib.suppress(OSError):   # the switch happened whether or not it is recorded
                     path = Path(self.root).joinpath(*MODEL_RECORD)

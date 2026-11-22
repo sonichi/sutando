@@ -34,7 +34,8 @@ case " $* " in *" capture-pane "*)
   acc=""; i=0
   while [ "$i" -lt "$k" ]; do
     i=$((i+1)); sent="$(grep -- "-l /model" "$TMUX_LOG" | sed -n "${i}p" | sed 's/.*-l \/model //')"
-    name="$(disp "${TMUX_ACCEPT_AS:-$sent}")"; acc="$acc  ⎿  Set model to $name and saved as your default\n"
+    name="$(disp "${TMUX_ACCEPT_AS:-$sent}")"; case "${TMUX_ACCEPT_AS:-$sent}" in *'[1m]') name="$name (1M context)";; esac
+    acc="$acc  ⎿  Set model to $name and saved as your default\n"
     [ -n "${TMUX_PERSIST_SETTINGS:-}" ] && printf '{"model":"%s"}\n' "${TMUX_ACCEPT_AS:-$sent}" > "$TMUX_PERSIST_SETTINGS"
   done
   printf '%b' "$acc$dlg${TMUX_PANE_TEXT:-────\n❯ \n────\n}";; esac

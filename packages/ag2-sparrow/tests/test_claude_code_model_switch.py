@@ -171,7 +171,7 @@ class SwitchModel(unittest.TestCase):
                                 # The context variant is part of the model: neither line confirms the other.
                                 ("opus[1m]", "Set model to Opus 4.6", False), ("opus", "Set model to Opus 4.6 (1M context)", False),
                                 ("claude-opus-4-6[1m]", "Set model to Opus 4.6 (1M context)", True)):
-            self.assertEqual(launcher.accepted_count(model, "x\n" + line, True), int(ok), (model, line))
+            self.assertEqual(launcher.accepted_count(model, "x\n" + line), int(ok), (model, line))
 
         def plain(keys, pane):
             pane.text += "\nSet model to Opus 4.6 and saved as your default"
@@ -217,6 +217,10 @@ class SwitchModel(unittest.TestCase):
         self.assertEqual((switched, line.endswith("Its question may still be on the session's screen.")), (False, True), line)
         self.assertTrue((self.root / "state" / "model-switch.lock").exists(), "one switch at a time per agent")
         self.assertIs(launcher.MODEL_RE, launcher.claude_model_switch.MODEL_RE, "the core's rules, not a copy")
+
+    def test_no_time_to_wait_is_unconfirmed_not_an_error(self):
+        switched, line = lc_for(Pane(), self.root).switch_model(REC, "opus", wait_s=0)
+        self.assertEqual((switched, line.startswith("unconfirmed")), (False, True), line)
 
     def test_a_switch_that_cannot_be_recorded_is_still_a_switch(self):
         pane = Pane(says)

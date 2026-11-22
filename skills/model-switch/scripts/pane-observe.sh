@@ -11,10 +11,10 @@ while [ $# -gt 0 ]; do case "$1" in
 esac; shift; done
 [ -n "$SOCK" ] || { echo "pane-observe: --socket required" >&2; exit 2; }
 [ -n "$REQ" ] || [ "$MODE" = cancel ] || { echo "pane-observe: --model required" >&2; exit 2; }
-DIALOG='Yes, switch'
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 PANE_KEYS="$REPO_ROOT/src/tmux-pane-keys.sh"
 PY="$(bash "$REPO_ROOT/scripts/sutando-config.sh" python-bin)" || exit 1
+DIALOG="$("$PY" "$REPO_ROOT/src/claude_model_switch.py" confirm-text)" || exit 1
 # The CLI echoes display names ("Set model to Fable 5.1"), not ids. The line that is this model's
 # is src/claude_model_switch.py's rule, shared with ag2-sparrow's claude-local.
 ACCEPT=""

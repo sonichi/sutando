@@ -47,10 +47,28 @@ class Rules(unittest.TestCase):
                             (rule + "\n\u276f\u00a0%srun the tests\x1b[39m\n" % grey + rule, "")):
             self.assertEqual(rules.composer_text(shown), text, shown)
 
-    def test_a_line_counts_for_a_context_variant_only_when_asked_to_tell_them_apart(self):
+    def test_a_line_counts_only_for_its_own_context_variant(self):
         shown = "Set model to Opus 4.6\nSet model to Opus 4.6 (1M context)\nSet model to Sonnet 4.6"
-        self.assertEqual([rules.accepted_count("opus", shown), rules.accepted_count("opus", shown, True),
-                          rules.accepted_count("opus[1m]", shown, True), rules.accepted_count("haiku", shown)], [2, 1, 1, 0])
+        self.assertEqual([rules.accepted_count("opus", shown), rules.accepted_count("opus[1m]", shown),
+                          rules.accepted_count("haiku", shown)], [1, 1, 0])
+
+    def test_the_command_line_count_is_as_strict_as_the_function(self):
+        def count(model, screen):
+            return subprocess.run([sys.executable, str(REPO / "src" / "claude_model_switch.py"), "count", model],
+                                  input=screen, capture_output=True, text=True).stdout.strip()
+
+        self.assertEqual(count("opus[1m]", "Set model to Opus 4.6\n"), "0", "plain Opus does not confirm a 1M request")
+        self.assertEqual(count("opus", "Set model to Opus 4.6 (1M context)\n"), "0")
+        self.assertEqual(count("opus[1m]", "Set model to Opus 4.6 (1M context)\n"), "1")
+        self.assertEqual(count("opus", "Set model to Opus 4.6\nSet model to Sonnet 4\n"), "1")
+
+    def test_the_screen_patterns_are_the_cores_own(self):
+        """The core's pane gate reads the same screens: its styling and placeholder patterns and its prompt
+        glyph must stay the ones this module uses, or the two would disagree on what is typed text."""
+        sys.path.insert(0, str(REPO / "src" / "delivery"))
+        import pane_gate
+        self.assertEqual((rules._SGR.pattern, rules._GHOST.pattern), (pane_gate._SGR.pattern, pane_gate._GHOST.pattern))
+        self.assertEqual(rules.PROMPT_GLYPH, pane_gate.CLAUDE.glyph)
 
     def test_the_shell_scripts_get_the_same_patterns_from_the_command_line(self):
         def run(*argv):
@@ -59,9 +77,7 @@ class Rules(unittest.TestCase):
 
         self.assertEqual(run("model-pattern").stdout.strip(), rules.MODEL_PATTERN)
         self.assertEqual(run("accept", "claude-opus-4-6").stdout.strip(), rules.accept_pattern("claude-opus-4-6"))
-        counted = subprocess.run([sys.executable, str(REPO / "src" / "claude_model_switch.py"), "count", "opus"],
-                                 input="Set model to Opus 4.6\nSet model to Sonnet 4\n", capture_output=True, text=True)
-        self.assertEqual(counted.stdout.strip(), "1")
+        self.assertEqual(run("confirm-text").stdout.strip(), rules.MODEL_CONFIRM)
         for bad in (["accept"], ["accept", "gpt-5"], [], ["model-pattern", "x"]):
             self.assertEqual(run(*bad).returncode, 2, bad)
         # The patterns are plain EREs, so grep -E in the skill reads them as Python does.
