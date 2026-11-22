@@ -432,7 +432,7 @@ Sutando checkout around it sends neither field.
   also stops the core. A stop names the local run it is for, so it never stops a later run. The other
   two, from a beat or an ack, withdraw the task file if the core has not
   taken it up (no turn row newer than the file), and otherwise stop the core; the log names the
-  broker's `reason` when it sends one. A stop for a `task_already_terminal` close is cooperative only: the stop interrupt sends no Escape for it. `task_cancelled` is a **cooperative Stop**: the core gets one
+  broker's `reason` when it sends one. A stop for a `task_already_terminal` close with no reason, or one naming an answer, is cooperative only: the stop interrupt sends no Escape for it; any other reason (an expiry) still gets one. `task_cancelled` is a **cooperative Stop**: the core gets one
   `CANCEL_INSTRUCTION` task (`source: relay-control`, whose result is retired locally and never
   posted), and nothing is fenced. Once the core has handled that control task, a result it wrote
   for the task is posted normally and no cancel-ack is sent; with no result, or one with nothing to
