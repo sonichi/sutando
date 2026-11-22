@@ -224,6 +224,79 @@ class IsolatedRestrictedTurn(ConnectBase):
             rc, out = self.verb("claim", self.task("task-h", "access_tier: guest\n"))
         self.assertEqual(json.loads(out), hard, "the mirror's hard answer is the reply")
 
+class OwnAttachments(IsolatedRestrictedTurn.__base__):
+    """Owner decision 2026-11-21 19:52 (design: Lucy's gap-7 analysis): a restricted turn may read the files its
+    sender attached to THIS task, copied into its empty cwd, and nothing else in the remote-media folder."""
+
+    def setUp(self):
+        super().setUp()
+        self.stub = write_isolated_stub(self.home)
+        self.configure(CLAUDE=str(self.stub))
+        self.assertEqual(inbox.prepare_root(str(self.work)), "")
+        self.holder, _ = hold_consumer(self.work)
+        self.addCleanup(unhold, self.holder)
+        self.media = inbox.media_root(cli.read_config(cli.config_path()))
+        self.media.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(shutil.rmtree, self.media, True)
+
+    def file(self, name, data=b"PNG-BYTES", where=None):
+        path = (where or self.media) / name
+        path.write_bytes(data)
+        return str(path)
+
+    def claim(self, task_id, locators, body):
+        refs = json.dumps([{"locator": loc, "mime": "image/png"} for loc in locators])
+        (self.inbox / (task_id + ".txt")).write_text("id: %s\naccess_tier: guest\nattachments: %s\ntask: %s\n"
+                                                    % (task_id, refs, body))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = cli.main(["inbox", "--root", str(self.work), "claim", task_id])
+        self.assertEqual(rc, 1, out.getvalue())
+        return isolated_runs(self.home)[-1]
+
+    def test_the_senders_own_attachment_is_copied_in_and_its_path_rewritten(self):
+        own = self.file("own.png")
+        other = self.file("another-task.png", b"NOT YOURS")
+        run = self.claim("task-own", [own], "[Photo attached: %s] what is this?" % own)
+        self.assertEqual(run["listing"], ["1-own.png"], "only this task's file, never the folder's others")
+        self.assertEqual(run["files"]["1-own.png"], "PNG-BYTES")
+        shown = re.search(r"\[Photo attached: ([^\]]+)\]", run["stdin"]).group(1)
+        self.assertEqual(os.path.realpath(shown), os.path.join(os.path.realpath(run["cwd"]), "1-own.png"))
+        self.assertNotIn(own, run["stdin"])
+        self.assertNotIn(other, run["stdin"]); self.assertNotIn(str(self.media), " ".join(run["argv"]))
+        self.assertIn("only the files attached to this message", run["stdin"])
+        self.assertEqual((self.results / "task-own.txt").read_text(), ISOLATED_REPLY + "\n")
+
+    def test_outside_the_folder_a_symlink_and_an_oversize_file_are_refused(self):
+        outside_dir = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, outside_dir, True)
+        outside = self.file("secret.txt", b"OWNER SECRET", outside_dir)
+        link = self.media / "link.png"
+        link.symlink_to(outside)
+        big = self.file("big.png", b"x" * 64)
+        with mock.patch.object(inbox.isolated, "MAX_MEDIA_BYTES", 16):
+            run = self.claim("task-bad", [outside, str(link), big, "relative.png", str(self.media / "gone.png")],
+                             "[File attached: %s]" % outside)
+        self.assertEqual(run["listing"], [], "none of them reaches the turn")
+        self.assertIn(outside, run["stdin"], "an unstaged path stays as written: the turn cannot read it")
+
+    def test_the_helper_alone(self):
+        dest = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, dest, True)
+        own = self.file("a b.png")
+        sub = self.media / "dir.png"; sub.mkdir()
+        heads = {"attachments": json.dumps([{"locator": own}, {"locator": own}, {"locator": str(sub)}])}
+        staged = inbox.isolated.stage_own_attachments(heads, str(dest), str(self.media))
+        self.assertEqual(staged, [(own, str(dest / "1-a_b.png"))], "once, a directory skipped, the name made safe")
+        self.assertEqual(inbox.isolated.stage_own_attachments(heads, str(dest), ""), [])
+        self.assertEqual(inbox.isolated.stage_own_attachments(heads, str(dest), str(self.media / "none")), [])
+        self.assertEqual(inbox.isolated.stage_own_attachments({}, str(dest), str(self.media)), [])
+        self.assertEqual(inbox.isolated.with_staged_paths("see %s" % own, staged), "see %s" % (dest / "1-a_b.png"))
+
+    def test_a_staging_failure_fails_the_turn_without_running_it(self):
+        ran = []
+        turn = inbox.isolated.run_collaborator_turn("claude", "t", {}, run=lambda *a, **k: ran.append(a),
+                                                    prepare=mock.Mock(side_effect=OSError("disk full")))
+        self.assertEqual((turn.kind, turn.detail, ran), ("failed", "attachments: OSError", []))
+
 class IsolatedLines(unittest.TestCase):
     def test_every_rule_but_the_result_file_and_codex_steps_is_kept(self):
         for name in sorted(p.name for p in ENVELOPES.glob("*.txt")):
