@@ -367,9 +367,7 @@ def ensure_remedy_timer(workspace, repo, *, runner=None,
                         "why": "legacy timer is installed but not loaded; "
                                "run an explicit install to migrate it"}
             want = prt.stop_interrupt_setting()
-            saved_knobs = st.get("alert_knobs") or {}
-            knobs_kept = all(saved_knobs.get(k) == v for k, v in prt.alert_knob_settings().items())
-            if st.get("loaded") and (want is None or st.get("stop_interrupt") == want) and knobs_kept:
+            if st.get("loaded") and (want is None or st.get("stop_interrupt") == want):
                 return {"ensured": False, "why": "already installed",
                         "plist": st["plist"], "label": st["label"]}
 

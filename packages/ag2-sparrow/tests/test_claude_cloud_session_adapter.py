@@ -405,8 +405,8 @@ class QueueLoopTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [ok(1), ok(2)])
             write_task(d, "task-o", "x", mtime=1000)
-            write_task(d, "task-t", "x", tier="team", mtime=2000)
-            run_adapter(d, fake, once=2, result_mode="echo", allow_non_owner=True)
+            write_task(d, "task-t", "x", tier="team", collaborator=True, mtime=2000)
+            run_adapter(d, fake, once=2, result_mode="echo", allow_collaborator=True)
             self.assertEqual(result(d, "task-o"), "Sent to the cloud agent: https://claude.ai/code/%s?turn=1\n" % SID)
             self.assertTrue(result(d, "task-t").startswith("[no-send]\n"))
 
@@ -420,15 +420,13 @@ class QueueLoopTest(unittest.TestCase):
             for tier in ("team", "guest", "superuser"):
                 self.assertEqual(result(d, "task-" + tier), ra.NON_OWNER_REFUSED)
 
-    def test_a_collaborator_gets_an_isolated_local_turn_and_never_the_session(self):
+    def test_a_restricted_task_gets_an_isolated_local_turn_and_never_the_session(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [turn_ok("Hello from the turn"), ok(7)])
-            write_task(d, "task-c", "collab asks SECRET-MARKER", tier="team", collaborator=True, mtime=1000)
-            write_task(d, "task-g", "guest asks", tier="guest", mtime=1100)
-            write_task(d, "task-fake", "claims it", tier="guest", collaborator=True, mtime=1200)
-            write_task(d, "task-team", "team without the flag", tier="team", mtime=1300)
+            write_task(d, "task-c", "guest asks SECRET-MARKER", tier="guest", mtime=1000)
+            write_task(d, "task-collab", "collaborator without the flag", tier="team", collaborator=True, mtime=1300)
             write_task(d, "task-o", "owner asks", mtime=1400, kind="room")
-            ad, err = run_adapter(d, fake, once=5, owner_dm="!dm:ag2.space", environ=LEAKY_ENV, allow_collaborator=True)
+            ad, err = run_adapter(d, fake, once=3, owner_dm="!dm:ag2.space", environ=LEAKY_ENV, allow_non_owner=True)
             collab, owner = fake.calls()
             self.assertEqual(collab["argv"], [str(fake.path), "-p", "--safe-mode", "--restricted", "--strict-mcp-config",
                                               "--no-session-persistence", "--tools", "Read,Grep,Glob",
@@ -438,10 +436,10 @@ class QueueLoopTest(unittest.TestCase):
             self.assertNotIn("SECRET-MARKER", " ".join(collab["argv"]), "the text goes on stdin")
             reminder, first, rest = text_of(collab).split("\n", 2)
             self.assertEqual(reminder, ct.REMINDER, "the isolated turn's own line, not the session's")
-            self.assertEqual(first, "room=!room:ag2.space thread=none tier=team collaborator=true task_id=task-c",
+            self.assertEqual(first, "room=!room:ag2.space thread=none tier=guest collaborator=false task_id=task-c",
                              "no session reminder, no channel_kind, no owner_dm: nothing of the session's instructions")
             self.assertTrue(rest.startswith("note: " + NOTE + "\n"), rest[:80])
-            self.assertEqual(SPAN_RE.search(rest).group(2), "collab asks SECRET-MARKER")
+            self.assertEqual(SPAN_RE.search(rest).group(2), "guest asks SECRET-MARKER")
             for owner_only in ("owner_dm", "!dm:ag2.space", sa.REMINDER):
                 self.assertNotIn(owner_only, text_of(collab))
             # macOS stamps __CF_USER_TEXT_ENCODING on every child it spawns, whatever env was passed.
@@ -460,9 +458,8 @@ class QueueLoopTest(unittest.TestCase):
             self.assertIn("tier=owner collaborator=false task_id=task-o channel_kind=room owner_dm=!dm:ag2.space",
                           text_of(owner))
             self.assertEqual(result(d, "task-o"), "[no-send]\n# claude cloud session: https://claude.ai/code/%s?turn=7\n" % SID)
-            for tid in ("task-g", "task-fake", "task-team"):
-                self.assertEqual(result(d, tid), ra.NON_OWNER_REFUSED, tid)
-            self.assertIn("collaborator turn -> task-c", err)
+            self.assertEqual(result(d, "task-collab"), ra.NON_OWNER_REFUSED, "--allow-non-owner is not --allow-collaborator")
+            self.assertIn("isolated turn -> task-c", err)
             self.assertNotIn("queue -> task-c", err)
             self.assertIn("queue -> task-o", err)
             rec = claim(d, "task-c")
@@ -480,15 +477,15 @@ class QueueLoopTest(unittest.TestCase):
             self.assertEqual(claim(d, "task-c")["attempt"], 0, "no call was prepared")
             self.assertIs(sa.build_parser().get_default("allow_collaborator"), False)
 
-    def test_a_collaborator_turn_never_counts_against_the_owner_cap_or_min_gap(self):
+    def test_an_isolated_turn_never_counts_against_the_owner_cap_or_min_gap(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [turn_ok("one"), turn_ok("two")])
-            write_task(d, "task-c1", "one", tier="team", collaborator=True, mtime=1000)
-            write_task(d, "task-c2", "two", tier="team", collaborator=True, mtime=2000)
+            write_task(d, "task-c1", "one", tier="guest", mtime=1000)
+            write_task(d, "task-c2", "two", tier="guest", mtime=2000)
             clock = FakeClock()
             start = clock.t
             ad, _ = run_adapter(d, fake, clock=clock, once=2, max_per_hour=1, min_gap_seconds=1000,
-                                allow_collaborator=True)
+                                allow_non_owner=True)
             self.assertEqual([result(d, "task-c1"), result(d, "task-c2")], ["one", "two"])
             self.assertEqual(charges(d), {}, "the rate journal holds no charge")
             self.assertEqual(ad.limiter.times, [])
@@ -496,12 +493,12 @@ class QueueLoopTest(unittest.TestCase):
             self.assertEqual(len(ad.collab_limiter.times), 2)
             self.assertIn("collaborator-turns.json", os.listdir(ad.args.state))
 
-    def test_a_failed_collaborator_turn_gets_the_plain_line_once_and_no_retry(self):
+    def test_a_failed_isolated_turn_gets_the_plain_line_once_and_no_retry(self):
         for script in ([{"rc": 1, "stderr": "boom\n"}], [ok()], [{"stdout": '{"is_error": true, "result": "x"}'}]):
             with tempfile.TemporaryDirectory() as d:
                 fake = Fake(d, script)
-                write_task(d, "task-c", "collab asks", tier="team", collaborator=True)
-                _, err = run_adapter(d, fake, once=1, allow_collaborator=True)
+                write_task(d, "task-c", "collab asks", tier="guest")
+                _, err = run_adapter(d, fake, once=1, allow_non_owner=True)
                 self.assertEqual(len(fake.calls()), 1, "one try")
                 self.assertEqual(result(d, "task-c"), rl.NON_OWNER_FAILED)
                 self.assertNotIn("--cloud", fake.calls()[0]["argv"], "no fallback to the session")
@@ -509,13 +506,13 @@ class QueueLoopTest(unittest.TestCase):
                 self.assertEqual(charges(d), {})
                 self.assertEqual(claim(d, "task-c")["phase"], "SETTLED")
 
-    def test_the_collaborator_cap_holds_the_next_turn_for_the_window(self):
+    def test_the_isolated_turn_cap_holds_the_next_turn_for_the_window(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [turn_ok("one")])
-            write_task(d, "task-c1", "one", tier="team", collaborator=True, mtime=1000)
-            write_task(d, "task-c2", "two", tier="team", collaborator=True, mtime=2000)
+            write_task(d, "task-c1", "one", tier="guest", mtime=1000)
+            write_task(d, "task-c2", "two", tier="guest", mtime=2000)
             clock = FakeClock()
-            ad, _ = run_adapter(d, fake, clock=clock, once=1, max_collaborator_per_hour=1, allow_collaborator=True)
+            ad, _ = run_adapter(d, fake, clock=clock, once=1, max_collaborator_per_hour=1, allow_non_owner=True)
             self.assertEqual(len(fake.calls()), 1)
             self.assertEqual(result(d, "task-c1"), "one")
             self.assertIsNone(claim(d, "task-c2"), "no call was prepared for the waiting task")
@@ -526,30 +523,30 @@ class QueueLoopTest(unittest.TestCase):
             self.assertEqual(ad.next_ready(["task-c2.txt"]), ("task-c2.txt", 0.0))
             self.assertEqual(sa.build_parser().get_default("max_collaborator_per_hour"), 10)
 
-    def test_a_collaborator_runs_under_a_full_session_cap_and_a_pending_min_gap(self):
+    def test_a_restricted_task_runs_under_a_full_session_cap_and_a_pending_min_gap(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [ok(1), turn_ok("two")])
             write_task(d, "task-o", "owner first", mtime=1000)
-            write_task(d, "task-c", "collab asks", tier="team", collaborator=True, mtime=2000)
+            write_task(d, "task-c", "collab asks", tier="guest", mtime=2000)
             clock = FakeClock()
             start = clock.t
             ad, _ = run_adapter(d, fake, clock=clock, once=2, max_per_hour=1, min_gap_seconds=1000,
-                                allow_collaborator=True)
+                                allow_non_owner=True)
             self.assertEqual(len(fake.calls()), 2)
             self.assertIn("--cloud", fake.calls()[0]["argv"])
             self.assertEqual(result(d, "task-c"), "two")
             self.assertLess(clock.t - start, 1000, "neither the full cap nor the gap held the collaborator")
             self.assertGreater(ad.provider_wait(), 0, "the session's own gate is still shut")
 
-    def test_an_owner_turn_is_not_held_by_a_full_collaborator_cap(self):
+    def test_an_owner_turn_is_not_held_by_a_full_isolated_turn_cap(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [turn_ok("one"), ok(5)])
-            write_task(d, "task-c1", "one", tier="team", collaborator=True, mtime=1000)
-            write_task(d, "task-c2", "two", tier="team", collaborator=True, mtime=2000)
+            write_task(d, "task-c1", "one", tier="guest", mtime=1000)
+            write_task(d, "task-c2", "two", tier="guest", mtime=2000)
             write_task(d, "task-o", "owner last", mtime=3000)
             clock = FakeClock()
             start = clock.t
-            run_adapter(d, fake, clock=clock, once=2, max_collaborator_per_hour=1, allow_collaborator=True)
+            run_adapter(d, fake, clock=clock, once=2, max_collaborator_per_hour=1, allow_non_owner=True)
             self.assertEqual([("--cloud" in c["argv"]) for c in fake.calls()], [False, True])
             self.assertEqual(result(d, "task-c1"), "one")
             self.assertIn("turn=5", result(d, "task-o"))
@@ -583,24 +580,24 @@ class QueueLoopTest(unittest.TestCase):
             self.assertAlmostEqual(wait, rl.HOUR, delta=11.0)
             self.assertEqual(ad.next_ready(["task-c2.txt", "task-g2.txt"]), ("task-g2.txt", 0.0), "the refusal goes first")
 
-    def test_a_collaborator_turn_uses_collaborator_timeout(self):
+    def test_an_isolated_turn_uses_collaborator_timeout(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [turn_ok()])
-            write_task(d, "task-c", "collab asks", tier="team", collaborator=True)
+            write_task(d, "task-c", "collab asks", tier="guest")
             with mock.patch.object(sa.subprocess, "run", wraps=subprocess.run) as spy:
-                run_adapter(d, fake, run=sa.subprocess.run, once=1, allow_collaborator=True, collaborator_timeout=7)
+                run_adapter(d, fake, run=sa.subprocess.run, once=1, allow_non_owner=True, collaborator_timeout=7)
             self.assertEqual(spy.call_args.kwargs["timeout"], 7.0, "--collaborator-timeout, not --timeout (10 here)")
             self.assertEqual(sa.build_parser().get_default("collaborator_timeout"), 60.0)
             self.assertEqual(sa.build_parser().get_default("collaborator_max_age"), 1800.0)
 
-    def test_a_non_owner_turn_under_allow_non_owner_never_carries_owner_dm(self):
+    def test_a_collaborator_turn_never_carries_owner_dm(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [ok(1), ok(2)])
-            write_task(d, "task-g", "guest asks", tier="guest", mtime=1000)
+            write_task(d, "task-g", "guest asks", tier="team", collaborator=True, mtime=1000)
             write_task(d, "task-o", "owner asks", mtime=2000)
-            run_adapter(d, fake, once=2, allow_non_owner=True, owner_dm="!dm:ag2.space")
+            run_adapter(d, fake, once=2, allow_collaborator=True, owner_dm="!dm:ag2.space")
             guest, owner = fake.calls()
-            self.assertIn("tier=guest", text_of(guest))
+            self.assertIn("tier=team", text_of(guest))
             for owner_only in ("owner_dm", "!dm:ag2.space"):
                 self.assertNotIn(owner_only, text_of(guest))
             self.assertIn("owner_dm=!dm:ag2.space", text_of(owner))
@@ -610,21 +607,21 @@ class QueueLoopTest(unittest.TestCase):
     def test_settling_drops_the_lane_and_first_seen_records(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [turn_ok("one")])
-            write_task(d, "task-c", "collab asks", tier="team", collaborator=True)
-            ad, _ = run_adapter(d, fake, once=1, allow_collaborator=True)
+            write_task(d, "task-c", "collab asks", tier="guest")
+            ad, _ = run_adapter(d, fake, once=1, allow_non_owner=True)
             self.assertEqual((ad.lanes, ad.seen_at), ({}, {}))
             ad.lanes["task-x.txt"], ad.seen_at["task-x.txt"] = "provider", 1.0
             ad._settled("task-x.txt", set())
             self.assertEqual((ad.lanes, ad.seen_at), ({}, {}))
 
-    def test_a_collaborator_task_that_waited_past_the_max_age_gets_the_line_and_no_turn(self):
+    def test_a_restricted_task_that_waited_past_the_max_age_gets_the_line_and_no_turn(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [turn_ok("one")])
-            write_task(d, "task-c1", "one", tier="team", collaborator=True, mtime=1000)
-            write_task(d, "task-c2", "two", tier="team", collaborator=True, mtime=2000)
+            write_task(d, "task-c1", "one", tier="guest", mtime=1000)
+            write_task(d, "task-c2", "two", tier="guest", mtime=2000)
             clock = FakeClock()
             start = clock.t
-            ad, _ = run_adapter(d, fake, clock=clock, once=1, max_collaborator_per_hour=1, allow_collaborator=True,
+            ad, _ = run_adapter(d, fake, clock=clock, once=1, max_collaborator_per_hour=1, allow_non_owner=True,
                                 collaborator_max_age=600)
             self.assertEqual(result(d, "task-c1"), "one", "fresh: it ran")
             self.assertIsNone(ad.next_ready(["task-c2.txt"])[0], "the next poll sees c2 waiting on the cap")
@@ -640,15 +637,15 @@ class QueueLoopTest(unittest.TestCase):
             self.assertEqual(len(fake.calls()), 1)
             self.assertEqual(prepare.call_count, 0, "no claim was prepared for the stale task")
             self.assertEqual(claim(d, "task-c2")["attempt"], 0)
-            self.assertIn("collaborator task waited too long -> task-c2", err_buf.getvalue())
+            self.assertIn("restricted task waited too long -> task-c2", err_buf.getvalue())
             self.assertEqual(json.loads(Path(ad.args.state, rl.COLLAB_LIMITER_FILE).read_text()), [start],
                              "the stale rejection consumed no cap entry: the file still holds only the first turn")
 
     def test_a_backlog_task_aged_past_the_cutoff_by_the_turn_before_it_gets_the_line(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [turn_ok("one"), turn_ok("two")])
-            write_task(d, "task-c1", "one", tier="team", collaborator=True, mtime=1000)
-            write_task(d, "task-c2", "two", tier="team", collaborator=True, mtime=2000)
+            write_task(d, "task-c1", "one", tier="guest", mtime=1000)
+            write_task(d, "task-c2", "two", tier="guest", mtime=2000)
             clock = FakeClock()
 
             def slow_run(argv, **kw):
@@ -656,18 +653,18 @@ class QueueLoopTest(unittest.TestCase):
                 return subprocess.run(argv, **kw)
             start = clock.t
             with mock.patch.object(lc.Lifecycle, "prepare", autospec=True, side_effect=lc.Lifecycle.prepare) as prepare:
-                ad, err = run_adapter(d, fake, clock=clock, run=slow_run, once=2, allow_collaborator=True,
+                ad, err = run_adapter(d, fake, clock=clock, run=slow_run, once=2, allow_non_owner=True,
                                       collaborator_max_age=10)
             self.assertEqual([c.args[1] for c in prepare.call_args_list], ["task-c1"], "one claim, for the turn that ran")
             self.assertEqual(result(d, "task-c1"), "one")
             self.assertEqual(result(d, "task-c2"), rl.NON_OWNER_FAILED, "seen at the first scan, aged by the turn before it")
             self.assertEqual(len(fake.calls()), 1, "exactly one turn")
             self.assertEqual(claim(d, "task-c2")["attempt"], 0, "no call was prepared")
-            self.assertIn("collaborator task waited too long -> task-c2", err)
+            self.assertIn("restricted task waited too long -> task-c2", err)
             self.assertEqual(ad.collab_limiter.times, [start], "the stale rejection consumed no cap entry")
             self.assertEqual(json.loads(Path(ad.args.state, rl.COLLAB_LIMITER_FILE).read_text()), [start])
 
-    def test_a_collaborator_reply_never_executes_delivery_protocol(self):
+    def test_an_isolated_turn_reply_never_executes_delivery_protocol(self):
         from ag2_sparrow.result_markers import parse_markers
         from ag2_sparrow.team_result_guard import guard_result_for_tier
         bodies = ("[no-send]\nHI", "[REPLIED]\nHI", "[deduped: task-1]\nHI", "[channel: !other:x]\nHI",
@@ -677,13 +674,13 @@ class QueueLoopTest(unittest.TestCase):
         for raw in bodies:
             with tempfile.TemporaryDirectory() as d:
                 fake = Fake(d, [turn_ok(raw)])
-                write_task(d, "task-c", "collab asks", tier="team", collaborator=True)
-                run_adapter(d, fake, once=1, allow_collaborator=True)
+                write_task(d, "task-c", "collab asks", tier="guest")
+                run_adapter(d, fake, once=1, allow_non_owner=True)
                 body = result(d, "task-c")
                 parsed = parse_markers(body)
                 self.assertEqual((parsed.actions, parsed.body), ([], body), raw)
                 self.assertEqual(parse_markers(body, skip_after_channel=True).actions, [], raw)
-                self.assertEqual(guard_result_for_tier(body, "team", PKG_ROOT, scan_sensitive_data=False),
+                self.assertEqual(guard_result_for_tier(body, "guest", PKG_ROOT, scan_sensitive_data=False),
                                  (body, None), "the real guard delivers it as a room reply: " + raw)
                 self.assertIn("HI", body)
                 self.assertNotEqual(body, raw, "and it was changed to get there")
@@ -694,8 +691,8 @@ class QueueLoopTest(unittest.TestCase):
             work.mkdir()
             self.assertIsNone(lc.prepare_work_dir(str(work)), "a fresh work dir, as the real start makes it")
             fake = Fake(d, [turn_ok("one"), ok(2)])
-            write_task(work, "task-c", "collab asks", tier="team", collaborator=True)
-            run_adapter(work, fake, once=1, allow_collaborator=True)
+            write_task(work, "task-c", "collab asks", tier="guest")
+            run_adapter(work, fake, once=1, allow_non_owner=True)
             self.assertEqual(result(work, "task-c"), "one")
             state = work / "state"
             self.assertIn(rl.COLLAB_LIMITER_FILE, os.listdir(state), "written by the production limiter")
@@ -717,11 +714,11 @@ class QueueLoopTest(unittest.TestCase):
             run_adapter(d, fake, once=1)
             self.assertEqual((fake.calls(), result(d, "task-g")), ([], ra.NON_OWNER_REFUSED))
 
-    def test_allow_non_owner_queues_with_the_note(self):
+    def test_allow_collaborator_queues_with_the_note(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [ok(3)])
-            write_task(d, "task-g", "x", tier="guest")
-            run_adapter(d, fake, once=1, allow_non_owner=True)
+            write_task(d, "task-g", "x", tier="team", collaborator=True)
+            run_adapter(d, fake, once=1, allow_collaborator=True)
             self.assertIn("\nnote: " + NOTE + "\n", text_of(fake.calls()[0]))
             self.assertIn("turn=3", result(d, "task-g"))
 
@@ -737,8 +734,8 @@ class QueueLoopTest(unittest.TestCase):
     def test_a_non_owner_failure_hides_the_exit_code(self):
         with tempfile.TemporaryDirectory() as d:
             fake = Fake(d, [{"rc": 1}])
-            write_task(d, "task-f", "x", tier="team")
-            run_adapter(d, fake, once=1, allow_non_owner=True)
+            write_task(d, "task-f", "x", tier="team", collaborator=True)
+            run_adapter(d, fake, once=1, allow_collaborator=True)
             self.assertEqual(result(d, "task-f"), "This message could not be sent to the cloud agent right now.\n")
 
     def test_exit_zero_without_ok_is_not_counted_as_queued(self):

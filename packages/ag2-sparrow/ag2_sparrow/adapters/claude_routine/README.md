@@ -54,18 +54,16 @@ the package-level `task_io.parse_task` every adapter shares), never from message
 The note is the shared `ag2_sparrow.task_io.NON_OWNER_NOTE`, the same text every adapter renders; `routine-prompt.md`
 carries the same text so the rules do not depend on the payload. A task with no room is not fired.
 
-**Who is served.** Admission is the shared `task_io.admission` gate over the attested headers: the owner,
-an attested collaborator (Team), nobody else. A non-owner without collaborator access (Guest, and any
-collaborator claim the broker did not attest) is refused before anything is sent, with a plain-text result
-("This agent only answers its owner here."), unless `--allow-non-owner` is passed — which fires such tasks
-at the same routine and connector scope as the owner, bounded only by the prompt's note, and should only be
-true when this specific routine's connector scope is meant to be reachable by them. An attested collaborator
-(the broker's `collaborator: true` on the team tier, from the parsed headers, never the message text) never
-reaches the routine at all: with `--allow-collaborator` it is served on the isolated local turn below;
-without it, it gets the same refusal line. `--allow-non-owner` does not imply `--allow-collaborator`. The
-owner path is unchanged.
+**Who is served.** The tier decision is the shared `task_io.turn_policy` over the attested headers. An
+attested collaborator (the broker's `collaborator: true` on the team tier, from the parsed headers, never
+the message text) gets the owner's capabilities: with `--allow-collaborator` its task is fired at this
+routine, at the owner's routine and connector scope, with the note; without it, it gets the plain refusal
+("This agent only answers its owner here."). A non-owner without collaborator access (Guest, and any
+collaborator claim the broker did not attest) gets a restricted turn, which never reaches the routine:
+with `--allow-non-owner` it is served on the isolated local turn below; without it, it gets the same
+refusal line. Neither flag implies the other. The owner path is unchanged.
 
-**The isolated collaborator turn.** `<--claude> -p --safe-mode --restricted --strict-mcp-config
+**The isolated (restricted) turn.** `<--claude> -p --safe-mode --restricted --strict-mcp-config
 --no-session-persistence --tools Read,Grep,Glob --output-format json`, the same payload on stdin (one lead
 line naming the situation, then the note, `collaborator=true`, never `owner_dm`), in a fresh empty temp
 directory removed afterwards, with an environment of only `PATH`, `HOME`, `USER`, `LANG` and
