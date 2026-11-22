@@ -265,11 +265,12 @@ On each context compaction, `src/session-handoff.sh` saves a snapshot to `<works
 
 The recent-conversation section comes from `src/context_resume.py`. Its `--turns`
 limit counts cleaned, nonempty user/assistant turns (including tool summaries),
-and its `--chars` limit counts the complete markdown payload, including headings
-and separators. Newest turns take priority and render in chronological order.
+and its `--chars` limit counts the complete markdown payload, including role
+prefixes and separators. Newest turns take priority and render in chronological
+order.
 A newest turn that exceeds the character limit is shortened with `[…truncated]`;
-a budget too small for its heading and marker produces only `…`. The CLI adds one
-final stdout newline outside the payload budget.
+a budget too small for its role prefix and marker produces only `…`. The CLI adds
+one final stdout newline outside the payload budget.
 
 Both limits must be nonnegative. Zero emits no context (the CLI exits 1 with its
 usual no-conversation diagnostic); a negative limit exits 1 with a limit error.
