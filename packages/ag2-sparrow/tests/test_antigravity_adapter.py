@@ -33,8 +33,17 @@ from ag2_sparrow import acp_host, connect_common as cm, holder_lock, task_io  # 
 
 # The work-root lock lives under the passwd home, not HOME: keep it in a temp dir for this suite.
 LOCK_HOME = tempfile.mkdtemp(prefix="agy-lock-home-")
-holder_lock._home = lambda: LOCK_HOME
 atexit.register(shutil.rmtree, LOCK_HOME, True)
+_REAL_LOCK_HOME = holder_lock._home
+
+
+# Only while this module runs: other modules in the same process (pytest) must see the real lock home.
+def setUpModule():
+    holder_lock._home = lambda: LOCK_HOME
+
+
+def tearDownModule():
+    holder_lock._home = _REAL_LOCK_HOME
 from ag2_sparrow.adapters.antigravity import cli, antigravity_connector as gc  # noqa: E402
 from ag2_sparrow import connector_cards, model_switch  # noqa: E402
 from ag2_sparrow.result_markers import parse_markers, render_skill_prelude  # noqa: E402
