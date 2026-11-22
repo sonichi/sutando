@@ -539,6 +539,54 @@ class MediaAndMarkersTest(unittest.TestCase):
         self.w.serve()
         self.assertEqual(self.w.metrics()[0]["status"], "completed")
 
+    def test_names_differing_only_in_case_are_both_kept(self):
+        # A macOS volume folds case: "Photo.png" and "photo.png" are one file there.
+        self.sent("task-1", files=(("Photo.png", "image/png", PNG + b"A"), ("photo.png", "image/png", PNG + b"b"),
+                                   ("x.png", "image/png", PNG + b"x")))
+        headers, _, _ = task_io.parse_task(str(self.w.root / "tasks" / "task-1.txt"))
+        real = acp_host._write_copy
+        planted = []
+
+        def write_copy(path, data):   # a name already on disk (the folder is case-folding): skip it, keep it
+            if os.path.basename(path) == "x.png" and not planted:
+                planted.append(real(path, b"theirs"))
+                raise FileExistsError(17, "File exists", path)
+            return real(path, data)
+        with mock.patch.object(acp_host, "_write_copy", write_copy), \
+                acp_host.task_media(headers, readable=True) as media:
+            self.assertEqual([f[0] for f in media.files], ["Photo.png", "2-photo.png", "2-x.png"])
+            self.assertEqual([Path(f[3]).read_bytes()[-1:] for f in media.files], [b"A", b"b", b"x"])
+            self.assertEqual(Path(media.folder, "x.png").read_bytes(), b"theirs", "an existing name is not removed")
+            self.assertEqual(len({f[0].casefold() for f in media.files}), 3)
+
+    def test_a_folder_that_cannot_be_sealed_drops_the_files_and_the_turn_still_runs(self):
+        self.sent("task-1")
+        real = os.chmod
+
+        def chmod(path, mode, *a, **k):
+            if mode == 0o500:
+                raise PermissionError(1, "Operation not permitted", path)
+            return real(path, mode, *a, **k)
+        headers, _, _ = task_io.parse_task(str(self.w.root / "tasks" / "task-1.txt"))
+        said, made = [], []
+        mkdtemp = tempfile.mkdtemp
+        with mock.patch("os.chmod", chmod), \
+                mock.patch.object(tempfile, "mkdtemp", lambda **k: made.append(mkdtemp(**k)) or made[-1]), \
+                acp_host.task_media(headers, True, log=said.append) as media:
+            self.assertIsNone(media.folder)
+            self.assertEqual([f[3] for f in media.files], [None, None], "no unsealed path is handed over")
+            self.assertEqual([i["_name"] for i in media.images], ["photo.png"])
+        self.assertEqual(said, ["media folder not sealed read-only (PermissionError): its files are left out"])
+        self.assertEqual(len(made), 1)
+        self.assertFalse(os.path.exists(made[0]), "the unsealed folder is still removed")
+        with mock.patch("os.chmod", chmod):
+            self.w.serve()
+        self.assertEqual(self.w.metrics()[0]["status"], "completed")
+        self.assertEqual(self.session_dirs(), [None])
+        prompt = self.prompt_rec()
+        self.assertEqual([b["type"] for b in prompt["blocks"]], ["text", "image", "text"])
+        self.assertIn("not readable in this session", prompt["text"])
+
     def test_one_bad_attachment_is_dropped_and_the_others_kept(self):
         refs = self.sent("task-1", files=(("ok.png", "image/png", PNG), ("gone.pdf", "application/pdf", PDF),
                                           ("big.bin", "application/octet-stream", b"x"),

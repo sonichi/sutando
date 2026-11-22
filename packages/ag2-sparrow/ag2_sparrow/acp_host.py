@@ -349,6 +349,31 @@ def _read_attachment(path):
         os.close(fd)
 
 
+def _stage(folder, base, data, used):
+    """(name, copy path or None) for one attachment, `name` unused in `used` compared case-insensitively (a
+    macOS volume folds case) and recorded there; (None, None) when its copy cannot be written. A name that
+    exists on disk anyway is skipped for the next, never removed."""
+    n = 1
+    while True:
+        name = base if n == 1 else "%d-%s" % (n, base)
+        n += 1
+        if name.casefold() in used:
+            continue
+        copy = os.path.join(folder, name) if folder else None
+        if copy:
+            try:
+                _write_copy(copy, data)
+            except FileExistsError:
+                used.add(name.casefold())
+                continue
+            except OSError:
+                with contextlib.suppress(OSError):
+                    os.unlink(copy)
+                return None, None
+        used.add(name.casefold())
+        return name, copy
+
+
 def _write_copy(path, data):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o400)
     with os.fdopen(fd, "wb") as f:
@@ -356,7 +381,7 @@ def _write_copy(path, data):
 
 
 @contextlib.contextmanager
-def task_media(headers, readable):
+def task_media(headers, readable, log=None):
     """The task's own attachments (its attested `attachments:` header, as the bridge stamps the files it
     downloaded for this message) as a `Media`: each image of a known type and at most MAX_IMAGE_BYTES as an
     image block; with `readable`, a read-only copy of every file in a new 0500 folder of this turn's own,
@@ -378,30 +403,24 @@ def task_media(headers, readable):
                 continue
             base = _SAFE_NAME_RE.sub("_", os.path.basename(ref.filename or ref.locator))[:120].lstrip(".") \
                 or "attachment"
-            name, n = base, 1
-            while name in used:   # a sender's own names may already hold "2-a.png": take the first free one
-                n += 1
-                name = "%d-%s" % (n, base)
+            name, copy = _stage(folder, base, data, used)
+            if name is None:
+                continue   # its copy could not be written: this attachment is dropped, the others go on
             sniffed = image_mime(data)
-            copy = None
-            if folder:
-                copy = os.path.join(folder, name)
-                try:
-                    _write_copy(copy, data)
-                except FileExistsError:
-                    continue   # never ours to remove
-                except OSError:
-                    with contextlib.suppress(OSError):
-                        os.unlink(copy)
-                    continue   # this attachment is dropped; the others and the turn go on
-            used.add(name)
             files.append((name, sniffed or ref.mime, len(data), copy))
             if sniffed and len(data) <= MAX_IMAGE_BYTES:
                 images.append({"type": "image", "mimeType": sniffed, "data": base64.b64encode(data).decode("ascii"),
                                "_name": name})
+        readable_folder = folder
         if folder:
-            os.chmod(folder, 0o500)
-        yield Media(tuple(files), tuple(images), folder)
+            try:
+                os.chmod(folder, 0o500)
+            except OSError as e:   # unsealed copies are never handed over; the text and images still go
+                (log or (lambda *a: None))("media folder not sealed read-only (%s): its files are left out"
+                                           % type(e).__name__)
+                files = [(name, mime, size, None) for name, mime, size, _ in files]
+                readable_folder = None
+        yield Media(tuple(files), tuple(images), readable_folder)
     finally:
         if folder:
             with contextlib.suppress(OSError):

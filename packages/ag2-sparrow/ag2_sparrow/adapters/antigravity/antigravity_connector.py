@@ -188,7 +188,7 @@ class Connector:
         The owner's turn resumes the room's Session in the working directory; any other runs `guest_turn`."""
         if owner:
             cwd = self.args.cwd
-            with acp_host.task_media(headers, readable=True) as media:
+            with acp_host.task_media(headers, readable=True, log=log) as media:
                 read_only = (media.folder,) if media.folder else ()
                 return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
                                            lambda params: acp_host.decide_permission(params, True, cwd,
