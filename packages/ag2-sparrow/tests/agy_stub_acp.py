@@ -107,6 +107,12 @@ def prompt(rid, params):
     elif "STUB:SHELL" in text:
         ask(sid, {"title": "rm -rf ~ [current working directory]", "kind": "execute", "locations": []})
         chunk(sid, "tried a command")
+    elif "STUB:MCP" in text:
+        # Assumed shape (no signed-in agy MCP call measured): the MCP server and tool named in `_meta`.
+        for title, meta, raw in MCP_CALLS:
+            kind = "execute" if "command" in raw else "other"
+            ask(sid, dict({"title": title, "kind": kind, "rawInput": raw}, **({"_meta": meta} if meta else {})))
+        chunk(sid, "tried the S.space tools")
     elif "STUB:WEB" in text:
         ask(sid, {"title": "date", "kind": "execute",
                   "rawInput": {"CommandLine": "date", "Cwd": cwd, "WaitMsBeforeAsync": 0}})
@@ -139,6 +145,45 @@ def prompt(rid, params):
     else:
         chunk(sid, "hello from agy-stub")
     send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
+
+
+PAGE = {"room_id": "!room:s.space", "action": "commons.page.create", "input": {"title": "Notes"}}
+MCP_CALLS = [
+    ("room.action.execute", {"serverName": "ag2-space", "toolName": "room.action.execute"}, PAGE),
+    ("room_actions_search", {"serverName": "ag2-space", "toolName": "room_actions_search"}, {"query": "page"}),
+    ("agent.unlink", {"serverName": "ag2-space", "toolName": "agent.unlink"}, {}),
+    ("room.action.execute", {"serverName": "other-server", "toolName": "room.action.execute"}, PAGE),
+    ("ag2-space room.action.execute", None, PAGE),
+    ("rm -rf ~", {"serverName": "ag2-space", "toolName": "ag2.whoami"}, {"command": "rm -rf ~"}),
+]
+
+
+def launch(servers, loading=False):
+    """With `launch-mcp` under $HOME, start each stdio MCP server as agy does (its command, args and only its env),
+    ask for its tools and log their names; on session/load only with `launch-on-load` (agy launched none then)."""
+    if not os.path.exists(os.path.join(HOME, "launch-mcp")) or (loading and not os.path.exists(os.path.join(HOME, "launch-on-load"))):
+        return
+    import subprocess
+    for s in servers or []:
+        if "command" not in s:
+            continue
+        env = {e["name"]: e["value"] for e in s.get("env") or []}
+        try:
+            p = subprocess.Popen([s["command"]] + list(s.get("args") or []), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, env=env, text=True)
+        except OSError as e:
+            log({"mcp_launch": s["name"], "error": type(e).__name__})
+            continue
+        try:
+            p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n")
+            p.stdin.flush()
+            line = p.stdout.readline()
+        except OSError:
+            line = ""
+        tools = [t.get("name") for t in ((json.loads(line).get("result") or {}).get("tools") or [])] if line else []
+        log({"mcp_launch": s["name"], "tools": tools})
+        p.stdin.close()
+        p.wait(30)
 
 
 GLOBAL_CONTEXT = ("GEMINI.md", "AGENTS.md", "config/GEMINI.md", "config/AGENTS.md")
@@ -177,7 +222,10 @@ def main():
         if method == "initialize":
             send({"jsonrpc": "2.0", "id": rid, "result": {
                 "protocolVersion": 1, "agentInfo": {"name": "Antigravity ACP Server", "version": "1.5.9"},
-                "agentCapabilities": {"loadSession": True, "sessionCapabilities": {"load": {}, "resume": {}}},
+                "agentCapabilities": dict({"loadSession": True, "sessionCapabilities": {"load": {}, "resume": {}}},
+                                          # `mcp-http` under $HOME declares HTTP MCP (assumed: 1.5.9 declared none)
+                                          **({"mcpCapabilities": {"http": True, "sse": False}}
+                                             if os.path.exists(os.path.join(HOME, "mcp-http")) else {})),
                 "authMethods": [{"id": "oauth-personal", "name": "Log in with Google"},
                                 {"id": "oauth-business", "name": "Log in with Gemini Enterprise"},
                                 {"id": "gemini-api-key", "name": "Gemini API key"},
@@ -187,6 +235,7 @@ def main():
                 send({"jsonrpc": "2.0", "id": rid,
                       "error": {"code": -32000, "message": "Authentication required"}})
                 continue
+            launch(params.get("mcpServers"))
             s = sessions()
             sid = "s-%d" % (len(s) + 1)
             s[sid] = params.get("cwd")
@@ -202,6 +251,7 @@ def main():
                 send({"jsonrpc": "2.0", "id": rid, "result": {}})
         elif method == "session/load":
             if params.get("sessionId") in sessions():
+                launch(params.get("mcpServers"), loading=True)
                 chunk(params["sessionId"], "replayed history")
                 send({"jsonrpc": "2.0", "id": rid, "result": {}})
             else:

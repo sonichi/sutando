@@ -432,7 +432,7 @@ Sutando checkout around it sends neither field.
   also stops the core. A stop names the local run it is for, so it never stops a later run. The other
   two, from a beat or an ack, withdraw the task file if the core has not
   taken it up (no turn row newer than the file), and otherwise stop the core; the log names the
-  broker's `reason` when it sends one. `task_cancelled` is a **cooperative Stop**: the core gets one
+  broker's `reason` when it sends one. A stop for a `task_already_terminal` close with no reason, or one naming an answer, is cooperative only: the stop interrupt sends no Escape for it; any other reason (an expiry) still gets one. `task_cancelled` is a **cooperative Stop**: the core gets one
   `CANCEL_INSTRUCTION` task (`source: relay-control`, whose result is retired locally and never
   posted), and nothing is fenced. Once the core has handled that control task, a result it wrote
   for the task is posted normally and no cancel-ack is sent; with no result, or one with nothing to
@@ -735,17 +735,17 @@ Config: `REMOTE_MEDIA_MARKER` (tag, default `remote-media`),
 `REMOTE_MEDIA_HS_TOKEN` + `REMOTE_MEDIA_HS_ORIGIN` (homeserver bearer and the
 exact origin it may be sent to), `REMOTE_MEDIA_DIR`, `REMOTE_MEDIA_MAX_BYTES`.
 
-Credential routing is by parsed exact origin, never string matching:
+Only two kinds of URL are fetched, matched on the raw URL (no `.`/`..` segment or
+percent-encoding passes, no userinfo or fragment), each with its own bearer:
 
-- gateway bearer → only when the URL's scheme/host/port equal the gateway's
-  AND the path sits at/under the gateway base path with a `/` boundary;
-- homeserver bearer → only for `/_matrix/` paths on exactly
-  `REMOTE_MEDIA_HS_ORIGIN` (legacy media routes are upgraded to the MSC3916
-  authenticated route first); unset origin ⇒ Matrix media is never credentialed;
-- anything else → fetched with no credentials.
+- gateway bearer → `<gateway base>/v1/media/<server>/<id>` on exactly the
+  gateway's scheme/host/port, with at most a `room_id` query parameter;
+- homeserver bearer → `/_matrix/client/v1/media/(download|thumbnail)/<server>/<id>`
+  (or the legacy `/_matrix/media/(r0|v3)/download/…`, upgraded to the MSC3916
+  route) on exactly `REMOTE_MEDIA_HS_ORIGIN`; unset ⇒ never fetched;
+- anything else → never fetched; the marker is left untouched.
 
-Authenticated fetches refuse redirects (a 3xx is a failure), so a
-gateway-controlled URL can never bounce a bearer to another host.
+No media fetch follows a redirect (a 3xx is a failure).
 
 The local `room_ops.py fetch` fallback accepts `mxc://server/id` with an
 explicit `--room`, or a media link under the selected gateway's
