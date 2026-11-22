@@ -896,6 +896,59 @@ class ExecutorEdges(Base):
         self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=False), [])
 
 
+class NotOwnerAudit(unittest.TestCase):
+    """Both copies of the audit (src and the vendored ag2-sparrow one) bound, skip and dedupe alike."""
+
+    def setUp(self):
+        sys.path.insert(0, str(REPO / "packages" / "ag2-sparrow"))
+        from ag2_sparrow.hitl import recovery as vendored
+        self.copies = (("src", recovery), ("vendored", vendored))
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _ws(self, name):
+        ws = Path(self.tmp.name) / name
+        ws.mkdir()
+        return ws
+
+    def _rows(self, mod, ws):
+        return [json.loads(l) for l in (mod.recovery_dir(ws) / mod.AUDIT_FILE).read_text().splitlines()]
+
+    def test_the_audit_is_trimmed_to_its_newest_rows(self):
+        for name, mod in self.copies:
+            with self.subTest(copy=name), mock.patch.object(mod, "AUDIT_KEEP", 3):
+                ws = self._ws(name)
+                for i in range(7):
+                    mod.audit(ws, {"at": i})
+                self.assertEqual([r["at"] for r in self._rows(mod, ws)], [4, 5, 6])
+                self.assertFalse((mod.recovery_dir(ws) / "audit.tmp").exists())
+
+    def test_an_unwritable_audit_is_swallowed(self):
+        for name, mod in self.copies:
+            with self.subTest(copy=name):
+                ws = self._ws(name)
+                (ws / "state").mkdir()
+                (ws / "state" / "recovery").write_text("not a dir")
+                mod.audit(ws, {"at": 1})
+                mod.audit_not_owner(ws, "h1", "retry", "@x:s")  # must not raise
+
+    def test_a_repeat_tap_is_not_recorded_and_a_corrupt_line_is_skipped(self):
+        for name, mod in self.copies:
+            with self.subTest(copy=name):
+                ws = self._ws(name)
+                mod.recovery_dir(ws).mkdir(parents=True)
+                (mod.recovery_dir(ws) / mod.AUDIT_FILE).write_text("{not json\n[1, 2]\n")
+                self.assertTrue(mod.audit_not_owner(ws, "h1", "retry", "@x:s", at=5))
+                self.assertFalse(mod.audit_not_owner(ws, "h1", "other", "@x:s"))
+                self.assertTrue(mod.audit_not_owner(ws, "h1", "retry", "@y:s"))
+                self.assertTrue(mod.audit_not_owner(ws, "h2", "retry", "@x:s"))
+                rows = [l for l in (mod.recovery_dir(ws) / mod.AUDIT_FILE).read_text().splitlines()]
+                self.assertEqual(len(rows), 5, "two corrupt lines kept, three refusals added")
+                first = json.loads(rows[2])
+                self.assertEqual((first["at"], first["hitl_id"], first["sender"], first["reason"]),
+                                 (5, "h1", "@x:s", mod.NOT_OWNER))
+
+
 class SeatRetryCopy(Base):
     def test_a_held_workers_card_says_retry_restarts_it(self):
         req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED, seat=SEAT)

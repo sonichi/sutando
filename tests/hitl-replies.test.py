@@ -201,6 +201,20 @@ class ReplyHandlerTests(unittest.TestCase):
         self.h.offer_task(self._task(user_id="@someone-else:ag2.space", reply_to_event="$card", task="Allow"))
         self.assertEqual(self._audit_rows(), [])
 
+    def test_non_owner_payload_that_is_not_a_reply_is_not_audited(self):
+        self.h.offer(event({"hitl_id": self.req.id}, actor="@stranger:ag2.space"))
+        self.assertEqual(self._audit_rows(), [])
+        self.assertEqual(self.mgr.get(self.req.id).status, "pending")
+
+    def test_a_failed_non_owner_audit_is_logged_and_the_refusal_stands(self):
+        from unittest import mock
+        from hitl import recovery
+        with mock.patch.object(recovery, "audit_not_owner", side_effect=RuntimeError("disk gone")):
+            self.assertEqual(self.h.offer(event(reply_for(self.req, "allow"), actor="@stranger:ag2.space")),
+                             ["$e1"])
+        self.assertEqual(self.mgr.get(self.req.id).status, "pending")
+        self.assertTrue(any("non-owner audit not written" in l and "disk gone" in l for l in self.logs))
+
     def test_no_owner_configured_is_inert(self):
         h = HitlReplyHandler(self.mgr, None, workspace=self.ws, log=self.logs.append)
         h.offer(event(reply_for(self.req, "allow")))
