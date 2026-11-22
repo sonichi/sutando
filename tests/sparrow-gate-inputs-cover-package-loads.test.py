@@ -10,6 +10,11 @@ repo, and imports that resolve only to a repo module (`tests/_helpers`, `src/`).
 
 Run: python3 tests/sparrow-gate-inputs-cover-package-loads.test.py
 """
+from _helpers.hermetic_env import isolate_os_environ
+
+# Before anything reads the environment: no outer credential selector survives.
+isolate_os_environ()
+
 import ast
 import subprocess
 import sys
