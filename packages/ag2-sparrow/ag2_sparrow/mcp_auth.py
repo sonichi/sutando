@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shlex
 import sys
 import urllib.error
@@ -220,18 +221,19 @@ def stdio_descriptor(env_path: str) -> dict:
     if not env_path:
         raise McpAuthError("descriptor needs --env-file, the agent's own .env")
     from .bounded_file_read import read_private
-    from .gateway_credential_sources import plain_token, raw_token_line, seat_token_path
+    from .gateway_credential_sources import plain_token, raw_token_line, seat_token_pointer
     text, why = read_private(env_path)   # this user's, 0600, no symlink: it holds or names the credential
     if text is None:
         raise McpAuthError(f"{env_path} was refused ({why or 'missing'})")
     key, url, bearer = plain_token(text)
     if not key:
-        raw_path = seat_token_path(env_path, text)
-        if not raw_path:
+        pointer = seat_token_pointer(env_path, text)
+        if not pointer:
             raise McpAuthError(f"{env_path} has neither a REMOTE_TASK_TOKEN= line nor a seat's token-file pointer")
-        raw, why = read_private(raw_path)
+        raw, why = read_private(pointer)   # the path as named, so a symlinked token file is refused
         if raw is None:
-            raise McpAuthError(f"the seat's token file {raw_path} was refused ({why or 'missing'})")
+            raise McpAuthError(f"the seat's token file {pointer} was refused ({why or 'missing'})")
+        raw_path = os.path.realpath(pointer)
         relay, secret = raw_token_line(raw)
         if not relay or not secret.strip():
             raise McpAuthError(f"the seat's token file {raw_path} holds no <relay_url>|<secret> line")

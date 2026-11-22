@@ -255,6 +255,13 @@ class HeadersTest(unittest.TestCase):
         rc, out, err = _run_main(["descriptor", "--env-file", link], None)
         self.assertEqual((rc, out), (1, ""))
         self.assertNotIn(SECRET, err)
+        real = os.path.join(os.path.dirname(token), "real-token")   # the seat names a link to a private file
+        os.replace(token, real)
+        os.symlink(real, token)
+        rc, out, err = _run_main(["descriptor", "--env-file", seat_env], None)
+        self.assertEqual((rc, out), (1, ""), "a symlinked raw token file is refused, as a symlinked .env is")
+        self.assertRegex(err, r"the seat.s token file \S*/token was refused")
+        self.assertEqual(mcp_auth.seat_token_file(seat_env), real, "the descriptor's own file stays the realpath")
         with mock.patch("ag2_sparrow.bounded_file_read.os.geteuid", return_value=os.geteuid() + 1):
             rc, out, err = _run_main(["descriptor", "--env-file", plain], None)
         self.assertEqual((rc, out), (1, ""))
