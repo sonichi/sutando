@@ -74,10 +74,12 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`core-input-watch.py`** — core-input-watch.py — the core supervisor MONITOR (M1).
 - **`core-supervisor-gate.py`** — core-supervisor-gate.py — the RECOVER decision gate (sonichi#2401 prototype).
 - **`core-supervisor-relay.py`** — core-supervisor-relay.py — the COMMUNICATOR (outbound ESCALATE).
+- **`core_crash_loop.py`** — core_crash_loop.py — a crash loop reaches the owner as one card per incident.
 - **`core_gate_notice.py`** — Tell each task waiting behind a blocked core why it is on hold.
 - **`core_heartbeat.py`** — Per-host heartbeat for sutando-core sessions.
 - **`core_limit_hold.py`** — Hold the core's relaunch while its provider refuses it for a limit.
 - **`core_lineage.py`** — Which conversation this host's core is having, and which it had before.
+- **`core_recovery_state.py`** — The core's recovery record (`core_recovery.v1`): one derivation, one writer.
 - **`core_restart_intent.py`** — core_restart_intent.py — the owner's easy-restart intent file (sonichi#2401).
 - **`core_runtime_record.py`** — Atomic publication of a confirmed core launch observation shared by CLI adapters.
 - **`correlation_log.py`** — One writer for task-correlation records: <workspace>/state/correlation.jsonl.
@@ -95,6 +97,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`dashboard_schedules.py`** — Cron parsing, schedule validation and atomic crons.json persistence.
 - **`dedup_recovery.py`** — Recovery for a `[deduped: <holder>]` result whose holder never answered.
 - **`dedup_soundness.py`** — Is a `[deduped: X]` sound?
+- **`detached_action.py`** — Run an action that can kill its caller (a restart of the session the caller lives in) in its own session, and know its outcome by a deadline.
 - **`discord-bridge.py`** — Discord bridge for Sutando — listens for DMs, writes to tasks/, sends replies from results/.
 - **`discord-read.py`** — Read recent messages from a Discord channel via REST API.
 - **`discord_access.py`** — Shared Discord collaborator policy and verified task admission.
@@ -201,6 +204,8 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`read_discord_channel.py`** — Gated Discord channel reader — compatibility wrapper over the shared reader and the shared contextNotFrom policy.
 - **`recording-state.ts`** — Shared recording state — used by both browser-tools.ts (describeScreenTool) and recording-tools.ts (scrollAndDescribeTool, screenRecordTool, etc.)
 - **`recording-tools.ts`** — Recording, video playback, and scroll-and-describe tools.
+- **`recovery_actions.py`** — recovery_actions.py — the host executor for recovery buttons on blocked cards (C2 -> C3).
+- **`recovery_gate.py`** — The one freshness and single-use gate for every way an owner's recovery command reaches the host.
 - **`recovery_issues.py`** — Durable issue identities for recovery telemetry, independent of retry counts.
 - **`relay-agent.ts`** — Sutando's relay agent: the voice side's task manager between the voice model and the core, run as the bodhi subagent behind the NON_BLOCKING `work` tool: each call stays open until its task's result returns as that call's own response (WHEN_IDLE).
 - **`remote-gateway-bridge.py`** — remote-gateway-bridge.py — sutando loader for the canonical ag2-sparrow client.
@@ -219,6 +224,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`result_router.py`** — Alias of `delivery.router` (phase-1a restructure); one transition window.
 - **`roster_membership.py`** — Which workers a pool roster counts as members: each key of its `workers` mapping whose row is not `state: "retired"` (a row that is not a mapping is a member).
 - **`runtime-health.py`** — runtime-health.py — derive this Sutando core's live health as one JSON object.
+- **`runtime_models.py`** — The models the core's runtime itself offers, read from its own model picker, by exact name.
 - **`runtime_observation.py`** — Runtime observations: one leased record per seat, written by whatever observes that seat's CLI.
 - **`safe_number.py`** — One reader for a number from untrusted JSON (a ledger, a record, a payload).
 - **`scan-call-logs.py`** — Proactive call log scanner — detects issues and classifies by actionability.
@@ -443,6 +449,7 @@ One entry per agent-facing module. 5 without a usable header comment.
 - **`manager.py`** — HumanRequirement Manager: durable requirement store + projection ledger.
 - **`policy.py`** — Manager-level auto-answer policy: the tail of permission requests that never needs a human.
 - **`projector.py`** — Projects HumanRequirement state into Matrix via an injected sender.
+- **`recovery.py`** — Recovery actions on a blocked core's or worker seat's card: the C2 action-id allowlist, the hand-off file and the C3 receipt (contracts/core_recovery.v1/).
 - **`renotify.py`** — Follow-up notices for a blocking requirement the owner has not cleared.
 - **`replies.py`** — Inbound half of the client action wire.
 - **`schema.py`** — HITL v1 domain model + wire contract (space.ag2.hitl).

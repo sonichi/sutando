@@ -4555,10 +4555,53 @@ def _diagnostic_health(health: "dict | None") -> "dict | None":
     return {**row, "condition": "abnormal", "reason": "health-check", "since": ts}
 
 
+# The core's recovery record (core_recovery.v1), read by the adapter's injected reader; a
+# standalone sparrow and a pool worker's lane have none, and their beats carry no such block.
+_CORE_RECOVERY_READER = globals().get("_SUTANDO_CORE_RECOVERY_READER")
+CORE_RECOVERY_CAPABILITY = "core_recovery.v1"
+CORE_RECOVERY_MAX_BYTES = 4096
+# A broker that refuses the beat with the block gets beats without it for this long.
+CORE_RECOVERY_REFUSED_BACKOFF_S = 3600.0
+_core_recovery_refused_until = 0.0
+_core_recovery_logged = None
+
+
+def _log_recovery_sent(payload: dict) -> None:
+    """One log line per change of the record the broker accepted: its state and incident, the
+    proof a live run reads that health.recovery left the Mac. Nothing else of it is logged."""
+    global _core_recovery_logged
+    rec = (payload.get("health") or {}).get("recovery")
+    key = (rec.get("state"), rec.get("incident")) if isinstance(rec, dict) else None
+    if key is not None and key != _core_recovery_logged:
+        _log(f"heartbeat carried {CORE_RECOVERY_CAPABILITY}: state={key[0]} incident={key[1]}")
+    _core_recovery_logged = key
+
+
+def _core_recovery() -> "dict | None":
+    """The adapter's record when it has one and it fits the bound, else None. Never raises."""
+    if not callable(_CORE_RECOVERY_READER) or time.time() < _core_recovery_refused_until:
+        return None
+    try:
+        rec = _CORE_RECOVERY_READER()
+        if isinstance(rec, dict) and len(json.dumps(rec)) <= CORE_RECOVERY_MAX_BYTES:
+            return rec
+    except Exception:  # noqa: BLE001 -- the record is advisory; the beat goes out without it
+        pass
+    return None
+
+
+def _with_recovery(health: "dict | None") -> "dict | None":
+    rec = _core_recovery()
+    if rec is None:
+        return health
+    return {**(health or {"alive": None, "motion": "unknown"}), "recovery": rec}
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
     global _heartbeat_retry_at, _heartbeat_backoff, _last_heartbeat_at, _last_core_health
+    global _core_recovery_refused_until
     now = time.time()
     # Ahead of every early return: a Stop reaches a running task only through these beats.
     _post_task_beats(inflight, force=force)
@@ -4568,7 +4611,8 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     health = (health_command.with_motion(_HEALTH_COMMAND.row(), bool(inflight))
               if _HEALTH_COMMAND else _core_health(_health_snapshot()))
     core_health = health
-    health = _diagnostic_health(health)
+    base = _diagnostic_health(health)
+    health = _with_recovery(base)
     changed = health is not None and health != _last_core_health
     if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
@@ -4596,7 +4640,22 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         if health is not None:
             payload["health"] = health
             payload["capabilities"].append("worker_health.v1")
-        reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
+            if "recovery" in health:
+                payload["capabilities"].append(CORE_RECOVERY_CAPABILITY)
+        try:
+            reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
+        except urllib.error.HTTPError as e:
+            if e.code not in (400, 422) or "recovery" not in (payload.get("health") or {}):
+                raise
+            _core_recovery_refused_until = time.time() + CORE_RECOVERY_REFUSED_BACKOFF_S
+            _log(f"heartbeat refused with the recovery block: HTTP {e.code} — sending without it")
+            drop = {CORE_RECOVERY_CAPABILITY} | (set() if base is not None else {"worker_health.v1"})
+            payload = {k: v for k, v in payload.items() if k != "health"}
+            payload["capabilities"] = [c for c in payload["capabilities"] if c not in drop]
+            if base is not None:
+                payload["health"] = base
+            reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
+        _log_recovery_sent(payload)
         _heartbeat_retry_at, _heartbeat_backoff = 0.0, 0.0
         _record_setup_hint(reply)
         _refresh_served_setup(reply)
