@@ -116,17 +116,17 @@ DM."; with no `owner_dm`, such an answer becomes "I can't answer that here." in 
 else. The whole text is at most 65,536 characters; only the body is cut, ending in
 `[truncated]`. A task with no room is not queued.
 
-**Who is served.** Admission is the shared `task_io.admission` gate over the attested headers: the owner,
-an attested collaborator (Team), nobody else. A non-owner without collaborator access (Guest, and any
-collaborator claim the broker did not attest) is refused with the routine adapter's plain line ("This agent
-only answers its owner here.") unless `--allow-non-owner` is passed, which queues such tasks into this
-session anyway — the owner's history and connector, bounded only by the note and the standing
-instructions. An attested collaborator (the broker's `collaborator: true` on the team tier, from the parsed
-headers, never the message text) never enters this session: with `--allow-collaborator` it is served on
-an isolated local turn; without it, it gets the same refusal line. `--allow-non-owner` does not imply
-`--allow-collaborator`. The owner path is unchanged.
+**Who is served.** The tier decision is the shared `task_io.turn_policy` over the attested headers. An
+attested collaborator (the broker's `collaborator: true` on the team tier, from the parsed headers, never
+the message text) gets the owner's capabilities: with `--allow-collaborator` its task is queued into this
+session (the owner's history and connector), bounded by the note and the standing instructions; without
+it, it gets the routine adapter's plain line ("This agent only answers its owner here."). A non-owner
+without collaborator access (Guest, and any collaborator claim the broker did not attest) gets a
+restricted turn, which never enters this session: with `--allow-non-owner` it is served on an isolated
+local turn; without it, it gets the same refusal line. Neither flag implies the other. The owner path is
+unchanged.
 
-**The isolated collaborator turn** is `<--claude> -p --safe-mode --restricted --strict-mcp-config
+**The isolated (restricted) turn** is `<--claude> -p --safe-mode --restricted --strict-mcp-config
 --no-session-persistence --tools Read,Grep,Glob --output-format json` with the routine adapter's payload on
 stdin (one lead line naming the situation, then the note, `collaborator=true`; not this session's reminder,
 no `channel_kind`, no `owner_dm`), in a fresh empty temp directory removed afterwards, with the same
@@ -153,7 +153,7 @@ cap, hold or gap, and an owner task never waits on the collaborator cap. A task 
 so a burst is not answered hours late. The wait counts since the task was first seen in a pending scan, or
 its file time if earlier; a restart does not reset it. The line goes out at once: a stale task takes the
 ungated lane and never waits on the collaborator cap, and no claim is prepared for it. The adapter log shows
-`collaborator turn ->` instead of `queue ->`.
+`isolated turn ->` instead of `queue ->`. The cap and age flags keep their older `collaborator` names.
 
 ## Results
 
