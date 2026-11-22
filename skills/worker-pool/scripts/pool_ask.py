@@ -74,8 +74,9 @@ def who(workspace, *, runner=None) -> list:
         for t in (target if isinstance(target, list) else [target]):
             rooms.setdefault(t, []).append(room)
     obs = sup.observe(workspace, time.time(), **({"runner": runner} if runner else {}))
+    ids = _agent_ids(workspace)
     out = [{"id": pr.CORE, "label": "core", "display_label": "core",
-            "rooms": rooms.get(pr.CORE, []),
+            "rooms": rooms.get(pr.CORE, []), "agent_mxid": _agent_of(ids, ""),
             "alive": None, "me": whoami() == pr.CORE}]
     for wid, row in sorted(workers.items()):
         o = obs.get(wid)
@@ -83,9 +84,26 @@ def who(workspace, *, runner=None) -> list:
                     "display_label": pr.display_label(row, wid),
                     "state": (row or {}).get("state"),
                     "rooms": sorted(rooms.get(wid, [])),
+                    "agent_mxid": _agent_of(ids, wid),
                     "alive": None if o is None else o.session_alive,
                     "me": whoami() == wid})
     return out
+
+
+# `agent_mxid` in a --who row: the s.space id, None when it has none, this when the record is unreadable.
+IDS_UNAVAILABLE = "unavailable"
+
+
+def _agent_ids(workspace) -> "dict | None":
+    try:
+        import connections
+        return connections.agent_ids(Path(workspace))
+    except Exception:  # noqa: BLE001 - identity is display only; --who still lists everyone
+        return None
+
+
+def _agent_of(ids, key: str):
+    return IDS_UNAVAILABLE if ids is None else ids.get(key)
 
 
 def resolve(workspace, name: str) -> str:
@@ -265,7 +283,8 @@ def main(argv=None) -> int:
                     display = r.get("display_label") or r["label"]
                     alias = f" alias={r['label']}" if r["label"] != display else ""
                     name = "core" if r["id"] == pr.CORE else f"{display} ({r['id']})"
-                    print(f"{name} {alive} rooms={','.join(r['rooms']) or '-'}{alias}{me}")
+                    agent = r.get("agent_mxid") or "(none)"
+                    print(f"{name} {alive} agent={agent} rooms={','.join(r['rooms']) or '-'}{alias}{me}")
             return 0
         if a.tier != "team" and a.relayed_from is None:
             p.error("--tier below team needs --relayed-from: whose content is it?")

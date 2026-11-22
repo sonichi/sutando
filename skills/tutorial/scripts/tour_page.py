@@ -25,6 +25,7 @@ import os
 import re
 import stat
 import string
+import unicodedata
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -165,10 +166,12 @@ HERO = (
 
 
 def clean_name(name: str) -> str:
-    """The agent's display name, single-spaced; refuses an empty or over-long one."""
-    cleaned = " ".join((name or "").split())
+    """The preview display name, single-spaced and stripped of invisible format controls."""
+    visible = "".join(c for c in (name or "") if c.isspace() or (
+        unicodedata.category(c) not in {"Cc", "Cf", "Cs"} and c not in "\u034f\u115f\u1160\u3164\uffa0"))
+    cleaned = " ".join(visible.split())
     if not cleaned or len(cleaned) > NAME_MAX:
-        raise ValueError(f"the agent's name must be 1-{NAME_MAX} characters, got {name!r}")
+        raise ValueError(f"the agent's name must be 1-{NAME_MAX} characters after removing format controls")
     return cleaned
 
 
@@ -867,35 +870,54 @@ def read_marker(text: str) -> Optional[Tuple[str, Optional[str]]]:
 
 def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: Optional[str] = None,
                 prompts: object = None, roles: object = None,
-                features: Optional[FeatureList] = None, media: object = None) -> str:
+                features: Optional[FeatureList] = None, media: object = None,
+                *, private_setup: bool = False, native_dm: bool = False) -> str:
     """The whole page as one HTML string; depends on nothing but its arguments: the agent's name,
     core, audience, mxid (the ownership marker, which also records the list's revision), per-slot
     prompts (`clean_prompts`), the owner's onboarding roles, the feature list (the skill's own by
     default) and the room's media map (`clean_media`; an asset it does not map is inlined). In a
-    room other than the owner's DM the agent is "your agent"."""
+    room other than the owner's DM the agent is "your agent". The overview uses saved setup
+    context only in a local preview; Commons publication uses generic content."""
     features = features or FEATURES
     prompts = clean_prompts(prompts, prompt_slots(features))
     media = clean_media(media, features)
+    if audience != "dm":
+        prompts, roles = {}, None
     labels = role_labels(roles)
     picked = (f'<p class="roles">Picked for: {html.escape(", ".join(labels))}</p>' if labels else "")
     if audience not in AUDIENCES:
         raise ValueError(f"audience must be one of {', '.join(AUDIENCES)}, got {audience!r}")
     who = html.escape(clean_name(name)) if audience == "dm" else "your agent"
+    marker = owner_marker(agent, features.revision, DIGEST_SLOT) if agent else ""
+    if audience == "dm" and (native_dm or private_setup):
+        from personalized_overview import render_guide
+
+        page = render_guide(PAGE_HEAD, marker, who if private_setup else "your agent",
+                            labels if private_setup else (), prompts if private_setup else {})
+        return _finish_page(page, agent)
     lead = ("One room for people and their agents. "
             + (f"A quick tour with your personal native agent, {who}. Try one thing in each part."
                if audience == "dm" else "A quick tour. Try one thing in each part."))
     secs = sections_for(core, features)
     body = "".join(_section(s, i, who, prompts, media) for i, s in enumerate(secs))
     overview_style, overview_body = overview_parts()
+    checklist_header = (f'<header class="hero">{HERO}<div><h1>Getting started with {who}</h1>'
+                        f'<p class="lead">{lead}</p>{picked}</div></header>')
+    if audience == "dm":
+        from personalized_overview import overview
+
+        display = who if private_setup else "your agent"
+        overview_style, overview_body = overview(overview_style, overview_body, display,
+                                                 labels if private_setup else ())
+        checklist_header = picked
     page = (
         f"{PAGE_HEAD}"
-        f"{owner_marker(agent, features.revision, DIGEST_SLOT) if agent else ''}"
+        f"{marker}"
         f"<title>{PAGE_TITLE}</title>{HEAD_SCRIPT}{STYLE % {'darkvars': DARK}}{overview_style}</head><body>"
         "<main id=\"tour\" data-mode=\"step\">"
         f"{overview_body}"
         '<details id="tutorial-checklist"><summary>Try it step by step</summary>'
-        f"<header class=\"hero\">{HERO}<div><h1>Getting started with {who}</h1>"
-        f"<p class=\"lead\">{lead}</p>{picked}</div></header>"
+        f"{checklist_header}"
         "<div class=\"progress\"><div class=\"progress-label\" id=\"progress-label\" aria-hidden=\"true\">"
         f"0 of {len(secs)} done</div>"
         f"<div class=\"bar\" id=\"progress-bar\" role=\"progressbar\" aria-label=\"Tour progress\" "
@@ -910,6 +932,10 @@ def render_page(name: str, core: str = "unknown", audience: str = "dm", agent: O
         f"{_finale(who, prompts)}{body}<div id=\"status\" class=\"sr-only\" role=\"status\" aria-live=\"polite\"></div></details>"
         f"{PAGE_TAIL}"
     )
+    return _finish_page(page, agent)
+
+
+def _finish_page(page: str, agent: Optional[str]) -> str:
     if agent:  # the tag's digest covers the whole page with the digest itself blanked
         page = page.replace(f'data-digest="{DIGEST_SLOT}"',
                             f'data-digest="{hashlib.sha256(page.encode("utf-8")).hexdigest()}"', 1)
