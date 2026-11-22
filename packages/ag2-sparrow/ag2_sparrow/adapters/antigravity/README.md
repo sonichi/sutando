@@ -77,22 +77,28 @@ text: a `collaborator: true` or `access_tier: owner` line in the body changes no
 | --- | --- | --- |
 | owner | always | the owner's turn |
 | Team (an attested collaborator: the team tier with the broker's `collaborator: true`) | always | the owner's turn |
-| guest (any other sender, the team tier without that stamp and an unknown tier included) | only under `--allow-non-owner` | isolated and read-only |
+| guest (any other sender, the team tier without that stamp and an unknown tier included) | always, as Sutando answers them | isolated and read-only |
 
-A sender who is not served gets one line, "This agent only answers its owner here.", and agy is not
-started. `verify` prints `INFO team (attested collaborator): served as the owner is …` and `INFO guest:
-refused` or `served (--allow-non-owner)`.
+`--allow-non-owner` is a no-op kept so existing configs parse. `verify` prints `INFO team (attested
+collaborator): served as the owner is …` and `INFO guest and plain team: always served …`.
 
 Every turn runs on the owner's agy sign-in (the Google account and quota in the Keychain): giving someone
 Collaborator access to this agent lets them spend that quota, and their turns may read and edit the
 working directory as the owner's do. A turn whose tool call is denied can end with no reply.
+
+The gateway writes a Sutando tier block into every non-owner task (`team_guardrail.py`). It tells a core to
+write `results/<task>.txt` and, for a guest, to delegate to `codex exec`; agy can do neither, and its final
+message is what Sparrow posts. So the adapter says those steps as "your final message" and "this turn is
+already the read-only sandbox", and keeps the scope, the DO / DO NOT lists, the trust boundary and the
+hand-off to the owner verbatim (`tier_block_lines`). The final reply is scanned by the shared bridge
+(`_guarded_result_body`) for every tier but the owner, as for any adapter.
 
 **The owner's turn** (the owner and Team, decided by the owner on 2026-11-21) runs in the working
 directory with agy's own home (`~/.gemini`: its settings, rules and context) under the owner's permission
 policy below. The owner resumes the room's Session; each collaborator resumes a Session of their own for
 the room (keyed by their user id), so no one resumes another's conversation.
 
-**A guest's turn** (anyone `--allow-non-owner` admits who is not owner or Team) runs isolated:
+**A guest's turn** (a guest, plain team or an unknown tier) runs isolated:
 
 - a fresh temporary directory per task holds the Session's working directory and a separate agy home,
   passed as `agy acp --gemini-dir <dir>`; that home has only a `settings.json` whose permission rules deny

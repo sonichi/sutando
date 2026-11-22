@@ -302,13 +302,12 @@ def verify(args, factory=gc.AcpClient) -> int:
         cm.check(results, Path(cfg[key]).is_dir(), key.lower().replace("_dir", ""), cfg[key])
     store = cfg.get("SESSION_STORE") or str(Path(cm.work_root(cfg)) / "state" / gc.SESSIONS_NAME)
     print(f"INFO sessions: {store} (the owner's and each collaborator's resumed per room, never retired; a "
-          "guest's turn is a throwaway session)")
+          "non-owner's turn is a throwaway session)")
     print("INFO team (attested collaborator): served as the owner is, on the owner's agy account: the working "
           "directory, agy's own home, the owner's permission policy (read or edit under the working directory, "
           "no command)")
-    print(f"INFO guest: {'served (--allow-non-owner)' if cfg.get('ALLOW_NON_OWNER') == '1' else 'refused'}; "
-          "each turn served on the owner's agy account, in its own temporary directory and agy home, deny-all "
-          "rules, read-only (plan) mode, no file operations")
+    print("INFO guest and plain team: always served, on the owner's agy account, each turn in its own temporary "
+          "directory and agy home, deny-all rules, read-only (plan) mode, no file operations")
     print("INFO owner shell and web: " + ("on (--allow-owner-shell-web): the owner's turns may run commands and "
                                           "fetch or search the web" if cfg.get("ALLOW_OWNER_SHELL_WEB") == "1"
                                           else "off (read and edit under the session cwd only)"))
@@ -346,8 +345,8 @@ def session_options(p) -> None:
     p.add_argument("--session-store", help="the sessions.json to resume from and record to (default: the work "
                    "root's state/sessions.json)")
     p.add_argument("--allow-non-owner", action="store_true",
-                   help="serve senders without collaborator access (guests) too, on the owner's agy sign-in, "
-                   "isolated and read-only (default: refused; an attested collaborator is always served)")
+                   help="a no-op kept so existing configs parse: guests and plain team are always served, "
+                   "isolated and read-only; an attested collaborator gets the owner's turn")
     p.add_argument("--allow-owner-shell-web", action="store_true",
                    help="let the owner's turns run shell commands and fetch or search the web, as a local Claude "
                    "Code agent may (never a collaborator's or a guest's; default: off)")
