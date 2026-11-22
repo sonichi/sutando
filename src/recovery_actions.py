@@ -10,8 +10,9 @@ check every entry path shares), from a fixed allowlist; argv is fixed here and t
 a click supplies is an id the card itself offered:
 
     retry_now           what the owner's bare "retry now" does (core_limit_hold): lift the hold, and
-                        restart a live core (or a seat, by its pool's --retry-cmd) held at its
-                        limit screen; else a refused turn gets `continue` once idle
+                        restart a live core held at its limit screen; a held seat whose session is
+                        alive gets Escape and `continue` once idle, and its pool's --retry-cmd only
+                        if still blocked after VERIFY_S; else a refused turn gets `continue` once idle
     switch_model:<m>    scripts/switch-model.sh <m> --confirm on that session (alias from the list)
     switch_runtime:<r>  core only: src/agent/start-cli.sh --runtime <r> --restart, detached
     restart_core        core only: src/agent/start-cli.sh --restart, detached (detached_action): it
@@ -246,9 +247,7 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
         why = ("This changes billing or the signed-in account, so it needs a confirmed sign-in step "
                "that is not available from here yet; nothing was changed.")
         return "refused", why, why, {}
-    env = dict(os.environ, SUTANDO_TMUX_SOCKET=target.socket, SUTANDO_TMUX_SESSION=target.session)
-    env.pop("SUTANDO_CORE_RUNTIME", None)  # the configured runtime, or --runtime, decides
-    env.pop("SUTANDO_CORE_SESSION", None)  # the monitor runs outside the core session
+    env = _env(target)
     if verb == recovery.RETRY_NOW:
         hold = core_limit_hold.active_hold(ws, now, target.hold_key())
         if hold is not None and target.seat:
@@ -256,17 +255,18 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
                 why = "This worker's restart is not available here; it continues when the limit resets."
                 return "refused", why, why, {}
             core_limit_hold.clear(ws, now, by=RETRY_BY, mirror=False, seat=target.hold_key())
-            # The pool's command hands the restart to its own detached child, which reports by key.
             key = _detached_key(req)
-            detached_action.begin(ws, key, now)
-            child_env = dict(env, **{detached_action.KEY_ENV: key, detached_action.GATE_ENV: gate or ""})
-            if _rc(runner, target.retry_cmd, child_env, RESTART_TIMEOUT_S) != 0:
-                detached_action.report(ws, key, detached_action.FAILED, now=now)
-                core_limit_hold.reinstate(ws, now, by=RETRY_BY, mirror=False, seat=target.hold_key())
+            if target.send_key("Escape"):
+                # A live session keeps its turn and context; verify_step restarts it only if still blocked.
+                follow_ups.append(CONTINUE)
+                return ("done", None, ESC_LINE, {"state": "starting", PATH_FIELD: PATH_ESC,
+                                                 VERIFY_FIELD: {"fallback": key, "gate": gate or ""}})
+            if not _seat_restart(target, runner, env, key, gate, now):
                 why = "The worker did not restart, so it is still paused. " + NEW_CARD
-                return "failed", why, why, {"state": "paused_limit"}
+                return "failed", why, why, {"state": "paused_limit", PATH_FIELD: PATH_RESTART}
             return ("done", None, "Restarting this worker; checking that it is working again.",
-                    {"state": "starting", VERIFY_FIELD: {"detached": key, "reinstate": target.hold_key()}})
+                    {"state": "starting", PATH_FIELD: PATH_RESTART,
+                     VERIFY_FIELD: {"detached": key, "reinstate": target.hold_key()}})
         if hold is not None:
             live = hold.get("source") == core_limit_hold.PANE_SOURCE
             core_limit_hold.clear(ws, now, by=RETRY_BY, mirror=not live)
@@ -352,6 +352,12 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
 
 #: What a card's done action hands to verify_step (not part of the receipt).
 VERIFY_FIELD = "_verify"
+#: Which way a worker's Retry now went, kept on its receipt and audit line.
+PATH_FIELD = "path"
+PATH_ESC, PATH_RESTART, PATH_FALLBACK = "esc", "restart", "restart-fallback"
+ESC_LINE = ("Pressed Escape on this worker and sending continue once it is idle; checking that it is "
+            "working again. If it is still blocked in a minute, it is restarted.")
+FALLBACK_LINE = "Still blocked; restarting this worker. Checking that it is working again."
 NEW_CARD = "If it is still blocked, a new card follows with what you can do now."
 #: How the detached restarts are started: replaced in tests, never run for real there.
 spawn_detached = subprocess.Popen
@@ -359,6 +365,29 @@ spawn_detached = subprocess.Popen
 
 def _detached_key(req) -> str:
     return f"restart:{req.id if req is not None else '-'}:{req.revision if req is not None else 0}"
+
+
+def _env(target: Target) -> Dict:
+    env = dict(os.environ, SUTANDO_TMUX_SOCKET=target.socket, SUTANDO_TMUX_SESSION=target.session)
+    env.pop("SUTANDO_CORE_RUNTIME", None)  # the configured runtime, or --runtime, decides
+    env.pop("SUTANDO_CORE_SESSION", None)  # the monitor runs outside the core session
+    return env
+
+
+def _seat_restart(target: Target, runner: Runner, env: Dict, key: str, gate: Optional[str],
+                  now: float) -> bool:
+    """Restart a seat by its pool's command, its hold lifted; False (hold back) when it did not start."""
+    import core_limit_hold
+    ws = target.workspace
+    core_limit_hold.clear(ws, now, by=RETRY_BY, mirror=False, seat=target.hold_key())
+    # The pool's command hands the restart to its own detached child, which reports by key.
+    detached_action.begin(ws, key, now)
+    child_env = dict(env, **{detached_action.KEY_ENV: key, detached_action.GATE_ENV: gate or ""})
+    if _rc(runner, target.retry_cmd, child_env, RESTART_TIMEOUT_S) != 0:
+        detached_action.report(ws, key, detached_action.FAILED, now=now)
+        core_limit_hold.reinstate(ws, now, by=RETRY_BY, mirror=False, seat=target.hold_key())
+        return False
+    return True
 
 
 def _rc(runner: Runner, argv: List[str], env: Dict, timeout: float) -> Optional[int]:
@@ -492,11 +521,13 @@ def verify_pending(req, now: float) -> bool:
 
 
 def verify_step(manager, workspace: Path, session: str, blocked: bool, now: Optional[float] = None,
-                state: Optional[str] = None) -> List[str]:
+                state: Optional[str] = None, target: Optional[Target] = None,
+                runner: Optional[Runner] = None) -> List[str]:
     """For each of this session's cards an action answered: once the session is seen unblocked,
     the card says so, and for the core whether the work that was waiting resumed (then
     resolve_escalations closes it); still blocked VERIFY_S after a done action, the same card says
-    that, once, and is closed for a fresh one. Never a new card. Returns the edited card ids."""
+    that, once, and is closed for a fresh one, unless a worker's Escape is owed its restart
+    (`target` carries the pool's command). Never a new card. Returns the edited card ids."""
     at = time.time() if now is None else now
     edited = []
     for r in manager.active():
@@ -523,6 +554,11 @@ def verify_step(manager, workspace: Path, session: str, blocked: bool, now: Opti
                         cur.updated_at = time.time()
                         manager.store.save(cur)
         if blocked and not (check.get("outcome") == "done" and at - float(check.get("at") or at) >= VERIFY_S):
+            continue
+        if blocked and check.get("fallback") and target is not None and target.seat \
+                and target.retry_cmd and target.session == session:
+            _fallback_restart(manager, workspace, r, check, target, runner or subprocess.run, at)
+            edited.append(r.id)
             continue
         seen = "blocked" if blocked else "working"
         if blocked:
@@ -552,6 +588,42 @@ def verify_step(manager, workspace: Path, session: str, blocked: bool, now: Opti
             _supersede(manager, r.id)
         edited.append(r.id)
     return edited
+
+
+def _fallback_restart(manager, workspace: Path, req, check: Dict, target: Target, runner: Runner,
+                      now: float) -> None:
+    """A worker still blocked after its Escape: the pool restarts it, and the same card, receipt
+    and audit say the retry fell back to that restart."""
+    key = str(check["fallback"])
+    ok = _seat_restart(target, runner, _env(target), key, check.get("gate") or None, now)
+    line = FALLBACK_LINE if ok else ("Still blocked, and the worker did not restart, so it is still "
+                                     "paused. " + NEW_CARD)
+    prior = recovery.read_receipt(workspace, req.id) or {}
+    aid = str(prior.get("action_id") or req.chosen_action or recovery.RETRY_NOW)
+    outcome = "done" if ok else "failed"
+    fields = {**(prior.get("recovery") or {}), "state": "starting" if ok else "paused_limit",
+              PATH_FIELD: PATH_FALLBACK}
+    recovery.write_receipt(workspace, recovery.receipt(req.id, str(prior.get("incident") or incident_for(req)),
+                                                       aid, outcome, None if ok else line, now, fields))
+    audit(workspace, {"at": int(now), "hitl_id": req.id, "action_id": aid, "outcome": outcome,
+                      "session": target.session, "seat": target.seat or "", PATH_FIELD: PATH_FALLBACK})
+    rest = {k: v for k, v in check.items() if k not in ("fallback", "gate")}
+    with manager.store.locked():
+        cur = manager.get(req.id)
+        if cur is None or cur.terminal:
+            return
+        cur.message = f"{cur.message}\n\n{line}"
+        if ok:
+            cur.subject = {**(cur.subject or {}), "verify": {**rest, "at": now, "detached": key,
+                                                             "reinstate": target.hold_key()}}
+        else:
+            cur.subject = {**(cur.subject or {}), "verify": {**rest, "seen": "failed"},
+                           "receipt": {"outcome": "failed", "at": int(now)}}
+        cur.revision += 1
+        cur.updated_at = time.time()
+        manager.store.save(cur)
+    if not ok:
+        _supersede(manager, req.id)
 
 
 def _restart_failed(manager, workspace: Path, req_id: str, check: Dict, done, now: float) -> None:
@@ -609,9 +681,11 @@ def _settle(manager, target: Target, data: Dict, req, outcome: str, reason, line
     check = fields.pop(VERIFY_FIELD, None)
     body = recovery.receipt(hitl_id, incident, aid, outcome, reason, now, fields)
     recovery.write_receipt(target.workspace, body)
-    audit(target.workspace, {"at": int(now), "hitl_id": hitl_id, "action_id": aid, "outcome": outcome,
-                             "sender": str(data.get("sender") or ""), "session": target.session,
-                             "seat": target.seat or ""})
+    entry = {"at": int(now), "hitl_id": hitl_id, "action_id": aid, "outcome": outcome,
+             "sender": str(data.get("sender") or ""), "session": target.session, "seat": target.seat or ""}
+    if fields.get(PATH_FIELD):
+        entry[PATH_FIELD] = fields[PATH_FIELD]
+    audit(target.workspace, entry)
     if outcome == "done" and req is not None and not target.seat:
         check = dict(check or {}, **_resume_check(target.workspace, req))
     if req is None or not card:

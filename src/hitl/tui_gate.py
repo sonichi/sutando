@@ -86,7 +86,7 @@ def limit_card_holds(req: HumanRequirement, pane: Optional[str], runtime: Option
 
 #: What Retry now does: the core's sends the refused message again; a worker's restarts it.
 RETRY_LINE = "Retry now sends the refused message again."
-RETRY_SEAT_LINE = "Retry now restarts the worker."
+RETRY_SEAT_LINE = "Retry now wakes the worker, and restarts it if it stays blocked."
 
 
 def limit_unblock(session: Optional[str] = None, runtime: Optional[str] = None,

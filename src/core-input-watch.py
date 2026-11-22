@@ -950,14 +950,18 @@ def models_step(manager, workspace, socket, session, runtime, seat, state, kind,
 _BLOCKED_STATES = ("blocked-human", "blocked-known", "logged-out", "hung")
 
 
-def verify_step(manager, workspace, session, blocked, state=None):
+def verify_step(manager, workspace, session, blocked, state=None, socket=None, seat=None, retry_cmd=None):
     """After a recovery action, the same card says whether the session is working again (and the
-    waiting work resumed) or still blocked (recovery_actions.verify_step); never a new card. Never fatal."""
+    waiting work resumed) or still blocked (recovery_actions.verify_step); never a new card. A
+    worker seat passes its pool's `retry_cmd`, the restart an Escape that did not unblock falls back to.
+    Never fatal."""
     if manager is None:
         return []
     try:
         import recovery_actions
-        return recovery_actions.verify_step(manager, workspace, session, blocked, state=state)
+        target = (recovery_actions.Target(workspace, socket, session, seat=seat, retry_cmd=retry_cmd)
+                  if seat and retry_cmd and socket else None)
+        return recovery_actions.verify_step(manager, workspace, session, blocked, state=state, target=target)
     except Exception as exc:  # noqa: BLE001
         print(f"recovery verify failed: {exc}", file=_sys.stderr)
         return []
@@ -1293,7 +1297,9 @@ def main():
             # emptied pane returns, and it must not resolve a card nobody answered.
             if pane and pane.strip():
                 settle_driven(hitl, a.session, seen_prompt, seen_state)
-                verify_step(hitl, workspace, a.session, seen_state in _BLOCKED_STATES, seen_state)
+                verify_step(hitl, workspace, a.session, seen_state in _BLOCKED_STATES, seen_state,
+                            socket=a.socket, seat=a.seat or None,
+                            retry_cmd=shlex.split(a.retry_cmd) if a.retry_cmd else None)
             verdict, idle_ticks = card_step(bool(pane and pane.strip()), state, idle_ticks, a.stable, settling)
             if verdict == "escalate":
                 drive_escalations(hitl, a.session, prompt, state,

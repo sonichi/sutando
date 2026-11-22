@@ -156,8 +156,14 @@ child lifts the hold, runs the restart, records the outcome on the action and pu
 on failure. A dispatch whose child never said it started within 60 seconds is reported once, and
 the hold stays in force.
 
-A worker's Retry now restarts the worker (its pool's `--retry-cmd`, `pool_manage.py retry`): the
-verb hands the restart to a detached child in its own session and returns, since the take-down
+A held worker whose session is still alive is woken in place first: Retry now lifts its hold,
+presses Escape and sends `continue` once the composer is idle, keeping its turn and context. Only
+if the seat is still blocked `VERIFY_S` (60 s) later does the monitor fall back to the restart
+below, and the same card says "Still blocked; restarting this worker." The receipt's `recovery.path`
+and the audit line's `path` record which way it went: `esc`, `restart` (the session did not take
+the key) or `restart-fallback`.
+
+A worker's restart is its pool's `--retry-cmd` (`pool_manage.py retry`): the verb hands the restart to a detached child in its own session and returns, since the take-down
 closes the input watcher's own session; the child never leaves the seat paused and tells the
 owner when the restart did not happen. The card says "checking" until the seat is seen working;
 after an action that did not report done, it says "The block has cleared.", never "It is working

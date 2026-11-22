@@ -936,6 +936,90 @@ class SeatRetryCopy(Base):
         self.assertIn("— Not done.", fallback_body(card))
 
 
+class SeatRetryEscFirst(Base):
+    """A held worker whose session is alive is woken in place (Escape, then `continue` once idle);
+    the pool's restart runs only when it is still blocked after the verify window."""
+
+    RETRY = ["python3", "pool_manage.py", "retry", "w1"]
+
+    def _tap(self):
+        now = time.time()
+        core_limit_hold._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "until": now + 3600,
+                                              "started_at": now - 60, "set_at": now - 60,
+                                              "source": core_limit_hold.PANE_SOURCE}, SEAT_SESSION)
+        req = self.card(kind="turn-rejected", prompt=FABLE_REFUSED, seat=SEAT)
+        self.click(req, "retry_now")
+        target = RA.Target(self.ws, SOCK, SEAT_SESSION, seat=SEAT, retry_cmd=self.RETRY,
+                           send_key=lambda k: self.keys.append(k) or True)
+        return now, req, target
+
+    def test_escape_unblocks_a_live_worker_without_a_restart(self):
+        now, req, target = self._tap()
+        run, owed = Run(), []
+        [receipt] = RA.run_pending(self.mgr, target, runner=run, now=now, follow_ups=owed)
+        self.assertEqual((receipt["outcome"], receipt["recovery"]["path"]), ("done", RA.PATH_ESC))
+        self.assertEqual((self.keys, owed, run.calls), (["Escape"], [RA.CONTINUE], []), "no restart was run")
+        self.assertEqual(core_limit_hold.read_hold(self.ws, SEAT_SESSION)["status"], "cleared")
+        self.assertEqual(self.audit()[-1]["path"], RA.PATH_ESC)
+        self.assertIn(RA.ESC_LINE, self.mgr.get(req.id).message)
+        RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=False, now=now + 5, target=target, runner=run)
+        card = self.mgr.get(req.id)
+        self.assertIn(RA.WORKING_AGAIN, card.message)
+        self.assertNotIn(RA.FALLBACK_LINE, card.message)
+        self.assertEqual(run.calls, [], "an unblocked worker is never restarted")
+
+    def test_a_worker_still_blocked_after_escape_falls_back_to_its_pools_restart(self):
+        now, req, target = self._tap()
+        run = Run()
+        RA.run_pending(self.mgr, target, runner=run, now=now, follow_ups=[])
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=True, now=now + 5,
+                                        target=target, runner=run), [], "still inside the verify window")
+        self.assertEqual(run.calls, [])
+        self.assertEqual(RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=True, now=now + RA.VERIFY_S + 1,
+                                        target=target, runner=run), [req.id])
+        self.assertEqual(run.calls[0][0], self.RETRY, "the pool's restart ran")
+        env = run.calls[0][1]["env"]
+        self.assertTrue(env[detached_action.GATE_ENV].startswith(f"card:{req.id}:retry_now:"))
+        card = self.mgr.get(req.id)
+        self.assertIn(RA.FALLBACK_LINE, card.message)
+        self.assertFalse(card.terminal, "the card stays on checking until the restart answers")
+        receipt = recovery.read_receipt(self.ws, req.id)
+        self.assertEqual((receipt["outcome"], receipt["recovery"]["path"]), ("done", RA.PATH_FALLBACK))
+        self.assertEqual([a.get("path") for a in self.audit()], [RA.PATH_ESC, RA.PATH_FALLBACK])
+        RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=True, now=now + RA.VERIFY_S + 2,
+                       target=target, runner=run)
+        self.assertEqual(len(run.calls), 1, "the fallback restart runs once")
+        detached_action.report(self.ws, env[detached_action.KEY_ENV], detached_action.DONE)
+        RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=False, now=now + RA.VERIFY_S + 3,
+                       target=target, runner=run)
+        self.assertIn(RA.WORKING_AGAIN, self.mgr.get(req.id).message)
+
+    def test_a_failed_fallback_restart_keeps_the_worker_paused(self):
+        now, req, target = self._tap()
+        RA.run_pending(self.mgr, target, runner=Run(), now=now, follow_ups=[])
+        RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=True, now=now + RA.VERIFY_S + 1,
+                       target=target, runner=Run(rc=1))
+        receipt = recovery.read_receipt(self.ws, req.id)
+        self.assertEqual((receipt["outcome"], receipt["recovery"]["path"]), ("failed", RA.PATH_FALLBACK))
+        self.assertIsNotNone(core_limit_hold.active_hold(self.ws, now + RA.VERIFY_S + 2, SEAT_SESSION))
+        self.assertTrue(self.mgr.get(req.id).terminal, "closed for a fresh card")
+
+    def test_a_dead_session_is_restarted_at_once(self):
+        now, req, _ = self._tap()
+        target = RA.Target(self.ws, SOCK, SEAT_SESSION, seat=SEAT, retry_cmd=self.RETRY)  # takes no key
+        run = Run()
+        [receipt] = RA.run_pending(self.mgr, target, runner=run, now=now, follow_ups=[])
+        self.assertEqual((receipt["recovery"]["path"], run.calls[0][0]), (RA.PATH_RESTART, self.RETRY))
+
+    def test_the_monitor_passes_the_seats_restart_to_verify(self):
+        now, req, target = self._tap()
+        RA.run_pending(self.mgr, target, runner=Run(), now=now, follow_ups=[])
+        with mock.patch.object(RA, "verify_step", return_value=[]) as v:
+            M.verify_step(self.mgr, self.ws, SEAT_SESSION, True, "blocked-human", socket=SOCK, seat=SEAT,
+                          retry_cmd=self.RETRY)
+        self.assertEqual(v.call_args.kwargs["target"].retry_cmd, self.RETRY)
+
+
 class MonitorStepsNeverFail(Base):
     """Each recovery step the monitor tick calls fails open: the monitor keeps ticking."""
 
@@ -1075,7 +1159,8 @@ class NothingPrintedLeaks(Base):
                     self.assertNotIn(SECRET, text)
                     self.assertNotIn("/Users/someone", text)
                 [line] = self.audit()
-                self.assertEqual(sorted(line), self.AUDIT_KEYS, "the tap audit holds ids and outcomes only")
+                keys = sorted(self.AUDIT_KEYS + ["path"]) if seat else self.AUDIT_KEYS
+                self.assertEqual(sorted(line), keys, "the tap audit holds ids, outcomes and the retry's path only")
 
 
 class HandOffRechecks(Base):
