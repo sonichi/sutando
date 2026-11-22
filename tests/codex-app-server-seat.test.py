@@ -829,6 +829,21 @@ class Crash(SeatCase):
         self.assertIn("already taken by the bridge", self.out.getvalue())
         self.assertNotIn("the result is kept at", self.out.getvalue())
 
+    def test_a_result_that_cannot_be_set_aside_says_so(self):
+        first = self.task("task-1.txt")
+        s = self.make()
+        s.ensure_server()
+        turn = s.run_turn
+
+        def withdrawn_mid_turn(filename, prompt):
+            out = turn(filename, prompt)
+            first.unlink()
+            return out
+
+        s.run_turn, s.set_result_aside = withdrawn_mid_turn, lambda filename: ""
+        self.assertEqual(s.step(), seat_mod.WITHDRAWN)
+        self.assertIn("the result could not be set aside", self.out.getvalue())
+
     def test_a_file_that_changes_while_it_is_being_copied_is_not_started(self):
         self.task("task-1.txt")
         s = self.make()

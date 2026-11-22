@@ -1349,6 +1349,10 @@ class Hooks(unittest.TestCase):
         self.assertTrue((gw.TASKS_DIR / f"{tid}.txt").exists(), "a file the seat is on stays")
         self.assertEqual(len(self.controls(tid)), 1, "the seat is asked to stop")
 
+    def test_a_seat_folder_that_cannot_be_read_takes_nothing(self):
+        with mock.patch.object(gw.Path, "glob", side_effect=OSError("denied")):
+            self.assertFalse(gw._seat_took("task-unreadable-seat"))
+
     def test_a_closed_task_the_core_claimed_first_is_stopped(self):
         tid = "task-closed-claimed"
         self.assertTrue(gw._take_served_task(_task(tid), set(), []))
