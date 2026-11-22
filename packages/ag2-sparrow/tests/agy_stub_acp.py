@@ -34,6 +34,13 @@ LOG = os.path.join(HOME, "stub.log")
 _next = [1000]
 
 
+# ACP's `models` on session/new, with ids as `agy models` prints them (assumed shape: the ACP schema's
+# SessionModelState; no signed-in agy has been asked yet).
+MODELS = {"currentModelId": "gemini-3.8-flash-medium",
+          "availableModels": [{"modelId": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash"},
+                              {"modelId": "claude-opus-4-6-thinking", "name": "Claude Opus 4.6"}]}
+
+
 def log(rec):
     with open(LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
@@ -186,7 +193,14 @@ def main():
             result = {"sessionId": sid}
             if not os.path.exists(os.path.join(HOME, "no-modes")):
                 result["modes"] = MODES
+            if os.path.exists(os.path.join(HOME, "models")):
+                result["models"] = MODELS
             send({"jsonrpc": "2.0", "id": rid, "result": result})
+        elif method == "session/set_model":
+            if os.path.exists(os.path.join(HOME, "set-model-fails")):
+                send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "unknown model"}})
+            else:
+                send({"jsonrpc": "2.0", "id": rid, "result": {}})
         elif method == "session/set_mode":
             if os.path.exists(os.path.join(HOME, "set-mode-fails")):
                 send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "mode not allowed"}})

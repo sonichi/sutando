@@ -36,6 +36,7 @@ LOCK_HOME = tempfile.mkdtemp(prefix="agy-lock-home-")
 holder_lock._home = lambda: LOCK_HOME
 atexit.register(shutil.rmtree, LOCK_HOME, True)
 from ag2_sparrow.adapters.antigravity import cli, antigravity_connector as gc  # noqa: E402
+from ag2_sparrow import connector_cards  # noqa: E402
 from ag2_sparrow.result_markers import parse_markers, render_skill_prelude  # noqa: E402
 
 STUB = str(Path(__file__).resolve().parent / "agy_stub_acp.py")
@@ -125,6 +126,119 @@ class ConnectorTest(unittest.TestCase):
                          ["initialize", "session/new", "session/prompt"])
         init = next(r for r in self.w.records() if r.get("method") == "initialize")
         self.assertEqual(init["params"]["clientInfo"]["name"], "ag2-sparrow-antigravity")
+
+    # ── the model card ───────────────────────────────────────────────────────
+
+    DM = "!dm:s.space"
+
+    def dm_task(self, tid, body, reply_to="", click="", tier="owner", kind="dm", channel=None, collaborator=False):
+        lines = ["id: " + tid, "timestamp: 2026-11-14T00:00:00Z", "source: ag2space",
+                 "channel_id: " + (channel or self.DM), "channel_kind: " + kind, "source_message_id: $m-" + tid,
+                 "user_id: @alice:s.space", "access_tier: " + tier] + (["collaborator: true"] if collaborator else [])
+        if reply_to:
+            lines.append("reply_to_event: " + reply_to)
+        if click:
+            lines.append("card_click: " + json.dumps({"card_id": "model-switch", "action": click}))
+        (self.w.root / "tasks" / (tid + ".txt")).write_text("\n".join(lines + ["task: " + body]) + "\n", encoding="utf-8")
+
+    def bridge_state(self):
+        return Path(str(self.w.root) + ".bridge") / "state"
+
+    def post_queued(self, event="$card1"):
+        """What the bridge does: post each queued card, and say which event it became."""
+        sent = []
+        connector_cards.Poster(self.bridge_state(), lambda p: sent.append(p) or {"ok": True, "event_id": event},
+                               log=lambda line: None).sweep()
+        return sent
+
+    def set_model_calls(self):
+        return [r["params"] for r in self.w.records() if r.get("method") == "session/set_model"]
+
+    def test_a_turn_remembers_the_models_agy_offers_and_changes_nothing_until_one_is_picked(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        state = json.loads((self.w.root / "state" / "model.json").read_text())
+        self.assertEqual((state["current"], [m["id"] for m in state["available"]]),
+                         ("gemini-3.8-flash-medium", ["gemini-3.8-flash-medium", "claude-opus-4-6-thinking"]))
+        self.assertEqual((self.set_model_calls(), self.w.metrics()[0]["model"]), ([], "gemini-3.8-flash-medium"))
+
+    def test_the_owners_tap_on_the_model_card_switches_the_next_turn_and_a_new_card_says_so(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        self.dm_task("task-2", "/model")
+        self.w.serve()
+        self.assertEqual(self.w.result("task-2"), "[no-send] the model card answers\n")
+        self.assertEqual(self.w.methods().count("session/prompt"), 1, "/model never reaches agy")
+        (sent,) = self.post_queued()
+        card = sent["extra_content"]["space.ag2.card"]
+        self.assertEqual((sent["room_id"], card["text"], [b["label"] for b in card["buttons"]]),
+                         (self.DM, "Now using Gemini 3.8 Flash.", ["Gemini 3.8 Flash", "Claude Opus 4.6"]))
+        said = card["buttons"][1]["reply"]
+        self.dm_task("task-3", said, reply_to="$card1", click=said)
+        self.w.serve()
+        self.assertEqual(self.w.result("task-3"), "[no-send] the model card answers\n")
+        self.assertEqual(json.loads((self.w.root / "state" / "model.json").read_text())["wanted"],
+                         "claude-opus-4-6-thinking")
+        (done,) = self.post_queued("$card2")
+        settled = done["extra_content"]["space.ag2.card"]
+        self.assertEqual((settled["state"], settled["text"], "buttons" in settled),
+                         ("done", "Now using Claude Opus 4.6. It applies from your next message.", False))
+        self.assertEqual(self.w.methods().count("session/prompt"), 1, "the tap never reaches agy either")
+        self.dm_task("task-4", "STUB:TEXT again")
+        self.w.serve()
+        (call,) = self.set_model_calls()
+        self.assertEqual(call["modelId"], "claude-opus-4-6-thinking")
+        self.assertEqual(self.w.metrics()[-1]["model"], "claude-opus-4-6-thinking")
+        # The settled card replaced the first one: its buttons no longer act.
+        self.dm_task("task-5", said, reply_to="$card1", click=said)
+        self.w.serve()
+        self.assertIn("couldn't match that button", self.w.result("task-5"))
+
+    def test_a_tap_that_is_not_the_owners_on_a_card_this_agent_posted_in_its_dm_changes_nothing(self):
+        (self.w.home / "models").write_text("")
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        said = "Use Claude Opus 4.6"
+        self.dm_task("task-2", said, reply_to="$never-posted", click=said)
+        self.w.serve()
+        self.assertIn("couldn't match that button", self.w.result("task-2"))
+        self.dm_task("task-3", "/model")
+        self.w.serve()
+        self.post_queued()
+        cases = {"task-4": dict(kind="room"), "task-5": dict(channel="!other:s.space"),
+                 "task-6": dict(reply_to="$other"), "task-8": dict(tier="team", collaborator=True)}
+        for tid, over in cases.items():
+            self.dm_task(tid, said, **dict(dict(reply_to="$card1", click=said), **over))
+            self.w.serve()
+            self.assertIn("couldn't match that button", self.w.result(tid), tid)
+        self.dm_task("task-7", said, reply_to="$card1")
+        self.w.serve()
+        self.assertIn("didn't arrive as a tap", self.w.result("task-7"))
+        self.assertNotIn("wanted", json.loads((self.w.root / "state" / "model.json").read_text()))
+        self.assertEqual(self.w.methods().count("session/prompt"), 1, "no refused tap reached agy")
+
+    def test_model_is_a_card_only_for_the_owner_in_their_dm_and_only_once_models_are_known(self):
+        self.dm_task("task-1", "/model")
+        self.w.serve()
+        self.assertIn("don't know my models yet", self.w.result("task-1"))
+        (self.w.home / "models").write_text("")
+        self.dm_task("task-2", "STUB:TEXT hi")
+        self.w.serve()
+        self.dm_task("task-3", "/model", kind="room")
+        self.w.serve()
+        self.assertEqual(self.post_queued(), [], "in a shared room /model is ordinary words for agy")
+        self.assertEqual(self.w.methods().count("session/prompt"), 2)
+
+    def test_a_refused_switch_leaves_the_turn_on_agys_own_model(self):
+        (self.w.home / "models").write_text("")
+        (self.w.home / "set-model-fails").write_text("")
+        (self.w.root / "state" / "model.json").write_text(json.dumps({"wanted": "claude-opus-4-6-thinking"}))
+        self.w.task("task-1", "STUB:TEXT hi")
+        self.w.serve()
+        self.assertEqual(self.w.result("task-1"), "hello from agy-stub\n")
+        self.assertEqual((len(self.set_model_calls()), self.w.metrics()[0]["model"]), (1, "gemini-3.8-flash-medium"))
 
     def test_signed_in_while_sign_in_methods_are_listed_needs_no_authenticate(self):
         self.w.task("task-1", "STUB:TEXT hi")
