@@ -2,8 +2,10 @@
 # The test gate a release must pass: every package suite plus the src-drift guard.
 # The tag publish and the PR job both run this file, on the same interpreter.
 # usage: publish_gate.sh [<shards> <shard>] — no arguments runs it whole; leg 1 also runs the guard.
+#        publish_gate.sh --list — prints every suite the gate runs, and runs nothing.
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
+if [ "${1:-}" = --list ]; then ls packages/ag2-sparrow/tests/test_*.py; exit 0; fi
 SHARDS="${1:-1}"; SHARD="${2:-1}"
 LEG="$(mktemp)"; trap 'rm -f "$LEG"' EXIT
 ls packages/ag2-sparrow/tests/test_*.py \
