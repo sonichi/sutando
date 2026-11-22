@@ -6034,18 +6034,48 @@ def _same_origin(url: str, base: str) -> bool:
         return False
 
 
-def _under_gateway(url: str) -> bool:
-    """True iff `url` is genuinely gateway-hosted: exact gateway origin AND the
-    path sits at/under the gateway base path with a real `/` boundary (so a
-    base path of `/relay` doesn't match `/relay-evil/...`). Malformed ⇒ False."""
-    if not URL or not _same_origin(url, URL):
-        return False
+# One Matrix server name and one media id, raw: no `%`, so no encoded dot or slash can pass.
+_MEDIA_SERVER = r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,253}[A-Za-z0-9])?(?::[0-9]{1,5})?"
+_MEDIA_ID = r"[A-Za-z0-9_=-]{1,255}"
+_HS_MEDIA_PATH = re.compile(r"/_matrix/(?:client/v1/media/(download|thumbnail)|media/(?:r0|v3)/(download))/"
+                            + _MEDIA_SERVER + "/" + _MEDIA_ID)
+_THUMBNAIL_KEYS = frozenset({"width", "height", "method", "animated"})
+
+
+def _query_only(query: str, allowed: "frozenset[str]") -> bool:
+    """True iff every key of `query` is in `allowed`, each at most once, with plain values."""
     try:
-        base_path = urllib.parse.urlsplit(URL).path.rstrip("/")
-        path = urllib.parse.urlsplit(url).path
+        pairs = urllib.parse.parse_qsl(query, keep_blank_values=True, strict_parsing=bool(query))
     except ValueError:
         return False
-    return path == base_path or path.startswith(base_path + "/")
+    keys = [k for k, _ in pairs]
+    return (all(k in allowed for k in keys) and len(set(keys)) == len(keys)
+            and all(v and v.isprintable() and not any(c.isspace() for c in v) for _, v in pairs))
+
+
+def _media_route(url: str) -> "str | None":
+    """The route: "gateway" for `<gateway base>/v1/media/<server>/<id>` (only `room_id` in the query) on the exact
+    gateway origin, "homeserver" for a Matrix media download/thumbnail on the exact homeserver origin, else None.
+    Matched on the raw URL, so `.`/`..` segments and percent-encoded dots or slashes never match."""
+    if not re.fullmatch(r"[\x21-\x7e]+", url or ""):
+        return None
+    try:
+        u = urllib.parse.urlsplit(url)
+        _ = u.port                         # raises ValueError on a malformed port
+    except ValueError:
+        return None
+    if u.username is not None or u.password is not None or "#" in url or "\\" in url:
+        return None
+    if URL and _same_origin(url, URL):
+        base = urllib.parse.urlsplit(URL).path.rstrip("/")
+        if (re.fullmatch(re.escape(base) + "/v1/media/" + _MEDIA_SERVER + "/" + _MEDIA_ID, u.path)
+                and _query_only(u.query, frozenset({"room_id"}))):
+            return "gateway"
+    if HS_MEDIA_TOKEN and HS_MEDIA_ORIGIN and _same_origin(url, HS_MEDIA_ORIGIN):
+        m = _HS_MEDIA_PATH.fullmatch(u.path)
+        if m and _query_only(u.query, _THUMBNAIL_KEYS if m.group(1) == "thumbnail" else frozenset()):
+            return "homeserver"
+    return None
 
 
 def _download_bytes(url: str, headers: dict, cap: int) -> bytes:
@@ -6089,24 +6119,16 @@ def _fetch_media_marker(inner: str) -> "tuple[str, Path, object] | None":
     if not url.startswith(("https://", "http://")):
         return None
     headers = {"User-Agent": "sutando-gateway-client/1.0"}
-    # Credential routing is by PARSED exact origin, never string prefix or
-    # substring — `https://relay.example.evil/...` must not receive the
-    try:
-        _split = urllib.parse.urlsplit(url)
-        _ = _split.port                    # raises ValueError on a malformed port
-        url_path = _split.path
-    except ValueError:
-        return None                        # unparseable URL — leave marker untouched
-    if _under_gateway(url):
+    # Credential routing is by PARSED exact origin and exact media path, never string prefix or substring.
+    route = _media_route(url)
+    if route == "gateway":
         headers["Authorization"] = f"Bearer {TOKEN}"            # gateway media-proxy
-    elif url_path.startswith("/_matrix/"):
-        if not HS_MEDIA_TOKEN or not HS_MEDIA_ORIGIN or not _same_origin(url, HS_MEDIA_ORIGIN):
-            return None                    # can't auth safely — leave marker
+    elif route == "homeserver":
         url = _to_authed_media_url(url)
         headers["Authorization"] = f"Bearer {HS_MEDIA_TOKEN}"
     else:
-        # Only the configured gateway or homeserver origin is fetched (a sender's marker must not reach loopback or LAN).
-        _log("media URL is not on the gateway or homeserver origin — leaving marker as-is")
+        # Only a media path on the configured gateway or homeserver origin is fetched.
+        _log("media URL is not a gateway or homeserver media path — leaving marker as-is")
         return None
 
     try:
