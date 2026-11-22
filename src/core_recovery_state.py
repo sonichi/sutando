@@ -58,7 +58,11 @@ ACTIONS = ("retry_now", "switch_model", "switch_runtime", "restart_core", "escap
 #: Per runtime, the aliases a switch may offer (switch-model.sh's, Fable being a spend decision)
 #: and the actions its host side carries out; Codex has no model switch or relaunch hold yet.
 MODEL_ALIASES = {"claude": ("opus", "sonnet", "haiku"), "codex": ()}
-RUNTIME_ACTIONS = {"claude": frozenset(ACTIONS),
+#: A click may also name a stored account; it is never offered in the record before such a store
+#: exists, and it is high impact: the executor asks for the owner's confirmation first.
+STEP_UP_ACTIONS = frozenset({"switch_account"})
+CLICK_VERBS = ACTIONS + tuple(sorted(STEP_UP_ACTIONS))
+RUNTIME_ACTIONS = {"claude": frozenset(CLICK_VERBS),
                    "codex": frozenset({"switch_runtime", "restart_core", "escape_prompt"})}
 #: An unknown runtime gets only what works on any pane.
 NEUTRAL_ACTIONS = frozenset({"restart_core", "escape_prompt"})
@@ -93,23 +97,32 @@ _LOGIN_KINDS = frozenset({"login"})
 # The provider's own words for an exhausted prepaid balance, as opposed to a plan's usage window.
 _CREDIT_TEXT = re.compile(r"\bout of (?:usage )?credits?\b|\bcredit balance\b|\binsufficient[_ ](?:credits?|quota)\b"
                           r"|\bbilling\b", re.I)
-_ACTION_ID = re.compile(r"^(retry_now|restart_core|escape_prompt|(switch_model|switch_runtime):([a-z]+))$")
+_ACTION_ID = re.compile(r"^(?:(retry_now|restart_core|escape_prompt)|(switch_model|switch_runtime):([a-z]{1,16})"
+                        r"|(switch_account):(acct_[0-9a-f]{6}))$")
 _HEX = re.compile(r"^[0-9a-f]{6,64}$")
 _ALL_ALIASES = tuple(a for r in RUNTIMES for a in MODEL_ALIASES[r])
 
 
 # ---- the vocabulary other modules share -------------------------------------------------
 
-def parse_action_id(action_id: Any, runtime: Optional[str] = None) -> Optional[tuple]:
+def parse_action_id(action_id: Any, runtime: Optional[str] = None, accounts: tuple = ()) -> Optional[tuple]:
     """(verb, arg) for an allowlisted click id (`contracts/core_recovery.v1/action.json`), else
     None. With `runtime`, the id must be one that runtime carries out: `switch_model:<alias>` an
-    alias of its own, `switch_runtime:<runtime>` another runtime. Anything else is refused."""
+    alias of its own, `switch_runtime:<runtime>` another runtime. `switch_account:<id>` takes only
+    an id in `accounts`, the host's own stored list. Anything else is refused; no part of the id is
+    ever passed on but a value from one of those lists."""
     if not isinstance(action_id, str):
         return None
-    m = _ACTION_ID.match(action_id)
+    m = _ACTION_ID.fullmatch(action_id)
     if not m:
         return None
-    verb, arg = (m.group(2), m.group(3)) if m.group(2) else (m.group(1), None)
+    simple, verb, arg, acct_verb, acct = m.groups()
+    if simple:
+        verb, arg = simple, None
+    elif acct_verb:
+        verb, arg = acct_verb, acct
+    if verb == "switch_account" and arg not in accounts:
+        return None
     if runtime is not None and verb not in RUNTIME_ACTIONS.get(runtime, NEUTRAL_ACTIONS):
         return None
     if verb == "switch_model" and arg not in (MODEL_ALIASES.get(runtime, ()) if runtime else _ALL_ALIASES):

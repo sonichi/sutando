@@ -417,6 +417,46 @@ class Contract(unittest.TestCase):
         self.assertIsNone(crs.parse_action_id("retry_now", "agy"), "an unknown runtime gets the neutral set")
         self.assertEqual(crs.parse_action_id("restart_core", "agy"), ("restart_core", None))
 
+    def test_no_fixture_carries_a_secret_or_an_account_identity(self):
+        """Security (5): the wire carries an opaque account id at most; no token, path or address."""
+        import re
+        for path in sorted(FIXTURES.glob("*.json")):
+            strings = []
+
+            def walk(node):
+                if isinstance(node, dict):
+                    for k, v in node.items():
+                        strings.append(k)
+                        walk(v)
+                elif isinstance(node, list):
+                    for v in node:
+                        walk(v)
+                elif isinstance(node, str):
+                    strings.append(node)
+            walk(json.loads(path.read_text()))
+            for text in strings:
+                self.assertIsNone(re.search(r"@|\bsk-|token|secret|password|/Users/|/home/|https?://", text, re.I),
+                                  f"{path.name}: {text!r}")
+            rec = json.loads(path.read_text()).get("health", {}).get("recovery")
+            if rec and "account" in rec:
+                self.assertRegex(rec["account"], r"^acct_[0-9a-f]{6}$")
+
+    def test_a_click_id_is_matched_whole_and_its_argument_comes_from_a_host_list(self):
+        """Security (2): no free text survives the allowlist; every argument is one of the host's own."""
+        for bad in ("retry_now\n", "retry_now ", " retry_now", "retry_now;id", "switch_model:sonnet\nrm",
+                    "switch_model:SONNET", "switch_runtime:codex/../x", "switch_account:me@example.com",
+                    "switch_account:acct_3f9a2b; rm -rf ~"):
+            self.assertIsNone(crs.parse_action_id(bad, "claude", ("acct_3f9a2b",)), repr(bad))
+        self.assertIsNone(crs.parse_action_id("switch_account:acct_3f9a2b"), "no stored list, no account switch")
+        self.assertEqual(crs.parse_action_id("switch_account:acct_3f9a2b", "claude", ("acct_3f9a2b",)),
+                         ("switch_account", "acct_3f9a2b"))
+        self.assertIsNone(crs.parse_action_id("switch_account:acct_3f9a2b", "codex", ("acct_3f9a2b",)))
+        self.assertEqual(crs.STEP_UP_ACTIONS, frozenset({"switch_account"}))
+
+    def test_a_step_up_action_is_never_offered_in_the_record(self):
+        rec = crs.coerce({"v": 1, "state": "paused_limit", "actions": ["switch_account", "retry_now"]})
+        self.assertEqual(rec["actions"], ["retry_now"])
+
     def test_the_receipt_fixture_uses_the_shared_vocabulary(self):
         body = fixture("receipt.json")
         self.assertIn(body["outcome"], crs.RECEIPT_OUTCOMES)
