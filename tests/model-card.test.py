@@ -323,6 +323,96 @@ class Settle(Base):
         self.assertEqual(len(self.fake.calls), 2)
 
 
+class Edges(Base):
+    """What a card says when the ledger, the card itself or the core's own row cannot be had."""
+
+    def test_a_card_whose_record_cannot_be_written_is_posted_and_says_its_buttons_will_not_act(self):
+        with mock.patch.object(mc.issued_cards, "record", side_effect=PermissionError("read-only")) as record:
+            rc, out = self.run_(["post", "--room", DM])
+        self.assertEqual((rc, out), (0, {"status": "posted", "event_id": "$card1",
+                                         "why": "its buttons will not act (PermissionError)"}))
+        self.assertEqual((len(self.fake.calls), record.call_count), (1, 1))
+        self.assertIsNone(mc.issued_cards.live(self.ws, "$card1"))
+
+    def test_a_menu_the_client_would_not_draw_is_failed_and_nothing_is_sent(self):
+        self.using("m" * 5000)
+        for argv in (["post", "--room", DM], ["post", "--room", DM, "--print"]):
+            rc, out = self.run_(argv)
+            self.assertEqual((rc, out["status"]), (1, "failed"), argv)
+            self.assertIn("the card would not render", out["why"])
+        self.assertEqual(self.fake.calls, [])
+
+    def test_a_tap_is_judged_by_the_cards_own_lane_when_the_core_row_cannot_be_read(self):
+        self.using("opus")
+        self.assertEqual(self.run_(["post", "--room", DM])[0], 0)
+        self.assertEqual(mc.issued_cards.live(self.ws, "$card1")["lane"], "s_dspace")
+        path = self.ws / "task.txt"
+
+        def reply(**kw):
+            path.write_text(task(SAID["fable"], reply_to_event="$card1", **kw,
+                                 card_click=json.dumps({"card_id": mc.CARD_ID, "action": SAID["fable"]})))
+            out = io.StringIO()
+            with mock.patch.object(mc, "_core", side_effect=RuntimeError("no core lane")) as core, \
+                    contextlib.redirect_stdout(out):
+                rc = mc.main(["--workspace", str(self.ws), "reply", "--task-file", str(path)],
+                             execute=self.fake.execute, popen=self.launch)
+            return rc, json.loads(out.getvalue()), core.call_count
+
+        rc, out, _ = reply(user="@x:s.space")
+        self.assertEqual((rc, out["status"], out["why"]), (1, "forged_or_stale_click", "only the owner can use this card"))
+        self.assertEqual(self.launch.calls, [])
+        rc, out, looked = reply()
+        self.assertEqual((rc, out["status"], out["model"]), (0, "started", "fable"))
+        self.assertEqual(len(self.launch.calls), 1)
+        self.assertEqual((looked, out["card_why"]), (2, "RuntimeError: no core lane"))
+        self.assertNotIn("event_id", out)
+        self.assertEqual(len(self.fake.calls), 1, "no card is posted as a core that cannot be found")
+
+    def test_without_a_workspace_flag_the_resolved_workspace_is_read(self):
+        import workspace_default
+        self.using("sonnet")
+        out = io.StringIO()
+        with mock.patch.object(workspace_default, "resolve_workspace", return_value=str(self.ws)) as resolve, \
+                contextlib.redirect_stdout(out):
+            rc = mc.main(["status"])
+        self.assertEqual((rc, json.loads(out.getvalue())["name"], resolve.call_count), (0, "Sonnet", 1))
+
+
+class Resolvers(unittest.TestCase):
+    """The core's row, its Action call and the owner's DM come from pool_provision and connections."""
+
+    def test_each_default_asks_its_module_with_the_workspace_and_lane(self):
+        ws = Path("/nowhere")
+        pool = mock.Mock()
+        pool.core_lane.return_value = CORE
+        pool.core_actions.return_value = (mock.Mock(execute="the action call"), CORE)
+        conn = mock.Mock()
+        conn.owner_dm.return_value = DM
+        with mock.patch.dict(sys.modules, {"pool_provision": pool, "connections": conn}):
+            self.assertIs(mc._core(ws), CORE)
+            self.assertEqual(mc._execute(ws, "s_dspace"), "the action call")
+            self.assertEqual(mc._owner_dm(ws, CORE), DM)
+        pool.core_lane.assert_called_once_with(ws, None)
+        pool.core_actions.assert_called_once_with(ws, "s_dspace")
+        conn.owner_dm.assert_called_once_with(CORE, ws)
+
+    def test_post_uses_them_when_nothing_is_injected(self):
+        fake = Fake()
+        pool = mock.Mock()
+        pool.core_lane.return_value = CORE
+        pool.core_actions.return_value = (mock.Mock(execute=fake.execute), CORE)
+        conn = mock.Mock()
+        conn.owner_dm.return_value = DM
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(sys.modules, {"pool_provision": pool, "connections": conn}), \
+                contextlib.redirect_stdout(out):
+            rc = mc.main(["--workspace", tmp, "post", "--room", DM])
+            entry = mc.issued_cards.live(Path(tmp), "$card1")
+        self.assertEqual((rc, json.loads(out.getvalue())), (0, {"status": "posted", "event_id": "$card1"}))
+        self.assertEqual((fake.calls[0][3], entry["lane"], entry["room"]), (DM, "s_dspace", DM))
+        pool.core_actions.assert_called_once_with(Path(tmp), "s_dspace")
+
+
 class Source(unittest.TestCase):
     def test_the_model_in_use_never_comes_from_a_settings_file_and_no_path_is_hardcoded(self):
         text = SCRIPT.read_text()
@@ -330,6 +420,12 @@ class Source(unittest.TestCase):
             self.assertNotIn(banned, text)
         self.assertEqual(mc.SWITCH, SCRIPT.parent / "switch-model.sh")
         self.assertEqual(mc._REPO, ROOT)
+
+    def test_the_script_runs_on_its_own_from_any_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            got = subprocess.run([sys.executable, str(SCRIPT), "--workspace", tmp, "status"], cwd=tmp,
+                                 capture_output=True, text=True, timeout=60)
+        self.assertEqual((got.returncode, json.loads(got.stdout)["name"]), (0, "the default model"), got.stderr)
 
     def test_a_brain_settings_file_in_the_workspace_is_ignored(self):
         with tempfile.TemporaryDirectory() as tmp:
