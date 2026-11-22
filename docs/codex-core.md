@@ -377,6 +377,34 @@ and is not persisted: pass it again on each invocation, including `--restart`.
 Authentication, helper checks, the notifier and core startup remain active.
 The flag does not isolate the Codex home or change helper ownership by itself.
 
+## Blocked-dialog hooks (on by default)
+
+The core supervisor (`src/core-input-watch.py`) decides whether the core is blocked on its
+owner. On Claude it reads the CLI's own hook events (`src/core_block_signal.py`) and uses the
+screen only for screens no hook reports (sign-in, usage limits, startup trust). Codex can
+send the same events, but Codex runs a session's hooks only once they are trusted in `/hooks`,
+and an untrusted hook is skipped or asks for review at startup, which a headless core never
+answers.
+
+The launcher registers them on every Codex CLI core launch (not on an app-server seat, below,
+which draws no TUI dialog for the supervisor to read): it passes `PermissionRequest`,
+`PreToolUse`, `PostToolUse`, `UserPromptSubmit` and `Stop` hooks as `-c hooks.<Event>=…`
+overrides for that run only.
+
+Before that it records trust for exactly those five hooks, the way an approval in `/hooks`
+does: it starts `codex app-server` against the core's Codex home, asks Codex for each hook's
+key and hash (`hooks/list`), and has Codex write the record itself (`config/value/write`,
+upserting `hooks.state."/<session-flags>/config.toml:<event>:0:0".trusted_hash` in that home's
+`config.toml`). A record holds one hash, so it trusts only a hook with exactly that command;
+every other hook, the user's own included, keeps its own trust state, and no trust check is
+bypassed. A later launch finds them trusted and writes nothing; a changed command (a moved
+checkout) is trusted again. If Codex cannot list or trust all five, the launch passes none of
+them and says so, and the supervisor reads the Codex screen as before. The launch output says
+which happened in one line.
+
+Set `SUTANDO_CODEX_BLOCK_HOOKS=0` in the launcher's environment to turn them off: the launch
+then passes no hooks and records no trust.
+
 ## Automatic earned resets
 
 On macOS, launching a Codex core or Codex worker installs a five-minute
@@ -548,8 +576,12 @@ Not supported under the flag yet:
 - Typing into the panel, and Codex slash commands. The panel is read-only.
 - Status and cards read from the pane: the runtime observation record, the core monitor's
   prompt classification, limit and sign-in cards, pool wedge detection.
-- Switching the model without a restart.
 - Delivering a task into a running turn (`turn/steer`). Tasks wait for the turn to end.
+
+Switching the core's model from the conversation (`skills/model-switch`) reaches the core seat
+without a restart: the seat passes the recorded model on its next `turn/start`. The pick is core-only
+(`<workspace>/state/model-switch.json`, `runtime: codex`), so pool workers keep their own model; a
+Codex TUI core takes it at its next start, when the launcher passes it as `-m`.
 
 The launch settings are carried over: `danger-full-access`, approvals `never`, the model, the
 working directory, and every `-c` override of the TUI launch, the worker's s-space MCP entry

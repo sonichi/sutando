@@ -157,6 +157,36 @@ class FlagOff(unittest.TestCase):
 class FlagOn(unittest.TestCase):
     ON = {"SUTANDO_CODEX_APP_SERVER": "1"}
 
+    def _switched(self, f, model):
+        state = f.workspace / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "model-switch.json").write_text(json.dumps({"model": model, "runtime": "codex", "accepted": True}))
+
+    def test_the_cores_own_switch_is_its_launch_model_when_none_is_set(self):
+        f = Fixture(self, seat_tmux=True)
+        self._switched(f, "gpt-switched")
+        result = f.run(**self.ON)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line, = [ln for ln in f.calls().splitlines() if ln.startswith("-S <TMP>/tmux.sock new-session")]
+        self.assertIn("--model gpt-switched", line)
+
+    def test_a_launch_model_set_for_this_launch_wins_over_the_switch_record(self):
+        f = Fixture(self, seat_tmux=True)
+        self._switched(f, "gpt-switched")
+        result = f.run(SUTANDO_CORE_MODEL="gpt-explicit", **self.ON)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        line, = [ln for ln in f.calls().splitlines() if ln.startswith("-S <TMP>/tmux.sock new-session")]
+        self.assertIn("--model gpt-explicit", line)
+        self.assertNotIn("gpt-switched", line)
+
+    def test_a_claude_cores_record_is_not_a_codex_launch_model(self):
+        f = Fixture(self, seat_tmux=True)
+        (f.workspace / "state").mkdir(parents=True, exist_ok=True)
+        (f.workspace / "state" / "model-switch.json").write_text(json.dumps({"model": "opus", "accepted": True}))
+        result = f.run(**self.ON)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--model", f.calls())
+
     def test_a_fresh_launch_starts_the_seat_in_the_core_session_and_no_helper_session(self):
         f = Fixture(self, seat_tmux=True)
         result = f.run(SUTANDO_CORE_MODEL="gpt-test", SUTANDO_STOP_INTERRUPT="1", **self.ON)

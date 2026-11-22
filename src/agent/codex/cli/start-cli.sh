@@ -283,9 +283,42 @@ CODEX_ARGS=(
   # The checkout's AGENTS.md is larger than Codex's 32 KiB default, which drops its tail.
   -c project_doc_max_bytes=131072
 )
+# The Codex core's own pick (skills/model-switch, src/codex_core_model.py) when this launch sets no
+# SUTANDO_CORE_MODEL: core-only, so the pool's Codex workers, which share CODEX_HOME, keep theirs.
+if [ -z "${SUTANDO_CORE_MODEL:-}" ] && [ -n "$(heartbeat_python)" ]; then
+  _model_ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
+  _model_rec=""
+  if [ -n "$_model_ws" ]; then
+    _model_rec="$("$(heartbeat_python)" "$REPO/src/codex_core_model.py" current --state-dir "$_model_ws/state" 2>/dev/null || true)"
+  fi
+  if [ -n "$_model_rec" ]; then
+    SUTANDO_CORE_MODEL="$_model_rec"
+    echo "  ✓ Codex core model: $_model_rec (the core's last switch, $_model_ws/state/model-switch.json)"
+  fi
+  unset _model_ws _model_rec
+fi
 if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   CODEX_ARGS+=(-m "$SUTANDO_CORE_MODEL")
 fi
+# On unless =0 (docs/codex-core.md): hooks that tell the core supervisor when Codex is blocked
+# on a dialog. Passed only once Codex has recorded trust for exactly these hooks.
+add_codex_block_hooks() {
+  [ "${SUTANDO_CODEX_BLOCK_HOOKS:-1}" != 0 ] && [ -n "$_HB_PY" ] || return 0
+  if [ -z "$CODEX_HOME_DIR" ]; then
+    echo "  ⚠ Codex block-signal hooks off: no usable Codex home to record their trust in" >&2
+    return 0
+  fi
+  local args=() arg
+  while IFS= read -r -d '' arg; do args+=("$arg"); done \
+    < <("$_HB_PY" "$REPO/src/core_block_signal.py" codex-args "$REPO" \
+          --codex-home "$CODEX_HOME_DIR" --cwd "$WORKING_DIR" 2>/dev/null || true)
+  if [ "${#args[@]}" -gt 0 ]; then
+    CODEX_ARGS+=("${args[@]}")
+    echo "  · Codex block-signal hooks on (trusted for these hooks only); set SUTANDO_CODEX_BLOCK_HOOKS=0 to turn them off" >&2
+  else
+    echo "  ⚠ Codex block-signal hooks off: Codex could not record their trust" >&2
+  fi
+}
 # A git checkout's first Codex launch stops on "Trust this folder?", which a headless core
 # never answers; see src/codex_project_trust.py. Best effort: a failure leaves the prompt.
 ensure_codex_project_trust() {
@@ -650,6 +683,7 @@ if session_exists "$SESSION" && ! codex_core_missing; then
   exit 0
 fi
 
+add_codex_block_hooks
 # Past the attach/reuse exit above, so this is a genuine Codex core boot. The
 # sentinel is cleared at each launch site below, never before one can fail.
 if [ -r "$REPO/scripts/python-binary.sh" ]; then
