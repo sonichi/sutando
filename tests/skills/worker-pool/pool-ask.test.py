@@ -101,6 +101,24 @@ class WhoAgentIds(Base):
         self.assertEqual(by[self.alpha]["agent_mxid"], "@alpha-agent:fixture.net")
         self.assertIsNone(by[self.beta]["agent_mxid"], "a worker with no identity row has none")
 
+    def test_two_rows_for_one_worker_show_the_session_identity(self):
+        import connections
+        self._write([self._row(instance="alpha-lane", worker=self.alpha, agent_mxid="@alpha-agent:fixture.net"),
+                     self._row(instance="alpha-lane-2", worker=self.alpha, server="other.net",
+                               gateway_url="https://other.net", agent_mxid="@alpha-other:other.net")])
+        by = {r["id"]: r for r in pa.who(self.ws, runner=Tmux())}
+        want = connections.worker_identity(self.alpha, self.ws)["agent_mxid"]
+        self.assertEqual(by[self.alpha]["agent_mxid"], want)
+        self.assertEqual(want, "@alpha-agent:fixture.net")
+
+    def test_a_parked_second_row_does_not_override(self):
+        self._write([self._row(instance="alpha-lane", worker=self.alpha, agent_mxid="@alpha-agent:fixture.net"),
+                     self._row(instance="alpha-lane-2", worker=self.alpha, server="other.net",
+                               gateway_url="https://other.net", agent_mxid="@alpha-parked:other.net",
+                               parked=True)])
+        by = {r["id"]: r for r in pa.who(self.ws, runner=Tmux())}
+        self.assertEqual(by[self.alpha]["agent_mxid"], "@alpha-agent:fixture.net")
+
     def test_text_output_shows_agent_ids_and_none(self):
         self._write([self._row(instance="alpha-lane", worker=self.alpha, agent_mxid="@alpha-agent:fixture.net")])
         out = io.StringIO()

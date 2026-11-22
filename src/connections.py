@@ -2213,14 +2213,14 @@ def agent_ids(workspace: Optional[Path] = None) -> "Optional[dict]":
     except (SchemaError, OSError):
         return {} if not path.exists() else None
     out = {}
-    for r in rows:
-        mxid = str(r.get("agent_mxid") or "").strip()
-        if not mxid:
-            continue
-        if r.get("worker"):
-            out[str(r["worker"])] = mxid
-        elif r.get("primary"):
-            out[""] = mxid
+    primary = next((r for r in rows if r.get("primary") and not r.get("worker")), None)
+    if str((primary or {}).get("agent_mxid") or "").strip():
+        out[""] = str(primary["agent_mxid"]).strip()
+    # The row worker_identity picks, so --who names the identity the session uses.
+    for worker in dict.fromkeys(str(r["worker"]) for r in rows if r.get("worker")):
+        mxid = str((worker_identity(worker, workspace) or {}).get("agent_mxid") or "").strip()
+        if mxid:
+            out[worker] = mxid
     return out
 
 
