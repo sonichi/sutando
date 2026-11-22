@@ -140,6 +140,12 @@ and the policy decides:
   [AG2_MCP_DESCRIPTOR, AG2_MCP_LOG]}`: paths only, exactly what Claude Code's stdio entry carries. The proxy,
   agy's child, reads the relay token from the token file, mints as the agent, sends the relay token only to
   the mint and the access token only to the MCP endpoint, and scrubs its own environment.
+- **Tool names (stdio).** agy drops every MCP tool whose name has a dot. Measured on 2026-11-21: of AG2
+  Space's tools it offered only `ui_describe`, `ui_request` and `ui_result`, so `ag2.whoami` (empty schema)
+  and every `room.*` tool were missing. The proxy therefore runs under `ag2_sparrow.mcp_name_shim`, which
+  only renames: `tools/list` answers `room_action_execute` for `room.action.execute` (any character outside
+  `[A-Za-z0-9_-]` becomes `_`, cut to 64), and a `tools/call` for that name reaches the server as
+  `room.action.execute`. The policy matches both spellings.
 - **Token file shape (stdio).** An agent `.env` with a `REMOTE_TASK_TOKEN=<relay>|<secret>` line gets the
   plain descriptor (`env_file` that `.env`, `env_key` its key). A seat made by `--token-stdin` or `connect` has
   an `.env` (`channels/ag2space/.env`) holding only `REMOTE_TASK_TOKEN_FILE`, and its token as a raw line in

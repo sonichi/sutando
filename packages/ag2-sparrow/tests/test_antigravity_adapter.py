@@ -785,7 +785,7 @@ class SspaceToolsTest(unittest.TestCase):
     def test_the_owner_and_team_prompts_name_the_tools_and_a_guests_does_not(self):
         owner = gc.wake_prompt("task-1", {"access_tier": "owner"}, "hi", [], "/w")
         self.assertIn("ag2-space MCP tools", owner)
-        self.assertIn("room.action.execute", owner)
+        self.assertIn("room_action_execute", owner)
         team = gc.wake_prompt("task-1", {"access_tier": "team", "collaborator": "true"}, "hi", [], "/w")
         self.assertIn("ag2-space MCP tools", team)
         unattested = gc.wake_prompt("task-1", {"access_tier": "team", "collaborator": "false"}, "hi", [], "/w")
@@ -867,7 +867,10 @@ class SspaceStdioTest(unittest.TestCase):
         [[entry]] = self.sent()
         state = os.path.abspath(str(self.w.root / "state"))
         desc_path = os.path.join(state, gc.DESCRIPTOR_NAME)
-        self.assertEqual(entry, {"name": "ag2-space", "command": "/app/node", "args": ["/app/ag2-mcp-proxy.mjs"],
+        self.assertEqual(entry["args"][-3:], ["--", "/app/node", "/app/ag2-mcp-proxy.mjs"], "the proxy, under the shim")
+        self.assertIn("mcp_name_shim", entry["args"][2])
+        self.assertEqual(entry, {"name": "ag2-space", "command": sys.executable, "args": gc.shim_args(
+                                     ["/app/node", "/app/ag2-mcp-proxy.mjs"]),
                                  "env": [{"name": "AG2_MCP_DESCRIPTOR", "value": desc_path},
                                          {"name": "AG2_MCP_LOG", "value": os.path.join(state, gc.PROXY_LOG_NAME)}]})
         self.assertEqual(json.loads(Path(desc_path).read_text()), dict(self.desc, agent_id="@agy:s.space"))

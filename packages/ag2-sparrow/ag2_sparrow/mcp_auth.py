@@ -112,8 +112,24 @@ def _call(method: str, url: str, bearer: str, gateway_url: str = "") -> Tuple[in
     return status, body if isinstance(body, dict) else {}
 
 
+MINT_PATH = "/api/v1/mcp/agent-access-tokens"   # the bridge's AGENT_ACCESS_MINT_PATH (a test keeps them equal)
+
+
+def same_origin(url: str, base: str) -> bool:
+    """The bridge's `_same_origin` (a test keeps them equal), without importing the bridge: its import resolves a
+    token, and `descriptor` must read nothing but the file it is given."""
+    try:
+        u, b = urllib.parse.urlsplit(url), urllib.parse.urlsplit(base)
+        if not u.scheme or not u.hostname or u.scheme != b.scheme:
+            return False
+        default = {"https": 443, "http": 80}.get(u.scheme)
+        return u.hostname.lower() == (b.hostname or "").lower() and (u.port or default) == (b.port or default)
+    except ValueError:
+        return False
+
+
 def discover(relay_url: str, bearer: str) -> Tuple[str, str]:
-    from .remote_gateway_bridge import AGENT_ACCESS_MINT_PATH, _same_origin
+    AGENT_ACCESS_MINT_PATH, _same_origin = MINT_PATH, same_origin
     _safe_url("the relay URL", relay_url)  # the bearer goes to discovery first: same rule as mint_url
     status, body = _call("GET", relay_url.rstrip("/") + DISCOVERY_PATH, bearer, relay_url)
     if status != 200:

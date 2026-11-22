@@ -453,6 +453,30 @@ def _fresh_bridge():
     sys.modules["ag2_sparrow"].__dict__.pop("remote_gateway_bridge", None)
 
 
+class BridgeCopiesTest(unittest.TestCase):
+    """mcp_auth keeps the bridge's mint path and origin rule without importing it (its import resolves a token)."""
+
+    def test_the_copies_match_the_bridge(self):
+        _fresh_bridge()
+        from ag2_sparrow import remote_gateway_bridge as bridge
+        self.assertEqual(mcp_auth.MINT_PATH, bridge.AGENT_ACCESS_MINT_PATH)
+        for url, base in (("https://r.example/a", "https://r.example/b"), ("https://r.example.evil/a", "https://r.example"),
+                          ("http://r.example/a", "https://r.example"), ("https://R.example:443/a", "https://r.example"),
+                          ("https://r.example:bad/", "https://r.example"), ("relative", "https://r.example"),
+                          ("http://127.0.0.1:81/x", "http://127.0.0.1:80/")):
+            self.assertEqual(mcp_auth.same_origin(url, base), bridge._same_origin(url, base), (url, base))
+
+    def test_descriptor_never_imports_the_bridge(self):
+        env_file = os.path.join(tempfile.mkdtemp(prefix="mcp-desc-"), ".env")
+        with open(env_file, "w") as fh:
+            fh.write("REMOTE_TASK_TOKEN=http://127.0.0.1:9/relay|s\n")
+        code = ("import sys; from ag2_sparrow import mcp_auth; rc = mcp_auth.main(['descriptor', '--env-file', %r]); "
+                "print('bridge' if 'ag2_sparrow.remote_gateway_bridge' in sys.modules else 'no-bridge')" % env_file)
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60,
+                           env=hermetic_env(PYTHONPATH=str(PKG_ROOT)))
+        self.assertEqual(r.stdout.strip().splitlines()[-1], "no-bridge", r.stderr)
+
+
 class ResolveTest(unittest.TestCase):
     def test_reads_the_bridges_own_resolution(self):
         relay = "https://gw.example/relay"

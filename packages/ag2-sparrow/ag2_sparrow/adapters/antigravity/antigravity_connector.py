@@ -144,6 +144,15 @@ DESCRIPTOR_NAME = "ag2-mcp-descriptor.json"
 PROXY_LOG_NAME = "ag2-mcp-proxy.log"
 
 
+def shim_args(argv):
+    """The arguments that run `argv` (the proxy) under `mcp_name_shim`, from this very package, isolated: agy
+    drops every tool whose name has a dot, so the shim offers `room_action_execute` for `room.action.execute`."""
+    root = str(Path(mcp_auth.__file__).resolve().parents[1])
+    code = ("import sys; sys.path.insert(0, %r); from ag2_sparrow.mcp_name_shim import main; "
+            "raise SystemExit(main(sys.argv[1:]))" % root)
+    return ["-I", "-c", code, "--"] + list(argv)
+
+
 def _descriptor_file(desc, token_env_file):
     """The file a descriptor must name: the .env itself, or for `token_format: "raw"` (no env_key) the raw
     token file that seat .env points at; None for any other shape."""
@@ -182,7 +191,7 @@ def stdio_entry(proxy_command, token_env_file, agent_id, state_dir, run=subproce
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(desc, f)
     os.replace(tmp, path)
-    return {"name": mcp_auth.SERVER_NAME, "command": argv[0], "args": argv[1:],
+    return {"name": mcp_auth.SERVER_NAME, "command": sys.executable, "args": shim_args(argv),
             "env": [{"name": "AG2_MCP_DESCRIPTOR", "value": path},
                     {"name": "AG2_MCP_LOG", "value": os.path.join(state, PROXY_LOG_NAME)}]}, ""
 
@@ -292,9 +301,9 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
                % (" as the reply" if event in (None, MESSAGE_EVENT) else "", NO_REPLY))
     if sspace_tools_for(headers):
         out.append("When this session has the %s MCP tools, they act in AG2 Space as you, this agent: use "
-                   "room.action.execute (find Actions with room.actions.search and room.actions.describe) to create "
-                   "or edit Room Commons pages and for other room actions, and put the page link in your reply."
-                   % mcp_auth.SERVER_NAME)
+                   "room_action_execute (the server's room.action.execute; find Actions with room_actions_search and "
+                   "room_actions_describe) to create or edit Room Commons pages and for other room actions, and put "
+                   "the page link in your reply." % mcp_auth.SERVER_NAME)
     out.append("No shell command is granted in this session. %s"
                % ("You may read and edit files under %s." % cwd if headers.get("access_tier") == "owner"
                   else "You may not read or change files."))
