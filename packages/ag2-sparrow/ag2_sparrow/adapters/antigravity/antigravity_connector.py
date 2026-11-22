@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -195,6 +196,17 @@ MODEL_UNKNOWN = ("I don't know my models yet: I learn them when a turn starts. S
                  "send /model again.")
 
 
+def model_verb(model_id: str) -> str:
+    """What a model's button carries. A card reply takes a short plain token, and an id may hold a
+    slash, a colon or a space ("models/gemini-pro"): such an id travels as a digest of itself."""
+    agent_card, _ = connector_cards._core()
+    try:
+        agent_card.reply("model", "agent", model_id)
+        return model_id
+    except ValueError:
+        return "id." + hashlib.sha256(model_id.encode("utf-8")).hexdigest()[:24]
+
+
 class Connector:
     def __init__(self, args, client_factory=AcpClient, note=None):
         self.args = args
@@ -253,12 +265,14 @@ class Connector:
                                     text="I could not switch to %s. I'm still using %s. Send /model to try again."
                                          % (name, names.get(ran, ran or "my default model")))
         buttons = [agent_card.button(name, "reply", reply="Use %s" % name,
-                                     command=agent_card.reply("model", "agent", mid))
+                                     command=agent_card.reply("model", "agent", model_verb(mid)))
                    for mid, name in list(names.items())[:MODEL_BUTTONS]]
         return agent_card.build(MODEL_CARD, "pending", title="Model", body="Pick a model for %s" % self.name,
                                 text="Now using %s." % names.get(now, now or "the default model"), buttons=buttons)
 
     def post_card(self, room, built) -> bool:
+        if built is None:
+            return False
         try:
             connector_cards.queue(self.args.bridge_state, str(room or ""), *built)
             return True
@@ -276,7 +290,8 @@ class Connector:
         verdict = connector_cards.click(sent, said, self.root)
         state, outcome = self.model_state(), ""
         if verdict.verdict == agent_card.COMMAND and verdict.command.kind == "model":
-            picked = verdict.command.verb
+            verb = verdict.command.verb
+            picked = next((m["id"] for m in state.get("available") or [] if model_verb(m["id"]) == verb), verb)
             if picked not in [m["id"] for m in state.get("available") or []]:
                 publish(result_file, quoted("That model is not one I can use now. Send /model for the current list.") + "\n")
                 outcome = "model-unknown"
@@ -305,12 +320,21 @@ class Connector:
         log("card ->", task_id, outcome)
         return {"task": task_id, "status": "completed", "detail": outcome, "tier": headers["access_tier"], "card": outcome}
 
+    def menu(self, state):
+        """The card with the buttons, or None when it cannot be built (a name the card rules refuse):
+        the ask is then answered in words, never left to raise and be retried."""
+        try:
+            return self.model_card(state)
+        except ValueError as e:
+            log("model card not built:", str(e)[:200])
+            return None
+
     def offer_models(self, sent, result_file) -> str:
         """Answer the owner's ask with the model card (or the line saying why there is none)."""
         state = self.model_state()
         if not state.get("available"):
             publish(result_file, quoted(MODEL_UNKNOWN) + "\n")
-        elif self.post_card(sent.get("channel_id"), self.model_card(state)):
+        elif self.post_card(sent.get("channel_id"), self.menu(state)):
             publish(result_file, "[no-send] the model card answers\n")
         else:
             publish(result_file, quoted("I could not post the model card. Try again in a moment.") + "\n")
