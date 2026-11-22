@@ -124,6 +124,62 @@ class Persist(Base):
             sutando_config.persist_codex_app_server("on", self.repo)  # type: ignore[arg-type]
 
 
+class Edges(Base):
+    """The refusals and failure paths of both readers and the writer."""
+
+    def clone(self) -> Path:
+        repo = self.base / "clone"
+        (repo / "workspace").mkdir(parents=True)
+        (repo / "sutando.config.json").write_text("{}")
+        return repo
+
+    def test_a_malformed_config_reads_as_off(self):
+        (self.workspace / "sutando.config.local.json").write_text("{not json")
+        with patch("sys.stderr"):
+            self.assertFalse(self.resolve())
+
+    def test_missing_files_are_created_with_only_the_choice(self):
+        self.assertEqual(sutando_config.persist_codex_app_server(True, self.repo)[0], "updated")
+        self.assertEqual(json.loads(self.runtime_json.read_text()), {"codexAppServer": True})
+        repo = self.clone()
+        sutando_config.persist_codex_app_server(False, repo)
+        self.assertEqual(json.loads((repo / "workspace" / "sutando.config.local.json").read_text()),
+                         {"core": {"codex_app_server": False}})
+
+    def test_an_unreadable_file_is_refused_and_left_alone(self):
+        self.runtime_json.write_text("{broken")
+        with self.assertRaises(ValueError):
+            sutando_config.persist_codex_app_server(True, self.repo)
+        self.assertEqual(self.runtime_json.read_text(), "{broken")
+
+    def test_a_core_key_that_is_not_an_object_is_refused(self):
+        repo = self.clone()
+        layer = repo / "workspace" / "sutando.config.local.json"
+        layer.write_text(json.dumps({"core": "codex"}))
+        with self.assertRaises(ValueError):
+            sutando_config.persist_codex_app_server(True, repo)
+        self.assertEqual(json.loads(layer.read_text()), {"core": "codex"})
+
+    def test_a_missing_workspace_is_refused(self):
+        repo = self.clone()
+        shutil.rmtree(repo / "workspace")
+        with self.assertRaises(ValueError):
+            sutando_config.persist_codex_app_server(True, repo)
+
+    def test_no_checkout_is_refused(self):
+        with patch.object(sutando_config, "desktop_runtime_selection_path", return_value=None), \
+             patch.object(sutando_config, "_find_repo_root", return_value=None):
+            with self.assertRaises(ValueError):
+                sutando_config.persist_codex_app_server(True)
+
+    def test_a_failed_replace_leaves_the_file_and_no_temp_behind(self):
+        self.runtime_json.write_text(json.dumps({"coreRuntime": "codex"}))
+        with patch.object(sutando_config.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                sutando_config.persist_codex_app_server(True, self.repo)
+        self.assertEqual(json.loads(self.runtime_json.read_text()), {"coreRuntime": "codex"})
+        self.assertEqual(sorted(p.name for p in self.runtime_json.parent.iterdir()), ["engine", "runtime.json"])
+
 class Cli(unittest.TestCase):
     """The subcommands in a copied checkout, with no desktop: the workspace layer."""
 
