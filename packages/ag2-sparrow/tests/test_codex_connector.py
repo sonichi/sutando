@@ -892,11 +892,16 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         (self.work / "state" / "model.json").write_text(json.dumps({
             "available": [{"id": "gpt-5.6-sol", "name": "Stub Model"}, {"id": "gpt-6-sol", "name": "Stub\nLarge"}],
             "current": "gpt-5.6-sol", "wanted": "gpt-6-sol", "asked_in": self.DM, "told": ""}))
+        room = self.serve("task-0", "hello", channel="!room:s.space", kind="room")
+        self.assertIn("model=gpt-6-sol", room)
+        self.assertNotIn("Switched", room, "words for the owner's DM never go to a shared room")
+        self.assertEqual(([o["picked"] for o in self.state()["untold"]], self.state()["confirmed"]),
+                         (["gpt-6-sol"], "gpt-6-sol"), "settled, and kept owed")
+        self.assertIn("task-0", (self.work / "state" / "done").read_text(), "answered, so the turn is not run again")
         text = self.serve("task-1", "hello")
-        self.assertIn("model=gpt-6-sol", text)
-        self.assertIn("Switched. I'm now using Stub", text, "the outcome, in words")
-        self.assertEqual((self.posted(), metrics(self.work)[-1]["model_switch"]), ([], "switched"))
-        self.assertIn("task-1", (self.work / "state" / "done").read_text(), "answered, so the turn is not run again")
+        self.assertIn("Switched. I'm now using Stub", text, "the outcome, in words, in the DM")
+        self.assertEqual((self.posted(), metrics(self.work)[-1]["model_switch"], self.state()["untold"]),
+                         ([], "switched", []))
         self.assertNotIn("Switched", self.serve("task-2", "again"), "said once")
         # A pick whose card cannot be built is answered in words.
         self.dm("task-3", "/model stub 5")
@@ -909,7 +914,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         # An owed outcome that cannot be built is said in words once, then dropped.
         c.models.save(untold={"picked": "gpt-5.6-terra", "ran": "", "room": self.DM})
         with mock.patch.object(model_switch.ModelSwitch, "card", side_effect=ValueError("bad name")):
-            self.assertEqual(c.models.tell(True, ""), "not-switched")
+            self.assertEqual(c.models.tell(True, "", self.DM), "not-switched")
         self.assertIn("I could not switch to Stub 5", c.models.unsaid())
         self.assertEqual((c.models.state().get("untold"), c.models.unsaid()), ([], ""))
 

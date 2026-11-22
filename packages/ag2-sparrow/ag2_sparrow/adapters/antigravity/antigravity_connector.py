@@ -279,7 +279,7 @@ class Connector:
         t0 = time.time()
         status, text, detail, turn = self.run_turn(task_id, headers, prompt, tier == "owner")
         # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
-        told = self.models.tell(turn.live, turn.model) if tier == "owner" else ""
+        told = self.models.tell(turn.live, turn.model, headers.get("channel_id")) if tier == "owner" else ""
         asked = self.desk.marked(headers.get("access_tier"), path, status, text, result_file)
         if not asked:
             unsaid = quoted(self.models.unsaid()).strip()

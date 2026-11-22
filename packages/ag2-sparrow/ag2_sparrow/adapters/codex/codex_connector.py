@@ -282,7 +282,7 @@ class Connector:
         log("card ->", task_id, outcome)
         return {"task": task_id, "status": "completed", "tier": headers["access_tier"], "card": outcome}
 
-    def tell_model(self, status, caps) -> str:
+    def tell_model(self, status, caps, room=None) -> str:
         """After a turn on a kept thread: tell the owner once whether their pick took. Codex names no model
         per turn, so a completed turn ran on the pick unless Codex said it moved the turn; a failed one did not.
         A moved turn's model is Codex's choice, not the owner's: the model in use stays the one before."""
@@ -292,7 +292,7 @@ class Connector:
         before = str(self.models.state().get("current") or "")
         took = status == "completed" and not (self.rerouted and self.rerouted != wanted)
         ran = wanted if took else (before if before != wanted else "")
-        return self.models.tell(True, ran)
+        return self.models.tell(True, ran, room)
 
     def handle_server_request(self, m):
         """No human is attached, so approvals are declined (the turn continues)."""
@@ -609,7 +609,7 @@ class Connector:
             t_done = time.time()
             out = self.result_body(status, text, err)
             # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
-            told = self.tell_model(status, policy.capabilities)
+            told = self.tell_model(status, policy.capabilities, headers.get("channel_id"))
             out = "\n\n".join(x for x in (out.rstrip("\n"), quoted(self.models.unsaid()).strip()) if x)
             asked = self.desk.marked(headers["access_tier"], path, status, text, result_path)
             t_result = os.stat(result_path).st_mtime if asked else write_atomic(result_path, out.rstrip("\n") + "\n")
