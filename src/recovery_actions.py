@@ -586,8 +586,10 @@ def verify_step(manager, workspace: Path, session: str, blocked: bool, now: Opti
                 continue
             cur.message = f"{cur.message}\n\n{line}"
             cur.subject = {**(cur.subject or {}), "verify": {**check, "seen": seen}}
-            if isinstance(cur.subject.get("receipt"), dict):
-                cur.subject["receipt"] = {**cur.subject["receipt"], "text": line}  # what was seen after
+            receipt = cur.subject.get("receipt")
+            if isinstance(receipt, dict) and receipt.get("outcome") == "done":
+                # What was seen after a dispatched action is its outcome; a failure keeps its own line.
+                cur.subject["receipt"] = {**receipt, "text": line}
             cur.revision += 1
             cur.updated_at = time.time()
             manager.store.save(cur)

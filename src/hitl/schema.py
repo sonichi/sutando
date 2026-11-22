@@ -32,6 +32,9 @@ RECEIPT_FAILED_TEXT = {
     "failed": "It could not be done.",
 }
 SUPERSEDED_TEXT = "It is still blocked. A new card follows."
+# What verification saw after a done recovery action that counts as done: the session working again.
+# Still blocked, a failed restart, or up with its waiting work not seen starting is not success.
+VERIFY_SEEN_DONE = ("working",)
 
 
 # Canonical JSON's integer range; a number outside it is refused like a float.
@@ -179,7 +182,8 @@ class HumanRequirement:
 
     def wire_outcome(self) -> Optional[Dict[str, str]]:
         """The card's `outcome`, or None while it still asks or nobody answered it. The producer's
-        own outcome wins, then a recovery receipt, then the status (in_progress runs, resolved is done)."""
+        own outcome wins, then a recovery receipt, then the status (in_progress runs, resolved is done).
+        A done receipt is only dispatched: it runs until verification has seen what came of it."""
         if self.status == STATUS_PENDING or not self.chosen_action:
             return None
         own = self.outcome
@@ -189,10 +193,18 @@ class HumanRequirement:
         receipt = subject.get("receipt")
         if isinstance(receipt, dict) and receipt.get("outcome") in WIRE_RECEIPT_OUTCOMES:
             text = receipt.get("text")
-            if receipt["outcome"] == "done" and subject.get("superseded") is not True:
+            if receipt["outcome"] != "done":
+                return outcome_wire(OUTCOME_FAILED, text or RECEIPT_FAILED_TEXT[receipt["outcome"]])
+            if subject.get("superseded") is True:
+                return outcome_wire(OUTCOME_FAILED, text or SUPERSEDED_TEXT)
+            check = subject.get("verify")
+            seen = check.get("seen") if isinstance(check, dict) else None
+            if isinstance(check, dict) and not seen:
+                # Still verifying (or a fallback restart runs); a card closed unverified moved on.
+                return outcome_wire(OUTCOME_DONE if self.terminal else OUTCOME_RUNNING)
+            if seen in VERIFY_SEEN_DONE or not isinstance(check, dict):
                 return outcome_wire(OUTCOME_DONE, text)
-            fallback = SUPERSEDED_TEXT if receipt["outcome"] == "done" else RECEIPT_FAILED_TEXT[receipt["outcome"]]
-            return outcome_wire(OUTCOME_FAILED, text or fallback)
+            return outcome_wire(OUTCOME_FAILED, text or SUPERSEDED_TEXT)
         if self.status == STATUS_IN_PROGRESS:
             return outcome_wire(OUTCOME_RUNNING)
         if self.status == STATUS_RESOLVED:

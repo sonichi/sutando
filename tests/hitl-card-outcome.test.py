@@ -101,14 +101,16 @@ class WireOutcome(_Store):
 
 
 class ReceiptOutcome(_Store):
-    def receipted(self, outcome, text=None, superseded=False, click=True):
-        rid = self.card(subject={"recovery": True}, guard=f"g-{outcome}")
+    def receipted(self, outcome, text=None, superseded=False, click=True, verify=None):
+        rid = self.card(subject={"recovery": True}, guard=f"g-{outcome}-{verify}")
         if click:
             self.click(rid)
         with self.m.store.locked():
             req = self.m.get(rid)
             req.subject = {**req.subject, "receipt": {"outcome": outcome, "at": 1,
                                                       **({"text": text} if text else {})}}
+            if verify is not None:
+                req.subject["verify"] = verify
             if superseded:
                 req.subject["superseded"] = True
             req.revision += 1
@@ -128,6 +130,30 @@ class ReceiptOutcome(_Store):
     def test_a_superseded_done_says_it_is_still_blocked(self):
         self.assertEqual(self.wire(self.receipted("done", superseded=True))["outcome"],
                          {"state": "failed", "text": SUPERSEDED_TEXT})
+
+    def test_a_done_receipt_still_verifying_runs(self):
+        rid = self.receipted("done", "Sent Escape.", verify={"outcome": "done", "at": 1})
+        self.assertEqual(self.wire(rid)["outcome"], {"state": "running"})
+
+    def test_a_done_receipt_closed_unverified_has_moved_on(self):
+        rid = self.receipted("done", "Sent Escape.", verify={"outcome": "done", "at": 1})
+        self.m.resolve(rid)
+        self.assertEqual(self.wire(rid)["outcome"], {"state": "done"})
+
+    def test_what_verification_saw_decides_a_done_receipt(self):
+        for seen, state in (("working", "done"), ("up", "failed"), ("blocked", "failed"), ("failed", "failed")):
+            with self.subTest(seen=seen):
+                rid = self.receipted("done", "what was seen", verify={"outcome": "done", "seen": seen})
+                self.assertEqual(self.wire(rid)["outcome"], {"state": state, "text": "what was seen"})
+
+    def test_a_failed_action_keeps_its_own_line_when_the_block_clears(self):
+        ra = _load("recovery_actions", REPO / "src" / "recovery_actions.py")
+        rid = self.card(subject={"recovery": True, "session": "s1"})
+        self.click(rid)
+        ra._answer_card(self.m, self.m.get(rid), "It could not be switched.", "failed", time.time())
+        ra.verify_step(self.m, self.ws, "s1", blocked=False)
+        self.assertIn(ra.CLEARED, self.m.get(rid).message)
+        self.assertEqual(self.wire(rid)["outcome"], {"state": "failed", "text": "It could not be switched."})
 
     def test_a_stale_tap_on_a_card_still_asking_keeps_its_buttons(self):
         self.assertNotIn("outcome", self.wire(self.receipted("stale", click=False)))
