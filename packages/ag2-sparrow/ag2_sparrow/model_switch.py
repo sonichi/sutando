@@ -312,8 +312,12 @@ class ModelSwitch:
         told, words = "", []
         while owed:
             first = {"picked": str(owed[0].get("picked") or ""), "ran": str(owed[0].get("ran") or "")}
-            card = self.built(state, **first)
-            if card is None:
+            # A pick made on the app's settings page names no room: the page reads the outcome from
+            # this state (model_settings), so it is settled without a card in any DM.
+            card = self.built(state, **first) if owed[0].get("room") else False
+            if card is False:
+                pass
+            elif card is None:
                 if room is None or str(owed[0].get("room") or "") != str(room):
                     break           # its words wait for a turn in the room the card was for
                 words.append(self.words(state, **first))
