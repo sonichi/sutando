@@ -3,7 +3,7 @@
 
 A Codex core and its pool workers share one CODEX_HOME (one login), so the core's pick must not go
 into `<CODEX_HOME>/config.toml`: every worker reads that file at start and would follow. The pick is
-kept in the core's switch record instead, `<workspace>/state/model-switch.json`, with
+kept in the core's switch record instead (`model-switch.json` in the state folder its caller names), with
 `runtime: "codex"` (a record without it is a Claude core's and is never read here). Readers:
 
 - `src/agent/codex/cli/start-cli.sh` launches the core with `-m <model>` from it when
