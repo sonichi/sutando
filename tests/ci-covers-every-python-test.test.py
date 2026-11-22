@@ -260,6 +260,26 @@ def _named_in(workflow_text: str) -> set:
     return set(program_python_args("\n".join(_run_bodies(workflow_text))))
 
 
+PUBLISH_GATE = "packages/ag2-sparrow/tools/publish_gate.sh"
+
+
+def invokes_publish_gate(workflow_text: str) -> bool:
+    """True when a run body actively calls the ag2-sparrow publish gate (not in a comment)."""
+    body = _uncommented("\n".join(_run_bodies(workflow_text)))
+    return re.search(r"(^|[\s;&|])bash\s+" + re.escape(PUBLISH_GATE) + r"(\s|$)", body, re.M) is not None
+
+
+def run_by_publish_gate() -> set:
+    """The suites the publish gate runs, asked of the gate itself, credited only while a workflow calls it."""
+    if not any(invokes_publish_gate(wf.read_text()) for wf in (REPO / ".github" / "workflows").glob("*.yml")):
+        return set()
+    out = subprocess.run(["bash", str(REPO / PUBLISH_GATE), "--list"], cwd=str(REPO),
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        raise AssertionError(f"publish_gate.sh --list failed rc={out.returncode}: {out.stderr.strip()}")
+    return {p for p in out.stdout.splitlines() if p}
+
+
 def test_looking_files():
     """Git-TRACKED test-looking files only.
 
@@ -335,7 +355,8 @@ class TestCICoversEveryPythonTest(unittest.TestCase):
         import os
         os.chdir(REPO)
         discovered = discovered_by_find()
-        orphans = orphans_in(test_looking_files(), discovered | delegated_by(discovered), named_in_workflows())
+        orphans = orphans_in(test_looking_files(), discovered | delegated_by(discovered) | run_by_publish_gate(),
+                             named_in_workflows())
         self.assertEqual(
             orphans, [],
             "these test files are never executed by CI — either move them to "
@@ -368,6 +389,12 @@ class TestCICoversEveryPythonTest(unittest.TestCase):
         self.assertEqual(run_whole_by(partial), set())
         not_main = 'import runpy\nT = R / "packages/p/tests/test_x.py"\nrunpy.run_path(str(T))\n'
         self.assertEqual(run_whole_by(not_main), set())
+
+    def test_the_publish_gate_credits_only_when_a_workflow_calls_it(self):
+        self.assertTrue(invokes_publish_gate(f"steps:\n  - run: bash {PUBLISH_GATE}\n"))
+        self.assertFalse(invokes_publish_gate(f"steps:\n  - run: |\n      # bash {PUBLISH_GATE}\n      true\n"))
+        self.assertFalse(invokes_publish_gate(f"steps:\n  - run: echo bash-{PUBLISH_GATE}\n"))
+        self.assertIn("packages/ag2-sparrow/tests/test_hatch_adapter.py", run_by_publish_gate())
 
     def test_a_workflow_named_file_is_not_an_orphan(self):
         self.assertEqual(orphans_in({"scripts/y.py"}, set(), {"scripts/y.py"}), [])
