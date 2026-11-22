@@ -1684,16 +1684,24 @@ def _row_servers(row: Mapping[str, object]) -> set:
 
 
 def _lane_holds_room(row: Mapping[str, object], room_id: str, workspace: Optional[Path]) -> bool:
-    """Whether the row's bridge has an open task in `room_id` (its `remote-task-rooms` sidecar)."""
+    """Whether the row's bridge has an unanswered task in `room_id`: its `remote-task-rooms` sidecar
+    names the room for a task that is still live (`task_disposition.live_tasks`)."""
+    held: set = set()
     for inst in [str(row["instance"])] + alias_instances(row):
         path = _workspace(workspace) / "state" / f"remote-task-rooms{'.' + inst if inst else ''}.json"
         try:
             rooms = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if isinstance(rooms, dict) and room_id in rooms.values():
-            return True
-    return False
+        if isinstance(rooms, dict):
+            held.update(str(tid) for tid, room in rooms.items() if room == room_id)
+    if not held:
+        return False
+    import task_disposition
+    try:
+        return bool(task_disposition.live_tasks(_workspace(workspace), held))
+    except (OSError, ValueError):
+        return True  # liveness unreadable: the recorded entry stands
 
 
 def primary_row(workspace: Optional[Path] = None) -> Optional[dict]:

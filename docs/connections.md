@@ -556,7 +556,8 @@ connection to use. The rule:
   server) is **exactly** that domain, so a room on `dev.example.org` never matches a row for
   `example.org`;
 - an ID with no domain picks the one row whose bridge has a task open in that room (its
-  `state/remote-task-rooms[.<instance>].json`), else the primary;
+  `state/remote-task-rooms[.<instance>].json`), else the primary. Only an unanswered task counts
+  (`task_disposition.live_tasks`): an entry left by an answered or archived task holds no room;
 - no room picks the primary;
 - fewer than two rows, no primary, or an unreadable record answers `None`, and the tool keeps
   its single-connection credential chain unchanged.

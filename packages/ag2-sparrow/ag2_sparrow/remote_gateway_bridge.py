@@ -7259,6 +7259,24 @@ def _forget_task_room(tid: str) -> None:
             _save_task_rooms(rooms)
 
 
+def _prune_task_rooms(inflight: "set[str]", suspects: "set[str]") -> "set[str]":
+    """Drop task-room entries no reply can still come from: not in flight, no task pending, no result
+    waiting. An id goes on its second consecutive sighting; returns the next pass's suspects."""
+    gone = {tid for tid in _load_task_rooms()
+            if tid not in inflight
+            and not (_valid_local_tid(tid)
+                     and (_task_pending(tid) or (RESULTS_DIR / f"{tid}.txt").exists()))}
+    confirmed = gone & suspects
+    if confirmed:
+        with _TASK_ROOMS_MUTEX:
+            rooms = _load_task_rooms()
+            kept = {tid: room for tid, room in rooms.items() if tid not in confirmed}
+            if len(kept) != len(rooms):
+                _save_task_rooms(kept)
+                _log(f"task-rooms: pruned {len(rooms) - len(kept)} completed task(s)")
+    return gone - confirmed
+
+
 def _load_task_media() -> "dict | None":
     """The per-task media-mode map, or None when it exists but cannot be read.
 
@@ -11577,6 +11595,7 @@ def main() -> int | None:
     except Exception as e:  # noqa: BLE001 — a parked result left behind waits for the next start
         _log(f"relay result reclaim failed ({diagnostics.describe(e)}) — continuing")
     abandoned_suspects: set[str] = set()
+    room_suspects: set[str] = set()
     _log(f"starting — gateway={_redact_url(URL)} provider={PROVIDER} tasks={TASKS_DIR} "
          f"(restored {len(inflight)} in-flight)")
     # Always name where the diagnostics live: after an incident this line is the
@@ -11682,6 +11701,7 @@ def main() -> int | None:
             if added:
                 wake_outbound()          # a fresh task often precedes its ack round-trip
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
+            room_suspects = _prune_task_rooms(inflight, room_suspects)
             if _keep_relay_results_in_flight(inflight):
                 wake_outbound()
             _reconcile_orphan_results(inflight)
