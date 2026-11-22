@@ -5,7 +5,8 @@
 device-connect flow as `pool_identity.py add <worker> --device-flow --label <label>`, as that
 command in a background process, and returns once the owner has been sent the approval link
 (or the start failed, or `wait_s` passed). The background process waits for the approval,
-saves the token and restarts the worker as its own agent, exactly as the command does alone.
+saves the token, puts the worker on its agent's own task and result folders and restarts it as its own
+agent, exactly as the command does alone.
 
 Nothing here fails the creation: every way the step cannot start is answered as
 {"status": "skipped", "why": ...}, and the worker answers through the core as before.
