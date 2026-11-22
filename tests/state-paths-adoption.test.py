@@ -148,6 +148,10 @@ ALLOWLIST = {
     # core_lineage never resolves the workspace — lineage_dir(workspace, host)
     # takes the root from the heartbeat, which owns the resolution.
     "src/core_lineage.py",
+    # hitl's only "state" tokens are the outcome wire dict key {state, text?};
+    # neither module reads or writes workspace paths.
+    "src/hitl/schema.py",
+    "src/hitl/projector.py",
     # roster_membership's "state" is a roster row's field name, not a path; it reads no file.
     "src/roster_membership.py",
     # the seat's host declaration: "results" and "state" are its JSON keys, and every
