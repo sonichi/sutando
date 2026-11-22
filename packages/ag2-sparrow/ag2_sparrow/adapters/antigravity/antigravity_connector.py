@@ -36,6 +36,7 @@ import shutil
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 from ... import acp_host, connector_cards, held_start, result_labels, result_publish
@@ -277,11 +278,11 @@ class Connector:
         return agent_card.build(MODEL_CARD, "pending", title="Model", body="Pick a model for %s" % self.name,
                                 text="Now using %s." % names.get(now, now or "the default model"), buttons=buttons)
 
-    def post_card(self, room, built) -> bool:
+    def post_card(self, room, built, key: str = "", at_ns: int = 0) -> bool:
         if built is None:
             return False
         try:
-            connector_cards.queue(self.args.bridge_state, str(room or ""), *built)
+            connector_cards.queue(self.args.bridge_state, str(room or ""), *built, key=key, at_ns=at_ns)
             return True
         except (OSError, ValueError) as e:
             log("model card not queued:", "%s: %s" % (type(e).__name__, e))
@@ -364,20 +365,24 @@ class Connector:
 
     def tell_model_outcome(self, turn) -> str:
         """After an owner turn that opened a Session: settle the pick it ran with, then say in the DM each
-        outcome not yet told, oldest first. The model state is settled whatever happens to the telling
-        (a switch agy refused is dropped, never asked for again); a notice whose card cannot be queued
-        stays owed, the newest UNTOLD_KEEP of them. '' when there was nothing to settle or tell."""
+        outcome not yet told, oldest first. The settlement and the notices it owes are SAVED before any
+        notice is queued, and each notice is queued under its own key, so a connector that stops in
+        between neither asks agy for a refused model again nor queues a notice twice. A notice whose
+        card cannot be queued stays owed, the newest UNTOLD_KEEP of them. '' when there was nothing to
+        settle or tell."""
         state = self.model_state()
         kept = state.get("untold")
         owed = [o for o in (kept if isinstance(kept, list) else [kept]) if isinstance(o, dict)]
-        wanted, outcome, changes = str(state.get("wanted") or ""), "", {}
+        wanted, outcome = str(state.get("wanted") or ""), ""
         if wanted and state.get("told") != wanted and turn.live:
             ran = turn.model or ""
             outcome = "switched" if ran == wanted else "not-switched"
-            owed.append({"picked": wanted, "ran": ran, "room": state.get("asked_in")})
+            owed.append({"picked": wanted, "ran": ran, "room": state.get("asked_in"),
+                         "key": uuid.uuid4().hex, "at": time.time_ns()})
+            owed = owed[-UNTOLD_KEEP:]
             # The model the turn ran on is the one in use, whatever a resumed Session reports of itself.
-            changes = dict(told=wanted, current=ran or state.get("current") or "",
-                           **({} if outcome == "switched" else {"wanted": ""}))
+            self.save_model_state(untold=owed, told=wanted, current=ran or state.get("current") or "",
+                                  **({} if outcome == "switched" else {"wanted": ""}))
         told = ""
         while owed:
             first = owed[0]
@@ -385,13 +390,15 @@ class Connector:
                 card = self.model_card(state, picked=str(first.get("picked") or ""), ran=str(first.get("ran") or ""))
             except ValueError:
                 card = None         # a notice that cannot be drawn is dropped, not kept in the way
-            if card is not None and not self.post_card(first.get("room"), card):
+            if card is not None and not self.post_card(first.get("room"), card, str(first.get("key") or ""),
+                                                       int(first.get("at") or 0)):
                 break
             owed.pop(0)
+            self.save_model_state(untold=list(owed))
             told = "switched" if first.get("picked") == first.get("ran") else "not-switched"
-        owed = owed[-UNTOLD_KEEP:]
-        if changes or owed != ([] if kept is None else kept):
-            self.save_model_state(untold=owed, **changes)
+        if len(owed) > UNTOLD_KEEP:
+            owed = owed[-UNTOLD_KEEP:]
+            self.save_model_state(untold=owed)
         return "untold" if owed else (outcome or told)
 
     def run_turn(self, task_id, headers, prompt, owner):
