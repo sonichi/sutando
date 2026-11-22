@@ -91,7 +91,9 @@ def confined_permissions(codex, platform=None):
     rules = {":minimal": "read", ":project_roots": {".": "read"}}
     if (platform or sys.platform) == "darwin":
         rules.update({"/private/tmp": "deny", "/tmp": "deny"})
-    for folder in link_folders(shutil.which(codex) or codex):
+    # Only an executable that is found: an unresolved name would resolve against the connector's own cwd.
+    exe = shutil.which(codex) if codex else None
+    for folder in link_folders(exe) if exe else ():
         rules[folder] = "read"
     return {"default_permissions": CONFINED_PROFILE, "permissions": {CONFINED_PROFILE: {"filesystem": rules}}}
 NO_REPLY = "[no reply] Codex completed the turn without a message."
@@ -302,7 +304,10 @@ class Connector:
         if confined:
             # A `sandbox` beside the profile wins and the profile is dropped (measured): it is not sent.
             del params["sandbox"]
-            params["config"] = dict(params.get("config") or {}, **confined_permissions(self.args.codex))
+            # The connector knows the server's executable only when it starts it (--server stdio).
+            started_here = getattr(self.args, "server", "stdio") == "stdio"
+            params["config"] = dict(params.get("config") or {},
+                                    **confined_permissions(self.args.codex if started_here else None))
         try:
             res = self.rpc.request("thread/start", params)
         except RuntimeError as e:

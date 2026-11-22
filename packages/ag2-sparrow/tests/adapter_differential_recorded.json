@@ -51,6 +51,7 @@
      "params": {
       "approvalPolicy": "never",
       "config": {
+       "default_permissions": "sparrow_restricted",
        "features": {
         "apps": false,
         "browser_use": false,
@@ -66,11 +67,20 @@
          "enabled": false
         }
        },
+       "permissions": {
+        "sparrow_restricted": {
+         "filesystem": {
+          ":minimal": "read",
+          ":project_roots": {
+           ".": "read"
+          }
+         }
+        }
+       },
        "web_search": "disabled"
       },
       "cwd": "<tmp>",
-      "ephemeral": true,
-      "sandbox": "read-only"
+      "ephemeral": true
      }
     },
     {
@@ -136,7 +146,7 @@
    ],
    "results": {
     "task-1700000000001.txt": "STUB echo: Sutando task task-1700000000001 (source=ag2space, channel_id=!room:ag2.space, ac [sandbox=read-only ephemeral=False cwd=<base>/basic]\n",
-    "task-1700000000002.txt": "STUB echo: Sutando task task-1700000000002 (source=ag2space, channel_id=!room:ag2.space, ac [sandbox=read-only ephemeral=True cwd=<tmp>]\n",
+    "task-1700000000002.txt": "STUB echo: Sutando task task-1700000000002 (source=ag2space, channel_id=!room:ag2.space, ac [sandbox=None ephemeral=True cwd=<tmp>]\n",
     "task-1700000000003.txt": "STUB echo: Sutando task task-1700000000003 (source=ag2space, channel_id=?, access_tier=owne [sandbox=read-only ephemeral=False cwd=<base>/basic]\n",
     "task-1700000000004.txt": "STUB echo: Sutando task task-1700000000004 (source=ag2space, channel_id=!other:ag2.space, a [sandbox=read-only ephemeral=False cwd=<base>/basic]\n"
    },
@@ -156,7 +166,7 @@
       "turn_s": "<n>"
      },
      {
-      "chars": 159,
+      "chars": 154,
       "declined": [],
       "detect_s": "<n>",
       "file_to_file_s": "<n>",
@@ -653,5 +663,8 @@
  },
  "no_integrations_rerecorded": {
   "why": "a restricted codex thread first reads the effective config (config/read) and starts with every MCP server it names disabled, web search off and the connector features off (thread/start config); with that call and key removed the recording equals the previous one"
+ },
+ "confined_rerecorded": {
+  "why": "a restricted codex thread starts under the sparrow_restricted permissions profile and without the `sandbox` param, which would win over the profile (thread/start config and params; the stub's echo of the thread's sandbox, and so the result's length, follow). The two macOS-only /tmp deny rules are left out by the driver so the recording is one for every host; with those changes removed the recording equals the previous one"
  }
 }

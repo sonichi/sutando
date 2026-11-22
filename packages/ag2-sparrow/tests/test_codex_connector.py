@@ -888,7 +888,8 @@ class EdgePathTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             real = Path(d).resolve() / "store" / "releases" / "1.0" / "bin"
             real.mkdir(parents=True)
-            (real / "codex").write_text("")
+            (real / "codex").write_text("#!/bin/sh\n")
+            (real / "codex").chmod(0o755)
             (Path(d).resolve() / "store" / "current").symlink_to("releases/1.0")
             shim = Path(d).resolve() / "cli" / "bin"
             shim.mkdir(parents=True)
@@ -901,6 +902,10 @@ class EdgePathTest(unittest.TestCase):
             self.assertEqual(sorted(k for k, v in mac.items() if v == "read"), sorted([":minimal"] + folders))
             linux = cc.confined_permissions(str(shim / "codex"), "linux")["permissions"][cc.CONFINED_PROFILE]["filesystem"]
             self.assertNotIn("/tmp", linux, "a Linux turn's scratch dir is under /tmp")
+            # A name that resolves to nothing adds no folder: against the cwd it would open the work root.
+            for unknown in ("no-such-codex-anywhere", None, ""):
+                rules = cc.confined_permissions(unknown, "linux")["permissions"][cc.CONFINED_PROFILE]["filesystem"]
+                self.assertEqual(rules, {":minimal": "read", ":project_roots": {".": "read"}}, unknown)
 
     def test_result_bodies_are_plain_text(self):
         args = cc.build_parser().parse_args(["--work", "w"])
