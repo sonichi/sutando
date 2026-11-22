@@ -31,8 +31,17 @@ def path_of(work) -> str:
     return os.path.join(str(work), "state", NAME)
 
 
-# Control characters (C0, DEL, C1) and the Unicode line and paragraph separators: what a terminal acts on.
-_CONTROL = dict.fromkeys(list(range(0x20)) + list(range(0x7f, 0xa0)) + [0x2028, 0x2029], " ")
+# Control characters (C0, DEL, C1), the Unicode line and paragraph separators, and the bidi embedding,
+# override and isolate marks: what a terminal acts on, or what makes a line read in another order.
+_CONTROL = dict.fromkeys(list(range(0x20)) + list(range(0x7f, 0xa0)) + [0x2028, 0x2029] +
+                         list(range(0x202a, 0x202f)) + list(range(0x2066, 0x206a)), " ")
+
+
+def shown(data: bytes) -> str:
+    """Whole lines of the log as a viewer may be shown them: the newlines kept, everything else a
+    terminal would act on made a space. The writer already does this; the reader does it again, for a
+    log an older build wrote or anything else that reached the file."""
+    return "".join(ln.translate(_CONTROL) + "\n" for ln in data.decode("utf-8", "replace").split("\n")[:-1])
 
 
 def _one_line(text, limit=LINE_MAX) -> str:
@@ -114,22 +123,23 @@ def follow(path, out=None, stop=lambda: False, sleep=time.sleep, first=SHOWN_FIR
     """Print the end of the log, then every line added to it, until `stop()`. A log that is not there
     yet is waited for; one that starts over (it shrank, or was replaced) is read again from its start."""
     out = out or sys.stdout
-    path, shown, at, ident = str(path), False, 0, None
+    path, said, at, ident, last = str(path), False, 0, None, b""
     while not stop():
         try:
             st = os.stat(path)
         except OSError:
             st = None
         if st is None:
-            if not shown:
+            if not said:
                 out.write(WAITING + "\n")
                 out.flush()
-                shown = True
+                said = True
             sleep(POLL_S)
             continue
         now = (st.st_dev, st.st_ino)
         if ident != now or st.st_size < at:
-            at = 0 if ident is not None else _start_of_last(path, st.st_size, first)
+            # A log trimmed to its own tail still holds the last line shown: go on from there.
+            at = _after(path, last) if ident is not None else _start_of_last(path, st.st_size, first)
             ident = now
         if st.st_size > at:
             try:
@@ -140,16 +150,31 @@ def follow(path, out=None, stop=lambda: False, sleep=time.sleep, first=SHOWN_FIR
                 data = b""
             keep = data.rfind(b"\n") + 1        # a half-written line is left for the next look
             if keep:
-                out.write(data[:keep].decode("utf-8", "replace"))
+                out.write(shown(data[:keep]))
                 out.flush()
                 at += keep
-                shown = True
+                said = True
+                last = data[:keep].rstrip(b"\n").rpartition(b"\n")[2] or last
                 continue
-        if not shown:
+        if not said:
             out.write(WAITING + "\n")
             out.flush()
-            shown = True
+            said = True
         sleep(POLL_S)
+
+
+def _after(path, last: bytes) -> int:
+    """Where to read on in a log that started over: just past the last line already shown when the
+    new file still holds it (a trim keeps the tail), else its start."""
+    if not last:
+        return 0
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return 0
+    found = (b"\n" + data).rfind(b"\n" + last + b"\n")
+    return found + len(last) + 1 if found >= 0 else 0
 
 
 def _start_of_last(path, size, lines) -> int:

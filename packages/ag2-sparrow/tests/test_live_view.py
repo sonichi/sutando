@@ -60,7 +60,7 @@ class Writing(Base):
     def test_nothing_written_can_drive_the_viewers_terminal(self):
         """An escape sequence, a carriage return or a bell in the agent's words, a command or a sender's
         message reaches the log as spaces: the view shows text, it never acts on it."""
-        nasty = "\x1b]0;title\x07\x1b[2J\x1b[31mred\r\x08over\x9b31m\u2028next\x00\x7f"
+        nasty = "\x1b]0;title\x07\x1b[2J\x1b[31mred\r\x08over\x9b31m\u2028next\x00\x7f\u202e\u2066"
         self.w.turn("Bob" + nasty, "hi" + nasty)
         self.w.say("words " + nasty + "\nmore\n")
         self.w.step("ran", "echo " + nasty, "exit " + nasty)
@@ -68,8 +68,8 @@ class Writing(Base):
         raw = self.path.read_bytes()
         text = raw.decode("utf-8")
         for ch in text:
-            self.assertTrue(ch == "\n" or (ord(ch) >= 0x20 and not 0x7f <= ord(ch) < 0xa0 and ch not in "\u2028\u2029"),
-                            repr(ch))
+            self.assertTrue(ch == "\n" or (ord(ch) >= 0x20 and not 0x7f <= ord(ch) < 0xa0
+                                            and ch not in "\u2028\u2029\u202e\u2066"), repr(ch))
         self.assertIn("words ]0;title [2J [31mred over 31m next", text)
         self.assertEqual(text.count("\n"), 7, "and it starts no line of its own")
 
@@ -113,6 +113,32 @@ class Following(Base):
         # An empty log says it is waiting, once.
         self.path.write_text("")
         self.assertEqual(self.follow([lambda: None, lambda: None]).splitlines(), [live_view.WAITING])
+
+    def test_a_log_someone_else_wrote_is_shown_as_inert_text(self):
+        """The reader does not trust the file: a log an older build wrote, or anything appended to it,
+        cannot drive the viewer's terminal either."""
+        self.path.parent.mkdir(parents=True)
+        self.path.write_bytes(b"old \x1b]0;title\x07\x1b[2Jline\r\x08x\n")
+        added = "new \x1b[31mred \u202egnp.exe\u2069\n".encode()
+
+        def append():
+            with open(self.path, "ab") as f:
+                f.write(added)
+        got = self.follow([append, lambda: None])
+        self.assertEqual(got.splitlines(), ["old  ]0;title  [2Jline  x", "new  [31mred  gnp.exe "])
+        self.assertTrue(all(ch == "\n" or ch.isprintable() for ch in got), repr(got))
+
+    def test_a_log_trimmed_to_its_tail_does_not_repeat_what_was_shown(self):
+        for n in range(50):
+            self.w.line("line %d" % n)
+
+        def trim_and_add():
+            kept = "".join("line %d\n" % n for n in range(40, 50))
+            Path(str(self.path) + ".new").write_text(kept)
+            os.replace(str(self.path) + ".new", str(self.path))
+            self.w.line("after the trim")
+        got = self.follow([lambda: None, trim_and_add, lambda: None], first=3)
+        self.assertEqual(got.splitlines(), ["line 47", "line 48", "line 49", "after the trim"])
 
     def test_a_half_written_line_is_not_shown_until_it_ends(self):
         self.path.parent.mkdir(parents=True)
