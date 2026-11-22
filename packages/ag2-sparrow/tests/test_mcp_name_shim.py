@@ -120,6 +120,19 @@ class ShimTest(unittest.TestCase):
         self.assertEqual(got[3:], [3, None], "a malformed entry is left as it came")
         self.assertEqual({names.server_name(got[0]), names.server_name(got[1])}, {"a.b", "a_b"})
 
+    def test_an_alias_keeps_its_server_tool_across_pages_and_later_lists(self):
+        names = shim.Names()
+        first = [{"name": "a.b"}]
+        names.rename_tools(first)
+        later = [{"name": "a_b"}]   # another page, or a refresh, lists a tool with the same alias
+        names.rename_tools(later)
+        self.assertEqual((first[0]["name"], later[0]["name"]), ("a_b", "a_b_2"))
+        self.assertEqual((names.server_name("a_b"), names.server_name("a_b_2")), ("a.b", "a_b"),
+                         "the alias the policy granted still forwards to the tool it was granted for")
+        again = [{"name": "a_b"}, {"name": "a.b"}]
+        names.rename_tools(again)
+        self.assertEqual([t["name"] for t in again], ["a_b_2", "a_b"])
+
     def test_every_alias_fits_agys_prefixed_name_rule(self):
         for name in SERVER_TOOLS + ["x." * 40, "a" * 80]:
             self.assertRegex("mcp_ag2-space_" + shim.alias(name), r"^[a-zA-Z0-9_-]{1,64}$", name)

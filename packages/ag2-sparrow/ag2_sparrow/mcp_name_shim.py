@@ -81,8 +81,9 @@ class Names:
         self.lock = threading.Lock()
 
     def rename_tools(self, tools):
+        """Rename in place; an alias once handed out keeps its server tool across pages and later lists."""
         with self.lock:
-            taken = {}
+            taken = dict(self.to_server)
             for tool in tools:
                 name = tool.get("name") if isinstance(tool, dict) else None
                 if not isinstance(name, str) or not name:
@@ -93,7 +94,7 @@ class Names:
                     safe, n = alias(name)[:ALIAS_MAX - len(suffix)] + suffix, n + 1
                 taken[safe] = name
                 tool["name"] = safe
-            self.to_server.update(taken)
+            self.to_server = taken
 
     def server_name(self, name):
         with self.lock:
