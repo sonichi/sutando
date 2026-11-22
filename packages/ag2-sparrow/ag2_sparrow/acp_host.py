@@ -212,7 +212,9 @@ def decide_permission(params, owner, cwd, command_ok=None, own_file=None, comman
         else:
             verdict = (False, command_refused)
     elif mcp is not None:
-        if mcp_tool_ok is None:
+        if mcp == CONFLICT:
+            verdict = (False, "the request names two different MCP tools")
+        elif mcp_tool_ok is None:
             verdict = (False, "no MCP tool is granted on this turn")
         elif mcp_tool_ok(*mcp):
             verdict = (True, "MCP tool %s/%s" % mcp)
@@ -255,22 +257,41 @@ _IDENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 AGY_MCP_NAME_RE = re.compile(r"mcp_([A-Za-z0-9-]+)_([A-Za-z0-9_-]{1,64})")
 
 
+# Any field that names a server or a tool, wherever a request may carry one; all must agree with the identity.
+SERVER_CLAIM_KEYS = frozenset({"serverName", "mcpServer", "server", "ServerName"})
+TOOL_CLAIM_KEYS = frozenset({"toolName", "mcpTool", "tool", "ToolName"})
+CONFLICT = ("", "")   # an identity two fields of the request disagree on: refused, never matched
+
+
+def _same_tool(a, b):
+    return a.replace("_", ".") == b.replace("_", ".")   # a shim alias and the server's dotted name
+
+
 def mcp_tool_identity(tool_call):
-    """(server, tool) when the request names an MCP server and tool in structured fields (`MCP_IDENTITY_KEYS`),
-    both plain identifiers; None otherwise. The title is the agent's free text and never read here."""
+    """(server, tool) when the request names an MCP server and tool: agy's `name` (`mcp_<server>_<tool>`), else
+    a structured pair (`MCP_IDENTITY_KEYS`) on the toolCall or its `_meta`, both plain identifiers; CONFLICT when
+    any other server or tool field (toolCall, `_meta`, `rawInput`, `args`) disagrees; None otherwise. The title
+    is the agent's free text and never read here."""
+    holders = [h for h in (tool_call, tool_call.get("_meta"), tool_call.get("rawInput"), tool_call.get("args"))
+               if isinstance(h, dict)]
     name = tool_call.get("name")
     agy = AGY_MCP_NAME_RE.fullmatch(name) if isinstance(name, str) else None
-    if agy:
-        return agy.group(1), agy.group(2)
-    for holder in (tool_call, tool_call.get("_meta")):
-        if not isinstance(holder, dict):
-            continue
+    found = (agy.group(1), agy.group(2)) if agy else None
+    for holder in holders[:2] if found is None else ():
         for skey, tkey in MCP_IDENTITY_KEYS:
             server, tool = holder.get(skey), holder.get(tkey)
             if isinstance(server, str) and isinstance(tool, str) and _IDENT_RE.fullmatch(server) \
                     and _IDENT_RE.fullmatch(tool):
-                return server, tool
-    return None
+                found = found or (server, tool)
+    if found is None:
+        return None
+    for holder in holders:
+        for key, value in holder.items():
+            if key in SERVER_CLAIM_KEYS and value != found[0]:
+                return CONFLICT
+            if key in TOOL_CLAIM_KEYS and not (isinstance(value, str) and _same_tool(value, found[1])):
+                return CONFLICT
+    return found
 
 
 def _key_names(obj):

@@ -800,6 +800,32 @@ class SspaceToolsTest(unittest.TestCase):
         self.assertFalse(decide(call("mcp_ag2-space_room_actions_search"), grant=False)[0], "a guest turn grants no MCP tool")
         self.assertFalse(decide(call("mcp_ag2-space_room_actions_search", kind="execute"))[0], "a command stays refused")
 
+    def test_every_identity_field_of_a_request_must_agree(self):
+        def call(**extra):
+            tc = {"kind": "other", "name": "mcp_ag2-space_room_actions_search", "rawInput": {"query": "page"},
+                  "args": {"query": "page"}, "title": "t", "toolCallId": "t1"}
+            for where, fields in extra.items():
+                if where == "top":
+                    tc.update(fields)
+                else:
+                    tc[where] = dict(tc.get(where) or {}, **fields)
+            return acp_host.decide_permission({"toolCall": tc, "options": OPTS}, True, str(self.w.cwd),
+                                              mcp_tool_ok=gc.mcp_auth.owner_tool_ok)[:2]
+        agree = [{"_meta": {"serverName": "ag2-space", "toolName": "room.actions.search"}},
+                 {"top": {"serverName": "ag2-space", "toolName": "room_actions_search"}},
+                 {"rawInput": {"server": "ag2-space"}}]
+        for fields in agree:
+            self.assertTrue(call(**fields)[0], fields)
+        disagree = [{"_meta": {"serverName": "other", "toolName": "room.actions.search"}},
+                    {"_meta": {"serverName": "ag2-space", "toolName": "room.action.execute"}},
+                    {"top": {"toolName": "agent.unlink"}}, {"rawInput": {"server": "evil"}},
+                    {"args": {"tool": "relay.token.issue"}}, {"rawInput": {"ServerName": "x"}},
+                    {"_meta": {"toolName": ["room.actions.search"]}}]
+        for fields in disagree:
+            self.assertEqual(call(**fields), (False, "the request names two different MCP tools"), fields)
+        self.assertIsNone(acp_host.mcp_tool_identity({"name": "read_file", "rawInput": {"server": "x"}}),
+                          "a field alone names no MCP tool")
+
     def test_the_policy_maps_mcp_calls_by_server_and_tool_never_by_title(self):
         def decide(tool_call, owner=True):
             return acp_host.decide_permission({"toolCall": tool_call, "options": OPTS}, owner, str(self.w.cwd),
