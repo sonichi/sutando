@@ -244,9 +244,8 @@ class Connector:
             log("refused (non-owner) ->", task_id, headers["access_tier"])
             publish(result_file, NON_OWNER_REFUSED)
             return {"task": task_id, "status": "refused", "tier": headers["access_tier"]}
-        # Team (an attested collaborator) gets the owner's turn and policy; from here `tier` names the turn, and
-        # headers["access_tier"] still names the sender (so shell_web_on stays off for Team). Any other admitted
-        # sender gets `guest_turn`.
+        # Team (an attested collaborator) gets the owner's turn; `tier` now names the turn, headers["access_tier"]
+        # the sender (so shell_web_on stays off for Team). Any other admitted sender gets `guest_turn`.
         if tier == "collaborator":
             tier = "owner"
         prompt = wake_prompt(task_id, headers, message, operator_lines, self.args.cwd if tier == "owner" else None,
