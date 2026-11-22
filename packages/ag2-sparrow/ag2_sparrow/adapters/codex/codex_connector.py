@@ -529,7 +529,7 @@ class Connector:
             rec = {"task": task_id, "status": status, "chars": len(out), "tier": headers["access_tier"],
                    "detect_s": round(t_seen - t_mtime, 3), "turn_s": round(t_done - t_sent, 3),
                    "file_to_file_s": round(t_result - t_mtime, 3), "thread": self.last_thread,
-                   "declined": list(self.declined), "items": dict(self.turn_items)}
+                   "declined": list(self.declined)}
             self.declined = []
             if policy.capabilities.session != "durable":
                 self.thread_id = None         # the ephemeral thread is never reused
