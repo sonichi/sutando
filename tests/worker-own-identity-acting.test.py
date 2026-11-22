@@ -8,8 +8,9 @@ uses it. `connections.acting_identity` is the one rule, reached by every room cl
 - In the worker's session a room on its agent's server resolves to the worker's own row, its
   token (the vault's) and its agent. The core's session, another worker's session and a room on
   another server never do.
-- A room local state says is the core's stays the core's: one where only a core lane has a task
-  open, and a core lane's own owner DM.
+- Identity comes from the task: a task addressed to the worker's agent is answered as it, one
+  addressed to the core's as the core; an unprompted post is the worker's own, except in a core
+  lane's own owner DM. A room nothing serves is refused, never sent with the shared token.
 - room_ops and task-progress send that worker's bearer, with no change of their own.
 - A task's rows in the local activity log name the agent the task is answered as, so a reader
   need not assume every row is the core's.
@@ -155,32 +156,74 @@ class NeverSomeoneElses(Base):
             self.assertIn(SEAT_VAR, (scripts / launcher).read_text(), launcher)
 
 
-class TheCoresRooms(Base):
-    def test_a_task_only_a_core_lane_holds_is_answered_as_the_core(self):
-        self.open_task("alpha", ROOM)
-        self.assertEqual(self.instance(ROOM, SEAT), "alpha")
+class IdentityComesFromTheTask(Base):
+    """Which lane once handled a room never decides: its task ledger outlives every task in it."""
 
-    def test_a_task_its_own_lane_holds_is_its_own_whatever_the_core_holds(self):
+    def instance_for(self, room, environ, task_agent):
+        r = C.connection_for_room(room, self.ws, environ, task_agent)
+        return None if r is None else r["instance"]
+
+    def test_its_own_task_is_its_own_even_where_a_stale_core_entry_names_the_room(self):
         self.open_task("alpha", ROOM)
-        self.open_task(OWN, ROOM)
+        self.assertEqual(self.instance_for(ROOM, SEAT, OWN_AGENT), OWN)
         self.assertEqual(self.instance(ROOM, SEAT), OWN)
 
+    def test_a_core_task_it_answers_is_answered_as_the_core(self):
+        self.assertEqual(self.instance_for(ROOM, SEAT, CORE_AGENT), "alpha")
+        self.assertEqual(self.instance_for(BETA_ROOM, SEAT, BETA_AGENT), "beta")
+
+    def test_a_core_task_is_the_cores_row_even_with_one_core_connection(self):
+        self.record([r for r in rows() if r["instance"] != "beta"])
+        self.assertEqual(self.instance_for(ROOM, SEAT, CORE_AGENT), "alpha")
+        self.assertEqual(C.room_credential(ROOM, workspace=self.ws, environ=SEAT, task_agent=CORE_AGENT),
+                         (ALPHA, ALPHA + "|core-secret"))
+
+    def test_an_unprompted_post_is_its_own(self):
+        self.open_task("alpha", ROOM)
+        self.open_task("beta", ROOM)
+        self.assertEqual(self.instance(ROOM, SEAT), OWN)
+        self.assertEqual(self.instance("!bare", SEAT), OWN)
+
+    def test_no_identity_for_the_room_is_refused_never_the_shared_token(self):
+        with self.assertRaises(C.NoConnectionForRoom):
+            C.connection_for_room("!r:gamma-fixture.net", self.ws, SEAT)
+        self.record([r for r in rows() if r["instance"] != "beta"])
+        for agent in ("", BETA_AGENT):
+            with self.subTest(task_agent=agent), self.assertRaises(C.NoConnectionForRoom):
+                C.connection_for_room(BETA_ROOM, self.ws, SEAT, agent)
+
+    def test_the_core_session_ignores_the_task_agent(self):
+        self.assertEqual(self.instance_for(ROOM, CORE_ENV, OWN_AGENT), "alpha")
+        self.record([r for r in rows() if r["instance"] != "beta"])
+        self.assertIsNone(self.instance_for(ROOM, CORE_ENV, OWN_AGENT))
+        C.record_path(self.ws).unlink()
+        self.assertIsNone(self.instance_for(ROOM, SEAT, OWN_AGENT))
+
+    def test_the_task_file_names_the_agent(self):
+        tasks = self.ws / "tasks"
+        tasks.mkdir()
+        addressed = tasks / "task-abc123.txt"
+        addressed.write_text(f"id: task-abc123\nreceiving_instance: {CORE_AGENT}\ntask: hi\n")
+        by_lane = tasks / f"task-{OWN}~abc123.txt"
+        by_lane.write_text(f"id: task-{OWN}~abc123\ntask: hi\n")
+        self.assertEqual(C.task_answer_agent(addressed, self.ws), CORE_AGENT)
+        self.assertEqual(C.task_answer_agent(by_lane, self.ws), OWN_AGENT)
+        self.assertEqual(C.task_answer_agent(tasks / "gone.txt", self.ws), "")
+
+
+class TheCoresOwnerDM(Base):
     def test_the_cores_owner_dm_stays_the_cores(self):
         self.owner_dm("alpha", CORE_AGENT, CORE_DM)
         self.assertEqual(self.instance(CORE_DM, SEAT), "alpha")
         self.assertEqual(self.instance(ROOM, SEAT), OWN)
 
-    def test_a_core_bridge_running_under_a_launch_key_alias_keeps_both(self):
+    def test_a_core_bridge_running_under_a_launch_key_alias_keeps_its_owner_dm(self):
         self.record(rows(core={"launch_keys": [C.token_ref_for("alias")]}))
         for name in ("alpha", "alias"):
             with self.subTest(owner_dm_written_as=name):
                 self.owner_dm(name, CORE_AGENT, CORE_DM)
                 self.assertEqual(self.instance(CORE_DM, SEAT), "alpha")
                 (self.ws / "state" / f"owner-routing.{name}.json").unlink()
-            with self.subTest(task_rooms_written_as=name):
-                self.open_task(name, ROOM)
-                self.assertEqual(self.instance(ROOM, SEAT), "alpha")
-                (self.ws / "state" / f"remote-task-rooms.{name}.json").unlink()
         self.assertEqual(self.instance(CORE_DM, SEAT), OWN)
         self.assertEqual(C.task_agent_mxid("task-alias~abc123", self.ws), CORE_AGENT)
 
@@ -191,11 +234,6 @@ class TheCoresRooms(Base):
         (self.ws / "state" / "owner-routing.alias.json").write_text(json.dumps(
             {"owner_dm": CORE_DM, "private": False, "identity": CORE_AGENT}))
         self.assertEqual(self.instance(CORE_DM, SEAT), OWN)
-
-    def test_a_room_id_naming_no_server_follows_the_lane_that_holds_it(self):
-        self.open_task(OWN, "!bare")
-        self.assertEqual(self.instance("!bare", SEAT), OWN)
-        self.assertEqual(self.instance("!other", SEAT), "alpha")
 
 
 class RoomClients(Base):
@@ -219,6 +257,24 @@ class RoomClients(Base):
         VAULT.clear()
         with mock.patch.dict("os.environ", SEAT), self.assertRaises(_gateway.RoomConnectionError):
             _gateway.gateway(ROOM)
+
+    def test_a_task_file_makes_room_ops_answer_as_the_agent_it_was_addressed_to(self):
+        task = self.ws / "tasks" / "task-abc123.txt"
+        task.parent.mkdir()
+        task.write_text(f"id: task-abc123\nreceiving_instance: {CORE_AGENT}\ntask: hi\n")
+        self.addCleanup(_gateway.set_task_file, None)
+        _gateway.set_task_file(str(task))
+        with mock.patch.dict("os.environ", SEAT):
+            self.assertEqual(_gateway.gateway(ROOM)[1]["Authorization"], "Bearer core-secret")
+            self.assertEqual(notify._gateway_config("ag2space", ROOM, str(task)), (ALPHA, "core-secret"))
+        _gateway.set_task_file(None)
+        self.assertEqual(self.bearer(SEAT), "own-secret")
+
+    def test_a_room_no_identity_serves_is_refused_by_both_clients(self):
+        with mock.patch.dict("os.environ", SEAT), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(_gateway.RoomConnectionError):
+                _gateway.gateway("!r:gamma-fixture.net")
+            self.assertIsNone(notify._gateway_config("ag2space", "!r:gamma-fixture.net"))
 
 
 class WhoATaskIsAnsweredAs(Base):

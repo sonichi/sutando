@@ -277,22 +277,23 @@ def _load_channel_env_containment():
 _channel_env_is_contained = _load_channel_env_containment()
 
 
-def _room_credential(room_id: str):
-    """`connections.room_credential` for the room: (url, token), None to keep the
-    source's own chain, or False when it refused (reason printed)."""
+def _room_credential(room_id: str, task_file: str = ""):
+    """`connections.room_credential` for the room, answering `task_file`'s task: (url, token),
+    None to keep the source's own chain, or False when it refused (reason printed)."""
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
         import connections  # type: ignore
     except Exception:
         return None
     try:
-        return connections.room_credential(room_id)
+        agent = connections.task_answer_agent(task_file) if task_file else ""
+        return connections.room_credential(room_id, task_agent=agent)
     except connections.ConnectionsError as e:
         print(f"[task-progress] {e}", file=sys.stderr)
         return False
 
 
-def _gateway_config(source: str, room_id: str = "") -> "tuple[str, str] | None":
+def _gateway_config(source: str, room_id: str = "", task_file: str = "") -> "tuple[str, str] | None":
     """(url, token) for a gateway-bridged source, or None (reason already
     printed). Shared by the text and media senders so the two cannot drift."""
     if not _SOURCE_SLUG_RE.match(source or ""):
@@ -300,7 +301,7 @@ def _gateway_config(source: str, room_id: str = "") -> "tuple[str, str] | None":
               "provider names are lowercase slugs; dots allowed only between "
               "alphanumerics (e.g. dev.ag2.space)", file=sys.stderr)
         return None
-    routed = _room_credential(room_id)
+    routed = _room_credential(room_id, task_file)
     if routed is False:
         return None
     if routed is not None:
@@ -374,7 +375,7 @@ def _event_id_or_empty(raw: str | None, field: str) -> "str | None":
 
 def send_remote_gateway(source: str, channel_id: str, message: str,
                         thread_root: str | None = None, reply_to: str | None = None,
-                        extra: dict | None = None) -> bool:
+                        extra: dict | None = None, task_file: str = "") -> bool:
     """Generic sender for gateway-bridged channels (any --source with a
     channels/<source>/.env carrying REMOTE_TASK_URL + REMOTE_TASK_TOKEN).
 
@@ -389,7 +390,7 @@ def send_remote_gateway(source: str, channel_id: str, message: str,
     reply_to = _event_id_or_empty(reply_to, "reply_to")
     if reply_to is None:
         return False
-    cfg = _gateway_config(source, channel_id)
+    cfg = _gateway_config(source, channel_id, task_file)
     if cfg is None:
         return False
     url, token = cfg
@@ -697,7 +698,7 @@ def main() -> int:
         ok = send_telegram(channel, message)
     else:
         ok = send_remote_gateway(source, channel, message, thread_root=thread_root,
-                                 reply_to=reply_to, extra=extra)
+                                 reply_to=reply_to, extra=extra, task_file=str(payload or args.task_file or ""))
 
     if ok:
         _record_sent(args.task_file)

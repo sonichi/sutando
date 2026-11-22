@@ -85,7 +85,10 @@ does the privileged Matrix ops + authoritative membership enforcement.
 
 On an install connected to several servers, a verb that names a room acts through the connection
 serving that room's server. `rooms`, `history`, `agents`, `resolve` and `events list|pull|stream`
-name none, so they act through the primary connection only.
+name none, so they act through the primary connection only. In a pool worker's session, pass
+`--task-file <task>` to `say`, `send`, `mention`, `react` or `unreact` when the post answers a
+task: it posts as the agent the task was addressed to. Without it the post is the worker's own,
+and a room none of its identities serves is refused rather than sent with the shared token.
 
 ```bash
 python3 skills/agent-room-ops/room_ops.py read   '!room:hs' --limit 20 --agent '@a:hs'
