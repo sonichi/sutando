@@ -3136,7 +3136,12 @@ def _tier_for(user_id, attested_tier=None):
 # A gateway can hand the task body a media MARKER instead of raw bytes:
 MEDIA_MARKER_TAG = re.sub(r"[^A-Za-z0-9_-]", "",
                           os.environ.get("REMOTE_MEDIA_MARKER") or "remote-media")
-MEDIA_MARKER_RE = re.compile(r"\[" + re.escape(MEDIA_MARKER_TAG) + r":([^\]]*)\]")
+# AG2 Space's gateway tag: seat bridges set no REMOTE_MEDIA_MARKER, so unset it is resolved too (a live
+# Antigravity turn got the raw URL, 2026-11-21); an explicit REMOTE_MEDIA_MARKER is the only tag.
+AG2_MEDIA_MARKER_TAG = "ag2space-media"
+MEDIA_MARKER_TAGS = ((MEDIA_MARKER_TAG,) if os.environ.get("REMOTE_MEDIA_MARKER")
+                     else (MEDIA_MARKER_TAG, AG2_MEDIA_MARKER_TAG))
+MEDIA_MARKER_RE = re.compile(r"\[(?:" + "|".join(map(re.escape, MEDIA_MARKER_TAGS)) + r"):([^\]]*)\]")
 
 HS_MEDIA_TOKEN = _FOUND.media_token
 diagnostics.register_secret(HS_MEDIA_TOKEN)
@@ -3145,6 +3150,8 @@ diagnostics.register_secret(HS_MEDIA_TOKEN)
 HS_MEDIA_ORIGIN = (os.environ.get("REMOTE_MEDIA_HS_ORIGIN") or "").rstrip("/")
 MEDIA_DIR = Path(os.environ.get("REMOTE_MEDIA_DIR") or str(_STATE / "remote-media"))
 MAX_MEDIA_BYTES = int(os.environ.get("REMOTE_MEDIA_MAX_BYTES") or str(25 * 1024 * 1024))
+# How many markers one task may make us download (its own and the replied-to message's together).
+MAX_MEDIA_PER_TASK = 10
 _EXT_BY_MIME = {
     "image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg",
     "image/gif": ".gif", "image/webp": ".webp", "image/svg+xml": ".svg",
@@ -4548,10 +4555,53 @@ def _diagnostic_health(health: "dict | None") -> "dict | None":
     return {**row, "condition": "abnormal", "reason": "health-check", "since": ts}
 
 
+# The core's recovery record (core_recovery.v1), read by the adapter's injected reader; a
+# standalone sparrow and a pool worker's lane have none, and their beats carry no such block.
+_CORE_RECOVERY_READER = globals().get("_SUTANDO_CORE_RECOVERY_READER")
+CORE_RECOVERY_CAPABILITY = "core_recovery.v1"
+CORE_RECOVERY_MAX_BYTES = 4096
+# A broker that refuses the beat with the block gets beats without it for this long.
+CORE_RECOVERY_REFUSED_BACKOFF_S = 3600.0
+_core_recovery_refused_until = 0.0
+_core_recovery_logged = None
+
+
+def _log_recovery_sent(payload: dict) -> None:
+    """One log line per change of the record the broker accepted: its state and incident, the
+    proof a live run reads that health.recovery left the Mac. Nothing else of it is logged."""
+    global _core_recovery_logged
+    rec = (payload.get("health") or {}).get("recovery")
+    key = (rec.get("state"), rec.get("incident")) if isinstance(rec, dict) else None
+    if key is not None and key != _core_recovery_logged:
+        _log(f"heartbeat carried {CORE_RECOVERY_CAPABILITY}: state={key[0]} incident={key[1]}")
+    _core_recovery_logged = key
+
+
+def _core_recovery() -> "dict | None":
+    """The adapter's record when it has one and it fits the bound, else None. Never raises."""
+    if not callable(_CORE_RECOVERY_READER) or time.time() < _core_recovery_refused_until:
+        return None
+    try:
+        rec = _CORE_RECOVERY_READER()
+        if isinstance(rec, dict) and len(json.dumps(rec)) <= CORE_RECOVERY_MAX_BYTES:
+            return rec
+    except Exception:  # noqa: BLE001 -- the record is advisory; the beat goes out without it
+        pass
+    return None
+
+
+def _with_recovery(health: "dict | None") -> "dict | None":
+    rec = _core_recovery()
+    if rec is None:
+        return health
+    return {**(health or {"alive": None, "motion": "unknown"}), "recovery": rec}
+
+
 def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     """Best-effort liveness + core-status ping. Liveness feeds hosted dashboards;
     the status/step feed the broker's presence sweep (agent working/available/…)."""
     global _heartbeat_retry_at, _heartbeat_backoff, _last_heartbeat_at, _last_core_health
+    global _core_recovery_refused_until
     now = time.time()
     # Ahead of every early return: a Stop reaches a running task only through these beats.
     _post_task_beats(inflight, force=force)
@@ -4561,7 +4611,8 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
     health = (health_command.with_motion(_HEALTH_COMMAND.row(), bool(inflight))
               if _HEALTH_COMMAND else _core_health(_health_snapshot()))
     core_health = health
-    health = _diagnostic_health(health)
+    base = _diagnostic_health(health)
+    health = _with_recovery(base)
     changed = health is not None and health != _last_core_health
     if not force and not changed and now - _last_heartbeat_at < HEARTBEAT_INTERVAL:
         return False
@@ -4589,7 +4640,22 @@ def _post_heartbeat(inflight: set[str], force: bool = False) -> bool:
         if health is not None:
             payload["health"] = health
             payload["capabilities"].append("worker_health.v1")
-        reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
+            if "recovery" in health:
+                payload["capabilities"].append(CORE_RECOVERY_CAPABILITY)
+        try:
+            reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
+        except urllib.error.HTTPError as e:
+            if e.code not in (400, 422) or "recovery" not in (payload.get("health") or {}):
+                raise
+            _core_recovery_refused_until = time.time() + CORE_RECOVERY_REFUSED_BACKOFF_S
+            _log(f"heartbeat refused with the recovery block: HTTP {e.code} — sending without it")
+            drop = {CORE_RECOVERY_CAPABILITY} | (set() if base is not None else {"worker_health.v1"})
+            payload = {k: v for k, v in payload.items() if k != "health"}
+            payload["capabilities"] = [c for c in payload["capabilities"] if c not in drop]
+            if base is not None:
+                payload["health"] = base
+            reply = _req("POST", "/v1/heartbeat", payload, timeout=10)
+        _log_recovery_sent(payload)
         _heartbeat_retry_at, _heartbeat_backoff = 0.0, 0.0
         _record_setup_hint(reply)
         _refresh_served_setup(reply)
@@ -6032,18 +6098,48 @@ def _same_origin(url: str, base: str) -> bool:
         return False
 
 
-def _under_gateway(url: str) -> bool:
-    """True iff `url` is genuinely gateway-hosted: exact gateway origin AND the
-    path sits at/under the gateway base path with a real `/` boundary (so a
-    base path of `/relay` doesn't match `/relay-evil/...`). Malformed ⇒ False."""
-    if not URL or not _same_origin(url, URL):
-        return False
+# One Matrix server name and one media id, raw: no `%`, so no encoded dot or slash can pass.
+_MEDIA_SERVER = r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,253}[A-Za-z0-9])?(?::[0-9]{1,5})?"
+_MEDIA_ID = r"[A-Za-z0-9_=-]{1,255}"
+_HS_MEDIA_PATH = re.compile(r"/_matrix/(?:client/v1/media/(download|thumbnail)|media/(?:r0|v3)/(download))/"
+                            + _MEDIA_SERVER + "/" + _MEDIA_ID)
+_THUMBNAIL_KEYS = frozenset({"width", "height", "method", "animated"})
+
+
+def _query_only(query: str, allowed: "frozenset[str]") -> bool:
+    """True iff every key of `query` is in `allowed`, each at most once, with plain values."""
     try:
-        base_path = urllib.parse.urlsplit(URL).path.rstrip("/")
-        path = urllib.parse.urlsplit(url).path
+        pairs = urllib.parse.parse_qsl(query, keep_blank_values=True, strict_parsing=bool(query))
     except ValueError:
         return False
-    return path == base_path or path.startswith(base_path + "/")
+    keys = [k for k, _ in pairs]
+    return (all(k in allowed for k in keys) and len(set(keys)) == len(keys)
+            and all(v and v.isprintable() and not any(c.isspace() for c in v) for _, v in pairs))
+
+
+def _media_route(url: str) -> "str | None":
+    """The route: "gateway" for `<gateway base>/v1/media/<server>/<id>` (only `room_id` in the query) on the exact
+    gateway origin, "homeserver" for a Matrix media download/thumbnail on the exact homeserver origin, else None.
+    Matched on the raw URL, so `.`/`..` segments and percent-encoded dots or slashes never match."""
+    if not re.fullmatch(r"[\x21-\x7e]+", url or ""):
+        return None
+    try:
+        u = urllib.parse.urlsplit(url)
+        _ = u.port                         # raises ValueError on a malformed port
+    except ValueError:
+        return None
+    if u.username is not None or u.password is not None or "#" in url or "\\" in url:
+        return None
+    if URL and _same_origin(url, URL):
+        base = urllib.parse.urlsplit(URL).path.rstrip("/")
+        if (re.fullmatch(re.escape(base) + "/v1/media/" + _MEDIA_SERVER + "/" + _MEDIA_ID, u.path)
+                and _query_only(u.query, frozenset({"room_id"}))):
+            return "gateway"
+    if HS_MEDIA_TOKEN and HS_MEDIA_ORIGIN and _same_origin(url, HS_MEDIA_ORIGIN):
+        m = _HS_MEDIA_PATH.fullmatch(u.path)
+        if m and _query_only(u.query, _THUMBNAIL_KEYS if m.group(1) == "thumbnail" else frozenset()):
+            return "homeserver"
+    return None
 
 
 def _download_bytes(url: str, headers: dict, cap: int) -> bytes:
@@ -6052,20 +6148,16 @@ def _download_bytes(url: str, headers: dict, cap: int) -> bytes:
     Authorization header is present, redirects are NOT followed — a
     gateway-controlled URL must not bounce our bearer to another host — and a
     3xx is treated as a FAILURE (raise) so the redirect page's body is never
-    saved as if it were the media."""
+    saved as if it were the media. Redirects are never followed, credentials or not."""
     with gateway_instance.gateway_call(url):  # a gateway-supplied URL, maybe under the gateway's
         req = urllib.request.Request(url, method="GET")
         for k, v in headers.items():
             req.add_header(k, v)
-        if "Authorization" in headers:
-            class _NoRedirect(urllib.request.HTTPRedirectHandler):
-                def redirect_request(self, *a, **kw):  # noqa: D401
-                    return None
-            opener = urllib.request.build_opener(_NoRedirect)
-            resp_ctx = opener.open(req, timeout=30)
-        else:
-            resp_ctx = urllib.request.urlopen(req, timeout=30)
-        with resp_ctx as resp:
+
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **kw):  # noqa: D401
+                return None
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=30) as resp:
             status = getattr(resp, "status", 200)
             if 300 <= status < 400:
                 raise ValueError(f"authenticated media fetch got a redirect ({status})")
@@ -6075,21 +6167,12 @@ def _download_bytes(url: str, headers: dict, cap: int) -> bytes:
     return data
 
 
-def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
-    """If `body` carries a media marker, download the attachment to a local
-    file and rewrite the marker to `[File attached: <path>]`. Returns the body
-    unchanged on any failure (drop-in safe).
-
-    When `_refs_out` is provided and a fetch succeeds, the corresponding
-    `AttachmentRef` (interaction-model 4D, step 1.5) is appended to it — so
-    _write_task can stamp structured `attachments:` headers alongside the legacy
-    body line, without disturbing any of the drop-in-safe early returns."""
-    m = MEDIA_MARKER_RE.search(body or "")
-    if not m:
-        return body
-    inner = m.group(1).strip()
+def _fetch_media_marker(inner: str) -> "tuple[str, Path, object] | None":
+    """Download the attachment one marker's inner text names; (label, local path,
+    AttachmentRef) on success, None on any failure (the caller leaves the marker)."""
+    inner = inner.strip()
     if not inner:
-        return body
+        return None
     parts = inner.split(None, 1)
     url = parts[0]
     attrs = parts[1] if len(parts) > 1 else ""
@@ -6098,30 +6181,25 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
     kind = _marker_attr(attrs, "kind")
 
     if not url.startswith(("https://", "http://")):
-        return body
+        return None
     headers = {"User-Agent": "sutando-gateway-client/1.0"}
-    # Credential routing is by PARSED exact origin, never string prefix or
-    # substring — `https://relay.example.evil/...` must not receive the
-    try:
-        _split = urllib.parse.urlsplit(url)
-        _ = _split.port                    # raises ValueError on a malformed port
-        url_path = _split.path
-    except ValueError:
-        return body                        # unparseable URL — leave marker untouched
-    if _under_gateway(url):
+    # Credential routing is by PARSED exact origin and exact media path, never string prefix or substring.
+    route = _media_route(url)
+    if route == "gateway":
         headers["Authorization"] = f"Bearer {TOKEN}"            # gateway media-proxy
-    elif url_path.startswith("/_matrix/"):
-        if not HS_MEDIA_TOKEN or not HS_MEDIA_ORIGIN or not _same_origin(url, HS_MEDIA_ORIGIN):
-            return body                    # can't auth safely — leave marker
+    elif route == "homeserver":
         url = _to_authed_media_url(url)
         headers["Authorization"] = f"Bearer {HS_MEDIA_TOKEN}"
-    # else: a plain public URL — fetched with no credentials.
+    else:
+        # Only a media path on the configured gateway or homeserver origin is fetched.
+        _log("media URL is not a gateway or homeserver media path — leaving marker as-is")
+        return None
 
     try:
         data = _download_bytes(url, headers, MAX_MEDIA_BYTES)
     except Exception as e:  # noqa: BLE001 — drop-in safe
         _log(f"media fetch failed ({diagnostics.describe(e)}) — leaving marker as-is")
-        return body
+        return None
     try:
         MEDIA_DIR.mkdir(parents=True, exist_ok=True)
         ext = _EXT_BY_MIME.get(mime.lower(), "")
@@ -6138,15 +6216,64 @@ def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
         path = Path(path_str)
     except Exception as e:  # noqa: BLE001
         _log(f"media save failed ({diagnostics.describe(e)}) — leaving marker as-is")
-        return body
+        return None
     _log(f"fetched media → {path} ({len(data)} bytes)")
+    ref = local_task_protocol.AttachmentRef(
+        locator=str(path), mime=mime, filename=(name or path.name), size=len(data))
+    return ("Photo attached" if str(kind) == "m.image" else "File attached"), path, ref
+
+
+def _maybe_fetch_media(body: str, _refs_out: "list | None" = None) -> str:
+    """Download every media marker in `body` (up to MAX_MEDIA_PER_TASK) to a local
+    file and rewrite each to `[File attached: <path>]` (`[Photo attached: …]` for an
+    image). A marker inside the broker's quoted reply-context record is the replied-to
+    message's: it is fetched the same way, rewritten in place to
+    `[… attached (from replied-to message): <path>]` (the record re-encoded, so it stays
+    well-formed quoted data) and listed after the message's own. A marker that cannot
+    be fetched is left as it was (drop-in safe).
+
+    When `_refs_out` is provided, each fetched file's `AttachmentRef`
+    (interaction-model 4D, step 1.5) is appended to it — so _write_task can stamp
+    structured `attachments:` headers alongside the legacy body lines."""
+    if not body or not MEDIA_MARKER_RE.search(body):
+        return body
+    # Only the message itself and the quoted record's `body` are scanned; every other
+    # quoted field stays inert. Each attempt, failed or not, spends one budget slot.
+    tail_at, reply = local_task_protocol.quoted_block_spans(body)
+    if tail_at is None:
+        # A malformed quoted block: no part of it can be told from the sender's own text, so nothing is fetched.
+        _log("malformed reply-context block — no media fetched")
+        return body
+    budget = [MAX_MEDIA_PER_TASK]
+
+    def resolve(segment: str, quoted: bool, refs: list) -> str:
+        def one(m: "re.Match") -> str:
+            if budget[0] <= 0:
+                return m.group(0)
+            budget[0] -= 1
+            got = _fetch_media_marker(m.group(1))
+            if got is None:
+                return m.group(0)
+            label, path, ref = got
+            refs.append(ref)
+            return f"[{label} (from replied-to message): {path}]" if quoted else f"[{label}: {path}]"
+        # Replacement as a FUNCTION so backslashes/`\g<>` in the path can never be
+        # interpreted as re.sub group references.
+        return MEDIA_MARKER_RE.sub(one, segment)
+
+    own_refs: list = []
+    replied_refs: list = []
+    tail = resolve(body[tail_at:], False, own_refs)    # the message's own first
+    head = body[:tail_at]
+    if reply is not None:
+        start, end, record, _label = reply
+        quoted = resolve(record["body"], True, replied_refs)
+        if quoted != record["body"]:
+            record = {**record, "body": quoted}
+            head = body[:start] + json.dumps(record, ensure_ascii=False) + body[end:tail_at]
     if _refs_out is not None:
-        _refs_out.append(local_task_protocol.AttachmentRef(
-            locator=str(path), mime=mime, filename=(name or path.name), size=len(data)))
-    label = "Photo attached" if str(kind) == "m.image" else "File attached"
-    # Replacement as a FUNCTION so backslashes/`\g<>` in the path can never be
-    # interpreted as re.sub group references.
-    return MEDIA_MARKER_RE.sub(lambda _m: f"[{label}: {path}]", body, count=1)
+        _refs_out.extend(own_refs + replied_refs)
+    return head + tail
 
 
 # Fleet-agent directory cache — peer agents (in the broker's /v1/agents) are
@@ -11135,6 +11262,32 @@ def _maybe_start_event_channel() -> None:
         _log(f"event channel start failed (task delivery unaffected): {diagnostics.describe(e)}")
 
 
+AGENT_CARD_SWEEP_S = 2.0
+
+
+def _start_agent_cards() -> None:
+    """Post the agent panel cards this agent's connector queued (connector_cards), on a daemon
+    thread of its own: a card that cannot be posted never touches task delivery."""
+    try:
+        from .connector_cards import Poster
+        poster = Poster(_STATE, lambda payload: _req("POST", "/v1/room", payload, timeout=_ROOM_POST_TIMEOUT_S),
+                        log=_log)
+    except Exception as e:  # noqa: BLE001 - cards are additive
+        _log(f"agent-card: sweep not started: {diagnostics.describe(e)}")
+        return
+
+    # Its own timer, never time.sleep: the poll loop's stall accounting counts every sleep it sees.
+    idle = threading.Event()
+
+    def _loop():
+        while not idle.wait(AGENT_CARD_SWEEP_S):
+            try:
+                poster.sweep()
+            except Exception as e:  # noqa: BLE001 - one bad sweep is not the last
+                _log(f"agent-card: sweep error (isolated): {diagnostics.describe(e)}")
+    threading.Thread(target=_loop, name="sparrow-agent-cards", daemon=True).start()
+
+
 def _poll_timeout_is_empty(last_ok: float, now: float,
                            grace: float = POLL_TIMEOUT_GRACE_S) -> bool:
     """Whether a long-poll read timeout should be read as `{"tasks": []}`.
@@ -11441,6 +11594,7 @@ def main() -> int | None:
     _emit_gateway_status(False, error="starting — not yet connected")
     refresh_routing(force=True)  # the owner's DM comes from the gateway at connect, not from a pin
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
+    _start_agent_cards()
     _results_watcher = _start_results_watcher()
     _outbound_thread = _start_outbound_worker(inflight)
     stop_workers = lambda: _stop_background_workers(_outbound_thread, _results_watcher)  # noqa: E731

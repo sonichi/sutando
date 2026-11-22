@@ -20,7 +20,7 @@ contracts are in [`docs/worker-pool-design.md`](../../docs/worker-pool-design.md
 - `apply_profile_label_overrides.py` — apply an s.space profile's complete worker display-label map from JSON stdin with `--workspace W --profile-mxid M --config-version N`.
 - `worker_bootstrap.py` — a worker session's first-turn decision (worker vs core mode) from its env.
 - `pool_roster.py` — owner bindings + compiled roster; `register_worker` is the locked read-merge-write. `set_worker_state` / `remove_worker` are its writers for a worker's lifecycle; `set_worker_plugin_dirs` writes a row's `plugin_dirs`.
-- `pool_manage.py` — stop, retire, re-enable, remove or reseat a worker, record its extra Claude plugin dirs, and bind or unbind a room (below).
+- `pool_manage.py` — stop, retire, re-enable, remove, reseat or retry (restart at once after a provider limit, on the owner's "retry now") a worker, record its extra Claude plugin dirs, and bind or unbind a room (below).
 - `pool_identity.py` — give a worker an s.space agent of its own, show it, rotate its token or remove it (below).
 - `pool_provision.py` — the local half of creating that agent without a pasted token: claim secret, redeem, retire (below).
 - `provision_e2e.py` — check that whole flow against one server, with a scan for leaked secrets (below).
@@ -467,7 +467,11 @@ python3 skills/worker-pool/scripts/pool_ask.py --workspace "$WS" --to <label|id|
 
 - `--who` lists `core` and each worker as `name (full worker_id)`, with bound
   rooms and session liveness; `(you)` marks the caller. It shows the base routing
-  alias separately when an s.space display override differs.
+  alias separately when an s.space display override differs. `agent=` is the one
+  s.space agent id each one's session uses (the core's primary row, a worker's first
+  identity row); a recipient with lanes on two homeservers has other ids not shown.
+  `(none)` without an identity row, `unavailable` when the record cannot be read;
+  `agent_mxid` in `--json`.
 - `--to X --ask "..."` writes `tasks/<task id>.txt` with `source: pool-ask`,
   `requested_worker: <id>` (never for the core, which is the default recipient) and
   `reply_to_instance: <asker>`, then routes it. A worker finds it in its inbox like

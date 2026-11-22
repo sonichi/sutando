@@ -2222,6 +2222,26 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
 WORKER_TOKEN_SOURCES = {"paste": "owner", "agent_link": "agent_link"}
 
 
+def agent_ids(workspace: Optional[Path] = None) -> "Optional[dict]":
+    """{"": the primary row's agent_mxid, worker id: its row's agent_mxid} for rows that name one,
+    read only; {} with no record; None when the record exists but cannot be read."""
+    path = record_path(workspace)
+    try:
+        rows = _read(path)
+    except (SchemaError, OSError):
+        return {} if not path.exists() else None
+    out = {}
+    primary = next((r for r in rows if r.get("primary") and not r.get("worker")), None)
+    if str((primary or {}).get("agent_mxid") or "").strip():
+        out[""] = str(primary["agent_mxid"]).strip()
+    # The row worker_identity picks, so --who names the identity the session uses.
+    for worker in dict.fromkeys(str(r["worker"]) for r in rows if r.get("worker")):
+        mxid = str((worker_identity(worker, workspace) or {}).get("agent_mxid") or "").strip()
+        if mxid:
+            out[worker] = mxid
+    return out
+
+
 def worker_identity(worker: str, workspace: Optional[Path] = None) -> Optional[dict]:
     """`worker`'s own identity row as stored, read only; None when it has none or the record is unreadable."""
     try:
