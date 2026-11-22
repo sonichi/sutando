@@ -155,8 +155,9 @@ and the policy decides:
   line when the tools did not come up: "S.space tools didn't start this turn (the helper did not start | the
   helper exited | no tool list), so I couldn't use Room Commons." Only those fixed words reach the room; the
   code, argv and paths stay in the log and `state/metrics.jsonl` (`sspace_tools_down`). A resumed Session
-  (`session/load`) with no launch says nothing: on the 18:44 live run agy launched no server on resume and
-  kept the tools it had when the Session started.
+  (`session/load`) with no launch reports its own last launch, kept per Session id in
+  `ag2-mcp-launches.json` beside the session store (on the 18:44 live run agy launched no server on resume and
+  kept the tools it had when the Session started): a line when that launch failed, nothing when it worked.
 - **Token file shape (stdio).** An agent `.env` with a `REMOTE_TASK_TOKEN=<relay>|<secret>` line gets the
   plain descriptor (`env_file` that `.env`, `env_key` its key). A seat made by `--token-stdin` or `connect` has
   an `.env` (`channels/ag2space/.env`) holding only `REMOTE_TASK_TOKEN_FILE`, and its token as a raw line in

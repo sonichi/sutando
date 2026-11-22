@@ -158,6 +158,7 @@ def shim_args(argv):
 
 
 STATUS_NAME = "ag2-mcp-status.json"
+LAUNCHES_NAME = "ag2-mcp-launches.json"
 # What a room is told when the tools did not come up: fixed words only; codes, argv and paths stay local.
 TOOLS_DOWN = "S.space tools didn't start this turn (%s), so I couldn't use Room Commons."
 
@@ -198,14 +199,45 @@ def tools_down(status_path, turn_id, resumed):
     except (OSError, ValueError):
         st = {}
     if not isinstance(st, dict) or st.get("turn") != turn_id:
-        if resumed:
-            return "", "no shim launch this turn (resumed Session)"
+        if resumed:   # None: agy keeps the tools of the Session's first launch, whose outcome LaunchLog holds
+            return None, "no shim launch this turn (resumed Session)"
         return "the helper did not start", "no shim launch this turn"
     if st.get("state") == "listed" and isinstance(st.get("tools"), int) and st["tools"] > 0:
         return "", "%d tools listed" % st["tools"]
     if st.get("state") == "exited":
         return "the helper exited", "the proxy exited %s before listing tools" % st.get("code")
     return "no tool list", "the proxy started but listed no tools (%s)" % st.get("state")
+
+
+class LaunchLog:
+    """Each Session's last launch outcome ('' when its tools came up, else TOOLS_DOWN's reason), beside the
+    session store, so a resumed Session that launches nothing reports what its own launch left it with."""
+
+    def __init__(self, sessions_path):
+        self.path = os.path.join(os.path.dirname(os.path.abspath(sessions_path)), LAUNCHES_NAME)
+
+    def _read(self):
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                rows = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        return rows if isinstance(rows, dict) else {}
+
+    def get(self, session_id):
+        row = self._read().get(session_id or "")
+        return row if isinstance(row, str) else ""
+
+    def record(self, session_id, reason):
+        if not session_id:
+            return
+        rows = self._read()
+        rows[session_id] = reason
+        tmp = "%s.%d.tmp" % (self.path, os.getpid())
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(rows, f)
+        os.replace(tmp, self.path)
 
 
 def stdio_entry(proxy_command, token_env_file, agent_id, state_dir, run=subprocess.run, turn=""):
@@ -466,7 +498,13 @@ class Connector:
         body = self.answer_body(headers, status, text, detail, turn)
         reason = ""
         if self.launch is not None:
+            launches = LaunchLog(self.args.session_store)
             reason, seen = tools_down(self.launch[0], self.launch[1], turn.resumed)
+            if reason is None:
+                reason = launches.get(turn.session_id)
+                seen += "; its launch: %s" % (reason or "tools came up, or none recorded")
+            else:
+                launches.record(turn.session_id, reason)
             log("ag2-space MCP tools:", seen)
         if reason and acp_host.is_message(headers) and not body.startswith("[no-send]"):
             body = body.rstrip("\n") + "\n\n" + TOOLS_DOWN % reason + "\n"

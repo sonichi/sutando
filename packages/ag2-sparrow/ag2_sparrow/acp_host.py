@@ -388,6 +388,7 @@ class Turn:
         self.decisions = []
         self.updates = collections.Counter()
         self.resumed = False   # the Session came from session/load, not session/new
+        self.session_id = None
         self.lock = threading.Lock()
 
     def on_update(self, params):
@@ -469,7 +470,7 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
                 client.call("session/load", {"sessionId": rec["session_id"], "cwd": cwd, "mcpServers": servers},
                             args.turn_timeout)
                 session_id, turns = rec["session_id"], int(rec.get("turns") or 0)
-                turn.resumed = True
+                turn.resumed, turn.session_id = True, session_id
                 log("resumed session", session_id, "for", key)
             except (AcpTimeout, AcpGone):
                 raise
@@ -481,6 +482,7 @@ def run_prompt(client_factory, args, headers, task_id, prompt, decide, store, st
             if not session_id:
                 return "failed", "", "session/new returned no sessionId", turn
             log("new session", session_id, "for", key, *(("(isolated)",) if isolated else ()))
+            turn.session_id = session_id
             if isolated:
                 refused = _set_mode(client, session_id, opened.get("modes"), isolated, args.rpc_timeout)
                 if refused:

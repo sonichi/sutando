@@ -1053,7 +1053,7 @@ class SspaceStdioTest(unittest.TestCase):
             json.loads(self.status_file().read_text())), "the code stays local; the room gets fixed words only")
         self.assertEqual(self.w.metrics()[0]["sspace_tools_down"], "the helper exited")
 
-    def test_no_launch_on_a_new_session_says_so_and_a_resumed_session_says_nothing(self):
+    def test_no_launch_on_a_new_session_says_so_and_so_does_its_resume(self):
         self.launched()
         (self.w.home / "launch-mcp").unlink()   # agy started nothing
         self.status_file().write_text(json.dumps({"turn": "old", "state": "listed", "tools": 23}))
@@ -1064,10 +1064,37 @@ class SspaceStdioTest(unittest.TestCase):
         self.w.task("task-2", "STUB:TEXT two")
         self.serve(proxy=proxy)
         self.assertIn("session/load", self.w.methods())
-        self.assertEqual(self.w.result("task-2"), "hello from agy-stub\n", "agy keeps a resumed Session's tools")
+        self.assertIn(gc.TOOLS_DOWN % "the helper did not start", self.w.result("task-2"),
+                      "agy keeps a resumed Session's tools: none, since its own launch never happened")
         self.assertEqual(gc.tools_down(str(self.status_file()), "t", False)[0], "the helper did not start")
+        self.assertIsNone(gc.tools_down(str(self.status_file()), "t", True)[0])
         self.status_file().write_text(json.dumps({"turn": "t", "state": "started"}))
         self.assertEqual(gc.tools_down(str(self.status_file()), "t", False)[0], "no tool list")
+
+    def test_a_resumed_session_whose_own_launch_failed_still_says_so(self):
+        self.launched()
+        bad = "%s /no/such/ag2-mcp-proxy.mjs" % shlex.quote(sys.executable.replace("python", "no-such-node"))
+        self.w.task("task-1", "STUB:TEXT one")
+        self.serve(proxy=bad)
+        self.assertIn(gc.TOOLS_DOWN % "the helper exited", self.w.result("task-1"))
+        self.w.task("task-2", "STUB:TEXT two")          # resumed: agy launches nothing, keeps the failed start
+        self.serve(proxy=bad)
+        self.assertIn("session/load", self.w.methods())
+        self.assertIn(gc.TOOLS_DOWN % "the helper exited", self.w.result("task-2"))
+        launches = gc.LaunchLog(self.w.root / "state" / gc.SESSIONS_NAME)
+        self.assertEqual(launches.get("s-1"), "the helper exited")
+        self.assertEqual(os.stat(launches.path).st_mode & 0o777, 0o600)
+
+    def test_a_resumed_session_whose_own_launch_worked_says_nothing(self):
+        proxy = self.launched()
+        self.w.task("task-1", "STUB:TEXT one")
+        self.serve(proxy=proxy)
+        self.w.task("task-2", "STUB:TEXT two")
+        self.serve(proxy=proxy)
+        self.assertEqual((self.w.result("task-1"), self.w.result("task-2")), ("hello from agy-stub\n",) * 2)
+        self.assertEqual(gc.LaunchLog(self.w.root / "state" / gc.SESSIONS_NAME).get("s-1"), "")
+        self.assertEqual(gc.LaunchLog("/no/such/dir/sessions.json").get("s-1"), "")
+        gc.LaunchLog(self.w.root / "state" / gc.SESSIONS_NAME).record("", "ignored")
 
     def test_the_launcher_runs_the_proxy_under_the_shim_with_only_the_entrys_environment(self):
         state = Path(self.tmp.name) / "launch state"   # a space in the path, as under Application Support
