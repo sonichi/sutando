@@ -93,10 +93,18 @@ class Rules(unittest.TestCase):
             self.assertEqual([pane_gate.composer_boxed(screen, pane_gate.CLAUDE), rules.composer_boxed(screen),
                               bundled.composer_boxed(screen)], [boxed] * 3, what)
             self.assertEqual(kind(pane_gate.pending_text(screen, pane_gate.CLAUDE)), prompt_row, what)
-            # Typing is allowed only on a box known empty inside its frame; never on text, never on unknown.
-            self.assertEqual(rules.composer_text(screen) == "" and rules.composer_boxed(screen),
-                             answer == "empty" and boxed, what)
-        self.assertEqual((rules.composer_text(None), rules.composer_boxed(None)), (None, False), "a failed capture")
+            # Typing is allowed only on a box known empty inside its frame, with nothing unstyled on its
+            # prompt row; never on text, never on unknown, never on words that only read like a hint.
+            self.assertEqual([m.composer_typed(screen) for m in (rules, bundled)],
+                             [pane_gate.pending_text(screen, pane_gate.CLAUDE)] * 2, what)
+            self.assertEqual(rules.composer_text(screen) == "" and rules.composer_boxed(screen)
+                             and rules.composer_typed(screen) == "",
+                             answer == "empty" and boxed and prompt_row == "empty", what)
+        self.assertEqual((rules.composer_text(None), rules.composer_boxed(None), rules.composer_typed(None)),
+                         (None, False, None), "a failed capture")
+        # The same words as a real draft and as the hint Claude Code draws: only the styling differs.
+        for words in ('Try "fix lint errors"', "Press up to edit queued messages"):
+            self.assertEqual((rules.composer_typed(box(words)), rules.composer_typed(box(DIM + words + OFF))), (words, ""))
         self.assertEqual(rules.composer_text(box("a", " b ")), "a b ", "every row of the box, as the pane gate joins them")
 
     def test_a_capture_taken_with_styling_reads_as_the_same_screen_without_it(self):

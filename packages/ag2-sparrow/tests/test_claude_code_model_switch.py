@@ -138,6 +138,9 @@ class SwitchModel(unittest.TestCase):
         for shown, why in ((box("half a message"), "holds unsent text"),
                            (box("", "  a second line under a blank first one"), "holds unsent text"),
                            (box("first", "second"), "holds unsent text"),
+                           # The owner's own words, unstyled, that read like Claude Code's hints.
+                           (box('Try "fix lint errors"'), "holds unsent text"),
+                           (box("Press up to edit queued messages"), "holds unsent text"),
                            ("old\n" + box() + "\nlater\n" + box("fix the bug"), "holds unsent text"),
                            (box("/mod") + "\n  /model   Set the AI model", "holds unsent text"),
                            ("\u276f ", "cannot be read"),
@@ -154,7 +157,8 @@ class SwitchModel(unittest.TestCase):
         # A placeholder or a suggestion is styled, never typed: the box is empty. So is a box whose
         # rules and footer arrive coloured, as a styled capture of the real screen has them.
         coloured = "\n".join("\x1b[38;5;244m%s\x1b[39m" % row if n != 1 else row for n, row in enumerate(box().splitlines()))
-        for shown in (box('%sTry "fix lint errors"\x1b[0m' % dim), box("\x1b[38;5;240mrun the tests\x1b[39m"), coloured):
+        for shown in (box('%sTry "fix lint errors"\x1b[0m' % dim), box("%sPress up to edit queued messages\x1b[0m" % dim),
+                      box("\x1b[38;5;240mrun the tests\x1b[39m"), coloured):
             pane = Pane(says)
             pane.text = shown
             self.assertEqual(lc_for(pane, self.root).switch_model(REC, "opus"), (True, "switched to opus"), shown)

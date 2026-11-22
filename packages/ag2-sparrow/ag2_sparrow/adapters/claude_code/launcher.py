@@ -45,7 +45,7 @@ MODEL_ACCEPT_S = 20.0
 # (src/claude_model_switch.py, bundled verbatim): one source for the skill and for this adapter.
 MODEL_RE, MODEL_SET, MODEL_CONFIRM = claude_model_switch.MODEL_RE, claude_model_switch.MODEL_SET, claude_model_switch.MODEL_CONFIRM
 composer_text, accepted_count = claude_model_switch.composer_text, claude_model_switch.accepted_count
-composer_boxed = claude_model_switch.composer_boxed
+composer_boxed, composer_typed = claude_model_switch.composer_boxed, claude_model_switch.composer_typed
 MODEL_RECORD = ("state", "model-switch.json")
 
 
@@ -638,7 +638,8 @@ class Launcher:
         if draft is None or not composer_boxed(styled):
             return False, ("refused: the session does not show its whole input box, so the box cannot be read; "
                            "nothing sent")
-        if draft:
+        # The whole-box reading takes hint wording for a hint; only its styling shows it is one.
+        if draft or composer_typed(styled) != "":
             return False, "refused: the session's input box holds unsent text; nothing sent"
         shown = self.tm.capture(gen["pane_id"]) or ""
         before, other, asked = accepted_count(model, shown), shown.count(MODEL_SET), shown.count(MODEL_CONFIRM)

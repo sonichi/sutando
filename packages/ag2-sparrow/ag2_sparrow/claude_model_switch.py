@@ -41,6 +41,14 @@ def composer_boxed(shown) -> bool:
     return pane_composer.composer_boxed(shown, pane_composer.CLAUDE_COMPOSER)
 
 
+def composer_typed(shown) -> "str | None":
+    """What is TYPED on the prompt row of a styled capture: a hint Claude Code draws there is styled
+    and dropped, so words that only read like a hint (`Try "fix lint errors"`, typed by the owner)
+    are kept as text. '' with nothing typed there, None with no prompt row. composer_text decides a
+    hint by its wording; a caller about to type asks this too."""
+    return pane_composer.pending_text(shown or "", pane_composer.CLAUDE_COMPOSER)
+
+
 def accept_pattern(model: str) -> str:
     """Claude Code's line for a switch to `model`, as an ERE to match ignoring case. It echoes display
     names ("Set model to Opus 4.6"): an alias accepts any version of its family at a boundary, an id
