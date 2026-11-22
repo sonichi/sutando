@@ -836,9 +836,8 @@ COPY_SCRIPT = """<script>
 })();
 </script>"""
 
-# One tap asks the viewer's own agent through the host (artifact.sendToMyAgent), which confirms first.
-# The key binds the step to its text and agent, so a changed request never reuses an old receipt; a
-# known decline moves to a new attempt key, any other failure keeps the key (the host replays it once).
+# The key binds step, agent and text, so no old receipt is reused; only a known decline gets a new
+# attempt key, since the host keeps a decline for its key and replays any other key at most once.
 SEND_SCRIPT = """<script>
 (() => {
   const host = (() => { try { return window.artifact || null; } catch (e) { return null; } })();
