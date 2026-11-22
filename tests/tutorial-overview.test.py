@@ -60,6 +60,18 @@ class OverviewTest(unittest.TestCase):
         for text in ("A&amp;B", "Designer", "Private agenda", 'id="step-4"'):
             self.assertNotIn(text, room)
 
+    def test_unrecognized_reference_prompt_is_preserved(self):
+        from personalized_overview import overview
+
+        style, body = tour_page.overview_parts()
+        extra = '<div class="prompt-box"><button type="button">Static example</button></div>'
+        body = body.replace('<section class="tour-card active" id="step-0">',
+                            '<section class="tour-card active" id="step-0">' + extra, 1)
+        self.assertIn(extra, body)
+        _, rendered = overview(style, body, "Example Agent", ("Designer",))
+        self.assertIn(extra, rendered)
+        self.assertIn("Examples for design work.", rendered)
+
     def test_scripts_parse(self):
         node = shutil.which("node")
         if not node:

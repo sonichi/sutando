@@ -1583,6 +1583,95 @@ class PublishTest(unittest.TestCase):
         self.assertEqual((result["action"], result["summoned"]), ("resumed", False))
         self.assertNotIn("Fictional Agent", self.room()["pages"]["html-p1"])
 
+    def test_legacy_migration_preserves_unclassified_newer_or_unrewritable_pages(self):
+        before = self.legacy_dm()
+        future = gs.tour_page.FEATURES._replace(revision="tutorial.2099-01-01.1")
+        newer = gs.render_page("Fictional Agent", "codex", agent=self.ME, features=future,
+                               private_setup=True)
+        cases = (
+            (before, {}, {"audience": None}, gs.CALL_BYTES, "audience unknown"),
+            (newer, {"audience": "dm"}, {}, gs.CALL_BYTES, "legacy page uses a newer guide version"),
+            (before, {"audience": "dm"}, {}, 1, "legacy page exceeds a single exact replacement"),
+        )
+        for live, entry, args, budget, reason in cases:
+            with self.subTest(reason=reason):
+                self.old_entry(live, state="complete", hash=gs.content_hash(live), **entry)
+                marker = self.marker.read_bytes()
+                with mock.patch.object(gs, "call_budget", return_value=(budget, budget * 2)):
+                    result = self.publish(if_newer=True, **args)
+                self.assertEqual((result["action"], result["reason"], result["summoned"]),
+                                 ("skipped", reason, False))
+                self.assertEqual(self.room()["pages"], {"html-p1": live})
+                self.assertEqual(self.marker.read_bytes(), marker)
+                self.assertFalse(any(c[0] in ("replace", "append", "create", "summon")
+                                     for c in self.room()["calls"]))
+
+    def test_malformed_legacy_journal_is_not_replayed_or_rewritten(self):
+        target = self.legacy_dm()
+        before = gs.chunks(target, 900)[0]
+        journal = gs._journal({"hash": gs.content_hash(target)}, before, target, None,
+                              "Fictional Agent", "codex", "dm", self.ME, mode="fill")
+        journal["piece"] = "not a byte limit"
+        self.old_entry(before, **journal)
+        marker = self.marker.read_bytes()
+        result = self.publish(if_newer=True)
+        self.assertEqual((result["action"], result["reason"]),
+                         ("skipped", "publisher ownership not verified"))
+        self.assertEqual(self.room()["calls"], [])
+        self.assertEqual(self.room()["pages"], {"html-p1": before})
+        self.assertEqual(self.marker.read_bytes(), marker)
+
+    def test_already_generic_legacy_page_updates_only_its_marker(self):
+        page = gs.render_page(gs.GENERIC_NAME, "codex", agent=self.ME, native_dm=True)
+        self.old_entry(page, state="complete", audience="dm", hash=gs.content_hash(page),
+                       roles="Designer", prompts={"dm": "A fictional private draft."})
+        db = self.room()
+        db["pages"]["html-p2"] = page
+        self.state.write_text(json.dumps(db))
+        result = self.publish(if_newer=True, summon=True)
+        self.assertEqual((result["action"], result["kind"], result["migrated"], result["summoned"]),
+                         ("unchanged", "html-p1", True, False))
+        self.assertEqual(self.room()["pages"], {"html-p1": page, "html-p2": page})
+        self.assertEqual([c[0] for c in self.room()["calls"]], ["pages", "read"])
+        entry = gs.load_marker(self.marker)[self.ROOM]
+        self.assertEqual(entry["privacy"], gs.PUBLISH_PRIVACY)
+        self.assertFalse({"roles", "prompts"} & entry.keys())
+
+    def test_recovery_holds_migrations_with_missing_page_corrupt_target_or_smaller_budget(self):
+        before = self.legacy_dm()
+        for case in ("missing", "corrupted", "small budget"):
+            with self.subTest(case=case):
+                self.old_entry(before, state="complete", audience="dm", hash=gs.content_hash(before))
+                with mock.patch.dict(os.environ, {"STUB_FAIL": "replace"}):
+                    with self.assertRaisesRegex(gs.PublishError, "generic target stays recorded"):
+                        self.publish(if_newer=True)
+                rooms = gs.load_marker(self.marker)
+                self.assertTrue(rooms[self.ROOM]["privacy_migration"])
+                if case == "corrupted":
+                    rooms[self.ROOM]["target"] += "<!-- corrupted journal -->"
+                    gs.save_marker(self.marker, rooms)
+                marker = self.marker.read_bytes()
+                db = self.room()
+                db["calls"] = []
+                if case == "missing":
+                    db["pages"] = {}
+                self.state.write_text(json.dumps(db))
+                if case == "missing":
+                    result = self.publish(if_newer=True)
+                    self.assertEqual((result["action"], result["reason"], result["summoned"]),
+                                     ("skipped", "migration page no longer listed", False))
+                elif case == "corrupted":
+                    with self.assertRaisesRegex(gs.PublishError, "target failed verification"):
+                        self.publish(if_newer=True)
+                else:
+                    with mock.patch.object(gs, "call_budget", return_value=(1, 2)):
+                        with self.assertRaisesRegex(gs.PublishError, "generic target stays recorded"):
+                            self.publish(if_newer=True)
+                self.assertEqual(self.marker.read_bytes(), marker)
+                self.assertEqual(self.room()["pages"], db["pages"])
+                self.assertFalse(any(c[0] in ("replace", "append", "create", "summon")
+                                     for c in self.room()["calls"]))
+
     def test_a_large_change_replaces_the_whole_page_by_its_first_piece_then_appends(self):
         self.publish()
         before = len(self.room()["calls"])
