@@ -213,13 +213,14 @@ class Tap(Base):
         self.assertTrue(kw["start_new_session"])
         self.assertEqual(kw["stdin"], subprocess.DEVNULL)
         card = self.fake.cards()[1]
-        self.assertEqual((card["id"], card["state"], card["text"]), (mc.CARD_ID, "pending", say))
+        self.assertEqual((card["id"], card["state"], card["text"]), (mc.NOTE_ID, "pending", say))
         self.assertNotIn("buttons", card)
         self.assertEqual(self.fake.calls[1][1]["reply_to"], "$card1")
         self.assertIn("switch to fable", (self.ws / "logs" / "model-card.log").read_text())
-        self.assertIsNone(mc.issued_cards.live(self.ws, "$card1"), "the answered menu stops acting")
-        self.assertEqual(self.tap("sonnet")[1]["status"], "forged_or_stale_click")
-        self.assertEqual(len(self.launch.calls), 1)
+        # The menu is still on the owner's screen after the card that answered it, and still acts.
+        self.assertIsNotNone(mc.issued_cards.live(self.ws, "$card1"), "the answered menu keeps acting")
+        self.assertEqual(self.tap("sonnet")[1]["status"], "started")
+        self.assertEqual(len(self.launch.calls), 2)
 
     def test_the_detached_line_passes_the_switch_exit_code_to_settle(self):
         """The line itself, run for real against stand-in scripts: `settle` gets the switch's own code."""
@@ -315,7 +316,7 @@ class Settle(Base):
                                          "say": "Switched. I'm now using Fable."}))
         self.assertEqual(self.fake.calls[0][2], f"model-card:{attempt}:outcome")
         card, = self.fake.cards()
-        self.assertEqual((card["id"], card["state"], card["text"]), (mc.CARD_ID, "done", "Switched. I'm now using Fable."))
+        self.assertEqual((card["id"], card["state"], card["text"]), (mc.NOTE_ID, "done", "Switched. I'm now using Fable."))
         self.assertEqual(self.fake.calls[0][3], DM)
         self.assertEqual(self.settle("default", 0)[1]["say"], "Switched. I'm now using Default.")
 
@@ -331,7 +332,7 @@ class Settle(Base):
             want = f"I could not switch to Fable. I'm still using Opus. {reason[0].upper()}{reason[1:]}."
             self.assertEqual((rc, out["outcome"], out["say"]), (0, "error", want), code)
             card = self.fake.cards()[-1]
-            self.assertEqual((card["id"], card["state"], card["text"]), (mc.CARD_ID, "error", want))
+            self.assertEqual((card["id"], card["state"], card["text"]), (mc.NOTE_ID, "error", want))
             self.assertNotIn("buttons", card)
         self.assertEqual(len(set(mc.REASONS.values())), len(documented))
         self.assertIn("in time", mc.REASONS[8])
@@ -350,14 +351,20 @@ class Settle(Base):
         self.using("fable", accepted=False, previous=None)
         self.assertIn("I'm still using the default model. ", self.settle("fable", 10)[1]["say"])
 
-    def test_the_outcome_retires_the_menu_and_goes_only_to_the_owner_dm(self):
+    def test_the_outcome_leaves_the_menu_acting_and_goes_only_to_the_owner_dm(self):
         self.assertEqual(self.run_(["post", "--room", DM])[0], 0)
         self.assertIsNotNone(mc.issued_cards.live(self.ws, "$card1"))
         self.assertEqual(self.settle("fable", 8)[0], 0)
-        self.assertIsNone(mc.issued_cards.live(self.ws, "$card1"))
+        self.assertEqual(self.fake.cards()[-1]["id"], mc.NOTE_ID)
+        self.assertIsNotNone(mc.issued_cards.live(self.ws, "$card1"), "an outcome card does not retire the menu")
+        # A newer menu does.
+        self.assertEqual(self.run_(["post", "--room", DM])[0], 0)
+        self.assertEqual((mc.issued_cards.live(self.ws, "$card1"), mc.issued_cards.live(self.ws, "$card3") is not None),
+                         (None, True))
+        sent = len(self.fake.calls)
         rc, out = self.settle("fable", 0, room=ROOM)
         self.assertEqual((rc, out["status"], out["outcome"]), (1, "failed", "done"))
-        self.assertEqual(len(self.fake.calls), 2)
+        self.assertEqual(len(self.fake.calls), sent, "nothing is posted outside the owner's DM")
         self.assertEqual(self.sleeps, [mc.SETTLE_PAUSE_S] * (mc.SETTLE_TRIES - 1))
 
 

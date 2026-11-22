@@ -108,5 +108,6 @@ did not finish"). A post that fails is tried again a few times inside the detach
 still untold is posted by the next `post` or `reply` before its own work (`delivered` in their
 output). An outcome is told once, and no retry runs the switch again. `reply` records an attempt
 before its "switching" card; an untold outcome with a newer attempt after it is marked `superseded`
-in the record and never posted, so only the newest attempt's outcome stands for the card. The menu, the "switching" answer and the outcome carry one card id, and each newer
-one retires the older one's buttons. Output of the detached line: `<workspace>/logs/model-card.log`.
+in the record and never posted, so only the newest attempt's outcome stands for the card. The menu has its own card id: a newer menu retires an older one's
+buttons, while the "switching" answer and the outcome (another id) leave the menu acting, since its
+buttons stay on the owner's screen. Output of the detached line: `<workspace>/logs/model-card.log`.

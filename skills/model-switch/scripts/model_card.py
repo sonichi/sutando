@@ -56,6 +56,9 @@ import agent_card as ac  # noqa: E402
 import issued_cards  # noqa: E402
 
 CARD_ID, KIND, TARGET = "core-model-switch", "model", "core"
+# The "switching" answer and the outcome are cards of their own: recorded under the menu's id they
+# would retire the menu (one live card per id and room) while its buttons are still on screen.
+NOTE_ID = "core-model-switch-status"
 HANDLER = "skills/model-switch/scripts/model_card.py reply"
 SWITCH = _HERE / "switch-model.sh"
 MANIFEST = _HERE.parent / "manifest.json"
@@ -210,8 +213,8 @@ def switching_words(alias: str) -> str:
 
 
 def notice_card(state: str, status: str, words: str) -> tuple:
-    """(body, card) with the menu's id and no buttons: the "switching" answer or the outcome."""
-    return ac.build(CARD_ID, state, title="Core model", avatar_=ac.avatar(initial="M"), status=status,
+    """(body, card) with no buttons, under its own id: the "switching" answer or the outcome."""
+    return ac.build(NOTE_ID, state, title="Core model", avatar_=ac.avatar(initial="M"), status=status,
                     text=words, body=words)
 
 
@@ -240,8 +243,8 @@ def _owner_dm(ws: Path, core: dict) -> str:
 
 def _post(ws: Path, room: str, body: str, card: dict, operation_id: str, *, reply_to: str = "", core=None,
           execute=None) -> dict:
-    """Post `card` in `room`, which must be the owner's checked DM, and record it for its taps; a card
-    with no buttons retires the older one of its id there."""
+    """Post `card` in `room`, which must be the owner's checked DM, and record it for its taps; a newer
+    menu retires the older one there, and a card with no buttons retires none."""
     try:
         core = core if core is not None else _core(ws)
         lane = str(core.get("instance") or "")
