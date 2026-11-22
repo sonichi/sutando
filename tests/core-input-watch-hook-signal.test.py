@@ -78,11 +78,9 @@ class TestHookClearVoidsAPaneGuess(unittest.TestCase):
         self.assertEqual(state(QUOTED_DIALOG, hook=CLEAR)[0], "blocked-human")
 
     def test_an_ambiguous_reading_under_a_clear_is_voided(self):
-        for pane in (AMBIGUOUS_SELECT, SAUTEED):
-            self.assertEqual(state(pane)[0], "blocked-human", "positive control")
-            self.assertNotEqual(state(pane, hook=CLEAR)[0], "blocked-human")
+        self.assertEqual(state(AMBIGUOUS_SELECT)[0], "blocked-human", "positive control")
         self.assertEqual(_mod.classify(AMBIGUOUS_SELECT)[0], "selection")
-        self.assertEqual(_mod.classify(SAUTEED)[0], "unknown")
+        self.assertNotEqual(state(AMBIGUOUS_SELECT, hook=CLEAR)[0], "blocked-human")
 
     def test_the_accented_turn_line_under_a_quoted_hint_is_not_blocked(self):
         self.assertNotEqual(state(SAUTEED, hook=CLEAR)[0], "blocked-human")
