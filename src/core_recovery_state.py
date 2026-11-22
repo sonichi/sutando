@@ -11,7 +11,7 @@ pure: it folds the records other modules already keep into one small dict.
     state/core-supervisor.json           core-input-watch.py (the monitor)
     state/core-limit-hold.json           core_limit_hold.py
     state/supervisor-status.json         the desktop's backend supervisor
-    state/quota-state.json               the credential proxy
+    state/quota-state.json               the credential proxy (only a record of the core's account)
     the pane's abnormal text             cli_wedge.frame_abnormal
     state/session-starts.log             the core launchers (restarts in the last 10 min)
 
@@ -496,12 +496,12 @@ def gather(workspace: Path, supervisor: Optional[dict], *, now: float, runtime: 
     """The record for this tick, from the files the other modules keep. Read-only."""
     workspace = Path(workspace)
     runtime = runtime if runtime in RUNTIMES else recorded_runtime(workspace)
-    model = None
+    model = account = None
     if runtime != "codex":
         try:
-            model = core_limit_hold.launch_identity(workspace)[0]
+            model, account = core_limit_hold.launch_identity(workspace)
         except Exception:  # noqa: BLE001 -- an unreadable identity is an unknown model, not a failure
-            model = None
+            model = account = None
     if pane and runtime == "codex":
         pane = codex_tail(pane)
     hold = core_limit_hold.read_hold(workspace)
@@ -510,7 +510,7 @@ def gather(workspace: Path, supervisor: Optional[dict], *, now: float, runtime: 
     return derive(
         supervisor, hold,
         _read_json(status_read_path("supervisor-status.json", workspace)),
-        _read_json(status_read_path("quota-state.json", workspace)),
+        qa.record_for_account(_read_json(status_read_path("quota-state.json", workspace)), account),
         cli_wedge.frame_abnormal(pane) if pane else None,
         now=now, prev=read(workspace, now), runtime=runtime, model=model,
         waiting_tasks=core_gate_notice.queued_count(workspace),

@@ -429,7 +429,9 @@ its request was sent with, and only when it took that credential from its config
 item with the dir's account unchanged across the pick; a passed-through credential is unbound. A
 reading's usage and last request model count only when its label is the signed-in account (an
 unlabeled reading, or one from a request sent before an account switch, reports no usage), and a
-rejection counts only for a record of its own account; `limited_until` comes only from a
+rejection counts only for a record of its own account. The recovery state and the limit hold act
+on a proxy record only when it is labeled with the core's signed-in account (with that account
+unknown, any record, as before); `limited_until` comes only from a
 hold that binds this seat's model family and account. A switch option is a row the recovery card
 itself offers (`recovery_actions.switch_offer`, the held model avoided), its `token` the runtime
 list's opaque row key that the card's `switch_model:<token>` click names; its name comes from the

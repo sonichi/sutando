@@ -513,7 +513,8 @@ class EdgePaths(unittest.TestCase):
         self.assertIsNone(clh.record_evidence(rec, now, b), "A's 429 landed after the seat switched to B")
         rec["account"] = f"acct_{b[:6]}"
         self.assertIsNone(clh.record_evidence(rec, now), "B's record: A's late 429 is not in its ledger")
-        self.assertIsNotNone(clh.record_evidence(limited_record(now), now, b), "an unlabeled record stays evidence")
+        self.assertIsNone(clh.record_evidence(limited_record(now), now, b), "unbound: not this known seat's")
+        self.assertIsNotNone(clh.record_evidence(limited_record(now), now), "the seat's account unknown: as before")
 
     def test_transcript_unreadable_and_odd_lines(self):
         now = time.time()
@@ -742,7 +743,15 @@ class AccountChange(unittest.TestCase):
         self.cfg = self.ws / "claude-config"
         self.cfg.mkdir()
         self.now = time.time()
-        (self.ws / "state" / "quota-state.json").write_text(json.dumps(limited_record(self.now)))
+        (self.ws / "state" / "quota-state.json").write_text(json.dumps(self.a_record(self.now)))
+
+    def a_record(self, now: float) -> dict:
+        """Account A's refusal, labeled by the proxy with the account its request was sent with."""
+        label = clh.qa.account_label(clh.account_digest(
+            {"accountUuid": "acct-a", "organizationUuid": "org-acct-a", "emailAddress": "a@example.com"}))
+        rec = dict(limited_record(now), account=label)
+        rec["recent_rejections"] = [dict(r, account=label) for r in rec["recent_rejections"]]
+        return rec
 
     def tearDown(self):
         self.td.cleanup()
@@ -784,7 +793,7 @@ class AccountChange(unittest.TestCase):
                          "a launch with no hold must still leave its account on record")
         self.assertIsNone(clh.active_hold(self.ws))
         self.assertIsNone(clh.binding_hold(self.ws))
-        quota.write_text(json.dumps(limited_record(time.time())))     # A is refused; the core dies
+        quota.write_text(json.dumps(self.a_record(time.time())))     # A is refused; the core dies
         self.sign_in("acct-b", "b@example.com")                       # the owner signs in to B
         self.assertEqual(self.gate(), 0, "account A's limit held account B, which had quota")
         self.assertIsNone(clh.active_hold(self.ws))
@@ -796,7 +805,7 @@ class AccountChange(unittest.TestCase):
         quota.unlink()
         self.sign_in("acct-a", "a@example.com")
         self.assertEqual(self.gate(), 0)
-        quota.write_text(json.dumps(limited_record(time.time())))
+        quota.write_text(json.dumps(self.a_record(time.time())))
         self.assertEqual(self.gate(), clh.HOLD_EXIT, "the account that hit the limit is the one held")
         self.assertEqual(clh.read_hold(self.ws)["account"], clh.account_fingerprint(str(self.cfg)))
 

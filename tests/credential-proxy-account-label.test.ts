@@ -118,6 +118,17 @@ test('a late rejection carries its request\'s account and cannot end another acc
 	assert.deepStrictEqual([own.limit_state, own.available], ['rejected', false], 'the record\'s own account');
 });
 
+test('a model-less request after an account switch drops the previous account\'s model hint', () => {
+	const h = { 'anthropic-ratelimit-unified-7d-utilization': '0.5' };
+	const a = quotaStateFromHeaders({}, h, 'claude-opus-5-5', 'T1', 'acct_aaaaaa');
+	assert.strictEqual((quotaStateFromHeaders(a, h, '', 'T2', 'acct_bbbbbb') as { last_request?: unknown }).last_request, undefined);
+	assert.strictEqual((quotaStateFromHeaders(a, h, '', 'T2') as { last_request?: unknown }).last_request, undefined, 'unbound');
+	assert.deepStrictEqual(quotaStateFromHeaders(a, h, '', 'T2', 'acct_aaaaaa').last_request,
+		{ model: 'claude-opus-5-5', at: 'T1' }, 'the same account keeps its hint');
+	assert.deepStrictEqual(quotaStateFromHeaders(a, h, 'claude-fable-5-1', 'T2', 'acct_bbbbbb').last_request,
+		{ model: 'claude-fable-5-1', at: 'T2' });
+});
+
 test('boundAccount: the scoped item, and the same account on both sides of the pick', () => {
 	assert.strictEqual(boundAccount('scoped', 'scoped', 'acct_aaaaaa', 'acct_aaaaaa'), 'acct_aaaaaa');
 	assert.strictEqual(boundAccount('scoped', 'scoped', 'acct_aaaaaa', 'acct_bbbbbb'), null, 'switched during the pick');

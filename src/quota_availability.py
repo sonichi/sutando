@@ -96,6 +96,15 @@ def account_label(digest: Any) -> Optional[str]:
     return f"acct_{digest[:6]}" if isinstance(digest, str) and _DIGEST.fullmatch(digest) else None
 
 
+def record_for_account(payload: Any, digest: Any) -> Optional[dict]:
+    """The proxy record when it may drive a decision for the core signed in as `digest`: labeled
+    with that account. With the account unknown, any record, as before labels existed."""
+    label = account_label(digest)
+    if label is None:
+        return payload if isinstance(payload, dict) else None
+    return payload if isinstance(payload, dict) and payload.get("account") == label else None
+
+
 def record_rejections(payload: Any) -> list:
     """The ledger rejections sent with the record's own account; unlabeled matches only unlabeled.
     The proxy's `boundRejections` implements the same rule."""

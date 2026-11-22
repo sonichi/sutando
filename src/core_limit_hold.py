@@ -202,11 +202,9 @@ def _record_reset(headers: dict, now: float) -> Optional[float]:
 
 def record_evidence(payload, now: float, account: Optional[str] = None) -> Optional[Limit]:
     """A recent 429 in the proxy's record, unless the provider served since then.
-    A record labeled with another account than the `account` digest is not this seat's."""
-    if not isinstance(payload, dict):
-        return None
-    label, own = qa.account_label(account), payload.get("account")
-    if label and own and own != label:
+    With the seat's `account` digest known, only a record labeled with it is evidence."""
+    payload = qa.record_for_account(payload, account)
+    if payload is None:
         return None
     newest = None
     for rej in qa.record_rejections(payload):

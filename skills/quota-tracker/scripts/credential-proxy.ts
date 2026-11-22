@@ -845,7 +845,9 @@ export function quotaStateFromHeaders(
 ): Record<string, unknown> {
 	// The header write replaces the file, so carry the rejection ledger across it.
 	const prevLedger = prev.recent_rejections;
-	const lastRequest = withLastRequest(prev, model, nowIso);
+	// Another account's model hint is not carried: a model-less request names no model then.
+	const prevAccount = (typeof prev.account === 'string' && prev.account) || null;
+	const lastRequest = withLastRequest(prevAccount === (account || null) ? prev : {}, model, nowIso);
 	const state: Record<string, unknown> = {
 		available: true,
 		last_checked: nowIso,
