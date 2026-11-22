@@ -383,16 +383,44 @@ class TheLane(Base):
         self.assertEqual((st.call_args.args, st.call_args.kwargs["repo"], st.call_args.kwargs["logs_dir"]),
                          ((self.lane,), ROOT, self.ws / "logs"))
 
-    def test_a_lane_that_does_not_start_again_is_reported_and_the_switch_still_finishes(self):
+    def test_a_lane_that_does_not_start_again_fails_the_run_and_the_rerun_starts_it(self):
         from _helpers import bridge_lease
         proc = bridge_lease.start(self.ws, self.lane)
         self.addCleanup(bridge_lease.stop, proc)
         _calls, start = self.started({"ok": False, "reason": "no_token"})
         out, why = self.migrate(procs={}, start=start)
-        self.assertEqual(why, "")
-        self.assertEqual(out["lane"], f"stopped pid {proc.pid}; it did not start again (no_token): "
-                                      f"run connections.py start {self.lane}")
-        self.assertEqual(C.worker_dirs(W, self.ws), (self.own / "tasks", self.own / "results"))
+        self.assertEqual(out["lane"], f"stopped pid {proc.pid}; it did not start again (no_token)")
+        self.assertIn(f"run connections.py start {self.lane}", why)
+        self.assertEqual(C.worker_dirs(W, self.ws), (self.own / "tasks", self.own / "results"),
+                         "the switch itself is kept")
+        calls, start = self.started({"ok": True, "lease": "held", "pid": 9})
+        out, why = self.migrate(procs={}, start=start)
+        self.assertEqual((why, out["lane"]), ("", "the lane was down; started again (pid 9)"))
+        self.assertEqual(len(calls), 1)
+        calls, start = self.started({"ok": True, "lease": "held", "pid": 10})
+        out, why = self.migrate(procs={}, start=start)
+        self.assertEqual((why, out["lane"], calls), ("", "not-running", []), "nothing owed: a down lane is left")
+
+    def test_a_start_that_raises_is_reported_by_its_type_and_owed(self):
+        from _helpers import bridge_lease
+        proc = bridge_lease.start(self.ws, self.lane)
+        self.addCleanup(bridge_lease.stop, proc)
+
+        def start(instance, ws):
+            raise RuntimeError("boom")
+        out, why = self.migrate(procs={}, start=start)
+        self.assertEqual(out["lane"], f"stopped pid {proc.pid}; it did not start again (RuntimeError)")
+        self.assertIn("re-run to retry", why)
+
+    def test_the_cli_reports_a_lane_left_down_as_not_ok(self):
+        from _helpers import bridge_lease
+        proc = bridge_lease.start(self.ws, self.lane)
+        self.addCleanup(bridge_lease.stop, proc)
+        with mock.patch.object(worker_lane, "_start_lane", return_value={"ok": False, "reason": "no_token"}):
+            rc, said = self.cli("migrate-dirs", "--worker", W, "--apply")
+        line = json.loads(said)
+        self.assertEqual((rc, line["ok"]), (1, False))
+        self.assertIn("did not start again (no_token)", line["why"])
 
     def test_undo_starts_the_lane_again_too(self):
         from _helpers import bridge_lease

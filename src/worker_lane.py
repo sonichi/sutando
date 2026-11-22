@@ -567,6 +567,9 @@ def _stop_unless_declared(worker: str, workspace, kill, procs, start=_start_lane
     except BridgeLeaseIndeterminate as e:
         return "", 0, f"whether the lane runs cannot be told ({e}); re-run"
     if not pid:
+        # A lane an earlier run stopped but could not start again is started on the re-run.
+        if _restart_owed(worker, ws).exists() and not row.get("disabled") and not row.get("parked"):
+            return _start_again(worker, instance, ws, 0, start)
         return "not-running", 0, ""
     decl, _why = _declaration_for(worker, ws)
     if decl and held_by(pid, processes() if procs is None else procs, decl["path"]) == "declared-bridge":
@@ -575,15 +578,31 @@ def _stop_unless_declared(worker: str, workspace, kill, procs, start=_start_lane
         _stop_row(row, ws, kill)
     except (BridgeStillRunning, BridgeLeaseIndeterminate) as e:
         return "", pid, f"lane {instance} did not stop ({e}); re-run"
+    return _start_again(worker, instance, ws, pid, start)
+
+
+def _restart_owed(worker: str, ws: Path) -> Path:
+    return ws / "state" / "worker-lane-restart-owed" / f"{worker}.json"
+
+
+def _start_again(worker: str, instance: str, ws: Path, pid: int, start) -> "tuple[str, int, str]":
+    """Start the lane `relaunch_lane` stopped (or an earlier run left down); a failure is owed to the re-run."""
+    owed = _restart_owed(worker, ws)
     try:
         rec = start(instance, ws) or {}
-    except Exception as e:  # noqa: BLE001 - the switch is done; a lane that did not start is reported, not fatal
+    except Exception as e:  # noqa: BLE001 - the switch is done; a lane that did not start is reported
         rec = {"ok": False, "reason": type(e).__name__}
+    lead = f"stopped pid {pid}; " if pid else "the lane was down; "
     if rec.get("ok"):
+        owed.unlink(missing_ok=True)
         how = "already running" if rec.get("lease") == "already_running" else "started"
-        return f"stopped pid {pid}; {how} again (pid {rec.get('pid')})", pid, ""
-    return (f"stopped pid {pid}; it did not start again ({rec.get('reason') or 'launch_failed'}): "
-            f"run connections.py start {instance}"), pid, ""
+        return f"{lead}{how} again (pid {rec.get('pid')})", pid, ""
+    reason = rec.get("reason") or "launch_failed"
+    owed.parent.mkdir(parents=True, exist_ok=True)
+    owed.write_text(json.dumps({"instance": instance, "reason": reason}) + "\n", encoding="utf-8")
+    return (f"{lead}it did not start again ({reason})", pid,
+            f"lane {instance} did not start again ({reason}): run connections.py start {instance}, "
+            "or re-run to retry and finish")
 
 
 def _await_replacement(worker: str, workspace, pid: int, wait_s, sleep, clock) -> "tuple[str, str]":
