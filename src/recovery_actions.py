@@ -278,8 +278,10 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
                 outcome = _execute(recovery.RESTART_CORE, None, req, target, runner, now, follow_ups, gate)
                 if outcome[0] != "done":
                     core_limit_hold.reinstate(ws, now, by=RETRY_BY, mirror=False)
-                    why = "The core did not restart, so it is still paused. " + NEW_CARD
-                    return outcome[0], why, why, {"state": "paused_limit"}
+                    why = ("The core is still paused. " + outcome[1] if outcome[0] == "refused"
+                           else "The core did not restart, so it is still paused. " + NEW_CARD)
+                    return outcome[0], why, why, {"state": "paused_limit", **{
+                        k: v for k, v in outcome[3].items() if k == VIA_FIELD}}
                 outcome[3][VERIFY_FIELD]["reinstate"] = ""  # the core's own hold returns if it fails
                 return outcome
             else:
@@ -325,6 +327,8 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
             argv, via = ["bash", str(REPO / "src" / "agent" / "start-cli.sh"), "--runtime", arg, "--restart"], None
         else:
             argv, via = _restart_core_argv(env)
+            if argv is None:
+                return "refused", NO_CTL_LINE, NO_CTL_LINE, {VIA_FIELD: via}
         # The launcher's --restart closes the tmux session this monitor runs in: it runs detached,
         # and the monitor that comes back with the core reads its outcome (verify_step).
         key = _detached_key(req)
@@ -370,6 +374,10 @@ spawn_detached = subprocess.Popen
 #: Which command restart_core ran, kept on its audit line only (the receipt is unchanged).
 VIA_FIELD = "via"
 VIA_CTL, VIA_START_CLI, VIA_FALLBACK = "ctl", "start-cli", "start-cli-fallback"
+#: The app's bundle without its controller: refused, nothing run.
+VIA_NO_CTL = "ctl-missing"
+NO_CTL_LINE = ("This core runs inside the desktop app, and the app's restart control is missing here, "
+               "so nothing was restarted. Restart the core from the desktop app.")
 #: The desktop app's control script, installed beside the engine checkout it drives.
 DESKTOP_CTL = "sutando-ctl.sh"
 #: Its restart-core exit when another launcher run held the launch lock: nothing was killed or started.
@@ -379,15 +387,18 @@ BUSY_LINE = ("The core is already being restarted, so nothing was done this time
 
 
 def _restart_core_argv(env: Dict):
-    """(argv, via) for restart_core. On a desktop install the app's restart-core re-runs its own
-    launcher and keeps the gateway's session; start-cli --restart would kill that whole session."""
+    """(argv, via) for restart_core; argv None when nothing may run. In the app's own bundle its
+    restart-core keeps the gateway's session, and start-cli --restart would kill that session."""
     start_cli = ["bash", str(REPO / "src" / "agent" / "start-cli.sh"), "--restart"]
     app_support = sutando_config.desktop_app_support(REPO)
     if app_support is None:
         return start_cli, VIA_START_CLI
+    repo = REPO.resolve()
+    if repo.parent.name != "engine" or repo.parent.parent != app_support.resolve():
+        return start_cli, VIA_FALLBACK  # a standalone clone the app's controller does not drive
     ctl = REPO.parent / DESKTOP_CTL
     if not ctl.is_file():
-        return start_cli, VIA_FALLBACK
+        return None, VIA_NO_CTL
     env["SUTANDO_APP_SUPPORT"] = str(app_support)
     return ["bash", str(ctl), "restart-core"], VIA_CTL
 

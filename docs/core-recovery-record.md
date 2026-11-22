@@ -144,9 +144,13 @@ until the confirmed, re-authenticated sign-in flow exists; a worker seat's card 
 Restart core runs detached from the monitor. On a desktop install (`$SUTANDO_APP_SUPPORT`, or a
 checkout under the app's `engine/` directory) it runs the app's `sutando-ctl.sh restart-core`,
 installed beside the checkout, which re-runs the app's own launcher: for Claude it replaces only
-the core window, so the gateway keeps its session. Elsewhere, or when that script is missing, it
-runs `src/agent/start-cli.sh --restart`. The audit line's `via` says which ran: `ctl`,
-`start-cli` or `start-cli-fallback`. Switch runtime always runs `start-cli.sh --runtime`.
+the core window, so the gateway keeps its session. In the app's own bundle
+(`<app-support>/engine/<checkout>`) with that script missing, the tap is refused before anything
+runs and the card says to restart the core from the desktop app: `start-cli.sh --restart` would
+kill the gateway's session. A standalone clone, even with `$SUTANDO_APP_SUPPORT` exported, and
+any install without the app run `src/agent/start-cli.sh --restart`. The audit line's `via` says
+which: `ctl`, `ctl-missing`, `start-cli` or `start-cli-fallback`. Switch runtime always runs
+`start-cli.sh --runtime`.
 When the ctl exits 12 (another launcher run held the app's launch lock; nothing was killed or
 started), the receipt is `failed`, the card says the core is already being restarted and to try
 again shortly, any hold it lifted returns, and nothing is retried automatically.

@@ -1551,11 +1551,39 @@ class DesktopRestart(Base):
         self.assertEqual(self.spawned.command(), ["bash", str(SRC / "agent" / "start-cli.sh"), "--restart"])
         self.assertEqual(self.audit()[-1]["via"], RA.VIA_START_CLI)
 
-    def test_a_desktop_install_without_its_ctl_falls_back_to_start_cli_and_says_so(self):
-        _, repo = self._desktop(ctl=False)
-        receipt = self._restart()
-        self.assertEqual(self.spawned.command(), ["bash", str(repo / "src" / "agent" / "start-cli.sh"), "--restart"])
-        self.assertEqual(receipt["outcome"], "done")
+    def test_the_apps_bundle_without_its_ctl_is_refused_and_launches_nothing(self):
+        # start-cli --restart would kill the gateway's session, which it does not recreate.
+        self._desktop(ctl=False)
+        req = self.card(kind="unknown", prompt=UNKNOWN)
+        self.click(req, "restart_core")
+        run = Run()
+        [receipt] = self.run_pending(run)
+        self.assertEqual((self.spawned.calls, run.calls), ([], []), "nothing is launched")
+        self.assertEqual(receipt["outcome"], "refused")
+        self.assertIn("Restart the core from the desktop app", self.mgr.get(req.id).message)
+        self.assertEqual(self.audit()[-1]["via"], RA.VIA_NO_CTL)
+
+    def test_a_held_retry_on_the_bundle_without_its_ctl_launches_nothing_and_stays_paused(self):
+        self._desktop(ctl=False)
+        now = time.time()
+        core_limit_hold._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "model": "opus",
+                                              "until": now + 3600, "started_at": now - 60, "set_at": now - 60,
+                                              "source": core_limit_hold.PANE_SOURCE})
+        req = self.card()
+        self.click(req, "retry_now")
+        [receipt] = self.run_pending(Run(), now=now)
+        self.assertEqual(self.spawned.calls, [])
+        self.assertEqual(receipt["outcome"], "refused")
+        self.assertIn("Restart the core from the desktop app", self.mgr.get(req.id).message)
+        self.assertIsNotNone(core_limit_hold.active_hold(self.ws, now + 1), "the hold stays")
+
+    def test_a_standalone_clone_with_the_apps_dir_exported_falls_back_to_start_cli(self):
+        app, repo = self._desktop()
+        clone = self.ws / "clone" / "sutando"
+        clone.mkdir(parents=True)
+        with mock.patch.object(RA, "REPO", clone):
+            self._restart()
+        self.assertEqual(self.spawned.command(), ["bash", str(clone / "src" / "agent" / "start-cli.sh"), "--restart"])
         self.assertEqual(self.audit()[-1]["via"], RA.VIA_FALLBACK)
 
     def test_a_busy_launch_lock_says_a_restart_is_already_running_keeps_the_hold_and_retries_nothing(self):
