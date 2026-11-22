@@ -260,10 +260,21 @@ def compose_message(signal: dict, surface: str = "") -> str:
         host = _core_host_label() or "the host"
         msg += (f" — check the core on {host}; restarting the engine rewrites the file."
                 " If the core looks fine, no action is needed.")
-    elif _is_login_class(signal):
+    elif _is_login_class(signal) and _CARD_SURFACE.search(surface or ""):
         host = _core_host_label() or "the host"
         msg += (f" — the core needs to sign in again: tap Sign in {_CARD_WHERE}; the sign-in"
                 f" finishes in the s.space app on {host}. A chat reply can't resolve this.")
+    elif _is_login_class(signal):
+        # No card reaches this surface, so the one remedy left is the sign-in on the host.
+        host = _core_host_label() or "the host"
+        try:
+            be = _derive_backend()
+        except Exception:
+            be = None
+        where = (f"`tmux -S {be['socket']} attach -t {be.get('session') or _DEFAULT_TMUX_SESSION}`"
+                 if be else "the Runtime panel")
+        msg += (f" — needs a sign-in on {host}: run /login in the core terminal ({where})."
+                " A chat reply can't resolve this.")
     else:
         host = _core_host_label() or "the host"
         # Guard at the CALL SITE too: this message is the owner's only channel

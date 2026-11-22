@@ -41,6 +41,7 @@ from typing import Callable, Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from hitl import recovery  # noqa: E402
+from workspace_default import status_read_path  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent  # lint-workspace-resolution: allow-repo-root
 HOLD_SOURCE = "core-hold"
@@ -67,7 +68,7 @@ def model_family(model: Optional[str]) -> Optional[str]:
 def current_model(workspace: Path) -> Optional[str]:
     """The family the core was last switched to (state/model-switch.json), else None."""
     try:
-        data = json.loads((Path(workspace) / "state" / "model-switch.json").read_text())
+        data = json.loads(status_read_path("model-switch.json", Path(workspace)).read_text())
     except (OSError, ValueError):
         return None
     return model_family(data.get("model")) if isinstance(data, dict) else None

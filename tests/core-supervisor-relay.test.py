@@ -250,19 +250,26 @@ class TestComposeMessage(unittest.TestCase):
         self.assertIn("not authenticated", m)
         self.assertTrue(m.endswith("resolve this."))
 
-    # Login-class states (sonichi#2397): the remedy is a sign-in on the host, started from the
-    # card's Sign in button — never a terminal command, never "reply here or open the app".
+    # Login-class states (sonichi#2397): on s.space the remedy is the card's Sign in button, never a
+    # terminal command; a surface no card reaches names the sign-in on the host.
     def test_logged_out_names_the_sign_in_button(self):
-        m = compose_message(_LOGGED_OUT)
+        m = compose_message(_LOGGED_OUT, surface="ag2space")
         self.assertIn("tap Sign in on its card", m)
         self.assertNotIn("/login", m)
         self.assertNotIn("reply here or open the app", m)
 
     def test_login_prompt_names_the_sign_in_button(self):
-        m = compose_message(_LOGIN)
+        m = compose_message(_LOGIN, surface="ag2space")
         self.assertIn("tap Sign in on its card", m)
         self.assertNotIn("run /login", m)
         self.assertNotIn("reply here or open the app", m)
+
+    def test_a_surface_no_card_reaches_names_the_sign_in_on_the_host(self):
+        for surface in ("", "telegram", "discord", "macos"):
+            with self.subTest(surface=surface), _no_backend():
+                m = compose_message(_LOGGED_OUT, surface=surface)
+                self.assertNotIn("tap Sign in", m, "a card this surface never shows was named")
+                self.assertIn("run /login in the core terminal (the Runtime panel)", m)
 
     def test_session_limit_escalates(self):
         self.assertTrue(should_escalate(_LIMIT, None)[0])
@@ -308,7 +315,7 @@ class TestComposeMessage(unittest.TestCase):
 
     def test_turn_rejected_login_line_names_gui_login_remedy(self):
         sig = dict(_REFUSED, prompt="OAuth access token has expired · Please run /login")
-        m = compose_message(sig)
+        m = compose_message(sig, surface="ag2space")
         self.assertIn("refuses every turn", m)
         self.assertIn("OAuth access token has expired", m)
         self.assertIn("tap Sign in on its card", m)

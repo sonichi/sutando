@@ -91,7 +91,12 @@ def label(aid: str, runtime_names: Optional[dict] = None) -> str:
     return _LABELS[verb]
 
 
-def recovery_dir(workspace: Path) -> Path:
+def recovery_dir(workspace: Optional[Path] = None) -> Path:
+    """Where recovery clicks, receipts and the audit live. With no workspace the repo's resolver
+    is imported here, as the hitl store does, so a vendored copy never needs it."""
+    if workspace is None:
+        from workspace_default import resolve_workspace
+        workspace = resolve_workspace()
     return Path(workspace) / "state" / "recovery"
 
 

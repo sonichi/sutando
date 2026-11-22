@@ -20,6 +20,8 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from workspace_default import status_read_path
+
 SOURCE = "crash-loop"
 STATUS_FILE = "supervisor-status.json"
 #: The supervisor rewrites its heartbeat every <=5 s; an older one is no supervisor (its schema).
@@ -31,7 +33,7 @@ def terminal_services(workspace: Path, now: float) -> List[Dict]:
     """[{service, reason, error, session}] for each service the supervisor gave up on in its
     current app session, from a fresh status file; [] when the file is stale or unreadable."""
     try:
-        doc = json.loads((Path(workspace) / "state" / STATUS_FILE).read_text())
+        doc = json.loads(status_read_path(STATUS_FILE, Path(workspace)).read_text())
     except (OSError, ValueError):
         return []
     if not isinstance(doc, dict):
