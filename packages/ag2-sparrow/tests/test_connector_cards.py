@@ -69,6 +69,14 @@ class ConnectorCards(unittest.TestCase):
         self.assertEqual(self.poster().sweep(), 0, "nothing is posted twice")
         self.assertEqual(len(self.sent), 1)
 
+    def test_cards_queued_between_two_sweeps_are_posted_in_the_order_they_were_queued(self):
+        ac, _ = cc._core()
+        for n in range(12):
+            cc.queue(self.state, ROOM, "card %d" % n, ac.build("account-switch", "info", title="Account", body="b",
+                                                               text="step %d" % n))
+        self.assertEqual(self.poster().sweep(), 12)
+        self.assertEqual([sent["body"] for sent in self.sent], ["card %d" % n for n in range(12)])
+
     def test_a_card_that_would_not_render_or_has_no_room_is_refused_at_the_queue(self):
         body, card = model_card()
         for room, line, bad in (("", body, card), ("not-a-room", body, card), (ROOM, "", card),

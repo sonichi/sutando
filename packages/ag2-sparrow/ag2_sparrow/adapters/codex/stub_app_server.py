@@ -7,6 +7,7 @@ request first and echoes the decision; `[[stall]]` never completes until
 `turn/interrupt`; `[[stall-hard]]` ignores the interrupt too.
 """
 import json
+import os
 import sys
 import time
 import uuid
@@ -33,6 +34,21 @@ MODELS = ([{"id": "stub-model", "displayName": "Stub Model", "isDefault": True},
            {"id": "stub-large", "displayName": "Stub Large"}, {"id": "stub-hidden", "displayName": "Hidden", "hidden": True},
            {"id": "stub-broken", "displayName": "Stub Broken"}, {"id": "stub-moved", "displayName": "Stub Moved"}]
           + [{"id": "stub-%d" % n, "displayName": "Stub %d" % n} for n in (5, 6, 7, 8)])
+
+
+def home_file(name, text=None):
+    """A sign-in stand-in under CODEX_HOME: `stub-account` holds the address signed in, `stub-login` says
+    how the next sign-in ends ("success <address>", "fail", "refuse"; absent: it never ends)."""
+    path = os.path.join(os.environ.get("CODEX_HOME") or ".", name)
+    if text is not None:
+        with open(path, "a") as f:
+            f.write(text)
+        return text
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
 
 
 def finish_turn(tid, turn_id, item_id, reply, status="completed", error=None):
@@ -66,6 +82,26 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": rid, "result": {"userAgent": "stub-app-server/0", "codexVersion": "stub"}})
     elif meth == "initialized":
         pass
+    elif meth == "account/read":
+        who = home_file("stub-account").split("\n")[-1]
+        send({"jsonrpc": "2.0", "id": rid, "result": {
+            "account": {"type": "chatgpt", "email": who, "planType": "pro"} if who else None, "requiresOpenaiAuth": True}})
+    elif meth == "account/login/start":
+        plan = home_file("stub-login").split()
+        if plan[:1] == ["refuse"]:
+            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": "login server could not start"}})
+            continue
+        send({"jsonrpc": "2.0", "id": rid, "result": {"type": "chatgpt", "loginId": "login-1",
+                                                      "authUrl": "https://stub.invalid/sign-in?id=login-1"}})
+        if plan[:1] == ["success"]:
+            home_file("stub-account", "\n" + plan[1])
+        if plan:
+            send({"jsonrpc": "2.0", "method": "account/login/completed",
+                  "params": {"loginId": "login-1", "success": plan[0] == "success",
+                             "error": None if plan[0] == "success" else "access_denied"}})
+    elif meth == "account/login/cancel":
+        home_file("stub-cancelled", p.get("loginId", "") + "\n")
+        send({"jsonrpc": "2.0", "id": rid, "result": {}})
     elif meth == "model/list":
         send({"jsonrpc": "2.0", "id": rid, "result": {"data": MODELS if p.get("limit") else MODELS[:1], "nextCursor": None}})
     elif meth in ("thread/start", "thread/resume"):
@@ -97,6 +133,8 @@ for line in sys.stdin:
             reply += " model=%s" % p["model"]
         if "[[askmodel]]" in text:
             reply = "[model-card]"
+        if "[[askaccount]]" in text:
+            reply = "[account-card]"
         if "[[empty]]" in text:
             reply = "" if not THREADS[tid].get("emptied") else "STUB second try"
             THREADS[tid]["emptied"] = True

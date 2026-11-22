@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 
-from . import connector_cards
+from . import card_desk, connector_cards
 
 FILE, CARD, ASK = "model.json", "model-switch", "/model"
 BUTTONS = 6          # the card's button limit
@@ -26,6 +26,7 @@ ANSWERED = "[no-send] the model card answers\n"
 
 
 class ModelSwitch:
+    KIND, ASK, MARK, HINT, IN_DM = "model", ASK, MARK, HINT, IN_DM
     """`publish(result_file, body)` writes a task's result; `quoted(text)` makes the connector's own
     words safe to publish; `refresh()`, when the runtime can list its models on request, is called
     before the card is shown."""
@@ -91,42 +92,21 @@ class ModelSwitch:
                                                           if more else ""), buttons=buttons)
 
     def usable(self) -> bool:
-        """Whether a card can reach the room: the agent's own bridge keeps a state dir (made at install).
-        Without one (a bridge run elsewhere, a bare connector) nothing would post what is queued."""
-        return bool(self.bridge_state) and os.path.isdir(self.bridge_state)
+        return card_desk.usable(self.bridge_state)
 
     def post(self, room, built) -> bool:
-        if not self.usable():
-            return False
-        try:
-            connector_cards.queue(self.bridge_state, str(room or ""), *built)
-            return True
-        except (OSError, ValueError) as e:
-            self.log("model card not queued:", "%s: %s" % (type(e).__name__, e))
-            return False
+        return card_desk.post(self.bridge_state, room, built, self.log)
 
-    def card_task(self, path, result_file) -> str:
-        """What a task that was a card matter came to (a tap, or the owner's /model in their DM), else
-        '': a tap never reaches the model, and a tap this agent cannot match gets the fixed line."""
-        agent_card, _ = connector_cards._core()
-        # The card rules read the task as the core does (the trusted header parse), not the connector's.
-        with open(path, encoding="utf-8") as f:
-            sent, said = agent_card.reply_words(f.read())
-        verdict = connector_cards.click(sent, said, self.root)
-        if verdict.verdict == agent_card.COMMAND and verdict.command.kind == "model":
-            return self.pick(verdict.command.verb, sent, result_file)
-        if verdict.verdict in (agent_card.COMMAND, agent_card.FORGED):
-            self.publish(result_file, self.quoted(verdict.say) + "\n")
-            return "card-refused"
-        ask, _, named = said.strip().partition(" ")
-        if ask.lower() != ASK or agent_card.owner_may_act(sent) is not None or not self.usable():
-            return ""
-        if not named.strip():
+    def tapped(self, verb, sent, result_file) -> str:
+        return self.pick(verb, sent, result_file)
+
+    def asked_for(self, named, sent, result_file) -> str:
+        """The owner's "/model" (the card) or "/model <name>" (the way to a model with no button)."""
+        if not named:
             return self.offer(sent, result_file)
-        # "/model <name>": the way to a model the card has no button for.
         if self.refresh:
             self.refresh()
-        wanted = named.strip().lower()
+        wanted = named.lower()
         match = [m["id"] for m in self.state().get("available") or [] if wanted in (m["id"].lower(), m["name"].lower())]
         return self.pick(match[0] if match else "", sent, result_file)
 
@@ -157,19 +137,6 @@ class ModelSwitch:
         else:
             self.publish(result_file, self.quoted("I could not post the model card. Try again in a moment.") + "\n")
         return "model-card"
-
-    def asked(self, tier, path, status, text, result_file) -> str:
-        """The runtime answered the owner with the mark alone: show the card in their DM, or say where to
-        ask. '' for any other answer, and for any sender but the owner, whose mark is then ordinary text."""
-        if status != "completed" or (text or "").strip() != MARK or tier != "owner":
-            return ""
-        agent_card, _ = connector_cards._core()
-        with open(path, encoding="utf-8") as f:
-            sent, _ = agent_card.reply_words(f.read())
-        if agent_card.owner_may_act(sent) is None:
-            return self.offer(sent, result_file)
-        self.publish(result_file, self.quoted(IN_DM) + "\n")
-        return "model-card-elsewhere"
 
     def tell(self, live, ran) -> str:
         """Once per pick, after the first owner turn that reached the runtime (`live`): say in the DM the

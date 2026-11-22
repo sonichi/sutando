@@ -37,7 +37,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from ... import acp_host, connector_cards, held_start, model_switch, result_labels, result_publish
+from ... import acp_host, card_desk, connector_cards, held_start, model_switch, result_labels, result_publish
 from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore, quoted, trigger_of  # noqa: F401
 from ...acp_client import AcpClient as _SharedClient
 from ...relay_loop import count_arg
@@ -194,6 +194,7 @@ class Connector:
         self.retry_at = {}
         self.models = model_switch.ModelSwitch(args.state, self.root, getattr(args, "bridge_state", None), NAME,
                                                publish, quoted, log)
+        self.desk = card_desk.Desk(self.root, publish, quoted, [self.models])
 
     def models_seen(self, models: dict):
         """Remember what a Session offered (ACP `models`), for the card."""
@@ -202,7 +203,7 @@ class Connector:
 
     def card_task(self, task_id, headers, path, result_file):
         """The record of a task that was a card matter (a tap, or the owner's /model in their DM), else None."""
-        outcome = self.models.card_task(path, result_file)
+        outcome = self.desk.task(path, result_file)
         if not outcome:
             return None
         log("card ->", task_id, outcome)
@@ -271,13 +272,13 @@ class Connector:
             return carded
         prompt = wake_prompt(task_id, headers, message, operator_lines, self.args.cwd if tier == "owner" else None,
                              self.note, shell_web=tier == "owner" and shell_web_on(self.args, headers))
-        if headers.get("access_tier") == "owner" and self.models.usable():
-            prompt += "\n\n" + model_switch.HINT
+        if headers.get("access_tier") == "owner" and self.desk.hint():
+            prompt += "\n\n" + self.desk.hint()
         event, _ = trigger_of(headers)
         log("wake ->", task_id, headers["access_tier"], event or "message")
         t0 = time.time()
         status, text, detail, turn = self.run_turn(task_id, headers, prompt, tier == "owner")
-        asked = self.models.asked(headers.get("access_tier"), path, status, text, result_file)
+        asked = self.desk.marked(headers.get("access_tier"), path, status, text, result_file)
         if not asked:
             publish(result_file, self.answer_body(headers, status, text, detail, turn))
         told = self.models.tell(turn.live, turn.model) if tier == "owner" else ""

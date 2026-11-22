@@ -21,7 +21,8 @@ from unittest import mock
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
-from ag2_sparrow import connector_cards, local_task_protocol, model_switch, task_io, team_guardrail  # noqa: E402
+from ag2_sparrow import (account_switch, connector_cards, local_task_protocol, model_switch, task_io,  # noqa: E402
+                         team_guardrail)
 from ag2_sparrow.adapters.codex import codex_connector as cc  # noqa: E402
 
 # The note as it was pinned before it moved to the shared owner: proves the move changed no byte.
@@ -37,6 +38,7 @@ PINNED_NON_OWNER_NOTE = (
 TAG = r"UNTRUSTED_TASK_[0-9a-f]{8}"
 REPO_ROOT = PKG_ROOT.parents[1]
 REAL_SERVER_ARGV = cc.server_argv
+REAL_OPEN_PAGE = cc.open_page
 
 
 def covered_server_argv(server, codex="codex"):
@@ -634,10 +636,10 @@ class EndToEndStubTest(unittest.TestCase):
             self.assertEqual([m["status"] for m in metrics(d)], ["completed", "completed"])
 
 
-class ModelCardTest(unittest.TestCase):
-    """The owner's model card (model_switch): asked for in their DM, tapped, and confirmed there."""
+class CardWorld:
+    """A work root with the agent's own bridge beside it, DM tasks, and the bridge's posting of queued cards."""
 
-    DM = "!dm:s.space"
+    DM, CARD = "!dm:s.space", "model-switch"
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -655,7 +657,7 @@ class ModelCardTest(unittest.TestCase):
         if reply_to:
             lines.append("reply_to_event: " + reply_to)
         if click:
-            lines.append("card_click: " + json.dumps({"card_id": "model-switch", "action": click}))
+            lines.append("card_click: " + json.dumps({"card_id": self.CARD, "action": click}))
         write_text(self.work, tid, "\n".join(lines + ["task: " + body]) + "\n")
 
     def serve(self, tid, body, extra=(), **kw):
@@ -669,6 +671,11 @@ class ModelCardTest(unittest.TestCase):
         connector_cards.Poster(self.bridge, lambda p: sent.append(p) or {"ok": True, "event_id": event},
                                log=lambda line: None).sweep()
         return [(p["room_id"], p["extra_content"]["space.ag2.card"]) for p in sent]
+
+
+
+class ModelCardTest(CardWorld, unittest.TestCase):
+    """The owner's model card (model_switch): asked for in their DM, tapped, and confirmed there."""
 
     def state(self):
         return json.loads((self.work / "state" / "model.json").read_text())
@@ -776,6 +783,137 @@ class ModelCardTest(unittest.TestCase):
         self.assertEqual(c.models.state()["available"], [{"id": "m1", "name": "One"}], "the last list is kept")
         with mock.patch.object(cc.connector_cards, "absorb", side_effect=ValueError("bad ledger")):
             self.assertTrue(self.serve("task-1", "hello").startswith("STUB echo: Sutando task task-1 (source=ag2space"))
+
+
+class AccountCardTest(CardWorld, unittest.TestCase):
+    """The owner's account card (account_switch): asked for in their DM, tapped, signed in in the browser
+    of the computer the agent runs on, and confirmed in that DM."""
+
+    CARD = "account-switch"
+
+    def setUp(self):
+        super().setUp()
+        self.home = Path(self.tmp.name) / "codex-home"
+        self.home.mkdir()
+        (self.home / "stub-account").write_text("alice@example.com")
+        self.opened = []
+        for patch in (mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home)}),
+                      mock.patch.object(cc, "open_page", side_effect=lambda url: self.opened.append(url) or True)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def tap(self, extra_task=True, event="$card1"):
+        """Ask for the card, have the bridge post it, tap "Switch account"; with `extra_task`, an
+        ordinary message follows in the same run, during which the server reports the sign-in over."""
+        self.assertEqual(self.serve("task-ask", "/account"), "[no-send] the account card answers\n")
+        ((room, card),) = self.posted(event)
+        self.assertEqual((room, card["state"], [b["label"] for b in card["buttons"]]), (self.DM, "pending", ["Switch account"]))
+        said = card["buttons"][0]["reply"]
+        self.dm("task-tap", said, reply_to=event, click=said)
+        if extra_task:
+            self.dm("task-next", "hello")
+            os.utime(self.work / "tasks" / "task-next.txt", (time.time() + 5, time.time() + 5))
+        self.assertEqual(run_connector(self.work, once=2), 0)
+        return card
+
+    def again(self, event):
+        """Ask for a new card (a card that was answered no longer acts) and tap it."""
+        self.serve("task-ask-" + event[1:], "/account")
+        ((_, card),) = self.posted(event)
+        said = card["buttons"][0]["reply"]
+        self.serve("task-tap-" + event[1:], said, reply_to=event, click=said)
+
+    def test_the_card_names_the_account_and_a_tap_signs_in_and_says_which_account_is_used_now(self):
+        (self.home / "stub-login").write_text("success bob@example.org")
+        card = self.tap()
+        self.assertEqual(card["text"], "I'm signed in as a…@example.com (pro).")
+        self.assertEqual(result(self.work, "task-tap"), "[no-send] the account card answers\n")
+        self.assertEqual(self.opened, ["https://stub.invalid/sign-in?id=login-1"], "the page is shown on this computer")
+        (_, started), (room, done) = self.posted("$card2")
+        self.assertEqual((started["state"], [(b["kind"], b["url"]) for b in started["buttons"]]),
+                         ("info", [("url", "https://stub.invalid/sign-in?id=login-1")]))
+        self.assertEqual(started["text"], "I opened the sign-in page in the browser on the computer I run on. Finish "
+                                          "signing in there; I'll confirm here. Until then: I'm signed in as "
+                                          "a…@example.com (pro).")
+        self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Signed in. I'm signed in as b…@example.org (pro)."))
+        self.assertEqual(json.loads((self.work / "state" / "account.json").read_text()), {})
+        self.assertTrue(result(self.work, "task-next").startswith("STUB echo:"), "the turn it arrived in is answered as usual")
+        self.assertEqual([m.get("card") for m in metrics(self.work)], ["account-card", "account-started", None])
+
+    def test_a_sign_in_that_fails_or_cannot_start_says_so_and_names_the_account_still_in_use(self):
+        (self.home / "stub-login").write_text("fail")
+        self.tap(extra_task=False)       # nothing else to do: the report arrives while the connector idles
+        (_, _started), (_, failed) = self.posted("$card2")
+        self.assertEqual((failed["state"], failed["text"]),
+                         ("error", "The sign-in did not finish (access_denied). I'm signed in as a…@example.com (pro)."))
+        (self.home / "stub-login").write_text("refuse")
+        self.again("$card3")
+        ((_, refused),) = self.posted("$card4")
+        self.assertEqual((refused["state"], refused["text"], metrics(self.work)[-1]["card"]),
+                         ("error", "I could not start a sign-in. I'm signed in as a…@example.com (pro).", "account-not-started"))
+
+    def test_a_sign_in_nobody_finishes_is_given_up_after_ten_minutes_and_a_new_tap_gives_up_the_old_one(self):
+        with mock.patch.object(cc, "open_page", return_value=False):
+            self.tap()
+        ((_, started),) = self.posted("$card2")
+        self.assertTrue(started["text"].startswith("Open the sign-in page on the computer I run on."), started["text"])
+        pending = json.loads((self.work / "state" / "account.json").read_text())
+        self.assertEqual((pending["id"], pending["room"]), ("login-1", self.DM))
+        self.again("$card3")
+        self.assertEqual((self.home / "stub-cancelled").read_text().split(), ["login-1"], "the first sign-in was cancelled")
+        self.posted("$card4")
+        (self.work / "state" / "account.json").write_text(json.dumps(dict(pending, at=time.time() - account_switch.WAIT_S - 1)))
+        self.assertTrue(self.serve("task-later", "hello").startswith("STUB echo:"))
+        ((room, gone),) = self.posted("$card5")
+        self.assertEqual((room, gone["state"]), (self.DM, "error"))
+        self.assertEqual(gone["text"], "The sign-in was not finished in 10 minutes, so I stopped waiting. I'm signed in "
+                                       "as a…@example.com (pro). Send /account to try again.")
+        self.assertEqual(len((self.home / "stub-cancelled").read_text().split()), 2)
+        self.assertEqual(json.loads((self.work / "state" / "account.json").read_text()), {})
+
+    def test_asking_in_ones_own_words_shows_the_card_in_the_dm_and_says_where_to_ask_elsewhere(self):
+        self.assertEqual(self.serve("task-1", "[[askaccount]] switch account please"), "[no-send] the account card answers\n")
+        self.assertEqual((metrics(self.work)[-1]["card"], len(self.posted())), ("account-card", 1))
+        self.assertEqual(self.serve("task-2", "[[askaccount]] switch", channel="!room:s.space", kind="room").strip(),
+                         account_switch.IN_DM)
+        (self.home / "stub-account").write_text("")
+        self.serve("task-3", "/account")
+        ((_, card),) = self.posted()
+        self.assertEqual(card["text"], "I'm not signed in.")
+
+    def test_the_account_is_named_without_its_address_and_what_cannot_be_read_is_not_called_signed_out(self):
+        self.assertEqual([account_switch.masked(e) for e in ("alice@example.com", "", "no-at-sign", "@x.org")],
+                         ["a…@example.com", "", "", ""])
+        args = cc.build_parser().parse_args(["--work", str(self.work)])
+        args.state, args.bridge_state = str(self.work / "state"), str(self.bridge)
+        (self.work / "state").mkdir(parents=True)
+        c = cc.Connector(FakeRpc, args, note="n")
+        for account, label in (({"type": "apiKey"}, "an API key"), ({"type": "amazonBedrock"}, "Amazon Bedrock"),
+                               ({"type": "new-kind"}, "an account I can't name"), (None, ""),
+                               ({"type": "chatgpt", "email": None, "planType": None}, "a ChatGPT account")):
+            with mock.patch.object(c.rpc, "request", return_value={"account": account}, create=True):
+                self.assertEqual(c.account_label(), label, account)
+        with mock.patch.object(c.rpc, "request", side_effect=RuntimeError("account/read: timed out"), create=True):
+            self.assertEqual(c.accounts.using(), "I could not read which account I'm signed in with.")
+            # A cancel the server refuses still clears the pending sign-in; one this card did not start is ignored.
+            c.accounts.keep({"id": "login-9", "room": self.DM, "at": time.time()})
+            self.assertEqual(c.accounts.finished("another-login", True), "")
+            c.accounts.give_up(c.accounts.pending())
+            self.assertEqual(c.accounts.pending(), {})
+        out = self.work / "results" / "task-x.txt"
+        self.assertEqual(c.accounts.tapped("other", {"channel_id": self.DM}, str(out)), "account-unknown")
+        self.assertIn("couldn't match that button", out.read_text())
+
+    def test_the_sign_in_page_is_opened_with_the_systems_own_opener_and_a_failure_is_not_an_error(self):
+        ran = []
+        ok = lambda argv, **kw: ran.append(argv) or mock.Mock(returncode=0)    # noqa: E731
+        with mock.patch.object(cc.sys, "platform", "darwin"):
+            self.assertTrue(REAL_OPEN_PAGE("https://example.org/a", run=ok))
+            self.assertFalse(REAL_OPEN_PAGE("https://example.org/a", run=lambda argv, **kw: mock.Mock(returncode=1)))
+            self.assertFalse(REAL_OPEN_PAGE("https://example.org/a", run=mock.Mock(side_effect=OSError("no open"))))
+        with mock.patch.object(cc.sys, "platform", "linux"), mock.patch.object(cc.shutil, "which", return_value=None):
+            self.assertFalse(REAL_OPEN_PAGE("https://example.org/a", run=ok))
+        self.assertEqual(ran, [["open", "https://example.org/a"]])
 
 
 class FakeRpc:

@@ -67,7 +67,8 @@ def queue(bridge_state, room: str, body: str, card: dict, *, now=None) -> str:
         raise ValueError("the card would not render: %s" % found)
     if not _ROOM_RE.match(room or "") or not body or "\n" in body:
         raise ValueError("a card needs a room id and a one-line body")
-    qid = uuid.uuid4().hex
+    # The clock leads the id, so two cards queued between sweeps are posted in the order they were queued.
+    qid = "%016x%s" % (time.time_ns(), uuid.uuid4().hex[:16])
     _write(Path(bridge_state).joinpath(*OUTBOX) / (qid + ".json"),
            {"room": room, "body": body, "card": card, "queued_at": time.time() if now is None else now})
     return qid
