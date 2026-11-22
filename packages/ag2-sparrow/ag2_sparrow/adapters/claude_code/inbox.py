@@ -37,7 +37,7 @@ ALLOW_COLLABORATOR = "ALLOW_COLLABORATOR"
 ISOLATED_TIMEOUT_S = 120.0
 ISOLATED_PER_HOUR = 10
 ISOLATED_LIMITER_FILE = "isolated-turns.json"
-ISOLATED_FAILED = ("[s.space] This agent could not answer this message right now; send it again later if it is "
+ISOLATED_FAILED = ("This agent could not answer this message right now; send it again later if it is "
                    "still wanted.\n")
 
 

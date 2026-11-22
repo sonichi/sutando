@@ -92,9 +92,8 @@ def run_collaborator_turn(claude, text, env, timeout=120.0, run=subprocess.run, 
     return Turn("ok", text=body)
 
 
-# The gateway's Sutando tier block is written for a core that writes results/<task>.txt and can run
-# `codex exec`. The isolated turn does neither: its reply text is the result, and it is the read-only
-# sandbox itself. isolated_lines says those steps as this turn can follow them; every other rule is kept.
+# The gateway's tier block assumes a core that writes results/<task>.txt and runs `codex exec`; this
+# turn does neither (its reply is the result, it is the sandbox), so isolated_lines restates those steps.
 _RESULT = r"results/[^\s()`'\"]+\.txt"
 NO_RESULT_FILE = "there is no results file to write"
 TIER_REWRITES = tuple((re.compile(a), b) for a, b in (

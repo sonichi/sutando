@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import functools
+import gc
 import io
 import json
 import os
@@ -487,13 +488,11 @@ class Install(Base):
         for recorded in ("1", "", None):     # served by default, the older flag, and an older install's empty value
             c = dict(cfg, ALLOW_NON_OWNER=recorded) if recorded is not None else \
                 {k: v for k, v in cfg.items() if k != "ALLOW_NON_OWNER"}
-            argv = cli.connector_argv(c, str(self.work), 7)
-            self.assertNotIn("--no-allow-non-owner", argv, recorded)
-            self.assertIs(cc.build_parser().parse_args(argv[3:]).allow_non_owner, True, recorded)
-        self.assertIs(cc.build_parser().parse_args(
-            cli.connector_argv(cfg, str(self.work), 7)[3:]).allow_non_owner, False)
-        self.assertIs(cc.build_parser().parse_args(["--work", str(self.work), "--allow-non-owner"]).allow_non_owner, True,
-                      "the older flag still works")
+            self.assertNotIn("--no-allow-non-owner", cli.connector_argv(c, str(self.work), 7), recorded)
+        # Only the non-owner flag is parsed: the full argv's --root-fd would open a descriptor.
+        parsed = lambda *flags: cc.build_parser().parse_args(["--work", str(self.work), *flags]).allow_non_owner  # noqa: E731
+        self.assertEqual((parsed(), parsed("--no-allow-non-owner")), (True, False))
+        self.assertIs(parsed("--allow-non-owner"), True, "the older flag still works")
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             cli.main(["install", "--work", str(self.work), "--sandbox", "danger-full-access"])
 
@@ -1222,6 +1221,7 @@ class ConnectCode(UndoSeams, Base):
         spies = {name: mock.patch.object(mod, name, wraps=getattr(mod, name)) for mod, name in
                  ((cm, "_post_json"), (cm, "redeem_code"), (cm, "operation_lock"), (cm, "agent_lock"),
                   (cb, "redeem_into_seat"), (cli, "connect_preflight"))}
+        gc.collect()    # an earlier test's leaked pipes warn when collected: not into the stderr asserted below
         with mock.patch.object(sm, "_run", side_effect=fake), mock.patch.object(cm, "is_macos", return_value=False), \
                 mock.patch.object(urllib.request, "urlopen", side_effect=backend), \
                 contextlib.ExitStack() as stack, \
