@@ -554,6 +554,19 @@ ensure_local_agent_api() {
 }
 ensure_local_agent_api
 
+# >>> codex-app-server-seat
+# A core last started as an app-server seat (its declaration exists): --restart replaces that
+# window too, whichever way SUTANDO_CODEX_APP_SERVER is set now.
+if [ "${1:-}" = "--restart" ] && tmux_available; then
+  _seat_ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || _seat_ws=""
+  if [ -n "$_seat_ws" ] && [ -f "$_seat_ws/state/codex-seat/$SESSION/host.json" ]; then
+    for _win in $(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" all codex-seat 2>/dev/null); do
+      tmux -S "$TMUX_SOCKET" kill-window -t "$_win" 2>/dev/null || true
+    done
+    [ "${SUTANDO_CODEX_APP_SERVER:-}" = 1 ] || rm -f "$_seat_ws/state/codex-seat/$SESSION/host.json"
+  fi
+fi
+# <<< codex-app-server-seat
 if [ "${1:-}" = "--restart" ]; then
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$WATCHER_SESSION" 2>/dev/null || true
   tmux_available && tmux -S "$TMUX_SOCKET" kill-session -t "=$OBSERVER_SESSION" 2>/dev/null || true
@@ -596,6 +609,16 @@ codex_core_missing() {
   ids="$(sutando_core_window_ids "$TMUX_SOCKET" "$SESSION" live codex)" && [ -z "$ids" ]
 }
 
+# >>> codex-app-server-seat
+# SUTANDO_CODEX_APP_SERVER=1: the core is a seat on `codex app-server` (docs/codex-core.md), with
+# no notifier or observer session beside it. Unset, nothing below this block changes.
+SEAT_MODE=""
+if [ "${SUTANDO_CODEX_APP_SERVER:-}" = 1 ]; then
+  SEAT_MODE=1
+  . "$REPO/src/agent/codex/app-server/seat-launch.sh"
+  seat_core_overrides
+fi
+# <<< codex-app-server-seat
 if session_exists "$SESSION" && ! codex_core_missing; then
   record_confirmed_core_runtime codex "$(heartbeat_python)"
   apply_tmux_defaults
@@ -717,6 +740,9 @@ wait_core_up() {
 # core as the session's lowest window, the notifier's target, and leave every sibling running.
 heal_core_window() {
   local idx low others
+  # >>> codex-app-server-seat
+  if [ -n "$SEAT_MODE" ]; then seat_heal_core_window; return; fi
+  # <<< codex-app-server-seat
   # Empty "live codex" also means a core the command match cannot see: a second core would poll the same workspace.
   if others="$(sutando_unidentified_live_windows "$TMUX_SOCKET" "$SESSION" codex)" && [ -n "$others" ]; then
     echo "  ⚠ $SESSION has live windows ($(echo $others)) that are not a known sibling and not identifiable as the Codex core — not healing, a second core would double-poll. Stop the core or kill the session, then relaunch." >&2
@@ -761,6 +787,9 @@ fi
 # Creates the core session, waits for has-session within the configured budget
 # (new-session rc=0 only means tmux accepted it), then starts the helpers.
 start_core_session_and_helpers() {
+  # >>> codex-app-server-seat
+  if [ -n "$SEAT_MODE" ]; then seat_start_core_session_and_helpers; return; fi
+  # <<< codex-app-server-seat
   prepare_codex_bootstrap || return 1
   prepare_codex_home
   tmux -S "$TMUX_SOCKET" new-session -d -s "$SESSION" "${CORE_ENV_ARGS[@]}" codex "${CODEX_ARGS[@]}"

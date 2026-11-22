@@ -157,18 +157,107 @@ class ConnectorTest(unittest.TestCase):
         self.assertIn("hello", said)
         self.assertEqual(parse_markers(said).actions, [])
 
-    def test_the_owner_may_edit_only_under_the_working_directory_and_no_command_is_granted(self):
+    def test_the_owner_may_edit_only_under_the_working_directory_and_no_command_is_granted_by_default(self):
+        """Without --allow-owner-shell-web an install behaves as before the opt-in existed."""
+        self.w.task("task-1", "STUB:EDIT go")
+        self.w.task("task-2", "STUB:SHELL go", channel="!b:s.space")
+        self.w.task("task-3", "STUB:WEB go", channel="!c:s.space")
+        os.utime(self.w.root / "tasks" / "task-2.txt", (2e9, 2e9))
+        os.utime(self.w.root / "tasks" / "task-3.txt", (3e9, 3e9))
+        self.w.serve(3)
+        self.assertEqual(self.permissions(), {"WriteFile notes.txt": True, "WriteFile /etc/stub-outside": False,
+                                              "rm -rf ~ [current working directory]": False, "date": False,
+                                              "Fetch https://example.com/": False,
+                                              "Search the web: news today": False})
+        reasons = [d["reason"] for m in self.w.metrics() for d in m["permissions"]]
+        self.assertEqual(reasons[:3], ["under the working directory", "outside the working directory",
+                                       "no command is granted"])
+        prompt = next(r["text"] for r in self.w.records() if r.get("method") == "session/prompt")
+        self.assertIn("No shell command is granted", prompt)
+
+    def test_with_the_opt_in_the_owner_may_run_commands(self):
         self.w.task("task-1", "STUB:EDIT go")
         self.w.task("task-2", "STUB:SHELL go", channel="!b:s.space")
         os.utime(self.w.root / "tasks" / "task-2.txt", (2e9, 2e9))
-        self.w.serve(2)
+        self.w.serve(2, "--allow-owner-shell-web")
         perms = [r for r in self.w.records() if "permission" in r]
         self.assertEqual(perms, [{"permission": "WriteFile notes.txt", "allowed": True},
                                  {"permission": "WriteFile /etc/stub-outside", "allowed": False},
-                                 {"permission": "rm -rf ~ [current working directory]", "allowed": False}])
+                                 {"permission": "rm -rf ~ [current working directory]", "allowed": True}])
         reasons = [d["reason"] for m in self.w.metrics() for d in m["permissions"]]
         self.assertEqual(reasons, ["under the working directory", "outside the working directory",
-                                   "no command is granted"])
+                                   "commands, web fetch and search are on for this turn"])
+
+    def permissions(self):
+        return {r["permission"]: r["allowed"] for r in self.w.records() if "permission" in r}
+
+    def test_with_the_opt_in_the_owner_may_run_a_command_and_fetch_and_search_the_web(self):
+        """--allow-owner-shell-web: the owner's agy runs commands and uses the web as local Claude Code does."""
+        self.w.task("task-1", "STUB:WEB go")
+        self.w.serve(1, "--allow-owner-shell-web")
+        self.assertEqual(self.permissions(), {"date": True, "Fetch https://example.com/": True,
+                                              "Search the web: news today": True})
+        prompt = next(r["text"] for r in self.w.records() if r.get("method") == "session/prompt")
+        self.assertIn("You may run shell commands and fetch and search the web.", prompt)
+        self.assertNotIn("No shell command is granted", prompt)
+
+    def test_the_owner_writes_and_edits_with_agys_own_argument_names_under_the_working_directory(self):
+        """A real owner turn's write was refused with "unrecognised key Content": agy names its arguments Path,
+        Content, Overwrite, Edits. Outside the working directory, and with a key agy does not declare, it is not."""
+        self.w.task("task-1", "STUB:AGYWRITE go")
+        self.w.serve()
+        self.assertEqual(self.permissions(), {"File notes.txt": True, "Edit notes.txt": True,
+                                              "File /etc/stub-outside": False, "File notes.txt (unknown key)": False})
+        reasons = [d["reason"] for m in self.w.metrics() for d in m["permissions"]]
+        self.assertEqual(reasons, ["under the working directory", "under the working directory",
+                                   "outside the working directory", "unrecognised key Mystery"])
+
+    def test_unknown_operation_kinds_are_refused_even_for_the_owner(self):
+        self.w.task("task-1", "STUB:ODD go")
+        self.w.serve()
+        self.assertEqual(self.permissions(), {"odd delete": False, "odd move": False, "odd other": False,
+                                              "odd think": False, "odd None": False})
+
+    def test_team_on_the_owners_turn_gets_no_command_and_no_web(self):
+        """SHELL_AND_WEB_TIERS is the owner only: a collaborator given the owner's turn (as #6645 does) keeps
+        the owner's file policy and gets no command, fetch or search; adding Team is the owner's decision."""
+        self.assertEqual(gc.SHELL_AND_WEB_TIERS, frozenset({"owner"}))
+        headers = {"channel_id": "!t:s.space", "access_tier": "team", "collaborator": "true",
+                   "user_id": "@bob:s.space"}
+        conn = gc.Connector(self.w.args("--allow-owner-shell-web"))
+        for tid, body in (("task-1", "STUB:WEB go"), ("task-2", "STUB:AGYWRITE go")):
+            with contextlib.redirect_stderr(io.StringIO()):
+                conn.run_turn(tid, headers, body, True)
+        self.assertEqual(self.permissions(), {"date": False, "Fetch https://example.com/": False,
+                                              "Search the web: news today": False, "File notes.txt": True,
+                                              "Edit notes.txt": True, "File /etc/stub-outside": False,
+                                              "File notes.txt (unknown key)": False})
+        prompt = gc.wake_prompt("task-3", headers, "hi", [], str(self.w.cwd),
+                                shell_web=gc.shell_web_on(conn.args, headers))
+        self.assertIn("No shell command is granted", prompt)
+
+    def test_a_guest_may_not_run_a_command_fetch_or_write(self):
+        self.w.task("task-1", "STUB:WEB go", tier="guest")
+        self.w.task("task-2", "STUB:AGYWRITE go", tier="guest", channel="!b:s.space")
+        os.utime(self.w.root / "tasks" / "task-2.txt", (2e9, 2e9))
+        self.w.serve(2, "--allow-non-owner", "--allow-owner-shell-web")
+        perms = self.permissions()
+        self.assertEqual(len(perms), 7)
+        self.assertEqual(set(perms.values()), {False})
+
+    def test_the_shared_policy_is_unchanged_for_other_acp_adapters(self):
+        """agy's argument names and the command/web grant are the Antigravity adapter's: acp_host's default (what
+        OpenClaw calls) still refuses agy's keys and every execute, fetch or search call."""
+        opts = [{"optionId": "a", "kind": "allow_once"}, {"optionId": "r", "kind": "reject_once"}]
+        inside = str(self.w.cwd / "notes.txt")
+
+        def decide(tc, **kw):
+            return acp_host.decide_permission({"toolCall": tc, "options": opts}, True, str(self.w.cwd), **kw)[:2]
+        write = {"kind": "edit", "rawInput": {"Content": "x", "Path": inside}}
+        self.assertEqual(decide(write), (False, "unrecognised key Content"))
+        self.assertEqual(decide(write, extra_keys=gc.AGY_KEYS), (True, "under the working directory"))
+        for kind in ("execute", "fetch", "search"):
+            self.assertFalse(decide({"kind": kind, "rawInput": {"Url": "https://example.com/"}})[0], kind)
 
     def test_agys_own_file_tool_keys_are_checked_against_the_working_directory(self):
         # The keys agy's read_file / write_file / write_to_file send (Path, TargetFile, Content, ...), from its
@@ -177,7 +266,8 @@ class ConnectorTest(unittest.TestCase):
         cwd = str(self.w.cwd)
 
         def decide(kind, raw):
-            return acp_host.decide_permission({"toolCall": {"kind": kind, "rawInput": raw}, "options": opts}, True, cwd)[:2]
+            return acp_host.decide_permission({"toolCall": {"kind": kind, "rawInput": raw}, "options": opts}, True, cwd,
+                                              extra_keys=gc.AGY_KEYS)[:2]
         inside, outside = os.path.join(cwd, "agent.json"), os.path.join(os.path.dirname(cwd), "agent.json")
         self.assertEqual(decide("read", {"Path": inside, "StartLine": 1, "EndLine": 9}), (True, "under the working directory"))
         self.assertEqual(decide("read", {"Path": outside}), (False, "outside the working directory"))
@@ -360,7 +450,7 @@ class ConnectorTest(unittest.TestCase):
         rec = self.w.metrics()[0]
         self.assertEqual((rec["detail"], rec["updates"]), ("end_turn", {"tool_call": 1}))
         self.assertEqual([(d["reason"], d["category"]) for d in rec["permissions"]],
-                         [("cannot tell what this would touch", "file change")])
+                         [("cannot tell what this would touch", "file change")])   # Content is agy's data key
         c = gc.Connector(self.w.args())
         turn = acp_host.Turn()
         self.assertEqual(c.answer_body({"access_tier": "owner"}, "completed", "", "max_tokens", turn),
@@ -394,7 +484,7 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         said = self.w.result("task-1")
         self.assertNotIn("Content", said)
-        self.assertIn("cannot tell what this would touch", self.w.metrics()[0]["permissions"][0]["reason"])
+        self.assertEqual(self.w.metrics()[0]["permissions"][0]["reason"], "cannot tell what this would touch")
 
     def test_failures_are_said_for_a_message_and_quiet_for_an_event(self):
         c = gc.Connector(self.w.args())
@@ -578,7 +668,12 @@ class InstallVerifyTest(unittest.TestCase):
     def test_the_connector_runs_held_with_the_recorded_settings_and_a_narrow_env(self):
         cfg = {"ACP_COMMAND": "%s acp" % self.agy, "CWD": str(self.cwd),
                "SESSION_STORE": "/s.json", "ALLOW_NON_OWNER": "1"}
+        self.assertNotIn("--allow-owner-shell-web", cli.connector_argv(cfg, str(self.work), 7), "off unless recorded")
+        cfg["ALLOW_OWNER_SHELL_WEB"] = "1"
         argv = " ".join(cli.connector_argv(cfg, str(self.work), 7))
+        self.assertIn("--allow-owner-shell-web", argv)
+        self.assertIn("ALLOW_OWNER_SHELL_WEB", cli.CONFIG_KEYS)
+        self.assertIn(("ALLOW_OWNER_SHELL_WEB", "allow_owner_shell_web"), [r[:2] for r in cli.RECORDED])
         for part in ("-m %s" % gc.__name__, "--held --root-fd 7",
                      "--acp-command %s acp" % self.agy, "--session-store /s.json", "--allow-non-owner"):
             self.assertIn(part, argv)
