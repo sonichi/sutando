@@ -753,6 +753,25 @@ class Crash(SeatCase):
             self.assertEqual(self.sent("turn/start"), [], name)
             s.close_server()
 
+    def test_a_task_answered_or_taken_between_its_pick_and_a_warm_dispatch_is_not_dispatched(self):
+        for name, meanwhile in (
+                ("task-1.txt", lambda: (self.results / "task-1.txt").write_text("answered\n", encoding="utf-8")),
+                ("task-2.txt", lambda: (self.tasks / "task-2.txt").unlink())):
+            self.task(name)
+            s = self.make()
+            s.ensure_server()
+            build = s.prompt_for
+
+            def built_slowly(filename, payload, build=build, meanwhile=meanwhile):
+                prompt = build(filename, payload)
+                meanwhile()
+                return prompt
+
+            s.prompt_for = built_slowly
+            self.assertEqual(s.step(), "done" if name == "task-1.txt" else seat_mod.WITHDRAWN)
+            self.assertEqual(self.sent("turn/start"), [], name)
+            s.close_server()
+
     def test_a_child_that_dies_twice_stops_the_seat_and_the_task_is_not_lost(self):
         self.task("task-1.txt")
         self.plan("die", "die")
@@ -1270,6 +1289,23 @@ class WatcherChild(SeatCase):
         self.assertEqual(s.watcher.announced.get("task-1.txt"), seat_mod.generation(self.tasks / "task-1.txt"))
         self.assertEqual(s.step(), "done")
         self.assertEqual(len(self.sent("turn/start")), 1)
+
+    def test_a_file_replaced_after_the_queue_chose_it_is_not_dispatched_even_with_the_server_running(self):
+        # Selection to dispatch, warm: the admitted generation is carried to the dispatch and read last.
+        s = self.make()
+        s.ensure_server()
+        s.watcher = self.announcing(s.wake)
+        s.watcher.ensure()
+        self.addCleanup(s.watcher.stop)
+        first = self.task("task-1.txt")
+        self.announce(s, "task-1.txt")
+        chosen = s.pending()
+        self.assertEqual([name for name, _ in chosen], ["task-1.txt"])
+        other = self.task("task-1.txt.new", "task: something else entirely\n", folder=self.ws)
+        os.replace(other, first)
+        self.assertEqual(s.run_task(*chosen[0]), seat_mod.WITHDRAWN)
+        self.assertEqual(self.sent("turn/start"), [])
+        self.assertIn("not the file that was admitted", self.out.getvalue())
 
     def test_an_announcement_naming_a_path_is_kept_by_its_file_name(self):
         s = self.make()

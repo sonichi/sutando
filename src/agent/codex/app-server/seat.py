@@ -505,6 +505,14 @@ class Seat:
             log(f"{len(names)} pending task(s) held: {why}")
         return []
 
+    def admitted(self, filename: str, payload: Path) -> Optional[tuple]:
+        """The generation this task was admitted as: the one the core's watcher announced, else
+        the file as it is when the task is picked (a worker's delivery, or a core with no watcher)."""
+        watcher = self.watcher
+        if not self.worker and watcher is not None and watcher.alive():
+            return watcher.announced.get(filename)
+        return generation(payload)
+
     def still_owed(self, filename: str, picked: Optional[tuple]) -> bool:
         """Whether the task this seat picked is still its own, unanswered, and the same file."""
         return any(name == filename and generation(path) == picked for name, path in self.pending())
@@ -685,18 +693,18 @@ class Seat:
             self.deferred[filename] = self.clock() + self.retry_s
             return "deferred"
         log(f"task {filename}: picked")
-        picked = generation(payload)
+        picked = self.admitted(filename, payload)
         prompt = self.prompt_for(filename, payload)
         started = time.monotonic()
         status, detail = "server-exited", ""
         for attempt in (1, 2):
-            started_server = self.ensure_server()
+            self.ensure_server()
             if self.stop_requested(filename):
                 status, detail = STOPPED, "a Stop opened before the turn was dispatched"
                 break
-            # Starting a server takes long enough for the task to be answered, taken or replaced.
-            if (attempt > 1 or started_server) and not self.still_owed(filename, picked):
-                status, detail = WITHDRAWN, "answered or no longer this seat's when the server came back"
+            # Read last, on every attempt: the task can be answered, taken or replaced at any point.
+            if not self.still_owed(filename, picked):
+                status, detail = WITHDRAWN, "answered, no longer this seat's, or not the file that was admitted"
                 break
             status, detail = self.run_turn(filename, prompt)
             if status != "server-exited" or has_ready_result(results, filename):

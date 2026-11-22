@@ -988,6 +988,15 @@ dispatch_task() {
       esac
       ;;
   esac
+  # For a reader that runs only the announced generation: one this decision could not read, or one that
+  # changed while the identity was being read, is not announced and not admitted. Held, so the same
+  # watcher decides again on its next event; an identity recorded now would suppress that decision.
+  if [ "${SUTANDO_ANNOUNCE_GENERATION:-}" = 1 ] \
+     && { [ -z "$DECISION_GENERATION" ] || [ "$(task_file_generation "$task_path")" != "$DECISION_GENERATION" ]; }; then
+    hold_task "$filename" now
+    echo "watch-tasks-stream: holding $filename: its generation could not be read, or changed while it was being identified; decided again on the next event" >&2
+    return 0
+  fi
   DECISION_INBOX_NAME="$(basename "$1")"
   if [ -n "$identity" ] && [ -n "$DISPATCHED_IDS" ] && printf '%s' "$DISPATCHED_IDS" | grep -qxF -- "$identity"; then
     record_inbox_admission

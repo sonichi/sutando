@@ -78,6 +78,35 @@ check $? "handler fallback: the announcement carries the generation read before 
 check $? "handler fallback: and that is not the file there now (the reader will hold it)"
 if [ "$fail" != "0" ]; then echo "  stdout:"; sed 's/^/    /' "$TMP/swapped/out"; echo "  stderr:"; tail -5 "$TMP/swapped/err" | sed 's/^/    /'; fi
 
+# --- a generation the watcher could not read: held, not announced, and decided again WITHOUT a restart --
+# The interpreter fails the metadata read while the flag file exists. An identity recorded for that
+# decision would make the same watcher skip the file for good; it must not be.
+REALPY="$(command -v "$PY")"; FLAG="$TMP/fail-generation"; WRAP="$TMP/py-wrap"
+printf '#!/bin/sh\ncase "$*" in *st_mtime_ns*) [ -e "%s" ] && exit 1 ;; esac\nexec "%s" "$@"\n' "$FLAG" "$REALPY" > "$WRAP"; chmod +x "$WRAP"
+ws="$TMP/held"; mkdir -p "$ws/tasks" "$ws/results" "$ws/state"
+printf 'id: task-held\naccess_tier: owner\ntask: read me later\n' > "$ws/tasks/task-held.txt"
+: > "$FLAG"; : > "$ws/out"
+set -m
+SUTANDO_PY="$WRAP" SUTANDO_ANNOUNCE_GENERATION=1 SUTANDO_WORKSPACE_DIR="$ws" SUTANDO_RESULTS_DIR="$ws/results" \
+  bash "$REPO/src/watch-tasks-stream.sh" "$ws/tasks" --role standby --inbox "$ws/tasks" > "$ws/out" 2> "$ws/err" &
+wpid=$!
+set +m
+for i in $(seq 1 80); do grep -q 'holding task-held.txt' "$ws/err" 2>/dev/null && break; sleep 0.25; done
+grep -q 'holding task-held.txt: its generation could not be read' "$ws/err"
+check $? "unreadable generation: the watcher says it holds the task"
+! grep -q 'task-held.txt' "$ws/out"
+check $? "unreadable generation: nothing is announced for it, not even an unknown"
+rm -f "$FLAG"
+printf 'id: task-nudge\naccess_tier: owner\ntask: any event\n' > "$ws/tasks/task-nudge.txt"
+for i in $(seq 1 80); do grep -q '^TASK_FILE: task-held.txt$' "$ws/out" 2>/dev/null && break; sleep 0.25; done
+kill -0 "$wpid" 2>/dev/null
+check $? "the same watcher is still the one running"
+[ "$(awk '/^TASK_FILE: task-held.txt$/{print prev; exit} {prev=$0}' "$ws/out")" = "TASK_GENERATION: task-held.txt $(gen "$ws/tasks/task-held.txt")" ]
+check $? "once readable, the held task is decided again and announced with its generation"
+kill -TERM -"$wpid" 2>/dev/null || kill -TERM "$wpid" 2>/dev/null
+wait "$wpid" 2>/dev/null
+if [ "$fail" != "0" ]; then echo "  stdout:"; sed 's/^/    /' "$ws/out"; echo "  stderr:"; tail -8 "$ws/err" | sed 's/^/    /'; fi
+
 # --- the emitters alone: a decision about another name, or none, is never borrowed ---------------
 emit() { SUTANDO_ANNOUNCE_GENERATION=1 DECISION_GENERATION_NAME="$1" DECISION_GENERATION="$2" \
   bash -c 'exec 9>&1; source "$1"; "$2" task-x.txt' _ "$REPO/src/task-emit.sh" "$3" 2>/dev/null | head -1; }

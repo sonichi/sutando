@@ -517,13 +517,18 @@ An announcement is for one file, not for a name. The seat starts its watcher wit
 task, on every emit path, the handler's fallback included (`<name> -` when it could not read
 one). The core runs a pending task only while the file in its inbox is that generation. A file
 put under the name at any later point, and a task announced without a generation, are held and
-logged once, until the watcher dispatches what is there and announces it. Without the switch
-the watcher's output is unchanged, so no other reader of `TASK_FILE:` lines sees a difference.
+logged once, until the watcher dispatches what is there and announces it. The admitted
+generation is carried to the dispatch and read once more, last, before every `turn/start`.
+A file whose generation the watcher cannot read, or that changes while it is being identified,
+is not announced and not recorded as dispatched: the watcher holds it and decides again on its
+next event, with no restart. Without the switch the watcher's output is unchanged, so no other
+reader of `TASK_FILE:` lines sees a difference.
 
 When the app-server child exits mid-turn the seat restarts it and retries the task once, on the
-same thread. Whenever a server had to be started before a `turn/start`, on the first attempt
-or the retry, the seat reads the queue again first: a task answered meanwhile is settled as
-done, and one that is no longer this seat's, or no longer the same file, is left alone.
+same thread. Before every `turn/start`, the first attempt and the retry, with the server
+already running or just started, the seat reads the queue again: a task answered meanwhile is
+settled as done, and one that is no longer this seat's, or no longer the file that was
+admitted, is left alone.
 
 The terminal panel shows the seat's log: one line per task, turn, command and tool call. The
 same lines go to `<workspace>/logs/codex-seat.log` (a worker: `codex-seat-<session>.log`).
