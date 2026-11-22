@@ -26,7 +26,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ... import _dirs, connect_bridge as cb, connect_common as cm, task_io
+from ... import _dirs, connect_bridge as cb, connect_common as cm, live_view, task_io
 from ...connect_bridge import EXTERNAL, UNIT
 from ...connect_common import EXIT_CHILD_HELD, EXIT_HELD, EXIT_UNUSABLE, RUN_TIMEOUT_S, Shape, _v
 from . import codex_connector
@@ -341,6 +341,21 @@ def selected(args) -> "tuple[Shape | None, str]":
                          getattr(args, "key", None))
 
 
+def view(args) -> int:
+    """Follow the agent's live view until interrupted. Reads one file under its work root; types nothing."""
+    local, problem = selected(args)
+    if not problem:
+        cfg, problem = load_config(local)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return EXIT_UNUSABLE
+    try:
+        live_view.follow(live_view.path_of(cm.work_root(cfg)))
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def verify(args) -> int:
     local, problem = selected(args)
     if problem:
@@ -452,6 +467,9 @@ def main(argv=None) -> int:
     agent_option(d)
     d.set_defaults(func=run, debug=True, launchd=False)
     agent_option(sub.add_parser("verify", help="check every part")).set_defaults(func=verify)
+    agent_option(sub.add_parser("view", help="follow what the agent is doing, read-only: Codex runs as a background "
+                                "app-server with no terminal of its own, so this prints each turn's words, commands "
+                                "and file changes as the connector sees them. Ends with Ctrl-C")).set_defaults(func=view)
     agent_option(sub.add_parser("uninstall", help="stop the job, then remove what install wrote (config last)")
                  ).set_defaults(func=uninstall)
     sub.add_parser("list", help="each job installed here: its agent, the manager's state, its work root and the "
