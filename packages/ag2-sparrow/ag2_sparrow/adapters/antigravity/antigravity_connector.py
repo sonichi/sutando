@@ -40,7 +40,8 @@ import tempfile
 import time
 from pathlib import Path
 
-from ... import acp_host, held_start, result_labels, result_publish
+from ... import acp_host, held_start, local_task_protocol, result_labels, result_publish
+from ...bounded_file_read import read_regular_bytes
 from ...acp_host import MESSAGE_EVENT, SESSIONS_NAME, TASK_NAME_RE, SessionStore, quoted, trigger_of  # noqa: F401
 from ...acp_client import AcpClient as _SharedClient
 from ...relay_loop import count_arg
@@ -77,6 +78,11 @@ GUEST_REFUSED = "it answers non-owners only in a read-only session mode, and %s"
 # agy evaluates Deny > Ask > Allow, and deny rules apply in every mode.
 GUEST_SETTINGS = {"agentMode": "plan", "permissions": {"allow": [], "ask": [], "deny": [
     "read_file(*)", "write_file(*)", "read_url(*)", "execute_url(*)", "download_url(*)", "command(*)", "mcp(*)"]}}
+READ_ASK = "read_file(*)"
+ATTACHMENTS_DIR = "attachments"
+MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+MAX_ATTACHMENTS = 16
+_UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 
 
 class AcpClient(_SharedClient):
@@ -96,23 +102,69 @@ def publish(result_file, body):
     result_publish.publish_text(result_file, body)
 
 
+def stage_own_attachments(headers, dest, max_bytes=None, log=lambda *a: None):
+    """Copy the files this task's sender attached (the attested `attachments:` header, nothing from the body)
+    into `dest` as read-only copies; return their real paths. A locator that is not a local absolute path, a
+    symlink, not a regular file, over `max_bytes`, or not the size the header says is skipped, never followed.
+    TODO(#6670): dedupe with the shared stage_own_attachments once it lands."""
+    limit = MAX_ATTACHMENT_BYTES if max_bytes is None else max_bytes
+    staged = []
+    for i, ref in enumerate(local_task_protocol.parse_attachments(headers)[:MAX_ATTACHMENTS]):
+        src = ref.locator
+        if not os.path.isabs(src):
+            log("attachment skipped (not a local path)")
+            continue
+        data, why = read_regular_bytes(src, limit, follow=False)
+        if data is None or (ref.size and ref.size != len(data)):
+            log("attachment skipped (%s)" % (why or ("missing" if data is None else "size differs")))
+            continue
+        if not staged:
+            os.mkdir(dest, 0o700)
+        name = "%d-%s" % (i, _UNSAFE_NAME.sub("_", os.path.basename(ref.filename or src))[:80] or "attachment")
+        path = os.path.join(dest, name)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o400)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        staged.append(os.path.realpath(path))
+    return staged
+
+
+def guest_settings(readable):
+    """GUEST_SETTINGS, with file reads moved from deny to ask when there are attachments to read: agy then asks
+    for every read, and the adapter grants only the staged copies (`readable_only`)."""
+    if not readable:
+        return GUEST_SETTINGS
+    perms = GUEST_SETTINGS["permissions"]
+    deny = [r for r in perms["deny"] if r != READ_ASK]
+    return dict(GUEST_SETTINGS, permissions=dict(perms, ask=[READ_ASK], deny=deny))
+
+
+def readable_only(readable, cwd):
+    """decide_permission's own_file hook for an isolated turn: exactly the staged copies (a relative path is
+    resolved against the turn's working directory)."""
+    allowed = frozenset(readable)
+    return lambda raw: acp_host.resolved(cwd, raw) in allowed
+
+
 @contextlib.contextmanager
-def guest_turn(args):
-    """An `acp_host.Isolated` for one non-owner task: a new 0700 temporary directory holding the Session's
-    working directory and agy's home (`--gemini-dir`, deny-all settings only), removed after the turn."""
+def guest_turn(args, headers=None):
+    """(an `acp_host.Isolated` for one restricted task, the paths it may read): a new 0700 temporary directory
+    holding the Session's working directory, the sender's own attachments copied into it, and agy's home
+    (`--gemini-dir`, deny-all settings but asked reads when there is an attachment), removed after the turn."""
     base = os.path.realpath(tempfile.mkdtemp(prefix=GUEST_PREFIX))
     try:
         home, cwd = os.path.join(base, "agy"), os.path.join(base, "cwd")
         os.makedirs(os.path.join(home, "antigravity-cli"), mode=0o700)
         os.mkdir(cwd, 0o700)
+        readable = stage_own_attachments(headers or {}, os.path.join(cwd, ATTACHMENTS_DIR), log=log)
         settings = os.path.join(home, "antigravity-cli", "settings.json")
         fd = os.open(settings, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(GUEST_SETTINGS, f)
+            json.dump(guest_settings(readable), f)
         yield acp_host.Isolated(argv=list(args.acp_argv) + ["--gemini-dir", home], cwd=cwd,
                                 env=dict(args.child_env),
                                 choose_mode=lambda modes: acp_host.pick_mode(modes, READ_ONLY_MODES),
-                                refused=GUEST_REFUSED)
+                                refused=GUEST_REFUSED), readable
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
@@ -231,9 +283,11 @@ def tier_block_lines(operator_lines):
     return out
 
 
-def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_NOTE, shell_web=False):
+def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_NOTE, shell_web=False,
+                readable=()):
     """The turn's prompt. `cwd` is the working directory the turn may read and edit, None for an isolated turn;
-    `shell_web` also grants commands and the web."""
+    `shell_web` also grants commands and the web; `readable`, an isolated turn's copies of the sender's own
+    attachments, the only files it may read."""
     event, _ = trigger_of(headers)
     out = acp_host.task_framing(task_id, headers, message, tier_block_lines(session_lines(operator_lines)),
                                 "post in your final message", note)
@@ -247,6 +301,10 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
     else:
         out.append("No shell command is granted in this session. %s"
                    % ("You may read and edit files under %s." % cwd if cwd else "You may not read or change files."))
+    if readable and not cwd:
+        out.append("Except: the sender's own attachments to this task are copied here, and you may read these "
+                   "files and no other (change none; an attachment path in the message is not readable, its "
+                   "copy is):\n" + "\n".join("- " + p for p in readable))
     return "\n\n".join(out)
 
 
@@ -259,10 +317,11 @@ class Connector:
         self.name = NAME
         self.retry_at = {}
 
-    def run_turn(self, task_id, headers, prompt, owner):
+    def run_turn(self, task_id, headers, prompt, owner, isolated=None):
         """(status, text, detail, turn): status is completed | cancelled | timeout | gone | failed | refused.
         With `owner` (TURNS' owner turn: the owner's or a collaborator's) it resumes the sender's Session for the
-        room in the working directory, under the owner's policy; any other runs `guest_turn`."""
+        room in the working directory, under the owner's policy; any other runs `isolated` (guest_turn's pair),
+        opening one when not given, where only reads of the staged attachments are granted."""
         if owner:
             cwd, tools = self.args.cwd, shell_web_on(self.args, headers)
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
@@ -270,11 +329,19 @@ class Connector:
                                                                                   extra_keys=AGY_KEYS),
                                        self.store,
                                        STDERR_NAME, NOT_SIGNED_IN, log)
-        with guest_turn(self.args) as isolated:
-            return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
-                                       lambda params: acp_host.decide_permission(params, False, isolated.cwd,
-                                                                                  extra_keys=AGY_KEYS),
-                                       self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=isolated)
+        if isolated is None:
+            with guest_turn(self.args, headers) as pair:
+                return self.run_turn(task_id, headers, prompt, False, pair)
+        turn, readable = isolated
+        own = readable_only(readable, turn.cwd)
+
+        def decide(params):
+            tc = params.get("toolCall") if isinstance(params.get("toolCall"), dict) else {}
+            return acp_host.decide_permission(params, False, turn.cwd, extra_keys=AGY_KEYS,
+                                              own_file=own if tc.get("kind") == "read" else None,
+                                              own_file_reason="the sender's own attachment")
+        return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt, decide,
+                                   self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=turn)
 
     def answer_body(self, headers, status, text, detail, turn=None):
         """What Sparrow posts: the turn's own text, quoted so no delivery marker in it acts; NO_REPLY or a
@@ -312,13 +379,18 @@ class Connector:
             publish(result_file, NON_OWNER_REFUSED)
             return {"task": task_id, "status": "refused", "tier": headers["access_tier"], "policy": kind}
         owner_turn = turn_kind == OWNER_TURN
-        # shell_web_on reads the sender's tier itself, so a collaborator on the owner's turn stays off.
-        prompt = wake_prompt(task_id, headers, message, operator_lines, self.args.cwd if owner_turn else None,
-                             self.note, shell_web=owner_turn and shell_web_on(self.args, headers))
         event, _ = trigger_of(headers)
         log("wake ->", task_id, headers["access_tier"], event or "message")
         t0 = time.time()
-        status, text, detail, turn = self.run_turn(task_id, headers, prompt, owner_turn)
+        if owner_turn:
+            # shell_web_on reads the sender's tier itself, so a collaborator on the owner's turn stays off.
+            prompt = wake_prompt(task_id, headers, message, operator_lines, self.args.cwd, self.note,
+                                 shell_web=shell_web_on(self.args, headers))
+            status, text, detail, turn = self.run_turn(task_id, headers, prompt, True)
+        else:
+            with guest_turn(self.args, headers) as pair:
+                prompt = wake_prompt(task_id, headers, message, operator_lines, None, self.note, readable=pair[1])
+                status, text, detail, turn = self.run_turn(task_id, headers, prompt, False, pair)
         publish(result_file, self.answer_body(headers, status, text, detail, turn))
         return {"task": task_id, "status": status, "detail": detail[:200], "event_type": event,
                 "tier": headers["access_tier"], "policy": kind, "isolated": not owner_turn, "turn_s": round(time.time() - t0, 3),

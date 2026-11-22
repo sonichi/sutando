@@ -102,6 +102,12 @@ permission policy. A collaborator is still framed as not the owner.
   every tool (`read_file(*)`, `write_file(*)`, `read_url(*)`, `execute_url(*)`, `download_url(*)`,
   `command(*)`, `mcp(*)`) and no global rules or context; the directory is removed after the turn. `HOME`
   and the rest of the environment are unchanged, so agy finds the sign-in in the Keychain as for the owner;
+- the sender's own attachments to this task (the attested `attachments:` header only, never a path in the
+  message) are copied read-only into `attachments/` in that working directory, and the prompt lists the
+  copies. Only then are file reads moved from deny to ask in that home's rules, and the adapter grants a
+  `read` of exactly those copies, nothing else: not the original under the bridge's media directory, not
+  another task's file, not any other path, and never an edit. A locator that is a symlink, not a regular
+  file, over 25 MB, not the size the header says, or not a local absolute path is not copied;
 - a new Session for every task, never resumed and never recorded in the session store;
 - the Session is put in a read-only mode with `session/set_mode` (`plan`, or a mode named `read-only`),
   picked from the `modes` that `session/new` returns. If agy offers no such mode, or refuses it, the turn
