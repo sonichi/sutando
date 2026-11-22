@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """core-input-watch.py with the CLI's hook record (src/core_block_signal.py): a fresh hook
-"clear" voids the pane's permission/selection/unknown guess, a hook "blocked" is
-blocked-human, and with no record the pane alone decides exactly as before.
+"clear" voids only an ambiguous pane reading (unknown, or a selection with no focused row),
+a dialog the screen names stays blocked-human, a hook "blocked" is blocked-human, and with no
+record the pane alone decides exactly as before.
 
 Run: python3 tests/core-input-watch-hook-signal.test.py
 """
@@ -37,6 +38,9 @@ SAUTEED = ("⏺ The diff shows the dialog text: \"Press Enter to accept the chan
 # The agent's own reply quoting a whole permission dialog: no pattern can tell it from a real one.
 QUOTED_DIALOG = ("⏺ Earlier the CLI showed this, and I answered it:\n"
                  "  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n  Esc to cancel\n\n" + _COMPOSER)
+# "Select" and a key hint in the agent's own reply, with no focused row: a selection guess.
+AMBIGUOUS_SELECT = ("⏺ In the picker, Select the build you want and press Enter to confirm.\n\n"
+                    + _COMPOSER)
 LOGIN_MENU = ("  Login\n  Select login method:\n  ❯ 1. Claude account with subscription\n"
               "    2. Anthropic Console account\n  Esc to cancel")
 IDLE_LOGGED_OUT = ("──────── sutando-core ──\n❯ \n────────\n"
@@ -69,10 +73,16 @@ class TestHookClearVoidsAPaneGuess(unittest.TestCase):
         # Without this the clear case below would pass for the wrong reason.
         self.assertEqual(state(QUOTED_DIALOG)[0], "blocked-human")
 
-    def test_a_fresh_clear_voids_the_quoted_dialog(self):
-        s, _, prompt, kind = state(QUOTED_DIALOG, hook=CLEAR)
-        self.assertNotIn(s, ("blocked-human", "blocked-known"))
-        self.assertIsNone(kind)
+    def test_a_fully_quoted_dialog_still_escalates_under_a_clear(self):
+        # It carries a named gate (signature, focused row, key hint): the screen stays authoritative.
+        self.assertEqual(state(QUOTED_DIALOG, hook=CLEAR)[0], "blocked-human")
+
+    def test_an_ambiguous_reading_under_a_clear_is_voided(self):
+        for pane in (AMBIGUOUS_SELECT, SAUTEED):
+            self.assertEqual(state(pane)[0], "blocked-human", "positive control")
+            self.assertNotEqual(state(pane, hook=CLEAR)[0], "blocked-human")
+        self.assertEqual(_mod.classify(AMBIGUOUS_SELECT)[0], "selection")
+        self.assertEqual(_mod.classify(SAUTEED)[0], "unknown")
 
     def test_the_accented_turn_line_under_a_quoted_hint_is_not_blocked(self):
         self.assertNotEqual(state(SAUTEED, hook=CLEAR)[0], "blocked-human")
@@ -170,9 +180,9 @@ class TestAnOwnerQuestionReachesTheOwner(unittest.TestCase):
         self.assertEqual(hook, ("blocked", "question"))
         self.assertEqual(state(self.QUESTION, hook=hook)[::3], ("blocked-human", "selection"))
 
-    def test_a_clear_would_have_hidden_it(self):
-        # What the finding saw: a fresh clear voids the screen's selection reading.
-        self.assertNotEqual(state(self.QUESTION, hook=CLEAR)[0], "blocked-human")
+    def test_an_unrelated_clear_does_not_hide_a_named_question(self):
+        # A focused numbered row under a key hint is a dialog the screen names; no clear voids it.
+        self.assertEqual(state(self.QUESTION, hook=CLEAR)[::3], ("blocked-human", "selection"))
 
 
 class TestNoRecordIsTheOldBehaviour(unittest.TestCase):

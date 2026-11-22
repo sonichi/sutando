@@ -37,8 +37,9 @@ idle / wedged":
     (any, + gateway down)   →   gateway-down       (gateway probe is bundled-specific)
     (any, + active gate)    →   blocked-known / blocked-human   (net-new: pane classify)
     (idle, + refused turn)  →   blocked-human (turn-rejected)   (net-new: refused_turn)
-    (any, + hook record)    →   a fresh hook "clear" voids a pane permission/selection/unknown
-                                guess; a hook "blocked" is blocked-human (src/core_block_signal.py)
+    (any, + hook record)    →   a fresh hook "clear" voids only an ambiguous pane reading (unknown,
+                                or a selection with no focused row); a hook "blocked" is
+                                blocked-human (src/core_block_signal.py)
 
 runtime-health.json stays the Console's coarse view (unchanged, its consumers
 untouched); core-supervisor.json is the escalation-facing refinement of the same
@@ -171,9 +172,9 @@ _TURN_WINDOW = 40
 _HUMAN_GATES = {"login", "selection", "permission", "session-limit", "usage-limit", "fable-limit-unfocused",
                 "turn-rejected", "unknown"}
 
-#: The pane kinds the CLI's own hooks report (a permission or question dialog, or a guess at
-#: one). A fresh hook "clear" overrides them; every other kind is a screen hooks never fire for.
-_HOOK_REPORTED_GATES = {"permission", "selection", "unknown"}
+#: A selection is positively identified only by a focused numbered row (Claude's ❯, Codex's ›/»);
+#: a bare "Select" word under a key hint is a guess, like "unknown".
+_FOCUSED_ROW = re.compile(r"^\s*[❯›»]\s*\d+\.\s", re.M)
 _HOOK_KIND = {"permission": "permission", "question": "selection"}
 
 # --- M4 AUTO-ANSWER (Layer 2): the safe key per gate; `answer_step` in the loop sends it
@@ -285,11 +286,16 @@ def classify(pane: str, styled_pane: "str | None" = None):
     return "unknown", tail
 
 
+def _ambiguous_gate(kind: str, excerpt: str) -> bool:
+    """A reading the screen only guesses: no named gate, or a selection with no focused row."""
+    return kind == "unknown" or (kind == "selection" and not _FOCUSED_ROW.search(excerpt or ""))
+
+
 def _live_gate(pane: str, styled_pane: "str | None" = None, hook=None):
-    """`classify()`, less a dialog guess the CLI's hooks have just said is not there."""
+    """`classify()`, less a guess the CLI's hooks have just said is not a dialog. A gate the
+    screen names (signature and key hint) stands whatever the hooks say."""
     hit = classify(pane, styled_pane)
-    if (hit and hook and hook[0] == core_block_signal.CLEAR and hit[0] in _HOOK_REPORTED_GATES
-            and not is_usage_limit(hit[0], hit[1])):
+    if hit and hook and hook[0] == core_block_signal.CLEAR and _ambiguous_gate(*hit):
         return None
     return hit
 
