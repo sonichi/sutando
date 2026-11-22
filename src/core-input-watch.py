@@ -719,7 +719,7 @@ AUTO_ANSWER_CARRY_S = 120.0
 
 # ESCALATE (Layer 3): a blocked core IS a HumanRequirement, so it goes through
 # `src/hitl` — the Manager dedups, the projector renders the card.
-_CHAT_ESCALATE_STATES = {"blocked-human", "logged-out"}
+from hitl.core_card import CARD_STATES as _CHAT_ESCALATE_STATES  # noqa: E402  (read by the relay too)
 #: How long a signed-out reading must hold before it is carded. A refusal or 401 banner
 #: the CLI recovers from on its own (a token refresh, a boot race) clears well inside it.
 LOGIN_CONFIRM_S = 60.0
