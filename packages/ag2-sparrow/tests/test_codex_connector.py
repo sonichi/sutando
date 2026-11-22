@@ -1137,6 +1137,79 @@ class EdgePathTest(unittest.TestCase):
             c.run_turn("hello")
         self.assertEqual(c.rpc.calls, ["turn/start", "turn/interrupt"])
 
+    def test_a_turn_without_a_message_says_what_it_did_instead(self):
+        # An owner asked for something, Codex ran commands, was refused one, and ended with no text:
+        # the room got only "[no reply] Codex completed the turn without a message."
+        class Scripted(FakeRpc):
+            def __init__(self):
+                super().__init__()
+                self.answers = []
+
+            def respond(self, rid, result):
+                self.answers.append((rid, result))
+
+        args = cc.build_parser().parse_args(["--work", "w"])
+        c = cc.Connector(Scripted, args, note="n")
+        c.thread_id = "th1"
+        c.declined, c.turn_items = ["item/fileChange/requestApproval"], {"commandExecution": 9}   # an earlier turn's
+
+        def item(kind, turn="t1", status="completed"):
+            body = {"type": kind} if status is None else {"type": kind, "status": status}
+            return {"method": "item/completed", "params": {"threadId": "th1", "turnId": turn, "item": body}}
+
+        def asks(rid, method, thread="th1", turn="t1"):
+            return {"id": rid, "method": method, "params": {"threadId": thread, "turnId": turn, "itemId": "i"}}
+
+        for m in (item("reasoning", status=None), item("commandExecution"), item("commandExecution"),
+                  item("webSearch", status=None), item("commandExecution", turn="another-turn"),
+                  # What did not happen is not said to have happened.
+                  item("commandExecution", status="failed"), item("commandExecution", status="declined"),
+                  item("fileChange", status="failed"), item("fileChange", status="declined"),
+                  item("mcpToolCall", status="failed"), item("mcpToolCall", status="inProgress"),
+                  asks(7, "item/commandExecution/requestApproval"),
+                  # Declined all the same, but not this turn's: another turn, another thread, and the
+                  # older methods, which name neither.
+                  asks(8, "item/fileChange/requestApproval", turn="another-turn"),
+                  asks(9, "item/commandExecution/requestApproval", thread="another-thread"),
+                  {"id": 10, "method": "execCommandApproval", "params": {"conversationId": "th1", "callId": "c"}},
+                  {"id": 11, "method": "item/permissions/requestApproval", "params": None},
+                  {"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": "t1", "status": "completed"}}}):
+            c.rpc.events.put(m)
+        status, text, err = c.run_turn("do it")
+        self.assertEqual((status, text), ("completed", ""))
+        self.assertEqual(c.rpc.answers, [(n, {"decision": "decline"}) for n in (7, 8, 9, 10, 11)], "every one is declined")
+        self.assertEqual(c.result_body(status, text, err),
+                         "[no reply] Codex completed the turn without a message: 1 command was not approved; "
+                         "it ran 2 commands, ran 1 web search; 1 command failed; 1 file change failed; "
+                         "1 tool call failed.")
+        self.assertEqual(c.turn_items, {"reasoning": 1, "commandExecution": 2, "webSearch": 1,
+                                        "commandExecution:failed": 1, "fileChange:failed": 1, "mcpToolCall:failed": 1})
+        self.assertEqual(c.turn_declined, ["item/commandExecution/requestApproval"])
+        self.assertEqual(len(c.declined), 6, "the task's metrics row still lists every decline")
+        # A request that arrives when no turn is running is declined and counted for no turn.
+        c.turn_id, c.turn_declined = None, []
+        c.handle_server_request({"id": 12, "method": "item/fileChange/requestApproval",
+                                 "params": {"threadId": "th1", "turnId": None}})
+        self.assertEqual((c.turn_declined, c.rpc.answers[-1]), ([], (12, {"decision": "decline"})))
+
+    def test_the_line_for_a_turn_without_a_message_is_fixed_words_and_counts(self):
+        why = cc.no_message_why
+        self.assertEqual(why([], {}), "")
+        self.assertEqual(why([], {"reasoning": 3, "agentMessage": 1, "userMessage": 1}), "", "nothing countable")
+        self.assertEqual(why(["applyPatchApproval", "item/fileChange/requestApproval", "execCommandApproval"], {}),
+                         "1 command was not approved; 2 file changes were not approved")
+        self.assertEqual(why(["item/permissions/requestApproval"], {"fileChange": 1, "mcpToolCall": 2, "webSearch": 2}),
+                         "1 permission request was not approved; it made 1 file change, made 2 tool calls, "
+                         "ran 2 web searches")
+        self.assertEqual(why(["some/new/requestApproval"], {"<script>": 4}), "", "an unknown name is never echoed")
+        self.assertEqual(why([], {"commandExecution:failed": 2, "fileChange:failed": 1}),
+                         "2 commands failed; 1 file change failed")
+        self.assertEqual(why([], {"webSearch:failed": 1, "<x>:failed": 2}), "", "only the failures it has words for")
+        outcome = cc.item_outcome
+        self.assertEqual([outcome({"type": "fileChange", "status": s}) for s in ("completed", "failed", "declined", "inProgress", "new")],
+                         ["fileChange", "fileChange:failed", "", "", ""])
+        self.assertEqual([outcome({"type": "webSearch"}), outcome({"type": 3}), outcome({})], ["webSearch", "", ""])
+
     def test_a_restricted_thread_is_confined_to_its_own_folder_not_merely_read_only(self):
         # Codex's read-only sandbox stops writes, not reads: a guest's turn could read the owner's files.
         with tempfile.TemporaryDirectory() as d:

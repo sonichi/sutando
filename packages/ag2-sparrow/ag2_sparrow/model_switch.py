@@ -125,7 +125,7 @@ class ModelSwitch:
         """(body, card): one reply button per model offered. After a pick (`picked`) the card has no
         buttons: it says the switch is coming, then, with `ran` (the model the next turn ran on), that
         it happened or that it did not; with `same`, that the pick is the model already in use."""
-        agent_card, _ = connector_cards._core()
+        agent_card, issued_cards = connector_cards._core()
         if picked:
             kind, body, text, status = self.parts(state, picked, ran, same)
             return agent_card.build(NOTE, kind, title="Model", body=body, text=text, **({"status": status} if status else {}))
@@ -140,8 +140,9 @@ class ModelSwitch:
             text += " Pending: %s, on your next message." % names.get(coming, coming)
         if more:
             text += " Also: %s (send /model and the name)." % ", ".join(more)
+        # The menu says when it stops acting (the time its record is kept), so the app can show it expired.
         return agent_card.build(CARD, "pending", title="Model", body="Pick a model for %s" % self.name,
-                                text=text, buttons=buttons)
+                                text=text, buttons=buttons, expires_at_ms=int((time.time() + issued_cards.TTL_S) * 1000))
 
     def parts(self, state, picked, ran, same):
         """(kind, body, text, status) of the card after a pick."""
