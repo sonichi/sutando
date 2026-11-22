@@ -105,6 +105,19 @@ def supervised_seat_problem(token_file: str, root: str, agent_id: str, mode: str
     return problem
 
 
+def credential_env(token_file: str, agent_id: str) -> "tuple[dict, str]":
+    """(the credential part of the bridge's launch env, '') or ({}, why): AG2_DEVICE_ENV and, for a seat .env,
+    the seat's exported keys, so a child (`ag2-sparrow-mcp`) resolves the relay token as this bridge does."""
+    if not token_file:
+        return {}, "no token file"
+    seat, problem = seat_env(token_file, agent_id)
+    if problem:
+        return {}, problem
+    env = {"AG2_DEVICE_ENV": token_file}
+    env.update(seat)
+    return env, ""
+
+
 def launch_env(cfg: dict) -> "tuple[dict, str]":
     """(the bridge's whole launch environment, '') or ({}, why): the one place it is built, for a unit, a
     declaration and the supervisor that runs one."""

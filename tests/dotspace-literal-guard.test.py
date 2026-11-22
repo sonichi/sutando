@@ -65,6 +65,9 @@ ALLOW: dict[str, "tuple[str, ...] | None"] = {
         "\"s.space\", \"GUEST tier\"",
         "the s.space broker attests",
     ),
+    "packages/ag2-sparrow/ag2_sparrow/adapters/antigravity/antigravity_connector.py": (
+        "S.space tools didn't start this turn",
+    ),
     "packages/ag2-sparrow/ag2_sparrow/adapters/claude_cloud_session/session_adapter.py": (
         "standing s.space instructions",
     ),
