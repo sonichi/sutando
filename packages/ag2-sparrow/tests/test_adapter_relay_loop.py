@@ -206,16 +206,16 @@ class AdmissionTest(unittest.TestCase):
     def test_refusal_is_the_gate_and_the_line_is_the_shared_constant(self):
         with tempfile.TemporaryDirectory() as d, contextlib.redirect_stderr(io.StringIO()):
             loop = Loop(d, allow_collaborator=True)
-            with mock.patch.object(rl, "admission", wraps=task_io.admission) as spy:
+            with mock.patch.object(rl, "turn_policy", wraps=task_io.turn_policy) as spy:
                 self.assertTrue(loop.refusal("task-g.txt", {"access_tier": "guest", "collaborator": "true"}, set()))
                 self.assertIsNone(loop.refusal("task-c.txt", {"access_tier": "team", "collaborator": "true"}, set()))
             self.assertEqual([c.args[0]["access_tier"] for c in spy.call_args_list], ["guest", "team"])
             self.assertEqual((Path(loop.args.results) / "task-g.txt").read_text(), task_io.NON_OWNER_REFUSED)
         self.assertIs(rl.NON_OWNER_REFUSED, task_io.NON_OWNER_REFUSED)
-        self.assertIs(rl.admission, task_io.admission)
+        for mod in (rl, cc):
+            self.assertIs(mod.turn_policy, task_io.turn_policy, mod)
         for mod in (ra, cc):
             self.assertIs(mod.NON_OWNER_REFUSED, task_io.NON_OWNER_REFUSED, mod)
-        self.assertIs(cc.admission, task_io.admission)
 
     def test_a_team_sender_not_yet_attested_is_retried_before_the_final_refusal(self):
         # #5878: the flat refusal gave collaborator attestation no chance to catch up before
@@ -437,21 +437,18 @@ class PositiveArgTest(unittest.TestCase):
 
 
 class LaneSchedulingTest(unittest.TestCase):
-    """Each task waits only on its own lane's gate: the collaborator cap, or the provider's hold and cap."""
+    """Each task waits only on its own lane's gate: the isolated-turn cap, or the provider's hold and cap."""
 
-    def loop(self, d, allow_collaborator=True, **kw):
-        loop = Loop(d, max_per_hour=1, max_collaborator_per_hour=1, allow_collaborator=allow_collaborator, **kw)
-        write_task(loop.args.inbox, "task-c", "normal", 100, tier="team")
-        p = Path(loop.args.inbox) / "task-c.txt"
-        p.write_text(p.read_text().replace("access_tier: team", "collaborator: true\naccess_tier: team"))
-        os.utime(p, (100, 100))            # the rewrite must keep the ordering mtime
+    def loop(self, d, allow_non_owner=True, **kw):
+        loop = Loop(d, max_per_hour=1, max_collaborator_per_hour=1, allow_non_owner=allow_non_owner, **kw)
+        write_task(loop.args.inbox, "task-c", "normal", 100, tier="guest")
         write_task(loop.args.inbox, "task-o", "normal", 200)
         return loop
 
-    def test_a_sole_collaborator_is_not_held_by_the_provider_hold_or_cap(self):
+    def test_a_sole_restricted_task_is_not_held_by_the_provider_hold_or_cap(self):
         with tempfile.TemporaryDirectory() as d:
             loop = self.loop(d)
-            self.assertEqual((loop.lane("task-c.txt"), loop.lane("task-o.txt")), ("collaborator", "provider"))
+            self.assertEqual((loop.lane("task-c.txt"), loop.lane("task-o.txt")), ("isolated", "provider"))
             loop.blocked_until = loop.clock() + 300
             self.assertEqual(loop.next_ready(["task-o.txt", "task-c.txt"]), ("task-c.txt", 0.0))
             self.assertEqual(loop.next_ready(["task-o.txt"]), (None, 300.0))
@@ -460,7 +457,7 @@ class LaneSchedulingTest(unittest.TestCase):
             self.assertEqual(loop.next_ready(["task-o.txt", "task-c.txt"]), ("task-c.txt", 0.0))
             self.assertEqual(loop.next_ready(["task-o.txt"]), (None, rl.HOUR))
 
-    def test_an_owner_task_is_not_held_by_a_full_collaborator_cap(self):
+    def test_an_owner_task_is_not_held_by_a_full_isolated_turn_cap(self):
         with tempfile.TemporaryDirectory() as d:
             loop = self.loop(d)
             loop.collab_limiter.record()
@@ -472,34 +469,37 @@ class LaneSchedulingTest(unittest.TestCase):
 
     def test_a_refused_task_has_no_gate_and_classify_is_what_refusal_decides(self):
         with tempfile.TemporaryDirectory() as d, contextlib.redirect_stderr(io.StringIO()):
-            loop = self.loop(d, allow_collaborator=False)
-            write_task(loop.args.inbox, "task-g", "normal", 300, tier="guest")
+            loop = self.loop(d, allow_non_owner=False)
+            write_task(loop.args.inbox, "task-k", "normal", 300, tier="team")
+            p = Path(loop.args.inbox) / "task-k.txt"
+            p.write_text(p.read_text().replace("access_tier: team", "collaborator: true\naccess_tier: team"))
+            os.utime(p, (300, 300))
             loop.limiter.record()
             loop.collab_limiter.record()
             loop.blocked_until = loop.clock() + 300
             # Both flags off: the guest and the collaborator are refused, so neither waits on anything.
-            self.assertEqual((loop.lane("task-g.txt"), loop.lane("task-c.txt")), ("refuse", "refuse"))
-            self.assertEqual(loop.next_ready(["task-o.txt", "task-c.txt", "task-g.txt"]), ("task-c.txt", 0.0))
-            self.assertEqual(loop.next_ready(["task-o.txt", "task-g.txt"]), ("task-g.txt", 0.0))
-            for name in ("task-c.txt", "task-g.txt"):
+            self.assertEqual((loop.lane("task-c.txt"), loop.lane("task-k.txt")), ("refuse", "refuse"))
+            self.assertEqual(loop.next_ready(["task-o.txt", "task-c.txt", "task-k.txt"]), ("task-c.txt", 0.0))
+            self.assertEqual(loop.next_ready(["task-o.txt", "task-k.txt"]), ("task-k.txt", 0.0))
+            for name in ("task-c.txt", "task-k.txt"):
                 self.assertTrue(loop.refusal(name, task_io.parse_task(os.path.join(loop.args.inbox, name))[0], set()))
-            # Flags on: the same tasks are admitted and wait on their own gate.
+            # Flags on: the guest is restricted (an isolated turn), the collaborator gets the owner's lane.
             loop.args.allow_collaborator = loop.args.allow_non_owner = True
             loop.lanes.clear()
-            self.assertEqual((loop.lane("task-g.txt"), loop.lane("task-c.txt")), ("provider", "collaborator"))
-            name, wait = loop.next_ready(["task-o.txt", "task-c.txt", "task-g.txt"])
-            self.assertEqual((name, wait), (None, 300.0), "an admitted guest waits on the provider gate")
+            self.assertEqual((loop.lane("task-c.txt"), loop.lane("task-k.txt")), ("isolated", "provider"))
+            name, wait = loop.next_ready(["task-o.txt", "task-k.txt", "task-c.txt"])
+            self.assertEqual((name, wait), (None, 300.0), "the collaborator waits on the provider gate, as the owner")
             for headers, flags, want in (({"access_tier": "owner"}, (False, False), "owner"),
                                          ({"access_tier": "guest"}, (False, False), "refused"),
-                                         ({"access_tier": "guest"}, (True, False), "non_owner"),
-                                         ({"access_tier": "team", "collaborator": "true"}, (False, False), "refused-collaborator"),
-                                         ({"access_tier": "team", "collaborator": "true"}, (True, False), "refused-collaborator"),
+                                         ({"access_tier": "guest"}, (True, False), "restricted"),
+                                         ({"access_tier": "team", "collaborator": "true"}, (False, False), "refused"),
+                                         ({"access_tier": "team", "collaborator": "true"}, (True, False), "refused"),
                                          ({"access_tier": "team", "collaborator": "true"}, (False, True), "collaborator"),
                                          ({"access_tier": "guest", "collaborator": "true"}, (False, True), "refused")):
                 loop.args.allow_non_owner, loop.args.allow_collaborator = flags
                 self.assertEqual(loop.classify(headers), want, (headers, flags))
                 refused = loop.refusal("task-x%d.txt" % len(loop.lanes), headers, set())
-                self.assertEqual(refused is None, not want.startswith("refused"), (headers, flags))
+                self.assertEqual(refused is None, want != "refused", (headers, flags))
 
     def test_a_task_is_too_old_once_it_waited_past_the_max_age_since_first_seen(self):
         with tempfile.TemporaryDirectory() as d:
