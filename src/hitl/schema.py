@@ -200,6 +200,8 @@ class HumanRequirement:
             subject["receipt"] = {"outcome": receipt["outcome"],
                                   **({"at": at} if isinstance(at, int) and not isinstance(at, bool)
                                      and 0 <= at <= WIRE_INT_MAX else {})}
+        if (self.subject or {}).get("superseded") is True:
+            subject["superseded"] = True  # closed for a fresh card: a done receipt here is not success
         if subject:
             wire["subject"] = subject
         if self.expires_at is not None:

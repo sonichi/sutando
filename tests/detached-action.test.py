@@ -135,6 +135,26 @@ class Records(unittest.TestCase):
         D.begin(self.ws, "j")
         self.assertFalse(D.report(self.ws, "j", "maybe"))
 
+    def test_two_racing_reporters_record_one_outcome(self):
+        import threading
+        D.begin(self.ws, "k")
+        real_write = D._write
+
+        def slow_write(*a, **k):
+            time.sleep(0.2)  # both would read "running" here without the lock
+            real_write(*a, **k)
+        got = []
+        with mock.patch.object(D, "_write", slow_write):
+            threads = [threading.Thread(target=lambda o=o: got.append((o, D.report(self.ws, "k", o))))
+                       for o in (D.DONE, D.FAILED)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        winners = [o for o, ok in got if ok]
+        self.assertEqual(len(winners), 1, got)
+        self.assertEqual(D.status(self.ws, "k").state, winners[0])
+
     def test_an_unreadable_record_is_no_action(self):
         D._path(self.ws, "k").parent.mkdir(parents=True)
         D._path(self.ws, "k").write_text("[")

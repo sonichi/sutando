@@ -1328,6 +1328,11 @@ class WireReceipt(unittest.TestCase):
         req = HumanRequirement(**base, subject={"receipt": {"outcome": "stale", "at": 5, "reason": "x"},
                                                 "verify": {"waiting": ["t"]}})
         self.assertEqual(req.to_wire()["subject"], {"receipt": {"outcome": "stale", "at": 5}})
+        # A card closed for a fresh one says so, so a client never reads its done receipt as success.
+        closed = HumanRequirement(**base, subject={"receipt": {"outcome": "done", "at": 5}, "superseded": True})
+        self.assertEqual(closed.to_wire()["subject"], {"receipt": {"outcome": "done", "at": 5}, "superseded": True})
+        for odd in ("yes", 1, None):
+            self.assertNotIn("superseded", HumanRequirement(**base, subject={"superseded": odd}).to_wire().get("subject", {}))
         for receipt in ({"outcome": "maybe"}, "done", {"outcome": "done", "at": True}):
             wire = HumanRequirement(**base, subject={"receipt": receipt}).to_wire()
             self.assertEqual(wire.get("subject", {}).get("receipt", {}).get("at"), None)

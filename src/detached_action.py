@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import List, NamedTuple, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from file_lock import locked_file  # noqa: E402
 from workspace_default import status_path  # noqa: E402
 
 #: Longest an action may stay unanswered before its caller treats it as failed.
@@ -81,12 +82,18 @@ def begin(workspace: Path, key: str, now: Optional[float] = None, deadline_s: fl
 
 def report(workspace: Path, key: str, outcome: str, reason: Optional[str] = None,
            rc: Optional[int] = None, now: Optional[float] = None) -> bool:
-    """Record the terminal outcome; False when one was already recorded (the first one stands)."""
-    prior = _read(workspace, key)
-    if prior is None or prior.get("state") != RUNNING or outcome not in (DONE, FAILED):
+    """Record the terminal outcome; False when one was already recorded (the first one stands,
+    also between reporters racing: the check and the write hold one lock)."""
+    if outcome not in (DONE, FAILED):
         return False
-    _write(workspace, key, dict(prior, state=outcome, reason=reason, rc=rc,
-                                ended_at=time.time() if now is None else now))
+    path = _path(workspace, key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with locked_file(path.with_suffix(".lock")):
+        prior = _read(workspace, key)
+        if prior is None or prior.get("state") != RUNNING:
+            return False
+        _write(workspace, key, dict(prior, state=outcome, reason=reason, rc=rc,
+                                    ended_at=time.time() if now is None else now))
     return True
 
 

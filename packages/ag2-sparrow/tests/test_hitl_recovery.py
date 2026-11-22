@@ -176,6 +176,7 @@ class VendoredCardAnswers(unittest.TestCase):
         self.mgr.resolve(self.req.id)
         card = self.mgr.get(self.req.id)
         self.assertTrue(fallback_body(card).endswith("— Still blocked."))
+        self.assertEqual(card.to_wire()["subject"], {"receipt": {"outcome": "done", "at": 1}, "superseded": True})
         self.assertTrue(renotify.said_on_card(card))
         up = SimpleNamespace(subject={"recovery": True, "verify": {"seen": "up"}})
         blocked = SimpleNamespace(subject={"recovery": True, "verify": {"seen": "blocked"}})
