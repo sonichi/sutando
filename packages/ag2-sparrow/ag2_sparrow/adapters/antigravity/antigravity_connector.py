@@ -144,6 +144,9 @@ DESCRIPTOR_NAME = "ag2-mcp-descriptor.json"
 PROXY_LOG_NAME = "ag2-mcp-proxy.log"
 
 
+SHIM_NAME = "ag2-mcp-shim"
+
+
 def shim_args(argv):
     """The arguments that run `argv` (the proxy) under `mcp_name_shim`, from this very package, isolated: agy
     drops every tool whose name has a dot, so the shim offers `room_action_execute` for `room.action.execute`."""
@@ -151,6 +154,20 @@ def shim_args(argv):
     code = ("import sys; sys.path.insert(0, %r); from ag2_sparrow.mcp_name_shim import main; "
             "raise SystemExit(main(sys.argv[1:]))" % root)
     return ["-I", "-c", code, "--"] + list(argv)
+
+
+def write_launcher(state):
+    """`<state>/ag2-mcp-shim` (0700): a plain executable that runs the shim, so agy's stdio entry is a file and
+    its args are only the proxy's command line (agy started no process for a `python -I -c <code>` entry)."""
+    path = os.path.join(state, SHIM_NAME)
+    text = "#!/bin/sh\nexec %s \"$@\"\n" % " ".join(shlex.quote(a) for a in [sys.executable] + shim_args([]))
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(tmp, 0o700)
+    os.replace(tmp, path)
+    return path
 
 
 def _descriptor_file(desc, token_env_file):
@@ -191,7 +208,7 @@ def stdio_entry(proxy_command, token_env_file, agent_id, state_dir, run=subproce
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(desc, f)
     os.replace(tmp, path)
-    return {"name": mcp_auth.SERVER_NAME, "command": sys.executable, "args": shim_args(argv),
+    return {"name": mcp_auth.SERVER_NAME, "command": write_launcher(state), "args": list(argv),
             "env": [{"name": "AG2_MCP_DESCRIPTOR", "value": path},
                     {"name": "AG2_MCP_LOG", "value": os.path.join(state, PROXY_LOG_NAME)}]}, ""
 

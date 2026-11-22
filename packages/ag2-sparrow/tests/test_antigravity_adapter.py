@@ -867,10 +867,10 @@ class SspaceStdioTest(unittest.TestCase):
         [[entry]] = self.sent()
         state = os.path.abspath(str(self.w.root / "state"))
         desc_path = os.path.join(state, gc.DESCRIPTOR_NAME)
-        self.assertEqual(entry["args"][-3:], ["--", "/app/node", "/app/ag2-mcp-proxy.mjs"], "the proxy, under the shim")
-        self.assertIn("mcp_name_shim", entry["args"][2])
-        self.assertEqual(entry, {"name": "ag2-space", "command": sys.executable, "args": gc.shim_args(
-                                     ["/app/node", "/app/ag2-mcp-proxy.mjs"]),
+        launcher = os.path.join(state, gc.SHIM_NAME)
+        self.assertEqual(os.stat(launcher).st_mode & 0o777, 0o700)
+        self.assertIn("mcp_name_shim", Path(launcher).read_text())
+        self.assertEqual(entry, {"name": "ag2-space", "command": launcher, "args": ["/app/node", "/app/ag2-mcp-proxy.mjs"],
                                  "env": [{"name": "AG2_MCP_DESCRIPTOR", "value": desc_path},
                                          {"name": "AG2_MCP_LOG", "value": os.path.join(state, gc.PROXY_LOG_NAME)}]})
         self.assertEqual(json.loads(Path(desc_path).read_text()), dict(self.desc, agent_id="@agy:s.space"))
@@ -952,6 +952,22 @@ class SspaceStdioTest(unittest.TestCase):
                 raise exc
             got = gc.stdio_entry(PROXY, self.token_file, "@agy:s.space", state, run=boom)
             self.assertEqual(got, (None, "the token exchange did not run (%s)" % type(exc).__name__))
+
+    def test_the_launcher_runs_the_proxy_under_the_shim_with_only_the_entrys_environment(self):
+        state = Path(self.tmp.name) / "launch state"   # a space in the path, as under Application Support
+        state.mkdir()
+        server = Path(self.tmp.name) / "server.py"
+        server.write_text("import json, sys\nfor line in sys.stdin:\n    m = json.loads(line)\n"
+                          "    print(json.dumps({'jsonrpc': '2.0', 'id': m['id'], 'result': {'tools': ["
+                          "{'name': 'room.action.execute'}, {'name': 'ui_request'}]}}), flush=True)\n")
+        launcher = gc.write_launcher(str(state))
+        log = state / "proxy.log"
+        r = gc.subprocess.run([launcher, sys.executable, str(server)], capture_output=True, text=True, timeout=60,
+                           input=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n",
+                           env={"AG2_MCP_DESCRIPTOR": "/d.json", "AG2_MCP_LOG": str(log)}, cwd="/")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual([t["name"] for t in json.loads(r.stdout)["result"]["tools"]], ["room_action_execute", "ui_request"])
+        self.assertRegex(log.read_text(), r"mcp_name_shim: start, running python[0-9.]*\n.*mcp_name_shim: exit, the server exited 0")
 
     def test_install_records_and_hands_on_the_proxy_command(self):
         cfg = {"ACP_COMMAND": "agy acp", "CWD": "/c", "TOKEN_ENV_FILE": "/a/agent.env", "AGENT_ID": "@agy:s.space",

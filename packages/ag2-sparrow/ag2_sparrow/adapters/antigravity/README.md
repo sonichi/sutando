@@ -145,7 +145,10 @@ and the policy decides:
   and every `room.*` tool were missing. The proxy therefore runs under `ag2_sparrow.mcp_name_shim`, which
   only renames: `tools/list` answers `room_action_execute` for `room.action.execute` (any character outside
   `[A-Za-z0-9_-]` becomes `_`, cut to 64), and a `tools/call` for that name reaches the server as
-  `room.action.execute`. The policy matches both spellings.
+  `room.action.execute`. The policy matches both spellings. agy checks the prefixed name
+  (`mcp_ag2-space_<tool>`, at most 64), so aliases stop at 50 characters. The entry's `command` is
+  `state/ag2-mcp-shim` (0700, written each turn), a two-line `sh` launcher, and its `args` are just the
+  proxy's command line; the shim writes `start` and `exit` lines to `state/ag2-mcp-proxy.log`.
 - **Token file shape (stdio).** An agent `.env` with a `REMOTE_TASK_TOKEN=<relay>|<secret>` line gets the
   plain descriptor (`env_file` that `.env`, `env_key` its key). A seat made by `--token-stdin` or `connect` has
   an `.env` (`channels/ag2space/.env`) holding only `REMOTE_TASK_TOKEN_FILE`, and its token as a raw line in

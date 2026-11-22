@@ -16,19 +16,32 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import re
 import subprocess
 import sys
 import threading
+import time
 
-NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# agy checks `mcp_<server>_<tool>` against ^[a-zA-Z0-9_-]{1,64}$; `mcp_ag2-space_` leaves the tool 50.
+ALIAS_MAX = 50
+NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,%d}" % ALIAS_MAX)
 _BAD = re.compile(r"[^A-Za-z0-9_-]")
+LOG_ENV = "AG2_MCP_LOG"
 
 
 def alias(name):
     """The client-safe name for a server tool name: itself when already safe, else every other character as
-    `_`, cut to 64."""
-    return name if NAME_RE.fullmatch(name) else (_BAD.sub("_", name)[:64] or "_")
+    `_`, cut to ALIAS_MAX."""
+    return name if NAME_RE.fullmatch(name) else (_BAD.sub("_", name)[:ALIAS_MAX] or "_")
+
+
+def note(line, environ=None):
+    """One line in the proxy's own log (AG2_MCP_LOG), so a run shows whether the shim started; best effort."""
+    path = (os.environ if environ is None else environ).get(LOG_ENV)
+    if path:
+        with contextlib.suppress(OSError), open(path, "a", encoding="utf-8") as f:
+            f.write("%s pid=%d mcp_name_shim: %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), os.getpid(), line))
 
 
 class Names:
@@ -48,7 +61,7 @@ class Names:
                 safe, n = alias(name), 2
                 while safe in taken and taken[safe] != name:
                     suffix = "_%d" % n
-                    safe, n = alias(name)[:64 - len(suffix)] + suffix, n + 1
+                    safe, n = alias(name)[:ALIAS_MAX - len(suffix)] + suffix, n + 1
                 taken[safe] = name
                 tool["name"] = safe
             self.to_server.update(taken)
@@ -118,6 +131,7 @@ def main(argv=None, stdin=None, stdout=None, popen=subprocess.Popen):
         return 2
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
+    note("start, running %s" % os.path.basename(argv[0]))
     child = popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
     names, pending, out_lock = Names(), set(), threading.Lock()
 
@@ -140,7 +154,9 @@ def main(argv=None, stdin=None, stdout=None, popen=subprocess.Popen):
         with contextlib.suppress(OSError):
             child.stdin.close()
     reader.join()
-    return child.wait()
+    rc = child.wait()
+    note("exit, the server exited %s" % rc)
+    return rc
 
 
 if __name__ == "__main__":

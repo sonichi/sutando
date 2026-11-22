@@ -119,6 +119,11 @@ class ShimTest(unittest.TestCase):
         self.assertEqual(got[3:], [3, None], "a malformed entry is left as it came")
         self.assertEqual({names.server_name(got[0]), names.server_name(got[1])}, {"a.b", "a_b"})
 
+    def test_every_alias_fits_agys_prefixed_name_rule(self):
+        for name in SERVER_TOOLS + ["x." * 40, "a" * 80]:
+            self.assertRegex("mcp_ag2-space_" + shim.alias(name), r"^[a-zA-Z0-9_-]{1,64}$", name)
+        self.assertEqual(shim.alias("a" * 50), "a" * 50)
+
     def test_lines_it_does_not_understand_pass_through(self):
         names, pending = shim.Names(), set()
         for line in ("not json\n", "[1, 2]\n", '"x"\n', '{"jsonrpc": "2.0", "method": "notifications/initialized"}\n'):
