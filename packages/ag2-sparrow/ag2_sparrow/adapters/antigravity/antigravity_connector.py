@@ -454,6 +454,11 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
 
 
 MODEL_FILE, MODEL_CARD, MODEL_ASK = "model.json", "model-switch", "/model"
+# What a pick came to is a card of its own: recorded under the menu's id it would retire the menu
+# (one live card per id and room), whose buttons the owner still sees and may tap again.
+MODEL_NOTE = "model-switch-status"
+MODEL_EXPIRED = "That card has expired, so nothing changed. Here's a new one."
+MODEL_EXPIRED_NO_CARD = "That card has expired, so nothing changed. Send /model for a new one."
 MODEL_BUTTONS = 6          # the card's button limit
 # How the owner asks in their own words: agy answers with the mark alone, and the connector shows the card.
 MODEL_MARK = "[model-card]"
@@ -530,16 +535,16 @@ class Connector:
         if picked:
             name = names.get(picked, picked)
             if same:
-                return agent_card.build(MODEL_CARD, "done", title="Model", body="Model: already %s" % name,
+                return agent_card.build(MODEL_NOTE, "done", title="Model", body="Model: already %s" % name,
                                         text="I'm already using %s. Nothing changed." % name)
             if ran is None:
-                return agent_card.build(MODEL_CARD, "info", title="Model", body="Model: switching to %s" % name,
+                return agent_card.build(MODEL_NOTE, "info", title="Model", body="Model: switching to %s" % name,
                                         text="Switching to %s on your next message. I'll confirm here once it has "
                                              "switched." % name)
             if ran == picked:
-                return agent_card.build(MODEL_CARD, "done", title="Model", body="Model: now %s" % name,
+                return agent_card.build(MODEL_NOTE, "done", title="Model", body="Model: now %s" % name,
                                         status="Switched", text="Switched. I'm now using %s." % name)
-            return agent_card.build(MODEL_CARD, "error", title="Model", body="Model: could not switch to %s" % name,
+            return agent_card.build(MODEL_NOTE, "error", title="Model", body="Model: could not switch to %s" % name,
                                     text="I could not switch to %s. I'm still using %s. Send /model to try again."
                                          % (name, names.get(ran, ran or "my default model")))
         buttons = [agent_card.button(name, "reply", reply="Use %s" % name,
@@ -590,6 +595,11 @@ class Connector:
                 publish(result_file, "[no-send] the model card answers\n" if self.post_card(room, coming)
                         else quoted(coming[1]["text"]) + "\n")
                 outcome = "model-picked"
+        elif (verdict.verdict == agent_card.FORGED and agent_card.owner_may_act(sent) is None
+              and (agent_card.card_click(sent) or {}).get("card_id") == MODEL_CARD):
+            # The owner tapped a model card this agent no longer keeps (a newer one replaced it, it is
+            # past its time, or an earlier install posted it): say so and show the current one.
+            outcome = self.expired_card(sent, state, result_file)
         elif verdict.verdict in (agent_card.COMMAND, agent_card.FORGED):
             publish(result_file, quoted(verdict.say) + "\n")
             outcome = "card-refused"
@@ -608,6 +618,15 @@ class Connector:
         except ValueError as e:
             log("model card not built:", str(e)[:200])
             return None
+
+    def expired_card(self, sent, state, result_file) -> str:
+        """Answer a tap on a model card that no longer acts: the words, and a fresh card when one can be shown."""
+        try:
+            fresh = bool(state.get("available")) and self.post_card(sent.get("channel_id"), self.menu(state))
+        except ValueError:
+            fresh = False
+        publish(result_file, quoted(MODEL_EXPIRED if fresh else MODEL_EXPIRED_NO_CARD) + "\n")
+        return "model-card-expired"
 
     def offer_models(self, sent, result_file) -> str:
         """Answer the owner's ask with the model card (or the line saying why there is none)."""
