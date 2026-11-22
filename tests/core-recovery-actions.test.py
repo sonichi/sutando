@@ -14,6 +14,7 @@ Contract: contracts/core_recovery.v1/action.json and receipt.json, compared lite
 """
 import importlib.util as u
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -1509,6 +1510,10 @@ class PausedCardWaitsForItsVerdict(Base):
         self.assertTrue(self.mgr.get(req.id).terminal)
 
 
+#: What a ctl that takes the app's launch lock lists for `capabilities`.
+LOCKING_CTL = "status\nrestart-core\nlaunch-lock\n"
+
+
 class DesktopRestart(Base):
     """On a desktop install restart_core goes through the app's sutando-ctl.sh restart-core, which
     re-runs the app's launcher and keeps the gateway's session; elsewhere it stays start-cli."""
@@ -1527,18 +1532,24 @@ class DesktopRestart(Base):
         self.addCleanup(repo_patch.stop)
         return app, repo
 
-    def _restart(self):
+    def _restart(self, run=None):
         req = self.card(kind="unknown", prompt=UNKNOWN)
         self.click(req, "restart_core")
-        [receipt] = self.run_pending(Run())
+        [receipt] = self.run_pending(run or Run(out=LOCKING_CTL))
         return receipt
 
     def test_a_desktop_install_restarts_the_core_through_the_apps_ctl(self):
         app, repo = self._desktop()
-        receipt = self._restart()
+        run = Run(out=LOCKING_CTL)
+        with mock.patch.dict(os.environ, {"SUTANDO_ENGINE_LAUNCH_LOCK_HELD": "/elsewhere/engine-launch.lock"}):
+            receipt = self._restart(run)
+        [(probe, probe_kw)] = run.calls
+        self.assertEqual(probe, ["bash", str(app / "engine" / "sutando-ctl.sh"), "capabilities"])
+        self.assertEqual(probe_kw["timeout"], RA.CTL_CAPABILITIES_TIMEOUT_S)
         self.assertEqual(self.spawned.command(), ["bash", str(app / "engine" / "sutando-ctl.sh"), "restart-core"])
         _, kw = self.spawned.calls[-1]
         self.assertEqual(kw["env"]["SUTANDO_APP_SUPPORT"], str(app))
+        self.assertNotIn("SUTANDO_ENGINE_LAUNCH_LOCK_HELD", kw["env"], "a lock marker is never inherited")
         self.assertEqual((kw["env"]["SUTANDO_TMUX_SOCKET"], kw["env"]["SUTANDO_TMUX_SESSION"]), (SOCK, CORE))
         self.assertTrue(kw["start_new_session"], "still detached from the monitor")
         self.assertTrue(self.spawned.gate(), "still gated on the tap's claim")
@@ -1586,6 +1597,58 @@ class DesktopRestart(Base):
         self.assertEqual(self.spawned.command(), ["bash", str(clone / "src" / "agent" / "start-cli.sh"), "--restart"])
         self.assertEqual(self.audit()[-1]["via"], RA.VIA_FALLBACK)
 
+    def test_a_standalone_restart_under_a_configured_app_dir_says_so_on_the_card_and_audit(self):
+        # A dev override (an exported app dir, or a checkout outside the bundle) is never silent.
+        self._desktop()
+        clone = self.ws / "clone" / "sutando"
+        clone.mkdir(parents=True)
+        req = self.card(kind="unknown", prompt=UNKNOWN)
+        self.click(req, "restart_core")
+        with mock.patch.object(RA, "REPO", clone):
+            [receipt] = self.run_pending(Run())
+        self.assertEqual(receipt["outcome"], "done")
+        self.assertIn("not the desktop app's own copy, so the standalone restart was used",
+                      self.mgr.get(req.id).message)
+        line = self.audit()[-1]
+        self.assertEqual((line["via"], line.get("via_reason")), (RA.VIA_FALLBACK, "not-bundle"))
+
+    def test_without_an_app_dir_the_card_carries_no_standalone_note(self):
+        req = self.card(kind="unknown", prompt=UNKNOWN)
+        self.click(req, "restart_core")
+        self.run_pending(Run())
+        self.assertNotIn("standalone", self.mgr.get(req.id).message)
+        self.assertNotIn("via_reason", self.audit()[-1])
+
+    def test_a_ctl_without_the_launch_lock_is_refused_and_launches_nothing(self):
+        # An engine newer than its app: the ctl predates the lock (no `capabilities` verb: usage, exit 2),
+        # lists no launch-lock, or does not answer in time. Never start-cli on the bundle either.
+        for name, run in (("old ctl", Run(rc=2)), ("no launch-lock", Run(out="status\nrestart-core\n")),
+                          ("hangs", Hang())):
+            with self.subTest(name):
+                self.tearDown()
+                self.setUp()
+                self._desktop()
+                req = self.card(kind="unknown", prompt=UNKNOWN)
+                self.click(req, "restart_core")
+                [receipt] = self.run_pending(run)
+                self.assertEqual(self.spawned.calls, [], "nothing is launched")
+                self.assertEqual([c[0][-1] for c in run.calls], ["capabilities"], "only the read-only probe ran")
+                self.assertEqual(receipt["outcome"], "refused")
+                self.assertIn("Restart the core from the desktop app", self.mgr.get(req.id).message)
+                self.assertEqual(self.audit()[-1]["via"], RA.VIA_NO_LOCK)
+
+    def test_a_held_retry_on_a_ctl_without_the_lock_keeps_its_hold(self):
+        self._desktop()
+        now = time.time()
+        core_limit_hold._write_hold(self.ws, {"status": "held", "kind": "usage-limit", "model": "opus",
+                                              "until": now + 3600, "started_at": now - 60, "set_at": now - 60,
+                                              "source": core_limit_hold.PANE_SOURCE})
+        req = self.card()
+        self.click(req, "retry_now")
+        [receipt] = self.run_pending(Run(rc=2), now=now)
+        self.assertEqual((self.spawned.calls, receipt["outcome"]), ([], "refused"))
+        self.assertIsNotNone(core_limit_hold.active_hold(self.ws, now + 1), "the hold stays")
+
     def test_a_busy_launch_lock_says_a_restart_is_already_running_keeps_the_hold_and_retries_nothing(self):
         # sutando-ctl.sh restart-core exits 12 when another launcher run holds the launch lock.
         self._desktop()
@@ -1595,7 +1658,7 @@ class DesktopRestart(Base):
                                               "source": core_limit_hold.PANE_SOURCE})
         req = self.card()
         self.click(req, "retry_now")
-        [receipt] = self.run_pending(Run(), now=now)
+        [receipt] = self.run_pending(Run(out=LOCKING_CTL), now=now)
         self.assertEqual((receipt["outcome"], self.spawned.command()[-1]), ("done", "restart-core"))
         self.answer(detached_action.FAILED, rc=RA.CTL_LAUNCH_LOCK_BUSY, reason="exit")
         self.assertEqual(RA.verify_step(self.mgr, self.ws, CORE, blocked=True, now=now + 5), [req.id])

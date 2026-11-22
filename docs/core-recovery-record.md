@@ -147,10 +147,14 @@ installed beside the checkout, which re-runs the app's own launcher: for Claude 
 the core window, so the gateway keeps its session. In the app's own bundle
 (`<app-support>/engine/<checkout>`) with that script missing, the tap is refused before anything
 runs and the card says to restart the core from the desktop app: `start-cli.sh --restart` would
-kill the gateway's session. A standalone clone, even with `$SUTANDO_APP_SUPPORT` exported, and
-any install without the app run `src/agent/start-cli.sh --restart`. The audit line's `via` says
-which: `ctl`, `ctl-missing`, `start-cli` or `start-cli-fallback`. Switch runtime always runs
-`start-cli.sh --runtime`.
+kill the gateway's session. Before using the ctl it runs `sutando-ctl.sh capabilities` (5 s): a
+ctl that does not list `launch-lock` (an app older than the engine) is refused the same way, so a
+restart never overlaps the app's own launcher. A standalone clone, even with
+`$SUTANDO_APP_SUPPORT` exported, and any install without the app run
+`src/agent/start-cli.sh --restart`; with an app dir configured the card says the standalone
+restart was used and the audit adds `via_reason: not-bundle`. The audit line's `via` says which:
+`ctl`, `ctl-missing`, `ctl-no-lock`, `start-cli` or `start-cli-fallback`. Switch runtime always
+runs `start-cli.sh --runtime`.
 When the ctl exits 12 (another launcher run held the app's launch lock; nothing was killed or
 started), the receipt is `failed`, the card says the core is already being restarted and to try
 again shortly, any hold it lifted returns, and nothing is retried automatically.

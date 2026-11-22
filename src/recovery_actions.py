@@ -326,9 +326,10 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
         if verb == recovery.SWITCH_RUNTIME:
             argv, via = ["bash", str(REPO / "src" / "agent" / "start-cli.sh"), "--runtime", arg, "--restart"], None
         else:
-            argv, via = _restart_core_argv(env)
+            argv, via = _restart_core_argv(env, runner)
             if argv is None:
-                return "refused", NO_CTL_LINE, NO_CTL_LINE, {VIA_FIELD: via}
+                why = NO_LOCK_LINE if via == VIA_NO_LOCK else NO_CTL_LINE
+                return "refused", why, why, {VIA_FIELD: via}
         # The launcher's --restart closes the tmux session this monitor runs in: it runs detached,
         # and the monitor that comes back with the core reads its outcome (verify_step).
         key = _detached_key(req)
@@ -342,8 +343,10 @@ def _execute(verb: str, arg: Optional[str], req, target: Target, runner: Runner,
         if verb == recovery.SWITCH_RUNTIME:
             return ("done", None, f"Switching the core to {arg}; checking that it is working again.",
                     {"state": "starting", "runtime": arg, VERIFY_FIELD: check})
-        return ("done", None, "Restarting the core; checking that it is working again.",
-                {"state": "starting", VERIFY_FIELD: check, VIA_FIELD: via})
+        line = "Restarting the core; checking that it is working again."
+        if via == VIA_FALLBACK:
+            line = f"{line} {STANDALONE_LINE}"
+        return ("done", None, line, {"state": "starting", VERIFY_FIELD: check, VIA_FIELD: via})
     if verb == recovery.REFRESH_OPTIONS:
         # The owner asked: the pane's own menu is read again, and a core idle at its limit has its
         # model picker opened, read and closed once; the card is replaced with what the screen shows.
@@ -374,10 +377,19 @@ spawn_detached = subprocess.Popen
 #: Which command restart_core ran, kept on its audit line only (the receipt is unchanged).
 VIA_FIELD = "via"
 VIA_CTL, VIA_START_CLI, VIA_FALLBACK = "ctl", "start-cli", "start-cli-fallback"
-#: The app's bundle without its controller: refused, nothing run.
-VIA_NO_CTL = "ctl-missing"
+#: The app's bundle without its controller, or with one that takes no launch lock: refused, nothing run.
+VIA_NO_CTL, VIA_NO_LOCK = "ctl-missing", "ctl-no-lock"
 NO_CTL_LINE = ("This core runs inside the desktop app, and the app's restart control is missing here, "
                "so nothing was restarted. Restart the core from the desktop app.")
+NO_LOCK_LINE = ("This core runs inside the desktop app, and this version of the app cannot restart it "
+                "safely from here, so nothing was restarted. Restart the core from the desktop app.")
+#: Why a restart took start-cli although an app-support dir is configured, kept on the audit line.
+VIA_REASON_FIELD = "via_reason"
+NOT_BUNDLE = "not-bundle"
+STANDALONE_LINE = "This checkout is not the desktop app's own copy, so the standalone restart was used."
+#: The ctl's side-effect-free capability list; `launch-lock` means restart-core takes the app's lock.
+CTL_CAPABILITIES_TIMEOUT_S = 5
+LAUNCH_LOCK_CAPABILITY = "launch-lock"
 #: The desktop app's control script, installed beside the engine checkout it drives.
 DESKTOP_CTL = "sutando-ctl.sh"
 #: Its restart-core exit when another launcher run held the launch lock: nothing was killed or started.
@@ -386,7 +398,7 @@ BUSY_LINE = ("The core is already being restarted, so nothing was done this time
              "Try again in a minute if it is still blocked.")
 
 
-def _restart_core_argv(env: Dict):
+def _restart_core_argv(env: Dict, runner: Runner):
     """(argv, via) for restart_core; argv None when nothing may run. In the app's own bundle its
     restart-core keeps the gateway's session, and start-cli --restart would kill that session."""
     start_cli = ["bash", str(REPO / "src" / "agent" / "start-cli.sh"), "--restart"]
@@ -400,7 +412,18 @@ def _restart_core_argv(env: Dict):
     if not ctl.is_file():
         return None, VIA_NO_CTL
     env["SUTANDO_APP_SUPPORT"] = str(app_support)
+    if not _ctl_has_launch_lock(ctl, env, runner):
+        return None, VIA_NO_LOCK  # an app older than the lock: its restart can overlap the launcher
     return ["bash", str(ctl), "restart-core"], VIA_CTL
+
+
+def _ctl_has_launch_lock(ctl: Path, env: Dict, runner: Runner) -> bool:
+    try:
+        run = runner(["bash", str(ctl), "capabilities"], capture_output=True, text=True,
+                     timeout=CTL_CAPABILITIES_TIMEOUT_S, env=env, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return run.returncode == 0 and LAUNCH_LOCK_CAPABILITY in (run.stdout or "").split()
 
 
 def _detached_key(req) -> str:
@@ -411,6 +434,7 @@ def _env(target: Target) -> Dict:
     env = dict(os.environ, SUTANDO_TMUX_SOCKET=target.socket, SUTANDO_TMUX_SESSION=target.session)
     env.pop("SUTANDO_CORE_RUNTIME", None)  # the configured runtime, or --runtime, decides
     env.pop("SUTANDO_CORE_SESSION", None)  # the monitor runs outside the core session
+    env.pop("SUTANDO_ENGINE_LAUNCH_LOCK_HELD", None)  # only a launcher run holding the lock may skip it
     return env
 
 
@@ -743,6 +767,8 @@ def _settle(manager, target: Target, data: Dict, req, outcome: str, reason, line
         entry[PATH_FIELD] = fields[PATH_FIELD]
     if via:
         entry[VIA_FIELD] = via
+    if via == VIA_FALLBACK:
+        entry[VIA_REASON_FIELD] = NOT_BUNDLE
     audit(target.workspace, entry)
     if outcome == "done" and req is not None and not target.seat:
         check = dict(check or {}, **_resume_check(target.workspace, req))
