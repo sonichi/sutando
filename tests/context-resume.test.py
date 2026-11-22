@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import weakref
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -158,6 +159,35 @@ class BudgetTests(unittest.TestCase):
         out = extract_recent_turns(self.write(entries), max_turns=3)
         self.assertEqual(out, "**User:** newest ask\n\n**Assistant:** [ran tools: Read]"
                              "\n\n**User:** newest follow-up")
+
+    def test_character_budget_keeps_a_contiguous_recent_suffix(self):
+        p = self.write([_user("old small"), _user("M" * 100), _user("newest")])
+        self.assertEqual(extract_recent_turns(p, max_chars=40), "**User:** newest")
+
+    def test_discarded_turns_are_released_during_the_scan(self):
+        import gc
+        from unittest import mock
+
+        class TrackedText(str):
+            pass
+
+        live = weakref.WeakSet()
+        peaks = []
+        clean = context_resume._clean
+
+        def tracked_clean(text):
+            value = TrackedText(clean(text))
+            live.add(value)
+            gc.collect()
+            peaks.append(len(live))
+            return value
+
+        p = self.write([_user(f"turn-{i}") for i in range(80)])
+        with mock.patch.object(context_resume, "_clean", side_effect=tracked_clean):
+            out = extract_recent_turns(p, max_turns=3)
+        self.assertEqual(len(peaks), 80)
+        self.assertLessEqual(max(peaks), 4)  # retained window plus the turn being cleaned
+        self.assertEqual(out, "**User:** turn-77\n\n**User:** turn-78\n\n**User:** turn-79")
 
     def test_tool_summary_obeys_rendered_budget(self):
         p = self.write([_assistant([{"type": "tool_use", "name": "T" * 3000}])])
