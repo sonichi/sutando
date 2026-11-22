@@ -291,6 +291,15 @@ def main():
         if method != "session/prompt":
             log({"method": method, "params": params})
         if method == "initialize":
+            account = os.path.join(HOME, "account")
+            if os.path.exists(account):
+                # agy's own log line naming the account it authenticated (server_oauth.go), in its default
+                # log dir, in a file named for this process.
+                logs = os.path.join(HOME, ".gemini", "antigravity-cli", "log")
+                os.makedirs(logs, exist_ok=True)
+                with open(os.path.join(logs, "acp-server-20261122_000000-%d.log" % os.getpid()), "a") as f:
+                    f.write("I1122 00:00:00.000000 1 server_oauth.go:221] applyAuthResult: email=%s, "
+                            "authMethod=consumer, quotaProject=\n" % open(account).read().strip())
             send({"jsonrpc": "2.0", "id": rid, "result": {
                 "protocolVersion": 1, "agentInfo": {"name": "Antigravity ACP Server", "version": "1.5.9"},
                 "agentCapabilities": dict(

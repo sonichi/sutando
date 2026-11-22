@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Antigravity's account card (adapters/antigravity/agy_account.py), all in the owner's DM: 切换账号 runs
-`agy acp --login` in the background and takes the authorization code from the owner's reply, 用 API key
-points to the settings, 停用 API key removes the key, and a quota error shows the card.
+"""Antigravity's account card (adapters/antigravity/agy_account.py) in the owner's DM: 切换账号 and 用 API key
+point to the agent's settings (no code or key is ever taken in chat), 停用 API key removes the key, the turn
+after a switch says which account agy now uses, and a quota error shows the card.
 
-Driven through the connector against tests/agy_stub_acp.py (the turns) and tests/agy_login_stub.py (the
-sign-in), with the Keychain and the browser opener faked, dummy codes and keys only.
+Driven through the connector against tests/agy_stub_acp.py, with the Keychain faked, dummy codes and keys only.
 
 Run:
     python3 -m pytest -q packages/ag2-sparrow/tests/test_antigravity_account_card.py
@@ -26,8 +25,7 @@ import test_antigravity_adapter as ta  # noqa: E402  (its hermetic env and Work)
 from ag2_sparrow import account_switch, connector_cards  # noqa: E402
 from ag2_sparrow.adapters.antigravity import agy_account, antigravity_connector as gc, gemini_key as gk  # noqa: E402
 
-LOGIN_STUB = str(Path(__file__).resolve().parent / "agy_login_stub.py")
-CODE = "DUMMY-CODE-1234"                 # the login stub's one good code
+CODE = "4/0A" + "d" * 40                # shaped like a Google sign-in code; not a real one
 DUMMY_KEY = "AIza" + "D" * 35            # shaped like a Google API key; not a real one
 AGENT = "@agy-bot:s.space"
 DM = "!dm:s.space"
@@ -46,34 +44,33 @@ class AccountCardTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.w = ta.Work(self.tmp.name)
         self.keychain = {"saved": False}
-        self.cleared, self.opened, self.logs = [], [], []
+        self.cleared, self.logs = [], []
         self.connector = None
         patches = [
             mock.patch.object(gk, "key_saved", lambda agent_id, **kw: agent_id == AGENT and self.keychain["saved"]),
             mock.patch.object(gk, "clear_key", self.fake_clear),
             mock.patch.object(gk, "gemini_api_key_from_app", lambda agent_id="", **kw: ""),
-            mock.patch.object(gc, "open_page", lambda url: self.opened.append(url) or True),
         ]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
 
     def tearDown(self):
-        if self.connector is not None:
-            self.connector.accounts.give_up()
         self.tmp.cleanup()
 
     def fake_clear(self, agent_id, **kw):
         self.cleared.append(agent_id)
+        if self.keychain.get("broken"):
+            return gk.FAILED
+        was = self.keychain["saved"]
         self.keychain["saved"] = False
-        return True
+        return gk.REMOVED if was else gk.ABSENT
 
     def serve(self):
-        """One task on one long-lived connector (a waiting sign-in lives in it), its log kept."""
+        """One task on one long-lived connector, its log kept."""
         a = self.w.args("--agent-id", AGENT)
         if self.connector is None:
             self.connector = gc.Connector(a)
-            self.connector.accounts.login_argv = [sys.executable, LOGIN_STUB]
         else:
             self.connector.args = a
         err = io.StringIO()
@@ -123,12 +120,6 @@ class AccountCardTest(unittest.TestCase):
                     out.append(p.read_text(encoding="utf-8", errors="replace"))
         return "\n".join(out)
 
-    def switch(self):
-        card = self.menu()
-        self.tap("task-switch", card, "切换账号")
-        (info,) = self.posted("$card2")
-        return info
-
     # ── A1 ──
     def test_asking_in_words_shows_the_card_with_switch_and_api_key(self):
         for n, ask in enumerate(("换账号", "switch account", "用 API key", "/account")):
@@ -139,49 +130,50 @@ class AccountCardTest(unittest.TestCase):
         self.assertEqual(self.prompts(), [], "asking for the card never reaches agy")
 
     # ── A2 ──
-    def test_switch_posts_the_link_and_the_code_sent_back_finishes_the_sign_in_unseen(self):
-        info = self.switch()
-        url = next(b["url"] for b in info["buttons"] if b["label"] == "打开登录页")
-        self.assertTrue(url.startswith("https://accounts.google.com/"))
-        self.assertEqual(self.opened, [url])
+    def test_switch_points_to_the_settings_sign_in_and_starts_nothing_here(self):
+        card = self.menu()
+        with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("nothing is run")):
+            self.tap("task-switch", card, "切换账号")
+        (info,) = self.posted("$card2")
+        self.assertIn("Connections", info["text"])
+        self.assertIn("Switch account", info["text"])
+        self.assertIn("不要把授权码发在这个对话里", info["text"])
         self.assertIn(agy_account.SHARED, info["text"])
-        self.dm("task-code", CODE)
-        self.serve()
-        (done,) = self.posted("$card3")
-        self.assertEqual(done["state"], "done")
-        self.assertIn("已切到 a…@example.com 账号", done["text"])
-        self.assertEqual(self.w.result("task-code"), account_switch.ANSWERED)
-        self.assertEqual(self.prompts(), [], "the code never reaches agy's turn")
-        self.assertEqual(self.w.metrics()[-1]["card"], "account-switched")
-        self.assertNotIn(CODE, self.everything_written())
-        self.assertFalse(self.connector.accounts.waiting())
+        self.assertFalse(info.get("buttons"), "no input box and no link: no secret travels through the card")
+        self.assertEqual(self.prompts(), [])
 
-    def test_the_whole_landing_address_works_too(self):
-        self.switch()
-        self.dm("task-code", "http://localhost:51121/oauth2callback?state=s1&code=%s&scope=email" % CODE)
-        self.serve()
-        (done,) = self.posted("$card3")
-        self.assertEqual(done["state"], "done")
-        self.assertNotIn(CODE, self.everything_written())
+    def test_a_sign_in_code_sent_in_chat_is_never_taken_nor_passed_on(self):
+        card = self.menu()
+        self.tap("task-switch", card, "切换账号")
+        self.posted("$card2")
+        for n, body in enumerate((CODE, "http://localhost:51121/oauth2callback?state=s1&code=%s&scope=x" % CODE)):
+            self.dm("task-code%d" % n, body)
+            self.serve()
+            self.assertIn("请把它从对话里删掉", self.w.result("task-code%d" % n))
+        self.assertEqual(self.prompts(), [], "the code never reaches agy")
+        self.assertEqual(self.posted("$x"), [], "and nothing acts on it")
+        self.assertNotIn(CODE, "\n".join(self.logs) + json.dumps(self.w.metrics()) + self.state_text())
 
-    def test_a_wrong_code_says_so_and_offers_the_card_again(self):
-        self.switch()
-        self.dm("task-code", "DUMMY-WRONG-9999")
-        self.serve()
-        (again,) = self.posted("$card3")
-        self.assertIn("登录没有完成", again["text"])
-        self.assertEqual([b["label"] for b in again["buttons"]], ["切换账号", "用 API key"])
-        self.assertNotIn("DUMMY-WRONG-9999", self.everything_written())
+    def state_text(self):
+        return "\n".join(p.read_text(encoding="utf-8", errors="replace")
+                         for p in (self.w.root / "state").rglob("*") if p.is_file())
 
-    def test_while_waiting_ordinary_words_and_other_senders_are_not_taken_as_the_code(self):
-        self.switch()
-        self.dm("task-words", "STUB:TEXT what is the weather")
+    def test_the_turn_after_a_switch_says_which_account_agy_now_uses(self):
+        (self.w.home / "account").write_text("alice@example.com")
+        self.dm("task-1", "STUB:TEXT hi")
         self.serve()
-        self.assertEqual(self.w.result("task-words"), "hello from agy-stub\n")
-        self.dm("task-team", CODE, tier="team", collaborator=True)
+        self.assertEqual(self.w.result("task-1"), "hello from agy-stub\n", "the first account seen is only kept")
+        (self.w.home / "account").write_text("bob@example.com")
+        self.dm("task-2", "STUB:TEXT hi")
         self.serve()
-        self.assertTrue(self.connector.accounts.waiting(), "a collaborator's message never feeds the sign-in")
-        self.assertEqual(self.posted("$x"), [])
+        self.assertTrue(self.w.result("task-2").startswith(gc.quoted("（已切到 b…@example.com 账号。）").strip()))
+        self.assertIn("hello from agy-stub", self.w.result("task-2"))
+        self.dm("task-3", "STUB:TEXT hi")
+        self.serve()
+        self.assertEqual(self.w.result("task-3"), "hello from agy-stub\n")
+        card = self.menu()
+        self.assertIn("b…@example.com", card["text"])
+        self.assertNotIn("bob@example.com", self.state_text())
 
     def test_a_tap_that_is_not_the_owners_changes_nothing(self):
         self.keychain["saved"] = True
@@ -189,8 +181,7 @@ class AccountCardTest(unittest.TestCase):
         self.tap("task-team", card, "停用 API key", tier="team", collaborator=True)
         self.assertIn("couldn't match that button", self.w.result("task-team"))
         self.tap("task-guest", card, "切换账号", tier="guest")
-        self.assertEqual((self.cleared, self.opened, self.posted("$x")), ([], [], []))
-        self.assertIsNone(self.connector.accounts.login)
+        self.assertEqual((self.cleared, self.posted("$x")), ([], []))
 
     # ── A3 ──
     def test_api_key_points_to_the_settings_and_a_key_sent_here_is_never_passed_on(self):
@@ -215,6 +206,43 @@ class AccountCardTest(unittest.TestCase):
         (done,) = self.posted("$card2")
         self.assertEqual(done["state"], "done")
 
+    def test_a_keychain_failure_is_said_as_one_never_as_removed(self):
+        self.keychain.update(saved=True, broken=True)
+        card = self.menu()
+        self.tap("task-stop", card, "停用 API key")
+        (said,) = self.posted("$card2")
+        self.assertEqual(said["state"], "error")
+        self.assertIn("没能删掉", said["text"])
+        self.assertNotIn("已停用", said["text"])
+        self.assertEqual(self.w.metrics()[-1]["card"], "account-key-not-cleared")
+
+    def test_stop_on_an_older_card_after_the_key_is_gone_changes_nothing_and_says_so(self):
+        self.keychain["saved"] = True
+        card = self.menu()
+        self.tap("task-stop1", card, "停用 API key")
+        self.posted("$card2")
+        self.tap("task-stop2", card, "停用 API key")
+        (said,) = self.posted("$card3")
+        self.assertIn("已经没有保存 API key", said["text"])
+        self.assertNotIn("已停用", said["text"])
+        self.assertEqual(self.w.metrics()[-1]["card"], "account-key-absent")
+
+    def test_the_switch_notice_is_said_only_in_the_owners_dm(self):
+        (self.w.home / "account").write_text("alice@example.com")
+        self.dm("task-1", "STUB:TEXT hi")
+        self.serve()
+        (self.w.home / "account").write_text("bob@example.com")
+        self.dm("task-room", "STUB:TEXT hi", kind="room")
+        self.serve()
+        self.assertEqual(self.w.result("task-room"), "hello from agy-stub\n", "never in a room with other people")
+        self.dm("task-collab", "STUB:TEXT hi", tier="team", collaborator=True)
+        self.serve()
+        self.assertNotIn("已切到", self.w.result("task-collab"))
+        self.dm("task-dm", "STUB:TEXT hi")
+        self.serve()
+        self.assertIn("已切到 b…@example.com 账号", self.w.result("task-dm"), "the DM is told once it is back there")
+        self.assertEqual(self.posted("$x"), [], "and no card goes anywhere")
+
     # ── A4 ──
     def test_a_quota_error_shows_the_card_in_the_dm_once(self):
         self.dm("task-q1", "STUB:QUOTA hi")
@@ -234,11 +262,21 @@ class AccountCardTest(unittest.TestCase):
 
 
 class PartsTest(unittest.TestCase):
-    def test_code_in_takes_a_code_or_an_addresses_code_and_nothing_else(self):
-        self.assertEqual(agy_account.code_in(" 4/0AbCd-123_xyz "), "4/0AbCd-123_xyz")
-        self.assertEqual(agy_account.code_in("http://localhost:1/cb?code=4/0Ab12345&state=x"), "4/0Ab12345")
-        for words in ("hello there", "thanks!", "http://example.com/no-code", "abcdefghij"):
-            self.assertEqual(agy_account.code_in(words), "", words)
+    def test_carries_secret_finds_codes_keys_and_markers_only(self):
+        for said in (CODE, "here " + CODE, "http://localhost:1/cb?code=4/0Ab12345&state=x", "k " + DUMMY_KEY,
+                     "[REDACTED-Google API Key]"):
+            self.assertTrue(agy_account.carries_secret(said), said)
+        for said in ("hello there", "4/5 of the tests pass", "http://example.com/no-code", "switch account"):
+            self.assertFalse(agy_account.carries_secret(said), said)
+
+    def test_signed_in_as_reads_only_this_processes_log(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "acp-server-1-42.log").write_text("x\nI1 server_oauth.go:221] applyAuthResult: email=bob@example.com, "
+                                                       "authMethod=consumer, quotaProject=\n")
+            Path(d, "acp-server-1-43.log").write_text("applyAuthResult: email=eve@example.com, authMethod=consumer\n")
+            self.assertEqual(agy_account.signed_in_as(d, 42), "b…@example.com")
+            self.assertEqual(agy_account.signed_in_as(d, 44), "")
+            self.assertEqual(agy_account.signed_in_as(os.path.join(d, "none"), 42), "")
 
     def test_asks_for_card_only_for_short_asks(self):
         for ask in ("换账号", "帮我切换账号", "Switch account.", "use an API key", "/account"):
@@ -252,10 +290,23 @@ class PartsTest(unittest.TestCase):
             calls.append(argv)
             return subprocess.CompletedProcess(argv, 0 if argv[1] == "delete-generic-password" else 44, "", "")
         self.assertFalse(gk.key_saved(AGENT, run=run, platform="darwin", environ={}))
-        self.assertTrue(gk.clear_key(AGENT, run=run, platform="darwin"))
+        self.assertEqual(gk.clear_key(AGENT, run=run, platform="darwin"), gk.REMOVED)
         for argv in calls:
             self.assertNotIn("-w", argv)
             self.assertEqual(argv[argv.index("-s") + 1], gk.agent_service(AGENT))
+
+    def test_clear_key_reports_each_failure_as_a_failure(self):
+        def answers(delete, find=44):
+            return lambda argv, **kw: subprocess.CompletedProcess(argv, delete if argv[1].startswith("delete") else find, "", "")
+
+        def boom(argv, **kw):
+            raise OSError("no security")
+        self.assertEqual(gk.clear_key(AGENT, run=answers(44), platform="darwin"), gk.ABSENT)
+        self.assertEqual(gk.clear_key(AGENT, run=answers(1), platform="darwin"), gk.FAILED)
+        self.assertEqual(gk.clear_key(AGENT, run=answers(0, find=0), platform="darwin"), gk.FAILED, "still there")
+        self.assertEqual(gk.clear_key(AGENT, run=boom, platform="darwin"), gk.FAILED)
+        self.assertEqual(gk.clear_key(AGENT, run=answers(0), platform="linux"), gk.FAILED)
+        self.assertEqual(gk.clear_key("", run=answers(0), platform="darwin"), gk.FAILED)
 
 
 if __name__ == "__main__":
