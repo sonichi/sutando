@@ -8,7 +8,7 @@ has been measured yet. Its sign-in, session
 and log files live under $HOME (the one variable the launcher's allowlist always passes): `signed-in` marks it
 signed in, `stub-sessions.json` keeps its sessions, `stub.log` records each request and permission outcome.
 A prompt marker picks the turn: STUB:TEXT, STUB:NOREPLY, STUB:MARKER, STUB:EDIT, STUB:SHELL, STUB:WEB,
-STUB:AGYWRITE, STUB:ODD, STUB:HANG. STUB:AGYWRITE's rawInput carries agy's own argument names (Path, Content,
+STUB:AGYWRITE, STUB:ODD, STUB:HANG, STUB:ASKMODEL. STUB:AGYWRITE's rawInput carries agy's own argument names (Path, Content,
 Overwrite; Target, Replacement, Edits) as its file tools declare them; the key order (Content first) is the one
 a real owner turn's refusal named ("unrecognised key Content").
 
@@ -101,6 +101,9 @@ def prompt(rid, params):
         send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {
             "sessionUpdate": "tool_call", "toolCallId": "c-file", "title": "File " + told.group(1), "kind": "edit"}}})
         ask(sid, {"title": "File " + told.group(1), "kind": "edit", "rawInput": {"Content": "hello"}})
+    elif "STUB:ASKMODEL" in text:
+        # What agy is told to answer when asked about its model, provided the hint reached it.
+        chunk(sid, "[model-card]" if "reply with exactly [model-card]" in text else "no hint")
     elif "STUB:NOREPLY" in text:
         chunk(sid, "NO_REPLY")
     elif "STUB:MARKER" in text:

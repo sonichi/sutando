@@ -116,7 +116,12 @@ from the next message with nothing restarted. A refused `session/set_model` is l
 `metrics.jsonl`, and `model_switch` there is `switched` or `not-switched` on the turn that settled a
 pick. Guest turns are not switched.
 
-The owner picks from a card. In their DM with the agent, the message `/model` is not sent to agy: the
+The owner picks from a card, and asks for it in their own words. Each of the owner's turns (not a
+collaborator's) ends with one more line telling agy to answer a question about its model with the mark
+`[model-card]` alone. When a completed turn's whole answer is that mark, the connector posts the card in
+place of the answer if the ask came from the owner's DM, and otherwise says "I can switch models from
+our direct message. Ask me there." The mark from anyone else, or inside a longer answer, is ordinary
+text. The fixed message `/model` in that DM does the same without a turn: the
 connector queues an agent panel card (`connector_cards`; the bridge posts it) with one reply button per
 model, at most six. A tap comes back as a task with `card_click`; it is judged by the core's own
 `agent_card.click_verdict` against this agent's ledger of the cards it posted, so it acts only when the

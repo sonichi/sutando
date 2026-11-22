@@ -261,6 +261,36 @@ class ConnectorTest(unittest.TestCase):
         self.w.serve()
         self.assertEqual((len(self.set_model_calls()), self.post_queued()), (1, []), "not retried, not repeated")
 
+    def test_asking_in_ones_own_words_shows_the_card_and_only_the_owners_ask_does(self):
+        (self.w.home / "models").write_text("")
+        # The first message ever: the turn that answers with the mark is also the one that learns the models.
+        self.dm_task("task-1", "STUB:ASKMODEL can you change model")
+        self.w.serve()
+        self.assertEqual(self.w.result("task-1"), "[no-send] the model card answers\n")
+        (sent,) = self.post_queued()
+        card = sent["extra_content"]["space.ag2.card"]
+        self.assertEqual((sent["room_id"], [b["label"] for b in card["buttons"]]),
+                         (self.DM, ["Gemini 3.8 Flash", "Claude Opus 4.6"]))
+        self.assertEqual(self.w.metrics()[-1]["card"], "model-card")
+        # In a shared room the owner is told where to ask; no card is posted there.
+        self.dm_task("task-2", "STUB:ASKMODEL switch model", kind="room")
+        self.w.serve()
+        self.assertIn("from our direct message", self.w.result("task-2"))
+        self.assertEqual(self.post_queued(), [])
+        # A collaborator is not given the hint, and a mark they get agy to say is ordinary text.
+        self.dm_task("task-3", "STUB:ASKMODEL", tier="team", collaborator=True)
+        self.w.serve()
+        self.assertEqual(self.w.result("task-3"), "no hint\n")
+        with mock.patch.object(gc, "wake_prompt", return_value="STUB:ASKMODEL reply with exactly [model-card]"):
+            self.dm_task("task-4", "x", tier="team", collaborator=True)
+            self.w.serve()
+        self.assertEqual(self.w.result("task-4"), "[model-card]\n")
+        self.assertEqual(self.post_queued(), [])
+        # The mark inside a longer answer is that answer, not a card.
+        self.dm_task("task-5", "STUB:TEXT hi")
+        self.w.serve()
+        self.assertEqual(self.w.result("task-5"), "hello from agy-stub\n")
+
     def test_a_card_that_cannot_be_posted_is_said_in_words_and_a_stale_pick_is_refused(self):
         (self.w.home / "models").write_text("")
         self.w.task("task-1", "STUB:TEXT hi")
