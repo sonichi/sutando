@@ -74,6 +74,7 @@ import hashlib
 import http.client
 import ipaddress
 import socket
+import stat
 import ssl
 import tempfile
 import threading
@@ -1879,15 +1880,15 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
     a refused stop (`BridgeStillRunning`, `BridgeLeaseIndeterminate`) and `PromoteConflict` (the
     primary moved, or the row to park was removed or parked, while it waited) re-raise after the
     rollback: the primary flag (never over a newer move) and a cleared `parked` flag are restored,
-    a bridge this call started is stopped and one it stopped is started again, and the old bridge was never touched
-    (a rowless legacy bridge already stopped stays parked). The legacy row is `_promote_legacy`.
+    a bridge this call started is stopped and one it stopped is started again, the lanes are synced to
+    the restored record, and the old bridge was never touched (a rowless legacy bridge already stopped stays parked). The legacy row is `_promote_legacy`.
     Idempotent: on the current primary it only starts the bridge if it is down. The row carries
     `previous` (the parked instance, None when nothing was parked), `kept` (the old owner left
     running, None when there was none or it was parked), `stopped_pid`, `legacy_stopped_pid`,
     `launch`, `changed` and `relaunch_needed` (the new primary's bridge runs without the room: one
     that was up under another launch and could not be relaunched)."""
     if not instance:
-        return _promote_legacy(workspace, kill, park)
+        return _promote_legacy(workspace, kill, park, environ=environ, vault=vault)
     with _transaction(workspace) as rec:
         row = _find(rec["rows"], instance)
         if row.get("worker"):
@@ -1918,12 +1919,16 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
         _await_connected(instance, int(launch.get("holder_pid") or launch.get("pid") or 0), workspace,
                          CONNECT_TIMEOUT_S if connect_timeout_s is None else connect_timeout_s)
     except ConnectionsError:
-        with _records_lock(workspace):
-            _undo_promote(_read_record(record_path(workspace)), **undo)
-            _restart_secondary(undo, start_kw)
+        # The record is rolled back under the lock: its lanes follow it even if the restart itself fails.
+        try:
+            with _records_lock(workspace):
+                _undo_promote(_read_record(record_path(workspace)), **undo)
+                _restart_secondary(undo, start_kw)
+        finally:
+            _refresh_mcp_lanes(workspace, environ, vault)
         raise
     path = record_path(workspace)
-    failure = None
+    failure = restart_failure = None
     with _records_lock(workspace):  # a rollback's stop and restart share one hold
         rec = _read_record(path)
         row = next((r for r in rec["rows"] if r["instance"] == instance), None)
@@ -1950,8 +1955,17 @@ def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapp
                 r["primary"] = r is row
             _write(path, rec)
         if failure is not None:
-            _restart_secondary(undo, start_kw)
-            raise failure
+            try:
+                _restart_secondary(undo, start_kw)
+            except Exception as e:  # noqa: BLE001 - re-raised below, once the lanes follow the record
+                restart_failure = e
+    # The lanes follow the committed record, not the launch: `start` synced them while the old
+    # owner was still unparked, and parking it above is a change no launch follows.
+    _refresh_mcp_lanes(workspace, environ, vault)
+    if restart_failure is not None:
+        raise restart_failure from failure
+    if failure is not None:
+        raise failure
     out = dict(row)
     parked = old if park else None
     out.update(previous=None if parked is None else parked["instance"],
@@ -1973,12 +1987,13 @@ def _connected_bridge(row: Mapping[str, object], workspace: Optional[Path]) -> i
     return pid if pid and sidecar.get("pid") == pid and sidecar.get("connected") and not _writer_gone(sidecar) else 0
 
 
-def _promote_legacy(workspace: Optional[Path], kill, park: bool = False) -> dict:
+def _promote_legacy(workspace: Optional[Path], kill, park: bool = False, *,
+                    environ: Optional[Mapping[str, str]] = None, vault=None) -> dict:
     """`promote('')`: the engine never launches the legacy bridge, so it must already run
     (`LegacyBridgeNotRunning`); under one hold of the record lock flip, and under `park` stop the old
     owner's bridge and park its row. That bridge settled the proactive room when it started, so with a named
     primary then it runs without the room and the row carries `relaunch_needed`: its launchers
-    restart it (`bash src/restart.sh`)."""
+    restart it (`bash src/restart.sh`). The lanes are synced to the committed record after."""
     path = record_path(workspace)
     with _records_lock(workspace):
         rec = _read_record(path)
@@ -1998,6 +2013,8 @@ def _promote_legacy(workspace: Optional[Path], kill, park: bool = False) -> dict
         for r in rec["rows"]:
             r["primary"] = r is row
         _write(path, rec)
+    # No launch follows the legacy flip, so nothing else would drop the parked owner's lane.
+    _refresh_mcp_lanes(workspace, environ, vault)
     out = dict(row)
     parked = old if park else None
     out.update(previous=None if parked is None else parked["instance"],
@@ -2057,7 +2074,8 @@ def unpark(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
     """Clear the row's `parked` flag and, for a named row, `start` its bridge as a secondary (`launch`
     in the row; None for the legacy row, whose launchers resume it, and for a disabled one).
     Un-parking a row that is not parked only starts it. `''` also clears the parked legacy bridge
-    that has no row of its own (a bare `{"instance": ""}` comes back)."""
+    that has no row of its own (a bare `{"instance": ""}` comes back). The lanes are synced to the
+    committed record after: the legacy row gets no launch, so no launch would bring its lane back."""
     with _transaction(workspace) as rec:
         if not instance:
             rec[LEGACY_PARKED_KEY] = False
@@ -2069,6 +2087,7 @@ def unpark(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mappi
     out = dict(row)
     out["launch"] = start_added(row, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
                                 vault=vault, spawn=spawn, python=python)
+    _refresh_mcp_lanes(workspace, environ, vault)
     return out
 
 
@@ -2094,6 +2113,7 @@ def park(instance: str, *, workspace: Optional[Path] = None, kill=None) -> dict:
         stopped = _stop_row(row, workspace, kill)
         row["parked"] = True
         _write(path, rec)
+    drop_mcp_lane(instance, workspace)
     out = dict(row)
     out["stopped_pid"] = stopped
     return out
@@ -2126,6 +2146,8 @@ def park_legacy(*, workspace: Optional[Path] = None, kill=None) -> dict:
                 rec[LEGACY_PARKED_KEY] = rec[LEGACY_PARKED_KEY] or bool(pid)
         finally:
             _write(path, rec)
+            for inst in parked:
+                drop_mcp_lane(inst, workspace)
     return {"primary": primary["instance"], "parked": parked, "stopped": stopped}
 
 
@@ -2160,6 +2182,7 @@ def remove_connection(instance: str, *, force: bool = False, workspace: Optional
                 stale_path.unlink()
             except FileNotFoundError:
                 pass
+        drop_mcp_lane(instance, workspace)
     out = dict(row)
     out["stopped_pid"] = stopped
     return out
@@ -2601,6 +2624,7 @@ def disconnect(instance: str, *, workspace: Optional[Path] = None, kill=None) ->
             raise PrimaryCannotDisconnect(instance)
         stopped = _stop_row(row, workspace, kill)
         row["disabled"] = True
+    drop_mcp_lane(instance, workspace)
     out = dict(row)
     out["stopped_pid"] = stopped
     return out
@@ -3455,6 +3479,17 @@ def _exit_code(child) -> Optional[int]:
 def launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
            workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None,
            env_only: bool = False, fetch=None, getaddrinfo=None) -> dict:
+    """`_launch`, then a successful launch refreshes the MCP lanes (`sync_mcp_lanes`)."""
+    rec = _launch(instance, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace, vault=vault,
+                  spawn=spawn, python=python, env_only=env_only, fetch=fetch, getaddrinfo=getaddrinfo)
+    if rec.get("ok"):
+        _refresh_mcp_lanes(workspace, environ, vault)
+    return rec
+
+
+def _launch(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
+            workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None,
+            env_only: bool = False, fetch=None, getaddrinfo=None) -> dict:
     """Start the bridge for one plan entry and leave a launch record; the bridge's own
     singleton lock turns a duplicate into a clean stand-down. The record lock is held from the
     plan read until the child is proven to hold its lease or has exited (`lease` in the record),
@@ -4095,9 +4130,20 @@ def _old_identity(row: Mapping[str, object], environ, vault, probe: dict) -> "tu
     return str(seen["agent_mxid"]), str(seen.get("owner_mxid") or "")
 
 
+class UnquotableValue(ConnectionsError):
+    """A value the single-quoted env line cannot hold: a `'` or a line break."""
+
+
 def _env_file_with(path: Path, key: str, value: str) -> str:
     """`path`'s lines with `key` set to `value`, single-quoted so a shell that sources the file
-    never runs what follows the `|` (every other line kept)."""
+    never runs what follows the `|` (every other line kept). A value holding `'` or a line break
+    is refused (`UnquotableValue`): the env readers only strip the outer quotes, so `'\\''` would
+    reach them undecoded."""
+    if "'" in value or "\n" in value or "\r" in value:
+        logging.getLogger(__name__).warning(
+            "connections: not writing %s to %s: its value holds a quote or line break the env readers "
+            "cannot decode", key, path.name)
+        raise UnquotableValue(key)
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
@@ -4111,18 +4157,77 @@ def mcp_descriptor_path(workspace: Optional[Path], mcp_config: Optional[Path] = 
     MCP config (`mcp_config`, default `<claude home>/.claude.json`) names inside the workspace, else
     `state/ag2-mcp.json`. A descriptor outside the workspace is the desktop host's and never chosen."""
     ws = _workspace(workspace).resolve()
+    for named in _claude_config_descriptors(mcp_config):
+        if named.resolve().is_relative_to(ws):
+            return named
+    return ws / "state" / MCP_DESCRIPTOR_NAME
+
+
+def _named_entries(servers) -> "list[tuple[Path, Mapping]]":
+    """(descriptor, env) for each MCP server entry whose `env` names an `AG2_MCP_DESCRIPTOR`, in entry
+    order; an entry or `env` that is not a table names nothing."""
+    out = []
+    for entry in servers.values() if isinstance(servers, Mapping) else []:
+        env = entry.get("env") if isinstance(entry, Mapping) else None
+        named = env.get("AG2_MCP_DESCRIPTOR") if isinstance(env, Mapping) else None
+        if isinstance(named, str) and named:
+            out.append((Path(named), env))
+    return out
+
+
+def _named_descriptors(servers) -> "list[Path]":
+    """The `AG2_MCP_DESCRIPTOR` each MCP server entry's `env` names, in entry order."""
+    return [path for path, _ in _named_entries(servers)]
+
+
+def _claude_config_descriptors(mcp_config: Optional[Path]) -> "list[Path]":
+    """Descriptors the Claude Code MCP config (`mcp_config`, default `<claude home>/.claude.json`) names."""
+    return _named_descriptors(_claude_config_servers(mcp_config))
+
+
+def _claude_config_servers(mcp_config: Optional[Path]):
+    """The Claude Code MCP config's `mcpServers` table; {} when unreadable."""
     if mcp_config is None:
         from util_paths import claude_home_path
         mcp_config = claude_home_path(".claude.json")
     try:
-        servers = json.loads(Path(mcp_config).read_text(encoding="utf-8")).get("mcpServers") or {}
+        return json.loads(Path(mcp_config).read_text(encoding="utf-8")).get("mcpServers") or {}
     except (OSError, ValueError, AttributeError):
-        servers = {}
-    for entry in servers.values() if isinstance(servers, dict) else []:
-        named = (entry.get("env") or {}).get("AG2_MCP_DESCRIPTOR") if isinstance(entry, dict) else None
-        if isinstance(named, str) and named and Path(named).resolve().is_relative_to(ws):
-            return Path(named)
-    return ws / "state" / MCP_DESCRIPTOR_NAME
+        return {}
+
+
+def _codex_config_path(environ: Mapping[str, str]) -> Optional[Path]:
+    """`config.toml` of the Codex home: `CODEX_HOME`, else the codex `core_config_dirs` entry."""
+    home = (environ.get("CODEX_HOME") or "").strip()
+    if not home:
+        try:
+            from sutando_config import find_core_config_dir
+            home = str((find_core_config_dir(type_="codex") or {}).get("value") or "").strip()
+        except Exception:  # noqa: BLE001 - an unreadable config only means no Codex home to read
+            home = ""
+    return Path(home).expanduser() / "config.toml" if home else None
+
+
+def _codex_config_descriptors(codex_config: Optional[Path]) -> "list[Path]":
+    """Descriptors Codex's `config.toml` names under `[mcp_servers.<name>.env]`."""
+    return _named_descriptors(_codex_config_servers(codex_config))
+
+
+def _codex_config_servers(codex_config: Optional[Path]):
+    """Codex's `config.toml` `mcp_servers` table; {} when there is none or it is unreadable."""
+    if codex_config is None:
+        return {}
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+        try:
+            import tomli as tomllib
+        except ModuleNotFoundError:
+            import toml_fallback as tomllib
+    try:
+        return tomllib.loads(Path(codex_config).read_text(encoding="utf-8")).get("mcp_servers") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
 
 
 def repoint_mcp_descriptor(path: Path, *, legacy: str, code: str, agent_mxid: str,
@@ -4168,6 +4273,336 @@ def repoint_mcp_descriptor(path: Path, *, legacy: str, code: str, agent_mxid: st
     except (OSError, UnicodeDecodeError, ConnectionsError):
         return "write_failed"
     return "repointed"
+
+
+# ── MCP lanes: one proxy descriptor per extra connection ─────────────────────
+
+MCP_LANES_DIR_NAME = "ag2-mcp.d"
+MCP_LANES_DIR_ENV = "AG2_MCP_LANES_DIR"
+MCP_LANE_PREFIX = "conn-"
+# A lane descriptor naming this env_file has no env copy: the proxy asks `lane_mcp_credential` for its
+# bearer through the argv `MCP_LANE_CREDENTIAL_ENV` carries, which the desktop host sets.
+MCP_VAULT_ENV_FILE = "(vault)"
+MCP_LANE_CREDENTIAL_ENV = "AG2_MCP_LANE_CREDENTIAL"
+
+
+def mcp_lanes_dir(workspace: Optional[Path] = None, environ: Optional[Mapping[str, str]] = None) -> Path:
+    """Where the MCP proxy reads its extra lanes: `AG2_MCP_LANES_DIR`, else `state/ag2-mcp.d`."""
+    environ = os.environ if environ is None else environ
+    named = (environ.get(MCP_LANES_DIR_ENV) or "").strip()
+    return Path(named) if named else _workspace(workspace) / "state" / MCP_LANES_DIR_NAME
+
+
+def _main_mcp_descriptor(workspace: Optional[Path], environ: Mapping[str, str], mcp_config: Optional[Path],
+                         descriptor: Optional[Path], codex_config: Optional[Path] = None) -> "Optional[tuple[dict, Path]]":
+    """(descriptor, its path) of the primary lane, read only: `descriptor`, else `AG2_MCP_DESCRIPTOR`, else any
+    descriptor the Claude Code MCP config names, else any the Codex `config.toml` names (the desktop's
+    lives outside the workspace), else `state/ag2-mcp.json`. None when none is a readable version-1
+    descriptor."""
+    def candidates():  # lazily, in precedence order: a later source is read only if every earlier one fails
+        if descriptor is not None:
+            yield descriptor
+        if (environ.get("AG2_MCP_DESCRIPTOR") or "").strip():
+            yield Path(environ["AG2_MCP_DESCRIPTOR"].strip())
+        yield from _claude_config_descriptors(mcp_config)
+        yield from _codex_config_descriptors(_codex_config_path(environ) if codex_config is None else codex_config)
+        yield _workspace(workspace) / "state" / MCP_DESCRIPTOR_NAME
+    for path in candidates():
+        try:
+            desc = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(desc, dict) and desc.get("version") == 1 and isinstance(desc.get("mint_url"), str):
+            return desc, Path(path)
+    return None
+
+
+def _resolver_argv(raw) -> Optional[list]:
+    """`raw` as the proxy reads `MCP_LANE_CREDENTIAL_ENV`: a JSON array of non-empty strings, else None."""
+    try:
+        argv = json.loads(raw) if isinstance(raw, str) and raw else None
+    except ValueError:
+        return None
+    return argv if isinstance(argv, list) and argv and all(isinstance(a, str) and a for a in argv) else None
+
+
+def _proxy_reads_vault_lanes(main_path: Path, environ: Mapping[str, str], mcp_config: Optional[Path],
+                             codex_config: Optional[Path]) -> bool:
+    """Whether the proxy serving `main_path` resolves `(vault)` lanes: `MCP_LANE_CREDENTIAL_ENV` holds a
+    resolver argv in this environment or in the env of an MCP config entry naming that descriptor."""
+    if _resolver_argv(environ.get(MCP_LANE_CREDENTIAL_ENV)):
+        return True
+    codex_config = _codex_config_path(environ) if codex_config is None else codex_config
+    entries = _named_entries(_claude_config_servers(mcp_config)) + _named_entries(_codex_config_servers(codex_config))
+    target = main_path.resolve()
+    return any(path.resolve() == target and _resolver_argv(env.get(MCP_LANE_CREDENTIAL_ENV)) for path, env in entries)
+
+
+def mcp_lane_slug(instance: str) -> str:
+    return instance or LEGACY_PATH_SEGMENT
+
+
+def _lane_relay(url: str) -> str:
+    return (url or "").strip().rstrip("/")
+
+
+def _lane_relay_secret(row: Mapping[str, object], token: str) -> "tuple[str, str]":
+    """(relay, secret) a lane descriptor and the lane resolver both state for `row`'s `token`."""
+    relay = _lane_relay(gateway_url_of(token) or str(row["gateway_url"]))
+    return relay, secret_of(token) if gateway_url_of(token) else token.strip()
+
+
+def _main_serves(row: Mapping[str, object], main: Mapping[str, object]) -> bool:
+    """Whether the main descriptor already serves `row` (by server or relay), so it gets no lane."""
+    served = {s for s in (str(main.get("server") or "").lower(), server_of_mxid(str(main.get("agent_id") or ""))) if s}
+    main_relay = _lane_relay(str(main.get("relay") or ""))
+    return bool(_row_servers(row) & served) or bool(main_relay and _lane_relay(str(row["gateway_url"])) == main_relay)
+
+
+def _mcp_lane(row: Mapping[str, object], token: str, main: Mapping[str, object], env_file: Path,
+              space_of=None) -> "tuple[Optional[dict], str]":
+    """(descriptor, '') for one row, or (None, reason). Endpoints are never invented: MCP from the
+    row server's DotSpace, mint at the main descriptor's mint path on the row's own relay origin."""
+    relay, secret = _lane_relay_secret(row, token)
+    mxid = str(row.get("agent_mxid") or "").strip()
+    server = server_of_mxid(mxid) or str(row["server"]).lower()
+    space = _space(server, space_of)
+    mcp_url = str(getattr(space, "mcp_url", "") or "")
+    mint_path = urllib.parse.urlsplit(str(main.get("mint_url") or "")).path
+    parts = urllib.parse.urlsplit(relay)
+    secure = parts.scheme == "https" or (parts.scheme == "http" and _loopback_host(parts.hostname or ""))
+    if not (mcp_url and mint_path and parts.netloc and secure and secret):
+        return None, "no_endpoints"
+    return {
+        "version": 1, "lane": mcp_lane_slug(str(row["instance"])), "server": server,
+        "env_file": str(env_file), "env_key": str(row["token_ref"]),
+        "mint_url": urllib.parse.urlunsplit((parts.scheme, parts.netloc, mint_path, "", "")),
+        "mcp_url": mcp_url, "ca_bundle": main.get("ca_bundle"),
+        "agent_id": mxid if _STRICT_MXID_RE.fullmatch(mxid) else None,
+        "relay": relay, "bearer_digest": hashlib.sha256(secret.encode()).hexdigest(),
+    }, ""
+
+
+def _write_if_changed(path: Path, body: str) -> bool:
+    try:
+        if path.read_text(encoding="utf-8") == body:
+            return False
+    except (OSError, UnicodeDecodeError):
+        pass
+    _atomic_text(path, body)
+    return True
+
+
+def _unlink_lane(lanes: Path, slug: str) -> bool:
+    gone = False
+    for suffix in (".json", ".env"):  # descriptor first: the proxy never sees one without its env
+        try:
+            (lanes / f"{MCP_LANE_PREFIX}{slug}{suffix}").unlink()
+            gone = True
+        except FileNotFoundError:
+            pass
+    return gone
+
+
+def drop_mcp_lane(instance: str, workspace: Optional[Path] = None,
+                  environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Remove one connection's lane descriptor and env file, offline; whether any existed. Under the
+    lanes lock `sync_mcp_lanes` holds, so a sync that read the row before it changed cannot write
+    the lane back after this. With no lock file yet no sync has reached its row read, so any sync
+    reads the row as already changed and no lock is created here."""
+    lanes, slug = mcp_lanes_dir(workspace, environ), mcp_lane_slug(instance)
+    lock = _workspace(workspace) / "state" / f"{MCP_LANES_DIR_NAME}.lock"
+    try:
+        if not lock.exists():
+            return _unlink_lane(lanes, slug)
+        with locked_file(lock, create_mode=0o600):
+            return _unlink_lane(lanes, slug)
+    except OSError as e:
+        logging.getLogger(__name__).warning("connections: dropping MCP lane %s failed (%s)",
+                                            mcp_lane_slug(instance), type(e).__name__)
+        return False
+
+
+def sync_mcp_lanes(workspace: Optional[Path] = None, *, environ: Optional[Mapping[str, str]] = None, vault=None,
+                   mcp_config: Optional[Path] = None, descriptor: Optional[Path] = None, space_of=None,
+                   codex_config: Optional[Path] = None) -> dict:
+    """Write `conn-<instance>.json` (and a 0600 `conn-<instance>.env` holding the row's bearer under its
+    `token_ref`) in `mcp_lanes_dir` for each enabled core row the main descriptor does not already
+    serve, and remove every other `conn-*` file there. When that proxy resolves vault lanes
+    (`_proxy_reads_vault_lanes`) and the token is found with no environment, the descriptor names
+    `MCP_VAULT_ENV_FILE` and no env file is kept. Without a readable main descriptor nothing is
+    touched (`skipped: no_main_descriptor`). Returns slugs only, never a secret."""
+    environ = os.environ if environ is None else environ
+    lanes = mcp_lanes_dir(workspace, environ)
+    out = {"ok": True, "lanes_dir": str(lanes), "written": [], "unchanged": [], "removed": [], "skipped": {}}
+    found = _main_mcp_descriptor(workspace, environ, mcp_config, descriptor, codex_config)
+    if found is None:
+        out.update(ok=False, reason="no_main_descriptor")
+        return out
+    main, main_path = found
+    vault_lanes = _proxy_reads_vault_lanes(main_path, environ, mcp_config, codex_config)
+    want = set()
+    lock = _workspace(workspace) / "state" / f"{MCP_LANES_DIR_NAME}.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with locked_file(lock, create_mode=0o600):
+        for row in _core_rows(enabled_rows(workspace)):
+            slug = mcp_lane_slug(str(row["instance"]))
+            if _main_serves(row, main):
+                continue
+            try:
+                _, token = connection_credential(row, environ, vault=vault)
+            except ConnectionsError:
+                out["skipped"][slug] = "no_token"
+                continue
+            env_file = lanes / f"{MCP_LANE_PREFIX}{slug}.env"
+            from_vault = vault_lanes and _resolvable_offline(row, token, vault)
+            desc, reason = _mcp_lane(row, token, main, MCP_VAULT_ENV_FILE if from_vault else env_file, space_of)
+            if desc is None:
+                out["skipped"][slug] = reason
+                continue
+            if from_vault:
+                want.add(slug)
+                body = json.dumps(desc, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+                changed = _write_if_changed(lanes / f"{MCP_LANE_PREFIX}{slug}.json", body)
+                # The descriptor no longer names the copy, so it goes after the descriptor is rewritten.
+                with contextlib.suppress(FileNotFoundError):
+                    env_file.unlink()
+                    changed = True
+                out["written" if changed else "unchanged"].append(slug)
+                continue
+            value = token.strip() if gateway_url_of(token) else f"{desc['relay']}|{token.strip()}"
+            try:
+                env_body = _env_file_with(env_file, str(row["token_ref"]), value)
+            except UnquotableValue:
+                out["skipped"][slug] = "unquotable_token"
+                continue
+            want.add(slug)
+            # The env first, then the descriptor: the proxy reads the descriptor to find the env.
+            changed = _write_if_changed(env_file, env_body)
+            body = json.dumps(desc, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+            changed = _write_if_changed(lanes / f"{MCP_LANE_PREFIX}{slug}.json", body) or changed
+            out["written" if changed else "unchanged"].append(slug)
+        try:
+            entries = list(lanes.iterdir())
+        except FileNotFoundError:
+            entries = []
+        present = sorted({p.stem[len(MCP_LANE_PREFIX):] for p in entries
+                          if p.name.startswith(MCP_LANE_PREFIX) and p.suffix in (".json", ".env")})
+        # A temp file left by a crash mid-write may hold a token; no write of ours is in flight here.
+        for p in entries:
+            if p.name.startswith(f".{MCP_LANE_PREFIX}") and p.name.endswith(".tmp"):
+                with contextlib.suppress(FileNotFoundError):
+                    p.unlink()
+        for slug in present:
+            if slug not in want and _unlink_lane(lanes, slug):
+                out["removed"].append(slug)
+    return out
+
+
+def _vault_lane_token(row: Mapping[str, object], vault) -> str:
+    """The row's token from the vault alone, as `url|secret` on the row's own gateway host; '' if none.
+    The lane resolver reads nothing else, so no environment or channel file can make it disagree."""
+    try:
+        tok = row_token(row, _vault_get(_vault(vault), str(row["token_ref"])))
+    except ConnectionsError:
+        return ""
+    return tok if tok and host_of_url(gateway_url_of(tok)) == host_of_url(str(row["gateway_url"])) else ""
+
+
+def _resolvable_offline(row: Mapping[str, object], token: str, vault) -> bool:
+    """Whether the lane resolver answers the token the sync resolved (`connection_credential`, which reads
+    the environment and channel files ahead of the vault): only when the vault holds that same token."""
+    return bool(token) and _vault_lane_token(row, vault) == token
+
+
+class NoLaneCredential(ConnectionsError):
+    """`lane_mcp_credential` refused; `reason` is one of LANE_CREDENTIAL_REASONS. Never carries a secret."""
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason, self.detail = reason, detail
+
+
+LANE_CREDENTIAL_REASONS = ("not_owner", "unknown_lane", "disabled", "parked", "not_engine_descriptor",
+                           "no_token", "descriptor_stale")
+
+
+LANE_DESCRIPTOR_MAX_BYTES = 64 * 1024
+
+
+def _engine_lane_descriptor(path: Path) -> Optional[dict]:
+    """The lane descriptor at `path` when it is a regular file of this user that no other user may write,
+    at most LANE_DESCRIPTOR_MAX_BYTES. One no-follow open: the checks and the read are of the same file."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o022 \
+                or st.st_size > LANE_DESCRIPTOR_MAX_BYTES:
+            return None
+        chunks, size = [], 0
+        while size <= LANE_DESCRIPTOR_MAX_BYTES:
+            chunk = os.read(fd, LANE_DESCRIPTOR_MAX_BYTES + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        if size > LANE_DESCRIPTOR_MAX_BYTES:
+            return None
+        desc = json.loads(b"".join(chunks).decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(fd)
+    return desc if isinstance(desc, dict) and desc.get("version") == 1 else None
+
+
+def lane_mcp_credential(lane: str, *, workspace: Optional[Path] = None,
+                        environ: Optional[Mapping[str, str]] = None, vault=None,
+                        mcp_config: Optional[Path] = None, codex_config: Optional[Path] = None) -> dict:
+    """`{lane, bearer, relay}` for the MCP proxy's `(vault)` lane `lane` (a `mcp_lane_slug`), `bearer` the
+    secret half of the row's vault token (`_vault_lane_token`), `relay` its gateway. Refused with
+    NoLaneCredential unless this user owns the workspace, `lane` is an enabled core row the main
+    descriptor does not serve (the primary lane is `unknown_lane`), and its `conn-<lane>.json` is a
+    `(vault)` descriptor this user wrote for that row, its relay and its secret."""
+    environ = os.environ if environ is None else environ
+    ws = _workspace(workspace)
+    try:
+        owner = ws.stat().st_uid
+    except OSError:
+        owner = None
+    if owner != os.geteuid():
+        raise NoLaneCredential("not_owner", "this user does not own the workspace")
+    row = next((r for r in _core_rows(read_rows(ws)) if mcp_lane_slug(str(r["instance"])) == lane), None) \
+        if isinstance(lane, str) and lane else None
+    found = _main_mcp_descriptor(ws, environ, mcp_config, None, codex_config) if row is not None else None
+    if row is None or found is None or _main_serves(row, found[0]):
+        raise NoLaneCredential("unknown_lane", "no extra core connection has this lane")
+    if row.get("disabled") or row.get("parked"):
+        reason = "disabled" if row.get("disabled") else "parked"
+        raise NoLaneCredential(reason, f"connection {lane} is {reason}")
+    desc = _engine_lane_descriptor(mcp_lanes_dir(ws, environ) / f"{MCP_LANE_PREFIX}{lane}.json")
+    if desc is None or desc.get("lane") != lane or desc.get("env_file") != MCP_VAULT_ENV_FILE \
+            or desc.get("env_key") != str(row["token_ref"]):
+        raise NoLaneCredential("not_engine_descriptor", f"lane {lane} has no vault descriptor of this engine")
+    token = _vault_lane_token(row, vault)
+    if not token:
+        raise NoLaneCredential("no_token", f"connection {lane} has no token in the vault")
+    relay, secret = _lane_relay_secret(row, token)
+    if not secret or _lane_relay(str(desc.get("relay") or "")) != relay \
+            or desc.get("bearer_digest") != hashlib.sha256(secret.encode()).hexdigest():
+        raise NoLaneCredential("descriptor_stale", f"lane {lane}'s descriptor was written for another credential")
+    return {"lane": lane, "bearer": secret, "relay": relay}
+
+
+def _refresh_mcp_lanes(workspace: Optional[Path], environ: Optional[Mapping[str, str]], vault) -> None:
+    """`sync_mcp_lanes` after a lifecycle change; it never fails the change it follows."""
+    try:
+        sync_mcp_lanes(workspace, environ=environ, vault=vault)
+    except Exception as e:  # noqa: BLE001 - derived state: the next lifecycle change or CLI run repairs it
+        logging.getLogger(__name__).warning("connections: MCP lane sync failed (%s)", type(e).__name__)
 
 
 def mirror_room_bindings(bindings: Mapping[str, str], legacy: str, successor: str,

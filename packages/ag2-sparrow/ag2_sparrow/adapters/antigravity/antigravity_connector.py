@@ -5,21 +5,23 @@ Transport: the Agent Client Protocol over the stdio of `agy acp`, through acp_ho
 the command, `initialize`, resume the task's Session with `session/load` (else `session/new`), send one
 `session/prompt` and wait for it to stop.
 
-`<dir>/tasks/task-*.txt` in, `<dir>/results/<task>.txt` out. The turn's final message is the answer: no
-reply command is granted (no shell command is), and the agent's own text is posted
+`<dir>/tasks/task-*.txt` in, `<dir>/results/<task>.txt` out. The turn's final message is the answer (there is
+no reply command), and the agent's own text is posted
 with every delivery marker neutralised. A final message of exactly NO_REPLY posts nothing. A message whose
 turn failed gets a line saying so; an event that failed posts nothing. The gateway's SKILL INSTRUCTIONS
 prelude (run a room-read command, write results/<task>.txt) is for a core with a shell: its steps are not
 passed on (`session_lines`). A turn that ends with no text says what it did instead (`no_answer_why`).
 
 Sessions, the permission policy and the framing are acp_host's: the owner may read or edit under the working
-directory, no command is ever granted. task_io.admission decides the tier. The owner and an attested
-collaborator (Team in s.space) are served, both in the same turn: the working directory, agy's own home, the
-owner's permission policy, a Session of their own resumed per room. Any other sender (a guest) is refused
-unless --allow-non-owner, and is then served isolated: a fresh temporary directory per task holds its working
-directory and its own agy home (`--gemini-dir`, with deny-all permission rules and no global context), its
-Session is new and never stored, and it is refused unless agy offers a read-only (plan) session mode and
-accepts it. Every turn runs on the owner's agy sign-in. Stdlib only.
+directory; with --allow-owner-shell-web the owner's own turns may also run commands and fetch or search the
+web (SHELL_AND_WEB_TIERS, read from the sender's tier: the owner only; never a collaborator or a guest).
+task_io.admission decides the tier. The owner and an attested collaborator (Team in s.space) are served, both
+in the same turn: the working directory, agy's own home, the owner's read/edit permission policy, a Session of
+their own resumed per room. Any other sender (a guest) is refused unless --allow-non-owner, and is then served
+isolated: a fresh temporary directory per task holds its working directory and its own agy home
+(`--gemini-dir`, with deny-all permission rules and no global context), its Session is new and never stored,
+and it is refused unless agy offers a read-only (plan) session mode and accepts it. Every turn runs on the
+owner's agy sign-in. Stdlib only.
 """
 from __future__ import annotations
 
@@ -53,6 +55,14 @@ NOT_SIGNED_IN = ("Antigravity is not signed in on this computer (%s): run `agy` 
                  "or run `agy acp --login`")
 
 
+# Sender tiers (headers["access_tier"]) whose turns may run commands and use the web, under --allow-owner-shell-web.
+# Team is left out on purpose, even on the owner's turn: adding it is the owner's decision.
+SHELL_AND_WEB_TIERS = frozenset({"owner"})
+# agy's own file-tool argument names (path, plain data, nested edits), as its tool schemas declare them.
+AGY_KEYS = (frozenset({"Path", "TargetFile", "AbsolutePath"}),
+            frozenset({"Content", "Overwrite", "Append", "Target", "Replacement", "AllowMultiple", "StartLine",
+                       "EndLine", "CodeContent", "TargetContent", "ReplacementContent", "Instruction"}),
+            frozenset({"Edits", "ReplacementChunks"}))
 READ_ONLY_MODES = frozenset({"plan", "read-only", "readonly", "read_only"})
 GUEST_PREFIX = "ag2-sparrow-antigravity-guest-"
 GUEST_REFUSED = "it answers non-owners only in a read-only session mode, and %s"
@@ -97,6 +107,11 @@ def guest_turn(args):
                                 refused=GUEST_REFUSED)
     finally:
         shutil.rmtree(base, ignore_errors=True)
+
+
+def shell_web_on(args, headers):
+    """This turn may run commands and fetch or search the web: the install opted in, and the sender is the owner."""
+    return bool(getattr(args, "allow_owner_shell_web", False)) and headers.get("access_tier") in SHELL_AND_WEB_TIERS
 
 
 PRELUDE_HEADER = "===SKILL INSTRUCTIONS"
@@ -149,8 +164,9 @@ def no_answer_why(detail, turn):
     return "; ".join(why)
 
 
-def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_NOTE):
-    """The turn's prompt. `cwd` is the working directory the turn may read and edit, None for an isolated turn."""
+def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_NOTE, shell_web=False):
+    """The turn's prompt. `cwd` is the working directory the turn may read and edit, None for an isolated turn;
+    `shell_web` (the owner's own turn on an opted-in install) also grants commands and the web."""
     event, _ = trigger_of(headers)
     out = acp_host.task_framing(task_id, headers, message, session_lines(operator_lines),
                                 "post in your final message", note)
@@ -159,8 +175,11 @@ def wake_prompt(task_id, headers, message, operator_lines, cwd, note=NON_OWNER_N
                "acknowledgement, thanks or FYI that needs no answer, or an event whose body asks for no post), make "
                "your final message exactly %s and nothing else."
                % (" as the reply" if event in (None, MESSAGE_EVENT) else "", NO_REPLY))
-    out.append("No shell command is granted in this session. %s"
-               % ("You may read and edit files under %s." % cwd if cwd else "You may not read or change files."))
+    if shell_web:
+        out.append("You may run shell commands and fetch and search the web. You may read and edit files under %s." % cwd)
+    else:
+        out.append("No shell command is granted in this session. %s"
+                   % ("You may read and edit files under %s." % cwd if cwd else "You may not read or change files."))
     return "\n\n".join(out)
 
 
@@ -178,13 +197,16 @@ class Connector:
         With `owner` (the owner's or an attested collaborator's turn) it resumes the sender's Session for the room
         in the working directory, under the owner's policy; any other runs `guest_turn`."""
         if owner:
-            cwd = self.args.cwd
+            cwd, tools = self.args.cwd, shell_web_on(self.args, headers)
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
-                                       lambda params: acp_host.decide_permission(params, True, cwd), self.store,
+                                       lambda params: acp_host.decide_permission(params, True, cwd, tools=tools,
+                                                                                  extra_keys=AGY_KEYS),
+                                       self.store,
                                        STDERR_NAME, NOT_SIGNED_IN, log)
         with guest_turn(self.args) as isolated:
             return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
-                                       lambda params: acp_host.decide_permission(params, False, isolated.cwd),
+                                       lambda params: acp_host.decide_permission(params, False, isolated.cwd,
+                                                                                  extra_keys=AGY_KEYS),
                                        self.store, STDERR_NAME, NOT_SIGNED_IN, log, isolated=isolated)
 
     def answer_body(self, headers, status, text, detail, turn=None):
@@ -223,11 +245,12 @@ class Connector:
             publish(result_file, NON_OWNER_REFUSED)
             return {"task": task_id, "status": "refused", "tier": headers["access_tier"]}
         # Team (an attested collaborator) gets the owner's turn and policy; from here `tier` names the turn, and
-        # headers["access_tier"] still names the sender. Any other admitted sender gets `guest_turn`.
+        # headers["access_tier"] still names the sender (so shell_web_on stays off for Team). Any other admitted
+        # sender gets `guest_turn`.
         if tier == "collaborator":
             tier = "owner"
         prompt = wake_prompt(task_id, headers, message, operator_lines, self.args.cwd if tier == "owner" else None,
-                             self.note)
+                             self.note, shell_web=tier == "owner" and shell_web_on(self.args, headers))
         event, _ = trigger_of(headers)
         log("wake ->", task_id, headers["access_tier"], event or "message")
         t0 = time.time()
@@ -292,6 +315,9 @@ def build_parser():
     ap.add_argument("--allow-non-owner", action="store_true",
                     help="serve senders without collaborator access (guests) too, on the owner's agy sign-in, "
                          "isolated and read-only (default: refused; an attested collaborator is always served)")
+    ap.add_argument("--allow-owner-shell-web", action="store_true",
+                    help="let the owner's turns run shell commands and fetch or search the web (never a "
+                         "collaborator's or a guest's; default: off)")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=0.2)

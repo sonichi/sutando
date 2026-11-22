@@ -362,6 +362,62 @@ def _record_lock(workspace: Optional[Path], worker: str):
 
 
 RESEND_STALE_S = 15 * 60
+WITHDRAWN, RETIRED_AFTER_APPROVAL = "withdrawn", "retired_after_approval"
+
+
+def withdrawn_note(worker_label: str, label: str) -> str:
+    worker_label, label = _md(worker_label), _md(label)
+    return (f"[dm-only]\n**The approval link for {worker_label} is withdrawn**\n\nYour worker {worker_label} was "
+            f"retired, so do not approve agent \"{label}\". If you already did, delete that agent in the app; "
+            "nothing on this computer uses it.")
+
+
+def retired_approval_note(worker_label: str, label: str, agent_id: str) -> str:
+    worker_label, label = _md(worker_label), _md(label)
+    return (f"[dm-only]\n**Delete agent `{agent_id}` in the app**\n\nAgent \"{label}\" was approved after your "
+            f"worker {worker_label} was retired, so nothing on this computer saved or uses it. The server cannot "
+            "delete a live agent for me yet, so it stays in your agents list until you delete it there.")
+
+
+def withdrawn_card(worker: str, worker_label: str, label: str, *, server: str, subtitle: str) -> tuple:
+    return ac.build(card_id(worker, server), "expired", title=worker_label, subtitle=subtitle,
+                    avatar_=ac.avatar(seed=label), status="Withdrawn",
+                    text=f"{worker_label} was retired, so this approval is withdrawn. Do not approve {label}; if "
+                         "you already did, delete that agent in the app.",
+                    body=ac.body_line(f"The approval for agent \"{label}\" (pool worker {worker_label}) is withdrawn: "
+                                      "the worker was retired."))
+
+
+def withdraw(workspace: Optional[Path], worker: str, *, deliver: Optional[Callable[[str], object]] = None,
+             cards: Optional["CardSink"] = None) -> dict:
+    """At retirement, withdraw `worker`'s open approval: {result: withdrawn|none, label?, owner_told?}. The
+    server has no way to cancel a device code, so a running flow keeps asking until it expires; an approval
+    that lands after this is reported to the owner by `connect`, by the agent's id."""
+    with _record_lock(workspace, worker):
+        rec = read_record(workspace, worker)
+        if rec.get("state") not in ("pending", "resending") or not rec.get("label"):
+            return {"result": "none"}
+        write_record(workspace, worker, {**rec, "state": WITHDRAWN})
+    who, label = str(rec.get("worker_label") or worker), str(rec["label"])
+    if cards is None and deliver is None:
+        try:
+            cards = default_cards(workspace, pp.core_lane(workspace, rec.get("lane")))
+        except (pp.ProvisionError, connections.ConnectionsError, OSError):
+            cards = None
+    shown = ""
+    if cards is not None and rec.get("event_id"):
+        try:
+            shown = cards.show(*withdrawn_card(worker, who, label, server=str(rec.get("server") or ""),
+                                               subtitle=worker_subtitle(workspace, worker)),
+                               f"{CARD_KIND}:{worker}:{secrets.token_hex(6)}:withdrawn",
+                               previous=str(rec["event_id"]))
+        except (ac.CardError, OSError):
+            shown = ""
+    told = bool(shown)
+    if not told:
+        send = deliver or (lambda text: send_to_owner(workspace or connections._workspace(None), text))
+        told = send(withdrawn_note(who, label)) is not False
+    return {"result": WITHDRAWN, "label": label, "owner_told": told}
 
 
 def _alive(pid: int) -> bool:
@@ -393,6 +449,8 @@ def _why_not(worker: str, rec: dict, now: float) -> Optional[str]:
         return f"the approval link for {who} still works; use Approve on the newest card"
     if rec.get("state") == "done":
         return f"{who} already has its own agent"
+    if rec.get("state") in (WITHDRAWN, RETIRED_AFTER_APPROVAL):
+        return f"{who} was retired, so its approval was withdrawn"
     return None
 
 
@@ -540,7 +598,9 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
     try:
         got = collect(base, pending, request=request, sleep=sleep, clock=clock)
     except DeviceConnectError as e:
-        if e.status == "expired":
+        if read_record(workspace, worker).get("state") == WITHDRAWN:
+            _keep(workspace, worker, {**read_record(workspace, worker), "lapsed": e.status})
+        elif e.status == "expired":
             tell(expired_card(worker, who, label, pending["expires_at"], server=server, subtitle=subtitle),
                  expiry_note(who, label, pending["expires_at"], now=clock()), "expired")
         else:
@@ -559,7 +619,12 @@ def connect(worker: str, *, label: str, display_name: str = "", worker_label: st
             if start_lane is not None and not rotate:
                 out["launch"] = start_lane(out["row"])
     except DeviceConnectError as e:
-        _keep(workspace, worker, {**record, "state": e.status})
+        if e.status == "worker_retired":
+            # The owner approved an agent nothing here will use: name it so they can delete it.
+            send(retired_approval_note(who, label, got["agent_id"]))
+            _keep(workspace, worker, {**record, "state": RETIRED_AFTER_APPROVAL, "agent_id": got["agent_id"]})
+        else:
+            _keep(workspace, worker, {**record, "state": e.status})
         raise DeviceConnectError(pp.scrub(str(e), known), status=e.status) from None
     except (pp.ProvisionError, connections.ConnectionsError) as e:
         _keep(workspace, worker, {**record, "state": "failed"})
