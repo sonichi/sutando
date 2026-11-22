@@ -1,15 +1,15 @@
 ---
 name: report-feedback
-description: THE way a bug, feature request or feedback about Sutando, s.space or the desktop app reaches the AG2 team; the only path to the tracker (Slack #product-feedback, a GitHub issue, the master DB). Posting it in chat, a room or a DM, or asking another agent to log it, is not reporting it. Use when the owner says "report this bug", "report this issue", "report an issue", "report a bug", "file a bug", "log this bug", "submit feedback", "feature request", "tell the team this is broken", "something's broken, file it", in a DM, a room or by voice (not "report this on the PR" or "to <someone>": that is a comment or a message); or automatically (--auto) when the agent itself hits a Sutando/s.space bug. Files through the cloud /api/feedback API with diagnostic context and replies with the reference id. A non-owner asking is told to file it through their own report-feedback skill or the app's Report a bug button.
+description: THE way a bug, feature request or feedback about Sutando, s.space or the desktop app reaches the AG2 team; the only path to the tracker (Slack #product-feedback, a GitHub issue, the master DB). Posting it in chat, a room or a DM, or asking another agent to log it, is not reporting it. Use when the owner says "report this bug", "report this issue", "report an issue", "report a bug", "file a bug", "log this bug", "submit feedback", "feature request", "tell the team this is broken", "something's broken, file it", in a DM, a room or by voice (not "report this on the PR" or "to <someone>": that is a comment or a message); or automatically (--auto) when the agent itself hits a Sutando/s.space bug. Files through the cloud /api/feedback API with diagnostic context and replies with a tracking reference only when the service returned one. A non-owner asking is told to file it through their own report-feedback skill or the app's Report a bug button.
 ---
 
 # Report Feedback
 
 When the user asks to **report a bug / issue / feature request / feedback about Sutando, s.space or the desktop app** — e.g. "report this bug", "report this issue", "report an issue", "file a bug", "log this bug", "submit feedback", "I have a feature request", "tell the team this is broken" — use this skill to file it, whether the ask comes in a DM, in a room or by voice. "Report this on the PR" or "report this to <someone>" asks for a PR comment or a message, not a report.
 
-**This is the only path that reaches the AG2 team.** The report goes skill → `/api/feedback` → Slack #product-feedback, a GitHub issue on sonichi/sutando and the master feedback DB. A message in a room or a DM, a hand-opened GitHub issue, or asking another agent (another Sutando included) to "add a row" or pass it on never gets there; do not do those instead of filing. After filing, reply with the reference id the script prints.
+**This is the only path that reaches the AG2 team.** The report goes skill → `/api/feedback` → Slack #product-feedback, a GitHub issue on sonichi/sutando and the master feedback DB. A message in a room or a DM, a hand-opened GitHub issue, or asking another agent (another Sutando included) to "add a row" or pass it on never gets there; do not do those instead of filing. If it prints a receipt, reply with the reference id the script prints. Otherwise do not claim the report is trackable.
 
-It posts to the cloud `/api/feedback` route (the same one the desktop "Report an issue" form uses, which mirrors into GitHub issues) and auto-attaches diagnostic context (platform + a tail of recent workspace logs), so you don't need to gather logs yourself.
+It posts to the cloud `/api/feedback` route (the same one the desktop "Report an issue" form uses, which mirrors into GitHub issues) and includes version and platform information. A recent workspace log excerpt is included only if the owner enabled diagnostic logs and did not opt out for this report.
 
 This is the **single reporting path for all surfaces** — chat, Discord, Telegram, and voice (which reaches it by delegating the task to the core agent). There is intentionally no separate voice tool, to avoid duplicating the same capability.
 
@@ -25,7 +25,7 @@ python3 skills/report-feedback/report-feedback.py \
 ```
 
 - Ask the user for a short **title** and a **description** if they're not already clear from the conversation. Infer `kind` (default `bug`) and `severity` (default `medium`) from context.
-- **Announce the log attachment before sending, then honor an opt-out.** Recent diagnostic logs are attached by default. Since there's no visible checkbox on voice/chat (unlike the desktop form), *say so first* — e.g. "I'll attach recent diagnostic logs to help debug, unless you'd rather I didn't." If the user declines, pass `--no-logs`. This makes it an informed opt-out rather than a silent default (especially important on voice, where the user can't see what's being sent). Log excerpts are redaction-scrubbed (Bearer tokens, `token=`/`api_key=`/`secret=` values, common key formats, and the home-dir username are masked) as a backstop, but announcing is still required.
+- **Diagnostic logs are opt-in.** Without the owner's explicit Settings opt-in, no log excerpt is attached. If the owner enabled logs, tell them before attaching an excerpt and use `--no-logs` if they decline or you cannot confirm the setting. Redaction is a backstop, not consent.
 
 ## Ask first (`--ask`, or `askFirst` in the owner's prefs)
 
@@ -55,8 +55,9 @@ python3 skills/report-feedback/report-feedback.py --decide <draft-id> file|file_
   `--apply` is the same routine by hand. It also registers any parked draft whose card was never created
   (a store write that failed at ask time exits 3 and keeps the draft).
 - Filing is exactly-once by markers: before the post the draft becomes `<id>.posting`; a 2xx renames it
-  to `<id>.filed`, the card is resolved, the receipt removed; a 4xx (the server refused, nothing written)
-  renames it back to a draft. A 5xx proves nothing (the write may have committed), so like no answer at
+  to `<id>.filed`, the card is resolved, and the local marker is removed. The marker prevents a
+  duplicate post; it is not the service's tracking reference. A 4xx (the server refused, nothing
+  written) renames it back to a draft. A 5xx proves nothing (the write may have committed), so like no answer at
   all (a transport error, a death mid-request) it leaves `<id>.posting`, and
   `--apply` **holds** it — never re-posted on a guess. A held draft is owner-visible: the answered card
   closes and a new card asks "Bug report: filed or not? — File it again / Skip"; its click runs through
@@ -81,7 +82,7 @@ When **you** (not the user) determine that a bug or error is caused by Sutando i
 
 Absence is not consent. An automatic report sends the owner's error context to the cloud, and the log excerpt adds incidental owner data — paths containing usernames, hostnames, workspace content. An owner who has never turned the toggles on files nothing automatically and ships no logs.
 
-Auto reports are also deduped (an identical title within 24h) and rate-limited (5 per 24h) via `<workspace>/state/feedback-auto-reports.json`. A `SKIPPED` exit (3) is a normal outcome, not an error — just move on. Only after `OK: filed` (not `HELD`), tell the owner in one short sentence (e.g. "I've filed a bug report about this"); the Settings toggle is the consent surface, so don't ask permission first.
+Auto reports are also deduped (an identical title within 24h) and rate-limited (5 per 24h) via `<workspace>/state/feedback-auto-reports.json`. A `SKIPPED` exit (3) is a normal outcome, not an error — just move on. After `OK: filed`, tell the owner the tracking reference. For `SUBMITTED`, say the service acknowledged the report but provided no tracking reference, and do not resubmit. Do not say a `HELD` draft was filed. The Settings toggle is the consent surface.
 
 ## Hold automatic reports while existing recovery runs
 
@@ -145,7 +146,7 @@ On other platforms, configure the OS scheduler to run the same `--apply` command
 once per minute. Without a periodic worker, deadlines are checked only on an explicit `--apply`
 or recovery update; installing the code alone does not activate the timer.
 
-Posts use the existing draft `.posting`/`.filed` receipts: uncertain network outcomes
+Posts use the existing draft `.posting`/`.filed` markers: uncertain network outcomes
 are held for the existing owner decision card, never automatically reposted. CLI,
 Stop hook and worker serialize mutations with `state/feedback-reports.lock`.
 
@@ -154,12 +155,14 @@ Stop hook and worker serialize mutations with `state/feedback-reports.lock`.
 - Every report includes Sutando and AG2Space version/commit identifiers in both structured context and a readable body section, even with `--no-logs`. Packaged apps use build-stamped metadata; source checkouts include the Git revision and tracked local-edit marker. Parked reports retain their incident-time versions across upgrades; older drafts and unavailable identifiers are explicitly `unknown`.
 
 - Requires the user to be **signed in to Sutando Cloud** (Settings → Sutando Cloud). If not, the script prints `NOT_SIGNED_IN` and exits 2 — relay that and ask them to sign in, then retry. `ACCOUNT_REFUSED` (also exit 2) means its credentials are another account than the desktop app's, or could not be verified right now: relay the line as printed, not as a sign-in request. For `--auto` reports, don't nag: mention it at most once.
-- On success it prints `OK: filed <kind> report (<status>). Reference: <id>.` (the id the feedback API returned; the line has no `Reference:` when the API named none). Tell the user it is filed and give the reference. On API error it prints `ERROR: …` — relay a brief apology and offer to retry.
-- Exit codes: `0` filed, held, recovery recorded, or applied (read the output), `1` error, `2` not signed in, `3` skipped (auto reports disabled, duplicate, or rate-limited).
+- `OK: filed <kind> report (<status>). Reference: <id>.` means the service returned a usable tracking reference. Give the user that reference.
+- `SUBMITTED` means the service acknowledged the post but no usable tracking reference is available. Say that plainly; do not claim it is trackable, invent a reference, or submit it again just to obtain one.
+- `ERROR` means the script could not confirm success. Do not retry an uncertain submission on a guess.
+- Exit codes: `0` acknowledged or tracked, held, recovery recorded, or applied (read the output), `1` error, `2` not signed in, `3` skipped (auto reports disabled, duplicate, or rate-limited).
 
 ## Access tier
 
-**Owner-tier only** — it files under the owner's Sutando Cloud identity, and it reads the owner's cloud token + attaches the owner's workspace log tail. Run it only for `access_tier: owner` (or an unauthenticated local/voice owner task). The script has no tier check of its own.
+**Owner-tier only** — it files under the owner's Sutando Cloud identity, and it reads the owner's cloud token. A log excerpt is opt-in, as described above. Run it only for `access_tier: owner` (or an unauthenticated local/voice owner task). The script has no tier check of its own.
 
 Guest tasks, every non-owner Slack task, and non-owner Discord tasks from senders outside the channel's `collaborators` list go to a read-only `codex exec --sandbox` agent with no cloud token, which cannot run this script. s.space Team tasks, broker-attested collaborators included, and a Discord channel's listed collaborators run in the owner's core with its normal tools (`docs/access-control.md`). Nothing structural stops them from running this script: the gate is prose, the in-band Team guardrail or collaborator rulebook (no external actions on their say-so) and the section below.
 

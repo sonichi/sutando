@@ -4,6 +4,7 @@
 import builtins
 import importlib.util
 import contextlib
+import http.client
 import io
 import json
 import os
@@ -1140,6 +1141,54 @@ class TestMain(unittest.TestCase):
                 contextlib.redirect_stdout(out):
             self._run(["--title", "hello", "--no-logs"])
         self.assertIn("OK: filed bug report (201). Reference: 0b9c7e1a-feedback.", out.getvalue())
+
+    def test_an_acknowledged_post_without_a_valid_reference_is_not_claimed_tracked(self):
+        no_reference = (
+            b'{"ok":true}', b'not-json', b'[]', b'{"ok":true,"id":42}',
+            b'{"ok":true,"id":"  "}', b'{"ok":false,"id":"looks-valid"}',
+            b'{"ok":1,"id":"looks-valid"}', b'{"ok":true,"id":"two words"}',
+            b'{"ok":true,"id":"message\\ncontrol"}', b'{"id":"looks-valid"}',
+            http.client.IncompleteRead(b'{"ok":'),
+        )
+        for body_or_error in no_reference:
+            with self.subTest(body_or_error=body_or_error), tempfile.TemporaryDirectory() as td:
+                response = _FakeRespWithId()
+                response.read = (mock.Mock(side_effect=body_or_error) if isinstance(body_or_error, Exception)
+                                 else mock.Mock(return_value=body_or_error))
+                out = io.StringIO()
+                with mock.patch.object(report_feedback, "resolve_workspace", return_value=Path(td)), \
+                        mock.patch.object(report_feedback, "read_cloud_auth",
+                                          return_value=("https://feedback.example.test", "fixture-token")), \
+                        mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=response) as send, \
+                        contextlib.redirect_stdout(out):
+                    self._run(["--title", "Synthetic receipt test", "--no-logs"])
+                send.assert_called_once()
+                line = out.getvalue()
+                self.assertIn("SUBMITTED: bug report (201); no tracking reference was returned.", line)
+                self.assertIn("Do not submit it again", line)
+                self.assertNotIn("OK: filed", line)
+                self.assertNotIn("Reference:", line)
+
+    def test_an_acknowledged_draft_without_reference_cannot_post_twice(self):
+        with tempfile.TemporaryDirectory() as td:
+            ws = Path(td)
+            did = report_feedback.write_draft(ws, {"kind": "bug", "severity": "low", "title": "t", "body": "b"})
+            response = _FakeRespWithId()
+            response.read = mock.Mock(return_value=b'{"ok":true}')
+            out = io.StringIO()
+            prefs = report_feedback.read_prefs(ws)
+            with mock.patch.object(report_feedback, "read_cloud_auth",
+                                   return_value=("https://feedback.example.test", "fixture-token")), \
+                    mock.patch.object(report_feedback.urllib.request, "urlopen", return_value=response) as send, \
+                    contextlib.redirect_stdout(out):
+                self.assertEqual(report_feedback.decide(ws, prefs, did, "file_no_logs"), 0)
+                self.assertTrue(report_feedback.filed_receipt(ws, did).exists())
+                self.assertEqual(report_feedback.decide(ws, prefs, did, "file_no_logs"), 0)
+            send.assert_called_once()
+            self.assertIn("no tracking reference was returned", out.getvalue())
+            self.assertIn("no tracking reference is available from the local record", out.getvalue())
+            self.assertNotIn("OK: filed", out.getvalue())
+            self.assertNotIn("Reference:", out.getvalue())
 
     def test_a_parked_draft_filed_later_prints_its_reference_too(self):
         out = io.StringIO()

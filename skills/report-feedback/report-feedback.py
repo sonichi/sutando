@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import platform
@@ -61,7 +62,7 @@ PREFS_DEFAULTS = {"autoReport": False, "sendLogs": False, "askFirst": False}
 DRAFTS_DIR = "feedback-drafts"
 DRAFT_ID_RE = re.compile(r"^fb_[0-9a-f]{10}$")  # the writer's grammar; anything else never becomes a path
 HITL_RUNTIME = "report-feedback"
-FILED_SUFFIX = ".filed"  # the receipt: the post landed, the card is not yet resolved
+FILED_SUFFIX = ".filed"  # local acknowledgment marker, not the server tracking reference
 POSTING_SUFFIX = ".posting"  # in flight: the post was sent and no answer was recorded
 ENGINE_SRC = Path(__file__).resolve().parents[2] / "src"
 
@@ -512,7 +513,7 @@ def apply_clicks(ws: Path, prefs: dict, device: str, *, release_automatic: bool 
             out["applied"].append(req.id)
             continue
         if posting_marker(ws, draft_id).exists():
-            # The post was sent and nothing came back: it may or may not have filed. Never
+            # The post was sent and no acknowledgment was recorded: it may or may not have filed. Never
             # re-post on a guess: the answered card closes, and a new card asks the owner.
             title = str((req.subject or {}).get("title") or draft_id)
             held_id = register_held(ws, manager, draft_id, title, device)
@@ -657,17 +658,28 @@ def logs_excerpt(ws: Path):
 
 
 def reference_id(resp) -> str | None:
-    """The report's id from the feedback API's `{"ok": true, "id": ...}` answer, or None:
-    a 2xx whose body is unreadable or names no id is still a filed report."""
+    """Return only a usable reference from an acknowledged feedback response."""
     try:
-        ref = json.loads(resp.read() or b"{}").get("id")
-    except (OSError, ValueError, AttributeError, TypeError):
+        payload = json.loads(resp.read() or b"{}")
+    except (OSError, http.client.HTTPException, ValueError, AttributeError, TypeError, RecursionError):
         return None
-    return ref if isinstance(ref, str) and ref else None
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        return None
+    ref = payload.get("id")
+    return ref if isinstance(ref, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", ref) else None
 
 
 def reference_note(receipt: dict) -> str:
     return f" Reference: {receipt['id']}." if receipt.get("id") else ""
+
+
+def print_submission(kind: str, status: int, receipt: dict, *, draft_id: str | None = None) -> None:
+    source = f" from draft {draft_id}" if draft_id else ""
+    if receipt.get("id"):
+        print(f"OK: filed {kind} report ({status}){source}.{reference_note(receipt)}")
+    else:
+        print(f"SUBMITTED: {kind} report ({status}){source}; no tracking reference was returned. "
+              "Do not submit it again just to get a reference.")
 
 
 def post_feedback(url: str, payload: dict, token: str, _hops: int = 0,
@@ -726,7 +738,8 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
         print(f"ERROR: choice must be file | file_no_logs | skip, got {choice!r}.")
         return 1
     if DRAFT_ID_RE.match(draft_id or "") and filed_receipt(ws, draft_id).exists():
-        print(f"OK: draft {draft_id} was already filed; the receipt closes the card on the next --apply.")
+        print(f"SUBMITTED: draft {draft_id} was already acknowledged; no tracking reference is available "
+              "from the local record. Do not submit it again.")
         return 0
     if DRAFT_ID_RE.match(draft_id or "") and posting_marker(ws, draft_id).exists():
         # An explicit --decide on an in-flight draft is the owner's call: skip drops it, file re-posts.
@@ -794,7 +807,7 @@ def decide(ws: Path, prefs: dict, draft_id: str, choice: str, *, owner_approved:
         print(f"ERROR: {e} — draft {draft_id} held as in flight (it may have been filed); --decide it.")
         return 1
     mark_filed(ws, draft_id)  # the ledger was written when the card was asked; the receipt guards the retry
-    print(f"OK: filed {d['kind']} report ({status}) from draft {draft_id}.{reference_note(receipt)}")
+    print_submission(d["kind"], status, receipt, draft_id=draft_id)
     return 0
 
 
@@ -936,7 +949,7 @@ def _main() -> None:
         status = post_feedback(f"{base.rstrip('/')}/api/feedback", payload, token, receipt=receipt)
         if a.auto:
             record_auto_report(ws, a.title)
-        print(f"OK: filed {a.kind} report ({status}).{reference_note(receipt)}")
+        print_submission(a.kind, status, receipt)
     except urllib.error.HTTPError as e:
         print(f"ERROR: feedback API {e.code}: {e.read().decode(errors='replace')[:300]}")
         sys.exit(1)
