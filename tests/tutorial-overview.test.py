@@ -218,7 +218,7 @@ const dom = new JSDOM(html, { url: 'https://page.test/', runScripts: 'dangerousl
             self.assertTrue(out["startsClosed"])
             self.assertEqual(out["label"], "Try it step by step")
             self.assertTrue(out["opens"])
-            self.assertEqual(out["stepCount"], 10)
+            self.assertEqual(out["stepCount"], 15)
             self.assertEqual(out["personalized"], "Get started with your agent in s.space")
             self.assertTrue(out["done"])
             self.assertEqual(out["saved"], ["dm"])

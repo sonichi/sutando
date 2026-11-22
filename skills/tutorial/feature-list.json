@@ -1,55 +1,52 @@
 {
   "schema_version": 1,
-  "revision": "tutorial.2026-11-20.3",
+  "revision": "tutorial.2026-11-21.1",
   "steps": [
     {
       "id": "dm",
       "title": "Your DM",
       "body": [
-        "Your DM with {name} is where you ask for things for yourself. What you ask for yourself (research, mail, calendar) comes back in your DM unless you explicitly ask to share it.",
-        "Open {name} under Your agents at the top of the sidebar and ask:"
+        "Your DM with {name} is where you ask for things for yourself. What you ask for yourself (research, mail, calendar) comes back here unless you ask to share it.",
+        "Every step below works the same way: ask {name}, and it does the work with you. Start here:"
       ],
       "surface": "dm",
       "screenshot": null,
       "since_release": "2026-10-15",
-      "paste": "What can you do for me today?"
+      "paste": "What can you do for me today?",
+      "locate": "{name} is under Your agents at the top of the sidebar."
     },
     {
       "id": "rooms",
       "title": "Rooms",
       "body": [
-        "You, your teammates and all of your agents meet in one room. Invite your team, and everyone brings their own agents. Each agent works for its owner, right in the room.",
-        "Press + at the top of the room list and choose Room. Name it and pick {name} under AI stands you own, or later open the room menu (&#8942;), choose Invite, and add {name}."
+        "You, your teammates and all of your agents meet in one room. Everyone brings their own agents, and each agent works for its owner.",
+        "Ask {name} to make one for you:"
       ],
-      "surface": "room",
+      "surface": "dm",
       "screenshot": [
         {
           "asset": "room-list-add-room",
           "hd_file": "assets/room-list-add-room.png",
           "fallback_file": "assets/room-list-add-room.jpg",
-          "alt": "Press + in the room list, then Room"
+          "alt": "The + menu at the top of the room list"
         },
         {
           "asset": "new-room-dialog",
           "hd_file": "assets/new-room-dialog.png",
           "fallback_file": "assets/new-room-dialog.jpg",
-          "alt": "The New Chat Room dialog, with your agent under AI stands you own"
-        },
-        {
-          "asset": "room-menu-invite",
-          "hd_file": "assets/room-menu-invite.png",
-          "fallback_file": "assets/room-menu-invite.jpg",
-          "alt": "The room menu, with Invite"
+          "alt": "The new room dialog, with your agent under AI stands you own"
         }
       ],
-      "since_release": "2026-10-15"
+      "since_release": "2026-10-15",
+      "paste": "Make me a room for a project. Ask me its name and who should be in it, create it, and invite yourself.",
+      "locate": "Press + at the top of the room list and choose New room. To add an agent later, open the room menu (&#8942;) and choose Invite."
     },
     {
       "id": "commons",
       "title": "Commons",
       "body": [
-        "Each room's shared Docs, HTML pages, PDFs, Figma files, whiteboards, sheets and databases. Open them with the Commons button at the right of the room header.",
-        "Ask {name} in a room:"
+        "Each room's shared Docs, HTML pages, PDFs, Figma files, whiteboards, sheets and databases, which everyone in the room can open and edit.",
+        "In a room, ask {name}:"
       ],
       "surface": "room",
       "screenshot": [
@@ -67,16 +64,34 @@
         }
       ],
       "since_release": "2026-10-15",
-      "paste": "Make a plan for our team offsite in Commons."
+      "paste": "Draft a page with me in this room's Commons. Ask me what it is for, then write the first version and send me the link.",
+      "locate": "The Commons button at the right of the room header."
+    },
+    {
+      "id": "workers",
+      "title": "Your workers",
+      "body": [
+        "A worker is another agent of yours, with its own name and identity, that takes work off {name}'s plate.",
+        "Ask {name}:"
+      ],
+      "surface": "dm",
+      "screenshot": null,
+      "since_release": "2026-11-21",
+      "paste": "Show my workers. If I have none, add one with its own identity: ask me what it should focus on, then set it up.",
+      "locate": "Agent Settings &rarr; Workers, or ask {name} &ldquo;show my workers&rdquo; at any time.",
+      "watches": [
+        "skills/worker-pool/",
+        "skills/agent-cards/"
+      ]
     },
     {
       "id": "agents",
       "title": "Connect other agents",
       "body": [
-        "Bring agents from the apps you already use into your rooms.",
-        "Open Add an agent from the room list. Choose an agent from another app, such as Claude Duet, Dot, Grok Bot, Hermes, Muse or OpenClaw, or use Other for a compatible app. Follow that app’s connection instructions. Claude Code and Codex are separate local-agent options, not other names for Duet and Dot. Antigravity is another local option in a supported desktop app; install and sign in to its CLI first. Its availability depends on the host."
+        "Bring agents from the apps you already use, such as Claude Duet, Dot, Grok Bot, Hermes, Muse or OpenClaw, into your rooms.",
+        "Ask {name} to walk you through it:"
       ],
-      "surface": "room",
+      "surface": "dm",
       "screenshot": [
         {
           "asset": "room-list-add",
@@ -97,16 +112,18 @@
           "alt": "Which agent? Dot, Grok Bot, Muse or Other"
         }
       ],
-      "since_release": "2026-10-15"
+      "since_release": "2026-10-15",
+      "paste": "Help me connect another agent I use. Ask me which app it is, walk me through its connection, and test its first reply.",
+      "locate": "Press + at the top of the room list, choose Agent, then Use an agent from another app (or Other for a compatible app). Claude Code, Codex and Antigravity are local-agent options there; Antigravity needs its CLI installed and signed in first."
     },
     {
       "id": "teamwork",
       "title": "Teamwork",
       "body": [
-        "@-mention an agent in a room to ask for help. Its owner’s access settings determine whether it can take your request; Team enables collaboration, while Guest requests need owner approval. With No access, the owner can still access and invoke the agent; other room members cannot. Tool approvals and owner permissions still apply.",
-        "In a room with another agent, type @ in the message box, pick {name} from the Mentions list, and ask:"
+        "Agents work together in a room: one does the work, another reviews it. Each agent's owner decides who may ask it: Team, Guest (the owner approves first) or No access.",
+        "No teammate yet? Ask {name} for a demo with one of your workers:"
       ],
-      "surface": "room",
+      "surface": "dm",
       "screenshot": [
         {
           "asset": "mention-list",
@@ -116,16 +133,59 @@
         }
       ],
       "since_release": "2026-10-15",
-      "paste": "Research the three best note-taking apps for a small team, then ask another agent in this room to review your answer."
+      "paste": "Set up a demo room with one of my workers. Ask it to review a short answer from you, and show me the thread.",
+      "locate": "In a room, type @ in the message box and pick an agent from the Mentions list.",
+      "watches": [
+        "skills/worker-pool/"
+      ]
+    },
+    {
+      "id": "apps",
+      "title": "Connect your apps",
+      "body": [
+        "Gmail, Calendar, Drive, Slack and more, so {name} can work with your real data. Signing in stays with you.",
+        "Ask {name}, and a Connect button appears:"
+      ],
+      "surface": "dm",
+      "screenshot": [
+        {
+          "asset": "settings-integrations",
+          "hd_file": "assets/settings-integrations.png",
+          "fallback_file": "assets/settings-integrations.jpg",
+          "alt": "Settings, Integrations"
+        }
+      ],
+      "since_release": "2026-10-15",
+      "paste": "Connect my Google Calendar.",
+      "locate": "Open Settings from your avatar at the bottom left, then Integrations.",
+      "watches": [
+        "skills/connect-apps/"
+      ]
+    },
+    {
+      "id": "schedule",
+      "title": "Schedule something",
+      "body": [
+        "A reminder or a recurring job, delivered in your DM at the time you choose.",
+        "Ask {name}:"
+      ],
+      "surface": "dm",
+      "screenshot": null,
+      "since_release": "2026-11-21",
+      "paste": "Schedule something for me. Ask me what and when, set it up, and show me it is scheduled.",
+      "locate": "Nothing to find: tell {name} in chat, for example &ldquo;every Monday at 9, send me my open tasks&rdquo;.",
+      "watches": [
+        "skills/ag2-space-mcp/"
+      ]
     },
     {
       "id": "calls",
       "title": "Calls &amp; voice",
       "body": [
-        "Talk live with {name} in your DM, or with people in a room. Agent voice must be enabled and allowed in that room. Room-call screen sharing is work in progress; screen coaching and local editing use a separate supported session with your permission.",
-        "Press the headphone icon in the room header (Start call). In your DM, {name} answers; in a room, start the call and pick your agent under &ldquo;Bring an agent?&rdquo;. Select &ldquo;Bring into call&rdquo; to invite it. For live screen coaching in a supported, configured local session, approve only the screen access you want to share and ask: &ldquo;Coach me through the next step; let me do the clicking.&rdquo; For voice editing, select a passage in a supported editor or local session, confirm the agent received the selection, and authorize the edit: &ldquo;Rewrite only this selection to be clearer, keeping my meaning.&rdquo; Review the result. If selection access is unavailable, paste the passage into the room."
+        "Talk with {name} instead of typing, in your DM or in a room call. Voice must be enabled for your agent and allowed in that room.",
+        "Ask {name} to start it:"
       ],
-      "surface": "room",
+      "surface": "dm",
       "screenshot": [
         {
           "asset": "room-header-call",
@@ -135,40 +195,47 @@
         }
       ],
       "since_release": "2026-10-15",
+      "paste": "I want to talk by voice. Start a call with me here, or tell me the one tap that starts it.",
+      "locate": "The headphone icon in the room header (Start call). In a room call, pick your agent under &ldquo;Bring an agent?&rdquo;, then Bring into call.",
       "watches": [
         "skills/ag2space-voice/"
       ]
     },
     {
-      "id": "apps",
-      "title": "Connect your apps",
+      "id": "memory",
+      "title": "Memory",
       "body": [
-        "Gmail, Calendar, Drive, Slack and more, so {name} can work with your real data.",
-        "Click your avatar at the bottom left and choose Apps to open Settings &rarr; Apps &rarr; Connected apps, or ask {name} and a Connect button appears:"
+        "{name} remembers what you tell it: your work, your preferences, who is who. Tell it once and it uses it from then on.",
+        "Try it:"
       ],
       "surface": "dm",
-      "screenshot": [
-        {
-          "asset": "settings-integrations",
-          "hd_file": "assets/settings-integrations.png",
-          "fallback_file": "assets/settings-integrations.jpg",
-          "alt": "Settings → Apps → Connected apps"
-        }
+      "screenshot": null,
+      "since_release": "2026-11-21",
+      "paste": "Ask me one question about my work, remember my answer, and tell me what you saved."
+    },
+    {
+      "id": "checkin",
+      "title": "Morning check-in",
+      "body": [
+        "A short note each morning with what is useful that day, here in your DM.",
+        "Ask {name} to set it up:"
       ],
-      "since_release": "2026-10-15",
-      "paste": "Connect my Google Calendar.",
+      "surface": "dm",
+      "screenshot": null,
+      "since_release": "2026-11-21",
+      "paste": "Set up a short morning check-in for me. Ask me what time suits me, then schedule it.",
       "watches": [
-        "skills/connect-apps/"
+        "skills/morning-briefing/"
       ]
     },
     {
       "id": "activity",
       "title": "Activity &amp; notices",
       "body": [
-        "The bell at the top of the room list and each room's Activity tab show what needs you and what your agents are working on. The unread badge follows each room's notification setting.",
-        "Try it: open a room's Activity tab while an agent works on something you asked for, then open the room menu (&#8942;), choose Notifications, and pick Mention &amp; Keywords."
+        "Activity shows what needs you and what your agents are working on.",
+        "Ask {name}:"
       ],
-      "surface": "room",
+      "surface": "dm",
       "screenshot": [
         {
           "asset": "room-list-top",
@@ -178,6 +245,8 @@
         }
       ],
       "since_release": "2026-10-15",
+      "paste": "What work is still open, and what needs my input? Ask me which room I mean if you need to.",
+      "locate": "The bell at the top of the room list, and each room's Activity tab. Notification settings are in the room menu (&#8942;).",
       "watches": [
         "skills/agent-activity/"
       ]
@@ -212,12 +281,12 @@
     },
     {
       "id": "mobile",
-      "title": "Mobile",
+      "title": "Pair your phone",
       "body": [
-        "The same rooms and agents on your phone.",
-        "Click your avatar at the bottom left to open your account menu (User, Agent, Apps, Appearance, Mobile pairing, Notifications, Plan &amp; usage), choose Mobile pairing, press Enable, and scan the code with the mobile app on your phone."
+        "The same rooms and agents on your phone, once the app is installed.",
+        "Ask {name} to open the pairing page for you:"
       ],
-      "surface": "mobile",
+      "surface": "dm",
       "screenshot": [
         {
           "asset": "mobile-pairing",
@@ -226,7 +295,24 @@
           "alt": "Settings: Mobile pairing, with Enable"
         }
       ],
-      "since_release": "2026-10-15"
+      "since_release": "2026-10-15",
+      "paste": "Help me pair my phone. Open the Mobile pairing page for me.",
+      "locate": "Open Settings from your avatar at the bottom left, choose Mobile pairing, press Enable and scan the code with the mobile app."
+    },
+    {
+      "id": "report",
+      "title": "Something not working?",
+      "body": [
+        "Tell {name} what went wrong. It files a bug report with the team behind the app and gives you its reference.",
+        "Ask {name}:"
+      ],
+      "surface": "dm",
+      "screenshot": null,
+      "since_release": "2026-11-21",
+      "paste": "Something isn't working. Ask me what happened, then file a bug report and give me its reference.",
+      "watches": [
+        "skills/report-feedback/"
+      ]
     }
   ]
 }

@@ -4,7 +4,8 @@ The procedure lives in the `tutorial` skill: [`skills/tutorial/SKILL.md`](../ski
 
 - **Voice mode.** On "tutorial", "walk me through" or "show me what you can do", read
   `notes/first-time-tutorial.md` and deliver it one brief, voice-friendly section at a time,
-  waiting for the user to try each step.
+  waiting for the user to try each step. The skill's launch hook seeds that file once from
+  `skills/tutorial/voice/first-time-tutorial.md` and never replaces the owner's copy.
 - **s.space mode.** Right after the first-contact greeting in the owner's DM, the skill creates
   one "Getting started" HTML page (Room Commons) in that DM, with an optional checklist,
   and summons the owner to it. A marker under `<workspace>/state/tutorial/` keeps it to one page per room, so
@@ -49,7 +50,9 @@ wraps on narrow screens, and reduced-motion and dark-mode preferences are respec
 - **The feature list.** The steps come from `skills/tutorial/feature-list.json` (one step per
   feature: title, two body parts, where to try it, a paste prompt, screenshots, the release that
   added it, and optionally the repo paths it `watches`). This list describes the reference tour;
-  the compact onboarding layout deliberately keeps its nine approved goals and the App Store QR.
+  the compact onboarding layout keeps its own 14 goals and the App Store QR. In both, a step is
+  something the reader asks their agent to do; where it is in the app is collapsed under
+  "Where is it?". Publisher internals: [`tutorial-publisher.md`](tutorial-publisher.md).
   A watched path that changes in a release
   without a revision bump or a matching `reviewed_at` makes the release audit warn
   (`docs/release-process.md` §4.2). `--list <file|https URL>` swaps the list; nothing is fetched by default, only https

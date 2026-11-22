@@ -38,51 +38,85 @@ Section = tp.Section
 APP_STORE = "https://apps.apple.com/us/app/s-space/id6788541784"
 OLD_SECTIONS = [
     Section("dm", "Your DM",
-            "Your DM with {name} is where you ask for things for yourself. What you ask for yourself (research, mail, calendar) comes back in your DM unless you explicitly ask to share it.",
-            "Open {name} under Your agents at the top of the sidebar and ask:",
-            "What can you do for me today?", "dm"),
+            "Your DM with {name} is where you ask for things for yourself. What you ask for yourself (research, mail, calendar) comes back here unless you ask to share it.",
+            "Every step below works the same way: ask {name}, and it does the work with you. Start here:",
+            "What can you do for me today?", "dm",
+            locate="{name} is under Your agents at the top of the sidebar."),
     Section("rooms", "Rooms",
-            "You, your teammates and all of your agents meet in one room. Invite your team, and everyone brings their own agents. Each agent works for its owner, right in the room.",
-            "Press + at the top of the room list and choose Room. Name it and pick {name} under AI stands you own, or later open the room menu (&#8942;), choose Invite, and add {name}.",
-            images=(("room-list-add-room.jpg", "Press + in the room list, then Room"), ("new-room-dialog.jpg", "The New Chat Room dialog, with your agent under AI stands you own"), ("room-menu-invite.jpg", "The room menu, with Invite"))),
+            "You, your teammates and all of your agents meet in one room. Everyone brings their own agents, and each agent works for its owner.",
+            "Ask {name} to make one for you:",
+            "Make me a room for a project. Ask me its name and who should be in it, create it, and invite yourself.", "dm",
+            images=(("room-list-add-room.jpg", "The + menu at the top of the room list"), ("new-room-dialog.jpg", "The new room dialog, with your agent under AI stands you own")),
+            locate="Press + at the top of the room list and choose New room. To add an agent later, open the room menu (&#8942;) and choose Invite."),
     Section("commons", "Commons",
-            "Each room's shared Docs, HTML pages, PDFs, Figma files, whiteboards, sheets and databases. Open them with the Commons button at the right of the room header.",
-            "Ask {name} in a room:",
-            "Make a plan for our team offsite in Commons.", "room",
-            (("room-header-commons.jpg", "The Commons button at the right of the room header"), ("commons-surfaces.jpg", "Commons: Doc, Whiteboard, HTML, PDF, Figma, Sheet and Database"))),
+            "Each room's shared Docs, HTML pages, PDFs, Figma files, whiteboards, sheets and databases, which everyone in the room can open and edit.",
+            "In a room, ask {name}:",
+            "Draft a page with me in this room's Commons. Ask me what it is for, then write the first version and send me the link.", "room",
+            images=(("room-header-commons.jpg", "The Commons button at the right of the room header"), ("commons-surfaces.jpg", "Commons: Doc, Whiteboard, HTML, PDF, Figma, Sheet and Database")),
+            locate="The Commons button at the right of the room header."),
+    Section("workers", "Your workers",
+            "A worker is another agent of yours, with its own name and identity, that takes work off {name}'s plate.",
+            "Ask {name}:",
+            "Show my workers. If I have none, add one with its own identity: ask me what it should focus on, then set it up.", "dm",
+            locate="Agent Settings &rarr; Workers, or ask {name} &ldquo;show my workers&rdquo; at any time."),
     Section("agents", "Connect other agents",
-            "Bring agents from the apps you already use into your rooms.",
-            "Open Add an agent from the room list. Choose an agent from another app, such as Claude Duet, Dot, Grok Bot, Hermes, Muse or OpenClaw, or use Other for a compatible app. Follow that app’s connection instructions. Claude Code and Codex are separate local-agent options, not other names for Duet and Dot. Antigravity is another local option in a supported desktop app; install and sign in to its CLI first. Its availability depends on the host.",
-            images=(("room-list-add.jpg", "The + menu at the top of the room list, with Agent"),
-                    ("add-agent-dialog.jpg", "Add an agent, with Use an agent from another app"), ("which-agent.jpg", "Which agent? Dot, Grok Bot, Muse or Other"))),
+            "Bring agents from the apps you already use, such as Claude Duet, Dot, Grok Bot, Hermes, Muse or OpenClaw, into your rooms.",
+            "Ask {name} to walk you through it:",
+            "Help me connect another agent I use. Ask me which app it is, walk me through its connection, and test its first reply.", "dm",
+            images=(("room-list-add.jpg", "The + menu at the top of the room list, with Agent"), ("add-agent-dialog.jpg", "Add an agent, with Use an agent from another app"), ("which-agent.jpg", "Which agent? Dot, Grok Bot, Muse or Other")),
+            locate="Press + at the top of the room list, choose Agent, then Use an agent from another app (or Other for a compatible app). Claude Code, Codex and Antigravity are local-agent options there; Antigravity needs its CLI installed and signed in first."),
     Section("teamwork", "Teamwork",
-            "@-mention an agent in a room to ask for help. Its owner’s access settings determine whether it can take your request; Team enables collaboration, while Guest requests need owner approval. With No access, the owner can still access and invoke the agent; other room members cannot. Tool approvals and owner permissions still apply.",
-            "In a room with another agent, type @ in the message box, pick {name} from the Mentions list, and ask:",
-            "Research the three best note-taking apps for a small team, then ask another agent in this room to review your answer.", "room",
-            (("mention-list.jpg", "Typing @ in the message box opens the Mentions list"),)),
-    Section("calls", "Calls &amp; voice",
-            "Talk live with {name} in your DM, or with people in a room. Agent voice must be enabled and allowed in that room. Room-call screen sharing is work in progress; screen coaching and local editing use a separate supported session with your permission.",
-            "Press the headphone icon in the room header (Start call). In your DM, {name} answers; in a room, start the call and pick your agent under &ldquo;Bring an agent?&rdquo;. Select &ldquo;Bring into call&rdquo; to invite it. For live screen coaching in a supported, configured local session, approve only the screen access you want to share and ask: &ldquo;Coach me through the next step; let me do the clicking.&rdquo; For voice editing, select a passage in a supported editor or local session, confirm the agent received the selection, and authorize the edit: &ldquo;Rewrite only this selection to be clearer, keeping my meaning.&rdquo; Review the result. If selection access is unavailable, paste the passage into the room.",
-            images=(("room-header-call.jpg", "The headphone icon in the room header"),)),
+            "Agents work together in a room: one does the work, another reviews it. Each agent's owner decides who may ask it: Team, Guest (the owner approves first) or No access.",
+            "No teammate yet? Ask {name} for a demo with one of your workers:",
+            "Set up a demo room with one of my workers. Ask it to review a short answer from you, and show me the thread.", "dm",
+            images=(("mention-list.jpg", "Typing @ in the message box opens the Mentions list"),),
+            locate="In a room, type @ in the message box and pick an agent from the Mentions list."),
     Section("apps", "Connect your apps",
-            "Gmail, Calendar, Drive, Slack and more, so {name} can work with your real data.",
-            "Click your avatar at the bottom left and choose Apps to open Settings &rarr; Apps &rarr; Connected apps, or ask {name} and a Connect button appears:",
+            "Gmail, Calendar, Drive, Slack and more, so {name} can work with your real data. Signing in stays with you.",
+            "Ask {name}, and a Connect button appears:",
             tp.CONNECT_PROMPT, "dm",
-            (("settings-integrations.jpg", "Settings → Apps → Connected apps"),)),
+            images=(("settings-integrations.jpg", "Settings, Integrations"),),
+            locate="Open Settings from your avatar at the bottom left, then Integrations."),
+    Section("schedule", "Schedule something",
+            "A reminder or a recurring job, delivered in your DM at the time you choose.",
+            "Ask {name}:",
+            "Schedule something for me. Ask me what and when, set it up, and show me it is scheduled.", "dm",
+            locate="Nothing to find: tell {name} in chat, for example &ldquo;every Monday at 9, send me my open tasks&rdquo;."),
+    Section("calls", "Calls &amp; voice",
+            "Talk with {name} instead of typing, in your DM or in a room call. Voice must be enabled for your agent and allowed in that room.",
+            "Ask {name} to start it:",
+            "I want to talk by voice. Start a call with me here, or tell me the one tap that starts it.", "dm",
+            images=(("room-header-call.jpg", "The headphone icon in the room header"),),
+            locate="The headphone icon in the room header (Start call). In a room call, pick your agent under &ldquo;Bring an agent?&rdquo;, then Bring into call."),
+    Section("memory", "Memory",
+            "{name} remembers what you tell it: your work, your preferences, who is who. Tell it once and it uses it from then on.",
+            "Try it:",
+            "Ask me one question about my work, remember my answer, and tell me what you saved.", "dm"),
+    Section("checkin", "Morning check-in",
+            "A short note each morning with what is useful that day, here in your DM.",
+            "Ask {name} to set it up:",
+            "Set up a short morning check-in for me. Ask me what time suits me, then schedule it.", "dm"),
     Section("activity", "Activity &amp; notices",
-            "The bell at the top of the room list and each room's Activity tab show what needs you and what your agents are working on. The unread badge follows each room's notification setting.",
-            "Try it: open a room's Activity tab while an agent works on something you asked for, then open the room menu (&#8942;), choose Notifications, and pick Mention &amp; Keywords.",
-            images=(("room-list-top.jpg", "The bell at the top of the room list"),)),
+            "Activity shows what needs you and what your agents are working on.",
+            "Ask {name}:",
+            "What work is still open, and what needs my input? Ask me which room I mean if you need to.", "dm",
+            images=(("room-list-top.jpg", "The bell at the top of the room list"),),
+            locate="The bell at the top of the room list, and each room's Activity tab. Notification settings are in the room menu (&#8942;)."),
     Section("phone", "Get the mobile app",
             "Take your rooms and agents with you: first, put the app on your phone.",
             "On your phone, search &ldquo;s.space&rdquo; in the App Store (by AG2AI, Inc), or scan this code with your phone&rsquo;s camera. Install the app with this icon and open it. You pair it with this computer in the next step.",
-            images=(("app-icon.png", "The S app icon", "S"),
-                    ("app-store-qr.png", "QR code that opens the app in the App Store", "Scan with your phone")),
+            images=(("app-icon.png", "The S app icon", "S"), ("app-store-qr.png", "QR code that opens the app in the App Store", "Scan with your phone")),
             link=(APP_STORE, "Open in the App Store")),
-    Section("mobile", "Mobile",
-            "The same rooms and agents on your phone.",
-            "Click your avatar at the bottom left to open your account menu (User, Agent, Apps, Appearance, Mobile pairing, Notifications, Plan &amp; usage), choose Mobile pairing, press Enable, and scan the code with the mobile app on your phone.",
-            images=(("mobile-pairing.jpg", "Settings: Mobile pairing, with Enable"),)),
+    Section("mobile", "Pair your phone",
+            "The same rooms and agents on your phone, once the app is installed.",
+            "Ask {name} to open the pairing page for you:",
+            "Help me pair my phone. Open the Mobile pairing page for me.", "dm",
+            images=(("mobile-pairing.jpg", "Settings: Mobile pairing, with Enable"),),
+            locate="Open Settings from your avatar at the bottom left, choose Mobile pairing, press Enable and scan the code with the mobile app."),
+    Section("report", "Something not working?",
+            "Tell {name} what went wrong. It files a bug report with the team behind the app and gives you its reference.",
+            "Ask {name}:",
+            "Something isn't working. Ask me what happened, then file a bug report and give me its reference.", "dm"),
 ]
 
 
@@ -101,6 +135,7 @@ MXC_OF = {name: f"mxc://ag2.example/{i:02d}{name.replace('-', '')}" for i, name 
 # The rendered content each shipped revision was cut with. A change to a rendered field fails
 # test_a_rendered_change_needs_a_revision_bump until `revision` is bumped and its key added here.
 RENDERED_AT = {
+    "tutorial.2026-11-21.1": "71a54ec705b18daf0a25f933d423aa2c8a0d3ec1c7c4d06ef1ef0209eac30f17",
     "tutorial.2026-11-20.1": "034bb9e136f1cfb0135ed1ec39feb9f7d2c2cab69f8a17c3a13dedc6e556b789",
     "tutorial.2026-11-20.2": "034bb9e136f1cfb0135ed1ec39feb9f7d2c2cab69f8a17c3a13dedc6e556b789",
     "tutorial.2026-11-20.3": "a694cb0ee8d513a9986383c5377f8bbd9c2ea272b80e2d52701be7003ae136ca",
@@ -117,7 +152,8 @@ RENDERED_AT = {
     "tutorial.2026-10-31.2": "d0be214f205df52c62f9dd2dec0267b49676dc80ba8ca9fea084ffae4614c728",
     "tutorial.2026-10-31.3": "b241929d5d588687c1005c7a39b758bf1772fd74511f7dcdf44cccf08230a561",
 }
-STEP_IDS = ["dm", "rooms", "commons", "agents", "teamwork", "calls", "apps", "activity", "phone", "mobile"]
+STEP_IDS = ["dm", "rooms", "commons", "workers", "agents", "teamwork", "apps", "schedule", "calls", "memory",
+            "checkin", "activity", "phone", "mobile", "report"]
 ASSET_CAP = 60_000
 PAGE_CAP = 300_000
 
@@ -204,17 +240,18 @@ class LosslessTest(unittest.TestCase):
         self.assertEqual([s.id for s in tp.SECTIONS], STEP_IDS)
         self.assertNotIn("import", [s.id for s in tp.FEATURES.steps])
         self.assertTrue(all(s.runtime is None for s in tp.FEATURES.steps))
-        self.assertEqual({s.since_release for s in tp.FEATURES.steps}, {"2026-10-15", "2026-10-30"})
-        self.assertEqual(tp.PROMPT_SLOTS, ("dm", "commons", "teamwork", "apps", "finale"))
+        self.assertEqual({s.since_release for s in tp.FEATURES.steps}, {"2026-10-15", "2026-10-30", "2026-11-21"})
+        self.assertEqual(tp.PROMPT_SLOTS, ("dm", "rooms", "commons", "workers", "agents", "teamwork", "apps", "schedule",
+                                          "calls", "memory", "checkin", "activity", "mobile", "report", "finale"))
         for core in tp.CORES:
             self.assertEqual([s.id for s in tp.sections_for(core)], STEP_IDS)
         raw = json.loads(tp.LIST_PATH.read_text(encoding="utf-8"))
         self.assertEqual(raw["schema_version"], tp.SCHEMA_VERSION)
         self.assertEqual(raw["revision"], tp.FEATURES.revision)
         self.assertEqual(set(raw["steps"][0]), {"id", "title", "body", "surface", "screenshot",
-                                                 "since_release", "paste"})
+                                                 "since_release", "paste", "locate"})
         shots = [shot for s in raw["steps"] if s["screenshot"] for shot in s["screenshot"]]
-        self.assertEqual(len(shots), 15)
+        self.assertEqual(len(shots), 14)
         for shot in shots:
             if shot["asset"] in ("app-icon", "app-store-qr"):  # small enough to inline everywhere: never uploaded
                 self.assertEqual(set(shot), {"asset", "fallback_file", "alt", "caption"})
@@ -223,7 +260,7 @@ class LosslessTest(unittest.TestCase):
             self.assertEqual(set(shot), {"asset", "hd_file", "fallback_file", "alt"})
             self.assertEqual((shot["hd_file"], shot["fallback_file"]),
                              (f"assets/{shot['asset']}.png", f"assets/{shot['asset']}.jpg"))  # the stems
-        self.assertEqual(len(tp.hd_files(tp.FEATURES)), 13)
+        self.assertEqual(len(tp.hd_files(tp.FEATURES)), 12)
 
     def test_sections_match_field_for_field(self):
         for old, new in zip(OLD_LIST.steps, tp.FEATURES.steps):
@@ -315,7 +352,7 @@ class ListTest(unittest.TestCase):
         for s in data["steps"]:
             s["runtime"] = "claude"
         self.refuse(data, "every core")
-        self.assertLessEqual(len(good_list()["steps"]), tp.STEPS_MAX // 2)
+        self.assertLess(len(good_list()["steps"]), tp.STEPS_MAX)
         self.refuse(many_steps(40), "steps", "at most 24", "got 40")
         self.assertEqual(len(tp.parse_list(many_steps(tp.STEPS_MAX)).steps), tp.STEPS_MAX)
 
@@ -382,7 +419,7 @@ class ListTest(unittest.TestCase):
         self.assertIsNone(tp.revision_key("tutorial.2026-10-23"))
         self.assertIsNone(tp.revision_key(None))
         self.assertTrue(tp.newer("tutorial.2026-10-23.10", "tutorial.2026-10-23.9"))
-        self.assertTrue(tp.newer("tutorial.2026-11-20.4", "tutorial.2026-10-23.9"))
+        self.assertTrue(tp.newer("tutorial.2026-11-21.2", "tutorial.2026-10-23.9"))
         self.assertTrue(tp.newer("tutorial.2026-10-23.1", None))  # a page from before lists had one
         self.assertFalse(tp.newer("tutorial.2026-10-23.1", "tutorial.2026-10-23.1"))
         self.assertFalse(tp.newer("tutorial.2026-10-23.1", "tutorial.2026-10-23.2"))
@@ -449,13 +486,13 @@ class MediaTest(unittest.TestCase):
                                                                          "commons-surfaces"})
         self.assertEqual(tp.clean_media(["x"]), {})
         self.assertEqual(tp.clean_media(None), {})
-        self.assertEqual(len(tp.asset_names(tp.FEATURES)), 15)
+        self.assertEqual(len(tp.asset_names(tp.FEATURES)), 14)
 
     def test_a_mapped_asset_points_at_the_rooms_media_and_the_rest_stay_inlined(self):
         page = tp.render_page("Blue", "codex", media={"room-list-add": MXC_OF["room-list-add"]})
         self.assertIn(f'<img src="{MXC_OF["room-list-add"]}" alt="The + menu at the top of the room list, with Agent" '
                       'loading="lazy">', page)
-        self.assertEqual(page.count('<img src="data:image/jpeg;base64,'), 12)
+        self.assertEqual(page.count('<img src="data:image/jpeg;base64,'), 11)
         self.assertEqual(page.count('<img src="data:image/png;base64,'), 2)
         self.assertEqual(page.count('<img src="mxc://'), 1)
 
@@ -463,8 +500,8 @@ class MediaTest(unittest.TestCase):
         for core in tp.CORES:
             page = tp.render_page("Blue", core, "dm", "@kai.agent:example.test", media=MXC_OF)
             self.assertNotIn("data:image", page)
-            self.assertEqual(page.count('<img src="mxc://'), 15)
-            self.assertLess(len(page.encode("utf-8")), 77_000, core)
+            self.assertEqual(page.count('<img src="mxc://'), 14)
+            self.assertLess(len(page.encode("utf-8")), 90_000, core)
 
     def test_without_media_the_page_is_the_fallback_page(self):
         self.assertEqual(tp.render_page("Blue", "claude", media={}), tp.render_page("Blue", "claude"))
@@ -489,9 +526,9 @@ class MarkerTest(unittest.TestCase):
         page = tp.render_page("Blue", "codex", "dm", self.ME)
         self.assertEqual(tp.read_marker(page), (self.ME, tp.FEATURES.revision))
         self.assertIsNone(tp.read_marker(tp.render_page("Blue", "codex")))
-        other = tp.FeatureList("tutorial.2026-11-20.4", tp.FEATURES.steps)
+        other = tp.FeatureList("tutorial.2026-11-21.2", tp.FEATURES.steps)
         self.assertEqual(tp.read_marker(tp.render_page("Blue", "codex", "dm", self.ME, features=other))[1],
-                         "tutorial.2026-11-20.4")
+                         "tutorial.2026-11-21.2")
 
     def test_ownership_reads_both_marker_forms(self):
         page = {"kind": "html-g", "title": "Getting started", "by": self.ME}
@@ -515,7 +552,7 @@ class SizeTest(unittest.TestCase):
 
     def test_every_hd_file_is_a_png_room_media_takes(self):
         hd = tp.hd_files(tp.FEATURES)
-        self.assertEqual(len(hd), 13)
+        self.assertEqual(len(hd), 12)
         for asset, name in hd.items():
             data = (tp.ASSETS / name).read_bytes()
             self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"), name)
@@ -600,7 +637,7 @@ class _Cli(unittest.TestCase):
 
 class ListOverrideTest(_Cli):
     def test_render_from_a_list_file(self):
-        other = self.write_list("tutorial.2026-11-20.4")
+        other = self.write_list("tutorial.2026-11-21.2")
         code, out, err = self.main("render", "--name", "Blue", "--core", "codex", "--list", str(other))
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(out, tp.render_page("Blue", "codex", features=tp.load_list(other)))
@@ -649,7 +686,7 @@ class ListOverrideTest(_Cli):
                 mock.patch.object(gs, "list_opener", side_effect=AssertionError("network")) as opener:
             code, out, _ = self.main("render", "--name", "Blue", "--core", "codex")
             self.assertEqual((code, out), (0, tp.render_page("Blue", "codex")))
-            other = self.write_list("tutorial.2026-11-20.4")
+            other = self.write_list("tutorial.2026-11-21.2")
             code, _, _ = self.main("render", "--name", "Blue", "--list", str(other))
             self.assertEqual(code, 0)
             code, _, _ = self.publish()
@@ -658,7 +695,7 @@ class ListOverrideTest(_Cli):
         opener.assert_not_called()
 
     def test_a_served_list_replaces_the_file(self):
-        served = json.dumps(good_list(revision="tutorial.2026-11-20.4", kind="tutorial", etag="x")).encode()
+        served = json.dumps(good_list(revision="tutorial.2026-11-21.2", kind="tutorial", etag="x")).encode()
         seen = {}
 
         @contextlib.contextmanager
@@ -678,7 +715,7 @@ class ListOverrideTest(_Cli):
         self.assertEqual((code, json.loads(out)["list"]), (0, "https://api.example.test:8443/setup-copy"))
 
     def test_a_redirect_is_followed_only_to_https(self):
-        served = json.dumps(good_list(revision="tutorial.2026-11-20.4")).encode()
+        served = json.dumps(good_list(revision="tutorial.2026-11-21.2")).encode()
         routes = {"https://trusted.example/list": (302, "http://127.0.0.1:8080/cleartext-list"),
                   "http://127.0.0.1:8080/cleartext-list": (200, served),
                   "https://trusted.example/ftp": (302, "ftp://files.example/list"),
@@ -695,7 +732,7 @@ class ListOverrideTest(_Cli):
             self.assertNotIn("secret", str(caught.exception))
         transport = FakeTransport(routes)
         self.assertEqual(gs.fetch_list("https://trusted.example/moved", gs.list_opener(transport)).revision,
-                         "tutorial.2026-11-20.4")
+                         "tutorial.2026-11-21.2")
         self.assertEqual(transport.seen, ["https://trusted.example/moved", "https://cdn.example/list?sig=s"])
         # Through the CLI the refusal falls back to the file; the note shows no userinfo or query.
         with mock.patch.object(gs, "list_opener", lambda *h: urllib.request.build_opener(
@@ -746,7 +783,7 @@ class ListOverrideTest(_Cli):
         got = json.loads(out)
         self.assertEqual((code, got["action"], got["media"]), (0, "created", ["room-list-add"]))
         self.assertIn(f'<img src="{MXC_OF["room-list-add"]}"', self.page_text())
-        self.assertEqual(self.page_text().count("data:image/jpeg"), 12)
+        self.assertEqual(self.page_text().count("data:image/jpeg"), 11)
         entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
         self.assertEqual(entry["media"], {"room-list-add": MXC_OF["room-list-add"]})
         code, out, _ = self.publish()  # the room keeps its media map
@@ -764,7 +801,7 @@ class ListOverrideTest(_Cli):
         self.assertEqual((code, out), (0, tp.render_page("Blue")))
 
     def test_custom_slot_uses_the_generic_list_prompt_on_publish(self):
-        data = good_list(revision="tutorial.2026-11-20.4")
+        data = good_list(revision="tutorial.2026-11-21.2")
         data["steps"].insert(1, {"id": "marketplace", "title": "Marketplace", "surface": "dm",
                                  "body": ["Cloud tools for {name}.", "Ask {name}:"], "screenshot": None,
                                  "since_release": "2026-11-01", "paste": "Install the Notion tool."})
@@ -778,34 +815,34 @@ class ListOverrideTest(_Cli):
         self.assertIn("Install the Notion tool.", self.page_text())
         entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
         self.assertNotIn("prompts", entry)
-        data["revision"] = "tutorial.2026-11-21.1"
+        data["revision"] = "tutorial.2026-11-21.3"
         other.write_text(json.dumps(data))
         code, out, _ = self.publish("--if-newer", "--list", str(other))
         self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
         self.assertNotIn("Show me the Marketplace.", self.page_text())
 
     def test_publish_reports_which_list_it_used(self):
-        other = self.write_list("tutorial.2026-11-20.4")
+        other = self.write_list("tutorial.2026-11-21.2")
         code, out, _ = self.publish("--list", str(other))
         got = json.loads(out)
         self.assertEqual((code, got["action"], got["list"], got["revision"]),
-                         (0, "created", str(other), "tutorial.2026-11-20.4"))
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
+                         (0, "created", str(other), "tutorial.2026-11-21.2"))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-21.2"))
         entry = gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]
-        self.assertEqual((entry["state"], entry["revision"]), ("complete", "tutorial.2026-11-20.4"))
+        self.assertEqual((entry["state"], entry["revision"]), ("complete", "tutorial.2026-11-21.2"))
 
 
 class IfNewerTest(_Cli):
     def test_a_newer_list_rebuilds_the_page_in_place(self):
         code, out, _ = self.publish()
         self.assertEqual((code, json.loads(out)["action"]), (0, "created"))
-        newer = self.write_list("tutorial.2026-11-20.4")
+        newer = self.write_list("tutorial.2026-11-21.2")
         code, out, _ = self.publish("--if-newer", "--list", str(newer))
         got = json.loads(out)
         self.assertEqual((code, got["action"], got["kind"], got["summoned"]), (0, "updated", "html-p1", False))
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-21.2"))
         self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["revision"],
-                         "tutorial.2026-11-20.4")
+                         "tutorial.2026-11-21.2")
 
     def test_a_current_page_is_left_alone_even_when_the_text_would_differ(self):
         self.publish()
@@ -837,7 +874,7 @@ class IfNewerTest(_Cli):
     def test_a_refresh_ignores_legacy_prompt_and_role_fields(self):
         self.publish()
         self.record(prompts={"dm": "Draft my fictional private update."}, roles="Founder")
-        newer = self.write_list("tutorial.2026-11-20.4")
+        newer = self.write_list("tutorial.2026-11-21.2")
         code, out, _ = self.publish("--if-newer", "--list", str(newer))
         self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
         self.assertNotIn("Draft my fictional private update.", self.page_text())
@@ -851,7 +888,7 @@ class IfNewerTest(_Cli):
         mine, theirs = db["pages"]["html-p1"], db["pages"]["html-p1"].replace("</main>", "<p>Our notes.</p></main>")
         db["pages"]["html-p1"] = theirs
         (self.tmp / "room.json").write_text(json.dumps(db))
-        newer = self.write_list("tutorial.2026-11-20.4")
+        newer = self.write_list("tutorial.2026-11-21.2")
         for extra in (("--if-newer", "--list", str(newer)), ("--name", "Kai")):
             code, out, err = self.main("publish", "--room", self.ROOM, "--name", "Blue", "--core", "codex",
                                        "--room-commons", str(self.stub), "--agent-mxid", self.ME, *extra)
@@ -866,7 +903,7 @@ class IfNewerTest(_Cli):
         (self.tmp / "room.json").write_text(json.dumps(db))
         code, out, err = self.publish("--if-newer", "--list", str(newer))
         self.assertEqual((code, json.loads(out)["action"], err), (0, "updated", ""))
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-21.2"))
 
     def test_a_same_or_older_revision_pass_never_blesses_an_owner_edit(self):
         self.publish()
@@ -881,7 +918,7 @@ class IfNewerTest(_Cli):
             self.assertEqual((code, json.loads(out)["action"]), (0, "kept"), extra)
             self.assertIn("edited", err)
             self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["hash"], written)
-        code, out, _ = self.publish("--if-newer", "--list", str(self.write_list("tutorial.2026-11-20.4")))
+        code, out, _ = self.publish("--if-newer", "--list", str(self.write_list("tutorial.2026-11-21.2")))
         self.assertEqual((code, json.loads(out)["action"]), (0, "kept"))
         self.assertEqual(self.page_text(), theirs)  # the edit survives the next revision
 
@@ -946,7 +983,7 @@ class IfNewerTest(_Cli):
     def test_a_rewrite_cut_short_is_finished_by_the_next_run_at_the_exact_target(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-20.4")
+        newer = self.write_list("tutorial.2026-11-21.2")
         target = tp.render_page(gs.GENERIC_NAME, "codex", "dm", self.ME, None, None,
                                 tp.load_list(newer))
         self.assertEqual(len(gs.chunks(target)), 3)  # the default-size page: one replace, two appends
@@ -973,7 +1010,7 @@ class IfNewerTest(_Cli):
                 else:
                     self.assertEqual((code, got["action"], got["resumed"], got["summoned"], got["name"],
                                       got["revision"], got["list"]),
-                                     (0, "resumed", True, False, gs.GENERIC_NAME, "tutorial.2026-11-20.4", "journal"))
+                                     (0, "resumed", True, False, gs.GENERIC_NAME, "tutorial.2026-11-21.2", "journal"))
                     self.assertIn("were not applied", err)
                 self.assertEqual(self.page_text(), target)
                 entry = self.entry()
@@ -986,7 +1023,7 @@ class IfNewerTest(_Cli):
     def test_an_edit_made_while_a_rewrite_was_cut_short_is_kept_at_every_boundary(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-20.4")
+        newer = self.write_list("tutorial.2026-11-21.2")
         for at in self.BOUNDARIES:
             with self.subTest(at=at):
                 mine, target, left = self.fail_at(at, newer, prompts)
@@ -1089,7 +1126,7 @@ class IfNewerTest(_Cli):
         that one write, which is the window the piecewise path cannot close."""
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        self.newer = self.write_list("tutorial.2026-11-20.4")
+        self.newer = self.write_list("tutorial.2026-11-21.2")
         for hook, mode in (("read:1", "append"), ("read:1", "inplace"), ("read:2", "inplace"), ("read:2", "append")):
             with self.subTest(hook=hook, mode=mode):
                 mine, target, theirs, calls, code, out, err = self.edited_run(f"{hook}:{mode}", self.newer, prompts)
@@ -1108,7 +1145,7 @@ class IfNewerTest(_Cli):
         prompts, media = self.tmp / "p.json", self.tmp / "all.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
         media.write_text(json.dumps(MXC_OF))  # every screenshot mapped: the page is text, under 40 KB
-        newer = self.newer = self.write_list("tutorial.2026-11-20.4")
+        newer = self.newer = self.write_list("tutorial.2026-11-21.2")
         for hook, mode in (("read:1", "append"), ("read:2", "append"), ("read:2", "inplace")):
             with self.subTest(hook=hook, mode=mode):
                 mine, target, theirs, calls, code, out, err = self.edited_run(f"{hook}:{mode}", newer, prompts,
@@ -1140,7 +1177,7 @@ class IfNewerTest(_Cli):
     def test_an_edit_after_any_write_is_taken_back_or_stops_the_run_by_hash(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        self.newer = self.write_list("tutorial.2026-11-20.4")
+        self.newer = self.write_list("tutorial.2026-11-21.2")
         for hook, call in (("replace:1", 1), ("append:1", 2)):
             for mode in ("append", "inplace"):
                 with self.subTest(hook=hook, mode=mode):
@@ -1148,7 +1185,7 @@ class IfNewerTest(_Cli):
                     self.expect_edit(mine, target, theirs, calls, code, out, call, gs.rewrite_steps(mine, target, whole=False))
 
     def test_a_second_failure_mid_resume_on_a_three_piece_page_still_ends_at_the_target(self):
-        data = good_list(revision="tutorial.2026-11-20.4")
+        data = good_list(revision="tutorial.2026-11-21.2")
         smallest = min(tp.ASSETS.glob("*.jpg"), key=lambda p: p.stat().st_size).name
         data["steps"].append({"id": "extra", "title": "Extra", "surface": "dm", "since_release": "2026-11-01",
                               "body": ["One more step for {name}.", "Ask {name}:"],
@@ -1199,7 +1236,7 @@ class IfNewerTest(_Cli):
     def test_a_retry_finishes_the_recorded_target_whatever_this_run_asks_for(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-20.4")
+        newer = self.write_list("tutorial.2026-11-21.2")
         other = self.write_list("tutorial.2026-12-01.1", name="other.json")
         media = self.tmp / "media.json"
         media.write_text(json.dumps({"room-list-add": MXC_OF["room-list-add"]}))
@@ -1226,7 +1263,7 @@ class IfNewerTest(_Cli):
                 got = json.loads(out)
                 self.assertEqual((code, got["action"], got["resumed"], got["summoned"], got["name"], got["core"],
                                   got["agent"], got["revision"], got["media"], got["list"]),
-                                 (0, "resumed", True, False, gs.GENERIC_NAME, "codex", self.ME, "tutorial.2026-11-20.4", [],
+                                 (0, "resumed", True, False, gs.GENERIC_NAME, "codex", self.ME, "tutorial.2026-11-21.2", [],
                                   "journal"))
                 self.assertIn("were not applied", err)
                 self.assertEqual(self.page_text(), target)
@@ -1235,7 +1272,7 @@ class IfNewerTest(_Cli):
                 self.assertEqual((entry["state"], entry["hash"], entry.get("prompts"), entry.get("roles"), entry["revision"],
                                   entry.get("media")),
                                  ("complete", gs.content_hash(target), None, None,
-                                  "tutorial.2026-11-20.4", None))
+                                  "tutorial.2026-11-21.2", None))
                 self.assertFalse(set(entry) & set(gs.JOURNAL_KEYS))
                 code, out, err = self.publish("--if-newer", "--list", str(newer))  # the target is current
                 self.assertEqual((code, json.loads(out)["action"], err), (0, "unchanged", ""))
@@ -1252,7 +1289,7 @@ class IfNewerTest(_Cli):
     def test_recovery_runs_before_this_runs_inputs_are_rendered(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-20.4")
+        newer = self.write_list("tutorial.2026-11-21.2")
         heavy = self.tmp / "heavy.json"
         heavy.write_text(json.dumps(many_steps(tp.STEPS_MAX, shots=3)))  # valid, over the page cap once rendered
         target = self.cut_short(newer, prompts)
@@ -1267,7 +1304,7 @@ class IfNewerTest(_Cli):
     def test_an_updating_entry_whose_target_does_not_hash_is_refused(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-20.4")
+        newer = self.write_list("tutorial.2026-11-21.2")
         target = self.cut_short(newer, prompts)
         self.record(target=target.replace("</body>", "<!-- stale bytes --></body>"))
         code, out, _ = self.publish("--if-newer", "--list", str(newer))
@@ -1278,11 +1315,11 @@ class IfNewerTest(_Cli):
 
     def test_a_revision_only_bump_rewrites_once_then_is_a_no_op(self):
         self.publish()
-        bumped = self.write_list("tutorial.2026-11-20.4")  # the same steps, a newer revision
+        bumped = self.write_list("tutorial.2026-11-21.2")  # the same steps, a newer revision
         code, out, _ = self.publish("--if-newer", "--list", str(bumped))
         self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
-        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["revision"], "tutorial.2026-11-20.4")
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-21.2"))
+        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["revision"], "tutorial.2026-11-21.2")
         page = self.page_text()
         calls = len(json.loads((self.tmp / "room.json").read_text())["calls"])
         code, out, _ = self.publish("--if-newer", "--list", str(bumped))
@@ -1294,7 +1331,7 @@ class IfNewerTest(_Cli):
         calls = len(json.loads((self.tmp / "room.json").read_text())["calls"])
         code, out, _ = self.publish("--if-newer", "--list", str(bumped))
         self.assertEqual((code, json.loads(out)["action"]), (0, "unchanged"))
-        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["revision"], "tutorial.2026-11-20.4")
+        self.assertEqual(gs.load_marker(gs.marker_path(self.tmp / "ws"))[self.ROOM]["revision"], "tutorial.2026-11-21.2")
         writes = [c for c in json.loads((self.tmp / "room.json").read_text())["calls"][calls:] if c[0] not in ("read", "pages")]
         self.assertEqual(writes, [])
 
@@ -1336,10 +1373,10 @@ class IfNewerTest(_Cli):
         code, out, _ = self.publish()  # untouched: ours again, and rewrites go through the journal
         got = json.loads(out)
         self.assertEqual((code, got["action"], got.get("adopted"), got["summoned"]), (0, "unchanged", True, False))
-        newer = self.write_list("tutorial.2026-11-20.4")
+        newer = self.write_list("tutorial.2026-11-21.2")
         code, out, _ = self.publish("--if-newer", "--list", str(newer))
         self.assertEqual((code, json.loads(out)["action"]), (0, "updated"))
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-21.2"))
         # Edited after the marker was lost: adopted as found, never rewritten.
         db = json.loads((self.tmp / "room.json").read_text())
         theirs = db["pages"]["html-p1"].replace("</main>", "<p>OWNER NOTES</p></main>")
@@ -1356,12 +1393,12 @@ class IfNewerTest(_Cli):
             self.assertEqual(self.writes_since(n), [])
         entry = self.entry()
         self.assertEqual((entry["foreign"], entry["hash"], entry["revision"]),
-                         (True, gs.content_hash(theirs), "tutorial.2026-11-20.4"))
+                         (True, gs.content_hash(theirs), "tutorial.2026-11-21.2"))
 
     def test_recovery_needs_nothing_of_this_runs_request(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-20.4")
+        newer = self.write_list("tutorial.2026-11-21.2")
         # A legacy name option has no effect on recovery or rendering.
         target = self.cut_short(newer, prompts)
         code, out, err = self.publish("--name", " ")
@@ -1400,10 +1437,10 @@ class IfNewerTest(_Cli):
         mine = self.page_text()
         self.assertGreater(len(mine.encode()), 131_072)  # over Linux's cap on one exec argument
         n = self.calls()
-        newer = self.write_list("tutorial.2026-11-20.4")
+        newer = self.write_list("tutorial.2026-11-21.2")
         code, out, err = self.publish("--if-newer", "--list", str(newer))  # setUp holds every exec to that cap
         self.assertEqual((code, json.loads(out)["action"], err), (0, "updated", ""))
-        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-20.4"))
+        self.assertEqual(tp.read_marker(self.page_text()), (self.ME, "tutorial.2026-11-21.2"))
         writes = self.writes_since(n)
         self.assertEqual([w[0] for w in writes], ["replace"])
         self.assertEqual(writes[0][2], len(mine.encode()))  # one replace whose needle is the whole page
@@ -1411,7 +1448,7 @@ class IfNewerTest(_Cli):
     def test_a_page_no_call_can_hold_is_refused_and_left_as_is(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        self.newer = self.write_list("tutorial.2026-11-20.4")
+        self.newer = self.write_list("tutorial.2026-11-21.2")
         for budget in (self.SMALL, (70_000, 140_000)):
             with self.subTest(budget=budget):
                 mine, target, theirs, calls, code, out, err = self.edited_run(
@@ -1431,7 +1468,7 @@ class IfNewerTest(_Cli):
         first write, read:3 the read-back after it."""
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        self.newer = self.write_list("tutorial.2026-11-20.4")
+        self.newer = self.write_list("tutorial.2026-11-21.2")
         for budget in (self.SMALL, self.SPLIT):
             for hook in ("read:2", "read:3"):
                 with self.subTest(budget=budget, hook=hook):
@@ -1453,7 +1490,7 @@ class IfNewerTest(_Cli):
     def test_an_owner_prepend_while_a_cut_short_rewrite_resumes_stays_at_the_front(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        newer = self.write_list("tutorial.2026-11-20.4")
+        newer = self.write_list("tutorial.2026-11-21.2")
         for hook in ("read:1", "read:2"):
             with self.subTest(hook=hook):
                 (self.tmp / "room.json").unlink(missing_ok=True)
@@ -1487,7 +1524,7 @@ class IfNewerTest(_Cli):
     def test_a_replace_that_cannot_be_taken_back_is_reported_as_landed(self):
         prompts = self.tmp / "p.json"
         prompts.write_text(json.dumps({"dm": "Draft my update."}))
-        self.newer = self.write_list("tutorial.2026-11-20.4")
+        self.newer = self.write_list("tutorial.2026-11-21.2")
         real = gs.fits_call
         # The undo's call (the shorter first piece back to the whole old page) does not fit this host.
         fits = mock.patch.object(gs, "fits_call", lambda a, b, env=None: real(a, b, env) and len(a) >= len(b))
@@ -1598,9 +1635,9 @@ class IfNewerTest(_Cli):
         commons = gs.Commons(self.stub, self.ROOM, actions=lambda: self.door)
         out = gs.publish(commons, marker, "Blue", core="codex", agent=self.ME)
         self.assertEqual(out["revision"], tp.FEATURES.revision)
-        other = tp.FeatureList("tutorial.2026-11-20.4", tp.FEATURES.steps)
+        other = tp.FeatureList("tutorial.2026-11-21.2", tp.FEATURES.steps)
         out = gs.publish(commons, marker, "Blue", core="codex", agent=self.ME, features=other, if_newer=True)
-        self.assertEqual((out["action"], out["revision"]), ("updated", "tutorial.2026-11-20.4"))
+        self.assertEqual((out["action"], out["revision"]), ("updated", "tutorial.2026-11-21.2"))
         out = gs.publish(commons, marker, "Kai", core="codex", agent=self.ME, features=other, if_newer=True)
         self.assertEqual(out["action"], "unchanged")
 
@@ -1657,9 +1694,9 @@ class UploadTest(_Cli):
         # The text page (under 40 KB, as test_a_fully_mapped_page_shrinks_to_text pins) plus the
         # inlined app icon, about 18 KB of base64.
         icon = sum(len(base64.b64encode((tp.ASSETS / f).read_bytes())) for f in ("app-icon.png", "app-store-qr.png"))
-        self.assertLess(len(page.encode("utf-8")) - icon, 77_000)
-        self.assertLess(len(page.encode("utf-8")), 97_000)
-        self.assertEqual(page.count('<img src="mxc://'), 13)
+        self.assertLess(len(page.encode("utf-8")) - icon, 90_000)
+        self.assertLess(len(page.encode("utf-8")), 110_000)
+        self.assertEqual(page.count('<img src="mxc://'), 12)
         self.assertNotIn("data:image/jpeg", page)
         self.assertEqual(page.count('<img src="data:image/png;base64,'), 2)  # the app icon and QR stay inline
         self.assertEqual(fake.checks, 1)
@@ -1668,7 +1705,7 @@ class UploadTest(_Cli):
             self.assertEqual(digest, hashlib.sha256((tp.ASSETS / self.HD[asset]).read_bytes()).hexdigest())
             self.assertEqual(op, gs.media_op_id(self.ROOM, asset, digest))
             self.assertEqual(self.entry()["media"][asset], {"mxc": "mxc://ag2.example/" + op[-24:], "sha256": digest})
-        self.assertEqual(len({op for _, _, _, op, _ in fake.uploads}), 13)
+        self.assertEqual(len({op for _, _, _, op, _ in fake.uploads}), 12)
         self.assertNotEqual(gs.media_op_id("!other:example.test", "room-list-add", "0" * 64),
                             gs.media_op_id(self.ROOM, "room-list-add", "0" * 64))
 
@@ -1717,9 +1754,9 @@ class UploadTest(_Cli):
         self.assertEqual((code, got["action"]), (0, "created"))
         self.assertEqual(got["upload"]["fallback"], ["commons-surfaces"])
         self.assertIn("commons-surfaces: room.media.upload failed", got["upload"]["reason"])
-        self.assertEqual(len(got["upload"]["uploaded"]), 12)
+        self.assertEqual(len(got["upload"]["uploaded"]), 11)
         page = self.page_text()
-        self.assertEqual(page.count('<img src="mxc://'), 12)
+        self.assertEqual(page.count('<img src="mxc://'), 11)
         self.assertEqual(page.count('<img src="data:image/jpeg;base64,'), 1)
         self.assertIn('<img src="data:image/jpeg;base64,' + base64.b64encode(
             (tp.ASSETS / "commons-surfaces.jpg").read_bytes()).decode("ascii"), page)
@@ -1794,8 +1831,8 @@ class UploadTest(_Cli):
         (self.tmp / "room.json").write_text(json.dumps(db))
         code, out, _ = self.publish("--audience", "room")
         got = json.loads(out)
-        self.assertEqual((code, got["action"], len(got["upload"]["uploaded"])), (0, "updated", 13))
-        self.assertEqual(self.page_text().count('<img src="mxc://'), 13)
+        self.assertEqual((code, got["action"], len(got["upload"]["uploaded"])), (0, "updated", 12))
+        self.assertEqual(self.page_text().count('<img src="mxc://'), 12)
 
     def test_no_upload_and_explicit_media(self):
         fake = self.with_media(FakeMedia())
@@ -1810,11 +1847,11 @@ class UploadTest(_Cli):
         got = json.loads(out)
         self.assertEqual((code, got["action"]), (0, "updated"))
         self.assertNotIn("room-list-add", [u[1] for u in fake.uploads])
-        self.assertEqual(len(fake.uploads), 12)
+        self.assertEqual(len(fake.uploads), 11)
         self.assertIn(f'<img src="{MXC_OF["room-list-add"]}"', self.page_text())
         self.assertEqual(self.entry()["media"]["room-list-add"], MXC_OF["room-list-add"])
         code, out, _ = self.publish()
-        self.assertEqual((json.loads(out)["action"], len(fake.uploads)), ("unchanged", 12))
+        self.assertEqual((json.loads(out)["action"], len(fake.uploads)), ("unchanged", 11))
 
     def test_room_media_loads_beside_room_commons_on_its_actions_client(self):
         (self.tmp / "room_media.py").write_text(
@@ -1831,8 +1868,14 @@ class UploadTest(_Cli):
 class DocTest(unittest.TestCase):
     SKILL = tp.LIST_PATH.parent / "SKILL.md"
 
+    PUBLISHER = HERE.parent / "docs" / "tutorial-publisher.md"
+
     def test_skill_md_describes_the_list_workflow_the_revision_rule_and_the_visuals_follow_up(self):
-        text = self.SKILL.read_text(encoding="utf-8")
+        # SKILL.md keeps the steps; the publisher internals it links live in docs/tutorial-publisher.md.
+        skill = self.SKILL.read_text(encoding="utf-8")
+        self.assertIn("docs/tutorial-publisher.md", skill)
+        self.assertLess(len(skill.splitlines()), 140)
+        text = skill + self.PUBLISHER.read_text(encoding="utf-8")
         self.assertIn("feature-list.json", text)
         self.assertIn("--if-newer", text)
         self.assertIn("--list", text)
