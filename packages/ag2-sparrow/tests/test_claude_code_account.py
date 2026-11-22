@@ -4,9 +4,11 @@ again. Claude Code is a stand-in script here: no real sign-in."""
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -28,6 +30,12 @@ fi
 if [ "$1 $2" = "auth login" ]; then
   echo "login $*" >> "$d/stub-logins"
   [ -f "$d/stub-login-fails" ] && exit 1
+  if [ -f "$d/stub-wants-code" ]; then
+    [ -f "$d/stub-no-link" ] && exit 4
+    printf 'Opening browser to sign in\nIf the browser did not open, visit:\n\033[1mhttps://claude.ai/oauth/authorize?code=true&state=s1\033[0m\nPaste code here if prompted > '
+    read code || exit 5
+    [ "$code" = "good-code#s1" ] || { echo "Couldn't log in: That code wasn't accepted."; exit 1; }
+  fi
   echo '{"loggedIn": true, "authMethod": "claude.ai", "email": "bob@example.org", "subscriptionType": "max"}' > "$d/account.json"
   exit 0
 fi
@@ -114,6 +122,94 @@ class SignIn(Base):
                 account.sign_in(cfg, env)
             self.assertEqual(str(refused.exception), why)
         self.assertFalse((self.dir / "stub-logins").exists())
+
+
+class TwoSteps(Base):
+    """A sign-in by someone who is not at the computer: a link out, the page's code back in."""
+
+    def setUp(self):
+        super().setUp()
+        (self.dir / "stub-wants-code").write_text("")
+        self.wait = self.tmp / "account-sign-in"
+        self.addCleanup(account.cancel, self.wait)
+
+    def test_start_gives_the_link_and_the_right_code_signs_the_agent_in(self):
+        link = account.start(self.cfg, self.env, self.wait)
+        self.assertEqual(link, "https://claude.ai/oauth/authorize?code=true&state=s1")
+        self.assertTrue(account.waiting(self.wait))
+        self.assertEqual(account.give_code(self.wait, "  good-code#s1\n"), (True, ""))
+        self.assertEqual(account.status(self.cfg, self.env)["account"], "b\u2026@example.org")
+        # Nothing of the sign-in is left behind, the code least of all.
+        self.assertFalse(self.wait.exists())
+        self.assertEqual(account.give_code(self.wait, "good-code#s1"), (False, account.NOT_WAITING))
+
+    def test_a_wrong_code_is_refused_in_claude_codes_words_and_ends_the_sign_in(self):
+        account.start(self.cfg, self.env, self.wait)
+        self.assertEqual(account.give_code(self.wait, "wrong-code#s1"), (False, "Couldn't log in: That code wasn't accepted."))
+        self.assertFalse(account.waiting(self.wait))
+        self.assertEqual(account.words(account.status(self.cfg, self.env)), "I'm not signed in.")
+        # What is not a code at all never reaches the waiting sign-in.
+        account.start(self.cfg, self.env, self.wait)
+        for bad in ("", "short", "two words here", "x" * 3000, "caf\u00e9-code-12345"):
+            self.assertIn("does not look like", account.give_code(self.wait, bad)[1], bad)
+        self.assertTrue(account.waiting(self.wait))
+
+    def test_a_second_start_replaces_the_first_and_cancel_ends_it(self):
+        account.start(self.cfg, self.env, self.wait)
+        first = json.loads((self.wait / "pids.json").read_text())
+        account.start(self.cfg, self.env, self.wait)
+        second = json.loads((self.wait / "pids.json").read_text())
+        self.assertNotEqual(first["supervisor"], second["supervisor"])
+        for _ in range(50):
+            if not account._alive(first["claude"]):
+                break
+            time.sleep(0.1)
+        self.assertFalse(account._alive(first["claude"]), "the first sign-in was ended")
+        self.assertEqual((account.cancel(self.wait), account.cancel(self.wait), account.waiting(self.wait)), (True, False, False))
+
+    def test_a_sign_in_that_gives_no_link_or_is_not_allowed_leaves_nothing_waiting(self):
+        (self.dir / "stub-no-link").write_text("")
+        with self.assertRaises(account.Refused) as refused:
+            account.start(self.cfg, self.env, self.wait)
+        self.assertIn("gave no link", str(refused.exception))
+        self.assertFalse(self.wait.exists())
+        for cfg, env, why in (({"CLAUDE": self.cfg["CLAUDE"]}, self.env, account.SHARED),
+                              (self.cfg, dict(self.env, ANTHROPIC_BASE_URL="http://localhost:7846"), account.PROXIED)):
+            with self.assertRaises(account.Refused) as refused:
+                account.start(cfg, env, self.wait)
+            self.assertEqual(str(refused.exception), why)
+        gone = mock.Mock(side_effect=OSError("no python"))
+        with self.assertRaises(account.Refused) as refused:
+            account.start(self.cfg, self.env, self.wait, popen=gone)
+        self.assertIn("could not be started", str(refused.exception))
+        self.assertFalse(self.wait.exists())
+
+    def test_a_sign_in_nobody_finishes_is_ended_and_the_late_code_is_told_so(self):
+        self.wait.mkdir()
+        os.mkfifo(str(self.wait / "code"))
+        (self.wait / "out.log").touch()
+        with mock.patch.dict(os.environ, self.env):
+            self.assertEqual(account.supervise(str(self.wait), self.cfg["CLAUDE"], "claudeai", wait_s=0.5), 0)
+        self.assertEqual(json.loads((self.wait / "result.json").read_text()), {"exit": "timeout"})
+        self.assertEqual(account.give_code(self.wait, "good-code#s1"), (False, account.NOT_WAITING))
+
+    def test_the_command_runs_both_steps_and_takes_the_code_from_standard_input(self):
+        cmd = Command("run_")
+        cmd.cfg, cmd.env, cmd.dir = self.cfg, self.env, self.dir
+        with mock.patch.object(cli, "config_dir", return_value=self.tmp):
+            rc, out = cmd.run_("--start")
+            self.assertEqual((rc, out["link"]), (0, "https://claude.ai/oauth/authorize?code=true&state=s1"))
+            self.assertIn(out["link"], out["say"])
+            with mock.patch.object(sys, "stdin", io.StringIO("good-code#s1\n")):
+                rc, out = cmd.run_("--code")
+            self.assertEqual((rc, out["changed"], out["account"]), (0, "account", "b\u2026@example.org"))
+            with mock.patch.object(sys, "stdin", io.StringIO("good-code#s1\n")):
+                rc, out = cmd.run_("--code")
+            self.assertEqual((rc, out["detail"]), (1, account.NOT_WAITING))
+            cmd.run_("--start")
+            self.assertEqual(cmd.run_("--cancel"), (0, {"changed": "", "cancelled": True}))
+            rc, out = cmd.run_("--start", env=dict(self.env, ANTHROPIC_BASE_URL="http://localhost:7846"))
+            self.assertEqual((rc, out["detail"]), (1, account.PROXIED))
 
 
 class Command(Base):

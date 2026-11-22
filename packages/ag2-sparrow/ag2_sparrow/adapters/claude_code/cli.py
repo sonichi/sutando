@@ -683,6 +683,10 @@ def account_env(cfg: dict, local) -> dict:
     return env
 
 
+START_SAY = ("Open this link and sign in, then send me the code the page shows, in this DM (the link works for "
+             "10 minutes): %s")
+
+
 def account(args) -> int:
     """Print the Anthropic account of the agent's Claude config dir, or sign it in again in the browser
     of this computer. A new sign-in applies when the session next starts."""
@@ -694,9 +698,22 @@ def account(args) -> int:
         print(f"error: {problem}", file=sys.stderr)
         return EXIT_UNUSABLE
     env, changed = account_env(cfg, local), ""
-    if args.switch:
+    waiting = config_dir(local) / "account-sign-in"
+    if args.cancel:
+        print(json.dumps({"changed": "", "cancelled": accounts.cancel(waiting)}))
+        return 0
+    if args.start:
         try:
-            ok, detail = accounts.sign_in(cfg, env, console=args.console)
+            link = accounts.start(cfg, env, waiting, console=args.console)
+        except accounts.Refused as e:
+            print(json.dumps({"changed": "", "detail": str(e), **accounts.status(cfg, env)}))
+            return 1
+        print(json.dumps({"changed": "", "link": link, "say": START_SAY % link}))
+        return 0
+    if args.switch or args.code:
+        try:
+            ok, detail = (accounts.give_code(waiting, sys.stdin.readline()) if args.code else
+                          accounts.sign_in(cfg, env, console=args.console))
         except accounts.Refused as e:
             ok, detail = False, str(e)
         if not ok:
@@ -849,8 +866,13 @@ def main(argv=None) -> int:
     a.add_argument("--switch", action="store_true", help="sign in again: Claude Code's sign-in page opens in the browser "
                    "of this computer, and the command waits until it is finished there. Refused for an agent behind "
                    "the credential proxy, whose own sign-in decides the account")
-    a.add_argument("--console", action="store_true", help="with --switch: sign in with an Anthropic Console account "
-                   "in place of a Claude subscription")
+    a.add_argument("--start", action="store_true", help="sign in again from anywhere, step 1: print the link of the "
+                   "sign-in page and leave the sign-in waiting 10 minutes for its code")
+    a.add_argument("--code", action="store_true", help="step 2: read the code the sign-in page showed from standard "
+                   "input (never an argument) and finish the waiting sign-in")
+    a.add_argument("--cancel", action="store_true", help="end a waiting sign-in")
+    a.add_argument("--console", action="store_true", help="with --switch or --start: sign in with an Anthropic Console "
+                   "account in place of a Claude subscription")
     a.set_defaults(func=account)
     agent_option(sub.add_parser("uninstall", help="stop the job and the session, then remove what install wrote "
                                 "(config last)")).set_defaults(func=uninstall)
