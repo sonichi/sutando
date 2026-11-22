@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "hitl_id": "hr_01J9Z8K2",
+  "incident": "inc_1026786a",
+  "action_id": "switch_model:sonnet",
+  "outcome": "done",
+  "reason": null,
+  "at": 1763730420,
+  "recovery": {"state": "running", "model": "sonnet"}
+}
