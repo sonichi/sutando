@@ -30,9 +30,15 @@ NAME = "Claude Code"
 CHOICES = (("default", "Default"), ("opus", "Opus"), ("sonnet[1m]", "Sonnet (1M context)"),
            ("haiku", "Haiku"), ("fable[1m]", "Fable (1M context)"))
 ALLOWED = frozenset(mid for mid, _ in CHOICES)
-APPLY_DELAY_S, APPLY_TRIES, APPLY_RETRY_S = 2.0, 3, 5.0
-# The live switch's answers worth another try: the box held a draft, or the switch was not seen in time.
-RETRYABLE = ("unsent text", "unconfirmed", "does not show its whole input box")
+APPLY_DELAY_S, APPLY_TRIES = 2.0, 3
+# The session may be in a long turn: the switch waits for it to go idle, polling, for up to this long in
+# all (every try included), and only then says it could not switch, and why.
+IDLE_WAIT_S, IDLE_POLL_S = 300.0, 5.0
+# The live switch's answers worth another try, and the reason told when the last try still gives one.
+RETRYABLE = {"unsent text": "your message box in the session held unsent text",
+             "does not show its whole input box": "the session's screen could not be read",
+             "unconfirmed": "Claude Code did not confirm the switch"}
+BUSY = "the session stayed busy with a turn for 5 minutes"
 
 
 def log(*parts):
@@ -95,9 +101,27 @@ def start_apply(root, popen=subprocess.Popen, environ=None) -> None:
         log("apply did not start:", "%s: %s" % (type(e).__name__, e))
 
 
-def apply(root, cfg: dict, config_dir, *, launcher_factory=None, sleep=time.sleep) -> str:
-    """Switch the session to the owner's wanted model, then tell them in the DM whether it took: the
-    `ModelSwitch.tell` outcome, '' when nothing is wanted."""
+def busy(root) -> bool:
+    """Whether the session is in a task's turn (an offer in flight in the Mod's record); an unreadable
+    record counts as busy, so nothing is typed into a turn this cannot see."""
+    try:
+        return bool(records.load_plugin(root).get("inflight"))
+    except Exception:  # noqa: BLE001 - unknown is not idle
+        return True
+
+
+def wait_idle(root, deadline: float, clock=time.monotonic, sleep=time.sleep) -> bool:
+    """Poll until the session is out of a task's turn; False when `deadline` came first."""
+    while busy(root):
+        if clock() >= deadline:
+            return False
+        sleep(min(IDLE_POLL_S, max(0.0, deadline - clock())))
+    return True
+
+
+def apply(root, cfg: dict, config_dir, *, launcher_factory=None, sleep=time.sleep, clock=time.monotonic) -> str:
+    """Switch the session to the owner's wanted model once it is idle, then tell them in the DM whether it
+    took, and why not when it did not: the `ModelSwitch.tell` outcome, '' when nothing is wanted."""
     ms = switcher(root, cfg)
     wanted = ms.pending(ms.state())
     if not wanted:
@@ -106,16 +130,26 @@ def apply(root, cfg: dict, config_dir, *, launcher_factory=None, sleep=time.slee
         from .launcher import Launcher as launcher_factory
     lc = launcher_factory(cfg, Path(config_dir))
     sleep(APPLY_DELAY_S)          # the claim that started this returns first, and the Mod moves on
-    switched, line = False, ""
+    deadline = clock() + IDLE_WAIT_S
+    switched, why = False, ""
     for n in range(APPLY_TRIES):
+        if not wait_idle(root, deadline, clock, sleep):
+            why = BUSY
+            log("switch to", wanted, "-> not sent:", BUSY)
+            break
         switched, line = lc.switch_model(records.load_supervisor(root), wanted, confirm=True)
         log("switch to", wanted, "->", line)
-        if switched or not any(r in line for r in RETRYABLE) or n + 1 == APPLY_TRIES:
+        if switched:
+            why = ""
             break
-        sleep(APPLY_RETRY_S)
+        retry = next((r for key, r in RETRYABLE.items() if key in line), "")
+        why = retry or line.split(";")[0][:120]
+        if not retry or n + 1 == APPLY_TRIES:
+            break
+        sleep(IDLE_POLL_S)
     before = str(ms.state().get("current") or "")
     ran = wanted if switched else (before if before != wanted else "")
-    return ms.tell(True, ran)
+    return ms.tell(True, ran, why=why)
 
 
 def main(argv=None) -> int:

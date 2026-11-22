@@ -158,7 +158,8 @@ class Apply(Base):
         self.assertEqual(model_card.apply(self.root, cfg, self.home, launcher_factory=lc, sleep=lambda s: None),
                          "not-switched")
         self.assertEqual(len(lc.calls), model_card.APPLY_TRIES)
-        self.assertIn("I could not switch to Haiku", self.queued()[-1]["card"]["text"])
+        self.assertIn("I could not switch to Haiku (Claude Code did not confirm the switch). I'm still using Default.",
+                      self.queued()[-1]["card"]["text"])
         self.assertEqual(model_card.turn_model(self.root, cfg), "")
 
     def test_a_refusal_that_another_try_cannot_change_is_not_retried(self):
@@ -205,6 +206,44 @@ class Apply(Base):
             self.assertEqual(model_card.turn_model(self.root, cfg), "")
         with mock.patch.object(connector_cards, "absorb", side_effect=OSError("ledger")):
             self.assertEqual(model_card.card_matter(self.root, self.task("task-z", "hello"), cfg), ("", ""))
+
+    def clock(self):
+        now = [0.0]
+        return now, (lambda: now[0]), (lambda secs: now.__setitem__(0, now[0] + secs))
+
+    def test_a_long_turn_is_waited_out_then_the_switch_is_made(self):
+        cfg = self.picked()
+        now, clock, sleep = self.clock()
+        states = iter([True] * 30 + [False] * 10)
+        lc = self.Launcher([(True, "switched to opus")])
+        with mock.patch.object(model_card, "busy", lambda root: next(states)):
+            outcome = model_card.apply(self.root, cfg, self.home, launcher_factory=lc, sleep=sleep, clock=clock)
+        self.assertEqual((outcome, len(lc.calls)), ("switched", 1))
+        self.assertGreaterEqual(now[0], 30 * model_card.IDLE_POLL_S, "it waited for the turn to end")
+        self.assertLess(now[0], model_card.IDLE_WAIT_S + model_card.APPLY_DELAY_S + 1)
+
+    def test_a_session_busy_past_the_wait_is_told_not_switched_and_why(self):
+        cfg = self.picked()
+        now, clock, sleep = self.clock()
+        lc = self.Launcher([])
+        with mock.patch.object(model_card, "busy", lambda root: True):
+            outcome = model_card.apply(self.root, cfg, self.home, launcher_factory=lc, sleep=sleep, clock=clock)
+        self.assertEqual((outcome, lc.calls), ("not-switched", []), "nothing typed into a busy session")
+        self.assertGreaterEqual(now[0], model_card.IDLE_WAIT_S)
+        self.assertIn("I could not switch to Opus (%s)." % model_card.BUSY, self.queued()[-1]["card"]["text"])
+
+    def test_an_offer_in_flight_or_an_unreadable_record_is_busy(self):
+        self.assertFalse(model_card.busy(self.root))
+        with mock.patch.object(model_card.records, "load_plugin", return_value={"inflight": {"task-a": {}}}):
+            self.assertTrue(model_card.busy(self.root))
+        with mock.patch.object(model_card.records, "load_plugin", side_effect=model_card.records.RecordError("bad")):
+            self.assertTrue(model_card.busy(self.root))
+
+    def test_an_unknown_refusal_is_told_by_its_first_clause(self):
+        cfg = self.picked()
+        lc = self.Launcher([(False, "busy: another pane-key sender holds the guard; /model not sent, retry later")])
+        model_card.apply(self.root, cfg, self.home, launcher_factory=lc, sleep=lambda s: None)
+        self.assertIn("(busy: another pane-key sender holds the guard)", self.queued()[-1]["card"]["text"])
 
 if __name__ == "__main__":
     unittest.main()
