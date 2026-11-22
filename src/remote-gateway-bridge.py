@@ -385,11 +385,11 @@ def _lane_dedupe_gate(task: dict):
     """A message another of this install's lanes queued, or one the lane its owner names will answer;
     seats are other agents, never asked."""
     import lane_dedupe
-    # An agent we cannot name claims for this lane alone: at worst a duplicate, never a drop.
-    group = lane_dedupe.lane_scope(GATEWAY_INSTANCE)  # noqa: F821
+    # The startup worker scopes the claim even without a record; else this lane alone (never a drop).
+    group = _LANE_WORKER or lane_dedupe.lane_scope(GATEWAY_INSTANCE)  # noqa: F821
     try:
         from connections import event_owner_lanes, lane_agent_group
-        agent = lane_agent_group(GATEWAY_INSTANCE, WS)  # noqa: F821
+        agent = _LANE_WORKER or lane_agent_group(GATEWAY_INSTANCE, WS)  # noqa: F821
         if agent is not None:
             group = agent
         owners = event_owner_lanes(task, WS, group=agent)

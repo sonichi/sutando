@@ -425,6 +425,17 @@ def main():
         on_lane("unknownlane", "task-G9", source_message_id="$ag3", access_tier="owner", **room)
         check("an unreadable agent on a lane keeps its copy rather than folding into the core's",
               (rgb.TASKS_DIR / "task-G8.txt").exists() and (rgb.TASKS_DIR / "task-unknownlane~task-G9.txt").exists())
+        # A worker resolved at startup keeps its scope when the record is gone (it reads as the core's then).
+        connections.lane_agent_group = lambda inst, ws=None: ""
+        real_worker = rgb._LANE_WORKER
+        on_lane("", "task-G10", source_message_id="$ag4", access_tier="owner", **room)
+        rgb._LANE_WORKER = "w3"
+        try:
+            on_lane("startlane", "task-G11", source_message_id="$ag4", access_tier="owner", **room)
+        finally:
+            rgb._LANE_WORKER = real_worker
+        check("a startup-resolved worker with no connection record keeps its own copy after the core's claim",
+              (rgb.TASKS_DIR / "task-G10.txt").exists() and (rgb.TASKS_DIR / "task-startlane~task-G11.txt").exists())
     finally:
         connections.lane_agent_group = real_group
 
