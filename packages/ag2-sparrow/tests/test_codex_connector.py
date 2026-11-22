@@ -854,7 +854,7 @@ class ModelCardTest(unittest.TestCase):
         self.assertEqual((card["state"], metrics(self.work)[-1]["model_switch"]), ("error", "not-switched"))
         self.assertIn("I could not switch to Stub Broken. I'm still using Stub Model.", card["text"])
         self.serve("task-4", "again")
-        self.assertEqual((self.posted(), self.state().get("untold")), ([], None), "told once")
+        self.assertEqual((self.posted(), self.state().get("untold")), ([], []), "told once")
 
 
     def test_a_model_codex_moved_the_turn_to_is_never_taken_for_the_owners_pick(self):
@@ -904,7 +904,7 @@ class ModelCardTest(unittest.TestCase):
         with mock.patch.object(model_switch.ModelSwitch, "card", side_effect=ValueError("bad name")):
             self.assertEqual(c.models.tell(True, ""), "not-switched")
         self.assertIn("I could not switch to Stub 5", c.models.unsaid())
-        self.assertEqual((c.models.state().get("untold"), c.models.unsaid()), (None, ""))
+        self.assertEqual((c.models.state().get("untold"), c.models.unsaid()), ([], ""))
 
 
 class FakeRpc:

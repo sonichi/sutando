@@ -15,6 +15,7 @@ from . import connector_cards
 
 FILE, CARD, ASK = "model.json", "model-switch", "/model"
 BUTTONS = 6          # the card's button limit
+UNTOLD_KEEP = 5      # outcome notices kept while their cards cannot be queued
 # How the owner asks in their own words: the runtime answers with the mark alone, and the card is shown.
 MARK = "[model-card]"
 HINT = ("If the person asks to change, switch or choose the model you run on, or which models you have, "
@@ -252,33 +253,34 @@ class ModelSwitch:
         return "model-card-elsewhere"
 
     def tell(self, live, ran) -> str:
-        """Once per pick, after the first owner turn that reached the runtime (`live`): say in the DM the
-        pick was made in whether the switch happened (`ran` is the model that turn ran on). The state is
-        settled at once (a refused switch is dropped, never asked for again); an outcome whose card could
-        not be queued is kept apart and told after a later turn. '' when there was nothing to tell."""
+        """After an owner turn that reached the runtime (`live`): settle the pick it ran with (`ran` is the
+        model that turn ran on), then say in the DM each outcome not yet told, oldest first. The state is
+        settled whatever happens to the telling (a refused switch is dropped, never asked for again); a
+        notice whose card cannot be queued stays owed, the newest UNTOLD_KEEP of them, and one that cannot
+        be drawn is said in words once. '' when there was nothing to settle or tell."""
         state = self.state()
-        owed = state.get("untold") if isinstance(state.get("untold"), dict) else None
-        if owed:
-            told = {"picked": str(owed.get("picked") or ""), "ran": str(owed.get("ran") or "")}
-            card = self.built(state, **told)
-            if card is None:        # never buildable: said in words once, not retried
-                self._unsaid = self.words(state, **told)
-            elif not self.post(owed.get("room"), card):
-                return "untold"
-            self.save(untold=None)
-            return "switched" if owed.get("picked") == owed.get("ran") else "not-switched"
-        wanted = str(state.get("wanted") or "")
-        if not wanted or state.get("told") == wanted or not live:
-            return ""
-        switched, ran = ran == wanted, ran or ""
-        card = self.built(state, picked=wanted, ran=ran)
-        if card is None:
-            self._unsaid = self.words(state, picked=wanted, ran=ran)
-        queued = card is None or self.post(state.get("asked_in"), card)
-        # Settled at once. Only a confirmed pick becomes the model in use: a model the runtime moved the turn
-        # to was never picked. An outcome whose card could not be queued is kept, to tell later.
-        self.save(told=wanted, **({"current": wanted, "confirmed": wanted} if switched else {"wanted": ""}),
-                  untold=None if queued else {"picked": wanted, "ran": ran, "room": state.get("asked_in")})
-        if not queued:
-            return "untold"
-        return "switched" if switched else "not-switched"
+        kept = state.get("untold")
+        owed = [o for o in (kept if isinstance(kept, list) else [kept]) if isinstance(o, dict)]
+        wanted, outcome, changes = str(state.get("wanted") or ""), "", {}
+        if wanted and state.get("told") != wanted and live:
+            ran = ran or ""
+            outcome = "switched" if ran == wanted else "not-switched"
+            owed.append({"picked": wanted, "ran": ran, "room": state.get("asked_in")})
+            # Only a confirmed pick becomes the model in use: a model the runtime moved the turn to was never picked.
+            changes = dict(told=wanted, **({"current": wanted, "confirmed": wanted} if outcome == "switched"
+                                           else {"wanted": ""}))
+        told, words = "", []
+        while owed:
+            first = {"picked": str(owed[0].get("picked") or ""), "ran": str(owed[0].get("ran") or "")}
+            card = self.built(state, **first)
+            if card is None:
+                words.append(self.words(state, **first))
+            elif not self.post(owed[0].get("room"), card):
+                break
+            owed.pop(0)
+            told = "switched" if first["picked"] == first["ran"] else "not-switched"
+        self._unsaid = " ".join(words)
+        owed = owed[-UNTOLD_KEEP:]
+        if changes or owed != ([] if kept is None else kept):
+            self.save(untold=owed, **changes)
+        return "untold" if owed else (outcome or told)
