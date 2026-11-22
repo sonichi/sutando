@@ -30,6 +30,7 @@ Format: `- Brief description of what changed. ([#NNN])`
 
 ## Fixed
 
+- model-switch: two quick taps on the core's model card now end on the model tapped last. Each tap starts its own detached switch, in no fixed order; an older switch that ran last left the core on a model the card did not show (its outcome is superseded and never posted). Switches now run one at a time (`model_card.py turn`), and only the newest accepted attempt's switch runs.
 - ag2-sparrow (antigravity-local): images and files people send now reach Antigravity: images as ACP image blocks in the prompt (when agy declares `image`), and on the owner's turn a read-only copy of the task's own files in a folder agy may read (`additionalDirectories`) but never change; an isolated non-owner turn gets the images only. The owner's final message keeps its delivery markers (`[channel:]`, `[thread]`, `[file:]` for a file under the working directory only), as Claude Code and Codex results do; non-owners' markers stay neutralised. A bridge launched without `REMOTE_MEDIA_MARKER` (the desktop's and connect's seat bridges) now resolves the AG2 Space gateway's `[ag2space-media: …]` marker too, so its download reaches every local adapter.
 
 <!-- fix() PRs go here -->

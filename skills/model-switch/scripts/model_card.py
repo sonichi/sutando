@@ -18,7 +18,9 @@ list is built in: with no readable choices the menu is not posted. `reply` handl
 (agent_card.click_verdict decides): it starts `switch-model.sh <id> --confirm` detached, because the
 core's CLI takes /model only after the current turn ends. Each tap is one attempt with its own id: the
 "switching" card is posted first, then the switch is started, so its outcome can only come after.
-The detached line always ends in `settle` with the switch's exit code and the attempt's id. `settle`
+The detached line runs the switch through `turn`, one at a time and only for the newest attempt
+(an older one started late is skipped, so the core is never left on a model the card does not
+show), and always ends in `settle` with the exit code and the attempt's id. `settle`
 saves the outcome in `<workspace>/state/model-card-outcome.json`, then posts it in the same DM:
 "Switched. I'm now using X." or "I could not switch to X. I'm still using Y. <reason>". A post that
 fails is tried again a few times; an outcome still untold is posted by the next `post` or `reply`
@@ -87,9 +89,13 @@ REASONS = {1: "the switch could not be locked or recorded",
            8: "the core did not accept the switch in time",
            9: "the core is running, so its settings were left alone",
            10: "the model is set for the next start, but the core did not start"}
-# The detached line: the switch, then always the outcome card with the switch's exit code.
-DETACHED = ('bash "$1" "$2" --confirm --accept-timeout "$3" --state-dir "$4"; '
+# The detached line: the switch in its turn (`turn` runs it only for the newest attempt), then always
+# the outcome card with the exit code.
+DETACHED = ('"$5" "$6" --workspace "$7" turn --attempt "$9" -- '
+            'bash "$1" "$2" --confirm --accept-timeout "$3" --state-dir "$4"; '
             '"$5" "$6" --workspace "$7" settle --room "$8" --model "$2" --attempt "$9" --rc $?')
+TURN_LOCK = ("state", "model-card-turn.lock")
+SKIPPED_RC = 75      # `turn` did not run the switch: a newer attempt had been accepted
 
 
 def _emit(payload: dict, code: int = 0) -> int:
@@ -449,6 +455,22 @@ def cmd_reply(ws: Path, args, *, core=None, execute=None, popen=subprocess.Popen
     return _emit(out)
 
 
+def cmd_turn(ws: Path, args, *, call=subprocess.call) -> int:
+    """Run an attempt's switch in its turn, one at a time, and only while it is the newest accepted
+    attempt. Two taps start two detached lines in no fixed order: without this the older switch could
+    run last, leaving the core on a model the card does not show (its outcome is superseded and
+    never posted). The command's exit code, or SKIPPED_RC when it was not run."""
+    from file_lock import locked_file
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    with locked_file(ws.joinpath(*TURN_LOCK)):
+        rows = outcomes(ws)
+        at = next((i for i, r in enumerate(rows) if r["attempt"] == args.attempt), None)
+        if at is not None and at + 1 < len(rows):
+            print(f"model-card: attempt {args.attempt} is not the newest; its switch is not run", flush=True)
+            return SKIPPED_RC
+        return int(call(command))
+
+
 def cmd_settle(ws: Path, args, *, core=None, execute=None, now=time.time, sleep=time.sleep) -> int:
     out = settle_attempt(ws, args.attempt or new_attempt(now()), args.room, args.model, args.rc, core=core,
                          execute=execute, now=now, sleep=sleep, tries=SETTLE_TRIES, pause=SETTLE_PAUSE_S)
@@ -470,6 +492,9 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, sleep=ti
     t.add_argument("--model", required=True)
     t.add_argument("--rc", required=True, type=int)
     t.add_argument("--attempt", default="")
+    u = sub.add_parser("turn")
+    u.add_argument("--attempt", required=True)
+    u.add_argument("command", nargs=argparse.REMAINDER)
     sub.add_parser("status")
     args = p.parse_args(argv)
     if args.workspace:
@@ -483,6 +508,8 @@ def main(argv=None, *, core=None, execute=None, popen=subprocess.Popen, sleep=ti
         return cmd_reply(ws, args, core=core, execute=execute, popen=popen)
     if args.cmd == "settle":
         return cmd_settle(ws, args, core=core, execute=execute, sleep=sleep)
+    if args.cmd == "turn":
+        return cmd_turn(ws, args)
     return _emit(current_model(ws))
 
 

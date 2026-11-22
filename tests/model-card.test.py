@@ -45,6 +45,10 @@ import connections  # noqa: E402
 DM, ROOM, OWNER = "!dm:s.space", "!team:s.space", "@owner:s.space"
 CORE = {"instance": "s_dspace", "owner_mxid": OWNER, "agent_mxid": "@owner-mini.agent:s.space"}
 SIMPLE = "opus=Opus;sonnet=Sonnet;fable=Fable;default=Default"
+# A stand-in for the interpreter in the detached line: `turn` runs the command after "--", as the
+# real one does when the attempt is the newest; any other call says what it was given.
+TURN_THEN_ECHO = ('#!/bin/sh\ncase " $* " in *" turn "*) echo "turn $6"; while [ "$1" != "--" ]; do shift; done; '
+                  'shift; exec "$@";; esac\necho "settle $*"\n')
 SHIPPED = "default=Default (auto-fallback);opus=Opus;sonnet[1m]=Sonnet (1M context);haiku=Haiku;fable[1m]=Fable (1M context)"
 SAID = {entry.split("=")[0]: "Switch the core to " + entry.split("=")[1] for entry in (SIMPLE + ";" + SHIPPED).split(";")}
 
@@ -227,13 +231,51 @@ class Tap(Base):
         fake_switch = self.ws / "switch.sh"
         fake_switch.write_text('echo "switch $*"; exit 8\n')
         fake_py = self.ws / "py.sh"
-        fake_py.write_text('#!/bin/sh\necho "settle $*"\n')
+        fake_py.write_text(TURN_THEN_ECHO)
         fake_py.chmod(0o755)
         got = subprocess.run(["bash", "-c", mc.DETACHED, "model-card", str(fake_switch), "fable", "180", "/st",
                               str(fake_py), "card.py", "/w s", DM, "17-ab"], capture_output=True, text=True, check=True)
         self.assertEqual(got.stdout.splitlines(),
-                         ["switch fable --confirm --accept-timeout 180 --state-dir /st",
+                         ["turn 17-ab",
+                          "switch fable --confirm --accept-timeout 180 --state-dir /st",
                           f"settle card.py --workspace /w s settle --room {DM} --model fable --attempt 17-ab --rc 8"])
+
+    def test_two_accepted_switches_run_one_at_a_time_and_an_older_one_started_last_is_not_run(self):
+        """Reverse start order, for real: the newer attempt's line gets its turn first; the older
+        one, starting after it, must not run its switch and leave the core on the older model."""
+        ran = self.ws / "ran.txt"
+        switch = self.ws / "switch.sh"
+        switch.write_text(f'echo "$1" >> "{ran}"; exit 0\n')
+        for attempt, alias in (("17-ab", "fable"), ("18-cd", "sonnet")):
+            mc.save_outcome(self.ws, attempt, DM, alias, None, mc.time.time())
+
+        def turn(attempt, alias):
+            return mc.main(["--workspace", str(self.ws), "turn", "--attempt", attempt, "--", "bash", str(switch), alias])
+
+        with contextlib.redirect_stdout(io.StringIO()) as said:
+            self.assertEqual((turn("18-cd", "sonnet"), turn("17-ab", "fable")), (0, mc.SKIPPED_RC))
+        self.assertEqual(ran.read_text().split(), ["sonnet"], "only the newest accepted switch ran")
+        self.assertIn("17-ab is not the newest", said.getvalue())
+        # The skipped attempt's outcome is superseded, never posted; the newest one's is.
+        sent = len(self.fake.calls)
+        def settle(attempt, rc, alias):
+            return self.run_(["settle", "--room", DM, "--model", alias, "--rc", str(rc), "--attempt", attempt])[1]
+
+        self.assertEqual(settle("17-ab", mc.SKIPPED_RC, "fable")["status"], "superseded")
+        self.assertEqual((settle("18-cd", 0, "sonnet")["status"], len(self.fake.calls)), ("posted", sent + 1))
+        # An attempt with no record (too old to be kept) still runs: there is nothing newer to defer to.
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(turn("01-zz", "haiku"), 0)
+        self.assertEqual(ran.read_text().split(), ["sonnet", "haiku"])
+        # While one switch holds its turn, the next one waits for it.
+        slow = self.ws / "slow.sh"
+        slow.write_text(f'echo "start $1" >> "{ran}"; sleep 1; echo "end $1" >> "{ran}"\n')
+        ran.write_text("")
+        procs = [subprocess.Popen([sys.executable, str(SCRIPT), "--workspace", str(self.ws), "turn", "--attempt", a,
+                                   "--", "bash", str(slow), a], stdout=subprocess.DEVNULL) for a in ("01-xx", "01-yy")]
+        self.assertEqual([p.wait(timeout=30) for p in procs], [0, 0])
+        lines = ran.read_text().splitlines()
+        self.assertEqual([ln.split()[0] for ln in lines], ["start", "end", "start", "end"], lines)
 
     def test_a_tap_that_is_not_the_owners_on_this_card_starts_nothing(self):
         for kw in ({"user": "@x:s.space"}, {"tier": "team"}, {"room": ROOM, "kind": "room"}, {"event": "$other"},
@@ -630,7 +672,8 @@ class Manifest(Base):
         fake_switch = self.ws / "switch.sh"
         fake_switch.write_text('echo "switch $1"; exit 0\n')
         fake_py = self.ws / "py.sh"
-        fake_py.write_text('#!/bin/sh\necho "settle $8"\n')
+        fake_py.write_text('#!/bin/sh\ncase " $* " in *" turn "*) while [ "$1" != "--" ]; do shift; done; shift; '
+                           'exec "$@";; esac\necho "settle $8"\n')
         fake_py.chmod(0o755)
         got = subprocess.run(["bash", "-c", mc.DETACHED, "model-card", str(fake_switch), "fable[1m]", "180", "/st",
                               str(fake_py), "card.py", str(self.ws), DM, "17-ab"], cwd=str(self.ws),
