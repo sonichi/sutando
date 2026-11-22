@@ -124,6 +124,7 @@ class SwitchModel(unittest.TestCase):
     def test_a_draft_in_the_input_box_or_a_box_that_cannot_be_read_gets_no_keys(self):
         dim = "\x1b[2m"
         for shown, why in (("\u276f half a message", "holds unsent text"),
+                           ("Select model\n\u276f 1. Default\n  2. Opus", "holds unsent text"),   # a menu left open
                            ("old\n\u276f \n  \u276f fix the bug", "holds unsent text"),
                            ("no prompt on this screen", "cannot be read"), ("", "cannot be read")):
             pane = Pane(says)
@@ -176,6 +177,20 @@ class SwitchModel(unittest.TestCase):
         ended.unsent = lambda gen, title, rc, what: ""
         self.assertIn("the session ended at the confirmation", ended.switch_model(REC, "opus", confirm=True)[1])
         self.assertEqual(launcher.switched_model(self.root), "")
+
+    def test_a_dialog_that_could_not_be_cancelled_is_said_to_be_still_on_screen_and_switches_take_turns(self):
+        class Asks(Pane):
+            def run(self, argv, **kw):
+                keys = argv[argv.index("--") + 1:]
+                self.sent.append(keys)
+                if keys[0] == "/model":
+                    self.text += "\nYes, switch / No, go back"
+                return types.SimpleNamespace(returncode=0 if keys[0] == "/model" else 1)
+
+        switched, line = lc_for(Asks(), self.root).switch_model(REC, "opus")
+        self.assertEqual((switched, line.endswith("Its question may still be on the session's screen.")), (False, True), line)
+        self.assertTrue((self.root / "state" / "model-switch.lock").exists(), "one switch at a time per agent")
+        self.assertIs(launcher.MODEL_RE, launcher.claude_model_switch.MODEL_RE, "the core's rules, not a copy")
 
     def test_a_switch_that_cannot_be_recorded_is_still_a_switch(self):
         pane = Pane(says)

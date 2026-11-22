@@ -24,7 +24,8 @@ import sys
 import time
 from pathlib import Path
 
-from ... import connect_common as cm, task_io, tmux_pane_keys, tmux_probe
+from ... import claude_model_switch, connect_common as cm, task_io, tmux_pane_keys, tmux_probe
+from ...file_lock import locked_file
 from ... import claude_local_accepter as accepter, claude_local_card as card, claude_local_records as records
 from . import detector, hmac_policy, hold, inbox, trust
 from .shape import (AUTOARM_VAR, HITL_ID_PREFIX, LAUNCHER_LOCK, LOCAL, MIN_TMUX, SESSION_NAME, SOCKET_NAME,
@@ -40,36 +41,10 @@ CONSUMER_WAIT_S = 30.0
 INNER_STOP_S = 120.0
 TITLE_CHANGED = "title changed"
 MODEL_ACCEPT_S = 20.0
-# What Claude Code's own /model takes: an alias or a claude-* id, either with an optional [1m] tag.
-MODEL_RE = re.compile(r"^(default|(opus|sonnet|haiku|fable)(\[1m\])?|claude-[a-z0-9.-]+(\[1m\])?)$")
-MODEL_SET, MODEL_CONFIRM = "Set model to", "Yes, switch"
-PROMPT_GLYPH = "\u276f"
-# As the core reads a pane (src/delivery/pane_gate.py): styling, and the dim or grey runs that are
-# a placeholder or a suggestion, never text someone typed.
-_SGR = re.compile(r"\x1b\[[0-9:;]*m|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
-_GHOST = re.compile(r"\x1b\[(?:2|38;5;(?:23[2-9]|24[0-9]|25[0-5]))m.*?(?=\x1b\[(?:0|22|39)m|$)")
-
-
-def composer_text(shown) -> "str | None":
-    """What sits unsent in Claude Code's input box, from a styled capture: the text after the last
-    prompt glyph, '' when the box is empty, None when no prompt is on screen (unknown, never empty)."""
-    found = None
-    for raw in (shown or "").splitlines():
-        if _SGR.sub("", raw).lstrip(" \t").startswith(PROMPT_GLYPH):
-            found = _SGR.sub("", _GHOST.sub("", raw[raw.find(PROMPT_GLYPH) + 1:])).strip(" \t\u00a0")
-    return found
-
-
-def model_accepted(model: str) -> "re.Pattern":
-    """Claude Code's line for a switch to `model`. It echoes display names ("Set model to Opus 4.6"),
-    so an alias accepts any version of its family and an id its own version, as the core's skill does."""
-    plain = re.sub(r"\[1m\]$", "", model)
-    family = re.sub(r"^claude-([a-z]+)-?.*", r"\1", plain)
-    version = re.match(r"^claude-[a-z]+-([0-9]+(?:-[0-9]+)*)", plain)
-    if version:
-        return re.compile(r"%s %s %s(?:[^0-9.]|$)" % (MODEL_SET, family, re.escape(version.group(1).replace("-", "."))),
-                          re.I | re.M)
-    return re.compile(r"%s %s(?: [0-9][0-9.]*)?(?:[^0-9.a-z]|$)" % (MODEL_SET, re.escape(family)), re.I | re.M)
+# The names that may be typed, Claude Code's two texts and its input-box check are the core's
+# (src/claude_model_switch.py, bundled verbatim): one source for the skill and for this adapter.
+MODEL_RE, MODEL_SET, MODEL_CONFIRM = claude_model_switch.MODEL_RE, claude_model_switch.MODEL_SET, claude_model_switch.MODEL_CONFIRM
+composer_text, model_accepted = claude_model_switch.composer_text, claude_model_switch.model_accepted
 MODEL_RECORD = ("state", "model-switch.json")
 
 
@@ -646,9 +621,14 @@ class Launcher:
         shows a NEW "Set model to" line naming this model. A warm session asks first; that dialog is
         answered once with `confirm`, else cancelled. Nothing is sent to a session whose tuple changed,
         nor to one whose input box holds a draft or cannot be read: Enter would send the draft."""
-        gen, title = rec.get("generation"), rec.get("title_token") or ""
         if not MODEL_RE.match(model or ""):
             return False, "refused: %r is not a model alias or a claude-* id; nothing sent" % model
+        # One switch at a time per agent: two would read each other's lines as their own.
+        with locked_file(Path(self.root) / "state" / "model-switch.lock"):
+            return self._switch_model(rec, model, confirm, wait_s)
+
+    def _switch_model(self, rec: dict, model: str, confirm, wait_s) -> "tuple[bool, str]":
+        gen, title = rec.get("generation"), rec.get("title_token") or ""
         if not gen or self.tm.has_session() is not True:
             return False, "no running session to switch; nothing sent"
         draft = composer_text(self.tm.capture(gen["pane_id"], styled=True))
@@ -684,9 +664,9 @@ class Launcher:
                 return True, "switched to %s" % model
             if text.count(MODEL_CONFIRM) > asked and not answered:
                 if not confirm:
-                    keys("Escape")
+                    left = "" if keys("Escape") == 0 else " Its question may still be on the session's screen."
                     return False, ("not switched: Claude Code asks to confirm a switch in a running conversation; "
-                                   "repeat with --confirm")
+                                   "repeat with --confirm.%s" % left)
                 # One attempt only: a second Enter after an uncertain one could act on whatever came next.
                 answered, rc = True, keys("Enter")
                 if rc != 0:
