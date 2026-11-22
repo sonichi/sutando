@@ -196,6 +196,9 @@ MODEL_UNKNOWN = ("I don't know my models yet: I learn them when a turn starts. S
                  "send /model again.")
 
 
+UNTOLD_KEEP = 5      # outcome notices kept while their cards cannot be queued
+
+
 def model_verb(model_id: str) -> str:
     """What a model's button carries. A card reply takes a short plain token, and an id may hold a
     slash, a colon or a space ("models/gemini-pro"): such an id travels as a digest of itself."""
@@ -360,30 +363,35 @@ class Connector:
         return "model-card-elsewhere"
 
     def tell_model_outcome(self, turn) -> str:
-        """Once per pick, after the first owner turn that opened a Session: say in the DM the pick was
-        made in whether the switch happened. The model state is settled at once (a switch agy refused
-        is dropped, never asked for again); an outcome whose card could not be queued is kept apart
-        and delivered after a later turn. '' when there was nothing to tell."""
+        """After an owner turn that opened a Session: settle the pick it ran with, then say in the DM each
+        outcome not yet told, oldest first. The model state is settled whatever happens to the telling
+        (a switch agy refused is dropped, never asked for again); a notice whose card cannot be queued
+        stays owed, the newest UNTOLD_KEEP of them. '' when there was nothing to settle or tell."""
         state = self.model_state()
-        owed = state.get("untold") if isinstance(state.get("untold"), dict) else None
-        if owed:
-            card = self.model_card(state, picked=str(owed.get("picked") or ""), ran=str(owed.get("ran") or ""))
-            if not self.post_card(owed.get("room"), card):
-                return "untold"
-            self.save_model_state(untold=None)
-            return "switched" if owed.get("picked") == owed.get("ran") else "not-switched"
-        wanted = str(state.get("wanted") or "")
-        if not wanted or state.get("told") == wanted or not turn.live:
-            return ""
-        switched, ran = turn.model == wanted, turn.model or ""
-        queued = self.post_card(state.get("asked_in"), self.model_card(state, picked=wanted, ran=ran))
-        # The model the turn ran on is the one in use, whatever a resumed Session reports of itself.
-        self.save_model_state(told=wanted, current=ran or state.get("current") or "",
-                              untold=None if queued else {"picked": wanted, "ran": ran, "room": state.get("asked_in")},
-                              **({} if switched else {"wanted": ""}))
-        if not queued:
-            return "untold"
-        return "switched" if switched else "not-switched"
+        kept = state.get("untold")
+        owed = [o for o in (kept if isinstance(kept, list) else [kept]) if isinstance(o, dict)]
+        wanted, outcome, changes = str(state.get("wanted") or ""), "", {}
+        if wanted and state.get("told") != wanted and turn.live:
+            ran = turn.model or ""
+            outcome = "switched" if ran == wanted else "not-switched"
+            owed.append({"picked": wanted, "ran": ran, "room": state.get("asked_in")})
+            # The model the turn ran on is the one in use, whatever a resumed Session reports of itself.
+            changes = dict(told=wanted, current=ran or state.get("current") or "",
+                           **({} if outcome == "switched" else {"wanted": ""}))
+        told = ""
+        while owed:
+            first = owed[0]
+            try:
+                card = self.model_card(state, picked=str(first.get("picked") or ""), ran=str(first.get("ran") or ""))
+            except ValueError:
+                card = None         # a notice that cannot be drawn is dropped, not kept in the way
+            if card is not None and not self.post_card(first.get("room"), card):
+                break
+            owed.pop(0)
+            told = "switched" if first.get("picked") == first.get("ran") else "not-switched"
+        if changes or owed != ([] if kept is None else kept):
+            self.save_model_state(untold=owed[-UNTOLD_KEEP:], **changes)
+        return "untold" if owed else (outcome or told)
 
     def run_turn(self, task_id, headers, prompt, owner):
         """(status, text, detail, turn): status is completed | cancelled | timeout | gone | failed | refused.

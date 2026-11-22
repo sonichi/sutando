@@ -294,7 +294,7 @@ class ConnectorTest(unittest.TestCase):
             self.w.task("task-4", "STUB:TEXT again")
             self.w.serve()
         owed = json.loads(state.read_text())
-        self.assertEqual((self.w.metrics()[-1]["model_switch"], owed["untold"]["picked"], owed["current"]),
+        self.assertEqual((self.w.metrics()[-1]["model_switch"], owed["untold"][0]["picked"], owed["current"]),
                          ("untold", "claude-opus-4-6-thinking", "claude-opus-4-6-thinking"))
         self.w.task("task-5", "STUB:TEXT once more")
         self.w.serve()
@@ -302,7 +302,7 @@ class ConnectorTest(unittest.TestCase):
         self.assertEqual(told["extra_content"]["space.ag2.card"]["text"], "Switched. I'm now using Claude Opus 4.6.")
         kept = json.loads(state.read_text())
         self.assertEqual((kept["told"], kept["current"], kept["untold"]),
-                         ("claude-opus-4-6-thinking", "claude-opus-4-6-thinking", None))
+                         ("claude-opus-4-6-thinking", "claude-opus-4-6-thinking", []))
 
     def test_a_menu_asked_for_in_the_turn_that_settles_a_pick_comes_after_the_outcome_and_still_acts(self):
         (self.w.home / "models").write_text("")
@@ -412,10 +412,53 @@ class ConnectorTest(unittest.TestCase):
         (told,) = self.post_queued()
         self.assertEqual((told["room_id"], told["extra_content"]["space.ag2.card"]["state"], self.w.metrics()[-1]["model_switch"]),
                          (self.DM, "error", "not-switched"))
-        self.assertEqual((len(self.set_model_calls()), json.loads(state.read_text())["untold"]), (1, None))
+        self.assertEqual((len(self.set_model_calls()), json.loads(state.read_text())["untold"]), (1, []))
         self.w.task("task-4", "STUB:TEXT last")
         self.w.serve()
         self.assertEqual((self.post_queued(), "model_switch" in self.w.metrics()[-1]), ([], False), "told once")
+
+    def test_two_picks_across_one_outage_are_each_settled_once_and_told_in_order_afterwards(self):
+        (self.w.home / "models").write_text("")
+        state = self.w.root / "state" / "model.json"
+        models = [{"id": "claude-opus-4-6-thinking", "name": "Claude Opus 4.6"},
+                  {"id": "gemini-3.8-flash-medium", "name": "Gemini 3.8 Flash"}, {"id": "no-such-model", "name": "Ghost"}]
+        state.write_text(json.dumps({"wanted": "claude-opus-4-6-thinking", "asked_in": self.DM, "available": models}))
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
+            self.w.task("task-1", "STUB:TEXT hi")
+            self.w.serve()                                  # pick A takes; its notice cannot be queued
+            self.assertEqual(self.w.metrics()[-1]["model_switch"], "untold")
+            kept = json.loads(state.read_text())
+            state.write_text(json.dumps(dict(kept, wanted="no-such-model", told="")))     # pick B, during the outage
+            (self.w.home / "set-model-fails").write_text("")
+            self.w.task("task-2", "STUB:TEXT again")
+            self.w.serve()                                  # B is refused: settled now, though A's notice is still owed
+            settled = json.loads(state.read_text())
+            self.assertEqual((settled["wanted"], [o["picked"] for o in settled["untold"]]),
+                             ("", ["claude-opus-4-6-thinking", "no-such-model"]))
+            calls = len(self.set_model_calls())
+            self.w.task("task-3", "STUB:TEXT third")
+            self.w.serve()
+            self.assertEqual(len(self.set_model_calls()), calls, "the refused pick is not asked for again")
+        self.w.task("task-4", "STUB:TEXT fourth")
+        self.w.serve()
+        first, second = [p["extra_content"]["space.ag2.card"] for p in self.post_queued()]
+        self.assertEqual((first["state"], second["state"]), ("done", "error"), "told oldest first")
+        self.assertIn("Claude Opus 4.6", first["text"])
+        self.assertIn("could not switch to no-such-model", second["text"])
+        self.assertEqual(json.loads(state.read_text())["untold"], [])
+        # A notice that can never be drawn is dropped; the list is bounded.
+        state.write_text(json.dumps(dict(json.loads(state.read_text()),
+                                         untold=[{"picked": "a", "ran": "b", "room": self.DM}] * 3)))
+        with mock.patch.object(gc.Connector, "model_card", side_effect=ValueError("bad label")):
+            self.w.task("task-5", "STUB:TEXT fifth")
+            self.w.serve()
+        self.assertEqual(json.loads(state.read_text())["untold"], [])
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
+            state.write_text(json.dumps(dict(json.loads(state.read_text()),
+                                             untold=[{"picked": "a", "ran": "b", "room": self.DM}] * 9)))
+            self.w.task("task-6", "STUB:TEXT sixth")
+            self.w.serve()
+        self.assertEqual(len(json.loads(state.read_text())["untold"]), gc.UNTOLD_KEEP)
 
     def test_a_refused_switch_is_said_in_the_dm_and_the_turn_runs_on_agys_own_model(self):
         (self.w.home / "models").write_text("")
