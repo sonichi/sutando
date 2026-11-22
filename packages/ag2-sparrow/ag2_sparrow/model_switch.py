@@ -16,6 +16,7 @@ from . import connector_cards
 FILE, CARD, ASK = "model.json", "model-switch", "/model"
 BUTTONS = 6          # the card's button limit
 UNTOLD_KEEP = 5      # outcome notices kept while their cards cannot be queued
+
 # How the owner asks in their own words: the runtime answers with the mark alone, and the card is shown.
 MARK = "[model-card]"
 HINT = ("If the person asks to change, switch or choose the model you run on, or which models you have, "
