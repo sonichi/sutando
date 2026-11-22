@@ -2318,13 +2318,19 @@ def main() -> int:
     fetched.clear()
     rtc._download_bytes = lambda url, headers, cap: (fetched.append((url, dict(headers))) or b"X")
     gw = os.environ["REMOTE_TASK_URL"]  # http://127.0.0.1:<port>
-    rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1.evil.example/media/p name=a.bin]")
-    check(bool(fetched) and "Authorization" not in fetched[-1][1],
-          "lookalike gateway host gets NO credentials")
+    out = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1.evil.example/media/p name=a.bin]")
+    check(not fetched and f"[{rtc.MEDIA_MARKER_TAG}:" in out, "lookalike gateway host is never fetched")
+    # Only the gateway or homeserver origin is fetched: loopback, metadata, LAN and public hosts are not.
+    for off in ("http://127.0.0.1:8080/admin", "http://169.254.169.254/latest/meta-data/",
+                "http://10.0.0.5/media/p", "http://192.168.1.1/p", "http://[::1]/p", "https://example.org/p.png",
+                "http://0.0.0.0/p", "http://224.0.0.1/p"):
+        refs = []
+        out = rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: {off} mime=text/plain name=a.txt]", refs)
+        check(not fetched and not refs and f"[{rtc.MEDIA_MARKER_TAG}:" in out,
+              f"off-origin media URL never fetched or attached: {off}")
     rtc.URL = "http://127.0.0.1:9/relay"
     rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1:9/relay-evil/p name=a.bin]")
-    check("Authorization" not in fetched[-1][1],
-          "gateway base-path boundary enforced (/relay-evil gets no bearer)")
+    check(not fetched, "gateway base-path boundary enforced (/relay-evil is never fetched)")
     rtc._maybe_fetch_media(f"[{rtc.MEDIA_MARKER_TAG}: http://127.0.0.1:9/relay/media/p name=a.bin]")
     check(fetched[-1][1].get("Authorization") == "Bearer testtoken",
           "true gateway-hosted path still gets the gateway bearer")
@@ -2368,6 +2374,27 @@ def main() -> int:
         check(False, "authed fetch raises on a real 302")
     except Exception:
         check(True, "authed fetch raises on a real 302")
+    import http.server as _hs
+    import threading as _th
+
+    class _Bounce(_hs.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/ok":
+                self.send_response(200); self.end_headers(); self.wfile.write(b"OK"); return
+            self.send_response(302); self.send_header("Location", "/ok"); self.end_headers()
+
+        def log_message(self, *a):
+            pass
+    _srv = _hs.ThreadingHTTPServer(("127.0.0.1", 0), _Bounce)
+    _th.Thread(target=_srv.serve_forever, daemon=True).start()
+    _base = "http://127.0.0.1:%d" % _srv.server_address[1]
+    check(rtc._download_bytes(_base + "/ok", {"User-Agent": "t"}, 100) == b"OK", "the bounce server serves /ok")
+    try:
+        rtc._download_bytes(_base + "/bounce", {"User-Agent": "t"}, 100)
+        check(False, "a fetch with no credentials does not follow a 302 either")
+    except Exception:
+        check(True, "a fetch with no credentials does not follow a 302 either")
+    _srv.shutdown(); _srv.server_close()
     STATE["force_media_redirect"] = False
 
     # 6d. same-name saves in the same instant get distinct files (mkstemp)
