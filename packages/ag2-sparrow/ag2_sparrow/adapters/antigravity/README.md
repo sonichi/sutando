@@ -15,7 +15,7 @@ Status: the handshake and the sign-in check were run against a real `agy` 1.5.9 
 curl -fsSL https://antigravity.google/cli/install.sh | bash      # Google's installer: ~/.local/bin/agy
 agy                                                               # once: sign in with Google
 ag2-sparrow-antigravity-local install --agent <@agent:server> --token-stdin [--cwd <dir>]
-ag2-sparrow-antigravity-local install --work <dir> [--acp-command '<cmd>'] [--allow-non-owner]
+ag2-sparrow-antigravity-local install --work <dir> [--acp-command '<cmd>'] [--allow-non-owner] [--allow-owner-shell-web]
 ag2-sparrow-antigravity-local verify [--agent <@agent:server>] [--no-probe]
 ag2-sparrow-antigravity-local uninstall [--agent <@agent:server>]
 ag2-sparrow-antigravity-local list
@@ -50,8 +50,8 @@ The turn's final message is what Sparrow posts: as the reply in the message's th
 `commons.summon`, any other well-formed type). A final message of exactly `NO_REPLY` posts nothing.
 The text is posted with every delivery marker (attachment, redirect, skip, thread) neutralised. When a
 turn fails, a message gets a line saying why (timeout, Antigravity stopped, not signed in) with any
-partial text; an event posts nothing. No shell command is granted, so no reply command is either: the
-final message is the only answer path.
+partial text; an event posts nothing. There is no reply command: the final message is the only answer
+path.
 
 The gateway ends an owner's task with a `===SKILL INSTRUCTIONS===` prelude written for a core that has a
 shell: run a room-read command, then write the result to `results/<task>.txt`. Neither is granted here, and
@@ -104,9 +104,26 @@ hand-off to the owner verbatim (`tier_block_lines`). The final reply is scanned 
 
 agy's `session/request_permission` is answered by `acp_host`'s policy, default deny:
 
+- the owner's turns only, and only on an install with `--allow-owner-shell-web` (recorded as
+  `ALLOW_OWNER_SHELL_WEB=1`; off by default, so an existing install does not change on update): any shell
+  command and any `execute`, `fetch` or `search` call, as a local Claude Code agent runs commands and uses
+  the web for its owner. `verify` prints `INFO owner shell and web: on|off`;
 - the owner only: a `read` or `edit` whose every path resolves (after `..`, `~` and symlinks) under the
-  working directory; never when the working directory is the home directory or above it;
-- nothing else: no shell command, and no `execute`, `fetch`, `delete`, `move` or unclassified call.
+  working directory; never when the working directory is the home directory or above it. agy's own
+  argument names (`Path`, `Content`, `Overwrite`, `Append`, `Target`, `Replacement`, `AllowMultiple`,
+  `Edits`, `StartLine`, `EndLine`, and the older `TargetFile`, `CodeContent`, `AbsolutePath`, ...) are
+  recognised; any other key refuses the request;
+- nothing else: no command or web call for a collaborator or a guest, and no `delete`, `move` or
+  unclassified call for anyone.
+
+| Turn | Commands, fetch, search | Read or edit under the working directory | Anything else |
+| --- | --- | --- | --- |
+| owner | granted with `--allow-owner-shell-web`, else refused | granted | refused |
+| Team (an attested collaborator) | refused (granting it is the owner's decision) | as the turn it runs in | refused |
+| guest (isolated) | refused | refused | refused |
+
+With `--allow-owner-shell-web`, the working-directory bound on `read` and `edit` is no longer a security
+boundary for the owner's turns: a command can read or write anything the owner's account can.
 
 For the owner's turns, agy applies its own permission rules first (an action they already allow runs
 without asking), and `--dangerously-skip-permissions` makes it run tools without asking; never add that
