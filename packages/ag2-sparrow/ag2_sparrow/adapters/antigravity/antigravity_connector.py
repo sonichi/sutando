@@ -195,7 +195,7 @@ class Connector:
         self.retry_at = {}
         self.models = model_switch.ModelSwitch(args.state, self.root, getattr(args, "bridge_state", None), NAME,
                                                publish, quoted, log)
-        self.desk = card_desk.Desk(self.root, publish, quoted, [self.models])
+        self.desk = card_desk.Desk(self.root, card_desk.led(publish, self.models.unsaid, quoted), quoted, [self.models])
 
     def models_seen(self, models: dict):
         """Remember what a Session offered (ACP `models`), for the card."""

@@ -251,6 +251,10 @@ class ModelSwitch:
         state = self.state()
         kept = state.get("untold")
         owed = [o for o in (kept if isinstance(kept, list) else [kept]) if isinstance(o, dict)]
+        # A notice saved before notices had keys gets one now, and is saved with it before it is queued.
+        unkeyed = [o for o in owed if not o.get("key")]
+        for n, o in enumerate(unkeyed):
+            o.update(key=uuid.uuid4().hex, at=time.time_ns() + n)
         wanted, outcome = str(state.get("wanted") or ""), ""
         if wanted and state.get("told") != wanted and live:
             ran = ran or ""
@@ -261,6 +265,8 @@ class ModelSwitch:
             # Only a confirmed pick becomes the model in use: a model the runtime moved the turn to was never picked.
             self.save(untold=owed, told=wanted, **({"current": wanted, "confirmed": wanted} if outcome == "switched"
                                                    else {"wanted": ""}))
+        elif unkeyed:
+            self.save(untold=owed)
         told, words = "", []
         while owed:
             first = {"picked": str(owed[0].get("picked") or ""), "ran": str(owed[0].get("ran") or "")}

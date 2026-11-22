@@ -172,6 +172,12 @@ class AccountSwitch:
         what is left. Each is queued under the key saved with it, so one queued just before a stop,
         and still on the saved list after the restart, is not a second card."""
         owed = self.owed()
+        # A result saved before results had keys gets one now, and is saved with it before it is queued.
+        unkeyed = [o for o in owed if not o.get("key")]
+        for n, o in enumerate(unkeyed):
+            o.update(key=uuid.uuid4().hex, at=time.time_ns() + n)
+        if unkeyed:
+            self.keep(self.pending(), owed)
         while owed and self.post(owed[0].get("room"), self.card(str(owed[0].get("state")), str(owed[0].get("text"))),
                                  str(owed[0].get("key") or ""), int(owed[0].get("at") or 0)):
             owed.pop(0)

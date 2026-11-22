@@ -74,6 +74,18 @@ class Desk:
         return "\n\n".join(card.HINT for card in self.cards if card.usable())
 
 
+def led(publish, pending, quoted):
+    """`publish`, with every answer led by `pending()`: what another card settled this turn and could
+    only say in words. A card's answer must not swallow them, whichever card answers; an answer that
+    was only "[no-send]" gives way to the words."""
+    def write(result_file, body):
+        words = pending()
+        if words:
+            body = quoted(words) + "\n" + ("" if body.startswith("[no-send]") else body)
+        return publish(result_file, body)
+    return write
+
+
 def usable(bridge_state) -> bool:
     """Whether a card can reach the room: the agent's own bridge keeps a state dir (made at install).
     Without one (a bridge run elsewhere, a bare connector) nothing would post what is queued."""

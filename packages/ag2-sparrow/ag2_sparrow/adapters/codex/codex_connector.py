@@ -220,7 +220,7 @@ class Connector:
         """The account card; made on first use, as `models` is."""
         if self._accounts is None:
             self._accounts = account_switch.AccountSwitch(
-                self.args.state, getattr(self.args, "bridge_state", None), "Codex", write_atomic, quoted, log,
+                self.args.state, getattr(self.args, "bridge_state", None), "Codex", self.card_answer, quoted, log,
                 read=self.account_label, begin=self.begin_login,
                 cancel=lambda login: self.rpc.request("account/login/cancel", {"loginId": login}),
                 opener=lambda url: open_page(url))
@@ -228,7 +228,11 @@ class Connector:
 
     @property
     def desk(self):
-        return card_desk.Desk(self.root, write_atomic, quoted, [self.models, self.accounts])
+        return card_desk.Desk(self.root, self.card_answer, quoted, [self.models, self.accounts])
+
+    def card_answer(self, result_file, body):
+        """A card matter's answer, led by a model outcome this turn could only say in words."""
+        return card_desk.led(write_atomic, self.models.unsaid, quoted)(result_file, body)
 
     def account_label(self) -> str:
         """The account the server is signed in with, as the card names it; '' when it is signed out."""

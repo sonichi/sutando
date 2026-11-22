@@ -1057,6 +1057,20 @@ class AccountCardTest(CardWorld, unittest.TestCase):
             else {"account": {"type": "chatgpt", "email": "alice@example.com", "planType": "pro"}})
         return c
 
+    def test_a_model_outcome_said_in_words_is_not_swallowed_by_an_account_card_asked_for_in_the_same_turn(self):
+        (self.work / "state").mkdir(parents=True, exist_ok=True)
+        (self.work / "state" / "model.json").write_text(json.dumps({
+            "available": [{"id": "gpt-5.6-sol", "name": "Stub Model"}, {"id": "gpt-6-sol", "name": "Stub\nLarge"}],
+            "current": "gpt-5.6-sol", "wanted": "gpt-6-sol", "asked_in": self.DM, "told": ""}))
+        text = self.serve("task-1", "[[askaccount]] switch account")
+        self.assertEqual(text.count("Switched. I'm now using Stub"), 1, "the outcome, in words, with the account card")
+        self.assertNotIn("[no-send]", text)
+        ((_, card),) = self.posted()
+        self.assertEqual(card["buttons"][0]["label"][:6], "Switch")
+        self.assertNotIn("Switched", self.serve("task-2", "again"), "told once")
+        # With nothing owed in words, the card alone answers.
+        self.assertTrue(self.serve("task-3", "[[askaccount]] switch account").startswith("[no-send]"))
+
     def test_a_final_card_that_could_not_be_posted_is_kept_and_posted_later(self):
         (self.home / "stub-login").write_text("success bob@example.org")
         self.serve("task-ask", "/account")
@@ -1092,6 +1106,12 @@ class AccountCardTest(CardWorld, unittest.TestCase):
                              "account-started")
         kept = json.loads((self.work / "state" / "account.json").read_text())
         self.assertEqual((kept["id"], [o["state"] for o in kept["owed"]]), ("login-1", ["done"]))
+        # A result saved before results had keys is given one, saved, before it is queued.
+        old = [{k: v for k, v in o.items() if k not in ("key", "at")} for o in c.accounts.owed()]
+        c.accounts.keep(c.accounts.pending(), old)
+        with mock.patch.object(connector_cards, "queue", side_effect=OSError("disk full")):
+            c.accounts.tell()
+        self.assertTrue(all(o.get("key") and o.get("at") for o in c.accounts.owed()), "the key is on the saved list")
         # A stop after the final card is queued and before it leaves the saved list: telling it
         # again after the restart is not a second card.
         stopped = mock.patch.object(account_switch.AccountSwitch, "keep", side_effect=OSError("the connector stopped here"))
