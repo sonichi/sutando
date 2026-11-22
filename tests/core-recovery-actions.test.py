@@ -1011,6 +1011,102 @@ class SeatRetryEscFirst(Base):
         [receipt] = RA.run_pending(self.mgr, target, runner=run, now=now, follow_ups=[])
         self.assertEqual((receipt["recovery"]["path"], run.calls[0][0]), (RA.PATH_RESTART, self.RETRY))
 
+    def _escaped(self):
+        now, req, target = self._tap()
+        RA.run_pending(self.mgr, target, runner=Run(), now=now, follow_ups=[])
+        return now, req, target
+
+    def test_a_fallback_whose_claim_is_not_saved_starts_no_restart(self):
+        now, req, target = self._escaped()
+        run = Run()
+        with mock.patch.object(self.mgr.store, "save", side_effect=OSError("disk full")):
+            for later in (RA.VERIFY_S + 1, RA.VERIFY_S + 30):
+                try:  # the monitor's own wrapper (M.verify_step) swallows what escapes here
+                    RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=True, now=now + later,
+                                   target=target, runner=run)
+                except OSError:
+                    pass
+        self.assertEqual(run.calls, [], "a restart ran with no record of it on the card")
+
+    def test_a_fallback_interrupted_after_its_dispatch_never_restarts_again(self):
+        now, req, target = self._escaped()
+
+        class Died(BaseException):
+            pass
+
+        calls = []
+
+        def dies(argv, **kw):
+            calls.append(argv)
+            raise Died()  # the monitor goes down mid-restart, before anything after it is recorded
+
+        with self.assertRaises(Died):
+            RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=True, now=now + RA.VERIFY_S + 1,
+                           target=target, runner=dies)
+        run = Run()
+        for later in (RA.VERIFY_S + 30, 2 * RA.VERIFY_S + 5):
+            RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=True, now=now + later,
+                           target=target, runner=run)
+        self.assertEqual((len(calls), run.calls), (1, []), "the restart was dispatched again")
+
+    def test_a_card_still_claiming_a_dispatched_fallback_is_reconciled_not_rerun(self):
+        now, req, target = self._escaped()
+        key = self.mgr.get(req.id).subject["verify"]["fallback"]
+        detached_action.begin(self.ws, key, now + 2)  # dispatched, then the card update was lost
+        run = Run()
+        RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=True, now=now + RA.VERIFY_S + 1,
+                       target=target, runner=run)
+        self.assertEqual(run.calls, [])
+        self.assertEqual(detached_action.status(self.ws, key, now + RA.VERIFY_S + 1).state, detached_action.RUNNING)
+        self.assertEqual(self.mgr.get(req.id).subject["verify"]["detached"], key)
+
+    def test_one_fallback_only_a_worker_still_blocked_after_its_restart_gets_a_new_card(self):
+        now, req, target = self._escaped()
+        run = Run()
+        RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=True, now=now + RA.VERIFY_S + 1,
+                       target=target, runner=run)
+        detached_action.report(self.ws, run.calls[0][1]["env"][detached_action.KEY_ENV], detached_action.DONE)
+        for later in (RA.VERIFY_S + 5, 2 * RA.VERIFY_S + 2, 3 * RA.VERIFY_S):
+            RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=True, now=now + later,
+                           target=target, runner=run)
+        self.assertEqual(len(run.calls), 1, "a second fallback restart ran")
+        card = self.mgr.get(req.id)
+        self.assertIn(RA.STILL_BLOCKED, card.message)
+        self.assertTrue(card.terminal, "closed for a fresh card")
+
+    def test_another_sessions_target_never_restarts_this_worker(self):
+        now, req, target = self._escaped()
+        other = RA.Target(self.ws, SOCK, "sutando-worker-other", seat="worker Other", retry_cmd=self.RETRY)
+        run = Run()
+        RA.verify_step(self.mgr, self.ws, SEAT_SESSION, blocked=True, now=now + RA.VERIFY_S + 1,
+                       target=other, runner=run)
+        self.assertEqual(run.calls, [])
+        self.assertIn(RA.STILL_BLOCKED, self.mgr.get(req.id).message)
+
+    def test_the_monitor_loop_hands_its_retry_cmd_to_verify(self):
+        out = self.ws / "state" / f"core-supervisor.{SEAT_SESSION}.json"
+        argv = ["core-input-watch.py", "--socket", SOCK, "--session", SEAT_SESSION, "--out", str(out),
+                "--once", "--stable", "1", "--seat", SEAT, "--retry-cmd=" + " ".join(self.RETRY)]
+
+        class RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "idle", "signals": {"process": True}}
+
+        with mock.patch.object(M, "capture_styled", lambda s, sess: FABLE_REFUSED), \
+                mock.patch.object(M, "_load_runtime_health", lambda: RH()), \
+                mock.patch.object(M, "gateway_alive", lambda *a: True), \
+                mock.patch.object(M, "_ensure_tmux_on_path", lambda: None), \
+                mock.patch.object(M, "session_runtime", lambda *a: "claude"), \
+                mock.patch.object(M, "send_keys", lambda *a: False), \
+                mock.patch.object(M, "verify_step", return_value=[]) as v, \
+                mock.patch.object(sys, "argv", argv):
+            M.main()
+        self.assertTrue(v.called, "the monitor never ran its verify step")
+        kw = v.call_args.kwargs
+        self.assertEqual((kw["retry_cmd"], kw["socket"], kw["seat"]), (self.RETRY, SOCK, SEAT))
+
     def test_the_monitor_passes_the_seats_restart_to_verify(self):
         now, req, target = self._tap()
         RA.run_pending(self.mgr, target, runner=Run(), now=now, follow_ups=[])

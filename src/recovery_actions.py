@@ -592,38 +592,51 @@ def verify_step(manager, workspace: Path, session: str, blocked: bool, now: Opti
 
 def _fallback_restart(manager, workspace: Path, req, check: Dict, target: Target, runner: Runner,
                       now: float) -> None:
-    """A worker still blocked after its Escape: the pool restarts it, and the same card, receipt
-    and audit say the retry fell back to that restart."""
+    """A worker still blocked after its Escape: the pool restarts it, once, and the same card,
+    receipt and audit say the retry fell back to that restart."""
     key = str(check["fallback"])
+    rest = {k: v for k, v in check.items() if k not in ("fallback", "gate")}
+    # The card gives up its claim before the restart starts: a failed save starts nothing, and a
+    # crash after it leaves a detached check that _restart_failed answers, never a second restart.
+    try:
+        with manager.store.locked():
+            cur = manager.get(req.id)
+            if cur is None or cur.terminal or (cur.subject or {}).get("verify", {}).get("fallback") != key:
+                return
+            cur.message = f"{cur.message}\n\n{FALLBACK_LINE}"
+            cur.subject = {**(cur.subject or {}), "verify": {**rest, "at": now, "detached": key,
+                                                             "reinstate": target.hold_key()}}
+            cur.revision += 1
+            cur.updated_at = time.time()
+            manager.store.save(cur)
+    except Exception:  # noqa: BLE001 -- an unrecorded claim must not restart anything
+        return
+    if detached_action.status(workspace, key, now).state is not None:
+        return  # already dispatched under this key: its own record says how it went
     ok = _seat_restart(target, runner, _env(target), key, check.get("gate") or None, now)
-    line = FALLBACK_LINE if ok else ("Still blocked, and the worker did not restart, so it is still "
-                                     "paused. " + NEW_CARD)
     prior = recovery.read_receipt(workspace, req.id) or {}
     aid = str(prior.get("action_id") or req.chosen_action or recovery.RETRY_NOW)
     outcome = "done" if ok else "failed"
+    line = None if ok else "The worker did not restart, so it is still paused. " + NEW_CARD
     fields = {**(prior.get("recovery") or {}), "state": "starting" if ok else "paused_limit",
               PATH_FIELD: PATH_FALLBACK}
     recovery.write_receipt(workspace, recovery.receipt(req.id, str(prior.get("incident") or incident_for(req)),
-                                                       aid, outcome, None if ok else line, now, fields))
+                                                       aid, outcome, line, now, fields))
     audit(workspace, {"at": int(now), "hitl_id": req.id, "action_id": aid, "outcome": outcome,
                       "session": target.session, "seat": target.seat or "", PATH_FIELD: PATH_FALLBACK})
-    rest = {k: v for k, v in check.items() if k not in ("fallback", "gate")}
+    if ok:
+        return
     with manager.store.locked():
         cur = manager.get(req.id)
         if cur is None or cur.terminal:
             return
         cur.message = f"{cur.message}\n\n{line}"
-        if ok:
-            cur.subject = {**(cur.subject or {}), "verify": {**rest, "at": now, "detached": key,
-                                                             "reinstate": target.hold_key()}}
-        else:
-            cur.subject = {**(cur.subject or {}), "verify": {**rest, "seen": "failed"},
-                           "receipt": {"outcome": "failed", "at": int(now)}}
+        cur.subject = {**(cur.subject or {}), "verify": {**(cur.subject or {}).get("verify", {}), "seen": "failed"},
+                       "receipt": {"outcome": "failed", "at": int(now)}}
         cur.revision += 1
         cur.updated_at = time.time()
         manager.store.save(cur)
-    if not ok:
-        _supersede(manager, req.id)
+    _supersede(manager, req.id)
 
 
 def _restart_failed(manager, workspace: Path, req_id: str, check: Dict, done, now: float) -> None:
