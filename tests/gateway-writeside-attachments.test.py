@@ -125,11 +125,7 @@ check("access_tier still last header", _tier_wins_last(text))
 text1 = (rgb.TASKS_DIR / "task-gw-1.txt").read_text()
 check("access_tier last even with media headers", _tier_wins_last(text1))
 
-# ── 6. a reply to a message with media: the replied-to message's markers become attachments ──
-# The broker quotes the replied-to message as one JSON record inside its reply-context block.
-# Its markers resolve like the message's own (same fetch, same cap, same dir), every one of
-# them rather than only the first, labelled as the replied-to message's, and the block stays
-# well-formed quoted data.
+# ── 6. a reply's quoted media: every marker resolved, labelled, the block still quoted data ──
 import json  # noqa: E402
 
 def _reply_task(quoted_body, own):
