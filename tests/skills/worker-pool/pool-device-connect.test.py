@@ -419,6 +419,89 @@ class Rotate(Base):
             self.connect(ConnectFake(self.backend), rotate=True)
 
 
+
+class OwnDirs(Base):
+    """A new worker's own agent puts it on that agent's own folders before its lane starts; nothing else does."""
+
+    def setUp(self):
+        super().setUp()
+        import worker_lane
+        lookup = unittest.mock.patch.object(worker_lane, "handler_lookup", lambda ws: ("", ""))
+        lookup.start()
+        self.addCleanup(lookup.stop)
+
+    def test_a_new_worker_with_its_own_agent_starts_on_its_agent_s_folders(self):
+        import spawn_worker
+        seen = []
+        out = self.connect(ConnectFake(self.backend), own_dirs=True,
+                           start_lane=lambda row: seen.append(C.worker_dirs(W, self.ws)) or {"ok": True})
+        root = C.worker_root(NEW_AGENT, self.ws)
+        self.assertEqual(out["dirs"], {"own": True})
+        self.assertEqual(C.worker_dirs(W, self.ws), (root / "tasks", root / "results"))
+        self.assertEqual(seen, [(root / "tasks", root / "results")], "the lane first starts on its own folders")
+        self.assertTrue((root / "tasks" / "archive").is_dir() and (root / "results" / "archive").is_dir())
+        env = spawn_worker.inbox_env(self.ws, W)
+        self.assertEqual((env["SUTANDO_TASKS_DIR"], env["SUTANDO_RESULTS_DIR"], env["SUTANDO_INBOX_KIND"]),
+                         (str(root / "tasks"), str(root / "results"), ""))
+
+    def test_without_own_dirs_the_worker_stays_on_the_shared_folders(self):
+        import spawn_worker
+        out = self.connect(ConnectFake(self.backend))
+        self.assertNotIn("dirs", out)
+        self.assertIsNone(C.worker_dirs(W, self.ws))
+        self.assertEqual(spawn_worker.inbox_env(self.ws, W)["SUTANDO_INBOX_KIND"], "deliveries")
+
+    def test_a_rotate_of_an_existing_shared_worker_keeps_its_folders(self):
+        self.connect(ConnectFake(self.backend))
+        again = ConnectFake(self.backend)
+        self.backend.agents[NEW_AGENT]["bearer"] = again.bearer = "bearer-" + secrets.token_hex(16)
+        with unittest.mock.patch.object(C, "update_token", lambda instance, token, **kw: {"instance": instance}):
+            out = self.connect(again, rotate=True, own_dirs=True)
+        self.assertEqual((out["status"], "dirs" in out), ("rotated", False))
+        self.assertIsNone(C.worker_dirs(W, self.ws))
+        self.assertNotIn("own_dirs", dc.read_record(self.ws, W))
+
+    def test_a_switch_that_cannot_be_made_is_reported_and_the_identity_and_lane_stay(self):
+        import worker_lane
+        starts = []
+        with unittest.mock.patch.object(worker_lane, "handler_lookup", lambda ws: ("", "lookup failed")):
+            out = self.connect(ConnectFake(self.backend), own_dirs=True,
+                               start_lane=lambda row: starts.append(row) or {"ok": True})
+        self.assertEqual(out["status"], "ok")
+        self.assertFalse(out["dirs"]["own"])
+        self.assertIn("lookup failed", out["dirs"]["why"])
+        self.assertIsNone(C.worker_dirs(W, self.ws))
+        self.assertEqual(len(starts), 1)
+
+    def test_the_cli_flag_prints_dirs_and_a_resend_carries_it(self):
+        real, out = dc.connect, []
+        fake, approve = ConnectFake(self.backend, expires_in=60), []
+
+        def sleep(seconds):
+            self.backend.sleep(seconds)
+            if approve:
+                fake.approve()
+
+        def wired(worker, **kw):
+            kw.update(request=fake.request, preview=self.preview, deliver=self.sent.append, vault=self.vault,
+                      sleep=sleep, clock=self.backend.clock)
+            return real(worker, **kw)
+        with unittest.mock.patch.object(dc, "connect", wired), \
+                unittest.mock.patch.object(C, "start_added", lambda row, **kw: {"ok": True}), \
+                unittest.mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
+            argv = ["--workspace", str(self.ws), "add", "Reviewer", "--device-flow", "--label", "reviewer", "--own-dirs"]
+            self.assertEqual(pool_identity.main(argv), 1, out)
+            self.assertTrue(dc.read_record(self.ws, W)["own_dirs"])
+            spawned = []
+            self.assertEqual(dc.resend(W, workspace=self.ws, spawn=lambda a: spawned.append(a) or 1)["status"], "started")
+            self.assertIn("--own-dirs", spawned[0])
+            approve.append(True)
+            out.clear()
+            self.assertEqual(pool_identity.main(spawned[0][2:]), 0, out)
+        self.assertEqual(json.loads(out[-1])["dirs"], "own")
+        self.assertIsNotNone(C.worker_dirs(W, self.ws))
+
+
 class Cli(Base):
     def test_add_device_flow_prints_one_json_line_without_a_secret(self):
         fake = ConnectFake(self.backend)

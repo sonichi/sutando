@@ -7,7 +7,7 @@ of its own that answers only what is addressed to that agent, hands every task i
 worker, and posts nothing proactively. Retiring the worker (pool_manage retire) takes it away.
 
     python3 pool_identity.py [--workspace WS] add <worker> --repo REPO --logs-dir DIR [TOKEN|-] [--yes --expected-server NAME]
-    python3 pool_identity.py [--workspace WS] add <worker> --device-flow --label LABEL [--display-name TEXT] [--lane INSTANCE]
+    python3 pool_identity.py [--workspace WS] add <worker> --device-flow --label LABEL [--display-name TEXT] [--lane INSTANCE] [--own-dirs]
     python3 pool_identity.py [--workspace WS] show <worker>
     python3 pool_identity.py [--workspace WS] rotate <worker> --repo REPO --logs-dir DIR [TOKEN|-]
     python3 pool_identity.py [--workspace WS] rotate <worker> --device-flow --label LABEL [--lane INSTANCE]
@@ -32,7 +32,9 @@ a file, and never printed. `add` shows what the token's gateway says before anyt
 `--device-flow` needs no pasted token either (pool_device_connect.py): the core starts s.space's
 device-connect flow for agent LABEL, sends the owner the approval link in their DM, waits until they
 approve it in a browser (or the link expires, which it reports), checks the agent and its owner, and
-saves the token in the vault. It prints one JSON line with the agent id and a status. The owner sees an
+saves the token in the vault. It prints one JSON line with the agent id and a status. `--own-dirs` (what
+create_worker.py asks for a new worker) also switches the worker onto its own task and result folders before
+its lane starts, as `worker_lane.py migrate-dirs --apply` does, and the line says `dirs`. The owner sees an
 approval card (the text note when no card can be posted); once the link expires, the card's "Get a new
 link" button replies "Get a new link for <worker>", and `card-reply` on that task starts the same flow again
 in the background, for the owner only; a click that matches no card this agent posted prints
@@ -146,7 +148,8 @@ def _device_flow(args, ws: Path, *, rotate: bool) -> tuple:
         out = pool_device_connect.connect(
             wid, label=args.label, display_name=args.display_name or "", worker_label=label, rotate=rotate,
             workspace=ws, lane=args.lane, base=args.base or "", repo=args.repo, logs_dir=args.logs_dir,
-            start_lane=start_lane, say=lambda text: print(text, file=sys.stderr, flush=True))
+            start_lane=start_lane, say=lambda text: print(text, file=sys.stderr, flush=True),
+            own_dirs=bool(getattr(args, "own_dirs", False)) and not rotate)
     except pool_device_connect.DeviceConnectError as e:
         print(f"pool_identity: {e}", file=sys.stderr)
         print(json.dumps({"status": e.status}, sort_keys=True))
@@ -157,6 +160,11 @@ def _device_flow(args, ws: Path, *, rotate: bool) -> tuple:
         print(f"lane {out['row']['instance']} not started: {launch.get('reason')}", file=sys.stderr)
     status = out["status"] if started else "stored_lane_not_started"
     line = {"agent_id": out["agent_id"], "status": status}
+    if "dirs" in out:
+        line["dirs"] = "own" if out["dirs"]["own"] else "shared"
+        if out["dirs"].get("why"):
+            print(f"worker {wid}'s folders: {out['dirs']['why']}; finish with: worker_lane.py migrate-dirs "
+                  f"--worker {wid} --apply", file=sys.stderr)
     if not rotate and not args.no_start:
         line["seat"] = reseat_after_add(ws, args.repo, wid).get("result")
     print(json.dumps(line, sort_keys=True))
@@ -363,6 +371,7 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("--display-name", default=None); s.add_argument("--lane", default=None)
         s.add_argument("--base", default=None, help=argparse.SUPPRESS); s.add_argument("--no-start", action="store_true")
         s.add_argument("--resend-id", default=None, help=argparse.SUPPRESS)
+    a.add_argument("--own-dirs", action="store_true")
     s = sub.add_parser("remove"); s.add_argument("worker"); s.set_defaults(fn=cmd_remove)
     s = sub.add_parser("provision-begin"); s.add_argument("worker"); s.add_argument("--role", default=None)
     s.add_argument("--lane", default=None); s.set_defaults(fn=cmd_provision_begin)
