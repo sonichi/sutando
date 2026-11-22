@@ -375,7 +375,8 @@ def session_options(p) -> None:
                    "owner's turn, any other non-owner an isolated read-only one (all on the owner's agy sign-in)")
     p.add_argument("--allow-owner-shell-web", action="store_true",
                    help="let the owner's turns run shell commands and fetch or search the web, as a local Claude "
-                   "Code agent may (never a collaborator's or a guest's; default: off)")
+                   "Code agent may, and an attested collaborator's turn run as the owner's (never plain Team's or a "
+                   "guest's; default: off)")
 
 
 def main(argv=None) -> int:

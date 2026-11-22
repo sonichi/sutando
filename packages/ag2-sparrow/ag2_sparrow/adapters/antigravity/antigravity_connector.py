@@ -19,8 +19,8 @@ folder of the turn's own, which the policy lets agy read and never change. An is
 and only the sender's own attachments (`own_attachment_headers`): never a replied-to member's.
 
 Sessions, the permission policy and the framing are acp_host's: the owner may read or edit under the working
-directory, no command is granted; with --allow-owner-shell-web the owner's turns may also run commands
-and fetch or search the web (SHELL_AND_WEB_TIERS: the owner only; never a collaborator or a guest).
+directory, no command is granted; with --allow-owner-shell-web the owner's turns, and an attested collaborator's,
+may also run commands and fetch or search the web (SHELL_AND_WEB_KINDS; never plain team or a guest).
 The tier is task_io.turn_policy's alone, mapped by TURNS: the owner and an attested collaborator (Team) get
 the owner's turn (the working directory, agy's own home, the owner's permission policy, a Session of their
 own per room); a restricted sender (a guest, plain team, any unknown tier) is always served, as Sutando
@@ -68,9 +68,6 @@ NOT_SIGNED_IN = ("Antigravity is not signed in on this computer (%s): run `agy` 
                  "or run `agy acp --login`")
 
 
-# Sender tiers (headers["access_tier"]) whose turns may run commands and use the web, under --allow-owner-shell-web.
-# Team is left out on purpose, even on the owner's turn: adding it is the owner's decision.
-SHELL_AND_WEB_TIERS = frozenset({"owner"})
 # agy's own file-tool argument names (path, plain data, nested edits), as its tool schemas declare them.
 AGY_KEYS = (frozenset({"Path", "TargetFile", "AbsolutePath"}),
             frozenset({"Content", "Overwrite", "Append", "Target", "Replacement", "AllowMultiple", "StartLine",
@@ -99,6 +96,9 @@ _UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._-]")
 # Who gets the AG2 Space MCP server as this agent (owners' rule, 2026-11-21): turn_policy's owner and attested
 # collaborator (Team) verdicts. Anyone else gets none and `mcp(*)` stays denied.
 SSPACE_KINDS = frozenset({OWNER, COLLABORATOR})
+# turn_policy verdicts whose turns may run commands and use the web, under --allow-owner-shell-web: the owner and
+# an attested collaborator, as claude-local and codex-local give a collaborator the owner's tools.
+SHELL_AND_WEB_KINDS = frozenset({OWNER, COLLABORATOR})
 
 
 def sspace_tools_for(headers, kind=None):
@@ -426,9 +426,11 @@ def turn_for(headers):
     return kind, TURNS.get(kind)
 
 
-def shell_web_on(args, headers):
-    """This turn may run commands and fetch or search the web: the install opted in, and the sender is the owner."""
-    return bool(getattr(args, "allow_owner_shell_web", False)) and headers.get("access_tier") in SHELL_AND_WEB_TIERS
+def shell_web_on(args, headers, kind=None):
+    """This turn may run commands and fetch or search the web: the install opted in, and turn_policy's verdict
+    (`kind` when the caller has it) is the owner or an attested collaborator, from the attested headers only."""
+    return bool(getattr(args, "allow_owner_shell_web", False)) and (
+        turn_policy(headers, allow_non_owner=True).kind if kind is None else kind) in SHELL_AND_WEB_KINDS
 
 
 PRELUDE_HEADER = "===SKILL INSTRUCTIONS"
@@ -608,7 +610,7 @@ class Connector:
         room in the working directory, under the owner's policy; any other runs `isolated` (guest_turn's pair),
         opening one when not given, where only reads of the staged attachments are granted."""
         if owner:
-            cwd, tools = self.args.cwd, shell_web_on(self.args, headers)
+            cwd, tools = self.args.cwd, shell_web_on(self.args, headers, kind)
             with acp_host.task_media(headers, readable=True, log=log) as media:
                 read_only = (media.folder,) if media.folder else ()
                 return acp_host.run_prompt(self.client_factory, self.args, headers, task_id, prompt,
@@ -688,9 +690,8 @@ class Connector:
         t0 = time.time()
         self.launch = None
         if owner_turn:
-            # shell_web_on reads the sender's tier itself, so a collaborator on the owner's turn stays off.
             prompt = wake_prompt(task_id, headers, message, operator_lines, self.args.cwd, self.note,
-                                 shell_web=shell_web_on(self.args, headers), kind=kind)
+                                 shell_web=shell_web_on(self.args, headers, kind), kind=kind)
             status, text, detail, turn = self.run_turn(task_id, headers, prompt, True, kind=kind)
         else:
             with guest_turn(self.args, headers, message) as pair:
@@ -779,8 +780,8 @@ def build_parser():
                     help="no effect, kept so existing configs parse: an attested collaborator always gets the "
                          "owner's turn, any other non-owner an isolated read-only one (all on the owner's agy sign-in)")
     ap.add_argument("--allow-owner-shell-web", action="store_true",
-                    help="let the owner's turns run shell commands and fetch or search the web (never a "
-                         "collaborator's or a guest's; default: off)")
+                    help="let the owner's turns, and an attested collaborator's, run shell commands and fetch or "
+                         "search the web (never plain Team's or a guest's; default: off)")
     ap.add_argument("--once", type=count_arg, default=0, help="exit after N tasks")
     ap.add_argument("--idle-exit", type=float, default=0, help="exit after S idle seconds")
     ap.add_argument("--poll", type=float, default=0.2)
