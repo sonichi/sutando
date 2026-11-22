@@ -278,10 +278,11 @@ class Connector:
         log("wake ->", task_id, headers["access_tier"], event or "message")
         t0 = time.time()
         status, text, detail, turn = self.run_turn(task_id, headers, prompt, tier == "owner")
+        # The outcome of an earlier pick goes first: a menu asked for in this turn then stays the card in force.
+        told = self.models.tell(turn.live, turn.model) if tier == "owner" else ""
         asked = self.desk.marked(headers.get("access_tier"), path, status, text, result_file)
         if not asked:
             publish(result_file, self.answer_body(headers, status, text, detail, turn))
-        told = self.models.tell(turn.live, turn.model) if tier == "owner" else ""
         return {"task": task_id, "status": status, "detail": detail[:200], "event_type": event,
                 "tier": headers["access_tier"], "isolated": tier != "owner", "turn_s": round(time.time() - t0, 3),
                 "permissions": turn.decisions, "updates": dict(turn.updates), "answer_chars": len(text or ""),

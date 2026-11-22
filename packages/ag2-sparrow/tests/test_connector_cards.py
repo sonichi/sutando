@@ -73,9 +73,39 @@ class ConnectorCards(unittest.TestCase):
         ac, _ = cc._core()
         for n in range(12):
             cc.queue(self.state, ROOM, "card %d" % n,
-                     ac.build("account-switch", "info", title="Account", body="b", text="step %d" % n)[1])
+                     ac.build("model-switch", "info", title="Model", body="b", text="step %d" % n)[1])
         self.assertEqual(self.poster().sweep(), 12)
         self.assertEqual([sent["body"] for sent in self.sent], ["card %d" % n for n in range(12)])
+
+    def test_a_card_waits_behind_an_earlier_unposted_one_of_the_same_card_and_others_do_not(self):
+        ac, _ = cc._core()
+
+        def card(card_id, text):
+            return ac.build(card_id, "info", title="T", body="b", text=text)[1]
+
+        cc.queue(self.state, ROOM, "outcome", card("model-switch", "the outcome"))
+        cc.queue(self.state, ROOM, "menu", card("model-switch", "the menu"))
+        cc.queue(self.state, ROOM, "other card", card("account-switch", "another card"))
+        cc.queue(self.state, "!other:s.space", "other room", card("model-switch", "another room"))
+        fails = {"outcome"}
+
+        def post(payload):
+            self.sent.append(payload["body"])
+            if payload["body"] in fails:
+                raise OSError("down")
+            return {"ok": True, "event_id": "$e%d" % len(self.sent)}
+
+        poster = cc.Poster(self.state, post, log=self.logs.append, clock=lambda: 1000.0)
+        self.assertEqual(poster.sweep(), 2)
+        self.assertEqual(self.sent, ["outcome", "other card", "other room"], "the menu waits behind the outcome")
+        fails.clear()
+        self.assertEqual(poster.sweep(), 2)
+        self.assertEqual(self.sent[3:], ["outcome", "menu"], "then both, in the order queued")
+        # A post that returns no event id holds what is behind it the same way.
+        cc.queue(self.state, ROOM, "first", card("model-switch", "1"))
+        cc.queue(self.state, ROOM, "second", card("model-switch", "2"))
+        self.assertEqual(cc.Poster(self.state, lambda p: {"ok": True}, log=self.logs.append, clock=lambda: 1000.0).sweep(), 0)
+        self.assertEqual(len(list((self.state / "agent-cards" / "outbox").iterdir())), 2)
 
     def test_a_card_that_would_not_render_or_has_no_room_is_refused_at_the_queue(self):
         body, card = model_card()
@@ -84,6 +114,12 @@ class ConnectorCards(unittest.TestCase):
             with self.assertRaises(ValueError):
                 cc.queue(self.state, room, line, bad)
         self.assertEqual(self.poster().sweep(), 0)
+
+    def test_a_room_id_without_a_server_is_a_room_at_the_queue_and_at_the_post(self):
+        body, card = model_card()
+        cc.queue(self.state, "!31hneApxJ_1o-63DmFrpeqnkFfWppnzWso1JvH3ogLM", body, card)
+        self.assertEqual(self.poster().sweep(), 1)
+        self.assertEqual(self.sent[0]["room_id"], "!31hneApxJ_1o-63DmFrpeqnkFfWppnzWso1JvH3ogLM")
 
     def test_a_failed_post_stays_queued_and_an_old_one_is_dropped(self):
         body, card = model_card()

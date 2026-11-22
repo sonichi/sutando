@@ -214,6 +214,13 @@ def unhold(p):
     p.stdout.close()
 
 
+def close_pipes(p):
+    """A spawned process's pipes, closed whether or not it was waited for (no unclosed-file warning later)."""
+    for pipe in (p.stdin, p.stdout):
+        if pipe is not None and not pipe.closed:
+            pipe.close()
+
+
 def platform_as(mac):
     """The manager branch a helper runs: None keeps the one the test (or the base, systemd) chose."""
     return contextlib.nullcontext() if mac is None else mock.patch.object(cm, "is_macos", return_value=mac)
@@ -281,6 +288,8 @@ class Runner:
                 except ProcessLookupError:
                     pass
         self.stop_session()
+        for spawned in self.spawned:
+            close_pipes(spawned)
 
     def verb(self, cmd):
         return cmd[1] if cmd[0] == "launchctl" else next(a for a in cmd[1:] if not a.startswith("--"))
@@ -2019,7 +2028,7 @@ class ConnectCode(UndoSeams, Base):
         p = subprocess.Popen([sys.executable, "-c", AGENT_LOCK_HOLDER % (str(PKG), str(self.root))],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.assertEqual(p.stdout.readline().strip(), "held")
-        self.addCleanup(lambda: unhold(p) if p.poll() is None else None)
+        self.addCleanup(lambda: unhold(p) if p.poll() is None else close_pipes(p))
         return p
 
     def test_both_adapters_resolve_one_lock_for_one_agent(self):

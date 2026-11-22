@@ -24,7 +24,8 @@ OUTBOX, POSTED = ("agent-cards", "outbox"), ("agent-cards", "posted")
 CARD_KEY = "space.ag2.card"
 MAX_QUEUED_S = 600.0
 _NAME_RE = re.compile(r"^[0-9a-f]{32}\.json$")
-_ROOM_RE = re.compile(r"^![^\s:]+:\S+$")
+# A room id with its server, or the newer kind that has none (room version 12).
+_ROOM_RE = re.compile(r"^![^\s:]+(:\S+)?$")
 
 
 def _core():
@@ -82,12 +83,17 @@ class Poster:
         self.state, self.post, self.log, self.clock = Path(bridge_state), post, log, clock
 
     def sweep(self) -> int:
-        posted = 0
+        posted, held = 0, set()
         for path in _entries(self.state.joinpath(*OUTBOX)):
             record = _read(path)
             card = (record or {}).get("card")
             if not record or not isinstance(card, dict) or not _ROOM_RE.match(str(record.get("room") or "")):
                 path.unlink(missing_ok=True)
+                continue
+            # A card waits behind an earlier one of the same card in the same room that is not posted
+            # yet: posted out of order, the earlier one would arrive last and replace it.
+            same = (record["room"], str(card.get("id") or ""))
+            if same in held:
                 continue
             if self.clock() - float(record.get("queued_at") or 0) > MAX_QUEUED_S:
                 self.log("agent-card: dropped a card queued over %d s ago" % MAX_QUEUED_S)
@@ -98,10 +104,12 @@ class Poster:
                                     "extra_content": {CARD_KEY: card}, "dedupe_key": "agent-card:" + path.stem})
             except Exception as e:  # noqa: BLE001 - stays queued, retried next sweep
                 self.log("agent-card: post failed (will retry): %s" % type(e).__name__)
+                held.add(same)
                 continue
             event_id = str((answer or {}).get("event_id") or "") if isinstance(answer, dict) else ""
             if not event_id.startswith("$"):
                 self.log("agent-card: the post returned no event id (will retry)")
+                held.add(same)
                 continue
             _write(self.state.joinpath(*POSTED) / path.name,
                    {"event_id": event_id, "room": record["room"], "card": card, "posted_at": self.clock()})

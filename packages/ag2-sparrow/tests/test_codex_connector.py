@@ -682,10 +682,11 @@ class ModelCardTest(CardWorld, unittest.TestCase):
 
     def pick(self, name, event="$card1"):
         """Ask for the card, have the bridge post it, and tap the button named `name`."""
-        self.assertEqual(self.serve("task-ask-" + name.replace(" ", ""), "/model"), "[no-send] the model card answers\n")
+        tag = name.replace(" ", "") + event.strip("$")
+        self.assertEqual(self.serve("task-ask-" + tag, "/model"), "[no-send] the model card answers\n")
         ((_, card),) = self.posted(event)
         said = next(b["reply"] for b in card["buttons"] if b["label"] == name)
-        return self.serve("task-tap-" + name.replace(" ", ""), said, reply_to=event, click=said)
+        return self.serve("task-tap-" + tag, said, reply_to=event, click=said)
 
     def test_the_owners_tap_runs_the_next_turn_on_the_pick_and_a_card_says_it_switched(self):
         self.assertEqual(self.serve("task-1", "/model"), "[no-send] the model card answers\n")
@@ -697,16 +698,16 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(card["text"], "Now using Stub Model. Also: Stub 7, Stub 8 (send /model and the name).")
         said = card["buttons"][1]["reply"]
         self.assertEqual(self.serve("task-2", said, reply_to="$card1", click=said), "[no-send] the model card answers\n")
-        self.assertEqual((self.state()["wanted"], metrics(self.work)[-1]["card"]), ("stub-large", "model-picked"))
+        self.assertEqual((self.state()["wanted"], metrics(self.work)[-1]["card"]), ("gpt-6-sol", "model-picked"))
         ((_, coming),) = self.posted("$card2")
         self.assertEqual((coming["state"], "buttons" in coming), ("info", False))
         self.assertIn("Switching to Stub Large on your next message", coming["text"])
         # The next turn on a kept thread, in any room, carries the pick; the owner is told in the DM.
-        self.assertIn("model=stub-large", self.serve("task-3", "hello", channel="!room:s.space", kind="room"))
-        self.assertEqual((metrics(self.work)[-1]["model"], metrics(self.work)[-1]["model_switch"]), ("stub-large", "switched"))
+        self.assertIn("model=gpt-6-sol", self.serve("task-3", "hello", channel="!room:s.space", kind="room"))
+        self.assertEqual((metrics(self.work)[-1]["model"], metrics(self.work)[-1]["model_switch"]), ("gpt-6-sol", "switched"))
         ((room, done),) = self.posted("$card3")
         self.assertEqual((room, done["state"], done["text"]), (self.DM, "done", "Switched. I'm now using Stub Large."))
-        self.assertIn("model=stub-large", self.serve("task-4", "again"), "the pick stays")
+        self.assertIn("model=gpt-6-sol", self.serve("task-4", "again"), "the pick stays")
         self.assertEqual(self.posted(), [], "told once")
         self.assertNotIn("model_switch", metrics(self.work)[-1])
         # Asked again, the card names the pick as the model in use; tapping it changes and confirms nothing.
@@ -717,10 +718,10 @@ class ModelCardTest(CardWorld, unittest.TestCase):
 
     def test_a_model_past_the_buttons_is_picked_by_name_and_an_unknown_name_is_refused(self):
         self.assertEqual(self.serve("task-1", "/model stub 7"), "[no-send] the model card answers\n")
-        self.assertEqual((self.state()["wanted"], metrics(self.work)[-1]["card"]), ("stub-7", "model-picked"))
-        self.assertIn("not one I can use now", self.serve("task-2", "/model stub-hidden"))
+        self.assertEqual((self.state()["wanted"], metrics(self.work)[-1]["card"]), ("gpt-5.5", "model-picked"))
+        self.assertIn("not one I can use now", self.serve("task-2", "/model gpt-6-hidden"))
         self.assertIn("not one I can use now", self.serve("task-3", "/model no such model"))
-        self.assertEqual(self.state()["wanted"], "stub-7")
+        self.assertEqual(self.state()["wanted"], "gpt-5.5")
 
     def test_a_turn_that_fails_on_the_pick_says_so_and_the_pick_is_dropped(self):
         self.pick("Stub Broken")
@@ -733,12 +734,12 @@ class ModelCardTest(CardWorld, unittest.TestCase):
                          (self.DM, "error", "I could not switch to Stub Broken. I'm still using Stub Model. Send /model "
                                             "to try again."))
         self.assertEqual(self.state()["wanted"], "")
-        self.assertNotIn("model=", self.serve("task-4", "again"), "the next turn is on Codex's own model")
+        self.assertIn("model=gpt-5.6-sol", self.serve("task-4", "again"), "the next turn is on the model in use before")
 
     def test_a_turn_codex_moved_to_another_model_is_not_called_switched(self):
         self.pick("Stub Moved")
         self.posted("$card2")
-        self.assertIn("model=stub-moved", self.serve("task-3", "hello"))
+        self.assertIn("model=gpt-6-luna", self.serve("task-3", "hello"))
         ((_, card),) = self.posted("$card3")
         self.assertEqual(card["text"], "I could not switch to Stub Moved. I'm still using Stub Model. Send /model to try again.")
         self.assertEqual((self.state()["wanted"], metrics(self.work)[-1]["model_switch"]), ("", "not-switched"))
@@ -762,7 +763,7 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         guest = self.serve("task-3", "hi", extra=["--allow-non-owner"], tier="guest", channel="!room:s.space", kind="room")
         self.assertNotIn("model=", guest)
         self.assertEqual((self.posted(), "model_switch" in metrics(self.work)[-1]), ([], False), "nothing is told for it")
-        self.assertIn("model=stub-large", self.serve("task-4", "hello"))
+        self.assertIn("model=gpt-6-sol", self.serve("task-4", "hello"))
         self.assertEqual(metrics(self.work)[-1]["model_switch"], "switched")
 
     def test_without_the_agents_own_bridge_there_is_no_card_and_model_is_an_ordinary_message(self):
@@ -772,17 +773,95 @@ class ModelCardTest(CardWorld, unittest.TestCase):
         self.assertEqual(self.serve("task-2", "[[askmodel]] change model").strip(),
                          "I could not post the model card. Try again in a moment.")
 
-    def test_a_model_list_codex_refuses_and_a_ledger_that_cannot_be_read_stop_nothing(self):
+    def connector(self, listed=None):
+        """A connector on a fake server whose `model/list` answers `listed` (None: it refuses)."""
         args = cc.build_parser().parse_args(["--work", str(self.work)])
         args.state, args.bridge_state = str(self.work / "state"), str(self.bridge)
-        (self.work / "state").mkdir(parents=True)
+        (self.work / "state").mkdir(parents=True, exist_ok=True)
         c = cc.Connector(FakeRpc, args, note="n")
-        c.models.seen([("m1", "One")], "m1")
-        with mock.patch.object(c.rpc, "request", side_effect=RuntimeError("model/list: refused"), create=True):
-            c.list_models()
-        self.assertEqual(c.models.state()["available"], [{"id": "m1", "name": "One"}], "the last list is kept")
+        refusal = RuntimeError("model/list: refused")
+        answer = (lambda *a, **k: {"data": listed}) if listed is not None else mock.Mock(side_effect=refusal)
+        return c, mock.patch.object(c.rpc, "request", answer, create=True)
+
+    def test_a_model_list_codex_refuses_and_a_ledger_that_cannot_be_read_stop_nothing(self):
+        c, refused = self.connector()
+        c.models.seen([("gpt-5.5", "One")], "gpt-5.5")
+        with refused:
+            self.assertFalse(c.list_models())
+        self.assertEqual(c.models.state()["available"], [{"id": "gpt-5.5", "name": "One"}], "the last list is kept")
         with mock.patch.object(cc.connector_cards, "absorb", side_effect=ValueError("bad ledger")):
             self.assertTrue(self.serve("task-1", "hello").startswith("STUB echo: Sutando task task-1 (source=ag2space"))
+
+    def test_only_a_model_on_the_allowlist_that_codex_lists_is_offered_or_taken(self):
+        self.assertEqual(self.serve("task-1", "/model"), "[no-send] the model card answers\n")
+        ((_, card),) = self.posted()
+        self.assertNotIn("Stub Unlisted", [b["label"] for b in card["buttons"]] + [card["text"]])
+        for tid, said in (("task-2", "/model stub unlisted"), ("task-3", "/model stub-unlisted")):
+            self.assertEqual(self.serve(tid, said).strip(), model_switch.NOT_USABLE, "Codex lists it; the code does not")
+        self.assertEqual(self.posted(), [])
+        # A ledger naming a model off the list never puts a turn on it.
+        (self.work / "state" / "model.json").write_text(json.dumps({"wanted": "stub-unlisted", "told": "stub-unlisted",
+                                                                     "current": "stub-unlisted"}))
+        self.assertNotIn("model=", self.serve("task-4", "hello"))
+        sent, rf = {"channel_id": self.DM}, str(self.work / "out.txt")
+        # On the allowlist, but not listed by Codex now: refused.
+        c, listed = self.connector([{"id": "gpt-5.2", "displayName": "Two"}])
+        c.models.save(available=[{"id": "gpt-5.5", "name": "One"}])
+        with listed:
+            self.assertEqual(c.models.pick("gpt-5.5", sent, rf), "model-unknown")
+        self.assertEqual(Path(rf).read_text().strip(), model_switch.NOT_USABLE)
+        # Codex's list unavailable: nothing is offered and nothing is taken, even a model listed before.
+        c, refused = self.connector()
+        c.models.save(available=[{"id": "gpt-5.5", "name": "One"}], wanted="")
+        with refused:
+            self.assertEqual((c.models.pick("gpt-5.5", sent, rf), c.models.offer(sent, rf)),
+                             ("model-unlisted", "model-unlisted"))
+        self.assertEqual((Path(rf).read_text().strip(), c.models.wanted()), (model_switch.UNLISTED, None))
+        self.assertEqual(self.posted(), [])
+
+    def test_a_pending_pick_is_shown_as_pending_and_a_failed_switch_names_the_model_really_in_use(self):
+        self.pick("Stub Broken")
+        ((_, coming),) = self.posted("$card2")
+        self.assertIn("Switching to Stub Broken on your next message", coming["text"])
+        # Reopened before any turn: the model in use is still Codex's own, and the pick is pending.
+        self.assertEqual(self.serve("task-again", "/model"), "[no-send] the model card answers\n")
+        ((_, menu),) = self.posted("$card3")
+        self.assertTrue(menu["text"].startswith("Now using Stub Model. Pending: Stub Broken, on your next message."))
+        self.assertEqual(self.state()["current"], "gpt-5.6-sol")
+        said = next(b["reply"] for b in menu["buttons"] if b["label"] == "Stub Broken")
+        self.assertEqual(self.serve("task-repeat", said, reply_to="$card3", click=said), "[no-send] the model card answers\n")
+        ((_, still),) = self.posted("$card4")
+        self.assertEqual((still["state"], metrics(self.work)[-1]["card"]), ("info", "model-pending"))
+        self.assertIn("Switching to Stub Broken on your next message", still["text"])
+        self.serve("task-turn", "hello")
+        ((_, failed),) = self.posted("$card5")
+        self.assertEqual(failed["text"], "I could not switch to Stub Broken. I'm still using Stub Model. Send /model "
+                                         "to try again.")
+        # A switch that took is the model in use from then on, and stays so when a later pick fails.
+        self.pick("Stub Large", "$card6")
+        self.posted("$card7")
+        self.serve("task-on-large", "hello")
+        self.posted("$card8")
+        self.pick("Stub Broken", "$card9")
+        self.posted("$card10")
+        self.serve("task-fails", "hello")
+        ((_, failed),) = self.posted("$card11")
+        self.assertIn("I'm still using Stub Large.", failed["text"])
+        self.assertIn("model=gpt-6-sol", self.serve("task-after", "again"), "the model that took is kept")
+
+    def test_an_outcome_that_could_not_be_queued_is_settled_at_once_and_told_after_the_next_turn(self):
+        self.pick("Stub Broken")
+        self.posted("$card2")
+        with mock.patch.object(model_switch.connector_cards, "queue", side_effect=OSError("disk full")):
+            c, _ = self.connector()
+            self.assertEqual(c.models.tell(True, "gpt-5.6-sol"), "untold")
+        self.assertEqual((self.state()["wanted"], self.state()["current"]), ("", "gpt-5.6-sol"), "the refused pick is dropped")
+        self.assertIn("model=gpt-5.6-sol", self.serve("task-3", "hello"), "the refused switch is not asked for again")
+        ((_, card),) = self.posted("$card3")
+        self.assertEqual((card["state"], metrics(self.work)[-1]["model_switch"]), ("error", "not-switched"))
+        self.assertIn("I could not switch to Stub Broken. I'm still using Stub Model.", card["text"])
+        self.serve("task-4", "again")
+        self.assertEqual((self.posted(), self.state().get("untold")), ([], None), "told once")
 
 
 class AccountCardTest(CardWorld, unittest.TestCase):
