@@ -871,6 +871,39 @@ class Crash(SeatCase):
         self.assertEqual(len(self.sent("thread/resume")), 1)
 
 
+class CoreModelSwitch(SeatCase):
+    """The Codex core's switch (switch-model.sh, src/codex_core_model.py) reaches the core seat's next
+    turn; it is core-only, so a worker's seat never reads it (TestWorker below)."""
+
+    def switch(self, model):
+        seat_mod.codex_core_model.save(self.ws / "state", model, applied="next-turn", accepted=True)
+
+    def test_a_switch_after_the_seat_started_is_the_next_turns_model_and_stays(self):
+        s = self.make(model="gpt-old")
+        s.started_at = time.time() - 60
+        self.switch("gpt-new")
+        self.task("task-1.txt")
+        self.assertEqual(s.serve(once=True), 0)
+        self.assertEqual([r["params"].get("model") for r in self.sent("turn/start")], ["gpt-new"])
+        self.assertEqual(s.model, "gpt-new", "a restarted child resumes the thread on it too")
+        self.assertEqual(s.thread_params()["model"], "gpt-new")
+        self.assertIn("model: gpt-new from the core's switch", self.out.getvalue())
+
+    def test_a_switch_recorded_before_the_seat_started_is_left_to_the_launch_model(self):
+        self.switch("gpt-launched")
+        s = self.make(model="gpt-launched")
+        s.started_at = time.time() + 60
+        self.task("task-1.txt")
+        self.assertEqual(s.serve(once=True), 0)
+        self.assertEqual([("model" in r["params"]) for r in self.sent("turn/start")], [False])
+
+    def test_a_claude_cores_record_is_never_a_codex_model(self):
+        (self.ws / "state" / "model-switch.json").write_text(json.dumps({"model": "opus", "accepted": True}))
+        s = self.make()
+        s.started_at = time.time() - 60
+        self.assertEqual(s.turn_model(), "")
+
+
 class CoreQueue(SeatCase):
     def test_the_core_leaves_worker_held_and_claimed_tasks_alone(self):
         self.task("task-mine.txt")
@@ -911,6 +944,21 @@ class Worker(SeatCase):
     def worker_seat(self, stage=None, **kw):
         decl = self.declaration(inbox=self.inbox, payloads=self.tasks, stage=stage or self.pool_stage())
         return self.make(decl, **kw)
+
+    def test_a_core_model_switch_leaves_a_workers_model_alone(self):
+        # Core and worker models are separate: the core's switch record is never a worker's model.
+        self.deliver("task-1")
+        s = self.worker_seat(stage=[sys.executable, str(self.hook)], model="gpt-worker")
+        s.started_at = time.time() - 60
+        seat_mod.codex_core_model.save(self.ws / "state", "gpt-core", applied="next-turn", accepted=True)
+        s.ensure_server()
+        self.assertEqual(s.step(), "done")
+        self.assertEqual([("model" in r["params"]) for r in self.sent("turn/start")], [False])
+        self.assertEqual(s.model, "gpt-worker")
+        self.assertEqual([r["params"].get("model") for r in self.sent("thread/start")], ["gpt-worker"])
+        launcher = (POOL / "launch-codex-worker-session.sh").read_text(encoding="utf-8")
+        for core_only in ("codex_core_model", "model-switch.json", "SUTANDO_CORE_MODEL"):
+            self.assertNotIn(core_only, launcher, "a worker launch never reads the core's model")
 
     def test_a_delivery_is_staged_pending_before_its_turn_and_done_only_after_the_result(self):
         self.deliver("task-1")

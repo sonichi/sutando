@@ -283,6 +283,20 @@ CODEX_ARGS=(
   # The checkout's AGENTS.md is larger than Codex's 32 KiB default, which drops its tail.
   -c project_doc_max_bytes=131072
 )
+# The Codex core's own pick (skills/model-switch, src/codex_core_model.py) when this launch sets no
+# SUTANDO_CORE_MODEL: core-only, so the pool's Codex workers, which share CODEX_HOME, keep theirs.
+if [ -z "${SUTANDO_CORE_MODEL:-}" ] && [ -n "$(heartbeat_python)" ]; then
+  _model_ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null || true)"
+  _model_rec=""
+  if [ -n "$_model_ws" ]; then
+    _model_rec="$("$(heartbeat_python)" "$REPO/src/codex_core_model.py" current --state-dir "$_model_ws/state" 2>/dev/null || true)"
+  fi
+  if [ -n "$_model_rec" ]; then
+    SUTANDO_CORE_MODEL="$_model_rec"
+    echo "  ✓ Codex core model: $_model_rec (the core's last switch, $_model_ws/state/model-switch.json)"
+  fi
+  unset _model_ws _model_rec
+fi
 if [ -n "${SUTANDO_CORE_MODEL:-}" ]; then
   CODEX_ARGS+=(-m "$SUTANDO_CORE_MODEL")
 fi

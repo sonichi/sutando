@@ -84,6 +84,7 @@ class Launch:
 
 class Base(unittest.TestCase):
     CHOICES = SIMPLE
+    RUNTIME = "claude"
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -94,6 +95,7 @@ class Base(unittest.TestCase):
         self.manifest = self.ws / "manifest.json"
         self.choose(self.CHOICES)
         for target, name, value in ((mc, "_owner_dm", lambda ws, core: DM), (mc, "MANIFEST", self.manifest),
+                                    (mc, "core_runtime", lambda: self.RUNTIME),
                                     (connections, "read_rows", lambda ws=None: [CORE])):
             patch = mock.patch.object(target, name, value)
             patch.start()
@@ -323,7 +325,7 @@ class Settle(Base):
     def test_every_documented_failure_posts_the_error_card_with_its_reason(self):
         self.using("opus")
         documented = sorted(mc.REASONS)
-        self.assertEqual(documented, list(range(1, 11)))
+        self.assertEqual(documented, list(range(1, 12)))
         switch = mc.SWITCH.read_text()
         for code in documented:
             self.assertTrue(f"exit {code}" in switch, f"switch-model.sh no longer exits {code}")
@@ -878,6 +880,47 @@ class Source(unittest.TestCase):
             (ws / ".claude-sutando").mkdir()
             (ws / ".claude-sutando" / "settings.json").write_text(json.dumps({"model": "opus"}))
             self.assertEqual(mc.current_model(ws)["name"], "the default model")
+
+
+class CodexCore(Base):
+    """A Codex core's card lists Codex's own models and reads only a Codex record."""
+
+    RUNTIME = "codex"
+
+    def setUp(self):
+        super().setUp()
+        self.home = self.ws / "codex-home"
+        self.home.mkdir()
+        (self.home / "models_cache.json").write_text(json.dumps({"models": [
+            {"slug": "gpt-b", "display_name": "GPT B", "visibility": "list", "priority": 3},
+            {"slug": "gpt-hidden", "display_name": "Hidden", "visibility": "hide", "priority": 1},
+            {"slug": "gpt-a", "display_name": "GPT A", "visibility": "list", "priority": 2},
+            {"slug": "opus", "display_name": "Not Codex", "visibility": "list", "priority": 4}]}))
+        patch = mock.patch.object(mc, "codex_home", lambda: self.home)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_the_buttons_are_the_models_codex_lists_by_its_priority(self):
+        self.assertEqual(mc.choices(), [("gpt-a", "GPT A", "gpt-a"), ("gpt-b", "GPT B", "gpt-b")])
+
+    def test_the_manifest_codex_list_wins_when_set(self):
+        self.manifest.write_text(json.dumps({"name": "model-switch", "config": {
+            mc.CHOICES_KEY: SIMPLE, mc.CODEX_CHOICES_KEY: "gpt-x=GPT X"}}))
+        self.assertEqual(mc.choices(), [("gpt-x", "GPT X", "gpt-x")])
+
+    def test_only_a_codex_record_names_the_model_in_use(self):
+        self.using("opus", accepted=True)
+        self.assertIsNone(mc.current_model(self.ws)["model"], "a Claude core's record is not this core's")
+        self.using("gpt-a", runtime="codex", accepted=True)
+        self.assertEqual(mc.current_model(self.ws)["name"], "GPT A")
+
+    def test_saved_for_the_next_start_is_said_as_such(self):
+        self.using("gpt-a", runtime="codex", accepted=True)
+        self.using("gpt-b", runtime="codex", accepted=False, previous="gpt-a")
+        state, words = mc.outcome(self.ws, "gpt-b", 11)
+        self.assertEqual(state, "error")
+        self.assertIn("I'm still using GPT A", words)
+        self.assertIn("uses it from its next start", words)
 
 
 if __name__ == "__main__":

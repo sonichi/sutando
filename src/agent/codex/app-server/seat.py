@@ -37,6 +37,7 @@ for _p in (str(REPO / "src"), str(Path(__file__).resolve().parent)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import codex_core_model  # noqa: E402
 import supervised_host  # noqa: E402
 from delivery.task_dispatch import (has_ready_result, owned_task_ids,  # noqa: E402
                                     pending_candidates)
@@ -307,6 +308,8 @@ class Seat:
         self.poll_s, self.retry_s, self.hold_s, self.max_attempts = poll_s, retry_s, hold_s, max_attempts
         self.backoff_s, self.turn_timeout, self.interrupt_grace = backoff_s, turn_timeout, interrupt_grace
         self.context, self.clock = context, clock
+        # A core switch recorded after this moment is the one the next turn takes (turn_model).
+        self.started_at = time.time()
         self.cwd = host.cwd or str(self.workspace)
         self.rpc: Optional[Rpc] = None
         self.thread_id: Optional[str] = None
@@ -622,12 +625,29 @@ class Seat:
         elif method == "thread/status/changed" and (params.get("status") or {}).get("type") == "systemError":
             log("  thread status: systemError")
 
+    def turn_model(self) -> str:
+        """The core's model for the next turn, '' to leave the thread's as it is. Only the core seat
+        reads the core's switch record (src/codex_core_model.py), and only one written after this seat
+        started: an older one is what the launcher already passed as --model. A pool worker's seat
+        never reads it, so a core switch leaves the workers' model alone."""
+        if self.worker:
+            return ""
+        picked = codex_core_model.newer_than(self.workspace / "state", self.started_at)
+        if picked and picked != self.model:
+            log(f"model: {picked} from the core's switch (was {self.model or 'the default'}); it holds from this turn")
+            self.model = picked  # a restarted child's thread/resume keeps it too
+        return picked
+
     def run_turn(self, filename: str, prompt: str) -> Tuple[str, str]:
         """(status, detail) once the turn is over: completed | failed | interrupted | stopped |
         timeout | server-exited | seat-stopping."""
+        params = {"threadId": self.thread_id, "cwd": self.cwd, "input": [{"type": "text", "text": prompt}]}
+        model = self.turn_model()
+        if model:
+            # turn/start's model holds for this turn and the thread's later ones.
+            params["model"] = model
         try:
-            res = self.rpc.request("turn/start", {"threadId": self.thread_id, "cwd": self.cwd,
-                                                  "input": [{"type": "text", "text": prompt}]})
+            res = self.rpc.request("turn/start", params)
             turn_id = res["turn"]["id"]
         except (RuntimeError, KeyError, TypeError) as e:
             return ("server-exited" if not self.rpc.alive() else "failed"), one_line(e, 240)
