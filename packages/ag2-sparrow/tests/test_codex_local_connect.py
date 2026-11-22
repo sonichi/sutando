@@ -8,7 +8,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import functools
-import gc
 import io
 import json
 import os
@@ -38,6 +37,7 @@ from _helpers.subprocess_coverage import covered_code  # noqa: E402
 isolate_os_environ()
 
 import fcntl  # noqa: E402  (outside the scanner's Python 3.9 stdlib list)
+import gc  # noqa: E402  (likewise)
 PKG = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG))
 from ag2_sparrow import _dirs, connect_bridge as cb, connect_common as cm, holder_lock, service_manager as sm, task_io  # noqa: E402
